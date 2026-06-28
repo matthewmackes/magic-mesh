@@ -1,0 +1,10 @@
+# Secrets, local state, and the GENERATED per-mesh backend config never go in the repo.
+env.sh
+*.auto.tfvars
+*.backend.hcl
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.tfstate.lock.info
+crash.log

@@ -1,0 +1,110 @@
+#cloud-config
+# DAR-13 — control-VM first-boot seed. Derived from build-vm.yaml.tftpl; the NM
+# static-IP keyfile block is REUSED VERBATIM (the BUILD-FARM root-cause fix). The
+# control VM then enrolls as a FULL mesh peer (--role server), mints its OWN age
+# identity, and converges its tier's units — with NO master secret in this payload.
+#
+# SECRET-ZERO INVARIANT (lock 8 / DAR-3): there is NO write_files entry for
+# /root/.mcnf-age-key and NO templated unseal passphrase. The ONLY credential in
+# this user-data is the join token, which arrives via the SENSITIVE tofu var
+# `join_token` (sourced from the mesh secret store at apply) — never a literal in
+# the committed .tf/.tftpl. The VM keygens its own age identity at first boot
+# (mcnf-secret.sh init-self) and is granted read access by an operator/leader
+# re-seal; the private key NEVER leaves the VM and never enters tofu state.
+hostname: ${hostname}
+users:
+  - name: mm
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    groups: [wheel]
+    ssh_authorized_keys:
+      - "${ssh_pubkey}"
+ssh_pwauth: false
+growpart: { mode: auto, devices: ['/'], ignore_growroot_disabled: false }
+# NETWORK — write the NetworkManager keyfile DIRECTLY (the BUILD-FARM root cause
+# fix proven in setup-xcp-build-vm.sh): on Fedora-Cloud + Xen HVM cloud-init
+# parses a netplan-v2 network-config but renders NO NM keyfile, so the NIC falls
+# back to DHCP and a static-only LAN leaves the VM dark. Generic type=ethernet
+# (no interface-name) binds whatever the NIC is called (Xen: enX0). Disable
+# cloud-init's net management so nothing competes; bring it up on first boot.
+write_files:
+  - path: /etc/NetworkManager/system-connections/static-primary.nmconnection
+    permissions: '0600'
+    owner: root:root
+    content: |
+      [connection]
+      id=static-primary
+      type=ethernet
+      autoconnect=true
+      autoconnect-priority=999
+
+      [ipv4]
+      method=manual
+      address1=${ip_cidr},${gateway}
+      dns=${dns}
+
+      [ipv6]
+      method=ignore
+  - path: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+    permissions: '0644'
+    content: |
+      network: {config: disabled}
+  # The convergence playbook (SETUP-7 shape) — NON-SECRET (mesh-id + overlay IP
+  # rosters + fixed service names only). `mackesd converge` re-applies it. The
+  # tier's backoffice services are appended below the always-on mesh service set;
+  # `converge` enables exactly this list (DAR-14 lands the unit files).
+  - path: /etc/mackesd/site.yml
+    permissions: '0644'
+    owner: root:root
+    content: |
+      # /etc/mackesd/site.yml — control-VM seed (backoffice_tier=${backoffice_tier}).
+      # Steady-state convergence playbook; re-apply: `mackesd converge`.
+      - hosts: localhost
+        connection: local
+        become: true
+        vars:
+          mde_role: "server"
+          mde_mesh_id: "${mesh_id}"
+          mde_qnm_path: "${qnm_path}"
+          mde_backoffice_tier: "${backoffice_tier}"
+          mde_lighthouses: ${lighthouse_ips}
+          mde_services:
+            - "nebula.service"
+            - "mackesd.service"
+            - "mesh-health.timer"
+            - "etcd.service"
+            - "syncthing.service"
+            # --- backoffice (all tiers): state-backend + the secret self-init oneshot
+            - "mcnf-secret-init-self.service"
+            - "mcnf-state-backend.service"
+%{ if backoffice_tier == "full" ~}
+            # --- full tier only: CI + reconciler + DR + status
+            - "mcnf-forgejo.service"
+            - "mcnf-forgejo-runner.service"
+            - "mcnf-farm-reconcile.timer"
+            - "mcnf-farm-autoscale-reconcile.timer"
+            - "mcnf-dr-backup.timer"
+            - "mcnf-backoffice-status.timer"
+%{ endif ~}
+        roles:
+          - role: mackes
+runcmd:
+  # 1) Bring up the static LAN NIC (reused build-vm fix).
+  - [ nmcli, connection, reload ]
+  - [ sh, -c, "nmcli connection up static-primary || systemctl restart NetworkManager" ]
+  # The provider's generated meta-data can leave the hostname at the cloud-image
+  # default (localhost); set it explicitly so logs/inventory read cleanly.
+  - [ hostnamectl, set-hostname, "${hostname}" ]
+  # 2) Enroll as a FULL mesh peer (lock 6). The token is the sensitive tofu var,
+  #    NOT a literal. After this the VM has its overlay IP + Nebula iface.
+  - [ sh, -c, "mackesd join '${join_token}' --role server" ]
+  # 3) Mint THIS VM's OWN age identity + publish only its public recipient (lock 8).
+  #    The private key (/root/.mcnf-age-key, 0600) never leaves the VM; an
+  #    operator/leader `mcnf-secret.sh reseal-to <recipient>` then grants read.
+  - [ sh, -c, "mcnf-secret.sh init-self" ]
+  # 4) Converge: enable exactly the tier's units from /etc/mackesd/site.yml.
+  - [ sh, -c, "mackesd converge" ]
+  # 5) Record the founder etcd quorum endpoints (overlay anchors) into
+  #    /etc/mackesd/etcd-endpoints so the state backend + secret store resolve the
+  #    live quorum (NEVER the dead .192:2379).
+  - [ sh, -c, "setup-etcd.sh --client-only --anchors '${etcd_anchors}'" ]
