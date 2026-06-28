@@ -1,0 +1,25 @@
+# DAR-8 — per-mesh OpenTofu http backend, GENERATED (do not hand-edit).
+#
+# This is the single source for every root's backend block. gen-backend-config.sh
+# expands __CONTROL_IP__ (the state-backend host = the control VM's OVERLAY IP, or
+# the founder lighthouse during Phase A) and __ROOT__ (the state key, e.g.
+# xen-xapi / zone1-do / edgeos / control-vm) and writes the result.
+#
+# WHY a template + a generated -backend-config (not a literal in the tracked .tf):
+# OpenTofu backend blocks CANNOT interpolate variables, so the host address can't
+# be a var. The tracked backend.tf in each root therefore keeps ONLY the static
+# lock_method/unlock_method, and the per-mesh address is supplied at `tofu init`
+# time via `-backend-config=<root>.backend.hcl` (also generated here). That is how
+# one root tree serves any mesh with no hardcoded 172.20.145.192 in git.
+#
+# State + lock keys live under the FROZEN /tofu/state/* + /tofu/lock/* prefixes
+# (lock 7) served by automation/state-backend/tofu-state-etcd.py.
+terraform {
+  backend "http" {
+    address        = "http://__CONTROL_IP__:8390/state/__ROOT__"
+    lock_address   = "http://__CONTROL_IP__:8390/state/__ROOT__"
+    unlock_address = "http://__CONTROL_IP__:8390/state/__ROOT__"
+    lock_method    = "LOCK"
+    unlock_method  = "UNLOCK"
+  }
+}

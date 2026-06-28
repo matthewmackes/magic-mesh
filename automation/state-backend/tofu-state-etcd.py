@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""DATACENTER-2 — OpenTofu `http` state backend backed by etcd (SUBSTRATE-V2).
+"""DATACENTER-2 / DAR-6 — OpenTofu `http` state backend backed by etcd (SUBSTRATE-V2).
 
 Implements the OpenTofu http-backend protocol (GET/POST/DELETE + LOCK/UNLOCK) over
 the etcd v3 HTTP gateway, so Tofu state + its lock live in the mesh-replicated etcd
 store rather than a single host's local file. Any leader-eligible node can then
 plan/apply against the same state with proper locking — no-fixed-center IaC.
 
-State  → etcd key  /tofu/state/<name>   (raw state JSON)
-Lock   → etcd key  /tofu/lock/<name>    (the lock-info JSON; created atomically)
+State  → etcd key  /tofu/state/<name>   (raw state JSON)   [FROZEN prefix]
+Lock   → etcd key  /tofu/lock/<name>     (the lock-info JSON; created atomically)
+
+The /tofu/state/* + /tofu/lock/* prefixes are FROZEN (lock 7): they are the live
+prefixes already wired into dr-backup.sh. Do NOT rename to /tofu-state.
 
 Stateless itself: all durable state is in etcd, so the service can run on any node
 (or several behind a VIP). Configure a workspace's backend with:
@@ -22,18 +25,90 @@ Stateless itself: all durable state is in etcd, so the service can run on any no
       }
     }
 
-Env: MCNF_ETCD (default http://172.20.145.192:2379), STATE_BACKEND_PORT (8390).
+Env (DAR-6 — NO dead-LAN default):
+  MCNF_ETCD            comma-separated etcd v3 gateway URLs (try-next failover).
+                       Resolved by DAR-1b before launch (state-backend-up.sh sources
+                       automation/lib/etcd-endpoints.sh). If unset, this falls back
+                       to MCNF_ETCD_ENDPOINTS_FILE; if still empty it FAILS LOUD
+                       (NO dead-LAN-node default — the old .192 control node is gone).
+  MCNF_ETCD_ENDPOINTS_FILE  defaults /etc/mackesd/etcd-endpoints (setup-etcd.sh).
+  STATE_BACKEND_BIND   address to bind (default the detected overlay IP, NOT
+                       0.0.0.0 — the overlay-only bind is load-bearing, lock 7).
+  STATE_BACKEND_PORT   default 8390.
 """
 from __future__ import annotations
 
 import base64
 import json
 import os
+import subprocess
+import sys
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-ETCD = os.environ.get("MCNF_ETCD", "http://172.20.145.192:2379")
+
+def _parse_endpoints(raw: str) -> list[str]:
+    """Mirror of substrate/etcd.rs::parse_endpoints: comma/whitespace/newline
+    separators, trims, drops blanks + `#` comments."""
+    out: list[str] = []
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0]
+        for tok in line.replace(",", " ").replace("\t", " ").split():
+            tok = tok.strip()
+            if tok:
+                out.append(tok)
+    return out
+
+
+def _resolve_endpoints() -> list[str]:
+    """Resolution order (DAR-1b / design §2.2): explicit MCNF_ETCD env →
+    /etc/mackesd/etcd-endpoints → FAIL LOUD. NEVER the dead .192:2379."""
+    env = os.environ.get("MCNF_ETCD", "").strip()
+    if env:
+        eps = _parse_endpoints(env)
+        if eps:
+            return eps
+    epfile = os.environ.get("MCNF_ETCD_ENDPOINTS_FILE", "/etc/mackesd/etcd-endpoints")
+    try:
+        with open(epfile, encoding="utf-8") as fh:
+            eps = _parse_endpoints(fh.read())
+        if eps:
+            return eps
+    except OSError:
+        pass
+    sys.stderr.write(
+        "tofu-state-etcd: no etcd endpoints resolved — MCNF_ETCD unset and "
+        f"{epfile} missing/empty. This node is not on the mesh etcd quorum. "
+        "Run setup-etcd.sh or export MCNF_ETCD=http://<lighthouse-overlay>:2379.\n"
+    )
+    sys.exit(2)
+
+
+ENDPOINTS = _resolve_endpoints()
 PORT = int(os.environ.get("STATE_BACKEND_PORT", "8390"))
+
+
+def _detect_overlay() -> str:
+    """The Nebula overlay IPv4 of this node (the only address the backend should
+    bind — lock 7). Falls back to 127.0.0.1 (NEVER 0.0.0.0) if no overlay iface,
+    so an un-meshed box can't accidentally expose state on every interface."""
+    try:
+        out = subprocess.run(
+            ["ip", "-o", "-4", "addr", "show"],
+            capture_output=True, text=True, timeout=5, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    for line in out.splitlines():
+        f = line.split()
+        # f[1] = iface, f[3] = <ip>/<prefix>
+        if len(f) >= 4 and ("nebula" in f[1] or "mde-neb" in f[1]):
+            return f[3].split("/")[0]
+    return "127.0.0.1"
+
+
+BIND = os.environ.get("STATE_BACKEND_BIND", "").strip() or _detect_overlay()
 
 
 def _b64(b: bytes) -> str:
@@ -41,11 +116,22 @@ def _b64(b: bytes) -> str:
 
 
 def _etcd(path: str, body: dict) -> dict:
-    req = urllib.request.Request(
-        f"{ETCD}{path}", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read() or b"{}")
+    """POST to the etcd v3 gateway, trying each endpoint in turn (naive try-next
+    failover — NOT linearizable, acceptable because Tofu re-locks before write)."""
+    last: Exception | None = None
+    for ep in ENDPOINTS:
+        req = urllib.request.Request(
+            f"{ep}{path}",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return json.loads(r.read() or b"{}")
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            last = exc
+            continue
+    raise RuntimeError(f"all etcd endpoints failed ({ENDPOINTS}): {last}")
 
 
 def etcd_get(key: str) -> bytes | None:
@@ -75,7 +161,7 @@ def etcd_lock(key: str, info: bytes) -> bool:
 
 
 def _state_key(path: str) -> str | None:
-    # /state/<name>  ->  /tofu/state/<name>
+    # /state/<name>  ->  <name>  (keyed under the FROZEN /tofu/state/ prefix)
     parts = path.lstrip("/").split("/", 1)
     if len(parts) != 2 or parts[0] != "state" or not parts[1]:
         return None
@@ -141,5 +227,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"tofu-state-etcd: :{PORT} -> etcd {ETCD}", flush=True)
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    print(
+        f"tofu-state-etcd: {BIND}:{PORT} -> etcd {','.join(ENDPOINTS)}",
+        flush=True,
+    )
+    ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()

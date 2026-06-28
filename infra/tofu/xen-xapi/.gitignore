@@ -3,3 +3,5 @@ env.sh
 *.tfstate.*
 .terraform/
 .terraform.tfstate.lock.info
+# DAR-8: the per-mesh backend address is generated (gen-backend-config.sh), never committed.
+*.backend.hcl
