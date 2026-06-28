@@ -77,6 +77,10 @@ use cosmic::Theme;
 // notify tokens (§4: severity → token, never a raw hex), the same path the
 // events rail + cosmic applet use.
 use mde_notify::{classify_severity, severity_token, Severity};
+// UNIFY-14 — the per-node mesh service-status shape the mackesd `service_status`
+// worker publishes; the Overview's node×service matrix reads the cross-node
+// mirror of these maps (real data only — §7).
+use mackes_mesh_types::service_status::{MeshService, ServiceState, ServiceStatusMap};
 use mde_theme::{FontSize, Palette, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
@@ -827,6 +831,14 @@ pub struct FrontDoorData {
     /// [`FrontDoor::load`] (an async CLI, not a blocking read like the rest of
     /// [`Self::read`]).
     pub audit: Vec<crate::panels::audit::AuditEventRow>,
+    /// UNIFY-14 — the Overview's **Service Matrix** source: each peer's mirrored
+    /// mesh service-status map (`<workgroup>/<host>/service-status.json`, the
+    /// mackesd `service_status` worker's cross-node lane), keyed by reporting
+    /// hostname. A peer absent from this map hasn't reported yet, so the matrix
+    /// charts its row as honest "unknown" cells — never a fabricated up/down (§7).
+    /// Read off the GUI thread in [`Self::read`] (blocking FS reads, like the
+    /// Convergence card).
+    pub service_status: ServiceStatusByHost,
 }
 
 /// UNIFY-15 — the **Fleet Convergence** card's data (design Overview, lines
@@ -914,6 +926,102 @@ fn read_convergence(peers: &[peers::PeerRow]) -> Option<Convergence> {
     ))
 }
 
+/// UNIFY-14 — the cross-node mesh service-status maps, keyed by the reporting
+/// node's hostname (the matrix row key). Built by [`read_service_status`].
+type ServiceStatusByHost = std::collections::BTreeMap<String, ServiceStatusMap>;
+
+/// UNIFY-14 — the per-node file the mackesd `service_status` worker mirrors to its
+/// QNM-Shared dir (`<workgroup>/<host>/service-status.json`, the worker's
+/// cross-node lane). Kept in sync with the daemon's `SHARED_STATUS_FILE` const —
+/// the GUI can't import that feature-gated daemon module, so the filename is
+/// single-valued here (mirrors how the Router panel names `router-registry.json`).
+const SERVICE_STATUS_FILE: &str = "service-status.json";
+
+/// UNIFY-14 — parse one node's mirrored `service-status.json` body into a
+/// [`ServiceStatusMap`]. A node that hasn't reported (no file / unreadable /
+/// malformed / empty hostname) yields `None`, so the matrix renders its row as
+/// honest "unknown" cells — never a fabricated up/down (§7). Pure + testable.
+#[must_use]
+fn parse_service_status(body: &str) -> Option<ServiceStatusMap> {
+    let map: ServiceStatusMap = serde_json::from_str(body.trim()).ok()?;
+    if map.hostname.is_empty() {
+        return None;
+    }
+    Some(map)
+}
+
+/// UNIFY-14 — read every peer's mirrored service-status map off the replicated
+/// QNM-Shared plane (`<workgroup>/<host>/service-status.json` — exactly where the
+/// mackesd `service_status` worker writes its cross-node lane), keyed by the
+/// reporting hostname. Resolves the SAME workgroup root the Convergence card reads
+/// ([`config_apply::workgroup_root`], single-sourced with the daemon), and mirrors
+/// the Router panel's per-node registry union (§6 — no reimplemented transport).
+/// Blocking FS reads — runs on [`FrontDoorData::read`]'s `spawn_blocking` thread.
+/// Best-effort: a missing share / unreadable file simply leaves that node absent,
+/// so the matrix charts it as an honest "unknown" row (§7).
+#[must_use]
+fn read_service_status() -> ServiceStatusByHost {
+    let root = crate::panels::config_apply::workgroup_root();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return ServiceStatusByHost::new();
+    };
+    let mut by_host = ServiceStatusByHost::new();
+    for ent in entries.flatten() {
+        let Ok(body) = std::fs::read_to_string(ent.path().join(SERVICE_STATUS_FILE)) else {
+            continue;
+        };
+        if let Some(map) = parse_service_status(&body) {
+            by_host.insert(map.hostname.clone(), map);
+        }
+    }
+    by_host
+}
+
+/// UNIFY-14 — the host-column width + inter-cell gap of the Service Matrix grid
+/// (design `grid-template-columns:96px repeat(9,1fr); gap:6px`).
+const MATRIX_HOST_COL_W: f32 = 96.0;
+const MATRIX_GAP: u16 = 6;
+
+/// UNIFY-14 — one Service Matrix cell: a 9 px status dot for one service's state
+/// on one node (the design's matrix dot). Active → a filled success-token dot;
+/// Inactive → a muted GRAY 50 dot (installed-but-down / absent, but the node DID
+/// report); Unknown → a hollow dim ring (the node hasn't reported this unit — an
+/// honest "—", never a fabricated up/down, §7). Reuses `panel_chrome::
+/// status_dot_sized` for the filled states (§6), tokens only (§4).
+fn matrix_cell<'a>(state: ServiceState, palette: Palette) -> Element<'a, crate::Message, Theme> {
+    const D: f32 = 9.0;
+    match state {
+        ServiceState::Active => {
+            crate::panel_chrome::status_dot_sized(palette.success.into_cosmic_color(), D)
+        }
+        ServiceState::Inactive => {
+            crate::panel_chrome::status_dot_sized(palette.text_muted.into_cosmic_color(), D)
+        }
+        // Honest unknown: a hollow ring (border only), visually distinct from a
+        // filled "down" dot — the node simply hasn't reported this unit yet.
+        ServiceState::Unknown => {
+            let ring = palette.border.into_cosmic_color();
+            container(
+                Space::new()
+                    .width(Length::Fixed(D))
+                    .height(Length::Fixed(D)),
+            )
+            .width(Length::Fixed(D))
+            .height(Length::Fixed(D))
+            .style(move |_t: &Theme| container::Style {
+                background: None,
+                border: Border {
+                    color: ring,
+                    width: 1.0,
+                    radius: (D / 2.0).into(),
+                },
+                ..container::Style::default()
+            })
+            .into()
+        }
+    }
+}
+
 impl FrontDoorData {
     /// The pre-rendered `(value, tone)` for one widget key, or `None` when this
     /// snapshot has nothing for it (incl. [`TileKey::Copilot`], which has no
@@ -989,6 +1097,10 @@ impl FrontDoorData {
             // UNIFY-15 — the Audit Trail card is an async CLI fetch, so it's filled
             // by `FrontDoor::load` after this blocking read; empty here.
             audit: Vec::new(),
+            // UNIFY-14 — the node×service matrix: every peer's mirrored mesh
+            // service-status map off the replicated QNM-Shared plane (the worker's
+            // cross-node lane). A node with no mirror reads as honest "unknown".
+            service_status: read_service_status(),
             // FRONTDOOR-6 — carry the raw roster for the unified mesh search.
             peers,
         }
@@ -3100,6 +3212,11 @@ pub struct FrontDoor {
     /// audit events), folded in from the [`FrontDoorData`] read. Empty until the
     /// first snapshot / when the chain is empty — the card is then omitted (§7).
     pub audit: Vec<crate::panels::audit::AuditEventRow>,
+    /// UNIFY-14 — the Overview's **Service Matrix** source (each peer's mesh
+    /// service-status map, keyed by hostname), folded in from the [`FrontDoorData`]
+    /// read. Empty until the first snapshot — a peer with no entry charts as honest
+    /// "unknown" cells, never a fabricated up/down (§7).
+    pub service_status: ServiceStatusByHost,
 }
 
 impl Default for FrontDoor {
@@ -3189,6 +3306,9 @@ impl FrontDoor {
             // snapshot lands (an empty store / chain keeps them omitted — §7).
             convergence: None,
             audit: Vec::new(),
+            // UNIFY-14 — no Service Matrix until the first snapshot reads the
+            // mirrored per-node maps (an empty roster keeps the card omitted — §7).
+            service_status: ServiceStatusByHost::new(),
         }
     }
 
@@ -4541,6 +4661,10 @@ impl FrontDoor {
         // rather than lingering (§7 — no phantom card).
         self.convergence = data.convergence.clone();
         self.audit = data.audit.clone();
+        // UNIFY-14 — fold the per-node service-status maps in for the Service
+        // Matrix, replaced wholesale each snapshot so a node that stops reporting
+        // reverts to honest "unknown" rather than showing a stale row (§7).
+        self.service_status = data.service_status.clone();
     }
 
     /// FRONTDOOR-10 — the suggestions that concern the tile at index `i` (Q19),
@@ -5984,19 +6108,114 @@ impl FrontDoor {
         if !self.audit.is_empty() {
             cards.push(self.audit_card(palette));
         }
-        if cards.is_empty() {
+        // UNIFY-14 — the node×service matrix gets its OWN full-width row beneath the
+        // KPI lane (nine columns need the width). Omitted when the roster is empty.
+        let matrix = self.service_matrix_card(palette);
+        if cards.is_empty() && matrix.is_none() {
             return None;
         }
-        let mut lane = row![].spacing(11).width(Length::Fill);
-        for card in cards {
-            lane = lane.push(container(card).width(Length::FillPortion(1)));
+        let mut stack = column![].spacing(11).width(Length::Fill);
+        if !cards.is_empty() {
+            let mut lane = row![].spacing(11).width(Length::Fill);
+            for card in cards {
+                lane = lane.push(container(card).width(Length::FillPortion(1)));
+            }
+            stack = stack.push(lane);
+        }
+        if let Some(matrix) = matrix {
+            stack = stack.push(matrix);
         }
         Some(
-            container(lane)
+            container(stack)
                 .width(Length::Fill)
                 .padding(Padding::from([4u16, 16u16]))
                 .into(),
         )
+    }
+
+    /// UNIFY-14 — the Overview's **Service Matrix** card (design lines 106-120): the
+    /// live peer roster as rows, the nine canonical mesh services as columns, each
+    /// cell a status dot drawn from the REAL per-node service-status map the mackesd
+    /// `service_status` worker mirrors (`<workgroup>/<host>/service-status.json`).
+    /// Filled success = up, muted GRAY 50 = down, a hollow dim ring = the node
+    /// hasn't reported that unit yet — an honest "unknown", never a fabricated
+    /// up/down (§7). `None` when the roster is empty (nothing honest to chart).
+    fn service_matrix_card(&self, palette: Palette) -> Option<Element<'_, crate::Message, Theme>> {
+        if self.peers.is_empty() {
+            return None;
+        }
+        let sizes = FontSize::defaults();
+
+        let header: Element<'_, crate::Message, Theme> = row![
+            text("Service Matrix")
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+            Space::new().width(Length::Fill),
+            text("node × service")
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+        ]
+        .align_y(cosmic::iced::Alignment::Center)
+        .width(Length::Fill)
+        .into();
+
+        // Column header: an empty lead cell over the host column, then the nine
+        // canonical service labels (mono, muted), each centered over its data column.
+        let mut head = row![container(Space::new()).width(Length::Fixed(MATRIX_HOST_COL_W))]
+            .spacing(MATRIX_GAP)
+            .align_y(cosmic::iced::Alignment::Center)
+            .width(Length::Fill);
+        for svc in MeshService::ALL {
+            head = head.push(
+                container(
+                    text(svc.label())
+                        .font(cosmic::iced::Font::MONOSPACE)
+                        .size(TypeRole::Caption.size_in(sizes))
+                        .colr(palette.text_muted.into_cosmic_color())
+                        .align_x(Alignment::Center),
+                )
+                .center_x(Length::FillPortion(1)),
+            );
+        }
+
+        let mut body = column![head].spacing(7).width(Length::Fill);
+
+        // One row per live peer (the roster already in `FrontDoorData`), each cell a
+        // dot from that node's reported map — or honest "unknown" when it has none.
+        for peer in &self.peers {
+            let map = self.service_status.get(&peer.hostname);
+            // The row's self-dot (design `r.self`): the accent token when this node
+            // is reporting its own map, dim when it hasn't (an honest "no row yet").
+            let self_color = if map.is_some() {
+                palette.accent.into_cosmic_color()
+            } else {
+                palette.text_muted.into_cosmic_color()
+            };
+            let label = row![
+                crate::panel_chrome::status_dot_sized(self_color, 5.0),
+                text(peer.hostname.clone())
+                    .font(cosmic::iced::Font::MONOSPACE)
+                    .size(TypeRole::Caption.size_in(sizes))
+                    .colr(palette.text.into_cosmic_color()),
+            ]
+            .spacing(5)
+            .align_y(cosmic::iced::Alignment::Center);
+
+            let mut line = row![container(label).width(Length::Fixed(MATRIX_HOST_COL_W))]
+                .spacing(MATRIX_GAP)
+                .align_y(cosmic::iced::Alignment::Center)
+                .width(Length::Fill);
+            for svc in MeshService::ALL {
+                // A node with no map, or a service it never sampled, reads as the
+                // honest Unknown (`ServiceStatusMap::state` defaults missing → Unknown).
+                let state = map.map_or(ServiceState::Unknown, |m| m.state(svc));
+                line = line
+                    .push(container(matrix_cell(state, palette)).center_x(Length::FillPortion(1)));
+            }
+            body = body.push(line);
+        }
+
+        Some(self.overview_card_frame(header, body.into(), palette))
     }
 
     /// UNIFY-15 — the **Fleet Convergence** card (design lines 137-144). The head
@@ -11148,6 +11367,87 @@ mod tests {
             // Both cards present ⇒ the block builds (and the whole view renders).
             assert!(fd.overview_cards(crate::live_theme::palette()).is_some());
             let _: Element<'_, crate::Message, Theme> = fd.view();
+        });
+    }
+
+    // ---- UNIFY-14 — the node×service Service Matrix --------------------------
+
+    #[test]
+    fn parse_service_status_decodes_a_mirrored_map_and_rejects_garbage() {
+        // The exact wire shape the mackesd `service_status` worker mirrors.
+        let map = ServiceStatusMap::new("forge", "10.42.0.3", 42)
+            .with(MeshService::Nebula, ServiceState::Active)
+            .with(MeshService::Etcd, ServiceState::Inactive);
+        let body = serde_json::to_string(&map).unwrap();
+        let back = parse_service_status(&body).expect("decoded");
+        assert_eq!(back.hostname, "forge");
+        assert_eq!(back.state(MeshService::Nebula), ServiceState::Active);
+        assert_eq!(back.state(MeshService::Etcd), ServiceState::Inactive);
+        // §7 — a service the node never sampled reads as an honest Unknown.
+        assert_eq!(back.state(MeshService::Music), ServiceState::Unknown);
+        // Garbage / an empty-hostname map are dropped (no phantom row).
+        assert!(parse_service_status("not json").is_none());
+        assert!(
+            parse_service_status(r#"{"hostname":"","overlay_ip":"","ts_ms":0,"services":{}}"#)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn service_matrix_card_charts_the_roster_and_honest_unknowns() {
+        with_isolated_prefs(|| {
+            let mut fd = FrontDoor::new();
+            // §7 — an empty roster has nothing honest to chart ⇒ no card.
+            assert!(fd
+                .service_matrix_card(crate::live_theme::palette())
+                .is_none());
+
+            // A roster + a reported map for ONE node ⇒ the card builds. The peer
+            // with no map renders honest-unknown cells, never a fabricated up/down.
+            fd.peers = vec![mesh_peer("oak", &[]), mesh_peer("pine", &[])];
+            let map = ServiceStatusMap::new("oak", "10.42.0.2", 1)
+                .with(MeshService::Bus, ServiceState::Active)
+                .with(MeshService::Etcd, ServiceState::Inactive);
+            fd.service_status.insert("oak".into(), map);
+
+            assert!(fd
+                .service_matrix_card(crate::live_theme::palette())
+                .is_some());
+            // And it shows through the whole Overview (both panel + full-screen
+            // paths route through `overview_cards`), even with no other card.
+            assert!(fd.overview_cards(crate::live_theme::palette()).is_some());
+            let _: Element<'_, crate::Message, Theme> = fd.view();
+        });
+    }
+
+    #[test]
+    fn apply_folds_the_service_status_maps_for_the_matrix() {
+        with_isolated_prefs(|| {
+            let mut fd = FrontDoor::new();
+            let mut data = FrontDoorData {
+                peers: vec![mesh_peer("oak", &[])],
+                ..FrontDoorData::default()
+            };
+            data.service_status.insert(
+                "oak".into(),
+                ServiceStatusMap::new("oak", "10.42.0.2", 1)
+                    .with(MeshService::Workbench, ServiceState::Active),
+            );
+            fd.apply(&data);
+            // The snapshot's per-node maps land on the live panel (matrix source).
+            assert_eq!(
+                fd.service_status
+                    .get("oak")
+                    .map(|m| m.state(MeshService::Workbench)),
+                Some(ServiceState::Active)
+            );
+            // A later snapshot WITHOUT oak's map reverts it to honest "unknown"
+            // (replaced wholesale — no stale row, §7).
+            fd.apply(&FrontDoorData {
+                peers: vec![mesh_peer("oak", &[])],
+                ..FrontDoorData::default()
+            });
+            assert!(fd.service_status.get("oak").is_none());
         });
     }
 }
