@@ -26,12 +26,15 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+use cosmic::iced::font::Weight;
 use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
-use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
+use cosmic::iced::{alignment, Background, Border, Color, Font, Length, Padding, Task};
 use cosmic::{Element, Theme};
-use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+use mde_theme::{FontSize, FontWeight, Icon, Palette, TypeRole};
 
+use crate::controls::{variant_button, ButtonVariant};
 use crate::cosmic_compat::prelude::*;
+use crate::status_strip::{mono_text, pip};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeStatus {
@@ -174,8 +177,10 @@ impl HealthCheckPanel {
     pub fn view(&self) -> Element<'_, crate::Message> {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
+        let weights = FontWeight::defaults();
 
-        let title = text("Health Check")
+        // ---- header: title · derived verdict · run · systemd hero ----
+        let title = text("Monitoring · Health")
             .size(TypeRole::Display.size_in(sizes))
             .colr(palette.text.into_cosmic_color());
 
@@ -237,47 +242,106 @@ impl HealthCheckPanel {
         let header = row![
             column![title, subtitle].spacing(2),
             Space::new().width(Length::Fill),
+            verdict_badge(&self.probes, palette, &sizes, &weights),
             run_btn,
             systemd,
         ]
         .spacing(12)
-        .align_y(cosmic::iced::alignment::Vertical::Center);
+        .align_y(alignment::Vertical::Center);
 
-        let mut probe_col = column![].spacing(8);
-        for p in &self.probes {
-            probe_col = probe_col.push(probe_row(p, palette));
-        }
-        if self.probes.is_empty() && !self.busy {
-            probe_col = probe_col.push(
-                container(
-                    text("No probes have been run yet. Click \"Run checks\" above to refresh.")
-                        .size(TypeRole::Body.size_in(sizes))
-                        .colr(palette.text_muted.into_cosmic_color()),
-                )
-                .padding(Padding::from([24u16, 0u16])),
-            );
-        }
+        // ---- partition the REAL probes: Doctor checks vs Netdata alarms ----
+        // The Netdata-alarm rows (`netdata_alarm_probes`) carry a "Netdata"
+        // name prefix; everything else is a `meshctl doctor`-style check. This
+        // is a presentation split of the existing probe data (§7) — no new
+        // data, no fabricated rows.
+        let (alarm_probes, doctor_probes): (Vec<&ProbeResult>, Vec<&ProbeResult>) = self
+            .probes
+            .iter()
+            .partition(|p| p.name.starts_with("Netdata"));
 
-        // PLANES-6 / W20 — folded mesh-service start/stop/restart
-        // controls. One row per HEALTH_SERVICES unit; buttons disabled
-        // while any op (or a probe pass) is in flight. A degraded daemon
-        // flagged above is actionable right here.
-        let mut services_col = column![text("Mesh services")
-            .size(TypeRole::Body.size_in(sizes))
-            .colr(palette.text.into_cosmic_color())]
-        .spacing(8);
+        // Doctor card body (or the preserved empty / loading state).
+        let doctor_body: Element<'_, crate::Message> = if doctor_probes.is_empty() {
+            let msg = if self.busy {
+                "Running checks…"
+            } else {
+                "No checks have been run yet. Click \"Run checks\" above to refresh."
+            };
+            container(
+                text(msg)
+                    .size(TypeRole::Body.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            )
+            .padding(Padding::from([14u16, 15u16]))
+            .into()
+        } else {
+            let n = doctor_probes.len();
+            let mut col = column![].width(Length::Fill);
+            for (i, p) in doctor_probes.into_iter().enumerate() {
+                col = col.push(doctor_row(p, palette, &sizes));
+                if i + 1 < n {
+                    col = col.push(hairline(palette));
+                }
+            }
+            col.into()
+        };
+        let doctor_card = dense_card(
+            "Doctor",
+            doctor_body,
+            Length::FillPortion(14),
+            palette,
+            &sizes,
+        );
+
+        // Netdata Alarms card body.
+        let alarms_body: Element<'_, crate::Message> = if alarm_probes.is_empty() {
+            container(
+                text("no alarm data")
+                    .size(TypeRole::Body.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            )
+            .padding(Padding::from([14u16, 13u16]))
+            .into()
+        } else {
+            let n = alarm_probes.len();
+            let mut col = column![].width(Length::Fill);
+            for (i, p) in alarm_probes.into_iter().enumerate() {
+                col = col.push(alarm_row(p, palette, &sizes, &weights));
+                if i + 1 < n {
+                    col = col.push(hairline(palette));
+                }
+            }
+            col.into()
+        };
+        let alarms_card = dense_card(
+            "Netdata Alarms",
+            alarms_body,
+            Length::FillPortion(10),
+            palette,
+            &sizes,
+        );
+
+        let grid = row![doctor_card, alarms_card]
+            .spacing(11)
+            .align_y(alignment::Vertical::Top);
+
+        // PLANES-6 / W20 — folded mesh-service start/stop/restart controls
+        // (preserved real functionality). One row per HEALTH_SERVICES unit;
+        // buttons disabled while any op (or a probe pass) is in flight, so a
+        // degraded daemon flagged above is actionable right here.
         let controls_live = !self.service_busy && !self.busy;
+        let mut services_inner = column![].spacing(8).width(Length::Fill);
         for unit in HEALTH_SERVICES {
-            let mut btns = row![text((*unit).to_string())
-                .size(14)
-                .width(Length::Fixed(160.0))
-                .colr(palette.text.into_cosmic_color())]
+            let mut btns = row![
+                mono_text((*unit).to_string(), TypeRole::Body, &sizes, &weights)
+                    .width(Length::Fixed(120.0))
+                    .colr(palette.text.into_cosmic_color())
+            ]
             .spacing(8)
-            .align_y(cosmic::iced::alignment::Vertical::Center);
+            .align_y(alignment::Vertical::Center);
             for op in ["start", "stop", "restart"] {
-                btns = btns.push(crate::controls::variant_button(
+                btns = btns.push(variant_button(
                     op,
-                    crate::controls::ButtonVariant::Secondary,
+                    ButtonVariant::Secondary,
                     controls_live.then_some(crate::Message::HealthCheck(Message::ServiceOp {
                         unit: (*unit).to_string(),
                         op,
@@ -285,100 +349,245 @@ impl HealthCheckPanel {
                     palette,
                 ));
             }
-            services_col = services_col.push(btns);
+            services_inner = services_inner.push(btns);
         }
         if !self.service_msg.is_empty() {
-            services_col = services_col.push(
+            services_inner = services_inner.push(
                 text(self.service_msg.clone())
-                    .size(12)
+                    .size(TypeRole::Caption.size_in(sizes))
                     .colr(palette.text_muted.into_cosmic_color()),
             );
         }
+        let services_card = dense_card(
+            "Mesh Services",
+            container(services_inner)
+                .padding(Padding::from([10u16, 13u16]))
+                .width(Length::Fill)
+                .into(),
+            Length::Fill,
+            palette,
+            &sizes,
+        );
 
-        container(
+        let content = column![grid, services_card].spacing(16).width(Length::Fill);
+
+        crate::panel_chrome::panel_container(
             column![
                 header,
                 Space::new().height(Length::Fixed(16.0)),
-                services_col,
-                Space::new().height(Length::Fixed(16.0)),
-                scrollable(probe_col).height(Length::Fill),
+                scrollable(content).height(Length::Fill),
             ]
-            .spacing(2),
+            .width(Length::Fill)
+            .into(),
+            crate::live_theme::tokens().density,
         )
-        .padding(Padding::from([24u16, 32u16]))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
     }
 }
 
-fn probe_row<'a>(p: &'a ProbeResult, palette: Palette) -> Element<'a, crate::Message> {
-    let resolved = mde_icon(p.status.icon(), IconSize::Inline);
-    let icon_color = match p.status {
-        ProbeStatus::Ok => palette.success.into_cosmic_color(),
-        ProbeStatus::Warn => palette.warning.into_cosmic_color(),
-        ProbeStatus::Fail => palette.danger.into_cosmic_color(),
-        ProbeStatus::Unknown => palette.text_muted.into_cosmic_color(),
-    };
-    let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
-        use cosmic::iced::widget::svg as widget_svg;
-        widget_svg(widget_svg::Handle::from_memory(svg_bytes))
-            .width(Length::Fixed(18.0))
-            .height(Length::Fixed(18.0))
-            .sty(move |_t: &Theme| widget_svg::Style {
-                color: Some(icon_color),
-            })
-            .into()
-    } else {
-        text(resolved.fallback_glyph)
-            .size(18.0)
-            .colr(icon_color)
-            .into()
-    };
+/// The semantic palette colour for a probe status (§4 token map).
+fn status_color(s: ProbeStatus, palette: Palette) -> Color {
+    status_rgba(s, palette).into_cosmic_color()
+}
 
-    let label = text(p.name.clone())
-        .size(14)
-        .colr(palette.text.into_cosmic_color());
-    let status_chip = text(p.status.label()).size(11).colr(icon_color);
-    let detail = text(p.detail.clone())
-        .size(12)
-        .colr(palette.text_muted.into_cosmic_color());
-    let mut col = column![
+/// The probe status as a palette [`mde_theme::Rgba`] (for the status pip).
+fn status_rgba(s: ProbeStatus, palette: Palette) -> mde_theme::Rgba {
+    match s {
+        ProbeStatus::Ok => palette.success,
+        ProbeStatus::Warn => palette.warning,
+        ProbeStatus::Fail => palette.danger,
+        ProbeStatus::Unknown => palette.text_muted,
+    }
+}
+
+/// A 1 px full-width hairline divider in the border token.
+fn hairline<'a>(palette: Palette) -> Element<'a, crate::Message> {
+    let color = palette.border.into_cosmic_color();
+    container(Space::new().height(Length::Fixed(1.0)).width(Length::Fill))
+        .style(move |_| container::Style {
+            snap: false,
+            icon_color: None,
+            background: Some(Background::Color(color)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            shadow: Default::default(),
+            text_color: None,
+        })
+        .into()
+}
+
+/// A dense Carbon card: a surface-tinted box with a sharp 1 px hairline
+/// border, an uppercase section-label header bar, an internal divider, and
+/// the caller's body. Matches the design's `#262626`/`#393939` card chrome.
+fn dense_card<'a>(
+    title: &str,
+    body: Element<'a, crate::Message>,
+    width: Length,
+    palette: Palette,
+    sizes: &FontSize,
+) -> Element<'a, crate::Message> {
+    let header = container(
+        text(title.to_uppercase())
+            .size(TypeRole::Caption.size_in(*sizes))
+            .font(Font {
+                weight: Weight::Medium,
+                ..Font::DEFAULT
+            })
+            .colr(palette.text_muted.into_cosmic_color()),
+    )
+    .padding(Padding::from([8u16, 13u16]))
+    .width(Length::Fill);
+
+    let inner = column![header, hairline(palette), body].width(Length::Fill);
+
+    container(inner)
+        .width(width)
+        .style(move |_| container::Style {
+            snap: false,
+            icon_color: None,
+            background: Some(Background::Color(palette.surface.into_cosmic_color())),
+            border: Border {
+                color: palette.border.into_cosmic_color(),
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            shadow: Default::default(),
+            text_color: Some(palette.text.into_cosmic_color()),
+        })
+        .into()
+}
+
+/// The design's derived verdict pill: a roll-up of the live probe statuses
+/// (worst severity wins), with a count summary sub-line. Honest — computed
+/// from the real probes, not a static "READY".
+fn verdict_badge<'a>(
+    probes: &[ProbeResult],
+    palette: Palette,
+    sizes: &FontSize,
+    weights: &FontWeight,
+) -> Element<'a, crate::Message> {
+    let (mut ok, mut warn, mut fail) = (0u32, 0u32, 0u32);
+    for p in probes {
+        match p.status {
+            ProbeStatus::Ok => ok += 1,
+            ProbeStatus::Warn => warn += 1,
+            ProbeStatus::Fail => fail += 1,
+            ProbeStatus::Unknown => {}
+        }
+    }
+    let (word, color) = if probes.is_empty() {
+        ("—", palette.text_muted)
+    } else if fail > 0 {
+        ("ATTENTION", palette.danger)
+    } else if warn > 0 {
+        ("DEGRADED", palette.warning)
+    } else {
+        ("READY", palette.success)
+    };
+    let sub = if probes.is_empty() {
+        "not yet run".to_string()
+    } else {
+        format!("{ok} ok · {warn} warn · {fail} fail")
+    };
+    let badge_color = color.into_cosmic_color();
+    container(
         row![
-            icon_widget,
-            label,
-            Space::new().width(Length::Fill),
-            status_chip
+            mono_text(word, TypeRole::Body, sizes, weights).colr(badge_color),
+            text(sub)
+                .size(TypeRole::Caption.size_in(*sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
         ]
-        .spacing(10)
-        .align_y(cosmic::iced::alignment::Vertical::Center),
-        detail,
+        .spacing(9)
+        .align_y(alignment::Vertical::Center),
+    )
+    .padding(Padding::from([7u16, 14u16]))
+    .style(move |_| container::Style {
+        snap: false,
+        icon_color: None,
+        background: Some(Background::Color(palette.surface.into_cosmic_color())),
+        border: Border {
+            color: badge_color,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        shadow: Default::default(),
+        text_color: Some(badge_color),
+    })
+    .into()
+}
+
+/// One Doctor check row: status pip · title/detail (+ remediation) · status word.
+fn doctor_row<'a>(
+    p: &'a ProbeResult,
+    palette: Palette,
+    sizes: &FontSize,
+) -> Element<'a, crate::Message> {
+    let col = status_color(p.status, palette);
+    let mut detail_col = column![
+        text(p.name.clone())
+            .size(TypeRole::Body.size_in(*sizes))
+            .colr(palette.text.into_cosmic_color()),
+        text(p.detail.clone())
+            .size(TypeRole::Caption.size_in(*sizes))
+            .colr(palette.text_muted.into_cosmic_color()),
     ]
     .spacing(2);
     if let Some(rem) = &p.remediation {
-        col = col.push(
+        detail_col = detail_col.push(
             text(format!("→ {rem}"))
-                .size(11)
+                .size(TypeRole::Caption.size_in(*sizes))
                 .colr(palette.text_muted.into_cosmic_color()),
         );
     }
+    container(
+        row![
+            pip(status_rgba(p.status, palette)),
+            detail_col.width(Length::Fill),
+            text(p.status.label())
+                .size(TypeRole::Caption.size_in(*sizes))
+                .colr(col),
+        ]
+        .spacing(11)
+        .align_y(alignment::Vertical::Center),
+    )
+    .padding(Padding::from([10u16, 15u16]))
+    .width(Length::Fill)
+    .into()
+}
 
-    let bg = palette.raised.into_cosmic_color();
-    let border = palette.border.into_cosmic_color();
-    container(col)
-        .padding(Padding::from([12u16, 16u16]))
-        .width(Length::Fill)
-        .sty(move |_| container::Style {
-            snap: false,
-            background: Some(Background::Color(bg)),
-            border: Border {
-                color: border,
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..container::Style::default()
-        })
-        .into()
+/// One Netdata alarm row: severity word · node (mono) / message.
+fn alarm_row<'a>(
+    p: &'a ProbeResult,
+    palette: Palette,
+    sizes: &FontSize,
+    weights: &FontWeight,
+) -> Element<'a, crate::Message> {
+    let col = status_color(p.status, palette);
+    let node = p.name.strip_prefix("Netdata: ").unwrap_or(p.name.as_str());
+    container(
+        row![
+            text(p.status.label())
+                .size(TypeRole::Caption.size_in(*sizes))
+                .colr(col)
+                .width(Length::Fixed(62.0)),
+            column![
+                mono_text(node.to_string(), TypeRole::Caption, sizes, weights)
+                    .colr(palette.text.into_cosmic_color()),
+                text(p.detail.clone())
+                    .size(TypeRole::Caption.size_in(*sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+        ]
+        .spacing(10)
+        .align_y(alignment::Vertical::Top),
+    )
+    .padding(Padding::from([8u16, 13u16]))
+    .width(Length::Fill)
+    .into()
 }
 
 // ---- probes ---------------------------------------------------
