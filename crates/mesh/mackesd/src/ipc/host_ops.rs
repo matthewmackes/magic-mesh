@@ -61,11 +61,14 @@ impl HostOpsService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 6] = [
+pub const ACTION_VERBS: [&str; 8] = [
     "host-power",
     "gateway-reboot",
     "dr-backup",
     "gateway-status",
+    // DATACENTER-23 — CA-only DR backup + the guided control-plane rebirth.
+    "dr-ca-backup",
+    "dr-rebirth",
     // LIGHTHOUSE-6 — the Workbench Lighthouses tab's full-ops actions.
     "lighthouse-restart",
     "lighthouse-promote",
@@ -344,6 +347,117 @@ fn dr_backup(req_body: Option<&str>) -> Result<String, String> {
     }
 }
 
+/// Validate a DR-artifact path supplied on the wire. PURE.
+///
+/// Accepts a non-empty path of `[A-Za-z0-9._/-]` ending in `.age`, with no `..`
+/// component — so an operator can name any `dr-*.age` file (incl. an absolute
+/// path) but can never smuggle a shell metacharacter or a path-traversal segment.
+/// (The path is also passed as a bare `Command` arg, never through a shell, so
+/// this is defense-in-depth.)
+#[must_use]
+pub fn valid_dr_path(p: &str) -> bool {
+    if p.is_empty() || !p.ends_with(".age") {
+        return false;
+    }
+    if !p
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+    {
+        return false;
+    }
+    !p.split('/').any(|seg| seg == "..")
+}
+
+/// DATACENTER-23 — run the CA-only DR backup (confirm-gated): shells out to
+/// `automation/dr/dr-ca-backup.sh`, which age-encrypts just the Nebula CA to the
+/// mesh recipient and prints the artifact path. Requires `{"confirm":true}`.
+fn dr_ca_backup(req_body: Option<&str>) -> Result<String, String> {
+    let Some(body) = req_body else {
+        return Err("dr-ca-backup: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("dr-ca-backup: bad json: {e}"))?;
+    if req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("dr-ca-backup requires confirm:true".into());
+    }
+    let o = std::process::Command::new("bash")
+        .args(["-lc", "automation/dr/dr-ca-backup.sh"])
+        .output()
+        .map_err(|e| format!("dr-ca-backup: spawn failed: {e}"))?;
+    if o.status.success() {
+        let path = String::from_utf8_lossy(&o.stdout);
+        let path = path.trim();
+        if path.is_empty() {
+            Err("dr-ca-backup: produced no output path".into())
+        } else {
+            Ok(path.to_string())
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        let msg = stderr.trim();
+        if msg.is_empty() {
+            Err("dr-ca-backup failed".into())
+        } else {
+            Err(msg.to_string())
+        }
+    }
+}
+
+/// DATACENTER-23 — run the guided control-plane rebirth.
+///
+/// Body `{ "file": "<dr-*.age path>", "execute"?: bool, "confirm"?: bool }`.
+/// `file` MUST pass [`valid_dr_path`] (checked BEFORE any spawn). DEFAULT is a
+/// SAFE dry run (validate the manifest + print the plan, no writes). A live
+/// rebirth (`--execute`, which clobbers etcd + the on-disk CA) requires BOTH
+/// `execute:true` AND `confirm:true` — the double-gate for the destructive path.
+/// Returns the script's combined stderr/stdout plan/output.
+fn dr_rebirth(req_body: Option<&str>) -> Result<String, String> {
+    let Some(body) = req_body else {
+        return Err("dr-rebirth: missing request body".into());
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("dr-rebirth: bad json: {e}"))?;
+
+    let file = req
+        .get("file")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !valid_dr_path(file) {
+        return Err("file must be a .age path ([A-Za-z0-9._/-], no '..')".into());
+    }
+
+    let execute = req
+        .get("execute")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if execute && req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("dr-rebirth --execute requires confirm:true".into());
+    }
+
+    // Invoke the script with bare args (no shell) so the path can never be
+    // re-parsed; the dry run is the default and only --execute is destructive.
+    let mut cmd = std::process::Command::new("bash");
+    cmd.arg("automation/dr/dr-rebirth.sh").arg(file);
+    if execute {
+        cmd.arg("--execute");
+    }
+    let o = cmd
+        .output()
+        .map_err(|e| format!("dr-rebirth: spawn failed: {e}"))?;
+
+    // The script narrates the plan/result on stderr; surface it either way.
+    let mut out = String::from_utf8_lossy(&o.stdout).into_owned();
+    out.push_str(&String::from_utf8_lossy(&o.stderr));
+    let out = out.trim().to_string();
+    if o.status.success() {
+        Ok(out)
+    } else if out.is_empty() {
+        Err("dr-rebirth failed".into())
+    } else {
+        Err(out)
+    }
+}
+
 /// LIGHTHOUSE-6 — run a remote command on a mesh node over the mesh key,
 /// returning the process result. The lighthouse counterpart of [`ssh_xe_status`]
 /// (same arg style + `BatchMode`/`ConnectTimeout` hardening), generalized off the
@@ -570,6 +684,20 @@ pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> 
                 Err(m) => err(m),
             };
         }
+        // DATACENTER-23 — CA-only DR backup.
+        "dr-ca-backup" => {
+            return match dr_ca_backup(req_body) {
+                Ok(path) => json!({ "ok": true, "path": path }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        // DATACENTER-23 — guided control-plane rebirth (dry-run default).
+        "dr-rebirth" => {
+            return match dr_rebirth(req_body) {
+                Ok(output) => json!({ "ok": true, "output": output }).to_string(),
+                Err(m) => err(m),
+            };
+        }
         "gateway-status" => {
             return match gateway_status(req_body) {
                 Ok((leases, uptime, model)) => json!({
@@ -717,6 +845,8 @@ mod tests {
         assert_eq!(action_topic("host-power"), "action/dc/host-power");
         assert_eq!(action_topic("gateway-reboot"), "action/dc/gateway-reboot");
         assert_eq!(action_topic("dr-backup"), "action/dc/dr-backup");
+        assert_eq!(action_topic("dr-ca-backup"), "action/dc/dr-ca-backup");
+        assert_eq!(action_topic("dr-rebirth"), "action/dc/dr-rebirth");
         assert_eq!(action_topic("gateway-status"), "action/dc/gateway-status");
         assert_eq!(
             action_topic("lighthouse-restart"),
@@ -729,6 +859,8 @@ mod tests {
         assert!(ACTION_VERBS.contains(&"host-power"));
         assert!(ACTION_VERBS.contains(&"gateway-reboot"));
         assert!(ACTION_VERBS.contains(&"dr-backup"));
+        assert!(ACTION_VERBS.contains(&"dr-ca-backup"));
+        assert!(ACTION_VERBS.contains(&"dr-rebirth"));
         assert!(ACTION_VERBS.contains(&"gateway-status"));
         assert!(ACTION_VERBS.contains(&"lighthouse-restart"));
         assert!(ACTION_VERBS.contains(&"lighthouse-promote"));
@@ -908,6 +1040,76 @@ mod tests {
         let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
         let r = build_reply(&s, "dr-backup", None);
         assert!(r.contains("missing request body"), "{r}");
+    }
+
+    #[test]
+    fn dr_ca_backup_requires_confirm_true() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let r = build_reply(&s, "dr-ca-backup", Some(&json!({}).to_string()));
+        assert!(r.contains("dr-ca-backup requires confirm:true"), "{r}");
+        let r = build_reply(
+            &s,
+            "dr-ca-backup",
+            Some(&json!({ "confirm": false }).to_string()),
+        );
+        assert!(r.contains("dr-ca-backup requires confirm:true"), "{r}");
+    }
+
+    #[test]
+    fn dr_ca_backup_missing_body_errors() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        assert!(build_reply(&s, "dr-ca-backup", None).contains("missing request body"));
+    }
+
+    #[test]
+    fn valid_dr_path_accepts_age_files_and_rejects_injection() {
+        // valid absolute + relative .age paths
+        assert!(valid_dr_path(
+            "/root/mcnf-dr-backups/dr-20260628T000000Z.age"
+        ));
+        assert!(valid_dr_path("dr-ca-20260628T000000Z.age"));
+        // must end in .age
+        assert!(!valid_dr_path("/etc/passwd"));
+        assert!(!valid_dr_path("dr-backup"));
+        // no shell metachars / spaces
+        assert!(!valid_dr_path("dr.age; rm -rf /"));
+        assert!(!valid_dr_path("dr file.age"));
+        assert!(!valid_dr_path("$(whoami).age"));
+        assert!(!valid_dr_path("a`b`.age"));
+        // no path traversal
+        assert!(!valid_dr_path("../../etc/shadow.age"));
+        assert!(!valid_dr_path("a/../b.age"));
+        // empty
+        assert!(!valid_dr_path(""));
+    }
+
+    #[test]
+    fn dr_rebirth_rejects_bad_path_before_spawn() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        // injection / traversal / non-.age are all rejected at the guard.
+        for bad in ["/etc/passwd", "x.age; reboot", "../secret.age", ""] {
+            let body = json!({ "file": bad }).to_string();
+            let r = build_reply(&s, "dr-rebirth", Some(&body));
+            assert!(r.contains("file must be a .age path"), "{bad} -> {r}");
+        }
+    }
+
+    #[test]
+    fn dr_rebirth_execute_requires_confirm() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        // A valid path but execute without confirm → refused before any spawn.
+        let body = json!({ "file": "dr-20260628T000000Z.age", "execute": true }).to_string();
+        let r = build_reply(&s, "dr-rebirth", Some(&body));
+        assert!(
+            r.contains("dr-rebirth --execute requires confirm:true"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn dr_rebirth_missing_body_errors() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        assert!(build_reply(&s, "dr-rebirth", None).contains("missing request body"));
     }
 
     #[test]

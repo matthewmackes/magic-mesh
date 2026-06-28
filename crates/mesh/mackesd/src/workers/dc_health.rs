@@ -246,7 +246,10 @@ pub fn pool_status_from_enabled(enabled_csv: &str) -> (&'static str, usize, usiz
         return ("warn", 0, 0);
     }
     let total = fields.len();
-    let enabled = fields.iter().filter(|f| f.eq_ignore_ascii_case("true")).count();
+    let enabled = fields
+        .iter()
+        .filter(|f| f.eq_ignore_ascii_case("true"))
+        .count();
     if enabled == total {
         ("ok", enabled, total)
     } else {
@@ -482,8 +485,8 @@ fn probe_token(workgroup_root: &std::path::Path) -> Probe {
             continue;
         };
         pending += 1;
-        let age_days = i64::try_from(now_ms.saturating_sub(issued_ms) / 86_400_000)
-            .unwrap_or(i64::MAX);
+        let age_days =
+            i64::try_from(now_ms.saturating_sub(issued_ms) / 86_400_000).unwrap_or(i64::MAX);
         oldest_age_days = Some(oldest_age_days.map_or(age_days, |o| o.max(age_days)));
     }
     match oldest_age_days {
@@ -942,7 +945,10 @@ mod tests {
             Some(1_700_000_000_000)
         );
         // The record_issued sentinel (0) is a real, timestamp-less dangling token.
-        assert_eq!(parse_issued_at_ms(r#"{"issued_at_ms":0,"note":"recorded"}"#), Some(0));
+        assert_eq!(
+            parse_issued_at_ms(r#"{"issued_at_ms":0,"note":"recorded"}"#),
+            Some(0)
+        );
         // Garbage / missing field → None (skipped, not counted).
         assert_eq!(parse_issued_at_ms("not json"), None);
         assert_eq!(parse_issued_at_ms(r#"{"note":"x"}"#), None);
@@ -984,7 +990,10 @@ mod tests {
 
     #[test]
     fn logs_topic_formats_under_event_dc_logs() {
-        assert_eq!(logs_topic("dom0:172.20.0.9"), "event/dc/logs/dom0:172.20.0.9");
+        assert_eq!(
+            logs_topic("dom0:172.20.0.9"),
+            "event/dc/logs/dom0:172.20.0.9"
+        );
     }
 
     #[test]

@@ -9,6 +9,12 @@ the replicated etcd store:
   by `automation/secrets/mcnf-secret.sh`, so the manifest holds ciphertext.
 - `/mcnf/age-recipient` — the public recipient, carried so a restore can re-encrypt
   new secrets against the same identity.
+- the **Nebula CA** (`ca.crt` + `ca.key` from `${MCNF_CA_DIR:-/var/lib/mackesd/nebula-ca}`)
+  — DATACENTER-23, manifest `dr_backup_version: 2`. The CA is the **root of the
+  mesh's identity**; folding it into the same age manifest means one artifact +
+  the out-of-band age key re-founds the *same* Nebula (existing peer certs stay
+  valid). The CA private key is only ever written **age-encrypted** to the mesh
+  recipient, so the artifact at rest never exposes a usable CA key.
 
 `dr-backup.sh` pulls those three sources via the etcd v3 range API (read-only,
 base64 keys/values exactly like `mcnf-secret.sh`), assembles a JSON manifest, and
@@ -27,13 +33,48 @@ Output: `${MCNF_DR_DIR:-$HOME/mcnf-dr-backups}/dr-<UTC-timestamp>.age`
 (timestamp `YYYYMMDDTHHMMSSZ`). The file is `age` ciphertext — `head` shows the
 `age-encryption.org` header.
 
+## Off-fleet push
+
+So a LAN-wide loss can't take the only DR copy with it, the produced artifact is
+optionally pushed off-fleet:
+
+- `MCNF_DR_OFFFLEET` — an scp/rsync destination (e.g. `user@host:/backups/`);
+  `dr-backup.sh`/`dr-ca-backup.sh` prefer `rsync`, falling back to `scp`.
+- `MCNF_DR_OFFFLEET_CMD` — a generic escape hatch: a command run with the
+  artifact path appended (e.g. `rclone copyto`, `b2 upload-file my-bucket`).
+
+A push failure **warns but never fails the backup** — the local copy is kept.
+
 ## ⚠️ Separate-key-backup caveat
 
-The mesh age **identity** (private key, `${MCNF_AGE_KEY:-/root/.mcnf-age-key}`) and
-the **Nebula CA** are **NOT** in this backup and CANNOT be — the master key cannot
-live only inside the thing it decrypts. Without the age identity this backup is
-**undecryptable**. Back the age key and the Nebula CA up **SEPARATELY and
-securely** (offline / out-of-band). `dr-backup.sh` prints this reminder on every run.
+The mesh age **identity** (private key, `${MCNF_AGE_KEY:-/root/.mcnf-age-key}`) is
+**NOT** in this backup and CANNOT be — the master key cannot live only inside the
+thing it decrypts. Without the age identity the backup is **undecryptable**. Back
+the age key up **SEPARATELY and securely** (offline / out-of-band). With it, a
+single `dr-*.age` now restores the tofu state, the secrets, **and** the Nebula CA.
+`dr-backup.sh` prints this reminder on every run.
+
+## CA-only backup (separate-key discipline)
+
+`dr-ca-backup.sh` backs up **only** the Nebula CA, age-encrypted to the mesh
+recipient, on its own cadence / destination (ideally cold storage):
+
+```sh
+automation/dr/dr-ca-backup.sh           # → dr-ca-<ts>.age (exit 3 if not the CA holder)
+```
+
+## Rebirth (guided control-plane restore)
+
+`dr-rebirth.sh` brings the no-fixed-center control plane back from cold:
+**restore** etcd state → **re-found** the Nebula CA on disk → **re-elect** a
+leader (restart `mackesd`). **Safe by default** (dry run validates + prints the
+plan, writes nothing); `--execute` performs the rebirth and refuses if etcd is
+unreachable (never a half-clobber).
+
+```sh
+automation/dr/dr-rebirth.sh ~/mcnf-dr-backups/dr-<ts>.age            # dry run (plan only)
+automation/dr/dr-rebirth.sh ~/mcnf-dr-backups/dr-<ts>.age --execute  # DANGER: perform it
+```
 
 ## Backup
 
@@ -67,8 +108,13 @@ stored as), so production secrets are never written in plaintext.
 
 ## RPC
 
-`mackesd` exposes the backup over the Bus action layer:
+`mackesd` exposes the DR flows over the Bus action layer (`ipc/host_ops.rs`):
 
-- topic `action/dc/dr-backup`, request `{"confirm":true}` (confirm-gated),
-- runs `dr-backup.sh` from the repo root,
-- reply `{"ok":true,"path":"<dr-*.age path>"}` or `{"error":"..."}`.
+- `action/dc/dr-backup` `{"confirm":true}` → `{"ok":true,"path":"<dr-*.age>"}`.
+- `action/dc/dr-ca-backup` `{"confirm":true}` → CA-only backup path.
+- `action/dc/dr-rebirth` `{"file":"<dr-*.age>"}` → dry-run plan; add
+  `{"execute":true,"confirm":true}` to perform the live rebirth. `file` is
+  validated (`.age`, `[A-Za-z0-9._/-]`, no `..`) before any spawn.
+
+All `action/dc/*` verbs pass the DATACENTER-7 RBAC gate first (mutating DR verbs
+require the `operator` role).

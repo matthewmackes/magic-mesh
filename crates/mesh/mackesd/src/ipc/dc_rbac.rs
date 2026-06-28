@@ -77,27 +77,27 @@ pub enum Role {
 impl Role {
     /// May this role run a mutating verb? `Operator`/`Admin` yes, `Viewer` no.
     #[must_use]
-    pub fn can_mutate(self) -> bool {
-        matches!(self, Role::Operator | Role::Admin)
+    pub const fn can_mutate(self) -> bool {
+        matches!(self, Self::Operator | Self::Admin)
     }
 
     /// The wire/log token for this role.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            Role::Viewer => "viewer",
-            Role::Operator => "operator",
-            Role::Admin => "admin",
+            Self::Viewer => "viewer",
+            Self::Operator => "operator",
+            Self::Admin => "admin",
         }
     }
 
     /// Parse a role token (case-insensitive). PURE. `None` for an unknown token.
     #[must_use]
-    pub fn parse(s: &str) -> Option<Role> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "viewer" | "read" | "readonly" | "read-only" => Some(Role::Viewer),
-            "operator" | "op" | "all" => Some(Role::Operator),
-            "admin" => Some(Role::Admin),
+            "viewer" | "read" | "readonly" | "read-only" => Some(Self::Viewer),
+            "operator" | "op" | "all" => Some(Self::Operator),
+            "admin" => Some(Self::Admin),
             _ => None,
         }
     }
@@ -120,7 +120,7 @@ pub struct RoleMap {
 impl RoleMap {
     /// Build from explicit entries + a default role (used by tests + parsing).
     #[must_use]
-    pub fn new(entries: BTreeMap<String, Role>, default_role: Role) -> Self {
+    pub const fn new(entries: BTreeMap<String, Role>, default_role: Role) -> Self {
         Self {
             entries,
             default_role,
@@ -130,7 +130,7 @@ impl RoleMap {
     /// The transparent single-operator map: no entries, default `operator`. Every
     /// verb is allowed (the live solo-operator default when no policy is set).
     #[must_use]
-    pub fn open() -> Self {
+    pub const fn open() -> Self {
         Self {
             entries: BTreeMap::new(),
             default_role: Role::Operator,
@@ -191,9 +191,7 @@ impl RoleMap {
 
         // A configured policy defaults unlisted principals to `viewer` (read-only)
         // unless an explicit default is given.
-        let default_role = default_raw
-            .and_then(Role::parse)
-            .unwrap_or(Role::Viewer);
+        let default_role = default_raw.and_then(Role::parse).unwrap_or(Role::Viewer);
 
         Self {
             entries,
@@ -263,7 +261,8 @@ pub fn enforce(verb: &str, req_body: Option<&str>) -> Result<(), String> {
 /// `result:"denied"`, and the reason — so a denied attempt is provable, not just
 /// silently refused. Mirrors the other dc workers' Bus-publish lane shape.
 pub fn audit_denial(verb: &str, req_body: Option<&str>, reason: &str) {
-    let principal = principal_from_body(req_body).unwrap_or_else(|| "<unauthenticated>".to_string());
+    let principal =
+        principal_from_body(req_body).unwrap_or_else(|| "<unauthenticated>".to_string());
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -372,7 +371,10 @@ mod tests {
     fn parse_tolerates_separators_and_garbage_pairs() {
         // `;` entry sep, `:` role sep, a garbage pair (skipped), an unknown role
         // (skipped), whitespace.
-        let m = RoleMap::parse(" alice:operator ; junkpair ; eve:wizard ; bob = viewer ", None);
+        let m = RoleMap::parse(
+            " alice:operator ; junkpair ; eve:wizard ; bob = viewer ",
+            None,
+        );
         assert_eq!(m.role_for(Some("alice")), Role::Operator);
         assert_eq!(m.role_for(Some("bob")), Role::Viewer);
         // eve's role was unparseable → not inserted → falls to the default.
@@ -390,7 +392,10 @@ mod tests {
             principal_from_body(Some(&json!({ "principal": "" }).to_string())),
             None
         );
-        assert_eq!(principal_from_body(Some(&json!({ "uuid": "x" }).to_string())), None);
+        assert_eq!(
+            principal_from_body(Some(&json!({ "uuid": "x" }).to_string())),
+            None
+        );
         assert_eq!(principal_from_body(Some("not json")), None);
         assert_eq!(principal_from_body(None), None);
     }
@@ -466,7 +471,9 @@ mod tests {
         // The live default (no policy) allows every verb regardless of principal —
         // so the gate never breaks the solo operator.
         let m = RoleMap::open();
-        assert!(enforce_with_map(&m, "vm-delete", Some(&json!({ "uuid": "x" }).to_string())).is_ok());
+        assert!(
+            enforce_with_map(&m, "vm-delete", Some(&json!({ "uuid": "x" }).to_string())).is_ok()
+        );
         assert!(enforce_with_map(&m, "tofu-destroy", Some(&json!({}).to_string())).is_ok());
         assert!(enforce_with_map(&m, "vm-console", None).is_ok());
     }
