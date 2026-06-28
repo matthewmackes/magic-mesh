@@ -314,6 +314,13 @@ pub const DEFAULT_EVAL_INTERVAL: std::time::Duration = std::time::Duration::from
 /// incident") rather than hidden machine junk.
 pub const SYNTH_TITLE_PREFIX: &str = "[correlate] ";
 
+/// L1043 — the stable consumer identity this evaluator registers its read
+/// cursors under in the bus `consumer_cursors` registry. The retention TTL reap
+/// reads the slowest live cursor per topic and won't delete a source message
+/// newer than it, so an expired-but-unobserved correlation source survives until
+/// the evaluator has actually read it.
+pub const CONSUMER_ID: &str = "correlate";
+
 /// Lowercase CLI-arg form of a priority (matches the `mde-bus
 /// publish --priority` accepted values).
 const fn priority_arg(p: Priority) -> &'static str {
@@ -430,6 +437,21 @@ impl CorrelateEvaluator {
                     continue;
                 }
                 self.window.observe(&msg.topic, msg.ts_unix_ms);
+            }
+            // L1043 — register/heartbeat this evaluator's read cursor on the topic
+            // so the bus retention TTL reap won't delete a source message before
+            // the rules engine has observed it (a strand would drop correlation
+            // events). Best-effort + every tick, so the liveness heartbeat stays
+            // fresh while the daemon runs and falls stale promptly when it stops.
+            if let Some(cur) = self.cursors.get(&topic) {
+                if let Err(e) = persist.register_consumer_cursor(CONSUMER_ID, &topic, cur) {
+                    tracing::debug!(
+                        target: "mde_bus::correlate",
+                        %topic,
+                        error = %e,
+                        "register consumer cursor failed; retention guard skipped this tick"
+                    );
+                }
             }
         }
 
@@ -1056,6 +1078,32 @@ rules:
         assert_eq!(e.poll_once(&p, now).len(), 1);
         // Cursors now point past both messages; nothing new to read.
         assert!(e.poll_once(&p, now + 500).is_empty());
+    }
+
+    #[test]
+    fn poll_registers_live_consumer_cursor_for_retention_guard() {
+        // L1043 — the evaluator registers its read cursor in the bus
+        // `consumer_cursors` registry so the retention TTL reap won't strand a
+        // source message it hasn't observed yet. After a poll that reads `a`, the
+        // slowest live cursor on `a` must equal the latest ulid the evaluator read.
+        let now = 1_000_000_000_000_i64;
+        let (tmp, p) = persist_with(&[("a", None, now - 1_000), ("b", None, now - 1_000)]);
+        let mut e = CorrelateEvaluator::new(cfg_with(vec![eval_rule(
+            "ab",
+            &["a", "b"],
+            60,
+            "incident/ab",
+        )]));
+        e.poll_once(&p, now);
+        // The registry now carries a fresh cursor on each source topic.
+        let live_cutoff = now - crate::retention::DEFAULT_CURSOR_LIVENESS_SECS as i64 * 1000;
+        let cur_a = p.slowest_live_cursor("a", live_cutoff).unwrap();
+        let cur_b = p.slowest_live_cursor("b", live_cutoff).unwrap();
+        assert!(cur_a.is_some(), "source topic 'a' cursor registered");
+        assert!(cur_b.is_some(), "source topic 'b' cursor registered");
+        // It matches the latest ulid actually stored on the topic (fully caught up).
+        assert_eq!(cur_a, p.latest_ulid("a").unwrap());
+        drop(tmp);
     }
 
     #[test]

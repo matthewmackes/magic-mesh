@@ -122,6 +122,17 @@ pub const AUDIT_RUN_CAP_ENTRIES: usize = 20_000;
 /// 85% leaves enough slack that the prune lands before ENOSPC.
 pub const FS_PRESSURE_FILL_PCT: u64 = 85;
 
+/// L1043 — consumer-cursor liveness window. A registered consumer cursor only
+/// holds back the TTL reap while it is FRESH: a consumer whose heartbeat
+/// (`consumer_cursors.updated_unix_ms`) is older than this is treated as DEAD and
+/// ignored, so a crashed or departed consumer can never strand the spool forever
+/// (the inverse of the strand this guard prevents). 10 minutes comfortably covers
+/// the slow consumers' poll cadences — the correlate evaluator re-registers every
+/// 2 s tick — while bounding how long a dead cursor protects expired messages.
+/// The df-pressure emergency evictor ignores cursors entirely, so even a live
+/// cursor can never wedge a full `/run`.
+pub const DEFAULT_CURSOR_LIVENESS_SECS: u64 = 10 * 60;
+
 /// Default GC pass cadence. BUS-RUN-FULL-1 (2026-06-18): the old hourly pass let
 /// high-ingest nodes refill `/run` (tmpfs) from the quota cap to 100% between
 /// passes — a live .13 spool reached 389 MB (double the ~195 MB cap) and blocked
@@ -160,6 +171,11 @@ pub struct RetentionPolicy {
     /// their on-disk size, so a 0-byte/missing-file read can never stall the
     /// byte cap and let index rows grow unbounded. See [`AUDIT_RUN_CAP_ENTRIES`].
     pub audit_cap_entries: usize,
+    /// L1043 — consumer-cursor liveness window (seconds). The TTL reap refuses to
+    /// delete a message newer than the slowest LIVE consumer cursor on its topic;
+    /// a cursor whose heartbeat is older than this is dead and ignored. See
+    /// [`DEFAULT_CURSOR_LIVENESS_SECS`].
+    pub cursor_liveness_secs: u64,
 }
 
 impl Default for RetentionPolicy {
@@ -173,6 +189,7 @@ impl Default for RetentionPolicy {
             quota_hard_bytes: DEFAULT_QUOTA_HARD_BYTES,
             audit_cap_bytes: AUDIT_RUN_CAP_BYTES,
             audit_cap_entries: AUDIT_RUN_CAP_ENTRIES,
+            cursor_liveness_secs: DEFAULT_CURSOR_LIVENESS_SECS,
         }
     }
 }
@@ -367,8 +384,8 @@ pub fn fs_pressure_hard_cap(
     let used = fs_total_bytes.saturating_sub(fs_avail_bytes);
     // Integer-only fill check: used/total >= PCT/100  ⇔  used*100 >= total*PCT.
     // u128 so a multi-GB workstation tmpfs can't overflow the multiply.
-    let over = u128::from(used) * 100
-        >= u128::from(fs_total_bytes) * u128::from(FS_PRESSURE_FILL_PCT);
+    let over =
+        u128::from(used) * 100 >= u128::from(fs_total_bytes) * u128::from(FS_PRESSURE_FILL_PCT);
     if !over {
         return (configured_hard_bytes, false);
     }
@@ -424,6 +441,12 @@ fn open_index(bus_root: &Path) -> Result<Connection, RetentionError> {
         .map_err(|e| RetentionError::Sql(format!("open {}: {e}", p.display())))?;
     conn.busy_timeout(Duration::from_secs(5))
         .map_err(|e| RetentionError::Sql(format!("busy_timeout: {e}")))?;
+    // L1043 — the TTL reap below joins `consumer_cursors`; ensure that table (and
+    // the rest of the schema) exists even on the unusual path where retention
+    // opens the index before any `Persist::open` has. The DDL is idempotent
+    // (`CREATE … IF NOT EXISTS`), so this is a no-op once the broker is up.
+    conn.execute_batch(crate::persist::SCHEMA)
+        .map_err(|e| RetentionError::Sql(format!("schema: {e}")))?;
     Ok(conn)
 }
 
@@ -473,6 +496,20 @@ fn run_pass_at_inner(
     // though audit records are `min` priority); exclude them from the
     // victim query regardless of TTL.
     let audit_like = format!("{}%", crate::persist::AUDIT_TOPIC_PREFIX);
+    // L1043 — consumer-cursor safety. A message may be past its TTL yet still be
+    // UNREAD by the slowest live consumer; deleting it would strand that consumer
+    // (it would never see the message). So the victim selection additionally
+    // requires `ulid <= the slowest LIVE consumer cursor on the message's topic`:
+    // only messages the slowest live consumer has already consumed are TTL-reaped;
+    // its unread tail survives until it advances. The `COALESCE(…, m.ulid)` makes
+    // a topic with NO live cursor fall through to the plain TTL (`ulid <= ulid` is
+    // always true), so behavior is unchanged where no consumer is registered. A
+    // cursor counts as live only when its heartbeat is at/after `cursor_live_cutoff`
+    // (a crashed/departed consumer drops out and stops holding the spool). This
+    // guards ONLY the TTL reap — the df-pressure emergency evictor (below) ignores
+    // cursors, because a full `/run` is strictly worse than a stranded consumer.
+    let cursor_live_cutoff =
+        now_unix_ms - i64::try_from(policy.cursor_liveness_secs * 1000).unwrap_or(i64::MAX);
     let mut victims: Vec<(String, String)> = Vec::new(); // (ulid, file_path)
     for priority in ["min", "default", "high"] {
         let Some(cutoff) = ttl_cutoff_unix_ms(policy, priority, now_unix_ms) else {
@@ -480,14 +517,19 @@ fn run_pass_at_inner(
         };
         let mut stmt = conn
             .prepare(
-                "SELECT ulid, file_path FROM messages \
-                 WHERE priority = ?1 AND ts_unix_ms < ?2 AND topic NOT LIKE ?3",
+                "SELECT m.ulid, m.file_path FROM messages m \
+                 WHERE m.priority = ?1 AND m.ts_unix_ms < ?2 AND m.topic NOT LIKE ?3 \
+                   AND m.ulid <= COALESCE( \
+                       (SELECT MIN(c.cursor_ulid) FROM consumer_cursors c \
+                        WHERE c.topic = m.topic AND c.updated_unix_ms >= ?4), \
+                       m.ulid)",
             )
             .map_err(|e| RetentionError::Sql(format!("prepare: {e}")))?;
         let rows = stmt
-            .query_map(params![priority, cutoff, audit_like], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
+            .query_map(
+                params![priority, cutoff, audit_like, cursor_live_cutoff],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
             .map_err(|e| RetentionError::Sql(format!("query: {e}")))?;
         for r in rows {
             victims.push(r.map_err(|e| RetentionError::Sql(format!("decode: {e}")))?);
@@ -503,15 +545,22 @@ fn run_pass_at_inner(
     {
         let cutoff =
             now_unix_ms - i64::try_from(policy.ttl_ephemeral_secs * 1000).unwrap_or(i64::MAX);
+        // L1043 — the same consumer-cursor guard applies to ephemeral RPC topics:
+        // an in-flight `reply/<ulid>`/`action/*` a slow requester hasn't read yet
+        // must outlive its short TTL until that registered live consumer reads it.
         let mut stmt = conn
             .prepare(
-                "SELECT ulid, file_path FROM messages \
-                 WHERE (topic LIKE 'reply/%' OR topic LIKE 'action/%') \
-                   AND ts_unix_ms < ?1 AND topic NOT LIKE ?2",
+                "SELECT m.ulid, m.file_path FROM messages m \
+                 WHERE (m.topic LIKE 'reply/%' OR m.topic LIKE 'action/%') \
+                   AND m.ts_unix_ms < ?1 AND m.topic NOT LIKE ?2 \
+                   AND m.ulid <= COALESCE( \
+                       (SELECT MIN(c.cursor_ulid) FROM consumer_cursors c \
+                        WHERE c.topic = m.topic AND c.updated_unix_ms >= ?3), \
+                       m.ulid)",
             )
             .map_err(|e| RetentionError::Sql(format!("prepare ephemeral: {e}")))?;
         let rows = stmt
-            .query_map(params![cutoff, audit_like], |r| {
+            .query_map(params![cutoff, audit_like, cursor_live_cutoff], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })
             .map_err(|e| RetentionError::Sql(format!("query ephemeral: {e}")))?;
@@ -1147,7 +1196,11 @@ mod tests {
             .list_since("audit/peerx", None)
             .unwrap()
             .iter()
-            .map(|m| std::fs::metadata(root.join(&m.file_path)).map(|x| x.len()).unwrap_or(0))
+            .map(|m| {
+                std::fs::metadata(root.join(&m.file_path))
+                    .map(|x| x.len())
+                    .unwrap_or(0)
+            })
             .sum();
         assert!(
             audit_bytes <= policy.audit_cap_bytes + 256 * kb as u64,
@@ -1163,7 +1216,13 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let now = 1_000_000_000_000_i64;
         for i in 0..3 {
-            write_sized(&root, "audit/peerx", Priority::Min, now - i * 1000, 4 * 1024);
+            write_sized(
+                &root,
+                "audit/peerx",
+                Priority::Min,
+                now - i * 1000,
+                4 * 1024,
+            );
         }
         let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
         assert_eq!(report.audit_pruned, 0, "under-cap audit lane untouched");
@@ -1186,7 +1245,13 @@ mod tests {
         let root = tmp.path().to_path_buf();
         let now = 1_000_000_000_000_i64;
         for i in 0..10 {
-            write_sized(&root, "audit/peerx", Priority::Min, now - (10 - i) * 1000, 64);
+            write_sized(
+                &root,
+                "audit/peerx",
+                Priority::Min,
+                now - (10 - i) * 1000,
+                64,
+            );
         }
         let policy = RetentionPolicy {
             audit_cap_bytes: u64::MAX, // byte cap can never bind
@@ -1235,7 +1300,11 @@ mod tests {
             .into_iter()
             .map(|m| m.ulid)
             .collect();
-        assert_eq!(remaining.len(), 1, "exactly the newest record survives a 0 cap");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "exactly the newest record survives a 0 cap"
+        );
         assert!(
             remaining.contains(ulids.last().unwrap()),
             "the surviving record is the most-recent one"
@@ -1255,14 +1324,23 @@ mod tests {
         // ulid order. 256 KB each → ~2 MB; cap 1 MB keeps the newest few.
         let mut ulids = Vec::new();
         for _ in 0..8 {
-            ulids.push(write_sized(&root, "audit/peerx", Priority::Min, now, 256 * 1024));
+            ulids.push(write_sized(
+                &root,
+                "audit/peerx",
+                Priority::Min,
+                now,
+                256 * 1024,
+            ));
         }
         let policy = RetentionPolicy {
             audit_cap_bytes: 1024 * 1024,
             ..RetentionPolicy::default()
         };
         let report = run_pass_at(&policy, &root, now).unwrap();
-        assert!(report.audit_pruned >= 1, "over-cap lane pruned even under a ts tie");
+        assert!(
+            report.audit_pruned >= 1,
+            "over-cap lane pruned even under a ts tie"
+        );
         let p = Persist::open(root.clone()).unwrap();
         let remaining: std::collections::HashSet<String> = p
             .list_since("audit/peerx", None)
@@ -1728,7 +1806,10 @@ mod tests {
         let footprint = 40;
         let (cap, pressure) = fs_pressure_hard_cap(1000, footprint, total, avail);
         assert!(pressure, "at threshold: pressure trips");
-        assert_eq!(cap, footprint, "reclaim 0 at the trip point → cap == footprint");
+        assert_eq!(
+            cap, footprint,
+            "reclaim 0 at the trip point → cap == footprint"
+        );
     }
 
     #[test]
@@ -1757,7 +1838,10 @@ mod tests {
         // reclaim on a footprint far above the configured cap still clamps down.
         let (cap2, pressure2) = fs_pressure_hard_cap(30, 1000, 100, 10); // 90% full
         assert!(pressure2);
-        assert!(cap2 <= 30, "effective cap never exceeds configured, got {cap2}");
+        assert!(
+            cap2 <= 30,
+            "effective cap never exceeds configured, got {cap2}"
+        );
     }
 
     #[test]
@@ -1781,7 +1865,13 @@ mod tests {
         let mut ulids = Vec::new();
         for i in 0..6 {
             // Recent High messages → no TTL reap; only the dfguard can shed them.
-            ulids.push(write_sized(&root, "t/bulk", Priority::High, now - (6 - i) * 1000, mb));
+            ulids.push(write_sized(
+                &root,
+                "t/bulk",
+                Priority::High,
+                now - (6 - i) * 1000,
+                mb,
+            ));
         }
         purge_audit(&root);
         // Caps far above the ~6 MB spool+DB footprint, so the bus-only hard-cap
@@ -1808,7 +1898,10 @@ mod tests {
             .into_iter()
             .map(|m| m.ulid)
             .collect();
-        assert!(!remaining.contains(&ulids[0]), "oldest evicted under fs pressure");
+        assert!(
+            !remaining.contains(&ulids[0]),
+            "oldest evicted under fs pressure"
+        );
         assert!(remaining.contains(ulids.last().unwrap()), "newest survives");
     }
 
@@ -1846,7 +1939,10 @@ mod tests {
         // A 1 KB spool is far under the 144 MB default hard cap; only a genuinely
         // full filesystem could force eviction, which a tempdir-on-a-real-disk is
         // not, so nothing should be shed.
-        assert_eq!(report.evicted, 0, "tiny spool under default caps evicts nothing");
+        assert_eq!(
+            report.evicted, 0,
+            "tiny spool under default caps evicts nothing"
+        );
     }
 
     #[test]
@@ -1857,9 +1953,121 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         if let Some((total, avail)) = filesystem_total_avail_bytes(tmp.path()) {
             assert!(total > 0, "real filesystem reports a non-zero size");
-            assert!(avail <= total, "avail ({avail}) must not exceed total ({total})");
+            assert!(
+                avail <= total,
+                "avail ({avail}) must not exceed total ({total})"
+            );
         }
         // `None` (no `df`) is an acceptable degraded outcome — the guard then
         // falls back to the bus-only cap — so we don't fail the test on it.
+    }
+
+    #[test]
+    fn lagging_live_consumer_unread_messages_survive_ttl_reap() {
+        // L1043 — the decisive regression: a lagging-but-LIVE consumer's unread
+        // messages must survive a TTL reap, while everything it has already
+        // delivered (at/below its cursor) is reaped on schedule.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        let day_ago = now - (25 * 60 * 60 * 1000); // past the 24h `min` TTL
+                                                   // Three min-priority messages on one topic, all expired. Monotonic ULIDs
+                                                   // ⇒ u1 < u2 < u3 in write order.
+        let u1 = write_sized(&root, "fleet/sec", Priority::Min, day_ago, 64);
+        let u2 = write_sized(&root, "fleet/sec", Priority::Min, day_ago, 64);
+        let u3 = write_sized(&root, "fleet/sec", Priority::Min, day_ago, 64);
+        purge_audit(&root);
+
+        // A live consumer has only consumed up to u1; u2 + u3 are unread.
+        let p = Persist::open(root.clone()).unwrap();
+        p.register_consumer_cursor_at("correlate", "fleet/sec", &u1, now)
+            .unwrap();
+        drop(p);
+
+        let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
+        // Only the delivered u1 is reaped; the unread tail (u2, u3) survives its
+        // TTL because the slowest live cursor is still at u1.
+        assert_eq!(
+            report.removed, 1,
+            "only the delivered (≤cursor) message reaped"
+        );
+        let p = Persist::open(root.clone()).unwrap();
+        let remaining: Vec<String> = p
+            .list_since("fleet/sec", None)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.ulid)
+            .collect();
+        assert!(!remaining.contains(&u1), "delivered message reaped");
+        assert!(remaining.contains(&u2), "unread message survives the reap");
+        assert!(remaining.contains(&u3), "unread message survives the reap");
+
+        // The consumer catches up to u3 → the whole expired backlog is now
+        // reclaimable on the next pass.
+        p.register_consumer_cursor_at("correlate", "fleet/sec", &u3, now)
+            .unwrap();
+        drop(p);
+        let report2 = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
+        assert_eq!(
+            report2.removed, 2,
+            "the caught-up backlog (u2, u3) is reaped"
+        );
+        let p = Persist::open(root.clone()).unwrap();
+        assert!(
+            p.list_since("fleet/sec", None).unwrap().is_empty(),
+            "nothing left once the consumer has read everything"
+        );
+    }
+
+    #[test]
+    fn dead_consumer_cursor_does_not_strand_the_spool() {
+        // L1043 — the inverse strand: a cursor whose heartbeat has gone stale
+        // (a crashed/departed consumer) is treated as DEAD and must NOT hold
+        // expired messages forever — the plain TTL reap resumes.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        let day_ago = now - (25 * 60 * 60 * 1000);
+        let u1 = write_sized(&root, "fleet/sec", Priority::Min, day_ago, 64);
+        let u2 = write_sized(&root, "fleet/sec", Priority::Min, day_ago, 64);
+        purge_audit(&root);
+
+        // Cursor at u1, but last heartbeat is well outside the liveness window.
+        let stale = now - (DEFAULT_CURSOR_LIVENESS_SECS as i64 * 1000) - 1000;
+        let p = Persist::open(root.clone()).unwrap();
+        p.register_consumer_cursor_at("correlate", "fleet/sec", &u1, stale)
+            .unwrap();
+        // The dead cursor isn't returned as live.
+        assert_eq!(
+            p.slowest_live_cursor(
+                "fleet/sec",
+                now - DEFAULT_CURSOR_LIVENESS_SECS as i64 * 1000
+            )
+            .unwrap(),
+            None,
+            "a stale-heartbeat cursor is not live"
+        );
+        drop(p);
+
+        let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
+        // Both expired messages reaped — the dead cursor protects nothing.
+        assert_eq!(report.removed, 2, "dead cursor doesn't hold the spool");
+        let _ = (u1, u2);
+    }
+
+    #[test]
+    fn no_registered_consumer_reaps_on_plain_ttl() {
+        // L1043 — with no consumer registered at all, the guard is a no-op and
+        // the TTL reap behaves exactly as before (COALESCE falls through to the
+        // message's own ulid).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let now = 1_000_000_000_000_i64;
+        let day_ago = now - (25 * 60 * 60 * 1000);
+        write_sized(&root, "fleet/sec", Priority::Min, day_ago, 64);
+        write_sized(&root, "fleet/sec", Priority::Min, day_ago, 64);
+        purge_audit(&root);
+        let report = run_pass_at(&RetentionPolicy::default(), &root, now).unwrap();
+        assert_eq!(report.removed, 2, "no live cursor ⇒ plain TTL reap");
     }
 }
