@@ -3,7 +3,7 @@
 > **This is the development toolchain and build environment for the MCNF platform.**
 > It is canonical: read it before building, and **do not rediscover it**. If you
 > find something here is wrong or has drifted, fix *this file* (and the pointer in
-> `AI_GOVERNANCE.md §11`) rather than relearning it from scratch. Every item below
+> `AI_GOVERNANCE.md §10`) rather than relearning it from scratch. Every item below
 > was learned the hard way; the "Gotchas index" exists so no one repeats that.
 
 There are **two build surfaces**, both real and both supported:
@@ -12,7 +12,7 @@ There are **two build surfaces**, both real and both supported:
    workspace incl. the cosmic/iced GUI in ~seconds-to-a-minute. Best for tight
    edit→build→verify loops. **Caveat: gcc 11.5 rejects `mold`** → use the gold
    override (below).
-2. **The build farm** (two Fedora VMs, `172.20.0.50` / `.51`) — fully
+2. **The build farm** (three Fedora VMs across the three dom0s — real IPs `172.20.0.50` / `.90` / `.130`; the VM names `mcnf-build-50/51/52` are legacy and do **not** equal the IP octet, see §3) — fully
    OpenTofu/Ansible-managed (see "Build farm" §). Best for offloaded/parallel
    builds, the release gates, and RPM cuts. gcc 15 there, so `mold` works as-is.
 
@@ -106,7 +106,7 @@ user). Secrets are **off-repo** — see "Credentials" below.
 
 ## 4. The build farm (IaC-managed)
 
-The two build VMs are **declared as code** and built by OpenTofu through Xen
+The three build VMs are **declared as code** and built by OpenTofu through Xen
 Orchestra (XO drives XAPI, so the `xe`-over-ssh foot-guns are gone). This is the
 **DEVOPS-SUBSTRATE** Farm Automation Manager; the `install-helpers/*xcp*` /
 `farm.sh` bash scripts are the working stopgap underneath.
@@ -194,7 +194,7 @@ Another AI/operator can rebuild the whole thing from this repo:
 ---
 
 ## See also
-- [`AI_GOVERNANCE.md §11`](../AI_GOVERNANCE.md) — the directive pointing here.
+- [`AI_GOVERNANCE.md §10`](../AI_GOVERNANCE.md) — the directive pointing here.
 - [`CONTRIBUTING.md`](../CONTRIBUTING.md) — build prereqs, test rules, commit gates.
 - [`docs/farm.md`](farm.md) — farm architecture + dom0 recovery playbook.
 - [`infra/tofu/README.md`](../infra/tofu/README.md) · [`infra/ansible/README.md`](../infra/ansible/README.md) — the IaC.

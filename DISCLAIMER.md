@@ -4,7 +4,7 @@ MCNF is an open-source, secure, no-fixed-center **workgroup** platform: a
 small set of trusted machines (a household, a lab, a small team) joined into one
 encrypted Nebula overlay with replicated storage (Syncthing), peer-to-peer fleet
 automation (Ansible-on-each-node), and a Cosmic desktop. Its mission is to make a
-**production-grade private workgroup of up to eight peers** something one operator
+**production-grade private workgroup of up to 12 nodes (3 lighthouses + 9 peers)** something one operator
 can stand up, run, and recover — without a cloud control plane, a central server,
 or a fixed point of failure.
 
@@ -12,8 +12,10 @@ or a fixed point of failure.
 
 MCNF is **production workgroup-grade within a stated envelope**:
 
-- **Scale:** up to **8 peers** in one trust envelope (the §8 lock). Beyond that,
-  split into multiple workgroups.
+- **Scale:** up to **12 nodes — 3 lighthouses + 9 Headless/Full peers** — in one
+  trust envelope (the §8 lock, raised from the prior ≤8-peer / single-lighthouse cap
+  by the 2026-06-14 operator directive; `ca/sign.rs` `MAX_PEER_CAP` follows). Beyond
+  that, split into multiple workgroups.
 - **Trust model:** a **flat, open mesh** — every enrolled peer fully trusts every
   other peer at the network layer (one open Nebula firewall rule). Membership is
   gated by an Ed25519/Nebula cert issued at enrollment; revocation is immediate
@@ -29,7 +31,7 @@ MCNF is **production workgroup-grade within a stated envelope**:
 It is suitable for a trusted small workgroup running real services. It is **not** a
 hyperscale fleet manager, a zero-trust micro-segmentation product, a managed
 service, a compliance appliance, or a guaranteed-availability system, and it makes
-no SLA. Use beyond the ≤8-peer envelope, or in regulated / safety-critical /
+no SLA. Use beyond the 12-node (3 LH + 9 peer) envelope, or in regulated / safety-critical /
 life-critical settings, requires independent security, legal, and operational
 review.
 
@@ -38,7 +40,7 @@ review.
 The flat-trust design is a deliberate trade for simplicity and resilience at small
 scale. The accepted consequence: **any compromised or misbehaving peer can reach
 every other peer on every port inside the overlay.** The mesh contains the blast
-radius by (a) keeping the envelope small (≤8 peers you actually trust), (b) gating
+radius by (a) keeping the envelope small (≤12 nodes you actually trust), (b) gating
 membership on a per-node cert, (c) making revocation immediate and fleet-wide, and
 (d) keeping the underlay firewall tight so only the overlay is exposed. If you need
 peer-to-peer network isolation *within* the group, MCNF is not the right
