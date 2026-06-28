@@ -3,8 +3,8 @@
 //! Master-detail over `action/mesh/directory` (PD-1): peer list left
 //! — self pinned "(this machine)" first, then Online, Idle, Offline
 //! (grayed) groups — detail pane right with the identity header,
-//! presence + health, version + revision currency, and the Services
-//! Provided inventory (PD-2 descriptors: remote access, Podman
+//! presence + health, revision currency + voice presence, and the
+//! Services Provided inventory (PD-2 descriptors: remote access, Podman
 //! containers, libvirt guests, media). A type-to-filter box matches
 //! hostname or offered service (L2). Degraded mesh states render the
 //! guided empty states (L3): no mackesd → "Start the mesh service",
@@ -68,6 +68,22 @@ pub struct DeviceRow {
     pub name: String,
     pub online: bool,
     pub battery: Option<u8>,
+}
+
+/// UNIFY-16 — the LOCAL node's voice (SIP) presence, parsed from the
+/// `state/voice/status` snapshot the running `mde-voice-hud --agent` publishes
+/// to the Bus (VOIP-28). The topic is this node's own agent heartbeat — there
+/// is no per-peer voice in the directory — so it is rendered only for the self
+/// row; every other peer shows an honest "—" (never a fabricated value).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VoiceStatus {
+    /// The agent is registered with its SIP server.
+    pub registered: bool,
+    /// The agent is listening for inbound (P2P / registrar) calls.
+    pub listening: bool,
+    /// The heartbeat `ts` is within [`VOICE_STALE_SECS`] (the agent is live).
+    /// A stale snapshot means the agent stopped publishing (not running).
+    pub fresh: bool,
 }
 
 /// PEERS-DT — the sortable columns of the Carbon data table. Default sort is
@@ -176,6 +192,11 @@ pub struct PeersPanel {
     /// "empty mesh" guidance, so the multi-minute cold-boot warm-up doesn't look
     /// broken. Read from `state/boot-readiness` only when the roster is empty.
     pub boot_converging: bool,
+    /// UNIFY-16 — the LOCAL node's voice (SIP) presence, read from the
+    /// `state/voice/status` Bus snapshot alongside the directory. `None` until
+    /// the first read resolves, or when no voice agent has ever published (an
+    /// honest unknown). Rendered in the VOICE stat tile for the self row only.
+    pub voice: Option<VoiceStatus>,
 }
 
 /// PD-8 — the four L14 series, oldest→newest over the last ~60 s.
@@ -190,6 +211,10 @@ pub struct PeerMetrics {
 #[derive(Debug, Clone)]
 pub enum Message {
     Loaded(Result<Vec<PeerRow>, String>),
+    /// UNIFY-16 — the LOCAL node's voice (SIP) presence snapshot resolved
+    /// (read from `state/voice/status` alongside the directory). `None` = the
+    /// Bus is down or no agent has ever published (rendered as an honest "—").
+    VoiceLoaded(Option<VoiceStatus>),
     FilterChanged(String),
     Select(String),
     /// PEERS-DT — sort the table by a column (re-click toggles direction).
@@ -480,6 +505,44 @@ pub fn parse_devices(raw: &str) -> Vec<DeviceRow> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// UNIFY-16 — reader-side staleness window for the voice agent's
+/// `state/voice/status` heartbeat: a snapshot older than this means the agent
+/// stopped publishing (not running). A small multiple of the agent's
+/// `STATUS_HEARTBEAT_SECS` (15 s), matching the birthright/notify-center
+/// readers so the whole desktop agrees on "live vs dead agent".
+const VOICE_STALE_SECS: u64 = 45;
+
+/// UNIFY-16 — read the LOCAL node's latest `state/voice/status` snapshot
+/// (published by `mde-voice-hud --agent`, VOIP-28) from the Bus. `None` when
+/// the Bus is unavailable or no agent has ever published — the caller renders
+/// that as an honest "—", never a fabricated state. The parsed status carries
+/// a `fresh` flag (heartbeat within [`VOICE_STALE_SECS`]) so a dead agent reads
+/// honestly as offline rather than its last-registered value. Blocking — the
+/// Bus client must run inside `spawn_blocking`.
+#[must_use]
+pub fn read_voice_status() -> Option<VoiceStatus> {
+    let dir = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(dir).ok()?;
+    // Newest message on the topic = the last row (list_since orders ulid asc).
+    let last = persist.list_since("state/voice/status", None).ok()?.pop()?;
+    let v: serde_json::Value = serde_json::from_str(last.body.as_deref()?).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
+    Some(VoiceStatus {
+        registered: v
+            .get("registered")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        listening: v
+            .get("listening")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        fresh: now.saturating_sub(ts) <= VOICE_STALE_SECS,
+    })
 }
 
 /// Filter predicate (L2): hostname OR capability tag (L1) OR any
@@ -960,7 +1023,23 @@ impl PeersPanel {
             },
             |result| crate::Message::Peers(Message::Loaded(result)),
         );
-        Task::batch([directory, Self::fetch_devices()])
+        Task::batch([directory, Self::fetch_devices(), Self::fetch_voice()])
+    }
+
+    /// UNIFY-16 — read the LOCAL node's voice (SIP) presence snapshot from the
+    /// `state/voice/status` Bus topic, off-thread (the Bus client is blocking).
+    /// Resolves to `None` when no agent has published / the Bus is down, which
+    /// the VOICE tile renders as an honest "—" — never a fabricated state.
+    pub fn fetch_voice() -> Task<crate::Message> {
+        Task::perform(
+            async {
+                tokio::task::spawn_blocking(read_voice_status)
+                    .await
+                    .ok()
+                    .flatten()
+            },
+            |voice| crate::Message::Peers(Message::VoiceLoaded(voice)),
+        )
     }
 
     /// PD-3/L6 — query the KDC host's live roster over the Bus. A missing
@@ -1005,6 +1084,12 @@ impl PeersPanel {
                     }
                     Err(e) => self.loaded = Some(Err(e)),
                 }
+                Task::none()
+            }
+            Message::VoiceLoaded(voice) => {
+                // UNIFY-16 — the LOCAL node's voice presence (or `None` when no
+                // agent has published); rendered in the self row's VOICE tile.
+                self.voice = voice;
                 Task::none()
             }
             Message::FilterChanged(f) => {
@@ -1992,12 +2077,17 @@ impl PeersPanel {
             chips.into()
         };
 
-        // --- 4-up stat tiles (presence / health / revision / version) ---
-        let version = if r.version.is_empty() {
-            "—".to_string()
-        } else {
-            r.version.clone()
-        };
+        // --- 4-up stat tiles (presence / health / revision / voice) ---
+        // UNIFY-16 — the VOICE tile carries the LOCAL node's real SIP presence
+        // from the `state/voice/status` Bus snapshot (published by
+        // `mde-voice-hud --agent`). That topic is this node's own agent
+        // heartbeat — there is no per-peer voice in the directory — so only the
+        // self row shows a real value; every other peer renders an honest "—"
+        // (never a fabricated per-peer voice state).
+        let local_voice = (r.hostname == self.self_hostname)
+            .then_some(self.voice.as_ref())
+            .flatten();
+        let (voice_value, voice_dot) = voice_tile_state(local_voice);
         let tiles = row![
             stat_tile(
                 "PRESENCE",
@@ -2020,7 +2110,7 @@ impl PeersPanel {
                 palette,
                 sizes
             ),
-            stat_tile("VERSION", version, palette.accent, palette, sizes),
+            stat_tile("VOICE", voice_value, voice_dot, palette, sizes),
         ]
         .spacing(8);
 
@@ -3016,6 +3106,23 @@ fn lifecycle_color(state: &str) -> Rgba {
     }
 }
 
+/// UNIFY-16 — the local voice (SIP) presence → the VOICE stat tile's
+/// (value, dot), mirroring the sibling `*_color` Carbon-token ramp. `None` (a
+/// non-self peer, or no/never-published local agent) renders an honest "—" in
+/// the neutral token — never a fabricated voice state. A fresh snapshot maps
+/// registered + listening → "Registered" (green), listening-only → "Listening"
+/// (amber), neither → "Offline" (red); a stale heartbeat (the agent stopped
+/// publishing) → "Offline".
+fn voice_tile_state(voice: Option<&VoiceStatus>) -> (String, Rgba) {
+    match voice {
+        None => ("—".to_string(), carbon::GRAY_50),
+        Some(v) if !v.fresh => ("Offline".to_string(), carbon::RED_50),
+        Some(v) if v.registered && v.listening => ("Registered".to_string(), carbon::GREEN_40),
+        Some(v) if v.listening => ("Listening".to_string(), carbon::YELLOW_30),
+        Some(_) => ("Offline".to_string(), carbon::RED_50),
+    }
+}
+
 /// UNIFY-9 — the current (last) sample of a series, one decimal.
 fn fmt_last(series: &[f64]) -> String {
     format!("{:.1}", series.last().copied().unwrap_or(0.0))
@@ -3599,5 +3706,74 @@ mod tests {
         let _ = p.update(Message::Loaded(Err("mackesd unreachable".into())));
         assert!(matches!(&p.loaded, Some(Err(e)) if e.contains("unreachable")));
         let _ = p.view(); // renders the guided state without panic
+    }
+
+    #[test]
+    fn unify16_voice_tile_state_maps_the_real_statuses() {
+        // No snapshot (non-self peer, or no agent) → honest dash, neutral token.
+        assert_eq!(voice_tile_state(None), ("—".to_string(), carbon::GRAY_50));
+        // Fresh + registered + listening → Registered (green).
+        let reg = VoiceStatus {
+            registered: true,
+            listening: true,
+            fresh: true,
+        };
+        assert_eq!(
+            voice_tile_state(Some(&reg)),
+            ("Registered".to_string(), carbon::GREEN_40)
+        );
+        // Fresh, listening only → Listening (amber).
+        let listening = VoiceStatus {
+            registered: false,
+            listening: true,
+            fresh: true,
+        };
+        assert_eq!(
+            voice_tile_state(Some(&listening)),
+            ("Listening".to_string(), carbon::YELLOW_30)
+        );
+        // Fresh but neither → Offline (red).
+        let idle = VoiceStatus {
+            registered: false,
+            listening: false,
+            fresh: true,
+        };
+        assert_eq!(
+            voice_tile_state(Some(&idle)),
+            ("Offline".to_string(), carbon::RED_50)
+        );
+        // A stale heartbeat (agent stopped) is offline regardless of last state.
+        let stale = VoiceStatus {
+            registered: true,
+            listening: true,
+            fresh: false,
+        };
+        assert_eq!(
+            voice_tile_state(Some(&stale)),
+            ("Offline".to_string(), carbon::RED_50)
+        );
+    }
+
+    #[test]
+    fn unify16_voice_loaded_sets_the_local_presence() {
+        let mut p = PeersPanel::new();
+        assert!(p.voice.is_none());
+        let _ = p.update(Message::VoiceLoaded(Some(VoiceStatus {
+            registered: true,
+            listening: true,
+            fresh: true,
+        })));
+        assert_eq!(
+            p.voice,
+            Some(VoiceStatus {
+                registered: true,
+                listening: true,
+                fresh: true,
+            })
+        );
+        // `peer_detail_body` passes `Some(voice)` for the self row and `None`
+        // for every other peer: the self row shows the real value, others "—".
+        assert_eq!(voice_tile_state(p.voice.as_ref()).0, "Registered");
+        assert_eq!(voice_tile_state(None).0, "—");
     }
 }
