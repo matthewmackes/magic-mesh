@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  ::-webkit-scrollbar{width:10px;height:10px;}
+  ::-webkit-scrollbar-thumb{background:#525252;}
+  ::-webkit-scrollbar-track{background:#161616;}
+  @keyframes beamSweep{to{transform:rotate(360deg);}}
+  @keyframes flow{to{stroke-dashoffset:-16;}}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:.35;}}
+  @keyframes marquee{from{transform:translateX(0);}to{transform:translateX(-100%);}}
+  @keyframes blink{0%,100%{opacity:1;}50%{opacity:.2;}}
+</style>
+</helmet>
+<div style="display:flex;flex-direction:column;height:100vh;width:100%;background:#161616;color:#f4f4f4;font-family:Roboto,system-ui,sans-serif;font-size:13px;overflow:hidden;">
+
+  <!-- GLOBAL STATUS STRIP -->
+  <div style="flex:none;height:26px;display:flex;align-items:stretch;background:#0a0a0a;border-bottom:1px solid #393939;font-family:'Roboto Mono';font-size:11px;">
+    <div style="display:flex;align-items:center;gap:7px;padding:0 11px;border-right:1px solid #262626;color:#c6c6c6;"><span style="color:#0f62fe;">◆</span>mcnf-eyrie<span style="color:#525252;">/8</span></div>
+    <div style="display:flex;align-items:center;gap:13px;padding:0 12px;border-right:1px solid #262626;">
+      <span style="color:#fa4d56;">● CRIT {{ sb.crit }}</span><span style="color:#f1c21b;">● WARN {{ sb.warn }}</span><span style="color:#42be65;">● OK {{ sb.ok }}</span>
+    </div>
+    <div style="flex:1;overflow:hidden;display:flex;align-items:center;position:relative;min-width:0;">
+      <div style="display:flex;gap:46px;white-space:nowrap;color:#8d8d8d;padding-left:100%;animation:marquee 42s linear infinite;">
+        <sc-for list="{{ sb.ticker }}" as="t" hint-placeholder-count="6"><span><span style="color:{{ t.col }};">{{ t.tag }}</span> {{ t.m }}</span></sc-for>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px;padding:0 12px;border-left:1px solid #262626;color:#8d8d8d;">POSTURE <span style="color:#f1c21b;font-weight:500;">GUARDED</span></div>
+    <div style="display:flex;align-items:center;gap:6px;padding:0 12px;border-left:1px solid #262626;color:#8d8d8d;">UPTIME <span style="color:#c6c6c6;">74d</span></div>
+    <div style="display:flex;align-items:center;gap:9px;padding:0 12px;border-left:1px solid #262626;color:#8d8d8d;"><span>{{ sb.date }}</span><span style="color:#f4f4f4;">{{ sb.clock }}</span></div>
+  </div>
+
+  <div style="flex:1;display:flex;min-height:0;">
+  <aside style="width:230px;flex:none;background:#262626;border-right:1px solid #393939;display:flex;flex-direction:column;">
+    <div style="display:flex;align-items:center;gap:10px;padding:15px 16px;border-bottom:1px solid #393939;">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="4" r="2.4" fill="#0f62fe"/><circle cx="4" cy="18" r="2.4" fill="#3ddbd9"/><circle cx="20" cy="18" r="2.4" fill="#42be65"/><circle cx="12" cy="13" r="2" fill="#f4f4f4"/><path d="M12 6.2v4.6M11 12 5 16.4M13 12l6 4.4" stroke="#525252" stroke-width="1.2"/></svg>
+      <div style="line-height:1.1;"><div style="font-weight:500;letter-spacing:.5px;font-size:15px;">MCNF</div><div style="font-size:10px;color:#8d8d8d;letter-spacing:.6px;text-transform:uppercase;">Workbench</div></div>
+    </div>
+    <nav style="flex:1;overflow-y:auto;padding:6px 0;">
+      <sc-for list="{{ navGroups }}" as="g" hint-placeholder-count="8">
+        <div onClick="{{ g.toggle }}" style="{{ g.hdrStyle }}"><span>{{ g.label }}</span><span style="font-size:14px;color:#6f6f6f;">{{ g.chevron }}</span></div>
+        <sc-if value="{{ g.open }}" hint-placeholder-val="{{ true }}">
+          <sc-for list="{{ g.items }}" as="p" hint-placeholder-count="3">
+            <div onClick="{{ p.select }}" style="{{ p.style }}" style-hover="background:#2f2f2f;"><span style="{{ p.dotStyle }}"></span>{{ p.label }}</div>
+          </sc-for>
+        </sc-if>
+      </sc-for>
+    </nav>
+    <div style="padding:11px 16px;border-top:1px solid #393939;display:flex;align-items:center;gap:9px;">
+      <span style="width:8px;height:8px;border-radius:50%;background:#3ddbd9;flex:none;"></span>
+      <div style="line-height:1.2;"><div style="font-size:12px;">oak <span style="color:#8d8d8d;">(this node)</span></div><div style="font-size:10px;color:#8d8d8d;">Workstation · 10.10.0.10</div></div>
+    </div>
+  </aside>
+
+  <main style="flex:1;display:flex;flex-direction:column;min-width:0;">
+    <header style="flex:none;height:38px;display:flex;align-items:center;gap:14px;padding:0 14px;background:#161616;border-bottom:1px solid #393939;">
+      <div style="font-family:'Roboto Mono';font-size:12px;color:#c6c6c6;letter-spacing:.2px;white-space:nowrap;">{{ crumb }}</div>
+      <div style="flex:1;display:flex;justify-content:center;">
+        <div style="display:flex;align-items:center;gap:8px;width:320px;max-width:40vw;padding:4px 10px;background:#262626;border:1px solid #393939;color:#8d8d8d;">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="4.5" stroke="#8d8d8d" stroke-width="1.3"/><path d="M10.5 10.5 14 14" stroke="#8d8d8d" stroke-width="1.3"/></svg>
+          <span style="font-size:11px;font-family:'Roboto Mono';">search · peers, services, panels…</span>
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;font-size:12px;font-family:'Roboto Mono';"><span style="width:7px;height:7px;border-radius:50%;background:#42be65;"></span><span>{{ onlineCount }}/{{ totalCount }} up</span></div>
+      <div style="width:1px;height:16px;background:#393939;"></div>
+      <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:#c6c6c6;font-family:'Roboto Mono';"><svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="M8 1.5 13.5 4v4c0 3.2-2.4 5.5-5.5 6.5C4.9 13.5 2.5 11.2 2.5 8V4L8 1.5Z" stroke="#42be65" stroke-width="1.2"/></svg>chain ok</div>
+      <div style="width:1px;height:16px;background:#393939;"></div>
+      <div onClick="{{ toggleRail }}" style="{{ railToggleStyle }}">{{ railToggleLabel }}</div>
+    </header>
+
+    <div style="flex:1;display:flex;min-height:0;">
+    <section style="flex:1;overflow:auto;background:#161616;min-width:0;">
+
+      <!-- OVERVIEW -->
+      <sc-if value="{{ isOverview }}" hint-placeholder-val="{{ true }}">
+      <div data-screen-label="Overview" style="padding:12px 15px;">
+        <div style="display:flex;align-items:flex-end;gap:14px;margin-bottom:12px;">
+          <div><div style="font-size:18px;font-weight:500;letter-spacing:-.3px;">Mesh Overview</div><div style="font-size:12px;color:#8d8d8d;margin-top:3px;">no-fixed-center workgroup · 8 peers · Nebula overlay 10.10.0.0/16</div></div>
+          <div style="margin-left:auto;display:flex;align-items:center;gap:9px;padding:7px 14px;background:#262626;border:1px solid #393939;border-left:3px solid #42be65;"><span style="width:9px;height:9px;border-radius:50%;background:#42be65;"></span><span style="font-size:13px;font-weight:500;">Mesh healthy</span><span style="font-size:12px;color:#8d8d8d;">· converged on r-2291</span></div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:1px;background:#393939;border:1px solid #393939;margin-bottom:11px;">
+          <sc-for list="{{ kpis }}" as="k" hint-placeholder-count="6">
+            <div style="background:#262626;padding:10px 13px;">
+              <div style="font:500 11px Roboto;letter-spacing:.4px;color:#8d8d8d;">{{ k.label }}</div>
+              <div style="display:flex;align-items:baseline;gap:5px;margin:7px 0 5px;"><span style="font-size:22px;font-weight:500;color:{{ k.col }};line-height:1;">{{ k.value }}</span><span style="font-size:12px;color:#8d8d8d;">{{ k.unit }}</span></div>
+              <div style="font-size:11px;color:#8d8d8d;line-height:1.35;">{{ k.sub }}</div>
+            </div>
+          </sc-for>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1.3fr 1fr;gap:11px;">
+          <div style="display:flex;flex-direction:column;gap:11px;">
+            <div style="background:#262626;border:1px solid #393939;">
+              <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 13px;border-bottom:1px solid #393939;"><span style="font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Service Matrix</span><span style="font-size:11px;color:#8d8d8d;">node × service</span></div>
+              <div style="padding:12px 15px;overflow:auto;">
+                <div style="display:grid;grid-template-columns:96px repeat(9,1fr);gap:6px;align-items:center;">
+                  <div></div>
+                  <sc-for list="{{ matrix.cols }}" as="c" hint-placeholder-count="9"><div style="font:500 10px 'Roboto Mono';color:#8d8d8d;text-align:center;">{{ c }}</div></sc-for>
+                </div>
+                <sc-for list="{{ matrix.rows }}" as="r" hint-placeholder-count="8">
+                  <div style="display:grid;grid-template-columns:96px repeat(9,1fr);gap:6px;align-items:center;margin-top:7px;">
+                    <div style="font:400 12px 'Roboto Mono';color:#c6c6c6;display:flex;align-items:center;gap:5px;"><span style="width:5px;height:5px;border-radius:50%;background:#3ddbd9;opacity:{{ r.self }};"></span>{{ r.host }}</div>
+                    <sc-for list="{{ r.cells }}" as="cell" hint-placeholder-count="9"><div style="display:flex;justify-content:center;"><span style="{{ cell.style }}"></span></div></sc-for>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+
+            <div style="background:#262626;border:1px solid #393939;">
+              <div style="padding:8px 13px;border-bottom:1px solid #393939;font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Lighthouses</div>
+              <div style="display:flex;gap:14px;padding:10px 13px;">
+                <sc-for list="{{ beacons }}" as="b" hint-placeholder-count="2">
+                  <div style="flex:1;display:flex;align-items:center;gap:13px;padding:12px;background:#161616;border:1px solid #393939;">
+                    <div style="position:relative;width:46px;height:46px;flex:none;"><div style="{{ b.beamStyle }}"></div><div style="{{ b.coreStyle }}"></div></div>
+                    <div style="line-height:1.4;"><div style="font-weight:500;font-size:14px;">{{ b.name }}</div><div style="font-family:'Roboto Mono';font-size:11px;color:#8d8d8d;">{{ b.ip }} · {{ b.pub }}</div><div style="font:500 10px Roboto;letter-spacing:.4px;color:#42be65;margin-top:2px;">{{ b.word }}</div></div>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:11px;">
+            <div style="background:#262626;border:1px solid #393939;">
+              <div style="padding:8px 13px;border-bottom:1px solid #393939;font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Fleet Convergence</div>
+              <div style="padding:10px 13px;">
+                <div style="display:flex;align-items:baseline;gap:8px;"><span style="font-family:'Roboto Mono';font-size:18px;font-weight:500;">{{ rev.head }}</span><span style="font-size:11px;color:#8d8d8d;">authored by {{ rev.author }} · {{ rev.when }}</span></div>
+                <div style="margin:11px 0 7px;height:6px;background:#161616;border:1px solid #393939;display:flex;"><div style="width:87.5%;background:#42be65;"></div></div>
+                <div style="font-size:12px;color:#c6c6c6;">{{ rev.converged }} / {{ rev.total }} peers converged</div>
+                <div style="font-size:11px;color:#8d8d8d;margin-top:4px;">{{ rev.note }}</div>
+              </div>
+            </div>
+            <div style="background:#262626;border:1px solid #393939;flex:1;">
+              <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 13px;border-bottom:1px solid #393939;"><span style="font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Audit Trail</span><span style="font-size:11px;color:#8d8d8d;">hash-chained · 72h</span></div>
+              <div>
+                <sc-for list="{{ audit }}" as="a" hint-placeholder-count="6">
+                  <div style="display:flex;gap:11px;padding:9px 15px;border-bottom:1px solid #1f1f1f;">
+                    <span style="font-family:'Roboto Mono';font-size:11px;color:#8d8d8d;flex:none;">{{ a.t }}</span>
+                    <span style="font:500 9px Roboto;letter-spacing:.5px;text-transform:uppercase;color:{{ a.sev }};flex:none;width:54px;padding-top:1px;">{{ a.k }}</span>
+                    <span style="font-size:12px;color:#c6c6c6;line-height:1.35;">{{ a.m }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      </sc-if>
+
+      <!-- PEERS -->
+      <sc-if value="{{ isPeers }}" hint-placeholder-val="{{ true }}">
+      <div data-screen-label="Peers" style="display:flex;height:100%;min-width:700px;">
+        <div style="width:262px;flex:none;border-right:1px solid #393939;display:flex;flex-direction:column;background:#161616;">
+          <div style="padding:11px 13px;border-bottom:1px solid #393939;">
+            <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:#262626;border:1px solid #393939;">
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="4.5" stroke="#8d8d8d" stroke-width="1.3"/><path d="M10.5 10.5 14 14" stroke="#8d8d8d" stroke-width="1.3"/></svg>
+              <input value="{{ filter }}" onInput="{{ setFilter }}" placeholder="Filter by host, role, tag…" style="flex:1;background:transparent;border:none;outline:none;color:#f4f4f4;font:400 12px Roboto;"/>
+            </div>
+          </div>
+          <div style="flex:1;overflow-y:auto;">
+            <sc-for list="{{ peerGroups }}" as="grp" hint-placeholder-count="4">
+              <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 14px 5px;font:500 10px Roboto;letter-spacing:.5px;text-transform:uppercase;color:#8d8d8d;"><span>{{ grp.title }}</span><span>{{ grp.count }}</span></div>
+              <sc-for list="{{ grp.items }}" as="p" hint-placeholder-count="3">
+                <div onClick="{{ p.select }}" style="{{ p.rowStyle }}" style-hover="background:#1f1f1f;">
+                  <span style="{{ p.dotStyle }}"></span>
+                  <div style="line-height:1.25;min-width:0;"><div style="font-size:13px;">{{ p.host }}</div><div style="font-size:11px;color:#8d8d8d;font-family:'Roboto Mono';">{{ p.sub }}</div></div>
+                </div>
+              </sc-for>
+            </sc-for>
+          </div>
+        </div>
+
+        <div style="flex:1;display:flex;flex-direction:column;min-width:0;">
+          <div style="display:flex;align-items:center;gap:10px;padding:11px 16px;border-bottom:1px solid #393939;">
+            <span style="font-size:15px;font-weight:500;">{{ sel.host }}</span>
+            <span style="font-size:12px;color:{{ sel.roleCol }};">{{ sel.role }}</span>
+            <div style="margin-left:auto;display:flex;">
+              <div onClick="{{ setListView }}" style="{{ viewListStyle }}">List</div>
+              <div onClick="{{ setMapView }}" style="{{ viewMapStyle }}">Live map</div>
+            </div>
+          </div>
+
+          <sc-if value="{{ showList }}" hint-placeholder-val="{{ true }}">
+          <div style="flex:1;overflow-y:auto;padding:16px;">
+            <div style="display:flex;flex-wrap:wrap;gap:7px;margin-bottom:10px;">
+              <sc-for list="{{ sel.actions }}" as="a" hint-placeholder-count="6"><div onClick="{{ a.click }}" style="{{ a.style }}">{{ a.label }}</div></sc-for>
+            </div>
+            <sc-if value="{{ result }}"><div style="margin-bottom:10px;padding:8px 12px;background:#262626;border-left:3px solid #0f62fe;font-family:'Roboto Mono';font-size:12px;color:#c6c6c6;">{{ result }}</div></sc-if>
+
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:#393939;border:1px solid #393939;margin-bottom:11px;">
+              <div style="background:#262626;padding:11px 13px;"><div style="font:500 10px Roboto;letter-spacing:.4px;color:#8d8d8d;">PRESENCE</div><div style="display:flex;align-items:center;gap:7px;margin-top:6px;"><span style="width:8px;height:8px;border-radius:50%;{{ sel.presDot }}"></span><span style="font-size:13px;text-transform:capitalize;">{{ sel.presence }}</span></div></div>
+              <div style="background:#262626;padding:11px 13px;"><div style="font:500 10px Roboto;letter-spacing:.4px;color:#8d8d8d;">VOICE</div><div style="display:flex;align-items:center;gap:7px;margin-top:6px;"><span style="width:8px;height:8px;border-radius:50%;{{ sel.voiceDot }}"></span><span style="font-size:13px;">{{ sel.voice }}</span></div></div>
+              <div style="background:#262626;padding:11px 13px;"><div style="font:500 10px Roboto;letter-spacing:.4px;color:#8d8d8d;">REVISION</div><div style="display:flex;align-items:center;gap:7px;margin-top:6px;"><span style="width:8px;height:8px;border-radius:50%;background:{{ sel.syncCol }};"></span><span style="font-size:13px;">{{ sel.sync }}</span></div></div>
+              <div style="background:#262626;padding:11px 13px;"><div style="font:500 10px Roboto;letter-spacing:.4px;color:#8d8d8d;">HEALTH</div><div style="display:flex;align-items:center;gap:7px;margin-top:6px;"><span style="width:8px;height:8px;border-radius:50%;{{ sel.healthDot }}"></span><span style="font-size:13px;text-transform:capitalize;">{{ sel.health }}</span></div></div>
+            </div>
+
+            <sc-if value="{{ sel.hasSpark }}">
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:11px;">
+              <div style="background:#262626;border:1px solid #393939;padding:11px 13px;"><div style="display:flex;justify-content:space-between;"><span style="font:500 10px Roboto;letter-spacing:.4px;color:#8d8d8d;">CPU</span><span style="font-family:'Roboto Mono';font-size:12px;">{{ sel.cpuV }}</span></div><svg viewBox="0 0 120 30" preserveAspectRatio="none" style="width:100%;height:30px;margin-top:6px;"><polyline points="{{ sel.sparkCpu }}" fill="none" stroke="#4589ff" stroke-width="1.5"/></svg></div>
+              <div style="background:#262626;border:1px solid #393939;padding:11px 13px;"><div style="display:flex;justify-content:space-between;"><span style="font:500 10px Roboto;letter-spacing:.4px;color:#8d8d8d;">NET</span><span style="font-family:'Roboto Mono';font-size:12px;">{{ sel.netV }}</span></div><svg viewBox="0 0 120 30" preserveAspectRatio="none" style="width:100%;height:30px;margin-top:6px;"><polyline points="{{ sel.sparkNet }}" fill="none" stroke="#42be65" stroke-width="1.5"/></svg></div>
+              <div style="background:#262626;border:1px solid #393939;padding:11px 13px;"><div style="display:flex;justify-content:space-between;"><span style="font:500 10px Roboto;letter-spacing:.4px;color:#8d8d8d;">LOAD</span><span style="font-family:'Roboto Mono';font-size:12px;">{{ sel.loadV }}</span></div><svg viewBox="0 0 120 30" preserveAspectRatio="none" style="width:100%;height:30px;margin-top:6px;"><polyline points="{{ sel.sparkLoad }}" fill="none" stroke="#f1c21b" stroke-width="1.5"/></svg></div>
+              <div style="background:#262626;border:1px solid #393939;padding:11px 13px;"><div style="display:flex;justify-content:space-between;"><span style="font:500 10px Roboto;letter-spacing:.4px;color:#8d8d8d;">DISK</span><span style="font-family:'Roboto Mono';font-size:12px;">{{ sel.diskV }}</span></div><svg viewBox="0 0 120 30" preserveAspectRatio="none" style="width:100%;height:30px;margin-top:6px;"><polyline points="{{ sel.sparkDisk }}" fill="none" stroke="#8d8d8d" stroke-width="1.5"/></svg></div>
+            </div>
+            </sc-if>
+
+            <div style="font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;margin-bottom:9px;">Services Provided</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+              <div style="background:#262626;border:1px solid #393939;padding:12px 13px;">
+                <div style="font:500 11px Roboto;color:#8d8d8d;margin-bottom:8px;">Podman</div>
+                <sc-if value="{{ sel.hasContainers }}" hint-placeholder-val="{{ true }}">
+                  <sc-for list="{{ sel.containers }}" as="ct" hint-placeholder-count="2">
+                    <div style="display:flex;align-items:center;gap:9px;padding:6px 0;border-top:1px solid #1f1f1f;">
+                      <span style="width:7px;height:7px;border-radius:50%;{{ ct.dot }};flex:none;"></span>
+                      <div style="min-width:0;flex:1;"><div style="font-size:12px;font-family:'Roboto Mono';">{{ ct.name }}</div><div style="font-size:10px;color:#8d8d8d;font-family:'Roboto Mono';">{{ ct.image }} · :{{ ct.ports }}</div></div>
+                      <div onClick="{{ ct.stop }}" style="{{ ct.actStyle }}">Stop</div>
+                    </div>
+                  </sc-for>
+                </sc-if>
+                <sc-if value="{{ sel.hasContainers }}" hint-placeholder-val="{{ false }}"></sc-if>
+              </div>
+              <div style="background:#262626;border:1px solid #393939;padding:12px 13px;">
+                <div style="font:500 11px Roboto;color:#8d8d8d;margin-bottom:8px;">KVM Guests</div>
+                <sc-for list="{{ sel.guests }}" as="gs" hint-placeholder-count="1">
+                  <div style="display:flex;align-items:center;gap:9px;padding:6px 0;border-top:1px solid #1f1f1f;">
+                    <span style="width:7px;height:7px;border-radius:50%;{{ gs.dot }};flex:none;"></span>
+                    <div style="min-width:0;flex:1;"><div style="font-size:12px;font-family:'Roboto Mono';">{{ gs.name }}</div><div style="font-size:10px;color:#8d8d8d;font-family:'Roboto Mono';">{{ gs.spec }}</div></div>
+                    <span style="font-size:10px;color:#8d8d8d;text-transform:capitalize;">{{ gs.state }}</span>
+                  </div>
+                </sc-for>
+                <div style="font:500 11px Roboto;color:#8d8d8d;margin:12px 0 6px;">Media</div>
+                <sc-for list="{{ sel.media }}" as="md" hint-placeholder-count="1">
+                  <div style="display:flex;justify-content:space-between;padding:5px 0;border-top:1px solid #1f1f1f;font-size:12px;font-family:'Roboto Mono';"><span>{{ md.name }}</span><span style="color:#8d8d8d;">:{{ md.port }}</span></div>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+          </sc-if>
+
+          <sc-if value="{{ showMap }}">
+          <div style="flex:1;overflow:hidden;padding:16px;">
+            <div style="height:100%;background:#161616;border:1px solid #393939;position:relative;">
+              <svg viewBox="0 0 1000 640" preserveAspectRatio="xMidYMid meet" style="width:100%;height:100%;">
+                <sc-for list="{{ mapEdges }}" as="e" hint-placeholder-count="9"><line x1="{{ e.x1 }}" y1="{{ e.y1 }}" x2="{{ e.x2 }}" y2="{{ e.y2 }}" style="{{ e.style }}"></line><line x1="{{ e.x1 }}" y1="{{ e.y1 }}" x2="{{ e.x2 }}" y2="{{ e.y2 }}" style="{{ e.flowStyle }}"></line><text x="{{ e.mx }}" y="{{ e.my }}" fill="#6f6f6f" font-size="13" font-family="Roboto Mono" text-anchor="middle">{{ e.rtt }}</text></sc-for>
+                <sc-for list="{{ mapNodes }}" as="n" hint-placeholder-count="8"><circle cx="{{ n.x }}" cy="{{ n.y }}" r="{{ n.r }}" fill="{{ n.fill }}" stroke="{{ n.stroke }}" stroke-width="2.5"></circle><text x="{{ n.x }}" y="{{ n.labelY }}" fill="#f4f4f4" font-size="15" font-family="Roboto Mono" text-anchor="middle">{{ n.host }}</text></sc-for>
+              </svg>
+              <div style="position:absolute;bottom:12px;left:12px;display:flex;gap:14px;font-size:11px;color:#8d8d8d;background:#161616cc;padding:7px 11px;border:1px solid #393939;"><span><span style="display:inline-block;width:18px;height:2px;background:#0f62fe;vertical-align:middle;"></span> direct</span><span><span style="display:inline-block;width:18px;height:0;border-top:1px dashed #525252;vertical-align:middle;"></span> via relay</span><span><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#3ddbd9;vertical-align:middle;"></span> this node</span></div>
+            </div>
+          </div>
+          </sc-if>
+        </div>
+      </div>
+      </sc-if>
+
+      <!-- THIS NODE -->
+      <sc-if value="{{ isNode }}" hint-placeholder-val="{{ true }}">
+      <div data-screen-label="This Node" style="padding:12px 15px;">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
+          <span style="width:11px;height:11px;border-radius:50%;background:#3ddbd9;"></span>
+          <div style="font-size:18px;font-weight:500;">{{ node.host }}</div>
+          <div style="font-size:12px;color:#c6c6c6;padding:3px 9px;border:1px solid #393939;">{{ node.role }}</div>
+          <div style="font-family:'Roboto Mono';font-size:12px;color:#8d8d8d;">{{ node.ip }} · v{{ node.version }} · up {{ node.uptime }}</div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:11px;">
+          <div style="background:#262626;border:1px solid #393939;">
+            <div style="padding:8px 13px;border-bottom:1px solid #393939;font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Hardware</div>
+            <div style="padding:6px 15px 12px;">
+              <sc-for list="{{ node.hw }}" as="h" hint-placeholder-count="6"><div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #1f1f1f;"><span style="font-size:12px;color:#8d8d8d;">{{ h.0 }}</span><span style="font-size:12px;font-family:'Roboto Mono';color:#c6c6c6;text-align:right;">{{ h.1 }}</span></div></sc-for>
+            </div>
+          </div>
+          <div style="background:#262626;border:1px solid #393939;">
+            <div style="padding:8px 13px;border-bottom:1px solid #393939;font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Mesh Services</div>
+            <div style="padding:4px 15px 10px;">
+              <sc-for list="{{ node.units }}" as="u" hint-placeholder-count="8"><div style="display:flex;align-items:center;gap:9px;padding:7px 0;border-bottom:1px solid #1f1f1f;"><span style="width:8px;height:8px;border-radius:50%;{{ u.dot }};flex:none;"></span><span style="font-size:12px;font-family:'Roboto Mono';flex:1;">{{ u.unit }}</span><span style="font-size:11px;color:#8d8d8d;">{{ u.status }}</span><div style="{{ u.btn }}">Restart</div></div></sc-for>
+            </div>
+          </div>
+          <div style="background:#262626;border:1px solid #393939;">
+            <div style="padding:8px 13px;border-bottom:1px solid #393939;font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Interfaces</div>
+            <div style="padding:6px 15px 12px;">
+              <sc-for list="{{ node.ifaces }}" as="i" hint-placeholder-count="3"><div style="display:flex;align-items:center;gap:11px;padding:9px 0;border-bottom:1px solid #1f1f1f;"><span style="font-family:'Roboto Mono';font-size:12px;color:{{ i.col }};width:64px;">{{ i.dev }}</span><span style="font-family:'Roboto Mono';font-size:12px;flex:1;">{{ i.addr }}</span><span style="font-size:11px;color:#8d8d8d;">{{ i.kind }}</span></div></sc-for>
+            </div>
+          </div>
+          <div style="background:#262626;border:1px solid #393939;">
+            <div style="padding:8px 13px;border-bottom:1px solid #393939;font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Registration &amp; Config</div>
+            <div style="padding:12px 15px;">
+              <div style="font-size:11px;color:#8d8d8d;">Node fingerprint ({{ node.fp }} · {{ node.epoch }})</div>
+              <div style="font-family:'Roboto Mono';font-size:13px;color:#3ddbd9;margin:5px 0 3px;letter-spacing:.5px;">{{ node.words }}</div>
+              <div style="font-family:'Roboto Mono';font-size:11px;color:#c6c6c6;word-break:break-all;">{{ node.fp }}</div>
+              <div style="display:flex;gap:18px;margin-top:13px;padding-top:12px;border-top:1px solid #393939;">
+                <div><div style="font-size:11px;color:#8d8d8d;">Config revision</div><div style="font-family:'Roboto Mono';font-size:14px;margin-top:3px;">{{ node.cfg.rev }}</div><div style="font-size:11px;color:#42be65;margin-top:2px;">{{ node.cfg.state }}</div></div>
+                <div><div style="font-size:11px;color:#8d8d8d;">CA cert</div><div style="font-family:'Roboto Mono';font-size:14px;margin-top:3px;">{{ node.cert }} days</div><div style="font-size:11px;color:#8d8d8d;margin-top:2px;">applied {{ node.cfg.applied }}</div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      </sc-if>
+
+      <!-- MONITORING -->
+      <sc-if value="{{ isMonitoring }}" hint-placeholder-val="{{ true }}">
+      <div data-screen-label="Monitoring" style="padding:12px 15px;">
+        <div style="display:flex;align-items:center;gap:14px;margin-bottom:11px;">
+          <div style="font-size:18px;font-weight:500;">Monitoring</div>
+          <div style="display:flex;margin-left:4px;">
+            <div onClick="{{ setHealth }}" style="{{ healthSeg }}">Health</div>
+            <div onClick="{{ setLogs }}" style="{{ logsSeg }}">Logs &amp; Metrics</div>
+          </div>
+          <div style="margin-left:auto;display:flex;align-items:center;gap:9px;padding:7px 14px;background:#262626;border:1px solid #393939;border-left:3px solid {{ verdict.col }};"><span style="font-size:14px;font-weight:500;color:{{ verdict.col }};">{{ verdict.word }}</span><span style="font-size:12px;color:#8d8d8d;">{{ verdict.sub }}</span></div>
+        </div>
+
+        <sc-if value="{{ showHealth }}" hint-placeholder-val="{{ true }}">
+        <div style="display:grid;grid-template-columns:1.4fr 1fr;gap:11px;">
+          <div style="background:#262626;border:1px solid #393939;">
+            <div style="padding:8px 13px;border-bottom:1px solid #393939;font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Doctor · ENT-7</div>
+            <sc-for list="{{ doctor }}" as="d" hint-placeholder-count="8">
+              <div style="display:flex;align-items:center;gap:11px;padding:10px 15px;border-bottom:1px solid #1f1f1f;">
+                <span style="width:9px;height:9px;border-radius:50%;{{ d.dot }};flex:none;"></span>
+                <div style="flex:1;min-width:0;"><div style="font-size:13px;">{{ d.t }}</div><div style="font-size:11px;color:#8d8d8d;">{{ d.d }}</div></div>
+                <span style="font:500 10px Roboto;letter-spacing:.5px;color:{{ d.col }};">{{ d.word }}</span>
+              </div>
+            </sc-for>
+          </div>
+          <div style="background:#262626;border:1px solid #393939;align-self:start;">
+            <div style="padding:8px 13px;border-bottom:1px solid #393939;font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Netdata Alarms</div>
+            <sc-for list="{{ alarms }}" as="a" hint-placeholder-count="3">
+              <div style="display:flex;gap:10px;padding:8px 13px;border-bottom:1px solid #1f1f1f;">
+                <span style="font:500 9px Roboto;letter-spacing:.5px;color:{{ a.col }};width:54px;flex:none;padding-top:2px;">{{ a.sev }}</span>
+                <div><div style="font-size:12px;font-family:'Roboto Mono';">{{ a.node }}</div><div style="font-size:11px;color:#8d8d8d;">{{ a.m }}</div></div>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+        </sc-if>
+
+        <sc-if value="{{ showLogs }}">
+        <div style="display:flex;flex-direction:column;gap:11px;">
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:#393939;border:1px solid #393939;">
+            <sc-for list="{{ gauges }}" as="g" hint-placeholder-count="8"><div style="background:#262626;padding:10px 13px;"><div style="font:400 10px 'Roboto Mono';color:#8d8d8d;">mackesd_{{ g.k }}</div><div style="font-family:'Roboto Mono';font-size:18px;font-weight:500;margin-top:3px;">{{ g.v }}</div></div></sc-for>
+          </div>
+          <div style="background:#161616;border:1px solid #393939;">
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:9px 15px;border-bottom:1px solid #393939;background:#262626;"><span style="font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">journald · mesh units</span><span style="font-size:11px;color:#8d8d8d;font-family:'Roboto Mono';">follow · all nodes</span></div>
+            <div style="padding:8px 0;">
+              <sc-for list="{{ logs }}" as="l" hint-placeholder-count="10">
+                <div style="display:flex;gap:12px;padding:3px 15px;font-family:'Roboto Mono';font-size:12px;line-height:1.5;">
+                  <span style="color:#6f6f6f;flex:none;">{{ l.t }}</span>
+                  <span style="color:#3ddbd9;flex:none;width:96px;">{{ l.h }}</span>
+                  <span style="color:#4589ff;flex:none;width:110px;">{{ l.u }}</span>
+                  <span style="color:#c6c6c6;">{{ l.m }}</span>
+                </div>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+        </sc-if>
+      </div>
+      </sc-if>
+
+      <!-- DATACENTER -->
+      <sc-if value="{{ isDatacenter }}" hint-placeholder-val="{{ true }}">
+      <div data-screen-label="Datacenter" style="display:flex;flex-direction:column;height:100%;">
+        <div style="display:flex;align-items:center;gap:2px;padding:0 16px;border-bottom:1px solid #393939;background:#161616;">
+          <sc-for list="{{ dcTabs }}" as="t" hint-placeholder-count="6"><div onClick="{{ t.click }}" style="{{ t.style }}">{{ t.label }}</div></sc-for>
+        </div>
+        <div style="flex:1;overflow:auto;padding:12px 15px;">
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:11px;">
+            <div style="display:flex;">
+              <sc-for list="{{ dcZones }}" as="z" hint-placeholder-count="3"><div onClick="{{ z.click }}" style="{{ z.style }}">{{ z.label }}</div></sc-for>
+            </div>
+            <span style="font-size:12px;color:#8d8d8d;">XAPI over overlay · leader-gated orchestrator · no central XO</span>
+            <sc-if value="{{ dcArmed }}" hint-placeholder-val="{{ true }}"><span style="margin-left:auto;font:500 11px Roboto;color:#42be65;">● zone armed</span></sc-if>
+            <sc-if value="{{ dcDisarmed }}"><span style="margin-left:auto;font:500 11px Roboto;color:#f1c21b;">● prod disarmed — arm to apply</span></sc-if>
+          </div>
+
+          <sc-if value="{{ showDcNative }}" hint-placeholder-val="{{ true }}">
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:#393939;border:1px solid #393939;margin-bottom:11px;">
+            <sc-for list="{{ dcCaps }}" as="k" hint-placeholder-count="4"><div style="background:#262626;padding:9px 13px;"><div style="font:500 10px Roboto;letter-spacing:.4px;color:#8d8d8d;">{{ k.l }}</div><div style="font-size:20px;font-weight:500;color:{{ k.col }};margin-top:5px;">{{ k.v }}</div></div></sc-for>
+          </div>
+
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-bottom:11px;">
+            <div style="background:#262626;border:1px solid #393939;">
+              <div style="padding:8px 13px;border-bottom:1px solid #393939;font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Hosts</div>
+              <sc-for list="{{ hosts }}" as="h" hint-placeholder-count="3">
+                <div style="padding:8px 13px;border-bottom:1px solid #1f1f1f;">
+                  <div style="display:flex;align-items:center;gap:9px;"><span style="width:8px;height:8px;border-radius:50%;{{ h.dot }};"></span><span style="font-family:'Roboto Mono';font-size:13px;flex:1;">{{ h.name }}</span><span style="font-size:11px;color:{{ h.poolCol }};text-transform:uppercase;letter-spacing:.4px;">{{ h.pool }}</span><span style="font-size:11px;color:#8d8d8d;">{{ h.vms }} VMs</span></div>
+                  <div style="display:flex;gap:10px;margin-top:8px;"><div style="flex:1;"><div style="font-size:10px;color:#8d8d8d;margin-bottom:3px;">CPU</div><div style="height:4px;background:#161616;"><div style="height:4px;{{ h.cpuBar }}"></div></div></div><div style="flex:1;"><div style="font-size:10px;color:#8d8d8d;margin-bottom:3px;">MEM</div><div style="height:4px;background:#161616;"><div style="height:4px;{{ h.memBar }}"></div></div></div></div>
+                </div>
+              </sc-for>
+            </div>
+            <div style="background:#262626;border:1px solid #393939;">
+              <div style="padding:8px 13px;border-bottom:1px solid #393939;font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Virtual Machines</div>
+              <sc-for list="{{ vms }}" as="v" hint-placeholder-count="5">
+                <div style="display:flex;align-items:center;gap:9px;padding:9px 15px;border-bottom:1px solid #1f1f1f;"><span style="width:8px;height:8px;border-radius:50%;{{ v.dot }};"></span><span style="font-family:'Roboto Mono';font-size:13px;flex:1;">{{ v.name }}</span><span style="font-size:11px;color:#8d8d8d;">{{ v.spec }}</span><span style="font-size:11px;color:#6f6f6f;font-family:'Roboto Mono';">{{ v.host }}</span></div>
+              </sc-for>
+            </div>
+          </div>
+
+          <div style="display:grid;grid-template-columns:1.2fr 1fr;gap:11px;">
+            <div style="background:#262626;border:1px solid #393939;">
+              <div style="padding:8px 13px;border-bottom:1px solid #393939;display:flex;justify-content:space-between;"><span style="font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Promotion · Version Matrix</span></div>
+              <div style="padding:9px 13px;">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+                  <sc-for list="{{ promo }}" as="p" hint-placeholder-count="3"><div style="flex:1;text-align:center;padding:9px;background:#161616;border:1px solid #393939;border-top:2px solid #42be65;"><div style="font-size:11px;color:#8d8d8d;">{{ p.stage }}</div><div style="font-family:'Roboto Mono';font-size:13px;margin-top:3px;">{{ p.v }}</div></div><span style="color:#525252;">→</span></sc-for>
+                  <span style="font-size:11px;color:#42be65;">auto-promote on green</span>
+                </div>
+                <div style="display:grid;grid-template-columns:1.3fr 1fr 1fr 1fr;gap:6px;font-size:11px;">
+                  <div style="font:500 10px Roboto;letter-spacing:.4px;color:#8d8d8d;text-transform:uppercase;">Node</div><div style="font:500 10px Roboto;color:#8d8d8d;text-transform:uppercase;">Build</div><div style="font:500 10px Roboto;color:#8d8d8d;text-transform:uppercase;">Eagle</div><div style="font:500 10px Roboto;color:#8d8d8d;text-transform:uppercase;">DO</div>
+                  <sc-for list="{{ matrix }}" as="m" hint-placeholder-count="4"><div style="font-family:'Roboto Mono';color:#c6c6c6;padding:4px 0;border-top:1px solid #1f1f1f;">{{ m.n }}</div><div style="font-family:'Roboto Mono';color:#8d8d8d;padding:4px 0;border-top:1px solid #1f1f1f;">{{ m.b }}</div><div style="font-family:'Roboto Mono';color:#8d8d8d;padding:4px 0;border-top:1px solid #1f1f1f;">{{ m.e }}</div><div style="font-family:'Roboto Mono';color:#8d8d8d;padding:4px 0;border-top:1px solid #1f1f1f;">{{ m.d }}</div></sc-for>
+                </div>
+              </div>
+            </div>
+            <div style="background:#262626;border:1px solid #393939;">
+              <div style="padding:8px 13px;border-bottom:1px solid #393939;font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#c6c6c6;">Tofu Run-log</div>
+              <sc-for list="{{ tofu }}" as="t" hint-placeholder-count="4">
+                <div style="display:flex;align-items:center;gap:11px;padding:9px 15px;border-bottom:1px solid #1f1f1f;"><span style="font-family:'Roboto Mono';font-size:11px;color:#8d8d8d;width:62px;flex:none;">{{ t.t }}</span><span style="font:500 11px Roboto;color:{{ t.col }};width:54px;flex:none;">{{ t.k }}</span><span style="font-size:11px;color:#c6c6c6;flex:1;font-family:'Roboto Mono';">{{ t.ws }}</span><span style="font-size:11px;color:#8d8d8d;font-family:'Roboto Mono';">{{ t.r }}</span></div>
+              </sc-for>
+            </div>
+          </div>
+          </sc-if>
+          <sc-if value="{{ showDcFolded }}">
+          <div style="display:flex;align-items:center;justify-content:center;padding:64px 20px;">
+            <div style="max-width:460px;text-align:center;">
+              <div style="font-size:17px;font-weight:500;margin-bottom:7px;">{{ dcFoldLabel }}</div>
+              <div style="font-size:13px;color:#8d8d8d;line-height:1.55;">Folded into the Datacenter panel as a tab (DATACENTER-25). This surface keeps its own reducer + Bus subscription; deep links to the retired standalone slug redirect here.</div>
+              <div style="display:inline-block;margin-top:15px;font:400 12px 'Roboto Mono';color:#4589ff;border:1px solid #393939;padding:6px 12px;">event/dc/* · op-locked</div>
+            </div>
+          </div>
+          </sc-if>
+        </div>
+      </div>
+      </sc-if>
+
+      <!-- FLEET -->
+      <sc-if value="{{ isFleet }}" hint-placeholder-val="{{ true }}">
+      <div data-screen-label="Fleet Rollup" style="padding:12px 15px;">
+        <div style="display:flex;align-items:flex-end;gap:11px;margin-bottom:11px;">
+          <div style="font-size:18px;font-weight:500;">Fleet Rollup</div>
+          <div style="display:flex;gap:18px;margin-left:auto;">
+            <sc-for list="{{ fleetStats }}" as="s" hint-placeholder-count="4"><div style="text-align:right;"><div style="font:500 10px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#8d8d8d;">{{ s.l }}</div><div style="font-size:14px;margin-top:2px;">{{ s.v }}</div></div></sc-for>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1.25fr;gap:11px;">
+          <div style="display:flex;flex-direction:column;gap:14px;">
+            <sc-for list="{{ roleGroups }}" as="rg" hint-placeholder-count="3">
+              <div>
+                <div style="font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#8d8d8d;margin-bottom:8px;">{{ rg.role }}</div>
+                <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+                  <sc-for list="{{ rg.nodes }}" as="n" hint-placeholder-count="2">
+                    <div onClick="{{ n.select }}" style="{{ n.cardStyle }}" style-hover="border-color:#525252;">
+                      <div style="display:flex;align-items:center;gap:8px;"><span style="width:8px;height:8px;border-radius:50%;{{ n.dot }};"></span><span style="font-size:13px;font-weight:500;flex:1;">{{ n.host }}</span><span style="width:7px;height:7px;border-radius:50%;{{ n.hdot }};"></span></div>
+                      <div style="font-family:'Roboto Mono';font-size:11px;color:#8d8d8d;margin:4px 0 7px;">{{ n.ip }}</div>
+                      <div style="display:flex;gap:5px;flex-wrap:wrap;">
+                        <sc-for list="{{ n.tags }}" as="tg" hint-placeholder-count="1"><span style="font:500 9px 'Roboto Mono';text-transform:uppercase;letter-spacing:.5px;padding:1px 6px;border:1px solid #525252;color:#c6c6c6;">{{ tg.label }}</span></sc-for>
+                      </div>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+            </sc-for>
+          </div>
+          <div style="background:#161616;border:1px solid #393939;position:relative;min-height:480px;">
+            <div style="position:absolute;top:11px;left:14px;font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:#8d8d8d;z-index:2;">Live Path Map · RTT-weighted</div>
+            <svg viewBox="0 0 1000 640" preserveAspectRatio="xMidYMid meet" style="width:100%;height:100%;">
+              <sc-for list="{{ mapEdges }}" as="e" hint-placeholder-count="9"><line x1="{{ e.x1 }}" y1="{{ e.y1 }}" x2="{{ e.x2 }}" y2="{{ e.y2 }}" style="{{ e.style }}"></line><line x1="{{ e.x1 }}" y1="{{ e.y1 }}" x2="{{ e.x2 }}" y2="{{ e.y2 }}" style="{{ e.flowStyle }}"></line><text x="{{ e.mx }}" y="{{ e.my }}" fill="#6f6f6f" font-size="13" font-family="Roboto Mono" text-anchor="middle">{{ e.rtt }}</text></sc-for>
+              <sc-for list="{{ mapNodes }}" as="n" hint-placeholder-count="8"><circle cx="{{ n.x }}" cy="{{ n.y }}" r="{{ n.r }}" fill="{{ n.fill }}" stroke="{{ n.stroke }}" stroke-width="2.5"></circle><text x="{{ n.x }}" y="{{ n.labelY }}" fill="#f4f4f4" font-size="15" font-family="Roboto Mono" text-anchor="middle">{{ n.host }}</text></sc-for>
+            </svg>
+          </div>
+        </div>
+      </div>
+      </sc-if>
+
+      <!-- EMPTY -->
+      <sc-if value="{{ isEmpty }}" hint-placeholder-val="{{ true }}">
+      <div data-screen-label="Empty state" style="display:flex;align-items:center;justify-content:center;height:100%;padding:40px;">
+        <div style="max-width:460px;text-align:center;">
+          <svg width="46" height="46" viewBox="0 0 24 24" fill="none" style="margin-bottom:11px;"><rect x="3" y="3" width="18" height="18" stroke="#525252" stroke-width="1.3"/><path d="M3 9h18M9 9v12" stroke="#393939" stroke-width="1.3"/><circle cx="6" cy="6" r="1" fill="#525252"/></svg>
+          <div style="font-size:18px;font-weight:500;margin-bottom:6px;">{{ emptyLabel }}</div>
+          <div style="font-size:13px;color:#8d8d8d;line-height:1.5;">This panel is on the worklist under <span style="color:#c6c6c6;">{{ emptyGroup }}</span>. The full nav renders from day one with guided empty states (W16); the surface lands with its mackesd Bus verbs + reducer.</div>
+          <div style="display:inline-block;margin-top:16px;font:400 12px 'Roboto Mono';color:#4589ff;border:1px solid #393939;padding:6px 12px;">mde --focus {{ emptyGroup }}</div>
+        </div>
+      </div>
+      </sc-if>
+
+    </section>
+
+    <sc-if value="{{ railOpen }}" hint-placeholder-val="{{ true }}">
+    <aside style="width:284px;flex:none;border-left:1px solid #393939;background:#0d0d0d;display:flex;flex-direction:column;min-height:0;">
+      <div style="flex:none;display:flex;align-items:center;gap:8px;padding:7px 12px;border-bottom:1px solid #393939;background:#161616;">
+        <span style="width:7px;height:7px;border-radius:50%;background:#42be65;animation:blink 1.6s ease-in-out infinite;"></span>
+        <span style="font:500 11px Roboto;letter-spacing:.5px;text-transform:uppercase;color:#c6c6c6;">Live Events</span>
+        <span style="margin-left:auto;font-family:'Roboto Mono';font-size:10px;color:#6f6f6f;">follow · all nodes</span>
+      </div>
+      <div style="flex:none;display:flex;border-bottom:1px solid #393939;font-family:'Roboto Mono';font-size:10px;">
+        <div style="flex:1;text-align:center;padding:6px 0;color:#fa4d56;border-right:1px solid #262626;"><div style="font-size:15px;font-weight:500;">{{ sb.crit }}</div>CRIT</div>
+        <div style="flex:1;text-align:center;padding:6px 0;color:#f1c21b;border-right:1px solid #262626;"><div style="font-size:15px;font-weight:500;">{{ sb.warn }}</div>WARN</div>
+        <div style="flex:1;text-align:center;padding:6px 0;color:#4589ff;border-right:1px solid #262626;"><div style="font-size:15px;font-weight:500;">{{ sb.info }}</div>INFO</div>
+        <div style="flex:1;text-align:center;padding:6px 0;color:#42be65;"><div style="font-size:15px;font-weight:500;">{{ sb.ok }}</div>OK</div>
+      </div>
+      <div style="flex:1;overflow-y:auto;">
+        <sc-for list="{{ rail }}" as="e" hint-placeholder-count="14">
+          <div style="display:flex;gap:8px;padding:6px 11px;border-bottom:1px solid #161616;border-left:2px solid {{ e.col }};">
+            <span style="font-family:'Roboto Mono';font-size:10px;color:#6f6f6f;flex:none;padding-top:1px;">{{ e.t }}</span>
+            <div style="min-width:0;"><div style="font-family:'Roboto Mono';font-size:10px;color:{{ e.col }};letter-spacing:.3px;">{{ e.tag }} · {{ e.host }}</div><div style="font-size:11px;color:#c6c6c6;line-height:1.35;">{{ e.m }}</div></div>
+          </div>
+        </sc-for>
+      </div>
+      <div style="flex:none;padding:6px 11px;border-top:1px solid #393939;background:#161616;font-family:'Roboto Mono';font-size:10px;color:#6f6f6f;display:flex;justify-content:space-between;"><span>alert_relay · cosmic-applet</span><span style="color:#42be65;">▮ streaming</span></div>
+    </aside>
+    </sc-if>
+
+    </div>
+  </main>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1440,&quot;height&quot;:900},&quot;density&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;comfortable&quot;,&quot;compact&quot;],&quot;default&quot;:&quot;compact&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Layout&quot;},&quot;reduceMotion&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Layout&quot;}}">
+class Component extends DCLogic {
+  state = {
+    group: 'dashboard', panel: 'home',
+    expanded: { dashboard:true, node:true, mesh:true, mesh_provisioning:false, fleet:true, provisioning:true, monitoring:true, system:false },
+    peerSel: 'oak', peerView: 'list', filter: '',
+    monTab: 'health', dcTab: 'Native', dcZone: 'dev',
+    result: '', railOpen: true,
+  };
+
+  // ---- static model ----
+  nav() {
+    return [
+      {slug:'dashboard', label:'Overview', items:[['home','Home']]},
+      {slug:'node', label:'This Node', items:[['hardware','Hardware'],['mesh_services','Mesh Services'],['interfaces','Interfaces'],['wifi','Wi-Fi'],['vpn','VPN'],['firewall','Firewall'],['remote_desktop','Remote Access']]},
+      {slug:'mesh', label:'Mesh', items:[['peers','Peers'],['lighthouses','Lighthouses'],['mesh_control','Mesh Control'],['mesh_storage','Mesh Storage'],['dns','Mesh DNS'],['routing','Routing'],['connectivity','Connectivity'],['all_services','All Services']]},
+      {slug:'mesh_provisioning', label:'Mesh: Provisioning', items:[['genesis','New Mesh'],['registration','Registration'],['mesh_join','Mesh Join'],['mesh_federation','Mesh Federation']]},
+      {slug:'fleet', label:'Other Nodes', items:[['fleet_rollup','Fleet Rollup'],['inventory','Fleet Roster'],['tags','Tags'],['jobs','Jobs'],['playbooks','Playbooks'],['drift','Remediation']]},
+      {slug:'provisioning', label:'Mesh: Virtual Workloads', items:[['node_roles','Node Roles'],['profiles','Install Profiles'],['mirrors','Mirrors'],['provisioning','VM Spawner'],['datacenter','Datacenter']]},
+      {slug:'monitoring', label:'Monitoring', items:[['health_check','Health'],['mesh_logs','Logs & Metrics'],['fleet_logs','Fleet Logs'],['run_history','Run History'],['audit','Audit'],['resources','Resources'],['logs','System Logs']]},
+      {slug:'system', label:'System', items:[['config_apply','Config'],['revisions','Fleet Config'],['policy','Policy'],['settings','Settings'],['hub','Hub'],['repair','Repair'],['system_update','System Update'],['index','Help Topics'],['about','About']]},
+    ];
+  }
+  realKey(g,p){
+    const m={'dashboard/home':'overview','mesh/peers':'peers','node/hardware':'node','monitoring/health_check':'monitoring','monitoring/mesh_logs':'monitoring','provisioning/datacenter':'datacenter','fleet/fleet_rollup':'fleet'};
+    return m[g+'/'+p]||'empty';
+  }
+  labelOf(g,p){ const grp=this.nav().find(x=>x.slug===g); if(!grp) return p; const it=grp.items.find(i=>i[0]===p); return it?it[1]:p; }
+
+  nodes(){
+    if(this.__n) return this.__n;
+    this.__n = [
+      {host:'oak',role:'Workstation',ip:'10.10.0.10',pub:'—',self:true,presence:'online',health:'healthy',version:'12.18.2',latest:'12.18.2',sync:'synced',behind:0,drift:0,voice:'available',cpu:18,load:'0.42',net:340,disk:54,mem:38,uptime:'6d 04h',cert:312,
+        svc:{bus:1,etcd:1,syncthing:1,nebula:1,dns:1,voice:1,music:1,kdc:1,workbench:1},ssh:1,rdp:0,vnc:0,
+        containers:[{name:'mde-musicd',image:'ghcr.io/mde/musicd:12',state:'running',ports:'6600'},{name:'registry',image:'registry:2',state:'running',ports:'5000'}],
+        guests:[],media:[{name:'Navidrome',port:4533},{name:'mde-musicd',port:6600}],tags:['execution','hop'],lighthouse:false,leader:false},
+      {host:'birch',role:'Workstation',ip:'10.10.0.11',pub:'—',self:false,presence:'online',health:'healthy',version:'12.18.2',latest:'12.18.2',sync:'synced',behind:0,drift:0,voice:'on-call',cpu:34,load:'1.10',net:880,disk:61,mem:52,uptime:'2d 11h',cert:298,
+        svc:{bus:1,etcd:1,syncthing:1,nebula:1,dns:1,voice:1,music:1,kdc:1,workbench:1},ssh:1,rdp:1,vnc:0,
+        containers:[{name:'jellyfin',image:'jellyfin/jellyfin:10.9',state:'running',ports:'8096'}],
+        guests:[{name:'win11-dev',state:'running',vcpu:4,mem:8,ip:'10.10.0.61'}],media:[{name:'Jellyfin',port:8096}],tags:['execution'],lighthouse:false,leader:false},
+      {host:'eagle',role:'Server',ip:'10.10.0.20',pub:'—',self:false,presence:'online',health:'healthy',version:'12.18.2',latest:'12.18.2',sync:'synced',behind:0,drift:0,voice:'offline',cpu:46,load:'2.30',net:2400,disk:72,mem:64,uptime:'31d 09h',cert:281,
+        svc:{bus:1,etcd:1,syncthing:1,nebula:1,dns:1,voice:0,music:1,kdc:0,workbench:1},ssh:1,rdp:0,vnc:1,
+        containers:[{name:'syncthing',image:'syncthing/syncthing:1.27',state:'running',ports:'8384'},{name:'navidrome',image:'navidrome:0.52',state:'running',ports:'4533'},{name:'mirror-pull',image:'mde/mirror:3',state:'exited',ports:'—'}],
+        guests:[{name:'ubuntu-ci',state:'running',vcpu:8,mem:16,ip:'10.10.0.70'},{name:'fedora-build',state:'running',vcpu:8,mem:16,ip:'10.10.0.71'}],media:[{name:'Navidrome',port:4533}],tags:['execution','headless'],lighthouse:false,leader:false},
+      {host:'cedar',role:'Server',ip:'10.10.0.21',pub:'—',self:false,presence:'online',health:'degraded',health_why:'disk-headroom WARNING — 86% used',version:'12.18.1',latest:'12.18.2',sync:'behind',behind:1,drift:2,voice:'offline',cpu:71,load:'4.05',net:1500,disk:86,mem:78,uptime:'18d 02h',cert:41,
+        svc:{bus:1,etcd:1,syncthing:1,nebula:1,dns:1,voice:0,music:0,kdc:0,workbench:1},ssh:1,rdp:0,vnc:1,
+        containers:[{name:'gitea',image:'gitea/gitea:1.22',state:'running',ports:'3000'}],
+        guests:[{name:'win11-qa',state:'paused',vcpu:4,mem:8,ip:'10.10.0.62'}],media:[],tags:['execution','headless'],lighthouse:false,leader:false},
+      {host:'fir',role:'Workstation',ip:'10.10.0.12',pub:'—',self:false,presence:'idle',health:'healthy',version:'12.18.2',latest:'12.18.2',sync:'synced',behind:0,drift:0,voice:'offline',cpu:6,load:'0.18',net:40,disk:44,mem:29,uptime:'9d 21h',cert:305,
+        svc:{bus:1,etcd:0,syncthing:1,nebula:1,dns:1,voice:1,music:1,kdc:1,workbench:1},ssh:1,rdp:0,vnc:0,
+        containers:[],guests:[],media:[{name:'mde-musicd',port:6600}],tags:[],lighthouse:false,leader:false},
+      {host:'lighthouse-nyc',role:'Lighthouse',ip:'10.10.0.1',pub:'45.55.33.179',self:false,presence:'online',health:'healthy',version:'12.18.2',latest:'12.18.2',sync:'synced',behind:0,drift:0,voice:'offline',cpu:12,load:'0.30',net:5200,disk:33,mem:41,uptime:'74d 06h',cert:41,
+        svc:{bus:1,etcd:1,syncthing:1,nebula:1,dns:1,voice:0,music:0,kdc:0,workbench:0},ssh:1,rdp:0,vnc:0,
+        containers:[],guests:[],media:[],tags:['hop'],lighthouse:true,leader:true},
+      {host:'lighthouse-sfo',role:'Lighthouse',ip:'10.10.0.2',pub:'159.65.183.51',self:false,presence:'online',health:'healthy',version:'12.18.2',latest:'12.18.2',sync:'synced',behind:0,drift:0,voice:'offline',cpu:9,load:'0.22',net:3100,disk:31,mem:38,uptime:'74d 06h',cert:41,
+        svc:{bus:1,etcd:1,syncthing:1,nebula:1,dns:1,voice:0,music:0,kdc:0,workbench:0},ssh:1,rdp:0,vnc:0,
+        containers:[],guests:[],media:[],tags:['hop'],lighthouse:true,leader:false},
+      {host:'maple',role:'Workstation',ip:'10.10.0.13',pub:'—',self:false,presence:'offline',health:'critical',health_why:'offline — last seen 3h 12m',version:'12.18.0',latest:'12.18.2',sync:'unknown',behind:0,drift:0,voice:'offline',cpu:0,load:'—',net:0,disk:0,mem:0,uptime:'—',cert:0,
+        svc:{bus:0,etcd:0,syncthing:0,nebula:0,dns:0,voice:0,music:0,kdc:0,workbench:0},ssh:0,rdp:0,vnc:0,
+        containers:[],guests:[],media:[],tags:[],lighthouse:false,leader:false},
+    ];
+    return this.__n;
+  }
+  devices(){ return [
+    {name:'pixel-8',label:'Pixel 8',owner:'matt',ip:'10.10.0.130',presence:'online',battery:82},
+    {name:'ipad-air',label:'iPad Air',owner:'matt',ip:'10.10.0.131',presence:'idle',battery:46},
+  ];}
+
+  // ---- color helpers ----
+  C(){ return {bg:'#161616',l1:'#262626',l2:'#393939',l3:'#525252',bd:'#393939',tx:'#f4f4f4',t2:'#c6c6c6',mut:'#8d8d8d',acc:'#0f62fe',acc2:'#4589ff',ok:'#42be65',ok2:'#24a148',warn:'#f1c21b',bad:'#fa4d56',self:'#3ddbd9'};}
+  dot(k){ const c=this.C(); return {healthy:c.ok,online:c.ok,degraded:c.warn,idle:c.warn,critical:c.bad,offline:c.bad,unknown:c.mut,synced:c.ok,behind:c.warn,'on-call':c.acc2,available:c.ok}[k]||c.mut; }
+  pad(){ return this.props.density==='comfortable' ? '11px 14px' : '5px 11px'; }
+
+  // ---- sparkline ----
+  spark(seed,n,lo,hi){ let v=[],x=seed; for(let i=0;i<n;i++){ x=(x*9301+49297)%233280; v.push(lo+(hi-lo)*(x/233280)); } return v; }
+  poly(vals,w,h){ const mn=Math.min(...vals),mx=Math.max(...vals),sp=(mx-mn)||1; return vals.map((v,i)=>`${(i/(vals.length-1)*w).toFixed(1)},${(h-(v-mn)/sp*h).toFixed(1)}`).join(' '); }
+
+  // ---- handlers ----
+  selectPanel(g,p){ const ex={...this.state.expanded,[g]:true}; const s={group:g,panel:p,expanded:ex,result:''}; if(g==='monitoring'){ s.monTab = p==='mesh_logs'?'logs':'health'; } this.setState(s); }
+  toggleGroup(slug){ this.setState(st=>({expanded:{...st.expanded,[slug]:!st.expanded[slug]}})); }
+
+  renderVals(){
+    const c=this.C(); const st=this.state; const key=this.realKey(st.group,st.panel);
+    const nodes=this.nodes(); const devices=this.devices();
+    const online=nodes.filter(n=>n.presence!=='offline');
+    const healthy=nodes.filter(n=>n.health==='healthy').length;
+    const degraded=nodes.filter(n=>n.health==='degraded').length;
+    const offline=nodes.filter(n=>n.presence==='offline').length;
+
+    // sidebar nav
+    const navGroups = this.nav().map(g=>({
+      label:g.label, open:!!st.expanded[g.slug], active:g.slug===st.group,
+      chevron: st.expanded[g.slug]?'–':'+',
+      hdrStyle:`display:flex;align-items:center;justify-content:space-between;cursor:pointer;padding:6px 14px 6px 13px;font:500 11px Roboto;letter-spacing:.4px;text-transform:uppercase;color:${g.slug===st.group?c.tx:c.mut};user-select:none;`,
+      toggle:()=>this.toggleGroup(g.slug),
+      items:g.items.map(([p,lbl])=>{
+        const on=st.group===g.slug&&st.panel===p; const real=this.realKey(g.slug,p)!=='empty';
+        return {label:lbl, select:()=>this.selectPanel(g.slug,p),
+          style:`display:flex;align-items:center;gap:8px;cursor:pointer;padding:4px 14px 4px 24px;font:${on?500:400} 13px Roboto;color:${on?c.tx:c.t2};background:${on?c.l2:'transparent'};border-left:3px solid ${on?c.acc:'transparent'};`,
+          dotStyle:`width:5px;height:5px;border-radius:50%;flex:none;background:${real?c.ok:c.l3};opacity:${real?1:.6};`};
+      }),
+    }));
+
+    // header
+    const crumb = `${this.nav().find(x=>x.slug===st.group).label}  ›  ${this.labelOf(st.group,st.panel)}`;
+
+    const vals = {
+      density:this.props.density, navGroups, crumb,
+      isOverview:key==='overview', isPeers:key==='peers', isNode:key==='node',
+      isMonitoring:key==='monitoring', isDatacenter:key==='datacenter', isFleet:key==='fleet', isEmpty:key==='empty',
+      emptyLabel:this.labelOf(st.group,st.panel), emptyGroup:this.nav().find(x=>x.slug===st.group).label,
+      onlineCount:online.length, totalCount:nodes.length, healthyCount:healthy, degradedCount:degraded, offlineCount:offline,
+    };
+
+    // ---- global console chrome: status strip + live events rail ----
+    vals.sb = {
+      crit:1, warn:3, info:5, ok:6, date:'2026-06-28', clock:'14:32:07',
+      ticker:[
+        {tag:'WARN',col:c.warn,m:'cedar disk_headroom /opt 86% — remediation plan p-77 queued'},
+        {tag:'CRIT',col:c.bad,m:'maple unreachable — heartbeat lost 14:20:30'},
+        {tag:'INFO',col:c.acc2,m:'oak converged revision r-2291 (0 changes)'},
+        {tag:'WARN',col:c.warn,m:'CA epoch 7 cert expires in 41d — rotate advised'},
+        {tag:'OK',col:c.ok,m:'etcd quorum 3/3 healthy · leader lighthouse-nyc'},
+        {tag:'INFO',col:c.acc2,m:'job nightly-backup 6/6 targets ok'},
+      ],
+    };
+    const sevCol={CRIT:c.bad,WARN:c.warn,INFO:c.acc2,AUTH:c.ok,OK:c.ok,DRIFT:c.warn,CONFIG:c.acc2,CA:c.ok};
+    vals.rail = [
+      ['14:32:01','CRIT','maple','heartbeat timeout — node marked offline'],
+      ['14:31:08','CONFIG','oak','revision r-2291 applied · reconcile ok'],
+      ['14:30:55','INFO','oak','mde-bus reply/01J9 published (4ms)'],
+      ['14:29:40','OK','eagle','syncthing folder mesh-storage up to date'],
+      ['14:28:12','WARN','cedar','disk_headroom /opt 86% (threshold 85%)'],
+      ['14:27:33','WARN','cedar','load_15min 4.05 above 4.0'],
+      ['14:27:03','OK','lighthouse-nyc','nebula handshake complete · cedar (relay)'],
+      ['14:25:51','INFO','birch','job nightly-backup target ok (2.1s)'],
+      ['14:24:18','OK','oak','etcd compacted to rev 88142'],
+      ['14:22:54','DRIFT','cedar','firewalld zone mismatch → plan p-77'],
+      ['14:19:02','AUTH','birch','enrolled device pixel-8 (KDC pair)'],
+      ['14:11:40','CA','lighthouse-nyc','re-signed 1 CSR under epoch 7'],
+      ['14:03:21','INFO','eagle','podman mirror-pull exited 0'],
+      ['13:58:10','OK','oak','backup verify-restore passed (19h cadence)'],
+    ].map(r=>({t:r[0],tag:r[1],host:r[2],m:r[3],col:sevCol[r[1]]||c.mut}));
+    vals.railOpen = st.railOpen;
+    vals.toggleRail = ()=>this.setState(s=>({railOpen:!s.railOpen}));
+    vals.railToggleLabel = st.railOpen ? '⟩ events' : '⟨ events';
+    vals.railToggleStyle = `cursor:pointer;font-family:'Roboto Mono';font-size:11px;padding:4px 9px;border:1px solid ${st.railOpen?c.l3:c.bd};color:${st.railOpen?c.t2:c.mut};background:${st.railOpen?c.l1:'transparent'};`;
+
+    // ---------- OVERVIEW ----------
+    if(key==='overview'){
+      vals.kpis=[
+        {label:'NODES ONLINE',value:`${online.length}`,unit:`/ ${nodes.length}`,sub:`${healthy} healthy · ${degraded} degraded · ${offline} offline`,col:c.ok},
+        {label:'AUDIT CHAIN',value:'intact',unit:'',sub:'4,182 events · 72h window',col:c.ok},
+        {label:'CA CERT',value:'41',unit:'days',sub:'epoch 7 · rotate due soon',col:c.warn},
+        {label:'WORKERS',value:'48',unit:'/ 50',sub:'2 idle · breaker clear',col:c.ok},
+        {label:'MESH DISK',value:'1.8',unit:'TB free',sub:'Syncthing /mnt/mesh-storage · 62%',col:c.acc2},
+        {label:'DRIFT',value:'2',unit:'open',sub:'cedar · auto-remediate armed',col:c.warn},
+      ];
+      vals.beacons=nodes.filter(n=>n.lighthouse).map(n=>({
+        name:n.host, ip:n.ip, pub:n.pub, healthy:n.health==='healthy', word:n.leader?'LEADER · healthy':'SHADOW · healthy',
+        beamStyle:`position:absolute;inset:0;border-radius:50%;background:conic-gradient(from 0deg, ${n.health==='healthy'?c.ok:c.bad}cc, transparent 70deg, transparent 360deg);${this.props.reduceMotion?'':`animation:beamSweep ${n.health==='healthy'?'6s':'0.9s'} linear infinite;`}`,
+        coreStyle:`position:absolute;inset:34%;border-radius:50%;background:${n.health==='healthy'?c.ok:c.bad};box-shadow:0 0 10px ${n.health==='healthy'?c.ok:c.bad};`,
+      }));
+      vals.audit=[
+        {t:'14:31:08',sev:c.acc2,k:'config',m:'oak applied revision r-2291 (reconcile ok)'},
+        {t:'14:22:54',sev:c.warn,k:'drift',m:'cedar: firewalld zone drift detected — plan queued'},
+        {t:'13:58:10',sev:c.ok,k:'auth',m:'birch enrolled device pixel-8 (KDC pair)'},
+        {t:'13:40:33',sev:c.acc2,k:'jobs',m:'job nightly-backup ran 6/6 targets ok'},
+        {t:'12:11:02',sev:c.bad,k:'presence',m:'maple went offline (heartbeat lost)'},
+        {t:'11:05:48',sev:c.ok,k:'ca',m:'lighthouse-nyc re-signed 1 CSR under epoch 7'},
+      ];
+      vals.matrix={cols:['Bus','etcd','Sync','Nebula','DNS','Voice','Music','KDC','WB'],keys:['bus','etcd','syncthing','nebula','dns','voice','music','kdc','workbench'],
+        rows:nodes.map(n=>({host:n.host,self:n.self,cells:['bus','etcd','syncthing','nebula','dns','voice','music','kdc','workbench'].map(k=>({on:!!n.svc[k],style:`width:9px;height:9px;border-radius:1px;background:${n.svc[k]?(n.presence==='offline'?c.l3:c.ok):'transparent'};border:1px solid ${n.svc[k]?'transparent':c.l3};`}))}))};
+      vals.rev={head:'r-2291',author:'oak',when:'14:31',converged:7,total:8,note:'maple unreachable — will converge on rejoin'};
+    }
+
+    // ---------- PEERS ----------
+    if(key==='peers'){
+      const f=st.filter.trim().toLowerCase();
+      const match=n=>!f||n.host.includes(f)||n.role.toLowerCase().includes(f)||(n.tags||[]).some(t=>t.includes(f));
+      const mk=n=>({host:n.host,role:n.role,ip:n.ip,self:n.self,presence:n.presence,
+        select:()=>this.setState({peerSel:n.host,result:''}),
+        rowStyle:`display:flex;align-items:center;gap:9px;cursor:pointer;padding:${this.pad()};border-left:3px solid ${st.peerSel===n.host?c.acc:'transparent'};background:${st.peerSel===n.host?c.l2:'transparent'};${n.presence==='offline'?'opacity:.5;':''}`,
+        dotStyle:`width:8px;height:8px;border-radius:50%;flex:none;background:${n.self?c.self:this.dot(n.presence)};`,
+        sub:`${n.role} · ${n.ip}`});
+      const onlineP=nodes.filter(n=>n.presence==='online'&&match(n)).map(mk);
+      const idleP=nodes.filter(n=>n.presence==='idle'&&match(n)).map(mk);
+      const offP=nodes.filter(n=>n.presence==='offline'&&match(n)).map(mk);
+      const devP=devices.filter(d=>!f||d.label.toLowerCase().includes(f)).map(d=>({host:d.label,role:`${d.owner} · ${d.battery}%`,ip:d.ip,self:false,presence:d.presence,
+        select:()=>this.setState({peerSel:d.name,result:''}),
+        rowStyle:`display:flex;align-items:center;gap:9px;cursor:pointer;padding:${this.pad()};border-left:3px solid ${st.peerSel===d.name?c.acc:'transparent'};background:${st.peerSel===d.name?c.l2:'transparent'};`,
+        dotStyle:`width:8px;height:8px;border-radius:50%;flex:none;background:${this.dot(d.presence)};`, sub:`${d.owner} · ${d.ip}`}));
+      vals.peerGroups=[{title:'Online',count:onlineP.length,items:onlineP},{title:'Idle',count:idleP.length,items:idleP},{title:'Offline',count:offP.length,items:offP},{title:'Devices',count:devP.length,items:devP}];
+      vals.filter=st.filter; vals.setFilter=(e)=>this.setState({filter:e.target.value});
+      vals.peerView=st.peerView; vals.setListView=()=>this.setState({peerView:'list'}); vals.setMapView=()=>this.setState({peerView:'map'});
+      vals.viewListStyle=this.segStyle(st.peerView==='list'); vals.viewMapStyle=this.segStyle(st.peerView==='map');
+      vals.showList=st.peerView==='list'; vals.showMap=st.peerView==='map';
+      vals.result=st.result;
+      const n=nodes.find(x=>x.host===st.peerSel)||nodes[0];
+      const isDev=!n||nodes.every(x=>x.host!==st.peerSel);
+      const dev=devices.find(d=>d.name===st.peerSel);
+      if(dev){
+        vals.sel={isDev:true,host:dev.label,role:`KDC device · ${dev.owner}`,ip:dev.ip,presence:dev.presence,presDot:`background:${this.dot(dev.presence)}`,
+          battery:dev.battery, version:'—', voice:'—',
+          actions:[{label:'Ring',en:dev.presence!=='offline'},{label:'Locate',en:dev.presence!=='offline'},{label:'Send file',en:dev.presence!=='offline'},{label:'KDC Hub',en:true}].map(a=>({...a,style:this.btnStyle(a.en),click:()=>this.act(a.label,dev.label)})),
+          containers:[],guests:[],media:[],hasSpark:false,roleCol:c.self};
+      } else {
+        vals.sel={isDev:false,host:n.host,role:n.role,ip:n.ip,pub:n.pub,presence:n.presence,version:n.version,
+          presDot:`background:${this.dot(n.presence)}`,
+          voice:n.voice, voiceDot:`background:${this.dot(n.voice)}`,
+          health:n.health, healthWhy:n.health_why||'all alarms clear', healthDot:`background:${this.dot(n.health)}`,
+          sync:n.sync==='behind'?`behind ${n.behind}`:(n.sync==='unknown'?'unknown':'synced'), syncCol:this.dot(n.sync),
+          drift:n.drift, certDays:n.cert, uptime:n.uptime, roleCol:n.lighthouse?c.acc2:(n.role==='Server'?c.t2:c.tx),
+          tags:(n.tags||[]).map(t=>({label:t,style:`font:500 10px 'Roboto Mono';text-transform:uppercase;letter-spacing:.5px;padding:2px 7px;border:1px solid ${c.l3};color:${c.t2};`})),
+          actions:[
+            {label:'Call',en:n.voice==='available'},{label:'SSH',en:n.ssh&&n.presence!=='offline'},{label:'RDP',en:n.rdp&&n.presence!=='offline'},{label:'VNC',en:n.vnc&&n.presence!=='offline'},
+            {label:'Trace',en:n.presence!=='offline'},{label:'Apply now',en:n.sync==='behind'},{label:n.presence==='offline'?'Wake':'Metrics',en:true},
+          ].map(a=>({...a,style:this.btnStyle(a.en),click:()=>this.act(a.label,n.host)})),
+          hasSpark:n.presence!=='offline',
+          sparkCpu:this.poly(this.spark(n.cpu+7,30,n.cpu*0.6,n.cpu*1.3),120,30),
+          sparkNet:this.poly(this.spark(n.net+3,30,n.net*0.4,n.net*1.4),120,30),
+          sparkLoad:this.poly(this.spark(parseFloat(n.load)*40+5,30,5,parseFloat(n.load)*40+30),120,30),
+          sparkDisk:this.poly(this.spark(n.disk+1,30,n.disk-3,n.disk+1),120,30),
+          cpuV:n.cpu+'%',netV:n.net+' kb/s',loadV:n.load,diskV:n.disk+'%',
+          containers:n.containers.map(x=>({...x,dot:`background:${x.state==='running'?c.ok:(x.state==='paused'?c.warn:c.mut)}`,
+            actStyle:this.miniBtn(), startStyle:this.miniBtn(), stop:()=>this.act('Stop '+x.name,n.host)})),
+          guests:n.guests.map(x=>({...x,spec:`${x.vcpu} vCPU · ${x.mem} GB · ${x.ip}`,dot:`background:${x.state==='running'?c.ok:(x.state==='paused'?c.warn:c.mut)}`})),
+          media:n.media.map(x=>({...x})),
+          hasContainers:n.containers.length>0,hasGuests:n.guests.length>0,hasMedia:n.media.length>0};
+      }
+      // map
+      const mp=this.mapModel(nodes);
+      vals.mapNodes=mp.nodes; vals.mapEdges=mp.edges;
+    }
+
+    // ---------- NODE ----------
+    if(key==='node'){
+      const n=nodes.find(x=>x.self);
+      vals.node={host:n.host,role:n.role,ip:n.ip,version:n.version,uptime:n.uptime,
+        hw:[['CPU','AMD Ryzen 7 7840U · 8C / 16T'],['Memory','32 GB DDR5 · '+n.mem+'% used'],['Disk','1 TB NVMe · '+n.disk+'% used'],['GPU','Radeon 780M (passthrough off)'],['Board','Framework 13 · BIOS 3.05'],['Kernel','6.14.6-300.fc41 · COSMIC']],
+        units:[['mackesd','active (running)',c.ok],['mde-bus','active (running)',c.ok],['nebula','active (running)',c.ok],['etcd','active (running)',c.ok],['syncthing','active (running)',c.ok],['mde-musicd','active (running)',c.ok],['mde-voice-hud','active (running)',c.ok],['mde-kdc-host','active (running)',c.ok]].map(([u,s,col])=>({unit:u,status:s,dot:`background:${col}`,btn:this.miniBtn()})),
+        ifaces:[['nebula1','10.10.0.10/16','overlay · trusted zone',c.self],['wlp1s0','192.168.1.42/24','Wi-Fi · home',c.t2],['enp2s0','down','ethernet',c.mut]].map(([d,a,k,col])=>({dev:d,addr:a,kind:k,col})),
+        fp:'9F2A 71C4 0E88 BD13 6A02 4FE9 C7A1 33DD',words:'amber-falcon-ledger-toffee',epoch:'epoch 7',cert:n.cert,
+        cfg:{rev:'r-2291',state:'synced · reconcile ok',applied:'14:31'}};
+    }
+
+    // ---------- MONITORING ----------
+    if(key==='monitoring'){
+      vals.monTab=st.monTab; vals.showHealth=st.monTab==='health'; vals.showLogs=st.monTab==='logs';
+      vals.setHealth=()=>this.setState({monTab:'health',panel:'health_check'}); vals.setLogs=()=>this.setState({monTab:'logs',panel:'mesh_logs'});
+      vals.healthSeg=this.segStyle(st.monTab==='health'); vals.logsSeg=this.segStyle(st.monTab==='logs');
+      vals.verdict={word:'READY',col:c.ok,sub:'overlay reachable · quorum healthy · audit chain intact'};
+      vals.doctor=[['Overlay reachability','7/8 peers + both lighthouses reachable','pass',c.ok],['Mesh DNS','.mesh resolving via systemd-resolved','pass',c.ok],['Firewall','firewalld overlay zone = trusted','pass',c.ok],['etcd quorum','3/3 members healthy (leader: lighthouse-nyc)','pass',c.ok],['Syncthing','all folders up to date','pass',c.ok],['Disk headroom','cedar at 86% — WARNING threshold','warn',c.warn],['CA cert expiry','41 days remaining — rotate soon','warn',c.warn],['Backup freshness','last verified restore 19h ago','pass',c.ok]].map(([t,d,s,col])=>({t,d,word:s.toUpperCase(),dot:`background:${col}`,col}));
+      vals.alarms=[{node:'cedar',sev:'WARNING',col:c.warn,m:'disk_space_usage / _opt 86%'},{node:'cedar',sev:'WARNING',col:c.warn,m:'load_15min above 4.0'},{node:'maple',sev:'CRITICAL',col:c.bad,m:'node unreachable'}];
+      vals.gauges=[['mesh_nodes_healthy','6'],['mesh_nodes_degraded','1'],['mesh_nodes_unreachable','1'],['audit_chain_intact','1'],['ca_cert_days_remaining','41'],['workers_alive','48'],['breaker_tripped','0'],['router_decision_p99_ms','3.4']].map(([k,v])=>({k,v}));
+      vals.logs=[
+        ['14:31:08','oak','mackesd','reconcile: revision r-2291 applied, 0 changes'],
+        ['14:30:55','oak','mde-bus','reply/01J9 published (4ms)'],
+        ['14:29:40','eagle','syncthing','folder mesh-storage up to date (0 need)'],
+        ['14:28:12','cedar','mackesd','ALERT disk_headroom: /opt 86% (warn)'],
+        ['14:27:03','lighthouse-nyc','nebula','handshake complete cedar (relay)'],
+        ['14:25:51','birch','mackesd','job nightly-backup target ok (2.1s)'],
+        ['14:24:18','oak','etcd','compacted to rev 88142'],
+        ['14:22:54','cedar','mackesd','drift: firewalld zone mismatch -> plan p-77'],
+        ['14:20:30','maple','mackesd','heartbeat timeout, marking offline'],
+        ['14:18:02','oak','mde-musicd','MPRIS now-playing updated'],
+      ].map(([t,h,u,m])=>({t,h,u,m}));
+    }
+
+    // ---------- DATACENTER ----------
+    if(key==='datacenter'){
+      vals.dcTabs=['Native','Instances','Snapshots','Images','Lighthouses','Build Farm'].map(t=>({label:t==='Native'?'Datacenter':t,sel:st.dcTab===t,style:this.tabStyle(st.dcTab===t),click:()=>this.setState({dcTab:t})}));
+      vals.dcZones=[['dev','Dev (Xen)'],['prod','Prod (DO)'],['gateway','Gateway']].map(([z,l])=>({label:l,style:this.segStyle(st.dcZone===z),click:()=>this.setState({dcZone:z})}));
+      vals.dcZoneLabel=({dev:'Dev (Xen)',prod:'Prod (DO)',gateway:'Gateway'})[st.dcZone];
+      vals.dcArmed=st.dcZone!=='prod'; vals.dcDisarmed=st.dcZone==='prod';
+      vals.showDcNative=st.dcTab==='Native'; vals.showDcFolded=st.dcTab!=='Native'; vals.dcFoldLabel=st.dcTab;
+      vals.dcCaps=[['Hosts','3 / 3 up',c.ok],['vCPU','38 / 64 allocated',c.acc2],['Memory','142 / 256 GB',c.acc2],['Running VMs','5',c.tx]].map(([l,v,col])=>({l,v,col}));
+      vals.hosts=[{name:'xcp-01',state:'running',vms:3,cpu:62,mem:71,pool:'master'},{name:'xcp-02',state:'running',vms:2,cpu:40,mem:55,pool:'member'},{name:'xcp-03',state:'standby',vms:0,cpu:0,mem:0,pool:'member'}].map(h=>({...h,dot:`background:${h.state==='running'?c.ok:c.mut}`,cpuBar:`width:${h.cpu}%;background:${c.acc}`,memBar:`width:${h.mem}%;background:${c.acc2}`,poolCol:h.pool==='master'?c.self:c.mut}));
+      vals.vms=[{name:'fedora-build',host:'xcp-01',state:'running',spec:'8 vCPU · 16 GB'},{name:'ubuntu-ci',host:'xcp-01',state:'running',spec:'8 vCPU · 16 GB'},{name:'win11-dev',host:'xcp-01',state:'running',spec:'4 vCPU · 8 GB'},{name:'win11-qa',host:'xcp-02',state:'paused',spec:'4 vCPU · 8 GB'},{name:'testbed-seed',host:'xcp-02',state:'running',spec:'2 vCPU · 4 GB'}].map(v=>({...v,dot:`background:${v.state==='running'?c.ok:(v.state==='paused'?c.warn:c.mut)}`}));
+      vals.matrix=[['fedora-farm','12.18.2','12.18.2','12.18.2'],['eagle','12.18.2','12.18.2','—'],['lighthouse-nyc','12.18.2','—','12.18.2'],['lighthouse-sfo','12.18.2','—','12.18.2']].map(([n,b,e,d])=>({n,b,e,d}));
+      vals.promo=[{stage:'Build (Xen)',v:'12.18.2',ok:true},{stage:'Eagle',v:'12.18.2',ok:true},{stage:'DO (prod)',v:'12.18.2',ok:true}];
+      vals.tofu=[['14:02','apply','zone1-do','+0 ~1 -0 · ok'],['11:18','plan','dev','+2 ~0 -1'],['09:40','apply','dev','+2 ~0 -1 · ok'],['Yesterday','destroy','dev/testbed','-4 · ok']].map(([t,k,ws,r])=>({t,k,ws,r,col:k==='destroy'?c.bad:(k==='apply'?c.acc2:c.t2)}));
+    }
+
+    // ---------- FLEET ----------
+    if(key==='fleet'){
+      const grp=(role)=>nodes.filter(n=>n.role===role).map(n=>({host:n.host,ip:n.ip,self:n.self,presence:n.presence,health:n.health,
+        dot:`background:${n.self?c.self:this.dot(n.presence)}`,
+        hdot:`background:${this.dot(n.health)}`,
+        sub:`${n.presence} · ${n.health}`,
+        tags:(n.tags||[]).map(t=>({label:t})),
+        cardStyle:`background:${c.l1};border:1px solid ${c.bd};border-top:2px solid ${this.dot(n.health)};padding:12px 13px;`,
+        select:()=>this.selectPanel('mesh','peers')&this.setState({peerSel:n.host})}));
+      vals.roleGroups=[{role:'Lighthouse',nodes:grp('Lighthouse')},{role:'Server',nodes:grp('Server')},{role:'Workstation',nodes:grp('Workstation')}];
+      vals.fleetStats=[['Roster',`${nodes.length} nodes`],['Online',`${online.length}`],['Roles','3'],['Tags','hop · execution · headless']].map(([l,v])=>({l,v}));
+      const mp=this.mapModel(nodes); vals.mapNodes=mp.nodes; vals.mapEdges=mp.edges;
+    }
+
+    return vals;
+  }
+
+  // ---- style helpers ----
+  segStyle(on){ const c=this.C(); return `cursor:pointer;padding:5px 13px;font:${on?500:400} 12px Roboto;color:${on?c.tx:c.t2};background:${on?c.l2:'transparent'};border:1px solid ${on?c.l3:c.bd};`; }
+  tabStyle(on){ const c=this.C(); return `cursor:pointer;padding:8px 15px;font:${on?500:400} 13px Roboto;color:${on?c.tx:c.mut};border-bottom:2px solid ${on?c.acc:'transparent'};`; }
+  btnStyle(en){ const c=this.C(); return `cursor:${en?'pointer':'not-allowed'};white-space:nowrap;padding:7px 13px;font:400 12px Roboto;color:${en?c.acc2:c.mut};background:transparent;border:1px solid ${en?c.l3:c.bd};opacity:${en?1:.5};`; }
+  miniBtn(){ const c=this.C(); return `cursor:pointer;padding:3px 9px;font:400 11px Roboto;color:${c.t2};background:transparent;border:1px solid ${c.l3};`; }
+  act(label,host){ this.setState({result:`${label} → ${host}: dispatched over mde-bus · ${new Date().toLocaleTimeString('en-GB')}`}); }
+
+  mapModel(nodes){
+    const c=this.C();
+    const pos={'lighthouse-nyc':[360,80],'lighthouse-sfo':[660,80],'oak':[180,330],'birch':[360,440],'eagle':[560,430],'cedar':[800,330],'fir':[300,560],'maple':[840,560]};
+    const mn=nodes.map(n=>{const p=pos[n.host]||[500,300];return{host:n.host,x:p[0],y:p[1],self:n.self,lighthouse:n.lighthouse,
+      fill:n.presence==='offline'?c.bg:(n.self?c.self:this.dot(n.health)),
+      stroke:n.self?c.self:(n.lighthouse?c.acc2:this.dot(n.presence)),
+      r:n.lighthouse?16:12,labelY:p[1]+(n.lighthouse?-22:26)};});
+    const E=(a,b,rtt,relay)=>{const pa=pos[a],pb=pos[b];return{x1:pa[0],y1:pa[1],x2:pb[0],y2:pb[1],mx:(pa[0]+pb[0])/2,my:(pa[1]+pb[1])/2,rtt:rtt+'ms',relay,
+      style:`stroke:${relay?c.l3:c.acc};stroke-width:${relay?1:2};stroke-dasharray:${relay?'4 4':'none'};opacity:.7;`,
+      flowStyle:`stroke:${c.acc2};stroke-width:2;stroke-dasharray:2 6;${this.props.reduceMotion?'':'animation:flow 1s linear infinite;'};opacity:${relay?0:.9};`};};
+    const edges=[E('oak','lighthouse-nyc',12,false),E('birch','lighthouse-nyc',14,false),E('eagle','lighthouse-nyc',9,false),E('cedar','lighthouse-sfo',22,true),E('fir','lighthouse-sfo',18,false),E('oak','eagle',2,false),E('birch','eagle',3,false),E('lighthouse-nyc','lighthouse-sfo',64,false),E('maple','lighthouse-sfo',0,true)];
+    return {nodes:mn,edges};
+  }
+}
+</script>
+</body>
+</html>
+

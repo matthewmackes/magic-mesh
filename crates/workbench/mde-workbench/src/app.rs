@@ -1435,7 +1435,12 @@ impl App {
         // so the wordmark + window controls span the full width.
         let window_header = crate::header::view(Message::WindowControl);
 
-        column![window_header, layout]
+        // UNIFY-1 — the Unified Workbench global status strip frames the whole
+        // app above the window header, surfacing live mesh chrome (this increment:
+        // mde-bus "chain" reachability + cluster mark).
+        let status_strip = crate::status_strip::view::<Message>(self.bus_reachable);
+
+        column![status_strip, window_header, layout]
             .width(Length::Fill)
             .height(Length::Fill)
             .into()

@@ -2522,3 +2522,49 @@ Reproducible + portable per-mesh DevOps backoffice on a dedicated control VM, re
   As the operator, I want the existing hand-stood-up backoffice migrated into the control-vm model, so the live mesh's DevOps plane becomes reproducible IaC and the LAN node is no longer a snowflake.
   - Running `backoffice-up.sh` with `MCNF_CONTROL_IP=172.20.145.192 --adopt` against the live founder etcd (quorum from `/etc/mackesd/etcd-endpoints`) converges state-backend + secrets + Forgejo + reconciler with NO destructive change; the live `/tofu/state/*` (incl. migrated edgeos) is readable by the new state-backend and a `tofu plan` of xen-xapi from the control VM shows 0-add/0-change/0-destroy (the `moved{}` port consumed against the live build VMs).
   - The live build farm (.50/.90/.130) stays managed (reconcile converges with the live nodes); secrets resolve from the store via the control VM's own re-sealed key and the `/root/.mcnf-*` fallback files can be removed without breaking `tofu plan` (closes DS-8); a DR backup restores into a throwaway etcd and a plan against it matches AND the restored Forgejo shows the named repo + admin row (DR round-trip proven, DAR-43).
+
+## UNIFY — the Single Workbench (one always-on GUI, dense Carbon console) (operator 2026-06-28; brief: docs/design/unified-workbench.md; visual: docs/design/workbench/Workbench.dc.html)
+
+Operator survey (3 rounds, 2026-06-28) locked: **one binary, all surfaces** — `mde-workbench`
+becomes THE single GUI (persistent main window + owned layer-shell overlays), absorbing Files /
+Voice / Notifications / the Apps launcher / all mesh-ops panels; **Music stays standalone** (the
+one exception); Cosmic applet + mesh-map wallpaper kept but owned by the one binary; **autostart on
+any node with a display**; **activity-bar + dense tree nav (VS Code style)**; **strict modern dense
+IBM Carbon** (Gray 100/90/10, `mde-theme` tokens only — no raw hex, §4); **big-bang single-release
+cutover**. **Supersedes FRONTDOOR Q40 (apps-standalone) + Q68 (summoned-only).** Build the cosmic/iced
+GUI on the farm (`./install-helpers/xcp-build.sh`) — local `cargo check`/build is farm-guarded off on
+the dev host. Every increment §7-complete (real data, no mockups) and builds green; visual restyle
+stays token-clean (`lint-carbon-tokens.sh`). Design→code targets below come from the 2026-06-28 impl
+recon (token map: `#161616→carbon::GRAY_100`, `#0f62fe→BLUE_60`, `#42be65→GREEN_40`,
+`#3ddbd9→TEAL_30`, etc.; render read-path `live_theme::palette()`).
+
+- [>] **UNIFY-1: shell — global status strip** *(top chrome band)*
+  **As** an operator, **I want** a persistent top strip with at-a-glance mesh status, **so that** core health is always visible regardless of panel.
+  **Acceptance** (runtime-observable):
+    - [✓] new `status_strip.rs`; injected in `app.rs::view()` as `column![status_strip, window_header, layout]`; 26 px band, token-only (no raw hex), `lint-carbon-tokens.sh` clean.
+    - [>] live **mde-bus "chain" indicator** reads real `App::bus_reachable` (green `chain ok` / red `bus offline`) — not a constant; **farm build green** (`xcp-build.sh cargo check -p mde-workbench`) [verifying].
+    - [ ] follow-on (UNIFY-5): CRIT/WARN/OK counts, event ticker, posture, uptime, clock — added only once their live sources are plumbed (no placeholders).
+- [ ] **UNIFY-2: shell — live mesh-health summary in App state**
+  **As** the shell, **I want** a single live `MeshHealth` summary (online/total, crit/warn/ok) in `App`, **so that** the strip, header chips, and events rail all read one real source.
+  **Acceptance:** an `App` field populated from the existing health/peer subscription (`mesh_directory::fetch_health`/`fetch_peers` path, not a fresh blocking call in `view()`); counts reflect live `action/mesh/*`; updates on the subscription tick; unit test on the derive.
+- [ ] **UNIFY-3: shell — Live Events right rail** *(collapsible)*
+  **As** an operator, **I want** a collapsible right rail streaming live mesh events, **so that** I can follow activity beside any panel.
+  **Acceptance:** new `events_rail.rs`; `App::events_rail_open` + `Message::ToggleLiveEventsRail` + update arm; `layout = row![sidebar, content, events_rail?]`; subscribes to the **real** Bus alert/event topic into a bounded ring buffer; severity counters + stream from live data; toggle in header; does not steal panel scroll/focus.
+- [ ] **UNIFY-4: shell — header refactor (breadcrumb + search + status + rail toggle)**
+  **As** an operator, **I want** the header to carry the breadcrumb, a command/search omnibox, status chips, and the rail toggle, **so that** the shell matches the design.
+  **Acceptance:** `header.rs::view` takes breadcrumb + search + status + rail-toggle; breadcrumb removed from `app.rs::page_heading`; search routes to real panel/peer results (no dead box); status chips read UNIFY-2 summary.
+- [ ] **UNIFY-5: shell — status-strip ticker / posture / uptime / clock (live sources)**
+  **As** an operator, **I want** the full status strip, **so that** it matches the design — but only real data.
+  **Acceptance:** ticker shows real recent events (UNIFY-3 source); clock ticks via a gated 1 s subscription; uptime from a real daemon signal; posture from a real signal or omitted; no placeholder values (§7).
+- [ ] **UNIFY-6: widgets — reusable dense Carbon components**
+  **As** the GUI, **I want** shared widgets, **so that** screens stop reinventing them.
+  **Acceptance:** add to `controls.rs`/`panel_chrome.rs` (each used by ≥2 screens, token-clean): `status_dot`, `segmented_control` (active-underline), `kpi_stat_tile`, zebra `data_table` (sortable header, expandable row), `progress_bar`, `tabs`; reuse existing `sparkline::sparkline`, `peers_map::MapProgram`, `panel_chrome::{card,section_header,empty_state,error_state}`.
+- [ ] **UNIFY-7: nav — activity-bar + collapsible tree + guided Empty routing**
+  **As** an operator, **I want** the design's 8-group collapsible nav with a guided empty state, **so that** the full nav renders day one.
+  **Acceptance:** `sidebar.rs` renders the 8 `Group`s collapsibly (reuse `SidebarState`); unimplemented panels route to `panel_chrome::empty_state` with the worklist/`mde --focus <slug>` hint (design Empty); deep-link slugs preserved (`view_from_focus_slug`).
+- [ ] **UNIFY-8..12: screen restyles to the design (data stays live)**
+  **As** an operator, **I want** Overview, Peers, This Node, Monitoring, Datacenter, Fleet restyled to `Workbench.dc.html`, **so that** the app matches the approved design.
+  **Acceptance (per screen):** restyle the backing panel (`front_door.rs`, `peers.rs`+`peers_map.rs`, `hardware.rs`, `health_check.rs`+`mesh_logs.rs`, `datacenter.rs`, `fleet_rollup.rs`) to the dc.html layout using UNIFY-6 widgets; **all data remains real** (existing Bus topics); loading/empty/error states preserved (`panel_chrome::error_state`, EFF-45); `lint-carbon-tokens.sh`/`lint-motion.sh` clean; builds + `cargo test -p mde-workbench` green.
+- [ ] **UNIFY-13: density compact default + toggle surfaced**
+  **As** a power user, **I want** the compact density the design defaults to, **so that** the console is information-dense.
+  **Acceptance:** density picker (reuse `Density`/`Preferences`) surfaced in the shell; compact applies across panels via `panel_chrome` spacing; persists.
