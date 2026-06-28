@@ -1,5 +1,5 @@
 Some(([
-    "com.mackes.MagicMeshApps",
+    "com.system76.CosmicPanelButton",
     "com.system76.CosmicAppList",
 ], [
     "com.mackes.MagicMeshApplet",

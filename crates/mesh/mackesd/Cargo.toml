@@ -373,9 +373,10 @@ assets = [
     # AUD-4 — the §5 Cosmic integration: the mesh-health cosmic-applet binary +
     # its X-CosmicApplet .desktop so cosmic-panel discovers + hosts it.
     { source = "target/release/mde-cosmic-applet",  dest = "/usr/bin/mde-cosmic-applet",  mode = "755" },
-    # APPS-9 — the Applications Panel launcher applet; the baked layout lists
-    # com.mackes.MagicMeshApps in the panel/dock in place of Cosmic's app-library.
-    { source = "target/release/mde-apps-applet",    dest = "/usr/bin/mde-apps-applet",    mode = "755" },
+    # APPLAUNCH-9 (2026-06-27) — the mde-apps-applet launcher binary was RETIRED:
+    # the app-launcher role folded into the Front Door (one launcher). The Start
+    # button now opens the Front Door launcher (com.mackes.MagicMeshApps.desktop →
+    # `mde-workbench --focus launcher`); nothing ships mde-apps-applet anymore.
     # AUD-6 / PKG-5 — the first-run deployment-role chooser GUI (autostart below).
     { source = "target/release/mde-role-chooser",   dest = "/usr/bin/mde-role-chooser",   mode = "755" },
     # PKG-3 — the self-gating daemon unit + the role-gated app units.

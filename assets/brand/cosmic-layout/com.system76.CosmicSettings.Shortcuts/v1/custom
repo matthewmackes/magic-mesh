@@ -1,0 +1,14 @@
+// APPLAUNCH-8/9 (2026-06-27) — the Super key opens the Front Door's unified
+// launcher (the SOLE launcher trigger, replacing the retired `mde-apps-applet
+// --toggle`). A Cosmic custom keybinding spawns the workbench focus deep-link;
+// the workbench raises + opens its launcher panel mode (Q24 — Super-key toggle:
+// pressing Super again closes it, the Front Door's ToggleLauncher being a toggle).
+{
+    (
+        modifiers: [
+            Super,
+        ],
+        key: "",
+        description: Some("Open the MCNF launcher (Front Door)"),
+    ): Spawn("mde-workbench --focus launcher"),
+}

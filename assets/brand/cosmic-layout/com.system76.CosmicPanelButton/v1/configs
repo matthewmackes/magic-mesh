@@ -1,0 +1,12 @@
+{
+    "Panel": (
+        force_presentation: None,
+        configs: {
+            "com.mackes.MagicMeshApps": Custom(
+                name: "MCNF Launcher",
+                icon: "magic-mesh",
+                exec: "mde-workbench --focus launcher",
+            ),
+        },
+    ),
+}
