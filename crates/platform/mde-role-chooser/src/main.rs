@@ -49,6 +49,12 @@ fn role_blurb(role: Role) -> (&'static str, &'static str) {
             "Relay-only mesh node — Nebula overlay + control plane. No storage \
              brick, no desktop. VPS-friendly. (Rank 0)",
         ),
+        Role::LighthouseMedia => (
+            "Lighthouse (Media)",
+            "A Lighthouse that also hosts the mesh music service — runs the capped \
+             Navidrome container behind music.mesh. Pick this only on a node with \
+             enough RAM/disk for the container. (Rank 0 + media)",
+        ),
         Role::Server => (
             "Server",
             "Headless mesh peer — Lighthouse + a replicated storage brick + \

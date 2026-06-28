@@ -66,6 +66,20 @@ pub fn min_rank(worker: &str) -> u8 {
         .map_or(0, |(_, r)| *r)
 }
 
+/// MEDIA-1 — the media-only worker tier. These workers gate on the orthogonal
+/// **media capability** ([`mde_role::Role::serves_media`]), NOT the rank ladder:
+/// they run ONLY on a `Lighthouse_Media` node and are absent on every stock
+/// Lighthouse / Server / Workstation. A rank gate can't express this (the media
+/// LH shares the Lighthouse rank, and Server/Workstation outrank it), so the
+/// spawn sites gate these names through [`runs_media`] instead of [`runs`].
+pub const MEDIA_WORKERS: &[&str] = &["media_navidrome"];
+
+/// Whether `worker` is a media-only worker (gated by [`runs_media`], not rank).
+#[must_use]
+pub fn is_media_worker(worker: &str) -> bool {
+    MEDIA_WORKERS.contains(&worker)
+}
+
 /// Resolve the deployment rank that gates worker spawns: the pinned role's
 /// rank, or **Workstation (2) when unpinned** (a dev tree / pre-role-pin box
 /// runs the full set — the desktop workers idle gracefully without a Wayland
@@ -108,6 +122,37 @@ pub fn resolve_rank_strict() -> Result<u8, String> {
 #[must_use]
 pub fn runs(worker: &str, role_rank: u8) -> bool {
     role_rank >= min_rank(worker)
+}
+
+/// Resolve the full pinned [`Role`] (not just its rank), with the same tolerant
+/// defaults as [`resolve_rank`]: **Workstation when unpinned** (a dev tree runs
+/// the full set), **Lighthouse when malformed** (fail closed to the relay-only
+/// plane). The media capability is read off the returned role.
+#[must_use]
+pub fn resolve_role() -> Role {
+    match mde_role::load() {
+        Ok(role) => role,
+        Err(mde_role::LoadError::NotPinned) => Role::Workstation,
+        Err(_) => Role::Lighthouse,
+    }
+}
+
+/// MEDIA-1 — whether THIS node hosts the media service tier (it is pinned
+/// `Lighthouse_Media`). Fail-closed: an unpinned or unreadable role is **not**
+/// media-capable, so the Navidrome supervisor never spawns except on a node
+/// explicitly pinned as a media lighthouse — the container is provably absent
+/// off that class. Reads `/var/lib/mde/role.toml` locally; no mesh needed.
+#[must_use]
+pub fn node_serves_media() -> bool {
+    mde_role::load().is_ok_and(Role::serves_media)
+}
+
+/// Whether `role` runs the media-only `worker`: a [`MEDIA_WORKERS`] entry runs
+/// iff the role serves media; a non-media worker is not gated here (use
+/// [`runs`]). The combined node check used by the spawn sites.
+#[must_use]
+pub fn runs_media(worker: &str, role: Role) -> bool {
+    is_media_worker(worker) && role.serves_media()
 }
 
 /// Every worker a box at `role_rank` runs — the role-gated subset (plan §12).
@@ -225,6 +270,39 @@ mod tests {
     fn unknown_worker_defaults_to_lighthouse() {
         assert_eq!(min_rank("some-future-worker"), 0);
         assert!(runs("some-future-worker", Role::Lighthouse.rank()));
+    }
+
+    #[test]
+    fn media_worker_runs_only_on_a_media_lighthouse() {
+        // MEDIA-1 — the media tier gates on the media capability, never the rank.
+        // A `Lighthouse_Media` runs it; NO other role does — not even Workstation
+        // (the highest rank), proving the container is absent off the subclass.
+        assert!(is_media_worker("media_navidrome"));
+        assert!(!is_media_worker("mesh_dns"));
+        assert!(runs_media("media_navidrome", Role::LighthouseMedia));
+        for r in [Role::Lighthouse, Role::Server, Role::Workstation] {
+            assert!(
+                !runs_media("media_navidrome", r),
+                "{r} must NOT run the media worker"
+            );
+        }
+        // A non-media worker is never gated by the media check (use `runs`).
+        assert!(!runs_media("mesh_dns", Role::LighthouseMedia));
+    }
+
+    #[test]
+    fn media_lighthouse_runs_the_full_lighthouse_control_plane() {
+        // The media subclass shares the Lighthouse rank, so it runs exactly the
+        // rank-0 relay control plane (plus the media worker via the capability
+        // gate) — and none of the Server/Workstation rank tiers.
+        let r = Role::LighthouseMedia.rank();
+        assert_eq!(r, Role::Lighthouse.rank());
+        for w in ["nebula_supervisor", "heartbeat", "mesh_router", "mesh_dns"] {
+            assert!(runs(w, r), "media LH must run the rank-0 worker {w}");
+        }
+        for w in ["app-sync", "kdc_host"] {
+            assert!(!runs(w, r), "media LH must NOT run the higher-tier {w}");
+        }
     }
 
     #[test]

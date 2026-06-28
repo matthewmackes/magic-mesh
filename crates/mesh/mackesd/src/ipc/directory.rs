@@ -262,7 +262,8 @@ impl DirectoryService {
         let (mut healthy, mut degraded, mut unreachable) = (0u32, 0u32, 0u32);
         // HA-4 — count the lighthouses in the live directory so healthz can flag
         // `degraded: no HA` below the 2-lighthouse floor. The directory's `role`
-        // is "lighthouse" for tagged peers (see `build_directory`).
+        // is "lighthouse" (or the MEDIA-1 subclass "lighthouse-media", which is
+        // also a relay anchor) for tagged peers (see `build_directory`).
         let mut lighthouses = 0u32;
         for p in &peers {
             match p["health"].as_str() {
@@ -273,7 +274,7 @@ impl DirectoryService {
             if p["presence"].as_str() == Some("offline") {
                 unreachable += 1;
             }
-            if p["role"].as_str() == Some("lighthouse") {
+            if mackes_mesh_types::lighthouse::role_is_lighthouse(p["role"].as_str()) {
                 lighthouses += 1;
             }
         }

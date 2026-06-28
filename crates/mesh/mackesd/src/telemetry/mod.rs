@@ -208,7 +208,10 @@ pub fn spawn_heartbeat_worker(
                 // into the directory so the enroll roster can hand joining nodes
                 // the FULL lighthouse set (redundancy). Only lighthouses carry it;
                 // others leave it None (skipped from any built roster).
-                if rec.role.as_deref() == Some(mackes_mesh_types::lighthouse::LIGHTHOUSE_ROLE) {
+                // Either lighthouse kind (the stock relay or the MEDIA-1 media
+                // subclass) is a public anchor a joining node must learn, so both
+                // stamp their public underlay address into the roster.
+                if mackes_mesh_types::lighthouse::role_is_lighthouse(rec.role.as_deref()) {
                     rec.external_addr = crate::lighthouse_addr::read_external_addr();
                 }
                 if etcd_endpoints.is_empty() {

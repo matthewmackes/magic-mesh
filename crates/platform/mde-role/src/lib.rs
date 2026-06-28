@@ -21,13 +21,30 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-/// A deployment role. Each variant is a strict superset of the one below it;
-/// [`Role::rank`] gives the total order the upgrade-only invariant compares.
+/// A deployment role. The capability **rank** ladder is the strict superset
+/// chain `Lighthouse ⊂ Server ⊂ Workstation` (ranks 0/1/2); [`Role::rank`] gives
+/// the total order the upgrade-only invariant compares.
+///
+/// [`Role::LighthouseMedia`] (MEDIA-1) is a **lateral specialization of the
+/// Lighthouse tier** — same rank-0 relay control plane, *plus* the media-serving
+/// capability ([`Role::serves_media`]). It is NOT a new rung in the linear
+/// ladder (a Server/Workstation is not "more" of a media lighthouse); it is a
+/// dedicated, adequately-resourced lighthouse subclass that hosts the Navidrome
+/// music service, gated off the orthogonal media capability rather than the
+/// rank. This keeps the superset doctrine coherent: a media lighthouse still IS
+/// a lighthouse for HA/roster/quorum (see `mackes_mesh_types::lighthouse`), it
+/// simply additionally serves music.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
     /// Relay-only mesh node — Nebula overlay + the `mackesd` control plane,
     /// no storage brick, no desktop. Rank 0. VPS-friendly.
     Lighthouse,
+    /// Media-serving lighthouse (MEDIA-1) — a Lighthouse (rank 0) **plus** the
+    /// media capability: it hosts the capped Navidrome music container and the
+    /// media-only worker tier. A lateral subclass of `Lighthouse`, not a higher
+    /// rank — selected at install/enroll for nodes provisioned with enough
+    /// RAM/disk to run the container (never the tiny stock master).
+    LighthouseMedia,
     /// Headless mesh peer — Lighthouse + a storage brick + fleet/monitoring
     /// workers. No desktop. Rank 1.
     Server,
@@ -36,31 +53,51 @@ pub enum Role {
 }
 
 impl Role {
-    /// Capability rank; a higher number is a richer superset.
+    /// Capability rank; a higher number is a richer superset. `LighthouseMedia`
+    /// shares the Lighthouse rank (0) — it is a media-capable lighthouse, not a
+    /// higher control-plane tier (its extra duty is gated by [`Self::serves_media`],
+    /// not the rank).
     #[must_use]
     pub const fn rank(self) -> u8 {
         match self {
-            Self::Lighthouse => 0,
+            Self::Lighthouse | Self::LighthouseMedia => 0,
             Self::Server => 1,
             Self::Workstation => 2,
         }
     }
 
-    /// Lowercase canonical name — the `--profile=` argument and the value
-    /// written to `role.toml`.
+    /// Whether this role hosts the mesh media service (MEDIA-1): true only for
+    /// [`Self::LighthouseMedia`]. The media-only `mackesd` worker tier gates on
+    /// this — stock Lighthouse / Server / Workstation nodes never run the
+    /// Navidrome supervisor, so the container is absent off a media lighthouse.
+    #[must_use]
+    pub const fn serves_media(self) -> bool {
+        matches!(self, Self::LighthouseMedia)
+    }
+
+    /// Lowercase canonical name — the `--profile=` / `--role=` argument and the
+    /// value written to `role.toml` (and stamped into the replicated peer
+    /// directory by the heartbeat, so a node's class is identifiable mesh-wide).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Lighthouse => "lighthouse",
+            Self::LighthouseMedia => "lighthouse-media",
             Self::Server => "server",
             Self::Workstation => "workstation",
         }
     }
 
-    /// All roles, lowest rank first.
+    /// All roles, lowest rank first (`LighthouseMedia` immediately after its
+    /// `Lighthouse` base, both rank 0).
     #[must_use]
-    pub const fn all() -> [Self; 3] {
-        [Self::Lighthouse, Self::Server, Self::Workstation]
+    pub const fn all() -> [Self; 4] {
+        [
+            Self::Lighthouse,
+            Self::LighthouseMedia,
+            Self::Server,
+            Self::Workstation,
+        ]
     }
 }
 
@@ -95,6 +132,11 @@ impl FromStr for Role {
         // pinned via either vocabulary resolves (E1.4 bridges the installer).
         match s.trim().to_ascii_lowercase().as_str() {
             "lighthouse" => Ok(Self::Lighthouse),
+            // MEDIA-1 — the media-serving lighthouse subclass, accepted under a
+            // few natural spellings so `--role` / the chooser / the installer
+            // all resolve it (canonical `lighthouse-media`, written to disk).
+            "lighthouse-media" | "lighthouse_media" | "media-lighthouse" | "lighthouse+media"
+            | "media" => Ok(Self::LighthouseMedia),
             "server" | "headless" => Ok(Self::Server),
             "workstation" | "full" => Ok(Self::Workstation),
             other => Err(ParseRoleError(other.to_string())),
@@ -355,9 +397,25 @@ mod tests {
 
     #[test]
     fn rank_is_a_strict_total_order() {
+        // The linear control-plane ladder is strict: Lighthouse < Server <
+        // Workstation. LighthouseMedia is a LATERAL rank-0 specialization (a
+        // media-capable lighthouse), so it shares the Lighthouse rank.
         assert!(Role::Lighthouse.rank() < Role::Server.rank());
         assert!(Role::Server.rank() < Role::Workstation.rank());
-        assert_eq!([0, 1, 2], Role::all().map(Role::rank));
+        assert_eq!(Role::LighthouseMedia.rank(), Role::Lighthouse.rank());
+        assert_eq!([0, 0, 1, 2], Role::all().map(Role::rank));
+    }
+
+    #[test]
+    fn only_the_media_lighthouse_serves_media() {
+        // MEDIA-1 — the media capability is orthogonal to the rank ladder; it is
+        // carried by exactly one role, so the media worker tier never lands on a
+        // stock lighthouse / server / workstation.
+        assert!(Role::LighthouseMedia.serves_media());
+        for r in [Role::Lighthouse, Role::Server, Role::Workstation] {
+            assert!(!r.serves_media(), "{r} must not serve media");
+        }
+        assert_eq!(Role::LighthouseMedia.as_str(), "lighthouse-media");
     }
 
     #[test]
@@ -365,11 +423,22 @@ mod tests {
         assert_eq!("lighthouse".parse(), Ok(Role::Lighthouse));
         assert_eq!("server".parse(), Ok(Role::Server));
         assert_eq!("workstation".parse(), Ok(Role::Workstation));
+        // MEDIA-1 — the media lighthouse + its accepted spellings.
+        assert_eq!("lighthouse-media".parse(), Ok(Role::LighthouseMedia));
+        assert_eq!("lighthouse_media".parse(), Ok(Role::LighthouseMedia));
+        assert_eq!("media-lighthouse".parse(), Ok(Role::LighthouseMedia));
+        assert_eq!("media".parse(), Ok(Role::LighthouseMedia));
+        // round-trips through the canonical on-disk slug
+        assert_eq!(
+            Role::LighthouseMedia.as_str().parse(),
+            Ok(Role::LighthouseMedia)
+        );
         // installer vocabulary aliases
         assert_eq!("headless".parse(), Ok(Role::Server));
         assert_eq!("full".parse(), Ok(Role::Workstation));
         // case-insensitive + trimmed
         assert_eq!("  WORKSTATION ".parse(), Ok(Role::Workstation));
+        assert_eq!("  Lighthouse-Media ".parse(), Ok(Role::LighthouseMedia));
         assert!("server-plus".parse::<Role>().is_err());
     }
 
