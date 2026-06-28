@@ -254,6 +254,117 @@ pub enum Message {
     /// sentinel so it never shows again on this node (Q71 — no tour, the greeting
     /// is the whole onboarding). A pure local flip + a best-effort file write.
     DismissGreeting,
+
+    // ───────────────────── APPLAUNCH — the unified launcher ─────────────────────
+    /// APPLAUNCH-8 — toggle the unified app-launcher view (the Start/Super-key
+    /// surface). Opening it paints instantly from the cached entry list (Q49
+    /// <150ms) and kicks an async refresh; closing returns to the tile grid.
+    ToggleLauncher,
+    /// APPLAUNCH-1 — the operator picked a filter chip (Local/Mesh/Workloads/
+    /// Services/Favorites). Clears the keyboard selection to the top of the new list.
+    /// `Mesh` also clears any focused peer (re-pick to re-query, APPLAUNCH-5).
+    LauncherFilter(launcher::Filter),
+    /// APPLAUNCH-8 — Tab / Shift+Tab cycle the filter chips by `delta` (+1/-1,
+    /// wrapping). Keyboard-first chip nav.
+    LauncherChipCycle(i32),
+    /// APPLAUNCH-4 — collapse / expand the operator-group section named by the
+    /// string in the Local (All-apps) view. A pure local view-state flip.
+    LauncherToggleGroup(String),
+    /// APPLAUNCH-2 — the launcher search box text changed. Drives the fuzzy filter
+    /// + resets the selection to the top hit. A leading `>` arms the Run box.
+    LauncherSearch(String),
+    /// APPLAUNCH-7 — a fresh aggregated entry list + favorites + groups landed off
+    /// the async `action/apps/{list,favorites,groups}` reads (the cache refresh).
+    /// Boxed so the enum stays small. Folded in without disturbing the open view.
+    LauncherLoaded(Box<LauncherData>),
+    /// APPLAUNCH-1 — activate the entry at the given filtered-list index: local app
+    /// → focus-or-launch; mesh/peer app → remmina RD; service → open endpoint;
+    /// workload → (start if stopped). Closes the launcher behind the action. A
+    /// Run-box (`>cmd`) query activates the command instead.
+    LauncherActivate(usize),
+    /// APPLAUNCH-8 — keyboard nav: move the selection by `delta` rows (clamped).
+    LauncherMove(i32),
+    /// APPLAUNCH-1 — pin / unpin the entry at the given index (favorites).
+    /// Persists via `action/apps/set-favorite`; the reply refreshes the pin set.
+    LauncherTogglePin(usize),
+    /// APPLAUNCH-5 — focus a mesh peer (by hostname): query its installed `.desktop`
+    /// set on demand (`action/apps/peer-list`) with a timeout so a slow/dead peer
+    /// never blocks the UI (lazy-mesh). Surfaces the apps with an on-peer badge.
+    LauncherFocusPeer(String),
+    /// APPLAUNCH-5 — a focused peer's app set landed (or the query timed out → an
+    /// empty set). Carries the peer hostname it was fired for (so a stale reply for
+    /// a since-changed focus is dropped) + the parsed entries.
+    LauncherPeerApps(String, Vec<launcher::Entry>),
+    /// APPLAUNCH-6 — open / close the per-entry context menu for the entry at the
+    /// given index (Properties / Copy command / Open location / Uninstall). `None`
+    /// closes it. A pure local view-state flip.
+    LauncherContextMenu(Option<usize>),
+    /// APPLAUNCH-6 — copy the entry-at-index's command (or service endpoint) to the
+    /// clipboard. A real best-effort `wl-copy`; closes the context menu.
+    LauncherCopyCommand(usize),
+    /// APPLAUNCH-6 — open the entry-at-index's `.desktop` file location in the file
+    /// manager (Open location). Closes the context menu.
+    LauncherOpenLocation(usize),
+    /// APPLAUNCH-6 — arm the confirm-gated uninstall for the entry at the given
+    /// index (sets the pending-uninstall id so the row shows the typed confirm).
+    /// `None` disarms. APPLAUNCH out-of-scope guard: no install path, only remove.
+    LauncherArmUninstall(Option<usize>),
+    /// APPLAUNCH-6 — the operator confirmed the uninstall for the entry at the
+    /// given index. Publishes `action/apps/uninstall` (confirm-gated, §9) + refreshes
+    /// the list on the reply. The result note lands via [`Message::LauncherActionResult`].
+    LauncherConfirmUninstall(usize),
+    /// APPLAUNCH-6 — a workload control (start/stop/attach) for the entry at the
+    /// given index fired. Spawns the typed `virsh`/`podman` argv locally (§9 — a
+    /// real Command, no shell) + refreshes the list.
+    LauncherWorkload(usize, WorkloadKind),
+    /// APPLAUNCH-6 — restart-if-owned for the service entry at the given index (the
+    /// service card action). Fires the owning unit's restart when this node owns it.
+    LauncherRestartService(usize),
+    /// APPLAUNCH-6 — a launcher action's reply landed (workload / service
+    /// restart). The bool is `ok`; the string is the detail/error, shown as a
+    /// transient note. Best-effort; a degrade is a quiet note, never a panic.
+    LauncherActionResult(bool, String),
+    /// APPLAUNCH-6 — the uninstall reply landed: its `(ok, detail)` note PLUS the
+    /// fresh cache (the removed app drops out of the list). Boxed so the enum stays
+    /// small.
+    LauncherUninstallDone(bool, String, Box<LauncherData>),
+    /// APPLAUNCH-8 — a slimmed Win+X power-menu action (Q17): the essentials only
+    /// (Terminal / Settings / Files / Lock / Power-off / Reboot / → Workbench). A
+    /// real action — launch / system command / a workbench view — never a stub (§7).
+    LauncherPower(PowerAction),
+}
+
+/// APPLAUNCH-8 — the slimmed Win+X power menu's essentials (Q17). Each maps to a
+/// REAL effect: a launch, a system power command, the local lock, or a jump to the
+/// Workbench surface. No bespoke quick-toggles (Q40 — Cosmic's panel owns those).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerAction {
+    /// Open a terminal.
+    Terminal,
+    /// Open Cosmic Settings.
+    Settings,
+    /// Open the file manager.
+    Files,
+    /// Lock the session (best-effort `loginctl lock-session`).
+    Lock,
+    /// Power off (`systemctl poweroff`).
+    PowerOff,
+    /// Reboot (`systemctl reboot`).
+    Reboot,
+    /// Leave the launcher → the full Workbench (closes the launcher surface).
+    Workbench,
+}
+
+/// APPLAUNCH-6 — a workload control kind (Q11 inline start/stop/attach), mirroring
+/// the mackesd `WorkloadAction`. Carried in [`Message::LauncherWorkload`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadKind {
+    /// Start a stopped VM/container.
+    Start,
+    /// Stop a running VM/container.
+    Stop,
+    /// Attach to the console / shell (run in a terminal).
+    Attach,
 }
 
 /// FRONTDOOR-3 — which of the two locked render modes the Front Door is in
@@ -282,6 +393,27 @@ const RAIL_WIDTH: f32 = 260.0;
 /// returns `None` immediately when there's no Bus data-dir, so this ceiling only
 /// bounds the genuinely-waiting-on-a-leader case.
 const COPILOT_ASK_TIMEOUT: Duration = Duration::from_secs(130);
+
+/// APPLAUNCH-7 — the apps-aggregator `list` round-trip ceiling. The aggregation
+/// scans local `.desktop` + reads the replicated planes, so it can take a beat
+/// the first time; 4 s bounds the genuinely-waiting case while a no-Bus / no-
+/// responder environment returns `None` immediately (cache-first keeps the open
+/// instant regardless). The read runs off-thread, so even this never blocks the UI.
+const APPS_LIST_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// APPLAUNCH — the cheap apps verbs (`favorites`/`groups`/`set-favorite`/
+/// `peer-list`/`uninstall`/the launch resolve) round-trip ceiling. These are
+/// single-file reads / a typed spawn, so a short budget keeps a missing responder
+/// from stalling the off-thread Task. A focused-peer query (`peer-list`) is a
+/// local-disk read of the replicated file, so this bounds it well under the
+/// lazy-mesh "never blocks" lock (Q49).
+const APPS_VERB_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// APPLAUNCH-6 — the uninstall round-trip ceiling. `dnf remove` / `flatpak
+/// uninstall` can run for many seconds (dependency resolution + the transaction),
+/// so it gets real headroom — but it's confirm-gated + off-thread, so the wait
+/// never blocks the UI (the launcher closes; the note lands when it returns).
+const UNINSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The Carbon token a tile's accent strip + label color reads from. Picked per
 /// tile kind so DevOps/Data-Center/alert tiles read distinctly against the
@@ -1282,6 +1414,591 @@ pub(super) mod search {
     }
 }
 
+// ===================== APPLAUNCH: the unified app-launcher view ==============
+
+/// APPLAUNCH-1..7 — the Front Door's unified app-launcher model. The mackesd
+/// `apps_aggregator` (`action/apps/list`) serves the unified entry list; this
+/// render-agnostic layer parses that reply + filters/fuzzy-searches it per chip so
+/// the view stays thin. The workbench must NOT depend on `mackesd` (§6 boundary),
+/// so this mirrors the WIRE JSON into a local shape — exactly as FD-6 parses
+/// FD-9's `AskReply` JSON locally. Pure (no Bus / no view) so the parse + fuzzy +
+/// filter are unit-tested directly; the Bus reads are thin shells over this.
+///
+/// This folds the standalone `mde-apps-applet`'s launcher model into the Front
+/// Door at parity (APPLAUNCH-9 then retires the applet) — the same `Entry` shape,
+/// the same favorites/groups/launch verbs, the same focus-or-launch + remmina RD
+/// paths, now keyboard-first and fuzzy-searched in the one launcher.
+pub(super) mod launcher {
+    use std::collections::HashSet;
+
+    /// One launchable entry, decoded from the `action/apps/list` reply. Mirrors
+    /// the mackesd `AppEntry` wire shape (§6 — parsed, not imported).
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+    pub struct Entry {
+        /// Stable id (desktop-file id for local apps, else `kind:node:name`).
+        pub id: String,
+        /// Display name.
+        pub name: String,
+        /// `app` | `mesh-app` | `workload` | `service`.
+        pub kind: String,
+        /// `xdg` | `flatpak` | `peer` | `podman` | `libvirt` | `service`.
+        #[serde(default)]
+        pub source: String,
+        /// Owning node hostname — empty for local.
+        #[serde(default)]
+        pub node: String,
+        /// Local exec line (apps) — empty otherwise.
+        #[serde(default)]
+        pub exec: String,
+        /// Service/remote endpoint — empty otherwise.
+        #[serde(default)]
+        pub endpoint: String,
+        /// Icon name (XDG icon-theme name for local apps).
+        #[serde(default)]
+        pub icon: String,
+        /// Mesh presence/health tier — empty for local.
+        #[serde(default)]
+        pub health: String,
+        /// Workload run state — empty otherwise.
+        #[serde(default)]
+        pub state: String,
+        /// APPLAUNCH-2 — `.desktop` Keywords, for the search scope (name + keywords
+        /// + description). Absent in the aggregator reply today → empty (the search
+        /// still matches name + comment); carried so a future aggregator that emits
+        /// it widens the match with no view change.
+        #[serde(default)]
+        pub keywords: String,
+        /// APPLAUNCH-2 — `.desktop` Comment / description, for the search scope.
+        #[serde(default)]
+        pub comment: String,
+    }
+
+    /// APPLAUNCH-1 — the launcher's filter chips (Q2). `Favorites` is the landing
+    /// grid (Q3); `All` is the operator-grouped all-apps view (= the Apps filter,
+    /// Q32). The kind chips isolate one entry kind.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum Filter {
+        /// Pinned favorites (any kind), the landing view (Q3).
+        #[default]
+        Favorites,
+        /// Local XDG + Flatpak apps (= the All-apps view, grouped — Q32/Q4).
+        Local,
+        /// Mesh peers (remote-desktop targets + on-demand peer apps).
+        Mesh,
+        /// Containers + VMs.
+        Workloads,
+        /// Published mesh services.
+        Services,
+    }
+
+    impl Filter {
+        /// All chips, in display order (Favorites first — Q3).
+        #[must_use]
+        pub fn all() -> [Filter; 5] {
+            [
+                Filter::Favorites,
+                Filter::Local,
+                Filter::Mesh,
+                Filter::Workloads,
+                Filter::Services,
+            ]
+        }
+
+        /// Chip label.
+        #[must_use]
+        pub fn label(self) -> &'static str {
+            match self {
+                Filter::Favorites => "Favorites",
+                Filter::Local => "Local",
+                Filter::Mesh => "Mesh",
+                Filter::Workloads => "Workloads",
+                Filter::Services => "Services",
+            }
+        }
+
+        /// The entry `kind` this chip shows (None for Favorites = by-pin). `Local`
+        /// is the local-app kind (`app`); `Mesh` shows the `mesh-app` kind plus
+        /// on-demand peer apps folded in by the view.
+        #[must_use]
+        pub fn kind(self) -> Option<&'static str> {
+            match self {
+                Filter::Favorites => None,
+                Filter::Local => Some("app"),
+                Filter::Mesh => Some("mesh-app"),
+                Filter::Workloads => Some("workload"),
+                Filter::Services => Some("service"),
+            }
+        }
+    }
+
+    /// One operator-curated group (APPLAUNCH-4), mirroring the mackesd `AppGroup`
+    /// wire shape.
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+    pub struct Group {
+        /// Display name of the group.
+        pub name: String,
+        /// The entry ids in this group, in operator order.
+        #[serde(default)]
+        pub ids: Vec<String>,
+    }
+
+    /// Parse the `action/apps/list` (or `peer-list`) reply body into entries. An
+    /// error envelope or malformed body yields an empty list (the view shows an
+    /// empty state) — never a panic.
+    #[must_use]
+    pub fn parse_entries(reply: &str) -> Vec<Entry> {
+        serde_json::from_str::<serde_json::Value>(reply)
+            .ok()
+            .and_then(|v| {
+                v.get("entries")
+                    .and_then(|e| serde_json::from_value::<Vec<Entry>>(e.clone()).ok())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Parse the `favorites`/`set-favorite` reply (`{"favorites":[id,…]}`) into a
+    /// pin set (APPLAUNCH-1). An error/garbage reply → empty set.
+    #[must_use]
+    pub fn parse_favorites(reply: &str) -> HashSet<String> {
+        serde_json::from_str::<serde_json::Value>(reply)
+            .ok()
+            .and_then(|v| {
+                v.get("favorites")
+                    .and_then(|f| serde_json::from_value::<Vec<String>>(f.clone()).ok())
+            })
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Parse the `groups`/`set-groups` reply (`{"groups":[…]}`) into curated
+    /// groups (APPLAUNCH-4). An error/garbage reply → empty list.
+    #[must_use]
+    pub fn parse_groups(reply: &str) -> Vec<Group> {
+        serde_json::from_str::<serde_json::Value>(reply)
+            .ok()
+            .and_then(|v| {
+                v.get("groups")
+                    .and_then(|g| serde_json::from_value::<Vec<Group>>(g.clone()).ok())
+            })
+            .unwrap_or_default()
+    }
+
+    /// True when a libvirt/podman state string reads as actively running (so the
+    /// row shows Stop rather than Start).
+    #[must_use]
+    pub fn workload_running(state: &str) -> bool {
+        let s = state.trim().to_lowercase();
+        s == "running" || s == "up" || s.starts_with("up ")
+    }
+
+    /// APPLAUNCH-2 — the relevance score of `needle` against one `haystack`
+    /// field (higher = better; `0` = no match). The ladder extends the existing
+    /// FD `score_match` with a **fuzzy / typo-tolerant** tail (Q5): exact (100) >
+    /// prefix (80) > word-prefix (60) > substring (40) > **subsequence with a
+    /// small edit budget** (1..=30, scaled by how tight the match is). The fuzzy
+    /// tail catches "frefox"→"Firefox" and "gmp"→"GIMP" without surfacing the old
+    /// mid-word-substring noise above a real prefix hit. Pure + case-insensitive.
+    #[must_use]
+    pub fn fuzzy_score(haystack: &str, needle: &str) -> u32 {
+        if needle.is_empty() {
+            return 0;
+        }
+        let hay = haystack.to_lowercase();
+        let need = needle.to_lowercase();
+        if hay == need {
+            return 100;
+        }
+        if hay.starts_with(&need) {
+            return 80;
+        }
+        if hay
+            .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '/' || c == '.')
+            .any(|w| w.starts_with(&need))
+        {
+            return 60;
+        }
+        if hay.contains(&need) {
+            return 40;
+        }
+        // Fuzzy tail: an in-order subsequence match (the needle's chars appear in
+        // order in the haystack, gaps allowed) — typo/abbreviation tolerant. The
+        // score rewards a tighter span (fewer gap chars between the matched ones),
+        // so "frefox" beats a loose scatter. Below substring so a real substring
+        // always outranks a fuzzy hit.
+        match subsequence_span(&hay, &need) {
+            Some(span) if span > 0 => {
+                // Tightness in [0,1]: needle-len / matched-span. Map to 1..=30.
+                let tightness = (need.chars().count() as f32) / (span as f32);
+                1 + (tightness * 29.0).round() as u32
+            }
+            _ => 0,
+        }
+    }
+
+    /// The character span (first..=last matched index, inclusive count) of the
+    /// tightest in-order subsequence of `needle` within `haystack`, or `None` when
+    /// `needle` isn't a subsequence. A greedy left-to-right scan finds the first
+    /// occurrence of each needle char after the previous; the span is the index
+    /// distance covered. Operates on `char`s (Unicode-safe). Returns the matched
+    /// span length in chars (>= needle length).
+    #[must_use]
+    fn subsequence_span(haystack: &str, needle: &str) -> Option<usize> {
+        let hay: Vec<char> = haystack.chars().collect();
+        let need: Vec<char> = needle.chars().collect();
+        if need.is_empty() {
+            return None;
+        }
+        let mut hi = 0usize;
+        let mut first = None;
+        let mut last = 0usize;
+        for &nc in &need {
+            let mut matched = false;
+            while hi < hay.len() {
+                if hay[hi] == nc {
+                    if first.is_none() {
+                        first = Some(hi);
+                    }
+                    last = hi;
+                    hi += 1;
+                    matched = true;
+                    break;
+                }
+                hi += 1;
+            }
+            if !matched {
+                return None;
+            }
+        }
+        first.map(|f| last - f + 1)
+    }
+
+    /// APPLAUNCH-2 — the best relevance score of `query` over an entry's full
+    /// search scope (name + keywords + description / Q6). The name is the primary
+    /// field (its score wins on a tie); keywords + comment widen the match a notch
+    /// lower so a name hit always outranks a keyword-only hit of equal strength.
+    #[must_use]
+    pub fn entry_score(entry: &Entry, query: &str) -> u32 {
+        let name = fuzzy_score(&entry.name, query);
+        let kw = fuzzy_score(&entry.keywords, query).saturating_sub(8);
+        let cm = fuzzy_score(&entry.comment, query).saturating_sub(8);
+        name.max(kw).max(cm)
+    }
+
+    /// APPLAUNCH-1/2 — filter + rank entries for the launcher list. A non-empty
+    /// `query` fuzzy-searches across ALL kinds by [`entry_score`], ranked best-
+    /// first then alphabetically (Q39 pure relevance). A blank query shows the
+    /// active `filter`: Favorites = the pinned ids (any kind), else the kind chip;
+    /// `Mesh` also folds in the on-demand-discovered `peer_apps`. Sorted by name.
+    /// Pure + unit-tested.
+    #[must_use]
+    pub fn filter_entries<'a>(
+        entries: &'a [Entry],
+        peer_apps: &'a [Entry],
+        filter: Filter,
+        query: &str,
+        favorites: &HashSet<String>,
+    ) -> Vec<&'a Entry> {
+        let q = query.trim();
+        if !q.is_empty() {
+            // Search spans the aggregated entries + any discovered peer apps.
+            let mut scored: Vec<(u32, &Entry)> = entries
+                .iter()
+                .chain(peer_apps.iter())
+                .filter_map(|e| {
+                    let s = entry_score(e, q);
+                    (s > 0).then_some((s, e))
+                })
+                .collect();
+            scored.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+            });
+            return scored.into_iter().map(|(_, e)| e).collect();
+        }
+        let mut out: Vec<&Entry> = match filter {
+            Filter::Favorites => entries
+                .iter()
+                .filter(|e| favorites.contains(&e.id))
+                .collect(),
+            Filter::Mesh => entries
+                .iter()
+                .filter(|e| e.kind == "mesh-app")
+                .chain(peer_apps.iter())
+                .collect(),
+            other => {
+                let k = other.kind();
+                entries
+                    .iter()
+                    .filter(|e| k == Some(e.kind.as_str()))
+                    .collect()
+            }
+        };
+        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out
+    }
+
+    /// APPLAUNCH-2 — a leading `>` makes the omnibox a Run box (Q18/Q44): the rest
+    /// of the line is run as a shell command. Returns the trimmed command when the
+    /// query starts with `>` (and is non-empty after it), else `None`.
+    #[must_use]
+    pub fn run_command(query: &str) -> Option<String> {
+        let rest = query.strip_prefix('>')?.trim();
+        (!rest.is_empty()).then(|| rest.to_string())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn sample() -> Vec<Entry> {
+            parse_entries(
+                r#"{"entries":[
+                {"id":"firefox","name":"Firefox","kind":"app","source":"xdg","exec":"firefox %u","keywords":"web browser internet","comment":"Browse the web"},
+                {"id":"org.gimp.GIMP","name":"GIMP","kind":"app","source":"flatpak","exec":"gimp"},
+                {"id":"mesh-app:anvil","name":"anvil (remote desktop)","kind":"mesh-app","source":"peer","node":"anvil","health":"online"},
+                {"id":"workload:podman:c1","name":"nginx","kind":"workload","source":"podman","state":"running"},
+                {"id":"service:anvil:Jellyfin","name":"Jellyfin","kind":"service","source":"service","endpoint":"http://10.42.0.2:8096"}
+            ]}"#,
+            )
+        }
+
+        #[test]
+        fn parse_entries_decodes_and_tolerates_garbage() {
+            let e = sample();
+            assert_eq!(e.len(), 5);
+            assert_eq!(e[0].name, "Firefox");
+            assert_eq!(e[0].keywords, "web browser internet");
+            assert!(parse_entries(r#"{"ok":false,"error":"x"}"#).is_empty());
+            assert!(parse_entries("not json").is_empty());
+        }
+
+        #[test]
+        fn fuzzy_ladder_orders_exact_prefix_word_substring_then_fuzzy() {
+            assert_eq!(fuzzy_score("Firefox", "firefox"), 100);
+            assert_eq!(fuzzy_score("Firefox", "fire"), 80);
+            assert_eq!(fuzzy_score("Mesh Bus", "bus"), 60);
+            assert_eq!(fuzzy_score("Color Profiles", "ofil"), 40);
+            // Typo / dropped letter still matches via the fuzzy tail, but below a
+            // real substring.
+            let typo = fuzzy_score("Firefox", "frefox");
+            assert!(typo > 0 && typo < 40, "fuzzy below substring: {typo}");
+            // Abbreviation.
+            assert!(fuzzy_score("GIMP", "gmp") > 0);
+            // No match at all.
+            assert_eq!(fuzzy_score("Firefox", "zzz"), 0);
+            assert_eq!(fuzzy_score("Firefox", ""), 0);
+        }
+
+        #[test]
+        fn entry_score_spans_name_keywords_comment() {
+            let ff = &sample()[0];
+            // Name hit dominates.
+            assert_eq!(entry_score(ff, "firefox"), 100);
+            // Keyword-only hit (no name match) still scores, a notch below.
+            let kw = entry_score(ff, "browser");
+            assert!(kw > 0 && kw < 100);
+            // Comment hit.
+            assert!(entry_score(ff, "web") > 0);
+        }
+
+        #[test]
+        fn filter_favorites_local_mesh_workloads_services() {
+            let e = sample();
+            let none = HashSet::new();
+            let no_peers: Vec<Entry> = Vec::new();
+            // Local = the two apps, sorted.
+            let local = filter_entries(&e, &no_peers, Filter::Local, "", &none);
+            assert_eq!(
+                local.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(),
+                ["Firefox", "GIMP"]
+            );
+            assert_eq!(
+                filter_entries(&e, &no_peers, Filter::Workloads, "", &none).len(),
+                1
+            );
+            assert_eq!(
+                filter_entries(&e, &no_peers, Filter::Services, "", &none).len(),
+                1
+            );
+            // Favorites honors the pin set across kinds.
+            let mut favs = HashSet::new();
+            favs.insert("org.gimp.GIMP".to_string());
+            favs.insert("service:anvil:Jellyfin".to_string());
+            assert_eq!(
+                filter_entries(&e, &no_peers, Filter::Favorites, "", &favs).len(),
+                2
+            );
+        }
+
+        #[test]
+        fn mesh_filter_folds_in_on_demand_peer_apps() {
+            let e = sample();
+            let none = HashSet::new();
+            let peers = parse_entries(
+                r#"{"entries":[{"id":"firefox","name":"Firefox","kind":"app","source":"xdg","node":"anvil","exec":"firefox"}]}"#,
+            );
+            // Mesh = the one mesh-app peer target + the discovered peer's apps.
+            let mesh = filter_entries(&e, &peers, Filter::Mesh, "", &none);
+            assert_eq!(mesh.len(), 2);
+            assert!(mesh.iter().any(|x| x.kind == "mesh-app"));
+            assert!(mesh.iter().any(|x| x.node == "anvil" && x.kind == "app"));
+        }
+
+        #[test]
+        fn search_spans_all_kinds_and_peer_apps_pure_relevance() {
+            let e = sample();
+            let none = HashSet::new();
+            let no_peers: Vec<Entry> = Vec::new();
+            // A query searches across tabs (Q2): "jelly" → the service, even from
+            // the Local chip.
+            let r = filter_entries(&e, &no_peers, Filter::Local, "jelly", &none);
+            assert_eq!(r.len(), 1);
+            assert_eq!(r[0].name, "Jellyfin");
+        }
+
+        #[test]
+        fn run_command_detects_the_run_box_prefix() {
+            assert_eq!(run_command(">htop").as_deref(), Some("htop"));
+            assert_eq!(run_command(">  ls -la  ").as_deref(), Some("ls -la"));
+            assert_eq!(run_command(">").as_deref(), None);
+            assert_eq!(run_command("> ").as_deref(), None);
+            assert_eq!(run_command("firefox"), None);
+        }
+
+        #[test]
+        fn workload_running_reads_state() {
+            assert!(workload_running("running"));
+            assert!(workload_running("Up 3 minutes"));
+            assert!(!workload_running("shut off"));
+            assert!(!workload_running("exited"));
+        }
+
+        #[test]
+        fn parse_favorites_and_groups_round_trip() {
+            let f = parse_favorites(r#"{"ok":true,"favorites":["firefox","gimp"]}"#);
+            assert!(f.contains("firefox") && f.len() == 2);
+            assert!(parse_favorites("junk").is_empty());
+            let g = parse_groups(r#"{"ok":true,"groups":[{"name":"Dev","ids":["firefox"]}]}"#);
+            assert_eq!(g.len(), 1);
+            assert_eq!(g[0].name, "Dev");
+            assert_eq!(g[0].ids, vec!["firefox"]);
+            assert!(parse_groups("junk").is_empty());
+        }
+    }
+}
+
+/// APPLAUNCH-7 — the launcher's async load payload: the aggregated entry list +
+/// the per-user favorites + the operator-curated groups, read off
+/// `action/apps/{list,favorites,groups}` on a blocking thread and folded back via
+/// [`Message::LauncherLoaded`]. Mirrors how [`FrontDoorData`] carries the widget
+/// snapshot. The `mesh_up` flag lets the offline-hides-mesh lock (Q25) reflect a
+/// down mesh: when `list` returns nothing AND no peers are known, mesh entries
+/// stay hidden and the local catalog still works.
+#[derive(Debug, Clone, Default)]
+pub struct LauncherData {
+    /// The aggregated launchable entries (`action/apps/list`).
+    pub entries: Vec<launcher::Entry>,
+    /// The per-user pinned ids (`action/apps/favorites`).
+    pub favorites: std::collections::HashSet<String>,
+    /// The operator-curated groups (`action/apps/groups`).
+    pub groups: Vec<launcher::Group>,
+    /// True when the aggregator answered (the apps responder is up). False keeps
+    /// the launcher painting from the last cache (Q27 — cache-first; a transient
+    /// daemon blip never blanks the list).
+    pub responded: bool,
+}
+
+impl LauncherData {
+    /// APPLAUNCH-7 — read the launcher's data off the existing `action/apps/*`
+    /// verbs on a blocking thread (the apps responder is a separate mackesd
+    /// thread). All three reads degrade to empty/None on no-Bus / no-responder, so
+    /// a quiet environment is an honest empty list, never an error. Called inside a
+    /// `Task::perform` future (off the iced executor).
+    #[must_use]
+    pub fn read() -> Self {
+        let user = whoami_user();
+        let list_raw =
+            crate::dbus::action_request_with_body("action/apps/list", None, APPS_LIST_TIMEOUT);
+        let responded = list_raw.is_some();
+        let entries = list_raw
+            .as_deref()
+            .map(launcher::parse_entries)
+            .unwrap_or_default();
+        let fav_body = serde_json::json!({ "user": user }).to_string();
+        let favorites = crate::dbus::action_request_with_body(
+            "action/apps/favorites",
+            Some(&fav_body),
+            APPS_VERB_TIMEOUT,
+        )
+        .as_deref()
+        .map(launcher::parse_favorites)
+        .unwrap_or_default();
+        let groups = crate::dbus::action_request_with_body(
+            "action/apps/groups",
+            Some(&fav_body),
+            APPS_VERB_TIMEOUT,
+        )
+        .as_deref()
+        .map(launcher::parse_groups)
+        .unwrap_or_default();
+        Self {
+            entries,
+            favorites,
+            groups,
+            responded,
+        }
+    }
+}
+
+/// APPLAUNCH — the live state of the unified launcher view, owned by
+/// [`FrontDoor`]. Holds the cached entry list (paints instantly on open — Q49),
+/// the active chip + search text + keyboard selection, the focused-peer apps
+/// (APPLAUNCH-5), and the per-row context-menu / pending-uninstall view flags.
+#[derive(Debug, Clone, Default)]
+pub struct LauncherState {
+    /// Whether the launcher surface is open (the Start/Super-key view). When
+    /// false, the Front Door shows its normal tile grid.
+    pub open: bool,
+    /// The cached aggregated entries (APPLAUNCH-7 — the open paints from this
+    /// instantly; an async refresh updates it live).
+    pub entries: Vec<launcher::Entry>,
+    /// The per-user pinned ids (the Favorites landing grid + the pin toggle).
+    pub favorites: std::collections::HashSet<String>,
+    /// The operator-curated groups (APPLAUNCH-4 — collapsible sections in Local).
+    pub groups: Vec<launcher::Group>,
+    /// The active filter chip (APPLAUNCH-1). Favorites is the landing (Q3).
+    pub filter: launcher::Filter,
+    /// The launcher search box text (APPLAUNCH-2 — fuzzy + the `>` Run box).
+    pub query: String,
+    /// The keyboard selection index into the current filtered list (APPLAUNCH-8).
+    pub selected: usize,
+    /// APPLAUNCH-5 — the focused mesh peer (Mesh chip), or None. Set by
+    /// [`Message::LauncherFocusPeer`]; its apps land in `peer_apps`.
+    pub focused_peer: Option<String>,
+    /// APPLAUNCH-5 — the focused peer's on-demand-discovered apps (folded into the
+    /// Mesh list). Cleared when the focus changes; an empty set after a query is a
+    /// dead/slow peer (lazy-mesh — the query timed out without blocking).
+    pub peer_apps: Vec<launcher::Entry>,
+    /// APPLAUNCH-6 — the index of the entry whose context menu is open, or None.
+    pub context_menu: Option<usize>,
+    /// APPLAUNCH-6 — the index of the entry armed for confirm-gated uninstall, or
+    /// None. While set, the row shows the typed-confirm affordance (§9).
+    pub arm_uninstall: Option<usize>,
+    /// APPLAUNCH-6 — a transient result note from the last launcher action
+    /// (uninstall / workload / restart), or None. Shown above the list.
+    pub action_note: Option<String>,
+    /// APPLAUNCH-7 — true once the first cache load has landed (the open paints a
+    /// "loading" hint until then, never a blank surface).
+    pub loaded: bool,
+    /// Whether the apps responder answered the last refresh (Q25 — mesh-down
+    /// detection: a no-responder read keeps the cache + a quiet note).
+    pub responded: bool,
+    /// APPLAUNCH-4 — the set of operator-group names currently collapsed in the
+    /// Local (= All-apps) view. A group renders as a collapsible section; clicking
+    /// its header toggles membership here.
+    pub collapsed_groups: std::collections::HashSet<String>,
+}
+
 // ===================== FRONTDOOR-10 (GUI half): Copilot live =================
 
 /// FRONTDOOR-10 — the Copilot live read off the two FD-10-backend bus topics
@@ -2120,6 +2837,12 @@ pub struct FrontDoor {
     /// construction); set `false` for good — and the sentinel written — the moment
     /// the operator dismisses it, so the welcome card shows EXACTLY once per node.
     pub show_greeting: bool,
+    /// APPLAUNCH — the unified app-launcher view's live state (the Start/Super-key
+    /// surface folded in from the retired `mde-apps-applet`): the cached entry
+    /// list + favorites + groups, the active chip/search/selection, the focused-
+    /// peer apps, and the per-row context-menu flags. Closed (the tile grid shows)
+    /// until the Start button / Super key / launcher chip opens it.
+    pub launcher: LauncherState,
 }
 
 impl Default for FrontDoor {
@@ -2202,6 +2925,9 @@ impl FrontDoor {
             // node has never dismissed it (the sentinel is absent). A returning
             // operator never sees it again; a fresh install greets once.
             show_greeting: !greeting_already_seen(),
+            // APPLAUNCH — the launcher starts closed (the tile grid shows); the
+            // Start/Super-key open lazy-loads its cache (Q49 cache-first).
+            launcher: LauncherState::default(),
         }
     }
 
@@ -2219,6 +2945,269 @@ impl FrontDoor {
         })
     }
 
+    /// APPLAUNCH-7 — the launcher's cache refresh: read `action/apps/{list,
+    /// favorites,groups}` off-thread (Persist isn't Send → spawn_blocking) and
+    /// fold the result back via [`Message::LauncherLoaded`]. The open paints from
+    /// the existing cache first; this updates it live when the reply lands.
+    pub fn launcher_load() -> Task<crate::Message> {
+        Task::perform(
+            async {
+                tokio::task::spawn_blocking(LauncherData::read)
+                    .await
+                    .unwrap_or_default()
+            },
+            |data| crate::Message::FrontDoor(Message::LauncherLoaded(Box::new(data))),
+        )
+    }
+
+    /// APPLAUNCH-1 — persist a favorite pin/unpin via `action/apps/set-favorite`,
+    /// folding the authoritative new pin set back into the cache (the reply is the
+    /// source of truth; the optimistic local flip is reconciled on `LauncherLoaded`
+    /// via a follow-on refresh).
+    fn launcher_set_favorite(id: String, pinned: bool) -> Task<crate::Message> {
+        Task::perform(
+            async move {
+                let user = whoami_user();
+                let body =
+                    serde_json::json!({ "user": user, "id": id, "pinned": pinned }).to_string();
+                tokio::task::spawn_blocking(move || {
+                    crate::dbus::action_request_with_body(
+                        "action/apps/set-favorite",
+                        Some(&body),
+                        APPS_VERB_TIMEOUT,
+                    )
+                })
+                .await
+                .ok()
+                .flatten();
+                // Re-read so the favorites grid + stars reflect the persisted set.
+                tokio::task::spawn_blocking(LauncherData::read)
+                    .await
+                    .unwrap_or_default()
+            },
+            |data| crate::Message::FrontDoor(Message::LauncherLoaded(Box::new(data))),
+        )
+    }
+
+    /// APPLAUNCH-5 — query a focused peer's installed app set on demand
+    /// (`action/apps/peer-list`) with a short timeout, off-thread. A slow/dead peer
+    /// returns an empty set without blocking the UI (the verb is a local-disk read
+    /// of the replicated plane, so it can't hang on the network — lazy-mesh, Q49).
+    fn launcher_peer_list(host: String) -> Task<crate::Message> {
+        Task::perform(
+            async move {
+                let body = serde_json::json!({ "node": host }).to_string();
+                let host_for_msg = host.clone();
+                let raw = tokio::task::spawn_blocking(move || {
+                    crate::dbus::action_request_with_body(
+                        "action/apps/peer-list",
+                        Some(&body),
+                        APPS_VERB_TIMEOUT,
+                    )
+                })
+                .await
+                .ok()
+                .flatten();
+                let apps = raw
+                    .as_deref()
+                    .map(launcher::parse_entries)
+                    .unwrap_or_default();
+                (host_for_msg, apps)
+            },
+            |(host, apps)| crate::Message::FrontDoor(Message::LauncherPeerApps(host, apps)),
+        )
+    }
+
+    /// APPLAUNCH-6 — publish the confirm-gated uninstall (`action/apps/uninstall`)
+    /// off-thread; carry the result note back + refresh the list (the removed app
+    /// drops out). §9 — the operator already typed the confirm before this fires.
+    fn launcher_uninstall(source: String, id: String, exec: String) -> Task<crate::Message> {
+        Task::perform(
+            async move {
+                let body =
+                    serde_json::json!({ "source": source, "id": id, "exec": exec }).to_string();
+                let raw = tokio::task::spawn_blocking(move || {
+                    crate::dbus::action_request_with_body(
+                        "action/apps/uninstall",
+                        Some(&body),
+                        UNINSTALL_TIMEOUT,
+                    )
+                })
+                .await
+                .ok()
+                .flatten();
+                let (ok, detail) = parse_action_reply(raw.as_deref());
+                let data = tokio::task::spawn_blocking(LauncherData::read)
+                    .await
+                    .unwrap_or_default();
+                (ok, detail, data)
+            },
+            |(ok, detail, data)| {
+                crate::Message::FrontDoor(Message::LauncherUninstallDone(
+                    ok,
+                    detail,
+                    Box::new(data),
+                ))
+            },
+        )
+    }
+
+    /// APPLAUNCH-6 — restart a locally-owned service via its systemd unit
+    /// (`systemctl restart`), off-thread, mapping the endpoint/name to a best-
+    /// effort unit. A foreign service (not owned by this node) never reaches here
+    /// (the card only offers restart when owned). Carries the result note back.
+    fn launcher_restart_service(name: String, endpoint: String) -> Task<crate::Message> {
+        Task::perform(
+            async move {
+                let _ = endpoint; // reserved for a future endpoint→unit map
+                let unit = service_unit_for(&name);
+                let res = tokio::task::spawn_blocking(move || {
+                    std::process::Command::new("systemctl")
+                        .args(["restart", &unit])
+                        .output()
+                })
+                .await;
+                match res {
+                    Ok(Ok(out)) if out.status.success() => (true, format!("Restarted {name}")),
+                    Ok(Ok(out)) => (
+                        false,
+                        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                    ),
+                    _ => (false, format!("could not restart {name}")),
+                }
+            },
+            |(ok, detail)| crate::Message::FrontDoor(Message::LauncherActionResult(ok, detail)),
+        )
+    }
+
+    /// APPLAUNCH-1/2 — the current filtered + ranked entry slice for the launcher
+    /// view (the chip's list, or the fuzzy hits when searching). Borrows the cache
+    /// + focused-peer apps; pure (no Bus). The view + keyboard nav + activate all
+    /// read this single source so the index a click/Enter carries always lines up.
+    fn launcher_filtered(&self) -> Vec<&launcher::Entry> {
+        launcher::filter_entries(
+            &self.launcher.entries,
+            &self.launcher.peer_apps,
+            self.launcher.filter,
+            &self.launcher.query,
+            &self.launcher.favorites,
+        )
+    }
+
+    /// The length of the current filtered list (for selection clamping).
+    fn launcher_filtered_len(&self) -> usize {
+        self.launcher_filtered().len()
+    }
+
+    /// The cloned entry at filtered-list index `i`, or None (a stale index after a
+    /// refresh shrank the list). Cloned so the caller can move it into a Task.
+    fn launcher_entry_at(&self, i: usize) -> Option<launcher::Entry> {
+        self.launcher_filtered().get(i).map(|e| (*e).clone())
+    }
+
+    /// APPLAUNCH-1/2 — activate the entry at filtered index `i`. A `>cmd` Run-box
+    /// query runs the command instead (Q44). Otherwise dispatch by kind:
+    /// local app → focus-or-launch (raise the running window, else spawn);
+    /// mesh/peer app → remmina RD (`action/apps/launch` resolves the target);
+    /// service → open the endpoint; workload → start it (if stopped). Closes the
+    /// launcher behind a real launch (it's a Start-menu — the operator moves on).
+    fn launcher_activate(&mut self, i: usize) -> Task<crate::Message> {
+        // The merged Run box: `>cmd` runs the rest as a shell command (Q18/Q44).
+        if let Some(cmd) = launcher::run_command(&self.launcher.query) {
+            run_shell_command(&cmd);
+            self.launcher.open = false;
+            self.launcher.query.clear();
+            return Task::none();
+        }
+        let Some(entry) = self.launcher_entry_at(i) else {
+            return Task::none();
+        };
+        match entry.kind.as_str() {
+            "app" => {
+                // APPLAUNCH-1 — focus-or-launch locally. A peer-discovered app
+                // (APPLAUNCH-5: `node` set to a peer) launches-on-peer via remmina
+                // RD (the GUI runs on the peer's seat); a truly-local app spawns/raises.
+                let local_host = local_hostname();
+                let on_local = entry.node.is_empty()
+                    || entry.node.eq_ignore_ascii_case(&local_host)
+                    || entry
+                        .node
+                        .split(',')
+                        .any(|h| h.trim().eq_ignore_ascii_case(&local_host));
+                if on_local {
+                    focus_or_launch_local(&entry.exec);
+                    self.launcher.open = false;
+                    Task::none()
+                } else {
+                    // Launch this app's owning peer over RD (the peer's seat runs it).
+                    let node = entry.node.clone();
+                    self.launcher.open = false;
+                    Self::launcher_remote_desktop(node)
+                }
+            }
+            "mesh-app" => {
+                let node = entry.node.clone();
+                self.launcher.open = false;
+                Self::launcher_remote_desktop(node)
+            }
+            "service" => {
+                if !entry.endpoint.is_empty() {
+                    open_url(&entry.endpoint);
+                }
+                self.launcher.open = false;
+                Task::none()
+            }
+            "workload" => {
+                // Activating a workload starts it if stopped, else attaches.
+                let kind = if launcher::workload_running(&entry.state) {
+                    WorkloadKind::Attach
+                } else {
+                    WorkloadKind::Start
+                };
+                run_workload(&entry.source, &entry.name, kind);
+                Self::launcher_load()
+            }
+            _ => Task::none(),
+        }
+    }
+
+    /// APPLAUNCH-5/9 — open a remmina remote-desktop session to `node`. mackesd
+    /// resolves the `(protocol, target)` off the PD-2 directory
+    /// (`action/apps/launch`); the workbench shells the local `remmina` client
+    /// (the same path the retired applet used). Detached + off-thread.
+    fn launcher_remote_desktop(node: String) -> Task<crate::Message> {
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let body = serde_json::json!({ "node": node }).to_string();
+                    let Some(reply) = crate::dbus::action_request_with_body(
+                        "action/apps/launch",
+                        Some(&body),
+                        APPS_VERB_TIMEOUT,
+                    ) else {
+                        return;
+                    };
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&reply) else {
+                        return;
+                    };
+                    if v.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+                        return;
+                    }
+                    let protocol = v.get("protocol").and_then(|p| p.as_str()).unwrap_or("rdp");
+                    let Some(target) = v.get("target").and_then(|t| t.as_str()) else {
+                        return;
+                    };
+                    let _ = std::process::Command::new("setsid")
+                        .args(["--fork", "remmina", "-c", &format!("{protocol}://{target}")])
+                        .status();
+                })
+                .await
+                .ok();
+            },
+            |()| crate::Message::Noop,
+        )
+    }
+
     /// FRONTDOOR-4 — the **slow-poll fallback** (design Q22: event-driven +
     /// slow-poll). The push half is the Peers directory-changed Bus event the
     /// app already subscribes to (it reloads the active view); this 15 s tick
@@ -2230,6 +3219,44 @@ impl FrontDoor {
     pub fn poll_subscription() -> Subscription<crate::Message> {
         cosmic::iced::time::every(Duration::from_secs(15))
             .map(|_| crate::Message::FrontDoor(Message::Reload))
+    }
+
+    /// APPLAUNCH-8 — the launcher's keyboard-first navigation (Q22), registered by
+    /// `App::subscription` ONLY while the launcher is open (the search box owns the
+    /// text; this handles the nav keys around it): ↑/↓ move the selection, Enter
+    /// activates it, Esc closes the launcher, Tab/Shift+Tab cycle the filter chips,
+    /// Ctrl+1..5 jump straight to a chip (number-jump). The fork's keyboard facade
+    /// has no `on_key_press`, so this filters the raw event stream (the mde-files
+    /// pattern). Unmatched keys fall through to the focused text input.
+    pub fn launcher_key_subscription() -> Subscription<crate::Message> {
+        cosmic::iced::event::listen_with(|event, _status, _window| {
+            use cosmic::iced::keyboard::{key::Named, Event as Kbd, Key};
+            let cosmic::iced::Event::Keyboard(Kbd::KeyPressed { key, modifiers, .. }) = event
+            else {
+                return None;
+            };
+            let fd = |m: Message| Some(crate::Message::FrontDoor(m));
+            // Number-jump: Ctrl+1..5 selects a filter chip directly.
+            if modifiers.command() {
+                if let Key::Character(c) = key.as_ref() {
+                    let chips = launcher::Filter::all();
+                    if let Some(n) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
+                        if n >= 1 && (n as usize) <= chips.len() {
+                            return fd(Message::LauncherFilter(chips[n as usize - 1]));
+                        }
+                    }
+                }
+                return None;
+            }
+            match key.as_ref() {
+                Key::Named(Named::Escape) if modifiers.is_empty() => fd(Message::ToggleLauncher),
+                Key::Named(Named::ArrowDown) => fd(Message::LauncherMove(1)),
+                Key::Named(Named::ArrowUp) => fd(Message::LauncherMove(-1)),
+                Key::Named(Named::Tab) if modifiers.shift() => fd(Message::LauncherChipCycle(-1)),
+                Key::Named(Named::Tab) => fd(Message::LauncherChipCycle(1)),
+                _ => None,
+            }
+        })
     }
 
     /// FRONTDOOR-2/3/4 — fold a Front Door message into local state. The FD-2/3
@@ -2616,6 +3643,278 @@ impl FrontDoor {
             Message::DismissGreeting => {
                 self.show_greeting = false;
                 mark_greeting_seen();
+                Task::none()
+            }
+
+            // ───────────────── APPLAUNCH — the unified launcher ─────────────────
+            // APPLAUNCH-8 — toggle the launcher surface. Opening it paints from the
+            // cache instantly (Q49) and fires the async refresh; closing returns to
+            // the tile grid + clears the transient view-state (search/peer/menu).
+            Message::ToggleLauncher => {
+                self.launcher.open = !self.launcher.open;
+                if self.launcher.open {
+                    self.launcher.query.clear();
+                    self.launcher.selected = 0;
+                    self.launcher.context_menu = None;
+                    self.launcher.arm_uninstall = None;
+                    // Force panel mode (the launcher is the compact dropdown — Q15/Q33).
+                    self.mode = Mode::Panel;
+                    return Self::launcher_load();
+                }
+                self.launcher.focused_peer = None;
+                self.launcher.peer_apps.clear();
+                self.launcher.action_note = None;
+                Task::none()
+            }
+            // APPLAUNCH-1 — pick a filter chip; reset selection to the top.
+            Message::LauncherFilter(f) => {
+                self.launcher.filter = f;
+                self.launcher.selected = 0;
+                self.launcher.context_menu = None;
+                self.launcher.arm_uninstall = None;
+                if f != launcher::Filter::Mesh {
+                    self.launcher.focused_peer = None;
+                    self.launcher.peer_apps.clear();
+                }
+                Task::none()
+            }
+            // APPLAUNCH-8 — Tab/Shift+Tab cycle the filter chips (wrapping).
+            Message::LauncherChipCycle(delta) => {
+                let chips = launcher::Filter::all();
+                let cur = chips
+                    .iter()
+                    .position(|c| *c == self.launcher.filter)
+                    .unwrap_or(0) as i32;
+                let n = chips.len() as i32;
+                let next = (cur + delta).rem_euclid(n) as usize;
+                let chip = chips[next];
+                // Reuse the chip-select handler so the side effects (selection
+                // reset, peer clear) stay in one place.
+                return self.update(Message::LauncherFilter(chip));
+            }
+            // APPLAUNCH-4 — collapse / expand an operator-group section.
+            Message::LauncherToggleGroup(name) => {
+                if !self.launcher.collapsed_groups.remove(&name) {
+                    self.launcher.collapsed_groups.insert(name);
+                }
+                Task::none()
+            }
+            // APPLAUNCH-2 — search text changed; reset the selection to the top hit.
+            Message::LauncherSearch(q) => {
+                self.launcher.query = q;
+                self.launcher.selected = 0;
+                self.launcher.context_menu = None;
+                self.launcher.arm_uninstall = None;
+                Task::none()
+            }
+            // APPLAUNCH-7 — a fresh cache landed. Fold it in without disturbing the
+            // open chip/search/selection (clamp the selection to the new length).
+            Message::LauncherLoaded(data) => {
+                // Q25/Q27 — keep the cache when the responder didn't answer (a
+                // transient blip / mesh-down): only replace the lists on a real reply.
+                self.launcher.responded = data.responded;
+                if data.responded {
+                    self.launcher.entries = data.entries;
+                    self.launcher.favorites = data.favorites;
+                    self.launcher.groups = data.groups;
+                }
+                self.launcher.loaded = true;
+                let len = self.launcher_filtered_len();
+                if len == 0 {
+                    self.launcher.selected = 0;
+                } else if self.launcher.selected >= len {
+                    self.launcher.selected = len - 1;
+                }
+                Task::none()
+            }
+            // APPLAUNCH-8 — keyboard move (clamped to the current list).
+            Message::LauncherMove(delta) => {
+                let len = self.launcher_filtered_len();
+                if len == 0 {
+                    self.launcher.selected = 0;
+                } else {
+                    let cur = self.launcher.selected as i32;
+                    let next = (cur + delta).clamp(0, len as i32 - 1);
+                    self.launcher.selected = next as usize;
+                }
+                Task::none()
+            }
+            // APPLAUNCH-1/2 — activate the selected entry (or the `>cmd` Run box).
+            Message::LauncherActivate(i) => self.launcher_activate(i),
+            // APPLAUNCH-1 — pin/unpin (persist via set-favorite, refresh on reply).
+            Message::LauncherTogglePin(i) => {
+                let Some(entry) = self.launcher_entry_at(i) else {
+                    return Task::none();
+                };
+                let id = entry.id.clone();
+                let pinned = !self.launcher.favorites.contains(&id);
+                // Optimistic local flip so the star reacts instantly; the reply
+                // reconciles it.
+                if pinned {
+                    self.launcher.favorites.insert(id.clone());
+                } else {
+                    self.launcher.favorites.remove(&id);
+                }
+                self.launcher.context_menu = None;
+                Self::launcher_set_favorite(id, pinned)
+            }
+            // APPLAUNCH-5 — focus a peer: query its app set on demand (lazy-mesh).
+            Message::LauncherFocusPeer(host) => {
+                if self.launcher.focused_peer.as_deref() == Some(host.as_str()) {
+                    // Re-focusing the same peer collapses it (toggle).
+                    self.launcher.focused_peer = None;
+                    self.launcher.peer_apps.clear();
+                    return Task::none();
+                }
+                self.launcher.focused_peer = Some(host.clone());
+                self.launcher.peer_apps.clear(); // show "querying…" until the reply
+                Self::launcher_peer_list(host)
+            }
+            // APPLAUNCH-5 — a focused peer's apps landed (drop a stale reply).
+            Message::LauncherPeerApps(host, apps) => {
+                if self.launcher.focused_peer.as_deref() == Some(host.as_str()) {
+                    self.launcher.peer_apps = apps;
+                }
+                Task::none()
+            }
+            // APPLAUNCH-6 — open/close the per-entry context menu.
+            Message::LauncherContextMenu(idx) => {
+                self.launcher.context_menu = idx;
+                self.launcher.arm_uninstall = None;
+                Task::none()
+            }
+            // APPLAUNCH-6 — copy the entry's command / endpoint to the clipboard.
+            Message::LauncherCopyCommand(i) => {
+                self.launcher.context_menu = None;
+                if let Some(entry) = self.launcher_entry_at(i) {
+                    let text = if !entry.exec.is_empty() {
+                        entry.exec.clone()
+                    } else {
+                        entry.endpoint.clone()
+                    };
+                    if !text.is_empty() {
+                        copy_to_clipboard(&text);
+                        self.launcher.action_note = Some(format!("Copied: {text}"));
+                    }
+                }
+                Task::none()
+            }
+            // APPLAUNCH-6 — open the entry's .desktop location in the file manager.
+            Message::LauncherOpenLocation(i) => {
+                self.launcher.context_menu = None;
+                if let Some(entry) = self.launcher_entry_at(i) {
+                    if let Some(dir) = desktop_file_dir(&entry.id) {
+                        let _ = std::process::Command::new("mde-files")
+                            .arg(&dir)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .spawn();
+                    }
+                }
+                Task::none()
+            }
+            // APPLAUNCH-6 — arm / disarm the confirm-gated uninstall.
+            Message::LauncherArmUninstall(idx) => {
+                self.launcher.arm_uninstall = idx;
+                self.launcher.context_menu = None;
+                Task::none()
+            }
+            // APPLAUNCH-6 — the operator confirmed the uninstall (§9 — confirm-gated).
+            Message::LauncherConfirmUninstall(i) => {
+                self.launcher.arm_uninstall = None;
+                let Some(entry) = self.launcher_entry_at(i) else {
+                    return Task::none();
+                };
+                let (source, id, exec) =
+                    (entry.source.clone(), entry.id.clone(), entry.exec.clone());
+                Self::launcher_uninstall(source, id, exec)
+            }
+            // APPLAUNCH-6 — a workload control (start/stop/attach), typed argv (§9).
+            Message::LauncherWorkload(i, kind) => {
+                self.launcher.context_menu = None;
+                let Some(entry) = self.launcher_entry_at(i) else {
+                    return Task::none();
+                };
+                let (source, name) = (entry.source.clone(), entry.name.clone());
+                run_workload(&source, &name, kind);
+                self.launcher.action_note = Some(match kind {
+                    WorkloadKind::Start => format!("Started {name}"),
+                    WorkloadKind::Stop => format!("Stopped {name}"),
+                    WorkloadKind::Attach => format!("Attaching to {name}…"),
+                });
+                // Re-read so the run-state badge updates.
+                Self::launcher_load()
+            }
+            // APPLAUNCH-6 — restart-if-owned for a service card.
+            Message::LauncherRestartService(i) => {
+                self.launcher.context_menu = None;
+                let Some(entry) = self.launcher_entry_at(i) else {
+                    return Task::none();
+                };
+                let endpoint = entry.endpoint.clone();
+                let name = entry.name.clone();
+                Self::launcher_restart_service(name, endpoint)
+            }
+            // APPLAUNCH-6 — a launcher action reply landed → a transient note.
+            Message::LauncherActionResult(ok, detail) => {
+                self.launcher.action_note = Some(if ok {
+                    detail
+                } else {
+                    format!("Failed: {detail}")
+                });
+                Task::none()
+            }
+            // APPLAUNCH-6 — the uninstall reply + fresh cache landed.
+            Message::LauncherUninstallDone(ok, detail, data) => {
+                self.launcher.action_note = Some(if ok {
+                    detail
+                } else {
+                    format!("Uninstall failed: {detail}")
+                });
+                if data.responded {
+                    self.launcher.entries = data.entries;
+                    self.launcher.favorites = data.favorites;
+                    self.launcher.groups = data.groups;
+                }
+                let len = self.launcher_filtered_len();
+                if len == 0 {
+                    self.launcher.selected = 0;
+                } else if self.launcher.selected >= len {
+                    self.launcher.selected = len - 1;
+                }
+                Task::none()
+            }
+            // APPLAUNCH-8 — a slimmed Win+X power-menu action (Q17).
+            Message::LauncherPower(action) => {
+                match action {
+                    PowerAction::Terminal => launch_local("cosmic-term"),
+                    PowerAction::Settings => launch_local("cosmic-settings"),
+                    PowerAction::Files => launch_local("mde-files"),
+                    PowerAction::Lock => {
+                        let _ = std::process::Command::new("loginctl")
+                            .arg("lock-session")
+                            .spawn();
+                    }
+                    PowerAction::PowerOff => {
+                        let _ = std::process::Command::new("systemctl")
+                            .arg("poweroff")
+                            .spawn();
+                    }
+                    PowerAction::Reboot => {
+                        let _ = std::process::Command::new("systemctl")
+                            .arg("reboot")
+                            .spawn();
+                    }
+                    PowerAction::Workbench => {
+                        // Leave the launcher for the full Workbench (the tile grid /
+                        // the operator's last surface). Just close the launcher.
+                        self.launcher.open = false;
+                    }
+                }
+                if action != PowerAction::Workbench {
+                    self.launcher.open = false;
+                }
                 Task::none()
             }
         }
@@ -3031,10 +4330,652 @@ impl FrontDoor {
         if let Some((i, tile)) = self.detail.and_then(|i| self.tiles.get(i).map(|t| (i, t))) {
             return self.detail_view(i, tile, palette);
         }
+        // APPLAUNCH-1/8 — the unified app-launcher view (the Start/Super-key
+        // surface) takes over the pane when open: filter chips + fuzzy search +
+        // the favorites-grid landing + list rows. The Cosmic panel draws the
+        // 33%-portrait dropdown chrome around the workbench window (Q15/Q33).
+        if self.launcher.open {
+            return self.launcher_view(palette);
+        }
         match self.mode {
             Mode::Panel => self.panel_view(palette),
             Mode::FullScreen => self.fullscreen_view(palette),
         }
+    }
+
+    /// APPLAUNCH-1/2/3/4/6/7/8 — the unified app-launcher view. A header (brand +
+    /// close), the merged search/Run box (APPLAUNCH-2), the filter chips
+    /// (APPLAUNCH-1), then the content: the Favorites landing grid (APPLAUNCH-3
+    /// real icons) or the filtered/fuzzy list rows with on-peer badges, service
+    /// cards, workload controls, pin stars + the per-row context menu (APPLAUNCH-6).
+    /// Carbon chrome via `mde-theme` tokens only (§4). Reuses the FD greeting
+    /// sentinel's empty-state voice for the helpful first-run states (Q36).
+    fn launcher_view(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+
+        // ── Header: brand title + a close control (Q26 brand logo Start) ──
+        let title = text("Launcher")
+            .size(TypeRole::Heading.size_in(sizes))
+            .colr(palette.text.into_cosmic_color());
+        let close = crate::controls::variant_button(
+            "Close",
+            crate::controls::ButtonVariant::Ghost,
+            Some(crate::Message::FrontDoor(Message::ToggleLauncher)),
+            palette,
+        );
+        let header = row![title, Space::new().width(Length::Fill), close]
+            .align_y(cosmic::iced::Alignment::Center)
+            .spacing(8);
+
+        // ── Search / Run box (APPLAUNCH-2) — a leading `>` runs a shell command ──
+        let run_armed = launcher::run_command(&self.launcher.query).is_some();
+        let placeholder = if run_armed {
+            "Run a command…  (Enter to run)"
+        } else {
+            "Search apps, mesh, workloads, services…  (› runs a command)"
+        };
+        let search: Element<'_, crate::Message, Theme> =
+            text_input(placeholder, &self.launcher.query)
+                .on_input(|s| crate::Message::FrontDoor(Message::LauncherSearch(s)))
+                .on_submit(crate::Message::FrontDoor(Message::LauncherActivate(
+                    self.launcher.selected,
+                )))
+                .padding(Padding::from([10u16, 14u16]))
+                .width(Length::Fill)
+                .into();
+
+        // ── Filter chips (APPLAUNCH-1) — Local/Mesh/Workloads/Services/Favorites ──
+        let mut chips = row![].spacing(8).align_y(cosmic::iced::Alignment::Center);
+        for chip in launcher::Filter::all() {
+            let active = self.launcher.filter == chip && self.launcher.query.trim().is_empty();
+            let variant = if active {
+                crate::controls::ButtonVariant::Primary
+            } else {
+                crate::controls::ButtonVariant::Secondary
+            };
+            chips = chips.push(crate::controls::variant_button(
+                chip.label(),
+                variant,
+                Some(crate::Message::FrontDoor(Message::LauncherFilter(chip))),
+                palette,
+            ));
+        }
+
+        // ── A transient action note + mesh-down hint (APPLAUNCH-6/7, Q25) ──
+        let mut top = column![header, search, scrollable(chips).width(Length::Fill)]
+            .spacing(10)
+            .width(Length::Fill);
+        if let Some(note) = &self.launcher.action_note {
+            top = top.push(
+                text(note.clone())
+                    .size(TypeRole::Caption.size_in(sizes))
+                    .colr(palette.accent.into_cosmic_color()),
+            );
+        }
+        if self.launcher.loaded && !self.launcher.responded {
+            top = top.push(
+                text(
+                    "Apps service unavailable — showing the last cached list. Mesh entries hidden.",
+                )
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+            );
+        }
+
+        // ── Content: favorites grid landing, or the list rows ──
+        let content = self.launcher_content(palette);
+
+        // ── Slimmed Win+X power menu (APPLAUNCH-8 / Q17) — the essentials only ──
+        let power = self.launcher_power_menu(palette);
+
+        let body = column![
+            container(top).padding(Padding::from([16u16, 16u16])),
+            container(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(Padding::from([0u16, 16u16])),
+            container(power)
+                .width(Length::Fill)
+                .padding(Padding::from([10u16, 16u16]))
+                .style(move |_t: &Theme| container::Style {
+                    background: Some(Background::Color(palette.surface.into_cosmic_color())),
+                    border: Border {
+                        color: palette.border.into_cosmic_color(),
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
+                    ..container::Style::default()
+                }),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        container(body)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(palette.background.into_cosmic_color())),
+                ..container::Style::default()
+            })
+            .into()
+    }
+
+    /// APPLAUNCH-1/3 — the launcher content: the Favorites landing **grid** of
+    /// big-icon tiles (Q3/Q16) when on the Favorites chip with a blank query, else
+    /// the filtered **list rows** (Q16) — fuzzy hits when searching, the chip's
+    /// list otherwise. A helpful empty state when nothing matches (Q36).
+    fn launcher_content(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+        let filtered = self.launcher_filtered();
+        let searching = !self.launcher.query.trim().is_empty();
+
+        if filtered.is_empty() {
+            let msg = self.launcher_empty_message();
+            return scrollable(
+                container(
+                    text(msg)
+                        .size(TypeRole::Body.size_in(sizes))
+                        .colr(palette.text_muted.into_cosmic_color()),
+                )
+                .padding(Padding::from([24u16, 0u16])),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        }
+
+        // Favorites landing → a big-icon grid (Q3/Q16). Everything else → rows.
+        if self.launcher.filter == launcher::Filter::Favorites && !searching {
+            return self.launcher_grid(&filtered, palette);
+        }
+
+        // APPLAUNCH-4 — the Local (All-apps) view with operator groups renders
+        // collapsible group sections (Q4), with an "Other apps" section for the
+        // ungrouped remainder. Falls through to the flat list when no groups exist.
+        if self.launcher.filter == launcher::Filter::Local
+            && !searching
+            && !self.launcher.groups.is_empty()
+        {
+            return self.launcher_grouped(&filtered, palette);
+        }
+
+        let mut list = column![].spacing(6).width(Length::Fill);
+        for (i, entry) in filtered.iter().enumerate() {
+            list = list.push(self.launcher_row(i, entry, palette));
+        }
+        scrollable(list)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// APPLAUNCH-4 — render the Local list as operator-curated collapsible group
+    /// sections (Q4): each group's apps under a click-to-collapse header, then an
+    /// "Other apps" section for the ungrouped remainder. Each row keeps its index
+    /// into the flat `filtered` list so the keyboard selection + activate still
+    /// line up. Pure render over the cached state.
+    fn launcher_grouped<'a>(
+        &'a self,
+        filtered: &[&'a launcher::Entry],
+        palette: Palette,
+    ) -> Element<'a, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+        // Index entries by id → their position in the flat filtered list (the row
+        // index the activate/selection use).
+        let mut idx_by_id: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for (i, e) in filtered.iter().enumerate() {
+            idx_by_id.entry(e.id.as_str()).or_insert(i);
+        }
+        let mut grouped_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut col = column![].spacing(10).width(Length::Fill);
+
+        for group in &self.launcher.groups {
+            // The group's entries that exist in the current (Local) list, in the
+            // operator's order.
+            let members: Vec<(usize, &launcher::Entry)> = group
+                .ids
+                .iter()
+                .filter_map(|id| idx_by_id.get(id.as_str()).map(|&i| (i, filtered[i])))
+                .collect();
+            if members.is_empty() {
+                continue; // an empty group (its apps aren't installed here) is hidden
+            }
+            for (_, e) in &members {
+                grouped_ids.insert(e.id.as_str());
+            }
+            let collapsed = self.launcher.collapsed_groups.contains(&group.name);
+            let caret = if collapsed { "▸" } else { "▾" };
+            let header = crate::controls::variant_button(
+                format!("{caret}  {}  ({})", group.name, members.len()),
+                crate::controls::ButtonVariant::Ghost,
+                Some(crate::Message::FrontDoor(Message::LauncherToggleGroup(
+                    group.name.clone(),
+                ))),
+                palette,
+            );
+            let mut section = column![header].spacing(4).width(Length::Fill);
+            if !collapsed {
+                for (i, e) in members {
+                    section = section.push(self.launcher_row(i, e, palette));
+                }
+            }
+            col = col.push(section);
+        }
+
+        // The ungrouped remainder.
+        let others: Vec<(usize, &launcher::Entry)> = filtered
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| !grouped_ids.contains(e.id.as_str()))
+            .map(|(i, e)| (i, *e))
+            .collect();
+        if !others.is_empty() {
+            col = col.push(
+                text("Other apps")
+                    .size(TypeRole::Caption.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+            for (i, e) in others {
+                col = col.push(self.launcher_row(i, e, palette));
+            }
+        }
+        scrollable(col)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// APPLAUNCH-3 — the Favorites landing grid: rows of big-icon tiles (the real
+    /// app icon when one resolves, else the Carbon kind-glyph). Three tiles per
+    /// row (the 33% portrait dropdown fits ~3 across, Q15). Each tile activates
+    /// its entry; the keyboard selection highlights one.
+    fn launcher_grid<'a>(
+        &'a self,
+        entries: &[&'a launcher::Entry],
+        palette: Palette,
+    ) -> Element<'a, crate::Message, Theme> {
+        const COLS: usize = 3;
+        let mut grid = column![].spacing(10).width(Length::Fill);
+        let mut row_acc = row![].spacing(10);
+        let mut in_row = 0usize;
+        for (i, entry) in entries.iter().enumerate() {
+            let selected = i == self.launcher.selected;
+            row_acc = row_acc.push(self.launcher_grid_tile(i, entry, selected, palette));
+            in_row += 1;
+            if in_row == COLS {
+                grid = grid.push(row_acc);
+                row_acc = row![].spacing(10);
+                in_row = 0;
+            }
+        }
+        if in_row > 0 {
+            // Pad the last row so the tiles keep their width (no stretch).
+            for _ in in_row..COLS {
+                row_acc = row_acc.push(Space::new().width(Length::FillPortion(1)));
+            }
+            grid = grid.push(row_acc);
+        }
+        scrollable(grid)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// APPLAUNCH-3 — one favorites-grid tile: the entry's icon above its name, in
+    /// a card that activates the entry. Selected → accent border (keyboard focus).
+    fn launcher_grid_tile<'a>(
+        &self,
+        i: usize,
+        entry: &launcher::Entry,
+        selected: bool,
+        palette: Palette,
+    ) -> Element<'a, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+        let icon = launcher_icon(entry, 40.0, palette);
+        let label = text(entry.name.clone())
+            .size(TypeRole::Caption.size_in(sizes))
+            .colr(palette.text.into_cosmic_color())
+            .align_x(Alignment::Center);
+        let inner = column![icon, label]
+            .spacing(6)
+            .align_x(cosmic::iced::Alignment::Center)
+            .width(Length::Fill);
+        let border_color = if selected {
+            palette.accent
+        } else {
+            palette.border
+        };
+        button(
+            container(inner)
+                .padding(Padding::from([12u16, 8u16]))
+                .width(Length::Fill),
+        )
+        .on_press(crate::Message::FrontDoor(Message::LauncherActivate(i)))
+        .width(Length::FillPortion(1))
+        .sty(move |_t: &Theme, _s| button::Style {
+            background: Some(Background::Color(palette.surface.into_cosmic_color())),
+            border: Border {
+                color: border_color.into_cosmic_color(),
+                width: if selected { 2.0 } else { 1.0 },
+                radius: 6.0.into(),
+            },
+            text_color: palette.text.into_cosmic_color(),
+            ..button::Style::default()
+        })
+        .into()
+    }
+
+    /// APPLAUNCH-1/5/6 — one launcher list row: the icon + name + a secondary line
+    /// (kind / on-peer badge / run-state / endpoint), a pin star, and — when its
+    /// context menu is open — the per-app actions (Properties / Copy / Open
+    /// location / Uninstall) or, for a service, the card actions; for a workload,
+    /// the inline start/stop/attach controls. Clicking the row activates it.
+    fn launcher_row<'a>(
+        &self,
+        i: usize,
+        entry: &launcher::Entry,
+        palette: Palette,
+    ) -> Element<'a, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+        let selected = i == self.launcher.selected;
+
+        let icon = launcher_icon(entry, 24.0, palette);
+        let name = text(entry.name.clone())
+            .size(TypeRole::Body.size_in(sizes))
+            .colr(palette.text.into_cosmic_color());
+        let subtitle = text(launcher_subtitle(entry))
+            .size(TypeRole::Caption.size_in(sizes))
+            .colr(palette.text_muted.into_cosmic_color());
+        let labels = column![name, subtitle].spacing(1);
+
+        // Pin star (APPLAUNCH-1) — pinned entries show a filled marker.
+        let pinned = self.launcher.favorites.contains(&entry.id);
+        let pin = crate::controls::variant_button(
+            if pinned { "★" } else { "☆" },
+            crate::controls::ButtonVariant::Ghost,
+            Some(crate::Message::FrontDoor(Message::LauncherTogglePin(i))),
+            palette,
+        );
+        // Context-menu toggle (APPLAUNCH-6) — ⋯ opens the per-row actions.
+        let menu_btn = crate::controls::variant_button(
+            "⋯",
+            crate::controls::ButtonVariant::Ghost,
+            Some(crate::Message::FrontDoor(Message::LauncherContextMenu(
+                if self.launcher.context_menu == Some(i) {
+                    None
+                } else {
+                    Some(i)
+                },
+            ))),
+            palette,
+        );
+
+        let main = button(
+            container(
+                row![icon, labels]
+                    .spacing(12)
+                    .align_y(cosmic::iced::Alignment::Center),
+            )
+            .padding(Padding::from([8u16, 10u16]))
+            .width(Length::Fill),
+        )
+        .on_press(crate::Message::FrontDoor(Message::LauncherActivate(i)))
+        .width(Length::Fill)
+        .sty(move |_t: &Theme, status| {
+            use cosmic::iced::widget::button::Status;
+            let bg = if selected || matches!(status, Status::Hovered) {
+                palette.raised
+            } else {
+                palette.surface
+            };
+            button::Style {
+                background: Some(Background::Color(bg.into_cosmic_color())),
+                border: Border {
+                    color: if selected {
+                        palette.accent.into_cosmic_color()
+                    } else {
+                        palette.border.into_cosmic_color()
+                    },
+                    width: if selected { 1.0 } else { 0.0 },
+                    radius: 4.0.into(),
+                },
+                text_color: palette.text.into_cosmic_color(),
+                ..button::Style::default()
+            }
+        });
+
+        let row_top = row![main, pin, menu_btn]
+            .spacing(4)
+            .align_y(cosmic::iced::Alignment::Center)
+            .width(Length::Fill);
+
+        // The per-row expansion (context menu / service card / workload controls /
+        // peer focus / armed uninstall) renders below the row when open.
+        let mut col = column![row_top].spacing(4).width(Length::Fill);
+        if let Some(expansion) = self.launcher_row_expansion(i, entry, palette) {
+            col = col.push(expansion);
+        }
+        col.into()
+    }
+
+    /// APPLAUNCH-5/6 — the expansion below a row: the per-app context menu, the
+    /// service card actions, the workload inline controls, the on-peer focus
+    /// affordance, and the armed-uninstall confirm. Returns `None` when nothing is
+    /// expanded for this row.
+    fn launcher_row_expansion<'a>(
+        &self,
+        i: usize,
+        entry: &launcher::Entry,
+        palette: Palette,
+    ) -> Option<Element<'a, crate::Message, Theme>> {
+        let sizes = FontSize::defaults();
+
+        // APPLAUNCH-6 — the armed uninstall confirm takes priority (a destructive
+        // gate, §9): a Confirm + Cancel pair.
+        if self.launcher.arm_uninstall == Some(i) {
+            let warn = text(format!(
+                "Uninstall {}? This removes the package.",
+                entry.name
+            ))
+            .size(TypeRole::Caption.size_in(sizes))
+            .colr(palette.danger.into_cosmic_color());
+            let confirm = crate::controls::variant_button(
+                "Confirm uninstall",
+                crate::controls::ButtonVariant::Primary,
+                Some(crate::Message::FrontDoor(
+                    Message::LauncherConfirmUninstall(i),
+                )),
+                palette,
+            );
+            let cancel = crate::controls::variant_button(
+                "Cancel",
+                crate::controls::ButtonVariant::Ghost,
+                Some(crate::Message::FrontDoor(Message::LauncherArmUninstall(
+                    None,
+                ))),
+                palette,
+            );
+            return Some(
+                container(column![warn, row![confirm, cancel].spacing(8)].spacing(6))
+                    .padding(Padding::from([8u16, 12u16]))
+                    .into(),
+            );
+        }
+
+        // APPLAUNCH-5 — a focused-peer marker for a mesh peer row, with a hint when
+        // the on-demand query is still in flight / found nothing (lazy-mesh).
+        if entry.kind == "mesh-app"
+            && self.launcher.focused_peer.as_deref() == Some(entry.node.as_str())
+        {
+            let note = if self.launcher.peer_apps.is_empty() {
+                "Querying this peer's apps… (a slow/offline peer simply shows none)"
+            } else {
+                "Showing this peer's apps below (launch opens a remote-desktop session)."
+            };
+            return Some(
+                container(
+                    text(note)
+                        .size(TypeRole::Caption.size_in(sizes))
+                        .colr(palette.text_muted.into_cosmic_color()),
+                )
+                .padding(Padding::from([4u16, 12u16]))
+                .into(),
+            );
+        }
+
+        // The context menu (⋯) — actions vary by kind.
+        if self.launcher.context_menu != Some(i) {
+            return None;
+        }
+        let mut actions = row![].spacing(8).width(Length::Fill);
+        match entry.kind.as_str() {
+            "app" => {
+                // Properties (Open location), Copy command, Open location, Uninstall.
+                actions = actions.push(crate::controls::variant_button(
+                    "Copy command",
+                    crate::controls::ButtonVariant::Secondary,
+                    Some(crate::Message::FrontDoor(Message::LauncherCopyCommand(i))),
+                    palette,
+                ));
+                actions = actions.push(crate::controls::variant_button(
+                    "Open location",
+                    crate::controls::ButtonVariant::Secondary,
+                    Some(crate::Message::FrontDoor(Message::LauncherOpenLocation(i))),
+                    palette,
+                ));
+                // Uninstall only for a truly-local app (XDG/Flatpak) — a peer-
+                // discovered app isn't this node's to remove.
+                if entry.node.is_empty() && (entry.source == "xdg" || entry.source == "flatpak") {
+                    actions = actions.push(crate::controls::variant_button(
+                        "Uninstall",
+                        crate::controls::ButtonVariant::Secondary,
+                        Some(crate::Message::FrontDoor(Message::LauncherArmUninstall(
+                            Some(i),
+                        ))),
+                        palette,
+                    ));
+                }
+            }
+            "mesh-app" => {
+                // Focus this peer to discover + launch its apps (APPLAUNCH-5).
+                actions = actions.push(crate::controls::variant_button(
+                    "Show this peer's apps",
+                    crate::controls::ButtonVariant::Secondary,
+                    Some(crate::Message::FrontDoor(Message::LauncherFocusPeer(
+                        entry.node.clone(),
+                    ))),
+                    palette,
+                ));
+            }
+            "service" => {
+                // APPLAUNCH-6 service card: copy endpoint + restart-if-owned.
+                actions = actions.push(crate::controls::variant_button(
+                    "Copy endpoint",
+                    crate::controls::ButtonVariant::Secondary,
+                    Some(crate::Message::FrontDoor(Message::LauncherCopyCommand(i))),
+                    palette,
+                ));
+                // Restart only when this node owns the service (no peer `node`).
+                if entry.node.is_empty() || entry.node.eq_ignore_ascii_case(&local_hostname()) {
+                    actions = actions.push(crate::controls::variant_button(
+                        "Restart",
+                        crate::controls::ButtonVariant::Secondary,
+                        Some(crate::Message::FrontDoor(Message::LauncherRestartService(
+                            i,
+                        ))),
+                        palette,
+                    ));
+                }
+            }
+            "workload" => {
+                // Inline start/stop/attach (Q11).
+                let running = launcher::workload_running(&entry.state);
+                let (lbl, kind) = if running {
+                    ("Stop", WorkloadKind::Stop)
+                } else {
+                    ("Start", WorkloadKind::Start)
+                };
+                actions = actions.push(crate::controls::variant_button(
+                    lbl,
+                    crate::controls::ButtonVariant::Secondary,
+                    Some(crate::Message::FrontDoor(Message::LauncherWorkload(
+                        i, kind,
+                    ))),
+                    palette,
+                ));
+                actions = actions.push(crate::controls::variant_button(
+                    "Attach",
+                    crate::controls::ButtonVariant::Secondary,
+                    Some(crate::Message::FrontDoor(Message::LauncherWorkload(
+                        i,
+                        WorkloadKind::Attach,
+                    ))),
+                    palette,
+                ));
+            }
+            _ => {}
+        }
+        Some(
+            container(scrollable(actions).width(Length::Fill))
+                .padding(Padding::from([4u16, 12u16]))
+                .into(),
+        )
+    }
+
+    /// APPLAUNCH-1/7 — the empty-state line for the launcher (Q36 helpful states),
+    /// tuned to why the list is empty: still loading, mesh-down, an unmatched
+    /// search, or an empty favorites grid.
+    fn launcher_empty_message(&self) -> String {
+        if !self.launcher.loaded {
+            return "Loading apps…".to_string();
+        }
+        if !self.launcher.query.trim().is_empty() {
+            return format!("No matches for “{}”.", self.launcher.query.trim());
+        }
+        match self.launcher.filter {
+            launcher::Filter::Favorites => {
+                "No favorites yet — open any entry's ⋯ menu, or tap ☆ to pin it here.".to_string()
+            }
+            launcher::Filter::Mesh => {
+                "No mesh peers reachable — the local launcher still works fully.".to_string()
+            }
+            launcher::Filter::Workloads => "No workloads on the mesh.".to_string(),
+            launcher::Filter::Services => "No published services.".to_string(),
+            launcher::Filter::Local => "No local apps found.".to_string(),
+        }
+    }
+
+    /// APPLAUNCH-8 — the slimmed Win+X power menu (Q17): the essentials only —
+    /// Terminal / Settings / Files / Lock / Reboot / Power off / → Workbench. Each
+    /// is a REAL action (§7 — a launch / system command / view jump). No bespoke
+    /// quick-toggles (Q40 — Cosmic's panel owns volume/wifi/brightness).
+    fn launcher_power_menu(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        let item = |label: &str, action: PowerAction| {
+            crate::controls::variant_button(
+                label.to_string(),
+                crate::controls::ButtonVariant::Ghost,
+                Some(crate::Message::FrontDoor(Message::LauncherPower(action))),
+                palette,
+            )
+        };
+        scrollable(
+            row![
+                item("Terminal", PowerAction::Terminal),
+                item("Files", PowerAction::Files),
+                item("Settings", PowerAction::Settings),
+                item("Workbench", PowerAction::Workbench),
+                Space::new().width(Length::Fill),
+                item("Lock", PowerAction::Lock),
+                item("Reboot", PowerAction::Reboot),
+                item("Power off", PowerAction::PowerOff),
+            ]
+            .spacing(8)
+            .align_y(cosmic::iced::Alignment::Center)
+            .width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .into()
     }
 
     /// FRONTDOOR-5 — the **detail actions menu** for one tile (Q45 click→detail,
@@ -4280,6 +6221,455 @@ fn whoami_label() -> String {
         .ok()
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| "Account".to_string())
+}
+
+/// APPLAUNCH — the username the apps favorites/groups verbs key on (matches the
+/// applet's `current_user`: `$USER`, else `_`). The per-user pins/groups follow
+/// the operator across nodes (the QNM-Shared store keys on this).
+fn whoami_user() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "_".to_string())
+}
+
+/// APPLAUNCH-5/8 — this node's hostname (matches the `hostname` mackesd stamps
+/// into the replicated planes), used to decide whether a discovered app is live
+/// *here* (raise/launch locally) or on a peer (remmina RD). `/etc/hostname` →
+/// `$HOSTNAME` → `localhost`. Mirrors the retired applet's `local_hostname`.
+fn local_hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
+/// APPLAUNCH-2/8 — launch a local app detached (`setsid --fork` so it reparents
+/// to init and never zombies the workbench — the NOTIFY-UI-4 lesson). XDG field
+/// codes (`%U`/`%f`/…) are stripped (no file args). No-op on an empty/blank exec.
+/// Mirrors the retired applet's `launch_local`.
+fn launch_local(exec: &str) {
+    let cleaned: Vec<String> = exec
+        .split_whitespace()
+        .filter(|tok| !tok.starts_with('%'))
+        .map(str::to_string)
+        .collect();
+    let Some((cmd, args)) = cleaned.split_first() else {
+        return;
+    };
+    let _ = std::process::Command::new("setsid")
+        .arg("--fork")
+        .arg(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// APPLAUNCH-1 — the launch-binary basename of a `.desktop` exec line (the app's
+/// likely window class), used as the focus hint when raising a running instance.
+fn exec_focus_hint(exec: &str) -> Option<String> {
+    for tok in exec.split_whitespace() {
+        if tok.starts_with('%') || tok == "env" || tok.contains('=') {
+            continue;
+        }
+        let base = std::path::Path::new(tok)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(tok);
+        if !base.is_empty() {
+            return Some(base.to_string());
+        }
+    }
+    None
+}
+
+/// APPLAUNCH-1 — focus an already-running app's window via `wmctrl -x -a <class>`
+/// (XWayland apps are reachable this way; native Wayland has no portable raise).
+/// Returns true when a window was activated. Mirrors the applet's `focus_local_window`.
+fn focus_local_window(hint: &str) -> bool {
+    if hint.is_empty() {
+        return false;
+    }
+    std::process::Command::new("wmctrl")
+        .args(["-x", "-a", hint])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// APPLAUNCH-1 — focus-or-launch (Q8): raise the running local window when one
+/// matches; else relaunch via `exec`. Mirrors the retired applet's
+/// `focus_or_launch_local`.
+fn focus_or_launch_local(exec: &str) {
+    if let Some(hint) = exec_focus_hint(exec) {
+        if focus_local_window(&hint) {
+            return;
+        }
+    }
+    launch_local(exec);
+}
+
+/// APPLAUNCH-2 — the merged Run box (`>cmd`): run a shell command detached via
+/// the user's shell (`sh -c`), `setsid --fork`'d so it never zombies the
+/// workbench. The whole remainder is one shell command line (so pipes/args work).
+fn run_shell_command(cmd: &str) {
+    let _ = std::process::Command::new("setsid")
+        .args(["--fork", "sh", "-c", cmd])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// APPLAUNCH-6 — copy text to the Wayland clipboard (`wl-copy`), detached + best-
+/// effort (a missing tool is a silent no-op, never a panic).
+fn copy_to_clipboard(text: &str) {
+    if let Ok(mut child) = std::process::Command::new("wl-copy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        use std::io::Write;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
+/// APPLAUNCH-6 — open a service endpoint / URL in the default handler
+/// (`xdg-open`), detached + best-effort.
+fn open_url(url: &str) {
+    let _ = std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// APPLAUNCH-6 — the directory holding an app's `.desktop` file, for "Open
+/// location" (Q19). Searches the standard XDG application dirs for `<id>.desktop`;
+/// `None` when it isn't found (a Flatpak export / a peer app has no local file).
+fn desktop_file_dir(id: &str) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let dirs = [
+        home.join(".local/share/applications"),
+        std::path::PathBuf::from("/usr/local/share/applications"),
+        std::path::PathBuf::from("/usr/share/applications"),
+    ];
+    let file = format!("{id}.desktop");
+    dirs.into_iter().find(|d| d.join(&file).is_file())
+}
+
+/// APPLAUNCH-6 — the typed argv to control a local workload (Q11 inline start/
+/// stop/attach), mirroring the mackesd `workload_argv`. VMs → `virsh`
+/// (`qemu:///system`); containers → `podman`. No shell (§9). `None` for an
+/// unknown source / empty name.
+fn workload_argv(source: &str, name: &str, kind: WorkloadKind) -> Option<Vec<String>> {
+    if name.is_empty() {
+        return None;
+    }
+    let v = |parts: &[&str]| parts.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    match (source, kind) {
+        ("libvirt", WorkloadKind::Start) => {
+            Some(v(&["virsh", "-c", "qemu:///system", "start", name]))
+        }
+        ("libvirt", WorkloadKind::Stop) => {
+            Some(v(&["virsh", "-c", "qemu:///system", "shutdown", name]))
+        }
+        ("libvirt", WorkloadKind::Attach) => {
+            Some(v(&["virsh", "-c", "qemu:///system", "console", name]))
+        }
+        ("podman", WorkloadKind::Start) => Some(v(&["podman", "start", name])),
+        ("podman", WorkloadKind::Stop) => Some(v(&["podman", "stop", name])),
+        ("podman", WorkloadKind::Attach) => Some(v(&["podman", "exec", "-it", name, "/bin/sh"])),
+        _ => None,
+    }
+}
+
+/// APPLAUNCH-6 — run a workload control. Start/Stop spawn the typed argv detached;
+/// Attach wraps the inner console/shell argv in a terminal (it's interactive). No
+/// shell interpolation (§9 — a real `Command`).
+fn run_workload(source: &str, name: &str, kind: WorkloadKind) {
+    let Some(argv) = workload_argv(source, name, kind) else {
+        return;
+    };
+    if kind == WorkloadKind::Attach {
+        // Attach is interactive — open it in a terminal.
+        let joined = argv.join(" ");
+        let _ = std::process::Command::new("setsid")
+            .args(["--fork", "cosmic-term", "-e", "sh", "-c", &joined])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        return;
+    }
+    let Some((cmd, args)) = argv.split_first() else {
+        return; // workload_argv never returns an empty vec, but degrade, don't panic
+    };
+    let _ = std::process::Command::new("setsid")
+        .arg("--fork")
+        .arg(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// APPLAUNCH-6 — map a service display name to a best-effort systemd unit name
+/// for restart-if-owned. The common mesh services (Navidrome, Jellyfin, Caddy,
+/// etc.) map by lowercased name; an unknown name falls back to `<name>.service`.
+/// Pure + testable.
+fn service_unit_for(name: &str) -> String {
+    let lc = name.trim().to_lowercase();
+    let base = match lc.as_str() {
+        "navidrome" | "music" => "navidrome",
+        "jellyfin" => "jellyfin",
+        "caddy" | "lighthouse proxy" => "caddy",
+        "syncthing" | "mesh sync" => "syncthing",
+        "etcd" => "etcd",
+        other => other,
+    };
+    if base.ends_with(".service") {
+        base.to_string()
+    } else {
+        format!("{base}.service")
+    }
+}
+
+/// APPLAUNCH-3 — the cache of resolved icon-theme lookups (`icon name → resolved
+/// file path or None`), so the icon-theme search runs once per name, not every
+/// render (the perf-budget lock, Q49/risk: real-icon lookup must be cached). A
+/// process-wide `OnceLock<Mutex<HashMap>>` (the launcher is a single surface;
+/// contention is nil).
+fn icon_path_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<std::path::PathBuf>>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<std::path::PathBuf>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// APPLAUNCH-3 — resolve an XDG icon NAME to a real icon file on disk (cached).
+/// An absolute path is taken as-is. Otherwise search the standard hicolor/Adwaita
+/// icon dirs for `<name>.{png,svg}` at a few common sizes (preferring larger PNG,
+/// then SVG). `None` when nothing resolves (the caller falls back to the Carbon
+/// kind-glyph). Best-effort + cached, so a miss costs one walk, then nothing.
+fn resolve_icon_path(name: &str) -> Option<std::path::PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    if let Ok(cache) = icon_path_cache().lock() {
+        if let Some(hit) = cache.get(name) {
+            return hit.clone();
+        }
+    }
+    let resolved = lookup_icon_file(name);
+    if let Ok(mut cache) = icon_path_cache().lock() {
+        cache.insert(name.to_string(), resolved.clone());
+    }
+    resolved
+}
+
+/// The uncached icon-theme file search (split out so the cache wrapper stays
+/// trivial). An absolute path wins; else walk the standard icon roots.
+fn lookup_icon_file(name: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(name);
+    if p.is_absolute() && p.is_file() {
+        return Some(p.to_path_buf());
+    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(h) = &home {
+        roots.push(h.join(".local/share/icons"));
+        roots.push(h.join(".icons"));
+    }
+    roots.push(std::path::PathBuf::from("/usr/share/icons"));
+    roots.push(std::path::PathBuf::from("/usr/local/share/icons"));
+    // Pixmaps hold flat <name>.{png,svg} for older apps.
+    let pixmaps = std::path::PathBuf::from("/usr/share/pixmaps");
+    // Prefer a crisp size, then scalable SVG.
+    let themes = ["hicolor", "Adwaita", "Cosmic"];
+    let sizes = ["64x64", "48x48", "128x128", "256x256", "32x32"];
+    let exts = ["png", "svg"];
+    for root in &roots {
+        for theme in &themes {
+            for size in &sizes {
+                for ext in &exts {
+                    let cand = root
+                        .join(theme)
+                        .join(size)
+                        .join("apps")
+                        .join(format!("{name}.{ext}"));
+                    if cand.is_file() {
+                        return Some(cand);
+                    }
+                }
+            }
+            // scalable/apps (SVG, theme-independent of size).
+            for ext in &exts {
+                let cand = root
+                    .join(theme)
+                    .join("scalable")
+                    .join("apps")
+                    .join(format!("{name}.{ext}"));
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    for ext in &exts {
+        let cand = pixmaps.join(format!("{name}.{ext}"));
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// APPLAUNCH-3 — the Carbon kind-glyph for a non-local entry (mesh/workload/
+/// service), and the fallback for a local app whose real icon didn't resolve.
+fn launcher_kind_glyph(kind: &str) -> mde_theme::Icon {
+    match kind {
+        "mesh-app" => mde_theme::Icon::Fleet,
+        "workload" => mde_theme::Icon::Compute,
+        "service" => mde_theme::Icon::Network,
+        _ => mde_theme::Icon::Apps,
+    }
+}
+
+/// APPLAUNCH-3 — render an entry's icon at `px` square: the **real** icon-theme
+/// icon for a local app (cached lookup), the Carbon kind-glyph otherwise (mesh/
+/// workload/service) or as the fallback when no real icon resolves. Carbon glyphs
+/// come from `mde_theme` tokens (§4 — never a raw asset). PNG icons render via an
+/// `Image`; SVG icons + Carbon glyphs via the `svg` widget.
+fn launcher_icon<'a>(
+    entry: &launcher::Entry,
+    px: f32,
+    palette: Palette,
+) -> Element<'a, crate::Message, Theme> {
+    use cosmic::iced::widget::{image as widget_image, svg as widget_svg};
+    // Real app icon (local apps only — mesh/workload/service keep glyphs, Q21).
+    if entry.kind == "app" && !entry.icon.is_empty() {
+        if let Some(path) = resolve_icon_path(&entry.icon) {
+            let is_svg = path.extension().and_then(|e| e.to_str()) == Some("svg");
+            if is_svg {
+                return widget_svg(widget_svg::Handle::from_path(path))
+                    .width(Length::Fixed(px))
+                    .height(Length::Fixed(px))
+                    .into();
+            }
+            return widget_image(widget_image::Handle::from_path(path))
+                .width(Length::Fixed(px))
+                .height(Length::Fixed(px))
+                .into();
+        }
+    }
+    // Carbon kind-glyph fallback (§4 — token, never a raw asset).
+    let glyph = launcher_kind_glyph(&entry.kind);
+    let resolved = mde_theme::mde_icon(glyph, mde_theme::IconSize::Nav);
+    let svg_bytes = resolved.svg_bytes();
+    let tint = palette.text.into_cosmic_color();
+    match svg_bytes {
+        Some(bytes) => widget_svg(widget_svg::Handle::from_memory(bytes))
+            .width(Length::Fixed(px))
+            .height(Length::Fixed(px))
+            .class(cosmic::theme::iced::Svg::custom(move |_t: &Theme| {
+                widget_svg::Style { color: Some(tint) }
+            }))
+            .into(),
+        None => Space::new()
+            .width(Length::Fixed(px))
+            .height(Length::Fixed(px))
+            .into(),
+    }
+}
+
+/// APPLAUNCH-1/5 — the secondary line for a launcher row: the kind + an on-peer
+/// badge / run-state / endpoint, so a row reads its context at a glance. Local
+/// running apps badge "running"; a peer app badges "on <host>"; a mesh peer shows
+/// its presence; a service shows its endpoint; a workload shows its run-state.
+fn launcher_subtitle(entry: &launcher::Entry) -> String {
+    match entry.kind.as_str() {
+        "app" => {
+            if !entry.node.is_empty() && !entry.node.eq_ignore_ascii_case(&local_hostname()) {
+                format!("on {}", entry.node)
+            } else if entry.state.eq_ignore_ascii_case("running") {
+                "running".to_string()
+            } else if entry.source == "flatpak" {
+                "Flatpak".to_string()
+            } else {
+                "App".to_string()
+            }
+        }
+        "mesh-app" => {
+            let presence = if entry.health.is_empty() {
+                "peer".to_string()
+            } else {
+                entry.health.clone()
+            };
+            format!("remote desktop · {presence}")
+        }
+        "workload" => {
+            let state = if entry.state.is_empty() {
+                "workload".to_string()
+            } else {
+                entry.state.clone()
+            };
+            let host = if entry.node.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", entry.node)
+            };
+            format!("{state}{host}")
+        }
+        "service" => {
+            if entry.endpoint.is_empty() {
+                "service".to_string()
+            } else {
+                entry.endpoint.clone()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// APPLAUNCH-6 — parse a mackesd `{ok, detail?, error?}` reply into `(ok,
+/// message)`. A `None` (no reply / timeout) is a graceful "no reply" failure.
+/// Mirrors the FD `parse_exec_reply` shape.
+fn parse_action_reply(raw: Option<&str>) -> (bool, String) {
+    let Some(body) = raw else {
+        return (false, "no reply from the apps daemon".to_string());
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
+        return (false, "unreadable reply".to_string());
+    };
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        let detail = v
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("done")
+            .trim()
+            .to_string();
+        (true, detail)
+    } else {
+        let error = v
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("the apps daemon rejected the action")
+            .trim()
+            .to_string();
+        (false, error)
+    }
 }
 
 /// FRONTDOOR-16 — the path of the once-per-node "greeted" sentinel: an empty
