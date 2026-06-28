@@ -49,6 +49,11 @@ const REGIONS_TOPIC: &str = "action/dc/do-regions";
 const PLAN_TOPIC: &str = "action/dc/genesis-plan";
 /// Action topic the execute step fires (structural Tofu-write, confirm-gated).
 const WRITE_TOPIC: &str = "action/dc/genesis-write";
+/// DAR-45 — action topic the backoffice step fires (read-only planner probe).
+const BACKOFFICE_TOPIC: &str = "action/dc/backoffice-plan";
+/// Read budget for the `backoffice-plan` probe — a `bash` shell-out that reads the
+/// tier manifest + a secret-store presence probe. A few seconds is ample.
+const BACKOFFICE_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// One DO region decoded from a `do-regions` reply.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
@@ -76,6 +81,33 @@ pub struct Plan {
     pub secrets_ready: bool,
 }
 
+/// DAR-45 — one rendered backoffice unit decoded from a `backoffice-plan` reply.
+/// Mirrors `backoffice-plan.sh`'s JSON unit row (the REAL rendered plan, not canned).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct BackofficeUnit {
+    pub id: String,
+    #[serde(default)]
+    pub phase: u32,
+    #[serde(default)]
+    pub live_gated: bool,
+    #[serde(default)]
+    pub via_script: String,
+}
+
+/// DAR-45 — the resolved backoffice plan decoded from a `backoffice-plan` reply
+/// (the genesis-wizard's backoffice step). The ordered unit list is the EXACT
+/// output of `backoffice-plan.sh --tier <t>` — a real probe, never a canned list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackofficePlan {
+    /// The tier this plan was rendered for (`minimal` | `full`).
+    pub tier: String,
+    /// The ordered units the orchestrator would enable (precheck → … → DR).
+    pub units: Vec<BackofficeUnit>,
+    /// Whether the `do-token` secret is already in the mesh store (the same probe
+    /// the genesis-plan step uses) — a false warns the operator before a live apply.
+    pub secrets_ready: bool,
+}
+
 /// The wizard's current step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Step {
@@ -84,7 +116,10 @@ pub enum Step {
     Name,
     /// Step 2 — review the resolved plan (the `genesis-plan` reply).
     Review,
-    /// Step 3 — execute: arm → confirm → write the founding Tofu.
+    /// Step 3 (DAR-45) — DevOps backoffice: pick a tier (off|minimal|full) and
+    /// preview the rendered unit list the backoffice would enable. Optional.
+    Backoffice,
+    /// Step 4 — execute: arm → confirm → write the founding Tofu.
     Execute,
 }
 
@@ -112,6 +147,15 @@ pub struct GenesisPanel {
     pub load_error: Option<String>,
     /// Set once the founding Tofu has been written (the gated apply is next).
     pub written: bool,
+    /// DAR-45 — the chosen DevOps backoffice tier: `None` = OFF (default, behavior
+    /// unchanged), `Some("minimal")` / `Some("full")` = opt in. Carried into the
+    /// `genesis-write` body as `backoffice_tier` so the reply echoes the intent.
+    pub backoffice_tier: Option<String>,
+    /// DAR-45 — the rendered backoffice plan (from `backoffice-plan`), once a tier
+    /// has been selected. None when OFF or not yet probed.
+    pub backoffice_plan: Option<BackofficePlan>,
+    /// DAR-45 — a backoffice-plan probe is in flight.
+    pub backoffice_busy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +184,15 @@ pub enum Message {
     WriteFinished(Result<String, String>),
     /// Reset the wizard to step 1 (start another genesis).
     StartOverClicked,
+    /// DAR-45 — Review → Backoffice: advance to the backoffice tier step.
+    ContinueToBackofficeClicked,
+    /// DAR-45 — pick the backoffice tier (`None` = OFF). A non-off pick fires the
+    /// read-only `backoffice-plan` RPC to render the unit list.
+    BackofficeTierSelected(Option<String>),
+    /// DAR-45 — the `backoffice-plan` reply arrived (or failed).
+    BackofficePlanFinished(Result<BackofficePlan, String>),
+    /// DAR-45 — Backoffice → Execute: proceed to the founding Tofu write.
+    ContinueToExecuteClicked,
 }
 
 impl GenesisPanel {
@@ -195,15 +248,17 @@ impl GenesisPanel {
             }
             Message::MeshIdChanged(v) => {
                 self.mesh_id = sanitize_mesh_id(&v);
-                // Any form change invalidates a stale plan / arm.
+                // Any form change invalidates a stale plan / arm / backoffice plan.
                 self.plan = None;
                 self.armed = false;
+                self.backoffice_plan = None;
                 Task::none()
             }
             Message::RegionSelected(r) => {
                 self.region = Some(r);
                 self.plan = None;
                 self.armed = false;
+                self.backoffice_plan = None;
                 Task::none()
             }
             Message::PlanClicked => {
@@ -251,7 +306,13 @@ impl GenesisPanel {
                 Task::none()
             }
             Message::BackClicked => {
-                self.step = Step::Name;
+                // Step-relative back: Execute → Backoffice → Review → Name. Esc/back
+                // walks the wizard one step at a time (DAR-45 — back works).
+                self.step = match self.step {
+                    Step::Execute => Step::Backoffice,
+                    Step::Backoffice => Step::Review,
+                    Step::Review | Step::Name => Step::Name,
+                };
                 self.armed = false;
                 Task::none()
             }
@@ -284,11 +345,16 @@ impl GenesisPanel {
                 self.busy = true;
                 self.armed = false;
                 self.status = format!("Writing founding Tofu for \"{mesh_id}\"…");
+                // DAR-45 — carry the chosen backoffice tier into the write body so
+                // the `genesis-write` reply echoes `backoffice_intent {tier}`.
+                let backoffice_tier = self.backoffice_tier.clone();
                 Task::perform(
                     async move {
-                        tokio::task::spawn_blocking(move || write_genesis(&mesh_id, &region))
-                            .await
-                            .unwrap_or_else(|_| Err("genesis-write task panicked".into()))
+                        tokio::task::spawn_blocking(move || {
+                            write_genesis(&mesh_id, &region, backoffice_tier.as_deref())
+                        })
+                        .await
+                        .unwrap_or_else(|_| Err("genesis-write task panicked".into()))
                     },
                     |res| crate::Message::Genesis(Message::WriteFinished(res)),
                 )
@@ -311,7 +377,81 @@ impl GenesisPanel {
                 self.plan = None;
                 self.armed = false;
                 self.written = false;
+                self.backoffice_tier = None;
+                self.backoffice_plan = None;
+                self.backoffice_busy = false;
                 self.status = "Ready for a new mesh.".into();
+                Task::none()
+            }
+            Message::ContinueToBackofficeClicked => {
+                // Review → Backoffice (DAR-45). The backoffice opt-in is OPTIONAL;
+                // the operator can leave it OFF and continue to Execute unchanged.
+                self.step = Step::Backoffice;
+                self.armed = false;
+                self.status = "Optional: deploy the DevOps backoffice with this mesh?".into();
+                Task::none()
+            }
+            Message::BackofficeTierSelected(tier) => {
+                self.backoffice_tier = tier.clone();
+                match tier {
+                    None => {
+                        // OFF — no plan to render; clear any stale one.
+                        self.backoffice_plan = None;
+                        self.status = "Backoffice OFF (genesis writes the founding Tofu only).".into();
+                        Task::none()
+                    }
+                    Some(t) => {
+                        if self.backoffice_busy {
+                            return Task::none();
+                        }
+                        self.backoffice_busy = true;
+                        self.backoffice_plan = None;
+                        self.status = format!("Planning the {t} backoffice…");
+                        let tier_for_task = t.clone();
+                        Task::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    plan_backoffice(&tier_for_task)
+                                })
+                                .await
+                                .unwrap_or_else(|_| Err("backoffice-plan task panicked".into()))
+                            },
+                            |res| crate::Message::Genesis(Message::BackofficePlanFinished(res)),
+                        )
+                    }
+                }
+            }
+            Message::BackofficePlanFinished(Ok(plan)) => {
+                self.backoffice_busy = false;
+                let warn = if plan.secrets_ready {
+                    String::new()
+                } else {
+                    "  (warning: do-token not in the secret store — provision it before \
+                     the backoffice can apply infra)"
+                        .to_string()
+                };
+                self.status = format!(
+                    "Backoffice plan ready: {} {}-tier unit(s).{warn}",
+                    plan.units.len(),
+                    plan.tier
+                );
+                self.backoffice_plan = Some(plan);
+                Task::none()
+            }
+            Message::BackofficePlanFinished(Err(e)) => {
+                self.backoffice_busy = false;
+                self.backoffice_plan = None;
+                self.status = e;
+                Task::none()
+            }
+            Message::ContinueToExecuteClicked => {
+                // Backoffice → Execute. Carries the chosen tier into the write body.
+                self.step = Step::Execute;
+                self.armed = false;
+                self.status = match &self.backoffice_tier {
+                    Some(t) => format!("Backoffice={t} will be recorded with the genesis."),
+                    None => "Backoffice OFF — Arm, then Confirm to write the founding Tofu.".into(),
+                };
                 Task::none()
             }
         }
@@ -372,7 +512,8 @@ impl GenesisPanel {
         row![
             badge("1 · Name the mesh", self.step == Step::Name),
             badge("2 · Review plan", self.step == Step::Review),
-            badge("3 · Execute", self.step == Step::Execute),
+            badge("3 · Backoffice", self.step == Step::Backoffice),
+            badge("4 · Execute", self.step == Step::Execute),
         ]
         .spacing(8)
         .align_y(cosmic::iced::alignment::Vertical::Center)
@@ -388,6 +529,7 @@ impl GenesisPanel {
         match self.step {
             Step::Name => self.name_step(palette, density),
             Step::Review => self.review_step(palette, density),
+            Step::Backoffice => self.backoffice_step(palette, density),
             Step::Execute => self.execute_step(palette, density),
         }
     }
@@ -510,9 +652,10 @@ impl GenesisPanel {
             ),
             Space::new().width(Length::Fill),
             variant_button(
-                "Continue to execute →",
+                "Continue →",
                 ButtonVariant::Primary,
-                (!self.busy).then_some(crate::Message::Genesis(Message::ArmClicked)),
+                (!self.busy)
+                    .then_some(crate::Message::Genesis(Message::ContinueToBackofficeClicked)),
                 palette,
             ),
         ]
@@ -529,7 +672,131 @@ impl GenesisPanel {
         section_block("Review the genesis plan", block.into(), palette, density)
     }
 
-    /// Step 3 — execute: arm → confirm → write the founding Tofu (the only thing
+    /// Step 3 (DAR-45) — the DevOps backoffice opt-in: pick a tier and preview the
+    /// REAL rendered unit list (`action/dc/backoffice-plan`, never a canned list).
+    /// Optional — OFF is the default and leaves genesis behavior unchanged.
+    fn backoffice_step(
+        &self,
+        palette: mde_theme::Palette,
+        density: mde_theme::Density,
+    ) -> Element<'_, crate::Message> {
+        // The tier toggle: Off | Minimal | Full. The current selection is Primary,
+        // the others Secondary — mde-theme variant buttons (no raw hex / metrics).
+        let tier_btn = |label: &str, val: Option<&str>| {
+            let selected = self.backoffice_tier.as_deref() == val;
+            let variant = if selected {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Secondary
+            };
+            let owned = val.map(ToString::to_string);
+            variant_button(
+                label,
+                variant,
+                (!self.backoffice_busy)
+                    .then_some(crate::Message::Genesis(Message::BackofficeTierSelected(owned))),
+                palette,
+            )
+        };
+
+        let toggle = row![
+            text("Deploy DevOps backoffice?")
+                .size(13)
+                .colr(palette.text_muted.into_cosmic_color()),
+            tier_btn("Off", None),
+            tier_btn("Minimal", Some("minimal")),
+            tier_btn("Full", Some("full")),
+        ]
+        .spacing(8)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+        // The rendered plan (when a non-off tier was probed): the secrets chip + the
+        // ordered unit list, each badged live-gated vs plain.
+        let plan_block: Element<'_, crate::Message> = if self.backoffice_busy {
+            text("Planning the backoffice…").size(13).into()
+        } else if let Some(plan) = &self.backoffice_plan {
+            let secrets_badge = if plan.secrets_ready {
+                status_badge("do-token ready", BadgeSeverity::Success, palette)
+            } else {
+                status_badge("do-token MISSING", BadgeSeverity::Warning, palette)
+            };
+            let units = plan.units.iter().enumerate().fold(
+                column![].spacing(6),
+                |col, (i, u)| {
+                    let gate = if u.live_gated {
+                        status_badge("live-gated", BadgeSeverity::Warning, palette)
+                    } else {
+                        status_badge("safe", BadgeSeverity::Neutral, palette)
+                    };
+                    col.push(
+                        row![
+                            text(format!("{}. p{} {}", i + 1, u.phase, u.id)).size(13),
+                            gate,
+                        ]
+                        .spacing(8)
+                        .align_y(cosmic::iced::alignment::Vertical::Center),
+                    )
+                },
+            );
+            column![
+                row![
+                    text("secret store:")
+                        .size(13)
+                        .colr(palette.text_muted.into_cosmic_color()),
+                    secrets_badge,
+                ]
+                .spacing(8)
+                .align_y(cosmic::iced::alignment::Vertical::Center),
+                section_block(
+                    format!("{}-tier units (rendered by backoffice-plan)", plan.tier),
+                    units.into(),
+                    palette,
+                    density,
+                ),
+            ]
+            .spacing(12)
+            .into()
+        } else {
+            text(
+                "Off: genesis writes the founding Tofu only. Pick Minimal or Full to \
+                 preview the backoffice units that would be enabled — the live bring-up \
+                 (`backoffice-up.sh`) stays operator-gated on the control VM.",
+            )
+            .size(13)
+            .colr(palette.text_muted.into_cosmic_color())
+            .into()
+        };
+
+        let actions = row![
+            variant_button(
+                "← Back",
+                ButtonVariant::Ghost,
+                (!self.backoffice_busy)
+                    .then_some(crate::Message::Genesis(Message::BackClicked)),
+                palette,
+            ),
+            Space::new().width(Length::Fill),
+            variant_button(
+                "Continue to execute →",
+                ButtonVariant::Primary,
+                (!self.backoffice_busy)
+                    .then_some(crate::Message::Genesis(Message::ContinueToExecuteClicked)),
+                palette,
+            ),
+        ]
+        .spacing(12)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+        let block = column![toggle, plan_block, actions].spacing(16);
+        section_block(
+            "DevOps backoffice (optional)",
+            block.into(),
+            palette,
+            density,
+        )
+    }
+
+    /// Step 4 — execute: arm → confirm → write the founding Tofu (the only thing
     /// that runs here). The live `tofu apply` + `mackesd found` stay gated.
     fn execute_step(
         &self,
@@ -646,9 +913,18 @@ fn plan_genesis(mesh_id: &str, region: &str) -> Result<Plan, String> {
 }
 
 /// Fire `action/dc/genesis-write` (`confirm:true`) for `mesh_id` + `region` — the
-/// structural Tofu-write. Blocking. Returns a status line on success.
-fn write_genesis(mesh_id: &str, region: &str) -> Result<String, String> {
-    let body = serde_json::json!({ "mesh_id": mesh_id, "region": region, "confirm": true });
+/// structural Tofu-write. Blocking. `backoffice_tier` (DAR-45) is carried into the
+/// body when the operator opted into the backoffice (`minimal`/`full`), so the
+/// reply echoes `backoffice_intent {tier}`. Returns a status line on success.
+fn write_genesis(
+    mesh_id: &str,
+    region: &str,
+    backoffice_tier: Option<&str>,
+) -> Result<String, String> {
+    let mut body = serde_json::json!({ "mesh_id": mesh_id, "region": region, "confirm": true });
+    if let Some(tier) = backoffice_tier {
+        body["backoffice_tier"] = serde_json::Value::String(tier.to_string());
+    }
     let reply =
         crate::dbus::action_request_with_body(WRITE_TOPIC, Some(&body.to_string()), WRITE_TIMEOUT)
             .ok_or("mackesd not reachable over the Bus (genesis-write)")?;
@@ -660,9 +936,30 @@ fn write_genesis(mesh_id: &str, region: &str) -> Result<String, String> {
     let path = v["path"]
         .as_str()
         .unwrap_or("infra/tofu/zone1-do/dc-lighthouses.tf");
+    let bo = v["backoffice_intent"]["tier"]
+        .as_str()
+        .map(|t| format!(" Backoffice intent ({t}) recorded."))
+        .unwrap_or_default();
     Ok(format!(
-        "Wrote founding lighthouse to {path}. Apply (gated) to provision."
+        "Wrote founding lighthouse to {path}. Apply (gated) to provision.{bo}"
     ))
+}
+
+/// DAR-45 — fire `action/dc/backoffice-plan` for `tier` (read-only). Blocking —
+/// call from `spawn_blocking`. Returns the REAL rendered plan (the same units
+/// `backoffice-plan.sh --tier <t>` emits), never a canned list.
+fn plan_backoffice(tier: &str) -> Result<BackofficePlan, String> {
+    let body = serde_json::json!({ "tier": tier });
+    let reply = crate::dbus::action_request_with_body(
+        BACKOFFICE_TOPIC,
+        Some(&body.to_string()),
+        BACKOFFICE_TIMEOUT,
+    )
+    .ok_or("mackesd not reachable over the Bus (backoffice-plan)")?;
+    if let Some(e) = crate::dbus::reply_error(&reply) {
+        return Err(format!("backoffice-plan failed: {e}"));
+    }
+    parse_backoffice_plan(&reply)
 }
 
 // ---- pure helpers (parse / validate) -----------------------------------------
@@ -712,6 +1009,33 @@ fn parse_plan(raw: &str) -> Result<Plan, String> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string(),
+        secrets_ready: v
+            .get("secrets_ready")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// DAR-45 — decode a `backoffice-plan` reply into a [`BackofficePlan`]. The
+/// `units` array is the EXACT shape `backoffice-plan.sh` emits (id/phase/
+/// live_gated/via_script); `secrets_ready` is the daemon's re-stamped bool.
+fn parse_backoffice_plan(raw: &str) -> Result<BackofficePlan, String> {
+    let v: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| format!("backoffice-plan reply not decodable: {e}"))?;
+    let units = v
+        .get("units")
+        .and_then(|a| serde_json::from_value::<Vec<BackofficeUnit>>(a.clone()).ok())
+        .unwrap_or_default();
+    if units.is_empty() {
+        return Err("backoffice-plan returned no units".into());
+    }
+    Ok(BackofficePlan {
+        tier: v
+            .get("tier")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        units,
         secrets_ready: v
             .get("secrets_ready")
             .and_then(serde_json::Value::as_bool)
@@ -960,10 +1284,131 @@ mod tests {
         p.step = Step::Execute;
         p.mesh_id = "home-mesh".into();
         p.written = true;
+        p.backoffice_tier = Some("full".into());
+        p.backoffice_plan = Some(BackofficePlan::default());
         let _ = p.update(Message::StartOverClicked);
         assert_eq!(p.step, Step::Name);
         assert!(p.mesh_id.is_empty());
         assert!(!p.written);
+        assert!(p.backoffice_tier.is_none(), "start-over clears the backoffice tier");
+        assert!(p.backoffice_plan.is_none());
         assert_eq!(p.regions.len(), 1, "the loaded region roster is kept");
+    }
+
+    // ── DAR-45 — the backoffice wizard step ──
+
+    #[test]
+    fn review_continue_goes_to_the_backoffice_step() {
+        // The Review step's Continue now lands on the Backoffice step (was Execute).
+        let mut p = GenesisPanel::new();
+        p.step = Step::Review;
+        let _ = p.update(Message::ContinueToBackofficeClicked);
+        assert_eq!(p.step, Step::Backoffice);
+    }
+
+    #[test]
+    fn backoffice_off_clears_the_plan_and_fires_nothing() {
+        let mut p = GenesisPanel::new();
+        p.step = Step::Backoffice;
+        p.backoffice_plan = Some(BackofficePlan::default());
+        let _ = p.update(Message::BackofficeTierSelected(None));
+        assert!(p.backoffice_tier.is_none());
+        assert!(p.backoffice_plan.is_none(), "OFF clears any rendered plan");
+        assert!(!p.backoffice_busy, "OFF fires no probe");
+    }
+
+    #[test]
+    fn selecting_a_tier_sets_busy_and_records_the_tier() {
+        let mut p = GenesisPanel::new();
+        p.step = Step::Backoffice;
+        let _ = p.update(Message::BackofficeTierSelected(Some("full".into())));
+        assert_eq!(p.backoffice_tier.as_deref(), Some("full"));
+        assert!(p.backoffice_busy, "picking a tier fires the read-only probe");
+        assert!(p.backoffice_plan.is_none(), "the stale plan is cleared while probing");
+    }
+
+    #[test]
+    fn backoffice_plan_finished_renders_units_and_warns_on_missing_secret() {
+        let mut p = GenesisPanel::new();
+        p.step = Step::Backoffice;
+        p.backoffice_busy = true;
+        let _ = p.update(Message::BackofficePlanFinished(Ok(BackofficePlan {
+            tier: "minimal".into(),
+            units: vec![
+                BackofficeUnit {
+                    id: "precheck".into(),
+                    phase: 0,
+                    live_gated: false,
+                    via_script: "automation/state-backend/state-backend-bootstrap.sh".into(),
+                },
+                BackofficeUnit {
+                    id: "tofu-roots".into(),
+                    phase: 3,
+                    live_gated: true,
+                    via_script: "automation/state-backend/state-backend-bootstrap.sh".into(),
+                },
+            ],
+            secrets_ready: false,
+        })));
+        assert!(!p.backoffice_busy);
+        let plan = p.backoffice_plan.as_ref().expect("plan rendered");
+        assert_eq!(plan.units.len(), 2);
+        assert_eq!(plan.tier, "minimal");
+        assert!(p.status.to_lowercase().contains("do-token"), "{}", p.status);
+    }
+
+    #[test]
+    fn backoffice_plan_error_clears_the_plan_and_surfaces_it() {
+        let mut p = GenesisPanel::new();
+        p.step = Step::Backoffice;
+        p.backoffice_busy = true;
+        let _ = p.update(Message::BackofficePlanFinished(Err(
+            "backoffice-plan failed: planner not found".into(),
+        )));
+        assert!(!p.backoffice_busy);
+        assert!(p.backoffice_plan.is_none());
+        assert!(p.status.contains("planner not found"), "{}", p.status);
+    }
+
+    #[test]
+    fn continue_to_execute_advances_and_back_walks_steps() {
+        let mut p = GenesisPanel::new();
+        p.step = Step::Backoffice;
+        p.backoffice_tier = Some("full".into());
+        let _ = p.update(Message::ContinueToExecuteClicked);
+        assert_eq!(p.step, Step::Execute);
+        assert!(p.status.contains("full"), "{}", p.status);
+        // Back from Execute → Backoffice → Review → Name (one step at a time).
+        let _ = p.update(Message::BackClicked);
+        assert_eq!(p.step, Step::Backoffice);
+        let _ = p.update(Message::BackClicked);
+        assert_eq!(p.step, Step::Review);
+        let _ = p.update(Message::BackClicked);
+        assert_eq!(p.step, Step::Name);
+    }
+
+    #[test]
+    fn parse_backoffice_plan_decodes_the_reply() {
+        let raw = r#"{"ok":true,"tier":"full","secrets_ready":true,"units":[
+            {"id":"precheck","phase":0,"ready":false,"live_gated":false,
+             "via_script":"automation/state-backend/state-backend-bootstrap.sh"},
+            {"id":"build-farm","phase":6,"ready":false,"live_gated":true,
+             "via_script":"install-helpers/farm-autoscale.sh"}
+        ]}"#;
+        let plan = parse_backoffice_plan(raw).unwrap();
+        assert_eq!(plan.tier, "full");
+        assert!(plan.secrets_ready);
+        assert_eq!(plan.units.len(), 2);
+        assert_eq!(plan.units[0].id, "precheck");
+        assert!(!plan.units[0].live_gated);
+        assert_eq!(plan.units[1].id, "build-farm");
+        assert!(plan.units[1].live_gated);
+        assert_eq!(plan.units[1].phase, 6);
+    }
+
+    #[test]
+    fn parse_backoffice_plan_errors_on_empty_units() {
+        assert!(parse_backoffice_plan(r#"{"ok":true,"units":[]}"#).is_err());
+        assert!(parse_backoffice_plan("not json").is_err());
     }
 }

@@ -1,0 +1,120 @@
+# manifest.full.toml — DAR-15: the Full-tier unit manifest.
+#
+# DEVOPS-AUTOMATION-REBUILD §3 (tier model) + §2.7 (bring-up ordering). Full is a
+# STRICT SUPERSET of manifest.minimal.toml: identical Phase 0–3 units, then the
+# Full-only phases 4–7 (CI → reconciler → build farm → DR). The orchestrator
+# (backoffice-up.sh) and the read-only planner (backoffice-plan.sh) read this and
+# sequence the EXISTING up-scripts in dependency order — no service logic here.
+#
+# Phase order (ascending `phase`; units in file order within a phase):
+#   0 precheck   — overlay reachable + founder etcd + this VM's recipient resealed
+#   1 secrets    — mint the VM's own key (init-self) + get the provider creds
+#   2 state      — state-backend up (overlay:8390) + per-root backend config
+#   3 tofu-roots — `tofu plan` each root against the etcd backend
+#   4 ci         — Forgejo + host-native runner + sovereign dnf channel  [Full]
+#   5 reconciler — both reconciler timers, installed PLAN-ONLY (FA_APPLY unset) [Full]
+#   6 build-farm — `tofu apply` xen-xapi + bake/clone golden + sccache  [Full, live-gated]
+#   7 dr         — on-mesh first-line DR snapshot timer (off-fleet push stays operator-run) [Full]
+#
+# Each `via_script` MUST resolve to a file that exists in the repo. `live_gated`
+# units mutate real infra/spend (a tofu apply, a real droplet, an off-fleet push)
+# and stay operator-gated even with the orchestrator armed: the orchestrator only
+# PLANS / probes them. The reconciler timers land PLAN-ONLY at genesis — FA_APPLY=1
+# is armed ONLY by the explicit operator step (enable-autoscale-timer.sh), never
+# here (Lock 12).
+
+tier = "full"
+
+# ── Phases 0–3: identical to the Minimal floor (strict-superset invariant) ──
+
+[[unit]]
+id = "precheck"
+phase = 0
+via_script = "automation/state-backend/state-backend-bootstrap.sh"
+live_gated = false
+desc = "PHASE 0 — overlay membership + founder etcd reachable + this VM's recipient is in the re-sealed secret envelopes (sentinel get). Refuses to proceed with the `mackesd join` / `mcnf-secret.sh reseal-to` remediation if not."
+
+[[unit]]
+id = "secrets-init-self"
+phase = 1
+via_script = "automation/secrets/mcnf-secret.sh"
+live_gated = false
+desc = "PHASE 1 — `mcnf-secret.sh init-self` (mint THIS VM's own age key + register only its public recipient). Idempotent; done at boot."
+
+[[unit]]
+id = "secrets-get"
+phase = 1
+via_script = "automation/secrets/mcnf-secret.sh"
+live_gated = false
+desc = "PHASE 1 — `mcnf-secret.sh get` DO/XAPI/Forgejo creds using the VM's OWN key. A missing secret fails loud with the `put` line; no plaintext logged."
+
+[[unit]]
+id = "state-backend"
+phase = 2
+via_script = "automation/state-backend/state-backend-up.sh"
+live_gated = false
+desc = "PHASE 2 — the OpenTofu http state backend (etcd-backed) bound to the control-VM OVERLAY IP :8390, endpoints from /etc/mackesd/etcd-endpoints."
+
+[[unit]]
+id = "gen-backend-config"
+phase = 2
+via_script = "automation/state-backend/gen-backend-config.sh"
+live_gated = false
+desc = "PHASE 2 — generate each root's <root>.backend.hcl from the control-VM overlay IP."
+
+[[unit]]
+id = "tofu-roots"
+phase = 3
+via_script = "automation/state-backend/state-backend-bootstrap.sh"
+live_gated = true
+desc = "PHASE 3 — `tofu plan` each root (xen-xapi, zone1-do, edgeos) against the etcd backend. `tofu init -migrate-state` is live-gated."
+
+# ── Phase 4: CI (Full only) ──
+
+[[unit]]
+id = "forgejo"
+phase = 4
+via_script = "automation/forgejo/forgejo-up.sh"
+live_gated = false
+desc = "PHASE 4 — Forgejo on the control VM (overlay IP), SECRET_KEY/admin-pass/runner-token from /mcnf/secret/forgejo-*. `curl :3000/api/healthz` = pass."
+
+[[unit]]
+id = "forgejo-runner"
+phase = 4
+via_script = "automation/forgejo/forgejo-runner-up.sh"
+live_gated = false
+desc = "PHASE 4 — host-native act_runner (systemd, label `farm`) registered with the token from the store, so `runs-on: farm` jobs inherit the mesh SSH key + overlay."
+
+# ── Phase 5: reconciler (Full only) — installed PLAN-ONLY (Lock 12) ──
+
+[[unit]]
+id = "reconciler-build"
+phase = 5
+via_script = "automation/reconciler/farm-reconcile.sh"
+live_gated = false
+desc = "PHASE 5 — the 15-min @farm build reconciler (converges @farm jobs into builds+PRs). Installed plan-only at genesis."
+
+[[unit]]
+id = "reconciler-autoscale"
+phase = 5
+via_script = "install-helpers/farm-reconciler.sh"
+live_gated = false
+desc = "PHASE 5 — the 5-min autoscale reconciler. Installed PLAN-ONLY (FA_APPLY UNSET). The standing LIVE timer is armed ONLY by the operator (enable-autoscale-timer.sh), never here."
+
+# ── Phase 6: build farm (Full only) — live-gated spend ──
+
+[[unit]]
+id = "build-farm"
+phase = 6
+via_script = "install-helpers/farm-autoscale.sh"
+live_gated = true
+desc = "PHASE 6 — `tofu apply` xen-xapi (LIVE-GATED real VM spend) from the elastic shape model + bake/clone MDE-VM-golden + sccache. The orchestrator only PLANS this unless an explicit live flag is passed."
+
+# ── Phase 7: DR (Full only) — on-mesh first line; off-fleet stays operator-run ──
+
+[[unit]]
+id = "dr-snapshot"
+phase = 7
+via_script = "automation/dr/dr-backup.sh"
+live_gated = false
+desc = "PHASE 7 — enable the leader-gated daily on-mesh DR snapshot (dr-<ts>.age into /mnt/mesh-storage/dr/). The off-fleet push (DO Spaces) stays a SEPARATE operator-run script."

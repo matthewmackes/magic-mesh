@@ -1,0 +1,67 @@
+# manifest.minimal.toml — DAR-15: the Minimal-tier unit manifest.
+#
+# DEVOPS-AUTOMATION-REBUILD §3 (tier model) + §2.7 (bring-up ordering). The
+# orchestrator (backoffice-up.sh) and the read-only planner (backoffice-plan.sh)
+# read this declarative manifest and sequence the EXISTING up-scripts in
+# dependency order. NOTHING here is service logic — only ordering + which
+# already-built script each unit drives.
+#
+# Minimal tier = the IaC floor: the mesh can stand up + `tofu apply` infra with a
+# reproducible state backend + secret store, and STOPS after the Tofu roots
+# (Phase 3). It enables NO CI, NO reconciler, NO build farm, NO DR. (Lock 4/9.)
+#
+# Phase order (the orchestrator runs phases in ascending `phase`, units in file
+# order within a phase):
+#   0 precheck   — overlay reachable + founder etcd + this VM's recipient resealed
+#   1 secrets    — mint the VM's own key (init-self) + get the provider creds
+#   2 state      — state-backend up (overlay:8390) + per-root backend config
+#   3 tofu-roots — `tofu plan` each root against the etcd backend (Minimal STOP)
+#
+# Each `via_script` MUST resolve to a file that exists in the repo (the planner
+# asserts this). `live_gated = true` means the unit mutates real infra/spend and
+# stays operator-gated even with the orchestrator armed — the orchestrator only
+# PLANS / probes it, never fires it, unless an explicit live flag is passed.
+
+tier = "minimal"
+
+[[unit]]
+id = "precheck"
+phase = 0
+via_script = "automation/state-backend/state-backend-bootstrap.sh"
+live_gated = false
+desc = "PHASE 0 — overlay membership + founder etcd reachable + this VM's recipient is in the re-sealed secret envelopes (sentinel get). Refuses to proceed with the `mackesd join` / `mcnf-secret.sh reseal-to` remediation if not."
+
+[[unit]]
+id = "secrets-init-self"
+phase = 1
+via_script = "automation/secrets/mcnf-secret.sh"
+live_gated = false
+desc = "PHASE 1 — `mcnf-secret.sh init-self` (mint THIS VM's own age key + register only its public recipient). Idempotent; done at boot. NEVER prints/transmits the private key."
+
+[[unit]]
+id = "secrets-get"
+phase = 1
+via_script = "automation/secrets/mcnf-secret.sh"
+live_gated = false
+desc = "PHASE 1 — `mcnf-secret.sh get do-token` / `xapi-password` using the VM's OWN key (resolved after reseal). A missing secret fails loud with the `put` line; no plaintext logged."
+
+[[unit]]
+id = "state-backend"
+phase = 2
+via_script = "automation/state-backend/state-backend-up.sh"
+live_gated = false
+desc = "PHASE 2 — the OpenTofu http state backend (etcd-backed) bound to the control-VM OVERLAY IP :8390 (never 0.0.0.0), endpoints from /etc/mackesd/etcd-endpoints."
+
+[[unit]]
+id = "gen-backend-config"
+phase = 2
+via_script = "automation/state-backend/gen-backend-config.sh"
+live_gated = false
+desc = "PHASE 2 — generate each root's <root>.backend.hcl from the control-VM overlay IP, so the four roots point at this VM's state backend (no hardcoded .192)."
+
+[[unit]]
+id = "tofu-roots"
+phase = 3
+via_script = "automation/state-backend/state-backend-bootstrap.sh"
+live_gated = true
+desc = "PHASE 3 — `tofu plan` each root (xen-xapi, zone1-do, edgeos) against the etcd backend. MINIMAL TIER STOPS HERE. `tofu init -migrate-state` / `apply` are live-gated (the bootstrap's --init-roots arm)."

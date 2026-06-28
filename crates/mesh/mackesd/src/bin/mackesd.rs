@@ -706,6 +706,24 @@ enum Cmd {
         /// Override the `/enroll` HTTPS port the token advertises.
         #[arg(long)]
         enroll_port: Option<u16>,
+        /// DAR-18 (DEVOPS-AUTOMATION-REBUILD, Lock 3) — opt in to the DevOps
+        /// backoffice at genesis. Bare `--with-backoffice` = `minimal`;
+        /// `--with-backoffice=full` adds CI + reconciler + build-farm + DR.
+        /// ABSENT (default) = OFF: found is byte-for-byte unchanged.
+        ///
+        /// This flag is INTENT-RECORDING + non-destructive: when set, found runs
+        /// the full existing flow, then records `/mcnf/backoffice/intent
+        /// {tier,host,ts}` to etcd and PRINTS the gated next command
+        /// (`backoffice-up.sh --tier <t>`). It does NOT itself provision the
+        /// control VM, run `tofu apply`, or spend money — those stay
+        /// operator-gated on the control VM.
+        #[arg(
+            long,
+            value_name = "TIER",
+            num_args = 0..=1,
+            default_missing_value = "minimal"
+        )]
+        with_backoffice: Option<String>,
     },
 
     /// ONBOARD-4 — **the Magic joining verb.** Join an existing mesh in
@@ -3931,8 +3949,16 @@ fn main() -> anyhow::Result<()> {
             external_addr,
             role,
             enroll_port,
+            with_backoffice,
         } => {
-            return cmd_found(&db_path, &mesh_id, &external_addr, &role, enroll_port);
+            return cmd_found(
+                &db_path,
+                &mesh_id,
+                &external_addr,
+                &role,
+                enroll_port,
+                with_backoffice.as_deref(),
+            );
         }
         Cmd::Join {
             token,
@@ -8978,6 +9004,7 @@ fn cmd_found(
     external_addr: &str,
     role: &str,
     enroll_port: Option<u16>,
+    with_backoffice: Option<&str>,
 ) -> anyhow::Result<()> {
     use mackesd_core::nebula_enroll_endpoint::{generate_endpoint_identity, DEFAULT_ENROLL_PORT};
     use mackesd_core::workers::nebula_enroll_listener::{DEFAULT_CERT_PATH, DEFAULT_KEY_PATH};
@@ -8985,6 +9012,13 @@ fn cmd_found(
     let parsed: mde_role::Role = role.parse().map_err(|_| {
         anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
     })?;
+
+    // DAR-18 — validate the backoffice tier UP FRONT (before any mesh-init side
+    // effect), so `--with-backoffice=bogus` fails fast without half-founding a mesh.
+    let backoffice_tier = match with_backoffice {
+        None => None,
+        Some(t) => Some(normalize_backoffice_tier(t)?),
+    };
     // Resolve the externally-dialable IPv4 (strip any :port the operator
     // included; `auto` detects the primary outbound IP).
     let ip = if external_addr.eq_ignore_ascii_case("auto") {
@@ -9128,7 +9162,89 @@ fn cmd_found(
         mackes_mesh_types::lighthouse::HA_MIN_LIGHTHOUSES
     );
     println!("\nAdd a peer — run this on the joining box:\n  mackesd join '{join_token}'");
+
+    // DAR-18 (Lock 3) — opt-in DevOps backoffice. INTENT-RECORDING + non-destructive:
+    // record `/mcnf/backoffice/intent {tier,host,ts}` to etcd and PRINT the gated
+    // next step. found itself never provisions the control VM, runs `tofu apply`, or
+    // spends — that stays the control VM's job (operator-gated). A failure to record
+    // intent is non-fatal: the mesh IS founded; we warn and still print the next step
+    // so the operator can re-run `backoffice-up.sh record-intent` by hand.
+    if let Some(tier) = backoffice_tier {
+        record_backoffice_intent(tier, &report.overlay_ip);
+    }
+
     Ok(())
+}
+
+/// DAR-18 — normalize + validate a `--with-backoffice` tier. Accepts only
+/// `minimal` / `full` (bare `--with-backoffice` already defaulted to `minimal` at
+/// the clap layer). Returns the canonical lowercase tier or a clear error so a
+/// typo fails the verb before any mesh side effect. PURE.
+///
+/// # Errors
+/// Returns `Err` for any tier other than `minimal` / `full`.
+fn normalize_backoffice_tier(tier: &str) -> anyhow::Result<&'static str> {
+    match tier.trim().to_ascii_lowercase().as_str() {
+        "minimal" => Ok("minimal"),
+        "full" => Ok("full"),
+        other => Err(anyhow::anyhow!(
+            "unknown --with-backoffice tier `{other}` — expected `minimal` or `full`"
+        )),
+    }
+}
+
+/// DAR-18 — record the backoffice INTENT by shelling out to the orchestrator's
+/// `record-intent` mode (the single owner of the `/mcnf/backoffice/intent` etcd
+/// write, which resolves endpoints via the shared DAR-1b resolver — never the dead
+/// `.192`). Non-destructive: this writes one small non-secret etcd key and prints
+/// the gated next command; it does NOT run the heavy bring-up. Best-effort — a
+/// failure is warned, not fatal (the mesh is already founded).
+///
+/// `tier` is the validated `minimal`/`full`; `host` is the founding overlay IP
+/// (the control VM defaults to this overlay until one is provisioned).
+fn record_backoffice_intent(tier: &str, host: &str) {
+    println!("\n--with-backoffice={tier} — recording DevOps backoffice intent…");
+    let script = backoffice_up_script_path();
+    if !script.is_file() {
+        eprintln!(
+            "found: backoffice orchestrator not found at {} — record intent by hand:\n  \
+             automation/backoffice/backoffice-up.sh record-intent --tier {tier}",
+            script.display()
+        );
+        return;
+    }
+    let status = std::process::Command::new("bash")
+        .arg(&script)
+        .arg("record-intent")
+        .arg("--tier")
+        .arg(tier)
+        .arg("--host")
+        .arg(host)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => eprintln!(
+            "found: recording backoffice intent exited {} — re-run by hand:\n  \
+             {} record-intent --tier {tier}",
+            s.code().unwrap_or(-1),
+            script.display()
+        ),
+        Err(e) => eprintln!(
+            "found: could not run the backoffice orchestrator ({e}) — re-run by hand:\n  \
+             {} record-intent --tier {tier}",
+            script.display()
+        ),
+    }
+}
+
+/// Resolve the deployed `backoffice-up.sh` orchestrator path: under `$MCNF_REPO`
+/// (the project-wide repo-root convention, matching the secret store) when set,
+/// else the default install root. Used by [`record_backoffice_intent`].
+fn backoffice_up_script_path() -> std::path::PathBuf {
+    let repo = std::env::var_os("MCNF_REPO")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/opt/mcnf"));
+    repo.join("automation/backoffice/backoffice-up.sh")
 }
 
 /// ONBOARD-4 — the `join` verb. One-command peer join: pin role +
@@ -9516,4 +9632,103 @@ fn install_signal_handlers(
         })
         .context("spawning signal-reader thread")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod found_backoffice_tests {
+    //! DAR-18 — the `mackesd found --with-backoffice[=minimal|full]` flag.
+    //!
+    //! Asserts the clap parse semantics (absent = OFF; bare = minimal; `=full`;
+    //! a bogus tier is caught by [`normalize_backoffice_tier`]) and that the flag
+    //! is purely ADDITIVE — `found` without it parses byte-for-byte the same
+    //! (the regression that found is unchanged when the flag is absent).
+    use super::{normalize_backoffice_tier, Cli, Cmd};
+    use clap::Parser;
+
+    /// Extract the `with_backoffice` field from a parsed `found` (panics if the
+    /// args didn't parse to a `Found`).
+    fn parse_found(args: &[&str]) -> Option<String> {
+        let cli = Cli::try_parse_from(args).expect("found args should parse");
+        match cli.cmd {
+            Cmd::Found {
+                with_backoffice, ..
+            } => with_backoffice,
+            other => panic!("expected Cmd::Found, got something else: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn found_without_flag_leaves_backoffice_off() {
+        // The regression guard: a plain `found` records NO backoffice intent.
+        assert_eq!(parse_found(&["mackesd", "found", "home-mesh"]), None);
+    }
+
+    #[test]
+    fn bare_with_backoffice_defaults_to_minimal() {
+        // `--with-backoffice` with no value = the bare default `minimal`.
+        assert_eq!(
+            parse_found(&["mackesd", "found", "home-mesh", "--with-backoffice"]),
+            Some("minimal".to_string())
+        );
+    }
+
+    #[test]
+    fn with_backoffice_full_parses() {
+        assert_eq!(
+            parse_found(&["mackesd", "found", "home-mesh", "--with-backoffice=full"]),
+            Some("full".to_string())
+        );
+        // The space form parses too.
+        assert_eq!(
+            parse_found(&["mackesd", "found", "home-mesh", "--with-backoffice", "minimal"]),
+            Some("minimal".to_string())
+        );
+    }
+
+    #[test]
+    fn with_backoffice_keeps_the_other_found_flags() {
+        // The new flag is additive — the existing flags still parse alongside it.
+        let cli = Cli::try_parse_from([
+            "mackesd",
+            "found",
+            "home-mesh",
+            "--external-addr",
+            "203.0.113.7",
+            "--role",
+            "lighthouse",
+            "--with-backoffice=full",
+        ])
+        .expect("parse");
+        match cli.cmd {
+            Cmd::Found {
+                mesh_id,
+                external_addr,
+                role,
+                with_backoffice,
+                ..
+            } => {
+                assert_eq!(mesh_id, "home-mesh");
+                assert_eq!(external_addr, "203.0.113.7");
+                assert_eq!(role, "lighthouse");
+                assert_eq!(with_backoffice.as_deref(), Some("full"));
+            }
+            _ => panic!("expected Found"),
+        }
+    }
+
+    #[test]
+    fn normalize_tier_accepts_minimal_and_full_case_insensitively() {
+        assert_eq!(normalize_backoffice_tier("minimal").unwrap(), "minimal");
+        assert_eq!(normalize_backoffice_tier("full").unwrap(), "full");
+        assert_eq!(normalize_backoffice_tier("FULL").unwrap(), "full");
+        assert_eq!(normalize_backoffice_tier("  Minimal ").unwrap(), "minimal");
+    }
+
+    #[test]
+    fn normalize_tier_rejects_a_bogus_tier() {
+        let e = normalize_backoffice_tier("bogus").unwrap_err().to_string();
+        assert!(e.contains("bogus"), "{e}");
+        assert!(e.contains("minimal") && e.contains("full"), "{e}");
+        assert!(normalize_backoffice_tier("").is_err());
+    }
 }
