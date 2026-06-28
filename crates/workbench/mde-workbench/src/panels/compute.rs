@@ -30,8 +30,11 @@ use mde_theme::{spacing, FontSize, Palette, TypeRole};
 use crate::cosmic_compat::prelude::*;
 
 use crate::controls::{variant_button, ButtonVariant};
+use crate::panels::service_publishing::{rows_for_peer, ServiceRow};
 use crate::panels::sparkline::{push_sample, sparkline};
 use crate::panels::vm_wizard::{WizardAction, WizardMsg, WizardState};
+
+use mackes_mesh_types::peers::PeerRecord;
 
 /// Live-metric sample cadence. Also the nominal interval used to turn a
 /// VM's cumulative `cpu.time` (nanoseconds) into a percentage.
@@ -75,6 +78,38 @@ pub struct Instance {
     /// (Start/Stop/Console/Migrate) shell local `virsh`/`podman`, so they only
     /// apply to local rows; peer rows are read-only here.
     pub local: bool,
+    /// SVC-VIEW-2 — the discoverable services of this instance, correlated to
+    /// the replicated peer roster. A VM that has enrolled into the mesh IS a
+    /// peer (overlay IP + mackesd publishing the canonical-7), so its services
+    /// are already discoverable through that roster; this field carries the
+    /// correlation so the row can surface them inline. Always
+    /// [`VmServices::NotApplicable`] for containers (a container isn't a mesh
+    /// peer); for a VM it is [`Enrolled`](VmServices::Enrolled) (matched to an
+    /// enrolled peer, services surfaced) or
+    /// [`NotEnrolled`](VmServices::NotEnrolled) (no roster match — services
+    /// undiscoverable until it joins the mesh, an honest empty state, §7).
+    pub services: VmServices,
+}
+
+/// SVC-VIEW-2 — the result of correlating a VM row to the replicated peer
+/// roster: whether this instance's services are discoverable, and if so which.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum VmServices {
+    /// Not a VM (a container) — service correlation doesn't apply. The default
+    /// so a freshly-enumerated row carries no correlation until one runs.
+    #[default]
+    NotApplicable,
+    /// This VM is NOT in the peer roster (by hostname / overlay IP). It hasn't
+    /// enrolled into the mesh, so nothing introspects its services — an honest
+    /// "undiscoverable until it joins" state, never fabricated rows (§7).
+    NotEnrolled,
+    /// This VM matched an enrolled peer; `services` are the canonical-7 it
+    /// publishes (reused from the SVC-VIEW-1 builder), and `overlay_ip` is the
+    /// mesh address they answer on.
+    Enrolled {
+        overlay_ip: String,
+        services: Vec<ServiceRow>,
+    },
 }
 
 /// The result of one enumeration pass. `sources` names the hypervisor
@@ -207,10 +242,26 @@ impl ComputePanel {
         &self.status
     }
 
-    /// Kick off a `virsh` + `podman` enumeration on the iced executor.
+    /// Kick off a `virsh` + `podman` enumeration on the iced executor, then
+    /// correlate each VM row to the replicated peer roster so an enrolled VM's
+    /// discoverable services surface inline (SVC-VIEW-2). The roster read
+    /// (`mesh_directory::fetch_peers`) is BLOCKING — it routes through
+    /// `action_request`, which builds its own current-thread runtime and
+    /// `block_on`s it; calling that from an iced async Task (on the multi-thread
+    /// tokio runtime) would panic ("Cannot start a runtime from within a
+    /// runtime"). So the roster fetch goes through `spawn_blocking` (the same
+    /// guard service_publishing/all-services use), while the hypervisor
+    /// enumeration stays on the async executor.
     pub fn load() -> Task<crate::Message> {
         Task::perform(
-            async move { Message::Loaded(enumerate().await) },
+            async move {
+                let mut e = enumerate().await;
+                let peers = tokio::task::spawn_blocking(crate::mesh_directory::fetch_peers)
+                    .await
+                    .unwrap_or_default();
+                correlate_vm_services(&mut e.instances, &peers);
+                Message::Loaded(e)
+            },
             crate::Message::Compute,
         )
     }
@@ -674,7 +725,7 @@ fn instance_row<'a>(
     } else {
         palette.text_muted
     };
-    row![
+    let main_row = row![
         text(inst.name.clone())
             .size(body)
             .colr(palette.text.into_cosmic_color())
@@ -696,8 +747,86 @@ fn instance_row<'a>(
         cosmic::iced::widget::container(action_cell).width(Length::FillPortion(2)),
     ]
     .spacing(f32::from(spacing::BASE[3]))
-    .align_y(cosmic::iced::alignment::Vertical::Center)
-    .into()
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    // SVC-VIEW-2 — under a VM row, surface its discoverable services (when it's
+    // enrolled into the mesh) or an honest "not enrolled" line (when it isn't).
+    // Containers carry NotApplicable, so the block is empty and the row reads
+    // exactly as before.
+    match services_block(&inst.services, palette) {
+        Some(block) => column![main_row, block]
+            .spacing(f32::from(spacing::BASE[1]))
+            .into(),
+        None => main_row.into(),
+    }
+}
+
+/// SVC-VIEW-2 — the per-row services block beneath a VM. `Enrolled` lists the
+/// services the VM-peer publishes (an indented, muted sub-list reusing the
+/// canonical-7 the Peers/All-Services panels show); `NotEnrolled` is a single
+/// honest line that the VM's services can't be introspected until it joins the
+/// mesh (no fabrication, §7). `NotApplicable` (containers) renders nothing.
+fn services_block<'a>(svc: &VmServices, palette: Palette) -> Option<Element<'a, crate::Message>> {
+    let cap = TypeRole::Caption.size_in(FontSize::defaults());
+    let indent = f32::from(spacing::BASE[5]);
+    match svc {
+        VmServices::NotApplicable => None,
+        VmServices::NotEnrolled => Some(
+            row![
+                Space::new().width(Length::Fixed(indent)),
+                text("not enrolled — services undiscoverable until it joins the mesh")
+                    .size(cap)
+                    .colr(palette.text_muted.into_cosmic_color()),
+            ]
+            .into(),
+        ),
+        VmServices::Enrolled {
+            overlay_ip,
+            services,
+        } => {
+            let header = text(format!("services on {overlay_ip}:"))
+                .size(cap)
+                .colr(palette.text_muted.into_cosmic_color());
+            // One muted line per canonical service: "SSH 22/tcp" with a
+            // published/offline note mirroring the Service Publishing panel.
+            let mut lines: Vec<Element<'a, crate::Message>> = vec![header.into()];
+            for s in services {
+                let state = if s.is_publishable {
+                    "published"
+                } else {
+                    "peer offline"
+                };
+                let color = if s.is_publishable {
+                    palette.success
+                } else {
+                    palette.text_muted
+                };
+                lines.push(
+                    text(format!("{} {}/{} · {state}", s.name, s.port, s.proto))
+                        .size(cap)
+                        .colr(color.into_cosmic_color())
+                        .into(),
+                );
+            }
+            // If somehow enrolled-but-no-rows (a roster row mid-enrollment),
+            // say so honestly rather than render a bare header.
+            if services.is_empty() {
+                lines.push(
+                    text("enrolled, awaiting published services")
+                        .size(cap)
+                        .colr(palette.text_muted.into_cosmic_color())
+                        .into(),
+                );
+            }
+            Some(
+                row![
+                    Space::new().width(Length::Fixed(indent)),
+                    column(lines).spacing(f32::from(spacing::BASE[0])),
+                ]
+                .into(),
+            )
+        }
+    }
 }
 
 /// The single lifecycle verb a row offers for `state`: Start when
@@ -1087,6 +1216,7 @@ async fn enumerate() -> Enumeration {
                 state,
                 node: local_host.clone(),
                 local: true,
+                services: VmServices::default(),
             });
         }
     }
@@ -1099,6 +1229,7 @@ async fn enumerate() -> Enumeration {
                 state,
                 node: local_host.clone(),
                 local: true,
+                services: VmServices::default(),
             });
         }
     }
@@ -1238,6 +1369,7 @@ fn fold_bus_inventories(
                     state: e.state.clone(),
                     node: node.clone(),
                     local: false,
+                    services: VmServices::default(),
                 });
             }
         };
@@ -1245,6 +1377,64 @@ fn fold_bus_inventories(
         fold(&inv.containers, InstanceKind::Container);
     }
     true
+}
+
+/// SVC-VIEW-2 — correlate each VM row to the replicated peer roster and attach
+/// its discoverable services. An MDE-VM that has enrolled into the mesh IS a
+/// peer: it has an overlay IP and runs mackesd, which publishes the canonical-7
+/// — so its services are ALREADY discoverable through the same roster the Peers
+/// panel + SVC-VIEW-1 read (`<workgroup>/peers/*.json`, surfaced here via
+/// `mesh_directory::fetch_peers`). The gap this closes is that the Instances
+/// panel never *correlated* a VM row to those services; this does, reusing the
+/// SVC-VIEW-1 per-peer builder (`rows_for_peer`) rather than re-deriving service
+/// discovery (§6 glue-not-rewrite).
+///
+/// Matching is by name: a VM's libvirt domain name (or bus-inventory name) vs a
+/// peer's hostname, case-insensitively and ignoring any DNS suffix on either
+/// side (`MDE-KVM-1` ↔ `mde-kvm-1.mesh`). Containers are never peers, so they
+/// stay [`VmServices::NotApplicable`]. A VM with no roster match is
+/// [`VmServices::NotEnrolled`] — an honest "undiscoverable until it joins"
+/// state, never fabricated rows (§7). Pure + unit-tested.
+pub fn correlate_vm_services(instances: &mut [Instance], peers: &[PeerRecord]) {
+    for inst in instances.iter_mut() {
+        if inst.kind != InstanceKind::Vm {
+            inst.services = VmServices::NotApplicable;
+            continue;
+        }
+        match match_peer(&inst.name, peers) {
+            // An enrolled VM-peer has an overlay IP; reuse the canonical-7
+            // builder. `rows_for_peer` returns empty for a peer without an
+            // overlay IP, so a roster row that exists but isn't enrolled yet
+            // still reads as NotEnrolled (no fabricated services).
+            Some(p) if p.overlay_ip.as_deref().is_some_and(|ip| !ip.is_empty()) => {
+                inst.services = VmServices::Enrolled {
+                    overlay_ip: p.overlay_ip.clone().unwrap_or_default(),
+                    services: rows_for_peer(p),
+                };
+            }
+            _ => inst.services = VmServices::NotEnrolled,
+        }
+    }
+}
+
+/// Find the roster peer whose hostname identifies `vm_name`. Compares the bare
+/// labels (lowercased, DNS suffix dropped) so `MDE-KVM-1` matches a peer named
+/// `mde-kvm-1` or `mde-kvm-1.mesh`. Returns the first match (hostnames are the
+/// roster's unique key). Pure.
+fn match_peer<'a>(vm_name: &str, peers: &'a [PeerRecord]) -> Option<&'a PeerRecord> {
+    let want = bare_label(vm_name);
+    if want.is_empty() {
+        return None;
+    }
+    peers.iter().find(|p| bare_label(&p.hostname) == want)
+}
+
+/// Normalize a hostname/VM name to its bare comparison label: trim, lowercase,
+/// drop any DNS suffix (everything from the first `.`). Pure.
+fn bare_label(s: &str) -> String {
+    let t = s.trim();
+    let stem = t.split('.').next().unwrap_or(t);
+    stem.to_ascii_lowercase()
 }
 
 /// Pull each peer's latest compute inventory from the replicated QNM-Shared
@@ -1345,6 +1535,7 @@ mod tests {
                 state: "running".into(),
                 node: "fedora".into(),
                 local: true,
+                services: VmServices::NotApplicable,
             }],
             sources: vec!["virsh", "podman"],
         };
@@ -1363,6 +1554,7 @@ mod tests {
                 state: "running".into(),
                 node: "fedora".into(),
                 local: true,
+                services: VmServices::NotApplicable,
             }],
             sources: vec!["virsh"],
         }));
@@ -1384,6 +1576,7 @@ mod tests {
                 state: "running".into(),
                 node: "fedora".into(),
                 local: true,
+                services: VmServices::NotApplicable,
             }],
             sources: vec!["podman"],
         }));
@@ -1438,6 +1631,7 @@ mod tests {
                 state: "shut off".into(),
                 node: "fedora".into(),
                 local: true,
+                services: VmServices::NotApplicable,
             }],
             sources: vec!["virsh"],
         }));
@@ -1567,6 +1761,7 @@ mod tests {
             state: "running".into(),
             node: "fedora".into(),
             local: true,
+            services: VmServices::NotApplicable,
         };
         let container = Instance {
             name: "web".into(),
@@ -1574,6 +1769,7 @@ mod tests {
             state: "running".into(),
             node: "fedora".into(),
             local: true,
+            services: VmServices::NotApplicable,
         };
         let _: Element<'_, crate::Message> =
             instance_row(&running_vm, None, crate::live_theme::palette());
@@ -1635,6 +1831,7 @@ mod tests {
             state: "shut off".into(),
             node: "fedora".into(),
             local: true,
+            services: VmServices::NotApplicable,
         };
         let _: Element<'_, crate::Message> =
             instance_row(&stopped_vm, None, crate::live_theme::palette());
@@ -1649,6 +1846,7 @@ mod tests {
             state: "running".into(),
             node: "fedora".into(),
             local: true,
+            services: VmServices::NotApplicable,
         }];
         let invs = vec![
             // This node's own published doc — skipped by overlay-IP match (its
@@ -1714,6 +1912,7 @@ mod tests {
             state: "running".into(),
             node: "fedora".into(),
             local: true,
+            services: VmServices::NotApplicable,
         }];
         let invs = vec![BusInventory {
             peer: "10.42.0.3".into(),
@@ -1735,5 +1934,130 @@ mod tests {
         assert_eq!(display_host("node-13"), "node-13");
         assert_eq!(display_host("  peer:lh-01 "), "lh-01");
         assert_eq!(display_host(""), "unknown");
+    }
+
+    // ── SVC-VIEW-2: VM↔peer service correlation ───────────────────────────────
+
+    fn enrolled_peer(host: &str, ip: &str, health: &str) -> PeerRecord {
+        let mut p = PeerRecord::now(host, None, health);
+        p.overlay_ip = Some(ip.to_string());
+        p
+    }
+
+    fn vm(name: &str) -> Instance {
+        Instance {
+            name: name.into(),
+            kind: InstanceKind::Vm,
+            state: "running".into(),
+            node: "fedora".into(),
+            local: true,
+            services: VmServices::NotApplicable,
+        }
+    }
+
+    #[test]
+    fn bare_label_normalizes_case_and_suffix() {
+        assert_eq!(bare_label("MDE-KVM-1"), "mde-kvm-1");
+        assert_eq!(bare_label("mde-kvm-1.mesh"), "mde-kvm-1");
+        assert_eq!(bare_label("  MDE-KVM-1.lan "), "mde-kvm-1");
+        assert_eq!(bare_label(""), "");
+    }
+
+    #[test]
+    fn match_peer_matches_across_case_and_dns_suffix() {
+        let peers = vec![
+            enrolled_peer("mde-kvm-1.mesh", "10.42.0.9", "healthy"),
+            enrolled_peer("other", "10.42.0.10", "healthy"),
+        ];
+        // VM domain name in upper-case, bare; peer hostname lower + DNS suffix.
+        let m = match_peer("MDE-KVM-1", &peers).expect("matches by bare label");
+        assert_eq!(m.hostname, "mde-kvm-1.mesh");
+        // No match → None (honest miss, not the first peer).
+        assert!(match_peer("nonesuch", &peers).is_none());
+        assert!(match_peer("", &peers).is_none());
+    }
+
+    #[test]
+    fn correlate_enrolled_vm_surfaces_canonical_services() {
+        let mut instances = vec![vm("MDE-KVM-1")];
+        let peers = vec![enrolled_peer("mde-kvm-1", "10.42.0.9", "healthy")];
+        correlate_vm_services(&mut instances, &peers);
+        match &instances[0].services {
+            VmServices::Enrolled {
+                overlay_ip,
+                services,
+            } => {
+                assert_eq!(overlay_ip, "10.42.0.9");
+                assert_eq!(services.len(), 7, "the canonical-7, reused from SVC-VIEW-1");
+                assert!(services.iter().all(|s| s.is_publishable));
+            }
+            other => panic!("expected Enrolled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn correlate_unmatched_vm_is_not_enrolled() {
+        // A VM with no roster peer → honest "not enrolled" (no fabricated rows).
+        let mut instances = vec![vm("orphan-vm")];
+        let peers = vec![enrolled_peer("some-other-host", "10.42.0.9", "healthy")];
+        correlate_vm_services(&mut instances, &peers);
+        assert_eq!(instances[0].services, VmServices::NotEnrolled);
+    }
+
+    #[test]
+    fn correlate_vm_matching_unenrolled_peer_is_not_enrolled() {
+        // The roster has a same-named record but it has no overlay IP (it hasn't
+        // finished enrolling) — its services aren't discoverable yet.
+        let mut instances = vec![vm("mde-kvm-2")];
+        let peers = vec![PeerRecord::now("mde-kvm-2", None, "healthy")];
+        correlate_vm_services(&mut instances, &peers);
+        assert_eq!(instances[0].services, VmServices::NotEnrolled);
+    }
+
+    #[test]
+    fn correlate_container_is_not_applicable() {
+        let mut instances = vec![Instance {
+            name: "web".into(),
+            kind: InstanceKind::Container,
+            state: "running".into(),
+            node: "fedora".into(),
+            local: true,
+            // even if a same-named peer existed, a container isn't a mesh peer.
+            services: VmServices::Enrolled {
+                overlay_ip: "x".into(),
+                services: vec![],
+            },
+        }];
+        let peers = vec![enrolled_peer("web", "10.42.0.9", "healthy")];
+        correlate_vm_services(&mut instances, &peers);
+        assert_eq!(instances[0].services, VmServices::NotApplicable);
+    }
+
+    #[test]
+    fn correlate_empty_roster_marks_every_vm_not_enrolled() {
+        let mut instances = vec![vm("MDE-KVM-1"), vm("MDE-KVM-2")];
+        correlate_vm_services(&mut instances, &[]);
+        assert!(instances
+            .iter()
+            .all(|i| i.services == VmServices::NotEnrolled));
+    }
+
+    #[test]
+    fn vm_row_renders_all_service_states_without_panic() {
+        let palette = crate::live_theme::palette();
+        // Enrolled VM → services block.
+        let mut enrolled_vm = vm("MDE-KVM-1");
+        enrolled_vm.services = VmServices::Enrolled {
+            overlay_ip: "10.42.0.9".into(),
+            services: rows_for_peer(&enrolled_peer("mde-kvm-1", "10.42.0.9", "healthy")),
+        };
+        let _: Element<'_, crate::Message> = instance_row(&enrolled_vm, None, palette);
+        // Not-enrolled VM → honest single line.
+        let mut not_enrolled = vm("orphan");
+        not_enrolled.services = VmServices::NotEnrolled;
+        let _: Element<'_, crate::Message> = instance_row(&not_enrolled, None, palette);
+        // NotApplicable → no extra block (renders as the bare row).
+        let plain = vm("plain");
+        let _: Element<'_, crate::Message> = instance_row(&plain, None, palette);
     }
 }
