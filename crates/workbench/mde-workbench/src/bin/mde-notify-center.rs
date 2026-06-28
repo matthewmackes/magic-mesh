@@ -254,6 +254,11 @@ impl Center {
         let read_state = mde_bus::client_data_dir()
             .map(|d| mde_notify::ReadState::load(&d))
             .unwrap_or_default();
+        // NOTIFY-FX-1 — arm the Hub-open reveal as the panel mounts, so it
+        // fades/slides in with the same Carbon panel-mount vocabulary the
+        // Application Menu plays on open (the launcher's idiom).
+        let mut anim = HubAnim::new(reduce_motion);
+        anim.on_open(std::time::Instant::now());
         Self {
             items: Vec::new(),
             tail: AlertTail::default(),
@@ -266,7 +271,7 @@ impl Center {
             beam_step: 0,
             now_art: None,
             now_art_id: None,
-            anim: HubAnim::new(reduce_motion),
+            anim,
             seen_ids: HashSet::new(),
             expanded_stacks: HashSet::new(),
             clips: Vec::new(),
@@ -1211,8 +1216,21 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     sections.push(quick_actions.into());
     sections.push(launch_bar.into());
 
+    // NOTIFY-FX-1 — the Hub-open reveal: the whole body starts a few px low and
+    // rises to rest (Carbon panel-mount), rendered as top padding that decays to
+    // 0 — iced 0.13 has no transform widget, so we offset layout instead (the
+    // same translate-as-padding approach the Application Menu uses on open). The
+    // offset is 0 once settled (and always 0 under reduce-motion), so there's no
+    // residual layout shift at rest.
+    let open_slide = state.anim.open_params(anim_now).translate_y.max(0.0);
     let content: Element<'_, Message> =
         container(cosmic::iced::widget::column(sections).spacing(0))
+            .padding(Padding {
+                top: open_slide,
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+            })
             .width(Length::Fill)
             .height(Length::Fill)
             .into();

@@ -19,7 +19,7 @@ use crate::backend::{Backend, RemoteBackend};
 use crate::dbus::PendingFocus;
 use crate::header::HeaderAction;
 use crate::keyboard::{KeyAction, Pane};
-use crate::model::{resolve_panel_label, view_from_focus_slug, Group, View};
+use crate::model::{resolve_panel_label, view_from_focus_slug, DatacenterTab, Group, View};
 use crate::panels::{
     audit as audit_panel, build_farm as build_farm_panel, compute as compute_panel,
     config_apply as config_apply_panel, connect as connect_panel,
@@ -145,6 +145,11 @@ pub enum Message {
     Jobs(jobs_panel::Message),
     BuildFarm(build_farm_panel::Message),
     Datacenter(datacenter_panel::Message),
+    /// DATACENTER-25 — select which surface shows inside the Datacenter plane:
+    /// its own lenses (`Native`) or one of the folded panels
+    /// (Instances/Snapshots/Images/Build Farm). Fires the chosen tab's `load`
+    /// so it lands populated.
+    SelectDatacenterTab(DatacenterTab),
     /// PLANES-12 — Audit panel (hash-chain timeline + verify) sub-message.
     Audit(audit_panel::Message),
     /// PLANES-8 — Mesh Logs panel (journald mesh-unit view) sub-message.
@@ -238,6 +243,10 @@ pub enum Message {
     /// the in-flight-only transition tick (idle ⇒ no wakeups); the handler just
     /// re-renders, clearing the transition once the tween completes.
     TransitionTick,
+    /// MOTION-TRANS-2 — one frame of the sidebar group-expand reveal. Fired by the
+    /// in-flight-only `nav_anim` tick; the handler GC's settled tweens so the tick
+    /// self-stops at rest.
+    NavAnimTick,
 }
 
 /// MOTION-TRANS-1 — an in-flight panel/route crossfade. Created the instant the
@@ -292,6 +301,12 @@ pub struct App {
     /// active [`View`] actually changes; cleared once the tween completes.
     transition: Option<PanelTransition>,
     sidebar: SidebarState,
+    /// MOTION-TRANS-2 — the sidebar group-expand reveal animator. Keyed by
+    /// `g:<group-slug>`; a tween is armed when a group expands (navigation to a
+    /// new active group, or a user chevron toggle) so its nav rows slide up into
+    /// place. Tick-driven only while in flight (`needs_tick`), so an idle sidebar
+    /// costs nothing. Empty/idle under reduce-motion (expansions are instant).
+    nav_anim: mde_theme::animation::Animator,
     focused_pane: Pane,
     /// GUI-RECONNECT — last known Bus/mackesd reachability. A down→up
     /// transition (the control plane came back after a restart) re-fires
@@ -321,6 +336,9 @@ pub struct App {
     jobs: jobs_panel::JobsPanel,
     build_farm: build_farm_panel::BuildFarmPanel,
     datacenter: datacenter_panel::DatacenterPanel,
+    /// DATACENTER-25 — the selected tab inside the Datacenter plane (its own
+    /// surface or one of the folded Instances/Snapshots/Images/Build-Farm panels).
+    datacenter_tab: DatacenterTab,
     audit: audit_panel::AuditPanel,
     mesh_logs: mesh_logs_panel::MeshLogsPanel,
     config_apply: config_apply_panel::ConfigApplyPanel,
@@ -421,6 +439,7 @@ impl App {
             view: View::default(),
             transition: None,
             sidebar: SidebarState::new(),
+            nav_anim: mde_theme::animation::Animator::new(),
             focused_pane: Pane::Sidebar,
             bus_reachable: true,
             bus_probing: false,
@@ -437,6 +456,7 @@ impl App {
             jobs: jobs_panel::JobsPanel::new(),
             build_farm: build_farm_panel::BuildFarmPanel::new(),
             datacenter: datacenter_panel::DatacenterPanel::new(),
+            datacenter_tab: DatacenterTab::default(),
             audit: audit_panel::AuditPanel::new(),
             mesh_logs: mesh_logs_panel::MeshLogsPanel::new(),
             config_apply: config_apply_panel::ConfigApplyPanel::new(),
@@ -678,10 +698,19 @@ impl App {
                     .map(|_| Message::TransitionTick),
             );
         }
-        // E6.10 — sample Compute instance CPU/mem only while that view is
-        // active, so virsh/podman stats aren't polled when the operator is
+        // MOTION-TRANS-2 — drive the sidebar group-expand reveal at ~60 fps, but
+        // ONLY while a reveal is in flight (idle ⇒ no subscription, zero wakeups).
+        if self.nav_anim.needs_tick(Instant::now()) {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(16))
+                    .map(|_| Message::NavAnimTick),
+            );
+        }
+        // E6.10 / DATACENTER-25 — sample Compute instance CPU/mem only while the
+        // Instances surface is actually showing (now the Datacenter plane's
+        // Instances tab), so virsh/podman stats aren't polled when the operator is
         // elsewhere.
-        if self.view.panel_slug() == Some("instances") {
+        if self.on_datacenter_tab(DatacenterTab::Instances) {
             subs.push(compute_panel::ComputePanel::sample_subscription());
         }
         // LIGHTHOUSE-5 — only while the Lighthouses tab is open: advance the
@@ -695,6 +724,17 @@ impl App {
             subs.push(
                 cosmic::iced::time::every(Duration::from_secs(5))
                     .map(|_| Message::Lighthouses(lighthouses_panel::Message::Refresh)),
+            );
+        }
+        // MOTION-TRANS-3 — drive the Mesh Pending list's row-insert reveal at
+        // ~60 fps, only while the panel is active AND a reveal is in flight (idle
+        // ⇒ no subscription, zero wakeups).
+        if self.view.panel_slug() == Some("mesh_pending")
+            && self.mesh_pending.needs_tick(Instant::now())
+        {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(16))
+                    .map(|_| Message::MeshPending(mesh_pending_panel::Message::AnimTick)),
             );
         }
         // PD-8 (L14) / PLANES-1 — Netdata sampling only while the Peers
@@ -749,6 +789,11 @@ impl App {
         let task = self.reduce(message);
         if self.view != prev_view {
             self.begin_transition();
+            // MOTION-TRANS-2 — a navigation onto a *different* group auto-expands
+            // that group; reveal its rows (no-op under reduce-motion).
+            if self.view.group() != prev_view.group() {
+                self.arm_nav_reveal(self.view.group());
+            }
         }
         task
     }
@@ -761,6 +806,23 @@ impl App {
             start: Instant::now(),
             reduce_motion: crate::live_theme::reduce_motion(),
         });
+    }
+
+    /// MOTION-TRANS-2 — arm the slide-up reveal for `group`'s sidebar rows (the
+    /// shared Carbon panel-mount preset). A no-op under reduce-motion, so the
+    /// expand is instant then — the Animator stays empty and the reveal closure
+    /// reads `1.0` (rows at rest). Keyed by `g:<slug>` so each group reveals
+    /// independently and the per-frame tick GC's it the moment it settles.
+    fn arm_nav_reveal(&mut self, group: Group) {
+        if crate::live_theme::reduce_motion() {
+            return;
+        }
+        self.nav_anim.start(
+            format!("g:{}", group.slug()),
+            Instant::now(),
+            mde_theme::motion::Motion::panel_mount(),
+            false,
+        );
     }
 
     /// The message reducer proper. Split out of [`App::update`] so the latter can
@@ -791,7 +853,15 @@ impl App {
                 self.on_panel_navigated(group, panel)
             }
             Message::ToggleGroupExpansion(group) => {
-                self.sidebar.toggle(group, self.view.group());
+                let active = self.view.group();
+                let was_expanded = self.sidebar.is_expanded(group, active);
+                self.sidebar.toggle(group, active);
+                // MOTION-TRANS-2 — reveal the rows only when the chevron *opens* a
+                // group; a collapse removes its rows immediately (instant exit —
+                // immediate-mode iced can't retain a leaving subtree to fade).
+                if !was_expanded && self.sidebar.is_expanded(group, active) {
+                    self.arm_nav_reveal(group);
+                }
                 Task::none()
             }
             Message::KeyPressed(action) => {
@@ -871,6 +941,13 @@ impl App {
             Message::Jobs(msg) => self.jobs.update(msg),
             Message::BuildFarm(msg) => self.build_farm.update(msg),
             Message::Datacenter(msg) => self.datacenter.update(msg),
+            // DATACENTER-25 — switch the Datacenter plane's tab + fire the chosen
+            // surface's load so a folded panel lands populated (each keeps its own
+            // state/reducer/subscription; this only selects + refreshes it).
+            Message::SelectDatacenterTab(tab) => {
+                self.datacenter_tab = tab;
+                self.load_datacenter_tab(tab)
+            }
             Message::Audit(msg) => self.audit.update(msg),
             Message::MeshLogs(msg) => self.mesh_logs.update(msg),
             Message::ConfigApply(msg) => self.config_apply.update(msg),
@@ -933,6 +1010,13 @@ impl App {
                 }
                 Task::none()
             }
+            // MOTION-TRANS-2 — advance the sidebar reveal: drop settled tweens so
+            // the in-flight-only tick subscription self-stops at rest.
+            Message::NavAnimTick => {
+                self.nav_anim.gc(Instant::now());
+                Task::none()
+            }
+            // GUI-RECONNECT — fire the cheap Bus liveness probe.
             // GUI-RECONNECT — fire the cheap Bus liveness probe. MOTION-NET-5 —
             // mark the background poll in-flight so the header shows a subtle,
             // non-blocking refresh indicator while the probe runs.
@@ -998,12 +1082,13 @@ impl App {
             "config_apply" => config_apply_panel::ConfigApplyPanel::load(),
             "registration" => registration_panel::RegistrationPanel::load(),
             "jobs" => jobs_panel::JobsPanel::load(),
-            "build-farm" => build_farm_panel::BuildFarmPanel::load(),
-            "datacenter" => datacenter_panel::DatacenterPanel::load(),
+            // DATACENTER-25 — entering the Datacenter plane loads the active tab
+            // (Native = its own `event/dc/*` projection; a folded tab = that
+            // panel's load) so it lands populated whichever surface is selected.
+            "datacenter" => self.load_datacenter_tab(self.datacenter_tab),
             "node_roles" => node_roles_panel::NodeRolesPanel::load(),
             "playbooks" => playbooks_panel::PlaybooksPanel::load(),
             "run_history" => run_history_panel::RunHistoryPanel::load(),
-            "snapshots" => snapshots_panel::SnapshotsPanel::load(),
             "logs" => logs_panel::LogsPanel::load(),
             "resources" => resources_panel::ResourcesPanel::load(),
             "system_update" => system_update_panel::SystemUpdatePanel::load(),
@@ -1028,12 +1113,6 @@ impl App {
             "profiles" => profiles_panel::ProfilesPanel::load(),
             // PLANES-24 — the package-mirror catalog.
             "mirrors" => mirrors_panel::MirrorsPanel::load(),
-            // PLANES-22 — the image catalog.
-            "images" => images_panel::ImagesPanel::load(),
-            // WORKLOAD-FLEET-3 — the Compute/Instances panel enumerates local
-            // VMs/pods + folds the fleet QNM inventory on nav (was the one
-            // panel missing here, so it sat at "Loading instances…" forever).
-            "instances" => compute_panel::ComputePanel::load(),
             // XCP-4 — the VM Spawner queries the xcp_provision worker for the
             // VM + dom0-host rosters on nav so the panel lands populated.
             "provisioning" => provisioning_panel::ProvisioningPanel::load(),
@@ -1125,6 +1204,24 @@ impl App {
         };
         self.view = view;
         self.focused_pane = Pane::Main;
+        // DATACENTER-25 — a deep link to one of the now-folded slugs
+        // (`instances`/`snapshots`/`images`/`build-farm`) routed to the Datacenter
+        // plane; select the matching fold tab so it opens on the right surface
+        // (set before `on_panel_navigated` so the tab's load fires below). A direct
+        // `datacenter` link keeps the current tab (defaults to `Native`).
+        if let View::Panel {
+            panel: "datacenter",
+            ..
+        } = view
+        {
+            if let Some(tab) = route_slug
+                .rsplit('.')
+                .next()
+                .and_then(DatacenterTab::from_folded_slug)
+            {
+                self.datacenter_tab = tab;
+            }
+        }
         // Apply the per-item focus before the panel loads so the tab opens
         // already highlighting + listing the clicked lighthouse first (Q20).
         if let (
@@ -1217,12 +1314,29 @@ impl App {
         if !self.disclaimer_accepted {
             return self.disclaimer_gate_view();
         }
+        // MOTION-TRANS-2 — the per-group reveal progress closure: reads the
+        // sidebar Animator (or `1.0`/instant under reduce-motion). One clock read
+        // for the whole sidebar build.
+        let nav_now = Instant::now();
+        let nav_anim = &self.nav_anim;
+        let reduce_motion = crate::live_theme::reduce_motion();
         let sidebar = crate::sidebar::view(
             &self.sidebar,
             self.view,
             self.focused_pane,
             Message::SelectGroup,
             |group, panel| Message::SelectPanel { group, panel },
+            move |group: Group| {
+                if reduce_motion {
+                    1.0
+                } else {
+                    nav_anim.value(
+                        &format!("g:{}", group.slug()),
+                        nav_now,
+                        mde_theme::motion::Easing::EaseOut,
+                    )
+                }
+            },
         );
 
         let crumbs = breadcrumb(self.view)
@@ -1310,6 +1424,68 @@ impl App {
         stack![body, scrim].into()
     }
 
+    /// DATACENTER-25 — is the Datacenter plane the active view with `tab`
+    /// selected? The single predicate the per-tab subscriptions + fold-bar share.
+    fn on_datacenter_tab(&self, tab: DatacenterTab) -> bool {
+        self.view.panel_slug() == Some("datacenter") && self.datacenter_tab == tab
+    }
+
+    /// DATACENTER-25 — fire the load for a Datacenter tab so a folded surface
+    /// lands populated when it's selected (or when the plane is (re)entered).
+    /// `Native` reloads Datacenter's own `event/dc/*` projection.
+    fn load_datacenter_tab(&self, tab: DatacenterTab) -> Task<Message> {
+        match tab {
+            DatacenterTab::Native => datacenter_panel::DatacenterPanel::load(),
+            DatacenterTab::Instances => compute_panel::ComputePanel::load(),
+            DatacenterTab::Snapshots => snapshots_panel::SnapshotsPanel::load(),
+            DatacenterTab::Images => images_panel::ImagesPanel::load(),
+            DatacenterTab::BuildFarm => build_farm_panel::BuildFarmPanel::load(),
+        }
+    }
+
+    /// DATACENTER-25 — the Datacenter plane surface: a fold bar that selects the
+    /// plane's own lenses (`Native`) or one of the folded panels (Instances /
+    /// Snapshots / Images / Build Farm), with the chosen tab's body below. Each
+    /// folded panel keeps its own state + reducer + subscription on `App` — this
+    /// is pure VIEW routing (§6 glue-not-rewrite), so the once-standalone surfaces
+    /// stay fully reachable here without their duplicated sidebar rows.
+    fn datacenter_surface(&self) -> Element<'_, Message> {
+        let palette = crate::live_theme::palette();
+        let mut bar = row![].spacing(f32::from(mde_theme::spacing::BASE[2]));
+        for tab in DatacenterTab::all() {
+            let variant = if self.datacenter_tab == tab {
+                crate::controls::ButtonVariant::Primary
+            } else {
+                crate::controls::ButtonVariant::Secondary
+            };
+            bar = bar.push(crate::controls::variant_button(
+                tab.label().to_string(),
+                variant,
+                Some(Message::SelectDatacenterTab(tab)),
+                palette,
+            ));
+        }
+        let body = match self.datacenter_tab {
+            DatacenterTab::Native => self.datacenter.view(),
+            DatacenterTab::Instances => self.compute.view(),
+            DatacenterTab::Snapshots => self.snapshots.view(),
+            DatacenterTab::Images => self.images.view(),
+            DatacenterTab::BuildFarm => self.build_farm.view(),
+        };
+        column![
+            container(bar).padding(cosmic::iced::Padding {
+                top: f32::from(mde_theme::spacing::BASE[2]),
+                right: f32::from(mde_theme::spacing::BASE[4]),
+                bottom: 0.0,
+                left: f32::from(mde_theme::spacing::BASE[4]),
+            }),
+            body,
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
     /// Per-View body — panel views land here as they ship.
     fn panel_body(&self) -> Element<'_, Message> {
         match self.view {
@@ -1367,14 +1543,15 @@ impl App {
             } => self.registration.view(),
             // Controller plane — jobs / playbooks / run history.
             View::Panel { panel: "jobs", .. } => self.jobs.view(),
-            View::Panel {
-                panel: "build-farm",
-                ..
-            } => self.build_farm.view(),
+            // DATACENTER-25 — the Datacenter plane renders the fold surface: its
+            // own lenses + the folded Instances/Snapshots/Images/Build-Farm tabs.
+            // The standalone `build-farm`/`snapshots`/`images`/`instances` view
+            // arms were removed (their nav rows are gone); the panels are reached
+            // here as tabs.
             View::Panel {
                 panel: "datacenter",
                 ..
-            } => self.datacenter.view(),
+            } => self.datacenter_surface(),
             View::Panel {
                 panel: "playbooks", ..
             } => self.playbooks.view(),
@@ -1387,9 +1564,6 @@ impl App {
                 panel: "node_roles",
                 ..
             } => self.node_roles.view(),
-            View::Panel {
-                panel: "snapshots", ..
-            } => self.snapshots.view(),
             View::Panel { panel: "logs", .. } => self.logs.view(),
             View::Panel {
                 panel: "resources", ..
@@ -1460,10 +1634,6 @@ impl App {
             View::Panel {
                 panel: "mirrors", ..
             } => self.mirrors.view(),
-            // PLANES-22 — the image catalog.
-            View::Panel {
-                panel: "images", ..
-            } => self.images.view(),
             // BUS-7.2 — Mackes Bus 5-tab operator surface.
             View::Panel {
                 panel: "mesh_bus", ..
@@ -1566,15 +1736,6 @@ impl App {
             View::Panel {
                 panel: "revisions", ..
             } => self.fleet_revisions.view(),
-            // E6.10 — the Compute group root (and its "Instances"
-            // sub-panel) render the bespoke local + fleet VM/pod list,
-            // not the generic role card: `--page compute` lands directly
-            // on the instance enumeration per the E6.10 acceptance.
-            // NAV-1 — Compute folds into Provisioning; the Instances panel
-            // (slug-routed) renders the local + fleet VM/pod list.
-            View::Panel {
-                panel: "instances", ..
-            } => self.compute.view(),
             // XCP-4 — the VM Spawner / Provisioning plane (A-plane MDE-VMs).
             View::Panel {
                 panel: "provisioning",
@@ -2042,6 +2203,112 @@ mod tests {
         let mut app = App::new();
         let _ = app.update(Message::FocusRequest("system".into()));
         assert_eq!(app.current_view(), View::Group(Group::System));
+    }
+
+    #[test]
+    fn select_datacenter_tab_updates_active_tab() {
+        // DATACENTER-25 — the fold bar selects which surface shows in the
+        // Datacenter plane; the tab state drives both the body + its subscriptions.
+        let mut app = App::new();
+        assert_eq!(app.datacenter_tab, DatacenterTab::Native, "defaults to Native");
+        let _ = app.update(Message::SelectDatacenterTab(DatacenterTab::Instances));
+        assert_eq!(app.datacenter_tab, DatacenterTab::Instances);
+        assert!(
+            app.on_datacenter_tab(DatacenterTab::Instances)
+                || app.current_view() != (View::Panel {
+                    group: Group::Provisioning,
+                    panel: "datacenter"
+                }),
+            "the Instances tab predicate only trips while the plane is the active view",
+        );
+        let _ = app.update(Message::SelectDatacenterTab(DatacenterTab::BuildFarm));
+        assert_eq!(app.datacenter_tab, DatacenterTab::BuildFarm);
+    }
+
+    #[test]
+    fn folded_slug_focus_lands_on_datacenter_with_the_matching_tab() {
+        // DATACENTER-25 — a deep link to a retired folded slug
+        // (here the old `system.snapshots`) opens the Datacenter plane on the
+        // Snapshots tab, never a missing panel.
+        let mut app = App::new();
+        let _ = app.update(Message::FocusRequest("system.snapshots".into()));
+        assert_eq!(
+            app.current_view(),
+            View::Panel {
+                group: Group::Provisioning,
+                panel: "datacenter"
+            }
+        );
+        assert_eq!(app.datacenter_tab, DatacenterTab::Snapshots);
+        assert_eq!(app.focused_pane(), Pane::Main);
+        // The Instances slug routes the same way, onto its own tab.
+        let _ = app.update(Message::FocusRequest("provisioning.instances".into()));
+        assert_eq!(app.datacenter_tab, DatacenterTab::Instances);
+    }
+
+    #[test]
+    fn sidebar_reveal_tween_drives_the_row_offset_to_rest() {
+        // MOTION-TRANS-2 — a reveal tween armed for a group resolves to a partial
+        // reveal at the start (rows offset) and the settled value once its
+        // panel-mount duration elapses (rows at rest). The sidebar reads this exact
+        // value into `reveal_offset`.
+        let mut app = App::new();
+        let t0 = Instant::now();
+        let key = format!("g:{}", Group::System.slug());
+        app.nav_anim
+            .start(&key, t0, mde_theme::motion::Motion::panel_mount(), false);
+        let early = app
+            .nav_anim
+            .value(&key, t0, mde_theme::motion::Easing::EaseOut);
+        assert!(early < 1.0, "a freshly-armed reveal is mid-flight, got {early}");
+        assert!(
+            crate::sidebar::reveal_offset(early) > 0.0,
+            "rows start offset below their rest position"
+        );
+        let done = t0 + mde_theme::motion::Motion::panel_mount().duration;
+        let settled = app
+            .nav_anim
+            .value(&key, done, mde_theme::motion::Easing::EaseOut);
+        assert!((settled - 1.0).abs() < 1e-3, "reveal settles to 1");
+        assert!(
+            crate::sidebar::reveal_offset(settled).abs() < 1e-3,
+            "rows rest at 0 — no residual layout shift"
+        );
+    }
+
+    #[test]
+    fn chevron_expand_arms_a_reveal_collapse_does_not() {
+        // MOTION-TRANS-2 — opening a group via its chevron arms the slide-up
+        // reveal (unless reduce-motion makes it instant); collapsing never arms
+        // one (the rows leave immediately).
+        let mut app = App::new();
+        let active = app.current_view().group();
+        let group = Group::all()
+            .into_iter()
+            .find(|g| *g != active)
+            .expect("a non-active group exists");
+        assert!(!app.sidebar.is_expanded(group, active), "starts collapsed");
+        let _ = app.update(Message::ToggleGroupExpansion(group));
+        assert!(
+            app.sidebar.is_expanded(group, active),
+            "the chevron opened the group"
+        );
+        let key = format!("g:{}", group.slug());
+        let now = Instant::now();
+        if crate::live_theme::reduce_motion() {
+            assert!(
+                !app.nav_anim.is_animating(&key, now),
+                "reduce-motion: the expand is instant, no reveal tween"
+            );
+        } else {
+            assert!(
+                app.nav_anim.is_animating(&key, now),
+                "a reveal tween is armed when the group opens"
+            );
+        }
+        // Collapsing again: the rows leave instantly — no new reveal is armed.
+        let _ = app.update(Message::ToggleGroupExpansion(group));
+        assert!(!app.sidebar.is_expanded(group, active), "the group collapsed");
     }
 
     #[test]
