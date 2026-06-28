@@ -132,6 +132,93 @@ pub struct NavEntry {
     pub panels: Vec<Panel>,
 }
 
+/// DATACENTER-25 — which surface is showing inside the **Datacenter** panel.
+///
+/// Six panels that used to be standalone sidebar entries (`compute`/Instances,
+/// `snapshots`, `images`, `lighthouses`, `build_farm`) are now folded in as tabs
+/// of the Datacenter panel; `Native` is Datacenter's own multi-lens surface
+/// (Overview / Topology / Resources / Tofu / Audit). The fold is a NAV + VIEW
+/// routing change: each folded surface keeps its own panel state + reducer +
+/// subscription in `app.rs` and is selected by this tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DatacenterTab {
+    /// Datacenter's own surface (the existing Overview/Topology/Resources/Tofu/
+    /// Audit lenses + the prod/dev zone tabs). The default landing tab.
+    #[default]
+    Native,
+    /// The Compute/Instances panel — local VMs/pods + the fleet QNM inventory
+    /// (carries its embedded VM-create wizard).
+    Instances,
+    /// The Snapshots panel — capture/restore the live config.
+    Snapshots,
+    /// The Images panel — the bootable-image catalog.
+    Images,
+    /// The Lighthouses panel — the lighthouse ops cards + beacon beam.
+    Lighthouses,
+    /// The Build Farm panel — farm jobs queued/passed/failed + test tiers.
+    BuildFarm,
+}
+
+impl DatacenterTab {
+    /// The sidebar/CLI slug a folded surface used to own as a standalone panel.
+    /// Returned for the folded tabs only — `Native` is Datacenter's own surface
+    /// and has no folded-panel slug (it routes through the `datacenter` panel
+    /// slug directly), so it yields `None`. Used to keep deep-link / focus-slug
+    /// compatibility: a request to focus one of these retired slugs redirects to
+    /// the Datacenter panel with this tab selected.
+    #[must_use]
+    pub const fn folded_slug(self) -> Option<&'static str> {
+        match self {
+            Self::Native => None,
+            // Compute's panel slug was "instances".
+            Self::Instances => Some("instances"),
+            Self::Snapshots => Some("snapshots"),
+            Self::Images => Some("images"),
+            Self::Lighthouses => Some("lighthouses"),
+            // Build Farm's panel slug was the kebab "build-farm".
+            Self::BuildFarm => Some("build-farm"),
+        }
+    }
+
+    /// The tab's label in the Datacenter fold bar.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Native => "Datacenter",
+            Self::Instances => "Instances",
+            Self::Snapshots => "Snapshots",
+            Self::Images => "Images",
+            Self::Lighthouses => "Lighthouses",
+            Self::BuildFarm => "Build Farm",
+        }
+    }
+
+    /// The fold bar's left-to-right tab order (Datacenter's own surface first,
+    /// then the folded surfaces). Drives the fold-bar render in `app.rs`.
+    #[must_use]
+    pub const fn all() -> [Self; 6] {
+        [
+            Self::Native,
+            Self::Instances,
+            Self::Snapshots,
+            Self::Images,
+            Self::Lighthouses,
+            Self::BuildFarm,
+        ]
+    }
+
+    /// Map a (now-retired) standalone panel slug to the Datacenter tab that
+    /// absorbed it. `None` for any slug the Datacenter panel doesn't host.
+    /// DATACENTER-25 keeps deep links / focus slugs working: the routing layer
+    /// resolves these to `provisioning.datacenter` + this tab.
+    #[must_use]
+    pub fn from_folded_slug(slug: &str) -> Option<Self> {
+        Self::all()
+            .into_iter()
+            .find(|t| t.folded_slug() == Some(slug))
+    }
+}
+
 /// Active view in the right pane. Either a group landing page
 /// (no leaf selected) or a specific panel under that group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -213,8 +300,9 @@ pub fn nav_model() -> Vec<NavEntry> {
             panels: vec![
                 // Peers directory first (Q9).
                 Panel::new("peers", "Peers"),
-                // LIGHTHOUSE-5 — the lighthouse ops tab, right after Peers (Q18).
-                Panel::new("lighthouses", "Lighthouses"),
+                // DATACENTER-25 — the Lighthouses ops surface folded into the
+                // Datacenter panel as a tab (deep link `mesh.lighthouses`
+                // redirects there). Its standalone Mesh-group entry is retired.
                 Panel::new("mesh_control", "Mesh Control"),
                 Panel::new("mesh_storage", "Mesh Storage"),
                 Panel::new("dns", "Mesh DNS"),
@@ -266,15 +354,14 @@ pub fn nav_model() -> Vec<NavEntry> {
             panels: vec![
                 Panel::new("node_roles", "Node Roles"),
                 Panel::new("profiles", "Install Profiles"),
-                Panel::new("images", "Images"),
                 Panel::new("mirrors", "Mirrors"),
-                // Compute folded into Provisioning.
-                Panel::new("instances", "Instances"),
                 // XCP-4 — the VM Spawner (A-plane MDE-VMs over XCP-ng dom0s).
                 Panel::new("provisioning", "VM Spawner"),
-                // FARM-AUTO-5 — build-farm activity (jobs queued/passed/failed).
-                Panel::new("build-farm", "Build Farm"),
                 // DATACENTER-8 — datacenter plane (DO/Xen resources via event/dc/*).
+                // DATACENTER-25 — also the host for the folded Instances / Images /
+                // Build Farm / Lighthouses / Snapshots surfaces (selected via the
+                // Datacenter fold-bar tabs); those standalone entries are retired
+                // and their deep links redirect here.
                 Panel::new("datacenter", "Datacenter"),
             ],
         },
@@ -303,7 +390,9 @@ pub fn nav_model() -> Vec<NavEntry> {
                 Panel::new("settings", "Settings"),
                 // Maintenance.
                 Panel::new("hub", "Hub"),
-                Panel::new("snapshots", "Snapshots"),
+                // DATACENTER-25 — Snapshots folded into the Datacenter panel as a
+                // tab (deep link `system.snapshots` redirects there); the
+                // standalone System entry is retired.
                 Panel::new("repair", "Repair"),
                 // Maintenance — NAV-1.2 relocated System Update + Panel Sync
                 // Status here from the retired Desktop group (mesh-synced
@@ -358,6 +447,21 @@ pub fn view_from_focus_slug(slug: &str) -> Option<View> {
     let (group_slug, panel_slug) = slug
         .split_once('.')
         .map_or((slug, None), |(g, p)| (g, Some(p)));
+    // DATACENTER-25 — the six folded surfaces no longer have standalone nav
+    // entries, but their deep-link slugs must keep working: redirect any
+    // `<group>.<folded>` (e.g. `mesh.lighthouses`, `provisioning.instances`,
+    // `system.snapshots`) to the Datacenter panel, where the surface now lives as
+    // a tab. The tab itself is selected by the caller (`app.rs` reads
+    // `DatacenterTab::from_folded_slug`). Resolving the View to `datacenter` here
+    // means a dangling folded slug never renders nothing.
+    if let Some(p) = panel_slug {
+        if DatacenterTab::from_folded_slug(p).is_some() {
+            return Some(View::Panel {
+                group: Group::Provisioning,
+                panel: "datacenter",
+            });
+        }
+    }
     let group = Group::from_slug(group_slug)?;
     match panel_slug {
         None => Some(View::Group(group)),
@@ -613,6 +717,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // DATACENTER-25 — the six panels folded into Datacenter tabs.
+    // Their standalone nav entries are gone, but the deep-link
+    // slugs must redirect to the Datacenter panel (never render
+    // nothing), and the tab mapping must round-trip.
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn folded_panels_have_no_standalone_nav_entry() {
+        // The six folded slugs must NOT appear as their own sidebar panel under
+        // any group anymore — they live as Datacenter tabs now.
+        let nav = nav_model();
+        for folded in [
+            "instances",
+            "snapshots",
+            "images",
+            "lighthouses",
+            "build-farm",
+        ] {
+            for entry in &nav {
+                assert!(
+                    entry.panels.iter().all(|p| p.slug() != folded),
+                    "folded slug {folded} must not have a standalone entry under {:?}",
+                    entry.group
+                );
+            }
+        }
+        // Datacenter itself stays — it's the host.
+        assert!(view_from_focus_slug("provisioning.datacenter").is_some());
+    }
+
+    #[test]
+    fn folded_deep_link_slugs_redirect_to_the_datacenter_panel() {
+        // Every retired standalone slug, addressed under the group it used to
+        // live in, redirects to the Datacenter panel rather than dangling.
+        let dc = View::Panel {
+            group: Group::Provisioning,
+            panel: "datacenter",
+        };
+        for slug in [
+            "mesh.lighthouses",
+            "provisioning.instances",
+            "provisioning.images",
+            "provisioning.build-farm",
+            "system.snapshots",
+        ] {
+            assert_eq!(
+                view_from_focus_slug(slug),
+                Some(dc),
+                "{slug} must redirect to the Datacenter panel after the fold",
+            );
+        }
+    }
+
+    #[test]
+    fn datacenter_tab_folded_slug_round_trips() {
+        for tab in DatacenterTab::all() {
+            match tab.folded_slug() {
+                None => assert_eq!(tab, DatacenterTab::Native),
+                Some(slug) => assert_eq!(DatacenterTab::from_folded_slug(slug), Some(tab)),
+            }
+        }
+        assert_eq!(DatacenterTab::from_folded_slug("not-a-folded-panel"), None);
+        // The default tab is Datacenter's own surface.
+        assert_eq!(DatacenterTab::default(), DatacenterTab::Native);
     }
 
     #[test]
