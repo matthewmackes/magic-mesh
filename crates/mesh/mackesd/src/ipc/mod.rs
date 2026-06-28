@@ -41,8 +41,12 @@ pub mod dc_common;
 // DATACENTER-16 (action layer) — action/dc/wol Wake-on-LAN power-orchestration
 // primitive (broadcasts the magic packet to wake a machine).
 pub mod dc_power;
-// DATACENTER RBAC — the two-role (viewer/operator) gate every mutating
-// action/dc/* responder consults before mutating (design §9).
+// DATACENTER-21 (action layer) — action/dc/testmesh-spin + testmesh-teardown:
+// ephemeral N-node test-mesh lifecycle wrapping farm-testbed.sh.
+pub mod dc_provision;
+// DATACENTER-7 / RBAC — the unified two-role (viewer/operator) gate every mutating
+// action/dc/* responder consults before mutating (design §9). Exposes both the
+// authorize(MCNF_DC_ROLE_MAP) and enforce(MCNF_DC_ROLES)+audit gate styles.
 pub mod dc_rbac;
 // DATACENTER-12 (action layer) — action/dc/{sr-list,sr-create,sr-destroy,
 // vdi-attach,vdi-detach,sr-snapshot-schedule,iso-list} storage responder.

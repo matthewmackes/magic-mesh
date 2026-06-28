@@ -526,6 +526,13 @@ fn wol_reply(req_body: Option<&str>) -> String {
 /// Build the reply for one `action/dc/<verb>` request.
 #[must_use]
 pub fn build_reply(svc: &DcPowerService, verb: &str, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    // DATACENTER-7 (RBAC): `wol`/`power-ipmi` power a machine — mutations; gate the
+    // mesh principal against the role policy BEFORE dispatch (deny + audit a viewer).
+    if let Err(reason) = crate::ipc::dc_rbac::enforce(verb, req_body) {
+        crate::ipc::dc_rbac::audit_denial(verb, req_body, &reason);
+        return err(reason);
+    }
     match verb {
         "wol" => wol_reply(req_body),
         "power-ipmi" => power_ipmi_reply(req_body),

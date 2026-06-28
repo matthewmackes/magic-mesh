@@ -401,8 +401,9 @@ pub fn build_reply(svc: &DatacenterService, verb: &str, req_body: Option<&str>) 
     // RBAC (design §9): a mutating verb requires the caller's mesh principal to map
     // to `operator`; a `viewer` is rejected BEFORE the op-lock / dom0 allow-list /
     // any SSH. Read-only verbs are always allowed. Checked first so a viewer's
-    // write never touches the substrate.
+    // write never touches the substrate; a denial is also audited (DATACENTER-7).
     if let Err(m) = crate::ipc::dc_rbac::authorize(req_body, is_mutating(verb)) {
+        crate::ipc::dc_rbac::audit_denial(verb, req_body, &m);
         return err(m);
     }
     // Op-lock: claim the resource for the duration of a mutating dispatch. The

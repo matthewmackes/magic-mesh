@@ -304,6 +304,13 @@ fn runlog_reply(svc: &TofuService, ws: &str, req: &serde_json::Value) -> String 
 #[must_use]
 pub fn build_reply(svc: &TofuService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
+    // DATACENTER-7 (RBAC): gate the mesh principal BEFORE dispatch. `tofu-plan` /
+    // `tofu-state` are reads (any role); `tofu-apply` / `tofu-destroy` mutate and
+    // require operator — a denied viewer is refused + audited here.
+    if let Err(reason) = crate::ipc::dc_rbac::enforce(verb, req_body) {
+        crate::ipc::dc_rbac::audit_denial(verb, req_body, &reason);
+        return err(reason);
+    }
     match verb {
         "tofu-plan" | "tofu-apply" | "tofu-destroy" | "tofu-state" | "tofu-runlog" | "tofu-arm" => {
         }
