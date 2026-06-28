@@ -641,6 +641,61 @@ mod tests {
         assert_eq!(back, pt);
     }
 
+    // ---- DAR-2: the `secret-seal`/`secret-unseal` thin-CLI path ----
+    // These exercise the EXACT call sequence the bin's cmd_secret_seal /
+    // cmd_secret_unseal use (seal_bytes → armor → dearmor → unseal_bytes) over
+    // an arbitrary-bytes payload, including an identity-sized one — so the DR
+    // CA/identity bundle (DAR-42) is proven to round-trip without re-rolling
+    // crypto, and a wrong passphrase is rejected with the existing AEAD error.
+
+    /// An age X25519 identity is a single ~74-char `AGE-SECRET-KEY-1…` line; the
+    /// DR bundle this CLI seals is a few such keys + a CA PEM. We seal a
+    /// realistic identity-sized blob (NUL-free here, but the bytes path is
+    /// binary-safe — see `secret_seal_path_is_binary_safe`).
+    const IDENTITY_BLOB: &[u8] =
+        b"AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQSXKLP0E\n\
+          -----BEGIN MACKES MESH AGE RECIPIENT-----\nage1exampleexampleexample\n";
+
+    #[test]
+    fn secret_seal_identity_round_trips_through_armor() {
+        let pp = "operator-DR-bundle-passphrase";
+        let sealed = seal_bytes(pp, IDENTITY_BLOB).expect("seal_bytes");
+        let armored = armor(&sealed, 1716000000);
+        let decoded = dearmor(&armored).expect("dearmor");
+        let back = unseal_bytes(pp, &decoded).expect("unseal_bytes");
+        assert_eq!(back, IDENTITY_BLOB, "exact identity bytes must round-trip");
+    }
+
+    #[test]
+    fn secret_seal_path_is_binary_safe() {
+        // The CLI reads stdin with read_to_end → arbitrary bytes incl. NUL.
+        let blob: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+        let pp = "pp-binary";
+        let sealed = seal_bytes(pp, &blob).expect("seal_bytes");
+        let back = unseal_bytes(pp, &dearmor(&armor(&sealed, 0)).unwrap()).expect("unseal_bytes");
+        assert_eq!(back, blob);
+    }
+
+    #[test]
+    fn secret_unseal_rejects_wrong_passphrase_no_plaintext() {
+        let sealed = seal_bytes("right-phrase", IDENTITY_BLOB).expect("seal_bytes");
+        let armored = armor(&sealed, 0);
+        let decoded = dearmor(&armored).expect("dearmor");
+        let r = unseal_bytes("wrong-phrase", &decoded);
+        assert!(
+            matches!(r, Err(BackupError::Aead(_))),
+            "wrong passphrase must fail AEAD, never return plaintext"
+        );
+    }
+
+    #[test]
+    fn secret_seal_rejects_empty_passphrase() {
+        assert!(matches!(
+            seal_bytes("", IDENTITY_BLOB),
+            Err(BackupError::EmptyPassphrase)
+        ));
+    }
+
     // ---- store integration (assemble + restore) -------------
 
     fn fresh_store() -> rusqlite::Connection {
