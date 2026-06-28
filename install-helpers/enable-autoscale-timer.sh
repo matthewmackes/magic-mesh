@@ -19,7 +19,8 @@ cat > "$SVC" <<UNITEOF
 # FARM-AUTOSCALE L2 — elastic-farm reconcile, LIVE on the .192 control host.
 # Demand -> per-dom0 shapes -> (gate green) tofu apply -> build-ready (toolchain
 # check + clean-baseline snapshot). Cutover 2026-06-24: always-on decommissioned,
-# farm elastic from MDE-VM-golden-tc. Operator authorized continuous auto-scaling.
+# farm elastic from MDE-VM-golden (DAR-34: toolchain baked in; no -tc name drift).
+# Operator authorized continuous auto-scaling.
 [Unit]
 Description=MCNF FARM-AUTOSCALE reconciler (demand -> per-dom0 VM shapes; LIVE apply)
 After=network-online.target
