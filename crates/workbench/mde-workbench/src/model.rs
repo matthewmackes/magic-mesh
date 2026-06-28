@@ -329,6 +329,9 @@ pub fn nav_model() -> Vec<NavEntry> {
         NavEntry {
             group: Group::MeshProvisioning,
             panels: vec![
+                // DATACENTER-18 — genesis comes first: founding a brand-new mesh
+                // precedes joining/registering against an existing one.
+                Panel::new("genesis", "New Mesh"),
                 Panel::new("registration", "Registration"),
                 Panel::new("mesh_join", "Mesh Join"),
                 Panel::new("mesh_pending", "Mesh Pending"),

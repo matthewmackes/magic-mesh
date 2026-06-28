@@ -27,19 +27,20 @@ use crate::panels::{
     drift as drift_panel, firewall as firewall_panel, fleet_logs as fleet_logs_panel,
     fleet_revisions as fleet_revisions_panel, fleet_rollup as fleet_rollup_panel,
     fleet_settings as fleet_settings_panel, front_door as front_door_panel,
-    hardware as hardware_panel, health_check as health_check_panel, help_index as help_index_panel,
-    hub as hub_panel, images as images_panel, interfaces as interfaces_panel,
-    inventory as inventory_panel, jobs as jobs_panel, lighthouses as lighthouses_panel,
-    logs as logs_panel, mesh_bus as mesh_bus_panel, mesh_control as mesh_control_panel,
-    mesh_federation as mesh_federation_panel, mesh_history as mesh_history_panel,
-    mesh_join as mesh_join_panel, mesh_logs as mesh_logs_panel, mesh_pending as mesh_pending_panel,
-    mesh_services as mesh_services_panel, mesh_storage as mesh_storage_panel,
-    mirrors as mirrors_panel, music as music_panel, network_hosts as network_hosts_panel,
-    node_roles as node_roles_panel, notifications as notifications_panel, peers as peers_panel,
-    playbooks as playbooks_panel, policy as policy_panel, profiles as profiles_panel,
-    provisioning as provisioning_panel, registration as registration_panel,
-    remote_desktop as remote_desktop_panel, repair as repair_panel, resources as resources_panel,
-    router as router_panel, routing as routing_panel, run_history as run_history_panel,
+    genesis as genesis_panel, hardware as hardware_panel, health_check as health_check_panel,
+    help_index as help_index_panel, hub as hub_panel, images as images_panel,
+    interfaces as interfaces_panel, inventory as inventory_panel, jobs as jobs_panel,
+    lighthouses as lighthouses_panel, logs as logs_panel, mesh_bus as mesh_bus_panel,
+    mesh_control as mesh_control_panel, mesh_federation as mesh_federation_panel,
+    mesh_history as mesh_history_panel, mesh_join as mesh_join_panel, mesh_logs as mesh_logs_panel,
+    mesh_pending as mesh_pending_panel, mesh_services as mesh_services_panel,
+    mesh_storage as mesh_storage_panel, mirrors as mirrors_panel, music as music_panel,
+    network_hosts as network_hosts_panel, node_roles as node_roles_panel,
+    notifications as notifications_panel, peers as peers_panel, playbooks as playbooks_panel,
+    policy as policy_panel, profiles as profiles_panel, provisioning as provisioning_panel,
+    registration as registration_panel, remote_desktop as remote_desktop_panel,
+    repair as repair_panel, resources as resources_panel, router as router_panel,
+    routing as routing_panel, run_history as run_history_panel,
     service_publishing as service_publishing_panel, sip_gateway as sip_gateway_panel,
     snapshots as snapshots_panel, sync_status as sync_status_panel,
     system_update as system_update_panel, tags as tags_panel, vpn as vpn_panel,
@@ -187,6 +188,8 @@ pub enum Message {
     Compute(compute_panel::Message),
     /// XCP-4 — Provisioning (VM Spawner) panel sub-message.
     Provisioning(provisioning_panel::Message),
+    /// DATACENTER-18 — New-Mesh genesis wizard sub-message.
+    Genesis(genesis_panel::Message),
     /// CB-1.7 partial — Maintain system-update panel sub-message.
     SystemUpdate(system_update_panel::Message),
     /// CB-1.7 partial — Maintain repair panel sub-message.
@@ -358,6 +361,7 @@ pub struct App {
     resources: resources_panel::ResourcesPanel,
     compute: compute_panel::ComputePanel,
     provisioning: provisioning_panel::ProvisioningPanel,
+    genesis: genesis_panel::GenesisPanel,
     system_update: system_update_panel::SystemUpdatePanel,
     repair: repair_panel::RepairPanel,
     health_check: health_check_panel::HealthCheckPanel,
@@ -478,6 +482,7 @@ impl App {
             resources: resources_panel::ResourcesPanel::new(),
             compute: compute_panel::ComputePanel::new(),
             provisioning: provisioning_panel::ProvisioningPanel::new(),
+            genesis: genesis_panel::GenesisPanel::new(),
             system_update: system_update_panel::SystemUpdatePanel::new(),
             repair: repair_panel::RepairPanel::new(),
             health_check: health_check_panel::HealthCheckPanel::new(),
@@ -988,6 +993,7 @@ impl App {
             Message::Resources(msg) => self.resources.update(msg),
             Message::Compute(msg) => self.compute.update(msg),
             Message::Provisioning(msg) => self.provisioning.update(msg),
+            Message::Genesis(msg) => self.genesis.update(msg),
             Message::SystemUpdate(msg) => self.system_update.update(msg),
             Message::Repair(msg) => self.repair.update(msg),
             Message::HealthCheck(msg) => self.health_check.update(msg),
@@ -1156,6 +1162,9 @@ impl App {
             // XCP-4 — the VM Spawner queries the xcp_provision worker for the
             // VM + dom0-host rosters on nav so the panel lands populated.
             "provisioning" => provisioning_panel::ProvisioningPanel::load(),
+            // DATACENTER-18 — the New-Mesh genesis wizard queries the do-regions
+            // roster on nav so step 1's region picker lands populated.
+            "genesis" => genesis_panel::GenesisPanel::load(),
             "audit" => audit_panel::AuditPanel::load(),
             "mesh_logs" => mesh_logs_panel::MeshLogsPanel::load(),
             "fleet_logs" => fleet_logs_panel::FleetLogsPanel::load(),
@@ -1745,6 +1754,11 @@ impl App {
                 panel: "provisioning",
                 ..
             } => self.provisioning.view(),
+            // DATACENTER-18 — the New-Mesh genesis wizard ("give birth to a new
+            // Nebula"): plan + Tofu-write here; the live apply/found stay gated.
+            View::Panel {
+                panel: "genesis", ..
+            } => self.genesis.view(),
             // WB-OVERVIEW-2 — the "Home" panel renders the home dashboard (same
             // as the group root). FRONTDOOR-1 swaps that VIEW for the GPU canvas
             // tile-grid Front Door (`home` state + load stay intact for the

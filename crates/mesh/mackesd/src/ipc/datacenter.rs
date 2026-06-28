@@ -220,7 +220,7 @@ impl Drop for OpLockGuard<'_> {
 /// DATACENTER-12: the trailing five are the storage verbs ([`crate::ipc::storage_ops`]),
 /// served on THIS responder so the panel's Storage tab acts through the same Bus
 /// round trip as the VM tab. `build_reply` routes them into `storage_ops`.
-pub const ACTION_VERBS: [&str; 19] = [
+pub const ACTION_VERBS: [&str; 21] = [
     "vm-power",
     "vm-snapshot",
     "vm-clone",
@@ -237,6 +237,11 @@ pub const ACTION_VERBS: [&str; 19] = [
     // DATACENTER-19 — the guided new-lighthouse flow's Tofu-write half: writes a
     // `digitalocean_droplet` into the `zone1-do` workspace (mirrors `vm-create`).
     "lighthouse-create",
+    // DATACENTER-18 — New-Mesh genesis: plan (read-only) + write (the founding
+    // lighthouse droplet + its DNS A-record). Reuses DC-19's lighthouse Tofu-write;
+    // the live apply + `mackesd found` stay operator-gated.
+    "genesis-plan",
+    "genesis-write",
     "sr-create",
     "vdi-create",
     "vdi-attach",
@@ -604,6 +609,20 @@ pub fn lock_key(verb: &str, req_body: Option<&str>) -> Option<String> {
         }
         return Some(format!("lighthouse-new:{name}"));
     }
+    // DATACENTER-18 — `genesis-write` mutates the shared `dc-lighthouses.tf`; it
+    // locks on the new mesh id so two genesis writes of the same mesh can't race
+    // the same `.tf` write. (`genesis-plan` is read-only → no lock, below.)
+    if verb == "genesis-write" {
+        let mesh_id = serde_json::from_str::<serde_json::Value>(req_body?)
+            .ok()?
+            .get("mesh_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)?;
+        if mesh_id.is_empty() {
+            return None;
+        }
+        return Some(format!("mesh-new:{mesh_id}"));
+    }
     // DATACENTER-11 — the snapshot-mutating verbs target a SNAPSHOT (not the VM),
     // and read it from the body's `snapshot` field, so they lock on `snap:<uuid>`
     // (a distinct namespace from `vm:` — reverting/deleting a snapshot shouldn't
@@ -690,6 +709,8 @@ pub fn build_reply(svc: &DatacenterService, verb: &str, req_body: Option<&str>) 
         "vm-snapshot-delete" => vm_snapshot_delete_reply(req_body),
         "do-regions" => do_regions_reply(),
         "lighthouse-create" => lighthouse_create_reply(svc, req_body),
+        "genesis-plan" => genesis_plan_reply(req_body),
+        "genesis-write" => genesis_write_reply(svc, req_body),
         // DATACENTER-12 — storage verbs are served on this responder but built by
         // the sibling storage_ops module (the op-lock above already guards them).
         v if crate::ipc::storage_ops::is_storage_verb(v) => {
@@ -1746,6 +1767,255 @@ fn lighthouse_create_reply(svc: &DatacenterService, req_body: Option<&str>) -> S
     json!({ "ok": true, "resource": addr, "path": rel }).to_string()
 }
 
+// ── DATACENTER-18 — New-Mesh genesis ("give birth to a new Nebula") ──────────
+//
+// The genesis wizard's backend half — GLUE over DC-19, not a rewrite. It does NOT
+// found a live mesh itself (founding is irreversible + costs real DO money + would
+// create a rogue mesh), so — mirroring DC-19's `lighthouse-create` honesty — the
+// verbs here only PLAN the genesis (`genesis-plan`, read-only) and WRITE the
+// founding lighthouse's Tofu (`genesis-write`). The droplet half REUSES
+// [`lighthouse_create_resource`] (the same `digitalocean_droplet` DC-19 emits);
+// genesis adds the founding DNS A-record. The real `tofu apply` (droplet spend)
+// goes through the gated `action/dc/tofu-apply` on `zone1-do`; the real `mackesd
+// found` runs on the booted droplet (the founding cloud-init,
+// `install-helpers/do-lighthouse-cloudinit.sh`). No credential is ever written to
+// the repo/HCL/log here.
+
+/// The ordered genesis step labels.
+///
+/// Shown in the wizard's review step and echoed in the `genesis-plan` reply so the
+/// GUI and the backend agree on the sequence. PURE constant — the plan is
+/// descriptive; each step is executed by a distinct, already-shipped primitive
+/// (the DC-19 lighthouse Tofu-write + gated apply, the cloud-init `mackesd found`,
+/// the DNS record, the printed join token).
+pub const GENESIS_STEPS: [&str; 6] = [
+    "generate the mesh CA (minted by `mackesd found` on the new lighthouse)",
+    "provision the first lighthouse droplet (DigitalOcean, via the gated zone1-do tofu apply)",
+    "found the mesh on it (`mackesd found` — self-signs, brings up the overlay)",
+    "seed the founding bundle + bring up QNM-Shared / Caddy",
+    "register the lighthouse DNS A-record",
+    "emit the first single-use join token",
+];
+
+/// Validate a new-mesh id as typed. PURE.
+///
+/// A mesh id is a DNS-ish label: non-empty, ASCII lowercase alphanumeric + hyphen,
+/// not starting/ending with a hyphen, at most 63 chars (it becomes the founding
+/// droplet's name + DNS record + HCL block label). Rejects anything that could
+/// widen the resource namespace or inject HCL.
+///
+/// # Errors
+/// Returns `Err` describing the first rule the id breaks.
+pub fn genesis_mesh_id_valid(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("empty mesh id".into());
+    }
+    if id.len() > 63 {
+        return Err("mesh id too long (max 63 chars)".into());
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err("mesh id must be lowercase letters, digits, or hyphens".into());
+    }
+    if id.starts_with('-') || id.ends_with('-') {
+        return Err("mesh id must not start or end with a hyphen".into());
+    }
+    Ok(())
+}
+
+/// Build the founding lighthouse's `digitalocean_droplet` + `digitalocean_record`
+/// HCL for a brand-new `mesh_id` in `region`. PURE.
+///
+/// GLUE over DC-19: the droplet half is exactly [`lighthouse_create_resource`]
+/// (named `lh-<mesh_id>-01`, standard lighthouse size/image), so the genesis
+/// droplet is byte-identical to a DC-19 lighthouse the orchestrator already manages.
+/// Genesis ADDS the founding DNS A-record (`lighthouse-<mesh_id>`) pointing at the
+/// droplet's `ipv4_address` — the DC-19 flow leaves DNS to a manual step, but a
+/// genesis IS the DNS-registration step, so it's emitted here. NO credential is
+/// ever interpolated.
+///
+/// Returns `(droplet_resource_address, hcl_block)` (the droplet+record blocks).
+///
+/// # Errors
+/// Returns `Err` if `mesh_id` / `region` fail their validation.
+pub fn genesis_lighthouse_resource(
+    mesh_id: &str,
+    region: &str,
+) -> Result<(String, String), String> {
+    genesis_mesh_id_valid(mesh_id)?;
+    if !is_slug(region) {
+        return Err("region is not a valid slug".into());
+    }
+    let droplet_name = format!("lh-{mesh_id}-01");
+    // REUSE DC-19's droplet HCL (standard lighthouse size/image defaults).
+    let (addr, droplet_hcl) =
+        lighthouse_create_resource(&droplet_name, region, "s-2vcpu-2gb", "fedora-43-x64")?;
+    // The block label DC-19 minted (`lighthouse_<ident>`) — reuse it for the record.
+    let ident = droplet_addr_label(&addr)
+        .strip_prefix("lighthouse_")
+        .unwrap_or_else(|| droplet_addr_label(&addr));
+    let record_name = format!("lighthouse-{mesh_id}");
+    let record_hcl = format!(
+        "\nresource \"digitalocean_record\" \"genesis_{ident}\" {{\n  \
+         domain = digitalocean_domain.primary.id\n  \
+         type   = \"A\"\n  \
+         name   = \"{record_name}\"\n  \
+         value  = digitalocean_droplet.lighthouse_{ident}.ipv4_address\n  \
+         ttl    = 3600\n}}\n"
+    );
+    Ok((addr, format!("{droplet_hcl}{record_hcl}")))
+}
+
+/// Probe the mesh credential store for the presence of the `do-token` (the DO API
+/// credential a live genesis apply needs). Returns only a boolean — the token is
+/// NEVER read into a reply/log. A store/tooling failure is treated as "absent" (the
+/// wizard then warns to provision it), never as a fake-present.
+fn do_token_present() -> bool {
+    let store = crate::ipc::secret_store::SecretStore::resolve(
+        &crate::ipc::secret_store::repo_root(),
+        &crate::default_qnm_shared_root(),
+    );
+    matches!(store.get("do-token"), Ok(Some(_)))
+}
+
+/// Build the `genesis-plan` reply value for `(mesh_id, region)`. PURE except for
+/// the credential-store presence probe the caller injects via `do_token_present`.
+///
+/// Validates both inputs, then reports the ordered [`GENESIS_STEPS`], the Tofu
+/// resource address the write would land, the rel path it writes, the gated
+/// workspace (`zone1-do`), and `secrets_ready` (whether `do-token` is already in
+/// the store — the boolean only, never the token). Read-only: it plans, never founds.
+///
+/// # Errors
+/// Returns `Err(message)` for an invalid `mesh_id` / `region`.
+pub fn genesis_plan(
+    mesh_id: &str,
+    region: &str,
+    do_token_present: bool,
+) -> Result<serde_json::Value, String> {
+    let (addr, _hcl) = genesis_lighthouse_resource(mesh_id, region)?;
+    Ok(json!({
+        "ok": true,
+        "mesh_id": mesh_id,
+        "region": region,
+        "steps": GENESIS_STEPS,
+        "resource": addr,
+        "path": "infra/tofu/zone1-do/dc-lighthouses.tf",
+        "workspace": "zone1-do",
+        // Only the PRESENCE boolean — never the credential itself.
+        "secrets_ready": do_token_present,
+    }))
+}
+
+/// Handle a `genesis-plan` request body `{ "mesh_id", "region" }` (read-only):
+/// validate, probe the credential store for the `do-token` presence (the boolean
+/// only), and reply with the ordered genesis steps + the Tofu resource preview +
+/// the gated `zone1-do` workspace. It PLANS the genesis; it never founds a mesh.
+fn genesis_plan_reply(req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("genesis-plan: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("genesis-plan: bad json: {e}")),
+    };
+    let mesh_id = req
+        .get("mesh_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let region = req
+        .get("region")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    match genesis_plan(mesh_id, region, do_token_present()) {
+        Ok(v) => v.to_string(),
+        Err(e) => err(e),
+    }
+}
+
+/// Handle a `genesis-write` request body `{ "mesh_id", "region", "confirm": true }`.
+///
+/// A STRUCTURAL change → it WRITES the founding lighthouse's `digitalocean_droplet`
+/// resource (REUSING DC-19's [`lighthouse_create_resource`]) plus its founding DNS
+/// A-record into the allow-listed `zone1-do` workspace's generated
+/// `dc-lighthouses.tf` (idempotent; a repeated `mesh_id` is rejected so a write
+/// never silently overwrites). It does NOT apply — the caller then runs the gated
+/// `action/dc/tofu-apply` on `zone1-do` (the real droplet spend), and the live
+/// `mackesd found` runs on the booted droplet (the founding cloud-init). The
+/// destructive write requires `confirm == true` (the wizard's arm→confirm gate).
+/// Replies `{"ok":true,"resource":..,"path":..,"workspace":"zone1-do"}`. NO
+/// credential is read or written here.
+fn genesis_write_reply(svc: &DatacenterService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("genesis-write: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("genesis-write: bad json: {e}")),
+    };
+    // DESTRUCTIVE-ish (writes Tofu that founds a real mesh on apply): refuse unless
+    // the caller explicitly confirms — the same fail-closed gate as `vm-delete`.
+    if req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return err("genesis-write requires confirm:true".into());
+    }
+    let mesh_id = req
+        .get("mesh_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let region = req
+        .get("region")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let (addr, hcl) = match genesis_lighthouse_resource(mesh_id, region) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    // The generated file lives in the allow-listed `zone1-do` workspace under the
+    // repo root the daemon runs in — the same tree DC-19 + `tofu-apply` use.
+    let tf_dir = svc.workgroup_root.join("infra/tofu/zone1-do");
+    let tf_path = tf_dir.join("dc-lighthouses.tf");
+    let rel = "infra/tofu/zone1-do/dc-lighthouses.tf";
+    // Refuse to overwrite an existing block for the same mesh's founding droplet
+    // (idempotent — the operator removes via Tofu, not by silently clobbering).
+    let existing = std::fs::read_to_string(&tf_path).unwrap_or_default();
+    let marker = format!(
+        "resource \"digitalocean_droplet\" \"{}\"",
+        droplet_addr_label(&addr)
+    );
+    if existing.contains(&marker) {
+        return err(format!(
+            "a genesis lighthouse for mesh {mesh_id} already exists in {rel}"
+        ));
+    }
+    if let Err(e) = std::fs::create_dir_all(&tf_dir) {
+        return err(format!("genesis-write: cannot create {rel} dir: {e}"));
+    }
+    // Append the new blocks (a header comment is written once, on the first write).
+    let mut out = existing;
+    if out.is_empty() {
+        out.push_str(
+            "# DATACENTER-18/19 — DO lighthouses written by the Datacenter flows\n\
+             # (DC-19 add-lighthouse + DC-18 New-Mesh genesis) and PROVISIONED by a\n\
+             # gated `tofu apply` of this workspace, so every create goes through Tofu\n\
+             # (no drift). A genesis block also founds the mesh on the booted droplet\n\
+             # via the founding cloud-init (`mackesd found`). All credentials come\n\
+             # from the mesh credential store, never from this file. Edit/remove via\n\
+             # Tofu, not by hand.\n",
+        );
+    } else if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&hcl);
+    if let Err(e) = std::fs::write(&tf_path, out) {
+        return err(format!("genesis-write: cannot write {rel}: {e}"));
+    }
+    json!({ "ok": true, "resource": addr, "path": rel, "workspace": "zone1-do" }).to_string()
+}
+
 /// Run the datacenter Bus responder loop on the current thread until `should_stop`.
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &DatacenterService, should_stop: F) {
     let mut cursors: HashMap<String, String> = HashMap::new();
@@ -1871,6 +2141,183 @@ mod tests {
         assert!(parse_regions(r#"{"slug":"nyc3"}"#).is_empty());
         // empty array
         assert!(parse_regions("[]").is_empty());
+    }
+
+    // ── DATACENTER-18 — New-Mesh genesis ──
+
+    #[test]
+    fn genesis_verbs_and_topics_are_registered() {
+        assert!(ACTION_VERBS.contains(&"genesis-plan"));
+        assert!(ACTION_VERBS.contains(&"genesis-write"));
+        assert_eq!(action_topic("genesis-plan"), "action/dc/genesis-plan");
+        assert_eq!(action_topic("genesis-write"), "action/dc/genesis-write");
+    }
+
+    #[test]
+    fn genesis_mesh_id_validation() {
+        assert!(genesis_mesh_id_valid("home-mesh").is_ok());
+        assert!(genesis_mesh_id_valid("m1").is_ok());
+        assert!(genesis_mesh_id_valid("").is_err());
+        // uppercase / underscore / space / dot are rejected (DNS-ish label only)
+        assert!(genesis_mesh_id_valid("HomeMesh").is_err());
+        assert!(genesis_mesh_id_valid("home_mesh").is_err());
+        assert!(genesis_mesh_id_valid("home mesh").is_err());
+        assert!(genesis_mesh_id_valid("home.mesh").is_err());
+        // injection-ish characters rejected
+        assert!(genesis_mesh_id_valid("a;rm -rf /").is_err());
+        assert!(genesis_mesh_id_valid("a\"b").is_err());
+        // leading/trailing hyphen rejected
+        assert!(genesis_mesh_id_valid("-mesh").is_err());
+        assert!(genesis_mesh_id_valid("mesh-").is_err());
+        // too long
+        assert!(genesis_mesh_id_valid(&"a".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn genesis_lighthouse_resource_reuses_dc19_droplet_adds_dns_no_secret() {
+        let (addr, hcl) = genesis_lighthouse_resource("home-mesh", "nyc3").unwrap();
+        // The droplet half is exactly DC-19's lighthouse resource for lh-<id>-01.
+        let (dc19_addr, _) =
+            lighthouse_create_resource("lh-home-mesh-01", "nyc3", "s-2vcpu-2gb", "fedora-43-x64")
+                .unwrap();
+        assert_eq!(addr, dc19_addr);
+        assert!(hcl.contains("resource \"digitalocean_droplet\" \"lighthouse_lh_home_mesh_01\""));
+        assert!(hcl.contains("name     = \"lh-home-mesh-01\""));
+        assert!(hcl.contains("region   = \"nyc3\""));
+        // Genesis ADDS the founding DNS A-record.
+        assert!(hcl.contains("resource \"digitalocean_record\" \"genesis_lh_home_mesh_01\""));
+        assert!(hcl.contains("name   = \"lighthouse-home-mesh\""));
+        assert!(hcl.contains(".ipv4_address"));
+        // SECRET-HANDLING: no credential material is ever emitted into the HCL.
+        let lc = hcl.to_lowercase();
+        assert!(
+            !lc.contains("token"),
+            "HCL must not carry a DO token: {hcl}"
+        );
+        assert!(
+            !lc.contains("passphrase"),
+            "HCL must not carry a passphrase"
+        );
+        assert!(
+            !lc.contains("private"),
+            "HCL must not carry private key material"
+        );
+    }
+
+    #[test]
+    fn genesis_lighthouse_resource_rejects_invalid_inputs() {
+        assert!(genesis_lighthouse_resource("", "nyc3").is_err());
+        assert!(genesis_lighthouse_resource("home_mesh", "nyc3").is_err());
+        // an invalid region slug is rejected by the reused DC-19 is_slug guard
+        assert!(genesis_lighthouse_resource("home-mesh", "NYC3").is_err());
+    }
+
+    #[test]
+    fn genesis_plan_reports_steps_resource_and_secret_presence() {
+        // do_token absent → secrets_ready:false (the wizard warns before a live apply).
+        let plan = genesis_plan("home-mesh", "nyc3", false).unwrap();
+        assert_eq!(plan["ok"], true);
+        assert_eq!(plan["mesh_id"], "home-mesh");
+        assert_eq!(plan["region"], "nyc3");
+        assert_eq!(plan["workspace"], "zone1-do");
+        assert_eq!(plan["path"], "infra/tofu/zone1-do/dc-lighthouses.tf");
+        assert_eq!(
+            plan["resource"],
+            "digitalocean_droplet.lighthouse_lh_home_mesh_01"
+        );
+        assert_eq!(plan["secrets_ready"], false);
+        let steps = plan["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), GENESIS_STEPS.len());
+        // do_token present → secrets_ready:true.
+        let ready = genesis_plan("home-mesh", "nyc3", true).unwrap();
+        assert_eq!(ready["secrets_ready"], true);
+    }
+
+    #[test]
+    fn genesis_plan_reply_validates_inputs() {
+        assert!(genesis_plan_reply(None).contains("missing request body"));
+        assert!(genesis_plan_reply(Some("not json")).contains("bad json"));
+        let bad = json!({ "mesh_id": "Bad_Id", "region": "nyc3" }).to_string();
+        assert!(genesis_plan_reply(Some(&bad)).contains("error"));
+    }
+
+    #[test]
+    fn genesis_write_requires_confirm_true() {
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp/dc18-noconfirm"));
+        // confirm missing
+        let body = json!({ "mesh_id": "home-mesh", "region": "nyc3" }).to_string();
+        let r = build_reply(&s, "genesis-write", Some(&body));
+        assert!(r.contains("genesis-write requires confirm:true"), "{r}");
+        // confirm false
+        let body =
+            json!({ "mesh_id": "home-mesh", "region": "nyc3", "confirm": false }).to_string();
+        let r = build_reply(&s, "genesis-write", Some(&body));
+        assert!(r.contains("genesis-write requires confirm:true"), "{r}");
+        // confirm as a non-bool string does not satisfy the gate
+        let body =
+            json!({ "mesh_id": "home-mesh", "region": "nyc3", "confirm": "true" }).to_string();
+        let r = build_reply(&s, "genesis-write", Some(&body));
+        assert!(r.contains("genesis-write requires confirm:true"), "{r}");
+    }
+
+    #[test]
+    fn genesis_write_lands_tofu_and_is_idempotent() {
+        let tmp = std::env::temp_dir().join(format!("dc18-genesis-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let s = DatacenterService::new(tmp.clone());
+        let body = json!({ "mesh_id": "home-mesh", "region": "nyc3", "confirm": true }).to_string();
+        let r = build_reply(&s, "genesis-write", Some(&body));
+        assert!(r.contains("\"ok\":true"), "{r}");
+        assert!(
+            r.contains("digitalocean_droplet.lighthouse_lh_home_mesh_01"),
+            "{r}"
+        );
+        let tf = tmp.join("infra/tofu/zone1-do/dc-lighthouses.tf");
+        let written = std::fs::read_to_string(&tf).unwrap();
+        assert!(
+            written.contains("resource \"digitalocean_droplet\" \"lighthouse_lh_home_mesh_01\"")
+        );
+        assert!(written.contains("resource \"digitalocean_record\" \"genesis_lh_home_mesh_01\""));
+        assert!(written.contains("DATACENTER-18/19"));
+        // No credential material reached the file.
+        assert!(!written.to_lowercase().contains("token"));
+        // A second write for the SAME mesh id is rejected.
+        let r2 = build_reply(&s, "genesis-write", Some(&body));
+        assert!(r2.contains("already exists"), "{r2}");
+        // A DIFFERENT mesh id appends a second pair of blocks.
+        let body2 = json!({ "mesh_id": "lab-mesh", "region": "fra1", "confirm": true }).to_string();
+        let r3 = build_reply(&s, "genesis-write", Some(&body2));
+        assert!(r3.contains("\"ok\":true"), "{r3}");
+        let written2 = std::fs::read_to_string(&tf).unwrap();
+        assert!(written2.contains("lighthouse_lh_home_mesh_01"));
+        assert!(written2.contains("lighthouse_lh_lab_mesh_01"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn genesis_write_rejects_invalid_mesh_id_before_writing() {
+        let tmp = std::env::temp_dir().join(format!("dc18-genesis-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let s = DatacenterService::new(tmp.clone());
+        let body = json!({ "mesh_id": "Bad_Id", "region": "nyc3", "confirm": true }).to_string();
+        let r = build_reply(&s, "genesis-write", Some(&body));
+        assert!(r.contains("error"), "{r}");
+        assert!(!tmp.join("infra/tofu/zone1-do/dc-lighthouses.tf").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn genesis_plan_takes_no_lock_write_locks_on_mesh_id() {
+        assert_eq!(
+            lock_key("genesis-plan", Some(r#"{"mesh_id":"home-mesh"}"#)),
+            None
+        );
+        assert_eq!(
+            lock_key("genesis-write", Some(r#"{"mesh_id":"home-mesh"}"#)),
+            Some("mesh-new:home-mesh".to_string())
+        );
+        assert_eq!(lock_key("genesis-write", Some(r#"{"mesh_id":""}"#)), None);
+        assert_eq!(lock_key("genesis-write", Some("{}")), None);
     }
 
     #[test]
