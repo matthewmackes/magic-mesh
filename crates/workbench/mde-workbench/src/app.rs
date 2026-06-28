@@ -40,7 +40,8 @@ use crate::panels::{
     provisioning as provisioning_panel, registration as registration_panel,
     remote_desktop as remote_desktop_panel, repair as repair_panel, resources as resources_panel,
     routing as routing_panel, run_history as run_history_panel,
-    service_publishing as service_publishing_panel, sip_gateway as sip_gateway_panel,
+    service_publishing as service_publishing_panel, services_map as services_map_panel,
+    sip_gateway as sip_gateway_panel,
     snapshots as snapshots_panel, sync_status as sync_status_panel,
     system_update as system_update_panel, tags as tags_panel, vpn as vpn_panel,
     wallpaper as wallpaper_panel, wifi as wifi_panel,
@@ -196,6 +197,8 @@ pub enum Message {
     MeshServices(mesh_services_panel::Message),
     /// NF-13.8 — Network → Service Publishing sub-message.
     ServicePublishing(service_publishing_panel::Message),
+    /// SVC-VIEW — Network → Services Across the Mesh (unified view) sub-message.
+    ServicesMap(services_map_panel::Message),
     /// CONNECT-6 — Network → Connectivity (exposure matrix) sub-message.
     Connectivity(connectivity_panel::Message),
     MeshStorage(mesh_storage_panel::Message),
@@ -347,6 +350,8 @@ pub struct App {
     mesh_services: mesh_services_panel::MeshServicesPanel,
     /// NF-13.8 — Network → Service Publishing panel state.
     service_publishing: service_publishing_panel::ServicePublishingPanel,
+    /// SVC-VIEW — Network → Services Across the Mesh (unified view) panel state.
+    services_map: services_map_panel::ServicesMapPanel,
     /// CONNECT-6 — Network → Connectivity (exposure matrix) panel state.
     connectivity: connectivity_panel::ConnectivityPanel,
     mesh_storage: mesh_storage_panel::MeshStoragePanel,
@@ -459,6 +464,7 @@ impl App {
             mesh_pending: mesh_pending_panel::MeshPendingPanel::new(),
             mesh_services: mesh_services_panel::MeshServicesPanel::new(),
             service_publishing: service_publishing_panel::ServicePublishingPanel::new(),
+            services_map: services_map_panel::ServicesMapPanel::new(),
             connectivity: connectivity_panel::ConnectivityPanel::new(),
             mesh_storage: mesh_storage_panel::MeshStoragePanel::new(),
             network_hosts: network_hosts_panel::NetworkHostsPanel::new(),
@@ -892,6 +898,7 @@ impl App {
             Message::MeshPending(msg) => self.mesh_pending.update(msg),
             Message::MeshServices(msg) => self.mesh_services.update(msg),
             Message::ServicePublishing(msg) => self.service_publishing.update(msg),
+            Message::ServicesMap(msg) => self.services_map.update(msg),
             Message::Connectivity(msg) => self.connectivity.update(msg),
             Message::MeshStorage(msg) => self.mesh_storage.update(msg),
             Message::NetworkHosts(msg) => self.network_hosts.update(msg),
@@ -1041,6 +1048,9 @@ impl App {
             // for the 7 canonical services + per-row overlay
             // bind state.
             "service_publishing" => service_publishing_panel::ServicePublishingPanel::load(),
+            // SVC-VIEW — the unified view unions the published + probe + compute
+            // readers on first nav (no new data path, just the merge).
+            "services_map" => services_map_panel::ServicesMapPanel::load(),
             // CONNECT-6 — the exposure matrix: list-services + list-candidates
             // over action/connect/* on first nav.
             "connectivity" => connectivity_panel::ConnectivityPanel::load(),
@@ -1478,6 +1488,12 @@ impl App {
                 panel: "service_publishing",
                 ..
             } => self.service_publishing.view(),
+            // SVC-VIEW — Network → Services Across the Mesh renders the unified
+            // union of published + probed + VM/container services (host-tagged).
+            View::Panel {
+                panel: "services_map",
+                ..
+            } => self.services_map.view(),
             // CONNECT-6 — Network → Connectivity renders the exposure matrix
             // (configured policies) + auto-discovered candidates.
             View::Panel {

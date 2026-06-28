@@ -63,6 +63,9 @@ pub mod resources;
 pub mod routing;
 pub mod run_history;
 pub mod service_publishing;
+/// SVC-VIEW — the unified "Services across the mesh" view (published + probed +
+/// VM/container, deduped, tagged by host).
+pub mod services_map;
 /// VOIP-GW-1 — the mesh-wide SIP outbound gateway settings panel.
 pub mod sip_gateway;
 pub mod snapshots;
