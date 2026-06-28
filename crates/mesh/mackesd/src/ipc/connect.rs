@@ -15,7 +15,61 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
+use mackes_mesh_types::ddns::{OnDown, RecordDef};
 use mackes_mesh_types::exposure::{self, ExposurePolicy, ExposureTemplate, Tier};
+
+/// CONNECT-9 — a follow-on DDNS record op the expose/unexpose path enqueues.
+///
+/// It rides the already-landed ddns responder (`action/ddns/*`, DDNS-EGRESS-3/4):
+/// exposing a service auto-creates its public DDNS name; unexposing removes it.
+/// The ddns worker reconciles the resulting `[ddns]` record against the DNS
+/// provider, so connect stays the sole authority on exposure and the ddns worker
+/// the sole authority on DNS — connect just enqueues the record op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DdnsOp {
+    /// Upsert the managed public record for a freshly-exposed hostname.
+    AddRecord(RecordDef),
+    /// Remove the managed record (by name) when a service is unexposed.
+    RemoveRecord(String),
+}
+
+impl DdnsOp {
+    /// The `action/ddns/<verb>` topic this op is enqueued onto.
+    #[must_use]
+    pub fn action_topic(&self) -> String {
+        match self {
+            Self::AddRecord(_) => crate::ipc::ddns::action_topic("add-record"),
+            Self::RemoveRecord(_) => crate::ipc::ddns::action_topic("remove-record"),
+        }
+    }
+
+    /// The request body for the op: the `RecordDef` JSON for an add, or the bare
+    /// record name for a remove (matching the ddns responder's verb contracts).
+    #[must_use]
+    pub fn body(&self) -> String {
+        match self {
+            Self::AddRecord(rec) => serde_json::to_string(rec).unwrap_or_default(),
+            Self::RemoveRecord(name) => name.clone(),
+        }
+    }
+}
+
+/// CONNECT-9 — derive the DDNS record name for an exposed public hostname.
+///
+/// The name is the bare label the ddns worker templates under its zone. The
+/// operator publishes `<label>.<zone>`, so strip a trailing `.<zone>` when
+/// present; else fall back to the leftmost DNS label. Stable across
+/// expose/unexpose so the remove matches the add. Pure.
+#[must_use]
+fn ddns_record_name(hostname: &str, zone: &str) -> String {
+    let suffix = format!(".{zone}");
+    if let Some(label) = hostname.strip_suffix(&suffix) {
+        if !label.is_empty() {
+            return label.to_string();
+        }
+    }
+    hostname.split('.').next().unwrap_or(hostname).to_string()
+}
 
 /// The connectivity responder service — holds the shared-substrate root where
 /// the exposure config (`<root>/connect/policy.toml`) lives + this node's
@@ -118,6 +172,23 @@ pub fn action_topic(verb: &str) -> String {
 /// failure is an `{"error": "..."}` envelope so the caller surfaces a diagnostic.
 #[must_use]
 pub fn build_reply(svc: &ConnectService, verb: &str, req_body: Option<&str>) -> String {
+    // Callers that don't need the ddns side-effect discard it into a throwaway.
+    build_reply_capturing(svc, verb, req_body, &mut None)
+}
+
+/// CONNECT-9 — [`build_reply`] that also captures the follow-on [`DdnsOp`].
+///
+/// The op is surfaced via the out-param so every error arm keeps returning a
+/// plain `String`. `*ddns_op` is set only on a successful expose/unexpose; the
+/// live [`poll_once`] loop enqueues it onto the ddns responder. Pure apart from
+/// the config read/write the verbs already do.
+#[must_use]
+pub fn build_reply_capturing(
+    svc: &ConnectService,
+    verb: &str,
+    req_body: Option<&str>,
+    ddns_op: &mut Option<DdnsOp>,
+) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
     let root = svc.workgroup_root.as_path();
     match verb {
@@ -220,7 +291,20 @@ pub fn build_reply(svc: &ConnectService, verb: &str, req_body: Option<&str>) -> 
             };
             cfg.upsert(updated);
             match exposure::save(root, &cfg) {
-                Ok(_) => json!({ "ok": true, "hostname": hostname }).to_string(),
+                Ok(_) => {
+                    // CONNECT-9 — auto-create the service's public DDNS name. The
+                    // ddns worker resolves the record's `wan` source to the ingress
+                    // lighthouse's public IP and reconciles it against the provider;
+                    // `on_down: keep` keeps a published service's name pinned rather
+                    // than yanking it on a transient source flap.
+                    let zone = mackes_mesh_types::ddns::load(root).zone;
+                    *ddns_op = Some(DdnsOp::AddRecord(RecordDef {
+                        name: ddns_record_name(hostname, &zone),
+                        source: "wan".to_string(),
+                        on_down: OnDown::Keep,
+                    }));
+                    json!({ "ok": true, "hostname": hostname }).to_string()
+                }
                 Err(e) => err(format!("expose: save: {e}")),
             }
         }
@@ -232,6 +316,10 @@ pub fn build_reply(svc: &ConnectService, verb: &str, req_body: Option<&str>) -> 
             let Some(svc_policy) = cfg.get(id).cloned() else {
                 return err(format!("unexpose: no such service '{id}'"));
             };
+            // CONNECT-9 — capture the bound public hostname BEFORE we clear the
+            // ingress, so the follow-on remove targets the same record the expose
+            // created. A service that was already mesh-only has no record to drop.
+            let bound_hostname = svc_policy.ingress.as_ref().map(|b| b.hostname.clone());
             let updated = ExposurePolicy {
                 tier: Tier::MeshOnly,
                 ingress: None,
@@ -239,7 +327,13 @@ pub fn build_reply(svc: &ConnectService, verb: &str, req_body: Option<&str>) -> 
             };
             cfg.upsert(updated);
             match exposure::save(root, &cfg) {
-                Ok(_) => json!({ "ok": true }).to_string(),
+                Ok(_) => {
+                    if let Some(hostname) = bound_hostname {
+                        let zone = mackes_mesh_types::ddns::load(root).zone;
+                        *ddns_op = Some(DdnsOp::RemoveRecord(ddns_record_name(&hostname, &zone)));
+                    }
+                    json!({ "ok": true }).to_string()
+                }
                 Err(e) => err(format!("unexpose: save: {e}")),
             }
         }
@@ -374,8 +468,9 @@ pub fn poll_once(persist: &Persist, svc: &ConnectService, cursors: &mut HashMap<
         };
         for msg in msgs {
             cursors.insert(topic.clone(), msg.ulid.clone());
+            let mut ddns_op: Option<DdnsOp> = None;
             let reply = if crate::ipc::body_within_cap(msg.body.as_deref()) {
-                build_reply(svc, verb, msg.body.as_deref())
+                build_reply_capturing(svc, verb, msg.body.as_deref(), &mut ddns_op)
             } else {
                 crate::ipc::body_too_large_reply(verb)
             };
@@ -386,6 +481,25 @@ pub fn poll_once(persist: &Persist, svc: &ConnectService, cursors: &mut HashMap<
                 Some(&reply),
             ) {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "connect responder: reply write failed");
+            }
+            // CONNECT-9 — enqueue the auto-DDNS record op onto the ddns responder
+            // so an exposed service gets its public name (and an unexposed one
+            // loses it). Best-effort: a failed enqueue is logged, never fatal to
+            // the exposure write that already succeeded.
+            if let Some(op) = ddns_op {
+                if let Err(e) = persist.write(
+                    &op.action_topic(),
+                    Priority::Default,
+                    None,
+                    Some(&op.body()),
+                ) {
+                    tracing::warn!(
+                        verb = %verb,
+                        topic = %op.action_topic(),
+                        error = %e,
+                        "connect responder: failed to enqueue ddns record op"
+                    );
+                }
             }
         }
     }
@@ -526,5 +640,167 @@ mod tests {
     fn unknown_verb_errors() {
         let (_t, s) = svc();
         assert!(build_reply(&s, "bogus", None).contains("unknown connect verb"));
+    }
+
+    // ── CONNECT-9 — auto-DDNS on expose / unexpose ──────────────────────
+
+    #[test]
+    fn ddns_record_name_strips_zone_then_falls_back_to_label() {
+        // Default zone → the operator's `<label>.<zone>` strips to the label.
+        assert_eq!(
+            ddns_record_name(
+                "grafana.services.matthewmackes.com",
+                "services.matthewmackes.com"
+            ),
+            "grafana"
+        );
+        // Not under the zone → leftmost DNS label.
+        assert_eq!(
+            ddns_record_name("app.example.org", "services.matthewmackes.com"),
+            "app"
+        );
+        // A bare label is its own name.
+        assert_eq!(ddns_record_name("eagle", "z.example"), "eagle");
+    }
+
+    #[test]
+    fn expose_captures_ddns_add_record() {
+        let (_t, s) = svc();
+        let _ = build_reply(
+            &s,
+            "set-policy",
+            Some(
+                &json!({"id":"grafana","source":{"node":"eagle","kind":"container","port":3000},"tier":"mesh-only"})
+                    .to_string(),
+            ),
+        );
+        let mut op = None;
+        let reply = build_reply_capturing(
+            &s,
+            "expose",
+            Some(
+                &json!({"id":"grafana","lighthouse":"LH-01",
+                        "hostname":"grafana.services.matthewmackes.com"})
+                .to_string(),
+            ),
+            &mut op,
+        );
+        assert!(reply.contains("\"ok\":true"), "{reply}");
+        // The expose enqueues an add-record for the host's DDNS label.
+        assert!(
+            matches!(
+                &op,
+                Some(DdnsOp::AddRecord(rec))
+                    if rec.name == "grafana" && rec.source == "wan" && rec.on_down == OnDown::Keep
+            ),
+            "expected AddRecord(grafana/wan/keep), got {op:?}"
+        );
+    }
+
+    #[test]
+    fn unexpose_captures_ddns_remove_record() {
+        let (_t, s) = svc();
+        let _ = build_reply(
+            &s,
+            "set-policy",
+            Some(
+                &json!({"id":"grafana","source":{"node":"eagle","kind":"host","port":3000},"tier":"mesh-only"})
+                    .to_string(),
+            ),
+        );
+        let _ = build_reply(
+            &s,
+            "expose",
+            Some(
+                &json!({"id":"grafana","lighthouse":"LH-01",
+                        "hostname":"grafana.services.matthewmackes.com"})
+                .to_string(),
+            ),
+        );
+        let mut op = None;
+        let reply = build_reply_capturing(&s, "unexpose", Some("grafana"), &mut op);
+        assert!(reply.contains("\"ok\":true"), "{reply}");
+        assert_eq!(op, Some(DdnsOp::RemoveRecord("grafana".to_string())));
+        // An already-mesh-only service has no record to remove → no op.
+        let mut op2 = None;
+        let _ = build_reply_capturing(&s, "unexpose", Some("grafana"), &mut op2);
+        assert_eq!(op2, None, "no ddns op when there was no ingress binding");
+    }
+
+    #[test]
+    fn ddns_op_topics_and_bodies() {
+        let add = DdnsOp::AddRecord(RecordDef {
+            name: "grafana".into(),
+            source: "wan".into(),
+            on_down: OnDown::Keep,
+        });
+        assert_eq!(add.action_topic(), "action/ddns/add-record");
+        assert!(add.body().contains("\"name\":\"grafana\""));
+        let rm = DdnsOp::RemoveRecord("grafana".into());
+        assert_eq!(rm.action_topic(), "action/ddns/remove-record");
+        assert_eq!(rm.body(), "grafana");
+    }
+
+    #[test]
+    fn poll_once_enqueues_ddns_record_op_end_to_end() {
+        // CONNECT-9 — the live responder loop enqueues the ddns op onto the bus
+        // for the ddns responder to drain. Drive poll_once with a real expose
+        // request and assert an add-record lands on `action/ddns/add-record`.
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = ConnectService::new(tmp.path().to_path_buf(), "eagle".into());
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        // Pre-create the service so expose can flip it.
+        let _ = build_reply(
+            &svc,
+            "set-policy",
+            Some(
+                &json!({"id":"grafana","source":{"node":"eagle","kind":"host","port":3000},"tier":"mesh-only"})
+                    .to_string(),
+            ),
+        );
+        // Enqueue the expose request the way a GUI/CLI would.
+        persist
+            .write(
+                &action_topic("expose"),
+                Priority::Default,
+                None,
+                Some(
+                    &json!({"id":"grafana","lighthouse":"LH-01",
+                            "hostname":"grafana.services.matthewmackes.com"})
+                    .to_string(),
+                ),
+            )
+            .unwrap();
+        let mut cursors = HashMap::new();
+        poll_once(&persist, &svc, &mut cursors);
+        // The ddns add-record op is now queued for the ddns responder.
+        let queued = persist.list_since("action/ddns/add-record", None).unwrap();
+        assert_eq!(
+            queued.len(),
+            1,
+            "expose enqueues exactly one ddns add-record"
+        );
+        let rec: RecordDef = serde_json::from_str(queued[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(rec.name, "grafana");
+
+        // Now unexpose → a remove-record op is enqueued.
+        persist
+            .write(
+                &action_topic("unexpose"),
+                Priority::Default,
+                None,
+                Some("grafana"),
+            )
+            .unwrap();
+        poll_once(&persist, &svc, &mut cursors);
+        let removed = persist
+            .list_since("action/ddns/remove-record", None)
+            .unwrap();
+        assert_eq!(
+            removed.len(),
+            1,
+            "unexpose enqueues exactly one ddns remove-record"
+        );
+        assert_eq!(removed[0].body.as_deref(), Some("grafana"));
     }
 }
