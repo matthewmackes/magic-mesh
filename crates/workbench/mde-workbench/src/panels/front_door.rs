@@ -1295,6 +1295,33 @@ pub(super) mod search {
             }
         }
 
+        // DATACENTER-25 — the five folded surfaces (Instances / Snapshots /
+        // Images / Lighthouses / Build Farm) are no longer standalone nav entries
+        // (they live as Datacenter tabs), so the nav_model loop above can't find
+        // them. Keep them searchable + launchable: the hit emits `SelectPanel`
+        // with the retired slug, which `app.rs` intercepts and redirects to the
+        // Datacenter panel + that tab. Without this, "build farm"/"snapshots"/…
+        // would vanish from the launcher the moment they were folded.
+        for tab in crate::model::DatacenterTab::all() {
+            let Some(slug) = tab.folded_slug() else {
+                continue;
+            };
+            let score = score_match(tab.label(), q);
+            if score == 0 {
+                continue;
+            }
+            hits.push(SearchHit {
+                label: tab.label().to_string(),
+                context: "Datacenter surface".to_string(),
+                kind: HitKind::App,
+                score: score.saturating_sub(5),
+                message: crate::Message::SelectPanel {
+                    group: crate::model::Group::Provisioning,
+                    panel: slug,
+                },
+            });
+        }
+
         // ── Mesh entities: the live Peers directory (nodes + services) ──
         for peer in peers {
             let node_score = score_match(&peer.hostname, q);
