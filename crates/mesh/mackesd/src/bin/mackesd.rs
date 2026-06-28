@@ -6522,6 +6522,27 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("compute_registry".into());
 
+        // UNIFY-14 — the service_status worker: per-node + always-on (every node
+        // is a row in the Workbench node×service matrix, so this runs on all
+        // roles, like compute_registry). Samples which of the nine canonical
+        // mesh services are live here and publishes a ServiceStatusMap on-change
+        // + a 5 min heartbeat to `state/service-status/<overlay_ip>` plus the
+        // replicated `<host>/service-status.json` QNM-Shared plane. The overlay
+        // IP is auto-detected from the nebula_supervisor overlay-ip path at tick
+        // time (empty hint = runtime detect); a service with no determinable
+        // signal reports an honest "unknown" rather than a fabricated up/down.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::service_status::ServiceStatusWorker::new(
+                fw_host.clone(),
+                String::new(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("service_status".into());
+
         // ROUTER-3/4 — per-node, always-on router-registry: discover the node's
         // primary router/firewall (lowest-metric default route + gateway MAC),
         // cred-match `router/<mac>` + Vyatta `show version` fingerprint, and

@@ -41,6 +41,9 @@ pub mod peer_probe;
 pub mod peers;
 /// ROUTE-TRACE-1 — the typed PathGraph model for `action/route/trace`.
 pub mod route_trace;
+/// UNIFY-14 — per-node mesh service-status map (`mackesd`'s `service_status`
+/// worker publishes it; the Workbench node×service matrix renders it).
+pub mod service_status;
 // Portal-18.a (v6.0 R12 lock 2026-05-26) — universal tag schema +
 // per-peer storage layer. Lands here (rather than in a fresh crate)
 // because every existing consumer of `mackes-mesh-types` is also a

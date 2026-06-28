@@ -248,6 +248,13 @@ pub mod selinux_monitor;
 // `compute/inventory/<peer-nebula-addr>` per docs/design/v5.0.0-
 // compute.md §3. Silent no-op when virsh/podman are absent.
 pub mod compute_registry;
+// UNIFY-14 — the service_status worker: per-node + always-on. Samples which of
+// the nine canonical mesh services (bus/etcd/syncthing/nebula/dns/voice/music/
+// kdc/workbench) are live on this box and publishes a ServiceStatusMap to the
+// Bus (`state/service-status/<overlay_ip>`, on-change + slow heartbeat) + the
+// replicated QNM-Shared `<host>/service-status.json` plane so peers can render
+// the Unified Workbench node×service matrix with real per-node data.
+pub mod service_status;
 // ROUTER-3/4 — the router_registry worker: per-node + always-on. Discovers the
 // node's primary router/firewall (lowest-metric default route + gateway MAC),
 // matches a sealed `router/<mac>` cred + fingerprints it over the Vyatta CLI,
