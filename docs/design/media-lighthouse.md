@@ -105,6 +105,57 @@ lighthouse leaves music reachable.
 - A shared Postgres / replicated DB (per-instance scan locked).
 - Transcoding profiles / mobile apps beyond what Navidrome ships by default.
 
+## Operating the service (implemented surfaces)
+
+The epic's code (the non-bucket-dependent half) is landed in `mde-role` +
+`mackesd`:
+
+- **`Lighthouse_Media` role (MEDIA-1)** — `mde_role::Role::LighthouseMedia`
+  (canonical slug `lighthouse-media`), selectable at install (the role chooser)
+  and enroll (`mackesd join --role lighthouse-media`). It is a lateral, rank-0
+  *media-capable lighthouse*: `mackes_mesh_types::lighthouse::is_lighthouse`
+  still counts it (HA/roster/quorum), `is_media_lighthouse` isolates the
+  subclass, and the heartbeat stamps `role="lighthouse-media"` into the
+  replicated directory so a node's class is identifiable mesh-wide. The
+  media-only worker tier gates on the orthogonal capability
+  (`worker_role::node_serves_media`), so the container is provably absent off the
+  subclass.
+- **Navidrome supervisor (MEDIA-3)** — `workers::media_navidrome` ADOPTS +
+  self-heals the `mcnf-navidrome.service` unit (restart on down), media-gated.
+- **`music.mesh` (MEDIA-5)** — `workers::mesh_dns::build_records_with_music`
+  emits the active-active A-record set of every live `Lighthouse_Media` overlay
+  IP; membership tracks join/leave automatically off the directory.
+- **Shared account (MEDIA-6)** — the single Navidrome account's password is a
+  leader-managed mesh secret (`ipc::secret_store`, the XCP-7 pattern), minted
+  once + distributed into the root-only creds env file (`ND_ADMIN_*`) without
+  clobbering the operator's `DO_SPACES_*`.
+- **Published service (MEDIA-7)** — the `music` row is registered in the mesh
+  service registry (`action/nebula/published-services`) only while a node serves
+  it, with per-instance health; it de-registers (no stale entry) on teardown.
+- **Birthright (MEDIA-8)** — at enroll, `mackesd` writes
+  `~/.local/share/mde/airsonic-creds.json` → `http://music.mesh:4533` + the
+  shared account, so `mde-music` browses with no manual connect.
+
+### Content ingestion (MEDIA-9)
+
+The operator owns the library; the bucket is the source of truth. The helper
+`install-helpers/mcnf-music-ingest.sh` wraps the two verbs:
+
+```sh
+# add music to the shared bucket (rclone copy; idempotent, secrets off-argv)
+mcnf-music-ingest.sh upload /path/to/album            # → bucket root
+mcnf-music-ingest.sh upload /path/to/album Artists/X  # → a sub-path
+
+# re-index every live instance (Subsonic startScan over the music.mesh A-set)
+mcnf-music-ingest.sh rescan
+```
+
+It reuses the same root-only creds env file (`/etc/mackesd/media-spaces.env`)
+the leader-managed secret path writes, resolves the `music.mesh` A-set to reach
+every instance, and never puts a secret on `argv`. A live bucket (MEDIA-2,
+operator-blocked on Spaces keys) is needed only to exercise it end-to-end; the
+path itself is landed.
+
 ## Related work
 
 Builds on: the `compute_*`/podman lifecycle workers, `mesh_dns`, the service
