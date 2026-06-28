@@ -77,6 +77,11 @@ write_files:
             # --- backoffice (all tiers): state-backend + the secret self-init oneshot
             - "mcnf-secret-init-self.service"
             - "mcnf-state-backend.service"
+            # --- DAR-46/47: boot-time convergence driver. Reads the tier from
+            #     etcd /mcnf/backoffice/intent (no tier hardcoded) and runs
+            #     backoffice-up.sh from-intent --adopt after enroll + reseal — the
+            #     SINGLE bootstrap entrypoint for the tier's CI/reconciler/farm/DR.
+            - "mcnf-backoffice-up.service"
 %{ if backoffice_tier == "full" ~}
             # --- full tier only: CI + reconciler + DR + status
             - "mcnf-forgejo.service"

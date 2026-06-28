@@ -1,0 +1,40 @@
+# DAR-46/47 — boot-time backoffice convergence. The control VM runs the ONE
+# bootstrap driver (`backoffice-up.sh from-intent --adopt`) at boot so a
+# rebuilt/rebooted control VM re-converges its tier's units with no manual step.
+#
+# NO tier is hardcoded in the unit (DAR-46 acceptance): `from-intent` reads the
+# tier from etcd `/mcnf/backoffice/intent` (written by `mackesd found
+# --with-backoffice` / `backoffice-up.sh record-intent`). `--adopt` makes a re-run
+# converge instead of recreating — when the services are already up the run exits
+# 0. An ABSENT intent (a control VM that opted out of the backoffice) is a clean
+# no-op exit 0, never a boot failure.
+#
+# Ordered AFTER the mesh substrate (nebula overlay + etcd reachable over it) and
+# after the reconciler-state prefix exists, since `from-intent` reads etcd over the
+# overlay and the Full-tier phases touch /reconciler/*. The orchestrator itself
+# NEVER applies tofu / creates a VM / arms FA_APPLY / pushes off-fleet — live_gated
+# units are planned, never fired (the §6 NO-live-execution boundary).
+[Unit]
+Description=MCNF backoffice — boot-time convergence (backoffice-up.sh from-intent --adopt)
+Documentation=https://github.com/matthewmackes/magic-mesh
+After=network-online.target nebula.service etcd.service mcnf-reconciler-bootstrap.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=HOME=/root
+# Per-mesh config (etcd endpoints resolve via the shared DAR-1b resolver, which
+# reads /etc/mackesd/etcd-endpoints — never the dead .192). Optional env file.
+EnvironmentFile=-/etc/mcnf/reconciler.env
+WorkingDirectory=/opt/mcnf
+# from-intent reads the tier from etcd /mcnf/backoffice/intent (no tier hardcoded);
+# --adopt skips already-up services so a reboot re-converges idempotently.
+ExecStart=/bin/bash -lc 'exec automation/backoffice/backoffice-up.sh from-intent --adopt'
+# A brand-new VM with no recorded intent exits 0; a transient etcd hiccup must not
+# wedge boot — best-effort (the next boot / a manual run re-converges).
+SuccessExitStatus=0 1
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=multi-user.target

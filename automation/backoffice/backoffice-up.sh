@@ -38,6 +38,7 @@
 #                    [--control-ip <overlay-ip>] [--manifest-dir <dir>]
 #   backoffice-up.sh --plan --tier full        # alias for backoffice-plan.sh JSON
 #   backoffice-up.sh record-intent --tier <t> [--host <h>]   # DAR-18: cmd_found hook
+#   backoffice-up.sh from-intent [--adopt] [--dry-run]       # DAR-46/47: boot driver
 #
 # Modes:
 #   (default)   run the phases for the tier, mutating only the SAFE (non-live_gated)
@@ -51,6 +52,13 @@
 #   record-intent  DAR-18: write /mcnf/backoffice/intent {tier,host,ts} to etcd and
 #                  print the gated next command. This is the ONLY etcd-mutating mode;
 #                  it is what `mackesd found --with-backoffice` invokes.
+#   from-intent    DAR-46/47: the SINGLE bootstrap driver. Read the tier from etcd
+#                  `/mcnf/backoffice/intent` (no tier hardcoded) and run the phases
+#                  for that tier. This is what `mcnf-backoffice-up.service` runs at
+#                  boot (with --adopt) on the control VM AFTER enroll + reseal, so
+#                  the Full-tier CI → reconciler → build-farm → DR steps are invoked
+#                  in order by exactly ONE entrypoint. Exits 0 (no-op) when no intent
+#                  is recorded (a control VM that opted out of the backoffice).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -69,8 +77,9 @@ CONTROL_IP="${MCNF_CONTROL_IP:-}"
 HOST_OVERRIDE=""
 MANIFEST_DIR="$HERE"
 
-# record-intent is a leading subcommand (not a flag), like `git <verb>`.
+# record-intent / from-intent are leading subcommands (not flags), like `git <verb>`.
 if [ "${1:-}" = "record-intent" ]; then MODE="record-intent"; shift; fi
+if [ "${1:-}" = "from-intent" ];   then MODE="from-intent";   shift; fi
 
 while [ $# -gt 0 ]; do case "$1" in
   --tier)        TIER="$2"; shift 2;;
@@ -84,6 +93,55 @@ while [ $# -gt 0 ]; do case "$1" in
   *) echo "backoffice-up: unknown arg: $1" >&2; exit 2;;
 esac; done
 
+log()  { echo "==> $*"; }
+warn() { echo "backoffice-up: $*" >&2; }
+die()  { echo "backoffice-up: $*" >&2; exit 1; }
+
+# ── from-intent (DAR-46/47): resolve the tier from etcd BEFORE the tier gate ──
+# Read /mcnf/backoffice/intent (written by record-intent / cmd_found), parse its
+# `tier`, and re-enter THIS orchestrator as `--tier <tier>` so there is exactly one
+# code path. No tier is hardcoded in the boot unit (DAR-46 acceptance). An ABSENT
+# intent is a clean no-op (a control VM that opted out of the backoffice) — exit 0,
+# never an error. The value is NON-secret ({tier,host,ts}); we read it, never log a
+# credential. Idempotent + boot-safe: the boot unit passes --adopt so a re-run
+# converges instead of recreating.
+if [ "$MODE" = "from-intent" ]; then
+  endpoints="$(mcnf_resolve_etcd)" || exit 1   # fail-loud already printed
+  ep="${endpoints%%,*}"
+  k="$(printf %s '/mcnf/backoffice/intent' | base64 -w0)"
+  # Decode the JSON value and extract `tier` with python3 (tomllib-era stdlib);
+  # an absent key yields an empty value → treated as "no intent".
+  intent_tier="$(curl -fsS --max-time 10 -X POST "$ep/v3/kv/range" -d "{\"key\":\"$k\"}" 2>/dev/null \
+    | python3 -c '
+import sys, json, base64
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+kvs = d.get("kvs")
+if not kvs:
+    sys.exit(0)
+try:
+    val = json.loads(base64.b64decode(kvs[0]["value"]).decode())
+except Exception:
+    sys.exit(0)
+t = val.get("tier", "")
+if t in ("minimal", "full"):
+    sys.stdout.write(t)
+' 2>/dev/null)" || true
+  if [ -z "$intent_tier" ]; then
+    log "from-intent: no /mcnf/backoffice/intent recorded (or unreadable) — nothing to converge (exit 0)"
+    exit 0
+  fi
+  log "from-intent: resolved tier=$intent_tier from /mcnf/backoffice/intent — driving backoffice-up --tier $intent_tier"
+  # Re-exec the SAME script with the resolved tier, carrying through the boot
+  # flags (--adopt / --dry-run). exec keeps it one process; no second entrypoint.
+  set -- --tier "$intent_tier"
+  if [ "$ADOPT" -eq 1 ];   then set -- "$@" --adopt;   fi
+  if [ "$DRY_RUN" -eq 1 ]; then set -- "$@" --dry-run; fi
+  exec "$0" "$@"
+fi
+
 # Tier gate: minimal | full only.
 case "$TIER" in
   minimal|full) ;;
@@ -92,10 +150,6 @@ case "$TIER" in
 esac
 MANIFEST="$MANIFEST_DIR/manifest.$TIER.toml"
 [ -r "$MANIFEST" ] || { echo "backoffice-up: missing manifest $MANIFEST" >&2; exit 2; }
-
-log()  { echo "==> $*"; }
-warn() { echo "backoffice-up: $*" >&2; }
-die()  { echo "backoffice-up: $*" >&2; exit 1; }
 
 # ── manifest parse (python3 tomllib if present, else a tiny [[unit]] parser) ──
 # Emits one TAB-separated line per unit: <phase>\t<id>\t<live_gated>\t<via_script>
