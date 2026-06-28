@@ -374,20 +374,36 @@ pub fn fleet_rows_from_peers(peers: &[mackes_mesh_types::peers::PeerRecord]) -> 
     enrolled.sort_by(|a, b| a.hostname.cmp(&b.hostname));
     let mut rows = Vec::with_capacity(enrolled.len() * CANONICAL_SERVICES.len());
     for p in enrolled {
-        let reachable = matches!(p.health.as_str(), "healthy" | "degraded");
-        for (id, name, port, proto) in CANONICAL_SERVICES {
-            rows.push(ServiceRow {
-                node: p.hostname.clone(),
-                id: id.to_string(),
-                name: name.to_string(),
-                port,
-                proto: proto.to_string(),
-                overlay_ip: p.overlay_ip.clone(),
-                is_publishable: reachable,
-            });
-        }
+        rows.extend(rows_for_peer(p));
     }
     rows
+}
+
+/// The 7 canonical service rows for ONE peer, attributed to its hostname +
+/// overlay IP. `is_publishable` = the peer is reachable (`healthy`/`degraded`)
+/// — an offline/unreachable peer's services aren't actually serving. Returns
+/// an empty list for an un-enrolled peer (no overlay IP), since it publishes
+/// nothing yet. Pulled out of [`fleet_rows_from_peers`] so the Instances panel
+/// can reuse the SAME canonical-7 builder to surface an enrolled VM's services
+/// inline (SVC-VIEW-2) without re-deriving service discovery (§6 glue).
+#[must_use]
+pub fn rows_for_peer(p: &mackes_mesh_types::peers::PeerRecord) -> Vec<ServiceRow> {
+    if p.overlay_ip.as_deref().is_none_or(str::is_empty) {
+        return Vec::new();
+    }
+    let reachable = matches!(p.health.as_str(), "healthy" | "degraded");
+    CANONICAL_SERVICES
+        .iter()
+        .map(|&(id, name, port, proto)| ServiceRow {
+            node: p.hostname.clone(),
+            id: id.to_string(),
+            name: name.to_string(),
+            port,
+            proto: proto.to_string(),
+            overlay_ip: p.overlay_ip.clone(),
+            is_publishable: reachable,
+        })
+        .collect()
 }
 
 /// Pure parser — accepts the JSON string the Python helper
@@ -476,6 +492,33 @@ mod tests {
                 .as_deref(),
             Some("10.42.0.2")
         );
+    }
+
+    #[test]
+    fn rows_for_peer_emits_canonical_seven_for_enrolled() {
+        let p = enrolled("MDE-KVM-1", "10.42.0.9", "healthy");
+        let rows = rows_for_peer(&p);
+        assert_eq!(rows.len(), 7, "the canonical-7 set");
+        assert!(rows.iter().all(|r| r.node == "MDE-KVM-1"));
+        assert!(rows.iter().all(|r| r.is_publishable));
+        assert!(rows
+            .iter()
+            .all(|r| r.overlay_ip.as_deref() == Some("10.42.0.9")));
+    }
+
+    #[test]
+    fn rows_for_peer_empty_when_not_enrolled() {
+        // No overlay IP → un-enrolled peer publishes nothing.
+        let p = PeerRecord::now("MDE-KVM-2", None, "healthy");
+        assert!(rows_for_peer(&p).is_empty());
+    }
+
+    #[test]
+    fn rows_for_peer_unreachable_is_not_publishable() {
+        let p = enrolled("MDE-KVM-3", "10.42.0.10", "unreachable");
+        let rows = rows_for_peer(&p);
+        assert_eq!(rows.len(), 7);
+        assert!(rows.iter().all(|r| !r.is_publishable));
     }
 
     #[test]
