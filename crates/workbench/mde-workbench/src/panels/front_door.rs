@@ -73,6 +73,10 @@ use cosmic::iced::{
     Subscription, Task,
 };
 use cosmic::Theme;
+// UNIFY-15 — the Audit Trail card colours its severity through the shared
+// notify tokens (§4: severity → token, never a raw hex), the same path the
+// events rail + cosmic applet use.
+use mde_notify::{classify_severity, severity_token, Severity};
 use mde_theme::{FontSize, Palette, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
@@ -809,6 +813,105 @@ pub struct FrontDoorData {
     /// search has the live mesh entities (nodes + services) without a second Bus
     /// read. The widget projections above are derived from these same rows.
     pub peers: Vec<peers::PeerRow>,
+    /// UNIFY-15 — the Overview's **Fleet Convergence** card: the elected head
+    /// config revision + how many live peers have converged to it, read off the
+    /// fleet revision store (the same store the Config-apply / Fleet-revisions
+    /// panels read). `None` when no revision has ever been authored — the source
+    /// genuinely has nothing, so the card is omitted (§7, never a faked figure).
+    /// Computed in [`Self::read`] (blocking FS reads, off the GUI thread).
+    pub convergence: Option<Convergence>,
+    /// UNIFY-15 — the Overview's **Audit Trail** card: the recent hash-chained
+    /// audit events, fetched via the Audit panel's own loader (`mackesd
+    /// audit-verify --json`) + parser (§6, read-only). Empty when the chain is
+    /// empty / `mackesd` is unreachable — the card is then omitted (§7). Filled in
+    /// [`FrontDoor::load`] (an async CLI, not a blocking read like the rest of
+    /// [`Self::read`]).
+    pub audit: Vec<crate::panels::audit::AuditEventRow>,
+}
+
+/// UNIFY-15 — the **Fleet Convergence** card's data (design Overview, lines
+/// 137-144): the elected head config revision + how many of the live mesh peers
+/// have converged to it. Real data only (§7): the head + author + time come from
+/// the same fleet revision store the Config-apply / Fleet-revisions panels read
+/// (`config_apply::newest_revision`), and a peer counts as converged when its
+/// highest applied ack reaches the head (`config_apply::applied_version`). No
+/// head revision ⇒ no card (the source genuinely has nothing — an honest omit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Convergence {
+    /// The elected head revision number (the store's monotonic version).
+    pub head: u64,
+    /// The node that authored the head revision (empty ⇒ unknown).
+    pub author: String,
+    /// Authoring time, Unix seconds (`0` ⇒ unknown).
+    pub at: u64,
+    /// Live peers that have converged to the head.
+    pub converged: usize,
+    /// Live peers in the roster — the convergence denominator.
+    pub total: usize,
+    /// Hostnames of the peers NOT yet converged (the honest note source).
+    pub unconverged: Vec<String>,
+}
+
+impl Convergence {
+    /// Project the convergence view from the head revision + the set of hostnames
+    /// whose highest applied ack reaches it, against the live roster. Pure (no
+    /// I/O) so the math is unit-tested without a fleet store.
+    #[must_use]
+    pub fn project(
+        head: u64,
+        author: String,
+        at: u64,
+        peers: &[peers::PeerRow],
+        converged_hosts: &std::collections::HashSet<String>,
+    ) -> Self {
+        let total = peers.len();
+        let converged = peers
+            .iter()
+            .filter(|p| converged_hosts.contains(&p.hostname))
+            .count();
+        let unconverged = peers
+            .iter()
+            .filter(|p| !converged_hosts.contains(&p.hostname))
+            .map(|p| p.hostname.clone())
+            .collect();
+        Self {
+            head,
+            author,
+            at,
+            converged,
+            total,
+            unconverged,
+        }
+    }
+}
+
+/// UNIFY-15 — read the Fleet Convergence view off the live fleet revision store
+/// (blocking FS reads — runs on [`FrontDoorData::read`]'s thread). Reuses the
+/// Config-apply panel's public store helpers (§6 glue, no reimplementation): the
+/// elected head revision and each live peer's highest applied ack. `None` when no
+/// revision has ever been authored (the store is empty — no honest card to show).
+#[must_use]
+fn read_convergence(peers: &[peers::PeerRow]) -> Option<Convergence> {
+    let root = crate::panels::config_apply::workgroup_root();
+    let (head, author, at) = crate::panels::config_apply::newest_revision(&root)?;
+    // A peer has converged when its highest *applied* ack reaches the head (a
+    // peer that has never acked / is behind / is unreachable is simply absent
+    // from this set — it shows in the honest "pending" note, never as converged).
+    let converged_hosts: std::collections::HashSet<String> = peers
+        .iter()
+        .filter(|p| {
+            crate::panels::config_apply::applied_version(&root, &p.hostname)
+                .is_some_and(|v| v >= head)
+        })
+        .map(|p| p.hostname.clone())
+        .collect();
+    Some(Convergence::project(
+        head,
+        author,
+        at,
+        peers,
+        &converged_hosts,
+    ))
 }
 
 impl FrontDoorData {
@@ -879,10 +982,128 @@ impl FrontDoorData {
             pending,
             // FRONTDOOR-13 — the AI alert triage for the Alerts tile detail.
             triage,
+            // UNIFY-15 — the Fleet Convergence card off the fleet revision store
+            // (the same store the Config-apply panel reads). `None` ⇒ no revision
+            // exists ⇒ the card is omitted (§7). Computed before `peers` is moved.
+            convergence: read_convergence(&peers),
+            // UNIFY-15 — the Audit Trail card is an async CLI fetch, so it's filled
+            // by `FrontDoor::load` after this blocking read; empty here.
+            audit: Vec::new(),
             // FRONTDOOR-6 — carry the raw roster for the unified mesh search.
             peers,
         }
     }
+}
+
+/// UNIFY-15 — fetch the recent hash-chained audit timeline for the Overview's
+/// Audit Trail card, reusing the Audit panel's loader command + parser (§6,
+/// read-only). Best-effort: a missing / erroring `mackesd` (a chain break exits
+/// non-zero, so its JSON isn't returned either) or an empty chain yields an empty
+/// timeline, and the card is omitted (§7 — never a faked row).
+async fn fetch_overview_audit() -> Vec<crate::panels::audit::AuditEventRow> {
+    let Ok(out) =
+        crate::panels::fleet_settings::run_mackesd(&["audit-verify".into(), "--json".into()]).await
+    else {
+        return Vec::new();
+    };
+    crate::panels::audit::parse_report(&out).timeline
+}
+
+/// UNIFY-15 — the Audit Trail card's severity for one event payload, classified
+/// through the shared notify classifier (§6 reuse) and coloured by
+/// [`severity_token`] at render (§4). The audit-verify timeline carries the full
+/// `Event` JSON (incl. `kind`/`node_id`/`detail`), so the outcome words baked
+/// into it ("failed", "applied", "unreachable", …) are the honest severity
+/// signal; absent any signal an event reads as informational.
+#[must_use]
+fn audit_severity(payload: &str) -> Severity {
+    let p = payload.to_ascii_lowercase();
+    let signal = if p.contains("fail")
+        || p.contains("error")
+        || p.contains("fatal")
+        || p.contains("denied")
+        || p.contains("break")
+    {
+        "error"
+    } else if p.contains("warn")
+        || p.contains("degraded")
+        || p.contains("unreachable")
+        || p.contains("drift")
+    {
+        "warn"
+    } else if p.contains("success")
+        || p.contains("applied")
+        || p.contains("healthy")
+        || p.contains("complete")
+        || p.contains("\"ok\"")
+    {
+        "ok"
+    } else {
+        "info"
+    };
+    classify_severity(Some(signal), "default")
+}
+
+/// UNIFY-15 — the short kind chip for an audit row (design's `a.k`). The
+/// audit-verify timeline carries the full `Event` JSON, so the real `kind`
+/// (`config_change`/`auth`/`lifecycle`/`reconcile`/`admin_action`, snake_case)
+/// is read straight off it and shortened to its leading token (`config`, `auth`,
+/// …). `None` when the payload carries no kind — the row then renders without a
+/// chip rather than inventing a category (§7).
+#[must_use]
+fn audit_kind(payload: &str) -> Option<String> {
+    let kind = serde_json::from_str::<serde_json::Value>(payload)
+        .ok()?
+        .get("kind")?
+        .as_str()?
+        .to_string();
+    kind.split('_').next().map(str::to_string)
+}
+
+/// UNIFY-15 — the human message for an audit row (design's `a.m`). Built from the
+/// real `Event` JSON: `"{node_id} — {detail}"`, where the detail is the event's
+/// `detail` object flattened to its scalar `key value` pairs (the same fields the
+/// daemon recorded). Falls back to the raw payload when it isn't the expected
+/// JSON shape, so an unrecognised row is shown verbatim rather than dropped (§7).
+#[must_use]
+fn audit_message(payload: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return payload.trim().to_string();
+    };
+    let node = v.get("node_id").and_then(|n| n.as_str()).unwrap_or("");
+    let detail = match v.get("detail") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Object(map)) => {
+            let parts: Vec<String> = map
+                .iter()
+                .filter_map(|(k, val)| match val {
+                    serde_json::Value::String(s) => Some(format!("{k} {s}")),
+                    serde_json::Value::Number(n) => Some(format!("{k} {n}")),
+                    serde_json::Value::Bool(b) => Some(format!("{k} {b}")),
+                    _ => None,
+                })
+                .take(3)
+                .collect();
+            parts.join(" · ")
+        }
+        _ => String::new(),
+    };
+    match (node.is_empty(), detail.is_empty()) {
+        (false, false) => format!("{node} — {detail}"),
+        (false, true) => node.to_string(),
+        (true, false) => detail,
+        (true, true) => payload.trim().to_string(),
+    }
+}
+
+/// UNIFY-15 — the clock-time (`HH:MM:SS`) for an audit row, reusing the
+/// workbench's shared event-timestamp formatter (`mesh_history::format_ts`, the
+/// same `YYYY-MM-DD HH:MM:SSZ` the History/Drift panels render) and slicing its
+/// fixed-width time field. `—` for a missing timestamp.
+#[must_use]
+fn audit_clock(ms: i64) -> String {
+    let full = crate::panels::mesh_history::format_ts(ms);
+    full.get(11..19).map_or(full.clone(), str::to_string)
 }
 
 /// FRONTDOOR-10 — read the latest body on a `state/` (or current-snapshot) Bus
@@ -2870,6 +3091,15 @@ pub struct FrontDoor {
     /// peer apps, and the per-row context-menu flags. Closed (the tile grid shows)
     /// until the Start button / Super key / launcher chip opens it.
     pub launcher: LauncherState,
+    /// UNIFY-15 — the Overview's **Fleet Convergence** card data (the head config
+    /// revision + converged-peer count), folded in from the [`FrontDoorData`] read.
+    /// `None` until the first snapshot / when no revision exists — the card is then
+    /// omitted (§7, never a faked figure).
+    pub convergence: Option<Convergence>,
+    /// UNIFY-15 — the Overview's **Audit Trail** card data (the recent hash-chained
+    /// audit events), folded in from the [`FrontDoorData`] read. Empty until the
+    /// first snapshot / when the chain is empty — the card is then omitted (§7).
+    pub audit: Vec<crate::panels::audit::AuditEventRow>,
 }
 
 impl Default for FrontDoor {
@@ -2955,6 +3185,10 @@ impl FrontDoor {
             // APPLAUNCH — the launcher starts closed (the tile grid shows); the
             // Start/Super-key open lazy-loads its cache (Q49 cache-first).
             launcher: LauncherState::default(),
+            // UNIFY-15 — no Overview convergence / audit cards until the first
+            // snapshot lands (an empty store / chain keeps them omitted — §7).
+            convergence: None,
+            audit: Vec::new(),
         }
     }
 
@@ -2967,9 +3201,20 @@ impl FrontDoor {
     /// established subscription infra (§6) — the FD-10 topics are already published
     /// by mackesd, so no new publisher is added on the GUI side.
     pub fn load() -> Task<crate::Message> {
-        Task::perform(async { FrontDoorData::read() }, |data| {
-            crate::Message::FrontDoor(Message::Loaded(Box::new(data)))
-        })
+        Task::perform(
+            async {
+                // UNIFY-15 — the Audit Trail card's source is an async CLI (the
+                // Audit panel's own `mackesd audit-verify --json` loader), so it is
+                // fetched here and folded into the otherwise-blocking snapshot. The
+                // rest of the read (incl. the Fleet Convergence store reads) stays
+                // in `FrontDoorData::read`.
+                let audit = fetch_overview_audit().await;
+                let mut data = FrontDoorData::read();
+                data.audit = audit;
+                data
+            },
+            |data| crate::Message::FrontDoor(Message::Loaded(Box::new(data))),
+        )
     }
 
     /// APPLAUNCH-7 — the launcher's cache refresh: read `action/apps/{list,
@@ -4291,6 +4536,11 @@ impl FrontDoor {
         if !self.query.trim().is_empty() {
             self.results = search::local_results(&self.query, &self.tiles, &self.peers);
         }
+        // UNIFY-15 — fold the Overview's Fleet Convergence + Audit Trail cards in,
+        // replaced wholesale each snapshot so a resolved/stale figure drops off
+        // rather than lingering (§7 — no phantom card).
+        self.convergence = data.convergence.clone();
+        self.audit = data.audit.clone();
     }
 
     /// FRONTDOOR-10 — the suggestions that concern the tile at index `i` (Q19),
@@ -5372,6 +5622,11 @@ impl FrontDoor {
             .height(Length::Fill);
         if !self.searching() {
             body = body.push(self.overview_header(palette));
+            // UNIFY-15 — the Fleet Convergence + Audit Trail cards under the header
+            // band (omitted when their sources are empty — §7).
+            if let Some(cards) = self.overview_cards(palette) {
+                body = body.push(cards);
+            }
         }
         if let Some(greeting) = self.greeting_banner(palette) {
             body = body.push(greeting);
@@ -5564,6 +5819,11 @@ impl FrontDoor {
             .height(Length::Fill);
         if !self.searching() {
             pane = pane.push(self.overview_header(palette));
+            // UNIFY-15 — the Fleet Convergence + Audit Trail cards under the header
+            // band (omitted when their sources are empty — §7).
+            if let Some(cards) = self.overview_cards(palette) {
+                pane = pane.push(cards);
+            }
         }
         if let Some(greeting) = self.greeting_banner(palette) {
             pane = pane.push(greeting);
@@ -5707,6 +5967,257 @@ impl FrontDoor {
         container(bar)
             .width(Length::Fill)
             .padding(Padding::from([10u16, 16u16]))
+            .into()
+    }
+
+    /// UNIFY-15 — the Overview's two data cards (design lines 137-156): the
+    /// **Fleet Convergence** card (head config revision + converged-peer count)
+    /// and the **Audit Trail** card (recent hash-chained events), laid out side by
+    /// side under the header band. Each card is omitted when its source is empty
+    /// (§7 — an honest gap, never a faked card); `None` when BOTH are empty, so the
+    /// resting Overview falls back to exactly the FD-1 grid (no layout change).
+    fn overview_cards(&self, palette: Palette) -> Option<Element<'_, crate::Message, Theme>> {
+        let mut cards: Vec<Element<'_, crate::Message, Theme>> = Vec::new();
+        if let Some(conv) = &self.convergence {
+            cards.push(self.convergence_card(conv, palette));
+        }
+        if !self.audit.is_empty() {
+            cards.push(self.audit_card(palette));
+        }
+        if cards.is_empty() {
+            return None;
+        }
+        let mut lane = row![].spacing(11).width(Length::Fill);
+        for card in cards {
+            lane = lane.push(container(card).width(Length::FillPortion(1)));
+        }
+        Some(
+            container(lane)
+                .width(Length::Fill)
+                .padding(Padding::from([4u16, 16u16]))
+                .into(),
+        )
+    }
+
+    /// UNIFY-15 — the **Fleet Convergence** card (design lines 137-144). The head
+    /// revision line (`r-N` + author + time), a converged/total progress bar, and
+    /// an honest "pending" note naming the peers not yet converged. All real (§7):
+    /// the figures are the fleet revision store's, projected in [`Convergence`].
+    fn convergence_card<'a>(
+        &self,
+        conv: &'a Convergence,
+        palette: Palette,
+    ) -> Element<'a, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+
+        let header: Element<'a, crate::Message, Theme> = text("Fleet Convergence")
+            .size(TypeRole::Caption.size_in(sizes))
+            .colr(palette.text_muted.into_cosmic_color())
+            .into();
+
+        // Head revision line: `r-N` (mono) + an honest attribution (author / time,
+        // each dropped when the store didn't record it — never a faked value).
+        let when = if conv.at == 0 {
+            String::new()
+        } else {
+            audit_clock(i64::try_from(conv.at.saturating_mul(1000)).unwrap_or(i64::MAX))
+        };
+        let attribution = match (conv.author.is_empty(), when.is_empty()) {
+            (false, false) => format!("authored by {} · {when}", conv.author),
+            (false, true) => format!("authored by {}", conv.author),
+            (true, false) => format!("authored {when}"),
+            (true, true) => String::new(),
+        };
+        let head_row = row![
+            text(format!("r-{}", conv.head))
+                .font(cosmic::iced::Font::MONOSPACE)
+                .size(TypeRole::Subheading.size_in(sizes))
+                .colr(palette.text.into_cosmic_color()),
+            text(attribution)
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+        ]
+        .spacing(8)
+        .align_y(cosmic::iced::Alignment::Center);
+
+        let mut body = column![head_row].spacing(7).width(Length::Fill);
+
+        if conv.total > 0 {
+            // Progress bar — converged / total as two `FillPortion` segments (a
+            // success-token fill over a track), the iced-idiomatic ratio width.
+            let filled = u16::try_from(conv.converged.min(conv.total)).unwrap_or(u16::MAX);
+            let rest = u16::try_from(conv.total - conv.converged.min(conv.total)).unwrap_or(0);
+            let success = palette.success.into_cosmic_color();
+            let track = palette.background.into_cosmic_color();
+            let bar = container(
+                row![
+                    container(Space::new())
+                        .width(Length::FillPortion(filled))
+                        .height(Length::Fixed(6.0))
+                        .style(move |_t: &Theme| container::Style {
+                            background: Some(Background::Color(success)),
+                            ..container::Style::default()
+                        }),
+                    container(Space::new())
+                        .width(Length::FillPortion(rest))
+                        .height(Length::Fixed(6.0))
+                        .style(move |_t: &Theme| container::Style {
+                            background: Some(Background::Color(track)),
+                            ..container::Style::default()
+                        }),
+                ]
+                .width(Length::Fill),
+            )
+            .style(move |_t: &Theme| container::Style {
+                border: Border {
+                    color: palette.border.into_cosmic_color(),
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..container::Style::default()
+            });
+            body = body.push(bar);
+            body = body.push(
+                text(format!(
+                    "{} / {} peers converged",
+                    conv.converged, conv.total
+                ))
+                .size(TypeRole::Body.size_in(sizes))
+                .colr(palette.text.into_cosmic_color()),
+            );
+            body = body.push(
+                text(self.convergence_note(conv))
+                    .size(TypeRole::Caption.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+        } else {
+            // A head revision exists but the live roster hasn't loaded yet — show
+            // the revision honestly without a fabricated denominator.
+            body = body.push(
+                text("peer convergence — roster syncing")
+                    .size(TypeRole::Caption.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+        }
+
+        self.overview_card_frame(header, body.into(), palette)
+    }
+
+    /// UNIFY-15 — the honest "pending" note for the convergence card: the peers
+    /// not yet converged to the head, the first few named (with an "(unreachable)"
+    /// mark when the live roster shows them offline), and a "+N more" tail.
+    /// "all peers converged" when none are pending. Pure presentation off the
+    /// projected [`Convergence`] + the live roster — no fabricated reasoning.
+    fn convergence_note(&self, conv: &Convergence) -> String {
+        if conv.unconverged.is_empty() {
+            return "all peers converged".to_string();
+        }
+        let shown: Vec<String> = conv
+            .unconverged
+            .iter()
+            .take(3)
+            .map(|h| {
+                let offline = self
+                    .peers
+                    .iter()
+                    .any(|p| &p.hostname == h && p.presence == "offline");
+                if offline {
+                    format!("{h} (unreachable)")
+                } else {
+                    h.clone()
+                }
+            })
+            .collect();
+        let more = conv.unconverged.len().saturating_sub(shown.len());
+        let mut note = format!("pending: {}", shown.join(", "));
+        if more > 0 {
+            note.push_str(&format!(" +{more} more"));
+        }
+        note
+    }
+
+    /// UNIFY-15 — the **Audit Trail** card (design lines 146-156): the most recent
+    /// hash-chained audit events, newest first. Each row is the real event's
+    /// clock-time, a severity-coloured kind chip (when the payload carries a kind),
+    /// and a human message — all read off the audit-verify timeline (§7, no demo).
+    fn audit_card(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+        let header: Element<'_, crate::Message, Theme> = row![
+            text("Audit Trail")
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+            Space::new().width(Length::Fill),
+            text("hash-chained · 72h")
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+        ]
+        .align_y(cosmic::iced::Alignment::Center)
+        .width(Length::Fill)
+        .into();
+
+        // Newest first, capped so the card stays compact above the grid.
+        let mut list = column![].spacing(0).width(Length::Fill);
+        for e in self.audit.iter().rev().take(6) {
+            let sev = audit_severity(&e.payload);
+            let sev_color = severity_token(sev, &palette).into_cosmic_color();
+            let mut entry = row![text(audit_clock(e.timestamp_ms))
+                .font(cosmic::iced::Font::MONOSPACE)
+                .size(TypeRole::Caption.size_in(sizes))
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::Fixed(66.0)),]
+            .spacing(11)
+            .align_y(cosmic::iced::Alignment::Start);
+            if let Some(kind) = audit_kind(&e.payload) {
+                entry = entry.push(
+                    text(kind.to_uppercase())
+                        .size(TypeRole::Caption.size_in(sizes))
+                        .colr(sev_color)
+                        .width(Length::Fixed(64.0)),
+                );
+            }
+            entry = entry.push(
+                text(audit_message(&e.payload))
+                    .size(TypeRole::Body.size_in(sizes))
+                    .colr(palette.text.into_cosmic_color())
+                    .width(Length::Fill),
+            );
+            list = list.push(
+                container(entry)
+                    .width(Length::Fill)
+                    .padding(Padding::from([9u16, 15u16])),
+            );
+        }
+
+        self.overview_card_frame(header, list.into(), palette)
+    }
+
+    /// UNIFY-15 — the shared Overview-card frame: a `surface`/`border` card (design
+    /// `#262626`/`#393939`) with a header band, a hairline rule under it (the
+    /// design's `border-bottom`), and a padded body. Carbon tokens only (§4).
+    fn overview_card_frame<'a>(
+        &self,
+        header: Element<'a, crate::Message, Theme>,
+        body: Element<'a, crate::Message, Theme>,
+        palette: Palette,
+    ) -> Element<'a, crate::Message, Theme> {
+        let header_band = container(header)
+            .width(Length::Fill)
+            .padding(Padding::from([8u16, 13u16]));
+        let body_pad = container(body)
+            .width(Length::Fill)
+            .padding(Padding::from([10u16, 13u16]));
+        let stack = column![header_band, top_bar_hairline(palette), body_pad].width(Length::Fill);
+        container(stack)
+            .width(Length::Fill)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(palette.surface.into_cosmic_color())),
+                border: Border {
+                    color: palette.border.into_cosmic_color(),
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..container::Style::default()
+            })
             .into()
     }
 
@@ -10499,6 +11010,143 @@ mod tests {
             let _: Element<'_, crate::Message, Theme> = fd.view();
             // Full-screen mode (iPadOS home) — the card is reachable here too (§7).
             fd.mode = Mode::FullScreen;
+            let _: Element<'_, crate::Message, Theme> = fd.view();
+        });
+    }
+
+    // ── UNIFY-15: the Overview's Fleet Convergence + Audit Trail cards ──────
+
+    #[test]
+    fn audit_severity_reads_outcome_words_through_classifier() {
+        // The audit-verify timeline carries the full Event JSON; the outcome
+        // words baked into it are the honest severity signal (coloured by the
+        // shared notify token at render).
+        assert_eq!(
+            audit_severity(r#"{"detail":{"status":"failed"}}"#),
+            Severity::Critical
+        );
+        assert_eq!(
+            audit_severity(r#"{"detail":{"state":"degraded"}}"#),
+            Severity::Warning
+        );
+        assert_eq!(
+            audit_severity(r#"{"detail":{"result":"applied"}}"#),
+            Severity::Success
+        );
+        // No signal ⇒ informational (a plain config/auth event).
+        assert_eq!(
+            audit_severity(r#"{"kind":"auth","detail":{}}"#),
+            Severity::Info
+        );
+    }
+
+    #[test]
+    fn audit_kind_reads_real_kind_or_none() {
+        assert_eq!(
+            audit_kind(r#"{"kind":"config_change","node_id":"oak"}"#).as_deref(),
+            Some("config")
+        );
+        assert_eq!(
+            audit_kind(r#"{"kind":"admin_action"}"#).as_deref(),
+            Some("admin")
+        );
+        // No kind field / not JSON ⇒ no chip (never an invented category — §7).
+        assert_eq!(audit_kind(r#"{"node_id":"oak"}"#), None);
+        assert_eq!(audit_kind("not json"), None);
+    }
+
+    #[test]
+    fn audit_message_builds_from_node_and_detail_or_falls_back() {
+        let m = audit_message(r#"{"node_id":"oak","detail":{"action":"repair_now","count":3}}"#);
+        assert!(m.starts_with("oak — "), "got: {m}");
+        assert!(m.contains("action repair_now"), "got: {m}");
+        // A non-JSON payload is shown verbatim, never dropped (§7).
+        assert_eq!(audit_message("plain text"), "plain text");
+    }
+
+    #[test]
+    fn audit_clock_extracts_hms_or_dash() {
+        // 1_715_000_000_000 ms = 2024-05-06 12:53:20 UTC (mesh_history::format_ts).
+        assert_eq!(audit_clock(1_715_000_000_000), "12:53:20");
+        assert_eq!(audit_clock(0), "-");
+    }
+
+    #[test]
+    fn convergence_project_counts_only_roster_peers_at_or_past_head() {
+        let peers = vec![
+            mesh_peer("oak", &[]),
+            mesh_peer("pine", &[]),
+            mesh_peer("maple", &[]),
+        ];
+        let mut converged = std::collections::HashSet::new();
+        converged.insert("oak".to_string());
+        converged.insert("pine".to_string());
+        // A converged host NOT in the roster never inflates the count (≤ total).
+        converged.insert("ghost".to_string());
+        let c = Convergence::project(2291, "oak".into(), 100, &peers, &converged);
+        assert_eq!(c.head, 2291);
+        assert_eq!(c.converged, 2);
+        assert_eq!(c.total, 3);
+        assert_eq!(c.unconverged, vec!["maple".to_string()]);
+    }
+
+    #[test]
+    fn convergence_note_names_pending_marks_unreachable_and_all_clear() {
+        with_isolated_prefs(|| {
+            let mut fd = FrontDoor::new();
+            let mut maple = mesh_peer("maple", &[]);
+            maple.presence = "offline".into();
+            fd.peers = vec![mesh_peer("oak", &[]), maple];
+            let conv = Convergence {
+                head: 2291,
+                author: "oak".into(),
+                at: 100,
+                converged: 1,
+                total: 2,
+                unconverged: vec!["maple".into()],
+            };
+            // An offline pending peer is honestly marked unreachable.
+            assert_eq!(fd.convergence_note(&conv), "pending: maple (unreachable)");
+            // None pending ⇒ the all-clear note.
+            let all = Convergence {
+                unconverged: vec![],
+                ..conv
+            };
+            assert_eq!(fd.convergence_note(&all), "all peers converged");
+        });
+    }
+
+    #[test]
+    fn overview_cards_omitted_when_sources_empty() {
+        with_isolated_prefs(|| {
+            let fd = FrontDoor::new();
+            // No convergence + no audit ⇒ no card block (honest omit — §7).
+            assert!(fd.overview_cards(crate::live_theme::palette()).is_none());
+        });
+    }
+
+    #[test]
+    fn overview_cards_render_with_real_data() {
+        with_isolated_prefs(|| {
+            let mut fd = FrontDoor::new();
+            fd.peers = vec![mesh_peer("oak", &[]), mesh_peer("pine", &[])];
+            fd.convergence = Some(Convergence {
+                head: 2291,
+                author: "oak".into(),
+                at: 1_715_000_000,
+                converged: 2,
+                total: 2,
+                unconverged: vec![],
+            });
+            fd.audit = vec![crate::panels::audit::AuditEventRow {
+                event_id: 7,
+                timestamp_ms: 1_715_000_000_000,
+                payload: r#"{"kind":"reconcile","node_id":"oak","detail":{"action":"repair_now"}}"#
+                    .into(),
+                hash: "abcd".into(),
+            }];
+            // Both cards present ⇒ the block builds (and the whole view renders).
+            assert!(fd.overview_cards(crate::live_theme::palette()).is_some());
             let _: Element<'_, crate::Message, Theme> = fd.view();
         });
     }
