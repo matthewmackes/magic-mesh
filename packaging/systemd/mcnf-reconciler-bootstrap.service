@@ -1,0 +1,23 @@
+# DAR-28/DAR-30 — ensure the reconciler's durable-state prefix exists in etcd
+# (/reconciler/*) before either reconcile timer fires. A fresh control VM has an
+# empty /reconciler/*; this oneshot touches the .init sentinel (idempotent) so the
+# first --status / backoffice-status read sees a present-but-empty prefix rather
+# than mistaking it for a fault. Ordered Before the timers by reconciler-up.sh's
+# install (the timers Want this). Reads MCNF_ETCD from /etc/mcnf/reconciler.env
+# (rendered by render-env.sh — the live quorum, never the dead .192:2379).
+[Unit]
+Description=MCNF reconciler — ensure the etcd /reconciler/* state prefix
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/mcnf/reconciler.env
+WorkingDirectory=/opt/mcnf
+ExecStart=/bin/bash -lc 'exec automation/reconciler/reconciler-state.sh ensure-prefix'
+# A transient etcd hiccup must not wedge the timers — best-effort.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target
