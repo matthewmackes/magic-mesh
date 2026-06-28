@@ -16,7 +16,9 @@ use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use cosmic::iced::widget::{column, container, mouse_area, row, scrollable, text, text_input};
+use cosmic::iced::widget::{
+    column, container, mouse_area, pick_list, row, scrollable, text, text_input,
+};
 use cosmic::iced::{Length, Task};
 use cosmic::Element;
 use mde_theme::animation::{lerp_f32, slide_in, Animator};
@@ -832,6 +834,300 @@ impl VersionMatrix {
     }
 }
 
+// ── DATACENTER-8/1813 — per-kind sub-tabs within a zone ───────────────────────
+
+/// The per-kind sub-tabs the Zone view splits its single card grid into (the
+/// DATACENTER-8/1813 "Hosts / VMs / Storage / Network within the zone" lock).
+/// Each tab maps to the resource `kind`s it shows; the Zone view filters the
+/// rendered cards to the active tab on top of the zone + global search. Pure +
+/// testable — `matches` is a total function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindTab {
+    Hosts,
+    Vms,
+    Storage,
+    Network,
+}
+
+impl KindTab {
+    /// The four sub-tabs in render order.
+    #[must_use]
+    pub const fn all() -> [KindTab; 4] {
+        [
+            KindTab::Hosts,
+            KindTab::Vms,
+            KindTab::Storage,
+            KindTab::Network,
+        ]
+    }
+
+    /// The sub-tab's button label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            KindTab::Hosts => "Hosts",
+            KindTab::Vms => "VMs",
+            KindTab::Storage => "Storage",
+            KindTab::Network => "Network",
+        }
+    }
+
+    /// A stable lowercase slug — persisted inside a saved view alongside the
+    /// [`ViewMode`] slug so a restored Zone view lands on the same sub-tab.
+    #[must_use]
+    pub const fn slug(self) -> &'static str {
+        match self {
+            KindTab::Hosts => "hosts",
+            KindTab::Vms => "vms",
+            KindTab::Storage => "storage",
+            KindTab::Network => "network",
+        }
+    }
+
+    /// Recover a sub-tab from its slug; an unknown/empty slug falls back to VMs
+    /// (the busiest tab) rather than dropping the saved view. Pure.
+    #[must_use]
+    pub fn from_slug(slug: &str) -> KindTab {
+        match slug {
+            "hosts" => KindTab::Hosts,
+            "storage" => KindTab::Storage,
+            "network" => KindTab::Network,
+            _ => KindTab::Vms,
+        }
+    }
+
+    /// Whether a resource of `kind` belongs under this sub-tab. The compute tab
+    /// (VMs) holds both Xen `vm`s and Prod `droplet`s; Storage holds SRs / VDIs /
+    /// ISOs; Network holds nets / PIFs / VLANs; Hosts holds the dom0 `host`s.
+    /// Pure + total.
+    #[must_use]
+    pub fn matches(self, kind: &str) -> bool {
+        match self {
+            KindTab::Hosts => kind == "host",
+            KindTab::Vms => kind == "vm" || kind == "droplet",
+            KindTab::Storage => matches!(kind, "sr" | "vdi" | "iso"),
+            KindTab::Network => matches!(kind, "net" | "pif" | "vlan"),
+        }
+    }
+}
+
+/// DATACENTER-16 — one host wake/power phase as last seen on the Bus
+/// (`event/dc/power/<host>`). The energy-aware power worker times each wake
+/// (WOL/IPMI → dom0 ready), keeps a rolling per-host average, and publishes the
+/// live phase + percent-complete + a learned ETA. The Hosts tab renders these as a
+/// phased progress bar (POST → XCP → toolstack) with a live ETA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PowerStatus {
+    /// The host (dom0 IP) being woken.
+    pub host: String,
+    /// The current phase — "post" | "xcp" | "toolstack" | "ready" (or empty).
+    pub phase: String,
+    /// Percent-complete (0..=100) as a string; parsed defensively.
+    pub pct: String,
+    /// The live ETA-to-ready in seconds as a string (empty when unknown).
+    pub eta_secs: String,
+}
+
+impl PowerStatus {
+    /// The percent-complete clamped to 0..=100, or 0 when the field is missing /
+    /// unparseable. Drives the progress bar fill. Pure.
+    #[must_use]
+    pub fn pct_clamped(&self) -> u8 {
+        // Parse → clamp into 0..=100; the clamped value always fits a u8.
+        let v = self.pct.parse::<u32>().unwrap_or(0).min(100);
+        u8::try_from(v).unwrap_or(100)
+    }
+
+    /// A human phase label for the progress bar caption. Pure.
+    #[must_use]
+    pub fn phase_label(&self) -> &'static str {
+        match self.phase.as_str() {
+            "post" => "POST",
+            "xcp" => "XCP boot",
+            "toolstack" => "toolstack",
+            "ready" => "ready",
+            _ => "waking",
+        }
+    }
+}
+
+/// Parse one `event/dc/power/<host>` body into a [`PowerStatus`]. Returns `None`
+/// for unparseable JSON or a body missing the `host` field. Pure + testable.
+#[must_use]
+pub fn parse_power_event(body: &str) -> Option<PowerStatus> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("gone").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    let host = v.get("host")?.as_str()?.to_string();
+    let phase = v
+        .get("phase")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let pct = v
+        .get("pct")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let eta_secs = v
+        .get("eta_secs")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(PowerStatus {
+        host,
+        phase,
+        pct,
+        eta_secs,
+    })
+}
+
+/// Project the `event/dc/power/*` topics into power-status rows, sorted by host
+/// for a stable render. A host that has reached `ready` is dropped (its wake is
+/// done — no lingering 100% bar). Pure + testable.
+#[must_use]
+pub fn project_power(events: &[(String, String)]) -> Vec<PowerStatus> {
+    let mut rows: Vec<PowerStatus> = events
+        .iter()
+        .filter(|(topic, _)| topic.starts_with("event/dc/power/"))
+        .filter_map(|(_, body)| parse_power_event(body))
+        .filter(|p| p.phase != "ready")
+        .collect();
+    rows.sort_by(|a, b| a.host.cmp(&b.host));
+    rows
+}
+
+/// DATACENTER-13 — one correlated row from the unified `action/dc/ipdns` read: a
+/// single host seen across the three name/address sources — the UniFi DHCP lease,
+/// the DigitalOcean DNS record, and the Nebula overlay IP. Empty fields render as
+/// "—". Pure data.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IpDnsEntry {
+    /// The host's name (the join key across the three sources).
+    pub name: String,
+    /// The UniFi DHCP lease address, or empty when the host has no lease.
+    pub lease_ip: String,
+    /// The DigitalOcean DNS record, or empty when there is none.
+    pub dns: String,
+    /// The Nebula overlay IP, or empty when the host isn't on the overlay.
+    pub overlay_ip: String,
+}
+
+/// Parse the `action/dc/ipdns` reply's `entries` array into [`IpDnsEntry`] rows.
+/// Tolerant: each entry's fields default to empty; a non-array / absent `entries`
+/// yields an empty list. Pure + testable.
+#[must_use]
+pub fn parse_ipdns(v: &serde_json::Value) -> Vec<IpDnsEntry> {
+    let Some(arr) = v.get("entries").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let field = |e: &serde_json::Value, k: &str| {
+        e.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    arr.iter()
+        .map(|e| IpDnsEntry {
+            name: field(e, "name"),
+            lease_ip: field(e, "lease_ip"),
+            dns: field(e, "dns"),
+            overlay_ip: field(e, "overlay_ip"),
+        })
+        .collect()
+}
+
+/// DATACENTER-19 — one DigitalOcean region from the `action/dc/do-regions` read.
+/// The region picker shows the slug + human name + availability; the geo group
+/// (inferred from the slug prefix) drives the multi-region-spread nudge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoRegion {
+    /// The region slug (e.g. `nyc3`) — the only knob for the fixed lighthouse
+    /// profile.
+    pub slug: String,
+    /// The human region name (e.g. `New York 3`).
+    pub name: String,
+    /// Whether DigitalOcean currently allows new droplets in this region.
+    pub available: bool,
+}
+
+impl DoRegion {
+    /// The geo group inferred from the slug's datacenter prefix (the letters before
+    /// the trailing digit — `nyc3` → `nyc`). Two lighthouses in different groups is
+    /// the spread the picker nudges toward. Pure.
+    #[must_use]
+    pub fn geo(&self) -> String {
+        self.slug
+            .trim_end_matches(|c: char| c.is_ascii_digit())
+            .to_string()
+    }
+}
+
+/// Parse the `action/dc/do-regions` reply's `regions` array into [`DoRegion`]s,
+/// sorted by slug for a stable picker. Tolerant: a region missing `slug` is
+/// dropped; `name` defaults to the slug; `available` defaults to true. Pure +
+/// testable.
+#[must_use]
+pub fn parse_do_regions(v: &serde_json::Value) -> Vec<DoRegion> {
+    let Some(arr) = v.get("regions").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<DoRegion> = arr
+        .iter()
+        .filter_map(|e| {
+            let slug = e.get("slug").and_then(serde_json::Value::as_str)?.to_string();
+            let name = e
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&slug)
+                .to_string();
+            let available = e
+                .get("available")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            Some(DoRegion {
+                slug,
+                name,
+                available,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.slug.cmp(&b.slug));
+    out
+}
+
+/// DATACENTER-19 — the count of distinct geo groups across a set of chosen region
+/// slugs. The picker nudges toward a multi-region spread: ≥2 groups for the (soon
+/// two) lighthouses. Pure + testable.
+#[must_use]
+pub fn distinct_geos(slugs: &[String]) -> usize {
+    let mut geos: Vec<String> = slugs
+        .iter()
+        .map(|s| {
+            s.trim_end_matches(|c: char| c.is_ascii_digit())
+                .to_string()
+        })
+        .collect();
+    geos.sort();
+    geos.dedup();
+    geos.len()
+}
+
+/// Render a fixed-width text progress bar for a 0..=100 percent — eight filled
+/// (`█`) / empty (`░`) cells. Token-free (pure text; the caller colors it with a
+/// palette token), so it composes into any text element. Pure + testable.
+#[must_use]
+pub fn progress_bar(pct: u8) -> String {
+    const CELLS: usize = 8;
+    let filled = ((usize::from(pct.min(100)) * CELLS) / 100).min(CELLS);
+    let mut s = String::with_capacity(CELLS);
+    for i in 0..CELLS {
+        s.push(if i < filled { '\u{2588}' } else { '\u{2591}' });
+    }
+    s
+}
+
 #[derive(Debug, Clone)]
 pub struct DatacenterPanel {
     pub rows: Vec<DcRow>,
@@ -955,6 +1251,96 @@ pub struct DatacenterPanel {
     /// panel's lazy-load convention); subsequent reloads are ignored so a Bus
     /// refresh never clobbers in-memory saved-view edits.
     pub views_loaded: bool,
+
+    // ── DATACENTER-8/1813 — per-kind sub-tabs ─────────────────────────────────
+    /// Which per-kind sub-tab the Zone view shows (Hosts / VMs / Storage /
+    /// Network). The card grid is filtered to this tab on top of the zone +
+    /// search. Defaults to VMs (the busiest tab).
+    pub kind_tab: KindTab,
+
+    // ── DATACENTER-11 — VM lifecycle (suspend / migrate / console / bulk / create)
+    /// When `Some((uuid, dom0))`, a VM migrate is being targeted — the row renders
+    /// a host picker + Confirm/Cancel; only Confirm fires `action/dc/vm-migrate`.
+    pub migrate: Option<(String, String)>,
+    /// The migrate target host picked in the dropdown (a dom0 IP), or `None`.
+    pub migrate_target: Option<String>,
+    /// DATACENTER-11 — whether the VMs tab is in multi-select bulk mode. Each VM
+    /// card then renders a Select toggle and a bulk action bar appears.
+    pub bulk_mode: bool,
+    /// The set of VM uuids selected for a bulk action.
+    pub bulk_sel: BTreeSet<String>,
+    /// Per-item bulk progress, keyed by uuid → a short status word ("ok" /
+    /// "error" / "…"). Populated from the `action/dc/vm-bulk` reply's per-item
+    /// results so the operator sees which VMs succeeded.
+    pub bulk_progress: std::collections::BTreeMap<String, String>,
+    /// DATACENTER-11 — the golden-template create wizard form, open when `true`.
+    pub create_open: bool,
+    /// The golden template name the new VM clones from.
+    pub create_template: String,
+    /// The new VM's name.
+    pub create_name: String,
+
+    // ── DATACENTER-10/16 — host lifecycle + energy-aware power ────────────────
+    /// When `Some((host, op))`, a destructive host op (evacuate) is awaiting
+    /// confirmation — only Confirm fires the RPC.
+    pub host_confirm: Option<(String, String)>,
+    /// When `Some((host, vms))`, a host patch impact-preview is shown — the VMs
+    /// that would move (evacuate-first) before the patch proceeds.
+    pub host_patch_preview: Option<(String, Vec<String>)>,
+    /// DATACENTER-16 — the idle-shutdown policy master toggle (a host with zero
+    /// running VMs auto-powers-down when on).
+    pub idle_policy_on: bool,
+    /// DATACENTER-16 — live host wake/power phases read off `event/dc/power/*`,
+    /// rendered as phased progress bars on the Hosts tab. Refreshed each load.
+    pub power: Vec<PowerStatus>,
+
+    // ── DATACENTER-12 — storage ───────────────────────────────────────────────
+    /// The scheduled-snapshot retention (count) input for an SR.
+    pub sr_retention: String,
+    /// When `Some(sr)`, an SR destroy is awaiting confirmation.
+    pub sr_confirm_destroy: Option<String>,
+
+    // ── DATACENTER-13 — network + unified IP/DNS ──────────────────────────────
+    /// The VLAN tag input for the `action/dc/vlan-set` control.
+    pub vlan_input: String,
+    /// The correlated UniFi-lease ↔ DO-DNS ↔ overlay-IP rows from the last
+    /// `action/dc/ipdns` read, rendered as a unified table on the Network tab.
+    pub ipdns: Vec<IpDnsEntry>,
+
+    // ── DATACENTER-14 — gateway firewall / port-forward edits ─────────────────
+    /// The firewall-rule text being authored for `action/dc/gateway-firewall`.
+    pub gw_fw_rule: String,
+    /// The port-forward text being authored for `action/dc/gateway-portforward`.
+    pub gw_pf_fwd: String,
+
+    // ── DATACENTER-15 — Tofu prod-arm + persisted run-log ─────────────────────
+    /// The prod-arm master switch — Tofu apply against the Prod (zone1-do)
+    /// workspace is refused while disarmed (DATACENTER-15/20 prod guardrail).
+    pub tofu_armed: bool,
+    /// The persisted run-log text from the last `action/dc/tofu-runlog` read.
+    pub tofu_runlog: String,
+
+    // ── DATACENTER-20 — promotion controls ────────────────────────────────────
+    /// Auto-promote-on-green toggle (Build→Eagle advances automatically).
+    pub auto_promote: bool,
+    /// The DO-step prod-arm toggle (armed = green auto-promotes to DO).
+    pub promote_armed: bool,
+
+    // ── DATACENTER-18/19/21 — provisioning (regions / genesis / test-mesh) ────
+    /// The DO regions from the last `action/dc/do-regions` read (region picker).
+    pub do_regions: Vec<DoRegion>,
+    /// The region slug picked for the guided new-lighthouse flow.
+    pub region_slug: Option<String>,
+    /// The new-mesh (genesis) name input.
+    pub genesis_name: String,
+    /// The new-mesh (genesis) region picked.
+    pub genesis_region: Option<String>,
+    /// The N-node count input for the ephemeral test-mesh spin.
+    pub testmesh_n: String,
+    /// The desired build-VM count input for the farm-scale control.
+    pub farm_scale_n: String,
+    /// A shared status line for the Provision view's long-running flows.
+    pub provision_status: String,
 }
 
 /// Top-level view selector for the datacenter panel.
@@ -971,6 +1357,13 @@ pub enum ViewMode {
     /// The structured infrastructure map: resources grouped by their owning
     /// host/zone, with collapsible host group headers (DATACENTER-13).
     Topology,
+    /// DATACENTER-14 — the UniFi gateway controls (status + firewall + port-
+    /// forward edits + reboot).
+    Gateway,
+    /// DATACENTER-18/19/21 — provisioning flows: the DO region picker + guided
+    /// new-lighthouse, the New-Mesh genesis wizard, and the ephemeral test-mesh +
+    /// build-farm scale controls.
+    Provision,
 }
 
 impl ViewMode {
@@ -985,6 +1378,8 @@ impl ViewMode {
             ViewMode::Tofu => "tofu",
             ViewMode::Audit => "audit",
             ViewMode::Topology => "topology",
+            ViewMode::Gateway => "gateway",
+            ViewMode::Provision => "provision",
         }
     }
 
@@ -999,6 +1394,8 @@ impl ViewMode {
             "tofu" => ViewMode::Tofu,
             "audit" => ViewMode::Audit,
             "topology" => ViewMode::Topology,
+            "gateway" => ViewMode::Gateway,
+            "provision" => ViewMode::Provision,
             // "overview" and anything unknown.
             _ => ViewMode::Overview,
         }
@@ -1188,6 +1585,36 @@ impl Default for DatacenterPanel {
             saved_views: SavedViews::default(),
             save_view_name: String::new(),
             views_loaded: false,
+            kind_tab: KindTab::Vms,
+            migrate: None,
+            migrate_target: None,
+            bulk_mode: false,
+            bulk_sel: BTreeSet::new(),
+            bulk_progress: std::collections::BTreeMap::new(),
+            create_open: false,
+            create_template: String::new(),
+            create_name: String::new(),
+            host_confirm: None,
+            host_patch_preview: None,
+            idle_policy_on: false,
+            power: Vec::new(),
+            sr_retention: String::new(),
+            sr_confirm_destroy: None,
+            vlan_input: String::new(),
+            ipdns: Vec::new(),
+            gw_fw_rule: String::new(),
+            gw_pf_fwd: String::new(),
+            tofu_armed: false,
+            tofu_runlog: String::new(),
+            auto_promote: false,
+            promote_armed: false,
+            do_regions: Vec::new(),
+            region_slug: None,
+            genesis_name: String::new(),
+            genesis_region: None,
+            testmesh_n: String::new(),
+            farm_scale_n: String::new(),
+            provision_status: String::new(),
         }
     }
 }
@@ -1210,6 +1637,10 @@ pub struct DcLoad {
     /// verbs for the "Recent Tofu runs" run-log on the Overview view. Refreshed
     /// alongside `rows` on every load.
     pub jobs: Vec<JobRow>,
+    /// DATACENTER-16 — the live host wake/power phases read off `event/dc/power/*`.
+    /// Rendered as phased progress bars on the Hosts tab. Refreshed alongside
+    /// `rows` on every load.
+    pub power: Vec<PowerStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -1350,6 +1781,199 @@ pub enum Message {
     /// be read), which is surfaced rather than silently emptied — so a later save
     /// can't overwrite a still-on-disk file. Only the FIRST load is applied.
     SavedViewsLoaded(Result<SavedViews, String>),
+
+    // ── DATACENTER-8/1813 — per-kind sub-tabs ─────────────────────────────────
+    /// Switch the Zone view's per-kind sub-tab (Hosts / VMs / Storage / Network).
+    KindTab(KindTab),
+
+    // ── DATACENTER-11 — VM lifecycle ──────────────────────────────────────────
+    /// A VM Suspend (or Resume, when `resume`) button — fires `action/dc/vm-suspend`
+    /// / `action/dc/vm-resume`.
+    SuspendClicked {
+        uuid: String,
+        dom0: String,
+        resume: bool,
+    },
+    /// The vm-suspend / vm-resume RPC came back.
+    SuspendDone(Result<String, String>),
+    /// A VM Migrate button — arms the target picker for this VM (no RPC yet).
+    MigrateClicked {
+        uuid: String,
+        dom0: String,
+    },
+    /// The migrate target host was picked in the dropdown.
+    MigrateTargetPicked(String),
+    /// The migrate Confirm button — fires `action/dc/vm-migrate {uuid,target_host}`.
+    MigrateConfirmed,
+    /// The migrate target picker was dismissed.
+    MigrateCancelled,
+    /// The vm-migrate RPC came back.
+    MigrateDone(Result<String, String>),
+    /// A VM Console button — fires `action/dc/vm-console {uuid}` → a noVNC URL,
+    /// opened via `xdg-open`.
+    VmConsoleClicked {
+        uuid: String,
+        dom0: String,
+    },
+    /// The vm-console RPC came back — `Ok(url)` is opened in the browser.
+    VmConsoleDone(Result<String, String>),
+    /// Toggle the VMs tab's multi-select bulk mode on/off.
+    BulkModeToggled,
+    /// Toggle a VM uuid's membership in the bulk selection.
+    BulkSelectToggled(String),
+    /// A bulk action button — fires `action/dc/vm-bulk {uuids[],op}` for the
+    /// selected VMs (op = "start" | "shutdown" | "snapshot" | "tag").
+    BulkOp(String),
+    /// The vm-bulk RPC came back — `Ok` carries the per-item `(uuid,status)` results.
+    BulkDone(Result<Vec<(String, String)>, String>),
+    /// Open / close the golden-template create wizard.
+    CreateToggled,
+    /// The create wizard's template field changed.
+    CreateTemplateChanged(String),
+    /// The create wizard's name field changed.
+    CreateNameChanged(String),
+    /// The create Submit button — fires `action/dc/vm-create {template,name,zone}`.
+    CreateSubmit,
+    /// The vm-create RPC came back.
+    CreateDone(Result<String, String>),
+
+    // ── DATACENTER-10/16 — host lifecycle + power ─────────────────────────────
+    /// A host maintenance / reboot button — fires `action/dc/host-power {host,op}`
+    /// (op = "maintenance-on" | "maintenance-off" | "reboot").
+    HostPowerClicked {
+        host: String,
+        op: String,
+    },
+    /// A host Evacuate button — arms the confirm (no RPC yet).
+    HostEvacuateClicked(String),
+    /// A host Patch button — fetches the impact preview, then `action/dc/host-patch`.
+    HostPatchClicked(String),
+    /// The host-patch impact preview came back (`(host, vms-that-would-move)`).
+    HostPatchPreviewDone(Result<(String, Vec<String>), String>),
+    /// A host pool op — fires `action/dc/host-pool {op,host}` (op = "join" |
+    /// "eject" | "designate-master").
+    HostPoolClicked {
+        host: String,
+        op: String,
+    },
+    /// A host SSH console button — launches a terminal to the host (reuses the
+    /// shared launcher).
+    HostConsoleClicked(String),
+    /// An IPMI op button — fires `action/dc/power-ipmi {host,op}` (op = "on" |
+    /// "off" | "cycle" | "status").
+    PowerIpmiClicked {
+        host: String,
+        op: String,
+    },
+    /// Toggle the idle-shutdown policy — fires `action/dc/host-idle-policy {on}`.
+    IdlePolicyToggled,
+    /// The host-confirm Confirm button (evacuate) — fires the armed RPC.
+    HostConfirmed,
+    /// The host-confirm / patch-preview was dismissed.
+    HostCancelled,
+    /// A generic host-action RPC came back (evacuate / patch / pool / ipmi /
+    /// idle-policy).
+    HostActionDone(Result<String, String>),
+
+    // ── DATACENTER-12 — storage ───────────────────────────────────────────────
+    /// An SR create button — fires `action/dc/sr-create`.
+    SrCreateClicked,
+    /// An SR destroy button — arms the confirm (no RPC yet).
+    SrDestroyClicked(String),
+    /// The SR destroy Confirm button — fires `action/dc/sr-destroy`.
+    SrDestroyConfirmed(String),
+    /// The SR destroy was dismissed.
+    SrDestroyCancelled,
+    /// A VDI attach / detach button — fires `action/dc/vdi-attach` / `vdi-detach`.
+    VdiClicked {
+        sr: String,
+        attach: bool,
+    },
+    /// The scheduled-snapshot retention input changed.
+    SrRetentionChanged(String),
+    /// The Schedule button — fires `action/dc/sr-snapshot-schedule {sr,retention}`.
+    SrScheduleClicked(String),
+    /// A generic storage-action RPC came back.
+    StorageActionDone(Result<String, String>),
+
+    // ── DATACENTER-13 — network + IP/DNS ──────────────────────────────────────
+    /// A network create button — fires `action/dc/net-create`.
+    NetCreateClicked,
+    /// The VLAN tag input changed.
+    VlanInputChanged(String),
+    /// The VLAN set button — fires `action/dc/vlan-set {net,vlan}`.
+    VlanSetClicked(String),
+    /// A PIF config button — fires `action/dc/pif-config {net}`.
+    PifConfigClicked(String),
+    /// The "Refresh IP/DNS" button — fires `action/dc/ipdns`.
+    IpDnsRefresh,
+    /// The ipdns RPC came back — the correlated lease/DNS/overlay rows.
+    IpDnsDone(Result<Vec<IpDnsEntry>, String>),
+    /// A generic network-action RPC came back.
+    NetActionDone(Result<String, String>),
+
+    // ── DATACENTER-14 — gateway edits ─────────────────────────────────────────
+    /// The gateway firewall-rule input changed.
+    GwFwRuleChanged(String),
+    /// The Add-firewall-rule button — fires `action/dc/gateway-firewall {rule}`.
+    GwFirewallClicked,
+    /// The gateway port-forward input changed.
+    GwPfFwdChanged(String),
+    /// The Add-port-forward button — fires `action/dc/gateway-portforward {fwd}`.
+    GwPortForwardClicked,
+    /// The gateway Reboot button — fires `action/dc/gateway-reboot` (confirm-gated
+    /// reuse of the host-confirm path).
+    GwRebootClicked,
+    /// A generic gateway-action RPC came back.
+    GwActionDone(Result<String, String>),
+
+    // ── DATACENTER-15 — Tofu prod-arm + run-log ───────────────────────────────
+    /// Toggle the prod-arm master switch — fires `action/dc/tofu-arm {on}`.
+    TofuArmToggled,
+    /// The tofu-arm RPC came back (`Ok(armed)`).
+    TofuArmDone(Result<bool, String>),
+    /// A workspace Run-log button — fires `action/dc/tofu-runlog {workspace}`.
+    TofuRunlogClicked(String),
+    /// The tofu-runlog RPC came back — the persisted log text.
+    TofuRunlogDone(Result<String, String>),
+
+    // ── DATACENTER-20 — promotion controls ────────────────────────────────────
+    /// Toggle auto-promote-on-green — fires `action/dc/promote-arm {on}` (auto).
+    AutoPromoteToggled,
+    /// Toggle the DO-step prod-arm — fires `action/dc/promote-arm {on}` (prod).
+    PromoteArmToggled,
+    /// The "Promote now" button — fires `action/dc/promote-now`.
+    PromoteNowClicked,
+    /// A promote-control RPC came back (`Ok(state-summary)`).
+    PromoteCtlDone(Result<String, String>),
+
+    // ── DATACENTER-18/19/21 — provisioning ────────────────────────────────────
+    /// The "Load regions" button — fires `action/dc/do-regions`.
+    RegionsRefresh,
+    /// The do-regions RPC came back.
+    RegionsDone(Result<Vec<DoRegion>, String>),
+    /// A DO region was picked for the guided new-lighthouse flow.
+    RegionPicked(String),
+    /// The "Guided new lighthouse" button — fires `action/dc/do-guided-lighthouse`.
+    GuidedLighthouseClicked,
+    /// The genesis name input changed.
+    GenesisNameChanged(String),
+    /// A genesis region was picked.
+    GenesisRegionPicked(String),
+    /// The genesis "Give birth" button — fires `action/dc/genesis-new-mesh`.
+    GenesisSubmit,
+    /// The test-mesh N-node input changed.
+    TestmeshNChanged(String),
+    /// The test-mesh Spin button — fires `action/dc/testmesh-spin {n}`.
+    TestmeshSpinClicked,
+    /// A test-mesh Teardown button — fires `action/dc/testmesh-teardown {id}`.
+    TestmeshTeardownClicked(String),
+    /// The farm-scale count input changed.
+    FarmScaleChanged(String),
+    /// The farm-scale Apply button — fires `action/dc/farm-scale {count}`.
+    FarmScaleClicked,
+    /// A generic provisioning-action RPC came back.
+    ProvisionDone(Result<String, String>),
 }
 
 impl DatacenterPanel {
@@ -1400,6 +2024,7 @@ impl DatacenterPanel {
                 self.promote = load.promote;
                 self.health = load.health;
                 self.jobs = load.jobs;
+                self.power = load.power;
                 self.busy = false;
                 self.load_error = None;
                 self.status.clear();
@@ -1538,6 +2163,14 @@ impl DatacenterPanel {
                 Task::none()
             }
             Message::TofuApply(ws) => {
+                // DATACENTER-15 prod guardrail — a Prod (zone1-do) apply is refused
+                // while the prod-arm master switch is disarmed.
+                if ws == "zone1-do" && !self.tofu_armed {
+                    self.tofu_confirm = None;
+                    self.status =
+                        "Prod is disarmed — arm prod (Tofu tab) before applying zone1-do.".into();
+                    return Task::none();
+                }
                 self.tofu_confirm = None;
                 self.status = format!("Applying {ws}…");
                 self.tofu_output = format!("Applying {ws}…");
@@ -1794,7 +2427,671 @@ impl DatacenterPanel {
                 }
                 Task::none()
             }
+
+            // ── DATACENTER-8/1813 — per-kind sub-tabs ─────────────────────────
+            Message::KindTab(t) => {
+                self.kind_tab = t;
+                // Leaving the VMs tab drops any in-progress bulk selection so a
+                // stale set can't act on the wrong tab.
+                if t != KindTab::Vms {
+                    self.bulk_mode = false;
+                    self.bulk_sel.clear();
+                }
+                Task::none()
+            }
+
+            // ── DATACENTER-11 — VM lifecycle ──────────────────────────────────
+            Message::SuspendClicked {
+                uuid,
+                dom0,
+                resume,
+            } => {
+                self.status = if resume { "Resuming…" } else { "Suspending…" }.into();
+                let verb = if resume { "vm-resume" } else { "vm-suspend" };
+                self.run_action(
+                    verb,
+                    serde_json::json!({"uuid": uuid, "dom0": dom0}),
+                    Duration::from_secs(60),
+                    Message::SuspendDone,
+                )
+            }
+            Message::SuspendDone(r) => {
+                self.status = flatten(r);
+                Task::none()
+            }
+            Message::MigrateClicked { uuid, dom0 } => {
+                self.migrate = Some((uuid, dom0));
+                self.migrate_target = None;
+                self.status = "Pick a migrate target host.".into();
+                Task::none()
+            }
+            Message::MigrateTargetPicked(h) => {
+                self.migrate_target = Some(h);
+                Task::none()
+            }
+            Message::MigrateConfirmed => {
+                let Some((uuid, _dom0)) = self.migrate.clone() else {
+                    return Task::none();
+                };
+                let Some(target) = self.migrate_target.clone() else {
+                    self.status = "Pick a target host first.".into();
+                    return Task::none();
+                };
+                self.migrate = None;
+                self.migrate_target = None;
+                self.status = format!("Migrating to {target}…");
+                self.run_action(
+                    "vm-migrate",
+                    serde_json::json!({"uuid": uuid, "target_host": target}),
+                    Duration::from_secs(600),
+                    Message::MigrateDone,
+                )
+            }
+            Message::MigrateCancelled => {
+                self.migrate = None;
+                self.migrate_target = None;
+                self.status.clear();
+                Task::none()
+            }
+            Message::MigrateDone(r) => {
+                self.status = flatten(r);
+                Task::none()
+            }
+            Message::VmConsoleClicked { uuid, dom0 } => {
+                self.status = "Opening console…".into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || vm_console(&uuid, &dom0))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("console task panicked: {e}")))
+                    },
+                    |r| crate::Message::Datacenter(Message::VmConsoleDone(r)),
+                )
+            }
+            Message::VmConsoleDone(Ok(url)) => {
+                // Open the noVNC console URL in the browser (detached, best-effort —
+                // a missing xdg-open simply no-ops).
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(&url)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                self.status = format!("console: {url}");
+                Task::none()
+            }
+            Message::VmConsoleDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::BulkModeToggled => {
+                self.bulk_mode = !self.bulk_mode;
+                if !self.bulk_mode {
+                    self.bulk_sel.clear();
+                }
+                self.bulk_progress.clear();
+                Task::none()
+            }
+            Message::BulkSelectToggled(uuid) => {
+                if !self.bulk_sel.remove(&uuid) {
+                    self.bulk_sel.insert(uuid);
+                }
+                Task::none()
+            }
+            Message::BulkOp(op) => {
+                if self.bulk_sel.is_empty() {
+                    self.status = "No VMs selected.".into();
+                    return Task::none();
+                }
+                let uuids: Vec<String> = self.bulk_sel.iter().cloned().collect();
+                // Seed per-item progress so each selected VM reads "…" until its
+                // result lands.
+                self.bulk_progress = uuids.iter().map(|u| (u.clone(), "…".to_string())).collect();
+                self.status = format!("Bulk {op} on {} VM(s)…", uuids.len());
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || vm_bulk(&uuids, &op))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("bulk task panicked: {e}")))
+                    },
+                    |r| crate::Message::Datacenter(Message::BulkDone(r)),
+                )
+            }
+            Message::BulkDone(Ok(results)) => {
+                for (uuid, status) in results {
+                    self.bulk_progress.insert(uuid, status);
+                }
+                self.status = "Bulk action complete".into();
+                Task::none()
+            }
+            Message::BulkDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::CreateToggled => {
+                self.create_open = !self.create_open;
+                Task::none()
+            }
+            Message::CreateTemplateChanged(v) => {
+                self.create_template = v;
+                Task::none()
+            }
+            Message::CreateNameChanged(v) => {
+                self.create_name = v;
+                Task::none()
+            }
+            Message::CreateSubmit => {
+                let template = self.create_template.trim().to_string();
+                let name = self.create_name.trim().to_string();
+                if template.is_empty() || name.is_empty() {
+                    self.status = "Template and name are both required.".into();
+                    return Task::none();
+                }
+                let zone = self.zone_tab.clone();
+                self.status = format!("Creating {name} from {template}…");
+                self.create_open = false;
+                self.run_action(
+                    "vm-create",
+                    serde_json::json!({"template": template, "name": name, "zone": zone}),
+                    Duration::from_secs(600),
+                    Message::CreateDone,
+                )
+            }
+            Message::CreateDone(r) => {
+                self.status = flatten(r);
+                Task::none()
+            }
+
+            // ── DATACENTER-10/16 — host lifecycle + power ─────────────────────
+            Message::HostPowerClicked { host, op } => {
+                self.status = format!("Host {op}…");
+                self.run_action(
+                    "host-power",
+                    serde_json::json!({"host": host, "op": op}),
+                    Duration::from_secs(120),
+                    Message::HostActionDone,
+                )
+            }
+            Message::HostEvacuateClicked(host) => {
+                self.host_confirm = Some((host, "evacuate".to_string()));
+                self.host_patch_preview = None;
+                self.status = "Confirm evacuate below.".into();
+                Task::none()
+            }
+            Message::HostPatchClicked(host) => {
+                self.status = format!("Computing patch impact for {host}…");
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || host_patch_preview(&host))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("patch task panicked: {e}")))
+                    },
+                    |r| crate::Message::Datacenter(Message::HostPatchPreviewDone(r)),
+                )
+            }
+            Message::HostPatchPreviewDone(Ok((host, vms))) => {
+                self.host_patch_preview = Some((host.clone(), vms));
+                self.host_confirm = Some((host, "patch".to_string()));
+                self.status = "Review the patch impact, then Apply.".into();
+                Task::none()
+            }
+            Message::HostPatchPreviewDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::HostPoolClicked { host, op } => {
+                self.status = format!("Pool {op}…");
+                self.run_action(
+                    "host-pool",
+                    serde_json::json!({"host": host, "op": op}),
+                    Duration::from_secs(120),
+                    Message::HostActionDone,
+                )
+            }
+            Message::HostConsoleClicked(host) => {
+                self.status = format!("Opening SSH to {host}…");
+                Task::perform(
+                    async move {
+                        let ok =
+                            crate::launcher::launch(&host, crate::launcher::Protocol::Ssh).await;
+                        if ok {
+                            Ok(format!("opened SSH to {host}"))
+                        } else {
+                            Err(format!("couldn't launch a terminal for {host}"))
+                        }
+                    },
+                    |r| crate::Message::Datacenter(Message::HostActionDone(r)),
+                )
+            }
+            Message::PowerIpmiClicked { host, op } => {
+                self.status = format!("IPMI {op}…");
+                self.run_action(
+                    "power-ipmi",
+                    serde_json::json!({"host": host, "op": op}),
+                    Duration::from_secs(120),
+                    Message::HostActionDone,
+                )
+            }
+            Message::IdlePolicyToggled => {
+                let on = !self.idle_policy_on;
+                self.idle_policy_on = on;
+                self.run_action(
+                    "host-idle-policy",
+                    serde_json::json!({"on": on}),
+                    Duration::from_secs(30),
+                    Message::HostActionDone,
+                )
+            }
+            Message::HostConfirmed => {
+                let Some((host, op)) = self.host_confirm.take() else {
+                    return Task::none();
+                };
+                self.host_patch_preview = None;
+                let verb = if op == "patch" {
+                    "host-patch"
+                } else {
+                    "host-evacuate"
+                };
+                self.status = format!("{op} {host}…");
+                self.run_action(
+                    verb,
+                    serde_json::json!({"host": host, "confirm": true}),
+                    Duration::from_secs(600),
+                    Message::HostActionDone,
+                )
+            }
+            Message::HostCancelled => {
+                self.host_confirm = None;
+                self.host_patch_preview = None;
+                self.status.clear();
+                Task::none()
+            }
+            Message::HostActionDone(r) => {
+                self.status = flatten(r);
+                Task::none()
+            }
+
+            // ── DATACENTER-12 — storage ───────────────────────────────────────
+            Message::SrCreateClicked => {
+                self.status = "Creating SR…".into();
+                self.run_action(
+                    "sr-create",
+                    serde_json::json!({"zone": self.zone_tab}),
+                    Duration::from_secs(120),
+                    Message::StorageActionDone,
+                )
+            }
+            Message::SrDestroyClicked(sr) => {
+                self.sr_confirm_destroy = Some(sr);
+                self.status = "Confirm SR destroy below.".into();
+                Task::none()
+            }
+            Message::SrDestroyConfirmed(sr) => {
+                self.sr_confirm_destroy = None;
+                self.status = format!("Destroying {sr}…");
+                self.run_action(
+                    "sr-destroy",
+                    serde_json::json!({"sr": sr, "confirm": true}),
+                    Duration::from_secs(120),
+                    Message::StorageActionDone,
+                )
+            }
+            Message::SrDestroyCancelled => {
+                self.sr_confirm_destroy = None;
+                self.status.clear();
+                Task::none()
+            }
+            Message::VdiClicked { sr, attach } => {
+                let verb = if attach { "vdi-attach" } else { "vdi-detach" };
+                self.status = if attach {
+                    "Attaching VDI…"
+                } else {
+                    "Detaching VDI…"
+                }
+                .into();
+                self.run_action(
+                    verb,
+                    serde_json::json!({"sr": sr}),
+                    Duration::from_secs(120),
+                    Message::StorageActionDone,
+                )
+            }
+            Message::SrRetentionChanged(v) => {
+                self.sr_retention = v;
+                Task::none()
+            }
+            Message::SrScheduleClicked(sr) => {
+                let retention = self.sr_retention.trim().parse::<u32>().unwrap_or(7);
+                self.status = format!("Scheduling snapshots (keep {retention})…");
+                self.run_action(
+                    "sr-snapshot-schedule",
+                    serde_json::json!({"sr": sr, "retention": retention}),
+                    Duration::from_secs(60),
+                    Message::StorageActionDone,
+                )
+            }
+            Message::StorageActionDone(r) => {
+                self.status = flatten(r);
+                Task::none()
+            }
+
+            // ── DATACENTER-13 — network + IP/DNS ──────────────────────────────
+            Message::NetCreateClicked => {
+                self.status = "Creating network…".into();
+                self.run_action(
+                    "net-create",
+                    serde_json::json!({"zone": self.zone_tab}),
+                    Duration::from_secs(120),
+                    Message::NetActionDone,
+                )
+            }
+            Message::VlanInputChanged(v) => {
+                self.vlan_input = v;
+                Task::none()
+            }
+            Message::VlanSetClicked(net) => {
+                let vlan = self.vlan_input.trim().parse::<u32>().unwrap_or(0);
+                self.status = format!("Setting VLAN {vlan}…");
+                self.run_action(
+                    "vlan-set",
+                    serde_json::json!({"net": net, "vlan": vlan}),
+                    Duration::from_secs(60),
+                    Message::NetActionDone,
+                )
+            }
+            Message::PifConfigClicked(net) => {
+                self.status = "Configuring PIF…".into();
+                self.run_action(
+                    "pif-config",
+                    serde_json::json!({"net": net}),
+                    Duration::from_secs(60),
+                    Message::NetActionDone,
+                )
+            }
+            Message::IpDnsRefresh => {
+                self.status = "Reading IP/DNS…".into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(ipdns_read)
+                            .await
+                            .unwrap_or_else(|e| Err(format!("ipdns task panicked: {e}")))
+                    },
+                    |r| crate::Message::Datacenter(Message::IpDnsDone(r)),
+                )
+            }
+            Message::IpDnsDone(Ok(entries)) => {
+                self.ipdns = entries;
+                self.status = "IP/DNS updated".into();
+                Task::none()
+            }
+            Message::IpDnsDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::NetActionDone(r) => {
+                self.status = flatten(r);
+                Task::none()
+            }
+
+            // ── DATACENTER-14 — gateway edits ─────────────────────────────────
+            Message::GwFwRuleChanged(v) => {
+                self.gw_fw_rule = v;
+                Task::none()
+            }
+            Message::GwFirewallClicked => {
+                let rule = self.gw_fw_rule.trim().to_string();
+                if rule.is_empty() {
+                    self.status = "Enter a firewall rule first.".into();
+                    return Task::none();
+                }
+                self.status = "Adding firewall rule…".into();
+                self.gw_fw_rule.clear();
+                self.run_action(
+                    "gateway-firewall",
+                    serde_json::json!({"rule": rule}),
+                    Duration::from_secs(60),
+                    Message::GwActionDone,
+                )
+            }
+            Message::GwPfFwdChanged(v) => {
+                self.gw_pf_fwd = v;
+                Task::none()
+            }
+            Message::GwPortForwardClicked => {
+                let fwd = self.gw_pf_fwd.trim().to_string();
+                if fwd.is_empty() {
+                    self.status = "Enter a port-forward first.".into();
+                    return Task::none();
+                }
+                self.status = "Adding port-forward…".into();
+                self.gw_pf_fwd.clear();
+                self.run_action(
+                    "gateway-portforward",
+                    serde_json::json!({"fwd": fwd}),
+                    Duration::from_secs(60),
+                    Message::GwActionDone,
+                )
+            }
+            Message::GwRebootClicked => {
+                self.status = "Rebooting gateway…".into();
+                self.run_action(
+                    "gateway-reboot",
+                    serde_json::json!({"confirm": true}),
+                    Duration::from_secs(120),
+                    Message::GwActionDone,
+                )
+            }
+            Message::GwActionDone(r) => {
+                self.status = flatten(r);
+                Task::none()
+            }
+
+            // ── DATACENTER-15 — Tofu prod-arm + run-log ───────────────────────
+            Message::TofuArmToggled => {
+                let on = !self.tofu_armed;
+                self.status = if on { "Arming prod…" } else { "Disarming prod…" }.into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || tofu_arm(on))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("tofu-arm task panicked: {e}")))
+                    },
+                    |r| crate::Message::Datacenter(Message::TofuArmDone(r)),
+                )
+            }
+            Message::TofuArmDone(Ok(armed)) => {
+                self.tofu_armed = armed;
+                self.status = if armed { "Prod armed" } else { "Prod disarmed" }.into();
+                Task::none()
+            }
+            Message::TofuArmDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+            Message::TofuRunlogClicked(ws) => {
+                self.status = format!("Reading {ws} run-log…");
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || tofu_runlog(&ws))
+                            .await
+                            .unwrap_or_else(|e| Err(format!("runlog task panicked: {e}")))
+                    },
+                    |r| crate::Message::Datacenter(Message::TofuRunlogDone(r)),
+                )
+            }
+            Message::TofuRunlogDone(Ok(log)) => {
+                self.tofu_runlog = log;
+                self.status = "Run-log loaded".into();
+                Task::none()
+            }
+            Message::TofuRunlogDone(Err(e)) => {
+                self.status = e;
+                Task::none()
+            }
+
+            // ── DATACENTER-20 — promotion controls ────────────────────────────
+            Message::AutoPromoteToggled => {
+                let on = !self.auto_promote;
+                self.auto_promote = on;
+                self.run_action(
+                    "promote-arm",
+                    serde_json::json!({"auto": on}),
+                    Duration::from_secs(30),
+                    Message::PromoteCtlDone,
+                )
+            }
+            Message::PromoteArmToggled => {
+                let on = !self.promote_armed;
+                self.promote_armed = on;
+                self.run_action(
+                    "promote-arm",
+                    serde_json::json!({"prod": on}),
+                    Duration::from_secs(30),
+                    Message::PromoteCtlDone,
+                )
+            }
+            Message::PromoteNowClicked => {
+                self.status = "Promoting…".into();
+                self.run_action(
+                    "promote-now",
+                    serde_json::json!({}),
+                    Duration::from_secs(300),
+                    Message::PromoteCtlDone,
+                )
+            }
+            Message::PromoteCtlDone(r) => {
+                self.status = flatten(r);
+                Task::none()
+            }
+
+            // ── DATACENTER-18/19/21 — provisioning ────────────────────────────
+            Message::RegionsRefresh => {
+                self.provision_status = "Loading regions…".into();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(do_regions_read)
+                            .await
+                            .unwrap_or_else(|e| Err(format!("regions task panicked: {e}")))
+                    },
+                    |r| crate::Message::Datacenter(Message::RegionsDone(r)),
+                )
+            }
+            Message::RegionsDone(Ok(rs)) => {
+                self.do_regions = rs;
+                self.provision_status = format!("{} region(s) loaded", self.do_regions.len());
+                Task::none()
+            }
+            Message::RegionsDone(Err(e)) => {
+                self.provision_status = e;
+                Task::none()
+            }
+            Message::RegionPicked(s) => {
+                self.region_slug = Some(s);
+                Task::none()
+            }
+            Message::GuidedLighthouseClicked => {
+                let Some(region) = self.region_slug.clone() else {
+                    self.provision_status = "Pick a region first.".into();
+                    return Task::none();
+                };
+                self.provision_status = format!("Provisioning a lighthouse in {region}…");
+                self.run_action(
+                    "do-guided-lighthouse",
+                    serde_json::json!({"region": region}),
+                    Duration::from_secs(600),
+                    Message::ProvisionDone,
+                )
+            }
+            Message::GenesisNameChanged(v) => {
+                self.genesis_name = v;
+                Task::none()
+            }
+            Message::GenesisRegionPicked(s) => {
+                self.genesis_region = Some(s);
+                Task::none()
+            }
+            Message::GenesisSubmit => {
+                let name = self.genesis_name.trim().to_string();
+                let Some(region) = self.genesis_region.clone() else {
+                    self.provision_status = "Pick a region for the new mesh.".into();
+                    return Task::none();
+                };
+                if name.is_empty() {
+                    self.provision_status = "Name the new mesh first.".into();
+                    return Task::none();
+                }
+                self.provision_status = format!("Giving birth to {name} in {region}…");
+                self.run_action(
+                    "genesis-new-mesh",
+                    serde_json::json!({"name": name, "region": region}),
+                    Duration::from_secs(600),
+                    Message::ProvisionDone,
+                )
+            }
+            Message::TestmeshNChanged(v) => {
+                self.testmesh_n = v;
+                Task::none()
+            }
+            Message::TestmeshSpinClicked => {
+                let n = self.testmesh_n.trim().parse::<u32>().unwrap_or(3);
+                self.provision_status = format!("Spinning a {n}-node test mesh…");
+                self.run_action(
+                    "testmesh-spin",
+                    serde_json::json!({"n": n}),
+                    Duration::from_secs(600),
+                    Message::ProvisionDone,
+                )
+            }
+            Message::TestmeshTeardownClicked(id) => {
+                self.provision_status = format!("Tearing down {id}…");
+                self.run_action(
+                    "testmesh-teardown",
+                    serde_json::json!({"id": id}),
+                    Duration::from_secs(300),
+                    Message::ProvisionDone,
+                )
+            }
+            Message::FarmScaleChanged(v) => {
+                self.farm_scale_n = v;
+                Task::none()
+            }
+            Message::FarmScaleClicked => {
+                let count = self.farm_scale_n.trim().parse::<u32>().unwrap_or(2);
+                self.provision_status = format!("Scaling the build farm to {count}…");
+                self.run_action(
+                    "farm-scale",
+                    serde_json::json!({"count": count}),
+                    Duration::from_secs(600),
+                    Message::ProvisionDone,
+                )
+            }
+            Message::ProvisionDone(r) => {
+                self.provision_status = flatten(r);
+                Task::none()
+            }
         }
+    }
+
+    /// Fire a datacenter action verb on a blocking thread and route the ok/err
+    /// status string back through `done`. Shared by the many "click → RPC →
+    /// status" handlers so each arm stays a one-liner (§6 — no per-verb copy of the
+    /// `spawn_blocking` + [`dc_action`] boilerplate). `verb` is a `'static` literal
+    /// so it captures cleanly into the async block.
+    fn run_action(
+        &self,
+        verb: &'static str,
+        body: serde_json::Value,
+        timeout: Duration,
+        done: fn(Result<String, String>) -> Message,
+    ) -> Task<crate::Message> {
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || dc_action(verb, &body, timeout))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("{verb} task panicked: {e}")))
+            },
+            move |r| crate::Message::Datacenter(done(r)),
+        )
     }
 
     /// MOTION-FEEDBACK-2 — stamp the card-grid reveal origin and arm the motion
@@ -2028,6 +3325,8 @@ impl DatacenterPanel {
             mode_btn("Topology", ViewMode::Topology),
             mode_btn("Resources", ViewMode::Zone),
             mode_btn("Tofu", ViewMode::Tofu),
+            mode_btn("Gateway", ViewMode::Gateway),
+            mode_btn("Provision", ViewMode::Provision),
             mode_btn("Audit", ViewMode::Audit),
             refresh_btn,
         ]
@@ -2108,6 +3407,51 @@ impl DatacenterPanel {
                 // ones show "—") so the pipeline reads left-to-right.
                 col = col.push(text("Promotion").size(f32::from(spacing::BASE[5])));
                 col = col.push(promote_strip_view(&self.promote, palette));
+                // DATACENTER-20 — promotion controls: auto-promote-on-green +
+                // the DO-step prod-arm gate + a manual "Promote now".
+                let auto_label = if self.auto_promote {
+                    "Auto-promote: ON"
+                } else {
+                    "Auto-promote: OFF"
+                };
+                let arm_label = if self.promote_armed {
+                    "Prod-arm: ARMED"
+                } else {
+                    "Prod-arm: disarmed"
+                };
+                col = col.push(
+                    row![
+                        variant_button(
+                            auto_label.to_string(),
+                            if self.auto_promote {
+                                ButtonVariant::Primary
+                            } else {
+                                ButtonVariant::Secondary
+                            },
+                            Some(crate::Message::Datacenter(Message::AutoPromoteToggled)),
+                            palette,
+                        ),
+                        variant_button(
+                            arm_label.to_string(),
+                            if self.promote_armed {
+                                ButtonVariant::Primary
+                            } else {
+                                ButtonVariant::Secondary
+                            },
+                            Some(crate::Message::Datacenter(Message::PromoteArmToggled)),
+                            palette,
+                        ),
+                        // "Promote now" only fires when the DO step is armed.
+                        variant_button(
+                            "Promote now".to_string(),
+                            ButtonVariant::Secondary,
+                            self.promote_armed
+                                .then_some(crate::Message::Datacenter(Message::PromoteNowClicked)),
+                            palette,
+                        ),
+                    ]
+                    .spacing(f32::from(spacing::BASE[2])),
+                );
                 // DATACENTER-9 — the per-target version matrix: farm / Eagle /
                 // each lighthouse. Where the strip above shows only the three
                 // pipeline stages, this adds a row per live lighthouse (a Prod
@@ -2173,6 +3517,31 @@ impl DatacenterPanel {
                 }
             }
             ViewMode::Tofu => {
+                // DATACENTER-15 — the prod-arm master switch. A Prod (zone1-do)
+                // apply is refused while disarmed (the guard in `TofuApply`); the
+                // toggle reads ARMED / disarmed and is the only path to enable it.
+                let arm_label = if self.tofu_armed {
+                    "Prod: ARMED"
+                } else {
+                    "Prod: disarmed"
+                };
+                col = col.push(
+                    row![
+                        text("Prod-arm").colr(palette.text_muted.into_cosmic_color()),
+                        variant_button(
+                            arm_label.to_string(),
+                            if self.tofu_armed {
+                                ButtonVariant::Primary
+                            } else {
+                                ButtonVariant::Secondary
+                            },
+                            Some(crate::Message::Datacenter(Message::TofuArmToggled)),
+                            palette,
+                        ),
+                    ]
+                    .spacing(f32::from(spacing::BASE[2]))
+                    .align_y(cosmic::iced::alignment::Vertical::Center),
+                );
                 // A Plan + Apply control pair per workspace. Apply arms a typed
                 // confirm before firing the destructive `action/dc/tofu-apply`.
                 for ws in ["xen-xapi", "zone1-do"] {
@@ -2192,10 +3561,20 @@ impl DatacenterPanel {
                         ))),
                         palette,
                     );
+                    // DATACENTER-15 — the persisted run-log button per workspace.
+                    let runlog_btn = variant_button(
+                        format!("Run-log {ws}"),
+                        ButtonVariant::Secondary,
+                        Some(crate::Message::Datacenter(Message::TofuRunlogClicked(
+                            ws.to_string(),
+                        ))),
+                        palette,
+                    );
                     let mut ws_row = row![
                         text(ws.to_string()).width(Length::FillPortion(2)),
                         plan_btn,
-                        state_btn
+                        state_btn,
+                        runlog_btn
                     ]
                     .spacing(f32::from(spacing::BASE[2]));
                     if self.tofu_confirm.as_deref() == Some(ws) {
@@ -2219,12 +3598,20 @@ impl DatacenterPanel {
                             ));
                     } else {
                         // Unarmed: the first click only arms the confirm (no RPC).
+                        // The Prod (zone1-do) Apply stays disabled until prod-arm is
+                        // ARMED (DATACENTER-15 prod guardrail).
+                        let prod_blocked = ws == "zone1-do" && !self.tofu_armed;
+                        let apply_label = if prod_blocked {
+                            "Apply (arm prod)".to_string()
+                        } else {
+                            format!("Apply {ws}")
+                        };
                         ws_row = ws_row.push(variant_button(
-                            format!("Apply {ws}"),
+                            apply_label,
                             ButtonVariant::Primary,
-                            Some(crate::Message::Datacenter(Message::TofuApplyClicked(
-                                ws.to_string(),
-                            ))),
+                            (!prod_blocked).then_some(crate::Message::Datacenter(
+                                Message::TofuApplyClicked(ws.to_string()),
+                            )),
                             palette,
                         ));
                     }
@@ -2237,6 +3624,15 @@ impl DatacenterPanel {
                 } else {
                     col = col.push(
                         container(text(self.tofu_output.clone()))
+                            .padding(f32::from(spacing::BASE[3]))
+                            .width(Length::Fill),
+                    );
+                }
+                // DATACENTER-15 — the persisted run-log, shown after a Run-log read.
+                if !self.tofu_runlog.is_empty() {
+                    col = col.push(text("Run log").size(f32::from(spacing::BASE[5])));
+                    col = col.push(
+                        container(text(self.tofu_runlog.clone()))
                             .padding(f32::from(spacing::BASE[3]))
                             .width(Length::Fill),
                     );
@@ -2366,67 +3762,1001 @@ impl DatacenterPanel {
                         ]
                         .spacing(f32::from(spacing::BASE[2])),
                     );
+                    // DATACENTER-8/1813 — per-kind sub-tabs (Hosts / VMs / Storage /
+                    // Network) within the active zone.
+                    col = col.push(self.kind_subtabs_view(palette));
 
-                    // Per-tab filter = the active zone tab AND the global search
-                    // needle (name / id / kind). The search narrows the card grid
-                    // in place; an empty box shows the whole zone.
+                    // The rendered set = active zone AND active kind sub-tab AND the
+                    // global search needle (name / id / kind).
                     let visible: Vec<&DcRow> = self
                         .rows
                         .iter()
-                        .filter(|r| r.zone == self.zone_tab && r.matches_filter(&self.filter))
+                        .filter(|r| {
+                            r.zone == self.zone_tab
+                                && self.kind_tab.matches(&r.kind)
+                                && r.matches_filter(&self.filter)
+                        })
                         .collect();
-                    if visible.is_empty() {
-                        // Distinguish "nothing in this zone" from "the search hid
-                        // everything" so an empty grid never looks like a bug.
-                        if self.filter.trim().is_empty() {
-                            col = col.push(text("No resources in this zone yet."));
-                        } else {
-                            col = col.push(
-                                text(format!(
-                                    "No resources match \u{201c}{}\u{201d} in this zone.",
-                                    self.filter.trim()
-                                ))
-                                .colr(palette.text_muted.into_cosmic_color()),
-                            );
-                        }
-                    } else {
-                        // MOTION-FEEDBACK-2 — a single `now` for the whole grid so
-                        // every card's reveal/hover/selection tween reads one
-                        // coherent frame, plus the live reduce-motion preference.
-                        let now = Instant::now();
-                        let reduce_motion = crate::live_theme::reduce_motion();
-                        // Responsive card grid — each resource is a card (status
-                        // dot + kind/label + readout + actions), wrapped N-per-row,
-                        // with a capped staggered reveal + hover-lift + an animated
-                        // accent on the selected card.
-                        let cards: Vec<Element<'_, crate::Message>> = visible
-                            .into_iter()
-                            .enumerate()
-                            .map(|(i, r)| {
-                                let confirming =
-                                    self.confirm_delete.as_deref() == Some(r.id.as_str());
-                                let motion = CardMotion {
-                                    index: i,
-                                    reveal_start: self.reveal_start,
-                                    selected: self.selected_card.as_deref()
-                                        == Some(r.id.as_str()),
-                                    selection: &self.selection,
-                                    hovered: self.hovered_card.as_deref() == Some(r.id.as_str()),
-                                    hover_since: self.hover_since,
-                                    now,
-                                    reduce_motion,
-                                };
-                                dc_card_view(r, palette, confirming, motion)
-                            })
-                            .collect();
-                        col = col.push(card_grid(cards));
+                    for el in self.kind_body_view(palette, &visible) {
+                        col = col.push(el);
                     }
+                }
+            }
+            ViewMode::Gateway => {
+                col = col.push(text("Gateway (UniFi)").size(f32::from(spacing::BASE[5])));
+                for el in self.gateway_view(palette) {
+                    col = col.push(el);
+                }
+            }
+            ViewMode::Provision => {
+                col = col.push(text("Provisioning").size(f32::from(spacing::BASE[5])));
+                for el in self.provision_view(palette) {
+                    col = col.push(el);
                 }
             }
         }
 
         scrollable(col).into()
     }
+
+    // ── DATACENTER-8/1813 — per-kind sub-tabs + per-tab bodies ────────────────
+
+    /// The Hosts / VMs / Storage / Network sub-tab selector for the active zone —
+    /// each chip carries that kind's count in the active zone. The selected tab is
+    /// the Primary (filled) variant.
+    fn kind_subtabs_view(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let mut r = row![].spacing(f32::from(spacing::BASE[2]));
+        for t in KindTab::all() {
+            let count = self
+                .rows
+                .iter()
+                .filter(|row| row.zone == self.zone_tab && t.matches(&row.kind))
+                .count();
+            let variant = if self.kind_tab == t {
+                ButtonVariant::Primary
+            } else {
+                ButtonVariant::Secondary
+            };
+            r = r.push(variant_button(
+                format!("{} ({count})", t.label()),
+                variant,
+                Some(crate::Message::Datacenter(Message::KindTab(t))),
+                palette,
+            ));
+        }
+        r.into()
+    }
+
+    /// Dispatch the active sub-tab to its purpose-built body. `visible` is the
+    /// zone + kind + search filtered row set.
+    fn kind_body_view(
+        &self,
+        palette: Palette,
+        visible: &[&DcRow],
+    ) -> Vec<Element<'_, crate::Message>> {
+        match self.kind_tab {
+            KindTab::Vms => self.vms_body(palette, visible),
+            KindTab::Hosts => self.hosts_body(palette, visible),
+            KindTab::Storage => self.storage_body(palette, visible),
+            KindTab::Network => self.network_body(palette, visible),
+        }
+    }
+
+    /// The empty-state hint shared by every sub-tab — distinguishes a genuinely
+    /// empty tab from a search that hid everything.
+    fn empty_zone_hint(&self, palette: Palette) -> Element<'_, crate::Message> {
+        if self.filter.trim().is_empty() {
+            text("Nothing in this sub-tab yet.")
+                .colr(palette.text_muted.into_cosmic_color())
+                .into()
+        } else {
+            text(format!(
+                "No resources match \u{201c}{}\u{201d} here.",
+                self.filter.trim()
+            ))
+            .colr(palette.text_muted.into_cosmic_color())
+            .into()
+        }
+    }
+
+    /// DATACENTER-11 — the VMs sub-tab: a New-VM (golden-template → Tofu) wizard
+    /// toggle + a bulk-select toggle, the optional create wizard / bulk bar /
+    /// migrate picker, then the motion card grid (each VM card carries power,
+    /// suspend, migrate, console, snapshot, clone, delete, and a bulk Select).
+    fn vms_body(&self, palette: Palette, visible: &[&DcRow]) -> Vec<Element<'_, crate::Message>> {
+        let mut out: Vec<Element<'_, crate::Message>> = Vec::new();
+        let bulk_label = if self.bulk_mode {
+            "Exit select"
+        } else {
+            "Select…"
+        };
+        out.push(
+            row![
+                pbtn("New VM…", Message::CreateToggled, palette),
+                sbtn(bulk_label, Message::BulkModeToggled, palette),
+            ]
+            .spacing(f32::from(spacing::BASE[2]))
+            .into(),
+        );
+        if self.create_open {
+            out.push(self.create_wizard_view(palette));
+        }
+        if self.bulk_mode {
+            out.push(self.bulk_bar_view(palette));
+        }
+        if let Some((uuid, _dom0)) = &self.migrate {
+            out.push(self.migrate_picker_view(palette, uuid));
+        }
+        if visible.is_empty() {
+            out.push(self.empty_zone_hint(palette));
+            return out;
+        }
+        let now = Instant::now();
+        let reduce_motion = crate::live_theme::reduce_motion();
+        let cards: Vec<Element<'_, crate::Message>> = visible
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, r)| {
+                let confirming = self.confirm_delete.as_deref() == Some(r.id.as_str());
+                let bulk = self.bulk_mode.then(|| self.bulk_sel.contains(r.id.as_str()));
+                let motion = CardMotion {
+                    index: i,
+                    reveal_start: self.reveal_start,
+                    selected: self.selected_card.as_deref() == Some(r.id.as_str()),
+                    selection: &self.selection,
+                    hovered: self.hovered_card.as_deref() == Some(r.id.as_str()),
+                    hover_since: self.hover_since,
+                    now,
+                    reduce_motion,
+                };
+                dc_card_view(r, palette, confirming, bulk, motion)
+            })
+            .collect();
+        out.push(card_grid(cards));
+        out
+    }
+
+    /// DATACENTER-11 — the golden-template create wizard: template + name inputs and
+    /// a Create button that fires `action/dc/vm-create` (the worker writes a Tofu
+    /// resource + applies, so structural changes don't drift).
+    fn create_wizard_view(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let template = text_input(
+            "golden template (e.g. MDE-VM-golden)",
+            &self.create_template,
+        )
+        .on_input(|v| crate::Message::Datacenter(Message::CreateTemplateChanged(v)))
+        .width(Length::FillPortion(2));
+        let name = text_input("new VM name", &self.create_name)
+            .on_input(|v| crate::Message::Datacenter(Message::CreateNameChanged(v)))
+            .width(Length::FillPortion(2));
+        let enabled =
+            !self.create_template.trim().is_empty() && !self.create_name.trim().is_empty();
+        let submit = variant_button(
+            "Create (Tofu)".to_string(),
+            ButtonVariant::Primary,
+            enabled.then_some(crate::Message::Datacenter(Message::CreateSubmit)),
+            palette,
+        );
+        let cancel = variant_button(
+            "Cancel".to_string(),
+            ButtonVariant::Ghost,
+            Some(crate::Message::Datacenter(Message::CreateToggled)),
+            palette,
+        );
+        let body = column![
+            text(format!(
+                "New VM in {} — clones a golden template via Tofu.",
+                self.zone_tab
+            ))
+            .colr(palette.text_muted.into_cosmic_color()),
+            row![template, name].spacing(f32::from(spacing::BASE[2])),
+            row![submit, cancel].spacing(f32::from(spacing::BASE[2])),
+        ]
+        .spacing(f32::from(spacing::BASE[2]));
+        surface_card(body, palette)
+    }
+
+    /// DATACENTER-11 — the bulk action bar (visible in select mode): the selected
+    /// count, the four bulk ops (start / stop / snapshot / tag) firing
+    /// `action/dc/vm-bulk`, and per-item progress as results land.
+    fn bulk_bar_view(&self, palette: Palette) -> Element<'_, crate::Message> {
+        let n = self.bulk_sel.len();
+        let op_btn = |label: &str, op: &str| {
+            let msg = (n > 0).then_some(crate::Message::Datacenter(Message::BulkOp(op.to_string())));
+            variant_button(label.to_string(), ButtonVariant::Secondary, msg, palette)
+        };
+        let mut body = column![row![
+            text(format!("{n} selected")).colr(palette.text.into_cosmic_color()),
+            op_btn("Start", "start"),
+            op_btn("Stop", "shutdown"),
+            op_btn("Snapshot", "snapshot"),
+            op_btn("Tag", "tag"),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center)]
+        .spacing(f32::from(spacing::BASE[2]));
+        for (uuid, status) in &self.bulk_progress {
+            let color = match status.as_str() {
+                "ok" => palette.success,
+                "error" => palette.danger,
+                _ => palette.warning,
+            };
+            body = body.push(
+                row![
+                    text(uuid.clone())
+                        .colr(palette.text_muted.into_cosmic_color())
+                        .width(Length::FillPortion(3)),
+                    text(status.clone())
+                        .colr(color.into_cosmic_color())
+                        .width(Length::FillPortion(1)),
+                ]
+                .spacing(f32::from(spacing::BASE[2])),
+            );
+        }
+        surface_card(body, palette)
+    }
+
+    /// DATACENTER-11 — the migrate target picker (armed for one VM): a dropdown of
+    /// candidate dom0 hosts + Migrate / Cancel. Migrate fires `action/dc/vm-migrate`.
+    fn migrate_picker_view(&self, palette: Palette, uuid: &str) -> Element<'_, crate::Message> {
+        let targets: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|r| r.kind == "host")
+            .map(|r| r.id.clone())
+            .collect();
+        let picker: Element<'_, crate::Message> = if targets.is_empty() {
+            text("no target hosts known")
+                .colr(palette.text_muted.into_cosmic_color())
+                .into()
+        } else {
+            pick_list(targets, self.migrate_target.clone(), |v| {
+                crate::Message::Datacenter(Message::MigrateTargetPicked(v))
+            })
+            .into()
+        };
+        let confirm = variant_button(
+            "Migrate".to_string(),
+            ButtonVariant::Primary,
+            self.migrate_target
+                .is_some()
+                .then_some(crate::Message::Datacenter(Message::MigrateConfirmed)),
+            palette,
+        );
+        let cancel = sbtn("Cancel", Message::MigrateCancelled, palette);
+        let body = column![
+            text(format!("Migrate VM {uuid} to:")).colr(palette.text.into_cosmic_color()),
+            row![picker, confirm, cancel]
+                .spacing(f32::from(spacing::BASE[2]))
+                .align_y(cosmic::iced::alignment::Vertical::Center),
+        ]
+        .spacing(f32::from(spacing::BASE[2]));
+        surface_card(body, palette)
+    }
+
+    /// DATACENTER-10/16 — the Hosts sub-tab: the idle-shutdown policy toggle, any
+    /// live wake/power progress bars, then one action card per host.
+    fn hosts_body(&self, palette: Palette, visible: &[&DcRow]) -> Vec<Element<'_, crate::Message>> {
+        let mut out: Vec<Element<'_, crate::Message>> = Vec::new();
+        let idle_label = if self.idle_policy_on {
+            "Idle-shutdown: ON"
+        } else {
+            "Idle-shutdown: OFF"
+        };
+        out.push(
+            row![
+                text("Energy policy").colr(palette.text_muted.into_cosmic_color()),
+                variant_button(
+                    idle_label.to_string(),
+                    if self.idle_policy_on {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Secondary
+                    },
+                    Some(crate::Message::Datacenter(Message::IdlePolicyToggled)),
+                    palette,
+                ),
+            ]
+            .spacing(f32::from(spacing::BASE[2]))
+            .align_y(cosmic::iced::alignment::Vertical::Center)
+            .into(),
+        );
+        for ps in &self.power {
+            out.push(power_progress_view(ps, palette));
+        }
+        if visible.is_empty() {
+            out.push(self.empty_zone_hint(palette));
+            return out;
+        }
+        for r in visible.iter().copied() {
+            out.push(self.host_row_view(palette, r));
+        }
+        out
+    }
+
+    /// DATACENTER-10/16 — one host action card: header (status dot + metrics), the
+    /// lifecycle row (maintenance/reboot/evacuate/patch/SSH), the pool + IPMI row,
+    /// and an inline evacuate confirm / patch-impact preview when armed.
+    fn host_row_view(&self, palette: Palette, r: &DcRow) -> Element<'_, crate::Message> {
+        let host = r.id.clone();
+        let name = if r.name.is_empty() {
+            r.id.clone()
+        } else {
+            r.name.clone()
+        };
+        let mut meta = String::new();
+        if !r.cpu.is_empty() {
+            meta.push_str(&format!(" · {} vCPU", r.cpu));
+        }
+        if !r.mem_free_mb.is_empty() && !r.mem_total_mb.is_empty() {
+            meta.push_str(&format!(" · {}/{} MB free", r.mem_free_mb, r.mem_total_mb));
+        }
+        if !r.load.is_empty() {
+            meta.push_str(&format!(" · load {}", r.load));
+        }
+        let header = row![
+            status_dot_view(r, palette),
+            text(format!("{name} ({host}){meta}")).colr(palette.text.into_cosmic_color()),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+        let actions = row![
+            sbtn(
+                "Maint-on",
+                Message::HostPowerClicked {
+                    host: host.clone(),
+                    op: "maintenance-on".into()
+                },
+                palette
+            ),
+            sbtn(
+                "Maint-off",
+                Message::HostPowerClicked {
+                    host: host.clone(),
+                    op: "maintenance-off".into()
+                },
+                palette
+            ),
+            sbtn(
+                "Reboot",
+                Message::HostPowerClicked {
+                    host: host.clone(),
+                    op: "reboot".into()
+                },
+                palette
+            ),
+            sbtn("Evacuate", Message::HostEvacuateClicked(host.clone()), palette),
+            sbtn("Patch…", Message::HostPatchClicked(host.clone()), palette),
+            sbtn("SSH", Message::HostConsoleClicked(host.clone()), palette),
+        ]
+        .spacing(f32::from(spacing::BASE[1]));
+        let pool = row![
+            text("Pool").colr(palette.text_muted.into_cosmic_color()),
+            sbtn(
+                "Join",
+                Message::HostPoolClicked {
+                    host: host.clone(),
+                    op: "join".into()
+                },
+                palette
+            ),
+            sbtn(
+                "Eject",
+                Message::HostPoolClicked {
+                    host: host.clone(),
+                    op: "eject".into()
+                },
+                palette
+            ),
+            sbtn(
+                "Master",
+                Message::HostPoolClicked {
+                    host: host.clone(),
+                    op: "designate-master".into()
+                },
+                palette
+            ),
+            text("IPMI").colr(palette.text_muted.into_cosmic_color()),
+            sbtn(
+                "On",
+                Message::PowerIpmiClicked {
+                    host: host.clone(),
+                    op: "on".into()
+                },
+                palette
+            ),
+            sbtn(
+                "Off",
+                Message::PowerIpmiClicked {
+                    host: host.clone(),
+                    op: "off".into()
+                },
+                palette
+            ),
+            sbtn(
+                "Cycle",
+                Message::PowerIpmiClicked {
+                    host: host.clone(),
+                    op: "cycle".into()
+                },
+                palette
+            ),
+        ]
+        .spacing(f32::from(spacing::BASE[1]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+
+        let mut body = column![header, actions, pool].spacing(f32::from(spacing::BASE[2]));
+
+        if let Some((chost, op)) = &self.host_confirm {
+            if chost == &host {
+                if op == "patch" {
+                    if let Some((_, vms)) = &self.host_patch_preview {
+                        let impact = if vms.is_empty() {
+                            "no VMs would move".to_string()
+                        } else {
+                            format!("{} VM(s) evacuate first: {}", vms.len(), vms.join(", "))
+                        };
+                        body = body.push(
+                            text(format!("Patch impact — {impact}"))
+                                .colr(palette.warning.into_cosmic_color()),
+                        );
+                    }
+                }
+                let verb_label = if op == "patch" {
+                    "Apply patch"
+                } else {
+                    "Confirm evacuate"
+                };
+                body = body.push(
+                    row![
+                        pbtn(verb_label, Message::HostConfirmed, palette),
+                        sbtn("Cancel", Message::HostCancelled, palette),
+                    ]
+                    .spacing(f32::from(spacing::BASE[2])),
+                );
+            }
+        }
+        surface_card(body, palette)
+    }
+
+    /// DATACENTER-12 — the Storage sub-tab: a Create-SR + retention toolbar, the
+    /// ISO/template library (absorbs the `images` panel), then one card per SR/VDI
+    /// with attach/detach/schedule/destroy.
+    fn storage_body(
+        &self,
+        palette: Palette,
+        visible: &[&DcRow],
+    ) -> Vec<Element<'_, crate::Message>> {
+        let mut out: Vec<Element<'_, crate::Message>> = Vec::new();
+        out.push(
+            row![
+                pbtn("Create SR", Message::SrCreateClicked, palette),
+                text("Snapshot retention (keep N):").colr(palette.text_muted.into_cosmic_color()),
+                text_input("7", &self.sr_retention)
+                    .on_input(|v| crate::Message::Datacenter(Message::SrRetentionChanged(v)))
+                    .width(Length::Fixed(60.0)),
+            ]
+            .spacing(f32::from(spacing::BASE[2]))
+            .align_y(cosmic::iced::alignment::Vertical::Center)
+            .into(),
+        );
+        // ISO / template library (absorbs the images panel content).
+        let isos: Vec<&DcRow> = visible.iter().copied().filter(|r| r.kind == "iso").collect();
+        out.push(
+            text(format!("ISO / template library ({})", isos.len()))
+                .colr(palette.text_muted.into_cosmic_color())
+                .into(),
+        );
+        for iso in isos {
+            let label = if iso.name.is_empty() {
+                iso.id.clone()
+            } else {
+                iso.name.clone()
+            };
+            out.push(
+                text(format!("• {label}"))
+                    .colr(palette.text.into_cosmic_color())
+                    .into(),
+            );
+        }
+        let srs: Vec<&DcRow> = visible
+            .iter()
+            .copied()
+            .filter(|r| r.kind == "sr" || r.kind == "vdi")
+            .collect();
+        if srs.is_empty() {
+            out.push(self.empty_zone_hint(palette));
+        } else {
+            for r in srs {
+                out.push(self.sr_row_view(palette, r));
+            }
+        }
+        out
+    }
+
+    /// DATACENTER-12 — one SR/VDI action card: capacity header + attach/detach VDI,
+    /// scheduled-snapshot, and a confirm-gated destroy.
+    fn sr_row_view(&self, palette: Palette, r: &DcRow) -> Element<'_, crate::Message> {
+        let sr = r.id.clone();
+        let name = if r.name.is_empty() {
+            r.id.clone()
+        } else {
+            r.name.clone()
+        };
+        let cap = r.capacity_readout().unwrap_or_else(|| r.status.clone());
+        let header = row![
+            status_dot_view(r, palette),
+            text(format!("{name} — {cap}")).colr(palette.text.into_cosmic_color()),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        let mut body = column![
+            header,
+            row![
+                sbtn(
+                    "Attach VDI",
+                    Message::VdiClicked {
+                        sr: sr.clone(),
+                        attach: true
+                    },
+                    palette
+                ),
+                sbtn(
+                    "Detach VDI",
+                    Message::VdiClicked {
+                        sr: sr.clone(),
+                        attach: false
+                    },
+                    palette
+                ),
+                sbtn(
+                    "Schedule snaps",
+                    Message::SrScheduleClicked(sr.clone()),
+                    palette
+                ),
+                pbtn("Destroy", Message::SrDestroyClicked(sr.clone()), palette),
+            ]
+            .spacing(f32::from(spacing::BASE[1])),
+        ]
+        .spacing(f32::from(spacing::BASE[2]));
+        if self.sr_confirm_destroy.as_deref() == Some(sr.as_str()) {
+            body = body.push(
+                row![
+                    text("Really destroy this SR?").colr(palette.danger.into_cosmic_color()),
+                    pbtn("Confirm", Message::SrDestroyConfirmed(sr.clone()), palette),
+                    sbtn("Cancel", Message::SrDestroyCancelled, palette),
+                ]
+                .spacing(f32::from(spacing::BASE[2])),
+            );
+        }
+        surface_card(body, palette)
+    }
+
+    /// DATACENTER-13 — the Network sub-tab: a Create-network + VLAN toolbar, one
+    /// card per net/PIF/VLAN, and the unified IP/DNS correlation table.
+    fn network_body(
+        &self,
+        palette: Palette,
+        visible: &[&DcRow],
+    ) -> Vec<Element<'_, crate::Message>> {
+        let mut out: Vec<Element<'_, crate::Message>> = Vec::new();
+        out.push(
+            row![
+                pbtn("Create network", Message::NetCreateClicked, palette),
+                text("VLAN tag:").colr(palette.text_muted.into_cosmic_color()),
+                text_input("0", &self.vlan_input)
+                    .on_input(|v| crate::Message::Datacenter(Message::VlanInputChanged(v)))
+                    .width(Length::Fixed(60.0)),
+            ]
+            .spacing(f32::from(spacing::BASE[2]))
+            .align_y(cosmic::iced::alignment::Vertical::Center)
+            .into(),
+        );
+        if visible.is_empty() {
+            out.push(self.empty_zone_hint(palette));
+        } else {
+            for r in visible.iter().copied() {
+                out.push(self.net_row_view(palette, r));
+            }
+        }
+        out.push(text("Unified IP / DNS").size(f32::from(spacing::BASE[5])).into());
+        out.push(
+            row![
+                sbtn("Refresh IP/DNS", Message::IpDnsRefresh, palette),
+                text("UniFi lease \u{2194} DO DNS \u{2194} overlay IP")
+                    .colr(palette.text_muted.into_cosmic_color()),
+            ]
+            .spacing(f32::from(spacing::BASE[2]))
+            .align_y(cosmic::iced::alignment::Vertical::Center)
+            .into(),
+        );
+        for el in ipdns_table_view(&self.ipdns, palette) {
+            out.push(el);
+        }
+        out
+    }
+
+    /// DATACENTER-13 — one network action card: header (status dot + bridge) +
+    /// Set-VLAN / Config-PIF.
+    fn net_row_view(&self, palette: Palette, r: &DcRow) -> Element<'_, crate::Message> {
+        let net = r.id.clone();
+        let name = if r.name.is_empty() {
+            r.id.clone()
+        } else {
+            r.name.clone()
+        };
+        let bridge = if r.bridge.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", r.bridge)
+        };
+        let header = row![
+            status_dot_view(r, palette),
+            text(format!("{name}{bridge}")).colr(palette.text.into_cosmic_color()),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        let body = column![
+            header,
+            row![
+                sbtn("Set VLAN", Message::VlanSetClicked(net.clone()), palette),
+                sbtn("Config PIF", Message::PifConfigClicked(net.clone()), palette),
+            ]
+            .spacing(f32::from(spacing::BASE[1])),
+        ]
+        .spacing(f32::from(spacing::BASE[2]));
+        surface_card(body, palette)
+    }
+
+    /// DATACENTER-14 — the Gateway view: gateway status rows, a firewall-rule add
+    /// form, a port-forward add form, and a reboot button.
+    fn gateway_view(&self, palette: Palette) -> Vec<Element<'_, crate::Message>> {
+        let mut out: Vec<Element<'_, crate::Message>> = Vec::new();
+        let gws: Vec<&DcRow> = self.rows.iter().filter(|r| r.kind == "gateway").collect();
+        if gws.is_empty() {
+            out.push(
+                text("No gateway data yet — the orchestrator publishes event/dc/gateway/*.")
+                    .colr(palette.text_muted.into_cosmic_color())
+                    .into(),
+            );
+        } else {
+            for g in gws {
+                let label = if g.name.is_empty() {
+                    g.id.clone()
+                } else {
+                    g.name.clone()
+                };
+                out.push(
+                    row![
+                        status_dot_view(g, palette),
+                        text(format!("{label} ({})", g.status))
+                            .colr(palette.text.into_cosmic_color()),
+                    ]
+                    .spacing(f32::from(spacing::BASE[2]))
+                    .align_y(cosmic::iced::alignment::Vertical::Center)
+                    .into(),
+                );
+            }
+        }
+        out.push(text("Firewall rule").size(f32::from(spacing::BASE[5])).into());
+        out.push(
+            row![
+                text_input("e.g. allow tcp 443 from any", &self.gw_fw_rule)
+                    .on_input(|v| crate::Message::Datacenter(Message::GwFwRuleChanged(v)))
+                    .width(Length::FillPortion(3)),
+                pbtn("Add rule", Message::GwFirewallClicked, palette),
+            ]
+            .spacing(f32::from(spacing::BASE[2]))
+            .align_y(cosmic::iced::alignment::Vertical::Center)
+            .into(),
+        );
+        out.push(text("Port-forward").size(f32::from(spacing::BASE[5])).into());
+        out.push(
+            row![
+                text_input("e.g. tcp 8443 -> 10.42.0.2:443", &self.gw_pf_fwd)
+                    .on_input(|v| crate::Message::Datacenter(Message::GwPfFwdChanged(v)))
+                    .width(Length::FillPortion(3)),
+                pbtn("Add forward", Message::GwPortForwardClicked, palette),
+            ]
+            .spacing(f32::from(spacing::BASE[2]))
+            .align_y(cosmic::iced::alignment::Vertical::Center)
+            .into(),
+        );
+        out.push(sbtn("Reboot gateway", Message::GwRebootClicked, palette));
+        out
+    }
+
+    /// DATACENTER-18/19/21 — the Provision view: the DO region picker + guided new-
+    /// lighthouse, the New-Mesh genesis wizard, and the ephemeral test-mesh +
+    /// build-farm scale controls.
+    fn provision_view(&self, palette: Palette) -> Vec<Element<'_, crate::Message>> {
+        let mut out: Vec<Element<'_, crate::Message>> = Vec::new();
+        if !self.provision_status.is_empty() {
+            out.push(
+                text(self.provision_status.clone())
+                    .colr(palette.text_muted.into_cosmic_color())
+                    .into(),
+            );
+        }
+        // ── DO region picker + guided new-lighthouse (DATACENTER-19) ──
+        out.push(
+            text("DigitalOcean regions")
+                .size(f32::from(spacing::BASE[5]))
+                .into(),
+        );
+        let region_slugs: Vec<String> = self
+            .do_regions
+            .iter()
+            .filter(|r| r.available)
+            .map(|r| r.slug.clone())
+            .collect();
+        let do_picker: Element<'_, crate::Message> = if region_slugs.is_empty() {
+            text("Load regions to pick one.")
+                .colr(palette.text_muted.into_cosmic_color())
+                .into()
+        } else {
+            pick_list(region_slugs.clone(), self.region_slug.clone(), |v| {
+                crate::Message::Datacenter(Message::RegionPicked(v))
+            })
+            .into()
+        };
+        out.push(
+            row![
+                sbtn("Load regions", Message::RegionsRefresh, palette),
+                do_picker,
+                pbtn(
+                    "Guided new lighthouse",
+                    Message::GuidedLighthouseClicked,
+                    palette
+                ),
+            ]
+            .spacing(f32::from(spacing::BASE[2]))
+            .align_y(cosmic::iced::alignment::Vertical::Center)
+            .into(),
+        );
+        let lh_count = self
+            .rows
+            .iter()
+            .filter(|r| r.kind == "droplet" && r.zone == "prod")
+            .count();
+        let geos = distinct_geos(
+            &self
+                .do_regions
+                .iter()
+                .map(|r| r.slug.clone())
+                .collect::<Vec<_>>(),
+        );
+        let nudge = if lh_count < 2 {
+            format!(
+                "Spread: {lh_count} lighthouse(s) — add a 2nd in a DIFFERENT geo for relay + \
+                 etcd-quorum redundancy ({geos} geo(s) available)."
+            )
+        } else {
+            format!("{lh_count} lighthouses — keep them spread across distinct geos ({geos} available).")
+        };
+        out.push(text(nudge).colr(palette.warning.into_cosmic_color()).into());
+
+        // ── New-Mesh genesis wizard (DATACENTER-18) ──
+        out.push(
+            text("New mesh (genesis)")
+                .size(f32::from(spacing::BASE[5]))
+                .into(),
+        );
+        let genesis_picker: Element<'_, crate::Message> = if region_slugs.is_empty() {
+            text("Load regions first.")
+                .colr(palette.text_muted.into_cosmic_color())
+                .into()
+        } else {
+            pick_list(region_slugs, self.genesis_region.clone(), |v| {
+                crate::Message::Datacenter(Message::GenesisRegionPicked(v))
+            })
+            .into()
+        };
+        out.push(
+            row![
+                text_input("new mesh name", &self.genesis_name)
+                    .on_input(|v| crate::Message::Datacenter(Message::GenesisNameChanged(v)))
+                    .width(Length::FillPortion(2)),
+                genesis_picker,
+                pbtn("Give birth", Message::GenesisSubmit, palette),
+            ]
+            .spacing(f32::from(spacing::BASE[2]))
+            .align_y(cosmic::iced::alignment::Vertical::Center)
+            .into(),
+        );
+        out.push(
+            text("Flow: name \u{2192} region \u{2192} CA \u{2192} found lighthouse \u{2192} DNS \u{2192} first join token.")
+                .colr(palette.text_muted.into_cosmic_color())
+                .into(),
+        );
+
+        // ── Ephemeral test-mesh + build-farm scale (DATACENTER-21) ──
+        out.push(
+            text("Ephemeral test-mesh")
+                .size(f32::from(spacing::BASE[5]))
+                .into(),
+        );
+        out.push(
+            row![
+                text("Nodes:").colr(palette.text_muted.into_cosmic_color()),
+                text_input("3", &self.testmesh_n)
+                    .on_input(|v| crate::Message::Datacenter(Message::TestmeshNChanged(v)))
+                    .width(Length::Fixed(60.0)),
+                pbtn("Spin", Message::TestmeshSpinClicked, palette),
+            ]
+            .spacing(f32::from(spacing::BASE[2]))
+            .align_y(cosmic::iced::alignment::Vertical::Center)
+            .into(),
+        );
+        for m in self.rows.iter().filter(|r| r.kind == "testmesh") {
+            out.push(
+                row![
+                    text(format!("test-mesh {}", m.id)).colr(palette.text.into_cosmic_color()),
+                    sbtn(
+                        "Teardown",
+                        Message::TestmeshTeardownClicked(m.id.clone()),
+                        palette
+                    ),
+                ]
+                .spacing(f32::from(spacing::BASE[2]))
+                .align_y(cosmic::iced::alignment::Vertical::Center)
+                .into(),
+            );
+        }
+        out.push(
+            text("Build-farm scale")
+                .size(f32::from(spacing::BASE[5]))
+                .into(),
+        );
+        out.push(
+            row![
+                text("Build VMs:").colr(palette.text_muted.into_cosmic_color()),
+                text_input("2", &self.farm_scale_n)
+                    .on_input(|v| crate::Message::Datacenter(Message::FarmScaleChanged(v)))
+                    .width(Length::Fixed(60.0)),
+                pbtn("Apply scale", Message::FarmScaleClicked, palette),
+            ]
+            .spacing(f32::from(spacing::BASE[2]))
+            .align_y(cosmic::iced::alignment::Vertical::Center)
+            .into(),
+        );
+        out
+    }
+}
+
+/// A Secondary (outline) action button wired to a panel [`Message`] — the concise
+/// builder the per-tab action rows use (the message is owned, so the element is
+/// `'static`). mde-theme tokens only (via `variant_button`).
+fn sbtn(label: &str, msg: Message, palette: Palette) -> Element<'static, crate::Message> {
+    variant_button(
+        label.to_string(),
+        ButtonVariant::Secondary,
+        Some(crate::Message::Datacenter(msg)),
+        palette,
+    )
+}
+
+/// A Primary (filled) action button wired to a panel [`Message`].
+fn pbtn(label: &str, msg: Message, palette: Palette) -> Element<'static, crate::Message> {
+    variant_button(
+        label.to_string(),
+        ButtonVariant::Primary,
+        Some(crate::Message::Datacenter(msg)),
+        palette,
+    )
+}
+
+/// Wrap a body element in the panel's standard bordered surface card (surface
+/// background + 1px border + small radius). mde-theme tokens only — no raw hex.
+fn surface_card<'a>(
+    body: impl Into<Element<'a, crate::Message>>,
+    palette: Palette,
+) -> Element<'a, crate::Message> {
+    container(body)
+        .padding(f32::from(spacing::BASE[3]))
+        .width(Length::Fill)
+        .style(move |_theme| container::Style {
+            background: Some(cosmic::iced::Background::Color(
+                palette.surface.into_cosmic_color(),
+            )),
+            border: cosmic::iced::Border {
+                color: palette.border.into_cosmic_color(),
+                width: 1.0,
+                radius: f32::from(spacing::BASE[1]).into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// DATACENTER-16 — render one host's phased wake progress bar: the host, a filled
+/// text bar, and a `pct% · phase · ETA` caption. mde-theme tokens only.
+fn power_progress_view(ps: &PowerStatus, palette: Palette) -> Element<'static, crate::Message> {
+    let bar = progress_bar(ps.pct_clamped());
+    let eta = if ps.eta_secs.is_empty() {
+        String::new()
+    } else {
+        format!(" \u{00b7} ETA {}s", ps.eta_secs)
+    };
+    row![
+        text(ps.host.clone())
+            .colr(palette.text.into_cosmic_color())
+            .width(Length::FillPortion(2)),
+        text(bar)
+            .colr(palette.accent.into_cosmic_color())
+            .width(Length::FillPortion(2)),
+        text(format!("{}% \u{00b7} {}{}", ps.pct_clamped(), ps.phase_label(), eta))
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::FillPortion(3)),
+    ]
+    .spacing(f32::from(spacing::BASE[2]))
+    .into()
+}
+
+/// DATACENTER-13 — render the unified IP/DNS correlation table (UniFi lease ↔ DO
+/// DNS ↔ overlay IP). Empty fields show "—"; an empty set shows a load hint.
+/// mde-theme tokens only.
+fn ipdns_table_view(
+    entries: &[IpDnsEntry],
+    palette: Palette,
+) -> Vec<Element<'static, crate::Message>> {
+    let mut out: Vec<Element<'static, crate::Message>> = Vec::new();
+    if entries.is_empty() {
+        out.push(
+            text("No IP/DNS correlation loaded — Refresh to read it.")
+                .colr(palette.text_muted.into_cosmic_color())
+                .into(),
+        );
+        return out;
+    }
+    out.push(
+        row![
+            text("Host")
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            text("Lease")
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            text("DNS")
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+            text("Overlay")
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(2)),
+        ]
+        .spacing(f32::from(spacing::BASE[2]))
+        .into(),
+    );
+    for e in entries {
+        let f = |s: &str| {
+            if s.is_empty() {
+                "\u{2014}".to_string()
+            } else {
+                s.to_string()
+            }
+        };
+        out.push(
+            row![
+                text(f(&e.name))
+                    .colr(palette.text.into_cosmic_color())
+                    .width(Length::FillPortion(2)),
+                text(f(&e.lease_ip))
+                    .colr(palette.text_muted.into_cosmic_color())
+                    .width(Length::FillPortion(2)),
+                text(f(&e.dns))
+                    .colr(palette.text_muted.into_cosmic_color())
+                    .width(Length::FillPortion(2)),
+                text(f(&e.overlay_ip))
+                    .colr(palette.accent.into_cosmic_color())
+                    .width(Length::FillPortion(2)),
+            ]
+            .spacing(f32::from(spacing::BASE[2]))
+            .into(),
+        );
+    }
+    out
 }
 
 /// The number of resource cards per row in the [`card_grid`]. A fixed column
@@ -2612,6 +4942,7 @@ fn dc_card_view<'a>(
     r: &DcRow,
     palette: Palette,
     confirming: bool,
+    bulk: Option<bool>,
     motion: CardMotion<'_>,
 ) -> Element<'a, crate::Message> {
     let label = if r.name.is_empty() {
@@ -2716,6 +5047,57 @@ fn dc_card_view<'a>(
             ));
         }
         card = card.push(actions);
+        // DATACENTER-11 — lifecycle beyond power: suspend/resume, migrate, console.
+        let suspended = matches!(
+            r.status.to_ascii_lowercase().as_str(),
+            "suspended" | "paused"
+        );
+        let suspend_btn = variant_button(
+            if suspended { "Resume" } else { "Suspend" }.to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::SuspendClicked {
+                uuid: r.id.clone(),
+                dom0: r.host.clone(),
+                resume: suspended,
+            })),
+            palette,
+        );
+        let migrate_btn = variant_button(
+            "Migrate".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::MigrateClicked {
+                uuid: r.id.clone(),
+                dom0: r.host.clone(),
+            })),
+            palette,
+        );
+        let console_btn = variant_button(
+            "Console".to_string(),
+            ButtonVariant::Secondary,
+            Some(crate::Message::Datacenter(Message::VmConsoleClicked {
+                uuid: r.id.clone(),
+                dom0: r.host.clone(),
+            })),
+            palette,
+        );
+        let mut actions2 =
+            row![suspend_btn, migrate_btn, console_btn].spacing(f32::from(spacing::BASE[1]));
+        // DATACENTER-11 — multi-select bulk: a Select toggle when bulk mode is on.
+        if let Some(selected) = bulk {
+            actions2 = actions2.push(variant_button(
+                if selected { "✓ Selected" } else { "Select" }.to_string(),
+                if selected {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Ghost
+                },
+                Some(crate::Message::Datacenter(Message::BulkSelectToggled(
+                    r.id.clone(),
+                ))),
+                palette,
+            ));
+        }
+        card = card.push(actions2);
     }
 
     // ── MOTION-FEEDBACK-2 — resolve this frame's motion for the card ──────────
@@ -3314,6 +5696,7 @@ fn read_dc_events() -> Result<DcLoad, String> {
         promote: project_promote(&events),
         health: project_health(&events),
         jobs: project_jobs(&events),
+        power: project_power(&events),
     })
 }
 
@@ -3658,6 +6041,173 @@ fn vm_delete(uuid: &str, dom0: &str) -> Result<String, String> {
     Err(format!("unexpected vm-delete reply: {raw}"))
 }
 
+/// Collapse an action RPC result into a single status line — both arms are
+/// surfaced verbatim to the operator (success text or error text). Shared by the
+/// many fire-and-status handlers.
+fn flatten(r: Result<String, String>) -> String {
+    match r {
+        Ok(s) => s,
+        Err(e) => e,
+    }
+}
+
+/// Generic datacenter action RPC: fire `action/dc/<verb>` with `body`, returning
+/// the parsed reply JSON (any `{"error":..}` surfaced as `Err`). Blocking — call
+/// on a `spawn_blocking` thread. Single-sources the Persist + `mde_bus::rpc::request`
+/// round trip the per-verb helpers above each open-code, wrapped in a local
+/// current-thread runtime because `request` borrows a non-`Send` `Persist` across
+/// its internal await (§6 — one copy of the boilerplate).
+fn dc_rpc(
+    verb: &str,
+    body: &serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let topic = format!("action/dc/{verb}");
+    let body_s = body.to_string();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let reply = rt.block_on(async {
+        let persist = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+        mde_bus::rpc::request(
+            &persist,
+            &topic,
+            mde_bus::hooks::config::Priority::Default,
+            Some(verb),
+            Some(&body_s),
+            timeout,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let raw = reply.body.unwrap_or_default();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad {verb} reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(serde_json::Value::as_str) {
+        return Err(err.to_string());
+    }
+    Ok(v)
+}
+
+/// Fire a datacenter action verb that just needs an ok/status string back, and
+/// translate `{"summary"|"status":..}` / `{"ok":true}` into a status line.
+fn dc_action(verb: &str, body: &serde_json::Value, timeout: Duration) -> Result<String, String> {
+    let v = dc_rpc(verb, body, timeout)?;
+    if let Some(s) = v.get("summary").and_then(serde_json::Value::as_str) {
+        return Ok(s.to_string());
+    }
+    if let Some(s) = v.get("status").and_then(serde_json::Value::as_str) {
+        return Ok(s.to_string());
+    }
+    if v.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(format!("{verb}: ok"));
+    }
+    Err(format!("unexpected {verb} reply: {v}"))
+}
+
+/// Fire `action/dc/vm-console {uuid}` and return the noVNC console URL the worker
+/// minted. Blocking — call on a `spawn_blocking` thread.
+fn vm_console(uuid: &str, dom0: &str) -> Result<String, String> {
+    let v = dc_rpc(
+        "vm-console",
+        &serde_json::json!({"uuid": uuid, "dom0": dom0}),
+        Duration::from_secs(60),
+    )?;
+    v.get("url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("no console url in reply: {v}"))
+}
+
+/// Fire `action/dc/vm-bulk {uuids[],op}` and return the per-item `(uuid,status)`
+/// results so the panel can render per-VM progress. When the worker doesn't itemize
+/// the reply, every requested uuid is marked `ok` (the call succeeded as a whole).
+fn vm_bulk(uuids: &[String], op: &str) -> Result<Vec<(String, String)>, String> {
+    let v = dc_rpc(
+        "vm-bulk",
+        &serde_json::json!({"uuids": uuids, "op": op}),
+        Duration::from_secs(600),
+    )?;
+    let itemized = v
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| {
+                    let uuid = e.get("uuid").and_then(serde_json::Value::as_str)?.to_string();
+                    let status = e
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("ok")
+                        .to_string();
+                    Some((uuid, status))
+                })
+                .collect::<Vec<_>>()
+        });
+    Ok(itemized.unwrap_or_else(|| uuids.iter().map(|u| (u.clone(), "ok".to_string())).collect()))
+}
+
+/// Fire `action/dc/host-patch {host,preview:true}` and return the list of VMs that
+/// would be evacuated first (the impact preview). Blocking — `spawn_blocking`.
+fn host_patch_preview(host: &str) -> Result<(String, Vec<String>), String> {
+    let v = dc_rpc(
+        "host-patch",
+        &serde_json::json!({"host": host, "preview": true}),
+        Duration::from_secs(120),
+    )?;
+    let vms = v
+        .get("impact")
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((host.to_string(), vms))
+}
+
+/// Fire `action/dc/ipdns` and project the correlated lease/DNS/overlay rows.
+fn ipdns_read() -> Result<Vec<IpDnsEntry>, String> {
+    let v = dc_rpc("ipdns", &serde_json::json!({}), Duration::from_secs(60))?;
+    Ok(parse_ipdns(&v))
+}
+
+/// Fire `action/dc/tofu-arm {on}` and return the resulting armed state.
+fn tofu_arm(on: bool) -> Result<bool, String> {
+    let v = dc_rpc(
+        "tofu-arm",
+        &serde_json::json!({"on": on}),
+        Duration::from_secs(30),
+    )?;
+    Ok(v.get("armed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(on))
+}
+
+/// Fire `action/dc/tofu-runlog {workspace}` and return the persisted run-log text.
+fn tofu_runlog(ws: &str) -> Result<String, String> {
+    let v = dc_rpc(
+        "tofu-runlog",
+        &serde_json::json!({"workspace": ws}),
+        Duration::from_secs(60),
+    )?;
+    Ok(v.get("log")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string())
+}
+
+/// Fire `action/dc/do-regions` and project the region list for the picker.
+fn do_regions_read() -> Result<Vec<DoRegion>, String> {
+    let v = dc_rpc("do-regions", &serde_json::json!({}), Duration::from_secs(60))?;
+    Ok(parse_do_regions(&v))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3709,6 +6259,8 @@ mod tests {
             ViewMode::Tofu,
             ViewMode::Audit,
             ViewMode::Topology,
+            ViewMode::Gateway,
+            ViewMode::Provision,
         ] {
             assert_eq!(
                 ViewMode::from_slug(mode.slug()),
@@ -4521,6 +7073,7 @@ mod tests {
             promote: Vec::new(),
             health: Vec::new(),
             jobs: Vec::new(),
+            power: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.audit.len(), 1);
@@ -4709,6 +7262,7 @@ mod tests {
             promote: Vec::new(),
             health: Vec::new(),
             jobs: Vec::new(),
+            power: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert!(p.expanded.contains("172.20.0.9"));
@@ -4915,6 +7469,7 @@ mod tests {
             }],
             health: Vec::new(),
             jobs: Vec::new(),
+            power: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.promote.len(), 1);
@@ -5050,6 +7605,7 @@ mod tests {
                 detail: String::new(),
             }],
             jobs: Vec::new(),
+            power: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.health.len(), 1);
@@ -5240,6 +7796,7 @@ mod tests {
                 ulid: "01J0001".into(),
                 status: "ok".into(),
             }],
+            power: Vec::new(),
         };
         let _ = p.update(Message::Loaded(Ok(load)));
         assert_eq!(p.jobs.len(), 1);
@@ -5390,7 +7947,7 @@ mod tests {
                     now,
                     reduce_motion: false,
                 };
-                dc_card_view(r, palette, false, motion)
+                dc_card_view(r, palette, false, None, motion)
             })
             .collect();
         // Building the grid must not panic for a short final row.
@@ -5751,6 +8308,492 @@ mod tests {
         }];
         p.rows = vec![row_with("droplet", "1", "lh-01", "active", "prod")];
         // Exercises version_matrix_view → its header + lighthouse + chip branches.
+        let _ = p.view();
+    }
+
+    // ── DATACENTER-8/1813 — per-kind sub-tabs ─────────────────────────────────
+
+    #[test]
+    fn kind_tab_matches_maps_kinds_onto_tabs() {
+        assert!(KindTab::Hosts.matches("host"));
+        assert!(!KindTab::Hosts.matches("vm"));
+        assert!(KindTab::Vms.matches("vm"));
+        assert!(KindTab::Vms.matches("droplet"));
+        assert!(KindTab::Storage.matches("sr"));
+        assert!(KindTab::Storage.matches("vdi"));
+        assert!(KindTab::Storage.matches("iso"));
+        assert!(KindTab::Network.matches("net"));
+        assert!(KindTab::Network.matches("vlan"));
+        // A kind that belongs to no tab matches none.
+        for t in KindTab::all() {
+            assert!(!t.matches("gateway"));
+        }
+    }
+
+    #[test]
+    fn kind_tab_slug_round_trips() {
+        for t in KindTab::all() {
+            assert_eq!(KindTab::from_slug(t.slug()), t);
+        }
+        // Unknown → VMs (the busy default).
+        assert_eq!(KindTab::from_slug("nonsense"), KindTab::Vms);
+    }
+
+    #[test]
+    fn kind_tab_message_switches_and_clears_bulk() {
+        let mut p = DatacenterPanel::new();
+        p.bulk_mode = true;
+        p.bulk_sel.insert("v1".to_string());
+        // Switching to a non-VM tab drops the bulk selection.
+        let _ = p.update(Message::KindTab(KindTab::Hosts));
+        assert_eq!(p.kind_tab, KindTab::Hosts);
+        assert!(!p.bulk_mode);
+        assert!(p.bulk_sel.is_empty());
+    }
+
+    #[test]
+    fn zone_view_renders_each_kind_subtab_without_panicking() {
+        let mut p = DatacenterPanel::new();
+        p.rows = project_rows(&[
+            (
+                "event/dc/host/a".into(),
+                r#"{"kind":"host","id":"172.20.0.9","name":"dom0-a","status":"up","zone":"dev","cpu":"8","mem_total_mb":"16000","mem_free_mb":"9000","load":"0.4"}"#.into(),
+            ),
+            (
+                "event/dc/vm/9".into(),
+                r#"{"kind":"vm","id":"9","name":"builder","status":"running","zone":"dev","host":"172.20.0.9"}"#.into(),
+            ),
+            (
+                "event/dc/sr/1".into(),
+                r#"{"kind":"sr","id":"sr-1","name":"local-ext","size":"222330230784","used":"42949672960","host":"172.20.0.9","zone":"dev"}"#.into(),
+            ),
+            (
+                "event/dc/net/0".into(),
+                r#"{"kind":"net","id":"net-0","name":"Pool-wide","status":"up","zone":"dev","bridge":"xenbr0"}"#.into(),
+            ),
+            (
+                "event/dc/iso/x".into(),
+                r#"{"kind":"iso","id":"iso-1","name":"fedora.iso","status":"ready","zone":"dev"}"#.into(),
+            ),
+        ]);
+        let _ = p.update(Message::ViewMode(ViewMode::Zone));
+        let _ = p.update(Message::ZoneTab("dev".to_string()));
+        for t in KindTab::all() {
+            let _ = p.update(Message::KindTab(t));
+            let _ = p.view();
+        }
+    }
+
+    // ── DATACENTER-11 — VM lifecycle ──────────────────────────────────────────
+
+    #[test]
+    fn suspend_clicked_sets_status_for_each_direction() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::SuspendClicked {
+            uuid: "v1".into(),
+            dom0: "172.20.0.9".into(),
+            resume: false,
+        });
+        assert_eq!(p.status, "Suspending…");
+        let _ = p.update(Message::SuspendClicked {
+            uuid: "v1".into(),
+            dom0: "172.20.0.9".into(),
+            resume: true,
+        });
+        assert_eq!(p.status, "Resuming…");
+    }
+
+    #[test]
+    fn migrate_arms_picker_and_needs_a_target() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::MigrateClicked {
+            uuid: "v1".into(),
+            dom0: "172.20.0.9".into(),
+        });
+        assert_eq!(p.migrate.as_ref().map(|(u, _)| u.as_str()), Some("v1"));
+        // Confirm without a target is a no-op that asks for one.
+        let _ = p.update(Message::MigrateConfirmed);
+        assert!(p.migrate.is_some(), "still armed until a target is picked");
+        assert_eq!(p.status, "Pick a target host first.");
+        // Pick a target, then confirm clears the picker + sets in-flight status.
+        let _ = p.update(Message::MigrateTargetPicked("172.20.145.193".into()));
+        let _ = p.update(Message::MigrateConfirmed);
+        assert!(p.migrate.is_none());
+        assert_eq!(p.status, "Migrating to 172.20.145.193…");
+        // Cancel path.
+        let _ = p.update(Message::MigrateClicked {
+            uuid: "v2".into(),
+            dom0: "h".into(),
+        });
+        let _ = p.update(Message::MigrateCancelled);
+        assert!(p.migrate.is_none());
+    }
+
+    #[test]
+    fn bulk_mode_select_and_op_track_selection() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::BulkModeToggled);
+        assert!(p.bulk_mode);
+        let _ = p.update(Message::BulkSelectToggled("v1".into()));
+        let _ = p.update(Message::BulkSelectToggled("v2".into()));
+        assert_eq!(p.bulk_sel.len(), 2);
+        // Toggling again deselects.
+        let _ = p.update(Message::BulkSelectToggled("v1".into()));
+        assert_eq!(p.bulk_sel.len(), 1);
+        // A bulk op seeds per-item progress for the selected set.
+        let _ = p.update(Message::BulkOp("shutdown".into()));
+        assert!(p.bulk_progress.contains_key("v2"));
+        // The results land per item.
+        let _ = p.update(Message::BulkDone(Ok(vec![("v2".into(), "ok".into())])));
+        assert_eq!(p.bulk_progress.get("v2").map(String::as_str), Some("ok"));
+        // Exiting bulk mode clears selection.
+        let _ = p.update(Message::BulkModeToggled);
+        assert!(!p.bulk_mode);
+        assert!(p.bulk_sel.is_empty());
+    }
+
+    #[test]
+    fn bulk_op_with_no_selection_is_a_noop() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::BulkModeToggled);
+        let _ = p.update(Message::BulkOp("start".into()));
+        assert_eq!(p.status, "No VMs selected.");
+        assert!(p.bulk_progress.is_empty());
+    }
+
+    #[test]
+    fn create_wizard_validates_required_fields() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::CreateToggled);
+        assert!(p.create_open);
+        // Empty template/name → submit refuses (no in-flight).
+        let _ = p.update(Message::CreateSubmit);
+        assert_eq!(p.status, "Template and name are both required.");
+        assert!(p.create_open, "stays open until a valid submit");
+        // Fill both → submit closes the wizard + sets in-flight status.
+        let _ = p.update(Message::CreateTemplateChanged("MDE-VM-golden".into()));
+        let _ = p.update(Message::CreateNameChanged("builder-2".into()));
+        let _ = p.update(Message::CreateSubmit);
+        assert!(!p.create_open);
+        assert_eq!(p.status, "Creating builder-2 from MDE-VM-golden…");
+    }
+
+    #[test]
+    fn vm_console_done_ok_sets_status_to_the_url() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::VmConsoleDone(Ok("https://novnc.example/1".into())));
+        assert_eq!(p.status, "console: https://novnc.example/1");
+        let _ = p.update(Message::VmConsoleDone(Err("no console".into())));
+        assert_eq!(p.status, "no console");
+    }
+
+    // ── DATACENTER-10/16 — host lifecycle + power ─────────────────────────────
+
+    #[test]
+    fn host_evacuate_arms_confirm_then_fires() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::HostEvacuateClicked("172.20.0.9".into()));
+        assert_eq!(
+            p.host_confirm.as_ref().map(|(h, o)| (h.as_str(), o.as_str())),
+            Some(("172.20.0.9", "evacuate"))
+        );
+        let _ = p.update(Message::HostConfirmed);
+        assert!(p.host_confirm.is_none());
+        assert_eq!(p.status, "evacuate 172.20.0.9…");
+    }
+
+    #[test]
+    fn host_patch_preview_arms_a_patch_confirm() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::HostPatchPreviewDone(Ok((
+            "172.20.0.9".into(),
+            vec!["builder".into(), "tester".into()],
+        ))));
+        assert_eq!(
+            p.host_patch_preview.as_ref().map(|(h, v)| (h.as_str(), v.len())),
+            Some(("172.20.0.9", 2))
+        );
+        assert_eq!(
+            p.host_confirm.as_ref().map(|(_, o)| o.as_str()),
+            Some("patch")
+        );
+        // Cancel clears both.
+        let _ = p.update(Message::HostCancelled);
+        assert!(p.host_confirm.is_none());
+        assert!(p.host_patch_preview.is_none());
+    }
+
+    #[test]
+    fn idle_policy_toggles_optimistically() {
+        let mut p = DatacenterPanel::new();
+        assert!(!p.idle_policy_on);
+        let _ = p.update(Message::IdlePolicyToggled);
+        assert!(p.idle_policy_on);
+    }
+
+    #[test]
+    fn parse_power_event_and_progress() {
+        let ps = parse_power_event(
+            r#"{"host":"172.20.0.9","phase":"xcp","pct":"45","eta_secs":"30"}"#,
+        )
+        .unwrap();
+        assert_eq!(ps.host, "172.20.0.9");
+        assert_eq!(ps.pct_clamped(), 45);
+        assert_eq!(ps.phase_label(), "XCP boot");
+        // An over-100 pct clamps; a missing pct is 0.
+        let hot = parse_power_event(r#"{"host":"h","phase":"post","pct":"250"}"#).unwrap();
+        assert_eq!(hot.pct_clamped(), 100);
+        let none = parse_power_event(r#"{"host":"h","phase":"post"}"#).unwrap();
+        assert_eq!(none.pct_clamped(), 0);
+        // Missing host → None.
+        assert!(parse_power_event(r#"{"phase":"post"}"#).is_none());
+    }
+
+    #[test]
+    fn project_power_drops_ready_and_sorts() {
+        let events = vec![
+            (
+                "event/dc/power/172.20.0.9".into(),
+                r#"{"host":"172.20.0.9","phase":"xcp","pct":"40"}"#.into(),
+            ),
+            (
+                "event/dc/power/172.20.0.8".into(),
+                r#"{"host":"172.20.0.8","phase":"ready","pct":"100"}"#.into(),
+            ),
+            // Not a power topic → dropped.
+            (
+                "event/dc/vm/9".into(),
+                r#"{"kind":"vm","id":"9","status":"running","zone":"dev"}"#.into(),
+            ),
+        ];
+        let rows = project_power(&events);
+        assert_eq!(rows.len(), 1, "ready dropped, non-power dropped");
+        assert_eq!(rows[0].host, "172.20.0.9");
+    }
+
+    #[test]
+    fn progress_bar_fills_proportionally() {
+        assert_eq!(progress_bar(0), "░░░░░░░░");
+        assert_eq!(progress_bar(100), "████████");
+        assert_eq!(progress_bar(50).chars().count(), 8);
+        // Over-100 is clamped to a full bar.
+        assert_eq!(progress_bar(250), "████████");
+    }
+
+    #[test]
+    fn loaded_populates_power() {
+        let mut p = DatacenterPanel::new();
+        let load = DcLoad {
+            power: vec![PowerStatus {
+                host: "172.20.0.9".into(),
+                phase: "post".into(),
+                pct: "10".into(),
+                eta_secs: "60".into(),
+            }],
+            ..DcLoad::default()
+        };
+        let _ = p.update(Message::Loaded(Ok(load)));
+        assert_eq!(p.power.len(), 1);
+    }
+
+    // ── DATACENTER-12 — storage ───────────────────────────────────────────────
+
+    #[test]
+    fn sr_destroy_requires_confirm() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::SrDestroyClicked("sr-1".into()));
+        assert_eq!(p.sr_confirm_destroy.as_deref(), Some("sr-1"));
+        let _ = p.update(Message::SrDestroyConfirmed("sr-1".into()));
+        assert!(p.sr_confirm_destroy.is_none());
+        assert_eq!(p.status, "Destroying sr-1…");
+        // Cancel path.
+        let _ = p.update(Message::SrDestroyClicked("sr-2".into()));
+        let _ = p.update(Message::SrDestroyCancelled);
+        assert!(p.sr_confirm_destroy.is_none());
+    }
+
+    // ── DATACENTER-13 — network + IP/DNS ──────────────────────────────────────
+
+    #[test]
+    fn parse_ipdns_reads_correlated_entries() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"entries":[{"name":"eagle","lease_ip":"172.20.0.2","dns":"eagle.mesh","overlay_ip":"10.42.0.2"},{"name":"lh1"}]}"#,
+        )
+        .unwrap();
+        let rows = parse_ipdns(&v);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "eagle");
+        assert_eq!(rows[0].overlay_ip, "10.42.0.2");
+        // Missing fields default empty.
+        assert_eq!(rows[1].lease_ip, "");
+        // No entries → empty.
+        assert!(parse_ipdns(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn ipdns_done_populates_the_table() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::IpDnsDone(Ok(vec![IpDnsEntry {
+            name: "eagle".into(),
+            lease_ip: "172.20.0.2".into(),
+            dns: "eagle.mesh".into(),
+            overlay_ip: "10.42.0.2".into(),
+        }])));
+        assert_eq!(p.ipdns.len(), 1);
+    }
+
+    // ── DATACENTER-14 — gateway ───────────────────────────────────────────────
+
+    #[test]
+    fn gateway_firewall_requires_a_rule() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::GwFirewallClicked);
+        assert_eq!(p.status, "Enter a firewall rule first.");
+        let _ = p.update(Message::GwFwRuleChanged("allow tcp 443".into()));
+        let _ = p.update(Message::GwFirewallClicked);
+        assert_eq!(p.status, "Adding firewall rule…");
+        assert!(p.gw_fw_rule.is_empty(), "the input clears on submit");
+    }
+
+    #[test]
+    fn gateway_view_renders() {
+        let mut p = DatacenterPanel::new();
+        p.rows = project_rows(&[(
+            "event/dc/gateway/gw0".into(),
+            r#"{"kind":"gateway","id":"gw0","name":"unifi-gw","status":"up","zone":"prod"}"#.into(),
+        )]);
+        let _ = p.update(Message::ViewMode(ViewMode::Gateway));
+        let _ = p.view();
+    }
+
+    // ── DATACENTER-15 — Tofu prod-arm + run-log ───────────────────────────────
+
+    #[test]
+    fn prod_apply_is_refused_while_disarmed() {
+        let mut p = DatacenterPanel::new();
+        // Disarmed: a prod (zone1-do) apply confirm is refused, no in-flight.
+        let _ = p.update(Message::TofuApply("zone1-do".into()));
+        assert!(p.status.contains("disarmed"));
+        assert_ne!(p.tofu_output, "Applying zone1-do…");
+        // Arm prod, then the apply proceeds.
+        let _ = p.update(Message::TofuArmDone(Ok(true)));
+        assert!(p.tofu_armed);
+        let _ = p.update(Message::TofuApply("zone1-do".into()));
+        assert_eq!(p.status, "Applying zone1-do…");
+    }
+
+    #[test]
+    fn dev_apply_is_allowed_while_disarmed() {
+        let mut p = DatacenterPanel::new();
+        // The Dev (xen-xapi) workspace is never gated by prod-arm.
+        let _ = p.update(Message::TofuApply("xen-xapi".into()));
+        assert_eq!(p.status, "Applying xen-xapi…");
+    }
+
+    #[test]
+    fn tofu_runlog_done_populates_the_log() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::TofuRunlogDone(Ok("apply 11:00 ok".into())));
+        assert_eq!(p.tofu_runlog, "apply 11:00 ok");
+    }
+
+    // ── DATACENTER-19/18/21 — provisioning ────────────────────────────────────
+
+    #[test]
+    fn parse_do_regions_and_geo_and_spread() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"regions":[{"slug":"sfo3","name":"San Francisco 3","available":true},{"slug":"nyc1","name":"New York 1"},{"slug":"bad"}]}"#,
+        )
+        .unwrap();
+        // Wait — {"slug":"bad"} is a valid region (name defaults to slug).
+        let rs = parse_do_regions(&v);
+        assert_eq!(rs.len(), 3);
+        // Sorted by slug: bad < nyc1 < sfo3.
+        assert_eq!(rs[0].slug, "bad");
+        assert_eq!(rs[2].slug, "sfo3");
+        assert_eq!(rs[1].geo(), "nyc");
+        // available defaults true when absent.
+        assert!(rs[1].available);
+        // Distinct geos across a spread of slugs.
+        assert_eq!(
+            distinct_geos(&["sfo3".into(), "sfo2".into(), "nyc1".into()]),
+            2
+        );
+    }
+
+    #[test]
+    fn genesis_validates_name_and_region() {
+        let mut p = DatacenterPanel::new();
+        // No region → asks for one.
+        let _ = p.update(Message::GenesisNameChanged("nebula-2".into()));
+        let _ = p.update(Message::GenesisSubmit);
+        assert_eq!(p.provision_status, "Pick a region for the new mesh.");
+        // Region but blank name → asks for a name.
+        let _ = p.update(Message::GenesisRegionPicked("fra1".into()));
+        let _ = p.update(Message::GenesisNameChanged("   ".into()));
+        let _ = p.update(Message::GenesisSubmit);
+        assert_eq!(p.provision_status, "Name the new mesh first.");
+        // Both → in-flight.
+        let _ = p.update(Message::GenesisNameChanged("nebula-2".into()));
+        let _ = p.update(Message::GenesisSubmit);
+        assert_eq!(p.provision_status, "Giving birth to nebula-2 in fra1…");
+    }
+
+    #[test]
+    fn guided_lighthouse_needs_a_region() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::GuidedLighthouseClicked);
+        assert_eq!(p.provision_status, "Pick a region first.");
+        let _ = p.update(Message::RegionPicked("sfo3".into()));
+        let _ = p.update(Message::GuidedLighthouseClicked);
+        assert_eq!(p.provision_status, "Provisioning a lighthouse in sfo3…");
+    }
+
+    #[test]
+    fn regions_done_populates_the_picker() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::RegionsDone(Ok(vec![DoRegion {
+            slug: "sfo3".into(),
+            name: "SF3".into(),
+            available: true,
+        }])));
+        assert_eq!(p.do_regions.len(), 1);
+    }
+
+    #[test]
+    fn provision_and_gateway_views_render_with_state() {
+        let mut p = DatacenterPanel::new();
+        p.do_regions = vec![DoRegion {
+            slug: "sfo3".into(),
+            name: "SF3".into(),
+            available: true,
+        }];
+        p.rows = project_rows(&[
+            (
+                "event/dc/droplet/2".into(),
+                r#"{"kind":"droplet","id":"2","name":"lh-01","status":"active","zone":"prod"}"#.into(),
+            ),
+            (
+                "event/dc/testmesh/t1".into(),
+                r#"{"kind":"testmesh","id":"t1","name":"ephemeral","status":"up","zone":"dev"}"#.into(),
+            ),
+        ]);
+        let _ = p.update(Message::ViewMode(ViewMode::Provision));
+        let _ = p.view();
+    }
+
+    // ── DATACENTER-20 — promotion controls ────────────────────────────────────
+
+    #[test]
+    fn promote_controls_toggle_optimistically() {
+        let mut p = DatacenterPanel::new();
+        let _ = p.update(Message::AutoPromoteToggled);
+        assert!(p.auto_promote);
+        let _ = p.update(Message::PromoteArmToggled);
+        assert!(p.promote_armed);
+        let _ = p.update(Message::PromoteNowClicked);
+        assert_eq!(p.status, "Promoting…");
+        // Overview renders the controls.
         let _ = p.view();
     }
 }
