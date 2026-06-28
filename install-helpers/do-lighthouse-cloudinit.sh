@@ -86,5 +86,23 @@ systemctl enable --now nebula.service mackesd.service mesh-health.timer \
     || fail "could not start mesh services"
 log "services up (boot-durable) — /enroll endpoint live on $PUBLIC_IP:$ENROLL_PORT"
 
+# 5b. First-boot helper-binary fetches (#17 — turn-key broker). The RPM
+#     post_install only `enable`s mesh-broker-setup (the ntfy notification
+#     broker), mesh-netdata-setup, and mesh-shell-setup — NOT `--now`, so the
+#     dnf transaction never blocks on network-online.target. On a freshly
+#     provisioned lighthouse that never reboots, that leaves no ntfy broker (the
+#     mesh-wide notification distribution the health watchdog feeds) until the
+#     first reboot. Start them now (post-boot, the network is up). ntfy is
+#     bundled in the RPM vendor dir (offline, near-instant); the others self-skip
+#     once their binary exists. --no-block so a slow upstream fetch never stalls
+#     cloud-init, and each oneshot is idempotent.
+for unit in mesh-broker-setup.service mesh-netdata-setup.service mesh-shell-setup.service; do
+    if systemctl start --no-block "$unit" 2>/dev/null; then
+        log "kicked $unit (first-boot provisioning)"
+    else
+        log "$unit stays enabled — will run at next boot"
+    fi
+done
+
 echo "OK $PUBLIC_IP $ENROLL_PORT" >"$STATUS_FILE"
 log "lighthouse ready. Add a peer with:  mackesd join '$JOIN_TOKEN'"
