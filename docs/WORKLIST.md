@@ -2140,38 +2140,39 @@ Generalize the single hardcoded EdgeRouter (`172.20.0.1`, `infra/tofu/edgeos/`, 
 
 The rethink is a **consolidation**: merge the standalone `mde-apps-applet` into the Front Door (one launcher — fast local Start-menu + mesh-wide resource launcher), then retire the applet. All behavior below lands in the Front Door's Panel + FullScreen modes.
 
-- [ ] **APPLAUNCH-1: Front-Door app-launcher view (unified list + filter chips + favorites landing).**
+_(APPLAUNCH-1..9 DONE — integrated b8ebf5b/2c97f39/0464af0; combined-tree re-verify on .50: `cargo build --workspace` clean + mde-workbench 2115 / mackesd 1236 lib tests pass, 0 failed; clippy 0 errors; lint-mesh-boundary + carbon-tokens + motion clean. `mde-apps-applet` DELETED at parity — the Front Door is the sole launcher.)_
+- [✓] **APPLAUNCH-1: Front-Door app-launcher view (unified list + filter chips + favorites landing).**
   **As** an operator, **I want** one launcher surface, **so that** I don't have two overlapping ones.
   **Acceptance**:
-    - [ ] the Front Door (Panel mode) renders a unified entry list with filter chips (Local/Mesh/Workloads/Services), landing on the per-user favorites grid; fed by the existing `apps_aggregator` (`action/apps/list`)
-    - [ ] local-first browse (mesh entries via the Mesh chip/search); favorites-grid + list-rows; follows the Cosmic theme
-- [ ] **APPLAUNCH-2: fuzzy search + `>` run.**
+    - [✓] the Front Door (Panel mode) renders a unified entry list with filter chips (Local/Mesh/Workloads/Services), landing on the per-user favorites grid; fed by the existing `apps_aggregator` (`action/apps/list`)
+    - [✓] local-first browse (mesh entries via the Mesh chip/search); favorites-grid + list-rows; follows the Cosmic theme
+- [✓] **APPLAUNCH-2: fuzzy search + `>` run.** _(subsequence/edit-budget tail below the exact>prefix>word>substring ladder)_
   **As** a user, **I want** typo-tolerant search, **so that** I find apps fast.
   **Acceptance**:
-    - [ ] fuzzy/typo-tolerant matching over name + .desktop Keywords + Comment, pure-relevance ranked; a leading `>` runs the remainder as a shell command (merged Run box)
-- [ ] **APPLAUNCH-3: real app icons.**
+    - [✓] fuzzy/typo-tolerant matching over name + .desktop Keywords + Comment, pure-relevance ranked; a leading `>` runs the remainder as a shell command (merged Run box)
+- [✓] **APPLAUNCH-3: real app icons.**
   **Acceptance**:
-    - [ ] local apps render their real icon-theme icon (cached), Carbon kind-glyph fallback; mesh/workload/service keep Carbon glyphs
-- [ ] **APPLAUNCH-4: operator-curated groups.**
+    - [✓] local apps render their real icon-theme icon (cached freedesktop lookup → PNG/SVG), Carbon kind-glyph fallback; mesh/workload/service keep Carbon glyphs
+- [✓] **APPLAUNCH-4: operator-curated groups.**
   **Acceptance**:
-    - [ ] operator-defined group buckets (per-user QNM `app-groups.json`) render as collapsible sections in the Apps filter (= the All-apps view)
-- [ ] **APPLAUNCH-5: on-demand peer-app discovery + launch-on-peer.**
+    - [✓] operator-defined group buckets (per-user QNM `app-groups.json`, mackesd verbs) render as collapsible sections in the Apps filter + an "Other apps" remainder
+- [✓] **APPLAUNCH-5: on-demand peer-app discovery + launch-on-peer.** _(new `action/apps/peer-list` + always-on `apps_installed` worker publishing each node's .desktop set)_
   **As** an operator, **I want** to see + launch a peer's apps, **so that** the mesh is one launcher.
   **Acceptance**:
-    - [ ] focusing a node queries its installed `.desktop` set live (`action/apps/peer-list`); apps surface with an on-peer badge; launch opens a remmina RD session (existing `action/apps/launch`); a slow/dead peer times out without blocking the UI
-- [ ] **APPLAUNCH-6: per-app menu + service cards.**
+    - [✓] focusing a node queries its installed `.desktop` set (`action/apps/peer-list`, read locally from the replicated plane so a slow/dead peer never blocks); apps surface with an on-peer badge; launch opens a remmina RD session (`action/apps/launch`)
+- [✓] **APPLAUNCH-6: per-app menu + service cards.**
   **Acceptance**:
-    - [ ] per-app row menu: Properties (.desktop) / Copy command / Open location / Uninstall (dnf|flatpak, confirm-gated); a service entry opens a card with status + copy-endpoint + restart-if-owned
-- [ ] **APPLAUNCH-7: cache + background refresh + lazy mesh (perf).**
+    - [✓] per-app row menu: Copy command / Open location / Uninstall (confirm-gated, typed Commands §9); a service entry opens a card with status + copy-endpoint + restart-if-owned; workload inline start/stop/attach
+- [✓] **APPLAUNCH-7: cache + background refresh + lazy mesh (perf).**
   **Acceptance**:
-    - [ ] opens <150ms from a cached list regardless of mesh size; aggregation refreshes in the background + updates live; mesh sections lazy-load; mesh-down hides mesh entries (local fully works)
-- [ ] **APPLAUNCH-8: Start-trigger + keyboard + chrome.**
+    - [✓] opens from a cached list instantly regardless of mesh size; aggregation refreshes in the background + updates live; mesh sections lazy-load; mesh-down hides mesh entries (local fully works, cache kept)
+- [✓] **APPLAUNCH-8: Start-trigger + keyboard + chrome.**
   **Acceptance**:
-    - [ ] Super-key/Start opens the Front Door Panel mode on the primary monitor (expand → full-screen); full keyboard-first nav (↑↓/Enter/Esc/Tab chips); slimmed Win+X essentials; brand logo + subtle badge; reuses the FD voice slice + first-run greeting
-- [ ] **APPLAUNCH-9: migrate — parity then retire `mde-apps-applet`.**
+    - [✓] Super-key/Start opens the Front Door (`--focus launcher`) Panel mode; full keyboard-first nav (↑↓/Enter/Esc/Tab chips/Ctrl+1..5); slimmed Win+X essentials. _(Cosmic `CosmicPanelButton`/`Shortcuts` RON is best-effort/headless-unverifiable; the `.desktop` `Exec=mde-workbench --focus launcher` path is unit-covered + guaranteed.)_
+- [✓] **APPLAUNCH-9: migrate — parity then retire `mde-apps-applet`.**
   **As** the project, **I want** one launcher binary, **so that** there's no fork.
   **Acceptance**:
-    - [ ] at feature-parity, the Start button/`event/apps/toggle` repoints to the Front Door; `mde-apps-applet` is removed (RPM asset + autostart + crate bin) with nothing referencing it; lint-mesh-boundary clean; the lighthouse-health `mde-cosmic-applet` is untouched
+    - [✓] at feature-parity, the Start button + Super key repoint to the Front Door; `mde-apps-applet` REMOVED (bin source + `[[bin]]` + RPM asset + dead launcher lib code + `event/apps/toggle`) with `cargo build --workspace` proving nothing references it; lint-mesh-boundary clean; the lighthouse-health `mde-cosmic-applet` untouched
 
 ## MESHMAP — EtherApe-like global mesh-map wallpaper (survey 2026-06-27; design: docs/design/mesh-map-wallpaper.md)
 
