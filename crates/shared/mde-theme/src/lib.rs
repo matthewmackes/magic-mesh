@@ -59,6 +59,7 @@ pub mod frame_timer;
 // surfaces, which Cosmic owns post-E11; zero workspace callers. The
 // shadow specs live on in `shadows` (consumed via `Theme::modal_shadow`).
 pub mod hero;
+pub mod hue;
 pub mod icons;
 pub mod load_state;
 pub mod motion;
@@ -93,6 +94,7 @@ pub use feedback::{
     HOVER_LIFT_PX, PRESS_DEPTH,
 };
 pub use frame_timer::{ArmedTimer, FrameSample, FrameStats, FrameTimer, FRAME_DEBUG_ENV};
+pub use hue::{hostname_seed, hsl_to_rgba, node_hue, node_hue_for, NODE_LIGHT, NODE_SAT};
 pub use icons::{
     icon_for_device_type, mde_icon, FillMode, Icon, IconSize, IconState, ResolvedIcon,
     MATERIAL_LINE_WEIGHT_PX,
