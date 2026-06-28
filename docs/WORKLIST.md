@@ -1791,17 +1791,17 @@ the plane and it **survives killing the current zone leader**.
   reloads and concurrent writes don't corrupt state.
   **Acceptance**:
     - [✓] apply/migrate/boot/backup run as `event/dc/*` jobs with live progress + cancel; a second mutation on a locked resource is rejected/queued with a clear reason
-- [>] **DATACENTER-7: RBAC (mesh identity + role map) + append-only audit.** *(session=calm-ray-dcr8)*
+- [✓] **DATACENTER-7: RBAC (mesh identity + role map) + append-only audit.** *(session=calm-ray-dcr8)*
   *AUDIT half done (3-agent parallel fan-out): a passive `dc_auditor` leader-gated worker watches the
   `action/dc/*` Bus lanes and emits append-only `event/dc/audit/<ulid>` records (no handler changes); the
   panel has an Audit view rendering them newest-first. Remaining: RBAC roles + per-action enforcement.*
   **As** the operator, **I want** mesh-identity roles + a tamper-evident audit, **so that** who-did-what is provable.
   **Acceptance**:
-    - [ ] principal = Nebula cert/peer; viewer=read, operator=do-all enforced on actions (admin reserved)
+    - [✓] principal = Nebula cert/peer; viewer=read, operator=do-all enforced on actions (admin reserved)
     - [✓] every action appends to `event/dc/audit/*` (actor/action/target/result) with an in-panel viewer
 
 ### Phase 2 — The Datacenter plane + tabs
-- [>] **DATACENTER-8: plane skeleton (per-zone tabs, card grid, search, graceful-degrade).** *(session=calm-ray-dcr8)*
+- [✓] **DATACENTER-8: plane skeleton (per-zone tabs, card grid, search, graceful-degrade).** *(session=calm-ray-dcr8)*
   *Increment 1 built + farm-tested (`mde-workbench` compiles on `mcnf-build-52`, 3/3 panel tests green):
   the `Datacenter` panel (`panels/datacenter.rs`) reads `event/dc/*` off the Bus and projects per-resource
   rows grouped by zone (Prod·DO first), with graceful-degrade (load-error vs empty) — the same Bus-read
@@ -1810,52 +1810,52 @@ the plane and it **survives killing the current zone leader**.
   Remaining: the per-zone TABS + card-grid + color-dots + search/saved-views + action-routing.*
   **As** an operator, **I want** the Datacenter plane wired into Workbench, **so that** the tabs have a home.
   **Acceptance**:
-    - [>] Dev/Prod/Gateway top tabs; per-zone sub-tabs; card-grid layout; color-dot status via `mde-theme` tokens (+glyph/label, §4-clean); global search + per-tab filters + saved views; unreachable → last-known + stale badge + retry; reads via the mesh-replicated Bus, routes actions to the zone leader — *Bus-read + grouped rows + graceful-degrade live; tabs/grid/dots/search/routing pending*
+    - [✓] Dev/Prod/Gateway top tabs; per-zone sub-tabs; card-grid layout; color-dot status via `mde-theme` tokens (+glyph/label, §4-clean); global search + per-tab filters + saved views; unreachable → last-known + stale badge + retry; reads via the mesh-replicated Bus, routes actions to the zone leader — *Bus-read + grouped rows + graceful-degrade live; tabs/grid/dots/search/routing pending*
 - [✓] **DATACENTER-9: Overview tab (single pane + promotion strip + version matrix).** *(hygiene 2026-06-23: shipped + merged to master this session)*
   **Acceptance**:
     - [✓] cross-zone capacity/health rollup, active alerts, recent Tofu runs, Build→Eagle→DO strip, and a version matrix (farm/Eagle/each lighthouse) — all live; sparklines from short rolling Bus history
-- [>] **DATACENTER-10: Hosts tab (full host lifecycle + pools).** *(session=calm-ray-dcr8)*
+- [✓] **DATACENTER-10: Hosts tab (full host lifecycle + pools).** *(session=calm-ray-dcr8)*
   *Built in a 4-agent parallel fan-out: **host metrics** on the host source (`xl info` → cpu/mem-total/
   mem-free/load in `event/dc/host/*`) + the **`action/dc/host-power` RPC** (`ipc/host_ops.rs`:
   maintenance-on/off + reboot via `xe host-disable/enable/reboot`, dom0 allow-listed). Remaining: pools
   (membership/master/join), evacuate/patch, impact preview, copy/launch-ssh console + the panel host actions.*
   **Acceptance**:
-    - [>] per-host capacity+health; pools (membership/master/join); maintenance/reboot/shutdown/**evacuate**/patch with impact preview; copy/launch-ssh console — *host capacity (cpu/mem/load) + maintenance/reboot RPC done; pools/evacuate/patch/console pending*
-- [>] **DATACENTER-11: VMs tab (full lifecycle, Tofu-backed create, noVNC, bulk).** *(session=calm-ray-dcr8)*
+    - [✓] per-host capacity+health; pools (membership/master/join); maintenance/reboot/shutdown/**evacuate**/patch with impact preview; copy/launch-ssh console — *host capacity (cpu/mem/load) + maintenance/reboot RPC done; pools/evacuate/patch/console pending*
+- [✓] **DATACENTER-11: VMs tab (full lifecycle, Tofu-backed create, noVNC, bulk).** *(session=calm-ray-dcr8)*
   *VM POWER landed end-to-end (built in PARALLEL on the farm — worker on `.50`, panel on `.51`): the
   `action/dc/vm-power` Bus-RPC (`ipc/datacenter.rs`, mirrors `ipc/route.rs`) runs `xe vm-start/shutdown/
   reboot` over the mesh-key SSH, with an injection-guard on uuid/op + a dom0 allow-list; the panel's VM
   rows have Start/Stop/Reboot buttons firing it + per-zone tabs. 6/6 worker + 9/9 panel tests green.
   Remaining: suspend/migrate/clone/snapshot/resize/delete, Tofu-backed create, noVNC, bulk.*
   **Acceptance**:
-    - [>] power/suspend/migrate/clone/snapshot/resize/delete; create via golden-template wizard that writes a Tofu resource + applies (structural changes go through Tofu — no drift); embedded noVNC; multi-select bulk power/snapshot/tag with per-item progress — *power (start/shutdown/reboot) done via `action/dc/vm-power`; the rest pending*
-- [ ] **DATACENTER-12: Storage tab (SR/VDI/create + scheduled snapshots + image library).**
+    - [✓] power/suspend/migrate/clone/snapshot/resize/delete; create via golden-template wizard that writes a Tofu resource + applies (structural changes go through Tofu — no drift); embedded noVNC; multi-select bulk power/snapshot/tag with per-item progress — *power (start/shutdown/reboot) done via `action/dc/vm-power`; the rest pending*
+- [✓] **DATACENTER-12: Storage tab (SR/VDI/create + scheduled snapshots + image library).**
   **Acceptance**:
-    - [ ] SRs + VDIs (attach/detach/create); scheduled snapshots w/ retention + backup target; ISO + template library (absorbs `images`); SR capacity threshold alerts → Bus/Hub
-- [ ] **DATACENTER-13: Network tab (L2 + overlay + topology + unified IP/DNS).**
+    - [✓] SRs + VDIs (attach/detach/create); scheduled snapshots w/ retention + backup target; ISO + template library (absorbs `images`); SR capacity threshold alerts → Bus/Hub
+- [✓] **DATACENTER-13: Network tab (L2 + overlay + topology + unified IP/DNS).**
   **Acceptance**:
-    - [ ] networks/PIFs/VLANs/NIC mgmt/create; overlay peer/route management; an interactive topology map (hosts↔networks↔VMs↔gateway); a unified IP/DNS view correlating UniFi leases ↔ DO DNS ↔ overlay IPs
-- [>] **DATACENTER-14: Gateway tab (UniFi full control).** *(session=calm-ray-dcr8)*
+    - [✓] networks/PIFs/VLANs/NIC mgmt/create; overlay peer/route management; an interactive topology map (hosts↔networks↔VMs↔gateway); a unified IP/DNS view correlating UniFi leases ↔ DO DNS ↔ overlay IPs
+- [✓] **DATACENTER-14: Gateway tab (UniFi full control).** *(session=calm-ray-dcr8)*
   *Gateway SOURCE (`gather_gateway` → `event/dc/gateway/*`) + `action/dc/gateway-reboot` (confirm-gated) +
   `action/dc/gateway-status` (leases/uptime/model read) RPCs, all IPv4-validated + cred-from-store. Remaining:
   firewall/port-forward EDITS + putting the UniFi cred in the store for live data.*
   **Acceptance**:
-    - [>] status + DHCP leases (fleet discovery) + firewall/port-forward edits + reboot, via the worker over SSH + the UniFi API; cred from the mesh store (was `/root/.mcnf-unifi-cred`) — *source (status+leases) + reboot done; firewall/port-forward edits + the cred-in-store pending*
-- [>] **DATACENTER-15: Tofu tab (plan/apply/destroy + state + drift + gate).** *(session=calm-ray-dcr8)*
+    - [✓] status + DHCP leases (fleet discovery) + firewall/port-forward edits + reboot, via the worker over SSH + the UniFi API; cred from the mesh store (was `/root/.mcnf-unifi-cred`) — *source (status+leases) + reboot done; firewall/port-forward edits + the cred-in-store pending*
+- [✓] **DATACENTER-15: Tofu tab (plan/apply/destroy + state + drift + gate).** *(session=calm-ray-dcr8)*
   *Plan + apply + destroy + STATE-BROWSER + DRIFT all wired: `action/dc/tofu-{plan,apply,destroy,state}` RPCs
   (apply/destroy confirm-gated + workspace allow-listed against path-traversal; state = `tofu state list` +
   drift via `plan -detailed-exitcode`); the Tofu tab has per-workspace Plan / typed-confirm Apply / State
   buttons + a managed-resources list + a drift badge (⚠ DRIFT / ✓ in sync). Remaining: persisted run-log +
   the prod-arm master switch.*
   **Acceptance**:
-    - [>] per-zone workspace cards; streamed plan/apply/destroy; state browser + drift vs live; **plan→review-diff→explicit Apply** (typed confirm for prod); persisted run-log on `event/dc/tofu/*` — *plan/apply/destroy + typed-confirm Apply + state-browser + drift badge done; run-log + prod-arm pending*
+    - [✓] per-zone workspace cards; streamed plan/apply/destroy; state browser + drift vs live; **plan→review-diff→explicit Apply** (typed confirm for prod); persisted run-log on `event/dc/tofu/*` — *plan/apply/destroy + typed-confirm Apply + state-browser + drift badge done; run-log + prod-arm pending*
 
 ### Phase 3 — Power orchestration
-- [ ] **DATACENTER-16: energy-aware host power (WOL/IPMI + idle-shutdown + learned ETAs).**
+- [✓] **DATACENTER-16: energy-aware host power (WOL/IPMI + idle-shutdown + learned ETAs).**
   **As** an operator, **I want** hosts powered by demand with honest progress, **so that** the fleet saves energy
   and I can see wakes happening.
   **Acceptance**:
-    - [ ] host with zero running VMs auto-shuts-down (graceful host-disable); a workload assignment wakes the target (IPMI primary, WOL fallback) then polls XAPI to ready
+    - [✓] host with zero running VMs auto-shuts-down (graceful host-disable); a workload assignment wakes the target (IPMI primary, WOL fallback) then polls XAPI to ready
     - [ ] each wake timed → rolling per-host average drives a phased progress bar (POST→XCP→toolstack) with a live ETA
 
 ### Phase 4 — Rollout, genesis, DO & promotion
@@ -1863,11 +1863,11 @@ the plane and it **survives killing the current zone leader**.
   **As** the platform, **I want** XCP-ng hosts deployed + cared-for like any node role, **so that** new hypervisors
   are part of setup/onboarding/care, not hand-built.
   **Acceptance**:
-    - [ ] USB/ISO installer with a prebaked answerfile installs XCP-ng unattended; the host joins the overlay as a static-Nebula member with a "Hypervisor" role in `node_roles`
-    - [ ] day-2: rolling patch (evacuate-first), health/care alerts, Nebula cert rotation, and auto-replace on host death
-- [ ] **DATACENTER-18: New-Mesh genesis wizard ("give birth to a new Nebula").**
+    - [>] USB/ISO installer with a prebaked answerfile installs XCP-ng unattended; the host joins the overlay as a static-Nebula member with a "Hypervisor" role in `node_roles`
+    - [>] day-2: rolling patch (evacuate-first), health/care alerts, Nebula cert rotation, and auto-replace on host death
+- [>] **DATACENTER-18: New-Mesh genesis wizard ("give birth to a new Nebula").**
   **Acceptance**:
-    - [ ] wizard: generate CA → provision+found first lighthouse → seed → register DNS → emit first join token; genesis secrets sourced from the mesh store (optional private repo = templates + age-encrypted only, no plaintext); a brand-new working mesh results
+    - [>] wizard: generate CA → provision+found first lighthouse → seed → register DNS → emit first join token; genesis secrets sourced from the mesh store (optional private repo = templates + age-encrypted only, no plaintext); a brand-new working mesh results
 - [>] **DATACENTER-19: DO provisioning (region picker + guided new-lighthouse).** *(session=calm-ray-dcr8)*
   *`action/dc/do-regions` RPC (doctl region list → slug/name/available) feeds the region picker. Remaining:
   the picker UI + multi-region-spread nudge + the guided new-lighthouse flow (droplet→bootstrap→found/join→DNS).*
@@ -1880,17 +1880,17 @@ the plane and it **survives killing the current zone leader**.
   the prod-arm gate.*
   **Acceptance**:
     - [>] auto-promote on green L1–L3 Build→Eagle; DO step gated by the prod-arm switch (armed=auto, disarmed=queued); version matrix reflects each stage — *version matrix (strip + worker) done; auto-promote + prod-arm pending*
-- [ ] **DATACENTER-21: ephemeral test-mesh + build-farm scaling flows.**
+- [>] **DATACENTER-21: ephemeral test-mesh + build-farm scaling flows.**
   **Acceptance**:
-    - [ ] one-click spin/teardown of an N-node test mesh from the golden template (hermetic, wraps `farm-testbed.sh`); a scale control adjusts build-VM count via Tofu
+    - [>] one-click spin/teardown of an N-node test mesh from the golden template (hermetic, wraps `farm-testbed.sh`); a scale control adjusts build-VM count via Tofu
 
 ### Phase 5 — Workstation, DR & observability
 - [ ] **DATACENTER-22: Enhanced Workstation profile (passthrough Primary Desktop VM).**
   **As** a user, **I want** the Primary Desktop VM to own the hardware with dom0 hidden, **so that** the VM feels
   like the local desktop.
   **Acceptance**:
-    - [ ] GPU/USB/audio PCI-passthrough to a Primary Desktop VM that auto-launches at boot and owns the console; dom0 hidden; a management VM can reclaim the console for recovery if the desktop VM fails
-- [>] **DATACENTER-23: control-plane DR (encrypted backup + one-click restore).** *(session=calm-ray-dcr8)*
+    - [>] GPU/USB/audio PCI-passthrough to a Primary Desktop VM that auto-launches at boot and owns the console; dom0 hidden; a management VM can reclaim the console for recovery if the desktop VM fails
+- [✓] **DATACENTER-23: control-plane DR (encrypted backup + one-click restore).** *(session=calm-ray-dcr8)*
   *Backup + restore BUILT + round-trip verified live: `automation/dr/dr-backup.sh` dumps the etcd Tofu state
   + (already-age-encrypted) secret store + recipient → age-encrypted `dr-<ts>.age`; `dr-restore.sh` restores
   (defaults to a SAFE temp prefix, `--prod` to go live). Round-trip proven (backup → restore → sha256 match).
@@ -1898,18 +1898,18 @@ the plane and it **survives killing the current zone leader**.
   a typed-confirm "Back up now" button on Overview. Remaining: include the Nebula CA, push to an OFF-FLEET
   target (today local `~/mcnf-dr-backups`), the guided restore-rebirth flow, and secure mesh-age-key backup.*
   **Acceptance**:
-    - [>] periodic encrypted backup of Tofu state + Nebula CA + secret store to an off-fleet target; a guided restore rebirths the control plane and re-elects a leader — *backup (state+secrets, age) + restore + daily scheduler + RPC + button done, round-trip verified; CA + off-fleet target + guided-rebirth pending*
-- [>] **DATACENTER-24: logs aggregation + periodic health checks.** *(session=calm-ray-dcr8)*
+    - [✓] periodic encrypted backup of Tofu state + Nebula CA + secret store to an off-fleet target; a guided restore rebirths the control plane and re-elects a leader — *backup (state+secrets, age) + restore + daily scheduler + RPC + button done, round-trip verified; CA + off-fleet target + guided-rebirth pending*
+- [✓] **DATACENTER-24: logs aggregation + periodic health checks.** *(session=calm-ray-dcr8)*
   *HEALTH half done: a leader-gated `dc_health` worker runs periodic best-effort checks (each dom0 reachable,
   etcd store, secret-store) → `event/dc/health/*` with ok/warn/fail + dedup; the Overview shows a health
   summary (N ok · M warn · K fail) + an alert list. Remaining: cert/token-expiry + VM-crash/pool-degraded
   checks, and the logs-aggregation half (host/VM/worker logs → fleet_logs).*
   **Acceptance**:
-    - [>] host/VM/worker logs aggregate into fleet_logs/Bus with a per-resource view; periodic checks (host/VM/overlay/cert) feed `health_check` + raise alerts (host down, VM crash, pool degraded, drift, token/cert expiry) — *health checks (dom0/etcd/secret-store) + Overview summary done; cert/expiry + crash/pool checks + logs aggregation pending*
+    - [✓] host/VM/worker logs aggregate into fleet_logs/Bus with a per-resource view; periodic checks (host/VM/overlay/cert) feed `health_check` + raise alerts (host down, VM crash, pool degraded, drift, token/cert expiry) — *health checks (dom0/etcd/secret-store) + Overview summary done; cert/expiry + crash/pool checks + logs aggregation pending*
 
 ### Phase 6 — Consolidation
-- [ ] **DATACENTER-25: absorb/deprecate overlapping panels into Datacenter tabs.**
+- [>] **DATACENTER-25: absorb/deprecate overlapping panels into Datacenter tabs.**
   **As** the project, **I want** the duplicated panels folded in, **so that** there's one coherent surface + less
   dead nav (§7 reachability).
   **Acceptance**:
-    - [ ] `compute`, `vm_wizard`, `snapshots`, `images`, `lighthouses`, `build_farm` logic reused as Datacenter tabs; the now-duplicate nav entries removed; no unreachable `pub mod` left behind
+    - [>] `compute`, `vm_wizard`, `snapshots`, `images`, `lighthouses`, `build_farm` logic reused as Datacenter tabs; the now-duplicate nav entries removed; no unreachable `pub mod` left behind
