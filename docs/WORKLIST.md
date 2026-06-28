@@ -2207,7 +2207,7 @@ Reproducible + portable per-mesh DevOps backoffice on a dedicated control VM, re
 
 #### Foundations (shared, no tier — land first)
 
-- [ ] **DAR-1 — Canonical etcd state prefix reconciled across state-backend + dr-backup**
+- [✓] **DAR-1 — Canonical etcd state prefix reconciled across state-backend + dr-backup**
   As the operator, I want ONE canonical Tofu-state etcd prefix used by both the state backend and the DR dump, so that DR actually captures the state and the mesh control-plane keys stay isolated.
   - Canonical prefix is the LIVE `/tofu/state/*` + `/tofu/lock/*` (NOT `/tofu-state/*`); `tofu-state-etcd.py` takes an optional `STATE_PREFIX` (default the canonical value) and a unit test confirms a put/get lands under the prefix.
   - `dr-backup.sh` ranges the SAME `/tofu/state/` prefix; a seeded fake state is present in the decrypted manifest.
@@ -2232,13 +2232,13 @@ Reproducible + portable per-mesh DevOps backoffice on a dedicated control VM, re
   - `put`/`get` read the recipient SET (not a single recipient); existing `init`/`list` behavior unchanged; a unit test seeds two recipients and proves both keys decrypt the same secret; `rotate <name>` does atomic put + optional `--revoke-cmd`, non-existent name exits 3.
   - `grep` of any produced state/log/tfvars shows no age PRIVATE key and no secret value.
 
-- [ ] **DAR-4 — Per-mesh config generated at found time (`mcnf-config.sh`)**
+- [✓] **DAR-4 — Per-mesh config generated at found time (`mcnf-config.sh`)**
   As a new-Nebula founder, I want mesh-id/project/regions/lighthouse-endpoints captured at found time into a portable non-secret etcd doc and rendered into tfvars, so the backoffice is self-describing.
   - `mcnf-config.sh gen <mesh-id> --project <p> --regions <r,...> --lighthouses <ip,...>` writes `/mcnf/backoffice/config` (+ `/mcnf/site/*`) and renders mesh-id/project/regions into `infra/tofu/*/*.auto.tfvars`.
   - `render` on a fresh control VM regenerates identical tfvars purely from the etcd doc (idempotent); the doc contains NO credentials.
   - Running `gen` with mesh 4533's actual project/regions yields tfvars matching the current live roots.
 
-- [ ] **DAR-5 — Fold plaintext cred files into the store (xo-token, edgeos-cred, dns-token, sccache-*)**
+- [✓] **DAR-5 — Fold plaintext cred files into the store (xo-token, edgeos-cred, dns-token, sccache-*)**
   As the operator reconstituting the hand-built setup, I want every backoffice credential in the encrypted store and the Tofu roots resolving from it, so no `/root/.mcnf-*` plaintext is required.
   - `/mcnf/secret/{xo-token,edgeos-cred,dns-token,sccache-access-key,sccache-secret-key,dr-spaces-key}` exist as age ciphertext; `infra/tofu/env.sh` + `infra/tofu/edgeos` resolve via `mcnf-secret.sh get` matching the zone1-do/xen-xapi pattern.
   - With `/root/.mcnf-xo-token` + `/root/.mcnf-ubnt-cred` removed, the farm + edgeos roots still `tofu plan` to a no-op.
@@ -2276,7 +2276,7 @@ Reproducible + portable per-mesh DevOps backoffice on a dedicated control VM, re
   - `tofu -chdir=infra/tofu/edgeos init -migrate-state` (or `state push` of the pulled local state) lands the current edgeos state under `/tofu/state/edgeos`; a subsequent `tofu plan` is 0-add/0-change/0-destroy against the live EdgeRouter reservations (the deliberate-drift markers preserved).
   - The deprecated top-level `infra/tofu/main.tf` local path is documented deprecated and its state (if any) is NOT a live source; `dr-backup.sh` now captures `/tofu/state/edgeos` in the manifest (verified in the decrypted dump).
 
-- [ ] **DAR-10 — Cred unseal from the mesh secret store (`tofu-env.sh`)**
+- [✓] **DAR-10 — Cred unseal from the mesh secret store (`tofu-env.sh`)**
   As an operator on a fresh control VM, I want provider creds unsealed from the secret store at apply time, so no hand-placed token files are needed.
   - `source tofu-env.sh` populates `XOA_TOKEN`/`TF_VAR_xapi_password`/`DIGITALOCEAN_TOKEN` in-process (via the VM's OWN key) and a tofu plan authenticates (real provider read).
   - The EdgeOS cred file is written to a tmpfs path 0600 and removed by the exit trap; no unsealed secret hits the repo/a dotfile/a log.
@@ -2323,7 +2323,7 @@ Reproducible + portable per-mesh DevOps backoffice on a dedicated control VM, re
   - Phase 2 state-backend is up on control-VM-overlay:8390 against the founder etcd (`curl /state/<root>` 200/404, not refused); the four backends now point at the control VM overlay IP via the generator.
   - Phase 3 `tofu plan` succeeds for xen-xapi + zone1-do + edgeos; `--tier minimal` STOPS after Phase 3; re-run reads `backoffice-site.yml` and is a no-op; `--adopt` against the live `.192` detects services ready WITHOUT recreating (container ids unchanged).
 
-- [ ] **DAR-17 — Portability: resolve `MCNF_CONTROL_IP`/`MCNF_BACKOFFICE_HOST` (kill hardcoded .192 host)**
+- [✓] **DAR-17 — Portability: resolve `MCNF_CONTROL_IP`/`MCNF_BACKOFFICE_HOST` (kill hardcoded .192 host)**
   As an operator founding a NEW mesh, I want the state/secret endpoints to resolve to that mesh's founding lighthouse/control VM, so the backoffice comes along instead of phoning the old LAN node.
   - With no override, `backoffice-up.sh`/`backoffice-plan.sh`/`state-backend-up.sh`/`mcnf-secret.sh`/`dr-*.sh`/`forgejo-up.sh` default the HOST to `${MCNF_CONTROL_IP:-<overlay-discovered>}` (from the founding bundle / `mackesd peers --json`), not the literal; the etcd ENDPOINT is independently resolved by DAR-1b (the two are decoupled).
   - Exporting `MCNF_CONTROL_IP=10.42.0.x` retargets all scripts (verified via `--dry-run` echo); with `=172.20.145.192` they reproduce today's host behavior byte-for-byte.
@@ -2415,13 +2415,13 @@ Reproducible + portable per-mesh DevOps backoffice on a dedicated control VM, re
   - With `shape={}`, a real `tofu plan` against the relocated etcd backend shows **0-add / 0-change / 0-destroy** for the three live VMs (the `moved{}` blocks consumed, NOT a destroy+recreate); the task FAILS if any destroy is proposed.
   - `shape={xen-bigboy="small"},small_count={xen-bigboy=1}` plans a clone of `MDE-VM-golden` on the big alias with the cloud-init from `build-vm.yaml.tftpl` and the `.130` lane IP; `outputs.tf` emits `build_farm` as name→{uuid,ip}; the top-level XO `main.tf` path is documented deprecated (not applied).
 
-- [ ] **DAR-32 — xen-xapi dom0-learn flow (`learn-dom0.sh`) + rendered provider aliases**
+- [✓] **DAR-32 — xen-xapi dom0-learn flow (`learn-dom0.sh`) + rendered provider aliases**
   As the operator founding a mesh on a NEW XCP-NG machine, I want to register a new dom0 by probing its XAPI, so the farm roots learn pool/network/SR/IP-lane without hand-coding `local.dom0` or a provider alias.
   - `learn-dom0.sh <key> <xapi_host>` unseals the XAPI cred, probes pool name_label + eth0 network_uuid + Local SR, appends a `dom0_registry` entry + the next free /16 ip_lane.
   - `gen-tfvars` re-renders `providers.tf` (aliased provider per registry key, from a `providers.tf.tmpl` since HCL can't `for_each` a provider block) and a tofu plan resolves the new dom0's data sources.
   - Re-running for a known dom0 is idempotent; the assigned ip_lane does not overlap an existing /16.
 
-- [ ] **DAR-33 — Per-mesh tfvars + backend generator from mesh identity (`gen-tfvars.sh`)**
+- [✓] **DAR-33 — Per-mesh tfvars + backend generator from mesh identity (`gen-tfvars.sh`)**
   As the operator, I want the four roots' inputs generated from the founding bundle + site facts, so no hand-edit of HCL points them at the new mesh.
   - `gen-tfvars.sh --print` on the live mesh emits `*.auto.tfvars` + `*.backend.hcl` whose mesh_id/control_overlay_ip/domain/lighthouse-roster match the founding bundle + `/mcnf/site/*`; a synthetic second mesh_id emits DIFFERENT values; the golden-template var renders `MDE-VM-golden`.
   - No secret appears in any generated file; generated `backend.hcl` address is `http://<control_overlay_ip>:8390/state/<root>`, not `.192`.
@@ -2497,12 +2497,12 @@ Reproducible + portable per-mesh DevOps backoffice on a dedicated control VM, re
   - The RPC's rendered unit list is asserted to MATCH `backoffice-plan.sh --tier <t>` output (NOT a canned/hardcoded plan — resolves STUB 5); the new verb `backoffice-plan` is registered in the datacenter `action/dc/<verb>` allow-list (host_ops verb table) with a passing `action_topic` test.
   - The arm→confirm `genesis-write` reply gains a `backoffice_intent {tier}` field (null/absent when toggle off, behavior unchanged); **coordinate the merge onto the parallel DC-18 `genesis.rs`/`datacenter.rs` Step enum + action allow-list (moving target — rebase, do not collide)**; `cargo test -p mde-workbench -p mackesd` green.
 
-- [ ] **DAR-46 — Boot-time convergence unit + RPM packaging of backoffice/control-vm artifacts**
+- [✓] **DAR-46 — Boot-time convergence unit + RPM packaging of backoffice/control-vm artifacts**
   As the platform, I want the backoffice artifacts packaged and a boot-time convergence unit, so a rebuilt/rebooted control VM re-converges without manual steps.
   - The RPM installs `automation/backoffice/*`, `automation/tofu-reconstitute/*`, `automation/farm/*`, `automation/lib/etcd-endpoints.sh`, and `infra/tofu/control-vm/*` to the existing automation/infra install roots (`rpm -ql`).
   - `mcnf-backoffice-up.service` (oneshot, `backoffice-up.sh --adopt` reading the tier from `/mcnf/backoffice/intent`) runs at boot and exits 0 when services are already up; no tier hardcoded in the unit; release pre-flight (fmt/build/test/token-clean) passes.
 
-- [ ] **DAR-47 — `--with-backoffice` invokes `backoffice-up.sh` after the control VM is up (single bootstrap driver)**
+- [✓] **DAR-47 — `--with-backoffice` invokes `backoffice-up.sh` after the control VM is up (single bootstrap driver)**
   As the operator, I want exactly one bootstrap driver wired into genesis, so the Full-tier farm/CI/reconciler/DR steps are invoked in order and never by two competing entrypoints.
   - The `--with-backoffice` Full-tier path calls `backoffice-up.sh --tier full` on the control VM after enrollment + reseal, which sequences CI → reconciler → build-farm → DR; coordinated with the DC-18 orchestrator so there is a single entrypoint.
   - Minimal tier installs neither reconciler/CI/farm/DR; genesis leaves FA_APPLY unset; re-run is idempotent (no duplicate units/containers).
