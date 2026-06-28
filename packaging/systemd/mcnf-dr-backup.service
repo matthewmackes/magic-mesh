@@ -1,34 +1,34 @@
-# DATACENTER-23 — off-fleet encrypted DR backup of the control plane.
+# DATACENTER-23 / DAR-39/40 — the ON-MESH FIRST LINE of DR (Full tier).
 #
-# Runs automation/dr/dr-backup.sh, which age-encrypts the OpenTofu state +
-# the mesh secret store (+ the Nebula CA when run on a CA holder) into one
-# manifest and rclone-pushes it OFF-FLEET to MCNF_DR_REMOTE, so a total
-# XCP/DO-fleet loss is recoverable.
+# Runs automation/dr/dr-snapshot-onmesh.sh, which produces a v2 dr-<ts>.age
+# (dr-backup.sh: tofu state + secrets + age-recipients + Forgejo data via sqlite
+# quiesce + a consistent etcd snapshot) and copies it into the Syncthing-replicated
+# Mesh-Sync root ($MCNF_MESHFS_DIR/dr/) with INDEX.json + N-deep retention. The
+# first recovery line then lands on every surviving peer with NO egress.
 #
-# NODE PLACEMENT (important): install this on the CONTROL HOST — the node with
-# (a) the repo, (b) reach to the LAN datacenter etcd that holds /tofu/state +
-# /mcnf/secret, (c) rclone + the `mcnf-spaces` remote configured, and (d) the
-# mesh age identity (/root/.mcnf-age-key). A DO lighthouse CANNOT run this
-# (it can't reach the LAN datacenter etcd). The Nebula CA itself is separately
-# resilient — replicated across every lighthouse; to also push the CA off-fleet,
-# run dr-backup.sh once on a CA holder that has rclone + the remote configured.
+# The OFF-FLEET push (DO Spaces) is a SEPARATE operator-run step
+# (automation/dr/dr-push-offfleet.sh) — NOT fired here. The CA/age master bundle is
+# a SEPARATE operator-run passphrase-sealed push (dr-ca-bundle.sh). The safety
+# classifier hard-blocks an automated agent from either off-fleet push by design.
 #
-# SAFETY: pushing the CA/secret store off the trust boundary is operator-run by
-# design — the safety classifier hard-blocks an automated agent from doing it.
-# This unit runs node-local under the operator's systemd, not via any agent.
+# NODE PLACEMENT: install on the control VM — it has (a) the repo, (b) reach to the
+# founder etcd quorum (via /etc/mackesd/etcd-endpoints — NO .192:2379), (c) the
+# Mesh-Sync mount, (d) the mesh age identity. Leader-gated: only the etcd leader's
+# run is authoritative (the dr_scheduler worker enforces this; a follower's run is a
+# harmless local artifact). Endpoints + paths come from dr-env.sh (DAR-37).
 
 [Unit]
-Description=MCNF DR — off-fleet encrypted control-plane backup (Tofu state + secrets → DO Spaces)
+Description=MCNF DR — on-mesh first-line snapshot (v2 manifest → Mesh-Sync)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-# The off-fleet target + the mesh age identity. Override REPO/REMOTE here if the
-# checkout or bucket differ.
-Environment=MCNF_DR_REMOTE=mcnf-spaces:mcnf-dr-4533
-Environment=MCNF_AGE_KEY=/root/.mcnf-age-key
-Environment=MCNF_REPO=/root/magic-mesh
-ExecStart=/bin/bash -lc 'cd "${MCNF_REPO}" && exec automation/dr/dr-backup.sh'
-# Don't let a transient etcd/rclone hiccup mark the timer failed forever.
+# Per-mesh config (etcd quorum, mesh-storage dir, forgejo data) resolved by
+# dr-env.sh; override the repo slot here if the checkout differs.
+Environment=MCNF_REPO=/opt/mcnf
+EnvironmentFile=-/etc/mcnf/reconciler.env
+WorkingDirectory=/opt/mcnf
+ExecStart=/bin/bash -lc 'exec automation/dr/dr-snapshot-onmesh.sh'
+# Don't let a transient etcd/Mesh-Sync hiccup mark the timer failed forever.
 SuccessExitStatus=0
