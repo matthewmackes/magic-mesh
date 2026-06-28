@@ -2556,15 +2556,37 @@ recon (token map: `#161616→carbon::GRAY_100`, `#0f62fe→BLUE_60`, `#42be65→
 - [ ] **UNIFY-5: shell — status-strip ticker / posture / uptime / clock (live sources)**
   **As** an operator, **I want** the full status strip, **so that** it matches the design — but only real data.
   **Acceptance:** ticker shows real recent events (UNIFY-3 source); clock ticks via a gated 1 s subscription; uptime from a real daemon signal; posture from a real signal or omitted; no placeholder values (§7).
-- [ ] **UNIFY-6: widgets — reusable dense Carbon components**
+- [✓] **UNIFY-6: widgets — reusable dense Carbon components** *(fan-out `26dbf5c` — status_dot, kpi_stat_tile, segmented_control, progress_bar, stat_grid; additive, no signature changes; farm check+lint pass)*
   **As** the GUI, **I want** shared widgets, **so that** screens stop reinventing them.
   **Acceptance:** add to `controls.rs`/`panel_chrome.rs` (each used by ≥2 screens, token-clean): `status_dot`, `segmented_control` (active-underline), `kpi_stat_tile`, zebra `data_table` (sortable header, expandable row), `progress_bar`, `tabs`; reuse existing `sparkline::sparkline`, `peers_map::MapProgram`, `panel_chrome::{card,section_header,empty_state,error_state}`.
 - [ ] **UNIFY-7: nav — activity-bar + collapsible tree + guided Empty routing**
   **As** an operator, **I want** the design's 8-group collapsible nav with a guided empty state, **so that** the full nav renders day one.
   **Acceptance:** `sidebar.rs` renders the 8 `Group`s collapsibly (reuse `SidebarState`); unimplemented panels route to `panel_chrome::empty_state` with the worklist/`mde --focus <slug>` hint (design Empty); deep-link slugs preserved (`view_from_focus_slug`).
-- [ ] **UNIFY-8..12: screen restyles to the design (data stays live)**
-  **As** an operator, **I want** Overview, Peers, This Node, Monitoring, Datacenter, Fleet restyled to `Workbench.dc.html`, **so that** the app matches the approved design.
-  **Acceptance (per screen):** restyle the backing panel (`front_door.rs`, `peers.rs`+`peers_map.rs`, `hardware.rs`, `health_check.rs`+`mesh_logs.rs`, `datacenter.rs`, `fleet_rollup.rs`) to the dc.html layout using UNIFY-6 widgets; **all data remains real** (existing Bus topics); loading/empty/error states preserved (`panel_chrome::error_state`, EFF-45); `lint-carbon-tokens.sh`/`lint-motion.sh` clean; builds + `cargo test -p mde-workbench` green.
+- [>] **UNIFY-8..12: screen restyles to the design (data stays live)** — *concurrent full-farm fan-out 2026-06-28: 6 panels restyled by 6 worktree-isolated agents (`.50/.90/.130`, 2+2+3) + cherry-picked; consolidated farm-green (check@.50 1m50s + clippy@.90 + test@.130; all data real §7, tokens §4).*
+    - [✓] **UNIFY-9 Peers** (`c4f4e6f`) — master-detail restyle (filter list + detail tiles + sparklines + services); VOICE tile shows real VERSION (no per-peer voice datum → lifted by UNIFY-16).
+    - [✓] **UNIFY-10 This Node** (`2aa57bc`) — dense Carbon hardware/services/interfaces/registration; real PeerProbe data.
+    - [✓] **UNIFY-11 Monitoring** (`8695e7c`) — Health/Logs segmented restyle; real probe/log data (+2 parse_journal_line tests).
+    - [✓] **UNIFY-12 Datacenter** (`5f168ce`) — KPI grid + host CPU/MEM bars + version matrix + Tofu run-log; real data/tabs/state.
+    - [✓] **UNIFY-12b Fleet** (`7986fc9`) — role-group node cards (health top-border + tags) + live path map; real roster.
+    - [>] **UNIFY-8 Overview** (`fa5010b`) — header band + live mesh-health pill landed (real roster counts); KPI grid / node×service matrix / Fleet Convergence / Audit Trail DEFERRED (data not in the loaded snapshot, §7) → **gates lifted (operator 2026-06-28)** → UNIFY-14 (service worker) + UNIFY-15 (convergence + audit).
 - [ ] **UNIFY-13: density compact default + toggle surfaced**
   **As** a power user, **I want** the compact density the design defaults to, **so that** the console is information-dense.
   **Acceptance:** density picker (reuse `Density`/`Preferences`) surfaced in the shell; compact applies across panels via `panel_chrome` spacing; persists.
+
+### UNIFY gate-lifts (operator-approved 2026-06-28 — wire the real sources the fan-out couldn't fabricate, §7)
+
+- [ ] **UNIFY-14: mackesd per-peer service-status worker → real node×service matrix**
+  **As** an operator, **I want** the design's node×service matrix (Bus/etcd/Sync/Nebula/DNS/Voice/Music/KDC/Workbench) backed by real per-peer status, **so that** the Overview/Peers matrix is authoritative, not fabricated.
+  **Acceptance:** a `mackesd` worker publishes a structured per-peer service-up map over the Bus (each node reports its own unit/service status, gossiped via the directory); `mackes-mesh-types` carries the typed shape; the Overview Service Matrix + Peers render it from the live topic (honest *unknown* when a node hasn't reported); unit-tested decode; farm build+test green.
+- [ ] **UNIFY-15: Overview Fleet Convergence + Audit Trail from real sources**
+  **As** an operator, **I want** the Overview's convergence + audit cards backed by real data, **so that** the dashboard is live, not a placeholder.
+  **Acceptance:** the Front Door / Overview load also fetches the real config revision + converged-peer count (etcd) and recent hash-chained audit events (the existing audit source the Audit panel reads); rendered in the design's Fleet Convergence + Audit Trail cards; no mock/demo data (§7); farm green.
+- [ ] **UNIFY-16: per-peer voice presence → real Peers VOICE tile**
+  **As** an operator, **I want** the Peers VOICE tile to show real per-peer voice/SIP presence, **so that** it matches the design instead of the VERSION stand-in.
+  **Acceptance:** surface `mde-voice-hud`'s `state/voice/status` per peer (via the directory/Bus); the Peers detail VOICE tile renders the real presence; honest "offline/unknown" when absent; farm green.
+
+### UNIFY live-gated queue (operator-selected 2026-06-28 — need live action/spend, not code; prep diagnosis/plans)
+- [!] Roll **11.0.15 to the lighthouses** — first diagnose the watchdog crash-loop root cause (1-vCPU beacon stall vs a real fix; 11.0.15 changelog has no watchdog entry), then publish/roll. (sitrep)
+- [!] **DAR control-VM live provisioning** (DAR-48/49/50) — code-complete; needs the live go.
+- [!] **Off-fleet CA/DR backup** (DATACENTER-23) — `mcnf-dr-4533` ready; safety-classifier blocks an agent exporting the CA key → operator runs the age-push.
+- [!] **MEDIA active-active** (MEDIA-9/10) — 2nd Lighthouse_Media node + operator music upload (DO spend).
