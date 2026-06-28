@@ -142,12 +142,14 @@ mod tests {
 
     #[test]
     fn page_title_uses_panel_label_for_panel_view() {
+        // DATACENTER-25 — `snapshots` folded into the Datacenter plane; use the
+        // still-standalone `repair` panel for the page-title label lookup.
         assert_eq!(
             page_title(View::Panel {
                 group: Group::System,
-                panel: "snapshots"
+                panel: "repair"
             }),
-            "Snapshots"
+            "Repair"
         );
     }
 

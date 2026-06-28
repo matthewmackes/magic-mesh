@@ -19,7 +19,7 @@ use crate::backend::{Backend, RemoteBackend};
 use crate::dbus::PendingFocus;
 use crate::header::HeaderAction;
 use crate::keyboard::{KeyAction, Pane};
-use crate::model::{resolve_panel_label, view_from_focus_slug, Group, View};
+use crate::model::{resolve_panel_label, view_from_focus_slug, DatacenterTab, Group, View};
 use crate::panels::{
     audit as audit_panel, build_farm as build_farm_panel, compute as compute_panel,
     config_apply as config_apply_panel, connect as connect_panel,
@@ -144,6 +144,11 @@ pub enum Message {
     Jobs(jobs_panel::Message),
     BuildFarm(build_farm_panel::Message),
     Datacenter(datacenter_panel::Message),
+    /// DATACENTER-25 — select which surface shows inside the Datacenter plane:
+    /// its own lenses (`Native`) or one of the folded panels
+    /// (Instances/Snapshots/Images/Build Farm). Fires the chosen tab's `load`
+    /// so it lands populated.
+    SelectDatacenterTab(DatacenterTab),
     /// PLANES-12 — Audit panel (hash-chain timeline + verify) sub-message.
     Audit(audit_panel::Message),
     /// PLANES-8 — Mesh Logs panel (journald mesh-unit view) sub-message.
@@ -313,6 +318,9 @@ pub struct App {
     jobs: jobs_panel::JobsPanel,
     build_farm: build_farm_panel::BuildFarmPanel,
     datacenter: datacenter_panel::DatacenterPanel,
+    /// DATACENTER-25 — the selected tab inside the Datacenter plane (its own
+    /// surface or one of the folded Instances/Snapshots/Images/Build-Farm panels).
+    datacenter_tab: DatacenterTab,
     audit: audit_panel::AuditPanel,
     mesh_logs: mesh_logs_panel::MeshLogsPanel,
     config_apply: config_apply_panel::ConfigApplyPanel,
@@ -426,6 +434,7 @@ impl App {
             jobs: jobs_panel::JobsPanel::new(),
             build_farm: build_farm_panel::BuildFarmPanel::new(),
             datacenter: datacenter_panel::DatacenterPanel::new(),
+            datacenter_tab: DatacenterTab::default(),
             audit: audit_panel::AuditPanel::new(),
             mesh_logs: mesh_logs_panel::MeshLogsPanel::new(),
             config_apply: config_apply_panel::ConfigApplyPanel::new(),
@@ -666,10 +675,11 @@ impl App {
                     .map(|_| Message::TransitionTick),
             );
         }
-        // E6.10 — sample Compute instance CPU/mem only while that view is
-        // active, so virsh/podman stats aren't polled when the operator is
+        // E6.10 / DATACENTER-25 — sample Compute instance CPU/mem only while the
+        // Instances surface is actually showing (now the Datacenter plane's
+        // Instances tab), so virsh/podman stats aren't polled when the operator is
         // elsewhere.
-        if self.view.panel_slug() == Some("instances") {
+        if self.on_datacenter_tab(DatacenterTab::Instances) {
             subs.push(compute_panel::ComputePanel::sample_subscription());
         }
         // LIGHTHOUSE-5 — only while the Lighthouses tab is open: advance the
@@ -859,6 +869,13 @@ impl App {
             Message::Jobs(msg) => self.jobs.update(msg),
             Message::BuildFarm(msg) => self.build_farm.update(msg),
             Message::Datacenter(msg) => self.datacenter.update(msg),
+            // DATACENTER-25 — switch the Datacenter plane's tab + fire the chosen
+            // surface's load so a folded panel lands populated (each keeps its own
+            // state/reducer/subscription; this only selects + refreshes it).
+            Message::SelectDatacenterTab(tab) => {
+                self.datacenter_tab = tab;
+                self.load_datacenter_tab(tab)
+            }
             Message::Audit(msg) => self.audit.update(msg),
             Message::MeshLogs(msg) => self.mesh_logs.update(msg),
             Message::ConfigApply(msg) => self.config_apply.update(msg),
@@ -977,12 +994,13 @@ impl App {
             "config_apply" => config_apply_panel::ConfigApplyPanel::load(),
             "registration" => registration_panel::RegistrationPanel::load(),
             "jobs" => jobs_panel::JobsPanel::load(),
-            "build-farm" => build_farm_panel::BuildFarmPanel::load(),
-            "datacenter" => datacenter_panel::DatacenterPanel::load(),
+            // DATACENTER-25 — entering the Datacenter plane loads the active tab
+            // (Native = its own `event/dc/*` projection; a folded tab = that
+            // panel's load) so it lands populated whichever surface is selected.
+            "datacenter" => self.load_datacenter_tab(self.datacenter_tab),
             "node_roles" => node_roles_panel::NodeRolesPanel::load(),
             "playbooks" => playbooks_panel::PlaybooksPanel::load(),
             "run_history" => run_history_panel::RunHistoryPanel::load(),
-            "snapshots" => snapshots_panel::SnapshotsPanel::load(),
             "logs" => logs_panel::LogsPanel::load(),
             "resources" => resources_panel::ResourcesPanel::load(),
             "system_update" => system_update_panel::SystemUpdatePanel::load(),
@@ -1007,12 +1025,6 @@ impl App {
             "profiles" => profiles_panel::ProfilesPanel::load(),
             // PLANES-24 — the package-mirror catalog.
             "mirrors" => mirrors_panel::MirrorsPanel::load(),
-            // PLANES-22 — the image catalog.
-            "images" => images_panel::ImagesPanel::load(),
-            // WORKLOAD-FLEET-3 — the Compute/Instances panel enumerates local
-            // VMs/pods + folds the fleet QNM inventory on nav (was the one
-            // panel missing here, so it sat at "Loading instances…" forever).
-            "instances" => compute_panel::ComputePanel::load(),
             // XCP-4 — the VM Spawner queries the xcp_provision worker for the
             // VM + dom0-host rosters on nav so the panel lands populated.
             "provisioning" => provisioning_panel::ProvisioningPanel::load(),
@@ -1101,6 +1113,24 @@ impl App {
         };
         self.view = view;
         self.focused_pane = Pane::Main;
+        // DATACENTER-25 — a deep link to one of the now-folded slugs
+        // (`instances`/`snapshots`/`images`/`build-farm`) routed to the Datacenter
+        // plane; select the matching fold tab so it opens on the right surface
+        // (set before `on_panel_navigated` so the tab's load fires below). A direct
+        // `datacenter` link keeps the current tab (defaults to `Native`).
+        if let View::Panel {
+            panel: "datacenter",
+            ..
+        } = view
+        {
+            if let Some(tab) = route_slug
+                .rsplit('.')
+                .next()
+                .and_then(DatacenterTab::from_folded_slug)
+            {
+                self.datacenter_tab = tab;
+            }
+        }
         // Apply the per-item focus before the panel loads so the tab opens
         // already highlighting + listing the clicked lighthouse first (Q20).
         if let (
@@ -1268,6 +1298,68 @@ impl App {
         stack![body, scrim].into()
     }
 
+    /// DATACENTER-25 — is the Datacenter plane the active view with `tab`
+    /// selected? The single predicate the per-tab subscriptions + fold-bar share.
+    fn on_datacenter_tab(&self, tab: DatacenterTab) -> bool {
+        self.view.panel_slug() == Some("datacenter") && self.datacenter_tab == tab
+    }
+
+    /// DATACENTER-25 — fire the load for a Datacenter tab so a folded surface
+    /// lands populated when it's selected (or when the plane is (re)entered).
+    /// `Native` reloads Datacenter's own `event/dc/*` projection.
+    fn load_datacenter_tab(&self, tab: DatacenterTab) -> Task<Message> {
+        match tab {
+            DatacenterTab::Native => datacenter_panel::DatacenterPanel::load(),
+            DatacenterTab::Instances => compute_panel::ComputePanel::load(),
+            DatacenterTab::Snapshots => snapshots_panel::SnapshotsPanel::load(),
+            DatacenterTab::Images => images_panel::ImagesPanel::load(),
+            DatacenterTab::BuildFarm => build_farm_panel::BuildFarmPanel::load(),
+        }
+    }
+
+    /// DATACENTER-25 — the Datacenter plane surface: a fold bar that selects the
+    /// plane's own lenses (`Native`) or one of the folded panels (Instances /
+    /// Snapshots / Images / Build Farm), with the chosen tab's body below. Each
+    /// folded panel keeps its own state + reducer + subscription on `App` — this
+    /// is pure VIEW routing (§6 glue-not-rewrite), so the once-standalone surfaces
+    /// stay fully reachable here without their duplicated sidebar rows.
+    fn datacenter_surface(&self) -> Element<'_, Message> {
+        let palette = crate::live_theme::palette();
+        let mut bar = row![].spacing(f32::from(mde_theme::spacing::BASE[2]));
+        for tab in DatacenterTab::all() {
+            let variant = if self.datacenter_tab == tab {
+                crate::controls::ButtonVariant::Primary
+            } else {
+                crate::controls::ButtonVariant::Secondary
+            };
+            bar = bar.push(crate::controls::variant_button(
+                tab.label().to_string(),
+                variant,
+                Some(Message::SelectDatacenterTab(tab)),
+                palette,
+            ));
+        }
+        let body = match self.datacenter_tab {
+            DatacenterTab::Native => self.datacenter.view(),
+            DatacenterTab::Instances => self.compute.view(),
+            DatacenterTab::Snapshots => self.snapshots.view(),
+            DatacenterTab::Images => self.images.view(),
+            DatacenterTab::BuildFarm => self.build_farm.view(),
+        };
+        column![
+            container(bar).padding(cosmic::iced::Padding {
+                top: f32::from(mde_theme::spacing::BASE[2]),
+                right: f32::from(mde_theme::spacing::BASE[4]),
+                bottom: 0.0,
+                left: f32::from(mde_theme::spacing::BASE[4]),
+            }),
+            body,
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
     /// Per-View body — panel views land here as they ship.
     fn panel_body(&self) -> Element<'_, Message> {
         match self.view {
@@ -1325,14 +1417,15 @@ impl App {
             } => self.registration.view(),
             // Controller plane — jobs / playbooks / run history.
             View::Panel { panel: "jobs", .. } => self.jobs.view(),
-            View::Panel {
-                panel: "build-farm",
-                ..
-            } => self.build_farm.view(),
+            // DATACENTER-25 — the Datacenter plane renders the fold surface: its
+            // own lenses + the folded Instances/Snapshots/Images/Build-Farm tabs.
+            // The standalone `build-farm`/`snapshots`/`images`/`instances` view
+            // arms were removed (their nav rows are gone); the panels are reached
+            // here as tabs.
             View::Panel {
                 panel: "datacenter",
                 ..
-            } => self.datacenter.view(),
+            } => self.datacenter_surface(),
             View::Panel {
                 panel: "playbooks", ..
             } => self.playbooks.view(),
@@ -1345,9 +1438,6 @@ impl App {
                 panel: "node_roles",
                 ..
             } => self.node_roles.view(),
-            View::Panel {
-                panel: "snapshots", ..
-            } => self.snapshots.view(),
             View::Panel { panel: "logs", .. } => self.logs.view(),
             View::Panel {
                 panel: "resources", ..
@@ -1418,10 +1508,6 @@ impl App {
             View::Panel {
                 panel: "mirrors", ..
             } => self.mirrors.view(),
-            // PLANES-22 — the image catalog.
-            View::Panel {
-                panel: "images", ..
-            } => self.images.view(),
             // BUS-7.2 — Mackes Bus 5-tab operator surface.
             View::Panel {
                 panel: "mesh_bus", ..
@@ -1518,15 +1604,6 @@ impl App {
             View::Panel {
                 panel: "revisions", ..
             } => self.fleet_revisions.view(),
-            // E6.10 — the Compute group root (and its "Instances"
-            // sub-panel) render the bespoke local + fleet VM/pod list,
-            // not the generic role card: `--page compute` lands directly
-            // on the instance enumeration per the E6.10 acceptance.
-            // NAV-1 — Compute folds into Provisioning; the Instances panel
-            // (slug-routed) renders the local + fleet VM/pod list.
-            View::Panel {
-                panel: "instances", ..
-            } => self.compute.view(),
             // XCP-4 — the VM Spawner / Provisioning plane (A-plane MDE-VMs).
             View::Panel {
                 panel: "provisioning",
@@ -1971,6 +2048,47 @@ mod tests {
         let mut app = App::new();
         let _ = app.update(Message::FocusRequest("system".into()));
         assert_eq!(app.current_view(), View::Group(Group::System));
+    }
+
+    #[test]
+    fn select_datacenter_tab_updates_active_tab() {
+        // DATACENTER-25 — the fold bar selects which surface shows in the
+        // Datacenter plane; the tab state drives both the body + its subscriptions.
+        let mut app = App::new();
+        assert_eq!(app.datacenter_tab, DatacenterTab::Native, "defaults to Native");
+        let _ = app.update(Message::SelectDatacenterTab(DatacenterTab::Instances));
+        assert_eq!(app.datacenter_tab, DatacenterTab::Instances);
+        assert!(
+            app.on_datacenter_tab(DatacenterTab::Instances)
+                || app.current_view() != (View::Panel {
+                    group: Group::Provisioning,
+                    panel: "datacenter"
+                }),
+            "the Instances tab predicate only trips while the plane is the active view",
+        );
+        let _ = app.update(Message::SelectDatacenterTab(DatacenterTab::BuildFarm));
+        assert_eq!(app.datacenter_tab, DatacenterTab::BuildFarm);
+    }
+
+    #[test]
+    fn folded_slug_focus_lands_on_datacenter_with_the_matching_tab() {
+        // DATACENTER-25 — a deep link to a retired folded slug
+        // (here the old `system.snapshots`) opens the Datacenter plane on the
+        // Snapshots tab, never a missing panel.
+        let mut app = App::new();
+        let _ = app.update(Message::FocusRequest("system.snapshots".into()));
+        assert_eq!(
+            app.current_view(),
+            View::Panel {
+                group: Group::Provisioning,
+                panel: "datacenter"
+            }
+        );
+        assert_eq!(app.datacenter_tab, DatacenterTab::Snapshots);
+        assert_eq!(app.focused_pane(), Pane::Main);
+        // The Instances slug routes the same way, onto its own tab.
+        let _ = app.update(Message::FocusRequest("provisioning.instances".into()));
+        assert_eq!(app.datacenter_tab, DatacenterTab::Instances);
     }
 
     #[test]
