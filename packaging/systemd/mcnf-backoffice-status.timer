@@ -1,0 +1,14 @@
+# DAR-44 — periodic backoffice health snapshot (mirrors mesh-status.timer). A
+# slower cadence than mesh-status (the backoffice changes far less often than the
+# mesh roster); Persistent so a missed run fires on next boot.
+[Unit]
+Description=MCNF — periodic backoffice health snapshot
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=2min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
