@@ -1,30 +1,30 @@
-# FARM-AUTOSCALE L2 — the elastic-farm reconcile tick, run on the control host
+# FARM-AUTOSCALE L2 — the elastic-farm reconcile tick, run on the control VM
 # (fleet-side, NO AI). One oneshot `--once` per fire: read the live per-dom0 build
 # demand (worklist @farm jobs + in-flight build slots), decide the per-dom0 shapes
 # via install-helpers/farm-autoscale.sh (hysteresis/drain/pods), and — ONLY when
-# the apply gate is fully green (FA_APPLY=1 + XO reachable + sane tofu state +
-# golden template) — `tofu apply` the shapes. Default is PLAN-ONLY: it never
-# applies until the operator opts in AND the prerequisites hold.
+# the apply gate is fully green (FA_APPLY=1 + founding-dom0 XAPI :443 reachable +
+# sane tofu state + golden template) — `tofu apply` the shapes. Default is
+# PLAN-ONLY: FA_APPLY is UNSET until the operator opts in (DAR-29/DAR-30).
 #
-# Install (operator-gated; NOT enabled by this PR): copy this unit + the timer to
-# /etc/systemd/system on the control host, then
-#   systemctl enable --now mcnf-farm-autoscale-reconcile.timer
-# Leave FA_APPLY unset (plan-only) until XO is up + tofu state is imported; flip it
-# with a drop-in (`systemctl edit`) once the live apply prerequisites are met.
+# This is the TEMPLATE; automation/reconciler/reconciler-up.sh installs the live
+# copy on the control VM (EnvironmentFile=/etc/mcnf/reconciler.env, repo slot
+# /opt/mcnf) PLAN-ONLY. enable-autoscale-timer.sh is the ONE operator step that
+# rewrites it with FA_APPLY=1. The DAR-29 apply gate is the founding-dom0 XAPI
+# :443, NOT the dead XO websocket. Per-mesh values come from the env file — no
+# .192/XO literals, no .claude/worktrees path.
 [Unit]
 Description=MCNF FARM-AUTOSCALE reconciler (demand -> per-dom0 VM shapes; plan-only by default)
-After=network-online.target
-Wants=network-online.target
+After=network-online.target mcnf-reconciler-bootstrap.service
+Wants=network-online.target mcnf-reconciler-bootstrap.service
 
 [Service]
 Type=oneshot
 Environment=HOME=/root
-# Plan-only by default — the apply gate stays closed until the operator opts in.
-# Enable the live apply (once XO is up + state imported) via a drop-in:
-#   [Service]\nEnvironment=FA_APPLY=1
-Environment=FA_APPLY=0
-WorkingDirectory=/root/magic-mesh
-# MCNF_REPO lets the unit point at the deployed tree; defaults to WorkingDirectory.
-ExecStart=/bin/bash -lc '/root/magic-mesh/install-helpers/farm-reconciler.sh --once'
+# Plan-only: FA_APPLY is intentionally UNSET (the gate stays closed). The live
+# apply is armed ONLY by install-helpers/enable-autoscale-timer.sh (operator).
+# Per-mesh config (MCNF_REPO, MCNF_ETCD, MCNF_XCP_HOST, golden) — rendered file.
+EnvironmentFile=-/etc/mcnf/reconciler.env
+WorkingDirectory=/opt/mcnf
+ExecStart=/bin/bash -lc 'exec install-helpers/farm-reconciler.sh --once'
 TimeoutStartSec=3600
 Nice=10

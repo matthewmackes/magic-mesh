@@ -100,10 +100,25 @@ XCP_BUILD="$HERE/xcp-build.sh"
 TOOLCHAIN_PLAYBOOK="${MCNF_TOOLCHAIN_PLAYBOOK:-$REPO_ROOT/infra/ansible/build-vm-toolchain.yml}"
 FARM_JOBS="$REPO_ROOT/automation/lib/farm-jobs.sh"
 XO_URL="${MCNF_XO_URL:-ws://172.20.145.192:8080}"
+# DAR-29: the apply-reachability gate targets the FOUNDING dom0 XAPI :443, NOT the
+# dead XO websocket (XO is connection-refused live — an XO-ws gate would pin the
+# reconciler plan-only forever even on a healthy no-XO farm). MCNF_XCP_HOST is
+# rendered into /etc/mcnf/reconciler.env by render-env.sh (DAR-27); the BigBoy
+# fallback keeps a clean checkout's --self-test deterministic. The XAPI control
+# plane is what `tofu apply` actually talks to, so it is the honest readiness gate.
+XCP_HOST="${MCNF_XCP_HOST:-172.20.145.165}"
+XAPI_PORT="${MCNF_XAPI_PORT:-443}"
 BUILD_USER="${MCNF_BUILD_USER:-mm}"
 KEY="${MCNF_FARM_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
 PROBE_TIMEOUT="${FA_PROBE_TIMEOUT:-4}"
 APPLY="${FA_APPLY:-0}"
+# DAR-28: route durable busy-state through etcd /reconciler/* (the replicated
+# quorum) instead of the host-local /var/lib file, so a fresh control VM resumes
+# the FA-4 hysteresis. Opt-in via MCNF_RECONCILER_STATE_ETCD=1 (render-env sets it);
+# default keeps the host-local file for the legacy .192 box + offline --self-test.
+RECON_STATE="$HERE/../automation/reconciler/reconciler-state.sh"
+[ -f "$RECON_STATE" ] || RECON_STATE="$REPO_ROOT/automation/reconciler/reconciler-state.sh"
+RECON_STATE_ETCD="${MCNF_RECONCILER_STATE_ETCD:-0}"
 
 # --- OVERCOMMIT GUARD (safe hybrid mode) -------------------------------------
 # The three dom0s each already run an ALWAYS-ON baseline build VM (16-24 GiB) with
@@ -283,14 +298,17 @@ bucket_demand() {
   printf '%s:%s:%s\n' "0" "$x1_small" "$x1_pods"
 }
 
-# apply_gate <fa_apply> <xo_reachable> <state_sane> <golden_set> — PURE: the apply
+# apply_gate <fa_apply> <reachable> <state_sane> <golden_set> — PURE: the apply
 # decision (L2). Echoes "apply" iff ALL four hold, else "plan-only:<reason>" naming
 # the FIRST failing prerequisite (so the tick logs exactly why it stayed plan-only).
 # Each input is "1"/"0". Default-safe: any 0 → plan-only.
+# DAR-29: the reachability prerequisite is now the FOUNDING dom0 XAPI :443 (the
+# control plane `tofu apply` actually talks to), not the dead XO websocket; the
+# reason text says XAPI-unreachable accordingly.
 apply_gate() {
-  local fa="$1" xo="$2" state="$3" golden="$4"
+  local fa="$1" reach="$2" state="$3" golden="$4"
   if [ "$fa" != "1" ];     then echo "plan-only:FA_APPLY!=1 (apply opt-in off)"; return; fi
-  if [ "$xo" != "1" ];     then echo "plan-only:XO-unreachable"; return; fi
+  if [ "$reach" != "1" ];  then echo "plan-only:XAPI-unreachable"; return; fi
   if [ "$state" != "1" ];  then echo "plan-only:tofu-state-unsafe"; return; fi
   if [ "$golden" != "1" ]; then echo "plan-only:no-golden-template"; return; fi
   echo "apply"
@@ -385,14 +403,14 @@ if [ "${1:-}" = "--self-test" ]; then
   # Idle fleet → every dom0 off (0:0:0).
   check "idle → all off" "$(bucket_demand 0 0 0 | tr '\n' '|')" "0:0:0|0:0:0|0:0:0|"
 
-  # --- apply_gate (L2: all four prereqs must hold) ---
+  # --- apply_gate (L2: all four prereqs must hold; DAR-29 reachability = XAPI) ---
   check "gate: all ok → apply"        "$(apply_gate 1 1 1 1)" apply
   check "gate: FA_APPLY off"          "$(apply_gate 0 1 1 1)" "plan-only:FA_APPLY!=1 (apply opt-in off)"
-  check "gate: XO down (current live)" "$(apply_gate 1 0 1 1)" "plan-only:XO-unreachable"
+  check "gate: XAPI unreachable"      "$(apply_gate 1 0 1 1)" "plan-only:XAPI-unreachable"
   check "gate: no state"              "$(apply_gate 1 1 0 1)" "plan-only:tofu-state-unsafe"
   check "gate: no golden"             "$(apply_gate 1 1 1 0)" "plan-only:no-golden-template"
-  # The CURRENT live state (XO down, no state) is plan-only even if opted in.
-  check "gate: live state → plan-only" "$(apply_gate 1 0 0 1)" "plan-only:XO-unreachable"
+  # A no-XAPI, no-state box is plan-only even if opted in (XAPI is the first gate).
+  check "gate: unreachable → plan-only" "$(apply_gate 1 0 0 1)" "plan-only:XAPI-unreachable"
 
   # --- host_port_from_xo_url ---
   check "xo url host:port"      "$(host_port_from_xo_url 'ws://172.20.145.192:8080')" "172.20.145.192 8080"
@@ -418,7 +436,7 @@ if [ "${1:-}" = "--self-test" ]; then
   # plan-only:* verdict (FA_APPLY=0, XO-down, dry-run) is a hard no-op.
   check "gate apply → provision"        "$(provision_enabled apply && echo yes || echo no)" yes
   check "FA_APPLY=0 → no provision"     "$(provision_enabled 'plan-only:FA_APPLY!=1 (apply opt-in off)' && echo yes || echo no)" no
-  check "XO-down → no provision"        "$(provision_enabled 'plan-only:XO-unreachable' && echo yes || echo no)" no
+  check "XAPI-down → no provision"      "$(provision_enabled 'plan-only:XAPI-unreachable' && echo yes || echo no)" no
 
   # --- demand contribution (queue-accuracy bug A): a @farm:{…} payload contributes
   # to demand ONLY when it is a real `cargo …` build command. Templates/placeholders
@@ -527,15 +545,26 @@ source_fn_from "$XCP_BUILD" infer_shape || warn "could not reuse infer_shape fro
 # if it can't be sourced the reset step degrades to a no-op (logged), never crashes.
 source_fn_from "$XCP_BUILD" dom0_shape || warn "could not reuse dom0_shape from $XCP_BUILD — inter-job reset will be skipped"
 
-# --- XO reachability probe (graceful-degrade signal #1) -----------------------
-# A pure TCP connect to the XO websocket host:port. The CURRENT live state is
-# connection-refused (XO down) → returns 1, and the reconciler degrades. Never
-# blocks the loop: bounded by FA_PROBE_TIMEOUT.
+# --- XO reachability probe (back-compat status only) --------------------------
+# A pure TCP connect to the XO websocket host:port. XO is dead live (connection-
+# refused); kept ONLY so --status can still report the legacy XO signal. It is NO
+# LONGER the apply gate (see xapi_reachable). Bounded by FA_PROBE_TIMEOUT.
 xo_reachable() {
   local hp host port
   hp="$(host_port_from_xo_url "$XO_URL")"
   host="${hp%% *}"; port="${hp##* }"
   timeout "$PROBE_TIMEOUT" bash -c "cat </dev/null >/dev/tcp/$host/$port" 2>/dev/null
+}
+
+# --- XAPI reachability probe (DAR-29 apply gate, graceful-degrade signal #1) ---
+# A pure TCP connect to the FOUNDING dom0 XAPI host:443 — the control plane every
+# `tofu apply` against infra/tofu/xen-xapi actually talks to. This REPLACES the
+# dead XO websocket as the apply-reachability prerequisite: a no-XO farm with a
+# healthy XAPI can now apply, where the old XO-ws gate pinned it plan-only forever.
+# Unreachable → returns 1 → the gate stays plan-only (the safe direction). Never
+# blocks the loop: bounded by FA_PROBE_TIMEOUT.
+xapi_reachable() {
+  timeout "$PROBE_TIMEOUT" bash -c "cat </dev/null >/dev/tcp/$XCP_HOST/$XAPI_PORT" 2>/dev/null
 }
 
 # --- tofu state sanity (graceful-degrade signal #2) ---------------------------
@@ -583,17 +612,59 @@ golden_template_set() {
 }
 
 # eval_gate — run the three apply prerequisites' probes once and set the globals
-# GATE_XO / GATE_STATE / GATE_GOLDEN (each 0/1) + GATE (the apply_gate verdict).
+# GATE_XAPI / GATE_STATE / GATE_GOLDEN (each 0/1) + GATE (the apply_gate verdict).
 # Each probe is bounded + never throws (a failure is the safe 0 = plan-only). Used
 # by both --status (report) and --once (decide), so the probe logic lives in ONE
 # place and the two paths can't disagree.
-GATE_XO=0; GATE_STATE=0; GATE_GOLDEN=0; GATE=""
+GATE_XAPI=0; GATE_STATE=0; GATE_GOLDEN=0; GATE=""
 eval_gate() {
-  GATE_XO=0; GATE_STATE=0; GATE_GOLDEN=0
-  if xo_reachable;        then GATE_XO=1;     fi
+  GATE_XAPI=0; GATE_STATE=0; GATE_GOLDEN=0
+  # DAR-29: the reachability prerequisite is the founding-dom0 XAPI :443, not XO.
+  if xapi_reachable;      then GATE_XAPI=1;   fi
   if tofu_state_sane;     then GATE_STATE=1;  fi
   if golden_template_set; then GATE_GOLDEN=1; fi
-  GATE="$(apply_gate "$APPLY" "$GATE_XO" "$GATE_STATE" "$GATE_GOLDEN")"
+  GATE="$(apply_gate "$APPLY" "$GATE_XAPI" "$GATE_STATE" "$GATE_GOLDEN")"
+}
+
+# DAR-28: read/write the cross-tick busy-state. When MCNF_RECONCILER_STATE_ETCD=1
+# (render-env sets it on the control VM) the state lives in etcd /reconciler/
+# farm-busy-state via reconciler-state.sh, so a control-VM rebuild or fail-over
+# resumes the FA-4 hysteresis. Otherwise it falls back to the host-local file (the
+# legacy .192 box + offline --self-test). Both are best-effort: a read/write
+# failure WARNs and degrades to the file/empty, never aborts the tick.
+# Defined here (before the --once linear body) so the apply-gated exits can call
+# record_reconcile — bash resolves a function only after its definition is parsed.
+busy_state_read() {
+  if [ "$RECON_STATE_ETCD" = "1" ] && [ -f "$RECON_STATE" ]; then
+    bash "$RECON_STATE" get farm-busy-state 2>/dev/null || true
+    return 0
+  fi
+  cat "$FARM_BUSY_STATE" 2>/dev/null || true
+}
+busy_state_write() { # value on stdin
+  local val; val="$(cat)"
+  if [ "$RECON_STATE_ETCD" = "1" ] && [ -f "$RECON_STATE" ]; then
+    printf '%s' "$val" | bash "$RECON_STATE" put farm-busy-state \
+      || warn "could not persist farm busy-state to etcd /reconciler/farm-busy-state"
+    return 0
+  fi
+  printf '%s' "$val" > "$FARM_BUSY_STATE" 2>/dev/null \
+    || warn "could not persist farm busy-state to $FARM_BUSY_STATE"
+}
+
+# DAR-28/DAR-44: record this tick's outcome to etcd /reconciler/last-reconcile so
+# backoffice-status.sh reads reconcile health from the replicated store (NOT a
+# host-local farm-status.txt that won't exist on a fresh control VM). JSON
+# {rev,outcome,ts}. Best-effort + only when the etcd seam is on — the legacy box
+# keeps farm-status.txt. NEVER aborts the tick (a status write must not break the loop).
+record_reconcile() { # <outcome>
+  [ "$RECON_STATE_ETCD" = "1" ] && [ -f "$RECON_STATE" ] || return 0
+  local outcome="$1" rev ts
+  rev="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  ts="$(date -u +%FT%TZ 2>/dev/null || echo unknown)"
+  printf '{"rev":"%s","outcome":"%s","ts":"%s"}' "$rev" "$outcome" "$ts" \
+    | bash "$RECON_STATE" put last-reconcile 2>/dev/null \
+    || warn "could not record /reconciler/last-reconcile (status only; tick unaffected)"
 }
 
 # =============================================================================
@@ -696,7 +767,7 @@ if [ "$MODE" = "status" ]; then
 
   # Gate state (each prereq + the resulting decision).
   eval_gate
-  log "apply-gate: FA_APPLY=$APPLY xo_reachable=$GATE_XO state_sane=$GATE_STATE golden_set=$GATE_GOLDEN → ${GATE%%:*}"
+  log "apply-gate: FA_APPLY=$APPLY xapi_reachable=$GATE_XAPI state_sane=$GATE_STATE golden_set=$GATE_GOLDEN → ${GATE%%:*}"
   case "$GATE" in plan-only:*) log "  plan-only reason: ${GATE#plan-only:}";; esac
 
   # Live queue → per-dom0 specs (best-effort; degrades to 0s if signals are down).
@@ -737,7 +808,7 @@ for dk in "${ORDER[@]}"; do AS_ARGS+=("${DOM0_FLAG[$dk]}" "${SPECS[$i]:-0:0:0}")
 # the commit path knows whether to attempt apply). XO + state probes are bounded
 # and never throw — a probe failure is just a 0 (→ plan-only), the safe direction.
 eval_gate
-log "apply-gate: FA_APPLY=$APPLY xo_reachable=$GATE_XO state_sane=$GATE_STATE golden_set=$GATE_GOLDEN → ${GATE%%:*}"
+log "apply-gate: FA_APPLY=$APPLY xapi_reachable=$GATE_XAPI state_sane=$GATE_STATE golden_set=$GATE_GOLDEN → ${GATE%%:*}"
 case "$GATE" in plan-only:*)
   warn "APPLY GATED — plan-only this tick (reason: ${GATE#plan-only:}). Last-good topology kept; no VM touched."
 ;; esac
@@ -766,17 +837,20 @@ fi
 # --- 3) APPLY — GATED --------------------------------------------------------
 if [ "$GATE" != "apply" ]; then
   log "apply skipped (${GATE}). Reconcile tick done (plan-only)."
+  record_reconcile "${GATE}"
   exit 0
 fi
 
-# Re-confirm the gate right before mutating (defence in depth — XO could have
+# Re-confirm the gate right before mutating (defence in depth — XAPI could have
 # dropped between the probe and here; never apply against a stale green probe).
-if ! xo_reachable; then
-  warn "XO went unreachable since the gate check — ABORTING apply (degrade, keep last-good)."
+if ! xapi_reachable; then
+  warn "founding-dom0 XAPI went unreachable since the gate check — ABORTING apply (degrade, keep last-good)."
+  record_reconcile "degraded:xapi-dropped"
   exit 0
 fi
 if ! tofu_state_sane; then
   warn "tofu state no longer sane — ABORTING apply (degrade, keep last-good)."
+  record_reconcile "degraded:state-unsafe"
   exit 0
 fi
 
@@ -945,11 +1019,10 @@ reset_running_vms() {
   # for_each_kept_vm calls the cb in-shell (no subshell), so these globals carry across.
   FARM_BUSY_STATE="${MCNF_FARM_BUSY_STATE:-/var/lib/mcnf-farm/farm-busy-state}"
   mkdir -p "$(dirname "$FARM_BUSY_STATE")" 2>/dev/null || true
-  PREV_BUSY="$(cat "$FARM_BUSY_STATE" 2>/dev/null || true)"
+  PREV_BUSY="$(busy_state_read)"
   THIS_BUSY=""
   for_each_kept_vm reset_one_vm || warn "could not enumerate kept VMs — inter-job reset skipped this tick"
-  printf '%s' "$THIS_BUSY" > "$FARM_BUSY_STATE" 2>/dev/null \
-    || warn "could not persist farm busy-state to $FARM_BUSY_STATE"
+  printf '%s' "$THIS_BUSY" | busy_state_write
 }
 
 # reset_one_vm <vm-name> <dom0-host> <vm-ip-or-empty> — keep ONE kept build VM
@@ -1003,4 +1076,5 @@ log "inter-job snapshot-revert of the converged build VMs to their clean baselin
 reset_running_vms
 
 log "reconcile tick complete (applied)."
+record_reconcile "applied"
 exit 0
