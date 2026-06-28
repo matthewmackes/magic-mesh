@@ -144,6 +144,10 @@ pub struct ProvisioningPanel {
     /// XCP-7 — the set/rotate-credential progress modal (pending → success /
     /// failure), reusing the shared `connect_progress` chrome.
     pub cred_modal: ConnectProgress,
+    /// DATACENTER-21 — running ephemeral test VMs (`action/dc/testbed-list`).
+    pub testbed: Vec<TestVmRow>,
+    /// DATACENTER-21 — tear-down confirm arm (destroys all test VMs).
+    pub testbed_armed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +176,14 @@ pub enum Message {
     CredDismiss,
     /// Retry the credential write from the modal's Failure state.
     CredRetry,
+    // DATACENTER-21 — ephemeral test-mesh + build-farm autoscale controls.
+    TestbedLoaded(Result<Vec<TestVmRow>, String>),
+    TestbedProvision,
+    TestbedTeardownArm,
+    TestbedTeardownConfirm,
+    TestbedTeardownCancel,
+    FarmScale,
+    TestbedOp(Result<String, String>),
 }
 
 impl ProvisioningPanel {
@@ -183,14 +195,27 @@ impl ProvisioningPanel {
     /// Probe the worker for the VM + host rosters on panel entry. Both Bus
     /// round-trips run on `spawn_blocking` (the client builds its own runtime).
     pub fn load() -> Task<crate::Message> {
-        Task::perform(
-            async {
-                tokio::task::spawn_blocking(fetch)
-                    .await
-                    .unwrap_or_else(|_| Err("provisioning probe task panicked".into()))
-            },
-            |result| crate::Message::Provisioning(Message::Loaded(result)),
-        )
+        // The MDE-VM roster and the ephemeral test-mesh list are independent
+        // probes; fetch both on open so the test-mesh section paints with live
+        // counts rather than waiting for the first operator action (DATACENTER-21).
+        Task::batch([
+            Task::perform(
+                async {
+                    tokio::task::spawn_blocking(fetch)
+                        .await
+                        .unwrap_or_else(|_| Err("provisioning probe task panicked".into()))
+                },
+                |result| crate::Message::Provisioning(Message::Loaded(result)),
+            ),
+            Task::perform(
+                async {
+                    tokio::task::spawn_blocking(testbed_list_rpc)
+                        .await
+                        .unwrap_or_else(|_| Err("testbed-list task panicked".into()))
+                },
+                |res| crate::Message::Provisioning(Message::TestbedLoaded(res)),
+            ),
+        ])
     }
 
     pub fn update(&mut self, message: Message) -> Task<crate::Message> {
@@ -326,6 +351,89 @@ impl ProvisioningPanel {
             }
             Message::SetCredsClicked => self.fire_set_creds(),
             Message::CredRetry => self.fire_set_creds(),
+            // DATACENTER-21 — ephemeral test-mesh + build-farm autoscale.
+            Message::TestbedLoaded(Ok(vms)) => {
+                self.testbed = vms;
+                Task::none()
+            }
+            Message::TestbedLoaded(Err(e)) => {
+                self.status = format!("test-mesh list: {e}");
+                Task::none()
+            }
+            Message::TestbedProvision => {
+                if self.busy {
+                    return Task::none();
+                }
+                self.busy = true;
+                self.status = "Provisioning 2 test VMs…".into();
+                Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(|| testbed_up_rpc(2))
+                            .await
+                            .unwrap_or_else(|_| Err("testbed-up task panicked".into()))
+                    },
+                    |res| crate::Message::Provisioning(Message::TestbedOp(res)),
+                )
+            }
+            Message::TestbedTeardownArm => {
+                self.testbed_armed = true;
+                Task::none()
+            }
+            Message::TestbedTeardownCancel => {
+                self.testbed_armed = false;
+                Task::none()
+            }
+            Message::TestbedTeardownConfirm => {
+                self.testbed_armed = false;
+                if self.busy {
+                    return Task::none();
+                }
+                self.busy = true;
+                self.status = "Tearing down test mesh…".into();
+                Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(testbed_down_rpc)
+                            .await
+                            .unwrap_or_else(|_| Err("testbed-down task panicked".into()))
+                    },
+                    |res| crate::Message::Provisioning(Message::TestbedOp(res)),
+                )
+            }
+            Message::FarmScale => {
+                if self.busy {
+                    return Task::none();
+                }
+                self.busy = true;
+                self.status = "Running autoscale reconcile (plan only)…".into();
+                Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(farm_scale_rpc)
+                            .await
+                            .unwrap_or_else(|_| Err("farm-scale task panicked".into()))
+                    },
+                    |res| {
+                        crate::Message::Provisioning(Message::TestbedOp(res.map(|plan| {
+                            let first = plan.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                            format!("autoscale reconcile done — {first}")
+                        })))
+                    },
+                )
+            }
+            Message::TestbedOp(result) => {
+                self.busy = false;
+                self.status = match result {
+                    Ok(m) | Err(m) => m,
+                };
+                // refresh the test-VM list after any test-mesh op
+                Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(testbed_list_rpc)
+                            .await
+                            .unwrap_or_else(|_| Err("testbed-list task panicked".into()))
+                    },
+                    |res| crate::Message::Provisioning(Message::TestbedLoaded(res)),
+                )
+            }
             Message::CredFinished(result) => {
                 // Ignore a late result for a modal the operator already dismissed
                 // (Dismiss → Closed before the in-flight store write landed) — a
@@ -441,10 +549,18 @@ impl ProvisioningPanel {
         .spacing(12)
         .align_y(cosmic::iced::alignment::Vertical::Center);
 
+        let testbed = section_block(
+            "Test mesh & farm-scale",
+            self.testbed_section(),
+            palette,
+            density,
+        );
+
         let body = column![
             header,
             spawn_form,
             cred_form,
+            testbed,
             roster,
             text(&self.status).size(13),
         ]
@@ -460,6 +576,82 @@ impl ProvisioningPanel {
             crate::Message::Provisioning(Message::CredRetry),
             crate::Message::Provisioning(Message::CredDismiss),
         )
+    }
+
+    /// DATACENTER-21 — the ephemeral test-mesh + farm-autoscale controls: a live
+    /// count of running test VMs, a Provision button, a confirm-gated Tear-down,
+    /// and an Autoscale-plan (dry-run) trigger. All route through the
+    /// `action/dc/testbed-*` / `action/dc/farm-scale` host_ops verbs.
+    fn testbed_section(&self) -> Element<'_, crate::Message> {
+        let palette = crate::live_theme::palette();
+
+        let summary = if self.testbed.is_empty() {
+            "No ephemeral test VMs running.".to_string()
+        } else {
+            let names: Vec<String> = self
+                .testbed
+                .iter()
+                .map(|v| {
+                    if v.ip.is_empty() {
+                        v.name.clone()
+                    } else {
+                        format!("{} ({})", v.name, v.ip)
+                    }
+                })
+                .collect();
+            format!("{} test VM(s): {}", self.testbed.len(), names.join(", "))
+        };
+
+        let provision = variant_button(
+            "Provision 2 test VMs",
+            ButtonVariant::Primary,
+            (!self.busy).then_some(crate::Message::Provisioning(Message::TestbedProvision)),
+            palette,
+        );
+
+        let scale = variant_button(
+            "Autoscale plan",
+            ButtonVariant::Secondary,
+            (!self.busy).then_some(crate::Message::Provisioning(Message::FarmScale)),
+            palette,
+        );
+
+        // Tear-down destroys every test VM, so it is arm → confirm gated.
+        let teardown: Element<'_, crate::Message> = if self.testbed_armed {
+            row![
+                variant_button(
+                    "Confirm tear-down",
+                    ButtonVariant::Primary,
+                    (!self.busy).then_some(crate::Message::Provisioning(
+                        Message::TestbedTeardownConfirm
+                    )),
+                    palette,
+                ),
+                variant_button(
+                    "Cancel",
+                    ButtonVariant::Ghost,
+                    Some(crate::Message::Provisioning(Message::TestbedTeardownCancel)),
+                    palette,
+                ),
+            ]
+            .spacing(8)
+            .into()
+        } else {
+            variant_button(
+                "Tear down test mesh",
+                ButtonVariant::Ghost,
+                (!self.busy && !self.testbed.is_empty())
+                    .then_some(crate::Message::Provisioning(Message::TestbedTeardownArm)),
+                palette,
+            )
+        };
+
+        column![
+            text(summary).size(13),
+            row![provision, teardown, scale].spacing(8),
+        ]
+        .spacing(12)
+        .into()
     }
 
     /// The name input + host picker + Spawn button.
@@ -724,6 +916,84 @@ fn destroy_vm(name: &str, host: &str) -> Result<String, String> {
 /// existing VM — distinct from spawn, which clones a new one).
 fn start_vm(name: &str, host: &str) -> Result<String, String> {
     named_vm_action(START_TOPIC, name, host, START_TIMEOUT, "started")
+}
+
+/// DATACENTER-21 — one ephemeral test VM from `action/dc/testbed-list`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TestVmRow {
+    pub name: String,
+    #[serde(default)]
+    pub ip: String,
+}
+
+/// Fire an `action/dc/<verb>` RPC (the DATACENTER-21 host_ops verbs) with `body`,
+/// returning the parsed reply (or its `error`). Mirrors the panel's Bus round-trip.
+fn dc_action(verb: &str, body: &str, timeout: Duration) -> Result<serde_json::Value, String> {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return Err("no Bus data dir".to_string());
+    };
+    let topic = format!("action/dc/{verb}");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    let reply = rt.block_on(async {
+        let p = mde_bus::persist::Persist::open(dir).map_err(|e| e.to_string())?;
+        mde_bus::rpc::request(
+            &p,
+            &topic,
+            mde_bus::hooks::config::Priority::Default,
+            Some(verb),
+            Some(body),
+            timeout,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })?;
+    let raw = reply.body.unwrap_or_default();
+    let v: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("bad {verb} reply: {e}"))?;
+    if let Some(err) = v.get("error").and_then(|x| x.as_str()) {
+        return Err(err.to_string());
+    }
+    Ok(v)
+}
+
+/// DATACENTER-21 — list running ephemeral test VMs.
+fn testbed_list_rpc() -> Result<Vec<TestVmRow>, String> {
+    let v = dc_action("testbed-list", "{}", Duration::from_secs(20))?;
+    Ok(v.get("vms")
+        .and_then(|a| serde_json::from_value::<Vec<TestVmRow>>(a.clone()).ok())
+        .unwrap_or_default())
+}
+
+/// DATACENTER-21 — provision `n` test VMs (async clone; returns immediately).
+fn testbed_up_rpc(n: u32) -> Result<String, String> {
+    dc_action(
+        "testbed-up",
+        &format!("{{\"n\":{n}}}"),
+        Duration::from_secs(20),
+    )?;
+    Ok(format!("provisioning {n} test VM(s) — refresh shortly"))
+}
+
+/// DATACENTER-21 — tear down ALL test VMs (confirm-gated on the handler).
+fn testbed_down_rpc() -> Result<String, String> {
+    dc_action(
+        "testbed-down",
+        "{\"confirm\":true}",
+        Duration::from_secs(120),
+    )?;
+    Ok("test mesh torn down".to_string())
+}
+
+/// DATACENTER-21 — run the autoscale reconcile (plan only); return the plan text.
+fn farm_scale_rpc() -> Result<String, String> {
+    let v = dc_action("farm-scale", "{}", Duration::from_secs(120))?;
+    Ok(v.get("plan")
+        .and_then(|x| x.as_str())
+        .unwrap_or("(no plan output)")
+        .to_string())
 }
 
 // ---- pure helpers (parse / validate) -----------------------------------------

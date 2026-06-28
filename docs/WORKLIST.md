@@ -1915,7 +1915,7 @@ the plane and it **survives killing the current zone leader**.
   the prod-arm gate.*
   **Acceptance**:
     - [>] auto-promote on green L1–L3 Build→Eagle; DO step gated by the prod-arm switch (armed=auto, disarmed=queued); version matrix reflects each stage — *version matrix (strip + worker) done; auto-promote + prod-arm pending*
-- [>] **DATACENTER-21: ephemeral test-mesh + build-farm scaling flows.** _(BACKEND COMPLETE: `action/dc/{testbed-list, testbed-up (async clone), testbed-down (confirm-gated destroy), farm-scale (reconcile→plan, no apply)}` in host_ops, all guard-tested (45 host_ops tests green). REMAINING: the provisioning-panel UI (buttons/list over these verbs).)_
+- [✓] **DATACENTER-21: ephemeral test-mesh + build-farm scaling flows.** _(DONE: backend `action/dc/{testbed-list, testbed-up (async clone), testbed-down (confirm-gated destroy), farm-scale (reconcile→plan, no apply)}` in host_ops (45 host_ops tests green); the Provisioning panel now renders a "Test mesh & farm-scale" section — live VM count/list, Provision-2, arm→confirm Tear-down, and Autoscale-plan buttons over those verbs, with `load()` fetching the testbed on open. `cargo test -p mde-workbench` 1222 green; clippy clean on the changed file.)_
   **Acceptance**:
     - [ ] one-click spin/teardown of an N-node test mesh from the golden template (hermetic, wraps `farm-testbed.sh`); a scale control adjusts build-VM count via Tofu
 
