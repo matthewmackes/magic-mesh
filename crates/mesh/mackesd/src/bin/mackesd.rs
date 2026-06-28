@@ -9085,6 +9085,17 @@ fn cmd_join(
         // (no manual `etcdctl member add`). Best-effort: failure logs an
         // actionable message and the enrolled lighthouse still comes up.
         lighthouse_join_etcd(&bundle, &display_name);
+
+        // MIG-3 — a joined lighthouse inherits the mesh CA (same mesh,
+        // same signing key as the founder), so it will hold ca.key and
+        // the backup worker would otherwise loud-warn SEC-7/ENT-11
+        // "UNBACKED-UP" every boot. Provision the sealed CA-backup
+        // passphrase credential now (generated-on-joiner, host-bound via
+        // systemd-creds — never transmitted off this box) + write the
+        // LoadCredentialEncrypted drop-in so the upcoming mackesd restart
+        // picks it up. Best-effort: a miss logs an actionable line but
+        // never aborts the join.
+        provision_ca_backup_passphrase_if_lighthouse(parsed);
     }
 
     // SETUP-7 — capture the joined facts (mesh-id + lighthouse roster from the
@@ -9194,6 +9205,47 @@ fn provision_caddy_if_lighthouse(role: mde_role::Role) {
         Err(e) => eprintln!(
             "provision: setup-caddy not run ({e}) — is the RPM installed? \
              public web ingress is unavailable until Caddy is set up"
+        ),
+    }
+}
+
+/// MIG-3 — on a joined Lighthouse, ensure a sealed CA-backup passphrase
+/// credential exists so the box boots without the SEC-7/ENT-11
+/// "UNBACKED-UP" warning. The passphrase is GENERATED locally + sealed
+/// host-bound via systemd-creds (TPM/host key) — it never leaves this
+/// box and is never logged (only its presence/length). No-op for
+/// non-lighthouse roles + idempotent (never rotates an existing cred).
+///
+/// The OFF-FLEET / off-site CA-backup push is intentionally NOT touched
+/// here — that remains an operator-run step. This only clears the
+/// "no backup passphrase credential" boot error.
+///
+/// Best-effort + idempotent: a miss logs an actionable line but never
+/// aborts the join (the lighthouse still joins; the worker keeps
+/// warning until the operator provisions it by hand per the unit
+/// comment).
+fn provision_ca_backup_passphrase_if_lighthouse(role: mde_role::Role) {
+    use mackesd_core::ca::backup_provision::{provision, ProvisionOutcome};
+    match provision(role) {
+        Ok(ProvisionOutcome::Provisioned { sealed_bytes }) => {
+            // Log presence/length only — NEVER the passphrase value.
+            println!(
+                "MIG-3: sealed CA-backup passphrase provisioned ({sealed_bytes}-byte credential) — CA no longer UNBACKED-UP"
+            );
+            // The drop-in is new; reload so the upcoming mackesd.service
+            // (re)start surfaces $CREDENTIALS_DIRECTORY/backup-passphrase.
+            let _ = std::process::Command::new("systemctl")
+                .arg("daemon-reload")
+                .status();
+        }
+        Ok(ProvisionOutcome::AlreadyPresent) => {
+            println!("MIG-3: CA-backup passphrase credential already present — left untouched");
+        }
+        Ok(ProvisionOutcome::NotLighthouse) => {}
+        Err(e) => eprintln!(
+            "MIG-3: could not provision the CA-backup passphrase ({e}) — this lighthouse will \
+             warn SEC-7/ENT-11 until you provision it by hand (see the EFF-15 comment in the \
+             mackesd.service unit)"
         ),
     }
 }
