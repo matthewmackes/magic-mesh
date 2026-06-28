@@ -535,6 +535,13 @@ fn promote_with_endpoints(
 #[must_use]
 pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
+    // DATACENTER-7 (RBAC): gate the caller's mesh principal against the role map
+    // BEFORE dispatch — a viewer (or unauthenticated caller under a configured
+    // policy) is denied a mutating verb, and the denial is audited.
+    if let Err(reason) = crate::ipc::dc_rbac::enforce(verb, req_body) {
+        crate::ipc::dc_rbac::audit_denial(verb, req_body, &reason);
+        return err(reason);
+    }
     match verb {
         "host-power" => {}
         "gateway-reboot" => {

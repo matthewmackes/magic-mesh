@@ -38,6 +38,17 @@ pub const DEFAULT_ETCD: &str = "http://172.20.145.192:2379";
 /// (matches [`crate::ca::expiry::CERT_EXPIRY_WARN_DAYS`]).
 pub const CERT_WARN_DAYS: i64 = 30;
 
+/// Days an issued-but-unredeemed join bearer may sit pending before the
+/// `token-expiry` check flags it `warn`: a dangling join token is a live
+/// credential the operator should redeem or revoke. A week is a generous window
+/// for a normal enrollment to complete.
+pub const TOKEN_STALE_WARN_DAYS: i64 = 7;
+
+/// How many recent warning+ dom0 journal lines [`aggregate_dom0_logs`] pulls per
+/// pass (bounded so the SSH stays cheap; dedup keeps re-fetched lines from
+/// re-appending).
+pub const DOM0_LOG_TAIL: usize = 25;
+
 /// Max characters of a check's `detail` string carried into the record. Keeps the
 /// health lane compact.
 pub const DETAIL_LEN: usize = 160;
@@ -154,6 +165,93 @@ pub fn parse_not_after(nebula_cert_output: &str) -> Option<String> {
             .map(|rest| rest.trim().to_string())
             .filter(|s| !s.is_empty())
     })
+}
+
+// ---- pure token-expiry helpers (the issued-bearer join-token ledger) ----
+
+/// Map a pending join bearer's age-in-days to a health status: `"warn"` once it
+/// has sat unredeemed for at least [`TOKEN_STALE_WARN_DAYS`], else `"ok"`. A
+/// dangling token never `fail`s — it is a credential to clean up, not an outage.
+#[must_use]
+pub fn token_status_from_age_days(age_days: i64) -> &'static str {
+    if age_days >= TOKEN_STALE_WARN_DAYS {
+        "warn"
+    } else {
+        "ok"
+    }
+}
+
+/// Extract `issued_at_ms` out of one bearer-ledger entry's JSON
+/// (`{"issued_at_ms":<u64>,"note":…}`, the shape [`crate::bearer_ledger::issue`]
+/// writes). PURE. `None` when absent/unparseable, and `0` (the `record_issued`
+/// sentinel) maps to `Some(0)` so a recorded-without-timestamp token reads as
+/// "epoch old" → always stale-warned (it is a real dangling credential).
+#[must_use]
+pub fn parse_issued_at_ms(entry_json: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(entry_json)
+        .ok()?
+        .get("issued_at_ms")
+        .and_then(serde_json::Value::as_u64)
+}
+
+// ---- pure VM-crash + pool-degraded helpers (parse `xl`/`xe` output) ----
+
+/// Parse `xl list` output and return the names of domains in the **crashed**
+/// state. PURE.
+///
+/// `xl list` prints a header (`Name ID Mem VCPUs State Time(s)`) then one row per
+/// domain; the `State` column is the 5th whitespace field, a 6-char flag string
+/// (`r-----`, `--p---`, …) where a `c` in the 5th position means *crashed*. This
+/// skips the header + the control domain (`Domain-0`) and returns every other
+/// domain whose `State` field contains a `c`.
+#[must_use]
+pub fn parse_crashed_vms(xl_list: &str) -> Vec<String> {
+    let mut crashed = Vec::new();
+    for line in xl_list.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // Need at least Name, ID, Mem, VCPUs, State.
+        if cols.len() < 5 {
+            continue;
+        }
+        let name = cols[0];
+        // Skip the header row and the control domain.
+        if name == "Name" || name == "Domain-0" {
+            continue;
+        }
+        let state = cols[4];
+        // The state flag string carries 'c' when the domain has crashed.
+        if state.contains('c') {
+            crashed.push(name.to_string());
+        }
+    }
+    crashed
+}
+
+/// Reduce a `xe host-list params=enabled --minimal` CSV (`true,false,…`) to a
+/// pool-health `(status, enabled_count, total)`. PURE.
+///
+/// XCP's `--minimal` prints the `enabled` field for every host as a
+/// comma-separated list. A pool is `"fail"` (degraded) when any host is disabled,
+/// `"ok"` when all are enabled, and `"warn"` when the output is empty/unparseable
+/// (nothing to assert on — honest, not a false alarm).
+#[must_use]
+pub fn pool_status_from_enabled(enabled_csv: &str) -> (&'static str, usize, usize) {
+    let fields: Vec<&str> = enabled_csv
+        .trim()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if fields.is_empty() {
+        return ("warn", 0, 0);
+    }
+    let total = fields.len();
+    let enabled = fields.iter().filter(|f| f.eq_ignore_ascii_case("true")).count();
+    if enabled == total {
+        ("ok", enabled, total)
+    } else {
+        ("fail", enabled, total)
+    }
 }
 
 // ---- thin I/O: run the probes, emit health events via the Bus ----
@@ -359,17 +457,252 @@ fn probe_cert(workgroup_root: &std::path::Path) -> Probe {
     }
 }
 
+/// Probe the issued-bearer join-token ledger for stale (long-pending) tokens.
+/// Reads `<workgroup_root>/ca/issued-bearers/*.json` (the
+/// [`crate::bearer_ledger`] store), finds the oldest still-pending bearer, and
+/// maps its age via [`token_status_from_age_days`]. `ok` ("no pending tokens")
+/// when the ledger is empty/absent — a fresh node has nothing to warn about.
+fn probe_token(workgroup_root: &std::path::Path) -> Probe {
+    let dir = crate::bearer_ledger::ledger_dir(workgroup_root);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Probe::ok("no pending tokens");
+    };
+    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    let mut oldest_age_days: Option<i64> = None;
+    let mut pending = 0_usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(issued_ms) = parse_issued_at_ms(&contents) else {
+            continue;
+        };
+        pending += 1;
+        let age_days = i64::try_from(now_ms.saturating_sub(issued_ms) / 86_400_000)
+            .unwrap_or(i64::MAX);
+        oldest_age_days = Some(oldest_age_days.map_or(age_days, |o| o.max(age_days)));
+    }
+    match oldest_age_days {
+        None => Probe::ok("no pending tokens"),
+        Some(age) => {
+            let detail = format!("{pending} pending; oldest {age}d");
+            match token_status_from_age_days(age) {
+                "warn" => Probe::warn(detail),
+                _ => Probe::ok(detail),
+            }
+        }
+    }
+}
+
+/// Probe a dom0 for crashed guests via `xl list` over the mesh key. `fail` (with
+/// the crashed VM names) when any guest is in the crashed state, `ok` otherwise.
+/// `warn` when the toolstack/SSH is unreachable — that liveness is the `dom0:*`
+/// check's job, so vm-crash stays quiet rather than double-alarming.
+fn probe_vm_crash(key: &str, dom0: &str) -> Probe {
+    let out = std::process::Command::new("ssh")
+        .args([
+            "-i",
+            key,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            &format!("root@{dom0}"),
+            "xl list",
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let crashed = parse_crashed_vms(&String::from_utf8_lossy(&o.stdout));
+            if crashed.is_empty() {
+                Probe::ok("no crashed vms")
+            } else {
+                Probe::fail(format!("crashed: {}", crashed.join(",")))
+            }
+        }
+        Ok(_) => Probe::warn("xl list failed"),
+        Err(e) => Probe::warn(format!("ssh spawn failed: {e}")),
+    }
+}
+
+/// Probe a dom0's pool health via `xe host-list params=enabled --minimal` over
+/// the mesh key, reduced by [`pool_status_from_enabled`]. `fail` when any pool
+/// host is disabled (degraded), `ok` when all are enabled, `warn` when the
+/// toolstack/SSH is unreachable.
+fn probe_pool(key: &str, dom0: &str) -> Probe {
+    let out = std::process::Command::new("ssh")
+        .args([
+            "-i",
+            key,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            &format!("root@{dom0}"),
+            "xe host-list params=enabled --minimal",
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let (status, enabled, total) =
+                pool_status_from_enabled(&String::from_utf8_lossy(&o.stdout));
+            let detail = format!("{enabled}/{total} hosts enabled");
+            match status {
+                "fail" => Probe::fail(detail),
+                "ok" => Probe::ok(detail),
+                _ => Probe::warn("pool state unknown"),
+            }
+        }
+        Ok(_) => Probe::warn("host-list failed"),
+        Err(e) => Probe::warn(format!("ssh spawn failed: {e}")),
+    }
+}
+
+/// DATACENTER-24 (logs half) — per-resource log dedup cursor.
+///
+/// dom0s run no mackesd (XCP-6), so their journals never reach the OBS-5
+/// structured-log sink the Fleet-logs panel reads. [`aggregate_dom0_logs`] tails
+/// each dom0's warning+ journal and republishes the NEW lines into that same sink
+/// under `host = "dom0:<ip>"` (the per-resource view) + an `event/dc/logs/*`
+/// digest. This tracks the last line already forwarded per resource so a
+/// re-fetched tail never re-appends the same lines every tick.
+#[derive(Default)]
+pub struct DcLogs {
+    last_seen: BTreeMap<String, String>,
+}
+
+impl DcLogs {
+    /// Fresh aggregator with no forwarded lines.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Given a `resource`'s current ordered log `lines` (oldest→newest), return
+    /// the suffix not yet forwarded and advance the cursor to the newest line.
+    /// PURE. If the previously-seen line is no longer present (rotation), the
+    /// whole batch is treated as new.
+    pub fn new_lines(&mut self, resource: &str, lines: &[String]) -> Vec<String> {
+        let trimmed: Vec<String> = lines
+            .iter()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        let fresh: Vec<String> = match self.last_seen.get(resource) {
+            Some(last) => match trimmed.iter().rposition(|l| l == last) {
+                // Everything after the last-seen line is new.
+                Some(idx) => trimmed[idx + 1..].to_vec(),
+                // Cursor rotated out of the window → forward the whole batch.
+                None => trimmed.clone(),
+            },
+            None => trimmed.clone(),
+        };
+        if let Some(newest) = trimmed.last() {
+            self.last_seen.insert(resource.to_string(), newest.clone());
+        }
+        fresh
+    }
+}
+
+/// Bus topic a logs digest for `resource` is published to: `event/dc/logs/<resource>`.
+#[must_use]
+pub fn logs_topic(resource: &str) -> String {
+    format!("event/dc/logs/{resource}")
+}
+
+/// DATACENTER-24 (logs half) — tail each reachable dom0's warning+ journal and
+/// forward the NEW lines into the OBS-5 structured-log sink (the Fleet-logs
+/// panel's source) under `host = "dom0:<ip>"`, plus a per-resource
+/// `event/dc/logs/dom0:<ip>` digest. Best-effort + deduped; a failed SSH/append
+/// degrades silently.
+fn aggregate_dom0_logs(logs: &mut DcLogs, workgroup_root: &std::path::Path, key: &str, dom0: &str) {
+    let out = std::process::Command::new("ssh")
+        .args([
+            "-i",
+            key,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            &format!("root@{dom0}"),
+            &format!("journalctl -p warning -n {DOM0_LOG_TAIL} -o cat --no-pager 2>/dev/null"),
+        ])
+        .output();
+    let Ok(o) = out else { return };
+    if !o.status.success() {
+        return;
+    }
+    let resource = format!("dom0:{dom0}");
+    let lines: Vec<String> = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let fresh = logs.new_lines(&resource, &lines);
+    if fresh.is_empty() {
+        return;
+    }
+    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+    for msg in &fresh {
+        let rec = magic_fleet::structured_log::LogRecord {
+            ts_ms: now_ms,
+            host: resource.clone(),
+            level: "warn".to_string(),
+            target: "dom0-journal".to_string(),
+            message: msg.clone(),
+            fields: std::collections::BTreeMap::new(),
+        };
+        let _ = magic_fleet::structured_log::append(workgroup_root, &rec);
+    }
+    // Per-resource digest onto the Bus (count + newest line).
+    let body = serde_json::json!({
+        "resource": resource,
+        "new_lines": fresh.len(),
+        "newest": fresh.last().cloned().unwrap_or_default(),
+    })
+    .to_string();
+    let mut cmd = std::process::Command::new("mde-bus");
+    cmd.args(["publish", &logs_topic(&resource), "--body-flag", &body]);
+    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+}
+
 /// One health pass: run each best-effort probe, feed its `(check, status)`
 /// through the dedup core, and publish the records that survive (status
 /// transitions). Every probe is independent — a failed/absent tool degrades that
 /// one check to `fail`/`warn` and never aborts the pass.
-fn run_checks(core: &mut DcHealth, workgroup_root: &std::path::Path) {
+fn run_checks(core: &mut DcHealth, logs: &mut DcLogs, workgroup_root: &std::path::Path) {
     let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
     for dom0 in crate::workers::datacenter_orchestrator::xen_dom0s() {
         let check = format!("dom0:{dom0}");
         let p = probe_dom0(&key, &dom0);
+        let reachable = p.status == "ok";
         if let Some(rec) = core.observe(&check, p.status, &p.detail) {
             publish(&rec);
+        }
+        // The per-dom0 Xen checks + log aggregation only make sense when the host
+        // is reachable — skip them otherwise (the dom0:* check already alarms).
+        if reachable {
+            let p = probe_vm_crash(&key, &dom0);
+            if let Some(rec) = core.observe(&format!("vm-crash:{dom0}"), p.status, &p.detail) {
+                publish(&rec);
+            }
+            let p = probe_pool(&key, &dom0);
+            if let Some(rec) = core.observe(&format!("pool:{dom0}"), p.status, &p.detail) {
+                publish(&rec);
+            }
+            aggregate_dom0_logs(logs, workgroup_root, &key, &dom0);
         }
     }
 
@@ -387,12 +720,18 @@ fn run_checks(core: &mut DcHealth, workgroup_root: &std::path::Path) {
     if let Some(rec) = core.observe("cert", p.status, &p.detail) {
         publish(&rec);
     }
+
+    let p = probe_token(workgroup_root);
+    if let Some(rec) = core.observe("token-expiry", p.status, &p.detail) {
+        publish(&rec);
+    }
 }
 
 /// The supervised worker. Leader-gated (only the elected node probes + publishes,
 /// so a multi-node mesh doesn't multi-publish) and best-effort.
 pub struct DcHealthWorker {
     core: DcHealth,
+    logs: DcLogs,
     tick_interval: Duration,
     node_id: String,
     leader_lock: PathBuf,
@@ -406,6 +745,7 @@ impl DcHealthWorker {
     pub fn new(workgroup_root: PathBuf, node_id: String) -> Self {
         Self {
             core: DcHealth::new(),
+            logs: DcLogs::new(),
             tick_interval: DEFAULT_TICK_INTERVAL,
             leader_lock: workgroup_root.join(".mackesd-leader.lock"),
             workgroup_root,
@@ -432,7 +772,7 @@ impl Worker for DcHealthWorker {
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         loop {
             if self.is_leader() {
-                run_checks(&mut self.core, &self.workgroup_root);
+                run_checks(&mut self.core, &mut self.logs, &self.workgroup_root);
             }
             tokio::select! {
                 () = shutdown.wait() => return Ok(()),
@@ -584,6 +924,123 @@ mod tests {
         let dt = chrono::DateTime::parse_from_str(to_parse, "%Y-%m-%d %H:%M:%S %z").unwrap();
         // 2027-01-01T00:00:00Z == 1_798_761_600.
         assert_eq!(dt.timestamp(), 1_798_761_600);
+    }
+
+    #[test]
+    fn token_status_thresholds_warn_at_the_window() {
+        assert_eq!(token_status_from_age_days(0), "ok");
+        assert_eq!(token_status_from_age_days(TOKEN_STALE_WARN_DAYS - 1), "ok");
+        // At and beyond the window → warn (a dangling credential, never fail).
+        assert_eq!(token_status_from_age_days(TOKEN_STALE_WARN_DAYS), "warn");
+        assert_eq!(token_status_from_age_days(90), "warn");
+    }
+
+    #[test]
+    fn parse_issued_at_ms_reads_the_ledger_shape() {
+        assert_eq!(
+            parse_issued_at_ms(r#"{"issued_at_ms":1700000000000,"note":"box"}"#),
+            Some(1_700_000_000_000)
+        );
+        // The record_issued sentinel (0) is a real, timestamp-less dangling token.
+        assert_eq!(parse_issued_at_ms(r#"{"issued_at_ms":0,"note":"recorded"}"#), Some(0));
+        // Garbage / missing field → None (skipped, not counted).
+        assert_eq!(parse_issued_at_ms("not json"), None);
+        assert_eq!(parse_issued_at_ms(r#"{"note":"x"}"#), None);
+    }
+
+    #[test]
+    fn parse_crashed_vms_finds_only_crashed_guests() {
+        // Header + Domain-0 + a running guest + a crashed guest + a paused guest.
+        let xl = "Name                                        ID   Mem VCPUs\tState\tTime(s)\n\
+                  Domain-0                                     0  4096     4     r-----    1234.5\n\
+                  build-vm-1                                   3  8192     4     -b----     567.8\n\
+                  test-vm-2                                    5  2048     2     --p---      12.3\n\
+                  broken-vm-3                                  7  2048     2     ---c--      99.0\n";
+        let crashed = parse_crashed_vms(xl);
+        assert_eq!(crashed, vec!["broken-vm-3".to_string()]);
+        // No crashed guests → empty.
+        let healthy = "Name ID Mem VCPUs State Time(s)\n\
+                       Domain-0 0 4096 4 r----- 1.0\n\
+                       vm-a 3 8192 4 -b---- 2.0\n";
+        assert!(parse_crashed_vms(healthy).is_empty());
+        // Domain-0 itself in a crashed-flagged state is ignored (never the guest signal).
+        let dom0_only = "Name ID Mem VCPUs State Time(s)\n\
+                         Domain-0 0 4096 4 ---c-- 1.0\n";
+        assert!(parse_crashed_vms(dom0_only).is_empty());
+    }
+
+    #[test]
+    fn pool_status_from_enabled_flags_a_disabled_host() {
+        // All enabled → ok.
+        assert_eq!(pool_status_from_enabled("true,true,true"), ("ok", 3, 3));
+        // One disabled → fail (degraded).
+        assert_eq!(pool_status_from_enabled("true,false,true"), ("fail", 2, 3));
+        // Case-insensitive + whitespace tolerant.
+        assert_eq!(pool_status_from_enabled(" True , TRUE "), ("ok", 2, 2));
+        // Empty/unparseable → warn (nothing to assert on).
+        assert_eq!(pool_status_from_enabled(""), ("warn", 0, 0));
+        assert_eq!(pool_status_from_enabled("   "), ("warn", 0, 0));
+    }
+
+    #[test]
+    fn logs_topic_formats_under_event_dc_logs() {
+        assert_eq!(logs_topic("dom0:172.20.0.9"), "event/dc/logs/dom0:172.20.0.9");
+    }
+
+    #[test]
+    fn dc_logs_forwards_only_new_lines_and_dedups() {
+        let mut l = DcLogs::new();
+        // First sight → all (non-empty) lines forwarded.
+        let batch1 = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(l.new_lines("dom0:x", &batch1), vec!["a", "b", "c"]);
+        // Re-fetch the same tail → nothing new (cursor at "c").
+        assert!(l.new_lines("dom0:x", &batch1).is_empty());
+        // Tail grows by two → only the two new lines.
+        let batch2 = vec![
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+            "e".to_string(),
+        ];
+        assert_eq!(l.new_lines("dom0:x", &batch2), vec!["d", "e"]);
+        // A different resource has an independent cursor.
+        assert_eq!(l.new_lines("dom0:y", &batch1), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn dc_logs_rotation_forwards_the_whole_window() {
+        let mut l = DcLogs::new();
+        let _ = l.new_lines("dom0:x", &["a".to_string(), "b".to_string()]);
+        // The previously-seen "b" rolled out of the window entirely → forward all.
+        let rotated = vec!["m".to_string(), "n".to_string()];
+        assert_eq!(l.new_lines("dom0:x", &rotated), vec!["m", "n"]);
+    }
+
+    #[test]
+    fn dc_logs_ignores_blank_lines() {
+        let mut l = DcLogs::new();
+        let batch = vec!["".to_string(), "  ".to_string(), "real".to_string()];
+        assert_eq!(l.new_lines("dom0:x", &batch), vec!["real"]);
+    }
+
+    #[test]
+    fn probe_token_ok_when_no_ledger() {
+        // A fresh root with no issued-bearer dir → ok, nothing pending.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = probe_token(tmp.path());
+        assert_eq!(p.status, "ok");
+        assert!(p.detail.contains("no pending tokens"), "{}", p.detail);
+    }
+
+    #[test]
+    fn probe_token_warns_on_a_stale_recorded_bearer() {
+        // record_issued writes issued_at_ms:0 (epoch) → always older than the
+        // window → warn, and counts the pending token.
+        let tmp = tempfile::tempdir().unwrap();
+        crate::bearer_ledger::record_issued(tmp.path(), "some-join-token").unwrap();
+        let p = probe_token(tmp.path());
+        assert_eq!(p.status, "warn");
+        assert!(p.detail.contains("1 pending"), "{}", p.detail);
     }
 
     #[test]

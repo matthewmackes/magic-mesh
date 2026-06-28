@@ -323,6 +323,13 @@ pub fn lock_key(verb: &str, req_body: Option<&str>) -> Option<String> {
 #[must_use]
 pub fn build_reply(svc: &DatacenterService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
+    // DATACENTER-7 (RBAC): gate the caller's mesh principal against the role map
+    // BEFORE anything else — a viewer (or an unauthenticated caller under a
+    // configured policy) is denied any mutating verb, and the denial is audited.
+    if let Err(reason) = crate::ipc::dc_rbac::enforce(verb, req_body) {
+        crate::ipc::dc_rbac::audit_denial(verb, req_body, &reason);
+        return err(reason);
+    }
     // Op-lock: claim the resource for the duration of a mutating dispatch. The
     // guard is dropped at the end of this function (after the reply is built),
     // releasing the key. Read-only verbs (lock_key → None) are unguarded.

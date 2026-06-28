@@ -35,6 +35,9 @@ pub mod clipboard;
 pub mod connect;
 // DATACENTER (action layer) — action/dc/vm-power Xen VM power control responder.
 pub mod datacenter;
+// DATACENTER-7 (RBAC half) — the shared role gate every action/dc/* responder
+// runs before dispatching a mutating verb (viewer=read / operator=all; deny+audit).
+pub mod dc_rbac;
 // DATACENTER-16 (action layer) — action/dc/wol Wake-on-LAN power-orchestration
 // primitive (broadcasts the magic packet to wake a machine).
 pub mod dc_power;

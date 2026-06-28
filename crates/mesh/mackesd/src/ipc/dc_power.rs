@@ -125,6 +125,12 @@ fn send_magic_packet(packet: &[u8]) -> Result<(), String> {
 #[must_use]
 pub fn build_reply(_svc: &DcPowerService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
+    // DATACENTER-7 (RBAC): `wol` powers a machine on — a mutation; gate the mesh
+    // principal against the role map BEFORE dispatch (deny + audit a viewer).
+    if let Err(reason) = crate::ipc::dc_rbac::enforce(verb, req_body) {
+        crate::ipc::dc_rbac::audit_denial(verb, req_body, &reason);
+        return err(reason);
+    }
     if verb != "wol" {
         return err("unknown dc verb".into());
     }
