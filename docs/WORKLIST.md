@@ -1901,9 +1901,9 @@ the plane and it **survives killing the current zone leader**.
   **Acceptance**:
     - [ ] USB/ISO installer with a prebaked answerfile installs XCP-ng unattended; the host joins the overlay as a static-Nebula member with a "Hypervisor" role in `node_roles`
     - [ ] day-2: rolling patch (evacuate-first), health/care alerts, Nebula cert rotation, and auto-replace on host death
-- [ ] **DATACENTER-18: New-Mesh genesis wizard ("give birth to a new Nebula").**
+- [✓] **DATACENTER-18: New-Mesh genesis wizard ("give birth to a new Nebula").** _(DONE, integrated a01a5f1 on the DC-25 nav: a `genesis` panel registered as "New Mesh" (first in MESH: PROVISIONING) — Step 1 name mesh + pick first-lighthouse DO region (reuses `action/dc/do-regions`) → Step 2 review the resolved plan (`action/dc/genesis-plan`: ordered GENESIS_STEPS + Tofu resource preview + a `secrets_ready` boolean probing the cred store for `do-token` presence, never the token) → Step 3 arm→confirm `action/dc/genesis-write` which REUSES DC-19's `lighthouse_create_resource` for the founding droplet + appends the founding DNS A-record into `infra/tofu/zone1-do/dc-lighthouses.tf` (idempotent on mesh-id, op-locked). The wizard PLANS + writes Tofu only; the live `tofu apply` (DO spend) + `mackesd found` stay operator-gated — a real mesh was NOT founded. No credential ever written to repo/HCL/log (asserted by test). Combined-tree green: mde-workbench 2146 + mackesd 1270 lib tests (27 genesis tests), clippy clean, lint-mesh-boundary clean.)_
   **Acceptance**:
-    - [ ] wizard: generate CA → provision+found first lighthouse → seed → register DNS → emit first join token; genesis secrets sourced from the mesh store (optional private repo = templates + age-encrypted only, no plaintext); a brand-new working mesh results
+    - [✓] wizard: generate CA → provision+found first lighthouse → seed → register DNS → emit first join token; genesis secrets sourced from the mesh store (no plaintext); the wizard plans + writes Tofu — the live apply/found stays operator-gated (real spend / rogue-mesh risk)
 - [✓] **DATACENTER-19: DO provisioning (region picker + guided new-lighthouse).** _(2026-06-25 — UI + Tofu-write half DONE (bbc523e): the Network tab gains a region picker firing `action/dc/do-regions` with a geo-spread recommendation (skips already-used lighthouse regions), and a `lighthouse-create` verb writes a `digitalocean_droplet` block into the allow-listed `infra/tofu/zone1-do/dc-lighthouses.tf` (mirrors DC-11's vm-create), routing the operator to the gated zone1-do apply; 16 tests, gated green. **Stays [>]:** the live `tofu apply` (droplet provision) + `mackesd found --role lighthouse` bootstrap + the DNS A-record add need live DigitalOcean — deliberately not auto-run.)_
   *`action/dc/do-regions` RPC (doctl region list → slug/name/available) feeds the region picker. Remaining:
   the picker UI + multi-region-spread nudge + the guided new-lighthouse flow (droplet→bootstrap→found/join→DNS).*
@@ -2199,3 +2199,326 @@ Turn the static topology wallpaper (`mde-mesh-wallpaper`) into an animated globa
   **As** the map, **I want** true per-link volume, **so that** intensity isn't a per-node proxy.
   **Acceptance**:
     - [✓] a mackesd collector reads per-peer-IP byte counters (nftables accounting) → real per-link traffic published for the wallpaper to consume, replacing the per-node-throughput proxy (MESHMAP-3) with an honest fallback
+
+
+### DEVOPS-AUTOMATION-REBUILD
+
+Reproducible + portable per-mesh DevOps backoffice on a dedicated control VM, replacing the hand-built 172.20.145.192 LAN node. De-duplicated and dependency-ordered: shared foundations → state plane (Minimal) → control VM → genesis hook → [Full: CI → reconciler → build farm → DR] → live reconstitution. `(live-gated)` units stay operator-gated even with FA_APPLY lifted. **v2:** etcd endpoints resolve from `/etc/mackesd/etcd-endpoints` (the dead `.192:2379` default is removed); secret-zero is on-VM keygen + recipient-register + multi-recipient re-seal (NO passphrase in tofu state, NO conflation with the #12 `ca_key_pem` channel); the build-VM `for_each` port carries `moved{}` blocks; edgeos migrates to etcd state; golden template canonical name = `MDE-VM-golden`.
+
+#### Foundations (shared, no tier — land first)
+
+- [ ] **DAR-1 — Canonical etcd state prefix reconciled across state-backend + dr-backup**
+  As the operator, I want ONE canonical Tofu-state etcd prefix used by both the state backend and the DR dump, so that DR actually captures the state and the mesh control-plane keys stay isolated.
+  - Canonical prefix is the LIVE `/tofu/state/*` + `/tofu/lock/*` (NOT `/tofu-state/*`); `tofu-state-etcd.py` takes an optional `STATE_PREFIX` (default the canonical value) and a unit test confirms a put/get lands under the prefix.
+  - `dr-backup.sh` ranges the SAME `/tofu/state/` prefix; a seeded fake state is present in the decrypted manifest.
+  - `grep` across `automation/` + `infra/` shows a single canonical prefix string (no `/tofu/state` vs `/tofu-state` drift).
+
+- [ ] **DAR-1b — Resolve `MCNF_ETCD` from `/etc/mackesd/etcd-endpoints` (kill the dead `.192:2379` default)**
+  As a mesh operator, I want every script's etcd endpoint resolved from the live quorum file, so the backoffice talks to the lighthouse quorum (nyc3/fra1/sfo3 + Eagle) and never the dead `172.20.145.192:2379`.
+  - A shared resolver (`automation/lib/etcd-endpoints.sh`, sourced by `tofu-state-etcd.py` via env, `state-backend-up.sh`, `mcnf-secret.sh`, `dr-env.sh`, `etcd-lib.sh`, `reconciler render-env.sh`) returns endpoints in order: explicit `MCNF_ETCD` → comma-joined contents of `/etc/mackesd/etcd-endpoints` → EXIT non-zero with a loud message; there is NO `http://172.20.145.192:2379` fallback in any script.
+  - On a live node, sourcing the resolver yields the current quorum (`grep -c '10.42.0' <result>` ≥ 3); `grep -rn '172.20.145.192:2379' automation/ install-helpers/ infra/` returns only docs/comments, no executable default.
+  - With the endpoints file absent and no env, each consumer fails loud (no silent default), and a unit/self-test asserts the non-zero exit + the remediation hint (`run setup-etcd.sh`).
+
+- [ ] **DAR-2 — Canonical Argon2id+AEAD seal CLI on mackesd (reuse `ca::backup` envelope)**
+  As the backoffice deployer, I want one canonical command to seal/unseal arbitrary bytes under the mesh envelope, so the DR CA/identity bundle can transit passphrase-sealed without re-rolling crypto. (NOTE: used ONLY for the separate operator-run DR key bundle in DAR-42, NOT for control-VM bootstrap.)
+  - `mackesd secret-seal --passphrase-file <f>` reads stdin → versioned `ca::backup` envelope on stdout; `secret-unseal` round-trips to exact input bytes via `ca::backup::seal_bytes`/`unseal_bytes` (no new AEAD/KDF code).
+  - Wrong/empty passphrase rejected with the existing aead error.
+  - `cargo test -p mackesd` green incl. an identity-sized round-trip; clippy clean.
+
+- [ ] **DAR-3 — Secret-zero: on-VM keygen + recipient register + multi-recipient re-seal in `mcnf-secret.sh`**
+  As the deployer, I want the control VM to mint its OWN age key, publish only its public recipient, and an operator/leader re-seal grant it read access, so there is NO passphrase or master key in tofu state and no conflation with the #12 CA-key channel.
+  - `mcnf-secret.sh init-self` generates `/root/.mcnf-age-key` (0600) if absent, derives the recipient, and PUTs it to `/mcnf/age-recipients/<node-id>` (public key only); it NEVER prints or transmits the private key; re-run is idempotent.
+  - `mcnf-secret.sh reseal-to <recipient>` (and `reseal-all`) decrypts each `/mcnf/secret/*` with the local key and RE-ENCRYPTS multi-recipient (`age -r` repeated over the full `/mcnf/age-recipients/*` set + the legacy `/mcnf/age-recipient`), atomic per key; a control VM whose recipient was added can then `get` every secret.
+  - `put`/`get` read the recipient SET (not a single recipient); existing `init`/`list` behavior unchanged; a unit test seeds two recipients and proves both keys decrypt the same secret; `rotate <name>` does atomic put + optional `--revoke-cmd`, non-existent name exits 3.
+  - `grep` of any produced state/log/tfvars shows no age PRIVATE key and no secret value.
+
+- [ ] **DAR-4 — Per-mesh config generated at found time (`mcnf-config.sh`)**
+  As a new-Nebula founder, I want mesh-id/project/regions/lighthouse-endpoints captured at found time into a portable non-secret etcd doc and rendered into tfvars, so the backoffice is self-describing.
+  - `mcnf-config.sh gen <mesh-id> --project <p> --regions <r,...> --lighthouses <ip,...>` writes `/mcnf/backoffice/config` (+ `/mcnf/site/*`) and renders mesh-id/project/regions into `infra/tofu/*/*.auto.tfvars`.
+  - `render` on a fresh control VM regenerates identical tfvars purely from the etcd doc (idempotent); the doc contains NO credentials.
+  - Running `gen` with mesh 4533's actual project/regions yields tfvars matching the current live roots.
+
+- [ ] **DAR-5 — Fold plaintext cred files into the store (xo-token, edgeos-cred, dns-token, sccache-*)**
+  As the operator reconstituting the hand-built setup, I want every backoffice credential in the encrypted store and the Tofu roots resolving from it, so no `/root/.mcnf-*` plaintext is required.
+  - `/mcnf/secret/{xo-token,edgeos-cred,dns-token,sccache-access-key,sccache-secret-key,dr-spaces-key}` exist as age ciphertext; `infra/tofu/env.sh` + `infra/tofu/edgeos` resolve via `mcnf-secret.sh get` matching the zone1-do/xen-xapi pattern.
+  - With `/root/.mcnf-xo-token` + `/root/.mcnf-ubnt-cred` removed, the farm + edgeos roots still `tofu plan` to a no-op.
+  - No secret value appears in `ps`, tfvars, or tofu logs; secrets README lists the full set.
+
+#### State plane — Minimal tier
+
+- [ ] **DAR-6 — Overlay-bind + multi-endpoint the etcd state backend**
+  As a mesh operator, I want the Tofu state backend to bind the control VM overlay IP and tolerate any single lighthouse loss, so IaC state lives on the mesh quorum and survives an anchor going down.
+  - `tofu-state-etcd.py` reads comma-separated `MCNF_ETCD` (resolved by DAR-1b) and on a GET/POST/LOCK succeeds while ≥1 member answers (kill one of 4 → plan still reads state).
+  - `:8390` binds the detected overlay (`nebula`/`mde-neb`) IP via `STATE_BACKEND_BIND`, not `0.0.0.0`: `ss -ltn` shows overlay-only; a LAN-IP curl is refused.
+  - State/lock keys unchanged: GET `/state/xen-xapi` returns `/tofu/state/xen-xapi`; a 2nd LOCK gets 423 + held lock-info.
+
+- [ ] **DAR-7 — Endpoint-aware `state-backend-up.sh` (drop hardcoded .192)**
+  As an operator, I want `state-backend-up.sh` to source endpoints from `/etc/mackesd/etcd-endpoints` (via DAR-1b), so it points at the live quorum on any mesh without editing the script.
+  - On a control VM with the endpoints file, running with no env starts the podman container pointed at those endpoints (`podman inspect` shows `MCNF_ETCD` = file contents, not `.192:2379`).
+  - With no endpoints file and no env, the script fails loud (no silent `.192` default).
+  - Container `--restart=always --network host`; GET `:8390/state/nonexistent` returns 404.
+
+- [ ] **DAR-8 — Per-mesh backend generator + template (`gen-backend-config.sh` + `backend.tf.tmpl`)**
+  As a genesis operator, I want the four roots' backend config generated from the control VM overlay IP, so the state backend comes along with no hardcoded host.
+  - `gen-backend-config.sh --control-ip <ip>` writes `infra/tofu/{xen-xapi,zone1-do,edgeos,control-vm}/*.backend.hcl` each with `address/lock_address/unlock_address = http://<ip>:8390/state/<root>` + LOCK/UNLOCK methods.
+  - Re-run with same IP is byte-identical (idempotent); a different IP rewrites them; no generated file contains `172.20.145.192`.
+  - `backend.tf.tmpl` is the single source (`__CONTROL_IP__`/`__ROOT__`); the per-root `*.backend.hcl` seam is passed via `-backend-config=`; the generated `.backend.hcl` files are gitignored.
+
+- [ ] **DAR-9 — Strip the literal `.192` from tracked backend blocks + provider seam in the four roots**
+  As the IaC maintainer, I want each root to take its backend address, control IP, domain, and dom0 registry as inputs, so one root tree serves any mesh and no `.192` lives in a tracked `.tf`.
+  - `infra/tofu/xen-xapi/backend.tf` + `zone1-do/backend.tf` have the literal `http://172.20.145.192:8390` REMOVED (backend block keeps only `lock_method`/`unlock_method`); the address comes from `-backend-config=<root>.backend.hcl`.
+  - `tofu init -backend-config=<root>.backend.hcl` succeeds for all four roots against the live control host.
+  - `grep 172.20.145.192 infra/tofu/*/backend.tf` returns EMPTY; `grep` shows no hardcoded `matthewmackes.com`/pool UUIDs in root `.tf` (only in generated/tfvars/example files).
+
+- [ ] **DAR-9b — Migrate `edgeos/` (and deprecate top-level `main.tf`) from LOCAL state into etcd `/tofu/state/edgeos`** `(live-gated)`
+  As the operator, I want edgeos's on-disk local state moved onto the etcd backend, so DR captures it and the generator/orchestrator treat all four roots uniformly.
+  - `gen-backend-config.sh` now emits `infra/tofu/edgeos/backend.tf` (or `.backend.hcl`); `edgeos` no longer keeps a local `terraform.tfstate` after migration.
+  - `tofu -chdir=infra/tofu/edgeos init -migrate-state` (or `state push` of the pulled local state) lands the current edgeos state under `/tofu/state/edgeos`; a subsequent `tofu plan` is 0-add/0-change/0-destroy against the live EdgeRouter reservations (the deliberate-drift markers preserved).
+  - The deprecated top-level `infra/tofu/main.tf` local path is documented deprecated and its state (if any) is NOT a live source; `dr-backup.sh` now captures `/tofu/state/edgeos` in the manifest (verified in the decrypted dump).
+
+- [ ] **DAR-10 — Cred unseal from the mesh secret store (`tofu-env.sh`)**
+  As an operator on a fresh control VM, I want provider creds unsealed from the secret store at apply time, so no hand-placed token files are needed.
+  - `source tofu-env.sh` populates `XOA_TOKEN`/`TF_VAR_xapi_password`/`DIGITALOCEAN_TOKEN` in-process (via the VM's OWN key) and a tofu plan authenticates (real provider read).
+  - The EdgeOS cred file is written to a tmpfs path 0600 and removed by the exit trap; no unsealed secret hits the repo/a dotfile/a log.
+  - Falls back to an existing `env.sh` only if present.
+
+- [ ] **DAR-11 — `state-backend-bootstrap.sh` ordered come-along hook (with the Phase-A overlay precheck)**
+  As a genesis operator, I want one idempotent script that stands the state backend up in the correct order (overlay membership → etcd precondition → service → generate backend → tofu init), so the chicken-and-egg breaks deterministically.
+  - Phase-A precheck: the runner has a nebula iface with a route to ≥1 quorum member (resolved via DAR-1b); if not, exits non-zero printing the `mackesd join` remediation BEFORE starting anything (resolves the founder-etcd reachability gap).
+  - With etcd reachable, runs end-to-end exit 0: probes each endpoint `/version`, starts the backend, generates backends, runs `tofu init -migrate-state -input=false` per root (incl. edgeos).
+  - After success, `tofu plan` in xen-xapi reads from the backend (no local tfstate) and a concurrent 2nd plan is blocked by the etcd lock (423).
+
+#### Control VM + genesis hook
+
+- [ ] **DAR-12 — `infra/tofu/control-vm/` root: clone `MDE-VM-golden` on the founding dom0 with a cloud-init seed**
+  As the operator founding a new Nebula, I want a single tofu root that creates the dedicated control VM on the founding dom0, so the backoffice host is reproducible IaC.
+  - `tofu -chdir=infra/tofu/control-vm validate` passes; `plan` against a reachable dom0 shows exactly 1 `xenserver_vm` to add (clone of `MDE-VM-golden`, the canonical name), 0 to destroy; reuses the aliased xenserver provider (no new provider invented).
+  - `providers.tf` resolves the XAPI password from the secret store via env.sh; `grep -ri password infra/tofu/control-vm` shows only the secret-store indirection.
+  - `backoffice_tier` + sizing vars exist (minimal ≈4vCPU/8GiB, full = larger); backend points at `http://<state-backend>:8390/state/control-vm` and a plan acquires+releases the etcd lock.
+  - `outputs.tf` emits the VM uuid + overlay IP.
+
+- [ ] **DAR-13 — Control-VM cloud-init: static-IP NM keyfile + headless `--role server` join + on-VM keygen + converge (NO sealed master key in write_files)**
+  As the operator, I want the control VM to boot, enroll as a full mesh peer, mint its OWN age identity, and self-configure its tier units with no manual post-boot steps and NO master secret in state.
+  - `cloud-init/control-vm.yaml.tftpl` renders with the NM `static-primary.nmconnection` keyfile (reusing the build-vm fix), `/etc/mackesd/site.yml`, and a runcmd ORDER of: render NM → `mackesd join <token> --role server` → `mcnf-secret.sh init-self` → `mackesd converge` → `setup-etcd.sh --client-only --anchors <quorum>`. There is NO write_file for `/root/.mcnf-age-key` and NO templated unseal passphrase (resolves the plaintext-in-state gap + the #12 conflation).
+  - Rendered user-data passes `cloud-init schema --config-file`; the join token comes from a tofu var sourced from the secret store, never a literal.
+  - tier=minimal renders a site.yml enabling state-backend+secrets only; tier=full additionally enables forgejo/runner/reconcile/dr units.
+  - `grep` of the rendered user-data (and, post-apply, the root's `terraform.tfstate`) shows NO age private key and NO unseal passphrase.
+
+- [ ] **DAR-14 — Tier-driven systemd unit inventory + converge site.yml + new units**
+  As the operator, I want `mackesd converge` on the control VM to enable exactly the tier's units, so Minimal and Full are one artifact differing only by which scripts run as services.
+  - site.yml enables: minimal ⇒ `mcnf-state-backend.service` + the secret self-init oneshot; full ⇒ + `mcnf-forgejo` + `mcnf-forgejo-runner` + `mcnf-farm-reconcile.timer` + `mcnf-farm-autoscale-reconcile.timer` + `mcnf-dr-backup.timer` + `mcnf-backoffice-status.timer`.
+  - NEW `packaging/systemd/{mcnf-state-backend.service, mcnf-secret-init-self.service, mcnf-dr-backup.{service,timer}, mcnf-backoffice-status.{service,timer}, mcnf-reconciler-bootstrap.service}` pass `systemd-analyze verify` clean.
+  - After `converge` on a test box, `systemctl is-enabled` matches the tier exactly (no-op on re-converge); reconcile/autoscale units stay FA_APPLY plan-only by default.
+
+- [ ] **DAR-15 — Tier manifests + `backoffice-plan.sh` (declarative, read-only planner)**
+  As an operator, I want the two tiers expressed as declarative manifests with a read-only planner, so I can see the exact ordered units and readiness before any live execution.
+  - `automation/backoffice/manifest.{minimal,full}.toml` exist; full is a strict superset (order: precheck→secrets→state-backend→tofu-roots→control-vm→enroll, then CI→reconciler→build-farm→DR).
+  - `backoffice-plan.sh --tier full` prints valid JSON: ordered units each `{id, ready, live_gated, via_script}`; exit 0; ZERO mutations (re-run leaves etcd/services unchanged).
+  - Each `via_script` resolves to an existing file (no dangling references).
+
+- [ ] **DAR-16 — `backoffice-up.sh` orchestrator: ordered idempotent bring-up (Minimal, Phases 0–3) with `--adopt` + `--dry-run`**
+  As an operator on the control VM, I want one orchestrator that sequences the existing up-scripts in tier order, so the backoffice comes up reproducibly and a re-run converges instead of duplicating.
+  - Phase 0 refuses to proceed if overlay/etcd preconditions fail OR if this VM's recipient is NOT present in the re-sealed envelopes (sentinel `get` self-test), printing the exact remediation command (`mackesd join` / `mcnf-secret.sh reseal-to`).
+  - Phase 1 `mcnf-secret.sh get` unseals DO + XAPI creds with the VM's OWN key; a missing secret exits non-zero printing the `put` line (no plaintext logged).
+  - Phase 2 state-backend is up on control-VM-overlay:8390 against the founder etcd (`curl /state/<root>` 200/404, not refused); the four backends now point at the control VM overlay IP via the generator.
+  - Phase 3 `tofu plan` succeeds for xen-xapi + zone1-do + edgeos; `--tier minimal` STOPS after Phase 3; re-run reads `backoffice-site.yml` and is a no-op; `--adopt` against the live `.192` detects services ready WITHOUT recreating (container ids unchanged).
+
+- [ ] **DAR-17 — Portability: resolve `MCNF_CONTROL_IP`/`MCNF_BACKOFFICE_HOST` (kill hardcoded .192 host)**
+  As an operator founding a NEW mesh, I want the state/secret endpoints to resolve to that mesh's founding lighthouse/control VM, so the backoffice comes along instead of phoning the old LAN node.
+  - With no override, `backoffice-up.sh`/`backoffice-plan.sh`/`state-backend-up.sh`/`mcnf-secret.sh`/`dr-*.sh`/`forgejo-up.sh` default the HOST to `${MCNF_CONTROL_IP:-<overlay-discovered>}` (from the founding bundle / `mackesd peers --json`), not the literal; the etcd ENDPOINT is independently resolved by DAR-1b (the two are decoupled).
+  - Exporting `MCNF_CONTROL_IP=10.42.0.x` retargets all scripts (verified via `--dry-run` echo); with `=172.20.145.192` they reproduce today's host behavior byte-for-byte.
+  - `grep 172.20.145.192` across `automation/` + `infra/tofu/*/backend.tf` returns only docs/examples.
+
+- [ ] **DAR-18 — `mackesd found --with-backoffice[=minimal|full]` genesis flag (intent-recording, non-destructive)**
+  As the operator, I want one opt-in flag on `mackesd found`, so genesis records intent to stand up the backoffice and prints the gated next step without itself spending money.
+  - `mackesd found --help` lists `--with-backoffice[=minimal|full]` (minimal the bare default); the flags parse (clap unit test).
+  - When set, found runs the full existing flow then writes `/mcnf/backoffice/intent {tier,host,ts}` (verify via etcd range) and prints the literal next command `backoffice-up.sh --tier <t>`; `--tier bogus` exits non-zero; re-run overwrites (not duplicates) the key.
+  - Without the flag, found is byte-for-byte unchanged (regression test asserts no backoffice call); cargo build + clippy + the mackesd suite stay green.
+
+- [ ] **DAR-19 — Control VM provisioner (`control-vm-provision.sh`): xen-xapi apply → mesh peer → on-VM keygen → reseal → backoffice-up** `(live-gated)`
+  As the platform, I want the control VM stood up on the founding dom0 and enrolled as a full mesh peer with its own key, so the backoffice runs on a dedicated VM with no master secret in state.
+  - `tofu apply`s `infra/tofu/control-vm` to create one VM on the founding dom0; after boot it runs `mackesd join <token> --role server` and the VM appears in `mackesd peers --json` with an overlay IP, and `mcnf-secret.sh init-self` has registered `/mcnf/age-recipients/<node-id>`.
+  - The provisioner runs (or prompts the operator to run) `mcnf-secret.sh reseal-to <vm-recipient>` then ssh-execs `backoffice-up.sh --tier <t>` and streams the phase log.
+  - **The produced `terraform.tfstate` is grepped and contains NO age private key, NO unseal passphrase, NO provider token** (resolves STUB 1, observed not asserted); re-run with an existing control VM (facts file present) is a no-op (no second VM).
+
+#### Full tier — CI
+
+- [ ] **DAR-20 — Control-VM-targeted, secret-store-backed Forgejo bring-up**
+  As the operator, I want Forgejo on the control VM with identity/tokens from the secret store, so the CI host is reproducible and carries no host-local plaintext.
+  - `forgejo-up.sh` (host param, not the hardcoded LAN IP) brings up `mcnf-forgejo`; `curl http://<ctrl-vm>:3000/api/healthz` returns pass.
+  - `SECRET_KEY`/admin-pass/runner-token read/written via `/mcnf/secret/forgejo-*`; `mcnf-secret.sh list` shows them; no plaintext token in `/var/lib/mcnf-forgejo/.runner-token`.
+  - Re-run is idempotent (existing container detected, secrets not regenerated).
+
+- [ ] **DAR-21 — Host-native act_runner on the control VM (systemd, label `farm`)**
+  As the platform, I want the runner host-native so workflow steps inherit the mesh key + overlay and can dispatch to the farm/etcd.
+  - `forgejo-runner-up.sh` registers with the token from the store; `systemctl is-active mcnf-forgejo-runner` active; runner shows online label `farm` in the admin API.
+  - A trivial `runs-on: farm` job runs a step that reaches a build VM (`farm-dispatch.sh nodes` returns the list).
+
+- [ ] **DAR-22 — Repo seeding: GitHub pull-mirror with on-disk sovereign fallback (`forgejo-seed.sh`)**
+  As the operator, I want the repo seeded from GitHub when online and from the local clone when air-gapped, so founding never hard-depends on internet.
+  - `forgejo-seed.sh` creates the magic-mesh repo via the API (admin token from the store); browsable in the UI.
+  - GitHub reachable ⇒ pull mirror configured (visible via API); unreachable ⇒ pushes the on-disk `/root/magic-mesh` clone and repo HEAD matches local master.
+  - Re-run idempotent (existing repo detected).
+
+- [ ] **DAR-23 — Sovereign dnf channel served by the control VM (gh-pages-shaped) (`dnf-channel-up.sh`)**
+  As a freshly-provisioned peer, I want to dnf-install from a control-VM channel laid out like gh-pages, so air-gapped provisioning works without GitHub.
+  - `dnf-channel-up.sh` serves a base URL with `fedora-N-x86_64/repodata/repomd.xml` + `RPM-GPG-KEY-magic-mesh` (curl 200 on both).
+  - `do-lighthouse-cloudinit.sh` with `REPO_BASEURL` pointed at this base yields a working `/etc/yum.repos.d/magic-mesh.repo` (no cloudinit code change).
+  - `dnf makecache`/`dnf list magic-mesh` from a test host succeeds with gpgcheck=1.
+
+- [ ] **DAR-24 — CI RPM build+stage workflow (`rpm-publish.yml`) reusing `build-rpm-fedora43.sh`**
+  As the operator, I want a Forgejo workflow that builds full + server RPMs on the farm and stages them unsigned into the channel hold area, so every master push produces installable artifacts.
+  - master push / `workflow_dispatch` runs `rpm-publish.yml` on `runs-on: farm`, invoking `build-rpm-fedora43.sh` and `--server` → `magic-mesh-*.rpm` + `magic-mesh-server-*.rpm`.
+  - `createrepo_c` runs; repodata appears under the channel `fedora-N-x86_64/` HOLD area; the workflow does NOT call the GPG sign step.
+
+- [ ] **DAR-25 — Forgejo self-minted secrets persisted to the store**
+  As the operator, I want Forgejo's secret-key/runner-token captured in the store, so a control-VM rebuild reconstitutes CI without re-pasting.
+  - `forgejo-up.sh` first stand-up `put`s `forgejo-secret-key`/`runner-token`/`admin-pass` into `/mcnf/secret/*`; a rebuilt control VM `get`s them and the runner re-registers without manual entry.
+  - The sqlite DB is recognized as control-VM-local app state covered by DR (DAR-38/43), not co-mingled with tofu state.
+
+- [ ] **DAR-26 — `forgejo-deploy.sh` one-shot reconstitute entrypoint wired to the Full-tier hook**
+  As the operator, I want one entrypoint that stands up the entire forgejo-ci subsystem from the mesh+store, so the backoffice comes along and can reconstitute the current setup.
+  - On a fresh control VM, runs secret init → forgejo-up → runner-up → seed → dnf-channel-up and ends with healthz pass, runner active, repo seeded, channel served (own post-checks).
+  - Against the existing hand-built node, reconstitutes idempotently (no duplicate containers/repos, tokens reused); Minimal tier does not call it.
+
+#### Full tier — reconciler
+
+- [ ] **DAR-27 — Portable reconciler env file (`render-env.sh`) — de-hardcode .192/XO/dom0/etcd**
+  As the operator, I want the reconciler's control-IP, XAPI/XO URL, etcd endpoint and dom0 topology resolved at deploy time, so the loop runs unchanged on a new XCP-NG machine.
+  - `render-env.sh` writes `/etc/mcnf/reconciler.env` with `MCNF_REPO`, `MCNF_ETCD` (from `/etc/mackesd/etcd-endpoints` via DAR-1b, NOT `.192:2379`), `MCNF_XO_URL`, and the dom0 host/IP map sourced from tofu state / `local.dom0`, NOT baked literals.
+  - On `.192` the rendered file reproduces today's host values (diff against the hardcoded arrays empty) EXCEPT `MCNF_ETCD` now carries the live quorum; `farm-reconciler.sh --status` sources it and prints the same topology/gate output.
+  - With a different `MCNF_REPO` + etcd endpoint, the file carries those values (not pinned to `.192`); the golden template name in any rendered reference is `MDE-VM-golden`.
+
+- [ ] **DAR-28 — Reconciler durable state in mesh etcd `/reconciler/*` (off host-local `/var/lib`)**
+  As the operator, I want busy-state + dwell/last-good stored under `/reconciler/*`, so control-VM rebuild or fail-over resumes reconciliation without losing hysteresis.
+  - `reconciler-state.sh` exposes get/put/cas/ensure-prefix over etcd `/reconciler/*` reusing the `mcnf-secret.sh` etcd HTTP v3 pattern; a self-test round-trips a key.
+  - `reset_running_vms` reads/writes busy-state via the helper (`MCNF_FARM_BUSY_STATE` seam repointed); after a tick, etcd shows busy VM names under `/reconciler/farm-busy-state`.
+  - `farm-reconciler.sh --self-test` still passes; deleting host-local `/var/lib/mcnf-farm/farm-busy-state` and running a tick reconstructs from etcd.
+
+- [ ] **DAR-29 — Re-target the reconciler at the XAPI root with an XAPI apply-gate + secret-store creds**
+  As the operator, I want the reconciler to plan/apply `infra/tofu/xen-xapi` and gate apply on XAPI reachability (not dead XO), with apply-time creds from the store, so an applied tick converges the no-XO farm and logs no secrets.
+  - `MCNF_TOFU_DIR=infra/tofu/xen-xapi` in `mcnf-farm-autoscale-reconcile.service`; `farm-reconciler.sh --self-test` still passes after the probe swap (4 prereqs kept; XO ws probe → founding-dom0 XAPI :443 TCP probe).
+  - `farm-autoscale.sh` writes `farm-autoscale.auto.tfvars` into the xen-xapi dir referencing `MDE-VM-golden`; a `--once --dry-run` tick succeeds; with FA_APPLY=0 the tick stays plan-only and logs the XAPI-gate reason (no VM touched).
+  - The apply path obtains `TF_VAR_do_token` + XO/XAPI creds via `mcnf-secret.sh get` (falling back to `env.sh` only if present); journal of a real apply tick shows no token value; with the store sealed/absent it degrades to plan-only, never crashing.
+
+- [ ] **DAR-30 — `reconciler-up.sh` installs both reconciler units PLAN-ONLY**
+  As the operator, I want one idempotent script that installs both timers (5-min autoscale, 15-min @farm build) on the control VM plan-only, so founding stands up the loop the way state-backend-up.sh does its service.
+  - Renders `/etc/mcnf/reconciler.env`, installs both units with `EnvironmentFile` + `WorkingDirectory=/opt/mcnf`, enables both timers, leaves FA_APPLY UNSET; the autoscale unit drops any inline `Environment=FA_APPLY=1`.
+  - Re-run idempotent; `systemctl list-timers` shows both timers active; a fired autoscale tick logs `apply-gate …→ plan-only (FA_APPLY!=1)`; no `.claude/worktrees` path in any installed unit.
+  - `enable-autoscale-timer.sh` de-hardcoded to `${MCNF_REPO:-/opt/mcnf}` AND its golden-template reference changed from `MDE-VM-golden-tc` to `MDE-VM-golden`; it remains the one explicit operator FA_APPLY=1 arming step.
+
+#### Full tier — build farm
+
+- [ ] **DAR-31 — Port the elastic shape model into the XAPI-native tofu root with `moved{}` (no destroy of live VMs)**
+  As the operator founding a new Nebula, I want the build farm's tofu to be the no-XO XAPI `for_each` root provisioning against mesh-etcd state, ported WITHOUT destroying the three live adopted build VMs.
+  - `infra/tofu/xen-xapi/build-vms.tf` defines `xenserver_vm` via `for_each` over `local.build_vm_specs` (copied from main.tf), AND ships `moved {}` blocks mapping `xenserver_vm.build_50/51/52` → `xenserver_vm.build["<key>"]`; `tofu -chdir=infra/tofu/xen-xapi validate` passes and `tofu providers` shows only `xenserver`.
+  - With `shape={}`, a real `tofu plan` against the relocated etcd backend shows **0-add / 0-change / 0-destroy** for the three live VMs (the `moved{}` blocks consumed, NOT a destroy+recreate); the task FAILS if any destroy is proposed.
+  - `shape={xen-bigboy="small"},small_count={xen-bigboy=1}` plans a clone of `MDE-VM-golden` on the big alias with the cloud-init from `build-vm.yaml.tftpl` and the `.130` lane IP; `outputs.tf` emits `build_farm` as name→{uuid,ip}; the top-level XO `main.tf` path is documented deprecated (not applied).
+
+- [ ] **DAR-32 — xen-xapi dom0-learn flow (`learn-dom0.sh`) + rendered provider aliases**
+  As the operator founding a mesh on a NEW XCP-NG machine, I want to register a new dom0 by probing its XAPI, so the farm roots learn pool/network/SR/IP-lane without hand-coding `local.dom0` or a provider alias.
+  - `learn-dom0.sh <key> <xapi_host>` unseals the XAPI cred, probes pool name_label + eth0 network_uuid + Local SR, appends a `dom0_registry` entry + the next free /16 ip_lane.
+  - `gen-tfvars` re-renders `providers.tf` (aliased provider per registry key, from a `providers.tf.tmpl` since HCL can't `for_each` a provider block) and a tofu plan resolves the new dom0's data sources.
+  - Re-running for a known dom0 is idempotent; the assigned ip_lane does not overlap an existing /16.
+
+- [ ] **DAR-33 — Per-mesh tfvars + backend generator from mesh identity (`gen-tfvars.sh`)**
+  As the operator, I want the four roots' inputs generated from the founding bundle + site facts, so no hand-edit of HCL points them at the new mesh.
+  - `gen-tfvars.sh --print` on the live mesh emits `*.auto.tfvars` + `*.backend.hcl` whose mesh_id/control_overlay_ip/domain/lighthouse-roster match the founding bundle + `/mcnf/site/*`; a synthetic second mesh_id emits DIFFERENT values; the golden-template var renders `MDE-VM-golden`.
+  - No secret appears in any generated file; generated `backend.hcl` address is `http://<control_overlay_ip>:8390/state/<root>`, not `.192`.
+  - Preserves the deliberate-drift markers (e.g. stale lighthouse-02/03 A records) — never prunes by accident.
+
+- [ ] **DAR-34 — Bake the Rust+sccache toolchain into `MDE-VM-golden` + canonicalize the name (`bake-build-golden.sh`)** `(live-gated)`
+  As the operator, I want the ONE canonical golden template (`MDE-VM-golden`) to carry rust 1.94 + dev libs + mold + sccache so every clone is instantly build-ready and there is no `-tc` name drift.
+  - `bake-build-golden.sh` runs `build-vm-toolchain.yml` + `sccache.yml` against a clone, then `build-mde-vm-golden.sh` generalizes + marks is-a-template under the name `MDE-VM-golden`.
+  - `infra/tofu/variables.tf` default and `enable-autoscale-timer.sh` changed from `MDE-VM-golden-tc` → `MDE-VM-golden`; `grep -rn 'MDE-VM-golden-tc' infra/ install-helpers/ automation/` returns only historical-doc comments; if a live `MDE-VM-golden-tc` template object exists it is renamed/retired to `MDE-VM-golden`.
+  - On a clone, `ssh … '. ~/.cargo/env; rustc --version && sccache --version && mold --version'` succeeds with no extra provisioning (live-verify on a real clone); `provision_build_ready` collapses to taking the clean baseline snapshot; the per-clone ansible path remains a logged fallback.
+
+- [ ] **DAR-35 — Portable, secret-store-backed shared sccache (`sccache-backend-up.sh` + sccache.yml edit)** `(live-gated)`
+  As the operator founding a new mesh, I want the sccache endpoint + creds from this mesh's store and tofu output, so the cache comes along with no plaintext and no `.192` reference.
+  - `sccache.yml` requires `minio_endpoint` + creds via `-e` (no hardcoded `.192` default; fails loud if absent).
+  - `sccache-backend-up.sh` stands up minio on the control VM and mints `sccache-access-key`/`sccache-secret-key` into the store (readable via get); no secret in any log/repo file.
+  - **LIVE-VERIFY (not a mock):** two REAL build VMs report the same shared S3 bucket and the second VM gets an observed `sccache --show-stats` cache HIT for a crate the first compiled (proven on the live farm, not a unit mock — resolves STUB 2).
+
+- [ ] **DAR-36 — `farm-bootstrap.sh` one-shot bring-up + drain/slot + snapshot-revert proven on a fresh farm** `(live-gated)`
+  As the operator, I want one reentrant script that stands the whole build farm up on the founding dom0, and proves the flock-slot dispatch + inter-job snapshot-revert on a fresh farm.
+  - `farm-bootstrap.sh` is idempotent: state-backend + sccache-backend running, `MDE-VM-golden` present, xen-xapi applied to a minimal shape, both reconciler timers enabled; a second run makes no changes (plan 0/0/0).
+  - **LIVE-VERIFY (not a mock):** on a REAL fresh clone, `farm-vm-snapshot.sh snapshot` takes the clean baseline (`has-clean` returns 0); two concurrent `@farm` jobs acquire distinct per-node flocks and run on different VMs; after completion the next tick REVERTS the VM to clean (observed via `farm-vm-snapshot.sh status` on the real VM) without disturbing a live build — observed runtime, not asserted (resolves STUB 2).
+
+#### Full tier — DR
+
+- [ ] **DAR-37 — Portable DR env resolver (`dr-env.sh`) — etcd from the endpoints file**
+  As the operator founding a new Nebula, I want every DR script to resolve targets from env/store with current-LAN defaults, so DR comes along to a fresh box without code edits.
+  - Sourcing `dr-env.sh` with no env resolves `MCNF_ETCD` from `/etc/mackesd/etcd-endpoints` (via DAR-1b, NOT `http://172.20.145.192:2379`), and echoes the path defaults (`MCNF_MESHFS_DIR=/mnt/mesh-storage`, `MCNF_FORGEJO_DATA=/var/lib/mcnf-forgejo`, `MCNF_DR_BUCKET=mcnf-dr-4533`).
+  - Overriding `MCNF_ETCD`/`MCNF_MESHFS_DIR` changes the resolved values (print-config subcommand); all DR scripts source it (grep shows the source line; no remaining hardcoded `.192:2379`).
+
+- [ ] **DAR-38 — Manifest v2: add Forgejo data + consistent etcd snapshot to `dr-backup.sh`**
+  As the operator, I want the encrypted DR artifact to also carry Forgejo CI data and a point-in-time etcd snapshot, so the whole backoffice is recoverable from one file.
+  - `dr-<ts>.age` decrypts to a manifest `dr_backup_version=2` with components: tofu-state (incl. `/tofu/state/edgeos`), secrets, age-recipients, forgejo-data, etcd-snapshot.
+  - Forgejo blob round-trips: the sqlite quiesce is documented + enforced (Forgejo stopped OR `sqlite3 .backup`/WAL-checkpoint), `.tables` succeeds after restore, repos excluding work-dirs/build caches; the embedded etcd snapshot is valid (`etcdctl snapshot status` non-zero revision, captured from the LEADER endpoint, revision recorded).
+  - The output still shows the age-encryption header (whole manifest single-age-encrypted; secrets remain age-in-age).
+
+- [ ] **DAR-39 — On-mesh first-line snapshot to Mesh-Sync (`dr-snapshot-onmesh.sh`)**
+  As the operator, I want each daily DR artifact copied into the Syncthing-replicated `/mnt/mesh-storage/dr/` with retention, so the first recovery line is present on every surviving peer with no egress.
+  - Writes `dr-<ts>.age` into `$MCNF_MESHFS_DIR/dr/` and updates `dr/INDEX.json` (ts+sha256+size+components); seeding 15 fake artifacts and running leaves exactly `MCNF_DR_KEEP` (default 14) newest.
+  - The existing leader-gated `dr_scheduler` worker output lands in `$MCNF_MESHFS_DIR/dr/` (verifies the path is writable + replicating before relying on it).
+
+- [ ] **DAR-40 — Genesis wiring: Full tier installs the DR first-line timer + reconstitution docs**
+  As the operator founding with `--with-backoffice=full`, I want the DR env + a leader-gated daily on-mesh snapshot timer installed, so DR is active from genesis.
+  - A Full-tier control VM has `automation/dr/` present with `dr-env.sh` resolving the new mesh's values; a leader-gated daily `dr-snapshot-onmesh` is scheduled and its first run writes an artifact into the new mesh's `/mnt/mesh-storage/dr/`.
+  - DR README documents the operator off-fleet push as the explicit next step.
+
+- [ ] **DAR-41 — Operator off-fleet push to mcnf-dr-4533 (`dr-push-offfleet.sh`)** `(live-gated)`
+  As the operator, I want a one-command push of the newest DR artifact to the DO Spaces bucket using the sealed key, so an off-fleet copy survives total-fleet loss.
+  - `--dry-run` prints the exact rclone/s3cmd command targeting `s3://mcnf-dr-4533/age/` and the resolved source path WITHOUT contacting DO and without printing the Spaces secret.
+  - The Spaces key is fetched via `mcnf-secret.sh get dr-spaces-key` (no plaintext in script/log); on a real run the artifact appears in the bucket with a matching remote sha256. Agent is classifier-blocked from the push.
+
+- [ ] **DAR-42 — Separate sealed CA + age-identity off-fleet bundle (`dr-ca-bundle.sh`)** `(live-gated)`
+  As the operator, I want the Nebula CA + mesh age identity backed up off-fleet in a SEPARATE passphrase-sealed bundle (via `mackesd secret-seal`, DAR-2), so the key that decrypts the DR manifest is recoverable but never co-located.
+  - Produces a passphrase-sealed bundle (reusing `mackesd ca export` / `mackesd secret-seal` over `ca::backup::seal_bytes`) containing the CA + the mesh age identity, with a distinct `keys/` prefix; not readable without the passphrase.
+  - `--dry-run` prints the off-fleet target `s3://mcnf-dr-4533/keys/` and does not push; a real push is operator-run.
+
+- [ ] **DAR-43 — Guided reconstitution / rebirth (`dr-reconstitute.sh`) with a content-verified restore**
+  As the operator rebuilding on a fresh box, I want a guided flow that takes a `dr-<ts>.age` + the CA/age bundle and rebirths state-backend + secrets + Forgejo + reconciler, so the backoffice comes back and a leader is elected.
+  - `--verify <dr.age>` dearmors + lists components and stops before any mutation (exit 0 = restorable).
+  - Round-trip against a throwaway etcd: restores the etcd snapshot + re-puts `/tofu/state` + `/mcnf/secret` + `/mcnf/age-recipients` keys (via `dr-restore.sh`), restored values sha256-match the source; the restored Forgejo serves `/api/healthz=pass` AND a NAMED seed repo is browsable AND an admin row exists in the `user` table (verified post-restore on the documented sqlite quiesce — resolves STUB 3, not a healthz-only pass on a corrupt-but-loadable DB).
+  - On live infra the final step confirms an etcd leader + mackesd healthz green.
+
+#### Observability + packaging + live reconstitution
+
+- [ ] **DAR-44 — Backoffice observability: `backoffice-status.sh --json` (health from etcd `/reconciler/*`, not a host-local txt) + `mackesd backoffice status` + status timer**
+  As the operator, I want a single command and a mesh-published health record for the backoffice itself, sourcing reconcile health from etcd so it works on a fresh VM.
+  - `backoffice-status.sh --json` emits per-component health (state-backend :8390 reachable, secret list ok, each tier unit is-active, **last reconcile rev+outcome read from etcd `/reconciler/*`** — NOT a host-local `automation/.state/farm-status.txt` that won't exist on a fresh VM (resolves STUB 4), forgejo `/api/healthz`, last DR snapshot age from `/mnt/mesh-storage/dr/INDEX.json`).
+  - On a brand-new control VM with no prior reconcile (empty `/reconciler/*`), the reconcile field reports `unknown`/`never` rather than erroring; `mackesd backoffice status --json` wraps it (shown in --help); `mcnf-backoffice-status.{service,timer}` (mirroring mesh-status) publishes the record into the mesh directory (`systemd-analyze verify` clean).
+  - Running against a partially-down backoffice reports that component unhealthy rather than erroring out.
+
+- [ ] **DAR-45 — Genesis-wizard Backoffice step + `action/dc/backoffice-plan` RPC (rendered units match `backoffice-plan.sh`, registered in the allow-list)**
+  As an operator using the genesis wizard, I want a Backoffice step with a Minimal/Full toggle that shows the planned units, so founding offers the backoffice as a guided gated choice.
+  - A wizard step after Review with a Minimal/Full toggle through mde-theme tokens (§4, no raw hex/metrics); Esc/back works; selecting a tier fires the read-only `action/dc/backoffice-plan` RPC and renders the ordered units + a `secrets ready` chip (reusing the genesis_plan secret-presence-probe); the RPC mutates nothing.
+  - The RPC's rendered unit list is asserted to MATCH `backoffice-plan.sh --tier <t>` output (NOT a canned/hardcoded plan — resolves STUB 5); the new verb `backoffice-plan` is registered in the datacenter `action/dc/<verb>` allow-list (host_ops verb table) with a passing `action_topic` test.
+  - The arm→confirm `genesis-write` reply gains a `backoffice_intent {tier}` field (null/absent when toggle off, behavior unchanged); **coordinate the merge onto the parallel DC-18 `genesis.rs`/`datacenter.rs` Step enum + action allow-list (moving target — rebase, do not collide)**; `cargo test -p mde-workbench -p mackesd` green.
+
+- [ ] **DAR-46 — Boot-time convergence unit + RPM packaging of backoffice/control-vm artifacts**
+  As the platform, I want the backoffice artifacts packaged and a boot-time convergence unit, so a rebuilt/rebooted control VM re-converges without manual steps.
+  - The RPM installs `automation/backoffice/*`, `automation/tofu-reconstitute/*`, `automation/farm/*`, `automation/lib/etcd-endpoints.sh`, and `infra/tofu/control-vm/*` to the existing automation/infra install roots (`rpm -ql`).
+  - `mcnf-backoffice-up.service` (oneshot, `backoffice-up.sh --adopt` reading the tier from `/mcnf/backoffice/intent`) runs at boot and exits 0 when services are already up; no tier hardcoded in the unit; release pre-flight (fmt/build/test/token-clean) passes.
+
+- [ ] **DAR-47 — `--with-backoffice` invokes `backoffice-up.sh` after the control VM is up (single bootstrap driver)**
+  As the operator, I want exactly one bootstrap driver wired into genesis, so the Full-tier farm/CI/reconciler/DR steps are invoked in order and never by two competing entrypoints.
+  - The `--with-backoffice` Full-tier path calls `backoffice-up.sh --tier full` on the control VM after enrollment + reseal, which sequences CI → reconciler → build-farm → DR; coordinated with the DC-18 orchestrator so there is a single entrypoint.
+  - Minimal tier installs neither reconciler/CI/farm/DR; genesis leaves FA_APPLY unset; re-run is idempotent (no duplicate units/containers).
+
+- [ ] **DAR-48 — `migrate-state.sh`: relocate live root state onto the control VM (state-move only, incl. edgeos)** `(live-gated)`
+  As the operator cutting over from `.192`, I want each root's etcd-backed state moved without disturbing live resources, so the live fleet keeps running on the reproducible backend.
+  - For each root (xen-xapi, zone1-do, edgeos, control-vm): state pull from the `.192` backend (edgeos pulled from its local file per DAR-9b), re-init with the control-VM `backend.hcl`, state push, then plan shows 0-add/0-change/0-destroy BEFORE any cutover is accepted; for xen-xapi the `moved{}` blocks are consumed (no destroy).
+  - The live DO lighthouses, ASTERISK droplet, and the 3 build VMs stay running throughout; migration is reversible (original state retained under a timestamped etcd key); quiesces the reconciler timer during the move to avoid a tofu-lock race; aborts loudly if any parity plan shows a destroy.
+
+- [ ] **DAR-49 — LIVE: provision the control VM on the founding dom0 and prove full-mesh enroll + tier units + no-plaintext-state** `(live-gated)`
+  As the operator, I want a real control VM created on a founding dom0 that enrolls as a full mesh peer and runs its tier units, so the design is proven on real XCP-NG end-to-end.
+  - `backoffice-up.sh`/`control-vm-provision.sh` (no dry-run) clones `MDE-VM-golden`; the VM boots, `mackesd peers --json` lists the control-vm overlay IP as enrolled (live-verify, not tofu output); `/mcnf/age-recipients/<node-id>` shows the VM's own recipient.
+  - **`grep` of the live control-vm root's `terraform.tfstate` confirms NO age private key / NO unseal passphrase / NO provider token (observed on the real produced state — resolves STUB 1).**
+  - SSH to the overlay IP: `mcnf-state-backend` active and `curl :8390` serves state; `mcnf-secret.sh get do-token` returns the live token using the VM's OWN key; for Full, forgejo `/api/healthz=pass` + runner registered; `tofu plan` against the relocated etcd backend shows 0-drift; `backoffice-status.sh --json` shows all tier components healthy.
+
+- [ ] **DAR-50 — LIVE: reconstitute the hand-built 172.20.145.192 backoffice as a control VM** `(live-gated)`
+  As the operator, I want the existing hand-stood-up backoffice migrated into the control-vm model, so the live mesh's DevOps plane becomes reproducible IaC and the LAN node is no longer a snowflake.
+  - Running `backoffice-up.sh` with `MCNF_CONTROL_IP=172.20.145.192 --adopt` against the live founder etcd (quorum from `/etc/mackesd/etcd-endpoints`) converges state-backend + secrets + Forgejo + reconciler with NO destructive change; the live `/tofu/state/*` (incl. migrated edgeos) is readable by the new state-backend and a `tofu plan` of xen-xapi from the control VM shows 0-add/0-change/0-destroy (the `moved{}` port consumed against the live build VMs).
+  - The live build farm (.50/.90/.130) stays managed (reconcile converges with the live nodes); secrets resolve from the store via the control VM's own re-sealed key and the `/root/.mcnf-*` fallback files can be removed without breaking `tofu plan` (closes DS-8); a DR backup restores into a throwaway etcd and a plan against it matches AND the restored Forgejo shows the named repo + admin row (DR round-trip proven, DAR-43).
