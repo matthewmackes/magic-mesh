@@ -34,6 +34,7 @@ pub fn view<'a, Message: Clone + 'a>(
     events_open: bool,
     on_search: Message,
     on_toggle_events: Message,
+    on_density: Message,
 ) -> Element<'a, Message> {
     let palette = crate::live_theme::palette();
     let sizes = FontSize::defaults();
@@ -68,6 +69,8 @@ pub fn view<'a, Message: Clone + 'a>(
         &sizes,
         &weights,
     ));
+    right = right.push(div_v(&palette));
+    right = right.push(density_btn(on_density, &palette, &sizes, &weights));
     right = right.push(div_v(&palette));
     right = right.push(events_toggle(
         events_open,
@@ -239,6 +242,53 @@ fn events_toggle<'a, Message: Clone + 'a>(
         .into()
 }
 
+/// UNIFY-13 — the density toggle: shows the current workgroup density and cycles it
+/// on press (the app's `on_density` persists + applies it via `live_theme::set`, so
+/// `panel_chrome` spacing updates on the next render).
+fn density_btn<'a, Message: Clone + 'a>(
+    on_density: Message,
+    palette: &Palette,
+    sizes: &FontSize,
+    weights: &FontWeight,
+) -> Element<'a, Message> {
+    let pal = *palette;
+    let label = match crate::live_theme::tokens().density {
+        mde_theme::Density::Compact => "▤ compact",
+        mde_theme::Density::Comfortable => "▤ comfortable",
+        mde_theme::Density::Spacious => "▤ spacious",
+    };
+    let txt = pal.text_muted.into_cosmic_color();
+    let content = mono_text(label, TypeRole::Caption, sizes, weights).colr(txt);
+    cosmic::iced::widget::button(content)
+        .padding([4u16, 9u16])
+        .on_press(on_density)
+        .sty(move |_t: &cosmic::Theme, status: ButtonStatus| {
+            let bg = match status {
+                ButtonStatus::Hovered | ButtonStatus::Pressed => {
+                    Some(Background::Color(overlay_white_on(pal.surface, 0.08)))
+                }
+                _ => None,
+            };
+            let border = Border {
+                color: pal.border.into_cosmic_color(),
+                width: 1.0,
+                radius: 0.0.into(),
+            };
+            button::Style {
+                snap: false,
+                background: bg,
+                text_color: txt,
+                icon_color: Some(txt),
+                border_color: border.color,
+                border_width: border.width,
+                border_radius: border.radius,
+                border,
+                shadow: cosmic::iced::Shadow::default(),
+            }
+        })
+        .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,13 +300,13 @@ mod tests {
 
     #[test]
     fn renders_with_and_without_health() {
-        let _none = view::<()>("Mesh / Peers".into(), None, true, true, (), ());
+        let _none = view::<()>("Mesh / Peers".into(), None, true, true, (), (), ());
         let h = HealthSummary {
             node_count: 8,
             healthy_nodes: 7,
             lighthouse_count: 3,
             ha_ok: true,
         };
-        let _some = view::<()>("Mesh / Peers".into(), Some(&h), false, false, (), ());
+        let _some = view::<()>("Mesh / Peers".into(), Some(&h), false, false, (), (), ());
     }
 }

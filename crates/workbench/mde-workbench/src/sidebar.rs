@@ -113,6 +113,7 @@ pub fn view<'a>(
     view: View,
     focused_pane: Pane,
     on_group_click: impl Fn(Group) -> crate::Message + 'a,
+    on_group_toggle: impl Fn(Group) -> crate::Message + 'a,
     on_panel_click: impl Fn(Group, &'static str) -> crate::Message + 'a,
 ) -> Element<'a, crate::Message, cosmic::Theme> {
     let palette = crate::live_theme::palette();
@@ -132,6 +133,7 @@ pub fn view<'a>(
             expanded,
             palette,
             &on_group_click,
+            &on_group_toggle,
         ));
         if expanded {
             for panel in &entry.panels {
@@ -196,6 +198,7 @@ fn group_header<'a>(
     expanded: bool,
     palette: Palette,
     on_click: &(impl Fn(Group) -> crate::Message + 'a),
+    on_toggle: &(impl Fn(Group) -> crate::Message + 'a),
 ) -> Element<'a, crate::Message, cosmic::Theme> {
     let is_active = group == active;
     // Design line 619 — active header in `text`, inactive in `text_muted`.
@@ -220,10 +223,43 @@ fn group_header<'a>(
         .colr(palette.text_muted.into_cosmic_color())
         .align_y(alignment::Vertical::Center);
 
-    let content =
-        row![label, Space::new().width(Length::Fill), chevron].align_y(alignment::Vertical::Center);
+    // UNIFY-7 follow-up — split the header so the LABEL navigates (on_click) while
+    // the CHEVRON toggles collapse *independently* (on_toggle →
+    // Message::ToggleGroupExpansion), instead of the chevron being inert.
+    let label_btn = button(row![label, Space::new().width(Length::Fill)])
+        .width(Length::Fill)
+        .padding(Padding {
+            top: 6.0,
+            right: 6.0,
+            bottom: 6.0,
+            left: 13.0,
+        })
+        .on_press(on_click(group))
+        .sty(header_btn_style(palette, label_color));
+    let chevron_btn = button(chevron)
+        .padding(Padding {
+            top: 6.0,
+            right: 14.0,
+            bottom: 6.0,
+            left: 6.0,
+        })
+        .on_press(on_toggle(group))
+        .sty(header_btn_style(
+            palette,
+            palette.text_muted.into_cosmic_color(),
+        ));
 
-    let style = move |_theme: &cosmic::Theme, status: ButtonStatus| {
+    row![label_btn, chevron_btn]
+        .align_y(alignment::Vertical::Center)
+        .into()
+}
+
+/// Shared hover/press style for the split group-header buttons (UNIFY-7).
+fn header_btn_style(
+    palette: Palette,
+    text_color: Color,
+) -> impl Fn(&cosmic::Theme, ButtonStatus) -> button::Style {
+    move |_theme, status| {
         let bg = match status {
             ButtonStatus::Hovered => Background::Color(palette.raised.into_cosmic_color()),
             ButtonStatus::Pressed => Background::Color(palette.overlay.into_cosmic_color()),
@@ -234,27 +270,14 @@ fn group_header<'a>(
             snap: false,
             icon_color: None,
             background: Some(bg),
-            text_color: label_color,
+            text_color,
             border,
             border_color: border.color,
             border_width: border.width,
             border_radius: border.radius,
             shadow: Shadow::default(),
         }
-    };
-
-    button(content)
-        .width(Length::Fill)
-        // Design line 619 — `padding:6px 14px 6px 13px`.
-        .padding(Padding {
-            top: 6.0,
-            right: 14.0,
-            bottom: 6.0,
-            left: 13.0,
-        })
-        .on_press(on_click(group))
-        .sty(style)
-        .into()
+    }
 }
 
 /// UNIFY-7 — a single nav item inside an expanded group (design line 624).

@@ -104,6 +104,8 @@ pub enum Message {
     EventsUpdated(Vec<mde_notify::AlertItem>),
     /// UNIFY-5 — refresh the status-strip clock (30 s tick).
     ClockTick,
+    /// UNIFY-13 — cycle the workgroup density (Compact ↔ Comfortable).
+    CycleDensity,
     /// Keyboard / chord-bar generated key. Translated by
     /// [`crate::keyboard::interpret_key`] before landing here.
     KeyPressed(KeyAction),
@@ -1103,6 +1105,17 @@ impl App {
                 self.now = utc_hhmm();
                 Task::none()
             }
+            // UNIFY-13 — cycle density (persisted + applied via live_theme::set so
+            // panel_chrome spacing updates on the next render).
+            Message::CycleDensity => {
+                let p = mde_theme::Preferences::load();
+                let next = match p.density {
+                    mde_theme::Density::Compact => mde_theme::Density::Comfortable,
+                    _ => mde_theme::Density::Compact,
+                };
+                crate::live_theme::set(p.theme, next);
+                Task::none()
+            }
             // GUI-RECONNECT — on a down→up transition, re-load the active
             // panel so its data recovers on its own. No reload while the
             // Bus stays healthy (no flicker / no clobbered input).
@@ -1449,6 +1462,7 @@ impl App {
             self.view,
             self.focused_pane,
             Message::SelectGroup,
+            Message::ToggleGroupExpansion,
             |group, panel| Message::SelectPanel { group, panel },
         );
 
@@ -1469,6 +1483,7 @@ impl App {
             self.events_rail_open,
             Message::FocusRequest("launcher".to_string()),
             Message::ToggleLiveEventsRail,
+            Message::CycleDensity,
         );
 
         let body = self.crossfaded_body();
