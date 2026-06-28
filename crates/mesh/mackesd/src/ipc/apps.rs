@@ -441,6 +441,214 @@ pub fn build_list(local: Vec<AppEntry>, mesh: Vec<AppEntry>, workloads: Vec<AppE
     .to_string()
 }
 
+// ───────────────────────── peer-app discovery (APPLAUNCH-5) ─────────────────────────
+
+/// APPLAUNCH-5 — read a peer's installed `.desktop` app set off the replicated
+/// QNM-Shared plane (`<root>/<host>/apps-installed.json`, published by that
+/// peer's `apps_installed` worker). This is a **local-disk** read of the
+/// Syncthing-mirrored file, so it never blocks on a network round-trip to a
+/// slow/dead peer (the lazy-mesh lock) — the worst case is a stale or absent
+/// file, which is an honest empty set (mesh-down → no entries). Returns the
+/// peer's launchable apps; empty when the share/file is absent or unparseable.
+#[must_use]
+pub fn read_peer_installed(workgroup_root: &Path, node: &str) -> Vec<AppEntry> {
+    if node.is_empty() {
+        return Vec::new();
+    }
+    let path = workgroup_root.join(node).join("apps-installed.json");
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return Vec::new();
+    };
+    doc.get("entries")
+        .and_then(|e| serde_json::from_value::<Vec<AppEntry>>(e.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// APPLAUNCH-5 — build the `action/apps/peer-list` reply: a focused peer's
+/// installed app set. An empty/self `node` answers THIS node's live local scan
+/// (so the verb works mesh-down for the local box too); any other node reads the
+/// replicated [`read_peer_installed`] file. Always `ok:true` — an unknown peer is
+/// an empty list, not an error (the Front Door simply shows "no apps discovered").
+#[must_use]
+pub fn build_peer_list(svc: &AppsService, node: &str) -> String {
+    let entries = if node.is_empty() || node == svc.node_id {
+        // Self / unscoped → the live local scan (works with the mesh down).
+        scan_local_apps(&default_app_dirs(&svc.home))
+    } else {
+        read_peer_installed(&svc.workgroup_root, node)
+    };
+    json!({
+        "ok": true,
+        "node": node,
+        "entries": entries,
+        "count": entries.len(),
+    })
+    .to_string()
+}
+
+// ───────────────────────── operator groups (APPLAUNCH-4) ─────────────────────────
+
+/// APPLAUNCH-4 — one operator-curated group: a named, ordered bucket of entry
+/// ids that renders as a collapsible section in the Apps view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppGroup {
+    /// Display name of the group (e.g. "Dev tools").
+    pub name: String,
+    /// The entry ids in this group, in operator order.
+    #[serde(default)]
+    pub ids: Vec<String>,
+}
+
+/// Per-user app-groups file on QNM-Shared (APPLAUNCH-4): a JSON array of
+/// [`AppGroup`] at `<workgroup_root>/app-groups/<user>.json`, so a user's curated
+/// sections follow them to any node (mirrors the favorites store). mackesd (root)
+/// is the only writer with mount access; the Front Door reads/sets via the bus
+/// verbs.
+#[must_use]
+pub fn app_groups_path(workgroup_root: &Path, user: &str) -> PathBuf {
+    workgroup_root
+        .join("app-groups")
+        .join(format!("{}.json", sanitize_user(user)))
+}
+
+/// Read a user's curated groups (empty when none/absent — never an error).
+#[must_use]
+pub fn read_app_groups(workgroup_root: &Path, user: &str) -> Vec<AppGroup> {
+    std::fs::read_to_string(app_groups_path(workgroup_root, user))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<AppGroup>>(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Replace a user's curated groups wholesale; returns the persisted set. Writes
+/// via temp+rename so a concurrent reader never sees a half-written file. The
+/// Front Door's group editor sends the full set on each edit (add/rename/reorder/
+/// remove), so the responder needs only this set-the-whole-thing verb.
+pub fn set_app_groups(workgroup_root: &Path, user: &str, groups: &[AppGroup]) -> Vec<AppGroup> {
+    let path = app_groups_path(workgroup_root, user);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(groups) {
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+    groups.to_vec()
+}
+
+// ───────────────────────── uninstall (APPLAUNCH-6) ─────────────────────────
+
+/// APPLAUNCH-6 — the launch binary of a local app's `Exec` line (what `rpm -qf`
+/// maps to an owning package). Strips XDG field codes + a leading `env`/`VAR=val`
+/// wrapper, mirroring [`crate::workers::apps_running::exec_basename`] but keeping
+/// the full path (`rpm -qf` wants a path on disk, not a bare basename). `None`
+/// for an empty/blank exec.
+#[must_use]
+pub fn exec_binary(exec: &str) -> Option<String> {
+    exec.split_whitespace()
+        .find(|t| !t.starts_with('%') && *t != "env" && !t.contains('='))
+        .map(str::to_string)
+}
+
+/// APPLAUNCH-6 — resolve the typed uninstall argv for a local app entry (no
+/// shell interpolation — a real `Command` argv, §9). A Flatpak app (its
+/// desktop-file id is the Flatpak app-id, e.g. `org.gimp.GIMP`) → `flatpak
+/// uninstall -y <id>`. An XDG app → `dnf remove -y <package>`, where `package`
+/// is the entry's owning RPM resolved by the caller (via `rpm -qf` on the exec
+/// binary) and passed in here. `None` for a non-app / empty entry, or an XDG app
+/// whose package couldn't be resolved (mesh apps, workloads, services are never
+/// "uninstalled" from here — out of scope).
+#[must_use]
+pub fn uninstall_argv(source: &str, id: &str, package: Option<&str>) -> Option<Vec<String>> {
+    if id.is_empty() {
+        return None;
+    }
+    match source {
+        "flatpak" => Some(vec![
+            "flatpak".into(),
+            "uninstall".into(),
+            "-y".into(),
+            id.into(),
+        ]),
+        "xdg" => {
+            let pkg = package.map(str::trim).filter(|p| !p.is_empty())?;
+            Some(vec!["dnf".into(), "remove".into(), "-y".into(), pkg.into()])
+        }
+        _ => None,
+    }
+}
+
+/// APPLAUNCH-6 — resolve the owning RPM package of an XDG app's exec binary via
+/// `rpm -qf`. Returns the package NAME (e.g. `firefox`), or `None` when `rpm`
+/// isn't present / the binary isn't owned by a package / the query fails. Runs a
+/// real subprocess (the responder's effect); the argv is fixed (no shell), so
+/// it's a typed call, not a shell channel (§9).
+#[must_use]
+pub fn resolve_owning_package(exec: &str) -> Option<String> {
+    let bin = exec_binary(exec)?;
+    let out = std::process::Command::new("rpm")
+        .args(["-qf", "--queryformat", "%{NAME}", &bin])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() || name.contains("not owned") {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// APPLAUNCH-6 — perform an app uninstall and return the `action/apps/uninstall`
+/// reply. Resolves the typed argv ([`uninstall_argv`], with the owning package
+/// resolved server-side for XDG apps) and spawns it as a real `Command` (no
+/// shell). Always returns an `{ok, …}` envelope. The Front Door gates this behind
+/// the operator's typed confirm before it ever publishes the request (§9 —
+/// destructive, confirm-gated).
+#[must_use]
+pub fn build_uninstall(body: Option<&str>) -> String {
+    let v: serde_json::Value = body
+        .and_then(|b| serde_json::from_str(b).ok())
+        .unwrap_or(json!({}));
+    let source = v.get("source").and_then(|s| s.as_str()).unwrap_or("");
+    let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("");
+    let exec = v.get("exec").and_then(|e| e.as_str()).unwrap_or("");
+    let package = if source == "xdg" {
+        resolve_owning_package(exec)
+    } else {
+        None
+    };
+    let Some(argv) = uninstall_argv(source, id, package.as_deref()) else {
+        return json!({
+            "ok": false,
+            "error": format!("cannot uninstall '{id}' (unresolved package or unsupported source '{source}')")
+        })
+        .to_string();
+    };
+    let Some((cmd, args)) = argv.split_first() else {
+        // uninstall_argv never yields an empty vec, but degrade rather than panic.
+        return json!({ "ok": false, "error": "empty uninstall command" }).to_string();
+    };
+    match std::process::Command::new(cmd).args(args).output() {
+        Ok(out) if out.status.success() => {
+            json!({ "ok": true, "detail": format!("uninstalled {id}") }).to_string()
+        }
+        Ok(out) => json!({
+            "ok": false,
+            "error": String::from_utf8_lossy(&out.stderr).trim().to_string()
+        })
+        .to_string(),
+        Err(e) => json!({ "ok": false, "error": format!("spawn {cmd} failed: {e}") }).to_string(),
+    }
+}
+
 // ───────────────────────── favorites (APPS-4) ─────────────────────────
 
 /// Sanitize a username into a safe single filename component.
@@ -531,8 +739,20 @@ impl AppsService {
     }
 }
 
-/// Action verbs served on `action/apps/<verb>`.
-pub const ACTION_VERBS: [&str; 4] = ["list", "favorites", "set-favorite", "launch"];
+/// Action verbs served on `action/apps/<verb>`. APPLAUNCH adds `peer-list`
+/// (APPLAUNCH-5 — a focused peer's installed `.desktop` set), `groups` +
+/// `set-groups` (APPLAUNCH-4 — per-user operator-curated buckets), and
+/// `uninstall` (APPLAUNCH-6 — confirm-gated dnf/flatpak removal).
+pub const ACTION_VERBS: [&str; 8] = [
+    "list",
+    "favorites",
+    "set-favorite",
+    "launch",
+    "peer-list",
+    "groups",
+    "set-groups",
+    "uninstall",
+];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -621,6 +841,36 @@ where
                 .to_string(),
             }
         }
+        // APPLAUNCH-5 — a focused peer's installed `.desktop` set, read on demand
+        // off the replicated plane (or the live local scan for self/unscoped). A
+        // local-disk read, so a slow/dead peer never blocks the caller.
+        "peer-list" => {
+            let node = body
+                .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+                .and_then(|v| v.get("node").and_then(|n| n.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            build_peer_list(svc, &node)
+        }
+        // APPLAUNCH-4 — per-user operator-curated groups on QNM-Shared.
+        "groups" => {
+            let user = user_from_body(body);
+            json!({ "ok": true, "groups": read_app_groups(&svc.workgroup_root, &user) }).to_string()
+        }
+        "set-groups" => {
+            let v: serde_json::Value = body
+                .and_then(|b| serde_json::from_str(b).ok())
+                .unwrap_or(json!({}));
+            let user = v.get("user").and_then(|u| u.as_str()).unwrap_or("_");
+            let groups: Vec<AppGroup> = v
+                .get("groups")
+                .and_then(|g| serde_json::from_value(g.clone()).ok())
+                .unwrap_or_default();
+            let saved = set_app_groups(&svc.workgroup_root, user, &groups);
+            json!({ "ok": true, "groups": saved }).to_string()
+        }
+        // APPLAUNCH-6 — confirm-gated uninstall (dnf|flatpak). The Front Door
+        // arms this only after the operator's typed confirm (§9 — destructive).
+        "uninstall" => build_uninstall(body),
         other => json!({ "ok": false, "error": format!("unknown apps verb: {other}") }).to_string(),
     }
 }
@@ -1105,5 +1355,148 @@ mod tests {
         assert_eq!(reply["counts"]["app"], 1);
         assert_eq!(reply["counts"]["mesh-app"], 1);
         assert_eq!(reply["counts"]["total"], 2);
+    }
+
+    // ───────────────────── APPLAUNCH-5 — peer-list ─────────────────────
+
+    #[test]
+    fn read_peer_installed_folds_the_replicated_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Seed a peer's apps-installed.json (what its apps_installed worker writes).
+        let dir = root.join("anvil");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("apps-installed.json"),
+            r#"{"hostname":"anvil","entries":[{"id":"firefox","name":"Firefox","kind":"app","source":"xdg","node":"anvil","exec":"firefox %u"}]}"#,
+        )
+        .unwrap();
+        let got = read_peer_installed(root, "anvil");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "Firefox");
+        assert_eq!(got[0].node, "anvil");
+        // An unknown peer / absent file → empty, never an error.
+        assert!(read_peer_installed(root, "ghost").is_empty());
+        // An empty node selector → empty (the verb routes self elsewhere).
+        assert!(read_peer_installed(root, "").is_empty());
+    }
+
+    #[test]
+    fn peer_list_self_uses_live_scan_peer_uses_share() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let home = tmp.path().join("home");
+        // A local app on THIS node.
+        let apps = home.join(".local/share/applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(
+            apps.join("term.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Terminal\nExec=cosmic-term\n",
+        )
+        .unwrap();
+        // A peer's published set on the share.
+        let peer_dir = root.join("anvil");
+        std::fs::create_dir_all(&peer_dir).unwrap();
+        std::fs::write(
+            peer_dir.join("apps-installed.json"),
+            r#"{"hostname":"anvil","entries":[{"id":"gimp","name":"GIMP","kind":"app","source":"flatpak","node":"anvil","exec":"gimp"}]}"#,
+        )
+        .unwrap();
+        let svc = AppsService::new(root, "me", &home);
+        // Self / unscoped → the live local scan.
+        let me: serde_json::Value = serde_json::from_str(&build_peer_list(&svc, "")).unwrap();
+        assert_eq!(me["ok"], true);
+        assert_eq!(me["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(me["entries"][0]["name"], "Terminal");
+        // A focused peer → the replicated file.
+        let peer: serde_json::Value =
+            serde_json::from_str(&build_peer_list(&svc, "anvil")).unwrap();
+        assert_eq!(peer["node"], "anvil");
+        assert_eq!(peer["entries"][0]["name"], "GIMP");
+        // A dead peer → ok:true with an empty list (never blocks, never errors).
+        let dead: serde_json::Value =
+            serde_json::from_str(&build_peer_list(&svc, "ghost")).unwrap();
+        assert_eq!(dead["ok"], true);
+        assert_eq!(dead["count"], 0);
+    }
+
+    // ───────────────────── APPLAUNCH-4 — app groups ─────────────────────
+
+    #[test]
+    fn app_groups_round_trip_per_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(read_app_groups(root, "mm").is_empty());
+        let groups = vec![
+            AppGroup {
+                name: "Dev".into(),
+                ids: vec!["firefox".into(), "code".into()],
+            },
+            AppGroup {
+                name: "Media".into(),
+                ids: vec!["mpv".into()],
+            },
+        ];
+        let saved = set_app_groups(root, "mm", &groups);
+        assert_eq!(saved, groups);
+        assert_eq!(read_app_groups(root, "mm"), groups);
+        // Per-user isolation + path sanitization (no traversal).
+        assert!(read_app_groups(root, "alice").is_empty());
+        assert!(app_groups_path(root, "../x")
+            .to_string_lossy()
+            .ends_with("app-groups/___x.json"));
+        // A wholesale replace (the editor sends the full set each edit).
+        let replaced = set_app_groups(root, "mm", &[]);
+        assert!(replaced.is_empty());
+        assert!(read_app_groups(root, "mm").is_empty());
+    }
+
+    // ───────────────────── APPLAUNCH-6 — uninstall ─────────────────────
+
+    #[test]
+    fn uninstall_argv_flatpak_and_xdg_and_unsupported() {
+        // Flatpak → flatpak uninstall -y <app-id>.
+        assert_eq!(
+            uninstall_argv("flatpak", "org.gimp.GIMP", None).unwrap(),
+            ["flatpak", "uninstall", "-y", "org.gimp.GIMP"]
+        );
+        // XDG with a resolved package → dnf remove -y <pkg>.
+        assert_eq!(
+            uninstall_argv("xdg", "firefox", Some("firefox")).unwrap(),
+            ["dnf", "remove", "-y", "firefox"]
+        );
+        // XDG with no resolved package → None (nothing to remove).
+        assert!(uninstall_argv("xdg", "firefox", None).is_none());
+        assert!(uninstall_argv("xdg", "firefox", Some("   ")).is_none());
+        // Non-app sources are never uninstalled here.
+        assert!(uninstall_argv("peer", "mesh-app:anvil", None).is_none());
+        assert!(uninstall_argv("service", "service:x:y", None).is_none());
+        // Empty id → None.
+        assert!(uninstall_argv("flatpak", "", None).is_none());
+    }
+
+    #[test]
+    fn exec_binary_strips_field_codes_and_env() {
+        assert_eq!(exec_binary("firefox %u").as_deref(), Some("firefox"));
+        assert_eq!(
+            exec_binary("/usr/bin/firefox %U").as_deref(),
+            Some("/usr/bin/firefox")
+        );
+        assert_eq!(
+            exec_binary("env GTK_THEME=x gimp %f").as_deref(),
+            Some("gimp")
+        );
+        assert_eq!(exec_binary("%U").as_deref(), None);
+        assert_eq!(exec_binary("   ").as_deref(), None);
+    }
+
+    #[test]
+    fn build_uninstall_rejects_unresolvable() {
+        // A workload/service kind has no uninstall path → ok:false, never a panic.
+        let reply: serde_json::Value = serde_json::from_str(&build_uninstall(Some(
+            r#"{"source":"podman","id":"workload:podman:c1"}"#,
+        )))
+        .unwrap();
+        assert_eq!(reply["ok"], false);
     }
 }
