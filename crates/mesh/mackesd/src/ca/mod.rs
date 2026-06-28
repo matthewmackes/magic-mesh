@@ -36,6 +36,10 @@
 //! depend on the binary being installed.
 
 pub mod backup;
+// MIG-3 — provision the sealed CA-backup passphrase credential on a
+// JOINED lighthouse so it boots without the SEC-7/ENT-11 "UNBACKED-UP"
+// warning. Called from the `mackesd join --role lighthouse` flow.
+pub mod backup_provision;
 // EPIC-SEC-BANLIST (Q53) — compromised-node ban list checked at
 // the CSR sign gate (nebula_enroll::sign_pending_csr).
 pub mod ban_list;
