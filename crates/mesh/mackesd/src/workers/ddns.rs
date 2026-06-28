@@ -364,18 +364,34 @@ impl DdnsWorker {
         self
     }
 
-    /// Run the reconcile loop until `should_stop`.
+    /// Run the reconcile loop until `should_stop`. Between sweeps it polls in
+    /// short slices both so shutdown is prompt AND so an operator `sync-now`
+    /// (DDNS-EGRESS-5 — a nudge file the responder drops) reconciles immediately
+    /// instead of waiting out the full sweep interval.
     pub fn run<F: Fn() -> bool>(&self, persist: &Persist, alerts_dir: &Path, should_stop: F) {
         let mut auth_alerted = false;
         while !should_stop() {
+            self.consume_sync_nudge();
             self.sweep_live(persist, alerts_dir, &mut auth_alerted);
-            // Sleep in small slices so shutdown is prompt.
             let mut slept = Duration::ZERO;
             while slept < SWEEP_INTERVAL && !should_stop() {
                 std::thread::sleep(Duration::from_millis(500));
                 slept += Duration::from_millis(500);
+                if self.sync_nudge_pending() {
+                    break; // operator asked for an immediate sync.
+                }
             }
         }
+    }
+
+    /// Is a `sync-now` nudge pending?
+    fn sync_nudge_pending(&self) -> bool {
+        crate::ipc::ddns::sync_nudge_path(&self.workgroup_root).exists()
+    }
+
+    /// Clear the `sync-now` nudge (consumed at the top of a sweep).
+    fn consume_sync_nudge(&self) {
+        let _ = std::fs::remove_file(crate::ipc::ddns::sync_nudge_path(&self.workgroup_root));
     }
 
     /// One live sweep: build the DO writer from the encrypted token, then run the
