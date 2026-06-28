@@ -700,7 +700,12 @@ fn run_traceroute(ip: &str) -> Result<Vec<String>, String> {
 /// from its Netdata `system.net`, normalized to 0.0..=1.0 against a 12 MB/s
 /// reference so a busy link saturates the particle stream. Unreachable
 /// Netdata → that host simply omitted (no particles). Blocking; off-thread.
-fn sample_flows(targets: &[(String, String)]) -> std::collections::HashMap<String, f64> {
+///
+/// MESHMAP-3 — `pub` so the `mde-mesh-wallpaper` bin reuses the exact sampler
+/// the Peers Map uses (no reimplementation), wiring real per-node flow into the
+/// desktop wallpaper's particle streams.
+#[must_use]
+pub fn sample_flows(targets: &[(String, String)]) -> std::collections::HashMap<String, f64> {
     /// Normalization reference: ~100 Mbit/s in bytes/s. A link at/above this
     /// saturates the stream; idle links round to ~0 and draw nothing.
     const REF_BYTES_PER_S: f64 = 12_000_000.0;
@@ -1446,7 +1451,7 @@ impl PeersPanel {
                 // Sample each online peer's overlay throughput (Netdata
                 // system.net) for the particle density. Offline peers / no
                 // overlay → no flow.
-                let targets: Vec<(String, String)> = self
+                let mut targets: Vec<(String, String)> = self
                     .rows
                     .iter()
                     .filter(|r| {
@@ -1456,6 +1461,13 @@ impl PeersPanel {
                     })
                     .map(|r| (r.hostname.clone(), r.overlay_ip.clone()))
                     .collect();
+                // MESHMAP-3 (W3) — also sample SELF's own throughput (its local
+                // Netdata on loopback) so the self→peer particle stream (self is
+                // the sender that direction) has a real density to ride. Keyed
+                // under the self hostname so the Map view reads it as `self_flow`.
+                if !self.self_hostname.is_empty() {
+                    targets.push((self.self_hostname.clone(), "127.0.0.1".to_string()));
+                }
                 if targets.is_empty() {
                     self.flows.clear();
                     return Task::none();
@@ -2140,6 +2152,16 @@ impl PeersPanel {
             // anchors that run Server tier), so the Map view gives them the same
             // beacon-hero treatment. One snapshot read per map build.
             let lh_ips = super::peers_map::lighthouse_overlay_ips();
+            // MESHMAP-4 (W7) — the per-peer underlay path (direct vs relayed),
+            // and an overlay-IP→hostname map so a relayed path's `relay_via` IP
+            // resolves to the relaying node we draw the bend through.
+            let paths = super::peers_map::read_latency_paths();
+            let ip_to_host: std::collections::HashMap<&str, &str> = self
+                .rows
+                .iter()
+                .filter(|r| !r.overlay_ip.is_empty())
+                .map(|r| (r.overlay_ip.as_str(), r.hostname.as_str()))
+                .collect();
             let nodes: Vec<super::peers_map::MapNode> = self
                 .rows
                 .iter()
@@ -2150,9 +2172,22 @@ impl PeersPanel {
                     is_self: r.hostname == self.self_hostname,
                     lighthouse: super::peers_map::is_lighthouse(&r.role, &r.overlay_ip, &lh_ips),
                     flow: self.flows.get(&r.hostname).copied().unwrap_or(0.0),
+                    // W7 — resolve the relay overlay-IP to its node hostname (so
+                    // the draw pass can bend through that node's position); a
+                    // direct/overlay path or an unknown relay IP leaves it None.
+                    relay_via: paths.get(&r.hostname).and_then(|pi| {
+                        pi.relay_via
+                            .as_deref()
+                            .and_then(|ip| ip_to_host.get(ip).map(|h| (*h).to_string()))
+                    }),
                 })
                 .collect();
-            let positions = super::peers_map::layout(&nodes);
+            // MESHMAP-1 (W4) — geographic placement when any node carries a
+            // region token (falls back to the force layout per-node otherwise).
+            let geo = super::peers_map::any_geo_known(&nodes);
+            let positions = super::peers_map::geo_layout(&nodes);
+            // MESHMAP-3 (W3) — self's own throughput drives the self→peer stream.
+            let self_flow = self.flows.get(&self.self_hostname).copied().unwrap_or(0.0);
             // `MapProgram` implements `canvas::Program` for the stock
             // `cosmic::iced::Theme`, so the canvas is a stock-themed element;
             // `themer` bridges it into the surrounding `cosmic::Theme` tree.
@@ -2164,6 +2199,10 @@ impl PeersPanel {
                     positions,
                     palette,
                     flow_phase: self.flow_phase,
+                    self_flow,
+                    geo,
+                    // MESHMAP-5 (W8) — reduce-motion → static colored edges.
+                    reduce_motion: crate::live_theme::reduce_motion(),
                 })
                 .width(Length::Fill)
                 .height(Length::Fill)
