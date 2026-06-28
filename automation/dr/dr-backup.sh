@@ -86,7 +86,17 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # ── component 1-3: tofu state, secrets, age recipients ──
-TOFU_JSON="$(range_prefix "$ETCD1" "/tofu/state/" "/tofu/state0")"
+# DAR-1: the tofu-state prefix is the SAME canonical /tofu/state/ the state backend
+# (tofu-state-etcd.py CANONICAL_STATE_PREFIX) writes under, and BOTH honor the same
+# STATE_PREFIX override so they can never drift — a DR range over STATE_PREFIX reads
+# exactly what the backend put there. The range_end is the prefix sans trailing
+# slash + the next byte (the "<…>0" open-ended-scan trick) computed from STATE_PREFIX
+# so a custom prefix scans correctly too.
+STATE_PREFIX="${STATE_PREFIX:-/tofu/state/}"
+case "$STATE_PREFIX" in */) ;; *) STATE_PREFIX="$STATE_PREFIX/" ;; esac
+# range_end = prefix with the trailing slash bumped to the next byte (slash=0x2f → '0'=0x30).
+STATE_RANGE_END="${STATE_PREFIX%/}0"
+TOFU_JSON="$(range_prefix "$ETCD1" "$STATE_PREFIX" "$STATE_RANGE_END")"
 SECRET_JSON="$(range_prefix "$ETCD1" "/mcnf/secret/" "/mcnf/secret0")"
 RECIP_LEGACY_JSON="$(range_key "$ETCD1" "/mcnf/age-recipient")"
 RECIP_SET_JSON="$(range_prefix "$ETCD1" "/mcnf/age-recipients/" "/mcnf/age-recipients0")"

@@ -35,6 +35,17 @@ Env (DAR-6 — NO dead-LAN default):
   STATE_BACKEND_BIND   address to bind (default the detected overlay IP, NOT
                        0.0.0.0 — the overlay-only bind is load-bearing, lock 7).
   STATE_BACKEND_PORT   default 8390.
+  STATE_PREFIX         (DAR-1) etcd key prefix for state. Default the CANONICAL
+                       live value /tofu/state/ — the SAME string dr-backup.sh
+                       ranges, so DR captures what the backend writes. Overridable
+                       ONLY for a test/throwaway namespace; in production this is
+                       frozen (lock 7). STATE_LOCK_PREFIX defaults /tofu/lock/.
+
+DAR-1: the canonical prefix lives in ONE place per language — here as
+CANONICAL_STATE_PREFIX, in dr-backup.sh as the same default — and both honor the
+SAME STATE_PREFIX override so they can never drift (a put under STATE_PREFIX is
+read by a DR range over STATE_PREFIX). Run the prefix self-test with:
+  STATE_BACKEND_SELFTEST=1 python3 tofu-state-etcd.py
 """
 from __future__ import annotations
 
@@ -85,8 +96,25 @@ def _resolve_endpoints() -> list[str]:
     sys.exit(2)
 
 
-ENDPOINTS = _resolve_endpoints()
+# DAR-1: the canonical live prefixes (lock 7 — FROZEN). STATE_PREFIX is overridable
+# so a test/throwaway run can isolate its keys, but it defaults to the same string
+# dr-backup.sh ranges. Always kept with a single trailing slash.
+CANONICAL_STATE_PREFIX = "/tofu/state/"
+CANONICAL_LOCK_PREFIX = "/tofu/lock/"
+
+
+def _norm_prefix(raw: str, default: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return default
+    return raw if raw.endswith("/") else raw + "/"
+
+
+# Resolved at import so both the server and the self-test share one source.
+ENDPOINTS = []
 PORT = int(os.environ.get("STATE_BACKEND_PORT", "8390"))
+STATE_PREFIX = _norm_prefix(os.environ.get("STATE_PREFIX", ""), CANONICAL_STATE_PREFIX)
+LOCK_PREFIX = _norm_prefix(os.environ.get("STATE_LOCK_PREFIX", ""), CANONICAL_LOCK_PREFIX)
 
 
 def _detect_overlay() -> str:
@@ -187,7 +215,7 @@ class Handler(BaseHTTPRequestHandler):
         name = self._name()
         if not name:
             return self._send(400)
-        data = etcd_get(f"/tofu/state/{name}")
+        data = etcd_get(f"{STATE_PREFIX}{name}")
         if data is None:
             return self._send(404)  # no state yet → tofu treats as empty
         self._send(200, data)
@@ -197,14 +225,14 @@ class Handler(BaseHTTPRequestHandler):
         if not name:
             return self._send(400)
         body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
-        etcd_put(f"/tofu/state/{name}", body)
+        etcd_put(f"{STATE_PREFIX}{name}", body)
         self._send(200)
 
     def do_DELETE(self):
         name = self._name()
         if not name:
             return self._send(400)
-        etcd_del(f"/tofu/state/{name}")
+        etcd_del(f"{STATE_PREFIX}{name}")
         self._send(200)
 
     def do_LOCK(self):
@@ -212,7 +240,7 @@ class Handler(BaseHTTPRequestHandler):
         if not name:
             return self._send(400)
         info = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)) or b"{}"
-        lk = f"/tofu/lock/{name}"
+        lk = f"{LOCK_PREFIX}{name}"
         if etcd_lock(lk, info):
             return self._send(200)
         held = etcd_get(lk) or b"{}"
@@ -222,13 +250,122 @@ class Handler(BaseHTTPRequestHandler):
         name = self._name()
         if not name:
             return self._send(400)
-        etcd_del(f"/tofu/lock/{name}")
+        etcd_del(f"{LOCK_PREFIX}{name}")
         self._send(200)
 
 
-if __name__ == "__main__":
+def _selftest() -> int:
+    """DAR-1: offline self-test — mock etcd with an in-process dict and drive a
+    PUT/GET/LOCK/UNLOCK through the REAL handler logic, asserting every key lands
+    under STATE_PREFIX / LOCK_PREFIX (so a custom prefix actually relocates the
+    keys and the default matches dr-backup.sh's range). Touches NO live etcd."""
+    import io
+
+    store: dict[str, bytes] = {}
+
+    # Monkeypatch the etcd KV layer with the in-memory mock.
+    global etcd_get, etcd_put, etcd_del, etcd_lock  # noqa: PLW0603
+    etcd_get = lambda k: store.get(k)  # noqa: E731
+    etcd_put = lambda k, v: store.__setitem__(k, v)  # noqa: E731
+    etcd_del = lambda k: store.pop(k, None)  # noqa: E731
+
+    def _mock_lock(k, info):
+        if k in store:
+            return False
+        store[k] = info
+        return True
+
+    etcd_lock = _mock_lock  # noqa: F811
+
+    fails: list[str] = []
+
+    def check(cond: bool, msg: str) -> None:
+        print(f"  {'PASS' if cond else 'FAIL'} {msg}")
+        if not cond:
+            fails.append(msg)
+
+    # A minimal fake request driving the handler methods without a socket.
+    class _Fake(Handler):
+        def __init__(self, path, body=b""):  # noqa: D401  (skip BaseHTTPRequestHandler.__init__)
+            self.path = path
+            self.rfile = io.BytesIO(body)
+            self.wfile = io.BytesIO()
+            self.headers = {"Content-Length": str(len(body))}
+            self._code = None
+            self._body = b""
+
+        def send_response(self, code):
+            self._code = code
+
+        def send_header(self, *a, **k):
+            pass
+
+        def end_headers(self):
+            pass
+
+    expect_state = f"{STATE_PREFIX}xen-xapi"
+    expect_lock = f"{LOCK_PREFIX}xen-xapi"
     print(
-        f"tofu-state-etcd: {BIND}:{PORT} -> etcd {','.join(ENDPOINTS)}",
+        f"tofu-state-etcd selftest (mock etcd; STATE_PREFIX={STATE_PREFIX} "
+        f"LOCK_PREFIX={LOCK_PREFIX})"
+    )
+
+    # POST a state body → it must land under STATE_PREFIX.
+    r = _Fake("/state/xen-xapi", b'{"version":4}')
+    r.do_POST()
+    check(store.get(expect_state) == b'{"version":4}', f"POST writes under {expect_state}")
+    check(
+        not any(k.startswith("/tofu/state/") and k != expect_state for k in store)
+        or STATE_PREFIX == CANONICAL_STATE_PREFIX,
+        "no stray default-prefix key when STATE_PREFIX is overridden",
+    )
+
+    # GET reads it back from the SAME prefix key.
+    r = _Fake("/state/xen-xapi")
+    r.do_GET()
+    check(r._code == 200, "GET of an existing key returns 200")
+    check(r.wfile.getvalue() == b'{"version":4}', "GET returns the stored body")
+
+    # GET of an absent name is 404.
+    r = _Fake("/state/never")
+    r.do_GET()
+    check(r._code == 404, "GET of an absent key returns 404")
+
+    # LOCK creates under LOCK_PREFIX; a 2nd LOCK is 423.
+    r = _Fake("/state/xen-xapi", b'{"ID":"a"}')
+    r.do_LOCK()
+    check(r._code == 200, "first LOCK returns 200")
+    check(store.get(expect_lock) == b'{"ID":"a"}', f"LOCK writes under {expect_lock}")
+    r = _Fake("/state/xen-xapi", b'{"ID":"b"}')
+    r.do_LOCK()
+    check(r._code == 423, "second LOCK returns 423 (held)")
+    check(r.wfile.getvalue() == b'{"ID":"a"}', "423 carries the held lock-info")
+
+    # UNLOCK clears it; lock can be re-taken.
+    r = _Fake("/state/xen-xapi")
+    r.do_UNLOCK()
+    check(expect_lock not in store, "UNLOCK clears the lock key")
+
+    # DELETE removes the state.
+    r = _Fake("/state/xen-xapi")
+    r.do_DELETE()
+    check(expect_state not in store, "DELETE removes the state key")
+
+    if fails:
+        print(f"selftest: {len(fails)} FAILURE(S)", file=sys.stderr)
+        return 1
+    print("selftest: ALL PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    if os.environ.get("STATE_BACKEND_SELFTEST"):
+        sys.exit(_selftest())
+    # Resolve endpoints only on the real server path (fail-loud if un-meshed).
+    ENDPOINTS = _resolve_endpoints()
+    print(
+        f"tofu-state-etcd: {BIND}:{PORT} -> etcd {','.join(ENDPOINTS)} "
+        f"(state={STATE_PREFIX} lock={LOCK_PREFIX})",
         flush=True,
     )
     ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()

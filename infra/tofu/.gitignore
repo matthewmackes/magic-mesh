@@ -10,6 +10,11 @@ env.sh
 *.auto.tfvars
 override.tf
 override.tf.json
+# DAR-8/DAR-33: the per-mesh backend address (control VM overlay IP) is GENERATED
+# into <root>.backend.hcl by gen-backend-config.sh / gen-tfvars.sh and passed to
+# `tofu init -backend-config=`. It is environment-specific (per mesh) — never
+# committed, so no host literal lands in git.
+*.backend.hcl
 # FARM-AUTOSCALE per-tick runtime state + lifecycle log (host/time-specific;
 # the autoscaler regenerates them — see install-helpers/farm-autoscale.sh).
 farm-autoscale.state

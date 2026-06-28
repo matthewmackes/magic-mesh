@@ -2,8 +2,20 @@
 # etcd-lib.sh — minimal etcd v3 HTTP-gateway client (curl + base64), shared by the
 # FARM-AUTO-3 queue pieces. No etcdctl needed on the build VMs — just curl/python3.
 # Source it: . etcd-lib.sh ; then use etcd_put / etcd_range_keys / etcd_claim / …
-# Endpoint: $MCNF_ETCD (default the control host).
-MCNF_ETCD="${MCNF_ETCD:-http://172.20.145.192:2379}"
+#
+# Endpoint (DAR-1b/DAR-17): resolved from the live quorum, NOT the dead LAN node
+# 172.20.145.192:2379. Order: explicit MCNF_ETCD env > the first endpoint in
+# /etc/mackesd/etcd-endpoints (via the shared resolver) > left UNSET (the first
+# curl then fails fast). The shared resolver lives one dir up in automation/lib.
+if [ -z "${MCNF_ETCD:-}" ]; then
+  _ETCD_LIB_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ -r "$_ETCD_LIB_HERE/../lib/etcd-endpoints.sh" ]; then
+    # shellcheck source=../lib/etcd-endpoints.sh
+    . "$_ETCD_LIB_HERE/../lib/etcd-endpoints.sh"
+    # Fail-soft: use the resolved first endpoint if present; never substitute .192.
+    MCNF_ETCD="$(mcnf_resolve_etcd_first 2>/dev/null || true)"
+  fi
+fi
 
 _b64()  { printf '%s' "$1" | base64 -w0; }
 _b64d() { base64 -d 2>/dev/null; }
