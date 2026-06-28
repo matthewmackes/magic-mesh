@@ -105,6 +105,9 @@ jobs:
       - name: No-crates.io-iced lint (CUT-3 — GUI is all-libcosmic)
         run: ./install-helpers/lint-no-cratesio-iced.sh
 
+      - name: Motion single-source lint (MOTION-AUDIT-2)
+        run: ./install-helpers/lint-motion-tokens.sh
+
       # NOTE on §1–§4 deeper checks: the Carbon single-source rule (§4) is
       # enforced by the mde-theme token tests above (a palette/metric value
       # changes only with a backing assertion); the substrate locks (§1–§3)
