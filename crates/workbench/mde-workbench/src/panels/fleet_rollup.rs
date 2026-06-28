@@ -13,10 +13,10 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use cosmic::iced::widget::{column, container, row, scrollable, stack, text};
-use cosmic::iced::{Length, Padding, Task};
+use cosmic::iced::widget::{button, column, container, row, scrollable, stack, text, Space};
+use cosmic::iced::{Alignment, Background, Border, Color, Length, Padding, Task};
 use cosmic::Element;
-use mde_theme::{EmptyState, Icon, LoadState, Palette};
+use mde_theme::{EmptyState, FontSize, Icon, LoadState, Palette, Rgba, TypeRole};
 use serde::Deserialize;
 
 use crate::controls::{variant_button, ButtonVariant};
@@ -74,6 +74,158 @@ pub fn health_severity(worst: &str) -> BadgeSeverity {
         "unreachable" | "degraded" => BadgeSeverity::Warning,
         _ => BadgeSeverity::Neutral,
     }
+}
+
+/// The design `dot(presence)` ramp — a peer's presence → its Carbon status hue.
+fn presence_color(palette: Palette, presence: &str) -> Rgba {
+    match presence {
+        "online" => palette.success,
+        "idle" => palette.warning,
+        "offline" => palette.danger,
+        _ => palette.text_muted,
+    }
+}
+
+/// The design `dot(health)` ramp — a peer's health → its Carbon status hue
+/// (also paints the node card's health top-border).
+fn health_color(palette: Palette, health: &str) -> Rgba {
+    match health {
+        "healthy" => palette.success,
+        "degraded" | "unreachable" => palette.warning,
+        "critical" => palette.danger,
+        _ => palette.text_muted,
+    }
+}
+
+/// A small filled status pip — the design's presence/health dots.
+fn dot<'a>(size: f32, color: Color) -> Element<'a, crate::Message> {
+    container(Space::new())
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .style(move |_theme| cosmic::iced::widget::container::Style {
+            background: Some(Background::Color(color)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: (size / 2.0).into(),
+            },
+            ..cosmic::iced::widget::container::Style::default()
+        })
+        .into()
+}
+
+/// One capability-tag chip — mono, uppercase, hairline border (design `n.tags`).
+fn tag_chip<'a>(label: &str, palette: Palette) -> Element<'a, crate::Message> {
+    container(
+        text(label.to_uppercase())
+            .size(10.0)
+            .colr(palette.text_muted.into_cosmic_color())
+            .font(cosmic::iced::Font {
+                family: cosmic::iced::font::Family::Name(TypeRole::Mono.family()),
+                ..cosmic::iced::Font::DEFAULT
+            }),
+    )
+    .padding(Padding::from([1u16, 6u16]))
+    .style(move |_theme| cosmic::iced::widget::container::Style {
+        border: Border {
+            color: palette.overlay.into_cosmic_color(),
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..cosmic::iced::widget::container::Style::default()
+    })
+    .into()
+}
+
+/// One node card (design left-column `rg.nodes`): a health top-border, a
+/// presence/self status dot, the host, a health pip, the overlay IP (mono), and
+/// the capability-tag chips. Clicking it drills into the Peers Front Door
+/// filtered to that host (W87). Real roster data, presentation only.
+fn node_card<'a>(r: &PeerRow, is_self: bool, palette: Palette) -> Element<'a, crate::Message> {
+    let sizes = FontSize::defaults();
+    let health = health_color(palette, &r.health);
+    let dot_color = if is_self {
+        // The design's `self` hue — Carbon Teal 30 (the one node-identity token
+        // the Palette doesn't name; read straight from the carbon ramp).
+        mde_theme::carbon::TEAL_30.into_cosmic_color()
+    } else {
+        presence_color(palette, &r.presence).into_cosmic_color()
+    };
+
+    // The design's `border-top:2px solid <health>`. Iced borders are uniform on
+    // all sides, so the health accent is a thin top strip inside the surface.
+    let top = container(Space::new())
+        .width(Length::Fill)
+        .height(Length::Fixed(2.0))
+        .style(move |_theme| cosmic::iced::widget::container::Style {
+            background: Some(Background::Color(health.into_cosmic_color())),
+            ..cosmic::iced::widget::container::Style::default()
+        });
+
+    let name_row = row![
+        dot(8.0, dot_color),
+        text(r.hostname.clone())
+            .size(sizes.body)
+            .colr(palette.text.into_cosmic_color())
+            .font(cosmic::iced::Font {
+                weight: cosmic::iced::font::Weight::Medium,
+                ..cosmic::iced::Font::DEFAULT
+            }),
+        Space::new().width(Length::Fill),
+        dot(7.0, health.into_cosmic_color()),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    let ip = if r.overlay_ip.is_empty() {
+        "—".to_string()
+    } else {
+        r.overlay_ip.clone()
+    };
+    let ip_text = text(ip)
+        .size(sizes.caption)
+        .colr(palette.text_muted.into_cosmic_color())
+        .font(cosmic::iced::Font {
+            family: cosmic::iced::font::Family::Name(TypeRole::Mono.family()),
+            ..cosmic::iced::Font::DEFAULT
+        });
+
+    let mut tags = row![].spacing(5);
+    for t in &r.tags {
+        tags = tags.push(tag_chip(t.as_str(), palette));
+    }
+
+    let inner = column![name_row, ip_text, tags]
+        .spacing(6)
+        .padding(Padding::from([10u16, 12u16]));
+
+    let card = container(column![top, inner])
+        .width(Length::Fill)
+        .style(move |_theme| cosmic::iced::widget::container::Style {
+            background: Some(Background::Color(palette.surface.into_cosmic_color())),
+            border: Border {
+                color: palette.border.into_cosmic_color(),
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..cosmic::iced::widget::container::Style::default()
+        });
+
+    button(card)
+        .width(Length::Fill)
+        .padding(Padding::from(0.0))
+        .on_press(crate::Message::DrillToPeers(r.hostname.clone()))
+        .sty(move |_theme, _status| button::Style {
+            background: None,
+            text_color: palette.text.into_cosmic_color(),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            ..button::Style::default()
+        })
+        .into()
 }
 
 /// MOTION-NET-3 — the old→new crossfade's `(outgoing_alpha, complete)` at `now`,
@@ -397,58 +549,145 @@ impl FleetRollupPanel {
         // full opacity. The crossfade swap on `Loaded` then dissolves old→new.
         let content_palette = palette.dimmed(load.content_alpha());
 
-        let mut cards = column![].spacing(10);
+        let sizes = FontSize::defaults();
+
+        // --- the fleet stat summary (design `fleetStats`, right of the title).
+        // All derived from the live roster — no fabricated values.
+        let online = self.rows.iter().filter(|r| r.presence != "offline").count();
+        let mut seen_tags: Vec<String> = Vec::new();
+        for r in &self.rows {
+            for t in &r.tags {
+                if !seen_tags.iter().any(|s| s == t) {
+                    seen_tags.push(t.clone());
+                }
+            }
+        }
+        let tags_summary = if seen_tags.is_empty() {
+            "—".to_string()
+        } else {
+            seen_tags.join(" · ")
+        };
+        let stats = [
+            ("Roster".to_string(), format!("{} nodes", self.rollup.total)),
+            ("Online".to_string(), online.to_string()),
+            ("Roles".to_string(), self.rollup.groups.len().to_string()),
+            ("Tags".to_string(), tags_summary),
+        ];
+        let mut stat_strip = row![].spacing(18).align_y(Alignment::Center);
+        for (label, value) in stats {
+            stat_strip = stat_strip.push(
+                column![
+                    text(label.to_uppercase())
+                        .size(sizes.caption)
+                        .colr(palette.text_muted.into_cosmic_color()),
+                    text(value)
+                        .size(sizes.body)
+                        .colr(palette.text.into_cosmic_color()),
+                ]
+                .spacing(2),
+            );
+        }
+
+        // MOTION-NET-3/-5 — the header never dims; it carries the title, the live
+        // stat summary, the non-blocking background-poll pill + the async-state
+        // badge (legible without motion), and Refresh.
+        let header = row![
+            text("Fleet Rollup")
+                .size(sizes.section)
+                .colr(palette.text.into_cosmic_color()),
+            cosmic::iced::widget::Space::new().width(Length::Fill),
+            stat_strip,
+            crate::panel_chrome::background_activity_indicator(load, palette),
+            load_state_indicator(load, palette),
+            refresh,
+        ]
+        .spacing(14)
+        .align_y(Alignment::Center);
+
+        // --- left column: role groups of node cards. The role structure +
+        // aggregate counts come from the canonical `fleet-status` rollup; each
+        // group's cards are drawn from the live roster rows for that role.
+        let mut groups_col = column![].spacing(14);
         for g in &self.rollup.groups {
+            let group_header = row![
+                text(g.role.to_uppercase())
+                    .size(sizes.caption)
+                    .colr(content_palette.text_muted.into_cosmic_color()),
+                text(format!(
+                    "· {} member{}",
+                    g.total,
+                    if g.total == 1 { "" } else { "s" }
+                ))
+                .size(sizes.caption)
+                .colr(content_palette.text_muted.into_cosmic_color()),
+                cosmic::iced::widget::Space::new().width(Length::Fill),
+                status_badge(
+                    g.worst_health.clone(),
+                    health_severity(&g.worst_health),
+                    content_palette,
+                ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            // PRESERVE the aggregate per-state breakdown (real rollup data).
             let breakdown = text(format!(
                 "{} healthy · {} degraded · {} unreachable · {} unknown",
                 g.healthy, g.degraded, g.unreachable, g.unknown
             ))
-            .size(12);
-            // W87 — drill-down: open the Peers Front Door filtered to this
-            // role. The directory filter matches the role token.
-            let drill = variant_button(
-                "View peers ›",
-                ButtonVariant::Ghost,
-                Some(crate::Message::DrillToPeers(g.role.clone())),
-                content_palette,
-            );
-            cards = cards.push(
-                container(
-                    row![
-                        column![
-                            text(format!(
-                                "{}  ({} member{})",
-                                g.role,
-                                g.total,
-                                if g.total == 1 { "" } else { "s" }
-                            ))
-                            .size(16),
-                            breakdown,
-                        ]
-                        .spacing(2),
-                        status_badge(
-                            g.worst_health.clone(),
-                            health_severity(&g.worst_health),
-                            content_palette
-                        ),
-                        cosmic::iced::widget::Space::new().width(Length::Fill),
-                        drill,
-                    ]
-                    .spacing(12)
-                    .align_y(cosmic::iced::Alignment::Center),
-                )
-                .padding(Padding::from(12)),
-            );
-        }
+            .size(sizes.caption)
+            .colr(content_palette.text_muted.into_cosmic_color());
 
-        // W81 — the live-map centerpiece: the same PD-7 force-graph the
-        // Peers panel + wallpaper render, fed by the directory + RTT cache.
-        // Sits above the role cards as the dashboard's focal point. (Node
-        // click pre-selects the peer; the cards' "View peers ›" navigates.)
-        let centerpiece: Element<'_, crate::Message> = if self.rows.is_empty() {
-            cosmic::iced::widget::Space::new()
-                .height(Length::Fixed(0.0))
-                .into()
+            // W87 — the design's two-up card grid for this role, from the roster.
+            let members: Vec<&PeerRow> = self
+                .rows
+                .iter()
+                .filter(|r| r.role.eq_ignore_ascii_case(&g.role))
+                .collect();
+            let mut grid = column![].spacing(10);
+            for pair in members.chunks(2) {
+                let mut card_row = row![].spacing(10).align_y(Alignment::Start);
+                for r in pair {
+                    card_row = card_row.push(node_card(
+                        r,
+                        r.hostname == self.self_hostname,
+                        content_palette,
+                    ));
+                }
+                if pair.len() == 1 {
+                    // Keep the surviving card on its left column (2-up grid).
+                    card_row =
+                        card_row.push(cosmic::iced::widget::Space::new().width(Length::Fill));
+                }
+                grid = grid.push(card_row);
+            }
+
+            groups_col = groups_col
+                .push(column![column![group_header, breakdown].spacing(4), grid].spacing(8));
+        }
+        let left: Element<'_, crate::Message> = scrollable(groups_col).height(Length::Fill).into();
+
+        // --- right column: the live path map centerpiece (W81). Same PD-7
+        // force-graph the Peers panel + wallpaper render, fed by the directory
+        // rows + the mesh-RTT cache; framed as the design's "Live Path Map" pane.
+        let map_label = container(
+            text("Live Path Map · RTT-weighted")
+                .size(sizes.caption)
+                .colr(content_palette.text_muted.into_cosmic_color()),
+        )
+        .padding(Padding::from([8u16, 12u16]))
+        .width(Length::Fill);
+        let map_canvas: Element<'_, crate::Message> = if self.rows.is_empty() {
+            container(
+                text("No live links yet")
+                    .size(sizes.body)
+                    .colr(content_palette.text_muted.into_cosmic_color()),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
         } else {
             // LIGHTHOUSE-7/9 — flag anchors by the same authoritative overlay-IP
             // signal the wallpaper + Peers Map use (role under-reports anchors on
@@ -493,40 +732,37 @@ impl FleetRollupPanel {
                     reduce_motion: true,
                 })
                 .width(Length::Fill)
-                .height(Length::Fixed(260.0))
+                .height(Length::Fill)
                 .into();
             cosmic::iced::widget::themer(None, canvas).into()
         };
+        let map: Element<'_, crate::Message> = container(stack![map_canvas, map_label])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_theme| cosmic::iced::widget::container::Style {
+                background: Some(Background::Color(
+                    content_palette.background.into_cosmic_color(),
+                )),
+                border: Border {
+                    color: content_palette.border.into_cosmic_color(),
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..cosmic::iced::widget::container::Style::default()
+            })
+            .into();
 
-        // MOTION-NET-3 — the header carries the canonical Refreshing indicator
-        // (icon + "Refreshing…", a non-motion cue) so a background refresh is
-        // legible even under reduce-motion. The header itself never dims — only
-        // the data below it does.
-        // MOTION-NET-5 — the dedicated NON-BLOCKING background-poll indicator: an
-        // "Updating…" pill that surfaces *only* while a background refresh runs over
-        // content that's still on screen, distinct from the full async-state badge
-        // (which also covers the blocking states). It's an inert empty element in
-        // every other state, so it costs nothing when the panel isn't polling.
-        let header = row![
-            text(format!("Fleet — {} node(s)", self.rollup.total)).size(20),
-            cosmic::iced::widget::Space::new().width(Length::Fill),
-            crate::panel_chrome::background_activity_indicator(load, palette),
-            load_state_indicator(load, palette),
-            refresh,
+        // The design's `1fr 1.25fr` split: role-card column · live map.
+        let body: Element<'_, crate::Message> = row![
+            container(left).width(Length::FillPortion(100)),
+            container(map).width(Length::FillPortion(125)),
         ]
-        .spacing(12)
-        .align_y(cosmic::iced::Alignment::Center);
-
-        // The live data section (centerpiece + role cards) — the part that dims
-        // while refreshing and crossfades on swap.
-        let content: Element<'_, crate::Message> =
-            column![centerpiece, scrollable(cards).height(Length::Fill),]
-                .spacing(16)
-                .width(Length::Fill)
-                .into();
+        .spacing(11)
+        .height(Length::Fill)
+        .into();
 
         panel_container(
-            column![header, self.crossfaded(content, palette)]
+            column![header, self.crossfaded(body, palette)]
                 .spacing(16)
                 .width(Length::Fill)
                 .into(),
