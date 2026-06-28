@@ -4429,6 +4429,62 @@ impl DatacenterPanel {
         }
         card = card.push(text(capacity).colr(palette.text_muted.into_cosmic_color()));
 
+        // UNIFY-12 — host utilization meters (the design's CPU/MEM bar pair). Both
+        // are REAL reported host metrics, presented as Carbon meter bars rather
+        // than synthetic figures: MEM% from `mem_total_mb` − `mem_free_mb`, and
+        // LOAD% the 1-minute load average per physical core (`load / cpu`, capped).
+        // Rendered only when the host reported the underlying metric.
+        let mem_pct: Option<u64> = {
+            let total: u64 = h.mem_total_mb.parse().unwrap_or(0);
+            let free: u64 = h.mem_free_mb.parse().unwrap_or(0);
+            if total > 0 {
+                let used = total.saturating_sub(free);
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                let pct = ((used as f64 / total as f64) * 100.0).round() as u64;
+                Some(pct.min(100))
+            } else {
+                None
+            }
+        };
+        let load_pct: Option<u64> = {
+            let cpu: f64 = h.cpu.parse().unwrap_or(0.0);
+            let load: f64 = h.load.parse().unwrap_or(0.0);
+            if cpu > 0.0 && !h.load.trim().is_empty() {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let pct = ((load / cpu) * 100.0).round().clamp(0.0, 100.0) as u64;
+                Some(pct)
+            } else {
+                None
+            }
+        };
+        if load_pct.is_some() || mem_pct.is_some() {
+            let mut meters = row![]
+                .spacing(f32::from(spacing::BASE[3]))
+                .width(Length::Fill);
+            if let Some(p) = load_pct {
+                meters = meters.push(
+                    container(host_meter_view("LOAD", p, palette.accent, palette))
+                        .width(Length::FillPortion(1)),
+                );
+            }
+            if let Some(p) = mem_pct {
+                meters = meters.push(
+                    container(host_meter_view(
+                        "MEM",
+                        p,
+                        mde_theme::carbon::BLUE_50,
+                        palette,
+                    ))
+                    .width(Length::FillPortion(1)),
+                );
+            }
+            card = card.push(meters);
+        }
+
         // Pool placement, when read. Renders the cached `action/dc/host-pool`
         // result; the "Pool" button (below) refreshes it.
         if let Some(p) = self.host_pool.get(&dom0) {
@@ -6832,28 +6888,42 @@ impl DatacenterPanel {
         match self.view_mode {
             ViewMode::Overview => {
                 let rollup = CapacityRollup::from_rows(&self.rows);
-                // Per-kind counts.
-                col = col.push(text("Resources by kind").size(f32::from(spacing::BASE[5])));
-                col = col.push(text(format!(
-                    "Hosts {} · VMs {} · Droplets {} · Storage {} · Networks {}",
-                    rollup.hosts, rollup.vms, rollup.droplets, rollup.srs, rollup.nets
-                )));
-                // Per-zone counts.
-                col = col.push(text("By zone").size(f32::from(spacing::BASE[5])));
-                col = col.push(text(format!(
-                    "Prod · DO {} · Dev · Xen {}",
-                    rollup.prod, rollup.dev
-                )));
-                // Summed host capacity.
-                col = col.push(text("Host capacity").size(f32::from(spacing::BASE[5])));
-                col = col.push(text(format!(
-                    "{} host(s) · {} vCPU total",
-                    rollup.hosts, rollup.total_cpu
-                )));
+                // UNIFY-12 — the design's dense 4-col capability KPI grid. Same
+                // rollup data as the old run-on text lines (per-kind counts,
+                // per-zone split, summed host vCPU), re-presented as Carbon KPI
+                // tiles so capacity reads at a glance. Presentation only — every
+                // value still comes straight off `CapacityRollup`.
+                col = col.push(text("Capacity").size(f32::from(spacing::BASE[5])));
+                col = col.push(kpi_grid_view(
+                    vec![
+                        ("Hosts".into(), rollup.hosts.to_string(), palette.success),
+                        ("VMs".into(), rollup.vms.to_string(), palette.text),
+                        (
+                            "Droplets".into(),
+                            rollup.droplets.to_string(),
+                            palette.accent,
+                        ),
+                        ("Storage".into(), rollup.srs.to_string(), palette.text),
+                        ("Networks".into(), rollup.nets.to_string(), palette.text),
+                        (
+                            "vCPU total".into(),
+                            rollup.total_cpu.to_string(),
+                            palette.accent,
+                        ),
+                        ("Prod · DO".into(), rollup.prod.to_string(), palette.accent),
+                        ("Dev · Xen".into(), rollup.dev.to_string(), palette.text),
+                    ],
+                    palette,
+                ));
                 if let Some(mem) = rollup.memory_readout() {
-                    col = col.push(text(format!("Memory: {mem}")));
+                    col = col.push(
+                        text(format!("Memory: {mem}")).colr(palette.text_muted.into_cosmic_color()),
+                    );
                 } else {
-                    col = col.push(text("Memory: no host metrics reported yet."));
+                    col = col.push(
+                        text("Memory: no host metrics reported yet.")
+                            .colr(palette.text_muted.into_cosmic_color()),
+                    );
                 }
                 // DATACENTER-9 — rolling-history sparklines: a block-glyph trend
                 // line per tracked series (resources / running / health-ok /
@@ -7622,6 +7692,151 @@ struct CardMotion<'a> {
     reduce_motion: bool,
 }
 
+/// UNIFY-12 — a 1 px Carbon **hairline divider**. A full-width, 1 px-tall strip in
+/// the `border` token, used to separate dense table rows (version matrix / Tofu
+/// run-log) the way the Unified Workbench design's `border-top` row rules do. Pure
+/// construction; mde-theme tokens only.
+fn hairline_view(palette: Palette) -> Element<'static, crate::Message> {
+    container(text(""))
+        .width(Length::Fill)
+        .height(Length::Fixed(1.0))
+        .style(move |_theme| container::Style {
+            background: Some(cosmic::iced::Background::Color(
+                palette.border.into_cosmic_color(),
+            )),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// UNIFY-12 — a dense Carbon **KPI cell**: a small uppercase muted label over a
+/// large value in the given semantic token color, on a `surface` tile with a
+/// hairline border and sharp (0-radius) corners. The building block of the
+/// Overview capability grid — the design's 4-col KPI band. Pure construction;
+/// mde-theme tokens only (the label reads `text_muted`, the value the caller's
+/// palette token, never raw hex).
+fn kpi_cell_view(
+    label: impl Into<String>,
+    value: impl Into<String>,
+    value_color: mde_theme::Rgba,
+    palette: Palette,
+) -> Element<'static, crate::Message> {
+    let sizes = mde_theme::FontSize::defaults();
+    let body = column![
+        text(label.into().to_uppercase())
+            .size(mde_theme::TypeRole::Caption.size_in(sizes))
+            .colr(palette.text_muted.into_cosmic_color()),
+        text(value.into())
+            .size(mde_theme::TypeRole::Heading.size_in(sizes))
+            .colr(value_color.into_cosmic_color()),
+    ]
+    .spacing(f32::from(spacing::BASE[0]));
+    container(body)
+        .padding(f32::from(spacing::BASE[2]))
+        .width(Length::Fill)
+        .style(move |_theme| container::Style {
+            background: Some(cosmic::iced::Background::Color(
+                palette.surface.into_cosmic_color(),
+            )),
+            border: cosmic::iced::Border {
+                color: palette.border.into_cosmic_color(),
+                width: 1.0,
+                radius: 0.0_f32.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// UNIFY-12 — arrange KPI cells into the design's dense capability band: rows of
+/// four equal-width [`kpi_cell_view`] tiles separated by a hairline gap. A short
+/// final row is left-aligned. Pure layout glue — mde-theme spacing tokens only.
+fn kpi_grid_view(
+    cells: Vec<(String, String, mde_theme::Rgba)>,
+    palette: Palette,
+) -> Element<'static, crate::Message> {
+    let mut grid = column![].spacing(f32::from(spacing::BASE[0]));
+    for chunk in cells.chunks(4) {
+        let mut line = row![].spacing(f32::from(spacing::BASE[0]));
+        for (label, value, color) in chunk {
+            line = line.push(kpi_cell_view(label.clone(), value.clone(), *color, palette));
+        }
+        grid = grid.push(line);
+    }
+    grid.into()
+}
+
+/// UNIFY-12 — a thin Carbon **meter bar**: a recessed `background` track with a
+/// `fill`-token bar sized to `pct` (0..=100). Matches the design's host CPU/MEM
+/// utilization bars. The fill/rest split uses `FillPortion`, skipping a zero-share
+/// cell so a 0 % or 100 % bar never asks the layout for a `FillPortion(0)`. Pure
+/// construction; mde-theme tokens only.
+fn meter_bar_view(
+    pct: u64,
+    fill: mde_theme::Rgba,
+    palette: Palette,
+) -> Element<'static, crate::Message> {
+    let pct = pct.min(100);
+    let filled = u16::try_from(pct).unwrap_or(100);
+    let rest = 100u16.saturating_sub(filled);
+    let h = f32::from(spacing::BASE[0]);
+    let mut bar = row![].width(Length::Fill);
+    if filled > 0 {
+        bar = bar.push(
+            container(text(""))
+                .height(Length::Fixed(h))
+                .width(Length::FillPortion(filled))
+                .style(move |_theme| container::Style {
+                    background: Some(cosmic::iced::Background::Color(fill.into_cosmic_color())),
+                    ..container::Style::default()
+                }),
+        );
+    }
+    if rest > 0 {
+        bar = bar.push(
+            container(text(""))
+                .height(Length::Fixed(h))
+                .width(Length::FillPortion(rest)),
+        );
+    }
+    container(bar)
+        .width(Length::Fill)
+        .style(move |_theme| container::Style {
+            background: Some(cosmic::iced::Background::Color(
+                palette.background.into_cosmic_color(),
+            )),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// UNIFY-12 — one labelled host utilization meter: a caption label over a thin
+/// [`meter_bar_view`], with the percentage as a trailing mono readout. The Hosts
+/// cards stack two of these (LOAD / MEM) to render the design's host bar pair.
+/// Pure construction; mde-theme tokens only.
+fn host_meter_view(
+    label: &str,
+    pct: u64,
+    fill: mde_theme::Rgba,
+    palette: Palette,
+) -> Element<'static, crate::Message> {
+    let sizes = mde_theme::FontSize::defaults();
+    let head = row![
+        text(label.to_string())
+            .size(mde_theme::TypeRole::Caption.size_in(sizes))
+            .colr(palette.text_muted.into_cosmic_color())
+            .width(Length::Fill),
+        text(format!("{pct}%"))
+            .size(mde_theme::TypeRole::Caption.size_in(sizes))
+            .font(cosmic::iced::Font::MONOSPACE)
+            .colr(palette.text.into_cosmic_color()),
+    ]
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+    column![head, meter_bar_view(pct, fill, palette)]
+        .spacing(f32::from(spacing::BASE[0]))
+        .into()
+}
+
 /// Arrange a list of resource cards into a responsive grid: rows of
 /// [`CARD_GRID_COLS`] cards, each card claiming an equal portion so the grid
 /// flexes with the panel width. A short final row is left-aligned (no phantom
@@ -8192,6 +8407,8 @@ fn recent_tofu_runs_view(
         return out;
     }
     for run in &runs {
+        // Hairline rule above each row — the design's run-log row rule.
+        out.push(hairline_view(palette));
         // Strip the `dc/tofu-` prefix so the verb reads cleanly (plan / apply /
         // destroy / state); fall back to the raw action if it doesn't match.
         let verb = run
@@ -8199,6 +8416,13 @@ fn recent_tofu_runs_view(
             .strip_prefix("dc/tofu-")
             .unwrap_or(&run.action)
             .to_string();
+        // UNIFY-12 — verb colored by kind (the design's run-log lane): apply →
+        // accent, destroy → danger, plan/state → primary text.
+        let verb_color = match verb.as_str() {
+            "apply" => palette.accent,
+            "destroy" => palette.danger,
+            _ => palette.text,
+        };
         // Status chip color tracks the outcome.
         let (chip_color, chip_text) = match run.status.as_str() {
             "ok" => (palette.success, "ok".to_string()),
@@ -8206,18 +8430,30 @@ fn recent_tofu_runs_view(
             "" => (palette.warning, "pending".to_string()),
             other => (palette.warning, other.to_string()),
         };
+        // The ULID is the run's durable identity — shown mono/muted as the design's
+        // run-id column (ULIDs are lexicographically time-ordered ⇒ also chronological).
+        let run_id = if run.ulid.is_empty() {
+            "—".to_string()
+        } else {
+            run.ulid.clone()
+        };
         let line = row![
             text(verb)
-                .colr(palette.text.into_cosmic_color())
+                .colr(verb_color.into_cosmic_color())
                 .width(Length::FillPortion(2)),
+            text(run_id)
+                .font(cosmic::iced::Font::MONOSPACE)
+                .colr(palette.text_muted.into_cosmic_color())
+                .width(Length::FillPortion(3)),
             text(chip_text)
                 .colr(chip_color.into_cosmic_color())
                 .width(Length::FillPortion(1)),
         ]
-        .spacing(f32::from(spacing::BASE[3]));
+        .spacing(f32::from(spacing::BASE[3]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
         out.push(
             container(line)
-                .padding(f32::from(spacing::BASE[2]))
+                .padding(f32::from(spacing::BASE[1]))
                 .width(Length::Fill)
                 .into(),
         );
@@ -8315,16 +8551,21 @@ fn version_matrix_view(
     palette: Palette,
 ) -> Vec<Element<'static, crate::Message>> {
     let mut out: Vec<Element<'static, crate::Message>> = Vec::new();
-    // Column header so the version / status columns read.
+    let sizes = mde_theme::FontSize::defaults();
+    // UNIFY-12 — dense Carbon table header: uppercase muted captions over each
+    // column so the version / state lanes read at a glance (the design's matrix).
     out.push(
         row![
-            text("Target")
+            text("TARGET")
+                .size(mde_theme::TypeRole::Caption.size_in(sizes))
                 .colr(palette.text_muted.into_cosmic_color())
                 .width(Length::FillPortion(2)),
-            text("Version")
+            text("VERSION")
+                .size(mde_theme::TypeRole::Caption.size_in(sizes))
                 .colr(palette.text_muted.into_cosmic_color())
                 .width(Length::FillPortion(2)),
-            text("State")
+            text("STATE")
+                .size(mde_theme::TypeRole::Caption.size_in(sizes))
                 .colr(palette.text_muted.into_cosmic_color())
                 .width(Length::FillPortion(1)),
         ]
@@ -8332,6 +8573,8 @@ fn version_matrix_view(
         .into(),
     );
     for vr in &matrix.rows {
+        // Hairline rule above each row — the design's table `border-top`.
+        out.push(hairline_view(palette));
         let (chip_color, chip_text) = match vr.status.as_str() {
             "ready" => (palette.success, "ready".to_string()),
             "pending" => (palette.warning, "pending".to_string()),
@@ -8344,21 +8587,24 @@ fn version_matrix_view(
                 },
             ),
         };
+        // Version in mono (an ID/metric column per the design's Roboto-Mono lane).
         let line = row![
             text(vr.target.clone())
                 .colr(palette.text.into_cosmic_color())
                 .width(Length::FillPortion(2)),
             text(vr.version.clone())
+                .font(cosmic::iced::Font::MONOSPACE)
                 .colr(palette.accent.into_cosmic_color())
                 .width(Length::FillPortion(2)),
             text(chip_text)
                 .colr(chip_color.into_cosmic_color())
                 .width(Length::FillPortion(1)),
         ]
-        .spacing(f32::from(spacing::BASE[3]));
+        .spacing(f32::from(spacing::BASE[3]))
+        .align_y(cosmic::iced::alignment::Vertical::Center);
         out.push(
             container(line)
-                .padding(f32::from(spacing::BASE[2]))
+                .padding(f32::from(spacing::BASE[1]))
                 .width(Length::Fill)
                 .into(),
         );
