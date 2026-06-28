@@ -19,13 +19,14 @@
 
 use std::time::Duration;
 
-use cosmic::iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
 use cosmic::iced::Task;
 use cosmic::iced::{Background, Border, Length, Padding};
 use cosmic::Element;
-use mde_theme::TypeRole;
+use mde_theme::{carbon, FontSize, FontWeight, Palette, Rgba, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
+use crate::status_strip::{mono_text, pip};
 
 /// One row of the directory reply, parsed leniently.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1610,488 +1611,63 @@ impl PeersPanel {
             Some(Ok(())) => {}
         }
 
-        // PEERS-DT — Search + Refresh toolbar (the old filter becomes the
-        // Carbon search input).
-        let filter_box = text_input("Search peers, roles, IPs, services…", &self.filter)
-            .on_input(|f| crate::Message::Peers(Message::FilterChanged(f)))
-            .padding(Padding::from([6u16, 10u16]))
-            .width(Length::Fill);
+        // UNIFY-9 — the Unified Workbench master-detail layout: a 262 px
+        // grouped filter list on the left and the peer/device detail (or the
+        // live map) on the right. Data, the map toggle, and selection state are
+        // all unchanged — this is presentation only.
+        let weights = FontWeight::defaults();
+        let left = self.peer_list_panel(palette, &sizes, &weights);
+        let right = self.detail_pane(palette, &sizes, &weights);
+        container(row![left, right].width(Length::Fill).height(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
 
-        // The peer-detail element (computed below) is rendered inline under the
-        // expanded row — see the table build after it.
+    /// UNIFY-9 — the left filter list (the design's 262 px column): a live
+    /// search box over presence-grouped peer rows (Online / Idle / Offline)
+    /// plus the paired-device group, each row a presence dot + host +
+    /// `role · ip`. Filter + selection wiring is unchanged.
+    fn peer_list_panel<'a>(
+        &'a self,
+        palette: Palette,
+        sizes: &FontSize,
+        weights: &FontWeight,
+    ) -> Element<'a, crate::Message> {
+        let search = container(crate::controls::styled_text_input(
+            "Filter by host, role, tag…",
+            &self.filter,
+            |f| crate::Message::Peers(Message::FilterChanged(f)),
+            palette,
+        ))
+        .padding(Padding::from([11u16, 13u16]))
+        .width(Length::Fill);
 
-        // Right: the detail pane. A selected device (L6) takes priority
-        // and renders the device card; otherwise the peer detail.
-        let selected_device = self
-            .selected_device
-            .as_deref()
-            .and_then(|id| self.devices.iter().find(|d| d.id == id));
-        let detail: Element<'_, crate::Message> = if let Some(d) = selected_device {
-            device_detail(d, &self.op_result, palette)
-        } else {
-            match self
-                .rows
-                .iter()
-                .find(|r| Some(r.hostname.as_str()) == self.selected.as_deref())
-            {
-                None => text("Select a peer.")
-                    .colr(palette.text_muted.into_cosmic_color())
-                    .into(),
-                Some(r) => {
-                    let header = row![
-                        text(&r.hostname)
-                            .size(20)
-                            .colr(palette.text.into_cosmic_color()),
-                        Space::new().width(Length::Fixed(10.0)),
-                        badge(
-                            if r.role.is_empty() {
-                                "role: -"
-                            } else {
-                                &r.role
-                            },
-                            palette
-                        ),
-                        Space::new().width(Length::Fill),
-                        refresh_btn(palette),
-                    ]
-                    .align_y(cosmic::iced::alignment::Vertical::Center);
-                    // L1 — capability-tag chips; honest absence when none.
-                    let tags_row: Element<'_, crate::Message> = if r.tags.is_empty() {
-                        Space::new().height(Length::Fixed(0.0)).into()
-                    } else {
-                        let mut chips = row![text("Tags")
-                            .size(11)
-                            .colr(palette.text_muted.into_cosmic_color())]
-                        .spacing(6)
-                        .align_y(cosmic::iced::alignment::Vertical::Center);
-                        for t in &r.tags {
-                            chips = chips.push(badge(t.as_str(), palette));
-                        }
-                        chips.into()
-                    };
-                    // PD-5 — the op toolbar, descriptor- + presence-gated.
-                    let mut ops = row![].spacing(8);
-                    // PD-5 — Call (voice): rings an online, non-self peer via
-                    // the voice HUD's Bus dial subscriber.
-                    let can_call = r.presence != "offline" && r.hostname != self.self_hostname;
-                    ops = ops.push(crate::controls::variant_button(
-                        "Call",
-                        crate::controls::ButtonVariant::Secondary,
-                        can_call.then(|| {
-                            crate::Message::Peers(Message::CallClicked(r.hostname.clone()))
-                        }),
-                        palette,
-                    ));
-                    for (offered, proto) in [
-                        (r.ssh, crate::launcher::Protocol::Ssh),
-                        (r.rdp, crate::launcher::Protocol::Rdp),
-                        (r.vnc, crate::launcher::Protocol::Vnc),
-                    ] {
-                        let target = r.overlay_ip.clone();
-                        let target = if target.is_empty() {
-                            r.hostname.clone()
-                        } else {
-                            target
-                        };
-                        let live = op_enabled(r, offered, &self.self_hostname)
-                            .then(|| crate::Message::Peers(Message::Op(proto, target)));
-                        ops = ops.push(crate::controls::variant_button(
-                            proto.label(),
-                            crate::controls::ButtonVariant::Secondary,
-                            live,
-                            palette,
-                        ));
-                    }
-                    let strip: Element<'_, crate::Message> = if self.op_result.is_empty() {
-                        Space::new().height(Length::Fixed(0.0)).into()
-                    } else {
-                        text(self.op_result.clone())
-                            .size(12)
-                            .colr(palette.text_muted.into_cosmic_color())
-                            .into()
-                    };
-                    // PD-12 — Wake is the one op an offline peer offers (L4).
-                    let wake: Element<'_, crate::Message> =
-                        match (r.presence.as_str(), r.lan_macs.first()) {
-                            ("offline", Some(mac)) => crate::controls::variant_button(
-                                "Wake",
-                                crate::controls::ButtonVariant::Primary,
-                                Some(crate::Message::Peers(Message::WakeClicked {
-                                    host: r.hostname.clone(),
-                                    mac: mac.clone(),
-                                })),
-                                palette,
-                            ),
-                            _ => Space::new().height(Length::Fixed(0.0)).into(),
-                        };
-                    // PD-9 — Apply now appears only for a behind peer (Q16).
-                    let nudge: Element<'_, crate::Message> = if r.currency == "behind" {
-                        crate::controls::variant_button(
-                            "Apply now",
-                            crate::controls::ButtonVariant::Primary,
-                            Some(crate::Message::Peers(Message::NudgeClicked(
-                                r.hostname.clone(),
-                            ))),
-                            palette,
-                        )
-                    } else {
-                        Space::new().height(Length::Fixed(0.0)).into()
-                    };
-                    let facts = column![
-                        fact("Presence", &r.presence, palette),
-                        fact("Health", &r.health, palette),
-                        fact(
-                            "Overlay IP",
-                            if r.overlay_ip.is_empty() {
-                                "-"
-                            } else {
-                                &r.overlay_ip
-                            },
-                            palette
-                        ),
-                        fact(
-                            "Version",
-                            if r.version.is_empty() {
-                                "-"
-                            } else {
-                                &r.version
-                            },
-                            palette
-                        ),
-                        fact("Revision", &r.currency, palette),
-                        nudge,
-                    ]
-                    .spacing(4);
-                    // PD-8 — live Netdata block (L14): four sparklines
-                    // while the 2s tick feeds; honest absence otherwise.
-                    let mut metrics_col = column![row![
-                        text("Live metrics")
-                            .size(13)
-                            .colr(palette.text.into_cosmic_color()),
-                        Space::new().width(Length::Fixed(10.0)),
-                        if !r.overlay_ip.is_empty() && r.presence != "offline" {
-                            crate::controls::variant_button(
-                                "Metrics ↗",
-                                crate::controls::ButtonVariant::Secondary,
-                                Some(crate::Message::Peers(Message::OpenDashboard(
-                                    r.overlay_ip.clone(),
-                                ))),
-                                palette,
-                            )
-                        } else {
-                            Space::new().height(Length::Fixed(0.0)).into()
-                        },
-                    ]
-                    .align_y(cosmic::iced::alignment::Vertical::Center)]
-                    .spacing(4);
-                    match (&self.metrics, &self.metrics_err) {
-                        (Some(m), _) => {
-                            for (label, series) in [
-                                ("CPU %", &m.cpu),
-                                ("Load", &m.load),
-                                ("Net", &m.net),
-                                ("Disk I/O", &m.disk),
-                            ] {
-                                let last = series.last().copied().unwrap_or(0.0);
-                                metrics_col = metrics_col.push(
-                                    row![
-                                        text(label)
-                                            .size(12)
-                                            .width(Length::Fixed(100.0))
-                                            .colr(palette.text_muted.into_cosmic_color()),
-                                        text(sparkline(series))
-                                            .size(12)
-                                            .colr(palette.accent.into_cosmic_color()),
-                                        text(format!(" {last:.1}"))
-                                            .size(12)
-                                            .colr(palette.text.into_cosmic_color()),
-                                    ]
-                                    .align_y(cosmic::iced::alignment::Vertical::Center),
-                                );
-                            }
-                        }
-                        (None, Some(e)) => {
-                            metrics_col = metrics_col.push(
-                                text(format!("Netdata not answering on this peer: {e}"))
-                                    .size(12)
-                                    .colr(palette.text_muted.into_cosmic_color()),
-                            );
-                        }
-                        (None, None) => {
-                            metrics_col = metrics_col.push(
-                                text(if r.presence == "offline" {
-                                    "Peer offline — no live metrics."
-                                } else {
-                                    "Waiting for the first sample…"
-                                })
-                                .size(12)
-                                .colr(palette.text_muted.into_cosmic_color()),
-                            );
-                        }
-                    }
-
-                    let mut services = column![text("Services provided")
-                        .size(13)
-                        .colr(palette.text.into_cosmic_color())]
-                    .spacing(4);
-                    // PD-11 — lifecycle rows: start one-click; stop/
-                    // restart armed-confirm (L16). Self excluded (local
-                    // service control lives in Mesh Services).
-                    if r.hostname != self.self_hostname {
-                        for (kind, list) in [("container", &r.containers), ("vm", &r.vms)] {
-                            for (name, state) in list {
-                                let running = state == "running";
-                                let mut ops_row = row![text(format!("{kind}: {name} ({state})"))
-                                    .size(12)
-                                    .colr(palette.text_muted.into_cosmic_color())]
-                                .spacing(8)
-                                .align_y(cosmic::iced::alignment::Vertical::Center);
-                                let mk = |op: &str| {
-                                    crate::Message::Peers(Message::Lifecycle {
-                                        host: r.hostname.clone(),
-                                        kind: kind.to_string(),
-                                        name: name.clone(),
-                                        op: op.to_string(),
-                                    })
-                                };
-                                if running {
-                                    let armed = |op: &str| {
-                                        self.pending_confirm
-                                            == Some((
-                                                r.hostname.clone(),
-                                                kind.to_string(),
-                                                name.clone(),
-                                                op.to_string(),
-                                            ))
-                                    };
-                                    ops_row = ops_row.push(crate::controls::variant_button(
-                                        if armed("stop") {
-                                            "Confirm stop"
-                                        } else {
-                                            "Stop"
-                                        },
-                                        crate::controls::ButtonVariant::Secondary,
-                                        Some(mk("stop")),
-                                        palette,
-                                    ));
-                                    ops_row = ops_row.push(crate::controls::variant_button(
-                                        if armed("restart") {
-                                            "Confirm restart"
-                                        } else {
-                                            "Restart"
-                                        },
-                                        crate::controls::ButtonVariant::Secondary,
-                                        Some(mk("restart")),
-                                        palette,
-                                    ));
-                                } else {
-                                    ops_row = ops_row.push(crate::controls::variant_button(
-                                        "Start",
-                                        crate::controls::ButtonVariant::Secondary,
-                                        Some(mk("start")),
-                                        palette,
-                                    ));
-                                }
-                                services = services.push(ops_row);
-                            }
-                        }
-                    }
-                    if r.services.is_empty() {
-                        services = services.push(
-                            text("Nothing published (peer pre-PD-2, or nothing offered).")
-                                .size(12)
-                                .colr(palette.text_muted.into_cosmic_color()),
-                        );
-                    } else {
-                        for s in &r.services {
-                            services = services.push(
-                                text(format!("• {s}"))
-                                    .size(12)
-                                    .colr(palette.text_muted.into_cosmic_color()),
-                            );
-                        }
-                    }
-                    column![
-                        header,
-                        tags_row,
-                        ops,
-                        wake,
-                        strip,
-                        facts,
-                        metrics_col,
-                        services
-                    ]
-                    .spacing(16)
-                    .into()
-                }
-            }
-        };
-        // PEERS-DT — flat sortable Carbon data table. The selected peer/device
-        // row expands inline (Carbon expandable row) and renders `detail` below
-        // it — the single detail mechanism (replaces the old side pane).
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let w_name = Length::FillPortion(3);
-        let w_status = Length::Fixed(86.0);
-        let w_role = Length::Fixed(104.0);
-        let w_ip = Length::Fixed(120.0);
-        let w_lat = Length::Fixed(80.0);
-        let w_svc = Length::Fixed(80.0);
-        let w_seen = Length::Fixed(86.0);
-        let vcenter = cosmic::iced::alignment::Vertical::Center;
-
-        let header = container(
-            row![
-                Space::new().width(Length::Fixed(20.0)),
-                sort_header(SortColumn::Name, self.sort, self.sort_asc, w_name, palette),
-                sort_header(
-                    SortColumn::Status,
-                    self.sort,
-                    self.sort_asc,
-                    w_status,
-                    palette
-                ),
-                sort_header(SortColumn::Role, self.sort, self.sort_asc, w_role, palette),
-                sort_header(
-                    SortColumn::OverlayIp,
-                    self.sort,
-                    self.sort_asc,
-                    w_ip,
-                    palette
-                ),
-                sort_header(
-                    SortColumn::Latency,
-                    self.sort,
-                    self.sort_asc,
-                    w_lat,
-                    palette
-                ),
-                sort_header(
-                    SortColumn::Services,
-                    self.sort,
-                    self.sort_asc,
-                    w_svc,
-                    palette
-                ),
-                sort_header(
-                    SortColumn::LastSeen,
-                    self.sort,
-                    self.sort_asc,
-                    w_seen,
-                    palette
-                ),
-            ]
-            .spacing(8)
-            .align_y(vcenter),
-        )
-        .padding(Padding::from([2u16, 6u16]));
-
-        let mut detail_slot = Some(detail);
-        let mut table = column![header].spacing(0);
-
-        let row_style = move |bg: mde_theme::Rgba| {
-            move |_t: &cosmic::Theme, _s: cosmic::iced::widget::button::Status| {
-                cosmic::iced::widget::button::Style {
-                    snap: false,
-                    background: Some(Background::Color(bg.into_cosmic_color())),
-                    text_color: palette.text.into_cosmic_color(),
-                    icon_color: None,
-                    border_radius: 0.0.into(),
-                    border_width: 0.0,
-                    border_color: cosmic::iced::Color::TRANSPARENT,
-                    border: Border {
-                        color: cosmic::iced::Color::TRANSPARENT,
-                        width: 0.0,
-                        radius: 0.0.into(),
-                    },
-                    shadow: cosmic::iced::Shadow::default(),
-                }
-            }
-        };
-
+        // Presence buckets over the filtered + sorted rows (the data logic is
+        // unchanged — `sorted_rows` still applies the filter + sort).
+        let (mut online, mut idle, mut offline) = (Vec::new(), Vec::new(), Vec::new());
         for r in self.sorted_rows() {
-            let expanded = self.selected.as_deref() == Some(r.hostname.as_str());
-            let chevron = if expanded { "▾" } else { "▸" };
-            let lat = self
-                .rtt
-                .get(&r.hostname)
-                .copied()
-                .flatten()
-                .map(|ms| format!("{ms:.0} ms"))
-                .unwrap_or_else(|| "—".to_string());
-            let role = if r.role.is_empty() {
-                "—".to_string()
-            } else {
-                r.role.clone()
-            };
-            let ip = if r.overlay_ip.is_empty() {
-                "—".to_string()
-            } else {
-                r.overlay_ip.clone()
-            };
-            let name_label = if r.hostname == self.self_hostname {
-                format!("{} · you", r.hostname)
-            } else {
-                r.hostname.clone()
-            };
-            let row_bg = if expanded {
-                palette.raised
-            } else {
-                palette.surface
-            };
-            let cells = row![
-                text(chevron)
-                    .size(12)
-                    .width(Length::Fixed(20.0))
-                    .colr(palette.text_muted.into_cosmic_color()),
-                text(name_label)
-                    .size(13)
-                    .width(w_name)
-                    .colr(palette.text.into_cosmic_color()),
-                container(status_tag(&r.presence, palette)).width(w_status),
-                text(role)
-                    .size(12)
-                    .width(w_role)
-                    .colr(palette.text_muted.into_cosmic_color()),
-                text(ip)
-                    .size(12)
-                    .width(w_ip)
-                    .colr(palette.text_muted.into_cosmic_color()),
-                text(lat)
-                    .size(12)
-                    .width(w_lat)
-                    .colr(palette.text_muted.into_cosmic_color()),
-                text(r.services.len().to_string())
-                    .size(12)
-                    .width(w_svc)
-                    .colr(palette.text_muted.into_cosmic_color()),
-                text(humanize_last_seen(r.last_seen_ms, now_ms))
-                    .size(12)
-                    .width(w_seen)
-                    .colr(palette.text_muted.into_cosmic_color()),
-            ]
-            .spacing(8)
-            .align_y(vcenter);
-            let host = r.hostname.clone();
-            table = table.push(
-                button(cells)
-                    .width(Length::Fill)
-                    .padding(Padding::from([6u16, 6u16]))
-                    .sty(row_style(row_bg))
-                    .on_press(crate::Message::Peers(Message::Select(host))),
-            );
-            if expanded {
-                if let Some(d) = detail_slot.take() {
-                    table = table.push(container(d).padding(Padding::from([8u16, 28u16])));
-                }
+            match r.presence.as_str() {
+                "online" => online.push(r),
+                "idle" => idle.push(r),
+                _ => offline.push(r),
             }
         }
 
-        // PD-3/L6/Q6 — paired KDE-Connect devices share the table; a device row
-        // expands to the KDC actions (device_detail, carried by `detail`).
-        let device_rows: Vec<&DeviceRow> = self
+        let mut list = column![].width(Length::Fill);
+        for (label, rows) in [("ONLINE", online), ("IDLE", idle), ("OFFLINE", offline)] {
+            if rows.is_empty() {
+                continue;
+            }
+            list = list.push(list_group_header(label, rows.len(), palette, sizes));
+            for r in rows {
+                let selected = self.selected.as_deref() == Some(r.hostname.as_str());
+                list = list.push(self.peer_list_row(r, selected, palette, sizes, weights));
+            }
+        }
+
+        // PD-3/L6 — the paired KDE-Connect devices as their own group.
+        let devices: Vec<&DeviceRow> = self
             .devices
             .iter()
             .filter(|d| {
@@ -2099,195 +1675,736 @@ impl PeersPanel {
                     || d.name.to_lowercase().contains(&self.filter.to_lowercase())
             })
             .collect();
-        if !device_rows.is_empty() {
-            table = table.push(
-                container(
-                    text("Devices")
-                        .size(11)
-                        .colr(palette.text_muted.into_cosmic_color()),
-                )
-                .padding(Padding::from([8u16, 6u16])),
-            );
-            for d in device_rows {
-                let expanded = self.selected_device.as_deref() == Some(d.id.as_str());
-                let chevron = if expanded { "▾" } else { "▸" };
-                let presence = if d.online { "online" } else { "offline" };
-                let batt = d
-                    .battery
-                    .map(|b| format!("{b}%"))
-                    .unwrap_or_else(|| "—".to_string());
-                let row_bg = if expanded {
-                    palette.raised
-                } else {
-                    palette.surface
-                };
-                let cells = row![
-                    text(chevron)
-                        .size(12)
-                        .width(Length::Fixed(20.0))
-                        .colr(palette.text_muted.into_cosmic_color()),
-                    text(d.name.clone())
-                        .size(13)
-                        .width(w_name)
-                        .colr(palette.text.into_cosmic_color()),
-                    container(status_tag(presence, palette)).width(w_status),
-                    text("device")
-                        .size(12)
-                        .width(w_role)
-                        .colr(palette.text_muted.into_cosmic_color()),
-                    text("—")
-                        .size(12)
-                        .width(w_ip)
-                        .colr(palette.text_muted.into_cosmic_color()),
-                    text("—")
-                        .size(12)
-                        .width(w_lat)
-                        .colr(palette.text_muted.into_cosmic_color()),
-                    text(batt)
-                        .size(12)
-                        .width(w_svc)
-                        .colr(palette.text_muted.into_cosmic_color()),
-                    text("—")
-                        .size(12)
-                        .width(w_seen)
-                        .colr(palette.text_muted.into_cosmic_color()),
-                ]
-                .spacing(8)
-                .align_y(vcenter);
-                let id = d.id.clone();
-                table = table.push(
-                    button(cells)
-                        .width(Length::Fill)
-                        .padding(Padding::from([6u16, 6u16]))
-                        .sty(row_style(row_bg))
-                        .on_press(crate::Message::Peers(Message::SelectDevice(id))),
-                );
-                if expanded {
-                    if let Some(dt) = detail_slot.take() {
-                        table = table.push(container(dt).padding(Padding::from([8u16, 28u16])));
-                    }
-                }
+        if !devices.is_empty() {
+            list = list.push(list_group_header("DEVICES", devices.len(), palette, sizes));
+            for d in devices {
+                let selected = self.selected_device.as_deref() == Some(d.id.as_str());
+                list = list.push(device_list_row(d, selected, palette, sizes, weights));
             }
         }
 
-        let right = container(scrollable(table))
+        let body = column![
+            search,
+            divider(palette),
+            scrollable(list).height(Length::Fill)
+        ]
+        .height(Length::Fill);
+
+        container(body)
+            .width(Length::Fixed(262.0))
+            .height(Length::Fill)
+            .sty(move |_| container::Style {
+                snap: false,
+                icon_color: None,
+                background: Some(Background::Color(palette.background.into_cosmic_color())),
+                border: Border {
+                    color: palette.border.into_cosmic_color(),
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                shadow: cosmic::iced::Shadow::default(),
+                text_color: Some(palette.text.into_cosmic_color()),
+            })
+            .into()
+    }
+
+    /// UNIFY-9 — one peer row in the left list: presence dot (teal for self) +
+    /// host + `role · overlay-ip` sub-line. Click selects (unchanged wiring).
+    fn peer_list_row<'a>(
+        &self,
+        r: &PeerRow,
+        selected: bool,
+        palette: Palette,
+        sizes: &FontSize,
+        weights: &FontWeight,
+    ) -> Element<'a, crate::Message> {
+        let is_self = r.hostname == self.self_hostname;
+        let dot = if is_self {
+            carbon::TEAL_30
+        } else {
+            presence_color(&r.presence)
+        };
+        let host_label = if is_self {
+            format!("{} · you", r.hostname)
+        } else {
+            r.hostname.clone()
+        };
+        let ip = if r.overlay_ip.is_empty() {
+            "—"
+        } else {
+            r.overlay_ip.as_str()
+        };
+        let role = if r.role.is_empty() {
+            "peer"
+        } else {
+            r.role.as_str()
+        };
+        let inner = row![
+            selected_bar(selected, palette),
+            Space::new().width(Length::Fixed(8.0)),
+            pip(dot),
+            Space::new().width(Length::Fixed(9.0)),
+            column![
+                text(host_label)
+                    .size(TypeRole::Body.size_in(*sizes))
+                    .colr(palette.text.into_cosmic_color()),
+                mono_text(format!("{role} · {ip}"), TypeRole::Caption, sizes, weights)
+                    .colr(palette.text_muted.into_cosmic_color()),
+            ]
+            .spacing(1)
+            .width(Length::Fill),
+        ]
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        let content = container(inner)
+            .padding(Padding::from([8u16, 11u16]))
+            .width(Length::Fill);
+        list_row(
+            content,
+            selected,
+            palette,
+            crate::Message::Peers(Message::Select(r.hostname.clone())),
+        )
+    }
+
+    /// UNIFY-9 — the right detail pane: the identity header (host + role +
+    /// List / Live-map toggle) over the list detail, the device card, or the
+    /// live map. Selection + map-toggle state is unchanged.
+    fn detail_pane<'a>(
+        &'a self,
+        palette: Palette,
+        sizes: &FontSize,
+        weights: &FontWeight,
+    ) -> Element<'a, crate::Message> {
+        let selected_device = self
+            .selected_device
+            .as_deref()
+            .and_then(|id| self.devices.iter().find(|d| d.id == id));
+        let selected_peer = self
+            .rows
+            .iter()
+            .find(|r| Some(r.hostname.as_str()) == self.selected.as_deref());
+
+        let (title, role, role_col): (String, String, Rgba) = if let Some(d) = selected_device {
+            (
+                d.name.clone(),
+                "KDE Connect device".to_string(),
+                carbon::TEAL_30,
+            )
+        } else if let Some(r) = selected_peer {
+            let col = if r.hostname == self.self_hostname {
+                carbon::TEAL_30
+            } else if r.role.to_lowercase().contains("lighthouse") {
+                carbon::BLUE_50
+            } else {
+                palette.text_muted
+            };
+            let role = if r.role.is_empty() {
+                "peer".to_string()
+            } else {
+                r.role.clone()
+            };
+            (r.hostname.clone(), role, col)
+        } else {
+            (
+                "Select a peer".to_string(),
+                String::new(),
+                palette.text_muted,
+            )
+        };
+
+        let header = self.detail_header(title, role, role_col, palette, sizes);
+
+        let body: Element<'a, crate::Message> = if self.map_view {
+            self.map_body(palette, sizes, weights)
+        } else if let Some(d) = selected_device {
+            device_detail(d, &self.op_result, palette, sizes, weights)
+        } else if let Some(r) = selected_peer {
+            self.peer_detail_body(r, palette, sizes, weights)
+        } else {
+            container(
+                text("Select a peer from the list to inspect it.")
+                    .size(TypeRole::Body.size_in(*sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            )
+            .padding(Padding::from([16u16, 16u16]))
+            .into()
+        };
+
+        container(column![header, body].height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding(Padding::from([0u16, 4u16]));
+            .into()
+    }
 
-        // PD-7 — the Map view replaces the master-detail body; a node
-        // click selects the peer and returns to the detail view.
-        let toggle = crate::controls::variant_button(
+    /// UNIFY-9 — the detail header: host title + role label + the List /
+    /// Live-map segmented toggle. The toggle emits the unchanged `ToggleMap`
+    /// (only the inactive segment is clickable, so it just flips the view).
+    fn detail_header<'a>(
+        &self,
+        title: String,
+        role: String,
+        role_col: Rgba,
+        palette: Palette,
+        sizes: &FontSize,
+    ) -> Element<'a, crate::Message> {
+        let list_btn = crate::controls::variant_button(
+            "List",
             if self.map_view {
-                "List view"
+                crate::controls::ButtonVariant::Secondary
             } else {
-                "Map view"
+                crate::controls::ButtonVariant::Primary
             },
-            crate::controls::ButtonVariant::Secondary,
-            Some(crate::Message::Peers(Message::ToggleMap)),
+            self.map_view
+                .then(|| crate::Message::Peers(Message::ToggleMap)),
             palette,
         );
-        if self.map_view {
-            // LIGHTHOUSE-7/9 — flag anchors by the same authoritative
-            // overlay-IP-membership signal the wallpaper uses (role under-reports
-            // anchors that run Server tier), so the Map view gives them the same
-            // beacon-hero treatment. One snapshot read per map build.
-            let lh_ips = super::peers_map::lighthouse_overlay_ips();
-            // MESHMAP-4 (W7) — the per-peer underlay path (direct vs relayed),
-            // and an overlay-IP→hostname map so a relayed path's `relay_via` IP
-            // resolves to the relaying node we draw the bend through.
-            let paths = super::peers_map::read_latency_paths();
-            let ip_to_host: std::collections::HashMap<&str, &str> = self
-                .rows
-                .iter()
-                .filter(|r| !r.overlay_ip.is_empty())
-                .map(|r| (r.overlay_ip.as_str(), r.hostname.as_str()))
-                .collect();
-            let nodes: Vec<super::peers_map::MapNode> = self
-                .rows
-                .iter()
-                .map(|r| super::peers_map::MapNode {
-                    hostname: r.hostname.clone(),
-                    presence: r.presence.clone(),
-                    rtt_ms: self.rtt.get(&r.hostname).copied().flatten(),
-                    is_self: r.hostname == self.self_hostname,
-                    lighthouse: super::peers_map::is_lighthouse(&r.role, &r.overlay_ip, &lh_ips),
-                    // MESHMAP-6 — the per-link tx feeds the self→peer stream...
-                    flow: self.flows.get(&r.hostname).map(|f| f.tx).unwrap_or(0.0),
-                    // ...and the per-link rx feeds the peer→self stream (0 under
-                    // the proxy → reverse stream honestly stays off).
-                    flow_rx: self.flows.get(&r.hostname).map(|f| f.rx).unwrap_or(0.0),
-                    // W7 — resolve the relay overlay-IP to its node hostname (so
-                    // the draw pass can bend through that node's position); a
-                    // direct/overlay path or an unknown relay IP leaves it None.
-                    relay_via: paths.get(&r.hostname).and_then(|pi| {
-                        pi.relay_via
-                            .as_deref()
-                            .and_then(|ip| ip_to_host.get(ip).map(|h| (*h).to_string()))
-                    }),
-                })
-                .collect();
-            // MESHMAP-1 (W4) — geographic placement when any node carries a
-            // region token (falls back to the force layout per-node otherwise).
-            let geo = super::peers_map::any_geo_known(&nodes);
-            let positions = super::peers_map::geo_layout(&nodes);
-            // MESHMAP-3 (W3) — self's own throughput drives the self→peer stream.
-            // MESHMAP-6 — `flows` is now per-link `LinkFlow`; self's loopback
-            // proxy sample carries it on `tx`.
-            let self_flow = self
-                .flows
-                .get(&self.self_hostname)
-                .map(|f| f.tx)
-                .unwrap_or(0.0);
-            // `MapProgram` implements `canvas::Program` for the stock
-            // `cosmic::iced::Theme`, so the canvas is a stock-themed element;
-            // `themer` bridges it into the surrounding `cosmic::Theme` tree.
-            // The program ignores the passed theme (it paints from `palette`),
-            // so `None` (Base default) carries no styling decision.
-            let canvas_stock: cosmic::iced::Element<'_, crate::Message, cosmic::iced::Theme> =
-                cosmic::iced::widget::canvas(super::peers_map::MapProgram {
-                    nodes,
-                    positions,
-                    palette,
-                    flow_phase: self.flow_phase,
-                    self_flow,
-                    geo,
-                    // MESHMAP-5 (W8) — reduce-motion → static colored edges.
-                    reduce_motion: crate::live_theme::reduce_motion(),
-                })
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
-            let canvas: Element<'_, crate::Message> =
-                cosmic::iced::widget::themer(None, canvas_stock).into();
-            // PD-7/L19-20 — the trace card overlays to the right when an edge
-            // is selected; otherwise the canvas fills the body.
-            let map_body: Element<'_, crate::Message> = match self.traced_edge.as_deref() {
-                Some(host) => row![
-                    container(canvas).width(Length::FillPortion(2)),
-                    container(self.trace_card(host, palette))
-                        .width(Length::FillPortion(1))
-                        .padding(Padding::from([0u16, 8u16])),
-                ]
-                .spacing(12)
-                .height(Length::Fill)
-                .into(),
-                None => canvas,
+        let map_btn = crate::controls::variant_button(
+            "Live map",
+            if self.map_view {
+                crate::controls::ButtonVariant::Primary
+            } else {
+                crate::controls::ButtonVariant::Secondary
+            },
+            (!self.map_view).then(|| crate::Message::Peers(Message::ToggleMap)),
+            palette,
+        );
+        let role_el: Element<'a, crate::Message> = if role.is_empty() {
+            Space::new().width(Length::Fixed(0.0)).into()
+        } else {
+            text(role)
+                .size(TypeRole::Caption.size_in(*sizes))
+                .colr(role_col.into_cosmic_color())
+                .into()
+        };
+        let header_row = row![
+            text(title)
+                .size(TypeRole::Subheading.size_in(*sizes))
+                .colr(palette.text.into_cosmic_color()),
+            Space::new().width(Length::Fixed(10.0)),
+            role_el,
+            Space::new().width(Length::Fill),
+            list_btn,
+            map_btn,
+        ]
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        column![
+            container(header_row)
+                .padding(Padding::from([11u16, 16u16]))
+                .width(Length::Fill),
+            divider(palette),
+        ]
+        .into()
+    }
+
+    /// UNIFY-9 — the peer list-view detail body: the op toolbar, the live op
+    /// result strip, capability-tag chips, the 4-up stat tiles, the
+    /// CPU/NET/LOAD/DISK sparkline row (real Netdata series), and the Services
+    /// Provided cards. Every op + the PD-11 lifecycle controls + the PD-8
+    /// metrics states are preserved; only the layout/styling changed.
+    fn peer_detail_body<'a>(
+        &'a self,
+        r: &'a PeerRow,
+        palette: Palette,
+        sizes: &FontSize,
+        weights: &FontWeight,
+    ) -> Element<'a, crate::Message> {
+        // --- op toolbar (descriptor- + presence-gated; wiring unchanged) ---
+        let mut ops = row![].spacing(7);
+        let can_call = r.presence != "offline" && r.hostname != self.self_hostname;
+        ops = ops.push(crate::controls::variant_button(
+            "Call",
+            crate::controls::ButtonVariant::Secondary,
+            can_call.then(|| crate::Message::Peers(Message::CallClicked(r.hostname.clone()))),
+            palette,
+        ));
+        for (offered, proto) in [
+            (r.ssh, crate::launcher::Protocol::Ssh),
+            (r.rdp, crate::launcher::Protocol::Rdp),
+            (r.vnc, crate::launcher::Protocol::Vnc),
+        ] {
+            let target = if r.overlay_ip.is_empty() {
+                r.hostname.clone()
+            } else {
+                r.overlay_ip.clone()
             };
-            let hint = text("Click a node to inspect a peer · click an edge for its trace")
-                .size(11)
-                .colr(palette.text_muted.into_cosmic_color());
-            let body = column![toggle, hint, map_body]
-                .spacing(8)
-                .height(Length::Fill);
-            return shell(title, body.into(), palette);
+            let live = op_enabled(r, offered, &self.self_hostname)
+                .then(|| crate::Message::Peers(Message::Op(proto, target)));
+            ops = ops.push(crate::controls::variant_button(
+                proto.label(),
+                crate::controls::ButtonVariant::Secondary,
+                live,
+                palette,
+            ));
         }
-        // PEERS-DT — toolbar (Search + Refresh + Map toggle) over the table.
-        let toolbar = row![filter_box, refresh_btn(palette), toggle]
-            .spacing(8)
+        if r.currency == "behind" {
+            ops = ops.push(crate::controls::variant_button(
+                "Apply now",
+                crate::controls::ButtonVariant::Primary,
+                Some(crate::Message::Peers(Message::NudgeClicked(
+                    r.hostname.clone(),
+                ))),
+                palette,
+            ));
+        }
+        if r.presence == "offline" {
+            if let Some(mac) = r.lan_macs.first() {
+                ops = ops.push(crate::controls::variant_button(
+                    "Wake",
+                    crate::controls::ButtonVariant::Primary,
+                    Some(crate::Message::Peers(Message::WakeClicked {
+                        host: r.hostname.clone(),
+                        mac: mac.clone(),
+                    })),
+                    palette,
+                ));
+            }
+        }
+        if !r.overlay_ip.is_empty() && r.presence != "offline" {
+            ops = ops.push(crate::controls::variant_button(
+                "Metrics ↗",
+                crate::controls::ButtonVariant::Secondary,
+                Some(crate::Message::Peers(Message::OpenDashboard(
+                    r.overlay_ip.clone(),
+                ))),
+                palette,
+            ));
+        }
+
+        // --- live op-result strip (PD-5) ---
+        let strip: Element<'a, crate::Message> = if self.op_result.is_empty() {
+            Space::new().height(Length::Fixed(0.0)).into()
+        } else {
+            result_strip(&self.op_result, palette, sizes, weights)
+        };
+
+        // --- L1 capability-tag chips ---
+        let tags: Element<'a, crate::Message> = if r.tags.is_empty() {
+            Space::new().height(Length::Fixed(0.0)).into()
+        } else {
+            let mut chips = row![text("Tags")
+                .size(TypeRole::Caption.size_in(*sizes))
+                .colr(palette.text_muted.into_cosmic_color())]
+            .spacing(6)
             .align_y(cosmic::iced::alignment::Vertical::Center);
-        let body = column![toolbar, right].spacing(8).height(Length::Fill);
-        shell(title, body.into(), palette)
+            for t in &r.tags {
+                chips = chips.push(badge(t.as_str(), palette));
+            }
+            chips.into()
+        };
+
+        // --- 4-up stat tiles (presence / health / revision / version) ---
+        let version = if r.version.is_empty() {
+            "—".to_string()
+        } else {
+            r.version.clone()
+        };
+        let tiles = row![
+            stat_tile(
+                "PRESENCE",
+                cap(&r.presence),
+                presence_color(&r.presence),
+                palette,
+                sizes
+            ),
+            stat_tile(
+                "HEALTH",
+                cap(&r.health),
+                health_color(&r.health),
+                palette,
+                sizes
+            ),
+            stat_tile(
+                "REVISION",
+                cap(&r.currency),
+                currency_color(&r.currency),
+                palette,
+                sizes
+            ),
+            stat_tile("VERSION", version, palette.accent, palette, sizes),
+        ]
+        .spacing(8);
+
+        // --- CPU/NET/LOAD/DISK sparkline row (real PD-8 Netdata series) ---
+        let spark_row: Element<'a, crate::Message> = match (&self.metrics, &self.metrics_err) {
+            (Some(m), _) => row![
+                spark_card(
+                    "CPU",
+                    fmt_last(&m.cpu),
+                    &m.cpu,
+                    carbon::BLUE_50,
+                    palette,
+                    sizes,
+                    weights
+                ),
+                spark_card(
+                    "NET",
+                    fmt_last(&m.net),
+                    &m.net,
+                    carbon::GREEN_40,
+                    palette,
+                    sizes,
+                    weights
+                ),
+                spark_card(
+                    "LOAD",
+                    fmt_last(&m.load),
+                    &m.load,
+                    carbon::YELLOW_30,
+                    palette,
+                    sizes,
+                    weights
+                ),
+                spark_card(
+                    "DISK",
+                    fmt_last(&m.disk),
+                    &m.disk,
+                    carbon::GRAY_50,
+                    palette,
+                    sizes,
+                    weights
+                ),
+            ]
+            .spacing(12)
+            .into(),
+            (None, Some(e)) => flat_panel(
+                text(format!("Netdata not answering on this peer: {e}"))
+                    .size(TypeRole::Caption.size_in(*sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+                palette,
+                [11u16, 13u16],
+            ),
+            (None, None) => flat_panel(
+                text(if r.presence == "offline" {
+                    "Peer offline — no live metrics."
+                } else {
+                    "Waiting for the first metrics sample…"
+                })
+                .size(TypeRole::Caption.size_in(*sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+                palette,
+                [11u16, 13u16],
+            ),
+        };
+
+        // --- Services Provided (Podman + KVM/Media) ---
+        let services_header = text("SERVICES PROVIDED")
+            .size(TypeRole::Caption.size_in(*sizes))
+            .colr(palette.text_muted.into_cosmic_color());
+        let services = row![
+            self.podman_card(r, palette, sizes, weights),
+            self.kvm_card(r, palette, sizes, weights),
+        ]
+        .spacing(12);
+
+        let content = column![
+            ops,
+            strip,
+            tags,
+            tiles,
+            spark_row,
+            services_header,
+            services
+        ]
+        .spacing(11)
+        .width(Length::Fill);
+        scrollable(
+            container(content)
+                .padding(Padding::from([16u16, 16u16]))
+                .width(Length::Fill),
+        )
+        .height(Length::Fill)
+        .into()
+    }
+
+    /// UNIFY-9 — the Podman services card: the peer's containers with their
+    /// PD-11 lifecycle controls (start one-click; stop/restart armed-confirm).
+    fn podman_card<'a>(
+        &'a self,
+        r: &'a PeerRow,
+        palette: Palette,
+        sizes: &FontSize,
+        weights: &FontWeight,
+    ) -> Element<'a, crate::Message> {
+        let mut col = column![text("Podman")
+            .size(TypeRole::Caption.size_in(*sizes))
+            .colr(palette.text_muted.into_cosmic_color())]
+        .spacing(2);
+        if r.containers.is_empty() {
+            col = col.push(
+                text("No containers published.")
+                    .size(TypeRole::Caption.size_in(*sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+        } else {
+            for (name, state) in &r.containers {
+                col = col.push(self.service_row(
+                    r,
+                    "container",
+                    name.as_str(),
+                    state.as_str(),
+                    palette,
+                    sizes,
+                    weights,
+                ));
+            }
+        }
+        flat_panel(col, palette, [12u16, 13u16])
+    }
+
+    /// UNIFY-9 — the KVM Guests + Media card: libvirt guests (with the PD-11
+    /// lifecycle controls) and the published media endpoints (PD-2).
+    fn kvm_card<'a>(
+        &'a self,
+        r: &'a PeerRow,
+        palette: Palette,
+        sizes: &FontSize,
+        weights: &FontWeight,
+    ) -> Element<'a, crate::Message> {
+        let mut col = column![text("KVM Guests")
+            .size(TypeRole::Caption.size_in(*sizes))
+            .colr(palette.text_muted.into_cosmic_color())]
+        .spacing(2);
+        if r.vms.is_empty() {
+            col = col.push(
+                text("No guests.")
+                    .size(TypeRole::Caption.size_in(*sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+        } else {
+            for (name, state) in &r.vms {
+                col = col.push(self.service_row(
+                    r,
+                    "vm",
+                    name.as_str(),
+                    state.as_str(),
+                    palette,
+                    sizes,
+                    weights,
+                ));
+            }
+        }
+        let media: Vec<&String> = r
+            .services
+            .iter()
+            .filter(|s| s.starts_with("media:"))
+            .collect();
+        if !media.is_empty() {
+            col = col.push(
+                text("Media")
+                    .size(TypeRole::Caption.size_in(*sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            );
+            for m in media {
+                let label = m
+                    .strip_prefix("media:")
+                    .map(str::trim)
+                    .unwrap_or(m.as_str());
+                col = col.push(
+                    container(
+                        mono_text(label.to_string(), TypeRole::Caption, sizes, weights)
+                            .colr(palette.text.into_cosmic_color()),
+                    )
+                    .padding(Padding::from([5u16, 0u16]))
+                    .width(Length::Fill),
+                );
+            }
+        }
+        flat_panel(col, palette, [12u16, 13u16])
+    }
+
+    /// UNIFY-9 — one service row (container or guest): a state dot + mono name
+    /// + state, with the PD-11 lifecycle button(s). Self is excluded (local
+    /// service control lives in Mesh Services). Wiring is unchanged.
+    fn service_row<'a>(
+        &'a self,
+        r: &'a PeerRow,
+        kind: &'a str,
+        name: &'a str,
+        state: &'a str,
+        palette: Palette,
+        sizes: &FontSize,
+        weights: &FontWeight,
+    ) -> Element<'a, crate::Message> {
+        let running = state == "running";
+        let mut rrow = row![
+            pip(lifecycle_color(state)),
+            Space::new().width(Length::Fixed(9.0)),
+            column![
+                mono_text(name.to_string(), TypeRole::Mono, sizes, weights)
+                    .colr(palette.text.into_cosmic_color()),
+                mono_text(state.to_string(), TypeRole::Caption, sizes, weights)
+                    .colr(palette.text_muted.into_cosmic_color()),
+            ]
+            .spacing(1)
+            .width(Length::Fill),
+        ]
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        if r.hostname != self.self_hostname {
+            let mk = |op: &str| {
+                crate::Message::Peers(Message::Lifecycle {
+                    host: r.hostname.clone(),
+                    kind: kind.to_string(),
+                    name: name.to_string(),
+                    op: op.to_string(),
+                })
+            };
+            if running {
+                let armed = |op: &str| {
+                    self.pending_confirm
+                        == Some((
+                            r.hostname.clone(),
+                            kind.to_string(),
+                            name.to_string(),
+                            op.to_string(),
+                        ))
+                };
+                rrow = rrow.push(crate::controls::variant_button(
+                    if armed("stop") {
+                        "Confirm stop"
+                    } else {
+                        "Stop"
+                    },
+                    crate::controls::ButtonVariant::Secondary,
+                    Some(mk("stop")),
+                    palette,
+                ));
+                rrow = rrow.push(crate::controls::variant_button(
+                    if armed("restart") {
+                        "Confirm restart"
+                    } else {
+                        "Restart"
+                    },
+                    crate::controls::ButtonVariant::Secondary,
+                    Some(mk("restart")),
+                    palette,
+                ));
+            } else {
+                rrow = rrow.push(crate::controls::variant_button(
+                    "Start",
+                    crate::controls::ButtonVariant::Secondary,
+                    Some(mk("start")),
+                    palette,
+                ));
+            }
+        }
+        container(rrow)
+            .padding(Padding::from([6u16, 0u16]))
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// UNIFY-9 — the live-map body (PD-7): the real mesh canvas (with the trace
+    /// card overlay when an edge is open) plus the legend. Unchanged map data,
+    /// flow, and trace wiring — only the surrounding chrome moved into the
+    /// shared detail header.
+    fn map_body<'a>(
+        &'a self,
+        palette: Palette,
+        sizes: &FontSize,
+        weights: &FontWeight,
+    ) -> Element<'a, crate::Message> {
+        let lh_ips = super::peers_map::lighthouse_overlay_ips();
+        let paths = super::peers_map::read_latency_paths();
+        let ip_to_host: std::collections::HashMap<&str, &str> = self
+            .rows
+            .iter()
+            .filter(|r| !r.overlay_ip.is_empty())
+            .map(|r| (r.overlay_ip.as_str(), r.hostname.as_str()))
+            .collect();
+        let nodes: Vec<super::peers_map::MapNode> = self
+            .rows
+            .iter()
+            .map(|r| super::peers_map::MapNode {
+                hostname: r.hostname.clone(),
+                presence: r.presence.clone(),
+                rtt_ms: self.rtt.get(&r.hostname).copied().flatten(),
+                is_self: r.hostname == self.self_hostname,
+                lighthouse: super::peers_map::is_lighthouse(&r.role, &r.overlay_ip, &lh_ips),
+                flow: self.flows.get(&r.hostname).map(|f| f.tx).unwrap_or(0.0),
+                flow_rx: self.flows.get(&r.hostname).map(|f| f.rx).unwrap_or(0.0),
+                relay_via: paths.get(&r.hostname).and_then(|pi| {
+                    pi.relay_via
+                        .as_deref()
+                        .and_then(|ip| ip_to_host.get(ip).map(|h| (*h).to_string()))
+                }),
+            })
+            .collect();
+        let geo = super::peers_map::any_geo_known(&nodes);
+        let positions = super::peers_map::geo_layout(&nodes);
+        let self_flow = self
+            .flows
+            .get(&self.self_hostname)
+            .map(|f| f.tx)
+            .unwrap_or(0.0);
+        let canvas_stock: cosmic::iced::Element<'_, crate::Message, cosmic::iced::Theme> =
+            cosmic::iced::widget::canvas(super::peers_map::MapProgram {
+                nodes,
+                positions,
+                palette,
+                flow_phase: self.flow_phase,
+                self_flow,
+                geo,
+                reduce_motion: crate::live_theme::reduce_motion(),
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        let canvas: Element<'_, crate::Message> =
+            cosmic::iced::widget::themer(None, canvas_stock).into();
+        let map_inner: Element<'a, crate::Message> = match self.traced_edge.as_deref() {
+            Some(host) => row![
+                container(canvas).width(Length::FillPortion(2)),
+                container(self.trace_card(host, palette))
+                    .width(Length::FillPortion(1))
+                    .padding(Padding::from([0u16, 8u16])),
+            ]
+            .spacing(12)
+            .height(Length::Fill)
+            .into(),
+            None => canvas,
+        };
+        let canvas_box = container(map_inner)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(Padding::from([1u16, 1u16]))
+            .sty(move |_| container::Style {
+                snap: false,
+                icon_color: None,
+                background: Some(Background::Color(palette.background.into_cosmic_color())),
+                border: Border {
+                    color: palette.border.into_cosmic_color(),
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                shadow: cosmic::iced::Shadow::default(),
+                text_color: Some(palette.text.into_cosmic_color()),
+            });
+        let legend = row![
+            legend_bar(palette.accent),
+            Space::new().width(Length::Fixed(6.0)),
+            mono_text("direct", TypeRole::Caption, sizes, weights)
+                .colr(palette.text_muted.into_cosmic_color()),
+            Space::new().width(Length::Fixed(16.0)),
+            legend_bar(palette.overlay),
+            Space::new().width(Length::Fixed(6.0)),
+            mono_text("via relay", TypeRole::Caption, sizes, weights)
+                .colr(palette.text_muted.into_cosmic_color()),
+            Space::new().width(Length::Fixed(16.0)),
+            pip(carbon::TEAL_30),
+            Space::new().width(Length::Fixed(6.0)),
+            mono_text("this node", TypeRole::Caption, sizes, weights)
+                .colr(palette.text_muted.into_cosmic_color()),
+        ]
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+        column![
+            container(canvas_box)
+                .padding(Padding::from([8u16, 16u16]))
+                .width(Length::Fill)
+                .height(Length::Fill),
+            container(legend).padding(Padding::from([8u16, 16u16])),
+        ]
+        .height(Length::Fill)
+        .into()
     }
 
     /// PD-7/L19-20 — the augmented trace card for the self→`host` edge:
@@ -2477,23 +2594,17 @@ impl PeersPanel {
     }
 }
 
-/// PD-3/L6 — the device detail card: identity + presence/battery facts,
-/// Ring + Send-file (the live Connect verbs), and a jump to the KDC hub
-/// (the Connected Devices panel) for pairing + richer plugins.
+/// PD-3/L6 — the device detail card body: the live Connect ops (Ring, Send
+/// file, open the KDC hub) over the op-result strip and the presence/battery
+/// tiles. Identity now lives in the shared detail header (UNIFY-9), so this is
+/// the body only. Ring / Send-file wiring is unchanged.
 fn device_detail<'a>(
     d: &'a DeviceRow,
-    op_result: &str,
-    palette: mde_theme::Palette,
+    op_result: &'a str,
+    palette: Palette,
+    sizes: &FontSize,
+    weights: &FontWeight,
 ) -> Element<'a, crate::Message> {
-    let header = row![
-        text(&d.name)
-            .size(20)
-            .colr(palette.text.into_cosmic_color()),
-        Space::new().width(Length::Fixed(10.0)),
-        badge("KDE Connect", palette),
-    ]
-    .align_y(cosmic::iced::alignment::Vertical::Center);
-    // Ring is live only for an online device (offline phones can't ring).
     let ring = crate::controls::variant_button(
         "Ring",
         crate::controls::ButtonVariant::Secondary,
@@ -2525,70 +2636,399 @@ fn device_detail<'a>(
         }),
         palette,
     );
-    let ops = row![ring, send, hub].spacing(8);
-    let strip: Element<'_, crate::Message> = if op_result.is_empty() {
+    let ops = row![ring, send, hub].spacing(7);
+    let strip: Element<'a, crate::Message> = if op_result.is_empty() {
         Space::new().height(Length::Fixed(0.0)).into()
     } else {
-        text(op_result.to_string())
-            .size(12)
-            .colr(palette.text_muted.into_cosmic_color())
-            .into()
+        result_strip(op_result, palette, sizes, weights)
+    };
+    let presence = if d.online { "online" } else { "offline" };
+    let battery = d
+        .battery
+        .map(|b| format!("{b}%"))
+        .unwrap_or_else(|| "—".to_string());
+    let tiles = row![
+        stat_tile(
+            "PRESENCE",
+            cap(presence),
+            presence_color(presence),
+            palette,
+            sizes
+        ),
+        stat_tile("BATTERY", battery, palette.accent, palette, sizes),
+    ]
+    .spacing(8);
+    let content = column![ops, strip, tiles].spacing(11).width(Length::Fill);
+    scrollable(
+        container(content)
+            .padding(Padding::from([16u16, 16u16]))
+            .width(Length::Fill),
+    )
+    .height(Length::Fill)
+    .into()
+}
+
+/// UNIFY-9 — a flat Carbon surface tile/card: square corners + a 1 px hairline
+/// border on `palette.surface`. The design's dense panels are flat; `card()`'s
+/// rounded + lifted treatment would fight that spec, so this is the local flat
+/// variant styled from the same tokens.
+fn flat_panel<'a>(
+    body: impl Into<Element<'a, crate::Message>>,
+    palette: Palette,
+    pad: [u16; 2],
+) -> Element<'a, crate::Message> {
+    container(body)
+        .width(Length::Fill)
+        .padding(Padding::from(pad))
+        .sty(move |_| container::Style {
+            snap: false,
+            icon_color: None,
+            background: Some(Background::Color(palette.surface.into_cosmic_color())),
+            border: Border {
+                color: palette.border.into_cosmic_color(),
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            shadow: cosmic::iced::Shadow::default(),
+            text_color: Some(palette.text.into_cosmic_color()),
+        })
+        .into()
+}
+
+/// UNIFY-9 — one stat tile: an uppercase caption label over a status dot +
+/// value (the design's 4-up presence/health/revision/version row).
+fn stat_tile<'a>(
+    label: &str,
+    value: String,
+    dot: Rgba,
+    palette: Palette,
+    sizes: &FontSize,
+) -> Element<'a, crate::Message> {
+    let body = column![
+        text(label.to_string())
+            .size(TypeRole::Caption.size_in(*sizes))
+            .colr(palette.text_muted.into_cosmic_color()),
+        row![
+            pip(dot),
+            Space::new().width(Length::Fixed(7.0)),
+            text(value)
+                .size(TypeRole::Body.size_in(*sizes))
+                .colr(palette.text.into_cosmic_color()),
+        ]
+        .align_y(cosmic::iced::alignment::Vertical::Center),
+    ]
+    .spacing(6);
+    flat_panel(body, palette, [11u16, 13u16])
+}
+
+/// UNIFY-9 — one sparkline card: caption label + current value (mono) over the
+/// unicode sparkline of the real Netdata series, tinted by the metric token.
+fn spark_card<'a>(
+    label: &str,
+    value: String,
+    series: &[f64],
+    color: Rgba,
+    palette: Palette,
+    sizes: &FontSize,
+    weights: &FontWeight,
+) -> Element<'a, crate::Message> {
+    let header = row![
+        text(label.to_string())
+            .size(TypeRole::Caption.size_in(*sizes))
+            .colr(palette.text_muted.into_cosmic_color()),
+        Space::new().width(Length::Fill),
+        mono_text(value, TypeRole::Mono, sizes, weights).colr(palette.text.into_cosmic_color()),
+    ]
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+    let spark = mono_text(sparkline(series), TypeRole::Mono, sizes, weights)
+        .colr(color.into_cosmic_color());
+    flat_panel(column![header, spark].spacing(6), palette, [11u16, 13u16])
+}
+
+/// UNIFY-9 — a left-list group header: uppercase label + the group count.
+fn list_group_header<'a>(
+    label: &str,
+    count: usize,
+    palette: Palette,
+    sizes: &FontSize,
+) -> Element<'a, crate::Message> {
+    container(
+        row![
+            text(label.to_string())
+                .size(TypeRole::Caption.size_in(*sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+            Space::new().width(Length::Fill),
+            text(count.to_string())
+                .size(TypeRole::Caption.size_in(*sizes))
+                .colr(palette.text_muted.into_cosmic_color()),
+        ]
+        .align_y(cosmic::iced::alignment::Vertical::Center),
+    )
+    .padding(Padding::from([8u16, 14u16]))
+    .width(Length::Fill)
+    .into()
+}
+
+/// PD-3/L6 — one paired-device row in the left list (presence dot + name +
+/// `KDE Connect · battery`). Click selects the device (unchanged wiring).
+fn device_list_row<'a>(
+    d: &DeviceRow,
+    selected: bool,
+    palette: Palette,
+    sizes: &FontSize,
+    weights: &FontWeight,
+) -> Element<'a, crate::Message> {
+    let dot = if d.online {
+        carbon::GREEN_40
+    } else {
+        carbon::RED_50
     };
     let battery = d
         .battery
         .map(|b| format!("{b}%"))
-        .unwrap_or_else(|| "-".to_string());
-    // Battery carries an owned String, so it builds its own row (the
-    // `fact` helper borrows its value for the element lifetime).
-    let battery_row = row![
-        text("Battery")
-            .size(12)
-            .width(Length::Fixed(100.0))
+        .unwrap_or_else(|| "—".to_string());
+    let inner = row![
+        selected_bar(selected, palette),
+        Space::new().width(Length::Fixed(8.0)),
+        pip(dot),
+        Space::new().width(Length::Fixed(9.0)),
+        column![
+            text(d.name.clone())
+                .size(TypeRole::Body.size_in(*sizes))
+                .colr(palette.text.into_cosmic_color()),
+            mono_text(
+                format!("KDE Connect · {battery}"),
+                TypeRole::Caption,
+                sizes,
+                weights
+            )
             .colr(palette.text_muted.into_cosmic_color()),
-        text(battery)
-            .size(12)
-            .colr(palette.text.into_cosmic_color()),
-    ];
-    let facts = column![
-        fact(
-            "Presence",
-            if d.online { "online" } else { "offline" },
-            palette
-        ),
-        battery_row,
+        ]
+        .spacing(1)
+        .width(Length::Fill),
     ]
-    .spacing(4);
-    column![header, ops, strip, facts].spacing(16).into()
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+    let content = container(inner)
+        .padding(Padding::from([8u16, 11u16]))
+        .width(Length::Fill);
+    list_row(
+        content,
+        selected,
+        palette,
+        crate::Message::Peers(Message::SelectDevice(d.id.clone())),
+    )
 }
 
-/// PEERS-DT — a colored Carbon status tag (Online/Idle/Offline) for the Status
-/// column. Color comes from the live palette (§4 tokens), never raw hex.
-fn status_tag(presence: &str, palette: mde_theme::Palette) -> Element<'static, crate::Message> {
-    let (label, color) = match presence {
-        "online" => ("Online", palette.success),
-        "idle" => ("Idle", palette.warning),
-        _ => ("Offline", palette.text_muted),
-    };
-    container(text(label).size(11).colr(color.into_cosmic_color()))
-        .padding(Padding::from([1u16, 8u16]))
-        .style(move |_| cosmic::iced::widget::container::Style {
-            snap: false,
-            background: Some(Background::Color(cosmic::iced::Color {
-                a: 0.14,
-                ..color.into_cosmic_color()
-            })),
-            text_color: Some(color.into_cosmic_color()),
-            border: Border {
-                color: cosmic::iced::Color {
-                    a: 0.35,
-                    ..color.into_cosmic_color()
+/// UNIFY-9 — wrap a list row's content in the clickable button + selection /
+/// hover background (selected = raised, hover = surface).
+fn list_row<'a>(
+    content: impl Into<Element<'a, crate::Message>>,
+    selected: bool,
+    palette: Palette,
+    msg: crate::Message,
+) -> Element<'a, crate::Message> {
+    button(content)
+        .width(Length::Fill)
+        .padding(Padding::from([0u16, 0u16]))
+        .on_press(msg)
+        .sty(move |_t, status| {
+            let bg = if selected {
+                palette.raised.into_cosmic_color()
+            } else if matches!(status, cosmic::iced::widget::button::Status::Hovered) {
+                palette.surface.into_cosmic_color()
+            } else {
+                cosmic::iced::Color::TRANSPARENT
+            };
+            cosmic::iced::widget::button::Style {
+                snap: false,
+                background: Some(Background::Color(bg)),
+                text_color: palette.text.into_cosmic_color(),
+                icon_color: None,
+                border_radius: 0.0.into(),
+                border_width: 0.0,
+                border_color: cosmic::iced::Color::TRANSPARENT,
+                border: Border {
+                    color: cosmic::iced::Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 0.0.into(),
                 },
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            ..container::Style::default()
+                shadow: cosmic::iced::Shadow::default(),
+            }
         })
         .into()
+}
+
+/// UNIFY-9 — the 3 px left selection rule (accent when selected, else an
+/// invisible spacer so the row indent stays constant).
+fn selected_bar<'a>(selected: bool, palette: Palette) -> Element<'a, crate::Message> {
+    let bg = if selected {
+        Some(Background::Color(palette.accent.into_cosmic_color()))
+    } else {
+        None
+    };
+    container(
+        Space::new()
+            .width(Length::Fixed(3.0))
+            .height(Length::Fixed(22.0)),
+    )
+    .sty(move |_| container::Style {
+        snap: false,
+        icon_color: None,
+        background: bg,
+        border: Border {
+            color: cosmic::iced::Color::TRANSPARENT,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
+        shadow: cosmic::iced::Shadow::default(),
+        text_color: None,
+    })
+    .into()
+}
+
+/// UNIFY-9 — a 1 px full-width hairline divider in the border token.
+fn divider<'a>(palette: Palette) -> Element<'a, crate::Message> {
+    container(Space::new().height(Length::Fixed(1.0)).width(Length::Fill))
+        .sty(move |_| container::Style {
+            snap: false,
+            icon_color: None,
+            background: Some(Background::Color(palette.border.into_cosmic_color())),
+            border: Border {
+                color: cosmic::iced::Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            shadow: cosmic::iced::Shadow::default(),
+            text_color: None,
+        })
+        .into()
+}
+
+/// UNIFY-9 — a short legend rule (the map's direct/relay key swatch).
+fn legend_bar<'a>(color: Rgba) -> Element<'a, crate::Message> {
+    container(
+        Space::new()
+            .width(Length::Fixed(18.0))
+            .height(Length::Fixed(2.0)),
+    )
+    .sty(move |_| container::Style {
+        snap: false,
+        icon_color: None,
+        background: Some(Background::Color(color.into_cosmic_color())),
+        border: Border {
+            color: cosmic::iced::Color::TRANSPARENT,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
+        shadow: cosmic::iced::Shadow::default(),
+        text_color: None,
+    })
+    .into()
+}
+
+/// UNIFY-9 — the live op-result strip: an accent left rule + mono message on a
+/// flat surface (the design's `border-left:3px` result box).
+fn result_strip<'a>(
+    msg: &str,
+    palette: Palette,
+    sizes: &FontSize,
+    weights: &FontWeight,
+) -> Element<'a, crate::Message> {
+    container(
+        row![
+            container(
+                Space::new()
+                    .width(Length::Fixed(3.0))
+                    .height(Length::Fixed(18.0))
+            )
+            .sty(move |_| container::Style {
+                snap: false,
+                icon_color: None,
+                background: Some(Background::Color(palette.accent.into_cosmic_color())),
+                border: Border {
+                    color: cosmic::iced::Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: 0.0.into(),
+                },
+                shadow: cosmic::iced::Shadow::default(),
+                text_color: None,
+            }),
+            Space::new().width(Length::Fixed(9.0)),
+            mono_text(msg.to_string(), TypeRole::Mono, sizes, weights)
+                .colr(palette.text_muted.into_cosmic_color()),
+        ]
+        .align_y(cosmic::iced::alignment::Vertical::Center),
+    )
+    .padding(Padding::from([8u16, 12u16]))
+    .width(Length::Fill)
+    .sty(move |_| container::Style {
+        snap: false,
+        icon_color: None,
+        background: Some(Background::Color(palette.surface.into_cosmic_color())),
+        border: Border {
+            color: palette.border.into_cosmic_color(),
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        shadow: cosmic::iced::Shadow::default(),
+        text_color: Some(palette.text.into_cosmic_color()),
+    })
+    .into()
+}
+
+/// UNIFY-9 — presence → Carbon status hue (online green / idle amber / offline
+/// red / unknown gray), the design's dot ramp read from the carbon tokens.
+fn presence_color(presence: &str) -> Rgba {
+    match presence {
+        "online" => carbon::GREEN_40,
+        "idle" => carbon::YELLOW_30,
+        "offline" => carbon::RED_50,
+        _ => carbon::GRAY_50,
+    }
+}
+
+/// UNIFY-9 — health → Carbon status hue.
+fn health_color(health: &str) -> Rgba {
+    match health {
+        "healthy" => carbon::GREEN_40,
+        "degraded" | "warning" => carbon::YELLOW_30,
+        "critical" | "unhealthy" => carbon::RED_50,
+        _ => carbon::GRAY_50,
+    }
+}
+
+/// UNIFY-9 — revision currency → Carbon status hue.
+fn currency_color(currency: &str) -> Rgba {
+    match currency {
+        "synced" | "current" => carbon::GREEN_40,
+        "behind" => carbon::YELLOW_30,
+        "ahead" => carbon::BLUE_50,
+        _ => carbon::GRAY_50,
+    }
+}
+
+/// UNIFY-9 — container/guest state → Carbon status hue.
+fn lifecycle_color(state: &str) -> Rgba {
+    match state {
+        "running" => carbon::GREEN_40,
+        "paused" => carbon::YELLOW_30,
+        _ => carbon::GRAY_50,
+    }
+}
+
+/// UNIFY-9 — the current (last) sample of a series, one decimal.
+fn fmt_last(series: &[f64]) -> String {
+    format!("{:.1}", series.last().copied().unwrap_or(0.0))
+}
+
+/// UNIFY-9 — capitalize the first character (the design's `capitalize` on the
+/// presence/health words).
+fn cap(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// PEERS-DT — humanize an epoch-ms `last_seen` against now. `0` (absent) → "—".
@@ -2609,50 +3049,6 @@ pub fn humanize_last_seen(ms: i64, now_ms: i64) -> String {
     } else {
         format!("{}d", secs / 86_400)
     }
-}
-
-/// PEERS-DT — a sortable column header cell: label + active-sort arrow, the
-/// whole cell a button that emits `SortBy(col)`.
-fn sort_header(
-    col: SortColumn,
-    active: SortColumn,
-    asc: bool,
-    width: Length,
-    palette: mde_theme::Palette,
-) -> Element<'static, crate::Message> {
-    let arrow = if col == active {
-        if asc {
-            " ▲"
-        } else {
-            " ▼"
-        }
-    } else {
-        ""
-    };
-    button(
-        text(format!("{}{arrow}", col.label()))
-            .size(11)
-            .colr(palette.text_muted.into_cosmic_color()),
-    )
-    .width(width)
-    .padding(Padding::from([4u16, 6u16]))
-    .sty(|_t, _s| cosmic::iced::widget::button::Style {
-        snap: false,
-        background: None,
-        text_color: cosmic::iced::Color::TRANSPARENT,
-        icon_color: None,
-        border_radius: 0.0.into(),
-        border_width: 0.0,
-        border_color: cosmic::iced::Color::TRANSPARENT,
-        border: Border {
-            color: cosmic::iced::Color::TRANSPARENT,
-            width: 0.0,
-            radius: 0.0.into(),
-        },
-        shadow: cosmic::iced::Shadow::default(),
-    })
-    .on_press(crate::Message::Peers(Message::SortBy(col)))
-    .into()
 }
 
 fn shell<'a>(
