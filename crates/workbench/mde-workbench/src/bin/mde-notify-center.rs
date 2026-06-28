@@ -237,11 +237,23 @@ struct Center {
     /// when the daemon is down. Each row renders as text + source-node + age, is
     /// click-to-copy onto THIS node, and carries per-entry pin + delete.
     clips: Vec<ClipRow>,
+    /// NOTIFY-3 (L656) — persisted read/cleared cursors. Mark-all-read + clear-all
+    /// advance these and write `<bus_root>/notify-read.yaml`, so the acknowledgement
+    /// + dismissal survive a restart (otherwise the bus tail re-reads the same
+    /// backlog as unread + un-cleared on every relaunch). Applied after each poll
+    /// merge by [`Center::apply_read_state`].
+    read_state: mde_notify::ReadState,
 }
 
 impl Center {
     fn new() -> Self {
         let reduce_motion = mde_theme::Preferences::load().a11y.reduce_motion;
+        // NOTIFY-3 (L656) — load the persisted read/cleared cursors so the panel
+        // opens honoring the operator's last mark-all-read / clear-all (no Bus
+        // data dir → empty cursors, i.e. the whole history is visible + unread).
+        let read_state = mde_bus::client_data_dir()
+            .map(|d| mde_notify::ReadState::load(&d))
+            .unwrap_or_default();
         Self {
             items: Vec::new(),
             tail: AlertTail::default(),
@@ -258,6 +270,31 @@ impl Center {
             seen_ids: HashSet::new(),
             expanded_stacks: HashSet::new(),
             clips: Vec::new(),
+            read_state,
+        }
+    }
+
+    /// NOTIFY-3 (L656) — apply the persisted cursors to the current rows: drop any
+    /// alert at/below the cleared cursor and flag any at/below the read cursor as
+    /// acknowledged. Run after every poll merge so a relaunch (which re-reads the
+    /// backlog off the bus tail + shared dir) reflects the operator's last
+    /// clear-all / mark-all-read instead of resurrecting the whole history.
+    fn apply_read_state(&mut self) {
+        let rs = &self.read_state;
+        self.items.retain(|it| !rs.is_cleared(&it.id));
+        for it in &mut self.items {
+            if self.read_state.is_read(&it.id) {
+                it.read = true;
+            }
+        }
+    }
+
+    /// NOTIFY-3 (L656) — persist the read/cleared cursors next to the bus data
+    /// (best-effort; a write failure leaves the in-memory state intact and is
+    /// retried on the next mark-all-read / clear-all).
+    fn persist_read_state(&self) {
+        if let Some(dir) = mde_bus::client_data_dir() {
+            let _ = self.read_state.save(&dir);
         }
     }
 
@@ -742,6 +779,13 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
                     state.shared_rx = Some(rx);
                 }
             }
+            // NOTIFY-3 (L656) — apply the persisted read/cleared cursors to the
+            // freshly-merged rows BEFORE the entrance animation samples them: a
+            // cleared item is dropped (never animates in then vanishes) and an
+            // already-read item renders acknowledged, so a relaunch honors the
+            // operator's last clear-all / mark-all-read instead of resurrecting
+            // the backlog.
+            state.apply_read_state();
             // NOTIFY-HUB-2 — kick the slide-in + 2× severity blink for any rows
             // that just appeared (skipped on the first poll so opening the panel
             // doesn't strobe the whole backlog). Driven by the cheap local tail
@@ -887,11 +931,28 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             }
         }
         Message::MarkAllRead => {
+            // NOTIFY-3 (L656) — advance the read cursor to the newest shown alert
+            // and persist it, so the acknowledgement survives a restart (the bus
+            // tail would otherwise re-surface this backlog as unread on relaunch).
+            if let Some(newest) = state.items.iter().map(|i| i.id.clone()).max() {
+                state.read_state.mark_read_through(&newest);
+                state.persist_read_state();
+            }
             for it in &mut state.items {
                 it.read = true;
             }
         }
-        Message::ClearAll => state.items.clear(),
+        Message::ClearAll => {
+            // NOTIFY-3 (L656) — advance the cleared cursor past the newest shown
+            // alert and persist it, so the dismissal survives a restart (without
+            // it the bus tail + shared dir re-read the same backlog into the panel
+            // on relaunch). Then drop the live rows.
+            if let Some(newest) = state.items.iter().map(|i| i.id.clone()).max() {
+                state.read_state.mark_cleared_through(&newest);
+                state.persist_read_state();
+            }
+            state.items.clear();
+        }
         Message::OpenApp(cmd) => {
             // Spawn the target app (detached) then close the panel.
             let _ = std::process::Command::new(cmd).spawn();
@@ -2026,5 +2087,67 @@ mod tests {
         assert_eq!(format_age(0, 172_800_000), "2d");
         // Clock skew (future ts) clamps to 0s, never negative.
         assert_eq!(format_age(10_000, 0), "0s");
+    }
+
+    // ── NOTIFY-3 (L656): persisted read/cleared wiring ──────────────────
+
+    /// Mark-all-read advances the read cursor to the newest shown alert id and
+    /// flags every current row read — the cursor is what survives a restart.
+    #[test]
+    fn mark_all_read_advances_cursor_and_flags_rows() {
+        let mut state = Center::new();
+        state.read_state = mde_notify::ReadState::default();
+        state.items = vec![
+            item("01A", Source::System, Severity::Info, 1),
+            item("01C", Source::Security, Severity::Critical, 3),
+            item("01B", Source::System, Severity::Info, 2),
+        ];
+        let _ = update(&mut state, Message::MarkAllRead);
+        // The cursor is the lexicographically-greatest (newest) id.
+        assert_eq!(state.read_state.read_through, "01C");
+        assert!(state.items.iter().all(|i| i.read), "all rows acknowledged");
+    }
+
+    /// Clear-all advances the cleared cursor and drops the rows; a subsequent poll
+    /// that re-reads the same backlog off the bus tail must stay hidden, while a
+    /// newer alert (greater ULID) still surfaces — the restart-survival contract.
+    #[test]
+    fn clear_all_advances_cursor_and_hides_replayed_backlog() {
+        let mut state = Center::new();
+        state.read_state = mde_notify::ReadState::default();
+        state.items = vec![
+            item("01A", Source::System, Severity::Info, 1),
+            item("01C", Source::Security, Severity::Info, 3),
+        ];
+        let _ = update(&mut state, Message::ClearAll);
+        assert!(state.items.is_empty(), "clear-all empties the live list");
+        assert_eq!(state.read_state.cleared_through, "01C");
+        // Simulate a relaunch's re-read: the bus tail re-surfaces the cleared ids
+        // plus a brand-new alert. apply_read_state must hide the cleared backlog
+        // and keep the newer one.
+        state.items = vec![
+            item("01A", Source::System, Severity::Info, 1), // cleared
+            item("01C", Source::Security, Severity::Info, 3), // cleared (inclusive)
+            item("01D", Source::Firewall, Severity::Warning, 4), // newer → survives
+        ];
+        state.apply_read_state();
+        let ids: Vec<&str> = state.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, vec!["01D"], "only the post-clear alert remains");
+    }
+
+    /// On a relaunch the read cursor flags the re-read backlog acknowledged (so it
+    /// doesn't all come back unread), while newer alerts stay unread.
+    #[test]
+    fn read_cursor_marks_replayed_backlog_acknowledged() {
+        let mut state = Center::new();
+        state.read_state = mde_notify::ReadState::default();
+        state.read_state.mark_read_through("01C");
+        state.items = vec![
+            item("01B", Source::System, Severity::Info, 2), // <= cursor → read
+            item("01D", Source::System, Severity::Info, 4), // >  cursor → unread
+        ];
+        state.apply_read_state();
+        assert!(state.items[0].read, "backlog at/below the cursor is read");
+        assert!(!state.items[1].read, "a newer alert stays unread");
     }
 }
