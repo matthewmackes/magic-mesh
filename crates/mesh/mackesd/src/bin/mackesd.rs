@@ -7237,6 +7237,42 @@ fn run_serve(
                 tracing::warn!(error = %e, "Tofu Bus responder: bus persist open failed; responder skipped");
             }
         }
+        // DATACENTER-21 (action layer) — the test-mesh provisioning responder:
+        // action/dc/testmesh-{spin,teardown} wrap automation/testbed/farm-testbed.sh
+        // to spin / tear down an ephemeral N-node test mesh. Same OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let provision_svc =
+                    mackesd_core::ipc::dc_provision::DcProvisionService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("dc-provision-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::dc_provision::serve_bus(&persist, &provision_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "DC-provision Bus responder spawned; serving \
+                             action/dc/testmesh-{{spin,teardown}} (DATACENTER-21)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DC-provision Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("dc_provision_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DC-provision Bus responder: bus persist open failed; responder skipped");
+            }
+        }
         // VPN-GW-1 — the VPN responder: action/vpn/* tunnel CRUD + wg-quick/
         // openvpn bring-up over the per-node tunnel config. Same OS-thread shape.
         match mde_bus::default_data_dir()

@@ -41,6 +41,9 @@ pub mod dc_rbac;
 // DATACENTER-16 (action layer) — action/dc/wol Wake-on-LAN power-orchestration
 // primitive (broadcasts the magic packet to wake a machine).
 pub mod dc_power;
+// DATACENTER-21 (action layer) — action/dc/testmesh-spin + testmesh-teardown:
+// ephemeral N-node test-mesh lifecycle wrapping farm-testbed.sh.
+pub mod dc_provision;
 // DATACENTER-10 (action layer) — action/dc/host-power Xen host (dom0)
 // maintenance + reboot control responder.
 pub mod host_ops;
