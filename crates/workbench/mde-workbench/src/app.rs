@@ -96,6 +96,12 @@ pub enum Message {
     ReconnectProbed(bool),
     /// UNIFY-2 — the live mesh-health summary fetch resolved (`None` = daemon down).
     MeshHealthUpdated(Option<crate::mesh_directory::HealthSummary>),
+    /// UNIFY-3 — toggle the Live Events rail.
+    ToggleLiveEventsRail,
+    /// UNIFY-3 — periodic tick to refresh the Live Events rail.
+    EventsTick,
+    /// UNIFY-3 — the live alert/event poll resolved (newest-first, bounded).
+    EventsUpdated(Vec<mde_notify::AlertItem>),
     /// Keyboard / chord-bar generated key. Translated by
     /// [`crate::keyboard::interpret_key`] before landing here.
     KeyPressed(KeyAction),
@@ -324,6 +330,12 @@ pub struct App {
     /// `None` until the daemon answers — the status strip then omits the count
     /// cell rather than render a fake 0/0 (§7).
     mesh_health: Option<crate::mesh_directory::HealthSummary>,
+    /// UNIFY-3 — the Live Events rail open/closed (design default: open).
+    events_rail_open: bool,
+    /// UNIFY-3 — live alert/event items tailed from the shared bus alert lanes
+    /// (`mde_notify::read_shared_alert_items`), newest-first + bounded. Rendered by
+    /// the rail; empty until the first poll (no placeholders, §7).
+    events: Vec<mde_notify::AlertItem>,
     backend: Arc<dyn Backend>,
     notifications: notifications_panel::NotificationsPanel,
     music: music_panel::MusicPanel,
@@ -460,6 +472,8 @@ impl App {
             focused_pane: Pane::Sidebar,
             bus_reachable: true,
             mesh_health: None,
+            events_rail_open: true,
+            events: Vec::new(),
             backend,
             notifications: notifications_panel::NotificationsPanel::new(),
             music: music_panel::MusicPanel::new(),
@@ -722,6 +736,12 @@ impl App {
             subs.push(
                 cosmic::iced::time::every(Duration::from_millis(16))
                     .map(|_| Message::TransitionTick),
+            );
+        }
+        // UNIFY-3 — refresh the Live Events rail while it's open (idle when shut).
+        if self.events_rail_open {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_secs(4)).map(|_| Message::EventsTick),
             );
         }
         // E6.10 — sample Compute instance CPU/mem only while that view is
@@ -1059,6 +1079,16 @@ impl App {
             // UNIFY-2 — store the live mesh-health summary for the status strip.
             Message::MeshHealthUpdated(summary) => {
                 self.mesh_health = summary;
+                Task::none()
+            }
+            // UNIFY-3 — Live Events rail.
+            Message::ToggleLiveEventsRail => {
+                self.events_rail_open = !self.events_rail_open;
+                Task::none()
+            }
+            Message::EventsTick => Task::perform(fetch_events(), Message::EventsUpdated),
+            Message::EventsUpdated(items) => {
+                self.events = items;
                 Task::none()
             }
             // GUI-RECONNECT — on a down→up transition, re-load the active
@@ -1439,21 +1469,29 @@ impl App {
                 crate::live_theme::tokens().density,
             ));
 
-        let layout = row![
+        let mut layout = row![
             sidebar,
             container(main).width(Length::Fill).height(Length::Fill)
         ]
         .height(Length::Fill);
+        // UNIFY-3 — the collapsible Live Events rail on the right edge.
+        if self.events_rail_open {
+            layout = layout.push(crate::events_rail::view::<Message>(&self.events));
+        }
 
         // UX-4 — custom window header sits above sidebar + body
         // so the wordmark + window controls span the full width.
         let window_header = crate::header::view(Message::WindowControl);
 
-        // UNIFY-1 — the Unified Workbench global status strip frames the whole
-        // app above the window header, surfacing live mesh chrome (this increment:
-        // mde-bus "chain" reachability + cluster mark).
-        let status_strip =
-            crate::status_strip::view::<Message>(self.bus_reachable, self.mesh_health.as_ref());
+        // UNIFY-1/2/3 — the Unified Workbench global status strip frames the whole
+        // app above the window header: live mde-bus "chain" reachability, the
+        // mesh-health counts, and the Live-Events rail toggle.
+        let status_strip = crate::status_strip::view(
+            self.bus_reachable,
+            self.mesh_health.as_ref(),
+            self.events_rail_open,
+            Message::ToggleLiveEventsRail,
+        );
 
         column![status_strip, window_header, layout]
             .width(Length::Fill)
@@ -1920,6 +1958,7 @@ impl Application for App {
         let boot = Task::batch([
             boot,
             Task::perform(fetch_mesh_health(), Message::MeshHealthUpdated),
+            Task::perform(fetch_events(), Message::EventsUpdated),
         ]);
         (app, boot.map(cosmic::Action::App))
     }
@@ -1977,6 +2016,24 @@ async fn fetch_mesh_health() -> Option<crate::mesh_directory::HealthSummary> {
     tokio::task::spawn_blocking(crate::mesh_directory::fetch_health)
         .await
         .unwrap_or(None)
+}
+
+/// UNIFY-3 — cap on the events the rail holds (newest-first window).
+const EVENTS_RAIL_CAP: usize = 200;
+
+/// UNIFY-3 — read the live shared alert lane off the GUI thread, newest-first +
+/// bounded. Reuses `mde_notify::read_shared_alert_items` (the same source the
+/// notification center tails) — no duplicate transport.
+async fn fetch_events() -> Vec<mde_notify::AlertItem> {
+    tokio::task::spawn_blocking(|| {
+        let wg = mackes_mesh_types::peers::default_workgroup_root();
+        let mut items = mde_notify::read_shared_alert_items(&wg);
+        items.sort_by(|a, b| b.ts_unix_ms.cmp(&a.ts_unix_ms));
+        items.truncate(EVENTS_RAIL_CAP);
+        items
+    })
+    .await
+    .unwrap_or_default()
 }
 
 fn panel_worklist_item(_group: Group, _panel: &str) -> Option<&'static str> {

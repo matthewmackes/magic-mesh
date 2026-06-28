@@ -31,6 +31,8 @@ pub mod panels;
 pub mod patternfly;
 pub mod role;
 pub mod sidebar;
+/// UNIFY-3 — the collapsible Live Events rail (right chrome) of the Unified Workbench.
+pub mod events_rail;
 pub mod single_instance;
 /// UNIFY-1 — the global status strip (top chrome band) of the Unified Workbench.
 pub mod status_strip;
