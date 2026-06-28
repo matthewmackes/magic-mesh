@@ -5,3 +5,7 @@ env.sh
 .terraform.tfstate.lock.info
 # DAR-8: the per-mesh backend address is generated (gen-backend-config.sh), never committed.
 *.backend.hcl
+# DAR-32: the dom0 registry is per-mesh generated state (learn-dom0.sh probes each
+# dom0's live XAPI), consumed by gen-tfvars.sh to render providers.tf + local.dom0.
+dom0_registry.json
+dom0_registry.json.tmp

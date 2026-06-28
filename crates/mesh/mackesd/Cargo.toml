@@ -523,6 +523,39 @@ assets = [
     # split by precondition so a missing optional type only skips that module.
     { source = "install-helpers/selinux/*.cil", dest = "/usr/share/magic-mesh/selinux/", mode = "644" },
     { source = "install-helpers/setup-selinux-policy.sh", dest = "/usr/libexec/mackesd/setup-selinux-policy", mode = "755" },
+    # DAR-46 — DEVOPS-AUTOMATION-REBUILD: ship the backoffice/control-VM plane so a
+    # rebuilt/rebooted control VM re-converges with no manual step (the deploy root
+    # is /opt/mcnf — the mcnf-* units WorkingDirectory + cmd_found's MCNF_REPO
+    # default). The orchestrator + its phase scripts + the secret/state/reconciler/
+    # DR helpers + the shared etcd resolver + the control-VM tofu root + the boot
+    # convergence unit. (live_gated units are PLANNED, never fired — §6 boundary.)
+    { source = "automation/backoffice/*",        dest = "/opt/mcnf/automation/backoffice/",    mode = "755" },
+    { source = "automation/state-backend/*",      dest = "/opt/mcnf/automation/state-backend/", mode = "755" },
+    { source = "automation/secrets/mcnf-secret.sh", dest = "/opt/mcnf/automation/secrets/mcnf-secret.sh", mode = "755" },
+    { source = "automation/reconciler/*",         dest = "/opt/mcnf/automation/reconciler/",    mode = "755" },
+    { source = "automation/dr/*",                 dest = "/opt/mcnf/automation/dr/",            mode = "755" },
+    { source = "automation/forgejo/*",            dest = "/opt/mcnf/automation/forgejo/",       mode = "755" },
+    { source = "automation/lib/etcd-endpoints.sh", dest = "/opt/mcnf/automation/lib/etcd-endpoints.sh", mode = "755" },
+    # The control-VM tofu root (committed .tf + cloud-init tmpl + README/example;
+    # the gitignored env.sh / *.backend.hcl / *.tfstate are never in a clean tree).
+    { source = "infra/tofu/control-vm/*.tf",      dest = "/opt/mcnf/infra/tofu/control-vm/",    mode = "644" },
+    { source = "infra/tofu/control-vm/cloud-init/*", dest = "/opt/mcnf/infra/tofu/control-vm/cloud-init/", mode = "644" },
+    { source = "infra/tofu/control-vm/env.sh.example", dest = "/opt/mcnf/infra/tofu/control-vm/env.sh.example", mode = "644" },
+    { source = "infra/tofu/control-vm/README.md", dest = "/opt/mcnf/infra/tofu/control-vm/README.md", mode = "644" },
+    # The backoffice systemd units (mcnf-*). The boot-time convergence oneshot
+    # (mcnf-backoffice-up.service, DAR-46/47) runs backoffice-up.sh from-intent
+    # --adopt; the reconciler/DR/status units are installed live by the *-up.sh
+    # scripts, but ship here so a fresh VM has the unit files to enable.
+    { source = "packaging/systemd/mcnf-backoffice-up.service",  dest = "/usr/lib/systemd/system/mcnf-backoffice-up.service",  mode = "644" },
+    { source = "packaging/systemd/mcnf-backoffice-status.service", dest = "/usr/lib/systemd/system/mcnf-backoffice-status.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-backoffice-status.timer",   dest = "/usr/lib/systemd/system/mcnf-backoffice-status.timer",   mode = "644" },
+    { source = "packaging/systemd/mcnf-reconciler-bootstrap.service", dest = "/usr/lib/systemd/system/mcnf-reconciler-bootstrap.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-farm-reconcile.service", dest = "/usr/lib/systemd/system/mcnf-farm-reconcile.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-farm-reconcile.timer",   dest = "/usr/lib/systemd/system/mcnf-farm-reconcile.timer",   mode = "644" },
+    { source = "packaging/systemd/mcnf-farm-autoscale-reconcile.service", dest = "/usr/lib/systemd/system/mcnf-farm-autoscale-reconcile.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-farm-autoscale-reconcile.timer",   dest = "/usr/lib/systemd/system/mcnf-farm-autoscale-reconcile.timer",   mode = "644" },
+    { source = "packaging/systemd/mcnf-dr-backup.service", dest = "/usr/lib/systemd/system/mcnf-dr-backup.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-dr-backup.timer",   dest = "/usr/lib/systemd/system/mcnf-dr-backup.timer",   mode = "644" },
 ]
 # EFF-14 — install/upgrade/remove scriptlets: register the daemon unit, create
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep
@@ -783,6 +816,31 @@ assets = [
     # SELINUX-1 — the local SELinux policy modules + installer.
     { source = "install-helpers/selinux/*.cil", dest = "/usr/share/magic-mesh/selinux/", mode = "644" },
     { source = "install-helpers/setup-selinux-policy.sh", dest = "/usr/libexec/mackesd/setup-selinux-policy", mode = "755" },
+    # DAR-46 — the backoffice/control-VM plane (the control VM IS a Server-role
+    # node, so the headless variant carries the same plane as the base RPM): the
+    # orchestrator + phase scripts + secret/state/reconciler/DR helpers + the shared
+    # etcd resolver + the control-VM tofu root + the boot convergence unit.
+    { source = "automation/backoffice/*",        dest = "/opt/mcnf/automation/backoffice/",    mode = "755" },
+    { source = "automation/state-backend/*",      dest = "/opt/mcnf/automation/state-backend/", mode = "755" },
+    { source = "automation/secrets/mcnf-secret.sh", dest = "/opt/mcnf/automation/secrets/mcnf-secret.sh", mode = "755" },
+    { source = "automation/reconciler/*",         dest = "/opt/mcnf/automation/reconciler/",    mode = "755" },
+    { source = "automation/dr/*",                 dest = "/opt/mcnf/automation/dr/",            mode = "755" },
+    { source = "automation/forgejo/*",            dest = "/opt/mcnf/automation/forgejo/",       mode = "755" },
+    { source = "automation/lib/etcd-endpoints.sh", dest = "/opt/mcnf/automation/lib/etcd-endpoints.sh", mode = "755" },
+    { source = "infra/tofu/control-vm/*.tf",      dest = "/opt/mcnf/infra/tofu/control-vm/",    mode = "644" },
+    { source = "infra/tofu/control-vm/cloud-init/*", dest = "/opt/mcnf/infra/tofu/control-vm/cloud-init/", mode = "644" },
+    { source = "infra/tofu/control-vm/env.sh.example", dest = "/opt/mcnf/infra/tofu/control-vm/env.sh.example", mode = "644" },
+    { source = "infra/tofu/control-vm/README.md", dest = "/opt/mcnf/infra/tofu/control-vm/README.md", mode = "644" },
+    { source = "packaging/systemd/mcnf-backoffice-up.service",  dest = "/usr/lib/systemd/system/mcnf-backoffice-up.service",  mode = "644" },
+    { source = "packaging/systemd/mcnf-backoffice-status.service", dest = "/usr/lib/systemd/system/mcnf-backoffice-status.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-backoffice-status.timer",   dest = "/usr/lib/systemd/system/mcnf-backoffice-status.timer",   mode = "644" },
+    { source = "packaging/systemd/mcnf-reconciler-bootstrap.service", dest = "/usr/lib/systemd/system/mcnf-reconciler-bootstrap.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-farm-reconcile.service", dest = "/usr/lib/systemd/system/mcnf-farm-reconcile.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-farm-reconcile.timer",   dest = "/usr/lib/systemd/system/mcnf-farm-reconcile.timer",   mode = "644" },
+    { source = "packaging/systemd/mcnf-farm-autoscale-reconcile.service", dest = "/usr/lib/systemd/system/mcnf-farm-autoscale-reconcile.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-farm-autoscale-reconcile.timer",   dest = "/usr/lib/systemd/system/mcnf-farm-autoscale-reconcile.timer",   mode = "644" },
+    { source = "packaging/systemd/mcnf-dr-backup.service", dest = "/usr/lib/systemd/system/mcnf-dr-backup.service", mode = "644" },
+    { source = "packaging/systemd/mcnf-dr-backup.timer",   dest = "/usr/lib/systemd/system/mcnf-dr-backup.timer",   mode = "644" },
 ]
 
 # XPA-6 — the headless variant's hard runtime deps: the same mesh substrate the
