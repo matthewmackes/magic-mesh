@@ -389,6 +389,10 @@ pub mod lifecycle_exec;
 pub mod firewall_preset;
 // CONNECT-3 — exposure-driven (additive) firewall enforcement.
 pub mod connect_firewall;
+// VPN-GW-6 — per-tunnel health + exit-IP/leak verification + auto-failover.
+pub mod vpn_health;
+// DDNS-EGRESS-4 — dynamic-DNS reconcile worker (VPN exit + WAN → DigitalOcean).
+pub mod ddns;
 // FARM-AUTO-1 — build-farm orchestrator: bridges the farm job lifecycle onto the Bus.
 pub mod farm_orchestrator;
 // DATACENTER-5 — datacenter orchestrator: samples the DC substrate (DO/Xen/gateway)

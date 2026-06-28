@@ -183,6 +183,94 @@ pub fn do_delete_request(domain: &str, id: &str) -> (&'static str, String) {
     ("DELETE", format!("/v2/domains/{domain}/records/{id}"))
 }
 
+/// DDNS-EGRESS-4/5 — one record's last-published runtime state, written by the
+/// `ddns` worker and read by the VPN/Routing panel's DDNS table. `status` is one
+/// of `synced` (the live IP is published), `stale` (the source IP changed but the
+/// last write failed), `removed` (the source went down + `on_down = remove`),
+/// `sentinel` (parked at the sentinel address), or `error` (a DO API failure).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedRecord {
+    /// The fully-qualified name (`<label>.<zone>`).
+    pub fqdn: String,
+    /// The record's IP source (`tunnel:<id>` or `wan`).
+    #[serde(default)]
+    pub source: String,
+    /// The last value published to DNS (empty when removed / never published).
+    #[serde(default)]
+    pub ip: String,
+    /// When the record was last written / evaluated (unix ms).
+    #[serde(default)]
+    pub updated_ms: u64,
+    /// The TTL the record was written with.
+    #[serde(default)]
+    pub ttl: u32,
+    /// Sync status (`synced` / `stale` / `removed` / `sentinel` / `error`).
+    #[serde(default)]
+    pub status: String,
+    /// Human-readable last-write detail (the DO error on a failure, etc.).
+    #[serde(default)]
+    pub detail: String,
+}
+
+/// The node's published DDNS state — one [`PublishedRecord`] per managed name.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DdnsPublished {
+    /// Per-name published state.
+    #[serde(default)]
+    pub record: Vec<PublishedRecord>,
+}
+
+impl DdnsPublished {
+    /// Look up a published record by its FQDN.
+    #[must_use]
+    pub fn get(&self, fqdn: &str) -> Option<&PublishedRecord> {
+        self.record.iter().find(|r| r.fqdn == fqdn)
+    }
+
+    /// Insert or replace a published record (keyed by FQDN).
+    pub fn upsert(&mut self, r: PublishedRecord) {
+        if let Some(slot) = self.record.iter_mut().find(|x| x.fqdn == r.fqdn) {
+            *slot = r;
+        } else {
+            self.record.push(r);
+        }
+    }
+}
+
+/// Durable path for the published DDNS state: `<workgroup_root>/ddns/published.json`.
+#[must_use]
+pub fn published_path(workgroup_root: &std::path::Path) -> std::path::PathBuf {
+    workgroup_root.join("ddns").join("published.json")
+}
+
+/// Load the published DDNS state (missing/malformed → empty).
+#[must_use]
+pub fn load_published(workgroup_root: &std::path::Path) -> DdnsPublished {
+    std::fs::read_to_string(published_path(workgroup_root))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the published DDNS state (atomic temp+rename).
+///
+/// # Errors
+/// An I/O / serialize error.
+pub fn save_published(
+    workgroup_root: &std::path::Path,
+    state: &DdnsPublished,
+) -> Result<std::path::PathBuf, String> {
+    let path = published_path(workgroup_root);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    let json = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename {}: {e}", path.display()))?;
+    Ok(path)
+}
+
 /// Durable path for the DDNS config: `<workgroup_root>/ddns/config.toml`.
 #[must_use]
 pub fn config_path(workgroup_root: &std::path::Path) -> std::path::PathBuf {
@@ -311,5 +399,41 @@ mod tests {
     fn load_missing_is_default() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(load(tmp.path()), DdnsConfig::default());
+    }
+
+    #[test]
+    fn published_state_round_trips_and_upserts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut pub_state = DdnsPublished::default();
+        pub_state.upsert(PublishedRecord {
+            fqdn: "eagle-mullvad.services.matthewmackes.com".into(),
+            source: "tunnel:mullvad1".into(),
+            ip: "1.2.3.4".into(),
+            updated_ms: 7,
+            ttl: 60,
+            status: "synced".into(),
+            ..Default::default()
+        });
+        save_published(tmp.path(), &pub_state).unwrap();
+        assert_eq!(load_published(tmp.path()), pub_state);
+        // Upsert by fqdn replaces.
+        pub_state.upsert(PublishedRecord {
+            fqdn: "eagle-mullvad.services.matthewmackes.com".into(),
+            ip: "5.6.7.8".into(),
+            status: "synced".into(),
+            ..Default::default()
+        });
+        assert_eq!(pub_state.record.len(), 1);
+        assert_eq!(
+            pub_state
+                .get("eagle-mullvad.services.matthewmackes.com")
+                .unwrap()
+                .ip,
+            "5.6.7.8"
+        );
+        assert_eq!(
+            load_published(tmp.path().join("none").as_path()),
+            DdnsPublished::default()
+        );
     }
 }
