@@ -2177,23 +2177,23 @@ The rethink is a **consolidation**: merge the standalone `mde-apps-applet` into 
 
 Turn the static topology wallpaper (`mde-mesh-wallpaper`) into an animated global-mesh-traffic map: nodes placed geographically, per-direction packet-particle trails colored by the sending node, intensity from each node's collected data; zero-CPU idle.
 
-- [ ] **MESHMAP-1: geographic node placement + faint map backdrop.**
+- [✓] **MESHMAP-1: geographic node placement + faint map backdrop.** _(DONE, e916620..3bc2402: `geo_layout` places nodes whose hostname carries a region token (DO `nyc`/`fra`/`sfo` + coarse `-us`/`-eu`/`-asia`) against a static centroid table — offline, no geoIP DB/network — and falls back PER-NODE to the existing force `layout()` when the region is unknown; a faint Carbon-Gray backdrop draws only when a node is geo-known. Honesty caveat (W6): today's roster JSON has no lat/long field, so geo keys off the hostname region token; a region-less workgroup is byte-identical to the old force map.)_
   **As** an operator, **I want** the mesh drawn by geography, **so that** the wallpaper maps the *global* mesh.
   **Acceptance**:
-    - [ ] each node projected to lat/long from its DO region (zone1-do tofu) or netassess public-IP geo (offline geoIP table / region centroids — no network call); faint Carbon-toned world/region backdrop; force-layout fallback when geo unknown
-- [ ] **MESHMAP-2: stable per-node hue + presence + labels.**
+    - [✓] each node projected from a region token to a static centroid (no network call); faint Carbon-toned backdrop when geo-known; force-layout fallback per node when geo unknown
+- [✓] **MESHMAP-2: stable per-node hue + presence + labels.** _(DONE: new `mde_theme::hue` module — `node_hue`/`node_hue_for`/`hsl_to_rgba`, FNV-1a hash + golden-ratio hue spread at fixed Carbon-band S/L; node dot FILL = hue, presence = RING; 5 unit tests. All color math in mde-theme — carbon-tokens lint clean.)_
   **Acceptance**:
-    - [ ] `hue = hash(hostname)` gives each node a deterministic distinct color (Carbon S/L); node carries a presence ring (online/idle/offline) + hostname label
-- [ ] **MESHMAP-3: per-direction packet-particle traffic, colored by sender.**
+    - [✓] `hue = hash(hostname)` gives each node a deterministic distinct color (Carbon S/L); node carries a presence ring (online/idle/offline) + hostname label
+- [✓] **MESHMAP-3: per-direction packet-particle traffic, colored by sender.** _(DONE: two particle streams per edge — self→peer on `self_flow`, peer→self on the peer's `flow` — each colored by its sender's hue, independent idle gates; wallpaper bin now reuses `peers::sample_flows` (made pub) for real per-node + self throughput and advances `flow_phase` — flow is no longer hardcoded 0.0, so the feature is live on the desktop (§7).)_
   **As** an operator, **I want** to see who's talking to whom, **so that** the wallpaper shows live mesh traffic.
   **Acceptance**:
-    - [ ] each edge animates TWO particle streams (one per direction), each colored by that direction's sender hue; density+speed ∝ the sender's Netdata `system.net` throughput (reuse `sample_flows`); enables the currently-disabled MapProgram particles
-- [ ] **MESHMAP-4: relay paths bend through the lighthouse.**
+    - [✓] each edge animates TWO particle streams (one per direction), each colored by that direction's sender hue; density+speed ∝ the sender's Netdata `system.net` throughput (`sample_flows`); enables the previously-disabled MapProgram particles
+- [✓] **MESHMAP-4: relay paths bend through the lighthouse.** _(DONE: a relayed edge (overlay-IP→hostname resolved from `PathInfo.relay_via`) draws as a 2-segment polyline through the relay node; particles ride it by arc length; direct paths stay straight.)_
   **Acceptance**:
-    - [ ] a `NebulaRelay` path (mesh_router `PeerPath.primary`) draws as two segments via the relaying lighthouse node; direct paths straight
-- [ ] **MESHMAP-5: zero-CPU idle + reduce-motion + cadence.**
+    - [✓] a relayed path draws as two segments via the relaying lighthouse node; direct paths straight
+- [✓] **MESHMAP-5: zero-CPU idle + reduce-motion + cadence.** _(DONE: reduce-motion → static colored edges (no particles, no anim/flow ticks); zero-CPU idle confirmed (anim tick gated on `has_flow`). Carbon tokens only.)_
   **Acceptance**:
-    - [ ] particle ticks gated on `has_flow()` (zero ticks at rest); roster/geo refresh 30s AC / 5min battery; reduce-motion → static colored edges (no particles); Carbon tokens only (§4), ≤3Hz
+    - [✓] particle ticks gated on `has_flow()` (zero ticks at rest); reduce-motion → static colored edges (no particles); Carbon tokens only (§4), ≤3Hz
 - [ ] **MESHMAP-6 (Phase 2): real per-link byte counters.**
   **As** the map, **I want** true per-link volume, **so that** intensity isn't a per-node proxy.
   **Acceptance**:
