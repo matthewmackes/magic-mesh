@@ -32,6 +32,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
+# shellcheck source=../lib/control-host.sh
+. "$REPO/automation/lib/control-host.sh"   # DAR-17: portable control-HOST resolver
 
 TIER=""
 CONTROL_IP="${MCNF_CONTROL_IP:-}"
@@ -56,12 +58,10 @@ esac
 MANIFEST="$MANIFEST_DIR/manifest.$TIER.toml"
 [ -r "$MANIFEST" ] || err "missing manifest $MANIFEST"
 
-# Detect this node's overlay IP for the readiness probes.
-_overlay_ip() {
-  ip -o -4 addr show 2>/dev/null \
-    | awk '$2 ~ /nebula|mde-neb/ {split($4,a,"/"); print a[1]; exit}'
-}
-CONTROL_IP="${CONTROL_IP:-$(_overlay_ip)}"
+# DAR-17: resolve the control HOST for the readiness probes via the shared chain
+# (explicit env > the per-mesh /mcnf/site doc > the peer directory > this node's
+# overlay), NEVER the dead .192. An explicit =172.20.145.192 is the reconstitute arm.
+CONTROL_IP="$(MCNF_CONTROL_IP="$CONTROL_IP" mcnf_resolve_control_host)"
 
 # Best-effort READ-ONLY liveness probe per unit id. Mutates nothing.
 _unit_ready() { # <id> -> echoes true|false

@@ -36,6 +36,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/etcd-endpoints.sh
 . "$HERE/../lib/etcd-endpoints.sh"
+# shellcheck source=../lib/control-host.sh
+. "$HERE/../lib/control-host.sh"   # DAR-17: portable control-HOST resolver
 
 OUT="${RECONCILER_ENV_OUT:-/etc/mcnf/reconciler.env}"
 PRINT=0
@@ -77,8 +79,21 @@ if [ -z "$XCP_HOST" ]; then
   [ -n "$XCP_HOST" ] || XCP_HOST="172.20.145.165"   # live BigBoy fallback
 fi
 
-# ── XO URL (back-compat status only; no longer the apply gate) ──
-XO_URL="${MCNF_XO_URL:-ws://${CONTROL_IP:-172.20.145.192}:8080}"
+# ── control HOST (DAR-17): the per-mesh control VM, resolved via the shared chain
+# (explicit MCNF_CONTROL_IP > the /mcnf/site doc > the peer directory > this node's
+# overlay), NEVER the dead .192. The reconstitute arm passes =172.20.145.192. ──
+CONTROL_IP="$(MCNF_CONTROL_IP="$CONTROL_IP" mcnf_resolve_control_host)"
+
+# ── XO URL (back-compat status only; XO is retired — no longer the apply gate). ──
+# Built from the resolved control host, not a dead-LAN literal; if the host is
+# un-resolvable the URL is left empty (status-only, never gates an apply).
+if [ -n "${MCNF_XO_URL:-}" ]; then
+  XO_URL="$MCNF_XO_URL"
+elif [ -n "$CONTROL_IP" ]; then
+  XO_URL="ws://${CONTROL_IP}:8080"
+else
+  XO_URL=""
+fi
 
 # ── render ──
 TS="$(date -u +%FT%TZ 2>/dev/null || echo unknown)"

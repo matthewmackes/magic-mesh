@@ -68,6 +68,8 @@ FACTS="$STATE_DIR/backoffice-site.yml"
 
 # shellcheck source=../lib/etcd-endpoints.sh
 . "$REPO/automation/lib/etcd-endpoints.sh"
+# shellcheck source=../lib/control-host.sh
+. "$REPO/automation/lib/control-host.sh"   # DAR-17: portable control-HOST resolver
 
 TIER=""
 MODE="run"          # run | dry-run | plan | adopt | record-intent
@@ -201,10 +203,12 @@ PY
 }
 
 # Detect this node's overlay IP (the control VM binds backoffice endpoints here).
-_overlay_ip() {
-  ip -o -4 addr show 2>/dev/null \
-    | awk '$2 ~ /nebula|mde-neb/ {split($4,a,"/"); print a[1]; exit}'
-}
+# DAR-17: delegate to the shared resolver — `_overlay_ip` is THIS node's overlay
+# iface (used by the precheck to assert overlay membership); the control HOST the
+# endpoints point at is resolved separately by mcnf_resolve_control_host (which
+# prefers an explicit MCNF_CONTROL_IP / the per-mesh /mcnf/site doc / the peer
+# directory before falling back to this node's own overlay IP). NO .192 default.
+_overlay_ip() { mcnf_overlay_ip; }
 
 # ── record-intent (DAR-18 / Lock 3) ──────────────────────────────────────────
 # Write /mcnf/backoffice/intent {tier,host,ts} via the etcd v3 HTTP gateway, using
@@ -216,7 +220,9 @@ _overlay_ip() {
 if [ "$MODE" = "record-intent" ]; then
   endpoints="$(mcnf_resolve_etcd)" || exit 1   # fail-loud already printed
   ep="${endpoints%%,*}"
-  host="${HOST_OVERRIDE:-${CONTROL_IP:-$(_overlay_ip)}}"
+  # DAR-17: --host override > the portable control-host resolver (explicit env /
+  # /mcnf/site / peer directory / this node's overlay) > the hostname. NO .192.
+  host="${HOST_OVERRIDE:-${CONTROL_IP:-$(MCNF_CONTROL_IP="$CONTROL_IP" mcnf_resolve_control_host)}}"
   host="${host:-$(hostname -s 2>/dev/null || hostname)}"
   ts="$(date -u +%FT%TZ 2>/dev/null || echo unknown)"
   value="$(printf '{"tier":"%s","host":"%s","ts":"%s"}' "$TIER" "$host" "$ts")"
@@ -245,7 +251,10 @@ fi
 MAX_PHASE=3
 [ "$TIER" = "full" ] && MAX_PHASE=7
 
-CONTROL_IP="${CONTROL_IP:-$(_overlay_ip)}"
+# DAR-17: resolve the control HOST via the portable chain (explicit env > the
+# per-mesh /mcnf/site doc > the peer directory > this node's overlay), NEVER the
+# dead .192. An explicit MCNF_CONTROL_IP=172.20.145.192 is the reconstitute arm.
+CONTROL_IP="$(MCNF_CONTROL_IP="$CONTROL_IP" mcnf_resolve_control_host)"
 mkdir -p "$STATE_DIR"
 
 # Probe whether a unit is already up so --adopt can SKIP recreating it.
