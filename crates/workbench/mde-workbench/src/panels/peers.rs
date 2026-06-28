@@ -160,10 +160,12 @@ pub struct PeersPanel {
     pub traceroute: Option<Result<Vec<String>, String>>,
     /// PD-7/L19 — a traceroute is in flight (button shows "Tracing…").
     pub traceroute_running: bool,
-    /// PD-7/L18 — host→normalized overlay throughput (0.0..=1.0) for the
-    /// flow particles, sampled from each online peer's Netdata while the
-    /// Map view is open.
-    pub flows: std::collections::HashMap<String, f64>,
+    /// PD-7/L18 + MESHMAP-6 — host→per-link flow (tx/rx, each 0.0..=1.0) for
+    /// the flow particles, refreshed while the Map view is open. The source
+    /// is the mackesd `link-traffic` collector's REAL per-link byte rates
+    /// when its cache is present, falling back to the per-node Netdata
+    /// `sample_flows` proxy (tx = the proxy busy-ness, rx = 0) otherwise.
+    pub flows: std::collections::HashMap<String, super::peers_map::LinkFlow>,
     /// PD-7/L18 — the flow-particle animation phase (0.0..=1.0), advanced
     /// by the animation tick (registered only while real traffic flows).
     pub flow_phase: f32,
@@ -303,7 +305,7 @@ pub enum Message {
     /// overlay throughput for the particle density.
     FlowTick,
     /// PD-7/L18 — the sampled per-host flow resolved.
-    FlowsSampled(std::collections::HashMap<String, f64>),
+    FlowsSampled(std::collections::HashMap<String, super::peers_map::LinkFlow>),
     /// PD-7/L18 — the animation tick: advance the particle phase.
     FlowAnim,
 }
@@ -703,9 +705,12 @@ fn run_traceroute(ip: &str) -> Result<Vec<String>, String> {
 ///
 /// MESHMAP-3 — `pub` so the `mde-mesh-wallpaper` bin reuses the exact sampler
 /// the Peers Map uses (no reimplementation), wiring real per-node flow into the
-/// desktop wallpaper's particle streams.
+/// desktop wallpaper's particle streams. MESHMAP-6 — returns `LinkFlow` (the
+/// proxy fills `tx` = busy-ness, `rx` = 0; it can't split direction).
 #[must_use]
-pub fn sample_flows(targets: &[(String, String)]) -> std::collections::HashMap<String, f64> {
+pub fn sample_flows(
+    targets: &[(String, String)],
+) -> std::collections::HashMap<String, super::peers_map::LinkFlow> {
     /// Normalization reference: ~100 Mbit/s in bytes/s. A link at/above this
     /// saturates the stream; idle links round to ~0 and draw nothing.
     const REF_BYTES_PER_S: f64 = 12_000_000.0;
@@ -714,7 +719,14 @@ pub fn sample_flows(targets: &[(String, String)]) -> std::collections::HashMap<S
         if let Ok(series) = fetch_series(ip, "system.net") {
             if let Some(last) = series.last() {
                 let norm = (last / REF_BYTES_PER_S).clamp(0.0, 1.0);
-                out.insert(host.clone(), norm);
+                // MESHMAP-6 — the per-node proxy attributes a node's TOTAL
+                // throughput to its self→peer edge; it can't split direction,
+                // so `tx` carries the busy-ness and `rx` stays 0 (no fake
+                // reverse stream). MESHMAP-6's real source fills both.
+                out.insert(
+                    host.clone(),
+                    super::peers_map::LinkFlow { tx: norm, rx: 0.0 },
+                );
             }
         }
     }
@@ -925,7 +937,7 @@ impl PeersPanel {
     /// idle mesh runs no particle loop.
     #[must_use]
     pub fn has_flow(&self) -> bool {
-        self.map_view && self.flows.values().any(|f| *f > 0.02)
+        self.map_view && self.flows.values().any(|f| f.tx > 0.02 || f.rx > 0.02)
     }
 
     /// Fetch the directory + the paired-device roster (each Bus client
@@ -1448,10 +1460,15 @@ impl PeersPanel {
                 Task::none()
             }
             Message::FlowTick => {
-                // Sample each online peer's overlay throughput (Netdata
-                // system.net) for the particle density. Offline peers / no
-                // overlay → no flow.
-                let mut targets: Vec<(String, String)> = self
+                // MESHMAP-6 — prefer the REAL per-link byte rates from the
+                // mackesd `link-traffic` collector (nftables accounting). It's
+                // a cheap local file read, done synchronously here. Any online
+                // peer the collector covers gets its true per-edge tx/rx; the
+                // rest fall back to the per-node Netdata `sample_flows` proxy
+                // (MESHMAP-3) so a counter-less node keeps working exactly as
+                // before — honest degradation, never a fake split.
+                let real = super::peers_map::read_link_traffic();
+                let online: Vec<&PeerRow> = self
                     .rows
                     .iter()
                     .filter(|r| {
@@ -1459,22 +1476,41 @@ impl PeersPanel {
                             && !r.overlay_ip.is_empty()
                             && r.hostname != self.self_hostname
                     })
-                    .map(|r| (r.hostname.clone(), r.overlay_ip.clone()))
                     .collect();
-                // MESHMAP-3 (W3) — also sample SELF's own throughput (its local
-                // Netdata on loopback) so the self→peer particle stream (self is
-                // the sender that direction) has a real density to ride. Keyed
-                // under the self hostname so the Map view reads it as `self_flow`.
-                if !self.self_hostname.is_empty() {
-                    targets.push((self.self_hostname.clone(), "127.0.0.1".to_string()));
-                }
-                if targets.is_empty() {
+                if online.is_empty() {
                     self.flows.clear();
+                    return Task::none();
+                }
+                // Seed the real per-link flows immediately; only the
+                // proxy-fallback peers need the (slower) off-thread Netdata
+                // sample.
+                let mut seeded = std::collections::HashMap::new();
+                let mut proxy_targets: Vec<(String, String)> = Vec::new();
+                for r in &online {
+                    if let Some(flow) = real.get(&r.hostname) {
+                        seeded.insert(r.hostname.clone(), *flow);
+                    } else {
+                        proxy_targets.push((r.hostname.clone(), r.overlay_ip.clone()));
+                    }
+                }
+                self.flows = seeded;
+                // MESHMAP-3 (W3) — also proxy-sample SELF's own throughput (its
+                // local Netdata on loopback) so the self→peer particle stream
+                // (self is the sender that direction) has a real density to ride.
+                // Self has no per-link self→self counter, so it's always proxied;
+                // keyed under the self hostname so the Map view reads it as
+                // `self_flow` (via `LinkFlow.tx`).
+                if !self.self_hostname.is_empty() {
+                    proxy_targets.push((self.self_hostname.clone(), "127.0.0.1".to_string()));
+                }
+                if proxy_targets.is_empty() {
+                    // Every online peer is real-sourced (and no self) — no
+                    // Netdata sampling needed.
                     return Task::none();
                 }
                 Task::perform(
                     async move {
-                        tokio::task::spawn_blocking(move || sample_flows(&targets))
+                        tokio::task::spawn_blocking(move || sample_flows(&proxy_targets))
                             .await
                             .unwrap_or_default()
                     },
@@ -1482,7 +1518,12 @@ impl PeersPanel {
                 )
             }
             Message::FlowsSampled(flows) => {
-                self.flows = flows;
+                // MESHMAP-6 — these are the PROXY-fallback peers (the real
+                // ones were seeded in FlowTick). Merge them in without
+                // clobbering the real per-link flows already set.
+                for (host, flow) in flows {
+                    self.flows.entry(host).or_insert(flow);
+                }
                 Task::none()
             }
             Message::FlowAnim => {
@@ -2171,7 +2212,11 @@ impl PeersPanel {
                     rtt_ms: self.rtt.get(&r.hostname).copied().flatten(),
                     is_self: r.hostname == self.self_hostname,
                     lighthouse: super::peers_map::is_lighthouse(&r.role, &r.overlay_ip, &lh_ips),
-                    flow: self.flows.get(&r.hostname).copied().unwrap_or(0.0),
+                    // MESHMAP-6 — the per-link tx feeds the self→peer stream...
+                    flow: self.flows.get(&r.hostname).map(|f| f.tx).unwrap_or(0.0),
+                    // ...and the per-link rx feeds the peer→self stream (0 under
+                    // the proxy → reverse stream honestly stays off).
+                    flow_rx: self.flows.get(&r.hostname).map(|f| f.rx).unwrap_or(0.0),
                     // W7 — resolve the relay overlay-IP to its node hostname (so
                     // the draw pass can bend through that node's position); a
                     // direct/overlay path or an unknown relay IP leaves it None.
@@ -2187,7 +2232,13 @@ impl PeersPanel {
             let geo = super::peers_map::any_geo_known(&nodes);
             let positions = super::peers_map::geo_layout(&nodes);
             // MESHMAP-3 (W3) — self's own throughput drives the self→peer stream.
-            let self_flow = self.flows.get(&self.self_hostname).copied().unwrap_or(0.0);
+            // MESHMAP-6 — `flows` is now per-link `LinkFlow`; self's loopback
+            // proxy sample carries it on `tx`.
+            let self_flow = self
+                .flows
+                .get(&self.self_hostname)
+                .map(|f| f.tx)
+                .unwrap_or(0.0);
             // `MapProgram` implements `canvas::Program` for the stock
             // `cosmic::iced::Theme`, so the canvas is a stock-themed element;
             // `themer` bridges it into the surrounding `cosmic::Theme` tree.
@@ -3110,15 +3161,26 @@ mod tests {
         // No flow + not in map view → no animation loop.
         assert!(!p.has_flow());
         p.map_view = true;
-        let mut flows = std::collections::HashMap::new();
-        flows.insert("pine".to_string(), 0.5);
-        let _ = p.update(Message::FlowsSampled(flows));
+        // MESHMAP-6 — a real per-link flow (proxy or collector) arms the loop.
+        // `FlowsSampled` now MERGES the proxy-fallback subset (the real flows
+        // are seeded in FlowTick), so seed directly here.
+        p.flows.insert(
+            "pine".to_string(),
+            crate::panels::peers_map::LinkFlow { tx: 0.5, rx: 0.0 },
+        );
         assert!(p.has_flow(), "real traffic arms the animation loop");
         let before = p.flow_phase;
         let _ = p.update(Message::FlowAnim);
         assert!(p.flow_phase > before, "phase advances");
+        // MESHMAP-6 — the reverse (rx) stream alone also arms the loop.
+        p.flows.clear();
+        p.flows.insert(
+            "oak".to_string(),
+            crate::panels::peers_map::LinkFlow { tx: 0.0, rx: 0.4 },
+        );
+        assert!(p.has_flow(), "a peer→self stream arms the loop too");
         // Idle traffic disarms the loop (L22 — idle mesh, idle CPU).
-        let _ = p.update(Message::FlowsSampled(std::collections::HashMap::new()));
+        p.flows.clear();
         assert!(!p.has_flow());
     }
 

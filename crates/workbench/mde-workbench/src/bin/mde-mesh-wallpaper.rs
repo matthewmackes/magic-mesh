@@ -77,6 +77,12 @@ struct Wallpaper {
     /// keyed by hostname incl. self (loopback). Drives the per-direction
     /// particle density; an empty/all-idle map runs no animation (W8).
     flows: HashMap<String, f64>,
+    /// MESHMAP-6 — the REAL per-link tx/rx from the `link-traffic` collector
+    /// cache (refreshed each roster tick). Where a peer is present here the
+    /// proxy fold (`apply_flows_to`) leaves its tx alone (the collector wins),
+    /// and these rates also feed the rx side of the `has_flow` idle gate so an
+    /// idle mesh still arms no animation loop.
+    real_flows: HashMap<String, mde_workbench::panels::peers_map::LinkFlow>,
     /// MESHMAP-3 (W3) — self's own normalized throughput (the self→peer stream's
     /// sender density). Cached from `flows[self_hostname]` on each sample.
     self_flow: f64,
@@ -95,7 +101,18 @@ impl Wallpaper {
     /// tick is subscribed only when this holds, so an idle mesh runs no loop.
     /// Reduce-motion always reports false (static edges, no animation — W8/WCAG).
     fn has_flow(&self) -> bool {
-        !mde_workbench::live_theme::reduce_motion() && self.flows.values().any(|f| *f > 0.02)
+        if mde_workbench::live_theme::reduce_motion() {
+            return false;
+        }
+        // The MESHMAP-3 proxy tx (self→peer busy-ness)...
+        self.flows.values().any(|f| *f > 0.02)
+            // ...OR MESHMAP-6's real per-link tx/rx (the collector covers the
+            // reverse peer→self stream the proxy never could, so the idle gate
+            // must see rx too — else a pure-rx edge would draw with no anim).
+            || self
+                .real_flows
+                .values()
+                .any(|f| f.tx > 0.02 || f.rx > 0.02)
     }
 }
 
@@ -120,6 +137,8 @@ struct LoadedData {
     geo: bool,
     self_hostname: String,
     ips: HashMap<String, String>,
+    /// MESHMAP-6 — the REAL per-link tx/rx the collector covered this refresh.
+    real_flows: HashMap<String, mde_workbench::panels::peers_map::LinkFlow>,
 }
 
 /// On battery? (sysfs probe — L22 pauses the cadence down to 5 min.)
@@ -198,6 +217,15 @@ fn refresh_task() -> Task<Message> {
                 let rtt = read_latency_cache();
                 // MESHMAP-4 (W7) — per-peer underlay path (direct vs relayed).
                 let paths = read_latency_paths();
+                // MESHMAP-6 — read the REAL per-link byte rates (the mackesd
+                // `link-traffic` collector cache). A cheap local file read,
+                // exactly like the latency cache above. Where present these are
+                // the real per-link tx/rx; the MESHMAP-3 per-node `sample_flows`
+                // proxy (below) only fills the self→peer (tx) direction for
+                // peers the collector doesn't cover. Absent cache → empty → the
+                // reverse (rx) stream stays off (honest: the proxy can't split
+                // direction, so it never fakes a reverse flow).
+                let flows = mde_workbench::panels::peers_map::read_link_traffic();
                 let hostname = std::process::Command::new("hostname")
                     .output()
                     .ok()
@@ -205,7 +233,7 @@ fn refresh_task() -> Task<Message> {
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
                 let lh_ips = mde_workbench::panels::peers_map::lighthouse_overlay_ips();
-                let nodes = parse_nodes(&raw, &rtt, &paths, &hostname, &lh_ips);
+                let nodes = parse_nodes(&raw, &rtt, &paths, &flows, &hostname, &lh_ips);
                 let geo = any_geo_known(&nodes);
                 let ips = parse_overlay_ips(&raw);
                 Box::new(LoadedData {
@@ -213,6 +241,10 @@ fn refresh_task() -> Task<Message> {
                     geo,
                     self_hostname: hostname,
                     ips,
+                    // MESHMAP-6 — the set of peers the real collector covers,
+                    // so the proxy fold below treats them as already-real (tx)
+                    // and never overwrites them, and the rx idle gate can see them.
+                    real_flows: flows,
                 })
             })
             .await
@@ -222,6 +254,7 @@ fn refresh_task() -> Task<Message> {
                     geo: false,
                     self_hostname: String::new(),
                     ips: HashMap::new(),
+                    real_flows: HashMap::new(),
                 })
             })
         },
@@ -254,7 +287,13 @@ fn flow_task(
                 if !self_hostname.is_empty() {
                     targets.push((self_hostname, "127.0.0.1".to_string()));
                 }
+                // MESHMAP-6 — `sample_flows` now returns per-link `LinkFlow`; the
+                // proxy only carries `tx` busy-ness (rx is always 0), so collapse
+                // to the per-node f64 the wallpaper's proxy map expects.
                 sample_flows(&targets)
+                    .into_iter()
+                    .map(|(host, f)| (host, f.tx))
+                    .collect::<HashMap<String, f64>>()
             })
             .await
             .unwrap_or_default()
@@ -290,10 +329,17 @@ fn parse_overlay_ips(raw: &str) -> HashMap<String, String> {
 /// hero agrees with the in-app Peers Map + Fleet rollup. `paths` resolves each
 /// peer's relay (W7): a relayed peer's `relay_via` overlay-IP is mapped to the
 /// relaying node's hostname so the draw pass bends the edge through it.
+/// MESHMAP-6 — `flows` is the REAL per-link tx/rx from the `link-traffic`
+/// collector cache: where a peer is present its `flow` (self→peer tx) and
+/// `flow_rx` (peer→self rx) come straight off the collector; an uncovered peer
+/// gets `flow: 0.0` here and is filled by the MESHMAP-3 `sample_flows` proxy
+/// later (`apply_flows_to`), while `flow_rx` stays 0 (the proxy can't split
+/// direction, so the reverse stream honestly stays off).
 fn parse_nodes(
     raw: &str,
     rtt: &HashMap<String, Option<f64>>,
     paths: &HashMap<String, mde_workbench::panels::peers_map::PathInfo>,
+    flows: &HashMap<String, mde_workbench::panels::peers_map::LinkFlow>,
     self_hostname: &str,
     lh_ips: &[String],
 ) -> Vec<MapNode> {
@@ -331,15 +377,21 @@ fn parse_nodes(
                     .as_deref()
                     .and_then(|ip| ip_to_host.get(ip).map(|h| (*h).to_string()))
             });
+            // MESHMAP-6 — the REAL per-link tx/rx from the `link-traffic`
+            // collector cache (read once per refresh in `refresh_task`). Where
+            // the collector covers this peer its rates land directly; otherwise
+            // `flow` (tx) stays idle here and the MESHMAP-3 `sample_flows` proxy
+            // fills it on the next FlowTick, while `flow_rx` stays 0 (the proxy
+            // can't split direction → the reverse stream honestly stays off).
+            let real = flows.get(&hostname).copied().unwrap_or_default();
             Some(MapNode {
                 hostname,
                 presence,
                 rtt_ms,
                 is_self,
                 lighthouse,
-                // Flow is wired live by the FlowTick sampler (see `update`);
-                // parse builds it idle, the sampler fills it on the next tick.
-                flow: 0.0,
+                flow: real.tx,
+                flow_rx: real.rx,
                 relay_via,
             })
         })
@@ -355,12 +407,17 @@ fn update(state: &mut Wallpaper, message: Message) -> Task<Message> {
             // (empty → populated) also arms the flow sampler.
             let first = state.nodes.is_empty() && !data.nodes.is_empty();
             let mut data = data;
-            // Carry the live flows onto the freshly-parsed nodes so a roster
-            // refresh (which rebuilds nodes with flow:0.0) doesn't blink the
-            // particles off until the next FlowTick — and so the change check
-            // compares apples to apples (roster identity, not transient flow).
+            // MESHMAP-6 — the freshly-read real per-link flows (collector cache)
+            // are already baked onto the parsed nodes; cache them for the rx idle
+            // gate + the proxy-fallback skip set.
+            state.real_flows = data.real_flows.clone();
+            // Carry the live proxy flows onto the freshly-parsed nodes so a roster
+            // refresh doesn't blink the particles off until the next FlowTick —
+            // and so the change check compares apples to apples (roster identity,
+            // not transient flow). The proxy only fills peers the collector
+            // doesn't cover (MESHMAP-6 collector wins; see `apply_flows_to`).
             let flows = state.flows.clone();
-            apply_flows_to(&mut data.nodes, &flows);
+            apply_flows_to(&mut data.nodes, &flows, &data.real_flows);
             if data.nodes != state.nodes || data.geo != state.geo {
                 // MESHMAP-1 (W4) — geo placement when any node is region-known.
                 state.positions = geo_layout(&data.nodes);
@@ -389,8 +446,10 @@ fn update(state: &mut Wallpaper, message: Message) -> Task<Message> {
             )
         }
         Message::FlowsSampled(flows) => {
-            // Fold the sampled per-node flow onto the nodes (drives the peer→
-            // self stream density) + cache self's own (the self→peer stream).
+            // Fold the sampled per-node proxy flow onto the nodes (drives the
+            // self→peer stream density for peers the collector doesn't cover) +
+            // cache self's own (the self→peer stream). MESHMAP-6: peers the
+            // real `link-traffic` collector covers keep their collector rate.
             self_apply_flows(state, &flows);
             state.flows = flows;
             Task::none()
@@ -406,21 +465,38 @@ fn update(state: &mut Wallpaper, message: Message) -> Task<Message> {
 
 /// Fold sampled per-node flow onto the node set + cache self's own throughput.
 fn self_apply_flows(state: &mut Wallpaper, flows: &HashMap<String, f64>) {
-    apply_flows_to(&mut state.nodes, flows);
+    let real = state.real_flows.clone();
+    apply_flows_to(&mut state.nodes, flows, &real);
     state.self_flow = flows.get(&state.self_hostname).copied().unwrap_or(0.0);
 }
 
-/// Fold sampled per-node flow onto a node set: each non-self node gets its
-/// sampled throughput (drives the peer→self particle stream); self's node `flow`
-/// stays 0.0 (self doesn't ride its own edges — `self_flow` drives the self→peer
-/// stream). Pure on `nodes`.
-fn apply_flows_to(nodes: &mut [MapNode], flows: &HashMap<String, f64>) {
+/// Fold the per-node sources onto a node set. MESHMAP-6 — the real per-link
+/// collector (`real`) is authoritative: a covered peer keeps its collector tx
+/// (`flow`) + rx (`flow_rx`); an uncovered peer falls back to the MESHMAP-3
+/// `sample_flows` per-node proxy (`flows`) for `flow` (tx busy-ness) and stays
+/// `flow_rx: 0.0` (the proxy can't split direction → the reverse stream honestly
+/// stays off). Self's node `flow` stays 0.0 (self doesn't ride its own edges —
+/// `self_flow` drives the self→peer stream). Pure on `nodes`.
+fn apply_flows_to(
+    nodes: &mut [MapNode],
+    flows: &HashMap<String, f64>,
+    real: &HashMap<String, mde_workbench::panels::peers_map::LinkFlow>,
+) {
     for n in nodes.iter_mut() {
-        n.flow = if n.is_self {
-            0.0
+        if n.is_self {
+            n.flow = 0.0;
+            n.flow_rx = 0.0;
+            continue;
+        }
+        if let Some(rf) = real.get(&n.hostname) {
+            // Collector covers this peer → real tx/rx win over the proxy.
+            n.flow = rf.tx;
+            n.flow_rx = rf.rx;
         } else {
-            flows.get(&n.hostname).copied().unwrap_or(0.0)
-        };
+            // Fallback: per-node proxy tx; no real rx data → reverse stream off.
+            n.flow = flows.get(&n.hostname).copied().unwrap_or(0.0);
+            n.flow_rx = 0.0;
+        }
     }
 }
 
@@ -448,6 +524,12 @@ fn view(state: &Wallpaper, _id: window::Id) -> Element<'_, Message, Theme> {
 mod tests {
     use super::*;
 
+    /// Shared empty per-link flow map for the parse tests that don't
+    /// exercise MESHMAP-6 flow wiring.
+    fn no_flows() -> std::collections::HashMap<String, mde_workbench::panels::peers_map::LinkFlow> {
+        std::collections::HashMap::new()
+    }
+
     #[test]
     fn nodes_parse_from_the_peers_json() {
         let raw = r#"{"ok":true,"head":null,"peers":[
@@ -456,12 +538,40 @@ mod tests {
         let mut rtt = std::collections::HashMap::new();
         rtt.insert("oak".to_string(), Some(20.0));
         let paths = HashMap::new();
-        let nodes = parse_nodes(raw, &rtt, &paths, "pine", &[]);
+        let nodes = parse_nodes(raw, &rtt, &paths, &no_flows(), "pine", &[]);
         assert_eq!(nodes.len(), 2);
         assert!(nodes[0].is_self);
         assert_eq!(nodes[1].rtt_ms, Some(20.0));
         assert!(!nodes[0].lighthouse, "no lighthouse signal → plain peer");
-        assert!(parse_nodes("junk", &rtt, &paths, "x", &[]).is_empty());
+        assert!(parse_nodes("junk", &rtt, &paths, &no_flows(), "x", &[]).is_empty());
+    }
+
+    #[test]
+    fn meshmap6_real_per_link_flow_feeds_the_wallpaper() {
+        // MESHMAP-6 — the collector cache's per-link tx/rx lands on the node.
+        let raw = r#"{"peers":[
+            {"hostname":"anvil","presence":"online","overlay_ip":"10.42.0.5"}]}"#;
+        let rtt = std::collections::HashMap::new();
+        let paths = HashMap::new();
+        let mut flows = std::collections::HashMap::new();
+        flows.insert(
+            "anvil".to_string(),
+            mde_workbench::panels::peers_map::LinkFlow { tx: 0.42, rx: 0.11 },
+        );
+        let nodes = parse_nodes(raw, &rtt, &paths, &flows, "self", &[]);
+        assert_eq!(nodes.len(), 1);
+        assert!(
+            (nodes[0].flow - 0.42).abs() < 1e-9,
+            "real tx feeds self→peer"
+        );
+        assert!(
+            (nodes[0].flow_rx - 0.11).abs() < 1e-9,
+            "real rx feeds peer→self"
+        );
+        // Absent cache → no particles (the wallpaper never ran the proxy).
+        let bare = parse_nodes(raw, &rtt, &paths, &no_flows(), "self", &[]);
+        assert_eq!(bare[0].flow, 0.0);
+        assert_eq!(bare[0].flow_rx, 0.0);
     }
 
     #[test]
@@ -501,7 +611,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let nodes = parse_nodes(raw, &rtt, &paths, "self", &["10.42.0.1".to_string()]);
+        let nodes = parse_nodes(raw, &rtt, &paths, &no_flows(), "self", &["10.42.0.1".to_string()]);
         let by = |h: &str| nodes.iter().find(|n| n.hostname == h).unwrap();
         assert_eq!(
             by("forge").relay_via.as_deref(),
@@ -526,6 +636,7 @@ mod tests {
                     is_self: true,
                     lighthouse: false,
                     flow: 0.0,
+                    flow_rx: 0.0,
                     relay_via: None,
                 },
                 MapNode {
@@ -535,6 +646,7 @@ mod tests {
                     is_self: false,
                     lighthouse: false,
                     flow: 0.0,
+                    flow_rx: 0.0,
                     relay_via: None,
                 },
             ],
@@ -548,13 +660,78 @@ mod tests {
         let me = state.nodes.iter().find(|n| n.is_self).unwrap();
         assert!(
             (forge.flow - 0.4).abs() < 1e-9,
-            "peer flow folded onto node"
+            "peer proxy flow (tx) folded onto node"
+        );
+        assert_eq!(
+            forge.flow_rx, 0.0,
+            "proxy can't split direction → reverse (rx) stream stays off"
         );
         assert_eq!(
             me.flow, 0.0,
             "self's node flow stays 0 (self_flow drives it)"
         );
         assert!((state.self_flow - 0.7).abs() < 1e-9, "self_flow cached");
+    }
+
+    #[test]
+    fn meshmap6_real_collector_wins_over_the_proxy() {
+        // MESHMAP-6 — where the `link-traffic` collector covers a peer, its real
+        // per-link tx/rx win over the MESHMAP-3 per-node proxy (and feed the
+        // reverse stream the proxy never could); an uncovered peer falls back to
+        // the proxy tx with rx off.
+        let mut state = Wallpaper {
+            self_hostname: "self".to_string(),
+            nodes: vec![
+                MapNode {
+                    hostname: "anvil".into(),
+                    presence: "online".into(),
+                    rtt_ms: Some(5.0),
+                    is_self: false,
+                    lighthouse: false,
+                    flow: 0.0,
+                    flow_rx: 0.0,
+                    relay_via: None,
+                },
+                MapNode {
+                    hostname: "forge".into(),
+                    presence: "online".into(),
+                    rtt_ms: Some(10.0),
+                    is_self: false,
+                    lighthouse: false,
+                    flow: 0.0,
+                    flow_rx: 0.0,
+                    relay_via: None,
+                },
+            ],
+            // anvil is collector-covered; forge is not.
+            real_flows: [(
+                "anvil".to_string(),
+                mde_workbench::panels::peers_map::LinkFlow { tx: 0.9, rx: 0.3 },
+            )]
+            .into_iter()
+            .collect(),
+            ..Wallpaper::default()
+        };
+        // The proxy would attribute 0.4 to anvil + 0.5 to forge.
+        let flows: HashMap<String, f64> = [("anvil".to_string(), 0.4), ("forge".to_string(), 0.5)]
+            .into_iter()
+            .collect();
+        self_apply_flows(&mut state, &flows);
+        let anvil = state.nodes.iter().find(|n| n.hostname == "anvil").unwrap();
+        let forge = state.nodes.iter().find(|n| n.hostname == "forge").unwrap();
+        assert!(
+            (anvil.flow - 0.9).abs() < 1e-9,
+            "collector tx wins over the proxy"
+        );
+        assert!(
+            (anvil.flow_rx - 0.3).abs() < 1e-9,
+            "collector feeds the reverse rx stream"
+        );
+        assert!(
+            (forge.flow - 0.5).abs() < 1e-9,
+            "uncovered peer keeps the proxy tx"
+        );
+        assert_eq!(forge.flow_rx, 0.0, "uncovered peer has no rx (proxy only)");
     }
 
     #[test]
@@ -585,7 +762,7 @@ mod tests {
         let rtt = std::collections::HashMap::new();
         let paths = HashMap::new();
         let lh_ips = vec!["10.42.0.1".to_string()];
-        let nodes = parse_nodes(raw, &rtt, &paths, "self", &lh_ips);
+        let nodes = parse_nodes(raw, &rtt, &paths, &no_flows(), "self", &lh_ips);
         let by = |h: &str| nodes.iter().find(|n| n.hostname == h).unwrap().lighthouse;
         assert!(by("lh-role"), "role==lighthouse flags the anchor");
         assert!(

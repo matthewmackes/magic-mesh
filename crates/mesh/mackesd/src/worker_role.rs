@@ -67,6 +67,10 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     ("stun_gather", 0),
     ("mdns_relay", 0),
     ("mesh_latency", 0),
+    // MESHMAP-6 — per-link byte-counter collector (nftables accounting on
+    // the Nebula iface). A control-plane traffic observer that runs on
+    // every node, like mesh_latency.
+    ("link-traffic", 0),
     ("mesh_dns", 0),
     ("hardware_probe", 0),
     ("bus_supervisor", 0),
@@ -301,7 +305,8 @@ mod tests {
         // pushes instant peer-down / leader-change alerts off etcd watch streams).
         // +1 music_autoconfig (MEDIA-8 — Workstation music birthright: writes the
         // desktop user's airsonic-creds.json from the published mesh shared account).
-        assert_eq!(WORKER_TIERS.len(), 29);
+        // +1 link-traffic (MESHMAP-6 — per-link byte-counter collector, rank 0).
+        assert_eq!(WORKER_TIERS.len(), 30);
     }
 
     #[test]
@@ -324,8 +329,8 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            21,
-            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe)"
+            22,
+            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic)"
         );
         assert_eq!(
             count(1),
@@ -388,11 +393,12 @@ mod tests {
         let ws = workers_for_rank(Role::Workstation.rank());
         // +1 each (hardware_probe, rank 0 → present in every tier).
         // +1 etcd_watch (SUBSTRATE-10, rank 0 → present in every tier).
-        assert_eq!(lh.len(), 21);
-        assert_eq!(srv.len(), 24);
-        // 29: +clipboard_sync (CLIP-SYNC-1), -clipd_supervisor (removed, CLIP-SYNC-2),
-        // +etcd_watch (SUBSTRATE-10), +music_autoconfig (MEDIA-8).
-        assert_eq!(ws.len(), 29);
+        // +1 link-traffic (MESHMAP-6, rank 0 → present in every tier).
+        assert_eq!(lh.len(), 22);
+        assert_eq!(srv.len(), 25);
+        // 30: +clipboard_sync (CLIP-SYNC-1), -clipd_supervisor (removed, CLIP-SYNC-2),
+        // +etcd_watch (SUBSTRATE-10), +music_autoconfig (MEDIA-8), +link-traffic (MESHMAP-6).
+        assert_eq!(ws.len(), 30);
         // Strict superset: every lower-tier worker is in the higher tier.
         assert!(lh.iter().all(|w| srv.contains(w)));
         assert!(srv.iter().all(|w| ws.contains(w)));
@@ -445,15 +451,15 @@ mod tests {
             "media ≠ workstation tier"
         );
         let set = workers_for_class(media_lh);
-        // = the 21 lighthouse-tier workers + navidrome.
-        assert_eq!(set.len(), 22);
+        // = the 22 lighthouse-tier workers (incl. link-traffic, MESHMAP-6) + navidrome.
+        assert_eq!(set.len(), 23);
         assert!(set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 21);
+        assert_eq!(workers_for_class(plain_lh).len(), 22);
     }
 
     #[test]

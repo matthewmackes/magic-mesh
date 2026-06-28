@@ -6955,6 +6955,44 @@ fn run_serve(
             }
         }
 
+        // MESHMAP-6 (2026-06-27) — real per-link byte counters. Maintains an
+        // nftables accounting table on the Nebula interface (one passive
+        // counter per peer overlay IP per direction), reads byte deltas every
+        // 5 s, and writes ~/.cache/mde/link-traffic.json. The mesh wallpaper /
+        // Peers-Map flow particles consume it as the REAL per-edge source,
+        // falling back to the per-node `sample_flows` proxy (MESHMAP-3) when
+        // the cache is absent (no nft / non-root / pre-delta). Rank-0 control-
+        // plane observer (runs everywhere, like mesh_latency); honest no-op on
+        // a box without nft (idles on the token, consumer keeps the proxy).
+        if mackesd_core::worker_role::runs("link-traffic", role_rank) {
+            match mackesd_core::store::open(&db_path) {
+                Ok(conn) => {
+                    let lt_store = Arc::new(tokio::sync::Mutex::new(conn));
+                    let lt_cache =
+                        mackesd_core::workers::link_traffic::default_cache_path();
+                    sup.spawn(Spawn::new(
+                        mackesd_core::workers::link_traffic::LinkTrafficWorker::new(
+                            lt_store,
+                            node_id.clone(),
+                            lt_cache,
+                        ),
+                        RestartPolicy::OnFailure,
+                    ));
+                    worker_names
+                        .lock()
+                        .expect("worker_names mutex")
+                        .push("link-traffic".into());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        db_path = %db_path.display(),
+                        "link-traffic: sqlite open failed; worker skipped"
+                    );
+                }
+            }
+        }
+
         // TUNE-16.d (2026-05-30) — Q22 8-peer cap counter. Reads the
         // enrolled peer count every 30 s, writes ~/.cache/mde/peer-cap.json,
         // and publishes to mesh/peer-cap/updated. Phones count (enrolled

@@ -463,9 +463,13 @@ impl FleetRollupPanel {
                     rtt_ms: self.rtt.get(&r.hostname).copied().flatten(),
                     is_self: r.hostname == self.self_hostname,
                     lighthouse: super::peers_map::is_lighthouse(&r.role, &r.overlay_ip, &lh_ips),
-                    // PD-7/L18 — the rollup map is a static overview; no live
-                    // flow particles here (the Peers Map drives those).
+                    // PD-7/L18 + MESHMAP-6 — the rollup map is a static overview;
+                    // no live flow particles here (the Peers Map / wallpaper drive
+                    // those), so both directions stay idle.
                     flow: 0.0,
+                    // MESHMAP-6 — the static rollup doesn't drive the reverse
+                    // (peer→self rx) particle stream either.
+                    flow_rx: 0.0,
                     // MESHMAP-4 — the static rollup doesn't draw relay bends.
                     relay_via: None,
                 })
