@@ -21,9 +21,8 @@ use crate::header::HeaderAction;
 use crate::keyboard::{KeyAction, Pane};
 use crate::model::{resolve_panel_label, view_from_focus_slug, Group, View};
 use crate::panels::{
-    all_services as all_services_panel, router as router_panel,
-    audit as audit_panel, build_farm as build_farm_panel, compute as compute_panel,
-    config_apply as config_apply_panel, connect as connect_panel,
+    all_services as all_services_panel, audit as audit_panel, build_farm as build_farm_panel,
+    compute as compute_panel, config_apply as config_apply_panel, connect as connect_panel,
     connectivity as connectivity_panel, datacenter as datacenter_panel, dns as dns_panel,
     drift as drift_panel, firewall as firewall_panel, fleet_logs as fleet_logs_panel,
     fleet_revisions as fleet_revisions_panel, fleet_rollup as fleet_rollup_panel,
@@ -40,7 +39,7 @@ use crate::panels::{
     playbooks as playbooks_panel, policy as policy_panel, profiles as profiles_panel,
     provisioning as provisioning_panel, registration as registration_panel,
     remote_desktop as remote_desktop_panel, repair as repair_panel, resources as resources_panel,
-    routing as routing_panel, run_history as run_history_panel,
+    router as router_panel, routing as routing_panel, run_history as run_history_panel,
     service_publishing as service_publishing_panel, sip_gateway as sip_gateway_panel,
     snapshots as snapshots_panel, sync_status as sync_status_panel,
     system_update as system_update_panel, tags as tags_panel, vpn as vpn_panel,
@@ -509,6 +508,15 @@ impl App {
     #[must_use]
     pub fn with_focus(focus_slug: &str) -> Self {
         let mut app = Self::default();
+        // APPLAUNCH-8/9 — the `launcher` slug (the Start button + Super key) lands
+        // on the Front Door (Dashboard) with its unified launcher OPEN, on a cold
+        // launch exactly as the running-instance hand-off does (apply_focus_request).
+        if focus_slug == "launcher" {
+            app.view = View::Group(Group::Dashboard);
+            app.focused_pane = Pane::Main;
+            app.front_door.launcher.open = true;
+            return app;
+        }
         if let Some(view) = view_from_focus_slug(focus_slug) {
             app.view = view;
             app.focused_pane = Pane::Main;
@@ -723,6 +731,12 @@ impl App {
                 peers_panel::directory_event_subscription()
                     .map(|_| Message::FrontDoor(front_door_panel::Message::Reload)),
             );
+            // APPLAUNCH-8 — the launcher's keyboard-first nav (↑↓/Enter/Esc/Tab
+            // chips/Ctrl+1..5), registered only while the launcher surface is open
+            // so the nav keys don't fight the rest of the workbench when it's shut.
+            if self.front_door.launcher.open {
+                subs.push(front_door_panel::FrontDoor::launcher_key_subscription());
+            }
         }
         // PD-8 (L14) / PLANES-1 — Netdata sampling only while the Peers
         // directory is the active view (the Compute pattern). The Front
@@ -1172,6 +1186,20 @@ impl App {
             // 1.x taskbar click-through behaviour.
             return Task::none();
         }
+        // APPLAUNCH-8/9 — the Start button + Super key press the `launcher` slug
+        // (replacing the retired `mde-apps-applet --toggle`): land on the Dashboard
+        // (the Front Door) and open its unified app-launcher panel mode. This is
+        // the SOLE launcher trigger now — one launcher (Q29/Q33).
+        if slug == "launcher" {
+            self.view = View::Group(Group::Dashboard);
+            self.focused_pane = Pane::Main;
+            return Task::batch([
+                front_door_panel::FrontDoor::load(),
+                Task::done(Message::FrontDoor(
+                    front_door_panel::Message::ToggleLauncher,
+                )),
+            ]);
+        }
         // LIGHTHOUSE-4 — a "<group>.<panel>:<focus>" slug carries a per-item
         // focus target (the Hub footer presses `mesh.lighthouses:<host>`). Split
         // the focus off: the left routes to the view, the right highlights the
@@ -1560,8 +1588,7 @@ impl App {
             } => self.all_services.view(),
             // ROUTER-5 — Mesh → Routers per-node router/firewall view.
             View::Panel {
-                panel: "router",
-                ..
+                panel: "router", ..
             } => self.router.view(),
             // v4.0.1 WB-2.j (2026-05-23) — Network → Mesh
             // Services renders systemctl status + start/stop/
@@ -1685,10 +1712,16 @@ impl Application for App {
         let (mut app, boot) = match PendingFocus::drain() {
             Some(slug) if !slug.is_empty() => {
                 let app = App::with_focus(&slug);
-                let boot = match app.view {
+                let mut boot = match app.view {
                     View::Panel { group, panel } => app.on_panel_navigated(group, panel),
                     View::Group(g) => app.on_group_navigated(g),
                 };
+                // APPLAUNCH-7 — a cold `--focus launcher` opens the launcher: load
+                // its cache (apps/favorites/groups) alongside the tile load so it
+                // paints populated, not empty.
+                if app.front_door.launcher.open {
+                    boot = Task::batch([boot, front_door_panel::FrontDoor::launcher_load()]);
+                }
                 (app, boot)
             }
             // FRONTDOOR-4 — a plain launch lands on the Dashboard/"home" view,
