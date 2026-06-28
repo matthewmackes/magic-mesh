@@ -142,7 +142,11 @@ impl Drop for OpLockGuard<'_> {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 11] = [
+///
+/// DATACENTER-19 adds `do-guided-lighthouse` (the droplet→bootstrap→found/join→DNS
+/// orchestration) and DATACENTER-20 adds `promote-arm` (the Build→Eagle→DO `do`
+/// step gate) + `promote-now` (trigger a stage promotion) to the DO surface.
+pub const ACTION_VERBS: [&str; 14] = [
     "vm-power",
     "vm-snapshot",
     "vm-clone",
@@ -156,6 +160,9 @@ pub const ACTION_VERBS: [&str; 11] = [
     "vm-migrate",
     "vm-create",
     "vm-bulk",
+    "do-guided-lighthouse",
+    "promote-arm",
+    "promote-now",
 ];
 
 /// Whether `verb` MUTATES infrastructure (so it is RBAC-gated to `operator` and
@@ -424,6 +431,9 @@ pub fn build_reply(svc: &DatacenterService, verb: &str, req_body: Option<&str>) 
         "vm-migrate" => vm_migrate_reply(req_body),
         "vm-create" => vm_create_reply(svc, req_body),
         "vm-bulk" => vm_bulk_reply(req_body),
+        "do-guided-lighthouse" => do_guided_lighthouse_reply(svc, req_body),
+        "promote-arm" => promote_arm_reply(svc, req_body),
+        "promote-now" => promote_now_reply(svc, req_body),
         _ => err("unknown dc verb".into()),
     }
 }
@@ -1236,6 +1246,331 @@ fn vm_create_reply(svc: &DatacenterService, req_body: Option<&str>) -> String {
     }
 }
 
+// ---- DATACENTER-19: guided new-lighthouse orchestration -----------------------
+//
+// One orchestrated job: droplet (Tofu) → bootstrap mackesd → found/join the prod
+// mesh → add the DNS record, with per-step progress on `event/dc/job/<jobid>`.
+// The plan is PURE + unit-tested; the executor runs each real step on a detached
+// thread and replies immediately with the job id so the long flow streams its
+// progress instead of blocking the responder.
+
+/// A doctl region slug is valid? `[a-z0-9-]`, non-empty, ≤ 16 chars. PURE.
+#[must_use]
+pub fn valid_region(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 16
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// The deterministic droplet/host name for a guided lighthouse in `region` at
+/// `ts`: `lighthouse-<region>-<ts>`. PURE.
+#[must_use]
+pub fn guided_droplet_name(region: &str, ts: u64) -> String {
+    format!("lighthouse-{region}-{ts}")
+}
+
+/// The shell fragment that resolves the new droplet's public IPv4 by name via
+/// doctl (no jq dependency — `--format`/`--no-header` + awk), failing the step if
+/// no public IP has surfaced yet. PURE — `name` is whitelisted `[a-z0-9-]`.
+fn ip_resolve(name: &str) -> String {
+    format!(
+        "IP=$(doctl compute droplet list --context ${{MCNF_DOCTL_CONTEXT:-mackes}} \
+         --format Name,PublicIPv4 --no-header 2>/dev/null | awk '$1==\"{name}\"{{print $2}}'); \
+         [ -n \"$IP\" ] || {{ echo 'no public IP for {name}' >&2; exit 1; }}"
+    )
+}
+
+/// Build the ordered guided-lighthouse plan for `region`/`name`. PURE — each step
+/// is a `(name, bash-script)` pair run in order. The droplet step is the in-repo
+/// `zone1-do` Tofu apply; the bootstrap/found-join/DNS steps shell the sibling
+/// `automation/lighthouse/*` scripts (referenced by path, the same pattern as the
+/// DR backup) against the resolved droplet IP.
+#[must_use]
+pub fn guided_lighthouse_plan(region: &str, name: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "droplet",
+            format!(
+                "cd infra/tofu/zone1-do && source ./env.sh 2>/dev/null && \
+                 tofu apply -auto-approve -no-color \
+                 -var 'lighthouse_name={name}' -var 'lighthouse_region={region}' 2>&1 | tail -20"
+            ),
+        ),
+        (
+            "await-ip",
+            format!(
+                "for i in $(seq 1 30); do {ip}; echo \"$IP\"; exit 0; done",
+                ip = ip_resolve(name)
+            ),
+        ),
+        (
+            "bootstrap",
+            format!(
+                "{ip}; bash automation/lighthouse/bootstrap.sh \"$IP\"",
+                ip = ip_resolve(name)
+            ),
+        ),
+        (
+            "found-join",
+            format!(
+                "{ip}; bash automation/lighthouse/found-join.sh \"$IP\"",
+                ip = ip_resolve(name)
+            ),
+        ),
+        (
+            "dns",
+            format!(
+                "{ip}; bash automation/lighthouse/add-dns.sh {name} \"$IP\"",
+                ip = ip_resolve(name)
+            ),
+        ),
+    ]
+}
+
+/// Publish one job-progress body onto `event/dc/job/<jobid>` (fire-and-reap, the
+/// same lane shape as the dc workers).
+fn publish_job(jobid: &str, body: &str) {
+    let mut cmd = std::process::Command::new("mde-bus");
+    cmd.args([
+        "publish",
+        &format!("event/dc/job/{jobid}"),
+        "--body-flag",
+        body,
+    ]);
+    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+}
+
+/// Run the guided-lighthouse plan to completion on the calling (detached) thread,
+/// publishing a progress event per step transition and a terminal job event. Stops
+/// at the first failing step (honest: a failed Tofu apply ends the job in
+/// `error`, with the step + detail on the Bus).
+fn run_guided_job(jobid: String, region: String, plan: Vec<(&'static str, String)>) {
+    publish_job(
+        &jobid,
+        &json!({ "job": jobid, "region": region, "status": "running", "step": "start" })
+            .to_string(),
+    );
+    for (step, script) in plan {
+        publish_job(
+            &jobid,
+            &json!({ "job": jobid, "region": region, "status": "running", "step": step })
+                .to_string(),
+        );
+        let out = std::process::Command::new("bash")
+            .args(["-lc", &script])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let detail: String = String::from_utf8_lossy(&o.stdout)
+                    .trim()
+                    .chars()
+                    .take(200)
+                    .collect();
+                publish_job(
+                    &jobid,
+                    &json!({ "job": jobid, "region": region, "status": "step-ok", "step": step, "detail": detail })
+                        .to_string(),
+                );
+            }
+            Ok(o) => {
+                let detail: String = String::from_utf8_lossy(&o.stderr)
+                    .trim()
+                    .chars()
+                    .take(200)
+                    .collect();
+                publish_job(
+                    &jobid,
+                    &json!({ "job": jobid, "region": region, "status": "error", "step": step, "detail": detail })
+                        .to_string(),
+                );
+                return;
+            }
+            Err(e) => {
+                publish_job(
+                    &jobid,
+                    &json!({ "job": jobid, "region": region, "status": "error", "step": step, "detail": format!("spawn failed: {e}") })
+                        .to_string(),
+                );
+                return;
+            }
+        }
+    }
+    publish_job(
+        &jobid,
+        &json!({ "job": jobid, "region": region, "status": "ok", "step": "done" }).to_string(),
+    );
+}
+
+/// Handle a `do-guided-lighthouse` request: RBAC + confirm + region validation,
+/// then kick off the orchestrated job on a detached thread and reply immediately
+/// with the job id + planned steps. Body `{ region, confirm:true, principal? }`.
+fn do_guided_lighthouse_reply(_svc: &DatacenterService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("do-guided-lighthouse: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("do-guided-lighthouse: bad json: {e}")),
+    };
+    if let Err(e) =
+        crate::ipc::dc_common::rbac_gate_mutating(crate::ipc::dc_common::body_principal(&req))
+    {
+        return err(e);
+    }
+    if req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return err("do-guided-lighthouse requires confirm:true".into());
+    }
+    let region = req
+        .get("region")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !valid_region(region) {
+        return err("region must be a doctl slug ([a-z0-9-], ≤16 chars)".into());
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let name = guided_droplet_name(region, ts);
+    let jobid = format!("guided-lh-{name}");
+    let plan = guided_lighthouse_plan(region, &name);
+    let step_names: Vec<&str> = plan.iter().map(|(n, _)| *n).collect();
+    // Run the long flow off the responder thread; it streams progress to
+    // event/dc/job/<jobid>. A failed spawn degrades to a synchronous error.
+    let (jid, reg, pl) = (jobid.clone(), region.to_string(), plan);
+    if let Err(e) = std::thread::Builder::new()
+        .name("dc-guided-lighthouse".into())
+        .spawn(move || run_guided_job(jid, reg, pl))
+    {
+        return err(format!("do-guided-lighthouse: spawn failed: {e}"));
+    }
+    json!({ "ok": true, "job": jobid, "name": name, "steps": step_names }).to_string()
+}
+
+// ---- DATACENTER-20: promotion arm + trigger ----------------------------------
+
+/// Whether a `promote-now` to `stage` is allowed given the promote prod-arm state.
+/// PURE. Only the production `do` (DigitalOcean) step is gated; `eagle` (the
+/// Build→Eagle hop) is always allowed.
+///
+/// # Errors
+/// Returns the disarmed reason when promoting to `do` while the gate is off.
+pub fn promote_now_gate(stage: &str, armed: bool) -> Result<(), String> {
+    if (stage == "do" || stage == "prod") && !armed {
+        return Err(
+            "prod disarmed: arm promotion (action/dc/promote-arm {\"on\":true}) \
+             before promoting to do"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Handle a `promote-arm` request: read or set the Build→Eagle→DO **`do` step**
+/// prod-arm gate. A set carries `{"on": <bool>}` (RBAC-gated + persisted); a bare
+/// read omits `on`. Reply `{"ok":true,"armed":<bool>}`.
+fn promote_arm_reply(svc: &DatacenterService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("promote-arm: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("promote-arm: bad json: {e}")),
+    };
+    let state_dir = crate::ipc::dc_common::dc_state_dir(&svc.workgroup_root);
+    if let Some(on) = req.get("on").and_then(serde_json::Value::as_bool) {
+        if let Err(e) =
+            crate::ipc::dc_common::rbac_gate_mutating(crate::ipc::dc_common::body_principal(&req))
+        {
+            return err(e);
+        }
+        if let Err(e) = crate::ipc::dc_common::write_arm(&state_dir, "promote", on) {
+            return err(format!("promote-arm: persist failed: {e}"));
+        }
+        return json!({ "ok": true, "armed": on }).to_string();
+    }
+    json!({ "ok": true, "armed": crate::ipc::dc_common::read_arm(&state_dir, "promote") })
+        .to_string()
+}
+
+/// Handle a `promote-now` request: RBAC + confirm, then (for the `do` stage) the
+/// promote prod-arm gate; publish the promotion intent to `event/dc/promote/intent`
+/// and shell the sibling `automation/promote/promote-now.sh <stage> <version>`
+/// (referenced by path, the DR-backup pattern). Body
+/// `{ stage:"eagle"|"do", version?, confirm:true, principal? }`.
+fn promote_now_reply(svc: &DatacenterService, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("promote-now: missing request body".into());
+    };
+    let req: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("promote-now: bad json: {e}")),
+    };
+    if let Err(e) =
+        crate::ipc::dc_common::rbac_gate_mutating(crate::ipc::dc_common::body_principal(&req))
+    {
+        return err(e);
+    }
+    if req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return err("promote-now requires confirm:true".into());
+    }
+    let stage = req
+        .get("stage")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !matches!(stage, "eagle" | "do" | "prod") {
+        return err("promote-now: stage must be eagle|do".into());
+    }
+    let state_dir = crate::ipc::dc_common::dc_state_dir(&svc.workgroup_root);
+    let armed = crate::ipc::dc_common::read_arm(&state_dir, "promote");
+    if let Err(e) = promote_now_gate(stage, armed) {
+        return err(e);
+    }
+    // The version is whitelisted to a release token so it is safe to interpolate.
+    let version = req
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !version.is_empty()
+        && !version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+    {
+        return err("promote-now: version contains invalid characters".into());
+    }
+    // Record the promotion intent on the Bus (no-fixed-center: the action records
+    // intent; the promotion machinery enacts it + the dc_promote worker re-reads
+    // the live versions onto event/dc/promote/*).
+    publish_job(
+        &format!("promote-{stage}"),
+        &json!({ "kind": "promote-intent", "stage": stage, "version": version }).to_string(),
+    );
+    let script = format!("automation/promote/promote-now.sh {stage} {version}");
+    let out = std::process::Command::new("bash")
+        .args(["-lc", &script])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let detail = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            json!({ "ok": true, "stage": stage, "version": version, "detail": detail }).to_string()
+        }
+        Ok(o) => {
+            let mut combined = String::from_utf8_lossy(&o.stdout).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&o.stderr));
+            let msg = combined.trim();
+            if msg.is_empty() {
+                err(format!("promote-now {stage} failed"))
+            } else {
+                err(msg.to_string())
+            }
+        }
+        Err(e) => err(format!("promote-now exec failed: {e}")),
+    }
+}
+
 /// Run the datacenter Bus responder loop on the current thread until `should_stop`.
 pub fn serve_bus<F: Fn() -> bool>(persist: &Persist, svc: &DatacenterService, should_stop: F) {
     let mut cursors: HashMap<String, String> = HashMap::new();
@@ -1768,6 +2103,16 @@ mod tests {
         }
     }
 
+    // ---- DATACENTER-19: guided new-lighthouse ----------------------------------
+
+    #[test]
+    fn dc19_dc20_verbs_in_lock() {
+        for v in ["do-guided-lighthouse", "promote-arm", "promote-now"] {
+            assert_eq!(action_topic(v), format!("action/dc/{v}"));
+            assert!(ACTION_VERBS.contains(&v), "{v} missing");
+        }
+    }
+
     #[test]
     fn is_mutating_marks_only_reads_readonly() {
         assert!(!is_mutating("vm-console"));
@@ -1966,5 +2311,92 @@ mod tests {
                 "{v}"
             );
         }
+    }
+
+    #[test]
+    fn valid_region_whitelists_slugs() {
+        assert!(valid_region("nyc3"));
+        assert!(valid_region("fra1"));
+        assert!(valid_region("sfo3"));
+        // injection / uppercase / empty / too long rejected
+        assert!(!valid_region("nyc3; rm -rf /"));
+        assert!(!valid_region("NYC3"));
+        assert!(!valid_region(""));
+        assert!(!valid_region("a-very-long-region-slug"));
+    }
+
+    #[test]
+    fn guided_name_and_plan_shape() {
+        let name = guided_droplet_name("nyc3", 1_700_000_000);
+        assert_eq!(name, "lighthouse-nyc3-1700000000");
+        let plan = guided_lighthouse_plan("nyc3", &name);
+        let names: Vec<&str> = plan.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec!["droplet", "await-ip", "bootstrap", "found-join", "dns"]
+        );
+        // The droplet step is the in-repo zone1-do Tofu apply, parameterized.
+        assert!(plan[0].1.contains("infra/tofu/zone1-do"));
+        assert!(plan[0].1.contains("tofu apply -auto-approve"));
+        assert!(plan[0].1.contains("lighthouse_region=nyc3"));
+        // The IP-dependent steps resolve the IP via doctl and shell the sibling
+        // automation scripts.
+        assert!(plan[1].1.contains("doctl compute droplet list"));
+        assert!(plan[2].1.contains("automation/lighthouse/bootstrap.sh"));
+        assert!(plan[3].1.contains("automation/lighthouse/found-join.sh"));
+        assert!(plan[4].1.contains("automation/lighthouse/add-dns.sh"));
+    }
+
+    #[test]
+    fn do_guided_lighthouse_gates_before_spawn() {
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        // missing body
+        assert!(build_reply(&s, "do-guided-lighthouse", None).contains("missing request body"));
+        // confirm required (valid region but no confirm → no spawn)
+        let body = json!({ "region": "nyc3" }).to_string();
+        let r = build_reply(&s, "do-guided-lighthouse", Some(&body));
+        assert!(r.contains("requires confirm:true"), "{r}");
+        // bad region with confirm → rejected before any spawn
+        let body = json!({ "region": "nyc3; rm -rf /", "confirm": true }).to_string();
+        let r = build_reply(&s, "do-guided-lighthouse", Some(&body));
+        assert!(r.contains("region must be a doctl slug"), "{r}");
+    }
+
+    // ---- DATACENTER-20: promote arm + trigger ----------------------------------
+
+    #[test]
+    fn promote_now_gate_only_gates_do() {
+        // Build→Eagle is always allowed.
+        assert!(promote_now_gate("eagle", false).is_ok());
+        assert!(promote_now_gate("eagle", true).is_ok());
+        // The DO step is gated.
+        let e = promote_now_gate("do", false).unwrap_err();
+        assert!(e.contains("prod disarmed"), "{e}");
+        assert!(promote_now_gate("do", true).is_ok());
+        assert!(promote_now_gate("prod", true).is_ok());
+    }
+
+    #[test]
+    fn promote_arm_read_reports_state() {
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        let r = build_reply(&s, "promote-arm", Some("{}"));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(v.get("armed").and_then(|a| a.as_bool()).is_some(), "{r}");
+    }
+
+    #[test]
+    fn promote_now_gates_before_exec() {
+        let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
+        // missing body
+        assert!(build_reply(&s, "promote-now", None).contains("missing request body"));
+        // confirm required (returns before any publish/shell)
+        let body = json!({ "stage": "eagle" }).to_string();
+        let r = build_reply(&s, "promote-now", Some(&body));
+        assert!(r.contains("requires confirm:true"), "{r}");
+        // bad stage with confirm → rejected before any publish/shell
+        let body = json!({ "stage": "moon", "confirm": true }).to_string();
+        let r = build_reply(&s, "promote-now", Some(&body));
+        assert!(r.contains("stage must be eagle|do"), "{r}");
     }
 }

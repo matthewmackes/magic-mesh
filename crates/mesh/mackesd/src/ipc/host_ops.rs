@@ -61,7 +61,7 @@ impl HostOpsService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 10] = [
+pub const ACTION_VERBS: [&str; 12] = [
     "host-power",
     "gateway-reboot",
     "dr-backup",
@@ -75,6 +75,9 @@ pub const ACTION_VERBS: [&str; 10] = [
     "host-patch",
     "host-pool",
     "host-console",
+    // DATACENTER-14 — UniFi gateway firewall + port-forward edits (mutating).
+    "gateway-firewall",
+    "gateway-portforward",
 ];
 
 /// Whether `verb` MUTATES (so it is RBAC-gated to `operator`). The read-only verbs
@@ -143,10 +146,9 @@ pub fn valid_ipv4(s: &str) -> bool {
 
 /// Read the UniFi SSH credential best-effort from the mesh secret store by
 /// shelling out to `automation/secrets/mcnf-secret.sh get unifi-cred` from the
-/// repo root. Returns `(user, password)` parsed like the orchestrator's
-/// `gather_gateway` path (`user:pass`, default user `"ubnt"`), or `None` if the
-/// helper is missing, the secret is absent, or the command exits non-zero/empty.
-fn unifi_cred() -> Option<(String, String)> {
+/// repo root. Returns the raw stored value, or `None` if the helper is missing,
+/// the secret is absent, or the command exits non-zero/empty.
+fn unifi_cred_from_store() -> Option<String> {
     let o = std::process::Command::new("bash")
         .args(["-lc", "automation/secrets/mcnf-secret.sh get unifi-cred"])
         .output()
@@ -157,10 +159,32 @@ fn unifi_cred() -> Option<(String, String)> {
     let raw = String::from_utf8_lossy(&o.stdout);
     let raw = raw.trim();
     if raw.is_empty() {
-        return None;
+        None
+    } else {
+        Some(raw.to_string())
     }
+}
+
+/// The host-local UniFi credential file to fall back to (DATACENTER-14):
+/// `MCNF_UNIFI_CRED_FILE` override, else `/root/.mcnf-unifi-cred`.
+fn unifi_cred_file() -> String {
+    std::env::var("MCNF_UNIFI_CRED_FILE").unwrap_or_else(|_| "/root/.mcnf-unifi-cred".to_string())
+}
+
+/// Read the UniFi SSH credential, mesh-secret-store **first**, then falling back
+/// to the host-local `/root/.mcnf-unifi-cred` file (DATACENTER-14). Returns
+/// `(user, password)` parsed like the orchestrator's `gather_gateway` path
+/// (`user:pass`, default user `"ubnt"`), or `None` if neither source yields a
+/// non-empty value.
+fn unifi_cred() -> Option<(String, String)> {
+    let raw = unifi_cred_from_store().or_else(|| {
+        std::fs::read_to_string(unifi_cred_file())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })?;
     Some(crate::workers::datacenter_orchestrator::parse_unifi_cred(
-        raw,
+        &raw,
     ))
 }
 
@@ -305,6 +329,333 @@ fn gateway_status(req_body: Option<&str>) -> Result<(u32, String, String), Strin
     let uptime_line = lines.next().unwrap_or("");
     let model_line = lines.next().unwrap_or("");
     Ok(parse_gateway_status(leases_line, uptime_line, model_line))
+}
+
+// ---- DATACENTER-14: UniFi/EdgeOS gateway firewall + port-forward edits --------
+//
+// The gateway (172.20.0.1) is an EdgeOS/vyatta-config router reached over the
+// same `sshpass` path as `gateway_reboot`/`gateway_status`. The mutations are
+// driven through the vyatta config session (`configure` … `commit; save`), built
+// from STRONGLY-validated request fields — every value is whitelisted to a safe
+// charset/range, so nothing the operator types can carry a shell metacharacter
+// into the remote config script (the same hardening posture as the `xe` verbs).
+
+/// A vyatta config name token (firewall ruleset, etc.): `[A-Za-z0-9_-]`, non-empty,
+/// ≤ 64 chars. PURE injection guard. Returns the same string when valid.
+fn valid_cfg_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A vyatta config rule number `1..=9999`. PURE. Returns the parsed number.
+fn valid_rule_number(v: &serde_json::Value) -> Option<u32> {
+    let n = u32::try_from(v.as_u64()?).ok()?;
+    (1..=9999).contains(&n).then_some(n)
+}
+
+/// A TCP/UDP port `1..=65535`. PURE.
+fn valid_port(v: &serde_json::Value) -> Option<u32> {
+    let n = u32::try_from(v.as_u64()?).ok()?;
+    (1..=65535).contains(&n).then_some(n)
+}
+
+/// A firewall action keyword. PURE allow-list.
+fn valid_fw_action(s: &str) -> bool {
+    matches!(s, "accept" | "drop" | "reject")
+}
+
+/// A protocol keyword EdgeOS accepts in firewall/port-forward rules. PURE.
+fn valid_protocol(s: &str) -> bool {
+    matches!(s, "tcp" | "udp" | "tcp_udp" | "all" | "icmp")
+}
+
+/// A port-forward description: `[A-Za-z0-9 ._-]`, ≤ 64 chars (single-quoted in the
+/// config line, and the charset excludes the quote itself). PURE.
+fn valid_description(s: &str) -> bool {
+    s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-'))
+}
+
+/// Build the vyatta `set`/`delete` config lines for a firewall rule edit. PURE —
+/// the security boundary (every field is whitelisted before it reaches the remote
+/// config script).
+///
+/// Request `rule` object: `{ ruleset, number, op:"set"|"delete", action?, protocol?,
+/// port? }`. A `set` requires `action`; `protocol`/`port` are optional refinements.
+/// A `delete` removes the whole numbered rule.
+///
+/// # Errors
+/// Returns `Err` for a missing/invalid ruleset, number, op, action, protocol, or
+/// port.
+pub fn firewall_config_lines(rule: &serde_json::Value) -> Result<Vec<String>, String> {
+    let ruleset = rule
+        .get("ruleset")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !valid_cfg_name(ruleset) {
+        return Err("firewall: ruleset must be [A-Za-z0-9_-]".into());
+    }
+    let number = rule
+        .get("number")
+        .and_then(valid_rule_number)
+        .ok_or("firewall: number must be 1..=9999")?;
+    let op = rule
+        .get("op")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("set");
+    let base = format!("firewall name {ruleset} rule {number}");
+    if op == "delete" {
+        return Ok(vec![format!("delete {base}")]);
+    }
+    if op != "set" {
+        return Err("firewall: op must be set|delete".into());
+    }
+    let action = rule
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !valid_fw_action(action) {
+        return Err("firewall: action must be accept|drop|reject".into());
+    }
+    let mut lines = vec![format!("set {base} action {action}")];
+    if let Some(proto) = rule.get("protocol").and_then(serde_json::Value::as_str) {
+        if !valid_protocol(proto) {
+            return Err("firewall: protocol must be tcp|udp|tcp_udp|all|icmp".into());
+        }
+        lines.push(format!("set {base} protocol {proto}"));
+    }
+    if let Some(p) = rule.get("port") {
+        let port = valid_port(p).ok_or("firewall: port must be 1..=65535")?;
+        lines.push(format!("set {base} destination port {port}"));
+    }
+    Ok(lines)
+}
+
+/// Build the vyatta `set`/`delete` config lines for a port-forward edit. PURE.
+///
+/// Request `fwd` object: `{ number, op:"set"|"delete", protocol?, original_port?,
+/// forward_ip?, forward_port?, description? }`. A `set` requires `protocol`,
+/// `original_port`, `forward_ip`, and `forward_port`; `description` is optional.
+///
+/// # Errors
+/// Returns `Err` for a missing/invalid number, op, protocol, port, or forward IP.
+pub fn portforward_config_lines(fwd: &serde_json::Value) -> Result<Vec<String>, String> {
+    let number = fwd
+        .get("number")
+        .and_then(valid_rule_number)
+        .ok_or("port-forward: number must be 1..=9999")?;
+    let op = fwd
+        .get("op")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("set");
+    let base = format!("port-forward rule {number}");
+    if op == "delete" {
+        return Ok(vec![format!("delete {base}")]);
+    }
+    if op != "set" {
+        return Err("port-forward: op must be set|delete".into());
+    }
+    let proto = fwd
+        .get("protocol")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !valid_protocol(proto) {
+        return Err("port-forward: protocol must be tcp|udp|tcp_udp|all|icmp".into());
+    }
+    let original_port = fwd
+        .get("original_port")
+        .and_then(valid_port)
+        .ok_or("port-forward: original_port must be 1..=65535")?;
+    let forward_ip = fwd
+        .get("forward_ip")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !valid_ipv4(forward_ip) {
+        return Err("port-forward: forward_ip must be a plain IPv4 address".into());
+    }
+    let forward_port = fwd
+        .get("forward_port")
+        .and_then(valid_port)
+        .ok_or("port-forward: forward_port must be 1..=65535")?;
+    let mut lines = vec![
+        format!("set {base} protocol {proto}"),
+        format!("set {base} original-port {original_port}"),
+        format!("set {base} forward-to address {forward_ip}"),
+        format!("set {base} forward-to port {forward_port}"),
+    ];
+    if let Some(desc) = fwd.get("description").and_then(serde_json::Value::as_str) {
+        if !valid_description(desc) {
+            return Err("port-forward: description must be [A-Za-z0-9 ._-], ≤64 chars".into());
+        }
+        lines.push(format!("set {base} description '{desc}'"));
+    }
+    Ok(lines)
+}
+
+/// Wrap validated vyatta config lines into a non-interactive EdgeOS config session
+/// script (`configure` … `commit; save; exit`). PURE.
+#[must_use]
+pub fn vyatta_config_script(lines: &[String]) -> String {
+    let mut s = String::from("source /opt/vyatta/etc/functions/script-template\nconfigure\n");
+    for l in lines {
+        s.push_str(l);
+        s.push('\n');
+    }
+    s.push_str("commit\nsave\nexit\n");
+    s
+}
+
+/// Run a validated EdgeOS config script on the gateway over `sshpass` (the router
+/// has no mesh key). `host` must already be IPv4-validated; the script is built
+/// only from whitelisted fields. Returns `Ok(())` on a zero exit.
+fn run_gateway_config(host: &str, script: &str) -> Result<(), String> {
+    let (user, pw) = unifi_cred().ok_or("no unifi cred in store")?;
+    let o = std::process::Command::new("sshpass")
+        .args([
+            "-p",
+            &pw,
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "ConnectTimeout=8",
+            &format!("{user}@{host}"),
+            script,
+        ])
+        .output()
+        .map_err(|e| format!("sshpass failed: {e}"))?;
+    if o.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        let msg = stderr.trim();
+        if msg.is_empty() {
+            Err("gateway config failed".into())
+        } else {
+            Err(msg.to_string())
+        }
+    }
+}
+
+/// Handle a `gateway-firewall` request: RBAC + confirm + IPv4 + validated rule →
+/// run the EdgeOS firewall config edit. Body
+/// `{ host, confirm:true, rule:{…}, principal? }`.
+fn gateway_firewall(req_body: Option<&str>) -> Result<(), String> {
+    let req = parse_gateway_edit(req_body, "gateway-firewall")?;
+    let rule = req.get("rule").ok_or("gateway-firewall: missing `rule`")?;
+    let lines = firewall_config_lines(rule)?;
+    let host = req
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    run_gateway_config(host, &vyatta_config_script(&lines))
+}
+
+/// Handle a `gateway-portforward` request: RBAC + confirm + IPv4 + validated fwd →
+/// run the EdgeOS port-forward config edit. Body
+/// `{ host, confirm:true, fwd:{…}, principal? }`.
+fn gateway_portforward(req_body: Option<&str>) -> Result<(), String> {
+    let req = parse_gateway_edit(req_body, "gateway-portforward")?;
+    let fwd = req.get("fwd").ok_or("gateway-portforward: missing `fwd`")?;
+    let lines = portforward_config_lines(fwd)?;
+    let host = req
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    run_gateway_config(host, &vyatta_config_script(&lines))
+}
+
+/// Shared front-half for the two gateway-edit verbs: parse the body, enforce RBAC
+/// (mutating), require `confirm:true`, and validate `host` is a plain IPv4 — all
+/// BEFORE any config line is built or any SSH is attempted. Returns the parsed
+/// request value on success.
+fn parse_gateway_edit(req_body: Option<&str>, verb: &str) -> Result<serde_json::Value, String> {
+    let Some(body) = req_body else {
+        return Err(format!("{verb}: missing request body"));
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("{verb}: bad json: {e}"))?;
+    crate::ipc::dc_common::rbac_gate_mutating(crate::ipc::dc_common::body_principal(&req))?;
+    if req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!("{verb} requires confirm:true"));
+    }
+    let host = req
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !valid_ipv4(host) {
+        return Err("host must be a plain IPv4 address".into());
+    }
+    Ok(req)
+}
+
+// ---- DATACENTER-17: day-2 host care (evacuate-first rolling patch) -------------
+
+/// The remote script the `host-evacuate` verb runs on a dom0 (resolve uuid →
+/// disable → live-migrate every resident VM off). PURE (a constant — no operator
+/// input is interpolated, so it carries no injection surface). XAPI refuses to
+/// evacuate an enabled host, so it is disabled first.
+#[must_use]
+pub fn host_evacuate_remote() -> &'static str {
+    "UUID=$(xe host-list params=uuid --minimal | cut -d, -f1); \
+     [ -n \"$UUID\" ] || { echo 'host uuid not found' >&2; exit 1; }; \
+     xe host-disable host=$UUID && xe host-evacuate uuid=$UUID"
+}
+
+/// The remote script the `host-patch` verb runs on a dom0: the full evacuate-first
+/// rolling patch — disable → evacuate → `yum update` → reboot. PURE constant (no
+/// interpolation). `xe host-reboot` returns once the reboot is accepted (same as
+/// the `host-power reboot` path), so a zero exit means "patch applied + reboot
+/// scheduled".
+#[must_use]
+pub fn host_patch_remote() -> &'static str {
+    "UUID=$(xe host-list params=uuid --minimal | cut -d, -f1); \
+     [ -n \"$UUID\" ] || { echo 'host uuid not found' >&2; exit 1; }; \
+     xe host-disable host=$UUID && xe host-evacuate uuid=$UUID && \
+     { yum clean all >/dev/null 2>&1 || true; } && yum update -y && \
+     xe host-reboot host=$UUID"
+}
+
+/// Shared handler for the two day-2 host verbs: RBAC + confirm + dom0 allow-list,
+/// then run the (constant) `remote` script over the mesh key. Body
+/// `{ dom0, confirm:true, principal? }`.
+fn host_day2(req_body: Option<&str>, verb: &str, remote: &str) -> Result<(), String> {
+    let Some(body) = req_body else {
+        return Err(format!("{verb}: missing request body"));
+    };
+    let req: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("{verb}: bad json: {e}"))?;
+    crate::ipc::dc_common::rbac_gate_mutating(crate::ipc::dc_common::body_principal(&req))?;
+    if req.get("confirm").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!("{verb} requires confirm:true"));
+    }
+    let dom0 = req
+        .get("dom0")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !crate::workers::datacenter_orchestrator::xen_dom0s()
+        .iter()
+        .any(|d| d == dom0)
+    {
+        return Err("dom0 not in allowed set".into());
+    }
+    let key = crate::workers::datacenter_orchestrator::xen_ssh_key();
+    match ssh_run(&key, dom0, remote) {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let msg = stderr.trim();
+            if msg.is_empty() {
+                Err(format!("{verb} failed"))
+            } else {
+                Err(msg.to_string())
+            }
+        }
+        Err(e) => Err(format!("ssh failed: {e}")),
+    }
 }
 
 /// Run the DATACENTER-23 disaster-recovery backup (confirm-gated): shells out to
@@ -876,6 +1227,19 @@ pub fn build_reply(svc: &HostOpsService, verb: &str, req_body: Option<&str>) -> 
                 Err(m) => err(m),
             };
         }
+        // DATACENTER-14 — UniFi/EdgeOS gateway firewall + port-forward EDITS.
+        "gateway-firewall" => {
+            return match gateway_firewall(req_body) {
+                Ok(()) => json!({ "ok": true }).to_string(),
+                Err(m) => err(m),
+            };
+        }
+        "gateway-portforward" => {
+            return match gateway_portforward(req_body) {
+                Ok(()) => json!({ "ok": true }).to_string(),
+                Err(m) => err(m),
+            };
+        }
         // LIGHTHOUSE-6 — restart the anchor's core fabric units over the mesh key.
         "lighthouse-restart" => {
             return match lighthouse_restart(req_body) {
@@ -1337,6 +1701,21 @@ mod tests {
         }
     }
 
+    // ---- DATACENTER-14: gateway firewall + port-forward edits -----------------
+
+    #[test]
+    fn new_dc14_dc17_verbs_in_lock() {
+        for v in [
+            "gateway-firewall",
+            "gateway-portforward",
+            "host-evacuate",
+            "host-patch",
+        ] {
+            assert_eq!(action_topic(v), format!("action/dc/{v}"));
+            assert!(ACTION_VERBS.contains(&v), "{v} missing from ACTION_VERBS");
+        }
+    }
+
     #[test]
     fn is_mutating_marks_reads_readonly() {
         assert!(!is_mutating("gateway-status"));
@@ -1351,6 +1730,23 @@ mod tests {
         assert_eq!(
             host_evacuate_commands(),
             vec!["host-disable".to_string(), "host-evacuate".to_string()]
+        );
+    }
+
+    #[test]
+    fn firewall_config_lines_builds_set_with_refinements() {
+        let rule = json!({
+            "ruleset": "WAN_IN", "number": 30, "op": "set",
+            "action": "accept", "protocol": "tcp", "port": 443
+        });
+        let lines = firewall_config_lines(&rule).unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "set firewall name WAN_IN rule 30 action accept".to_string(),
+                "set firewall name WAN_IN rule 30 protocol tcp".to_string(),
+                "set firewall name WAN_IN rule 30 destination port 443".to_string(),
+            ]
         );
     }
 
@@ -1441,5 +1837,157 @@ mod tests {
         std::env::remove_var(crate::ipc::dc_rbac::ROLE_MAP_ENV);
         assert!(r.contains("rbac"), "{r}");
         assert!(r.contains("viewer"), "{r}");
+    }
+
+    #[test]
+    fn firewall_config_lines_delete_drops_whole_rule() {
+        let rule = json!({ "ruleset": "WAN_IN", "number": 30, "op": "delete" });
+        assert_eq!(
+            firewall_config_lines(&rule).unwrap(),
+            vec!["delete firewall name WAN_IN rule 30".to_string()]
+        );
+    }
+
+    #[test]
+    fn firewall_config_lines_reject_bad_fields() {
+        // injection in ruleset
+        assert!(
+            firewall_config_lines(&json!({"ruleset":"a;b","number":1,"action":"accept"})).is_err()
+        );
+        // out-of-range number
+        assert!(
+            firewall_config_lines(&json!({"ruleset":"WAN","number":0,"action":"accept"})).is_err()
+        );
+        assert!(
+            firewall_config_lines(&json!({"ruleset":"WAN","number":99999,"action":"accept"}))
+                .is_err()
+        );
+        // bad action
+        assert!(
+            firewall_config_lines(&json!({"ruleset":"WAN","number":1,"action":"nuke"})).is_err()
+        );
+        // set without action
+        assert!(firewall_config_lines(&json!({"ruleset":"WAN","number":1,"op":"set"})).is_err());
+        // bad protocol / port
+        assert!(firewall_config_lines(
+            &json!({"ruleset":"WAN","number":1,"action":"drop","protocol":"raw"})
+        )
+        .is_err());
+        assert!(firewall_config_lines(
+            &json!({"ruleset":"WAN","number":1,"action":"drop","port":70000})
+        )
+        .is_err());
+        // unknown op
+        assert!(firewall_config_lines(&json!({"ruleset":"WAN","number":1,"op":"flush"})).is_err());
+    }
+
+    #[test]
+    fn portforward_config_lines_builds_full_set() {
+        let fwd = json!({
+            "number": 1, "op": "set", "protocol": "tcp",
+            "original_port": 443, "forward_ip": "172.20.0.5",
+            "forward_port": 8443, "description": "ingress 1"
+        });
+        let lines = portforward_config_lines(&fwd).unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "set port-forward rule 1 protocol tcp".to_string(),
+                "set port-forward rule 1 original-port 443".to_string(),
+                "set port-forward rule 1 forward-to address 172.20.0.5".to_string(),
+                "set port-forward rule 1 forward-to port 8443".to_string(),
+                "set port-forward rule 1 description 'ingress 1'".to_string(),
+            ]
+        );
+        // delete
+        assert_eq!(
+            portforward_config_lines(&json!({ "number": 1, "op": "delete" })).unwrap(),
+            vec!["delete port-forward rule 1".to_string()]
+        );
+    }
+
+    #[test]
+    fn portforward_config_lines_reject_bad_fields() {
+        // missing required set fields
+        assert!(
+            portforward_config_lines(&json!({"number":1,"op":"set","protocol":"tcp"})).is_err()
+        );
+        // bad forward ip (injection)
+        assert!(portforward_config_lines(&json!({
+            "number":1,"protocol":"tcp","original_port":443,
+            "forward_ip":"1.2.3.4; reboot","forward_port":443
+        }))
+        .is_err());
+        // bad description charset (a quote would break out)
+        assert!(portforward_config_lines(&json!({
+            "number":1,"protocol":"tcp","original_port":443,
+            "forward_ip":"172.20.0.5","forward_port":443,"description":"a'b"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn vyatta_config_script_wraps_session() {
+        let s = vyatta_config_script(&["set port-forward rule 1 protocol tcp".to_string()]);
+        assert!(s.starts_with("source /opt/vyatta/etc/functions/script-template\nconfigure\n"));
+        assert!(s.contains("set port-forward rule 1 protocol tcp\n"));
+        assert!(s.trim_end().ends_with("exit"));
+        assert!(s.contains("commit\nsave\n"));
+    }
+
+    #[test]
+    fn gateway_firewall_gates_before_ssh() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        // missing body
+        assert!(build_reply(&s, "gateway-firewall", None).contains("missing request body"));
+        // confirm required
+        let body = json!({ "host": "172.20.0.1", "rule": { "ruleset": "WAN", "number": 1, "action": "accept" } }).to_string();
+        let r = build_reply(&s, "gateway-firewall", Some(&body));
+        assert!(r.contains("requires confirm:true"), "{r}");
+        // bad host rejected before building config
+        let body = json!({ "host": "1.2.3.4; reboot", "confirm": true, "rule": { "ruleset": "WAN", "number": 1, "action": "accept" } }).to_string();
+        let r = build_reply(&s, "gateway-firewall", Some(&body));
+        assert!(r.contains("host must be a plain IPv4 address"), "{r}");
+        // missing rule object
+        let body = json!({ "host": "172.20.0.1", "confirm": true }).to_string();
+        let r = build_reply(&s, "gateway-firewall", Some(&body));
+        assert!(r.contains("missing `rule`"), "{r}");
+    }
+
+    #[test]
+    fn gateway_portforward_gates_before_ssh() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        let body =
+            json!({ "host": "172.20.0.1", "fwd": { "number": 1, "op": "delete" } }).to_string();
+        let r = build_reply(&s, "gateway-portforward", Some(&body));
+        assert!(r.contains("requires confirm:true"), "{r}");
+        let body = json!({ "host": "172.20.0.1", "confirm": true }).to_string();
+        let r = build_reply(&s, "gateway-portforward", Some(&body));
+        assert!(r.contains("missing `fwd`"), "{r}");
+    }
+
+    #[test]
+    fn host_day2_remote_scripts_carry_the_key_verbs() {
+        assert!(host_evacuate_remote().contains("xe host-evacuate"));
+        assert!(host_evacuate_remote().contains("xe host-disable"));
+        let patch = host_patch_remote();
+        assert!(patch.contains("xe host-evacuate"));
+        assert!(patch.contains("yum update -y"));
+        assert!(patch.contains("xe host-reboot"));
+    }
+
+    #[test]
+    fn host_evacuate_and_patch_gate_confirm_then_dom0() {
+        let s = HostOpsService::new(std::path::PathBuf::from("/tmp"));
+        for verb in ["host-evacuate", "host-patch"] {
+            // confirm required
+            let body = json!({ "dom0": "172.20.0.9" }).to_string();
+            let r = build_reply(&s, verb, Some(&body));
+            assert!(r.contains("requires confirm:true"), "{verb}: {r}");
+            // confirmed but dom0 not in the (empty) allowed set
+            let body = json!({ "dom0": "172.20.0.9", "confirm": true }).to_string();
+            let r = build_reply(&s, verb, Some(&body));
+            assert!(r.contains("dom0 not in allowed set"), "{verb}: {r}");
+        }
     }
 }
