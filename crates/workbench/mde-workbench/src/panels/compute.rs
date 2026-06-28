@@ -1073,7 +1073,12 @@ async fn run_action(program: &str, args: &[String]) {
 /// Enumerate local KVM domains + Podman containers in one pass. Each
 /// source is queried independently so a missing tool degrades to "skip
 /// that source" rather than failing the whole list.
-async fn enumerate() -> Enumeration {
+/// Enumerate compute instances: this node's local `virsh`/`podman` workloads
+/// plus the fleet-wide rows merged off the replicated `compute-inventory.json`
+/// plane. Pub(crate) so the unified "Services across the mesh" view (SVC-VIEW)
+/// reuses this exact reader for the VM/container source instead of duplicating
+/// the compute-inventory data path.
+pub(crate) async fn enumerate() -> Enumeration {
     let mut instances = Vec::new();
     let mut sources = Vec::new();
     let (self_ip, local_host) = self_identity();

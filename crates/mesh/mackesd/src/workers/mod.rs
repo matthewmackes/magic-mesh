@@ -235,6 +235,12 @@ pub mod meshfs_worker;
 pub mod firewall_monitor;
 /// NOTIFY-SRC — SELinux AVC denials → the `fleet/sec/selinux/<host>` alert lane.
 pub mod selinux_monitor;
+// HA-5 — etcd-quorum + leadership monitor. Reads the live mesh directory each
+// tick, publishes the coordination-plane state (member count + quorum-OK +
+// leader) to the retained `mesh/ha/status` lane the Mesh Control panel consumes,
+// and fires an edge-triggered `mackesd::alert` when quorum is lost/restored or
+// leadership changes (no per-tick spam).
+pub mod ha_monitor;
 // VIRT-1 (v5.0.0) — unified KVM + Podman compute inventory.
 // Polls `virsh list --all --uuid` + `virsh dominfo`/`domblklist`/
 // `domstats` for KVM guests and `podman ps`/`podman stats` for

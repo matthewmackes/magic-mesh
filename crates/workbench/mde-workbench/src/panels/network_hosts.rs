@@ -373,7 +373,10 @@ pub fn inventory_from_cards(cards: &[Card]) -> HostInventory {
 /// Returns an honest error (shown as the empty-state hint) when the
 /// mount isn't present — the inventory only exists once mesh-storage is
 /// active + the probe worker has run at least once.
-fn fetch_inventory() -> Result<HostInventory, String> {
+///
+/// Pub so the unified "Services across the mesh" view (SVC-VIEW) reuses this
+/// exact probe-inventory read instead of duplicating the data path.
+pub fn fetch_inventory() -> Result<HostInventory, String> {
     let root = workgroup_root();
     if !root.exists() {
         return Err(format!(
