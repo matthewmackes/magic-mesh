@@ -119,6 +119,45 @@ impl LoopingTween {
         Self { start, period }
     }
 
+    /// MOTION-A11Y-3 — a flash-safe looping constructor for pulses/blinks/
+    /// shimmer. The requested `period` is **clamped up** to
+    /// [`crate::motion::MIN_PULSE_PERIOD_MS`] so the loop can never flash faster
+    /// than [`crate::motion::MAX_PULSE_HZ`] (the WCAG 2.3.1 3 Hz seizure
+    /// threshold), regardless of the caller. Use this — not
+    /// [`LoopingTween::starting_at`] — for any *visual flash* loop; the plain
+    /// constructor stays for non-flashing continuous timelines (e.g. a slow beacon
+    /// sweep) where the cap doesn't apply.
+    ///
+    /// ```
+    /// use std::time::{Duration, Instant};
+    /// use mde_theme::animation::LoopingTween;
+    /// use mde_theme::motion::MAX_PULSE_HZ;
+    /// // A 50 ms (20 Hz) request is clamped up to the ≤3 Hz floor.
+    /// let p = LoopingTween::pulse(Instant::now(), Duration::from_millis(50));
+    /// assert!(p.hz() <= MAX_PULSE_HZ + 1e-3);
+    /// ```
+    #[must_use]
+    pub fn pulse(start: Instant, period: Duration) -> Self {
+        let floor = Duration::from_millis(crate::motion::MIN_PULSE_PERIOD_MS);
+        Self {
+            start,
+            period: period.max(floor),
+        }
+    }
+
+    /// MOTION-A11Y-3 — this loop's flash frequency in Hz (one full cycle = one
+    /// flash). `0.0` for a degenerate zero period. Lets a test/assertion verify a
+    /// loop respects [`crate::motion::MAX_PULSE_HZ`].
+    #[must_use]
+    pub fn hz(self) -> f32 {
+        let secs = self.period.as_secs_f32();
+        if secs <= f32::EPSILON {
+            0.0
+        } else {
+            1.0 / secs
+        }
+    }
+
     /// Fractional phase 0.0 → 1.0 within the current cycle.
     #[must_use]
     pub fn phase(self, now: Instant) -> f32 {
@@ -236,6 +275,19 @@ pub enum Transition {
 
 /// MOTION-INFRA-2 — the render parameters a [`Transition`] yields at a given
 /// progress. Consumers apply what's relevant (most use one or two fields).
+///
+/// ## MOTION-PERF-2 — the transform/opacity-only invariant
+///
+/// `RenderParams` carries **exactly** opacity ([`alpha`](RenderParams::alpha)) and
+/// transform ([`translate_y`](RenderParams::translate_y),
+/// [`scale`](RenderParams::scale)) — and *structurally no width/height/layout
+/// field*. That is the whole MOTION-PERF-2 guard: an animation expressed through
+/// this struct can only ever drive compositor-cheap properties, so it can never
+/// trigger a per-frame relayout. A consumer **must** map these onto
+/// transform-equivalents (a padding *offset* for `translate_y`, a render `scale`)
+/// and **must not** re-measure or resize the widget per frame from them. The
+/// [`is_compositor_safe`](RenderParams::is_compositor_safe) predicate is the
+/// runtime backstop a consumer can `debug_assert` before applying a frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderParams {
     /// Opacity multiplier `0.0..=1.0`.
@@ -244,6 +296,29 @@ pub struct RenderParams {
     pub translate_y: f32,
     /// Scale multiplier (1.0 = natural size).
     pub scale: f32,
+}
+
+impl RenderParams {
+    /// MOTION-PERF-2 — the runtime guard for the transform/opacity-only invariant.
+    /// `true` when every field holds a sane, compositor-applicable value: `alpha`
+    /// in `0.0..=1.0`, a finite `translate_y`, and a strictly-positive finite
+    /// `scale`. (A non-finite or non-positive value would force the renderer down
+    /// a degenerate/relayout path.) Consumers `debug_assert!(params.is_compositor_safe())`
+    /// before applying a frame so a future mis-tuned transition can't silently
+    /// regress the no-relayout guarantee.
+    ///
+    /// ```
+    /// use mde_theme::animation::Transition;
+    /// let p = Transition::SlideUp(8.0).params(0.5);
+    /// assert!(p.is_compositor_safe()); // alpha∈[0,1], finite translate, scale>0
+    /// ```
+    #[must_use]
+    pub fn is_compositor_safe(self) -> bool {
+        (0.0..=1.0).contains(&self.alpha)
+            && self.translate_y.is_finite()
+            && self.scale.is_finite()
+            && self.scale > 0.0
+    }
 }
 
 impl Transition {
@@ -589,6 +664,53 @@ mod tests {
         assert!((Transition::Press(0.04).params(1.0).scale - 0.96).abs() < 1e-6);
         // Clamped: out-of-range t doesn't overshoot.
         assert_eq!(Transition::FadeIn.params(2.0).alpha, 1.0);
+    }
+
+    #[test]
+    fn transition_outputs_are_compositor_safe_across_the_sweep() {
+        // MOTION-PERF-2 — every transition kind, at every sampled progress, yields
+        // only sane transform/opacity values (no relayout-forcing field exists on
+        // the struct, and the values stay in the compositor-safe ranges).
+        let kinds = [
+            Transition::FadeIn,
+            Transition::FadeOut,
+            Transition::SlideUp(12.0),
+            Transition::Lift(6.0),
+            Transition::Press(0.04),
+        ];
+        for k in kinds {
+            for i in 0..=20 {
+                let t = i as f32 / 20.0;
+                let p = k.params(t);
+                assert!(
+                    p.is_compositor_safe(),
+                    "{k:?} at t={t} produced a non-compositor-safe frame: {p:?}"
+                );
+            }
+            // Out-of-range progress is clamped, so even that stays safe.
+            assert!(k.params(-1.0).is_compositor_safe());
+            assert!(k.params(2.0).is_compositor_safe());
+        }
+    }
+
+    #[test]
+    fn pulse_clamps_period_to_the_flash_cap() {
+        // MOTION-A11Y-3 — a too-fast pulse period is clamped up to the 3 Hz floor;
+        // a slow period is left as requested.
+        let t0 = Instant::now();
+        let floor = Duration::from_millis(crate::motion::MIN_PULSE_PERIOD_MS);
+        // 50 ms (20 Hz) requested → clamped to the 334 ms floor (≈3 Hz).
+        let fast = LoopingTween::pulse(t0, Duration::from_millis(50));
+        assert!(
+            fast.hz() <= crate::motion::MAX_PULSE_HZ + 1e-3,
+            "clamped pulse must not exceed the cap, got {} Hz",
+            fast.hz()
+        );
+        // The clamp lands exactly on the floor period.
+        assert!((fast.hz() - LoopingTween::starting_at(t0, floor).hz()).abs() < 1e-6);
+        // A 2 s pulse (0.5 Hz) is well under the cap → unchanged.
+        let slow = LoopingTween::pulse(t0, Duration::from_secs(2));
+        assert!((slow.hz() - 0.5).abs() < 1e-3);
     }
 
     #[test]
