@@ -6184,6 +6184,26 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("selinux_monitor".into());
 
+        // HA-5 — etcd-quorum + leadership monitor. Reads the live mesh directory
+        // (the same etcd-or-fs source healthz uses) on a 30 s tick, publishes the
+        // coordination-plane state (member count + quorum-OK + leader) to the
+        // retained `mesh/ha/status` lane the Mesh Control panel consumes, and
+        // fires an edge-triggered `mackesd::alert` when quorum is lost/restored
+        // or leadership changes. Runs on every node (each operator wants the
+        // local Alert Center to surface a failover), like the other monitors.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::ha_monitor::HaMonitorWorker::new(
+                workgroup_root.clone(),
+                Some(db_path.clone()),
+                fw_host.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("ha_monitor".into());
+
         // VIRT-1 (v5.0.0) — unified KVM + Podman compute inventory.
         // Polls virsh + podman every 10 s and publishes the per-peer
         // inventory to `compute/inventory/<peer-nebula-addr>` per
