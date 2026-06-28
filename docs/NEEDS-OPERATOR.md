@@ -63,6 +63,14 @@ classifier gates prod SSH until targets are named). Listed so nothing is silent.
 - **MEDIA-10 / OPROG-4** (1601/1630) — provision 3 lighthouses, 2 Lighthouse_Media
   (depends on A1 + SUBSTRATE-V2 cutover).
 - **OPROG-5** (1631) — migrate instances off XCP host 1 and decommission it.
+- **DRAIN-4-ACTIVATE** — the FARM-AUTOSCALE apply path is implemented + gated
+  (`FA_APPLY` default 0, apply-gate + `--readiness` preflight). Activating LIVE
+  elastic provisioning is operator-gated: the loop must NOT flip `FA_APPLY=1`,
+  enable `mcnf-farm-autoscale-reconcile.timer`, or `tofu apply` (it would
+  clone/destroy real VMs). **Unblock:** (1) bring XO up + mint a token; (2) confirm
+  `install-helpers/farm-reconciler.sh --readiness` (with `FA_APPLY=1`) reports
+  READY; (3) `systemctl enable --now mcnf-farm-autoscale-reconcile.timer` with
+  `FA_APPLY=1` in the unit drop-in.
 
 ---
 
@@ -116,3 +124,7 @@ fleet-wide change that must stay operator-gated.
 
 *Items not in this ledger are either reconciled-done or in the active
 implementation pass. Update this file as blockers clear.*
+
+<!-- install-helpers/park-blocker.sh (DRAIN-5) appends machine-parked entries
+     below this line; clear one by doing its unblock action + flipping its
+     [!] marker in docs/WORKLIST.md off. -->

@@ -40,6 +40,11 @@ were **mechanical failures that halted all progress**:
 - **`install-helpers/install-drain-guardrails.sh {--install|--uninstall}`** — operator-run
   (like `enable-autonomy.sh`): installs the guard + a 5-min `disk-watchdog` systemd timer.
   Reversible.
+- **`install-helpers/check-worktree-isolation.sh`** (DRAIN-7) — the STEP-0 guard that an
+  agent is in its OWN isolated worktree, not a shared checkout (the main `/root/magic-mesh`
+  or the `bright-elm-ajw0` / `calm-ray-dcr8` worktrees). Run it (`./install-helpers/check-worktree-isolation.sh`,
+  rc≠0 = refuse) or `source` it and call `require_isolated_worktree` before any edit; carries
+  a `--self-test`. Makes the stray-into-shared-worktree failure (below) mechanically refusable.
 
 ### B. Hybrid engine (L1)
 - **Mechanical half (no AI):** the FARM-AUTO GitOps reconciler — a timer reads the
@@ -80,7 +85,8 @@ Every drain tick, in order:
 - Auto-merge under lifted gates can land a bad auto-merge across crates — mitigate with
   a periodic full-workspace integration gate on the farm (cheap, non-blocking).
 - Worktree straying (DRAIN-7) silently lost an agent's work once — the fix makes the
-  shared worktree off-limits to agents.
+  shared worktree off-limits to agents, enforced at STEP 0 by
+  `install-helpers/check-worktree-isolation.sh` (refuses + exits non-zero on a shared/main checkout).
 
 ## Out of scope
 - Replacing the operator-gated `/release` (RPM cut/publish stays deliberate).

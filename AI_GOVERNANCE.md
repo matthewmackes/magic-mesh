@@ -244,7 +244,11 @@ desktop-personal panels grouped below. Locks (full table: `docs/design/planes.md
 >   `git reset --hard <current-work-tip-sha>` first; have each commit its **disjoint**
 >   files + report the SHA; then **cherry-pick** the SHAs onto the work branch (clean,
 >   since disjoint). **Clean up** the agent worktrees afterward (`git worktree remove`) —
->   their `target/` dirs fill the dev-host disk fast.
+>   their `target/` dirs fill the dev-host disk fast. Each agent's **STEP 0** runs
+>   `install-helpers/check-worktree-isolation.sh` (DRAIN-7): it refuses + exits non-zero
+>   if the cwd is a SHARED checkout (the main `/root/magic-mesh` or the `bright-elm-ajw0` /
+>   `calm-ray-dcr8` worktrees) rather than the agent's own isolated one — a subagent
+>   straying into the shared `calm-ray-dcr8` worktree once silently wiped its work (2026-06-24).
 
 The development toolchain and build environment are documented **once**, in
 [`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md) — **read it before building

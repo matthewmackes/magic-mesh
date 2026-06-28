@@ -57,10 +57,23 @@
 #   farm-reconciler.sh --once --dry-run      one reconcile, decide-only (no commit,
 #                                            no apply — succeeds even with XO down)
 #   farm-reconciler.sh --status              current topology + queue + gate state
+#   farm-reconciler.sh --readiness           DRAIN-4 apply pre-flight ONLY: probe the
+#                                            apply prerequisites + report the verdict
+#                                            (and WHY, per failing prereq). rc 0 iff
+#                                            apply WOULD run (FA_APPLY=1 + all probes
+#                                            green); non-zero otherwise — so an
+#                                            operator can gate live activation on it
+#                                            (`FA_APPLY=1 farm-reconciler.sh --readiness
+#                                            && …`). Touches no VM, runs no reconcile.
 #   farm-reconciler.sh --self-test           pure-function assertions (no farm I/O)
 #
 # Apply prerequisites (ALL required before a real apply happens — honest defaults):
-#   - FA_APPLY=1            opt in to apply (default OFF → plan-only, safe)
+#   - FA_APPLY=1            opt in to apply (default OFF → plan-only, safe). The
+#                          ONLY override path — set it in the env (operator) or the
+#                          timer drop-in to enable live provisioning; nothing else
+#                          flips it. The systemd timer ships DISABLED; enabling it
+#                          is a separate operator live-activation step.
+#   - XO reachable          the XO websocket host:port accepts a TCP connect
 #   - XO reachable          the XO websocket host:port accepts a TCP connect
 #   - tofu state present     `tofu state list` succeeds with ≥0 resources (sane)
 #   - golden template set    var.golden_template_name is NON-EMPTY (default
@@ -191,7 +204,7 @@ declare -A DOM0_FLAG=(
   ["kvm-xcp1"]="--xcp1"
 )
 
-usage() { sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # =============================================================================
 # PURE helpers — no I/O, no globals; exercised by --self-test.
@@ -414,6 +427,17 @@ if [ "${1:-}" = "--self-test" ]; then
   check "FA_APPLY=0 → no provision"     "$(provision_enabled 'plan-only:FA_APPLY!=1 (apply opt-in off)' && echo yes || echo no)" no
   check "XO-down → no provision"        "$(provision_enabled 'plan-only:XO-unreachable' && echo yes || echo no)" no
 
+  # --- DRAIN-4 readiness exit-code contract: `--readiness` exits 0 iff the gate
+  # verdict authorises apply (provision_enabled "$GATE"), so apply_gate + the rc
+  # predicate compose to the operator's preflight signal. Asserted end-to-end here
+  # (the readiness MODE just prints + exits on this exact composition).
+  readiness_rc() { provision_enabled "$(apply_gate "$@")" && echo 0 || echo 1; }
+  check "readiness: all green → rc 0"    "$(readiness_rc 1 1 1 1)" 0
+  check "readiness: FA_APPLY off → rc 1" "$(readiness_rc 0 1 1 1)" 1
+  check "readiness: XO down → rc 1"      "$(readiness_rc 1 0 1 1)" 1
+  check "readiness: no state → rc 1"     "$(readiness_rc 1 1 0 1)" 1
+  check "readiness: no golden → rc 1"    "$(readiness_rc 1 1 1 0)" 1
+
   # --- demand contribution (queue-accuracy bug A): a @farm:{…} payload contributes
   # to demand ONLY when it is a real `cargo …` build command. Templates/placeholders
   # (crate,verify / …) contribute 0. We assert this end-to-end through the REAL
@@ -473,9 +497,10 @@ fi
 MODE="status"
 DRY_RUN=0
 while [ $# -gt 0 ]; do case "$1" in
-  --once)    MODE="once"; shift;;
-  --status)  MODE="status"; shift;;
-  --dry-run) DRY_RUN=1; shift;;
+  --once)      MODE="once"; shift;;
+  --status)    MODE="status"; shift;;
+  --readiness) MODE="readiness"; shift;;
+  --dry-run)   DRY_RUN=1; shift;;
   -h | --help | help) usage; exit 0;;
   *) echo "farm-reconciler: unknown arg: $1" >&2; usage; exit 2;;
 esac; done
@@ -679,6 +704,31 @@ collect_demand() {
       "→ fleet(big=$FLEET_BIG small=$FLEET_SMALL pods=$FLEET_PODS)"
   bucket_demand "$FLEET_BIG" "$FLEET_SMALL" "$FLEET_PODS"
 }
+
+# =============================================================================
+# --readiness — DRAIN-4 apply PRE-FLIGHT. Probe the apply prerequisites ONCE and
+# report the verdict + WHY (per failing prereq), then exit 0 iff apply WOULD run
+# (FA_APPLY=1 + XO reachable + tofu state sane + golden template set), else exit 1.
+# This is the override-mechanism's readiness gate the operator runs BEFORE flipping
+# FA_APPLY=1 live — it touches no VM, runs no reconcile, and reuses the SAME
+# eval_gate/apply_gate path as --once (so the report can't disagree with what a real
+# tick would decide). `provision_enabled "$GATE"` is the apply-authorising predicate.
+# =============================================================================
+if [ "$MODE" = "readiness" ]; then
+  eval_gate
+  log "apply readiness @ $(date -u -d "@$NOW" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+  log "  FA_APPLY (opt-in) ... $([ "$APPLY" = 1 ] && echo 'on (1)' || echo 'OFF (0) — default-safe')"
+  log "  XO reachable ....... $([ "$GATE_XO" = 1 ] && echo yes || echo 'NO') ($XO_URL)"
+  log "  tofu state sane .... $([ "$GATE_STATE" = 1 ] && echo yes || echo 'NO') ($TOFU_DIR)"
+  log "  golden template set  $([ "$GATE_GOLDEN" = 1 ] && echo yes || echo 'NO')"
+  if provision_enabled "$GATE"; then
+    log "READY: apply WOULD run this tick (all prerequisites green)."
+    exit 0
+  fi
+  warn "NOT READY: apply is GATED — reason: ${GATE#plan-only:}"
+  warn "  the reconciler stays PLAN-ONLY until every prerequisite above is green."
+  exit 1
+fi
 
 # =============================================================================
 # --status — read-only: current committed topology + the live queue it WOULD act
