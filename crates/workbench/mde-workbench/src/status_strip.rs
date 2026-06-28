@@ -1,30 +1,25 @@
-//! UNIFY-1/2/3 — the global status strip.
+//! UNIFY-1/4 — the global status strip (top chrome band).
 //!
-//! The Unified Workbench design (`docs/design/workbench/Workbench.dc.html`) frames
-//! the whole app with a thin, always-on chrome strip across the very top — above
-//! the window header — rendering at-a-glance mesh status in dense IBM-Carbon mono.
-//! It surfaces the **live, real** signals the shell holds: the mde-bus ("chain")
-//! reachability (UNIFY-1), the mesh-health summary — online/total nodes +
-//! lighthouse count (UNIFY-2, from `action/shell/healthz`), and the Live-Events
-//! rail toggle (UNIFY-3). Remaining design fields (CRIT/WARN/OK alert counts in the
-//! strip, the event ticker, posture, uptime, clock) land in later UNIFY increments
-//! once their live sources are plumbed; per §7 we render only what is genuinely
-//! backed, never placeholder values — when the daemon hasn't answered, the count
-//! cell is simply omitted rather than showing a fake 0/0.
+//! The design (`docs/design/workbench/Workbench.dc.html` lines 30-43) puts the
+//! cluster brand mark + the **CRIT / WARN / OK severity tallies** in the always-on
+//! top strip, while the per-screen breadcrumb / search / up-count / chain live in
+//! the content header (UNIFY-4, `content_header.rs`). The severity tallies are
+//! **real** — computed from the live shared alert lane the Live-Events rail already
+//! tails (`App::events`), so no separate feed and no placeholders (§7). Remaining
+//! design fields (ticker, posture, uptime, clock) land in UNIFY-5 once their live
+//! sources are wired.
 //!
-//! All colour / size / weight come from `mde-theme` tokens (§4 — no raw hex):
-//! the strip background is a token-derived near-black (`palette.background`
-//! darkened toward `carbon::BLACK`), matching the design's `#0a0a0a` chrome shade
-//! while staying single-sourced.
+//! All colour / size / weight come from `mde-theme` tokens (§4 — no raw hex): the
+//! strip background is a token-derived near-black (`palette.background` darkened
+//! toward `carbon::BLACK`), matching the design's `#0a0a0a` chrome shade.
 
-use cosmic::iced::widget::button::{self, Status as ButtonStatus};
 use cosmic::iced::widget::{container, row, text, Space};
 use cosmic::iced::{alignment, Background, Border, Color, Length};
 use cosmic::Element;
 
+use crate::cosmic_compat::overlay_color_on;
 use crate::cosmic_compat::prelude::*;
-use crate::cosmic_compat::{overlay_color_on, overlay_white_on};
-use crate::mesh_directory::HealthSummary;
+use mde_notify::{AlertItem, Severity};
 use mde_theme::{carbon, FontSize, FontWeight, Palette, TypeRole};
 
 /// Strip height — the design's 26 px chrome band.
@@ -33,19 +28,11 @@ pub const STRIP_HEIGHT: f32 = 26.0;
 /// Diameter of an inline status pip.
 const PIP: f32 = 7.0;
 
-/// Build the global status strip as an Iced [`Element`].
+/// Build the global status strip from the live alert items.
 ///
-/// `bus_reachable` is the live mde-bus health the shell tracks (`App::bus_reachable`)
-/// and drives the "chain" indicator. `health` is the latest mesh-health summary
-/// (`App::mesh_health`); when `Some`, the strip shows live online/total + lighthouse
-/// counts, and when `None` (daemon not yet answered) that cell is omitted.
-/// `events_open` + `on_toggle_events` drive the right-edge Live-Events rail toggle.
-pub fn view<'a, Message: Clone + 'a>(
-    bus_reachable: bool,
-    health: Option<&HealthSummary>,
-    events_open: bool,
-    on_toggle_events: Message,
-) -> Element<'a, Message> {
+/// `events` is the live shared alert lane (`App::events`); the strip shows the
+/// cluster brand + the CRIT / WARN / OK tallies derived from it. Display-only.
+pub fn view<'a, Message: 'a>(events: &[AlertItem]) -> Element<'a, Message> {
     let palette = crate::live_theme::palette();
     let sizes = FontSize::defaults();
     let weights = FontWeight::defaults();
@@ -64,38 +51,32 @@ pub fn view<'a, Message: Clone + 'a>(
     ]
     .align_y(alignment::Vertical::Center);
 
-    // Chain / bus reachability — live (UNIFY-1).
-    let (chain_col, chain_label) = if bus_reachable {
-        (palette.success, "chain ok")
-    } else {
-        (palette.danger, "bus offline")
-    };
-    let chain = row![
-        pip(chain_col),
-        Space::new().width(Length::Fixed(7.0)),
-        mono_text(chain_label, TypeRole::Caption, &sizes, &weights)
-            .colr(palette.text.into_cosmic_color()),
+    // CRIT / WARN / OK tallies — real, from the live alert lane.
+    let (mut crit, mut warn, mut ok) = (0u32, 0u32, 0u32);
+    for e in events {
+        match e.severity {
+            Severity::Critical => crit += 1,
+            Severity::Warning => warn += 1,
+            Severity::Success => ok += 1,
+            Severity::Info => {}
+        }
+    }
+    let tallies = row![
+        tally("CRIT", crit, palette.danger, &sizes, &weights),
+        Space::new().width(Length::Fixed(13.0)),
+        tally("WARN", warn, palette.warning, &sizes, &weights),
+        Space::new().width(Length::Fixed(13.0)),
+        tally("OK", ok, palette.success, &sizes, &weights),
     ]
     .align_y(alignment::Vertical::Center);
 
-    let mut bar = row![cell(brand.into(), &palette), cell(chain.into(), &palette)]
-        .height(Length::Fixed(STRIP_HEIGHT))
-        .align_y(alignment::Vertical::Center);
-
-    // Live mesh-health counts (UNIFY-2) — only when the daemon has answered (§7).
-    if let Some(h) = health {
-        bar = bar.push(cell(up_cell(h, &palette), &palette));
-    }
-
-    bar = bar.push(Space::new().width(Length::Fill));
-    // Live Events rail toggle (UNIFY-3) — on the strip's right edge.
-    bar = bar.push(events_toggle(
-        events_open,
-        on_toggle_events,
-        &palette,
-        &sizes,
-        &weights,
-    ));
+    let bar = row![
+        cell(brand.into(), &palette),
+        cell(tallies.into(), &palette),
+        Space::new().width(Length::Fill),
+    ]
+    .height(Length::Fixed(STRIP_HEIGHT))
+    .align_y(alignment::Vertical::Center);
 
     container(bar)
         .width(Length::Fill)
@@ -115,108 +96,38 @@ pub fn view<'a, Message: Clone + 'a>(
         .into()
 }
 
-/// UNIFY-3 — the Live Events rail toggle (the design's `⟨/⟩ events` control). Lives
-/// in the always-on strip so the rail can be collapsed/shown from anywhere.
-fn events_toggle<'a, Message: Clone + 'a>(
-    open: bool,
-    on_toggle: Message,
-    palette: &Palette,
+/// One severity tally: a coloured pip + `LABEL n`.
+fn tally<'a, Message: 'a>(
+    label: &'static str,
+    n: u32,
+    color: mde_theme::Rgba,
     sizes: &FontSize,
     weights: &FontWeight,
 ) -> Element<'a, Message> {
-    let pal = *palette;
-    let label = if open { "⟨ events" } else { "⟩ events" };
-    let txt = if open { pal.text } else { pal.text_muted }.into_cosmic_color();
-    let border_col = if open { pal.overlay } else { pal.border }.into_cosmic_color();
-    let content = mono_text(label, TypeRole::Caption, sizes, weights).colr(txt);
-    cosmic::iced::widget::button(content)
-        .padding([3u16, 9u16])
-        .on_press(on_toggle)
-        .sty(move |_t: &cosmic::Theme, status: ButtonStatus| {
-            let bg = match status {
-                ButtonStatus::Hovered | ButtonStatus::Pressed => {
-                    Some(Background::Color(overlay_white_on(pal.surface, 0.08)))
-                }
-                _ => None,
-            };
-            let border = Border {
-                color: border_col,
-                width: 1.0,
-                radius: 0.0.into(),
-            };
-            button::Style {
-                snap: false,
-                background: bg,
-                text_color: txt,
-                icon_color: Some(txt),
-                border_color: border.color,
-                border_width: border.width,
-                border_radius: border.radius,
-                border,
-                shadow: cosmic::iced::Shadow::default(),
-            }
-        })
-        .into()
-}
-
-/// The live online/total + lighthouse-count segment (UNIFY-2).
-fn up_cell<'a, Message: 'a>(h: &HealthSummary, palette: &Palette) -> Element<'a, Message> {
-    let sizes = FontSize::defaults();
-    let weights = FontWeight::defaults();
-    // Healthy ⇒ success token; any unhealthy node ⇒ warning, so the dot tells the
-    // truth at a glance without a separate severity feed.
-    let dot = if h.healthy_nodes >= h.node_count {
-        palette.success
-    } else {
-        palette.warning
-    };
     row![
-        pip(dot),
-        Space::new().width(Length::Fixed(7.0)),
-        mono_text(
-            format!("{}/{} up", h.healthy_nodes, h.node_count),
-            TypeRole::Caption,
-            &sizes,
-            &weights,
-        )
-        .colr(palette.text.into_cosmic_color()),
-        Space::new().width(Length::Fixed(9.0)),
-        mono_text(
-            format!("{} LH", h.lighthouse_count),
-            TypeRole::Caption,
-            &sizes,
-            &weights,
-        )
-        .colr(palette.text_muted.into_cosmic_color()),
+        pip(color),
+        Space::new().width(Length::Fixed(6.0)),
+        mono_text(format!("{label} {n}"), TypeRole::Caption, sizes, weights)
+            .colr(color.into_cosmic_color()),
     ]
     .align_y(alignment::Vertical::Center)
     .into()
 }
 
 /// One segment of the strip, padded (design's per-cell `border-right` spacing).
-fn cell<'a, Message: 'a>(content: Element<'a, Message>, palette: &Palette) -> Element<'a, Message> {
-    let border = palette.border.into_cosmic_color();
+fn cell<'a, Message: 'a>(
+    content: Element<'a, Message>,
+    _palette: &Palette,
+) -> Element<'a, Message> {
     container(content)
         .padding([0u16, 11u16])
         .height(Length::Fixed(STRIP_HEIGHT))
         .align_y(alignment::Vertical::Center)
-        .style(move |_| container::Style {
-            snap: false,
-            icon_color: None,
-            background: None,
-            border: Border {
-                color: border,
-                width: 0.0,
-                radius: 0.0.into(),
-            },
-            shadow: Default::default(),
-            text_color: None,
-        })
         .into()
 }
 
 /// A small filled status pip (the design's `border-radius:50%` dot). Shared with
-/// the events rail (UNIFY-3).
+/// the content header (UNIFY-4) + the events rail (UNIFY-3).
 pub(crate) fn pip<'a, Message: 'a>(color: mde_theme::Rgba) -> Element<'a, Message> {
     let fill = color.into_cosmic_color();
     container(
@@ -240,7 +151,7 @@ pub(crate) fn pip<'a, Message: 'a>(color: mde_theme::Rgba) -> Element<'a, Messag
 }
 
 /// Roboto-Mono caption text, the chrome typeface (design uses `'Roboto Mono'`).
-/// Shared with the events rail (UNIFY-3).
+/// Shared with the content header (UNIFY-4) + the events rail (UNIFY-3).
 pub(crate) fn mono_text<'a>(
     s: impl Into<String>,
     role: TypeRole,
@@ -256,7 +167,7 @@ pub(crate) fn mono_text<'a>(
         })
 }
 
-fn weight_from_u16(w: u16) -> cosmic::iced::font::Weight {
+pub(crate) fn weight_from_u16(w: u16) -> cosmic::iced::font::Weight {
     match w {
         0..=150 => cosmic::iced::font::Weight::Thin,
         151..=250 => cosmic::iced::font::Weight::ExtraLight,
@@ -274,24 +185,35 @@ fn weight_from_u16(w: u16) -> cosmic::iced::font::Weight {
 mod tests {
     use super::*;
 
+    fn item(sev: Severity) -> AlertItem {
+        AlertItem {
+            id: "x".into(),
+            ts_unix_ms: 0,
+            severity: sev,
+            source: mde_notify::Source::System,
+            topic: "mackesd::alert".into(),
+            host: None,
+            title: "t".into(),
+            body: "b".into(),
+            read: false,
+        }
+    }
+
     #[test]
     fn strip_height_matches_design_band() {
-        // Design (`Workbench.dc.html`) global status strip is a 26 px band.
         assert!((STRIP_HEIGHT - 26.0).abs() < f32::EPSILON);
     }
 
     #[test]
-    fn renders_from_real_signals_not_constants() {
-        // Build every branch: bus up/down, health present/absent, rail open/closed —
-        // guards against the strip going static (must reflect live App state).
-        let _up = view::<()>(true, None, true, ());
-        let _down = view::<()>(false, None, false, ());
-        let h = HealthSummary {
-            node_count: 8,
-            healthy_nodes: 7,
-            lighthouse_count: 3,
-            ha_ok: true,
-        };
-        let _with = view::<()>(true, Some(&h), true, ());
+    fn tallies_render_from_real_events_not_constants() {
+        let _empty = view::<()>(&[]);
+        let items = [
+            item(Severity::Critical),
+            item(Severity::Warning),
+            item(Severity::Warning),
+            item(Severity::Success),
+            item(Severity::Info),
+        ];
+        let _full = view::<()>(&items);
     }
 }

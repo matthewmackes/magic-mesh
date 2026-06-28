@@ -46,7 +46,7 @@ use crate::panels::{
     system_update as system_update_panel, tags as tags_panel, vpn as vpn_panel,
     wallpaper as wallpaper_panel, wifi as wifi_panel,
 };
-use crate::patternfly::{breadcrumb, page_subtitle, page_title};
+use crate::patternfly::breadcrumb;
 use crate::sidebar::SidebarState;
 
 /// Default window size — matches the v1.x GTK3 sidebar window
@@ -1446,28 +1446,32 @@ impl App {
             .collect::<Vec<_>>()
             .join(" / ");
 
-        let page_heading = column![
-            text(crumbs).size(12),
-            text(page_title(self.view)).size(26),
-            text(page_subtitle(self.view)).size(13),
-        ]
-        .spacing(6);
+        // UNIFY-4 — the content header (breadcrumb · search · live up-count + chain ·
+        // events toggle) replaces the old page-heading block. The breadcrumb is the
+        // nav context (each restyled panel carries its own title). The search box
+        // opens the REAL app launcher (`FocusRequest("launcher")`) — not a dead box.
+        let content_header = crate::content_header::view(
+            crumbs,
+            self.mesh_health.as_ref(),
+            self.bus_reachable,
+            self.events_rail_open,
+            Message::FocusRequest("launcher".to_string()),
+            Message::ToggleLiveEventsRail,
+        );
 
         let body = self.crossfaded_body();
 
-        // UX-6.a — outer panel padding (SPACE_24) is supplied
-        // here once for every panel, replacing the per-panel
-        // `Padding::new(0.0)` no-op wrappers. Density-aware via
-        // `panel_chrome::outer_padding`.
-        let main = column![page_heading, body]
-            // CV-3 — density-aware gap (space.lg), in step with the
-            // density-aware outer padding below.
-            .spacing(crate::panel_chrome::column_gap(
-                crate::live_theme::tokens().density,
-            ))
-            .padding(crate::panel_chrome::outer_padding(
-                crate::live_theme::tokens().density,
-            ));
+        // The content header spans full width (its own bottom border); the panel
+        // body keeps the density-aware outer padding (UX-6.a).
+        let main = column![
+            content_header,
+            container(body)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(crate::panel_chrome::outer_padding(
+                    crate::live_theme::tokens().density,
+                )),
+        ];
 
         let mut layout = row![
             sidebar,
@@ -1483,15 +1487,10 @@ impl App {
         // so the wordmark + window controls span the full width.
         let window_header = crate::header::view(Message::WindowControl);
 
-        // UNIFY-1/2/3 — the Unified Workbench global status strip frames the whole
-        // app above the window header: live mde-bus "chain" reachability, the
-        // mesh-health counts, and the Live-Events rail toggle.
-        let status_strip = crate::status_strip::view(
-            self.bus_reachable,
-            self.mesh_health.as_ref(),
-            self.events_rail_open,
-            Message::ToggleLiveEventsRail,
-        );
+        // UNIFY-1/4 — the global status strip: cluster brand + the live CRIT/WARN/OK
+        // tallies (from the same alert lane the events rail tails). The breadcrumb /
+        // search / up-count / chain / events-toggle now live in the content header.
+        let status_strip = crate::status_strip::view::<Message>(&self.events);
 
         column![status_strip, window_header, layout]
             .width(Length::Fill)
@@ -2401,6 +2400,7 @@ mod tests {
 
     #[test]
     fn page_title_tracks_active_page() {
+        use crate::patternfly::page_title;
         // CUT-1: the page-aware title now drives the custom header heading via
         // `page_title(self.view)` (the iced-era window `title()` was removed).
         let mut app = App::new();

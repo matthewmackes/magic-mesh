@@ -16,6 +16,8 @@ pub mod backend;
 /// MESH-CONNECT-DIALOG-1 — shared, panel-agnostic UI components
 /// (e.g. the connect/configure progress modal).
 pub mod components;
+/// UNIFY-4 — the content header (breadcrumb · search · status chips · rail toggle).
+pub mod content_header;
 pub mod controls;
 pub mod cosmic_compat;
 pub mod dbus;
