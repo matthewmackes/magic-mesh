@@ -24,7 +24,9 @@ ansible-playbook build-vm-toolchain.yml -l build-50   # one node
 
 ## Inventory
 
-- `build_vms` — the Fedora build VMs (`mm` user): `172.20.0.50`, `172.20.0.51`.
-- `dom0s` — the XCP hypervisors (`root`): `172.20.0.9`, `172.20.145.193`.
+- `build_vms` — the Fedora build VMs (`mm` user): `172.20.0.50`, `172.20.0.51`,
+  `172.20.0.52`, `172.20.0.170` (XEN-194).
+- `dom0s` — the XCP hypervisors (`root`): `172.20.0.9`, `172.20.145.193`,
+  `172.20.145.165`, `172.20.145.194`.
 
 > Needs only `ansible-core` (no extra collections — uses `ansible.builtin.*`).

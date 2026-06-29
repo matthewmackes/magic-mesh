@@ -37,3 +37,15 @@ resource "xenserver_vm" "build_52" {
     ignore_changes = [hard_drive, template_name, boot_mode, boot_order, cores_per_socket, dynamic_mem_max, dynamic_mem_min, static_mem_min, name_description, cdrom]
   }
 }
+resource "xenserver_vm" "build_53" {
+  provider          = xenserver.x194
+  name_label        = "mcnf-build-53"
+  template_name     = "MDE-VM-golden"
+  static_mem_max    = 11811160064 # 11 GiB (host is 15 GiB total; ~4 GiB for dom0)
+  vcpus             = 4
+  check_ip_timeout  = 0
+  network_interface = [{ device = "0", network_uuid = "1d940eba-09fb-71e9-e6e5-a7ab5f7259ce" }]
+  lifecycle {
+    ignore_changes = [hard_drive, template_name, boot_mode, boot_order, cores_per_socket, dynamic_mem_max, dynamic_mem_min, static_mem_min, name_description, cdrom]
+  }
+}
