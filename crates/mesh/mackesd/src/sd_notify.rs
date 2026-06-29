@@ -71,7 +71,12 @@ fn watchdog_interval_from(watchdog_usec: u64, pid_matches: bool) -> Option<Durat
     if !pid_matches || watchdog_usec == 0 {
         return None;
     }
-    Some(Duration::from_micros(watchdog_usec / 2))
+    // Half of WATCHDOG_USEC (systemd's recommendation), but CAPPED at 15 s
+    // (WIFI-WATCHDOG): with a generous WatchdogSec the half-interval ping cadence
+    // becomes coarse, so one withheld ping could blow the whole window. Capping
+    // keeps the daemon pinging steadily; the freshness gate still decides whether
+    // to withhold during a genuine wedge.
+    Some(Duration::from_micros((watchdog_usec / 2).min(15_000_000)))
 }
 
 /// WATCHDOG-2 — should the dedicated watchdog thread ping right now?
@@ -128,10 +133,16 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_interval_is_half_of_usec_when_armed() {
+    fn watchdog_interval_is_half_of_usec_capped_at_15s() {
+        // half = 30 s, capped at 15 s (WIFI-WATCHDOG: keep pings frequent).
         assert_eq!(
             watchdog_interval_from(60_000_000, true),
-            Some(Duration::from_micros(30_000_000))
+            Some(Duration::from_micros(15_000_000))
+        );
+        // a small WatchdogSec stays at half (below the cap): half of 10 s = 5 s.
+        assert_eq!(
+            watchdog_interval_from(10_000_000, true),
+            Some(Duration::from_micros(5_000_000))
         );
     }
 

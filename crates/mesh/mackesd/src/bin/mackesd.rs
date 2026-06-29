@@ -8297,9 +8297,18 @@ fn run_serve(
             );
             let beat = Arc::clone(&wd_beat);
             let wd_shutdown = Arc::clone(&shutdown);
-            // A beat older than 5 s while WatchdogSec is 60 s means the serve
-            // loop (which beats every 250 ms) is genuinely wedged.
-            let fresh_ms = 5_000u64;
+            // A beat older than `fresh_ms` means the serve loop (which beats every
+            // 250 ms) is genuinely wedged. WIFI-WATCHDOG: a node on a slow/high-
+            // latency link (e.g. a laptop on WiFi) can legitimately starve the beat
+            // for tens of seconds during a blocking coordination op — at 5 s that
+            // false-restarted mackesd into a crash-loop and blocked in-place
+            // upgrades on WiFi. Default 60 s, raisable per-node via
+            // MACKESD_WATCHDOG_FRESH_MS; the systemd WatchdogSec window (180 s) is
+            // sized to match, so a genuine wedge is still caught within minutes.
+            let fresh_ms = std::env::var("MACKESD_WATCHDOG_FRESH_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(60_000u64);
             let _ = std::thread::Builder::new()
                 .name("mackesd-watchdog".into())
                 .spawn(move || {
