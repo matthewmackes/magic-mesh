@@ -14,7 +14,7 @@
 //! merged files, so opening the panel never kicks off a scan.
 
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
 use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
@@ -70,18 +70,40 @@ pub struct NetworkHostsPanel {
     pub error: Option<String>,
     pub last_run_at: Option<SystemTime>,
     pub busy: bool,
+    /// MOTION-TRANS-3 — the keyed-diff reveal: a host that just appeared on a
+    /// refresh slides up + fades into the inventory, while hosts already on
+    /// screen stay put (the list doesn't restroke). Keyed by host IP.
+    reveal: mde_theme::animation::KeyedListReveal,
 }
+
+/// MOTION-TRANS-3 — stable scrollable id so the host inventory keeps its scroll
+/// position across a refresh (the list doesn't jump when a host is added/removed).
+const LIST_ID: &str = "network-hosts-list";
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Loaded(Result<HostInventory, String>),
     RefreshClicked,
+    /// MOTION-TRANS-3 — advance the host-insert reveal one frame (in-flight-only
+    /// tick; GC's settled reveals so it self-stops at rest).
+    AnimTick,
 }
 
 impl NetworkHostsPanel {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            reveal: mde_theme::animation::KeyedListReveal::new(crate::live_theme::reduce_motion()),
+            ..Self::default()
+        }
+    }
+
+    /// MOTION-TRANS-3 — does the host-insert reveal still have a frame to draw?
+    /// The app gates the panel's per-frame tick subscription on this (idle ⇒ no
+    /// tick).
+    #[must_use]
+    pub fn needs_tick(&self, now: Instant) -> bool {
+        !self.reveal.is_idle(now)
     }
 
     pub fn load() -> Task<crate::Message> {
@@ -93,6 +115,13 @@ impl NetworkHostsPanel {
     pub fn update(&mut self, msg: Message) -> Task<crate::Message> {
         match msg {
             Message::Loaded(Ok(inv)) => {
+                // MOTION-TRANS-3 — diff the freshly-merged inventory against the
+                // last frame so any newly-appeared host reveals in (the first load
+                // is treated as the list appearing — no mass reveal).
+                let now = Instant::now();
+                self.reveal
+                    .sync(inv.hosts.iter().map(|h| h.ip.clone()), now);
+                self.reveal.gc(now);
                 self.inventory = inv;
                 self.error = None;
                 self.busy = false;
@@ -100,10 +129,19 @@ impl NetworkHostsPanel {
                 Task::none()
             }
             Message::Loaded(Err(e)) => {
+                // The inventory emptied — drop any in-flight reveals.
+                let now = Instant::now();
+                self.reveal.sync(Vec::<String>::new(), now);
+                self.reveal.gc(now);
                 self.inventory = HostInventory::default();
                 self.error = Some(e);
                 self.busy = false;
                 self.last_run_at = Some(SystemTime::now());
+                Task::none()
+            }
+            // MOTION-TRANS-3 — drop settled reveals so the tick subscription stops.
+            Message::AnimTick => {
+                self.reveal.gc(Instant::now());
                 Task::none()
             }
             Message::RefreshClicked => {
@@ -191,13 +229,31 @@ impl NetworkHostsPanel {
                 .colr(palette.text_muted.into_cosmic_color())
                 .into()
         } else {
+            // MOTION-TRANS-3 — a single clock read for this frame's reveal sampling.
+            let now = Instant::now();
             let blocks: Vec<Element<'_, crate::Message>> = self
                 .inventory
                 .hosts
                 .iter()
-                .map(|h| host_block(h, palette, sizes))
+                .map(|h| {
+                    // A freshly-inserted host starts a few px low and rises to
+                    // rest, applied as decaying top padding (iced 0.13 has no
+                    // transform widget — the translate-as-padding idiom). `0` once
+                    // settled, so the resting layout is unchanged.
+                    let slide = self.reveal.row_params(&h.ip, now).translate_y.max(0.0);
+                    container(host_block(h, palette, sizes))
+                        .padding(Padding {
+                            top: slide,
+                            right: 0.0,
+                            bottom: 0.0,
+                            left: 0.0,
+                        })
+                        .into()
+                })
                 .collect();
-            scrollable(column(blocks).spacing(10)).into()
+            scrollable(column(blocks).spacing(10))
+                .id(cosmic::iced::widget::Id::new(LIST_ID))
+                .into()
         };
 
         let page = column![header, row![subtitle], Space::new().height(12), body].spacing(4);
@@ -514,5 +570,58 @@ mod tests {
         // dev box happens to have /mnt/mesh-storage the call still
         // completes (Ok) — the contract is "never panics".
         let _ = fetch_inventory();
+    }
+
+    /// A minimal inventory of bare-IP hosts (the reveal keys on `ip`).
+    fn inv(ips: &[&str]) -> HostInventory {
+        HostInventory {
+            hosts: ips
+                .iter()
+                .map(|ip| HostRow {
+                    display: (*ip).to_string(),
+                    ip: (*ip).to_string(),
+                    source: "LAN".to_string(),
+                    trust: String::new(),
+                    services: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn first_load_seeds_without_revealing_then_an_insert_reveals() {
+        // MOTION-TRANS-3 — opening the panel (first Loaded) seeds the inventory
+        // with no mass reveal; a later refresh that adds a host reveals it, so the
+        // panel reports it needs a per-frame tick.
+        let mut p = NetworkHostsPanel::new();
+        let now = Instant::now();
+        let _ = p.update(Message::Loaded(Ok(inv(&["10.0.0.1", "10.0.0.2"]))));
+        assert!(
+            !p.needs_tick(now),
+            "the initial inventory must not mass-reveal (no tick needed)"
+        );
+        // A refresh that adds a host arms its reveal → a tick is needed.
+        let _ = p.update(Message::Loaded(Ok(inv(&[
+            "10.0.0.1", "10.0.0.2", "10.0.0.3",
+        ]))));
+        assert!(
+            p.needs_tick(Instant::now()),
+            "an inserted host reveals → the panel needs a tick"
+        );
+    }
+
+    #[test]
+    fn anim_tick_settles_the_reveal_and_stops_the_clock() {
+        // MOTION-TRANS-3 — once the reveal's panel-mount duration has elapsed, an
+        // AnimTick GC's it and the panel goes idle (the subscription stops).
+        let mut p = NetworkHostsPanel::new();
+        let _ = p.update(Message::Loaded(Ok(inv(&["10.0.0.1"]))));
+        let _ = p.update(Message::Loaded(Ok(inv(&["10.0.0.1", "10.0.0.2"]))));
+        let _ = p.update(Message::AnimTick);
+        let later = Instant::now() + mde_theme::motion::Motion::panel_mount().duration;
+        assert!(
+            !p.needs_tick(later),
+            "a settled reveal needs no further ticks"
+        );
     }
 }

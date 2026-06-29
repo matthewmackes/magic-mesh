@@ -22,7 +22,7 @@
 //! Carbon tokens only (§4) — all colour/metrics via the `mde-theme` palette.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
 use cosmic::iced::{Background, Border, Color, Length, Padding, Task};
@@ -104,6 +104,18 @@ impl UnifiedService {
         match self.port {
             Some(p) => (host, Some(p), String::new()),
             None => (host, None, self.name.to_ascii_lowercase()),
+        }
+    }
+
+    /// MOTION-TRANS-3 — a stable, unique string key for the row-insert reveal,
+    /// mirroring [`Self::dedup_key`] (rows are already unique by it after the
+    /// union/dedup) so a row keeps the same identity across refreshes.
+    #[must_use]
+    fn row_key(&self) -> String {
+        let host = self.host.to_ascii_lowercase();
+        match self.port {
+            Some(p) => format!("{host}|{p}|"),
+            None => format!("{host}||{}", self.name.to_ascii_lowercase()),
         }
     }
 }
@@ -232,18 +244,39 @@ pub struct ServicesMapPanel {
     pub last_run_at: Option<SystemTime>,
     /// Operator-facing status — the per-source counts, or the failure mode.
     pub last_op: String,
+    /// MOTION-TRANS-3 — the keyed-diff reveal: a service that just appeared on a
+    /// refresh slides up + fades into the list, while rows already on screen stay
+    /// put (the list doesn't restroke). Keyed by [`UnifiedService::row_key`].
+    reveal: mde_theme::animation::KeyedListReveal,
 }
+
+/// MOTION-TRANS-3 — stable scrollable id so the unified-services list keeps its
+/// scroll position across a refresh (the list doesn't jump on add/remove).
+const LIST_ID: &str = "services-map-list";
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Loaded(Vec<UnifiedService>),
     RefreshClicked,
+    /// MOTION-TRANS-3 — advance the row-insert reveal one frame (in-flight-only
+    /// tick; GC's settled reveals so it self-stops at rest).
+    AnimTick,
 }
 
 impl ServicesMapPanel {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            reveal: mde_theme::animation::KeyedListReveal::new(crate::live_theme::reduce_motion()),
+            ..Self::default()
+        }
+    }
+
+    /// MOTION-TRANS-3 — does the row-insert reveal still have a frame to draw? The
+    /// app gates the panel's per-frame tick subscription on this (idle ⇒ no tick).
+    #[must_use]
+    pub fn needs_tick(&self, now: Instant) -> bool {
+        !self.reveal.is_idle(now)
     }
 
     /// Gather the three surfaces + union them. The two blocking readers ride
@@ -272,10 +305,22 @@ impl ServicesMapPanel {
     pub fn update(&mut self, msg: Message) -> Task<crate::Message> {
         match msg {
             Message::Loaded(rows) => {
+                // MOTION-TRANS-3 — diff the freshly-unioned roster against the last
+                // frame so any newly-appeared service reveals in (the first load is
+                // treated as the list appearing — no mass reveal).
+                let now = Instant::now();
+                self.reveal
+                    .sync(rows.iter().map(UnifiedService::row_key), now);
+                self.reveal.gc(now);
                 self.last_op = summarise(&rows);
                 self.rows = rows;
                 self.busy = false;
                 self.last_run_at = Some(SystemTime::now());
+                Task::none()
+            }
+            // MOTION-TRANS-3 — drop settled reveals so the tick subscription stops.
+            Message::AnimTick => {
+                self.reveal.gc(Instant::now());
                 Task::none()
             }
             Message::RefreshClicked => {
@@ -349,11 +394,30 @@ impl ServicesMapPanel {
         let rows_widget: Element<'_, crate::Message> = if self.rows.is_empty() {
             empty_state(palette)
         } else {
+            // MOTION-TRANS-3 — a single clock read for this frame's reveal sampling.
+            let now = Instant::now();
             let mut col = column![].spacing(6);
             for r in &self.rows {
-                col = col.push(unified_row_view(r, palette));
+                // A freshly-inserted row starts a few px low and rises to rest,
+                // applied as decaying top padding (iced 0.13 has no transform
+                // widget — the translate-as-padding idiom). `0` once settled, so
+                // the resting layout is unchanged.
+                let slide = self
+                    .reveal
+                    .row_params(&r.row_key(), now)
+                    .translate_y
+                    .max(0.0);
+                col = col.push(container(unified_row_view(r, palette)).padding(Padding {
+                    top: slide,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                }));
             }
-            scrollable(col).height(Length::FillPortion(1)).into()
+            scrollable(col)
+                .id(cosmic::iced::widget::Id::new(LIST_ID))
+                .height(Length::FillPortion(1))
+                .into()
         };
 
         container(
@@ -761,5 +825,56 @@ mod tests {
         assert!(!p.busy);
         assert!(p.last_op.contains("1 service"));
         assert!(p.last_run_at.is_some());
+    }
+
+    /// A unified row keyed by its host+port (the reveal key).
+    fn svc(host: &str, port: u16) -> UnifiedService {
+        UnifiedService {
+            host: host.to_string(),
+            name: format!("svc-{port}"),
+            detail: String::new(),
+            port: Some(port),
+            proto: "tcp".to_string(),
+            source: ServiceSource::Published,
+            reachable: true,
+        }
+    }
+
+    #[test]
+    fn first_load_seeds_without_revealing_then_an_insert_reveals() {
+        // MOTION-TRANS-3 — opening the panel (first Loaded) seeds the roster with
+        // no mass reveal; a later refresh that adds a service reveals it, so the
+        // panel reports it needs a per-frame tick.
+        let mut p = ServicesMapPanel::new();
+        let now = Instant::now();
+        let _ = p.update(Message::Loaded(vec![svc("a", 22), svc("a", 80)]));
+        assert!(
+            !p.needs_tick(now),
+            "the initial roster must not mass-reveal (no tick needed)"
+        );
+        let _ = p.update(Message::Loaded(vec![
+            svc("a", 22),
+            svc("a", 80),
+            svc("b", 443),
+        ]));
+        assert!(
+            p.needs_tick(Instant::now()),
+            "an inserted service reveals → the panel needs a tick"
+        );
+    }
+
+    #[test]
+    fn anim_tick_settles_the_reveal_and_stops_the_clock() {
+        // MOTION-TRANS-3 — once the reveal's panel-mount duration has elapsed, an
+        // AnimTick GC's it and the panel goes idle (the subscription stops).
+        let mut p = ServicesMapPanel::new();
+        let _ = p.update(Message::Loaded(vec![svc("a", 22)]));
+        let _ = p.update(Message::Loaded(vec![svc("a", 22), svc("b", 443)]));
+        let _ = p.update(Message::AnimTick);
+        let later = Instant::now() + mde_theme::motion::Motion::panel_mount().duration;
+        assert!(
+            !p.needs_tick(later),
+            "a settled reveal needs no further ticks"
+        );
     }
 }

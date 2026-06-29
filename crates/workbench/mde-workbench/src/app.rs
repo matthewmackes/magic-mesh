@@ -761,6 +761,41 @@ impl App {
                     .map(|_| Message::MeshPending(mesh_pending_panel::Message::AnimTick)),
             );
         }
+        // MOTION-TRANS-3 — drive each long-list panel's row-insert reveal at
+        // ~60 fps, only while that panel is active AND a reveal is in flight (idle
+        // ⇒ no subscription, zero wakeups). Same gate as Mesh Pending: a peer/
+        // host/service/role that just appeared on a refresh slides in while the
+        // settled rows stay put.
+        if self.view.panel_slug() == Some("peers") && self.peers.needs_tick(Instant::now()) {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(16))
+                    .map(|_| Message::Peers(peers_panel::Message::AnimTick)),
+            );
+        }
+        if self.view.panel_slug() == Some("services_map")
+            && self.services_map.needs_tick(Instant::now())
+        {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(16))
+                    .map(|_| Message::ServicesMap(services_map_panel::Message::AnimTick)),
+            );
+        }
+        if self.view.panel_slug() == Some("network_hosts")
+            && self.network_hosts.needs_tick(Instant::now())
+        {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(16))
+                    .map(|_| Message::NetworkHosts(network_hosts_panel::Message::AnimTick)),
+            );
+        }
+        if self.view.panel_slug() == Some("fleet_rollup")
+            && self.fleet_rollup.needs_tick(Instant::now())
+        {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(16))
+                    .map(|_| Message::FleetRollup(fleet_rollup_panel::Message::AnimTick)),
+            );
+        }
         // PD-8 (L14) / PLANES-1 — Netdata sampling only while the Peers
         // directory is the active view (the Compute pattern). The Front
         // Door is reachable as the Peers plane root/panel or the

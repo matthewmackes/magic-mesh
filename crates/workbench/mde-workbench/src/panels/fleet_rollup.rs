@@ -121,7 +121,17 @@ pub struct FleetRollupPanel {
     /// fresh instant but does NOT spawn a second loop, so rapid refreshes never
     /// multiply the timer wakeups.
     crossfade_ticking: bool,
+    /// MOTION-TRANS-3 — the keyed-diff reveal: a role group that just appeared on
+    /// a refresh slides up + fades into the dashboard, while groups already on
+    /// screen stay put. This is the per-row insert reveal layered on top of the
+    /// MOTION-NET-3 whole-panel swap dissolve (a different signal: which group is
+    /// new, not just that the data changed). Keyed by `role`.
+    reveal: mde_theme::animation::KeyedListReveal,
 }
+
+/// MOTION-TRANS-3 — stable scrollable id so the role-group list keeps its scroll
+/// position across a refresh (the list doesn't jump on add/remove).
+const LIST_ID: &str = "fleet-rollup-list";
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -140,12 +150,26 @@ pub enum Message {
     /// crossfade is in flight, so the dissolve animates WITHOUT a central tick in
     /// `app.rs`; the loop stops the moment the tween settles (no idle wakeups).
     CrossfadeTick,
+    /// MOTION-TRANS-3 — advance the role-group insert reveal one frame (central
+    /// in-flight-only tick from `app.rs`; GC's settled reveals so it self-stops).
+    AnimTick,
 }
 
 impl FleetRollupPanel {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            reveal: mde_theme::animation::KeyedListReveal::new(crate::live_theme::reduce_motion()),
+            ..Self::default()
+        }
+    }
+
+    /// MOTION-TRANS-3 — does the role-group insert reveal still have a frame to
+    /// draw? The app gates the panel's per-frame reveal tick on this (idle ⇒ no
+    /// tick). Independent of the MOTION-NET-3 panel-local crossfade self-tick.
+    #[must_use]
+    pub fn needs_tick(&self, now: Instant) -> bool {
+        !self.reveal.is_idle(now)
     }
 
     pub fn load() -> Task<crate::Message> {
@@ -208,6 +232,13 @@ impl FleetRollupPanel {
                 // panel never blanks (the stale data was kept dimmed until now).
                 let had_prior = self.loaded && !self.rollup.groups.is_empty();
                 let reduce_motion = crate::live_theme::reduce_motion();
+                // MOTION-TRANS-3 — diff the freshly-loaded role groups against the
+                // last frame so any newly-appeared role reveals in (the first load
+                // is treated as the list appearing — no mass reveal).
+                let reveal_now = Instant::now();
+                self.reveal
+                    .sync(rollup.groups.iter().map(|g| g.role.clone()), reveal_now);
+                self.reveal.gc(reveal_now);
                 self.rollup = rollup;
                 self.rows = rows;
                 self.rtt = rtt;
@@ -244,6 +275,11 @@ impl FleetRollupPanel {
                 self.crossfade_start = None;
                 self.status = "Refreshing…".into();
                 Self::load()
+            }
+            // MOTION-TRANS-3 — drop settled reveals so the reveal tick stops.
+            Message::AnimTick => {
+                self.reveal.gc(Instant::now());
+                Task::none()
             }
             Message::CrossfadeTick => {
                 // MOTION-NET-3 — advance the panel-local crossfade. While still in
@@ -354,6 +390,8 @@ impl FleetRollupPanel {
         // full opacity. The crossfade swap on `Loaded` then dissolves old→new.
         let content_palette = palette.dimmed(load.content_alpha());
 
+        // MOTION-TRANS-3 — a single clock read for this frame's reveal sampling.
+        let reveal_now = Instant::now();
         let mut cards = column![].spacing(10);
         for g in &self.rollup.groups {
             let breakdown = text(format!(
@@ -369,32 +407,49 @@ impl FleetRollupPanel {
                 Some(crate::Message::DrillToPeers(g.role.clone())),
                 content_palette,
             );
+            // A freshly-inserted role group starts a few px low and rises to rest,
+            // applied as decaying top padding (iced 0.13 has no transform widget —
+            // the translate-as-padding idiom). `0` once settled, so the resting
+            // layout is unchanged.
+            let slide = self
+                .reveal
+                .row_params(&g.role, reveal_now)
+                .translate_y
+                .max(0.0);
             cards = cards.push(
                 container(
-                    row![
-                        column![
-                            text(format!(
-                                "{}  ({} member{})",
-                                g.role,
-                                g.total,
-                                if g.total == 1 { "" } else { "s" }
-                            ))
-                            .size(16),
-                            breakdown,
+                    container(
+                        row![
+                            column![
+                                text(format!(
+                                    "{}  ({} member{})",
+                                    g.role,
+                                    g.total,
+                                    if g.total == 1 { "" } else { "s" }
+                                ))
+                                .size(16),
+                                breakdown,
+                            ]
+                            .spacing(2),
+                            status_badge(
+                                g.worst_health.clone(),
+                                health_severity(&g.worst_health),
+                                content_palette
+                            ),
+                            cosmic::iced::widget::Space::new().width(Length::Fill),
+                            drill,
                         ]
-                        .spacing(2),
-                        status_badge(
-                            g.worst_health.clone(),
-                            health_severity(&g.worst_health),
-                            content_palette
-                        ),
-                        cosmic::iced::widget::Space::new().width(Length::Fill),
-                        drill,
-                    ]
-                    .spacing(12)
-                    .align_y(cosmic::iced::Alignment::Center),
+                        .spacing(12)
+                        .align_y(cosmic::iced::Alignment::Center),
+                    )
+                    .padding(Padding::from(12)),
                 )
-                .padding(Padding::from(12)),
+                .padding(Padding {
+                    top: slide,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                }),
             );
         }
 
@@ -459,11 +514,15 @@ impl FleetRollupPanel {
 
         // The live data section (centerpiece + role cards) — the part that dims
         // while refreshing and crossfades on swap.
-        let content: Element<'_, crate::Message> =
-            column![centerpiece, scrollable(cards).height(Length::Fill),]
-                .spacing(16)
-                .width(Length::Fill)
-                .into();
+        let content: Element<'_, crate::Message> = column![
+            centerpiece,
+            scrollable(cards)
+                .id(cosmic::iced::widget::Id::new(LIST_ID))
+                .height(Length::Fill),
+        ]
+        .spacing(16)
+        .width(Length::Fill)
+        .into();
 
         panel_container(
             column![header, self.crossfaded(content, palette)]
@@ -678,6 +737,62 @@ mod tests {
         assert!(
             !p.crossfade_ticking,
             "loop stops + flag clears when the crossfade is gone"
+        );
+    }
+
+    /// A `Loaded` message carrying one healthy group per role (the reveal keys
+    /// on `role`).
+    fn loaded_with_roles(roles: &[&str]) -> Message {
+        Message::Loaded {
+            rollup: Rollup {
+                total: roles.len(),
+                groups: roles
+                    .iter()
+                    .map(|r| RoleGroup {
+                        role: (*r).to_string(),
+                        total: 1,
+                        worst_health: "healthy".to_string(),
+                        ..RoleGroup::default()
+                    })
+                    .collect(),
+            },
+            rows: Vec::new(),
+            rtt: HashMap::new(),
+            self_hostname: "pine".into(),
+        }
+    }
+
+    #[test]
+    fn first_load_seeds_without_revealing_then_an_insert_reveals() {
+        // MOTION-TRANS-3 — opening the panel (first Loaded) seeds the dashboard
+        // with no mass reveal; a later refresh that adds a role reveals it, so the
+        // panel reports it needs a per-frame reveal tick.
+        let mut p = FleetRollupPanel::new();
+        let now = Instant::now();
+        let _ = p.update(loaded_with_roles(&["host", "peer"]));
+        assert!(
+            !p.needs_tick(now),
+            "the initial roster must not mass-reveal (no reveal tick needed)"
+        );
+        let _ = p.update(loaded_with_roles(&["host", "peer", "relay"]));
+        assert!(
+            p.needs_tick(Instant::now()),
+            "an inserted role group reveals → the panel needs a tick"
+        );
+    }
+
+    #[test]
+    fn anim_tick_settles_the_reveal_and_stops_the_clock() {
+        // MOTION-TRANS-3 — once the reveal's panel-mount duration has elapsed, an
+        // AnimTick GC's it and the panel goes idle (the reveal tick stops).
+        let mut p = FleetRollupPanel::new();
+        let _ = p.update(loaded_with_roles(&["host"]));
+        let _ = p.update(loaded_with_roles(&["host", "peer"]));
+        let _ = p.update(Message::AnimTick);
+        let later = Instant::now() + Motion::panel_mount().duration;
+        assert!(
+            !p.needs_tick(later),
+            "a settled reveal needs no further ticks"
         );
     }
 
