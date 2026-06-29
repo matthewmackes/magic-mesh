@@ -90,7 +90,10 @@ user). Secrets are **off-repo** — see "Credentials" below.
 | `rocky9-kvm2` (dev) | `172.20.145.192` | Rocky 9.8 | — | Orchestration + **local builds** + podman; runs XO + tofu/ansible/packer; this is where Claude Code + `/root/magic-mesh` live |
 | `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 | 4c / 24 GiB | hypervisor — build VM `mcnf-build-50` (172.20.0.50, 4 vCPU/16 GiB); local SR is `ext` ("Local storage") |
 | `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 | 4c / 23 GiB | hypervisor — build VM `mcnf-build-51` (172.20.0.51, 4 vCPU/16 GiB) |
-| `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 | **12c / 32 GiB** | hypervisor — build VM `mcnf-build-52` (172.20.0.52, **8 vCPU/24 GiB**); 398 GiB SR; the high-capacity node (room for several more build VMs) |
+| `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 | **12c / 32 GiB** | hypervisor — build VM `mcnf-build-52` (reachable `172.20.0.130`; currently 4 vCPU — resize to 12 vCPU pending an operator-run `xe vm-vcpus-set` to use the 12-core host); 398 GiB SR; the high-capacity node |
+| `XEN-196` | `172.20.145.196` | XCP-ng dom0 | ~24 GiB | hypervisor — build VM `mcnf-build-53` (`172.20.0.53`, Fedora 42, rust 1.94 + sccache); added to the farm 2026-06-28, reachable via `MCNF_BUILD_HOST=172.20.0.53` |
+
+> Note: the build VMs' reachable IPs have drifted from the canonical `.50/.51/.52` via DHCP — live: `mcnf-build-50`=`.50`, `mcnf-build-51`=`.90`, `mcnf-build-52`=`.130`, `mcnf-build-53`=`.53`. `xcp-build.sh`'s routing table holds the live IPs.
 
 ### Credentials (locations only — never in-repo)
 - **Mesh SSH key:** `~/.ssh/mackes_mesh_ed25519` (+ `.pub`) — dom0s + build-VM `mm`.
