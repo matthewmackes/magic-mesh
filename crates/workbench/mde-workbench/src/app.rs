@@ -41,10 +41,9 @@ use crate::panels::{
     remote_desktop as remote_desktop_panel, repair as repair_panel, resources as resources_panel,
     routing as routing_panel, run_history as run_history_panel,
     service_publishing as service_publishing_panel, services_map as services_map_panel,
-    sip_gateway as sip_gateway_panel,
-    snapshots as snapshots_panel, sync_status as sync_status_panel,
-    system_update as system_update_panel, tags as tags_panel, vpn as vpn_panel,
-    wallpaper as wallpaper_panel, wifi as wifi_panel,
+    sip_gateway as sip_gateway_panel, snapshots as snapshots_panel,
+    sync_status as sync_status_panel, system_update as system_update_panel, tags as tags_panel,
+    vpn as vpn_panel, wallpaper as wallpaper_panel, wifi as wifi_panel,
 };
 use crate::patternfly::{breadcrumb, page_subtitle, page_title};
 use crate::sidebar::SidebarState;
@@ -702,8 +701,7 @@ impl App {
         // ONLY while a reveal is in flight (idle ⇒ no subscription, zero wakeups).
         if self.nav_anim.needs_tick(Instant::now()) {
             subs.push(
-                cosmic::iced::time::every(Duration::from_millis(16))
-                    .map(|_| Message::NavAnimTick),
+                cosmic::iced::time::every(Duration::from_millis(16)).map(|_| Message::NavAnimTick),
             );
         }
         // E6.10 / DATACENTER-25 — sample Compute instance CPU/mem only while the
@@ -1376,8 +1374,7 @@ impl App {
 
         // UX-4 — custom window header sits above sidebar + body
         // so the wordmark + window controls span the full width.
-        let window_header =
-            crate::header::view(Message::WindowControl, self.connection_state());
+        let window_header = crate::header::view(Message::WindowControl, self.connection_state());
 
         column![window_header, layout]
             .width(Length::Fill)
@@ -2210,15 +2207,20 @@ mod tests {
         // DATACENTER-25 — the fold bar selects which surface shows in the
         // Datacenter plane; the tab state drives both the body + its subscriptions.
         let mut app = App::new();
-        assert_eq!(app.datacenter_tab, DatacenterTab::Native, "defaults to Native");
+        assert_eq!(
+            app.datacenter_tab,
+            DatacenterTab::Native,
+            "defaults to Native"
+        );
         let _ = app.update(Message::SelectDatacenterTab(DatacenterTab::Instances));
         assert_eq!(app.datacenter_tab, DatacenterTab::Instances);
         assert!(
             app.on_datacenter_tab(DatacenterTab::Instances)
-                || app.current_view() != (View::Panel {
-                    group: Group::Provisioning,
-                    panel: "datacenter"
-                }),
+                || app.current_view()
+                    != (View::Panel {
+                        group: Group::Provisioning,
+                        panel: "datacenter"
+                    }),
             "the Instances tab predicate only trips while the plane is the active view",
         );
         let _ = app.update(Message::SelectDatacenterTab(DatacenterTab::BuildFarm));
@@ -2260,7 +2262,10 @@ mod tests {
         let early = app
             .nav_anim
             .value(&key, t0, mde_theme::motion::Easing::EaseOut);
-        assert!(early < 1.0, "a freshly-armed reveal is mid-flight, got {early}");
+        assert!(
+            early < 1.0,
+            "a freshly-armed reveal is mid-flight, got {early}"
+        );
         assert!(
             crate::sidebar::reveal_offset(early) > 0.0,
             "rows start offset below their rest position"
@@ -2308,7 +2313,10 @@ mod tests {
         }
         // Collapsing again: the rows leave instantly — no new reveal is armed.
         let _ = app.update(Message::ToggleGroupExpansion(group));
-        assert!(!app.sidebar.is_expanded(group, active), "the group collapsed");
+        assert!(
+            !app.sidebar.is_expanded(group, active),
+            "the group collapsed"
+        );
     }
 
     #[test]

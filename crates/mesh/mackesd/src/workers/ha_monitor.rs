@@ -237,7 +237,14 @@ fn publish_ha_status(snap: &HaSnapshot) {
         return;
     };
     let mut cmd = Command::new("mde-bus");
-    cmd.args(["publish", STATUS_TOPIC, "--body-flag", &body, "--priority", "high"]);
+    cmd.args([
+        "publish",
+        STATUS_TOPIC,
+        "--body-flag",
+        &body,
+        "--priority",
+        "high",
+    ]);
     crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
@@ -477,7 +484,8 @@ mod tests {
         assert_eq!(back.leader, None);
         // And a populated one.
         let doc2 = HaStatusDoc::from_snapshot(&snap(3, Some("kiln")));
-        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&doc2).unwrap()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&doc2).unwrap()).unwrap();
         assert_eq!(v["member_count"], 3);
         assert_eq!(v["quorum_ok"], true);
         assert_eq!(v["leader"], "kiln");

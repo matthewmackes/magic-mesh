@@ -286,8 +286,10 @@ impl BuildFarmPanel {
             col = col.push(
                 column![
                     text("Build farm").size(16),
-                    text("No @farm jobs yet — queued and finished jobs appear here as the \
-                          orchestrator publishes them.")
+                    text(
+                        "No @farm jobs yet — queued and finished jobs appear here as the \
+                          orchestrator publishes them."
+                    )
                     .colr(palette.text_muted.into_cosmic_color()),
                 ]
                 .spacing(6),
@@ -364,12 +366,27 @@ mod tests {
 
     #[test]
     fn parse_tier_outcome_maps_verdicts() {
-        assert_eq!(parse_tier_outcome(r#"{"outcome":"pass"}"#), TierOutcome::Pass);
-        assert_eq!(parse_tier_outcome(r#"{"overall":"green"}"#), TierOutcome::Pass);
-        assert_eq!(parse_tier_outcome(r#"{"overall":"RED"}"#), TierOutcome::Fail);
-        assert_eq!(parse_tier_outcome(r#"{"outcome":"fail"}"#), TierOutcome::Fail);
+        assert_eq!(
+            parse_tier_outcome(r#"{"outcome":"pass"}"#),
+            TierOutcome::Pass
+        );
+        assert_eq!(
+            parse_tier_outcome(r#"{"overall":"green"}"#),
+            TierOutcome::Pass
+        );
+        assert_eq!(
+            parse_tier_outcome(r#"{"overall":"RED"}"#),
+            TierOutcome::Fail
+        );
+        assert_eq!(
+            parse_tier_outcome(r#"{"outcome":"fail"}"#),
+            TierOutcome::Fail
+        );
         // empty / running → Unknown; malformed JSON → Unknown (never an error)
-        assert_eq!(parse_tier_outcome(r#"{"outcome":""}"#), TierOutcome::Unknown);
+        assert_eq!(
+            parse_tier_outcome(r#"{"outcome":""}"#),
+            TierOutcome::Unknown
+        );
         assert_eq!(parse_tier_outcome("not json"), TierOutcome::Unknown);
     }
 
@@ -388,14 +405,8 @@ mod tests {
     #[test]
     fn project_tiers_reads_latest_per_tier() {
         let events = vec![
-            (
-                "event/test/install".into(),
-                r#"{"outcome":"pass"}"#.into(),
-            ),
-            (
-                "event/test/stability".into(),
-                r#"{"overall":"RED"}"#.into(),
-            ),
+            ("event/test/install".into(), r#"{"outcome":"pass"}"#.into()),
+            ("event/test/stability".into(), r#"{"overall":"RED"}"#.into()),
             // feature absent → stays "no runs yet"
             ("event/farm/x".into(), r#"{"jobid":"x"}"#.into()), // ignored here
         ];

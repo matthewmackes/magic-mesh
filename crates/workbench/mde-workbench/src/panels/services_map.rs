@@ -357,7 +357,12 @@ impl ServicesMapPanel {
         };
 
         container(
-            column![header, Space::new().height(Length::Fixed(20.0)), rows_widget].spacing(2),
+            column![
+                header,
+                Space::new().height(Length::Fixed(20.0)),
+                rows_widget
+            ]
+            .spacing(2),
         )
         .padding(Padding::from([24u16, 32u16]))
         .width(Length::Fill)
@@ -527,7 +532,14 @@ mod tests {
     use crate::panels::network_hosts::{HostInventory, HostRow, ServiceRow as ProbeServiceRow};
     use crate::panels::service_publishing::ServiceRow as PublishedServiceRow;
 
-    fn published(node: &str, id: &str, name: &str, port: u16, proto: &str, ok: bool) -> PublishedServiceRow {
+    fn published(
+        node: &str,
+        id: &str,
+        name: &str,
+        port: u16,
+        proto: &str,
+        ok: bool,
+    ) -> PublishedServiceRow {
         PublishedServiceRow {
             node: node.to_string(),
             id: id.to_string(),
@@ -570,16 +582,31 @@ mod tests {
     fn unions_all_three_sources_tagged_by_host() {
         let pubs = vec![published("node-a", "ssh", "SSH", 22, "tcp", true)];
         let probe = HostInventory {
-            hosts: vec![probe_host("node-b", "172.20.0.2", &[(4040, "http", "Airsonic")])],
+            hosts: vec![probe_host(
+                "node-b",
+                "172.20.0.2",
+                &[(4040, "http", "Airsonic")],
+            )],
         };
-        let vms = vec![vm("airsonic-ctr", InstanceKind::Container, "running", "node-c")];
+        let vms = vec![vm(
+            "airsonic-ctr",
+            InstanceKind::Container,
+            "running",
+            "node-c",
+        )];
 
         let rows = unify_services(&pubs, &probe, &vms);
         assert_eq!(rows.len(), 3, "one row per distinct service");
         // Every row carries its host tag.
-        assert!(rows.iter().any(|r| r.host == "node-a" && r.source == ServiceSource::Published));
-        assert!(rows.iter().any(|r| r.host == "node-b" && r.source == ServiceSource::Probe));
-        assert!(rows.iter().any(|r| r.host == "node-c" && r.source == ServiceSource::Vm));
+        assert!(rows
+            .iter()
+            .any(|r| r.host == "node-a" && r.source == ServiceSource::Published));
+        assert!(rows
+            .iter()
+            .any(|r| r.host == "node-b" && r.source == ServiceSource::Probe));
+        assert!(rows
+            .iter()
+            .any(|r| r.host == "node-c" && r.source == ServiceSource::Vm));
         // The VM/container row is portless + carries its running state.
         let ctr = rows.iter().find(|r| r.source == ServiceSource::Vm).unwrap();
         assert_eq!(ctr.port, None);
@@ -608,7 +635,11 @@ mod tests {
             hosts: vec![probe_host("node-a", "10.42.0.9", &[(80, "http", "nginx")])],
         };
         let rows = unify_services(&pubs, &probe, &[]);
-        assert_eq!(rows.len(), 2, "different ports on the same host are distinct");
+        assert_eq!(
+            rows.len(),
+            2,
+            "different ports on the same host are distinct"
+        );
         // Sorted by host then port: 22 before 80.
         assert_eq!(rows[0].port, Some(22));
         assert_eq!(rows[1].port, Some(80));
@@ -617,7 +648,11 @@ mod tests {
     #[test]
     fn probe_only_host_appears() {
         let probe = HostInventory {
-            hosts: vec![probe_host("airsonic-host", "172.20.0.2", &[(4040, "http", "Airsonic")])],
+            hosts: vec![probe_host(
+                "airsonic-host",
+                "172.20.0.2",
+                &[(4040, "http", "Airsonic")],
+            )],
         };
         let rows = unify_services(&[], &probe, &[]);
         assert_eq!(rows.len(), 1);
@@ -698,9 +733,18 @@ mod tests {
         p.rows = unify_services(
             &[published("node-a", "ssh", "SSH", 22, "tcp", true)],
             &HostInventory {
-                hosts: vec![probe_host("node-b", "172.20.0.2", &[(4040, "http", "Airsonic")])],
+                hosts: vec![probe_host(
+                    "node-b",
+                    "172.20.0.2",
+                    &[(4040, "http", "Airsonic")],
+                )],
             },
-            &[vm("airsonic-ctr", InstanceKind::Container, "running", "node-c")],
+            &[vm(
+                "airsonic-ctr",
+                InstanceKind::Container,
+                "running",
+                "node-c",
+            )],
         );
         let _ = p.view();
     }

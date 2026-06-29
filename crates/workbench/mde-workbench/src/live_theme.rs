@@ -123,6 +123,9 @@ mod tests {
         assert!(!decorative_motion(), "env=0 forces decorative motion off");
         std::env::remove_var("MDE_MOTION_DECORATIVE");
         // Default preference keeps decorative motion on.
-        assert!(decorative_motion(), "default prefs keep decorative motion on");
+        assert!(
+            decorative_motion(),
+            "default prefs keep decorative motion on"
+        );
     }
 }

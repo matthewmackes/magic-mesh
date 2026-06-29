@@ -695,7 +695,11 @@ mod tests {
 
     // MOTION-FEEDBACK-1 — status→style mapping for the shared variant_button.
 
-    fn style_for(variant: ButtonVariant, reduce_motion: bool, status: ButtonStatus) -> button::Style {
+    fn style_for(
+        variant: ButtonVariant,
+        reduce_motion: bool,
+        status: ButtonStatus,
+    ) -> button::Style {
         // Default to decorative-on (full polish) so the existing hover/press
         // assertions read the standard chrome; the decorative-off path has its own
         // test below.
@@ -740,7 +744,10 @@ mod tests {
             "hover must change the background (accent tint)"
         );
         // Movement: a raised lift shadow at the Carbon hover-shadow strength.
-        assert!(active.shadow.offset.y.abs() < f32::EPSILON, "resting button has no lift");
+        assert!(
+            active.shadow.offset.y.abs() < f32::EPSILON,
+            "resting button has no lift"
+        );
         assert!(
             (hovered.shadow.offset.y - CARD_SHADOW_HOVER_OFFSET_Y).abs() < f32::EPSILON,
             "hover lift uses the Carbon hover-shadow offset"
@@ -756,7 +763,11 @@ mod tests {
         // The hover feedback must not touch the structural chrome: border width
         // is unchanged from the resting (Active) border, and the helper never
         // sets a height/padding (those live on the widget, not the style).
-        for variant in [ButtonVariant::Primary, ButtonVariant::Secondary, ButtonVariant::Ghost] {
+        for variant in [
+            ButtonVariant::Primary,
+            ButtonVariant::Secondary,
+            ButtonVariant::Ghost,
+        ] {
             let active = style_for(variant, false, ButtonStatus::Active);
             let hovered = style_for(variant, false, ButtonStatus::Hovered);
             assert!(
@@ -798,7 +809,10 @@ mod tests {
             p.r <= h.r && p.g <= h.g && p.b <= h.b && (p.r < h.r || p.g < h.g || p.b < h.b),
             "press darkens the background relative to hover"
         );
-        assert!(pressed.shadow.offset.y.abs() < f32::EPSILON, "no lift on press");
+        assert!(
+            pressed.shadow.offset.y.abs() < f32::EPSILON,
+            "no lift on press"
+        );
     }
 
     #[test]
@@ -823,7 +837,11 @@ mod tests {
         // MOTION-FEEDBACK-1 — the engaged (pressed) control gains the accent focus
         // ring drawn through ControlFeedback::focus_ring: the border blends toward
         // accent and thickens past its resting weight. Active (resting) has no ring.
-        for variant in [ButtonVariant::Primary, ButtonVariant::Secondary, ButtonVariant::Ghost] {
+        for variant in [
+            ButtonVariant::Primary,
+            ButtonVariant::Secondary,
+            ButtonVariant::Ghost,
+        ] {
             let active = style_for(variant, false, ButtonStatus::Active);
             let pressed = style_for(variant, false, ButtonStatus::Pressed);
             assert!(
@@ -852,7 +870,10 @@ mod tests {
         let pressed_full = style_for(ButtonVariant::Ghost, false, ButtonStatus::Pressed);
         let pressed_reduced = style_for(ButtonVariant::Ghost, true, ButtonStatus::Pressed);
         let active = style_for(ButtonVariant::Ghost, false, ButtonStatus::Active);
-        assert!(pressed_reduced.border.width > active.border.width, "ring kept under reduce-motion");
+        assert!(
+            pressed_reduced.border.width > active.border.width,
+            "ring kept under reduce-motion"
+        );
         // At the settled render frame both reach the full ring width.
         assert!((pressed_reduced.border.width - pressed_full.border.width).abs() < 1e-3);
     }
@@ -865,13 +886,20 @@ mod tests {
         let deco_on = style_for_full(ButtonVariant::Primary, false, true, ButtonStatus::Hovered);
         let deco_off = style_for_full(ButtonVariant::Primary, false, false, ButtonStatus::Hovered);
         // Lift dropped: no shadow under decorative-off.
-        assert!(deco_on.shadow.offset.y.abs() > f32::EPSILON, "lift present with decorative on");
+        assert!(
+            deco_on.shadow.offset.y.abs() > f32::EPSILON,
+            "lift present with decorative on"
+        );
         assert!(
             deco_off.shadow.offset.y.abs() < f32::EPSILON && deco_off.shadow.color.a < f32::EPSILON,
             "no lift shadow when non-essential motion is disabled"
         );
         // Tint kept: the hovered background is identical either way.
-        assert_eq!(bg_color(&deco_on), bg_color(&deco_off), "the hover tint stays");
+        assert_eq!(
+            bg_color(&deco_on),
+            bg_color(&deco_off),
+            "the hover tint stays"
+        );
     }
 
     #[test]
@@ -881,7 +909,10 @@ mod tests {
         for variant in [ButtonVariant::Secondary, ButtonVariant::Ghost] {
             let active = style_for(variant, false, ButtonStatus::Active);
             let hovered = style_for(variant, false, ButtonStatus::Hovered);
-            assert!(bg_color(&active).a < f32::EPSILON, "{variant:?} rests transparent");
+            assert!(
+                bg_color(&active).a < f32::EPSILON,
+                "{variant:?} rests transparent"
+            );
             assert!(
                 bg_color(&hovered).a > f32::EPSILON,
                 "{variant:?} gains a visible hover wash"

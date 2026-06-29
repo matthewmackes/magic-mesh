@@ -459,13 +459,11 @@ impl FleetRollupPanel {
 
         // The live data section (centerpiece + role cards) — the part that dims
         // while refreshing and crossfades on swap.
-        let content: Element<'_, crate::Message> = column![
-            centerpiece,
-            scrollable(cards).height(Length::Fill),
-        ]
-        .spacing(16)
-        .width(Length::Fill)
-        .into();
+        let content: Element<'_, crate::Message> =
+            column![centerpiece, scrollable(cards).height(Length::Fill),]
+                .spacing(16)
+                .width(Length::Fill)
+                .into();
 
         panel_container(
             column![header, self.crossfaded(content, palette)]
@@ -689,8 +687,9 @@ mod tests {
         // (no idle wakeups): once `crossfade_start` is in the past beyond the
         // dialog_mount duration, a tick clears it.
         let mut p = loaded_panel();
-        p.crossfade_start =
-            Some(Instant::now() - Motion::dialog_mount().duration - std::time::Duration::from_secs(1));
+        p.crossfade_start = Some(
+            Instant::now() - Motion::dialog_mount().duration - std::time::Duration::from_secs(1),
+        );
         let _ = p.update(Message::CrossfadeTick);
         assert!(
             p.crossfade_start.is_none(),

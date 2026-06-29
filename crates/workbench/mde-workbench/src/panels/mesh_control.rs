@@ -673,7 +673,15 @@ fn ha_card_view<'a>(
     let published_row = ha_published_row(snap, palette);
 
     ha_card_shell(
-        column![header, etcd_row, members_row, lh_row, published_row, context_row].spacing(10),
+        column![
+            header,
+            etcd_row,
+            members_row,
+            lh_row,
+            published_row,
+            context_row
+        ]
+        .spacing(10),
         palette,
     )
 }

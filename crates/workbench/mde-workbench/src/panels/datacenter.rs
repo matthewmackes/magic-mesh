@@ -124,8 +124,9 @@ impl DcRow {
         match self.status.to_ascii_lowercase().as_str() {
             "running" | "active" | "up" | "online" | "ready" => palette.success,
             "halted" | "off" | "stopped" | "shutoff" | "down" | "error" => palette.danger,
-            "paused" | "suspended" | "rebooting" | "starting" | "pending"
-            | "provisioning" => palette.warning,
+            "paused" | "suspended" | "rebooting" | "starting" | "pending" | "provisioning" => {
+                palette.warning
+            }
             // Unknown / empty — a muted dot rather than a misleading green/red.
             _ => palette.text_muted,
         }
@@ -1076,7 +1077,10 @@ pub fn parse_do_regions(v: &serde_json::Value) -> Vec<DoRegion> {
     let mut out: Vec<DoRegion> = arr
         .iter()
         .filter_map(|e| {
-            let slug = e.get("slug").and_then(serde_json::Value::as_str)?.to_string();
+            let slug = e
+                .get("slug")
+                .and_then(serde_json::Value::as_str)?
+                .to_string();
             let name = e
                 .get("name")
                 .and_then(serde_json::Value::as_str)
@@ -1104,10 +1108,7 @@ pub fn parse_do_regions(v: &serde_json::Value) -> Vec<DoRegion> {
 pub fn distinct_geos(slugs: &[String]) -> usize {
     let mut geos: Vec<String> = slugs
         .iter()
-        .map(|s| {
-            s.trim_end_matches(|c: char| c.is_ascii_digit())
-                .to_string()
-        })
+        .map(|s| s.trim_end_matches(|c: char| c.is_ascii_digit()).to_string())
         .collect();
     geos.sort();
     geos.dedup();
@@ -2441,12 +2442,13 @@ impl DatacenterPanel {
             }
 
             // ── DATACENTER-11 — VM lifecycle ──────────────────────────────────
-            Message::SuspendClicked {
-                uuid,
-                dom0,
-                resume,
-            } => {
-                self.status = if resume { "Resuming…" } else { "Suspending…" }.into();
+            Message::SuspendClicked { uuid, dom0, resume } => {
+                self.status = if resume {
+                    "Resuming…"
+                } else {
+                    "Suspending…"
+                }
+                .into();
                 let verb = if resume { "vm-resume" } else { "vm-suspend" };
                 self.run_action(
                     verb,
@@ -2889,7 +2891,12 @@ impl DatacenterPanel {
             // ── DATACENTER-15 — Tofu prod-arm + run-log ───────────────────────
             Message::TofuArmToggled => {
                 let on = !self.tofu_armed;
-                self.status = if on { "Arming prod…" } else { "Disarming prod…" }.into();
+                self.status = if on {
+                    "Arming prod…"
+                } else {
+                    "Disarming prod…"
+                }
+                .into();
                 Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || tofu_arm(on))
@@ -3125,10 +3132,9 @@ impl DatacenterPanel {
         // duration is reduce-motion-aware, matching `slide_in`), so a settled grid
         // renders statically with no per-frame easing — and a small grid doesn't
         // keep ticking for the absent cap slots.
-        if self
-            .reveal_start
-            .is_some_and(|start| reveal_is_complete(start, now, self.visible_card_count(), reduce_motion))
-        {
+        if self.reveal_start.is_some_and(|start| {
+            reveal_is_complete(start, now, self.visible_card_count(), reduce_motion)
+        }) {
             self.reveal_start = None;
         }
         if self.motion_in_flight(now, reduce_motion) {
@@ -3899,7 +3905,9 @@ impl DatacenterPanel {
             .enumerate()
             .map(|(i, r)| {
                 let confirming = self.confirm_delete.as_deref() == Some(r.id.as_str());
-                let bulk = self.bulk_mode.then(|| self.bulk_sel.contains(r.id.as_str()));
+                let bulk = self
+                    .bulk_mode
+                    .then(|| self.bulk_sel.contains(r.id.as_str()));
                 let motion = CardMotion {
                     index: i,
                     reveal_start: self.reveal_start,
@@ -3963,7 +3971,8 @@ impl DatacenterPanel {
     fn bulk_bar_view(&self, palette: Palette) -> Element<'_, crate::Message> {
         let n = self.bulk_sel.len();
         let op_btn = |label: &str, op: &str| {
-            let msg = (n > 0).then_some(crate::Message::Datacenter(Message::BulkOp(op.to_string())));
+            let msg =
+                (n > 0).then_some(crate::Message::Datacenter(Message::BulkOp(op.to_string())));
             variant_button(label.to_string(), ButtonVariant::Secondary, msg, palette)
         };
         let mut body = column![row![
@@ -4127,7 +4136,11 @@ impl DatacenterPanel {
                 },
                 palette
             ),
-            sbtn("Evacuate", Message::HostEvacuateClicked(host.clone()), palette),
+            sbtn(
+                "Evacuate",
+                Message::HostEvacuateClicked(host.clone()),
+                palette
+            ),
             sbtn("Patch…", Message::HostPatchClicked(host.clone()), palette),
             sbtn("SSH", Message::HostConsoleClicked(host.clone()), palette),
         ]
@@ -4243,7 +4256,11 @@ impl DatacenterPanel {
             .into(),
         );
         // ISO / template library (absorbs the images panel content).
-        let isos: Vec<&DcRow> = visible.iter().copied().filter(|r| r.kind == "iso").collect();
+        let isos: Vec<&DcRow> = visible
+            .iter()
+            .copied()
+            .filter(|r| r.kind == "iso")
+            .collect();
         out.push(
             text(format!("ISO / template library ({})", isos.len()))
                 .colr(palette.text_muted.into_cosmic_color())
@@ -4361,7 +4378,11 @@ impl DatacenterPanel {
                 out.push(self.net_row_view(palette, r));
             }
         }
-        out.push(text("Unified IP / DNS").size(f32::from(spacing::BASE[5])).into());
+        out.push(
+            text("Unified IP / DNS")
+                .size(f32::from(spacing::BASE[5]))
+                .into(),
+        );
         out.push(
             row![
                 sbtn("Refresh IP/DNS", Message::IpDnsRefresh, palette),
@@ -4402,7 +4423,11 @@ impl DatacenterPanel {
             header,
             row![
                 sbtn("Set VLAN", Message::VlanSetClicked(net.clone()), palette),
-                sbtn("Config PIF", Message::PifConfigClicked(net.clone()), palette),
+                sbtn(
+                    "Config PIF",
+                    Message::PifConfigClicked(net.clone()),
+                    palette
+                ),
             ]
             .spacing(f32::from(spacing::BASE[1])),
         ]
@@ -4440,7 +4465,11 @@ impl DatacenterPanel {
                 );
             }
         }
-        out.push(text("Firewall rule").size(f32::from(spacing::BASE[5])).into());
+        out.push(
+            text("Firewall rule")
+                .size(f32::from(spacing::BASE[5]))
+                .into(),
+        );
         out.push(
             row![
                 text_input("e.g. allow tcp 443 from any", &self.gw_fw_rule)
@@ -4452,7 +4481,11 @@ impl DatacenterPanel {
             .align_y(cosmic::iced::alignment::Vertical::Center)
             .into(),
         );
-        out.push(text("Port-forward").size(f32::from(spacing::BASE[5])).into());
+        out.push(
+            text("Port-forward")
+                .size(f32::from(spacing::BASE[5]))
+                .into(),
+        );
         out.push(
             row![
                 text_input("e.g. tcp 8443 -> 10.42.0.2:443", &self.gw_pf_fwd)
@@ -4687,9 +4720,14 @@ fn power_progress_view(ps: &PowerStatus, palette: Palette) -> Element<'static, c
         text(bar)
             .colr(palette.accent.into_cosmic_color())
             .width(Length::FillPortion(2)),
-        text(format!("{}% \u{00b7} {}{}", ps.pct_clamped(), ps.phase_label(), eta))
-            .colr(palette.text_muted.into_cosmic_color())
-            .width(Length::FillPortion(3)),
+        text(format!(
+            "{}% \u{00b7} {}{}",
+            ps.pct_clamped(),
+            ps.phase_label(),
+            eta
+        ))
+        .colr(palette.text_muted.into_cosmic_color())
+        .width(Length::FillPortion(3)),
     ]
     .spacing(f32::from(spacing::BASE[2]))
     .into()
@@ -4840,7 +4878,9 @@ fn reveal_is_complete(
     let last_start = reveal_card_start(reveal_start, last_index);
     let mount = Motion::panel_mount().duration;
     let dur = if reduce_motion {
-        mount.min(Duration::from_millis(mde_theme::motion::REDUCE_MOTION_CAP_MS))
+        mount.min(Duration::from_millis(
+            mde_theme::motion::REDUCE_MOTION_CAP_MS,
+        ))
     } else {
         mount
     };
@@ -6138,7 +6178,10 @@ fn vm_bulk(uuids: &[String], op: &str) -> Result<Vec<(String, String)>, String> 
         .map(|arr| {
             arr.iter()
                 .filter_map(|e| {
-                    let uuid = e.get("uuid").and_then(serde_json::Value::as_str)?.to_string();
+                    let uuid = e
+                        .get("uuid")
+                        .and_then(serde_json::Value::as_str)?
+                        .to_string();
                     let status = e
                         .get("status")
                         .and_then(serde_json::Value::as_str)
@@ -6148,7 +6191,12 @@ fn vm_bulk(uuids: &[String], op: &str) -> Result<Vec<(String, String)>, String> 
                 })
                 .collect::<Vec<_>>()
         });
-    Ok(itemized.unwrap_or_else(|| uuids.iter().map(|u| (u.clone(), "ok".to_string())).collect()))
+    Ok(itemized.unwrap_or_else(|| {
+        uuids
+            .iter()
+            .map(|u| (u.clone(), "ok".to_string()))
+            .collect()
+    }))
 }
 
 /// Fire `action/dc/host-patch {host,preview:true}` and return the list of VMs that
@@ -6204,7 +6252,11 @@ fn tofu_runlog(ws: &str) -> Result<String, String> {
 
 /// Fire `action/dc/do-regions` and project the region list for the picker.
 fn do_regions_read() -> Result<Vec<DoRegion>, String> {
-    let v = dc_rpc("do-regions", &serde_json::json!({}), Duration::from_secs(60))?;
+    let v = dc_rpc(
+        "do-regions",
+        &serde_json::json!({}),
+        Duration::from_secs(60),
+    )?;
     Ok(parse_do_regions(&v))
 }
 
@@ -7865,23 +7917,38 @@ mod tests {
     fn status_dot_maps_liveness_onto_semantic_tokens() {
         let p = Palette::dark();
         // Up vocabularies (DO "active" / Xen "running" / "up") → success.
-        assert_eq!(row_with("vm", "1", "a", "running", "dev").status_dot(p), p.success);
+        assert_eq!(
+            row_with("vm", "1", "a", "running", "dev").status_dot(p),
+            p.success
+        );
         assert_eq!(
             row_with("droplet", "2", "b", "active", "prod").status_dot(p),
             p.success
         );
         // Off vocabularies → danger.
-        assert_eq!(row_with("vm", "3", "c", "halted", "dev").status_dot(p), p.danger);
-        assert_eq!(row_with("droplet", "4", "d", "off", "prod").status_dot(p), p.danger);
+        assert_eq!(
+            row_with("vm", "3", "c", "halted", "dev").status_dot(p),
+            p.danger
+        );
+        assert_eq!(
+            row_with("droplet", "4", "d", "off", "prod").status_dot(p),
+            p.danger
+        );
         // Transitional → warning.
         assert_eq!(
             row_with("vm", "5", "e", "rebooting", "dev").status_dot(p),
             p.warning
         );
         // Case-insensitive.
-        assert_eq!(row_with("vm", "6", "f", "RUNNING", "dev").status_dot(p), p.success);
+        assert_eq!(
+            row_with("vm", "6", "f", "RUNNING", "dev").status_dot(p),
+            p.success
+        );
         // Unknown / empty → muted (never a misleading green/red).
-        assert_eq!(row_with("vm", "7", "g", "", "dev").status_dot(p), p.text_muted);
+        assert_eq!(
+            row_with("vm", "7", "g", "", "dev").status_dot(p),
+            p.text_muted
+        );
         assert_eq!(
             row_with("vm", "8", "h", "weird", "dev").status_dot(p),
             p.text_muted
@@ -8494,7 +8561,9 @@ mod tests {
         let mut p = DatacenterPanel::new();
         let _ = p.update(Message::HostEvacuateClicked("172.20.0.9".into()));
         assert_eq!(
-            p.host_confirm.as_ref().map(|(h, o)| (h.as_str(), o.as_str())),
+            p.host_confirm
+                .as_ref()
+                .map(|(h, o)| (h.as_str(), o.as_str())),
             Some(("172.20.0.9", "evacuate"))
         );
         let _ = p.update(Message::HostConfirmed);
@@ -8510,7 +8579,9 @@ mod tests {
             vec!["builder".into(), "tester".into()],
         ))));
         assert_eq!(
-            p.host_patch_preview.as_ref().map(|(h, v)| (h.as_str(), v.len())),
+            p.host_patch_preview
+                .as_ref()
+                .map(|(h, v)| (h.as_str(), v.len())),
             Some(("172.20.0.9", 2))
         );
         assert_eq!(
@@ -8533,10 +8604,9 @@ mod tests {
 
     #[test]
     fn parse_power_event_and_progress() {
-        let ps = parse_power_event(
-            r#"{"host":"172.20.0.9","phase":"xcp","pct":"45","eta_secs":"30"}"#,
-        )
-        .unwrap();
+        let ps =
+            parse_power_event(r#"{"host":"172.20.0.9","phase":"xcp","pct":"45","eta_secs":"30"}"#)
+                .unwrap();
         assert_eq!(ps.host, "172.20.0.9");
         assert_eq!(ps.pct_clamped(), 45);
         assert_eq!(ps.phase_label(), "XCP boot");
@@ -8771,11 +8841,13 @@ mod tests {
         p.rows = project_rows(&[
             (
                 "event/dc/droplet/2".into(),
-                r#"{"kind":"droplet","id":"2","name":"lh-01","status":"active","zone":"prod"}"#.into(),
+                r#"{"kind":"droplet","id":"2","name":"lh-01","status":"active","zone":"prod"}"#
+                    .into(),
             ),
             (
                 "event/dc/testmesh/t1".into(),
-                r#"{"kind":"testmesh","id":"t1","name":"ephemeral","status":"up","zone":"dev"}"#.into(),
+                r#"{"kind":"testmesh","id":"t1","name":"ephemeral","status":"up","zone":"dev"}"#
+                    .into(),
             ),
         ]);
         let _ = p.update(Message::ViewMode(ViewMode::Provision));

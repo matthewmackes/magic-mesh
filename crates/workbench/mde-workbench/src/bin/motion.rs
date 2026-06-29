@@ -213,7 +213,12 @@ impl HubAnim {
     #[must_use]
     pub fn open_params(&self, now: Instant) -> RenderParams {
         match self.open {
-            Some(open) => slide_in(open.start(), now, PANEL_MOUNT_TRANSLATE_Y_PX, self.reduce_motion),
+            Some(open) => slide_in(
+                open.start(),
+                now,
+                PANEL_MOUNT_TRANSLATE_Y_PX,
+                self.reduce_motion,
+            ),
             None => RenderParams {
                 alpha: 1.0,
                 translate_y: 0.0,
@@ -502,7 +507,10 @@ mod tests {
             "existing card starts pushed down, got {}",
             m0.translate_y
         );
-        assert_eq!(m0.translate_x, 0.0, "existing card never slides horizontally");
+        assert_eq!(
+            m0.translate_x, 0.0,
+            "existing card never slides horizontally"
+        );
         // It eases back up to rest within the first beat.
         let settled = t0 + blink_beat() + Duration::from_millis(1);
         assert!(anim.card_motion("old", settled).translate_y.abs() < 1e-3);
@@ -541,7 +549,10 @@ mod tests {
         let mut anim = HubAnim::new(false);
         assert!(anim.is_idle(t0), "a fresh Hub (no open armed) is idle");
         anim.on_open(t0);
-        assert!(!anim.is_idle(t0), "an armed open reveal ⇒ not idle (the Hub ticks)");
+        assert!(
+            !anim.is_idle(t0),
+            "an armed open reveal ⇒ not idle (the Hub ticks)"
+        );
         // At t0 the body starts offset below + transparent, then rises to rest.
         let p0 = anim.open_params(t0);
         assert!(
@@ -569,7 +580,10 @@ mod tests {
             assert_eq!(p.translate_y, 0.0, "no slide under reduce-motion at {ms}ms");
         }
         let capped = t0 + Duration::from_millis(80) + Duration::from_millis(1);
-        assert!(anim.is_idle(capped), "open reveal settles within the 80 ms cap");
+        assert!(
+            anim.is_idle(capped),
+            "open reveal settles within the 80 ms cap"
+        );
     }
 
     #[test]

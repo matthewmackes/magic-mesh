@@ -695,8 +695,7 @@ impl KeyedListReveal {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let current: std::collections::HashSet<String> =
-            keys.into_iter().map(Into::into).collect();
+        let current: std::collections::HashSet<String> = keys.into_iter().map(Into::into).collect();
         if self.seeded {
             for k in &current {
                 if !self.seen.contains(k) {
@@ -1312,12 +1311,19 @@ mod tests {
         let t0 = Instant::now();
         let mut r = KeyedListReveal::new(false);
         r.sync(["a", "b"], t0); // seed
-        // A later refresh adds "c": only "c" reveals; "a"/"b" stay put.
+                                // A later refresh adds "c": only "c" reveals; "a"/"b" stay put.
         r.sync(["a", "b", "c"], t0);
         assert!(!r.is_idle(t0), "the inserted row is mid-reveal");
         let c0 = r.row_params("c", t0);
-        assert!(c0.alpha < 1.0 && c0.translate_y > 0.0, "c starts low + faded");
-        assert_eq!(r.row_params("a", t0).translate_y, 0.0, "existing row never moves");
+        assert!(
+            c0.alpha < 1.0 && c0.translate_y > 0.0,
+            "c starts low + faded"
+        );
+        assert_eq!(
+            r.row_params("a", t0).translate_y,
+            0.0,
+            "existing row never moves"
+        );
         assert!((r.row_params("a", t0).alpha - 1.0).abs() < 1e-4);
         // After the panel-mount duration the reveal settles + the tick can stop.
         let done = t0 + Motion::panel_mount().duration;
@@ -1337,8 +1343,15 @@ mod tests {
         // c is removed before it settled (accept/reject) → its reveal is dropped,
         // and the steady rows a/b never animate on the refresh.
         r.sync(["a", "b"], t0);
-        assert!(r.is_idle(t0), "removing the only revealing row leaves nothing in flight");
-        assert_eq!(r.row_params("c", t0).alpha, 1.0, "a dropped row reads as rest");
+        assert!(
+            r.is_idle(t0),
+            "removing the only revealing row leaves nothing in flight"
+        );
+        assert_eq!(
+            r.row_params("c", t0).alpha,
+            1.0,
+            "a dropped row reads as rest"
+        );
         assert_eq!(r.row_params("a", t0).translate_y, 0.0);
     }
 

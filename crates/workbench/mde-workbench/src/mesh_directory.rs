@@ -281,7 +281,11 @@ pub fn fetch_ha_status() -> Option<HaStatus> {
     // The published topic is small (published on change); read it and take the
     // most recent message — the established "latest on a topic" read shape
     // (`crate::dbus::action_request_reply_on`).
-    let latest = persist.list_since(HA_STATUS_TOPIC, None).ok()?.into_iter().next_back()?;
+    let latest = persist
+        .list_since(HA_STATUS_TOPIC, None)
+        .ok()?
+        .into_iter()
+        .next_back()?;
     parse_ha_status(latest.body.as_deref()?)
 }
 
@@ -404,7 +408,8 @@ mod tests {
     #[test]
     fn parse_ha_status_decodes_the_worker_doc() {
         // The exact HaStatusDoc JSON the ha_monitor publishes.
-        let body = r#"{"member_count":3,"quorum_ok":true,"leader":"kiln","ts_unix_ms":1750000000000}"#;
+        let body =
+            r#"{"member_count":3,"quorum_ok":true,"leader":"kiln","ts_unix_ms":1750000000000}"#;
         let s = parse_ha_status(body).expect("decoded");
         assert_eq!(s.member_count, 3);
         assert!(s.quorum_ok);

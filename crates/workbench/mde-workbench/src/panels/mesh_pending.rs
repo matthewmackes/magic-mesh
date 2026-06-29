@@ -99,8 +99,10 @@ impl MeshPendingPanel {
                 // MOTION-TRANS-3 — diff the freshly-loaded roster against the last
                 // frame so any newly-appeared pending peer reveals in (the first
                 // load is treated as the list appearing — no mass reveal).
-                self.reveal
-                    .sync(peers.iter().map(|p| p.peer_id.clone()), std::time::Instant::now());
+                self.reveal.sync(
+                    peers.iter().map(|p| p.peer_id.clone()),
+                    std::time::Instant::now(),
+                );
                 self.peers = peers;
                 self.busy = false;
                 self.last_run_at = Some(SystemTime::now());
@@ -649,6 +651,9 @@ mod tests {
         // Far enough in the future that the reveal has settled.
         let _ = p.update(Message::AnimTick);
         let later = std::time::Instant::now() + mde_theme::motion::Motion::panel_mount().duration;
-        assert!(!p.needs_tick(later), "a settled reveal needs no further ticks");
+        assert!(
+            !p.needs_tick(later),
+            "a settled reveal needs no further ticks"
+        );
     }
 }

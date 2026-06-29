@@ -901,7 +901,10 @@ mod tests {
         // read_through = 01C: ids <= 01C are read, a newer one is not.
         assert!(rs.is_read("01B"), "older than the read cursor");
         assert!(rs.is_read("01C"), "the cursor itself is inclusive");
-        assert!(!rs.is_read("01D"), "newer than the read cursor stays unread");
+        assert!(
+            !rs.is_read("01D"),
+            "newer than the read cursor stays unread"
+        );
         // cleared_through = 01B: only ids <= 01B are hidden.
         assert!(rs.is_cleared("01A"));
         assert!(rs.is_cleared("01B"));

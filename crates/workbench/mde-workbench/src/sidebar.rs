@@ -494,6 +494,8 @@ mod tests {
     fn reveal_translate_is_the_shared_panel_mount_token() {
         // The sidebar reveal reuses the one Carbon panel-mount translate token the
         // launcher + Hub open with — one motion vocabulary, no bespoke literal.
-        assert!((NAV_REVEAL_TRANSLATE_PX - mde_theme::PANEL_MOUNT_TRANSLATE_Y_PX).abs() < f32::EPSILON);
+        assert!(
+            (NAV_REVEAL_TRANSLATE_PX - mde_theme::PANEL_MOUNT_TRANSLATE_Y_PX).abs() < f32::EPSILON
+        );
     }
 }

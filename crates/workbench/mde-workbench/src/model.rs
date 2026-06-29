@@ -806,8 +806,14 @@ mod tests {
                 );
             }
         }
-        assert_eq!(DatacenterTab::from_folded_slug("instances"), Some(DatacenterTab::Instances));
-        assert_eq!(DatacenterTab::from_folded_slug("build-farm"), Some(DatacenterTab::BuildFarm));
+        assert_eq!(
+            DatacenterTab::from_folded_slug("instances"),
+            Some(DatacenterTab::Instances)
+        );
+        assert_eq!(
+            DatacenterTab::from_folded_slug("build-farm"),
+            Some(DatacenterTab::BuildFarm)
+        );
         // Datacenter's own slug is not a folded slug (lands on Native).
         assert_eq!(DatacenterTab::from_folded_slug("datacenter"), None);
         assert_eq!(DatacenterTab::from_folded_slug("not-a-tab"), None);
