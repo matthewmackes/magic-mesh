@@ -1871,6 +1871,7 @@ the plane and it **survives killing the current zone leader**.
 - [>] **DATACENTER-18: New-Mesh genesis wizard ("give birth to a new Nebula").**
   **Acceptance**:
     - [>] wizard: generate CA → provision+found first lighthouse → seed → register DNS → emit first join token; genesis secrets sourced from the mesh store (optional private repo = templates + age-encrypted only, no plaintext); a brand-new working mesh results
+  *(dead-write hunt 2026-06-28 — the GUI is already wired ahead of the backend: the "Give birth" button fires `action/dc/genesis-new-mesh {name,region}` via `run_action` (600 s timeout), but **no mesh responder serves that verb** — the only ref is the `dc_rbac` allow-list, so the click degrades to a timeout, not a hang. Same shape for the build-farm scale control: the Apply button fires `action/dc/farm-scale {count}`, and `dc_provision.rs:27` explicitly defers it to the autoscaler/Tofu path — unserved today. So the remaining work for both is purely the responder + its live-provisioning backend (DO/CA for genesis, the Tofu-apply path for farm-scale, both gated); the GUI contract is done.)*
 - [>] **DATACENTER-19: DO provisioning (region picker + guided new-lighthouse).** *(session=calm-ray-dcr8)*
   *`action/dc/do-regions` RPC (doctl region list → slug/name/available) feeds the region picker. Remaining:
   the picker UI + multi-region-spread nudge + the guided new-lighthouse flow (droplet→bootstrap→found/join→DNS).*
