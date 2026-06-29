@@ -30,6 +30,8 @@
 #   --memory-max <m>   container MemoryMax (default 768M)
 #   --cpu-quota <q>    container CPUQuota (default 75%)
 #   --vfs-cache <sz>   rclone VFS cache hard cap (default 4G)
+#   --playlists <dir>  MEDIA-6 mesh-synced flat-file playlist dir (default
+#                      /mnt/mesh-storage/music-playlists — the Syncthing plane)
 #
 # Required keys in the creds env file (KEY=value, root-only 0600):
 #   DO_SPACES_KEY, DO_SPACES_SECRET, DO_SPACES_ENDPOINT (e.g. nyc3.digitaloceanspaces.com),
@@ -42,6 +44,13 @@ set -euo pipefail
 LISTEN=""; CREDS=/etc/mackesd/media-spaces.env; STATE=/var/lib/mcnf-music
 PORT=4533; IMAGE=docker.io/deluan/navidrome:0.53.3
 MEMORY_MAX=768M; CPU_QUOTA=75%; VFS_CACHE=4G
+# MEDIA-6 — mesh-wide playlists via FLAT FILES: a Syncthing-replicated dir of
+# .m3u playlists on the workgroup root (/mnt/mesh-storage, the SUBSTRATE-5
+# Syncthing plane), bind-mounted into every Navidrome. Both instances import the
+# same playlists; edits to a file-backed playlist sync back to its .m3u, which
+# Syncthing then replicates. NO shared SQLite — lock #3 stands; flat files dodge
+# the concurrent-DB-write corruption risk a shared scan DB would carry.
+PLAYLISTS=/mnt/mesh-storage/music-playlists
 
 while [ $# -gt 0 ]; do case "$1" in
   --listen) LISTEN="$2"; shift 2;;
@@ -52,6 +61,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --memory-max) MEMORY_MAX="$2"; shift 2;;
   --cpu-quota) CPU_QUOTA="$2"; shift 2;;
   --vfs-cache) VFS_CACHE="$2"; shift 2;;
+  --playlists) PLAYLISTS="$2"; shift 2;;
   *) echo "unknown arg: $1" >&2; exit 1;;
 esac; done
 
@@ -82,6 +92,9 @@ LIBRARY="$STATE/library"   # rclone mount target → Navidrome /music (read-most
 DATA="$STATE/data"         # per-instance SQLite scan DB (local, NOT shared)
 CACHE="$STATE/vfs-cache"   # rclone VFS cache
 mkdir -p "$LIBRARY" "$DATA" "$CACHE"
+# MEDIA-6 — the mesh-synced flat-file playlist dir (Syncthing-replicated when it
+# lives under the workgroup root; a plain local dir otherwise — still valid).
+mkdir -p "$PLAYLISTS"
 
 # ---- tooling: rclone + podman (BIRTHRIGHT: both in the Fedora base repos) --
 for pkg in rclone podman fuse3; do
@@ -156,6 +169,11 @@ Environment=ND_DATAFOLDER=/data
 Environment=ND_SCANSCHEDULE=1h
 Environment=ND_SESSIONTIMEOUT=24h
 Environment=ND_LOGLEVEL=info
+# MEDIA-6 — import the Syncthing-synced flat .m3u playlists (mesh-wide); a
+# file-backed playlist's UI edits sync back to its .m3u, which Syncthing then
+# replicates to the peer media lighthouse.
+Environment=ND_PLAYLISTSPATH=/playlists
+Environment=ND_AUTOIMPORTPLAYLISTS=true
 # First-start bootstrap of the single shared service account (idempotent —
 # Navidrome creates it only if no users exist; MEDIA-6).
 Environment=ND_DEFAULTADMINPASSWORD=$ND_ADMIN_PASS
@@ -164,8 +182,9 @@ ExecStart=/usr/bin/podman run --rm --name navidrome \\
   --network host \\
   -e ND_MUSICFOLDER -e ND_DATAFOLDER -e ND_SCANSCHEDULE \\
   -e ND_SESSIONTIMEOUT -e ND_LOGLEVEL -e ND_DEFAULTADMINPASSWORD \\
+  -e ND_PLAYLISTSPATH -e ND_AUTOIMPORTPLAYLISTS \\
   -e ND_ADDRESS=$LISTEN -e ND_PORT=$PORT \\
-  -v $LIBRARY:/music:ro -v $DATA:/data:Z \\
+  -v $LIBRARY:/music:ro -v $DATA:/data:Z -v $PLAYLISTS:/playlists:rw \\
   $IMAGE
 ExecStop=/usr/bin/podman stop -t 10 navidrome
 Restart=always
@@ -196,7 +215,7 @@ else
   echo "==> media: admin account already present (createAdmin no-op)"
 fi
 
-log "done — Navidrome on http://$LISTEN:$PORT (Subsonic API), bucket=$DO_SPACES_BUCKET"
+log "done — Navidrome on http://$LISTEN:$PORT (Subsonic API), bucket=$DO_SPACES_BUCKET, playlists=$PLAYLISTS (mesh-synced flat .m3u)"
 echo "  verify: curl -fsS \"http://$LISTEN:$PORT/rest/ping.view?u=$ND_ADMIN_USER&p=…&v=1.16.1&c=mcnf\""
 echo "  store:  systemctl status mcnf-music-store.service   # rclone S3 mount"
 echo "  server: systemctl status mcnf-navidrome.service     # the container"
