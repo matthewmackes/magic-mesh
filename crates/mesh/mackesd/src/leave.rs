@@ -9,8 +9,8 @@
 //!    (the ENT-3 machinery), so every peer's nebula drops our
 //!    tunnels within a tick.
 //! 2. **Leave the roster** — remove our own published files
-//!    (PeerRecord, bundle, ssh pubkey): own-row authority applies
-//!    to departure too.
+//!    (PeerRecord, bundle, ssh pubkey, media-registry row): own-row
+//!    authority applies to departure too.
 //! 3. **Wipe local state** — `/etc/nebula/*`, the published
 //!    overlay-ip/role markers, and `role.toml` (the box returns to
 //!    the ENT-2 fail-closed unpinned state).
@@ -38,6 +38,9 @@ pub struct LeaveReport {
     pub nebula_config_wiped: bool,
     /// `role.toml` removed (box is unpinned again).
     pub role_unpinned: bool,
+    /// Own `<host>/media-registry.json` removed from the shared media
+    /// plane (MEDIA-7 — present only on a Lighthouse_Media node).
+    pub media_registry_removed: bool,
 }
 
 /// Execute the voluntary exit. Every step is best-effort and
@@ -93,6 +96,15 @@ pub fn leave(
             .join(format!("{hostname}.pub")),
     )
     .is_ok();
+    // MEDIA-7 — de-register from the media plane so a torn-down
+    // Lighthouse_Media node leaves no stale "up" row behind. Absent on
+    // a non-media node (remove_file → false, honestly reported).
+    report.media_registry_removed = std::fs::remove_file(
+        workgroup_root
+            .join(hostname)
+            .join(crate::mesh_media::MEDIA_REGISTRY_FILE),
+    )
+    .is_ok();
 
     // 3. Local teardown.
     report.nebula_config_wiped = wipe_dir_contents(nebula_config_dir);
@@ -137,6 +149,8 @@ mod tests {
         std::fs::write(&bpath, "{}").unwrap();
         std::fs::create_dir_all(root.join("ssh-keys")).unwrap();
         std::fs::write(root.join("ssh-keys/pine.pub"), "ssh-ed25519 X").unwrap();
+        std::fs::create_dir_all(root.join("pine")).unwrap();
+        std::fs::write(root.join("pine/media-registry.json"), "{}").unwrap();
         let nebula = tmp.path().join("etc-nebula");
         std::fs::create_dir_all(&nebula).unwrap();
         std::fs::write(nebula.join("config.yaml"), "x").unwrap();
@@ -149,6 +163,10 @@ mod tests {
         assert!(report.roster_record_removed && !pdir.join("pine.json").exists());
         assert!(report.bundle_removed && !bpath.exists());
         assert!(report.ssh_key_removed);
+        assert!(
+            report.media_registry_removed && !root.join("pine/media-registry.json").exists(),
+            "MEDIA-7: media-registry row pruned on leave"
+        );
         assert!(report.nebula_config_wiped);
         assert!(!nebula.join("host.key").exists(), "keys must not survive");
         assert!(
