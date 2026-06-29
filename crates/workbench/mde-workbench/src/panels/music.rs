@@ -43,6 +43,9 @@ pub struct MusicPanel {
     /// MESH-CONNECT-DIALOG-1 — the connect/configure progress modal for
     /// the "Test connection" daemon probe (pending → success / failure).
     pub connect: ConnectProgress,
+    /// MOTION-TRANS-2 — open-reveal clock for the connect modal (armed on the
+    /// `Closed → open` edge, cleared on dismiss).
+    reveal: crate::panel_chrome::DialogReveal,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +144,14 @@ impl MusicPanel {
                 if self.busy {
                     return Task::none();
                 }
+                // MOTION-TRANS-2 — arm the open reveal on the `Closed → open` edge
+                // (Test connection); an in-place Retry from a Failure is untouched.
+                if !self.connect.is_open() {
+                    self.reveal.open(
+                        std::time::Instant::now(),
+                        crate::live_theme::reduce_motion(),
+                    );
+                }
                 // Don't probe a half-filled form — show the failure state
                 // immediately rather than spinning forever on a bad URL.
                 if !creds::is_valid(&self.server_url, &self.username) {
@@ -186,6 +197,7 @@ impl MusicPanel {
             }
             Message::ConnectDismiss => {
                 self.connect = ConnectProgress::Closed;
+                self.reveal.close();
                 // Clear busy too: a dismiss during a pending probe must not leave
                 // the "Test connection" button disabled (it's gated on !busy) with
                 // no modal to re-trigger from.
@@ -325,7 +337,15 @@ impl MusicPanel {
             pal,
             m(Message::ConnectRetry),
             m(Message::ConnectDismiss),
+            self.reveal.params(std::time::Instant::now()),
         )
+    }
+
+    /// MOTION-TRANS-2 — the connect modal's open-reveal clock for the shell's
+    /// tick-subscription gate ([`crate::panel_chrome::DialogReveal::needs_tick`]).
+    #[must_use]
+    pub fn dialog_reveal(&self) -> &crate::panel_chrome::DialogReveal {
+        &self.reveal
     }
 }
 

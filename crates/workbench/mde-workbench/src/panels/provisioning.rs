@@ -144,6 +144,9 @@ pub struct ProvisioningPanel {
     /// XCP-7 — the set/rotate-credential progress modal (pending → success /
     /// failure), reusing the shared `connect_progress` chrome.
     pub cred_modal: ConnectProgress,
+    /// MOTION-TRANS-2 — open-reveal clock for the credential modal (armed on the
+    /// `Closed → open` edge, cleared on dismiss).
+    reveal: crate::panel_chrome::DialogReveal,
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +350,7 @@ impl ProvisioningPanel {
             }
             Message::CredDismiss => {
                 self.cred_modal = ConnectProgress::Closed;
+                self.reveal.close();
                 // Drop the password on dismiss too — the operator walked away, so
                 // the GUI keeps no copy of an un-stored credential.
                 self.cred_password.clear();
@@ -362,6 +366,14 @@ impl ProvisioningPanel {
     /// cleared only once the store write succeeds ([`Message::CredFinished`]) or
     /// the modal is dismissed, so the GUI never retains a stored/abandoned secret.
     fn fire_set_creds(&mut self) -> Task<crate::Message> {
+        // MOTION-TRANS-2 — arm the open reveal only on the `Closed → open` edge
+        // (the Set button); an in-place Retry from a Failure leaves it untouched.
+        if !self.cred_modal.is_open() {
+            self.reveal.open(
+                std::time::Instant::now(),
+                crate::live_theme::reduce_motion(),
+            );
+        }
         let Some(host) = self.cred_host.clone() else {
             self.cred_modal = ConnectProgress::pending("Set dom0 credential", "")
                 .failure("Pick a dom0 host first.");
@@ -459,7 +471,15 @@ impl ProvisioningPanel {
             palette,
             crate::Message::Provisioning(Message::CredRetry),
             crate::Message::Provisioning(Message::CredDismiss),
+            self.reveal.params(std::time::Instant::now()),
         )
+    }
+
+    /// MOTION-TRANS-2 — the credential modal's open-reveal clock, so the shell's
+    /// subscription can gate a per-frame tick on [`crate::panel_chrome::DialogReveal::needs_tick`].
+    #[must_use]
+    pub fn dialog_reveal(&self) -> &crate::panel_chrome::DialogReveal {
+        &self.reveal
     }
 
     /// The name input + host picker + Spawn button.

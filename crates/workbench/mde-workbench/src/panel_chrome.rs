@@ -19,8 +19,10 @@
 //! Component dimensions (44 px row, 32 px icon slot) are NOT
 //! density-scaled per UX-24 sub-lock.
 
+use std::time::Instant;
+
 use cosmic::iced::widget::button::Status as ButtonStatus;
-use cosmic::iced::widget::{button, column, container, row, text, Column, Space};
+use cosmic::iced::widget::{button, column, container, row, stack, text, Column, Space};
 use cosmic::iced::{
     alignment, Background, Border, Color, Font, Length, Padding, Shadow as IcedShadow,
 };
@@ -600,6 +602,150 @@ pub fn dialog_backdrop<'a, Message: 'a>() -> Element<'a, Message> {
         .into()
 }
 
+// ── MOTION-TRANS-2 — dialog / modal / drawer OPEN reveal ──────────────────────
+//
+// Every dialog/modal/drawer in the Workbench surfaces through the
+// [`dialog`] chrome — directly (snapshots' restore-confirm) or via the shared
+// `connect_progress` modal (provisioning, lighthouses, mesh-services, the
+// Overview, music). [`DialogReveal`] gives that OPEN a uniform Carbon
+// **panel-mount** entrance WITHOUT re-implementing any timing (§6 no-reimpl): it
+// composes the existing `mde_theme::animation::slide_in` helper — a
+// [`Motion::panel_mount`](mde_theme::motion::Motion::panel_mount) (Carbon
+// `moderate-02`, 240 ms) fade-and-rise — and the §4 Carbon tokens. The render
+// side ([`reveal_dialog`]) applies it with the pinned iced-0.13 fork's
+// **fake-opacity** idiom (a `palette.raised` scrim — the fork ships no
+// opacity/transform widget, the same trick the TRANS-1 route crossfade and the
+// sidebar rail use) plus a translate-as-padding rise.
+//
+// Reduce-motion ⇒ instant: [`DialogReveal::open`] under `reduce_motion` stores no
+// start, so [`DialogReveal::params`] is the settled frame and
+// [`DialogReveal::needs_tick`] is `false` — the surface appears with no movement.
+//
+// CLOSE is instant: immediate-mode iced can't retain a leaving subtree once the
+// host clears its dialog state (the same constraint TRANS-1 documents for its
+// route crossfade), so only the OPEN is animated — the surface simply vanishes on
+// dismiss.
+
+/// MOTION-TRANS-2 — the open-reveal clock for one dialog/modal/drawer surface.
+/// Holds the instant the surface opened, or `None` at rest / under reduce-motion
+/// (an instant, movement-free appearance). Pure state: the host panel arms it on
+/// open ([`DialogReveal::open`]), clears it on dismiss ([`DialogReveal::close`]),
+/// gates its tick subscription on [`DialogReveal::needs_tick`], and feeds
+/// [`DialogReveal::params`] into [`reveal_dialog`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DialogReveal {
+    /// When the surface opened, or `None` at rest / under reduce-motion.
+    start: Option<Instant>,
+}
+
+impl DialogReveal {
+    /// Arm the open reveal at `now`. Under `reduce_motion` the surface appears
+    /// instantly (no tween, no movement): `start` stays `None`, mirroring the
+    /// `Motion::resolved` reduce-motion contract.
+    pub fn open(&mut self, now: Instant, reduce_motion: bool) {
+        self.start = (!reduce_motion).then_some(now);
+    }
+
+    /// Clear the reveal on dismiss. A later open re-arms from scratch.
+    pub fn close(&mut self) {
+        self.start = None;
+    }
+
+    /// The render params for `now`: a [`Motion::panel_mount`] fade-and-rise from
+    /// [`mde_theme::animation::slide_in`] while the reveal is in flight, or the
+    /// settled frame (fully opaque, no offset) at rest / once complete / under
+    /// reduce-motion.
+    #[must_use]
+    pub fn params(&self, now: Instant) -> mde_theme::animation::RenderParams {
+        match self.start {
+            Some(start) => mde_theme::animation::slide_in(
+                start,
+                now,
+                mde_theme::motion::PANEL_MOUNT_TRANSLATE_Y_PX,
+                false,
+            ),
+            None => mde_theme::animation::RenderParams {
+                alpha: 1.0,
+                translate_y: 0.0,
+                scale: 1.0,
+            },
+        }
+    }
+
+    /// THE subscription gate (mirrors
+    /// [`mde_theme::animation::Animator::needs_tick`]): a per-frame tick is needed
+    /// only while the open reveal is in flight. At rest, once settled, or under
+    /// reduce-motion this is `false`, so the host's tick subscription never arms
+    /// (MOTION-PERF-1: zero idle wakeups).
+    #[must_use]
+    pub fn needs_tick(&self, now: Instant) -> bool {
+        self.start.is_some_and(|start| {
+            !mde_theme::animation::Tween::starting_at(
+                start,
+                mde_theme::motion::Motion::panel_mount().duration,
+            )
+            .is_complete(now)
+        })
+    }
+}
+
+/// MOTION-TRANS-2 — wrap a built `dialog` surface with the open-reveal transform
+/// from [`DialogReveal::params`]: a translate-as-padding rise plus a fake-opacity
+/// fade (a `palette.raised`, `Radii::sm` scrim stacked over the surface at
+/// `1 - alpha`, since the pinned iced-0.13 fork has no opacity/transform widget —
+/// the same idiom as the TRANS-1 route crossfade + the sidebar rail). At the
+/// settled/rest frame (`alpha >= 1` and no offset) it's a zero-cost pass-through,
+/// so a fully-open or reduce-motion dialog pays no extra widgets and keeps its own
+/// sizing: the `Stack` takes the dialog's intrinsic `Shrink` size, so the Fill
+/// scrim covers exactly the dialog and any downstream centering is unaffected.
+#[must_use]
+pub fn reveal_dialog<'a, Message: 'a>(
+    dialog: Element<'a, Message>,
+    palette: Palette,
+    reveal: mde_theme::animation::RenderParams,
+) -> Element<'a, Message> {
+    // Fade: stack a raised-coloured scrim over the surface (the iced fork has no
+    // opacity widget — fade toward the dialog's own shell colour, never a hole).
+    let faded: Element<'a, Message> = if reveal.alpha >= 1.0 {
+        dialog
+    } else {
+        let radii = Radii::defaults();
+        let scrim_color = Color {
+            a: (1.0 - reveal.alpha).clamp(0.0, 1.0),
+            ..palette.raised.into_cosmic_color()
+        };
+        let scrim = container(Space::new().width(Length::Fill).height(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_theme| container::Style {
+                snap: false,
+                icon_color: None,
+                background: Some(Background::Color(scrim_color)),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: f32::from(radii.sm).into(),
+                },
+                shadow: IcedShadow::default(),
+                text_color: None,
+            });
+        stack![dialog, scrim].into()
+    };
+    // Rise: translate-as-padding (top padding = translate_y, shrinks to 0 as the
+    // surface settles). `slide_in` only ever yields a non-negative offset.
+    if reveal.translate_y.abs() < f32::EPSILON {
+        return faded;
+    }
+    container(faded)
+        .padding(Padding {
+            top: reveal.translate_y.max(0.0),
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        })
+        .into()
+}
+
 /// UX-9 (d) — tooltip chrome. 12 sp text, SPACE_8 padding,
 /// `Radii::sm` (4 px) corners, surface-3 (palette.overlay)
 /// background. Fade-in timing (`Motion::tooltip_fade()`) lives
@@ -858,5 +1004,102 @@ mod tests {
         let palette = crate::live_theme::palette();
         let card = mde_theme::ObjectCard::small(mde_theme::Icon::Fleet, "smoke");
         let _: Element<'_, ()> = object_card(card, palette);
+    }
+
+    // ── MOTION-TRANS-2 — dialog/modal/drawer open-reveal state ─────────────────
+
+    #[test]
+    fn dialog_reveal_at_rest_is_settled_and_needs_no_tick() {
+        // A fresh (unopened) reveal is the settled frame and arms no tick — a
+        // dialog that isn't opening pays zero animation wakeups.
+        let now = Instant::now();
+        let r = DialogReveal::default();
+        assert!(!r.needs_tick(now), "no open ⇒ no tick (MOTION-PERF-1)");
+        let p = r.params(now);
+        assert!((p.alpha - 1.0).abs() < 1e-6, "settled = fully opaque");
+        assert_eq!(p.translate_y, 0.0, "settled = no offset");
+        assert_eq!(p.scale, 1.0);
+    }
+
+    #[test]
+    fn dialog_reveal_open_runs_a_panel_mount_rise_then_settles() {
+        // open() arms the Carbon panel-mount fade-and-rise; it's in flight (needs a
+        // tick) until the panel_mount duration elapses, then settles to rest.
+        let t0 = Instant::now();
+        let mut r = DialogReveal::default();
+        r.open(t0, false);
+        // First frame: transparent + risen `PANEL_MOUNT_TRANSLATE_Y_PX` below rest.
+        let p0 = r.params(t0);
+        assert!(p0.alpha < 1e-4, "starts transparent");
+        assert!(
+            (p0.translate_y - mde_theme::motion::PANEL_MOUNT_TRANSLATE_Y_PX).abs() < 1e-4,
+            "starts offset below rest"
+        );
+        assert!(r.needs_tick(t0), "in-flight ⇒ tick needed");
+        // After the panel_mount duration it has settled: opaque, no offset, no tick.
+        let done = t0 + mde_theme::motion::Motion::panel_mount().duration;
+        let p1 = r.params(done);
+        assert!((p1.alpha - 1.0).abs() < 1e-4, "ends opaque");
+        assert!(p1.translate_y.abs() < 1e-4, "ends at rest");
+        assert!(
+            !r.needs_tick(done),
+            "settled ⇒ tick stops (no idle wakeups)"
+        );
+    }
+
+    #[test]
+    fn dialog_reveal_reduce_motion_is_instant_no_movement() {
+        // Reduce-motion ⇒ instant: the surface appears settled with no tween and
+        // no movement, and never arms a tick.
+        let now = Instant::now();
+        let mut r = DialogReveal::default();
+        r.open(now, true);
+        let p = r.params(now);
+        assert!(
+            (p.alpha - 1.0).abs() < 1e-6,
+            "reduce-motion = instant opaque"
+        );
+        assert_eq!(p.translate_y, 0.0, "reduce-motion = no movement");
+        assert!(
+            !r.needs_tick(now),
+            "reduce-motion arms no tick (instant, nothing to animate)"
+        );
+    }
+
+    #[test]
+    fn dialog_reveal_close_returns_to_rest() {
+        let t0 = Instant::now();
+        let mut r = DialogReveal::default();
+        r.open(t0, false);
+        assert!(r.needs_tick(t0));
+        r.close();
+        assert!(!r.needs_tick(t0), "closed ⇒ no tick");
+        assert_eq!(r.params(t0).alpha, 1.0, "closed renders settled");
+    }
+
+    #[test]
+    fn reveal_dialog_passes_through_when_settled() {
+        // At the settled frame the wrapper is a zero-cost pass-through (the common
+        // fully-open / reduce-motion case); mid-reveal it wraps without panicking.
+        let palette = crate::live_theme::palette();
+        let settled = DialogReveal::default().params(Instant::now());
+        let body: Element<'_, ()> = dialog(
+            cosmic::iced::widget::text("x").into(),
+            palette,
+            Density::Comfortable,
+        );
+        let _ = reveal_dialog(body, palette, settled);
+        // A mid-reveal frame (alpha < 1, offset > 0) exercises the scrim + rise.
+        let mid = mde_theme::animation::RenderParams {
+            alpha: 0.4,
+            translate_y: 3.0,
+            scale: 1.0,
+        };
+        let body2: Element<'_, ()> = dialog(
+            cosmic::iced::widget::text("x").into(),
+            palette,
+            Density::Comfortable,
+        );
+        let _ = reveal_dialog(body2, palette, mid);
     }
 }

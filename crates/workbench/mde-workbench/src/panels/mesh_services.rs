@@ -101,6 +101,9 @@ pub struct MeshServicesPanel {
     /// The `(name, scope)` of the unit the open modal is starting — drives
     /// the modal's Retry.
     pub connect_target: Option<(String, UnitScope)>,
+    /// MOTION-TRANS-2 — open-reveal clock for the connect/start modal (armed on
+    /// the `Closed → open` edge, cleared on dismiss).
+    reveal: crate::panel_chrome::DialogReveal,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +173,7 @@ impl MeshServicesPanel {
             },
             Message::ConnectDismiss => {
                 self.connect = ConnectProgress::Closed;
+                self.reveal.close();
                 self.connect_target = None;
                 Task::none()
             }
@@ -273,6 +277,14 @@ impl MeshServicesPanel {
     /// Retry. The post-start re-probe ([`Message::ConnectProbed`]) sets the
     /// terminal outcome from the unit's real `ActiveState`.
     fn start_unit(&mut self, name: String, scope: UnitScope) -> Task<crate::Message> {
+        // MOTION-TRANS-2 — arm the open reveal only on the `Closed → open` edge
+        // (the row's Start button); an in-place Retry from a Failure is untouched.
+        if !self.connect.is_open() {
+            self.reveal.open(
+                std::time::Instant::now(),
+                crate::live_theme::reduce_motion(),
+            );
+        }
         self.busy = true;
         self.last_op = format!("starting {name}");
         self.connect = ConnectProgress::pending(
@@ -432,7 +444,15 @@ impl MeshServicesPanel {
             palette,
             crate::Message::MeshServices(Message::ConnectRetry),
             crate::Message::MeshServices(Message::ConnectDismiss),
+            self.reveal.params(std::time::Instant::now()),
         )
+    }
+
+    /// MOTION-TRANS-2 — the connect/start modal's open-reveal clock for the
+    /// shell's tick-subscription gate ([`crate::panel_chrome::DialogReveal::needs_tick`]).
+    #[must_use]
+    pub fn dialog_reveal(&self) -> &crate::panel_chrome::DialogReveal {
+        &self.reveal
     }
 }
 
