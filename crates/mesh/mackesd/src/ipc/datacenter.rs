@@ -1620,6 +1620,25 @@ pub fn poll_once(
 mod tests {
     use super::*;
 
+    /// Test-only: call [`build_reply`] while holding the RBAC env lock so a
+    /// concurrent `rbac_*` test that mutates `dc_rbac::ROLE_MAP_ENV` can't leak
+    /// a stray role map into this call. EFF-18 env-race: `cargo test` runs tests
+    /// in threads of ONE process, and `enforce` reads the role map from the
+    /// process-global env — so a mutating-verb call here (no caller principal)
+    /// would be denied if a setter test had `ROLE_MAP_ENV` set at that instant.
+    /// The canonical run pins `--test-threads=1`, but routing every reader
+    /// through this lock makes the suite robust even without it (the full
+    /// `cargo test --workspace` integration gate runs threaded). The two
+    /// `rbac_*` setter tests keep their EXPLICIT guard — they hold the lock
+    /// across `set_var`/`build_reply`/`remove_var`, so they must call
+    /// `build_reply` directly (re-locking through this helper would deadlock).
+    fn rbac_safe_reply(s: &DatacenterService, verb: &str, body: Option<&str>) -> String {
+        let _g = crate::ipc::dc_rbac::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        build_reply(s, verb, body)
+    }
+
     #[test]
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("vm-power"), "action/dc/vm-power");
@@ -1845,7 +1864,7 @@ mod tests {
             "dom0": "10.0.0.1"
         })
         .to_string();
-        let r = build_reply(&s, "vm-console", Some(&body));
+        let r = rbac_safe_reply(&s, "vm-console", Some(&body));
         assert!(r.contains("dom0 not in allowed set"), "{r}");
     }
 
@@ -1860,7 +1879,7 @@ mod tests {
             "dom0": "10.0.0.1"
         })
         .to_string();
-        let r = build_reply(&s, "vm-delete", Some(&body));
+        let r = rbac_safe_reply(&s, "vm-delete", Some(&body));
         assert!(r.contains("delete requires confirm:true"), "{r}");
         // confirm false
         let body = json!({
@@ -1869,7 +1888,7 @@ mod tests {
             "confirm": false
         })
         .to_string();
-        let r = build_reply(&s, "vm-delete", Some(&body));
+        let r = rbac_safe_reply(&s, "vm-delete", Some(&body));
         assert!(r.contains("delete requires confirm:true"), "{r}");
         // confirm as a non-bool ("true" string) does not satisfy the gate
         let body = json!({
@@ -1878,7 +1897,7 @@ mod tests {
             "confirm": "true"
         })
         .to_string();
-        let r = build_reply(&s, "vm-delete", Some(&body));
+        let r = rbac_safe_reply(&s, "vm-delete", Some(&body));
         assert!(r.contains("delete requires confirm:true"), "{r}");
     }
 
@@ -1894,7 +1913,7 @@ mod tests {
             "confirm": true
         })
         .to_string();
-        let r = build_reply(&s, "vm-delete", Some(&body));
+        let r = rbac_safe_reply(&s, "vm-delete", Some(&body));
         assert!(r.contains("dom0 not in allowed set"), "{r}");
     }
 
@@ -1908,19 +1927,19 @@ mod tests {
             "dom0": "10.0.0.1"
         })
         .to_string();
-        let r = build_reply(&s, "vm-clone", Some(&body));
+        let r = rbac_safe_reply(&s, "vm-clone", Some(&body));
         assert!(r.contains("dom0 not in allowed set"), "{r}");
     }
 
     #[test]
     fn unknown_verb_and_missing_body_error() {
         let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
-        assert!(build_reply(&s, "bogus", None).contains("unknown dc verb"));
-        assert!(build_reply(&s, "vm-power", None).contains("missing request body"));
-        assert!(build_reply(&s, "vm-snapshot", None).contains("missing request body"));
-        assert!(build_reply(&s, "vm-clone", None).contains("missing request body"));
-        assert!(build_reply(&s, "vm-delete", None).contains("missing request body"));
-        assert!(build_reply(&s, "vm-console", None).contains("missing request body"));
+        assert!(rbac_safe_reply(&s, "bogus", None).contains("unknown dc verb"));
+        assert!(rbac_safe_reply(&s, "vm-power", None).contains("missing request body"));
+        assert!(rbac_safe_reply(&s, "vm-snapshot", None).contains("missing request body"));
+        assert!(rbac_safe_reply(&s, "vm-clone", None).contains("missing request body"));
+        assert!(rbac_safe_reply(&s, "vm-delete", None).contains("missing request body"));
+        assert!(rbac_safe_reply(&s, "vm-console", None).contains("missing request body"));
     }
 
     #[test]
@@ -1934,7 +1953,7 @@ mod tests {
             "dom0": "10.0.0.1"
         })
         .to_string();
-        let r = build_reply(&s, "vm-power", Some(&body));
+        let r = rbac_safe_reply(&s, "vm-power", Some(&body));
         assert!(r.contains("dom0 not in allowed set"), "{r}");
     }
 
@@ -1948,7 +1967,7 @@ mod tests {
             "dom0": "10.0.0.1"
         })
         .to_string();
-        let r = build_reply(&s, "vm-snapshot", Some(&body));
+        let r = rbac_safe_reply(&s, "vm-snapshot", Some(&body));
         assert!(r.contains("dom0 not in allowed set"), "{r}");
     }
 
@@ -2000,7 +2019,7 @@ mod tests {
 
         // Second vm-power on the same uuid → busy-reject, NOT the dom0 error.
         let body = json!({ "uuid": uuid, "op": "start", "dom0": "10.0.0.1" }).to_string();
-        let r = build_reply(&s, "vm-power", Some(&body));
+        let r = rbac_safe_reply(&s, "vm-power", Some(&body));
         assert!(
             r.contains(&format!("resource vm:{uuid} busy")),
             "expected busy reject, got: {r}"
@@ -2022,7 +2041,7 @@ mod tests {
             "dom0": "10.0.0.1"
         })
         .to_string();
-        let r2 = build_reply(&s, "vm-power", Some(&other));
+        let r2 = rbac_safe_reply(&s, "vm-power", Some(&other));
         assert!(r2.contains("dom0 not in allowed set"), "{r2}");
 
         // Release the first op; the same uuid is now claimable again.
@@ -2046,9 +2065,9 @@ mod tests {
             "dom0": "10.0.0.1"
         })
         .to_string();
-        let r1 = build_reply(&s, "vm-power", Some(&body));
+        let r1 = rbac_safe_reply(&s, "vm-power", Some(&body));
         assert!(r1.contains("dom0 not in allowed set"), "{r1}");
-        let r2 = build_reply(&s, "vm-power", Some(&body));
+        let r2 = rbac_safe_reply(&s, "vm-power", Some(&body));
         assert!(
             r2.contains("dom0 not in allowed set"),
             "lock must have released after the first call: {r2}"
@@ -2064,7 +2083,7 @@ mod tests {
         let _held = s.try_lock(format!("vm:{uuid}")).expect("claim on original");
         let clone = s.clone();
         let body = json!({ "uuid": uuid, "op": "reboot", "dom0": "10.0.0.1" }).to_string();
-        let r = build_reply(&clone, "vm-power", Some(&body));
+        let r = rbac_safe_reply(&clone, "vm-power", Some(&body));
         assert!(
             r.contains(&format!("resource vm:{uuid} busy")),
             "a clone must see the same in-flight set: {r}"
@@ -2080,7 +2099,7 @@ mod tests {
         let uuid = "abcd1234-5678-90ab-cdef-1234567890ab";
         let _held = s.try_lock(format!("vm:{uuid}")).expect("claim the uuid");
         let body = json!({ "uuid": uuid, "dom0": "10.0.0.1" }).to_string();
-        let r = build_reply(&s, "vm-console", Some(&body));
+        let r = rbac_safe_reply(&s, "vm-console", Some(&body));
         assert!(
             !r.contains("busy"),
             "read-only verb must not be locked: {r}"
@@ -2192,7 +2211,7 @@ mod tests {
                 json!({ "uuids": [uuid], "op": "start", "dom0": "10.0.0.1" }),
             ),
         ] {
-            let r = build_reply(&s, verb, Some(&body.to_string()));
+            let r = rbac_safe_reply(&s, verb, Some(&body.to_string()));
             assert!(r.contains("dom0 not in allowed set"), "{verb}: {r}");
         }
     }
@@ -2281,20 +2300,20 @@ mod tests {
         // bad name.
         let body =
             json!({ "name": "bad name!", "network_uuid": "1111", "zone": "dev" }).to_string();
-        assert!(build_reply(&s, "vm-create", Some(&body)).contains("name must be"));
+        assert!(rbac_safe_reply(&s, "vm-create", Some(&body)).contains("name must be"));
         // missing/empty network_uuid.
         let body = json!({ "name": "web1", "zone": "dev" }).to_string();
-        assert!(build_reply(&s, "vm-create", Some(&body)).contains("network_uuid"));
+        assert!(rbac_safe_reply(&s, "vm-create", Some(&body)).contains("network_uuid"));
         // bad zone.
         let body =
             json!({ "name": "web1", "network_uuid": "1111-2222", "zone": "prod" }).to_string();
-        assert!(build_reply(&s, "vm-create", Some(&body)).contains("unknown zone/pool"));
+        assert!(rbac_safe_reply(&s, "vm-create", Some(&body)).contains("unknown zone/pool"));
         // out-of-range vcpus.
         let body = json!({
             "name": "web1", "network_uuid": "1111-2222", "zone": "dev", "vcpus": 999
         })
         .to_string();
-        assert!(build_reply(&s, "vm-create", Some(&body)).contains("vcpus must be"));
+        assert!(rbac_safe_reply(&s, "vm-create", Some(&body)).contains("vcpus must be"));
     }
 
     #[test]
@@ -2308,7 +2327,7 @@ mod tests {
             "vm-bulk",
         ] {
             assert!(
-                build_reply(&s, v, None).contains("missing request body"),
+                rbac_safe_reply(&s, v, None).contains("missing request body"),
                 "{v}"
             );
         }
@@ -2352,14 +2371,14 @@ mod tests {
     fn do_guided_lighthouse_gates_before_spawn() {
         let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
         // missing body
-        assert!(build_reply(&s, "do-guided-lighthouse", None).contains("missing request body"));
+        assert!(rbac_safe_reply(&s, "do-guided-lighthouse", None).contains("missing request body"));
         // confirm required (valid region but no confirm → no spawn)
         let body = json!({ "region": "nyc3" }).to_string();
-        let r = build_reply(&s, "do-guided-lighthouse", Some(&body));
+        let r = rbac_safe_reply(&s, "do-guided-lighthouse", Some(&body));
         assert!(r.contains("requires confirm:true"), "{r}");
         // bad region with confirm → rejected before any spawn
         let body = json!({ "region": "nyc3; rm -rf /", "confirm": true }).to_string();
-        let r = build_reply(&s, "do-guided-lighthouse", Some(&body));
+        let r = rbac_safe_reply(&s, "do-guided-lighthouse", Some(&body));
         assert!(r.contains("region must be a doctl slug"), "{r}");
     }
 
@@ -2380,7 +2399,7 @@ mod tests {
     #[test]
     fn promote_arm_read_reports_state() {
         let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
-        let r = build_reply(&s, "promote-arm", Some("{}"));
+        let r = rbac_safe_reply(&s, "promote-arm", Some("{}"));
         let v: serde_json::Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["ok"], true);
         assert!(v.get("armed").and_then(|a| a.as_bool()).is_some(), "{r}");
@@ -2390,14 +2409,14 @@ mod tests {
     fn promote_now_gates_before_exec() {
         let s = DatacenterService::new(std::path::PathBuf::from("/tmp"));
         // missing body
-        assert!(build_reply(&s, "promote-now", None).contains("missing request body"));
+        assert!(rbac_safe_reply(&s, "promote-now", None).contains("missing request body"));
         // confirm required (returns before any publish/shell)
         let body = json!({ "stage": "eagle" }).to_string();
-        let r = build_reply(&s, "promote-now", Some(&body));
+        let r = rbac_safe_reply(&s, "promote-now", Some(&body));
         assert!(r.contains("requires confirm:true"), "{r}");
         // bad stage with confirm → rejected before any publish/shell
         let body = json!({ "stage": "moon", "confirm": true }).to_string();
-        let r = build_reply(&s, "promote-now", Some(&body));
+        let r = rbac_safe_reply(&s, "promote-now", Some(&body));
         assert!(r.contains("stage must be eagle|do"), "{r}");
     }
 }
