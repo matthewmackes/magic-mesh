@@ -31,3 +31,16 @@ GPL-3.0-or-later is compatible with MPL-2.0 and the permissive licenses above
 (the combined work is distributable under GPL-3.0-or-later). No bundled
 dependency imposes a license incompatible with GPL-3.0-or-later; should one be
 introduced, the `cargo deny check licenses` gate (EFF-16) fails the build.
+
+--------------------------------------------------------------------------------
+Third-party brand marks (About → "Built on open source")
+--------------------------------------------------------------------------------
+The Workbench About page credits and thanks the open-source projects MCNF builds
+on, and displays each project's brand mark where one is cleanly available. The
+vendored marks under crates/workbench/mde-workbench/assets/oss/ (etcd, Syncthing,
+COSMIC/System76, iced, Tokio, Podman, OpenTofu) are sourced from SimpleIcons
+(https://simpleicons.org, CC0 for the icon SVGs) and the projects' own marks.
+These marks remain the trademarks of their respective owners and are used here
+solely to identify, credit, and thank those projects (nominative use); their
+inclusion does not imply endorsement. Nebula, Navidrome, and age are shown with a
+neutral monogram tile.

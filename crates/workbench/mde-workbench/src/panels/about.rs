@@ -39,23 +39,18 @@ pub const CHANGELOG: &str = include_str!("../../../../../CHANGELOG.md");
 // authors/maintainers, links to its official home (opened via
 // `OpenExternal`/`xdg-open`), and says thank you.
 //
-// LOGOS — design decision (honest): the operator asked for each project's logo.
-// We deliberately ship a Carbon-token *monogram tile* for every project instead
-// of a bundled raster logo, for three converging reasons:
-//   1. Trademark / brand-usage. These are ten different organisations' marks
-//      (Slack, CNCF, System76, Red Hat, the Linux Foundation, individual
-//      authors, …) each with its own brand-usage policy. Redistributing all ten
-//      into this repo is a licensing question we cannot cleanly warrant, so per
-//      the task's own guidance ("licensing is unclear → tasteful monogram") we
-//      take the safe path uniformly rather than mixing real logos and fallbacks.
-//   2. Airgapped build. The canonical build host has no fetch at build time, so
-//      a logo would have to be vendored as bytes — see (1).
-//   3. §4 single-source colour. The tiles are rendered from the `mde_theme`
-//      Carbon ramp tokens only (no raw hex), so they stay on-brand and adapt
-//      cleanly. Each tile is a rounded square in a Carbon support/gray token
-//      with the project's monogram; "never ship a broken image" is guaranteed.
-// If a future change vendors blessed logos, swap `monogram_tile` for an
-// `image`/`svg` handle per entry — the row layout already leaves the slot.
+// LOGOS — each project's real brand mark, vendored + rendered (the operator
+// asked for logos). We ship a simple monochrome SVG of the brand mark under
+// `assets/oss/` for the seven projects with a cleanly-available one (etcd,
+// Syncthing, COSMIC→System76, iced, Tokio, Podman, OpenTofu — from SimpleIcons /
+// the projects' own marks), vendored as bytes so the airgapped build host needs
+// no fetch. The SVG is rendered tinted to the tile's `ink` Carbon token, so the
+// mark reads on the Carbon fill and stays §4 single-source colour (no raw hex)
+// and light/dark-adaptive. Nebula, Navidrome and age have no simple SVG we can
+// cleanly vendor, so they keep the Carbon *monogram tile* fallback — `logo_tile`
+// renders whichever applies, and "never ship a broken image" is guaranteed.
+// The marks remain their owners' trademarks; they appear here only to credit and
+// thank their projects (nominative use), see NOTICE.
 
 /// One acknowledged open-source project: its name, the people behind it, the
 /// official link (opened via [`crate::Message::OpenExternal`]), the monogram +
@@ -407,7 +402,7 @@ fn oss_entry<'a>(
     palette: Palette,
     sizes: FontSize,
 ) -> Element<'a, crate::Message, cosmic::Theme> {
-    let tile = monogram_tile(project, sizes);
+    let tile = logo_tile(project, sizes);
 
     let name = oss_link_button(project.name, project.url, palette, sizes);
     let author = text(project.author)
@@ -436,34 +431,60 @@ fn oss_entry<'a>(
     .into()
 }
 
-/// The logo slot: a rounded Carbon-token tile with the project's monogram. This
-/// is the deliberate stand-in for a bundled raster logo (see the module note on
-/// trademark + airgapped-build + §4 single-source colour). Both fill and ink
-/// are `mde_theme` Carbon tokens, so it adapts cleanly and never ships broken.
-fn monogram_tile<'a>(
+/// The vendored monochrome SVG brand mark for `name`, or `None` for the three
+/// projects (Nebula, Navidrome, age) that keep the Carbon monogram fallback.
+/// Bytes are `include_bytes!`-embedded so the airgapped build host needs no fetch.
+fn logo_bytes(name: &str) -> Option<&'static [u8]> {
+    let bytes: &'static [u8] = match name {
+        "etcd" => include_bytes!("../../assets/oss/etcd.svg"),
+        "Syncthing" => include_bytes!("../../assets/oss/syncthing.svg"),
+        "COSMIC / libcosmic" => include_bytes!("../../assets/oss/cosmic.svg"),
+        "iced" => include_bytes!("../../assets/oss/iced.svg"),
+        "Tokio" => include_bytes!("../../assets/oss/tokio.svg"),
+        "Podman" => include_bytes!("../../assets/oss/podman.svg"),
+        "OpenTofu" => include_bytes!("../../assets/oss/opentofu.svg"),
+        _ => return None,
+    };
+    Some(bytes)
+}
+
+/// The logo slot: a rounded Carbon-token tile holding the project's real brand
+/// mark — a vendored monochrome SVG tinted to the tile's `ink` Carbon token — when
+/// one is available ([`logo_bytes`]), else the Carbon monogram. Both fill and ink
+/// are `mde_theme` tokens, so it adapts in light/dark and never ships broken.
+fn logo_tile<'a>(
     project: &OssProject,
     sizes: FontSize,
 ) -> Element<'a, crate::Message, cosmic::Theme> {
     let fill = project.tile.into_cosmic_color();
     let ink = project.ink.into_cosmic_color();
-    let initials = project.initials;
-    container(
-        text(initials)
-            .size(TypeRole::Section.size_in(sizes))
-            .colr(ink),
-    )
-    .center_x(Length::Fixed(48.0))
-    .center_y(Length::Fixed(48.0))
-    .style(move |_t: &cosmic::Theme| container::Style {
-        background: Some(Background::Color(fill)),
-        border: Border {
-            color: Color::TRANSPARENT,
-            width: 0.0,
-            radius: 10.0.into(),
-        },
-        ..container::Style::default()
-    })
-    .into()
+    let inner: Element<'a, crate::Message, cosmic::Theme> =
+        if let Some(bytes) = logo_bytes(project.name) {
+            use cosmic::iced::widget::svg;
+            svg(svg::Handle::from_memory(bytes))
+                .sty(move |_t: &cosmic::Theme| svg::Style { color: Some(ink) })
+                .width(Length::Fixed(28.0))
+                .height(Length::Fixed(28.0))
+                .into()
+        } else {
+            text(project.initials)
+                .size(TypeRole::Section.size_in(sizes))
+                .colr(ink)
+                .into()
+        };
+    container(inner)
+        .center_x(Length::Fixed(48.0))
+        .center_y(Length::Fixed(48.0))
+        .style(move |_t: &cosmic::Theme| container::Style {
+            background: Some(Background::Color(fill)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 10.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// An accent-colored, chromeless link button showing `label` and opening `url`
