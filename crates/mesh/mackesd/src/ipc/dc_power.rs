@@ -424,6 +424,190 @@ fn save_wake_model(state_dir: &std::path::Path, model: &WakeEtaModel) -> std::io
     std::fs::write(wake_model_path(state_dir), model.to_json())
 }
 
+// ---- DATACENTER-16: live wake-progress publisher (model → Bus → Hosts tab) -----
+//
+// The model (rolling ETA), the phasing (`wake_phase`), the IPC (`power-eta`/
+// `power-wake-done`), and the Workbench Hosts-tab progress bar all existed, but
+// nothing DROVE them live: `event/dc/power/<host>` (the topic the GUI reads) had
+// no publisher and `power-wake-done` had no caller, so the learned average never
+// got a sample and the bar never appeared. This closes that gap: when a wake is
+// issued (`wol`/`power-ipmi on`) the responder spawns a timed driver that
+// publishes a phased `event/dc/power/<host>` sample each tick (from the learned
+// ETA) until the dom0 answers, then records the measured duration + publishes the
+// terminal `ready` event. The pure body builders + the generic driver are
+// unit-tested with no clock/network/Bus.
+
+/// Tick spacing for live wake-progress publishes (seconds).
+const WAKE_PROGRESS_TICK: u64 = 3;
+/// Hard ceiling on a tracked wake before giving up (seconds) — a host that never
+/// answers must not publish forever or poison the rolling average with a sample.
+const WAKE_PROGRESS_TIMEOUT: u64 = 600;
+/// TCP port whose acceptance means the dom0's SSH/toolstack is up (ready).
+const DOM0_READY_PORT: u16 = 22;
+
+/// The Bus topic + JSON body for one live wake-progress sample, shaped EXACTLY
+/// for the Workbench Hosts tab (`parse_power_event`/`PowerStatus`:
+/// `{host, phase, pct, eta_secs}`, with `pct`/`eta_secs` as strings). PURE.
+/// `eta` `None` ⇒ the model has no sample for this host yet, so show `post` at
+/// 0% with an empty ETA. The GUI's phase vocabulary uses `xcp` where the model's
+/// [`wake_phase`] says `xcp-up`, so map it.
+#[must_use]
+pub fn power_progress_event(host: &str, elapsed_secs: u64, eta: Option<u64>) -> (String, String) {
+    let (phase, pct) = match eta {
+        Some(e) => wake_phase(elapsed_secs, e),
+        None => ("post", 0),
+    };
+    let gui_phase = if phase == "xcp-up" { "xcp" } else { phase };
+    let body = json!({
+        "host": host,
+        "phase": gui_phase,
+        "pct": pct.to_string(),
+        "eta_secs": eta.map(|e| e.to_string()).unwrap_or_default(),
+    })
+    .to_string();
+    (format!("event/dc/power/{host}"), body)
+}
+
+/// The terminal `ready` event that clears the host's progress bar (the Hosts
+/// tab drops `ready` rows). PURE.
+#[must_use]
+pub fn power_ready_event(host: &str) -> (String, String) {
+    let body = json!({ "host": host, "phase": "ready", "pct": "100", "eta_secs": "0" }).to_string();
+    (format!("event/dc/power/{host}"), body)
+}
+
+/// The dom0 IP to follow a wake for, or `None` when this request isn't a
+/// host-power-ON worth tracking. `power-ipmi` carries `host` and is a wake only
+/// for `op:"on"`; `wol` optionally carries `host` (the dom0 IP to probe + key
+/// the bar) alongside `mac`. PURE.
+#[must_use]
+pub fn wake_host_to_track(verb: &str, req_body: Option<&str>) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(req_body?).ok()?;
+    match verb {
+        "power-ipmi" => {
+            let op = v.get("op").and_then(serde_json::Value::as_str)?;
+            op.eq_ignore_ascii_case("on")
+                .then(|| v.get("host").and_then(serde_json::Value::as_str))
+                .flatten()
+                .map(str::to_string)
+        }
+        "wol" => v
+            .get("host")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Drive one host's live wake progress: publish a phased `event/dc/power/<host>`
+/// sample every tick (computed from the learned ETA) until the host answers
+/// (ready) or `timeout_secs` elapses; on ready, record the measured duration
+/// into `model` + publish the terminal `ready` event. Returns the measured wake
+/// seconds on success, `None` on timeout. Generic over time / readiness /
+/// publish / sleep so it unit-tests with no real clock, network, or Bus.
+///
+/// A zero-second "ready" (the host was already up — not actually asleep) is NOT
+/// recorded, so an immediate answer can't skew the average toward zero.
+pub fn drive_wake_progress<Now, Ready, Sink, Tick>(
+    model: &mut WakeEtaModel,
+    host: &str,
+    timeout_secs: u64,
+    now: Now,
+    ready: Ready,
+    mut publish: Sink,
+    tick: Tick,
+) -> Option<u64>
+where
+    Now: Fn() -> u64,
+    Ready: Fn(&str) -> bool,
+    Sink: FnMut(&str, &str),
+    Tick: Fn(),
+{
+    let start = now();
+    loop {
+        let elapsed = now().saturating_sub(start);
+        if ready(host) {
+            if elapsed > 0 {
+                model.record(host, elapsed);
+            }
+            let (t, b) = power_ready_event(host);
+            publish(&t, &b);
+            return Some(elapsed);
+        }
+        if elapsed >= timeout_secs {
+            return None;
+        }
+        let (t, b) = power_progress_event(host, elapsed, model.eta(host));
+        publish(&t, &b);
+        tick();
+    }
+}
+
+/// Current Unix time in whole seconds (0 on a pre-epoch clock).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Live dom0 readiness: a TCP connect to `host:22` succeeds (SSH/toolstack up).
+/// A refused/timed-out connect ⇒ not ready yet.
+fn dom0_ready(host: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    format!("{host}:{DOM0_READY_PORT}")
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .is_some_and(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).is_ok()
+        })
+}
+
+/// Publish one event onto the Bus (best-effort, fire-and-reap) — the same lane
+/// shape the datacenter orchestrator uses.
+fn bus_publish(topic: &str, body: &str) {
+    let mut cmd = std::process::Command::new("mde-bus");
+    cmd.args(["publish", topic, "--body-flag", body]);
+    crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+}
+
+/// Spawn the live wake-progress thread for `host` after a wake is issued: real
+/// clock, a TCP dom0-readiness probe, real `mde-bus` publishes, and the rolling
+/// model loaded from + (on a real wake) saved back to the dc state dir.
+/// Best-effort + detached — a failed probe/publish is a silent no-op and never
+/// blocks the responder.
+fn spawn_wake_progress(svc: &DcPowerService, host: String) {
+    let state_dir = crate::ipc::dc_common::dc_state_dir(&svc.workgroup_root);
+    let _ = std::thread::Builder::new()
+        .name(format!("dc-wake-progress:{host}"))
+        .spawn(move || {
+            let mut model = load_wake_model(&state_dir);
+            let measured = drive_wake_progress(
+                &mut model,
+                &host,
+                WAKE_PROGRESS_TIMEOUT,
+                now_unix_secs,
+                dom0_ready,
+                bus_publish,
+                || std::thread::sleep(std::time::Duration::from_secs(WAKE_PROGRESS_TICK)),
+            );
+            // Only persist when a real wake completed (a sample was recorded);
+            // a timeout records nothing, so there's nothing to save.
+            if measured.is_some_and(|secs| secs > 0) {
+                let _ = save_wake_model(&state_dir, &model);
+            }
+        });
+}
+
+/// True when a verb reply is a success (`{"ok":true}`), not an `{"error":…}`.
+fn reply_is_ok(reply: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(reply)
+        .ok()
+        .and_then(|v| v.get("ok").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
 /// Handle a `power-eta` request (read-only): the learned phased ETA for `host`.
 /// Body `{ host, elapsed? }` — when `elapsed` (seconds since the wake was issued)
 /// is supplied, the reply also carries the current phase + percent.
@@ -578,6 +762,14 @@ pub fn poll_once(persist: &Persist, svc: &DcPowerService, cursors: &mut HashMap<
                 Some(&reply),
             ) {
                 tracing::warn!(ulid = %msg.ulid, error = %e, "dc-power responder: reply write failed");
+            }
+            // DATACENTER-16: a successful host-power-ON drives the live wake
+            // progress bar — publish phased `event/dc/power/<host>` until the
+            // dom0 answers, then feed the rolling ETA model.
+            if reply_is_ok(&reply) {
+                if let Some(host) = wake_host_to_track(verb, msg.body.as_deref()) {
+                    spawn_wake_progress(svc, host);
+                }
             }
         }
     }
@@ -848,5 +1040,122 @@ mod tests {
         assert!(r.contains("missing `host`"), "{r}");
         let r = build_reply(&s, "power-wake-done", Some(r#"{"host":"x"}"#));
         assert!(r.contains("`secs`"), "{r}");
+    }
+
+    // ---- DATACENTER-16: live wake-progress publisher ----
+
+    #[test]
+    fn power_progress_event_matches_the_hosts_tab_contract() {
+        // The body must be exactly what the Workbench `parse_power_event` reads:
+        // {host, phase, pct, eta_secs} with pct/eta_secs as STRINGS, and the
+        // model's `xcp-up` phase mapped to the GUI's `xcp`.
+        let (topic, body) = power_progress_event("172.20.0.9", 50, Some(100));
+        assert_eq!(topic, "event/dc/power/172.20.0.9");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["host"], "172.20.0.9");
+        assert_eq!(v["phase"], "xcp"); // wake_phase says "xcp-up" → GUI "xcp"
+        assert_eq!(v["pct"], "50"); // string, not number
+        assert_eq!(v["eta_secs"], "100");
+
+        // No learned sample yet → post / 0% / empty ETA (never a bogus number).
+        let (_, body) = power_progress_event("h", 12, None);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["phase"], "post");
+        assert_eq!(v["pct"], "0");
+        assert_eq!(v["eta_secs"], "");
+
+        // toolstack phase carries through unmapped.
+        let (_, body) = power_progress_event("h", 80, Some(100));
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["phase"], "toolstack");
+    }
+
+    #[test]
+    fn power_ready_event_is_the_terminal_clear() {
+        let (topic, body) = power_ready_event("172.20.0.8");
+        assert_eq!(topic, "event/dc/power/172.20.0.8");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["phase"], "ready"); // the Hosts tab drops `ready` rows
+        assert_eq!(v["pct"], "100");
+    }
+
+    #[test]
+    fn wake_host_to_track_picks_only_real_power_ons() {
+        // power-ipmi: tracked only for op:on, keyed by host.
+        assert_eq!(
+            wake_host_to_track("power-ipmi", Some(r#"{"op":"on","host":"172.20.0.9"}"#)),
+            Some("172.20.0.9".to_string())
+        );
+        assert_eq!(
+            wake_host_to_track("power-ipmi", Some(r#"{"op":"off","host":"172.20.0.9"}"#)),
+            None
+        );
+        // wol: tracked when a host (dom0 IP) is supplied alongside the mac.
+        assert_eq!(
+            wake_host_to_track(
+                "wol",
+                Some(r#"{"mac":"aa:bb:cc:dd:ee:ff","host":"172.20.0.5"}"#)
+            ),
+            Some("172.20.0.5".to_string())
+        );
+        assert_eq!(
+            wake_host_to_track("wol", Some(r#"{"mac":"aa:bb:cc:dd:ee:ff"}"#)),
+            None
+        );
+        // other verbs / bad input are never tracked.
+        assert_eq!(
+            wake_host_to_track("power-eta", Some(r#"{"host":"x"}"#)),
+            None
+        );
+        assert_eq!(wake_host_to_track("wol", None), None);
+        assert_eq!(wake_host_to_track("wol", Some("not json")), None);
+    }
+
+    #[test]
+    fn drive_wake_progress_publishes_phases_then_records_on_ready() {
+        // Injected clock (advances only on tick) + ready-at-9 + a capturing sink.
+        let clock = std::cell::Cell::new(0u64);
+        let mut published: Vec<(String, String)> = Vec::new();
+        let mut model = WakeEtaModel::new();
+        let measured = drive_wake_progress(
+            &mut model,
+            "172.20.0.9",
+            600,
+            || clock.get(),
+            |_| clock.get() >= 9,
+            |t, b| published.push((t.to_string(), b.to_string())),
+            || clock.set(clock.get() + 3),
+        );
+        // Ready at elapsed 9 → that's the recorded sample (avg of one = 9).
+        assert_eq!(measured, Some(9));
+        assert_eq!(model.eta("172.20.0.9"), Some(9));
+        // Three progress publishes (elapsed 0, 3, 6) then the terminal ready.
+        assert_eq!(published.len(), 4);
+        assert!(published[0].0 == "event/dc/power/172.20.0.9");
+        assert!(published[3].1.contains("\"phase\":\"ready\""));
+        assert!(!published[0].1.contains("\"phase\":\"ready\""));
+    }
+
+    #[test]
+    fn drive_wake_progress_times_out_without_recording() {
+        // Never ready; the clock runs past the timeout → no sample, no `ready`
+        // (a stuck wake must not poison the rolling average).
+        let clock = std::cell::Cell::new(0u64);
+        let mut published: Vec<(String, String)> = Vec::new();
+        let mut model = WakeEtaModel::new();
+        let measured = drive_wake_progress(
+            &mut model,
+            "h",
+            9,
+            || clock.get(),
+            |_| false,
+            |t, b| published.push((t.to_string(), b.to_string())),
+            || clock.set(clock.get() + 3),
+        );
+        assert_eq!(measured, None);
+        assert_eq!(model.sample_count("h"), 0);
+        assert!(published
+            .iter()
+            .all(|(_, b)| !b.contains("\"phase\":\"ready\"")));
     }
 }
