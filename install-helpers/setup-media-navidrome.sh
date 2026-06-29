@@ -194,10 +194,16 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload 2>/dev/null || true
-systemctl enable --now mcnf-music-store.service >/dev/null 2>&1 || true
-# Give the mount a moment to establish before the scanner starts (the Requires=
-# above orders it; this just avoids a noisy first-scan against an empty mount).
-systemctl enable --now mcnf-navidrome.service >/dev/null 2>&1 || true
+# enable + RESTART (not `enable --now`): on a RE-provision the unit file changed
+# but an already-running unit keeps its old config under `enable --now` (this bit
+# the MEDIA-6 playlists mount — the live container ran stale until an explicit
+# restart). `restart` applies the rewritten unit and starts it if it was down.
+systemctl enable mcnf-music-store.service >/dev/null 2>&1 || true
+systemctl restart mcnf-music-store.service >/dev/null 2>&1 || true
+# Mount established (Requires= orders navidrome after it); restart navidrome too
+# so a config change (e.g. the playlists mount) actually reaches the container.
+systemctl enable mcnf-navidrome.service >/dev/null 2>&1 || true
+systemctl restart mcnf-navidrome.service >/dev/null 2>&1 || true
 
 # MEDIA-6 — auto-provision the single shared service account. Navidrome 0.53's
 # ND_DEFAULTADMINPASSWORD does NOT auto-create the user (verified live 2026-06-27 —
