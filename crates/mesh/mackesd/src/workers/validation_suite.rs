@@ -98,6 +98,20 @@ impl ValidationSuiteWorker {
         self.role_marker_path.exists()
     }
 
+    /// LH-JOIN-QNM-1 — is it safe to write into the replicated share this tick?
+    /// `false` only when the workgroup root is the canonical mountpoint
+    /// (`/mnt/mesh-storage`) and it isn't a real FUSE mount (legacy LizardFS) /
+    /// a provisioned plain dir (post-SUBSTRATE-V2). Seeding `<root>/validation/`
+    /// into a bare canonical mountpoint fills it so LizardFS can never
+    /// `mfsmount` over it ("mountpoint is not empty") — one of the stray-write
+    /// races that wedged a fresh lighthouse join. Dev/test roots (tempdir,
+    /// `~/QNM-Shared`) are always writable, so the normal path is unaffected.
+    /// Mirrors the `ssh_pubkey_gossip` / `meshfs_worker` guard.
+    #[must_use]
+    fn share_writable(&self) -> bool {
+        crate::shared_root_writable(&self.workgroup_root)
+    }
+
     /// Probe every other participant of `run` and write this node's row.
     /// `at` is the report timestamp (Unix seconds).
     fn participate(&self, run: &ValidationRun, reach: &dyn Reachability, at: u64) {
@@ -172,6 +186,13 @@ impl ValidationSuiteWorker {
     /// One pass: participate in pending runs, then (leader) mint nightly /
     /// pick up Run-now and write verdicts. `now` is injected for tests.
     fn tick_with(&self, reach: &dyn Reachability, now: u64) {
+        // LH-JOIN-QNM-1: never touch the shared `validation/` dir until the
+        // workgroup root is a real mount — seeding it (rows, verdicts, the
+        // nightly stamp, a minted run) into the bare canonical mountpoint
+        // wedges a fresh lighthouse's mfsmount.
+        if !self.share_writable() {
+            return;
+        }
         for id in list_run_ids(&self.workgroup_root) {
             if let Some(run) = magic_fleet::validation::read_run(&self.workgroup_root, &id) {
                 if row_pending_for(&self.workgroup_root, &run, &self.hostname) {
@@ -252,13 +273,6 @@ impl Worker for ValidationSuiteWorker {
     }
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
-        // The Workbench Routing panel shells `mackesd validate run` as the
-        // uid-1000 desktop user, which drops `validation/runnow` here — but
-        // mackesd (root) owns the QNM-Shared mount, so a root-owned dir
-        // rejects that write ("Permission denied"). Pre-create the request
-        // dir sticky-world-writable (like /tmp) so the GUI can request a
-        // run; this worker (root) consumes + removes the marker.
-        ensure_request_dir(&self.workgroup_root.join("validation"));
         loop {
             let this = ValidationSuiteWorker {
                 workgroup_root: self.workgroup_root.clone(),
@@ -266,9 +280,28 @@ impl Worker for ValidationSuiteWorker {
                 hostname: self.hostname.clone(),
                 role_marker_path: self.role_marker_path.clone(),
             };
-            // transport_probe is blocking; keep the sweep off the scheduler.
-            let _ =
-                tokio::task::spawn_blocking(move || this.tick_with(&SystemReach, now_secs())).await;
+            // LH-JOIN-QNM-1: only touch the shared `validation/` dir once the
+            // workgroup root is a real mount. The request-dir create used to
+            // run ONCE, unconditionally, BEFORE this loop — so on a fresh
+            // lighthouse whose QNM-Shared mount hadn't come up yet it seeded
+            // `validation/` into the bare canonical mountpoint and helped wedge
+            // mfsmount. It's now inside the loop and guarded: a no-op while the
+            // mount is absent (retried harmlessly each tick), then it creates
+            // the request dir on the real share once it lands.
+            if this.share_writable() {
+                // The Workbench Routing panel shells `mackesd validate run` as
+                // the uid-1000 desktop user, which drops `validation/runnow`
+                // here — but mackesd (root) owns the QNM-Shared mount, so a
+                // root-owned dir rejects that write ("Permission denied").
+                // Pre-create the request dir sticky-world-writable (like /tmp)
+                // so the GUI can request a run; this worker (root) consumes +
+                // removes the marker.
+                ensure_request_dir(&this.workgroup_root.join("validation"));
+                // transport_probe is blocking; keep the sweep off the scheduler.
+                let _ =
+                    tokio::task::spawn_blocking(move || this.tick_with(&SystemReach, now_secs()))
+                        .await;
+            }
             tokio::select! {
                 _ = shutdown.wait() => return Ok(()),
                 () = tokio::time::sleep(POLL) => {}
@@ -412,5 +445,37 @@ mod tests {
         let w = worker(tmp.path(), "pine", &nomarker);
         w.tick_with(&MockReach { reachable: true }, 1000);
         assert!(list_run_ids(tmp.path()).is_empty(), "no leader, no mint");
+    }
+
+    #[test]
+    fn writes_gate_on_a_real_mount_for_the_canonical_root() {
+        // LH-JOIN-QNM-1 regression: on the canonical mountpoint the share is
+        // writable exactly when it's a real mount (legacy LizardFS, via
+        // /proc/mounts) — so on an unmounted fresh lighthouse the worker never
+        // seeds `<root>/validation/` into the bare mountpoint, leaving it empty
+        // so mfsmount succeeds on the first try instead of looping on
+        // "mountpoint is not empty". Mirrors ssh_pubkey_gossip's guard test.
+        let canon = worker(
+            Path::new(crate::CANONICAL_QNM_MOUNT),
+            "anvil",
+            Path::new("/nonexistent-role-marker"),
+        );
+        let mounted = std::fs::read_to_string("/proc/mounts")
+            .map(|c| {
+                c.lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(crate::CANONICAL_QNM_MOUNT))
+            })
+            .unwrap_or(false);
+        assert_eq!(canon.share_writable(), mounted);
+        // The guarded tick is a no-op on an unmounted canonical root — no mint,
+        // no write into the bare mountpoint, no panic.
+        if !mounted {
+            canon.tick_with(&MockReach { reachable: true }, 1_000);
+        }
+        // A dev/non-canonical (tempdir) root is always writable — the normal
+        // path and the other tests above are unaffected by the guard.
+        let tmp = tempfile::tempdir().unwrap();
+        let dev = worker(tmp.path(), "anvil", &tmp.path().join("role"));
+        assert!(dev.share_writable());
     }
 }
