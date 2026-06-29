@@ -397,7 +397,8 @@ impl GenesisPanel {
                     None => {
                         // OFF — no plan to render; clear any stale one.
                         self.backoffice_plan = None;
-                        self.status = "Backoffice OFF (genesis writes the founding Tofu only).".into();
+                        self.status =
+                            "Backoffice OFF (genesis writes the founding Tofu only).".into();
                         Task::none()
                     }
                     Some(t) => {
@@ -410,11 +411,9 @@ impl GenesisPanel {
                         let tier_for_task = t.clone();
                         Task::perform(
                             async move {
-                                tokio::task::spawn_blocking(move || {
-                                    plan_backoffice(&tier_for_task)
-                                })
-                                .await
-                                .unwrap_or_else(|_| Err("backoffice-plan task panicked".into()))
+                                tokio::task::spawn_blocking(move || plan_backoffice(&tier_for_task))
+                                    .await
+                                    .unwrap_or_else(|_| Err("backoffice-plan task panicked".into()))
                             },
                             |res| crate::Message::Genesis(Message::BackofficePlanFinished(res)),
                         )
@@ -654,8 +653,9 @@ impl GenesisPanel {
             variant_button(
                 "Continue →",
                 ButtonVariant::Primary,
-                (!self.busy)
-                    .then_some(crate::Message::Genesis(Message::ContinueToBackofficeClicked)),
+                (!self.busy).then_some(crate::Message::Genesis(
+                    Message::ContinueToBackofficeClicked
+                )),
                 palette,
             ),
         ]
@@ -693,8 +693,9 @@ impl GenesisPanel {
             variant_button(
                 label,
                 variant,
-                (!self.backoffice_busy)
-                    .then_some(crate::Message::Genesis(Message::BackofficeTierSelected(owned))),
+                (!self.backoffice_busy).then_some(crate::Message::Genesis(
+                    Message::BackofficeTierSelected(owned),
+                )),
                 palette,
             )
         };
@@ -720,9 +721,11 @@ impl GenesisPanel {
             } else {
                 status_badge("do-token MISSING", BadgeSeverity::Warning, palette)
             };
-            let units = plan.units.iter().enumerate().fold(
-                column![].spacing(6),
-                |col, (i, u)| {
+            let units = plan
+                .units
+                .iter()
+                .enumerate()
+                .fold(column![].spacing(6), |col, (i, u)| {
                     let gate = if u.live_gated {
                         status_badge("live-gated", BadgeSeverity::Warning, palette)
                     } else {
@@ -736,8 +739,7 @@ impl GenesisPanel {
                         .spacing(8)
                         .align_y(cosmic::iced::alignment::Vertical::Center),
                     )
-                },
-            );
+                });
             column![
                 row![
                     text("secret store:")
@@ -771,8 +773,7 @@ impl GenesisPanel {
             variant_button(
                 "← Back",
                 ButtonVariant::Ghost,
-                (!self.backoffice_busy)
-                    .then_some(crate::Message::Genesis(Message::BackClicked)),
+                (!self.backoffice_busy).then_some(crate::Message::Genesis(Message::BackClicked)),
                 palette,
             ),
             Space::new().width(Length::Fill),
@@ -1290,7 +1291,10 @@ mod tests {
         assert_eq!(p.step, Step::Name);
         assert!(p.mesh_id.is_empty());
         assert!(!p.written);
-        assert!(p.backoffice_tier.is_none(), "start-over clears the backoffice tier");
+        assert!(
+            p.backoffice_tier.is_none(),
+            "start-over clears the backoffice tier"
+        );
         assert!(p.backoffice_plan.is_none());
         assert_eq!(p.regions.len(), 1, "the loaded region roster is kept");
     }
@@ -1323,8 +1327,14 @@ mod tests {
         p.step = Step::Backoffice;
         let _ = p.update(Message::BackofficeTierSelected(Some("full".into())));
         assert_eq!(p.backoffice_tier.as_deref(), Some("full"));
-        assert!(p.backoffice_busy, "picking a tier fires the read-only probe");
-        assert!(p.backoffice_plan.is_none(), "the stale plan is cleared while probing");
+        assert!(
+            p.backoffice_busy,
+            "picking a tier fires the read-only probe"
+        );
+        assert!(
+            p.backoffice_plan.is_none(),
+            "the stale plan is cleared while probing"
+        );
     }
 
     #[test]

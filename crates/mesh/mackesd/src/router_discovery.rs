@@ -167,7 +167,9 @@ pub fn mac_for_ip(neigh_stdout: &str, ip: &str) -> Option<String> {
 #[must_use]
 pub fn oui_hint(vendor: &str) -> Option<String> {
     let v = vendor.to_ascii_lowercase();
-    for needle in ["ubiquiti", "mikrotik", "vyos", "cisco", "juniper", "fortinet"] {
+    for needle in [
+        "ubiquiti", "mikrotik", "vyos", "cisco", "juniper", "fortinet",
+    ] {
         if v.contains(needle) {
             return Some(needle.to_string());
         }
@@ -311,7 +313,10 @@ mod tests {
             ("ubnt".into(), "hunter2".into())
         );
         // bare password → default user ubnt
-        assert_eq!(parse_router_cred(" s3cret "), ("ubnt".into(), "s3cret".into()));
+        assert_eq!(
+            parse_router_cred(" s3cret "),
+            ("ubnt".into(), "s3cret".into())
+        );
         // password may contain ':'
         assert_eq!(
             parse_router_cred("vyos:a:b:c"),

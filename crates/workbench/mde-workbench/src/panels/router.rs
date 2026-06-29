@@ -361,7 +361,14 @@ impl RouterPanel {
         let seal_status: Element<'_, crate::Message> = match &self.seal_msg {
             Some((m, is_err)) => text(m.clone())
                 .size(TypeRole::Caption.size_in(sizes))
-                .colr((if *is_err { palette.danger } else { palette.success }).into_cosmic_color())
+                .colr(
+                    (if *is_err {
+                        palette.danger
+                    } else {
+                        palette.success
+                    })
+                    .into_cosmic_color(),
+                )
                 .into(),
             None => Space::new().into(),
         };
@@ -443,7 +450,11 @@ fn pill_style(color: Color) -> cosmic::iced::widget::button::Style {
 }
 
 /// One appliance card: vendor/status badge · ip · node · version/detail.
-fn row_view<'a>(r: &'a RouterRow, palette: Palette, sizes: FontSize) -> Element<'a, crate::Message> {
+fn row_view<'a>(
+    r: &'a RouterRow,
+    palette: Palette,
+    sizes: FontSize,
+) -> Element<'a, crate::Message> {
     let (badge_text, badge_kind) = badge(r);
     let badge_color = badge_color(badge_kind, palette);
     let bg = palette.raised.into_cosmic_color();
@@ -533,7 +544,8 @@ fn fetch_routers() -> Result<Vec<RouterRow>, String> {
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Ok(Vec::new());
     };
-    let mut by_id: std::collections::BTreeMap<String, RouterRow> = std::collections::BTreeMap::new();
+    let mut by_id: std::collections::BTreeMap<String, RouterRow> =
+        std::collections::BTreeMap::new();
     for ent in entries.flatten() {
         let path = ent.path().join("router-registry.json");
         let Ok(body) = std::fs::read_to_string(&path) else {
@@ -662,9 +674,21 @@ mod tests {
 
     #[test]
     fn badge_reflects_state() {
-        assert_eq!(badge(&row("a", false, true, "unknown")), ("needs creds".into(), BadgeKind::NeedsCreds));
-        assert_eq!(badge(&row("a", false, false, "unknown")), ("unmanaged".into(), BadgeKind::Unmanaged));
-        assert_eq!(badge(&row("a", true, false, "unknown")), ("unreachable".into(), BadgeKind::Unreachable));
-        assert_eq!(badge(&row("a", true, false, "edgeos")), ("edgeos".into(), BadgeKind::Vendor));
+        assert_eq!(
+            badge(&row("a", false, true, "unknown")),
+            ("needs creds".into(), BadgeKind::NeedsCreds)
+        );
+        assert_eq!(
+            badge(&row("a", false, false, "unknown")),
+            ("unmanaged".into(), BadgeKind::Unmanaged)
+        );
+        assert_eq!(
+            badge(&row("a", true, false, "unknown")),
+            ("unreachable".into(), BadgeKind::Unreachable)
+        );
+        assert_eq!(
+            badge(&row("a", true, false, "edgeos")),
+            ("edgeos".into(), BadgeKind::Vendor)
+        );
     }
 }

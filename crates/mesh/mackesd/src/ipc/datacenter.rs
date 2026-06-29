@@ -2026,7 +2026,10 @@ fn genesis_write_reply(svc: &DatacenterService, req_body: Option<&str>) -> Strin
     // → `backoffice_intent {tier}` in the reply; ABSENT/off → null (behavior
     // unchanged — genesis-write does NOT itself record intent or run the
     // orchestrator; that stays `mackesd found --with-backoffice` / the operator).
-    let backoffice_intent = match req.get("backoffice_tier").and_then(serde_json::Value::as_str) {
+    let backoffice_intent = match req
+        .get("backoffice_tier")
+        .and_then(serde_json::Value::as_str)
+    {
         Some(t) if backoffice_tier_valid(t).is_ok() => json!({ "tier": t }),
         _ => serde_json::Value::Null,
     };
@@ -2123,7 +2126,11 @@ fn backoffice_plan_reply(_svc: &DatacenterService, req_body: Option<&str>) -> St
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut plan: serde_json::Value = match serde_json::from_str(stdout.trim()) {
         Ok(v) => v,
-        Err(e) => return err(format!("backoffice-plan: planner output not decodable: {e}")),
+        Err(e) => {
+            return err(format!(
+                "backoffice-plan: planner output not decodable: {e}"
+            ))
+        }
     };
     // Re-stamp secrets_ready from the SAME Rust probe genesis-plan uses, so the two
     // wizard steps agree (and the boolean is the daemon's view, not the shell's).
@@ -2264,7 +2271,10 @@ mod tests {
         assert!(r.contains("error") && r.contains("bad json"), "{r}");
         // Invalid tier.
         let r = backoffice_plan_reply(&svc, Some(r#"{"tier":"bogus"}"#));
-        assert!(r.contains("error") && r.contains("invalid backoffice tier"), "{r}");
+        assert!(
+            r.contains("error") && r.contains("invalid backoffice tier"),
+            "{r}"
+        );
     }
 
     #[test]
@@ -2282,7 +2292,10 @@ mod tests {
             .expect("repo root");
         let script = repo.join("automation/backoffice/backoffice-plan.sh");
         if !script.is_file() {
-            eprintln!("skipping: {} not present in this checkout", script.display());
+            eprintln!(
+                "skipping: {} not present in this checkout",
+                script.display()
+            );
             return;
         }
         // Test-only env set under the serializing ENV_LOCK.
@@ -2294,8 +2307,8 @@ mod tests {
             // The verb's reply.
             let body = format!(r#"{{"tier":"{tier}"}}"#);
             let reply = backoffice_plan_reply(&svc, Some(&body));
-            let rpc: serde_json::Value =
-                serde_json::from_str(&reply).unwrap_or_else(|e| panic!("rpc json {tier}: {e}\n{reply}"));
+            let rpc: serde_json::Value = serde_json::from_str(&reply)
+                .unwrap_or_else(|e| panic!("rpc json {tier}: {e}\n{reply}"));
             assert_eq!(rpc["ok"], true, "rpc not ok for {tier}: {reply}");
             assert_eq!(rpc["tier"], tier, "rpc tier mismatch: {reply}");
 
@@ -2307,8 +2320,11 @@ mod tests {
                 .current_dir(&repo)
                 .output()
                 .expect("run backoffice-plan.sh");
-            assert!(out.status.success(), "script failed for {tier}: {}",
-                String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "script failed for {tier}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             let script_json: serde_json::Value =
                 serde_json::from_slice(&out.stdout).expect("script json");
 

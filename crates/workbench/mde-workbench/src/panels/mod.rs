@@ -4,11 +4,9 @@
 //! the parent app's `Message`, and a `view` builder over
 //! [`Element<'_, crate::Message>`].
 
+pub mod about;
 /// COMPUTE/SVC-VIEW — unified "All Services" panel (published + discovered + vm-internal).
 pub mod all_services;
-/// ROUTER-5 — per-node router/firewall (EdgeRouter/VyOS) read panel.
-pub mod router;
-pub mod about;
 pub mod audit;
 pub mod build_farm;
 pub mod compute;
@@ -70,6 +68,8 @@ pub mod registration;
 pub mod remote_desktop;
 pub mod repair;
 pub mod resources;
+/// ROUTER-5 — per-node router/firewall (EdgeRouter/VyOS) read panel.
+pub mod router;
 pub mod routing;
 pub mod run_history;
 pub mod service_publishing;

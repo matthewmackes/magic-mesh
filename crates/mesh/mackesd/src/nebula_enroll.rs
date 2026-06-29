@@ -816,7 +816,9 @@ pub fn sign_csr_into_bundle<B: crate::ca::NebulaCertBackend + ?Sized>(
     // this a concurrent sign on another lighthouse could pick an IP this one (or
     // a peer signed seconds ago) just assigned but hasn't heartbeated yet.
     if !etcd_eps.is_empty() {
-        directory_taken.extend(crate::substrate::peers::reserved_overlay_ips_blocking(&etcd_eps));
+        directory_taken.extend(crate::substrate::peers::reserved_overlay_ips_blocking(
+            &etcd_eps,
+        ));
     }
     let signed = crate::ca::sign::sign_peer_cert(
         backend,

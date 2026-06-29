@@ -9653,7 +9653,10 @@ mod found_backoffice_tests {
             Cmd::Found {
                 with_backoffice, ..
             } => with_backoffice,
-            other => panic!("expected Cmd::Found, got something else: {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected Cmd::Found, got something else: {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -9680,7 +9683,13 @@ mod found_backoffice_tests {
         );
         // The space form parses too.
         assert_eq!(
-            parse_found(&["mackesd", "found", "home-mesh", "--with-backoffice", "minimal"]),
+            parse_found(&[
+                "mackesd",
+                "found",
+                "home-mesh",
+                "--with-backoffice",
+                "minimal"
+            ]),
             Some("minimal".to_string())
         );
     }

@@ -466,7 +466,12 @@ mod tests {
         let conn = fresh_conn();
         let _tmp = mint_one(&conn);
         let global: std::collections::HashSet<String> = [
-            "10.42.0.1", "10.42.0.2", "10.42.0.3", "10.42.0.4", "10.42.0.5", "10.42.0.6",
+            "10.42.0.1",
+            "10.42.0.2",
+            "10.42.0.3",
+            "10.42.0.4",
+            "10.42.0.5",
+            "10.42.0.6",
         ]
         .iter()
         .map(|s| (*s).to_string())

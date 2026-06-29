@@ -321,7 +321,8 @@ mod tests {
         let e = build_entry_from("peer:eagle", &candidate(), None, |_, _, _| None);
         write_shared_entry(&tmp, "eagle", &e);
         let path = tmp.join("eagle").join(ROUTER_REGISTRY_FILE);
-        let back: RouterEntry = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let back: RouterEntry =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(back, e);
         assert!(!tmp.join("eagle").join("router-registry.json.tmp").exists());
         // empty hostname writes nothing

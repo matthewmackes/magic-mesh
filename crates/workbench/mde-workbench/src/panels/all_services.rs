@@ -174,8 +174,11 @@ impl AllServicesPanel {
             .colr(palette.text_muted.into_cosmic_color())
             .into()
         } else {
-            let blocks: Vec<Element<'_, crate::Message>> =
-                self.rows.iter().map(|r| row_view(r, palette, sizes)).collect();
+            let blocks: Vec<Element<'_, crate::Message>> = self
+                .rows
+                .iter()
+                .map(|r| row_view(r, palette, sizes))
+                .collect();
             scrollable(column(blocks).spacing(6)).into()
         };
 
@@ -517,6 +520,9 @@ mod tests {
         // The workgroup root and bus spool almost certainly don't exist in the
         // build environment; the contract is "never panics, returns Ok(empty)".
         let result = fetch_all();
-        assert!(result.is_ok(), "fetch_all must not return Err on a bare host");
+        assert!(
+            result.is_ok(),
+            "fetch_all must not return Err on a bare host"
+        );
     }
 }

@@ -611,7 +611,14 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let nodes = parse_nodes(raw, &rtt, &paths, &no_flows(), "self", &["10.42.0.1".to_string()]);
+        let nodes = parse_nodes(
+            raw,
+            &rtt,
+            &paths,
+            &no_flows(),
+            "self",
+            &["10.42.0.1".to_string()],
+        );
         let by = |h: &str| nodes.iter().find(|n| n.hostname == h).unwrap();
         assert_eq!(
             by("forge").relay_via.as_deref(),

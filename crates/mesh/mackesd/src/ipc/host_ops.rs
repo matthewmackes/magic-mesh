@@ -1610,7 +1610,7 @@ mod tests {
         assert!(!valid_mac("46:6a:7c:96:e8")); // too short
         assert!(!valid_mac("zz:6a:7c:96:e8:aa")); // non-hex
         assert!(!valid_mac("46:6a:7c:96:e8:aa; rm -rf /")); // injection attempt
-        // handler rejects bad input BEFORE shelling mcnf-secret.sh
+                                                            // handler rejects bad input BEFORE shelling mcnf-secret.sh
         assert!(router_seal_cred(None).is_err());
         assert!(router_seal_cred(Some("{bad json")).is_err());
         assert!(router_seal_cred(Some(r#"{"mac":"nothex","cred":"u:p"}"#)).is_err());
