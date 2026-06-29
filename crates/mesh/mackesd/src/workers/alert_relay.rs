@@ -224,7 +224,7 @@ impl AlertRelayWorker {
         }
         // OBS-8 — primary path: publish on the `fdo/*` Bus topic so the
         // cosmic-applet renders it through the FDO Notifications path
-        // (the same bridge `ipc::bus_bridge` rides). Only when the Bus
+        // (the same FDO→mde-bus bridge path). Only when the Bus
         // path is unavailable (no `mde-bus`, e.g. a pre-RPM dev box) do
         // we fall back to a direct `notify-send`.
         if !self.bus_binary.is_empty() {
@@ -329,7 +329,7 @@ pub fn notify_send_argv(binary: &str, event: &AlertEventPartial) -> Vec<String> 
 
 /// OBS-8 — build the `mde-bus publish` argv that delivers an alert
 /// through the cosmic-applet FDO Notifications path. Publishes on the
-/// `fdo/MCNF Alerts` topic (the bridge `ipc::bus_bridge` renders),
+/// `fdo/MCNF Alerts` topic (rendered via the FDO Notifications bridge),
 /// mapping severity → the Bus priority and `[host] alert` → the title.
 /// `--no-broker` lets the publish persist + reach even pre-enrollment.
 /// Pure so the argv shape is unit-tested without shelling.

@@ -303,7 +303,7 @@ fn local_hostname() -> String {
 }
 
 /// Broadcast one clip on the bus (best-effort, fire-and-forget shell-out —
-/// same `mde-bus publish` bridge shape as `ipc::bus_bridge`). The durable
+/// same `mde-bus publish` bridge shape). The durable
 /// record is the history file; the bus event is the real-time nudge.
 fn publish_clip(entry: &ClipEntry) {
     let body = serde_json::json!({

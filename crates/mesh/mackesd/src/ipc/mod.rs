@@ -6,8 +6,6 @@
 //! E11 pivot Cosmic owns `org.freedesktop.Notifications`).
 //!
 //! What lives here now:
-//! - `bus_bridge` — bridges FDO `Notify` calls into `mde-bus
-//!   publish` (client side; BUS-4.4).
 //! - `directory` / `fleet` / `jobs` / `files` / `nebula` /
 //!   `shell` / `settings` — Bus responder + record-shape modules
 //!   consumed by `run_serve` and the workers.
@@ -27,7 +25,6 @@
 // launcher (docs/design/apps-launcher.md). Thin applet; this worker is the
 // single source of truth (local XDG+flatpak, mesh peers, workloads, services).
 pub mod apps;
-pub mod bus_bridge;
 // CLIP-SYNC-1 — action/clipboard/* responder (list/pin/unpin/delete/clear)
 // for the mesh-global clipboard history the clipboard_sync worker maintains.
 pub mod clipboard;
