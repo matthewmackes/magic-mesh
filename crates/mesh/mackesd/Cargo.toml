@@ -416,6 +416,9 @@ assets = [
     # MEDIA-pkg — ship the Lighthouse_Media bring-up script so the add-Media flow
     # installs it (was scp'd by hand). It self-installs rclone/podman/fuse3 at run.
     { source = "install-helpers/setup-media-navidrome.sh", dest = "/usr/libexec/mackesd/setup-media-navidrome", mode = "755" },
+    # MEDIA-9 — the music upload/rescan helper (was repo/leader-host-only). Ships so
+    # `mcnf-music-ingest upload <path>` / `rescan` run on any fleet node.
+    { source = "install-helpers/mcnf-music-ingest.sh",     dest = "/usr/libexec/mackesd/mcnf-music-ingest",   mode = "755" },
     # SUBSTRATE-14 — the etcd+Syncthing cutover entry point (operator runs it on
     # the VM bed to rehearse, then per fleet node at the 11.0 roll).
     { source = "install-helpers/cutover-substrate-v2.sh", dest = "/usr/libexec/mackesd/cutover-substrate-v2",    mode = "755" },
@@ -766,6 +769,9 @@ assets = [
     # MEDIA-pkg — ship the Lighthouse_Media bring-up script so the add-Media flow
     # installs it (was scp'd by hand). It self-installs rclone/podman/fuse3 at run.
     { source = "install-helpers/setup-media-navidrome.sh", dest = "/usr/libexec/mackesd/setup-media-navidrome", mode = "755" },
+    # MEDIA-9 — the music upload/rescan helper (was repo/leader-host-only). Ships so
+    # `mcnf-music-ingest upload <path>` / `rescan` run on any fleet node.
+    { source = "install-helpers/mcnf-music-ingest.sh",     dest = "/usr/libexec/mackesd/mcnf-music-ingest",   mode = "755" },
     { source = "install-helpers/cutover-substrate-v2.sh", dest = "/usr/libexec/mackesd/cutover-substrate-v2",    mode = "755" },
     { source = "install-helpers/verify-boot-recovery.sh", dest = "/usr/libexec/mackesd/verify-boot-recovery",   mode = "755" },
     # SETUP-fix — the shared bus spool (tmpfiles + environment.d).
