@@ -1,6 +1,6 @@
-# The farm spans THREE standalone XCP-ng pools; the xenserver provider is
+# The farm spans FOUR standalone XCP-ng pools; the xenserver provider is
 # single-pool, so one aliased provider per dom0 XAPI endpoint. Same root password
-# (TF_VAR_xapi_password from /root/.mcnf-xapi-cred, 0600, off-repo) on all three.
+# (TF_VAR_xapi_password from /root/.mcnf-xapi-cred, 0600, off-repo) on all four.
 provider "xenserver" {
   alias    = "xhs" # XEN-HOME-SERVICES
   host     = "https://172.20.0.9"
@@ -16,6 +16,12 @@ provider "xenserver" {
 provider "xenserver" {
   alias    = "big" # XEN-BIGBOY
   host     = "https://172.20.145.165"
+  username = var.xapi_username
+  password = var.xapi_password
+}
+provider "xenserver" {
+  alias    = "x194" # XEN-194 (4c / 15 GiB, added 2026-06-29)
+  host     = "https://172.20.145.194"
   username = var.xapi_username
   password = var.xapi_password
 }

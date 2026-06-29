@@ -60,6 +60,15 @@ locals {
       big_vcpus      = 10 # ~whole 12-core BigBoy, 2 cores for dom0
       big_mem_gib    = 26
     }
+    "xen-194" = {
+      provider_alias = "x194"
+      network_uuid   = "1d940eba-09fb-71e9-e6e5-a7ab5f7259ce" # eth0 (172.20.145.194)
+      ip_base        = "172.20.0.170"                         # lane .170–.200
+      big_name       = "mcnf-build-big-53"
+      small_name     = "mcnf-build-53"
+      big_vcpus      = 3 # ~whole 4-core host, 1 core for dom0
+      big_mem_gib    = 11
+    }
   }
 
   # Split each dom0's ip_base into the first-3-octets prefix + the last octet, so
@@ -97,6 +106,17 @@ locals {
       ip_cidr  = "172.20.0.130/16"
       vcpus    = 4
       mem_gib  = 24
+    }
+    # XEN-194 (added 2026-06-29): a live VM provisioned via xe (4 vCPU / 11 GiB @
+    # .170). NOT yet in tofu state — adopt at deploy with
+    # `tofu import xenserver_vm.build_x194["xen-194-0"] <uuid>` (no moved{} block:
+    # it's net-new to tofu, not a renamed resource).
+    "xen-194-0" = {
+      dom0_key = "xen-194"
+      name     = "mcnf-build-53"
+      ip_cidr  = "172.20.0.170/16"
+      vcpus    = 4
+      mem_gib  = 11
     }
   }
 
@@ -152,9 +172,10 @@ locals {
 
   # Partition the flat spec map by dom0 provider alias — one subset per aliased
   # provider, because `provider` can't vary per for_each instance (see header).
-  build_vms_xhs = { for k, v in local.active_build_vms : k => v if v.dom0_key == "xen-home-services" }
-  build_vms_kvm = { for k, v in local.active_build_vms : k => v if v.dom0_key == "kvm-xcp1" }
-  build_vms_big = { for k, v in local.active_build_vms : k => v if v.dom0_key == "xen-bigboy" }
+  build_vms_xhs  = { for k, v in local.active_build_vms : k => v if v.dom0_key == "xen-home-services" }
+  build_vms_kvm  = { for k, v in local.active_build_vms : k => v if v.dom0_key == "kvm-xcp1" }
+  build_vms_big  = { for k, v in local.active_build_vms : k => v if v.dom0_key == "xen-bigboy" }
+  build_vms_x194 = { for k, v in local.active_build_vms : k => v if v.dom0_key == "xen-194" }
 }
 
 # --- One for_each resource per pool/provider-alias --------------------------
@@ -199,6 +220,20 @@ resource "xenserver_vm" "build_big" {
   vcpus             = each.value.vcpus
   check_ip_timeout  = 0
   network_interface = [{ device = "0", network_uuid = local.dom0["xen-bigboy"].network_uuid }]
+  lifecycle {
+    ignore_changes = [hard_drive, template_name, boot_mode, boot_order, cores_per_socket, dynamic_mem_max, dynamic_mem_min, static_mem_min, name_description, cdrom]
+  }
+}
+
+resource "xenserver_vm" "build_x194" {
+  for_each          = local.build_vms_x194
+  provider          = xenserver.x194 # XEN-194
+  name_label        = each.value.name
+  template_name     = var.golden_template_name
+  static_mem_max    = each.value.mem_gib * 1073741824
+  vcpus             = each.value.vcpus
+  check_ip_timeout  = 0
+  network_interface = [{ device = "0", network_uuid = local.dom0["xen-194"].network_uuid }]
   lifecycle {
     ignore_changes = [hard_drive, template_name, boot_mode, boot_order, cores_per_socket, dynamic_mem_max, dynamic_mem_min, static_mem_min, name_description, cdrom]
   }
