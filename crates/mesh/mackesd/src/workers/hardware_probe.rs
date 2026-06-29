@@ -162,6 +162,15 @@ pub fn probe_path(workgroup_root: &Path, node_id: &str) -> PathBuf {
 
 /// Gather + write this node's probe into the replicated directory.
 fn publish(workgroup_root: &Path, node_id: &str) {
+    // LH-JOIN-QNM-1: never seed `<root>/peer:<host>/mackesd/…` into the bare
+    // canonical mountpoint before QNM-Shared mounts — that helps wedge a fresh
+    // lighthouse's mfsmount ("mountpoint is not empty"). An unmounted-local
+    // probe is invisible mesh-wide anyway, so skip until the share is real
+    // (retried next tick). Mirrors the ssh_pubkey_gossip / validation_suite
+    // guard.
+    if !crate::shared_root_writable(workgroup_root) {
+        return;
+    }
     let probe = gather(node_id);
     let path = probe_path(workgroup_root, node_id);
     if let Some(parent) = path.parent() {
@@ -262,5 +271,32 @@ mod tests {
         let json = serde_json::to_string(&probe).expect("serialize");
         let back: PeerProbe = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.peer_id, "peer:test-node");
+    }
+
+    #[test]
+    fn publish_gates_on_a_real_mount_for_the_canonical_root() {
+        // LH-JOIN-QNM-1: a tempdir root is writable → the probe lands; the
+        // canonical mountpoint that isn't a real mount is NOT writable → the
+        // publish is a no-op so the bare mountpoint stays empty (mfsmount can
+        // then mount over it on the first try). Mirrors ssh_pubkey_gossip's
+        // guard test.
+        let tmp = tempfile::tempdir().unwrap();
+        publish(tmp.path(), "peer:anvil");
+        assert!(
+            probe_path(tmp.path(), "peer:anvil").exists(),
+            "a tempdir (non-canonical) root is writable → the probe is published"
+        );
+
+        let mounted = std::fs::read_to_string("/proc/mounts")
+            .map(|c| {
+                c.lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(crate::CANONICAL_QNM_MOUNT))
+            })
+            .unwrap_or(false);
+        assert_eq!(
+            crate::shared_root_writable(Path::new(crate::CANONICAL_QNM_MOUNT)),
+            mounted,
+            "canonical root is writable exactly when it's a real mount"
+        );
     }
 }

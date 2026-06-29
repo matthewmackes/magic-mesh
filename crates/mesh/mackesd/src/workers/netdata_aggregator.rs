@@ -274,6 +274,14 @@ impl NetdataAggregator {
     }
 
     fn publish_self_pointer(&mut self) -> Result<(), String> {
+        // LH-JOIN-QNM-1: skip the shared-dir self-pointer until the workgroup
+        // root is a real mount — never seed `<root>/peer:<host>/mackesd/…` into
+        // the bare canonical mountpoint (helps wedge a fresh lighthouse's
+        // mfsmount "mountpoint is not empty"). Retried next tick once mounted.
+        // Mirrors the ssh_pubkey_gossip / validation_suite guard.
+        if !crate::shared_root_writable(&self.workgroup_root) {
+            return Ok(());
+        }
         let overlay = read_overlay_ip(&self.overlay_ip_source)?;
         let epoch_s = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -645,6 +653,38 @@ mod tests {
         write_pointer(&p, &pointer).expect("write");
         let scanned = scan_aggregator_pointers(tmp.path());
         assert_eq!(scanned, vec![pointer]);
+    }
+
+    #[test]
+    fn publish_self_pointer_skips_unmounted_canonical_root() {
+        // LH-JOIN-QNM-1: rooted at the canonical mountpoint that isn't a real
+        // mount, the self-pointer write is a clean no-op (`Ok`) — the guard
+        // fires before the overlay read + the `<root>/peer:<host>/…` write, so
+        // the bare mountpoint is never seeded (mfsmount can mount over it on
+        // the first try). Mirrors the validation_suite / gossip guard tests.
+        let mounted = std::fs::read_to_string("/proc/mounts")
+            .map(|c| {
+                c.lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(crate::CANONICAL_QNM_MOUNT))
+            })
+            .unwrap_or(false);
+        if mounted {
+            return; // the rare build host that actually has QNM-Shared mounted
+        }
+        let mut w = NetdataAggregator::new(
+            std::sync::Arc::new(tokio::sync::Mutex::new(
+                rusqlite::Connection::open_in_memory().expect("in-mem db"),
+            )),
+            "peer:test".into(),
+            std::path::PathBuf::from(crate::CANONICAL_QNM_MOUNT),
+            "k".into(),
+        );
+        assert_eq!(w.publish_self_pointer(), Ok(()));
+        assert!(!self_pointer_path(
+            std::path::Path::new(crate::CANONICAL_QNM_MOUNT),
+            "peer:test"
+        )
+        .exists());
     }
 
     #[test]
