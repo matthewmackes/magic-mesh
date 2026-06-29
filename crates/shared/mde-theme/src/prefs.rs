@@ -97,6 +97,13 @@ impl MotionPrefs {
             return m; // already capped + de-looped
         }
         let scale = self.speed_scale.clamp(0.1, 10.0);
+        // At unit scale, return the motion EXACTLY — the `as_secs_f32`/`from_secs_f32`
+        // round-trip is lossy (150 ms → 0.15f32 → 150.000006 ms), which would make a
+        // "no scaling" path silently perturb every essential duration. Only pay that
+        // imprecision when the operator actually scaled speed.
+        if (scale - 1.0).abs() <= f32::EPSILON {
+            return m;
+        }
         Motion {
             duration: std::time::Duration::from_secs_f32(m.duration.as_secs_f32() / scale),
             ..m
