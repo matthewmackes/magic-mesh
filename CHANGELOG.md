@@ -13,6 +13,26 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [11.2.0] — 2026-06-29
+Reconciliation release: the divergent `master` (pre-SUBSTRATE-V2) and the
+fleet-proven `farm-autoscale-plan` lines were unified onto one validated trunk
+(base-on-canonical + graft of master-unique deltas; LizardFS-era reimplementations
+dropped). See `docs/POSTMORTEM-line-divergence.md` + `docs/RECONCILE-PLAN.md`.
+### Added
+- **XEN-194 grafted onto the `for_each` XAPI farm model** — fourth build dom0
+  (`mcnf-build-53` @ .170) as a net-new `build_x194` pool + `x194` provider alias;
+  surfaced in the `build_farm` output.
+- **ABOUT-OSS acknowledgements** page (10 OSS projects) + NotifyCenter autostart.
+- **MEDIA-9** — `mcnf-music-ingest.sh` (`upload`/`rescan`) now packaged in the RPM
+  (`/usr/libexec/mackesd/mcnf-music-ingest`), so any fleet node can ingest music.
+### Fixed
+- **MEDIA-7** — `mackesd leave` now de-registers from the media plane
+  (`<host>/media-registry.json`), so a torn-down Lighthouse_Media node leaves no
+  stale "up" registry row.
+### Removed
+- Dead `ipc::bus_bridge` module (zero callers since the FDO Notifications server was
+  retired to Cosmic, 2026-06-13).
+
 ## [11.1.0] — 2026-06-28
 A large feature wave: the desktop launcher + mesh-map surfaces, the New-Mesh
 genesis wizard, and the reproducible **DevOps backoffice** (DEVOPS-AUTOMATION-REBUILD).
