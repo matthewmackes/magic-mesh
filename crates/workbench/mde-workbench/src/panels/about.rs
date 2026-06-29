@@ -412,23 +412,14 @@ fn oss_entry<'a>(
         .size(TypeRole::Body.size_in(sizes))
         .colr(palette.text.into_cosmic_color());
 
-    let body = column![
-        name,
-        author,
-        Space::new().height(Length::Fixed(4.0)),
-        blurb,
-    ]
-    .spacing(1)
-    .width(Length::Fill);
+    let body = column![name, author, Space::new().height(Length::Fixed(4.0)), blurb,]
+        .spacing(1)
+        .width(Length::Fill);
 
-    row![
-        tile,
-        Space::new().width(Length::Fixed(16.0)),
-        body,
-    ]
-    .align_y(cosmic::iced::alignment::Vertical::Top)
-    .width(Length::Fill)
-    .into()
+    row![tile, Space::new().width(Length::Fixed(16.0)), body,]
+        .align_y(cosmic::iced::alignment::Vertical::Top)
+        .width(Length::Fill)
+        .into()
 }
 
 /// The vendored monochrome SVG brand mark for `name`, or `None` for the three
@@ -569,7 +560,11 @@ mod tests {
         // monogram for its tile, and a non-empty thank-you blurb.
         for p in &OSS_PROJECTS {
             assert!(!p.name.trim().is_empty(), "name present");
-            assert!(!p.author.trim().is_empty(), "{}: maintainer present", p.name);
+            assert!(
+                !p.author.trim().is_empty(),
+                "{}: maintainer present",
+                p.name
+            );
             assert!(
                 p.url.starts_with("https://"),
                 "{}: url must be an https link, got {:?}",
@@ -614,7 +609,9 @@ mod tests {
         }
         // libcosmic / COSMIC is named as the desktop substrate.
         assert!(
-            names.iter().any(|n| n.contains("cosmic") || n.contains("COSMIC")),
+            names
+                .iter()
+                .any(|n| n.contains("cosmic") || n.contains("COSMIC")),
             "missing libcosmic / COSMIC"
         );
         // The section prose leads with gratitude and closes on the wider community.
