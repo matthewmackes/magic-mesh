@@ -48,6 +48,26 @@ real nodes. With your "approved" + "you own all sessions", I can execute most of
 these in the deploy pass **once you confirm the target hosts** (the auto-mode
 classifier gates prod SSH until targets are named). Listed so nothing is silent.
 
+### B0. Deploy-readiness — the session's PR line is fully validated; publish/deploy is your call *(2026-06-29)*
+The 68-commit branch (`worktree-bright-elm-ajw0` — the LH-JOIN-QNM-1 source-side
+guard sweep + the DATACENTER-16 wake-progress driver + the env-race test fix +
+NOTIFY-5/dead-chain reconciliations) is validated end-to-end on the farm:
+**build (debug+release) · `cargo test --workspace` 5172/0 · `clippy --all-targets`
+clean · RPM cut (`magic-mesh-11.0.8-1.x86_64.rpm`) · hermetic install on a clean
+`fedora:43`** (dnf deps resolve, all binaries land + dynamically link
+`missing-libs=0`, `mackesd --help` runs, `rpm -V` clean). **Operator-gated:**
+merging the branch + the RPM publish/deploy (`/release`).
+- **Live-VM L1/systemd + LH-JOIN-QNM mount verify** is *runnable on your go* but
+  needs the off-dom0 path: `automation/testbed/farm-testbed.sh` needs
+  `genisoimage` **and** `xe` co-located, but the dom0 (`.9`) lacks `genisoimage`
+  (installing it on the XCP dom0 risks hypervisor stability — **don't**), while
+  the dev host has `genisoimage` but no `xe`. Clean fix: run the testbed from the
+  dev host with an `xe`→`ssh root@<dom0> xe` shim (seed-ISO built locally, only
+  `xe` ops cross to the dom0 — no dom0 package change). Testbed IP range
+  `172.20.0.60–.69` is collision-free vs the build farm; teardown is
+  `mcnf-test-*`-scoped. **Unblock:** say go and I'll run it via the shim (or I
+  hold, since it spins VMs on a production dom0).
+
 - **BOOT-REC-4** (830) — power-cycle each role (Lighthouse/Server/Workstation),
   run `install-helpers/verify-boot-recovery.sh`, record green. Release gate.
 - **MUSIC-BROWSE/ART** (849) — reopen `mde-music` on `.13` (daemon up); confirm
