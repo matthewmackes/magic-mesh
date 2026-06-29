@@ -294,6 +294,20 @@ pub fn write_links(
     node_id: &str,
     samples: &[LinkSample],
 ) -> std::io::Result<PathBuf> {
+    // ONBOARD-6 / LH-JOIN-QNM-1 guard: never write into the canonical QNM mount
+    // when it isn't actually mounted — that poisons the mountpoint so LizardFS
+    // can't remount. The sibling `write_heartbeat` already guards; this writer
+    // (called by the same heartbeat worker) was missing it, so `links.json`
+    // could still seed the bare mountpoint.
+    if !crate::shared_root_writable(workgroup_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "QNM-Shared mount {} is down — skipping link-sample write (would poison the mountpoint)",
+                workgroup_root.display()
+            ),
+        ));
+    }
     let path = links_path(workgroup_root, node_id);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -369,6 +383,48 @@ mod tests {
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].rtt_ms, Some(12));
         assert!(back[1].rtt_ms.is_none());
+    }
+
+    #[test]
+    fn per_node_writes_gate_on_a_real_mount_for_the_canonical_root() {
+        // LH-JOIN-QNM-1 / ONBOARD-6: on the canonical mountpoint that isn't a
+        // real mount, BOTH heartbeat-worker writers must refuse (Err) so the
+        // bare mountpoint stays empty and LizardFS can mfsmount over it on the
+        // first try. write_heartbeat was already guarded; write_links was not.
+        let mounted = std::fs::read_to_string("/proc/mounts")
+            .map(|c| {
+                c.lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(crate::CANONICAL_QNM_MOUNT))
+            })
+            .unwrap_or(false);
+        if mounted {
+            return; // the rare host that actually has QNM-Shared mounted
+        }
+        let canon = Path::new(crate::CANONICAL_QNM_MOUNT);
+        let hb = Heartbeat {
+            node_id: "peer:a".into(),
+            at_ms: 1,
+            agent_version: "1.1.0".into(),
+            applied_revision: None,
+            health: HealthState::Healthy,
+        };
+        assert!(
+            write_heartbeat(canon, &hb).is_err(),
+            "write_heartbeat must refuse the unmounted canonical root"
+        );
+        let samples = vec![LinkSample {
+            from_id: "peer:a".into(),
+            to_id: "peer:b".into(),
+            rtt_ms: Some(1),
+            loss: None,
+            throughput_mbps: None,
+            at_ms: 1,
+        }];
+        assert!(
+            write_links(canon, "peer:a", &samples).is_err(),
+            "write_links must refuse the unmounted canonical root (was the gap)"
+        );
+        assert_eq!(crate::shared_root_writable(canon), mounted);
     }
 
     #[test]
