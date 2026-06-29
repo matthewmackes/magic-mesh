@@ -216,6 +216,79 @@ pub fn fetch_health() -> Option<HealthSummary> {
     )?)
 }
 
+// ---- HA-5 — the published coordination-plane status (mesh/ha/status) -------
+
+/// Retained Bus data lane the `ha_monitor` worker publishes the coordination-
+/// plane snapshot to (`crates/mesh/mackesd/src/workers/ha_monitor.rs`,
+/// [`HaStatusDoc`]). This is the authoritative *published* view the Mesh Control
+/// panel consumes — distinct from the live healthz RPC: it's what the worker
+/// observed + alerted on, so the panel can show the same member/quorum/leader
+/// state the Alert Center fires against.
+const HA_STATUS_TOPIC: &str = "mesh/ha/status";
+
+/// HA-5 — the worker-published coordination-plane status the Mesh Control panel
+/// consumes off [`HA_STATUS_TOPIC`]. Shape mirrors the daemon's `HaStatusDoc`
+/// (member count + quorum-OK + leader), parsed by convention (no cross-crate
+/// dep, exactly like [`HealthSummary`] ↔ the daemon's `HealthReport`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HaStatus {
+    /// etcd-quorum member count (the lighthouse roster).
+    pub member_count: u32,
+    /// Whether a leader is elected (etcd quorum healthy).
+    pub quorum_ok: bool,
+    /// Current leader's bare hostname, or `None` when no leader is elected.
+    pub leader: Option<String>,
+}
+
+/// Parse a `mesh/ha/status` message body (the worker's `HaStatusDoc` JSON) into
+/// an [`HaStatus`]. `None` when the body is unparseable or carries none of the
+/// expected fields (so an unrelated message can't decode to a zeroed status).
+/// Pure + testable.
+#[must_use]
+pub fn parse_ha_status(body: &str) -> Option<HaStatus> {
+    let v: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    if v.get("quorum_ok").is_none() && v.get("member_count").is_none() {
+        return None;
+    }
+    Some(HaStatus {
+        member_count: v
+            .get("member_count")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0),
+        quorum_ok: v
+            .get("quorum_ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        leader: v
+            .get("leader")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
+}
+
+/// Fetch the latest worker-published HA status off the Bus. Reads the most
+/// recent message on [`HA_STATUS_TOPIC`] (the `ha_monitor` publishes on change
+/// at `high` priority, so the current-state row persists). `None` on no Bus
+/// data-dir / persist error / an empty topic (the panel falls back to the live
+/// healthz RPC — honest degradation). Blocking — same contract as
+/// [`fetch_peers`]: call from `tokio::task::spawn_blocking`.
+#[must_use]
+pub fn fetch_ha_status() -> Option<HaStatus> {
+    let bus_dir = mde_bus::client_data_dir()?;
+    let persist = mde_bus::persist::Persist::open(bus_dir).ok()?;
+    // The published topic is small (published on change); read it and take the
+    // most recent message — the established "latest on a topic" read shape
+    // (`crate::dbus::action_request_reply_on`).
+    let latest = persist
+        .list_since(HA_STATUS_TOPIC, None)
+        .ok()?
+        .into_iter()
+        .next_back()?;
+    parse_ha_status(latest.body.as_deref()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +401,34 @@ mod tests {
         assert_eq!(h.node_count, 1);
         assert_eq!(h.lighthouse_count, 0);
         assert!(!h.ha_ok);
+    }
+
+    // ---- HA-5 published-status decode (mesh/ha/status) --------
+
+    #[test]
+    fn parse_ha_status_decodes_the_worker_doc() {
+        // The exact HaStatusDoc JSON the ha_monitor publishes.
+        let body =
+            r#"{"member_count":3,"quorum_ok":true,"leader":"kiln","ts_unix_ms":1750000000000}"#;
+        let s = parse_ha_status(body).expect("decoded");
+        assert_eq!(s.member_count, 3);
+        assert!(s.quorum_ok);
+        assert_eq!(s.leader.as_deref(), Some("kiln"));
+    }
+
+    #[test]
+    fn parse_ha_status_handles_no_leader_and_null() {
+        let body = r#"{"member_count":3,"quorum_ok":false,"leader":null,"ts_unix_ms":1}"#;
+        let s = parse_ha_status(body).expect("decoded");
+        assert_eq!(s.member_count, 3);
+        assert!(!s.quorum_ok);
+        assert_eq!(s.leader, None);
+    }
+
+    #[test]
+    fn parse_ha_status_rejects_garbage_and_unrelated_json() {
+        assert!(parse_ha_status("not json").is_none());
+        // An unrelated object with none of the expected fields is not a status.
+        assert!(parse_ha_status(r#"{"ok":true,"leader":"x"}"#).is_none());
     }
 }

@@ -119,6 +119,45 @@ impl LoopingTween {
         Self { start, period }
     }
 
+    /// MOTION-A11Y-3 — a flash-safe looping constructor for pulses/blinks/
+    /// shimmer. The requested `period` is **clamped up** to
+    /// [`crate::motion::MIN_PULSE_PERIOD_MS`] so the loop can never flash faster
+    /// than [`crate::motion::MAX_PULSE_HZ`] (the WCAG 2.3.1 3 Hz seizure
+    /// threshold), regardless of the caller. Use this — not
+    /// [`LoopingTween::starting_at`] — for any *visual flash* loop; the plain
+    /// constructor stays for non-flashing continuous timelines (e.g. a slow beacon
+    /// sweep) where the cap doesn't apply.
+    ///
+    /// ```
+    /// use std::time::{Duration, Instant};
+    /// use mde_theme::animation::LoopingTween;
+    /// use mde_theme::motion::MAX_PULSE_HZ;
+    /// // A 50 ms (20 Hz) request is clamped up to the ≤3 Hz floor.
+    /// let p = LoopingTween::pulse(Instant::now(), Duration::from_millis(50));
+    /// assert!(p.hz() <= MAX_PULSE_HZ + 1e-3);
+    /// ```
+    #[must_use]
+    pub fn pulse(start: Instant, period: Duration) -> Self {
+        let floor = Duration::from_millis(crate::motion::MIN_PULSE_PERIOD_MS);
+        Self {
+            start,
+            period: period.max(floor),
+        }
+    }
+
+    /// MOTION-A11Y-3 — this loop's flash frequency in Hz (one full cycle = one
+    /// flash). `0.0` for a degenerate zero period. Lets a test/assertion verify a
+    /// loop respects [`crate::motion::MAX_PULSE_HZ`].
+    #[must_use]
+    pub fn hz(self) -> f32 {
+        let secs = self.period.as_secs_f32();
+        if secs <= f32::EPSILON {
+            0.0
+        } else {
+            1.0 / secs
+        }
+    }
+
     /// Fractional phase 0.0 → 1.0 within the current cycle.
     #[must_use]
     pub fn phase(self, now: Instant) -> f32 {
@@ -236,6 +275,19 @@ pub enum Transition {
 
 /// MOTION-INFRA-2 — the render parameters a [`Transition`] yields at a given
 /// progress. Consumers apply what's relevant (most use one or two fields).
+///
+/// ## MOTION-PERF-2 — the transform/opacity-only invariant
+///
+/// `RenderParams` carries **exactly** opacity ([`alpha`](RenderParams::alpha)) and
+/// transform ([`translate_y`](RenderParams::translate_y),
+/// [`scale`](RenderParams::scale)) — and *structurally no width/height/layout
+/// field*. That is the whole MOTION-PERF-2 guard: an animation expressed through
+/// this struct can only ever drive compositor-cheap properties, so it can never
+/// trigger a per-frame relayout. A consumer **must** map these onto
+/// transform-equivalents (a padding *offset* for `translate_y`, a render `scale`)
+/// and **must not** re-measure or resize the widget per frame from them. The
+/// [`is_compositor_safe`](RenderParams::is_compositor_safe) predicate is the
+/// runtime backstop a consumer can `debug_assert` before applying a frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderParams {
     /// Opacity multiplier `0.0..=1.0`.
@@ -244,6 +296,29 @@ pub struct RenderParams {
     pub translate_y: f32,
     /// Scale multiplier (1.0 = natural size).
     pub scale: f32,
+}
+
+impl RenderParams {
+    /// MOTION-PERF-2 — the runtime guard for the transform/opacity-only invariant.
+    /// `true` when every field holds a sane, compositor-applicable value: `alpha`
+    /// in `0.0..=1.0`, a finite `translate_y`, and a strictly-positive finite
+    /// `scale`. (A non-finite or non-positive value would force the renderer down
+    /// a degenerate/relayout path.) Consumers `debug_assert!(params.is_compositor_safe())`
+    /// before applying a frame so a future mis-tuned transition can't silently
+    /// regress the no-relayout guarantee.
+    ///
+    /// ```
+    /// use mde_theme::animation::Transition;
+    /// let p = Transition::SlideUp(8.0).params(0.5);
+    /// assert!(p.is_compositor_safe()); // alpha∈[0,1], finite translate, scale>0
+    /// ```
+    #[must_use]
+    pub fn is_compositor_safe(self) -> bool {
+        (0.0..=1.0).contains(&self.alpha)
+            && self.translate_y.is_finite()
+            && self.scale.is_finite()
+            && self.scale > 0.0
+    }
 }
 
 impl Transition {
@@ -565,6 +640,116 @@ const fn motion_easing(motion: Motion, reduce_motion: bool) -> Easing {
     }
 }
 
+// ── MOTION-TRANS-3 — keyed-diff list/table reveal ─────────────────────────────
+
+/// MOTION-TRANS-3 — a keyed-diff reveal for a refreshing list/table.
+///
+/// On each refresh the consumer hands this the current set of stable **row keys**;
+/// it diffs them against the previous frame and arms a [`slide_in`] reveal for
+/// every **genuinely new** row, so an inserted row slides up + fades into place
+/// while every row that was already on screen stays put — a periodic refresh
+/// therefore never restrokes the whole list (and, paired with a stable
+/// `scrollable` id on the consumer side, never jumps the scroll position). The
+/// first sync is treated as the list simply *appearing*, so opening a panel does
+/// not mass-reveal its whole backlog.
+///
+/// Removals are intentionally **not** animated here: the iced 0.13 fork has no
+/// clip/opacity/transform widget to height-collapse a *dynamic-height* row, so a
+/// vanished row is simply dropped on the next sync (the row-level reveal is the
+/// expressible half; a collapse-on-remove would need a clip widget the toolkit
+/// lacks). Pure state (no toolkit dep) — the consumer reads [`Self::row_params`]
+/// in its `view` and applies the alpha/translate to its themed row.
+///
+/// Tick-driven like [`Animator`]: advance with [`Self::gc`] from one subscription
+/// the consumer arms only while [`Self::is_idle`] is `false` (zero idle wakeups).
+#[derive(Debug, Clone, Default)]
+pub struct KeyedListReveal {
+    /// row key → its in-flight reveal tween.
+    entering: HashMap<String, Tween>,
+    /// the row keys present as of the last [`Self::sync`].
+    seen: std::collections::HashSet<String>,
+    /// whether a first sync has happened (so the initial list doesn't mass-reveal).
+    seeded: bool,
+    reduce_motion: bool,
+}
+
+impl KeyedListReveal {
+    /// A fresh, idle reveal. `reduce_motion` caps every reveal to the Carbon
+    /// ≤80 ms crossfade and drops the slide (via [`slide_in`]'s contract).
+    #[must_use]
+    pub fn new(reduce_motion: bool) -> Self {
+        Self {
+            entering: HashMap::new(),
+            seen: std::collections::HashSet::new(),
+            seeded: false,
+            reduce_motion,
+        }
+    }
+
+    /// Diff this frame's `keys` (the current row keys) against the previous sync:
+    /// arm a reveal for each key that is **new** (skipped on the very first sync),
+    /// forget reveals for rows that vanished, and record the current set. Call
+    /// once from the consumer's load/refresh handler with the freshly-loaded keys.
+    pub fn sync<I, S>(&mut self, keys: I, now: Instant)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let current: std::collections::HashSet<String> = keys.into_iter().map(Into::into).collect();
+        if self.seeded {
+            for k in &current {
+                if !self.seen.contains(k) {
+                    self.entering.insert(
+                        k.clone(),
+                        Tween::resolved(now, Motion::panel_mount().duration, self.reduce_motion),
+                    );
+                }
+            }
+        }
+        // Drop reveals for rows that are no longer present (removed before settling).
+        self.entering.retain(|k, _| current.contains(k));
+        self.seen = current;
+        self.seeded = true;
+    }
+
+    /// The reveal [`RenderParams`] (alpha + `translate_y`) for the row keyed `key`
+    /// at `now`: a slide-up + fade for a freshly-inserted row, or the fully-shown
+    /// rest frame for a row that was already present (or any unknown key). Under
+    /// reduce-motion the slide drops to a crossfade ([`slide_in`]).
+    #[must_use]
+    pub fn row_params(&self, key: &str, now: Instant) -> RenderParams {
+        self.entering.get(key).map_or(
+            RenderParams {
+                alpha: 1.0,
+                translate_y: 0.0,
+                scale: 1.0,
+            },
+            |tw| {
+                slide_in(
+                    tw.start(),
+                    now,
+                    crate::motion::PANEL_MOUNT_TRANSLATE_Y_PX,
+                    self.reduce_motion,
+                )
+            },
+        )
+    }
+
+    /// Drop every settled reveal (call once per tick); returns the count still in
+    /// flight so the consumer's subscription can stop when it reaches 0.
+    pub fn gc(&mut self, now: Instant) -> usize {
+        self.entering.retain(|_, tw| !tw.is_complete(now));
+        self.entering.len()
+    }
+
+    /// `true` when no row is mid-reveal — the consumer stops ticking (zero idle
+    /// wakeups).
+    #[must_use]
+    pub fn is_idle(&self, now: Instant) -> bool {
+        self.entering.values().all(|tw| tw.is_complete(now))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,6 +774,53 @@ mod tests {
         assert!((Transition::Press(0.04).params(1.0).scale - 0.96).abs() < 1e-6);
         // Clamped: out-of-range t doesn't overshoot.
         assert_eq!(Transition::FadeIn.params(2.0).alpha, 1.0);
+    }
+
+    #[test]
+    fn transition_outputs_are_compositor_safe_across_the_sweep() {
+        // MOTION-PERF-2 — every transition kind, at every sampled progress, yields
+        // only sane transform/opacity values (no relayout-forcing field exists on
+        // the struct, and the values stay in the compositor-safe ranges).
+        let kinds = [
+            Transition::FadeIn,
+            Transition::FadeOut,
+            Transition::SlideUp(12.0),
+            Transition::Lift(6.0),
+            Transition::Press(0.04),
+        ];
+        for k in kinds {
+            for i in 0..=20 {
+                let t = i as f32 / 20.0;
+                let p = k.params(t);
+                assert!(
+                    p.is_compositor_safe(),
+                    "{k:?} at t={t} produced a non-compositor-safe frame: {p:?}"
+                );
+            }
+            // Out-of-range progress is clamped, so even that stays safe.
+            assert!(k.params(-1.0).is_compositor_safe());
+            assert!(k.params(2.0).is_compositor_safe());
+        }
+    }
+
+    #[test]
+    fn pulse_clamps_period_to_the_flash_cap() {
+        // MOTION-A11Y-3 — a too-fast pulse period is clamped up to the 3 Hz floor;
+        // a slow period is left as requested.
+        let t0 = Instant::now();
+        let floor = Duration::from_millis(crate::motion::MIN_PULSE_PERIOD_MS);
+        // 50 ms (20 Hz) requested → clamped to the 334 ms floor (≈3 Hz).
+        let fast = LoopingTween::pulse(t0, Duration::from_millis(50));
+        assert!(
+            fast.hz() <= crate::motion::MAX_PULSE_HZ + 1e-3,
+            "clamped pulse must not exceed the cap, got {} Hz",
+            fast.hz()
+        );
+        // The clamp lands exactly on the floor period.
+        assert!((fast.hz() - LoopingTween::starting_at(t0, floor).hz()).abs() < 1e-6);
+        // A 2 s pulse (0.5 Hz) is well under the cap → unchanged.
+        let slow = LoopingTween::pulse(t0, Duration::from_secs(2));
+        assert!((slow.hz() - 0.5).abs() < 1e-3);
     }
 
     #[test]
@@ -1055,5 +1287,86 @@ mod tests {
                 assert_eq!(r.scale, 1.0);
             }
         }
+    }
+
+    // ── MOTION-TRANS-3 — KeyedListReveal ───────────────────────────────────────
+
+    #[test]
+    fn first_sync_never_mass_reveals_the_initial_list() {
+        // Opening a panel (first sync) treats the whole set as already present —
+        // every row is at rest, nothing strobes.
+        let t0 = Instant::now();
+        let mut r = KeyedListReveal::new(false);
+        r.sync(["a", "b", "c"], t0);
+        assert!(r.is_idle(t0), "first sync arms no reveal");
+        for k in ["a", "b", "c"] {
+            let p = r.row_params(k, t0);
+            assert!((p.alpha - 1.0).abs() < 1e-4, "{k} starts at rest");
+            assert_eq!(p.translate_y, 0.0);
+        }
+    }
+
+    #[test]
+    fn a_newly_inserted_row_reveals_then_settles() {
+        let t0 = Instant::now();
+        let mut r = KeyedListReveal::new(false);
+        r.sync(["a", "b"], t0); // seed
+                                // A later refresh adds "c": only "c" reveals; "a"/"b" stay put.
+        r.sync(["a", "b", "c"], t0);
+        assert!(!r.is_idle(t0), "the inserted row is mid-reveal");
+        let c0 = r.row_params("c", t0);
+        assert!(
+            c0.alpha < 1.0 && c0.translate_y > 0.0,
+            "c starts low + faded"
+        );
+        assert_eq!(
+            r.row_params("a", t0).translate_y,
+            0.0,
+            "existing row never moves"
+        );
+        assert!((r.row_params("a", t0).alpha - 1.0).abs() < 1e-4);
+        // After the panel-mount duration the reveal settles + the tick can stop.
+        let done = t0 + Motion::panel_mount().duration;
+        let c1 = r.row_params("c", done);
+        assert!((c1.alpha - 1.0).abs() < 1e-4 && c1.translate_y.abs() < 1e-4);
+        assert!(r.is_idle(done));
+        assert_eq!(r.gc(done), 0, "gc clears the settled reveal");
+    }
+
+    #[test]
+    fn a_removed_row_drops_its_reveal_and_unchanged_rows_dont_restrobe() {
+        let t0 = Instant::now();
+        let mut r = KeyedListReveal::new(false);
+        r.sync(["a", "b"], t0);
+        r.sync(["a", "b", "c"], t0); // c revealing
+        assert!(!r.is_idle(t0));
+        // c is removed before it settled (accept/reject) → its reveal is dropped,
+        // and the steady rows a/b never animate on the refresh.
+        r.sync(["a", "b"], t0);
+        assert!(
+            r.is_idle(t0),
+            "removing the only revealing row leaves nothing in flight"
+        );
+        assert_eq!(
+            r.row_params("c", t0).alpha,
+            1.0,
+            "a dropped row reads as rest"
+        );
+        assert_eq!(r.row_params("a", t0).translate_y, 0.0);
+    }
+
+    #[test]
+    fn reduce_motion_reveal_drops_the_slide_and_caps_at_80ms() {
+        let t0 = Instant::now();
+        let mut r = KeyedListReveal::new(true);
+        r.sync(["a"], t0);
+        r.sync(["a", "b"], t0);
+        // No positional slide under reduce-motion (crossfade only)...
+        for ms in [0, 40, 80] {
+            let p = r.row_params("b", t0 + Duration::from_millis(ms));
+            assert_eq!(p.translate_y, 0.0, "no slide under reduce-motion at {ms}ms");
+        }
+        // ...and it settles within the Carbon 80 ms cap.
+        assert!(r.is_idle(t0 + Duration::from_millis(80) + Duration::from_millis(1)));
     }
 }

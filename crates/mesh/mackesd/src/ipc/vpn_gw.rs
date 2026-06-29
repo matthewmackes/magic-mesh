@@ -28,7 +28,7 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use serde_json::json;
 
-use mackes_mesh_types::vpn::{self, Method, TunnelDef};
+use mackes_mesh_types::vpn::{self, EgressRoute, Method, RouteScope, TunnelDef};
 use mackes_mesh_types::vpn_egress::EgressPlan;
 use mackes_mesh_types::vpn_providers::{
     self, AdapterError, ProducedTunnel, Provider, SecretKind, WgSetup,
@@ -90,7 +90,7 @@ impl VpnService {
 }
 
 /// Action verbs served on `action/vpn/<verb>`.
-pub const ACTION_VERBS: [&str; 8] = [
+pub const ACTION_VERBS: [&str; 12] = [
     "list-tunnels",
     "add-tunnel",
     "remove-tunnel",
@@ -100,6 +100,12 @@ pub const ACTION_VERBS: [&str; 8] = [
     // VPN-GW-5 — provider adapters (5 named + generic WG paste / .ovpn import).
     "list-providers",
     "setup-provider",
+    // VPN-GW-4 — egress routing (per-node / group / ANY → gateway + tunnel +
+    // ordered failover chain + kill-switch).
+    "set-route",
+    "list-routes",
+    "clear-route",
+    "route-status",
 ];
 
 /// Where a tunnel's DECRYPTED config lands on the node just before bring-up, for
@@ -250,7 +256,123 @@ pub fn build_reply(svc: &VpnService, verb: &str, req_body: Option<&str>) -> Stri
         }
         "list-providers" => list_providers_reply(),
         "setup-provider" => setup_provider(svc, req_body),
+        "set-route" => set_route(root, req_body),
+        "list-routes" => {
+            let cfg = vpn::load(root);
+            json!({ "ok": true, "routes": cfg.route }).to_string()
+        }
+        "clear-route" => clear_route(root, req_body),
+        "route-status" => route_status(svc, root),
         other => err(format!("unknown vpn verb: {other}")),
+    }
+}
+
+/// `set-route` — upsert an [`EgressRoute`] (VPN-GW-4) into the durable VPN config.
+/// Body is the `EgressRoute` JSON (`{scope,target,gateway,tunnel,failover,
+/// kill_switch}`). Validated before save so an unusable route is rejected with an
+/// honest reason, never silently stored.
+fn set_route(root: &std::path::Path, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("set-route: missing EgressRoute body".into());
+    };
+    let r: EgressRoute = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return err(format!("set-route: bad json: {e}")),
+    };
+    if let Err(e) = r.validate() {
+        return err(format!("set-route: {e}"));
+    }
+    let mut cfg = vpn::load(root);
+    cfg.upsert_route(r);
+    match vpn::save(root, &cfg) {
+        Ok(_) => json!({ "ok": true }).to_string(),
+        Err(e) => err(format!("set-route: save: {e}")),
+    }
+}
+
+/// `clear-route` — remove an egress route. Body is `{scope, target}` (target
+/// ignored for `any`). Errors when no matching route exists.
+fn clear_route(root: &std::path::Path, req_body: Option<&str>) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let Some(body) = req_body else {
+        return err("clear-route: missing {scope,target} body".into());
+    };
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return err(format!("clear-route: bad json: {e}")),
+    };
+    let scope = match v.get("scope").and_then(serde_json::Value::as_str) {
+        Some("node") => RouteScope::Node,
+        Some("group") => RouteScope::Group,
+        Some("any") => RouteScope::Any,
+        other => return err(format!("clear-route: bad scope {other:?} (node|group|any)")),
+    };
+    let target = v
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let mut cfg = vpn::load(root);
+    if !cfg.remove_route(scope, target) {
+        return err(format!(
+            "clear-route: no route for scope {scope:?} target '{target}'"
+        ));
+    }
+    match vpn::save(root, &cfg) {
+        Ok(_) => json!({ "ok": true }).to_string(),
+        Err(e) => err(format!("clear-route: save: {e}")),
+    }
+}
+
+/// `route-status` — the live "who exits where": each configured route resolved
+/// against the published per-tunnel exit state ([`vpn::load_exit_state`], written
+/// by the `vpn_health` worker, VPN-GW-6). For each route the active tunnel is the
+/// first healthy id in its chain; `None` ⇒ the kill-switch is engaged (when the
+/// route opts in) so there is no leak. Reports the resolved tunnel + its verified
+/// exit IP so the Routing panel renders the truth, not the config intent.
+fn route_status(svc: &VpnService, root: &std::path::Path) -> String {
+    let cfg = vpn::load(root);
+    let state = vpn::load_exit_state(root);
+    let healthy = |id: &str| {
+        state
+            .get(id)
+            .is_some_and(|e| e.up && e.verified && !e.dns_leak)
+    };
+    let routes: Vec<serde_json::Value> = cfg
+        .route
+        .iter()
+        .map(|r| {
+            let active = r.resolve(healthy);
+            let exit_ip = active
+                .and_then(|id| state.get(id))
+                .map_or("", |e| e.exit_ip.as_str());
+            let kill_switch_engaged = active.is_none() && r.kill_switch;
+            json!({
+                "scope": scope_label(r.scope),
+                "target": r.target,
+                "gateway": r.gateway,
+                "primary": r.tunnel,
+                "failover": r.failover,
+                "active_tunnel": active,
+                "exit_ip": exit_ip,
+                "kill_switch": r.kill_switch,
+                "kill_switch_engaged": kill_switch_engaged,
+            })
+        })
+        .collect();
+    // `svc` carries the workgroup root the exit state is read from — keep the
+    // signature uniform with the other handlers even though `root` is the lever.
+    let _ = svc;
+    json!({ "ok": true, "routes": routes }).to_string()
+}
+
+/// The kebab-case label for a [`RouteScope`] (matches the serde wire form).
+#[must_use]
+fn scope_label(scope: RouteScope) -> &'static str {
+    match scope {
+        RouteScope::Node => "node",
+        RouteScope::Group => "group",
+        RouteScope::Any => "any",
     }
 }
 
@@ -354,7 +476,11 @@ fn run_argv_batch(label: &str, batch: &[Vec<String>]) {
 
 /// Install the selective-egress rules for an up tunnel, then clear the
 /// kill-switch so the now-routable marked traffic can flow.
-fn apply_egress(plan: &EgressPlan) {
+///
+/// `pub(crate)` so the `vpn_health` worker (VPN-GW-6) reuses the exact same
+/// apply sequence when it moves a route's egress to a freshly-failed-over tunnel
+/// (no second egress code path — §6).
+pub(crate) fn apply_egress(plan: &EgressPlan) {
     // Re-applying over a stale state can leave duplicate rules; tear down any
     // prior egress for this tunnel first so `up` is idempotent on a re-up.
     run_argv_batch("egress-reset", &plan.down_argv());
@@ -366,7 +492,10 @@ fn apply_egress(plan: &EgressPlan) {
 /// egress routing/NAT rules down. Used on tunnel-down and on a failed bring-up.
 /// Ordering is leak-proof: the DROP is installed *before* the egress rules are
 /// removed, so there is never a window where marked traffic can escape direct.
-fn engage_kill_switch(plan: &EgressPlan) {
+///
+/// `pub(crate)` so the `vpn_health` worker (VPN-GW-6) engages the same leak-proof
+/// kill-switch when a route's whole failover chain is unhealthy.
+pub(crate) fn engage_kill_switch(plan: &EgressPlan) {
     run_argv_batch("kill-switch", &plan.kill_switch_argv());
     run_argv_batch("egress-down", &plan.down_argv());
 }
@@ -634,9 +763,127 @@ mod tests {
     #[test]
     fn topic_and_verbs_lock() {
         assert_eq!(action_topic("tunnel-up"), "action/vpn/tunnel-up");
-        assert_eq!(ACTION_VERBS.len(), 8);
+        assert_eq!(ACTION_VERBS.len(), 12);
         assert!(ACTION_VERBS.contains(&"list-providers"));
         assert!(ACTION_VERBS.contains(&"setup-provider"));
+        for v in ["set-route", "list-routes", "clear-route", "route-status"] {
+            assert!(ACTION_VERBS.contains(&v), "missing {v}");
+        }
+    }
+
+    // ── VPN-GW-4: egress routing verbs over the responder ──
+
+    fn set_route_body(scope: &str, target: &str, tunnel: &str, failover: &[&str]) -> String {
+        json!({
+            "scope": scope,
+            "target": target,
+            "gateway": "eagle",
+            "tunnel": tunnel,
+            "failover": failover,
+            "kill_switch": true,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn set_list_clear_route_round_trip() {
+        let (_t, s) = svc();
+        let r = build_reply(
+            &s,
+            "set-route",
+            Some(&set_route_body("node", "pine", "mullvad1", &["proton2"])),
+        );
+        assert!(r.contains("\"ok\":true"), "{r}");
+        let list = build_reply(&s, "list-routes", None);
+        let v: serde_json::Value = serde_json::from_str(&list).unwrap();
+        let routes = v["routes"].as_array().unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0]["target"], "pine");
+        assert_eq!(routes[0]["tunnel"], "mullvad1");
+        // A second set with the same scope/target replaces (no duplicate).
+        let _ = build_reply(
+            &s,
+            "set-route",
+            Some(&set_route_body("node", "pine", "ivpn9", &[])),
+        );
+        let list2 = build_reply(&s, "list-routes", None);
+        let v2: serde_json::Value = serde_json::from_str(&list2).unwrap();
+        assert_eq!(v2["routes"].as_array().unwrap().len(), 1);
+        assert_eq!(v2["routes"][0]["tunnel"], "ivpn9");
+        // Clear it.
+        let c = build_reply(
+            &s,
+            "clear-route",
+            Some(&json!({"scope":"node","target":"pine"}).to_string()),
+        );
+        assert!(c.contains("\"ok\":true"), "{c}");
+        assert!(build_reply(
+            &s,
+            "clear-route",
+            Some(&json!({"scope":"node","target":"pine"}).to_string())
+        )
+        .contains("no route"));
+    }
+
+    #[test]
+    fn set_route_rejects_invalid() {
+        let (_t, s) = svc();
+        // Missing gateway/tunnel.
+        let bad = json!({"scope":"node","target":"pine","gateway":"","tunnel":""}).to_string();
+        assert!(build_reply(&s, "set-route", Some(&bad)).contains("error"));
+        // Node scope with no target.
+        let bad2 = set_route_body("node", "", "t", &[]);
+        assert!(build_reply(&s, "set-route", Some(&bad2)).contains("needs a target"));
+    }
+
+    #[test]
+    fn route_status_resolves_active_tunnel_from_exit_state() {
+        let (_t, s) = svc();
+        let root = s.workgroup_root.clone();
+        // A route: primary mullvad1, failover proton2.
+        let _ = build_reply(
+            &s,
+            "set-route",
+            Some(&set_route_body("any", "", "mullvad1", &["proton2"])),
+        );
+        // Publish exit state: mullvad1 DOWN, proton2 healthy → route fails over.
+        let mut st = vpn::VpnExitState::default();
+        st.upsert(vpn::TunnelExit {
+            id: "mullvad1".into(),
+            up: false,
+            verified: false,
+            ..Default::default()
+        });
+        st.upsert(vpn::TunnelExit {
+            id: "proton2".into(),
+            up: true,
+            verified: true,
+            exit_ip: "9.9.9.9".into(),
+            ..Default::default()
+        });
+        vpn::save_exit_state(&root, &st).unwrap();
+        let rs = build_reply(&s, "route-status", None);
+        let v: serde_json::Value = serde_json::from_str(&rs).unwrap();
+        let route = &v["routes"][0];
+        assert_eq!(route["active_tunnel"], "proton2", "{rs}");
+        assert_eq!(route["exit_ip"], "9.9.9.9");
+        assert_eq!(route["kill_switch_engaged"], serde_json::Value::Bool(false));
+
+        // Now both unhealthy → no active tunnel, kill-switch engaged.
+        let mut st2 = vpn::VpnExitState::default();
+        st2.upsert(vpn::TunnelExit {
+            id: "proton2".into(),
+            up: false,
+            ..Default::default()
+        });
+        vpn::save_exit_state(&root, &st2).unwrap();
+        let rs2 = build_reply(&s, "route-status", None);
+        let v2: serde_json::Value = serde_json::from_str(&rs2).unwrap();
+        assert_eq!(v2["routes"][0]["active_tunnel"], serde_json::Value::Null);
+        assert_eq!(
+            v2["routes"][0]["kill_switch_engaged"],
+            serde_json::Value::Bool(true)
+        );
     }
 
     #[test]

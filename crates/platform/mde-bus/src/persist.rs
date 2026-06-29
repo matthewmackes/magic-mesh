@@ -39,7 +39,7 @@ use crate::hooks::config::Priority;
 
 /// SQL schema applied on `open` — embedded so the binary doesn't
 /// need a separate file at runtime.
-const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
+pub(crate) const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
 
 /// Process-global MONOTONIC ULID generator for message ids. The `(topic,
 /// ulid)` cursor scan (`list_since`, `latest_ulid`, the music daemon's
@@ -60,6 +60,15 @@ fn next_ulid() -> Ulid {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .generate()
         .unwrap_or_else(|_| Ulid::new())
+}
+
+/// L1043 — wall-clock milliseconds since the Unix epoch (consumer-cursor
+/// heartbeats). Matches the `ts_unix_ms` clock used on the message rows.
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 /// BOOT-REC-3 — true only for a definitive SQLite **read-only** failure (the
@@ -615,6 +624,99 @@ impl Persist {
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .map_err(|e| PersistError::Sql(format!("count: {e}")))?;
         Ok(n)
+    }
+
+    /// L1043 — register/advance a live consumer's read cursor on a source topic,
+    /// stamping it live "now". A consumer calls this after consuming up to
+    /// `cursor_ulid`; the retention TTL reap then refuses to delete any message
+    /// newer than the SLOWEST live cursor on that topic, so a lagging-but-live
+    /// consumer's unread messages survive their TTL until it has actually read
+    /// them (no strand). The heartbeat (`updated_unix_ms = now`) is what keeps the
+    /// guard from protecting the spool forever after a consumer crashes/departs —
+    /// a cursor that stops refreshing falls out of the liveness window and is
+    /// ignored. Thin wrapper over [`Self::register_consumer_cursor_at`].
+    ///
+    /// # Errors
+    /// [`PersistError::Sql`] on upsert failure.
+    pub fn register_consumer_cursor(
+        &self,
+        consumer: &str,
+        topic: &str,
+        cursor_ulid: &str,
+    ) -> Result<(), PersistError> {
+        self.register_consumer_cursor_at(consumer, topic, cursor_ulid, now_unix_ms())
+    }
+
+    /// L1043 — [`Self::register_consumer_cursor`] with an injected `now_unix_ms`
+    /// so the liveness window is deterministically testable. Upserts on
+    /// `(consumer, topic)` — a re-register both advances the cursor and refreshes
+    /// the liveness heartbeat.
+    ///
+    /// # Errors
+    /// [`PersistError::Sql`] on upsert failure.
+    pub fn register_consumer_cursor_at(
+        &self,
+        consumer: &str,
+        topic: &str,
+        cursor_ulid: &str,
+        now_unix_ms: i64,
+    ) -> Result<(), PersistError> {
+        self.conn
+            .execute(
+                "INSERT INTO consumer_cursors (consumer, topic, cursor_ulid, updated_unix_ms) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(consumer, topic) DO UPDATE SET \
+                     cursor_ulid = excluded.cursor_ulid, \
+                     updated_unix_ms = excluded.updated_unix_ms",
+                params![consumer, topic, cursor_ulid, now_unix_ms],
+            )
+            .map_err(|e| {
+                PersistError::Sql(format!("register_consumer_cursor {consumer}/{topic}: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// L1043 — drop a consumer's cursor on a topic (e.g. it unsubscribed). After
+    /// this the topic is no longer held back on that consumer's account; if it was
+    /// the slowest cursor, the next TTL reap can reclaim down to the next-slowest
+    /// (or the plain TTL when none remain). Returns `true` if a row was removed.
+    ///
+    /// # Errors
+    /// [`PersistError::Sql`] on delete failure.
+    pub fn drop_consumer_cursor(&self, consumer: &str, topic: &str) -> Result<bool, PersistError> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM consumer_cursors WHERE consumer = ?1 AND topic = ?2",
+                params![consumer, topic],
+            )
+            .map_err(|e| {
+                PersistError::Sql(format!("drop_consumer_cursor {consumer}/{topic}: {e}"))
+            })?;
+        Ok(n > 0)
+    }
+
+    /// L1043 — the SLOWEST live cursor on `topic`: the minimum `cursor_ulid` over
+    /// consumers whose heartbeat is at/after `live_cutoff_unix_ms`. `None` ⇒ no
+    /// live consumer is registered (the retention reap then applies the plain TTL
+    /// with no consumer hold). Exposed for retention + observability/tests.
+    ///
+    /// # Errors
+    /// [`PersistError::Sql`] on query failure.
+    pub fn slowest_live_cursor(
+        &self,
+        topic: &str,
+        live_cutoff_unix_ms: i64,
+    ) -> Result<Option<String>, PersistError> {
+        // MIN over an empty/stale set yields SQL NULL → None.
+        self.conn
+            .query_row(
+                "SELECT MIN(cursor_ulid) FROM consumer_cursors \
+                 WHERE topic = ?1 AND updated_unix_ms >= ?2",
+                params![topic, live_cutoff_unix_ms],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| PersistError::Sql(format!("slowest_live_cursor {topic}: {e}")))
     }
 
     /// Walk the file tree under `bus_root` and compare against
@@ -1210,8 +1312,8 @@ mod tests {
     fn is_auditable_skips_observational_reads_but_keeps_mutations() {
         // The flood classes observed live on Eagle (2026-06-24) must NOT audit:
         for noisy in [
-            "audit/UNIT-EAGLE",       // recursion guard
-            "state/voice/status",     // observational broadcast
+            "audit/UNIT-EAGLE",   // recursion guard
+            "state/voice/status", // observational broadcast
             "state/boot-readiness",
             "reply/abc",              // query response
             "action/music/get-state", // the dominant poller (~36% of the flood)

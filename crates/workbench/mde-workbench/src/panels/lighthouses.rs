@@ -139,6 +139,9 @@ pub struct LighthousesPanel {
     /// modal with the wrong outcome — only the reply whose generation matches the
     /// in-flight action lands.
     pub action_gen: u64,
+    /// MOTION-TRANS-2 — open-reveal clock for the confirm/ops modal (armed on the
+    /// `Closed → Confirm` edge, cleared on dismiss).
+    reveal: crate::panel_chrome::DialogReveal,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +217,13 @@ impl LighthousesPanel {
             // LIGHTHOUSE-6 — a card action button: open the confirm gate.
             // Nothing destructive runs until the operator presses Confirm.
             Message::ActionRequested(action) => {
+                // MOTION-TRANS-2 — opening the confirm gate is the dialog's
+                // `Closed → open` edge; arm the reveal (the later Confirm → Pending
+                // is a content change inside the already-open dialog, not a re-open).
+                self.reveal.open(
+                    std::time::Instant::now(),
+                    crate::live_theme::reduce_motion(),
+                );
                 self.connect = ConnectProgress::confirm(action.title(), action.prompt());
                 self.pending_action = Some(action);
                 Task::none()
@@ -240,6 +250,7 @@ impl LighthousesPanel {
             }
             Message::ConnectDismiss => {
                 self.connect = ConnectProgress::Closed;
+                self.reveal.close();
                 self.pending_action = None;
                 Task::none()
             }
@@ -391,7 +402,15 @@ impl LighthousesPanel {
             crate::Message::Lighthouses(Message::ConnectConfirm),
             crate::Message::Lighthouses(Message::ConnectRetry),
             crate::Message::Lighthouses(Message::ConnectDismiss),
+            self.reveal.params(std::time::Instant::now()),
         )
+    }
+
+    /// MOTION-TRANS-2 — the ops modal's open-reveal clock for the shell's
+    /// tick-subscription gate ([`crate::panel_chrome::DialogReveal::needs_tick`]).
+    #[must_use]
+    pub fn dialog_reveal(&self) -> &crate::panel_chrome::DialogReveal {
+        &self.reveal
     }
 }
 

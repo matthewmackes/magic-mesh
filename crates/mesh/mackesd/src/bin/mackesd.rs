@@ -1969,7 +1969,9 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::RolePin { role } => {
             let parsed: mde_role::Role = role.parse().map_err(|_| {
-                anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+                anyhow::anyhow!(
+                    "unknown role `{role}` — expected lighthouse|lighthouse-media|server|workstation"
+                )
             })?;
             match mde_role::pin(parsed) {
                 Ok(outcome) => {
@@ -3706,7 +3708,9 @@ fn main() -> anyhow::Result<()> {
             role,
         } => {
             let parsed: mde_role::Role = role.parse().map_err(|_| {
-                anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+                anyhow::anyhow!(
+                    "unknown role `{role}` — expected lighthouse|lighthouse-media|server|workstation"
+                )
             })?;
             let conn = mackesd_core::store::open(&db_path)
                 .with_context(|| format!("opening store at {}", db_path.display()))?;
@@ -5594,6 +5598,22 @@ fn run_serve(
             ));
             worker_names.lock().expect("worker_names mutex").push("mesh_dns".into());
         }
+        // MEDIA-3/6 — adopt + supervise the Navidrome music container, and
+        // distribute the leader-managed shared-account secret. Gated on the
+        // ORTHOGONAL media capability (a `Lighthouse_Media` pin), NOT the rank —
+        // so it is provably absent on every stock Lighthouse / Server /
+        // Workstation (worker_role::node_serves_media is fail-closed: unpinned /
+        // unreadable role ⇒ not media).
+        if mackesd_core::worker_role::node_serves_media() {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::media_navidrome::MediaNavidromeWorker::new(
+                    node_id.clone(),
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("media_navidrome".into());
+        }
         // PLANES-15 — netstate engine mount: converge the baseline's
         // network desired-state under a rollback checkpoint + overlay
         // self-test (W77/W78), on every node.
@@ -6183,6 +6203,26 @@ fn run_serve(
             .lock()
             .expect("worker_names mutex")
             .push("selinux_monitor".into());
+
+        // HA-5 — etcd-quorum + leadership monitor. Reads the live mesh directory
+        // (the same etcd-or-fs source healthz uses) on a 30 s tick, publishes the
+        // coordination-plane state (member count + quorum-OK + leader) to the
+        // retained `mesh/ha/status` lane the Mesh Control panel consumes, and
+        // fires an edge-triggered `mackesd::alert` when quorum is lost/restored
+        // or leadership changes. Runs on every node (each operator wants the
+        // local Alert Center to surface a failover), like the other monitors.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::ha_monitor::HaMonitorWorker::new(
+                workgroup_root.clone(),
+                Some(db_path.clone()),
+                fw_host.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("ha_monitor".into());
 
         // VIRT-1 (v5.0.0) — unified KVM + Podman compute inventory.
         // Polls virsh + podman every 10 s and publishes the per-peer
@@ -7202,6 +7242,76 @@ fn run_serve(
                 tracing::warn!(error = %e, "DC-power Bus responder: bus persist open failed; responder skipped");
             }
         }
+        // DATACENTER-12 (action layer) — the storage responder: action/dc/{sr-list,
+        // sr-create,sr-destroy,vdi-attach,vdi-detach,sr-snapshot-schedule,iso-list}
+        // over the mesh-key SSH against an allowed dom0. Same OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let dc_storage_svc =
+                    mackesd_core::ipc::dc_storage::DcStorageService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("dc-storage-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::dc_storage::serve_bus(&persist, &dc_storage_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "DC-storage Bus responder spawned; serving action/dc/{{sr-*,vdi-*,iso-list}} (DATACENTER-12)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DC-storage Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("dc_storage_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DC-storage Bus responder: bus persist open failed; responder skipped");
+            }
+        }
+        // DATACENTER-13 (action layer) — the network responder: action/dc/{net-list,
+        // net-create,vlan-set,pif-config,ipdns} over the mesh-key SSH against an
+        // allowed dom0 (ipdns reads DO DNS + gateway leases + overlay). OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let dc_network_svc =
+                    mackesd_core::ipc::dc_network::DcNetworkService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("dc-network-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::dc_network::serve_bus(&persist, &dc_network_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "DC-network Bus responder spawned; serving action/dc/{{net-*,vlan-set,pif-config,ipdns}} (DATACENTER-13)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DC-network Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("dc_network_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DC-network Bus responder: bus persist open failed; responder skipped");
+            }
+        }
         // DC-15 (action layer) — the Tofu-plan responder: action/dc/tofu-plan
         // runs a read-only `tofu plan` of an allow-listed workspace under
         // infra/tofu/<ws> with its env sourced. Same dedicated-OS-thread shape.
@@ -7235,6 +7345,42 @@ fn run_serve(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "Tofu Bus responder: bus persist open failed; responder skipped");
+            }
+        }
+        // DATACENTER-21 (action layer) — the test-mesh provisioning responder:
+        // action/dc/testmesh-{spin,teardown} wrap automation/testbed/farm-testbed.sh
+        // to spin / tear down an ephemeral N-node test mesh. Same OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let provision_svc =
+                    mackesd_core::ipc::dc_provision::DcProvisionService::new(workgroup_root.clone());
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("dc-provision-bus-responder".into())
+                    .spawn(move || {
+                        mackesd_core::ipc::dc_provision::serve_bus(&persist, &provision_svc, || {
+                            resp_shutdown.load(Ordering::Relaxed)
+                        });
+                    })
+                    .map(|_handle| {
+                        tracing::info!(
+                            "DC-provision Bus responder spawned; serving \
+                             action/dc/testmesh-{{spin,teardown}} (DATACENTER-21)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DC-provision Bus responder thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("dc_provision_bus_responder".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DC-provision Bus responder: bus persist open failed; responder skipped");
             }
         }
         // VPN-GW-1 — the VPN responder: action/vpn/* tunnel CRUD + wg-quick/
@@ -7303,6 +7449,85 @@ fn run_serve(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "DDNS Bus responder: bus persist open failed; responder skipped");
+            }
+        }
+        // VPN-GW-6 — the VPN health + exit-IP/leak verification + auto-failover
+        // worker: probes each tunnel, publishes verified exit state, fails over a
+        // route's chain or engages the kill-switch, raises event/vpn/tunnel-down.
+        // Same dedicated-OS-thread shape as the responders (holds its own Persist
+        // + the alert_relay drop-dir for the Hub toast).
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let vpn_node = node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string();
+                let health = mackesd_core::workers::vpn_health::VpnHealthWorker::new(
+                    workgroup_root.clone(),
+                    vpn_node,
+                );
+                let alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("vpn-health-worker".into())
+                    .spawn(move || {
+                        health.run(&persist, &alerts, || resp_shutdown.load(Ordering::Relaxed));
+                    })
+                    .map(|_h| {
+                        tracing::info!(
+                            "VPN health worker spawned (exit-IP/leak verify + auto-failover, VPN-GW-6)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "VPN health worker thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("vpn_health".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "VPN health worker: bus persist open failed; worker skipped");
+            }
+        }
+        // DDNS-EGRESS-4 — the DDNS reconcile worker: watches the VPN exit + WAN
+        // IPs and keeps the [ddns] records pointing at the live IP (DigitalOcean),
+        // rewriting on reconnect-with-new-IP within ~TTL + applying on_down on a
+        // tunnel-down. Same dedicated-OS-thread shape.
+        match mde_bus::default_data_dir()
+            .ok_or_else(|| "no XDG data dir for bus".to_string())
+            .and_then(|d| mde_bus::persist::Persist::open(d).map_err(|e| e.to_string()))
+        {
+            Ok(persist) => {
+                let ddns_node = node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string();
+                let ddns_worker = mackesd_core::workers::ddns::DdnsWorker::new(
+                    workgroup_root.clone(),
+                    ddns_node,
+                );
+                let alerts = mackesd_core::workers::alert_relay::default_alerts_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/mde-alerts"));
+                let resp_shutdown = Arc::clone(&shutdown);
+                std::thread::Builder::new()
+                    .name("ddns-worker".into())
+                    .spawn(move || {
+                        ddns_worker.run(&persist, &alerts, || resp_shutdown.load(Ordering::Relaxed));
+                    })
+                    .map(|_h| {
+                        tracing::info!(
+                            "DDNS reconcile worker spawned (VPN exit + WAN → DigitalOcean, DDNS-EGRESS-4)"
+                        );
+                    })
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "DDNS worker thread spawn failed");
+                    });
+                worker_names
+                    .lock()
+                    .expect("worker_names mutex")
+                    .push("ddns_worker".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DDNS worker: bus persist open failed; worker skipped");
             }
         }
         // PD-1 — the peer-directory responder: action/mesh/directory
@@ -8107,7 +8332,9 @@ fn cmd_add_peer(
     enroll_port: Option<u16>,
 ) -> anyhow::Result<()> {
     let parsed: mde_role::Role = role.parse().map_err(|_| {
-        anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+        anyhow::anyhow!(
+            "unknown role `{role}` — expected lighthouse|lighthouse-media|server|workstation"
+        )
     })?;
     let root = mackesd_core::default_qnm_shared_root();
     let node_id = default_node_id();
@@ -8204,7 +8431,9 @@ fn cmd_found(
     use mackesd_core::workers::nebula_enroll_listener::{DEFAULT_CERT_PATH, DEFAULT_KEY_PATH};
 
     let parsed: mde_role::Role = role.parse().map_err(|_| {
-        anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+        anyhow::anyhow!(
+            "unknown role `{role}` — expected lighthouse|lighthouse-media|server|workstation"
+        )
     })?;
     // Resolve the externally-dialable IPv4 (strip any :port the operator
     // included; `auto` detects the primary outbound IP).
@@ -8380,7 +8609,9 @@ fn cmd_join(
     };
 
     let parsed: mde_role::Role = role.parse().map_err(|_| {
-        anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+        anyhow::anyhow!(
+            "unknown role `{role}` — expected lighthouse|lighthouse-media|server|workstation"
+        )
     })?;
     let token = mackesd_core::nebula_enroll::parse_join_token(&raw_token).ok_or_else(|| {
         anyhow::anyhow!("invalid join token (expected mesh:<id>@<ip>:<port>#<bearer>?fp=<sha256>)")
@@ -8460,7 +8691,7 @@ fn cmd_join(
     // public underlay address so its heartbeat publishes it to the directory and
     // every node's enroll roster includes it (full redundancy). Auto-detect the
     // primary public IPv4 (override later with `mackesd set-external-addr`).
-    if parsed == mde_role::Role::Lighthouse {
+    if mackes_mesh_types::lighthouse::role_is_lighthouse(Some(parsed.as_str())) {
         match detect_primary_ipv4() {
             Ok(ip) => {
                 if let Err(e) =
@@ -8474,6 +8705,15 @@ fn cmd_join(
             ),
         }
     }
+
+    // MEDIA-8 — birthright auto-config: write the music client's
+    // `airsonic-creds.json` (→ http://music.mesh:4533 + the shared account) so a
+    // fresh node has working music with zero manual connect (the Music System's
+    // Auto-Configuration host). Best-effort: the shared password comes from the
+    // leader-managed secret store when this node can already read it; otherwise
+    // the file is still seeded pointing at music.mesh (the media_navidrome /
+    // registry path fills the password once it distributes).
+    write_music_birthright_best_effort(&root);
 
     // SETUP-7 — capture the joined facts (mesh-id + lighthouse roster from the
     // signed bundle) for idempotent re-convergence.
@@ -8493,6 +8733,41 @@ fn cmd_join(
     );
     println!("services: nebula + mackesd + mesh-health enabled (boot-durable) and running");
     Ok(())
+}
+
+/// MEDIA-8 — write the music-client birthright (`airsonic-creds.json`) at
+/// enroll. Resolves the shared-account password from the leader-managed secret
+/// store ([[XCP-7]] / `ipc::secret_store`) when this node can read it; either way
+/// the creds point at the active-active `http://music.mesh:4533` + the shared
+/// account, so `mde-music` opens + browses with no manual connect. Best-effort:
+/// a write/secret failure is logged, never fatal to the join.
+fn write_music_birthright_best_effort(workgroup_root: &std::path::Path) {
+    use mackesd_core::ipc::secret_store::{repo_root, SecretStore};
+    use mackesd_core::mesh_media;
+    // The shared password is only present once the leader has distributed it; a
+    // fresh node may not have it yet (None) — seed the rest regardless.
+    let password = SecretStore::resolve(&repo_root(), workgroup_root)
+        .get(&mesh_media::media_account_secret_ref())
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let path = mesh_media::airsonic_creds_path();
+    match mesh_media::write_music_birthright(&path, mesh_media::MEDIA_ACCOUNT_USER, &password) {
+        Ok(()) => {
+            if password.is_empty() {
+                println!(
+                    "music: seeded {} → music.mesh (shared-account password pending the leader-managed secret)",
+                    path.display()
+                );
+            } else {
+                println!(
+                    "music: wrote birthright {} → music.mesh:4533",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => eprintln!("music: could not write airsonic-creds birthright ({e})"),
+    }
 }
 
 /// BIRTHRIGHT-1 — install LizardFS + stand up QNM-Shared (the §1 shared-state

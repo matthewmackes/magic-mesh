@@ -220,6 +220,16 @@ impl NebulaCaBackup {
 
     /// One backup pass. Pulled out for direct testing.
     pub async fn tick_once(&self) {
+        // LH-JOIN-QNM-1: never seed the sealed CA backup into the bare
+        // canonical mountpoint before QNM-Shared mounts — that helps wedge a
+        // fresh lighthouse's mfsmount ("mountpoint is not empty"). The bundle
+        // is the mesh's DR copy and belongs on the real shared mount; writing
+        // it to an unmounted-local dir is both useless (invisible to peers/DR)
+        // and a poisoner. Retried next tick once mounted. Mirrors the
+        // ssh_pubkey_gossip / telemetry / validation_suite guard.
+        if !crate::shared_root_writable(&self.workgroup_root) {
+            return;
+        }
         // ENT-11 — systemd-creds first, env fallback (C8).
         let passphrase = match self.read_passphrase() {
             p if !p.is_empty() => p,
@@ -545,6 +555,41 @@ mod tests {
         let plain = crate::ca::backup::unseal("test-passphrase", &sealed).expect("unseal");
         assert_eq!(plain.mesh_id, "test-mesh");
         assert_eq!(plain.ca_certs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tick_skips_the_unmounted_canonical_root() {
+        // LH-JOIN-QNM-1: rooted at the canonical mountpoint that isn't a real
+        // mount, tick_once is a guarded no-op — it never seeds the bare
+        // mountpoint with the sealed bundle (which would wedge a fresh
+        // lighthouse's mfsmount). The happy-path test above proves a writable
+        // (tempdir) root still gets the backup, so the guard isn't over-broad.
+        let mounted = std::fs::read_to_string("/proc/mounts")
+            .map(|c| {
+                c.lines()
+                    .any(|l| l.split_whitespace().nth(1) == Some(crate::CANONICAL_QNM_MOUNT))
+            })
+            .unwrap_or(false);
+        if mounted {
+            return; // the rare host that actually has QNM-Shared mounted
+        }
+        let store = fresh_store();
+        let env_var = unique_passphrase_env("skips_canonical");
+        std::env::set_var(&env_var, "test-passphrase");
+        let w = NebulaCaBackup::new(
+            PathBuf::from(crate::CANONICAL_QNM_MOUNT),
+            "peer:lh".into(),
+            "test-mesh".into(),
+            store,
+        )
+        .with_passphrase_env(env_var.clone());
+        w.tick_once().await; // guarded no-op — no panic, no write under /mnt
+        std::env::remove_var(&env_var);
+        assert!(!w.backup_path().exists());
+        assert_eq!(
+            crate::shared_root_writable(Path::new(crate::CANONICAL_QNM_MOUNT)),
+            mounted
+        );
     }
 
     #[tokio::test]

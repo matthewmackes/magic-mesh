@@ -17,7 +17,7 @@
 //! the peers with presence + battery, Ring + Send-file (the live
 //! Connect verbs), and a jump to the KDC hub.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cosmic::iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use cosmic::iced::Task;
@@ -173,7 +173,17 @@ pub struct PeersPanel {
     /// "empty mesh" guidance, so the multi-minute cold-boot warm-up doesn't look
     /// broken. Read from `state/boot-readiness` only when the roster is empty.
     pub boot_converging: bool,
+    /// MOTION-TRANS-3 — the keyed-diff reveal: a peer that just enrolled (appears
+    /// on a directory refresh) slides up + fades into the table, while rows
+    /// already on screen stay put (the roster doesn't restroke). Keyed by
+    /// `hostname`; only the List view samples it (the Map view paints nodes).
+    reveal: mde_theme::animation::KeyedListReveal,
 }
+
+/// MOTION-TRANS-3 — stable scrollable id so the peers table keeps its scroll
+/// position across a directory refresh (it doesn't jump when a peer is
+/// enrolled/dropped).
+const LIST_ID: &str = "peers-table-list";
 
 /// PD-8 — the four L14 series, oldest→newest over the last ~60 s.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -192,6 +202,9 @@ pub enum Message {
     /// PEERS-DT — sort the table by a column (re-click toggles direction).
     SortBy(SortColumn),
     RefreshClicked,
+    /// MOTION-TRANS-3 — advance the peer-insert reveal one frame (central
+    /// in-flight-only tick from `app.rs`; GC's settled reveals so it self-stops).
+    AnimTick,
     /// PD-5 — launch a connection op against the selected peer.
     Op(crate::launcher::Protocol, String),
     /// PD-5 — a launch finished (spawned or failed).
@@ -858,8 +871,16 @@ impl PeersPanel {
             // PEERS-DT — default sort Status, online-first (ascending rank).
             sort: SortColumn::Status,
             sort_asc: true,
+            reveal: mde_theme::animation::KeyedListReveal::new(crate::live_theme::reduce_motion()),
             ..Self::default()
         }
+    }
+
+    /// MOTION-TRANS-3 — does the peer-insert reveal still have a frame to draw?
+    /// The app gates the panel's per-frame reveal tick on this (idle ⇒ no tick).
+    #[must_use]
+    pub fn needs_tick(&self, now: Instant) -> bool {
+        !self.reveal.is_idle(now)
     }
 
     /// PEERS-DT — the rows in current sort order, with the search filter
@@ -954,6 +975,14 @@ impl PeersPanel {
             Message::Loaded(result) => {
                 match result {
                     Ok(rows) => {
+                        // MOTION-TRANS-3 — diff the freshly-loaded roster against
+                        // the last frame so a newly-enrolled peer reveals in (the
+                        // first load is treated as the table appearing — no mass
+                        // reveal).
+                        let now = Instant::now();
+                        self.reveal
+                            .sync(rows.iter().map(|r| r.hostname.clone()), now);
+                        self.reveal.gc(now);
                         self.rows = rows;
                         self.loaded = Some(Ok(()));
                         // BOOT-PEERS-1 — only when the roster is empty do we read
@@ -1024,6 +1053,11 @@ impl PeersPanel {
             // re-read the directory; the Loaded handler keeps the
             // operator's filter + selection across the swap.
             Message::RefreshClicked | Message::PollTick => Self::load(),
+            // MOTION-TRANS-3 — drop settled reveals so the reveal tick stops.
+            Message::AnimTick => {
+                self.reveal.gc(Instant::now());
+                Task::none()
+            }
             Message::Op(proto, host) => {
                 self.op_result = format!("launching {} → {host}…", proto.label());
                 let label = proto.label();
@@ -1944,6 +1978,8 @@ impl PeersPanel {
             }
         };
 
+        // MOTION-TRANS-3 — a single clock read for this frame's reveal sampling.
+        let reveal_now = Instant::now();
         for r in self.sorted_rows() {
             let expanded = self.selected.as_deref() == Some(r.hostname.as_str());
             let chevron = if expanded { "▾" } else { "▸" };
@@ -2008,12 +2044,29 @@ impl PeersPanel {
             .spacing(8)
             .align_y(vcenter);
             let host = r.hostname.clone();
+            // A freshly-enrolled peer starts a few px low and rises to rest,
+            // applied as decaying top padding (iced 0.13 has no transform widget —
+            // the translate-as-padding idiom). `0` once settled, so the resting
+            // table layout is unchanged.
+            let slide = self
+                .reveal
+                .row_params(&r.hostname, reveal_now)
+                .translate_y
+                .max(0.0);
             table = table.push(
-                button(cells)
-                    .width(Length::Fill)
-                    .padding(Padding::from([6u16, 6u16]))
-                    .sty(row_style(row_bg))
-                    .on_press(crate::Message::Peers(Message::Select(host))),
+                container(
+                    button(cells)
+                        .width(Length::Fill)
+                        .padding(Padding::from([6u16, 6u16]))
+                        .sty(row_style(row_bg))
+                        .on_press(crate::Message::Peers(Message::Select(host))),
+                )
+                .padding(Padding {
+                    top: slide,
+                    right: 0.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                }),
             );
             if expanded {
                 if let Some(d) = detail_slot.take() {
@@ -2103,7 +2156,7 @@ impl PeersPanel {
             }
         }
 
-        let right = container(scrollable(table))
+        let right = container(scrollable(table).id(cosmic::iced::widget::Id::new(LIST_ID)))
             .width(Length::Fill)
             .height(Length::Fill)
             .padding(Padding::from([0u16, 4u16]));
@@ -3088,5 +3141,50 @@ mod tests {
         let _ = p.update(Message::Loaded(Err("mackesd unreachable".into())));
         assert!(matches!(&p.loaded, Some(Err(e)) if e.contains("unreachable")));
         let _ = p.view(); // renders the guided state without panic
+    }
+
+    /// A roster of bare-hostname peers (the reveal keys on `hostname`).
+    fn roster(hosts: &[&str]) -> Vec<PeerRow> {
+        hosts
+            .iter()
+            .map(|h| PeerRow {
+                hostname: (*h).to_string(),
+                ..PeerRow::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn first_load_seeds_without_revealing_then_an_insert_reveals() {
+        // MOTION-TRANS-3 — opening the panel (first Loaded) seeds the table with
+        // no mass reveal; a later directory refresh that enrolls a peer reveals it,
+        // so the panel reports it needs a per-frame reveal tick.
+        let mut p = PeersPanel::new();
+        let now = Instant::now();
+        let _ = p.update(Message::Loaded(Ok(roster(&["anvil", "pine"]))));
+        assert!(
+            !p.needs_tick(now),
+            "the initial roster must not mass-reveal (no reveal tick needed)"
+        );
+        let _ = p.update(Message::Loaded(Ok(roster(&["anvil", "pine", "maple"]))));
+        assert!(
+            p.needs_tick(Instant::now()),
+            "a newly-enrolled peer reveals → the panel needs a tick"
+        );
+    }
+
+    #[test]
+    fn anim_tick_settles_the_reveal_and_stops_the_clock() {
+        // MOTION-TRANS-3 — once the reveal's panel-mount duration has elapsed, an
+        // AnimTick GC's it and the panel goes idle (the reveal tick stops).
+        let mut p = PeersPanel::new();
+        let _ = p.update(Message::Loaded(Ok(roster(&["anvil"]))));
+        let _ = p.update(Message::Loaded(Ok(roster(&["anvil", "pine"]))));
+        let _ = p.update(Message::AnimTick);
+        let later = Instant::now() + mde_theme::motion::Motion::panel_mount().duration;
+        assert!(
+            !p.needs_tick(later),
+            "a settled reveal needs no further ticks"
+        );
     }
 }

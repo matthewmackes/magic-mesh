@@ -43,7 +43,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mackes_xcp::{
-    build_identity_seed, mde_vm_hostname, HostCapacity, HostTarget, Hypervisor, VmInfo, XeSsh,
+    build_identity_seed, build_join_seed, mde_vm_hostname, precheck_host_memory, HostCapacity,
+    HostTarget, Hypervisor, VmInfo, XeSsh, DEFAULT_SERVER_VM_MEM_BYTES, HOST_MEM_HEADROOM_KIB,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -90,6 +91,16 @@ pub const SET_CREDS_TOPIC: &str = "action/provision/set-creds";
 
 /// The golden template every spawn clones (design A2).
 pub const GOLDEN_TEMPLATE: &str = "MDE-VM-golden";
+
+/// The role every provisioned MDE-VM pins on join — headless **Server** (design
+/// A2/§5; XPA-1 right-sizes its memory, XPA-7 mints its join token for this role).
+pub const SPAWN_ROLE: &str = "server";
+
+/// XCP-6 — max age of a published `compute/xcp-host/<node>` capacity advert before
+/// the host-capacity consumer ignores it and direct-probes the dom0 instead. The
+/// `xcp_host` worker republishes every 15 s ([`super::xcp_host::INTERVAL`]), so
+/// 60 s tolerates a few missed ticks while still catching a dom0 gone quiet.
+pub const PUBLISHED_CAP_MAX_AGE_MS: u64 = 60_000;
 
 /// Poll cadence for the spawn topic.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -395,35 +406,68 @@ pub fn resolve_dom0(requested: Option<&str>, allowed: &[String]) -> Result<Strin
 
 /// Drive the full A-plane spawn over a [`Hypervisor`].
 ///
-/// Clones the golden, attaches the fresh identity seed, starts, and polls for
-/// the IP. Generic over the hypervisor so the reachability of `set_identity_seed`
-/// is provable with a mock (no live dom0). `op_ssh_key` is the operator's
-/// authorized public key the seed installs. `wait`/`poll` bound the IP wait
-/// (0 ⇒ skip the wait).
+/// Precheck → clone → right-size memory (XPA-1) → reset VIF MACs (XPA-4) → attach
+/// the fresh identity seed (with the XPA-7 self-join when `join_token` is set) →
+/// start → poll for the IP. Generic over the hypervisor so the whole flow's
+/// reachability is provable with a mock (no live dom0).
+///
+/// - `op_ssh_key` is the operator's authorized public key the seed installs.
+/// - `role` is the role a self-joining clone pins (headless [`SPAWN_ROLE`]).
+/// - `join_token` is the **v3 add-peer** join token (XPA-7) the clone runs
+///   `mackesd join` with on first boot; `None` ⇒ no auto-join (the clone still
+///   boots with the op key + hostname, the operator joins it).
+/// - `wait`/`poll` bound the IP wait (0 ⇒ skip the wait).
 ///
 /// Returns the success-ack body; `Err(description)` becomes an error-ack.
 ///
 /// # Errors
-/// Any `xe`/`ssh` step failing (clone / seed / start) aborts the spawn.
+/// The host-memory precheck (XPA-1) failing, or any `xe`/`ssh` step (capacity /
+/// clone / memory / VIF / seed / start) failing, aborts the spawn.
 pub fn run_spawn<H: Hypervisor>(
     hv: &H,
     name: &str,
     op_ssh_key: &str,
+    role: &str,
+    join_token: Option<&str>,
     wait: Duration,
     poll: Duration,
 ) -> Result<String, String> {
     let hostname = mde_vm_hostname(name);
+
+    // 1. XPA-1 — host-free-memory precheck BEFORE the clone, so an over-committed
+    //    host fails fast with a clear message instead of cloning a VM that then
+    //    can't start ("a 15.9 GB host couldn't start 4×4 GB VMs + the base").
+    let cap = hv
+        .host_capacity()
+        .map_err(|e| format!("probe host capacity (pre-spawn): {e}"))?;
+    let per_vm_kib = DEFAULT_SERVER_VM_MEM_BYTES / 1024;
+    precheck_host_memory(&cap, per_vm_kib, 1, HOST_MEM_HEADROOM_KIB)?;
 
     // 2a. Clone the golden template into the new MDE-VM.
     let uuid = hv
         .clone_golden(GOLDEN_TEMPLATE, &hostname)
         .map_err(|e| format!("clone {GOLDEN_TEMPLATE} → {hostname}: {e}"))?;
 
-    // 2b. THE load-bearing step — attach the fresh cloud-init identity seed so
-    //     the clone boots with a new hostname/host-keys/machine-id + the op key
-    //     (A2). The instance-id is the new uuid, which makes cloud-init treat the
-    //     clone as a first boot.
-    let seed = build_identity_seed(name, op_ssh_key, &uuid);
+    // 2b. XPA-1 — right-size the clone to the headless-Server default (2 GB), not
+    //     the golden's larger size (must happen while halted, before start).
+    hv.set_memory(&uuid, DEFAULT_SERVER_VM_MEM_BYTES)
+        .map_err(|e| format!("right-size memory on {uuid}: {e}"))?;
+
+    // 2c. XPA-4 — give every VIF a fresh MAC so clones don't collide on the
+    //     golden's copied MAC (also while halted).
+    hv.reset_vif_macs(&uuid)
+        .map_err(|e| format!("reset VIF MAC on {uuid}: {e}"))?;
+
+    // 2d. THE load-bearing step — attach the fresh cloud-init identity seed so the
+    //     clone boots with a new hostname/host-keys/machine-id + the op key (A2).
+    //     XPA-7: when a v3 join token was minted, the seed ALSO self-enrolls the
+    //     clone via `mackesd join` against the PUBLIC /enroll endpoint the token
+    //     pins (NOT the legacy enroll-token's unreachable overlay IP — subsumes
+    //     XPA-5). The instance-id is the new uuid (cloud-init first-boot trigger).
+    let seed = join_token.map_or_else(
+        || build_identity_seed(name, op_ssh_key, &uuid),
+        |tok| build_join_seed(name, op_ssh_key, &uuid, tok, role),
+    );
     hv.set_identity_seed(&uuid, &seed)
         .map_err(|e| format!("attach identity seed to {uuid}: {e}"))?;
 
@@ -541,13 +585,75 @@ fn spawn_over_ssh(req: &SpawnRequest) -> Result<String, String> {
         req.host.as_deref(),
         &allowed_dom0s(),
     )?));
+    // XPA-7 — mint a single-use v3 join token (add-peer) so the clone self-enrolls
+    // on first boot against the PUBLIC /enroll endpoint. Best-effort: a non-founded
+    // provisioning node degrades to no auto-join rather than failing the spawn.
+    let join_token = mint_join_token(SPAWN_ROLE, &req.name);
     run_spawn(
         &hv,
         &req.name,
         &operator_ssh_key(),
+        SPAWN_ROLE,
+        join_token.as_deref(),
         IP_WAIT_TIMEOUT,
         IP_WAIT_POLL,
     )
+}
+
+/// Build the `mackesd add-peer` argv that mints a **v3** join token for a clone
+/// (XPA-7). Letting add-peer auto-detect this lighthouse's public IPv4 + use the
+/// default `/enroll` port is exactly what pins the *reachable* endpoint + cert
+/// fingerprint into the token (the v3 contract) — the fix for the legacy
+/// `enroll-token`, which advertised the unreachable Nebula overlay IP (XPA-5).
+#[must_use]
+pub fn mackesd_add_peer_argv(role: &str, note: &str) -> Vec<String> {
+    vec![
+        "add-peer".into(),
+        "--role".into(),
+        role.into(),
+        "--note".into(),
+        note.into(),
+    ]
+}
+
+/// XPA-7 — mint a single-use v3 join token for a clone by running
+/// `mackesd add-peer` on THIS (founded-lighthouse / leader) node, reusing the
+/// same binary that's currently executing (`current_exe`). The minted token pins
+/// the public `/enroll` endpoint (`:4243`) + the endpoint cert fingerprint, so a
+/// fresh LAN/internet clone can actually reach it.
+///
+/// Returns `None` — degrade to no auto-join, the spawn still succeeds — when
+/// add-peer isn't possible (this node isn't a founded lighthouse, the binary is
+/// missing, or it emitted no parseable token). Validated through the canonical
+/// [`crate::nebula_enroll::parse_join_token`] so a non-token stdout never rides
+/// into the seed.
+fn mint_join_token(role: &str, name: &str) -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let note = format!("xcp-provision {name}");
+    let out = std::process::Command::new(&exe)
+        .args(mackesd_add_peer_argv(role, &note))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        tracing::warn!(
+            role, name,
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "xcp_provision: `mackesd add-peer` failed; clone will boot without auto-join"
+        );
+        return None;
+    }
+    // add-peer prints the token on stdout; status/help goes to stderr.
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if crate::nebula_enroll::parse_join_token(&token).is_some() {
+        Some(token)
+    } else {
+        tracing::warn!(
+            role,
+            name,
+            "xcp_provision: add-peer produced no parseable join token; no auto-join"
+        );
+        None
+    }
 }
 
 /// The xe-over-SSH target reaching a single dom0 (the same target
@@ -582,7 +688,10 @@ fn hv_target_with_store(dom0: &str, store: &SecretStore) -> HostTarget {
 /// the deployed repo, not the systemd cwd `/`) with the local-AEAD fallback rooted
 /// under the workgroup volume.
 fn dom0_secret_store() -> SecretStore {
-    SecretStore::resolve(&secret_store::repo_root(), &crate::default_qnm_shared_root())
+    SecretStore::resolve(
+        &secret_store::repo_root(),
+        &crate::default_qnm_shared_root(),
+    )
 }
 
 /// Store-injected core of [`dom0_password`] — read `xcp/<dom0>` from `store`,
@@ -654,14 +763,32 @@ fn list_all_vms() -> Vec<ListedVm> {
     out
 }
 
-/// Probe every configured dom0's capacity for a [`HOSTS_TOPIC`] reply, recording
-/// an error row for any host that didn't answer (so the panel can grey it out).
-fn probe_all_hosts() -> Vec<HostRow> {
+/// Resolve each configured dom0's capacity for a [`HOSTS_TOPIC`] reply (XCP-6).
+///
+/// **Primary source: the published advert.** The `xcp_host` worker publishes each
+/// dom0's capacity to `compute/xcp-host/<node>` on a 15 s cadence; this consumer
+/// prefers a FRESH one of those (matched to the dom0 by its advertised address /
+/// hostname) over a fresh SSH probe — so the common "list spawn targets" path
+/// costs a local bus read, not N round-trips of `xe` over SSH. A direct probe is
+/// the fallback **only** when no fresh advert matches (absent / stale dom0), so
+/// the result is never worse than the prior always-probe behaviour; a per-host
+/// probe failure records an error row (so the panel can grey it out).
+fn probe_all_hosts(bus_root: &Path) -> Vec<HostRow> {
     // One store resolution for the whole probe sweep (XCP-7 efficiency).
     let store = dom0_secret_store();
+    // One bus read of all published adverts for the whole sweep (XCP-6).
+    let published = read_published_caps(bus_root);
+    let now = now_ms();
     allowed_dom0s()
         .into_iter()
         .map(|dom0| {
+            // XCP-6: a fresh published advert wins — no SSH needed.
+            if let Some(p) =
+                select_published_capacity(&dom0, &published, now, PUBLISHED_CAP_MAX_AGE_MS)
+            {
+                return HostRow::ok(&dom0, &p.capacity);
+            }
+            // Fallback: the advert is absent/stale → probe the dom0 directly.
             let hv = XeSsh::new(hv_target_with_store(&dom0, &store));
             match hv.host_capacity() {
                 Ok(cap) => HostRow::ok(&dom0, &cap),
@@ -669,6 +796,112 @@ fn probe_all_hosts() -> Vec<HostRow> {
             }
         })
         .collect()
+}
+
+/// A parsed `compute/xcp-host/<node>` capacity advert (XCP-6). The provisioner
+/// prefers a fresh one of these over a direct SSH probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedCapacity {
+    /// The dom0's reachable address the advert carried (matches an
+    /// `MCNF_XEN_DOM0S` allow-list entry — the primary match key).
+    pub address: String,
+    /// The dom0 hostname (secondary match key, for an allow-list keyed by name).
+    pub hostname: String,
+    /// Publish timestamp (ms since epoch) — drives the staleness check.
+    pub ts_ms: u64,
+    /// The advertised capacity.
+    pub capacity: HostCapacity,
+}
+
+/// Parse one `compute/xcp-host/<node>` advert body (the [`super::xcp_host`] doc)
+/// into a [`PublishedCapacity`]. `None` when the body isn't an `xcp-host` doc /
+/// is malformed. Pure so the selection logic is testable without the bus.
+#[must_use]
+pub fn parse_published_capacity(body: &str) -> Option<PublishedCapacity> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("kind").and_then(serde_json::Value::as_str) != Some("xcp-host") {
+        return None;
+    }
+    let cap = v.get("capacity")?;
+    let u64f = |k: &str| cap.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let u32f = |k: &str| u32::try_from(u64f(k)).unwrap_or(0);
+    let strf = |k: &str| {
+        v.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(PublishedCapacity {
+        address: strf("address"),
+        hostname: strf("hostname"),
+        ts_ms: v
+            .get("ts_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        capacity: HostCapacity {
+            cpu_count: u32f("cpu_count"),
+            mem_total_kib: u64f("mem_total_kib"),
+            mem_free_kib: u64f("mem_free_kib"),
+            sr_free_bytes: u64f("sr_free_bytes"),
+            running_vms: u32f("running_vms"),
+        },
+    })
+}
+
+/// XCP-6 selection: the freshest published advert for `dom0` (matched by the
+/// advert's address or hostname) that is within `max_age_ms` of `now_ms`, or
+/// `None` when none match / all are stale (the caller then direct-probes).
+#[must_use]
+pub fn select_published_capacity<'a>(
+    dom0: &str,
+    published: &'a [PublishedCapacity],
+    now_ms: u64,
+    max_age_ms: u64,
+) -> Option<&'a PublishedCapacity> {
+    published
+        .iter()
+        .filter(|p| p.address == dom0 || p.hostname == dom0)
+        .filter(|p| now_ms.saturating_sub(p.ts_ms) <= max_age_ms)
+        .max_by_key(|p| p.ts_ms)
+}
+
+/// Read the latest published `compute/xcp-host/*` advert per topic from the bus
+/// (XCP-6). A bus fault / missing topic degrades to an empty list → every dom0
+/// direct-probes (the prior behaviour), so this is a safe optimization, never a
+/// regression.
+fn read_published_caps(bus_root: &Path) -> Vec<PublishedCapacity> {
+    let Ok(persist) = Persist::open(bus_root.to_path_buf()) else {
+        return vec![];
+    };
+    let Ok(topics) = persist.list_topics() else {
+        return vec![];
+    };
+    let prefix = super::xcp_host::TOPIC_PREFIX;
+    let mut out = Vec::new();
+    for topic in topics {
+        if !topic.starts_with(prefix) {
+            continue;
+        }
+        // The newest message on the topic is the current advert.
+        let Ok(msgs) = persist.list_since(&topic, None) else {
+            continue;
+        };
+        if let Some(cap) = msgs
+            .last()
+            .and_then(|m| m.body.as_deref())
+            .and_then(parse_published_capacity)
+        {
+            out.push(cap);
+        }
+    }
+    out
+}
+
+/// Wall-clock ms since the epoch (stamps the XCP-6 freshness check).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Resolve a name-on-a-dom0 request to its live `(XeSsh, uuid)`: resolve the
@@ -766,7 +999,11 @@ fn handle_list_blocking(bus_root: &Path, req_ulid: &str) {
 
 /// Handle one [`HOSTS_TOPIC`] request on a blocking thread + write the reply.
 fn handle_hosts_blocking(bus_root: &Path, req_ulid: &str) {
-    write_reply(bus_root, req_ulid, &build_hosts_reply(&probe_all_hosts()));
+    write_reply(
+        bus_root,
+        req_ulid,
+        &build_hosts_reply(&probe_all_hosts(bus_root)),
+    );
 }
 
 /// Handle one [`DESTROY_TOPIC`] request on a blocking thread + write the reply.
@@ -1076,6 +1313,18 @@ mod tests {
             *self.seeded_uuid.borrow_mut() = Some(uuid.to_string());
             Ok(())
         }
+        fn set_memory(&self, uuid: &str, bytes: u64) -> Result<(), XcpError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("set_memory({uuid},{bytes})"));
+            Ok(())
+        }
+        fn reset_vif_macs(&self, uuid: &str) -> Result<(), XcpError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("reset_vif_macs({uuid})"));
+            Ok(())
+        }
         fn start(&self, uuid: &str) -> Result<(), XcpError> {
             self.calls.borrow_mut().push(format!("start({uuid})"));
             Ok(())
@@ -1091,44 +1340,60 @@ mod tests {
             unreachable!("list is not part of the spawn flow")
         }
         fn host_capacity(&self) -> Result<HostCapacity, XcpError> {
-            unreachable!("host_capacity is not part of the spawn flow")
+            // The XPA-1 precheck probes capacity first; report a roomy host so the
+            // happy-path flow proceeds to the clone.
+            self.calls.borrow_mut().push("host_capacity".to_string());
+            Ok(HostCapacity {
+                cpu_count: 8,
+                mem_total_kib: 32 * 1024 * 1024,
+                mem_free_kib: 16 * 1024 * 1024,
+                sr_free_bytes: 500_000_000_000,
+                running_vms: 1,
+            })
         }
     }
 
     #[test]
-    fn run_spawn_calls_set_identity_seed_between_clone_and_start() {
+    fn run_spawn_drives_the_full_flow_in_order() {
         let hv = MockHv::default();
         let ack = run_spawn(
             &hv,
             "web1",
             "ssh-ed25519 OPKEY op@host",
+            SPAWN_ROLE,
+            None,           // no join token → plain identity seed
             Duration::ZERO, // skip the wait — vm_ip is probed once
             Duration::from_millis(1),
         )
         .expect("spawn ok");
 
-        // REACHABILITY ASSERTION — set_identity_seed is invoked, in order,
-        // between the clone and the start. This is the whole point of the unit:
-        // a provisioned VM actually gets its identity seed.
+        // REACHABILITY ASSERTION — the full XPA-1/4 + seed flow runs in order:
+        // precheck (host_capacity) → clone → right-size memory → reset VIF MACs →
+        // identity seed → start → ip. This proves every step is actually reached.
         let calls = hv.calls.borrow().clone();
         assert_eq!(
             calls,
             vec![
+                "host_capacity".to_string(),
                 "clone(MDE-VM-golden->MDE-VM-web1)".to_string(),
+                format!("set_memory(uuid-xyz,{})", 2u64 * 1024 * 1024 * 1024),
+                "reset_vif_macs(uuid-xyz)".to_string(),
                 "seed(uuid-xyz)".to_string(),
                 "start(uuid-xyz)".to_string(),
                 "vm_ip".to_string(),
             ],
-            "set_identity_seed must run between clone_golden and start"
+            "precheck→clone→memory→vif→seed→start must run in order"
         );
 
         // The seed was attached to the freshly cloned uuid…
         assert_eq!(hv.seeded_uuid.borrow().as_deref(), Some("uuid-xyz"));
         // …and it carries the op key + the MDE-VM hostname + the uuid as the
-        // first-boot instance-id (the A2 fresh-identity rule).
+        // first-boot instance-id (the A2 fresh-identity rule). No join token ⇒ no
+        // self-join runcmd.
         let seed = hv.seed.borrow().clone().expect("seed recorded");
         assert!(seed.user_data.contains("hostname: MDE-VM-web1"));
         assert!(seed.user_data.contains("ssh-ed25519 OPKEY op@host"));
+        assert!(!seed.user_data.contains("mackesd"));
         assert_eq!(seed.instance_id, "uuid-xyz");
 
         // The ack reports the booted VM identity + the resolved IP.
@@ -1136,6 +1401,84 @@ mod tests {
         assert_eq!(v["uuid"], "uuid-xyz");
         assert_eq!(v["hostname"], "MDE-VM-web1");
         assert_eq!(v["ip"], "10.42.0.9");
+    }
+
+    #[test]
+    fn run_spawn_embeds_the_v3_self_join_when_a_token_is_minted() {
+        // XPA-7 — with a v3 join token the seed self-enrolls the clone via
+        // `mackesd join` against the token's PUBLIC endpoint (subsumes XPA-5).
+        let hv = MockHv::default();
+        let token = "mesh:home@203.0.113.5:4243#BEARERxyz?fp=deadbeefdeadbeef";
+        run_spawn(
+            &hv,
+            "web1",
+            "ssh-ed25519 OPKEY op@host",
+            SPAWN_ROLE,
+            Some(token),
+            Duration::ZERO,
+            Duration::from_millis(1),
+        )
+        .expect("spawn ok");
+        let seed = hv.seed.borrow().clone().expect("seed recorded");
+        // The clone runs `mackesd join '<token>' --role server` as an exec list —
+        // the token (with its overlay-IP-killing public endpoint) rides verbatim.
+        assert!(
+            seed.user_data.contains(&format!(
+                "[ 'mackesd', 'join', '{token}', '--role', 'server' ]"
+            )),
+            "missing v3 self-join runcmd: {}",
+            seed.user_data
+        );
+    }
+
+    #[test]
+    fn run_spawn_aborts_early_when_the_host_is_over_committed() {
+        // XPA-1 — the precheck fails BEFORE any clone, with a clear message.
+        struct TightHost;
+        impl Hypervisor for TightHost {
+            fn host_capacity(&self) -> Result<HostCapacity, XcpError> {
+                // Only 1 GiB free — can't fit a 2 GiB Server VM + headroom.
+                Ok(HostCapacity {
+                    mem_free_kib: 1024 * 1024,
+                    ..HostCapacity::default()
+                })
+            }
+            fn clone_golden(&self, _g: &str, _n: &str) -> Result<String, XcpError> {
+                panic!("clone must not run after a failed precheck");
+            }
+            fn set_identity_seed(&self, _u: &str, _s: &IdentitySeed) -> Result<(), XcpError> {
+                unreachable!()
+            }
+            fn set_memory(&self, _u: &str, _b: u64) -> Result<(), XcpError> {
+                unreachable!()
+            }
+            fn reset_vif_macs(&self, _u: &str) -> Result<(), XcpError> {
+                unreachable!()
+            }
+            fn start(&self, _u: &str) -> Result<(), XcpError> {
+                unreachable!()
+            }
+            fn vm_ip(&self, _u: &str) -> Result<Option<String>, XcpError> {
+                unreachable!()
+            }
+            fn destroy(&self, _u: &str) -> Result<(), XcpError> {
+                unreachable!()
+            }
+            fn list(&self) -> Result<Vec<VmInfo>, XcpError> {
+                unreachable!()
+            }
+        }
+        let err = run_spawn(
+            &TightHost,
+            "web1",
+            "ssh-ed25519 K op@h",
+            SPAWN_ROLE,
+            None,
+            Duration::ZERO,
+            Duration::from_millis(1),
+        )
+        .expect_err("over-committed host must fail the precheck");
+        assert!(err.contains("insufficient host free memory"), "{err}");
     }
 
     /// A failing `set_identity_seed` must abort the spawn (the VM never starts
@@ -1151,6 +1494,12 @@ mod tests {
             fn set_identity_seed(&self, _u: &str, _s: &IdentitySeed) -> Result<(), XcpError> {
                 Err(XcpError::Parse("boom".into()))
             }
+            fn set_memory(&self, _u: &str, _b: u64) -> Result<(), XcpError> {
+                Ok(())
+            }
+            fn reset_vif_macs(&self, _u: &str) -> Result<(), XcpError> {
+                Ok(())
+            }
             fn start(&self, _u: &str) -> Result<(), XcpError> {
                 panic!("start must not run after a seed failure");
             }
@@ -1164,13 +1513,19 @@ mod tests {
                 unreachable!()
             }
             fn host_capacity(&self) -> Result<HostCapacity, XcpError> {
-                unreachable!()
+                // Roomy host so the precheck passes and we reach the seed step.
+                Ok(HostCapacity {
+                    mem_free_kib: 16 * 1024 * 1024,
+                    ..HostCapacity::default()
+                })
             }
         }
         let err = run_spawn(
             &SeedFails,
             "web1",
             "ssh-ed25519 K op@h",
+            SPAWN_ROLE,
+            None,
             Duration::ZERO,
             Duration::from_millis(1),
         )
@@ -1392,5 +1747,139 @@ mod tests {
         assert!(err.contains("allow-list"), "{err}");
         // Nothing was written for the rejected host.
         assert_eq!(read_dom0_password(&store, "9.9.9.9"), None);
+    }
+
+    // ── XPA-7: the add-peer token-minting command ──
+
+    #[test]
+    fn mackesd_add_peer_argv_mints_a_v3_token_for_the_server_role() {
+        // Auto-detected lighthouse + default enroll port is exactly what pins the
+        // reachable /enroll endpoint + fp into the v3 token (the XPA-5 fix).
+        assert_eq!(
+            mackesd_add_peer_argv("server", "xcp-provision web1"),
+            vec![
+                "add-peer",
+                "--role",
+                "server",
+                "--note",
+                "xcp-provision web1"
+            ]
+        );
+    }
+
+    // ── XCP-6: consume the published capacity advert ──
+
+    fn xcp_host_body(address: &str, hostname: &str, ts_ms: u64, mem_free_kib: u64) -> String {
+        // The exact shape the `xcp_host` worker publishes (super::xcp_host::xcp_host_doc).
+        serde_json::json!({
+            "ok": true,
+            "kind": "xcp-host",
+            "role": "hypervisor",
+            "node_id": format!("peer:{hostname}"),
+            "hostname": hostname,
+            "address": address,
+            "ts_ms": ts_ms,
+            "capacity": {
+                "cpu_count": 8,
+                "mem_total_kib": 32 * 1024 * 1024_u64,
+                "mem_free_kib": mem_free_kib,
+                "sr_free_bytes": 500_000_000_000_u64,
+                "running_vms": 2,
+            },
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn parse_published_capacity_decodes_an_xcp_host_doc() {
+        let p = parse_published_capacity(&xcp_host_body(
+            "172.20.0.9",
+            "xen-home",
+            42,
+            9 * 1024 * 1024,
+        ))
+        .expect("parse");
+        assert_eq!(p.address, "172.20.0.9");
+        assert_eq!(p.hostname, "xen-home");
+        assert_eq!(p.ts_ms, 42);
+        assert_eq!(p.capacity.cpu_count, 8);
+        assert_eq!(p.capacity.mem_free_kib, 9 * 1024 * 1024);
+        assert_eq!(p.capacity.running_vms, 2);
+        // A non-xcp-host body / garbage is rejected.
+        assert!(parse_published_capacity(r#"{"kind":"something-else"}"#).is_none());
+        assert!(parse_published_capacity("not json").is_none());
+    }
+
+    #[test]
+    fn select_published_capacity_prefers_fresh_matching_adverts() {
+        let now = 1_000_000_u64;
+        let fresh = parse_published_capacity(&xcp_host_body(
+            "172.20.0.9",
+            "xen-home",
+            now - 5_000, // 5 s old → fresh
+            9 * 1024 * 1024,
+        ))
+        .unwrap();
+        let stale = parse_published_capacity(&xcp_host_body(
+            "172.20.0.51",
+            "xen-kvm1",
+            now - 120_000, // 2 min old → stale
+            7 * 1024 * 1024,
+        ))
+        .unwrap();
+        let published = vec![fresh, stale];
+
+        // A fresh advert matched by ADDRESS is chosen (no direct probe needed).
+        let hit =
+            select_published_capacity("172.20.0.9", &published, now, PUBLISHED_CAP_MAX_AGE_MS)
+                .expect("fresh advert selected");
+        assert_eq!(hit.capacity.mem_free_kib, 9 * 1024 * 1024);
+        // A stale advert is rejected → caller falls back to a direct probe.
+        assert!(select_published_capacity(
+            "172.20.0.51",
+            &published,
+            now,
+            PUBLISHED_CAP_MAX_AGE_MS
+        )
+        .is_none());
+        // An allow-listed dom0 with no advert at all → None (direct probe).
+        assert!(select_published_capacity(
+            "172.20.0.99",
+            &published,
+            now,
+            PUBLISHED_CAP_MAX_AGE_MS
+        )
+        .is_none());
+        // Matching by HOSTNAME also works (an allow-list keyed by name).
+        assert!(
+            select_published_capacity("xen-home", &published, now, PUBLISHED_CAP_MAX_AGE_MS)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn select_published_capacity_picks_the_newest_when_several_match() {
+        let now = 2_000_000_u64;
+        let older = parse_published_capacity(&xcp_host_body(
+            "172.20.0.9",
+            "xen-home",
+            now - 30_000,
+            5 * 1024 * 1024,
+        ))
+        .unwrap();
+        let newer = parse_published_capacity(&xcp_host_body(
+            "172.20.0.9",
+            "xen-home",
+            now - 2_000,
+            8 * 1024 * 1024,
+        ))
+        .unwrap();
+        let published = vec![older, newer];
+        let hit =
+            select_published_capacity("172.20.0.9", &published, now, PUBLISHED_CAP_MAX_AGE_MS)
+                .expect("a fresh advert");
+        // The newest advert wins (its free-memory figure, not the older one's).
+        assert_eq!(hit.capacity.mem_free_kib, 8 * 1024 * 1024);
+        assert_eq!(hit.ts_ms, now - 2_000);
     }
 }

@@ -28,7 +28,9 @@ use cosmic::Element;
 use mde_theme::{Density, EmptyState, Icon};
 
 use crate::controls::{styled_text_input, variant_button, ButtonVariant};
-use crate::panel_chrome::{card, dialog, empty_state, error_state, panel_container};
+use crate::panel_chrome::{
+    card, dialog, empty_state, error_state, panel_container, reveal_dialog, DialogReveal,
+};
 
 /// Subdirectory name under each snapshot dir that holds the
 /// copied config tree.
@@ -61,6 +63,9 @@ pub struct SnapshotsPanel {
     /// Path of the snapshot pending restore confirmation;
     /// `None` = no confirmation modal up.
     pub pending_restore: Option<String>,
+    /// MOTION-TRANS-2 — open-reveal clock for the restore-confirm dialog (armed
+    /// when the confirm opens, cleared on confirm/cancel).
+    reveal: DialogReveal,
 }
 
 #[derive(Debug, Clone)]
@@ -152,10 +157,16 @@ impl SnapshotsPanel {
                 )
             }
             Message::RestoreClicked(path) => {
+                // MOTION-TRANS-2 — arm the open reveal as the confirm dialog appears.
+                self.reveal.open(
+                    std::time::Instant::now(),
+                    crate::live_theme::reduce_motion(),
+                );
                 self.pending_restore = Some(path);
                 Task::none()
             }
             Message::RestoreConfirmed => {
+                self.reveal.close();
                 let Some(path) = self.pending_restore.take() else {
                     return Task::none();
                 };
@@ -171,6 +182,7 @@ impl SnapshotsPanel {
             }
             Message::RestoreCancelled => {
                 self.pending_restore = None;
+                self.reveal.close();
                 Task::none()
             }
             Message::OperationFinished(result) => {
@@ -332,10 +344,24 @@ impl SnapshotsPanel {
         ]
         .spacing(12)
         .into();
+        // MOTION-TRANS-2 — wrap the restore-confirm dialog in the shared
+        // open-reveal (fake-opacity fade + translate-as-padding rise; instant
+        // under reduce-motion).
         panel_container(
-            dialog(body, crate::live_theme::palette(), Density::Comfortable),
+            reveal_dialog(
+                dialog(body, palette, Density::Comfortable),
+                palette,
+                self.reveal.params(std::time::Instant::now()),
+            ),
             crate::live_theme::tokens().density,
         )
+    }
+
+    /// MOTION-TRANS-2 — the restore-confirm dialog's open-reveal clock for the
+    /// shell's tick-subscription gate ([`crate::panel_chrome::DialogReveal::needs_tick`]).
+    #[must_use]
+    pub fn dialog_reveal(&self) -> &DialogReveal {
+        &self.reveal
     }
 }
 

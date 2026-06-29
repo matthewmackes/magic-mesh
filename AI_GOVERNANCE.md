@@ -104,6 +104,14 @@ MD5/SHA1 is a finding.
   (`install-helpers/lint-carbon-tokens.sh`, in CI). No raw hex / scattered metric
   literals outside the token modules (mark a genuinely-dynamic/test colour
   `// carbon-ok` with a reason).
+- **Motion is part of the token system.** Every animation routes through the one
+  shared vocabulary (`mde-theme::{motion,animation,feedback,load_state,skeleton}`):
+  Carbon duration/easing tokens, the reduce-motion + decorative-motion contracts,
+  and the `Animator`/`Tween` primitives — **no bespoke animation timing literal
+  outside `mde-theme`** (gated by `install-helpers/lint-motion-tokens.sh`, in CI;
+  mark a genuinely-dynamic duration `// motion-ok`). The contributor how-to with a
+  compiling snippet per pattern is [`docs/design/motion-language.md`](docs/design/motion-language.md)
+  (companion to `docs/design/motion-system.md`).
 - **Pure-Rust toolkit:** libcosmic's vendored iced fork (wgpu + cosmic-text, no
   FreeType; carries a11y/accesskit — the full-libcosmic cutover, 2026-06-13), rustls (no
   OpenSSL). GUIs ship as Cosmic apps + a native cosmic-applet; Cosmic draws the
@@ -244,7 +252,11 @@ desktop-personal panels grouped below. Locks (full table: `docs/design/planes.md
 >   `git reset --hard <current-work-tip-sha>` first; have each commit its **disjoint**
 >   files + report the SHA; then **cherry-pick** the SHAs onto the work branch (clean,
 >   since disjoint). **Clean up** the agent worktrees afterward (`git worktree remove`) —
->   their `target/` dirs fill the dev-host disk fast.
+>   their `target/` dirs fill the dev-host disk fast. Each agent's **STEP 0** runs
+>   `install-helpers/check-worktree-isolation.sh` (DRAIN-7): it refuses + exits non-zero
+>   if the cwd is a SHARED checkout (the main `/root/magic-mesh` or the `bright-elm-ajw0` /
+>   `calm-ray-dcr8` worktrees) rather than the agent's own isolated one — a subagent
+>   straying into the shared `calm-ray-dcr8` worktree once silently wiped its work (2026-06-24).
 
 The development toolchain and build environment are documented **once**, in
 [`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md) — **read it before building

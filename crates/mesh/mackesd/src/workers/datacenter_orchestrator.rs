@@ -436,6 +436,45 @@ pub fn parse_xe_srs(output: &str) -> Vec<(String, String, String, String)> {
         .collect()
 }
 
+/// Parse `uuid|name|virtual-size|sr-uuid` lines into VDI tuples. Pure. Skips
+/// empty-uuid lines (mirrors [`parse_xe_srs`]). DC-12: gather VDIs alongside SRs.
+#[must_use]
+pub fn parse_xe_vdis(output: &str) -> Vec<(String, String, String, String)> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut p = l.splitn(4, '|');
+            let u = p.next()?.trim();
+            if u.is_empty() {
+                return None;
+            }
+            let n = p.next().unwrap_or("").trim();
+            let sz = p.next().unwrap_or("").trim();
+            let sr = p.next().unwrap_or("").trim();
+            Some((u.to_string(), n.to_string(), sz.to_string(), sr.to_string()))
+        })
+        .collect()
+}
+
+/// DC-12 — an SR's capacity health from its physical size/used (bytes). PURE.
+/// `fail` at ≥95% used, `warn` at ≥85%, else `ok`. A zero/unknown size yields
+/// `ok` (nothing to alert on). Drives the `event/dc/health/sr-capacity:<id>`
+/// capacity-threshold alert.
+#[must_use]
+pub fn sr_capacity_status(size_bytes: u64, used_bytes: u64) -> &'static str {
+    if size_bytes == 0 {
+        return "ok";
+    }
+    let pct = used_bytes.saturating_mul(100) / size_bytes;
+    if pct >= 95 {
+        "fail"
+    } else if pct >= 85 {
+        "warn"
+    } else {
+        "ok"
+    }
+}
+
 /// Parse the remote `xe` network helper's pipe-delimited `uuid|name|bridge`
 /// lines into `(uuid, name, bridge)` triples. Pure — fed the raw stdout. Skips
 /// lines with an empty uuid (mirrors [`parse_xe_srs`]).
@@ -558,6 +597,12 @@ fn gather_xen() -> Vec<DcResource> {
     // below (the path is published + can degrade to Direct independently).
     let on_lan = node_on_lan();
     let relay = xen_relay_peer();
+    // DATACENTER-16: read the operator's idle-shutdown policy once per pass (the
+    // gate set by `action/dc/host-idle-policy`). Default-disarmed → no shutdowns.
+    let idle_policy = crate::ipc::dc_common::read_arm(
+        &crate::ipc::dc_common::dc_state_dir(std::path::Path::new(".")),
+        "idle-policy",
+    );
     let mut out = Vec::new();
     for dom0 in xen_dom0s() {
         let mut route = XenRoute::open(&dom0, on_lan, relay.as_deref());
@@ -614,7 +659,42 @@ fn gather_xen() -> Vec<DcResource> {
                     "kind": "sr", "id": u, "name": n, "size": size, "used": used, "host": dom0, "zone": "dev"
                 })
                 .to_string();
-                out.push(DcResource::new("sr", u, sig));
+                out.push(DcResource::new("sr", u.clone(), sig));
+                // DC-12 — SR capacity-threshold alert to the Hub. Routed through
+                // the SAME reconcile/dedup as a `health` resource so the alert is
+                // published once on a threshold transition (and cleared via a
+                // `gone` event when the SR returns to ok / disappears). The body
+                // matches the `event/dc/health/*` shape the panel + Hub read.
+                let sz = size.parse::<u64>().unwrap_or(0);
+                let usd = used.parse::<u64>().unwrap_or(0);
+                let status = sr_capacity_status(sz, usd);
+                if status != "ok" {
+                    let pct = if sz > 0 {
+                        usd.saturating_mul(100) / sz
+                    } else {
+                        0
+                    };
+                    let check = format!("sr-capacity:{u}");
+                    let hsig = serde_json::json!({
+                        "check": check, "status": status,
+                        "detail": format!("SR {n} at {pct}% ({used}/{size} bytes) on {dom0}")
+                    })
+                    .to_string();
+                    out.push(DcResource::new("health", check, hsig));
+                }
+            }
+        }
+        // VDIs (virtual disks) → storage visibility (DC-12: gather SR/VDI). Only
+        // managed disks; the body's `kind:"vdi"` is what the panel grid groups on.
+        let vdi_script = "for u in $(xe vdi-list managed=true params=uuid --minimal | tr , ' '); \
+             do echo \"$u|$(xe vdi-param-get uuid=$u param-name=name-label)|$(xe vdi-param-get uuid=$u param-name=virtual-size)|$(xe vdi-param-get uuid=$u param-name=sr-uuid)\"; done";
+        if let Some(vdiout) = route.run(&key, vdi_script) {
+            for (u, n, size, sr) in parse_xe_vdis(&vdiout) {
+                let sig = serde_json::json!({
+                    "kind": "vdi", "id": u, "name": n, "size": size, "sr": sr, "host": dom0, "zone": "dev"
+                })
+                .to_string();
+                out.push(DcResource::new("vdi", u, sig));
             }
         }
         // Networks (bridges) → network visibility (DC-13).
@@ -636,6 +716,18 @@ fn gather_xen() -> Vec<DcResource> {
         if let Some(hn) = host_name {
             let sig = idle_power_signal(&dom0, &hn, running_vms);
             out.push(DcResource::new("power", dom0.clone(), sig));
+            // DATACENTER-16: enforce the idle-shutdown policy. Only acts when the
+            // operator armed it AND the host has zero running VMs (host readable →
+            // real name, so this never fires on a probe miss). The host going down
+            // surfaces as a `gone` event on the next reconcile.
+            if should_idle_shutdown(running_vms, idle_policy)
+                && route.run(&key, idle_shutdown_remote()).is_some()
+            {
+                tracing::info!(
+                    dom0 = %dom0,
+                    "DATACENTER-16: idle host auto-shutdown (policy armed, 0 running VMs)"
+                );
+            }
         }
     }
     out
@@ -659,6 +751,25 @@ pub fn idle_power_signal(dom0: &str, host_name: &str, running_vms: usize) -> Str
         "hint": if idle { "candidate-for-shutdown" } else { "in-use" }
     })
     .to_string()
+}
+
+/// DATACENTER-16 — whether to ACT on the idle signal and auto-shut-down a host.
+/// PURE: a host is shut down only when the operator-armed idle policy is on AND it
+/// has zero running VMs. Default-disarmed, so the gather is a pure observer unless
+/// the operator opts in via `action/dc/host-idle-policy {"on":true}`.
+#[must_use]
+pub fn should_idle_shutdown(running_vms: usize, policy_armed: bool) -> bool {
+    policy_armed && running_vms == 0
+}
+
+/// The remote script that gracefully powers a zero-running-VM dom0 down (resolve
+/// uuid → disable → shutdown). PURE constant (no interpolation). XAPI requires the
+/// host be disabled before shutdown.
+#[must_use]
+pub fn idle_shutdown_remote() -> &'static str {
+    "UUID=$(xe host-list params=uuid --minimal | cut -d, -f1); \
+     [ -n \"$UUID\" ] || exit 1; \
+     xe host-disable host=$UUID && xe host-shutdown host=$UUID"
 }
 
 /// Host of the on-prem UniFi gateway (the router) to sample over SSH —
@@ -990,6 +1101,25 @@ mod tests {
     }
 
     #[test]
+    fn should_idle_shutdown_requires_armed_policy_and_zero_vms() {
+        // Disarmed → never shut down, regardless of VM count (pure observer).
+        assert!(!should_idle_shutdown(0, false));
+        assert!(!should_idle_shutdown(3, false));
+        // Armed → only when zero running VMs.
+        assert!(should_idle_shutdown(0, true));
+        assert!(!should_idle_shutdown(1, true));
+    }
+
+    #[test]
+    fn idle_shutdown_remote_disables_then_shuts_down() {
+        let r = idle_shutdown_remote();
+        assert!(r.contains("xe host-disable"));
+        assert!(r.contains("xe host-shutdown"));
+        // disable must precede shutdown (XAPI requirement)
+        assert!(r.find("host-disable").unwrap() < r.find("host-shutdown").unwrap());
+    }
+
+    #[test]
     fn parse_xe_srs_reads_capacity() {
         let out = "s1|Local storage|207296921600|42949672960\n|skip||\n";
         let srs = parse_xe_srs(out);
@@ -998,6 +1128,35 @@ mod tests {
         assert_eq!(srs[0].1, "Local storage");
         assert_eq!(srs[0].2, "207296921600");
         assert_eq!(srs[0].3, "42949672960");
+    }
+
+    #[test]
+    fn parse_xe_vdis_reads_four_fields() {
+        let out = "v1|MDE-VM-web1 root|53687091200|s1\n|skip|||\n";
+        let vdis = parse_xe_vdis(out);
+        assert_eq!(vdis.len(), 1); // empty-uuid line skipped
+        assert_eq!(
+            vdis[0],
+            (
+                "v1".to_string(),
+                "MDE-VM-web1 root".to_string(),
+                "53687091200".to_string(),
+                "s1".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn sr_capacity_status_thresholds() {
+        // ok below 85%, warn at 85..95, fail at >=95.
+        assert_eq!(sr_capacity_status(100, 10), "ok");
+        assert_eq!(sr_capacity_status(100, 84), "ok");
+        assert_eq!(sr_capacity_status(100, 85), "warn");
+        assert_eq!(sr_capacity_status(100, 94), "warn");
+        assert_eq!(sr_capacity_status(100, 95), "fail");
+        assert_eq!(sr_capacity_status(100, 100), "fail");
+        // zero/unknown size → ok (nothing to alert on).
+        assert_eq!(sr_capacity_status(0, 50), "ok");
     }
 
     // ---- DATACENTER-4: XAPI-over-overlay route selection -----------------------

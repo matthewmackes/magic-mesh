@@ -29,7 +29,7 @@
 use cosmic::iced::widget::{column, container, mouse_area, row, stack, text, Space};
 use cosmic::iced::{Element, Length, Padding};
 
-use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
+use mde_theme::{animation::RenderParams, mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
 
@@ -156,17 +156,21 @@ impl ConnectProgress {
 /// the terminal states — a `Pending` modal has no buttons and its
 /// backdrop is inert, so an in-flight probe can't be dismissed out from
 /// under itself.
+/// `reveal` is the MOTION-TRANS-2 open-reveal frame
+/// ([`crate::panel_chrome::DialogReveal::params`]) the host samples each frame;
+/// the settled frame is a zero-cost pass-through.
 pub fn overlay<'a, Message>(
     state: &ConnectProgress,
     body: Element<'a, Message, cosmic::Theme>,
     palette: Palette,
     on_retry: Message,
     on_dismiss: Message,
+    reveal: RenderParams,
 ) -> Element<'a, Message, cosmic::Theme>
 where
     Message: Clone + 'a,
 {
-    overlay_with_action(state, body, palette, on_retry, on_dismiss, None)
+    overlay_with_action(state, body, palette, on_retry, on_dismiss, None, reveal)
 }
 
 /// As [`overlay`], but with an optional terminal-state **primary action**
@@ -182,6 +186,7 @@ pub fn overlay_with_action<'a, Message>(
     on_retry: Message,
     on_dismiss: Message,
     primary: Option<(&'a str, Message)>,
+    reveal: RenderParams,
 ) -> Element<'a, Message, cosmic::Theme>
 where
     Message: Clone + 'a,
@@ -189,7 +194,7 @@ where
     if !state.is_open() {
         return body;
     }
-    let modal = view(state, palette, on_retry, on_dismiss, primary, None);
+    let modal = view(state, palette, on_retry, on_dismiss, primary, None, reveal);
     stack![body, modal].into()
 }
 
@@ -206,6 +211,7 @@ pub fn overlay_confirm<'a, Message>(
     on_confirm: Message,
     on_retry: Message,
     on_dismiss: Message,
+    reveal: RenderParams,
 ) -> Element<'a, Message, cosmic::Theme>
 where
     Message: Clone + 'a,
@@ -213,7 +219,15 @@ where
     if !state.is_open() {
         return body;
     }
-    let modal = view(state, palette, on_retry, on_dismiss, None, Some(on_confirm));
+    let modal = view(
+        state,
+        palette,
+        on_retry,
+        on_dismiss,
+        None,
+        Some(on_confirm),
+        reveal,
+    );
     stack![body, modal].into()
 }
 
@@ -226,6 +240,7 @@ fn view<'a, Message>(
     on_dismiss: Message,
     primary: Option<(&'a str, Message)>,
     on_confirm: Option<Message>,
+    reveal: RenderParams,
 ) -> Element<'a, Message, cosmic::Theme>
 where
     Message: Clone + 'a,
@@ -241,10 +256,17 @@ where
         backdrop
     };
 
-    let dialog = crate::panel_chrome::dialog(
-        dialog_body(state, palette, on_retry, on_dismiss, primary, on_confirm),
+    // MOTION-TRANS-2 — wrap the dialog surface in the shared open-reveal
+    // (fake-opacity fade + translate-as-padding rise); a settled/reduce-motion
+    // frame passes the dialog straight through.
+    let dialog = crate::panel_chrome::reveal_dialog(
+        crate::panel_chrome::dialog(
+            dialog_body(state, palette, on_retry, on_dismiss, primary, on_confirm),
+            palette,
+            mde_theme::Density::Comfortable,
+        ),
         palette,
-        mde_theme::Density::Comfortable,
+        reveal,
     );
 
     // Center the dialog within the backdrop's bounds.
@@ -457,7 +479,28 @@ mod tests {
         assert!(!s.is_pending());
         // overlay returns the bare body (no panic, no extra layer).
         let body: Element<'_, (), cosmic::Theme> = cosmic::iced::widget::text("body").into();
-        let _ = overlay(&s, body, crate::live_theme::palette(), (), ());
+        let _ = overlay(
+            &s,
+            body,
+            crate::live_theme::palette(),
+            (),
+            (),
+            settled_reveal(),
+        );
+    }
+
+    /// A settled (fully-open) reveal frame for the render smoke tests.
+    fn settled_reveal() -> RenderParams {
+        crate::panel_chrome::DialogReveal::default().params(std::time::Instant::now())
+    }
+
+    /// A mid-reveal frame (alpha < 1, offset > 0) to exercise the scrim + rise.
+    fn mid_reveal() -> RenderParams {
+        RenderParams {
+            alpha: 0.4,
+            translate_y: 3.0,
+            scale: 1.0,
+        }
     }
 
     #[test]
@@ -508,11 +551,22 @@ mod tests {
             ConnectProgress::pending("t", "l").failure("err"),
         ] {
             // The plain form, the primary-action form, and the confirm form (a
-            // wired Confirm button) — none should panic.
-            let _: Element<'_, (), cosmic::Theme> = view(&s, palette, (), (), None, None);
-            let _: Element<'_, (), cosmic::Theme> =
-                view(&s, palette, (), (), Some(("Open settings", ())), None);
-            let _: Element<'_, (), cosmic::Theme> = view(&s, palette, (), (), None, Some(()));
+            // wired Confirm button) — none should panic, settled OR mid-reveal.
+            for reveal in [settled_reveal(), mid_reveal()] {
+                let _: Element<'_, (), cosmic::Theme> =
+                    view(&s, palette, (), (), None, None, reveal);
+                let _: Element<'_, (), cosmic::Theme> = view(
+                    &s,
+                    palette,
+                    (),
+                    (),
+                    Some(("Open settings", ())),
+                    None,
+                    reveal,
+                );
+                let _: Element<'_, (), cosmic::Theme> =
+                    view(&s, palette, (), (), None, Some(()), reveal);
+            }
         }
     }
 
@@ -526,6 +580,7 @@ mod tests {
             (),
             (),
             (),
+            settled_reveal(),
         );
     }
 
@@ -539,6 +594,7 @@ mod tests {
             (),
             (),
             Some(("Open settings", ())),
+            settled_reveal(),
         );
     }
 }

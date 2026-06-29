@@ -265,6 +265,89 @@ pub fn sound_for_alert(
     Some(severity_sound_name(item.severity))
 }
 
+/// NOTIFY-3 (L656) — the persisted read/cleared state for the Action Center, so
+/// **mark-all-read** + **clear-all** survive a restart of the center (without it
+/// the bus tail re-reads the same backlog into the panel — unread + un-cleared —
+/// on every relaunch). Stored as YAML next to the bus data (the [`SoundSettings`]
+/// idiom), as two ULID high-water cursors: because bus ULIDs sort
+/// lexicographically by time, a single `*_through` ULID stands in for "everything
+/// up to this moment" without an unbounded id set.
+///
+/// `read_through` ⇒ any alert with `id <= read_through` renders acknowledged;
+/// `cleared_through` ⇒ any alert with `id <= cleared_through` is hidden. New
+/// alerts (a strictly-greater ULID) are unaffected, so a fresh Critical after a
+/// clear still surfaces. Empty cursors (the default) mean nothing read / cleared.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReadState {
+    /// The lexicographically-greatest ULID the operator has marked read; alerts
+    /// at or below it render acknowledged. Empty = nothing marked read.
+    #[serde(default)]
+    pub read_through: String,
+    /// The lexicographically-greatest ULID the operator has cleared; alerts at or
+    /// below it are dropped from the center. Empty = nothing cleared.
+    #[serde(default)]
+    pub cleared_through: String,
+}
+
+impl ReadState {
+    /// Load from `<bus_root>/notify-read.yaml`; missing/corrupt → defaults (an
+    /// empty cursor pair, i.e. nothing read or cleared) so a bad file never
+    /// silently hides the operator's alert history.
+    #[must_use]
+    pub fn load(bus_root: &std::path::Path) -> Self {
+        let path = bus_root.join("notify-read.yaml");
+        std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_yaml::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// Atomic-write to `<bus_root>/notify-read.yaml` (temp + rename), mirroring
+    /// [`SoundSettings::save`].
+    ///
+    /// # Errors
+    /// Filesystem create/serialize/write/rename failures.
+    pub fn save(&self, bus_root: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(bus_root)?;
+        let s = serde_yaml::to_string(self)
+            .map_err(|e| std::io::Error::other(format!("serialize notify-read.yaml: {e}")))?;
+        let tmp = bus_root.join("notify-read.yaml.tmp");
+        let dst = bus_root.join("notify-read.yaml");
+        std::fs::write(&tmp, s)?;
+        std::fs::rename(&tmp, &dst)
+    }
+
+    /// True when `id` is at or below the read cursor (renders acknowledged).
+    #[must_use]
+    pub fn is_read(&self, id: &str) -> bool {
+        !self.read_through.is_empty() && id <= self.read_through.as_str()
+    }
+
+    /// True when `id` is at or below the cleared cursor (hidden from the center).
+    #[must_use]
+    pub fn is_cleared(&self, id: &str) -> bool {
+        !self.cleared_through.is_empty() && id <= self.cleared_through.as_str()
+    }
+
+    /// Advance the read cursor to `id` (monotonic — an older ULID never rewinds
+    /// it). Call with the newest shown alert id on **mark-all-read**.
+    pub fn mark_read_through(&mut self, id: &str) {
+        if id > self.read_through.as_str() {
+            self.read_through = id.to_string();
+        }
+    }
+
+    /// Advance the cleared cursor to `id` (monotonic). Call with the newest shown
+    /// alert id on **clear-all**. A cleared alert is also implicitly read, so the
+    /// read cursor is advanced to at least the cleared one.
+    pub fn mark_cleared_through(&mut self, id: &str) {
+        if id > self.cleared_through.as_str() {
+            self.cleared_through = id.to_string();
+        }
+        self.mark_read_through(id);
+    }
+}
+
 /// Normalize one [`StoredMessage`] into an [`AlertItem`]. The body is parsed as
 /// JSON for `severity`/`host`/`title`/`summary` when present; everything
 /// degrades gracefully (a non-JSON body becomes the alert text).
@@ -778,5 +861,77 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // No file → defaults (sound on) so a fresh install isn't silent.
         assert_eq!(SoundSettings::load(dir.path()), SoundSettings::default());
+    }
+
+    // ── NOTIFY-3 (L656): persisted read/cleared cursors ─────────────────
+
+    #[test]
+    fn read_state_round_trips_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = ReadState {
+            read_through: "01HZZZREADHIGHWATER0000000".into(),
+            cleared_through: "01HZZZCLEARHIGHWATER000000".into(),
+        };
+        original.save(dir.path()).unwrap();
+        assert_eq!(ReadState::load(dir.path()), original);
+    }
+
+    #[test]
+    fn read_state_missing_file_is_empty_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        // No file → nothing read or cleared (the whole history is visible/unread).
+        let rs = ReadState::load(dir.path());
+        assert_eq!(rs, ReadState::default());
+        assert!(rs.read_through.is_empty() && rs.cleared_through.is_empty());
+    }
+
+    #[test]
+    fn empty_cursors_mark_nothing() {
+        // The default (fresh install): no alert is read or cleared.
+        let rs = ReadState::default();
+        assert!(!rs.is_read("01AAA"));
+        assert!(!rs.is_cleared("01AAA"));
+    }
+
+    #[test]
+    fn cursors_are_inclusive_and_time_ordered() {
+        let mut rs = ReadState::default();
+        rs.mark_read_through("01C");
+        rs.mark_cleared_through("01B");
+        // read_through = 01C: ids <= 01C are read, a newer one is not.
+        assert!(rs.is_read("01B"), "older than the read cursor");
+        assert!(rs.is_read("01C"), "the cursor itself is inclusive");
+        assert!(
+            !rs.is_read("01D"),
+            "newer than the read cursor stays unread"
+        );
+        // cleared_through = 01B: only ids <= 01B are hidden.
+        assert!(rs.is_cleared("01A"));
+        assert!(rs.is_cleared("01B"));
+        assert!(!rs.is_cleared("01C"), "newer than the cleared cursor shows");
+    }
+
+    #[test]
+    fn cursors_advance_monotonically_never_rewind() {
+        let mut rs = ReadState::default();
+        rs.mark_read_through("01C");
+        // An older id must not rewind the cursor (a late-arriving backlog item
+        // can't un-acknowledge newer alerts the operator already read).
+        rs.mark_read_through("01A");
+        assert_eq!(rs.read_through, "01C");
+        // A newer id advances it.
+        rs.mark_read_through("01E");
+        assert_eq!(rs.read_through, "01E");
+    }
+
+    #[test]
+    fn clearing_implies_read() {
+        // A cleared alert is also acknowledged: the read cursor advances to at
+        // least the cleared one, so a cleared item never lingers as "unread".
+        let mut rs = ReadState::default();
+        rs.mark_cleared_through("01D");
+        assert_eq!(rs.cleared_through, "01D");
+        assert!(rs.is_read("01D"));
+        assert!(rs.read_through >= "01D".to_string());
     }
 }

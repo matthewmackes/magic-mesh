@@ -50,6 +50,23 @@ const NAV_LABEL_SIZE: f32 = 14.0;
 /// UX-5 (e) — section-divider label point size.
 const SECTION_LABEL_SIZE: f32 = 11.0;
 
+/// MOTION-TRANS-2 — the slide-up distance (px) a group's nav rows reveal from when
+/// the group expands. The shared Carbon panel-mount translate token (the same the
+/// Application Menu + Hub open with), so the sidebar reveal reads as one
+/// vocabulary. The rows start this far below their rest position and rise to 0
+/// over the panel-mount duration; reduce-motion skips it (reveal jumps to 1).
+const NAV_REVEAL_TRANSLATE_PX: f32 = mde_theme::PANEL_MOUNT_TRANSLATE_Y_PX;
+
+/// MOTION-TRANS-2 — the top-padding offset (px) for a group's revealing rows at
+/// reveal progress `t` (`0`=just expanded → `1`=settled). Rendered as decaying
+/// top padding (iced 0.13 has no transform widget — the translate-as-padding
+/// approach the launcher/Hub use). `0` once settled, so there is no residual
+/// layout shift at rest. Pure + testable.
+#[must_use]
+pub fn reveal_offset(t: f32) -> f32 {
+    (1.0 - t.clamp(0.0, 1.0)) * NAV_REVEAL_TRANSLATE_PX
+}
+
 /// Per-group expand/collapse + focus state. The active group
 /// (matching the current [`View`]) is always expanded
 /// automatically — additional groups can be toggled by the user.
@@ -102,6 +119,11 @@ pub fn view<'a>(
     focused_pane: Pane,
     on_group_click: impl Fn(Group) -> crate::Message + 'a,
     on_panel_click: impl Fn(Group, &'static str) -> crate::Message + 'a,
+    // MOTION-TRANS-2 — the per-group reveal progress (`0`=just expanded →
+    // `1`=settled / not animating). The caller folds the Animator + reduce-motion
+    // through it (reduce-motion ⇒ always `1.0`, an instant expand). Only read
+    // during the build, so no lifetime binding onto the returned Element.
+    group_reveal: impl Fn(Group) -> f32,
 ) -> Element<'a, crate::Message, cosmic::Theme> {
     let palette = crate::live_theme::palette();
     let space = MdeSpace::for_density(crate::live_theme::tokens().density);
@@ -122,13 +144,19 @@ pub fn view<'a>(
         }
         col = col.push(section_label(entry.group, active, palette, &on_group_click));
         if state.is_expanded(entry.group, active) {
+            // MOTION-TRANS-2 — the just-expanded group's rows reveal: they start a
+            // few px low and rise to rest (Carbon panel-mount), rendered as decaying
+            // top padding on the row column. `0` once settled / under reduce-motion,
+            // so the resting layout is byte-identical to before.
+            let offset = reveal_offset(group_reveal(entry.group));
+            let mut rows: Column<'a, crate::Message, cosmic::Theme> = column![].spacing(0);
             for panel in &entry.panels {
                 let is_active = matches!(
                     view,
                     View::Panel { group, panel: slug }
                         if group == entry.group && slug == panel.slug()
                 );
-                col = col.push(nav_row(
+                rows = rows.push(nav_row(
                     entry.group,
                     panel.slug(),
                     panel.label(),
@@ -138,6 +166,12 @@ pub fn view<'a>(
                     &on_panel_click,
                 ));
             }
+            col = col.push(container(rows).padding(Padding {
+                top: offset,
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+            }));
         }
     }
 
@@ -431,5 +465,37 @@ mod tests {
     fn nav_label_is_fourteen_sp() {
         // UX-5 (b) — 14 sp nav row label.
         assert!((NAV_LABEL_SIZE - 14.0).abs() < f32::EPSILON);
+    }
+
+    // MOTION-TRANS-2 — sidebar group expand reveal.
+
+    #[test]
+    fn reveal_offset_runs_from_translate_token_to_zero() {
+        // At reveal 0 (just expanded) the rows sit a full panel-mount translate
+        // below; at reveal 1 (settled / reduce-motion) they rest at 0 — no
+        // residual layout shift.
+        assert!((reveal_offset(0.0) - NAV_REVEAL_TRANSLATE_PX).abs() < f32::EPSILON);
+        assert!(reveal_offset(1.0).abs() < f32::EPSILON);
+        // Midway is between the two, monotonic in `t`.
+        let mid = reveal_offset(0.5);
+        assert!(mid > 0.0 && mid < NAV_REVEAL_TRANSLATE_PX);
+        assert!(reveal_offset(0.25) > reveal_offset(0.75));
+    }
+
+    #[test]
+    fn reveal_offset_clamps_out_of_range_progress() {
+        // Defensive: a stray t outside [0,1] never produces a negative/oversized
+        // offset (the Animator clamps, but the renderer must not jump either way).
+        assert!((reveal_offset(-1.0) - NAV_REVEAL_TRANSLATE_PX).abs() < f32::EPSILON);
+        assert!(reveal_offset(2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn reveal_translate_is_the_shared_panel_mount_token() {
+        // The sidebar reveal reuses the one Carbon panel-mount translate token the
+        // launcher + Hub open with — one motion vocabulary, no bespoke literal.
+        assert!(
+            (NAV_REVEAL_TRANSLATE_PX - mde_theme::PANEL_MOUNT_TRANSLATE_Y_PX).abs() < f32::EPSILON
+        );
     }
 }

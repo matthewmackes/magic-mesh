@@ -237,6 +237,55 @@ impl Motion {
     }
 }
 
+/// MOTION-A11Y-2 — the two motion *classes*, so a consumer can declare whether a
+/// given animation **communicates state** or is merely **decorative polish**. The
+/// "disable non-essential motion" preference
+/// ([`crate::prefs::MotionPrefs::decorative`]) suppresses [`Decorative`] motion
+/// while keeping [`Essential`] cues. Orthogonal to reduce-motion (which gates
+/// *every* class to a ≤80 ms crossfade): a user can keep full essential motion yet
+/// drop decorative flourishes, or vice-versa.
+///
+/// [`Essential`]: MotionClass::Essential
+/// [`Decorative`]: MotionClass::Decorative
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MotionClass {
+    /// State-communicating motion — loading/progress/refresh activity, async
+    /// state transitions, focus appearance, success/error feedback. Never dropped
+    /// by the decorative toggle (it is a real cue, not ornament); only
+    /// reduce-motion / the kill switch may shorten it.
+    Essential,
+    /// Decorative polish — hover-lift, skeleton shimmer *breathe*, selection
+    /// slide accent, staggered reveal. Removed when the user disables
+    /// non-essential motion; the underlying state stays legible via the
+    /// non-motion cue (colour token, static placeholder, instant select).
+    Decorative,
+}
+
+impl MotionClass {
+    /// `true` for [`MotionClass::Essential`] — a state cue that must survive the
+    /// decorative-motion toggle.
+    #[must_use]
+    pub const fn is_essential(self) -> bool {
+        matches!(self, Self::Essential)
+    }
+}
+
+/// MOTION-A11Y-3 — the maximum permitted pulse/blink frequency (Hz). WCAG 2.x
+/// (2.3.1) flags content flashing **more than 3 times per second** as a seizure
+/// risk; MCNF clamps every *looping* pulse to at most this rate so no shimmer,
+/// blink, or breathing indicator can flash. A single full bright→dim→bright cycle
+/// of a [`LoopingTween`](crate::animation::LoopingTween) is one "flash", so the
+/// cap is enforced on the loop period (see [`MIN_PULSE_PERIOD_MS`]).
+pub const MAX_PULSE_HZ: f32 = 3.0;
+
+/// MOTION-A11Y-3 — the minimum permitted pulse/blink **period** (ms), the
+/// reciprocal of [`MAX_PULSE_HZ`] (`ceil(1000 / 3) = 334 ms`). A
+/// [`LoopingTween`](crate::animation::LoopingTween) built via
+/// [`LoopingTween::pulse`](crate::animation::LoopingTween::pulse) is clamped to at
+/// least this period so it can never exceed the 3 Hz flash threshold, regardless
+/// of the caller's requested period.
+pub const MIN_PULSE_PERIOD_MS: u64 = 334;
+
 /// UX-9 (b) — notification bell pulse maximum scale factor.
 /// Component dimension, not density-scaled.
 pub const PULSE_MAX_SCALE: f32 = 1.15;
@@ -442,6 +491,41 @@ mod tests {
         assert_eq!(Easing::EaseOut.carbon_bezier(), EASING_ENTRANCE);
         assert_eq!(Easing::EaseIn.carbon_bezier(), EASING_EXIT);
         assert_eq!(Easing::EaseInOut.carbon_bezier(), EASING_STANDARD);
+    }
+
+    #[test]
+    fn pulse_rate_cap_is_three_hz() {
+        // MOTION-A11Y-3 — the flash threshold + its reciprocal period.
+        assert!((MAX_PULSE_HZ - 3.0).abs() < f32::EPSILON);
+        // ceil(1000 / 3) == 334 ms — the period that yields exactly ≤3 Hz.
+        assert_eq!(MIN_PULSE_PERIOD_MS, 334);
+        assert!(1000.0 / MIN_PULSE_PERIOD_MS as f32 <= MAX_PULSE_HZ);
+    }
+
+    #[test]
+    fn every_looping_preset_is_within_the_flash_cap() {
+        // MOTION-A11Y-3 — no built-in looping activity indicator may flash faster
+        // than 3 Hz. One full loop period is one bright→dim→bright "flash".
+        for m in [
+            Motion::notification_pulse(), // 2000 ms → 0.5 Hz
+            Motion::loading(),            // 700 ms → 1.43 Hz
+            Motion::refresh(),            // 400 ms → 2.5 Hz
+        ] {
+            assert!(m.looping, "preset under test must be a loop");
+            let hz = 1000.0 / m.duration.as_millis() as f32;
+            assert!(
+                hz <= MAX_PULSE_HZ + f32::EPSILON,
+                "{:?} flashes at {hz} Hz, exceeds the {MAX_PULSE_HZ} Hz cap",
+                m.duration
+            );
+        }
+    }
+
+    #[test]
+    fn motion_class_partitions_essential_and_decorative() {
+        // MOTION-A11Y-2 — the class predicate the decorative toggle keys off.
+        assert!(MotionClass::Essential.is_essential());
+        assert!(!MotionClass::Decorative.is_essential());
     }
 
     #[test]

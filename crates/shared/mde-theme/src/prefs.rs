@@ -54,6 +54,16 @@ pub struct MotionPrefs {
     /// half speed (double duration). Clamped to a sane range on apply.
     #[cfg_attr(feature = "serde", serde(default = "default_motion_scale"))]
     pub speed_scale: f32,
+    /// MOTION-A11Y-2 — keep **decorative** (non-essential) motion. `true` (default)
+    /// = full polish; `false` drops hover-lifts, the skeleton shimmer *breathe*,
+    /// selection-slide accents and staggered reveals while keeping every
+    /// **essential** state cue (loading/progress/refresh, async state transitions,
+    /// focus, success/error). Local config is authoritative — Cosmic exposes no
+    /// system "decorative motion" signal today (GUI-9), so this file is the source
+    /// of truth. Orthogonal to [`Self::enabled`] (the all-motion kill switch) and
+    /// to `a11y.reduce_motion` (the ≤80 ms crossfade cap).
+    #[cfg_attr(feature = "serde", serde(default = "default_motion_decorative"))]
+    pub decorative: bool,
 }
 
 impl Default for MotionPrefs {
@@ -61,6 +71,7 @@ impl Default for MotionPrefs {
         Self {
             enabled: true,
             speed_scale: 1.0,
+            decorative: true,
         }
     }
 }
@@ -86,10 +97,65 @@ impl MotionPrefs {
             return m; // already capped + de-looped
         }
         let scale = self.speed_scale.clamp(0.1, 10.0);
+        // At unit scale, return the motion EXACTLY — the `as_secs_f32`/`from_secs_f32`
+        // round-trip is lossy (150 ms → 0.15f32 → 150.000006 ms), which would make a
+        // "no scaling" path silently perturb every essential duration. Only pay that
+        // imprecision when the operator actually scaled speed.
+        if (scale - 1.0).abs() <= f32::EPSILON {
+            return m;
+        }
         Motion {
             duration: std::time::Duration::from_secs_f32(m.duration.as_secs_f32() / scale),
             ..m
         }
+    }
+
+    /// MOTION-A11Y-2 — should **decorative** motion play? `true` only when motion
+    /// is globally enabled **and** the decorative toggle is on. Essential motion
+    /// ignores this — it is gated by [`Self::enabled`] / reduce-motion alone.
+    #[must_use]
+    pub const fn shows_decorative(self) -> bool {
+        self.enabled && self.decorative
+    }
+
+    /// MOTION-A11Y-2 — resolve a [`Motion`](crate::motion::Motion) preset for a
+    /// given [`MotionClass`](crate::motion::MotionClass). [`Essential`] motion
+    /// resolves exactly as [`Self::apply`] (kill switch + reduce-motion + speed
+    /// scale). [`Decorative`] motion additionally collapses to a **terminal
+    /// (zero-duration) frame** when the decorative toggle is off — the animation
+    /// is dropped, the consumer renders the settled state, and its non-motion cue
+    /// (colour token / static placeholder / instant select) carries the meaning.
+    ///
+    /// [`Essential`]: crate::motion::MotionClass::Essential
+    /// [`Decorative`]: crate::motion::MotionClass::Decorative
+    ///
+    /// ```
+    /// use mde_theme::motion::{Motion, MotionClass};
+    /// use mde_theme::prefs::MotionPrefs;
+    /// let prefs = MotionPrefs { decorative: false, ..MotionPrefs::default() };
+    /// // Decorative collapses to a terminal (zero-duration) frame…
+    /// let deco = prefs.apply_class(Motion::hover(), MotionClass::Decorative, false);
+    /// assert_eq!(deco.duration, std::time::Duration::ZERO);
+    /// // …essential motion still animates.
+    /// let ess = prefs.apply_class(Motion::loading(), MotionClass::Essential, false);
+    /// assert!(ess.looping);
+    /// ```
+    #[must_use]
+    pub fn apply_class(
+        self,
+        m: crate::motion::Motion,
+        class: crate::motion::MotionClass,
+        reduce_motion: bool,
+    ) -> crate::motion::Motion {
+        use crate::motion::{Easing, Motion, MotionClass};
+        if matches!(class, MotionClass::Decorative) && !self.shows_decorative() {
+            return Motion {
+                duration: std::time::Duration::ZERO,
+                easing: Easing::Linear,
+                looping: false,
+            };
+        }
+        self.apply(m, reduce_motion)
     }
 }
 
@@ -106,6 +172,11 @@ fn default_motion_enabled() -> bool {
 #[cfg(feature = "serde")]
 fn default_motion_scale() -> f32 {
     1.0
+}
+
+#[cfg(feature = "serde")]
+fn default_motion_decorative() -> bool {
+    true
 }
 
 impl Preferences {
@@ -139,6 +210,12 @@ impl Preferences {
         // MOTION-CORE-3 — env overrides for the global motion controls.
         if std::env::var_os("MDE_MOTION_DISABLED").map_or(false, |v| v != "0") {
             prefs.motion.enabled = false;
+        }
+        // MOTION-A11Y-2 — env override for the decorative-motion toggle
+        // (`MDE_MOTION_DECORATIVE=0` drops non-essential motion in CI / headless /
+        // quick toggles, file value otherwise).
+        if std::env::var_os("MDE_MOTION_DECORATIVE").map_or(false, |v| v == "0") {
+            prefs.motion.decorative = false;
         }
         if let Ok(s) = std::env::var("MDE_MOTION_SCALE") {
             if let Ok(f) = s.parse::<f32>() {
@@ -279,6 +356,7 @@ mod tests {
         let off = MotionPrefs {
             enabled: false,
             speed_scale: 1.0,
+            ..MotionPrefs::default()
         };
         let r = off.apply(crate::motion::Motion::loading(), false);
         assert_eq!(r.duration, std::time::Duration::ZERO);
@@ -292,12 +370,14 @@ mod tests {
         let fast = MotionPrefs {
             enabled: true,
             speed_scale: 2.0,
+            ..MotionPrefs::default()
         }
         .apply(crate::motion::Motion::panel_mount(), false);
         assert!((fast.duration.as_secs_f32() - base / 2.0).abs() < 1e-4);
         let slow = MotionPrefs {
             enabled: true,
             speed_scale: 0.5,
+            ..MotionPrefs::default()
         }
         .apply(crate::motion::Motion::panel_mount(), false);
         assert!((slow.duration.as_secs_f32() - base * 2.0).abs() < 1e-4);
@@ -309,10 +389,76 @@ mod tests {
         let r = MotionPrefs {
             enabled: true,
             speed_scale: 2.0,
+            ..MotionPrefs::default()
         }
         .apply(crate::motion::Motion::loading(), true);
         assert_eq!(r.duration, std::time::Duration::from_millis(80));
         assert!(!r.looping);
+    }
+
+    #[test]
+    fn motion_prefs_default_keeps_decorative_on() {
+        // MOTION-A11Y-2 — full polish by default.
+        let m = MotionPrefs::default();
+        assert!(m.decorative);
+        assert!(m.shows_decorative());
+    }
+
+    #[test]
+    fn decorative_off_drops_decorative_but_keeps_essential() {
+        use crate::motion::{Motion, MotionClass};
+        // Decorative toggle off, but motion globally enabled.
+        let prefs = MotionPrefs {
+            enabled: true,
+            decorative: false,
+            ..MotionPrefs::default()
+        };
+        assert!(!prefs.shows_decorative());
+        // A decorative animation collapses to a terminal (zero-duration) frame…
+        let deco = prefs.apply_class(Motion::hover(), MotionClass::Decorative, false);
+        assert_eq!(deco.duration, std::time::Duration::ZERO);
+        // …while an essential state cue still animates normally.
+        let ess = prefs.apply_class(Motion::loading(), MotionClass::Essential, false);
+        assert_eq!(ess.duration, Motion::loading().duration);
+        assert!(ess.looping);
+    }
+
+    #[test]
+    fn decorative_on_animates_both_classes() {
+        use crate::motion::{Motion, MotionClass};
+        let prefs = MotionPrefs::default(); // decorative on
+        let deco = prefs.apply_class(Motion::hover(), MotionClass::Decorative, false);
+        assert_eq!(deco.duration, Motion::hover().duration);
+        let ess = prefs.apply_class(Motion::success(), MotionClass::Essential, false);
+        assert_eq!(ess.duration, Motion::success().duration);
+    }
+
+    #[test]
+    fn kill_switch_drops_decorative_regardless_of_toggle() {
+        use crate::motion::{Motion, MotionClass};
+        // Global kill switch wins: decorative is gone even with the toggle on.
+        let prefs = MotionPrefs {
+            enabled: false,
+            decorative: true,
+            ..MotionPrefs::default()
+        };
+        assert!(!prefs.shows_decorative());
+        let deco = prefs.apply_class(Motion::hover(), MotionClass::Decorative, false);
+        assert_eq!(deco.duration, std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn decorative_reduce_motion_still_caps_essential() {
+        use crate::motion::{Motion, MotionClass};
+        // Essential motion under reduce-motion: capped to the 80 ms crossfade,
+        // independent of the decorative toggle.
+        let prefs = MotionPrefs {
+            decorative: false,
+            ..MotionPrefs::default()
+        };
+        let ess = prefs.apply_class(Motion::loading(), MotionClass::Essential, true);
+        assert_eq!(ess.duration, std::time::Duration::from_millis(80));
+        assert!(!ess.looping);
     }
 
     #[test]

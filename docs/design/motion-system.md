@@ -363,3 +363,33 @@ smooth, subtle, consistent, purposeful — and fully reduce-motion-safe.
   adding cost; MOTION-PERF-1 (idle suppression) is P0 and gates the rest.
 - **GUI-5 removed dead motion widgets once already** — revive only what gets
   wired this time (§7 — no dead `pub` modules).
+
+---
+
+## Appendix — MOTION coverage inventory (MOTION-AUDIT-1)
+
+A sweep of every interactive/async surface against the standard feedback set.
+**Covered** = the surface routes through the shared `mde-theme` vocabulary;
+**Gap** = it lacks the standard feedback, with the follow-up item that owns it.
+The contributor guide is [`motion-language.md`](motion-language.md); the lint that
+keeps timing single-sourced is `install-helpers/lint-motion-tokens.sh`
+(MOTION-AUDIT-2, in CI).
+
+| Surface (file) | Feedback present | Status / follow-up |
+|----------------|------------------|--------------------|
+| Buttons — `controls::variant_button` | hover tint+lift, press darken, engaged focus ring | **Covered** (FEEDBACK-1; lift decorative-gated, A11Y-2) |
+| Overview controls — `panels/home` | hover/press/focus via `ControlFeedback` | **Covered** (FEEDBACK-1/2) |
+| Data card grid — `panels/datacenter` | staggered reveal (≤8), selection accent, hover-lift | **Covered** (FEEDBACK-2) |
+| Panel/route switch — `app::crossfaded_body` | crossfade scrim, reduce-motion instant | **Covered** (TRANS-1) |
+| Header window controls + connectivity — `header` | hover tint; non-motion connectivity pill | **Covered** (NET-5) |
+| Notification toast — `bin/mde-notify-toast` | slide-in + crossfade exit (reduce-motion safe) | **Covered** (FEEDBACK-3) |
+| Notification Hub — `bin/motion` | slide-in + slide-down + ≤3 Hz blink via `Tween::resolved` | **Covered** (FEEDBACK-3) |
+| Skeleton placeholders — `skeleton` / `controls::skeleton` | shimmer breathe, static under reduce-motion/kill | **Covered** (NET-2) |
+| Async state chrome — `panel_chrome` / `LoadState` | 7 distinct states, non-motion icon+label | **Covered** (NET-1) |
+| Sidebar nav rows — `sidebar` | hover/active tint, static focus ring | **Covered** (feedback); group **expand/collapse is instant** → **Gap: TRANS-2** |
+| Toggle pill — `controls::toggle` | hover brighten; **knob slide is a snap** | **Gap: FEEDBACK-1 follow-up** (slide via `Tween` once a per-control tick lands) |
+| Lists/tables (most panels) | fresh-load reveal where wired | **Gap: TRANS-3** — per-row insert/remove reveal/collapse not yet keyed-diffed shell-wide |
+| Drawers / modals (disclaimer gate, dialogs) | instant open/close | **Gap: TRANS-2** — slide/scale-fade open/close not yet wired |
+| Text input focus ring — `controls::styled_text_input` | built-in class only | **Blocked** — the libcosmic `text_input` Catalog exposes no per-instance closure (CUT-1 fork drift); re-thread when the fork grows a custom variant |
+| Live-map flow tick — `panels/peers` (90 ms) | view-gated animation tick | **Gap (note): AUDIT-2** — not on the shared 16 ms frame cadence; consolidate onto MOTION-INFRA |
+| True old→new opacity crossfade (arbitrary subtree) | scrim dissolve stand-in | **Blocked (UX-PRE)** — needs the iced-0.14 opacity widget; current crossfade is a background-scrim dissolve, the honest non-faked substitute |

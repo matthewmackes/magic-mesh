@@ -235,6 +235,12 @@ pub mod meshfs_worker;
 pub mod firewall_monitor;
 /// NOTIFY-SRC — SELinux AVC denials → the `fleet/sec/selinux/<host>` alert lane.
 pub mod selinux_monitor;
+// HA-5 — etcd-quorum + leadership monitor. Reads the live mesh directory each
+// tick, publishes the coordination-plane state (member count + quorum-OK +
+// leader) to the retained `mesh/ha/status` lane the Mesh Control panel consumes,
+// and fires an edge-triggered `mackesd::alert` when quorum is lost/restored or
+// leadership changes (no per-tick spam).
+pub mod ha_monitor;
 // VIRT-1 (v5.0.0) — unified KVM + Podman compute inventory.
 // Polls `virsh list --all --uuid` + `virsh dominfo`/`domblklist`/
 // `domstats` for KVM guests and `podman ps`/`podman stats` for
@@ -374,6 +380,10 @@ pub mod presence_watch;
 pub mod mesh_shunt;
 // PLANES-18 — feeds <host>.mesh into resolved + /etc/hosts.
 pub mod mesh_dns;
+// MEDIA-3/6 — adopts + supervises the Navidrome container on Lighthouse_Media,
+// and distributes the leader-managed shared-account secret. Media-capability
+// gated (runs only on the media subclass).
+pub mod media_navidrome;
 // PLANES-15 — converges the baseline's netstate desired-state under a
 // rollback checkpoint with a post-apply overlay-reachability self-test.
 pub mod netstate_apply;
@@ -389,6 +399,10 @@ pub mod lifecycle_exec;
 pub mod firewall_preset;
 // CONNECT-3 — exposure-driven (additive) firewall enforcement.
 pub mod connect_firewall;
+// VPN-GW-6 — per-tunnel health + exit-IP/leak verification + auto-failover.
+pub mod vpn_health;
+// DDNS-EGRESS-4 — dynamic-DNS reconcile worker (VPN exit + WAN → DigitalOcean).
+pub mod ddns;
 // FARM-AUTO-1 — build-farm orchestrator: bridges the farm job lifecycle onto the Bus.
 pub mod farm_orchestrator;
 // DATACENTER-5 — datacenter orchestrator: samples the DC substrate (DO/Xen/gateway)

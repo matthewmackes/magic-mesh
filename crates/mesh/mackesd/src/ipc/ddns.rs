@@ -31,7 +31,23 @@ impl DdnsService {
 }
 
 /// Action verbs served on `action/ddns/<verb>`.
-pub const ACTION_VERBS: [&str; 4] = ["get-config", "set-config", "add-record", "remove-record"];
+pub const ACTION_VERBS: [&str; 6] = [
+    "get-config",
+    "set-config",
+    "add-record",
+    "remove-record",
+    // DDNS-EGRESS-5 — the live table + an operator-triggered immediate reconcile.
+    "list-records",
+    "sync-now",
+];
+
+/// DDNS-EGRESS-5 — the nudge file the responder drops on `sync-now`; the `ddns`
+/// worker checks it at the top of its loop and reconciles immediately (rather
+/// than waiting out the sweep interval), then clears it.
+#[must_use]
+pub fn sync_nudge_path(workgroup_root: &std::path::Path) -> PathBuf {
+    workgroup_root.join("ddns").join(".sync-now")
+}
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -101,6 +117,35 @@ pub fn build_reply(svc: &DdnsService, verb: &str, req_body: Option<&str>) -> Str
             match ddns::save(root, &cfg) {
                 Ok(_) => json!({ "ok": true }).to_string(),
                 Err(e) => err(format!("remove-record: save: {e}")),
+            }
+        }
+        "list-records" => {
+            // DDNS-EGRESS-5 — the live table: the published per-name state (fqdn ·
+            // source · current IP · last-updated · TTL · status) joined with the
+            // config so the GUI can render pending (not-yet-published) rows + the
+            // on_down policy. The published state is written by the `ddns` worker.
+            let cfg = ddns::load(root);
+            let published = ddns::load_published(root);
+            json!({
+                "ok": true,
+                "enabled": cfg.enabled,
+                "zone": cfg.zone,
+                "ttl": cfg.ttl,
+                "records": published.record,
+                "config_records": cfg.record,
+            })
+            .to_string()
+        }
+        "sync-now" => {
+            // Drop the nudge file the worker honors on its next loop tick.
+            let path = sync_nudge_path(root);
+            let res = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, b"1"));
+            match res {
+                Ok(()) => json!({ "ok": true, "detail": "sync requested" }).to_string(),
+                Err(e) => err(format!("sync-now: {e}")),
             }
         }
         other => err(format!("unknown ddns verb: {other}")),
@@ -199,5 +244,43 @@ mod tests {
         let (_t, s) = service();
         assert!(build_reply(&s, "bogus", None).contains("unknown ddns verb"));
         assert!(build_reply(&s, "add-record", None).contains("missing RecordDef"));
+    }
+
+    #[test]
+    fn list_records_joins_published_state_and_config() {
+        let (_t, s) = service();
+        // A config record + a published-state row (written by the worker).
+        let _ = build_reply(
+            &s,
+            "add-record",
+            Some(
+                &json!({"name":"{node}-{provider}","source":"tunnel:m1","on_down":"remove"})
+                    .to_string(),
+            ),
+        );
+        let mut published = mackes_mesh_types::ddns::DdnsPublished::default();
+        published.upsert(mackes_mesh_types::ddns::PublishedRecord {
+            fqdn: "eagle-mullvad.services.matthewmackes.com".into(),
+            source: "tunnel:m1".into(),
+            ip: "1.2.3.4".into(),
+            ttl: 60,
+            status: "synced".into(),
+            ..Default::default()
+        });
+        mackes_mesh_types::ddns::save_published(s.workgroup_root.as_path(), &published).unwrap();
+        let r = build_reply(&s, "list-records", None);
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], serde_json::Value::Bool(true));
+        assert_eq!(v["records"][0]["ip"], "1.2.3.4");
+        assert_eq!(v["records"][0]["status"], "synced");
+        assert_eq!(v["config_records"][0]["source"], "tunnel:m1");
+    }
+
+    #[test]
+    fn sync_now_drops_the_nudge_file() {
+        let (_t, s) = service();
+        let r = build_reply(&s, "sync-now", None);
+        assert!(r.contains("\"ok\":true"), "{r}");
+        assert!(sync_nudge_path(s.workgroup_root.as_path()).exists());
     }
 }

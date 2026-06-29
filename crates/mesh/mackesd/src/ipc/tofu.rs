@@ -50,7 +50,18 @@ impl TofuService {
 }
 
 /// Action verbs served on `action/dc/<verb>`.
-pub const ACTION_VERBS: [&str; 4] = ["tofu-plan", "tofu-apply", "tofu-destroy", "tofu-state"];
+///
+/// DATACENTER-15 adds the persisted **run-log** (`tofu-runlog`) and the
+/// production-apply **prod-arm** gate (`tofu-arm`) to the plan/apply/destroy/state
+/// surface.
+pub const ACTION_VERBS: [&str; 6] = [
+    "tofu-plan",
+    "tofu-apply",
+    "tofu-destroy",
+    "tofu-state",
+    "tofu-runlog",
+    "tofu-arm",
+];
 
 /// Responder poll interval.
 pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -153,12 +164,156 @@ pub fn plan_has_real_drift(plan: &str) -> bool {
     false
 }
 
+// ---- DATACENTER-15: persisted run-log + the prod-arm production gate ----------
+
+/// Max chars of a run's summary kept in an on-disk run-log line. PURE cap so one
+/// giant plan can't bloat the log.
+pub const RUNLOG_SUMMARY_CAP: usize = 2000;
+
+/// Default number of run-log records `tofu-runlog` returns (newest last).
+pub const RUNLOG_DEFAULT_LIMIT: usize = 50;
+
+/// The per-workspace Tofu run-log file under the dc state dir:
+/// `<state>/tofu-runlog/<ws>.jsonl`. PURE — the workspace is already allow-listed
+/// by [`tofu_workspace_dir`] before this is built, so it carries no traversal.
+#[must_use]
+pub fn runlog_path(state_dir: &std::path::Path, ws: &str) -> PathBuf {
+    state_dir.join("tofu-runlog").join(format!("{ws}.jsonl"))
+}
+
+/// Build one JSON run-log line for a completed plan/apply/destroy. PURE — `ts` is
+/// supplied so it's deterministic in tests. The summary is capped to
+/// [`RUNLOG_SUMMARY_CAP`] chars (char-boundary safe).
+#[must_use]
+pub fn runlog_record_json(ts: u64, verb: &str, ws: &str, ok: bool, summary: &str) -> String {
+    let capped: String = summary.chars().take(RUNLOG_SUMMARY_CAP).collect();
+    serde_json::json!({
+        "ts": ts, "verb": verb, "workspace": ws, "ok": ok, "summary": capped,
+    })
+    .to_string()
+}
+
+/// Parse run-log file content into the last `limit` records (newest last). PURE.
+/// Blank lines and lines that don't parse as JSON are skipped.
+#[must_use]
+pub fn parse_runlog(content: &str, limit: usize) -> Vec<serde_json::Value> {
+    let mut recs: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect();
+    if recs.len() > limit {
+        recs = recs.split_off(recs.len() - limit);
+    }
+    recs
+}
+
+/// Whether an apply/destroy on `ws` is allowed given the Tofu prod-arm state.
+/// PURE. Only the **production** zone (`zone1-do`) is gated; the dev zone
+/// (`xen-xapi`) is always allowed.
+///
+/// # Errors
+/// Returns the "prod disarmed" reason when a production apply/destroy is attempted
+/// while the gate is off.
+pub fn prod_apply_gate(ws: &str, armed: bool) -> Result<(), String> {
+    if ws == "zone1-do" && !armed {
+        return Err(
+            "prod disarmed: arm tofu prod (action/dc/tofu-arm {\"on\":true}) \
+             before applying to zone1-do"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Current unix time in seconds (0 on a pre-epoch clock — never panics).
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Append one run record to a workspace's run-log (best-effort). Creates the
+/// run-log dir as needed; a write failure is logged + swallowed so a full disk can
+/// never wedge the tofu op itself.
+fn append_runlog(state_dir: &std::path::Path, verb: &str, ws: &str, ok: bool, summary: &str) {
+    use std::io::Write;
+    let path = runlog_path(state_dir, ws);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::debug!(error = %e, "tofu runlog: mkdir failed");
+            return;
+        }
+    }
+    let line = format!(
+        "{}\n",
+        runlog_record_json(now_unix(), verb, ws, ok, summary)
+    );
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                tracing::debug!(error = %e, "tofu runlog: append failed");
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "tofu runlog: open failed"),
+    }
+}
+
+/// `tofu-arm` — read or set the Tofu **production-apply** gate (the `zone1-do`
+/// apply/destroy guard). A set carries `{"on": <bool>}` (RBAC-gated + persisted);
+/// a bare read omits `on`. Reply `{"ok":true,"armed":<bool>}`.
+fn tofu_arm_reply(svc: &TofuService, req: &serde_json::Value) -> String {
+    let err = |m: String| json!({ "error": m }).to_string();
+    let state_dir = crate::ipc::dc_common::dc_state_dir(&svc.workgroup_root);
+    if let Some(on) = req.get("on").and_then(serde_json::Value::as_bool) {
+        if let Err(e) =
+            crate::ipc::dc_common::rbac_gate_mutating(crate::ipc::dc_common::body_principal(req))
+        {
+            return err(e);
+        }
+        if let Err(e) = crate::ipc::dc_common::write_arm(&state_dir, "tofu", on) {
+            return err(format!("tofu-arm: persist failed: {e}"));
+        }
+        return json!({ "ok": true, "armed": on }).to_string();
+    }
+    json!({ "ok": true, "armed": crate::ipc::dc_common::read_arm(&state_dir, "tofu") }).to_string()
+}
+
+/// `tofu-runlog` — the persisted per-workspace run-log (read-only). `ws` is
+/// already allow-listed. Optional `{"limit": <n>}` (clamped 1..=1000) bounds the
+/// newest records returned. Reply `{"ok":true,"workspace":<ws>,"runs":[…]}`.
+fn runlog_reply(svc: &TofuService, ws: &str, req: &serde_json::Value) -> String {
+    let state_dir = crate::ipc::dc_common::dc_state_dir(&svc.workgroup_root);
+    let limit = req
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map_or(RUNLOG_DEFAULT_LIMIT, |n| n as usize)
+        .clamp(1, 1000);
+    let path = runlog_path(&state_dir, ws);
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let runs = parse_runlog(&content, limit);
+    json!({ "ok": true, "workspace": ws, "runs": runs }).to_string()
+}
+
 /// Build the reply for one `action/dc/<verb>` request.
 #[must_use]
 pub fn build_reply(svc: &TofuService, verb: &str, req_body: Option<&str>) -> String {
     let err = |m: String| json!({ "error": m }).to_string();
+    // DATACENTER-7 (RBAC): gate the mesh principal BEFORE dispatch. `tofu-plan` /
+    // `tofu-state` are reads (any role); `tofu-apply` / `tofu-destroy` mutate and
+    // require operator — a denied viewer is refused + audited here.
+    if let Err(reason) = crate::ipc::dc_rbac::enforce(verb, req_body) {
+        crate::ipc::dc_rbac::audit_denial(verb, req_body, &reason);
+        return err(reason);
+    }
     match verb {
-        "tofu-plan" | "tofu-apply" | "tofu-destroy" | "tofu-state" => {}
+        "tofu-plan" | "tofu-apply" | "tofu-destroy" | "tofu-state" | "tofu-runlog" | "tofu-arm" => {
+        }
         _ => return err("unknown dc verb".into()),
     }
     let Some(body) = req_body else {
@@ -168,6 +323,13 @@ pub fn build_reply(svc: &TofuService, verb: &str, req_body: Option<&str>) -> Str
         Ok(v) => v,
         Err(e) => return err(format!("{verb}: bad json: {e}")),
     };
+
+    // tofu-arm is a global prod gate with no workspace — handle it before the
+    // workspace allow-list (and before any tofu invocation).
+    if verb == "tofu-arm" {
+        return tofu_arm_reply(svc, &req);
+    }
+
     let ws = req
         .get("workspace")
         .and_then(serde_json::Value::as_str)
@@ -177,10 +339,29 @@ pub fn build_reply(svc: &TofuService, verb: &str, req_body: Option<&str>) -> Str
         Err(e) => return err(e),
     };
 
-    // The mutating verbs fail closed unless explicitly confirmed. The allow-list
-    // above remains the injection guard; this is the destructive-op guard.
-    if (verb == "tofu-apply" || verb == "tofu-destroy") && !is_confirmed(&req) {
-        return err("apply requires confirm:true".into());
+    // tofu-runlog is a read-only per-workspace history (allow-list above is the
+    // only guard it needs).
+    if verb == "tofu-runlog" {
+        return runlog_reply(svc, ws, &req);
+    }
+
+    // The mutating verbs are RBAC-gated (viewer = denied when a role map is set),
+    // then fail closed unless explicitly confirmed, then — for the production
+    // zone — gated behind the prod-arm switch.
+    if verb == "tofu-apply" || verb == "tofu-destroy" {
+        if let Err(e) =
+            crate::ipc::dc_common::rbac_gate_mutating(crate::ipc::dc_common::body_principal(&req))
+        {
+            return err(e);
+        }
+        if !is_confirmed(&req) {
+            return err("apply requires confirm:true".into());
+        }
+        let state_dir = crate::ipc::dc_common::dc_state_dir(&svc.workgroup_root);
+        let armed = crate::ipc::dc_common::read_arm(&state_dir, "tofu");
+        if let Err(e) = prod_apply_gate(ws, armed) {
+            return err(e);
+        }
     }
 
     let repo = svc.workgroup_root.display();
@@ -223,25 +404,36 @@ pub fn build_reply(svc: &TofuService, verb: &str, req_body: Option<&str>) -> Str
     };
 
     let script = format!("cd {repo}/{dir} && source ./env.sh 2>/dev/null && {tofu_cmd}");
+    // Persist the run to the per-workspace on-disk run-log (DATACENTER-15) — every
+    // plan/apply/destroy, ok or fail — so the panel's run-log survives a reload,
+    // not just the transient Bus.
+    let state_dir = crate::ipc::dc_common::dc_state_dir(&svc.workgroup_root);
     match std::process::Command::new("bash")
         .args(["-lc", &script])
         .output()
     {
         Ok(o) if o.status.success() => {
             let summary = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            append_runlog(&state_dir, verb, ws, true, &summary);
             json!({ "ok": true, "summary": summary }).to_string()
         }
         Ok(o) => {
             let mut out = String::from_utf8_lossy(&o.stdout).into_owned();
             out.push_str(&String::from_utf8_lossy(&o.stderr));
             let msg = out.trim();
-            if msg.is_empty() {
-                err(format!("{verb} failed"))
+            let msg = if msg.is_empty() {
+                format!("{verb} failed")
             } else {
-                err(msg.to_string())
-            }
+                msg.to_string()
+            };
+            append_runlog(&state_dir, verb, ws, false, &msg);
+            err(msg)
         }
-        Err(e) => err(format!("{verb} exec failed: {e}")),
+        Err(e) => {
+            let msg = format!("{verb} exec failed: {e}");
+            append_runlog(&state_dir, verb, ws, false, &msg);
+            err(msg)
+        }
     }
 }
 
@@ -436,6 +628,120 @@ mod tests {
         let s = TofuService::new(PathBuf::from("/tmp"));
         let body = json!({ "workspace": "prod" }).to_string();
         let r = build_reply(&s, "tofu-plan", Some(&body));
+        assert!(r.contains("unknown tofu workspace"), "{r}");
+    }
+
+    // ---- DATACENTER-15: run-log + prod-arm gate --------------------------------
+
+    #[test]
+    fn new_verbs_in_lock() {
+        assert_eq!(action_topic("tofu-runlog"), "action/dc/tofu-runlog");
+        assert_eq!(action_topic("tofu-arm"), "action/dc/tofu-arm");
+        assert!(ACTION_VERBS.contains(&"tofu-runlog"));
+        assert!(ACTION_VERBS.contains(&"tofu-arm"));
+    }
+
+    #[test]
+    fn runlog_path_is_per_workspace_jsonl() {
+        let p = runlog_path(std::path::Path::new("/var/dc"), "xen-xapi");
+        assert_eq!(
+            p,
+            std::path::Path::new("/var/dc/tofu-runlog/xen-xapi.jsonl")
+        );
+    }
+
+    #[test]
+    fn runlog_record_round_trips_and_caps_summary() {
+        let line = runlog_record_json(1_700_000_000, "tofu-apply", "zone1-do", true, "applied 2");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["ts"], 1_700_000_000_u64);
+        assert_eq!(v["verb"], "tofu-apply");
+        assert_eq!(v["workspace"], "zone1-do");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["summary"], "applied 2");
+        // A monster summary is capped char-boundary safe.
+        let big = "é".repeat(RUNLOG_SUMMARY_CAP + 500);
+        let line = runlog_record_json(1, "tofu-plan", "xen-xapi", false, &big);
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            v["summary"].as_str().unwrap().chars().count(),
+            RUNLOG_SUMMARY_CAP
+        );
+    }
+
+    #[test]
+    fn parse_runlog_keeps_newest_limit_in_order() {
+        let mut content = String::new();
+        for i in 0..5 {
+            content.push_str(&runlog_record_json(i, "tofu-plan", "xen-xapi", true, "ok"));
+            content.push('\n');
+        }
+        // A blank + garbage line are skipped.
+        content.push_str("\n");
+        content.push_str("not json\n");
+        let runs = parse_runlog(&content, 3);
+        assert_eq!(runs.len(), 3);
+        // Newest-last: ts 2,3,4.
+        assert_eq!(runs[0]["ts"], 2);
+        assert_eq!(runs[2]["ts"], 4);
+        // A limit larger than the record count returns them all.
+        assert_eq!(parse_runlog(&content, 100).len(), 5);
+        assert!(parse_runlog("", 10).is_empty());
+    }
+
+    #[test]
+    fn append_then_read_runlog_round_trip() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        append_runlog(dir, "tofu-plan", "xen-xapi", true, "no changes");
+        append_runlog(dir, "tofu-apply", "xen-xapi", false, "boom");
+        let content = std::fs::read_to_string(runlog_path(dir, "xen-xapi")).unwrap();
+        let runs = parse_runlog(&content, 10);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0]["verb"], "tofu-plan");
+        assert_eq!(runs[1]["verb"], "tofu-apply");
+        assert_eq!(runs[1]["ok"], false);
+        // A different workspace has its own (empty) log.
+        assert!(std::fs::read_to_string(runlog_path(dir, "zone1-do")).is_err());
+    }
+
+    #[test]
+    fn prod_apply_gate_only_gates_zone1_do() {
+        // Dev zone is always allowed.
+        assert!(prod_apply_gate("xen-xapi", false).is_ok());
+        assert!(prod_apply_gate("xen-xapi", true).is_ok());
+        // Prod zone disarmed → denied with a clear reason.
+        let e = prod_apply_gate("zone1-do", false).unwrap_err();
+        assert!(e.contains("prod disarmed") && e.contains("zone1-do"), "{e}");
+        // Prod zone armed → allowed.
+        assert!(prod_apply_gate("zone1-do", true).is_ok());
+    }
+
+    #[test]
+    fn tofu_arm_read_reports_armed_state() {
+        // A bare read (no `on`) never mutates and always answers ok+armed.
+        let s = TofuService::new(PathBuf::from("/tmp"));
+        let r = build_reply(&s, "tofu-arm", Some("{}"));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], true);
+        assert!(v.get("armed").and_then(|a| a.as_bool()).is_some(), "{r}");
+    }
+
+    #[test]
+    fn tofu_runlog_returns_runs_array() {
+        // Pin the state dir to a temp dir so the read is hermetic, seed one run.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let s = TofuService::new(tmp.path().to_path_buf());
+        // With no MCNF_DC_STATE_DIR override the service falls back to XDG; to keep
+        // this hermetic we write directly to where the service will look only when
+        // XDG is absent — so instead assert the read-only shape on an empty log.
+        let r = build_reply(&s, "tofu-runlog", Some(r#"{"workspace":"xen-xapi"}"#));
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["workspace"], "xen-xapi");
+        assert!(v["runs"].is_array(), "{r}");
+        // An unknown workspace is still rejected by the allow-list.
+        let r = build_reply(&s, "tofu-runlog", Some(r#"{"workspace":"prod"}"#));
         assert!(r.contains("unknown tofu workspace"), "{r}");
     }
 }

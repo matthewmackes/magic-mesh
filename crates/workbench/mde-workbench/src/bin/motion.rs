@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use mde_notify::{AlertItem, Severity, Source};
-use mde_theme::animation::{ease, lerp_f32, Tween};
-use mde_theme::motion::{Easing, DURATION_MODERATE_02};
+use mde_theme::animation::{ease, lerp_f32, slide_in, RenderParams, Tween};
+use mde_theme::motion::{Easing, Motion, DURATION_MODERATE_02, PANEL_MOUNT_TRANSLATE_Y_PX};
 
 /// Slide-in travel: a new card starts this many px to the **right** of its rest
 /// position and eases in. Component dimension (the slide-out is 420 px wide), so
@@ -159,16 +159,24 @@ struct Entrance {
     reduce_motion: bool,
 }
 
-/// NOTIFY-HUB-2 — the Hub's motion state machine.
+/// NOTIFY-HUB-2 / NOTIFY-FX-1 — the Hub's motion state machine.
 ///
 /// Tracks which item IDs are currently entering (slide-in + blink) and, while
-/// any are, slides the rest of the list down. Tick-driven: the Hub advances it
-/// from a single `iced::time::every` subscription that it only arms while
-/// [`HubAnim::is_idle`] is `false` (no idle CPU).
+/// any are, slides the rest of the list down. **NOTIFY-FX-1** adds the Hub-*open*
+/// fade/slide-in: when the panel maps it plays the same Carbon `panel_mount`
+/// reveal the Application Menu uses on open ([`HubAnim::on_open`] →
+/// [`HubAnim::open_params`], built on the shared `mde_theme::animation::slide_in`
+/// helper), so the Hub and the launcher share one open vocabulary. Tick-driven:
+/// the Hub advances it from a single `iced::time::every` subscription that it
+/// only arms while [`HubAnim::is_idle`] is `false` (no idle CPU).
 #[derive(Debug, Default, Clone)]
 pub struct HubAnim {
     /// item id → its in-flight entrance.
     entering: HashMap<String, Entrance>,
+    /// NOTIFY-FX-1 — the Hub-open reveal tween (Carbon `panel_mount`), in flight
+    /// from [`HubAnim::on_open`] until its duration elapses; `None` = settled / no
+    /// open animation (the `Default` state, so a fresh `HubAnim` is idle).
+    open: Option<Tween>,
     reduce_motion: bool,
 }
 
@@ -180,7 +188,42 @@ impl HubAnim {
     pub fn new(reduce_motion: bool) -> Self {
         Self {
             entering: HashMap::new(),
+            open: None,
             reduce_motion,
+        }
+    }
+
+    /// NOTIFY-FX-1 — arm the Hub-open reveal at `now`: a Carbon `panel_mount`
+    /// fade + slide-up (≤80 ms crossfade under reduce-motion), the same open
+    /// vocabulary the Application Menu plays. Call once when the panel maps.
+    pub fn on_open(&mut self, now: Instant) {
+        self.open = Some(Tween::resolved(
+            now,
+            Motion::panel_mount().duration,
+            self.reduce_motion,
+        ));
+    }
+
+    /// NOTIFY-FX-1 — the Hub-open reveal's render params at `now` (alpha +
+    /// `translate_y`), straight off the shared [`slide_in`] helper so the Hub and
+    /// the launcher resolve the open motion from one source. Once the reveal has
+    /// settled (or was never armed) this is the fully-shown rest frame. Under
+    /// reduce-motion `slide_in` drops the slide (crossfade only) — no positional
+    /// thrash on the layer surface.
+    #[must_use]
+    pub fn open_params(&self, now: Instant) -> RenderParams {
+        match self.open {
+            Some(open) => slide_in(
+                open.start(),
+                now,
+                PANEL_MOUNT_TRANSLATE_Y_PX,
+                self.reduce_motion,
+            ),
+            None => RenderParams {
+                alpha: 1.0,
+                translate_y: 0.0,
+                scale: 1.0,
+            },
         }
     }
 
@@ -205,16 +248,21 @@ impl HubAnim {
         }
     }
 
-    /// `true` when no item is currently animating — the Hub stops ticking
-    /// (MOTION-PERF-1: zero idle wakeups).
+    /// `true` when no item is currently animating **and** the Hub-open reveal has
+    /// settled — the Hub stops ticking (MOTION-PERF-1: zero idle wakeups).
     #[must_use]
     pub fn is_idle(&self, now: Instant) -> bool {
-        self.entering.values().all(|e| e.window.is_complete(now))
+        self.open.is_none_or(|o| o.is_complete(now))
+            && self.entering.values().all(|e| e.window.is_complete(now))
     }
 
-    /// Drop every finished entrance (call once per tick). Returns the count
-    /// still in flight so the subscription can stop when it reaches 0.
+    /// Drop every finished entrance + the settled open reveal (call once per
+    /// tick). Returns the count of entrances still in flight so the subscription
+    /// can stop when it reaches 0 and nothing else is animating ([`Self::is_idle`]).
     pub fn gc(&mut self, now: Instant) -> usize {
+        if self.open.is_some_and(|o| o.is_complete(now)) {
+            self.open = None;
+        }
         self.entering.retain(|_, e| !e.window.is_complete(now));
         self.entering.len()
     }
@@ -459,7 +507,10 @@ mod tests {
             "existing card starts pushed down, got {}",
             m0.translate_y
         );
-        assert_eq!(m0.translate_x, 0.0, "existing card never slides horizontally");
+        assert_eq!(
+            m0.translate_x, 0.0,
+            "existing card never slides horizontally"
+        );
         // It eases back up to rest within the first beat.
         let settled = t0 + blink_beat() + Duration::from_millis(1);
         assert!(anim.card_motion("old", settled).translate_y.abs() < 1e-3);
@@ -486,6 +537,70 @@ mod tests {
         assert!(anim.is_idle(Instant::now()));
         // A never-registered id reads as fully at rest.
         assert!(anim.card_motion("ghost", Instant::now()).is_rest());
+    }
+
+    // ── NOTIFY-FX-1 — Hub-open reveal ───────────────────────────────────
+
+    #[test]
+    fn hub_open_slides_up_and_fades_then_settles() {
+        // The Hub-open reveal mirrors the Application Menu: a Carbon panel-mount
+        // fade + slide-up that arms on open and settles after its duration.
+        let t0 = Instant::now();
+        let mut anim = HubAnim::new(false);
+        assert!(anim.is_idle(t0), "a fresh Hub (no open armed) is idle");
+        anim.on_open(t0);
+        assert!(
+            !anim.is_idle(t0),
+            "an armed open reveal ⇒ not idle (the Hub ticks)"
+        );
+        // At t0 the body starts offset below + transparent, then rises to rest.
+        let p0 = anim.open_params(t0);
+        assert!(
+            (p0.translate_y - PANEL_MOUNT_TRANSLATE_Y_PX).abs() < 1e-3,
+            "starts a few px low, got {}",
+            p0.translate_y
+        );
+        assert!(p0.alpha < 1e-3, "starts transparent");
+        let dur = Motion::panel_mount().duration;
+        let settled = anim.open_params(t0 + dur);
+        assert!(settled.translate_y.abs() < 1e-3, "rises to rest");
+        assert!((settled.alpha - 1.0).abs() < 1e-3, "ends fully shown");
+        assert!(anim.is_idle(t0 + dur), "settled ⇒ idle again");
+    }
+
+    #[test]
+    fn hub_open_reduce_motion_drops_the_slide_and_caps_at_80ms() {
+        // Reduce-motion: a crossfade only (no positional slide on the layer
+        // surface) and the ≤80 ms Carbon cap — the a11y contract.
+        let t0 = Instant::now();
+        let mut anim = HubAnim::new(true);
+        anim.on_open(t0);
+        for ms in [0, 40, 80] {
+            let p = anim.open_params(t0 + std::time::Duration::from_millis(ms));
+            assert_eq!(p.translate_y, 0.0, "no slide under reduce-motion at {ms}ms");
+        }
+        let capped = t0 + Duration::from_millis(80) + Duration::from_millis(1);
+        assert!(
+            anim.is_idle(capped),
+            "open reveal settles within the 80 ms cap"
+        );
+    }
+
+    #[test]
+    fn hub_open_gc_clears_the_settled_reveal() {
+        let t0 = Instant::now();
+        let mut anim = HubAnim::new(false);
+        anim.on_open(t0);
+        assert!(!anim.is_idle(t0));
+        // gc before completion keeps the reveal; after completion clears it.
+        let _ = anim.gc(t0);
+        assert!(!anim.is_idle(t0), "in-flight reveal survives an early gc");
+        let done = t0 + Motion::panel_mount().duration + Duration::from_millis(1);
+        let _ = anim.gc(done);
+        assert!(anim.is_idle(done));
+        // Fully shown rest frame once cleared.
+        let p = anim.open_params(done);
+        assert!((p.alpha - 1.0).abs() < 1e-3 && p.translate_y.abs() < 1e-3);
     }
 
     #[test]

@@ -609,6 +609,9 @@ pub struct HomePanel {
     /// The capability the open modal is probing — drives Retry + the jump
     /// offered on success.
     pub connect_target: Option<CapabilityId>,
+    /// MOTION-TRANS-2 — open-reveal clock for the connect/configure modal (armed
+    /// on the `Closed → open` edge, cleared on dismiss).
+    reveal: crate::panel_chrome::DialogReveal,
 }
 
 impl HomePanel {
@@ -619,6 +622,7 @@ impl HomePanel {
             remediation: String::new(),
             connect: ConnectProgress::Closed,
             connect_target: None,
+            reveal: crate::panel_chrome::DialogReveal::default(),
         }
     }
 
@@ -709,6 +713,7 @@ impl HomePanel {
             },
             Message::ConnectDismiss => {
                 self.connect = ConnectProgress::Closed;
+                self.reveal.close();
                 self.connect_target = None;
                 Task::none()
             }
@@ -746,6 +751,14 @@ impl HomePanel {
     /// button and the modal's Retry. The probe result resolves the modal via
     /// [`Message::ConnectProbed`].
     fn probe_capability(&mut self, id: CapabilityId) -> Task<crate::Message> {
+        // MOTION-TRANS-2 — arm the open reveal only on the `Closed → open` edge
+        // (a row's Configure); an in-place Retry from a Failure is untouched.
+        if !self.connect.is_open() {
+            self.reveal.open(
+                std::time::Instant::now(),
+                crate::live_theme::reduce_motion(),
+            );
+        }
         self.connect = ConnectProgress::pending(
             format!("Configure {}", capability_label(id)),
             format!("Checking {} status…", capability_label(id)),
@@ -1073,7 +1086,15 @@ impl HomePanel {
             crate::Message::Home(Message::ConnectRetry),
             crate::Message::Home(Message::ConnectDismiss),
             primary,
+            self.reveal.params(std::time::Instant::now()),
         )
+    }
+
+    /// MOTION-TRANS-2 — the connect/configure modal's open-reveal clock for the
+    /// shell's tick-subscription gate ([`crate::panel_chrome::DialogReveal::needs_tick`]).
+    #[must_use]
+    pub fn dialog_reveal(&self) -> &crate::panel_chrome::DialogReveal {
+        &self.reveal
     }
 }
 

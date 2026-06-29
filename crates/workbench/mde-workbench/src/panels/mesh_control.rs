@@ -59,6 +59,12 @@ pub struct MeshControlSnapshot {
     /// the etcd-quorum members; the card lists them by name. Empty
     /// when the directory is unreachable or no lighthouse is enrolled.
     pub lighthouse_members: Vec<String>,
+    /// HA-5 — the worker-published coordination-plane status off the Bus
+    /// (`mesh/ha/status`, the `ha_monitor` lane). This is the authoritative
+    /// *published* view the daemon alerts against: member count + quorum-OK +
+    /// leader. `None` when the topic is empty / the Bus is unreachable (the
+    /// card just omits the "published" line and stands on the live healthz).
+    pub ha_status: Option<crate::mesh_directory::HaStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -660,10 +666,69 @@ fn ha_card_view<'a>(
     ]
     .spacing(6);
 
+    // HA-5 — the worker-published coordination-plane status (the `mesh/ha/status`
+    // lane the `ha_monitor` alerts against). This consumes the published topic so
+    // the operator sees the exact member/quorum/leader state the Alert Center
+    // fires on — distinct from the live healthz rows above.
+    let published_row = ha_published_row(snap, palette);
+
     ha_card_shell(
-        column![header, etcd_row, members_row, lh_row, context_row].spacing(10),
+        column![
+            header,
+            etcd_row,
+            members_row,
+            lh_row,
+            published_row,
+            context_row
+        ]
+        .spacing(10),
         palette,
     )
+}
+
+/// HA-5 — render the worker-published coordination-plane status row from
+/// [`MeshControlSnapshot::ha_status`] (the `mesh/ha/status` bus lane). Green when
+/// the published view reports an elected leader (quorum healthy), amber when it
+/// reports no leader (quorum lost), and a muted "not published yet" line when the
+/// topic is empty / the Bus is unreachable — an honest absence, never demo data.
+fn ha_published_row<'a>(
+    snap: &'a MeshControlSnapshot,
+    palette: Palette,
+) -> Element<'a, crate::Message> {
+    let success = palette.success.into_cosmic_color();
+    let warning = palette.warning.into_cosmic_color();
+    let text_muted = palette.text_muted.into_cosmic_color();
+
+    let Some(status) = &snap.ha_status else {
+        return text("published HA status: none on the bus yet (ha_monitor)")
+            .size(11)
+            .colr(text_muted)
+            .into();
+    };
+
+    let (icon, color, label, summary) = if status.quorum_ok {
+        let leader = status.leader.as_deref().unwrap_or("?");
+        (
+            Icon::StatusOk,
+            success,
+            "QUORUM OK",
+            format!(
+                "leader {leader} · {} etcd member(s) (published by ha_monitor)",
+                status.member_count
+            ),
+        )
+    } else {
+        (
+            Icon::StatusWarning,
+            warning,
+            "NO LEADER",
+            format!(
+                "quorum lost — no elected leader · {} member(s) (published by ha_monitor)",
+                status.member_count
+            ),
+        )
+    };
+    ha_status_row("coordination plane", icon, color, label, summary, palette)
 }
 
 /// One labelled status line for the HA card: an icon pill + a bold verdict
@@ -777,6 +842,11 @@ pub fn probe_cluster() -> MeshControlSnapshot {
     // members). Both degrade to an honest empty/unreachable state.
     let health = crate::mesh_directory::fetch_health();
     let lighthouse_members = read_lighthouse_members();
+    // HA-5 — the worker-published coordination-plane status (the `ha_monitor`
+    // lane the daemon alerts against). Consumed alongside the live healthz so
+    // the panel shows the same member/quorum/leader state the Alert Center fires
+    // on; an empty topic / down Bus is an honest `None`.
+    let ha_status = crate::mesh_directory::fetch_ha_status();
     MeshControlSnapshot {
         lease,
         self_is_leader,
@@ -787,6 +857,7 @@ pub fn probe_cluster() -> MeshControlSnapshot {
         nebula_mesh_id,
         health,
         lighthouse_members,
+        ha_status,
     }
 }
 
@@ -1133,6 +1204,11 @@ mod tests {
                 ha_ok: true,
             }),
             lighthouse_members: vec!["anvil".into(), "forge".into(), "kiln".into()],
+            ha_status: Some(crate::mesh_directory::HaStatus {
+                member_count: 3,
+                quorum_ok: true,
+                leader: Some("anvil".into()),
+            }),
         };
         let _ = p.view();
     }
@@ -1224,6 +1300,7 @@ mod tests {
             nebula_mesh_id: String::new(),
             health: None,
             lighthouse_members: Vec::new(),
+            ha_status: None,
         };
         let _ = p.view();
     }
@@ -1333,6 +1410,42 @@ mod tests {
         let members = u32::try_from(p.snapshot.lighthouse_members.len()).unwrap();
         assert_eq!(members, 3);
         assert_eq!(quorum_fault_tolerance(members), 1);
+        let _ = p.view();
+    }
+
+    /// HA-5 — the card consumes the worker-published `mesh/ha/status` lane: a
+    /// healthy published snapshot (leader present) renders without panicking, and
+    /// a quorum-lost published snapshot (no leader) renders the warning line.
+    #[test]
+    fn ha_card_renders_published_status_row() {
+        let raw = r#"{"schema":1,"node_count":4,"healthy_nodes":4,
+            "lighthouse_count":3,"ha_ok":true}"#;
+        let health = crate::mesh_directory::parse_health_report(raw).expect("decoded");
+
+        // Healthy published view.
+        let mut p = MeshControlPanel::new();
+        p.snapshot = MeshControlSnapshot {
+            health: Some(health.clone()),
+            lighthouse_members: vec!["anvil".into(), "forge".into(), "kiln".into()],
+            ha_status: Some(crate::mesh_directory::HaStatus {
+                member_count: 3,
+                quorum_ok: true,
+                leader: Some("kiln".into()),
+            }),
+            ..MeshControlSnapshot::default()
+        };
+        let _ = p.view();
+
+        // Quorum-lost published view (no leader) — warning line, no panic.
+        p.snapshot.ha_status = Some(crate::mesh_directory::HaStatus {
+            member_count: 3,
+            quorum_ok: false,
+            leader: None,
+        });
+        let _ = p.view();
+
+        // Absent published topic — the muted "not published yet" line, no panic.
+        p.snapshot.ha_status = None;
         let _ = p.view();
     }
 }

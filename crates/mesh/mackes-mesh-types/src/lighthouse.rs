@@ -30,6 +30,22 @@ pub const DEFAULT_STALE_MS: u64 = 90_000;
 /// The directory `role` value that marks a lighthouse (design Q1).
 pub const LIGHTHOUSE_ROLE: &str = "lighthouse";
 
+/// The directory `role` value that marks the media-serving lighthouse subclass
+/// (MEDIA-1). A `Lighthouse_Media` node IS a lighthouse for relay / HA / roster /
+/// quorum purposes (same rank-0 control plane) — it merely *additionally* hosts
+/// the music service — so [`is_lighthouse`] treats it as a lighthouse, while
+/// [`is_media_lighthouse`] isolates the subclass for `music.mesh` membership.
+pub const MEDIA_LIGHTHOUSE_ROLE: &str = "lighthouse-media";
+
+/// Whether a directory `role` string names a lighthouse of either kind (the
+/// stock `lighthouse` or the media subclass `lighthouse-media`). Single-sourced
+/// so every membership / count / roster site stays coherent now that the media
+/// subclass exists. Tolerant of an unset/empty role (pre-role writers) → false.
+#[must_use]
+pub fn role_is_lighthouse(role: Option<&str>) -> bool {
+    matches!(role, Some(LIGHTHOUSE_ROLE | MEDIA_LIGHTHOUSE_ROLE))
+}
+
 /// How long a leader lease is valid (mirrors `mackesd`'s `leader::LEASE_DURATION`).
 /// A lease older than this is treated as no leader (failover in progress).
 pub const LEASE_DURATION_S: u64 = 60;
@@ -138,12 +154,36 @@ impl Beacon {
     }
 }
 
-/// Whether a directory row is a lighthouse (design Q1). Tolerant of the
+/// Whether a directory row is a lighthouse (design Q1) — the stock relay
+/// `lighthouse` OR the media subclass `lighthouse-media` (MEDIA-1; a media
+/// lighthouse is still a relay anchor for HA/roster/quorum). Tolerant of the
 /// pre-role writers that left `role` unset — those are treated as non-
 /// lighthouse peers.
 #[must_use]
 pub fn is_lighthouse(peer: &PeerRecord) -> bool {
-    peer.role.as_deref() == Some(LIGHTHOUSE_ROLE)
+    role_is_lighthouse(peer.role.as_deref())
+}
+
+/// Whether a directory row is the media-serving lighthouse subclass (MEDIA-1):
+/// `role == "lighthouse-media"`. This is the membership predicate the
+/// `music.mesh` active-active A-record set + the published music-service
+/// registration are built from.
+#[must_use]
+pub fn is_media_lighthouse(peer: &PeerRecord) -> bool {
+    peer.role.as_deref() == Some(MEDIA_LIGHTHOUSE_ROLE)
+}
+
+/// The media-lighthouse subset of a peer directory, sorted by hostname for a
+/// stable order (the `music.mesh` A-set + the published-service health rows).
+#[must_use]
+pub fn media_lighthouse_records(peers: &[PeerRecord]) -> Vec<PeerRecord> {
+    let mut out: Vec<PeerRecord> = peers
+        .iter()
+        .filter(|p| is_media_lighthouse(p))
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| a.hostname.cmp(&b.hostname));
+    out
 }
 
 /// The lighthouse subset of a peer directory, sorted by hostname for a stable
@@ -362,6 +402,41 @@ mod tests {
         assert!(!is_lighthouse(&p));
         p.role = Some("lighthouse".into());
         assert!(is_lighthouse(&p));
+    }
+
+    #[test]
+    fn media_lighthouse_counts_as_a_lighthouse_but_is_its_own_subclass() {
+        // MEDIA-1 — a `lighthouse-media` node is still a lighthouse for
+        // HA/roster/quorum, AND is isolated as the media subclass for music.mesh.
+        let mut media = PeerRecord::now("lh-media-1", None, "healthy");
+        media.role = Some(MEDIA_LIGHTHOUSE_ROLE.to_string());
+        media.overlay_ip = Some("10.42.0.7".into());
+        assert!(
+            is_lighthouse(&media),
+            "media LH still counts as a lighthouse"
+        );
+        assert!(is_media_lighthouse(&media), "and is the media subclass");
+        assert!(role_is_lighthouse(Some("lighthouse-media")));
+        assert!(role_is_lighthouse(Some("lighthouse")));
+        assert!(!role_is_lighthouse(Some("server")));
+        assert!(!role_is_lighthouse(None));
+
+        // A plain lighthouse is a lighthouse but NOT a media lighthouse.
+        let mut plain = PeerRecord::now("lh-plain", None, "healthy");
+        plain.role = Some(LIGHTHOUSE_ROLE.to_string());
+        assert!(is_lighthouse(&plain));
+        assert!(!is_media_lighthouse(&plain));
+
+        // The media subset filters + sorts only the media lighthouses.
+        let mut media2 = PeerRecord::now("lh-media-0", None, "healthy");
+        media2.role = Some(MEDIA_LIGHTHOUSE_ROLE.to_string());
+        media2.overlay_ip = Some("10.42.0.8".into());
+        let set = media_lighthouse_records(&[media.clone(), plain, media2]);
+        assert_eq!(
+            set.iter().map(|p| p.hostname.as_str()).collect::<Vec<_>>(),
+            ["lh-media-0", "lh-media-1"],
+            "only media lighthouses, sorted by hostname"
+        );
     }
 
     #[test]

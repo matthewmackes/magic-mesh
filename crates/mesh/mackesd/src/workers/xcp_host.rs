@@ -53,10 +53,18 @@ pub fn is_xcp_dom0() -> bool {
 /// the tag model carries. The token is taken from the typed
 /// [`CapabilityTag::Hypervisor`] so it can never drift from the writer's
 /// vocabulary.
+///
+/// `address` is the dom0's reachable IPv4 (XCP-6): the provisioning-side consumer
+/// ([`super::xcp_provision::select_published_capacity`]) matches this advert to an
+/// `MCNF_XEN_DOM0S` allow-list entry by `address` (or `hostname`), so it can
+/// prefer this published capacity over a fresh SSH probe of the dom0. Empty when
+/// the dom0's primary IPv4 couldn't be determined (the consumer then matches by
+/// hostname / falls back to a direct probe).
 #[must_use]
 pub fn xcp_host_doc(
     node_id: &str,
     hostname: &str,
+    address: &str,
     cap: &HostCapacity,
     now_ms: u64,
 ) -> serde_json::Value {
@@ -66,6 +74,7 @@ pub fn xcp_host_doc(
         "role": CapabilityTag::Hypervisor.as_str(),
         "node_id": node_id,
         "hostname": hostname,
+        "address": address,
         "ts_ms": now_ms,
         "capacity": {
             "cpu_count": cap.cpu_count,
@@ -86,6 +95,24 @@ fn now_ms() -> u64 {
 fn read_hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Best-effort primary outbound IPv4 of this dom0 (XCP-6) — the address a
+/// provisioner's `MCNF_XEN_DOM0S` allow-list entry uses, published into the
+/// advert so the consumer can match it to the right dom0. Uses the connected-UDP
+/// trick: connecting a datagram socket sends **no** packet, it just makes the
+/// kernel pick (via the routing table) the egress source address, which it
+/// exposes as the socket's local address. Empty on failure (no route / no IPv4),
+/// in which case the consumer matches by hostname or falls back to a direct probe.
+fn primary_ipv4() -> String {
+    use std::net::UdpSocket;
+    UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| {
+            s.connect("192.0.2.1:9")?; // TEST-NET-1 — no packet sent, route lookup only
+            s.local_addr()
+        })
+        .map(|a| a.ip().to_string())
         .unwrap_or_default()
 }
 
@@ -131,7 +158,8 @@ impl Worker for XcpHostWorker {
             let node_id = self.node_id.clone();
             let _ = tokio::task::spawn_blocking(move || match hv.host_capacity() {
                 Ok(cap) => {
-                    let doc = xcp_host_doc(&node_id, &read_hostname(), &cap, now_ms());
+                    let doc =
+                        xcp_host_doc(&node_id, &read_hostname(), &primary_ipv4(), &cap, now_ms());
                     if let Ok(persist) = Persist::open(bus_root) {
                         let _ =
                             persist.write(&topic, Priority::Default, None, Some(&doc.to_string()));
@@ -162,7 +190,7 @@ mod tests {
             sr_free_bytes: 500_000_000_000,
             running_vms: 3,
         };
-        let v = xcp_host_doc("node-7", "xcp-1", &cap, 42);
+        let v = xcp_host_doc("node-7", "xcp-1", "172.20.0.9", &cap, 42);
         assert_eq!(v["kind"], "xcp-host");
         // DATACENTER-17 — the dom0 self-asserts the hypervisor role, taken
         // from the typed cap-tag so it stays in lock-step with the vocabulary.
@@ -170,6 +198,9 @@ mod tests {
         assert_eq!(v["role"], CapabilityTag::Hypervisor.as_str());
         assert_eq!(v["node_id"], "node-7");
         assert_eq!(v["hostname"], "xcp-1");
+        // XCP-6 — the advert carries the dom0's reachable address so the
+        // provisioner can match it to an MCNF_XEN_DOM0S allow-list entry.
+        assert_eq!(v["address"], "172.20.0.9");
         assert_eq!(v["ts_ms"], 42);
         assert_eq!(v["capacity"]["cpu_count"], 8);
         assert_eq!(v["capacity"]["running_vms"], 3);
