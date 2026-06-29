@@ -39,6 +39,14 @@ locals {
       big_vcpus   = 10 # ~whole 12-core BigBoy, 2 cores for dom0
       big_mem_gib = 26
     }
+    "xen-194" = {
+      pool_name   = "XEN-194"      # 172.20.145.194 — 4c / 15 GiB
+      ip_base     = "172.20.0.170" # lane .170–.200
+      big_name    = "mcnf-build-big-53"
+      small_name  = "mcnf-build-53"
+      big_vcpus   = 3 # ~whole 4-core host, 1 core for dom0
+      big_mem_gib = 11
+    }
   }
 
   # Split each dom0's ip_base into the first-3-octets prefix + the last octet, so

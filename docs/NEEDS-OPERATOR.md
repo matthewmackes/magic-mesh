@@ -15,13 +15,46 @@ below are the residual that need you.
 
 ---
 
+## 2026-06-29 — operator-cleared drain (this session)
+
+The operator cleared the five blockers; autonomous execution drove them all:
+- **✅ DO keys** — found at `/root/.mcnf-media-spaces.env` (all `DO_SPACES_*` +
+  `ND_ADMIN_*`, region `nyc3`); `mcnf-spaces` rclone remote works; 3 buckets:
+  `mcnf-media-4533`, `mcnf-dr-4533`, `mcnf-mesh-media`. MEDIA-2 credential block CLEARED.
+- **✅ Merge** — PR #66 merged to `master` (`82deeeb`, 72 commits).
+- **✅ RPM** — `magic-mesh-11.0.8-1.x86_64.rpm` cut on BIGBOY + staged `/root/mcnf-rpm/`
+  (fixed a stale `Cargo.lock` 11.0.1→11.0.8 that broke `--locked`).
+- **✅ Live-VM verify** — L1 install 6/6; LH-JOIN-QNM mount end-to-end (founding
+  lighthouse → `/mnt/mesh-storage` live FUSE mount, not wedged, no reboot).
+- **✅ SUBSTRATE-V2 rehearsal** — 3-node etcd cluster + SUBSTRATE-14 reboot/disconnect
+  drill PASSED (quorum survived, reconverged, rollback clean).
+- **✅ XEN-194** — new Xen host onboarded as 4th build pool (`mcnf-build-53` @ .170,
+  toolchained, builds); IaC in **PR #67**.
+
+**Still operator-gated (your call):** merge **PR #67** · RPM **publish/deploy** (`/release`) ·
+SUBSTRATE-V2 **fleet cutover** go/no-go (rehearsal passed) · DO **live deploy** of the
+MEDIA chain + LH-JOIN-QNM verify on a **real DO lighthouse**.
+
+---
+
 ## A. Operator-only secret — **the single highest-leverage unblock**
 
-### A1. MEDIA-2 — DigitalOcean Spaces bucket + S3 key-pair
+### A1. MEDIA-2 — DigitalOcean Spaces bucket + S3 key-pair  ✅ RESOLVED 2026-06-29
+**Resolved:** keys live at `/root/.mcnf-media-spaces.env` (the exact path
+`setup-media-navidrome.sh` reads) — `DO_SPACES_KEY/SECRET/ENDPOINT/REGION/BUCKET`
+(region `nyc3`, bucket `mcnf-media-4533`) + `ND_ADMIN_*`, plus a working
+`mcnf-spaces` rclone remote and a DO API token at `/root/.mcnf-do-token`. The 3
+Spaces buckets are enumerated. *Remaining (downstream, not the key): the live
+MEDIA serving chain (MEDIA-3/4/…) still needs a running Lighthouse_Media node +
+the SUBSTRATE-V2 cutover; see C/B.*
+
+<details><summary>original unblock (kept for history)</summary>
+
 **Unblock:** in the DO console, create a ~100 GB Spaces bucket (record name +
 region), generate a Spaces **access key / secret** pair, and hand them over (or
 drop them where `setup-media-navidrome.sh` reads `DO_SPACES_KEY/SECRET/ENDPOINT/
 REGION/BUCKET`). Once provided, the leader will age-encrypt them onto Mesh-Sync.
+</details>
 
 **Code is ready and waiting** — `install-helpers/setup-media-navidrome.sh`
 (rclone `--read-only` VFS-cache mount + `mcnf-music-store.service`), the

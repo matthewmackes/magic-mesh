@@ -2,7 +2,7 @@
 
 The no-fixed-center replacement for the XO-backed Xen IaC: the `xenserver`
 provider talks **XAPI directly** to a pool master, so there is no central Xen
-Orchestra to lose. The farm spans **3 standalone pools**, so this uses **3 aliased
+Orchestra to lose. The farm spans **4 standalone pools**, so this uses **4 aliased
 providers** (one per dom0). **This supersedes the `xenorchestra` config in `../`**
 (now deprecated — do not `apply` it; both managing the same VMs would conflict).
 
@@ -10,6 +10,10 @@ providers** (one per dom0). **This supersedes the `xenorchestra` config in `../`
 `mcnf-build-50` (.9), `-51` (.193), `-52` (.165) — farm-wide `tofu plan` =
 **`0 add / 0 destroy`** (only the benign per-VM metadata residual). The VMs stayed
 `running` throughout (import is non-mutating). The farm is now XAPI-managed, no XO.
+
+**XEN-194 added (2026-06-29):** a 4th pool (`172.20.145.194`, 4c / 15 GiB) joined
+the farm — provider alias `x194`, build VM `mcnf-build-53` (.170), `MDE-VM-golden`
+replicated from `.9`. Same adopt-via-import pattern as the other three.
 
 ## Status
 
