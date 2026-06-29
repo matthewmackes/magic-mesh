@@ -235,6 +235,12 @@ pub enum Message {
     /// the in-flight-only transition tick (idle ⇒ no wakeups); the handler just
     /// re-renders, clearing the transition once the tween completes.
     TransitionTick,
+    /// MOTION-TRANS-2 — one frame of a dialog/modal/drawer OPEN reveal. Fired by
+    /// the in-flight-only tick the subscription arms while any open panel's
+    /// [`panel_chrome::DialogReveal::needs_tick`] holds; the handler is a no-op
+    /// (the reveal reads `Instant::now()` live in `view`), so this just re-renders.
+    /// Stops the instant every reveal settles (zero idle wakeups).
+    DialogRevealTick,
 }
 
 /// MOTION-TRANS-1 — an in-flight panel/route crossfade. Created the instant the
@@ -666,6 +672,26 @@ impl App {
                     .map(|_| Message::TransitionTick),
             );
         }
+        // MOTION-TRANS-2 — drive a dialog/modal/drawer OPEN reveal at ~60 fps, but
+        // ONLY while one is actually in flight. Each dialog-bearing panel exposes
+        // its `DialogReveal`; the tick is gated on whether ANY of them
+        // `needs_tick` (at most one dialog is open at a time, so this is a handful
+        // of cheap checks). At rest / once settled / under reduce-motion every
+        // `needs_tick` is false, so this subscription doesn't exist — zero idle
+        // wakeups (MOTION-PERF-1).
+        let now = Instant::now();
+        let dialog_revealing = self.provisioning.dialog_reveal().needs_tick(now)
+            || self.snapshots.dialog_reveal().needs_tick(now)
+            || self.lighthouses.dialog_reveal().needs_tick(now)
+            || self.mesh_services.dialog_reveal().needs_tick(now)
+            || self.home.dialog_reveal().needs_tick(now)
+            || self.music.dialog_reveal().needs_tick(now);
+        if dialog_revealing {
+            subs.push(
+                cosmic::iced::time::every(Duration::from_millis(16))
+                    .map(|_| Message::DialogRevealTick),
+            );
+        }
         // E6.10 — sample Compute instance CPU/mem only while that view is
         // active, so virsh/podman stats aren't polled when the operator is
         // elsewhere.
@@ -920,6 +946,11 @@ impl App {
                 }
                 Task::none()
             }
+            // MOTION-TRANS-2 — a dialog/modal/drawer open-reveal frame. The reveal
+            // is stateless w.r.t. the tick (each panel's `view` samples
+            // `Instant::now()`), so this just re-renders the next frame; the
+            // subscription stops arming the tick once every reveal settles.
+            Message::DialogRevealTick => Task::none(),
             // GUI-RECONNECT — fire the cheap Bus liveness probe.
             Message::ReconnectTick => {
                 Task::perform(probe_bus_reachable(), Message::ReconnectProbed)
