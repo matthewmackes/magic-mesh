@@ -74,6 +74,25 @@ the zero-build per-node console while the thin scheduler is built.
   human front-end that submits desired-state (start this VM / run this service).
 - **No new consensus:** reuse the etcd you already run; don't add Nomad/k8s Raft.
 
+## Per-node KVM service set (the recipe — `infra/ansible/node-virt.yml`)
+The Fedora+KVM replacement for the XCP-ng 16-service toolstack. Only ~4 packages are
+*added*; the kernel + the mesh + systemd cover the rest. Encoded as idempotent ansible.
+
+- **Install:** `qemu-kvm` (VMM) · `libvirt` (+ qemu/network/storage drivers =
+  `xapi`+`xenopsd`+`sm`+`xcp-networkd`) · `virt-install`/`libguestfs-tools` ·
+  **`podman`** (new) · `cloud-hypervisor` (VDI fast-path) · *opt*
+  `cockpit`+`cockpit-machines`+`cockpit-podman`.
+- **Enable:** `libvirtd.service` · `podman.socket` · (`cockpit.socket`) + the default
+  libvirt network (autostart) + a `default` dir storage pool + the mesh user in the
+  `libvirt` group.
+- **Add nothing for:** `xen`/`xenstored`/`xenconsoled` (in-kernel KVM) · `squeezed`
+  (virtio-balloon) · `stunnel` (Nebula) · `xha` (the mesh) · `v6d` (no licensing) ·
+  `message-switch`/`forkexecd` (systemd/D-Bus/`mde-bus`) · `xcp-rrdd`/`perfmon` (a
+  `mackesd` metrics worker, MV-2).
+
+This list IS the `KVM_SERVICES` catalog (worklist MV-1); the `kvm-host-health` worker
+(MV-2) surfaces it to `event/kvm/services`; the Datacenter panels (MV-6) drive it.
+
 ## Acceptance (runtime-observable, §7)
 - One image installs on a box; `role=lighthouse` brings up relay/media/CA with no
   desktop; the *same* image with `role=workstation` (+ a display) brings up the egui

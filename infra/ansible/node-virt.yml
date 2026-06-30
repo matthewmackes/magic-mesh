@@ -1,0 +1,106 @@
+# The per-node KVM virtualization service set — the Fedora+KVM replacement for the
+# XCP-ng toolstack (design: docs/design/mesh-virt-management.md). EVERY mesh node
+# (Lighthouse OR Workstation — same stack, role is config) carries this; the
+# Datacenter interfaces drive it via mackesd's libvirt + Podman workers.
+#
+# It deliberately adds only ~4 packages: KVM lives in the kernel, and the mesh
+# (Nebula = stunnel, the overlay routes around a dead node = xha) + systemd/D-Bus
+# (= message-switch/forkexecd) + virtio-balloon (= squeezed) cover the rest.
+#
+#   ansible-playbook node-virt.yml                 # all mesh nodes
+#   ansible-playbook node-virt.yml -l <host>       # one node
+#   ansible-playbook node-virt.yml -e virt_target=build_vms   # any group
+---
+- name: MCNF node KVM virtualization stack (libvirt + Podman + cloud-hypervisor)
+  hosts: "{{ virt_target | default('mesh_nodes') }}"
+  gather_facts: true
+
+  tasks:
+    # libvirt = xapi + xenopsd + sm + xcp-networkd (lifecycle + storage pools +
+    # virtual networks + the management API). qemu-kvm = the VMM userspace over the
+    # in-kernel KVM. cloud-hypervisor = the VDI desktop fast-path runtime (mde-kvm).
+    # podman = the container side XCP-ng never had.
+    - name: KVM virt service set (dnf)
+      become: true
+      ansible.builtin.dnf:
+        name:
+          - qemu-kvm
+          - libvirt
+          - libvirt-daemon-driver-qemu
+          - libvirt-daemon-driver-network
+          - libvirt-daemon-driver-storage
+          - virt-install
+          - libguestfs-tools
+          - podman
+          - cloud-hypervisor
+          # Per-node KVM+Podman web console (replaces the XO/console UI). Optional
+          # but cheap; the Datacenter panels are the primary UI.
+          - cockpit
+          - cockpit-machines
+          - cockpit-podman
+        state: present
+        install_weak_deps: false
+
+    # xcp-rrdd / perfmon equivalent is a mackesd metrics worker (code, MV-2/MV-5);
+    # nothing to install here for it.
+
+    - name: Enable libvirt + Podman sockets
+      become: true
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - libvirtd.service
+        - podman.socket
+
+    - name: Cockpit socket (optional console)
+      become: true
+      ansible.builtin.systemd:
+        name: cockpit.socket
+        enabled: true
+        state: started
+      failed_when: false
+
+    # The default libvirt network (virbr0, NAT) — autostart so guests get DHCP
+    # without a per-boot dance (the xcp-networkd job). Guarded for idempotency.
+    - name: Autostart the default libvirt network
+      become: true
+      ansible.builtin.command: virsh net-autostart default
+      register: net_autostart
+      changed_when: "'marked as autostarted' in net_autostart.stdout"
+      failed_when: net_autostart.rc != 0 and 'already' not in net_autostart.stderr
+
+    - name: Start the default libvirt network
+      become: true
+      ansible.builtin.command: virsh net-start default
+      register: net_start
+      changed_when: "'started' in net_start.stdout"
+      failed_when: net_start.rc != 0 and 'already active' not in net_start.stderr
+
+    # A dir storage pool (the sm/SR equivalent). VM disks live here (Workstation:
+    # ~/Local per the storage lock; servers: a larger volume). Idempotent.
+    - name: Ensure the VM-disk storage dir exists
+      become: true
+      ansible.builtin.file:
+        path: /var/lib/libvirt/images
+        state: directory
+        mode: "0711"
+
+    - name: Define + start the default storage pool
+      become: true
+      ansible.builtin.shell: >
+        virsh pool-info default >/dev/null 2>&1 ||
+        (virsh pool-define-as default dir --target /var/lib/libvirt/images &&
+         virsh pool-autostart default && virsh pool-start default)
+      register: pool_def
+      changed_when: pool_def.rc == 0 and pool_def.stdout != ""
+      failed_when: pool_def.rc != 0
+
+    # Non-root virsh/podman for the mesh user (so mackesd drives them unprivileged).
+    - name: Add the build/mesh user to the libvirt group
+      become: true
+      ansible.builtin.user:
+        name: "{{ ansible_user | default('mm') }}"
+        groups: libvirt
+        append: true
