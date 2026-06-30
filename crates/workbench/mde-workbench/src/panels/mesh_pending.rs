@@ -1,18 +1,14 @@
-//! v4.0.1 WB-2.i — Network → Mesh Pending panel.
+//! Network → Mesh Join Status panel.
 //!
-//! Lists peer-probe JSON entries that `mackesd` has cached at
-//! `$XDG_CACHE_HOME/mde/peers/<peer-id>/probe.json` (the
-//! `peer_join::write_probe` landing spot). Each row is treated
-//! as a pending pair-request: the operator clicks Accept to
-//! shell `mackesd enroll <peer-id>`, or Reject to delete the
-//! probe file. When the daemon ships a real "pair-request
-//! queue" abstraction later, this panel switches its source
-//! over without touching the UI shape.
-//!
-//! Chrome influence: Win11 Settings → Bluetooth & devices →
-//! Add device flow (cards-with-accept-reject pattern).
+//! Token-join (the v2.5 Nebula flow) has **no pending-approval step** — a valid
+//! single-use join token IS the authorization, so there is no inbox of requests
+//! to accept or deny. This panel therefore shows the live **join status**: every
+//! node in the replicated peer directory, most recently-seen first, with its
+//! overlay IP, role, and health. (It replaces the v1.x "pending pair requests"
+//! approval queue, whose probe-cache source — `~/.cache/mde/peers/*/probe.json`
+//! — was removed and whose Accept/Reject targeted a leader-ingest flow that was
+//! never built.)
 
-use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
@@ -20,44 +16,32 @@ use cosmic::iced::Task;
 use cosmic::iced::{Background, Border, Color, Length, Padding};
 use cosmic::Element;
 use cosmic::Theme;
+use mackes_mesh_types::peers::PeerRecord;
 use mde_theme::{mde_icon, FontSize, Icon, IconSize, Palette, TypeRole};
 
 use crate::cosmic_compat::prelude::*;
 
+/// One enrolled peer as shown in the join-status roster.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PendingPeer {
-    pub peer_id: String,
+pub struct JoinedPeer {
     pub hostname: String,
-    pub distro: String,
-    pub mded_version: String,
-    pub rtt_ms: u32,
-    /// Path to the cached probe.json — used by the reject
-    /// button to delete the file.
-    pub probe_path: PathBuf,
+    pub overlay_ip: String,
+    pub role: String,
+    pub health: String,
+    pub last_seen_ms: u64,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct MeshPendingPanel {
-    pub peers: Vec<PendingPeer>,
+    pub peers: Vec<JoinedPeer>,
     pub busy: bool,
-    pub last_op: String,
     pub last_run_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Loaded(Vec<PendingPeer>),
+    Loaded(Vec<JoinedPeer>),
     RefreshClicked,
-    AcceptClicked(String),
-    RejectClicked {
-        peer_id: String,
-        probe_path: PathBuf,
-    },
-    OpFinished {
-        peer_id: String,
-        op: String,
-        success: bool,
-    },
 }
 
 impl MeshPendingPanel {
@@ -67,9 +51,17 @@ impl MeshPendingPanel {
     }
 
     pub fn load() -> Task<crate::Message> {
-        Task::perform(async { scan_pending_probes() }, |peers| {
-            crate::Message::MeshPending(Message::Loaded(peers))
-        })
+        Task::perform(
+            async {
+                // fetch_peers does a blocking Bus round-trip — keep it off the
+                // iced executor thread.
+                let peers = tokio::task::spawn_blocking(crate::mesh_directory::fetch_peers)
+                    .await
+                    .unwrap_or_default();
+                roster_from_peers(peers)
+            },
+            |roster| crate::Message::MeshPending(Message::Loaded(roster)),
+        )
     }
 
     pub fn update(&mut self, msg: Message) -> Task<crate::Message> {
@@ -84,58 +76,6 @@ impl MeshPendingPanel {
                 self.busy = true;
                 Self::load()
             }
-            Message::AcceptClicked(peer_id) => {
-                self.busy = true;
-                self.last_op = format!("enrolling {peer_id}…");
-                let id = peer_id.clone();
-                Task::perform(
-                    async move {
-                        let ok = run_mackesd_enroll(&id).await;
-                        (id, "enroll".to_string(), ok)
-                    },
-                    |(peer_id, op, success)| {
-                        crate::Message::MeshPending(Message::OpFinished {
-                            peer_id,
-                            op,
-                            success,
-                        })
-                    },
-                )
-            }
-            Message::RejectClicked {
-                peer_id,
-                probe_path,
-            } => {
-                self.busy = true;
-                self.last_op = format!("rejecting {peer_id}…");
-                let id = peer_id.clone();
-                Task::perform(
-                    async move {
-                        let ok = std::fs::remove_file(&probe_path).is_ok();
-                        (id, "reject".to_string(), ok)
-                    },
-                    |(peer_id, op, success)| {
-                        crate::Message::MeshPending(Message::OpFinished {
-                            peer_id,
-                            op,
-                            success,
-                        })
-                    },
-                )
-            }
-            Message::OpFinished {
-                peer_id,
-                op,
-                success,
-            } => {
-                self.last_op = if success {
-                    format!("{op} {peer_id}: ok")
-                } else {
-                    format!("{op} {peer_id}: FAILED")
-                };
-                self.busy = false;
-                Self::load()
-            }
         }
     }
 
@@ -143,20 +83,19 @@ impl MeshPendingPanel {
         let palette = crate::live_theme::palette();
         let sizes = FontSize::defaults();
 
-        let title = text("Mesh Pending")
+        let title = text("Join Status")
             .size(TypeRole::Display.size_in(sizes))
             .colr(palette.text.into_cosmic_color());
 
-        let subtitle_text = if !self.last_op.is_empty() {
-            self.last_op.clone()
-        } else if let Some(t) = self.last_run_at {
-            format!("last refresh {}", fmt_age(t))
-        } else {
+        let subtitle_text = if let Some(t) = self.last_run_at {
             format!(
-                "{} pending request{}",
+                "{} peer{} · last refresh {}",
                 self.peers.len(),
-                if self.peers.len() == 1 { "" } else { "s" }
+                if self.peers.len() == 1 { "" } else { "s" },
+                fmt_age(t),
             )
+        } else {
+            "click Refresh to load the roster".to_string()
         };
         let subtitle = text(subtitle_text)
             .size(TypeRole::Body.size_in(sizes))
@@ -226,7 +165,25 @@ impl MeshPendingPanel {
     }
 }
 
-fn peer_row<'a>(p: &'a PendingPeer, palette: Palette) -> Element<'a, crate::Message> {
+/// Project the replicated peer directory into the join-status roster, most
+/// recently-seen first. Pure + testable (no Bus).
+#[must_use]
+pub fn roster_from_peers(peers: Vec<PeerRecord>) -> Vec<JoinedPeer> {
+    let mut out: Vec<JoinedPeer> = peers
+        .into_iter()
+        .map(|p| JoinedPeer {
+            hostname: p.hostname,
+            overlay_ip: p.overlay_ip.unwrap_or_default(),
+            role: p.role.unwrap_or_else(|| "peer".into()),
+            health: p.health,
+            last_seen_ms: p.last_seen_ms,
+        })
+        .collect();
+    out.sort_by(|a, b| b.last_seen_ms.cmp(&a.last_seen_ms));
+    out
+}
+
+fn peer_row<'a>(p: &'a JoinedPeer, palette: Palette) -> Element<'a, crate::Message> {
     let resolved = mde_icon(Icon::Peer, IconSize::PanelHeader);
     let icon_color = palette.accent.into_cosmic_color();
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
@@ -248,32 +205,33 @@ fn peer_row<'a>(p: &'a PendingPeer, palette: Palette) -> Element<'a, crate::Mess
     let hostname_text = text(p.hostname.clone())
         .size(14)
         .colr(palette.text.into_cosmic_color());
-    let id_text = text(p.peer_id.clone())
-        .size(11)
-        .colr(palette.text_muted.into_cosmic_color());
-    let distro_text = text(format!(
-        "{} · mded {} · {} ms",
-        p.distro, p.mded_version, p.rtt_ms
+    let where_text = text(format!(
+        "{} · {}",
+        if p.overlay_ip.is_empty() {
+            "(no overlay ip)"
+        } else {
+            p.overlay_ip.as_str()
+        },
+        p.role,
     ))
     .size(11)
     .colr(palette.text_muted.into_cosmic_color());
 
-    let accept_btn = action_btn("Accept", palette, false).on_press(crate::Message::MeshPending(
-        Message::AcceptClicked(p.peer_id.clone()),
-    ));
-    let reject_btn = action_btn("Reject", palette, true).on_press(crate::Message::MeshPending(
-        Message::RejectClicked {
-            peer_id: p.peer_id.clone(),
-            probe_path: p.probe_path.clone(),
-        },
-    ));
+    let health_color = match p.health.as_str() {
+        "healthy" => palette.success,
+        "degraded" => palette.warning,
+        "unreachable" => palette.danger,
+        _ => palette.text_muted,
+    }
+    .into_cosmic_color();
+    let status_text = text(format!("{} · seen {}", p.health, fmt_seen(p.last_seen_ms)))
+        .size(11)
+        .colr(health_color);
 
     let body = row![
         icon_widget,
-        column![hostname_text, id_text, distro_text].spacing(2),
+        column![hostname_text, where_text, status_text].spacing(2),
         Space::new().width(Length::Fill),
-        accept_btn,
-        reject_btn,
     ]
     .spacing(12)
     .align_y(cosmic::iced::alignment::Vertical::Center);
@@ -318,12 +276,13 @@ fn empty_state_card<'a>(palette: Palette) -> Element<'a, crate::Message> {
         column![
             icon_widget,
             Space::new().height(Length::Fixed(8.0)),
-            text("No pending pair requests")
+            text("No peers in the directory yet")
                 .size(14)
                 .colr(palette.text.into_cosmic_color()),
             text(
-                "When a peer initiates a pair request mackesd caches its probe under \
-                 ~/.cache/mde/peers/<peer-id>/probe.json; rows appear here.",
+                "Peers appear here as they enroll (Mesh Join → paste a join token). \
+                 Token-join needs no approval — a valid single-use token is the \
+                 authorization.",
             )
             .size(11)
             .colr(palette.text_muted.into_cosmic_color()),
@@ -336,141 +295,26 @@ fn empty_state_card<'a>(palette: Palette) -> Element<'a, crate::Message> {
     .into()
 }
 
-fn action_btn<'a>(
-    label: &'a str,
-    palette: Palette,
-    ghost: bool,
-) -> cosmic::iced::widget::Button<'a, crate::Message, Theme> {
-    let accent = palette.accent.into_cosmic_color();
-    let danger = palette.danger.into_cosmic_color();
-    button(
-        text(label)
-            .size(11)
-            .colr(if ghost { danger } else { Color::WHITE }),
-    )
-    .padding(Padding::from([4u16, 14u16]))
-    .sty(
-        move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
-            let (bg, fg) = if ghost {
-                // Faint danger tint on hover for the destructive ghost button.
-                let hover_bg = Color { a: 0.12, ..danger };
-                match status {
-                    cosmic::iced::widget::button::Status::Hovered => (hover_bg, danger),
-                    _ => (Color::TRANSPARENT, danger),
-                }
-            } else {
-                let bg = match status {
-                    cosmic::iced::widget::button::Status::Hovered => Color {
-                        r: accent.r * 1.10,
-                        g: accent.g * 1.10,
-                        b: accent.b * 1.10,
-                        a: accent.a,
-                    },
-                    _ => accent,
-                };
-                (bg, Color::WHITE)
-            };
-            cosmic::iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(bg)),
-                text_color: fg,
-                border: Border {
-                    color: if ghost { danger } else { Color::TRANSPARENT },
-                    width: if ghost { 1.0 } else { 0.0 },
-                    radius: 4.0.into(),
-                },
-                shadow: cosmic::iced::Shadow::default(),
-                ..cosmic::iced::widget::button::Style::default()
-            }
-        },
-    )
+// ---- helpers --------------------------------------------------
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
-// ---- I/O ------------------------------------------------------
-
-#[must_use]
-pub fn scan_pending_probes() -> Vec<PendingPeer> {
-    let Some(root) = pending_root() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let peer_dir = entry.path();
-        let probe_path = peer_dir.join("probe.json");
-        if let Some(p) = read_probe(&probe_path) {
-            out.push(p);
-        }
+/// Coarse "… ago" string for a unix-ms last-seen timestamp.
+fn fmt_seen(last_seen_ms: u64) -> String {
+    let secs = now_ms().saturating_sub(last_seen_ms) / 1000;
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{} min ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{} h ago", secs / 3600)
+    } else {
+        format!("{} d ago", secs / 86_400)
     }
-    out.sort_by(|a, b| a.hostname.cmp(&b.hostname));
-    out
-}
-
-fn pending_root() -> Option<PathBuf> {
-    let base = std::env::var("XDG_CACHE_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".cache"))
-        })?;
-    Some(base.join("mde").join("peers"))
-}
-
-fn read_probe(path: &Path) -> Option<PendingPeer> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    parse_probe(&raw, path)
-}
-
-/// Pure parser — exposed for tests + to keep the I/O wrapper
-/// thin. Extracts the subset of `PeerProbe` fields the panel
-/// displays; ignores everything else.
-#[must_use]
-pub fn parse_probe(raw: &str, probe_path: &Path) -> Option<PendingPeer> {
-    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
-    let peer_id = v.get("peer_id")?.as_str()?.to_string();
-    let hostname = v
-        .get("hostname")
-        .and_then(|x| x.as_str())
-        .unwrap_or(&peer_id)
-        .to_string();
-    let distro = v
-        .get("distro")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let mded_version = v
-        .pointer("/kernel_driver/mded_version")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let rtt_ms = v
-        .pointer("/bus_topology/rtt_ms")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0) as u32;
-    Some(PendingPeer {
-        peer_id,
-        hostname,
-        distro,
-        mded_version,
-        rtt_ms,
-        probe_path: probe_path.to_path_buf(),
-    })
-}
-
-pub async fn run_mackesd_enroll(peer_id: &str) -> bool {
-    use tokio::process::Command;
-    let status = Command::new("mackesd")
-        .args(["enroll", peer_id])
-        .status()
-        .await;
-    status.map(|s| s.success()).unwrap_or(false)
 }
 
 fn fmt_age(t: SystemTime) -> String {
@@ -493,55 +337,38 @@ fn fmt_age(t: SystemTime) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_probe_decodes_minimum_required_fields() {
-        let raw = r#"{
-            "peer_id": "peer:abcd1234",
-            "hostname": "anvil",
-            "distro": "Fedora 44",
-            "vendor_id": "8086",
-            "product_id": "5916",
-            "kernel_driver": {
-                "uname": "6.7.0",
-                "transport_module": "tcp",
-                "mded_version": "4.0.0",
-                "dmesg_tail": []
-            },
-            "bus_topology": {
-                "mesh_path": [],
-                "rtt_ms": 42,
-                "nat_class": "Open",
-                "ice_candidate": "",
-                "pci_tree": [],
-                "usb_tree": []
-            }
-        }"#;
-        let probe_path = Path::new("/tmp/peer/probe.json");
-        let p = parse_probe(raw, probe_path).expect("decoded");
-        assert_eq!(p.peer_id, "peer:abcd1234");
-        assert_eq!(p.hostname, "anvil");
-        assert_eq!(p.distro, "Fedora 44");
-        assert_eq!(p.mded_version, "4.0.0");
-        assert_eq!(p.rtt_ms, 42);
-        assert_eq!(p.probe_path, probe_path);
+    fn peer(host: &str, health: &str, last_seen_ms: u64) -> PeerRecord {
+        let mut r = PeerRecord::now(host, None, health);
+        r.last_seen_ms = last_seen_ms;
+        r
     }
 
     #[test]
-    fn parse_probe_returns_none_without_peer_id() {
-        let raw = r#"{"hostname": "anvil"}"#;
-        assert!(parse_probe(raw, Path::new("/tmp/probe.json")).is_none());
+    fn roster_sorts_most_recently_seen_first() {
+        let roster = roster_from_peers(vec![
+            peer("old", "healthy", 1_000),
+            peer("new", "degraded", 9_000),
+        ]);
+        assert_eq!(roster[0].hostname, "new");
+        assert_eq!(roster[0].health, "degraded");
+        assert_eq!(roster[1].hostname, "old");
     }
 
     #[test]
-    fn parse_probe_uses_peer_id_as_fallback_hostname() {
-        let raw = r#"{"peer_id": "peer:only-id"}"#;
-        let p = parse_probe(raw, Path::new("/tmp/p.json")).expect("decoded");
-        assert_eq!(p.hostname, "peer:only-id");
+    fn roster_defaults_role_and_overlay_when_absent() {
+        let roster = roster_from_peers(vec![peer("anvil", "healthy", 5_000)]);
+        assert_eq!(roster[0].role, "peer");
+        assert_eq!(roster[0].overlay_ip, "");
     }
 
     #[test]
-    fn parse_probe_returns_none_for_garbage() {
-        assert!(parse_probe("not json", Path::new("/x")).is_none());
+    fn roster_carries_overlay_and_role_when_present() {
+        let mut r = peer("lh", "healthy", 5_000);
+        r.overlay_ip = Some("10.42.0.1".into());
+        r.role = Some("lighthouse".into());
+        let roster = roster_from_peers(vec![r]);
+        assert_eq!(roster[0].overlay_ip, "10.42.0.1");
+        assert_eq!(roster[0].role, "lighthouse");
     }
 
     #[test]
@@ -551,16 +378,9 @@ mod tests {
     }
 
     #[test]
-    fn view_renders_with_pending_peer_without_panic() {
+    fn view_renders_with_peers_without_panic() {
         let mut p = MeshPendingPanel::new();
-        p.peers = vec![PendingPeer {
-            peer_id: "peer:abc".into(),
-            hostname: "anvil".into(),
-            distro: "Fedora 44".into(),
-            mded_version: "4.0.0".into(),
-            rtt_ms: 42,
-            probe_path: PathBuf::from("/tmp/probe.json"),
-        }];
+        p.peers = roster_from_peers(vec![peer("anvil", "healthy", 5_000)]);
         let _ = p.view();
     }
 }
