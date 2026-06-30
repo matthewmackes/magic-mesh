@@ -1,5 +1,15 @@
 # E12 — Forked-COSMIC + Magic-Mesh → one egui-native mesh desktop OS
 
+> ⚠️ **SUPERSEDED IN PART (2026-06-30, same day).** The **forked-compositor** model
+> in this doc (locks 1/5/6/12 — vendor `cosmic-comp`, compositor-up desktop,
+> mesh-aware compositor) is **RETIRED**. A 50-question follow-up survey replaced it
+> with a **thin-client VDI / egui-on-DRM** desktop: the host owns the DRM seat with
+> **no compositor** and brokers VM desktops. The authoritative E12 desktop design is
+> now **[`quasar-vdi-desktop.md`](quasar-vdi-desktop.md)**. What carries forward from
+> this doc: **egui as the one toolkit** (lock 2), the **fresh egui-native `Style`**
+> (locks 3/9), and **egui built-in motion** (lock 10) — i.e. the `mde-egui` harness,
+> which landed as E12-1.
+
 > **Status:** LOCKED (design) · 2026-06-30 · 4-round / 16-question `/plan` survey.
 > **Supersedes:** the Cosmic-era desktop locks (`AI_GOVERNANCE.md` §4/§5/§6, E11).
 > **Series:** opens **MCNF 12.0** (current tip: 11.2.0). Codename **"Quasar"**

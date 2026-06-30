@@ -1,27 +1,33 @@
 # MCNF — Mackes Cosmic Nebula Fedora — Governance & Architectural Locks
 
 > **Identity:** *MCNF (Mackes Cosmic Nebula Fedora) is a secure, no-fixed-center
-> workgroup mesh AND its own forked, mesh-native Fedora-Cosmic desktop OS, with
-> an all-egui UI.* This document is the platform's identity + the architectural
-> locks. When a lock conflicts with prose elsewhere, the **newer lock wins**;
-> authority ranks **Memory > this file > design docs > worklist body**.
+> workgroup mesh AND an egui-native mesh **thin-client desktop OS**: the host is a
+> single egui shell that owns the DRM seat and brokers VM desktops (local KVM +
+> remote mesh peers), with **no Wayland compositor**.* This document is the
+> platform's identity + the architectural locks. When a lock conflicts with prose
+> elsewhere, the **newer lock wins**; authority ranks **Memory > this file > design
+> docs > worklist body**.
 >
-> **Series (E12 pivot, 2026-06-30):** the **12.0 series is codenamed "Quasar"**,
-> surfaced as `MCNF 12.0 "Quasar"` in the About/greeter. The package + infra id +
-> GitHub repo **stay `magic-mesh`** so the live-node upgrade path is unbroken.
-> Internal identifiers (`mackesd`, `mde-*`, `org.magicmesh.*`, `magic-mesh.repo`,
-> `magic-mesh-v*` tags, the `magic-mesh` icon name) are unchanged. The **"C" in
-> MCNF now means *our forked Cosmic desktop*, not "runs on stock Cosmic"** — E12
-> forks the COSMIC source into the repo.
+> **Series (E12 pivot, 2026-06-30; design revised same day):** the **12.0 series is
+> codenamed "Quasar"**, surfaced as `MCNF 12.0 "Quasar"` in the About/greeter. The
+> package + infra id + GitHub repo **stay `magic-mesh`** so the live-node upgrade
+> path is unbroken. Internal identifiers (`mackesd`, `mde-*`, `org.magicmesh.*`,
+> `magic-mesh.repo`, `magic-mesh-v*` tags, the `magic-mesh` icon name) are
+> unchanged. **E12 first proposed forking the COSMIC compositor; that fork is
+> RETIRED — the "C" in MCNF is heritage (the Cosmic-derived look + the `cosmic-*`
+> lineage), not a vendored compositor.** Desktop design:
+> `docs/design/quasar-vdi-desktop.md`.
 
 This rewrites the 11.x/Cosmic-era governance for the **E12 pivot** (the 12.0
-series, "Quasar"). Where E11 ended the labwc desktop and made MCNF a *tenant* of
-upstream Cosmic, **E12 forks Cosmic into the repo** and makes the desktop a
-first-class, mesh-aware part of the platform — every surface an **egui** Wayland
-client. The toolkit (§4), desktop-ownership (§5), and boundary (§6) locks are
-restated for the forked-egui context. The mesh substrate (§1), Bus (§2), crypto
-(§3), Definition of Done (§7), trust envelope (§8), planes (§9), and build
-environment (§10) carry forward.
+series, "Quasar"). E11 ended the labwc desktop and made MCNF a *tenant* of upstream
+Cosmic; E12 makes the desktop a first-class, mesh-native part of the platform —
+every surface **egui**. The **revised** E12 (50-Q survey, 2026-06-30) is a
+**thin-client VDI** desktop: a single egui shell **owns the DRM seat directly (no
+compositor)** and brokers VM desktops; the originally-proposed `cosmic-comp` fork
+is **retired**. The toolkit (§4), desktop model (§5), and boundary (§6) locks are
+restated for that model; the trust envelope (§8) is raised for VM guests. The mesh
+substrate (§1), Bus (§2), crypto (§3), Definition of Done (§7), planes (§9), and
+build environment (§10) carry forward.
 
 > **Heritage — the Cosmic-era desktop locks (E11) are archived.** "libcosmic's
 > vendored iced fork", strictly-IBM-Carbon, "Cosmic provides the desktop / MCNF
@@ -79,11 +85,12 @@ auth, SIP digest) stand as recorded.
 
 ## §4 — Look & toolkit: egui-native (E12 — replaces strictly-Carbon)
 
-- **The UI toolkit is egui.** Every MCNF surface — shell chrome, panel, apps,
-  HUD/overlays — is rendered with **egui** via **eframe** (egui + winit + wgpu),
-  built as a **Wayland client** on the shared **`mde-egui`** harness. There is one
-  rendering idiom across the whole platform. **libcosmic / the vendored iced fork
-  is retired.**
+- **The UI toolkit is egui.** Every MCNF surface — shell chrome, panel, session
+  view, HUD/overlays — is rendered with **egui** via **eframe** (egui + wgpu) on the
+  shared **`mde-egui`** harness, which **owns the DRM/KMS seat directly** (a
+  winit-less smithay DRM/GBM + libinput runner — **no Wayland compositor**, §5).
+  There is one rendering idiom and one shell across the whole platform. **libcosmic
+  / the vendored iced fork is retired.**
 - **The design system is egui-native.** Strict IBM Carbon is **retired**. The
   single source of look is the shared **`Style`/`Visuals` module** in `mde-egui`
   — a Rust module, not a token crate. Surfaces never hand-roll styling; they use
@@ -98,28 +105,35 @@ auth, SIP digest) stand as recorded.
 - **Retired §4 lint gates:** `lint-carbon-tokens.sh`, `lint-motion.sh`,
   `lint-libcosmic-rev.sh`, `lint-no-cratesio-iced.sh` are removed from CI.
 
-## §5 — Distribution, desktop ownership & roles (E12 — replaces "Cosmic provides the desktop")
+## §5 — Desktop model & roles (E12 revised — egui-DRM thin-client VDI, no compositor)
 
-- **MCNF forks and owns the desktop.** The COSMIC source — `cosmic-comp` (smithay
-  compositor) + `cosmic-panel` + `cosmic-session` + `cosmic-settings` — is
-  **vendored into the repo**, pinned to a recorded upstream rev and rebased on a
-  cadence. The forked `cosmic-comp` stays a **pure compositor** (no UI embedded);
-  all UI is egui Wayland clients on top.
-- **The compositor is mesh-aware (this is what earns the fork).** The forked
-  session provides **per-peer workspaces**, a **mesh overlay/HUD**, and
-  **desktop-state** surfaced from etcd/Syncthing; `mackesd` supervises the
-  session. A pure, non-mesh fork would not justify the maintenance burden.
-- **Two delivery lanes from one codebase, because the surfaces are portable
-  Wayland clients:** (1) the **integrated spin** — forked `cosmic-comp` + the egui
-  shell/panel/app clients, built by a Fedora-Cosmic **kickstart**; (2) the **RPM
-  layer** — the same egui client binaries installed onto **stock** upstream
-  Fedora-Cosmic. Headless **Server/Lighthouse** roles install the **mesh-only RPM
-  set** (no desktop).
-- **Deployment roles** (Lighthouse ⊂ Server ⊂ Workstation, strict supersets) gate
-  which `mackesd` workers + surfaces run. "Workstation" = the MCNF desktop (spin
-  or RPM-layer). Shipped as **one RPM + install-time role chooser** + a
-  GitHub-hosted dnf repo (Releases asset + GitHub Pages, project-GPG-signed) + the
-  kickstart spin.
+> **Revised 2026-06-30** (50-Q `/plan` survey → `docs/design/quasar-vdi-desktop.md`).
+> The forked-`cosmic-comp` desktop is **retired** before any code landed; MCNF does
+> **not** fork or ship a Wayland compositor.
+
+- **The host is an egui thin client, not a general desktop.** The whole UI is a
+  single **egui shell that owns the DRM/KMS seat directly** (the §4 `mde-egui` smithay
+  DRM/GBM + libinput runner) — **no Wayland compositor**. There are **no native host
+  apps**: a browser / office suite / game runs **inside a VM guest**, never on the
+  host. A thin persistent chrome bar (peers · sessions · status) frames the active
+  desktop and **expands into the full Workbench**.
+- **The desktop you use is a VM.** A Workstation **brokers and displays full OS
+  desktops** (Windows/Ubuntu/…) that run either **locally on cloud-hypervisor** or
+  **remotely on any mesh peer** (an MCNF Server or an XCP-ng host), rendered
+  **egui-native** (ironrdp/vnc → an egui texture) over Nebula. A "session" is a
+  fullscreen VM desktop; sessions **roam** per-peer via etcd/Syncthing. The
+  mesh-control surfaces (Workbench/Files/Music/Voice) are **panels inside the one
+  shell**, not separate clients.
+- **One shell, three roles.** Lighthouse ⊂ Server ⊂ Workstation all run the **same**
+  egui shell — headless roles control-only / graphically light; a Workstation adds
+  the DRM seat + the VDI layer. A **`desktop-host`** capability tag marks peers that
+  serve VM desktops. `mackesd` runs the **session-broker + vm-lifecycle** workers
+  (the shell renders; mackesd brokers — §1/§9).
+- **Delivery:** the Workstation ships as an **immutable bootc/ostree image** (the
+  egui-DRM shell + cloud-hypervisor + ironrdp/virtio-gpu stack baked in; VM disks +
+  mesh state on the writable partition). Headless **Server/Lighthouse** install the
+  **mesh-only set**. The install-time **role chooser** + the GitHub-hosted dnf repo
+  (Releases asset + GitHub Pages, project-GPG-signed) carry forward.
 
 ## §6 — The boundary: layered tiers (E12 — replaces the two-bucket gate)
 
@@ -127,9 +141,9 @@ The dependency graph is **three lint-gated tiers**:
 
 ```
   desktop-shell   ⊃→   platform-services   ⊃→   mesh-substrate
-  (egui clients +      (mackesd, mde-bus,        (Nebula, etcd,
-   forked COSMIC)       magic-fleet, enroll,      Syncthing, CA/KDC)
-                        session-supervisor)
+  (the one egui       (mackesd: session-        (Nebula, etcd,
+   shell on DRM +       broker + vm-lifecycle,    Syncthing, CA/KDC)
+   mde-vdi)             mde-bus, magic-fleet)
 ```
 
 - **Dependencies point only inward** (shell → services → mesh; never outward). A
@@ -154,14 +168,22 @@ runtime-reachability bar is unchanged — `/preview` stays optional/best-effort.
 
 ## §8 — Positioning & trust envelope
 
-*(Carried forward unchanged from E11.)* **Production workgroup-grade, not
-hyperscale.** Supported envelope: a single workgroup of up to **3 lighthouses + 9
-peers (12 nodes)**. Trust stays **flat / open-mesh** (any enrolled cert reaches
-every peer + service; no per-service ACL) — the §0 "Simple" lever, accepted only
-because the envelope is a small trusted workgroup; the blast radius is documented
-for operators. Security controls are **enforced in code + covered by tests**, not
-just documented (single-use enrollment bearer; revocation evicts the data plane;
-unpinned node fails closed; hash-chain audit).
+**Production workgroup-grade, not hyperscale.** Infrastructure envelope: a single
+workgroup of up to **3 lighthouses + 9 peers** of the Lighthouse/Server/Workstation
+roles. Trust stays **flat / open-mesh** (any enrolled cert reaches every peer +
+service; no per-service ACL) — the §0 "Simple" lever, accepted because the envelope
+is a small trusted workgroup; the blast radius is documented for operators. Security
+controls are **enforced in code + covered by tests** (single-use enrollment bearer;
+revocation evicts the data plane; unpinned node fails closed; hash-chain audit).
+
+> **VDI revision (2026-06-30 — `quasar-vdi-desktop.md` locks 46/47).** **VM desktop
+> guests are first-class mesh members** — each dual-homed (its own Nebula cert + a
+> LAN NIC) and a **full flat-trust peer**. The supported node envelope is **raised**
+> to accommodate them; guest count is no longer bounded by the 12-node
+> infrastructure cap. This **widens the flat-trust blast radius** (a guest OS — incl.
+> Windows — reaches every peer + service); that radius **MUST be documented for
+> operators** (extends ENT-12), guests stay **default-deny inbound**, and
+> per-service ACLs are revisited if the envelope grows materially.
 
 ## §9 — The five planes
 
