@@ -50,15 +50,16 @@ fn role_blurb(role: Role) -> (&'static str, &'static str) {
             "Relay-only mesh node — Nebula overlay + control plane. No storage \
              brick, no desktop. VPS-friendly. (Rank 0)",
         ),
-        Role::Server => (
-            "Server",
-            "Headless mesh peer — Lighthouse + a replicated storage brick + \
-             fleet/monitoring workers. No desktop. (Rank 1)",
+        Role::Xcpng => (
+            "XCP-NG",
+            "Xen virtualization host — runs the full xcp-ng toolstack \
+             (xapi/xenopsd/SM/networkd…) and serves VM desktops to the mesh. \
+             No local desktop. (Rank 1)",
         ),
         Role::Workstation => (
             "Workstation",
-            "Full workstation — Server + the Cosmic desktop and all the GUIs. \
-             (Rank 2)",
+            "Full workstation — the egui thin client (Quasar): brokers VM \
+             desktops from XCP-NG hosts and local KVM. (Rank 2)",
         ),
     }
 }

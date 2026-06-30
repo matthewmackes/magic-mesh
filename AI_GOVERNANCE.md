@@ -119,19 +119,20 @@ auth, SIP digest) stand as recorded.
   desktop and **expands into the full Workbench**.
 - **The desktop you use is a VM.** A Workstation **brokers and displays full OS
   desktops** (Windows/Ubuntu/…) that run either **locally on cloud-hypervisor** or
-  **remotely on any mesh peer** (an MCNF Server or an XCP-ng host), rendered
+  **remotely on any mesh peer** (an MCNF **XCP-NG** host — the Xen tier mirroring
+  the xcp-ng toolstack), rendered
   **egui-native** (ironrdp/vnc → an egui texture) over Nebula. A "session" is a
   fullscreen VM desktop; sessions **roam** per-peer via etcd/Syncthing. The
   mesh-control surfaces (Workbench/Files/Music/Voice) are **panels inside the one
   shell**, not separate clients.
-- **One shell, three roles.** Lighthouse ⊂ Server ⊂ Workstation all run the **same**
+- **One shell, three roles.** Lighthouse · **XCP-NG** · Workstation (rank-ordered) all run the **same**
   egui shell — headless roles control-only / graphically light; a Workstation adds
   the DRM seat + the VDI layer. A **`desktop-host`** capability tag marks peers that
   serve VM desktops. `mackesd` runs the **session-broker + vm-lifecycle** workers
   (the shell renders; mackesd brokers — §1/§9).
 - **Delivery:** the Workstation ships as an **immutable bootc/ostree image** (the
   egui-DRM shell + cloud-hypervisor + ironrdp/virtio-gpu stack baked in; VM disks +
-  mesh state on the writable partition). Headless **Server/Lighthouse** install the
+  mesh state on the writable partition). Headless **XCP-NG/Lighthouse** install the
   **mesh-only set**. The install-time **role chooser** + the GitHub-hosted dnf repo
   (Releases asset + GitHub Pages, project-GPG-signed) carry forward.
 
@@ -169,7 +170,7 @@ runtime-reachability bar is unchanged — `/preview` stays optional/best-effort.
 ## §8 — Positioning & trust envelope
 
 **Production workgroup-grade, not hyperscale.** Infrastructure envelope: a single
-workgroup of up to **3 lighthouses + 9 peers** of the Lighthouse/Server/Workstation
+workgroup of up to **3 lighthouses + 9 peers** of the Lighthouse/XCP-NG/Workstation
 roles. Trust stays **flat / open-mesh** (any enrolled cert reaches every peer +
 service; no per-service ACL) — the §0 "Simple" lever, accepted because the envelope
 is a small trusted workgroup; the blast radius is documented for operators. Security

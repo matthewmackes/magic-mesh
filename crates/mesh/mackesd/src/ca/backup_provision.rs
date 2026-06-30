@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn non_lighthouse_join_does_not_get_the_passphrase() {
-        for role in [mde_role::Role::Server, mde_role::Role::Workstation] {
+        for role in [mde_role::Role::Xcpng, mde_role::Role::Workstation] {
             let tmp = tempfile::tempdir().unwrap();
             let paths = tmp_paths(tmp.path());
             let seen = RefCell::new(None);

@@ -363,7 +363,7 @@ mod tests {
 
     #[test]
     fn server_adds_fleet_but_no_desktop() {
-        let r = Role::Server.rank();
+        let r = Role::Xcpng.rank();
         for w in ["ansible-pull", "app-sync", "nebula_supervisor", "heartbeat"] {
             assert!(runs(w, r), "Server must run {w}");
         }
@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn workers_for_rank_is_a_growing_superset() {
         let lh = workers_for_rank(Role::Lighthouse.rank());
-        let srv = workers_for_rank(Role::Server.rank());
+        let srv = workers_for_rank(Role::Xcpng.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
         // +1 each (hardware_probe, rank 0 → present in every tier).
         // +1 etcd_watch (SUBSTRATE-10, rank 0 → present in every tier).
@@ -423,7 +423,7 @@ mod tests {
         // (acceptance: container absent on a non-media node), even at higher rank.
         for rank in [
             Role::Lighthouse.rank(),
-            Role::Server.rank(),
+            Role::Xcpng.rank(),
             Role::Workstation.rank(),
         ] {
             assert!(
@@ -471,7 +471,7 @@ mod tests {
         assert_eq!(media.rank, 0);
         assert!(media.media);
         // A non-lighthouse role can't be a media class (RoleClass enforces it).
-        let srv = DeployClass::from_role_class(&RoleClass::plain(Role::Server));
+        let srv = DeployClass::from_role_class(&RoleClass::plain(Role::Xcpng));
         assert_eq!(srv.rank, 1);
         assert!(!srv.media);
     }

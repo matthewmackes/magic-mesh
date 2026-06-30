@@ -16,8 +16,8 @@ use std::process::{Command, Stdio};
 pub enum SetupRole {
     /// Public lighthouse (LH1 founds; LH2/3 join as lighthouse).
     Lighthouse,
-    /// Headless server behind NAT (no desktop).
-    Server,
+    /// XCP-NG Xen virtualization host behind NAT (no desktop).
+    Xcpng,
     /// Full workstation behind NAT (desktop GUIs).
     Workstation,
 }
@@ -28,7 +28,7 @@ impl SetupRole {
     pub fn as_arg(self) -> &'static str {
         match self {
             SetupRole::Lighthouse => "lighthouse",
-            SetupRole::Server => "server",
+            SetupRole::Xcpng => "server",
             SetupRole::Workstation => "workstation",
         }
     }
@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn role_args_match_mackesd_vocabulary() {
         assert_eq!(SetupRole::Lighthouse.as_arg(), "lighthouse");
-        assert_eq!(SetupRole::Server.as_arg(), "server");
+        assert_eq!(SetupRole::Xcpng.as_arg(), "server");
         assert_eq!(SetupRole::Workstation.as_arg(), "workstation");
     }
 

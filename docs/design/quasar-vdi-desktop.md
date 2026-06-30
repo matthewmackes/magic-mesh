@@ -23,7 +23,7 @@ it runs inside a VM guest.** That dissolves the "do we need a Wayland compositor
 host a browser" question — the host stays pure egui, and the heavy third-party
 software lives in a guest desktop the shell renders as an egui texture.
 
-Three roles, one shell: **Lighthouse ⊂ Server ⊂ Workstation** all run the *same*
+Three roles, one shell: **Lighthouse · XCP-NG · Workstation** (rank-ordered) all run the *same*
 egui shell — headless/lighthouse use it control-only (graphically light); a
 Workstation adds the VDI layer (the local DRM seat + VM desktops). There is exactly
 **one shell to build**; VDI is a capability layered onto it.
@@ -69,7 +69,7 @@ Workstation adds the VDI layer (the local DRM seat + VM desktops). There is exac
 | 26 | Codec | **Adaptive to mesh link quality** (H.264/RemoteFX on good links → lighter on weak/relayed). |
 | 27 | Lifecycle owner | **The hosting peer owns lifecycle; the leader coordinates;** the Workstation requests via typed mackesd verbs (§9, no push-SSH). |
 | 28 | Concurrency | **One active fullscreen session; others connected in the chrome bar**, switchable instantly. |
-| 29 | Who serves | **Any Server-role peer serves desktops** (same cloud-hypervisor stack) — XCP-ng is one host type among them. |
+| 29 | Who serves | **Any XCP-NG host serves desktops** — the Xen tier mirroring the full xcp-ng toolstack (xapi/xenopsd/SM/…); a Workstation also serves local cloud-hypervisor VMs. |
 | 30 | On disconnect | **VM keeps running** (reconnect later); operator can set a per-VM suspend/shutdown policy. |
 
 ### Round 4 — Display & boot foundation
@@ -92,7 +92,7 @@ Workstation adds the VDI layer (the local DRM seat + VM desktops). There is exac
 | 41 | Identity | **Keep E12 "Quasar"; revise the design** (this doc + governance §4/§5/§6) to the VDI/egui-DRM model. |
 | 42 | Packaging | **Immutable bootc/ostree image** for the Workstation (image-based, appliance-style updates). |
 | 43 | Crate structure | **Many small crates** (granular: shell, chrome, each panel, RDP, VNC, KVM-broker, session-broker). |
-| 44 | Roles | **Keep Lighthouse⊂Server⊂Workstation + a new `desktop-host` capability tag** for peers that serve VMs. |
+| 44 | Roles | **Lighthouse · XCP-NG · Workstation** (XCP-NG renamed from Server — the Xen host mirroring the xcp-ng toolstack) **+ a `desktop-host` capability tag** for peers that serve VMs. |
 | 45 | VDI control | **mackesd workers** — a session-broker worker + a vm-lifecycle worker. The shell renders; mackesd brokers (§1/§9). |
 | 46 | §8 envelope | **Raise the envelope** — VM desktop guests are first-class nodes; the supported node count grows to accommodate them. |
 | 47 | Guest security | **Full flat-trust mesh members** — guests are full peers (§0-Simple). The widened blast radius is documented for operators. |
