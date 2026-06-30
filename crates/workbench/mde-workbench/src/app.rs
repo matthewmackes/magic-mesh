@@ -666,8 +666,9 @@ impl App {
 
     /// Run the libcosmic application (GUI-7).
     ///
-    /// Builds the cosmic [`Settings`](cosmic::app::Settings) (WIN_W×WIN_H
-    /// window, custom titlebar via the suppressed headerbar) then hands off to
+    /// Builds the cosmic [`Settings`](cosmic::app::Settings) (opening at the
+    /// persisted compact/expanded window size — CTRLSURF-5 — with the custom
+    /// titlebar via the suppressed headerbar) then hands off to
     /// `cosmic::app::run`. The deep-link boot (a `--focus <slug>` queued in
     /// [`PendingFocus`] by `main` before `run()`) is drained in `init`, so a
     /// `--focus` hand-off lands directly on the target panel rather than
@@ -675,9 +676,11 @@ impl App {
     pub fn run() -> cosmic::iced::Result {
         // UX-4 (d) — the custom `crate::header` bar is the only title strip the
         // user sees; Cosmic's headerbar is suppressed in `init`. The compositor
-        // manages window geometry under Cosmic; Settings carries the default
-        // size.
-        let settings = cosmic::app::Settings::default().size(cosmic::iced::Size::new(WIN_W, WIN_H));
+        // manages window geometry under Cosmic; Settings carries the open-size hint.
+        // CTRLSURF-5 — open at the persisted CompactExpand size, so the operator's
+        // compact / expanded choice survives a reopen.
+        let settings =
+            cosmic::app::Settings::default().size(front_door_panel::persisted_window_size());
         cosmic::app::run::<App>(settings, ())
     }
 
