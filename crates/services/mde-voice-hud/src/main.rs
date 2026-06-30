@@ -246,6 +246,12 @@ pub enum Message {
     /// existing register action); the agent's result lands as a later
     /// `Agent(Registration(..))` event.
     RetryRegistration,
+    /// POLISH-voicehud-chips — the operator clicked "Configure account" on the
+    /// empty-dialer zero-state (shown only with no `account.toml`). Launches the
+    /// `mde-voice-config` companion so they can register an account — best-effort,
+    /// mirroring the desktop-notification spawn (a missing binary never crashes
+    /// the HUD).
+    ConfigureAccount,
 }
 
 /// Top-level HUD state.
@@ -795,6 +801,13 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
             state.registration = sip::RegistrationState::Registering;
             agent_send(sip::AgentCommand::Reregister);
         }
+        Message::ConfigureAccount => {
+            // Launch the voice-config companion (the account editor). Best-effort,
+            // like the notify-send call record — a missing binary must never crash
+            // the HUD. The CTA only renders with no account configured, so this is
+            // the operator's real next step to register.
+            let _ = std::process::Command::new("mde-voice-config").spawn();
+        }
     }
     // MOTION-TRANS — after any message, if the call MODE changed, crossfade the
     // call bar so the mode switch reads as one motion (not a hard cut).
@@ -1144,9 +1157,10 @@ fn roster_source_indicator<'a>(source: RosterSource, appear: f32) -> Option<Elem
     )
 }
 
-/// Build the display + resolved-chip strip. The text-input
-/// receives keypad/keyboard input; the chip to its right
-/// renders the `resolve_target` classification.
+/// Build the display + status strip. The text-input receives keypad/keyboard
+/// input; below it sits the `resolve_target` classification chip — or, when the
+/// dialer is empty (the resting state), the shared empty-state block instead of a
+/// bare hint pill.
 fn build_display<'a>(state: &VoiceHud) -> Element<'a, Message> {
     let display = text_input(
         "Type 1NNN for mesh, 9 + E.164 for PSTN",
@@ -1160,13 +1174,20 @@ fn build_display<'a>(state: &VoiceHud) -> Element<'a, Message> {
     // In an established call the keypad sends DTMF tones rather than editing the
     // dial buffer — surface that so the keypad reads correctly (a touch-tone pad,
     // not a target editor). True for both outbound (local media) and inbound
-    // (agent-thread media) calls. Otherwise show the resolved-target chip.
+    // (agent-thread media) calls. Otherwise classify the dialled target: an empty
+    // dialer is the resting zero-state (the shared EmptyState), anything else a
+    // status chip.
     let in_call = matches!(state.call, sip::CallState::InCall { .. });
-    let chip = if in_call {
-        build_dtmf_hint_chip()
+    let status: Element<Message> = if in_call {
+        chip("keypad · sends tones".to_string(), theme::INFO)
     } else {
-        let resolved = resolve_target(&state.dialer_input, &state.roster);
-        build_resolved_chip(&resolved)
+        match resolve_target(&state.dialer_input, &state.roster) {
+            Resolved::Empty => dialer_empty_state(state.account.is_none()),
+            resolved => {
+                let (label, fill) = resolved_chip_label_and_color(&resolved);
+                chip(label, fill)
+            }
+        }
     };
 
     column![
@@ -1179,39 +1200,22 @@ fn build_display<'a>(state: &VoiceHud) -> Element<'a, Message> {
             },
             ..Default::default()
         }),
-        chip,
+        status,
     ]
     .spacing(8)
     .into()
 }
 
-/// The in-call keypad hint: tells the operator the keypad now sends DTMF touch-
-/// tones to the peer/IVR (RFC 4733), not dial-buffer edits. §4 — Carbon tokens.
-fn build_dtmf_hint_chip<'a>() -> Element<'a, Message> {
-    container(
-        text("keypad · sends tones")
-            .size(12.0)
-            .colr(theme::ON_PRIMARY),
-    )
-    .sty(|_: &Theme| cosmic::iced::widget::container::Style {
-        background: Some(cosmic::iced::Background::Color(theme::INFO)),
-        border: cosmic::iced::Border {
-            radius: cosmic::iced::border::Radius::from(12.0),
-            ..Default::default()
-        },
-        ..Default::default()
-    })
-    .padding(Padding::from([4, 10]))
-    .into()
-}
-
-/// Build the resolved-classification chip for the current
-/// display contents. One pill per state, colored by category.
-fn build_resolved_chip<'a>(resolved: &Resolved) -> Element<'a, Message> {
-    let (label, color) = resolved_chip_label_and_color(resolved);
-    container(text(label).size(12.0).colr(Color::WHITE))
+/// One rounded status pill — `label` over `fill`, the label colour WCAG-picked
+/// for that fill ([`theme::label_on`]) so it's never the old low-contrast
+/// white-on-Green-40. The single pill builder the resolved-target chip and the
+/// in-call DTMF hint (keypad sends DTMF touch-tones per RFC 4733, not dial edits)
+/// now share — one chip, not the near-identical pills they were (§6 reuse). §4 —
+/// every colour is an `mde-theme` token.
+fn chip<'a>(label: String, fill: Color) -> Element<'a, Message> {
+    container(text(label).size(12.0).colr(theme::label_on(fill)))
         .sty(move |_: &Theme| cosmic::iced::widget::container::Style {
-            background: Some(cosmic::iced::Background::Color(color)),
+            background: Some(cosmic::iced::Background::Color(fill)),
             border: cosmic::iced::Border {
                 radius: cosmic::iced::border::Radius::from(12.0),
                 ..Default::default()
@@ -1219,6 +1223,78 @@ fn build_resolved_chip<'a>(resolved: &Resolved) -> Element<'a, Message> {
             ..Default::default()
         })
         .padding(Padding::from([4, 10]))
+        .into()
+}
+
+/// The empty-dialer zero-state, built on the shared [`mde_theme::EmptyState`]
+/// data shape rather than a bare hint pill (§6 — the one empty-state vocabulary
+/// the shell already uses in mde-files / mde-music / the workbench). With no SIP
+/// account configured it carries a "Configure account" CTA that launches the
+/// `mde-voice-config` companion ([`Message::ConfigureAccount`]); with an account
+/// it's an info-only nudge on how to dial.
+fn dialer_empty_state<'a>(no_account: bool) -> Element<'a, Message> {
+    let data = if no_account {
+        mde_theme::EmptyState::with_cta(
+            "No SIP account",
+            "Dial a mesh peer by name, or configure an account to register for extensions and PSTN.",
+            "Configure account",
+        )
+    } else {
+        mde_theme::EmptyState::info(
+            "Ready to dial",
+            "Type 1NNN for a mesh peer, or 9 + E.164 for PSTN.",
+        )
+    };
+    render_empty_state(&data, Message::ConfigureAccount)
+}
+
+/// Render an [`mde_theme::EmptyState`] as the HUD's compact zero-state block:
+/// heading + muted body, and — when the data carries a CTA label — a primary
+/// pill wired to `cta`. Like mde-files / mde-music, the HUD renders the shared
+/// data shape with its own widgets (the workbench widget builder is shell-side,
+/// §6). §4 — every colour is an `mde-theme` token; the inter-element gaps are the
+/// `EmptyState` component tokens.
+fn render_empty_state<'a>(data: &mde_theme::EmptyState, cta: Message) -> Element<'a, Message> {
+    let mut col = column![
+        text(data.heading.clone()).size(14.0).colr(theme::ON_SURF),
+        text(data.body.clone())
+            .size(12.0)
+            .colr(theme::ON_SURF_MUTED),
+    ]
+    .spacing(mde_theme::components::HEADING_BODY_GAP)
+    .align_x(cosmic::iced::Alignment::Center);
+    if let Some(label) = data.cta_label.clone() {
+        col = col
+            .push(
+                cosmic::iced::widget::space()
+                    .height(Length::Fixed(mde_theme::components::BODY_CTA_GAP)),
+            )
+            .push(empty_state_cta(label, cta));
+    }
+    container(col)
+        .width(Length::Fill)
+        .center_x(Length::Fill)
+        .padding(Padding::from([8, 0]))
+        .into()
+}
+
+/// The empty-state CTA — a primary-fill pill wired to `msg`, its label WCAG-
+/// picked for the fill ([`theme::label_on`]) like every other chip. §4 tokens.
+fn empty_state_cta<'a>(label: String, msg: Message) -> Element<'a, Message> {
+    button(text(label).size(12.0).colr(theme::label_on(theme::PRIMARY)))
+        .on_press(msg)
+        .padding(Padding::from([6, 14]))
+        .sty(
+            move |_: &Theme, _status| cosmic::iced::widget::button::Style {
+                background: Some(cosmic::iced::Background::Color(theme::PRIMARY)),
+                text_color: theme::label_on(theme::PRIMARY),
+                border: cosmic::iced::Border {
+                    radius: cosmic::iced::border::Radius::from(12.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
         .into()
 }
 
