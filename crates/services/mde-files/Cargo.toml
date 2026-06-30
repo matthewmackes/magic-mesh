@@ -8,17 +8,24 @@ license.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
+# The windowed libcosmic app. Gated on the `gui` feature so a headless consumer
+# (E12 `mde-files-egui` reuses this crate's non-GUI backend/model/send_to over
+# the Bus) can depend on the crate with `default-features = false` and never pull
+# the libcosmic/wgpu/winit stack.
 [[bin]]
 name = "mde-files"
 path = "src/main.rs"
+required-features = ["gui"]
 
 [dependencies]
 # GUI-7 (2026-06-11) — maximize-Cosmic-native cutover: mde-files is ported off
 # iced 0.14 onto libcosmic (the same rev GUI-6's applet pinned). `cosmic::iced`
 # is libcosmic's vendored iced fork, so the view/style code ports largely
 # mechanically (iced:: → cosmic::iced::); the shell becomes a `cosmic::
-# Application`. wgpu render + svg + wayland for the windowed app.
-libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87", default-features = false, features = ["tokio", "winit", "wgpu", "a11y", "wayland", "multi-window"] }
+# Application`. wgpu render + svg + wayland for the windowed app. Optional +
+# folded into the `gui` feature (E12) so the non-GUI surface (backend/model/
+# send_to + the Bus client) can be reused without the toolkit.
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87", default-features = false, features = ["tokio", "winit", "wgpu", "a11y", "wayland", "multi-window"], optional = true }
 # Object Card data form (ObjectCard / Icon / Palette) — the toolkit-free data
 # types. The iced-0.14 renderer (`mde-iced-components`) is dropped in the
 # cutover; mde-files renders the card with a local cosmic::iced helper.
@@ -61,10 +68,17 @@ mde-bus    = { path = "../../platform/mde-bus", optional = true }
 # production binary talks to mackesd's Fleet.Files + Nebula surfaces over
 # the Bus (action/*) for real mesh content — without it the Artifact
 # Manager would only ever show local files + an empty peers list.
-default = ["wayland", "dbus"]
+default = ["wayland", "dbus", "gui"]
 wayland = []
 x11     = []
 dbus    = ["dep:tokio", "dep:mde-bus"]
+# `gui` (default): the windowed libcosmic surface — the `app`/`views`/`widgets`/
+# `icons`/`theme`/`loading`/`picker`/`prefs`/`cosmic_compat`/`mounts` modules + the
+# `mde-files` binary. Off → only the render-agnostic backend/model/send_to logic
+# (+ the dbus Bus client) compiles, with no libcosmic dependency. E12's
+# `mde-files-egui` consumes the crate this way to reuse the transfer model on the
+# egui harness.
+gui     = ["dep:libcosmic"]
 
 [lints.rust]
 unsafe_code     = "forbid"

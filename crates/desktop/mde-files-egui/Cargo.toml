@@ -1,0 +1,41 @@
+# MCNF E12 "Quasar" — `mde-files-egui`: the egui file-manager surface (E12-11).
+#
+# An `eframe` app on the shared `mde-egui` harness that REUSES `mde-files`'
+# render-agnostic core — the `Backend` trait (`RealBackend`/`DemoBackend`/
+# `LocalFsBackend`), the `FileRow`/`Peer` model, and the `SendToRequest` transfer
+# shape — over the mesh Bus. The first slice browses a local directory and a
+# mesh-peer folder and initiates a Send-To.
+#
+# Tier (§6): desktop-shell. The edges point inward — `mde-egui` (shared harness)
+# and `mde-files` (services, consumed WITHOUT its libcosmic GUI). E12 is
+# egui-native, so the libcosmic file manager is never pulled.
+[package]
+name        = "mde-files-egui"
+description = "MCNF E12 Quasar — an egui file-manager surface on the mde-egui harness that reuses mde-files' render-agnostic backend/model/send_to (file listing + transfer model) over the mesh Bus: browse a local directory and a mesh-peer folder, then initiate a Send-To. Renders through the shared Style; the libcosmic GUI is not pulled (mde-files is consumed with default-features off)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_files_egui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mde-files-egui"
+path = "src/main.rs"
+
+[dependencies]
+# The §4/§5 egui harness — `run_client` + the shared `Style`/`Motion` + the
+# re-exported `egui`/`eframe` (one toolkit resolution for every surface).
+mde-egui = { path = "../../shared/mde-egui" }
+# REUSE: mde-files' render-agnostic core. `default-features = false` drops the
+# libcosmic GUI (E12 is egui-native); `dbus` keeps the Bus transport so Send-To
+# routes over `action/file-ops/send-to` and peer folders list over
+# `action/fleet-files/list-peer`.
+mde-files = { path = "../../services/mde-files", default-features = false, features = ["dbus"] }
+
+[lints]
+workspace = true

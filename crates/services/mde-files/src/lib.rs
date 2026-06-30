@@ -17,42 +17,63 @@
 //! 3. **KDC** — phone/tablet files via the KDE-Connect-protocol host
 //!    (`action/connect/*`), for paired mobile devices.
 
+// ── Render-agnostic surface (always compiled) ───────────────────────────────
+// The file/listing/transfer model + the Bus client. This subset carries no
+// libcosmic dependency, so it compiles under `--no-default-features` (with
+// `dbus`) for headless reuse — E12's `mde-files-egui` renders it on the egui
+// harness instead of the libcosmic `app` below.
 pub mod a11y_labels;
-pub mod app;
 pub mod archive;
 pub mod backend;
 pub mod bookmarks;
 #[cfg(feature = "dbus")]
 pub mod bus_backend;
-/// GUI-7 — libcosmic `.sty()` styling shims (see module docs).
-pub mod cosmic_compat;
 pub mod demo_data;
 /// DENSITY-SYMMETRY — density-resolving Carbon metrics for the file listing.
 pub mod density;
 pub mod desktop;
 pub mod fileops;
 pub mod grid;
-pub mod icons;
-pub mod loading;
 #[cfg(feature = "dbus")]
 pub mod mesh_backend;
 pub mod mime;
 pub mod model;
-pub mod mounts;
 pub mod panels;
-pub mod picker;
-pub mod prefs;
 pub mod properties;
 pub mod search;
 pub mod selection;
 pub mod send_to;
 pub mod smb;
-pub mod theme;
 pub mod thumbnails;
 pub mod trash;
+
+// ── Windowed libcosmic surface (feature = "gui") ────────────────────────────
+// Every module that renders through libcosmic, plus `mounts` (which resolves its
+// icon through `icons`). Gated so a `default-features = false` consumer never
+// pulls the toolkit.
+#[cfg(feature = "gui")]
+pub mod app;
+/// GUI-7 — libcosmic `.sty()` styling shims (see module docs).
+#[cfg(feature = "gui")]
+pub mod cosmic_compat;
+#[cfg(feature = "gui")]
+pub mod icons;
+#[cfg(feature = "gui")]
+pub mod loading;
+#[cfg(feature = "gui")]
+pub mod mounts;
+#[cfg(feature = "gui")]
+pub mod picker;
+#[cfg(feature = "gui")]
+pub mod prefs;
+#[cfg(feature = "gui")]
+pub mod theme;
+#[cfg(feature = "gui")]
 pub mod views;
+#[cfg(feature = "gui")]
 pub mod widgets;
 
+#[cfg(feature = "gui")]
 pub use app::{MdeFiles, Message};
 pub use backend::{
     AuditEntry, Backend, BackendError, ConflictPolicy, DemoBackend, Destination, OpId, SendMode,
