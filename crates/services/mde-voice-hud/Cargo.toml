@@ -8,16 +8,26 @@ license.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
+# E12 reuse split (mirrors `mde-files`): the render-agnostic SIP core
+# (sip/media/roster/resolve — no libcosmic) is a library so `mde-voice-egui` can
+# reuse the register/call state machine on the egui harness with
+# `default-features = false`. The libcosmic + layer-shell HUD is the `gui` binary
+# (default-on); with `gui` off, only the core compiles, with no toolkit.
+[lib]
+name = "mde_voice_hud"
+path = "src/lib.rs"
+
 [[bin]]
 name = "mde-voice-hud"
 path = "src/main.rs"
+required-features = ["gui"]
 
 [dependencies]
 # CUT-2 (2026-06-13) — the HUD is a layer-shell Overlay surface; ported off
 # crates.io iced + iced_layershell onto libcosmic's vendored iced fork (the
 # EFF-35 rev) which ships native wlr-layer-shell. This evicts the last
 # crates.io iced from the workspace (→ CUT-3 deny-flip).
-libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87", default-features = false, features = ["tokio", "winit", "wgpu", "a11y", "wayland", "multi-window"] }
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87", default-features = false, features = ["tokio", "winit", "wgpu", "a11y", "wayland", "multi-window"], optional = true }
 
 # §4 — the HUD's Carbon hex is single-sourced from the mde-theme ramp, not
 # re-typed here. We take the `Rgba` ramp constants and convert to this crate's
@@ -51,6 +61,15 @@ cpal = "0.17"
 # state to the Bus (`state/voice/status`) so the birthright commissioning
 # dashboard (and any other reader) can attest the softphone is up cross-process.
 mde-bus = { path = "../../platform/mde-bus" }
+
+[features]
+# `gui` (default): the libcosmic + wlr-layer-shell HUD binary (the `main` entry
+# plus its `theme`/`cosmic_compat` modules). With `gui` off, only the
+# render-agnostic core (sip/media/roster/resolve) compiles, with NO libcosmic
+# dependency — which is how E12's `mde-voice-egui` reuses the SIP register/call
+# state machine on the egui harness (`default-features = false`).
+default = ["gui"]
+gui     = ["dep:libcosmic"]
 
 [lints]
 workspace = true

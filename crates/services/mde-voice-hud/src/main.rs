@@ -40,14 +40,16 @@ use cosmic::{Element, Theme};
 use crate::cosmic_compat::prelude::*;
 
 mod cosmic_compat;
-mod media;
-mod resolve;
-mod roster;
-mod sip;
 mod theme;
 
-use resolve::{resolve_target, Resolved};
-use roster::{Peer, RosterLoad, RosterSource};
+// E12 reuse split — the SIP core (sip/media/roster/resolve) now lives in this
+// crate's library so `mde-voice-egui` reuses it without libcosmic. The HUD binary
+// consumes it back through the crate root, so every bare `sip::`/`media::`/
+// `roster::`/`resolve::` reference below resolves unchanged.
+use mde_voice_hud::media;
+use mde_voice_hud::resolve::{self, resolve_target, Resolved};
+use mde_voice_hud::roster::{self, Peer, RosterLoad, RosterSource};
+use mde_voice_hud::sip;
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -642,12 +644,12 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
             // (registrar-less); a bare number/extension routes via the registrar
             // account. Direct calls work even with no account.toml (a local
             // overlay identity is synthesized).
-            if looks_like_peer(&dialed) {
+            if sip::looks_like_peer(&dialed) {
                 let acct = state
                     .account
                     .clone()
                     .unwrap_or_else(sip::SipAccount::local_identity);
-                let peer_host = peer_host_for(&dialed);
+                let peer_host = sip::peer_host_for(&dialed);
                 state.call = sip::CallState::Calling {
                     peer: dialed.clone(),
                 };
@@ -1746,30 +1748,9 @@ pub fn is_dialer_char(c: char) -> bool {
     c.is_ascii_digit() || c == '*' || c == '#'
 }
 
-/// VOIP-P2P — a dialed string names a mesh PEER (vs a number/extension) when it
-/// contains an alphabetic character (a hostname). Peer names route to a direct
-/// registrar-less overlay call; pure numbers route to the registrar. Pure.
-#[must_use]
-pub fn looks_like_peer(dialed: &str) -> bool {
-    dialed.chars().any(|c| c.is_ascii_alphabetic())
-}
-
-/// VOIP-P2P — normalize a dialed peer name to a resolvable overlay host. A bare
-/// name gets the `.mesh.mde` mesh-DNS suffix (which resolves to the peer's
-/// overlay IP); an already-qualified host (contains `.`), or a `sip:`/`user@`
-/// form, yields just its host part. Pure + testable.
-#[must_use]
-pub fn peer_host_for(dialed: &str) -> String {
-    let d = dialed.trim();
-    let host = d.strip_prefix("sip:").unwrap_or(d);
-    // Take the host part after any `user@`.
-    let host = host.rsplit('@').next().unwrap_or(host).trim();
-    if host.contains('.') {
-        host.to_string()
-    } else {
-        format!("{host}.mesh.mde")
-    }
-}
+// VOIP-P2P — `looks_like_peer` + `peer_host_for` (the dialed-string routing
+// helpers) moved to `mde_voice_hud::sip` so `mde-voice-egui` reuses them; the
+// call sites above now read `sip::looks_like_peer` / `sip::peer_host_for`.
 
 /// Strip non-dialer characters from a pasted string. Operator
 /// pasting `"(415) 555-1234"` into the field should resolve to
@@ -2059,7 +2040,7 @@ mod tests {
             "peer name kept for direct P2P dial"
         );
         assert!(
-            looks_like_peer(&hud.dialer_input),
+            sip::looks_like_peer(&hud.dialer_input),
             "routes to place_call_direct"
         );
 
@@ -2068,7 +2049,7 @@ mod tests {
             hud.dialer_input, "1009",
             "a number is kept for the registrar"
         );
-        assert!(!looks_like_peer(&hud.dialer_input));
+        assert!(!sip::looks_like_peer(&hud.dialer_input));
     }
 
     #[test]
@@ -2248,29 +2229,8 @@ mod tests {
         assert_eq!(filter_dialer_chars("call 1003 now"), "1003");
     }
 
-    #[test]
-    fn looks_like_peer_distinguishes_names_from_numbers() {
-        // Mesh peer names (have letters) → direct P2P.
-        assert!(looks_like_peer("pine"));
-        assert!(looks_like_peer("pine.mesh.mde"));
-        assert!(looks_like_peer("UNIT-EAGLE"));
-        // Numbers / extensions / SIP digits → registrar.
-        assert!(!looks_like_peer("1004"));
-        assert!(!looks_like_peer("+15551234567"));
-        assert!(!looks_like_peer("*69"));
-        assert!(!looks_like_peer(""));
-    }
-
-    #[test]
-    fn peer_host_for_appends_mesh_suffix_for_bare_names() {
-        assert_eq!(peer_host_for("pine"), "pine.mesh.mde");
-        // Already-qualified hosts are used as-is.
-        assert_eq!(peer_host_for("pine.mesh.mde"), "pine.mesh.mde");
-        assert_eq!(peer_host_for("pine.mesh"), "pine.mesh");
-        // sip: / user@ forms reduce to the host part.
-        assert_eq!(peer_host_for("sip:pine"), "pine.mesh.mde");
-        assert_eq!(peer_host_for("sip:matt@birch.mesh.mde"), "birch.mesh.mde");
-    }
+    // `looks_like_peer` / `peer_host_for` moved to `mde_voice_hud::sip`; their
+    // unit tests moved with them (see the sip module's test suite).
 
     #[test]
     fn resolved_chip_empty_state() {

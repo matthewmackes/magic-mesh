@@ -833,6 +833,33 @@ pub fn direct_target_uri(peer_user: &str, peer_host: &str) -> String {
     }
 }
 
+/// VOIP-P2P — a dialed string names a mesh PEER (vs a number/extension) when it
+/// contains an alphabetic character (a hostname). Peer names route to a direct
+/// registrar-less overlay call ([`place_call_direct`]); pure numbers route to the
+/// registrar ([`place_call`]). Pure + testable. (Moved here from the HUD binary
+/// so the egui surface reuses the same routing rule — §6.)
+#[must_use]
+pub fn looks_like_peer(dialed: &str) -> bool {
+    dialed.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// VOIP-P2P — normalize a dialed peer name to a resolvable overlay host. A bare
+/// name gets the `.mesh.mde` mesh-DNS suffix (which resolves to the peer's
+/// overlay IP); an already-qualified host (contains `.`), or a `sip:`/`user@`
+/// form, yields just its host part. Pure + testable.
+#[must_use]
+pub fn peer_host_for(dialed: &str) -> String {
+    let d = dialed.trim();
+    let host = d.strip_prefix("sip:").unwrap_or(d);
+    // Take the host part after any `user@`.
+    let host = host.rsplit('@').next().unwrap_or(host).trim();
+    if host.contains('.') {
+        host.to_string()
+    } else {
+        format!("{host}.mesh.mde")
+    }
+}
+
 /// Place an outbound call: INVITE (+ digest retry) → await a final response,
 /// ACK a 2xx, and return the established `CallSession`. Blocking + socket —
 /// run off the UI thread. The live audio path is slice 3 (RTP/ALSA).
@@ -1878,5 +1905,31 @@ mod tests {
         assert!(resp.contains("Content-Length: 0\r\n"));
         assert!(!resp.contains("Content-Type:"));
         assert!(!resp.contains("Contact:")); // non-2xx → no Contact
+    }
+
+    // ── VOIP-P2P: dialed-string routing helpers (moved from the HUD binary) ──
+
+    #[test]
+    fn looks_like_peer_distinguishes_names_from_numbers() {
+        // Mesh peer names (have letters) → direct P2P.
+        assert!(looks_like_peer("pine"));
+        assert!(looks_like_peer("pine.mesh.mde"));
+        assert!(looks_like_peer("UNIT-EAGLE"));
+        // Numbers / extensions / SIP digits → registrar.
+        assert!(!looks_like_peer("1004"));
+        assert!(!looks_like_peer("+15551234567"));
+        assert!(!looks_like_peer("*69"));
+        assert!(!looks_like_peer(""));
+    }
+
+    #[test]
+    fn peer_host_for_appends_mesh_suffix_for_bare_names() {
+        assert_eq!(peer_host_for("pine"), "pine.mesh.mde");
+        // Already-qualified hosts are used as-is.
+        assert_eq!(peer_host_for("pine.mesh.mde"), "pine.mesh.mde");
+        assert_eq!(peer_host_for("pine.mesh"), "pine.mesh");
+        // sip: / user@ forms reduce to the host part.
+        assert_eq!(peer_host_for("sip:pine"), "pine.mesh.mde");
+        assert_eq!(peer_host_for("sip:matt@birch.mesh.mde"), "birch.mesh.mde");
     }
 }
