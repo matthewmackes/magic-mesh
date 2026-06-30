@@ -2531,9 +2531,9 @@ _Design: `docs/design/workbench-control-surface.md` (locked 2026-06-29 via the o
   As an operator, I want one relevance ladder behind every search, so the launcher and the omnibox rank identically and there is one place to tune.
   - [✓] a standalone module merges `search::score_match` + `launcher::fuzzy_score`; the existing score tests (`front_door.rs` ~9102-9169) pass against it unchanged
   - [✓] `cargo test -p mde-workbench --lib` green on the farm
-- [ ] **CTRLSURF-2: the Compact command-line + status surface**
+- [✓] **CTRLSURF-2: the Compact command-line + status surface** *(new `Mode::Compact`: one always-focused command line over 5 ambient status rows (Mesh/Nodes/Build/Alerts/System) projected from the folded `FrontDoorData`/`mod project` tiles via the pure `compact` module; the command line routes through the CTRLSURF-1 `relevance::score` ladder; cache-first — instant local hits sync, the Copilot preview ~120ms-debounced (no Bus on keypress); an unanswered `action/mesh/directory` shows the `responded=false` offline notice, never a hang. Additive — reachable via a Compact/Expand toggle; Panel/FullScreen + the existing `view()` untouched (the real window resize is CTRLSURF-5))*
   As an operator, I want a compact window with one command line over ~5 live status rows, so I get the 4-second glance + launch without a full screen.
-  - [ ] rows render from `FrontDoorData::read`/`mod project` (no fake values, §7); an absent Bus shows the `responded=false` state, never a hang; no synchronous Bus read on keypress (cache-first + debounced async preview)
+  - [✓] rows render from `FrontDoorData::read`/`mod project` (no fake values, §7); an absent Bus shows the `responded=false` state, never a hang; no synchronous Bus read on keypress (cache-first + debounced async preview)
 - [ ] **CTRLSURF-3: whole-home keyboard nav**
   As a keyboard-first operator, I want Up/Down/Enter/Esc/Tab/Ctrl+1..5 on the home (launcher closed), so I never reach for the mouse.
   - [ ] `launcher_key_subscription` is active on the home view; every binding drives a real message

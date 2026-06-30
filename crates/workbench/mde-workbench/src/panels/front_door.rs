@@ -58,6 +58,18 @@
 //! FILES search is a follow-up: there is no trivial existing filename source the
 //! workbench reads, so faking it would violate §7 — it's deferred, not stubbed.
 //!
+//! CTRLSURF-2 (this layer) adds the **Command Watchfloor** compact surface
+//! ([`Mode::Compact`], `docs/design/workbench-control-surface.md` → Architecture /
+//! Phase 1): one always-focused command line over ~5 ambient status rows projected
+//! from the cached [`FrontDoorData`] (the `compact` module selects the already-
+//! folded keyed-tile values — §6 glue, no second derivation). The command line
+//! routes through the ONE [`crate::relevance::score`] ladder (CTRLSURF-1), cache-
+//! first: the instant local hits recompute synchronously, the Copilot preview is
+//! debounced (no Bus on the keystroke), and an absent Bus shows the `responded ==
+//! false` offline notice rather than hanging. It is additive — the Panel /
+//! FullScreen views and the in-window `Mode` framework are unchanged (the real
+//! Win10-Start-sized window resize is CTRLSURF-5).
+//!
 //! SCOPE held to FRONTDOOR-1..6:
 //! - `draw` only — tile click → detail view is FRONTDOOR-5, so the canvas keeps
 //!   `type State = ()` and the default `update` / `mouse_interaction`.
@@ -104,6 +116,27 @@ pub enum Message {
     /// FRONTDOOR-3 — the top-bar toggle was pressed: flip [`FrontDoor::mode`]
     /// between the Win10 panel and the iPadOS full-screen home.
     ToggleMode,
+    /// CTRLSURF-2 — enter / leave the **Compact** Command-Watchfloor surface
+    /// (additive to [`ToggleMode`]'s expand toggle). From any expanded mode it
+    /// enters [`Mode::Compact`]; from Compact it returns to the Win10-Start
+    /// [`Mode::Panel`]. The real Win10-Start-sized window resize behind this is
+    /// CTRLSURF-5 — today it is an in-window [`Mode`] flip, so the existing grid /
+    /// `view()` stay reachable (Phase-1 additive).
+    ToggleCompact,
+    /// CTRLSURF-2 — the Compact command line's text changed. The instant LOCAL
+    /// hits recompute SYNCHRONOUSLY from the cached catalog (the seeded launchers +
+    /// routable panels + the cached `peers` roster) through the ONE
+    /// [`crate::relevance::score`] ladder — no Bus on this hot path (cache-first).
+    /// It then schedules a debounced [`Message::CompactPreview`] (~120 ms after the
+    /// last keystroke) so a fast typist fires the async preview once the query
+    /// settles, never per key (latency-masked by construction).
+    CompactQueryChanged(String),
+    /// CTRLSURF-2 — the input debounce elapsed. If the carried generation still
+    /// matches [`FrontDoor::compact_gen`] (no newer keystroke superseded it), fire
+    /// the async preview for the settled query (the generation-guarded Copilot
+    /// `ask`, streamed below the instant local hits). A stale generation is dropped
+    /// — its successor already scheduled the live preview.
+    CompactPreview(u64),
     /// FRONTDOOR-4 — the slow-poll tick (or a reconnect) asks for a fresh read.
     /// The handler returns [`FrontDoor::load`] so the actual Bus read happens
     /// off-thread; the result comes back as [`Message::Loaded`].
@@ -378,11 +411,32 @@ pub enum Mode {
     /// The FRONTDOOR-3 **iPadOS home**: rail hidden, a full-screen rounded-icon
     /// grid + widgets, **no dock** (Q86/Q89).
     FullScreen,
+    /// CTRLSURF-2 — the **Command Watchfloor** compact surface: one always-focused
+    /// command line over ~5 ambient status rows projected from [`FrontDoorData`].
+    /// The 4-second glance + launch without a full screen (design "Architecture →
+    /// Compact mode"). For now it lives inside this in-window [`Mode`] framework;
+    /// the real Win10-Start-sized window resize is CTRLSURF-5 (additive — Panel /
+    /// FullScreen stay reachable through the existing toggles).
+    Compact,
 }
 
 /// The fixed width of the left rail (design Q5 — a Win10-Start identity/pinned/
 /// surfaces column). Comfortable-density Start rails sit around this width.
 const RAIL_WIDTH: f32 = 260.0;
+
+/// CTRLSURF-2 — the Compact status rows' fixed label-gutter width, so the live
+/// values line up in a clean column for the 4-second glance.
+const STATUS_LABEL_WIDTH: f32 = 64.0;
+
+/// CTRLSURF-2 — how long the Compact command line waits after the last keystroke
+/// before firing its async preview (the Copilot `ask`). The instant LOCAL hits
+/// are already on screen — recomputed synchronously from cache through the one
+/// [`crate::relevance::score`] ladder — so this debounce only keeps a fast typist
+/// from firing one Bus ask per key; the preview runs once the query settles. This
+/// is an **input debounce**, not an animation beat, so (like the `*_TIMEOUT`s) it
+/// is a plain `Duration`, not an `mde_theme::motion` token — the §4 motion gate
+/// exempts debounce/timeout timings by design.
+const COMPACT_PREVIEW_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// FRONTDOOR-6 — how long the omnibox waits for the Copilot `ask` reply before
 /// degrading to "unavailable". Set a touch above FD-9's per-request codex ceiling
@@ -809,6 +863,12 @@ pub struct FrontDoorData {
     /// search has the live mesh entities (nodes + services) without a second Bus
     /// read. The widget projections above are derived from these same rows.
     pub peers: Vec<peers::PeerRow>,
+    /// CTRLSURF-2 — whether the mesh-directory read responded at all (the
+    /// `action/mesh/directory` verb answered). `false` = an absent Bus / no
+    /// leader: the Compact status surface then shows the offline notice rather
+    /// than a wall of resting rows or a hang (§7). Mirrors
+    /// [`LauncherData::responded`]; the [`Default`] is `false` (no read yet).
+    pub responded: bool,
 }
 
 impl FrontDoorData {
@@ -840,7 +900,13 @@ impl FrontDoorData {
     /// without a live Bus.
     #[must_use]
     pub fn read() -> Self {
-        let peers = peers::action_directory().unwrap_or_default();
+        // CTRLSURF-2 — capture whether the directory verb answered (the honest
+        // "Bus responded" signal, mirroring `LauncherData::responded`) before
+        // falling back to an empty roster. `None` (absent Bus / no leader) ⇒
+        // `responded == false` ⇒ the Compact glance shows offline, never a hang.
+        let directory = peers::action_directory();
+        let responded = directory.is_some();
+        let peers = directory.unwrap_or_default();
         let farm = build_farm::read_farm_events().unwrap_or_default();
         let health = datacenter::read_health_checks();
         let boot = home::read_boot_readiness();
@@ -881,6 +947,8 @@ impl FrontDoorData {
             triage,
             // FRONTDOOR-6 — carry the raw roster for the unified mesh search.
             peers,
+            // CTRLSURF-2 — the directory-responded flag for the Compact glance.
+            responded,
         }
     }
 }
@@ -1087,6 +1155,98 @@ pub(super) mod project {
             (format!("ready · v{version}"), TileTone::Success)
         } else {
             (format!("booting · v{version}"), TileTone::Warning)
+        }
+    }
+}
+
+// ====================== CTRLSURF-2: the Compact status surface ===============
+
+/// CTRLSURF-2 — the **Command Watchfloor** compact status surface: the pure
+/// projection behind the ~5 ambient rows the Compact mode shows over its command
+/// line. It does NOT re-derive any metric (§6 glue) — it SELECTS the values the
+/// grid tiles already hold (each keyed tile's `(value, tone)` was folded from
+/// [`FrontDoorData::read`] → [`project`] by [`FrontDoor::apply`]) into the
+/// glance's blast-radius row order. One projection, surfaced two ways (the grid +
+/// this glance), never a second derivation. Pure + Bus-free, so the row mapping
+/// and the offline gate are unit-tested without a live Bus.
+pub(super) mod compact {
+    use super::{Tile, TileKey, TileTone};
+
+    /// One ambient status row: a fixed short label, the live value, and the
+    /// Carbon tone the value renders in. A row whose keyed source had no live
+    /// data this snapshot carries the honest resting [`RESTING`] value (never a
+    /// fabricated metric — §7).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct StatusRow {
+        /// The fixed glance label (Mesh / Nodes / Build / Alerts / System).
+        pub label: &'static str,
+        /// The live value, or [`RESTING`] when no source answered this snapshot.
+        pub value: String,
+        /// The tone the value reads in ([`TileTone::Neutral`] for a resting row).
+        pub tone: TileTone,
+    }
+
+    /// The resting value for a row whose keyed source had no live data — an
+    /// honest "no metric yet", not a fabricated number (§7).
+    pub const RESTING: &str = "—";
+
+    /// The five ambient rows, in blast-radius glance order, each bound to its
+    /// keyed tile. The tiles already hold [`project`] output (folded by
+    /// [`FrontDoor::apply`]), so the glance reads the same numbers as the grid.
+    const GLANCE: [(&str, TileKey); 5] = [
+        ("Mesh", TileKey::MeshMap),
+        ("Nodes", TileKey::NodeHealth),
+        ("Build", TileKey::BuildFarm),
+        ("Alerts", TileKey::Alerts),
+        ("System", TileKey::System),
+    ];
+
+    /// Project the ambient status rows from the folded tile set. A keyed tile with
+    /// a live value contributes it (with its live tone); a tile with no value (no
+    /// source this snapshot) contributes the resting row (Neutral). Always returns
+    /// the five rows in [`GLANCE`] order. Pure.
+    #[must_use]
+    pub fn status_rows(tiles: &[Tile]) -> Vec<StatusRow> {
+        GLANCE
+            .iter()
+            .map(|(label, key)| {
+                let live = tiles
+                    .iter()
+                    .find(|t| t.key == Some(*key))
+                    .and_then(|t| t.value.as_ref().map(|v| (v.clone(), t.tone)));
+                match live {
+                    Some((value, tone)) => StatusRow { label, value, tone },
+                    None => StatusRow {
+                        label,
+                        value: RESTING.to_string(),
+                        tone: TileTone::Neutral,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// What the Compact status surface should render, decided purely from the last
+    /// snapshot's `responded` flag plus the folded tiles. Lets the view stay a
+    /// thin shell and the "absent Bus" path be unit-tested directly.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Glance {
+        /// The mesh directory did not answer (absent Bus / no leader) — show the
+        /// offline notice, never a wall of dashes or a hang (§7).
+        Offline,
+        /// The Bus answered — the five ambient rows (each live or honest resting).
+        Rows(Vec<StatusRow>),
+    }
+
+    /// Decide the glance: `responded == false` ⇒ [`Glance::Offline`]; otherwise the
+    /// projected [`status_rows`]. Pure — the [`FrontDoor::compact_status`] view is
+    /// a thin shell over this.
+    #[must_use]
+    pub fn glance(responded: bool, tiles: &[Tile]) -> Glance {
+        if responded {
+            Glance::Rows(status_rows(tiles))
+        } else {
+            Glance::Offline
         }
     }
 }
@@ -2770,6 +2930,17 @@ pub struct FrontDoor {
     /// peer apps, and the per-row context-menu flags. Closed (the tile grid shows)
     /// until the Start button / Super key / launcher chip opens it.
     pub launcher: LauncherState,
+    /// CTRLSURF-2 — whether the LAST [`FrontDoorData`] snapshot's mesh-directory
+    /// read responded (its `responded` flag, set in [`FrontDoor::apply`]). The
+    /// Compact glance reads it to show the offline notice on a real no-Bus read
+    /// (never a hang — §7). Optimistic `true` until the first snapshot lands (the
+    /// `loading` skeleton covers that window, so it never flashes offline).
+    pub bus_responded: bool,
+    /// CTRLSURF-2 — the monotonic generation stamped on each Compact command-line
+    /// keystroke, so a debounced [`Message::CompactPreview`] fires its async
+    /// preview only when no newer keystroke has superseded it (the input debounce
+    /// — no per-key Bus read on the hot path).
+    pub compact_gen: u64,
 }
 
 impl Default for FrontDoor {
@@ -2855,6 +3026,11 @@ impl FrontDoor {
             // APPLAUNCH — the launcher starts closed (the tile grid shows); the
             // Start/Super-key open lazy-loads its cache (Q49 cache-first).
             launcher: LauncherState::default(),
+            // CTRLSURF-2 — optimistic until the first snapshot (the `loading`
+            // skeleton covers the gap, so the Compact glance never flashes offline
+            // before its first real directory read); no command-line keystrokes yet.
+            bus_responded: true,
+            compact_gen: 0,
         }
     }
 
@@ -3227,8 +3403,58 @@ impl FrontDoor {
                 self.mode = match self.mode {
                     Mode::Panel => Mode::FullScreen,
                     Mode::FullScreen => Mode::Panel,
+                    // CTRLSURF-2 — `ToggleMode` is the *expand* toggle; from the
+                    // Compact surface it expands to the Win10-Start panel
+                    // (`ToggleCompact` is the dedicated Compact entry/exit).
+                    Mode::Compact => Mode::Panel,
                 };
                 Task::none()
+            }
+            // CTRLSURF-2 — enter / leave the Compact Command-Watchfloor surface.
+            // Additive to the Panel↔FullScreen expand toggle: enter Compact from
+            // any expanded mode, leave it back to Panel. (The real window resize
+            // is CTRLSURF-5; today it is an in-window `Mode` flip.)
+            Message::ToggleCompact => {
+                self.mode = match self.mode {
+                    Mode::Compact => Mode::Panel,
+                    _ => Mode::Compact,
+                };
+                Task::none()
+            }
+            // CTRLSURF-2 — the Compact command line changed. Recompute the instant
+            // LOCAL hits SYNCHRONOUSLY from cache (the one relevance ladder over the
+            // cached catalog + roster — no Bus on this hot path), then schedule the
+            // debounced async preview: bump the generation and fire a ~120 ms timer
+            // that emits `CompactPreview(gen)`. A fast typist supersedes the prior
+            // generation, so the preview runs once the query settles, never per key.
+            Message::CompactQueryChanged(q) => {
+                self.query = q;
+                self.recompute_results();
+                self.compact_gen = self.compact_gen.wrapping_add(1);
+                let generation = self.compact_gen;
+                // The sleep is created INSIDE the async block (lazily, at poll time
+                // on the executor's tokio runtime), not eagerly here — constructing a
+                // `tokio::time::sleep` off-runtime would panic (and unit tests build
+                // this Task without a runtime). Mirrors the codebase's delay idiom.
+                Task::perform(
+                    async {
+                        tokio::time::sleep(COMPACT_PREVIEW_DEBOUNCE).await;
+                    },
+                    move |()| crate::Message::FrontDoor(Message::CompactPreview(generation)),
+                )
+            }
+            // CTRLSURF-2 — the debounce elapsed. If no newer keystroke has
+            // superseded this generation, launch the async preview for the settled
+            // query (`search_task` — the generation-guarded Copilot ask streamed
+            // below the instant local hits). A stale generation is dropped; its
+            // successor already scheduled the live preview. A blank query's
+            // `search_task` is itself a no-op, so an emptied line fires nothing.
+            Message::CompactPreview(generation) => {
+                if generation == self.compact_gen {
+                    self.search_task()
+                } else {
+                    Task::none()
+                }
             }
             // The slow-poll / reconnect tick: fire a fresh off-thread Bus read.
             Message::Reload => Self::load(),
@@ -4191,6 +4417,10 @@ impl FrontDoor {
         if !self.query.trim().is_empty() {
             self.results = search::local_results(&self.query, &self.tiles, &self.peers);
         }
+        // CTRLSURF-2 — record whether this snapshot's directory read responded, so
+        // the Compact glance shows the offline notice on a real no-Bus read rather
+        // than a wall of resting rows (never a hang — §7).
+        self.bus_responded = data.responded;
     }
 
     /// FRONTDOOR-10 — the suggestions that concern the tile at index `i` (Q19),
@@ -4265,6 +4495,9 @@ impl FrontDoor {
             return self.launcher_view(palette);
         }
         match self.mode {
+            // CTRLSURF-2 — the Command Watchfloor compact surface (command line +
+            // ambient status rows). Additive: Panel / FullScreen stay reachable.
+            Mode::Compact => self.compact_view(palette),
             Mode::Panel => self.panel_view(palette),
             Mode::FullScreen => self.fullscreen_view(palette),
         }
@@ -5204,6 +5437,129 @@ impl FrontDoor {
         sec.into()
     }
 
+    /// CTRLSURF-2 — the **Command Watchfloor** compact surface (design "Architecture
+    /// → Compact mode"): one always-focused command line over ~5 ambient status
+    /// rows projected from the cached [`FrontDoorData`]. The 4-second glance + a
+    /// keyboard launch without a full screen.
+    ///
+    /// Cache-first by construction: the command line's LOCAL hits recompute
+    /// synchronously from cache through the one [`crate::relevance::score`] ladder
+    /// (no Bus on the keystroke); the async Copilot preview is debounced
+    /// ([`Message::CompactPreview`]). The status rows read the already-folded
+    /// snapshot — an absent Bus (`responded == false`) shows the offline notice,
+    /// never a hang (§7). Carbon chrome via `mde-theme` tokens only (§4).
+    fn compact_view(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        // ── The always-focused command line + the Expand control ──
+        let mut command = text_input("Search apps, mesh, or ask Copilot…", &self.query)
+            .on_input(|s| crate::Message::FrontDoor(Message::CompactQueryChanged(s)))
+            .padding(Padding::from([10u16, 14u16]))
+            .width(Length::Fill);
+        // Enter launches the top-ranked hit (a keyboard launch with no mouse) —
+        // only when there is a hit to launch (§7 — never an inert submit). The
+        // ranking is the same relevance ladder the results list shows.
+        if let Some(top) = self.results.first() {
+            command = command.on_submit(crate::Message::FrontDoor(Message::SearchHitActivated(
+                Box::new(top.message.clone()),
+            )));
+        }
+        let command: Element<'_, crate::Message, Theme> = command.into();
+        let command_row = row![command, self.compact_toggle(palette)]
+            .spacing(8)
+            .align_y(cosmic::iced::Alignment::Center);
+        let command_bar = container(command_row)
+            .width(Length::Fill)
+            .padding(Padding::from([12u16, 12u16]));
+
+        // ── Body: the unified search results when a query is live (the same
+        // instant-local + Copilot-card surface both expanded modes use — §6), else
+        // the ambient status glance. ──
+        let content: Element<'_, crate::Message, Theme> = if self.searching() {
+            self.search_results_view(palette)
+        } else {
+            self.compact_status(palette)
+        };
+
+        let body = column![command_bar, content]
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        container(body)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(palette.background.into_cosmic_color())),
+                ..container::Style::default()
+            })
+            .into()
+    }
+
+    /// CTRLSURF-2 — the ambient status surface under the Compact command line: the
+    /// ~5 glance rows projected from the cached snapshot ([`compact::glance`]), or
+    /// the offline notice when the last directory read did not respond (§7 — never
+    /// a hang, never a fabricated metric). A pre-first-snapshot paint shows a quiet
+    /// resting hint (the FD-4 `loading` skeleton's compact equivalent — no flash of
+    /// offline/empty before the first real read).
+    fn compact_status(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+
+        if self.loading {
+            return container(
+                text("Reading the mesh…")
+                    .size(TypeRole::Body.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            )
+            .width(Length::Fill)
+            .padding(Padding::from([12u16, 16u16]))
+            .into();
+        }
+
+        let body = match compact::glance(self.bus_responded, &self.all_tiles) {
+            // The mesh directory didn't answer — an honest offline notice, not a
+            // wall of dashes (the operator knows it's connectivity, not a quiet mesh).
+            compact::Glance::Offline => column![
+                text("Mesh offline")
+                    .size(TypeRole::Body.size_in(sizes))
+                    .colr(palette.danger.into_cosmic_color()),
+                text("The mesh directory didn't respond — no live status to show.")
+                    .size(TypeRole::Caption.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            ]
+            .spacing(4)
+            .width(Length::Fill),
+            compact::Glance::Rows(rows) => {
+                let mut col = column![].spacing(8).width(Length::Fill);
+                for r in &rows {
+                    col = col.push(compact_status_row(r, palette));
+                }
+                col
+            }
+        };
+
+        scrollable(container(body).padding(Padding::from([12u16, 16u16])))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// CTRLSURF-2 — the control that enters / leaves the Compact Command-Watchfloor
+    /// surface (additive to the expand [`Self::mode_toggle`]). It names the target:
+    /// "▭ Compact" from an expanded mode, "⤢ Expand" from Compact. Wired to the
+    /// real [`Message::ToggleCompact`] (§7 — no dead button); Ghost chrome via
+    /// `mde-theme` tokens (§4).
+    fn compact_toggle(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        let label = if self.mode == Mode::Compact {
+            "⤢ Expand"
+        } else {
+            "▭ Compact"
+        };
+        crate::controls::variant_button(
+            label,
+            crate::controls::ButtonVariant::Ghost,
+            Some(crate::Message::FrontDoor(Message::ToggleCompact)),
+            palette,
+        )
+    }
+
     /// FRONTDOOR-2 — the Win10-Start two-pane view: a fixed left **rail** beside a
     /// right **pane** (the full-width omnibox above the FRONTDOOR-1 tile grid).
     fn panel_view(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
@@ -5242,6 +5598,8 @@ impl FrontDoor {
         controls = controls.push(self.ptt_toggle(palette));
         controls = controls.push(self.settings_toggle(palette));
         controls = controls.push(self.lock_toggle(palette));
+        // CTRLSURF-2 — the Compact surface is reachable from the expanded modes too.
+        controls = controls.push(self.compact_toggle(palette));
         controls = controls.push(self.mode_toggle(palette));
         let top_bar = container(controls)
             .width(Length::Fill)
@@ -5433,6 +5791,8 @@ impl FrontDoor {
         // affordance consistent across both modes).
         omnibox_row = omnibox_row.push(self.settings_toggle(palette));
         omnibox_row = omnibox_row.push(self.lock_toggle(palette));
+        // CTRLSURF-2 — the Compact surface is reachable from the expanded modes too.
+        omnibox_row = omnibox_row.push(self.compact_toggle(palette));
         omnibox_row = omnibox_row.push(self.mode_toggle(palette));
         let omnibox_bar = container(omnibox_row)
             .width(Length::Fill)
@@ -5640,6 +6000,10 @@ impl FrontDoor {
         let label = match self.mode {
             Mode::Panel => "⤢ Full screen",
             Mode::FullScreen => "⤡ Panel",
+            // CTRLSURF-2 — `mode_toggle` is the expand toggle; from Compact it grows
+            // to the panel. (Compact's own surface uses `compact_toggle` to expand;
+            // this arm keeps the match exhaustive over the new `Mode` variant.)
+            Mode::Compact => "⤢ Panel",
         };
         let accent = palette.accent.into_cosmic_color();
         let raised = palette.raised.into_cosmic_color();
@@ -7697,6 +8061,33 @@ fn proposal_card<'a>(
         .into()
 }
 
+/// CTRLSURF-2 — one ambient Compact status row: the fixed muted label at a stable
+/// gutter width, then the live value in its Carbon tone ([`TileTone::color`] —
+/// §4, never a raw colour). A resting "—" row reads [`TileTone::Neutral`] (muted),
+/// so the glance never shows a fabricated metric (§7). All data is owned (cloned),
+/// so the row carries no borrow of the snapshot.
+fn compact_status_row<'a>(
+    r: &compact::StatusRow,
+    palette: Palette,
+) -> Element<'a, crate::Message, Theme> {
+    let sizes = FontSize::defaults();
+    let label = text(r.label.to_string())
+        .size(TypeRole::Caption.size_in(sizes))
+        .colr(palette.text_muted.into_cosmic_color())
+        .width(Length::Fixed(STATUS_LABEL_WIDTH));
+    let value = text(r.value.clone())
+        .size(TypeRole::Body.size_in(sizes))
+        .colr(r.tone.color(&palette));
+    container(
+        row![label, value]
+            .spacing(12)
+            .align_y(cosmic::iced::Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding(Padding::from([6u16, 0u16]))
+    .into()
+}
+
 /// FRONTDOOR-6 — one full-width row in the unified search results list. The
 /// primary label (the matched app / node / service) over a muted context line
 /// (the node a service runs on / the surface a panel lives under). Clicking it
@@ -8195,6 +8586,159 @@ mod tests {
                 let _: Element<'_, crate::Message, Theme> = fd.view();
             }
         }
+    }
+
+    #[test]
+    fn ctrlsurf2_status_rows_project_from_folded_tiles() {
+        // CTRLSURF-2 — the Compact glance reads the SAME `FrontDoorData::read` →
+        // `mod project` values the grid tiles hold (folded by `apply`), in the
+        // five-row blast-radius order. No second derivation (§6).
+        let data = FrontDoorData {
+            mesh_map: Some(("5/5 online".to_string(), TileTone::Success)),
+            node_health: Some(("4/5 healthy".to_string(), TileTone::Danger)),
+            build_farm: Some(("build: green".to_string(), TileTone::Success)),
+            alerts: Some(("2 alerts".to_string(), TileTone::Danger)),
+            system: Some(("ready · v9.9.9".to_string(), TileTone::Success)),
+            responded: true,
+            ..Default::default()
+        };
+        let mut fd = FrontDoor::new();
+        fd.apply(&data);
+        assert!(
+            fd.bus_responded,
+            "a responded snapshot sets the glance flag"
+        );
+        let rows = compact::status_rows(&fd.all_tiles);
+        let expect = [
+            ("Mesh", "5/5 online", TileTone::Success),
+            ("Nodes", "4/5 healthy", TileTone::Danger),
+            ("Build", "build: green", TileTone::Success),
+            ("Alerts", "2 alerts", TileTone::Danger),
+            ("System", "ready · v9.9.9", TileTone::Success),
+        ];
+        assert_eq!(rows.len(), expect.len());
+        for (row, (label, value, tone)) in rows.iter().zip(expect) {
+            assert_eq!(row.label, label);
+            assert_eq!(row.value, value);
+            assert_eq!(row.tone, tone);
+        }
+    }
+
+    #[test]
+    fn ctrlsurf2_status_rows_rest_honestly_with_no_source() {
+        // CTRLSURF-2 / §7 — a keyed source with nothing this snapshot renders an
+        // honest resting "—" (Neutral), never a fabricated metric.
+        let data = FrontDoorData {
+            responded: true,
+            ..Default::default()
+        };
+        let mut fd = FrontDoor::new();
+        fd.apply(&data);
+        let rows = compact::status_rows(&fd.all_tiles);
+        assert_eq!(rows.len(), 5);
+        assert!(
+            rows.iter()
+                .all(|r| r.value == compact::RESTING && r.tone == TileTone::Neutral),
+            "no source ⇒ honest resting rows, never a fake value (§7)"
+        );
+    }
+
+    #[test]
+    fn ctrlsurf2_glance_offline_when_directory_absent() {
+        // CTRLSURF-2 — an absent Bus (`responded == false`) shows the offline
+        // glance, never a wall of dashes / a hang; a responded read shows the rows.
+        let tiles = FrontDoor::new().all_tiles;
+        assert_eq!(compact::glance(false, &tiles), compact::Glance::Offline);
+        match compact::glance(true, &tiles) {
+            compact::Glance::Rows(rows) => assert_eq!(rows.len(), 5),
+            other => panic!("responded ⇒ rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrlsurf2_front_door_data_default_is_not_responded() {
+        // CTRLSURF-2 — no read yet ⇒ `responded == false` (the offline default,
+        // mirroring `LauncherData`); the `loading` skeleton covers that window.
+        assert!(!FrontDoorData::default().responded);
+    }
+
+    #[test]
+    fn ctrlsurf2_compact_query_recomputes_local_hits_cache_first() {
+        // CTRLSURF-2 — a Compact keystroke recomputes the instant LOCAL hits +
+        // parks the AI card at Thinking SYNCHRONOUSLY (the async ask is debounced,
+        // not fired on the hot path) and bumps the debounce generation. A blank
+        // line clears back to the glance + parks the card at Idle.
+        let mut fd = FrontDoor::new();
+        let _ = fd.update(Message::CompactQueryChanged("mesh".to_string()));
+        assert_eq!(fd.query, "mesh");
+        assert_eq!(fd.copilot, CopilotState::Thinking);
+        let gen_after_first = fd.compact_gen;
+        let _ = fd.update(Message::CompactQueryChanged("mesh b".to_string()));
+        assert!(
+            fd.compact_gen > gen_after_first,
+            "each keystroke bumps the debounce generation"
+        );
+        let _ = fd.update(Message::CompactQueryChanged(String::new()));
+        assert!(fd.query.is_empty());
+        assert!(fd.results.is_empty(), "a blank query clears results");
+        assert_eq!(fd.copilot, CopilotState::Idle, "and parks the AI card");
+    }
+
+    #[test]
+    fn ctrlsurf2_compact_preview_drops_a_stale_generation() {
+        // CTRLSURF-2 — a debounce timer that fired for a superseded query is a
+        // no-op (its successor already scheduled the live preview); the current
+        // generation still fires the async preview.
+        let mut fd = FrontDoor::new();
+        let _ = fd.update(Message::CompactQueryChanged("me".to_string()));
+        let stale = fd.compact_gen;
+        let _ = fd.update(Message::CompactQueryChanged("mesh".to_string()));
+        // The stale generation is dropped; the live one is honoured (both return a
+        // Task — the assertion is that neither panics and the generation guards it).
+        let _ = fd.update(Message::CompactPreview(stale));
+        let _ = fd.update(Message::CompactPreview(fd.compact_gen));
+        assert_eq!(fd.query, "mesh");
+    }
+
+    #[test]
+    fn ctrlsurf2_toggle_compact_enters_and_leaves() {
+        // CTRLSURF-2 — `ToggleCompact` enters Compact from any expanded mode and
+        // leaves it back to Panel (additive to the Panel↔FullScreen expand toggle).
+        let mut fd = FrontDoor::new();
+        assert_eq!(fd.mode, Mode::Panel);
+        let _ = fd.update(Message::ToggleCompact);
+        assert_eq!(fd.mode, Mode::Compact);
+        let _ = fd.update(Message::ToggleCompact);
+        assert_eq!(fd.mode, Mode::Panel, "leaves Compact back to Panel");
+        fd.mode = Mode::FullScreen;
+        let _ = fd.update(Message::ToggleCompact);
+        assert_eq!(fd.mode, Mode::Compact, "reachable from FullScreen too");
+    }
+
+    #[test]
+    fn ctrlsurf2_compact_view_constructs_in_every_state() {
+        // CTRLSURF-2 — the Compact surface builds without panicking across its
+        // states: the pre-snapshot loading hint, the offline notice (absent Bus),
+        // the live ambient rows, and an active query's unified results.
+        let mut fd = FrontDoor::new();
+        fd.mode = Mode::Compact;
+        fd.loading = true;
+        let _: Element<'_, crate::Message, Theme> = fd.view();
+
+        fd.loading = false;
+        fd.bus_responded = false;
+        let _: Element<'_, crate::Message, Theme> = fd.view();
+
+        let data = FrontDoorData {
+            mesh_map: Some(("5/5 online".to_string(), TileTone::Success)),
+            responded: true,
+            ..Default::default()
+        };
+        fd.apply(&data);
+        let _: Element<'_, crate::Message, Theme> = fd.view();
+
+        let _ = fd.update(Message::CompactQueryChanged("mesh".to_string()));
+        let _: Element<'_, crate::Message, Theme> = fd.view();
     }
 
     #[test]
