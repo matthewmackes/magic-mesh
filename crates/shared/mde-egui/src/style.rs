@@ -69,6 +69,9 @@ impl Style {
     /// Install the shared look on an egui [`Context`]. Call once per surface,
     /// from the harness runner's creation hook (see [`crate::run_client`]).
     pub fn install(ctx: &Context) {
+        // Fira Code is the default font set for every surface (governance §4).
+        crate::fonts::install(ctx);
+
         let mut v = egui::Visuals::dark();
 
         v.panel_fill = Self::BG;

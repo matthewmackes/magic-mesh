@@ -24,13 +24,21 @@
 //! `egui`/`eframe`. Both are re-exported so every surface resolves to the one
 //! harness-pinned egui version (no cross-surface version skew).
 
+pub mod fonts;
 pub mod motion;
 pub mod runner;
 pub mod style;
 
+// E12-2: the bare-seat DRM/KMS backend (no compositor), behind `feature = "drm"`.
+#[cfg(feature = "drm")]
+pub mod drm;
+
 pub use motion::Motion;
 pub use runner::run_client;
 pub use style::Style;
+
+#[cfg(feature = "drm")]
+pub use drm::run_drm;
 
 // Re-export the toolkit so surfaces depend on `mde-egui` alone and share one
 // egui/eframe resolution.

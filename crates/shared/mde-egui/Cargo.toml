@@ -12,6 +12,14 @@ repository.workspace   = true
 name = "mde_egui"
 path = "src/lib.rs"
 
+[features]
+default = []
+# E12-2: the bare-seat backend — egui rendered directly on a DRM/KMS seat with NO
+# Wayland compositor. Pulls a heavy native stack (libdrm/GBM/EGL/GLES via egui_glow,
+# libinput/udev for the seat), so it is OFF by default and enabled by the shell
+# binary; dev/windowed builds use the default eframe (wgpu) runner.
+drm = ["dep:drm", "dep:gbm", "dep:khronos-egl", "dep:glow", "dep:egui_glow", "dep:input", "dep:udev"]
+
 [dependencies]
 # E12 §4: egui is THE toolkit. eframe = egui + winit + wgpu, built as a Wayland
 # client — default-features off drops glow/x11/persistence; we opt into the wgpu
@@ -20,6 +28,17 @@ path = "src/lib.rs"
 # absent — that absence IS the a11y deferral, not a stub.
 eframe = { version = "0.31", default-features = false, features = ["wgpu", "wayland", "default_fonts"] }
 egui   = "0.31"
+
+# --- E12-2 bare-seat (DRM/KMS) backend — optional, enabled by `--features drm`.
+# Native deps: libdrm, libgbm, libEGL/libGLESv2, libinput, libudev. Versions are
+# pinned loosely; the farm build is the source of truth for resolution.
+drm         = { version = "0.14", optional = true }
+gbm         = { version = "0.18", optional = true, features = ["drm-support"] }
+khronos-egl = { version = "6", optional = true, features = ["dynamic"] }
+glow        = { version = "0.16", optional = true }
+egui_glow   = { version = "0.31", optional = true }
+input       = { version = "0.9", optional = true }
+udev        = { version = "0.9", optional = true }
 
 [[example]]
 name = "hello"
