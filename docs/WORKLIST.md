@@ -2522,3 +2522,33 @@ Reproducible + portable per-mesh DevOps backoffice on a dedicated control VM, re
   As the operator, I want the existing hand-stood-up backoffice migrated into the control-vm model, so the live mesh's DevOps plane becomes reproducible IaC and the LAN node is no longer a snowflake.
   - Running `backoffice-up.sh` with `MCNF_CONTROL_IP=172.20.145.192 --adopt` against the live founder etcd (quorum from `/etc/mackesd/etcd-endpoints`) converges state-backend + secrets + Forgejo + reconciler with NO destructive change; the live `/tofu/state/*` (incl. migrated edgeos) is readable by the new state-backend and a `tofu plan` of xen-xapi from the control VM shows 0-add/0-change/0-destroy (the `moved{}` port consumed against the live build VMs).
   - The live build farm (.50/.90/.130) stays managed (reconcile converges with the live nodes); secrets resolve from the store via the control VM's own re-sealed key and the `/root/.mcnf-*` fallback files can be removed without breaking `tofu plan` (closes DS-8); a DR backup restores into a throwaway etcd and a plan against it matches AND the restored Forgejo shows the named repo + admin row (DR round-trip proven, DAR-43).
+
+### CTRLSURF — Workbench Control Surface (Command Watchfloor)
+
+_Design: `docs/design/workbench-control-surface.md` (locked 2026-06-29 via the operator design tour + the 10-paradigm + nav-rethink workflows + a convergence survey). Phased + feature-flagged; build via the farm (`xcp-build.sh`)._
+
+- [ ] **CTRLSURF-1: unified verb-aware relevance ladder**
+  As an operator, I want one relevance ladder behind every search, so the launcher and the omnibox rank identically and there is one place to tune.
+  - [ ] a standalone module merges `search::score_match` + `launcher::fuzzy_score`; the existing score tests (`front_door.rs` ~9102-9169) pass against it unchanged
+  - [ ] `cargo test -p mde-workbench --lib` green on the farm
+- [ ] **CTRLSURF-2: the Compact command-line + status surface**
+  As an operator, I want a compact window with one command line over ~5 live status rows, so I get the 4-second glance + launch without a full screen.
+  - [ ] rows render from `FrontDoorData::read`/`mod project` (no fake values, §7); an absent Bus shows the `responded=false` state, never a hang; no synchronous Bus read on keypress (cache-first + debounced async preview)
+- [ ] **CTRLSURF-3: whole-home keyboard nav**
+  As a keyboard-first operator, I want Up/Down/Enter/Esc/Tab/Ctrl+1..5 on the home (launcher closed), so I never reach for the mouse.
+  - [ ] `launcher_key_subscription` is active on the home view; every binding drives a real message
+- [ ] **CTRLSURF-4: Expand "what changed" activity rail**
+  As an operator, I want a chronological change rail in Expand, so I can see farm/peer/datacenter events since I last looked.
+  - [ ] driven by the peers directory-changed push + the 15s `poll_subscription`; real bus events, no demo data
+- [ ] **CTRLSURF-5: CompactExpand window-size + expand-arrow resize**
+  As an operator, I want the expand arrow to actually resize the window between compact and full screen, so compact is a real Win10-Start-sized window.
+  - [ ] a `CompactExpand` enum augments `Mode`; the arrow performs a real `window::` resize (not an in-window swap); state survives reopen; the old `mode_toggle` swap is retired
+- [ ] **CTRLSURF-6: one universal sidebar + scope-first nav taxonomy**
+  As an operator, I want a single left nav with plain-language scope-first sections + sub-groups, so the two stacked rails and the SHOUTING labels are gone.
+  - [ ] the Front Door rail folds into `sidebar.rs`; `model.rs` renders the scope-first sections (Overview/This Node/Mesh/Fleet/Datacenter/Monitoring/System) with sub-group headers; no SHOUTING labels; `Group::from_slug` round-trips every section
+- [ ] **CTRLSURF-7: shared zebra `striped_list` helper**
+  As an operator, I want every list zebra-striped, so dense rows are scannable.
+  - [ ] a shared helper (the `mde-notify-center` zebra idiom) backs the list/table panels; Carbon tokens only (§4)
+- [ ] **CTRLSURF-8: subtle density pass + new Workbench icon**
+  As an operator, I want tightened spacing + a mesh-native app icon, so the console reads denser and on-brand.
+  - [ ] redundant triple titles dropped; fixed-height output boxes flex; the new mesh-control glyph replaces the Carbon tools icon in `assets/icons/carbon/workbench.svg` + the launcher tile
