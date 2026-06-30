@@ -16,6 +16,22 @@ use crate::model::{
 };
 use crate::theme as t;
 
+/// POLISH-files-focusring — the width (px) of the keyboard-focus ring to paint on
+/// a file row/tile this frame, or `None` for no ring.
+///
+/// Returns the shared 2px Carbon ring ([`mde_theme::feedback::FOCUS_RING_WIDTH_PX`]
+/// — the Object Card focus-outline weight, single-sourced) **only** when the item
+/// both holds the focus cursor (`focused`) AND that focus is keyboard-visible
+/// (`focus_visible` = the resolved [`crate::prefs::FocusVisibility::should_render`]
+/// gate on `keyboard_active`). A mouse-driven focus or a plain pointer hover yields
+/// `None`, so the ring is the keyboard cue alone — never drawn on every hover, and
+/// visually distinct from the `ROW_HOVER` wash (§4/§7). Reading the width off the
+/// `feedback` token keeps a `2.0` literal out of the surface crate.
+#[must_use]
+fn focus_ring_width(focused: bool, focus_visible: bool) -> Option<f32> {
+    (focused && focus_visible).then_some(mde_theme::feedback::FOCUS_RING_WIDTH_PX)
+}
+
 /// GUI-7 — local cosmic renderer for an `mde_theme::ObjectCard` (replaces the
 /// dropped iced-0.14 `mde_iced_components::object_card` in the Cosmic cutover).
 /// Faithful to the small-card spec: a leading Material icon + title (+
@@ -23,6 +39,7 @@ use crate::theme as t;
 pub fn object_card(
     card: mde_theme::ObjectCard,
     palette: mde_theme::Palette,
+    focus_visible: bool,
 ) -> Element<'static, Message> {
     use mde_theme::{CardState, IconSize, IconState};
     let to_color = |c: mde_theme::Rgba| Color {
@@ -65,6 +82,16 @@ pub fn object_card(
         CardState::Hover => (t::ROW_HOVER_FAINT, t::DIVIDER),
         _ => (t::PF_BG_300, t::PF_BORDER),
     };
+    // POLISH-files-focusring — a keyboard-focused card wears the shared 2px Carbon
+    // focus ring (`mde_theme::feedback`) in the interactive accent, gated on
+    // keyboard-visible focus so a pointer hover keeps the faint 1px resting border.
+    // The accent ring is the distinct keyboard cue; the wash + hairline stay the
+    // mouse path (§4/§7).
+    let (border_color, border_width) =
+        match focus_ring_width(card.state == CardState::Focused, focus_visible) {
+            Some(w) => (to_color(palette.accent), w),
+            None => (border, 1.0),
+        };
     container(
         row![icon_slot, text_col]
             .spacing(12)
@@ -76,8 +103,8 @@ pub fn object_card(
         snap: false,
         background: Some(Background::Color(bg)),
         border: Border {
-            color: border,
-            width: 1.0,
+            color: border_color,
+            width: border_width,
             radius: 6.0.into(),
         },
         ..container::Style::default()
@@ -91,7 +118,9 @@ pub fn object_card(
 pub fn detail_card(name: &str, mime: Mime) -> Element<'static, Message> {
     let card = mde_theme::ObjectCard::small(mime_to_icon(mime), name.to_string())
         .with_subtitle(mime_label(mime).to_string());
-    object_card(card, t::mde_files_palette())
+    // The details-panel header is a static, non-focusable card (state stays
+    // `Default`), so no keyboard-focus ring ever applies.
+    object_card(card, t::mde_files_palette(), false)
 }
 
 /// POLISH-files-emptystates — local cosmic renderer for the shared
@@ -831,6 +860,12 @@ pub struct RowMotionCtx<'a> {
     pub now: std::time::Instant,
     /// Reduce-motion: instant state changes, no movement.
     pub reduce_motion: bool,
+    /// POLISH-files-focusring — whether a keyboard-focus ring should be painted
+    /// this frame: the resolved [`crate::prefs::FocusVisibility::should_render`]
+    /// gate on `keyboard_active`. Carried beside `reduce_motion` (the sibling
+    /// per-frame a11y signal) so every file view draws the 2px Carbon focus ring
+    /// only when focus is keyboard-driven, never on a pointer hover.
+    pub focus_visible: bool,
     /// BEAUT-FILES — the perceived-performance load state of this listing. Drives
     /// the skeleton-first paint + the stale-while-refreshing dim/crossfade the
     /// file views apply around their row list.
@@ -1058,6 +1093,7 @@ pub fn file_row(
     show_src: bool,
     selected: bool,
     focused: bool,
+    focus_visible: bool,
     motion: RowMotion,
 ) -> Element<'static, Message> {
     let has_conflict = row_data.has_conflict;
@@ -1106,7 +1142,7 @@ pub fn file_row(
     if !subtitle.is_empty() {
         card = card.with_subtitle(subtitle);
     }
-    let card_el = object_card(card, palette);
+    let card_el = object_card(card, palette, focus_visible);
 
     // MESHFS-11.1: conflict chip — rendered below the card when present.
     let conflict_chip: Option<Element<'static, Message>> = if has_conflict {
@@ -1255,10 +1291,11 @@ pub fn collapsing_row(
     m: FileListMetrics,
     motion: RowMotion,
 ) -> Element<'static, Message> {
-    // A leaving row is never selected/focused — it is on its way out. `list_row`
-    // routes through the collapse-aware `with_row_motion` (height → 0); fade the
-    // whole row by `collapse_alpha` so it dims as it shrinks.
-    let body = list_row(row_data, show_src, false, false, m, motion);
+    // A leaving row is never selected/focused — it is on its way out (so no
+    // focus ring either). `list_row` routes through the collapse-aware
+    // `with_row_motion` (height → 0); fade the whole row by `collapse_alpha` so it
+    // dims as it shrinks.
+    let body = list_row(row_data, show_src, false, false, false, m, motion);
     crate::loading::dim(body, motion.collapse_alpha())
 }
 
@@ -1321,6 +1358,7 @@ pub fn list_row(
     show_src: bool,
     selected: bool,
     focused: bool,
+    focus_visible: bool,
     m: FileListMetrics,
     motion: RowMotion,
 ) -> Element<'static, Message> {
@@ -1391,12 +1429,30 @@ pub fn list_row(
                 .align_x(cosmic::iced::alignment::Horizontal::Right),
         );
 
+    // POLISH-files-focusring — paint the shared 2px Carbon focus ring
+    // (`mde_theme::feedback`) in the interactive accent around a keyboard-focused
+    // row, gated on keyboard-visible focus so a pointer hover/mouse cursor keeps
+    // only the bare `ROW_HOVER` wash. The accent ring is the distinct keyboard cue
+    // (§4/§7); a mouse-focused row stays the wash it always was.
+    let focus_border = match focus_ring_width(focused, focus_visible) {
+        Some(w) => Border {
+            color: t::ACCENT,
+            width: w,
+            radius: 0.0.into(),
+        },
+        None => Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
+    };
     let row_el: Element<'static, Message> = container(inner)
         .padding(Padding::from([0.0, f32::from(m.pad_x)]))
         .height(Length::Fixed(m.row_h))
         .sty(move |_| container::Style {
             snap: false,
             background: Some(Background::Color(bg)),
+            border: focus_border,
             ..container::Style::default()
         })
         .into();
@@ -1751,6 +1807,7 @@ mod motion_tests {
             reveal_origin,
             now,
             reduce_motion,
+            focus_visible: false,
             load: crate::loading::ListingLoad::default(),
             removed: &[],
         }
@@ -2017,5 +2074,68 @@ mod motion_tests {
         };
         let a = half.collapse_alpha();
         assert!(a > 0.0 && a < 1.0, "mid-collapse partly faded, got {a}");
+    }
+}
+
+#[cfg(test)]
+mod focus_tests {
+    //! POLISH-files-focusring — the keyboard-focus-ring gate the file rows/tiles
+    //! consume so the 2px Carbon ring tracks real keyboard focus and never paints
+    //! on a pointer hover.
+    use super::focus_ring_width;
+    use crate::prefs::FocusVisibility;
+
+    #[test]
+    fn ring_shows_only_for_visible_keyboard_focus() {
+        // The ring is drawn only when the row holds the focus cursor AND that
+        // focus is keyboard-visible — never on a focused-but-mouse row, and never
+        // on an unfocused (e.g. merely hovered) row.
+        assert!(
+            focus_ring_width(true, true).is_some(),
+            "keyboard-focused row draws the ring",
+        );
+        assert!(
+            focus_ring_width(true, false).is_none(),
+            "mouse-driven focus draws no ring (the wash stays the mouse cue)",
+        );
+        assert!(
+            focus_ring_width(false, true).is_none(),
+            "an unfocused row draws no ring even while keyboard is active",
+        );
+        assert!(focus_ring_width(false, false).is_none());
+    }
+
+    #[test]
+    fn ring_width_is_the_2px_carbon_token() {
+        // The drawn width is the shared `mde_theme::feedback` ring token (= the
+        // Object Card focus-outline weight, 2px) — distinct from the 1px resting
+        // border, with no scattered literal in the surface crate (§4).
+        let w = focus_ring_width(true, true).expect("ring present");
+        assert!((w - mde_theme::feedback::FOCUS_RING_WIDTH_PX).abs() < f32::EPSILON);
+        assert!(
+            (w - 2.0).abs() < f32::EPSILON,
+            "the Carbon focus ring is 2px, got {w}",
+        );
+    }
+
+    #[test]
+    fn gate_matches_the_focus_visibility_policy() {
+        // The `focus_visible` bit the rows receive is exactly the resolved
+        // FocusVisibility gate, so the ring follows the policy: Auto honors the
+        // keyboard-active signal; AlwaysVisible forces it on. This is the consumer
+        // of the previously-dropped `FocusVisibility::Auto` signal.
+        for keyboard_active in [false, true] {
+            let auto = FocusVisibility::Auto.should_render(keyboard_active);
+            assert_eq!(
+                focus_ring_width(true, auto).is_some(),
+                keyboard_active,
+                "Auto ring tracks keyboard_active",
+            );
+            let always = FocusVisibility::AlwaysVisible.should_render(keyboard_active);
+            assert!(
+                focus_ring_width(true, always).is_some(),
+                "AlwaysVisible always draws the ring on a focused row",
+            );
+        }
     }
 }

@@ -1603,6 +1603,11 @@ impl MdeFiles {
             reveal_origin: self.reveal_origin,
             now: std::time::Instant::now(),
             reduce_motion: self.reduce_motion(),
+            // POLISH-files-focusring — consume the `FocusVisibility::Auto` signal
+            // (previously computed into `keyboard_active` and dropped): resolve the
+            // focus-ring policy against the live keyboard/pointer modality so the
+            // rows paint the 2px Carbon ring for keyboard focus only.
+            focus_visible: self.a11y.focus.should_render(self.keyboard_active),
             load: self.listing_load,
             removed: &self.removed_rows,
         }
