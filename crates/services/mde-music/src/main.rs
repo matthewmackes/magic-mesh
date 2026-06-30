@@ -2399,9 +2399,13 @@ impl State {
         } else {
             self.connection.clone()
         };
-        let avatar = container(text("\u{25CF}").size(14).colr(carbon(p.accent, 1.0)))
-            .width(Length::Fixed(28.0))
-            .center_x(Length::Fixed(28.0));
+        let avatar = container(
+            text(mde_theme::Icon::StatusOk.fallback_glyph())
+                .size(14)
+                .colr(carbon(p.accent, 1.0)),
+        )
+        .width(Length::Fixed(28.0))
+        .center_x(Length::Fixed(28.0));
         let account = button(
             row![avatar, text(conn).size(12).colr(carbon(p.text_muted, 1.0))]
                 .spacing(8)
@@ -2534,7 +2538,9 @@ impl State {
         };
         let server = column![
             row![
-                text("●").size(12).colr(dotc),
+                text(mde_theme::Icon::StatusOk.fallback_glyph())
+                    .size(12)
+                    .colr(dotc),
                 Space::new().width(Length::Fixed(8.0)),
                 text(format!("Airsonic · {}", s.host)).size(14).colr(text_c),
             ]
@@ -2602,9 +2608,12 @@ impl State {
             .iter()
             .map(|pr| {
                 let (glyph, c) = if pr.playing {
-                    ("♪", carbon(p.accent, 1.0))
+                    (
+                        mde_theme::Icon::Audio.fallback_glyph(),
+                        carbon(p.accent, 1.0),
+                    )
                 } else {
-                    ("○", muted)
+                    (mde_theme::Icon::StatusUnknown.fallback_glyph(), muted)
                 };
                 row![
                     text(glyph.to_string()).size(12).colr(c),
@@ -2665,7 +2674,7 @@ impl State {
         let last = segments.len().saturating_sub(1);
         for (i, seg) in segments.iter().enumerate() {
             if i > 0 {
-                crumbs = crumbs.push(text("›"));
+                crumbs = crumbs.push(text(mde_theme::Icon::ChevronRight.fallback_glyph()));
             }
             // The ellipsis isn't navigable; the current (last) segment is
             // shown as plain text.
@@ -2906,10 +2915,15 @@ impl State {
                                             .on_input(Message::RenameBufferChanged)
                                             .on_submit(Message::CommitRenamePlaylist)
                                             .width(Length::Fixed(100.0)),
-                                        button(text("✓").size(12))
-                                            .on_press(Message::CommitRenamePlaylist),
-                                        button(text("✕").size(12))
-                                            .on_press(Message::CancelRenamePlaylist),
+                                        button(
+                                            text(mde_theme::Icon::Confirm.fallback_glyph())
+                                                .size(12),
+                                        )
+                                        .on_press(Message::CommitRenamePlaylist),
+                                        button(
+                                            text(mde_theme::Icon::Cancel.fallback_glyph()).size(12),
+                                        )
+                                        .on_press(Message::CancelRenamePlaylist),
                                     ]
                                     .spacing(4)
                                     .into()
@@ -2965,11 +2979,21 @@ impl State {
             }
         };
 
-        let search_field = text_input("Search artists, albums, songs…", &self.search_query)
-            .id(search_id())
-            .on_input(Message::SearchInput)
-            .padding(8)
-            .width(Length::Fixed(340.0));
+        let pal = mde_theme::Palette::dark();
+        // MUSIC-ICONS — a leading Carbon search glyph (the typed `Icon::Search`,
+        // single-sourced from `mde_theme`) marks the field as a search affordance.
+        let search_field = row![
+            text(mde_theme::Icon::Search.fallback_glyph())
+                .size(13)
+                .colr(carbon(pal.text, 1.0)),
+            text_input("Search artists, albums, songs…", &self.search_query)
+                .id(search_id())
+                .on_input(Message::SearchInput)
+                .padding(8)
+                .width(Length::Fixed(340.0)),
+        ]
+        .spacing(8)
+        .align_y(cosmic::iced::Alignment::Center);
         // MUSIC-NAV — the window has no title-bar chrome, so the header carries
         // explicit Back / Home controls (left) and an Exit control (right) the
         // operator asked for, alongside the connection line + search.
@@ -2988,7 +3012,6 @@ impl State {
         // MUSIC-ALBUMS-1 — Carbon header (48px): Back/Home + "MCNF Music"
         // wordmark, centered search, and the MUSIC-DOCK-3 minimize control.
         // Surface background + bottom inset.
-        let pal = mde_theme::Palette::dark();
         let header = container(
             row![
                 back,
@@ -3385,7 +3408,7 @@ impl State {
                 .width(Length::Fixed(220.0))
                 .height(Length::Fixed(220.0))
                 .into(),
-            None => container(text("♪").size(48))
+            None => container(text(mde_theme::Icon::Audio.fallback_glyph()).size(48))
                 .width(Length::Fixed(220.0))
                 .height(Length::Fixed(220.0))
                 .padding(86)
@@ -3728,8 +3751,14 @@ impl State {
             );
             // GLYPH-FIX — ●/○ (text-presentation BMP), not ☑/☐: U+2611 ☑ is
             // Emoji_Presentation=Yes, so it renders via the color-emoji font
-            // (ignores tint, stalls first paint). ● selected, ○ unselected.
-            let sel_glyph = if selected { "\u{25CF}" } else { "\u{25CB}" };
+            // (ignores tint, stalls first paint). Single-sourced from the typed
+            // `mde_theme::Icon` table (StatusOk ● selected / StatusUnknown ○ not),
+            // which resolves to those same text-presentation BMP codepoints.
+            let sel_glyph = if selected {
+                mde_theme::Icon::StatusOk.fallback_glyph()
+            } else {
+                mde_theme::Icon::StatusUnknown.fallback_glyph()
+            };
             let mut row_el = row![
                 button(text(sel_glyph).size(13)).on_press(Message::QueueToggleSelect(i)),
                 text(format!("{marker}{label}"))
@@ -3751,7 +3780,10 @@ impl State {
                 row_el = row_el
                     .push(button(text("Play next").size(11)).on_press(Message::QueuePlayNext(i)));
             }
-            row_el = row_el.push(button(text("✕").size(12)).on_press(Message::QueueRemove(i)));
+            row_el = row_el.push(
+                button(text(mde_theme::Icon::Cancel.fallback_glyph()).size(12))
+                    .on_press(Message::QueueRemove(i)),
+            );
             // MOTION-FEEDBACK — the reveal's rise becomes a leading-padding offset
             // (translate→padding glue); under reduce-motion `slide_in` yields no
             // rise, so the row only crossfades into place.
@@ -3784,7 +3816,11 @@ impl State {
         } else {
             let mut col = column![].spacing(6);
             for p in &self.maxi_peers {
-                let status = if p.playing { "● playing" } else { "paused" };
+                let status = if p.playing {
+                    format!("{} playing", mde_theme::Icon::StatusOk.fallback_glyph())
+                } else {
+                    "paused".to_string()
+                };
                 col = col.push(
                     row![
                         text(p.host.clone()).size(14).width(Length::Fixed(150.0)),
@@ -4652,5 +4688,40 @@ mod transport_outcome_tests {
         assert!(TransportAction::PlayPause { was_playing: true }
             .failed_label()
             .contains("playback"));
+    }
+}
+
+#[cfg(test)]
+mod icon_glyph_tests {
+    // POLISH-music-icons — the surface routes its inline glyphs through the typed
+    // `mde_theme::Icon` table (single source, §6) instead of scattering literals.
+    // These contracts pin the codepoints the music layout assumes: if the shared
+    // table ever remaps one of these, the now-playing/queue rows change glyph in
+    // lock-step with the source of truth — and the second test guards the
+    // GLYPH-FIX hazard (a status dot must stay a text-presentation BMP glyph, not
+    // an emoji-presentation one the colour-emoji font would claim, ignoring tint).
+    use mde_theme::Icon;
+
+    #[test]
+    fn routed_icons_resolve_to_the_expected_text_glyphs() {
+        assert_eq!(Icon::Audio.fallback_glyph(), "\u{266A}"); // ♪ now-playing
+        assert_eq!(Icon::StatusOk.fallback_glyph(), "\u{25CF}"); // ● filled dot
+        assert_eq!(Icon::StatusUnknown.fallback_glyph(), "\u{25CB}"); // ○ idle dot
+        assert_eq!(Icon::ChevronRight.fallback_glyph(), "\u{203A}"); // › breadcrumb
+        assert_eq!(Icon::Confirm.fallback_glyph(), "\u{2713}"); // ✓ commit
+        assert_eq!(Icon::Cancel.fallback_glyph(), "\u{00D7}"); // × cancel/remove
+    }
+
+    #[test]
+    fn status_dot_glyphs_stay_text_presentation_bmp() {
+        for icon in [Icon::StatusOk, Icon::StatusUnknown] {
+            let g = icon.fallback_glyph();
+            let ch = g.chars().next().expect("glyph is non-empty");
+            assert_eq!(g.chars().count(), 1, "{icon:?} must be a single char");
+            assert!(
+                (ch as u32) < 0x1_0000,
+                "{icon:?} must stay in the BMP (text presentation)"
+            );
+        }
     }
 }
