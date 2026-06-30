@@ -53,7 +53,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use mde_theme::animation::{Animator, Transition};
-use mde_theme::feedback::{ControlFeedback, FeedbackParams};
+use mde_theme::feedback::{ControlFeedback, FeedbackParams, FocusRing};
 use mde_theme::motion::{Easing, Motion, PANEL_MOUNT_TRANSLATE_Y_PX};
 use mde_theme::{LoadState, StateTone};
 
@@ -78,6 +78,11 @@ const ANIM_TICK: Duration = Duration::from_millis(16);
 const ANIM_APPEAR: &str = "appear";
 /// [`Animator`] key for the call-bar's state-change crossfade.
 const ANIM_CALLSTATE: &str = "callstate";
+/// POLISH-voicehud-focusring — [`Animator`] key for the keyboard focus-ring
+/// grow-in. Re-armed each time focus moves to a new control so the tick
+/// subscription stays alive while that control's ring animates in (and only
+/// then — a settled ring needs no ticks, MOTION-PERF-1).
+const ANIM_FOCUS: &str = "focus";
 
 /// Build a per-control hover-lift [`Animator`] key (one tween per control id).
 fn hover_key(id: &str) -> String {
@@ -217,6 +222,15 @@ pub enum Message {
     HoverEnter(String),
     /// MOTION-FEEDBACK-1 — the pointer left a control, settling its hover-lift.
     HoverExit(String),
+    /// POLISH-voicehud-focusring — Tab pressed: advance keyboard focus to the
+    /// next on-screen control (wraps at the end), arming its focus-ring grow-in.
+    /// Parallel to [`HoverEnter`](Self::HoverEnter), but driven by the keyboard
+    /// rather than the pointer, so a keyboard user can SEE which control is
+    /// focused.
+    FocusNext,
+    /// POLISH-voicehud-focusring — Shift+Tab: advance keyboard focus to the
+    /// previous on-screen control (wraps at the start).
+    FocusPrev,
     /// MOTION-FEEDBACK-1 — the pointer pressed *down* on a control. The depress
     /// fires on this down edge (no input delay), so it carries no timestamp.
     ControlPressed(String),
@@ -272,6 +286,16 @@ pub struct VoiceHud {
     /// MOTION-FEEDBACK-1 — the control id currently hovered, if any (so a stale
     /// `HoverExit` after a fast re-enter is ignored).
     pub hovered: Option<String>,
+    /// POLISH-voicehud-focusring — the control id currently keyboard-focused, if
+    /// any. Parallel to [`hovered`](Self::hovered), but advanced by the keyboard
+    /// (Tab / Shift+Tab) instead of the pointer; drives the Carbon focus ring so
+    /// a keyboard user can see — and reach — each control. Only ever holds an id
+    /// that is actually on screen (see [`focus_order`]).
+    pub focused: Option<String>,
+    /// POLISH-voicehud-focusring — when focus last moved to a new control. Drives
+    /// the focus-ring grow-in tween ([`ControlFeedback::focus_ring`]); a single
+    /// timestamp suffices because exactly one control is focused at a time.
+    pub focus_since: Instant,
     /// MOTION-TRANS — the discriminant of the last-rendered call state, so the
     /// update handler can start the state-change crossfade only when the mode
     /// actually changes (not on every unrelated message).
@@ -332,6 +356,23 @@ impl VoiceHud {
         self.start_anim(hover_key(id), Motion::hover());
     }
 
+    /// POLISH-voicehud-focusring — move keyboard focus to `id` (or clear it),
+    /// stamping [`focus_since`](Self::focus_since) and arming the focus-ring
+    /// grow-in so the ring animates in on the newly-focused control. A no-op when
+    /// the id is unchanged, so holding/re-pressing the same key doesn't restart
+    /// the ring's grow-in. The focus tween is only armed when focusing a control
+    /// (clearing focus needs no animation — the ring just snaps off).
+    fn set_focus(&mut self, id: Option<String>) {
+        if self.focused == id {
+            return;
+        }
+        self.focused = id;
+        self.focus_since = Instant::now();
+        if self.focused.is_some() {
+            self.start_anim(ANIM_FOCUS, Motion::focus());
+        }
+    }
+
     /// MOTION-TRANS — start the call-bar crossfade iff the call MODE changed since
     /// the last sync. Called once at the end of every `update`. Under reduce-motion
     /// the crossfade collapses to the ≤80 ms cap (state kept, motion minimal).
@@ -365,6 +406,19 @@ impl VoiceHud {
             translate_y: lift,
             scale: press.scale,
         }
+    }
+
+    /// POLISH-voicehud-focusring — the animated focus ring for control `id` at
+    /// `now`, built from the shared [`ControlFeedback`] helper (§6 — reuse, not a
+    /// parallel ring impl). Visible — and growing in over [`Motion::focus`] —
+    /// only for the keyboard-[`focused`](Self::focused) control; an invisible
+    /// (zero-width) ring for every other control. Under reduce-motion the ring is
+    /// present immediately at full width (the helper's contract).
+    fn focus_ring(&self, id: &str, now: Instant) -> FocusRing {
+        let focused = self.focused.as_deref() == Some(id);
+        ControlFeedback::new()
+            .focused(focused, self.focus_since)
+            .focus_ring(now, self.reduce_motion)
     }
 
     /// MOTION-FEEDBACK-1 — the hover-lift offset (px, negative = up) for control
@@ -700,6 +754,20 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
                 state.start_hover(&id);
             }
         }
+        Message::FocusNext => {
+            // POLISH-voicehud-focusring — Tab walks focus forward through the
+            // controls actually on screen (so the ring never lands on a hidden
+            // control); set_focus arms the grow-in.
+            let order = focus_order(state);
+            let next = advance_focus(&order, state.focused.as_deref(), true);
+            state.set_focus(next);
+        }
+        Message::FocusPrev => {
+            // Shift+Tab — the same walk, reversed.
+            let order = focus_order(state);
+            let prev = advance_focus(&order, state.focused.as_deref(), false);
+            state.set_focus(prev);
+        }
         Message::ToggleMute => {
             // Toggle the live media session's mic mute. Only meaningful while a
             // call has media up; a no-op otherwise (the pill only renders then).
@@ -865,10 +933,10 @@ fn keyboard_subscription() -> cosmic::iced::Subscription<Message> {
     // Only act on events no widget consumed (`Ignored`) — the same focus contract
     // the dialer text-input relies on, so a focused field still owns its keys.
     event::listen_with(|event, status, _window| match event {
-        cosmic::iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. })
+        cosmic::iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. })
             if status == event::Status::Ignored =>
         {
-            key_to_message(&key.as_ref())
+            key_to_message(&key.as_ref(), modifiers.shift())
         }
         _ => None,
     })
@@ -879,13 +947,23 @@ fn keyboard_subscription() -> cosmic::iced::Subscription<Message> {
 /// Enter are keyboard *intents* the `update` handler resolves against the live
 /// call state ([`escape_action`] / [`enter_action`]); `m`/`M` is the in-call mute
 /// accelerator ([`Message::ToggleMute`] self-guards when no call is up, so it maps
-/// unconditionally); a dialer char types into the pad. Other keys are ignored.
-fn key_to_message(key: &cosmic::iced::keyboard::Key<&str>) -> Option<Message> {
+/// unconditionally); Tab / Shift+Tab walk the keyboard focus ring through the
+/// on-screen controls (POLISH-voicehud-focusring); a dialer char types into the
+/// pad. Other keys are ignored.
+fn key_to_message(key: &cosmic::iced::keyboard::Key<&str>, shift: bool) -> Option<Message> {
     use cosmic::iced::keyboard::{key::Named, Key};
     match key {
         Key::Named(Named::Escape) => Some(Message::Escape),
         Key::Named(Named::Enter) => Some(Message::Enter),
         Key::Named(Named::Backspace) => Some(Message::Backspace),
+        // Tab moves keyboard focus through the controls so a keyboard user can
+        // SEE which one is focused (the pointer-only mouse_areas drew no ring).
+        // Shift+Tab reverses. This is the a11y nav the HUD was missing.
+        Key::Named(Named::Tab) => Some(if shift {
+            Message::FocusPrev
+        } else {
+            Message::FocusNext
+        }),
         Key::Character(s) => {
             let c = s.chars().next()?;
             if is_dialer_char(c) {
@@ -1213,6 +1291,56 @@ fn keypad_id(c: char) -> String {
     format!("key/{c}")
 }
 
+/// POLISH-voicehud-focusring — the keyboard tab order: every control id that is
+/// actually rendered + pressable in the current call state, in reading order
+/// (the keypad, then the live call-bar actions). It mirrors [`build_keypad`] +
+/// [`build_call_bar`] exactly, so Tab focus only ever lands on a control that is
+/// really on screen and the ring always rings a real target (§7). The single
+/// source the focus-advance and the per-control ring render both read.
+fn focus_order(state: &VoiceHud) -> Vec<String> {
+    let mut ids: Vec<String> = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#']
+        .into_iter()
+        .map(keypad_id)
+        .collect();
+    ids.push("key/backspace".to_string());
+    // Mirror build_call_bar's state machine (Incoming checked before is_active).
+    if matches!(state.call, sip::CallState::Incoming { .. }) {
+        ids.push("call/answer".to_string());
+        ids.push("call/decline".to_string());
+    } else if state.call.is_active() {
+        // The Mute pill only renders once media is up, and sits before Hang up.
+        if state.media.is_some() {
+            ids.push("call/mute".to_string());
+        }
+        ids.push("call/hangup".to_string());
+    } else if !state.dialer_input.trim().is_empty() {
+        // The Call pill is only pressable (and so focusable) with a dialed target.
+        ids.push("call/place".to_string());
+    }
+    ids
+}
+
+/// POLISH-voicehud-focusring — pure: the next focus id when tabbing through
+/// `order`. Steps one place from `current` in the `forward` direction, wrapping
+/// at the ends; a `current` of `None` (or one no longer in `order`, e.g. the
+/// focused control just left the screen) restarts at the first entry going
+/// forward / the last going backward. An empty order yields `None`. Split out so
+/// the focus-advance logic is unit-testable without an event loop.
+#[must_use]
+fn advance_focus(order: &[String], current: Option<&str>, forward: bool) -> Option<String> {
+    if order.is_empty() {
+        return None;
+    }
+    let len = order.len();
+    let next = match current.and_then(|c| order.iter().position(|id| id.as_str() == c)) {
+        Some(i) if forward => (i + 1) % len,
+        Some(i) => (i + len - 1) % len,
+        None if forward => 0,
+        None => len - 1,
+    };
+    Some(order[next].clone())
+}
+
 /// MOTION-FEEDBACK-1 — render a control's [`FeedbackParams`] (hover-lift +
 /// press-depress) as a `(top, bottom)` padding pair around `base_pad`. The control
 /// rises on hover and sinks on press, and in BOTH cases the opposite edge absorbs
@@ -1248,6 +1376,28 @@ fn press_sink_px(scale: f32) -> f32 {
     // exactly HOVER_LIFT_PX of travel (mirroring the hover nudge magnitude).
     let frac = (depth / mde_theme::feedback::PRESS_DEPTH).clamp(0.0, 1.0);
     frac * mde_theme::feedback::HOVER_LIFT_PX
+}
+
+/// POLISH-voicehud-focusring — a control's border carrying the animated Carbon
+/// focus ring. The keyboard-[`focused`](VoiceHud::focused) control gets the Blue
+/// accent ring growing 0 → [`FOCUS_RING_WIDTH_PX`](mde_theme::feedback::FOCUS_RING_WIDTH_PX)
+/// (the 2px Carbon weight, single-sourced with the Object Card), its opacity
+/// rising with the width; every other control gets a zero-width (invisible)
+/// border at `radius` — identical to the prior plain border. §4 — the hue reads
+/// the [`theme::PRIMARY`] token and the width comes from the `mde-theme` ring
+/// token, no raw literal. The single border builder the keypad keys + the call
+/// pills share (§6 — one ring, applied identically).
+fn focus_border(ring: FocusRing, radius: f32) -> cosmic::iced::Border {
+    cosmic::iced::Border {
+        radius: cosmic::iced::border::Radius::from(radius),
+        // Alpha-only override of the accent token (carbon-lint sees this as a
+        // token-derived spread, not a raw colour): the ring fades in with width.
+        color: Color {
+            a: ring.alpha,
+            ..theme::PRIMARY
+        },
+        width: ring.width,
+    }
 }
 
 /// One 3 × 4 keypad button — the digit/symbol cell, click fires
@@ -1293,6 +1443,9 @@ fn keypad_cell(
 ) -> Element<'_, Message> {
     let hovered = state.hovered.as_deref() == Some(&id);
     let fb = state.control_feedback(&id, now);
+    // POLISH-voicehud-focusring — the Carbon focus ring for this key (visible only
+    // while it holds keyboard focus); rendered as the button's border.
+    let ring = state.focus_ring(&id, now);
     // Hover tint is the non-motion cue (kept under reduce-motion, where the lift
     // is dropped): a hovered key brightens to the high-elevation surface step.
     let bg = if hovered {
@@ -1314,10 +1467,7 @@ fn keypad_cell(
         move |_: &Theme, _status| cosmic::iced::widget::button::Style {
             background: Some(cosmic::iced::Background::Color(bg)),
             text_color: theme::ON_SURF,
-            border: cosmic::iced::Border {
-                radius: cosmic::iced::border::Radius::from(8.0),
-                ..Default::default()
-            },
+            border: focus_border(ring, 8.0),
             ..Default::default()
         },
     );
@@ -1363,6 +1513,9 @@ fn call_pill<'a>(
 ) -> Element<'a, Message> {
     let fill = fade_color(fill, state.call_state_alpha(now));
     let fb = state.control_feedback(id, now);
+    // POLISH-voicehud-focusring — the Carbon focus ring for this pill, drawn as
+    // its border when it holds keyboard focus.
+    let ring = state.focus_ring(id, now);
     let pill = button(
         container(text(label).size(16.0).colr(label_color))
             .width(Length::Fill)
@@ -1375,10 +1528,7 @@ fn call_pill<'a>(
         move |_: &Theme, _status| cosmic::iced::widget::button::Style {
             background: Some(cosmic::iced::Background::Color(fill)),
             text_color: label_color,
-            border: cosmic::iced::Border {
-                radius: cosmic::iced::border::Radius::from(8.0),
-                ..Default::default()
-            },
+            border: focus_border(ring, 8.0),
             ..Default::default()
         },
     );
@@ -1467,6 +1617,10 @@ fn build_call_bar(state: &VoiceHud, now: Instant) -> Element<'_, Message> {
         } else {
             theme::ON_SURF_MUTED
         };
+        // POLISH-voicehud-focusring — the Call pill's ring (only ever visible
+        // when it is both enabled and keyboard-focused; a disabled Call is not in
+        // the focus order, so its ring stays invisible).
+        let ring = state.focus_ring("call/place", now);
         let mut b = button(
             container(text("Call").size(16.0).colr(label_color))
                 .width(Length::Fill)
@@ -1478,10 +1632,7 @@ fn build_call_bar(state: &VoiceHud, now: Instant) -> Element<'_, Message> {
             move |_: &Theme, _status| cosmic::iced::widget::button::Style {
                 background: Some(cosmic::iced::Background::Color(fill)),
                 text_color: theme::SURF,
-                border: cosmic::iced::Border {
-                    radius: cosmic::iced::border::Radius::from(8.0),
-                    ..Default::default()
-                },
+                border: focus_border(ring, 8.0),
                 ..Default::default()
             },
         );
@@ -1757,6 +1908,8 @@ fn main() -> Result<(), cosmic::iced::Error> {
                     reduce_motion,
                     pressed: None,
                     hovered: None,
+                    focused: None,
+                    focus_since: Instant::now(),
                     call_kind: CallKind::Idle,
                     muted: false,
                 },
@@ -1802,6 +1955,8 @@ mod tests {
             reduce_motion: false,
             pressed: None,
             hovered: None,
+            focused: None,
+            focus_since: Instant::now(),
             call_kind: CallKind::Idle,
             muted: false,
         }
@@ -2462,41 +2617,49 @@ mod tests {
     #[test]
     fn key_to_message_maps_call_control_and_dialer_keys() {
         use cosmic::iced::keyboard::{key::Named, Key};
-        // Call-control intents + erase.
+        // Call-control intents + erase (no modifier).
         assert!(matches!(
-            key_to_message(&Key::Named(Named::Escape)),
+            key_to_message(&Key::Named(Named::Escape), false),
             Some(Message::Escape)
         ));
         assert!(matches!(
-            key_to_message(&Key::Named(Named::Enter)),
+            key_to_message(&Key::Named(Named::Enter), false),
             Some(Message::Enter)
         ));
         assert!(matches!(
-            key_to_message(&Key::Named(Named::Backspace)),
+            key_to_message(&Key::Named(Named::Backspace), false),
             Some(Message::Backspace)
         ));
         // 'm' / 'M' is the in-call mute accelerator (case-insensitive).
         assert!(matches!(
-            key_to_message(&Key::Character("m")),
+            key_to_message(&Key::Character("m"), false),
             Some(Message::ToggleMute)
         ));
         assert!(matches!(
-            key_to_message(&Key::Character("M")),
+            key_to_message(&Key::Character("M"), false),
             Some(Message::ToggleMute)
         ));
         // Dialer chars still type into the pad.
         assert!(matches!(
-            key_to_message(&Key::Character("5")),
+            key_to_message(&Key::Character("5"), false),
             Some(Message::KeypadPressed('5'))
         ));
         assert!(matches!(
-            key_to_message(&Key::Character("#")),
+            key_to_message(&Key::Character("#"), false),
             Some(Message::KeypadPressed('#'))
         ));
-        // A non-accelerator letter and unrelated named keys are ignored (no
-        // dial-buffer pollution).
-        assert!(key_to_message(&Key::Character("z")).is_none());
-        assert!(key_to_message(&Key::Named(Named::Tab)).is_none());
+        // POLISH-voicehud-focusring — Tab now walks the keyboard focus ring
+        // (Shift+Tab reverses); it is no longer an ignored no-op.
+        assert!(matches!(
+            key_to_message(&Key::Named(Named::Tab), false),
+            Some(Message::FocusNext)
+        ));
+        assert!(matches!(
+            key_to_message(&Key::Named(Named::Tab), true),
+            Some(Message::FocusPrev)
+        ));
+        // A non-accelerator letter is still ignored (no dial-buffer pollution).
+        assert!(key_to_message(&Key::Character("z"), false).is_none());
     }
 
     #[test]
@@ -2514,6 +2677,150 @@ mod tests {
         hud.call = sip::CallState::Idle;
         let _ = update(&mut hud, Message::Backspace);
         assert_eq!(hud.dialer_input, "pin");
+    }
+
+    // ── POLISH-voicehud-focusring — keyboard focus ring ───────────────────────
+
+    #[test]
+    fn advance_focus_walks_the_order_and_wraps() {
+        // The pure focus-id advance logic: forward from None starts at the first,
+        // backward from None at the last, and stepping wraps at both ends.
+        let order: Vec<String> = ["a", "b", "c"].into_iter().map(String::from).collect();
+        // None ⇒ the appropriate end.
+        assert_eq!(advance_focus(&order, None, true).as_deref(), Some("a"));
+        assert_eq!(advance_focus(&order, None, false).as_deref(), Some("c"));
+        // Step forward through the list.
+        assert_eq!(advance_focus(&order, Some("a"), true).as_deref(), Some("b"));
+        assert_eq!(advance_focus(&order, Some("b"), true).as_deref(), Some("c"));
+        // Wrap forward at the end.
+        assert_eq!(advance_focus(&order, Some("c"), true).as_deref(), Some("a"));
+        // Step + wrap backward.
+        assert_eq!(
+            advance_focus(&order, Some("b"), false).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            advance_focus(&order, Some("a"), false).as_deref(),
+            Some("c")
+        );
+        // A current id that left the order restarts at the appropriate end (so a
+        // control vanishing — e.g. the call bar changing — never strands focus).
+        assert_eq!(
+            advance_focus(&order, Some("gone"), true).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            advance_focus(&order, Some("gone"), false).as_deref(),
+            Some("c")
+        );
+        // An empty order has nothing to focus.
+        assert_eq!(advance_focus(&[], Some("a"), true), None);
+    }
+
+    #[test]
+    fn focus_order_tracks_the_live_call_state() {
+        // focus_order lists exactly the controls on screen, so a Tab can only ever
+        // ring a real target (§7). The keypad (12 keys + Backspace) is always
+        // present; the call-bar tail follows the call state, mirroring
+        // build_call_bar.
+        let mut hud = make_hud();
+        // Idle + empty dialer ⇒ keypad only (the Call pill isn't pressable yet).
+        let idle = focus_order(&hud);
+        assert_eq!(idle.len(), 13, "12 keys + Backspace");
+        assert_eq!(idle.first().map(String::as_str), Some("key/1"));
+        assert_eq!(idle.last().map(String::as_str), Some("key/backspace"));
+        assert!(!idle.iter().any(|id| id == "call/place"));
+        // Idle + a dialed target ⇒ the Call pill joins the order.
+        hud.dialer_input = "1003".into();
+        assert!(focus_order(&hud).iter().any(|id| id == "call/place"));
+        // A ringing inbound call ⇒ Answer + Decline, no Call pill.
+        hud.dialer_input.clear();
+        hud.call = sip::CallState::Incoming {
+            from: "pine".into(),
+        };
+        let inc = focus_order(&hud);
+        assert!(inc.iter().any(|id| id == "call/answer"));
+        assert!(inc.iter().any(|id| id == "call/decline"));
+        assert!(!inc.iter().any(|id| id == "call/place"));
+        // An active call ⇒ Hang up; Mute only joins once media is up (it isn't).
+        hud.call = sip::CallState::InCall {
+            peer: "pine".into(),
+        };
+        let active = focus_order(&hud);
+        assert!(active.iter().any(|id| id == "call/hangup"));
+        assert!(
+            !active.iter().any(|id| id == "call/mute"),
+            "no Mute pill without a live media session"
+        );
+    }
+
+    #[test]
+    fn tab_advances_keyboard_focus_and_rings_the_focused_control() {
+        // POLISH-voicehud-focusring — Tab lands focus on the first control and
+        // arms its ring grow-in; the focused control draws a visible 2px Carbon
+        // ring (once grown in) and no other does. §7 — the ring tracks REAL focus.
+        let mut hud = make_hud();
+        assert!(hud.focused.is_none(), "nothing focused at rest");
+        assert!(
+            !hud.focus_ring("key/1", Instant::now()).is_visible(),
+            "no ring before any focus"
+        );
+
+        let _ = update(&mut hud, Message::FocusNext);
+        assert_eq!(
+            hud.focused.as_deref(),
+            Some("key/1"),
+            "Tab lands on the first control"
+        );
+        // The focus-ring grow-in tween is armed, so the tick subscription runs
+        // while it animates in (and only then — MOTION-PERF-1).
+        assert!(
+            hud.anim.is_animating(ANIM_FOCUS, hud.focus_since),
+            "focus-ring grow-in is armed"
+        );
+        // Sampled at the end of the grow-in the focused control's ring is fully
+        // drawn at the Carbon 2px weight; an unfocused control draws nothing.
+        let settled = hud.focus_since + Motion::focus().duration;
+        let focused = hud.focused.clone().unwrap();
+        let ring = hud.focus_ring(&focused, settled);
+        assert!(ring.is_visible(), "the focused control is ringed");
+        assert!(
+            (ring.width - mde_theme::feedback::FOCUS_RING_WIDTH_PX).abs() < 1e-4,
+            "ring grows to the 2px Carbon weight, got {}",
+            ring.width
+        );
+        assert!(
+            !hud.focus_ring("key/2", settled).is_visible(),
+            "an unfocused control draws no ring"
+        );
+
+        // Tab again advances the ring to the next control (and off the first).
+        let _ = update(&mut hud, Message::FocusNext);
+        assert_eq!(hud.focused.as_deref(), Some("key/2"));
+        assert!(
+            !hud.focus_ring("key/1", settled).is_visible(),
+            "the ring left the previously-focused control"
+        );
+        // Shift+Tab walks focus back.
+        let _ = update(&mut hud, Message::FocusPrev);
+        assert_eq!(hud.focused.as_deref(), Some("key/1"));
+    }
+
+    #[test]
+    fn focus_ring_is_present_immediately_under_reduce_motion() {
+        // The helper's reduce-motion contract at the HUD level: the ring is the
+        // focus cue, so it is present (at full width) the instant focus arrives —
+        // it simply does not animate in.
+        let mut hud = make_hud();
+        hud.reduce_motion = true;
+        let _ = update(&mut hud, Message::FocusNext);
+        let focused = hud.focused.clone().unwrap();
+        let ring = hud.focus_ring(&focused, hud.focus_since);
+        assert!(
+            ring.is_visible(),
+            "focus ring present immediately under reduce-motion"
+        );
+        assert!((ring.width - mde_theme::feedback::FOCUS_RING_WIDTH_PX).abs() < 1e-4);
     }
 
     // ── POLISH-voicehud-loadstate — registration/roster load-state mapping ─────
