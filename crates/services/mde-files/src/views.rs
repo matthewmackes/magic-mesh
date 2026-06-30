@@ -1050,10 +1050,11 @@ pub fn peer_folder<'a>(
             }
             let sel = selection.is_selected(&f.name);
             let foc = selection.is_focused(&f.name);
+            let fv = motion.focus_visible;
             let rm = motion.for_row(&f.name, i, sel);
             let row_el = match layout {
-                Layout::List => list_row(f.clone(), true, sel, foc, metrics, rm),
-                Layout::Grid => file_row(f.clone(), true, sel, foc, rm),
+                Layout::List => list_row(f.clone(), true, sel, foc, fv, metrics, rm),
+                Layout::Grid => file_row(f.clone(), true, sel, foc, fv, rm),
             };
             list = list.push(row_el);
         }
@@ -1124,10 +1125,11 @@ fn file_listing(
         }
         let sel = selection.is_selected(&f.name);
         let foc = selection.is_focused(&f.name);
+        let fv = motion.focus_visible;
         let rm = motion.for_row(&f.name, i, sel);
         let el = match layout {
-            Layout::List => list_row(f.clone(), show_src, sel, foc, metrics, rm),
-            Layout::Grid => file_row(f.clone(), show_src, sel, foc, rm),
+            Layout::List => list_row(f.clone(), show_src, sel, foc, fv, metrics, rm),
+            Layout::Grid => file_row(f.clone(), show_src, sel, foc, fv, rm),
         };
         list = list.push(el);
     }
@@ -1353,14 +1355,15 @@ pub fn local_browser<'a>(
             }
             let sel = selection.is_selected(&f.name);
             let foc = selection.is_focused(&f.name);
+            let fv = motion.focus_visible;
             let rm = motion.for_row(&f.name, i, sel);
             // AFM-4 — every local row is now actionable: clicking descends a
             // directory or opens a file (LocalActivate resolves the path in the
             // reducer). Was an inert card that no click reached. AFM-7 — the
             // row shape honors the toolbar list/grid toggle.
             let row_el = match layout {
-                Layout::List => list_row(f.clone(), true, sel, foc, metrics, rm),
-                Layout::Grid => file_row(f.clone(), true, sel, foc, rm),
+                Layout::List => list_row(f.clone(), true, sel, foc, fv, metrics, rm),
+                Layout::Grid => file_row(f.clone(), true, sel, foc, fv, rm),
             };
             let activatable = button(row_el)
                 .padding(0)
@@ -1416,8 +1419,9 @@ pub fn cloud_devices<'a>(
         for (i, f) in files.iter().enumerate() {
             let sel = selection.is_selected(&f.name);
             let foc = selection.is_focused(&f.name);
+            let fv = motion.focus_visible;
             let rm = motion.for_row(&f.name, i, sel);
-            list = list.push(file_row(f.clone(), true, sel, foc, rm));
+            list = list.push(file_row(f.clone(), true, sel, foc, fv, rm));
         }
     }
 
@@ -1628,12 +1632,13 @@ pub fn mesh_home_child<'a>(
             } else {
                 let sel = selection.is_selected(&f.name);
                 let foc = selection.is_focused(&f.name);
+                let fv = motion.focus_visible;
                 let rm = motion.for_row(&f.name, row_idx, sel);
                 row_idx += 1;
                 // AFM-7 — honor the list/grid toggle for file rows.
                 let row_el = match layout {
-                    Layout::List => list_row(f, false, sel, foc, metrics, rm),
-                    Layout::Grid => file_row(f, false, sel, foc, rm),
+                    Layout::List => list_row(f, false, sel, foc, fv, metrics, rm),
+                    Layout::Grid => file_row(f, false, sel, foc, fv, rm),
                 };
                 list = list.push(row_el);
             }
@@ -1704,7 +1709,9 @@ fn folder_row_button(f: FileRow) -> Element<'static, Message> {
     if !subtitle.is_empty() {
         card = card.with_subtitle(subtitle);
     }
-    button(crate::widgets::object_card(card, palette))
+    // A folder shortcut button is not a focus-cursor target (its card state is
+    // `Default`), so no keyboard-focus ring applies.
+    button(crate::widgets::object_card(card, palette, false))
         .padding(0)
         .sty(|_, _| ghost_button_style())
         .on_press(Message::MeshFolderEnter(name_payload))
