@@ -428,6 +428,15 @@ const RAIL_WIDTH: f32 = 260.0;
 /// values line up in a clean column for the 4-second glance.
 const STATUS_LABEL_WIDTH: f32 = 64.0;
 
+/// CTRLSURF-4 — the Expand "what changed" activity rail's fixed width: a right-hand
+/// companion column to the [`RAIL_WIDTH`] nav rail, wide enough to read a one-line
+/// event without wrapping most of the time.
+const ACTIVITY_RAIL_WIDTH: f32 = 300.0;
+
+/// CTRLSURF-4 — the activity row's fixed leading-glyph gutter, so the event text
+/// lines up in a clean column regardless of the `+` / `−` / `•` marker.
+const ACTIVITY_GLYPH_WIDTH: f32 = 16.0;
+
 /// CTRLSURF-2 — how long the Compact command line waits after the last keystroke
 /// before firing its async preview (the Copilot `ask`). The instant LOCAL hits
 /// are already on screen — recomputed synchronously from cache through the one
@@ -1248,6 +1257,219 @@ pub(super) mod compact {
         } else {
             Glance::Offline
         }
+    }
+}
+
+// ===================== CTRLSURF-4: the Expand "what changed" rail =============
+
+/// CTRLSURF-4 — the Expand "what changed" activity rail's pure event model and the
+/// snapshot-delta derivation (`docs/design/workbench-control-surface.md` →
+/// Architecture / Expand mode: "a 'what changed' activity rail driven by the peers
+/// directory-changed push + the 15s `poll_subscription`"). Mirrors [`mod compact`]:
+/// a tiny projection of each [`FrontDoorData`] snapshot ([`ActivitySnapshot`])
+/// plus [`derive_events`], both Bus-free so the "what changed" logic is unit-tested
+/// without a live mesh. §7 — every event is a REAL change observed between two
+/// *responded* snapshots (a peer joined/left, the build/farm verdict flipped,
+/// datacenter health or node health changed); an unchanged snapshot yields none, so
+/// the rail shows its honest empty state rather than a fabricated feed.
+pub(super) mod activity {
+    use super::{FrontDoorData, TileTone};
+
+    /// How many events the rail retains (newest-first). Bounds the history so a
+    /// long-running session never grows it without limit; older events scroll off.
+    pub const HISTORY_CAP: usize = 50;
+
+    /// What kind of change one event records. Drives the leading glyph
+    /// ([`ActivityKind::glyph`]); the Carbon tone the row reads is carried on the
+    /// [`ActivityEvent`] itself (the new state's own status tone for a metric
+    /// change, success/warning for a join/leave) so the colour stays honest (§4).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ActivityKind {
+        /// A peer appeared in the directory roster.
+        PeerJoined,
+        /// A peer dropped out of the directory roster.
+        PeerLeft,
+        /// The mesh online/total presence line changed.
+        Presence,
+        /// The node-health line changed (a node degraded / recovered).
+        NodeHealth,
+        /// The Build / Farm verdict changed (green ↔ building ↔ failing).
+        Build,
+        /// The DevOps in-flight farm-job line changed.
+        DevOps,
+        /// The datacenter Alerts line changed (a health check flipped).
+        Alerts,
+        /// The datacenter node count changed.
+        DataCenter,
+    }
+
+    impl ActivityKind {
+        /// The short leading marker drawn before the event text — a quiet bullet
+        /// vocabulary, not an emoji parade: a join `+`, a leave `−`, and a neutral
+        /// `•` for a status-line change (the tone carries its meaning in colour).
+        #[must_use]
+        pub fn glyph(self) -> &'static str {
+            match self {
+                ActivityKind::PeerJoined => "+",
+                ActivityKind::PeerLeft => "\u{2212}", // minus sign
+                _ => "\u{2022}",                      // bullet
+            }
+        }
+    }
+
+    /// One entry in the "what changed" rail: the [`ActivityKind`], the human one-line
+    /// summary, and the Carbon [`TileTone`] the row reads (§4 — resolved to a colour
+    /// via [`TileTone::color`], never a raw literal). Derived purely from a snapshot
+    /// delta; §7 — always a real observed change, never demo data.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ActivityEvent {
+        /// Which kind of change this is (drives the glyph).
+        pub kind: ActivityKind,
+        /// The one-line summary (e.g. "anvil joined the mesh", "build/farm: green").
+        pub text: String,
+        /// The tone the row reads — the new state's status tone for a metric change,
+        /// or success/warning for a join/leave.
+        pub tone: TileTone,
+    }
+
+    /// A minimal projection of one [`FrontDoorData`] snapshot — just what
+    /// [`derive_events`] needs to diff against the next one, so the rail never
+    /// retains a whole roster. Pure; built by [`Self::project`].
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct ActivitySnapshot {
+        /// The peer hostnames in the roster (sorted + deduped so set membership is
+        /// stable regardless of directory order), for join/leave detection.
+        pub peers: Vec<String>,
+        /// The scalar widget projections, carried as `(value, tone)` so a change in
+        /// EITHER the text or the status tone surfaces.
+        pub mesh_map: Option<(String, TileTone)>,
+        pub node_health: Option<(String, TileTone)>,
+        pub build_farm: Option<(String, TileTone)>,
+        pub dev_ops: Option<(String, TileTone)>,
+        pub alerts: Option<(String, TileTone)>,
+        pub data_center: Option<(String, TileTone)>,
+    }
+
+    impl ActivitySnapshot {
+        /// Project a snapshot down to the diff baseline. Pure — no Bus read (the
+        /// snapshot was already read off the bus by [`FrontDoorData::read`]).
+        #[must_use]
+        pub fn project(data: &FrontDoorData) -> Self {
+            let mut peers: Vec<String> = data.peers.iter().map(|p| p.hostname.clone()).collect();
+            peers.sort();
+            peers.dedup();
+            Self {
+                peers,
+                mesh_map: data.mesh_map.clone(),
+                node_health: data.node_health.clone(),
+                build_farm: data.build_farm.clone(),
+                dev_ops: data.dev_ops.clone(),
+                alerts: data.alerts.clone(),
+                data_center: data.data_center.clone(),
+            }
+        }
+    }
+
+    /// Push one scalar-projection transition when it changed AND lands on a real
+    /// value. A field clearing to `None` (its source simply dropped this round) is
+    /// NOT surfaced as a fabricated "changed" line (§7 — honest, no phantom event);
+    /// the tone is the NEW state's own status tone, so the row reads in the colour
+    /// of where the mesh now is.
+    fn push_scalar(
+        events: &mut Vec<ActivityEvent>,
+        kind: ActivityKind,
+        prev: &Option<(String, TileTone)>,
+        next: &Option<(String, TileTone)>,
+        label: &str,
+    ) {
+        if prev == next {
+            return;
+        }
+        if let Some((value, tone)) = next {
+            events.push(ActivityEvent {
+                kind,
+                text: format!("{label}: {value}"),
+                tone: *tone,
+            });
+        }
+    }
+
+    /// Derive the "what changed" events between two consecutive *responded*
+    /// snapshots, in a deterministic order (joins, then leaves, then the scalar
+    /// changes). Pure + Bus-free, so it is unit-tested directly. An identical pair
+    /// yields an empty `Vec` (the rail keeps its prior / empty state). The caller
+    /// only ever passes two responded snapshots — an absent-Bus round never reaches
+    /// here, so a transient no-leader read can't fabricate a "whole mesh left" storm.
+    #[must_use]
+    pub fn derive_events(prev: &ActivitySnapshot, next: &ActivitySnapshot) -> Vec<ActivityEvent> {
+        let mut events = Vec::new();
+
+        // ── Peer join / leave: a set difference on the (sorted) hostname rosters ──
+        for host in &next.peers {
+            if !prev.peers.contains(host) {
+                events.push(ActivityEvent {
+                    kind: ActivityKind::PeerJoined,
+                    text: format!("{host} joined the mesh"),
+                    tone: TileTone::Success,
+                });
+            }
+        }
+        for host in &prev.peers {
+            if !next.peers.contains(host) {
+                events.push(ActivityEvent {
+                    kind: ActivityKind::PeerLeft,
+                    text: format!("{host} left the mesh"),
+                    tone: TileTone::Warning,
+                });
+            }
+        }
+
+        // ── Scalar projection changes (the not-purely-push topics the 15s poll
+        //    backstops): each surfaces in the new state's own status tone. ──
+        push_scalar(
+            &mut events,
+            ActivityKind::Presence,
+            &prev.mesh_map,
+            &next.mesh_map,
+            "mesh presence",
+        );
+        push_scalar(
+            &mut events,
+            ActivityKind::NodeHealth,
+            &prev.node_health,
+            &next.node_health,
+            "node health",
+        );
+        push_scalar(
+            &mut events,
+            ActivityKind::Build,
+            &prev.build_farm,
+            &next.build_farm,
+            "build/farm",
+        );
+        push_scalar(
+            &mut events,
+            ActivityKind::DevOps,
+            &prev.dev_ops,
+            &next.dev_ops,
+            "farm jobs",
+        );
+        push_scalar(
+            &mut events,
+            ActivityKind::Alerts,
+            &prev.alerts,
+            &next.alerts,
+            "datacenter",
+        );
+        push_scalar(
+            &mut events,
+            ActivityKind::DataCenter,
+            &prev.data_center,
+            &next.data_center,
+            "datacenter nodes",
+        );
+
+        events
     }
 }
 
@@ -2941,6 +3163,20 @@ pub struct FrontDoor {
     /// preview only when no newer keystroke has superseded it (the input debounce
     /// — no per-key Bus read on the hot path).
     pub compact_gen: u64,
+    /// CTRLSURF-4 — the baseline projection of the LAST *responded* snapshot,
+    /// diffed against the next one to derive the Expand "what changed" events.
+    /// `None` until the first responded read; that first read only SEEDS the
+    /// baseline (it emits nothing — every peer/metric would otherwise look
+    /// brand-new). Only a responded snapshot updates it, so an absent-Bus round
+    /// never rebases it to empty (which would fabricate a "whole mesh left" storm
+    /// on the next read). §6/§7 — fed by the existing push + poll via [`Self::apply`].
+    pub activity_baseline: Option<activity::ActivitySnapshot>,
+    /// CTRLSURF-4 — the Expand "what changed" activity rail's history, newest-first,
+    /// capped at [`activity::HISTORY_CAP`]. Each entry is a REAL delta observed
+    /// between two responded snapshots (peer joined/left, build/alerts/health
+    /// changed — §7, no demo data). Empty until the first change lands; the rail
+    /// then shows its honest empty state rather than a fabricated feed.
+    pub activity: Vec<activity::ActivityEvent>,
 }
 
 impl Default for FrontDoor {
@@ -3031,6 +3267,11 @@ impl FrontDoor {
             // before its first real directory read); no command-line keystrokes yet.
             bus_responded: true,
             compact_gen: 0,
+            // CTRLSURF-4 — no activity baseline / history until the first responded
+            // snapshot lands (the first read seeds the baseline; the rail shows its
+            // honest empty state until a real change is observed — §7).
+            activity_baseline: None,
+            activity: Vec::new(),
         }
     }
 
@@ -4547,6 +4788,29 @@ impl FrontDoor {
         // the Compact glance shows the offline notice on a real no-Bus read rather
         // than a wall of resting rows (never a hang — §7).
         self.bus_responded = data.responded;
+
+        // CTRLSURF-4 — derive the Expand "what changed" events from this snapshot's
+        // delta vs the last responded baseline (this `apply` is the single fold-in
+        // point both the peers directory-changed push AND the 15s `poll_subscription`
+        // reach, via `Reload` → `load` → `Loaded` — §6, no new bus path). ONLY a
+        // responded read participates: a no-Bus / no-leader round is skipped so a
+        // transient outage never fabricates a join/leave storm, and the FIRST
+        // responded read merely seeds the baseline (every entry would otherwise look
+        // brand-new). §7 — real deltas only; an unchanged snapshot adds nothing.
+        if data.responded {
+            let next = activity::ActivitySnapshot::project(data);
+            if let Some(prev) = self.activity_baseline.as_ref() {
+                let mut events = activity::derive_events(prev, &next);
+                if !events.is_empty() {
+                    // Newest-first: this batch goes in front of the running history,
+                    // then the whole rail is capped so a long session stays bounded.
+                    events.append(&mut self.activity);
+                    events.truncate(activity::HISTORY_CAP);
+                    self.activity = events;
+                }
+            }
+            self.activity_baseline = Some(next);
+        }
     }
 
     /// FRONTDOOR-10 — the suggestions that concern the tile at index `i` (Q19),
@@ -5689,9 +5953,74 @@ impl FrontDoor {
     /// FRONTDOOR-2 — the Win10-Start two-pane view: a fixed left **rail** beside a
     /// right **pane** (the full-width omnibox above the FRONTDOOR-1 tile grid).
     fn panel_view(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
-        row![self.rail(palette), self.right_pane(palette)]
+        // CTRLSURF-4 — the Expand (full rail+grid) view gains a third companion
+        // column on the right: the "what changed" activity rail. Additive — the
+        // existing rail + grid panes are unchanged (the real Win10-Start window
+        // resize stays CTRLSURF-5).
+        row![
+            self.rail(palette),
+            self.right_pane(palette),
+            self.activity_rail(palette)
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
+    /// CTRLSURF-4 — the Expand "what changed" activity rail: a chronological,
+    /// newest-first list of mesh events derived from the live [`FrontDoorData`]
+    /// deltas (the peers directory-changed push + the 15s [`Self::poll_subscription`]
+    /// both fold in through [`Self::apply`] — §6, no new bus path). A fixed-width
+    /// right-hand companion to the rail + grid. When no change has been observed yet
+    /// it shows an HONEST empty state, never a fabricated feed (§7). Carbon chrome
+    /// via `mde-theme` tokens only (§4).
+    fn activity_rail(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
+        let sizes = FontSize::defaults();
+        let heading = text("What changed")
+            .size(TypeRole::Heading.size_in(sizes))
+            .colr(palette.text.into_cosmic_color());
+
+        let body: Element<'_, crate::Message, Theme> = if self.activity.is_empty() {
+            // Honest empty state (§7) — not a fake feed. Names the real sources so
+            // the operator reads "quiet", not "broken".
+            column![
+                text("No recent changes.")
+                    .size(TypeRole::Body.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+                text("Peer, farm, and datacenter events will appear here as they happen.")
+                    .size(TypeRole::Caption.size_in(sizes))
+                    .colr(palette.text_muted.into_cosmic_color()),
+            ]
+            .spacing(6)
             .width(Length::Fill)
+            .into()
+        } else {
+            let mut col = column![].spacing(8).width(Length::Fill);
+            for ev in &self.activity {
+                col = col.push(activity_event_row(ev, palette));
+            }
+            col.into()
+        };
+
+        let inner =
+            column![heading, Space::new().height(Length::Fixed(12.0)), body,].width(Length::Fill);
+
+        let scroller = scrollable(container(inner).padding(Padding::from([20u16, 16u16])))
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        container(scroller)
+            .width(Length::Fixed(ACTIVITY_RAIL_WIDTH))
             .height(Length::Fill)
+            .style(move |_t: &Theme| container::Style {
+                background: Some(Background::Color(palette.surface.into_cosmic_color())),
+                border: Border {
+                    color: palette.border.into_cosmic_color(),
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..container::Style::default()
+            })
             .into()
     }
 
@@ -8197,6 +8526,34 @@ fn compact_status_row<'a>(
     )
     .width(Length::Fill)
     .padding(Padding::from([6u16, 0u16]))
+    .into()
+}
+
+/// CTRLSURF-4 — one row in the Expand "what changed" activity rail: a tone-colored
+/// leading glyph (a join `+` / leave `−` / a neutral `•` for a status change)
+/// beside the event text. The glyph reads the §4 Carbon token the event carries
+/// (the new state's status colour, or success/warning for a join/leave) via
+/// [`TileTone::color`]; the text reads the primary text token. Tokens only (§4).
+fn activity_event_row<'a>(
+    ev: &activity::ActivityEvent,
+    palette: Palette,
+) -> Element<'a, crate::Message, Theme> {
+    let sizes = FontSize::defaults();
+    let glyph = text(ev.kind.glyph())
+        .size(TypeRole::Body.size_in(sizes))
+        .colr(ev.tone.color(&palette))
+        .width(Length::Fixed(ACTIVITY_GLYPH_WIDTH));
+    let label = text(ev.text.clone())
+        .size(TypeRole::Body.size_in(sizes))
+        .colr(palette.text.into_cosmic_color())
+        .width(Length::Fill);
+    container(
+        row![glyph, label]
+            .spacing(8)
+            .align_y(cosmic::iced::Alignment::Start),
+    )
+    .width(Length::Fill)
+    .padding(Padding::from([4u16, 0u16]))
     .into()
 }
 
@@ -11016,5 +11373,198 @@ mod tests {
             fd.mode = Mode::FullScreen;
             let _: Element<'_, crate::Message, Theme> = fd.view();
         });
+    }
+
+    // ── CTRLSURF-4: the Expand "what changed" activity rail ──────────────────
+
+    /// An `ActivitySnapshot` carrying just a peer roster (no scalar projections),
+    /// for exercising the join/leave diff in isolation.
+    fn snap_peers(hosts: &[&str]) -> activity::ActivitySnapshot {
+        let mut peers: Vec<String> = hosts.iter().map(|h| (*h).to_string()).collect();
+        peers.sort();
+        peers.dedup();
+        activity::ActivitySnapshot {
+            peers,
+            ..activity::ActivitySnapshot::default()
+        }
+    }
+
+    #[test]
+    fn derive_events_reports_peer_joins_and_leaves() {
+        use activity::ActivityKind;
+        // oak left, forge joined; anvil stays.
+        let events = activity::derive_events(
+            &snap_peers(&["anvil", "oak"]),
+            &snap_peers(&["anvil", "forge"]),
+        );
+        assert_eq!(events.len(), 2, "one join + one leave");
+        // Joins are emitted before leaves (deterministic batch order).
+        assert_eq!(events[0].kind, ActivityKind::PeerJoined);
+        assert_eq!(events[0].text, "forge joined the mesh");
+        assert_eq!(events[0].tone, TileTone::Success);
+        assert_eq!(events[1].kind, ActivityKind::PeerLeft);
+        assert_eq!(events[1].text, "oak left the mesh");
+        assert_eq!(events[1].tone, TileTone::Warning);
+    }
+
+    #[test]
+    fn derive_events_is_empty_for_an_identical_snapshot() {
+        // §7 — no change ⇒ no fabricated event (the rail keeps its prior/empty state).
+        let s = snap_peers(&["anvil", "oak"]);
+        assert!(activity::derive_events(&s, &s).is_empty());
+    }
+
+    #[test]
+    fn derive_events_reports_a_scalar_change_in_the_new_states_tone() {
+        use activity::{ActivityKind, ActivitySnapshot};
+        let prev = ActivitySnapshot {
+            build_farm: Some(("green".into(), TileTone::Success)),
+            ..ActivitySnapshot::default()
+        };
+        let next = ActivitySnapshot {
+            build_farm: Some(("failing".into(), TileTone::Danger)),
+            ..ActivitySnapshot::default()
+        };
+        let events = activity::derive_events(&prev, &next);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, ActivityKind::Build);
+        assert_eq!(events[0].text, "build/farm: failing");
+        // The row reads in the NEW state's status tone (here a red verdict), not a
+        // tone fixed by kind — so the colour stays honest.
+        assert_eq!(events[0].tone, TileTone::Danger);
+    }
+
+    #[test]
+    fn derive_events_does_not_fabricate_when_a_source_drops_to_none() {
+        // §7 — a projection clearing to None (its source simply went absent this
+        // round) is NOT surfaced as a phantom "changed" line.
+        use activity::ActivitySnapshot;
+        let prev = ActivitySnapshot {
+            alerts: Some(("2 alerts".into(), TileTone::Danger)),
+            ..ActivitySnapshot::default()
+        };
+        assert!(activity::derive_events(&prev, &ActivitySnapshot::default()).is_empty());
+    }
+
+    #[test]
+    fn project_sorts_dedups_peers_and_carries_the_scalars() {
+        let data = FrontDoorData {
+            peers: vec![
+                mesh_peer("oak", &[]),
+                mesh_peer("anvil", &[]),
+                mesh_peer("oak", &[]),
+            ],
+            build_farm: Some(("green".into(), TileTone::Success)),
+            responded: true,
+            ..FrontDoorData::default()
+        };
+        let snap = activity::ActivitySnapshot::project(&data);
+        assert_eq!(snap.peers, vec!["anvil".to_string(), "oak".to_string()]);
+        assert_eq!(
+            snap.build_farm,
+            Some(("green".to_string(), TileTone::Success))
+        );
+    }
+
+    #[test]
+    fn apply_seeds_a_baseline_then_records_real_deltas() {
+        let mut fd = FrontDoor::new();
+        // The first responded snapshot only SEEDS the baseline (no events — every
+        // peer/metric would otherwise look brand-new).
+        let _ = fd.update(Message::Loaded(Box::new(FrontDoorData {
+            peers: vec![mesh_peer("anvil", &[])],
+            responded: true,
+            ..FrontDoorData::default()
+        })));
+        assert!(fd.activity.is_empty(), "first responded read seeds only");
+        assert!(fd.activity_baseline.is_some());
+
+        // The second responded snapshot with a real change ⇒ exactly one event.
+        let _ = fd.update(Message::Loaded(Box::new(FrontDoorData {
+            peers: vec![mesh_peer("anvil", &[]), mesh_peer("oak", &[])],
+            responded: true,
+            ..FrontDoorData::default()
+        })));
+        assert_eq!(fd.activity.len(), 1);
+        assert_eq!(fd.activity[0].text, "oak joined the mesh");
+    }
+
+    #[test]
+    fn apply_skips_an_absent_bus_round_so_no_join_leave_storm() {
+        // §7 — a no-Bus / no-leader round (responded == false) never rebases the
+        // baseline, so a transient outage can't fabricate "everyone left/joined".
+        let mut fd = FrontDoor::new();
+        let real = FrontDoorData {
+            peers: vec![mesh_peer("anvil", &[]), mesh_peer("oak", &[])],
+            responded: true,
+            ..FrontDoorData::default()
+        };
+        let _ = fd.update(Message::Loaded(Box::new(real.clone())));
+        assert!(fd.activity.is_empty(), "first responded read seeds only");
+
+        // An absent-Bus round (empty roster, responded == false) is skipped.
+        let _ = fd.update(Message::Loaded(Box::new(FrontDoorData::default())));
+        assert!(fd.activity.is_empty(), "an absent-Bus round adds no events");
+
+        // The same roster returns: still no change vs the last RESPONDED baseline.
+        let _ = fd.update(Message::Loaded(Box::new(real)));
+        assert!(
+            fd.activity.is_empty(),
+            "no storm after the transient outage"
+        );
+    }
+
+    #[test]
+    fn activity_history_is_capped_newest_first() {
+        let mut fd = FrontDoor::new();
+        // Seed the baseline (no build verdict yet).
+        let _ = fd.update(Message::Loaded(Box::new(FrontDoorData {
+            responded: true,
+            ..FrontDoorData::default()
+        })));
+        // Each distinct verdict is one Build event; drive well past the cap.
+        for i in 0..(activity::HISTORY_CAP + 10) {
+            let tone = if i % 2 == 0 {
+                TileTone::Success
+            } else {
+                TileTone::Danger
+            };
+            let _ = fd.update(Message::Loaded(Box::new(FrontDoorData {
+                build_farm: Some((format!("verdict-{i}"), tone)),
+                responded: true,
+                ..FrontDoorData::default()
+            })));
+        }
+        assert_eq!(
+            fd.activity.len(),
+            activity::HISTORY_CAP,
+            "history is bounded"
+        );
+        // Newest-first: the most recent verdict sits at the front.
+        assert!(fd.activity[0]
+            .text
+            .contains(&format!("verdict-{}", activity::HISTORY_CAP + 9)));
+    }
+
+    #[test]
+    fn activity_rail_renders_empty_then_populated_in_panel_mode() {
+        let mut fd = FrontDoor::new();
+        fd.loading = false;
+        fd.mode = Mode::Panel;
+        // Empty: the honest empty state renders without panic.
+        let _: Element<'_, crate::Message, Theme> = fd.view();
+        // Populate via a real delta, then the rail renders the event rows.
+        let _ = fd.update(Message::Loaded(Box::new(FrontDoorData {
+            peers: vec![mesh_peer("anvil", &[])],
+            responded: true,
+            ..FrontDoorData::default()
+        })));
+        let _ = fd.update(Message::Loaded(Box::new(FrontDoorData {
+            peers: vec![mesh_peer("anvil", &[]), mesh_peer("oak", &[])],
+            responded: true,
+            ..FrontDoorData::default()
+        })));
+        assert_eq!(fd.activity.len(), 1);
+        let _: Element<'_, crate::Message, Theme> = fd.view();
     }
 }
