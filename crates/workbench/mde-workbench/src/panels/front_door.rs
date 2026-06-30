@@ -3362,6 +3362,132 @@ impl FrontDoor {
         })
     }
 
+    /// CTRLSURF-3 — is the resting / searching Front Door home the foreground, so
+    /// the whole-home keyboard nav ([`home_key_subscription`]) should drive it?
+    /// `false` while an overlay owns the pane — the launcher, the in-menu Settings,
+    /// the Pending confirm gate, or an open tile detail — since each carries its own
+    /// controls and the home keys must not fight them (§7 — no two handlers on one
+    /// key). Mirrors the `view()` overlay ordering (Settings → Pending → detail →
+    /// launcher → the home grid).
+    #[must_use]
+    pub fn home_keys_active(&self) -> bool {
+        !self.launcher.open && !self.show_settings && !self.show_pending && self.detail.is_none()
+    }
+
+    /// CTRLSURF-3 — the rail's keyboard-reachable section routes, in render order
+    /// `(label, emphasized, route)`. [`rail`](Self::rail) renders this exact set and
+    /// CTRLSURF-3's `Ctrl+1..5` number-jump indexes it, so the visible rail and the
+    /// keyboard jump share ONE source and can never drift (§6/§7 — glue, one truth).
+    /// Every route is a REAL existing message `App::update` already handles (a
+    /// `SelectPanel` router hop, or the Front Door's own Settings panel). The rail's
+    /// Lock toggle is deliberately NOT here — it is a stateful toggle, not a section,
+    /// so it has no number-jump slot (only `1..5` are bound).
+    fn rail_nav_targets() -> [(&'static str, bool, crate::Message); 5] {
+        [
+            (
+                "DevOps",
+                true,
+                crate::Message::SelectPanel {
+                    group: Group::Provisioning,
+                    panel: "build-farm",
+                },
+            ),
+            (
+                "Data Center",
+                true,
+                crate::Message::SelectPanel {
+                    group: Group::Provisioning,
+                    panel: "datacenter",
+                },
+            ),
+            (
+                "Peers",
+                false,
+                crate::Message::SelectPanel {
+                    group: Group::Mesh,
+                    panel: "peers",
+                },
+            ),
+            (
+                "Mesh Bus",
+                false,
+                crate::Message::SelectPanel {
+                    group: Group::Mesh,
+                    panel: "mesh_bus",
+                },
+            ),
+            (
+                "Settings",
+                false,
+                crate::Message::FrontDoor(Message::OpenSettings),
+            ),
+        ]
+    }
+
+    /// CTRLSURF-3 — the pure home-keyboard map (Phase 2: whole-home keyboard nav).
+    /// Promotes the launcher's keyboard-first nav to the resting / searching Front
+    /// Door home so a keyboard-first operator drives it with the launcher CLOSED.
+    /// Pure + total over the bound keys, so the mapping is unit-tested without an
+    /// event loop ([`home_key_subscription`] is a thin shell over it). Every arm
+    /// returns a REAL existing message `App::update` already handles (§6/§7 — glue,
+    /// no parallel nav system):
+    /// * `Esc` clears the omnibox search back to the resting grid.
+    /// * `Up`/`Down`/`Tab` summon the launcher — the home's keyboard-navigable
+    ///   surface, where the existing [`launcher_key_subscription`] then highlights
+    ///   (`Up`/`Down`), cycles its sections (`Tab`), and commits (`Enter`). This is
+    ///   the literal "promote launcher nav to the home": a nav keypress brings up the
+    ///   navigable surface. The subscription only registers while the launcher is
+    ///   CLOSED, so `ToggleLauncher` always opens it.
+    /// * `Ctrl+1..5` jump straight to the rail's section routes ([`rail_nav_targets`]).
+    ///
+    /// `Enter` is the omnibox's own `on_submit` (it needs the live top hit), so it is
+    /// handled at the widget, not here. Unmatched keys return `None` and fall through
+    /// to the focused omnibox text input.
+    fn home_key_message(key: &cosmic::iced::keyboard::Key, ctrl: bool) -> Option<crate::Message> {
+        use cosmic::iced::keyboard::{key::Named, Key};
+        let fd = |m: Message| crate::Message::FrontDoor(m);
+        // Ctrl+1..5 — number-jump to a rail section route (the rail's own set).
+        if ctrl {
+            if let Key::Character(c) = key.as_ref() {
+                if let Some(n) = c.chars().next().and_then(|ch| ch.to_digit(10)) {
+                    let targets = Self::rail_nav_targets();
+                    if n >= 1 && (n as usize) <= targets.len() {
+                        return Some(targets[(n - 1) as usize].2.clone());
+                    }
+                }
+            }
+            return None;
+        }
+        match key.as_ref() {
+            Key::Named(Named::Escape) => Some(fd(Message::OmniboxChanged(String::new()))),
+            Key::Named(Named::ArrowDown | Named::ArrowUp | Named::Tab) => {
+                Some(fd(Message::ToggleLauncher))
+            }
+            _ => None,
+        }
+    }
+
+    /// CTRLSURF-3 — the whole-home keyboard subscription (design Phase 2). The
+    /// companion to [`launcher_key_subscription`]: registered by `App::subscription`
+    /// while the Front Door home is the active view AND the launcher is CLOSED (and
+    /// no overlay owns the pane — [`home_keys_active`](Self::home_keys_active)), so a
+    /// keyboard-first operator drives the home without the mouse. A thin shell over
+    /// the pure [`home_key_message`](Self::home_key_message) map — it filters the raw
+    /// key-event stream (the fork's facade has no `on_key_press`; the mde-files
+    /// pattern) and emits the mapped REAL message. `Enter` is the omnibox's own
+    /// `on_submit`, so it is not handled here; unmatched keys fall through to the
+    /// focused omnibox.
+    pub fn home_key_subscription() -> Subscription<crate::Message> {
+        cosmic::iced::event::listen_with(|event, _status, _window| {
+            use cosmic::iced::keyboard::Event as Kbd;
+            let cosmic::iced::Event::Keyboard(Kbd::KeyPressed { key, modifiers, .. }) = event
+            else {
+                return None;
+            };
+            Self::home_key_message(&key, modifiers.command())
+        })
+    }
+
     /// FRONTDOOR-2/3/4 — fold a Front Door message into local state. The FD-2/3
     /// variants (omnibox text; the panel ↔ full-screen flip) are pure local
     /// edits with no follow-up; FRONTDOOR-4's [`Message::Reload`] kicks off the
@@ -5576,12 +5702,20 @@ impl FrontDoor {
     /// rounded icons, more columns); it scrolls rather than paging (the accepted
     /// first cut — see the module note).
     fn fullscreen_view(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
-        let omnibox: Element<'_, crate::Message, Theme> =
+        let mut omnibox_input =
             text_input("Search apps, files, mesh, or ask Copilot…", &self.query)
                 .on_input(|s| crate::Message::FrontDoor(Message::OmniboxChanged(s)))
                 .padding(Padding::from([10u16, 14u16]))
-                .width(Length::Fill)
-                .into();
+                .width(Length::Fill);
+        // CTRLSURF-3 — Enter commits the top-ranked local hit (the same
+        // `SearchHitActivated` a click fires), armed only when a hit exists (§7 —
+        // never an inert submit). Mirrors the panel-mode omnibox + the Compact line.
+        if let Some(top) = self.results.first() {
+            omnibox_input = omnibox_input.on_submit(crate::Message::FrontDoor(
+                Message::SearchHitActivated(Box::new(top.message.clone())),
+            ));
+        }
+        let omnibox: Element<'_, crate::Message, Theme> = omnibox_input.into();
 
         // Top bar: the omnibox stretches; the FD-11 pending indicator + the FD-14
         // settings / lock toggles + the mode toggle sit at its right. In full-screen
@@ -5661,69 +5795,39 @@ impl FrontDoor {
         ]
         .spacing(2);
 
-        // Pinned — the launchers that have a real route today. Each entry
-        // navigates somewhere real (§7); we don't list a pin we can't open yet.
+        // CTRLSURF-3 — the rail's section links + CTRLSURF-3's `Ctrl+1..5`
+        // number-jump share ONE ordered source ([`rail_nav_targets`]), so the
+        // visible rail and the keyboard jump can never drift (§6/§7). Order:
+        // Surfaces (1,2), Pinned (3,4), Front Door's Settings (5). Each route is
+        // real (§7 — we don't list a destination we can't open).
+        let [t_devops, t_datacenter, t_peers, t_mesh_bus, t_settings] = Self::rail_nav_targets();
+
+        // Pinned — the launchers that have a real route today.
         let pinned = column![
             rail_section_label("Pinned", palette),
-            rail_link(
-                "Peers",
-                crate::Message::SelectPanel {
-                    group: Group::Mesh,
-                    panel: "peers",
-                },
-                palette,
-                false,
-            ),
-            rail_link(
-                "Mesh Bus",
-                crate::Message::SelectPanel {
-                    group: Group::Mesh,
-                    panel: "mesh_bus",
-                },
-                palette,
-                false,
-            ),
+            rail_link(t_peers.0, t_peers.2, palette, t_peers.1),
+            rail_link(t_mesh_bus.0, t_mesh_bus.2, palette, t_mesh_bus.1),
         ]
         .spacing(4);
 
         // The predominant surfaces (the brief: DevOps + Data Center front-and-
-        // center). Rendered as accent-emphasized rail links that navigate to the
-        // real `build-farm` / `datacenter` panel routes (§7).
+        // center) — accent-emphasized links to the real `build-farm` / `datacenter`
+        // panel routes (§7).
         let surfaces = column![
             rail_section_label("Surfaces", palette),
-            rail_link(
-                "DevOps",
-                crate::Message::SelectPanel {
-                    group: Group::Provisioning,
-                    panel: "build-farm",
-                },
-                palette,
-                true,
-            ),
-            rail_link(
-                "Data Center",
-                crate::Message::SelectPanel {
-                    group: Group::Provisioning,
-                    panel: "datacenter",
-                },
-                palette,
-                true,
-            ),
+            rail_link(t_devops.0, t_devops.2, palette, t_devops.1),
+            rail_link(t_datacenter.0, t_datacenter.2, palette, t_datacenter.1),
         ]
         .spacing(4);
 
         // FRONTDOOR-14 — the Front Door's own controls at the foot of the rail
         // (Q48 in-menu settings, Q91 lock): a Settings entry opening the in-menu
         // panel, and a lock toggle gating the action affordances. Both are REAL
-        // (§7 — wired to live messages, no dead buttons).
+        // (§7 — wired to live messages, no dead buttons). Lock is rail-only (not a
+        // number-jump section — it is a stateful toggle, not a route).
         let system = column![
             rail_section_label("Front Door", palette),
-            rail_link(
-                "Settings",
-                crate::Message::FrontDoor(Message::OpenSettings),
-                palette,
-                false,
-            ),
+            rail_link(t_settings.0, t_settings.2, palette, t_settings.1),
             rail_link(
                 self.lock_label(),
                 crate::Message::FrontDoor(Message::ToggleLock),
@@ -5768,12 +5872,20 @@ impl FrontDoor {
     /// search is FRONTDOOR-6) and the FRONTDOOR-3 full-screen toggle in the top
     /// bar, above the FRONTDOOR-1 canvas tile grid.
     fn right_pane(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
-        let omnibox: Element<'_, crate::Message, Theme> =
+        let mut omnibox_input =
             text_input("Search apps, files, mesh, or ask Copilot…", &self.query)
                 .on_input(|s| crate::Message::FrontDoor(Message::OmniboxChanged(s)))
                 .padding(Padding::from([10u16, 14u16]))
-                .width(Length::Fill)
-                .into();
+                .width(Length::Fill);
+        // CTRLSURF-3 — Enter commits the top-ranked local hit (the default keyboard
+        // focus), the same `SearchHitActivated` a click fires; armed only when a hit
+        // exists (§7 — never an inert submit). Mirrors the Compact command line.
+        if let Some(top) = self.results.first() {
+            omnibox_input = omnibox_input.on_submit(crate::Message::FrontDoor(
+                Message::SearchHitActivated(Box::new(top.message.clone())),
+            ));
+        }
+        let omnibox: Element<'_, crate::Message, Theme> = omnibox_input.into();
 
         // FRONTDOOR-11 — the pending indicator sits between the omnibox and the
         // mode toggle, surfacing the queued-proposals count + opening the gate.
@@ -8460,6 +8572,96 @@ impl canvas::Program<crate::Message> for TileGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ───────────────────────── CTRLSURF-3 — whole-home keyboard nav ─────────────
+
+    #[test]
+    fn rail_nav_targets_are_the_real_section_routes() {
+        // CTRLSURF-3 — the Ctrl+1..5 number-jump set is the rail's own ordered set;
+        // each is a REAL route App::update handles (§7 — no dead jump). Match by
+        // reference (the messages are not Copy).
+        let targets = FrontDoor::rail_nav_targets();
+        assert_eq!(targets.len(), 5, "only 1..5 are bound");
+        let route = |i: usize| match &targets[i].2 {
+            crate::Message::SelectPanel { panel, .. } => *panel,
+            crate::Message::FrontDoor(Message::OpenSettings) => "settings",
+            _ => "?",
+        };
+        assert_eq!(route(0), "build-farm", "Ctrl+1 → DevOps");
+        assert_eq!(route(1), "datacenter", "Ctrl+2 → Data Center");
+        assert_eq!(route(2), "peers", "Ctrl+3 → Peers");
+        assert_eq!(route(3), "mesh_bus", "Ctrl+4 → Mesh Bus");
+        assert_eq!(route(4), "settings", "Ctrl+5 → Settings");
+    }
+
+    #[test]
+    fn home_keys_map_to_real_messages() {
+        use cosmic::iced::keyboard::{key::Named, Key};
+        // Esc clears the omnibox search (back to the resting grid).
+        assert!(
+            matches!(
+                FrontDoor::home_key_message(&Key::Named(Named::Escape), false),
+                Some(crate::Message::FrontDoor(Message::OmniboxChanged(ref q))) if q.is_empty()
+            ),
+            "Esc clears the search"
+        );
+        // Up / Down / Tab summon the keyboard-navigable launcher.
+        for named in [Named::ArrowDown, Named::ArrowUp, Named::Tab] {
+            assert!(
+                matches!(
+                    FrontDoor::home_key_message(&Key::Named(named), false),
+                    Some(crate::Message::FrontDoor(Message::ToggleLauncher))
+                ),
+                "{named:?} summons the launcher"
+            );
+        }
+        // Ctrl+1 jumps to the first rail route (DevOps → build-farm); Ctrl+5 → Settings.
+        assert!(
+            matches!(
+                FrontDoor::home_key_message(&Key::Character("1".into()), true),
+                Some(crate::Message::SelectPanel {
+                    panel: "build-farm",
+                    ..
+                })
+            ),
+            "Ctrl+1 → DevOps route"
+        );
+        assert!(
+            matches!(
+                FrontDoor::home_key_message(&Key::Character("5".into()), true),
+                Some(crate::Message::FrontDoor(Message::OpenSettings))
+            ),
+            "Ctrl+5 → Settings"
+        );
+        // Ctrl+6 is out of range, Ctrl+letter is not a number-jump, and a plain
+        // character falls through to the focused omnibox — none of these bind.
+        assert!(FrontDoor::home_key_message(&Key::Character("6".into()), true).is_none());
+        assert!(FrontDoor::home_key_message(&Key::Character("x".into()), true).is_none());
+        assert!(FrontDoor::home_key_message(&Key::Character("a".into()), false).is_none());
+    }
+
+    #[test]
+    fn home_keys_active_only_when_no_overlay_owns_the_pane() {
+        // CTRLSURF-3 — the whole-home keys drive ONLY the resting / searching home;
+        // any overlay (launcher / Settings / Pending / detail) suppresses them so two
+        // handlers never fight one key (§7).
+        let mut fd = FrontDoor::new();
+        assert!(
+            fd.home_keys_active(),
+            "the resting home drives the keyboard"
+        );
+        fd.launcher.open = true;
+        assert!(!fd.home_keys_active(), "the launcher owns its own keys");
+        fd.launcher.open = false;
+        fd.show_settings = true;
+        assert!(!fd.home_keys_active(), "Settings owns the pane");
+        fd.show_settings = false;
+        fd.show_pending = true;
+        assert!(!fd.home_keys_active(), "the Pending gate owns the pane");
+        fd.show_pending = false;
+        fd.detail = Some(0);
+        assert!(!fd.home_keys_active(), "an open tile detail owns the pane");
+    }
 
     #[test]
     fn new_seeds_the_design_widget_set() {
