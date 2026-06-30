@@ -91,8 +91,15 @@ user). Secrets are **off-repo** — see "Credentials" below.
 | `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 | 4c / 24 GiB | hypervisor — build VM `mcnf-build-50` (172.20.0.50, 4 vCPU/16 GiB); local SR is `ext` ("Local storage") |
 | `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 | 4c / 23 GiB | hypervisor — build VM `mcnf-build-51` (172.20.0.90, 4 vCPU/16 GiB) |
 | `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 | **12c / 32 GiB** | hypervisor — build VM `mcnf-build-52` (172.20.0.130, **8 vCPU/24 GiB**); 398 GiB SR; the high-capacity node (room for several more build VMs) |
+| `XEN-194` | `172.20.145.194` | XCP-ng 8.3 dom0 | 4c | hypervisor — build VM `mcnf-build-53` (172.20.0.170, lane .170–.200); the **4th dom0** (declared in `infra/tofu/xen-xapi`, the canonical root) |
 
-> ⚠️ **Build-VM IPs follow a per-dom0 lane** (`infra/tofu/main.tf`): XEN-HOME-SERVICES → `.50–.80`, KVM-XCP1 → `.90–.120`, XEN-BIGBOY → `.130–.160`. The VM **names** `mcnf-build-50/51/52` are legacy and do **not** equal the IP octet — `mcnf-build-51` is **172.20.0.90**, `mcnf-build-52` is **172.20.0.130**. The real farm is **.50 / .90 / .130**; there are no live `.51`/`.52` IPs (probing them gives "No route to host"). The `/ship` skill's topology table still shows the stale `.50/.51/.52` and should be corrected too (operator-gated — it's skill config).
+> **Do not memorize this list — derive it.** The live, tofu-derived farm inventory is
+> one command: **`install-helpers/farm-inventory.sh topology`** (human table + live
+> reachability + free slots + drift) and `… fleet` (machine-readable). It reads the
+> canonical `infra/tofu/xen-xapi` root, so a fresh context never trusts a stale copy.
+> `… discover <range>` sweeps the LAN for XCP-ng dom0s and reconciles against tofu.
+
+> ⚠️ **Build-VM IPs follow a per-dom0 lane** (`infra/tofu/xen-xapi/build-vms.tf`): XEN-HOME-SERVICES → `.50–.80`, KVM-XCP1 → `.90–.120`, XEN-BIGBOY → `.130–.160`, XEN-194 → `.170–.200`. The VM **names** `mcnf-build-50/51/52/53` are legacy and do **not** equal the IP octet — `mcnf-build-51` is **172.20.0.90**, `mcnf-build-52` is **172.20.0.130**, `mcnf-build-53` is **172.20.0.170**. The real farm is **.50 / .90 / .130 / .170**; there are no live `.51`/`.52` IPs (probing them gives "No route to host"). All consumers (`farm.sh`, `drain-coordinator.sh`, the `/ship` + `/polish` skills) now derive this from `farm-inventory.sh` (tofu) rather than embedding it.
 
 ### Credentials (locations only — never in-repo)
 - **Mesh SSH key:** `~/.ssh/mackes_mesh_ed25519` (+ `.pub`) — dom0s + build-VM `mm`.

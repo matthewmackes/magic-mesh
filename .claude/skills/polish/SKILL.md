@@ -92,22 +92,28 @@ units stay file-disjoint and the farm parallelizes cleanly:
     never updates is half-built (§7). Wire the live data, finish the interaction,
     remove the "coming soon".
 
-## The farm (exact topology — know it cold)
+## The farm (topology is tofu-derived — never memorize it)
 
-Three Xen build VMs, all **Fedora 42**, user `mm`, key
-`/root/.ssh/mackes_mesh_ed25519`, **shared sccache** (`RUSTC_WRAPPER=sccache`):
+Run **`install-helpers/farm-inventory.sh topology`** for the live, authoritative
+farm (canonical `infra/tofu/xen-xapi` root — hosts, build VMs, free slots, drift);
+`… fleet` is the machine-readable form. Do NOT hardcode IPs here. All VMs are
+**Fedora 42**, user `mm`, key `/root/.ssh/mackes_mesh_ed25519`, **shared sccache**.
+
+The current 4-dom0 reality (snapshot — confirm with the command above):
 
 | Host | VM | IP | vCPU / RAM | SAFE heavy slots |
 |---|---|---|---|---|
 | **XEN-BIGBOY** | `mcnf-build-52` | `172.20.0.130` | 8 / 24 GB | **3** |
 | KVM-XCP1 | `mcnf-build-51` | `172.20.0.90` | 4 / 16 GB | **2** |
 | XEN-HOME-SERVICES | `mcnf-build-50` | `172.20.0.50` | 4 / 16 GB | **2** |
+| XEN-194 | `mcnf-build-53` | `172.20.0.170` | 4 / 11 GB | **2** |
 
 > ⚠️ **VM names are legacy and do NOT equal the IP octet** (`docs/BUILD-ENVIRONMENT.md`):
-> `mcnf-build-51`=**.90**, `mcnf-build-52`=**.130**. The real farm is **.50 / .90 /
-> .130**; probing `.51`/`.52` gives "No route to host" (not a node-down alarm).
+> `mcnf-build-51`=**.90**, `mcnf-build-52`=**.130**, `mcnf-build-53`=**.170**. The real farm is
+> **.50 / .90 / .130 / .170**; probing `.51`/`.52` gives "No route to host" (not a node-down alarm).
 
-**Total = 7 concurrent heavy (cosmic/iced) build slots, spread 3 + 2 + 2.** The
+**Total = 9 concurrent heavy build slots, spread 3 + 2 + 2 + 2** (plus elastic
+small×N + pods per dom0 — see FARM-AUTOSCALE). The
 GUI crates ride libcosmic's vendored iced fork — a cosmic/iced compile is a
 *heavy* slot (~1 hr cold). That slowness is exactly why this work must go to the
 farm and never grind locally (`/no-flinch` rule 4: fix the loop, don't avoid it).

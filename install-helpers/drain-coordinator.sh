@@ -11,10 +11,13 @@
 #   3. next [N]   — list the next N open, UNBLOCKED worklist units to dispatch
 #   4. plan [N]   — all of the above = the tick's dispatch plan
 #
-# Real farm topology (NOT the stale .50/.51/.52 — see docs/BUILD-ENVIRONMENT.md §3):
-#   .50  XEN-HOME-SERVICES / mcnf-build-50   4 vCPU  cap 2
-#   .90  KVM-XCP1          / mcnf-build-51   4 vCPU  cap 2
-#   .130 XEN-BIGBOY        / mcnf-build-52   8 vCPU  cap 3   => 7 heavy slots total
+# Farm topology is DERIVED from the single tofu source (farm-inventory.sh) — never
+# hardcoded, so it can't drift (this was a stale 3-node/"7 slots" table that missed
+# xen-194). The live 4-dom0 reality (docs/BUILD-ENVIRONMENT.md §3):
+#   .50  XEN-HOME-SERVICES / mcnf-build-50   3 vCPU  cap 2
+#   .90  KVM-XCP1          / mcnf-build-51   3 vCPU  cap 2
+#   .130 XEN-BIGBOY        / mcnf-build-52  10 vCPU  cap 3
+#   .170 XEN-194           / mcnf-build-53   3 vCPU  cap 2   => 9 heavy slots total
 #
 # A node that is unreachable is reported down (0 free) and the tick continues — the
 # coordinator never stalls on one node (park-don't-stall ethos, DRAIN-5).
@@ -26,10 +29,21 @@ WORKLIST="${MCNF_WORKLIST:-$ROOT/docs/WORKLIST.md}"
 KEY="${MCNF_FARM_KEY:-/root/.ssh/mackes_mesh_ed25519}"
 SSH_USER="${MCNF_FARM_USER:-mm}"
 
-# parallel arrays: node octet / dom0+VM name / heavy-build cap
-NODES=(50 90 130)
-NAMES=("XEN-HOME-SERVICES/mcnf-build-50" "KVM-XCP1/mcnf-build-51" "XEN-BIGBOY/mcnf-build-52")
-CAPS=(2 2 3)
+# parallel arrays: node octet / dom0 label+build-VM / heavy-build cap — DERIVED from
+# the single tofu source (farm-inventory.sh fleet: host|label|buildvm_ip|vcpus|cap).
+NODES=(); NAMES=(); CAPS=()
+if [ -x "$HERE/farm-inventory.sh" ]; then
+  while IFS='|' read -r _hostip _label _vmip _vcpus _cap; do
+    [ -n "$_vmip" ] || continue
+    NODES+=("${_vmip##*.}"); NAMES+=("$_label/$_vmip"); CAPS+=("${_cap:-2}")
+  done < <("$HERE/farm-inventory.sh" fleet)
+fi
+# Fallback if the tool is missing: the correct 4-dom0 reality (.50/.90/.130/.170).
+if [ "${#NODES[@]}" -eq 0 ]; then
+  NODES=(50 90 130 170)
+  NAMES=("XEN-HOME-SERVICES/.50" "KVM-XCP1/.90" "XEN-BIGBOY/.130" "XEN-194/.170")
+  CAPS=(2 2 3 2)
+fi
 
 farm_ssh() { timeout 14 ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=8 \
   -o StrictHostKeyChecking=accept-new "$SSH_USER@172.20.0.$1" "$2" 2>/dev/null; }

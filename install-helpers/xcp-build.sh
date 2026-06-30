@@ -20,7 +20,7 @@
 #   xcp-build.sh route <cargo args>   print the shape-routed host + reason (dry; no sync/build)
 #   xcp-build.sh --route-test         run the routing self-test (offline; no farm contact)
 #
-# Env overrides: MCNF_BUILD_HOST (172.20.0.52), MCNF_BUILD_USER (mm),
+# Env overrides: MCNF_BUILD_HOST (e.g. 172.20.0.130 = BigBoy), MCNF_BUILD_USER (mm),
 #   MCNF_BUILD_SLOT (unset) — an isolated remote workspace+target on the SAME host
 #   so multiple concurrent jobs run without colliding (scale workloads per node:
 #   e.g. BigBoy's 12c/24G hosts 2-3 parallel builds). slot "2" → ~/magic-mesh-2.
@@ -200,11 +200,12 @@ dom0_shape() {
 # No I/O — given the same text it always yields the same records (self-testable).
 topology_from_tfvars() {
   local text="$1" dk shape n base i ip
-  for dk in xen-bigboy xen-home-services kvm-xcp1; do
+  for dk in xen-bigboy xen-home-services kvm-xcp1 xen-194; do
     case "$dk" in
       xen-bigboy)        base="172.20.0.130" ;;
       xen-home-services) base="172.20.0.50" ;;
       kvm-xcp1)          base="172.20.0.90" ;;
+      xen-194)           base="172.20.0.170" ;;
     esac
     shape="$(dom0_shape "$text" "$dk")"
     case "$shape" in

@@ -13,10 +13,14 @@
 #
 # Architecture + the recovery playbook: docs/farm.md.
 #
-# Fleet (override via env or ~/.config/mcnf-farm.conf — `dom0_ip|label|buildvm_ip`):
+# Fleet (single source of truth = tofu, via farm-inventory.sh; override with
+# ~/.config/mcnf-farm.conf, one `dom0_ip|label|buildvm_ip` per line):
 #   172.20.145.192  the dev/orchestration host (this box; local builds + podman)
 #   172.20.0.9      XEN-HOME-SERVICES  → build VM 172.20.0.50
-#   172.20.145.193  KVM-XCP1           → build VM 172.20.0.51
+#   172.20.145.193  KVM-XCP1           → build VM 172.20.0.90
+#   172.20.145.165  XEN-BIGBOY         → build VM 172.20.0.130
+#   172.20.145.194  XEN-194            → build VM 172.20.0.170
+#   (run `farm-inventory.sh topology` for the live, tofu-derived inventory.)
 #
 # Usage:
 #   farm.sh status                  fleet state (dom0 reachable · VMs · build VM up + toolchained)
@@ -36,9 +40,19 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 KEY="${MCNF_FARM_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
 CONF="${MCNF_FARM_CONF:-$HOME/.config/mcnf-farm.conf}"
 
-# Default fleet; a conf file (one `dom0_ip|label|buildvm_ip` per line) overrides.
-FLEET_DEFAULT=$'172.20.0.9|XEN-HOME-SERVICES|172.20.0.50\n172.20.145.193|KVM-XCP1|172.20.0.51\n172.20.145.165|XEN-BIGBOY|172.20.0.52'
-fleet() { [ -f "$CONF" ] && grep -vE '^\s*(#|$)' "$CONF" || printf '%s\n' "$FLEET_DEFAULT"; }
+# Fleet — single source of truth = tofu, read via farm-inventory.sh. A conf file
+# (one `dom0_ip|label|buildvm_ip` per line) overrides; the literal below is only a
+# last-resort fallback if farm-inventory.sh is absent, and it is the CORRECT 4-dom0
+# reality (.50/.90/.130/.170 — NOT the old dead .51/.52).
+FLEET_DEFAULT=$'172.20.0.9|XEN-HOME-SERVICES|172.20.0.50\n172.20.145.193|KVM-XCP1|172.20.0.90\n172.20.145.165|XEN-BIGBOY|172.20.0.130\n172.20.145.194|XEN-194|172.20.0.170'
+fleet() {
+  [ -f "$CONF" ] && { grep -vE '^\s*(#|$)' "$CONF"; return; }
+  if [ -x "$HERE/farm-inventory.sh" ]; then
+    "$HERE/farm-inventory.sh" fleet | cut -d'|' -f1-3
+  else
+    printf '%s\n' "$FLEET_DEFAULT"
+  fi
+}
 
 SSHK=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=12)
 log()  { echo "==> farm: $*"; }

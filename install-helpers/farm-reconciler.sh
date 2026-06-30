@@ -182,10 +182,15 @@ ORDER=("xen-bigboy" "xen-home-services" "kvm-xcp1")
 # few cheap TCP checks; xcp-build.sh::topology_from_tfvars owns the authoritative
 # IP math for ROUTING (this is only a liveness probe, so a superset is safe).
 declare -A DOM0_IPS=(
-  ["xen-bigboy"]="172.20.0.130 172.20.0.140 172.20.0.150 172.20.0.160 172.20.0.52"
+  ["xen-bigboy"]="172.20.0.130 172.20.0.140 172.20.0.150 172.20.0.160"
   ["xen-home-services"]="172.20.0.50 172.20.0.60 172.20.0.70 172.20.0.80"
-  ["kvm-xcp1"]="172.20.0.90 172.20.0.100 172.20.0.110 172.20.0.120 172.20.0.51"
+  ["kvm-xcp1"]="172.20.0.90 172.20.0.100 172.20.0.110 172.20.0.120"
 )
+# NOTE (xen-194 follow-up): the 4th dom0 (172.20.145.194 → build VM .170, lane
+# .170–.200) is declared in infra/tofu/xen-xapi but NOT yet elastic-managed here —
+# wiring it needs a matching `--x194` shape flag in farm-autoscale.sh + the DOM0_*
+# maps below. Do that on the host with live verification (see
+# docs/ops/farm-inventory-validate.md). The dead .51/.52 probe IPs were removed.
 # dom0 → its hypervisor (dom0) host, for the inter-job snapshot-revert (the dom0
 # runs `xe`). Cold facts from install-helpers/farm.sh's fleet + main.tf pool names.
 declare -A DOM0_HOST=(

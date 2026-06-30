@@ -102,10 +102,11 @@ should now report the new count. Then `tofu plan` to converge.
 **4b. A declared build VM is down:** `XCP_PASS=… ./install-helpers/farm.sh up`
 (idempotent: keys the dom0, provisions/boots the VM, installs the toolchain).
 
-## Step 5 — Finish the de-hardcoding (point every straggler at the one source)
+## Step 5 — De-hardcoding (ALREADY APPLIED on this branch — just verify)
 
-Make these edits, then verify (Step 6). Each replaces a hardcoded/stale copy with a
-read of `farm-inventory.sh`:
+These edits were pre-applied on `claude/cosmic-magic-mesh-egui-hs4n8j` (so a fresh
+context can't drift). **Do not redo them — confirm they're present** (Step 6's grep
+does this). Listed here as the record of what changed:
 
 1. **`install-helpers/farm.sh`** — replace the stale `FLEET_DEFAULT` (`.50/.51/.52`)
    and `fleet()` so the fleet comes from the inventory tool:
@@ -139,6 +140,25 @@ read of `farm-inventory.sh`:
    *"Farm topology is tofu-derived — run `install-helpers/farm-inventory.sh topology`
    (and `… fleet` for machine-readable). Do not hardcode IPs here."* *(Operator-gated
    skill config — make the edit, it's authorized by this runbook.)*
+
+## Step 5b — Follow-up: make xen-194 elastic (host-side, needs live verification)
+
+`xen-194` (the 4th dom0) is now in the **declared/probed** topology everywhere, but
+it is **not yet elastic-managed** by the autoscaler — `farm-autoscale.sh` has flags
+`--bigboy/--home/--xcp1` but no `--x194`, and `farm-reconciler.sh`'s `DOM0_*` maps
+(HOST/BIG_NAME/SMALL_NAME/FLAG) still list only 3 dom0s. To actually *use* xen-194's
+elastic small×N + pod capacity (not just its single fixed build VM):
+
+1. Add a `--x194` shape flag to `install-helpers/farm-autoscale.sh` (mirror `--xcp1`),
+   and the `xen-194` shape→VM logic.
+2. Add `xen-194` to `farm-reconciler.sh`'s `DOM0_HOST` (`172.20.145.194`),
+   `DOM0_BIG_NAME` (`mcnf-build-big-53`), `DOM0_SMALL_NAME` (`mcnf-build-53`),
+   `DOM0_FLAG` (`--x194`), and `DOM0_IPS` (`172.20.0.170 .180 .190 .200`).
+3. `farm-inventory.sh discover` + a `tofu plan` to confirm convergence, then a real
+   `@farm` job that lands on xen-194 (verify via `farm-inventory.sh topology`).
+
+This is a feature (wiring the 4th dom0 into the elastic farm), so do it on the host
+where you can run the autoscaler + tofu and watch a job actually route there.
 
 ## Step 6 — Verify & commit
 

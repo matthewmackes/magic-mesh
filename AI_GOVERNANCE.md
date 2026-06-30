@@ -187,8 +187,11 @@ run in parallel across the farm nodes; a slow/fuzzy success signal is never a
 reason to serialize or defer (see `no-flinch`). Mechanics (build slots, per-node
 concurrency caps, worktree-isolated parallel mutating agents) and the full
 toolchain live in [`docs/BUILD-ENVIRONMENT.md`](docs/BUILD-ENVIRONMENT.md) —
-**read it before building.** Load-bearing facts: two build surfaces (local dev
-host + the Fedora farm VMs); Rust pin `1.94.0` / MSRV `1.85`; the
+**read it before building.** The live farm topology (hosts + build VMs + free
+slots) is **derived from OpenTofu, never memorized**: run
+`install-helpers/farm-inventory.sh topology` (the single source every consumer
+reads) instead of trusting a host list from a prior context. Load-bearing facts:
+two build surfaces (local dev host + the **4-dom0** Fedora farm VMs); Rust pin `1.94.0` / MSRV `1.85`; the
 `opus-devel`-in-CRB EL9 trap; the farm is IaC (`infra/tofu/` + `infra/ansible/`);
 the **GitOps reconciler on a timer** is the canonical build lane (no AI in the
 build loop). **E12 note:** the GUI build is now an **egui/eframe** compile

@@ -45,24 +45,30 @@ parallel, that's a §10.0 violation — fix it before continuing.
 > lives in `docs/BUILD-ENVIRONMENT.md` + `AI_GOVERNANCE.md §10`; this is the
 > operating procedure.
 
-### The farm (exact topology — know it cold)
-Three Xen build VMs, all **Fedora 42** (an F42-built RPM installs on F43+F44 —
-older-glibc forward-compat), user `mm`, key `/root/.ssh/mackes_mesh_ed25519`,
-**shared sccache** (`RUSTC_WRAPPER=sccache`):
+### The farm (topology is tofu-derived — never memorize it)
+Run **`install-helpers/farm-inventory.sh topology`** for the live, authoritative
+farm (it reads the canonical `infra/tofu/xen-xapi` tofu root — hosts, build VMs,
+free slots, drift). `… fleet` is the machine-readable form; `drain-coordinator.sh
+slots` and `farm.sh` already consume it. Do NOT hardcode IPs in this skill — that
+is exactly what drifted before. All VMs are **Fedora 42** (F42-built RPM installs
+on F43+F44), user `mm`, key `/root/.ssh/mackes_mesh_ed25519`, **shared sccache**.
+
+The current 4-dom0 reality (snapshot — confirm with the command above):
 
 | Host | VM | IP | vCPU / RAM | SAFE heavy slots |
 |---|---|---|---|---|
 | **XEN-BIGBOY** | `mcnf-build-52` | `172.20.0.130` | 8 / 24 GB | **3** |
 | KVM-XCP1 | `mcnf-build-51` | `172.20.0.90` | 4 / 16 GB | **2** |
 | XEN-HOME-SERVICES | `mcnf-build-50` | `172.20.0.50` | 4 / 16 GB | **2** |
+| XEN-194 | `mcnf-build-53` | `172.20.0.170` | 4 / 11 GB | **2** |
 
 > ⚠️ **VM names are legacy and do NOT equal the IP octet** (`docs/BUILD-ENVIRONMENT.md §3`):
-> `mcnf-build-51`=**.90**, `mcnf-build-52`=**.130**. The real farm is **.50 / .90 / .130** —
-> probing `.51`/`.52` gives "No route to host" (don't be fooled into a false "node down"
-> alarm). `install-helpers/drain-coordinator.sh slots` reads the real topology for you.
+> `mcnf-build-51`=**.90**, `mcnf-build-52`=**.130**, `mcnf-build-53`=**.170**. The real farm is
+> **.50 / .90 / .130 / .170** — probing `.51`/`.52` gives "No route to host" (don't be fooled
+> into a false "node down" alarm). `farm-inventory.sh topology` reads the truth for you.
 
-**Total = 7 concurrent heavy (cosmic/iced/mackesd-release) build slots.** Full
-utilization = all 7 busy, spread **3 + 2 + 2**.
+**Total = 9 concurrent heavy build slots**, spread **3 + 2 + 2 + 2** (plus the
+farm scales elastically: each dom0 also runs small×N VMs + pods — see FARM-AUTOSCALE).
 
 ### The hard cap (the load-44 lesson — NON-NEGOTIABLE)
 **≤3 heavy builds per node. NEVER more.** Proven live: 6 concurrent heavy builds on
