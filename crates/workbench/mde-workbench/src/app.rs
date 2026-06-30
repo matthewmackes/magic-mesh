@@ -754,11 +754,19 @@ impl App {
                 peers_panel::directory_event_subscription()
                     .map(|_| Message::FrontDoor(front_door_panel::Message::Reload)),
             );
-            // APPLAUNCH-8 — the launcher's keyboard-first nav (↑↓/Enter/Esc/Tab
-            // chips/Ctrl+1..5), registered only while the launcher surface is open
-            // so the nav keys don't fight the rest of the workbench when it's shut.
+            // APPLAUNCH-8 / CTRLSURF-3 — keyboard-first nav on the Front Door home.
+            // The launcher overlay owns its keys while open (↑↓ highlight, Enter
+            // commit, Esc close, Tab/Ctrl+1..5). CTRLSURF-3 (Phase 2) promotes the
+            // same keyboard-first story to the resting / searching home when the
+            // launcher is CLOSED: Esc clears the search, ↑↓/Tab summon the launcher,
+            // Ctrl+1..5 jump to the rail's section routes (Enter is the omnibox's own
+            // on_submit). Additive — the mouse is untouched. Gated on
+            // `home_keys_active` so the home keys never fight an open overlay
+            // (Settings / Pending / detail), which carry their own controls.
             if self.front_door.launcher.open {
                 subs.push(front_door_panel::FrontDoor::launcher_key_subscription());
+            } else if self.front_door.home_keys_active() {
+                subs.push(front_door_panel::FrontDoor::home_key_subscription());
             }
         }
         // PD-8 (L14) / PLANES-1 — Netdata sampling only while the Peers
