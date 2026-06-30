@@ -576,17 +576,13 @@ pub fn persisted_window_size() -> Size {
     load_window_state().window_size()
 }
 
-/// The fixed width of the left rail (design Q5 — a Win10-Start identity/pinned/
-/// surfaces column). Comfortable-density Start rails sit around this width.
-const RAIL_WIDTH: f32 = 260.0;
-
 /// CTRLSURF-2 — the Compact status rows' fixed label-gutter width, so the live
 /// values line up in a clean column for the 4-second glance.
 const STATUS_LABEL_WIDTH: f32 = 64.0;
 
 /// CTRLSURF-4 — the Expand "what changed" activity rail's fixed width: a right-hand
-/// companion column to the [`RAIL_WIDTH`] nav rail, wide enough to read a one-line
-/// event without wrapping most of the time.
+/// companion column to the universal sidebar + tile grid, wide enough to read a
+/// one-line event without wrapping most of the time.
 const ACTIVITY_RAIL_WIDTH: f32 = 300.0;
 
 /// CTRLSURF-4 — the activity row's fixed leading-glyph gutter, so the event text
@@ -798,10 +794,10 @@ impl Tile {
             // operator-gated apply/destroy with the prod-arm + typed-confirm lives
             // there); a destructive op is never triggered from a tile click.
             Some(TileKey::DataCenter) => vec![
-                TileAction::pipeline_nav("Join node", Group::MeshProvisioning, "mesh_join"),
+                TileAction::pipeline_nav("Join node", Group::Mesh, "mesh_join"),
                 TileAction::pipeline_wired(
                     "Drain node",
-                    Group::Provisioning,
+                    Group::Fleet,
                     "node_roles",
                     crate::Message::NodeRoles(node_roles::Message::RefreshClicked),
                 ),
@@ -815,8 +811,8 @@ impl Tile {
                 TileAction::pipeline_nav("Cutover helpers", Group::Mesh, "mesh_control"),
                 // Provision / destroy — navigate-ONLY to the tofu/autoscaler surface
                 // (the operator-gated apply); never a destructive op from a click.
-                TileAction::pipeline_nav("Provision", Group::Provisioning, "datacenter"),
-                TileAction::pipeline_nav("Destroy", Group::Provisioning, "datacenter"),
+                TileAction::pipeline_nav("Provision", Group::Datacenter, "datacenter"),
+                TileAction::pipeline_nav("Destroy", Group::Datacenter, "datacenter"),
             ],
             // FRONTDOOR-7 — the Build/Farm + DevOps tiles get the locked one-click
             // pipeline action set (Q50d: build · deploy · rollback · view-logs ·
@@ -830,11 +826,11 @@ impl Tile {
             Some(TileKey::BuildFarm) => vec![
                 TileAction::pipeline_wired(
                     "Build — refresh farm",
-                    Group::Provisioning,
+                    Group::Datacenter,
                     "build-farm",
                     crate::Message::BuildFarm(build_farm::Message::RefreshClicked),
                 ),
-                TileAction::pipeline_nav("Deploy", Group::Provisioning, "build-farm"),
+                TileAction::pipeline_nav("Deploy", Group::Datacenter, "build-farm"),
                 TileAction::pipeline_nav("Rollback", Group::System, "revisions"),
                 TileAction::pipeline_nav("View logs", Group::Monitoring, "run_history"),
                 TileAction::pipeline_wired(
@@ -851,11 +847,11 @@ impl Tile {
             Some(TileKey::DevOps) => vec![
                 TileAction::pipeline_wired(
                     "Build — refresh farm",
-                    Group::Provisioning,
+                    Group::Datacenter,
                     "build-farm",
                     crate::Message::BuildFarm(build_farm::Message::RefreshClicked),
                 ),
-                TileAction::pipeline_nav("Deploy", Group::Provisioning, "build-farm"),
+                TileAction::pipeline_nav("Deploy", Group::Datacenter, "build-farm"),
                 TileAction::pipeline_nav("Rollback", Group::System, "revisions"),
                 TileAction::pipeline_nav("View logs", Group::Monitoring, "run_history"),
                 TileAction::pipeline_wired(
@@ -866,7 +862,7 @@ impl Tile {
                 ),
             ],
             Some(TileKey::Alerts) => vec![
-                TileAction::nav("Open Datacenter", Group::Provisioning, "datacenter"),
+                TileAction::nav("Open Datacenter", Group::Datacenter, "datacenter"),
                 TileAction::nav("Open Health", Group::Monitoring, "health_check"),
             ],
             Some(TileKey::System) => vec![
@@ -1828,7 +1824,7 @@ pub(super) mod search {
                 kind: HitKind::App,
                 score: score.saturating_sub(5),
                 message: crate::Message::SelectPanel {
-                    group: crate::model::Group::Provisioning,
+                    group: crate::model::Group::Datacenter,
                     panel: slug,
                 },
             });
@@ -3775,21 +3771,22 @@ impl FrontDoor {
         !self.launcher.open && !self.show_settings && !self.show_pending && self.detail.is_none()
     }
 
-    /// CTRLSURF-3 — the rail's keyboard-reachable section routes, in render order
-    /// `(label, emphasized, route)`. [`rail`](Self::rail) renders this exact set and
-    /// CTRLSURF-3's `Ctrl+1..5` number-jump indexes it, so the visible rail and the
-    /// keyboard jump share ONE source and can never drift (§6/§7 — glue, one truth).
-    /// Every route is a REAL existing message `App::update` already handles (a
-    /// `SelectPanel` router hop, or the Front Door's own Settings panel). The rail's
-    /// Lock toggle is deliberately NOT here — it is a stateful toggle, not a section,
-    /// so it has no number-jump slot (only `1..5` are bound).
+    /// CTRLSURF-3/6 — the keyboard-reachable section routes for the home, in order
+    /// `(label, emphasized, route)`. CTRLSURF-3's `Ctrl+1..5` number-jump indexes
+    /// this set (DevOps · Data Center · Peers · Message Bus · Settings); CTRLSURF-6
+    /// folded the old Front Door rail that also rendered it into the universal
+    /// `sidebar.rs`, leaving this as the single number-jump source (§6/§7 — glue,
+    /// one truth). Every route is a REAL existing message `App::update` already
+    /// handles (a `SelectPanel` router hop, or the Front Door's own Settings panel).
+    /// The Lock toggle is deliberately NOT here — it is a stateful toggle, not a
+    /// section, so it has no number-jump slot (only `1..5` are bound).
     fn rail_nav_targets() -> [(&'static str, bool, crate::Message); 5] {
         [
             (
                 "DevOps",
                 true,
                 crate::Message::SelectPanel {
-                    group: Group::Provisioning,
+                    group: Group::Datacenter,
                     panel: "build-farm",
                 },
             ),
@@ -3797,7 +3794,7 @@ impl FrontDoor {
                 "Data Center",
                 true,
                 crate::Message::SelectPanel {
-                    group: Group::Provisioning,
+                    group: Group::Datacenter,
                     panel: "datacenter",
                 },
             ),
@@ -6103,21 +6100,19 @@ impl FrontDoor {
         )
     }
 
-    /// FRONTDOOR-2 — the Win10-Start two-pane view: a fixed left **rail** beside a
-    /// right **pane** (the full-width omnibox above the FRONTDOOR-1 tile grid).
+    /// FRONTDOOR-2 / CTRLSURF-6 — the Expand view: the omnibox + tile grid pane
+    /// beside the "what changed" activity rail. The Front Door's own left rail is
+    /// **gone** — its Pinned/Surfaces quick-links folded into the one universal
+    /// `sidebar.rs` (CTRLSURF-6, no second in-content rail); its Settings + Lock
+    /// controls live in the top bar (`right_pane`).
     fn panel_view(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
-        // CTRLSURF-4 — the Expand (full rail+grid) view gains a third companion
-        // column on the right: the "what changed" activity rail. Additive — the
-        // existing rail + grid panes are unchanged (CTRLSURF-5 made the compact /
-        // expanded switch a real window resize).
-        row![
-            self.rail(palette),
-            self.right_pane(palette),
-            self.activity_rail(palette)
-        ]
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        // CTRLSURF-4 — the Expand view's right-hand companion column: the "what
+        // changed" activity rail (CTRLSURF-5 made the compact / expanded switch a
+        // real window resize).
+        row![self.right_pane(palette), self.activity_rail(palette)]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// CTRLSURF-4 — the Expand "what changed" activity rail: a chronological,
@@ -6164,100 +6159,6 @@ impl FrontDoor {
 
         container(scroller)
             .width(Length::Fixed(ACTIVITY_RAIL_WIDTH))
-            .height(Length::Fill)
-            .style(move |_t: &Theme| container::Style {
-                background: Some(Background::Color(palette.surface.into_cosmic_color())),
-                border: Border {
-                    color: palette.border.into_cosmic_color(),
-                    width: 1.0,
-                    radius: 0.0.into(),
-                },
-                ..container::Style::default()
-            })
-            .into()
-    }
-
-    /// The left rail (design Q5): identity → Pinned → the predominant DevOps +
-    /// Data Center surfaces. Fixed width, scrollable so a short window still
-    /// reaches every entry. No power control: the Front Door has no existing
-    /// local power/session action to call, so §7 says omit it (better an absent
-    /// control than a dead button) — the mesh-power tile is FRONTDOOR-4 data.
-    fn rail(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
-        let sizes = FontSize::defaults();
-
-        // Identity — the account this Front Door belongs to. A static label for
-        // now (live identity is FRONTDOOR-4); rendered, not interactive.
-        let account = whoami_label();
-        let identity = column![
-            text(account)
-                .size(TypeRole::Heading.size_in(sizes))
-                .colr(palette.text.into_cosmic_color()),
-            text("This node")
-                .size(TypeRole::Caption.size_in(sizes))
-                .colr(palette.text_muted.into_cosmic_color()),
-        ]
-        .spacing(2);
-
-        // CTRLSURF-3 — the rail's section links + CTRLSURF-3's `Ctrl+1..5`
-        // number-jump share ONE ordered source ([`rail_nav_targets`]), so the
-        // visible rail and the keyboard jump can never drift (§6/§7). Order:
-        // Surfaces (1,2), Pinned (3,4), Front Door's Settings (5). Each route is
-        // real (§7 — we don't list a destination we can't open).
-        let [t_devops, t_datacenter, t_peers, t_mesh_bus, t_settings] = Self::rail_nav_targets();
-
-        // Pinned — the launchers that have a real route today.
-        let pinned = column![
-            rail_section_label("Pinned", palette),
-            rail_link(t_peers.0, t_peers.2, palette, t_peers.1),
-            rail_link(t_mesh_bus.0, t_mesh_bus.2, palette, t_mesh_bus.1),
-        ]
-        .spacing(4);
-
-        // The predominant surfaces (the brief: DevOps + Data Center front-and-
-        // center) — accent-emphasized links to the real `build-farm` / `datacenter`
-        // panel routes (§7).
-        let surfaces = column![
-            rail_section_label("Surfaces", palette),
-            rail_link(t_devops.0, t_devops.2, palette, t_devops.1),
-            rail_link(t_datacenter.0, t_datacenter.2, palette, t_datacenter.1),
-        ]
-        .spacing(4);
-
-        // FRONTDOOR-14 — the Front Door's own controls at the foot of the rail
-        // (Q48 in-menu settings, Q91 lock): a Settings entry opening the in-menu
-        // panel, and a lock toggle gating the action affordances. Both are REAL
-        // (§7 — wired to live messages, no dead buttons). Lock is rail-only (not a
-        // number-jump section — it is a stateful toggle, not a route).
-        let system = column![
-            rail_section_label("Front Door", palette),
-            rail_link(t_settings.0, t_settings.2, palette, t_settings.1),
-            rail_link(
-                self.lock_label(),
-                crate::Message::FrontDoor(Message::ToggleLock),
-                palette,
-                false,
-            ),
-        ]
-        .spacing(4);
-
-        let body = column![
-            identity,
-            Space::new().height(Length::Fixed(16.0)),
-            surfaces,
-            Space::new().height(Length::Fixed(16.0)),
-            pinned,
-            Space::new().height(Length::Fixed(16.0)),
-            system,
-        ]
-        .spacing(8)
-        .width(Length::Fill);
-
-        let scroller = scrollable(container(body).padding(Padding::from([20u16, 16u16])))
-            .width(Length::Fill)
-            .height(Length::Fill);
-
-        container(scroller)
-            .width(Length::Fixed(RAIL_WIDTH))
             .height(Length::Fill)
             .style(move |_t: &Theme| container::Style {
                 background: Some(Background::Color(palette.surface.into_cosmic_color())),
@@ -6956,16 +6857,6 @@ fn arrange_tiles(seed: &[Tile], prefs: &mde_theme::FrontDoorPrefs) -> Vec<Tile> 
     visible
 }
 
-/// The rail's account identity. Best-effort from the environment (`$USER`),
-/// falling back to a neutral label — no probe in `view()`. Live identity is
-/// FRONTDOOR-4.
-fn whoami_label() -> String {
-    std::env::var("USER")
-        .ok()
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| "Account".to_string())
-}
-
 /// APPLAUNCH — the username the apps favorites/groups verbs key on (matches the
 /// applet's `current_user`: `$USER`, else `_`). The per-user pins/groups follow
 /// the operator across nodes (the QNM-Shared store keys on this).
@@ -7522,74 +7413,14 @@ fn greeting_card<'a>(palette: Palette) -> Element<'a, crate::Message, Theme> {
         .into()
 }
 
-/// A rail section header (Pinned / Surfaces), muted + caption-sized.
+/// A muted, caption-sized section header. CTRLSURF-6 retired the Front Door's
+/// left rail, but this label is still the section caption for the unified search
+/// results + the tile detail menus (Actions / Target node / Copilot triage).
 fn rail_section_label<'a>(label: &'a str, palette: Palette) -> Element<'a, crate::Message, Theme> {
     text(label)
         .size(TypeRole::Caption.size_in(FontSize::defaults()))
         .colr(palette.text_muted.into_cosmic_color())
         .into()
-}
-
-/// A full-width rail link. `emphasized` marks the predominant DevOps / Data
-/// Center surfaces (design Q5): an accent-tinted fill + accent text so they read
-/// front-and-center; ordinary pins read as quiet ghost rows. Every link carries a
-/// REAL `on_press` route (§7 — no dead buttons).
-fn rail_link<'a>(
-    label: &'a str,
-    msg: crate::Message,
-    palette: Palette,
-    emphasized: bool,
-) -> Element<'a, crate::Message, Theme> {
-    let accent = palette.accent.into_cosmic_color();
-    let fg = if emphasized {
-        accent
-    } else {
-        palette.text.into_cosmic_color()
-    };
-    let raised = palette.raised.into_cosmic_color();
-    let hover_tint = palette.hover_tint().into_cosmic_color();
-    let idle_bg = if emphasized {
-        hover_tint
-    } else {
-        cosmic::iced::Color::TRANSPARENT
-    };
-
-    button(
-        text(label)
-            .size(TypeRole::Body.size_in(FontSize::defaults()))
-            .colr(fg),
-    )
-    .width(Length::Fill)
-    .padding(Padding::from([8u16, 12u16]))
-    .sty(
-        move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
-            use cosmic::iced::widget::button::Status;
-            let bg = match status {
-                Status::Hovered | Status::Pressed => {
-                    if emphasized {
-                        accent_tint(accent)
-                    } else {
-                        raised
-                    }
-                }
-                _ => idle_bg,
-            };
-            cosmic::iced::widget::button::Style {
-                snap: false,
-                background: Some(Background::Color(bg)),
-                text_color: fg,
-                border: Border {
-                    color: cosmic::iced::Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 6.0.into(),
-                },
-                shadow: cosmic::iced::Shadow::default(),
-                ..cosmic::iced::widget::button::Style::default()
-            }
-        },
-    )
-    .on_press(msg)
-    .into()
 }
 
 /// A stronger accent wash for an emphasized rail link's hover/press — the accent
@@ -9997,10 +9828,10 @@ mod tests {
         // The named verbs land on the surface that owns them.
         assert_eq!(
             routes["Build — refresh farm"],
-            (Group::Provisioning, "build-farm", true),
+            (Group::Datacenter, "build-farm", true),
             "build is wired and routes to the Build Farm panel"
         );
-        assert_eq!(routes["Deploy"], (Group::Provisioning, "build-farm", false));
+        assert_eq!(routes["Deploy"], (Group::Datacenter, "build-farm", false));
         assert_eq!(
             routes["Rollback"],
             (Group::System, "revisions", false),
@@ -10093,12 +9924,12 @@ mod tests {
         // (join/restart/cutover) and the gated provision/destroy are navigate-only.
         assert_eq!(
             dc_route("Join node"),
-            (Group::MeshProvisioning, "mesh_join", false),
+            (Group::Mesh, "mesh_join", false),
             "join navigates to the Mesh Join surface (it needs a passcode)"
         );
         assert_eq!(
             dc_route("Drain node"),
-            (Group::Provisioning, "node_roles", true),
+            (Group::Fleet, "node_roles", true),
             "drain is wired to the Node Roles surface's own re-read"
         );
         assert_eq!(
@@ -10125,12 +9956,12 @@ mod tests {
         // and carry NO trigger, so a destructive op is never fired from a tile click.
         assert_eq!(
             dc_route("Provision"),
-            (Group::Provisioning, "datacenter", false),
+            (Group::Datacenter, "datacenter", false),
             "provision navigates to the gated tofu surface, no blind trigger"
         );
         assert_eq!(
             dc_route("Destroy"),
-            (Group::Provisioning, "datacenter", false),
+            (Group::Datacenter, "datacenter", false),
             "destroy navigates to the gated tofu surface, no blind trigger"
         );
     }
@@ -11133,7 +10964,7 @@ mod tests {
         // an empty Task (no nav, no trigger) rather than firing them.
         let _ = fd.update(Message::PipelineAction {
             nav: Box::new(crate::Message::SelectPanel {
-                group: Group::Provisioning,
+                group: Group::Datacenter,
                 panel: "build-farm",
             }),
             trigger: Some(Box::new(crate::Message::FrontDoor(Message::Reload))),

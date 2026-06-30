@@ -7,25 +7,26 @@
 
 use std::fmt;
 
-/// One of the top-level sidebar groups. **NAV-1 (the grouping redesign,
-/// `docs/design/workbench-nav-grouping.md`)** rebuilds the nav as seven
-/// scope→function sections — **Overview · This Node · Mesh · Fleet ·
-/// Provisioning · Monitoring · System** (System = Config + Maintain +
-/// Help) — and defers the desktop-settings panels to Cosmic Settings
-/// (Q2). NAV-1.2 deleted the 17 desktop-settings panels (Cosmic Store/
-/// Settings owns them) and relocated the 4 mesh-specific kept panels
-/// (wallpaper + notifications → This Node; system update + sync status →
-/// System), retiring the hidden Desktop group entirely. Order is
+/// One of the top-level sidebar groups. **CTRLSURF-6 (the control-surface
+/// redesign, `docs/design/workbench-control-surface.md`)** folds the nav to the
+/// seven scope-first sections — **Overview · This Node · Mesh · Fleet ·
+/// Datacenter · Monitoring · System** — with plain-language, sub-grouped labels
+/// (no SHOUTING). It dissolves the two prior shouting sections: `MESH:
+/// PROVISIONING`'s enrollment/federation panels fold into **Mesh ▸ Join the
+/// Mesh**, and `MESH: VIRTUAL WORKLOADS` (the old Provisioning section) splits
+/// into **Fleet ▸ Node Templates** (node-build artifacts) + the new
+/// **Datacenter** section (compute). Retired group slugs (`mesh_provisioning`,
+/// `provisioning`) still resolve via [`view_from_focus_slug`] redirects so deep-
+/// links + the Front Door search don't break (§7 reachability). Order is
 /// load-bearing — it drives the Ctrl+digit hotkey dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Group {
-    // ── The seven mesh sections (locked order, Q15) ──
+    // ── The seven scope-first sections (locked order, CTRLSURF-6) ──
     Dashboard, // "Overview"
     ThisNode,
     Mesh,
-    MeshProvisioning, // "MESH: PROVISIONING" — enrollment/federation (operator 2026-06-16)
-    Fleet,            // labelled "OTHER NODES"
-    Provisioning,     // labelled "MESH: VIRTUAL WORKLOADS"
+    Fleet,
+    Datacenter, // compute — VM spawner + the datacenter plane (highest blast radius)
     Monitoring,
     System, // Config + Maintain + Help
 }
@@ -40,48 +41,45 @@ impl Group {
             Self::Dashboard => "dashboard",
             Self::ThisNode => "node",
             Self::Mesh => "mesh",
-            Self::MeshProvisioning => "mesh_provisioning",
             Self::Fleet => "fleet",
-            Self::Provisioning => "provisioning",
+            Self::Datacenter => "datacenter",
             Self::Monitoring => "monitoring",
             Self::System => "system",
         }
     }
 
-    /// Sentence-case label shown in the sidebar.
+    /// Sentence-case label shown in the sidebar (CTRLSURF-6 — plain-language,
+    /// no SHOUTING).
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             Self::Dashboard => "Overview",
             Self::ThisNode => "This Node",
             Self::Mesh => "Mesh",
-            Self::MeshProvisioning => "MESH: PROVISIONING",
-            Self::Fleet => "OTHER NODES",
-            Self::Provisioning => "MESH: VIRTUAL WORKLOADS",
+            Self::Fleet => "Fleet",
+            Self::Datacenter => "Datacenter",
             Self::Monitoring => "Monitoring",
             Self::System => "System",
         }
     }
 
-    /// Stable display order (drives the Ctrl+1..8 hotkey dispatch).
-    /// The eight visible sections map cleanly to Ctrl+1..8.
+    /// Stable display order (drives the Ctrl+1..7 hotkey dispatch).
+    /// The seven visible sections map cleanly to Ctrl+1..7.
     #[must_use]
-    pub const fn all() -> [Self; 8] {
+    pub const fn all() -> [Self; 7] {
         [
             Self::Dashboard,
             Self::ThisNode,
             Self::Mesh,
-            Self::MeshProvisioning,
             Self::Fleet,
-            Self::Provisioning,
+            Self::Datacenter,
             Self::Monitoring,
             Self::System,
         ]
     }
 
     /// The groups EXPOSED in the sidebar + the Ctrl+digit hotkeys —
-    /// the seven mesh sections (NAV-1). NAV-1.2 retired the hidden
-    /// Desktop group, so this is now identical to [`Self::all`].
+    /// the seven scope-first sections (CTRLSURF-6).
     #[must_use]
     pub fn sidebar_groups() -> Vec<Self> {
         Self::all().to_vec()
@@ -102,16 +100,37 @@ impl fmt::Display for Group {
 
 /// Per-group leaf panel. Slug + label are stable — the Iced view
 /// layer indexes panels by [`Panel::slug`] for deep-link routing.
+///
+/// CTRLSURF-6 — a panel may carry an optional `subgroup` header (e.g.
+/// "Hardware & Desktop", "Join the Mesh"). Panels sharing a subgroup render
+/// under one plain-language sub-heading in the universal sidebar; a `None`
+/// subgroup renders flat (Overview / Datacenter / Monitoring).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Panel {
     slug: &'static str,
     label: &'static str,
+    subgroup: Option<&'static str>,
 }
 
 impl Panel {
+    /// A flat panel with no sub-group header.
     #[must_use]
     pub const fn new(slug: &'static str, label: &'static str) -> Self {
-        Self { slug, label }
+        Self {
+            slug,
+            label,
+            subgroup: None,
+        }
+    }
+
+    /// CTRLSURF-6 — a panel filed under a named sub-group header.
+    #[must_use]
+    pub const fn sub(slug: &'static str, label: &'static str, subgroup: &'static str) -> Self {
+        Self {
+            slug,
+            label,
+            subgroup: Some(subgroup),
+        }
     }
 
     #[must_use]
@@ -123,6 +142,12 @@ impl Panel {
     pub const fn label(&self) -> &'static str {
         self.label
     }
+
+    /// CTRLSURF-6 — this panel's sub-group header, or `None` when it renders flat.
+    #[must_use]
+    pub const fn subgroup(&self) -> Option<&'static str> {
+        self.subgroup
+    }
 }
 
 /// One full sidebar row: a group plus its ordered leaf panels.
@@ -130,6 +155,24 @@ impl Panel {
 pub struct NavEntry {
     pub group: Group,
     pub panels: Vec<Panel>,
+}
+
+impl NavEntry {
+    /// CTRLSURF-6 — group this entry's panels into consecutive
+    /// `(subgroup, panels)` runs, preserving order. A run of panels sharing a
+    /// `Some(header)` renders under one sub-heading; a `None` run renders flat.
+    /// The sidebar walks these to emit a sub-group header per `Some(_)` run.
+    #[must_use]
+    pub fn subgroups(&self) -> Vec<(Option<&'static str>, Vec<&Panel>)> {
+        let mut out: Vec<(Option<&'static str>, Vec<&Panel>)> = Vec::new();
+        for panel in &self.panels {
+            match out.last_mut() {
+                Some((header, panels)) if *header == panel.subgroup() => panels.push(panel),
+                _ => out.push((panel.subgroup(), vec![panel])),
+            }
+        }
+        out
+    }
 }
 
 /// DATACENTER-25 — which surface is showing inside the **Datacenter** panel.
@@ -270,143 +313,154 @@ impl View {
 #[must_use]
 pub fn nav_model() -> Vec<NavEntry> {
     vec![
-        // ── Overview (default landing, Q14) ─────────────────────────
+        // ── Overview (default landing) ──────────────────────────────
         NavEntry {
             group: Group::Dashboard,
             panels: vec![Panel::new("home", "Home")],
         },
-        // ── This Node — the local box + its networking (Q7) ─────────
+        // ── This Node — Hardware & Desktop / Network (CTRLSURF-6) ────
         NavEntry {
             group: Group::ThisNode,
             panels: vec![
-                Panel::new("hardware", "Hardware"),
-                Panel::new("mesh_services", "Mesh Services"),
-                // Local networking stays under This Node (Q7).
-                Panel::new("interfaces", "Interfaces"),
-                Panel::new("wifi", "Wi-Fi"),
-                Panel::new("vpn", "VPN"),
-                Panel::new("firewall", "Firewall"),
-                Panel::new("remote_desktop", "Remote Access"),
-                // NAV-1.2 — mesh-specific desktop panels relocated here from
-                // the retired Desktop group (wallpaper + notifications are
-                // mesh-synced surfaces, not Cosmic-owned settings).
-                Panel::new("wallpaper", "Wallpaper"),
-                Panel::new("notifications", "Notifications"),
+                Panel::sub("hardware", "Hardware", "Hardware & Desktop"),
+                // NAV-1.2 — mesh-specific desktop panels (wallpaper + notifications
+                // are mesh-synced surfaces, not Cosmic-owned settings).
+                Panel::sub("wallpaper", "Wallpaper", "Hardware & Desktop"),
+                Panel::sub("notifications", "Notifications", "Hardware & Desktop"),
+                // Network — this node's mesh + local networking.
+                Panel::sub("mesh_services", "Mesh Connection", "Network"),
+                Panel::sub("interfaces", "Interfaces", "Network"),
+                Panel::sub("wifi", "Wi-Fi", "Network"),
+                Panel::sub("vpn", "VPN", "Network"),
+                Panel::sub("firewall", "Firewall", "Network"),
+                Panel::sub("remote_desktop", "Remote Access", "Network"),
             ],
         },
-        // ── Mesh — Peers front door + all mesh-wide services (Q5/Q9) ─
+        // ── Mesh — Fabric / Shared Resources / Services / Local Network /
+        //    Join the Mesh (CTRLSURF-6 — the old MESH: PROVISIONING section folds
+        //    in as the "Join the Mesh" sub-group). ─────────────────────────────
         NavEntry {
             group: Group::Mesh,
             panels: vec![
-                // Peers directory first (Q9).
-                Panel::new("peers", "Peers"),
-                // DATACENTER-25 — the Lighthouses ops surface folded into the
-                // Datacenter panel as a tab (deep link `mesh.lighthouses`
-                // redirects there). Its standalone Mesh-group entry is retired.
-                Panel::new("mesh_control", "Mesh Control"),
-                Panel::new("mesh_storage", "Mesh Storage"),
-                Panel::new("dns", "Mesh DNS"),
-                Panel::new("routing", "Routing"),
-                // Plain-language renames (Q13).
-                Panel::new("mesh_bus", "Message Bus"),
-                Panel::new("service_publishing", "Published Services"),
-                // CONNECT-6 — the unified exposure matrix (mesh-only vs public).
-                Panel::new("connectivity", "Connectivity"),
-                Panel::new("network_hosts", "Discovered Hosts"),
-                // COMPUTE/SVC-VIEW — unified view of all three service sources.
-                Panel::new("all_services", "All Services"),
+                // Fabric — the core mesh plumbing.
+                Panel::sub("peers", "Peers", "Fabric"),
+                Panel::sub("mesh_control", "Mesh Control", "Fabric"),
+                Panel::sub("dns", "Mesh DNS", "Fabric"),
+                Panel::sub("routing", "Routing", "Fabric"),
                 // ROUTER-5 — per-node router/firewall (EdgeRouter/VyOS) controls.
-                Panel::new("router", "Routers"),
-                // Mesh-relevant peer/device services kept here (Q2 exception).
-                Panel::new("connect", "Connected Devices"),
-                Panel::new("music", "Music"),
-                Panel::new("sip_gateway", "SIP Gateway"),
+                Panel::sub("router", "Routers", "Fabric"),
+                // Shared Resources — what the mesh shares.
+                Panel::sub("mesh_storage", "Shared Storage", "Shared Resources"),
+                Panel::sub("music", "Music", "Shared Resources"),
+                // Services — mesh-wide service surfaces.
+                Panel::sub("mesh_bus", "Message Bus", "Services"),
+                Panel::sub("service_publishing", "Published Services", "Services"),
+                // COMPUTE/SVC-VIEW — unified view of all three service sources.
+                Panel::sub("all_services", "Service Directory", "Services"),
+                // CONNECT-6 — the unified exposure matrix (mesh-only vs public).
+                Panel::sub("connectivity", "Connectivity", "Services"),
+                Panel::sub("sip_gateway", "Voice Gateway", "Services"),
+                // Local Network — LAN discovery + paired devices.
+                Panel::sub("network_hosts", "Discovered Hosts", "Local Network"),
+                Panel::sub("connect", "Connected Devices", "Local Network"),
+                // Join the Mesh — enrollment + federation (was MESH: PROVISIONING).
+                // Genesis first: founding a brand-new mesh precedes joining one.
+                Panel::sub("genesis", "Create a Mesh", "Join the Mesh"),
+                Panel::sub("registration", "Registration", "Join the Mesh"),
+                Panel::sub("mesh_join", "Mesh Join", "Join the Mesh"),
+                Panel::sub("mesh_pending", "Join Requests", "Join the Mesh"),
+                Panel::sub("mesh_federation", "Linked Meshes", "Join the Mesh"),
             ],
         },
-        // ── MESH: PROVISIONING — enrollment + federation (operator 2026-06-16):
-        //    the join/registration/pending/federation flow lifted out of Mesh
-        //    into its own top-level section.
-        NavEntry {
-            group: Group::MeshProvisioning,
-            panels: vec![
-                // DATACENTER-18 — genesis comes first: founding a brand-new mesh
-                // precedes joining/registering against an existing one.
-                Panel::new("genesis", "New Mesh"),
-                Panel::new("registration", "Registration"),
-                Panel::new("mesh_join", "Mesh Join"),
-                Panel::new("mesh_pending", "Mesh Pending"),
-                Panel::new("mesh_federation", "Mesh Federation"),
-            ],
-        },
-        // ── OTHER NODES (Group::Fleet) — roster + orchestration (Q6) ─
+        // ── Fleet — Roster / Orchestration / Node Templates (CTRLSURF-6 — the
+        //    old Provisioning section's node-build artifacts fold in as "Node
+        //    Templates"). ─────────────────────────────────────────────────────
         NavEntry {
             group: Group::Fleet,
             panels: vec![
-                Panel::new("fleet_rollup", "Fleet Rollup"),
-                Panel::new("inventory", "Fleet Roster"),
-                Panel::new("tags", "Tags"),
+                // Roster.
+                Panel::sub("fleet_rollup", "Fleet Rollup", "Roster"),
+                Panel::sub("inventory", "Fleet Roster", "Roster"),
+                Panel::sub("tags", "Tags", "Roster"),
                 // Orchestration (was the Controller plane, Q6).
-                Panel::new("jobs", "Jobs"),
-                Panel::new("playbooks", "Playbooks"),
-                Panel::new("drift", "Remediation"),
+                Panel::sub("jobs", "Jobs", "Orchestration"),
+                Panel::sub("playbooks", "Playbooks", "Orchestration"),
+                Panel::sub("drift", "Remediation", "Orchestration"),
+                // Node Templates — node-build artifacts (from the old Provisioning).
+                Panel::sub("node_roles", "Node Roles", "Node Templates"),
+                Panel::sub("profiles", "Install Profiles", "Node Templates"),
+                Panel::sub("mirrors", "Mirrors", "Node Templates"),
             ],
         },
-        // ── Provisioning — onboard/build artifacts + compute ────────
+        // ── Datacenter — compute (CTRLSURF-6, highest blast radius, last).
+        //    The VM spawner + the datacenter plane. DATACENTER-25 — the datacenter
+        //    panel also hosts the folded Instances / Images / Build Farm /
+        //    Lighthouses / Snapshots surfaces as fold-bar tabs; those slugs deep-
+        //    link-redirect here. Flat (no sub-groups), per the taxonomy. ─────────
         NavEntry {
-            group: Group::Provisioning,
+            group: Group::Datacenter,
             panels: vec![
-                Panel::new("node_roles", "Node Roles"),
-                Panel::new("profiles", "Install Profiles"),
-                Panel::new("mirrors", "Mirrors"),
                 // XCP-4 — the VM Spawner (A-plane MDE-VMs over XCP-ng dom0s).
-                Panel::new("provisioning", "VM Spawner"),
+                Panel::new("provisioning", "New Virtual Machine"),
                 // DATACENTER-8 — datacenter plane (DO/Xen resources via event/dc/*).
-                // DATACENTER-25 — also the host for the folded Instances / Images /
-                // Build Farm / Lighthouses / Snapshots surfaces (selected via the
-                // Datacenter fold-bar tabs); those standalone entries are retired
-                // and their deep links redirect here.
                 Panel::new("datacenter", "Datacenter"),
             ],
         },
-        // ── Monitoring — all observability across scopes (Q11) ──────
+        // ── Monitoring — all observability across scopes, unified (Q11) ──
         NavEntry {
             group: Group::Monitoring,
             panels: vec![
-                Panel::new("health_check", "Health"),
+                Panel::new("health_check", "Health Check"),
                 Panel::new("mesh_logs", "Logs & Metrics"),
                 Panel::new("fleet_logs", "Fleet Logs"),
                 Panel::new("run_history", "Run History"),
                 Panel::new("audit", "Audit"),
                 Panel::new("mesh_history", "Mesh History"),
-                Panel::new("resources", "Resources"),
+                Panel::new("resources", "Resource Usage"),
                 Panel::new("logs", "System Logs"),
             ],
         },
-        // ── System — Config + Maintenance + Help (Q12 + follow-up) ──
+        // ── System — Configuration / Maintenance / Preferences & Help ──
         NavEntry {
             group: Group::System,
             panels: vec![
-                // Config (unified Local / Fleet / Policy, Q12).
-                Panel::new("config_apply", "Config"),
-                Panel::new("revisions", "Fleet Config"),
-                Panel::new("policy", "Policy"),
-                Panel::new("settings", "Settings"),
-                // Maintenance.
-                Panel::new("hub", "Hub"),
-                // DATACENTER-25 — Snapshots folded into the Datacenter panel as a
-                // tab (deep link `system.snapshots` redirects there); the
-                // standalone System entry is retired.
-                Panel::new("repair", "Repair"),
-                // Maintenance — NAV-1.2 relocated System Update + Panel Sync
-                // Status here from the retired Desktop group (mesh-synced
-                // maintenance surfaces).
-                Panel::new("system_update", "System Update"),
-                Panel::new("sync_status", "Panel Sync Status"),
-                // Help.
-                Panel::new("index", "Help Topics"),
-                Panel::new("about", "About"),
+                // Configuration (unified Local / Fleet / Policy, Q12).
+                Panel::sub("config_apply", "Apply Configuration", "Configuration"),
+                Panel::sub("revisions", "Fleet Config", "Configuration"),
+                Panel::sub("policy", "Policy", "Configuration"),
+                // Maintenance. DATACENTER-25 — Snapshots folded into the Datacenter
+                // panel (deep link `system.snapshots` redirects there).
+                Panel::sub("hub", "Hub", "Maintenance"),
+                Panel::sub("repair", "Repair", "Maintenance"),
+                // NAV-1.2 relocated System Update + Panel Sync Status here.
+                Panel::sub("system_update", "System Update", "Maintenance"),
+                Panel::sub("sync_status", "Panel Sync Status", "Maintenance"),
+                // Preferences & Help.
+                Panel::sub("settings", "Settings", "Preferences & Help"),
+                Panel::sub("index", "Help Topics", "Preferences & Help"),
+                Panel::sub("about", "About", "Preferences & Help"),
             ],
         },
+    ]
+}
+
+/// CTRLSURF-6 — the universal sidebar's **Pinned** quick-links: the shortcuts the
+/// Front Door's retired left rail used to carry (its Pinned pins + the
+/// predominant DevOps / Data-Center Surfaces), folded into the one sidebar so
+/// there is no second in-content rail. Each is a real `(label, group, panel)`
+/// route that resolves — either a `nav_model` panel or a Datacenter fold-bar tab
+/// (`build-farm`) — so there is no dead shortcut (§7). The richer
+/// favorites/groups pin store is a later CTRLSURF phase.
+#[must_use]
+pub fn pinned_links() -> [(&'static str, Group, &'static str); 4] {
+    [
+        ("Peers", Group::Mesh, "peers"),
+        ("Message Bus", Group::Mesh, "mesh_bus"),
+        // DevOps / Data Center — the Front Door rail's predominant Surfaces. Build
+        // Farm is a Datacenter fold-bar tab (the route redirects to the datacenter
+        // panel + that tab).
+        ("Build Farm", Group::Datacenter, "build-farm"),
+        ("Datacenter", Group::Datacenter, "datacenter"),
     ]
 }
 
@@ -433,11 +487,33 @@ pub fn resolve_panel_label(group: Group, panel_slug: &str) -> Option<&'static st
         })
 }
 
+/// CTRLSURF-6 — rewrite a retired top-level group slug to its new home. The
+/// taxonomy dissolved the two SHOUTING sections: `mesh_provisioning` folded into
+/// **Mesh ▸ Join the Mesh**, and `provisioning` split into **Fleet ▸ Node
+/// Templates** (the node-build artifacts) + the new **Datacenter** section
+/// (compute). The split is panel-aware: a `provisioning.<node-template>` slug
+/// lands on Fleet, everything else on Datacenter. A slug that isn't a retired
+/// group is returned unchanged. Pure — used only by [`view_from_focus_slug`].
+fn redirect_retired_group_slug<'a>(group_slug: &'a str, panel_slug: Option<&str>) -> &'a str {
+    match group_slug {
+        "mesh_provisioning" => "mesh",
+        "provisioning" => match panel_slug {
+            // Node-build artifacts moved under Fleet ▸ Node Templates.
+            Some("node_roles" | "profiles" | "mirrors") => "fleet",
+            // VM spawner, the datacenter plane, the folded compute tabs, and the
+            // bare section all land on the new Datacenter section.
+            _ => "datacenter",
+        },
+        other => other,
+    }
+}
+
 /// Resolve a deep-link slug into the matching [`View`]. Accepts
-/// `<group>` or `<group>.<panel>` forms (e.g. `network` or
-/// `network.remote_desktop`). Unknown slugs return `None`.
+/// `<group>` or `<group>.<panel>` forms (e.g. `node` or
+/// `node.remote_desktop`). Unknown slugs return `None`.
 /// `network.mesh_ssh` (the retired B1 entry) aliases to the
-/// Remote Access panel that absorbed it (SVC-1).
+/// Remote Access panel that absorbed it (SVC-1). CTRLSURF-6 — retired group
+/// slugs (`mesh_provisioning`, `provisioning`) redirect to their new sections.
 #[must_use]
 pub fn view_from_focus_slug(slug: &str) -> Option<View> {
     let slug = if slug == "network.mesh_ssh" || slug == "node.mesh_ssh" {
@@ -450,9 +526,14 @@ pub fn view_from_focus_slug(slug: &str) -> Option<View> {
     let (group_slug, panel_slug) = slug
         .split_once('.')
         .map_or((slug, None), |(g, p)| (g, Some(p)));
-    // DATACENTER-25 — the six folded surfaces no longer have standalone nav
+    // CTRLSURF-6 — the two SHOUTING sections were dissolved (their panels moved):
+    // `mesh_provisioning.*` → Mesh, and `provisioning.*` → Fleet (node templates)
+    // or Datacenter (compute). Rewrite the retired group slug to its new home so
+    // old deep-links + the Front Door search keep resolving (§7 reachability).
+    let group_slug = redirect_retired_group_slug(group_slug, panel_slug);
+    // DATACENTER-25 — the five folded surfaces no longer have standalone nav
     // entries, but their deep-link slugs must keep working: redirect any
-    // `<group>.<folded>` (e.g. `mesh.lighthouses`, `provisioning.instances`,
+    // `<group>.<folded>` (e.g. `mesh.lighthouses`, `datacenter.instances`,
     // `system.snapshots`) to the Datacenter panel, where the surface now lives as
     // a tab. The tab itself is selected by the caller (`app.rs` reads
     // `DatacenterTab::from_folded_slug`). Resolving the View to `datacenter` here
@@ -460,7 +541,7 @@ pub fn view_from_focus_slug(slug: &str) -> Option<View> {
     if let Some(p) = panel_slug {
         if DatacenterTab::from_folded_slug(p).is_some() {
             return Some(View::Panel {
-                group: Group::Provisioning,
+                group: Group::Datacenter,
                 panel: "datacenter",
             });
         }
@@ -490,8 +571,9 @@ mod tests {
     #[test]
     fn nav_model_has_all_groups_in_locked_order() {
         let nav = nav_model();
-        // 8 visible sections (2026-06-16: MESH: PROVISIONING split out of Mesh).
-        assert_eq!(nav.len(), 8);
+        // CTRLSURF-6 — seven scope-first sections (MeshProvisioning + Provisioning
+        // dissolved; Datacenter added).
+        assert_eq!(nav.len(), 7);
         let order: Vec<Group> = nav.iter().map(|e| e.group).collect();
         assert_eq!(order, Group::all().to_vec());
     }
@@ -552,17 +634,16 @@ mod tests {
 
     #[test]
     fn nav_sections_are_the_seven_locked_in_order() {
-        // NAV-1 (Q15) — the visible sidebar is exactly the 7 sections in
-        // the locked order; Desktop is hidden (Q2).
+        // CTRLSURF-6 (Q6) — the visible sidebar is exactly the 7 scope-first
+        // sections in the locked, blast-radius order.
         assert_eq!(
             Group::sidebar_groups(),
             vec![
                 Group::Dashboard,
                 Group::ThisNode,
                 Group::Mesh,
-                Group::MeshProvisioning,
                 Group::Fleet,
-                Group::Provisioning,
+                Group::Datacenter,
                 Group::Monitoring,
                 Group::System,
             ]
@@ -756,9 +837,11 @@ mod tests {
     #[test]
     fn folded_deep_link_slugs_redirect_to_the_datacenter_panel() {
         // Every retired standalone slug, addressed under the group it used to
-        // live in, redirects to the Datacenter panel rather than dangling.
+        // live in, redirects to the Datacenter panel rather than dangling. The
+        // old `provisioning.*` form keeps working via the CTRLSURF-6 group
+        // redirect on top of the DATACENTER-25 fold.
         let dc = View::Panel {
-            group: Group::Provisioning,
+            group: Group::Datacenter,
             panel: "datacenter",
         };
         for slug in [
@@ -766,6 +849,8 @@ mod tests {
             "provisioning.instances",
             "provisioning.images",
             "provisioning.build-farm",
+            "datacenter.instances",
+            "datacenter.build-farm",
             "system.snapshots",
         ] {
             assert_eq!(
@@ -800,5 +885,217 @@ mod tests {
             None,
             "stale kde_connect slug must not resolve",
         );
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // CTRLSURF-6 — scope-first taxonomy: sub-groups, plain-language
+    // renames (no SHOUTING), retired-section redirects, the Pinned
+    // quick-links, and the section-slug round-trip.
+    // ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn group_from_slug_round_trips_every_section() {
+        // DoD — every one of the seven section slugs round-trips.
+        for g in Group::all() {
+            assert_eq!(
+                Group::from_slug(g.slug()),
+                Some(g),
+                "section slug {} must round-trip",
+                g.slug()
+            );
+        }
+        let slugs: Vec<&str> = Group::all().iter().map(|g| g.slug()).collect();
+        assert_eq!(
+            slugs,
+            vec![
+                "dashboard",
+                "node",
+                "mesh",
+                "fleet",
+                "datacenter",
+                "monitoring",
+                "system",
+            ]
+        );
+    }
+
+    #[test]
+    fn no_section_or_panel_or_subgroup_label_is_shouting() {
+        // CTRLSURF-6 — no all-caps multi-word labels (the old "OTHER NODES" /
+        // "MESH: PROVISIONING" / "MESH: VIRTUAL WORKLOADS"). A bare acronym with
+        // no whitespace ("VPN") is legitimately upper-case and is NOT shouting.
+        fn is_shouting(s: &str) -> bool {
+            s.chars().any(char::is_whitespace)
+                && s.chars().any(|c| c.is_alphabetic())
+                && s == s.to_uppercase()
+        }
+        for g in Group::all() {
+            assert!(
+                !is_shouting(g.label()),
+                "section label SHOUTS: {}",
+                g.label()
+            );
+        }
+        for entry in nav_model() {
+            for panel in &entry.panels {
+                assert!(
+                    !is_shouting(panel.label()),
+                    "panel label SHOUTS: {}",
+                    panel.label()
+                );
+                if let Some(header) = panel.subgroup() {
+                    assert!(!is_shouting(header), "sub-group header SHOUTS: {header}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_sections_carry_subgroups_flat_sections_do_not() {
+        for g in [Group::ThisNode, Group::Mesh, Group::Fleet, Group::System] {
+            let entry = nav_model().into_iter().find(|e| e.group == g).unwrap();
+            assert!(
+                entry.panels.iter().all(|p| p.subgroup().is_some()),
+                "{g:?} panels must all carry a sub-group header"
+            );
+        }
+        for g in [Group::Dashboard, Group::Datacenter, Group::Monitoring] {
+            let entry = nav_model().into_iter().find(|e| e.group == g).unwrap();
+            assert!(
+                entry.panels.iter().all(|p| p.subgroup().is_none()),
+                "{g:?} renders flat (no sub-groups)"
+            );
+        }
+        // The Mesh sub-group headers, in the locked order.
+        let mesh = nav_model()
+            .into_iter()
+            .find(|e| e.group == Group::Mesh)
+            .unwrap();
+        let headers: Vec<&str> = mesh
+            .subgroups()
+            .into_iter()
+            .filter_map(|(h, _)| h)
+            .collect();
+        assert_eq!(
+            headers,
+            vec![
+                "Fabric",
+                "Shared Resources",
+                "Services",
+                "Local Network",
+                "Join the Mesh",
+            ]
+        );
+    }
+
+    #[test]
+    fn subgroups_helper_collapses_consecutive_runs_in_order() {
+        let entry = NavEntry {
+            group: Group::System,
+            panels: vec![
+                Panel::sub("a", "A", "One"),
+                Panel::sub("b", "B", "One"),
+                Panel::sub("c", "C", "Two"),
+                Panel::new("d", "D"),
+            ],
+        };
+        let sg = entry.subgroups();
+        assert_eq!(sg.len(), 3, "two headers + one flat run");
+        assert_eq!(sg[0].0, Some("One"));
+        assert_eq!(sg[0].1.len(), 2);
+        assert_eq!(sg[1].0, Some("Two"));
+        assert_eq!(sg[1].1.len(), 1);
+        assert_eq!(sg[2].0, None);
+        assert_eq!(sg[2].1.len(), 1);
+    }
+
+    #[test]
+    fn retired_section_slugs_redirect_to_their_new_homes() {
+        // CTRLSURF-6 — `mesh_provisioning` folds into Mesh; `provisioning` splits
+        // into Fleet (node templates) + Datacenter (compute). Deep-links survive.
+        assert_eq!(
+            view_from_focus_slug("mesh_provisioning"),
+            Some(View::Group(Group::Mesh))
+        );
+        for (slug, panel) in [
+            ("mesh_provisioning.mesh_join", "mesh_join"),
+            ("mesh_provisioning.genesis", "genesis"),
+            ("mesh_provisioning.mesh_federation", "mesh_federation"),
+        ] {
+            assert_eq!(
+                view_from_focus_slug(slug),
+                Some(View::Panel {
+                    group: Group::Mesh,
+                    panel,
+                }),
+                "{slug} must fold into Mesh ▸ Join the Mesh",
+            );
+        }
+        for (slug, panel) in [
+            ("provisioning.node_roles", "node_roles"),
+            ("provisioning.profiles", "profiles"),
+            ("provisioning.mirrors", "mirrors"),
+        ] {
+            assert_eq!(
+                view_from_focus_slug(slug),
+                Some(View::Panel {
+                    group: Group::Fleet,
+                    panel,
+                }),
+                "{slug} must fold into Fleet ▸ Node Templates",
+            );
+        }
+        assert_eq!(
+            view_from_focus_slug("provisioning.provisioning"),
+            Some(View::Panel {
+                group: Group::Datacenter,
+                panel: "provisioning",
+            }),
+            "the VM spawner moves to Datacenter",
+        );
+        assert_eq!(
+            view_from_focus_slug("provisioning"),
+            Some(View::Group(Group::Datacenter)),
+            "the bare retired section lands on Datacenter",
+        );
+    }
+
+    #[test]
+    fn pinned_links_all_resolve_to_real_routes() {
+        // §7 — no dead Pinned shortcut: each is a nav_model panel or a Datacenter
+        // fold-bar tab (build-farm).
+        for (label, group, slug) in pinned_links() {
+            let resolves = resolve_panel_label(group, slug).is_some()
+                || DatacenterTab::from_folded_slug(slug).is_some();
+            assert!(
+                resolves,
+                "pinned link {label} ({group:?}/{slug}) must resolve to a real route"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_language_renames_applied() {
+        // CTRLSURF-6 — the design's plain-language renames landed on the panels.
+        for (group, slug, want) in [
+            (Group::ThisNode, "mesh_services", "Mesh Connection"),
+            (Group::Mesh, "mesh_storage", "Shared Storage"),
+            (Group::Mesh, "sip_gateway", "Voice Gateway"),
+            (Group::Mesh, "all_services", "Service Directory"),
+            (Group::Mesh, "genesis", "Create a Mesh"),
+            (Group::Mesh, "mesh_pending", "Join Requests"),
+            (Group::Mesh, "mesh_federation", "Linked Meshes"),
+            (Group::Datacenter, "provisioning", "New Virtual Machine"),
+            (Group::System, "config_apply", "Apply Configuration"),
+            (Group::Monitoring, "health_check", "Health Check"),
+            (Group::Monitoring, "resources", "Resource Usage"),
+        ] {
+            assert_eq!(
+                resolve_panel_label(group, slug),
+                Some(want),
+                "{slug} must be relabelled {want:?}"
+            );
+        }
+        assert_eq!(Group::Fleet.label(), "Fleet");
     }
 }

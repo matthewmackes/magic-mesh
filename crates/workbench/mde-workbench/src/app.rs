@@ -875,10 +875,10 @@ impl App {
                 // standalone slug never lands on a missing panel.
                 if let Some(tab) = DatacenterTab::from_folded_slug(panel) {
                     self.view = View::Panel {
-                        group: Group::Provisioning,
+                        group: Group::Datacenter,
                         panel: "datacenter",
                     };
-                    let dc_load = self.on_panel_navigated(Group::Provisioning, "datacenter");
+                    let dc_load = self.on_panel_navigated(Group::Datacenter, "datacenter");
                     let tab_load = self.select_datacenter_tab(tab);
                     return Task::batch([dc_load, tab_load]);
                 }
@@ -1332,7 +1332,7 @@ impl App {
                     self.lighthouses.set_focus(focus);
                 }
             }
-            let dc_load = self.on_panel_navigated(Group::Provisioning, "datacenter");
+            let dc_load = self.on_panel_navigated(Group::Datacenter, "datacenter");
             let tab_load = self.select_datacenter_tab(tab);
             return Task::batch([dc_load, tab_load]);
         }
@@ -2048,11 +2048,10 @@ mod tests {
             (Group::ThisNode, "dns"),
             (Group::ThisNode, "routing"),
             (Group::Fleet, "tags"),
-            (Group::Provisioning, "profiles"),
-            // DATACENTER-25 — images folded into the Datacenter panel; node_roles
-            // is the still-standalone Provisioning panel used in its place here.
-            (Group::Provisioning, "node_roles"),
-            (Group::Provisioning, "mirrors"),
+            // CTRLSURF-6 — the node-build artifacts moved to Fleet ▸ Node Templates.
+            (Group::Fleet, "profiles"),
+            (Group::Fleet, "node_roles"),
+            (Group::Fleet, "mirrors"),
         ] {
             assert!(
                 panel_worklist_item(g, p).is_none(),
