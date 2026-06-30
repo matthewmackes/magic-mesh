@@ -134,13 +134,13 @@ pub mod router_discovery;
 pub mod bearer_ledger;
 pub mod descriptors;
 pub mod image_build;
-pub mod syncthing;
 pub mod image_catalog;
 pub mod install_profiles;
 pub mod leave;
 pub mod lifecycle;
 pub mod mesh_init;
 pub mod mirrors;
+pub mod syncthing;
 // NET-INTROSPECT (PD-6/PD-7) — direct-vs-relay tunnel classification via
 // Nebula's loopback debug SSH server. Consumed by nebula_supervisor (renders
 // the sshd block) + mesh_latency (queries + joins the hostmap).
