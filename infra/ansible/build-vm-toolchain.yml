@@ -36,6 +36,17 @@
           - opus-devel
           - gtk3-devel
           - libxkbcommon-devel
+          # E12 "Quasar" egui-on-DRM bare-seat backend (mde-egui `drm` feature):
+          # libgbm/EGL/GLES for the GBM + EGL + egui_glow render path, libinput +
+          # libudev (systemd-devel) for the seat input, libdrm for KMS. The
+          # egui-DRM example binary links these (gbm/EGL); without them the link
+          # fails `mold: fatal: library not found: gbm`.
+          - mesa-libgbm-devel
+          - mesa-libEGL-devel
+          - mesa-libGL-devel
+          - libinput-devel
+          - libdrm-devel
+          - systemd-devel
         state: present
 
     - name: rustup present?
