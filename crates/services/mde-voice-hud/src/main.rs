@@ -169,15 +169,23 @@ pub enum Message {
     /// Keypad button pressed. The handler appends the char to
     /// the current display contents.
     KeypadPressed(char),
-    /// Operator clicked the backspace key (or pressed Backspace
-    /// on the hardware keyboard). Removes the last char.
+    /// Operator clicked the on-screen Backspace key (or pressed
+    /// Backspace on the hardware keyboard). Removes the last char
+    /// of the dialer; a no-op while a call is up (the dialer is
+    /// frozen, showing the peer rather than an editable target).
     Backspace,
-    /// Operator pressed Escape. VOIP-27 ships idle-state only;
-    /// Escape exits the process (active-call → minimize-to-
-    /// dock-pill ships with VOIP-29). The handler invokes
-    /// `Task::done(Message::Exit)` which routes through the
-    /// runtime to a graceful exit.
+    /// Operator pressed Escape — a keyboard *intent*, routed in
+    /// `update` by the call state so a live call is never killed:
+    /// an `Incoming` ring → `Decline`, an active call → `HangUp`,
+    /// and only an idle/ended HUD → the graceful `Exit`. The
+    /// mapping is the pure [`escape_action`]; routing is `Task::done`.
     Escape,
+    /// Operator pressed Enter — the confirm/answer keyboard
+    /// accelerator. Routed in `update` (pure [`enter_action`]) to
+    /// the existing call messages: `Answer` a ringing call, else
+    /// `PlaceCall` the dialed target; a no-op while a call is
+    /// connecting or up. A keyboard intent, not a new call flow.
+    Enter,
     /// Sentinel that the runtime uses to flag exit. Triggers
     /// `std::process::exit(0)` — a layer-shell daemon has no
     /// last-window-closed shutdown signal.
@@ -475,10 +483,27 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
             }
         }
         Message::Backspace => {
-            state.dialer_input.pop();
+            // The dialer is frozen while a call is up (it shows the peer, not an
+            // editable target); don't let Backspace corrupt that display. Matches
+            // the KeypadPressed / DialerInputChanged in-call freeze.
+            if !matches!(state.call, sip::CallState::InCall { .. }) {
+                state.dialer_input.pop();
+            }
         }
         Message::Escape => {
-            return Task::done(Message::Exit);
+            // A live call must never be killed by Esc: route Esc to the call
+            // control that matches the current state (Decline a ring, Hang up an
+            // active call) and only exit an idle/ended HUD. Reuses the existing
+            // call-state messages — no new flow (§6).
+            return Task::done(escape_action(&state.call));
+        }
+        Message::Enter => {
+            // The confirm/answer accelerator: Answer a ring, else place the
+            // dialed call (PlaceCall self-guards an empty buffer / an active
+            // call); no Enter action while a call is connecting or up.
+            if let Some(action) = enter_action(&state.call) {
+                return Task::done(action);
+            }
         }
         Message::Exit => {
             std::process::exit(0);
@@ -817,27 +842,42 @@ async fn dial_poll(cursor: Option<String>) -> (Vec<String>, Option<String>) {
 fn keyboard_subscription() -> cosmic::iced::Subscription<Message> {
     use cosmic::iced::event;
     use cosmic::iced::keyboard;
+    // Only act on events no widget consumed (`Ignored`) — the same focus contract
+    // the dialer text-input relies on, so a focused field still owns its keys.
     event::listen_with(|event, status, _window| match event {
         cosmic::iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. })
             if status == event::Status::Ignored =>
         {
-            use cosmic::iced::keyboard::{key::Named, Key};
-            match key {
-                Key::Named(Named::Escape) => Some(Message::Escape),
-                Key::Named(Named::Backspace) => Some(Message::Backspace),
-                Key::Character(s) => {
-                    let c = s.chars().next()?;
-                    if is_dialer_char(c) {
-                        Some(Message::KeypadPressed(c))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            }
+            key_to_message(&key.as_ref())
         }
         _ => None,
     })
+}
+
+/// Pure key → [`Message`] mapping for the HUD's hardware-keyboard accelerators,
+/// split out so the routing is unit-testable without an event loop. Escape and
+/// Enter are keyboard *intents* the `update` handler resolves against the live
+/// call state ([`escape_action`] / [`enter_action`]); `m`/`M` is the in-call mute
+/// accelerator ([`Message::ToggleMute`] self-guards when no call is up, so it maps
+/// unconditionally); a dialer char types into the pad. Other keys are ignored.
+fn key_to_message(key: &cosmic::iced::keyboard::Key<&str>) -> Option<Message> {
+    use cosmic::iced::keyboard::{key::Named, Key};
+    match key {
+        Key::Named(Named::Escape) => Some(Message::Escape),
+        Key::Named(Named::Enter) => Some(Message::Enter),
+        Key::Named(Named::Backspace) => Some(Message::Backspace),
+        Key::Character(s) => {
+            let c = s.chars().next()?;
+            if is_dialer_char(c) {
+                Some(Message::KeypadPressed(c))
+            } else if c.eq_ignore_ascii_case(&'m') {
+                Some(Message::ToggleMute)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Bridge the persistent SIP agent's event channel (set up at boot) into iced
@@ -1055,7 +1095,7 @@ fn build_keypad(state: &VoiceHud) -> Element<'_, Message> {
         ['7', '8', '9'],
         ['*', '0', '#'],
     ];
-    let mut col: Vec<Element<Message>> = Vec::with_capacity(4);
+    let mut col: Vec<Element<Message>> = Vec::with_capacity(5);
     for line in rows {
         let mut row_buf: Vec<Element<Message>> = Vec::with_capacity(3);
         for c in line {
@@ -1063,6 +1103,19 @@ fn build_keypad(state: &VoiceHud) -> Element<'_, Message> {
         }
         col.push(row(row_buf).spacing(8).into());
     }
+    // A Backspace key in the bottom-right cell (under '#', the phone-keypad
+    // convention): the two leading thirds are left empty so it aligns to the
+    // keypad's right column. Gives the touch UI parity with the keyboard
+    // Backspace (axis 10 — no keyboard-only erase).
+    col.push(
+        row![
+            cosmic::iced::widget::space().width(Length::Fill),
+            cosmic::iced::widget::space().width(Length::Fill),
+            backspace_cell(state, now),
+        ]
+        .spacing(8)
+        .into(),
+    );
     column(col).spacing(8).into()
 }
 
@@ -1109,13 +1162,47 @@ fn press_sink_px(scale: f32) -> f32 {
     frac * mde_theme::feedback::HOVER_LIFT_PX
 }
 
-/// One 3 × 4 keypad button. Renders the digit/symbol on a
-/// surface-container background; click fires
-/// `Message::KeypadPressed(c)`. MOTION-FEEDBACK-1 — wrapped in a `mouse_area`
-/// that drives the shared hover-lift + press-depress feedback; the hover state
-/// also tints the key (the non-motion cue kept under reduce-motion).
+/// One 3 × 4 keypad button — the digit/symbol cell, click fires
+/// `Message::KeypadPressed(c)`. A thin wrapper over [`keypad_cell`] (the shared
+/// key builder), so every key — digits and Backspace alike — has one look and one
+/// feedback path.
 fn keypad_button(state: &VoiceHud, now: Instant, c: char) -> Element<'_, Message> {
-    let id = keypad_id(c);
+    keypad_cell(
+        state,
+        now,
+        keypad_id(c),
+        c.to_string(),
+        Message::KeypadPressed(c),
+    )
+}
+
+/// The on-screen Backspace key — the touch twin of the hardware Backspace, wired
+/// to the same [`Message::Backspace`] so both erase paths behave identically. Sits
+/// in the keypad's bottom-right cell (the phone-keypad convention) and carries the
+/// shared key look + hover/press feedback.
+fn backspace_cell(state: &VoiceHud, now: Instant) -> Element<'_, Message> {
+    keypad_cell(
+        state,
+        now,
+        "key/backspace".to_string(),
+        "\u{232b}".to_string(), // ⌫ U+232B ERASE TO THE LEFT
+        Message::Backspace,
+    )
+}
+
+/// One keypad cell: a labelled key on the mid-elevation surface, wired to `msg`,
+/// carrying the shared hover-lift + press-depress feedback (MOTION-FEEDBACK-1) and
+/// the hover tint that survives reduce-motion. The single builder the digit/symbol
+/// keys and the Backspace key share, so every key has one look + one feedback path
+/// (§6 — reuse, not per-key reimplementation). Every colour is an `mde-theme`
+/// token (§4).
+fn keypad_cell(
+    state: &VoiceHud,
+    now: Instant,
+    id: String,
+    label: String,
+    msg: Message,
+) -> Element<'_, Message> {
     let hovered = state.hovered.as_deref() == Some(&id);
     let fb = state.control_feedback(&id, now);
     // Hover tint is the non-motion cue (kept under reduce-motion, where the lift
@@ -1126,13 +1213,13 @@ fn keypad_button(state: &VoiceHud, now: Instant, c: char) -> Element<'_, Message
         theme::SURF_C
     };
     let key = button(
-        container(text(c.to_string()).size(22.0).colr(theme::ON_SURF))
+        container(text(label).size(22.0).colr(theme::ON_SURF))
             .width(Length::Fill)
             .height(Length::Fill)
             .align_x(cosmic::iced::alignment::Horizontal::Center)
             .align_y(cosmic::iced::alignment::Vertical::Center),
     )
-    .on_press(Message::KeypadPressed(c))
+    .on_press(msg)
     .width(Length::Fill)
     .height(Length::Fixed(56.0))
     .sty(
@@ -1390,6 +1477,34 @@ pub fn appended_char(old: &str, new: &str) -> Option<char> {
         Some(c)
     } else {
         None
+    }
+}
+
+/// Pure: the action an Escape key press maps to, given the live call state.
+///
+/// A live call is never killed by Esc — Esc Declines a ringing call and Hangs up
+/// an active one (reusing the existing call-state messages); only an idle/ended
+/// HUD exits. Split out so the keyboard→message routing is unit-testable.
+#[must_use]
+pub const fn escape_action(call: &sip::CallState) -> Message {
+    match CallKind::of(call) {
+        CallKind::Incoming => Message::Decline,
+        CallKind::Calling | CallKind::InCall => Message::HangUp,
+        CallKind::Idle | CallKind::Ended => Message::Exit,
+    }
+}
+
+/// Pure: the action the Enter/confirm key maps to.
+///
+/// Answers a ringing call, otherwise places the dialed call (`PlaceCall`
+/// self-guards an empty buffer); `None` while a call is connecting or up (Enter
+/// has no in-call action).
+#[must_use]
+pub const fn enter_action(call: &sip::CallState) -> Option<Message> {
+    match CallKind::of(call) {
+        CallKind::Incoming => Some(Message::Answer),
+        CallKind::Idle | CallKind::Ended => Some(Message::PlaceCall),
+        CallKind::Calling | CallKind::InCall => None,
     }
 }
 
@@ -2132,5 +2247,130 @@ mod tests {
         let at1 = fade_color(theme::PRIMARY, 1.0);
         assert!((at1.r - theme::PRIMARY.r).abs() < 1e-6);
         assert!((at1.g - theme::PRIMARY.g).abs() < 1e-6);
+    }
+
+    // ── POLISH-voicehud-callkeys — keyboard call control ──────────────────────
+
+    #[test]
+    fn escape_never_kills_a_live_call() {
+        // The bug fix: Esc must Decline a ring / Hang up an active call, and only
+        // exit when there is no live call. The pure mapping IS the routing — the
+        // handler is `Task::done(escape_action(..))`.
+        assert!(matches!(
+            escape_action(&sip::CallState::Incoming {
+                from: "pine".into()
+            }),
+            Message::Decline
+        ));
+        assert!(matches!(
+            escape_action(&sip::CallState::Calling {
+                peer: "pine".into()
+            }),
+            Message::HangUp
+        ));
+        assert!(matches!(
+            escape_action(&sip::CallState::Ringing {
+                peer: "pine".into()
+            }),
+            Message::HangUp
+        ));
+        assert!(matches!(
+            escape_action(&sip::CallState::InCall {
+                peer: "pine".into()
+            }),
+            Message::HangUp
+        ));
+        // Only an idle / ended / failed HUD exits.
+        assert!(matches!(
+            escape_action(&sip::CallState::Idle),
+            Message::Exit
+        ));
+        assert!(matches!(
+            escape_action(&sip::CallState::Ended),
+            Message::Exit
+        ));
+        assert!(matches!(
+            escape_action(&sip::CallState::Failed("x".into())),
+            Message::Exit
+        ));
+    }
+
+    #[test]
+    fn enter_answers_a_ring_else_places_the_call() {
+        assert!(matches!(
+            enter_action(&sip::CallState::Incoming {
+                from: "pine".into()
+            }),
+            Some(Message::Answer)
+        ));
+        assert!(matches!(
+            enter_action(&sip::CallState::Idle),
+            Some(Message::PlaceCall)
+        ));
+        assert!(matches!(
+            enter_action(&sip::CallState::Ended),
+            Some(Message::PlaceCall)
+        ));
+        // No confirm action while a call is connecting or up.
+        assert!(enter_action(&sip::CallState::Calling { peer: "p".into() }).is_none());
+        assert!(enter_action(&sip::CallState::Ringing { peer: "p".into() }).is_none());
+        assert!(enter_action(&sip::CallState::InCall { peer: "p".into() }).is_none());
+    }
+
+    #[test]
+    fn key_to_message_maps_call_control_and_dialer_keys() {
+        use cosmic::iced::keyboard::{key::Named, Key};
+        // Call-control intents + erase.
+        assert!(matches!(
+            key_to_message(&Key::Named(Named::Escape)),
+            Some(Message::Escape)
+        ));
+        assert!(matches!(
+            key_to_message(&Key::Named(Named::Enter)),
+            Some(Message::Enter)
+        ));
+        assert!(matches!(
+            key_to_message(&Key::Named(Named::Backspace)),
+            Some(Message::Backspace)
+        ));
+        // 'm' / 'M' is the in-call mute accelerator (case-insensitive).
+        assert!(matches!(
+            key_to_message(&Key::Character("m")),
+            Some(Message::ToggleMute)
+        ));
+        assert!(matches!(
+            key_to_message(&Key::Character("M")),
+            Some(Message::ToggleMute)
+        ));
+        // Dialer chars still type into the pad.
+        assert!(matches!(
+            key_to_message(&Key::Character("5")),
+            Some(Message::KeypadPressed('5'))
+        ));
+        assert!(matches!(
+            key_to_message(&Key::Character("#")),
+            Some(Message::KeypadPressed('#'))
+        ));
+        // A non-accelerator letter and unrelated named keys are ignored (no
+        // dial-buffer pollution).
+        assert!(key_to_message(&Key::Character("z")).is_none());
+        assert!(key_to_message(&Key::Named(Named::Tab)).is_none());
+    }
+
+    #[test]
+    fn backspace_does_not_edit_the_frozen_in_call_buffer() {
+        // The dialer shows the peer while a call is up; the new on-screen (and the
+        // existing hardware) Backspace must not corrupt it.
+        let mut hud = make_hud();
+        hud.call = sip::CallState::InCall {
+            peer: "pine".into(),
+        };
+        hud.dialer_input = "pine".into();
+        let _ = update(&mut hud, Message::Backspace);
+        assert_eq!(hud.dialer_input, "pine", "in-call Backspace is a no-op");
+        // Idle, it still erases the last char.
+        hud.call = sip::CallState::Idle;
+        let _ = update(&mut hud, Message::Backspace);
+        assert_eq!(hud.dialer_input, "pin");
     }
 }
