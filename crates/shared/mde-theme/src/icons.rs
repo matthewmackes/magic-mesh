@@ -241,6 +241,9 @@ pub enum Icon {
     StatusWarning,
     /// Error status dot.
     StatusError,
+    /// Informational status dot (filled `i`-in-a-circle). The peer of
+    /// the OK / warning / error dots for an *info*-severity indicator.
+    StatusInfo,
     /// Unknown / pending status dot.
     StatusUnknown,
 
@@ -339,6 +342,7 @@ impl Icon {
             Icon::StatusOk => "check_circle",
             Icon::StatusWarning => "warning",
             Icon::StatusError => "error",
+            Icon::StatusInfo => "info",
             Icon::StatusUnknown => "help",
 
             Icon::Refresh => "refresh",
@@ -413,6 +417,7 @@ impl Icon {
             Icon::StatusOk => "\u{25CF}",
             Icon::StatusWarning => "\u{25CF}",
             Icon::StatusError => "\u{25CF}",
+            Icon::StatusInfo => "\u{24D8}",
             Icon::StatusUnknown => "\u{25CB}",
 
             Icon::Refresh => "\u{21BB}",
@@ -447,6 +452,7 @@ impl Icon {
             | Icon::StatusOk
             | Icon::StatusWarning
             | Icon::StatusError
+            | Icon::StatusInfo
             | Icon::StatusUnknown
             | Icon::Playbook => FillMode::AlwaysFill,
 
@@ -851,6 +857,12 @@ fn material_svg_bytes(icon: Icon, svg_size: u32, filled: bool) -> &'static [u8] 
             24 => include_bytes!("../../../../assets/icons/material-symbols/error_fill1_24px.svg"),
             40 => include_bytes!("../../../../assets/icons/material-symbols/error_fill1_40px.svg"),
             _ => include_bytes!("../../../../assets/icons/material-symbols/error_fill1_24px.svg"),
+        },
+        Icon::StatusInfo => match svg_size {
+            20 => include_bytes!("../../../../assets/icons/material-symbols/info_fill1_20px.svg"),
+            24 => include_bytes!("../../../../assets/icons/material-symbols/info_fill1_24px.svg"),
+            40 => include_bytes!("../../../../assets/icons/material-symbols/info_fill1_40px.svg"),
+            _ => include_bytes!("../../../../assets/icons/material-symbols/info_fill1_24px.svg"),
         },
 
         // ── Never-filled icons (outlined-only) ──
@@ -1259,6 +1271,7 @@ mod tests {
             Icon::StatusOk,
             Icon::StatusWarning,
             Icon::StatusError,
+            Icon::StatusInfo,
             Icon::StatusUnknown,
             Icon::Playbook,
         ] {
@@ -1406,6 +1419,7 @@ mod tests {
             Icon::StatusOk,
             Icon::StatusWarning,
             Icon::StatusError,
+            Icon::StatusInfo,
             Icon::StatusUnknown,
             Icon::Refresh,
             Icon::Add,

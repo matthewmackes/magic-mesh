@@ -26,7 +26,7 @@ use cosmic::iced::widget::{button, column, container, row, scrollable, text, Spa
 use cosmic::iced::{window, Element, Length, Padding, Subscription, Task, Theme};
 use mackes_mesh_types::lighthouse::{self, Beacon};
 use mde_notify::{severity_token, AlertItem, AlertTail, Severity, Source};
-use mde_theme::Palette;
+use mde_theme::{mde_icon, Icon, IconSize, Palette};
 
 use motion::{collapse_stacks, HubAnim, Stack};
 // World-2 (raw `cosmic::iced`) layer-shell daemon — use the iced widgets +
@@ -993,14 +993,65 @@ pub fn group_severity(items: &[AlertItem]) -> Severity {
         .unwrap_or(Severity::Info)
 }
 
-/// One-glyph severity marker.
-fn severity_glyph(s: Severity) -> &'static str {
-    match s {
-        Severity::Critical => "●",
-        Severity::Warning => "◐",
-        Severity::Info => "○",
-        Severity::Success => "✓",
+/// NOTIFY-STATUS-STRIP — render a Carbon (Material Symbols) icon as a tinted SVG
+/// **in this bin**. The notify daemons sit on the far side of the World-1/World-2
+/// `Theme` boundary, so they can't call the `panel_chrome` icon renderers; this
+/// is the in-bin mirror of that idiom — `mde_icon(..).svg_bytes()` →
+/// `cosmic::iced::widget::svg` with a token-coloured `svg::Style`. The tint is
+/// always a `Palette`/severity token the caller passes (§4 — no raw colour here).
+fn icon_svg(icon: Icon, size: IconSize, color: cosmic::iced::Color) -> Element<'static, Message> {
+    use cosmic::iced::widget::svg as widget_svg;
+    let resolved = mde_icon(icon, size);
+    let px = resolved.size_px();
+    match resolved.svg_bytes() {
+        Some(bytes) => widget_svg(widget_svg::Handle::from_memory(bytes))
+            .width(Length::Fixed(px))
+            .height(Length::Fixed(px))
+            .style(move |_t, _s| widget_svg::Style { color: Some(color) })
+            .into(),
+        // Structural fallback (svg_bytes is always Some today) — never a raw glyph.
+        None => text(resolved.fallback_glyph).size(px).color(color).into(),
     }
+}
+
+/// NOTIFY-STATUS-STRIP — the Carbon status icon for a severity. The four glyphs
+/// are **shape-distinct** (error octagon / warning triangle / info & check
+/// circles), so the severity reads without relying on colour alone (a11y axis 6
+/// — never colour-only). Pure + testable.
+fn severity_icon(s: Severity) -> Icon {
+    match s {
+        Severity::Critical => Icon::StatusError,
+        Severity::Warning => Icon::StatusWarning,
+        Severity::Info => Icon::StatusInfo,
+        Severity::Success => Icon::StatusOk,
+    }
+}
+
+/// NOTIFY-STATUS-STRIP — the plain-language severity word shown beside the icon
+/// in the group header so the indicator is self-describing (paired with
+/// [`severity_icon`] for the never-colour-alone rule). Pure + testable.
+fn severity_label(s: Severity) -> &'static str {
+    match s {
+        Severity::Critical => "Critical",
+        Severity::Warning => "Warning",
+        Severity::Info => "Info",
+        Severity::Success => "OK",
+    }
+}
+
+/// NOTIFY-STATUS-STRIP — the labeled severity indicator: a shape-distinct Carbon
+/// status icon + its plain-language word, both in the severity token colour. Used
+/// where the severity was a bare colour-coded glyph (the group-card accent) so
+/// the meaning is carried by icon-shape + text, never colour alone.
+fn severity_indicator(s: Severity, p: Palette) -> Element<'static, Message> {
+    let color = severity_token(s, &p).into_cosmic_color();
+    row![
+        icon_svg(severity_icon(s), IconSize::Inline, color),
+        Space::new().width(Length::Fixed(6.0)),
+        text(severity_label(s)).size(12).color(color),
+    ]
+    .align_y(cosmic::iced::Alignment::Center)
+    .into()
 }
 
 /// Compact "Nm ago" age. Pure + testable.
@@ -1035,14 +1086,17 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     // (the panel is only ~390px wide). Generous top/side padding so nothing is
     // jammed against the window edge.
     let unread = state.items.iter().filter(|i| !i.read).count();
-    // NOTIFY-HUB-1 — a Carbon header matching the Application Menu's "▦ Applications"
-    // header: an accent glyph + the title in heading size, with the unread count
-    // as a muted suffix.
+    // NOTIFY-STATUS-STRIP — a wide, welcoming header indicator: the Carbon
+    // notification bell (a real Material SVG, not a cryptic glyph) + the title in
+    // heading size + the unread count as a muted live-state suffix, with generous
+    // breathing room before the title.
     let title_row = row![
-        text("\u{25D4}\u{FE0E}") // ◔ — a notification/bell-ish BMP glyph (not emoji)
-            .size(18)
-            .color(p.accent.into_cosmic_color()),
-        Space::new().width(Length::Fixed(10.0)),
+        icon_svg(
+            Icon::Notification,
+            IconSize::PanelHeader,
+            p.accent.into_cosmic_color()
+        ),
+        Space::new().width(Length::Fixed(12.0)),
         text("Notifications")
             .size(18)
             .color(p.text.into_cosmic_color()),
@@ -1075,10 +1129,11 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     } else {
         for (source, group) in group_items(&state.items) {
             let label = source.label();
-            let accent = severity_token(group_severity(&group), &p).into_cosmic_color();
             let collapsed = state.collapsed.contains(&label);
             let caret = if collapsed { "▸" } else { "▾" };
-            // Group header — clickable to toggle.
+            // Group header — clickable to toggle. The trailing severity indicator
+            // is now a Carbon status icon + plain word (NOTIFY-STATUS-STRIP), so
+            // the group's severity is never carried by colour alone.
             let head = button(
                 row![
                     text(caret).size(12).color(p.text_muted.into_cosmic_color()),
@@ -1087,9 +1142,7 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
                         .size(13)
                         .color(p.text.into_cosmic_color()),
                     Space::new().width(Length::Fill),
-                    text(severity_glyph(group_severity(&group)))
-                        .size(13)
-                        .color(accent),
+                    severity_indicator(group_severity(&group), p),
                 ]
                 .align_y(cosmic::iced::Alignment::Center),
             )
@@ -1145,9 +1198,9 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     // Workbench, MDE-Files, or Cosmic Settings, then dismiss the panel.
     let launch_bar = container(
         row![
-            launch_tile("\u{2317}\u{FE0E}", "Workbench", "mde-workbench", p),
-            launch_tile("\u{25A4}", "Files", "mde-files", p),
-            launch_tile("\u{2699}\u{FE0E}", "Settings", "cosmic-settings", p),
+            launch_tile(Icon::Workbench, "Workbench", "mde-workbench", p),
+            launch_tile(Icon::Files, "Files", "mde-files", p),
+            launch_tile(Icon::Settings, "Settings", "cosmic-settings", p),
         ]
         .spacing(8),
     )
@@ -1526,10 +1579,18 @@ fn lighthouses_footer(beacons: &[Beacon], beam_step: u16, p: Palette) -> Element
     } else {
         p.danger
     };
+    // NOTIFY-STATUS-STRIP — a Carbon shield (Material `security`) tinted by the
+    // live health colour replaces the cryptic ◉ fisheye, so the footer reads as a
+    // labeled "shield · Lighthouses · N/M healthy" status indicator. The beacon
+    // cards below keep the SHARED `lighthouse::beam_frame` sweep + each carries the
+    // plain `BeaconStatus::word()` state label, so this stays consistent with the
+    // Workbench Lighthouses tab (not forked).
     let header = row![
-        text("\u{25C9}") // ◉ fisheye — an abstract light source (BMP, not emoji)
-            .size(13)
-            .color(count_color.into_cosmic_color()),
+        icon_svg(
+            Icon::Firewall,
+            IconSize::Inline,
+            count_color.into_cosmic_color()
+        ),
         Space::new().width(Length::Fixed(8.0)),
         text("Lighthouses")
             .size(13)
@@ -1643,21 +1704,19 @@ fn transport_button(glyph: &str, msg: Message, p: Palette) -> Element<'_, Messag
     .into()
 }
 
-/// A bottom quick-launch tile: label + the binary it spawns (`OpenApp`).
-/// MUSIC-HUB-3 — a quick-launch tile matching the Application Menu's quick-link
-/// tiles: a glyph over a centred label, equal-width. (The applet uses the same
-/// ⌗ / ▤ / ⚙ glyphs for Workbench / Files / Settings.)
+/// A bottom quick-launch tile: a Carbon icon over a centred label + the binary it
+/// spawns (`OpenApp`). NOTIFY-STATUS-STRIP — the cryptic ⌗ / ▤ / ⚙ glyphs are now
+/// real Material SVGs (`Workbench` / `Files` / `Settings`); the label is kept so
+/// the tile is a labeled, welcoming launcher rather than glyph soup.
 fn launch_tile<'a>(
-    glyph: &'a str,
+    icon: Icon,
     label: &'a str,
     cmd: &'static str,
     p: Palette,
 ) -> Element<'a, Message> {
     button(
         cosmic::iced::widget::column![
-            text(glyph.to_string())
-                .size(18)
-                .color(p.text.into_cosmic_color()),
+            icon_svg(icon, IconSize::PanelHeader, p.text.into_cosmic_color()),
             text(label).size(12).color(p.text.into_cosmic_color()),
         ]
         .spacing(6)
@@ -1704,10 +1763,13 @@ fn alert_row_body(
     } else {
         format!("{} · {host}", format_age(item.ts_unix_ms, now_ms))
     };
+    // NOTIFY-STATUS-STRIP — the leading severity marker is a shape-distinct Carbon
+    // status icon (error octagon / warning triangle / info & check circles). The
+    // shape conveys severity independently of colour (a11y), and the alert title
+    // right beside it gives the plain-language context, so per-row severity reads
+    // clearly without a redundant word on every one of up to MAX_ROWS rows.
     let mut head = row![
-        text(severity_glyph(item.severity))
-            .size(13)
-            .color(sev_color),
+        icon_svg(severity_icon(item.severity), IconSize::Inline, sev_color),
         Space::new().width(Length::Fixed(8.0)),
         text(item.title.clone()).size(13).color(title_color),
     ]
@@ -1890,6 +1952,35 @@ mod tests {
         // Within Security, newest (ts 30) first.
         assert_eq!(groups[0].1[0].id, "c");
         assert_eq!(groups[0].1[1].id, "b");
+    }
+
+    /// NOTIFY-STATUS-STRIP — every severity maps to its shape-distinct Carbon
+    /// status icon + a plain-language word, and each icon resolves to a real
+    /// Material SVG payload (so the indicator is icon+label, never colour-alone).
+    #[test]
+    fn severity_maps_to_carbon_icon_and_plain_label() {
+        assert_eq!(severity_icon(Severity::Critical), Icon::StatusError);
+        assert_eq!(severity_icon(Severity::Warning), Icon::StatusWarning);
+        assert_eq!(severity_icon(Severity::Info), Icon::StatusInfo);
+        assert_eq!(severity_icon(Severity::Success), Icon::StatusOk);
+
+        assert_eq!(severity_label(Severity::Critical), "Critical");
+        assert_eq!(severity_label(Severity::Warning), "Warning");
+        assert_eq!(severity_label(Severity::Info), "Info");
+        assert_eq!(severity_label(Severity::Success), "OK");
+
+        for s in [
+            Severity::Critical,
+            Severity::Warning,
+            Severity::Info,
+            Severity::Success,
+        ] {
+            let bytes = mde_icon(severity_icon(s), IconSize::Inline).svg_bytes();
+            assert!(
+                bytes.is_some_and(|b| b.len() > 32),
+                "severity {s:?} status icon must resolve a real Carbon SVG"
+            );
+        }
     }
 
     #[test]
