@@ -5770,6 +5770,25 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("xcp_host".into());
         }
+        // XCPNG-HEALTH — on an XCP-NG host, probe the xcp-ng toolstack service
+        // catalog (`mde_role::xcpng::XCPNG_SERVICES`, `systemctl is-active` each)
+        // every 30 s and publish a whole-host health summary to
+        // `event/xcpng/services` so the Workbench host view + the alert lane see
+        // the live toolstack state. Gated to Role::Xcpng (rank 1) EXACTLY — not a
+        // rank floor: the catalog only exists on a Xen host, so a Workstation
+        // (rank 2) or Lighthouse (rank 0) would publish a misleading all-down
+        // summary. rank↔role is a bijection over the three roles, so the rank
+        // equality IS an exact-role gate.
+        if role_rank == mde_role::Role::Xcpng.rank() {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::xcpng_health::XcpngHealthWorker::new(node_id.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("xcpng_health".into());
+        }
         // OV-7.a (v2.6) — health reconciler. Polls each known
         // peer's QNM-Shared heartbeat.json every 5 s, applies the
         // telemetry::health_state_from_age threshold table, writes
