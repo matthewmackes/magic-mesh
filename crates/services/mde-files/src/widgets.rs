@@ -322,6 +322,21 @@ pub fn icon(svg_bytes: &'static [u8], size: f32, color: Color) -> Element<'stati
         .into()
 }
 
+/// POLISH-files-icons — render a typed [`mde_theme::Icon`] as a fixed-`size`,
+/// `color`-tinted inline glyph, through the very same `svg(handle(bytes))` path
+/// [`icon`] uses for the file-row mime glyph. The status + sync chips route
+/// their leading glyph through here so the canonical Material [`mde_theme::Icon`]
+/// set stays the single source — no inline `"⚠"`/`"⟳"` codepoint literal lives
+/// in the surface (§4 single-source / §6 reuse-don't-reimplement). The optical
+/// asset is the [`mde_theme::IconSize::Inline`] tier (the Carbon inline /
+/// badge-prefix size); `size` is the on-screen box, so the glyph matches its
+/// neighbouring chip text exactly.
+fn typed_icon(ic: mde_theme::Icon, size: f32, color: Color) -> Element<'static, Message> {
+    let bytes = mde_theme::mde_icon(ic, mde_theme::IconSize::Inline)
+        .svg_bytes_for_state(mde_theme::IconState::Idle);
+    icon(bytes, size, color)
+}
+
 /// 1-px horizontal divider line (`var(--divider)`).
 pub fn hdivider() -> Element<'static, Message> {
     container(Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
@@ -713,6 +728,23 @@ fn mime_to_icon(mime: Mime) -> mde_theme::Icon {
         Mime::Disk => mde_theme::Icon::Document,
     }
 }
+
+/// POLISH-files-icons — the typed [`mde_theme::Icon`] for the MESHFS conflict
+/// chip's leading glyph: the canonical *filled warning* status icon. Naming the
+/// mapping (rather than spelling a `"⚠"` codepoint inline) keeps the chip drawing
+/// from the same Material set as every file-row glyph and makes the choice
+/// testable (§4/§6).
+const CONFLICT_CHIP_ICON: mde_theme::Icon = mde_theme::Icon::StatusWarning;
+
+/// POLISH-files-icons — the typed [`mde_theme::Icon`] for the MESHFS sync/heal
+/// badge: the canonical *refresh* affordance. An in-flight heal reads as the same
+/// refresh glyph the rest of the fleet uses, instead of a hand-written `"⟳"`.
+const SYNC_BADGE_ICON: mde_theme::Icon = mde_theme::Icon::Refresh;
+
+/// POLISH-files-icons — on-screen box (px) for an inline status/sync chip glyph,
+/// matched to the chip's `size(10)` label text so the typed icon swaps in for the
+/// prior codepoint with no layout shift.
+const CHIP_GLYPH_PX: f32 = 10.0;
 
 // ─── MOTION-FEEDBACK — file-row/tile motion (shared mde_theme vocabulary) ────
 
@@ -1151,7 +1183,7 @@ pub fn file_row(
             button(
                 container(
                     row![
-                        text("⚠").size(10).colr(t::ACCENT_HI),
+                        typed_icon(CONFLICT_CHIP_ICON, CHIP_GLYPH_PX, t::ACCENT_HI),
                         text("conflict").size(10).colr(t::ACCENT_HI),
                     ]
                     .spacing(3)
@@ -1187,7 +1219,7 @@ pub fn file_row(
     // MESHFS-11.1: sync badge — renders below the card while healing.
     let sync_badge: Option<Element<'static, Message>> = if syncing {
         Some(
-            container(text("⟳").size(10).colr(t::FG_FAINT))
+            container(typed_icon(SYNC_BADGE_ICON, CHIP_GLYPH_PX, t::FG_FAINT))
                 .padding(Padding::from([1.0, 4.0]))
                 .into(),
         )
@@ -1474,7 +1506,7 @@ pub fn list_row(
             button(
                 container(
                     row![
-                        text("⚠").size(10).colr(t::ACCENT_HI),
+                        typed_icon(CONFLICT_CHIP_ICON, CHIP_GLYPH_PX, t::ACCENT_HI),
                         text("conflict").size(10).colr(t::ACCENT_HI),
                     ]
                     .spacing(3)
@@ -1509,7 +1541,7 @@ pub fn list_row(
 
     let sync_badge: Option<Element<'static, Message>> = if syncing {
         Some(
-            container(text("⟳").size(10).colr(t::FG_FAINT))
+            container(typed_icon(SYNC_BADGE_ICON, CHIP_GLYPH_PX, t::FG_FAINT))
                 .padding(Padding::from([1.0, 4.0]))
                 .into(),
         )
@@ -2137,5 +2169,42 @@ mod focus_tests {
                 "AlwaysVisible always draws the ring on a focused row",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    //! POLISH-files-icons — the status/sync chip glyphs resolve to the canonical
+    //! typed Material [`mde_theme::Icon`]s (no inline `"⚠"`/`"⟳"` codepoint), so a
+    //! chip draws from the same single source as every file-row glyph (§4/§6/§7).
+    use super::*;
+
+    #[test]
+    fn conflict_chip_uses_the_typed_warning_status_icon() {
+        // The MESHFS conflict chip's leading glyph is the canonical filled Carbon
+        // warning status icon, not a hand-written "⚠".
+        assert_eq!(CONFLICT_CHIP_ICON, mde_theme::Icon::StatusWarning);
+        assert_eq!(CONFLICT_CHIP_ICON.material_name(), "warning");
+        // …and it resolves to the real SVG byte slice the chip renders.
+        let bytes = mde_theme::mde_icon(CONFLICT_CHIP_ICON, mde_theme::IconSize::Inline)
+            .svg_bytes_for_state(mde_theme::IconState::Idle);
+        assert!(
+            bytes.starts_with(b"<svg"),
+            "warning glyph is real SVG bytes"
+        );
+    }
+
+    #[test]
+    fn sync_badge_uses_the_typed_refresh_icon() {
+        // The MESHFS sync/heal badge is the canonical Carbon refresh affordance,
+        // not a hand-written "⟳".
+        assert_eq!(SYNC_BADGE_ICON, mde_theme::Icon::Refresh);
+        assert_eq!(SYNC_BADGE_ICON.material_name(), "refresh");
+        let bytes = mde_theme::mde_icon(SYNC_BADGE_ICON, mde_theme::IconSize::Inline)
+            .svg_bytes_for_state(mde_theme::IconState::Idle);
+        assert!(
+            bytes.starts_with(b"<svg"),
+            "refresh glyph is real SVG bytes"
+        );
     }
 }
