@@ -1,0 +1,29 @@
+[package]
+name        = "mde-egui"
+description = "MCNF E12 egui harness — the shared eframe Wayland-client runner, the single-source Style/Visuals design system, and the motion (duration/easing) table that every E12 surface renders through. Replaces the retired libcosmic/iced + Carbon-token (mde-theme) stack."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_egui"
+path = "src/lib.rs"
+
+[dependencies]
+# E12 §4: egui is THE toolkit. eframe = egui + winit + wgpu, built as a Wayland
+# client — default-features off drops glow/x11/persistence; we opt into the wgpu
+# renderer, the Wayland winit backend, and the bundled default fonts. a11y/
+# accesskit is DEFERRED (E12 lock 11), so the `accesskit` feature is intentionally
+# absent — that absence IS the a11y deferral, not a stub.
+eframe = { version = "0.31", default-features = false, features = ["wgpu", "wayland", "default_fonts"] }
+egui   = "0.31"
+
+[[example]]
+name = "hello"
+path = "examples/hello.rs"
+
+[lints]
+workspace = true

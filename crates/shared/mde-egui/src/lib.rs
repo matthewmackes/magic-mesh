@@ -1,0 +1,38 @@
+//! `mde-egui` — the MCNF **E12 "Quasar"** egui harness.
+//!
+//! E12 forks the COSMIC desktop into the repo and rewrites every UI surface from
+//! libcosmic/iced to **egui** (governance §4/§5/§6). This crate is the shared
+//! foundation every surface is built on — the three things lock 14 says ship
+//! first:
+//!
+//! 1. [`runner::run_client`] — the **eframe Wayland-client runner**. One call
+//!    stands a surface up as an `eframe` (egui + winit + wgpu) Wayland client with
+//!    the shared look already installed.
+//! 2. [`style::Style`] — the **single source of look** (`Style`/`Visuals`). A Rust
+//!    module, not a token crate: there is no raw-literal lint gate (E12 lock 9, the
+//!    §0-Simple lever), so `Style` *is* the discipline. Surfaces never hand-roll
+//!    colours or spacing — they read `Style` and call [`Style::install`].
+//! 3. [`motion::Motion`] — the small shared **duration/easing table** wrapping
+//!    egui's built-in `animate_bool` (E12 lock 10 — no bespoke motion engine, no
+//!    motion lint gate).
+//!
+//! **Accessibility is deferred** (E12 lock 11): the `accesskit` eframe feature is
+//! intentionally not enabled. egui/eframe keep an accesskit path to wire in a
+//! post-stabilization a11y epic; until then this harness ships without it.
+//!
+//! The crate has **zero libcosmic/iced dependencies** — it depends only on
+//! `egui`/`eframe`. Both are re-exported so every surface resolves to the one
+//! harness-pinned egui version (no cross-surface version skew).
+
+pub mod motion;
+pub mod runner;
+pub mod style;
+
+pub use motion::Motion;
+pub use runner::run_client;
+pub use style::Style;
+
+// Re-export the toolkit so surfaces depend on `mde-egui` alone and share one
+// egui/eframe resolution.
+pub use eframe;
+pub use egui;
