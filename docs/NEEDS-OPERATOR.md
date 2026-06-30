@@ -19,6 +19,14 @@ _Generated 2026-06-27 from the worklist reconcile (wf_0cfa1277). These items hav
 - **DATACENTER-3: DS-8 mesh secret store holds DC creds** — _needs:_ automation/secrets/mcnf-secret.sh built; XAPI + DO creds resolve from etcd+age store (proven); UniFi cred pending (coupled to DC-14); store replication to other live nodes + guided-rebirth remain live
 - **DATACENTER-23: control-plane DR (encrypted backup + one-click restore)** — _needs:_ automation/dr/dr-backup.sh + restore built + round-trip verified live; dr_scheduler worker + RPC + Overview button done. Remaining: Nebula CA + off-fleet push target + guided restore-rebirth (operator
 
+## FEDERATION
+
+_(2026-06-29 — surfaced during the workbench critical-bug drain. The `accept` auth-bypass itself is **fixed**: `cmd_accept` now consumes a single-use, unexpired, unconsumed local mint envelope — `crates/platform/mde-bus/src/cli/federation.rs`, farm-tested. These are the larger gaps that need a decision, not a build.)_
+
+- **FED-RUNTIME: `federation.yaml` has no runtime consumer** — _needs:_ design/build decision. `mde-bus federation accept/grant/revoke` write `federation.yaml`, but nothing in `mackesd`/`mde-bus` reads it at runtime — the topic grants/exclusions have **zero live effect** (no bus-federation worker enforces cross-mesh topic flow). Either build the enforcement worker or the pairing surface is decorative.
+- **FED-XMESH: cross-mesh accept has no envelope on the accepter** — _needs:_ design decision + the **missing** design doc. `accept` now (correctly) requires a local mint envelope; a true two-mesh pairing (mint on A, accept on B) has none on B. Decide the model (replicate the secret / handshake exchange / keep same-root) and author `docs/design/v1.0-federation-pairing.md` (cited everywhere, does not exist).
+- **FED-GUI: panel-side no-ops + missing guards** (workbench audit) — _needs:_ operator decision. `mesh_federation.rs`: "Apply grants" writes `federation-pending-grant.yaml` that nothing reads (silent no-op reported as success); `rotate` only bumps the `established` timestamp (no real CA cross-sign); GUI writes are non-atomic vs the CLI's temp+rename; no confirm before destructive Revoke; accept label hardcoded. Resolve with FED-RUNTIME.
+
 ## LIGHTHOUSE-BOOT
 
 - **LIGHTHOUSE-VARMOUNT acceptance bullet 3: verify on rebooted droplet mackesd active without** — _needs:_ Requires live infra verification on a real DO lighthouse after it reboots. The fix is code-complete and baked into packaging; verification is operator-gated (manual droplet provision + reboot).
