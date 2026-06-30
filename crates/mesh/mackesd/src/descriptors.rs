@@ -14,7 +14,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use mackes_mesh_types::peers::{
-    AlarmSummary, ContainerInfo, MediaService, RemoteAccess, ServiceDescriptors, VmInfo,
+    AlarmSummary, ContainerInfo, MediaService, MeshFsUsage, RemoteAccess, ServiceDescriptors,
+    VmInfo,
 };
 
 /// The pinned localhost media-port scan list (L12) — a constant,
@@ -49,7 +50,44 @@ pub fn probe_local() -> ServiceDescriptors {
         media: probe_media(),
         alarms: probe_netdata_alarms(),
         lan_macs: probe_lan_macs(),
+        mesh_fs: probe_mesh_fs(),
     }
+}
+
+/// MESHFS-2 — `df` the Mesh-Sync mount (`CANONICAL_QNM_MOUNT`) for this peer's
+/// used/avail bytes, published on the heartbeat. `present: false` when the mount
+/// is absent or `df` fails — the aggregator skips such peers.
+#[must_use]
+pub fn probe_mesh_fs() -> MeshFsUsage {
+    let mount = std::path::Path::new(crate::CANONICAL_QNM_MOUNT);
+    if !mount.is_dir() {
+        return MeshFsUsage::default();
+    }
+    match df_used_avail(mount) {
+        Some((used_bytes, avail_bytes)) => MeshFsUsage {
+            present: true,
+            used_bytes,
+            avail_bytes,
+        },
+        None => MeshFsUsage::default(),
+    }
+}
+
+/// `df -B1 --output=used,avail <path>` → `(used, avail)` bytes; `None` on failure.
+fn df_used_avail(path: &std::path::Path) -> Option<(u64, u64)> {
+    let out = Command::new("df")
+        .args(["-B1", "--output=used,avail"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let mut nums = body.lines().nth(1)?.split_whitespace();
+    let used = nums.next()?.parse::<u64>().ok()?;
+    let avail = nums.next()?.parse::<u64>().ok()?;
+    Some((used, avail))
 }
 
 /// Physical-interface MACs from `/sys/class/net` (PD-12). Physical =

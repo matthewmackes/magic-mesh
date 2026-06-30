@@ -1809,8 +1809,9 @@ fn main() -> anyhow::Result<()> {
             println!("{}", report.to_json_line()?);
         }
         Cmd::MeshFsStatus => {
-            // MESHFS-1 — local mount report; both GUI consumers parse this JSON.
-            let report = mesh_fs_report(std::path::Path::new(mackesd_core::CANONICAL_QNM_MOUNT));
+            // MESHFS-2 — aggregate every peer's share usage from the replicated
+            // directory; both GUI consumers parse this JSON.
+            let report = mesh_fs_report(&mackesd_core::default_qnm_shared_root());
             println!("{}", serde_json::to_string(&report)?);
         }
         Cmd::Connect { ip, port } => match mackesd_core::connect_actions::connect_argv(&ip, port) {
@@ -5274,40 +5275,42 @@ struct MeshFsReport {
     offline_peers: Vec<String>,
 }
 
-/// `df` for the mesh-storage mount → `(used_bytes, avail_bytes)`. `None` when df
-/// fails / the path is absent. Not feature-gated: the sibling `filesystem_*_bytes`
-/// wrappers + `mde_bus::retention::filesystem_total_avail_bytes` are all behind
-/// `async-services` / the optional `mde-bus` dep, unreachable from the sync CLI.
-fn mesh_storage_df(path: &std::path::Path) -> Option<(u64, u64)> {
-    let out = std::process::Command::new("df")
-        .args(["-B1", "--output=used,avail"])
-        .arg(path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// MESHFS-2 — aggregate every peer's Mesh-Sync `df` usage from the replicated
+/// peer directory under `qnm_root`. Each peer publishes its own usage on the
+/// heartbeat (`descriptors.mesh_fs`); a peer that hasn't probed yet (pre-MESHFS-2
+/// / `present: false`) is skipped rather than shown as a phantom 0-byte share.
+/// Falls back to THIS node's local mount when no peer has published usage yet, so
+/// the Mesh Storage panel is never empty on a fresh mesh.
+fn mesh_fs_report(qnm_root: &std::path::Path) -> MeshFsReport {
+    let mount = std::path::Path::new(mackesd_core::CANONICAL_QNM_MOUNT);
+    let records =
+        mackes_mesh_types::peers::read_peers(&mackes_mesh_types::peers::peers_dir(qnm_root));
+    let mut peers: Vec<MeshFsPeer> = records
+        .iter()
+        .filter_map(|r| {
+            let u = r.descriptors.as_ref()?.mesh_fs;
+            u.present.then(|| MeshFsPeer {
+                addr: r.hostname.clone(),
+                used_bytes: u.used_bytes,
+                avail_bytes: u.avail_bytes,
+                undergoal_chunks: 0,
+            })
+        })
+        .collect();
+    peers.sort_by(|a, b| a.addr.cmp(&b.addr));
+    if peers.is_empty() {
+        // No peer has published mesh_fs yet — report this node's local mount so
+        // the panel still shows real data (reuses the heartbeat's own prober).
+        let u = mackesd_core::descriptors::probe_mesh_fs();
+        if u.present {
+            peers.push(MeshFsPeer {
+                addr: default_node_id(),
+                used_bytes: u.used_bytes,
+                avail_bytes: u.avail_bytes,
+                undergoal_chunks: 0,
+            });
+        }
     }
-    let body = String::from_utf8_lossy(&out.stdout);
-    let mut nums = body.lines().nth(1)?.split_whitespace();
-    let used = nums.next()?.parse::<u64>().ok()?;
-    let avail = nums.next()?.parse::<u64>().ok()?;
-    Some((used, avail))
-}
-
-/// MESHFS-1 — build the local-mount storage report for `mount`.
-fn mesh_fs_report(mount: &std::path::Path) -> MeshFsReport {
-    let present = mount.is_dir();
-    let peers = if present {
-        let (used_bytes, avail_bytes) = mesh_storage_df(mount).unwrap_or((0, 0));
-        vec![MeshFsPeer {
-            addr: default_node_id(),
-            used_bytes,
-            avail_bytes,
-            undergoal_chunks: 0,
-        }]
-    } else {
-        vec![]
-    };
     // full-mesh: every present node holds a copy, so the goal == the peer count.
     let goal = peers.len() as u64;
     MeshFsReport {
@@ -5317,7 +5320,7 @@ fn mesh_fs_report(mount: &std::path::Path) -> MeshFsReport {
         goal,
         quota_cap_bytes: None,
         limiting_peer_addr: None,
-        master_reachable: present,
+        master_reachable: mount.is_dir(),
         offline_peers: vec![],
     }
 }
@@ -5325,30 +5328,64 @@ fn mesh_fs_report(mount: &std::path::Path) -> MeshFsReport {
 #[cfg(test)]
 mod meshfs_tests {
     use super::*;
+    use mackes_mesh_types::peers::{MeshFsUsage, PeerRecord, ServiceDescriptors};
 
-    #[test]
-    fn report_for_absent_mount_is_empty_but_valid() {
-        let r = mesh_fs_report(std::path::Path::new("/no-such-mesh-mount-zzz"));
-        assert!(!r.master_reachable);
-        assert!(r.peers.is_empty());
-        assert_eq!(r.goal, 0);
-        let json = serde_json::to_string(&r).unwrap();
-        // The Workbench panel's emptiness check is on stdout, not the peer list:
-        // an absent mount still emits a non-empty JSON object (no false error).
-        assert!(json.contains("\"master_reachable\":false"));
-        assert!(json.contains("\"peers\":[]"));
+    fn write_peer(root: &std::path::Path, host: &str, mesh_fs: MeshFsUsage) {
+        let mut rec = PeerRecord::now(host, None, "healthy");
+        rec.descriptors = Some(ServiceDescriptors {
+            mesh_fs,
+            ..Default::default()
+        });
+        let pdir = mackes_mesh_types::peers::peers_dir(root);
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(
+            pdir.join(format!("{host}.json")),
+            serde_json::to_string(&rec).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
-    fn report_for_present_mount_has_one_local_peer() {
-        // /tmp exists on the build host; stand-in for the mesh mount.
-        let r = mesh_fs_report(std::path::Path::new("/tmp"));
-        assert!(r.master_reachable);
-        assert_eq!(r.peers.len(), 1);
-        assert_eq!(r.goal, 1);
-        assert!(!r.peers[0].addr.is_empty());
-        // the under-replicated check both GUIs run must read healthy:
-        assert!(!(r.goal > 0 && (r.peers.len() as u64) < r.goal));
+    fn aggregates_present_peers_from_the_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_peer(
+            tmp.path(),
+            "anvil",
+            MeshFsUsage {
+                present: true,
+                used_bytes: 100,
+                avail_bytes: 900,
+            },
+        );
+        write_peer(
+            tmp.path(),
+            "forge",
+            MeshFsUsage {
+                present: true,
+                used_bytes: 200,
+                avail_bytes: 800,
+            },
+        );
+        // A peer that hasn't probed its mount yet must be SKIPPED, not shown as a
+        // phantom 0-byte share.
+        write_peer(tmp.path(), "lh", MeshFsUsage::default());
+        let r = mesh_fs_report(tmp.path());
+        assert_eq!(r.peers.len(), 2, "only present peers aggregate");
+        assert_eq!(r.goal, 2);
+        // sorted by addr (hostname)
+        assert_eq!(r.peers[0].addr, "anvil");
+        assert_eq!(r.peers[0].used_bytes, 100);
+    }
+
+    #[test]
+    fn empty_directory_emits_valid_json_no_false_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No peer records and /mnt/mesh-storage absent on the build host → empty
+        // peers, but still a non-empty JSON object (the panel checks stdout).
+        let r = mesh_fs_report(tmp.path());
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"peers\":"));
+        assert!(json.contains("\"goal\":"));
     }
 }
 
