@@ -1,0 +1,49 @@
+# MCNF E12 "Quasar" — `mde-panel-egui`: the egui panel client (E12-7).
+#
+# Replaces the libcosmic cosmic-applet (crates/platform/mde-cosmic-applet) with an
+# egui panel rendered through the shared `mde-egui` Style/Motion: a live worst-of
+# mesh-health pip + one working quick action (mesh-wide Do-Not-Disturb).
+#
+# Tier (§6): desktop-shell. Its dependency edges all point INWARD —
+#   mde-egui          (shared harness)            : Style/Motion + run_client
+#   mde-bus           (platform-services)         : the mesh-replicated DND state
+#   mde-cosmic-applet (platform, lib-only)        : the reused LIGHTHOUSE-7 model
+# — so the mesh substrate stays headless-capable. No libcosmic: this panel REPLACES
+# the libcosmic shell, so it pulls the applet's pure logic with default-features off.
+[package]
+name        = "mde-panel-egui"
+description = "MCNF E12 Quasar — the egui panel client that replaces the libcosmic cosmic-applet: a live worst-of mesh-health pip (the LIGHTHOUSE-7 snapshot model reused from mde-cosmic-applet + mackes-mesh-types) plus a working Do-Not-Disturb quick action off the mesh-replicated mde-bus DND state, rendered through the shared mde-egui Style/Motion. Render-agnostic model (lib, unit-tested) + the thin eframe panel shell (bin)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_panel_egui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mde-panel-egui"
+path = "src/main.rs"
+
+[dependencies]
+# §4/§5 harness — the shared Style/Motion, run_client (the eframe Wayland-client
+# runner), and re-exported egui/eframe so the panel shares one toolkit resolution.
+mde-egui = { path = "../../shared/mde-egui" }
+
+# The mesh-wide Do-Not-Disturb state — the quick action's live subscription (the
+# bus-replicated dnd.yaml) AND its write target (mde_bus::dnd::save_default).
+# platform-services tier; the edge points inward (§6).
+mde-bus = { path = "../../platform/mde-bus" }
+
+# Reuse the cosmic-applet's render-agnostic LIGHTHOUSE-7 model
+# (lighthouse_health_from_snapshot / LighthouseHealth), itself built on
+# mackes-mesh-types' LIGHTHOUSE_ROLE. `default-features = false` drops the
+# applet's libcosmic panel shell — this egui panel replaces it, and E12 retires
+# libcosmic — so only the pure logic layer is compiled in.
+mde-cosmic-applet = { path = "../../platform/mde-cosmic-applet", default-features = false }
+
+[lints]
+workspace = true
