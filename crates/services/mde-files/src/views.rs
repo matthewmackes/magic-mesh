@@ -15,15 +15,15 @@ use crate::density::FileListMetrics;
 use crate::grid;
 use crate::icons;
 use crate::model::{fmt_count, FileRow, Layout, Peer, PeerStatus, SelfNode, Tab, View};
-use crate::panels::ContextMenuItem;
+use crate::panels::{ContextMenuItem, OpRow, OpState};
 use crate::properties::FileProperties;
 use crate::search;
 use crate::selection::Selection;
 use crate::theme as t;
 use crate::widgets::{
-    banner, breadcrumb_tag, disclosure_row, file_row, file_row_head, ghost_button_style, icon,
-    list_row, peer_card, section_h, side_row, side_section_header, tx_row, BannerStat,
-    RowMotionCtx, SideRowVariant,
+    banner, breadcrumb_tag, detail_card, disclosure_row, file_row, file_row_head,
+    ghost_button_style, hdivider, icon, list_row, local_pill, mesh_pill, peer_card, section_h,
+    side_row, side_section_header, tx_row, BannerStat, RowMotionCtx, SideRowVariant,
 };
 
 // ─── Titlebar ──────────────────────────────────────────────────────────────
@@ -2166,6 +2166,347 @@ pub fn properties_dialog(props: &FileProperties) -> Element<'static, Message> {
     ])
     .width(Length::Fill)
     .height(Length::Fill)
+    .into()
+}
+
+// ── Phase 1.4 / 1.7: details panel + operation drawer ───────────────────────
+
+/// Phase 1.4 — the right-hand details panel: a fixed-width metadata rail for the
+/// focused item, rendered straight from its live [`FileRow`] (no fabricated
+/// fields — `MdeFiles::focused_detail_row` only resolves rows that exist in the
+/// active listing). Header reuses the shared object card; below it the origin
+/// pill, size, modified, sync / conflict state, and a Copy-path action for local
+/// rows. The Close control consumes the locked `DetailsClose` a11y label.
+pub fn details_pane(file: &FileRow) -> Element<'static, Message> {
+    let kv = |k: &str, v: String, color: Color| -> Element<'static, Message> {
+        row![
+            container(text(k.to_string()).size(11).colr(t::FG_DIM)).width(Length::Fixed(72.0)),
+            text(v).size(11).colr(color),
+        ]
+        .spacing(8)
+        .into()
+    };
+
+    let header = row![
+        text("DETAILS").size(11).colr(t::FG_DIM),
+        Space::new().width(Length::Fill),
+        tooltip(
+            op_icon_btn(icons::CLOSE, t::FG_DIM, Message::ToggleDetails),
+            text(a11y_labels::label_for(A11yAction::DetailsClose)).size(11),
+            tooltip::Position::Bottom,
+        ),
+    ]
+    .spacing(8)
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    // Origin — a mesh-peer pill when the row came off the mesh, else "local".
+    let origin: Element<'static, Message> = match file.origin() {
+        Some(host) => mesh_pill(host),
+        None => local_pill(),
+    };
+
+    let mut col = column![
+        detail_card(&file.name, file.mime),
+        Space::new().height(Length::Fixed(12.0)),
+        row![
+            container(text("Origin").size(11).colr(t::FG_DIM)).width(Length::Fixed(72.0)),
+            origin,
+        ]
+        .spacing(8)
+        .align_y(cosmic::iced::alignment::Vertical::Center),
+        kv("Size", file.size.clone(), t::FG),
+        kv("Modified", file.age.clone(), t::FG),
+    ]
+    .spacing(6)
+    .padding(Padding::from([14.0, 16.0]))
+    .width(Length::Fill);
+
+    // Sync state — only meaningful for mesh-homed rows.
+    if file.syncing {
+        col = col.push(kv("Sync", "Replicating…".to_string(), t::ACCENT));
+    } else if file.is_mesh() {
+        col = col.push(kv("Sync", "Up to date".to_string(), t::PF_SUCCESS));
+    }
+    if let Some(sibling) = &file.conflict_sibling {
+        col = col.push(kv("Conflict", sibling.clone(), t::PF_DANGER));
+    }
+    // Local rows carry a real path → show it + a Copy-path action.
+    if let Some(path) = &file.path {
+        col = col.push(Space::new().height(Length::Fixed(8.0)));
+        col = col.push(text(path.clone()).size(10).colr(t::FG_FAINT));
+        col = col.push(Space::new().height(Length::Fixed(8.0)));
+        col = col.push(
+            button(text("Copy path").size(11).colr(t::FG))
+                .padding(Padding::from([4.0, 10.0]))
+                .sty(|_, status| {
+                    let bg = match status {
+                        button::Status::Hovered | button::Status::Pressed => Color {
+                            a: 0.08,
+                            ..Color::WHITE
+                        },
+                        _ => Color {
+                            a: 0.04,
+                            ..Color::WHITE
+                        },
+                    };
+                    button::Style {
+                        snap: false,
+                        background: Some(Background::Color(bg)),
+                        text_color: t::FG,
+                        border: Border {
+                            color: t::DIVIDER,
+                            width: 1.0,
+                            radius: 0.0.into(),
+                        },
+                        ..button::Style::default()
+                    }
+                })
+                .on_press(Message::CopyPath(path.clone())),
+        );
+    }
+
+    container(
+        column![
+            container(header).padding(Padding::from([12.0, 16.0])),
+            hdivider(),
+            col,
+        ]
+        .spacing(0),
+    )
+    .width(Length::Fixed(t::SIDEBAR_W))
+    .height(Length::Fill)
+    .sty(|_| container::Style {
+        snap: false,
+        background: Some(Background::Color(t::PF_BG_200)),
+        border: Border {
+            color: t::DIVIDER,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
+/// Phase 1.7 — the operation drawer: a docked bottom panel of recent + in-flight
+/// transfers, each with live progress, a state badge, a Retry (failed/cancelled
+/// only) + a Dismiss control. Rendered whenever the drawer is open — it auto-
+/// opens after every Send-To (`MdeFiles::dispatch_send`), so the operator always
+/// sees a transfer's outcome instead of it being recorded invisibly.
+pub fn operation_drawer(rows: &[OpRow]) -> Element<'static, Message> {
+    let active = rows.iter().filter(|r| r.state.is_active()).count();
+    let summary = if active > 0 {
+        format!("{active} active")
+    } else {
+        format!("{} recent", rows.len())
+    };
+
+    let header = row![
+        text("TRANSFERS").size(11).colr(t::FG_DIM),
+        text(summary).size(10).colr(t::FG_FAINT),
+        Space::new().width(Length::Fill),
+        button(text("Hide").size(11).colr(t::FG_FAINT))
+            .padding(Padding::from([2.0, 8.0]))
+            .sty(|_, status| {
+                let bg = match status {
+                    button::Status::Hovered | button::Status::Pressed => Color {
+                        a: 0.08,
+                        ..Color::WHITE
+                    },
+                    _ => Color::TRANSPARENT,
+                };
+                button::Style {
+                    snap: false,
+                    background: Some(Background::Color(bg)),
+                    text_color: t::FG_FAINT,
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 4.0.into(),
+                    },
+                    ..button::Style::default()
+                }
+            })
+            .on_press(Message::ToggleOperationDrawer),
+    ]
+    .spacing(8)
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    let body: Element<'static, Message> = if rows.is_empty() {
+        container(text("No transfers yet.").size(12).colr(t::FG_FAINT))
+            .padding(Padding::from([10.0, 4.0]))
+            .into()
+    } else {
+        let mut list = column![].spacing(2);
+        for r in rows {
+            list = list.push(op_row_view(r));
+        }
+        scrollable(list).height(Length::Fixed(168.0)).into()
+    };
+
+    container(
+        column![
+            container(header).padding(Padding::from([8.0, 12.0])),
+            hdivider(),
+            body,
+        ]
+        .spacing(0),
+    )
+    .width(Length::Fill)
+    .sty(|_| container::Style {
+        snap: false,
+        background: Some(Background::Color(t::PF_BG_200)),
+        border: Border {
+            color: t::DIVIDER,
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
+/// Phase 1.7 — one operation-drawer row: `source → destination`, a percent
+/// readout, the state badge + (gated) Retry / Dismiss controls, and the progress
+/// track below. Retry is shown only for a retryable op ([`OpState::can_retry`]);
+/// Dismiss only once the op is terminal. No Cancel control is wired — the
+/// synchronous backend never leaves an op mid-flight, so a Cancel would be dead
+/// (the `OpDrawerCancel` a11y label is reserved for when streaming progress lands).
+fn op_row_view(op: &OpRow) -> Element<'static, Message> {
+    let (badge_label, color) = match op.state {
+        OpState::Queued => ("Queued", t::FG_FAINT),
+        OpState::Running => ("Running", t::ACCENT),
+        OpState::Completed => ("Done", t::PF_SUCCESS),
+        OpState::Failed => ("Failed", t::PF_DANGER),
+        OpState::Cancelled => ("Cancelled", t::FG_FAINT),
+    };
+    let pct = (u32::from(op.progress_permille.min(1000)) / 10) as u16;
+
+    let mut controls = row![op_state_badge(badge_label, color)]
+        .spacing(6)
+        .align_y(cosmic::iced::alignment::Vertical::Center);
+    if op.state.can_retry() {
+        controls = controls.push(tooltip(
+            op_icon_btn(icons::REFRESH, t::ACCENT, Message::RetryOp(op.op_id)),
+            text(a11y_labels::label_for(A11yAction::OpDrawerRetry)).size(11),
+            tooltip::Position::Bottom,
+        ));
+    }
+    if op.state.is_terminal() {
+        controls = controls.push(tooltip(
+            op_icon_btn(icons::CLOSE, t::FG_DIM, Message::OpRowDismiss(op.op_id)),
+            text(a11y_labels::label_for(A11yAction::OpDrawerDismiss)).size(11),
+            tooltip::Position::Bottom,
+        ));
+    }
+
+    let head = row![
+        text(format!("{}  →  {}", op.source, op.destination))
+            .size(12)
+            .colr(t::FG)
+            .width(Length::Fill),
+        text(format!("{pct}%")).size(11).colr(t::FG_FAINT),
+        controls,
+    ]
+    .spacing(10)
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+
+    container(column![head, op_progress_bar(op.progress_permille, color)].spacing(6))
+        .padding(Padding::from([8.0, 10.0]))
+        .width(Length::Fill)
+        .into()
+}
+
+/// Phase 1.7 — small state pill for an op row (a tint of the state colour, like
+/// the transfer-log direction pill). The fill/border are alpha tints of the same
+/// single-sourced token, so no raw colour is minted.
+fn op_state_badge(label: &str, color: Color) -> Element<'static, Message> {
+    container(text(label.to_string()).size(10).colr(color))
+        .padding(Padding::from([1.0, 6.0]))
+        .sty(move |_| container::Style {
+            snap: false,
+            background: Some(Background::Color(Color { a: 0.10, ..color })),
+            border: Border {
+                color: Color { a: 0.40, ..color },
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Phase 1.7 — a 4 px progress track for one op: the filled portion in the op's
+/// state colour, the remainder on the Carbon content surface. Two `FillPortion`
+/// cells (permille split) — no bespoke progress widget, no scattered metric for
+/// the ratio.
+fn op_progress_bar(permille: u16, fill: Color) -> Element<'static, Message> {
+    let done = permille.min(1000);
+    let rest = 1000 - done;
+    let fill_cell = container(Space::new().height(Length::Fixed(4.0)))
+        .width(Length::FillPortion(done))
+        .height(Length::Fixed(4.0))
+        .sty(move |_| container::Style {
+            snap: false,
+            background: Some(Background::Color(fill)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            ..container::Style::default()
+        });
+    let rest_cell = container(Space::new().height(Length::Fixed(4.0)))
+        .width(Length::FillPortion(rest))
+        .height(Length::Fixed(4.0))
+        .sty(|_| container::Style {
+            snap: false,
+            background: Some(Background::Color(t::PF_BG_300)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 0.0.into(),
+            },
+            ..container::Style::default()
+        });
+    container(row![fill_cell, rest_cell].spacing(0))
+        .width(Length::Fill)
+        .height(Length::Fixed(4.0))
+        .into()
+}
+
+/// Phase 1.7 — a compact icon-only ghost button for the drawer controls (mirrors
+/// the toolbar's `view_toggle_btn`: transparent at rest, white-tint on hover).
+fn op_icon_btn(svg_bytes: &'static [u8], fg: Color, msg: Message) -> Element<'static, Message> {
+    button(
+        container(icon(svg_bytes, 14.0, fg))
+            .width(Length::Fixed(24.0))
+            .height(Length::Fixed(22.0))
+            .align_x(cosmic::iced::alignment::Horizontal::Center)
+            .align_y(cosmic::iced::alignment::Vertical::Center),
+    )
+    .padding(0)
+    .sty(move |_, status| {
+        let bg = match status {
+            button::Status::Hovered | button::Status::Pressed => Color {
+                a: 0.08,
+                ..Color::WHITE
+            },
+            _ => Color::TRANSPARENT,
+        };
+        button::Style {
+            snap: false,
+            background: Some(Background::Color(bg)),
+            text_color: fg,
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 4.0.into(),
+            },
+            ..button::Style::default()
+        }
+    })
+    .on_press(msg)
     .into()
 }
 
