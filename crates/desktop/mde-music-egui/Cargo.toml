@@ -1,0 +1,46 @@
+# MCNF E12 "Quasar" — `mde-music-egui`: the egui music surface (E12-5).
+#
+# A standalone eframe surface on the shared `mde-egui` harness that REUSES the
+# `mde-musicd` service crate end-to-end — its Subsonic/Airsonic REST client, the
+# shared credential loader, the codec classifier, and the native playback engine.
+# This crate is glue, not reimplementation (§6): it loads the library through the
+# daemon's client and plays a track through the daemon's engine, rendering the
+# whole thing through the shared `Style`.
+#
+# Tier (§6): desktop-shell. The dependency edges point strictly INWARD —
+# desktop → harness (`mde-egui`) and desktop → services (`mde-musicd`); it pulls
+# in no mesh-substrate crate, so the substrate stays headless-capable.
+[package]
+name        = "mde-music-egui"
+description = "MCNF E12 Quasar — the egui-native music surface. Reuses mde-musicd (Airsonic REST client + shared creds + codec classifier + native playback engine) to list a library and play a track, rendered through the shared mde-egui Style. Async airsonic + audio run on a worker thread; the render-agnostic view-model is unit-tested without a GPU or sound device."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_music_egui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mde-music-egui"
+path = "src/main.rs"
+
+[dependencies]
+# §4/§5 harness — the one inward desktop dependency: run_client (the eframe
+# Wayland-client runner), the shared Style, and the re-exported egui/eframe so
+# the surface shares one toolkit resolution.
+mde-egui   = { path = "../../shared/mde-egui" }
+# §6 reuse — the music service crate. We call its airsonic::Client (library
+# listing + authenticated stream URL), creds (the shared credential loader),
+# engine::{Engine, SourceCodec} (native playback), all already tested there.
+mde-musicd = { path = "../../services/mde-musicd" }
+# The worker thread owns a current-thread Tokio runtime to drive the async
+# airsonic client (`net` = the IO driver hyper needs; `time` = the client's
+# connect/total timeouts). The UI thread never blocks on it.
+tokio      = { version = "1", features = ["rt", "net", "time"] }
+
+[lints]
+workspace = true
