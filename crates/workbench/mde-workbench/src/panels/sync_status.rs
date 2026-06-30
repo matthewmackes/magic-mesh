@@ -5,10 +5,11 @@
 //! TOML's mesh-sync state:
 //!   * `~/.config/mde/panel.toml` mtime + size (proof the file
 //!     exists locally, when it last changed).
-//!   * `mackesd healthz` JSON (parsed for `node_id` /
-//!     `revision` / `drift_count` when present; until mackesd
-//!     populates those fields the panel honestly says
-//!     "not collected yet").
+//!   * `mackesd healthz` JSON (the `HealthReport` shape from
+//!     `mackesd::health`: `applied_revision`, `is_leader`, and the
+//!     `node_count` / `healthy_nodes` / `degraded_nodes` /
+//!     `unreachable_nodes` rollup). An unreachable daemon yields an
+//!     honest "not reachable", never a fake value.
 //!
 //! Closes the worklist item at line ≈2723 (v4.0.1 panel.toml
 //! sync-status). Mirrors the Win11 Settings → Sync your
@@ -34,14 +35,20 @@ pub struct SyncSnapshot {
     pub size_bytes: u64,
     /// mtime of the file (None when missing).
     pub mtime: Option<SystemTime>,
-    /// Parsed `node_id` from `mackesd healthz`. Empty when not
-    /// populated yet.
-    pub healthz_node: String,
-    /// Parsed `revision` from healthz (best-effort). Empty when
-    /// the field isn't in the JSON.
-    pub healthz_revision: String,
-    /// Parsed `drift_count` from healthz. None when not present.
-    pub drift_count: Option<u64>,
+    /// `applied_revision` from `mackesd healthz` — the most recent
+    /// applied config revision. `None` when the store has never
+    /// accepted a deploy (a fresh / follower node).
+    pub applied_revision: Option<String>,
+    /// `is_leader` from healthz.
+    pub is_leader: bool,
+    /// Mesh size from healthz (`node_count`).
+    pub node_count: u64,
+    /// Healthy / degraded / unreachable node counts from healthz.
+    pub healthy_nodes: u64,
+    pub degraded_nodes: u64,
+    pub unreachable_nodes: u64,
+    /// True when healthz returned a body that parsed as JSON.
+    pub healthz_ok: bool,
     /// Raw healthz JSON for the "see full" disclosure.
     pub healthz_raw: String,
 }
@@ -257,37 +264,50 @@ fn healthz_status_card<'a>(
     snap: &'a SyncSnapshot,
     palette: Palette,
 ) -> Element<'a, crate::Message, Theme> {
-    let (status_icon, status_color, summary): (Icon, Color, String) =
-        if !snap.healthz_node.is_empty()
-            && (!snap.healthz_revision.is_empty() || snap.drift_count.is_some())
-        {
-            let rev = if snap.healthz_revision.is_empty() {
-                "(no revision in healthz)".into()
-            } else {
-                snap.healthz_revision.clone()
-            };
-            let drift = snap
-                .drift_count
-                .map(|n| format!(" · drift={n}"))
-                .unwrap_or_default();
-            (
-                Icon::StatusOk,
-                palette.success.into_cosmic_color(),
-                format!("synced to revision {rev} on {}{drift}", snap.healthz_node),
-            )
-        } else if !snap.healthz_raw.is_empty() {
-            (
+    let healthy = snap.degraded_nodes == 0 && snap.unreachable_nodes == 0;
+    let (status_icon, status_color, summary): (Icon, Color, String) = if snap.healthz_ok {
+        let role = if snap.is_leader { "leader" } else { "follower" };
+        let rollup = format!(
+            "{} node{} · {} healthy · {} degraded · {} unreachable",
+            snap.node_count,
+            if snap.node_count == 1 { "" } else { "s" },
+            snap.healthy_nodes,
+            snap.degraded_nodes,
+            snap.unreachable_nodes,
+        );
+        match &snap.applied_revision {
+            Some(rev) => (
+                if healthy {
+                    Icon::StatusOk
+                } else {
+                    Icon::StatusWarning
+                },
+                if healthy {
+                    palette.success.into_cosmic_color()
+                } else {
+                    palette.warning.into_cosmic_color()
+                },
+                format!("applied revision {rev} · {role} · {rollup}"),
+            ),
+            None => (
                 Icon::StatusWarning,
                 palette.warning.into_cosmic_color(),
-                "mackesd healthz returned data but no revision/drift fields populated yet".into(),
-            )
-        } else {
-            (
-                Icon::StatusUnknown,
-                palette.text_muted.into_cosmic_color(),
-                "mackesd healthz not reachable — is the daemon installed?".into(),
-            )
-        };
+                format!("no revision applied yet · {role} · {rollup}"),
+            ),
+        }
+    } else if !snap.healthz_raw.trim().is_empty() {
+        (
+            Icon::StatusWarning,
+            palette.warning.into_cosmic_color(),
+            "mackesd healthz returned an unparseable body".into(),
+        )
+    } else {
+        (
+            Icon::StatusUnknown,
+            palette.text_muted.into_cosmic_color(),
+            "mackesd healthz not reachable — is the daemon installed?".into(),
+        )
+    };
     let resolved = mde_icon(status_icon, IconSize::Inline);
     let icon_widget: Element<'a, crate::Message, Theme> =
         if let Some(svg_bytes) = resolved.svg_bytes() {
@@ -375,15 +395,19 @@ pub fn probe() -> SyncSnapshot {
         .map(|m| (true, m.len(), m.modified().ok()))
         .unwrap_or((false, 0, None));
     let healthz_raw = run_mackesd_healthz();
-    let (healthz_node, healthz_revision, drift_count) = parse_healthz(&healthz_raw);
+    let hz = parse_healthz(&healthz_raw);
     SyncSnapshot {
         panel_toml_path,
         file_exists,
         size_bytes,
         mtime,
-        healthz_node,
-        healthz_revision,
-        drift_count,
+        applied_revision: hz.applied_revision,
+        is_leader: hz.is_leader,
+        node_count: hz.node_count,
+        healthy_nodes: hz.healthy_nodes,
+        degraded_nodes: hz.degraded_nodes,
+        unreachable_nodes: hz.unreachable_nodes,
+        healthz_ok: hz.ok,
         healthz_raw,
     }
 }
@@ -408,30 +432,46 @@ fn run_mackesd_healthz() -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Pure parser — extracts `(node_id, revision, drift_count)`
-/// from `mackesd healthz` JSON. Missing fields return empty
-/// strings / None.
+/// Parsed subset of `mackesd healthz` (the `HealthReport` shape in
+/// `mackesd::health`). `ok` is false when the body did not parse as
+/// JSON (e.g. the daemon is absent and stdout was empty).
+#[derive(Debug, Clone, Default)]
+pub struct HealthzView {
+    pub ok: bool,
+    pub is_leader: bool,
+    pub applied_revision: Option<String>,
+    pub node_count: u64,
+    pub healthy_nodes: u64,
+    pub degraded_nodes: u64,
+    pub unreachable_nodes: u64,
+}
+
+/// Pure parser — projects the `HealthReport` JSON `mackesd healthz`
+/// prints into the fields the panel renders. Missing numeric fields
+/// default to 0; a JSON `null` / absent / empty `applied_revision`
+/// is `None`.
 #[must_use]
-pub fn parse_healthz(raw: &str) -> (String, String, Option<u64>) {
+pub fn parse_healthz(raw: &str) -> HealthzView {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return (String::new(), String::new(), None);
+        return HealthzView::default();
     };
-    let node = v
-        .get("node_id")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    let rev = v
-        .get("revision")
-        .and_then(|x| x.as_str())
-        .or_else(|| v.get("config_version").and_then(|x| x.as_str()))
-        .unwrap_or("")
-        .to_string();
-    let drift = v
-        .get("drift_count")
-        .and_then(|x| x.as_u64())
-        .or_else(|| v.get("drift").and_then(|x| x.as_u64()));
-    (node, rev, drift)
+    let u64f = |k: &str| v.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    HealthzView {
+        ok: true,
+        is_leader: v
+            .get("is_leader")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        applied_revision: v
+            .get("applied_revision")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        node_count: u64f("node_count"),
+        healthy_nodes: u64f("healthy_nodes"),
+        degraded_nodes: u64f("degraded_nodes"),
+        unreachable_nodes: u64f("unreachable_nodes"),
+    }
 }
 
 fn fmt_age(t: SystemTime) -> String {
@@ -455,27 +495,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_healthz_extracts_known_shape() {
-        let raw = r#"{"node_id":"peer:anvil","revision":"r42","drift_count":3}"#;
-        let (node, rev, drift) = parse_healthz(raw);
-        assert_eq!(node, "peer:anvil");
-        assert_eq!(rev, "r42");
-        assert_eq!(drift, Some(3));
+    fn parse_healthz_extracts_health_report_shape() {
+        let raw = r#"{"schema":1,"is_leader":true,"applied_revision":"r-2026-06-29-0007","node_count":3,"healthy_nodes":3,"degraded_nodes":0,"unreachable_nodes":0}"#;
+        let hz = parse_healthz(raw);
+        assert!(hz.ok);
+        assert!(hz.is_leader);
+        assert_eq!(hz.applied_revision.as_deref(), Some("r-2026-06-29-0007"));
+        assert_eq!(hz.node_count, 3);
+        assert_eq!(hz.healthy_nodes, 3);
     }
 
     #[test]
-    fn parse_healthz_falls_back_to_config_version() {
-        let raw = r#"{"node_id":"peer:anvil","config_version":"v9"}"#;
-        let (_, rev, _) = parse_healthz(raw);
-        assert_eq!(rev, "v9");
+    fn parse_healthz_null_applied_revision_is_none() {
+        // The live follower shape from the operator's screenshot:
+        // applied_revision is JSON null, the rollup is still present.
+        let raw = r#"{"schema":1,"is_leader":false,"applied_revision":null,"node_count":3,"healthy_nodes":3,"degraded_nodes":0,"unreachable_nodes":0}"#;
+        let hz = parse_healthz(raw);
+        assert!(hz.ok);
+        assert!(!hz.is_leader);
+        assert!(hz.applied_revision.is_none());
+        assert_eq!(hz.node_count, 3);
     }
 
     #[test]
-    fn parse_healthz_returns_empties_for_garbage() {
-        let (n, r, d) = parse_healthz("not json");
-        assert!(n.is_empty());
-        assert!(r.is_empty());
-        assert!(d.is_none());
+    fn parse_healthz_marks_not_ok_for_garbage() {
+        let hz = parse_healthz("not json");
+        assert!(!hz.ok);
+        assert!(hz.applied_revision.is_none());
+        assert_eq!(hz.node_count, 0);
     }
 
     #[test]
@@ -492,10 +539,15 @@ mod tests {
             file_exists: true,
             size_bytes: 256,
             mtime: Some(SystemTime::now()),
-            healthz_node: "peer:anvil".into(),
-            healthz_revision: "r42".into(),
-            drift_count: Some(0),
-            healthz_raw: r#"{"node_id":"peer:anvil","revision":"r42"}"#.into(),
+            applied_revision: Some("r-2026-06-29-0007".into()),
+            is_leader: false,
+            node_count: 3,
+            healthy_nodes: 3,
+            degraded_nodes: 0,
+            unreachable_nodes: 0,
+            healthz_ok: true,
+            healthz_raw: r#"{"schema":1,"applied_revision":"r-2026-06-29-0007","node_count":3}"#
+                .into(),
         };
         p.last_run_at = Some(SystemTime::now());
         let _ = p.view();
