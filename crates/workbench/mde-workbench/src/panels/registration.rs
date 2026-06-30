@@ -17,7 +17,7 @@ use cosmic::iced::{Length, Task};
 use cosmic::Element;
 use serde::Deserialize;
 
-use crate::controls::{variant_button, ButtonVariant};
+use crate::controls::{styled_text_input, variant_button, ButtonVariant};
 use crate::panel_chrome::panel_container;
 use crate::panels::fleet_settings::run_mackesd;
 
@@ -44,6 +44,14 @@ pub struct RegistrationPanel {
     pub status: String,
     pub busy: bool,
     pub loaded: bool,
+    /// Mesh id the operator mints an invite token for (`EnrollToken`
+    /// requires `--mesh-id`; the bare shell failed clap).
+    pub mesh_id_input: String,
+    /// This node's stable id for re-enroll (`Reenroll` takes a positional
+    /// `node_id`); pre-filled with `peer:<hostname>`.
+    pub node_id_input: String,
+    /// Two-stage confirm for the destructive Leave (arm → confirm).
+    pub leave_armed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -51,9 +59,12 @@ pub enum Message {
     Loaded { identity: Identity, tags: String },
     Error(String),
     MintTokenClicked,
+    MeshIdChanged(String),
     TokenMinted(String),
     ReenrollClicked,
+    NodeIdChanged(String),
     LeaveClicked,
+    CancelLeave,
     ActionDone(String),
     RefreshClicked,
 }
@@ -61,7 +72,10 @@ pub enum Message {
 impl RegistrationPanel {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            node_id_input: default_node_id(),
+            ..Self::default()
+        }
     }
 
     pub fn load() -> Task<crate::Message> {
@@ -116,9 +130,23 @@ impl RegistrationPanel {
                 if self.busy {
                     return Task::none();
                 }
+                let mesh = self.mesh_id_input.trim().to_string();
+                if mesh.is_empty() {
+                    self.status = "Enter a mesh-id to mint an invite token for.".into();
+                    return Task::none();
+                }
                 self.busy = true;
                 self.status = "Minting a single-use invite token…".into();
-                Self::shell(vec!["enroll-token".into()], "mint token")
+                // EnrollToken requires --mesh-id; the bare `enroll-token` shell
+                // failed clap validation (the panel never minted a token).
+                Self::shell(
+                    vec!["enroll-token".into(), "--mesh-id".into(), mesh],
+                    "mint token",
+                )
+            }
+            Message::MeshIdChanged(s) => {
+                self.mesh_id_input = s;
+                Task::none()
             }
             Message::TokenMinted(tok) => {
                 self.last_token = tok;
@@ -130,17 +158,47 @@ impl RegistrationPanel {
                 if self.busy {
                     return Task::none();
                 }
+                // Reenroll takes a positional node_id; default to THIS node's
+                // stable id (peer:<hostname>) so the bare `reenroll` shell (which
+                // failed clap) now resolves to re-enrolling this node.
+                let node = {
+                    let n = self.node_id_input.trim();
+                    if n.is_empty() {
+                        default_node_id()
+                    } else {
+                        n.to_string()
+                    }
+                };
                 self.busy = true;
-                self.status = "Re-enrolling…".into();
-                Self::shell(vec!["reenroll".into()], "re-enroll")
+                self.status = format!("Re-enrolling {node}…");
+                Self::shell(vec!["reenroll".into(), node], "re-enroll")
+            }
+            Message::NodeIdChanged(s) => {
+                self.node_id_input = s;
+                Task::none()
             }
             Message::LeaveClicked => {
                 if self.busy {
                     return Task::none();
                 }
+                if !self.leave_armed {
+                    // Destructive — arm on the first click, fire only on the
+                    // second (Confirm). One click used to wipe the node.
+                    self.leave_armed = true;
+                    self.status = "Leave wipes /etc/nebula, keys, and the pinned role on THIS \
+                                   node. Click Confirm leave to proceed."
+                        .into();
+                    return Task::none();
+                }
+                self.leave_armed = false;
                 self.busy = true;
                 self.status = "Leaving the mesh…".into();
                 Self::shell(vec!["leave".into(), "--yes".into()], "leave")
+            }
+            Message::CancelLeave => {
+                self.leave_armed = false;
+                self.status.clear();
+                Task::none()
             }
             Message::ActionDone(msg) => {
                 self.status = msg;
@@ -182,6 +240,46 @@ impl RegistrationPanel {
             crate::panel_chrome::pkg_version_cached("nebula").as_deref(),
             palette,
         );
+        let wrap = |msg: Message| crate::Message::Registration(msg);
+        let mesh_input = styled_text_input(
+            "mesh-id (e.g. home-mesh)",
+            &self.mesh_id_input,
+            move |s| wrap(Message::MeshIdChanged(s)),
+            palette,
+        );
+        let node_input = styled_text_input(
+            "this node's id (defaults to peer:hostname)",
+            &self.node_id_input,
+            move |s| wrap(Message::NodeIdChanged(s)),
+            palette,
+        );
+        let mint_row = row![
+            mesh_input,
+            btn("Mint invite token", Message::MintTokenClicked)
+        ]
+        .spacing(8)
+        .align_y(cosmic::iced::Alignment::Center);
+        let reenroll_row = row![node_input, btn("Re-enroll", Message::ReenrollClicked)]
+            .spacing(8)
+            .align_y(cosmic::iced::Alignment::Center);
+        let leave_row: Element<'_, crate::Message> = if self.leave_armed {
+            row![
+                text("⚠ Confirm — leave wipes /etc/nebula, keys + role").size(13),
+                variant_button(
+                    "Confirm leave",
+                    ButtonVariant::Primary,
+                    (!self.busy).then_some(wrap(Message::LeaveClicked)),
+                    palette,
+                ),
+                btn("Cancel", Message::CancelLeave),
+            ]
+            .spacing(8)
+            .align_y(cosmic::iced::Alignment::Center)
+            .into()
+        } else {
+            btn("Leave mesh", Message::LeaveClicked).into()
+        };
+
         let mut col = column![
             row![
                 text("Registration").size(20),
@@ -202,18 +300,15 @@ impl RegistrationPanel {
             ]
             .spacing(8),
             text(self.tags.clone()).size(13),
-            row![
-                btn("Mint invite token", Message::MintTokenClicked),
-                btn("Re-enroll", Message::ReenrollClicked),
-                btn("Leave mesh", Message::LeaveClicked),
-                variant_button(
-                    "Refresh",
-                    ButtonVariant::Ghost,
-                    (!self.busy).then_some(crate::Message::Registration(Message::RefreshClicked)),
-                    palette,
-                ),
-            ]
-            .spacing(12),
+            mint_row,
+            reenroll_row,
+            leave_row,
+            variant_button(
+                "Refresh",
+                ButtonVariant::Ghost,
+                (!self.busy).then_some(crate::Message::Registration(Message::RefreshClicked)),
+                palette,
+            ),
         ]
         .spacing(10);
 
@@ -231,6 +326,18 @@ impl RegistrationPanel {
 
         panel_container(col.width(Length::Fill).into(), density)
     }
+}
+
+/// This node's stable id, matching mackesd's `peer:<hostname>` default
+/// (`Reconcile`/`default_node_id`). Reads the kernel hostname directly so the
+/// GUI never re-derives node-id logic that could diverge from the daemon.
+fn default_node_id() -> String {
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "localhost".into());
+    format!("peer:{host}")
 }
 
 #[cfg(test)]
@@ -269,5 +376,55 @@ mod tests {
         assert!(p.loaded);
         assert_eq!(p.identity.word_pair, "jade-reef");
         assert!(p.tags.contains("execution"));
+    }
+
+    #[test]
+    fn new_prefills_node_id_with_peer_prefix() {
+        assert!(RegistrationPanel::new().node_id_input.starts_with("peer:"));
+    }
+
+    #[test]
+    fn leave_first_click_arms_without_firing() {
+        let mut p = RegistrationPanel::new();
+        let _ = p.update(Message::LeaveClicked);
+        assert!(p.leave_armed, "first click must arm, not leave");
+        assert!(!p.busy, "no leave fired on the arming click");
+    }
+
+    #[test]
+    fn leave_second_click_fires() {
+        let mut p = RegistrationPanel::new();
+        let _ = p.update(Message::LeaveClicked); // arm
+        let _ = p.update(Message::LeaveClicked); // confirm
+        assert!(!p.leave_armed);
+        assert!(p.busy, "confirm fires the leave");
+    }
+
+    #[test]
+    fn cancel_leave_disarms() {
+        let mut p = RegistrationPanel::new();
+        let _ = p.update(Message::LeaveClicked); // arm
+        let _ = p.update(Message::CancelLeave);
+        assert!(!p.leave_armed);
+        assert!(!p.busy);
+    }
+
+    #[test]
+    fn mint_without_mesh_id_is_a_noop() {
+        let mut p = RegistrationPanel::new();
+        p.mesh_id_input.clear();
+        let _ = p.update(Message::MintTokenClicked);
+        assert!(!p.busy, "no mint fires without a mesh-id");
+        assert!(p.status.to_lowercase().contains("mesh-id"));
+    }
+
+    #[test]
+    fn reenroll_defaults_to_this_node_when_input_blank() {
+        let mut p = RegistrationPanel::new();
+        p.node_id_input.clear();
+        let _ = p.update(Message::ReenrollClicked);
+        // a blank input falls back to peer:<hostname>, so the action fires
+        assert!(p.busy, "re-enroll fires with the derived node id");
+        assert!(p.status.contains("peer:"));
     }
 }
