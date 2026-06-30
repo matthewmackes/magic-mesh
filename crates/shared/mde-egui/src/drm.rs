@@ -14,12 +14,11 @@
 //! [`DrmError`] when no DRM master is available** (CI / headless / another master
 //! already holds the seat) — the caller then falls back to the windowed runner.
 //!
-//! **Status: in progress (E12-2), built in stages so each farm compile validates a
-//! bounded slice of the native APIs. Stages 1–2 (DRM/GBM bring-up + the
-//! EGL/`egui_glow` single-frame present) are here; stage 3 (the libinput → egui
-//! input pump + the continuous page-flip loop) lands next.** The farm can only
-//! *compile* this path (no DRM master headless); the live render is the
-//! hardware-gated `/preview`.
+//! **Status (E12-2): all three stages compile + link green** — DRM/GBM bring-up ·
+//! EGL/`egui_glow` present · the libinput seat + the continuous page-flip loop. The
+//! farm can only *compile* this path (no DRM master headless); the live render +
+//! input on a real seat is the hardware-gated `/preview`, which is why the unit
+//! stays `[>]` (a render loop that compiles is not yet one that *works*).
 
 // FFI backend: DRM/GBM/EGL/GL all require `unsafe`. The crate denies unsafe by
 // default (mirroring the workspace); this one FFI module opts in — the rest of
@@ -32,9 +31,15 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::os::fd::OwnedFd;
+use std::os::unix::fs::OpenOptionsExt;
+
 use drm::control::{connector, crtc, Device as ControlDevice, Mode};
 use drm::Device as BasicDevice;
 use gbm::AsRaw;
+use input::event::keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait};
+use input::event::pointer::{ButtonState, PointerEvent};
+use input::{Event as LiEvent, Libinput, LibinputInterface};
 use khronos_egl as egl;
 
 /// Why the bare-seat backend could not start / present. The shell treats any
@@ -148,12 +153,33 @@ fn resolve_output(card: &Card) -> Result<Output, DrmError> {
     ))
 }
 
+/// libinput device opener for a bare seat (root on a VT). The present loop pumps
+/// egui input from here; on a host with logind a seat manager would mediate fd
+/// access — that path is a follow-up.
+struct SeatInterface;
+
+impl LibinputInterface for SeatInterface {
+    fn open_restricted(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, i32> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(flags)
+            .open(path)
+            .map(OwnedFd::from)
+            .map_err(|e| e.raw_os_error().unwrap_or(5))
+    }
+
+    fn close_restricted(&mut self, fd: OwnedFd) {
+        drop(fd);
+    }
+}
+
 /// Run an MCNF egui surface on the bare DRM/KMS seat (no compositor).
 ///
 /// `ui` paints the surface each frame against an [`egui::Context`] (the shared
-/// [`crate::Style`] is installed before the first paint). Stages 1–2 bring the seat
-/// up and present a **single** `Style`-themed frame onto the CRTC; the continuous
-/// page-flip loop + the libinput input pump land in stage 3.
+/// [`crate::Style`] is installed before the first paint). Brings the seat up, then
+/// runs the present loop: pump libinput → egui events, render through `Style`, and
+/// scan each frame out via DRM page-flip (Esc quits). Blocks until the surface exits.
 ///
 /// # Errors
 /// [`DrmError::NoDrmMaster`] when no DRM master is available (headless/CI) so the
@@ -236,51 +262,124 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     let mut painter = egui_glow::Painter::new(Arc::new(gl), "", None, false)
         .map_err(|e| DrmError::Gl(e.to_string()))?;
 
-    // --- one egui frame through the shared Style ---
+    // --- the present loop: pump the seat, render, scan out, repeat (Esc quits) ---
     let egui_ctx = egui::Context::default();
     crate::Style::install(&egui_ctx);
-    let raw_input = egui::RawInput {
-        screen_rect: Some(egui::Rect::from_min_size(
-            egui::pos2(0.0, 0.0),
-            egui::vec2(wp as f32, hp as f32),
-        )),
-        ..Default::default()
-    };
-    let full_output = egui_ctx.run(raw_input, |ctx| ui(ctx));
-    let clipped = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-    painter.paint_and_update_textures(
-        [wp, hp],
-        full_output.pixels_per_point,
-        &clipped,
-        &full_output.textures_delta,
-    );
-    egl.swap_buffers(display, surface).map_err(egl_err)?;
 
-    // --- scan the rendered GBM front buffer out onto the CRTC ---
-    let bo = unsafe {
-        gbm_surface
-            .lock_front_buffer()
-            .map_err(|e| DrmError::Present(format!("lock_front_buffer: {e}")))?
-    };
-    let fb = gbm
-        .add_framebuffer(&bo, 24, 32)
-        .map_err(|e| DrmError::Present(format!("add_framebuffer: {e}")))?;
-    gbm.set_crtc(
-        output.crtc,
-        Some(fb),
-        (0, 0),
-        &[output.connector],
-        Some(output.mode),
-    )
-    .map_err(|e| DrmError::Present(format!("set_crtc: {e}")))?;
+    let mut libinput = Libinput::new_with_udev(SeatInterface);
+    libinput
+        .udev_assign_seat("seat0")
+        .map_err(|()| DrmError::Present("libinput: udev_assign_seat(seat0) failed".into()))?;
 
-    // Hold the frame so it is visible on a real seat (stage 3 replaces this with the
-    // libinput-driven page-flip loop).
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(wp as f32, hp as f32));
+    let mut pointer = egui::pos2(wp as f32 / 2.0, hp as f32 / 2.0);
+    let start = std::time::Instant::now();
+    // The previous frame's scanout buffer + framebuffer, freed only after the next
+    // flip completes (GBM hands out a small ring of buffers).
+    let mut prev: Option<(gbm::BufferObject<()>, drm::control::framebuffer::Handle)> = None;
+    let mut quit = false;
 
-    // Best-effort teardown (the OS reclaims the rest on exit).
-    let _ = gbm.destroy_framebuffer(fb);
-    drop(bo);
+    while !quit {
+        // 1. drain libinput → egui events
+        libinput
+            .dispatch()
+            .map_err(|e| DrmError::Present(format!("libinput dispatch: {e}")))?;
+        let mut events = Vec::new();
+        for event in &mut libinput {
+            match event {
+                LiEvent::Pointer(PointerEvent::Motion(m)) => {
+                    pointer.x = (pointer.x + m.dx() as f32).clamp(0.0, wp as f32);
+                    pointer.y = (pointer.y + m.dy() as f32).clamp(0.0, hp as f32);
+                    events.push(egui::Event::PointerMoved(pointer));
+                }
+                LiEvent::Pointer(PointerEvent::MotionAbsolute(m)) => {
+                    pointer = egui::pos2(
+                        m.absolute_x_transformed(wp) as f32,
+                        m.absolute_y_transformed(hp) as f32,
+                    );
+                    events.push(egui::Event::PointerMoved(pointer));
+                }
+                LiEvent::Pointer(PointerEvent::Button(b)) => {
+                    events.push(egui::Event::PointerButton {
+                        pos: pointer,
+                        button: egui::PointerButton::Primary,
+                        pressed: b.button_state() == ButtonState::Pressed,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                }
+                LiEvent::Keyboard(KeyboardEvent::Key(k)) => {
+                    // Linux KEY_ESC == 1 quits; the full key→egui::Key map (text/IME,
+                    // modifiers) is a stage-3 follow-up.
+                    if k.key() == 1 && k.key_state() == KeyState::Pressed {
+                        quit = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 2. run + paint the egui frame
+        let raw_input = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(start.elapsed().as_secs_f64()),
+            events,
+            ..Default::default()
+        };
+        let full_output = egui_ctx.run(raw_input, |ctx| ui(ctx));
+        let clipped = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        painter.paint_and_update_textures(
+            [wp, hp],
+            full_output.pixels_per_point,
+            &clipped,
+            &full_output.textures_delta,
+        );
+        egl.swap_buffers(display, surface).map_err(egl_err)?;
+
+        // 3. scan the new front buffer out — set_crtc on the first frame, page-flip
+        //    after (waiting for the flip to complete before recycling buffers).
+        let bo = unsafe {
+            gbm_surface
+                .lock_front_buffer()
+                .map_err(|e| DrmError::Present(format!("lock_front_buffer: {e}")))?
+        };
+        let fb = gbm
+            .add_framebuffer(&bo, 24, 32)
+            .map_err(|e| DrmError::Present(format!("add_framebuffer: {e}")))?;
+        if prev.is_none() {
+            gbm.set_crtc(
+                output.crtc,
+                Some(fb),
+                (0, 0),
+                &[output.connector],
+                Some(output.mode),
+            )
+            .map_err(|e| DrmError::Present(format!("set_crtc: {e}")))?;
+        } else {
+            gbm.page_flip(output.crtc, fb, drm::control::PageFlipFlags::EVENT, None)
+                .map_err(|e| DrmError::Present(format!("page_flip: {e}")))?;
+            'flip: loop {
+                let evs = gbm
+                    .receive_events()
+                    .map_err(|e| DrmError::Present(format!("receive_events: {e}")))?;
+                for ev in evs {
+                    if matches!(ev, drm::control::Event::PageFlip(_)) {
+                        break 'flip;
+                    }
+                }
+            }
+        }
+        if let Some((prev_bo, prev_fb)) = prev.take() {
+            let _ = gbm.destroy_framebuffer(prev_fb);
+            drop(prev_bo);
+        }
+        prev = Some((bo, fb));
+    }
+
+    // teardown (best-effort; the OS reclaims the rest on exit)
+    if let Some((bo, fb)) = prev.take() {
+        let _ = gbm.destroy_framebuffer(fb);
+        drop(bo);
+    }
     painter.destroy();
     Ok(())
 }
