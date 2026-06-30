@@ -1,0 +1,27 @@
+[package]
+name        = "mde-kvm"
+description = "E12-7 (Quasar) — local cloud-hypervisor VM broker. A pure spec→VmConfig builder (the load-bearing, unit-tested core) plus a create/boot/shutdown/info lifecycle over cloud-hypervisor's HTTP-on-a-unix-socket API, with an injectable transport so the lifecycle is testable without a live VMM. Models the dual-homed guest (lock 19): every VM is its own Nebula mesh peer AND has a LAN-bridged NIC. Live boot needs KVM + cloud-hypervisor + a golden image, so it is integration-gated."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# §6 glue, not reimplementation: the crate is deliberately dependency-light. The
+# cloud-hypervisor API is plain HTTP/1.1 over a unix-domain socket, so the
+# transport is `std::os::unix::net::UnixStream` + a tiny hand-rolled request/
+# response (no hyper/reqwest/ureq — none of which speak UDS cleanly anyway). The
+# load-bearing surface — the VmSpec → CH `VmConfig` JSON mapping and the HTTP
+# framing — is pure and unit-tested here.
+serde      = { workspace = true }
+serde_json = { workspace = true }
+# Error enum, matching the mackes-xcp hypervisor layer's convention.
+thiserror  = "1"
+
+[lints]
+workspace = true
