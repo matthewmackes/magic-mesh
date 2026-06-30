@@ -2760,17 +2760,12 @@ impl State {
                         }
                     }
                     prefs::apply_sort(&mut items, self.sort);
-                    // AIR-11.c — width-adaptive grid: the column count is
-                    // derived from the live viewport width via iced
-                    // `responsive`, so the 160px cards reflow as the window
-                    // resizes (replacing the AIR-11.b fixed 5-column layout).
-                    // Per-card cover art + scroll-position persistence remain
-                    // the AIR-11.c.2 follow-on.
-                    // AIR-11.c — width-adaptive columns: the count is derived
+                    // AIR-11.c — width-adaptive grid: the column count is derived
                     // from the live window width (tracked via the WindowResized
                     // subscription) so the 160px cards reflow on resize, replacing
-                    // the AIR-11.b fixed 5-column layout. Per-card cover art +
-                    // scroll-position persistence remain the AIR-11.c.2 follow-on.
+                    // the AIR-11.b fixed 5-column layout. Per-card cover art and
+                    // scroll-position persistence are wired below (art_cache /
+                    // grid_scroll).
                     // MUSIC-RESPONSIVE-9 — virtualize large grids: render only the
                     // visible row window (+overscan) and reserve the off-window
                     // height with spacers, so a multi-hundred-card library doesn't
@@ -3230,10 +3225,6 @@ impl State {
             .into()
     }
 
-    /// AIR-12 — the album detail page: an art-placeholder column + the
-    /// album header (Play / Shuffle / Add) + the numbered track list (each
-    /// row can Play-Next or Add-to-Queue). Cover-art *image* rendering is a
-    /// follow-on (art-over-Bus); the layout uses a glyph placeholder.
     /// MUSIC-RFX-6b — move the playlist track at `from` to `to` (an adjacent
     /// swap), then persist the whole new order to the daemon. Out-of-range or
     /// no-op moves do nothing.
@@ -3322,6 +3313,10 @@ impl State {
         .into()
     }
 
+    /// AIR-12 — the album detail page: a cover-art column (the image once
+    /// art-over-Bus resolves it, a glyph until then) + the album header
+    /// (Play / Shuffle / Add) + the numbered track list (each row can Play-Next
+    /// or Add-to-Queue).
     fn album_page(&self) -> Element<'_, Message> {
         if self.album_loading {
             // POLISH-music-errorretry — a breathing header + track-list skeleton
@@ -3407,8 +3402,8 @@ impl State {
                 list.push(mouse_area(track_row).on_right_press(Message::OpenTrackMenu(menu_ctx)));
         }
 
-        // Art placeholder (left) + header/tracks (right). The art-over-Bus
-        // image fetch is a follow-on; a glyph stands in for now.
+        // Cover image (left) over header/tracks (right): the resolved art-over-Bus
+        // image when present, a glyph placeholder until it loads.
         let art: Element<'_, Message> = match &self.album_art {
             Some(handle) => image(handle.clone())
                 .width(Length::Fixed(220.0))
@@ -3569,10 +3564,10 @@ impl State {
         )
     }
 
-    /// AIR-15.b — the maxi-player full-window surface: now-playing header
-    /// (title/artist + transport) + the Queue tab (the play queue with the
-    /// current track marked). Large art + scrub-progress + volume slider +
-    /// Lyrics/Peers tabs are the AIR-15.b.2 follow-on.
+    /// AIR-15.b — the maxi-player full-window surface: a scaling cover-art hero
+    /// over a dominant-colour tint band, the now-playing header (title/artist +
+    /// transport), the scrub bar + volume slider, and the Queue / Lyrics / Peers
+    /// tabs.
     fn maxi_view(&self) -> Element<'_, Message> {
         // §4: muted/accent come from the Carbon palette, not raw literals.
         let p = mde_theme::Palette::dark();
@@ -4370,25 +4365,79 @@ fn empty_state(heading: &str, body: &str) -> Element<'static, Message> {
     .into()
 }
 
-/// POLISH-music-playlistcreate — selects the empty-state copy for a category
-/// page and whether to pair it with the inline create-playlist form. The
-/// Playlists page MUST offer creation from its empty state: a zero-playlist
-/// operator has no other entry point (the add-to-playlist sheet only points
-/// back here), so without this the core "create your first playlist" flow
-/// dead-ends. Returns `(heading, body, show_create_form)`.
+/// POLISH-music-playlistcreate / POLISH-music-emptycopy — the single source of
+/// empty-state copy for every page that renders through the grid path. Returns
+/// `(heading, body, show_create_form)`.
+///
+/// The copy is honest per route. By the time an empty state renders, the load
+/// has already succeeded — a daemon that is down or unreachable renders the
+/// Offline error block instead (see `load_error_block`) — so the old generic
+/// "Start mde-musicd" hint was misleading on every page: a sub-page the operator
+/// navigated *into* (an artist, a genre, a channel) is itself proof the daemon
+/// is up. Each route therefore names its own empty container, never the daemon.
+///
+/// The Playlists landing is the one empty state that doubles as an entry point:
+/// a zero-playlist operator has no other way to create their first (the
+/// add-to-playlist sheet only points back here), so its copy pairs with the
+/// inline create form (the third field).
 const fn empty_state_for(route: &Route) -> (&'static str, &'static str, bool) {
-    if matches!(route, Route::Category(HubCard::Playlists)) {
-        (
+    match route {
+        Route::Category(HubCard::Playlists) => (
             "No playlists yet",
             "Name your first playlist below to get started.",
             true,
-        )
-    } else {
-        (
-            "Nothing here yet",
-            "Start mde-musicd to load your library across the mesh.",
+        ),
+        Route::Category(HubCard::Albums) => (
+            "No albums in your library",
+            "Albums you add appear here.",
             false,
-        )
+        ),
+        Route::Category(HubCard::Artists) => (
+            "No artists in your library",
+            "Artists you add appear here.",
+            false,
+        ),
+        Route::Category(HubCard::Genres) => (
+            "No genres in your library",
+            "Genres appear here as your tracks are tagged.",
+            false,
+        ),
+        Route::Category(HubCard::Recents) => (
+            "Nothing played recently",
+            "Tracks you play appear here.",
+            false,
+        ),
+        Route::Category(HubCard::Podcasts) => (
+            "No podcast subscriptions",
+            "Channels you subscribe to appear here.",
+            false,
+        ),
+        Route::Category(HubCard::Radio) => {
+            ("No radio stations", "Stations you add appear here.", false)
+        }
+        // Sub-pages: reached by navigating in, so the daemon is plainly up —
+        // name the empty container, never "start the daemon".
+        Route::Artist(..) => (
+            "No albums for this artist",
+            "This artist has nothing in your library yet.",
+            false,
+        ),
+        Route::Genre(..) => (
+            "No albums in this genre",
+            "Nothing in your library is tagged with this genre.",
+            false,
+        ),
+        Route::Podcast(..) => (
+            "No episodes yet",
+            "This channel has no episodes to show.",
+            false,
+        ),
+        // Hub/Album/Playlist render their own pages and Search uses its own
+        // sheet, so they never reach here; a neutral fallback keeps the match
+        // total without a misleading daemon hint.
+        Route::Hub | Route::Album(..) | Route::Playlist(..) | Route::Search(..) => {
+            ("Nothing here yet", "There's nothing to show here.", false)
+        }
     }
 }
 
@@ -4449,11 +4498,81 @@ mod empty_state_tests {
 
     #[test]
     fn other_categories_have_no_create_form() {
-        // Albums/Artists/etc. have no inline create affordance — their empty
-        // state is the generic "start the daemon" hint only.
+        // Albums/Artists/etc. have no inline create affordance — only their
+        // honest per-route empty copy (the create form is Playlists-only).
         for card in [HubCard::Albums, HubCard::Artists, HubCard::Genres] {
             let (_h, _b, show_create) = empty_state_for(&Route::Category(card));
             assert!(!show_create, "{card:?} must not show a create form");
+        }
+    }
+
+    #[test]
+    fn no_empty_state_tells_the_operator_to_start_the_daemon() {
+        // POLISH-music-emptycopy — reaching an empty state means the load already
+        // succeeded; a daemon that is down renders the Offline error block, not
+        // this. So no empty-state copy may name the daemon — that hint is honest
+        // only in the error path, never here.
+        let routes = [
+            Route::Category(HubCard::Albums),
+            Route::Category(HubCard::Artists),
+            Route::Category(HubCard::Playlists),
+            Route::Category(HubCard::Recents),
+            Route::Category(HubCard::Genres),
+            Route::Category(HubCard::Podcasts),
+            Route::Category(HubCard::Radio),
+            Route::Artist("1".into(), "Air".into()),
+            Route::Genre("Jazz".into()),
+            Route::Podcast("p".into(), "Pod".into()),
+        ];
+        for r in routes {
+            let (heading, body, _) = empty_state_for(&r);
+            assert!(
+                !heading.is_empty() && !body.is_empty(),
+                "{r:?} needs non-empty copy"
+            );
+            let copy = format!("{heading} {body}").to_lowercase();
+            assert!(
+                !copy.contains("mde-musicd"),
+                "{r:?} empty copy must not name the daemon: {copy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_top_level_category_names_its_own_emptiness() {
+        // POLISH-music-emptycopy — every library category gets distinct copy that
+        // names what is empty (an empty Albums page reads "No albums…"), not one
+        // reused generic line.
+        let cases = [
+            (HubCard::Albums, "albums"),
+            (HubCard::Artists, "artists"),
+            (HubCard::Genres, "genres"),
+            (HubCard::Recents, "recently"),
+            (HubCard::Podcasts, "podcast"),
+            (HubCard::Radio, "radio"),
+        ];
+        for (card, needle) in cases {
+            let (heading, _b, _c) = empty_state_for(&Route::Category(card));
+            assert!(
+                heading.to_lowercase().contains(needle),
+                "{card:?} heading {heading:?} should name {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sub_pages_get_their_own_copy_distinct_from_the_generic_fallback() {
+        // POLISH-music-emptycopy — a sub-page the operator navigated into must
+        // describe its own empty container, not fall through to the neutral
+        // "Nothing here yet" fallback (reserved for routes that never render here).
+        for r in [
+            Route::Artist("1".into(), "Air".into()),
+            Route::Genre("Jazz".into()),
+            Route::Podcast("p".into(), "Pod".into()),
+        ] {
+            let (heading, _b, show_create) = empty_state_for(&r);
+            assert!(!show_create, "{r:?} must not show a create form");
+            assert_ne!(heading, "Nothing here yet", "{r:?} needs its own heading");
         }
     }
 }
