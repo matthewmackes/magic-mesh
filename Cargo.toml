@@ -46,6 +46,7 @@ members = [
     "crates/workbench/mde-workbench",
     "crates/desktop/mde-shell-egui",
     "crates/desktop/mde-mesh-view",
+    "crates/desktop/mde-vdi-rdp",
     "crates/shared/mde-card",
     "crates/shared/mde-disclaimer",
     "crates/shared/mde-egui",

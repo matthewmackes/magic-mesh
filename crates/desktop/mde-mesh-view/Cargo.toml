@@ -1,0 +1,36 @@
+# MCNF E12 "Quasar" — `mde-mesh-view`: the live mesh-state canvas widget.
+#
+# A reusable egui widget that draws the CURRENT mesh state procedurally with
+# `egui::Painter` (the egui-clock-demo idiom — line_segment / circle_filled /
+# circle_stroke / text, animated every frame), themed entirely through the shared
+# `mde-egui` Style/Motion. This is the E12-egui reincarnation of the old MESHMAP.
+#
+# Tier (§6): desktop-shell. It depends ONLY on the shared `mde-egui` harness —
+# the dependency edge points inward (shell → harness); it pulls in no
+# services/mesh-substrate crate, so the substrate stays headless-capable.
+[package]
+name        = "mde-mesh-view"
+description = "MCNF E12 Quasar — a live, procedural egui::Painter canvas of the current mesh state (nodes by role/health, leader pulse, travelling per-link activity). The egui reincarnation of MESHMAP; renders only the MeshState it is handed, through the shared mde-egui Style/Motion."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_mesh_view"
+path = "src/lib.rs"
+
+[dependencies]
+# The single dependency: the shared egui harness (Style/Motion + re-exported
+# egui/eframe). No services/mesh deps — the tier edge points inward (§6).
+mde-egui = { path = "../../shared/mde-egui" }
+
+# Runnable acceptance surface — paints a small SAMPLE mesh through the widget.
+[[example]]
+name = "mesh_view"
+path = "examples/mesh_view.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,63 @@
+[package]
+name        = "mde-vdi-rdp"
+description = "MCNF E12 'Quasar' VDI — render a remote RDP desktop into an egui texture (RDP-primary, lock 21). Pure-Rust ironrdp drives the connection + session; this crate decodes framebuffer/bitmap updates into an egui ColorImage and forwards egui input events as RDP input. NO external viewer — the shell uploads the ColorImage to a TextureHandle."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_vdi_rdp"
+path = "src/lib.rs"
+
+[dependencies]
+# egui comes via the harness so this VDI backend resolves to the ONE
+# harness-pinned egui (no cross-surface version skew, §4). We use only the egui
+# types (ColorImage / Event / Key / ...) — eframe/wgpu are pulled transitively by
+# the harness but unused here.
+mde-egui = { path = "../../shared/mde-egui" }
+
+# Structured logs in the workspace JSON-line format.
+tracing = "0.1"
+
+# The pure-Rust IronRDP stack (Devolutions) — RDP-primary, lock 21. Coherent
+# release set resolved on the farm (see `cargo search ironrdp`). We use the
+# connection-sequence config + the input PDU builders + the session image/decoder
+# types; the live connect loop (async transport + TLS + CredSSP) is gated behind
+# the `live-connect` feature so the default build + unit tests stay server-free.
+ironrdp-core = "0.2"
+ironrdp-pdu = "0.8"
+ironrdp-connector = "0.9"
+ironrdp-graphics = "0.8"
+ironrdp-session = "0.10"
+ironrdp-input = "0.6"
+
+[features]
+default = []
+# E12-4: the live connection sequence (`connect.rs`) — drives the IronRDP
+# connector→session state machines over a real Nebula TCP link with TLS + CredSSP.
+# It needs a server to exercise, so it is OFF by default; the unit-tested
+# egui-facing surface (decode + input PDU build) never depends on it.
+live-connect = ["dep:ironrdp-async", "dep:ironrdp-tokio", "dep:ironrdp-tls", "dep:tokio"]
+
+[dependencies.ironrdp-async]
+version = "0.9"
+optional = true
+
+[dependencies.ironrdp-tokio]
+version = "0.9"
+optional = true
+
+[dependencies.ironrdp-tls]
+version = "0.2"
+optional = true
+
+[dependencies.tokio]
+version = "1"
+optional = true
+features = ["net", "rt", "io-util"]
+
+[lints]
+workspace = true
