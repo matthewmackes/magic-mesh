@@ -2563,6 +2563,6 @@ _The `mackesd mesh-fs-status` verb was deleted with the LizardFS plane (SUBSTRAT
 - [✓] **MESHFS-2: per-peer aggregation from the replicated probes** *(farm-verified, pushed)*
   As an operator, I want every mesh node's storage usage in the report, so I see the whole share, not just this node.
   - [✓] a serde-defaulted `MeshFsUsage` field on `ServiceDescriptors` (`mackes-mesh-types/src/peers.rs`), populated in `descriptors.rs::probe_mesh_fs()` via `df`; `mesh_fs_report` aggregates every peer's from `read_peers()` over the replicated directory (skipping un-probed peers); falls back to the local mount on a fresh mesh; goal = present-peer count
-- [ ] **MESHFS-3: Syncthing-native completion / healing**
-  As an operator, I want real replication/healing state, so under-replicated or out-of-sync folders surface honestly.
-  - [ ] read Syncthing's REST completion API per device → real `undergoal`/`offline_peers`/`master_reachable` (replacing the MESHFS-1 honest constants); no fake values (§7)
+- [✓] **MESHFS-3: Syncthing-native completion** *(farm-verified, pushed)* — operator greenlit building the REST client (2026-06-30).
+  As an operator, I want real replication state, so an out-of-sync share surfaces honestly.
+  - [✓] new `mackesd::syncthing` reads the API key from the provisioned `config.xml` (string-scan, no XML/HTTP dep) + shells `curl` to `/rest/db/completion?folder=mcnf-mesh`; `mesh_fs_report` adds `sync_completion_pct` (`None` when Syncthing unreachable — degrades honestly, never a faked 100%); the Mesh Storage panel renders "replication N%". Pure parsers unit-tested; the live curl is gated on a real Syncthing node. Per-device `undergoal`/`offline_peers` granularity = a future refinement.

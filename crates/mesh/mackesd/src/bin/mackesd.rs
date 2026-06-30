@@ -5273,6 +5273,10 @@ struct MeshFsReport {
     /// `mde-files`' healing check; under Syncthing = is the local mount present.
     master_reachable: bool,
     offline_peers: Vec<String>,
+    /// MESHFS-3 — Mesh-Sync folder completion percent from Syncthing's REST API
+    /// (`None` when Syncthing is unreachable / unprovisioned); 100 = fully
+    /// replicated across the mesh.
+    sync_completion_pct: Option<f64>,
 }
 
 /// MESHFS-2 — aggregate every peer's Mesh-Sync `df` usage from the replicated
@@ -5313,6 +5317,9 @@ fn mesh_fs_report(qnm_root: &std::path::Path) -> MeshFsReport {
     }
     // full-mesh: every present node holds a copy, so the goal == the peer count.
     let goal = peers.len() as u64;
+    // MESHFS-3 — real replication state from Syncthing's REST API (best-effort;
+    // None when the daemon/config is absent, never a faked 100%).
+    let sync = mackesd_core::syncthing::folder_health();
     MeshFsReport {
         schema: 1,
         mount: mount.display().to_string(),
@@ -5322,6 +5329,7 @@ fn mesh_fs_report(qnm_root: &std::path::Path) -> MeshFsReport {
         limiting_peer_addr: None,
         master_reachable: mount.is_dir(),
         offline_peers: vec![],
+        sync_completion_pct: sync.reachable.then_some(sync.completion_pct),
     }
 }
 

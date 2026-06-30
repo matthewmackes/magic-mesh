@@ -134,6 +134,7 @@ pub mod router_discovery;
 pub mod bearer_ledger;
 pub mod descriptors;
 pub mod image_build;
+pub mod syncthing;
 pub mod image_catalog;
 pub mod install_profiles;
 pub mod leave;
