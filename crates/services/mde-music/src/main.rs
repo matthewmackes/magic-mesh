@@ -2986,9 +2986,15 @@ impl State {
             text(mde_theme::Icon::Search.fallback_glyph())
                 .size(13)
                 .colr(carbon(pal.text, 1.0)),
-            text_input("Search artists, albums, songs…", &self.search_query)
+            // POLISH-music-feedback — the cosmic-native text input (vs the iced
+            // fork one the dialog fields use) so the surface's one keyboard-focusable
+            // control exposes a `focused` style hook; `search_input_style` draws the
+            // shared 2px Carbon focus ring around it on keyboard focus. It registers
+            // focusable under the same id, so Cmd-F (`FocusSearch`) is unchanged.
+            cosmic::widget::text_input("Search artists, albums, songs…", &self.search_query)
                 .id(search_id())
                 .on_input(Message::SearchInput)
+                .style(search_input_style(self.reduce_motion))
                 .padding(8)
                 .width(Length::Fixed(340.0)),
         ]
@@ -3928,7 +3934,7 @@ fn transport_button<'a>(
             let shadow = if lifted {
                 cosmic::iced::Shadow {
                     color: carbon(p.background, 0.45),
-                    offset: cosmic::iced::Vector::new(0.0, motion::HOVER_RISE_PX),
+                    offset: cosmic::iced::Vector::new(0.0, mde_theme::feedback::HOVER_LIFT_PX),
                     blur_radius: 4.0,
                 }
             } else {
@@ -3988,7 +3994,7 @@ fn primary_button<'a>(
             let shadow = if lifted {
                 cosmic::iced::Shadow {
                     color: carbon(p.background, 0.45),
-                    offset: cosmic::iced::Vector::new(0.0, motion::HOVER_RISE_PX),
+                    offset: cosmic::iced::Vector::new(0.0, mde_theme::feedback::HOVER_LIFT_PX),
                     blur_radius: 4.0,
                 }
             } else {
@@ -4016,6 +4022,46 @@ fn primary_button<'a>(
 /// The stable widget id for the AIR-14 search field (so Cmd-F can focus it).
 fn search_id() -> cosmic::iced::widget::Id {
     cosmic::iced::widget::Id::new("mde-music-search")
+}
+
+/// POLISH-music-feedback (axis 5 — focus/a11y) — the search field's text-input
+/// style: cosmic's standard input chrome for the rest / hover / error / disabled
+/// states, with the **keyboard-focus** state drawing the shared 2px Carbon focus
+/// ring ([`mde_theme::feedback::ControlFeedback::focus_ring`]) in place of the
+/// default focus border. The search field is the surface's one keyboard-focusable
+/// control, so wiring the shared ring here makes it speak the same focus
+/// vocabulary as the rest of the shell — the ring width / offset / accent come
+/// from the single-sourced `feedback` tokens (§4), never a local literal.
+///
+/// The field re-styles on the focus-status flip with no tween/tick, so the ring
+/// is sampled at its arrived endpoint (a focus timestamp backdated past the focus
+/// tween): it is *present* at full 2px whenever the field holds keyboard focus —
+/// the a11y cue — and gone otherwise.
+fn search_input_style(reduce_motion: bool) -> cosmic::theme::TextInput {
+    use cosmic::widget::text_input::StyleSheet;
+    // Delegate the non-focused states to cosmic's standard input appearance; only
+    // the focused state is overridden, to carry the shared focus ring. (Each
+    // closure builds its own `Default` base — the enum isn't `Copy` to capture.)
+    cosmic::theme::TextInput::Custom {
+        active: Box::new(|t| StyleSheet::active(t, &cosmic::theme::TextInput::Default)),
+        error: Box::new(|t| StyleSheet::error(t, &cosmic::theme::TextInput::Default)),
+        hovered: Box::new(|t| StyleSheet::hovered(t, &cosmic::theme::TextInput::Default)),
+        focused: Box::new(move |t| {
+            let mut a = StyleSheet::focused(t, &cosmic::theme::TextInput::Default);
+            let now = std::time::Instant::now();
+            let since = now
+                .checked_sub(mde_theme::motion::Motion::focus().duration * 2)
+                .unwrap_or(now);
+            let ring = mde_theme::feedback::ControlFeedback::new()
+                .focused(true, since)
+                .focus_ring(now, reduce_motion);
+            a.border_width = ring.width;
+            a.border_offset = Some(ring.offset);
+            a.border_color = carbon(mde_theme::Palette::dark().accent, ring.alpha);
+            a
+        }),
+        disabled: Box::new(|t| StyleSheet::disabled(t, &cosmic::theme::TextInput::Default)),
+    }
 }
 
 /// AIR-11.c.2 — stable id for the library card grid's scrollable, so the

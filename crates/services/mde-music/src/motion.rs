@@ -5,13 +5,15 @@
 //! its themed widgets):
 //!
 //!   * [`button_feedback`] — the transport/buttons' hover-lift + press-depress,
-//!     keyed off the widget's `button::Status`. The shared
-//!     [`mde_theme::animation::Transition`] `Lift`/`Press` mapping is applied at
-//!     full progress: a button re-styles the instant its status flips, so press
-//!     fires on **down with no input delay** and no tween/tick is needed for the
-//!     button chrome itself. **Under reduce-motion the transform is dropped** —
-//!     the hover/press *state change* still reads (a colour-tint depth), but the
-//!     surface never moves (Q32: motion is never the only cue).
+//!     keyed off the widget's `button::Status`. A thin **settled-endpoint adapter
+//!     over the shared [`mde_theme::feedback::ControlFeedback`]** (MOTION-FEEDBACK-1):
+//!     a button re-styles the instant its status flips, so the shared feedback is
+//!     sampled at its *arrived* endpoint (no tween/tick for the button chrome) and
+//!     the lift travel + press depth live in one place — no local literals. Press
+//!     fires on **down with no input delay**. **Under reduce-motion the transform
+//!     is dropped** — the hover/press *state change* still reads (a colour-tint
+//!     depth via [`feedback_tint_depth`]), but the surface never moves (Q32:
+//!     motion is never the only cue).
 //!   * [`Reveal`] — the gentle enter tween for the now-playing footer + the
 //!     queue rows. A single [`mde_theme::animation::Tween`] per reveal "epoch"
 //!     (the now-playing track id / a queue (re)load), read in `view` via
@@ -23,19 +25,9 @@
 
 use std::time::{Duration, Instant};
 
-use mde_theme::animation::{slide_in, RenderParams, Transition};
+use mde_theme::animation::{slide_in, RenderParams};
+use mde_theme::feedback::{ControlFeedback, FeedbackParams};
 use mde_theme::motion::Motion;
-
-/// Hover-lift travel for a transport/nav button (px the control rises on hover).
-/// A small, fixed component dimension (the shared Carbon micro-interaction tier
-/// is conveyed by `Motion::hover`, not by this travel), so a local constant —
-/// not a density-scaled metric. Mirrors the workbench control-feedback rise.
-pub const HOVER_RISE_PX: f32 = 2.0;
-
-/// Press-depress depth: the control scales to `1.0 - PRESS_DEPTH` at full press
-/// (a subtle 4 % shrink — the depressed read), matching the shared Carbon press
-/// feedback used across the shell.
-pub const PRESS_DEPTH: f32 = 0.04;
 
 /// The now-playing footer / queue reveal travel: the surface fades in while
 /// rising this many px to rest. The Carbon panel-mount reveal offset, kept local
@@ -60,35 +52,28 @@ pub const STAGGER_ROW_CAP: u32 = mde_theme::motion::list::STAGGER_CAP as u32;
 /// is in flight (MOTION-PERF-1 — a settled surface costs no idle wakeups).
 pub const REVEAL_TICK: Duration = Duration::from_millis(16);
 
-/// MOTION-FEEDBACK — the hover-lift / press-depress [`RenderParams`] for an
-/// interactive control at the given `button::Status` value (a settled endpoint,
-/// since iced re-styles on every status flip). `hovered`/`pressed` are the two
-/// active states; everything else is at rest. **Under `reduce_motion` the
-/// transform is dropped** (no translate/scale) so the control never moves — the
-/// caller still reflects the hover/press state via its colour-tint depth.
+/// MOTION-FEEDBACK — the hover-lift / press-depress [`FeedbackParams`] for an
+/// interactive control at the given `(hovered, pressed)` state, **folded onto the
+/// shared [`ControlFeedback`]** so the lift travel, press depth, and reduce-motion
+/// contract are single-sourced (MOTION-FEEDBACK-1 tokens, no local literals).
 ///
-/// Pure glue over the shared [`Transition::Lift`] / [`Transition::Press`]
-/// vocabulary (the same motion every shell surface speaks); no toolkit types
-/// here so it's unit-testable without iced.
+/// A button re-styles the instant its `button::Status` flips with no tween/tick,
+/// so the shared feedback is sampled at its *arrived* endpoint (a hover timestamp
+/// backdated past the hover tween). **Press wins over hover for the lift**: a
+/// pressed control sinks rather than also elevating, so it is not "hovered" for
+/// the lift purpose. **Under `reduce_motion` the movement is dropped** (the shared
+/// helper returns rest) — the caller still reflects the hover/press state via its
+/// colour-tint depth ([`feedback_tint_depth`]).
 #[must_use]
-pub fn button_feedback(hovered: bool, pressed: bool, reduce_motion: bool) -> RenderParams {
-    let rest = RenderParams {
-        alpha: 1.0,
-        translate_y: 0.0,
-        scale: 1.0,
-    };
-    if reduce_motion {
-        // State change without movement (Q32): the colour tint carries it.
-        return rest;
-    }
-    if pressed {
-        // Press wins over hover (a pressed control is always hovered too).
-        Transition::Press(PRESS_DEPTH).params(1.0)
-    } else if hovered {
-        Transition::Lift(HOVER_RISE_PX).params(1.0)
-    } else {
-        rest
-    }
+pub fn button_feedback(hovered: bool, pressed: bool, reduce_motion: bool) -> FeedbackParams {
+    let now = Instant::now();
+    // Backdate the hover timestamp past the hover tween so the shared feedback is
+    // already at its settled endpoint (the button chrome has no tick to animate).
+    let settled = now.checked_sub(Motion::hover().duration * 2).unwrap_or(now);
+    ControlFeedback::new()
+        .hovered(hovered && !pressed, settled)
+        .pressed(pressed)
+        .params(now, reduce_motion)
 }
 
 /// MOTION-FEEDBACK — the depth `0.0..=1.0` of a control's background-tint shift
@@ -293,15 +278,17 @@ mod tests {
 
     #[test]
     fn hover_lifts_press_depresses_with_motion_on() {
-        // Hover rises (negative translate_y), press shrinks scale — the shared
-        // Lift/Press vocabulary, applied at the settled endpoint.
+        // Hover rises (negative translate_y), press shrinks scale — sampled from
+        // the shared ControlFeedback at its settled endpoint, reading the shared
+        // lift/press tokens (no local literals).
+        use mde_theme::feedback::{HOVER_LIFT_PX, PRESS_DEPTH};
         let hover = button_feedback(true, false, false);
         assert!(
-            (hover.translate_y + HOVER_RISE_PX).abs() < 1e-6,
-            "hover lifts by -rise, got {}",
+            (hover.translate_y + HOVER_LIFT_PX).abs() < 1e-4,
+            "hover lifts by -HOVER_LIFT_PX, got {}",
             hover.translate_y
         );
-        assert_eq!(hover.scale, 1.0, "hover never scales");
+        assert!((hover.scale - 1.0).abs() < 1e-6, "hover never scales");
         let press = button_feedback(true, true, false);
         assert!(
             (press.scale - (1.0 - PRESS_DEPTH)).abs() < 1e-6,
@@ -313,7 +300,7 @@ mod tests {
         // At rest: no transform.
         let rest = button_feedback(false, false, false);
         assert_eq!(rest.translate_y, 0.0);
-        assert_eq!(rest.scale, 1.0);
+        assert!((rest.scale - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -324,8 +311,10 @@ mod tests {
         for (h, p) in [(true, false), (true, true), (false, false)] {
             let r = button_feedback(h, p, true);
             assert_eq!(r.translate_y, 0.0, "no lift under reduce-motion");
-            assert_eq!(r.scale, 1.0, "no depress under reduce-motion");
-            assert_eq!(r.alpha, 1.0);
+            assert!(
+                (r.scale - 1.0).abs() < 1e-6,
+                "no depress under reduce-motion"
+            );
         }
         // The tint cue is identical regardless of reduce-motion.
         assert!(feedback_tint_depth(true, false) > 0.0, "hover tints");
