@@ -36,8 +36,6 @@ pub const SURF: Color = tok(carbon::GRAY_100);
 pub const SURF_C: Color = tok(carbon::GRAY_80);
 /// High-elevation hover state — Gray 70.
 pub const SURF_C_HI: Color = tok(carbon::GRAY_70);
-/// Outline / divider line — Gray 70.
-pub const OUTLINE: Color = tok(carbon::GRAY_70);
 /// Outline variant (lighter divider) — Gray 80.
 pub const OUTLINE_VAR: Color = tok(carbon::GRAY_80);
 
@@ -58,6 +56,9 @@ pub const SUCCESS: Color = tok(carbon::GREEN_40);
 pub const ERROR: Color = tok(carbon::RED_50);
 /// Info — Blue 40.
 pub const INFO: Color = tok(carbon::BLUE_40);
+/// Warning — on-dark Yellow 30 (degraded / caveated states, e.g. a fixture
+/// roster or a `StateTone::Warning` load-state).
+pub const WARNING: Color = tok(carbon::YELLOW_30);
 
 // ---------- Primary (Carbon Blue accent) ----------
 
@@ -66,10 +67,10 @@ pub const PRIMARY: Color = tok(carbon::BLUE_50);
 /// Text on the Blue fill — White.
 pub const ON_PRIMARY: Color = tok(carbon::WHITE);
 
-// ---------- Presence pip colors ----------
+// ---------- Presence color ----------
 
+/// An available / online mesh peer (drives the resolved-chip "mesh · <name>").
 pub const PRESENCE_AVAILABLE: Color = SUCCESS;
-pub const PRESENCE_OFFLINE: Color = OUTLINE;
 
 #[cfg(test)]
 mod tests {
@@ -93,5 +94,6 @@ mod tests {
         assert_eq!(rgb8(PRIMARY), (0x45, 0x89, 0xff), "accent = Blue 50");
         assert_eq!(rgb8(SUCCESS), (0x42, 0xbe, 0x65), "success = Green 40");
         assert_eq!(rgb8(ERROR), (0xfa, 0x4d, 0x56), "error = Red 50");
+        assert_eq!(rgb8(WARNING), (0xf1, 0xc2, 0x1b), "warning = Yellow 30");
     }
 }

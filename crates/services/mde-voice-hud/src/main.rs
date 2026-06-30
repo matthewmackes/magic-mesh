@@ -47,7 +47,7 @@ mod sip;
 mod theme;
 
 use resolve::{resolve_target, Resolved};
-use roster::{Peer, RosterLoad};
+use roster::{Peer, RosterLoad, RosterSource};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -55,6 +55,7 @@ use std::time::{Duration, Instant};
 use mde_theme::animation::{Animator, Transition};
 use mde_theme::feedback::{ControlFeedback, FeedbackParams};
 use mde_theme::motion::{Easing, Motion, PANEL_MOUNT_TRANSLATE_Y_PX};
+use mde_theme::{LoadState, StateTone};
 
 // ── MOTION-FEEDBACK-1 / MOTION-TRANS — the HUD's shared-motion wiring ─────────
 //
@@ -225,6 +226,12 @@ pub enum Message {
     /// No-op when no call is up. Stops/resumes mic transmission while the peer's
     /// audio keeps playing.
     ToggleMute,
+    /// POLISH-voicehud-loadstate — the operator clicked Retry on a recoverable
+    /// (failed) registration. Optimistically flips the state to the in-flight
+    /// `Registering` and asks the persistent SIP agent to re-REGISTER (its
+    /// existing register action); the agent's result lands as a later
+    /// `Agent(Registration(..))` event.
+    RetryRegistration,
 }
 
 /// Top-level HUD state.
@@ -234,8 +241,13 @@ pub struct VoiceHud {
     /// Loaded mesh roster — drives the `Resolved::Mesh` lookup
     /// in the resolved-chip rendering.
     pub roster: Vec<Peer>,
+    /// POLISH-voicehud-loadstate — where [`roster`](Self::roster) came from
+    /// (live mesh vs the embedded compile-time fixture). Drives the topbar's
+    /// roster-source caveat so a fixture roster is surfaced honestly instead of
+    /// being shown as if it were live mesh data.
+    pub roster_source: RosterSource,
     /// Live SIP registration state (VOIP-28) — drives the topbar status
-    /// line + presence pip. `NoAccount` until `account.toml` exists.
+    /// line + state icon. `NoAccount` until `account.toml` exists.
     pub registration: sip::RegistrationState,
     /// The loaded SIP account (used to place calls); `None` with no config.
     pub account: Option<sip::SipAccount>,
@@ -707,6 +719,14 @@ pub fn update(state: &mut VoiceHud, message: Message) -> Task<Message> {
                 state.pressed = None;
             }
         }
+        Message::RetryRegistration => {
+            // Gated in the view on `can_retry()`, so this fires only on a
+            // recoverable state. Show the in-flight state immediately, then ask
+            // the agent to re-REGISTER — reusing its existing register action
+            // (the periodic `agent_register` path) rather than a new flow (§6).
+            state.registration = sip::RegistrationState::Registering;
+            agent_send(sip::AgentCommand::Reregister);
+        }
     }
     // MOTION-TRANS — after any message, if the call MODE changed, crossfade the
     // call bar so the mode switch reads as one motion (not a hard cut).
@@ -905,21 +925,22 @@ fn agent_subscription() -> cosmic::iced::Subscription<Message> {
     })
 }
 
-/// Build the topbar — account dot + peer name + presence pip + registration
-/// status. The peer name + initials are the real host identity; the presence
-/// pip is offline and the status reads "Not registered" until VOIP-28 wires
-/// the live PJSIP registrar state over the Bus (the registered view is the
-/// SIP-server bench).
+/// Build the topbar — account dot + peer name + the live registration state.
+///
+/// POLISH-voicehud-loadstate — the registration state rides the shared
+/// [`LoadState`] async-state vocabulary: it renders as a distinct icon SHAPE +
+/// the registration label, so the state reads by icon+text and never by colour
+/// alone (the a11y contract the old colour-only pip broke). The state's
+/// [`StateTone`] is a *secondary* colour cue, every hue a `mde-theme` token
+/// (§4). A Retry affordance appears whenever the state is recoverable
+/// ([`LoadState::can_retry`]), wired to the persistent SIP agent's existing
+/// re-REGISTER action. When the roster is the embedded fixture (not live mesh
+/// data) a Degraded "fixture roster" caveat is surfaced rather than dropped.
 fn build_topbar(state: &VoiceHud, appear: f32) -> Element<'_, Message> {
     let peer_name = local_peer_name();
-    let pip_color = fade_color(
-        if state.registration.is_online() {
-            theme::PRESENCE_AVAILABLE
-        } else {
-            theme::PRESENCE_OFFLINE
-        },
-        appear,
-    );
+    // The registration state, mapped onto the shared LoadState vocabulary so its
+    // icon (shape) + tone (colour) come from the one source the whole shell uses.
+    let reg_ls = registration_load_state(&state.registration);
     let registration_status = state.registration.label();
     let account_dot = container(
         text(account_initials(&peer_name))
@@ -942,32 +963,45 @@ fn build_topbar(state: &VoiceHud, appear: f32) -> Element<'_, Message> {
     .align_x(cosmic::iced::alignment::Horizontal::Center)
     .align_y(cosmic::iced::alignment::Vertical::Center);
 
-    let presence_pip = container(cosmic::iced::widget::Space::new())
-        .sty(move |_: &Theme| cosmic::iced::widget::container::Style {
-            background: Some(cosmic::iced::Background::Color(pip_color)),
-            border: cosmic::iced::Border {
-                radius: cosmic::iced::border::Radius::from(4.0),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-        .width(Length::Fixed(8.0))
-        .height(Length::Fixed(8.0));
+    // The state "pip" is now the LoadState icon glyph — a distinct shape carrying
+    // the state, with the tone colour layered on as a secondary (non-sole) cue.
+    let mut status_items: Vec<Element<Message>> = vec![
+        text(reg_ls.icon().to_string())
+            .size(11.0)
+            .colr(fade_color(state_tone_color(reg_ls.tone()), appear))
+            .into(),
+        cosmic::iced::widget::space()
+            .width(Length::Fixed(6.0))
+            .into(),
+        text(registration_status)
+            .size(11.0)
+            .colr(fade_color(theme::ON_SURF_VAR, appear))
+            .into(),
+    ];
+    // Retry only when the state is recoverable (Failed) — the user can act.
+    if reg_ls.can_retry() {
+        status_items.push(
+            cosmic::iced::widget::space()
+                .width(Length::Fixed(8.0))
+                .into(),
+        );
+        status_items.push(retry_chip(appear));
+    }
+    let status_line = row(status_items).align_y(cosmic::iced::Alignment::Center);
 
-    let name_col = column![
+    let mut name_children: Vec<Element<Message>> = vec![
         text(peer_name)
             .size(14.0)
-            .colr(fade_color(theme::ON_SURF, appear)),
-        row![
-            presence_pip,
-            cosmic::iced::widget::space().width(Length::Fixed(6.0)),
-            text(registration_status)
-                .size(11.0)
-                .colr(fade_color(theme::ON_SURF_VAR, appear)),
-        ]
-        .align_y(cosmic::iced::Alignment::Center),
-    ]
-    .spacing(2);
+            .colr(fade_color(theme::ON_SURF, appear))
+            .into(),
+        status_line.into(),
+    ];
+    // Roster-source honesty: warn when the roster is the embedded fixture rather
+    // than live mesh data (live mesh is the silent-good default — no caveat).
+    if let Some(indicator) = roster_source_indicator(state.roster_source, appear) {
+        name_children.push(indicator);
+    }
+    let name_col = column(name_children).spacing(2);
 
     row![
         account_dot,
@@ -976,6 +1010,60 @@ fn build_topbar(state: &VoiceHud, appear: f32) -> Element<'_, Message> {
     ]
     .align_y(cosmic::iced::Alignment::Center)
     .into()
+}
+
+/// POLISH-voicehud-loadstate — the topbar Retry affordance, shown only when the
+/// registration is recoverable ([`LoadState::can_retry`]). Wired to
+/// [`Message::RetryRegistration`], which asks the persistent SIP agent to
+/// re-REGISTER (its existing register action). Every hue is a `mde-theme` token.
+fn retry_chip<'a>(appear: f32) -> Element<'a, Message> {
+    button(
+        text("Retry")
+            .size(11.0)
+            .colr(fade_color(theme::ON_PRIMARY, appear)),
+    )
+    .on_press(Message::RetryRegistration)
+    .padding(Padding::from([4, 10]))
+    .sty(
+        move |_: &Theme, _status| cosmic::iced::widget::button::Style {
+            background: Some(cosmic::iced::Background::Color(fade_color(
+                theme::PRIMARY,
+                appear,
+            ))),
+            text_color: fade_color(theme::ON_PRIMARY, appear),
+            border: cosmic::iced::Border {
+                radius: cosmic::iced::border::Radius::from(12.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .into()
+}
+
+/// POLISH-voicehud-loadstate — the roster-source caveat indicator. A live mesh
+/// source renders nothing (a `Loaded` roster is the silent-good default); the
+/// embedded compile-time fixture renders a `Degraded` "fixture roster" chip
+/// (icon shape + label + warning tone) so the operator can tell they're not on
+/// live mesh data. Returns `None` for the live case so no empty row is added.
+fn roster_source_indicator<'a>(source: RosterSource, appear: f32) -> Option<Element<'a, Message>> {
+    let ls = roster_load_state(source);
+    if ls == LoadState::Loaded {
+        return None;
+    }
+    Some(
+        row![
+            text(ls.icon().to_string())
+                .size(11.0)
+                .colr(fade_color(state_tone_color(ls.tone()), appear)),
+            cosmic::iced::widget::space().width(Length::Fixed(6.0)),
+            text("fixture roster")
+                .size(11.0)
+                .colr(fade_color(theme::ON_SURF_MUTED, appear)),
+        ]
+        .align_y(cosmic::iced::Alignment::Center)
+        .into(),
+    )
 }
 
 /// Build the display + resolved-chip strip. The text-input
@@ -1480,6 +1568,58 @@ pub fn appended_char(old: &str, new: &str) -> Option<char> {
     }
 }
 
+/// POLISH-voicehud-loadstate — map the SIP [`sip::RegistrationState`] onto the
+/// shared [`LoadState`] async-state vocabulary.
+///
+/// The topbar then renders the state with `LoadState`'s icon (a non-colour-only
+/// shape cue) + tone, and offers a Retry whenever [`LoadState::can_retry`].
+/// `NoAccount` is the resting `Idle` (nothing to register → no retry); a REGISTER
+/// in flight is `Loading`; a 200 OK is `Loaded`; a terminal failure is `Failed`
+/// (retriable). Pure + testable.
+#[must_use]
+pub const fn registration_load_state(reg: &sip::RegistrationState) -> LoadState {
+    match reg {
+        sip::RegistrationState::NoAccount => LoadState::Idle,
+        sip::RegistrationState::Registering => LoadState::Loading,
+        sip::RegistrationState::Registered { .. } => LoadState::Loaded,
+        sip::RegistrationState::Failed(_) => LoadState::Failed,
+    }
+}
+
+/// POLISH-voicehud-loadstate — map the roster [`RosterSource`] onto a
+/// [`LoadState`].
+///
+/// Every live source is `Loaded`; the embedded compile-time fixture is `Degraded`
+/// (usable, but NOT live mesh data) so the topbar can warn the operator they're
+/// seeing a fixture roster instead of silently dropping the source. Pure +
+/// testable.
+#[must_use]
+pub const fn roster_load_state(source: RosterSource) -> LoadState {
+    match source {
+        RosterSource::EmbeddedFixture => LoadState::Degraded,
+        RosterSource::MeshDirectory
+        | RosterSource::EnvOverride
+        | RosterSource::MeshStorage
+        | RosterSource::LocalFallback => LoadState::Loaded,
+    }
+}
+
+/// POLISH-voicehud-loadstate — the `mde-theme` Carbon colour token for a
+/// [`StateTone`].
+///
+/// §4 — every hue reads a token, never a raw literal. The tone is the *secondary*
+/// cue; the state's icon + label carry it without colour.
+#[must_use]
+pub const fn state_tone_color(tone: StateTone) -> Color {
+    match tone {
+        StateTone::Neutral => theme::ON_SURF_MUTED,
+        StateTone::Info => theme::INFO,
+        StateTone::Warning => theme::WARNING,
+        StateTone::Danger => theme::ERROR,
+        StateTone::Success => theme::SUCCESS,
+    }
+}
+
 /// Pure: the action an Escape key press maps to, given the live call state.
 ///
 /// A live call is never killed by Esc — Esc Declines a ringing call and Hangs up
@@ -1607,6 +1747,7 @@ fn main() -> Result<(), cosmic::iced::Error> {
                 VoiceHud {
                     dialer_input: String::new(),
                     roster: peers,
+                    roster_source: source,
                     registration,
                     account,
                     call: sip::CallState::Idle,
@@ -1651,6 +1792,7 @@ mod tests {
         VoiceHud {
             dialer_input: String::new(),
             roster: vec![],
+            roster_source: roster::RosterSource::EmbeddedFixture,
             registration: sip::RegistrationState::NoAccount,
             account: None,
             call: sip::CallState::Idle,
@@ -2372,5 +2514,127 @@ mod tests {
         hud.call = sip::CallState::Idle;
         let _ = update(&mut hud, Message::Backspace);
         assert_eq!(hud.dialer_input, "pin");
+    }
+
+    // ── POLISH-voicehud-loadstate — registration/roster load-state mapping ─────
+
+    #[test]
+    fn registration_maps_onto_the_shared_loadstate_vocabulary() {
+        use sip::RegistrationState as R;
+        assert_eq!(registration_load_state(&R::NoAccount), LoadState::Idle);
+        assert_eq!(registration_load_state(&R::Registering), LoadState::Loading);
+        assert_eq!(
+            registration_load_state(&R::Registered {
+                server: "sip.example.com:5060".into(),
+                expires: 60,
+            }),
+            LoadState::Loaded
+        );
+        assert_eq!(
+            registration_load_state(&R::Failed("registrar unreachable".into())),
+            LoadState::Failed
+        );
+    }
+
+    #[test]
+    fn only_a_failed_registration_offers_retry() {
+        // The Retry affordance is gated on `can_retry()`, so it appears exactly
+        // for the recoverable (Failed) state — never mid-register or when live.
+        use sip::RegistrationState as R;
+        assert!(registration_load_state(&R::Failed("x".into())).can_retry());
+        assert!(!registration_load_state(&R::Registering).can_retry());
+        assert!(!registration_load_state(&R::NoAccount).can_retry());
+        assert!(!registration_load_state(&R::Registered {
+            server: "s".into(),
+            expires: 1,
+        })
+        .can_retry());
+    }
+
+    #[test]
+    fn every_registration_state_reads_as_a_distinct_shape_not_colour() {
+        // The a11y fix: each state carries a distinct icon SHAPE (via LoadState),
+        // so it is never conveyed by colour alone.
+        use sip::RegistrationState as R;
+        let states = [
+            R::NoAccount,
+            R::Registering,
+            R::Registered {
+                server: "s".into(),
+                expires: 1,
+            },
+            R::Failed("x".into()),
+        ];
+        let icons: Vec<char> = states
+            .iter()
+            .map(|s| registration_load_state(s).icon())
+            .collect();
+        for (i, a) in icons.iter().enumerate() {
+            for b in &icons[i + 1..] {
+                assert_ne!(a, b, "registration icons must be distinct shapes");
+            }
+        }
+    }
+
+    #[test]
+    fn roster_fixture_is_degraded_and_live_sources_are_loaded() {
+        assert_eq!(
+            roster_load_state(RosterSource::EmbeddedFixture),
+            LoadState::Degraded
+        );
+        for live in [
+            RosterSource::MeshDirectory,
+            RosterSource::EnvOverride,
+            RosterSource::MeshStorage,
+            RosterSource::LocalFallback,
+        ] {
+            assert_eq!(
+                roster_load_state(live),
+                LoadState::Loaded,
+                "{live:?} is live"
+            );
+        }
+        // The fixture caveat reads as a Warning tone (usable-but-not-live), and a
+        // live roster is the silent-good default (no indicator).
+        assert_eq!(
+            roster_load_state(RosterSource::EmbeddedFixture).tone(),
+            StateTone::Warning
+        );
+        assert!(roster_source_indicator(RosterSource::EmbeddedFixture, 1.0).is_some());
+        assert!(roster_source_indicator(RosterSource::MeshDirectory, 1.0).is_none());
+    }
+
+    #[test]
+    fn retry_flips_registration_optimistically_in_flight() {
+        // Clicking Retry shows the in-flight (Loading) Registering state at once;
+        // the agent's real result then lands as a later Registration event.
+        let mut hud = make_hud();
+        hud.registration = sip::RegistrationState::Failed("registrar unreachable".into());
+        let _ = update(&mut hud, Message::RetryRegistration);
+        assert!(matches!(
+            hud.registration,
+            sip::RegistrationState::Registering
+        ));
+        assert_eq!(
+            registration_load_state(&hud.registration),
+            LoadState::Loading
+        );
+    }
+
+    #[test]
+    fn state_tone_colours_are_distinct_carbon_tokens() {
+        // §4 — each tone resolves to a distinct mde-theme Carbon token (the
+        // secondary colour cue), and danger/success/warning map to the expected
+        // status tokens.
+        let danger = state_tone_color(StateTone::Danger);
+        let success = state_tone_color(StateTone::Success);
+        let warning = state_tone_color(StateTone::Warning);
+        let triple = |c: Color| (c.r, c.g, c.b);
+        assert_ne!(triple(danger), triple(success));
+        assert_ne!(triple(warning), triple(success));
+        assert_ne!(triple(warning), triple(danger));
+        assert_eq!(triple(danger), triple(theme::ERROR));
+        assert_eq!(triple(success), triple(theme::SUCCESS));
+        assert_eq!(triple(warning), triple(theme::WARNING));
     }
 }

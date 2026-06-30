@@ -170,11 +170,6 @@ impl RegistrationState {
             RegistrationState::Failed(_) => "Registration failed".to_string(),
         }
     }
-
-    /// Whether the account is live (drives the presence pip).
-    pub const fn is_online(&self) -> bool {
-        matches!(self, Self::Registered { .. })
-    }
 }
 
 // ── VOIP-28 / E7.5: publish agent status to the Bus ─────────────────────────
@@ -1171,6 +1166,11 @@ pub enum AgentCommand {
     /// in-call keypad digits route here. A no-op if no call/media is up or the
     /// key is not a DTMF digit.
     Dtmf(char),
+    /// POLISH-voicehud-loadstate — re-attempt registration now (the topbar Retry
+    /// affordance). Reuses the agent's existing periodic re-REGISTER path
+    /// (`agent_register`) by firing it on the next loop tick; a no-op for a
+    /// registrar-less P2P agent (nothing to register — it is already reachable).
+    Reregister,
 }
 
 /// Discover the local IP that routes to `peer` (the overlay IP for a mesh
@@ -1366,6 +1366,13 @@ pub fn run_agent(
                     m.stop();
                 }
                 pending = None;
+            }
+            Ok(AgentCommand::Reregister) => {
+                // POLISH-voicehud-loadstate — re-register now by collapsing the
+                // periodic re-REGISTER timer to "due"; the existing block below
+                // runs `agent_register` on this same iteration (registrar
+                // accounts only — a registrar-less P2P agent has no registrar).
+                next_reg = Instant::now();
             }
             // The UI dropping its sender (app exit) is the shutdown signal.
             Err(TryRecvError::Disconnected) => {
@@ -1664,12 +1671,6 @@ mod tests {
             .label(),
             "Registered · sip.example.com:5060"
         );
-        assert!(RegistrationState::Registered {
-            server: "h".into(),
-            expires: 1
-        }
-        .is_online());
-        assert!(!RegistrationState::Failed("x".into()).is_online());
     }
 
     // ── slice 2: call signaling ──────────────────────────────────────────
