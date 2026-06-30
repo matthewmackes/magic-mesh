@@ -1,0 +1,26 @@
+[package]
+name        = "mde-vdi-vnc"
+description = "MCNF E12 'Quasar' VDI — render a remote VNC/RFB desktop into an egui texture (VNC/XAPI-console fallback, lock 21). A pure-Rust RFB decoder turns Raw/CopyRect/RRE/Hextile framebuffer-update rectangles into an egui ColorImage, and egui input events map to RFB PointerEvent/KeyEvent messages. NO external viewer and NO external protocol crate — the decoder is ours (which is why VNC is the universal fallback), so the egui-facing decode + input surface is fully unit-tested without a server; the live RFB transport is the integration-gated layer."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_vdi_vnc"
+path = "src/lib.rs"
+
+[dependencies]
+# egui comes via the harness so this VDI backend resolves to the ONE
+# harness-pinned egui (no cross-surface version skew, §4). We use only the egui
+# types (ColorImage / Event / Key / ...). Unlike mde-vdi-rdp (ironrdp), the RFB
+# framebuffer decoder + input mapping are pure-Rust in-crate, so there is NO
+# external protocol dependency — the unit-tested decode/input surface stands
+# alone, and the live RFB transport (the only server-dependent part) is the
+# integration-gated layer added on top.
+mde-egui = { path = "../../shared/mde-egui" }
+
+[lints]
+workspace = true
