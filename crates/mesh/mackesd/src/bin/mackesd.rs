@@ -43,6 +43,14 @@ enum Cmd {
     /// panel + the CLI consume identical data.
     Healthz,
 
+    /// MESHFS-1 — print the Mesh-Sync (`/mnt/mesh-storage`) storage status as a
+    /// JSON line. The verb was deleted with the LizardFS plane (SUBSTRATE-6) but
+    /// the Workbench Mesh Storage panel + `mde-files` still shell it, so it is
+    /// restored Syncthing-native: this node's `df` (used/avail) as one peer plus
+    /// the goal/quota fields both GUIs read. Per-peer aggregation (MESHFS-2) and
+    /// Syncthing completion (MESHFS-3) build on this.
+    MeshFsStatus,
+
     /// MESH-A-7 (v5.0.0) — resolve the connect-action for a host:port
     /// from the 12 well-known service mappings (R8-Q50). Prints
     /// `<service>\t<launch argv>` (e.g. port 22 → `ssh <ip>`, port 80
@@ -1799,6 +1807,11 @@ fn main() -> anyhow::Result<()> {
             let report =
                 report.with_mesh(n, healthy, degraded, unreachable, is_leader, lighthouses);
             println!("{}", report.to_json_line()?);
+        }
+        Cmd::MeshFsStatus => {
+            // MESHFS-1 — local mount report; both GUI consumers parse this JSON.
+            let report = mesh_fs_report(std::path::Path::new(mackesd_core::CANONICAL_QNM_MOUNT));
+            println!("{}", serde_json::to_string(&report)?);
         }
         Cmd::Connect { ip, port } => match mackesd_core::connect_actions::connect_argv(&ip, port) {
             Some((service, argv)) => {
@@ -5226,6 +5239,116 @@ fn print_revisions_table(rows: &[serde_json::Value]) {
             .unwrap_or("?");
         let sm = row.get("summary").and_then(|v| v.as_str()).unwrap_or("");
         println!("{rid:>6}  [{st}]  {aut:<16}  {cre}  {sm}");
+    }
+}
+
+// ── MESHFS-1: Mesh-Sync storage status ────────────────────────────────────────
+// The `mesh-fs-status` verb was deleted with the LizardFS plane (SUBSTRATE-6);
+// two GUIs still shell it. Restored Syncthing-native. The report is the UNION of
+// the fields both consumers read: the Workbench Mesh Storage panel reads
+// peers[].{addr,used_bytes,avail_bytes} + goal + quota_cap_bytes +
+// limiting_peer_addr; `mde-files` reads master_reachable + peers[].undergoal_chunks
+// + goal + offline_peers. Under Syncthing there is no master/chunks, so those
+// LizardFS-era fields are honest constants (0 / [] / mount-present), kept in the
+// wire shape as MESHFS-2/3 placeholders — never faked.
+
+#[derive(Debug, serde::Serialize)]
+struct MeshFsPeer {
+    addr: String,
+    used_bytes: u64,
+    avail_bytes: u64,
+    /// LizardFS-era field `mde-files` still reads; always 0 under Syncthing.
+    undergoal_chunks: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct MeshFsReport {
+    schema: u32,
+    mount: String,
+    peers: Vec<MeshFsPeer>,
+    goal: u64,
+    quota_cap_bytes: Option<u64>,
+    limiting_peer_addr: Option<String>,
+    /// `mde-files`' healing check; under Syncthing = is the local mount present.
+    master_reachable: bool,
+    offline_peers: Vec<String>,
+}
+
+/// `df` for the mesh-storage mount → `(used_bytes, avail_bytes)`. `None` when df
+/// fails / the path is absent. Not feature-gated: the sibling `filesystem_*_bytes`
+/// wrappers + `mde_bus::retention::filesystem_total_avail_bytes` are all behind
+/// `async-services` / the optional `mde-bus` dep, unreachable from the sync CLI.
+fn mesh_storage_df(path: &std::path::Path) -> Option<(u64, u64)> {
+    let out = std::process::Command::new("df")
+        .args(["-B1", "--output=used,avail"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let mut nums = body.lines().nth(1)?.split_whitespace();
+    let used = nums.next()?.parse::<u64>().ok()?;
+    let avail = nums.next()?.parse::<u64>().ok()?;
+    Some((used, avail))
+}
+
+/// MESHFS-1 — build the local-mount storage report for `mount`.
+fn mesh_fs_report(mount: &std::path::Path) -> MeshFsReport {
+    let present = mount.is_dir();
+    let peers = if present {
+        let (used_bytes, avail_bytes) = mesh_storage_df(mount).unwrap_or((0, 0));
+        vec![MeshFsPeer {
+            addr: default_node_id(),
+            used_bytes,
+            avail_bytes,
+            undergoal_chunks: 0,
+        }]
+    } else {
+        vec![]
+    };
+    // full-mesh: every present node holds a copy, so the goal == the peer count.
+    let goal = peers.len() as u64;
+    MeshFsReport {
+        schema: 1,
+        mount: mount.display().to_string(),
+        peers,
+        goal,
+        quota_cap_bytes: None,
+        limiting_peer_addr: None,
+        master_reachable: present,
+        offline_peers: vec![],
+    }
+}
+
+#[cfg(test)]
+mod meshfs_tests {
+    use super::*;
+
+    #[test]
+    fn report_for_absent_mount_is_empty_but_valid() {
+        let r = mesh_fs_report(std::path::Path::new("/no-such-mesh-mount-zzz"));
+        assert!(!r.master_reachable);
+        assert!(r.peers.is_empty());
+        assert_eq!(r.goal, 0);
+        let json = serde_json::to_string(&r).unwrap();
+        // The Workbench panel's emptiness check is on stdout, not the peer list:
+        // an absent mount still emits a non-empty JSON object (no false error).
+        assert!(json.contains("\"master_reachable\":false"));
+        assert!(json.contains("\"peers\":[]"));
+    }
+
+    #[test]
+    fn report_for_present_mount_has_one_local_peer() {
+        // /tmp exists on the build host; stand-in for the mesh mount.
+        let r = mesh_fs_report(std::path::Path::new("/tmp"));
+        assert!(r.master_reachable);
+        assert_eq!(r.peers.len(), 1);
+        assert_eq!(r.goal, 1);
+        assert!(!r.peers[0].addr.is_empty());
+        // the under-replicated check both GUIs run must read healthy:
+        assert!(!(r.goal > 0 && (r.peers.len() as u64) < r.goal));
     }
 }
 
