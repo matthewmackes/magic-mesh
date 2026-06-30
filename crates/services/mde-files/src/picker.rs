@@ -592,7 +592,17 @@ fn view(state: &Picker) -> Element<'_, Message> {
     // File list well.
     let mut list = Column::new().spacing(0.0);
     if state.entries.is_empty() {
-        list = list.push(container(text("(empty)").size(ROW_PX).colr(t::FG_FAINT)).padding(6.0));
+        // Route the chooser's empty directory through the same shared empty-state
+        // renderer the manager views use, so a zero-entry folder reads as a
+        // deliberate state, not a stray "(empty)" label.
+        list = list.push(crate::widgets::empty_state(
+            mde_theme::EmptyState::info(
+                "This folder is empty",
+                "No files or folders to show here.",
+            )
+            .with_icon(mde_theme::Icon::Folder),
+            None::<Message>,
+        ));
     }
     for (i, e) in state.entries.iter().enumerate() {
         list = list.push(entry_row(state, i, e));
