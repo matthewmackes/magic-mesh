@@ -50,7 +50,9 @@ shared look stack is `crates/shared/`: **`mde-theme`** (the Carbon token source 
 `motion`/`animation`/`frame_timer`, `density`, `accessibility`, `skeleton`,
 `feedback`, `components/{object_card,empty_state}`), **`mde-card`**, and
 **`mde-disclaimer`**. `salvage/from-mde-binary/` holds two not-yet-rehomed
-surfaces (`birthright`, `mesh_status`).
+surfaces (`birthright`, `mesh_status`) — **out of scope for polish until rehomed
+into their own crates**; they aren't buildable binaries yet, so don't dispatch
+units against them.
 
 ## The single hard rule (§4)
 
@@ -96,6 +98,13 @@ units stay file-disjoint and the farm parallelizes cleanly:
 
 Three Xen build VMs, all **Fedora 42**, user `mm`, key
 `/root/.ssh/mackes_mesh_ed25519`, **shared sccache** (`RUSTC_WRAPPER=sccache`):
+
+> **Single source of truth:** `docs/BUILD-ENVIRONMENT.md` (the canonical map) and
+> `install-helpers/drain-coordinator.sh slots` (reads the live topology at runtime).
+> The table below is a **convenience snapshot, not authority** — if it ever disagrees
+> with the doc or the helper, the doc/helper win and this snapshot is the bug. Don't
+> hand-edit caps/IPs here in isolation (the §4 single-source rule applies to farm
+> config too): fix `docs/BUILD-ENVIRONMENT.md` and let the helper read it.
 
 | Host | VM | IP | vCPU / RAM | SAFE heavy slots |
 |---|---|---|---|---|
@@ -158,10 +167,11 @@ completion handlers, not `parallel(); await; parallel()`. Detach long builds
    `workbench-nav-grouping.md`, the per-surface docs). Never polish from a stale
    memory of the locks.
 2. **Survey each surface against the 10 axes.** Build the GUI workspace once on
-   the farm, then for each surface inspect the client area (`/preview` is the tool
-   for this — launch the real binary, or capture + `Read` the PNG headless). Note
-   every gap as a candidate unit. Back the visual read with the static token
-   ground truth: `cargo test -p mde-theme`.
+   the farm, then for each surface inspect the client area — lean on `/preview` for
+   this survey read (launch the real binary, or capture + `Read` the PNG headless),
+   but it stays best-effort: gate units on the token/build/lint ground truth, never
+   on a preview. Note every gap as a candidate unit. Back the visual read with the
+   static token ground truth: `cargo test -p mde-theme`.
 3. **Rescue first (cheap, high-value).** Catch the project's recurring failure
    mode before adding polish: a surface that renders but whose state never updates,
    `demo_data`/placeholder/"coming soon" strings, a `pub mod` with no caller, a
@@ -210,10 +220,12 @@ in-flight workers the same surface crate.
 > Do not cross into another surface's crate; do not touch desktop-shell concerns
 > (Cosmic owns those, §6).
 > **Build on the farm** with a unique `MCNF_BUILD_SLOT` (`install-helpers/xcp-build.sh`).
-> **Gate (all green before commit):** `cargo build -p <crate>` (or `--workspace`),
-> `cargo test` (and `cargo test -p mde-theme` for any token change),
-> `cargo clippy --all-targets`, `cargo fmt --all`, `./install-helpers/lint-carbon-tokens.sh`,
-> `./install-helpers/lint-motion.sh`, `./install-helpers/lint-mesh-boundary.sh`.
+> **Gate (all green before commit — the full §7 set, no subset):** `cargo build -p <crate>`
+> (or `--workspace`), `cargo test` (and `cargo test -p mde-theme` for any token change),
+> `cargo clippy --all-targets`, `cargo fmt --all`, and **all five GUI lints**:
+> `./install-helpers/lint-carbon-tokens.sh`, `./install-helpers/lint-motion.sh`,
+> `./install-helpers/lint-mesh-boundary.sh`, `./install-helpers/lint-no-cratesio-iced.sh`,
+> `./install-helpers/lint-libcosmic-rev.sh`.
 > `/preview` is optional/best-effort, never a blocker.
 > **Commit** named pathspecs with a why-not-what message + the repo's
 > `Co-Authored-By` trailer (see `/ship`). Flip the unit `[✓]`. **Do NOT push.**
