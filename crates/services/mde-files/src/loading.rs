@@ -4,9 +4,12 @@
 //!
 //! 1. **Skeleton-first paint.** The instant a listing is navigated to, the view
 //!    paints layout-matching greyed placeholder rows (a [`skeleton_rows`]) so the
-//!    pane is never blank while the backend enumerates the directory. The grey
-//!    *breathes* via [`mde_theme::animation::shimmer_alpha`] (and is a STATIC grey
-//!    under reduce-motion — the a11y contract: motion is never the only cue).
+//!    pane is never blank while the backend enumerates the directory. The bars are
+//!    the shared Carbon [`mde_theme::SkeletonBlock`] geometry filled by a
+//!    [`mde_theme::SkeletonShimmer`] — the grey *breathes* over the loading period
+//!    and collapses to a STATIC grey under reduce-motion / the motion kill switch
+//!    (the a11y contract: motion is never the only cue), single-sourced in
+//!    [`mde_theme::skeleton`].
 //!
 //! 2. **Stale-while-refreshing.** A *refresh* of a listing that already has
 //!    content keeps the previous rows on screen — dimmed (not blanked) — and
@@ -14,16 +17,12 @@
 //!
 //! The async vocabulary is the shared [`mde_theme::LoadState`]
 //! (`Loading`/`Refreshing { stale }`/`Loaded`); the dim factor is
-//! [`LoadState::content_alpha`], the skeleton shimmer is
-//! [`mde_theme::animation::shimmer_alpha`], and the fade-in of fresh content is
+//! [`LoadState::content_alpha`], the skeleton placeholder is the shared
+//! [`mde_theme::skeleton`] primitive (geometry + shimmer + the reduce-motion
+//! contract), and the fade-in of fresh content is
 //! [`mde_theme::animation::fade_in`]. This module owns NONE of that math — it is
-//! the glue (`AI_GOVERNANCE.md` §4/§7: reuse, don't reimplement).
-//!
-//! ## Follow-up (BEAUT-THEME)
-//!
-//! [`skeleton_rows`] is a deliberately *minimal local* skeleton so this unit
-//! stays parallel-buildable with BEAUT-THEME. Once BEAUT-THEME lands a shared
-//! `mde_theme::skeleton`, consolidate this onto it and delete the local widget.
+//! the glue (`AI_GOVERNANCE.md` §4/§6/§7: reuse the shared primitive, don't
+//! reimplement).
 
 use std::time::{Duration, Instant};
 
@@ -31,7 +30,7 @@ use cosmic::iced::widget::{column, container, Space};
 use cosmic::iced::{Background, Border, Color, Length, Padding};
 use cosmic::Element;
 use mde_theme::motion::Motion;
-use mde_theme::LoadState;
+use mde_theme::{LoadState, Palette, Radii, SkeletonBlock, SkeletonShimmer, Space as Spacing};
 
 use crate::app::Message;
 use crate::cosmic_compat::ContainerSty;
@@ -61,8 +60,8 @@ fn refresh_window() -> Duration {
 pub struct ListingLoad {
     /// The shared async state vocabulary (`Loading`/`Refreshing`/`Loaded`).
     state: LoadState,
-    /// When the current `state` was entered — the origin the skeleton-shimmer
-    /// phase + the crossfade progress are sampled against.
+    /// When the current `state` was entered — the origin the skeleton shimmer
+    /// clock + the crossfade progress are sampled against.
     origin: Instant,
 }
 
@@ -147,13 +146,15 @@ impl ListingLoad {
         matches!(self.state, LoadState::Loading)
     }
 
-    /// BEAUT-FILES — the skeleton-shimmer phase `0.0..=1.0` for [`skeleton_rows`],
-    /// derived from the elapsed loading time over the Carbon `loading` period.
+    /// BEAUT-FILES — the shared Carbon skeleton shimmer for this listing's loading
+    /// paint, its breathe clock anchored at the load `origin`. `reduce_motion`
+    /// (already folding the a11y preference + the motion kill switch) collapses it
+    /// to a STATIC grey block — the a11y contract single-sourced in
+    /// [`mde_theme::skeleton`]. Consumed by [`skeleton_rows`]; its
+    /// [`SkeletonShimmer::needs_tick`] is the visibility/liveness gate.
     #[must_use]
-    pub fn skeleton_phase(self, now: Instant) -> f32 {
-        let period = loading_window().as_secs_f32().max(f32::EPSILON);
-        let elapsed = now.saturating_duration_since(self.origin).as_secs_f32();
-        (elapsed % period) / period
+    pub fn skeleton_shimmer(self, reduce_motion: bool) -> SkeletonShimmer {
+        SkeletonShimmer::new(self.origin, reduce_motion)
     }
 
     /// BEAUT-FILES — the alpha to render kept-on-screen content at: full normally,
@@ -182,37 +183,45 @@ impl ListingLoad {
 /// list that reads as "rows are coming" without implying an exact count.
 pub const SKELETON_ROW_COUNT: usize = 6;
 
-/// BEAUT-FILES — the placeholder bar height (px). Matches the 28 px list-row
-/// height (`list_row`) minus the row's own vertical breathing room, so the
-/// skeleton occupies the same vertical rhythm the real rows will.
-const SKELETON_BAR_HEIGHT: f32 = 16.0;
-
-/// BEAUT-FILES — vertical gap between placeholder bars (px). Mirrors the list
-/// row divider rhythm so the skeleton lines up with the eventual rows.
-const SKELETON_BAR_GAP: f32 = 12.0;
-
 /// BEAUT-FILES — render `rows` greyed placeholder bars for a loading file list.
 ///
-/// Each bar is a Carbon `text_muted`-tinted block whose alpha *breathes* via
-/// [`mde_theme::animation::shimmer_alpha`] (STATIC mid-grey under reduce-motion —
-/// no shimmer, the a11y contract). This is the **minimal local** skeleton; once
-/// BEAUT-THEME ships a shared `mde_theme::skeleton` this consolidates onto it.
+/// Each bar is a shared Carbon [`SkeletonBlock::line`] (fill-width, body line-box
+/// height, `sm` corner) filled by the [`SkeletonShimmer`]: its grey *breathes*
+/// over the loading period, or holds a STATIC mid-grey under reduce-motion / the
+/// motion kill switch (the a11y contract, single-sourced in
+/// [`mde_theme::skeleton`]). Geometry, tint and the reduce-motion fallback all
+/// come from the shared primitive — this is glue, not a reimplementation (§6).
 #[must_use]
-pub fn skeleton_rows<'a>(rows: usize, phase: f32, reduce_motion: bool) -> Element<'a, Message> {
-    let alpha = mde_theme::animation::shimmer_alpha(phase, reduce_motion);
-    // Carbon Gray-50 helper text tone (`t::FG_FAINT`) at the shimmer alpha — a
-    // token, not a raw colour (§4).
+pub fn skeleton_rows<'a>(
+    rows: usize,
+    shimmer: SkeletonShimmer,
+    now: Instant,
+    palette: &Palette,
+) -> Element<'a, Message> {
+    // Shared Carbon geometry: a fill-width single-line block (height = body
+    // line-box, `sm` corner) — no re-derived bar height or radius literal (§6).
+    let block = SkeletonBlock::line(None, Radii::defaults());
+    let height = f32::from(block.height);
+    let radius = f32::from(block.radius);
+    // Shared shimmer fill: the palette `text` token at the breathe alpha,
+    // composited over the surface — a token, not a raw colour (§4).
+    let fill = shimmer.fill(now, palette);
     let bar_color = Color {
-        a: alpha,
-        ..t::FG_FAINT
+        r: fill.r as f32 / 255.0,
+        g: fill.g as f32 / 255.0,
+        b: fill.b as f32 / 255.0,
+        a: fill.a,
     };
-    let mut col = column![].spacing(SKELETON_BAR_GAP);
+    // Inter-row gap = the Carbon "gap between adjacent list rows" spacing token
+    // (§4 single source), so the skeleton keeps the eventual rows' rhythm.
+    let gap = f32::from(Spacing::scaled(1.0).md);
+    let mut col = column![].spacing(gap);
     for _ in 0..rows {
         col = col.push(
             container(
                 Space::new()
                     .width(Length::Fill)
-                    .height(Length::Fixed(SKELETON_BAR_HEIGHT)),
+                    .height(Length::Fixed(height)),
             )
             .width(Length::Fill)
             .sty(move |_| container::Style {
@@ -221,7 +230,7 @@ pub fn skeleton_rows<'a>(rows: usize, phase: f32, reduce_motion: bool) -> Elemen
                 border: Border {
                     color: Color::TRANSPARENT,
                     width: 0.0,
-                    radius: 2.0.into(),
+                    radius: radius.into(),
                 },
                 ..container::Style::default()
             }),
@@ -366,13 +375,16 @@ mod tests {
 
     #[test]
     fn reduce_motion_makes_skeleton_static_and_fade_instant() {
-        // BEAUT-FILES — a11y: the skeleton grey is phase-independent (STATIC) and
-        // the refresh crossfade caps to ≤80 ms under reduce-motion.
+        // BEAUT-FILES — a11y: the shared skeleton shimmer is STATIC (and arms no
+        // tick) under reduce-motion, and the refresh crossfade caps to ≤80 ms.
         let t0 = Instant::now();
-        // Static skeleton: same alpha at every phase.
-        let a = mde_theme::animation::shimmer_alpha(0.0, true);
-        let b = mde_theme::animation::shimmer_alpha(0.9, true);
-        assert_eq!(a, b, "reduce-motion skeleton is static grey");
+        // Static skeleton: the shared shimmer reports static + never ticks.
+        let still = ListingLoad::default().skeleton_shimmer(true);
+        assert!(still.is_static(), "reduce-motion skeleton is static grey");
+        assert!(
+            !still.needs_tick(true),
+            "a static skeleton arms no breathe tick"
+        );
         // Refresh fade is complete by the 80 ms cap under reduce-motion.
         let mut l = ListingLoad::default();
         l.begin(t0, true);
@@ -384,23 +396,41 @@ mod tests {
     }
 
     #[test]
-    fn skeleton_phase_cycles_within_unit_interval() {
+    fn skeleton_shimmer_breathes_while_visible_and_is_anchored_at_origin() {
+        // BEAUT-FILES — the loading paint drives the shared shimmer: a live shimmer
+        // arms its breathe tick only while visible, and its fill resolves against
+        // the palette `text` token at every frame across the loading window.
         let t0 = Instant::now();
         let mut l = ListingLoad::default();
         l.begin(t0, false);
+        let live = l.skeleton_shimmer(false);
+        assert!(!live.is_static(), "motion-live ⇒ the skeleton breathes");
+        assert!(live.needs_tick(true), "a visible live skeleton arms a tick");
+        assert!(!live.needs_tick(false), "a hidden skeleton arms no tick");
+        // Fill resolves to the palette `text` hue at a breathe alpha, every frame.
+        let pal = crate::theme::mde_files_palette();
         for ms in [0u64, 100, 350, 699, 700, 1400] {
-            let p = l.skeleton_phase(t0 + Duration::from_millis(ms));
-            assert!((0.0..=1.0).contains(&p), "phase {p} out of range at {ms}ms");
+            let f = live.fill(t0 + Duration::from_millis(ms), &pal);
+            assert_eq!((f.r, f.g, f.b), (pal.text.r, pal.text.g, pal.text.b));
+            assert!(
+                (0.0..=1.0).contains(&f.a),
+                "alpha {} out of range at {ms}ms",
+                f.a
+            );
         }
     }
 
     #[test]
     fn skeleton_widget_builds_for_any_row_count_and_motion_pref() {
         // §7 runtime-reachable — the skeleton renders for the empty, single, and
-        // multi-row cases, with motion on and reduced.
+        // multi-row cases, with motion on and reduced, off the shared primitive.
+        let now = Instant::now();
+        let pal = crate::theme::mde_files_palette();
         for rows in [0usize, 1, SKELETON_ROW_COUNT] {
-            let _: Element<'_, Message> = skeleton_rows(rows, 0.3, false);
-            let _: Element<'_, Message> = skeleton_rows(rows, 0.3, true);
+            let live = SkeletonShimmer::new(now, false);
+            let still = SkeletonShimmer::new(now, true);
+            let _: Element<'_, Message> = skeleton_rows(rows, live, now, &pal);
+            let _: Element<'_, Message> = skeleton_rows(rows, still, now, &pal);
         }
     }
 
@@ -408,8 +438,11 @@ mod tests {
     fn dim_is_pass_through_at_full_opacity_and_wraps_when_dimmed() {
         // §7 runtime-reachable — `dim` builds for both the full-opacity (no scrim)
         // and the dimmed (scrim stacked) paths.
-        let _: Element<'_, Message> = dim(skeleton_rows(1, 0.0, false), 1.0);
-        let _: Element<'_, Message> = dim(skeleton_rows(1, 0.0, false), 0.55);
-        let _: Element<'_, Message> = dim(skeleton_rows(1, 0.0, false), 0.0);
+        let now = Instant::now();
+        let pal = crate::theme::mde_files_palette();
+        let sk = || skeleton_rows(1, SkeletonShimmer::new(now, false), now, &pal);
+        let _: Element<'_, Message> = dim(sk(), 1.0);
+        let _: Element<'_, Message> = dim(sk(), 0.55);
+        let _: Element<'_, Message> = dim(sk(), 0.0);
     }
 }

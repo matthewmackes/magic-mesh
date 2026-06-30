@@ -679,8 +679,9 @@ impl RowMotionCtx<'_> {
     pub fn skeleton(&self) -> Element<'static, Message> {
         crate::loading::skeleton_rows(
             crate::loading::SKELETON_ROW_COUNT,
-            self.load.skeleton_phase(self.now),
-            self.reduce_motion,
+            self.load.skeleton_shimmer(self.reduce_motion),
+            self.now,
+            &t::mde_files_palette(),
         )
     }
 
