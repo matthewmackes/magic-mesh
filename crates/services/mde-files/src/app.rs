@@ -129,6 +129,14 @@ pub enum Message {
     OpRowUpsert(OpRow),
     /// v2.0.0 Phase 1.7 — dismiss a terminal op from the drawer.
     OpRowDismiss(u64),
+    /// v2.0.0 Phase 1.7 — retry a failed / cancelled transfer from the
+    /// operation drawer. Replays the Send-To recorded under this op id
+    /// (gated in the view on [`OpState::can_retry`]).
+    RetryOp(u64),
+    /// v2.0.0 Phase 1.4 — copy a file's absolute path to the clipboard
+    /// (the details-panel "Copy path" action; mirrors the context menu's
+    /// Copy-path side-effect).
+    CopyPath(String),
     /// v2.0.0 Phase 1.6 — user grabbed a row (or the current
     /// selection) and started dragging.
     DragStart(Vec<String>),
@@ -394,6 +402,28 @@ pub struct MdeFiles {
     /// refresh (full data, in display order), used to diff removals on the next
     /// in-place refresh and to render the departed row's real shape collapsing.
     prev_listing_rows: Vec<crate::model::FileRow>,
+    /// v2.0.0 Phase 1.7 — replayable Send-To payload per drawer op, so a failed
+    /// / cancelled transfer can be retried verbatim from the operation drawer.
+    /// Keyed by op id; recorded only for retryable outcomes and pruned to the
+    /// rows the drawer still shows after every dispatch (so it can't grow past
+    /// the drawer's own capacity).
+    op_retry: std::collections::HashMap<u64, RetryPayload>,
+    /// v2.0.0 Phase 1.7 — id source for FAILED ops. The backend only allocates
+    /// ids for accepted sends, so a rejected send has no real op id; this counts
+    /// DOWN from `u64::MAX` so each synthetic failure id is distinct (every
+    /// failure is its own retryable/dismissible row) and can never collide with
+    /// a real backend op id (which grow up from 1).
+    next_failed_op_id: u64,
+}
+
+/// v2.0.0 Phase 1.7 — a Send-To recorded so the operation drawer's Retry
+/// affordance can replay it. Mirrors [`MdeFiles::dispatch_send`]'s arguments.
+#[derive(Debug, Clone)]
+struct RetryPayload {
+    sources: Vec<std::path::PathBuf>,
+    destination: Destination,
+    mode: SendMode,
+    conflict: ConflictPolicy,
 }
 
 /// MOTION-TRANS-3 — one row collapsing out of the listing: the full row data (so
@@ -492,6 +522,8 @@ impl Default for MdeFiles {
             listing_load: crate::loading::ListingLoad::default(),
             removed_rows: Vec::new(),
             prev_listing_rows: Vec::new(),
+            op_retry: std::collections::HashMap::new(),
+            next_failed_op_id: u64::MAX,
         }
     }
 }
@@ -937,6 +969,22 @@ impl MdeFiles {
             Message::OpRowUpsert(row) => self.op_drawer.upsert(row),
             Message::OpRowDismiss(id) => {
                 self.op_drawer.dismiss(id);
+                self.op_retry.remove(&id);
+            }
+            Message::RetryOp(op_id) => {
+                // Phase 1.7 — replay the recorded Send-To. Drop the stale failed
+                // row + its payload first; the re-dispatch creates a fresh op
+                // (and records a fresh payload if it fails again).
+                if let Some(p) = self.op_retry.remove(&op_id) {
+                    self.op_drawer.dismiss(op_id);
+                    self.dispatch_send(p.sources, p.destination, p.mode, p.conflict);
+                }
+            }
+            Message::CopyPath(path) => {
+                // Phase 1.4 — details-panel "Copy path": same wl-copy side-effect
+                // the context menu's Copy-path uses. Best-effort; a missing
+                // wl-copy is a silent no-op (Wayland-only, like the rest).
+                let _ = std::process::Command::new("wl-copy").arg(path).spawn();
             }
             Message::DragStart(rows) => self.drag.start(rows),
             Message::DragHover(target) => self.drag.set_hover(target),
@@ -1162,10 +1210,21 @@ impl MdeFiles {
                 .to_string(),
             n => format!("{n} files"),
         };
-        let result = self.backend.send_to(&sources, destination, mode, conflict);
+        // Clone the destination for the (consuming) backend call so the original
+        // can be kept for a retry payload below.
+        let result = self
+            .backend
+            .send_to(&sources, destination.clone(), mode, conflict);
         let (op_id, state, progress) = match &result {
             Ok(id) => (*id, OpState::Completed, 1000),
-            Err(_) => (0, OpState::Failed, 0),
+            // A rejected send has no backend id — mint a distinct synthetic one
+            // (counting down from u64::MAX) so each failure is its own retryable
+            // drawer row rather than all collapsing onto op id 0.
+            Err(_) => {
+                let id = self.next_failed_op_id;
+                self.next_failed_op_id = self.next_failed_op_id.saturating_sub(1);
+                (id, OpState::Failed, 0)
+            }
         };
         self.op_drawer.upsert(OpRow {
             op_id,
@@ -1175,6 +1234,23 @@ impl MdeFiles {
             state,
         });
         self.op_drawer.set_open(true);
+        // Phase 1.7 — record the payload for a retryable outcome so the drawer's
+        // Retry control can replay it, then prune the registry to the rows the
+        // drawer still keeps (it caps at OP_DRAWER_CAPACITY).
+        if state.can_retry() {
+            self.op_retry.insert(
+                op_id,
+                RetryPayload {
+                    sources,
+                    destination,
+                    mode,
+                    conflict,
+                },
+            );
+        }
+        let live: std::collections::HashSet<u64> =
+            self.op_drawer.rows().iter().map(|r| r.op_id).collect();
+        self.op_retry.retain(|k, _| live.contains(k));
     }
 
     /// AFM-9 — resolve a peer id (as carried by the card / peer view) to a
@@ -1329,6 +1405,17 @@ impl MdeFiles {
             View::CloudDevices => self.cloud_files.clone(),
             View::MeshOverview | View::MeshHome | View::MeshUndelete | View::Network => Vec::new(),
         }
+    }
+
+    /// Phase 1.4 — the [`FileRow`](crate::model::FileRow) the details panel is
+    /// pointed at, resolved against the active listing. `None` when the panel
+    /// has no target or the target no longer exists (so the view renders nothing
+    /// rather than stale metadata).
+    fn focused_detail_row(&self) -> Option<crate::model::FileRow> {
+        let target = self.details.target()?;
+        self.active_listing_rows()
+            .into_iter()
+            .find(|r| r.name == target)
     }
 
     /// MOTION-TRANS-3 — queue any row that was on screen in the prior render of
@@ -1611,12 +1698,19 @@ impl MdeFiles {
             ..container::Style::default()
         });
 
-        let main = column![
+        let mut main = column![
             views::tab_strip(&self.tabs, self.active_tab),
             views::toolbar(&self.view, self.layout, self.density, &self.search, crumbs),
             content,
         ]
         .spacing(0);
+        // Phase 1.7 — dock the operation drawer at the bottom of the content
+        // column whenever it's open (auto-opens after every Send-To). `content`
+        // is Fill-height so the drawer takes only its own bounded strip below.
+        if self.op_drawer.is_open() {
+            let op_rows = self.op_drawer.rows();
+            main = main.push(views::operation_drawer(&op_rows));
+        }
 
         // MOTION-TRANS-2 — crossfade the rail on collapse/expand: the new form
         // fades in from the rail page colour (`loading::dim_fixed` at `1 - fade`,
@@ -1633,11 +1727,19 @@ impl MdeFiles {
             self.sidebar_fade(),
             rail_w,
         );
-        let body = row![
+        let mut body = row![
             rail,
             container(main).width(Length::Fill).height(Length::Fill),
         ]
         .height(Length::Fill);
+        // Phase 1.4 — when the details panel is open, dock it as a right-hand
+        // metadata rail for the focused item. Only renders when the focused row
+        // still resolves in the active listing (no stale / fabricated content).
+        if self.details.is_open() {
+            if let Some(row_data) = self.focused_detail_row() {
+                body = body.push(views::details_pane(&row_data));
+            }
+        }
 
         let online = snap
             .peers
@@ -2580,6 +2682,108 @@ mod tests {
         assert_eq!(s.op_drawer.len(), 1);
         let _ = s.update(Message::OpRowDismiss(7));
         assert_eq!(s.op_drawer.len(), 0);
+    }
+
+    #[test]
+    fn failed_send_records_a_retryable_op_and_opens_drawer() {
+        use crate::backend::Destination;
+        use crate::send_to::{SendToEntry, SendToRequest};
+        // RealBackend (the default) has no DBus route yet, so every Send-To is
+        // rejected → a Failed op. The drawer must auto-open with one retryable
+        // row whose id is a distinct synthetic id (not 0), and the payload must
+        // be recorded so Retry can replay it.
+        let mut s = MdeFiles::default();
+        let req = SendToRequest::copy_ask(
+            vec![std::path::PathBuf::from("/tmp/a.txt")],
+            Destination::Peer("pine".into()),
+            SendToEntry::Toolbar,
+        );
+        let _ = s.update(Message::SendTo(req));
+        assert!(s.op_drawer.is_open(), "drawer auto-opens after a send");
+        let rows = s.op_drawer.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].state, crate::panels::OpState::Failed);
+        assert_ne!(rows[0].op_id, 0, "failed op gets a distinct synthetic id");
+        assert!(
+            s.op_retry.contains_key(&rows[0].op_id),
+            "the payload is recorded so the row can be retried"
+        );
+    }
+
+    #[test]
+    fn distinct_failed_sends_are_separate_drawer_rows() {
+        use crate::backend::Destination;
+        use crate::send_to::{SendToEntry, SendToRequest};
+        let mut s = MdeFiles::default();
+        for name in ["/tmp/a", "/tmp/b"] {
+            let req = SendToRequest::copy_ask(
+                vec![std::path::PathBuf::from(name)],
+                Destination::Peer("pine".into()),
+                SendToEntry::Toolbar,
+            );
+            let _ = s.update(Message::SendTo(req));
+        }
+        assert_eq!(
+            s.op_drawer.len(),
+            2,
+            "each failure is its own row (no collapse onto op id 0)"
+        );
+    }
+
+    #[test]
+    fn retry_op_replays_the_recorded_send() {
+        use crate::backend::Destination;
+        use crate::send_to::{SendToEntry, SendToRequest};
+        let mut s = MdeFiles::default();
+        let req = SendToRequest::copy_ask(
+            vec![std::path::PathBuf::from("/tmp/a.txt")],
+            Destination::Peer("pine".into()),
+            SendToEntry::Toolbar,
+        );
+        let _ = s.update(Message::SendTo(req));
+        let first = s.op_drawer.rows()[0].op_id;
+        let _ = s.update(Message::RetryOp(first));
+        // The stale row is replaced by a fresh (again-failed) op: still exactly
+        // one retryable row, under a new id, and the old payload is gone.
+        assert_eq!(s.op_drawer.len(), 1);
+        let second = s.op_drawer.rows()[0].op_id;
+        assert_ne!(first, second, "retry creates a fresh op");
+        assert!(!s.op_retry.contains_key(&first));
+        assert!(s.op_retry.contains_key(&second));
+    }
+
+    #[test]
+    fn dismiss_op_clears_its_retry_payload() {
+        use crate::backend::Destination;
+        use crate::send_to::{SendToEntry, SendToRequest};
+        let mut s = MdeFiles::default();
+        let req = SendToRequest::copy_ask(
+            vec![std::path::PathBuf::from("/tmp/a.txt")],
+            Destination::Peer("pine".into()),
+            SendToEntry::Toolbar,
+        );
+        let _ = s.update(Message::SendTo(req));
+        let id = s.op_drawer.rows()[0].op_id;
+        let _ = s.update(Message::OpRowDismiss(id));
+        assert_eq!(s.op_drawer.len(), 0);
+        assert!(
+            !s.op_retry.contains_key(&id),
+            "dismiss drops the retry payload too"
+        );
+    }
+
+    #[test]
+    fn focused_detail_row_resolves_target_against_active_listing() {
+        use crate::model::{FileRow, Mime};
+        let mut s = MdeFiles::default();
+        s.view = View::Peer("p".into());
+        s.peer_files = vec![FileRow::local("a.txt", Mime::Doc, "1 KB", "now")];
+        // A target that exists in the active listing resolves to its row.
+        s.details.open("a.txt");
+        assert!(s.focused_detail_row().is_some());
+        // A target absent from the listing resolves to nothing (no stale render).
+        s.details.open("ghost.txt");
+        assert!(s.focused_detail_row().is_none());
     }
 
     #[test]

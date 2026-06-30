@@ -85,6 +85,15 @@ pub fn object_card(
     .into()
 }
 
+/// Phase 1.4 — details-panel header for the focused object: its mime icon +
+/// name + kind, rendered through the shared [`object_card`] so the panel header
+/// matches the file rows exactly (one card idiom, not a bespoke header).
+pub fn detail_card(name: &str, mime: Mime) -> Element<'static, Message> {
+    let card = mde_theme::ObjectCard::small(mime_to_icon(mime), name.to_string())
+        .with_subtitle(mime_label(mime).to_string());
+    object_card(card, t::mde_files_palette())
+}
+
 // ─── Generic helpers ───────────────────────────────────────────────────────
 
 /// A coloured square dot — used for status indicators (`.peer-status` in CSS).
