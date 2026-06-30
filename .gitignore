@@ -31,3 +31,6 @@ target-f43/
 # shipped in the RPM; third-party binaries, not source.
 /vendor/birthright/
 install-helpers/__pycache__/
+
+# Session scratchpad (temporary working files)
+scratchpad/
