@@ -44,5 +44,24 @@ udev        = { version = "0.9", optional = true }
 name = "hello"
 path = "examples/hello.rs"
 
-[lints]
-workspace = true
+# E12-2 bare-seat (DRM) acceptance surface — only built when the `drm` feature is on.
+[[example]]
+name = "hello_drm"
+path = "examples/hello_drm.rs"
+required-features = ["drm"]
+
+# E12-2: this crate carries the bare-seat FFI backend (DRM/GBM/EGL/GL/libinput),
+# which inherently needs `unsafe`. The workspace FORBIDS unsafe; mirror the workspace
+# lints here but DENY (overridable) rather than forbid it, so the FFI `drm` module can
+# opt in per-module with a documented reason while the rest of the crate stays clean.
+[lints.rust]
+unsafe_code     = "deny"
+missing_docs    = "warn"
+unused_must_use = "deny"
+
+[lints.clippy]
+pedantic    = { level = "warn", priority = -1 }
+nursery     = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+panic       = "warn"
+todo        = "deny"
