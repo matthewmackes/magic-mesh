@@ -2560,9 +2560,9 @@ _The `mackesd mesh-fs-status` verb was deleted with the LizardFS plane (SUBSTRAT
 - [✓] **MESHFS-1: `mesh-fs-status` subcommand — local mount report** *(farm-verified, pushed)*
   As an operator, I want the Mesh Storage panel to show real storage instead of "returned no output", so it stops lying on every node.
   - [✓] `mackesd mesh-fs-status` emits JSON — the union shape both GUIs read (peers[].{addr,used_bytes,avail_bytes} + goal + quota_cap/limiting + master_reachable/undergoal/offline); local mount `df` as one peer; absent mount → valid non-empty JSON (no false error)
-- [ ] **MESHFS-2: per-peer aggregation from the replicated probes**
+- [✓] **MESHFS-2: per-peer aggregation from the replicated probes** *(farm-verified, pushed)*
   As an operator, I want every mesh node's storage usage in the report, so I see the whole share, not just this node.
-  - [ ] a serde-defaulted `mesh_fs` usage field on `ServiceDescriptors` (`mackes-mesh-types/src/peers.rs`), populated in `descriptors.rs::probe_local()` via `df` on the mount; `mesh_fs_report` aggregates every peer's from the replicated `<peer>/mackesd/probe.json` directory; goal = node_count
+  - [✓] a serde-defaulted `MeshFsUsage` field on `ServiceDescriptors` (`mackes-mesh-types/src/peers.rs`), populated in `descriptors.rs::probe_mesh_fs()` via `df`; `mesh_fs_report` aggregates every peer's from `read_peers()` over the replicated directory (skipping un-probed peers); falls back to the local mount on a fresh mesh; goal = present-peer count
 - [ ] **MESHFS-3: Syncthing-native completion / healing**
   As an operator, I want real replication/healing state, so under-replicated or out-of-sync folders surface honestly.
   - [ ] read Syncthing's REST completion API per device → real `undergoal`/`offline_peers`/`master_reachable` (replacing the MESHFS-1 honest constants); no fake values (§7)

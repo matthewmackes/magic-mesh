@@ -104,6 +104,23 @@ pub struct ServiceDescriptors {
     /// This peer's physical LAN MAC addresses (PD-12 — the Wake-on-LAN
     /// targets; own-row authority beats ARP-cache guessing).
     pub lan_macs: Vec<String>,
+    /// MESHFS-2 — this peer's Mesh-Sync (`/mnt/mesh-storage`) `df` usage,
+    /// published on the heartbeat so any node can aggregate the whole share.
+    pub mesh_fs: MeshFsUsage,
+}
+
+/// MESHFS-2 — a peer's Mesh-Sync mount `df` usage. `present` is false on a
+/// pre-MESHFS-2 writer (serde-defaulted) or a missing mount, so an aggregator
+/// skips it rather than reporting a phantom 0-byte share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MeshFsUsage {
+    /// True when the mount was probed and `df` succeeded.
+    pub present: bool,
+    /// Bytes used on the Mesh-Sync mount.
+    pub used_bytes: u64,
+    /// Bytes available on the Mesh-Sync mount.
+    pub avail_bytes: u64,
 }
 
 /// Which remote-access services listen locally.
