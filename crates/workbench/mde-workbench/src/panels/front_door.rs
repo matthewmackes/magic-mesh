@@ -17,15 +17,15 @@
 //! search yet (that's FRONTDOOR-6). Carbon chrome: follow-OS theme, Blue 60
 //! accent, comfortable density — all via `mde-theme` tokens, never raw hex (§4).
 //!
-//! FRONTDOOR-3 (this layer) adds the locked **iPadOS home** full-screen mode
-//! (design Q86/Q89: a rounded-icon grid + widgets, **no dock**). A real toggle in
-//! the top bar flips [`FrontDoor::mode`] between [`Mode::Panel`] (the FD-2 two-pane
-//! shell, rail visible) and [`Mode::FullScreen`] (rail hidden; the same
-//! [`TileGrid`] reused with full-screen layout params — larger rounded icons, more
-//! columns — under a full-width omnibox). The full-screen render is a single
-//! scrollable grid rather than true horizontal paging: paging is the design ideal,
-//! but a scrollable grid is the accepted first cut (the rounded-icon aesthetic is
-//! the required part), and it avoids a heavy custom pager on the canvas path.
+//! FRONTDOOR-3 originally added a second in-window render mode (an iPadOS-home
+//! full-screen grid) reached by an in-window `mode_toggle` content swap. CTRLSURF-5
+//! **retired** that swap (design Phase 4): the two locked surfaces are now the
+//! [`Mode::Panel`] two-pane rail + grid (the *expanded* window) and the
+//! [`Mode::Compact`] Command Watchfloor (the *small* window), and the expand /
+//! collapse arrow performs a REAL [`window::resize`] between them rather than
+//! swapping content inside one fixed window (see the [`CompactExpand`] window-size
+//! enum below). The reusable [`Layout`] tile scale survives as a rendering
+//! primitive; only the dead in-window full-screen *view* was removed.
 //!
 //! FRONTDOOR-4 (this layer) makes the **widget** tiles live: each one carries a
 //! [`TileKey`] naming the design widget (Q99: mesh map, build/farm, alerts, node
@@ -66,9 +66,9 @@
 //! routes through the ONE [`crate::relevance::score`] ladder (CTRLSURF-1), cache-
 //! first: the instant local hits recompute synchronously, the Copilot preview is
 //! debounced (no Bus on the keystroke), and an absent Bus shows the `responded ==
-//! false` offline notice rather than hanging. It is additive — the Panel /
-//! FullScreen views and the in-window `Mode` framework are unchanged (the real
-//! Win10-Start-sized window resize is CTRLSURF-5).
+//! false` offline notice rather than hanging. CTRLSURF-5 then made the Compact /
+//! Expanded switch a real window resize (the [`CompactExpand`] enum + the
+//! expand-arrow [`window::resize`]), retiring the old in-window `mode_toggle` swap.
 //!
 //! SCOPE held to FRONTDOOR-1..6:
 //! - `draw` only — tile click → detail view is FRONTDOOR-5, so the canvas keeps
@@ -81,7 +81,7 @@ use cosmic::iced::widget::canvas::{self, Frame, Path, Text};
 use cosmic::iced::widget::text::Alignment;
 use cosmic::iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use cosmic::iced::{
-    mouse, Background, Border, Element, Length, Padding, Pixels, Point, Rectangle, Size,
+    mouse, window, Background, Border, Element, Length, Padding, Pixels, Point, Rectangle, Size,
     Subscription, Task,
 };
 use cosmic::Theme;
@@ -113,15 +113,11 @@ pub enum Message {
     /// Front Door returns to the tile grid. The carried message is always one
     /// `App::update` already handles (§7 — no inert results).
     SearchHitActivated(Box<crate::Message>),
-    /// FRONTDOOR-3 — the top-bar toggle was pressed: flip [`FrontDoor::mode`]
-    /// between the Win10 panel and the iPadOS full-screen home.
-    ToggleMode,
-    /// CTRLSURF-2 — enter / leave the **Compact** Command-Watchfloor surface
-    /// (additive to [`ToggleMode`]'s expand toggle). From any expanded mode it
-    /// enters [`Mode::Compact`]; from Compact it returns to the Win10-Start
-    /// [`Mode::Panel`]. The real Win10-Start-sized window resize behind this is
-    /// CTRLSURF-5 — today it is an in-window [`Mode`] flip, so the existing grid /
-    /// `view()` stay reachable (Phase-1 additive).
+    /// CTRLSURF-5 — the expand / collapse arrow: flip the [`CompactExpand`]
+    /// window-size state and perform a REAL [`window::resize`] between the small
+    /// Win10-Start ([`Mode::Compact`], the Command Watchfloor) and the full
+    /// ([`Mode::Panel`], the rail + grid) windows. The choice is persisted so it
+    /// survives a reopen. Replaces the retired in-window `mode_toggle` swap (§7).
     ToggleCompact,
     /// CTRLSURF-2 — the Compact command line's text changed. The instant LOCAL
     /// hits recompute SYNCHRONOUSLY from the cached catalog (the seeded launchers +
@@ -400,24 +396,184 @@ pub enum WorkloadKind {
     Attach,
 }
 
-/// FRONTDOOR-3 — which of the two locked render modes the Front Door is in
-/// (design Q29: panel default + a full-screen toggle).
+/// FRONTDOOR-3 / CTRLSURF-5 — which in-window surface the Front Door renders. The
+/// two surfaces map 1:1 to the [`CompactExpand`] window-size state, so the expand /
+/// collapse arrow resizes the real window AND flips this together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     /// The FRONTDOOR-2 **Win10 Start** two-pane shell: left rail + right pane
-    /// (omnibox above the tile grid). The default summon form (Q29).
+    /// (omnibox above the tile grid). The *expanded* window's surface (Q29).
     #[default]
     Panel,
-    /// The FRONTDOOR-3 **iPadOS home**: rail hidden, a full-screen rounded-icon
-    /// grid + widgets, **no dock** (Q86/Q89).
-    FullScreen,
     /// CTRLSURF-2 — the **Command Watchfloor** compact surface: one always-focused
-    /// command line over ~5 ambient status rows projected from [`FrontDoorData`].
-    /// The 4-second glance + launch without a full screen (design "Architecture →
-    /// Compact mode"). For now it lives inside this in-window [`Mode`] framework;
-    /// the real Win10-Start-sized window resize is CTRLSURF-5 (additive — Panel /
-    /// FullScreen stay reachable through the existing toggles).
+    /// command line over ~5 ambient status rows projected from [`FrontDoorData`]
+    /// (design "Architecture → Compact mode"). The *compact* window's surface;
+    /// CTRLSURF-5 backs it with a real Win10-Start-sized [`window::resize`].
     Compact,
+}
+
+/// CTRLSURF-5 — the **compact** (Win10-Start-sized) window dimensions: a small,
+/// launcher-shaped window for the Command Watchfloor glance. Window geometry is a
+/// new kind of constant — the §4 "no scattered literal, read a named const" rule
+/// extended from colour / metric tokens to window sizes — so it is named here, not
+/// inlined at the resize call.
+const COMPACT_WINDOW_SIZE: Size = Size::new(560.0, 680.0);
+
+/// CTRLSURF-5 — the **expanded** (full working) window dimensions: the familiar
+/// two-pane rail + tile grid. Anchored to the workbench's established default
+/// ([`crate::app::WIN_W`] × [`crate::app::WIN_H`]) so an expand returns to the exact
+/// size the app has always opened at (single source — no duplicated literal).
+const EXPANDED_WINDOW_SIZE: Size = Size::new(crate::app::WIN_W, crate::app::WIN_H);
+
+/// CTRLSURF-5 — the Front Door's **window-size** state: which of the two real OS
+/// window sizes the workbench occupies. It augments the in-window surface [`Mode`]
+/// with the *window* dimension the expand / collapse arrow drives through a real
+/// [`window::resize`] (design Phase 4 — replacing the retired in-window
+/// `mode_toggle` content swap). Persisted via [`save_window_state`] so the chosen
+/// size survives a reopen, and mapped 1:1 to the [`Mode`] surface it shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompactExpand {
+    /// The small **Win10-Start-sized** window ([`COMPACT_WINDOW_SIZE`]) showing the
+    /// Command Watchfloor ([`Mode::Compact`]).
+    Compact,
+    /// The **full** working window ([`EXPANDED_WINDOW_SIZE`]) showing the familiar
+    /// two-pane rail + tile grid ([`Mode::Panel`]). The default — a fresh launch
+    /// opens expanded, as the workbench always has; the operator's later choice
+    /// persists.
+    #[default]
+    Expanded,
+}
+
+impl CompactExpand {
+    /// The other size — the expand / collapse arrow's transition.
+    const fn toggled(self) -> Self {
+        match self {
+            Self::Compact => Self::Expanded,
+            Self::Expanded => Self::Compact,
+        }
+    }
+
+    /// The real OS window size this state resizes to.
+    const fn window_size(self) -> Size {
+        match self {
+            Self::Compact => COMPACT_WINDOW_SIZE,
+            Self::Expanded => EXPANDED_WINDOW_SIZE,
+        }
+    }
+
+    /// The in-window [`Mode`] surface this window size shows.
+    const fn mode(self) -> Mode {
+        match self {
+            Self::Compact => Mode::Compact,
+            Self::Expanded => Mode::Panel,
+        }
+    }
+
+    /// Classify a [`Mode`] surface back into its window size — the inverse of
+    /// [`Self::mode`] (the two form a bijection over the live surfaces).
+    const fn of_mode(mode: Mode) -> Self {
+        match mode {
+            Mode::Compact => Self::Compact,
+            Mode::Panel => Self::Expanded,
+        }
+    }
+
+    /// The stable on-disk token this state persists as.
+    const fn as_token(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Expanded => "expanded",
+        }
+    }
+
+    /// Parse a persisted token; anything unrecognised falls back to the default
+    /// (a corrupt file never errors the launch — §7 honest fallback).
+    fn from_token(s: &str) -> Self {
+        match s.trim() {
+            "compact" => Self::Compact,
+            _ => Self::Expanded,
+        }
+    }
+}
+
+/// CTRLSURF-5 — the mde config dir the [`CompactExpand`] choice persists into,
+/// resolved by reusing [`mde_theme::Preferences::xdg_path`] (§6 — no second XDG
+/// implementation). The choice lives in a dedicated workbench-local file (a sibling
+/// of `preferences.toml`) rather than a `preferences.toml` field only because the
+/// `FrontDoorPrefs` struct lives in `mde-theme` while this is a workbench-only
+/// change; the persistence *shape* (load-on-construct, save-on-change,
+/// defaults-on-garbage) mirrors the prefs store.
+fn window_config_dir() -> Option<std::path::PathBuf> {
+    mde_theme::Preferences::xdg_path()
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .map(std::path::Path::to_path_buf)
+}
+
+/// CTRLSURF-5 — the persisted file's leaf name (a sibling of `preferences.toml`).
+const WINDOW_STATE_FILE: &str = "workbench-window.toml";
+
+/// CTRLSURF-5 — render the persisted form: a single-key TOML line (legible +
+/// loss-less). Pure, so the round-trip is unit-tested.
+fn render_window_state(ce: CompactExpand) -> String {
+    format!("compact_expand = \"{}\"\n", ce.as_token())
+}
+
+/// CTRLSURF-5 — parse the persisted form. Absent / malformed ⇒ the default,
+/// mirroring `Preferences::load`'s defaults-on-garbage rule. Pure, unit-tested.
+fn parse_window_state(raw: &str) -> CompactExpand {
+    raw.lines()
+        .find_map(|line| {
+            let value = line
+                .trim()
+                .strip_prefix("compact_expand")?
+                .trim_start()
+                .strip_prefix('=')?
+                .trim()
+                .trim_matches('"');
+            Some(CompactExpand::from_token(value))
+        })
+        .unwrap_or_default()
+}
+
+/// CTRLSURF-5 — load the persisted window-size choice from `dir` (defaults on an
+/// absent / unreadable / malformed file). Dir-injected so the persistence is
+/// unit-tested against a tempdir, with no global env mutation.
+fn load_window_state_in(dir: &std::path::Path) -> CompactExpand {
+    std::fs::read_to_string(dir.join(WINDOW_STATE_FILE))
+        .map(|raw| parse_window_state(&raw))
+        .unwrap_or_default()
+}
+
+/// CTRLSURF-5 — persist the window-size choice into `dir`. Dir-injected sibling of
+/// [`load_window_state_in`].
+fn save_window_state_in(dir: &std::path::Path, ce: CompactExpand) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(WINDOW_STATE_FILE), render_window_state(ce))
+}
+
+/// CTRLSURF-5 — load the persisted choice from the real mde config dir.
+fn load_window_state() -> CompactExpand {
+    window_config_dir()
+        .map(|dir| load_window_state_in(&dir))
+        .unwrap_or_default()
+}
+
+/// CTRLSURF-5 — persist the choice to the real mde config dir (best-effort, like
+/// the prefs save — a write failure never breaks the live UI; the operator already
+/// saw the resize).
+fn save_window_state(ce: CompactExpand) {
+    if let Some(dir) = window_config_dir() {
+        let _ = save_window_state_in(&dir, ce);
+    }
+}
+
+/// CTRLSURF-5 — the window size the workbench should open at, from the persisted
+/// [`CompactExpand`] choice (so the chosen size survives a reopen). Read by
+/// [`crate::app::App::run`] before the window opens.
+#[must_use]
+pub fn persisted_window_size() -> Size {
+    load_window_state().window_size()
 }
 
 /// The fixed width of the left rail (design Q5 — a Win10-Start identity/pinned/
@@ -3238,7 +3394,11 @@ impl FrontDoor {
             results: Vec::new(),
             copilot: CopilotState::Idle,
             copilot_gen: 0,
-            mode: Mode::Panel,
+            // CTRLSURF-5 — open on the surface matching the persisted window size
+            // (the size `App::run` opens the window at), so the operator's compact /
+            // expanded choice survives a reopen. A fresh / corrupt config defaults to
+            // the expanded panel.
+            mode: load_window_state().mode(),
             // FRONTDOOR-5 — start on the grid; a tile click opens a detail menu.
             detail: None,
             // FRONTDOOR-10 — no suggestions until the first snapshot (a quiet mesh
@@ -3766,27 +3926,19 @@ impl FrontDoor {
                 self.recompute_results();
                 Task::done(*msg)
             }
-            Message::ToggleMode => {
-                self.mode = match self.mode {
-                    Mode::Panel => Mode::FullScreen,
-                    Mode::FullScreen => Mode::Panel,
-                    // CTRLSURF-2 — `ToggleMode` is the *expand* toggle; from the
-                    // Compact surface it expands to the Win10-Start panel
-                    // (`ToggleCompact` is the dedicated Compact entry/exit).
-                    Mode::Compact => Mode::Panel,
-                };
-                Task::none()
-            }
-            // CTRLSURF-2 — enter / leave the Compact Command-Watchfloor surface.
-            // Additive to the Panel↔FullScreen expand toggle: enter Compact from
-            // any expanded mode, leave it back to Panel. (The real window resize
-            // is CTRLSURF-5; today it is an in-window `Mode` flip.)
+            // CTRLSURF-5 — the expand / collapse arrow. Flip the persisted
+            // `CompactExpand` window-size state and perform a REAL `window::resize`
+            // between the compact (Win10-Start-sized) and expanded (full working)
+            // windows — no longer an in-window pane swap (the retired `mode_toggle`).
+            // The matching in-window surface follows (`Mode::Compact` ↔ `Mode::Panel`),
+            // and the choice is persisted so it survives a reopen (§7 — real resize,
+            // state persists, old path removed).
             Message::ToggleCompact => {
-                self.mode = match self.mode {
-                    Mode::Compact => Mode::Panel,
-                    _ => Mode::Compact,
-                };
-                Task::none()
+                let next = CompactExpand::of_mode(self.mode).toggled();
+                self.mode = next.mode();
+                save_window_state(next);
+                let size = next.window_size();
+                window::latest().and_then(move |id| window::resize(id, size))
             }
             // CTRLSURF-2 — the Compact command line changed. Recompute the instant
             // LOCAL hits SYNCHRONOUSLY from cache (the one relevance ladder over the
@@ -4849,10 +5001,10 @@ impl FrontDoor {
         self.suggestions_for_tile(i).len()
     }
 
-    /// FRONTDOOR-2/3 — the Front Door view, branching on [`Self::mode`]:
-    /// [`Mode::Panel`] renders the FD-2 Win10-Start two-pane shell (rail + right
-    /// pane); [`Mode::FullScreen`] renders the FD-3 iPadOS-home full-screen grid
-    /// (rail hidden). The top-bar toggle (in each mode) flips between them.
+    /// FRONTDOOR-2/3 / CTRLSURF-5 — the Front Door view, branching on [`Self::mode`]:
+    /// [`Mode::Panel`] renders the Win10-Start two-pane shell (the expanded window),
+    /// [`Mode::Compact`] the Command Watchfloor (the small window). The expand /
+    /// collapse arrow resizes the real window and flips between them.
     #[must_use]
     pub fn view(&self) -> Element<'_, crate::Message, Theme> {
         let palette = crate::live_theme::palette();
@@ -4886,10 +5038,10 @@ impl FrontDoor {
         }
         match self.mode {
             // CTRLSURF-2 — the Command Watchfloor compact surface (command line +
-            // ambient status rows). Additive: Panel / FullScreen stay reachable.
+            // ambient status rows); CTRLSURF-5 backs it with the small real window.
             Mode::Compact => self.compact_view(palette),
+            // The expanded window's familiar two-pane rail + tile grid.
             Mode::Panel => self.panel_view(palette),
-            Mode::FullScreen => self.fullscreen_view(palette),
         }
     }
 
@@ -5931,11 +6083,12 @@ impl FrontDoor {
             .into()
     }
 
-    /// CTRLSURF-2 — the control that enters / leaves the Compact Command-Watchfloor
-    /// surface (additive to the expand [`Self::mode_toggle`]). It names the target:
-    /// "▭ Compact" from an expanded mode, "⤢ Expand" from Compact. Wired to the
-    /// real [`Message::ToggleCompact`] (§7 — no dead button); Ghost chrome via
-    /// `mde-theme` tokens (§4).
+    /// CTRLSURF-5 — the **expand / collapse arrow**: the single control that resizes
+    /// the real window between the compact Command-Watchfloor and the expanded rail +
+    /// grid (the retired `mode_toggle` is gone). It names the target: "▭ Compact"
+    /// from the expanded window, "⤢ Expand" from the compact one. Wired to the real
+    /// [`Message::ToggleCompact`] (§7 — no dead button); Ghost chrome via `mde-theme`
+    /// tokens (§4).
     fn compact_toggle(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
         let label = if self.mode == Mode::Compact {
             "⤢ Expand"
@@ -5955,8 +6108,8 @@ impl FrontDoor {
     fn panel_view(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
         // CTRLSURF-4 — the Expand (full rail+grid) view gains a third companion
         // column on the right: the "what changed" activity rail. Additive — the
-        // existing rail + grid panes are unchanged (the real Win10-Start window
-        // resize stays CTRLSURF-5).
+        // existing rail + grid panes are unchanged (CTRLSURF-5 made the compact /
+        // expanded switch a real window resize).
         row![
             self.rail(palette),
             self.right_pane(palette),
@@ -6019,85 +6172,6 @@ impl FrontDoor {
                     width: 1.0,
                     radius: 0.0.into(),
                 },
-                ..container::Style::default()
-            })
-            .into()
-    }
-
-    /// FRONTDOOR-3 — the iPadOS-home full-screen view (Q86/Q89): the rail is
-    /// hidden, leaving a full-width top bar (omnibox + the back-to-panel toggle)
-    /// above a full-screen rounded-icon grid. **No dock** (the lock). The grid is
-    /// the same [`TileGrid`] program reused with full-screen layout params (bigger
-    /// rounded icons, more columns); it scrolls rather than paging (the accepted
-    /// first cut — see the module note).
-    fn fullscreen_view(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
-        let mut omnibox_input =
-            text_input("Search apps, files, mesh, or ask Copilot…", &self.query)
-                .on_input(|s| crate::Message::FrontDoor(Message::OmniboxChanged(s)))
-                .padding(Padding::from([10u16, 14u16]))
-                .width(Length::Fill);
-        // CTRLSURF-3 — Enter commits the top-ranked local hit (the same
-        // `SearchHitActivated` a click fires), armed only when a hit exists (§7 —
-        // never an inert submit). Mirrors the panel-mode omnibox + the Compact line.
-        if let Some(top) = self.results.first() {
-            omnibox_input = omnibox_input.on_submit(crate::Message::FrontDoor(
-                Message::SearchHitActivated(Box::new(top.message.clone())),
-            ));
-        }
-        let omnibox: Element<'_, crate::Message, Theme> = omnibox_input.into();
-
-        // Top bar: the omnibox stretches; the FD-11 pending indicator + the FD-14
-        // settings / lock toggles + the mode toggle sit at its right. In full-screen
-        // there is NO rail, so the settings + lock entries MUST live here for them to
-        // be reachable in this mode (§7 — no unreachable surface).
-        let mut controls = row![omnibox]
-            .spacing(12)
-            .align_y(cosmic::iced::Alignment::Center);
-        if let Some(indicator) = self.pending_indicator(palette) {
-            controls = controls.push(indicator);
-        }
-        // FRONTDOOR-15 — the push-to-talk voice control (Q55), in the full-screen
-        // top bar too (no rail here — the top bar is the only reachable home).
-        controls = controls.push(self.ptt_toggle(palette));
-        controls = controls.push(self.settings_toggle(palette));
-        controls = controls.push(self.lock_toggle(palette));
-        // CTRLSURF-2 — the Compact surface is reachable from the expanded modes too.
-        controls = controls.push(self.compact_toggle(palette));
-        controls = controls.push(self.mode_toggle(palette));
-        let top_bar = container(controls)
-            .width(Length::Fill)
-            .padding(Padding::from([16u16, 16u16]));
-
-        // FRONTDOOR-6 — a non-empty query REPLACES the icon grid with the unified
-        // search results (instant local hits + the AI card streaming in below);
-        // an empty query keeps the iPadOS rounded-icon grid (FD-1..5 unchanged).
-        let content: Element<'_, crate::Message, Theme> = if self.searching() {
-            self.search_results_view(palette)
-        } else {
-            // The full-screen rounded-icon grid: the same canvas program, told to
-            // lay out at the larger full-screen scale. A scrollable wrapper gives
-            // the "first cut" vertical paging when icons overflow the viewport.
-            scrollable(self.icon_grid())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        };
-
-        // FRONTDOOR-16 — the guided first-run greeting (Q27) above the icon grid,
-        // the same once-per-node card the panel mode shows (both modes are reachable
-        // surfaces — §7). `None` once dismissed / while searching.
-        let body = match self.greeting_banner(palette) {
-            Some(greeting) => column![top_bar, greeting, content],
-            None => column![top_bar, content],
-        }
-        .width(Length::Fill)
-        .height(Length::Fill);
-
-        container(body)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(move |_t: &Theme| container::Style {
-                background: Some(Background::Color(palette.background.into_cosmic_color())),
                 ..container::Style::default()
             })
             .into()
@@ -6232,9 +6306,8 @@ impl FrontDoor {
         // affordance consistent across both modes).
         omnibox_row = omnibox_row.push(self.settings_toggle(palette));
         omnibox_row = omnibox_row.push(self.lock_toggle(palette));
-        // CTRLSURF-2 — the Compact surface is reachable from the expanded modes too.
+        // CTRLSURF-5 — the expand / collapse arrow (a real window resize) ends the bar.
         omnibox_row = omnibox_row.push(self.compact_toggle(palette));
-        omnibox_row = omnibox_row.push(self.mode_toggle(palette));
         let omnibox_bar = container(omnibox_row)
             .width(Length::Fill)
             .padding(Padding::from([16u16, 16u16]));
@@ -6394,21 +6467,7 @@ impl FrontDoor {
         self.canvas_grid(Layout::Panel, Length::Fill)
     }
 
-    /// FRONTDOOR-3 — the iPadOS-home full-screen icon grid: the same [`TileGrid`]
-    /// canvas program at the larger [`Layout::FullScreen`] scale (bigger rounded
-    /// icons, more columns). Its height is the natural grid height for the tile
-    /// count so the enclosing `scrollable` can page through overflow (the accepted
-    /// first cut in place of true horizontal paging).
-    fn icon_grid(&self) -> Element<'_, crate::Message, Theme> {
-        let rows = self
-            .tiles
-            .len()
-            .div_ceil(Layout::FullScreen.nominal_columns());
-        let height = Layout::FullScreen.grid_height(rows);
-        self.canvas_grid(Layout::FullScreen, Length::Fixed(height))
-    }
-
-    /// Shared canvas-grid construction for both modes: build a [`TileGrid`] at the
+    /// Canvas-grid construction (the panel tile grid): build a [`TileGrid`] at the
     /// given [`Layout`] and bridge the stock-themed canvas back into the cosmic
     /// theme via `themer(None, ..)`.
     fn canvas_grid(&self, layout: Layout, height: Length) -> Element<'_, crate::Message, Theme> {
@@ -6433,56 +6492,8 @@ impl FrontDoor {
         cosmic::iced::widget::themer(None, canvas_stock).into()
     }
 
-    /// FRONTDOOR-3 — the real panel ↔ full-screen toggle button (§7 — a real
-    /// control wired to [`Message::ToggleMode`], no stub). Its glyph + label name
-    /// the *target* mode: in panel mode it offers "⤢ Full screen"; in full-screen
-    /// it offers "⤡ Panel". Carbon chrome via tokens only (§4).
-    fn mode_toggle(&self, palette: Palette) -> Element<'_, crate::Message, Theme> {
-        let label = match self.mode {
-            Mode::Panel => "⤢ Full screen",
-            Mode::FullScreen => "⤡ Panel",
-            // CTRLSURF-2 — `mode_toggle` is the expand toggle; from Compact it grows
-            // to the panel. (Compact's own surface uses `compact_toggle` to expand;
-            // this arm keeps the match exhaustive over the new `Mode` variant.)
-            Mode::Compact => "⤢ Panel",
-        };
-        let accent = palette.accent.into_cosmic_color();
-        let raised = palette.raised.into_cosmic_color();
-        let idle_bg = palette.hover_tint().into_cosmic_color();
-
-        button(
-            text(label)
-                .size(TypeRole::Body.size_in(FontSize::defaults()))
-                .colr(accent),
-        )
-        .padding(Padding::from([8u16, 14u16]))
-        .sty(
-            move |_t: &Theme, status: cosmic::iced::widget::button::Status| {
-                use cosmic::iced::widget::button::Status;
-                let bg = match status {
-                    Status::Hovered | Status::Pressed => raised,
-                    _ => idle_bg,
-                };
-                cosmic::iced::widget::button::Style {
-                    snap: false,
-                    background: Some(Background::Color(bg)),
-                    text_color: accent,
-                    border: Border {
-                        color: cosmic::iced::Color::TRANSPARENT,
-                        width: 0.0,
-                        radius: 6.0.into(),
-                    },
-                    shadow: cosmic::iced::Shadow::default(),
-                    ..cosmic::iced::widget::button::Style::default()
-                }
-            },
-        )
-        .on_press(crate::Message::FrontDoor(Message::ToggleMode))
-        .into()
-    }
-
     /// FRONTDOOR-14 — the rail/top-bar label for the lock toggle (Q91): names the
-    /// ACTION the press performs, mirroring the mode toggle's target-naming idiom.
+    /// ACTION the press performs, mirroring the expand arrow's target-naming idiom.
     fn lock_label(&self) -> &'static str {
         if self.locked {
             "🔓 Unlock"
@@ -8677,23 +8688,6 @@ impl Layout {
             Layout::FullScreen => 18.0,
         }
     }
-
-    /// A nominal column count used to pre-size the full-screen scroll area before
-    /// the canvas knows its true width (the canvas itself recomputes columns from
-    /// the real `bounds.width` at draw time).
-    fn nominal_columns(self) -> usize {
-        match self {
-            Layout::Panel => 5,
-            Layout::FullScreen => 6,
-        }
-    }
-
-    /// The natural pixel height of a grid with `rows` rows at this scale — used to
-    /// give the full-screen `scrollable` a content height it can page through.
-    fn grid_height(self, rows: usize) -> f32 {
-        let rows = rows.max(1) as f32;
-        2.0 * self.pad() + rows * self.tile_h() + (rows - 1.0).max(0.0) * self.gap()
-    }
 }
 
 /// The canvas program that draws the tile grid. Holds an owned snapshot of the
@@ -9103,28 +9097,69 @@ mod tests {
     }
 
     #[test]
-    fn toggle_mode_flips_between_panel_and_fullscreen() {
-        // FRONTDOOR-3 — the Front Door defaults to the panel; the toggle flips it
-        // to full-screen and back (the real handler behind the top-bar button).
-        let mut fd = FrontDoor::new();
-        assert_eq!(fd.mode, Mode::Panel);
-        let _ = fd.update(Message::ToggleMode);
-        assert_eq!(fd.mode, Mode::FullScreen);
-        let _ = fd.update(Message::ToggleMode);
-        assert_eq!(fd.mode, Mode::Panel);
+    fn compact_expand_toggles_maps_to_mode_and_size() {
+        // CTRLSURF-5 — the window-size state toggles between compact and expanded,
+        // each maps 1:1 to its in-window surface and to a distinct real window size
+        // (the compact window is strictly smaller than the expanded one). Pure.
+        assert_eq!(CompactExpand::Expanded.toggled(), CompactExpand::Compact);
+        assert_eq!(CompactExpand::Compact.toggled(), CompactExpand::Expanded);
+        assert_eq!(CompactExpand::Compact.mode(), Mode::Compact);
+        assert_eq!(CompactExpand::Expanded.mode(), Mode::Panel);
+        assert_eq!(
+            CompactExpand::of_mode(Mode::Compact),
+            CompactExpand::Compact
+        );
+        assert_eq!(CompactExpand::of_mode(Mode::Panel), CompactExpand::Expanded);
+        // `mode` and `of_mode` are inverses over the live surfaces.
+        for ce in [CompactExpand::Compact, CompactExpand::Expanded] {
+            assert_eq!(CompactExpand::of_mode(ce.mode()), ce);
+        }
+        let (c, e) = (
+            CompactExpand::Compact.window_size(),
+            CompactExpand::Expanded.window_size(),
+        );
+        assert!(
+            c.width < e.width && c.height < e.height,
+            "the compact window is strictly smaller than the expanded one"
+        );
+    }
+
+    #[test]
+    fn window_state_persists_round_trip() {
+        // CTRLSURF-5 — the chosen window size survives a reopen: a saved choice reads
+        // back identically from disk, and an absent / malformed file falls back to the
+        // default (a corrupt file never errors the launch — §7). Dir-injected, pure.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_window_state_in(dir.path()),
+            CompactExpand::default(),
+            "an absent file is the default"
+        );
+        for ce in [CompactExpand::Compact, CompactExpand::Expanded] {
+            save_window_state_in(dir.path(), ce).unwrap();
+            assert_eq!(
+                load_window_state_in(dir.path()),
+                ce,
+                "the saved choice round-trips through disk"
+            );
+            // The pure parse/render also round-trips.
+            assert_eq!(parse_window_state(&render_window_state(ce)), ce);
+        }
+        assert_eq!(parse_window_state("garbage\n"), CompactExpand::default());
+        assert_eq!(parse_window_state(""), CompactExpand::default());
     }
 
     #[test]
     fn both_modes_view_constructs() {
-        // FRONTDOOR-2/3 — both the two-pane panel view and the iPadOS full-screen
-        // view (rail hidden + larger icon grid) build without panicking, in both
-        // the loading and loaded states.
+        // FRONTDOOR-2/3 / CTRLSURF-5 — both the two-pane panel view and the compact
+        // Command Watchfloor build without panicking, in both the loading and loaded
+        // states.
         let mut fd = FrontDoor::new();
         let _: Element<'_, crate::Message, Theme> = fd.view();
         fd.loading = true;
         let _: Element<'_, crate::Message, Theme> = fd.view();
 
-        fd.mode = Mode::FullScreen;
+        fd.mode = Mode::Compact;
         fd.loading = false;
         let _: Element<'_, crate::Message, Theme> = fd.view();
         fd.loading = true;
@@ -9133,7 +9168,7 @@ mod tests {
         // FRONTDOOR-6 — the search-results surface (local hits + the AI card)
         // builds in BOTH modes, in every Copilot state, without panicking.
         fd.loading = false;
-        for mode in [Mode::Panel, Mode::FullScreen] {
+        for mode in [Mode::Panel, Mode::Compact] {
             fd.mode = mode;
             let _ = fd.update(Message::OmniboxChanged("mesh".to_string()));
             for state in [
@@ -9260,18 +9295,32 @@ mod tests {
     }
 
     #[test]
-    fn ctrlsurf2_toggle_compact_enters_and_leaves() {
-        // CTRLSURF-2 — `ToggleCompact` enters Compact from any expanded mode and
-        // leaves it back to Panel (additive to the Panel↔FullScreen expand toggle).
-        let mut fd = FrontDoor::new();
-        assert_eq!(fd.mode, Mode::Panel);
-        let _ = fd.update(Message::ToggleCompact);
-        assert_eq!(fd.mode, Mode::Compact);
-        let _ = fd.update(Message::ToggleCompact);
-        assert_eq!(fd.mode, Mode::Panel, "leaves Compact back to Panel");
-        fd.mode = Mode::FullScreen;
-        let _ = fd.update(Message::ToggleCompact);
-        assert_eq!(fd.mode, Mode::Compact, "reachable from FullScreen too");
+    fn ctrlsurf5_toggle_compact_resizes_and_persists() {
+        // CTRLSURF-5 — the expand / collapse arrow flips the window-size surface
+        // (Panel ↔ Compact) and persists the choice so it survives a reopen. Under
+        // isolated prefs so the persisted state writes a tempdir, not the real config.
+        with_isolated_prefs(|| {
+            let mut fd = FrontDoor::new();
+            assert_eq!(fd.mode, Mode::Panel, "a fresh config opens expanded");
+            // Collapse to the small Command-Watchfloor window.
+            let _ = fd.update(Message::ToggleCompact);
+            assert_eq!(fd.mode, Mode::Compact);
+            assert_eq!(
+                load_window_state(),
+                CompactExpand::Compact,
+                "compact persisted"
+            );
+            // A freshly constructed Front Door restores the persisted surface.
+            assert_eq!(FrontDoor::new().mode, Mode::Compact, "survives reopen");
+            // Expand back to the full rail + grid window.
+            let _ = fd.update(Message::ToggleCompact);
+            assert_eq!(fd.mode, Mode::Panel);
+            assert_eq!(
+                load_window_state(),
+                CompactExpand::Expanded,
+                "expanded persisted"
+            );
+        });
     }
 
     #[test]
@@ -9832,7 +9881,7 @@ mod tests {
     fn alerts_tile_detail_renders_the_triage_in_both_modes() {
         // FD-13 — the triage lands and the Alerts tile detail renders it (the grouped
         // cards + the fix affordance) in BOTH render modes, without panicking.
-        for mode in [Mode::Panel, Mode::FullScreen] {
+        for mode in [Mode::Panel, Mode::Compact] {
             let mut fd = FrontDoor::new();
             fd.loading = false;
             fd.mode = mode;
@@ -10879,7 +10928,7 @@ mod tests {
             pending: pend,
             ..FrontDoorData::default()
         })));
-        for mode in [Mode::Panel, Mode::FullScreen] {
+        for mode in [Mode::Panel, Mode::Compact] {
             fd.mode = mode;
             // The indicator renders in the top bar (count > 0).
             let _: Element<'_, crate::Message, Theme> = fd.view();
@@ -11107,7 +11156,7 @@ mod tests {
         // theme/density/AI applies don't write the real config.
         with_isolated_prefs(|| {
             let mut fd = FrontDoor::new();
-            for mode in [Mode::Panel, Mode::FullScreen] {
+            for mode in [Mode::Panel, Mode::Compact] {
                 fd.mode = mode;
                 fd.show_settings = true;
                 let _: Element<'_, crate::Message, Theme> = fd.view();
@@ -11245,7 +11294,7 @@ mod tests {
             .iter()
             .position(|t| t.key.is_none())
             .expect("at least one launcher tile is seeded");
-        for mode in [Mode::Panel, Mode::FullScreen] {
+        for mode in [Mode::Panel, Mode::Compact] {
             fd.mode = mode;
             for idx in [data_center, files] {
                 fd.detail = Some(idx);
@@ -11369,8 +11418,8 @@ mod tests {
             // Panel mode (Win10 Start) — the resting view builds with the card.
             fd.mode = Mode::Panel;
             let _: Element<'_, crate::Message, Theme> = fd.view();
-            // Full-screen mode (iPadOS home) — the card is reachable here too (§7).
-            fd.mode = Mode::FullScreen;
+            // Compact mode (Command Watchfloor) — the card is reachable here too (§7).
+            fd.mode = Mode::Compact;
             let _: Element<'_, crate::Message, Theme> = fd.view();
         });
     }
