@@ -168,6 +168,9 @@ pub struct StorageStatus {
     pub goal: usize,
     pub quota_cap_bytes: Option<u64>,
     pub limiting_peer_addr: Option<String>,
+    /// MESHFS-3 — Mesh-Sync folder completion percent from Syncthing's REST API
+    /// (`None` when Syncthing is unreachable / unprovisioned).
+    pub sync_completion_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -233,8 +236,12 @@ impl MeshStoragePanel {
 
         let subtitle_str = if let Some(t) = self.last_run_at {
             let age_s = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+            let repl = match self.status.sync_completion_pct {
+                Some(p) => format!(" · replication {p:.0}%"),
+                None => String::new(),
+            };
             format!(
-                "{} peer{} · goal {} · last refresh {}s ago",
+                "{} peer{} · goal {} · last refresh {}s ago{}",
                 self.status.peers.len(),
                 if self.status.peers.len() == 1 {
                     ""
@@ -243,6 +250,7 @@ impl MeshStoragePanel {
                 },
                 self.status.goal,
                 age_s,
+                repl,
             )
         } else {
             "click Refresh to query Mesh Sync share usage".into()
@@ -464,11 +472,14 @@ pub fn fetch_status() -> Result<StorageStatus, String> {
     let goal = v["goal"].as_u64().unwrap_or(0) as usize;
     let quota_cap_bytes = v["quota_cap_bytes"].as_u64();
     let limiting_peer_addr = v["limiting_peer_addr"].as_str().map(str::to_owned);
+    // MESHFS-3 — Syncthing folder completion (None when the daemon is unreachable).
+    let sync_completion_pct = v["sync_completion_pct"].as_f64();
     Ok(StorageStatus {
         peers,
         goal,
         quota_cap_bytes,
         limiting_peer_addr,
+        sync_completion_pct,
     })
 }
 
@@ -591,6 +602,7 @@ mod tests {
             goal: 1,
             quota_cap_bytes: Some(7_200_000),
             limiting_peer_addr: Some("10.42.0.5".to_string()),
+            sync_completion_pct: None,
         })));
         let _ = populated.view();
     }
@@ -618,6 +630,7 @@ mod tests {
             goal: 1,
             quota_cap_bytes: Some(7_200_000),
             limiting_peer_addr: Some("10.42.0.5".to_string()),
+            sync_completion_pct: None,
         };
         let _ = panel.update(Message::Loaded(Ok(status)));
         assert_eq!(panel.status.peers.len(), 1);
@@ -639,6 +652,7 @@ mod tests {
                 goal: 1,
                 quota_cap_bytes: None,
                 limiting_peer_addr: None,
+                sync_completion_pct: None,
             },
             ..Default::default()
         };
