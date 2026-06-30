@@ -510,11 +510,6 @@ pub mod xcp_host;
 // the IP over the mackes-xcp Hypervisor layer (the runtime caller of
 // set_identity_seed, so a provisioned VM actually gets its identity seed).
 pub mod xcp_provision;
-// XCPNG-HEALTH — on an XCP-ng host, probe the xcp-ng toolstack service catalog
-// (`mde_role::xcpng::XCPNG_SERVICES`, `systemctl is-active` each) every tick and
-// publish a whole-host health summary to `event/xcpng/services` so the Workbench
-// host view + the alert lane see the live toolstack state. Role::Xcpng-gated.
-pub mod xcpng_health;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
 // text clip on the bus + appends to ONE mesh-global `clipboard/history.json`

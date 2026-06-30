@@ -1,8 +1,9 @@
 //! `mde-role` — the pinned deployment role (E1.1).
 //!
-//! Three rank-ordered deployment roles — `Lighthouse` (relay) · `Xcpng` (the
-//! XCP-NG Xen virtualization host, mirroring the xcp-ng project's service set) ·
-//! `Workstation` (the egui thin client). Rank gives the upgrade-only order.
+//! Two rank-ordered deployment roles — `Lighthouse` (the always-on relay /
+//! control plane, no desktop) · `Workstation` (the full Quasar egui thin
+//! client). Rank gives the upgrade-only order. "Headless" is not a role: a
+//! headless box is a `Workstation` without a local display.
 //! The role is chosen once at install time (the role chooser / `mde-role`)
 //! and written to
 //! [`default_role_path`] (`/var/lib/mde/role.toml`). Thereafter it can only be
@@ -22,25 +23,21 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-/// The xcp-ng service catalog the [`Role::Xcpng`] deployment mirrors.
-pub mod xcpng;
-
 /// A deployment role — the install-time identity, rank-ordered for the
-/// upgrade-only invariant ([`Role::rank`]): **Lighthouse** (relay) ·
-/// **XCP-NG** (the Xen virtualization host) · **Workstation** (the egui thin
-/// client). The XCP-NG role mirrors the **xcp-ng project**'s service set (see
-/// the [`xcpng`] catalog).
+/// upgrade-only invariant ([`Role::rank`]): **Lighthouse** (the always-on
+/// relay / control plane) · **Workstation** (the full Quasar egui thin
+/// client). "Headless" is not a role — a headless box is a `Workstation`
+/// without a local display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
-    /// Relay-only mesh node — Nebula overlay + the `mackesd` control plane,
-    /// no storage brick, no desktop. Rank 0. VPS-friendly.
+    /// Relay + control plane — Nebula overlay, the `mackesd` control plane,
+    /// the media server, and the CA/signer. Always-on, no desktop. Rank 0.
+    /// VPS-friendly.
     Lighthouse,
-    /// **XCP-NG virtualization host** — a Xen host running the full xcp-ng
-    /// toolstack (xapi/xenopsd/SM/networkd/…, see [`xcpng::XCPNG_SERVICES`])
-    /// that serves VM desktops to the mesh. Rank 1. *(Renamed from `Server`;
-    /// the `server`/`headless` slugs stay accepted aliases.)*
-    Xcpng,
-    /// Full workstation — the egui-DRM thin client (Quasar). Rank 2.
+    /// Full workstation — the Quasar stack: the egui-DRM shell + VDI + local
+    /// KVM/cloud-hypervisor + Podman. A headless box is a `Workstation` with no
+    /// local display. Rank 1. *(The retired XCP-NG/Server role folded in here;
+    /// the legacy `xcpng`/`server`/`headless` slugs stay accepted aliases.)*
     Workstation,
 }
 
@@ -51,8 +48,7 @@ impl Role {
     pub const fn rank(self) -> u8 {
         match self {
             Self::Lighthouse => 0,
-            Self::Xcpng => 1,
-            Self::Workstation => 2,
+            Self::Workstation => 1,
         }
     }
 
@@ -62,25 +58,14 @@ impl Role {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Lighthouse => "lighthouse",
-            Self::Xcpng => "xcpng",
             Self::Workstation => "workstation",
         }
     }
 
     /// All roles, lowest rank first.
     #[must_use]
-    pub const fn all() -> [Self; 3] {
-        [Self::Lighthouse, Self::Xcpng, Self::Workstation]
-    }
-
-    /// The xcp-ng toolstack services this role provisions, mirroring the xcp-ng
-    /// project (the [`xcpng`] catalog). Non-empty only for [`Role::Xcpng`].
-    #[must_use]
-    pub fn xcpng_services(self) -> &'static [xcpng::XcpngService] {
-        match self {
-            Self::Xcpng => xcpng::XCPNG_SERVICES,
-            _ => &[],
-        }
+    pub const fn all() -> [Self; 2] {
+        [Self::Lighthouse, Self::Workstation]
     }
 }
 
@@ -119,8 +104,8 @@ impl Capability {
 
     /// Whether this capability is valid on `role`. `Media` is a **lighthouse
     /// subclass** (MEDIA-1) — only the [`Role::Lighthouse`] tier may carry it; a
-    /// Server/Workstation tagged media is rejected (the media class is a
-    /// lighthouse subclass, never a peer/desktop capability).
+    /// `Workstation` tagged media is rejected (the media class is a lighthouse
+    /// subclass, never a peer/desktop capability).
     #[must_use]
     pub const fn applies_to(self, role: Role) -> bool {
         match self {
@@ -212,7 +197,7 @@ impl fmt::Display for ParseRoleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "unknown role: {} (choose lighthouse|xcpng|workstation)",
+            "unknown role: {} (choose lighthouse|workstation)",
             self.0
         )
     }
@@ -224,15 +209,16 @@ impl FromStr for Role {
     type Err = ParseRoleError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // The governance names are canonical; the two `mde-installer` profile
-        // spellings (`headless`/`full`) are accepted as aliases so a role
-        // pinned via either vocabulary resolves (E1.4 bridges the installer).
+        // The canonical 2-role names plus back-compat aliases. The retired
+        // XCP-NG/Server role and the `mde-installer` `headless`/`full` spellings
+        // all fold into `Workstation`, so a box pinned under any pre-2-role
+        // vocabulary still resolves (a former server/headless box is now a
+        // Workstation without a local display).
         match s.trim().to_ascii_lowercase().as_str() {
             "lighthouse" => Ok(Self::Lighthouse),
-            // `server`/`headless` stay accepted aliases so a box pinned under the
-            // pre-rename vocabulary still resolves to the XCP-NG tier.
-            "xcpng" | "xcp-ng" | "server" | "headless" => Ok(Self::Xcpng),
-            "workstation" | "full" => Ok(Self::Workstation),
+            "workstation" | "full" | "xcpng" | "xcp-ng" | "server" | "headless" => {
+                Ok(Self::Workstation)
+            }
             other => Err(ParseRoleError(other.to_string())),
         }
     }
@@ -580,7 +566,7 @@ fn write_atomic_class(path: &Path, role: Role, media: bool) -> std::io::Result<(
     let mut body = format!(
         "# MCNF deployment role — pinned at install by the role chooser.\n\
          # Upgrade-only: a lower rank is refused (E1.1).\n\
-         # Rank: lighthouse 0  <  server 1  <  workstation 2.\n\
+         # Rank: lighthouse 0  <  workstation 1.\n\
          role = \"{}\"\n",
         role.as_str()
     );
@@ -613,18 +599,20 @@ mod tests {
 
     #[test]
     fn rank_is_a_strict_total_order() {
-        assert!(Role::Lighthouse.rank() < Role::Xcpng.rank());
-        assert!(Role::Xcpng.rank() < Role::Workstation.rank());
-        assert_eq!([0, 1, 2], Role::all().map(Role::rank));
+        assert!(Role::Lighthouse.rank() < Role::Workstation.rank());
+        assert_eq!([0, 1], Role::all().map(Role::rank));
     }
 
     #[test]
-    fn parse_canonical_and_installer_aliases() {
+    fn parse_canonical_and_legacy_aliases() {
         assert_eq!("lighthouse".parse(), Ok(Role::Lighthouse));
-        assert_eq!("server".parse(), Ok(Role::Xcpng));
         assert_eq!("workstation".parse(), Ok(Role::Workstation));
-        // installer vocabulary aliases
-        assert_eq!("headless".parse(), Ok(Role::Xcpng));
+        // The retired XCP-NG/Server role + installer spellings all fold into
+        // Workstation (a former server/headless box is now a Workstation).
+        assert_eq!("xcpng".parse(), Ok(Role::Workstation));
+        assert_eq!("xcp-ng".parse(), Ok(Role::Workstation));
+        assert_eq!("server".parse(), Ok(Role::Workstation));
+        assert_eq!("headless".parse(), Ok(Role::Workstation));
         assert_eq!("full".parse(), Ok(Role::Workstation));
         // case-insensitive + trimmed
         assert_eq!("  WORKSTATION ".parse(), Ok(Role::Workstation));
@@ -634,7 +622,7 @@ mod tests {
     #[test]
     fn parse_role_toml_ignores_comments_and_quotes() {
         let body = "# header comment\n\nrole = \"server\"\n# trailing\n";
-        assert_eq!(parse_role_toml(body), Some(Role::Xcpng));
+        assert_eq!(parse_role_toml(body), Some(Role::Workstation));
         assert_eq!(
             parse_role_toml("role=\"lighthouse\""),
             Some(Role::Lighthouse)
@@ -663,9 +651,9 @@ mod tests {
     fn pin_first_then_show_round_trips() {
         let p = scratch("first");
         let _ = std::fs::remove_file(&p);
-        let out = pin_at(&p, Role::Xcpng).expect("first pin");
-        assert_eq!(out, PinOutcome::Pinned(Role::Xcpng));
-        assert_eq!(load_from(&p).expect("reload"), Role::Xcpng);
+        let out = pin_at(&p, Role::Workstation).expect("first pin");
+        assert_eq!(out, PinOutcome::Pinned(Role::Workstation));
+        assert_eq!(load_from(&p).expect("reload"), Role::Workstation);
         assert_eq!(load_from(&p).unwrap().rank(), 1);
         let _ = std::fs::remove_file(&p);
     }
@@ -729,7 +717,6 @@ mod tests {
     fn media_capability_is_lighthouse_only() {
         // §9: media is a capability tag ON a lighthouse — never on Server/Workstation.
         assert!(Capability::Media.applies_to(Role::Lighthouse));
-        assert!(!Capability::Media.applies_to(Role::Xcpng));
         assert!(!Capability::Media.applies_to(Role::Workstation));
         assert_eq!(Capability::Media.as_str(), "media");
         assert_eq!("media".parse(), Ok(Capability::Media));
@@ -748,7 +735,7 @@ mod tests {
         // A plain lighthouse is NOT the media subclass.
         assert!(!RoleClass::plain(Role::Lighthouse).is_media_lighthouse());
         assert_eq!(RoleClass::plain(Role::Lighthouse).class_str(), "lighthouse");
-        // The 3 roles are intact and untagged by default.
+        // The 2 roles are intact and untagged by default.
         for r in Role::all() {
             assert!(!RoleClass::plain(r).is_media_lighthouse());
             assert_eq!(RoleClass::plain(r).class_str(), r.as_str());
@@ -798,24 +785,24 @@ mod tests {
 
     #[test]
     fn media_tag_on_a_non_lighthouse_is_dropped_not_promoted() {
-        // A media tag is meaningless on a Server — pinning one drops it, and
-        // reading it back is a plain Server (never a phantom media-server).
-        let p = scratch("media-on-server");
+        // A media tag is meaningless on a Workstation — pinning one drops it, and
+        // reading it back is a plain Workstation (never a phantom media-peer).
+        let p = scratch("media-on-workstation");
         let _ = std::fs::remove_file(&p);
         pin_class_at(
             &p,
             &RoleClass {
-                role: Role::Xcpng,
+                role: Role::Workstation,
                 media: true,
             },
         )
-        .expect("pin server");
+        .expect("pin workstation");
         let class = load_class_from(&p).expect("reload");
-        assert_eq!(class.role, Role::Xcpng);
+        assert_eq!(class.role, Role::Workstation);
         assert!(!class.media, "media tag dropped on a non-lighthouse role");
         assert!(!class.is_media_lighthouse());
-        // Belt-and-suspenders: even a hand-edited `media=true` under a server
-        // role is ignored on read (applies_to gate).
+        // Belt-and-suspenders: even a hand-edited `media=true` under a non-lighthouse
+        // role (the legacy `server` slug now resolves to Workstation) is ignored.
         std::fs::write(&p, "role = \"server\"\nmedia = true\n").unwrap();
         assert!(!load_class_from(&p).unwrap().media);
         let _ = std::fs::remove_file(&p);

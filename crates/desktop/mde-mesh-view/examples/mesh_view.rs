@@ -48,16 +48,16 @@ impl eframe::App for MeshViewDemo {
 }
 
 /// The SAMPLE mesh — example-only data, never in the widget render path: three
-/// lighthouses (nyc3 is the elected leader, sfo3 degraded), two servers and two
-/// workstations (one Down), and a spread of active links. All auto-placed, so
-/// the lighthouses cluster on the inner ring and the peers ring around them.
+/// lighthouses (nyc3 is the elected leader, sfo3 degraded) and four workstation
+/// peers (one Down), and a spread of active links. All auto-placed, so the
+/// lighthouses cluster on the inner ring and the peers ring around them.
 fn sample_state() -> MeshState {
     let nodes = vec![
         MeshNode::new("lh-nyc3", "lighthouse-nyc3", Role::Lighthouse, Health::Ok).leader(),
         MeshNode::new("lh-fra1", "lighthouse-fra1", Role::Lighthouse, Health::Ok),
         MeshNode::new("lh-sfo3", "lighthouse-sfo3", Role::Lighthouse, Health::Warn),
-        MeshNode::new("eagle", "eagle", Role::Xcpng, Health::Ok),
-        MeshNode::new("media", "media-server", Role::Xcpng, Health::Warn),
+        MeshNode::new("eagle", "eagle", Role::Workstation, Health::Ok),
+        MeshNode::new("media", "media-server", Role::Workstation, Health::Warn),
         MeshNode::new("ws-01", "workstation-01", Role::Workstation, Health::Ok),
         MeshNode::new("ws-02", "workstation-02", Role::Workstation, Health::Down),
     ];

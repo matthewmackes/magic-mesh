@@ -41,7 +41,7 @@ pub fn ring(center: Vec2, radius: f32, count: usize, start_angle: f32) -> Vec<Ve
 /// - a node with an explicit [`pos`](crate::MeshNode::pos) keeps it;
 /// - a lone auto-placed lighthouse sits at the centre; several share the inner
 ///   ring ([`LH_RING_RADIUS`]);
-/// - auto-placed peers (Xcpng/Workstation) share the outer ring
+/// - auto-placed Workstation peers share the outer ring
 ///   ([`PEER_RING_RADIUS`]).
 #[must_use]
 pub fn auto_layout(state: &MeshState) -> Vec<Vec2> {
@@ -129,7 +129,7 @@ mod tests {
         MeshNode::new(id, id, Role::Lighthouse, Health::Ok)
     }
     fn peer(id: &str) -> MeshNode {
-        MeshNode::new(id, id, Role::Xcpng, Health::Ok)
+        MeshNode::new(id, id, Role::Workstation, Health::Ok)
     }
 
     #[test]

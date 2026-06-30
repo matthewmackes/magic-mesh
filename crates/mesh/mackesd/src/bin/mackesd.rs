@@ -590,7 +590,7 @@ enum Cmd {
         /// static_host_map points here.
         #[arg(long)]
         external_addr: String,
-        /// Role to pin when unpinned (lighthouse|server|workstation).
+        /// Role to pin when unpinned (lighthouse|workstation).
         #[arg(long, default_value = "lighthouse")]
         role: String,
     },
@@ -618,7 +618,7 @@ enum Cmd {
     /// mesh-id is read from the local founding bundle. Prints the
     /// ready-to-paste token + a `magic-setup`/`mackesd join` line.
     AddPeer {
-        /// Role the new peer will pin (lighthouse|server|workstation).
+        /// Role the new peer will pin (lighthouse|workstation).
         #[arg(long, default_value = "workstation")]
         role: String,
         /// Operator note recorded beside the issued bearer hash.
@@ -708,7 +708,7 @@ enum Cmd {
         /// the public IP explicitly.
         #[arg(long, default_value = "auto")]
         external_addr: String,
-        /// Role to pin when unpinned (lighthouse|server|workstation).
+        /// Role to pin when unpinned (lighthouse|workstation).
         #[arg(long, default_value = "lighthouse")]
         role: String,
         /// Override the `/enroll` HTTPS port the token advertises.
@@ -746,7 +746,7 @@ enum Cmd {
         /// (`mesh:<id>@<ip>:<port>#<bearer>?fp=<sha256>`). Omit to
         /// launch the TUI.
         token: Option<String>,
-        /// Role to pin when unpinned (lighthouse|server|workstation).
+        /// Role to pin when unpinned (lighthouse|workstation).
         #[arg(long, default_value = "workstation")]
         role: String,
         /// Optional display name; defaults to the system hostname.
@@ -856,7 +856,7 @@ enum Cmd {
         /// Delete the named on-disk profile (no-op for a core profile).
         #[arg(long, value_name = "NAME")]
         rm: Option<String>,
-        /// Role for --set (lighthouse|server|workstation).
+        /// Role for --set (lighthouse|workstation).
         #[arg(long)]
         role: Option<String>,
         /// Description for --set.
@@ -2103,7 +2103,7 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::RolePin { role, media } => {
             let parsed: mde_role::Role = role.parse().map_err(|_| {
-                anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+                anyhow::anyhow!("unknown role `{role}` — expected lighthouse|workstation")
             })?;
             // MEDIA-1 — pin the role + the media capability tag as a class. The
             // tag is only valid on the lighthouse tier; reject an inapplicable
@@ -3852,7 +3852,7 @@ fn main() -> anyhow::Result<()> {
             role,
         } => {
             let parsed: mde_role::Role = role.parse().map_err(|_| {
-                anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
+                anyhow::anyhow!("unknown role `{role}` — expected lighthouse|workstation")
             })?;
             let conn = mackesd_core::store::open(&db_path)
                 .with_context(|| format!("opening store at {}", db_path.display()))?;
@@ -4468,9 +4468,7 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(name) = set {
                 let Some(role) = role else {
-                    eprintln!(
-                        "mackesd profiles --set requires --role <lighthouse|server|workstation>"
-                    );
+                    eprintln!("mackesd profiles --set requires --role <lighthouse|workstation>");
                     std::process::exit(1);
                 };
                 let profile = install_profiles::InstallProfile {
@@ -5769,25 +5767,6 @@ fn run_serve(
                 .lock()
                 .expect("worker_names mutex")
                 .push("xcp_host".into());
-        }
-        // XCPNG-HEALTH — on an XCP-NG host, probe the xcp-ng toolstack service
-        // catalog (`mde_role::xcpng::XCPNG_SERVICES`, `systemctl is-active` each)
-        // every 30 s and publish a whole-host health summary to
-        // `event/xcpng/services` so the Workbench host view + the alert lane see
-        // the live toolstack state. Gated to Role::Xcpng (rank 1) EXACTLY — not a
-        // rank floor: the catalog only exists on a Xen host, so a Workstation
-        // (rank 2) or Lighthouse (rank 0) would publish a misleading all-down
-        // summary. rank↔role is a bijection over the three roles, so the rank
-        // equality IS an exact-role gate.
-        if role_rank == mde_role::Role::Xcpng.rank() {
-            sup.spawn(Spawn::new(
-                mackesd_core::workers::xcpng_health::XcpngHealthWorker::new(node_id.clone()),
-                RestartPolicy::OnFailure,
-            ));
-            worker_names
-                .lock()
-                .expect("worker_names mutex")
-                .push("xcpng_health".into());
         }
         // OV-7.a (v2.6) — health reconciler. Polls each known
         // peer's QNM-Shared heartbeat.json every 5 s, applies the
@@ -8835,9 +8814,9 @@ fn cmd_add_peer(
     lighthouse: Option<String>,
     enroll_port: Option<u16>,
 ) -> anyhow::Result<()> {
-    let parsed: mde_role::Role = role.parse().map_err(|_| {
-        anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
-    })?;
+    let parsed: mde_role::Role = role
+        .parse()
+        .map_err(|_| anyhow::anyhow!("unknown role `{role}` — expected lighthouse|workstation"))?;
     let token = mint_join_token(parsed, note, lighthouse, enroll_port)?;
     println!("{token}");
     eprintln!(
@@ -9205,9 +9184,9 @@ fn cmd_found(
     use mackesd_core::nebula_enroll_endpoint::{generate_endpoint_identity, DEFAULT_ENROLL_PORT};
     use mackesd_core::workers::nebula_enroll_listener::{DEFAULT_CERT_PATH, DEFAULT_KEY_PATH};
 
-    let parsed: mde_role::Role = role.parse().map_err(|_| {
-        anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
-    })?;
+    let parsed: mde_role::Role = role
+        .parse()
+        .map_err(|_| anyhow::anyhow!("unknown role `{role}` — expected lighthouse|workstation"))?;
 
     // DAR-18 — validate the backoffice tier UP FRONT (before any mesh-init side
     // effect), so `--with-backoffice=bogus` fails fast without half-founding a mesh.
@@ -9463,9 +9442,9 @@ fn cmd_join(
         };
     };
 
-    let parsed: mde_role::Role = role.parse().map_err(|_| {
-        anyhow::anyhow!("unknown role `{role}` — expected lighthouse|server|workstation")
-    })?;
+    let parsed: mde_role::Role = role
+        .parse()
+        .map_err(|_| anyhow::anyhow!("unknown role `{role}` — expected lighthouse|workstation"))?;
     let token = mackesd_core::nebula_enroll::parse_join_token(&raw_token).ok_or_else(|| {
         anyhow::anyhow!("invalid join token (expected mesh:<id>@<ip>:<port>#<bearer>?fp=<sha256>)")
     })?;

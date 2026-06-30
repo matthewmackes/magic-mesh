@@ -1,7 +1,7 @@
 //! MCNF first-run deployment-role chooser (E12-8 / PKG-5).
 //!
 //! An egui window shown once, at first boot, to pin this box's deployment role —
-//! **Lighthouse · XCP-NG · Workstation** (governance §5). Picking a role runs
+//! **Lighthouse · Workstation** (governance §5). Picking a role runs
 //! `mackesd role-pin <role>` (the upgrade-only ENT-2 path) and exits. If a role is
 //! already pinned it exits immediately, so an `/etc/xdg/autostart` entry can launch
 //! it every login as a no-op after the first run.
@@ -17,19 +17,15 @@ fn role_blurb(role: Role) -> (&'static str, &'static str) {
     match role {
         Role::Lighthouse => (
             "Lighthouse",
-            "Relay-only mesh node — Nebula overlay + control plane. No storage \
-             brick, no desktop. VPS-friendly. (Rank 0)",
-        ),
-        Role::Xcpng => (
-            "XCP-NG",
-            "Xen virtualization host — runs the full xcp-ng toolstack \
-             (xapi/xenopsd/SM/networkd…) and serves VM desktops to the mesh. \
-             No local desktop. (Rank 1)",
+            "Always-on relay + control plane — Nebula overlay, the mackesd \
+             control plane, the media server, and the CA/signer. No desktop. \
+             VPS-friendly. (Rank 0)",
         ),
         Role::Workstation => (
             "Workstation",
-            "Full workstation — the egui thin client (Quasar): brokers VM desktops \
-             from XCP-NG hosts and local KVM. (Rank 2)",
+            "The full Quasar stack — the egui-DRM shell + VDI + local \
+             KVM/cloud-hypervisor + Podman. A headless machine is just a \
+             Workstation without a local display. (Rank 1)",
         ),
     }
 }
@@ -66,7 +62,7 @@ impl eframe::App for RoleChooser {
             ui.colored_label(
                 Style::TEXT_DIM,
                 "One deployment role is pinned per machine at install. You can \
-                 upgrade later (Lighthouse → XCP-NG → Workstation), never downgrade.",
+                 upgrade later (Lighthouse → Workstation), never downgrade.",
             );
             ui.add_space(Style::SP_S);
 
@@ -129,8 +125,10 @@ mod tests {
     }
 
     #[test]
-    fn the_middle_role_is_xcpng() {
-        // The Server→XCP-NG rename must reach the user-facing chooser label.
-        assert_eq!(role_blurb(Role::Xcpng).0, "XCP-NG");
+    fn the_two_roles_are_lighthouse_and_workstation() {
+        // The 2-role model: only Lighthouse and Workstation, no middle role.
+        assert_eq!(Role::all().len(), 2);
+        assert_eq!(role_blurb(Role::Lighthouse).0, "Lighthouse");
+        assert_eq!(role_blurb(Role::Workstation).0, "Workstation");
     }
 }

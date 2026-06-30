@@ -326,19 +326,19 @@ mod tests {
 
     #[test]
     fn non_lighthouse_join_does_not_get_the_passphrase() {
-        for role in [mde_role::Role::Xcpng, mde_role::Role::Workstation] {
-            let tmp = tempfile::tempdir().unwrap();
-            let paths = tmp_paths(tmp.path());
-            let seen = RefCell::new(None);
-            let sealer = recording_sealer(&seen);
+        // Workstation is the only non-lighthouse role in the 2-role model.
+        let role = mde_role::Role::Workstation;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = tmp_paths(tmp.path());
+        let seen = RefCell::new(None);
+        let sealer = recording_sealer(&seen);
 
-            let outcome = provision_with(role, &paths, &sealer).expect("provision");
-            assert_eq!(outcome, ProvisionOutcome::NotLighthouse);
-            // Nothing sealed, nothing written.
-            assert!(seen.borrow().is_none(), "sealer must NOT run for {role:?}");
-            assert!(!paths.cred_path.exists());
-            assert!(!paths.dropin_path().exists());
-        }
+        let outcome = provision_with(role, &paths, &sealer).expect("provision");
+        assert_eq!(outcome, ProvisionOutcome::NotLighthouse);
+        // Nothing sealed, nothing written.
+        assert!(seen.borrow().is_none(), "sealer must NOT run for {role:?}");
+        assert!(!paths.cred_path.exists());
+        assert!(!paths.dropin_path().exists());
     }
 
     #[test]

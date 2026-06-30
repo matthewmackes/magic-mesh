@@ -1,19 +1,15 @@
 //! E1.2 — role-gated worker subsets.
 //!
 //! Each `mackesd` worker is tiered to the **minimum deployment role rank** that
-//! runs it (plan §12: `Lighthouse ⊂ Server ⊂ Workstation`). `run_serve` resolves
-//! the box's rank once via [`resolve_rank`] and gates every `sup.spawn` with
-//! [`runs`], so a Lighthouse never starts the media/voice/desktop workers and a
-//! Server never starts the desktop stack.
+//! runs it (`Lighthouse ⊂ Workstation`). `run_serve` resolves the box's rank
+//! once via [`resolve_rank`] and gates every `sup.spawn` with [`runs`], so a
+//! Lighthouse never starts the fleet/media/voice/desktop workers.
 //!
-//! **Interpretation (E1.2):** §12's role *definitions* govern over the terse
-//! "Lighthouse = enroll+leader+health" summary — a Lighthouse IS a VPS relay, so
-//! it runs Nebula + mde-bus + mesh routing + leader + health. Over-tiering a
-//! relay-essential worker would break routing, so the mesh/control plane sits at
-//! rank 0; fleet at rank 1; voice/media + every sway/desktop worker at
-//! rank 2. The four genuinely-ambiguous calls (`mesh_latency`, `reconcile`,
-//! `remmina-sync`, `kdc_host`) are noted in the worklist for a design-doc
-//! cross-check.
+//! **Interpretation (E1.2):** a Lighthouse IS a VPS relay, so it runs Nebula +
+//! mde-bus + mesh routing + leader + health. Over-tiering a relay-essential
+//! worker would break routing, so the mesh/control plane sits at rank 0; every
+//! fleet + voice/media + desktop worker sits at rank 1 (Workstation — a headless
+//! box is a Workstation too, its desktop workers idle without a local display).
 
 use mde_role::{Capability, Role, RoleClass};
 
@@ -27,7 +23,7 @@ use mde_role::{Capability, Role, RoleClass};
 /// [`Capability::Media`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeployClass {
-    /// The role rank (0 lighthouse · 1 server · 2 workstation).
+    /// The role rank (0 lighthouse · 1 workstation).
     pub rank: u8,
     /// `true` when this box carries [`Capability::Media`] — the `Lighthouse_Media`
     /// subclass that hosts the media service.
@@ -85,19 +81,21 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     ("netstate_apply", 0),
     ("validation_suite", 0),
     ("metrics_exporter", 0),
-    // ── Server (rank 1) — adds fleet + mesh storage.
+    // ── Workstation (rank 1) — everything beyond the relay control plane: the
+    //    fleet + mesh storage workers AND voice / clipboard / kdc / remmina /
+    //    music. A headless box is a Workstation too (the desktop workers idle
+    //    gracefully without a local display).
     ("ansible-pull", 1),
     ("app-sync", 1),
     ("job_exec", 1),
-    // ── Workstation (rank 2) — adds voice + media + kdc + remmina.
-    ("voice_config", 2),
-    ("clipboard_sync", 2),
-    ("kdc_host", 2),
-    ("remmina-sync", 2),
+    ("voice_config", 1),
+    ("clipboard_sync", 1),
+    ("kdc_host", 1),
+    ("remmina-sync", 1),
     // MEDIA-8 — Workstation music auto-config: a desktop worker (no seated user
-    // on a Lighthouse/Server, so Workstation-tier), reads the published shared
+    // on a Lighthouse, so Workstation-tier), reads the published shared
     // account off the registry plane + writes the desktop user's creds.
-    ("music_autoconfig", 2),
+    ("music_autoconfig", 1),
 ];
 
 /// MEDIA-1 — workers that ALSO require a capability tag beyond their rank tier.
@@ -157,7 +155,7 @@ pub fn required_capability(worker: &str) -> Option<Capability> {
 }
 
 /// Resolve the deployment rank that gates worker spawns: the pinned role's
-/// rank, or **Workstation (2) when unpinned** (a dev tree / pre-role-pin box
+/// rank, or **Workstation (1) when unpinned** (a dev tree / pre-role-pin box
 /// runs the full set — the desktop workers idle gracefully without a Wayland
 /// session), or **Lighthouse (0) when `role.toml` is malformed** (fail closed —
 /// run only the relay control plane, never assume a Workstation default).
@@ -208,7 +206,7 @@ pub fn resolve_class_strict() -> Result<DeployClass, String> {
         Err(mde_role::LoadError::NotPinned) => Err(
             "no deployment role pinned (/var/lib/mde/role.toml absent) — this box refuses to \
              start its worker pool unpinned (ENT-2 fail-closed). Pin one first: \
-             `mackesd role pin <lighthouse|server|workstation>`"
+             `mackesd role pin <lighthouse|workstation>`"
                 .to_string(),
         ),
         Err(e) => Err(format!(
@@ -325,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn tier_counts_match_the_plan_12_split() {
+    fn tier_counts_match_the_two_role_split() {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
@@ -334,13 +332,14 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            3,
-            "Server rank-1 = fleet workers + job_exec (PLANES-9)"
+            8,
+            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8)"
         );
+        // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
             count(2),
-            5,
-            "Workstation adds voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8)"
+            0,
+            "the retired Server/XCP-NG tier (rank 2) is gone"
         );
     }
 
@@ -362,13 +361,19 @@ mod tests {
     }
 
     #[test]
-    fn server_adds_fleet_but_no_desktop() {
-        let r = Role::Xcpng.rank();
-        for w in ["ansible-pull", "app-sync", "nebula_supervisor", "heartbeat"] {
-            assert!(runs(w, r), "Server must run {w}");
-        }
-        for w in ["voice_config", "clipboard_sync", "kdc_host"] {
-            assert!(!runs(w, r), "Server must NOT run {w}");
+    fn workstation_adds_fleet_and_desktop() {
+        // The retired Server tier folded into Workstation: it now runs BOTH the
+        // fleet workers AND the desktop stack (a headless box runs them too — the
+        // desktop workers idle without a display).
+        let r = Role::Workstation.rank();
+        for w in [
+            "ansible-pull",
+            "app-sync",
+            "voice_config",
+            "clipboard_sync",
+            "kdc_host",
+        ] {
+            assert!(runs(w, r), "Workstation must run {w}");
         }
     }
 
@@ -389,19 +394,14 @@ mod tests {
     #[test]
     fn workers_for_rank_is_a_growing_superset() {
         let lh = workers_for_rank(Role::Lighthouse.rank());
-        let srv = workers_for_rank(Role::Xcpng.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        // +1 each (hardware_probe, rank 0 → present in every tier).
-        // +1 etcd_watch (SUBSTRATE-10, rank 0 → present in every tier).
-        // +1 link-traffic (MESHMAP-6, rank 0 → present in every tier).
+        // 22 lighthouse control-plane workers; Workstation adds the 8 fleet +
+        // desktop workers for the full 30 (the retired Server tier folded into
+        // Workstation in the 2-role model).
         assert_eq!(lh.len(), 22);
-        assert_eq!(srv.len(), 25);
-        // 30: +clipboard_sync (CLIP-SYNC-1), -clipd_supervisor (removed, CLIP-SYNC-2),
-        // +etcd_watch (SUBSTRATE-10), +music_autoconfig (MEDIA-8), +link-traffic (MESHMAP-6).
         assert_eq!(ws.len(), 30);
-        // Strict superset: every lower-tier worker is in the higher tier.
-        assert!(lh.iter().all(|w| srv.contains(w)));
-        assert!(srv.iter().all(|w| ws.contains(w)));
+        // Strict superset: every lighthouse worker is also in the workstation set.
+        assert!(lh.iter().all(|w| ws.contains(w)));
     }
 
     // ── MEDIA-1: the Lighthouse_Media capability gate ──
@@ -419,13 +419,9 @@ mod tests {
             runs_in("navidrome", media_lh),
             "media-lighthouse runs navidrome"
         );
-        // ...but a stock lighthouse / server / workstation WITHOUT the tag does NOT
+        // ...but a stock lighthouse / workstation WITHOUT the tag does NOT
         // (acceptance: container absent on a non-media node), even at higher rank.
-        for rank in [
-            Role::Lighthouse.rank(),
-            Role::Xcpng.rank(),
-            Role::Workstation.rank(),
-        ] {
+        for rank in [Role::Lighthouse.rank(), Role::Workstation.rank()] {
             assert!(
                 !runs_in("navidrome", DeployClass::plain(rank)),
                 "rank {rank} without the media tag must NOT run navidrome"
@@ -439,13 +435,16 @@ mod tests {
     fn media_tag_only_unlocks_the_media_worker_not_the_tier() {
         // The media tag adds the media worker WITHOUT changing the rank set:
         // a media-lighthouse runs the lighthouse control plane + navidrome,
-        // never a server/desktop worker.
+        // never a fleet/desktop (Workstation-tier) worker.
         let media_lh = DeployClass {
             rank: Role::Lighthouse.rank(),
             media: true,
         };
         assert!(runs_in("nebula_supervisor", media_lh), "still a lighthouse");
-        assert!(!runs_in("ansible-pull", media_lh), "media ≠ server tier");
+        assert!(
+            !runs_in("ansible-pull", media_lh),
+            "media ≠ workstation (fleet) tier"
+        );
         assert!(
             !runs_in("voice_config", media_lh),
             "media ≠ workstation tier"
@@ -471,8 +470,8 @@ mod tests {
         assert_eq!(media.rank, 0);
         assert!(media.media);
         // A non-lighthouse role can't be a media class (RoleClass enforces it).
-        let srv = DeployClass::from_role_class(&RoleClass::plain(Role::Xcpng));
-        assert_eq!(srv.rank, 1);
-        assert!(!srv.media);
+        let ws = DeployClass::from_role_class(&RoleClass::plain(Role::Workstation));
+        assert_eq!(ws.rank, 1);
+        assert!(!ws.media);
     }
 }

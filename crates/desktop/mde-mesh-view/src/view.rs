@@ -28,9 +28,7 @@ use crate::state::{Health, MeshState, Role};
 
 /// Node disc radius for a Lighthouse (the largest role).
 const NODE_R_LIGHTHOUSE: f32 = 12.0;
-/// Node disc radius for an XCP-NG host.
-const NODE_R_SERVER: f32 = 9.0;
-/// Node disc radius for a Workstation (the smallest role).
+/// Node disc radius for a Workstation peer (the smaller role).
 const NODE_R_WORKSTATION: f32 = 6.5;
 /// Stroke width of a node's health ring.
 const NODE_STROKE_W: f32 = 1.5;
@@ -53,7 +51,6 @@ impl Role {
     const fn radius(self) -> f32 {
         match self {
             Self::Lighthouse => NODE_R_LIGHTHOUSE,
-            Self::Xcpng => NODE_R_SERVER,
             Self::Workstation => NODE_R_WORKSTATION,
         }
     }

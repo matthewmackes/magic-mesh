@@ -16,9 +16,8 @@ use mde_egui::egui::Vec2;
 pub enum Role {
     /// A lighthouse — the always-on mesh anchor / relay (drawn largest, centred).
     Lighthouse,
-    /// An XCP-NG Xen virtualization host (the desktop-serving tier).
-    Xcpng,
-    /// A workstation peer (an interactive seat).
+    /// A workstation peer (an interactive seat; a headless box is a workstation
+    /// without a local display).
     Workstation,
 }
 

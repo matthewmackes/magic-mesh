@@ -162,8 +162,7 @@ fn run(
 
 fn cycle_role(r: SetupRole) -> SetupRole {
     match r {
-        SetupRole::Lighthouse => SetupRole::Xcpng,
-        SetupRole::Xcpng => SetupRole::Workstation,
+        SetupRole::Lighthouse => SetupRole::Workstation,
         SetupRole::Workstation => SetupRole::Lighthouse,
     }
 }
