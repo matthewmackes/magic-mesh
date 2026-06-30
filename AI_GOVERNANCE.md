@@ -119,22 +119,31 @@ auth, SIP digest) stand as recorded.
   desktop and **expands into the full Workbench**.
 - **The desktop you use is a VM.** A Workstation **brokers and displays full OS
   desktops** (Windows/Ubuntu/…) that run either **locally on cloud-hypervisor** or
-  **remotely on any mesh peer** (an MCNF **XCP-NG** host — the Xen tier mirroring
-  the xcp-ng toolstack), rendered
+  **remotely on any mesh peer** (a **headless Workstation** serving VM desktops over
+  KVM/cloud-hypervisor), rendered
   **egui-native** (ironrdp/vnc → an egui texture) over Nebula. A "session" is a
   fullscreen VM desktop; sessions **roam** per-peer via etcd/Syncthing. The
   mesh-control surfaces (Workbench/Files/Music/Voice) are **panels inside the one
   shell**, not separate clients.
-- **One shell, three roles.** Lighthouse · **XCP-NG** · Workstation (rank-ordered) all run the **same**
-  egui shell — headless roles control-only / graphically light; a Workstation adds
-  the DRM seat + the VDI layer. A **`desktop-host`** capability tag marks peers that
-  serve VM desktops. `mackesd` runs the **session-broker + vm-lifecycle** workers
-  (the shell renders; mackesd brokers — §1/§9).
-- **Delivery:** the Workstation ships as an **immutable bootc/ostree image** (the
-  egui-DRM shell + cloud-hypervisor + ironrdp/virtio-gpu stack baked in; VM disks +
-  mesh state on the writable partition). Headless **XCP-NG/Lighthouse** install the
-  **mesh-only set**. The install-time **role chooser** + the GitHub-hosted dnf repo
-  (Releases asset + GitHub Pages, project-GPG-signed) carry forward.
+- **One stack, two roles (revised 2026-06-30 — `docs/design/onboarding-wizard.md` +
+  `mesh-virt-management.md`).** **Lighthouse · Workstation** (rank 0/1). Every machine
+  runs the **byte-identical stack**; **role is configuration, not a build** — a flag
+  toggles systemd units, so a box is re-roled without a reinstall. A **headless machine
+  is a Workstation without a local display** (daemon stack only, no egui seat, serving
+  VMs/containers to the mesh). The **Lighthouse** is relay + control plane + **media
+  server (Navidrome→DO Spaces) + CA/signer**. There is **no XCP-NG role** — the
+  hypervisor is **Fedora + KVM/cloud-hypervisor + Podman** (`mde-kvm`); an external
+  XCP-ng host may be *adopted* day-2 but is never produced by our installer. A
+  **`desktop-host`** tag marks peers serving VM desktops; `mackesd` runs the
+  **session-broker + vm-lifecycle + container** workers (the shell renders; mackesd
+  brokers — §1/§9).
+- **Delivery:** **one immutable bootc/ostree image for every role** (egui-DRM shell +
+  cloud-hypervisor + ironrdp/virtio-gpu + `mackesd` + Podman + Nebula baked in; VM disks
+  + mesh state on the writable partition). The **role is a config flag**, not a separate
+  build — a Lighthouse runs the same image with the desktop units masked (Option 1),
+  role-features migrating to managed Podman/VM workloads over time (Option 2). The
+  install-time **role chooser** (binary: Lighthouse / Workstation) + the GitHub-hosted
+  dnf repo (Releases asset + GitHub Pages, project-GPG-signed) carry forward.
 
 ## §6 — The boundary: layered tiers (E12 — replaces the two-bucket gate)
 
