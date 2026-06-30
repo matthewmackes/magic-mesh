@@ -1,0 +1,24 @@
+[package]
+name        = "mde-shell-egui"
+description = "MCNF E12 \"Quasar\" — the single egui shell (E12-3). One eframe app on the mde-egui harness: a thin persistent chrome bar (peers · sessions · status + an Expand toggle) over a central view that is either the session EmptyState (collapsed — a real session is a VM texture from mde-vdi, a later unit) or the Workbench five-plane nav (expanded). The skeleton the panels (Workbench/Files/Music/Voice) and the VM session-view plug into."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "mde-shell-egui"
+path = "src/main.rs"
+
+[dependencies]
+# The §4/§5 harness is the shell's one inward dependency (§6 layered tiers): it
+# provides run_client (the eframe Wayland-client runner), the shared Style, the
+# Motion table, and re-exports egui/eframe so the shell shares one toolkit
+# resolution. No mesh/services deps — the skeleton renders only; Bus wiring lands
+# with the panels.
+mde-egui = { path = "../../shared/mde-egui" }
+
+[lints]
+workspace = true
