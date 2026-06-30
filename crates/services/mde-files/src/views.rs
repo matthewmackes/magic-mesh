@@ -1227,13 +1227,15 @@ pub fn outbox<'a>(
     );
 
     let body: Element<'a, Message> = if snap.outbox.is_empty() {
-        container(
-            text("Nothing sent yet — use Send on a file or drop one onto a peer.")
-                .size(12)
-                .colr(t::FG_DIM),
+        crate::widgets::empty_state(
+            mde_theme::EmptyState::with_cta(
+                "Nothing sent yet",
+                "Use Send on a file, or drop one onto a peer, to share it across the mesh.",
+                "Browse my files",
+            )
+            .with_icon(mde_theme::Icon::History),
+            Some(Message::SelectView(View::Local)),
         )
-        .padding(Padding::from([8.0, 4.0]))
-        .into()
     } else {
         file_listing(&snap.outbox, true, "To", layout, metrics, selection, motion)
     };
@@ -1322,10 +1324,15 @@ pub fn local_browser<'a>(
         Layout::Grid => column![].spacing(8),
     };
     if files.is_empty() {
-        list = list.push(
-            container(text("Empty folder").size(12).colr(t::FG_DIM))
-                .padding(Padding::from([8.0, 4.0])),
-        );
+        list = list.push(crate::widgets::empty_state(
+            mde_theme::EmptyState::with_cta(
+                "This folder is empty",
+                "Nothing here yet. Go up to choose another folder, or add files from your file manager.",
+                "Go up a folder",
+            )
+            .with_icon(mde_theme::Icon::Folder),
+            Some(Message::LocalUp),
+        ));
     } else {
         for (i, f) in files.iter().enumerate() {
             // CTXMENU — the row under inline rename swaps its content for a text
@@ -1397,14 +1404,14 @@ pub fn cloud_devices<'a>(
 
     let mut list = column![file_row_head("Device", metrics)];
     if files.is_empty() {
-        list = list.push(
-            container(
-                text("No paired devices — pair one from Settings ▸ Mobile Devices.")
-                    .size(12)
-                    .colr(t::FG_DIM),
+        list = list.push(crate::widgets::empty_state(
+            mde_theme::EmptyState::info(
+                "No paired devices",
+                "Pair a phone or tablet from Settings ▸ Mobile Devices to browse its files here.",
             )
-            .padding(Padding::from([8.0, 4.0])),
-        );
+            .with_icon(mde_theme::Icon::Devices),
+            None::<Message>,
+        ));
     } else {
         for (i, f) in files.iter().enumerate() {
             let sel = selection.is_selected(&f.name);
@@ -2057,11 +2064,14 @@ pub fn send_to_picker_sheet<'a>(source: &str, peers: &'a [Peer]) -> Element<'a, 
 
     let reachable: Vec<&Peer> = peers.iter().filter(|p| p.status.is_reachable()).collect();
     if reachable.is_empty() {
-        col = col.push(
-            text("No reachable peers on the mesh.")
-                .size(12)
-                .colr(t::FG_FAINT),
-        );
+        col = col.push(crate::widgets::empty_state(
+            mde_theme::EmptyState::info(
+                "No reachable peers",
+                "No peers are online on the mesh right now — the file will send once one reconnects.",
+            )
+            .with_icon(mde_theme::Icon::Peer),
+            None::<Message>,
+        ));
     } else {
         for p in reachable {
             let id = p.id.clone();
@@ -2512,33 +2522,83 @@ fn op_icon_btn(svg_bytes: &'static [u8], fg: Color, msg: Message) -> Element<'st
 
 // ── MESHFS-8.1: Recycle Bin view ────────────────────────────────────────────
 
+/// MESHFS-8.1 — map the recycle-bin fetch inputs onto the shared async
+/// [`mde_theme::LoadState`] vocabulary, so the view's busy/error/empty chrome
+/// reads from ONE model instead of three hand-rolled booleans (a terminal error
+/// wins over an in-flight load). Pure — unit-tested below.
+fn undelete_load_state(busy: bool, has_error: bool) -> mde_theme::LoadState {
+    if has_error {
+        mde_theme::LoadState::Failed
+    } else if busy {
+        mde_theme::LoadState::Loading
+    } else {
+        mde_theme::LoadState::Loaded
+    }
+}
+
 /// Render the mesh-storage trash listing. Shows items recoverable within the
-/// configured retention window (default 48 h) with a "Restore" button per
-/// row. Displays a loading/error state when busy or on error.
+/// configured retention window (default 48 h) with a "Restore" button per row.
+/// The busy / error / empty chrome is modelled on the shared [`LoadState`]
+/// vocabulary and routed through the shared empty-state renderer, rather than a
+/// hand-rolled trio of ad-hoc strings.
+///
+/// [`LoadState`]: mde_theme::LoadState
 pub fn mesh_undelete<'a>(
     items: &'a [TrashItem],
     busy: bool,
     error: Option<&'a str>,
 ) -> Element<'a, Message> {
+    let state = undelete_load_state(busy, error.is_some());
+
+    // Header status — the shared async label, tinted by the state's tone (the
+    // a11y contract: legible text + colour, not a bare spinner). Blank once the
+    // listing has settled to `Loaded`.
+    let status_color = match state.tone() {
+        mde_theme::StateTone::Danger => t::PF_DANGER,
+        mde_theme::StateTone::Info => t::ACCENT,
+        _ => t::FG_FAINT,
+    };
+    let status_label = if state.is_busy() || state.is_error() {
+        state.label()
+    } else {
+        ""
+    };
     let header = row![
         text("Recycle Bin").size(13).colr(t::FG),
         Space::new().width(Length::Fill),
-        text(if busy { "Loading…" } else { "" })
-            .size(11)
-            .colr(t::FG_FAINT),
+        text(status_label.to_string()).size(11).colr(status_color),
     ]
     .align_y(cosmic::iced::alignment::Vertical::Center);
 
-    let body: Element<'a, Message> = if let Some(err) = error {
-        text(format!("Error: {err}"))
-            .size(12)
-            .colr(t::PF_DANGER)
-            .into()
-    } else if items.is_empty() && !busy {
-        text("Recycle Bin is empty — no files recoverable.")
-            .size(12)
-            .colr(t::FG_FAINT)
-            .into()
+    let body: Element<'a, Message> = if state.is_error() {
+        crate::widgets::empty_state(
+            mde_theme::EmptyState::info(
+                "Couldn't load the Recycle Bin",
+                error
+                    .unwrap_or("The mesh-storage trash is unreachable.")
+                    .to_string(),
+            )
+            .with_icon(mde_theme::Icon::StatusError),
+            None::<Message>,
+        )
+    } else if state.is_busy() {
+        crate::widgets::empty_state(
+            mde_theme::EmptyState::info(
+                "Loading the Recycle Bin…",
+                "Fetching files recoverable from mesh storage.",
+            )
+            .with_icon(mde_theme::Icon::History),
+            None::<Message>,
+        )
+    } else if items.is_empty() {
+        crate::widgets::empty_state(
+            mde_theme::EmptyState::info(
+                "Recycle Bin is empty",
+                "No files are recoverable within the retention window.",
+            )
+            .with_icon(mde_theme::Icon::Delete),
+            None::<Message>,
+        )
     } else {
         let rows: Vec<Element<'a, Message>> = items.iter().map(|item| trash_row(item)).collect();
         scrollable(column(rows).spacing(2)).into()
@@ -2591,4 +2651,28 @@ fn trash_row(item: &TrashItem) -> Element<'_, Message> {
     .align_y(cosmic::iced::alignment::Vertical::Center)
     .padding(Padding::from([4.0, 0.0]))
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mde_theme::LoadState;
+
+    #[test]
+    fn undelete_state_maps_inputs_onto_the_shared_loadstate() {
+        // MESHFS-8.1 — the recycle-bin chrome routes through ONE LoadState model:
+        // a terminal error is `Failed`, an in-flight fetch is `Loading`, a settled
+        // fetch is `Loaded` (its emptiness handled by the empty-state renderer).
+        assert_eq!(undelete_load_state(false, false), LoadState::Loaded);
+        assert_eq!(undelete_load_state(true, false), LoadState::Loading);
+        assert_eq!(undelete_load_state(false, true), LoadState::Failed);
+        // A terminal error wins over an in-flight load.
+        assert_eq!(undelete_load_state(true, true), LoadState::Failed);
+
+        // The predicates the view branches on line up with the model.
+        assert!(undelete_load_state(true, false).is_busy());
+        assert!(undelete_load_state(false, true).is_error());
+        assert!(!undelete_load_state(false, false).is_busy());
+        assert!(!undelete_load_state(false, false).is_error());
+    }
 }

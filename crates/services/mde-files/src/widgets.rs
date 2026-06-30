@@ -94,6 +94,174 @@ pub fn detail_card(name: &str, mime: Mime) -> Element<'static, Message> {
     object_card(card, t::mde_files_palette())
 }
 
+/// POLISH-files-emptystates — local cosmic renderer for the shared
+/// [`mde_theme::EmptyState`] data shape, the zero-data twin of [`object_card`]:
+/// the data form lives in `mde-theme` (so non-iced consumers can describe a
+/// panel) and the toolkit widget is built here (so iced doesn't leak into the
+/// theme crate). It paints a reserved 32 px hero-icon slot, a heading, a muted
+/// body line, and — when the state is actionable — a primary-fill CTA whose
+/// click handler the call site supplies. Every zero-data view in this crate
+/// routes through this ONE shape so empty panels read consistently (UX-6)
+/// instead of each rolling its own bare faint line.
+///
+/// Spacing is the shared empty-state vocabulary verbatim (the `EMPTY_ICON_SIZE`
+/// slot, the `HEADING_BODY_GAP`/`BODY_CTA_GAP` gaps, the `VERTICAL_PADDING`
+/// centring band) — no re-derived metric (§4/§6). Generic over the message type
+/// so the file-manager views AND the standalone file picker (which carries its
+/// own `Message`) share the single renderer.
+pub fn empty_state<M: Clone + 'static>(
+    state: mde_theme::EmptyState,
+    on_cta: Option<M>,
+) -> Element<'static, M> {
+    use mde_theme::components::{
+        BODY_CTA_GAP, EMPTY_ICON_SIZE, HEADING_BODY_GAP, VERTICAL_PADDING,
+    };
+    use mde_theme::{IconSize, IconState};
+
+    let mde_theme::EmptyState {
+        icon,
+        heading,
+        body,
+        cta_label,
+        body_color_override,
+    } = state;
+
+    // Body colour: the shape's override (reserved for UX-22 high-contrast
+    // variants) or the muted `text_muted` token the panels use for secondary
+    // copy — a token, never a raw colour (§4).
+    let body_color = body_color_override.map_or(t::FG_FAINT, |c| Color {
+        r: f32::from(c.r) / 255.0,
+        g: f32::from(c.g) / 255.0,
+        b: f32::from(c.b) / 255.0,
+        a: c.a,
+    });
+
+    // Hero icon slot — reserved at the 32 px empty-state tier whether or not an
+    // icon is set, so the block geometry is stable (UX-6/UX-8 swap-in target).
+    let icon_slot: Element<'static, M> = if let Some(ic) = icon {
+        let bytes =
+            mde_theme::mde_icon(ic, IconSize::EmptyState).svg_bytes_for_state(IconState::Idle);
+        svg(svg::Handle::from_memory(bytes))
+            .width(Length::Fixed(EMPTY_ICON_SIZE))
+            .height(Length::Fixed(EMPTY_ICON_SIZE))
+            .sty(move |_t: &Theme| svg::Style {
+                color: Some(t::FG_DIM),
+            })
+            .into()
+    } else {
+        Space::new()
+            .width(Length::Fixed(EMPTY_ICON_SIZE))
+            .height(Length::Fixed(EMPTY_ICON_SIZE))
+            .into()
+    };
+
+    let mut col = column![
+        icon_slot,
+        Space::new().height(Length::Fixed(HEADING_BODY_GAP)),
+        text(heading).size(15).colr(t::FG),
+        Space::new().height(Length::Fixed(HEADING_BODY_GAP)),
+        text(body).size(12).colr(body_color),
+    ]
+    .align_x(cosmic::iced::alignment::Horizontal::Center);
+
+    // CTA — a primary-fill button beneath the body, painted only when the state
+    // is actionable: it carries BOTH a label (the data) AND a handler (supplied
+    // by the call site). An empty state with nothing to act on stays info-only.
+    if let (Some(label), Some(msg)) = (cta_label, on_cta) {
+        col = col.push(Space::new().height(Length::Fixed(BODY_CTA_GAP)));
+        col = col.push(
+            button(text(label).size(12).colr(t::FG))
+                .padding(Padding::from([6.0, 14.0]))
+                .sty(|_t: &Theme, status: button::Status| {
+                    let bg = match status {
+                        button::Status::Hovered => t::PRIMARY_AMBER_BG_HOVER,
+                        _ => t::PRIMARY_AMBER_BG,
+                    };
+                    button::Style {
+                        snap: false,
+                        background: Some(Background::Color(bg)),
+                        text_color: t::FG,
+                        border: Border {
+                            color: t::PRIMARY_AMBER_BORDER,
+                            width: 1.0,
+                            radius: 0.0.into(),
+                        },
+                        ..button::Style::default()
+                    }
+                })
+                .on_press(msg),
+        );
+    }
+
+    // The shared `VERTICAL_PADDING` band centres the block inside the panel
+    // body; `BODY_CTA_GAP` gives the prose breathing room from the edges.
+    container(col)
+        .width(Length::Fill)
+        .padding(Padding::from([VERTICAL_PADDING, BODY_CTA_GAP]))
+        .align_x(cosmic::iced::alignment::Horizontal::Center)
+        .into()
+}
+
+#[cfg(test)]
+mod empty_state_tests {
+    //! POLISH-files-emptystates — the one shared empty-state renderer builds for
+    //! every shape the 7 zero-data call sites construct, and the CTA affordance
+    //! appears iff the state is actionable (label + handler both present).
+    use super::*;
+    use crate::app::Message;
+    use crate::model::View;
+
+    #[test]
+    fn builds_for_info_cta_icon_and_override_variants() {
+        // §7 runtime-reachable — info-only, with a CTA, with/without a hero icon,
+        // and with a body-colour override all produce a valid element.
+        let _: Element<'static, Message> =
+            empty_state(mde_theme::EmptyState::info("Empty", "Nothing here."), None);
+        let _: Element<'static, Message> = empty_state(
+            mde_theme::EmptyState::info("Empty", "Nothing here.")
+                .with_icon(mde_theme::Icon::Folder),
+            None,
+        );
+        let _: Element<'static, Message> = empty_state(
+            mde_theme::EmptyState::with_cta("Empty", "Add one.", "Get started")
+                .with_icon(mde_theme::Icon::Peer),
+            Some(Message::SelectView(View::MeshOverview)),
+        );
+        let mut overridden = mde_theme::EmptyState::info("Failed", "Boom.");
+        overridden.body_color_override = Some(mde_theme::Rgba::rgba(255, 0, 0, 1.0));
+        let _: Element<'static, Message> = empty_state(overridden, None);
+    }
+
+    #[test]
+    fn cta_needs_both_a_label_and_a_handler() {
+        // Route logic — a label with no handler, or a handler with no label,
+        // both stay info-only (no CTA button). Each combination still builds.
+        let _: Element<'static, Message> = empty_state(
+            mde_theme::EmptyState::with_cta("h", "b", "go"),
+            None::<Message>,
+        );
+        let _: Element<'static, Message> = empty_state(
+            mde_theme::EmptyState::info("h", "b"),
+            Some(Message::Refresh),
+        );
+    }
+
+    #[test]
+    fn renderer_is_generic_over_the_message_type() {
+        // The standalone file picker carries its own `Message`; the single
+        // renderer serves it too (compile-asserts the generic bound holds for a
+        // second, unrelated message type).
+        #[derive(Clone)]
+        enum OtherMsg {
+            Go,
+        }
+        let _: Element<'static, OtherMsg> = empty_state(
+            mde_theme::EmptyState::with_cta("h", "b", "go"),
+            Some(OtherMsg::Go),
+        );
+    }
+}
+
 // ─── Generic helpers ───────────────────────────────────────────────────────
 
 /// A coloured square dot — used for status indicators (`.peer-status` in CSS).

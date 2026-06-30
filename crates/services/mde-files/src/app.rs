@@ -6,7 +6,7 @@
 //! is a `cosmic::Application` with a `Core`. The custom titlebar is kept
 //! (Cosmic's headerbar is disabled in `init`).
 
-use crate::cosmic_compat::{ContainerSty, TextSty};
+use crate::cosmic_compat::ContainerSty;
 use cosmic::app::ApplicationExt;
 use cosmic::iced::widget::{column, container, row, scrollable};
 use cosmic::iced::{window, Background, Border, Color, Length, Padding, Task};
@@ -1637,7 +1637,18 @@ impl MdeFiles {
                         rm,
                     )
                 } else {
-                    empty_state("no peer").into()
+                    // Recover from a dead-end (the peer left / went offline since
+                    // the link was followed) through the shared empty state, with a
+                    // CTA back to the mesh overview rather than a bare "no peer".
+                    crate::widgets::empty_state(
+                        mde_theme::EmptyState::with_cta(
+                            "Peer not found",
+                            "This peer isn't in the current mesh roster — it may have left or gone offline.",
+                            "Back to mesh overview",
+                        )
+                        .with_icon(mde_theme::Icon::Peer),
+                        Some(Message::SelectView(View::MeshOverview)),
+                    )
                 }
             }
             View::Downloads => views::downloads(snap, self.layout, metrics, &self.selection, rm),
@@ -2161,30 +2172,6 @@ fn make_unique_dir(dir: &str) {
             return;
         }
     }
-}
-
-fn empty_state(label: &str) -> Element<'static, Message> {
-    container(
-        cosmic::iced::widget::text(label.to_string())
-            .size(12)
-            .colr(t::FG_FAINT),
-    )
-    .padding(Padding::new(56.0))
-    .width(Length::Fill)
-    .sty(|_| container::Style {
-        snap: false,
-        background: Some(Background::Color(Color::TRANSPARENT)),
-        border: Border {
-            color: Color {
-                a: 0.10,
-                ..Color::WHITE
-            },
-            width: 1.0,
-            radius: 0.0.into(),
-        },
-        ..container::Style::default()
-    })
-    .into()
 }
 
 #[cfg(test)]
