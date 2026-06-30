@@ -431,6 +431,11 @@ struct State {
     /// MUSIC-RFX-6b — the open playlist editor's tracks in current order
     /// (the [`Route::Playlist`] detail page). Empty until loaded / off-route.
     playlist_tracks: Vec<library::LibraryItem>,
+    /// POLISH-music-errorretry — a playlist-tracks fetch is in flight. While set,
+    /// the playlist page shows the breathing skeleton instead of falsely claiming
+    /// "This playlist is empty." — the empty line is honest only once the load has
+    /// actually completed (§7: loading is distinct from empty).
+    playlist_loading: bool,
     /// AIR-15.b.4 — maxi tab + the current track's lyrics lines.
     maxi_tab: MaxiTab,
     maxi_lyrics: Vec<String>,
@@ -843,6 +848,7 @@ impl State {
             new_playlist_name: String::new(),
             renaming_playlist: None,
             playlist_tracks: Vec::new(),
+            playlist_loading: false,
             context_menu: None,
             rename_buffer: String::new(),
             maxi_tab: MaxiTab::Queue,
@@ -940,6 +946,13 @@ impl State {
             Route::Podcast(id, _) => {
                 Task::perform(library::fetch_podcast_episodes(id.clone()), to_msg)
             }
+            // POLISH-music-errorretry — the album detail page re-fetches its own
+            // view (not a grid of LibraryItems), so the shared Retry affordance on
+            // an album load failure is live rather than a no-op.
+            Route::Album(id, _) => Task::perform(album::fetch_album(id.clone()), |r| match r {
+                Ok(a) => Message::AlbumLoaded(a),
+                Err(e) => Message::AlbumFailed(e),
+            }),
             _ => Task::none(),
         }
     }
@@ -998,8 +1011,20 @@ impl State {
                 Task::none()
             }
             Message::RetryLoad => {
-                self.load_error = None;
-                self.loading = true;
+                // POLISH-music-errorretry — the one retry entry point for every
+                // browse surface. Reset only the *current* surface's load flags
+                // (so the right error clears and the right skeleton arms), then
+                // re-dispatch via `reload_current`. The album page tracks its own
+                // `album_*` flags; the grid/artist/genre/podcast routes share the
+                // `load_*` pair.
+                if matches!(self.nav.current(), Route::Album(..)) {
+                    self.album = None;
+                    self.album_error = None;
+                    self.album_loading = true;
+                } else {
+                    self.load_error = None;
+                    self.loading = true;
+                }
                 self.reload_current()
             }
             Message::ArtLoaded(id, handle) => {
@@ -1325,6 +1350,11 @@ impl State {
                 if seq != self.search_seq || self.search_query.trim().is_empty() {
                     return Task::none();
                 }
+                // POLISH-music-errorretry — starting a search clears any prior
+                // failure so the in-flight skeleton shows (and a later success is
+                // never shadowed by the stale error). This also makes the search
+                // error block's Retry → re-run-this-query path correct.
+                self.search_error = None;
                 self.searching = true;
                 let query = self.search_query.trim().to_string();
                 Task::perform(search::fetch_search(query), |r| match r {
@@ -1505,12 +1535,18 @@ impl State {
             Message::OpenPlaylist(id, name) => {
                 self.nav.push(Route::Playlist(id.clone(), name));
                 self.playlist_tracks.clear();
+                // POLISH-music-errorretry — mark the fetch in flight so the page
+                // shows a loading skeleton, not the "empty" line, until it lands.
+                self.playlist_loading = true;
                 Task::perform(album::playlist_songs(id), |r| {
                     Message::PlaylistTracksLoaded(r.unwrap_or_default())
                 })
             }
             Message::PlaylistTracksLoaded(tracks) => {
                 self.playlist_tracks = tracks;
+                // The load settled (with tracks, or genuinely empty) — drop the
+                // skeleton so the real list / honest empty state shows.
+                self.playlist_loading = false;
                 Task::none()
             }
             Message::PlaylistMoveUp(idx) => {
@@ -1867,11 +1903,20 @@ impl State {
         if self.form.is_some() || self.maxi_open {
             return false;
         }
+        // POLISH-music-errorretry — the search results overlay sits above whatever
+        // route is behind it, so its loading skeleton breathes whenever a search
+        // fetch is in flight, independent of the route.
+        if self.searching {
+            return true;
+        }
         match self.nav.current() {
             // Home shows the stat/server/chip skeleton until the first batch.
             Route::Hub => self.stats.is_none(),
-            // Album / Playlist pages have their own (text) loading lines.
-            Route::Album(..) | Route::Playlist(..) => false,
+            // POLISH-music-errorretry — the album / playlist detail pages now show
+            // the breathing track-list skeleton while their fetch is in flight
+            // (replacing the old static text line), so arm the ticker for them too.
+            Route::Album(..) => self.album_loading,
+            Route::Playlist(..) => self.playlist_loading,
             // A category grid shows the skeleton tiles while fetching.
             _ => self.loading,
         }
@@ -2669,11 +2714,15 @@ impl State {
                     let fill = self.shimmer.fill(std::time::Instant::now(), &route_pal);
                     col = col.push(skeleton_grid(cols, fill));
                 } else if let Some(err) = &self.load_error {
-                    col = col.push(
-                        text(err.clone())
-                            .size(13)
-                            .colr(carbon(route_pal.danger, 1.0)),
-                    );
+                    // POLISH-music-errorretry — render the failure through the
+                    // shared Carbon LoadState (icon + label + tone) with a live
+                    // Retry wired to RetryLoad, instead of a bare red one-liner.
+                    col = col.push(load_error_block(
+                        load_state_for_error(err),
+                        err,
+                        ListMetrics::carbon_dense(),
+                        Some(Message::RetryLoad),
+                    ));
                 } else if self.items.is_empty() {
                     // BEAUT-MUSIC — a tasteful Carbon empty state (hero glyph +
                     // heading + body) instead of a bare one-liner.
@@ -3113,9 +3162,21 @@ impl State {
             .padding(m.pad)
             .max_width(720);
         if self.searching {
-            col = col.push(text("Searching…").size(m.body));
+            // POLISH-music-errorretry — a breathing list skeleton while the query
+            // runs, the shared Carbon convention, instead of a bare "Searching…".
+            let fill = self
+                .shimmer
+                .fill(std::time::Instant::now(), &mde_theme::Palette::dark());
+            col = col.push(loading_list_skeleton(fill, m, 4));
         } else if let Some(err) = &self.search_error {
-            col = col.push(text(err.clone()).size(m.body));
+            // The search overlay is not a route, so its Retry re-runs the current
+            // query (SearchTick) rather than going through `reload_current`.
+            col = col.push(load_error_block(
+                load_state_for_error(err),
+                err,
+                m,
+                Some(Message::SearchTick(self.search_seq)),
+            ));
         } else if let Some(results) = &self.search_results {
             if results.is_empty() {
                 col = col.push(text("No results.").size(m.body));
@@ -3184,7 +3245,15 @@ impl State {
         .spacing(m.row_gap);
 
         let mut list = column![].spacing(m.row_gap);
-        if self.playlist_tracks.is_empty() {
+        if self.playlist_loading {
+            // POLISH-music-errorretry — tracks are still loading: show the
+            // breathing skeleton, NOT the "empty" line (which would be a lie until
+            // the fetch settles).
+            let fill = self
+                .shimmer
+                .fill(std::time::Instant::now(), &mde_theme::Palette::dark());
+            list = list.push(loading_list_skeleton(fill, m, 6));
+        } else if self.playlist_tracks.is_empty() {
             list = list.push(text("This playlist is empty.").size(m.body));
         }
         let last = self.playlist_tracks.len().saturating_sub(1);
@@ -3226,10 +3295,23 @@ impl State {
 
     fn album_page(&self) -> Element<'_, Message> {
         if self.album_loading {
-            return text("Loading album…").size(13).into();
+            // POLISH-music-errorretry — a breathing header + track-list skeleton
+            // while the album fetches, the shared Carbon convention, instead of a
+            // bare "Loading album…" line.
+            let fill = self
+                .shimmer
+                .fill(std::time::Instant::now(), &mde_theme::Palette::dark());
+            return album_loading_skeleton(fill);
         }
         if let Some(err) = &self.album_error {
-            return text(err.clone()).size(13).into();
+            // POLISH-music-errorretry — shared LoadState failure block with a live
+            // Retry (RetryLoad now re-fetches the album route), not a bare line.
+            return load_error_block(
+                load_state_for_error(err),
+                err,
+                ListMetrics::carbon_dense(),
+                Some(Message::RetryLoad),
+            );
         }
         let Some(a) = &self.album else {
             return text("No album loaded.").size(13).into();
@@ -4063,6 +4145,123 @@ fn skeleton_bar(w: u16, h: u16, fill: mde_theme::Rgba) -> Element<'static, Messa
     skeleton_block(block, fill)
 }
 
+/// POLISH-music-errorretry — a breathing list-loading placeholder: `rows` skeleton
+/// track rows (a short index bar + a fill-width title bar), reusing the shared
+/// [`mde_theme::SkeletonBlock`] / [`mde_theme::SkeletonShimmer`] convention the
+/// grid and Home dashboard already use, for the album / playlist / search loading
+/// states. `fill` is the resolved shimmer tint (static under reduce-motion).
+/// Placeholder bar widths follow the established skeleton geometry convention (the
+/// §4 lint scopes colours + motion, not skeleton px shapes).
+fn loading_list_skeleton(
+    fill: mde_theme::Rgba,
+    m: ListMetrics,
+    rows: usize,
+) -> Element<'static, Message> {
+    let radii = mde_theme::Radii::defaults();
+    let mut col = column![].spacing(m.row_gap);
+    for _ in 0..rows {
+        col = col.push(
+            row![
+                skeleton_block(mde_theme::SkeletonBlock::line(Some(24), radii), fill),
+                skeleton_block(mde_theme::SkeletonBlock::line(None, radii), fill),
+            ]
+            .spacing(m.col_gap),
+        );
+    }
+    col.into()
+}
+
+/// POLISH-music-errorretry — the album detail page's loading placeholder: two
+/// header skeleton bars (title · artist) over the shared track-list skeleton, the
+/// Carbon convention shown while the album fetches. Split out of `album_page` so
+/// the page renderer stays within the readable line budget.
+fn album_loading_skeleton(fill: mde_theme::Rgba) -> Element<'static, Message> {
+    let m = ListMetrics::carbon_dense();
+    let radii = mde_theme::Radii::defaults();
+    column![
+        skeleton_block(mde_theme::SkeletonBlock::line(Some(220), radii), fill),
+        skeleton_block(mde_theme::SkeletonBlock::line(Some(140), radii), fill),
+        Space::new().height(Length::Fixed(f32::from(m.header_gap))),
+        loading_list_skeleton(fill, m, 8),
+    ]
+    .spacing(m.row_gap)
+    .padding(m.pad)
+    .into()
+}
+
+/// POLISH-music-errorretry — classify a daemon/library load-error string onto the
+/// shared [`mde_theme::LoadState`], so every failed surface renders the one Carbon
+/// async-state vocabulary (icon + label + tone) rather than a bare red line. A
+/// connectivity-class failure (daemon/mesh unreachable) is the recoverable
+/// [`mde_theme::LoadState::Offline`] — a cached/empty view waiting to reconnect;
+/// anything else is a terminal [`mde_theme::LoadState::Failed`]. Both report
+/// `can_retry()`, so both surface the Retry affordance. Pure → unit-tested.
+fn load_state_for_error(err: &str) -> mde_theme::LoadState {
+    let e = err.to_ascii_lowercase();
+    let connectivity = e.contains("not responding")
+        || e.contains("unreachable")
+        || e.contains("connection refused")
+        || e.contains("no connection")
+        || e.contains("no route")
+        || e.contains("timed out")
+        || e.contains("timeout")
+        || e.contains("offline");
+    if connectivity {
+        mde_theme::LoadState::Offline
+    } else {
+        mde_theme::LoadState::Failed
+    }
+}
+
+/// POLISH-music-errorretry — the Carbon support colour token for a state's
+/// [`mde_theme::StateTone`]. Tone is the *secondary* cue layered under the icon +
+/// label (the a11y contract: never colour alone); every arm reads a `Palette`
+/// token (§4).
+const fn tone_token(p: &mde_theme::Palette, tone: mde_theme::StateTone) -> mde_theme::Rgba {
+    match tone {
+        mde_theme::StateTone::Neutral => p.text_muted,
+        mde_theme::StateTone::Info => p.accent,
+        mde_theme::StateTone::Warning => p.warning,
+        mde_theme::StateTone::Danger => p.danger,
+        mde_theme::StateTone::Success => p.success,
+    }
+}
+
+/// POLISH-music-errorretry — the shared failed/offline state block used by the
+/// grid, album, and search surfaces: the [`mde_theme::LoadState`] icon + label
+/// (the non-motion a11y pair) in the tone colour, the raw error `detail` beneath,
+/// and a **Retry** button shown only when [`mde_theme::LoadState::can_retry`] AND a
+/// retry message is wired — so it is never a dead control (§7). Centred + padded,
+/// mirroring the empty-state composition. Every colour is an `mde-theme` token (§4).
+fn load_error_block(
+    state: mde_theme::LoadState,
+    detail: &str,
+    m: ListMetrics,
+    retry: Option<Message>,
+) -> Element<'static, Message> {
+    let p = mde_theme::Palette::dark();
+    let tone = carbon(tone_token(&p, state.tone()), 1.0);
+    let mut col = column![
+        text(state.icon().to_string()).size(m.heading).colr(tone),
+        text(state.label()).size(m.body).colr(tone),
+        text(detail.to_string())
+            .size(m.body)
+            .colr(carbon(p.text_muted, 1.0)),
+    ]
+    .spacing(m.row_gap)
+    .align_x(cosmic::iced::Alignment::Center);
+    if let Some(msg) = retry {
+        if state.can_retry() {
+            col = col.push(button(text("Retry").size(m.body)).on_press(msg));
+        }
+    }
+    container(col)
+        .width(Length::Fill)
+        .padding(m.pad)
+        .center_x(Length::Fill)
+        .into()
+}
+
 /// BEAUT-MUSIC — a tasteful Carbon empty state: a muted hero glyph over a
 /// heading + a one-line body, centered, instead of a bare one-liner. Mirrors the
 /// shared `mde_theme::EmptyState` data shape (icon · heading · body) — kept as a
@@ -4173,6 +4372,82 @@ mod empty_state_tests {
         for card in [HubCard::Albums, HubCard::Artists, HubCard::Genres] {
             let (_h, _b, show_create) = empty_state_for(&Route::Category(card));
             assert!(!show_create, "{card:?} must not show a create form");
+        }
+    }
+}
+
+#[cfg(test)]
+mod load_error_tests {
+    use super::load_state_for_error;
+    use mde_theme::LoadState;
+
+    #[test]
+    fn connectivity_errors_classify_as_offline() {
+        // POLISH-music-errorretry — the daemon-not-warm / unreachable family is
+        // the recoverable Offline state (a cached/empty view waiting to reconnect),
+        // not a terminal Failed.
+        for msg in [
+            "daemon not responding",
+            "Connection refused (os error 111)",
+            "host unreachable",
+            "request timed out",
+            "read timeout",
+            "no route to host",
+            "backend OFFLINE",
+        ] {
+            assert_eq!(
+                load_state_for_error(msg),
+                LoadState::Offline,
+                "{msg:?} should classify as Offline"
+            );
+        }
+    }
+
+    #[test]
+    fn other_errors_classify_as_failed() {
+        // A non-connectivity error is a terminal Failed (the request itself was
+        // rejected) — distinct from a transport outage.
+        for msg in [
+            "bad request: unknown verb",
+            "deserialize error: missing field `id`",
+            "permission denied",
+        ] {
+            assert_eq!(
+                load_state_for_error(msg),
+                LoadState::Failed,
+                "{msg:?} should classify as Failed"
+            );
+        }
+    }
+
+    #[test]
+    fn classification_is_case_insensitive() {
+        assert_eq!(
+            load_state_for_error("DAEMON NOT RESPONDING"),
+            LoadState::Offline
+        );
+        assert_eq!(
+            load_state_for_error("TimeOut while reading"),
+            LoadState::Offline
+        );
+    }
+
+    #[test]
+    fn every_classified_error_state_offers_retry() {
+        // The contract behind the shared error block: the error→LoadState logic
+        // only ever yields retryable states (Offline / Failed), so a real load
+        // failure always surfaces the Retry affordance — never a dead-end screen.
+        for msg in [
+            "daemon not responding",
+            "host unreachable",
+            "weird internal error",
+            "",
+        ] {
+            let s = load_state_for_error(msg);
+            assert!(
+                s.can_retry(),
+                "{msg:?} → {s:?} must offer Retry (is_error or recoverable)"
+            );
         }
     }
 }
