@@ -49,6 +49,20 @@ const BEAM_TICK_MS: u64 = 150;
 /// subscription is only armed while [`HubAnim::is_idle`] is `false`, so an idle
 /// Hub (no entrance in flight) costs nothing.
 const ANIM_TICK_MS: u64 = 16;
+/// NOTIFY-REDESIGN-B — the dim floor of the in-call Voice icon's blink: its glyph
+/// alpha breathes between this and full opacity (an opacity channel — there is no
+/// opacity widget in the iced fork — so the floor is never fully dark and the
+/// glyph stays legible through the blink). A wash, like the per-item blink peak.
+const VOICE_BLINK_MIN_ALPHA: f32 = 0.35;
+/// NOTIFY-REDESIGN-B — the Voice/Music icon tile geometry (a compact peer of the
+/// 54/78 px lighthouse `beacon_card`, sized to sit two-up beside the beacon strip).
+/// Component dimensions, not density-scaled — single-sourced here so both cards
+/// share one geometry rather than scattering the literals.
+const VM_ICON_SQUARE_PX: f32 = 48.0;
+/// Base glyph size inside the tile (the pulse scales up from this).
+const VM_ICON_GLYPH_PX: f32 = 22.0;
+/// Full card width (tile + caption column).
+const VM_ICON_CARD_PX: f32 = 56.0;
 
 /// Single-instance guard — dep-free pidfile so re-launching the Action Center
 /// (e.g. the applet bell pressed twice) never STACKS a second full-height
@@ -187,9 +201,121 @@ struct MusicNow {
 struct VoiceStatus {
     registered: bool,
     listening: bool,
-    detail: String,
     /// True when the snapshot's `ts` is within the staleness window (live agent).
     fresh: bool,
+}
+
+/// NOTIFY-REDESIGN-B — the rendered state of the footer **Music** icon, derived
+/// from the live `MusicNow` snapshot. Drives colour + motion + show/hide: a
+/// playing track pulses in the accent, a paused track is static accent, a
+/// present-but-idle daemon greys out, and an absent/offline daemon HIDES the icon
+/// (the lighthouse-footer hide-when-empty convention).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MusicIconState {
+    /// A track is playing — accent, gentle pulse.
+    Playing,
+    /// A track is loaded but paused — accent, static.
+    Paused,
+    /// Daemon present but nothing playing (idle / needs setup) — muted, static.
+    Idle,
+    /// No music daemon reachable — the icon is hidden.
+    Hidden,
+}
+
+impl MusicIconState {
+    /// The §4 palette token the icon's glyph reads in (a present icon is always
+    /// drawn in a token; `Hidden` never renders so its colour is unused).
+    fn token(self, p: &Palette) -> mde_theme::Rgba {
+        match self {
+            MusicIconState::Playing | MusicIconState::Paused => p.accent,
+            MusicIconState::Idle | MusicIconState::Hidden => p.text_muted,
+        }
+    }
+
+    /// `true` only while a track is playing — the single state that animates
+    /// (gentle pulse). Paused/idle are static.
+    fn pulses(self) -> bool {
+        matches!(self, MusicIconState::Playing)
+    }
+}
+
+/// NOTIFY-REDESIGN-B — map the live Now-Playing snapshot to the Music icon's
+/// render state. `None` (no snapshot / daemon down) hides the icon; a present
+/// snapshot greys when idle, shows accent when a track is loaded, and pulses only
+/// while actually playing. Pure + testable.
+fn music_icon_state(music: Option<&MusicNow>) -> MusicIconState {
+    match music {
+        Some(m) if m.active && m.playing => MusicIconState::Playing,
+        Some(m) if m.active => MusicIconState::Paused,
+        Some(_) => MusicIconState::Idle,
+        None => MusicIconState::Hidden,
+    }
+}
+
+/// NOTIFY-REDESIGN-B — the rendered state of the footer **Voice** icon, derived
+/// from the live `VoiceStatus` snapshot. An on-call agent blinks in the accent, a
+/// registered/ready agent shows the ok-tone, a present-but-unregistered agent
+/// greys, and a stale/absent agent HIDES the icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceIconState {
+    /// On a call (the agent is listening) — accent, blink.
+    InCall,
+    /// Registered / ready, not on a call — ok-tone, static.
+    Ready,
+    /// Agent present but not registered — muted, static.
+    Idle,
+    /// No live voice agent — the icon is hidden.
+    Hidden,
+}
+
+impl VoiceIconState {
+    /// The §4 palette token the icon's glyph reads in.
+    fn token(self, p: &Palette) -> mde_theme::Rgba {
+        match self {
+            VoiceIconState::InCall => p.accent,
+            VoiceIconState::Ready => p.success,
+            VoiceIconState::Idle | VoiceIconState::Hidden => p.text_muted,
+        }
+    }
+
+    /// `true` only while on a call — the single state that animates (blink).
+    fn blinks(self) -> bool {
+        matches!(self, VoiceIconState::InCall)
+    }
+}
+
+/// NOTIFY-REDESIGN-B — map the live voice snapshot to the Voice icon's render
+/// state. A stale/absent agent (`None` / `!fresh`) hides the icon; a live agent
+/// blinks while on a call, shows the ok-tone when registered, and greys when
+/// present-but-unregistered. Pure + testable.
+fn voice_icon_state(voice: Option<&VoiceStatus>) -> VoiceIconState {
+    match voice {
+        Some(v) if v.fresh && v.listening => VoiceIconState::InCall,
+        Some(v) if v.fresh && v.registered => VoiceIconState::Ready,
+        Some(v) if v.fresh => VoiceIconState::Idle,
+        _ => VoiceIconState::Hidden,
+    }
+}
+
+/// NOTIFY-REDESIGN-B — the 0..1 loop phase for the ambient Voice/Music icon
+/// motion at lighthouse beam step `beam_step`, over a loop of `period`. It rides
+/// the SAME beam-tick clock the lighthouse beacons sweep on ([`BEAM_TICK_MS`]), so
+/// the footer's two labeled sections animate off one shared motion clock (the
+/// beacon idiom, reused not reforked). `period` is always an `mde_theme::motion`
+/// token, so there is no bespoke beat (§4). Pure + testable.
+fn vm_phase(beam_step: u16, period: std::time::Duration) -> f32 {
+    let period_ms = (period.as_secs_f32() * 1000.0).max(f32::EPSILON);
+    let elapsed_ms = f32::from(beam_step) * BEAM_TICK_MS as f32;
+    ((elapsed_ms % period_ms) / period_ms).clamp(0.0, 1.0)
+}
+
+/// NOTIFY-REDESIGN-B — the in-call Voice blink's glyph alpha at loop `phase`: an
+/// eased ping-pong between [`VOICE_BLINK_MIN_ALPHA`] and full opacity. Reuses the
+/// shared `pulse_scale` ping-pong (`= lerp(1, max, eased-triangle)`); scaling its
+/// `[1, 1/floor]` output by `floor` yields `lerp(floor, 1, eased-triangle)` — the
+/// alpha breathe with no second tween implementation (§6). Pure + testable.
+fn blink_alpha(phase: f32) -> f32 {
+    VOICE_BLINK_MIN_ALPHA * mde_theme::animation::pulse_scale(phase, 1.0 / VOICE_BLINK_MIN_ALPHA)
 }
 
 /// NOTIFY-REDESIGN-A — the two top tabs. The Notifications tab (default) holds
@@ -254,6 +380,11 @@ struct Center {
     /// the shared open-in helper collapses the slide to a pure crossfade (the same
     /// reduce-motion contract `HubAnim` already honors for the per-item motion).
     reduce_motion: bool,
+    /// NOTIFY-REDESIGN-B — whether the Music icon's now-playing popover is open.
+    /// The footer Music ICON replaced the old full-width Now-Playing bar; the
+    /// track + transport now live in this on-demand popover (toggled by clicking
+    /// the icon), so the resting footer stays a compact two-icon strip.
+    music_popover: bool,
 }
 
 impl Center {
@@ -279,7 +410,19 @@ impl Center {
             // slides up on open exactly like the launcher dropdown.
             opened_at: std::time::Instant::now(),
             reduce_motion,
+            music_popover: false,
         }
+    }
+
+    /// NOTIFY-REDESIGN-B — does the footer Voice/Music icon need the ambient
+    /// motion tick? True only when a track is actually playing (the Music pulse)
+    /// or a call is live (the Voice blink), and motion isn't reduced — so an idle
+    /// footer (or a reduce-motion preference) arms no extra tick, exactly like the
+    /// lighthouse beam tick self-disarms on an empty footer (MOTION-PERF-1).
+    fn vm_motion_active(&self) -> bool {
+        !self.reduce_motion
+            && (music_icon_state(self.music.as_ref()).pulses()
+                || voice_icon_state(self.voice.as_ref()).blinks())
     }
 
     /// NOTIFY-FX-1 — the Hub-open transition at `now`, reusing the **same** shared
@@ -377,6 +520,11 @@ enum Message {
     MusicPrev,
     MusicToggle,
     MusicNext,
+    /// NOTIFY-REDESIGN-B — show/hide the Music icon's now-playing popover. NOT a
+    /// transport verb — it only reveals the popover that hosts the reused
+    /// `MusicPrev`/`MusicToggle`/`MusicNext` controls (the compact replacement for
+    /// the removed full-width Now-Playing bar).
+    MusicTogglePopover,
     /// LIGHTHOUSE-3 — advance the beacon beam animation one step.
     BeamTick,
     /// LIGHTHOUSE-3/4 — a lighthouse card was pressed: open the Workbench
@@ -514,11 +662,6 @@ fn fetch_voice() -> Option<VoiceStatus> {
             .get("listening")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
-        detail: v
-            .get("detail")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string(),
         fresh: now.saturating_sub(ts) <= 45,
     })
 }
@@ -690,10 +833,13 @@ fn subscription(s: &Center) -> Subscription<Message> {
         }
         None
     });
-    // LIGHTHOUSE-3 — only animate the beacons when at least one lighthouse is
-    // shown; an empty/idle Hub footer costs no CPU (Q12 "inactive when hidden").
+    // LIGHTHOUSE-3 / NOTIFY-REDESIGN-B — the beam tick drives BOTH the lighthouse
+    // beacon sweep AND the Voice/Music icon pulse/blink (one shared motion clock).
+    // Arm it when at least one lighthouse is shown OR a track is playing / a call
+    // is live; an idle footer (no beacons, nothing playing, no call) costs no CPU
+    // (Q12 "inactive when hidden"; reduce-motion never arms it either).
     let mut subs = vec![poll, esc];
-    if !s.lighthouses.is_empty() {
+    if !s.lighthouses.is_empty() || s.vm_motion_active() {
         subs.push(
             cosmic::iced::time::every(std::time::Duration::from_millis(BEAM_TICK_MS))
                 .map(|_| Message::BeamTick),
@@ -875,6 +1021,12 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
                     state.dnd_active = st.active;
                 }
             }
+        }
+        Message::MusicTogglePopover => {
+            // NOTIFY-REDESIGN-B — flip the now-playing popover open/closed. Pure
+            // UI state; the next `view()` shows/hides the card (only when the
+            // music daemon is actually reachable — see the render gate).
+            state.music_popover = !state.music_popover;
         }
         Message::MusicPrev | Message::MusicToggle | Message::MusicNext => {
             // Resume vs pause depends on the live state; default to resume.
@@ -1175,14 +1327,30 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
         section_divider(p),
         // NOTIFY-REDESIGN-A — the ambient severity strip persists on both tabs.
         severity_strip(&state.items, p),
-        section_divider(p),
-        now_playing_section(state.music.as_ref(), state.now_art.as_ref(), p),
-        section_divider(p),
-        voice_section(state.voice.as_ref(), p),
     ];
-    if !state.lighthouses.is_empty() {
+    // NOTIFY-REDESIGN-B — the Music popover (the compact, on-demand replacement for
+    // the old full-width Now-Playing bar) appears just above the footer when its
+    // icon is toggled open AND the music daemon is reachable.
+    if state.music_popover && music_icon_state(state.music.as_ref()) != MusicIconState::Hidden {
+        sections.push(music_popover_card(
+            state.music.as_ref(),
+            state.now_art.as_ref(),
+            p,
+        ));
+    }
+    // NOTIFY-REDESIGN-B — the combined status footer: "Lighthouses | Voice & Music",
+    // two labeled sections side by side, each hiding when empty (its leading divider
+    // drops with it). Persists on both tabs (rendered outside the scroll).
+    if let Some(footer) = status_footer(
+        &state.lighthouses,
+        state.beam_step,
+        state.music.as_ref(),
+        state.voice.as_ref(),
+        state.reduce_motion,
+        p,
+    ) {
         sections.push(section_divider(p));
-        sections.push(lighthouses_footer(&state.lighthouses, state.beam_step, p));
+        sections.push(footer);
     }
     sections.push(section_divider(p));
     sections.push(quick_actions.into());
@@ -1245,10 +1413,14 @@ fn section_divider(p: Palette) -> Element<'static, Message> {
         .into()
 }
 
-/// NOTIFY-AC / MUSIC-HUB-2 — the "Now Playing" media section, styled to match the
-/// Music app's mini playback bar: a square album-art tile + a title/artist stack
-/// + the transport controls. Honest idle state when nothing is playing.
-fn now_playing_section(
+/// NOTIFY-REDESIGN-B — the Music icon's now-playing **popover**: the compact card
+/// the footer Music icon reveals on click. It carries the same album-art tile +
+/// title/artist + transport (prev / play-pause / next) the removed full-width
+/// Now-Playing bar did — REUSING the `MusicPrev`/`MusicToggle`/`MusicNext`
+/// messages and the decoded cover-art handle — but only on demand, so the resting
+/// footer stays a single compact icon. Honest idle / needs-setup states when
+/// nothing is playing.
+fn music_popover_card(
     music: Option<&MusicNow>,
     art: Option<&cosmic::iced::widget::image::Handle>,
     p: Palette,
@@ -1321,53 +1493,279 @@ fn now_playing_section(
             .color(p.text_muted.into_cosmic_color())
             .into(),
     };
+    // A raised, bordered card so the on-demand popover reads as a surface floating
+    // above the footer rather than another inline section.
     container(body)
         .padding(Padding::from([10u16, 14u16]))
         .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(cosmic::iced::Background::Color(
+                p.raised.into_cosmic_color(),
+            )),
+            border: cosmic::iced::Border {
+                color: p.border.into_cosmic_color(),
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            ..Default::default()
+        })
         .into()
 }
 
-/// NOTIFY-AC — the Voice section: agent registration + listening state.
-fn voice_section(voice: Option<&VoiceStatus>, p: Palette) -> Element<'static, Message> {
-    let (glyph, gcolor, line) = match voice {
-        Some(v) if v.fresh => {
-            let g = if v.listening { "●" } else { "○" };
-            let c = if v.listening {
-                p.success
-            } else if v.registered {
-                p.accent
-            } else {
-                p.text_muted
-            };
-            let detail = if v.detail.is_empty() {
-                if v.registered {
-                    "registered".to_string()
-                } else {
-                    "not registered".to_string()
-                }
-            } else {
-                v.detail.clone()
-            };
-            let listen = if v.listening { " · listening" } else { "" };
-            (g, c, format!("Voice · {detail}{listen}"))
-        }
-        _ => ("○", p.text_muted, "Voice · agent offline".to_string()),
+/// NOTIFY-REDESIGN-B — the footer **Music** icon: a lighthouse-style square (the
+/// `beacon_card` idiom — a bordered tile + a glyph in the state token + a label)
+/// over a "Music" caption. The glyph gently PULSES (size breathe via the shared
+/// `pulse_scale`, riding the beam clock) while a track is playing, is static
+/// accent when paused, and greys when idle. Pressing it toggles the now-playing
+/// popover. Never drawn when `Hidden` — the caller gates that.
+fn music_icon_card(
+    st: MusicIconState,
+    beam_step: u16,
+    reduce_motion: bool,
+    p: Palette,
+) -> Element<'static, Message> {
+    let color = st.token(&p);
+    // Pulse the glyph SIZE (the iced fork has no transform widget); a fixed square
+    // hosts it so the breathe never reflows the row.
+    let glyph_size = if st.pulses() && !reduce_motion {
+        VM_ICON_GLYPH_PX
+            * mde_theme::animation::pulse_scale(
+                vm_phase(beam_step, mde_theme::Motion::notification_pulse().duration),
+                mde_theme::PULSE_MAX_SCALE,
+            )
+    } else {
+        VM_ICON_GLYPH_PX
     };
-    container(
-        row![
-            text(glyph).size(13).color(gcolor.into_cosmic_color()),
-            Space::new().width(Length::Fixed(8.0)),
-            text(line)
-                .size(12)
-                .color(p.text.into_cosmic_color())
-                .width(Length::Fill),
-            action_button("Open", Message::OpenApp("mde-voice-hud"), p),
-        ]
-        .align_y(cosmic::iced::Alignment::Center),
+    vm_icon_card(
+        text("\u{266A}")
+            .size(glyph_size)
+            .color(color.into_cosmic_color())
+            .into(),
+        color,
+        "Music",
+        Message::MusicTogglePopover,
+        p,
     )
-    .padding(Padding::from([10u16, 14u16]))
-    .width(Length::Fill)
-    .into()
+}
+
+/// NOTIFY-REDESIGN-B — the footer **Voice** icon: the same lighthouse-style square
+/// over a "Voice" caption. The glyph BLINKS (accent alpha breathe riding the beam
+/// clock) while on a call, shows the ok-tone when registered/ready, and greys when
+/// idle. A filled dot marks an active agent vs the hollow idle dot (a shape cue, so
+/// state never rests on colour alone — the NOTIFY-STATUS-STRIP a11y rule). Pressing
+/// it opens the Voice HUD (the existing detached-spawn launch idiom). Never drawn
+/// when `Hidden`.
+fn voice_icon_card(
+    st: VoiceIconState,
+    beam_step: u16,
+    reduce_motion: bool,
+    p: Palette,
+) -> Element<'static, Message> {
+    let base = st.token(&p);
+    // Blink the glyph ALPHA (no opacity widget — the alpha rides the glyph colour);
+    // the border keeps the steady token so only the glyph pulses.
+    let glyph_color = if st.blinks() && !reduce_motion {
+        base.with_alpha(blink_alpha(vm_phase(
+            beam_step,
+            mde_theme::Motion::loading().duration,
+        )))
+    } else {
+        base
+    };
+    // Filled dot = a live/registered agent; hollow = idle (the shape cue).
+    let glyph = if matches!(st, VoiceIconState::Idle) {
+        "\u{25CB}" // ○
+    } else {
+        "\u{25CF}" // ●
+    };
+    vm_icon_card(
+        text(glyph)
+            .size(VM_ICON_GLYPH_PX)
+            .color(glyph_color.into_cosmic_color())
+            .into(),
+        base,
+        "Voice",
+        Message::OpenApp("mde-voice-hud"),
+        p,
+    )
+}
+
+/// NOTIFY-REDESIGN-B — the shared shell for a Voice/Music icon card: a bordered
+/// square (border in `border_color`, fill `p.surface`) hosting `glyph`, captioned
+/// with `label`, pressing through to `on_press`. Mirrors `beacon_card` so the two
+/// footer sections read as one family.
+fn vm_icon_card(
+    glyph: Element<'static, Message>,
+    border_color: mde_theme::Rgba,
+    label: &'static str,
+    on_press: Message,
+    p: Palette,
+) -> Element<'static, Message> {
+    let square = container(glyph)
+        .center_x(Length::Fixed(VM_ICON_SQUARE_PX))
+        .center_y(Length::Fixed(VM_ICON_SQUARE_PX))
+        .style(move |_| container::Style {
+            background: Some(cosmic::iced::Background::Color(
+                p.surface.into_cosmic_color(),
+            )),
+            border: cosmic::iced::Border {
+                color: border_color.into_cosmic_color(),
+                width: 2.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        });
+    let body = column![
+        square,
+        text(label).size(10).color(p.text_muted.into_cosmic_color()),
+    ]
+    .spacing(2)
+    .align_x(cosmic::iced::Alignment::Center)
+    .width(Length::Fixed(VM_ICON_CARD_PX));
+    button(body)
+        .on_press(on_press)
+        .style(|_, _| button::Style {
+            background: None,
+            ..Default::default()
+        })
+        .padding(0)
+        .into()
+}
+
+/// NOTIFY-REDESIGN-B — the "Voice & Music" labeled footer block: a heading (a
+/// Carbon SVG via the reused `mde_icon` path + the title) over the two status
+/// icons. Each icon hides independently when its own service is offline; the whole
+/// block is `None` when BOTH are absent (mirrors the lighthouse footer's
+/// hide-when-empty). Returned WITHOUT outer padding so [`status_footer`] can place
+/// it beside the Lighthouses block.
+fn voice_music_inner(
+    music: Option<&MusicNow>,
+    voice: Option<&VoiceStatus>,
+    beam_step: u16,
+    reduce_motion: bool,
+    p: Palette,
+) -> Option<Element<'static, Message>> {
+    let m = music_icon_state(music);
+    let v = voice_icon_state(voice);
+    if m == MusicIconState::Hidden && v == VoiceIconState::Hidden {
+        return None;
+    }
+    let header = row![
+        icon_svg(Icon::Sound, IconSize::Inline, p.text.into_cosmic_color()),
+        Space::new().width(Length::Fixed(8.0)),
+        text("Voice & Music")
+            .size(13)
+            .color(p.text.into_cosmic_color()),
+    ]
+    .align_y(cosmic::iced::Alignment::Center);
+    let mut icons = row![].spacing(10).align_y(cosmic::iced::Alignment::Center);
+    if v != VoiceIconState::Hidden {
+        icons = icons.push(voice_icon_card(v, beam_step, reduce_motion, p));
+    }
+    if m != MusicIconState::Hidden {
+        icons = icons.push(music_icon_card(m, beam_step, reduce_motion, p));
+    }
+    Some(
+        column![header, Space::new().height(Length::Fixed(8.0)), icons]
+            .spacing(0)
+            .into(),
+    )
+}
+
+/// LIGHTHOUSE-3 — the Lighthouses labeled block (header + the horizontally-
+/// scrollable beacon strip), WITHOUT outer padding so [`status_footer`] can place
+/// it beside the Voice & Music block. (Split out of the former `lighthouses_footer`
+/// for the NOTIFY-REDESIGN-B side-by-side footer; the header/strip are unchanged.)
+fn lighthouses_inner(beacons: &[Beacon], beam_step: u16, p: Palette) -> Element<'static, Message> {
+    let (healthy, total) = lighthouse::health_counts(beacons);
+    let count_color = if healthy == total {
+        p.beacon_healthy
+    } else {
+        p.danger
+    };
+    let header = row![
+        icon_svg(
+            Icon::Firewall,
+            IconSize::Inline,
+            count_color.into_cosmic_color()
+        ),
+        Space::new().width(Length::Fixed(8.0)),
+        text("Lighthouses")
+            .size(13)
+            .color(p.text.into_cosmic_color())
+            .width(Length::Fill),
+        text(format!("{healthy}/{total} healthy"))
+            .size(12)
+            .color(count_color.into_cosmic_color()),
+    ]
+    .align_y(cosmic::iced::Alignment::Center);
+
+    let cards: Vec<Element<'static, Message>> = beacons
+        .iter()
+        .map(|b| beacon_card(b, beam_step, p))
+        .collect();
+    let strip = scrollable(row(cards).spacing(10)).direction(
+        cosmic::iced::widget::scrollable::Direction::Horizontal(
+            cosmic::iced::widget::scrollable::Scrollbar::new()
+                .width(4)
+                .scroller_width(4),
+        ),
+    );
+
+    column![header, Space::new().height(Length::Fixed(8.0)), strip,]
+        .spacing(0)
+        .into()
+}
+
+/// NOTIFY-REDESIGN-B — the combined bottom status footer: the Lighthouses block
+/// and the new Voice & Music block rendered as two labeled sections SIDE BY SIDE
+/// ("Lighthouses" | "Voice & Music"), each independently hiding when empty. The
+/// whole footer is `None` when neither has anything to show, so the caller can also
+/// drop its leading divider (the lighthouse-footer hide-when-empty convention,
+/// extended to cover both). Persists on BOTH tabs (rendered outside the scroll).
+fn status_footer(
+    lighthouses: &[Beacon],
+    beam_step: u16,
+    music: Option<&MusicNow>,
+    voice: Option<&VoiceStatus>,
+    reduce_motion: bool,
+    p: Palette,
+) -> Option<Element<'static, Message>> {
+    let lh = (!lighthouses.is_empty()).then(|| lighthouses_inner(lighthouses, beam_step, p));
+    let vm = voice_music_inner(music, voice, beam_step, reduce_motion, p);
+    let body: Element<'static, Message> = match (lh, vm) {
+        (Some(lh), Some(vm)) => row![
+            container(lh).width(Length::FillPortion(3)),
+            vertical_divider(p),
+            container(vm).width(Length::Shrink),
+        ]
+        .spacing(12)
+        .align_y(cosmic::iced::Alignment::Start)
+        .into(),
+        (Some(lh), None) => lh,
+        (None, Some(vm)) => vm,
+        (None, None) => return None,
+    };
+    Some(
+        container(body)
+            .padding(Padding::from([10u16, 14u16]))
+            .width(Length::Fill)
+            .into(),
+    )
+}
+
+/// A thin vertical divider between the two side-by-side footer sections (the
+/// vertical peer of [`section_divider`]).
+fn vertical_divider(p: Palette) -> Element<'static, Message> {
+    container(Space::new().width(Length::Fixed(1.0)).height(Length::Fill))
+        .style(move |_| container::Style {
+            snap: false,
+            background: Some(cosmic::iced::Background::Color(
+                p.border.into_cosmic_color(),
+            )),
+            ..Default::default()
+        })
+        .into()
 }
 
 /// NOTIFY-REDESIGN-A — the Notifications tab body: the bulk actions (mark-all-
@@ -1554,59 +1952,6 @@ fn clip_row(c: &ClipRow, idx: usize, now_ms: i64, p: Palette) -> Element<'static
     .into()
 }
 
-/// A compact transport control button.
-/// LIGHTHOUSE-3 — the pinned Lighthouses footer (Q5): a header (beacon glyph +
-/// "Lighthouses" + live `N/M healthy`, Q8) over a horizontally-scrollable strip
-/// of square beacon cards (Q6/Q7). Colors come only from `mde-theme` tokens
-/// (`beacon_healthy` / `danger`, §4).
-fn lighthouses_footer(beacons: &[Beacon], beam_step: u16, p: Palette) -> Element<'static, Message> {
-    let (healthy, total) = lighthouse::health_counts(beacons);
-    let count_color = if healthy == total {
-        p.beacon_healthy
-    } else {
-        p.danger
-    };
-    // NOTIFY-STATUS-STRIP — a Carbon shield (Material `security`) tinted by the
-    // live health colour replaces the cryptic ◉ fisheye, so the footer reads as a
-    // labeled "shield · Lighthouses · N/M healthy" status indicator. The beacon
-    // cards below keep the SHARED `lighthouse::beam_frame` sweep + each carries the
-    // plain `BeaconStatus::word()` state label, so this stays consistent with the
-    // Workbench Lighthouses tab (not forked).
-    let header = row![
-        icon_svg(
-            Icon::Firewall,
-            IconSize::Inline,
-            count_color.into_cosmic_color()
-        ),
-        Space::new().width(Length::Fixed(8.0)),
-        text("Lighthouses")
-            .size(13)
-            .color(p.text.into_cosmic_color())
-            .width(Length::Fill),
-        text(format!("{healthy}/{total} healthy"))
-            .size(12)
-            .color(count_color.into_cosmic_color()),
-    ]
-    .align_y(cosmic::iced::Alignment::Center);
-
-    let cards: Vec<Element<'static, Message>> = beacons
-        .iter()
-        .map(|b| beacon_card(b, beam_step, p))
-        .collect();
-    let strip = scrollable(row(cards).spacing(10)).direction(
-        cosmic::iced::widget::scrollable::Direction::Horizontal(
-            cosmic::iced::widget::scrollable::Scrollbar::new()
-                .width(4)
-                .scroller_width(4),
-        ),
-    );
-
-    container(column![header, Space::new().height(Length::Fixed(8.0)), strip,].spacing(0))
-        .padding(Padding::from([10u16, 14u16]))
-        .width(Length::Fill)
-        .into()
-}
-
 /// LIGHTHOUSE-3 — one square beacon card: the animated beam square (border in
 /// the status color) over name / overlay IP / status word (Q16). The whole card
 /// presses through to the Workbench Lighthouses tab (Q19).
@@ -1679,6 +2024,7 @@ fn carbon_btn(
     }
 }
 
+/// A compact transport control button (the popover's prev / play-pause / next).
 fn transport_button(glyph: &str, msg: Message, p: Palette) -> Element<'_, Message> {
     button(
         text(glyph.to_string())
@@ -2060,7 +2406,6 @@ mod tests {
         state.voice = Some(VoiceStatus {
             registered: true,
             listening: true,
-            detail: "SENTINEL".into(),
             fresh: true,
         });
         state.clips = vec![ClipRow {
@@ -2083,8 +2428,9 @@ mod tests {
             Some("SENTINEL")
         );
         assert_eq!(
-            state.voice.as_ref().map(|v| v.detail.as_str()),
-            Some("SENTINEL")
+            state.voice.as_ref().map(|v| (v.registered, v.listening)),
+            Some((true, true)),
+            "voice snapshot not refetched inline by Refresh"
         );
         assert_eq!(
             state.clips.len(),
@@ -2249,6 +2595,207 @@ mod tests {
             "reduce-motion open-in must not slide, got {}",
             p.translate_y
         );
+    }
+
+    /// NOTIFY-REDESIGN-B — the Music snapshot maps to the four icon render states:
+    /// hidden when the daemon is absent, muted-idle when present-but-stopped,
+    /// accent-paused with a loaded track, and accent-pulsing while playing.
+    #[test]
+    fn music_icon_state_maps_snapshot_to_render_state() {
+        assert_eq!(music_icon_state(None), MusicIconState::Hidden);
+        // ok:false / inactive → present but idle (greyed), never hidden.
+        assert_eq!(
+            music_icon_state(Some(&MusicNow::default())),
+            MusicIconState::Idle
+        );
+        // needs-setup is still "present but idle" (a configure prompt, not offline).
+        assert_eq!(
+            music_icon_state(Some(&MusicNow {
+                needs_airsonic: true,
+                ..MusicNow::default()
+            })),
+            MusicIconState::Idle
+        );
+        assert_eq!(
+            music_icon_state(Some(&MusicNow {
+                active: true,
+                playing: false,
+                ..MusicNow::default()
+            })),
+            MusicIconState::Paused
+        );
+        assert_eq!(
+            music_icon_state(Some(&MusicNow {
+                active: true,
+                playing: true,
+                ..MusicNow::default()
+            })),
+            MusicIconState::Playing
+        );
+        // Only Playing animates (gentle pulse); paused/idle are static.
+        assert!(MusicIconState::Playing.pulses());
+        assert!(!MusicIconState::Paused.pulses());
+        assert!(!MusicIconState::Idle.pulses());
+    }
+
+    /// NOTIFY-REDESIGN-B — the Voice snapshot maps to the four icon render states:
+    /// hidden when stale/absent, muted-idle when unregistered, ok-tone when
+    /// registered, and accent-blinking while on a call.
+    #[test]
+    fn voice_icon_state_maps_snapshot_to_render_state() {
+        assert_eq!(voice_icon_state(None), VoiceIconState::Hidden);
+        // A stale snapshot (agent offline) hides regardless of its last flags.
+        assert_eq!(
+            voice_icon_state(Some(&VoiceStatus {
+                registered: true,
+                listening: true,
+                fresh: false,
+            })),
+            VoiceIconState::Hidden
+        );
+        assert_eq!(
+            voice_icon_state(Some(&VoiceStatus {
+                fresh: true,
+                ..VoiceStatus::default()
+            })),
+            VoiceIconState::Idle
+        );
+        assert_eq!(
+            voice_icon_state(Some(&VoiceStatus {
+                fresh: true,
+                registered: true,
+                ..VoiceStatus::default()
+            })),
+            VoiceIconState::Ready
+        );
+        assert_eq!(
+            voice_icon_state(Some(&VoiceStatus {
+                fresh: true,
+                registered: true,
+                listening: true,
+            })),
+            VoiceIconState::InCall
+        );
+        // Only an in-call agent animates (blink); ready/idle are static.
+        assert!(VoiceIconState::InCall.blinks());
+        assert!(!VoiceIconState::Ready.blinks());
+        assert!(!VoiceIconState::Idle.blinks());
+    }
+
+    /// NOTIFY-REDESIGN-B — the "Voice & Music" block hides only when BOTH services
+    /// are absent and shows as soon as either is present (the lighthouse-footer
+    /// hide-when-empty convention, applied to the pair).
+    #[test]
+    fn voice_music_section_hides_when_both_absent() {
+        let p = hub_palette();
+        // Both absent → no block.
+        assert!(voice_music_inner(None, None, 0, false, p).is_none());
+        // Music present (idle) → block shows.
+        assert!(voice_music_inner(Some(&MusicNow::default()), None, 0, false, p).is_some());
+        // Voice present (idle) → block shows.
+        let v = VoiceStatus {
+            fresh: true,
+            ..VoiceStatus::default()
+        };
+        assert!(voice_music_inner(None, Some(&v), 0, false, p).is_some());
+    }
+
+    /// NOTIFY-REDESIGN-B — the combined footer renders iff there is at least one
+    /// lighthouse OR a present Voice/Music service; with neither it is `None` so the
+    /// caller drops the whole footer (and its divider).
+    #[test]
+    fn status_footer_shows_only_with_content() {
+        let p = hub_palette();
+        // Nothing at all → no footer.
+        assert!(status_footer(&[], 0, None, None, false, p).is_none());
+        // A lighthouse alone → footer.
+        assert!(status_footer(&[beacon_sentinel()], 0, None, None, false, p).is_some());
+        // Voice/Music alone → footer.
+        assert!(status_footer(&[], 0, Some(&MusicNow::default()), None, false, p).is_some());
+        // Both → footer (the side-by-side case).
+        assert!(status_footer(
+            &[beacon_sentinel()],
+            0,
+            Some(&MusicNow::default()),
+            None,
+            false,
+            p
+        )
+        .is_some());
+    }
+
+    /// NOTIFY-REDESIGN-B — the shared beam-clock phase stays in `[0,1]` and advances
+    /// with the beam step over a motion-token loop.
+    #[test]
+    fn vm_phase_is_bounded_and_advances() {
+        let period = mde_theme::Motion::notification_pulse().duration;
+        for step in 0..512u16 {
+            let ph = vm_phase(step, period);
+            assert!(
+                (0.0..=1.0).contains(&ph),
+                "phase {ph} out of range at step {step}"
+            );
+        }
+        // Phase 0 at step 0; strictly grows over the first step (period ≫ tick).
+        assert!(vm_phase(0, period).abs() < 1e-6);
+        assert!(vm_phase(1, period) > vm_phase(0, period));
+    }
+
+    /// NOTIFY-REDESIGN-B — the in-call blink alpha breathes between the dim floor
+    /// and full opacity (floor at the endpoints, ~1.0 at mid), never out of range.
+    #[test]
+    fn blink_alpha_breathes_between_floor_and_full() {
+        assert!((blink_alpha(0.0) - VOICE_BLINK_MIN_ALPHA).abs() < 1e-3);
+        assert!((blink_alpha(1.0) - VOICE_BLINK_MIN_ALPHA).abs() < 1e-3);
+        assert!((blink_alpha(0.5) - 1.0).abs() < 1e-3);
+        for i in 0..=20 {
+            let a = blink_alpha(i as f32 / 20.0);
+            assert!(
+                (VOICE_BLINK_MIN_ALPHA - 1e-3..=1.0 + 1e-3).contains(&a),
+                "alpha {a} out of [floor,1]"
+            );
+        }
+    }
+
+    /// NOTIFY-REDESIGN-B — clicking the Music icon toggles the now-playing popover
+    /// open/closed (the compact replacement for the removed full-width bar).
+    #[test]
+    fn music_popover_toggles() {
+        let mut state = Center::new();
+        assert!(!state.music_popover, "popover starts closed");
+        let _ = update(&mut state, Message::MusicTogglePopover);
+        assert!(state.music_popover);
+        let _ = update(&mut state, Message::MusicTogglePopover);
+        assert!(!state.music_popover);
+    }
+
+    /// NOTIFY-REDESIGN-B — the footer + popover render paths build without panic: a
+    /// playing track + a live call + a lighthouse (the side-by-side footer with both
+    /// motion states active) and the open Music popover, in full motion AND under
+    /// reduce-motion (static icons).
+    #[test]
+    fn view_renders_voice_music_footer_and_popover() {
+        let mut state = Center::new();
+        state.music = Some(MusicNow {
+            active: true,
+            playing: true,
+            title: "Song".into(),
+            artist: "Artist".into(),
+            audio_available: true,
+            ..MusicNow::default()
+        });
+        state.voice = Some(VoiceStatus {
+            fresh: true,
+            registered: true,
+            listening: true,
+        });
+        state.lighthouses = vec![beacon_sentinel()];
+        state.beam_step = 7;
+        state.music_popover = true;
+        let _ = view(&state, window::Id::unique());
+        // Under reduce-motion the icons are static, but the view must still build.
+        state.reduce_motion = true;
+        let _ = view(&state, window::Id::unique());
     }
 
     #[test]
