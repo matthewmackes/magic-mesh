@@ -1,27 +1,21 @@
-//! NOTIFY-HUB-2 — the Notification Hub's motion + same-source stacking.
+//! NOTIFY-HUB-2 — the Notification Hub's per-item entrance motion.
 //!
-//! Two self-contained pieces, both pure + unit-tested, driven by the Hub's
-//! `subscription` tick (no toolkit dep in here — the bin's `view` reads these
-//! and applies the offsets/tints to its themed widgets):
+//! [`HubAnim`] — the per-item motion state machine, pure + unit-tested and driven
+//! by the Hub's `subscription` tick (no toolkit dep in here — the bin's `view`
+//! reads it and applies the offsets/tints to its themed widgets): a freshly-
+//! arrived item **slides in from the right** and **blinks 2× in its severity
+//! colour**, while the items already on screen **slide down** to make room. Built
+//! on the shared `mde_theme::animation` tweens + the Carbon `mde_theme::motion`
+//! duration grid (no scattered timing literals — §4).
 //!
-//!   * [`collapse_stacks`] — same-source **and** same-title repeats collapse to
-//!     one card carrying a repeat `count`, expandable on demand. This is the
-//!     "stack" axis the design asks for (`group_items` already buckets by
-//!     `Source`; this folds the duplicate *runs* inside a bucket).
-//!   * [`HubAnim`] — the per-item motion state machine: a freshly-arrived item
-//!     **slides in from the right** and **blinks 2× in its severity colour**,
-//!     while the items already on screen **slide down** to make room. Built on
-//!     the shared `mde_theme::animation` tweens + the Carbon `mde_theme::motion`
-//!     duration grid (no scattered timing literals — §4); a later follow-up
-//!     (MOTION-INFRA-2) consolidates onto the shared shell helpers.
-//!
-//! Self-contained so it lands without depending on a sibling agent's unmerged
-//! `mde-theme` motion-helper branch (different files → no conflict).
+//! NOTIFY-REDESIGN-A — the same-source stacking that used to live here is gone
+//! (the Hub now renders one flat, chronological list); only the per-item motion,
+//! which works identically on a flat list keyed by item id, remains.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
-use mde_notify::{AlertItem, Severity, Source};
+use mde_notify::Severity;
 use mde_theme::animation::{ease, lerp_f32, Tween};
 use mde_theme::motion::{Easing, DURATION_MODERATE_02};
 
@@ -47,75 +41,6 @@ pub const BLINK_PEAK_ALPHA: f32 = 0.45;
 /// `BLINK_COUNT` beats long, and the slide finishes within the first.
 fn blink_beat() -> std::time::Duration {
     DURATION_MODERATE_02
-}
-
-/// A collapsed stack of same-source + same-title notifications: the newest item
-/// stands in for the run, with `count` total repeats. `count == 1` is a plain
-/// single card; `count > 1` renders as one card with a "×N" badge, expandable
-/// to reveal the individual repeats.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Stack {
-    /// The representative (newest) item — drives the card's title/severity/age.
-    pub head: AlertItem,
-    /// Every item in the stack, newest-first (`head` is `items[0]`). Shown when
-    /// the stack is expanded.
-    pub items: Vec<AlertItem>,
-    /// Stable key (source label + title) — the expand/collapse toggle id and
-    /// the dedup axis.
-    pub key: String,
-}
-
-impl Stack {
-    /// Repeat count — `1` for a lone notification, `>1` for a collapsed run.
-    #[must_use]
-    pub fn count(&self) -> usize {
-        self.items.len()
-    }
-
-    /// `true` when this stack folds more than one notification (renders the
-    /// count badge + is expandable).
-    #[must_use]
-    pub fn is_stacked(&self) -> bool {
-        self.items.len() > 1
-    }
-}
-
-/// The stable stack key for an item: its source group + its title. Same source
-/// **and** same title ⇒ the same stack (e.g. a flapping peer re-emitting
-/// "offline" collapses to one card with a count instead of N identical rows).
-#[must_use]
-pub fn stack_key(source: &Source, title: &str) -> String {
-    format!("{}\u{1f}{title}", source.label())
-}
-
-/// Collapse a source group's items (already newest-first, as `group_items`
-/// yields) into [`Stack`]s. Consecutive **and** non-consecutive repeats of the
-/// same `(source, title)` fold into one stack; first-seen order of the *heads*
-/// is preserved so the newest distinct alert stays on top. Pure + testable.
-#[must_use]
-pub fn collapse_stacks(items: &[AlertItem]) -> Vec<Stack> {
-    let mut order: Vec<String> = Vec::new();
-    let mut by_key: HashMap<String, Stack> = HashMap::new();
-    for it in items {
-        let key = stack_key(&it.source, &it.title);
-        if let Some(stack) = by_key.get_mut(&key) {
-            stack.items.push(it.clone());
-        } else {
-            order.push(key.clone());
-            by_key.insert(
-                key.clone(),
-                Stack {
-                    head: it.clone(),
-                    items: vec![it.clone()],
-                    key,
-                },
-            );
-        }
-    }
-    order
-        .into_iter()
-        .filter_map(|k| by_key.remove(&k))
-        .collect()
 }
 
 /// Per-card render motion at the current instant: how far the card is still
@@ -302,94 +227,6 @@ pub fn blink_tint(severity: Severity, palette: &mde_theme::Palette, alpha: f32) 
 mod tests {
     use super::*;
     use std::time::Duration;
-
-    fn item(id: &str, src: Source, sev: Severity, title: &str, ts: i64) -> AlertItem {
-        AlertItem {
-            id: id.into(),
-            ts_unix_ms: ts,
-            severity: sev,
-            source: src,
-            topic: "t".into(),
-            host: None,
-            title: title.into(),
-            body: String::new(),
-            read: false,
-        }
-    }
-
-    // ── collapse / stack logic ──────────────────────────────────────────
-
-    #[test]
-    fn distinct_titles_do_not_collapse() {
-        let items = vec![
-            item("a", Source::System, Severity::Info, "disk low", 30),
-            item("b", Source::System, Severity::Warning, "cpu hot", 20),
-        ];
-        let stacks = collapse_stacks(&items);
-        assert_eq!(stacks.len(), 2);
-        assert!(stacks.iter().all(|s| !s.is_stacked()));
-        assert!(stacks.iter().all(|s| s.count() == 1));
-    }
-
-    #[test]
-    fn same_source_same_title_repeats_collapse_with_a_count() {
-        // The core acceptance: same-source repeats collapse to one card + a count.
-        let items = vec![
-            item("c", Source::Security, Severity::Critical, "csr denied", 30),
-            item("b", Source::Security, Severity::Critical, "csr denied", 20),
-            item("a", Source::Security, Severity::Critical, "csr denied", 10),
-        ];
-        let stacks = collapse_stacks(&items);
-        assert_eq!(stacks.len(), 1, "three repeats fold to one card");
-        assert_eq!(stacks[0].count(), 3);
-        assert!(stacks[0].is_stacked());
-        // The head is the newest (first in the newest-first input).
-        assert_eq!(stacks[0].head.id, "c");
-        // Every repeat is retained for the expanded view, newest-first.
-        let ids: Vec<&str> = stacks[0].items.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, ["c", "b", "a"]);
-    }
-
-    #[test]
-    fn same_title_different_source_stays_separate() {
-        // Stacking is keyed on source AND title — only true duplicates fold.
-        let items = vec![
-            item("a", Source::Security, Severity::Warning, "offline", 20),
-            item(
-                "b",
-                Source::Peer("eagle".into()),
-                Severity::Warning,
-                "offline",
-                10,
-            ),
-        ];
-        let stacks = collapse_stacks(&items);
-        assert_eq!(stacks.len(), 2, "different sources never merge");
-    }
-
-    #[test]
-    fn non_adjacent_repeats_still_collapse_and_keep_head_order() {
-        // A→B→A interleave: the two A's fold; B keeps its own card; head order
-        // follows first appearance (A before B).
-        let items = vec![
-            item("a1", Source::System, Severity::Info, "ping", 30),
-            item("b1", Source::System, Severity::Info, "pong", 20),
-            item("a2", Source::System, Severity::Info, "ping", 10),
-        ];
-        let stacks = collapse_stacks(&items);
-        assert_eq!(stacks.len(), 2);
-        assert_eq!(stacks[0].key, stack_key(&Source::System, "ping"));
-        assert_eq!(stacks[0].count(), 2);
-        assert_eq!(stacks[1].key, stack_key(&Source::System, "pong"));
-        assert_eq!(stacks[1].count(), 1);
-    }
-
-    #[test]
-    fn empty_input_yields_no_stacks() {
-        assert!(collapse_stacks(&[]).is_empty());
-    }
-
-    // ── motion state machine ────────────────────────────────────────────
 
     #[test]
     fn new_item_slides_in_from_the_right_and_settles() {

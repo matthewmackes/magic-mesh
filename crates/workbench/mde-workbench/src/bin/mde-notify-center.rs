@@ -25,10 +25,10 @@ use cosmic::iced::platform_specific::shell::commands::layer_surface::{
 use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
 use cosmic::iced::{window, Element, Length, Padding, Subscription, Task, Theme};
 use mackes_mesh_types::lighthouse::{self, Beacon};
-use mde_notify::{severity_token, AlertItem, AlertTail, Severity, Source};
+use mde_notify::{severity_token, AlertItem, AlertTail, Severity};
 use mde_theme::{mde_icon, Icon, IconSize, Palette};
 
-use motion::{collapse_stacks, HubAnim, Stack};
+use motion::HubAnim;
 // World-2 (raw `cosmic::iced`) layer-shell daemon — use the iced widgets +
 // raw `.color()` directly; only borrow the Rgba→Color conversion shim (the
 // `.colr`/`.sty` extensions are world-1 `cosmic::Theme`-bound and don't apply).
@@ -192,11 +192,23 @@ struct VoiceStatus {
     fresh: bool,
 }
 
+/// NOTIFY-REDESIGN-A — the two top tabs. The Notifications tab (default) holds
+/// the flat alert list; the Clipboard tab holds the mesh clipboard viewer. The
+/// status footer renders under both, regardless of which tab is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Tab {
+    #[default]
+    Notifications,
+    Clipboard,
+}
+
 struct Center {
     items: Vec<AlertItem>,
     tail: AlertTail,
-    /// Source-group labels the operator collapsed.
-    collapsed: HashSet<String>,
+    /// NOTIFY-REDESIGN-A — the active top tab. Switching it changes only the
+    /// scrollable content; the status footer (severity strip + lighthouses)
+    /// stays rendered on both.
+    tab: Tab,
     /// NOTIFY-AC — Now-Playing snapshot (`None` until first poll / music idle).
     music: Option<MusicNow>,
     /// NOTIFY-AC — voice agent snapshot (`None` when no agent has published).
@@ -229,9 +241,6 @@ struct Center {
     /// NOTIFY-HUB-2 — every item id ever surfaced, so a `Refresh` can tell which
     /// rows are *new* (and thus animate in) vs. already on screen.
     seen_ids: HashSet<String>,
-    /// NOTIFY-HUB-2 — collapsed same-source stacks the operator has expanded (by
-    /// [`Stack::key`]); a stack not in here renders folded with its count badge.
-    expanded_stacks: HashSet<String>,
     /// CLIP-VIEW-1 — the mesh-global clipboard history (newest first), refreshed
     /// each poll from `action/clipboard/list`. Empty until the first list reply /
     /// when the daemon is down. Each row renders as text + source-node + age, is
@@ -253,7 +262,7 @@ impl Center {
         Self {
             items: Vec::new(),
             tail: AlertTail::default(),
-            collapsed: HashSet::new(),
+            tab: Tab::default(),
             music: None,
             voice: None,
             dnd_active: false,
@@ -264,7 +273,6 @@ impl Center {
             now_art_id: None,
             anim: HubAnim::new(reduce_motion),
             seen_ids: HashSet::new(),
-            expanded_stacks: HashSet::new(),
             clips: Vec::new(),
             // NOTIFY-FX-1 — the open-in clock starts the moment the Center is
             // constructed (the layer surface is mapped right after), so the Hub
@@ -350,10 +358,8 @@ enum Message {
     /// NOTIFY-RENDER-LAG-1 — cover art for `cover_id` finished decoding off-thread
     /// (gated: only fetched AFTER `MusicLoaded`, never on the first frame).
     CoverArtLoaded(String, Option<cosmic::iced::widget::image::Handle>),
-    /// Collapse/expand a source group by its label.
-    ToggleGroup(String),
-    /// NOTIFY-HUB-2 — expand/collapse a same-source stack by its [`Stack::key`].
-    ToggleStack(String),
+    /// NOTIFY-REDESIGN-A — switch the active top tab (Notifications / Clipboard).
+    SwitchTab(Tab),
     /// NOTIFY-HUB-2 — advance the new-item slide/blink animation one frame.
     AnimTick,
     /// Acknowledge every alert.
@@ -843,11 +849,7 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             // Drop finished entrances; the subscription self-stops once idle.
             state.anim.gc(std::time::Instant::now());
         }
-        Message::ToggleStack(key) => {
-            if !state.expanded_stacks.remove(&key) {
-                state.expanded_stacks.insert(key);
-            }
-        }
+        Message::SwitchTab(tab) => state.tab = tab,
         Message::BeamTick => {
             state.beam_step = state.beam_step.wrapping_add(1);
         }
@@ -925,11 +927,6 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
             // Mesh-wide clear of unpinned entries; pinned survive everywhere.
             state.clips = clip_mutate("clear", None);
         }
-        Message::ToggleGroup(label) => {
-            if !state.collapsed.remove(&label) {
-                state.collapsed.insert(label);
-            }
-        }
         Message::MarkAllRead => {
             for it in &mut state.items {
                 it.read = true;
@@ -951,46 +948,18 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
     Task::none()
 }
 
-/// Source render order (stable group ordering, matching the design).
-fn source_rank(s: &Source) -> u8 {
-    match s {
-        Source::Security => 0,
-        Source::Firewall => 1,
-        Source::Presence => 2,
-        Source::Compute => 3,
-        Source::Peer(_) => 4,
-        Source::DesktopApp => 5,
-        Source::System => 6,
-    }
-}
-
-/// Group items by source (stable order), items within a group newest-first.
-/// Pure + testable.
+/// NOTIFY-REDESIGN-A — the flat, chronological (newest-first) alert list. The
+/// redesign drops the per-source grouping AND the same-source stacking, so the
+/// Hub shows ONE time-ordered stream; source identity moves to the (later)
+/// click-opened detail viewer. Sorting here (rather than relying on the insert
+/// order, which differs between the local tail and the shared-merge paths)
+/// guarantees a stable newest-first order whatever the merge route. Pure +
+/// testable.
 #[must_use]
-pub fn group_items(items: &[AlertItem]) -> Vec<(Source, Vec<AlertItem>)> {
-    let mut groups: Vec<(Source, Vec<AlertItem>)> = Vec::new();
-    for it in items {
-        if let Some(g) = groups.iter_mut().find(|(s, _)| *s == it.source) {
-            g.1.push(it.clone());
-        } else {
-            groups.push((it.source.clone(), vec![it.clone()]));
-        }
-    }
-    for (_, v) in &mut groups {
-        v.sort_by(|a, b| b.ts_unix_ms.cmp(&a.ts_unix_ms));
-    }
-    groups.sort_by_key(|(s, _)| source_rank(s));
-    groups
-}
-
-/// The highest (most-severe) severity in a group — drives the group accent.
-#[must_use]
-pub fn group_severity(items: &[AlertItem]) -> Severity {
-    items
-        .iter()
-        .map(|i| i.severity)
-        .min()
-        .unwrap_or(Severity::Info)
+pub fn flat_newest_first(items: &[AlertItem]) -> Vec<AlertItem> {
+    let mut v = items.to_vec();
+    v.sort_by(|a, b| b.ts_unix_ms.cmp(&a.ts_unix_ms));
+    v
 }
 
 /// NOTIFY-STATUS-STRIP — render a Carbon (Material Symbols) icon as a tinted SVG
@@ -1027,31 +996,58 @@ fn severity_icon(s: Severity) -> Icon {
     }
 }
 
-/// NOTIFY-STATUS-STRIP — the plain-language severity word shown beside the icon
-/// in the group header so the indicator is self-describing (paired with
-/// [`severity_icon`] for the never-colour-alone rule). Pure + testable.
-fn severity_label(s: Severity) -> &'static str {
-    match s {
-        Severity::Critical => "Critical",
-        Severity::Warning => "Warning",
-        Severity::Info => "Info",
-        Severity::Success => "OK",
+/// NOTIFY-REDESIGN-A — the ambient severity strip in the status footer: a compact
+/// per-severity tally (shape-distinct Carbon status icon + a count) over the
+/// alerts currently held, most-severe first. It is rendered OUTSIDE the tab-
+/// switched scroll area, so the mesh's alert posture stays visible on BOTH tabs
+/// (the operator sees it while on the Clipboard tab). The shape-distinct icons
+/// carry severity without relying on colour (a11y, the NOTIFY-STATUS-STRIP rule);
+/// an empty hub shows an honest "All clear" rather than a blank strip.
+fn severity_strip(items: &[AlertItem], p: Palette) -> Element<'static, Message> {
+    let mut strip = row![].spacing(14).align_y(cosmic::iced::Alignment::Center);
+    let mut any = false;
+    for s in [
+        Severity::Critical,
+        Severity::Warning,
+        Severity::Info,
+        Severity::Success,
+    ] {
+        let n = items.iter().filter(|i| i.severity == s).count();
+        if n == 0 {
+            continue;
+        }
+        any = true;
+        let color = severity_token(s, &p).into_cosmic_color();
+        strip = strip.push(
+            row![
+                icon_svg(severity_icon(s), IconSize::Inline, color),
+                Space::new().width(Length::Fixed(4.0)),
+                text(n.to_string()).size(12).color(color),
+            ]
+            .align_y(cosmic::iced::Alignment::Center),
+        );
     }
-}
-
-/// NOTIFY-STATUS-STRIP — the labeled severity indicator: a shape-distinct Carbon
-/// status icon + its plain-language word, both in the severity token colour. Used
-/// where the severity was a bare colour-coded glyph (the group-card accent) so
-/// the meaning is carried by icon-shape + text, never colour alone.
-fn severity_indicator(s: Severity, p: Palette) -> Element<'static, Message> {
-    let color = severity_token(s, &p).into_cosmic_color();
-    row![
-        icon_svg(severity_icon(s), IconSize::Inline, color),
-        Space::new().width(Length::Fixed(6.0)),
-        text(severity_label(s)).size(12).color(color),
-    ]
-    .align_y(cosmic::iced::Alignment::Center)
-    .into()
+    let body: Element<'static, Message> = if any {
+        strip.into()
+    } else {
+        row![
+            icon_svg(
+                severity_icon(Severity::Success),
+                IconSize::Inline,
+                severity_token(Severity::Success, &p).into_cosmic_color(),
+            ),
+            Space::new().width(Length::Fixed(6.0)),
+            text("All clear")
+                .size(12)
+                .color(p.text_muted.into_cosmic_color()),
+        ]
+        .align_y(cosmic::iced::Alignment::Center)
+        .into()
+    };
+    container(body)
+        .padding(Padding::from([10u16, 14u16]))
+        .width(Length::Fill)
+        .into()
 }
 
 /// Compact "Nm ago" age. Pure + testable.
@@ -1076,15 +1072,21 @@ fn now_ms() -> i64 {
 }
 
 fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
-    let p = hub_palette();
+    // One prefs load per frame (as the prior `hub_palette()` did), now also
+    // yielding the density-scaled spacing + radii tokens the segmented tab bar
+    // reads — so the new control carries no scattered metric literals (§4).
+    let prefs = mde_theme::Preferences::load();
+    let p = Palette::for_theme(prefs.theme);
+    let space = mde_theme::Space::for_density(prefs.density);
+    let radii = mde_theme::Radii::defaults();
     let now = now_ms();
     // NOTIFY-HUB-2 — single clock read for this frame's slide/blink sampling.
     let anim_now = std::time::Instant::now();
 
-    // Header: title + close on the top line, the bulk actions on their own
-    // line below so a long "· N unread" title never collides with the buttons
-    // (the panel is only ~390px wide). Generous top/side padding so nothing is
-    // jammed against the window edge.
+    // Header: the Carbon bell + title + "· N unread" + Close on one line; the
+    // bulk actions (mark-all-read / clear-all) now live on the Notifications tab,
+    // and the segmented tabs sit just below this header. Generous top/side
+    // padding so nothing is jammed against the window edge.
     let unread = state.items.iter().filter(|i| !i.read).count();
     // NOTIFY-STATUS-STRIP — a wide, welcoming header indicator: the Carbon
     // notification bell (a real Material SVG, not a cryptic glyph) + the title in
@@ -1109,87 +1111,20 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
         action_button("✕", Message::Close, p),
     ]
     .align_y(cosmic::iced::Alignment::Center);
-    let actions = row![
-        action_button("Mark all read", Message::MarkAllRead, p),
-        Space::new().width(Length::Fixed(8.0)),
-        action_button("Clear all", Message::ClearAll, p),
-    ];
-    let header = column![title_row, actions].spacing(10);
+    // NOTIFY-REDESIGN-A — the segmented/pill tabs sit directly under the header.
+    // The tab switches ONLY the scrollable content below; the status footer is
+    // rendered outside it (see the sections vec), so it persists on both tabs.
+    let tabs = tab_bar(state.tab, p, space, radii);
 
-    let mut body = column![header, Space::new().height(Length::Fixed(12.0))]
-        .spacing(8)
-        .padding(Padding::from([14u16, 16u16]));
-
-    if state.items.is_empty() {
-        body = body.push(
-            text("No alerts.")
-                .size(13)
-                .color(p.text_muted.into_cosmic_color()),
-        );
-    } else {
-        for (source, group) in group_items(&state.items) {
-            let label = source.label();
-            let collapsed = state.collapsed.contains(&label);
-            let caret = if collapsed { "▸" } else { "▾" };
-            // Group header — clickable to toggle. The trailing severity indicator
-            // is now a Carbon status icon + plain word (NOTIFY-STATUS-STRIP), so
-            // the group's severity is never carried by colour alone.
-            let head = button(
-                row![
-                    text(caret).size(12).color(p.text_muted.into_cosmic_color()),
-                    Space::new().width(Length::Fixed(6.0)),
-                    text(format!("{label} ({})", group.len()))
-                        .size(13)
-                        .color(p.text.into_cosmic_color()),
-                    Space::new().width(Length::Fill),
-                    severity_indicator(group_severity(&group), p),
-                ]
-                .align_y(cosmic::iced::Alignment::Center),
-            )
-            .on_press(Message::ToggleGroup(label.clone()))
-            .width(Length::Fill)
-            // Flat: a section-header toggle, not a chrome button (no blue box).
-            .style(|_t, _s| cosmic::iced::widget::button::Style {
-                background: None,
-                ..Default::default()
-            });
-            body = body.push(head);
-            if !collapsed {
-                // NOTIFY-HUB-2 — fold same-source + same-title repeats into one
-                // card carrying a count (expandable), then render each stack with
-                // its slide/blink motion.
-                for (i, stack) in collapse_stacks(&group).into_iter().enumerate() {
-                    let expanded = state.expanded_stacks.contains(&stack.key);
-                    body = body.push(stack_card(
-                        &stack,
-                        expanded,
-                        i,
-                        now,
-                        anim_now,
-                        &state.anim,
-                        p,
-                    ));
-                    // Expanded stack: show the individual repeats beneath the head
-                    // (the head is items[0], so the rest start at index 1).
-                    if expanded && stack.is_stacked() {
-                        for (j, item) in stack.items.iter().enumerate().skip(1) {
-                            body = body.push(stack_child_row(
-                                item,
-                                i + j,
-                                now,
-                                anim_now,
-                                &state.anim,
-                                p,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+    // The active tab's scrollable content. Each tab owns its own actions (the
+    // notifications mark-all/clear-all; the clipboard clear-all) and its own
+    // honest empty state.
+    let tab_content: Element<'_, Message> = match state.tab {
+        Tab::Notifications => notifications_tab(&state.items, anim_now, &state.anim, p),
+        Tab::Clipboard => clipboard_tab(&state.clips, now, p),
+    };
     let scroll = scrollable(
-        container(body)
+        container(tab_content)
             .padding(Padding::from([12u16, 14u16]))
             .width(Length::Fill),
     );
@@ -1230,10 +1165,16 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     // quick-actions + app launchers. Built as a vec so the footer + its divider
     // appear only when there is something to show.
     let mut sections: Vec<Element<'_, Message>> = vec![
+        // Header (Carbon bell + title + unread + Close) and the tabs stay pinned
+        // at the top — they don't scroll with the list.
+        column![title_row, tabs]
+            .spacing(8)
+            .padding(Padding::from([14u16, 16u16]))
+            .into(),
         container(scroll).height(Length::Fill).into(),
         section_divider(p),
-        // CLIP-VIEW-1 — Clipboard Viewer, locked above Music + SIP.
-        clipboard_section(&state.clips, now, p),
+        // NOTIFY-REDESIGN-A — the ambient severity strip persists on both tabs.
+        severity_strip(&state.items, p),
         section_divider(p),
         now_playing_section(state.music.as_ref(), state.now_art.as_ref(), p),
         section_divider(p),
@@ -1429,65 +1370,111 @@ fn voice_section(voice: Option<&VoiceStatus>, p: Palette) -> Element<'static, Me
     .into()
 }
 
-/// CLIP-VIEW-1 — the Clipboard Viewer section: a header (clipboard glyph +
-/// "Clipboard" + a mesh-wide "Clear all" that wipes unpinned entries) over the
-/// mesh-global history rows. Each row is click-to-copy onto THIS node, with a
-/// per-entry pin (★ toggle, exempt from the 50-cap) + delete (✕). Capped to a
-/// handful of visible rows so the section stays compact in the Hub column; the
-/// full history lives in the shared file. Empty state is honest.
-///
-/// `now_ms` is the frame clock in milliseconds — the same epoch-ms clock the
-/// notifications list passes to [`format_age`], so the clipboard ages read off
-/// the same bucket ladder.
-fn clipboard_section(clips: &[ClipRow], now_ms: i64, p: Palette) -> Element<'static, Message> {
-    /// Rows shown inline in the Hub (the rest stay in the shared history).
-    const VISIBLE_ROWS: usize = 6;
+/// NOTIFY-REDESIGN-A — the Notifications tab body: the bulk actions (mark-all-
+/// read / clear-all, kept working here on the Notifications tab) over the flat
+/// newest-first message list, or an honest empty state. Each row is message-first
+/// (severity icon + the message); the sender/host/age live in the later click-
+/// opened detail viewer, so a row at rest is message-only (no hover subline).
+fn notifications_tab(
+    items: &[AlertItem],
+    anim_now: std::time::Instant,
+    anim: &HubAnim,
+    p: Palette,
+) -> Element<'static, Message> {
+    let mut col = column![].spacing(8);
+    if items.is_empty() {
+        col = col.push(
+            text("No alerts.")
+                .size(13)
+                .color(p.text_muted.into_cosmic_color()),
+        );
+        return col.into();
+    }
+    col = col.push(
+        row![
+            action_button("Mark all read", Message::MarkAllRead, p),
+            Space::new().width(Length::Fixed(8.0)),
+            action_button("Clear all", Message::ClearAll, p),
+        ]
+        .align_y(cosmic::iced::Alignment::Center),
+    );
+    // Flatten: one chronological, newest-first stream (no source groups, no
+    // same-source stacking) — source identity is the future detail viewer's job.
+    for (i, item) in flat_newest_first(items).iter().enumerate() {
+        col = col.push(notification_row(item, i, anim_now, anim, p));
+    }
+    col.into()
+}
 
-    let mut header = row![
-        text("\u{2398}") // ⎘ next-page / clipboard-ish glyph (BMP, not emoji)
-            .size(13)
-            .color(p.accent.into_cosmic_color()),
+/// NOTIFY-REDESIGN-A — one message-first notification row: the shape-distinct
+/// severity icon + the message in prominent type, wrapped in the zebra-shaded
+/// card with the per-item slide/blink entrance motion (the NOTIFY-HUB-2 motion is
+/// kept; only the grouping/stacking is gone). The row is message-ONLY at rest —
+/// no sender/host/age subline — and clicking it is a no-op for now (the click-
+/// opened detail viewer is a separate later unit).
+fn notification_row(
+    item: &AlertItem,
+    idx: usize,
+    anim_now: std::time::Instant,
+    anim: &HubAnim,
+    p: Palette,
+) -> Element<'static, Message> {
+    let sev_color = severity_token(item.severity, &p).into_cosmic_color();
+    // Unread reads at full strength; an acknowledged alert dims to muted.
+    let msg_color = if item.read { p.text_muted } else { p.text }.into_cosmic_color();
+    let head = row![
+        icon_svg(severity_icon(item.severity), IconSize::Inline, sev_color),
         Space::new().width(Length::Fixed(8.0)),
-        text("Clipboard")
-            .size(13)
-            .color(p.text.into_cosmic_color())
-            .width(Length::Fill),
+        // Message-first: the alert message reads larger than the surrounding chrome.
+        text(item.title.clone()).size(14).color(msg_color),
     ]
     .align_y(cosmic::iced::Alignment::Center);
+    motioned_card(
+        head.into(),
+        idx,
+        item.severity,
+        anim.card_motion(&item.id, anim_now),
+        p,
+    )
+}
+
+/// NOTIFY-REDESIGN-A — the Clipboard tab body: the mesh-global clipboard history
+/// (pinned first, then the daemon's newest-first order), each a click-to-copy
+/// `clip_row` with per-entry pin + delete, plus a mesh-wide Clear all. Moved out
+/// of the cramped footer into its own scrollable tab, so it shows the FULL synced
+/// history (no 6-row peek + "+N more"); it reuses the CLIP-VIEW-1 `clip_row`
+/// rendering. Honest empty state.
+///
+/// `now_ms` is the frame clock in milliseconds — the same epoch-ms clock
+/// [`format_age`] takes — so the clipboard ages read off the same bucket ladder.
+fn clipboard_tab(clips: &[ClipRow], now_ms: i64, p: Palette) -> Element<'static, Message> {
+    let mut col = column![].spacing(6);
     // Clear-all only when there is at least one unpinned entry to wipe (pinned
     // survive a clear, so an all-pinned history has nothing to clear).
     if clips.iter().any(|c| !c.pinned) {
-        header = header.push(action_button("Clear all", Message::ClipClearAll, p));
+        col = col.push(
+            row![
+                Space::new().width(Length::Fill),
+                action_button("Clear all", Message::ClipClearAll, p),
+            ]
+            .align_y(cosmic::iced::Alignment::Center),
+        );
     }
-
-    let mut col = column![header].spacing(6);
     if clips.is_empty() {
         col = col.push(
             text("Clipboard history is empty.")
                 .size(12)
                 .color(p.text_muted.into_cosmic_color()),
         );
-    } else {
-        // Pinned first (they're the operator's kept clips), then the rest in
-        // the daemon's newest-first order; cap the inline view.
-        let mut ordered: Vec<&ClipRow> = clips.iter().filter(|c| c.pinned).collect();
-        ordered.extend(clips.iter().filter(|c| !c.pinned));
-        for (i, c) in ordered.iter().take(VISIBLE_ROWS).enumerate() {
-            col = col.push(clip_row(c, i, now_ms, p));
-        }
-        if ordered.len() > VISIBLE_ROWS {
-            col = col.push(
-                text(format!("+{} more in history", ordered.len() - VISIBLE_ROWS))
-                    .size(11)
-                    .color(p.text_muted.into_cosmic_color()),
-            );
-        }
+        return col.into();
     }
-
-    container(col)
-        .padding(Padding::from([10u16, 14u16]))
-        .width(Length::Fill)
-        .into()
+    // Pinned first (the operator's kept clips), then the rest newest-first.
+    let mut ordered: Vec<&ClipRow> = clips.iter().filter(|c| c.pinned).collect();
+    ordered.extend(clips.iter().filter(|c| !c.pinned));
+    for (i, c) in ordered.iter().enumerate() {
+        col = col.push(clip_row(c, i, now_ms, p));
+    }
+    col.into()
 }
 
 /// CLIP-VIEW-1 — one clipboard row: a click-to-copy body (single-line preview +
@@ -1746,52 +1733,6 @@ fn quick_toggle<'a>(label: &'a str, on: bool, msg: Message, p: Palette) -> Eleme
     .into()
 }
 
-/// The title/body column for one alert (severity glyph · title · age/host, plus
-/// an optional body line). `count_badge` adds a "×N" pill for a collapsed stack
-/// head. Shared by [`stack_card`] + [`stack_child_row`].
-fn alert_row_body(
-    item: &AlertItem,
-    now_ms: i64,
-    count_badge: Option<usize>,
-    p: Palette,
-) -> Element<'static, Message> {
-    let sev_color = severity_token(item.severity, &p).into_cosmic_color();
-    let title_color = if item.read { p.text_muted } else { p.text }.into_cosmic_color();
-    let host = item.host.clone().unwrap_or_default();
-    let meta = if host.is_empty() {
-        format_age(item.ts_unix_ms, now_ms)
-    } else {
-        format!("{} · {host}", format_age(item.ts_unix_ms, now_ms))
-    };
-    // NOTIFY-STATUS-STRIP — the leading severity marker is a shape-distinct Carbon
-    // status icon (error octagon / warning triangle / info & check circles). The
-    // shape conveys severity independently of colour (a11y), and the alert title
-    // right beside it gives the plain-language context, so per-row severity reads
-    // clearly without a redundant word on every one of up to MAX_ROWS rows.
-    let mut head = row![
-        icon_svg(severity_icon(item.severity), IconSize::Inline, sev_color),
-        Space::new().width(Length::Fixed(8.0)),
-        text(item.title.clone()).size(13).color(title_color),
-    ]
-    .align_y(cosmic::iced::Alignment::Center);
-    // NOTIFY-HUB-2 — a "×N" repeat badge in the severity colour when this card
-    // stands in for a collapsed same-source run.
-    if let Some(n) = count_badge {
-        if n > 1 {
-            head = head.push(Space::new().width(Length::Fixed(6.0)));
-            head = head.push(text(format!("\u{00d7}{n}")).size(11).color(sev_color));
-        }
-    }
-    head = head.push(Space::new().width(Length::Fill));
-    head = head.push(text(meta).size(11).color(p.text_muted.into_cosmic_color()));
-    let mut col = column![head].spacing(2);
-    if !item.body.is_empty() {
-        let body: String = item.body.chars().take(200).collect();
-        col = col.push(text(body).size(11).color(p.text_muted.into_cosmic_color()));
-    }
-    col.into()
-}
-
 /// NOTIFY-HUB-2 — composite the severity-blink wash over a base zebra shade:
 /// alpha-over blend so the blink reads as a tint of the row, not an opaque flood.
 fn blink_shade(base: mde_theme::Rgba, blink: mde_theme::Rgba) -> cosmic::iced::Color {
@@ -1856,62 +1797,6 @@ fn motioned_card(
         .into()
 }
 
-/// NOTIFY-HUB-2 — a stack's head card: the representative alert with a count
-/// badge + the slide/blink entrance motion. When the stack folds repeats, the
-/// whole card is a toggle that expands/collapses the run.
-fn stack_card(
-    stack: &Stack,
-    expanded: bool,
-    idx: usize,
-    now_ms: i64,
-    anim_now: std::time::Instant,
-    anim: &HubAnim,
-    p: Palette,
-) -> Element<'static, Message> {
-    let m = anim.card_motion(&stack.head.id, anim_now);
-    let badge = stack.is_stacked().then_some(stack.count());
-    let mut body = alert_row_body(&stack.head, now_ms, badge, p);
-    // Expandable run → a flat full-width toggle wrapping the card body.
-    if stack.is_stacked() {
-        let caret = if expanded { "\u{25be}" } else { "\u{25b8}" }; // ▾ / ▸
-        let toggled = row![
-            text(caret).size(11).color(p.text_muted.into_cosmic_color()),
-            Space::new().width(Length::Fixed(6.0)),
-            body,
-        ]
-        .align_y(cosmic::iced::Alignment::Center);
-        body = button(toggled)
-            .on_press(Message::ToggleStack(stack.key.clone()))
-            .width(Length::Fill)
-            .padding(0)
-            .style(|_t, _s| cosmic::iced::widget::button::Style {
-                background: None,
-                ..Default::default()
-            })
-            .into();
-    }
-    motioned_card(body, idx, stack.head.severity, m, p)
-}
-
-/// NOTIFY-HUB-2 — one revealed repeat under an expanded stack head. Slightly
-/// indented; carries the same slide-down motion as the head's siblings (it is
-/// never itself the *new* item — the head is) so the reveal moves coherently.
-fn stack_child_row(
-    item: &AlertItem,
-    idx: usize,
-    now_ms: i64,
-    anim_now: std::time::Instant,
-    anim: &HubAnim,
-    p: Palette,
-) -> Element<'static, Message> {
-    let m = anim.card_motion(&item.id, anim_now);
-    let indented = row![
-        Space::new().width(Length::Fixed(16.0)),
-        alert_row_body(item, now_ms, None, p),
-    ];
-    motioned_card(indented.into(), idx, item.severity, m, p)
-}
-
 fn action_button<'a>(label: &'a str, msg: Message, p: Palette) -> Element<'a, Message> {
     button(text(label).size(12).color(p.text.into_cosmic_color()))
         .padding(Padding::from([4u16, 10u16]))
@@ -1920,9 +1805,111 @@ fn action_button<'a>(label: &'a str, msg: Message, p: Palette) -> Element<'a, Me
         .into()
 }
 
+/// NOTIFY-REDESIGN-A — the segmented/pill tab bar under the header: two equal-
+/// width segments (Notifications / Clipboard) in a rounded track, the active one
+/// filled in the accent. Every metric is an `mde-theme` token — `Space` (density-
+/// scaled padding/gaps), `Radii::full` (the pill corners), `FontSize` (the label
+/// size) — so the control carries no scattered literals (§4).
+fn tab_bar(
+    active: Tab,
+    p: Palette,
+    space: mde_theme::Space,
+    radii: mde_theme::Radii,
+) -> Element<'static, Message> {
+    container(
+        row![
+            tab_segment(
+                "Notifications",
+                Tab::Notifications,
+                active == Tab::Notifications,
+                p,
+                space,
+                radii,
+            ),
+            tab_segment(
+                "Clipboard",
+                Tab::Clipboard,
+                active == Tab::Clipboard,
+                p,
+                space,
+                radii,
+            ),
+        ]
+        .spacing(space.xs2),
+    )
+    .padding(Padding::from([space.xs2, space.xs2]))
+    .width(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(cosmic::iced::Background::Color(
+            p.surface.into_cosmic_color(),
+        )),
+        border: cosmic::iced::Border {
+            color: p.border.into_cosmic_color(),
+            width: 1.0,
+            radius: f32::from(radii.full).into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
+/// NOTIFY-REDESIGN-A — one segment of [`tab_bar`]. Active = accent fill with
+/// background-coloured (high-contrast) text; inactive = muted text on a
+/// transparent segment that fills to `raised` on hover (the Application Menu's
+/// subtle-button idiom). Both fill the track width so the two segments split it.
+fn tab_segment(
+    label: &'static str,
+    tab: Tab,
+    active: bool,
+    p: Palette,
+    space: mde_theme::Space,
+    radii: mde_theme::Radii,
+) -> Element<'static, Message> {
+    let fg = if active { p.background } else { p.text_muted };
+    button(
+        container(
+            text(label)
+                .size(mde_theme::FontSize::defaults().body)
+                .color(fg.into_cosmic_color()),
+        )
+        .center_x(Length::Fill)
+        .padding(Padding::from([space.xs, space.sm])),
+    )
+    .width(Length::Fill)
+    .on_press(Message::SwitchTab(tab))
+    .style(move |_t, status| {
+        use cosmic::iced::widget::button::Status;
+        let bg = if active {
+            Some(cosmic::iced::Background::Color(
+                p.accent.into_cosmic_color(),
+            ))
+        } else if matches!(status, Status::Hovered | Status::Pressed) {
+            Some(cosmic::iced::Background::Color(
+                p.raised.into_cosmic_color(),
+            ))
+        } else {
+            None
+        };
+        cosmic::iced::widget::button::Style {
+            background: bg,
+            text_color: fg.into_cosmic_color(),
+            border: cosmic::iced::Border {
+                color: cosmic::iced::Color::TRANSPARENT,
+                width: 0.0,
+                radius: f32::from(radii.full).into(),
+            },
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `Source` is now only named in tests — the redesign's flat list dropped the
+    // source-rank/grouping that used it in non-test code — so import it here.
+    use mde_notify::Source;
 
     fn item(id: &str, src: Source, sev: Severity, ts: i64) -> AlertItem {
         AlertItem {
@@ -1938,36 +1925,84 @@ mod tests {
         }
     }
 
+    /// NOTIFY-REDESIGN-A — the Notifications tab is the default, and `SwitchTab`
+    /// flips the live tab (the only thing it changes is which scrollable content
+    /// renders; the status footer is unconditional).
     #[test]
-    fn group_items_orders_groups_and_sorts_newest_first() {
+    fn default_tab_is_notifications_and_switch_tab_flips_it() {
+        let mut state = Center::new();
+        assert_eq!(
+            state.tab,
+            Tab::Notifications,
+            "Notifications is the default tab"
+        );
+        let _ = update(&mut state, Message::SwitchTab(Tab::Clipboard));
+        assert_eq!(state.tab, Tab::Clipboard);
+        let _ = update(&mut state, Message::SwitchTab(Tab::Notifications));
+        assert_eq!(state.tab, Tab::Notifications);
+    }
+
+    /// NOTIFY-REDESIGN-A — the list is ONE flat chronological (newest-first)
+    /// stream, not bucketed by source: two interleaved sources come back purely
+    /// in timestamp order, proving the per-source grouping is gone.
+    #[test]
+    fn flat_newest_first_is_chronological_not_grouped_by_source() {
         let items = vec![
             item("a", Source::System, Severity::Info, 10),
-            item("b", Source::Security, Severity::Critical, 20),
-            item("c", Source::Security, Severity::Warning, 30),
+            item("b", Source::Security, Severity::Critical, 40),
+            item("c", Source::System, Severity::Info, 30),
+            item("d", Source::Security, Severity::Warning, 20),
         ];
-        let groups = group_items(&items);
-        // Security ranks before System.
-        assert_eq!(groups[0].0, Source::Security);
-        assert_eq!(groups[1].0, Source::System);
-        // Within Security, newest (ts 30) first.
-        assert_eq!(groups[0].1[0].id, "c");
-        assert_eq!(groups[0].1[1].id, "b");
+        let ids: Vec<String> = flat_newest_first(&items)
+            .iter()
+            .map(|i| i.id.clone())
+            .collect();
+        // Pure newest-first by ts (40,30,20,10); sources stay interleaved — a
+        // grouped order would instead cluster the two Security rows together.
+        assert_eq!(ids, ["b", "c", "d", "a"]);
+    }
+
+    /// NOTIFY-REDESIGN-A — both tab bodies build a renderable view without panic:
+    /// the Notifications tab (a message-first row + the bulk actions + the
+    /// severity strip) and the Clipboard tab (a clip row), each with real content.
+    #[test]
+    fn view_renders_on_both_tabs() {
+        let mut state = Center::new();
+        state.items.push(AlertItem {
+            id: "x".into(),
+            ts_unix_ms: 1,
+            severity: Severity::Warning,
+            source: Source::System,
+            topic: "t".into(),
+            host: Some("node".into()),
+            title: "disk almost full".into(),
+            body: "details".into(),
+            read: false,
+        });
+        state.clips.push(ClipRow {
+            id: "c1".into(),
+            text: "hello".into(),
+            source: "node".into(),
+            time: String::new(),
+            pinned: false,
+        });
+        // Notifications tab (default) builds.
+        let _ = view(&state, window::Id::unique());
+        // Clipboard tab builds.
+        state.tab = Tab::Clipboard;
+        let _ = view(&state, window::Id::unique());
     }
 
     /// NOTIFY-STATUS-STRIP — every severity maps to its shape-distinct Carbon
-    /// status icon + a plain-language word, and each icon resolves to a real
-    /// Material SVG payload (so the indicator is icon+label, never colour-alone).
+    /// status icon, and each icon resolves to a real Material SVG payload (the
+    /// severity reads by icon SHAPE, never colour alone — kept by this redesign,
+    /// in the rows and the severity strip).
     #[test]
-    fn severity_maps_to_carbon_icon_and_plain_label() {
+    fn severity_maps_to_carbon_icon() {
         assert_eq!(severity_icon(Severity::Critical), Icon::StatusError);
         assert_eq!(severity_icon(Severity::Warning), Icon::StatusWarning);
         assert_eq!(severity_icon(Severity::Info), Icon::StatusInfo);
         assert_eq!(severity_icon(Severity::Success), Icon::StatusOk);
-
-        assert_eq!(severity_label(Severity::Critical), "Critical");
-        assert_eq!(severity_label(Severity::Warning), "Warning");
-        assert_eq!(severity_label(Severity::Info), "Info");
-        assert_eq!(severity_label(Severity::Success), "OK");
 
         for s in [
             Severity::Critical,
@@ -1981,16 +2016,6 @@ mod tests {
                 "severity {s:?} status icon must resolve a real Carbon SVG"
             );
         }
-    }
-
-    #[test]
-    fn group_severity_is_the_most_severe() {
-        let g = vec![
-            item("a", Source::Security, Severity::Info, 1),
-            item("b", Source::Security, Severity::Critical, 2),
-            item("c", Source::Security, Severity::Warning, 3),
-        ];
-        assert_eq!(group_severity(&g), Severity::Critical);
     }
 
     /// NOTIFY-RENDER-LAG-1 — a non-default `MusicNow` sentinel the snapshot
