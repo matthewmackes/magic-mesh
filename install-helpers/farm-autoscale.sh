@@ -35,8 +35,9 @@
 #   --bigboy   B:S[:P]   (XEN-BIGBOY,        dom0 key xen-bigboy)
 #   --home     B:S[:P]   (XEN-HOME-SERVICES, dom0 key xen-home-services)
 #   --xcp1     B:S[:P]   (KVM-XCP1,          dom0 key kvm-xcp1)
-# or  FA_QUEUE_BIGBOY / FA_QUEUE_HOME / FA_QUEUE_XCP1 = "B:S[:P]" (flags win),
-# or  FA_PODS_BIGBOY / FA_PODS_HOME / FA_PODS_XCP1 = "<pods>" (override the :P).
+#   --x194     B:S[:P]   (XEN-194,           dom0 key xen-194)
+# or  FA_QUEUE_BIGBOY / FA_QUEUE_HOME / FA_QUEUE_XCP1 / FA_QUEUE_X194 = "B:S[:P]" (flags win),
+# or  FA_PODS_BIGBOY / FA_PODS_HOME / FA_PODS_XCP1 / FA_PODS_X194 = "<pods>" (override the :P).
 # Omitted/unset dom0 = "0:0:0" (off).
 #
 # Modes:
@@ -75,15 +76,17 @@ declare -A QUEUE=(
   ["xen-bigboy"]="${FA_QUEUE_BIGBOY:-0:0:0}"
   ["xen-home-services"]="${FA_QUEUE_HOME:-0:0:0}"
   ["kvm-xcp1"]="${FA_QUEUE_XCP1:-0:0:0}"
+  ["xen-194"]="${FA_QUEUE_X194:-0:0:0}"
 )
 # Optional explicit pod override per dom0 (wins over the :P field of the spec).
 declare -A PODS_ENV=(
   ["xen-bigboy"]="${FA_PODS_BIGBOY:-}"
   ["xen-home-services"]="${FA_PODS_HOME:-}"
   ["kvm-xcp1"]="${FA_PODS_XCP1:-}"
+  ["xen-194"]="${FA_PODS_X194:-}"
 )
 # Stable print order (matches the design doc's dom0 table).
-ORDER=("xen-bigboy" "xen-home-services" "kvm-xcp1")
+ORDER=("xen-bigboy" "xen-home-services" "kvm-xcp1" "xen-194")
 
 # nonneg <n> — true iff <n> is a non-negative integer.
 nonneg() { case "$1" in '' | *[!0-9]*) return 1;; *) return 0;; esac; }
@@ -262,6 +265,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --bigboy) QUEUE["xen-bigboy"]="$2"; shift 2;;
   --home)   QUEUE["xen-home-services"]="$2"; shift 2;;
   --xcp1)   QUEUE["kvm-xcp1"]="$2"; shift 2;;
+  --x194)   QUEUE["xen-194"]="$2"; shift 2;;
   --max-small) MAX_SMALL="$2"; shift 2;;
   --dwell) DWELL_SECS="$2"; shift 2;;
   --pod-budget) POD_BUDGET="$2"; shift 2;;

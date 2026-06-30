@@ -169,7 +169,7 @@ export TF_VAR_build_vcpus="$BUILD_VCPUS"
 export FA_MAX_SMALL="${FA_MAX_SMALL:-1}"
 
 # Stable dom0 print/iterate order (matches the design doc + farm-autoscale.sh).
-ORDER=("xen-bigboy" "xen-home-services" "kvm-xcp1")
+ORDER=("xen-bigboy" "xen-home-services" "kvm-xcp1" "xen-194")
 # dom0 → the build-VM IPs to probe for in-flight work (best-effort, degrades).
 # Per dom0 we probe BOTH:
 #   - the elastic lane the autoscaler provisions (ip_base + the +10 small steps,
@@ -185,18 +185,20 @@ declare -A DOM0_IPS=(
   ["xen-bigboy"]="172.20.0.130 172.20.0.140 172.20.0.150 172.20.0.160"
   ["xen-home-services"]="172.20.0.50 172.20.0.60 172.20.0.70 172.20.0.80"
   ["kvm-xcp1"]="172.20.0.90 172.20.0.100 172.20.0.110 172.20.0.120"
+  ["xen-194"]="172.20.0.170 172.20.0.180 172.20.0.190 172.20.0.200"
 )
-# NOTE (xen-194 follow-up): the 4th dom0 (172.20.145.194 → build VM .170, lane
-# .170–.200) is declared in infra/tofu/xen-xapi but NOT yet elastic-managed here —
-# wiring it needs a matching `--x194` shape flag in farm-autoscale.sh + the DOM0_*
-# maps below. Do that on the host with live verification (see
-# docs/ops/farm-inventory-validate.md). The dead .51/.52 probe IPs were removed.
+# xen-194 (172.20.145.194 → build VM .170, lane .170–.200) IS now elastic-managed:
+# it carries a `--x194` shape flag in farm-autoscale.sh + full DOM0_* entries here, so
+# bucket_demand spreads smalls/pods onto it and the reconciler probes its lane like
+# any other dom0. The dead .51/.52 probe IPs were removed. (Wired per the runbook
+# docs/ops/farm-inventory-validate.md Step 5b.)
 # dom0 → its hypervisor (dom0) host, for the inter-job snapshot-revert (the dom0
 # runs `xe`). Cold facts from install-helpers/farm.sh's fleet + main.tf pool names.
 declare -A DOM0_HOST=(
   ["xen-bigboy"]="172.20.145.165"
   ["xen-home-services"]="172.20.0.9"
   ["kvm-xcp1"]="172.20.145.193"
+  ["xen-194"]="172.20.145.194"
 )
 # dom0 → the VM name-labels per shape (cold facts from infra/tofu/main.tf
 # local.dom0: big_name / small_name; the nth small is "<small_name>-<n>" for n≥1).
@@ -204,17 +206,20 @@ declare -A DOM0_BIG_NAME=(
   ["xen-bigboy"]="mcnf-build-big-52"
   ["xen-home-services"]="mcnf-build-big-50"
   ["kvm-xcp1"]="mcnf-build-big-51"
+  ["xen-194"]="mcnf-build-big-53"
 )
 declare -A DOM0_SMALL_NAME=(
   ["xen-bigboy"]="mcnf-build-52"
   ["xen-home-services"]="mcnf-build-50"
   ["kvm-xcp1"]="mcnf-build-51"
+  ["xen-194"]="mcnf-build-53"
 )
 # dom0 → the autoscaler flag that carries its queue spec.
 declare -A DOM0_FLAG=(
   ["xen-bigboy"]="--bigboy"
   ["xen-home-services"]="--home"
   ["kvm-xcp1"]="--xcp1"
+  ["xen-194"]="--x194"
 )
 
 usage() { sed -n '2,55p' "$0" | sed 's/^# \{0,1\}//'; }
@@ -256,7 +261,7 @@ classify_command() {
 
 # bucket_demand <big-total> <small-total> <pod-total> — PURE: turn the WHOLE-FLEET
 # big/small/pod job totals into the per-dom0 "big:small:pods" specs the autoscaler
-# takes, on stdout as three lines IN ORDER (xen-bigboy, xen-home-services, kvm-xcp1).
+# takes, on stdout as four lines IN ORDER (xen-bigboy, xen-home-services, kvm-xcp1, xen-194).
 # Placement rule (mirrors xcp-build.sh routing + design L1/L4):
 #   - BIG jobs want a whole host → ALL counted on xen-bigboy (the only true big iron;
 #     a big VM on home/xcp1 is only 3 vCPU). The autoscaler then runs BigBoy `big`.
@@ -268,13 +273,13 @@ classify_command() {
 # Deterministic in its 3 args, so the self-test can assert exact specs.
 bucket_demand() {
   local big="$1" small="$2" pods="$3"
-  local bb_big=0 bb_small=0 hm_small=0 x1_small=0
-  local bb_pods=0 hm_pods=0 x1_pods=0
+  local bb_big=0 bb_small=0 hm_small=0 x1_small=0 x194_small=0
+  local bb_pods=0 hm_pods=0 x1_pods=0 x194_pods=0
   # BIG → BigBoy (whole host). A nonzero big count claims BigBoy's big shape.
   bb_big="$big"
   # SMALL pool dom0s: home + xcp1 always; BigBoy too ONLY when no bigs claim it.
-  local -a pool=("xen-home-services" "kvm-xcp1")
-  [ "$big" -eq 0 ] && pool=("xen-bigboy" "xen-home-services" "kvm-xcp1")
+  local -a pool=("xen-home-services" "kvm-xcp1" "xen-194")
+  [ "$big" -eq 0 ] && pool=("xen-bigboy" "xen-home-services" "kvm-xcp1" "xen-194")
   local n="${#pool[@]}" i=0 dk
   # Spread smalls + pods round-robin across the pool (deterministic order).
   local s=0 p=0
@@ -285,6 +290,7 @@ bucket_demand() {
         xen-bigboy) bb_small=$(( bb_small + 1 )) ;;
         xen-home-services) hm_small=$(( hm_small + 1 )) ;;
         kvm-xcp1) x1_small=$(( x1_small + 1 )) ;;
+        xen-194) x194_small=$(( x194_small + 1 )) ;;
       esac
       s=$(( s + 1 ))
     fi
@@ -293,6 +299,7 @@ bucket_demand() {
         xen-bigboy) bb_pods=$(( bb_pods + 1 )) ;;
         xen-home-services) hm_pods=$(( hm_pods + 1 )) ;;
         kvm-xcp1) x1_pods=$(( x1_pods + 1 )) ;;
+        xen-194) x194_pods=$(( x194_pods + 1 )) ;;
       esac
       p=$(( p + 1 ))
     fi
@@ -301,6 +308,7 @@ bucket_demand() {
   printf '%s:%s:%s\n' "$bb_big" "$bb_small" "$bb_pods"
   printf '%s:%s:%s\n' "0" "$hm_small" "$hm_pods"
   printf '%s:%s:%s\n' "0" "$x1_small" "$x1_pods"
+  printf '%s:%s:%s\n' "0" "$x194_small" "$x194_pods"
 }
 
 # apply_gate <fa_apply> <reachable> <state_sane> <golden_set> — PURE: the apply
@@ -398,15 +406,16 @@ if [ "${1:-}" = "--self-test" ]; then
 
   # --- bucket_demand (whole-fleet totals → per-dom0 specs) ---
   # One big job → BigBoy big, nothing else.
-  check "1 big → bigboy big" "$(bucket_demand 1 0 0 | tr '\n' '|')" "1:0:0|0:0:0|0:0:0|"
+  check "1 big → bigboy big" "$(bucket_demand 1 0 0 | tr '\n' '|')" "1:0:0|0:0:0|0:0:0|0:0:0|"
   # Two smalls, no bigs → BigBoy + home take one each (round-robin from the 3-pool).
-  check "2 small no-big spread" "$(bucket_demand 0 2 0 | tr '\n' '|')" "0:1:0|0:1:0|0:0:0|"
+  check "2 small no-big spread" "$(bucket_demand 0 2 0 | tr '\n' '|')" "0:1:0|0:1:0|0:0:0|0:0:0|"
   # Bigs present → BigBoy claimed by big; smalls fold onto home+xcp1 only (L4).
-  check "big preempts: smalls to home+xcp1" "$(bucket_demand 1 2 0 | tr '\n' '|')" "1:0:0|0:1:0|0:1:0|"
+  check "big preempts: smalls to home+xcp1+x194" "$(bucket_demand 1 2 0 | tr '\n' '|')" "1:0:0|0:1:0|0:1:0|0:0:0|"
   # Pods follow the smalls; a pod-heavy queue lands pods on the small pool (FA-5).
-  check "pods spread to small pool" "$(bucket_demand 0 0 3 | tr '\n' '|')" "0:0:1|0:0:1|0:0:1|"
+  check "pods spread to small pool" "$(bucket_demand 0 0 3 | tr '\n' '|')" "0:0:1|0:0:1|0:0:1|0:0:0|"
   # Idle fleet → every dom0 off (0:0:0).
-  check "idle → all off" "$(bucket_demand 0 0 0 | tr '\n' '|')" "0:0:0|0:0:0|0:0:0|"
+  check "idle → all off" "$(bucket_demand 0 0 0 | tr '\n' '|')" "0:0:0|0:0:0|0:0:0|0:0:0|"
+  check "4 smalls → xen-194 in the rotation" "$(bucket_demand 0 4 0 | tr '\n' '|')" "0:1:0|0:1:0|0:1:0|0:1:0|"
 
   # --- apply_gate (L2: all four prereqs must hold; DAR-29 reachability = XAPI) ---
   check "gate: all ok → apply"        "$(apply_gate 1 1 1 1)" apply
