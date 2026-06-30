@@ -22,7 +22,7 @@ use mde_theme::{Palette, Space as MdeSpace};
 
 use crate::cosmic_compat::prelude::*;
 use crate::keyboard::Pane;
-use crate::model::{nav_model, Group, View};
+use crate::model::{nav_model, pinned_links, Group, View};
 
 /// UX-5 (a) — 240 px fixed sidebar width. Component dimension,
 /// not density-scaled.
@@ -113,30 +113,53 @@ pub fn view<'a>(
 
     let mut col: Column<'a, crate::Message, cosmic::Theme> = column![].spacing(0);
 
-    // NAV-1 — render the visible sections (the 7 mesh sections in locked
-    // order). NAV-1.2 retired the hidden Desktop group, so nav_model() now
-    // contains exactly the sidebar sections.
-    for (i, entry) in nav_model().into_iter().enumerate() {
-        if i > 0 {
-            col = col.push(section_divider(palette));
-        }
+    // CTRLSURF-6 — the **Pinned** quick-links folded in from the retired Front
+    // Door rail, at the top of the ONE universal sidebar (no second in-content
+    // rail). Each is a real route ([`pinned_links`]).
+    col = col.push(minor_header("Pinned", palette, false));
+    for (label, pinned_group, pinned_slug) in pinned_links() {
+        let is_active = matches!(
+            view,
+            View::Panel { group, panel } if group == pinned_group && panel == pinned_slug
+        );
+        col = col.push(nav_row(
+            pinned_group,
+            pinned_slug,
+            label,
+            is_active,
+            sidebar_focused,
+            palette,
+            &on_panel_click,
+        ));
+    }
+
+    // CTRLSURF-6 — the seven scope-first sections in locked order. Each renders a
+    // plain-language group header (no SHOUTING), then its panels grouped under
+    // sub-group headers ([`NavEntry::subgroups`]).
+    for entry in nav_model() {
+        col = col.push(section_divider(palette));
         col = col.push(section_label(entry.group, active, palette, &on_group_click));
         if state.is_expanded(entry.group, active) {
-            for panel in &entry.panels {
-                let is_active = matches!(
-                    view,
-                    View::Panel { group, panel: slug }
-                        if group == entry.group && slug == panel.slug()
-                );
-                col = col.push(nav_row(
-                    entry.group,
-                    panel.slug(),
-                    panel.label(),
-                    is_active,
-                    sidebar_focused,
-                    palette,
-                    &on_panel_click,
-                ));
+            for (subgroup, panels) in entry.subgroups() {
+                if let Some(header) = subgroup {
+                    col = col.push(minor_header(header, palette, true));
+                }
+                for panel in panels {
+                    let is_active = matches!(
+                        view,
+                        View::Panel { group, panel: slug }
+                            if group == entry.group && slug == panel.slug()
+                    );
+                    col = col.push(nav_row(
+                        entry.group,
+                        panel.slug(),
+                        panel.label(),
+                        is_active,
+                        sidebar_focused,
+                        palette,
+                        &on_panel_click,
+                    ));
+                }
             }
         }
     }
@@ -183,10 +206,37 @@ fn section_divider<'a>(palette: Palette) -> Element<'a, crate::Message, cosmic::
         .into()
 }
 
-/// UX-5 (e) — section label above a group's panels. All-caps
-/// 11 sp muted label, clickable to toggle the group's expansion
-/// (preserves the CB-1.2 collapse contract; the label itself is
-/// the section divider's title).
+/// CTRLSURF-6 — a non-interactive minor header inside the universal sidebar:
+/// the top-level **"Pinned"** quick-links heading (`indent == false`) and the
+/// per-group **sub-group** headers (`indent == true`, e.g. "Hardware & Desktop",
+/// "Join the Mesh"). A muted 11 sp caption, sentence-case (no SHOUTING); the
+/// indent nests it under its group header. Colour via `mde-theme` token (§4);
+/// it carries no `on_press` (a heading, not a route — so no dead button).
+fn minor_header<'a>(
+    label: &'a str,
+    palette: Palette,
+    indent: bool,
+) -> Element<'a, crate::Message, cosmic::Theme> {
+    let left = if indent { 16.0 } else { 0.0 };
+    container(
+        text(label)
+            .size(SECTION_LABEL_SIZE)
+            .colr(palette.text_muted.into_cosmic_color())
+            .align_y(alignment::Vertical::Center),
+    )
+    .padding(Padding {
+        top: 8.0,
+        right: 0.0,
+        bottom: 2.0,
+        left,
+    })
+    .into()
+}
+
+/// UX-5 (e) / CTRLSURF-6 — section label above a group's panels. A 11 sp
+/// plain-language (sentence-case, **no SHOUTING**) label, clickable to toggle
+/// the group's expansion (preserves the CB-1.2 collapse contract; the label
+/// itself is the section divider's title).
 fn section_label<'a>(
     group: Group,
     active: Group,
@@ -194,7 +244,7 @@ fn section_label<'a>(
     on_click: &(impl Fn(Group) -> crate::Message + 'a),
 ) -> Element<'a, crate::Message, cosmic::Theme> {
     let is_active = group == active;
-    let label_text = group.label().to_uppercase();
+    let label_text = group.label();
     let text_color = if is_active {
         palette.text.into_cosmic_color()
     } else {
@@ -423,7 +473,7 @@ mod tests {
 
     #[test]
     fn section_label_is_eleven_sp() {
-        // UX-5 (e) — 11 sp all-caps muted label.
+        // UX-5 (e) / CTRLSURF-6 — 11 sp muted label (sentence-case, no SHOUTING).
         assert!((SECTION_LABEL_SIZE - 11.0).abs() < f32::EPSILON);
     }
 

@@ -29,14 +29,13 @@ use crate::Message;
 /// PLANES-1: the four new plane groups reuse existing Material glyphs
 /// (no new SVG assets) — kept distinct per the `role_icons_*` test.
 const fn role_icon(group: Group) -> Icon {
-    // NAV-1 — distinct glyph per visible section.
+    // CTRLSURF-6 — distinct glyph per visible section.
     match group {
         Group::Dashboard => Icon::Dashboard,
         Group::ThisNode => Icon::Workbench,
         Group::Mesh => Icon::Network,
-        Group::MeshProvisioning => Icon::Peer,
         Group::Fleet => Icon::Fleet,
-        Group::Provisioning => Icon::Update,
+        Group::Datacenter => Icon::Update,
         Group::Monitoring => Icon::Maintain,
         Group::System => Icon::System,
     }
@@ -50,25 +49,22 @@ const fn role_description(group: Group) -> &'static str {
             "At-a-glance system and fleet status, with quick links into every section."
         }
         Group::ThisNode => {
-            "This box — hardware, services, and its local networking (interfaces, Wi-Fi, VPN, firewall, remote access)."
+            "This box — hardware and desktop, plus its networking (mesh connection, interfaces, Wi-Fi, VPN, firewall, remote access)."
         }
         Group::Mesh => {
-            "The mesh — every peer plus mesh-wide services: control, storage, DNS, routing, bus, publishing, and discovered hosts."
-        }
-        Group::MeshProvisioning => {
-            "Grow the mesh — enrol new peers (registration, join, pending approvals) and federate with other meshes."
+            "The mesh — fabric (peers, control, DNS, routing), shared resources, services, local network, and joining the mesh (enrol + federate)."
         }
         Group::Fleet => {
-            "Drive the fleet — roster, rollup, tags, and orchestration (jobs, playbooks, remediation)."
+            "Drive the fleet — roster, orchestration (jobs, playbooks, remediation), and node templates (roles, install profiles, mirrors)."
         }
-        Group::Provisioning => {
-            "Build and enrol nodes — node roles, install profiles, images (ISO/VM/container/USB), mirrors, and compute instances."
+        Group::Datacenter => {
+            "Compute — spin up virtual machines and manage the datacenter plane (instances, images, build farm, lighthouses, snapshots)."
         }
         Group::Monitoring => {
-            "Observe everything — health, logs and metrics, fleet logs, run history, audit, mesh history, and resources."
+            "Observe everything — health checks, logs and metrics, fleet logs, run history, audit, mesh history, and resource usage."
         }
         Group::System => {
-            "Configure and maintain — local/fleet config, policy, snapshots, repair, and help."
+            "Configure and maintain — apply configuration, policy, maintenance (hub, repair, updates), and preferences & help."
         }
     }
 }
@@ -79,12 +75,11 @@ const fn see_also(group: Group) -> &'static [Group] {
     match group {
         Group::Dashboard => &[Group::Mesh, Group::Fleet, Group::Monitoring],
         Group::ThisNode => &[Group::Mesh, Group::Monitoring, Group::System],
-        Group::Mesh => &[Group::MeshProvisioning, Group::Fleet, Group::Monitoring],
-        Group::MeshProvisioning => &[Group::Mesh, Group::Fleet, Group::Provisioning],
-        Group::Fleet => &[Group::Mesh, Group::Provisioning, Group::Monitoring],
-        Group::Provisioning => &[Group::Fleet, Group::Mesh, Group::System],
+        Group::Mesh => &[Group::Fleet, Group::Datacenter, Group::Monitoring],
+        Group::Fleet => &[Group::Mesh, Group::Datacenter, Group::Monitoring],
+        Group::Datacenter => &[Group::Fleet, Group::Mesh, Group::System],
         Group::Monitoring => &[Group::Mesh, Group::Fleet, Group::System],
-        Group::System => &[Group::ThisNode, Group::Monitoring, Group::Provisioning],
+        Group::System => &[Group::ThisNode, Group::Monitoring, Group::Datacenter],
     }
 }
 
@@ -313,37 +308,33 @@ mod tests {
     }
 
     #[test]
-    fn mesh_section_leads_with_peers_then_mesh_services() {
-        // NAV-1 (Q9) — Peers is the first item under Mesh, followed by the
-        // mesh-wide services.
+    fn mesh_section_leads_with_peers_and_absorbs_join_the_mesh() {
+        // CTRLSURF-6 (Q9) — Peers leads the Mesh section; the old MESH:
+        // PROVISIONING enrollment/federation panels now live under Mesh ▸ Join
+        // the Mesh, so they surface as Mesh role tasks.
         let slugs: Vec<&str> = role_action_panels(Group::Mesh)
             .iter()
             .map(Panel::slug)
             .collect();
         assert_eq!(slugs.first(), Some(&"peers"));
         for want in ["mesh_control", "mesh_storage", "dns", "routing"] {
-            assert!(slugs.contains(&want), "Mesh missing {want}: {slugs:?}");
+            assert!(
+                slugs.contains(&want),
+                "Mesh missing fabric {want}: {slugs:?}"
+            );
         }
-        // 2026-06-16: enrollment/federation moved to MESH: PROVISIONING.
-        let prov: Vec<&str> = role_action_panels(Group::MeshProvisioning)
-            .iter()
-            .map(Panel::slug)
-            .collect();
         for want in [
+            "genesis",
             "registration",
             "mesh_join",
             "mesh_pending",
             "mesh_federation",
         ] {
             assert!(
-                prov.contains(&want),
-                "MeshProvisioning missing {want}: {prov:?}"
+                slugs.contains(&want),
+                "Mesh missing Join-the-Mesh {want}: {slugs:?}"
             );
         }
-        assert!(
-            !slugs.contains(&"mesh_join"),
-            "mesh_join should have left Mesh"
-        );
     }
 
     #[test]

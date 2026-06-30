@@ -113,10 +113,9 @@ pub fn interpret_key(key: Key, mods: Modifiers, current_pane: Pane) -> KeyAction
         (Key::Escape, _) => KeyAction::CloseDetail,
         (Key::Digit(n), m) if m.ctrl && (1..=9).contains(&n) => {
             // Group-hotkey table: Ctrl+1 → first sidebar section … Ctrl+7
-            // → seventh. NAV-1 has seven sections (Overview, This Node,
-            // Mesh, Fleet, Provisioning, Monitoring, System); NAV-1.2 retired
-            // the hidden Desktop group. A digit past the last section is
-            // ignored (no panic).
+            // → seventh. CTRLSURF-6 has seven scope-first sections (Overview,
+            // This Node, Mesh, Fleet, Datacenter, Monitoring, System). A digit
+            // past the last section is ignored (no panic).
             let idx = (n - 1) as usize;
             Group::sidebar_groups()
                 .get(idx)
@@ -172,17 +171,17 @@ mod tests {
 
     #[test]
     fn ctrl_digit_jumps_to_matching_sidebar_group() {
-        // Ctrl+1..8 map to the eight sections (2026-06-16: MESH: PROVISIONING
-        // split out of Mesh); Ctrl+9 is ignored (no ninth section).
+        // CTRLSURF-6 — Ctrl+1..7 map to the seven scope-first sections (the two
+        // SHOUTING sections were dissolved; Datacenter added); Ctrl+8 is ignored
+        // (no eighth section).
         let cases = [
             (1, Group::Dashboard),
             (2, Group::ThisNode),
             (3, Group::Mesh),
-            (4, Group::MeshProvisioning),
-            (5, Group::Fleet),
-            (6, Group::Provisioning),
-            (7, Group::Monitoring),
-            (8, Group::System),
+            (4, Group::Fleet),
+            (5, Group::Datacenter),
+            (6, Group::Monitoring),
+            (7, Group::System),
         ];
         for (n, expected) in cases {
             assert_eq!(
@@ -193,7 +192,7 @@ mod tests {
         }
         // Past the last section → no-op (no panic).
         assert_eq!(
-            interpret_key(Key::Digit(9), Modifiers::ctrl(), Pane::Sidebar),
+            interpret_key(Key::Digit(8), Modifiers::ctrl(), Pane::Sidebar),
             KeyAction::Ignored,
         );
     }
