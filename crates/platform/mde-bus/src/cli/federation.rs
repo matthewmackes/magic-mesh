@@ -320,13 +320,72 @@ fn cmd_revoke_mint(ulid: &str, bus_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Normalize a mnemonic/passcode for comparison: trim ends, lowercase, and
+/// collapse internal runs of whitespace to single spaces.
+fn normalize_passcode(s: &str) -> String {
+    s.split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Find the pending mint envelope whose mnemonic matches `passcode`, verify it
+/// is unexpired and not already consumed, mark it `used` on disk (consume), and
+/// return it. **Fails closed:** a passcode with no matching live envelope is
+/// rejected. This enforces the documented single-use contract (§8 — a claimed
+/// security control must be enforced in code, not just prose).
+fn consume_matching_mint(bus_root: &Path, passcode: &str) -> Result<MintEnvelope> {
+    let want = normalize_passcode(passcode);
+    let dir = mints_dir(bus_root);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        bail!("no pending mints — mint a passcode on the peer mesh first");
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue; // skip *.json.tmp and anything else
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut env) = serde_json::from_str::<MintEnvelope>(&text) else {
+            continue;
+        };
+        if normalize_passcode(&env.mnemonic) != want {
+            continue;
+        }
+        if env.used {
+            bail!("that passcode has already been consumed (single-use)");
+        }
+        if env.expires_at_unix_ms <= now_unix_ms() {
+            bail!("that passcode has expired (mints are valid for 24 h)");
+        }
+        // Consume: mark used + rewrite atomically (temp + rename) so a crash
+        // mid-write can't leave a half-truncated envelope that re-opens the door.
+        env.used = true;
+        let json = serde_json::to_string_pretty(&env).context("serialize consumed mint")?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
+        return Ok(env);
+    }
+    bail!("no pending mint matches that passcode — check the words (they may be mistyped, expired, or already consumed)")
+}
+
 fn cmd_accept(passcode: &str, label: &str, json_out: bool, bus_root: &Path) -> Result<()> {
     let word_count = passcode.split_whitespace().count();
     if word_count != 6 {
         bail!("passcode must be exactly 6 words ({word_count} provided)");
     }
 
-    let peer_mesh_id = Ulid::new().to_string();
+    // §8 / TUNE-15.c — the mnemonic is a documented single-use secret, so it MUST
+    // match a pending, unexpired, unconsumed local mint envelope. The old path
+    // minted a fresh ULID and wrote a pair for ANY 6-word string — anyone who
+    // matched the word *count* established a federation pair (an auth bypass).
+    // Consuming the matching envelope closes the hole and prevents replay.
+    let env = consume_matching_mint(bus_root, passcode)?;
+    let peer_mesh_id = env.ulid;
     let established = now_rfc3339();
 
     let mut fed = read_federation_yaml(bus_root)?;
@@ -503,6 +562,40 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    /// Read the (single) mint envelope in a test bus root.
+    fn read_one_mint(dir: &Path) -> MintEnvelope {
+        let path = std::fs::read_dir(mints_dir(dir))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// Secure pairing setup: mint a fresh passcode, then accept its REAL
+    /// mnemonic (the path that replaced the old "accept any 6 words" bypass).
+    /// Returns the established pair's peer-mesh-id.
+    fn accept_with_fresh_mint(dir: &Path, label: &str) -> String {
+        cmd_mint_passcode(false, dir).unwrap();
+        let mnemonic = std::fs::read_dir(mints_dir(dir))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter_map(|t| serde_json::from_str::<MintEnvelope>(&t).ok())
+            .find(|env| !env.used)
+            .map(|env| env.mnemonic)
+            .expect("a fresh unused mint");
+        cmd_accept(&mnemonic, label, false, dir).unwrap();
+        read_federation_yaml(dir)
+            .unwrap()
+            .pairs
+            .last()
+            .unwrap()
+            .peer_mesh_id
+            .clone()
+    }
+
     // ── wordlist ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -645,13 +738,7 @@ mod tests {
     #[test]
     fn accept_writes_pair_to_federation_yaml() {
         let dir = tmp();
-        cmd_accept(
-            "able acid aged also apex arch",
-            "TestMesh",
-            false,
-            dir.path(),
-        )
-        .unwrap();
+        accept_with_fresh_mint(dir.path(), "TestMesh");
         let fed = read_federation_yaml(dir.path()).unwrap();
         assert_eq!(fed.pairs.len(), 1);
         assert_eq!(fed.pairs[0].peer_mesh_label, "TestMesh");
@@ -660,13 +747,7 @@ mod tests {
     #[test]
     fn accept_pair_has_default_subscribe_all() {
         let dir = tmp();
-        cmd_accept(
-            "able acid aged also apex arch",
-            "TestMesh",
-            false,
-            dir.path(),
-        )
-        .unwrap();
+        accept_with_fresh_mint(dir.path(), "TestMesh");
         let fed = read_federation_yaml(dir.path()).unwrap();
         assert_eq!(fed.pairs[0].subscribe_topics, vec!["#"]);
         assert!(fed.pairs[0].publish_topics.is_empty());
@@ -675,13 +756,7 @@ mod tests {
     #[test]
     fn accept_pair_has_default_exclusions() {
         let dir = tmp();
-        cmd_accept(
-            "able acid aged also apex arch",
-            "TestMesh",
-            false,
-            dir.path(),
-        )
-        .unwrap();
+        accept_with_fresh_mint(dir.path(), "TestMesh");
         let fed = read_federation_yaml(dir.path()).unwrap();
         assert!(
             fed.pairs[0]
@@ -711,18 +786,81 @@ mod tests {
         assert!(r2.is_err());
     }
 
+    #[test]
+    fn accept_rejects_passcode_with_no_matching_mint() {
+        let dir = tmp();
+        cmd_mint_passcode(false, dir.path()).unwrap();
+        // Six valid-count words that are not the minted mnemonic. The old bypass
+        // wrote a pair for any 6 words; the secure path must fail closed.
+        let r = cmd_accept(
+            "mesh node link mint mode myth",
+            "Imposter",
+            false,
+            dir.path(),
+        );
+        assert!(r.is_err(), "arbitrary 6 words must not establish a pair");
+        assert!(
+            read_federation_yaml(dir.path()).unwrap().pairs.is_empty(),
+            "no pair may be written for an unmatched passcode"
+        );
+    }
+
+    #[test]
+    fn accept_consumes_matching_mint() {
+        let dir = tmp();
+        let peer = accept_with_fresh_mint(dir.path(), "Peer");
+        assert!(!peer.is_empty());
+        // Every envelope in the dir is now marked used (the one we accepted).
+        let all_used = std::fs::read_dir(mints_dir(dir.path()))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter_map(|t| serde_json::from_str::<MintEnvelope>(&t).ok())
+            .all(|env| env.used);
+        assert!(all_used, "the accepted mint must be marked used");
+    }
+
+    #[test]
+    fn accept_rejects_replayed_passcode() {
+        let dir = tmp();
+        cmd_mint_passcode(false, dir.path()).unwrap();
+        let mnemonic = read_one_mint(dir.path()).mnemonic;
+        cmd_accept(&mnemonic, "First", false, dir.path()).unwrap();
+        // Replaying the same words must fail — single-use.
+        let r = cmd_accept(&mnemonic, "Replay", false, dir.path());
+        assert!(r.is_err(), "a consumed passcode must not be replayable");
+        assert_eq!(
+            read_federation_yaml(dir.path()).unwrap().pairs.len(),
+            1,
+            "replay must not add a second pair"
+        );
+    }
+
+    #[test]
+    fn accept_rejects_expired_mint() {
+        let dir = tmp();
+        cmd_mint_passcode(false, dir.path()).unwrap();
+        // Force-expire the envelope on disk, then try to accept it.
+        let path = std::fs::read_dir(mints_dir(dir.path()))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let mut env: MintEnvelope =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        env.expires_at_unix_ms = now_unix_ms() - 1;
+        std::fs::write(&path, serde_json::to_string(&env).unwrap()).unwrap();
+        let r = cmd_accept(&env.mnemonic, "Stale", false, dir.path());
+        assert!(r.is_err(), "an expired passcode must be rejected");
+    }
+
     // ── grant-publish ─────────────────────────────────────────────────────────
 
     #[test]
     fn grant_publish_adds_topic_to_pair() {
         let dir = tmp();
-        cmd_accept(
-            "able acid aged also apex arch",
-            "TestMesh",
-            false,
-            dir.path(),
-        )
-        .unwrap();
+        accept_with_fresh_mint(dir.path(), "TestMesh");
         let peer_id = {
             let fed = read_federation_yaml(dir.path()).unwrap();
             fed.pairs[0].peer_mesh_id.clone()
@@ -744,13 +882,7 @@ mod tests {
     #[test]
     fn grant_publish_errors_on_duplicate_topic() {
         let dir = tmp();
-        cmd_accept(
-            "able acid aged also apex arch",
-            "TestMesh",
-            false,
-            dir.path(),
-        )
-        .unwrap();
+        accept_with_fresh_mint(dir.path(), "TestMesh");
         let peer_id = {
             let fed = read_federation_yaml(dir.path()).unwrap();
             fed.pairs[0].peer_mesh_id.clone()
@@ -765,13 +897,7 @@ mod tests {
     #[test]
     fn revoke_removes_pair_from_yaml() {
         let dir = tmp();
-        cmd_accept(
-            "able acid aged also apex arch",
-            "TestMesh",
-            false,
-            dir.path(),
-        )
-        .unwrap();
+        accept_with_fresh_mint(dir.path(), "TestMesh");
         let peer_id = {
             let fed = read_federation_yaml(dir.path()).unwrap();
             fed.pairs[0].peer_mesh_id.clone()
@@ -793,13 +919,7 @@ mod tests {
     #[test]
     fn rotate_updates_established_timestamp() {
         let dir = tmp();
-        cmd_accept(
-            "able acid aged also apex arch",
-            "TestMesh",
-            false,
-            dir.path(),
-        )
-        .unwrap();
+        accept_with_fresh_mint(dir.path(), "TestMesh");
         let peer_id = {
             let fed = read_federation_yaml(dir.path()).unwrap();
             fed.pairs[0].peer_mesh_id.clone()
@@ -832,13 +952,7 @@ mod tests {
     #[test]
     fn federation_yaml_uses_kebab_case_keys() {
         let dir = tmp();
-        cmd_accept(
-            "able acid aged also apex arch",
-            "TestMesh",
-            false,
-            dir.path(),
-        )
-        .unwrap();
+        accept_with_fresh_mint(dir.path(), "TestMesh");
         let raw = std::fs::read_to_string(federation_yaml_path(dir.path())).unwrap();
         assert!(
             raw.contains("peer-mesh-id:"),
