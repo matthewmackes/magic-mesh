@@ -2677,10 +2677,16 @@ impl State {
                 } else if self.items.is_empty() {
                     // BEAUT-MUSIC — a tasteful Carbon empty state (hero glyph +
                     // heading + body) instead of a bare one-liner.
-                    col = col.push(empty_state(
-                        "Nothing here yet",
-                        "Start mde-musicd to load your library across the mesh.",
-                    ));
+                    // POLISH-music-playlistcreate — the Playlists page pairs its
+                    // empty state with the inline create form so a zero-playlist
+                    // operator can make their first one. Without it the page (and
+                    // the add-to-playlist sheet's "create one on the Playlists
+                    // page" hint) dead-ends.
+                    let (heading, body, show_create) = empty_state_for(route);
+                    col = col.push(empty_state(heading, body));
+                    if show_create {
+                        col = col.push(container(self.new_playlist_form()).center_x(Length::Fill));
+                    }
                 } else {
                     let mut items = self.items.clone();
                     // MUSIC-ALBUMS-4 — apply the in-header filter (case-insensitive
@@ -2898,16 +2904,7 @@ impl State {
                     }
                     // MUSIC-RFX-6 — the Playlists page gets a "new playlist" form.
                     if matches!(route, Route::Category(HubCard::Playlists)) {
-                        col = col.push(
-                            row![
-                                text_input("New playlist name…", &self.new_playlist_name)
-                                    .on_input(Message::NewPlaylistNameChanged)
-                                    .on_submit(Message::CreatePlaylist)
-                                    .width(Length::Fixed(280.0)),
-                                button(text("Create").size(13)).on_press(Message::CreatePlaylist),
-                            ]
-                            .spacing(8),
-                        );
+                        col = col.push(self.new_playlist_form());
                     }
                     col = col.push(
                         scrollable(grid)
@@ -3005,6 +3002,22 @@ impl State {
         } else {
             page.into()
         }
+    }
+
+    /// MUSIC-RFX-6 / POLISH-music-playlistcreate — the inline "new playlist"
+    /// form (name field + Create). Shared by the populated Playlists grid and
+    /// its empty state, so a zero-playlist operator always has a way to create
+    /// the first one (single-sourced here rather than duplicated, §6).
+    fn new_playlist_form(&self) -> Element<'_, Message> {
+        row![
+            text_input("New playlist name…", &self.new_playlist_name)
+                .on_input(Message::NewPlaylistNameChanged)
+                .on_submit(Message::CreatePlaylist)
+                .width(Length::Fixed(280.0)),
+            button(text("Create").size(13)).on_press(Message::CreatePlaylist),
+        ]
+        .spacing(8)
+        .into()
     }
 
     /// MUSIC-RFX-7 — the add-to-playlist picker sheet: the operator's playlists
@@ -4076,6 +4089,28 @@ fn empty_state(heading: &str, body: &str) -> Element<'static, Message> {
     .into()
 }
 
+/// POLISH-music-playlistcreate — selects the empty-state copy for a category
+/// page and whether to pair it with the inline create-playlist form. The
+/// Playlists page MUST offer creation from its empty state: a zero-playlist
+/// operator has no other entry point (the add-to-playlist sheet only points
+/// back here), so without this the core "create your first playlist" flow
+/// dead-ends. Returns `(heading, body, show_create_form)`.
+const fn empty_state_for(route: &Route) -> (&'static str, &'static str, bool) {
+    if matches!(route, Route::Category(HubCard::Playlists)) {
+        (
+            "No playlists yet",
+            "Name your first playlist below to get started.",
+            true,
+        )
+    } else {
+        (
+            "Nothing here yet",
+            "Start mde-musicd to load your library across the mesh.",
+            false,
+        )
+    }
+}
+
 /// Render one search section: a heading + a clickable row per item. An
 /// empty section renders nothing. `on_click` maps an item to its message.
 fn result_section<'a>(
@@ -4111,6 +4146,34 @@ mod theme_tests {
         assert!((bg.r - f32::from(p.background.r) / 255.0).abs() < 0.01);
         assert!((bg.g - f32::from(p.background.g) / 255.0).abs() < 0.01);
         assert!((bg.b - f32::from(p.background.b) / 255.0).abs() < 0.01);
+    }
+}
+
+#[cfg(test)]
+mod empty_state_tests {
+    use super::{empty_state_for, HubCard, Route};
+
+    #[test]
+    fn playlists_empty_state_offers_create() {
+        // POLISH-music-playlistcreate — a zero-playlist operator must be able to
+        // create their first from the Playlists empty state; the third tuple
+        // field gates the inline create-playlist form.
+        let (heading, _body, show_create) = empty_state_for(&Route::Category(HubCard::Playlists));
+        assert!(
+            show_create,
+            "Playlists empty state must show the create form"
+        );
+        assert_eq!(heading, "No playlists yet");
+    }
+
+    #[test]
+    fn other_categories_have_no_create_form() {
+        // Albums/Artists/etc. have no inline create affordance — their empty
+        // state is the generic "start the daemon" hint only.
+        for card in [HubCard::Albums, HubCard::Artists, HubCard::Genres] {
+            let (_h, _b, show_create) = empty_state_for(&Route::Category(card));
+            assert!(!show_create, "{card:?} must not show a create form");
+        }
     }
 }
 
