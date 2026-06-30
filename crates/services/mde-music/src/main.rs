@@ -452,11 +452,14 @@ struct State {
     /// tick armed). Started at launch; restarted when the Home dashboard's
     /// skeleton is first replaced by real content (staged reveal).
     mount: Option<motion::MountReveal>,
-    /// BEAUT-MUSIC — the breathing skeleton placeholder phase, used while the
-    /// library grid / Home dashboard is still loading the daemon state. Static
-    /// (no tick) under reduce-motion; the shimmer subscription gates on
-    /// [`State::skeleton_visible`] so it costs nothing once content lands.
-    shimmer: motion::Shimmer,
+    /// BEAUT-MUSIC — the breathing skeleton placeholder fill, used while the
+    /// library grid / Home dashboard is still loading the daemon state. The shared
+    /// Carbon primitive ([`mde_theme::SkeletonShimmer`]) — its breathe, fill, and
+    /// reduce-motion contract are single-sourced in `mde-theme`, not re-derived
+    /// here. Static (no tick) under reduce-motion / the motion kill switch; the
+    /// subscription gates on [`SkeletonShimmer::needs_tick`] (fed
+    /// [`State::skeleton_visible`]) so it costs nothing once content lands.
+    shimmer: mde_theme::SkeletonShimmer,
 }
 
 /// MUSIC-RFX-8 — the target of a right-click track context menu. A track row
@@ -851,7 +854,11 @@ impl State {
             // card or, once creds exist, the dock chrome settling in over its
             // skeleton). Restarted when the Home dashboard's stats land.
             mount: Some(motion::MountReveal::starting_at(now, reduce_motion)),
-            shimmer: motion::Shimmer::starting_at(now, reduce_motion),
+            // BEAUT-MUSIC — the effective reduce-motion is already folded once at
+            // launch (`motion_suppressed`: a11y pref OR the kill switch), so seed
+            // the shared shimmer with that resolved flag rather than re-reading
+            // prefs.
+            shimmer: mde_theme::SkeletonShimmer::new(now, reduce_motion),
         }
     }
 
@@ -1946,9 +1953,11 @@ impl State {
             Subscription::none()
         };
         // BEAUT-MUSIC — the skeleton shimmer ticker, armed ONLY while a breathing
-        // placeholder is on screen AND motion is on (under reduce-motion the grey
-        // is static, so no tick). It self-disarms the instant real content lands.
-        let shimmer = if self.skeleton_visible() && self.shimmer.animates() {
+        // placeholder is on screen AND motion is live (under reduce-motion / the
+        // kill switch the grey is static, so no tick) — the shared
+        // `SkeletonShimmer::needs_tick(visible)` predicate, fed the surface's
+        // visibility. It self-disarms the instant real content lands.
+        let shimmer = if self.shimmer.needs_tick(self.skeleton_visible()) {
             cosmic::iced::time::every(motion::SHIMMER_TICK).map(|_| Message::ShimmerTick)
         } else {
             Subscription::none()
@@ -2426,25 +2435,27 @@ impl State {
             // BEAUT-MUSIC — a breathing Carbon skeleton (title bar · hero counts ·
             // server line · count chips) while the first `library-stats` batch is
             // in flight, so Home paints its structure within one frame instead of
-            // a bare "Loading…" line. Static grey under reduce-motion; the shimmer
-            // tick gates on `skeleton_visible`.
-            let a = self.shimmer.alpha(std::time::Instant::now());
+            // a bare "Loading…" line. The fill is the shared
+            // `SkeletonShimmer::fill` (the palette `text` token at the live shimmer
+            // alpha) — static grey under reduce-motion; the tick gates on
+            // `skeleton_visible`.
+            let fill = self.shimmer.fill(std::time::Instant::now(), &p);
             let hero_block = row![
-                skeleton_bar(90.0, 40.0, a),
-                skeleton_bar(90.0, 40.0, a),
-                skeleton_bar(90.0, 40.0, a),
+                skeleton_bar(90, 40, fill),
+                skeleton_bar(90, 40, fill),
+                skeleton_bar(90, 40, fill),
             ]
             .spacing(40);
             return column![
-                skeleton_bar(180.0, 24.0, a),
+                skeleton_bar(180, 24, fill),
                 Space::new().height(Length::Fixed(18.0)),
                 hero_block,
                 Space::new().height(Length::Fixed(22.0)),
-                skeleton_bar(260.0, 16.0, a),
+                skeleton_bar(260, 16, fill),
                 Space::new().height(Length::Fixed(8.0)),
-                skeleton_bar(320.0, 12.0, a),
+                skeleton_bar(320, 12, fill),
                 Space::new().height(Length::Fixed(20.0)),
-                skeleton_bar(360.0, 14.0, a),
+                skeleton_bar(360, 14, fill),
             ]
             .spacing(0)
             .padding(8)
@@ -2655,8 +2666,8 @@ impl State {
                     // "Loading…" line, so a navigation paints structure within one
                     // frame and the slow load reads as active (static under
                     // reduce-motion).
-                    let alpha = self.shimmer.alpha(std::time::Instant::now());
-                    col = col.push(skeleton_grid(cols, alpha));
+                    let fill = self.shimmer.fill(std::time::Instant::now(), &route_pal);
+                    col = col.push(skeleton_grid(cols, fill));
                 } else if let Some(err) = &self.load_error {
                     col = col.push(
                         text(err.clone())
@@ -3948,39 +3959,66 @@ impl QueueWindow {
     }
 }
 
+/// BEAUT-MUSIC — render one Carbon skeleton placeholder: a rounded, breathing
+/// rectangle. Geometry (width / height / corner) is the shared
+/// [`mde_theme::SkeletonBlock`] token shape (`width == None` ⇒ fill the available
+/// width); `fill` is the resolved [`mde_theme::SkeletonShimmer::fill`] — the
+/// palette `text` token at the live shimmer alpha — so every skeleton on the
+/// surface breathes on the one shared convention and the corner radius is a
+/// [`mde_theme::Radii`] token, never a re-derived literal (§4 / §6: consume the
+/// primitive, don't reimplement it).
+fn skeleton_block(
+    block: mde_theme::SkeletonBlock,
+    fill: mde_theme::Rgba,
+) -> Element<'static, Message> {
+    let width = block
+        .width
+        .map_or(Length::Fill, |w| Length::Fixed(f32::from(w)));
+    let color = carbon(fill, fill.a);
+    let radius = f32::from(block.radius);
+    container(
+        Space::new()
+            .width(width)
+            .height(Length::Fixed(f32::from(block.height))),
+    )
+    .style(move |_| cosmic::iced::widget::container::Style {
+        background: Some(color.into()),
+        border: cosmic::iced::Border {
+            color: cosmic::iced::Color::TRANSPARENT,
+            width: 0.0,
+            radius: radius.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
 /// MUSIC-RESPONSIVE-6 / BEAUT-MUSIC — a grid of greyed Carbon skeleton tiles
-/// shown while a category loads, matching the real card geometry (160px col,
-/// 150px art tile + a short label bar) so navigation paints structure within one
-/// frame instead of a blank pane. The tiles **breathe** at `alpha`
-/// ([`motion::Shimmer::alpha`]) so a slow load reads as active; under
-/// reduce-motion that alpha is the static mid grey (no movement). `cols` mirrors
-/// the real grid's width-adaptive column count.
-fn skeleton_grid(cols: usize, alpha: f32) -> Element<'static, Message> {
-    let cpal = mde_theme::Palette::dark();
-    // The breathing fill: the muted-text token at the shimmer alpha, matching the
-    // shared `mde-theme` skeleton convention (panel_chrome::skeleton).
-    let fill = carbon(cpal.text_muted, alpha);
-    let block = move |w: Length, h: f32| -> Element<'static, Message> {
-        container(Space::new().width(w).height(Length::Fixed(h)))
-            .style(move |_| cosmic::iced::widget::container::Style {
-                background: Some(fill.into()),
-                border: cosmic::iced::Border {
-                    color: cosmic::iced::Color::TRANSPARENT,
-                    width: 0.0,
-                    radius: 4.0.into(),
-                },
-                ..Default::default()
-            })
-            .into()
-    };
+/// shown while a category loads, matching the real card geometry (the
+/// single-sourced Carbon grid metrics: art tile + gutter + card width) so
+/// navigation paints structure within one frame instead of a blank pane. The
+/// tiles **breathe** via `fill` — the shared [`mde_theme::SkeletonShimmer::fill`]
+/// — so a slow load reads as active; under reduce-motion that fill is the static
+/// mid grey (no movement). `cols` mirrors the real grid's width-adaptive column
+/// count.
+fn skeleton_grid(cols: usize, fill: mde_theme::Rgba) -> Element<'static, Message> {
+    let radii = mde_theme::Radii::defaults();
     // MUSIC-RFX-10 — the skeleton tile mirrors the real card geometry from the
     // single-sourced Carbon grid metrics (art tile + gutter + card width), so the
     // loading placeholder lines up pixel-for-pixel with the cards it precedes.
     let gm = GridMetrics::carbon_dense();
     let tile = move || -> Element<'static, Message> {
+        // The art tile fills the card width; `art_height` is an integer-valued
+        // metric (`f32::from(u16)`), so the down-cast is exact. The label below is
+        // a standard skeleton text line (`sm` corner, text-line height).
+        let art = mde_theme::SkeletonBlock {
+            width: None,
+            height: gm.art_height as u16,
+            radius: radii.sm,
+        };
         column![
-            block(Length::Fill, gm.art_height),
-            block(Length::Fixed(110.0), 12.0),
+            skeleton_block(art, fill),
+            skeleton_block(mde_theme::SkeletonBlock::line(Some(110), radii), fill),
         ]
         .spacing(gm.gap)
         .width(Length::Fixed(gm.card_width))
@@ -3998,29 +4036,18 @@ fn skeleton_grid(cols: usize, alpha: f32) -> Element<'static, Message> {
     grid.into()
 }
 
-/// BEAUT-MUSIC — a single breathing Carbon skeleton bar at `alpha`, the
+/// BEAUT-MUSIC — a single breathing Carbon skeleton bar of `w`×`h` px, the
 /// building block for the Home dashboard's loading placeholder (hero counts /
-/// server line / chips). The muted-text token at the shimmer alpha, matching the
-/// shared `mde-theme` skeleton convention; under reduce-motion `alpha` is the
-/// static mid grey.
-fn skeleton_bar(w: f32, h: f32, alpha: f32) -> Element<'static, Message> {
-    let cpal = mde_theme::Palette::dark();
-    let fill = carbon(cpal.text_muted, alpha);
-    container(
-        Space::new()
-            .width(Length::Fixed(w))
-            .height(Length::Fixed(h)),
-    )
-    .style(move |_| cosmic::iced::widget::container::Style {
-        background: Some(fill.into()),
-        border: cosmic::iced::Border {
-            color: cosmic::iced::Color::TRANSPARENT,
-            width: 0.0,
-            radius: 4.0.into(),
-        },
-        ..Default::default()
-    })
-    .into()
+/// server line / chips). A pinned [`mde_theme::SkeletonBlock`] at the `sm` Carbon
+/// corner, painted with the shared [`mde_theme::SkeletonShimmer::fill`]; under
+/// reduce-motion that fill is the static mid grey.
+fn skeleton_bar(w: u16, h: u16, fill: mde_theme::Rgba) -> Element<'static, Message> {
+    let block = mde_theme::SkeletonBlock {
+        width: Some(w),
+        height: h,
+        radius: mde_theme::Radii::defaults().sm,
+    };
+    skeleton_block(block, fill)
 }
 
 /// BEAUT-MUSIC — a tasteful Carbon empty state: a muted hero glyph over a

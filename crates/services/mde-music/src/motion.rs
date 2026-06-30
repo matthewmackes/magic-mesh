@@ -23,7 +23,7 @@
 
 use std::time::{Duration, Instant};
 
-use mde_theme::animation::{shimmer_alpha, slide_in, LoopingTween, RenderParams, Transition};
+use mde_theme::animation::{slide_in, RenderParams, Transition};
 use mde_theme::motion::Motion;
 
 /// Hover-lift travel for a transport/nav button (px the control rises on hover).
@@ -211,59 +211,15 @@ pub fn reveal_params(reveal: Option<Reveal>, now: Instant, row_idx: u32) -> Rend
 
 /// BEAUT-MUSIC — the per-frame cadence for the skeleton shimmer (~30 fps).
 ///
-/// The breathe is slow (a ~1.5 s `loading` period — see [`Shimmer`]), so half
-/// the reveal rate keeps the placeholder lively at a fraction of the wakeups, and
-/// it is armed only while a skeleton is on screen (MOTION-PERF-1 — a settled,
-/// content-painted surface costs nothing).
+/// The breathing skeleton state itself is the shared
+/// [`mde_theme::SkeletonShimmer`] (the library/now-playing/Home placeholders
+/// consume it directly — no local copy); this const is only the consumer-side
+/// repaint clock. The breathe is slow (the shared ~700 ms `Motion::loading`
+/// period the shimmer runs on), so half the reveal rate keeps the placeholder
+/// lively at a fraction of the wakeups, and it is armed only while a skeleton is
+/// on screen and motion is live (`SkeletonShimmer::needs_tick`) — MOTION-PERF-1,
+/// a settled content-painted surface costs nothing.
 pub const SHIMMER_TICK: Duration = Duration::from_millis(33);
-
-/// BEAUT-MUSIC — the looping breathe driving the library/now-playing skeleton
-/// placeholders shown while the daemon state loads.
-///
-/// A single [`mde_theme::animation::LoopingTween`] on the shared
-/// [`Motion::loading`] preset; [`Shimmer::alpha`] is the
-/// [`mde_theme::animation::shimmer_alpha`] ping-pong (glue, not a
-/// reimplementation), which is **STATIC at the mid alpha under reduce-motion** —
-/// a plain grey block, no movement (Q32: motion is never the only cue; the
-/// structure itself is the placeholder).
-///
-/// Tick-gating: a skeleton arms [`SHIMMER_TICK`] only while it is on screen, and
-/// **never under reduce-motion** ([`Shimmer::animates`] is `false`), so the
-/// breathe costs zero idle wakeups once real content lands.
-#[derive(Clone, Copy, Debug)]
-pub struct Shimmer {
-    tween: LoopingTween,
-    reduce_motion: bool,
-}
-
-impl Shimmer {
-    /// Begin the shimmer breathe at `start`. One per surface; restarting is
-    /// harmless (the phase is derived from `start`, not accumulated).
-    #[must_use]
-    pub fn starting_at(start: Instant, reduce_motion: bool) -> Self {
-        Self {
-            tween: LoopingTween::starting_at(start, Motion::loading().duration),
-            reduce_motion,
-        }
-    }
-
-    /// The skeleton tile alpha `0.10..=0.22` at `now` — the breathing grey. A
-    /// pure delegate to [`mde_theme::animation::shimmer_alpha`] over this
-    /// shimmer's looping phase, so the reduce-motion contract (a static mid
-    /// grey) lives centrally in `mde-theme`.
-    #[must_use]
-    pub fn alpha(self, now: Instant) -> f32 {
-        shimmer_alpha(self.tween.phase(now), self.reduce_motion)
-    }
-
-    /// Whether this shimmer actually moves: `true` only when motion is on. Under
-    /// reduce-motion the alpha is phase-independent, so a caller arms **no tick**
-    /// (the static grey is correct on the first frame and never changes).
-    #[must_use]
-    pub const fn animates(self) -> bool {
-        !self.reduce_motion
-    }
-}
 
 /// BEAUT-MUSIC — the gentle first-paint reveal for a whole settling surface (the
 /// welcome card on first open, the Home dashboard once stats land).
@@ -448,34 +404,6 @@ mod tests {
         assert_eq!(p.alpha, 1.0);
         assert_eq!(p.translate_y, 0.0);
         assert_eq!(p.scale, 1.0);
-    }
-
-    #[test]
-    fn shimmer_breathes_with_motion_and_is_static_under_reduce_motion() {
-        // BEAUT-MUSIC — with motion on the skeleton breathes within the
-        // mde-theme bounds and the alpha varies across the cycle; it animates so
-        // a caller arms the tick.
-        let t0 = Instant::now();
-        let s = Shimmer::starting_at(t0, false);
-        assert!(s.animates(), "motion-on shimmer arms a tick");
-        let period = mde_theme::motion::Motion::loading().duration;
-        let lo = s.alpha(t0);
-        let mid = s.alpha(t0 + period / 2);
-        assert!((mde_theme::animation::SKELETON_ALPHA_DIM
-            ..=mde_theme::animation::SKELETON_ALPHA_BRIGHT)
-            .contains(&lo));
-        assert!(
-            (mid - lo).abs() > 1e-3,
-            "the breathe actually moves across the cycle ({lo} vs {mid})"
-        );
-        // Reduce-motion: a static mid grey, phase-independent, and NO tick armed.
-        let r = Shimmer::starting_at(t0, true);
-        assert!(!r.animates(), "reduce-motion shimmer arms no tick");
-        assert_eq!(
-            r.alpha(t0),
-            r.alpha(t0 + period / 2),
-            "reduce-motion alpha is phase-independent (static grey)"
-        );
     }
 
     #[test]
