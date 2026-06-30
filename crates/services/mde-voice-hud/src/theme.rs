@@ -72,6 +72,46 @@ pub const ON_PRIMARY: Color = tok(carbon::WHITE);
 /// An available / online mesh peer (drives the resolved-chip "mesh · <name>").
 pub const PRESENCE_AVAILABLE: Color = SUCCESS;
 
+// ---------- Contrast-aware label colour (WCAG) ----------
+
+/// WCAG relative luminance of `c` (0.0 = black … 1.0 = white). The sRGB channels
+/// are linearised per the WCAG 2.x definition before the luma weights apply.
+/// Pure; reads the already-token-derived `Color`, so it mints nothing.
+fn relative_luminance(c: Color) -> f32 {
+    fn linearize(ch: f32) -> f32 {
+        if ch <= 0.03928 {
+            ch / 12.92
+        } else {
+            ((ch + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    let (lr, lg, lb) = (linearize(c.r), linearize(c.g), linearize(c.b));
+    lr.mul_add(0.2126, lg.mul_add(0.7152, lb * 0.0722))
+}
+
+/// WCAG contrast ratio between two colours (1.0 = identical … 21.0 = black/white).
+fn contrast_ratio(a: Color, b: Color) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Pick the chip/label foreground that reads best over `fill`: the dark text
+/// token ([`SURF`], Gray 100) on light fills, the light text token ([`ON_SURF`],
+/// Gray 10) on dark fills — whichever wins the WCAG contrast. This is the §4
+/// contrast fix for the status chips, which used to paint raw white over the
+/// light Green-40 / Blue-40 fills (≈ 1.9 : 1, an AA fail); the pick mirrors the
+/// call pill, which already lays dark text over its saturated status fills. Both
+/// candidates are single-sourced `mde-theme` tokens — nothing is minted.
+#[must_use]
+pub fn label_on(fill: Color) -> Color {
+    if contrast_ratio(ON_SURF, fill) >= contrast_ratio(SURF, fill) {
+        ON_SURF
+    } else {
+        SURF
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +135,49 @@ mod tests {
         assert_eq!(rgb8(SUCCESS), (0x42, 0xbe, 0x65), "success = Green 40");
         assert_eq!(rgb8(ERROR), (0xfa, 0x4d, 0x56), "error = Red 50");
         assert_eq!(rgb8(WARNING), (0xf1, 0xc2, 0x1b), "warning = Yellow 30");
+    }
+
+    /// Axis-3 contrast — the light Green/Blue/Red status fills must take the DARK
+    /// label (Gray 100), the same dark-on-fill treatment the call pill uses; this
+    /// is the fix for the old raw white-on-Green-40 (≈ 1.9 : 1) AA fail.
+    #[test]
+    fn label_on_picks_dark_text_over_light_fills() {
+        assert_eq!(label_on(SUCCESS), SURF, "green-40 fill → dark label");
+        assert_eq!(label_on(PRESENCE_AVAILABLE), SURF, "presence fill → dark");
+        assert_eq!(label_on(INFO), SURF, "blue-40 fill → dark label");
+        assert_eq!(label_on(PRIMARY), SURF, "blue-50 fill → dark label");
+        assert_eq!(label_on(ERROR), SURF, "red-50 fill → dark label");
+    }
+
+    /// The neutral dark fills (Gray 70 empty/partial chip, Gray 100) keep the
+    /// light label.
+    #[test]
+    fn label_on_picks_light_text_over_dark_fills() {
+        assert_eq!(label_on(SURF_C_HI), ON_SURF, "gray-70 fill → light label");
+        assert_eq!(label_on(SURF), ON_SURF, "gray-100 fill → light label");
+    }
+
+    /// Quantify the fix on the worst offender (Green-40): the chosen label clears
+    /// WCAG AA (≥ 4.5 : 1) where the old raw white was well under 3 : 1.
+    #[test]
+    fn label_on_clears_aa_where_raw_white_failed() {
+        let chosen = label_on(SUCCESS);
+        assert!(
+            contrast_ratio(chosen, SUCCESS) >= 4.5,
+            "chip label must clear AA on Green-40, got {}",
+            contrast_ratio(chosen, SUCCESS)
+        );
+        assert!(
+            contrast_ratio(Color::WHITE, SUCCESS) < 3.0,
+            "raw white on Green-40 was the failing baseline"
+        );
+    }
+
+    /// Relative luminance spans the full black→white range (sanity-checks the
+    /// sRGB linearisation).
+    #[test]
+    fn relative_luminance_spans_black_to_white() {
+        assert!(relative_luminance(Color::BLACK) < 0.01);
+        assert!(relative_luminance(Color::WHITE) > 0.99);
     }
 }
