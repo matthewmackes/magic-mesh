@@ -29,6 +29,9 @@ pub mod model;
 pub mod panel_chrome;
 pub mod panels;
 pub mod patternfly;
+/// CTRLSURF-1 — the unified verb-aware relevance ladder behind every search
+/// (the launcher overlay + the Front Door omnibox rank through one path).
+pub mod relevance;
 pub mod role;
 pub mod sidebar;
 pub mod single_instance;

@@ -2527,10 +2527,10 @@ Reproducible + portable per-mesh DevOps backoffice on a dedicated control VM, re
 
 _Design: `docs/design/workbench-control-surface.md` (locked 2026-06-29 via the operator design tour + the 10-paradigm + nav-rethink workflows + a convergence survey). Phased + feature-flagged; build via the farm (`xcp-build.sh`)._
 
-- [ ] **CTRLSURF-1: unified verb-aware relevance ladder**
+- [✓] **CTRLSURF-1: unified verb-aware relevance ladder** *(new `relevance::score` module is the one ladder; front_door score tests pass unchanged; both launcher+omnibox route through it)*
   As an operator, I want one relevance ladder behind every search, so the launcher and the omnibox rank identically and there is one place to tune.
-  - [ ] a standalone module merges `search::score_match` + `launcher::fuzzy_score`; the existing score tests (`front_door.rs` ~9102-9169) pass against it unchanged
-  - [ ] `cargo test -p mde-workbench --lib` green on the farm
+  - [✓] a standalone module merges `search::score_match` + `launcher::fuzzy_score`; the existing score tests (`front_door.rs` ~9102-9169) pass against it unchanged
+  - [✓] `cargo test -p mde-workbench --lib` green on the farm
 - [ ] **CTRLSURF-2: the Compact command-line + status surface**
   As an operator, I want a compact window with one command line over ~5 live status rows, so I get the 4-second glance + launch without a full screen.
   - [ ] rows render from `FrontDoorData::read`/`mod project` (no fake values, §7); an absent Bus shows the `responded=false` state, never a hang; no synchronous Bus read on keypress (cache-first + debounced async preview)

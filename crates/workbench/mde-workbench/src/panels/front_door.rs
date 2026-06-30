@@ -1142,7 +1142,7 @@ pub struct SearchHit {
     pub context: String,
     /// What kind of hit this is (drives the section + the tie-break order).
     pub kind: HitKind,
-    /// Relevance score (higher = better); see [`search::score_match`].
+    /// Relevance score (higher = better); see [`crate::relevance::score`].
     pub score: u32,
     /// The app message activating this hit fires — always one `App::update`
     /// handles (a `SelectPanel` route or a `LaunchApp` spawn).
@@ -1196,37 +1196,11 @@ pub(super) mod search {
     /// contract: `action/copilot/ask`, reply on the generic `reply/<ulid>` lane).
     pub const COPILOT_ASK_TOPIC: &str = "action/copilot/ask";
 
-    /// Score one candidate `haystack` against the lowercased `needle`. Higher is
-    /// better; `0` means no match (the candidate is dropped). The ladder is the
-    /// "exact / prefix / word-prefix / substring" relevance the design accepts
-    /// (frequency/recency not needed — these are small, static-ish catalogs):
-    /// an exact equality outranks a leading-prefix, which outranks a match at a
-    /// word boundary, which outranks a bare substring. Pure + case-insensitive.
-    #[must_use]
-    pub fn score_match(haystack: &str, needle: &str) -> u32 {
-        if needle.is_empty() {
-            return 0;
-        }
-        let hay = haystack.to_lowercase();
-        let need = needle.to_lowercase();
-        if hay == need {
-            return 100;
-        }
-        if hay.starts_with(&need) {
-            return 80;
-        }
-        // A match at the start of any whitespace/`-`/`_`/`/`-delimited word.
-        if hay
-            .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '/')
-            .any(|word| word.starts_with(&need))
-        {
-            return 60;
-        }
-        if hay.contains(&need) {
-            return 40;
-        }
-        0
-    }
+    /// CTRLSURF-1 — score one candidate `haystack` against `needle` (higher =
+    /// better; `0` = no match, the candidate is dropped). The omnibox now ranks
+    /// through the ONE unified relevance ladder so it agrees with the launcher;
+    /// this is the historical omnibox name for [`crate::relevance::score`].
+    pub use crate::relevance::score as score_match;
 
     /// FRONTDOOR-6 — compute the instant LOCAL results for `query` over the real
     /// catalogs (§7 — no `demo_data`): the app launchers (`tiles` with a launch
@@ -1618,86 +1592,12 @@ pub(super) mod launcher {
         s == "running" || s == "up" || s.starts_with("up ")
     }
 
-    /// APPLAUNCH-2 — the relevance score of `needle` against one `haystack`
-    /// field (higher = better; `0` = no match). The ladder extends the existing
-    /// FD `score_match` with a **fuzzy / typo-tolerant** tail (Q5): exact (100) >
-    /// prefix (80) > word-prefix (60) > substring (40) > **subsequence with a
-    /// small edit budget** (1..=30, scaled by how tight the match is). The fuzzy
-    /// tail catches "frefox"→"Firefox" and "gmp"→"GIMP" without surfacing the old
-    /// mid-word-substring noise above a real prefix hit. Pure + case-insensitive.
-    #[must_use]
-    pub fn fuzzy_score(haystack: &str, needle: &str) -> u32 {
-        if needle.is_empty() {
-            return 0;
-        }
-        let hay = haystack.to_lowercase();
-        let need = needle.to_lowercase();
-        if hay == need {
-            return 100;
-        }
-        if hay.starts_with(&need) {
-            return 80;
-        }
-        if hay
-            .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '/' || c == '.')
-            .any(|w| w.starts_with(&need))
-        {
-            return 60;
-        }
-        if hay.contains(&need) {
-            return 40;
-        }
-        // Fuzzy tail: an in-order subsequence match (the needle's chars appear in
-        // order in the haystack, gaps allowed) — typo/abbreviation tolerant. The
-        // score rewards a tighter span (fewer gap chars between the matched ones),
-        // so "frefox" beats a loose scatter. Below substring so a real substring
-        // always outranks a fuzzy hit.
-        match subsequence_span(&hay, &need) {
-            Some(span) if span > 0 => {
-                // Tightness in [0,1]: needle-len / matched-span. Map to 1..=30.
-                let tightness = (need.chars().count() as f32) / (span as f32);
-                1 + (tightness * 29.0).round() as u32
-            }
-            _ => 0,
-        }
-    }
-
-    /// The character span (first..=last matched index, inclusive count) of the
-    /// tightest in-order subsequence of `needle` within `haystack`, or `None` when
-    /// `needle` isn't a subsequence. A greedy left-to-right scan finds the first
-    /// occurrence of each needle char after the previous; the span is the index
-    /// distance covered. Operates on `char`s (Unicode-safe). Returns the matched
-    /// span length in chars (>= needle length).
-    #[must_use]
-    fn subsequence_span(haystack: &str, needle: &str) -> Option<usize> {
-        let hay: Vec<char> = haystack.chars().collect();
-        let need: Vec<char> = needle.chars().collect();
-        if need.is_empty() {
-            return None;
-        }
-        let mut hi = 0usize;
-        let mut first = None;
-        let mut last = 0usize;
-        for &nc in &need {
-            let mut matched = false;
-            while hi < hay.len() {
-                if hay[hi] == nc {
-                    if first.is_none() {
-                        first = Some(hi);
-                    }
-                    last = hi;
-                    hi += 1;
-                    matched = true;
-                    break;
-                }
-                hi += 1;
-            }
-            if !matched {
-                return None;
-            }
-        }
-        first.map(|f| last - f + 1)
-    }
+    /// APPLAUNCH-2 / CTRLSURF-1 — the relevance score of `needle` against one
+    /// `haystack` field (higher = better; `0` = no match). The launcher ranks
+    /// through the ONE unified ladder (exact > prefix > word-prefix > substring >
+    /// fuzzy subsequence tail), so it agrees with the omnibox; this is the
+    /// historical launcher name for [`crate::relevance::score`].
+    pub use crate::relevance::score as fuzzy_score;
 
     /// APPLAUNCH-2 — the best relevance score of `query` over an entry's full
     /// search scope (name + keywords + description / Q6). The name is the primary
