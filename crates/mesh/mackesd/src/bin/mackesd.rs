@@ -5768,6 +5768,25 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("xcp_host".into());
         }
+        // KVM-HEALTH (MV-2) — the Fedora+KVM successor to xcpng_health. Probes
+        // the per-node KVM virtualization service catalog
+        // (`mackesd_core::kvm::KVM_SERVICES`, `systemctl is-active` each) every
+        // 30 s and publishes a whole-host health summary to `event/kvm/services`
+        // so the Datacenter panels + the alert lane see the live stack state.
+        // The KVM stack is universal — every mesh node runs the same libvirt +
+        // Podman set (docs/design/mesh-virt-management.md: "same stack on every
+        // machine") — so it gates through the rank-0-default worker resolver,
+        // i.e. it runs everywhere.
+        if mackesd_core::worker_role::runs("kvm_health", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::kvm_health::KvmHealthWorker::new(node_id.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("kvm_health".into());
+        }
         // OV-7.a (v2.6) — health reconciler. Polls each known
         // peer's QNM-Shared heartbeat.json every 5 s, applies the
         // telemetry::health_state_from_age threshold table, writes

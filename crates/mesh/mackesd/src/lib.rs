@@ -173,6 +173,12 @@ pub mod voip_rtt;
 // pile (the live-mesh wedge). Non-gated so the always-compiled `ca::revoke` +
 // `voip_rtt` callers can use it in a no-default-features build.
 pub mod proc_reap;
+// MV-1 — the per-node KVM virtualization service catalog (the Fedora+KVM
+// replacement for the xcp-ng toolstack). Pure data + helpers; non-gated so any
+// consumer reads the catalog without the async-services worker pool. The
+// host-health worker (MV-2, `workers::kvm_health`) folds it onto
+// `event/kvm/services`.
+pub mod kvm;
 pub mod worker;
 /// E1.2 — role-gated worker subsets (which workers `run_serve` spawns per role).
 pub mod worker_role;

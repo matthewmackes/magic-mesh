@@ -510,6 +510,12 @@ pub mod xcp_host;
 // the IP over the mackes-xcp Hypervisor layer (the runtime caller of
 // set_identity_seed, so a provisioned VM actually gets its identity seed).
 pub mod xcp_provision;
+// KVM-HEALTH (MV-2) — the Fedora+KVM successor to xcpng_health. Probes the
+// per-node KVM virtualization service catalog (`crate::kvm::KVM_SERVICES`,
+// `systemctl is-active` each) every 30 s and publishes a whole-host health
+// summary to `event/kvm/services` so the Datacenter panels + the alert lane see
+// the live stack state. Universal — every mesh node runs the same KVM stack.
+pub mod kvm_health;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
 // text clip on the bus + appends to ONE mesh-global `clipboard/history.json`
