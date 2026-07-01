@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=MCNF Notification Hub
-Comment=Slide-out mesh + desktop alert center (NOTIFY-3); Workstation-rank gated — Servers/Lighthouses are headless. OPT-IN (off by default): the applet bell already spawns the Hub on demand, so auto-opening the panel at login is opt-in. Set X-GNOME-Autostart-enabled=true (or enable in Settings ▸ Startup Applications) to have it open at login.
-Exec=sh -c "mackesd role-gate --min-rank 2 && exec mde-notify-center"
-Icon=magic-mesh
-Terminal=false
-NoDisplay=true
-X-GNOME-Autostart-enabled=false
