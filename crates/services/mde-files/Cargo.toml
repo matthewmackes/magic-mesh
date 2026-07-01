@@ -13,10 +13,6 @@ repository.workspace   = true
 # `mde-shell-egui`, reusing this crate's render-agnostic backend/model/send_to
 # over the Bus. The crate is now lib-only (no libcosmic/wgpu/winit).
 [dependencies]
-# Object Card data form (ObjectCard / Icon / Palette) — the toolkit-free data
-# types (the render-agnostic `density` module single-sources its Carbon metrics
-# from here). The iced/libcosmic GUI that consumed it was stripped (E12-14b).
-mde-theme  = { path = "../../shared/mde-theme" }
 # Single-sourced QNM-Shared mount resolution so the mesh-home subtitle
 # shows the real mount, not a phantom /mnt/mesh-storage.
 mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }

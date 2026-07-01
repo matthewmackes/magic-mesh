@@ -7,10 +7,10 @@
 //! (NOTIFY-4):
 //!
 //!   * [`AlertItem`] + [`Severity`] + [`Source`] — the typed model (NOTIFY-1).
-//!   * [`classify_severity`] / [`classify_source`] / [`severity_token`] — the
-//!     grouping + color engine (NOTIFY-2): topic → source, `severity`-field
-//!     and/or bus `Priority` → severity, severity → an `mde-theme` Carbon
-//!     token (no raw hex — §4).
+//!   * [`classify_severity`] / [`classify_source`] — the grouping engine
+//!     (NOTIFY-2): topic → source, `severity`-field and/or bus `Priority`
+//!     → severity. Color mapping is done by the rendering surface (e.g.
+//!     `mde-shell-egui` maps `Severity` → `Style::DANGER/WARN/ACCENT/OK`).
 //!   * [`AlertTail`] — tails the live bus alert lanes via
 //!     [`mde_bus::persist::Persist::list_since`] with a per-topic cursor,
 //!     deduped by ULID, bounded by a retention horizon (NOTIFY-1).
@@ -23,7 +23,6 @@
 use std::collections::{HashMap, HashSet};
 
 use mde_bus::persist::{Persist, StoredMessage};
-use mde_theme::{Palette, Rgba};
 
 /// Alert severity — the color + sort axis. Ordered most-severe first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -158,18 +157,6 @@ pub fn topic_is_alert_lane(topic: &str) -> bool {
         || t == "mackesd::alert"
         || t.contains("presence")
         || peer_host(t).is_some()
-}
-
-/// The `mde-theme` Carbon token a severity renders in (NOTIFY-2 — no raw hex;
-/// the caller supplies the active [`Palette`]).
-#[must_use]
-pub fn severity_token(severity: Severity, palette: &Palette) -> Rgba {
-    match severity {
-        Severity::Critical => palette.danger,
-        Severity::Warning => palette.warning,
-        Severity::Info => palette.accent,
-        Severity::Success => palette.success,
-    }
 }
 
 /// NOTIFY-5 — the freedesktop XDG sound-theme name for a severity, played via
@@ -608,15 +595,6 @@ mod tests {
         ] {
             assert!(!topic_is_alert_lane(t), "should NOT tail {t}");
         }
-    }
-
-    #[test]
-    fn severity_token_maps_to_the_carbon_status_colors() {
-        let p = Palette::dark();
-        assert_eq!(severity_token(Severity::Critical, &p), p.danger);
-        assert_eq!(severity_token(Severity::Warning, &p), p.warning);
-        assert_eq!(severity_token(Severity::Info, &p), p.accent);
-        assert_eq!(severity_token(Severity::Success, &p), p.success);
     }
 
     #[test]
