@@ -44,3 +44,22 @@ _(2026-06-29 — surfaced during the workbench critical-bug drain. The `accept` 
 
 Units the drain loop parked automatically (a live-infra/artifact/gate blocker it could not clear from a build). Each needs an operator/live action.
 - **E12-9-audio** (parked 2026-07-01) — remote audio needs an ironrdp RDPSND/audio virtual-channel API that the pinned version doesn't expose; needs an ironrdp bump or a custom SVC decoder — operator/design call
+
+## BUCKET-A onboard-seam live-verify (2026-07-01)
+
+The onboard verbs are on the live fleet (11.3.1). The seams verifiable with prod-SSH
+alone are **DONE + LIVE-VERIFIED** (OW-10 self-test, OW-13 recovery, OW-4 invite-issue —
+see their worklist markers; 3 real bugs found + fixed, incl. the security-relevant
+Nebula-Cert-V2 fingerprint fix shipped as 11.3.1). The remaining seams each need one
+operator-provided cred/host — drop any and the loop wires + live-verifies it:
+
+- **OW-4 join-half / OW-3 mesh-create / OW-5 network bring-up** — _needs:_ a **fresh
+  throwaway node** to enroll/found/configure (spinning one itself needs a hypervisor
+  or a DO droplet — the build VMs can't be used without disrupting their farm role).
+- **OW-7 spawn-lighthouse (cloud)** — _needs:_ a **DigitalOcean API token** so
+  `LiveProvisioner` can push-provision + enroll a droplet.
+- **OW-8 first-desktop** — _needs:_ a **live cloud-hypervisor host** (api-socket) + a
+  golden VM disk so `LiveFirstDesktop` can clone → boot → open the broker session.
+- **OW-11 service-add** — _needs:_ **DO Spaces creds** (Music → Navidrome, overlaps
+  MEDIA-2) + an **external SIP account** (Voice) so `LiveServiceApply` can provision /
+  register.
