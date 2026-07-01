@@ -6,17 +6,23 @@
 //! * `event/kvm/services` (MV-2 `kvm_health`) — each node's KVM service-health
 //!   summary (libvirtd / podman / … up or down).
 //! * `event/vm/instances` (MV-3 `vm_lifecycle`) — each node's VM roster.
+//! * `event/podman/containers` (MV-4 `container`) — each node's Podman container
+//!   roster (MV-6b).
 //! * `action/vm/lifecycle` (MV-3) — create / start / stop, **host-targeted** so a
 //!   request can only ever act on the one node it names (the worker drops any
 //!   request that doesn't `targets()` its own id; an empty host never matches).
 //!
 //! The payloads are a JSON boundary: we mirror them with **local** serde structs
-//! (field shapes read from `mackesd`'s `kvm_health.rs` / `vm_lifecycle.rs`)
-//! rather than depending on the daemon crate — the shell stays in the
-//! desktop-shell tier and only leans inward on `mde-bus` (§6).
+//! (field shapes read from `mackesd`'s `kvm_health.rs` / `vm_lifecycle.rs` /
+//! `container.rs`) rather than depending on the daemon crate — the shell stays in
+//! the desktop-shell tier and only leans inward on `mde-bus` (§6).
 //!
-//! Podman container rows are a deliberate follow-up: the MV-4 container worker
-//! (`event/podman/containers`) is not on master yet, so nothing here reads it.
+//! The container roster is rendered **read-only** (name / image / state) beside the
+//! VM roster: it completes MV-6's "VMs *and* containers" surface. Container
+//! run/stop lifecycle-drive (publishing `action/container/lifecycle`) is a
+//! deliberate follow-up — the container worker has no "start an existing container"
+//! verb to mirror the VM Start/Stop toggle, so the read-only roster lands cleanly
+//! first rather than half-wiring a drive.
 //!
 //! `project` is pure (no Bus, no GPU) and unit-tested directly; the only IO is
 //! `poll` (a cheap local `Persist` read) and `publish` (a `Persist` write — the
@@ -38,6 +44,8 @@ use mde_bus::persist::Persist;
 const SERVICES_TOPIC: &str = "event/kvm/services";
 /// Per-node VM roster topic (MV-3 `vm_lifecycle`).
 const INSTANCES_TOPIC: &str = "event/vm/instances";
+/// Per-node Podman container roster topic (MV-4 `container`, read by MV-6b).
+const CONTAINERS_TOPIC: &str = "event/podman/containers";
 /// VM lifecycle request topic (MV-3). Flat — per-node targeting is the request's
 /// `host` field, never the topic.
 const ACTION_TOPIC: &str = "action/vm/lifecycle";
@@ -100,6 +108,29 @@ struct InstanceReport {
     published_at_ms: u64,
 }
 
+/// One container row — mirrors `container::Container` (the podman `id` on the wire
+/// is not rendered, so it's omitted; serde drops it).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct Container {
+    /// Container name (first of podman's `Names`) — the roster key.
+    name: String,
+    /// Image reference (`docker.io/library/nginx:latest`, `postgres:16`, …).
+    image: String,
+    /// Raw podman state string (`running`, `exited`, `created`, `paused`, …).
+    state: String,
+}
+
+/// Whole-node container roster — mirrors `container::ContainerReport`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct ContainerReport {
+    /// Publishing node id.
+    host: String,
+    /// The node's containers in `podman ps --all` order.
+    containers: Vec<Container>,
+    /// Publish time (ms since the Unix epoch) — the latest-wins fold key.
+    published_at_ms: u64,
+}
+
 // ──────────────────────────── projected view ────────────────────────────
 
 /// One node's live datacenter reality, folded from the latest health + roster
@@ -117,6 +148,14 @@ struct NodeView {
     roster_seen: bool,
     /// Publish time of the roster currently held (latest-wins fold key).
     roster_at_ms: u64,
+    /// Latest container roster (also empty for a genuinely empty node — see
+    /// `containers_seen`).
+    containers: Vec<Container>,
+    /// `true` once an `event/podman/containers` report has been seen for this host
+    /// — distinguishes "no containers" from "container roster not yet reported".
+    containers_seen: bool,
+    /// Publish time of the container roster currently held (latest-wins fold key).
+    containers_at_ms: u64,
 }
 
 impl NodeView {
@@ -127,14 +166,22 @@ impl NodeView {
             instances: Vec::new(),
             roster_seen: false,
             roster_at_ms: 0,
+            containers: Vec::new(),
+            containers_seen: false,
+            containers_at_ms: 0,
         }
     }
 }
 
 /// Fold raw topic bodies into a sorted-by-host per-node view. Latest message wins
-/// per host (health + roster tracked independently by `published_at_ms`), so a
-/// growing topic collapses to one row per node. Pure — no Bus, no GPU.
-fn project(health_bodies: &[String], instance_bodies: &[String]) -> Vec<NodeView> {
+/// per host (health, VM roster + container roster each tracked independently by
+/// their own `published_at_ms`), so a growing topic collapses to one row per node.
+/// Pure — no Bus, no GPU.
+fn project(
+    health_bodies: &[String],
+    instance_bodies: &[String],
+    container_bodies: &[String],
+) -> Vec<NodeView> {
     let mut nodes: BTreeMap<String, NodeView> = BTreeMap::new();
 
     for body in health_bodies {
@@ -165,6 +212,20 @@ fn project(health_bodies: &[String], instance_bodies: &[String]) -> Vec<NodeView
             entry.roster_at_ms = r.published_at_ms;
             entry.instances = r.instances;
             entry.roster_seen = true;
+        }
+    }
+
+    for body in container_bodies {
+        let Ok(r) = serde_json::from_str::<ContainerReport>(body) else {
+            continue;
+        };
+        let entry = nodes
+            .entry(r.host.clone())
+            .or_insert_with(|| NodeView::new(&r.host));
+        if !entry.containers_seen || r.published_at_ms >= entry.containers_at_ms {
+            entry.containers_at_ms = r.published_at_ms;
+            entry.containers = r.containers;
+            entry.containers_seen = true;
         }
     }
 
@@ -356,7 +417,8 @@ impl DatacenterState {
         };
         let health = read_bodies(&persist, SERVICES_TOPIC);
         let instances = read_bodies(&persist, INSTANCES_TOPIC);
-        self.nodes = project(&health, &instances);
+        let containers = read_bodies(&persist, CONTAINERS_TOPIC);
+        self.nodes = project(&health, &instances, &containers);
     }
 
     /// Render the Fleet plane's live datacenter content: per-node KVM
@@ -385,8 +447,8 @@ impl DatacenterState {
             ui.add_space(Style::SP_XS);
             ui.label(
                 RichText::new(
-                    "Each mesh node publishes its libvirt/Podman stack health and VM roster \
-                     to the Bus.",
+                    "Each mesh node publishes its libvirt/Podman stack health, VM roster, \
+                     and container roster to the Bus.",
                 )
                 .color(Style::TEXT_DIM)
                 .size(Style::SMALL),
@@ -407,6 +469,15 @@ impl DatacenterState {
                     });
                     ui.add_space(Style::SP_S);
                 }
+                // MV-6b lands the container roster read-only; container run/stop
+                // lifecycle-drive (action/container/lifecycle) is a follow-up.
+                ui.colored_label(
+                    Style::TEXT_DIM,
+                    RichText::new(
+                        "Container rows are read-only — run/stop lifecycle-drive is a follow-up.",
+                    )
+                    .size(Style::SMALL),
+                );
             });
 
         if let Some(action) = pending {
@@ -512,6 +583,45 @@ fn show_node(
     // Create control (host-targeted to this node).
     ui.add_space(Style::SP_XS);
     show_create(ui, &node.host, create_for, form, pending);
+
+    // Container roster (read-only — mirrors the VM roster; MV-6b).
+    ui.add_space(Style::SP_XS);
+    ui.label(
+        RichText::new("Containers")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL),
+    );
+    ui.indent((node.host.as_str(), "containers"), |ui| {
+        if node.containers.is_empty() {
+            let msg = if node.containers_seen {
+                "No containers on this node."
+            } else {
+                "Container roster not yet reported."
+            };
+            ui.colored_label(Style::TEXT_DIM, RichText::new(msg).size(Style::SMALL));
+        } else {
+            for c in &node.containers {
+                ui.horizontal(|ui| {
+                    show_container_row(ui, c);
+                });
+            }
+        }
+    });
+}
+
+/// One container roster row (read-only): a state pip + name + image + raw state.
+/// Mirrors [`show_instance_row`] without the lifecycle buttons — container run/stop
+/// drive is a deliberate follow-up (see the module doc).
+fn show_container_row(ui: &mut egui::Ui, c: &Container) {
+    let running = c.state.trim() == "running";
+    let dot = if running { Style::OK } else { Style::TEXT_DIM };
+    ui.label(RichText::new("\u{25CF}").color(dot).size(Style::SMALL));
+    ui.add_space(Style::SP_XS);
+    ui.label(RichText::new(&c.name).color(Style::TEXT).size(Style::SMALL));
+    ui.add_space(Style::SP_S);
+    ui.colored_label(Style::TEXT_DIM, RichText::new(&c.image).size(Style::SMALL));
+    ui.add_space(Style::SP_S);
+    ui.colored_label(Style::TEXT_DIM, RichText::new(&c.state).size(Style::SMALL));
 }
 
 /// One VM roster row: a state pip + name + raw state, and a Start (when not
@@ -656,6 +766,21 @@ mod tests {
         )
     }
 
+    fn container_body(host: &str, rows: &[(&str, &str, &str)], at: u64) -> String {
+        // A minimal but faithful `event/podman/containers` body — each row is
+        // (name, image, state). `id` is on the wire but not rendered (serde drops it).
+        let cs: Vec<String> = rows
+            .iter()
+            .map(|(n, img, s)| {
+                format!(r#"{{"id":"-","name":"{n}","image":"{img}","state":"{s}"}}"#)
+            })
+            .collect();
+        format!(
+            r#"{{"host":"{host}","containers":[{}],"published_at_ms":{at}}}"#,
+            cs.join(",")
+        )
+    }
+
     #[test]
     fn project_folds_one_row_per_host_sorted() {
         let health = vec![
@@ -663,19 +788,31 @@ mod tests {
             health_body("node-a", false, 1),
         ];
         let instances = vec![roster_body("node-a", &[("web1", "running")], 1)];
-        let nodes = project(&health, &instances);
+        let containers = vec![container_body(
+            "node-a",
+            &[("cache", "redis:7", "running")],
+            1,
+        )];
+        let nodes = project(&health, &instances, &containers);
         assert_eq!(nodes.len(), 2, "one row per host");
         // BTreeMap key order → sorted by host.
         assert_eq!(nodes[0].host, "node-a");
         assert_eq!(nodes[1].host, "node-b");
-        // node-a has both a health summary and a roster.
+        // node-a has a health summary, a VM roster, AND a container roster — the
+        // "VMs and containers" surface folds onto one node view.
         assert!(nodes[0].health.is_some());
         assert!(nodes[0].roster_seen);
         assert_eq!(nodes[0].instances.len(), 1);
         assert_eq!(nodes[0].instances[0].name, "web1");
-        // node-b has health but no roster reported yet.
+        assert!(nodes[0].containers_seen);
+        assert_eq!(nodes[0].containers.len(), 1);
+        assert_eq!(nodes[0].containers[0].name, "cache");
+        assert_eq!(nodes[0].containers[0].image, "redis:7");
+        assert_eq!(nodes[0].containers[0].state, "running");
+        // node-b has health but no VM roster / container roster reported yet.
         assert!(nodes[1].health.is_some());
         assert!(!nodes[1].roster_seen);
+        assert!(!nodes[1].containers_seen);
     }
 
     #[test]
@@ -685,7 +822,7 @@ mod tests {
             health_body("node-a", false, 10),
             health_body("node-a", true, 20),
         ];
-        let nodes = project(&health, &[]);
+        let nodes = project(&health, &[], &[]);
         assert_eq!(nodes.len(), 1);
         let h = &nodes[0].health;
         assert!(
@@ -701,7 +838,7 @@ mod tests {
             roster_body("node-a", &[("web1", "running")], 5),
             roster_body("node-a", &[("web1", "shut off"), ("db1", "running")], 9),
         ];
-        let nodes = project(&[], &instances);
+        let nodes = project(&[], &instances, &[]);
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].instances.len(), 2, "the newer roster wins");
         assert_eq!(nodes[0].roster_at_ms, 9);
@@ -710,7 +847,7 @@ mod tests {
     #[test]
     fn project_skips_malformed_bodies() {
         let health = vec!["not json".to_string(), health_body("node-a", true, 1)];
-        let nodes = project(&health, &["{}".to_string()]);
+        let nodes = project(&health, &["{}".to_string()], &[]);
         // The garbage + the `{}` (missing required fields) are dropped; only the
         // valid node-a survives.
         assert_eq!(nodes.len(), 1);
@@ -719,7 +856,72 @@ mod tests {
 
     #[test]
     fn empty_bodies_project_to_no_nodes() {
-        assert!(project(&[], &[]).is_empty());
+        assert!(project(&[], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn project_folds_containers_per_host_sorted() {
+        let containers = vec![
+            container_body("node-b", &[("web", "nginx:latest", "running")], 1),
+            container_body("node-a", &[("db", "postgres:16", "exited")], 1),
+        ];
+        let nodes = project(&[], &[], &containers);
+        assert_eq!(nodes.len(), 2, "one row per host");
+        // BTreeMap key order → sorted by host.
+        assert_eq!(nodes[0].host, "node-a");
+        assert_eq!(nodes[1].host, "node-b");
+        assert!(nodes[0].containers_seen);
+        assert_eq!(nodes[0].containers.len(), 1);
+        assert_eq!(nodes[0].containers[0].name, "db");
+        assert_eq!(nodes[0].containers[0].image, "postgres:16");
+        assert_eq!(nodes[0].containers[0].state, "exited");
+    }
+
+    #[test]
+    fn project_latest_containers_win_per_host() {
+        let containers = vec![
+            container_body("node-a", &[("web", "nginx", "running")], 5),
+            container_body(
+                "node-a",
+                &[("web", "nginx", "exited"), ("db", "pg", "running")],
+                9,
+            ),
+        ];
+        let nodes = project(&[], &[], &containers);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].containers.len(), 2, "the newer roster wins");
+        assert_eq!(nodes[0].containers_at_ms, 9);
+    }
+
+    #[test]
+    fn project_container_roster_seen_distinguishes_empty_from_unreported() {
+        // A host with health but no container report → containers_seen false, so the
+        // view can honestly say "not yet reported" rather than "no containers".
+        let nodes = project(&[health_body("node-a", true, 1)], &[], &[]);
+        assert_eq!(nodes.len(), 1);
+        assert!(!nodes[0].containers_seen);
+        assert!(nodes[0].containers.is_empty());
+
+        // An explicitly empty roster → seen true, still no containers.
+        let empty = container_body("node-a", &[], 3);
+        let nodes = project(&[], &[], &[empty]);
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].containers_seen);
+        assert!(nodes[0].containers.is_empty());
+    }
+
+    #[test]
+    fn project_skips_malformed_container_bodies() {
+        let containers = vec![
+            "not json".to_string(),
+            "{}".to_string(), // missing required fields
+            container_body("node-a", &[("web", "nginx", "running")], 1),
+        ];
+        let nodes = project(&[], &[], &containers);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].host, "node-a");
+        assert_eq!(nodes[0].containers.len(), 1);
+        assert_eq!(nodes[0].containers[0].name, "web");
     }
 
     #[test]
