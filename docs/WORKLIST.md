@@ -2592,18 +2592,18 @@ _Design: `docs/design/workbench-control-surface.md` (locked 2026-06-29 via the o
 - [✓] **CTRLSURF-2: the Compact command-line + status surface** *(new `Mode::Compact`: one always-focused command line over 5 ambient status rows (Mesh/Nodes/Build/Alerts/System) projected from the folded `FrontDoorData`/`mod project` tiles via the pure `compact` module; the command line routes through the CTRLSURF-1 `relevance::score` ladder; cache-first — instant local hits sync, the Copilot preview ~120ms-debounced (no Bus on keypress); an unanswered `action/mesh/directory` shows the `responded=false` offline notice, never a hang. Additive — reachable via a Compact/Expand toggle; Panel/FullScreen + the existing `view()` untouched (the real window resize is CTRLSURF-5))*
   As an operator, I want a compact window with one command line over ~5 live status rows, so I get the 4-second glance + launch without a full screen.
   - [✓] rows render from `FrontDoorData::read`/`mod project` (no fake values, §7); an absent Bus shows the `responded=false` state, never a hang; no synchronous Bus read on keypress (cache-first + debounced async preview)
-- [ ] **CTRLSURF-3: whole-home keyboard nav**
+- [✓] **CTRLSURF-3: whole-home keyboard nav** _(landed c74d321; reconciled 2026-07-01)_
   As a keyboard-first operator, I want Up/Down/Enter/Esc/Tab/Ctrl+1..5 on the home (launcher closed), so I never reach for the mouse.
-  - [ ] `launcher_key_subscription` is active on the home view; every binding drives a real message
-- [ ] **CTRLSURF-4: Expand "what changed" activity rail**
+  - [✓] `launcher_key_subscription` is active on the home view; every binding drives a real message
+- [✓] **CTRLSURF-4: Expand "what changed" activity rail** _(landed b6ad8bc; reconciled 2026-07-01)_
   As an operator, I want a chronological change rail in Expand, so I can see farm/peer/datacenter events since I last looked.
-  - [ ] driven by the peers directory-changed push + the 15s `poll_subscription`; real bus events, no demo data
-- [ ] **CTRLSURF-5: CompactExpand window-size + expand-arrow resize**
+  - [✓] driven by the peers directory-changed push + the 15s `poll_subscription`; real bus events, no demo data
+- [✓] **CTRLSURF-5: CompactExpand window-size + expand-arrow resize** _(landed 51001b3; reconciled 2026-07-01)_
   As an operator, I want the expand arrow to actually resize the window between compact and full screen, so compact is a real Win10-Start-sized window.
-  - [ ] a `CompactExpand` enum augments `Mode`; the arrow performs a real `window::` resize (not an in-window swap); state survives reopen; the old `mode_toggle` swap is retired
-- [ ] **CTRLSURF-6: one universal sidebar + scope-first nav taxonomy**
+  - [✓] a `CompactExpand` enum augments `Mode`; the arrow performs a real `window::` resize (not an in-window swap); state survives reopen; the old `mode_toggle` swap is retired
+- [✓] **CTRLSURF-6: one universal sidebar + scope-first nav taxonomy** _(landed dabc1fa; reconciled 2026-07-01)_
   As an operator, I want a single left nav with plain-language scope-first sections + sub-groups, so the two stacked rails and the SHOUTING labels are gone.
-  - [ ] the Front Door rail folds into `sidebar.rs`; `model.rs` renders the scope-first sections (Overview/This Node/Mesh/Fleet/Datacenter/Monitoring/System) with sub-group headers; no SHOUTING labels; `Group::from_slug` round-trips every section
+  - [✓] the Front Door rail folds into `sidebar.rs`; `model.rs` renders the scope-first sections (Overview/This Node/Mesh/Fleet/Datacenter/Monitoring/System) with sub-group headers; no SHOUTING labels; `Group::from_slug` round-trips every section
 - [ ] **CTRLSURF-7: shared zebra `striped_list` helper**
   As an operator, I want every list zebra-striped, so dense rows are scannable.
   - [ ] a shared helper (the `mde-notify-center` zebra idiom) backs the list/table panels; Carbon tokens only (§4)
