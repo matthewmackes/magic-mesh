@@ -288,7 +288,7 @@ impl Persist {
     /// after long uptime" wedge. Detect the swap (cheap stat) and reopen the
     /// connection so a long-running consumer follows the live DB. Returns `true`
     /// if it reopened. Lifts the MUSIC-WEDGE-2 pattern into the shared crate so
-    /// every consumer (mackesd workers, mde-workbench, mde-musicd) is covered.
+    /// every consumer (mackesd workers, GUI surfaces, mde-musicd) is covered.
     pub fn reopen_if_index_changed(&mut self) -> bool {
         let db_path = self.bus_root.join("index.sqlite");
         let live = file_inode(&db_path);

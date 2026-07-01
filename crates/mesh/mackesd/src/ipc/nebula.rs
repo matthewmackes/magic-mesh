@@ -86,9 +86,9 @@ pub const ACTION_VERBS: [&str; 5] = [
 /// its object-path/bus-name consts are gone — reads + the
 /// RegenCerts write serve on `action/nebula/*`, and the three
 /// signals fan out here as fire-and-forget event rows. Consumers
-/// (Workbench Overview) `list_since` this topic from a per-reader
-/// cursor. Keep the literal in sync with mde-workbench's
-/// `home::NEBULA_EVENT_TOPIC`.
+/// (GUI overview surfaces) `list_since` this topic from a per-reader
+/// cursor. The literal is the Bus contract event readers key on;
+/// the `event_topic_locks` test pins it.
 pub const NEBULA_EVENT_TOPIC: &str = "event/nebula/signals";
 
 /// JSON wire shape for the Status() reply.
@@ -520,9 +520,8 @@ impl NebulaStatusService {
 
 /// Serialize a [`NebulaSignal`] to the JSON event body the
 /// dispatcher writes to [`NEBULA_EVENT_TOPIC`]. The `kind` tag lets
-/// one topic carry all three variants; mde-workbench's
-/// `home::nebula_event_from_body` is the matching decoder, so keep
-/// the `kind` strings in sync with it.
+/// one topic carry all three variants; downstream decoders key on
+/// the `kind` strings, so the round-trip test below locks them.
 #[must_use]
 pub fn signal_event_body(signal: &NebulaSignal) -> String {
     match signal {
@@ -845,15 +844,15 @@ mod tests {
 
     #[test]
     fn event_topic_locks() {
-        // E0.3.1.b — the signal fan-out topic; mde-workbench's
-        // home::NEBULA_EVENT_TOPIC must match this literal.
+        // E0.3.1.b — the signal fan-out topic; every event consumer
+        // reads this literal, so it must never drift.
         assert_eq!(NEBULA_EVENT_TOPIC, "event/nebula/signals");
     }
 
     #[test]
     fn signal_event_body_round_trips_each_variant() {
         // The dispatcher serializes each NebulaSignal to this JSON;
-        // mde-workbench's home::nebula_event_from_body parses it.
+        // downstream event consumers parse it by the `kind` tag.
         let peer = signal_event_body(&NebulaSignal::PeerStateChanged {
             node_id: "peer:pine".into(),
             reachable: "online".into(),

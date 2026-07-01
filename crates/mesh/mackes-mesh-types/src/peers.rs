@@ -243,7 +243,7 @@ pub fn default_mesh_home() -> PathBuf {
 }
 
 /// Resolve the workgroup-root directory — the single source of truth
-/// shared by `mackesd` (directory/healthz) and `mde-workbench` (every
+/// shared by `mackesd` (directory/healthz) and the GUI shell (every
 /// panel that reads off mesh-storage). Under SUBSTRATE-V2 this is the
 /// plain Syncthing-replicated dir at `/mnt/mesh-storage`.
 ///

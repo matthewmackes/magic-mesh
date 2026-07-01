@@ -8,9 +8,9 @@
 #
 # Crates: platform (Bus, role) · mesh (mackesd control plane, Nebula, transport,
 # config, types, the magic-fleet Automation Mesh node engine) · services
-# (mde-files, voice HUD/config, music) · workbench (the Cosmic control surface) ·
-# shared (the Carbon look stack: theme, iced-components, card, disclaimer) ·
-# kdc (the canonical KDE Connect host).
+# (mde-files, voice HUD/config, music) · desktop (the E12 egui shell + panels;
+# the Workbench is a plane inside mde-shell-egui) · shared (the egui harness +
+# look stack, card, disclaimer) · kdc (the canonical KDE Connect host).
 #
 # EFF-35 — libcosmic git-pin policy. libcosmic has no crates.io release, so
 # the three consumers (mde-cosmic-applet, mde-files, mde-role-chooser) pin
@@ -42,7 +42,6 @@ members = [
     "crates/services/mde-notify",
     "crates/services/mde-voice-config",
     "crates/services/mde-voice-hud",
-    "crates/workbench/mde-workbench",
     "crates/desktop/mde-shell-egui",
     "crates/desktop/mde-mesh-view",
     "crates/desktop/mde-music-egui",

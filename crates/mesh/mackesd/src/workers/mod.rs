@@ -382,8 +382,8 @@ pub mod hardware_probe;
 // perf retired 2026-05-27 (TUNE-3.b): the Rust port of
 // `mackes/mesh_perf.py`'s read-only sysfs surface was destined for
 // the Workbench Mesh Performance panel (Python GTK), which retires
-// under EPIC-RETIRE-PY-WORKBENCH. The Iced mde-workbench panel
-// equivalent doesn't yet exist; if a future v2.x panel needs the
+// under EPIC-RETIRE-PY-WORKBENCH. No Workbench panel
+// equivalent exists; if a future v2.x panel needs the
 // same sysfs reads, restoring from `git log -p
 // crates/mackesd/src/workers/perf.rs` is trivial. No live consumer
 // of the pure helpers (`kernel_module_loaded` / `current_mtu` /

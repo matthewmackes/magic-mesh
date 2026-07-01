@@ -1,5 +1,5 @@
-//! Shared mesh-resource types, consumed by `mackesd`, `mde-workbench`,
-//! and `mackes-config`.
+//! Shared mesh-resource types, consumed by `mackesd`, the GUI
+//! surfaces, and `mackes-config`.
 //!
 //! A `MeshResource` is anything the mackes mesh exposes that can be rendered
 //! as a first-class dock item — a peer, a mounted share, or an advertised

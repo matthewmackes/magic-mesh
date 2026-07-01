@@ -18,8 +18,8 @@
 //! `audiopus_sys` already emits `cargo:rustc-link-lib=dylib=opus`, and
 //! `-lopus` falls back to `libopus.a` when no `.so` is present — so the
 //! vendored archive links. The directive propagates to the final link of
-//! this crate AND of downstream binaries (e.g. `mde-workbench`, which
-//! depends on `mde-musicd`), and it re-globs after `cargo clean`, so the
+//! this crate AND of downstream binaries that depend on `mde-musicd`,
+//! and it re-globs after `cargo clean`, so the
 //! fix is durable without the non-reproducible manual symlink.
 
 use std::path::Path;

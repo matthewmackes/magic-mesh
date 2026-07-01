@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=MCNF Workbench
-Comment=The mesh control surface
-Exec=mde-workbench
-Icon=magic-mesh
-Terminal=false
-Categories=Settings;

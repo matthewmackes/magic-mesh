@@ -310,7 +310,7 @@ pub fn fleet_workload_entries(this_node: &str) -> Vec<AppEntry> {
 
 /// Pure variant (unit-tested): read every `<root>/<host>/compute-inventory.json`.
 ///
-/// Ports the proven `fold_bus_inventories` discipline (mde-workbench compute
+/// Ports the proven `fold_bus_inventories` discipline (the Workbench compute
 /// panel): every node — including this one — publishes its own
 /// `compute-inventory.json` onto the share, so without a self-skip the local
 /// box's own VMs/containers would surface here AND again from the responder's

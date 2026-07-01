@@ -3,8 +3,8 @@
 //!
 //! Mirrors the JSON shape `dev.mackes.MDE.Nebula.Status`'s
 //! `Status() + ListPeers()` calls return. Defined here so
-//! every consumer (mde-peer-card, mde-workbench's mesh
-//! panels, the v2.5 wizard preview page) reads from the
+//! every consumer (mde-peer-card, the mesh panels of the
+//! GUI shell, the v2.5 wizard preview page) reads from the
 //! same canonical struct rather than re-deriving fields
 //! from the raw JSON.
 //!

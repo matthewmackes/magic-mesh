@@ -1009,10 +1009,9 @@ enum Cmd {
     },
 
     /// CB-1.5.a — fleet node roster. `mded nodes list --json` emits
-    /// every row from the `nodes` table as a JSON array; the Iced
-    /// inventory panel (in `crates/mde-workbench/src/panels/
-    /// inventory.rs`) consumes the same shape. Without `--json` the
-    /// command prints a human-readable table.
+    /// every row from the `nodes` table as a JSON array; GUI
+    /// inventory surfaces consume the same shape. Without `--json`
+    /// the command prints a human-readable table.
     Nodes {
         #[command(subcommand)]
         cmd: NodesCmd,
@@ -5619,8 +5618,9 @@ fn playbook_description(name: &str) -> &'static str {
 }
 
 /// `~/QNM-Shared/.qnm-sync/ansible-runs/` (or its
-/// `$QNM_SHARED_ROOT` override). Matches the panel's
-/// resolution in `mde-workbench/src/panels/run_history.rs`.
+/// `$QNM_SHARED_ROOT` override). Same resolution the retired
+/// Workbench's run-history panel used — the on-disk layout is
+/// the load-bearing contract.
 fn ansible_runs_root() -> PathBuf {
     let base = std::env::var("QNM_SHARED_ROOT").map(PathBuf::from).ok();
     let base = base.unwrap_or_else(|| {

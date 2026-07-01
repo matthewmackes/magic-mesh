@@ -361,7 +361,6 @@ assets = [
     { source = "target/release/mde-enroll",         dest = "/usr/bin/mde-enroll",         mode = "755" },
     { source = "target/release/magic-setup",        dest = "/usr/bin/magic-setup",        mode = "755" },
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
-    { source = "target/release/mde-workbench",      dest = "/usr/bin/mde-workbench",      mode = "755" },
     # E12-3 "Quasar" — the single egui shell that OWNS the DRM/KMS seat directly (no
     # compositor, no display manager) and hosts Workbench/Files/Music/Voice/Desktop/
     # Instances as in-shell panels. Built `--features drm` (the RPM build re-links this
@@ -381,9 +380,10 @@ assets = [
     # is deleted). The mde-musicd DAEMON stays — it drives the shell's Music panel.
     { source = "target/release/mde-musicd",         dest = "/usr/bin/mde-musicd",         mode = "755" },
     # APPLAUNCH-9 (2026-06-27) — the mde-apps-applet launcher binary was RETIRED:
-    # the app-launcher role folded into the Front Door (one launcher). The Start
-    # button now opens the Front Door launcher (com.mackes.MagicMeshApps.desktop →
-    # `mde-workbench --focus launcher`); nothing ships mde-apps-applet anymore.
+    # the app-launcher role folded into the Front Door (one launcher). E12-14c —
+    # the retired-era Workbench binary + its launcher/autostart .desktop entries
+    # (org.magicmesh.Workbench / com.mackes.MagicMeshApps / BootStatus) retired
+    # with it; the Front Door launcher now lives inside mde-shell-egui.
     # AUD-6 / PKG-5 — the first-run deployment-role chooser GUI (autostart below).
     { source = "target/release/mde-role-chooser",   dest = "/usr/bin/mde-role-chooser",   mode = "755" },
     # PKG-3 — the self-gating daemon unit + the role-gated app units.

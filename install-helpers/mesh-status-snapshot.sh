@@ -35,7 +35,9 @@ s_dns="$s_mackesd"                                   # mesh DNS is a mackesd wor
 s_voice="$(running mde-voice-hud)"
 s_music="$(running mde-musicd)"
 s_kdc="$([ "$ROLE" = workstation ] && [ "$s_mackesd" = true ] && echo true || echo false)"
-s_workbench="$(command -v mde-workbench >/dev/null 2>&1 && echo true || echo false)"
+# E12-14c — the Workbench is a plane inside the egui shell; the snapshot field
+# name stays "workbench" (consumers key on it) but the probe is the live binary.
+s_workbench="$(command -v mde-shell-egui >/dev/null 2>&1 && echo true || echo false)"
 
 if [ -n "$SELF" ] && [ -d "$WG" ]; then
     mkdir -p "$WG/$SELF" 2>/dev/null || true

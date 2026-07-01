@@ -1,6 +1,6 @@
 //! KDC2-5.1+5.2 — peer kind + KDC connect facts.
 //!
-//! Shared types consumed by `mde-peer-card`, `mde-workbench`,
+//! Shared types consumed by `mde-peer-card`, the GUI shell,
 //! and applet crates so all surfaces render the same view of a
 //! KDC-paired peer. Pure data — no I/O, no D-Bus, no protocol
 //! knowledge.
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// Coarse classification of a mesh peer. Drives conditional UI
 /// (phone-only sections in `mde-peer-card`, dock-icon glyph,
-/// device-row sorting in `mde-workbench`).
+/// device-row sorting in the GUI shell).
 ///
 /// Token table (`#[serde(rename_all = "snake_case")]`) — stays
 /// stable across releases since it's persisted in devices.toml

@@ -5,7 +5,7 @@
 //! Lives here (production home) since PC-2 (2026-05-21). The
 //! placeholder previously shipped in `mde_peer_card::probe::PeerProbe`
 //! now re-exports from this module so cross-crate consumers
-//! (mded, mde-workbench, future tooling) share one definition.
+//! (mded, the GUI surfaces, future tooling) share one definition.
 
 use serde::{Deserialize, Serialize};
 

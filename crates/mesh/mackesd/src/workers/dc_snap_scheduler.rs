@@ -2,8 +2,8 @@
 //! Storage tab's "Save schedule".
 //!
 //! The Workbench Datacenter panel's Storage tab persists a scheduled-snapshot
-//! config by publishing an `event/dc/snap-schedule/<sr>` record to the Bus (see
-//! `mde_workbench::panels::datacenter::snap_schedule_save`): `{ kind:
+//! config by publishing an `event/dc/snap-schedule/<sr>` record to the Bus
+//! (the retired Workbench's `snap_schedule_save` originated the shape): `{ kind:
 //! "snap-schedule", id, sr, retention, backup_target, dom0 }`. Until this worker,
 //! NOTHING consumed that topic — the config was honest persistence with no
 //! executor, so no snapshot was ever taken on a schedule and retention was never

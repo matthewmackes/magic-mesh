@@ -334,7 +334,7 @@ fn split_capabilities(raw: &str) -> Vec<String> {
 /// shunt worker (KDC2-4.3) feeds synthetic announces (relayed
 /// from neighbors' `phones.json`) via [`inject_synthetic`].
 /// Downstream consumers (`KdcHost::open` for outbound pairing
-/// + the `mde-workbench` peer list) drain via
+/// + the egui Workbench's peer list) drain via
 /// [`take_fresh`] on each tick.
 ///
 /// Receivers can't distinguish real from synthetic — both

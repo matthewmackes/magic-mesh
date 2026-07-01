@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=MCNF Mesh Boot Status
-Comment=BOOT-STATUS-5 — opens the Workbench at the mesh bring-up status at login, so the boot handshake (Nebula → bus → etcd → peers) is front-and-centre. Exits silently when the mesh is already all-green (the applet chip suffices).
-Exec=mde-workbench --boot-popup
-Icon=magic-mesh
-Terminal=false
-NoDisplay=true
-X-GNOME-Autostart-enabled=true

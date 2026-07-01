@@ -252,7 +252,7 @@ pub fn default_db_path() -> std::path::PathBuf {
 /// is EPIC-RETIRE-QNM Phase B.
 #[must_use]
 pub fn default_qnm_shared_root() -> std::path::PathBuf {
-    // Single-sourced in `mackes-mesh-types` so `mde-workbench` resolves
+    // Single-sourced in `mackes-mesh-types` so every GUI surface resolves
     // byte-for-byte the same mount (EPIC-RETIRE-QNM split-brain fix,
     // 2026-06-14): the workbench panels used to fall back to a phantom
     // `/mnt/mesh-storage` while this read `~/QNM-Shared`, so the GUI

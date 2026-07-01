@@ -22,8 +22,8 @@ mde-bus = { path = "../mde-bus" }
 # LIGHTHOUSE-7 — the canonical lighthouse `role` string (LIGHTHOUSE_ROLE) so the
 # applet's snapshot-based lighthouse-health indicator can't silently diverge from
 # the Workbench tab / mackesd. mackes-mesh-types is a shell-free mesh-side leaf
-# crate (the §6 boundary lint only forbids deps into crates/shell/*), already a
-# dep of the sibling mde-workbench.
+# crate (the §6 boundary lint only forbids deps into crates/shell/*), shared
+# with the other GUI surfaces.
 mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
 
 [dev-dependencies]

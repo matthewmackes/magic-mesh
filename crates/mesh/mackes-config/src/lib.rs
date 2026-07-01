@@ -2,8 +2,9 @@
 //!
 //! Per the 50-question lock (Q18–Q22), this file lives in TOML and is
 //! mesh-replicated whole-file via QNM-Shared. This crate carries the
-//! schema only — I/O lives in the consumer (`mde-workbench`'s
-//! panel-apps editor).
+//! schema only — I/O lives in the GUI consumer (under E12 that is
+//! the egui shell's panel configuration, succeeding the retired
+//! Workbench's panel-apps editor).
 
 #![forbid(unsafe_code)]
 
