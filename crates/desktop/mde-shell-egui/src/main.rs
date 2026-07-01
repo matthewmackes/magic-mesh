@@ -17,6 +17,7 @@
 mod chrome;
 mod datacenter;
 mod dock;
+mod instances;
 mod session;
 mod vdi;
 mod workbench;
@@ -78,6 +79,11 @@ struct Shell {
     /// the gated wire transport (E12-4) attaches one; the panel shows its honest
     /// "no desktop" EmptyState until then.
     vdi: vdi::VdiState,
+    /// The Instances surface — this workstation's local cloud-hypervisor VMs via
+    /// the `mde-kvm` broker (E12-7). Create / boot / shutdown drive mde-kvm's real
+    /// lifecycle; with no live VMM the ops surface mde-kvm's typed gated error, and
+    /// an empty roster shows the honest "No local VMs" EmptyState.
+    instances: instances::InstancesState,
 }
 
 impl Shell {
@@ -94,6 +100,7 @@ impl Shell {
             files: mde_files_egui::real_browser(),
             voice: VoiceApp::new(cc),
             vdi: vdi::VdiState::default(),
+            instances: instances::InstancesState::default(),
         }
     }
 
@@ -133,6 +140,15 @@ impl Shell {
                 if leave {
                     self.nav.surface = Surface::Workbench;
                 }
+            }
+            Surface::Instances => {
+                // The local cloud-hypervisor VM broker (E12-7). Scoped under its
+                // own `push_id` like every mounted surface so its egui ids can't
+                // collide in the shell's one `Context`.
+                let instances = &mut self.instances;
+                ui.push_id("shell-instances", |ui| {
+                    instances::instances_panel(ui, instances);
+                });
             }
             Surface::Music => {
                 music_pump(&mut self.music);

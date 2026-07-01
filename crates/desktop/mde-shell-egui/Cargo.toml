@@ -57,5 +57,12 @@ mde-voice-egui = { path = "../mde-voice-egui" }
 mde-vdi-rdp = { path = "../mde-vdi-rdp" }
 mde-vdi-vnc = { path = "../mde-vdi-vnc" }
 
+# E12-7 — the Instances surface. The local cloud-hypervisor VM broker: the shell's
+# `instances` panel is its first caller (the reachability fix E12-5a made for the
+# VDI crates). It drives mde-kvm's create/boot/shutdown lifecycle over the VM's
+# api-socket; the live VMM stays gated behind mde-kvm's own transport seam. The
+# edge points inward to the services tier (§6).
+mde-kvm = { path = "../../services/mde-kvm" }
+
 [lints]
 workspace = true

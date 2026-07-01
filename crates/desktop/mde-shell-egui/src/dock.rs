@@ -4,9 +4,10 @@
 //! not separate clients (§5, the EMBED model — there is no compositor). The dock
 //! is that shell nav: a compact vertical rail that selects which surface fills the
 //! shell body — the mesh-control [`Workbench`](Surface::Workbench) (This Node →
-//! Fleet, MV-6), the brokered VM [`Desktop`](Surface::Desktop) (VDI, egui-native),
-//! or one of the three embedded app surfaces (Music / Files / Voice). One surface
-//! shows at a time; the Workbench is always one click away.
+//! Fleet, MV-6), this node's local VM [`Instances`](Surface::Instances) (the
+//! cloud-hypervisor broker, E12-7), the brokered VM [`Desktop`](Surface::Desktop)
+//! (VDI, egui-native), or one of the three embedded app surfaces (Music / Files /
+//! Voice). One surface shows at a time; the Workbench is always one click away.
 //!
 //! The rail is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
@@ -28,6 +29,9 @@ pub(crate) enum Surface {
     /// The VDI **Desktop** surface — a brokered VM desktop rendered egui-native
     /// (`mde-vdi-rdp` / `mde-vdi-vnc`), the point of E12 "Quasar".
     Desktop,
+    /// The **Instances** surface — this workstation's local cloud-hypervisor VMs
+    /// (`mde-kvm`): the create / boot / shutdown lifecycle broker (E12-7).
+    Instances,
     /// The embedded Music surface (`mde-music-egui`).
     Music,
     /// The embedded Files surface (`mde-files-egui`).
@@ -38,9 +42,11 @@ pub(crate) enum Surface {
 
 impl Surface {
     /// The dock entries in nav order — the Workbench (mesh-control home) first,
-    /// then the brokered Desktop, then the three app surfaces.
-    pub(crate) const ALL: [Surface; 5] = [
+    /// then the local VM Instances broker + the brokered Desktop, then the three
+    /// app surfaces.
+    pub(crate) const ALL: [Surface; 6] = [
         Surface::Workbench,
+        Surface::Instances,
         Surface::Desktop,
         Surface::Music,
         Surface::Files,
@@ -51,6 +57,7 @@ impl Surface {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Surface::Workbench => "Workbench",
+            Surface::Instances => "Instances",
             Surface::Desktop => "Desktop",
             Surface::Music => "Music",
             Surface::Files => "Files",
@@ -64,6 +71,9 @@ impl Surface {
         match self {
             Surface::Workbench => {
                 "Mesh control — This Node, Controller, Network, Fleet, Provisioning."
+            }
+            Surface::Instances => {
+                "Manage this node's local VMs (cloud-hypervisor) — create, boot, shut down."
             }
             Surface::Desktop => "View a brokered VM desktop (RDP / VNC), rendered in-shell.",
             Surface::Music => "Play the mesh music library (Subsonic / Airsonic).",
@@ -106,11 +116,13 @@ mod tests {
     use super::Surface;
 
     #[test]
-    fn the_dock_lists_the_workbench_the_desktop_plus_the_three_app_surfaces() {
-        // Exactly five entries, Workbench first, then Desktop + the three surfaces.
-        assert_eq!(Surface::ALL.len(), 5);
+    fn the_dock_lists_the_workbench_the_vm_surfaces_plus_the_three_app_surfaces() {
+        // Exactly six entries, Workbench first, then the two VM surfaces
+        // (Instances / Desktop) + the three app surfaces.
+        assert_eq!(Surface::ALL.len(), 6);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
+            Surface::Instances,
             Surface::Desktop,
             Surface::Music,
             Surface::Files,
