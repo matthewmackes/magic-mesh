@@ -570,6 +570,16 @@ pub mod session_roaming;
 // (typed `ClipboardAccessError::IntegrationGated`, §7); the pure model + relay
 // pipeline ship green behind the seam.
 pub mod clipboard_bridge;
+// OW-11 (Bus half) — the service_onboard worker: `onboard service-add` reachable
+// over the Bus for the shell's Services flow. Drains `action/onboard/service-add`
+// (a typed ServiceAddAction: ServiceKind + optional SIP params + dry_run), runs
+// the EXISTING onboard::service_add engine (`plan_service_add` + the injectable
+// `ServiceApply` seam — §6 glue, no re-planning), and — leader-gated so an N-node
+// mesh answers once — publishes the typed ServiceAddEvent (plan steps / outcome /
+// typed error) on `event/onboard/service-add`. Production applies run over
+// `LiveServiceApply`, whose typed `IntegrationGated` is the honest live answer
+// today (§7 — never a fake success).
+pub mod service_onboard;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
 // text clip on the bus + appends to ONE mesh-global `clipboard/history.json`

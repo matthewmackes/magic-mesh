@@ -6552,6 +6552,28 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("session_roaming".into());
         }
+        // OW-11 (Bus half) — the service_onboard worker: `onboard service-add`
+        // reachable over the Bus. Drains `action/onboard/service-add`, runs the
+        // EXISTING onboard::service_add engine (plan + the injectable ServiceApply
+        // seam — §6 glue), and — leader-gated like session_broker so an N-node
+        // mesh answers each request once — publishes the typed result event on
+        // `event/onboard/service-add` for the shell's Services flow. Rank-0-default
+        // like session_broker (runs everywhere); real applies run over
+        // LiveServiceApply, whose typed IntegrationGated is the honest live answer
+        // today (§7).
+        if mackesd_core::worker_role::runs("service_onboard", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::service_onboard::ServiceOnboardWorker::new(
+                    workgroup_root.clone(),
+                    node_id.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("service_onboard".into());
+        }
         // E12-9 — the clipboard_bridge worker: the first of the E12-9 VDI client↔VM
         // bridges. Drains `action/vdi/clipboard`, applies a per-session policy
         // (allow/deny + one-way + a size cap) via the pure relay decision
