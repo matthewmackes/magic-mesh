@@ -4,7 +4,10 @@
 //! The panel shows two things, both off live mesh state:
 //!
 //! 1. a **worst-of mesh-health pip** — green only when every lighthouse is up,
-//!    red the moment one is degraded/offline, hidden when none are in view; and
+//!    red the moment one is degraded/offline, **amber while connecting** (no
+//!    mesh-status snapshot has been read yet — e.g. a fresh boot, before the
+//!    root timer's first write to tmpfs, or the status writer being down), and
+//!    hidden once a snapshot IS in hand but names no lighthouses; and
 //! 2. one **working quick action** — a mesh-wide **Do-Not-Disturb** toggle.
 //!
 //! This module is the **render-agnostic, fully-tested model** ([`PanelModel`]).
@@ -48,6 +51,11 @@ pub const DND_LABEL: &str = "Do Not Disturb";
 /// [`PanelModel::set_dnd`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelModel {
+    /// Whether a mesh-status snapshot has actually been read this poll. `false`
+    /// means "no snapshot yet" (fresh boot / status writer down) — the honest
+    /// **connecting** state, which the reused [`LighthouseHealth::None`] can't be
+    /// told apart from "a snapshot IS in hand but names no lighthouses".
+    snapshot_seen: bool,
     /// Worst-of lighthouse health driving the pip.
     health: LighthouseHealth,
     /// Number of lighthouses reporting online.
@@ -60,13 +68,22 @@ pub struct PanelModel {
 
 impl PanelModel {
     /// Build the model from the two live sources the panel subscribes to: the
-    /// world-readable mesh-status snapshot JSON (parsed via the reused
-    /// [`lighthouse_health_from_snapshot`] — a missing/garbage snapshot yields
-    /// "no lighthouses", never a panic) and the mesh-wide bus [`DndState`].
+    /// world-readable mesh-status snapshot JSON and the mesh-wide bus [`DndState`].
+    ///
+    /// `snapshot` is `Some(json)` when a snapshot was actually read (parsed via
+    /// the reused [`lighthouse_health_from_snapshot`] — even a *present* but
+    /// garbage/empty-of-lighthouses snapshot yields "no lighthouses", never a
+    /// panic), and `None` when no snapshot could be read at all — the honest
+    /// **connecting** state ([`PipState::Connecting`]), kept distinct from
+    /// "snapshot in hand, but it names no lighthouses" ([`PipState::NoLighthouses`]).
     #[must_use]
-    pub fn from_state(snapshot: &str, dnd: DndState) -> Self {
-        let (health, healthy, total) = lighthouse_health_from_snapshot(snapshot);
+    pub fn from_state(snapshot: Option<&str>, dnd: DndState) -> Self {
+        let (health, healthy, total) = snapshot.map_or(
+            (LighthouseHealth::None, 0, 0),
+            lighthouse_health_from_snapshot,
+        );
         Self {
+            snapshot_seen: snapshot.is_some(),
             health,
             healthy,
             total,
@@ -74,10 +91,20 @@ impl PanelModel {
         }
     }
 
-    /// The worst-of lighthouse health behind the pip.
+    /// The worst-of lighthouse health behind the pip. (The presentation state the
+    /// shell renders is [`PanelModel::pip`], which widens this with the connecting
+    /// state; this raw verdict is kept for the token lock-step test.)
     #[must_use]
     pub const fn health(&self) -> LighthouseHealth {
         self.health
+    }
+
+    /// The resolved pip presentation state: the reused worst-of lighthouse verdict
+    /// widened with [`PipState::Connecting`] when no snapshot has been read yet.
+    /// The shell matches this once for the dot colour, pulse, and label.
+    #[must_use]
+    pub const fn pip(&self) -> PipState {
+        PipState::resolve(self.snapshot_seen, self.health)
     }
 
     /// `(healthy, total)` lighthouse counts — rendered inline beside the pip and
@@ -87,28 +114,15 @@ impl PanelModel {
         (self.healthy, self.total)
     }
 
-    /// The pip's [`Style`] colour: [`Style::OK`] green when every lighthouse is
-    /// up, [`Style::DANGER`] red the moment one is degraded/offline, and `None`
-    /// when the snapshot names no lighthouses — the pip is then hidden (an honest
-    /// empty state, never a fake dot, mirroring the cosmic-applet it replaces).
-    ///
-    /// The mapping is kept in lock-step with the reused
-    /// [`LighthouseHealth::token`] by a unit test, so the egui colour can't
-    /// silently diverge from the rest of the fleet's health verdict.
-    #[must_use]
-    pub const fn pip_color(&self) -> Option<Color32> {
-        match self.health {
-            LighthouseHealth::AllHealthy => Some(Style::OK),
-            LighthouseHealth::Degraded => Some(Style::DANGER),
-            LighthouseHealth::None => None,
-        }
-    }
-
-    /// The pip's hover tooltip (a `healthy/total` summary), or `None` when there
-    /// is no pip. Delegates to the reused [`LighthouseHealth::tooltip`].
+    /// The pip's hover tooltip: a `healthy/total` summary once a snapshot is in
+    /// hand (delegating to the reused [`LighthouseHealth::tooltip`]), a plain
+    /// "waiting" note while connecting, or `None` when there is no pip.
     #[must_use]
     pub fn pip_tooltip(&self) -> Option<String> {
-        self.health.tooltip(self.healthy, self.total)
+        match self.pip() {
+            PipState::Connecting => Some("Waiting for the first mesh-status snapshot".to_string()),
+            _ => self.health.tooltip(self.healthy, self.total),
+        }
     }
 
     /// Whether mesh-wide Do-Not-Disturb is currently active.
@@ -157,9 +171,86 @@ impl PanelModel {
     }
 }
 
+/// What the mesh-health pip should show, resolved from snapshot availability plus
+/// the reused worst-of lighthouse verdict.
+///
+/// It is the reused [`LighthouseHealth`] widened with one presentation-only state
+/// the render-agnostic verdict structurally cannot express — [`PipState::Connecting`],
+/// for "no mesh-status snapshot has been read yet". This is glue, not a second
+/// health engine (§6): the parsing and the worst-of decision stay in the reused
+/// [`lighthouse_health_from_snapshot`]; this enum only adds the honest "we don't
+/// know yet" state and carries every pip's [`Style`] look in one place so the
+/// shell matches once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipState {
+    /// No snapshot yet — fresh boot before the root timer's first tmpfs write, or
+    /// the status writer being down. Distinct from [`PipState::NoLighthouses`].
+    Connecting,
+    /// A snapshot IS in hand, but it names no lighthouses — the pip is hidden.
+    NoLighthouses,
+    /// One or more lighthouses, and every one is up.
+    AllHealthy,
+    /// One or more lighthouses, at least one degraded/offline.
+    Degraded,
+}
+
+impl PipState {
+    /// Resolve the pip state from whether a snapshot was read and the reused
+    /// verdict: no snapshot → [`PipState::Connecting`]; otherwise the reused
+    /// [`LighthouseHealth`] maps 1:1.
+    #[must_use]
+    pub const fn resolve(snapshot_seen: bool, health: LighthouseHealth) -> Self {
+        if !snapshot_seen {
+            return Self::Connecting;
+        }
+        match health {
+            LighthouseHealth::AllHealthy => Self::AllHealthy,
+            LighthouseHealth::Degraded => Self::Degraded,
+            LighthouseHealth::None => Self::NoLighthouses,
+        }
+    }
+
+    /// The pip dot's [`Style`] colour, or `None` when there is no dot: [`Style::OK`]
+    /// green all-healthy, [`Style::DANGER`] red degraded, [`Style::WARN`] amber
+    /// connecting, and no dot at all when a snapshot names no lighthouses (an
+    /// honest empty state, never a fake dot).
+    ///
+    /// The health-derived colours are kept in lock-step with the reused
+    /// [`LighthouseHealth::token`] by a unit test, so the egui colour can't
+    /// silently diverge from the rest of the fleet's health verdict.
+    #[must_use]
+    pub const fn dot_color(self) -> Option<Color32> {
+        match self {
+            Self::AllHealthy => Some(Style::OK),
+            Self::Degraded => Some(Style::DANGER),
+            Self::Connecting => Some(Style::WARN),
+            Self::NoLighthouses => None,
+        }
+    }
+
+    /// Whether the dot should pulse: degraded pulses to draw the eye to a problem,
+    /// connecting pulses to show it is actively coming up. The two steady states
+    /// (all-healthy, no-lighthouses) don't, so the panel is zero-CPU idle there.
+    #[must_use]
+    pub const fn pulses(self) -> bool {
+        matches!(self, Self::Degraded | Self::Connecting)
+    }
+
+    /// The pip's status line and its [`Style`] text colour.
+    #[must_use]
+    pub const fn label(self) -> (&'static str, Color32) {
+        match self {
+            Self::AllHealthy => ("All lighthouses healthy", Style::TEXT),
+            Self::Degraded => ("Mesh degraded — a lighthouse is down", Style::DANGER),
+            Self::Connecting => ("Connecting to mesh…", Style::TEXT_DIM),
+            Self::NoLighthouses => ("No lighthouses in view", Style::TEXT_DIM),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DndState, LighthouseHealth, PanelModel, Style, DND_LABEL};
+    use super::{DndState, LighthouseHealth, PanelModel, PipState, Style, DND_LABEL};
     use mde_bus::dnd::TopicSnooze;
 
     /// Two lighthouses (one identified by `role`, one by `lighthouse_ips`
@@ -182,31 +273,35 @@ mod tests {
     fn pip_colour_tracks_and_agrees_with_the_reused_health_token() {
         // All up → green; the colour must agree with the reused token verdict.
         let all = PanelModel::from_state(
-            &snapshot("online", "online", "offline"),
+            Some(&snapshot("online", "online", "offline")),
             DndState::default(),
         );
         assert_eq!(all.health(), LighthouseHealth::AllHealthy);
-        assert_eq!(all.pip_color(), Some(Style::OK));
+        assert_eq!(all.pip().dot_color(), Some(Style::OK));
         assert_eq!(all.health().token(), Some("beacon_healthy"));
 
         // Any lighthouse down → red (worst-of), agreeing with the "danger" token.
-        let degraded =
-            PanelModel::from_state(&snapshot("online", "idle", "online"), DndState::default());
+        let degraded = PanelModel::from_state(
+            Some(&snapshot("online", "idle", "online")),
+            DndState::default(),
+        );
         assert_eq!(degraded.health(), LighthouseHealth::Degraded);
-        assert_eq!(degraded.pip_color(), Some(Style::DANGER));
+        assert_eq!(degraded.pip().dot_color(), Some(Style::DANGER));
         assert_eq!(degraded.health().token(), Some("danger"));
 
-        // No lighthouses → no pip (hidden), agreeing with the absent token.
-        let none = PanelModel::from_state(NO_LIGHTHOUSES, DndState::default());
+        // Snapshot in hand but no lighthouses → no pip (hidden), agreeing with the
+        // absent token.
+        let none = PanelModel::from_state(Some(NO_LIGHTHOUSES), DndState::default());
         assert_eq!(none.health(), LighthouseHealth::None);
-        assert_eq!(none.pip_color(), None);
+        assert_eq!(none.pip(), PipState::NoLighthouses);
+        assert_eq!(none.pip().dot_color(), None);
         assert_eq!(none.health().token(), None);
     }
 
     #[test]
     fn counts_and_tooltip_track_the_snapshot() {
         let degraded = PanelModel::from_state(
-            &snapshot("online", "offline", "online"),
+            Some(&snapshot("online", "offline", "online")),
             DndState::default(),
         );
         assert_eq!(degraded.counts(), (1, 2));
@@ -219,20 +314,99 @@ mod tests {
         );
 
         // No pip → no counts, no tooltip.
-        let none = PanelModel::from_state(NO_LIGHTHOUSES, DndState::default());
+        let none = PanelModel::from_state(Some(NO_LIGHTHOUSES), DndState::default());
         assert_eq!(none.counts(), (0, 0));
         assert_eq!(none.pip_tooltip(), None);
     }
 
     #[test]
-    fn garbage_or_missing_snapshot_is_empty_not_a_panic() {
+    fn present_but_garbage_snapshot_is_no_lighthouses_not_a_panic() {
+        // A snapshot that WAS read but is unparseable/empty-of-lighthouses is
+        // "no lighthouses" (we heard from the mesh) — never a panic, and never
+        // mistaken for the not-yet-connected state.
         for bad in ["", "not json", "{}", r#"{"nodes":[]}"#] {
-            let m = PanelModel::from_state(bad, DndState::default());
+            let m = PanelModel::from_state(Some(bad), DndState::default());
             assert_eq!(m.health(), LighthouseHealth::None);
+            assert_eq!(m.pip(), PipState::NoLighthouses);
             assert_eq!(m.counts(), (0, 0));
-            assert_eq!(m.pip_color(), None);
+            assert_eq!(m.pip().dot_color(), None);
             assert_eq!(m.pip_tooltip(), None);
         }
+    }
+
+    #[test]
+    fn absent_snapshot_is_connecting_not_no_lighthouses() {
+        // No snapshot read at all (fresh boot / status writer down) is the honest
+        // connecting state — an amber, pulsing pip with a "connecting" line, NOT
+        // the alarming "no lighthouses in view" a present-but-empty snapshot gives.
+        let connecting = PanelModel::from_state(None, DndState::default());
+        assert_eq!(connecting.pip(), PipState::Connecting);
+        assert_eq!(connecting.pip().dot_color(), Some(Style::WARN));
+        assert!(connecting.pip().pulses());
+        assert!(connecting.pip().label().0.contains("Connecting"));
+        assert_eq!(connecting.counts(), (0, 0));
+        assert!(
+            connecting
+                .pip_tooltip()
+                .is_some_and(|t| t.to_lowercase().contains("waiting")),
+            "connecting has a waiting tooltip"
+        );
+
+        // The whole point: connecting must NOT read the same as a present snapshot
+        // that simply names no lighthouses.
+        let empty = PanelModel::from_state(Some(NO_LIGHTHOUSES), DndState::default());
+        assert_ne!(connecting.pip(), empty.pip());
+        assert_ne!(connecting.pip().dot_color(), empty.pip().dot_color());
+        assert_ne!(connecting.pip().label(), empty.pip().label());
+    }
+
+    #[test]
+    fn pip_state_presentation_is_distinct_and_styled() {
+        use PipState::{AllHealthy, Connecting, Degraded, NoLighthouses};
+
+        // Dot colours read from Style (or no dot), each state distinct.
+        assert_eq!(AllHealthy.dot_color(), Some(Style::OK));
+        assert_eq!(Degraded.dot_color(), Some(Style::DANGER));
+        assert_eq!(Connecting.dot_color(), Some(Style::WARN));
+        assert_eq!(NoLighthouses.dot_color(), None);
+
+        // Only the two transient/attention states animate; the stable ones idle.
+        assert!(Degraded.pulses() && Connecting.pulses());
+        assert!(!AllHealthy.pulses() && !NoLighthouses.pulses());
+
+        // Every label is a distinct, non-empty line.
+        let labels = [
+            AllHealthy.label().0,
+            Degraded.label().0,
+            Connecting.label().0,
+            NoLighthouses.label().0,
+        ];
+        for l in labels {
+            assert!(!l.is_empty(), "a pip label is empty");
+        }
+        for i in 0..labels.len() {
+            for j in (i + 1)..labels.len() {
+                assert_ne!(labels[i], labels[j], "two pip labels collide");
+            }
+        }
+
+        // resolve() maps the reused verdict 1:1 once a snapshot is seen.
+        assert_eq!(
+            PipState::resolve(true, LighthouseHealth::AllHealthy),
+            AllHealthy
+        );
+        assert_eq!(
+            PipState::resolve(true, LighthouseHealth::Degraded),
+            Degraded
+        );
+        assert_eq!(
+            PipState::resolve(true, LighthouseHealth::None),
+            NoLighthouses
+        );
+        assert_eq!(
+            PipState::resolve(false, LighthouseHealth::AllHealthy),
+            Connecting
+        );
     }
 
     #[test]
@@ -244,7 +418,7 @@ mod tests {
             set_by_peer: "lh-01".to_string(),
         };
         let off = {
-            let mut m = PanelModel::from_state(NO_LIGHTHOUSES, DndState::default());
+            let mut m = PanelModel::from_state(Some(NO_LIGHTHOUSES), DndState::default());
             m.set_dnd(DndState {
                 snoozes: vec![snooze.clone()],
                 ..DndState::default()
@@ -269,11 +443,11 @@ mod tests {
 
     #[test]
     fn dnd_status_and_active_read_the_state() {
-        let off = PanelModel::from_state(NO_LIGHTHOUSES, DndState::default());
+        let off = PanelModel::from_state(Some(NO_LIGHTHOUSES), DndState::default());
         assert!(!off.dnd_active());
         assert!(off.dnd_status().starts_with("Off"));
 
-        let mut on = PanelModel::from_state(NO_LIGHTHOUSES, DndState::default());
+        let mut on = PanelModel::from_state(Some(NO_LIGHTHOUSES), DndState::default());
         on.set_dnd(DndState {
             active: true,
             since_unix_ms: 5,

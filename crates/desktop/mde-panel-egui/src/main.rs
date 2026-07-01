@@ -21,7 +21,7 @@ use mde_egui::egui::{self, RichText};
 use mde_egui::{eframe, run_client, Motion, Style};
 
 use mde_bus::dnd;
-use mde_panel_egui::{LighthouseHealth, PanelModel, DND_LABEL};
+use mde_panel_egui::{PanelModel, DND_LABEL};
 
 /// Wayland app-id — the compositor groups windows + maps icons by it.
 const APP_ID: &str = "org.magicmesh.Panel";
@@ -62,7 +62,8 @@ impl Panel {
     /// reflects current state on first paint.
     fn new() -> Self {
         let bus_root = mde_bus::client_data_dir();
-        let model = PanelModel::from_state(&read_snapshot(), load_dnd(bus_root.as_deref()));
+        let model =
+            PanelModel::from_state(read_snapshot().as_deref(), load_dnd(bus_root.as_deref()));
         Self {
             model,
             bus_root,
@@ -74,7 +75,10 @@ impl Panel {
 
     /// One subscription tick: re-read both live sources into the model.
     fn poll(&mut self) {
-        self.model = PanelModel::from_state(&read_snapshot(), load_dnd(self.bus_root.as_deref()));
+        self.model = PanelModel::from_state(
+            read_snapshot().as_deref(),
+            load_dnd(self.bus_root.as_deref()),
+        );
     }
 
     /// Flip DND and persist it to the bus so the change replicates mesh-wide.
@@ -115,25 +119,22 @@ impl Panel {
         self.show_dnd(ui);
     }
 
-    /// The worst-of mesh-health pip: a coloured dot (pulsing when degraded to
-    /// draw the eye; steady — zero-CPU idle — when all-healthy) + a status line +
-    /// an inline `healthy/total` count, with a hover tooltip. Hidden honestly
-    /// (a dim "no lighthouses" line, no dot) when none are in view.
+    /// The worst-of mesh-health pip: a coloured dot (pulsing while degraded — to
+    /// draw the eye to a problem — or while connecting; steady, zero-CPU idle,
+    /// when all-healthy) + a status line + an inline `healthy/total` count, with a
+    /// hover tooltip. Amber "Connecting…" until the first snapshot lands; then a
+    /// dim "no lighthouses" line (no dot) if the snapshot in hand names none.
     fn show_pip(&self, ui: &mut egui::Ui) {
-        let health = self.model.health();
-        let (label, label_color) = match health {
-            LighthouseHealth::AllHealthy => ("All lighthouses healthy", Style::TEXT),
-            LighthouseHealth::Degraded => ("Mesh degraded — a lighthouse is down", Style::DANGER),
-            LighthouseHealth::None => ("No lighthouses in view", Style::TEXT_DIM),
-        };
+        let pip = self.model.pip();
+        let (label, label_color) = pip.label();
         let tooltip = self.model.pip_tooltip();
 
         let resp = ui
             .horizontal(|ui| {
                 ui.add_space(Style::SP_M);
-                if let Some(base) = self.model.pip_color() {
-                    let color = if matches!(health, LighthouseHealth::Degraded) {
-                        // Keep the pulse animating while degraded.
+                if let Some(base) = pip.dot_color() {
+                    let color = if pip.pulses() {
+                        // Keep the pulse animating while degraded or connecting.
                         ui.ctx().request_repaint();
                         let t = ui.input(|i| i.time);
                         let pulse = 0.5 - 0.5 * ((t / PIP_PULSE_SECS) * TAU).cos();
@@ -235,10 +236,15 @@ impl eframe::App for Panel {
     }
 }
 
-/// Read the mesh-status snapshot, or `""` when absent — the model then reports no
-/// lighthouses (an honest empty pip), never a panic.
-fn read_snapshot() -> String {
-    std::fs::read_to_string(SNAPSHOT_PATH).unwrap_or_default()
+/// Read the mesh-status snapshot, or `None` when there is nothing to read yet:
+/// the file is absent (a fresh boot, before the root timer's first write to the
+/// tmpfs `/run`), unreadable, or empty. The model then shows the honest
+/// **connecting** pip rather than a misleading "no lighthouses", and never panics.
+fn read_snapshot() -> Option<String> {
+    match std::fs::read_to_string(SNAPSHOT_PATH) {
+        Ok(s) if !s.trim().is_empty() => Some(s),
+        _ => None,
+    }
 }
 
 /// Load the mesh-wide DND state from the bus root (DND off when the dir doesn't
