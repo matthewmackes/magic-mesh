@@ -29,7 +29,7 @@ sections are §4 (Carbon look), §6 (the mesh boundary), and §7 (Definition of 
 the rulebook and it changes; never drain from a stale memory of it. *(operator,
 2026-06-22.)* `Read` the whole file. Pay special attention to the load-bearing
 sections: **§10.0 (MANDATE: work the farm — offload builds + fan out concurrent
-subagents across `.50/.51/.52`, never grind solo or serialize decomposable work)**,
+subagents across the farm (`.50/.90/.130/.170`), never grind solo or serialize decomposable work)**,
 §4 (Carbon look), §6 (the mesh boundary), and §7 (Definition of Done). If you catch
 yourself building locally/sequentially when the work could go to the farm in
 parallel, that's a §10.0 violation — fix it before continuing.
@@ -46,7 +46,7 @@ parallel, that's a §10.0 violation — fix it before continuing.
 > operating procedure.
 
 ### The farm (exact topology — know it cold)
-Three Xen build VMs, all **Fedora 42** (an F42-built RPM installs on F43+F44 —
+Four Xen build VMs, all **Fedora 42** (an F42-built RPM installs on F43+F44 —
 older-glibc forward-compat), user `mm`, key `/root/.ssh/mackes_mesh_ed25519`,
 **shared sccache** (`RUSTC_WRAPPER=sccache`):
 
@@ -55,14 +55,19 @@ older-glibc forward-compat), user `mm`, key `/root/.ssh/mackes_mesh_ed25519`,
 | **XEN-BIGBOY** | `mcnf-build-52` | `172.20.0.130` | 12 / 20 GB | **3** |
 | KVM-XCP1 | `mcnf-build-51` | `172.20.0.90` | 4 / 16 GB | **2** |
 | XEN-HOME-SERVICES | `mcnf-build-50` | `172.20.0.50` | 4 / 16 GB | **2** |
+| XEN-194 | `mcnf-build-53` | `172.20.0.170` | 4 / 16 GB | **2** |
 
 > ⚠️ **VM names are legacy and do NOT equal the IP octet** (`docs/BUILD-ENVIRONMENT.md §3`):
-> `mcnf-build-51`=**.90**, `mcnf-build-52`=**.130**. The real farm is **.50 / .90 / .130** —
-> probing `.51`/`.52` gives "No route to host" (don't be fooled into a false "node down"
-> alarm). `install-helpers/drain-coordinator.sh slots` reads the real topology for you.
+> `mcnf-build-51`=**.90**, `mcnf-build-52`=**.130**, `mcnf-build-53`=**.170**. The real
+> farm is the **4 build VMs .50 / .90 / .130 / .170** across **4 dom0s** (the 4th is
+> XEN-194 / `mcnf-build-53` / `.170`); probing `.51`/`.52` gives "No route to host" (not
+> a false "node down"). **`install-helpers/farm-topology.sh` is the single canonical
+> roster** — `./install-helpers/farm-topology.sh table` prints a VERIFIED utilization
+> table (probes all 4, fails if one is missing); `drain-coordinator.sh slots` sources it.
 
-**Total = 7 concurrent heavy (cosmic/iced/mackesd-release) build slots.** Full
-utilization = all 7 busy, spread **3 + 2 + 2**.
+**Total = 9 concurrent heavy (egui/wgpu · cosmic/iced · mackesd-release) build
+slots.** Full utilization = all 9 busy, spread **2 + 2 + 3 + 2** (.50/.90/.170 at 2,
+BigBoy .130 at 3).
 
 ### The hard cap (the load-44 lesson — NON-NEGOTIABLE)
 **≤3 heavy builds per node. NEVER more.** Proven live: 6 concurrent heavy builds on
@@ -89,12 +94,12 @@ trivial build while a small node grinds the workspace.
 clobber** (rsync `--delete`). Therefore:
 - Every concurrent build gets a **unique slot name on its host**.
 - A slot-assigning **workflow** uses numeric slots `1/2/3` by index over
-  `[.130/1, .130/2, .130/3, .50/1, .50/2, .90/1, .90/2]`.
+  `[.130/1, .130/2, .130/3, .50/1, .50/2, .90/1, .90/2, .170/1, .170/2]` (9 slots).
 - Ad-hoc / second-campaign builds use **named** slots (`fixclip`, `eagledeploy`,
   `fillA`) so they never collide with a workflow's numeric dirs — but you MUST still
   count them against that node's ≤3 cap.
 - **Two slot-assigning workflows at once is FORBIDDEN** — both index the same numeric
-  array and clobber. One coordinator owns the 7 slots at a time; everything else uses
+  array and clobber. One coordinator owns the 9 slots at a time; everything else uses
   named slots within the *remaining* per-node headroom.
 
 ### Rearm — never drain-and-wait (operator, standing)
@@ -106,12 +111,13 @@ that idles every fast slot for the duration of the slowest build. Use `pipeline(
 `parallel(); await; parallel()`.
 
 ### The procedure (reach + HOLD full utilization)
-1. **Inventory all three nodes** (read-only):
+1. **Inventory all four nodes** — simplest is `./install-helpers/farm-topology.sh table`
+   (verified; fails if a node is missing). The raw probe:
    ```
-   for n in 50 90 130; do ssh -i /root/.ssh/mackes_mesh_ed25519 -o BatchMode=yes mm@172.20.0.$n \
+   for n in 50 90 130 170; do ssh -i /root/.ssh/mackes_mesh_ed25519 -o BatchMode=yes mm@172.20.0.$n \
      'echo ".'$n' load=$(cut -d" " -f1 /proc/loadavg) rustc=$(pgrep -c rustc) cargo=$(pgrep -c cargo) free=$(df -h --output=avail /home|tail -1|tr -d " ") dirs=$(ls -d ~/magic-mesh-* 2>/dev/null|wc -l)"'; done
    ```
-2. **Compute free slots/node** = cap (3/2/2) − active heavy builds (a single
+2. **Compute free slots/node** = cap (2/2/3/2) − active heavy builds (a single
    `cargo build` shows as 1 cargo proc + up to N-core rustc fan-out; count distinct
    build dirs/cargo procs, not rustc).
 3. **Fill every free slot** with a productive buildable unit (queue below). Distinct
@@ -127,7 +133,7 @@ The mechanics above are encoded as runnable helpers so a tick never depends on
 re-deriving them by hand:
 - **`install-helpers/drain-coordinator.sh plan [N]`** — one tick end-to-end:
   pre-flight `disk-watchdog.sh` → free-slot compute over the REAL topology
-  (`.50/.90/.130`, caps 2/2/3) → the next N open, unblocked unit ids. `… slots` /
+  (`.50/.90/.130/.170`, caps 2/2/3/2) → the next N open, unblocked unit ids. `… slots` /
   `… next N` / `… preflight` run the pieces alone.
 - **`install-helpers/park-blocker.sh <ID> "<reason>"`** (DRAIN-5) — when a unit hits a
   live-infra/artifact/gate blocker you can't clear from a build, PARK it: flips the unit

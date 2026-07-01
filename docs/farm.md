@@ -19,9 +19,16 @@ it is, how it's automated, and how to recover it.
 | Host | IP | Role | Notes |
 |---|---|---|---|
 | `rocky9-kvm2` (dev) | `172.20.145.192` | Orchestration + local builds + podman | Rocky 9.8; full GUI toolchain installed (below); runs XO + tofu/ansible/packer |
-| `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 — build host (4c/24G) | local SR is **`ext`** (not "Local storage"); build VM → `172.20.0.50` |
-| `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 — test bed (4c/23G) | build VM → `172.20.0.51`; spin throwaway test nodes here |
-| `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 — high-capacity (**12c/32G**, 398G SR) | build VM → `172.20.0.52` (8 vCPU/24G); room for several more build VMs |
+| `XEN-HOME-SERVICES` | `172.20.0.9` | XCP-ng 8.3 dom0 — build host (4c/24G) | local SR is **`ext`** (not "Local storage"); build VM `mcnf-build-50` → `172.20.0.50` (4 vCPU, cap 2) |
+| `KVM-XCP1` | `172.20.145.193` | XCP-ng 8.3 dom0 — test bed (4c/23G) | build VM `mcnf-build-51` → `172.20.0.90` (4 vCPU, cap 2); spin throwaway test nodes here |
+| `XEN-BIGBOY` | `172.20.145.165` | XCP-ng 8.3 dom0 — high-capacity (**12c/32G**, 398G SR) | build VM `mcnf-build-52` → `172.20.0.130` (**12 vCPU**/~20G, cap 3 — the long-pole node); room for several more build VMs |
+| `XEN-194` | `172.20.145.194` | XCP-ng 8.3 dom0 — **the 4th dom0** | build VM `mcnf-build-53` → `172.20.0.170` (4 vCPU, cap 2) |
+
+> **Canonical roster:** `install-helpers/farm-topology.sh` is the single source of
+> truth — **4 dom0s / 4 build VMs / 9 heavy slots** (2+2+3+2). Build-VM names are
+> legacy (`mcnf-build-5N` ≠ the IP octet: `-51`=.90, `-52`=.130, `-53`=.170).
+> `./install-helpers/farm-topology.sh table` prints a **verified** utilization
+> table each run (probes all 4, fails if one is missing). Do not hardcode the list.
 
 **Access:** management is SSH-key (`~/.ssh/mackes_mesh_ed25519`, authorized on both
 dom0s + the build VMs' `mm` user). First-time dom0 provisioning needs the XCP root

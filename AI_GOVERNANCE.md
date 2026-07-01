@@ -236,7 +236,13 @@ release build. The 4-vCPU nodes (`.50` / `.90` / `.170`) take the shorter/simple
 jobs (single small crates, per-crate tests/clippy). This composes with the ≤-cap
 spread (`docs/BUILD-ENVIRONMENT.md`): spread the *count* to honor per-node caps,
 but the *long pole* goes to BigBoy first — never leave the workspace/heavy-GUI
-build on a small node while BigBoy runs a trivial one.
+build on a small node while BigBoy runs a trivial one. The **canonical farm
+roster** is `install-helpers/farm-topology.sh` — **4 dom0s / 4 build VMs / 9 heavy
+slots** (`.50`/`.90`/`.170` at cap 2 · BigBoy `.130` at cap 3; the 4th dom0 is
+XEN-194 → `mcnf-build-53` → `.170`). Run `./install-helpers/farm-topology.sh table`
+at the start of every run for a **verified** utilization table — it probes all 4
+nodes and **fails if one is missing** (XEN-194/.170 sat idle a whole session once,
+under a stale 3-node roster). Never hardcode the node list or chart from memory.
 
 ---
 

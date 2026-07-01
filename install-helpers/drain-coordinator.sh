@@ -11,10 +11,12 @@
 #   3. next [N]   — list the next N open, UNBLOCKED worklist units to dispatch
 #   4. plan [N]   — all of the above = the tick's dispatch plan
 #
-# Real farm topology (NOT the stale .50/.51/.52 — see docs/BUILD-ENVIRONMENT.md §3):
+# Real farm topology is the SINGLE CANONICAL SOURCE in farm-topology.sh (4 dom0s /
+# 4 build VMs / 9 heavy slots; NOT the stale .50/.51/.52 — see BUILD-ENVIRONMENT.md §3):
 #   .50  XEN-HOME-SERVICES / mcnf-build-50   4 vCPU  cap 2
 #   .90  KVM-XCP1          / mcnf-build-51   4 vCPU  cap 2
-#   .130 XEN-BIGBOY        / mcnf-build-52   8 vCPU  cap 3   => 7 heavy slots total
+#   .130 XEN-BIGBOY        / mcnf-build-52  12 vCPU  cap 3   (BigBoy — long-pole node)
+#   .170 XEN-194           / mcnf-build-53   4 vCPU  cap 2   (the 4th dom0)  => 9 slots total
 #
 # A node that is unreachable is reported down (0 free) and the tick continues — the
 # coordinator never stalls on one node (park-don't-stall ethos, DRAIN-5).
@@ -26,10 +28,14 @@ WORKLIST="${MCNF_WORKLIST:-$ROOT/docs/WORKLIST.md}"
 KEY="${MCNF_FARM_KEY:-/root/.ssh/mackes_mesh_ed25519}"
 SSH_USER="${MCNF_FARM_USER:-mm}"
 
-# parallel arrays: node octet / dom0+VM name / heavy-build cap
-NODES=(50 90 130)
-NAMES=("XEN-HOME-SERVICES/mcnf-build-50" "KVM-XCP1/mcnf-build-51" "XEN-BIGBOY/mcnf-build-52")
-CAPS=(2 2 3)
+# parallel arrays: node octet / dom0+VM name / heavy-build cap — sourced from the
+# SINGLE CANONICAL roster so this coordinator can never drift from the real farm
+# (it once silently missed the 4th dom0 XEN-194/.170).
+# shellcheck source=farm-topology.sh
+. "$HERE/farm-topology.sh"
+NODES=("${FARM_OCTETS[@]}")
+NAMES=("${FARM_NAMES[@]}")
+CAPS=("${FARM_CAPS[@]}")
 
 farm_ssh() { timeout 14 ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=8 \
   -o StrictHostKeyChecking=accept-new "$SSH_USER@172.20.0.$1" "$2" 2>/dev/null; }

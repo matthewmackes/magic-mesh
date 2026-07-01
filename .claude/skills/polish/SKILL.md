@@ -94,7 +94,7 @@ units stay file-disjoint and the farm parallelizes cleanly:
 
 ## The farm (exact topology — know it cold)
 
-Three Xen build VMs, all **Fedora 42**, user `mm`, key
+Four Xen build VMs, all **Fedora 42**, user `mm`, key
 `/root/.ssh/mackes_mesh_ed25519`, **shared sccache** (`RUSTC_WRAPPER=sccache`):
 
 | Host | VM | IP | vCPU / RAM | SAFE heavy slots |
@@ -102,13 +102,23 @@ Three Xen build VMs, all **Fedora 42**, user `mm`, key
 | **XEN-BIGBOY** | `mcnf-build-52` | `172.20.0.130` | 12 / 20 GB | **3** |
 | KVM-XCP1 | `mcnf-build-51` | `172.20.0.90` | 4 / 16 GB | **2** |
 | XEN-HOME-SERVICES | `mcnf-build-50` | `172.20.0.50` | 4 / 16 GB | **2** |
+| XEN-194 | `mcnf-build-53` | `172.20.0.170` | 4 / 16 GB | **2** |
+
+> **Canonical roster + verified table:** `install-helpers/farm-topology.sh` is the
+> single source of truth (4 dom0s / 4 build VMs / 9 slots). Run
+> `./install-helpers/farm-topology.sh table` at the start of every run to chart a
+> **verified** utilization table — it probes all 4 nodes and fails if one is
+> missing. Never chart from memory or hardcode the node list (this table once
+> silently missed the 4th dom0 XEN-194/.170).
 
 > ⚠️ **VM names are legacy and do NOT equal the IP octet** (`docs/BUILD-ENVIRONMENT.md`):
-> `mcnf-build-51`=**.90**, `mcnf-build-52`=**.130**. The real farm is **.50 / .90 /
-> .130**; probing `.51`/`.52` gives "No route to host" (not a node-down alarm).
+> `mcnf-build-51`=**.90**, `mcnf-build-52`=**.130**, `mcnf-build-53`=**.170**. The
+> real farm is the **4 build VMs .50 / .90 / .130 / .170**; probing `.51`/`.52`
+> gives "No route to host" (not a node-down alarm).
 
-**Total = 7 concurrent heavy (cosmic/iced) build slots, spread 3 + 2 + 2.** The
-GUI crates ride libcosmic's vendored iced fork — a cosmic/iced compile is a
+**Total = 9 concurrent heavy build slots, spread 2 + 2 + 3 + 2** (.50/.90/.170 at
+2, BigBoy .130 at 3). The GUI crates ride the egui/wgpu (E12) or libcosmic/iced
+(legacy) stack — a cold GUI compile is a
 *heavy* slot (~1 hr cold). That slowness is exactly why this work must go to the
 farm and never grind locally (`/no-flinch` rule 4: fix the loop, don't avoid it).
 
@@ -131,7 +141,7 @@ node grinds the workspace.
 Every concurrent build needs a **unique slot name on its host** (its own `target/`);
 two builds sharing one (host, slot) clobber via rsync `--delete`. A slot-assigning
 workflow uses numeric slots `1/2/3` indexed over `[.130/1, .130/2, .130/3, .50/1,
-.50/2, .90/1, .90/2]`; ad-hoc/second-campaign builds use **named** slots
+.50/2, .90/1, .90/2, .170/1, .170/2]` (9 slots); ad-hoc/second-campaign builds use **named** slots
 (`polishA`, `polish-workbench`) within the *remaining* per-node headroom. **Two
 slot-assigning coordinators at once is FORBIDDEN** — they index the same array and
 clobber.
@@ -146,8 +156,8 @@ completion handlers, not `parallel(); await; parallel()`. Detach long builds
 
 ### The coordinator helpers (don't re-derive by hand)
 - **`install-helpers/drain-coordinator.sh plan [N]`** — one tick: pre-flight
-  `disk-watchdog.sh` → free-slot compute over the REAL topology (`.50/.90/.130`,
-  caps 2/2/3) → next N open, unblocked unit ids. `… slots` / `… next N` /
+  `disk-watchdog.sh` → free-slot compute over the REAL topology (`.50/.90/.130/.170`,
+  caps 2/2/3/2) → next N open, unblocked unit ids. `… slots` / `… next N` /
   `… preflight` run the pieces alone.
 - **`install-helpers/assert-own-worktree.sh`** — every isolated worker runs this as
   STEP-0; it REFUSES the shared/primary checkout so a worker can't reset the
