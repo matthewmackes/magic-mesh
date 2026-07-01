@@ -17,6 +17,11 @@ into the filesystem; the hicolor icon set lives in `../assets/icons/`.
   Servers/Lighthouses (SVC-7/Q70 — desktop services are Workstation
   surfaces; the voice-agent autostart carries the same gate inline)
 
+- `bootc/`        → the E12-13 **immutable bootc/ostree image lane** (§5: ONE
+  image for every role — role is a config flag; a Lighthouse runs the same
+  image with the desktop seat skipped/masked). Containerfile + the DRM-seat
+  unit + `build-image.sh`; doctrine + verification status in
+  `bootc/README.md`.
 - `kickstart/`    → the Magic-on-Cosmic ISO kickstart (PKG-9) with the
   install-time role-chooser `%post` (PKG-5); built with livemedia-creator.
 - `repo/`         → the GitHub-hosted `.repo` (PKG-8) + the committed public

@@ -1,0 +1,106 @@
+# E12-13 — the ONE immutable MCNF bootc/ostree image, every role (§5 delivery lock).
+#
+# One image for Lighthouse AND Workstation: role is a config flag
+# (/var/lib/mde/role.toml, pinned by magic-setup / `mackesd found|join`), never a
+# separate build. A Lighthouse runs this exact image with the desktop seat unit
+# skipped (its ExecCondition) or masked (Option 1) — see README.md "Roles".
+#
+# Build (both lanes) via ./build-image.sh; context is the REPO ROOT:
+#   podman build -f packaging/bootc/Containerfile .
+#
+# ── Writable-partition doctrine (what survives a `bootc upgrade`) ─────────────
+# bootc/ostree gives three lanes; every stateful path the RPM + units use is
+# pinned to a surviving one (grep-verified against packaging/systemd/* and the
+# mackesd sources — each path annotated below):
+#
+#  /usr, /boot        IMMUTABLE image content — swapped atomically per upgrade.
+#  /etc               3-way merged: image defaults update, LOCAL EDITS PERSIST.
+#    /etc/mackesd                daemon config, etcd-endpoints, backup-passphrase.cred
+#                                (mackesd.service EFF-15; post-install `install -d -m0700`)
+#    /etc/nebula                 overlay identity/certs, materialized by mackesd (EFF-29)
+#    /etc/etcd/etcd.env          written by setup-etcd.sh; etcd.service gates on it
+#    /etc/systemd/system/…       etcd.service + syncthing.service (RPM installs them to
+#                                /etc for admin precedence) + setup-written drop-ins
+#                                (syncthing.service.d/10-home.conf, mackesd.service.d/*)
+#    /etc/hosts                  mesh_dns <host>.mesh merges persist
+#  /var               MACHINE-LOCAL: image /var only SEEDS the FIRST boot;
+#                     upgrades NEVER touch it. All live state lands here:
+#    /var/lib/mackesd            daemon state (unit ExecStartPre `install -d -m0700`,
+#                                deliberately not StateDirectory= — LIGHTHOUSE-VARMOUNT)
+#    /var/lib/mde/role.toml      THE role flag (+ the `branded` run-once stamp)
+#    /var/lib/etcd               etcd data dir
+#    /var/lib/mcnf-syncthing     Syncthing home (syncthing.service Environment=)
+#    /var/home/<u>/Local         ~/Local VM running disks (mde-kvm running_disk_path,
+#                                lock 18 — never mesh-synced); /home → var/home
+#    /var/mnt/mesh-storage       the Syncthing-replicated workgroup dir; /mnt → var/mnt,
+#                                so the tmpfiles.d line `d /mnt/mesh-storage` (RPM's
+#                                magic-mesh.conf) creates it through the symlink and
+#                                MDE_WORKGROUP_ROOT=/mnt/mesh-storage keeps resolving
+#    /var/opt/mcnf               ⚠ the automation/backoffice plane (/opt → var/opt).
+#                                RPM content under /opt is a FIRST-BOOT SEED ONLY on
+#                                bootc — image upgrades do NOT refresh it. Acceptable:
+#                                that plane converges control-VM-side (DAR-46); caveat
+#                                documented in README.md.
+#  /run/mde-bus       tmpfs, re-created every boot by tmpfiles (magic-mesh.conf).
+#
+# So: a `bootc upgrade` swaps /usr atomically and cannot touch ~/Local VM disks,
+# /mnt/mesh-storage, /etc/mackesd or /etc/nebula — the E12-13 acceptance line.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Fedora 42 matches the fleet's RPM channel (the gh-pages repo serves
+# fedora-$releasever; the mesh-service container image is FROM fedora:42 too).
+# Override with --build-arg BOOTC_BASE=… for an F43+ rebase.
+ARG BOOTC_BASE=quay.io/fedora/fedora-bootc:42
+FROM ${BOOTC_BASE}
+
+# Two RPM lanes (build-image.sh drives this):
+#   repo  (default) — install magic-mesh from the GitHub-hosted dnf channel
+#                     (PKG-8; the .repo file below). Needs network at build.
+#   local           — install a locally-built magic-mesh-*.rpm staged into
+#                     packaging/bootc/rpms/ by `build-image.sh --rpm <path>`.
+ARG MCNF_RPM_LANE=repo
+
+# The staging dir always COPYies (it carries a .gitkeep, so the repo lane works
+# with an empty dir); the channel .repo ships regardless — the RPM installs the
+# same file, and it keeps `bootc switch` rebases + debugging honest.
+COPY packaging/bootc/rpms/ /tmp/mcnf-rpms/
+COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
+
+# The magic-mesh RPM carries every binary + unit + asset (PKG-1: ONE monolithic
+# RPM; its post-install scriptlet runs here and its `systemctl enable` calls are
+# offline-safe symlink creation). Weak deps stay ON — this is the full
+# Workstation image; a Lighthouse runs the same bits with the seat masked (§5).
+# podman + cloud-hypervisor are the §5 VDI substrate (mackesd's kvm probe
+# checks podman.socket; vm_lifecycle shells cloud-hypervisor); nebula arrives
+# as the RPM's hard Require.
+RUN set -eux; \
+    if [ "${MCNF_RPM_LANE}" = "local" ]; then \
+        ls /tmp/mcnf-rpms/magic-mesh-*.rpm >/dev/null 2>&1 || { \
+            echo "FATAL: MCNF_RPM_LANE=local but no magic-mesh-*.rpm staged in packaging/bootc/rpms/"; \
+            echo "       stage one via: packaging/bootc/build-image.sh --rpm <path-to-rpm>"; \
+            exit 1; }; \
+        dnf -y install /tmp/mcnf-rpms/magic-mesh-*.rpm; \
+    else \
+        dnf -y install magic-mesh; \
+    fi; \
+    dnf -y install podman cloud-hypervisor; \
+    dnf clean all; \
+    rm -rf /tmp/mcnf-rpms
+
+# The DRM-seat unit (bootc lane only — the dnf/RPM lane keeps the .desktop
+# launcher). Boot-to-seat: quasar-vdi-desktop.md lock 34.
+COPY packaging/bootc/units/mde-shell-egui.service /usr/lib/systemd/system/mde-shell-egui.service
+
+# Workstation-role wiring. The RPM post-install already enabled the all-roles
+# set (mackesd, nebula, mesh-health.timer, mesh-status.timer, the first-boot
+# setup oneshots, magic-setup, magic-mesh-brand + the mde-musicd user unit);
+# this adds the VDI seat + the podman API socket and boots to graphical.
+# NOTHING is masked by default (§5): the seat unit self-gates on the role flag,
+# so this one image serves every role unmodified.
+RUN systemctl enable mde-shell-egui.service podman.socket && \
+    systemctl set-default graphical.target
+
+# Surface bootc's own image lint in the build log (non-fatal: it flags the
+# known /var seeding — e.g. the /opt/mcnf automation plane — which is
+# documented doctrine above, not an accident).
+RUN bootc container lint || echo "WARN: bootc container lint reported findings (documented /var seeding; see doctrine block above)"

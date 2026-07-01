@@ -1,0 +1,63 @@
+# E12-13 — the Quasar DRM-seat unit (bootc image lane only; the dnf/RPM lane
+# still launches the shell from a session via org.magicmesh.Shell.desktop).
+#
+# systemd launches the ONE egui shell directly on the DRM/KMS seat, greetd-style
+# — no display manager, no Wayland compositor (§5, quasar-vdi-desktop.md lock 34).
+# The binary is the RPM's /usr/bin/mde-shell-egui, re-linked `--features drm` at
+# RPM build time so it takes DRM master itself (smithay DRM/GBM + libinput); this
+# unit only has to own the VT and get out of the way.
+#
+# ROLE IS A CONFIG FLAG, NOT A BUILD (§5): every role boots this same image.
+#   * unconfigured node — ConditionPathExists skips this unit; magic-setup.service
+#     (the first-run wizard) owns tty1 instead. After=magic-setup.service means the
+#     boot where the wizard pins a Workstation role flows straight into the shell.
+#   * workstation      — ExecCondition passes → shell on the seat.
+#   * lighthouse/headless — ExecCondition fails → clean skip (exit 0, no seat).
+#     Hard-off (Option 1 masking, belt-and-braces): systemctl mask mde-shell-egui.service
+# The role file + grep pattern mirror magic-mesh-brand.service exactly, so the
+# two Workstation-gated units can never disagree about what "workstation" means.
+
+[Unit]
+Description=MCNF Quasar egui shell (DRM seat, no compositor)
+Documentation=https://github.com/matthewmackes/magic-mesh
+# The wizard owns tty1 until a role is pinned; we own it after.
+ConditionPathExists=/var/lib/mde/role.toml
+After=systemd-user-sessions.service plymouth-quit-wait.service magic-setup.service
+# The shell talks to mackesd over the shared bus spool; degrade gracefully if
+# the daemon is still coming up (panels show their honest empty states).
+After=mackesd.service
+Wants=mackesd.service
+Conflicts=getty@tty1.service
+Before=getty.target
+# The shell IS the UI — keep bringing it back, but don't tight-loop a broken
+# GPU stack forever; the getty ExecStopPost below restores a console either way.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Workstation-role gate (same pattern as magic-mesh-brand.service).
+ExecCondition=/bin/sh -c 'grep -Eq "role[[:space:]]*=[[:space:]]*\"workstation\"" /var/lib/mde/role.toml'
+ExecStart=/usr/bin/mde-shell-egui
+# Own the physical VT so getty never fights the DRM master.
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYReset=yes
+TTYVHangup=yes
+# Match mackesd.service's shared-bus + mesh-storage pins so the shell resolves
+# the SAME bus spool + workgroup dir as the root daemon (the SETUP-fix split-brain).
+Environment=MDE_BUS_ROOT=/run/mde-bus
+Environment=MDE_WORKGROUP_ROOT=/mnt/mesh-storage
+# root is intentional for now: DRM master + /dev/input/* need seat ownership and
+# there is no logind/seatd integration yet (follow-up noted in
+# packaging/bootc/README.md). Containment doctrine follows mackesd.service.
+Restart=always
+RestartSec=2
+# If the shell gives up (start-limit hit / GPU dead), hand the VT to a getty so
+# the box is still administrable at the console.
+ExecStopPost=-/usr/bin/systemctl start getty@tty1.service
+
+[Install]
+WantedBy=graphical.target
