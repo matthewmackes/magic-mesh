@@ -425,7 +425,7 @@ fn show_overlay(ui: &mut egui::Ui, status: &NetStatus) {
     });
     ui.add_space(Style::SP_XS);
 
-    field(
+    mde_egui::field(
         ui,
         "Overlay IP",
         status.overlay_ip.as_deref().unwrap_or("—"),
@@ -436,13 +436,13 @@ fn show_overlay(ui: &mut egui::Ui, status: &NetStatus) {
         },
     );
     if let Some(iface) = &status.overlay_if {
-        field(ui, "Interface", iface, Style::TEXT);
+        mde_egui::field(ui, "Interface", iface, Style::TEXT);
     }
     if let Some(cidr) = &status.overlay_cidr {
-        field(ui, "Overlay subnet", cidr, Style::TEXT);
+        mde_egui::field(ui, "Overlay subnet", cidr, Style::TEXT);
     }
     if let Some(cipher) = &status.cipher {
-        field(ui, "Tunnel cipher", cipher, Style::TEXT);
+        mde_egui::field(ui, "Tunnel cipher", cipher, Style::TEXT);
     }
     match &status.leader {
         Some(leader) => {
@@ -460,7 +460,7 @@ fn show_overlay(ui: &mut egui::Ui, status: &NetStatus) {
                 }
             });
         }
-        None => field(ui, "Leader", "no leader elected", Style::TEXT_DIM),
+        None => mde_egui::field(ui, "Leader", "no leader elected", Style::TEXT_DIM),
     }
 }
 
@@ -560,7 +560,7 @@ fn show_routing(ui: &mut egui::Ui, status: &NetStatus) {
         return;
     }
     if !status.gateway_endpoints.is_empty() {
-        field(
+        mde_egui::field(
             ui,
             "Lighthouse endpoints",
             &status.gateway_endpoints.join(", "),
@@ -568,7 +568,7 @@ fn show_routing(ui: &mut egui::Ui, status: &NetStatus) {
         );
     }
     if !status.routes.is_empty() {
-        field(
+        mde_egui::field(
             ui,
             "Routable subnets",
             &status.routes.join(", "),
@@ -576,21 +576,8 @@ fn show_routing(ui: &mut egui::Ui, status: &NetStatus) {
         );
     }
     if let Some(gw) = &status.default_gw {
-        field(ui, "Default gateway", gw, Style::TEXT);
+        mde_egui::field(ui, "Default gateway", gw, Style::TEXT);
     }
-}
-
-/// A labelled value row on the spacing grid: a dim label + a toned value.
-fn field(ui: &mut egui::Ui, label: &str, value: &str, tone: Color32) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(label)
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
-        );
-        ui.add_space(Style::SP_S);
-        ui.colored_label(tone, RichText::new(value).size(Style::SMALL));
-    });
 }
 
 #[cfg(test)]

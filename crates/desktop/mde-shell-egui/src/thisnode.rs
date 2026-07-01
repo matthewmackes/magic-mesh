@@ -372,7 +372,7 @@ fn show_identity(ui: &mut egui::Ui, status: &NodeStatus) {
     });
     ui.add_space(Style::SP_XS);
 
-    field(
+    mde_egui::field(
         ui,
         "Overlay IP",
         status.overlay_ip.as_deref().unwrap_or("—"),
@@ -383,7 +383,7 @@ fn show_identity(ui: &mut egui::Ui, status: &NodeStatus) {
         },
     );
     if let Some(cipher) = &status.cipher {
-        field(ui, "Tunnel cipher", cipher, Style::TEXT);
+        mde_egui::field(ui, "Tunnel cipher", cipher, Style::TEXT);
     }
 
     // Presence + heartbeat freshness.
@@ -406,7 +406,7 @@ fn show_identity(ui: &mut egui::Ui, status: &NodeStatus) {
                 }
             });
         }
-        None => field(
+        None => mde_egui::field(
             ui,
             "Presence",
             "not yet in the peer directory",
@@ -435,7 +435,7 @@ fn show_identity(ui: &mut egui::Ui, status: &NodeStatus) {
                 }
             });
         }
-        None => field(ui, "Version", "unknown", Style::TEXT_DIM),
+        None => mde_egui::field(ui, "Version", "unknown", Style::TEXT_DIM),
     }
 }
 
@@ -495,22 +495,9 @@ fn show_mesh(ui: &mut egui::Ui, status: &NodeStatus) {
         );
     });
     match &status.leader {
-        Some(leader) => field(ui, "Leader", leader, Style::TEXT),
-        None => field(ui, "Leader", "no leader elected", Style::TEXT_DIM),
+        Some(leader) => mde_egui::field(ui, "Leader", leader, Style::TEXT),
+        None => mde_egui::field(ui, "Leader", "no leader elected", Style::TEXT_DIM),
     }
-}
-
-/// A labelled value row on the spacing grid: a dim label + a toned value.
-fn field(ui: &mut egui::Ui, label: &str, value: &str, tone: Color32) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(label)
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
-        );
-        ui.add_space(Style::SP_S);
-        ui.colored_label(tone, RichText::new(value).size(Style::SMALL));
-    });
 }
 
 #[cfg(test)]

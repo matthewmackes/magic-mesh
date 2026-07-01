@@ -408,8 +408,8 @@ fn show_posture(ui: &mut egui::Ui, status: &ProvStatus) {
 /// pending-update / not-yet-reporting rollup — the update surface.
 fn show_versions(ui: &mut egui::Ui, status: &ProvStatus) {
     match &status.latest_version {
-        Some(v) => field(ui, "Latest on mesh", v, Style::TEXT),
-        None => field(
+        Some(v) => mde_egui::field(ui, "Latest on mesh", v, Style::TEXT),
+        None => mde_egui::field(
             ui,
             "Latest on mesh",
             "no published version yet",
@@ -456,7 +456,7 @@ fn show_versions(ui: &mut egui::Ui, status: &ProvStatus) {
         });
     }
     if unreported > 0 {
-        field(
+        mde_egui::field(
             ui,
             "Not yet reporting",
             &format!("{unreported} enrolled node{}", plural(unreported)),
@@ -498,19 +498,6 @@ fn show_nodes(ui: &mut egui::Ui, status: &ProvStatus) {
             ui.colored_label(tone, RichText::new(label).size(Style::SMALL));
         });
     }
-}
-
-/// A labelled value row on the spacing grid: a dim label + a toned value.
-fn field(ui: &mut egui::Ui, label: &str, value: &str, tone: Color32) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(label)
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
-        );
-        ui.add_space(Style::SP_S);
-        ui.colored_label(tone, RichText::new(value).size(Style::SMALL));
-    });
 }
 
 #[cfg(test)]

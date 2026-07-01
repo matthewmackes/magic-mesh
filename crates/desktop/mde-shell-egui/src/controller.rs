@@ -396,7 +396,7 @@ fn show_controller(ui: &mut egui::Ui, status: &CtrlStatus) {
                 mde_egui::muted_note(ui, "\u{00B7} this node");
             }
         });
-        field(
+        mde_egui::field(
             ui,
             "Overlay IP",
             status.leader_overlay_ip.as_deref().unwrap_or("—"),
@@ -407,7 +407,7 @@ fn show_controller(ui: &mut egui::Ui, status: &CtrlStatus) {
             },
         );
         if let Some(role) = &status.leader_role {
-            field(ui, "Tier", role, Style::TEXT);
+            mde_egui::field(ui, "Tier", role, Style::TEXT);
         }
         // The held leader lease is the live, observable consensus outcome the
         // snapshot carries (the lease auto-expires, so a named leader is a live
@@ -424,7 +424,7 @@ fn show_controller(ui: &mut egui::Ui, status: &CtrlStatus) {
             ui.colored_label(Style::OK, RichText::new("held").size(Style::SMALL));
         });
     } else {
-        field(ui, "Controller", "no leader elected", Style::TEXT_DIM);
+        mde_egui::field(ui, "Controller", "no leader elected", Style::TEXT_DIM);
         ui.add_space(Style::SP_XS);
         ui.colored_label(
             Style::WARN,
@@ -535,19 +535,6 @@ fn control_chip(ui: &mut egui::Ui, label: &str, up: bool) {
     ui.add_space(Style::SP_XS);
     ui.colored_label(tone, RichText::new(label).size(Style::SMALL));
     ui.add_space(Style::SP_S);
-}
-
-/// A labelled value row on the spacing grid: a dim label + a toned value.
-fn field(ui: &mut egui::Ui, label: &str, value: &str, tone: Color32) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(label)
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
-        );
-        ui.add_space(Style::SP_S);
-        ui.colored_label(tone, RichText::new(value).size(Style::SMALL));
-    });
 }
 
 #[cfg(test)]
