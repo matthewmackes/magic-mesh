@@ -50,9 +50,19 @@ impl<T: ChTransport> Vm<T> {
     /// `PUT /api/v1/vm.create` with `spec`'s `VmConfig` body — defines the guest
     /// (it is not yet running; follow with [`Vm::boot`]).
     ///
+    /// A spec carrying VFIO passthrough devices without the explicit operator
+    /// opt-in ([`VmSpec::vfio_allowed`], lock 13) is **refused** before any
+    /// transport call — passthrough hands the guest raw DMA-capable hardware,
+    /// so it never rides an un-opted create. (Host readiness — IOMMU, the
+    /// vfio-pci binding, group viability — is [`crate::preflight_vfio`]'s job,
+    /// which the vm-lifecycle caller runs first; this pure gate is the
+    /// backstop that cannot be skipped.)
+    ///
     /// # Errors
-    /// Serialization, transport, or a non-2xx API response.
+    /// [`KvmError::Vfio`] for an un-opted passthrough spec; otherwise
+    /// serialization, transport, or a non-2xx API response.
     pub fn create(&self, spec: &VmSpec) -> Result<(), KvmError> {
+        crate::vfio::ensure_vfio_opt_in(spec)?;
         let body = serde_json::to_string(&build_ch_config(spec))?;
         self.put("/vm.create", Some(&body)).map(|_| ())
     }
@@ -264,6 +274,34 @@ mod tests {
         let calls = vm.transport.calls();
         assert_eq!(calls[0].method, "GET");
         assert_eq!(calls[0].path, "/api/v1/vm.info");
+    }
+
+    #[test]
+    fn create_refuses_un_opted_vfio_passthrough_before_any_transport_call() {
+        use crate::vfio::{PciAddress, VfioDevice, VfioError};
+        let gpu = VfioDevice::new(PciAddress::parse("0000:01:00.0").expect("addr"));
+        let vm = Vm::with_transport(MockTransport::ok());
+        // no opt-in → typed refusal, and the VMM is never touched.
+        let err = vm
+            .create(&spec().with_vfio_device(gpu.clone()))
+            .expect_err("must refuse un-opted passthrough");
+        assert!(
+            matches!(&err, KvmError::Vfio(VfioError::NotOptedIn { .. })),
+            "{err:?}"
+        );
+        assert!(vm.transport.calls().is_empty(), "no transport call allowed");
+        // with the operator opt-in the create proceeds and carries the device.
+        let vm = Vm::with_transport(MockTransport::ok());
+        vm.create(&spec().with_vfio_device(gpu).allow_vfio(true))
+            .expect("opted-in create");
+        let calls = vm.transport.calls();
+        assert_eq!(calls.len(), 1);
+        let sent: serde_json::Value =
+            serde_json::from_str(calls[0].body.as_ref().expect("body")).expect("json");
+        assert_eq!(
+            sent["devices"][0]["path"],
+            serde_json::json!("/sys/bus/pci/devices/0000:01:00.0")
+        );
     }
 
     #[test]

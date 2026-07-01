@@ -9,6 +9,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::vfio::VfioDevice;
+
 /// The conventional runtime directory for mde-kvm's per-VM unix sockets (the CH
 /// api-socket and, when virtio-gpu is enabled, the vhost-user-gpu socket). One
 /// sub-directory per VM keeps a fan-out of local VMs from colliding.
@@ -192,6 +194,17 @@ pub struct VmSpec {
     /// common case ([`SharedFolder::mesh_share`]). Each becomes a cloud-hypervisor
     /// `fs` device backed by a virtiofsd socket.
     pub shared_folders: Vec<SharedFolder>,
+    /// Host PCI devices passed through into the guest via **VFIO** (E12-10,
+    /// lock 13 — e.g. the dGPU). Each becomes a cloud-hypervisor `devices`
+    /// entry; refused at create/preflight unless [`VmSpec::vfio_allowed`].
+    pub vfio_devices: Vec<VfioDevice>,
+    /// The explicit **operator opt-in** for VFIO passthrough on this host
+    /// (lock 13: dGPU passthrough is an operator choice per host). Passthrough
+    /// hands the guest raw DMA-capable hardware, so a spec carrying
+    /// [`VmSpec::vfio_devices`] without this flag is refused with a typed
+    /// [`VfioError::NotOptedIn`](crate::VfioError::NotOptedIn) — never
+    /// silently honored or dropped.
+    pub vfio_allowed: bool,
 }
 
 impl VmSpec {
@@ -208,6 +221,8 @@ impl VmSpec {
             virtio_gpu: false,
             nics: Vec::new(),
             shared_folders: Vec::new(),
+            vfio_devices: Vec::new(),
+            vfio_allowed: false,
         }
     }
 
@@ -238,6 +253,24 @@ impl VmSpec {
     #[must_use]
     pub fn with_shared_folder(mut self, folder: SharedFolder) -> Self {
         self.shared_folders.push(folder);
+        self
+    }
+
+    /// Attach a VFIO passthrough device (builder style). Order is preserved.
+    /// Remember the opt-in: without [`VmSpec::allow_vfio`] the spec is refused
+    /// at create/preflight with a typed error.
+    #[must_use]
+    pub fn with_vfio_device(mut self, device: VfioDevice) -> Self {
+        self.vfio_devices.push(device);
+        self
+    }
+
+    /// Record the operator's per-host VFIO opt-in (builder style, lock 13).
+    /// The shell/`vm-lifecycle` worker sets this from host policy — it is
+    /// never defaulted on.
+    #[must_use]
+    pub const fn allow_vfio(mut self, allowed: bool) -> Self {
+        self.vfio_allowed = allowed;
         self
     }
 
@@ -334,6 +367,28 @@ mod tests {
             virtiofs_socket_path("web1", "mesh-share"),
             virtiofs_socket_path("web1", "ref")
         );
+    }
+
+    #[test]
+    fn vfio_defaults_off_and_builders_preserve_order_and_opt_in() {
+        use crate::vfio::{PciAddress, VfioDevice};
+        // passthrough is entirely opt-in: empty + not allowed by default.
+        let plain = VmSpec::new("plain", 1, 512, "/d.img");
+        assert!(plain.vfio_devices.is_empty());
+        assert!(!plain.vfio_allowed);
+        // builders attach devices in order and record the operator opt-in.
+        let gpu = PciAddress::parse("0000:01:00.0").expect("gpu addr");
+        let audio = PciAddress::parse("0000:01:00.1").expect("audio addr");
+        let spec = VmSpec::new("gpu1", 4, 8192, "/g.img")
+            .with_vfio_device(VfioDevice::new(gpu.clone()).with_iommu_group(14))
+            .with_vfio_device(VfioDevice::new(audio.clone()))
+            .allow_vfio(true);
+        assert_eq!(spec.vfio_devices.len(), 2);
+        assert_eq!(spec.vfio_devices[0].address, gpu);
+        assert_eq!(spec.vfio_devices[0].iommu_group, Some(14));
+        assert_eq!(spec.vfio_devices[1].address, audio);
+        assert_eq!(spec.vfio_devices[1].iommu_group, None);
+        assert!(spec.vfio_allowed);
     }
 
     #[test]

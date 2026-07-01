@@ -11,6 +11,7 @@
 use serde_json::{json, Value};
 
 use crate::spec::{gpu_socket_path, virtiofs_socket_path, Nic, SharedFolder, VmSpec};
+use crate::vfio::VfioDevice;
 
 /// MiB → bytes (cloud-hypervisor's `memory.size` is bytes).
 const MIB: u64 = 1024 * 1024;
@@ -36,6 +37,12 @@ const FS_QUEUE_SIZE: u16 = 1024;
 ///   the guest mount `tag` + the per-folder virtiofsd `socket`
 ///   ([`virtiofs_socket_path`]). The host `host_path`/`read_only` are virtiofsd's
 ///   concern (the live launch), not cloud-hypervisor's, so they are not emitted.
+/// - `devices` ← one VFIO `DeviceConfig` per [`VmSpec::vfio_devices`] entry
+///   (E12-10, lock 13): `path` = the device's sysfs node. The `iommu_group`
+///   pin is preflight-side ([`crate::preflight_vfio`]), not emitted — and note
+///   this mapping is faithful to the spec; the **operator opt-in is enforced at
+///   the lifecycle** ([`crate::Vm::create`] / [`crate::ensure_vfio_opt_in`]),
+///   which refuses an un-opted passthrough spec with a typed error.
 /// - `rng`/`serial` ← entropy + a debug serial, always present.
 #[must_use]
 pub fn build_ch_config(spec: &VmSpec) -> Value {
@@ -90,6 +97,14 @@ pub fn build_ch_config(spec: &VmSpec) -> Value {
         config["fs"] = Value::Array(fs);
     }
 
+    // The VFIO passthrough devices (E12-10, lock 13): each → one `devices`
+    // entry naming the host sysfs node. The iommu_group pin is host-side
+    // (preflight), so — like the NIC role — it does not appear here.
+    if !spec.vfio_devices.is_empty() {
+        let devices: Vec<Value> = spec.vfio_devices.iter().map(vfio_to_device).collect();
+        config["devices"] = Value::Array(devices);
+    }
+
     config
 }
 
@@ -124,6 +139,15 @@ fn shared_folder_to_fs(vm_name: &str, folder: &SharedFolder) -> Value {
     })
 }
 
+/// One [`VfioDevice`] → a cloud-hypervisor VFIO `DeviceConfig` entry: just the
+/// device's sysfs `path` (its `OpenAPI` shape; `iommu` defaults false and the
+/// broker leaves it there — the guest gets the device, not a vIOMMU). The
+/// spec's `iommu_group` pin drives [`crate::preflight_vfio`], not the config,
+/// so it is deliberately not emitted (mirrors the NIC-role pattern).
+fn vfio_to_device(device: &VfioDevice) -> Value {
+    json!({ "path": device.address.sysfs_path().to_string_lossy() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +155,7 @@ mod tests {
         gpu_socket_path, virtiofs_socket_path, Nic, SharedFolder, VmSpec, DEFAULT_FIRMWARE,
         MESH_SHARE_TAG,
     };
+    use crate::vfio::{PciAddress, VfioDevice};
 
     /// A representative dual-homed desktop spec for the mapping tests.
     fn web1() -> VmSpec {
@@ -247,6 +272,39 @@ mod tests {
         // never appear in the `fs` entry (mirrors the dual-homed NIC role).
         assert!(fs[0].get("host_path").is_none());
         assert!(fs[1].get("read_only").is_none());
+    }
+
+    #[test]
+    fn vfio_devices_map_to_devices_entries_with_sysfs_paths_in_order() {
+        // THE passthrough acceptance at the config layer: each VfioDevice → one
+        // VFIO `devices` entry carrying the host sysfs path (CH DeviceConfig).
+        let gpu = PciAddress::parse("0000:01:00.0").expect("gpu");
+        let audio = PciAddress::parse("0000:01:00.1").expect("audio");
+        let spec = VmSpec::new("gpu1", 4, 8192, "/home/op/Local/gpu1.img")
+            .with_vfio_device(VfioDevice::new(gpu).with_iommu_group(14))
+            .with_vfio_device(VfioDevice::new(audio))
+            .allow_vfio(true);
+        let cfg = build_ch_config(&spec);
+        let devices = cfg["devices"].as_array().expect("devices array");
+        assert_eq!(devices.len(), 2);
+        assert_eq!(
+            devices[0]["path"],
+            json!("/sys/bus/pci/devices/0000:01:00.0")
+        );
+        assert_eq!(
+            devices[1]["path"],
+            json!("/sys/bus/pci/devices/0000:01:00.1")
+        );
+        // the iommu_group pin is preflight-side, never emitted; `iommu` stays
+        // at CH's default (absent) — the guest gets the device, not a vIOMMU.
+        assert!(devices[0].get("iommu_group").is_none());
+        assert!(devices[0].get("iommu").is_none());
+    }
+
+    #[test]
+    fn no_vfio_devices_leaves_no_devices_key() {
+        let cfg = build_ch_config(&VmSpec::new("plain", 2, 2048, "/p.img"));
+        assert!(cfg.get("devices").is_none());
     }
 
     #[test]

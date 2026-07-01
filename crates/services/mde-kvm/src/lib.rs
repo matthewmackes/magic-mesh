@@ -37,10 +37,21 @@
 //! `virtiofsd` (which needs the binary + the host mesh-share export) is parked behind
 //! [`VirtiofsLauncher`], whose production impl ([`LiveVirtiofsLauncher`]) returns a
 //! typed integration-gated error rather than faking success.
+//!
+//! ## E12-10 — the advanced-VDI cores (passthrough / USB / migration)
+//!
+//! - **VFIO GPU passthrough** (lock 13): [`VfioDevice`]s on the spec →
+//!   cloud-hypervisor `devices` entries; **operator-opt per host**
+//!   ([`VmSpec::vfio_allowed`], enforced by [`Vm::create`] +
+//!   [`ensure_vfio_opt_in`]); host readiness (IOMMU / vfio-pci binding / group
+//!   viability) via [`preflight_vfio`] over the injectable [`VfioProbe`] seam,
+//!   whose live [`SysfsVfioProbe`] reads the real sysfs — the full live check
+//!   is gated on passthrough hardware.
 
 mod config;
 mod spec;
 mod transport;
+mod vfio;
 mod virtiofs;
 mod vm;
 
@@ -55,6 +66,10 @@ pub use spec::{
 };
 pub use transport::{
     build_http_request, parse_http_response, ChResponse, ChTransport, UnixSocketTransport,
+};
+pub use vfio::{
+    ensure_vfio_opt_in, preflight_vfio, PciAddress, SysfsVfioProbe, VfioDevice, VfioError,
+    VfioProbe, VFIO_PCI_DRIVER,
 };
 pub use virtiofs::{LiveVirtiofsLauncher, VirtiofsError, VirtiofsLauncher};
 pub use vm::{Vm, VmInfo};
@@ -88,4 +103,9 @@ pub enum KvmError {
     /// (De)serializing a `VmConfig` / `vm.info` body failed.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// A VFIO passthrough gate failed (E12-10, lock 13) — most importantly the
+    /// operator opt-in: [`Vm::create`] refuses a spec carrying passthrough
+    /// devices unless [`VmSpec::vfio_allowed`] is set.
+    #[error("vfio: {0}")]
+    Vfio(#[from] VfioError),
 }
