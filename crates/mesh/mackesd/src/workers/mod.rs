@@ -516,6 +516,14 @@ pub mod xcp_provision;
 // summary to `event/kvm/services` so the Datacenter panels + the alert lane see
 // the live stack state. Universal — every mesh node runs the same KVM stack.
 pub mod kvm_health;
+// MV-3 — the vm_lifecycle worker: the libvirt/KVM VM-lifecycle actuator (the
+// Fedora+KVM equivalent of xapi/xenopsd/sm/xcp-networkd). Drains
+// `action/vm/lifecycle` (create-from-image / start / stop / destroy / list,
+// each addressed to a target node id) and publishes this node's VM instance
+// roster to `event/vm/instances`. Shells `virsh`/`qemu-img` through the bounded
+// proc path behind an injectable `LibvirtBackend` trait. Universal, like
+// kvm_health — every node can host datacenter VMs.
+pub mod vm_lifecycle;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
 // text clip on the bus + appends to ONE mesh-global `clipboard/history.json`

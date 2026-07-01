@@ -5787,6 +5787,25 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("kvm_health".into());
         }
+        // MV-3 — the vm_lifecycle worker: the libvirt/KVM VM-lifecycle actuator
+        // the Datacenter UI drives. Drains `action/vm/lifecycle` (create-from-
+        // image / start / stop / destroy / list, each addressed to a target
+        // node id) via an injectable LibvirtBackend that shells `virsh`/
+        // `qemu-img` through the bounded proc path, and publishes this node's VM
+        // instance roster to `event/vm/instances`. Universal like kvm_health —
+        // every node can host datacenter VMs — so it gates through the
+        // rank-0-default worker resolver (runs everywhere). node_id is both the
+        // event `host` stamp and the action target this worker matches.
+        if mackesd_core::worker_role::runs("vm_lifecycle", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::vm_lifecycle::VmLifecycleWorker::new(node_id.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("vm_lifecycle".into());
+        }
         // OV-7.a (v2.6) — health reconciler. Polls each known
         // peer's QNM-Shared heartbeat.json every 5 s, applies the
         // telemetry::health_state_from_age threshold table, writes
