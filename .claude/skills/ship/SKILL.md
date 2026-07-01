@@ -52,7 +52,7 @@ older-glibc forward-compat), user `mm`, key `/root/.ssh/mackes_mesh_ed25519`,
 
 | Host | VM | IP | vCPU / RAM | SAFE heavy slots |
 |---|---|---|---|---|
-| **XEN-BIGBOY** | `mcnf-build-52` | `172.20.0.130` | 8 / 24 GB | **3** |
+| **XEN-BIGBOY** | `mcnf-build-52` | `172.20.0.130` | 12 / 20 GB | **3** |
 | KVM-XCP1 | `mcnf-build-51` | `172.20.0.90` | 4 / 16 GB | **2** |
 | XEN-HOME-SERVICES | `mcnf-build-50` | `172.20.0.50` | 4 / 16 GB | **2** |
 
@@ -69,12 +69,12 @@ utilization = all 7 busy, spread **3 + 2 + 2**.
 BIGBOY → load average **44**, disk full, stuck/dud agents whose code had to be
 salvaged on the small nodes (`AI_GOVERNANCE.md §10`). "Full utilization" means
 filling **to** the cap, *spread*, NOT piling onto BIGBOY. A 4-vCPU node (.50/.90)
-caps at **2**; the 8-vCPU BIGBOY (.130) at **3**. Exceeding the cap is the *opposite* of
+caps at **2**; the 12-vCPU BIGBOY (.130) at **3**. Exceeding the cap is the *opposite* of
 utilization — it deadlocks the node and you lose the work.
 
 ### BigBoy takes the longest / most-complex build (standing rule, operator 2026-06-30)
 Complementary to the spread cap: the **single heaviest job always goes to BIGBOY**
-(`.130`, 8 vCPU) — a full `cargo --workspace` build/test/clippy, the biggest egui
+(`.130`, 12 vCPU) — a full `cargo --workspace` build/test/clippy, the biggest egui
 crates (`mde-shell-egui` / `mde-workbench`), a cold cosmic/iced/wgpu compile, or the
 RPM release build. The 4-vCPU nodes (`.50`/`.90`/`.170`) take the shorter/simpler
 jobs (small single crates, per-crate tests/clippy). Spread the *count* to honor the

@@ -99,7 +99,7 @@ Three Xen build VMs, all **Fedora 42**, user `mm`, key
 
 | Host | VM | IP | vCPU / RAM | SAFE heavy slots |
 |---|---|---|---|---|
-| **XEN-BIGBOY** | `mcnf-build-52` | `172.20.0.130` | 8 / 24 GB | **3** |
+| **XEN-BIGBOY** | `mcnf-build-52` | `172.20.0.130` | 12 / 20 GB | **3** |
 | KVM-XCP1 | `mcnf-build-51` | `172.20.0.90` | 4 / 16 GB | **2** |
 | XEN-HOME-SERVICES | `mcnf-build-50` | `172.20.0.50` | 4 / 16 GB | **2** |
 
@@ -115,11 +115,11 @@ farm and never grind locally (`/no-flinch` rule 4: fix the loop, don't avoid it)
 ### The hard cap (the load-44 lesson — NON-NEGOTIABLE)
 **≤3 heavy builds per node. NEVER more.** 6 concurrent heavies on BIGBOY → load
 44, disk full, lost work (`AI_GOVERNANCE.md §10`). Full utilization = fill *to* the
-cap, *spread* — not pile onto BIGBOY. 4-vCPU nodes cap at 2; the 8-vCPU BIGBOY at 3.
+cap, *spread* — not pile onto BIGBOY. 4-vCPU nodes cap at 2; the 12-vCPU BIGBOY at 3.
 
 ### BigBoy takes the longest / most-complex build (standing rule, operator 2026-06-30)
 Complementary to the spread cap: the **single heaviest job always goes to BIGBOY**
-(`.130`, 8 vCPU) — a full `cargo --workspace` build/test/clippy, the biggest egui
+(`.130`, 12 vCPU) — a full `cargo --workspace` build/test/clippy, the biggest egui
 crates (`mde-shell-egui` / `mde-workbench`), a cold cosmic/iced/wgpu compile, the RPM
 release. The 4-vCPU nodes (`.50`/`.90`/`.170`) take the shorter/simpler jobs (small
 single crates, per-crate tests/clippy). Spread the *count* to honor caps; route the
