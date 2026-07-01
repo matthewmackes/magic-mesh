@@ -56,6 +56,15 @@
 //!   + the golden image on disk); the create/reconnect/no-image branches are all real
 //!   outcomes, not stubs. The shell/DRM-boot half (E12-2/E12-3) is hardware-gated and
 //!   lands in its own units.
+//! * [`service_add`] (OW-11) adds a curated back-office service without blocking the
+//!   working network (#20): **Music** provisions Navidrome on a media-lighthouse
+//!   reading DO Spaces (reusing [`spawn_lighthouse`]'s `ProvisionSpec` + the peer
+//!   roster's media tag to select/promote the target, #18/#19), **Files** is P2P
+//!   `mde-files` Send-To with no VM (a real no-op outcome, never a spawn), and
+//!   **Voice** registers to an external SIP provider (the password held in the secret
+//!   store, never embedded). Pure `plan_service_add` core + the injectable
+//!   [`service_add::ServiceApply`] seam (production `LiveServiceApply` is honestly
+//!   integration-gated); no-lighthouse / no-SIP-account are real retryable outcomes.
 //!
 //! # Verbs still owned by the sibling OW units — deliberately NOT declared here (§7)
 //! The remaining complex verbs land in their own units with real implementations;
@@ -68,4 +77,5 @@ pub mod mesh_dns;
 pub mod network;
 pub mod role_provision;
 pub mod self_test;
+pub mod service_add;
 pub mod spawn_lighthouse;

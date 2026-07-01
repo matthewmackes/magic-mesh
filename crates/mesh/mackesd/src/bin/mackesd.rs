@@ -1378,6 +1378,28 @@ enum OnboardCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// OW-11 — add a curated back-office service (Music / Files / Voice) as a
+    /// separate day-2 Services flow that never blocks the working network (#20).
+    /// Music provisions Navidrome on a media-lighthouse (DO Spaces); Files is P2P
+    /// Send-To (no VM); Voice registers to an external SIP provider. The live
+    /// Navidrome provision / SIP register is integration-gated behind the
+    /// ServiceApply seam; `--dry-run` prints the plan + ordered steps.
+    ServiceAdd {
+        /// Which service to add: `music`, `files`, or `voice`.
+        kind: String,
+        /// Voice only: the external SIP registrar host (e.g. `sip.provider.net`).
+        #[arg(long)]
+        sip_registrar: Option<String>,
+        /// Voice only: the SIP domain (defaults to the registrar when omitted).
+        #[arg(long)]
+        sip_domain: Option<String>,
+        /// Voice only: the SIP account username.
+        #[arg(long)]
+        sip_username: Option<String>,
+        /// Print the plan + ordered steps without provisioning / registering.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// DDNS-EGRESS-3 — `mackesd ddns <sub>` subcommands. Each calls the same
@@ -2617,6 +2639,61 @@ fn main() -> anyhow::Result<()> {
                     Err(e) => {
                         eprintln!(
                             "  first-desktop failed (live VM create/boot + session is integration-gated): {e}"
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            OnboardCmd::ServiceAdd {
+                kind,
+                sip_registrar,
+                sip_domain,
+                sip_username,
+                dry_run,
+            } => {
+                // OW-11 — add a curated back-office service. Gather the mesh's
+                // lighthouses (media servers live on lighthouses, #19), fold into a
+                // per-kind plan: Music provisions Navidrome on a media-lighthouse
+                // (DO Spaces); Files is a real P2P no-op; Voice registers to an
+                // external SIP. The live provision / SIP register is integration-gated
+                // behind the ServiceApply seam; --dry-run stops at the plan + steps.
+                use mackesd_core::onboard::service_add as sa;
+                let Some(service_kind) = sa::ServiceKind::parse(&kind) else {
+                    eprintln!(
+                        "service-add: unknown service '{kind}' (expected music | files | voice)"
+                    );
+                    std::process::exit(2);
+                };
+                // Voice: build the external SIP account only when the operator
+                // supplied registrar + username; otherwise the plan is the honest
+                // VoiceNeedsAccount retryable outcome (never a fabricated account).
+                let sip = match (sip_registrar, sip_username) {
+                    (Some(registrar), Some(username)) => {
+                        let domain = sip_domain.unwrap_or_else(|| registrar.clone());
+                        Some(sa::SipAccount::new(&registrar, &domain, &username))
+                    }
+                    _ => None,
+                };
+                let req = sa::ServiceAddRequest {
+                    kind: service_kind,
+                    sip,
+                };
+                let root = mackesd_core::default_qnm_shared_root();
+                let facts = sa::gather(&root);
+                let plan = sa::plan_service_add(&req, &facts);
+                println!("onboard service-add: {}", plan.human());
+                if dry_run {
+                    for (i, step) in plan.steps().iter().enumerate() {
+                        println!("  {}. {}", i + 1, step);
+                    }
+                    return Ok(());
+                }
+                // Live path: drive the integration-gated ServiceApply seam.
+                match sa::execute(&plan, &sa::LiveServiceApply) {
+                    Ok(outcome) => println!("  {}", outcome.human()),
+                    Err(e) => {
+                        eprintln!(
+                            "  service-add failed (live Navidrome provision / SIP register is integration-gated): {e}"
                         );
                         std::process::exit(1);
                     }
