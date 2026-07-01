@@ -80,7 +80,12 @@ impl Plane {
 /// the Network plane from `network` (WB-Network), the Fleet plane's live per-node
 /// KVM reality from `datacenter` (MV-6), and the Provisioning plane's live
 /// deployment / version / enrollment posture from `provisioning` (WB-Provisioning)
-/// — every plane now renders live status.
+/// — every plane now renders live status. The Provisioning plane additionally
+/// hosts the day-2 Services flow (`services`, OW-11): pick Music/Files/Voice,
+/// preview the daemon's plan, apply over the Bus.
+// One state struct per mounted plane view — the Workbench is the single place
+// they all meet, so the arity IS the plane count, not a design smell.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn show(
     ui: &mut egui::Ui,
     selected: &mut Plane,
@@ -92,6 +97,9 @@ pub(crate) fn show(
     network: &crate::network::NetworkState,
     controller: &crate::controller::ControllerState,
     provisioning: &crate::provisioning::ProvisioningState,
+    // Mutable like `datacenter`: the Services flow publishes service-add
+    // requests onto the Bus and holds the daemon's typed answer.
+    services: &mut crate::services_flow::ServicesFlowState,
 ) {
     ui.add_space(Style::SP_L);
     ui.heading(
@@ -159,8 +167,15 @@ pub(crate) fn show(
                 // WB-Provisioning — the mesh's live deployment posture (per-node
                 // tier + role rollup, the fleet version target vs each node's build
                 // + update flag, per-node enrollment readiness) off the same
-                // snapshot.
-                Plane::Provisioning => provisioning.show(ui),
+                // snapshot — plus the OW-11 Services flow (day-2 service adds are
+                // provisioning work: `onboard service-add` over the Bus).
+                Plane::Provisioning => {
+                    provisioning.show(ui);
+                    ui.add_space(Style::SP_M);
+                    ui.separator();
+                    ui.add_space(Style::SP_M);
+                    services.show(ui);
+                }
             }
         });
     });

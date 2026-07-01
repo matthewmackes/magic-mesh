@@ -24,6 +24,7 @@ mod instances;
 mod network;
 mod notifications;
 mod provisioning;
+mod services_flow;
 mod session;
 mod thisnode;
 mod vdi;
@@ -89,6 +90,10 @@ struct Shell {
     /// the same world-readable mesh-status snapshot (WB-Provisioning). Reads no
     /// `mackesd` IPC.
     provisioning: provisioning::ProvisioningState,
+    /// The Services flow (OW-11) — the Provisioning plane's day-2 service adds:
+    /// pick Music/Files/Voice, preview the daemon's plan (dry-run), apply over
+    /// the Bus, and render the `service_onboard` worker's typed answer.
+    services: services_flow::ServicesFlowState,
     /// The always-visible chrome bar's live state — peers + mesh status folded
     /// from the world-readable mesh-status snapshot, polled on the shared cadence
     /// (self-gating inside `chrome::show`).
@@ -144,6 +149,7 @@ impl Shell {
             network: network::NetworkState::default(),
             controller: controller::ControllerState::default(),
             provisioning: provisioning::ProvisioningState::default(),
+            services: services_flow::ServicesFlowState::default(),
             chrome: chrome::ChromeState::default(),
             music: MusicApp::new_with_ctx(ctx),
             files: mde_files_egui::real_browser(),
@@ -184,6 +190,7 @@ impl Shell {
                     &self.network,
                     &self.controller,
                     &self.provisioning,
+                    &mut self.services,
                 );
             }
             Surface::Desktop => {
@@ -295,6 +302,9 @@ impl Shell {
             self.network.poll(ctx);
             self.controller.poll(ctx);
             self.provisioning.poll(ctx);
+            // The Services flow only actually reads while a request is in
+            // flight (it self-gates on `pending`), so this is free otherwise.
+            self.services.poll(ctx);
         }
 
         // The Desktop surface's picker (E12-5b) subscribes to the same live VM
