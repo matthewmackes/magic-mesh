@@ -260,6 +260,39 @@ impl MusicApp {
     }
 }
 
+/// Render the music surface's central content into the given `ui`.
+///
+/// Draws the honest "connect a server" state when no credentials are configured,
+/// then any transient engine-error line, and finally either the open album's track
+/// list or the library listing. Clicks still flow to the worker through `app`'s
+/// command channel, exactly as the standalone binary drives them.
+///
+/// This is the one body shared by the standalone binary's `CentralPanel` and the
+/// embedded shell panel (E12-3b), so the surface renders identically whether it
+/// owns a window or is a panel inside the one shell — the EMBED model of E12
+/// "Quasar" §5 (surfaces are panels in the shell, not separate clients). It draws
+/// only through the shared [`Style`], reusing `app`'s existing state (no parallel
+/// state is introduced).
+pub fn music_panel(ui: &mut egui::Ui, app: &mut MusicApp) {
+    if let Some(detail) = &app.setup_error {
+        render_setup_needed(ui, detail);
+        return;
+    }
+    // A transient playback/engine error (e.g. no sound device on a headless
+    // host) — rendered, not swallowed.
+    if let Some(error) = app.state.error.clone() {
+        ui.add_space(Style::SP_XS);
+        ui.colored_label(Style::DANGER, error);
+        ui.add_space(Style::SP_XS);
+    }
+    ui.add_space(Style::SP_S);
+    if app.state.open_album.is_some() {
+        app.render_album(ui);
+    } else {
+        app.render_library(ui);
+    }
+}
+
 impl App for MusicApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         // Drain everything the worker has sent since the last frame.
@@ -271,25 +304,9 @@ impl App for MusicApp {
             self.render_header(ui);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(detail) = &self.setup_error {
-                render_setup_needed(ui, detail);
-                return;
-            }
-            // A transient playback/engine error (e.g. no sound device on a
-            // headless host) — rendered, not swallowed.
-            if let Some(error) = self.state.error.clone() {
-                ui.add_space(Style::SP_XS);
-                ui.colored_label(Style::DANGER, error);
-                ui.add_space(Style::SP_XS);
-            }
-            ui.add_space(Style::SP_S);
-            if self.state.open_album.is_some() {
-                self.render_album(ui);
-            } else {
-                self.render_library(ui);
-            }
-        });
+        // The central content is the shared `music_panel` body, so the standalone
+        // window and the embedded shell panel (E12-3b) render identically.
+        egui::CentralPanel::default().show(ctx, |ui| music_panel(ui, self));
     }
 }
 
@@ -378,4 +395,118 @@ fn track_row(ui: &mut egui::Ui, index: usize, song: &Song) -> Response {
         .response
         .interact(Sense::click())
         .on_hover_cursor(CursorIcon::PointingHand)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{music_panel, MusicApp};
+    use crate::model::{Fetch, MusicState, Update};
+    use mde_egui::egui::{self, pos2, vec2, Rect};
+    use mde_egui::Style;
+    use mde_musicd::airsonic::{Album, Song};
+    use std::sync::mpsc;
+
+    fn album(id: &str) -> Album {
+        Album {
+            id: id.to_string(),
+            name: format!("Album {id}"),
+            artist: "Artist".to_string(),
+            artist_id: String::new(),
+            song_count: 2,
+            cover_art: String::new(),
+            year: Some(2021),
+        }
+    }
+
+    fn song(id: &str) -> Song {
+        Song {
+            id: id.to_string(),
+            title: format!("Track {id}"),
+            album: "Album".to_string(),
+            artist: "Artist".to_string(),
+            duration: 180,
+            track: None,
+            suffix: "flac".to_string(),
+            cover_art: String::new(),
+        }
+    }
+
+    /// Build a `MusicApp` around a given `state` with no worker and no credentials
+    /// — the embedded case a shell would drive, minus the daemon. `music_panel`
+    /// never touches the update channel, so a disconnected receiver is fine.
+    fn app_with(state: MusicState, setup_error: Option<String>) -> MusicApp {
+        let (_tx, rx) = mpsc::channel::<Update>();
+        MusicApp {
+            state,
+            commands: None,
+            updates: rx,
+            server: "airsonic.mesh:4040".to_string(),
+            setup_error,
+        }
+    }
+
+    /// Drive one headless egui frame that shows `music_panel`, then tessellate the
+    /// result on the CPU so any paint-path fault (bad shape/text/geometry) surfaces
+    /// as a test failure. This is the same `Context::run` → `tessellate` path the
+    /// DRM runner drives, minus the GPU — no window, no wgpu, no sound device — so
+    /// the embeddable panel is proven runtime-reachable in `cargo test`.
+    fn render(app: &mut MusicApp) {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(480.0, 360.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| music_panel(ui, app));
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(!prims.is_empty(), "frame produced no draw primitives");
+    }
+
+    #[test]
+    fn setup_needed_renders_without_credentials() {
+        // No creds ⇒ the honest "connect a server" state (§7), the path an
+        // unconfigured embed opens to — rendered end-to-end, no worker spawned.
+        let mut app = app_with(
+            MusicState::new(),
+            Some("no music server configured (run `mde-musicd --first-run`)".to_string()),
+        );
+        render(&mut app);
+    }
+
+    #[test]
+    fn library_listing_and_states_render() {
+        // A populated library exercises album_row for every row.
+        let mut ready = MusicState::new();
+        ready.albums = Fetch::Ready(vec![album("1"), album("2")]);
+        render(&mut app_with(ready, None));
+
+        // The loading / failed / empty branches each paint their honest line.
+        let mut loading = MusicState::new();
+        loading.albums = Fetch::Loading;
+        render(&mut app_with(loading, None));
+
+        let mut failed = MusicState::new();
+        failed.albums = Fetch::Failed("server down".to_string());
+        render(&mut app_with(failed, None));
+
+        let mut empty = MusicState::new();
+        empty.albums = Fetch::Ready(Vec::new());
+        render(&mut app_with(empty, None));
+    }
+
+    #[test]
+    fn open_album_with_tracks_and_error_banner_render() {
+        // Transient engine error + a now-playing track + an open album with tracks
+        // exercises the error banner and track_row alongside the album header.
+        let mut state = MusicState::new();
+        state.error = Some("audio output unavailable".to_string());
+        state.now_playing = Some(song("42"));
+        state.playing = true;
+        state.open(album("7"));
+        state.open_album.as_mut().expect("an album is open").tracks =
+            Fetch::Ready(vec![song("a"), song("b")]);
+        render(&mut app_with(state, None));
+    }
 }
