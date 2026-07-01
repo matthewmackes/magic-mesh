@@ -361,18 +361,16 @@ assets = [
     { source = "target/release/mde-enroll",         dest = "/usr/bin/mde-enroll",         mode = "755" },
     { source = "target/release/magic-setup",        dest = "/usr/bin/magic-setup",        mode = "755" },
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
-    { source = "target/release/mde-files",          dest = "/usr/bin/mde-files",          mode = "755" },
     { source = "target/release/mde-workbench",      dest = "/usr/bin/mde-workbench",      mode = "755" },
-    # E12-14b — the live-map layer-shell wallpaper (mde-mesh-wallpaper) + the
-    # notify-hub bins (mde-notify-{center,toast,capture}) were dropped as obsolete
-    # Cosmic-era surfaces; their /usr/bin binaries + their autostart/launcher
-    # .desktop files no longer ship.
-    { source = "target/release/mde-voice-hud",      dest = "/usr/bin/mde-voice-hud",      mode = "755" },
-    { source = "target/release/mde-music",          dest = "/usr/bin/mde-music",          mode = "755" },
+    # E12-14b — the obsolete Cosmic-era surfaces were dropped: the live-map
+    # layer-shell wallpaper (mde-mesh-wallpaper) + the notify-hub bins
+    # (mde-notify-{center,toast,capture}), AND the four iced/libcosmic GUIs that
+    # now render as egui panels in mde-shell-egui — the file manager (mde-files),
+    # music player (mde-music), voice HUD (mde-voice-hud), and the cosmic-applet.
+    # Their /usr/bin binaries + their autostart/launcher .desktop files no longer
+    # ship (mde-files/mde-voice-hud/mde-cosmic-applet are now lib-only; mde-music
+    # is deleted). The mde-musicd DAEMON stays — it drives the shell's Music panel.
     { source = "target/release/mde-musicd",         dest = "/usr/bin/mde-musicd",         mode = "755" },
-    # AUD-4 — the §5 Cosmic integration: the mesh-health cosmic-applet binary +
-    # its X-CosmicApplet .desktop so cosmic-panel discovers + hosts it.
-    { source = "target/release/mde-cosmic-applet",  dest = "/usr/bin/mde-cosmic-applet",  mode = "755" },
     # APPLAUNCH-9 (2026-06-27) — the mde-apps-applet launcher binary was RETIRED:
     # the app-launcher role folded into the Front Door (one launcher). The Start
     # button now opens the Front Door launcher (com.mackes.MagicMeshApps.desktop →

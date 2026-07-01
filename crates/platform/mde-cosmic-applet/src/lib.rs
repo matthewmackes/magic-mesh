@@ -1,13 +1,11 @@
 //! GUI-6 (Q46/47) — the MCNF cosmic-applet's logic layer.
 //!
-//! The applet is a libcosmic panel widget that subscribes to `mde-bus` and
-//! renders into the Cosmic panel. libcosmic only renders inside a live Cosmic
-//! session, so this module is the **render-agnostic, fully-tested core** — the
-//! lighthouse-health panel indicator (LIGHTHOUSE-7). The libcosmic shell that
-//! draws this state into the Cosmic panel is the hardware-gated render target
-//! (it needs a Cosmic session to build + verify); it consumes this crate so the
-//! surface is thin glue, not logic. (APPLAUNCH-9, 2026-06-27: the app-launcher
-//! model that used to live here retired into the Front Door — one launcher.)
+//! This module is the **render-agnostic, fully-tested core** — the
+//! lighthouse-health panel indicator (LIGHTHOUSE-7). E12-14b stripped the
+//! libcosmic panel-shell binary; MCNF 12.0 "Quasar" reuses this core from the
+//! egui replacements (`mde-panel-egui` + `mde-shell-egui`) as thin glue, not
+//! logic. (APPLAUNCH-9, 2026-06-27: the app-launcher model that used to live
+//! here retired into the Front Door — one launcher.)
 
 // ──────────────────── LIGHTHOUSE-7 — panel health indicator ────────────────
 //

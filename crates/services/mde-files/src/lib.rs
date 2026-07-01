@@ -47,34 +47,12 @@ pub mod smb;
 pub mod thumbnails;
 pub mod trash;
 
-// ── Windowed libcosmic surface (feature = "gui") ────────────────────────────
-// Every module that renders through libcosmic, plus `mounts` (which resolves its
-// icon through `icons`). Gated so a `default-features = false` consumer never
-// pulls the toolkit.
-#[cfg(feature = "gui")]
-pub mod app;
-/// GUI-7 — libcosmic `.sty()` styling shims (see module docs).
-#[cfg(feature = "gui")]
-pub mod cosmic_compat;
-#[cfg(feature = "gui")]
-pub mod icons;
-#[cfg(feature = "gui")]
-pub mod loading;
-#[cfg(feature = "gui")]
-pub mod mounts;
-#[cfg(feature = "gui")]
-pub mod picker;
-#[cfg(feature = "gui")]
-pub mod prefs;
-#[cfg(feature = "gui")]
-pub mod theme;
-#[cfg(feature = "gui")]
-pub mod views;
-#[cfg(feature = "gui")]
-pub mod widgets;
-
-#[cfg(feature = "gui")]
-pub use app::{MdeFiles, Message};
+// ── E12-14b — the windowed libcosmic surface was stripped ───────────────────
+// The iced/libcosmic file-manager GUI (`app`/`views`/`widgets`/`icons`/`theme`/
+// `loading`/`picker`/`prefs`/`cosmic_compat`/`mounts` + the `mde-files` binary)
+// is retired. MCNF 12.0 "Quasar" renders Files as an egui panel
+// (`mde-files-egui::files_panel`) inside `mde-shell-egui`, reusing the
+// render-agnostic backend/model/send_to above. No `gui` feature remains.
 pub use backend::{
     AuditEntry, Backend, BackendError, ConflictPolicy, DemoBackend, Destination, OpId, SendMode,
 };

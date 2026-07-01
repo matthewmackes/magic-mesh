@@ -301,11 +301,11 @@ struct MediaPlayer2;
 
 #[interface(name = "org.mpris.MediaPlayer2")]
 impl MediaPlayer2 {
-    /// Bring the player to the foreground by launching the `mde-music`
-    /// window (best-effort).
-    async fn raise(&self) {
-        let _ = std::process::Command::new("mde-music").spawn();
-    }
+    /// MPRIS `Raise`. E12-14b stripped the standalone `mde-music` window —
+    /// Music is now an egui panel in `mde-shell-egui`, not a raisable app — so
+    /// this is a no-op and `CanRaise` is false (an MPRIS controller checks that
+    /// property before ever calling Raise).
+    async fn raise(&self) {}
 
     /// MPRIS `Quit`. The daemon is a session service managed by systemd
     /// (AIR-1), so this is a no-op rather than killing playback for the
@@ -319,7 +319,8 @@ impl MediaPlayer2 {
 
     #[zbus(property)]
     async fn can_raise(&self) -> bool {
-        true
+        // E12-14b — no standalone player window to raise (Music is a shell panel).
+        false
     }
 
     #[zbus(property)]
@@ -334,7 +335,9 @@ impl MediaPlayer2 {
 
     #[zbus(property)]
     async fn desktop_entry(&self) -> String {
-        "mde-music".to_string()
+        // E12-14b — the org.magicmesh.Music.desktop launcher was removed with the
+        // standalone GUI; the daemon has no installed .desktop entry to advertise.
+        String::new()
     }
 
     #[zbus(property)]

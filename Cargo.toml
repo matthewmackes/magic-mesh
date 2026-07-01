@@ -38,7 +38,6 @@ members = [
     "crates/mesh/magic-fleet",
     "crates/services/mde-files",
     "crates/services/mde-kvm",
-    "crates/services/mde-music",
     "crates/services/mde-musicd",
     "crates/services/mde-notify",
     "crates/services/mde-voice-config",

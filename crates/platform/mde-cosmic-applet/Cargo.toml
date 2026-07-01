@@ -9,30 +9,12 @@ description = "MCNF cosmic-applet: mesh health pip + quick actions over mde-bus,
 [lib]
 path = "src/lib.rs"
 
-# GUI-6 — the libcosmic panel shell. Thin glue over the lib; renders the
-# pip + popover into the Cosmic panel. Pinned to the libcosmic rev the
-# feasibility probe built clean against (cca48bc).
-#
-# APPLAUNCH-9 (2026-06-27): the `mde-apps-applet` launcher bin was RETIRED here —
-# the app-launcher role folded into the Front Door (one launcher; the standalone
-# applet is gone). This crate now ships ONLY the lighthouse-health applet; the
-# launcher-only lib model (Entry/LauncherTab/WorkloadAction/filter_entries/…) was
-# removed with it. The Front Door is the sole launcher.
-# E12-7 — the libcosmic shell is now gated behind the (default) `applet-shell`
-# feature so the render-agnostic lib (the LIGHTHOUSE-7 model) can be reused by the
-# egui replacement (crates/desktop/mde-panel-egui) WITHOUT compiling libcosmic,
-# which E12 retires. Default-on keeps this applet building exactly as before;
-# `--no-default-features` yields the pure lib alone.
-[[bin]]
-name = "mde-cosmic-applet"
-path = "src/bin/mde-cosmic-applet.rs"
-required-features = ["applet-shell"]
-
-[features]
-default = ["applet-shell"]
-# The libcosmic panel shell (the bin) + its render-only deps. Off → just the lib.
-applet-shell = ["dep:libcosmic", "dep:mde-notify", "dep:mde-theme"]
-
+# E12-14b — the libcosmic panel-shell binary (`src/bin/mde-cosmic-applet.rs`) was
+# stripped. The render-agnostic lib (the LIGHTHOUSE-7 mesh-health model) is reused
+# by the egui replacements (`mde-panel-egui` + `mde-shell-egui`) WITHOUT compiling
+# libcosmic, which E12 retires. The crate is now lib-only.
+# (APPLAUNCH-9, 2026-06-27: the `mde-apps-applet` launcher bin was already retired
+# here — the app-launcher role folded into the Front Door, one launcher.)
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -43,26 +25,5 @@ mde-bus = { path = "../mde-bus" }
 # crate (the §6 boundary lint only forbids deps into crates/shell/*), already a
 # dep of the sibling mde-workbench.
 mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
-# NOTIFY-7 / AC — the bell tints by the highest-severity unread alert tailed off
-# the bus, and shares the severity→Carbon-token map with the Action Center.
-# Render-only (the bin) → optional, pulled in by `applet-shell` (E12-7).
-mde-notify = { path = "../../services/mde-notify", optional = true }
-# `serde` feature: the applet reads the user's theme preference
-# (`Preferences::load`) so the panel indicator honors light + dark themes.
-# Render-only (the bin) → optional, pulled in by `applet-shell` (E12-7).
-mde-theme = { path = "../../shared/mde-theme", features = ["serde"], optional = true }
-# (APPLAUNCH-9: the `tokio` dep was dropped with the apps-applet — the
-# lighthouse-health applet does no async process work.)
-
-# Render-only (the bin) → optional, pulled in by the default `applet-shell`
-# feature (E12-7) so a `default-features = false` consumer skips libcosmic.
-[dependencies.libcosmic]
-optional = true
-git = "https://github.com/pop-os/libcosmic.git"
-rev = "cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87"
-default-features = false
-# EFF-37 — a11y on: the panel applet exposes its tree via accesskit
-# like the other libcosmic surfaces (mde-files, mde-role-chooser).
-features = ["applet-token", "tokio", "wayland", "a11y"]
 
 [dev-dependencies]

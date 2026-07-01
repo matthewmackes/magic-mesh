@@ -1,16 +1,16 @@
-//! `mde-voice-hud` — the libcosmic voice HUD **and** its render-agnostic SIP core.
+//! `mde-voice-hud` — the render-agnostic SIP softphone core.
 //!
-//! The crate ships two faces over one source tree (the lib + bin + `gui`-feature
-//! split `mde-files` uses):
+//! This crate is the toolkit-free voice core: the pure-Rust SIP register/call
+//! state machine ([`sip`]), the RTP/G.711 [`media`] engine, the mesh peer
+//! [`roster`] loader, and the dialer-target [`resolve`] heuristic. It carries
+//! **no libcosmic dependency**.
 //!
-//! * **This library** — the toolkit-free core: the pure-Rust SIP register/call
-//!   state machine ([`sip`]), the RTP/G.711 [`media`] engine, the mesh peer
-//!   [`roster`] loader, and the dialer-target [`resolve`] heuristic. It carries
-//!   **no libcosmic dependency**, so it compiles under `--no-default-features`
-//!   for headless reuse — E12's `mde-voice-egui` renders this core on the shared
-//!   egui harness instead of the layer-shell HUD.
-//! * **The `gui` binary** (`src/main.rs`, `required-features = ["gui"]`) — the
-//!   libcosmic + wlr-layer-shell softphone HUD built on top of this core.
+//! E12-14b — the libcosmic + wlr-layer-shell softphone HUD binary (`src/main.rs`)
+//! was stripped. MCNF 12.0 "Quasar" renders Voice as an egui panel
+//! (`mde-voice-egui::voice_panel`, pumped by `voice_pump`) inside
+//! `mde-shell-egui`, reusing this core — including the persistent SIP agent
+//! ([`sip::run_agent`]) that the shell spawns once at start — on the shared egui
+//! harness instead of the retired layer-shell HUD + its `--agent` autostart.
 //!
 //! Everything here is the shipped VOIP-27/28/29 logic; the egui surface is glue
 //! over it, not a reimplementation (governance §6).
