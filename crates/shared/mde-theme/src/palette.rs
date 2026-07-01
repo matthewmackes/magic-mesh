@@ -182,6 +182,22 @@ impl Palette {
             ..self
         }
     }
+
+    /// CTRLSURF-7 — the zebra-stripe shade for a homogeneous list row at
+    /// `index` (0-based). Alternates the two lowest Carbon layer tokens:
+    /// even rows read [`Self::background`] (page / layer-0), odd rows read
+    /// [`Self::surface`] (layer-01) — the same layer alternation Carbon's
+    /// data-table zebra uses. Centralized here so every list surface (the
+    /// notify-center rows + the Workbench table panels) reads one token rule
+    /// instead of scattering an `if idx % 2` shade pick per call site (§4).
+    #[must_use]
+    pub const fn zebra_row(&self, index: usize) -> Rgba {
+        if index % 2 == 1 {
+            self.surface
+        } else {
+            self.background
+        }
+    }
 }
 
 #[cfg(test)]
@@ -288,5 +304,26 @@ mod tests {
         let h = p.hover_tint();
         assert_eq!(h.r, p.accent.r);
         assert!((h.a - 0.08).abs() < 0.001);
+    }
+
+    #[test]
+    fn zebra_row_alternates_layer_zero_and_one() {
+        // CTRLSURF-7 — even rows read the page background (layer-0), odd rows
+        // the surface (layer-01); the parity repeats every two rows. This is
+        // the single source the shared `striped_list` helper + the notify
+        // center both read, so the stripe rule can't drift between surfaces.
+        for p in [Palette::dark(), Palette::gray_90(), Palette::light()] {
+            assert_eq!(p.zebra_row(0), p.background);
+            assert_eq!(p.zebra_row(1), p.surface);
+            assert_eq!(p.zebra_row(2), p.background);
+            assert_eq!(p.zebra_row(3), p.surface);
+            // The two shades must be genuinely distinct in every theme, else
+            // the zebra would be invisible.
+            assert_ne!(
+                p.zebra_row(0),
+                p.zebra_row(1),
+                "zebra shades collapse — stripe would be invisible"
+            );
+        }
     }
 }

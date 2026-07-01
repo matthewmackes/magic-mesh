@@ -1481,11 +1481,9 @@ fn clipboard_tab(clips: &[ClipRow], now_ms: i64, p: Palette) -> Element<'static,
 /// "from <node> · <age>" sub-label) trailed by the pin + delete controls. Zebra
 /// shaded to match the notification rows' idiom.
 fn clip_row(c: &ClipRow, idx: usize, now_ms: i64, p: Palette) -> Element<'static, Message> {
-    let base = if idx % 2 == 1 {
-        p.surface
-    } else {
-        p.background
-    };
+    // CTRLSURF-7 — the zebra shade now comes from the shared `mde-theme` token
+    // (was an inline `if idx % 2` here); one rule for the whole workspace.
+    let base = p.zebra_row(idx);
     let preview = notify_clipboard::preview(&c.text, 44);
     // Age off the SAME format_age ladder as the notifications list: parse the
     // RFC3339 stamp → epoch-ms → format_age. An unparseable stamp falls back to
@@ -1761,12 +1759,9 @@ fn motioned_card(
     motion: motion::CardMotion,
     p: Palette,
 ) -> Element<'static, Message> {
-    // Zebra base layer (the Application Menu row idiom).
-    let base = if idx % 2 == 1 {
-        p.surface
-    } else {
-        p.background
-    };
+    // Zebra base layer (the Application Menu row idiom) — CTRLSURF-7 lifted the
+    // shade pick into the shared `mde-theme` zebra token.
+    let base = p.zebra_row(idx);
     // A settled card draws as the plain zebra row (no blink, no offset) — the
     // common case once nothing is entering.
     let (bg, left, top) = if motion.is_rest() {

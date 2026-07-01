@@ -220,22 +220,23 @@ impl FleetLogsPanel {
                 .size(13),
             );
         }
-        for r in &visible {
+        for (i, r) in visible.iter().enumerate() {
             let sev = match level_rank(&r.level) {
                 4 => BadgeSeverity::Warning,
                 3 => BadgeSeverity::Warning,
                 _ => BadgeSeverity::Neutral,
             };
-            list = list.push(
-                row![
-                    status_badge(r.level.clone(), sev, palette),
-                    text(r.host.clone()).width(Length::Fixed(120.0)).size(12),
-                    text(r.target.clone()).width(Length::Fixed(200.0)).size(12),
-                    text(r.message.clone()).size(13),
-                ]
-                .spacing(10)
-                .align_y(cosmic::iced::Alignment::Center),
-            );
+            // CTRLSURF-7 — each log line rides the shared zebra band so a dense
+            // journal is scannable row-to-row.
+            let cells = row![
+                status_badge(r.level.clone(), sev, palette),
+                text(r.host.clone()).width(Length::Fixed(120.0)).size(12),
+                text(r.target.clone()).width(Length::Fixed(200.0)).size(12),
+                text(r.message.clone()).size(13),
+            ]
+            .spacing(10)
+            .align_y(cosmic::iced::Alignment::Center);
+            list = list.push(crate::striped_list::striped_row(cells.into(), i, palette));
         }
 
         let body: Element<'_, crate::Message> = column![

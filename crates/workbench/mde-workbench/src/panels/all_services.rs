@@ -177,7 +177,8 @@ impl AllServicesPanel {
             let blocks: Vec<Element<'_, crate::Message>> = self
                 .rows
                 .iter()
-                .map(|r| row_view(r, palette, sizes))
+                .enumerate()
+                .map(|(i, r)| row_view(r, i, palette, sizes))
                 .collect();
             scrollable(column(blocks).spacing(6)).into()
         };
@@ -208,14 +209,18 @@ fn source_color(source: &str, palette: Palette) -> Color {
     }
 }
 
-/// One unified service row: source badge · name · host · detail.
+/// One unified service row: source badge · name · host · detail. CTRLSURF-7 —
+/// zebra-striped by `index` through the shared [`crate::striped_list`] helper,
+/// so the directory reads as a scannable dense table rather than a stack of
+/// identical raised cards.
 fn row_view<'a>(
     r: &'a UnifiedServiceRow,
+    index: usize,
     palette: Palette,
     sizes: FontSize,
 ) -> Element<'a, crate::Message> {
     let badge_color = source_color(r.source, palette);
-    let bg = palette.raised.into_cosmic_color();
+    let bg = crate::striped_list::row_shade(palette, index);
     let border = palette.border.into_cosmic_color();
 
     let badge = container(
@@ -258,7 +263,7 @@ fn row_view<'a>(
     .width(Length::Fill)
     .sty(move |_| container::Style {
         snap: false,
-        background: Some(Background::Color(bg)),
+        background: Some(bg),
         border: Border {
             color: border,
             width: 1.0,

@@ -143,8 +143,8 @@ impl MeshPendingPanel {
         .align_y(cosmic::iced::alignment::Vertical::Center);
 
         let mut peers_col = column![].spacing(10);
-        for p in &self.peers {
-            peers_col = peers_col.push(peer_row(p, palette));
+        for (i, p) in self.peers.iter().enumerate() {
+            peers_col = peers_col.push(peer_row(p, i, palette));
         }
         if self.peers.is_empty() && !self.busy {
             peers_col = peers_col.push(empty_state_card(palette));
@@ -183,7 +183,7 @@ pub fn roster_from_peers(peers: Vec<PeerRecord>) -> Vec<JoinedPeer> {
     out
 }
 
-fn peer_row<'a>(p: &'a JoinedPeer, palette: Palette) -> Element<'a, crate::Message> {
+fn peer_row<'a>(p: &'a JoinedPeer, index: usize, palette: Palette) -> Element<'a, crate::Message> {
     let resolved = mde_icon(Icon::Peer, IconSize::PanelHeader);
     let icon_color = palette.accent.into_cosmic_color();
     let icon_widget: Element<'a, crate::Message> = if let Some(svg_bytes) = resolved.svg_bytes() {
@@ -236,14 +236,14 @@ fn peer_row<'a>(p: &'a JoinedPeer, palette: Palette) -> Element<'a, crate::Messa
     .spacing(12)
     .align_y(cosmic::iced::alignment::Vertical::Center);
 
-    let bg = palette.raised.into_cosmic_color();
+    let bg = crate::striped_list::row_shade(palette, index);
     let border = palette.border.into_cosmic_color();
     container(body)
         .padding(Padding::from([12u16, 16u16]))
         .width(Length::Fill)
         .sty(move |_| container::Style {
             snap: false,
-            background: Some(Background::Color(bg)),
+            background: Some(bg),
             border: Border {
                 color: border,
                 width: 1.0,

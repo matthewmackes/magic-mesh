@@ -35,6 +35,9 @@ pub mod relevance;
 pub mod role;
 pub mod sidebar;
 pub mod single_instance;
+/// CTRLSURF-7 — shared zebra-striped list helper (`row_shade` / `striped_row`)
+/// backing every list / table panel from the `mde-theme` zebra token (§4).
+pub mod striped_list;
 
 pub use app::{App, Message};
 pub use backend::{Backend, BackendError, DemoBackend, FileBackend, RemoteBackend};

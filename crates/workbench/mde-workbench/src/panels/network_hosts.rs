@@ -191,11 +191,16 @@ impl NetworkHostsPanel {
                 .colr(palette.text_muted.into_cosmic_color())
                 .into()
         } else {
+            // CTRLSURF-7 — zebra-stripe each host block through the shared
+            // helper so a long discovered-host list stays scannable.
             let blocks: Vec<Element<'_, crate::Message>> = self
                 .inventory
                 .hosts
                 .iter()
-                .map(|h| host_block(h, palette, sizes))
+                .enumerate()
+                .map(|(i, h)| {
+                    crate::striped_list::striped_row(host_block(h, palette, sizes), i, palette)
+                })
                 .collect();
             scrollable(column(blocks).spacing(10)).into()
         };
