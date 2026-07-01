@@ -19,20 +19,25 @@
 //!   derived from the `mde_role` rank model (the same tiering
 //!   [`crate::worker_role`] gates the in-process workers by).
 //!
-//! # Landed since OW-2: OW-3 [`mesh_create`] + OW-4 [`invite`]
+//! # Landed since OW-2: OW-3 [`mesh_create`] + OW-4 [`invite`] + OW-5 [`network`]
 //! * [`mesh_create`] (OW-3) founds a lone Workstation's mesh-of-one (mint CA +
 //!   LAN-only overlay, offline) — a thin idempotent wrapper over the ENT-4
 //!   [`crate::mesh_init`] bootstrap (reuse, not a reimplementation).
 //! * [`invite`] (OW-4) mints a short-TTL, mesh-scoped join invite (an authenticated
 //!   bearer recorded in [`crate::bearer_ledger`], a typeable code + a QR string) and
-//!   exposes the pure redemption check the joiner (OW-5) pairs with the ledger.
+//!   exposes the pure redemption check the joiner pairs with the ledger.
+//! * [`network`] (OW-5) brings up the primary LAN interface *before* the overlay:
+//!   detect DHCP-vs-static (reusing [`crate::router_discovery`]'s default-gateway
+//!   detection) and write the correct NetworkManager keyfile, so a fresh box reaches
+//!   its LAN even on a static-only, no-DHCP network (the cloud-init NM-keyfile fix).
 //!
 //! # Verbs still owned by the sibling OW units — deliberately NOT declared here (§7)
 //! The remaining complex verbs land in their own units with real implementations;
-//! this engine carries no stub / `todo!()` variant for any: `enroll` (OW-5) and
-//! `mesh-dns` + `network` (OW-6).
+//! this engine carries no stub / `todo!()` variant for any: `enroll` and `mesh-dns`
+//! (their own OW units).
 
 pub mod invite;
 pub mod mesh_create;
+pub mod network;
 pub mod role_provision;
 pub mod self_test;

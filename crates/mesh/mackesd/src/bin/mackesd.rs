@@ -1278,6 +1278,16 @@ enum OnboardCmd {
         #[arg(long)]
         ttl: Option<u64>,
     },
+    /// OW-5 — bring up the primary LAN interface *before* the overlay: detect
+    /// DHCP-vs-static (reusing `router_discovery` for the default gateway) and write
+    /// the NetworkManager keyfile, so a fresh box reaches its LAN even on a
+    /// static-only, no-DHCP network. Idempotent. `--dry-run` prints the plan + the
+    /// keyfile it would write without touching NetworkManager.
+    Network {
+        /// Print the plan + rendered keyfile without writing it / reloading NM.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// DDNS-EGRESS-3 — `mackesd ddns <sub>` subcommands. Each calls the same
@@ -2375,6 +2385,42 @@ fn main() -> anyhow::Result<()> {
                 );
                 println!("  code: {}", issued.code);
                 println!("  qr:   {}", issued.qr);
+            }
+            OnboardCmd::Network { dry_run } => {
+                // Detect DHCP-vs-static on the primary LAN interface (reusing
+                // router_discovery's default-gateway detection) and render the
+                // NetworkManager keyfile. The live apply (write + `nmcli reload`) is
+                // the integration-gated LAN bring-up; --dry-run stops at the plan.
+                let facts = mackesd_core::onboard::network::gather();
+                let plan = match mackesd_core::onboard::network::plan_network(&facts) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("onboard network: cannot plan LAN bring-up — {e}");
+                        std::process::exit(1);
+                    }
+                };
+                println!("onboard network: {}", plan.human());
+                let dir =
+                    std::path::Path::new(mackesd_core::onboard::network::SYSTEM_CONNECTIONS_DIR);
+                let path = mackesd_core::onboard::network::keyfile_path(dir);
+                if dry_run {
+                    println!("--- {} (dry-run, not written) ---", path.display());
+                    print!("{}", mackesd_core::onboard::network::render_keyfile(&plan));
+                    return Ok(());
+                }
+                match mackesd_core::onboard::network::apply(
+                    &plan,
+                    dir,
+                    &mackesd_core::onboard::network::SystemConnections,
+                ) {
+                    Ok(outcome) => println!("  keyfile {}: {}", outcome.tag(), path.display()),
+                    Err(e) => {
+                        eprintln!(
+                            "  keyfile apply failed (LAN bring-up is integration-gated): {e}"
+                        );
+                        std::process::exit(1);
+                    }
+                }
             }
         },
         Cmd::DnsLeakCheck { expected } => {
