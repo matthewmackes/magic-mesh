@@ -19,31 +19,18 @@
 
 // ── Render-agnostic surface (always compiled) ───────────────────────────────
 // The file/listing/transfer model + the Bus client. This subset carries no
-// libcosmic dependency, so it compiles under `--no-default-features` (with
-// `dbus`) for headless reuse — E12's `mde-files-egui` renders it on the egui
-// harness instead of the libcosmic `app` below.
-pub mod a11y_labels;
-pub mod archive;
+// libcosmic dependency — E12's `mde-files-egui` renders it on the egui
+// harness. E12-14b stripped the iced/libcosmic GUI + all modules that
+// only that GUI used (archive, bookmarks, desktop, fileops, grid, mime,
+// panels, properties, search, selection, smb, thumbnails, trash).
 pub mod backend;
-pub mod bookmarks;
 #[cfg(feature = "dbus")]
 pub mod bus_backend;
 pub mod demo_data;
-pub mod desktop;
-pub mod fileops;
-pub mod grid;
 #[cfg(feature = "dbus")]
 pub mod mesh_backend;
-pub mod mime;
 pub mod model;
-pub mod panels;
-pub mod properties;
-pub mod search;
-pub mod selection;
 pub mod send_to;
-pub mod smb;
-pub mod thumbnails;
-pub mod trash;
 
 // ── E12-14b — the windowed libcosmic surface was stripped ───────────────────
 // The iced/libcosmic file-manager GUI (`app`/`views`/`widgets`/`icons`/`theme`/
