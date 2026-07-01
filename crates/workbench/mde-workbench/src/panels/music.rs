@@ -303,7 +303,8 @@ impl MusicPanel {
 
         let body: Element<'_, crate::Message, cosmic::Theme> = container(
             column![
-                text("Music").size(20),
+                // CTRLSURF-8 — "Music" is already the page title (app.rs); the
+                // panel no longer repeats it as a redundant self-heading.
                 server,
                 Space::new().height(Length::Fixed(8.0)),
                 cache_section,

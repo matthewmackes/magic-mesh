@@ -157,8 +157,10 @@ impl SystemUpdatePanel {
             palette,
         );
         column![
+            // CTRLSURF-8 — "System Update" is already rendered as the page
+            // title by app.rs; the panel keeps only the Fedora hero band,
+            // right-aligned as before, instead of repeating the heading.
             row![
-                text("System Update").size(20),
                 cosmic::iced::widget::Space::new().width(Length::Fill),
                 fedora,
             ]
@@ -171,12 +173,15 @@ impl SystemUpdatePanel {
             text(&self.summary).size(13),
             row![check_btn, install_btn].spacing(12),
             text("Output").size(16),
+            // CTRLSURF-8 — the dnf output box flexes to fill the remaining
+            // height rather than a hardcoded 320 px band, so it grows with the
+            // window and never shows a tall empty band before output streams.
             scrollable(
                 container(text(&self.output).size(12))
                     .padding(Padding::new(12.0))
                     .width(Length::Fill),
             )
-            .height(Length::Fixed(320.0)),
+            .height(Length::Fill),
             text(&self.status).size(13),
         ]
         .spacing(12)

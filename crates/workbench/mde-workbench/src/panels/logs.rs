@@ -72,32 +72,40 @@ impl LogsPanel {
     }
 
     pub fn view(&self) -> Element<'_, crate::Message, cosmic::Theme> {
+        let palette = crate::live_theme::palette();
+        // CTRLSURF-8 — density pass: metrics resolve from the mde-theme spacing
+        // scale (§4, density-aware) instead of raw px, and each log pane flexes
+        // to share the available height rather than a hardcoded 280 px band.
+        let space = mde_theme::Space::for_density(crate::live_theme::tokens().density);
+        let sizes = mde_theme::FontSize::defaults();
+        let caption = mde_theme::TypeRole::Caption.size_in(sizes);
+
         // UX-7.a — refresh routed through the shared button variant.
         let refresh_btn = variant_button(
             "Refresh",
             ButtonVariant::Ghost,
             Some(crate::Message::Logs(Message::RefreshClicked)),
-            crate::live_theme::palette(),
+            palette,
         );
 
         column![
-            text("mackes.log").size(16),
+            crate::panel_chrome::section_header("mackes.log", palette),
             scrollable(
-                container(text(&self.mackes_log).size(12))
-                    .padding(Padding::new(12.0))
+                container(text(&self.mackes_log).size(caption))
+                    .padding(Padding::new(f32::from(space.sm2)))
                     .width(Length::Fill),
             )
-            .height(Length::Fixed(280.0)),
-            text("sway user-session journal").size(16),
+            .height(Length::Fill),
+            crate::panel_chrome::section_header("sway user-session journal", palette),
             scrollable(
-                container(text(&self.sway_journal).size(12))
-                    .padding(Padding::new(12.0))
+                container(text(&self.sway_journal).size(caption))
+                    .padding(Padding::new(f32::from(space.sm2)))
                     .width(Length::Fill),
             )
-            .height(Length::Fixed(280.0)),
-            row![refresh_btn, text(&self.status).size(13)].spacing(12),
+            .height(Length::Fill),
+            row![refresh_btn, text(&self.status).size(caption)].spacing(f32::from(space.sm2)),
         ]
-        .spacing(12)
+        .spacing(f32::from(space.md2))
         .width(Length::Fill)
         .into()
     }

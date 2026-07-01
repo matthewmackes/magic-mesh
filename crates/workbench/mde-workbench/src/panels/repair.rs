@@ -159,8 +159,9 @@ impl RepairPanel {
             palette,
         );
 
+        // CTRLSURF-8 — the page title ("Repair") is already rendered once by
+        // `app.rs` (breadcrumb + `page_title`); the panel no longer repeats it.
         column![
-            text("Repair").size(20),
             text(
                 "Safe one-click fixes for common MDE problems. Each repair \
                  runs on its own — none of them touch your personal files."
@@ -202,12 +203,15 @@ impl RepairPanel {
             ]
             .spacing(12),
             text("Output").size(14),
+            // CTRLSURF-8 — the output box flexes to fill the remaining height
+            // instead of a hardcoded 220 px band (which left dead space when
+            // the output was short and clipped it when long).
             scrollable(
                 container(text(&self.output).size(12))
                     .padding(Padding::new(12.0))
                     .width(Length::Fill),
             )
-            .height(Length::Fixed(220.0)),
+            .height(Length::Fill),
             text(&self.status).size(13),
         ]
         .spacing(12)

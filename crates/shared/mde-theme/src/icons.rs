@@ -974,11 +974,19 @@ fn material_svg_bytes(icon: Icon, svg_size: u32, filled: bool) -> &'static [u8] 
             include_bytes!("../../../../assets/icons/material-symbols/checklist_24px.svg"),
             include_bytes!("../../../../assets/icons/material-symbols/checklist_40px.svg"),
         ),
+        // CTRLSURF-8 — the Workbench brand renders the mesh-native
+        // "mesh-control" glyph (`assets/icons/carbon/workbench.svg`), not the
+        // generic Material `handyman` tools glyph. It's a single scalable path,
+        // so every optical tier bakes the one asset. `material_name` still
+        // reports `handyman` as the Material lineage/fallback; these bytes are
+        // the deliberate brand override so the header brand-strip, the
+        // notify-center launch tile, and the This-Node nav group all read the
+        // on-brand mesh glyph consistently (BUG-20 cross-surface parity).
         Icon::Workbench => pick_3(
             svg_size,
-            include_bytes!("../../../../assets/icons/material-symbols/handyman_20px.svg"),
-            include_bytes!("../../../../assets/icons/material-symbols/handyman_24px.svg"),
-            include_bytes!("../../../../assets/icons/material-symbols/handyman_40px.svg"),
+            include_bytes!("../../../../assets/icons/carbon/workbench.svg"),
+            include_bytes!("../../../../assets/icons/carbon/workbench.svg"),
+            include_bytes!("../../../../assets/icons/carbon/workbench.svg"),
         ),
         Icon::WindowMinimize => pick_3(
             svg_size,

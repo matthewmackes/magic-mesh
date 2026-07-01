@@ -281,8 +281,9 @@ impl RegistrationPanel {
         };
 
         let mut col = column![
+            // CTRLSURF-8 — "Registration" is already the page title (app.rs);
+            // keep the Nebula identity hero, right-aligned, without repeating it.
             row![
-                text("Registration").size(20),
                 cosmic::iced::widget::Space::new().width(Length::Fill),
                 nebula,
             ]
