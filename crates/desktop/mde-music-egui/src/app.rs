@@ -42,13 +42,22 @@ impl MusicApp {
     /// library.
     #[must_use]
     pub fn new(cc: &CreationContext<'_>) -> Self {
+        Self::new_with_ctx(&cc.egui_ctx)
+    }
+
+    /// Build over an egui [`egui::Context`] directly — the DRM-seat shell path
+    /// (`mde-shell-egui --features drm`) has no eframe `CreationContext`, only the
+    /// bare `Context` the DRM runner drives. Both entry points converge here so the
+    /// worker still gets a repaint handle in either runner.
+    #[must_use]
+    pub fn new_with_ctx(ctx: &egui::Context) -> Self {
         let (update_tx, update_rx) = mpsc::channel::<Update>();
         let mut state = MusicState::new();
         match creds::load() {
             Ok(c) => {
                 let client = Client::new(c.server_url, c.username, &c.password);
                 let server = client.base_url().to_string();
-                let commands = worker::spawn(client, cc.egui_ctx.clone(), update_tx);
+                let commands = worker::spawn(client, ctx.clone(), update_tx);
                 let _ = commands.send(Command::LoadLibrary);
                 state.albums = Fetch::Loading;
                 Self {

@@ -72,6 +72,14 @@ impl VoiceApp {
     /// reflects reality (P2P-registered, or a failure) rather than faking it.
     #[must_use]
     pub fn new(cc: &CreationContext<'_>) -> Self {
+        Self::new_with_ctx(&cc.egui_ctx)
+    }
+
+    /// Build over an egui [`egui::Context`] directly — the DRM-seat shell path has
+    /// no eframe `CreationContext`, only the bare `Context` the DRM runner drives.
+    /// Both entry points converge here so the SIP worker gets a repaint handle.
+    #[must_use]
+    pub fn new_with_ctx(ctx: &egui::Context) -> Self {
         let (update_tx, update_rx) = mpsc::channel::<Update>();
         let account = SipAccount::load();
         let identity = match &account {
@@ -83,7 +91,7 @@ impl VoiceApp {
         // not a registrar-less P2P node. Read from the resolved account before it
         // is moved into the worker.
         let registrar_backed = model::is_registrar_backed(&account);
-        let commands = worker::spawn(account, cc.egui_ctx.clone(), &update_tx);
+        let commands = worker::spawn(account, ctx.clone(), &update_tx);
         Self {
             state: VoiceState::new(),
             dial: String::new(),

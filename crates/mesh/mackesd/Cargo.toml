@@ -362,6 +362,15 @@ assets = [
     { source = "target/release/magic-setup",        dest = "/usr/bin/magic-setup",        mode = "755" },
     { source = "target/release/mde-bus",            dest = "/usr/bin/mde-bus",            mode = "755" },
     { source = "target/release/mde-workbench",      dest = "/usr/bin/mde-workbench",      mode = "755" },
+    # E12-3 "Quasar" — the single egui shell that OWNS the DRM/KMS seat directly (no
+    # compositor, no display manager) and hosts Workbench/Files/Music/Voice/Desktop/
+    # Instances as in-shell panels. Built `--features drm` (the RPM build re-links this
+    # one bin with the feature after the workspace build) so it takes the seat; it
+    # falls back to a windowed client where there is no DRM master. This is THE
+    # graphical surface now that the iced GUIs are stripped (E12-14b), with a .desktop
+    # so it's launchable from a session too.
+    { source = "target/release/mde-shell-egui",     dest = "/usr/bin/mde-shell-egui",     mode = "755" },
+    { source = "packaging/applications/org.magicmesh.Shell.desktop", dest = "/usr/share/applications/org.magicmesh.Shell.desktop", mode = "644" },
     # E12-14b — the obsolete Cosmic-era surfaces were dropped: the live-map
     # layer-shell wallpaper (mde-mesh-wallpaper) + the notify-hub bins
     # (mde-notify-{center,toast,capture}), AND the four iced/libcosmic GUIs that

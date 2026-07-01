@@ -12,6 +12,15 @@ repository.workspace   = true
 name = "mde-shell-egui"
 path = "src/main.rs"
 
+[features]
+# E12-3 — the DRM/KMS bare-seat backend. Build `mde-shell-egui --features drm` to
+# ship the shell that OWNS the seat directly (no compositor, no display manager).
+# OFF by default so the workspace build stays portable — the native DRM stack
+# (libdrm/gbm/egl/libinput/udev) is pulled only for the shipped shell binary;
+# `main.rs` falls back to the windowed eframe client when the feature is off or no
+# DRM master is present.
+drm = ["mde-egui/drm"]
+
 [dependencies]
 # The §4/§5 harness is the shell's primary inward dependency (§6 layered tiers):
 # it provides run_client (the eframe Wayland-client runner), the shared Style, the

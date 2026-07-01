@@ -122,6 +122,13 @@ impl Shell {
     /// off-thread updates repaint the one shell). This is the single "built once"
     /// mount point of E12-3b.
     fn new(cc: &CreationContext<'_>) -> Self {
+        Self::new_for_ctx(&cc.egui_ctx)
+    }
+
+    /// Build the shell + its embedded surfaces over a bare egui [`egui::Context`] —
+    /// the DRM-seat path (`run_drm`) has no eframe `CreationContext`, so `new` (the
+    /// windowed `run_client` path) delegates here and both runners build one shell.
+    fn new_for_ctx(ctx: &egui::Context) -> Self {
         Self {
             nav: Nav::default(),
             datacenter: datacenter::DatacenterState::default(),
@@ -130,9 +137,9 @@ impl Shell {
             controller: controller::ControllerState::default(),
             provisioning: provisioning::ProvisioningState::default(),
             chrome: chrome::ChromeState::default(),
-            music: MusicApp::new(cc),
+            music: MusicApp::new_with_ctx(ctx),
             files: mde_files_egui::real_browser(),
-            voice: VoiceApp::new(cc),
+            voice: VoiceApp::new_with_ctx(ctx),
             vdi: vdi::VdiState::default(),
             discovery: discovery::DiscoveryState::default(),
             instances: instances::InstancesState::default(),
@@ -243,6 +250,16 @@ impl Shell {
 
 impl eframe::App for Shell {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render(ctx);
+    }
+}
+
+impl Shell {
+    /// The shell's per-frame render — every panel drawn into `ctx`. Driven by the
+    /// eframe `App::update` (windowed `run_client`) AND directly by the DRM runner
+    /// (`run_drm`), which owns the seat with a bare `Context` and no eframe `Frame`.
+    /// The body never touched `Frame`, so both runners render identically.
+    fn render(&mut self, ctx: &egui::Context) {
         // The Fleet, This Node, Network, Controller + Provisioning planes subscribe
         // to live mesh state. Poll on the shared cadence while the Workbench surface
         // is in view (the reads are cheap local scans) so a host health flip, a new
@@ -304,8 +321,29 @@ impl eframe::App for Shell {
     }
 }
 
-fn main() -> eframe::Result<()> {
-    run_client("org.magicmesh.Shell", "MCNF", Shell::new)
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // E12-3 — the shell OWNS the DRM/KMS seat directly (no compositor, no display
+    // manager) when built `--features drm` and a seat is available. It falls back to
+    // the windowed eframe client only when there is no DRM master (a dev host, or a
+    // compositor already holds the seat) — the exact fallback E12-2 designed in.
+    #[cfg(feature = "drm")]
+    {
+        let mut shell: Option<Shell> = None;
+        match mde_egui::run_drm("org.magicmesh.Shell", |ctx| {
+            shell
+                .get_or_insert_with(|| Shell::new_for_ctx(ctx))
+                .render(ctx);
+        }) {
+            Ok(()) => return Ok(()),
+            Err(mde_egui::drm::DrmError::NoDrmMaster(why)) => {
+                eprintln!(
+                    "mde-shell-egui: no DRM seat ({why}); falling back to the windowed client"
+                );
+            }
+            Err(e) => return Err(Box::new(e)),
+        }
+    }
+    run_client("org.magicmesh.Shell", "MCNF", Shell::new).map_err(Into::into)
 }
 
 #[cfg(test)]
