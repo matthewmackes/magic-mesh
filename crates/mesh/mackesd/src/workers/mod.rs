@@ -540,6 +540,15 @@ pub mod container;
 // `event/schedule/placements`). Rank-0-default like vm_lifecycle/container; an
 // interim lowest-node-id single-actor election prevents duplicate placements.
 pub mod scheduler;
+// E12-5b — the session_broker worker: the mackesd side of the E12-5 VDI
+// remote-desktop milestone. Drains `action/vdi/session`, folds each op into the
+// live VDI-session roster (which peer serves which VM to which client + state)
+// via a pure state machine, and — leader-gated — reconciles that roster into the
+// shared roaming-session plane through an injectable `SessionStore` seam so any
+// peer sees the active sessions. The live etcd/Syncthing cross-peer publish is
+// integration-gated (typed `SessionStoreError::IntegrationGated`, §7); the pure
+// core + fold + reconcile ship green behind the seam.
+pub mod session_broker;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
 // text clip on the bus + appends to ONE mesh-global `clipboard/history.json`

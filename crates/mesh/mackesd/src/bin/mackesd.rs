@@ -6245,6 +6245,28 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("scheduler".into());
         }
+        // E12-5b — the session_broker worker: the mackesd side of the E12-5 VDI
+        // remote-desktop milestone. Drains `action/vdi/session`, folds each op
+        // into the live VDI-session roster (which peer serves which VM to which
+        // client + state) via a pure state machine, and — leader-gated —
+        // reconciles that roster into the shared roaming-session plane through the
+        // injectable SessionStore seam so any peer sees the active sessions.
+        // Rank-0-default like scheduler (runs everywhere); the shared leader lock
+        // keeps an N-node mesh from multi-writing. The live etcd/Syncthing
+        // cross-peer publish is integration-gated (typed error, §7).
+        if mackesd_core::worker_role::runs("session_broker", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::session_broker::SessionBrokerWorker::new(
+                    workgroup_root.clone(),
+                    node_id.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("session_broker".into());
+        }
         // OV-7.a (v2.6) — health reconciler. Polls each known
         // peer's QNM-Shared heartbeat.json every 5 s, applies the
         // telemetry::health_state_from_age threshold table, writes
