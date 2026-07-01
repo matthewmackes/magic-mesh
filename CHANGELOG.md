@@ -13,6 +13,33 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [11.3.0] — 2026-07-01
+Feature release: the `mackesd onboard` engine gains its VDI + services verbs, and
+the two operator-active iced-`mde-workbench` GUI epics (CTRLSURF, NOTIFY-REDESIGN)
+land complete. Purpose: deploy the new onboard engine to the live mesh to unblock
+the integration-gated live-verify seams (OW-3/4/5/10/13).
+### Added
+- **OW-8 `onboard first-desktop`** — plans + offers a Workstation's first local VM
+  desktop (golden-image select → dual-homed `mde-kvm` `VmSpec` → create/boot →
+  broker session), with create/reconnect/no-image branches + a gated
+  `FirstDesktopApply` seam (never a fake success).
+- **OW-11 `onboard service-add`** — a day-2 Services flow (Music → Navidrome on a
+  media-lighthouse reading DO Spaces; Files → P2P Send-To, no VM; Voice → external
+  SIP) over a gated `ServiceApply` seam; services never block the working network.
+- **CTRLSURF 1–8 — Workbench "Command Watchfloor" complete** — the compact
+  command-line + status surface, whole-home keyboard nav, the Expand activity rail,
+  real CompactExpand window resize, one universal scope-first sidebar, a shared
+  zebra `striped_list` helper (over a new `Palette::zebra_row` mde-theme token), a
+  subtle density pass, and a mesh-native Workbench icon.
+- **NOTIFY-REDESIGN A–C — Notification Hub redesign complete** — top
+  Notifications/Clipboard tabs + a message-first list, Voice/Music footer icons +
+  transport, and one generic reusable center-modal detail viewer
+  (Notification / Clipboard / Lighthouse / Voice consumers).
+### Changed
+- **Onboarding reconciled to the 2-role model** — OW-9 (XCP-NG provisioning)
+  dropped; XCP-ng is day-2 adopt (MV-7), not a role. E12-14 (iced decommission)
+  readiness audited + sliced.
+
 ## [11.2.0] — 2026-06-29
 Reconciliation release: the divergent `master` (pre-SUBSTRATE-V2) and the
 fleet-proven `farm-autoscale-plan` lines were unified onto one validated trunk

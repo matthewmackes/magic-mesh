@@ -343,9 +343,10 @@ payload_compress = "xz"
 # sees a newer NEVRA; reset to "1" on every workspace version bump.
 # -2 (2026-06-29): WIFI-WATCHDOG fix — mackesd watchdog no longer
 # false-restarts on a slow/high-latency (WiFi) link, so an in-place
-# `dnf upgrade` survives on a node like Eagle. Code + unit change, but
-# same 11.2.0 trunk → release bump, not a version bump.
-release = "2"
+# `dnf upgrade` survives on a node like Eagle. A minor VERSION bump
+# (11.2.0 → 11.3.0: onboard verbs OW-8/11, CTRLSURF 1-8, NOTIFY-REDESIGN A-C)
+# resets release to 1.
+release = "1"
 summary = "MCNF — secure no-fixed-center workgroup mesh + native-Rust Carbon GUIs on Fedora-Cosmic"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
 # MPL-2.0 (libcosmic/iced stack) + permissive (MIT/Apache-2.0/BSD); see NOTICE.
