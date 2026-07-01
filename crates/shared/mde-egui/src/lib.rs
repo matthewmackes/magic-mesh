@@ -28,6 +28,7 @@ pub mod fonts;
 pub mod motion;
 pub mod runner;
 pub mod style;
+pub mod widgets;
 
 // E12-2: the bare-seat DRM/KMS backend (no compositor), behind `feature = "drm"`.
 #[cfg(feature = "drm")]
@@ -36,6 +37,7 @@ pub mod drm;
 pub use motion::Motion;
 pub use runner::run_client;
 pub use style::Style;
+pub use widgets::muted_note;
 
 #[cfg(feature = "drm")]
 pub use drm::run_drm;
