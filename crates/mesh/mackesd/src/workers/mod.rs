@@ -559,6 +559,17 @@ pub mod session_broker;
 // companion seam gated by the same `SessionStoreError::IntegrationGated` (§7). The
 // pure policy + layout model + drain/fold/plan pipeline ship green behind the seam.
 pub mod session_roaming;
+// E12-9 — the clipboard_bridge worker: the first of the E12-9 VDI client↔VM
+// bridges. Drains `action/vdi/clipboard`, applies a per-session [`ClipboardPolicy`]
+// (allow/deny + one-way + a size cap) via the pure `relay` decision
+// (Forward/Drop/Truncate), and relays each clip into the connected VM desktop
+// through the injectable `ClipboardAccess` seam — with an echo guard so a re-applied
+// clip doesn't loop. Per-session + node-local, so NOT leader-gated (every serving
+// node relays its own session's clips); rank-0-default like session_broker. The live
+// OS/guest clipboard channel (SPICE/RDP vdagent / wl-clipboard) is integration-gated
+// (typed `ClipboardAccessError::IntegrationGated`, §7); the pure model + relay
+// pipeline ship green behind the seam.
+pub mod clipboard_bridge;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
 // text clip on the bus + appends to ONE mesh-global `clipboard/history.json`
