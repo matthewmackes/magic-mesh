@@ -496,6 +496,57 @@ fn read_bodies(persist: &Persist, topic: &str) -> Vec<String> {
         .collect()
 }
 
+// ─────────────────────────── shared VM inventory (E12-5b) ───────────────────────────
+// The E12-5b remote-desktop picker (`crate::discovery`) reuses this crate's live
+// `event/vm/instances` roster rather than opening a second VM source — one
+// inventory, projected once here and flattened to per-VM rows.
+
+/// One remote-desktop-connectable VM, flattened from the Fleet [`project`]ion:
+/// which `host` (peer) serves a VM of this `name` in this raw libvirt `state`.
+/// Reused by [`crate::discovery`] so the picker lists the same VMs the Datacenter
+/// view renders — no parallel inventory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VmRow {
+    /// The peer serving the VM (the Bus `host`).
+    pub host: String,
+    /// The libvirt domain name.
+    pub name: String,
+    /// The raw libvirt state string (`running`, `shut off`, …).
+    pub state: String,
+}
+
+/// Flatten the per-node projection to one row per VM (peer × VM), preserving the
+/// host-sorted, `virsh list`-order sequence. Pure — the testable core of
+/// [`read_inventory`].
+fn flatten_inventory(nodes: Vec<NodeView>) -> Vec<VmRow> {
+    nodes
+        .into_iter()
+        .flat_map(|node| {
+            let host = node.host;
+            node.instances.into_iter().map(move |inst| VmRow {
+                host: host.clone(),
+                name: inst.name,
+                state: inst.state,
+            })
+        })
+        .collect()
+}
+
+/// Read the mesh-wide VM inventory off the Bus and flatten it to per-VM rows — the
+/// same `event/vm/instances` roster [`DatacenterState::refresh`] projects, lifted
+/// so the E12-5b discovery picker reuses one inventory. A missing / unreadable Bus
+/// dir yields an empty inventory (never a panic).
+pub(crate) fn read_inventory(bus_root: Option<&Path>) -> Vec<VmRow> {
+    let Some(root) = bus_root else {
+        return Vec::new();
+    };
+    let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        return Vec::new();
+    };
+    let instances = read_bodies(&persist, INSTANCES_TOPIC);
+    flatten_inventory(project(&[], &instances, &[]))
+}
+
 /// Render one node's section: header + health summary, KVM service rows, VM
 /// roster with per-VM start/stop, and the inline create control. Any button
 /// click sets `pending` (the host is always this node — the fan-out guard).
@@ -857,6 +908,26 @@ mod tests {
     #[test]
     fn empty_bodies_project_to_no_nodes() {
         assert!(project(&[], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn read_inventory_flattens_the_projection_to_per_vm_rows() {
+        // The E12-5b picker reuses this: two hosts, three VMs → three flat rows,
+        // host-sorted (node-a before node-b), `virsh` order within a host.
+        let insts = vec![
+            roster_body("node-b", &[("db1", "running")], 1),
+            roster_body("node-a", &[("web1", "running"), ("web2", "shut off")], 1),
+        ];
+        let rows = flatten_inventory(project(&[], &insts, &[]));
+        assert_eq!(rows.len(), 3, "one row per VM across the mesh");
+        assert_eq!(rows[0].host, "node-a");
+        assert_eq!(rows[0].name, "web1");
+        assert_eq!(rows[0].state, "running");
+        assert_eq!(rows[1].host, "node-a");
+        assert_eq!(rows[1].name, "web2");
+        assert_eq!(rows[1].state, "shut off");
+        assert_eq!(rows[2].host, "node-b");
+        assert_eq!(rows[2].name, "db1");
     }
 
     #[test]

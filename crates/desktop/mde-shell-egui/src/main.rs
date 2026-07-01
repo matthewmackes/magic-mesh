@@ -16,6 +16,7 @@
 
 mod chrome;
 mod datacenter;
+mod discovery;
 mod dock;
 mod instances;
 mod session;
@@ -79,6 +80,10 @@ struct Shell {
     /// the gated wire transport (E12-4) attaches one; the panel shows its honest
     /// "no desktop" EmptyState until then.
     vdi: vdi::VdiState,
+    /// The remote-desktop picker (E12-5b) — the Desktop surface's no-session face:
+    /// lists the mesh's advertised VMs (reusing the Fleet inventory) and, on
+    /// Connect, emits the broker `Open` request + hands the target to `vdi`.
+    discovery: discovery::DiscoveryState,
     /// The Instances surface — this workstation's local cloud-hypervisor VMs via
     /// the `mde-kvm` broker (E12-7). Create / boot / shutdown drive mde-kvm's real
     /// lifecycle; with no live VMM the ops surface mde-kvm's typed gated error, and
@@ -100,6 +105,7 @@ impl Shell {
             files: mde_files_egui::real_browser(),
             voice: VoiceApp::new(cc),
             vdi: vdi::VdiState::default(),
+            discovery: discovery::DiscoveryState::default(),
             instances: instances::InstancesState::default(),
         }
     }
@@ -127,18 +133,38 @@ impl Shell {
                 workbench::show(ui, &mut self.nav.plane, &mut self.datacenter);
             }
             Surface::Desktop => {
-                // The VDI desktop fills the body. It reserves an Esc chord that
-                // asks to return to the mesh-control chrome — honour it by falling
-                // back to the Workbench so a fullscreen session is never a trap.
-                let vdi = &mut self.vdi;
-                let leave = ui
-                    .push_id("shell-desktop", |ui| {
-                        vdi::vdi_panel(ui, vdi);
-                        vdi.take_return_to_chrome()
-                    })
-                    .inner;
-                if leave {
-                    self.nav.surface = Surface::Workbench;
+                // The Desktop surface's no-session face IS the E12-5b remote-desktop
+                // picker: with nothing requested it lists the mesh's VMs; Connect
+                // hands a target to `vdi`, and the surface flips to the desktop
+                // (connecting caption until the gated E12-4 wire transport attaches
+                // the live decoder). This mirrors E12-5a driving the surface.
+                if self.vdi.requested_target().is_none() {
+                    let discovery = &mut self.discovery;
+                    let picked = ui
+                        .push_id("shell-discovery", |ui| {
+                            discovery::discovery_panel(ui, discovery);
+                            discovery.take_connect()
+                        })
+                        .inner;
+                    if let Some(target) = picked {
+                        self.vdi.request_target(target);
+                    }
+                } else {
+                    // The VDI desktop fills the body. It reserves an Esc chord that
+                    // asks to return to the mesh-control chrome — honour it by
+                    // clearing the pending target (back to the picker) and falling
+                    // back to the Workbench so a session is never a trap.
+                    let vdi = &mut self.vdi;
+                    let leave = ui
+                        .push_id("shell-desktop", |ui| {
+                            vdi::vdi_panel(ui, vdi);
+                            vdi.take_return_to_chrome()
+                        })
+                        .inner;
+                    if leave {
+                        self.vdi.clear_target();
+                        self.nav.surface = Surface::Workbench;
+                    }
                 }
             }
             Surface::Instances => {
@@ -187,6 +213,16 @@ impl eframe::App for Shell {
         // alive. The app surfaces drive their own repaints from their workers.
         if self.nav.expanded && self.nav.surface == Surface::Workbench {
             self.datacenter.poll(ctx);
+        }
+
+        // The Desktop surface's picker (E12-5b) subscribes to the same live VM
+        // roster while it's in view with no session requested — the cheap local
+        // scan surfaces a new/removed remote desktop without operator input.
+        if self.nav.expanded
+            && self.nav.surface == Surface::Desktop
+            && self.vdi.requested_target().is_none()
+        {
+            self.discovery.poll(ctx);
         }
 
         // The thin persistent chrome bar (48px = SP_XL + SP_M).
