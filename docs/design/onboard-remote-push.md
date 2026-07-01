@@ -95,10 +95,31 @@ typed Bus verbs (§9) over the CA-rooted overlay.
 4. Wire the 3 `LiveX` seams onto `RemotePush`; each stops returning `IntegrationGated`.
 5. Live-verify acceptance 1 + 2 on the magic-mesh (LH1/LH2 + a throwaway node).
 
-## Open questions for the operator (the decision)
+## Decisions (locked 2026-07-01, during the `/polish /ship` loop)
 
-- **Confirm C** (hybrid) vs A (all-SSH, simpler but §9-violating) vs B (all-Bus, but
-  can't bootstrap)?
-- For `SshBootstrap`, is the **enroll bearer** the right SSH auth scope, or do you want
-  a mesh-CA-signed SSH cert (heavier, but no bearer-over-SSH)?
-- Is the signed job bundle's signer the **CA** or a per-node key? (leans CA — one root.)
+- **Transport = C (hybrid).** Operator-confirmed via the gate-lift survey. Bootstrap
+  targets → bearer-scoped SSH; day-2 enrolled peers → typed Bus verb + signed bundle.
+- **Bundle signer = the issuing node's mesh identity key, authorized by leadership**
+  (not the Nebula CA key). The issuer signs the [`JobBundle`] with its `identity.rs`
+  Ed25519 key — the **same trust primitive the SEC-6 blocklist already uses**
+  (`ca/blocklist.rs` signs revocations with the node identity's `verifying_key()`).
+  The target's `onboard_apply` worker: (1) resolves the *claimed issuer's* identity
+  pubkey from the replicated peer roster, (2) verifies the signature against it (proves
+  the claimant holds that identity), and (3) **authorizes** by requiring the issuer to
+  be a current **leader** (`health.rs::is_leader` / the leader lock) — so only a
+  leader-eligible node may push a role-pin / secret-seal to a peer (§8 privileged
+  issuer; a compromised low-priv node cannot). *Rationale:* reuses mesh-native identity
+  + roster + election (no new distributed authority key, no coupling to Nebula CA-key
+  extraction). The bundle therefore carries an `issuer` node-id field (signed).
+  → `process_apply` already takes the trusted `signer: &VerifyingKey` injected, so the
+  worker owns resolution (roster-lookup + leader-check) and the pure core is unchanged.
+- **`SshBootstrap` auth scope = the single-use enroll bearer** (OW-4's mint), matching
+  OW-7's accepted `push_enroll` model — scoped to the bootstrap instant only, never a
+  standing SSH key. (A mesh-CA-signed SSH cert stays a future hardening, not needed for
+  the first cut.)
+
+## Historical open questions (now resolved above)
+
+- ~~Confirm C (hybrid) vs A vs B?~~ → C.
+- ~~`SshBootstrap` auth: enroll bearer vs mesh-CA-signed SSH cert?~~ → enroll bearer.
+- ~~Bundle signer: CA vs per-node key?~~ → issuing node's identity, leader-authorized.
