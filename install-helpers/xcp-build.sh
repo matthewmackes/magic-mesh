@@ -442,7 +442,10 @@ case "${1:-}" in
     log "vendoring birthright blobs on the VM (off the local host)"
     remote "./install-helpers/vendor-birthright-blobs.sh"
     log "release build + generate-rpm on the VM (heavy — runs on XCP, not local)"
-    remote "cargo build --workspace --release && cargo generate-rpm -p crates/mesh/mackesd"
+    # E12-3 DRM: after the workspace build, re-link mde-shell-egui with --features drm
+    # so it owns the bare KMS/DRM seat (no Wayland compositor). The workspace build
+    # compiles all dependencies; this one-crate rebuild only re-links the final binary.
+    remote "cargo build --workspace --release && cargo build --release -p mde-shell-egui --features drm && cargo generate-rpm -p crates/mesh/mackesd"
     mkdir -p "$ARTIFACTS"
     log "pulling RPM(s) → $ARTIFACTS"
     rsync -az -e "${SSH[*]}" "$DEST:$REMOTE_DIR/target/generate-rpm/*.rpm" "$ARTIFACTS/"
