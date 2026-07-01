@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-use mde_files::backend::{Backend, BackendError, Destination, OpId};
+use mde_files::backend::{Backend, BackendError, Destination, MeshOverlayBadge, OpId};
 use mde_files::model::{FileRow, Peer, SelfNode};
 use mde_files::send_to::{SendToEntry, SendToRequest};
 
@@ -126,6 +126,11 @@ pub struct FileBrowser {
     destination: Option<String>,
     /// The last Send-To outcome.
     last_send: SendOutcome,
+    /// Cached live Nebula overlay badge — the mesh id, active transport, and
+    /// lighthouse role this node is running on — or `None` when the node is
+    /// standalone or the mesh daemon isn't reachable. Refreshed with the roster
+    /// (it comes from the same reconnect probe), never fabricated.
+    mesh_overlay: Option<MeshOverlayBadge>,
 }
 
 impl FileBrowser {
@@ -146,6 +151,7 @@ impl FileBrowser {
             selected: None,
             destination: None,
             last_send: SendOutcome::Idle,
+            mesh_overlay: None,
         };
         me.refresh_roster();
         me.reload();
@@ -161,6 +167,7 @@ impl FileBrowser {
         self.backend.reconnect();
         self.self_node = self.backend.self_node();
         self.peers = self.backend.peers();
+        self.mesh_overlay = self.backend.mesh_overlay();
         if !self.destination_reachable() {
             self.destination = None;
         }
@@ -176,6 +183,15 @@ impl FileBrowser {
     #[must_use]
     pub fn peers(&self) -> &[Peer] {
         &self.peers
+    }
+
+    /// The live Nebula overlay badge (mesh id, active transport, lighthouse role)
+    /// when this node is on a mesh; `None` when it is standalone or the mesh
+    /// daemon isn't reachable — the surface renders that as an honest "no mesh"
+    /// state rather than a fabricated one. Refreshed with the roster.
+    #[must_use]
+    pub fn mesh_overlay(&self) -> Option<&MeshOverlayBadge> {
+        self.mesh_overlay.as_ref()
     }
 
     /// The peers that can receive a Send-To right now — online, idle, or self
@@ -372,6 +388,7 @@ mod tests {
         peers: Vec<Peer>,
         rows: Vec<FileRow>,
         next_op: OpId,
+        mesh: Option<MeshOverlayBadge>,
     }
 
     impl FixtureBackend {
@@ -380,7 +397,15 @@ mod tests {
                 peers,
                 rows,
                 next_op: 1,
+                mesh: None,
             }
+        }
+
+        /// Give this fixture a live Nebula overlay, the way `RealBackend` reports
+        /// one when `mackesd`'s Nebula.Status responder is up.
+        fn with_mesh(mut self, mesh: MeshOverlayBadge) -> Self {
+            self.mesh = Some(mesh);
+            self
         }
     }
 
@@ -416,6 +441,9 @@ mod tests {
         }
         fn rollback(&mut self, op_id: OpId) -> Result<OpId, BackendError> {
             Err(BackendError::NotFound(op_id))
+        }
+        fn mesh_overlay(&self) -> Option<MeshOverlayBadge> {
+            self.mesh.clone()
         }
     }
 
@@ -527,6 +555,39 @@ mod tests {
             !reachable.iter().any(|p| p.id == "cedar"),
             "the offline peer must not be a destination"
         );
+    }
+
+    // ── Mesh overlay (live Nebula badge) ────────────────────────────────────
+
+    #[test]
+    fn mesh_overlay_is_none_without_a_live_mesh() {
+        // The demo/local/fixture backends have no Nebula source, so the model
+        // surfaces an honest `None` — the view draws a "standalone" state, never
+        // a fabricated mesh badge.
+        assert!(FileBrowser::new(Box::new(DemoBackend::new()))
+            .mesh_overlay()
+            .is_none());
+        assert!(fixture_browser().mesh_overlay().is_none());
+    }
+
+    #[test]
+    fn mesh_overlay_surfaces_the_live_badge_and_refreshes_with_the_roster() {
+        let badge = MeshOverlayBadge {
+            is_lighthouse: true,
+            ca_epoch: 7,
+            mesh_id: "quasar".into(),
+            peer_count: 3,
+            active_transport: "udp".into(),
+        };
+        let mut b = FileBrowser::new(Box::new(
+            FixtureBackend::new(Vec::new(), Vec::new()).with_mesh(badge.clone()),
+        ));
+        // Populated on construction (new() refreshes the roster + overlay)…
+        assert_eq!(b.mesh_overlay(), Some(&badge));
+        // …and kept fresh on an explicit refresh (same reconnect probe).
+        b.refresh_roster();
+        assert_eq!(b.mesh_overlay().map(|m| m.mesh_id.as_str()), Some("quasar"));
+        assert_eq!(b.mesh_overlay().map(|m| m.is_lighthouse), Some(true));
     }
 
     // ── Selection ───────────────────────────────────────────────────────────

@@ -137,7 +137,8 @@ fn sidebar(ctx: &egui::Context, b: &FileBrowser, actions: &mut Vec<Action>) {
                 b.self_node().host.as_str()
             };
             ui.label(RichText::new(host).color(Style::TEXT).strong());
-            ui.colored_label(Style::TEXT_DIM, "this node");
+            ui.colored_label(Style::TEXT_DIM, node_role(b));
+            mesh_badge(ui, b);
             ui.add_space(Style::SP_M);
 
             section_header(ui, "LOCAL");
@@ -251,10 +252,14 @@ fn empty_state(ui: &mut egui::Ui, b: &FileBrowser) {
                 "Nothing here",
                 "This directory is empty, or it doesn't exist on this node.",
             ),
-            Pane::Peer(_) => (
-                "No shared files",
-                "This peer is sharing nothing, or the mesh Bus is unavailable.",
+            // Distinguish a genuinely-empty share from "no mesh at all" using the
+            // same live overlay the sidebar badge reads — an honest error state
+            // instead of a hedged "sharing nothing, or the Bus is unavailable".
+            Pane::Peer(_) if b.mesh_overlay().is_none() => (
+                "No mesh connection",
+                "This node isn't on a live mesh, so no peer files can be listed.",
             ),
+            Pane::Peer(_) => ("No shared files", "This peer is sharing nothing right now."),
         };
         ui.label(
             RichText::new(title)
@@ -268,6 +273,50 @@ fn empty_state(ui: &mut egui::Ui, b: &FileBrowser) {
 }
 
 // ── Small render helpers ────────────────────────────────────────────────────
+
+/// The node's sub-label under its hostname: its live mesh role (Lighthouse /
+/// Workstation) when the Nebula overlay is up, else the neutral "this node".
+fn node_role(b: &FileBrowser) -> &'static str {
+    match b.mesh_overlay() {
+        Some(m) if m.is_lighthouse => "this node · Lighthouse",
+        Some(_) => "this node · Workstation",
+        None => "this node",
+    }
+}
+
+/// The live mesh badge under the node header: a status dot plus the mesh id and
+/// active transport when this node is on a Nebula overlay, or an honest
+/// "standalone" line when it isn't (the demo/local backends, or a node whose mesh
+/// daemon isn't reachable). Reads the same cached overlay the model refreshes with
+/// the roster — never a fabricated value.
+fn mesh_badge(ui: &mut egui::Ui, b: &FileBrowser) {
+    ui.horizontal(|ui| {
+        if let Some(mesh) = b.mesh_overlay() {
+            status_dot(ui, Style::OK);
+            let mut label = if mesh.mesh_id.is_empty() {
+                "on the mesh".to_string()
+            } else {
+                format!("mesh {}", mesh.mesh_id)
+            };
+            if !mesh.active_transport.is_empty() {
+                label.push_str(" · via ");
+                label.push_str(&mesh.active_transport);
+            }
+            ui.label(
+                RichText::new(label)
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+            );
+        } else {
+            status_dot(ui, Style::WARN);
+            ui.label(
+                RichText::new("Standalone — no mesh")
+                    .color(Style::TEXT_DIM)
+                    .size(Style::SMALL),
+            );
+        }
+    });
+}
 
 fn section_header(ui: &mut egui::Ui, text: &str) {
     ui.label(
