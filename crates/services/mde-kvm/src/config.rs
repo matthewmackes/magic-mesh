@@ -4,7 +4,7 @@
 //! internal `VmConfig`. [`build_ch_config`] is the *only* place that mapping
 //! lives, and it is a pure function so the exact spec→JSON shape — including the
 //! dual-homed NIC mapping and the virtio-gpu device — is unit-tested without a
-//! live VMM. Field names track cloud-hypervisor's OpenAPI `VmConfig`:
+//! live VMM. Field names track cloud-hypervisor's `OpenAPI` `VmConfig`:
 //! `cpus`/`memory`/`payload`/`disks`/`net`/`rng`/`serial`/`console`, plus the
 //! vhost-user `gpu` device.
 

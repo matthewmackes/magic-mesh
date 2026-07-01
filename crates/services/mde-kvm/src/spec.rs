@@ -11,16 +11,19 @@ use std::path::{Path, PathBuf};
 
 use crate::vfio::VfioDevice;
 
-/// The conventional runtime directory for mde-kvm's per-VM unix sockets (the CH
-/// api-socket and, when virtio-gpu is enabled, the vhost-user-gpu socket). One
-/// sub-directory per VM keeps a fan-out of local VMs from colliding.
+/// The conventional runtime directory for mde-kvm's per-VM unix sockets.
+///
+/// Holds the CH api-socket and, when virtio-gpu is enabled, the vhost-user-gpu
+/// socket. One sub-directory per VM keeps a fan-out of local VMs from colliding.
 pub const RUNTIME_DIR: &str = "/run/mde-kvm";
 
-/// The default cloud-hypervisor guest firmware. A **mesh golden image** (lock 14)
-/// is a full bootable disk — Windows 10 included (lock 15) — so cloud-hypervisor
-/// boots it through UEFI firmware (the EDK2 `CLOUDHV.fd` build), not a direct
-/// kernel payload. The bootc Workstation image (lock 42) ships this firmware; a
-/// spec may override it via [`VmSpec::firmware`].
+/// The default cloud-hypervisor guest firmware.
+///
+/// A **mesh golden image** (lock 14) is a full bootable disk — Windows 10
+/// included (lock 15) — so cloud-hypervisor boots it through UEFI firmware (the
+/// EDK2 `CLOUDHV.fd` build), not a direct kernel payload. The bootc Workstation
+/// image (lock 42) ships this firmware; a spec may override it via
+/// [`VmSpec::firmware`].
 pub const DEFAULT_FIRMWARE: &str = "/usr/share/cloud-hypervisor/CLOUDHV.fd";
 
 /// Which host-side network a guest NIC attaches to — the dual-homing roles
@@ -49,9 +52,11 @@ impl NicRole {
     }
 }
 
-/// One guest network interface. `tap` is the host-side tap device cloud-hypervisor
-/// attaches to; `mac`/`mtu` are optional (cloud-hypervisor auto-generates a MAC
-/// when `None`, and the mesh side typically pins the Nebula overlay MTU).
+/// One guest network interface.
+///
+/// `tap` is the host-side tap device cloud-hypervisor attaches to; `mac`/`mtu`
+/// are optional (cloud-hypervisor auto-generates a MAC when `None`, and the mesh
+/// side typically pins the Nebula overlay MTU).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nic {
     /// The dual-homing role (mesh peer vs LAN bridge).
@@ -97,20 +102,24 @@ impl Nic {
 
     /// Pin the MTU (builder style) — e.g. the Nebula overlay MTU on the mesh NIC.
     #[must_use]
-    pub fn with_mtu(mut self, mtu: u16) -> Self {
+    pub const fn with_mtu(mut self, mtu: u16) -> Self {
         self.mtu = Some(mtu);
         self
     }
 }
 
-/// The conventional in-guest mount tag for the **mesh-share** folder — the common
-/// case ([`SharedFolder::mesh_share`]): a Syncthing-replicated mesh directory the
-/// guest mounts read-write (`mount -t virtiofs mesh-share /mnt/mesh-share`). Distinct
-/// from the XCP server path's `mesh-storage` tag; this is the E12 desktop bridge.
+/// The conventional in-guest mount tag for the **mesh-share** folder.
+///
+/// The common case ([`SharedFolder::mesh_share`]): a Syncthing-replicated mesh
+/// directory the guest mounts read-write (`mount -t virtiofs mesh-share
+/// /mnt/mesh-share`). Distinct from the XCP server path's `mesh-storage` tag;
+/// this is the E12 desktop bridge.
 pub const MESH_SHARE_TAG: &str = "mesh-share";
 
-/// A host directory exported into the guest over **virtio-fs** (E12-9, the mesh-share
-/// bridge). Mirrors [`Nic`]: a plain typed field on [`VmSpec`] that
+/// A host directory exported into the guest over **virtio-fs** (E12-9, the
+/// mesh-share bridge).
+///
+/// Mirrors [`Nic`]: a plain typed field on [`VmSpec`] that
 /// [`crate::config::build_ch_config`] folds into the cloud-hypervisor config. A VM
 /// can carry zero or more shared folders.
 ///
@@ -158,15 +167,17 @@ impl SharedFolder {
     /// Export read-only (builder style) — the guest sees the folder but cannot write
     /// back into the mesh dir.
     #[must_use]
-    pub fn with_read_only(mut self, yes: bool) -> Self {
+    pub const fn with_read_only(mut self, yes: bool) -> Self {
         self.read_only = yes;
         self
     }
 }
 
-/// A local cloud-hypervisor VM spec (lock 11). The exact, minimal description the
-/// shell/`vm-lifecycle` worker hands to the broker; [`crate::config::build_ch_config`]
-/// turns it into cloud-hypervisor's `VmConfig` JSON.
+/// A local cloud-hypervisor VM spec (lock 11).
+///
+/// The exact, minimal description the shell/`vm-lifecycle` worker hands to the
+/// broker; [`crate::config::build_ch_config`] turns it into cloud-hypervisor's
+/// `VmConfig` JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmSpec {
     /// Stable VM name — drives the per-VM socket paths ([`api_socket_path`] /
@@ -228,7 +239,7 @@ impl VmSpec {
 
     /// Enable the virtio-gpu fast path (builder style).
     #[must_use]
-    pub fn with_virtio_gpu(mut self, on: bool) -> Self {
+    pub const fn with_virtio_gpu(mut self, on: bool) -> Self {
         self.virtio_gpu = on;
         self
     }
@@ -292,19 +303,23 @@ pub fn api_socket_path(name: &str) -> PathBuf {
 }
 
 /// The vhost-user-gpu socket path for a VM named `name`
-/// (`/run/mde-kvm/<name>/gpu.sock`). The shell's GPU backend listens here; the
-/// `gpu` device in the [`crate::config::build_ch_config`] output points at it.
+/// (`/run/mde-kvm/<name>/gpu.sock`).
+///
+/// The shell's GPU backend listens here; the `gpu` device in the
+/// [`crate::config::build_ch_config`] output points at it.
 #[must_use]
 pub fn gpu_socket_path(name: &str) -> PathBuf {
     PathBuf::from(RUNTIME_DIR).join(name).join("gpu.sock")
 }
 
 /// The virtiofsd unix-socket path for VM `name`'s shared folder tagged `tag`
-/// (`/run/mde-kvm/<name>/fs-<tag>.sock`). One socket per folder (a VM can export
-/// several), so the two ends — the [`VirtiofsLauncher`](crate::VirtiofsLauncher) that
-/// binds virtiofsd here and the `fs` device [`crate::config::build_ch_config`] points
-/// at it — agree by both deriving the path from this one pure function, never
-/// colliding across a fan-out of folders.
+/// (`/run/mde-kvm/<name>/fs-<tag>.sock`).
+///
+/// One socket per folder (a VM can export several), so the two ends — the
+/// [`VirtiofsLauncher`](crate::VirtiofsLauncher) that binds virtiofsd here and
+/// the `fs` device [`crate::config::build_ch_config`] points at it — agree by
+/// both deriving the path from this one pure function, never colliding across a
+/// fan-out of folders.
 #[must_use]
 pub fn virtiofs_socket_path(name: &str, tag: &str) -> PathBuf {
     PathBuf::from(RUNTIME_DIR)
@@ -313,8 +328,10 @@ pub fn virtiofs_socket_path(name: &str, tag: &str) -> PathBuf {
 }
 
 /// The running-disk path under a `~/Local` directory for a VM named `name`
-/// (`<local_dir>/<name>.img`). Per lock 18 the broker copies a mesh golden base
-/// to this local, never-synced path and points [`VmSpec::disk`] at it before boot.
+/// (`<local_dir>/<name>.img`).
+///
+/// Per lock 18 the broker copies a mesh golden base to this local, never-synced
+/// path and points [`VmSpec::disk`] at it before boot.
 #[must_use]
 pub fn running_disk_path(local_dir: &Path, name: &str) -> PathBuf {
     local_dir.join(format!("{name}.img"))

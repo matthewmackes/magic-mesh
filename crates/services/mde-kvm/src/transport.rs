@@ -34,9 +34,11 @@ impl ChResponse {
     }
 }
 
-/// The cloud-hypervisor API transport. The real impl is [`UnixSocketTransport`];
-/// tests inject a recording mock. `method` is `"PUT"`/`"GET"`, `path` is the full
-/// API path (e.g. `"/api/v1/vm.boot"`), `body` is an optional JSON request body.
+/// The cloud-hypervisor API transport.
+///
+/// The real impl is [`UnixSocketTransport`]; tests inject a recording mock.
+/// `method` is `"PUT"`/`"GET"`, `path` is the full API path (e.g.
+/// `"/api/v1/vm.boot"`), `body` is an optional JSON request body.
 pub trait ChTransport {
     /// Issue one request and return the parsed response.
     ///
@@ -66,7 +68,7 @@ impl UnixSocketTransport {
 
     /// Override the read/write timeout (builder style).
     #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
@@ -139,7 +141,7 @@ pub fn parse_http_response(raw: &[u8]) -> Result<ChResponse, KvmError> {
     let text = String::from_utf8_lossy(raw);
     let (head, body) = text
         .split_once("\r\n\r\n")
-        .map_or((text.as_ref(), ""), |(h, b)| (h, b));
+        .map_or_else(|| (text.as_ref(), ""), |(h, b)| (h, b));
 
     let status_line = head
         .lines()

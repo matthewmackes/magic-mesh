@@ -23,6 +23,7 @@ use crate::KvmError;
 const API_BASE: &str = "/api/v1";
 
 /// A handle to one cloud-hypervisor instance, bound to its api-socket transport.
+///
 /// One `cloud-hypervisor` process (hence one api-socket, hence one `Vm`) hosts a
 /// single guest, so the lifecycle verbs take no VM id — the socket *is* the VM.
 #[derive(Debug, Clone)]
@@ -43,7 +44,7 @@ impl Vm<UnixSocketTransport> {
 
 impl<T: ChTransport> Vm<T> {
     /// Bind to an arbitrary transport (the test seam).
-    pub fn with_transport(transport: T) -> Self {
+    pub const fn with_transport(transport: T) -> Self {
         Self { transport }
     }
 
