@@ -90,11 +90,7 @@ impl MusicApp {
             );
             if !self.server.is_empty() {
                 ui.add_space(Style::SP_M);
-                ui.label(
-                    RichText::new(&self.server)
-                        .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
-                );
+                mde_egui::muted_note(ui, &self.server);
             }
             // Transport, pinned to the right edge.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -136,17 +132,9 @@ impl MusicApp {
                     } else {
                         format!("{state_word} · {}", format_duration(elapsed))
                     };
-                    ui.label(
-                        RichText::new(status)
-                            .size(Style::SMALL)
-                            .color(Style::TEXT_DIM),
-                    );
+                    mde_egui::muted_note(ui, status);
                 } else {
-                    ui.label(
-                        RichText::new("Nothing playing")
-                            .size(Style::SMALL)
-                            .color(Style::TEXT_DIM),
-                    );
+                    mde_egui::muted_note(ui, "Nothing playing");
                 }
             });
         });
@@ -363,11 +351,7 @@ fn album_row(ui: &mut egui::Ui, album: &Album) -> Response {
             );
             let subtitle = album_subtitle(album);
             if !subtitle.is_empty() {
-                ui.label(
-                    RichText::new(subtitle)
-                        .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
-                );
+                mde_egui::muted_note(ui, subtitle);
             }
         });
     });
