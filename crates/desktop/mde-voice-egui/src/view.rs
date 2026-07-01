@@ -15,17 +15,32 @@ use mde_voice_hud::sip::CallState;
 use crate::model::{call_tone, dial_ready, registration_tone, Command, Tone, VoiceState};
 
 /// Render the whole Voice surface for one frame, returning the user's intents.
-pub fn show(ctx: &Context, state: &VoiceState, dial: &mut String, identity: &str) -> Vec<Command> {
+/// `registrar_backed` gates the header Retry (see [`top_panel`]).
+pub fn show(
+    ctx: &Context,
+    state: &VoiceState,
+    dial: &mut String,
+    identity: &str,
+    registrar_backed: bool,
+) -> Vec<Command> {
     let mut cmds = Vec::new();
-    top_panel(ctx, state, identity, &mut cmds);
+    top_panel(ctx, state, identity, registrar_backed, &mut cmds);
     central(ctx, state, dial, &mut cmds);
     cmds
 }
 
 /// The header strip: the surface title, the account identity, and the live
 /// registration status (dot + the shipped `RegistrationState::label`) with a
-/// Retry affordance shown only when registration has actually failed.
-fn top_panel(ctx: &Context, state: &VoiceState, identity: &str, cmds: &mut Vec<Command>) {
+/// Retry affordance shown only for a **registrar-backed** failure — a
+/// registrar-less P2P node has no registrar to re-register against, so Retry
+/// there would be a dead-end.
+fn top_panel(
+    ctx: &Context,
+    state: &VoiceState,
+    identity: &str,
+    registrar_backed: bool,
+    cmds: &mut Vec<Command>,
+) {
     egui::TopBottomPanel::top("voice-header").show(ctx, |ui| {
         ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
@@ -44,9 +59,12 @@ fn top_panel(ctx: &Context, state: &VoiceState, identity: &str, cmds: &mut Vec<C
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(Style::SP_S);
-                // Re-register is a no-op for a registrar-less P2P node, so the
-                // Retry button only appears when a real registration failed.
-                if matches!(registration_tone(&state.registration), Tone::Bad)
+                // Re-register is meaningless for a registrar-less P2P node (no
+                // registrar to retry, and after an overlay-bind failure the agent
+                // has already exited), so Retry appears only for a registrar-backed
+                // failure — never as a dead-end button.
+                if registrar_backed
+                    && matches!(registration_tone(&state.registration), Tone::Bad)
                     && ui.button("Retry").clicked()
                 {
                     cmds.push(Command::Reregister);

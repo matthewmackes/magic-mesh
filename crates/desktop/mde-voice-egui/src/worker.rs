@@ -24,7 +24,7 @@ use mde_egui::egui::Context;
 use mde_voice_hud::media::{self, MediaSession};
 use mde_voice_hud::sip::{self, AgentCommand, AgentEvent, CallSession, SipAccount};
 
-use crate::model::{Command, Update};
+use crate::model::{is_registrar_backed, Command, Update};
 
 /// How long an outbound INVITE waits for an answer before giving up. Mirrors the
 /// shipped HUD's 30 s ring timeout.
@@ -37,6 +37,19 @@ pub fn spawn(account: SipAccount, ctx: Context, updates: &Sender<Update>) -> Sen
     let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
     let (agent_ev_tx, agent_ev_rx) = mpsc::channel::<AgentEvent>();
     let (agent_cmd_tx, agent_cmd_rx) = mpsc::channel::<AgentCommand>();
+
+    // Loading state: a registrar account's initial REGISTER is synchronous
+    // (`agent_register` blocks the whole registrar round-trip), and the agent
+    // emits its first Registration event only once that returns — so without this
+    // the surface would sit on a stale "Not registered" for the round-trip. Show
+    // the real in-progress "Registering…" at once; the agent's first event
+    // replaces it with the true outcome. A registrar-less P2P node has no REGISTER
+    // and reports its real state near-instantly, so it keeps its honest NoAccount.
+    // This send precedes any worker thread, so it is drained before the agent's
+    // outcome — no flicker back to "Registering…".
+    if is_registrar_backed(&account) {
+        let _ = updates.send(Update::Registration(sip::RegistrationState::Registering));
+    }
 
     // The SIP agent: registration + inbound calls. Owns the socket; blocks.
     let agent_account = account.clone();

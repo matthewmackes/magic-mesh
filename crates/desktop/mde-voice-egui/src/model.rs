@@ -11,7 +11,7 @@
 //! the [`RegistrationState`] and [`CallState`] the shipped SIP state machine
 //! already defines and labels.
 
-use mde_voice_hud::sip::{CallState, RegistrationState};
+use mde_voice_hud::sip::{CallState, RegistrationState, SipAccount};
 
 /// The complete render-agnostic state of the voice surface.
 ///
@@ -175,6 +175,24 @@ pub fn dial_ready(input: &str) -> bool {
     !input.trim().is_empty()
 }
 
+/// Whether a resolved account is backed by a **registrar** (has a `server_host`)
+/// rather than a registrar-less P2P-overlay identity.
+///
+/// Two surface decisions hang off this one rule, so it lives here as a single
+/// tested predicate:
+///
+/// * the worker shows an optimistic `Registering…` the instant it starts, while
+///   a registrar account's *blocking* initial REGISTER is in flight — otherwise
+///   the surface sits on a stale `Not registered` for the whole round-trip;
+/// * the header offers **Retry** only for a registrar-backed failure. A
+///   registrar-less P2P node has no registrar to re-register against (its agent
+///   treats `Reregister` as a no-op, and after an overlay-bind failure the agent
+///   has already exited), so a Retry there would be a silent dead-end.
+#[must_use]
+pub fn is_registrar_backed(account: &SipAccount) -> bool {
+    !account.server_host.trim().is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +299,24 @@ mod tests {
         assert!(!dial_ready("   "));
         assert!(dial_ready("pine"));
         assert!(dial_ready("1004"));
+    }
+
+    #[test]
+    fn registrar_backed_only_with_a_real_server_host() {
+        // A registrar-less P2P identity (no `server_host`) is NOT registrar-backed:
+        // no optimistic "Registering…", and no dead-end Retry.
+        let p2p = SipAccount::local_identity();
+        assert!(!is_registrar_backed(&p2p));
+
+        // A registrar account is — its blocking initial REGISTER earns the
+        // optimistic "Registering…", and a failure earns a working Retry.
+        let mut acct = SipAccount::local_identity();
+        acct.server_host = "sip.example.com".to_string();
+        assert!(is_registrar_backed(&acct));
+
+        // Whitespace-only is treated as no registrar (matches the agent's own
+        // `server_host.trim().is_empty()` registrar-less test).
+        acct.server_host = "   ".to_string();
+        assert!(!is_registrar_backed(&acct));
     }
 }

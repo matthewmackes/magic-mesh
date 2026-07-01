@@ -48,6 +48,10 @@ pub struct VoiceApp {
     updates: Receiver<Update>,
     /// The account identity shown in the header (the AOR, or a P2P-overlay note).
     identity: String,
+    /// Whether this is a registrar-backed account (vs. a registrar-less P2P
+    /// identity) — gates the header's Retry affordance, which is meaningless
+    /// (a dead-end) for a P2P node with no registrar to re-register against.
+    registrar_backed: bool,
 }
 
 impl VoiceApp {
@@ -65,6 +69,10 @@ impl VoiceApp {
             _ => "this node · P2P overlay".to_string(),
         };
         let account = account.unwrap_or_else(SipAccount::local_identity);
+        // Whether Retry (re-register) is meaningful — a registrar-backed account,
+        // not a registrar-less P2P node. Read from the resolved account before it
+        // is moved into the worker.
+        let registrar_backed = model::is_registrar_backed(&account);
         let commands = worker::spawn(account, cc.egui_ctx.clone(), &update_tx);
         Self {
             state: VoiceState::new(),
@@ -72,6 +80,7 @@ impl VoiceApp {
             commands,
             updates: update_rx,
             identity,
+            registrar_backed,
         }
     }
 
@@ -87,7 +96,13 @@ impl App for VoiceApp {
         while let Ok(update) = self.updates.try_recv() {
             self.state.apply(update);
         }
-        let cmds = view::show(ctx, &self.state, &mut self.dial, &self.identity);
+        let cmds = view::show(
+            ctx,
+            &self.state,
+            &mut self.dial,
+            &self.identity,
+            self.registrar_backed,
+        );
         for cmd in cmds {
             self.send(cmd);
         }
