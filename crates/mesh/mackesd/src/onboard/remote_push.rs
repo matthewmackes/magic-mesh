@@ -323,6 +323,93 @@ impl Applier for LocalApplier {
     }
 }
 
+/// The observed-state an `onboard_apply` worker reports after applying a bundle:
+/// the redacted (secret-free) actions that took effect on this node, echoed back
+/// so the issuer + the §8 audit log confirm exactly what landed. Publishable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedOutcome {
+    /// The node that applied the bundle (its mesh node id).
+    pub node: String,
+    /// The redacted descriptions of the actions that applied, in order — never the
+    /// secret material itself (§8).
+    pub applied: Vec<String>,
+}
+
+/// A single-use nonce guard that closes the replay window freshness alone leaves
+/// open: inside [`JobBundle::MAX_AGE_SECS`] a validly-signed bundle could be
+/// replayed verbatim. The guard records each accepted bundle's nonce and refuses a
+/// re-seen one, pruning entries once they age out of the freshness window — a
+/// bundle that old is already rejected by [`JobBundle::verify`], so its nonce is
+/// safe to forget, and the guard stays bounded without persistence.
+#[derive(Debug, Default)]
+pub struct NonceGuard {
+    /// nonce -> issued_at (Unix seconds), for age-based pruning.
+    seen: std::collections::HashMap<String, i64>,
+}
+
+impl NonceGuard {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drop nonces older than the freshness window relative to `now` (they can no
+    /// longer be replayed — [`JobBundle::verify`] rejects them on age).
+    fn prune(&mut self, now: i64) {
+        self.seen
+            .retain(|_, issued_at| now - *issued_at <= JobBundle::MAX_AGE_SECS);
+    }
+
+    /// Record `nonce` as used; `true` if it was fresh (first use), `false` if it
+    /// was already seen (a replay to reject). Prunes aged entries first.
+    fn check_and_record(&mut self, nonce: &str, issued_at: i64, now: i64) -> bool {
+        self.prune(now);
+        if self.seen.contains_key(nonce) {
+            return false;
+        }
+        self.seen.insert(nonce.to_string(), issued_at);
+        true
+    }
+}
+
+/// Validate a received signed bundle and apply it locally — the `onboard_apply`
+/// worker's pure core (the Bus drain loop wires this onto `action/onboard/apply`).
+///
+/// The order is security-load-bearing:
+/// 1. [`JobBundle::verify`] — signature + freshness. A failure here leaves the
+///    target **fully unchanged** and does NOT burn the nonce (so an attacker can't
+///    exhaust the nonce space with unsigned bundles, and a genuine re-send under a
+///    fresh signature still works).
+/// 2. Nonce single-use — refuse a replay of an already-applied bundle.
+/// 3. [`apply_all`] — apply in order, stopping at the first failure (no silent
+///    partial past it, §7). Validation being fully upstream of apply is what makes
+///    an auth failure a clean no-op on the target.
+///
+/// # Errors
+/// [`RemotePushError::BundleRejected`] on a bad signature / stale bundle / replayed
+/// nonce (target unchanged); [`RemotePushError::ActionFailed`] if an action fails
+/// mid-apply (stops there, naming it).
+pub fn process_apply(
+    bundle: &JobBundle,
+    sig: &[u8],
+    signer: &VerifyingKey,
+    now: i64,
+    nonce_guard: &mut NonceGuard,
+    applier: &dyn Applier,
+) -> Result<AppliedOutcome, RemotePushError> {
+    bundle.verify(sig, signer, now)?;
+    if !nonce_guard.check_and_record(&bundle.nonce, bundle.issued_at, now) {
+        return Err(RemotePushError::BundleRejected {
+            why: format!("nonce {} already applied (replay)", bundle.nonce),
+        });
+    }
+    apply_all(applier, &bundle.actions)?;
+    Ok(AppliedOutcome {
+        node: bundle.target_node.clone(),
+        applied: bundle.actions.iter().map(Action::redacted).collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +660,83 @@ mod tests {
             }),
             Err(RemotePushError::NotWired { .. })
         ));
+    }
+
+    // ── process_apply: the onboard_apply worker's validate→apply core ──
+
+    #[test]
+    fn process_apply_verifies_then_applies_and_reports_observed_state() {
+        // A valid signed bundle: verify → apply → the effects really land (role.toml
+        // + secret store) and the observed-state echoes the redacted actions.
+        let (tmp, applier) = local_applier();
+        let mut guard = NonceGuard::new();
+        let k = key();
+        let now = 1_800_000_000;
+        let b = bundle(now); // PinRole lighthouse+media, SealSecret media-spaces
+        let sig = b.sign(&k);
+        let outcome =
+            process_apply(&b, &sig, &k.verifying_key(), now, &mut guard, &applier).unwrap();
+        assert_eq!(outcome.node, "peer:lh-media");
+        assert_eq!(outcome.applied.len(), 2);
+        assert!(outcome.applied[0].contains("pin-role lighthouse +media"));
+        // end-to-end: the role.toml + the sealed secret both landed
+        assert!(mde_role::load_class_from(&tmp.path().join("role.toml"))
+            .unwrap()
+            .is_media_lighthouse());
+        assert_eq!(
+            applier.store.get("media-spaces").unwrap().as_deref(),
+            Some("s3-creds")
+        );
+    }
+
+    #[test]
+    fn process_apply_refuses_a_replayed_nonce() {
+        // The same bundle applied twice: the second is rejected on the nonce, so a
+        // captured-and-replayed bundle can't re-run inside the freshness window.
+        let (_tmp, applier) = local_applier();
+        let mut guard = NonceGuard::new();
+        let k = key();
+        let now = 1_800_000_000;
+        let b = bundle(now);
+        let sig = b.sign(&k);
+        assert!(process_apply(&b, &sig, &k.verifying_key(), now, &mut guard, &applier).is_ok());
+        let err =
+            process_apply(&b, &sig, &k.verifying_key(), now + 1, &mut guard, &applier).unwrap_err();
+        assert!(
+            matches!(err, RemotePushError::BundleRejected { .. }),
+            "a replayed nonce is rejected"
+        );
+    }
+
+    #[test]
+    fn process_apply_a_bad_signature_does_not_burn_the_nonce() {
+        // A wrong-signer bundle is rejected WITHOUT recording its nonce, so a
+        // genuine re-send of the same bundle (correctly signed) still applies —
+        // an attacker can't grief the nonce space with forged bundles.
+        let (_tmp, applier) = local_applier();
+        let mut guard = NonceGuard::new();
+        let k = key();
+        let now = 1_800_000_000;
+        let b = bundle(now);
+        let wrong = SigningKey::from_bytes(&[1_u8; 32]);
+        assert!(process_apply(
+            &b,
+            &b.sign(&wrong),
+            &k.verifying_key(),
+            now,
+            &mut guard,
+            &applier
+        )
+        .is_err());
+        // same nonce, now correctly signed → still applies (nonce was not burned)
+        assert!(process_apply(
+            &b,
+            &b.sign(&k),
+            &k.verifying_key(),
+            now,
+            &mut guard,
+            &applier
+        )
+        .is_ok());
     }
 }

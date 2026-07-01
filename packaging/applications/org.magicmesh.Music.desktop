@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=MCNF Music
-Comment=Mesh music player (Airsonic/Subsonic)
-Exec=mde-music
-Icon=magic-mesh
-Terminal=false
-Categories=AudioVideo;Audio;Player;
