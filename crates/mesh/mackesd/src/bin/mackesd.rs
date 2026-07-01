@@ -5806,6 +5806,26 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("vm_lifecycle".into());
         }
+        // MV-4 — the container worker: the Podman container-lifecycle actuator (the
+        // container half of the mesh management layer, companion to MV-3
+        // vm_lifecycle). Drains `action/container/lifecycle` (run / stop / rm /
+        // list, each addressed to a target node id) via an injectable
+        // PodmanBackend that shells `podman` through the bounded proc path, and
+        // publishes this node's container roster to `event/podman/containers`.
+        // Universal like vm_lifecycle — every node can host datacenter containers —
+        // so it gates through the rank-0-default worker resolver (runs everywhere).
+        // node_id is both the event `host` stamp and the action target this worker
+        // matches.
+        if mackesd_core::worker_role::runs("container", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::container::ContainerWorker::new(node_id.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("container".into());
+        }
         // OV-7.a (v2.6) — health reconciler. Polls each known
         // peer's QNM-Shared heartbeat.json every 5 s, applies the
         // telemetry::health_state_from_age threshold table, writes

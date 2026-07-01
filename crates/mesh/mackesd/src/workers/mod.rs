@@ -524,6 +524,14 @@ pub mod kvm_health;
 // proc path behind an injectable `LibvirtBackend` trait. Universal, like
 // kvm_health — every node can host datacenter VMs.
 pub mod vm_lifecycle;
+// MV-4 — the container worker: the Podman container-lifecycle actuator (the
+// container half of the mesh management layer, companion to MV-3 vm_lifecycle).
+// Drains `action/container/lifecycle` (run / stop / rm / list, each addressed to a
+// target node id) via an injectable `PodmanBackend` that shells `podman` through
+// the bounded proc path, and publishes this node's container roster to
+// `event/podman/containers`. Universal like vm_lifecycle — every node can host
+// datacenter containers.
+pub mod container;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
 // text clip on the bus + appends to ONE mesh-global `clipboard/history.json`
