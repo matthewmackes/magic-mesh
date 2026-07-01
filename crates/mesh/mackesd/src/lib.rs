@@ -185,6 +185,13 @@ pub mod kvm;
 // it without the async-services worker pool. The live enroll + xe/tofu apply is
 // integration-gated behind the seam.
 pub mod adopt_xcp;
+// OW-13 — recovery + passive revocation: a reinstalled box re-enrolls FRESH (its old
+// identity left to lapse on its short TTL — no CRL, no key-backup), the current cert
+// auto-renews before its lead-time cliff, and immediate node removal reuses the ENT-3
+// blocklist. Pure planner (plan_renewal / passive_revocation_status / plan_recovery)
+// + injectable RecoveryApply seam (live re-enroll integration-gated); non-gated so
+// the `mackesd recovery` CLI verb reaches it without the async-services worker pool.
+pub mod recovery;
 pub mod worker;
 /// E1.2 — role-gated worker subsets (which workers `run_serve` spawns per role).
 pub mod worker_role;
