@@ -193,9 +193,110 @@ impl JobBundle {
     }
 }
 
+/// The target-side effect seam — applies ONE allow-listed [`Action`] locally on
+/// the node receiving the push. Production `LocalApplier` (a follow-up) calls the
+/// real primitives (`mde_role::pin`, the secret store, enroll, the session-
+/// broker); tests use a recording fake. Both transports + the `onboard_apply`
+/// worker converge here, so the actual effects live in exactly one place.
+pub trait Applier {
+    /// Apply a single action to THIS node. Idempotent where possible (re-applying
+    /// a `PinRole` is a no-op).
+    ///
+    /// # Errors
+    /// [`RemotePushError::ActionFailed`] naming the (redacted) action + reason.
+    fn apply_one(&self, action: &Action) -> Result<(), RemotePushError>;
+}
+
+/// Apply `actions` in order via `applier`, stopping at the FIRST failure. Returns
+/// `Ok(())` only when every action applied; the error names the failing action.
+/// Callers validate the whole signed bundle BEFORE calling this, so a mid-way
+/// failure is rare + observable rather than a silent partial (§7).
+///
+/// # Errors
+/// The first [`RemotePushError::ActionFailed`] any action returns.
+pub fn apply_all(applier: &dyn Applier, actions: &[Action]) -> Result<(), RemotePushError> {
+    for action in actions {
+        applier.apply_one(action)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// Records the actions it was asked to apply; fails on any action whose
+    /// redacted text contains `fail_on` (to exercise the stop-on-first-failure
+    /// path without any live effect).
+    struct RecordingApplier {
+        applied: RefCell<Vec<String>>,
+        fail_on: Option<&'static str>,
+    }
+    impl Applier for RecordingApplier {
+        fn apply_one(&self, action: &Action) -> Result<(), RemotePushError> {
+            let desc = action.redacted();
+            if let Some(f) = self.fail_on {
+                if desc.contains(f) {
+                    return Err(RemotePushError::ActionFailed {
+                        action: desc,
+                        why: "injected".into(),
+                    });
+                }
+            }
+            self.applied.borrow_mut().push(desc);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn apply_all_applies_every_action_in_order() {
+        let app = RecordingApplier {
+            applied: RefCell::new(vec![]),
+            fail_on: None,
+        };
+        let actions = vec![
+            Action::PinRole {
+                role: "Media".into(),
+            },
+            Action::SealSecret {
+                name: "media-spaces".into(),
+                sealed: vec![1],
+            },
+        ];
+        assert!(apply_all(&app, &actions).is_ok());
+        assert_eq!(app.applied.borrow().len(), 2);
+        assert!(app.applied.borrow()[0].contains("pin-role Media"));
+    }
+
+    #[test]
+    fn apply_all_stops_at_the_first_failure() {
+        // fail on the seal ⇒ the pin (before it) applied, the open-broker (after)
+        // never runs — no silent partial past the failure.
+        let app = RecordingApplier {
+            applied: RefCell::new(vec![]),
+            fail_on: Some("seal-secret"),
+        };
+        let actions = vec![
+            Action::PinRole {
+                role: "Media".into(),
+            },
+            Action::SealSecret {
+                name: "s".into(),
+                sealed: vec![1],
+            },
+            Action::OpenBroker {
+                session_id: "x".into(),
+            },
+        ];
+        let err = apply_all(&app, &actions).unwrap_err();
+        assert!(matches!(err, RemotePushError::ActionFailed { .. }));
+        assert_eq!(
+            app.applied.borrow().len(),
+            1,
+            "only the pin applied before the failure"
+        );
+    }
 
     fn key() -> SigningKey {
         SigningKey::from_bytes(&[9_u8; 32])
