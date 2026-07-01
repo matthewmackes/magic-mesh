@@ -15,8 +15,8 @@
 //! Everything renders through the shared [`mde_egui::Style`]. The blocking, !Send
 //! SIP work lives on [`worker`] threads so the egui UI thread never blocks; the
 //! render-agnostic view-model in [`model`] is unit-tested without a socket or a
-//! sound device. The libcosmic HUD is never pulled (`mde-voice-hud` is consumed
-//! with its `gui` feature off).
+//! sound device. The retired Cosmic-era HUD is never pulled (`mde-voice-hud` is
+//! consumed with its `gui` feature off).
 //!
 //! Under E12 "Quasar" the mesh-control surfaces are **panels inside the one shell**
 //! (`mde-shell-egui`), not separate clients (§5, the EMBED model — there is no

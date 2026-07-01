@@ -2,7 +2,7 @@
 //!
 //! This module is the **render-agnostic, fully-tested core** — the
 //! lighthouse-health panel indicator (LIGHTHOUSE-7). E12-14b stripped the
-//! libcosmic panel-shell binary; MCNF 12.0 "Quasar" reuses this core from the
+//! Cosmic-era panel-shell binary; MCNF 12.0 "Quasar" reuses this core from the
 //! egui replacements (`mde-panel-egui` + `mde-shell-egui`) as thin glue, not
 //! logic. (APPLAUNCH-9, 2026-06-27: the app-launcher model that used to live
 //! here retired into the Front Door — one launcher.)
@@ -19,8 +19,8 @@
 // peer directory, so — exactly like the NEB-CRYPTO-LABEL cipher text — the data
 // comes from the **world-readable** mesh-status snapshot (`/run/mde/
 // mesh-status.json`), written by the root snapshot timer. This render-agnostic
-// layer parses that JSON; the libcosmic shell only renders the result + spawns
-// the deep-link. Lighthouse identification mirrors the Workbench
+// layer parses that JSON; the panel surface (today the egui panel/shell) only
+// renders the result + spawns the deep-link. Lighthouse identification mirrors the Workbench
 // `enrich_roles` (LIGHTHOUSE-9): a node is a lighthouse when its `role` is
 // `"lighthouse"` OR its `overlay_ip` is in `network.lighthouse_ips`.
 
@@ -49,7 +49,7 @@ pub enum LighthouseHealth {
 }
 
 impl LighthouseHealth {
-    /// The `mde-theme` token the libcosmic shell maps to the dot color
+    /// The legacy theme-token name the panel surface maps to the dot color
     /// (`beacon_healthy` green / `danger` red — the dedicated lighthouse-beacon
     /// hues, Q13/Q14). `None` has no dot, so no token.
     #[must_use]

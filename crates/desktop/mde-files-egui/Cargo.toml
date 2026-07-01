@@ -7,11 +7,11 @@
 # mesh-peer folder and initiates a Send-To.
 #
 # Tier (§6): desktop-shell. The edges point inward — `mde-egui` (shared harness)
-# and `mde-files` (services, consumed WITHOUT its libcosmic GUI). E12 is
-# egui-native, so the libcosmic file manager is never pulled.
+# and `mde-files` (services, consumed WITHOUT its Cosmic-era GUI). E12 is
+# egui-native, so the retired file-manager GUI is never pulled.
 [package]
 name        = "mde-files-egui"
-description = "MCNF E12 Quasar — an egui file-manager surface on the mde-egui harness that reuses mde-files' render-agnostic backend/model/send_to (file listing + transfer model) over the mesh Bus: browse a local directory and a mesh-peer folder, then initiate a Send-To. Renders through the shared Style; the libcosmic GUI is not pulled (mde-files is consumed with default-features off)."
+description = "MCNF E12 Quasar — an egui file-manager surface on the mde-egui harness that reuses mde-files' render-agnostic backend/model/send_to (file listing + transfer model) over the mesh Bus: browse a local directory and a mesh-peer folder, then initiate a Send-To. Renders through the shared Style; the retired Cosmic-era GUI is not pulled (mde-files is consumed with default-features off)."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -32,7 +32,7 @@ path = "src/main.rs"
 # re-exported `egui`/`eframe` (one toolkit resolution for every surface).
 mde-egui = { path = "../../shared/mde-egui" }
 # REUSE: mde-files' render-agnostic core. `default-features = false` drops the
-# libcosmic GUI (E12 is egui-native); `dbus` keeps the Bus transport so Send-To
+# Cosmic-era GUI (E12 is egui-native); `dbus` keeps the Bus transport so Send-To
 # routes over `action/file-ops/send-to` and peer folders list over
 # `action/fleet-files/list-peer`.
 mde-files = { path = "../../services/mde-files", default-features = false, features = ["dbus"] }

@@ -9,8 +9,8 @@
 //! Layering (§6): the decision logic lives in [`model`] (no egui — unit-tested
 //! without a GPU); [`view`] turns that model into egui widgets. The production
 //! backend is `mde_files::backend::RealBackend` (local filesystem + the mesh Bus);
-//! the libcosmic file manager is never pulled (`mde-files` is consumed with its
-//! `gui` feature off).
+//! the retired Cosmic-era file-manager GUI is never pulled (`mde-files` is
+//! consumed with its `gui` feature off).
 
 pub mod model;
 pub mod view;

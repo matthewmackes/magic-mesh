@@ -8,9 +8,9 @@ license.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
-# E12-14b — the libcosmic + wlr-layer-shell HUD binary was stripped; this crate
+# E12-14b — the Cosmic-era wlr-layer-shell HUD binary was stripped; this crate
 # is now purely the render-agnostic SIP core (sip/media/roster/resolve — no
-# libcosmic) as a library. `mde-voice-egui` reuses the register/call state
+# GUI toolkit) as a library. `mde-voice-egui` reuses the register/call state
 # machine + the persistent SIP agent on the egui harness
 # (`default-features = false`), rendered as the Voice panel in `mde-shell-egui`.
 [lib]

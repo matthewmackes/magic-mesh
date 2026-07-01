@@ -45,7 +45,7 @@ pub mod wallpaper;
 #[serde(rename_all = "snake_case")]
 pub enum SettingKey {
     // --- theme ---
-    /// GTK / libcosmic theme name (e.g. "Mackes-Carbon").
+    /// GTK / desktop theme name (e.g. "Mackes-Carbon").
     ThemeName,
     /// Accent color, hex `#RRGGBB`.
     ThemeAccent,

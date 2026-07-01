@@ -1,7 +1,7 @@
 //! `mde-egui` — the MCNF **E12 "Quasar"** egui harness.
 //!
-//! E12 forks the COSMIC desktop into the repo and rewrites every UI surface from
-//! libcosmic/iced to **egui** (governance §4/§5/§6). This crate is the shared
+//! E12 retires the Cosmic-era toolkit and rewrites every UI surface from
+//! the iced-based stack to **egui** (governance §4/§5/§6). This crate is the shared
 //! foundation every surface is built on — the three things lock 14 says ship
 //! first:
 //!
@@ -20,8 +20,8 @@
 //! intentionally not enabled. egui/eframe keep an accesskit path to wire in a
 //! post-stabilization a11y epic; until then this harness ships without it.
 //!
-//! The crate has **zero libcosmic/iced dependencies** — it depends only on
-//! `egui`/`eframe`. Both are re-exported so every surface resolves to the one
+//! The crate has **zero retired-toolkit (Cosmic/iced) dependencies** — it depends
+//! only on `egui`/`eframe`. Both are re-exported so every surface resolves to the one
 //! harness-pinned egui version (no cross-surface version skew).
 
 pub mod fonts;

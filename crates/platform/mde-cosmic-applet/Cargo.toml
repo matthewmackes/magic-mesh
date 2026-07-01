@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2021"
 # EFF-16 — license metadata so cargo-deny's unlicensed gate passes.
 license.workspace = true
-description = "MCNF cosmic-applet: mesh health pip + quick actions over mde-bus, deep-linking into the Workbench (GUI-6/Q46-47). Render-agnostic logic layer (lib) + the libcosmic panel shell (bin)."
+description = "MCNF cosmic-applet core: mesh health pip + quick actions over mde-bus, deep-linking into the Workbench (GUI-6/Q46-47). Render-agnostic logic layer, lib-only since E12-14b stripped the Cosmic-era panel-shell bin; the egui panel/shell reuse it."
 
 [lib]
 path = "src/lib.rs"
 
-# E12-14b — the libcosmic panel-shell binary (`src/bin/mde-cosmic-applet.rs`) was
+# E12-14b — the Cosmic-era panel-shell binary (`src/bin/mde-cosmic-applet.rs`) was
 # stripped. The render-agnostic lib (the LIGHTHOUSE-7 mesh-health model) is reused
 # by the egui replacements (`mde-panel-egui` + `mde-shell-egui`) WITHOUT compiling
-# libcosmic, which E12 retires. The crate is now lib-only.
+# the retired toolkit. The crate is now lib-only.
 # (APPLAUNCH-9, 2026-06-27: the `mde-apps-applet` launcher bin was already retired
 # here — the app-launcher role folded into the Front Door, one launcher.)
 [dependencies]

@@ -19,8 +19,8 @@
 
 // ── Render-agnostic surface (always compiled) ───────────────────────────────
 // The file/listing/transfer model + the Bus client. This subset carries no
-// libcosmic dependency — E12's `mde-files-egui` renders it on the egui
-// harness. E12-14b stripped the iced/libcosmic GUI + all modules that
+// GUI-toolkit dependency — E12's `mde-files-egui` renders it on the egui
+// harness. E12-14b stripped the Cosmic-era iced GUI + all modules that
 // only that GUI used (archive, bookmarks, desktop, fileops, grid, mime,
 // panels, properties, search, selection, smb, thumbnails, trash).
 pub mod backend;
@@ -32,8 +32,8 @@ pub mod mesh_backend;
 pub mod model;
 pub mod send_to;
 
-// ── E12-14b — the windowed libcosmic surface was stripped ───────────────────
-// The iced/libcosmic file-manager GUI (`app`/`views`/`widgets`/`icons`/`theme`/
+// ── E12-14b — the windowed Cosmic-era surface was stripped ──────────────────
+// The Cosmic-era iced file-manager GUI (`app`/`views`/`widgets`/`icons`/`theme`/
 // `loading`/`picker`/`prefs`/`cosmic_compat`/`mounts` + the `mde-files` binary)
 // is retired. MCNF 12.0 "Quasar" renders Files as an egui panel
 // (`mde-files-egui::files_panel`) inside `mde-shell-egui`, reusing the

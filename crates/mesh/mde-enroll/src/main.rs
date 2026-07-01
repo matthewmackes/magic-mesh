@@ -4,7 +4,7 @@
 //! printed by `mackesd found` (optionally overriding the lighthouse IP)
 //! and watches the fingerprint-pinned network enroll run, step by step.
 //! Works headless over SSH — lighthouses/servers have no display, so a
-//! terminal UI is the right surface (not a libcosmic window).
+//! terminal UI is the right surface (not a GUI window).
 //!
 //! The state machine lives in [`app`]; this file is the terminal I/O
 //! shell: raw-mode setup, the crossterm event loop, the ratatui render,

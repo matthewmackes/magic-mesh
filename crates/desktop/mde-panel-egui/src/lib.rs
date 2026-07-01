@@ -1,5 +1,5 @@
 //! `mde-panel-egui` — the MCNF E12 "Quasar" egui **panel client** (E12-7), the
-//! egui replacement for the retired libcosmic cosmic-applet.
+//! egui replacement for the retired Cosmic-era cosmic-applet.
 //!
 //! The panel shows two things, both off live mesh state:
 //!

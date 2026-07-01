@@ -3,9 +3,9 @@
 //! This crate is the toolkit-free voice core: the pure-Rust SIP register/call
 //! state machine ([`sip`]), the RTP/G.711 [`media`] engine, the mesh peer
 //! [`roster`] loader, and the dialer-target [`resolve`] heuristic. It carries
-//! **no libcosmic dependency**.
+//! **no GUI-toolkit dependency**.
 //!
-//! E12-14b — the libcosmic + wlr-layer-shell softphone HUD binary (`src/main.rs`)
+//! E12-14b — the Cosmic-era wlr-layer-shell softphone HUD binary (`src/main.rs`)
 //! was stripped. MCNF 12.0 "Quasar" renders Voice as an egui panel
 //! (`mde-voice-egui::voice_panel`, pumped by `voice_pump`) inside
 //! `mde-shell-egui`, reusing this core — including the persistent SIP agent

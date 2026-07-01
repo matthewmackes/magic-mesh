@@ -9,7 +9,7 @@
 #
 # Tier (§6): desktop-shell. The dependency edges point strictly INWARD —
 # desktop → harness (`mde-egui`) and desktop → services (`mde-voice-hud`,
-# consumed WITHOUT its libcosmic HUD via `default-features = false`); it pulls in
+# consumed WITHOUT its Cosmic-era HUD via `default-features = false`); it pulls in
 # no mesh-substrate crate, so the substrate stays headless-capable.
 [package]
 name        = "mde-voice-egui"
@@ -35,7 +35,7 @@ path = "src/main.rs"
 # the surface shares one toolkit resolution.
 mde-egui = { path = "../../shared/mde-egui" }
 # §6 reuse — the voice service crate's render-agnostic core. `default-features =
-# false` drops the libcosmic HUD (E12 is egui-native); we call its `sip` register/
+# false` drops the Cosmic-era HUD (E12 is egui-native); we call its `sip` register/
 # call state machine (`SipAccount`, `run_agent`, `place_call`/`place_call_direct`,
 # `hang_up`, `AgentEvent`/`AgentCommand`, the routing helpers) and the `media`
 # engine — all already tested there.

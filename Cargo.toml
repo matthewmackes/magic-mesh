@@ -1,25 +1,17 @@
-# MCNF — the mesh substrate + its Carbon GUIs, on stock Fedora-Cosmic.
+# MCNF — the mesh substrate + the E12 "Quasar" egui-native thin-client desktop.
 #
 # Split out of the MackesWorkstation monorepo (the labwc/Win-era MDE desktop,
-# now EOL'd) by the E11 "MCNF" pivot: this repo carries only the mesh
-# fabric + the iced-0.14 Carbon GUIs that run as apps/applets on Cosmic. The
-# desktop chrome (panel/menu/settings/themes/window-mgmt/lock/greeter) is gone —
-# Cosmic provides it.
+# now EOL'd) by the E11 "MCNF" pivot; the E12 "Quasar" pivot then retired the
+# Cosmic-era GUI toolkit stack: the host UI is ONE egui shell (mde-shell-egui on
+# the mde-egui harness) that owns the DRM seat directly — no compositor, no
+# second toolkit (§4/§5). E12-14c removed the last Cosmic-era git pins, so the
+# workspace resolves entirely from crates.io again.
 #
 # Crates: platform (Bus, role) · mesh (mackesd control plane, Nebula, transport,
 # config, types, the magic-fleet Automation Mesh node engine) · services
 # (mde-files, voice HUD/config, music) · desktop (the E12 egui shell + panels;
 # the Workbench is a plane inside mde-shell-egui) · shared (the egui harness +
 # look stack, disclaimer) · kdc (the canonical KDE Connect host).
-#
-# EFF-35 — libcosmic git-pin policy. libcosmic has no crates.io release, so
-# the three consumers (mde-cosmic-applet, mde-files, mde-role-chooser) pin
-# the SAME explicit `rev` (today cca48bc29ef7a9f22160c0ab6ba117ab22d1ae87 —
-# the GUI-6 probe rev). Update cadence: bump deliberately, never track a
-# branch — re-pin all three in one commit when (a) a Cosmic point release
-# lands on the target Fedora spin, or (b) a needed fix/API lands upstream;
-# gate the bump on the full workspace build + the GUI crates' tests. Keep
-# the revs identical across crates so Cargo resolves one libcosmic tree.
 
 [workspace]
 resolver = "2"

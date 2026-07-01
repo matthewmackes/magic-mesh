@@ -8,10 +8,10 @@ license.workspace      = true
 authors.workspace      = true
 repository.workspace   = true
 
-# E12-14b — the windowed libcosmic `mde-files` binary was stripped; MCNF 12.0
+# E12-14b — the windowed Cosmic-era `mde-files` binary was stripped; MCNF 12.0
 # "Quasar" renders Files as an egui panel (`mde-files-egui::files_panel`) in
 # `mde-shell-egui`, reusing this crate's render-agnostic backend/model/send_to
-# over the Bus. The crate is now lib-only (no libcosmic/wgpu/winit).
+# over the Bus. The crate is now lib-only (no GUI toolkit/wgpu/winit).
 [dependencies]
 # Single-sourced QNM-Shared mount resolution so the mesh-home subtitle
 # shows the real mount, not a phantom /mnt/mesh-storage.
@@ -26,8 +26,8 @@ chrono     = "0.4"
 # a fetch-free add. `tar` does its own path-traversal guarding on unpack.
 tar        = "0.4"
 flate2     = "1"
-# E11.6 native parity — freedesktop thumbnail generation. `image` is already
-# pulled transitively (iced 0.14 -> image 0.25 -> png 0.18); `md5` (URI cache
+# E11.6 native parity — freedesktop thumbnail generation. `image` + `png` were
+# already in the workspace lockfile when this landed; `md5` (URI cache
 # naming) is in the lockfile too. Fetch-free.
 image      = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 png        = "0.18"

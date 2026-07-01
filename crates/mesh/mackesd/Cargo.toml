@@ -347,9 +347,9 @@ payload_compress = "xz"
 # (11.2.0 → 11.3.0: onboard verbs OW-8/11, CTRLSURF 1-8, NOTIFY-REDESIGN A-C)
 # resets release to 1.
 release = "1"
-summary = "MCNF — secure no-fixed-center workgroup mesh + native-Rust Carbon GUIs on Fedora-Cosmic"
+summary = "MCNF — secure no-fixed-center workgroup mesh + the native-Rust egui mesh shell on Fedora"
 # EFF-13 — matches the workspace license (GPL-3.0-or-later). Bundled deps add
-# MPL-2.0 (libcosmic/iced stack) + permissive (MIT/Apache-2.0/BSD); see NOTICE.
+# MPL-2.0 + permissive (MIT/Apache-2.0/BSD); see NOTICE.
 license = "GPL-3.0-or-later AND MPL-2.0"
 # Every binary the workspace builds, placed under /usr/bin.
 assets = [
@@ -366,13 +366,13 @@ assets = [
     # Instances as in-shell panels. Built `--features drm` (the RPM build re-links this
     # one bin with the feature after the workspace build) so it takes the seat; it
     # falls back to a windowed client where there is no DRM master. This is THE
-    # graphical surface now that the iced GUIs are stripped (E12-14b), with a .desktop
-    # so it's launchable from a session too.
+    # graphical surface now that the Cosmic-era GUIs are stripped (E12-14b), with a
+    # .desktop so it's launchable from a session too.
     { source = "target/release/mde-shell-egui",     dest = "/usr/bin/mde-shell-egui",     mode = "755" },
     # (the org.magicmesh.Shell.desktop launcher ships via the packaging/applications/*.desktop glob below)
     # E12-14b — the obsolete Cosmic-era surfaces were dropped: the live-map
     # layer-shell wallpaper (mde-mesh-wallpaper) + the notify-hub bins
-    # (mde-notify-{center,toast,capture}), AND the four iced/libcosmic GUIs that
+    # (mde-notify-{center,toast,capture}), AND the four Cosmic-era GUIs that
     # now render as egui panels in mde-shell-egui — the file manager (mde-files),
     # music player (mde-music), voice HUD (mde-voice-hud), and the cosmic-applet.
     # Their /usr/bin binaries + their autostart/launcher .desktop files no longer
@@ -723,11 +723,11 @@ magic-mesh-server = "*"
 # *variant*). Built with `cargo generate-rpm -p crates/mesh/mackesd --variant
 # server`; build-rpm-fedora43.sh's `--server` mode compiles ONLY the daemon +
 # mesh-substrate crates (mackesd/magic-fleet/mde-enroll/mde-bus — none of which
-# pull libcosmic/iced), so a headless build neither gates on the ~100 MB
-# libcosmic GUI compile nor ships the workbench/files/music/voice-hud/applet
+# pull a GUI toolkit), so a headless build neither gates on the heavy
+# GUI-toolkit compile nor ships the shell/files/music/voice-hud/applet
 # binaries a Server never runs. cargo-generate-rpm overrides each base
 # generate-rpm key with the variant's value (and `auto_req` regenerates the ELF
-# `Requires` from the listed assets only, so the GUI's gtk3/libcosmic ELF deps
+# `Requires` from the listed assets only, so the GUI's graphics-stack ELF deps
 # drop out automatically). The variant `assets` array REPLACES the base list —
 # it carries the daemon bins + every systemd unit / install-helper / substrate
 # script / doc the headless roles need, minus the desktop GUI surface

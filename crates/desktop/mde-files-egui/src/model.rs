@@ -10,7 +10,7 @@
 //! The reuse is deliberate (governance §6): the listing comes from
 //! [`Backend::list`], the roster from [`Backend::peers`], the transfer request is
 //! the canonical [`SendToRequest`], and the send itself dispatches through
-//! [`Backend::send_to`] — the same surfaces the libcosmic file manager renders.
+//! [`Backend::send_to`] — the same surfaces the retired file-manager GUI rendered.
 //! In production the backend is `RealBackend` (local FS + the mesh Bus); tests
 //! drive the model with the shipped `DemoBackend`/`LocalFsBackend` and a small
 //! in-test double for the states only a live mesh produces.
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn open_peer_surfaces_the_backend_listing() {
         // DemoBackend ships a curated per-peer listing; the model surfaces it
-        // verbatim through the same `list()` the libcosmic manager uses.
+        // verbatim through the same `list()` every consumer uses.
         let mut b = FileBrowser::new(Box::new(DemoBackend::new()));
         b.open_peer("pine");
         assert!(b.pane().is_peer());
