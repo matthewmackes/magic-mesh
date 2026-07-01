@@ -179,6 +179,12 @@ pub mod proc_reap;
 // host-health worker (MV-2, `workers::kvm_health`) folds it onto
 // `event/kvm/services`.
 pub mod kvm;
+// MV-7 — day-2 `adopt-xcp`: adopt an existing XCP-ng host into the mesh (enroll its
+// dom0 as a static Nebula member + drive its XAPI toolstack via xe/tofu, as the live
+// farm does). Pure plan + injectable Adopter seam; non-gated so the CLI verb reaches
+// it without the async-services worker pool. The live enroll + xe/tofu apply is
+// integration-gated behind the seam.
+pub mod adopt_xcp;
 pub mod worker;
 /// E1.2 — role-gated worker subsets (which workers `run_serve` spawns per role).
 pub mod worker_role;

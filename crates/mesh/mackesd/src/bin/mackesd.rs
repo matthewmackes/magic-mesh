@@ -188,6 +188,29 @@ enum Cmd {
         verb: OnboardCmd,
     },
 
+    /// MV-7 — day-2 adopt an existing XCP-ng host into this mesh: enroll its dom0
+    /// as a static Nebula member (not a role) and drive its XAPI toolstack via
+    /// `xe`/tofu (as the live farm does), so it serves VMs to the mesh. Needs a
+    /// founded mesh (a CA to sign the member) + a resolvable host credential;
+    /// otherwise it stays blocked (retry available). The live enroll + xe/tofu
+    /// apply is integration-gated behind the Adopter seam; `--dry-run` prints the
+    /// plan + ordered steps without touching the host.
+    AdoptXcp {
+        /// The XCP-ng pool master / dom0 address (`ip` or host, e.g. `172.20.0.9`).
+        #[arg(long, value_name = "ADDR")]
+        pool_address: String,
+        /// The overlay IP the dom0 takes as a static Nebula member (e.g. `10.42.0.9`).
+        #[arg(long, value_name = "IP")]
+        overlay_ip: String,
+        /// A handle to the host root credential (e.g. `secret:xcp-host`), never the
+        /// secret itself — resolved at apply time.
+        #[arg(long, value_name = "REF", default_value = "secret:xcp-adopt")]
+        credential_ref: String,
+        /// Print the plan + ordered steps without enrolling / driving the toolstack.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// LIGHTHOUSE-10 — set this lighthouse's PUBLIC underlay address
     /// (`ip` or `ip:port`, port defaults to 4242). Persisted so the
     /// heartbeat publishes it to the directory and every node's enroll
@@ -2532,6 +2555,53 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         },
+        Cmd::AdoptXcp {
+            pool_address,
+            overlay_ip,
+            credential_ref,
+            dry_run,
+        } => {
+            // Plan the adoption: gather this node's facts (mesh-id, CA holder,
+            // whether the host credential resolves), fold into a plan. The live
+            // member-enroll + xe/tofu apply is integration-gated behind the Adopter
+            // seam; --dry-run stops at the plan + ordered steps.
+            use mackesd_core::adopt_xcp as ax;
+            let node_id = default_node_id();
+            let root = mackesd_core::default_qnm_shared_root();
+            let target = ax::AdoptTarget {
+                pool_address,
+                overlay_ip,
+                credential_ref,
+            };
+            let facts = ax::gather(&root, &node_id, &target);
+            let plan = ax::plan_adopt(&target, &facts);
+            println!("adopt-xcp: {}", plan.human());
+            if dry_run {
+                for (i, step) in plan.steps().iter().enumerate() {
+                    println!("  {}. {}", i + 1, step.describe());
+                }
+                return Ok(());
+            }
+            // Live path: drive the integration-gated Adopter seam (enroll static
+            // member → drive toolstack).
+            match ax::execute(&plan, &ax::LiveAdopter) {
+                Ok(ax::AdoptOutcome::Adopted { host }) => {
+                    println!(
+                        "  adopted {} as a static member (overlay {})",
+                        host.pool_address, host.overlay_ip
+                    );
+                }
+                Ok(ax::AdoptOutcome::Blocked { reason }) => {
+                    println!("  no-op — blocked ({reason}); retry available");
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  adopt-xcp failed (live enroll + xe/tofu is integration-gated): {e}"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
         Cmd::DnsLeakCheck { expected } => {
             use mackesd_core::surrounding_hosts::{dns_leak, parse_resolv_nameservers};
             let content = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
