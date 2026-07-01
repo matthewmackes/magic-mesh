@@ -178,6 +178,16 @@ enum Cmd {
         media: bool,
     },
 
+    /// OW-2 — node onboarding engine: the headless verbs both onboarding
+    /// front-ends drive (the egui first-run wizard + the TUI enroll flow). Today
+    /// two verbs land here — `self-test` (node self-diagnostic) and
+    /// `role-provision` (apply a role's systemd unit set); the complex verbs
+    /// (mesh-create/invite/enroll/mesh-dns/network) arrive with OW-3..OW-6.
+    Onboard {
+        #[command(subcommand)]
+        verb: OnboardCmd,
+    },
+
     /// LIGHTHOUSE-10 — set this lighthouse's PUBLIC underlay address
     /// (`ip` or `ip:port`, port defaults to 4242). Persisted so the
     /// heartbeat publishes it to the directory and every node's enroll
@@ -1224,6 +1234,33 @@ enum ProbeCmd {
     },
 }
 
+/// OW-2 — `mackesd onboard <verb>` subcommands. The engine lives in
+/// `mackesd_core::onboard` so the egui + TUI onboarding front-ends call the same
+/// code these CLI verbs do.
+#[derive(Subcommand)]
+enum OnboardCmd {
+    /// OW-2 — node self-diagnostic: KVM stack readiness (the KVM_SERVICES
+    /// catalog), the mesh peer directory, and identity + CA presence. Prints a
+    /// human report (or `--json`) and exits non-zero when a *critical* check
+    /// fails (missing identity / unreadable directory).
+    SelfTest {
+        /// Emit the report as a single JSON line instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// OW-2 — apply a deployment role's systemd unit set: enable the units the
+    /// role runs, mask the ones it does not. Idempotent. `--dry-run` prints the
+    /// plan without touching systemd.
+    RoleProvision {
+        /// `lighthouse` | `workstation`.
+        #[arg(long)]
+        role: String,
+        /// Print the planned enable/mask actions without applying them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 /// DDNS-EGRESS-3 — `mackesd ddns <sub>` subcommands. Each calls the same
 /// `mackesd_core::ipc::ddns::build_reply` verb the `action/ddns/*` bus responder
 /// serves (CLI/GUI parity over one config), rooted at the shared workgroup root.
@@ -2202,6 +2239,65 @@ fn main() -> anyhow::Result<()> {
             }
             // rank >= min_rank: the gate is satisfied; the unit may start (exit 0).
         }
+        Cmd::Onboard { verb } => match verb {
+            OnboardCmd::SelfTest { json } => {
+                // Probe the live node, fold into the report, print, and exit on
+                // its verdict (non-zero iff a critical check failed).
+                let node_id = default_node_id();
+                let root = mackesd_core::default_qnm_shared_root();
+                let probes = mackesd_core::onboard::self_test::gather(&node_id, &db_path, &root);
+                let report = mackesd_core::onboard::self_test::assemble(&probes);
+                if json {
+                    println!("{}", serde_json::to_string(&report)?);
+                } else {
+                    print!("{}", report.human());
+                }
+                std::process::exit(report.exit_code());
+            }
+            OnboardCmd::RoleProvision { role, dry_run } => {
+                let parsed: mde_role::Role = role.parse().map_err(|_| {
+                    anyhow::anyhow!("unknown role `{role}` — expected lighthouse|workstation")
+                })?;
+                let plan = mackesd_core::onboard::role_provision::plan(parsed);
+                if dry_run {
+                    println!(
+                        "onboard role-provision --role {} (dry-run, {} units):",
+                        parsed.as_str(),
+                        plan.len()
+                    );
+                    for u in &plan {
+                        println!("  {:?}\t{}", u.action, u.unit);
+                    }
+                    return Ok(());
+                }
+                let outcomes = mackesd_core::onboard::role_provision::apply(
+                    &plan,
+                    &mackesd_core::onboard::role_provision::SystemctlUnits,
+                );
+                let mut failed = 0usize;
+                for o in &outcomes {
+                    if o.ok {
+                        println!("  {:?} {} — ok", o.action, o.unit);
+                    } else {
+                        failed += 1;
+                        eprintln!(
+                            "  {:?} {} — FAILED: {}",
+                            o.action,
+                            o.unit,
+                            o.error.as_deref().unwrap_or("unknown error")
+                        );
+                    }
+                }
+                println!(
+                    "role-provision {}: {} units applied, {failed} failed",
+                    parsed.as_str(),
+                    outcomes.len()
+                );
+                if failed > 0 {
+                    std::process::exit(1);
+                }
+            }
+        },
         Cmd::DnsLeakCheck { expected } => {
             use mackesd_core::surrounding_hosts::{dns_leak, parse_resolv_nameservers};
             let content = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();

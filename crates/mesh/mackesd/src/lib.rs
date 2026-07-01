@@ -183,6 +183,11 @@ pub mod worker;
 /// E1.2 — role-gated worker subsets (which workers `run_serve` spawns per role).
 pub mod worker_role;
 
+/// OW-2 — the `mackesd onboard` engine core (the self-test + role-provision
+/// verbs both onboarding front-ends drive). Feature-agnostic (pure fold + thin
+/// systemctl/file shells), so a non-`async-services` front-end can call it too.
+pub mod onboard;
+
 // v2.0.0 Phase A modules — async surface for the unified backend.
 // Gated behind `async-services` so the legacy sync read-API still
 // builds with only the original Phase 12 deps. Library consumers
