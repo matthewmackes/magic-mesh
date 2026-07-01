@@ -6,8 +6,9 @@
 //! shell body — the mesh-control [`Workbench`](Surface::Workbench) (This Node →
 //! Fleet, MV-6), this node's local VM [`Instances`](Surface::Instances) (the
 //! cloud-hypervisor broker, E12-7), the brokered VM [`Desktop`](Surface::Desktop)
-//! (VDI, egui-native), or one of the three embedded app surfaces (Music / Files /
-//! Voice). One surface shows at a time; the Workbench is always one click away.
+//! (VDI, egui-native), the three embedded app surfaces (Music / Files / Voice),
+//! plus the two mesh information surfaces (Notifications / Clipboard). One surface
+//! shows at a time; the Workbench is always one click away.
 //!
 //! The rail is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
@@ -38,19 +39,27 @@ pub(crate) enum Surface {
     Files,
     /// The embedded Voice / SIP surface (`mde-voice-egui`).
     Voice,
+    /// The Notifications surface — mesh-wide alerts (security, presence,
+    /// firewall, compute) tailed from the Bus alert lanes.
+    Notifications,
+    /// The Clipboard surface — recent mesh clipboard entries from
+    /// `event/clipboard/clip`, newest first.
+    Clipboard,
 }
 
 impl Surface {
     /// The dock entries in nav order — the Workbench (mesh-control home) first,
     /// then the local VM Instances broker + the brokered Desktop, then the three
-    /// app surfaces.
-    pub(crate) const ALL: [Surface; 6] = [
+    /// app surfaces, then the two mesh information surfaces.
+    pub(crate) const ALL: [Surface; 8] = [
         Surface::Workbench,
         Surface::Instances,
         Surface::Desktop,
         Surface::Music,
         Surface::Files,
         Surface::Voice,
+        Surface::Notifications,
+        Surface::Clipboard,
     ];
 
     /// The short dock label.
@@ -62,6 +71,8 @@ impl Surface {
             Surface::Music => "Music",
             Surface::Files => "Files",
             Surface::Voice => "Voice",
+            Surface::Notifications => "Alerts",
+            Surface::Clipboard => "Clipboard",
         }
     }
 
@@ -79,6 +90,12 @@ impl Surface {
             Surface::Music => "Play the mesh music library (Subsonic / Airsonic).",
             Surface::Files => "Browse local + peer folders and Send-To across the mesh.",
             Surface::Voice => "Place and receive mesh voice calls (SIP).",
+            Surface::Notifications => {
+                "Mesh-wide alerts — security, presence, firewall, compute events."
+            }
+            Surface::Clipboard => {
+                "Recent clipboard copies from across the mesh, newest first."
+            }
         }
     }
 }
@@ -116,10 +133,11 @@ mod tests {
     use super::Surface;
 
     #[test]
-    fn the_dock_lists_the_workbench_the_vm_surfaces_plus_the_three_app_surfaces() {
-        // Exactly six entries, Workbench first, then the two VM surfaces
-        // (Instances / Desktop) + the three app surfaces.
-        assert_eq!(Surface::ALL.len(), 6);
+    fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
+        // Eight entries: Workbench first, two VM surfaces (Instances / Desktop),
+        // three app surfaces (Music / Files / Voice), two info surfaces
+        // (Notifications / Clipboard).
+        assert_eq!(Surface::ALL.len(), 8);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
             Surface::Instances,
@@ -127,6 +145,8 @@ mod tests {
             Surface::Music,
             Surface::Files,
             Surface::Voice,
+            Surface::Notifications,
+            Surface::Clipboard,
         ] {
             assert!(Surface::ALL.contains(&s), "{s:?} missing from the dock");
         }

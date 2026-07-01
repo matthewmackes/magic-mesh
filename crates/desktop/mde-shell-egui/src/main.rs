@@ -15,12 +15,14 @@
 //! plug into.
 
 mod chrome;
+mod clipboard;
 mod controller;
 mod datacenter;
 mod discovery;
 mod dock;
 mod instances;
 mod network;
+mod notifications;
 mod provisioning;
 mod session;
 mod thisnode;
@@ -114,6 +116,12 @@ struct Shell {
     /// lifecycle; with no live VMM the ops surface mde-kvm's typed gated error, and
     /// an empty roster shows the honest "No local VMs" EmptyState.
     instances: instances::InstancesState,
+    /// The Notifications surface — tails the Bus alert lanes (security, presence,
+    /// firewall, compute, FDO) and accumulates mesh-wide alerts newest-first.
+    notifications: notifications::NotificationsState,
+    /// The Clipboard surface — tails `event/clipboard/clip` and shows recent mesh
+    /// clipboard entries captured by the clipboard_sync worker, newest first.
+    clipboard: clipboard::ClipboardState,
 }
 
 impl Shell {
@@ -143,6 +151,8 @@ impl Shell {
             vdi: vdi::VdiState::default(),
             discovery: discovery::DiscoveryState::default(),
             instances: instances::InstancesState::default(),
+            notifications: notifications::NotificationsState::default(),
+            clipboard: clipboard::ClipboardState::default(),
         }
     }
 
@@ -244,6 +254,18 @@ impl Shell {
                     voice_panel(ui, voice);
                 });
             }
+            Surface::Notifications => {
+                let notifications = &mut self.notifications;
+                ui.push_id("shell-notifications", |ui| {
+                    notifications.show(ui);
+                });
+            }
+            Surface::Clipboard => {
+                let clipboard = &mut self.clipboard;
+                ui.push_id("shell-clipboard", |ui| {
+                    clipboard.show(ui);
+                });
+            }
         }
     }
 }
@@ -283,6 +305,15 @@ impl Shell {
             && self.vdi.requested_target().is_none()
         {
             self.discovery.poll(ctx);
+        }
+
+        // The Notifications and Clipboard surfaces tail their respective bus
+        // topics whenever the shell is expanded — cheap incremental reads that
+        // keep the panels live so data is ready the instant the operator switches
+        // to either surface (no cold-start 5-second wait).
+        if self.nav.expanded {
+            self.notifications.poll(ctx);
+            self.clipboard.poll(ctx);
         }
 
         // The thin persistent chrome bar (48px = SP_XL + SP_M).
