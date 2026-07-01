@@ -18,11 +18,12 @@
 #   farm-slot-gc.sh --deploy        push + --install the GC timer to every farm node (from coordinator)
 #
 # Env: MCNF_GC_IDLE_MIN (30) · MCNF_GC_KEEP ("slotA slotB" never-touch) ·
-#      MCNF_FARM_NODES ("172.20.0.50 172.20.0.90 172.20.0.130") · MCNF_FARM_KEY · MCNF_FARM_USER
+#      MCNF_FARM_NODES ("172.20.0.50 172.20.0.90 172.20.0.130 172.20.0.170") · MCNF_FARM_KEY · MCNF_FARM_USER
 set -uo pipefail
 IDLE_MIN="${MCNF_GC_IDLE_MIN:-30}"
 KEEP=" ${MCNF_GC_KEEP:-} "
-NODES="${MCNF_FARM_NODES:-172.20.0.50 172.20.0.90 172.20.0.130}"
+# 4 build VMs (incl. XEN-194/.170, the 4th dom0); canonical roster: install-helpers/farm-topology.sh.
+NODES="${MCNF_FARM_NODES:-172.20.0.50 172.20.0.90 172.20.0.130 172.20.0.170}"
 KEY="${MCNF_FARM_KEY:-/root/.ssh/mackes_mesh_ed25519}"
 USER="${MCNF_FARM_USER:-mm}"
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"

@@ -67,7 +67,9 @@ Every drain tick, in order:
 ### D. Coordinator + park + worktree tools (DRAIN-5/6/7) — *implemented 2026-06-25*
 - **`install-helpers/drain-coordinator.sh`** (DRAIN-6) — `plan`/`slots`/`next`/`preflight`:
   the per-tick mechanics as one runnable tool over the REAL farm topology
-  (`.50`/`.90`/`.130`, caps 2/2/3 — not the stale `.50/.51/.52`). The ship skill's
+  (`.50`/`.90`/`.130`/`.170`, caps 2/2/3/2 = **9 heavy slots** across 4 dom0s; canonical
+  roster `install-helpers/farm-topology.sh` — the octets are build-VM IPs, not the legacy
+  `mcnf-build-5x` name-octets). The ship skill's
   "coordinator loop (DRAIN-5/6/7)" section drives it.
 - **`install-helpers/park-blocker.sh <ID> "<reason>"`** (DRAIN-5) — flips a blocked unit
   to `[!]`, annotates its worklist line, surfaces it under "Parked by the drain loop" in

@@ -14,9 +14,12 @@
 # Architecture + the recovery playbook: docs/farm.md.
 #
 # Fleet (override via env or ~/.config/mcnf-farm.conf — `dom0_ip|label|buildvm_ip`):
+# Canonical dom0/build-VM roster (4 dom0s / 9 heavy slots): install-helpers/farm-topology.sh.
 #   172.20.145.192  the dev/orchestration host (this box; local builds + podman)
 #   172.20.0.9      XEN-HOME-SERVICES  → build VM 172.20.0.50
 #   172.20.145.193  KVM-XCP1           → build VM 172.20.0.51
+#   172.20.145.165  XEN-BIGBOY         → build VM 172.20.0.52
+#   172.20.145.194  XEN-194 (4th dom0) → build VM 172.20.0.170
 #
 # Usage:
 #   farm.sh status                  fleet state (dom0 reachable · VMs · build VM up + toolchained)
@@ -37,7 +40,8 @@ KEY="${MCNF_FARM_KEY:-$HOME/.ssh/mackes_mesh_ed25519}"
 CONF="${MCNF_FARM_CONF:-$HOME/.config/mcnf-farm.conf}"
 
 # Default fleet; a conf file (one `dom0_ip|label|buildvm_ip` per line) overrides.
-FLEET_DEFAULT=$'172.20.0.9|XEN-HOME-SERVICES|172.20.0.50\n172.20.145.193|KVM-XCP1|172.20.0.51\n172.20.145.165|XEN-BIGBOY|172.20.0.52'
+# 4 dom0s (incl. XEN-194/.170, the 4th); canonical roster: install-helpers/farm-topology.sh.
+FLEET_DEFAULT=$'172.20.0.9|XEN-HOME-SERVICES|172.20.0.50\n172.20.145.193|KVM-XCP1|172.20.0.51\n172.20.145.165|XEN-BIGBOY|172.20.0.52\n172.20.145.194|XEN-194|172.20.0.170'
 fleet() { [ -f "$CONF" ] && grep -vE '^\s*(#|$)' "$CONF" || printf '%s\n' "$FLEET_DEFAULT"; }
 
 SSHK=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=12)

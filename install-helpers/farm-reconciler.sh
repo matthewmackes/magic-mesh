@@ -169,6 +169,10 @@ export TF_VAR_build_vcpus="$BUILD_VCPUS"
 export FA_MAX_SMALL="${FA_MAX_SMALL:-1}"
 
 # Stable dom0 print/iterate order (matches the design doc + farm-autoscale.sh).
+# NOTE: the FARM is 4 dom0s / 9 heavy build slots (canonical roster:
+# install-helpers/farm-topology.sh); this reconciler's elastic layer manages only
+# these 3 — the 4th dom0 XEN-194 (build VM .170, heavy cap 2) is NOT yet elastic-wired
+# (infra/tofu/variables.tf validates only these 3 dom0 keys — a known IaC gap).
 ORDER=("xen-bigboy" "xen-home-services" "kvm-xcp1")
 # dom0 → the build-VM IPs to probe for in-flight work (best-effort, degrades).
 # Per dom0 we probe BOTH:

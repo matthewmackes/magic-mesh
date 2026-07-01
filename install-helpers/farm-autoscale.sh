@@ -83,6 +83,10 @@ declare -A PODS_ENV=(
   ["kvm-xcp1"]="${FA_PODS_XCP1:-}"
 )
 # Stable print order (matches the design doc's dom0 table).
+# NOTE: the FARM is 4 dom0s / 9 heavy build slots (canonical roster:
+# install-helpers/farm-topology.sh); this elastic autoscaler manages only these 3 —
+# the 4th dom0 XEN-194 (build VM .170, heavy cap 2) is NOT yet elastic-wired because
+# infra/tofu/variables.tf validates only these 3 dom0 keys (a known IaC gap).
 ORDER=("xen-bigboy" "xen-home-services" "kvm-xcp1")
 
 # nonneg <n> — true iff <n> is a non-negative integer.

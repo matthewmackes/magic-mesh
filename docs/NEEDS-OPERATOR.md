@@ -5,7 +5,7 @@ _Generated 2026-06-27 from the worklist reconcile (wf_0cfa1277). These items hav
 
 ## BUILD-INFRA
 
-- **BUILD-PLATFORM-1: cache hit verification; a crate built on node A then B shows hit, fresh ** — _needs:_ This is a RUNTIME-OBSERVABLE acceptance: requires live build farm nodes (172.20.0.50+.51+.52) with sccache.yml applied, a fresh RPM build on one node to populate cache, second build on different node 
+- **BUILD-PLATFORM-1: cache hit verification; a crate built on node A then B shows hit, fresh ** — _needs:_ This is a RUNTIME-OBSERVABLE acceptance: requires live build farm nodes (172.20.0.50/.90/.130/.170 — 4 build VMs; see install-helpers/farm-topology.sh) with sccache.yml applied, a fresh RPM build on one node to populate cache, second build on different node 
 - **BUILD-PLATFORM-5: per-feature pass/fail on Bus (event/test/feature/<id>), red feature name** — _needs:_ test-feature.sh line 60+ publishes to Bus (mde-bus) + nightly.sh would aggregate + report. But this depends on BUILD-PLATFORM-5 test harness actually running nightly on live infra, which is BLOCKED on
 - **BUILD-PLATFORM-6: chaos test — destroying a lighthouse causes no fleet-wide FUSE wedge, fa** — _needs:_ test-stability.sh lines 46-50+ implement chaos: shut down node B via xe vm-shutdown, verify node A's mackesd stays healthy (no uninterruptible procs, load sane). Code-complete. But requires live multi
 - **BUILD-PLATFORM-6: reboot-recovery test — node reboots and mounts/overlay self-heal (BOOT-R** — _needs:_ test-stability.sh implements reboot via xe vm-reboot (code-complete). But BLOCKED on live mesh (same as soak/chaos above). Additionally, self-heal assertions (mounts + overlay come back) require inspe

@@ -7,10 +7,13 @@ same hardware for normal build VMs or agents — and likewise on the two smaller
 hosts. The pipeline should create and destroy resources for the best on-demand use
 of the hardware."*
 
-Today the farm is **3 always-on, fixed-size build VMs** (`mcnf-build-50/51/52`, one
-per dom0, declared in `infra/tofu/`). The directive makes each dom0 **elastic**: it
-runs *either* one hardware-maxing big VM *or* several small VMs / agent pods,
-created and destroyed by tofu to fit the live build workload.
+Today the farm is **4 always-on, fixed-size build VMs** (`mcnf-build-50/51/52/53`,
+build-VM IPs `.50`/`.90`/`.130`/`.170`, one per dom0 — canonical roster
+`install-helpers/farm-topology.sh`). The first three are declared in `infra/tofu/`; the
+4th dom0 **XEN-194** (`.170`) is live but **not yet in the elastic tofu model**
+(`infra/tofu/variables.tf` validates only 3 dom0 keys — a known IaC gap). The directive
+makes each dom0 **elastic**: it runs *either* one hardware-maxing big VM *or* several
+small VMs / agent pods, created and destroyed by tofu to fit the live build workload.
 
 ## Locks (operator survey, 2026-06-24)
 
@@ -27,6 +30,13 @@ created and destroyed by tofu to fit the live build workload.
 | **XEN-BIGBOY** | 172.20.145.165 | 12c / 32 GiB · 398 GiB SR | `mcnf-build-big-52` ~10 vCPU / 26 GiB | N× 4 vCPU / 8–16 GiB |
 | XEN-HOME-SERVICES | 172.20.0.9 | 4c / 24 GiB | ~3 vCPU / 18 GiB | 1–2× small |
 | KVM-XCP1 | 172.20.145.193 | 4c / 23 GiB | ~3 vCPU / 18 GiB | 1–2× small |
+| XEN-194 *(4th dom0)* | 172.20.145.194 | 4c (RAM/SR not cold-verified) | ~3 vCPU | 1–2× small |
+
+**XEN-194** is the farm's 4th dom0 (build VM `.170`, heavy cap 2), verified live
+2026-07-01 — a 4-core host like XEN-HOME-SERVICES / KVM-XCP1, but its RAM/SR are not yet
+cold-verified and it is **not yet in the elastic tofu model** (`infra/tofu/variables.tf`
+validates only 3 dom0 keys — a known IaC gap). Canonical roster (4 dom0s / 9 heavy
+slots): `install-helpers/farm-topology.sh`.
 
 ## Architecture (two-level elastic scaler)
 

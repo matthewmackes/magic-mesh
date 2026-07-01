@@ -1,7 +1,8 @@
 # Build Platform — fast builds, least AI tokens, internal e2e/feature/stability testing
 
 *Design locked 2026-06-22 (4-Q survey). Builds on the FARM-AUTO substrate + the
-3-node IaC farm (XEN-HOME-SERVICES/.50, KVM-XCP1/.51, XEN-BIGBOY/.52) and the
+4-node IaC farm (XEN-HOME-SERVICES/.50, KVM-XCP1/.90, XEN-BIGBOY/.130, XEN-194/.170 —
+9 heavy build slots; canonical roster `install-helpers/farm-topology.sh`) and the
 bottleneck analysis that preceded it.*
 
 ## Goal

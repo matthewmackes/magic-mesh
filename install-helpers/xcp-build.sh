@@ -200,6 +200,11 @@ dom0_shape() {
 # No I/O — given the same text it always yields the same records (self-testable).
 topology_from_tfvars() {
   local text="$1" dk shape n base i ip
+  # The 3 elastic-managed dom0s + their build-VM ip_base (cold facts, main.tf). The
+  # farm's 4th dom0 XEN-194 (build VM .170) is NOT in the autoscaler tfvars
+  # (infra/tofu/variables.tf validates only these 3 keys — a known IaC gap), so routing
+  # here covers these 3 + the fixed DEFAULT_BUILD_HOST fallback; pin
+  # MCNF_BUILD_HOST=172.20.0.170 to target .170. Canonical roster: farm-topology.sh.
   for dk in xen-bigboy xen-home-services kvm-xcp1; do
     case "$dk" in
       xen-bigboy)        base="172.20.0.130" ;;

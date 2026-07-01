@@ -9,14 +9,18 @@ IaC state — no single `tofu apply` ever spans both.
 
 | | **DEV** | **PRODUCTION** |
 |---|---|---|
-| Compute | **Xen only** — 3 XCP-ng dom0s | **DigitalOcean** droplets **+ Eagle** |
-| Hosts | XEN-HOME-SERVICES, KVM-XCP1, XEN-BIGBOY | `lighthouse-01` (live), `lighthouse-02` (soon), **Eagle** (LAN, production member) |
+| Compute | **Xen only** — 4 XCP-ng dom0s | **DigitalOcean** droplets **+ Eagle** |
+| Hosts | XEN-HOME-SERVICES, KVM-XCP1, XEN-BIGBOY, XEN-194 | `lighthouse-01` (live), `lighthouse-02` (soon), **Eagle** (LAN, production member) |
 | Workloads | build + test / CI only | the real fleet (lighthouse-anchored) |
 | IaC | `infra/tofu/` (xenorchestra) + Ansible | `infra/tofu/zone1-do/` (digitalocean) + `doctl` |
 | Tofu state | `infra/tofu/terraform.tfstate` | `infra/tofu/zone1-do/terraform.tfstate` |
 
 Eagle is a **production** node (the operator-review machine), not a dev/test box.
 It joins the production mesh anchored by the DO lighthouse(s).
+
+The dev-zone build farm is **4 dom0s / 9 heavy build slots** (XEN-HOME-SERVICES/.50,
+KVM-XCP1/.90, XEN-BIGBOY/.130, XEN-194/.170) — canonical roster in
+`install-helpers/farm-topology.sh`.
 
 ## Promotion pipeline
 
@@ -26,7 +30,7 @@ It joins the production mesh anchored by the DO lighthouse(s).
         │   Dev / Xen  │                    │  Production  │                    │  Production  │
         └──────────────┘                    └──────────────┘                    └──────────────┘
   cut next-version RPM on the          install RPM on the operator-          roll the lighthouse
-  build farm (.50/.51/.52);            review node; join the                 droplet(s) to the new
+  build farm (.50/.90/.130/.170);      review node; join the                 droplet(s) to the new
   L0 build+unit → L1 install →         production mesh; operator             version
   L2 feature → L3 stability            reviews
   on the snapshot-reset pool
