@@ -34,6 +34,10 @@ struct Shell {
     /// Fleet plane — live per-node KVM host health + VM roster, and the
     /// host-targeted VM lifecycle controls (MV-6). Subscribes to the Bus.
     datacenter: datacenter::DatacenterState,
+    /// The always-visible chrome bar's live state — peers + mesh status folded
+    /// from the world-readable mesh-status snapshot, polled on the shared cadence
+    /// (self-gating inside `chrome::show`).
+    chrome: chrome::ChromeState,
 }
 
 impl Shell {
@@ -57,7 +61,7 @@ impl eframe::App for Shell {
         egui::TopBottomPanel::top("mcnf-chrome")
             .exact_height(Style::SP_XL + Style::SP_M)
             .show(ctx, |ui| {
-                if chrome::show(ui, self.expanded) {
+                if chrome::show(ui, &mut self.chrome, self.expanded) {
                     self.toggle_expand();
                 }
             });

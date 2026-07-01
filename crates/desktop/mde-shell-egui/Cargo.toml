@@ -31,5 +31,14 @@ mde-bus = { path = "../../platform/mde-bus" }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 
+# The chrome bar's live Peers + Status fold the world-readable mesh-status
+# snapshot, reusing the render-agnostic LIGHTHOUSE-7 model
+# (`lighthouse_health_from_snapshot` / `LighthouseHealth`) so the bar's health
+# verdict can't diverge from the fleet's. `default-features = false` drops the
+# applet's libcosmic panel shell (E12 retires libcosmic) — only the pure logic
+# layer compiles in. platform tier; the edge points inward (§6), the same reuse
+# the egui panel client (mde-panel-egui) makes.
+mde-cosmic-applet = { path = "../../platform/mde-cosmic-applet", default-features = false }
+
 [lints]
 workspace = true
