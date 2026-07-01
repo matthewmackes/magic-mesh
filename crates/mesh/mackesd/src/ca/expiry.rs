@@ -48,7 +48,12 @@ pub fn ca_cert_days_remaining(ca_cert_path: &std::path::Path, now_unix: i64) -> 
 #[must_use]
 pub fn parse_not_after_unix(raw_json: &str) -> Option<i64> {
     let v: serde_json::Value = serde_json::from_str(raw_json.trim()).ok()?;
-    let not_after = v.get("details")?.get("notAfter")?.as_str()?;
+    // Nebula Cert V1 prints a single object `{"details":…}`; V2 prints a JSON
+    // array of certs `[{"details":…}]`. Accept both (same shape change that
+    // broke fingerprint parsing — found live 2026-07-01: without this the
+    // self-test cert probe showed "expiry not probed" on the V2 fleet).
+    let cert = if v.is_array() { v.get(0)? } else { &v };
+    let not_after = cert.get("details")?.get("notAfter")?.as_str()?;
     chrono::DateTime::parse_from_rfc3339(not_after)
         .ok()
         .map(|dt| dt.timestamp())
@@ -76,6 +81,17 @@ mod tests {
     fn parses_not_after_to_unix_seconds() {
         // 2027-01-01T00:00:00Z == 1_798_761_600.
         assert_eq!(parse_not_after_unix(SAMPLE), Some(1_798_761_600));
+    }
+
+    #[test]
+    fn parses_not_after_from_v2_array() {
+        // Nebula Cert V2: `nebula-cert print -json` wraps the cert in a JSON
+        // array. The same notAfter must parse (found live 2026-07-01 — the V2
+        // fleet showed "expiry not probed" until parse_not_after_unix took the
+        // array's first element).
+        let v2 = format!("[{SAMPLE}]");
+        assert_eq!(parse_not_after_unix(&v2), Some(1_798_761_600));
+        assert!(parse_not_after_unix("[]").is_none()); // empty array ⇒ no cert
     }
 
     #[test]
