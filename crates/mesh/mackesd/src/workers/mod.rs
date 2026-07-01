@@ -549,6 +549,16 @@ pub mod scheduler;
 // integration-gated (typed `SessionStoreError::IntegrationGated`, §7); the pure
 // core + fold + reconcile ship green behind the seam.
 pub mod session_broker;
+// E12-8 — the session_roaming worker: the roaming + persistence POLICY over the
+// E12-5b `session_broker`'s sessions. Drains `action/vdi/roaming`, folds arrivals
+// / per-VM disconnect policy / monitor layouts, and — leader-gated — makes a
+// user's desktops follow them to any Workstation and survive disconnect: pure
+// `reconcile_roaming` (desktops-follow-me), `on_disconnect` (default KeepRunning),
+// and `on_node_loss` (hold reconnectable). REUSES the broker's `VdiSession` +
+// `SessionStore` verbatim (no parallel session model); the `MonitorLayout` rides a
+// companion seam gated by the same `SessionStoreError::IntegrationGated` (§7). The
+// pure policy + layout model + drain/fold/plan pipeline ship green behind the seam.
+pub mod session_roaming;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
 // text clip on the bus + appends to ONE mesh-global `clipboard/history.json`

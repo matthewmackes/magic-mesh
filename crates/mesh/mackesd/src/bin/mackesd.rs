@@ -6267,6 +6267,29 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("session_broker".into());
         }
+        // E12-8 — the session_roaming worker: the roaming + persistence POLICY over
+        // the E12-5b session_broker's sessions. Drains `action/vdi/roaming`, folds
+        // arrivals / per-VM disconnect policy / monitor layouts, and — leader-gated —
+        // makes a user's desktops follow them to any Workstation (reconcile_roaming)
+        // and survive disconnect (on_disconnect default KeepRunning; on_node_loss
+        // holds reconnectable). Rank-0-default like session_broker (runs everywhere);
+        // the shared leader lock keeps an N-node mesh from multi-writing. REUSES the
+        // broker's VdiSession + SessionStore; the live cross-peer persist stays
+        // integration-gated through MeshSessionStore + the companion MeshLayoutStore
+        // (typed IntegrationGated, §7).
+        if mackesd_core::worker_role::runs("session_roaming", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::session_roaming::SessionRoamingWorker::new(
+                    workgroup_root.clone(),
+                    node_id.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("session_roaming".into());
+        }
         // OV-7.a (v2.6) — health reconciler. Polls each known
         // peer's QNM-Shared heartbeat.json every 5 s, applies the
         // telemetry::health_state_from_age threshold table, writes
