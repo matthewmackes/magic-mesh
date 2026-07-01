@@ -1,9 +1,12 @@
 //! The Workbench — the five-plane mesh-control nav the chrome bar expands into.
 //!
-//! E12-3 ships the *skeleton*: the five scope-first planes as a selectable rail
-//! beside an honest, descriptive content pane. Live Bus data (peers, sessions,
-//! provisioning state) wires into each plane in a later unit; nothing here fakes
-//! a metric (governance §7) — the blurbs are descriptive copy, not stand-in data.
+//! E12-3 shipped the *skeleton*: the five scope-first planes as a selectable rail
+//! beside an honest content pane. Live data then wires into each plane: **This
+//! Node** (WB-ThisNode — this host's role / overlay IP / presence + heartbeat /
+//! daemon health, off the mesh-status snapshot) and **Fleet** (MV-6 — per-node KVM
+//! reality off the Bus) are live; Controller / Network / Provisioning still show
+//! descriptive copy until their units land. Nothing here fakes a metric (governance
+//! §7) — a plane shows live data or an honest blurb, never stand-in data.
 
 use mde_egui::egui::{self, RichText};
 use mde_egui::Style;
@@ -67,12 +70,16 @@ impl Plane {
 
 /// Render the expanded Workbench: a title, the plane rail, and the selected
 /// plane's content pane. `selected` is read and written, so a rail click changes
-/// the active plane. The Fleet plane renders live per-node KVM reality from
-/// `datacenter` (MV-6); the other planes still show descriptive copy.
+/// the active plane. The This Node plane renders this host's live status from
+/// `thisnode` (WB-ThisNode) and the Fleet plane renders live per-node KVM reality
+/// from `datacenter` (MV-6); the remaining planes still show descriptive copy.
 pub(crate) fn show(
     ui: &mut egui::Ui,
     selected: &mut Plane,
     datacenter: &mut crate::datacenter::DatacenterState,
+    // Read-only: the This Node plane only renders its polled status (`&self`),
+    // unlike the Fleet plane whose `datacenter` publishes lifecycle actions.
+    thisnode: &crate::thisnode::ThisNodeState,
 ) {
     ui.add_space(Style::SP_L);
     ui.heading(
@@ -118,15 +125,20 @@ pub(crate) fn show(
             ui.add_space(Style::SP_XS);
             ui.colored_label(Style::TEXT_DIM, selected.blurb());
             ui.add_space(Style::SP_M);
-            if *selected == Plane::Fleet {
+            match *selected {
+                // WB-ThisNode — this host's live status (role, overlay IP,
+                // presence + heartbeat, daemon health, peer/leader context) off the
+                // world-readable mesh-status snapshot.
+                Plane::ThisNode => thisnode.show(ui),
                 // MV-6 — the Fleet plane drives live KVM host health + the VM
                 // roster off the Bus (Podman container rows follow once MV-4 lands).
-                datacenter.show(ui);
-            } else {
-                ui.colored_label(
-                    Style::TEXT_DIM,
-                    "Live mesh data wires into this plane in a later unit.",
-                );
+                Plane::Fleet => datacenter.show(ui),
+                _ => {
+                    ui.colored_label(
+                        Style::TEXT_DIM,
+                        "Live mesh data wires into this plane in a later unit.",
+                    );
+                }
             }
         });
     });
