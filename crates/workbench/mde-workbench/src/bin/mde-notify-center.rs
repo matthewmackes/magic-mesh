@@ -22,11 +22,15 @@ use cosmic::iced::platform_specific::runtime::wayland::layer_surface::SctkLayerS
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
     get_layer_surface, Anchor, KeyboardInteractivity, Layer,
 };
-use cosmic::iced::widget::{button, column, container, row, scrollable, text, Space};
+use cosmic::iced::widget::{button, column, container, mouse_area, row, scrollable, text, Space};
 use cosmic::iced::{window, Element, Length, Padding, Subscription, Task, Theme};
 use mackes_mesh_types::lighthouse::{self, Beacon};
 use mde_notify::{severity_token, AlertItem, AlertTail, Severity};
 use mde_theme::{mde_icon, Icon, IconSize, Palette};
+// NOTIFY-REDESIGN-C — the reusable detail-viewer contract (render-agnostic
+// model lives in the lib; the shared modal shell + per-item providers below
+// are the World-2 iced glue).
+use mde_workbench::detail_viewer::{ActionTone, DetailAction, DetailContent};
 
 use motion::HubAnim;
 // World-2 (raw `cosmic::iced`) layer-shell daemon — use the iced widgets +
@@ -63,6 +67,27 @@ const VM_ICON_SQUARE_PX: f32 = 48.0;
 const VM_ICON_GLYPH_PX: f32 = 22.0;
 /// Full card width (tile + caption column).
 const VM_ICON_CARD_PX: f32 = 56.0;
+/// NOTIFY-REDESIGN-C — the detail modal card width as a fraction of the Hub
+/// surface (~70%, the viewer spec), expressed as `FillPortion` weights: the
+/// card takes [`DETAIL_CARD_PORTION`] of `2 × `[`DETAIL_GUTTER_PORTION`] `+`
+/// [`DETAIL_CARD_PORTION`] and is capped at [`DETAIL_MAX_W`] px. Component
+/// dimensions (like the VM_ICON_* tiles), single-sourced here.
+const DETAIL_CARD_PORTION: u16 = 14;
+/// Each side gutter beside the centered detail card (3 + 14 + 3 = 20 → 70%).
+const DETAIL_GUTTER_PORTION: u16 = 3;
+/// Max detail-card width (px) — the ≤760 px cap from the viewer spec.
+const DETAIL_MAX_W: f32 = 760.0;
+/// A verbatim raw block taller than [`DETAIL_RAW_SCROLL_LINES`] lines scrolls
+/// within this fixed viewport (px) so a long clipboard clip never grows the
+/// modal past the surface; a short block renders at its natural height.
+const DETAIL_RAW_MAX_H: f32 = 220.0;
+/// Line count above which the raw block gets its own bounded scroll viewport.
+const DETAIL_RAW_SCROLL_LINES: usize = 12;
+/// The alpha of the severity-tint wash on the detail hero band — a light wash
+/// (like the palette's 8%/12% hover/active tints) so the band reads as tinted
+/// while the title text over it stays legible. Single-sourced (§4, no bare
+/// alpha literal at the call site).
+const DETAIL_HERO_TINT_ALPHA: f32 = 0.16;
 
 /// Single-instance guard — dep-free pidfile so re-launching the Action Center
 /// (e.g. the applet bell pressed twice) never STACKS a second full-height
@@ -383,8 +408,16 @@ struct Center {
     /// NOTIFY-REDESIGN-B — whether the Music icon's now-playing popover is open.
     /// The footer Music ICON replaced the old full-width Now-Playing bar; the
     /// track + transport now live in this on-demand popover (toggled by clicking
-    /// the icon), so the resting footer stays a compact two-icon strip.
+    /// the icon), so the resting footer stays a compact two-icon strip. Music
+    /// keeps this lighter inline popover for quick transport (the viewer spec's
+    /// sanctioned option); the OTHER item types open the C detail viewer below.
     music_popover: bool,
+    /// NOTIFY-REDESIGN-C — the currently-open hub detail viewer, or `None` when
+    /// closed. Built fresh from live state when an item is clicked (a
+    /// notification / clipboard row / lighthouse beacon / voice icon), rendered
+    /// by the one shared center-modal shell ([`detail_modal`]). One field serves
+    /// every item kind — the operator's REUSE directive.
+    detail: Option<DetailContent<Message>>,
 }
 
 impl Center {
@@ -411,6 +444,7 @@ impl Center {
             opened_at: std::time::Instant::now(),
             reduce_motion,
             music_popover: false,
+            detail: None,
         }
     }
 
@@ -530,9 +564,11 @@ enum Message {
     /// LIGHTHOUSE-3/4 — a lighthouse card was pressed: open the Workbench
     /// Lighthouses tab focused on this lighthouse (by hostname).
     OpenLighthouse(String),
-    /// CLIP-VIEW-1 — load a clip row's text into THIS node's Wayland clipboard
-    /// (`wl-copy`). The carried text is the verbatim clip, not the preview.
-    ClipCopy(String),
+    /// NOTIFY-REDESIGN-C — load arbitrary text onto THIS node's Wayland
+    /// clipboard (`wl-copy`). The one copy path behind the detail viewer's
+    /// Copy-all / Copy-raw buttons (generalizing the old CLIP-VIEW-1 `ClipCopy`,
+    /// which only copied a clip's verbatim text).
+    CopyText(String),
     /// CLIP-VIEW-1 — toggle an entry's pin mesh-wide (`action/clipboard/{pin,
     /// unpin}`). Carries the entry id + its current pinned state.
     ClipTogglePin(String, bool),
@@ -541,6 +577,38 @@ enum Message {
     /// CLIP-VIEW-1 — clear every UNPINNED entry mesh-wide; pinned survive
     /// (`action/clipboard/clear`).
     ClipClearAll,
+    /// NOTIFY-REDESIGN-C — open the shared detail viewer for the notification
+    /// with this id (rebuilt fresh from the live item).
+    OpenNotifDetail(String),
+    /// NOTIFY-REDESIGN-C — open the detail viewer for the clipboard entry by id.
+    OpenClipDetail(String),
+    /// NOTIFY-REDESIGN-C — open the detail viewer for the lighthouse beacon by
+    /// hostname.
+    OpenBeaconDetail(String),
+    /// NOTIFY-REDESIGN-C — open the detail viewer for the live voice snapshot
+    /// (call / registration detail + Open Voice HUD).
+    OpenVoiceDetail,
+    /// NOTIFY-REDESIGN-C — close JUST the detail viewer (the viewer X + a
+    /// scrim-click). The Hub stays open (see [`Message::EscPressed`] for the
+    /// layered Esc).
+    CloseDetail,
+    /// NOTIFY-REDESIGN-C — a benign click-absorber for the modal card, so a
+    /// click on the card body does NOT fall through the scrim and dismiss the
+    /// viewer (only the scrim margin dismisses).
+    DetailNoop,
+    /// NOTIFY-REDESIGN-C — Esc: layered dismissal. First Esc closes an open
+    /// viewer; a second Esc (viewer already closed) closes the Hub.
+    EscPressed,
+    /// NOTIFY-REDESIGN-C — mark the notification `id` read (`true`) / unread
+    /// (`false`) per its `read` field; the open viewer rebuilds so the toggle
+    /// label flips.
+    DetailMarkRead(String, bool),
+    /// NOTIFY-REDESIGN-C — dismiss (remove) the notification `id` and close the
+    /// viewer.
+    DetailDismiss(String),
+    /// NOTIFY-REDESIGN-C — mute future alerts from this source label via the
+    /// shared `SoundSettings` muted-sources store, then close the viewer.
+    MuteSource(String),
 }
 
 /// NOTIFY-AC — fetch the Now-Playing snapshot over the bus (best-effort, short
@@ -823,12 +891,14 @@ fn cover_art_task(cover_id: String) -> Task<Message> {
 fn subscription(s: &Center) -> Subscription<Message> {
     let poll = cosmic::iced::time::every(std::time::Duration::from_secs(POLL_SECS))
         .map(|_| Message::Refresh);
-    // Esc closes the panel (W10 Action Center dismiss).
+    // Esc dismissal is LAYERED (NOTIFY-REDESIGN-C): the arm decides whether it
+    // closes an open detail viewer or the Hub, so the subscription just reports
+    // the keypress (it can't read state at event time).
     let esc = cosmic::iced::event::listen_with(|event, _status, _window| {
         use cosmic::iced::keyboard::{key::Named, Event as Kbd, Key};
         if let cosmic::iced::Event::Keyboard(Kbd::KeyPressed { key, .. }) = event {
             if key == Key::Named(Named::Escape) {
-                return Some(Message::Close);
+                return Some(Message::EscPressed);
             }
         }
         None
@@ -1061,10 +1131,10 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
                 Message::MusicLoaded,
             );
         }
-        Message::ClipCopy(text) => {
-            // CLIP-VIEW-1 — load the entry onto THIS node's clipboard. No re-list:
-            // the capture worker re-syncs/debounces it, and the entry is already
-            // at/near the top of the shared history.
+        Message::CopyText(text) => {
+            // NOTIFY-REDESIGN-C — the one wl-copy path behind Copy-all / Copy-raw
+            // (and a clip's Copy-raw). No re-list: `load_into_clipboard` detaches,
+            // and the capture worker re-syncs/debounces any clip echo.
             load_into_clipboard(&text);
         }
         Message::ClipTogglePin(id, pinned) => {
@@ -1074,10 +1144,87 @@ fn update(state: &mut Center, message: Message) -> Task<Message> {
         }
         Message::ClipDelete(id) => {
             state.clips = clip_mutate("delete", Some(&id));
+            // NOTIFY-REDESIGN-C — the clip detail viewer's Dismiss routes here;
+            // close it after the delete. Harmless when fired from the row button
+            // (no viewer open → already `None`).
+            state.detail = None;
         }
         Message::ClipClearAll => {
             // Mesh-wide clear of unpinned entries; pinned survive everywhere.
             state.clips = clip_mutate("clear", None);
+        }
+        Message::OpenNotifDetail(id) => {
+            // NOTIFY-REDESIGN-C — build the viewer fresh from the live item.
+            let now = now_ms();
+            state.detail = state
+                .items
+                .iter()
+                .find(|i| i.id == id)
+                .map(|item| notif_detail(item, now));
+        }
+        Message::OpenClipDetail(id) => {
+            let now = now_ms();
+            state.detail = state
+                .clips
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| clip_detail(c, now));
+        }
+        Message::OpenBeaconDetail(host) => {
+            state.detail = state
+                .lighthouses
+                .iter()
+                .find(|b| b.hostname == host)
+                .map(beacon_detail);
+        }
+        Message::OpenVoiceDetail => {
+            state.detail = Some(voice_detail(state.voice.as_ref()));
+        }
+        Message::CloseDetail => {
+            // Layered dismissal: the viewer X + a scrim-click close JUST the
+            // viewer; the Hub stays open.
+            state.detail = None;
+        }
+        Message::DetailNoop => {
+            // A card-body click was absorbed so it can't fall through the scrim.
+        }
+        Message::EscPressed => {
+            // First Esc closes an open viewer; a second Esc (none open) closes
+            // the Hub — the same exit the header ✕ / `Close` takes.
+            if state.detail.is_some() {
+                state.detail = None;
+            } else {
+                std::process::exit(0);
+            }
+        }
+        Message::DetailMarkRead(id, read) => {
+            // Set the read flag, then rebuild the open viewer so the toggle's
+            // label flips (Mark read ⇄ Mark unread) in place.
+            if let Some(item) = state.items.iter_mut().find(|i| i.id == id) {
+                item.read = read;
+            }
+            let now = now_ms();
+            if let Some(item) = state.items.iter().find(|i| i.id == id) {
+                state.detail = Some(notif_detail(item, now));
+            }
+        }
+        Message::DetailDismiss(id) => {
+            // Remove the alert by id (the per-item peer of Clear all) + close.
+            state.items.retain(|i| i.id != id);
+            state.detail = None;
+        }
+        Message::MuteSource(label) => {
+            // Suppress future alerts from this source via the SAME shared
+            // `notify-sound.yaml` the toast/sound + Settings paths read, so the
+            // mute is authoritative mesh-wide, not a Hub-local flag.
+            if let Some(dir) = mde_bus::client_data_dir() {
+                let mut settings = mde_notify::SoundSettings::load(&dir);
+                if !settings.muted_sources.contains(&label) {
+                    settings.muted_sources.push(label);
+                    let _ = settings.save(&dir);
+                }
+            }
+            state.detail = None;
         }
         Message::MarkAllRead => {
             for it in &mut state.items {
@@ -1394,7 +1541,14 @@ fn view(state: &Center, _id: window::Id) -> Element<'_, Message> {
     .align_y(cosmic::iced::alignment::Vertical::Bottom)
     .padding(Padding::from([0u16, 0u16, 6u16, 0u16]))
     .into();
-    cosmic::iced::widget::Stack::with_children(vec![content, watermark])
+    let mut layers: Vec<Element<'_, Message>> = vec![content, watermark];
+    // NOTIFY-REDESIGN-C — the shared detail viewer floats above everything as a
+    // centered modal over a dimming scrim (layered dismissal: viewer X / scrim /
+    // Esc). Rendered only while a hub item is open; one shell for every kind.
+    if let Some(detail) = state.detail.as_ref() {
+        layers.push(detail_modal(detail, p, space));
+    }
+    cosmic::iced::widget::Stack::with_children(layers)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
@@ -1552,9 +1706,9 @@ fn music_icon_card(
 /// over a "Voice" caption. The glyph BLINKS (accent alpha breathe riding the beam
 /// clock) while on a call, shows the ok-tone when registered/ready, and greys when
 /// idle. A filled dot marks an active agent vs the hollow idle dot (a shape cue, so
-/// state never rests on colour alone — the NOTIFY-STATUS-STRIP a11y rule). Pressing
-/// it opens the Voice HUD (the existing detached-spawn launch idiom). Never drawn
-/// when `Hidden`.
+/// state never rests on colour alone — the NOTIFY-STATUS-STRIP a11y rule).
+/// NOTIFY-REDESIGN-C — pressing it opens the shared detail viewer (call /
+/// registration detail + an "Open Voice HUD" action). Never drawn when `Hidden`.
 fn voice_icon_card(
     st: VoiceIconState,
     beam_step: u16,
@@ -1585,7 +1739,7 @@ fn voice_icon_card(
             .into(),
         base,
         "Voice",
-        Message::OpenApp("mde-voice-hud"),
+        Message::OpenVoiceDetail,
         p,
     )
 }
@@ -1808,8 +1962,9 @@ fn notifications_tab(
 /// severity icon + the message in prominent type, wrapped in the zebra-shaded
 /// card with the per-item slide/blink entrance motion (the NOTIFY-HUB-2 motion is
 /// kept; only the grouping/stacking is gone). The row is message-ONLY at rest —
-/// no sender/host/age subline — and clicking it is a no-op for now (the click-
-/// opened detail viewer is a separate later unit).
+/// no sender/host/age subline — and NOTIFY-REDESIGN-C wires the click to open the
+/// shared detail viewer (source / host / ts / id / raw + actions), where A had
+/// left it a no-op.
 fn notification_row(
     item: &AlertItem,
     idx: usize,
@@ -1827,13 +1982,25 @@ fn notification_row(
         text(item.title.clone()).size(14).color(msg_color),
     ]
     .align_y(cosmic::iced::Alignment::Center);
-    motioned_card(
+    let card = motioned_card(
         head.into(),
         idx,
         item.severity,
         anim.card_motion(&item.id, anim_now),
         p,
-    )
+    );
+    // NOTIFY-REDESIGN-C — the whole row opens the shared detail viewer. A
+    // transparent, full-width, zero-padding button so the zebra + entrance-motion
+    // card inside renders exactly as before, but the row is now clickable.
+    button(card)
+        .on_press(Message::OpenNotifDetail(item.id.clone()))
+        .width(Length::Fill)
+        .padding(0)
+        .style(|_, _| button::Style {
+            background: None,
+            ..Default::default()
+        })
+        .into()
 }
 
 /// NOTIFY-REDESIGN-A — the Clipboard tab body: the mesh-global clipboard history
@@ -1889,9 +2056,10 @@ fn clip_row(c: &ClipRow, idx: usize, now_ms: i64, p: Palette) -> Element<'static
     let then_ms = notify_clipboard::rfc3339_to_epoch(&c.time).map_or(now_ms, |s| s * 1000);
     let meta = notify_clipboard::meta_label(&c.source, &format_age(then_ms, now_ms));
 
-    // The text + meta stack — the whole thing is a flat click-to-copy button so
-    // a click loads the verbatim clip onto this node (ClipCopy carries the full
-    // text, not the truncated preview).
+    // NOTIFY-REDESIGN-C — the text + meta stack is a flat button that OPENS the
+    // shared detail viewer (full verbatim clip in the mono raw block + Copy /
+    // Dismiss), superseding the old click-to-copy — the preview here is
+    // truncated, the viewer shows the whole clip.
     let body = column![
         text(preview).size(12).color(p.text.into_cosmic_color()),
         text(meta).size(10).color(p.text_muted.into_cosmic_color()),
@@ -1899,7 +2067,7 @@ fn clip_row(c: &ClipRow, idx: usize, now_ms: i64, p: Palette) -> Element<'static
     .spacing(1)
     .width(Length::Fill);
     let copy = button(body)
-        .on_press(Message::ClipCopy(c.text.clone()))
+        .on_press(Message::OpenClipDetail(c.id.clone()))
         .width(Length::Fill)
         .padding(0)
         .style(|_t, _s| cosmic::iced::widget::button::Style {
@@ -1951,8 +2119,9 @@ fn clip_row(c: &ClipRow, idx: usize, now_ms: i64, p: Palette) -> Element<'static
 }
 
 /// LIGHTHOUSE-3 — one square beacon card: the animated beam square (border in
-/// the status color) over name / overlay IP / status word (Q16). The whole card
-/// presses through to the Workbench Lighthouses tab (Q19).
+/// the status color) over name / overlay IP / status word (Q16). NOTIFY-REDESIGN-C
+/// — the card now opens the shared detail viewer (host / health / role, with an
+/// "Open Lighthouses tab" action that reuses the `OpenLighthouse` deep-link).
 fn beacon_card(b: &Beacon, beam_step: u16, p: Palette) -> Element<'static, Message> {
     let healthy = b.healthy();
     let color = if healthy { p.beacon_healthy } else { p.danger };
@@ -1986,7 +2155,7 @@ fn beacon_card(b: &Beacon, beam_step: u16, p: Palette) -> Element<'static, Messa
     .align_x(cosmic::iced::Alignment::Center)
     .width(Length::Fixed(78.0));
     button(body)
-        .on_press(Message::OpenLighthouse(b.hostname.clone()))
+        .on_press(Message::OpenBeaconDetail(b.hostname.clone()))
         .style(|_, _| button::Style {
             background: None,
             ..Default::default()
@@ -2243,6 +2412,511 @@ fn tab_segment(
         }
     })
     .into()
+}
+
+// ---------------------------------------------------------------------------
+// NOTIFY-REDESIGN-C — the reusable hub detail viewer: the per-item providers
+// (each maps its own type → a `DetailContent`) + the ONE shared center-modal
+// shell that renders any `DetailContent`. Consumers wired: notification
+// (primary), clipboard row, lighthouse beacon, voice. Music keeps its lighter
+// art-rich popover for quick transport (the viewer spec's sanctioned option).
+// ---------------------------------------------------------------------------
+
+/// NOTIFY-REDESIGN-C — the **notification** consumer (primary).
+///
+/// Title / body / severity / source / host / absolute+relative ts / topic / id,
+/// the verbatim event in the raw block, and the full action set. Actions show
+/// only when applicable — "Open source" only for a host-bearing alert (it
+/// deep-links to that host in the Workbench mesh view, reusing the existing
+/// `OpenLighthouse` deep-link). Copy-all / Copy-raw are shell-provided.
+fn notif_detail(item: &AlertItem, now: i64) -> DetailContent<Message> {
+    let when = format!(
+        "{} · {} ago",
+        fmt_utc(item.ts_unix_ms),
+        format_age(item.ts_unix_ms, now)
+    );
+    let mut c: DetailContent<Message> = DetailContent::new(item.title.clone())
+        .with_severity(item.severity)
+        .field("Source", item.source.label())
+        .field("Host", item.host.clone().unwrap_or_default())
+        .field("When", when)
+        .field("Topic", item.topic.clone())
+        .field("ID", item.id.clone())
+        .with_body(item.body.clone())
+        .with_raw(notif_raw(item));
+    if let Some(host) = &item.host {
+        c = c.action(DetailAction::new(
+            "Open source",
+            ActionTone::Neutral,
+            Message::OpenLighthouse(host.clone()),
+        ));
+    }
+    let (mark_label, mark_to) = if item.read {
+        ("Mark unread", false)
+    } else {
+        ("Mark read", true)
+    };
+    c.action(DetailAction::new(
+        mark_label,
+        ActionTone::Neutral,
+        Message::DetailMarkRead(item.id.clone(), mark_to),
+    ))
+    .action(DetailAction::new(
+        "Mute source",
+        ActionTone::Neutral,
+        Message::MuteSource(item.source.label()),
+    ))
+    .action(DetailAction::new(
+        "Dismiss",
+        ActionTone::Danger,
+        Message::DetailDismiss(item.id.clone()),
+    ))
+}
+
+/// NOTIFY-REDESIGN-C — the notification's verbatim structured block for the raw
+/// pane: the normalized alert as pretty JSON (the one copy-pasteable "event").
+fn notif_raw(item: &AlertItem) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "topic": item.topic,
+        "id": item.id,
+        "severity": format!("{:?}", item.severity),
+        "source": item.source.label(),
+        "host": item.host,
+        "ts_unix_ms": item.ts_unix_ms,
+        "title": item.title,
+        "body": item.body,
+        "read": item.read,
+    }))
+    .unwrap_or_default()
+}
+
+/// NOTIFY-REDESIGN-C — the **clipboard** consumer.
+///
+/// The FULL verbatim clip in the mono raw block + source-node + age; Copy is the
+/// shell's Copy-raw, plus a Dismiss that deletes the entry mesh-wide.
+fn clip_detail(c: &ClipRow, now: i64) -> DetailContent<Message> {
+    let then_ms = notify_clipboard::rfc3339_to_epoch(&c.time).map_or(now, |s| s * 1000);
+    let age = format!("{} ago", format_age(then_ms, now));
+    DetailContent::new(notify_clipboard::preview(&c.text, 60))
+        .field("From", c.source.clone())
+        .field("Age", age)
+        .field("Pinned", if c.pinned { "Yes" } else { "" })
+        .with_raw(c.text.clone())
+        .action(DetailAction::new(
+            "Dismiss",
+            ActionTone::Danger,
+            Message::ClipDelete(c.id.clone()),
+        ))
+}
+
+/// NOTIFY-REDESIGN-C — the **lighthouse beacon** consumer: host / overlay IP /
+/// health tier / role; the action opens the Lighthouses tab (reusing the
+/// existing `OpenLighthouse` deep-link).
+fn beacon_detail(b: &Beacon) -> DetailContent<Message> {
+    DetailContent::new(b.hostname.clone())
+        .field("Overlay IP", b.overlay_ip.clone().unwrap_or_default())
+        .field("Health", b.status.word().to_string())
+        .field("Role", if b.is_master { "Leader" } else { "Follower" })
+        .with_body(format!(
+            "Lighthouse beacon — {}.",
+            if b.healthy() { "healthy" } else { "unhealthy" }
+        ))
+        .action(DetailAction::new(
+            "Open Lighthouses tab",
+            ActionTone::Primary,
+            Message::OpenLighthouse(b.hostname.clone()),
+        ))
+}
+
+/// NOTIFY-REDESIGN-C — the **voice** consumer.
+///
+/// The live call / registration state in the body + fields; the action opens the
+/// Voice HUD (the existing detached-spawn launch). `None` (defensive — the icon
+/// hides when absent) still renders an honest empty state.
+fn voice_detail(v: Option<&VoiceStatus>) -> DetailContent<Message> {
+    let mut c: DetailContent<Message> = DetailContent::new("Voice");
+    match v {
+        Some(v) => {
+            let word = if v.listening {
+                "On a call"
+            } else if v.registered {
+                "Registered · ready"
+            } else {
+                "Idle"
+            };
+            c = c
+                .field("Status", word)
+                .field("Registered", if v.registered { "Yes" } else { "No" })
+                .field("On call", if v.listening { "Yes" } else { "No" })
+                .field("Agent", if v.fresh { "Live" } else { "Stale" })
+                .with_body(format!("Voice agent is {}.", word.to_ascii_lowercase()));
+        }
+        None => {
+            c = c.with_body("No voice agent is running on this node.");
+        }
+    }
+    c.action(DetailAction::new(
+        "Open Voice HUD",
+        ActionTone::Primary,
+        Message::OpenApp("mde-voice-hud"),
+    ))
+}
+
+/// NOTIFY-REDESIGN-C — the ONE shared center-modal shell that renders any
+/// [`DetailContent`].
+///
+/// A severity-tinted hero band (big status icon + title + viewer ✕) over an
+/// elevated `raised` card with the modal drop-shadow, floating on a dimming
+/// scrim. Layered dismissal: the ✕ + a scrim-click send `CloseDetail` (Esc is
+/// handled in `update`); a `mouse_area` around the card absorbs body clicks so
+/// they don't fall through the scrim. The body carries the field table, the sans
+/// body, the mono raw block, and the domain actions; Copy-all / Copy-raw are
+/// added here (from `copy_all_text` / `raw`). Responsive ~70 % width capped at
+/// [`DETAIL_MAX_W`] px.
+fn detail_modal(
+    content: &DetailContent<Message>,
+    p: Palette,
+    space: mde_theme::Space,
+) -> Element<'static, Message> {
+    let sizes = mde_theme::FontSize::defaults();
+    let radii = mde_theme::Radii::defaults();
+
+    let mut body =
+        column![detail_hero(&content.title, content.severity, p, space)].spacing(space.sm2);
+    if !content.fields.is_empty() {
+        body = body.push(detail_field_table(&content.fields, p, space));
+    }
+    if !content.body.trim().is_empty() {
+        body = body.push(
+            text(content.body.clone())
+                .size(sizes.body)
+                .color(p.text.into_cosmic_color()),
+        );
+    }
+    // Copy-all sits by the content (the whole detail as text).
+    body = body.push(
+        row![
+            Space::new().width(Length::Fill),
+            detail_action_btn(
+                "Copy all",
+                ActionTone::Neutral,
+                Message::CopyText(content.copy_all_text()),
+                p,
+                space,
+            ),
+        ]
+        .align_y(cosmic::iced::Alignment::Center),
+    );
+    // Raw / structured block + Copy-raw, only when there's a verbatim block.
+    if content.has_raw() {
+        body = body
+            .push(
+                text("Raw event")
+                    .size(sizes.caption)
+                    .color(p.text_muted.into_cosmic_color()),
+            )
+            .push(detail_raw_block(&content.raw, p, space))
+            .push(
+                row![
+                    Space::new().width(Length::Fill),
+                    detail_action_btn(
+                        "Copy raw",
+                        ActionTone::Neutral,
+                        Message::CopyText(content.raw.clone()),
+                        p,
+                        space,
+                    ),
+                ]
+                .align_y(cosmic::iced::Alignment::Center),
+            );
+    }
+    // Footer domain actions (Open source · Mark read · Mute · Dismiss …).
+    if !content.actions.is_empty() {
+        let mut actions = row![Space::new().width(Length::Fill)]
+            .spacing(space.sm)
+            .align_y(cosmic::iced::Alignment::Center);
+        for a in &content.actions {
+            actions = actions.push(detail_action_btn(
+                &a.label,
+                a.tone,
+                a.on_press.clone(),
+                p,
+                space,
+            ));
+        }
+        body = body.push(actions);
+    }
+
+    // The elevated card — `raised` fill, hairline border, modal drop-shadow,
+    // sized to ~70 % of the surface (its `FillPortion` share) capped at the
+    // spec's ≤760 px.
+    let card = container(body)
+        .padding(Padding::from([space.md, space.md2]))
+        .width(Length::FillPortion(DETAIL_CARD_PORTION))
+        .max_width(DETAIL_MAX_W)
+        .style(move |_| container::Style {
+            background: Some(cosmic::iced::Background::Color(
+                p.raised.into_cosmic_color(),
+            )),
+            border: cosmic::iced::Border {
+                color: p.border.into_cosmic_color(),
+                width: 1.0,
+                radius: f32::from(radii.modal).into(),
+            },
+            shadow: modal_shadow(),
+            ..Default::default()
+        });
+    // A `mouse_area` around the card absorbs body clicks so they can't fall
+    // through the scrim and dismiss the viewer.
+    let card_area = mouse_area(card).on_press(Message::DetailNoop);
+    // Center the card at ~70 % width (equal gutters) + vertically.
+    let centered = container(
+        row![
+            Space::new().width(Length::FillPortion(DETAIL_GUTTER_PORTION)),
+            card_area,
+            Space::new().width(Length::FillPortion(DETAIL_GUTTER_PORTION)),
+        ]
+        .width(Length::Fill)
+        .align_y(cosmic::iced::Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_y(cosmic::iced::alignment::Vertical::Center);
+    // The dimming scrim BELOW the card layer; a click on it closes the viewer.
+    let scrim = mouse_area(
+        container(Space::new().width(Length::Fill).height(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(cosmic::iced::Background::Color(scrim_color())),
+                ..Default::default()
+            }),
+    )
+    .on_press(Message::CloseDetail);
+
+    cosmic::iced::widget::Stack::with_children(vec![scrim.into(), centered.into()])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+/// NOTIFY-REDESIGN-C — the modal's severity-coloured hero band.
+///
+/// A tint wash over the card, the large shape-distinct status icon (severity
+/// reads by shape+colour, never colour alone — the a11y rule), the title, and
+/// the viewer ✕. A non-severity item (`None`) uses the accent tint + the generic
+/// notification glyph.
+fn detail_hero(
+    title: &str,
+    severity: Option<Severity>,
+    p: Palette,
+    space: mde_theme::Space,
+) -> Element<'static, Message> {
+    let sizes = mde_theme::FontSize::defaults();
+    let radii = mde_theme::Radii::defaults();
+    let tint = match severity {
+        Some(s) => severity_token(s, &p),
+        None => p.accent,
+    };
+    let icon = match severity {
+        Some(s) => severity_icon(s),
+        None => Icon::Notification,
+    };
+    // Reuse the alpha-over compositor for the tint wash over the raised card.
+    let band_bg = blink_shade(p.raised, tint.with_alpha(DETAIL_HERO_TINT_ALPHA));
+    let head = row![
+        icon_svg(icon, IconSize::PanelHeader, tint.into_cosmic_color()),
+        Space::new().width(Length::Fixed(f32::from(space.sm))),
+        text(title.to_string())
+            .size(sizes.section)
+            .color(p.text.into_cosmic_color())
+            .width(Length::Fill),
+        detail_action_btn("✕", ActionTone::Neutral, Message::CloseDetail, p, space),
+    ]
+    .align_y(cosmic::iced::Alignment::Center);
+    container(head)
+        .padding(Padding::from([space.sm, space.sm2]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(cosmic::iced::Background::Color(band_bg)),
+            border: cosmic::iced::Border {
+                color: cosmic::iced::Color::TRANSPARENT,
+                width: 0.0,
+                radius: f32::from(radii.md).into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// NOTIFY-REDESIGN-C — the modal's structured field table: muted `label` +
+/// `value` rows split on a shared column ratio.
+fn detail_field_table(
+    fields: &[(String, String)],
+    p: Palette,
+    space: mde_theme::Space,
+) -> Element<'static, Message> {
+    let sizes = mde_theme::FontSize::defaults();
+    let mut col = column![].spacing(space.xs);
+    for (label, value) in fields {
+        col = col.push(
+            row![
+                text(label.clone())
+                    .size(sizes.caption)
+                    .color(p.text_muted.into_cosmic_color())
+                    .width(Length::FillPortion(2)),
+                text(value.clone())
+                    .size(sizes.body)
+                    .color(p.text.into_cosmic_color())
+                    .width(Length::FillPortion(5)),
+            ]
+            .spacing(space.sm)
+            .align_y(cosmic::iced::Alignment::Start),
+        );
+    }
+    col.into()
+}
+
+/// NOTIFY-REDESIGN-C — the mono raw / structured block.
+///
+/// The ONLY monospace pane (Carbon sans elsewhere), on the layer-0 surface so it
+/// reads as a code block. A payload taller than [`DETAIL_RAW_SCROLL_LINES`] lines
+/// scrolls within a bounded viewport so a long clipboard clip never grows the
+/// modal off-surface.
+fn detail_raw_block(raw: &str, p: Palette, space: mde_theme::Space) -> Element<'static, Message> {
+    let sizes = mde_theme::FontSize::defaults();
+    let radii = mde_theme::Radii::defaults();
+    let mono = text(raw.to_string())
+        .size(sizes.mono)
+        .font(cosmic::iced::Font::MONOSPACE)
+        .color(p.text.into_cosmic_color());
+    let inner: Element<'static, Message> = if raw.lines().count() > DETAIL_RAW_SCROLL_LINES {
+        scrollable(mono)
+            .height(Length::Fixed(DETAIL_RAW_MAX_H))
+            .into()
+    } else {
+        mono.into()
+    };
+    container(inner)
+        .padding(Padding::from([space.sm, space.sm2]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(cosmic::iced::Background::Color(
+                p.background.into_cosmic_color(),
+            )),
+            border: cosmic::iced::Border {
+                color: p.border.into_cosmic_color(),
+                width: 1.0,
+                radius: f32::from(radii.input).into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// NOTIFY-REDESIGN-C — a tone-styled detail action button.
+///
+/// `Primary` = accent fill (high-contrast label, the tab-active idiom); `Danger`
+/// = subtle layer, danger-toned label + edge; `Neutral` = the Carbon subtle
+/// button.
+fn detail_action_btn(
+    label: &str,
+    tone: ActionTone,
+    msg: Message,
+    p: Palette,
+    space: mde_theme::Space,
+) -> Element<'static, Message> {
+    let sizes = mde_theme::FontSize::defaults();
+    let radii = mde_theme::Radii::defaults();
+    // The label colour is constant per tone (only bg lifts on hover), so colour
+    // the text explicitly — the established button idiom in this bin — rather
+    // than lean on `text_color` inheritance.
+    let fg = match tone {
+        ActionTone::Primary => p.background,
+        ActionTone::Danger => p.danger,
+        ActionTone::Neutral => p.text,
+    };
+    button(
+        text(label.to_string())
+            .size(sizes.body)
+            .color(fg.into_cosmic_color()),
+    )
+    .padding(Padding::from([space.xs, space.sm]))
+    .on_press(msg)
+    .style(move |_t, status| {
+        use cosmic::iced::widget::button::Status;
+        let hovered = matches!(status, Status::Hovered | Status::Pressed);
+        let (bg, bc) = match tone {
+            ActionTone::Primary => (p.accent, p.accent),
+            ActionTone::Danger => (if hovered { p.overlay } else { p.raised }, p.danger),
+            ActionTone::Neutral => (if hovered { p.overlay } else { p.raised }, p.border),
+        };
+        cosmic::iced::widget::button::Style {
+            background: Some(cosmic::iced::Background::Color(bg.into_cosmic_color())),
+            text_color: fg.into_cosmic_color(),
+            border: cosmic::iced::Border {
+                color: bc.into_cosmic_color(),
+                width: 1.0,
+                radius: f32::from(radii.md).into(),
+            },
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
+/// NOTIFY-REDESIGN-C — the modal drop-shadow, from the `mde-theme` modal shadow
+/// token (§4 — no bespoke elevation), mirroring `panel_chrome`'s conversion.
+fn modal_shadow() -> cosmic::iced::Shadow {
+    let s = mde_theme::Shadow::modal();
+    cosmic::iced::Shadow {
+        color: s.color.into_cosmic_color(),
+        offset: cosmic::iced::Vector::new(s.offset_x, s.offset_y),
+        blur_radius: s.blur,
+    }
+}
+
+/// NOTIFY-REDESIGN-C — the dimming scrim colour.
+///
+/// Pure-black at the locked dialog backdrop opacity, both `mde-theme` tokens
+/// (§4). A cheap blur isn't available in this iced fork, so the spec's scrim
+/// fallback stands.
+fn scrim_color() -> cosmic::iced::Color {
+    cosmic::iced::Color {
+        a: mde_theme::motion::dialog::BACKDROP_OPACITY,
+        ..mde_theme::carbon::BLACK.into_cosmic_color()
+    }
+}
+
+/// NOTIFY-REDESIGN-C — an epoch-ms instant as an absolute UTC wall-clock stamp.
+///
+/// `YYYY-MM-DD HH:MM:SS UTC`, with no `chrono`, via Howard Hinnant's
+/// `civil_from_days` (the inverse of the clipboard parser's `days_from_civil`).
+/// The detail viewer pairs this absolute time with the relative "N ago" age.
+/// Pure + testable.
+fn fmt_utc(ts_unix_ms: i64) -> String {
+    let secs = ts_unix_ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02} UTC")
+}
+
+/// Civil (year, month, day) from a day count since the Unix epoch — Howard
+/// Hinnant's proleptic-Gregorian algorithm (the inverse of `notify_clipboard`'s
+/// `days_from_civil`). Pure integer math.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]
@@ -2801,5 +3475,159 @@ mod tests {
         assert_eq!(format_age(0, 172_800_000), "2d");
         // Clock skew (future ts) clamps to 0s, never negative.
         assert_eq!(format_age(10_000, 0), "0s");
+    }
+
+    /// A notification `AlertItem` with a host + body for the C viewer tests.
+    fn notif(id: &str, sev: Severity, read: bool) -> AlertItem {
+        AlertItem {
+            id: id.into(),
+            ts_unix_ms: 1_700_000_000_000,
+            severity: sev,
+            source: Source::System,
+            topic: "mackesd::alert".into(),
+            host: Some("node-a".into()),
+            title: "Disk almost full".into(),
+            body: "root at 92%".into(),
+            read,
+        }
+    }
+
+    /// NOTIFY-REDESIGN-C — the absolute-timestamp formatter (no chrono) lands the
+    /// right UTC wall-clock for known epochs (epoch 0 + a known 2026 instant,
+    /// cross-checked against the clipboard RFC3339 parser).
+    #[test]
+    fn fmt_utc_formats_known_instants() {
+        assert_eq!(fmt_utc(0), "1970-01-01 00:00:00 UTC");
+        let e = notify_clipboard::rfc3339_to_epoch("2026-06-21T12:00:00Z").unwrap();
+        assert_eq!(fmt_utc(e * 1000), "2026-06-21 12:00:00 UTC");
+    }
+
+    /// NOTIFY-REDESIGN-C — the notification consumer maps an alert to the full
+    /// detail: severity tint, the field rows, the verbatim JSON raw block, and
+    /// the full action set in order (Open source only when a host maps).
+    #[test]
+    fn notif_detail_carries_full_content_and_actions() {
+        let it = notif("u1", Severity::Warning, false);
+        let d = notif_detail(&it, it.ts_unix_ms + 60_000);
+        assert_eq!(d.severity, Some(Severity::Warning));
+        let labels: Vec<&str> = d.fields.iter().map(|(l, _)| l.as_str()).collect();
+        for expected in ["Source", "Host", "When", "Topic", "ID"] {
+            assert!(labels.contains(&expected), "missing field {expected}");
+        }
+        // The raw block is the verbatim structured event (valid JSON, topic in it).
+        assert!(d.has_raw());
+        let raw: serde_json::Value = serde_json::from_str(&d.raw).unwrap();
+        assert_eq!(
+            raw.get("topic").and_then(|v| v.as_str()),
+            Some("mackesd::alert")
+        );
+        let alabels: Vec<&str> = d.actions.iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(
+            alabels,
+            ["Open source", "Mark read", "Mute source", "Dismiss"]
+        );
+    }
+
+    /// NOTIFY-REDESIGN-C — clicking a notification row opens the shared viewer,
+    /// and the FIRST Esc closes JUST the viewer (the layered dismissal; a second
+    /// Esc — not exercised, it exits the process — closes the Hub).
+    #[test]
+    fn open_notif_detail_and_first_esc_closes_viewer() {
+        let mut state = Center::new();
+        state.items.push(notif("u1", Severity::Info, false));
+        assert!(state.detail.is_none());
+        let _ = update(&mut state, Message::OpenNotifDetail("u1".into()));
+        assert!(state.detail.is_some(), "row click opens the viewer");
+        let _ = update(&mut state, Message::EscPressed);
+        assert!(state.detail.is_none(), "first Esc closes just the viewer");
+    }
+
+    /// NOTIFY-REDESIGN-C — Mark read flips the item's `read` field and rebuilds
+    /// the open viewer so the toggle's label flips in place (Mark read → unread).
+    #[test]
+    fn detail_mark_read_toggles_and_keeps_viewer_open() {
+        let mut state = Center::new();
+        state.items.push(notif("u1", Severity::Info, false));
+        let _ = update(&mut state, Message::OpenNotifDetail("u1".into()));
+        let _ = update(&mut state, Message::DetailMarkRead("u1".into(), true));
+        assert!(state.items[0].read, "read flag set");
+        let d = state.detail.as_ref().expect("viewer stays open");
+        assert!(
+            d.actions.iter().any(|a| a.label == "Mark unread"),
+            "the toggle rebuilt to Mark unread"
+        );
+    }
+
+    /// NOTIFY-REDESIGN-C — Dismiss removes the alert by id and closes the viewer.
+    #[test]
+    fn detail_dismiss_removes_item_and_closes() {
+        let mut state = Center::new();
+        state.items.push(notif("u1", Severity::Info, false));
+        let _ = update(&mut state, Message::OpenNotifDetail("u1".into()));
+        let _ = update(&mut state, Message::DetailDismiss("u1".into()));
+        assert!(state.items.is_empty(), "alert removed by id");
+        assert!(state.detail.is_none(), "viewer closed");
+    }
+
+    /// NOTIFY-REDESIGN-C — the clipboard consumer puts the FULL verbatim clip in
+    /// the mono raw block (not the truncated preview), titled by the preview.
+    #[test]
+    fn clip_detail_puts_verbatim_text_in_raw() {
+        let c = ClipRow {
+            id: "c1".into(),
+            text: "line one\nline two\nverbatim".into(),
+            source: "node-a".into(),
+            time: String::new(),
+            pinned: false,
+        };
+        let d = clip_detail(&c, 0);
+        assert_eq!(d.raw, "line one\nline two\nverbatim");
+        assert!(d.severity.is_none());
+        assert!(d.actions.iter().any(|a| a.label == "Dismiss"));
+    }
+
+    /// NOTIFY-REDESIGN-C — the lighthouse consumer surfaces host / health / role,
+    /// with an Open-Lighthouses-tab action (the reused `OpenLighthouse` deep-link).
+    #[test]
+    fn beacon_detail_shows_host_health_and_deeplink() {
+        let d = beacon_detail(&beacon_sentinel());
+        assert_eq!(d.title, "lh-sentinel");
+        let labels: Vec<&str> = d.fields.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(labels.contains(&"Health"));
+        assert!(labels.contains(&"Role"));
+        assert!(d.actions.iter().any(|a| a.label == "Open Lighthouses tab"));
+    }
+
+    /// NOTIFY-REDESIGN-C — every consumer's viewer renders in the ONE shared
+    /// modal shell (scrim + centered card + actions) without panic: notification,
+    /// clipboard, lighthouse, voice.
+    #[test]
+    fn view_renders_open_detail_modal_for_every_consumer() {
+        let mut state = Center::new();
+        state.items.push(notif("u1", Severity::Critical, false));
+        // Notification.
+        let d = notif_detail(&state.items[0], state.items[0].ts_unix_ms);
+        state.detail = Some(d);
+        let _ = view(&state, window::Id::unique());
+        // Clipboard.
+        let clip = ClipRow {
+            id: "c1".into(),
+            text: "hi".into(),
+            source: "n".into(),
+            time: String::new(),
+            pinned: true,
+        };
+        state.detail = Some(clip_detail(&clip, 0));
+        let _ = view(&state, window::Id::unique());
+        // Lighthouse.
+        state.detail = Some(beacon_detail(&beacon_sentinel()));
+        let _ = view(&state, window::Id::unique());
+        // Voice.
+        state.detail = Some(voice_detail(Some(&VoiceStatus {
+            registered: true,
+            listening: true,
+            fresh: true,
+        })));
+        let _ = view(&state, window::Id::unique());
     }
 }

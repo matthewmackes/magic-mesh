@@ -19,6 +19,10 @@ pub mod components;
 pub mod controls;
 pub mod cosmic_compat;
 pub mod dbus;
+/// NOTIFY-REDESIGN-C — the reusable hub detail-viewer contract (`DetailContent`
+/// + `DetailAction`): one render-agnostic model every Hub item maps itself to,
+/// rendered by the notify bin's one shared center-modal shell.
+pub mod detail_viewer;
 pub mod header;
 pub mod keyboard;
 pub mod launcher;
