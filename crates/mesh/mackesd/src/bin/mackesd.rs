@@ -1288,6 +1288,17 @@ enum OnboardCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// OW-6 — publish this mesh's DNS: fold the replicated peer roster into a
+    /// `<host>.<mesh-id>` → overlay-IP zone and write the managed `/etc/hosts`
+    /// block, so nodes are reachable by name over the overlay instead of by
+    /// Nebula IP. Idempotent. `--dry-run` prints the zone + the rendered block
+    /// without touching `/etc/hosts`.
+    MeshDns {
+        /// Print the built zone + the rendered hosts block without writing
+        /// `/etc/hosts`.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// DDNS-EGRESS-3 — `mackesd ddns <sub>` subcommands. Each calls the same
@@ -2418,6 +2429,43 @@ fn main() -> anyhow::Result<()> {
                         eprintln!(
                             "  keyfile apply failed (LAN bring-up is integration-gated): {e}"
                         );
+                        std::process::exit(1);
+                    }
+                }
+            }
+            OnboardCmd::MeshDns { dry_run } => {
+                // Fold the replicated peer roster into the mesh-DNS zone and
+                // publish the managed /etc/hosts block. Headless: prints the zone,
+                // then (unless --dry-run) writes the block idempotently.
+                let node_id = default_node_id();
+                let root = mackesd_core::default_qnm_shared_root();
+                let mesh_id = mackesd_core::onboard::invite::resolve_mesh_id(&root, &node_id);
+                let zone = mackesd_core::onboard::mesh_dns::resolve_zone(&root, &mesh_id);
+                println!(
+                    "onboard mesh-dns: mesh '{mesh_id}' — {} name(s):",
+                    zone.len()
+                );
+                for (name, ip) in &zone {
+                    println!("  {name}\t{ip}");
+                }
+                if dry_run {
+                    print!("{}", mackesd_core::onboard::mesh_dns::render_hosts(&zone));
+                    return Ok(());
+                }
+                let sink = mackesd_core::onboard::mesh_dns::EtcHosts::default();
+                match mackesd_core::onboard::mesh_dns::apply(&zone, &sink) {
+                    Ok(outcome) => println!(
+                        "  {} → {} ({})",
+                        outcome.names,
+                        mackesd_core::onboard::mesh_dns::DEFAULT_HOSTS_PATH,
+                        if outcome.changed {
+                            "updated"
+                        } else {
+                            "unchanged"
+                        }
+                    ),
+                    Err(e) => {
+                        eprintln!("mesh-dns apply failed: {e}");
                         std::process::exit(1);
                     }
                 }

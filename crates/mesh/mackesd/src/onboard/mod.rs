@@ -19,7 +19,7 @@
 //!   derived from the `mde_role` rank model (the same tiering
 //!   [`crate::worker_role`] gates the in-process workers by).
 //!
-//! # Landed since OW-2: OW-3 [`mesh_create`] + OW-4 [`invite`] + OW-5 [`network`]
+//! # Landed since OW-2: OW-3 [`mesh_create`] + OW-4 [`invite`] + OW-5 [`network`] + OW-6 [`mesh_dns`]
 //! * [`mesh_create`] (OW-3) founds a lone Workstation's mesh-of-one (mint CA +
 //!   LAN-only overlay, offline) — a thin idempotent wrapper over the ENT-4
 //!   [`crate::mesh_init`] bootstrap (reuse, not a reimplementation).
@@ -30,14 +30,19 @@
 //!   detect DHCP-vs-static (reusing [`crate::router_discovery`]'s default-gateway
 //!   detection) and write the correct NetworkManager keyfile, so a fresh box reaches
 //!   its LAN even on a static-only, no-DHCP network (the cloud-init NM-keyfile fix).
+//! * [`mesh_dns`] (OW-6) publishes the mesh's name service: it folds the replicated
+//!   peer roster ([`mackes_mesh_types::peers`]) into a `<host>.<mesh-id>` →
+//!   overlay-IP zone and writes a managed `/etc/hosts` block, so operators reach
+//!   nodes by name over the overlay without memorizing Nebula IPs (reusing the
+//!   own-row directory, not a new sync).
 //!
 //! # Verbs still owned by the sibling OW units — deliberately NOT declared here (§7)
 //! The remaining complex verbs land in their own units with real implementations;
-//! this engine carries no stub / `todo!()` variant for any: `enroll` and `mesh-dns`
-//! (their own OW units).
+//! this engine carries no stub / `todo!()` variant for any: `enroll` (its own OW unit).
 
 pub mod invite;
 pub mod mesh_create;
+pub mod mesh_dns;
 pub mod network;
 pub mod role_provision;
 pub mod self_test;
