@@ -5826,6 +5826,25 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("container".into());
         }
+        // MV-5a — the scheduler worker: the placement slice of the no-center
+        // scheduler. Drains `action/schedule/place`, folds each node's latest
+        // `event/kvm/services` capacity, chooses the target node (healthy pin →
+        // most-active → node_id tie-break), and forwards a host-targeted
+        // create/run onto `action/vm/lifecycle` / `action/container/lifecycle`
+        // (plus the decision to `event/schedule/placements`). Rank-0-default like
+        // vm_lifecycle/container (runs everywhere); an interim lowest-node-id
+        // single-actor election keeps N nodes from emitting duplicate placements.
+        // Failover re-election + etcd desired-state persistence are MV-5b.
+        if mackesd_core::worker_role::runs("scheduler", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::scheduler::SchedulerWorker::new(node_id.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("scheduler".into());
+        }
         // OV-7.a (v2.6) — health reconciler. Polls each known
         // peer's QNM-Shared heartbeat.json every 5 s, applies the
         // telemetry::health_state_from_age threshold table, writes

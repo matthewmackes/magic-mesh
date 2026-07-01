@@ -532,6 +532,14 @@ pub mod vm_lifecycle;
 // `event/podman/containers`. Universal like vm_lifecycle — every node can host
 // datacenter containers.
 pub mod container;
+// MV-5a — the scheduler worker: the placement slice of the no-center scheduler.
+// Drains `action/schedule/place`, folds each node's latest `event/kvm/services`
+// capacity, chooses the target node (healthy pin → most-active → node_id
+// tie-break), and forwards a host-targeted create/run onto
+// `action/vm/lifecycle` / `action/container/lifecycle` (plus the decision to
+// `event/schedule/placements`). Rank-0-default like vm_lifecycle/container; an
+// interim lowest-node-id single-actor election prevents duplicate placements.
+pub mod scheduler;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
 // text clip on the bus + appends to ONE mesh-global `clipboard/history.json`
