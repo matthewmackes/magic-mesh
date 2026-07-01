@@ -38,7 +38,7 @@ _(2026-06-29 — surfaced during the workbench critical-bug drain. The `accept` 
 - **MEDIA-4: mount the Spaces bucket into the container as /music** — _needs:_ Blocked on MEDIA-2 (live bucket + keys). Substrate (setup-media-navidrome.sh) implements rclone mount at $STATE/library with VFS cache, bind-mounted into container at /music:ro; two acceptance bullets
 - **MEDIA-6: shared service account auto-provisioning** — _needs:_ Blocked on MEDIA-2 (live bucket) + live Lighthouse_Media node. Only the env-var half exists in the unpackaged helper. Idempotent account creation (first-start provisioning), durable shared-playlist wr
 - **MEDIA-9: content ingestion — operator upload to the bucket** — _needs:_ Blocked on MEDIA-2 (live bucket) + MEDIA-3 (running Lighthouse_Media). No upload path or rescan trigger wired. Every acceptance (upload via rclone / mesh Files surface, rescan refresh, tracks appear i
-- **MEDIA-10: redundancy + live verification on DO** — _needs:_ Pure live verification task. Requires: (1) ≥2 Lighthouse_Media nodes on real DO serving the same bucket; (2) kill-one resilience with user-visible gap measurement; (3) fresh-node auto-config + plays e
+- **MEDIA-10: redundancy + live verification on DO** — ✅ **RESOLVED 2026-07-01** (operator DO Spaces creds). LH1 (10.42.0.1) + LH2 (10.42.0.2) both serve `mcnf-mesh-media` active-active (Subsonic 200 each); `music.mesh` round-robins both; kill-one resilience proven (controlled+reversible: LH2 down → LH1 keeps serving → LH2 restored). Residual is only a user-visible-gap *metric* (needs a client mid-stream) + fresh-node auto-config (MEDIA-6/8), not a blocker.
 
 ## Parked by the drain loop (DRAIN-5)
 
