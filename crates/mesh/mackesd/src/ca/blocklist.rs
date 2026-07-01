@@ -194,10 +194,19 @@ pub fn all_fingerprints(workgroup_root: &Path) -> Vec<String> {
 }
 
 /// Parse `nebula-cert print -json` output for the fingerprint (pure).
+///
+/// Handles both cert formats: a **Nebula Certificate V1** prints a single JSON
+/// object `{"fingerprint": …}`, while a **V2** cert (`-----BEGIN NEBULA
+/// CERTIFICATE V2-----`) prints a JSON *array* of certs
+/// `[{"fingerprint": …, "details": …}]`. Accept the object directly, or the
+/// first element of the array — otherwise a V2 mesh reads every host cert as
+/// absent (found live 2026-07-01: the self-test cert probe + the `leave`
+/// revocation-eviction both silently no-op'd on the V2 fleet).
 #[must_use]
 pub fn parse_fingerprint_json(raw: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
-    v.get("fingerprint")
+    let cert = if v.is_array() { v.get(0)? } else { &v };
+    cert.get("fingerprint")
         .and_then(|f| f.as_str())
         .map(str::to_string)
 }
@@ -300,5 +309,20 @@ mod tests {
             "the real fingerprint is 64-hex (blocklist-valid)"
         );
         assert!(fp.starts_with("ac130a60"));
+    }
+
+    #[test]
+    fn fingerprint_json_parses_v2_array_output() {
+        // Nebula Certificate V2 (`-----BEGIN NEBULA CERTIFICATE V2-----`):
+        // `nebula-cert print -json` emits a JSON ARRAY of certs, not a single
+        // object. Verbatim-shaped from the live magic-mesh fleet (2026-07-01) —
+        // before the array-form fix every V2 host cert read as absent, so the
+        // OW-10 self-test cert probe false-FAILED and `leave` eviction silently
+        // no-op'd in prod. This test locks the V2 wire shape.
+        let v2 = format!(
+            r#"[{{"curve":"CURVE25519","details":{{"groups":["role:host"],"isCa":false,"name":"peer:lh-magic-mesh"}},"fingerprint":"{FP_A}","publicKey":"abc"}}]"#
+        );
+        assert_eq!(parse_fingerprint_json(&v2).as_deref(), Some(FP_A));
+        assert!(parse_fingerprint_json("[]").is_none()); // empty array ⇒ no cert
     }
 }
