@@ -5,12 +5,13 @@
 //! Node** (WB-ThisNode — this host's role / overlay IP / presence + heartbeat /
 //! daemon health, off the mesh-status snapshot), **Controller** (WB-Controller —
 //! the elected controller + its leader lease and the fleet-wide control-service
-//! health rollup, off the same snapshot), **Network** (WB-Network — the overlay IP
-//! + cipher, elected leader, the peer directory as network links, and overlay
-//! routing, off the same snapshot), and **Fleet** (MV-6 — per-node KVM reality off
-//! the Bus) are live; Provisioning still shows descriptive copy until its unit
-//! lands. Nothing here fakes a metric (governance §7) — a plane shows live data or
-//! an honest blurb, never stand-in data.
+//! health rollup), **Network** (WB-Network — the overlay IP + cipher, elected
+//! leader, the peer directory as network links, and overlay routing), **Fleet**
+//! (MV-6 — per-node KVM reality off the Bus), and **Provisioning** (WB-Provisioning
+//! — per-node deployment tier + role rollup, the fleet version target vs each
+//! node's build, and per-node enrollment readiness) — all five planes are now
+//! live off the mesh-status snapshot / Bus. Nothing here fakes a metric (governance
+//! §7) — a plane shows live data or an honest blurb, never stand-in data.
 
 use mde_egui::egui::{self, RichText};
 use mde_egui::Style;
@@ -75,21 +76,22 @@ impl Plane {
 /// Render the expanded Workbench: a title, the plane rail, and the selected
 /// plane's content pane. `selected` is read and written, so a rail click changes
 /// the active plane. The This Node plane renders this host's live status from
-/// `thisnode` (WB-ThisNode), the Controller plane renders the mesh control plane's
-/// live status from `controller` (WB-Controller), the Network plane renders the
-/// mesh fabric's live status from `network` (WB-Network), and the Fleet plane
-/// renders live per-node KVM reality from `datacenter` (MV-6); the remaining plane
-/// still shows descriptive copy.
+/// `thisnode` (WB-ThisNode), the Controller plane from `controller` (WB-Controller),
+/// the Network plane from `network` (WB-Network), the Fleet plane's live per-node
+/// KVM reality from `datacenter` (MV-6), and the Provisioning plane's live
+/// deployment / version / enrollment posture from `provisioning` (WB-Provisioning)
+/// — every plane now renders live status.
 pub(crate) fn show(
     ui: &mut egui::Ui,
     selected: &mut Plane,
     datacenter: &mut crate::datacenter::DatacenterState,
-    // Read-only: the This Node, Network + Controller planes only render their
-    // polled status (`&self`), unlike the Fleet plane whose `datacenter` publishes
-    // lifecycle actions.
+    // Read-only: the This Node / Controller / Network / Provisioning planes only
+    // render their polled status (`&self`), unlike the Fleet plane whose
+    // `datacenter` publishes lifecycle actions.
     thisnode: &crate::thisnode::ThisNodeState,
     network: &crate::network::NetworkState,
     controller: &crate::controller::ControllerState,
+    provisioning: &crate::provisioning::ProvisioningState,
 ) {
     ui.add_space(Style::SP_L);
     ui.heading(
@@ -135,6 +137,9 @@ pub(crate) fn show(
             ui.add_space(Style::SP_XS);
             ui.colored_label(Style::TEXT_DIM, selected.blurb());
             ui.add_space(Style::SP_M);
+            // Every plane is matched explicitly — no `_` wildcard — so a future
+            // plane variant can't silently fall through to a placeholder (clippy's
+            // `match_wildcard_for_single_variants` fix once only one arm remained).
             match *selected {
                 // WB-ThisNode — this host's live status (role, overlay IP,
                 // presence + heartbeat, daemon health, peer/leader context) off the
@@ -151,15 +156,11 @@ pub(crate) fn show(
                 // MV-6 — the Fleet plane drives live KVM host health + the VM
                 // roster off the Bus (Podman container rows follow once MV-4 lands).
                 Plane::Fleet => datacenter.show(ui),
-                // Provisioning is the last plane still on descriptive copy — its
-                // live wiring lands in a later unit. Matched explicitly (not `_`) so
-                // a future plane can't silently fall through to the placeholder.
-                Plane::Provisioning => {
-                    ui.colored_label(
-                        Style::TEXT_DIM,
-                        "Live mesh data wires into this plane in a later unit.",
-                    );
-                }
+                // WB-Provisioning — the mesh's live deployment posture (per-node
+                // tier + role rollup, the fleet version target vs each node's build
+                // + update flag, per-node enrollment readiness) off the same
+                // snapshot.
+                Plane::Provisioning => provisioning.show(ui),
             }
         });
     });
