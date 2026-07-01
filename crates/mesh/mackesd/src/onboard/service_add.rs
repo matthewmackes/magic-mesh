@@ -667,11 +667,17 @@ impl ServiceApply for LiveServiceApply {
         Err(ServiceError::IntegrationGated {
             step: "provision-music",
             reason: format!(
-                "lighthouse `{}` → needs live SSH to run `setup-media-navidrome.sh` (rclone-mount \
-                 the DO Spaces bucket via the `{creds_ref}` secret + rootless-podman Navidrome), \
-                 then publish {server_url}; the DO Spaces bucket + the media-lighthouse box \
-                 (via onboard spawn-lighthouse) are not provisioned on this host yet",
-                target.hostname
+                "media-lighthouse `{}` provisions Navidrome *itself* once it carries the Media \
+                 role + the `{creds_ref}` (DO Spaces) secret: its `navidrome_supervisor` worker \
+                 runs the RPM-shipped `setup-media-navidrome.sh` when the unit is missing, and \
+                 `media_registry` publishes {server_url} (this capability-driven path is live on \
+                 the fleet's media lighthouses). What is gated is the REMOTE push from this \
+                 authoring node — pinning the Media role on `{}` + sealing the secret there — via \
+                 the onboard-family live executor (the same unbuilt SSH/typed-verb seam OW-7's \
+                 `push_enroll` needs; no onboard verb wires live remote push yet). Until it lands, \
+                 pin the Media role on the target lighthouse directly and provisioning + \
+                 registration come up automatically.",
+                target.hostname, target.hostname
             ),
         })
     }
@@ -1234,16 +1240,26 @@ mod tests {
         match err {
             ServiceError::IntegrationGated { step, reason } => {
                 assert_eq!(step, "provision-music");
-                // Names the missing infra: the container script, the creds, the bucket.
+                // Honestly names the real architecture: the capability-driven self-provision
+                // (the supervisor script + the Media role + the creds) AND the actual gate —
+                // the remote push from the authoring node — never a fake success.
                 assert!(
                     reason.contains("setup-media-navidrome.sh"),
-                    "names the spawn: {reason}"
+                    "names the supervisor script: {reason}"
                 );
                 assert!(
                     reason.contains("media-spaces"),
                     "names the creds ref: {reason}"
                 );
-                assert!(reason.contains("DO Spaces"), "names the bucket: {reason}");
+                assert!(reason.contains("DO Spaces"), "names the creds source: {reason}");
+                assert!(
+                    reason.contains("Media role"),
+                    "names the capability-driven provisioning: {reason}"
+                );
+                assert!(
+                    reason.contains("remote push") || reason.contains("REMOTE push"),
+                    "names the actual gate (the remote push, not the provisioning): {reason}"
+                );
             }
             ServiceError::Failed { .. } => panic!("expected an integration-gated error"),
         }
