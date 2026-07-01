@@ -18,6 +18,14 @@
 //! sound device. The libcosmic HUD is never pulled (`mde-voice-hud` is consumed
 //! with its `gui` feature off).
 //!
+//! Under E12 "Quasar" the mesh-control surfaces are **panels inside the one shell**
+//! (`mde-shell-egui`), not separate clients (§5, the EMBED model — there is no
+//! compositor). So the central view is factored into the public [`voice_panel`]
+//! function: the standalone [`VoiceApp`] renders it into its own `CentralPanel`
+//! (framing it with the registration header and the per-frame worker-update drain),
+//! and the shell renders the *same* function into a panel of its egui context, so
+//! the surface looks and behaves identically either way.
+//!
 //! Tier (§6): desktop-shell — it depends only on the harness and the voice
 //! service (both inward edges), pulling in no mesh-substrate crate.
 
@@ -29,11 +37,13 @@ mod worker;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use mde_egui::eframe::{self, App, CreationContext};
-use mde_egui::egui::Context;
+use mde_egui::egui::{self, Context};
 
 use mde_voice_hud::sip::SipAccount;
 
 use crate::model::{Command, Update, VoiceState};
+
+pub use view::voice_panel;
 
 /// The voice surface: the view-model, the dial buffer, and the channel to its
 /// worker threads.
@@ -96,15 +106,11 @@ impl App for VoiceApp {
         while let Ok(update) = self.updates.try_recv() {
             self.state.apply(update);
         }
-        let cmds = view::show(
-            ctx,
-            &self.state,
-            &mut self.dial,
-            &self.identity,
-            self.registrar_backed,
-        );
-        for cmd in cmds {
-            self.send(cmd);
-        }
+
+        egui::TopBottomPanel::top("voice-header").show(ctx, |ui| view::header(ui, self));
+
+        // The central content is the shared `voice_panel` body, so the standalone
+        // window and the embedded shell panel (E12-3b) render identically.
+        egui::CentralPanel::default().show(ctx, |ui| view::voice_panel(ui, self));
     }
 }
