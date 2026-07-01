@@ -311,18 +311,10 @@ fn mesh_badge(ui: &mut egui::Ui, b: &FileBrowser) {
                 label.push_str(" · via ");
                 label.push_str(&mesh.active_transport);
             }
-            ui.label(
-                RichText::new(label)
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
+            mde_egui::muted_note(ui, label);
         } else {
             status_dot(ui, Style::WARN);
-            ui.label(
-                RichText::new("Standalone — no mesh")
-                    .color(Style::TEXT_DIM)
-                    .size(Style::SMALL),
-            );
+            mde_egui::muted_note(ui, "Standalone — no mesh");
         }
     });
 }
