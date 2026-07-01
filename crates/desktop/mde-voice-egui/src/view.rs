@@ -36,11 +36,7 @@ pub fn header(ui: &mut egui::Ui, app: &VoiceApp) {
                 .color(Style::TEXT),
         );
         ui.add_space(Style::SP_M);
-        ui.label(
-            RichText::new(&app.identity)
-                .size(Style::SMALL)
-                .color(Style::TEXT_DIM),
-        );
+        mde_egui::muted_note(ui, &app.identity);
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add_space(Style::SP_S);
@@ -55,11 +51,7 @@ pub fn header(ui: &mut egui::Ui, app: &VoiceApp) {
                 reregister = true;
             }
             ui.add_space(Style::SP_S);
-            ui.label(
-                RichText::new(app.state.registration.label())
-                    .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
-            );
+            mde_egui::muted_note(ui, app.state.registration.label());
             ui.add_space(Style::SP_XS);
             status_dot(ui, tone_color(registration_tone(&app.state.registration)));
         });
