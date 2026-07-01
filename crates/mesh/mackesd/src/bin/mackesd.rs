@@ -1299,6 +1299,24 @@ enum OnboardCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// OW-7 — spawn this mesh's first lighthouse and migrate the CA to it: provision
+    /// a cloud droplet (`--cloud`) or a local cloud-hypervisor VM, push-enroll it as
+    /// a lighthouse, then migrate the CA over #12's lighthouse-scoped-bearer key
+    /// delivery. With no cloud token the mesh stays LAN-only (retry available). The
+    /// live provision/SSH/CA-move is integration-gated behind the Provisioner seam;
+    /// `--dry-run` prints the plan + the provision spec without provisioning.
+    SpawnLighthouse {
+        /// Provision a cloud droplet (DigitalOcean); omit for a local
+        /// cloud-hypervisor VM.
+        #[arg(long)]
+        cloud: bool,
+        /// Provision a PAIR (two lighthouses) for an HA / two-voter quorum.
+        #[arg(long)]
+        pair: bool,
+        /// Print the plan + provision spec without provisioning / migrating.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// DDNS-EGRESS-3 — `mackesd ddns <sub>` subcommands. Each calls the same
@@ -2466,6 +2484,49 @@ fn main() -> anyhow::Result<()> {
                     ),
                     Err(e) => {
                         eprintln!("mesh-dns apply failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            OnboardCmd::SpawnLighthouse {
+                cloud,
+                pair,
+                dry_run,
+            } => {
+                // Plan the spawn: gather this node's facts (mesh-id, CA holder,
+                // cloud token / local virt), fold into a plan. The live
+                // provision/SSH/CA-move is integration-gated behind the Provisioner
+                // seam; --dry-run stops at the plan + rendered spec.
+                use mackesd_core::onboard::spawn_lighthouse as sl;
+                let node_id = default_node_id();
+                let root = mackesd_core::default_qnm_shared_root();
+                let facts = sl::gather(&root, &node_id);
+                let target = if cloud {
+                    sl::SpawnTarget::default_cloud()
+                } else {
+                    sl::SpawnTarget::default_local()
+                };
+                let req = sl::SpawnRequest { target, pair };
+                let plan = sl::plan_spawn(&req, &facts);
+                println!("onboard spawn-lighthouse: {}", plan.human());
+                if dry_run {
+                    if let Some(spec) = plan.provision_spec() {
+                        println!("--- provision spec (dry-run, not provisioned) ---");
+                        print!("{}", spec.document());
+                    }
+                    return Ok(());
+                }
+                // Live path: drive the integration-gated Provisioner seam
+                // (provision → push-enroll → migrate-CA).
+                match sl::execute(&plan, &sl::LiveProvisioner) {
+                    Ok(sl::SpawnOutcome::Provisioned { endpoint }) => {
+                        println!("  lighthouse provisioned at {}", endpoint.host);
+                    }
+                    Ok(sl::SpawnOutcome::LanOnly { reason }) => {
+                        println!("  no-op — stays LAN-only ({reason}); retry available");
+                    }
+                    Err(e) => {
+                        eprintln!("  spawn-lighthouse failed (live provisioning is integration-gated): {e}");
                         std::process::exit(1);
                     }
                 }

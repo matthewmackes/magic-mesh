@@ -19,7 +19,7 @@
 //!   derived from the `mde_role` rank model (the same tiering
 //!   [`crate::worker_role`] gates the in-process workers by).
 //!
-//! # Landed since OW-2: OW-3 [`mesh_create`] + OW-4 [`invite`] + OW-5 [`network`] + OW-6 [`mesh_dns`]
+//! # Landed since OW-2: OW-3 [`mesh_create`] + OW-4 [`invite`] + OW-5 [`network`] + OW-6 [`mesh_dns`] + OW-7 [`spawn_lighthouse`]
 //! * [`mesh_create`] (OW-3) founds a lone Workstation's mesh-of-one (mint CA +
 //!   LAN-only overlay, offline) — a thin idempotent wrapper over the ENT-4
 //!   [`crate::mesh_init`] bootstrap (reuse, not a reimplementation).
@@ -35,6 +35,13 @@
 //!   overlay-IP zone and writes a managed `/etc/hosts` block, so operators reach
 //!   nodes by name over the overlay without memorizing Nebula IPs (reusing the
 //!   own-row directory, not a new sync).
+//! * [`spawn_lighthouse`] (OW-7) promotes a lone Workstation's LAN-only mesh by
+//!   standing up its first lighthouse (a cloud droplet or a local cloud-hypervisor
+//!   VM), push-enrolling it, and **migrating the CA** to it over #12's existing
+//!   lighthouse-scoped-bearer CA-key delivery. This slice is the pure `plan_spawn`
+//!   core + the injectable [`spawn_lighthouse::Provisioner`] apply seam (production
+//!   `LiveProvisioner` is honestly integration-gated); the no-cloud-token case is a
+//!   real `LanOnly` + retry branch, not a stub.
 //!
 //! # Verbs still owned by the sibling OW units — deliberately NOT declared here (§7)
 //! The remaining complex verbs land in their own units with real implementations;
@@ -46,3 +53,4 @@ pub mod mesh_dns;
 pub mod network;
 pub mod role_provision;
 pub mod self_test;
+pub mod spawn_lighthouse;
