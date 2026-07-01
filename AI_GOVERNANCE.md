@@ -227,6 +227,17 @@ build loop). **E12 note:** the GUI build is now an **egui/eframe** compile
 (winit + wgpu) plus the forked-compositor crates; update the farm's GUI build
 expectations accordingly (libcosmic is gone).
 
+**§10.0.1 — BigBoy takes the longest / most-complex build (standing rule, operator
+2026-06-30).** The single heaviest job always routes to **XEN-BIGBOY**
+(`172.20.0.130`, 8 vCPU / 24 GiB — the high-capacity build VM): a full
+`cargo --workspace` build/test/clippy, the biggest egui crates
+(`mde-shell-egui` / `mde-workbench`), a cold cosmic/iced/wgpu compile, or the RPM
+release build. The 4-vCPU nodes (`.50` / `.90` / `.170`) take the shorter/simpler
+jobs (single small crates, per-crate tests/clippy). This composes with the ≤-cap
+spread (`docs/BUILD-ENVIRONMENT.md`): spread the *count* to honor per-node caps,
+but the *long pole* goes to BigBoy first — never leave the workspace/heavy-GUI
+build on a small node while BigBoy runs a trivial one.
+
 ---
 
 *Heritage: the pre-E12 Cosmic-era identity (libcosmic/iced, strictly-Carbon,

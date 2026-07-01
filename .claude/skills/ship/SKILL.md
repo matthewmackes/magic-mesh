@@ -72,6 +72,15 @@ filling **to** the cap, *spread*, NOT piling onto BIGBOY. A 4-vCPU node (.50/.90
 caps at **2**; the 8-vCPU BIGBOY (.130) at **3**. Exceeding the cap is the *opposite* of
 utilization — it deadlocks the node and you lose the work.
 
+### BigBoy takes the longest / most-complex build (standing rule, operator 2026-06-30)
+Complementary to the spread cap: the **single heaviest job always goes to BIGBOY**
+(`.130`, 8 vCPU) — a full `cargo --workspace` build/test/clippy, the biggest egui
+crates (`mde-shell-egui` / `mde-workbench`), a cold cosmic/iced/wgpu compile, or the
+RPM release build. The 4-vCPU nodes (`.50`/`.90`/`.170`) take the shorter/simpler
+jobs (small single crates, per-crate tests/clippy). Spread the *count* to honor the
+caps; route the *long pole* to BigBoy first — never leave BigBoy idle or on a
+trivial build while a small node grinds the workspace.
+
 ### Slot mechanics (so concurrent builds don't clobber each other)
 `install-helpers/xcp-build.sh` derives the remote dir:
 `REMOTE_DIR="magic-mesh${MCNF_BUILD_SLOT:+-$MCNF_BUILD_SLOT}"`. So `MCNF_BUILD_SLOT=2`

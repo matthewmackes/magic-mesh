@@ -94,6 +94,8 @@ user). Secrets are **off-repo** — see "Credentials" below.
 
 > ⚠️ **Build-VM IPs follow a per-dom0 lane** (`infra/tofu/main.tf`): XEN-HOME-SERVICES → `.50–.80`, KVM-XCP1 → `.90–.120`, XEN-BIGBOY → `.130–.160`. The VM **names** `mcnf-build-50/51/52` are legacy and do **not** equal the IP octet — `mcnf-build-51` is **172.20.0.90**, `mcnf-build-52` is **172.20.0.130**. The real farm is **.50 / .90 / .130**; there are no live `.51`/`.52` IPs (probing them gives "No route to host"). The `/ship` skill's topology table still shows the stale `.50/.51/.52` and should be corrected too (operator-gated — it's skill config).
 
+> **Standing rule (operator 2026-06-30): BigBoy takes the longest / most-complex build.** The single heaviest job always routes to **XEN-BIGBOY** (`172.20.0.130`, 8 vCPU / 24 GiB — the high-capacity node): a full `cargo --workspace` build/test/clippy, the biggest egui crates (`mde-shell-egui`/`mde-workbench`), a cold cosmic/iced/wgpu compile, or the RPM release build (`MCNF_BUILD_SHAPE=big` / an explicit `MCNF_BUILD_HOST=172.20.0.130`). The 4-vCPU nodes (`.50`/`.90`/`.170`) take the shorter/simpler jobs. This composes with the per-node concurrency cap: spread the *count* to honor caps, but the *long pole* goes to BigBoy first — never leave the workspace/heavy-GUI build on a small node while BigBoy runs a trivial one.
+
 ### Credentials (locations only — never in-repo)
 - **Mesh SSH key:** `~/.ssh/mackes_mesh_ed25519` (+ `.pub`) — dom0s + build-VM `mm`.
 - **dom0 root password:** operator-held / in the agent's memory; needed only for a

@@ -117,6 +117,15 @@ farm and never grind locally (`/no-flinch` rule 4: fix the loop, don't avoid it)
 44, disk full, lost work (`AI_GOVERNANCE.md §10`). Full utilization = fill *to* the
 cap, *spread* — not pile onto BIGBOY. 4-vCPU nodes cap at 2; the 8-vCPU BIGBOY at 3.
 
+### BigBoy takes the longest / most-complex build (standing rule, operator 2026-06-30)
+Complementary to the spread cap: the **single heaviest job always goes to BIGBOY**
+(`.130`, 8 vCPU) — a full `cargo --workspace` build/test/clippy, the biggest egui
+crates (`mde-shell-egui` / `mde-workbench`), a cold cosmic/iced/wgpu compile, the RPM
+release. The 4-vCPU nodes (`.50`/`.90`/`.170`) take the shorter/simpler jobs (small
+single crates, per-crate tests/clippy). Spread the *count* to honor caps; route the
+*long pole* to BigBoy first — never leave BigBoy on a trivial build while a small
+node grinds the workspace.
+
 ### Slot mechanics (so concurrent builds don't clobber)
 `install-helpers/xcp-build.sh` derives `REMOTE_DIR="magic-mesh${MCNF_BUILD_SLOT:+-$MCNF_BUILD_SLOT}"`.
 Every concurrent build needs a **unique slot name on its host** (its own `target/`);
