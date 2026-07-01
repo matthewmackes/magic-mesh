@@ -4,8 +4,8 @@
 //!
 //! A founded Workstation (OW-3 `mesh-create`) holds its own CA but has no
 //! always-on lighthouse — the overlay is LAN-only and there is no durable CA home
-//! off the desktop. This verb provisions one: a **cloud** droplet (DigitalOcean /
-//! the `zone1-do` IaC) or a **local** cloud-hypervisor VM, push-provisions it over
+//! off the desktop. This verb provisions one: a **cloud** droplet (`DigitalOcean` /
+//! the `zone1-do` `IaC`) or a **local** cloud-hypervisor VM, push-provisions it over
 //! SSH (RPM install + a lighthouse-scoped enroll), then **migrates the CA** to it
 //! so the lighthouse becomes the mesh's durable signer + etcd voter.
 //!
@@ -44,7 +44,7 @@
 //! behind [`Provisioner`], exactly as OW-5's live `nmcli` apply sits behind
 //! [`crate::onboard::network::KeyfileSink`]. [`LiveProvisioner`] returning a typed
 //! `IntegrationGated` error (never a fake success) is §7-legal — the same way
-//! OW-5's apply returns a typed error when NetworkManager is not reachable.
+//! OW-5's apply returns a typed error when `NetworkManager` is not reachable.
 
 use std::fmt::Write as _;
 
@@ -63,16 +63,17 @@ pub const DEFAULT_LOCAL_VCPUS: u32 = 1;
 /// Default memory (MiB) for a local cloud-hypervisor lighthouse VM.
 pub const DEFAULT_LOCAL_MEM_MB: u64 = 1024;
 
-/// The join-token placeholder the rendered provision spec carries. The impure
-/// [`migrate_ca`] step mints a fresh lighthouse-scoped token and substitutes it —
-/// the pure plan never embeds a secret (mirrors `do-lighthouse-join.sh`'s
-/// `@JOIN_TOKEN@` sed seam).
+/// The join-token placeholder the rendered provision spec carries.
+///
+/// The impure [`migrate_ca`] step mints a fresh lighthouse-scoped token and
+/// substitutes it — the pure plan never embeds a secret (mirrors
+/// `do-lighthouse-join.sh`'s `@JOIN_TOKEN@` sed seam).
 pub const JOIN_TOKEN_PLACEHOLDER: &str = "{{JOIN_TOKEN}}";
 
 /// Where a spawned lighthouse is provisioned.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SpawnTarget {
-    /// A cloud droplet (DigitalOcean, the `zone1-do` IaC).
+    /// A cloud droplet (`DigitalOcean`, the `zone1-do` `IaC`).
     Cloud {
         /// DO region slug (e.g. `nyc3`).
         region: String,
@@ -100,7 +101,7 @@ impl SpawnTarget {
 
     /// A local cloud-hypervisor target with the default 1-vCPU/1GB shape.
     #[must_use]
-    pub fn default_local() -> Self {
+    pub const fn default_local() -> Self {
         Self::Local {
             vcpus: DEFAULT_LOCAL_VCPUS,
             mem_mb: DEFAULT_LOCAL_MEM_MB,
@@ -109,7 +110,7 @@ impl SpawnTarget {
 
     /// Whether this is a cloud target (else local).
     #[must_use]
-    pub fn is_cloud(&self) -> bool {
+    pub const fn is_cloud(&self) -> bool {
         matches!(self, Self::Cloud { .. })
     }
 }
@@ -158,7 +159,7 @@ pub enum LanOnlyReason {
 impl LanOnlyReason {
     /// What the operator must fix before a retry succeeds.
     #[must_use]
-    pub fn hint(self) -> &'static str {
+    pub const fn hint(self) -> &'static str {
         match self {
             Self::NoCloudToken => {
                 "set a cloud token (DIGITALOCEAN_ACCESS_TOKEN / `doctl auth init`), then retry"
@@ -181,9 +182,11 @@ impl std::fmt::Display for LanOnlyReason {
 }
 
 /// One ordered, idempotent step of migrating the CA from the current holder (this
-/// Workstation) to the freshly spawned lighthouse. The steps *describe* the flow
-/// the real [`migrate_ca`] drives over the existing #12 mechanism; each is phrased
-/// so a re-run on an already-migrated mesh is a no-op.
+/// Workstation) to the freshly spawned lighthouse.
+///
+/// The steps *describe* the flow the real [`migrate_ca`] drives over the existing
+/// #12 mechanism; each is phrased so a re-run on an already-migrated mesh is a
+/// no-op.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum CaMigrationStep {
     /// 1. Mint a **lighthouse-scoped** join bearer on the CA holder — the
@@ -221,7 +224,7 @@ impl CaMigrationStep {
 
     /// A one-line human description of the step.
     #[must_use]
-    pub fn describe(self) -> &'static str {
+    pub const fn describe(self) -> &'static str {
         match self {
             Self::MintLighthouseToken => {
                 "mint a lighthouse-scoped join token (authorizes CA-key delivery, #12)"
@@ -239,9 +242,10 @@ impl CaMigrationStep {
 }
 
 /// The rendered provisioning spec — the cloud-init user-data (cloud) or the
-/// cloud-hypervisor VM config (local). Deterministic given the target, so it
-/// round-trips in tests. Carries a [`JOIN_TOKEN_PLACEHOLDER`] the enroll step
-/// substitutes.
+/// cloud-hypervisor VM config (local).
+///
+/// Deterministic given the target, so it round-trips in tests. Carries a
+/// [`JOIN_TOKEN_PLACEHOLDER`] the enroll step substitutes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum ProvisionSpec {
     /// A cloud droplet: its region/size/image + the rendered cloud-init user-data.
@@ -262,7 +266,7 @@ pub enum ProvisionSpec {
         /// Memory (MiB).
         mem_mb: u64,
         /// The rendered cloud-hypervisor VM config (cpus/memory/boot + the join
-        /// bootstrap NoCloud seed).
+        /// bootstrap `NoCloud` seed).
         vm_config: String,
     },
 }
@@ -321,13 +325,13 @@ impl SpawnPlan {
     /// Whether a retry is available (always true for the LAN-only outcome — the
     /// mesh keeps running and the operator retries after fixing the blocker).
     #[must_use]
-    pub fn retry_available(&self) -> bool {
+    pub const fn retry_available(&self) -> bool {
         matches!(self, Self::LanOnly { .. })
     }
 
     /// The rendered provisioning spec, when this plan provisions.
     #[must_use]
-    pub fn provision_spec(&self) -> Option<&ProvisionSpec> {
+    pub const fn provision_spec(&self) -> Option<&ProvisionSpec> {
         match self {
             Self::Provision { spec, .. } => Some(spec),
             Self::LanOnly { .. } => None,
@@ -336,7 +340,7 @@ impl SpawnPlan {
 
     /// How many lighthouses this plan stands up (0 for LAN-only, 2 for a pair).
     #[must_use]
-    pub fn lighthouse_count(&self) -> usize {
+    pub const fn lighthouse_count(&self) -> usize {
         match self {
             Self::LanOnly { .. } => 0,
             Self::Provision { pair, .. } => {
@@ -432,10 +436,12 @@ pub fn plan_spawn(req: &SpawnRequest, facts: &SpawnFacts) -> SpawnPlan {
     }
 }
 
-/// Pure renderer: the provisioning spec for `target`. Cloud → a `#cloud-config`
-/// user-data that installs the RPM off the channel and runs the lighthouse join;
-/// local → a cloud-hypervisor VM config that boots the same join bootstrap. Both
-/// carry the [`JOIN_TOKEN_PLACEHOLDER`] the enroll step substitutes.
+/// Pure renderer: the provisioning spec for `target`.
+///
+/// Cloud → a `#cloud-config` user-data that installs the RPM off the channel and
+/// runs the lighthouse join; local → a cloud-hypervisor VM config that boots the
+/// same join bootstrap. Both carry the [`JOIN_TOKEN_PLACEHOLDER`] the enroll step
+/// substitutes.
 #[must_use]
 pub fn render_spec(target: &SpawnTarget) -> ProvisionSpec {
     match target {
@@ -515,7 +521,7 @@ pub enum ProvisionError {
     /// The live path is not runnable in this build/environment yet — it needs a
     /// real prerequisite (cloud token / live SSH / the CA signer). Names the step
     /// + what is missing. §7-legal: a real method returning a real typed error,
-    /// exactly as OW-5's apply does when NetworkManager is unreachable.
+    ///   exactly as OW-5's apply does when `NetworkManager` is unreachable.
     IntegrationGated {
         /// Which seam step (`provision` / `push-enroll` / `migrate-ca`).
         step: &'static str,
@@ -646,9 +652,11 @@ pub enum SpawnOutcome {
     },
 }
 
-/// Pure orchestration over the [`Provisioner`] seam: for a [`SpawnPlan::Provision`]
-/// run provision → push-enroll → migrate-CA **in that order**; for
-/// [`SpawnPlan::LanOnly`] short-circuit to the retryable outcome (no seam calls).
+/// Pure orchestration over the [`Provisioner`] seam.
+///
+/// For a [`SpawnPlan::Provision`] run provision → push-enroll → migrate-CA **in
+/// that order**; for [`SpawnPlan::LanOnly`] short-circuit to the retryable outcome
+/// (no seam calls).
 ///
 /// This is the tested orchestration the fake pins; the real side effects live
 /// entirely in the injected `prov`.
@@ -694,7 +702,7 @@ pub fn gather(workgroup_root: &std::path::Path, node_id: &str) -> SpawnFacts {
 }
 
 /// Whether a cloud API token is present in the environment (the `doctl` /
-/// DigitalOcean vars). Pure over the process env — the signal the no-cloud-token
+/// `DigitalOcean` vars). Pure over the process env — the signal the no-cloud-token
 /// branch keys off.
 #[must_use]
 fn cloud_token_present() -> bool {
