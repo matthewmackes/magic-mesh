@@ -13,10 +13,20 @@
 #                                          # ALSO run bootc-image-builder (needs root podman)
 #
 # Typed-gated: every missing input is collected and printed before refusing —
-# no silent half-runs.
+# no silent half-runs, and never a raw podman splat for the expected airgap case.
+#
+# Exit codes:
+#   0  image (and disk, if requested) built
+#   2  REFUSED — bad/missing inputs (author error; itemized list on stderr)
+#   3  GATED[E12-13/base-image] — the registry is unreachable from this host.
+#      On the airgap-ish farm this is the EXPECTED outcome, not a bug: gain
+#      egress or side-load the base once (`podman load`) and re-run.
+#      (MCNF_PULL_TIMEOUT=<secs> bounds the probe; default 120.)
 set -euo pipefail
 
-usage() { sed -n '2,17p' "$0"; }
+# Print the header comment block (line 2 → first non-comment) so usage never
+# drifts from the doc when the header grows.
+usage() { awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; }
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 BOOTC_DIR="$REPO/packaging/bootc"
@@ -31,6 +41,45 @@ DISK_TYPE=""
 OUT_DIR="$BOOTC_DIR/out"
 # bootc-image-builder — the upstream disk-image builder for bootc images.
 BIB_IMAGE="${MCNF_BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder:latest}"
+PULL_TIMEOUT="${MCNF_PULL_TIMEOUT:-120}"
+
+# ── The E12-13 typed base-image gate ──────────────────────────────────────────
+# Resolve an image ref before we need it: already-in-local-storage wins (THE
+# airgap side-load path — podman build's default `missing` pull policy then
+# never touches the network), otherwise ONE bounded pull. A network-shaped
+# failure exits 3 with a GATED[...] block instead of a raw podman error halfway
+# through the build; a non-network pull failure (bad ref/tag) is an author
+# error and refuses with rc 2.
+resolve_image() { # $1 = image ref, $2 = what it is (for the message)
+    local ref="$1" label="$2" err rc=0
+    if podman image exists "$ref"; then
+        echo "==> $label image already in local storage (offline OK): $ref"
+        return 0
+    fi
+    local -a pull=(podman pull "$ref")
+    command -v timeout >/dev/null 2>&1 && pull=(timeout "$PULL_TIMEOUT" "${pull[@]}")
+    echo "==> pulling $label image: $ref (bounded: ${PULL_TIMEOUT}s)"
+    err=$("${pull[@]}" 2>&1 >/dev/null) || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    if [ "$rc" -eq 124 ] || grep -Eqi \
+        'no such host|dial tcp|i/o timeout|timed out|connection refused|network is unreachable|no route to host|tls handshake|proxyconnect|temporary failure in name resolution' \
+        <<<"$err"; then
+        {
+            echo "GATED[E12-13/base-image]: registry unreachable for the $label image"
+            echo "  ref: $ref"
+            printf '%s\n' "$err" | tail -n 3 | sed 's/^/  podman: /'
+            echo "This farm is airgap-ish — an unreachable registry is the EXPECTED gated"
+            echo "outcome here, not a build bug. Unblock either way:"
+            echo "  1. run on a host with container-registry egress, or"
+            echo "  2. side-load the $label image once: podman load -i <image.tar>"
+            echo "     (an image already in local storage skips this probe entirely)"
+        } >&2
+        exit 3
+    fi
+    echo "FATAL: podman pull failed for the $label image $ref (not network-shaped — check the ref/tag):" >&2
+    printf '%s\n' "$err" | tail -n 5 | sed 's/^/  podman: /' >&2
+    exit 2
+}
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -86,16 +135,30 @@ if [ "$LANE" = "local" ]; then
     cp -v "$RPM_PATH" "$RPMS_DIR/"
 fi
 
-# ── Build the bootc image ─────────────────────────────────────────────────────
+# ── The base-image gate, THEN the build ──────────────────────────────────────
+# Effective base = --base, else the Containerfile's ARG default (single source
+# of truth — never restate the quay ref here).
+EFFECTIVE_BASE="${BASE:-$(sed -n 's/^ARG BOOTC_BASE=//p' "$CONTAINERFILE" | head -n 1)}"
+if [ -z "$EFFECTIVE_BASE" ]; then
+    echo "FATAL: cannot determine the base image (no --base and no 'ARG BOOTC_BASE=' in $CONTAINERFILE)" >&2
+    exit 2
+fi
+resolve_image "$EFFECTIVE_BASE" "bootc base"
+
 build_args=(--build-arg "MCNF_RPM_LANE=$LANE")
 [ -n "$BASE" ] && build_args+=(--build-arg "BOOTC_BASE=$BASE")
 
-echo "==> bootc image build: lane=$LANE tag=$TAG base=${BASE:-<Containerfile default>}"
-podman build "${build_args[@]}" -t "$TAG" -f "$CONTAINERFILE" "$REPO"
+echo "==> bootc image build: lane=$LANE tag=$TAG base=$EFFECTIVE_BASE"
+# --ignorefile: context is the repo root but only packaging/ is COPYied —
+# the allowlist keeps crates/.git/docs out of the context upload.
+podman build "${build_args[@]}" -t "$TAG" \
+    --ignorefile "$BOOTC_DIR/context.containerignore" \
+    -f "$CONTAINERFILE" "$REPO"
 echo "==> built: $TAG"
 
 # ── Optional: a bootable disk image via bootc-image-builder ──────────────────
 if [ -n "$DISK_TYPE" ]; then
+    resolve_image "$BIB_IMAGE" "bootc-image-builder"
     mkdir -p "$OUT_DIR"
     echo "==> bootc-image-builder: type=$DISK_TYPE out=$OUT_DIR"
     podman run --rm --privileged \

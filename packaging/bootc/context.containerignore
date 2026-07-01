@@ -1,0 +1,6 @@
+# E12-13 — build-context allowlist (passed via `podman build --ignorefile`;
+# kept HERE, not at repo root, so no other container build inherits it).
+# The Containerfile COPYies only packaging/ paths; everything else (crates/,
+# .git/, docs/, infra/, target*/ …) would ride along as dead context weight.
+*
+!packaging

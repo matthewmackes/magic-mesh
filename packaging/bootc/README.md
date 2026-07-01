@@ -19,8 +19,12 @@ Contents:
   lane only; the dnf/RPM lane keeps launching the shell from a session via
   `org.magicmesh.Shell.desktop`.
 - `build-image.sh` — typed-gated build driver (podman build + optional
-  bootc-image-builder disk image). Refuses with an itemized list when inputs
-  are missing; shellcheck-clean.
+  bootc-image-builder disk image). Exit contract: `0` built; `2` REFUSED
+  (missing/invalid inputs, itemized — author error); `3` **GATED** — the
+  registry is unreachable from this host (`GATED[E12-13/base-image]`, the
+  expected outcome on the airgap-ish farm; never a raw podman splat mid-build).
+  An image already in local storage skips the pull probe entirely, so a
+  side-loaded base (`podman load`) builds fully offline. Shellcheck-clean.
 - `rpms/` — staging dir for the local-RPM lane (populated by
   `build-image.sh --rpm`; only `.gitkeep` is committed).
 
@@ -41,7 +45,20 @@ sudo packaging/bootc/build-image.sh --rpm <rpm> --disk qcow2
 ```
 
 `--base` overrides the Fedora bootc base (e.g. an F43 rebase);
-`--tag` names the output (default `localhost/magic-mesh-bootc:latest`).
+`--tag` names the output (default `localhost/magic-mesh-bootc:latest`);
+`MCNF_PULL_TIMEOUT=<secs>` bounds the base-image pull probe (default 120 —
+raise it on a slow uplink, the fleet base is GB-scale).
+
+Fully offline (no registry egress at all): side-load the base once —
+
+```sh
+podman load -i fedora-bootc-42.tar      # exported elsewhere via podman save
+packaging/bootc/build-image.sh --rpm <farm-built.rpm>
+```
+
+the gate sees the base in local storage and skips the pull; podman build's
+default `missing` pull policy never touches the network; the local-RPM lane
+avoids the dnf channel. Everything else fails **typed** (rc 3, above).
 
 ## Boot-to-seat & the systemd unit set
 
@@ -83,6 +100,13 @@ Nothing is masked by default — **every role boots this same image**:
 
   Re-roling is the reverse (`unmask` + `set-default graphical.target` + pin
   the role) — no reinstall, per §5.
+
+Relation to the **dnf-lane mesh-only set**: on the package channel the
+headless story is the `magic-mesh-server` variant RPM (same daemon + units,
+no GUI payload; conflicts with the full `magic-mesh`, `dnf swap` moves a node
+between them). The image lane deliberately has **no such variant** — one
+image, and the seat unit's role gate does what the package split does on the
+dnf lane. Both lanes read the same `/var/lib/mde/role.toml`.
 
 ## Writable-partition doctrine
 
