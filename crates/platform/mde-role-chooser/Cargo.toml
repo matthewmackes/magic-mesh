@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 # EFF-16 — license metadata so cargo-deny's unlicensed gate passes.
 license.workspace = true
-description = "MCNF first-run deployment-role chooser (E12-8): an egui client that pins Lighthouse / XCP-NG / Workstation at install via `mackesd role-pin`. Self-exits when a role is already pinned, so it can run as a first-boot autostart."
+description = "MCNF first-run onboarding entry (ONBOARD-WIZARD OW-1): an egui gate — disclaimer ack, pick Lighthouse / Workstation, pick create-vs-join — that pins the role via `mackesd role-pin` and records the intent (~/.config/mde/onboard.json) for the wizard. Self-exits when a role is already pinned, so it can run as a first-boot autostart."
 
 [[bin]]
 name = "mde-role-chooser"
