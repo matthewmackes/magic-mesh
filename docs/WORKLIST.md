@@ -2607,9 +2607,9 @@ _Design: `docs/design/workbench-control-surface.md` (locked 2026-06-29 via the o
 - [✓] **CTRLSURF-7: shared zebra `striped_list` helper** _(landed 67b718d)_
   As an operator, I want every list zebra-striped, so dense rows are scannable.
   - [✓] a shared helper (the `mde-notify-center` zebra idiom) backs the list/table panels; Carbon tokens only (§4) — new `striped_list` module (`row_shade`/`striped_row`) over a new `Palette::zebra_row(index)` mde-theme token (reuses the two layer shades, no literal, backed by a token test); routes all_services / mesh_pending / fleet_logs / network_hosts; `mde-notify-center` deduped onto it; `peers.rs` deliberately skipped (its row bg signals expand-state). Farm-green: mde-theme 233, mde-workbench 1316+, clippy 0.
-- [ ] **CTRLSURF-8: subtle density pass + new Workbench icon**
+- [✓] **CTRLSURF-8: subtle density pass + new Workbench icon** _(landed 62e4eb2)_
   As an operator, I want tightened spacing + a mesh-native app icon, so the console reads denser and on-brand.
-  - [ ] redundant triple titles dropped; fixed-height output boxes flex; the new mesh-control glyph replaces the Carbon tools icon in `assets/icons/carbon/workbench.svg` + the launcher tile
+  - [✓] redundant triple titles dropped (repair/system_update/registration/music — app.rs already renders breadcrumb + page_title); fixed-height output boxes flexed to `Length::Fill` (repair/system_update/logs, matching playbooks/jobs); logs.rs re-tokenised through `mde-theme` spacing (§4); the new mesh-native mesh-control glyph replaces the Material tools icon in `assets/icons/carbon/workbench.svg` — repointed via the shared `mde_theme::Icon::Workbench` source so every Workbench surface (incl. the sibling-owned launcher tile) updates transitively, honoring the BUG-20 consistency rule. Farm-green: mde-theme 233, mde-workbench 1373, clippy 0.
 
 ### NOTIFY-REDESIGN — Notification Hub redesign (operator-locked 2026-06-30; design: docs/design/notification-hub-redesign.md)
 
