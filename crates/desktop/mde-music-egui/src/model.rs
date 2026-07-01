@@ -58,6 +58,11 @@ pub struct MusicState {
     pub now_playing: Option<Song>,
     /// Whether the engine is in the playing (not paused) state.
     pub playing: bool,
+    /// The playhead position within the now-playing track, in milliseconds
+    /// (`0` when nothing plays). Driven by the worker's live poll of the engine,
+    /// so the transport shows real elapsed time instead of a value frozen at the
+    /// moment playback began.
+    pub position_ms: u64,
     /// A transient playback/engine error to surface (e.g. no audio device).
     pub error: Option<String>,
 }
@@ -81,8 +86,15 @@ pub enum Update {
     Started(Song),
     /// The play/pause state changed (`true` = playing, `false` = paused).
     Playing(bool),
+    /// The playhead advanced within the current track (position in milliseconds).
+    /// Emitted by the worker's poll while a track plays, so the transport shows a
+    /// live elapsed time rather than a value frozen at the moment playback began.
+    Progress(u64),
     /// Playback stopped and the now-playing track was cleared.
     Stopped,
+    /// The current track finished on its own (the engine drained) — distinct from
+    /// an operator Stop, but it clears the now-playing transport the same way.
+    Ended,
     /// A playback/engine error to surface to the operator.
     Error(String),
 }
@@ -131,12 +143,17 @@ impl MusicState {
             Update::Started(song) => {
                 self.now_playing = Some(song);
                 self.playing = true;
+                self.position_ms = 0;
                 self.error = None;
             }
             Update::Playing(playing) => self.playing = playing,
-            Update::Stopped => {
+            Update::Progress(ms) => self.position_ms = ms,
+            // A user Stop and a track finishing on its own both leave the
+            // transport empty and the playhead at zero.
+            Update::Stopped | Update::Ended => {
                 self.now_playing = None;
                 self.playing = false;
+                self.position_ms = 0;
             }
             Update::Error(e) => self.error = Some(e),
         }
@@ -172,9 +189,11 @@ pub fn track_for_engine(client: &Client, song: &Song) -> (String, SourceCodec) {
     )
 }
 
-/// Format a track length (whole seconds) as `m:ss`.
+/// Format a length (whole seconds) as `m:ss`. Takes `u64` so it renders both a
+/// track's tagged duration and the engine's live playhead (a `u64` millisecond
+/// count / 1000) without a truncating cast.
 #[must_use]
-pub fn format_duration(seconds: u32) -> String {
+pub fn format_duration(seconds: u64) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
@@ -305,6 +324,30 @@ mod tests {
         let mut s = MusicState::new();
         s.apply(Update::Error("no audio device".to_string()));
         assert_eq!(s.error.as_deref(), Some("no audio device"));
+    }
+
+    #[test]
+    fn progress_updates_track_the_playhead_and_reset_on_start() {
+        let mut s = MusicState::new();
+        s.apply(Update::Started(song("1", "flac", 200)));
+        assert_eq!(s.position_ms, 0);
+        s.apply(Update::Progress(12_345));
+        assert_eq!(s.position_ms, 12_345);
+        // Starting a new track rewinds the playhead to zero.
+        s.apply(Update::Started(song("2", "mp3", 60)));
+        assert_eq!(s.position_ms, 0);
+    }
+
+    #[test]
+    fn a_track_ending_on_its_own_clears_the_transport() {
+        let mut s = MusicState::new();
+        s.apply(Update::Started(song("9", "flac", 30)));
+        s.apply(Update::Progress(29_000));
+        // The worker's poll saw the engine drain and reports the natural end.
+        s.apply(Update::Ended);
+        assert!(s.now_playing.is_none(), "the finished track is cleared");
+        assert!(!s.playing);
+        assert_eq!(s.position_ms, 0);
     }
 
     #[test]

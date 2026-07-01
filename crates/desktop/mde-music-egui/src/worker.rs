@@ -10,7 +10,8 @@
 //! via `block_on`; playback control (`play`/`pause`/`stop`) is synchronous and the
 //! engine spawns its own decode thread, so no Tokio runtime is ever nested.
 
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::Duration;
 
 use mde_egui::egui::Context;
 use mde_musicd::airsonic::{Client, Song};
@@ -24,6 +25,11 @@ const LIBRARY_PAGE: u32 = 500;
 
 /// The `getAlbumList2` ordering used for the library listing.
 const LIBRARY_ORDER: &str = "alphabeticalByName";
+
+/// How often the worker polls the engine's live playhead while a track is loaded,
+/// pushing an [`Update::Progress`] and detecting a track that finished on its own.
+/// Fast enough for a smooth seconds readout, slow enough to stay off the UI.
+const PROGRESS_TICK: Duration = Duration::from_millis(500);
 
 /// Spawn the worker thread around `client`, returning the [`Command`] sender the
 /// UI drives it with. `ctx` is repainted after every [`Update`]; `updates`
@@ -57,47 +63,85 @@ fn run(client: &Client, ctx: &Context, updates: &Sender<Update>, rx: &Receiver<C
     // Opened on first play; a headless host with no sound card surfaces the
     // failure once, on the play attempt, instead of failing the whole surface.
     let mut engine: Option<Engine> = None;
+    // Whether a track is loaded in the engine (playing OR paused). While it is,
+    // we wait on a timeout so the live playhead and a natural end reach the UI
+    // without a user command; while it isn't, we block until the next command.
+    let mut track_loaded = false;
 
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            Command::LoadLibrary => {
-                let result = rt
-                    .block_on(client.get_album_list2(LIBRARY_ORDER, LIBRARY_PAGE))
-                    .map_err(|e| e.to_string());
-                let _ = updates.send(Update::Library(result));
+    loop {
+        let cmd = if track_loaded {
+            match rx.recv_timeout(PROGRESS_TICK) {
+                Ok(cmd) => Some(cmd),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-            Command::LoadAlbum(id) => {
-                let result = rt
-                    .block_on(client.get_album(&id))
-                    .map(|detail| detail.songs)
-                    .map_err(|e| e.to_string());
-                let _ = updates.send(Update::Tracks {
-                    album_id: id,
-                    result,
-                });
+        } else {
+            match rx.recv() {
+                Ok(cmd) => Some(cmd),
+                Err(_) => break,
             }
-            Command::Play(song) => play(client, &mut engine, updates, song),
-            Command::Pause => {
-                if let Some(eng) = engine.as_ref() {
-                    eng.pause();
+        };
+
+        if let Some(cmd) = cmd {
+            match cmd {
+                Command::LoadLibrary => {
+                    let result = rt
+                        .block_on(client.get_album_list2(LIBRARY_ORDER, LIBRARY_PAGE))
+                        .map_err(|e| e.to_string());
+                    let _ = updates.send(Update::Library(result));
                 }
-                let _ = updates.send(Update::Playing(false));
-            }
-            Command::Resume => {
-                if let Some(eng) = engine.as_ref() {
-                    eng.resume();
+                Command::LoadAlbum(id) => {
+                    let result = rt
+                        .block_on(client.get_album(&id))
+                        .map(|detail| detail.songs)
+                        .map_err(|e| e.to_string());
+                    let _ = updates.send(Update::Tracks {
+                        album_id: id,
+                        result,
+                    });
                 }
-                let _ = updates.send(Update::Playing(true));
-            }
-            Command::Stop => {
-                if let Some(eng) = engine.as_ref() {
-                    eng.stop();
+                Command::Play(song) => track_loaded = play(client, &mut engine, updates, song),
+                Command::Pause => {
+                    if let Some(eng) = engine.as_ref() {
+                        eng.pause();
+                    }
+                    let _ = updates.send(Update::Playing(false));
                 }
-                let _ = updates.send(Update::Stopped);
+                Command::Resume => {
+                    if let Some(eng) = engine.as_ref() {
+                        eng.resume();
+                    }
+                    let _ = updates.send(Update::Playing(true));
+                }
+                Command::Stop => {
+                    if let Some(eng) = engine.as_ref() {
+                        eng.stop();
+                    }
+                    track_loaded = false;
+                    let _ = updates.send(Update::Stopped);
+                }
+            }
+            // Wake the UI to drain the update we just sent.
+            ctx.request_repaint();
+        }
+
+        // Poll the live engine while a track is loaded and actually playing: report
+        // the playhead, or — once decode has finished and the ring has drained —
+        // report the natural end so the transport clears instead of freezing on
+        // the last track. A paused engine reports neither (it is not playing).
+        if track_loaded {
+            if let Some(eng) = engine.as_ref() {
+                if eng.is_playing() {
+                    if eng.is_active() {
+                        let _ = updates.send(Update::Progress(eng.position_ms()));
+                    } else {
+                        track_loaded = false;
+                        let _ = updates.send(Update::Ended);
+                    }
+                    ctx.request_repaint();
+                }
             }
         }
-        // Wake the UI to drain the update we just sent.
-        ctx.request_repaint();
     }
 }
 
@@ -121,11 +165,22 @@ fn ensure_engine<'a>(
 }
 
 /// Resolve the track's authenticated stream URL + codec and start it on the
-/// engine, replacing any current playback. Confirms with [`Update::Started`].
-fn play(client: &Client, engine: &mut Option<Engine>, updates: &Sender<Update>, song: Song) {
+/// engine, replacing any current playback. Confirms with [`Update::Started`] and
+/// returns `true` when a track is now loaded, so the caller begins polling the
+/// playhead; returns `false` (having surfaced an [`Update::Error`]) when no audio
+/// device is available.
+fn play(
+    client: &Client,
+    engine: &mut Option<Engine>,
+    updates: &Sender<Update>,
+    song: Song,
+) -> bool {
     if let Some(eng) = ensure_engine(engine, updates) {
         let (url, codec) = track_for_engine(client, &song);
         eng.play(vec![(url, codec)]);
         let _ = updates.send(Update::Started(song));
+        true
+    } else {
+        false
     }
 }

@@ -122,8 +122,22 @@ impl MusicApp {
                     } else {
                         "Paused"
                     };
+                    // Live elapsed / total from the worker's playhead poll. Clamp
+                    // the elapsed value to the tagged length so a slightly-ahead
+                    // playhead never reads past the end; when the server gave no
+                    // length (e.g. a stream), show the elapsed time on its own.
+                    let elapsed = self.state.position_ms / 1000;
+                    let status = if song.duration > 0 {
+                        format!(
+                            "{state_word} · {} / {}",
+                            format_duration(elapsed.min(u64::from(song.duration))),
+                            format_duration(u64::from(song.duration)),
+                        )
+                    } else {
+                        format!("{state_word} · {}", format_duration(elapsed))
+                    };
                     ui.label(
-                        RichText::new(state_word)
+                        RichText::new(status)
                             .size(Style::SMALL)
                             .color(Style::TEXT_DIM),
                     );
@@ -352,7 +366,7 @@ fn track_row(ui: &mut egui::Ui, index: usize, song: &Song) -> Response {
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(
-                    RichText::new(format_duration(song.duration))
+                    RichText::new(format_duration(u64::from(song.duration)))
                         .monospace()
                         .size(Style::SMALL)
                         .color(Style::TEXT_DIM),
