@@ -185,7 +185,7 @@ fn peer_row(
     actions: &mut Vec<Action>,
 ) {
     ui.horizontal(|ui| {
-        status_dot(ui, peer_color(peer.status));
+        mde_egui::status_dot(ui, peer_color(peer.status));
         let browsing = matches!(b.pane(), Pane::Peer(id) if id.as_str() == peer.id.as_str());
         if ui
             .selectable_label(browsing, peer.host.as_str())
@@ -301,7 +301,7 @@ fn node_role(b: &FileBrowser) -> &'static str {
 fn mesh_badge(ui: &mut egui::Ui, b: &FileBrowser) {
     ui.horizontal(|ui| {
         if let Some(mesh) = b.mesh_overlay() {
-            status_dot(ui, Style::OK);
+            mde_egui::status_dot(ui, Style::OK);
             let mut label = if mesh.mesh_id.is_empty() {
                 "on the mesh".to_string()
             } else {
@@ -313,7 +313,7 @@ fn mesh_badge(ui: &mut egui::Ui, b: &FileBrowser) {
             }
             mde_egui::muted_note(ui, label);
         } else {
-            status_dot(ui, Style::WARN);
+            mde_egui::status_dot(ui, Style::WARN);
             mde_egui::muted_note(ui, "Standalone — no mesh");
         }
     });
@@ -326,14 +326,6 @@ fn section_header(ui: &mut egui::Ui, text: &str) {
             .size(Style::SMALL)
             .strong(),
     );
-}
-
-/// A small filled circle used as a peer reachability indicator.
-fn status_dot(ui: &mut egui::Ui, color: Color32) {
-    let diameter = Style::SP_S;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
-    ui.painter()
-        .circle_filled(rect.center(), diameter * 0.28, color);
 }
 
 /// One monospace-aligned listing line: a type tag, the name, the size + age, and

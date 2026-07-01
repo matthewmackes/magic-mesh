@@ -53,7 +53,7 @@ pub fn header(ui: &mut egui::Ui, app: &VoiceApp) {
             ui.add_space(Style::SP_S);
             mde_egui::muted_note(ui, app.state.registration.label());
             ui.add_space(Style::SP_XS);
-            status_dot(ui, tone_color(registration_tone(&app.state.registration)));
+            mde_egui::status_dot(ui, tone_color(registration_tone(&app.state.registration)));
         });
     });
     ui.add_space(Style::SP_XS);
@@ -193,14 +193,6 @@ fn dialer(ui: &mut egui::Ui, state: &VoiceState, dial: &mut String, cmds: &mut V
 }
 
 // ── Small render helpers ────────────────────────────────────────────────────
-
-/// A small filled circle used as the registration status indicator.
-fn status_dot(ui: &mut egui::Ui, color: Color32) {
-    let diameter = Style::SP_S;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(diameter, diameter), egui::Sense::hover());
-    ui.painter()
-        .circle_filled(rect.center(), diameter * 0.28, color);
-}
 
 /// Map a render-agnostic [`Tone`] to its shared `Style` colour.
 const fn tone_color(tone: Tone) -> Color32 {

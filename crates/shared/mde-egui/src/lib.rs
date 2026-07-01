@@ -37,7 +37,7 @@ pub mod drm;
 pub use motion::Motion;
 pub use runner::run_client;
 pub use style::Style;
-pub use widgets::muted_note;
+pub use widgets::{muted_note, status_dot};
 
 #[cfg(feature = "drm")]
 pub use drm::run_drm;

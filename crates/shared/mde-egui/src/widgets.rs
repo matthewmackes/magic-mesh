@@ -4,7 +4,7 @@
 //! these instead of re-typing the same idiom, so a look lives in ONE place
 //! (§6 glue; `/polish` axis 7 — component reuse & consolidation).
 
-use egui::{Response, RichText, Ui};
+use egui::{Color32, Response, RichText, Sense, Ui};
 
 use crate::Style;
 
@@ -21,6 +21,19 @@ use crate::Style;
 /// content (§7 — a muted note is an honest "nothing here", never a mockup).
 pub fn muted_note(ui: &mut Ui, msg: impl Into<String>) -> Response {
     ui.colored_label(Style::TEXT_DIM, RichText::new(msg).size(Style::SMALL))
+}
+
+/// A small filled **status dot** — a [`Style::SP_S`]-sized circle in `color` —
+/// for an inline health/presence indicator beside a label.
+///
+/// The single source for the primitive that mde-files-egui and mde-voice-egui
+/// hand-rolled byte-identically. `color` is a `Style` palette token
+/// ([`Style::OK`]/[`Style::WARN`]/[`Style::DANGER`]/…), never a raw literal.
+pub fn status_dot(ui: &mut Ui, color: Color32) {
+    let diameter = Style::SP_S;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(diameter, diameter), Sense::hover());
+    ui.painter()
+        .circle_filled(rect.center(), diameter * 0.28, color);
 }
 
 #[cfg(test)]
@@ -40,6 +53,20 @@ mod tests {
                 // Accepts both &str and String callers (the two call-site shapes).
                 let owned = String::from("roster not yet reported");
                 let _ = muted_note(ui, owned);
+            });
+        });
+    }
+
+    #[test]
+    fn status_dot_paints_without_panicking() {
+        // Headless render: allocating + painting the dot must not panic, and it
+        // takes a Style palette token (proving the primitive is live, reachable
+        // code both surfaces can share).
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                status_dot(ui, Style::OK);
+                status_dot(ui, Style::DANGER);
             });
         });
     }
