@@ -39,3 +39,8 @@ _(2026-06-29 — surfaced during the workbench critical-bug drain. The `accept` 
 - **MEDIA-6: shared service account auto-provisioning** — _needs:_ Blocked on MEDIA-2 (live bucket) + live Lighthouse_Media node. Only the env-var half exists in the unpackaged helper. Idempotent account creation (first-start provisioning), durable shared-playlist wr
 - **MEDIA-9: content ingestion — operator upload to the bucket** — _needs:_ Blocked on MEDIA-2 (live bucket) + MEDIA-3 (running Lighthouse_Media). No upload path or rescan trigger wired. Every acceptance (upload via rclone / mesh Files surface, rescan refresh, tracks appear i
 - **MEDIA-10: redundancy + live verification on DO** — _needs:_ Pure live verification task. Requires: (1) ≥2 Lighthouse_Media nodes on real DO serving the same bucket; (2) kill-one resilience with user-visible gap measurement; (3) fresh-node auto-config + plays e
+
+## Parked by the drain loop (DRAIN-5)
+
+Units the drain loop parked automatically (a live-infra/artifact/gate blocker it could not clear from a build). Each needs an operator/live action.
+- **E12-9-audio** (parked 2026-07-01) — remote audio needs an ironrdp RDPSND/audio virtual-channel API that the pinned version doesn't expose; needs an ironrdp bump or a custom SVC decoder — operator/design call
