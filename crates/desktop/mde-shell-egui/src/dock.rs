@@ -93,9 +93,7 @@ impl Surface {
             Surface::Notifications => {
                 "Mesh-wide alerts — security, presence, firewall, compute events."
             }
-            Surface::Clipboard => {
-                "Recent clipboard copies from across the mesh, newest first."
-            }
+            Surface::Clipboard => "Recent clipboard copies from across the mesh, newest first.",
         }
     }
 }

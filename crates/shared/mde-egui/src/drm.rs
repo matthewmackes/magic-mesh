@@ -210,18 +210,42 @@ fn drm_key(code: u32) -> Option<egui::Key> {
         110 => egui::Key::Insert,
         111 => egui::Key::Delete,
         // Letters (physical key — layout-independent)
-        16 => egui::Key::Q, 17 => egui::Key::W, 18 => egui::Key::E, 19 => egui::Key::R,
-        20 => egui::Key::T, 21 => egui::Key::Y, 22 => egui::Key::U, 23 => egui::Key::I,
-        24 => egui::Key::O, 25 => egui::Key::P,
-        30 => egui::Key::A, 31 => egui::Key::S, 32 => egui::Key::D, 33 => egui::Key::F,
-        34 => egui::Key::G, 35 => egui::Key::H, 36 => egui::Key::J, 37 => egui::Key::K,
+        16 => egui::Key::Q,
+        17 => egui::Key::W,
+        18 => egui::Key::E,
+        19 => egui::Key::R,
+        20 => egui::Key::T,
+        21 => egui::Key::Y,
+        22 => egui::Key::U,
+        23 => egui::Key::I,
+        24 => egui::Key::O,
+        25 => egui::Key::P,
+        30 => egui::Key::A,
+        31 => egui::Key::S,
+        32 => egui::Key::D,
+        33 => egui::Key::F,
+        34 => egui::Key::G,
+        35 => egui::Key::H,
+        36 => egui::Key::J,
+        37 => egui::Key::K,
         38 => egui::Key::L,
-        44 => egui::Key::Z, 45 => egui::Key::X, 46 => egui::Key::C, 47 => egui::Key::V,
-        48 => egui::Key::B, 49 => egui::Key::N, 50 => egui::Key::M,
+        44 => egui::Key::Z,
+        45 => egui::Key::X,
+        46 => egui::Key::C,
+        47 => egui::Key::V,
+        48 => egui::Key::B,
+        49 => egui::Key::N,
+        50 => egui::Key::M,
         // Digit row
-        2 => egui::Key::Num1, 3 => egui::Key::Num2, 4 => egui::Key::Num3,
-        5 => egui::Key::Num4, 6 => egui::Key::Num5, 7 => egui::Key::Num6,
-        8 => egui::Key::Num7, 9 => egui::Key::Num8, 10 => egui::Key::Num9,
+        2 => egui::Key::Num1,
+        3 => egui::Key::Num2,
+        4 => egui::Key::Num3,
+        5 => egui::Key::Num4,
+        6 => egui::Key::Num5,
+        7 => egui::Key::Num6,
+        8 => egui::Key::Num7,
+        9 => egui::Key::Num8,
+        10 => egui::Key::Num9,
         11 => egui::Key::Num0,
         _ => return None,
     })
@@ -234,55 +258,102 @@ fn drm_key(code: u32) -> Option<egui::Key> {
 fn drm_char(code: u32, shift: bool) -> Option<char> {
     Some(match (code, shift) {
         // Letters
-        (16, false) => 'q', (16, true) => 'Q',
-        (17, false) => 'w', (17, true) => 'W',
-        (18, false) => 'e', (18, true) => 'E',
-        (19, false) => 'r', (19, true) => 'R',
-        (20, false) => 't', (20, true) => 'T',
-        (21, false) => 'y', (21, true) => 'Y',
-        (22, false) => 'u', (22, true) => 'U',
-        (23, false) => 'i', (23, true) => 'I',
-        (24, false) => 'o', (24, true) => 'O',
-        (25, false) => 'p', (25, true) => 'P',
-        (30, false) => 'a', (30, true) => 'A',
-        (31, false) => 's', (31, true) => 'S',
-        (32, false) => 'd', (32, true) => 'D',
-        (33, false) => 'f', (33, true) => 'F',
-        (34, false) => 'g', (34, true) => 'G',
-        (35, false) => 'h', (35, true) => 'H',
-        (36, false) => 'j', (36, true) => 'J',
-        (37, false) => 'k', (37, true) => 'K',
-        (38, false) => 'l', (38, true) => 'L',
-        (44, false) => 'z', (44, true) => 'Z',
-        (45, false) => 'x', (45, true) => 'X',
-        (46, false) => 'c', (46, true) => 'C',
-        (47, false) => 'v', (47, true) => 'V',
-        (48, false) => 'b', (48, true) => 'B',
-        (49, false) => 'n', (49, true) => 'N',
-        (50, false) => 'm', (50, true) => 'M',
+        (16, false) => 'q',
+        (16, true) => 'Q',
+        (17, false) => 'w',
+        (17, true) => 'W',
+        (18, false) => 'e',
+        (18, true) => 'E',
+        (19, false) => 'r',
+        (19, true) => 'R',
+        (20, false) => 't',
+        (20, true) => 'T',
+        (21, false) => 'y',
+        (21, true) => 'Y',
+        (22, false) => 'u',
+        (22, true) => 'U',
+        (23, false) => 'i',
+        (23, true) => 'I',
+        (24, false) => 'o',
+        (24, true) => 'O',
+        (25, false) => 'p',
+        (25, true) => 'P',
+        (30, false) => 'a',
+        (30, true) => 'A',
+        (31, false) => 's',
+        (31, true) => 'S',
+        (32, false) => 'd',
+        (32, true) => 'D',
+        (33, false) => 'f',
+        (33, true) => 'F',
+        (34, false) => 'g',
+        (34, true) => 'G',
+        (35, false) => 'h',
+        (35, true) => 'H',
+        (36, false) => 'j',
+        (36, true) => 'J',
+        (37, false) => 'k',
+        (37, true) => 'K',
+        (38, false) => 'l',
+        (38, true) => 'L',
+        (44, false) => 'z',
+        (44, true) => 'Z',
+        (45, false) => 'x',
+        (45, true) => 'X',
+        (46, false) => 'c',
+        (46, true) => 'C',
+        (47, false) => 'v',
+        (47, true) => 'V',
+        (48, false) => 'b',
+        (48, true) => 'B',
+        (49, false) => 'n',
+        (49, true) => 'N',
+        (50, false) => 'm',
+        (50, true) => 'M',
         // Digits and their shift-symbols
-        (2, false) => '1', (2, true) => '!',
-        (3, false) => '2', (3, true) => '@',
-        (4, false) => '3', (4, true) => '#',
-        (5, false) => '4', (5, true) => '$',
-        (6, false) => '5', (6, true) => '%',
-        (7, false) => '6', (7, true) => '^',
-        (8, false) => '7', (8, true) => '&',
-        (9, false) => '8', (9, true) => '*',
-        (10, false) => '9', (10, true) => '(',
-        (11, false) => '0', (11, true) => ')',
+        (2, false) => '1',
+        (2, true) => '!',
+        (3, false) => '2',
+        (3, true) => '@',
+        (4, false) => '3',
+        (4, true) => '#',
+        (5, false) => '4',
+        (5, true) => '$',
+        (6, false) => '5',
+        (6, true) => '%',
+        (7, false) => '6',
+        (7, true) => '^',
+        (8, false) => '7',
+        (8, true) => '&',
+        (9, false) => '8',
+        (9, true) => '*',
+        (10, false) => '9',
+        (10, true) => '(',
+        (11, false) => '0',
+        (11, true) => ')',
         // Punctuation
-        (12, false) => '-', (12, true) => '_',
-        (13, false) => '=', (13, true) => '+',
-        (26, false) => '[', (26, true) => '{',
-        (27, false) => ']', (27, true) => '}',
-        (43, false) => '\\', (43, true) => '|',
-        (39, false) => ';', (39, true) => ':',
-        (40, false) => '\'', (40, true) => '"',
-        (41, false) => '`', (41, true) => '~',
-        (51, false) => ',', (51, true) => '<',
-        (52, false) => '.', (52, true) => '>',
-        (53, false) => '/', (53, true) => '?',
+        (12, false) => '-',
+        (12, true) => '_',
+        (13, false) => '=',
+        (13, true) => '+',
+        (26, false) => '[',
+        (26, true) => '{',
+        (27, false) => ']',
+        (27, true) => '}',
+        (43, false) => '\\',
+        (43, true) => '|',
+        (39, false) => ';',
+        (39, true) => ':',
+        (40, false) => '\'',
+        (40, true) => '"',
+        (41, false) => '`',
+        (41, true) => '~',
+        (51, false) => ',',
+        (51, true) => '<',
+        (52, false) => '.',
+        (52, true) => '>',
+        (53, false) => '/',
+        (53, true) => '?',
         (57, _) => ' ',
         _ => return None,
     })
@@ -359,18 +430,27 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     let (config, gbm_format) = configs
         .iter()
         .copied()
-        .find(|&c| egl.get_config_attrib(display, c, egl::NATIVE_VISUAL_ID) == Ok(DRM_FORMAT_XRGB8888))
+        .find(|&c| {
+            egl.get_config_attrib(display, c, egl::NATIVE_VISUAL_ID) == Ok(DRM_FORMAT_XRGB8888)
+        })
         .map(|c| (c, gbm::Format::Xrgb8888))
         .or_else(|| {
-            configs.iter().copied()
-                .find(|&c| egl.get_config_attrib(display, c, egl::NATIVE_VISUAL_ID) == Ok(DRM_FORMAT_ARGB8888))
+            configs
+                .iter()
+                .copied()
+                .find(|&c| {
+                    egl.get_config_attrib(display, c, egl::NATIVE_VISUAL_ID)
+                        == Ok(DRM_FORMAT_ARGB8888)
+                })
                 .map(|c| (c, gbm::Format::Argb8888))
         })
         .or_else(|| {
             // Use DrmFourcc TryFrom to accept ANY format the driver advertises.
             use std::convert::TryFrom;
             configs.iter().copied().find_map(|c| {
-                let vid = egl.get_config_attrib(display, c, egl::NATIVE_VISUAL_ID).ok()?;
+                let vid = egl
+                    .get_config_attrib(display, c, egl::NATIVE_VISUAL_ID)
+                    .ok()?;
                 let fmt = gbm::Format::try_from(vid as u32).ok()?;
                 Some((c, fmt))
             })
@@ -474,7 +554,12 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                     if code == 1 && pressed {
                         quit = true; // ESC exits the DRM shell
                     }
-                    let modifiers = egui::Modifiers { alt, ctrl, shift, ..Default::default() };
+                    let modifiers = egui::Modifiers {
+                        alt,
+                        ctrl,
+                        shift,
+                        ..Default::default()
+                    };
                     if let Some(key) = drm_key(code) {
                         events.push(egui::Event::Key {
                             key,

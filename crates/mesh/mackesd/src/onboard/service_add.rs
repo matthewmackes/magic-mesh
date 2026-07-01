@@ -1251,7 +1251,10 @@ mod tests {
                     reason.contains("media-spaces"),
                     "names the creds ref: {reason}"
                 );
-                assert!(reason.contains("DO Spaces"), "names the creds source: {reason}");
+                assert!(
+                    reason.contains("DO Spaces"),
+                    "names the creds source: {reason}"
+                );
                 assert!(
                     reason.contains("Media role"),
                     "names the capability-driven provisioning: {reason}"
