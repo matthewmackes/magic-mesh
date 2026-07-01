@@ -193,17 +193,15 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     let (w, h) = output.mode.size();
     let (wp, hp) = (u32::from(w), u32::from(h));
 
-    // GBM scanout surface at the native mode (the `gbm::Device` also drives KMS via
+    // GBM device from the DRM fd (the `gbm::Device` also drives KMS via
     // the drm-support feature, so it stands in for `card` from here on).
+    // The GBM *surface* is created AFTER EGL config selection so its format
+    // matches EGL_NATIVE_VISUAL_ID — creating the surface first and then
+    // searching for a matching EGL config inverts the dependency and causes
+    // Mesa to internally re-select a different DRI config for the window
+    // surface than the one the context was created with, triggering
+    // EGL_BAD_MATCH at eglMakeCurrent (seen live on Eagle Intel iGPU).
     let gbm = gbm::Device::new(card).map_err(|e| DrmError::Gbm(format!("gbm device: {e}")))?;
-    let gbm_surface = gbm
-        .create_surface::<()>(
-            wp,
-            hp,
-            gbm::Format::Xrgb8888,
-            gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING,
-        )
-        .map_err(|e| DrmError::Gbm(format!("gbm surface {wp}x{hp}: {e}")))?;
 
     // --- EGL on the GBM device (Mesa accepts the gbm device as the native display) ---
     let egl = unsafe { egl::DynamicInstance::<egl::EGL1_4>::load_required() }
@@ -212,30 +210,68 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
         egl.get_display(gbm.as_raw() as *mut c_void)
             .ok_or_else(|| DrmError::Egl("eglGetDisplay returned no display".into()))?
     };
-    egl.initialize(display).map_err(egl_err)?;
-    egl.bind_api(egl::OPENGL_ES_API).map_err(egl_err)?;
+    egl.initialize(display)
+        .map_err(|e| DrmError::Egl(format!("eglInitialize: {e}")))?;
+    egl.bind_api(egl::OPENGL_ES_API)
+        .map_err(|e| DrmError::Egl(format!("eglBindAPI: {e}")))?;
 
-    let config = egl
-        .choose_first_config(
-            display,
-            &[
-                egl::SURFACE_TYPE,
-                egl::WINDOW_BIT,
-                egl::RENDERABLE_TYPE,
-                egl::OPENGL_ES2_BIT,
-                egl::RED_SIZE,
-                8,
-                egl::GREEN_SIZE,
-                8,
-                egl::BLUE_SIZE,
-                8,
-                egl::ALPHA_SIZE,
-                0,
-                egl::NONE,
-            ],
+    let attribs = [
+        egl::SURFACE_TYPE,
+        egl::WINDOW_BIT,
+        egl::RENDERABLE_TYPE,
+        egl::OPENGL_ES2_BIT,
+        egl::RED_SIZE,
+        8,
+        egl::GREEN_SIZE,
+        8,
+        egl::BLUE_SIZE,
+        8,
+        egl::ALPHA_SIZE,
+        0,
+        egl::NONE,
+    ];
+    let mut configs = Vec::with_capacity(32);
+    egl.choose_config(display, &attribs, &mut configs)
+        .map_err(|e| DrmError::Egl(format!("eglChooseConfig: {e}")))?;
+    if configs.is_empty() {
+        return Err(DrmError::Egl("eglChooseConfig: no configs matched".into()));
+    }
+    // Pick config + GBM format together: prefer XRGB8888, then ARGB8888, then
+    // accept the first config whose NATIVE_VISUAL_ID converts to any recognized
+    // GBM format. On Intel iris with Mesa 26 all configs advertise
+    // XRGB2101010 (0x30335258, "XR30") — the fallback branch handles that.
+    const DRM_FORMAT_XRGB8888: egl::Int = 0x3432_5258;
+    const DRM_FORMAT_ARGB8888: egl::Int = 0x3432_5241;
+    let (config, gbm_format) = configs
+        .iter()
+        .copied()
+        .find(|&c| egl.get_config_attrib(display, c, egl::NATIVE_VISUAL_ID) == Ok(DRM_FORMAT_XRGB8888))
+        .map(|c| (c, gbm::Format::Xrgb8888))
+        .or_else(|| {
+            configs.iter().copied()
+                .find(|&c| egl.get_config_attrib(display, c, egl::NATIVE_VISUAL_ID) == Ok(DRM_FORMAT_ARGB8888))
+                .map(|c| (c, gbm::Format::Argb8888))
+        })
+        .or_else(|| {
+            // Use DrmFourcc TryFrom to accept ANY format the driver advertises.
+            use std::convert::TryFrom;
+            configs.iter().copied().find_map(|c| {
+                let vid = egl.get_config_attrib(display, c, egl::NATIVE_VISUAL_ID).ok()?;
+                let fmt = gbm::Format::try_from(vid as u32).ok()?;
+                Some((c, fmt))
+            })
+        })
+        .ok_or_else(|| DrmError::Egl("no EGL config with a recognized GBM format".into()))?;
+
+    // GBM scanout surface — format chosen to match the selected EGL config.
+    let gbm_surface = gbm
+        .create_surface::<()>(
+            wp,
+            hp,
+            gbm_format,
+            gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING,
         )
-        .map_err(egl_err)?
-        .ok_or_else(|| DrmError::Egl("no matching EGL config".into()))?;
+        .map_err(|e| DrmError::Gbm(format!("gbm surface {wp}x{hp}: {e}")))?;
 
     let context = egl
         .create_context(
@@ -244,13 +280,13 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
             None,
             &[egl::CONTEXT_MAJOR_VERSION, 2, egl::NONE],
         )
-        .map_err(egl_err)?;
+        .map_err(|e| DrmError::Egl(format!("eglCreateContext: {e}")))?;
     let surface = unsafe {
         egl.create_window_surface(display, config, gbm_surface.as_raw() as *mut c_void, None)
-            .map_err(egl_err)?
+            .map_err(|e| DrmError::Egl(format!("eglCreateWindowSurface: {e}")))?
     };
     egl.make_current(display, Some(surface), Some(surface), Some(context))
-        .map_err(egl_err)?;
+        .map_err(|e| DrmError::Egl(format!("eglMakeCurrent: {e}")))?;
 
     // --- glow + egui_glow on the EGL context ---
     let gl = unsafe {
@@ -325,7 +361,18 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
             events,
             ..Default::default()
         };
-        let full_output = egui_ctx.run(raw_input, |ctx| ui(ctx));
+        let cur = pointer;
+        let full_output = egui_ctx.run(raw_input, |ctx| {
+            ui(ctx);
+            // Software cursor: draw a small crosshair/dot at the pointer position.
+            // The DRM backend has no OS cursor; we own the whole framebuffer.
+            let layer = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new("drm_cursor"),
+            ));
+            layer.circle_filled(cur, 4.0, egui::Color32::WHITE);
+            layer.circle_stroke(cur, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
+        });
         let clipped = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
         painter.paint_and_update_textures(
             [wp, hp],
@@ -342,8 +389,13 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                 .lock_front_buffer()
                 .map_err(|e| DrmError::Present(format!("lock_front_buffer: {e}")))?
         };
+        let (fb_depth, fb_bpp) = match gbm_format {
+            gbm::Format::Xrgb2101010 | gbm::Format::Argb2101010 => (30u32, 32u32),
+            gbm::Format::Rgb565 | gbm::Format::Bgr565 => (16, 16),
+            _ => (24, 32),
+        };
         let fb = gbm
-            .add_framebuffer(&bo, 24, 32)
+            .add_framebuffer(&bo, fb_depth, fb_bpp)
             .map_err(|e| DrmError::Present(format!("add_framebuffer: {e}")))?;
         if prev.is_none() {
             gbm.set_crtc(
