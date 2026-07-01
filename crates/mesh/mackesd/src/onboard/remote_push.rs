@@ -19,8 +19,11 @@
 //!   **signed** [`JobBundle`] to an **enrolled** peer; the `onboard_apply` worker
 //!   validates signer + freshness + the allow-list and applies.
 
+use crate::ipc::secret_store::SecretStore;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use mde_role::{Role, RoleClass};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// The bounded, exhaustive set of effects the executor will apply on a target.
 ///
@@ -29,13 +32,19 @@ use serde::{Deserialize, Serialize};
 /// no `Exec(String)`). This enum *is* the security allow-list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
-    /// Pin a deployment role/capability on the target (e.g. `Media` for OW-11's
-    /// media-lighthouse, so its `navidrome_supervisor` provisions Navidrome).
-    PinRole { role: String },
-    /// Seal a named secret into the target's local store. The `sealed` value is
-    /// the already-encrypted blob (LocalAead / age ciphertext) — it is opaque
-    /// here and MUST NOT be logged; only the `name` is loggable.
-    SealSecret { name: String, sealed: Vec<u8> },
+    /// Pin a deployment role + its capability tags on the target. `role` is a
+    /// [`mde_role::Role`] name (`lighthouse`/`workstation`); `media` sets the
+    /// [`mde_role::Capability::Media`] tag (OW-11 promotes a plain lighthouse to
+    /// `Lighthouse_Media` so its `navidrome_supervisor` provisions Navidrome).
+    PinRole { role: String, media: bool },
+    /// Seal a named secret into the target's replicated store. `secret` is the
+    /// plaintext value; the target's [`SecretStore`] encrypts it **at rest** (the
+    /// audited `age`+etcd or local-AEAD envelope) — matching how the platform's
+    /// own `mcnf-secret.sh` takes plaintext and seals it. It travels only inside a
+    /// signed [`JobBundle`] over an encrypted transport (Nebula overlay for day-2,
+    /// bearer-scoped SSH for bootstrap) and MUST NOT be logged; only the `name` is
+    /// loggable ([`Action::redacted`]).
+    SealSecret { name: String, secret: String },
     /// Run the RPM-shipped enroll bootstrap so a fresh box joins the mesh
     /// (OW-7 push-enroll). Carries the single-use enroll bearer.
     RunEnroll { bearer: String },
@@ -49,9 +58,12 @@ impl Action {
     #[must_use]
     pub fn redacted(&self) -> String {
         match self {
-            Self::PinRole { role } => format!("pin-role {role}"),
-            Self::SealSecret { name, sealed } => {
-                format!("seal-secret {name} ({} bytes, redacted)", sealed.len())
+            Self::PinRole { role, media } => {
+                let tag = if *media { " +media" } else { "" };
+                format!("pin-role {role}{tag}")
+            }
+            Self::SealSecret { name, secret } => {
+                format!("seal-secret {name} ({} bytes, redacted)", secret.len())
             }
             Self::RunEnroll { .. } => "run-enroll (bearer redacted)".to_string(),
             Self::OpenBroker { session_id } => format!("open-broker {session_id}"),
@@ -221,6 +233,96 @@ pub fn apply_all(applier: &dyn Applier, actions: &[Action]) -> Result<(), Remote
     Ok(())
 }
 
+/// The production [`Applier`] — applies an [`Action`]'s **local effect** on THIS
+/// node using the real primitives, no shell escape-hatch:
+///
+/// * [`Action::PinRole`] → [`mde_role::pin_class_at`] (writes the pinned
+///   `role.toml`, upgrade-only; promoting a lighthouse to `Lighthouse_Media` is
+///   exactly OW-11's Music step).
+/// * [`Action::SealSecret`] → [`SecretStore::put`] (encrypts at rest into the
+///   replicated `age`+etcd store, or the local-AEAD fallback).
+///
+/// [`Action::RunEnroll`] and [`Action::OpenBroker`] are **not** local effects:
+/// enroll is the bootstrap step the `SshBootstrap` transport runs over the
+/// enroll-bearer SSH, and open-broker is a Bus publish the `onboard_apply` worker
+/// (which holds the Bus handle) issues. This applier owns the two node-local
+/// effects only, so both transports + the worker converge on ONE place for them;
+/// it returns a typed [`RemotePushError::NotWired`] naming the layer that does own
+/// the action, never a fake success (§7).
+pub struct LocalApplier {
+    /// Where the pinned role is written — the canonical `/var/lib/mde/role.toml`
+    /// in production, a redirect in tests (via [`mde_role::default_role_path`]'s
+    /// `MDE_ROLE_PATH`, or an explicit path here).
+    role_path: PathBuf,
+    /// The node's secret store — the mesh `age`+etcd store when its helper is
+    /// reachable, else the local-AEAD fallback ([`SecretStore::resolve`]).
+    store: SecretStore,
+}
+
+impl LocalApplier {
+    /// Production constructor: pin at the canonical role path, and resolve the
+    /// secret store from the deployed `repo_dir` (holding
+    /// `automation/secrets/mcnf-secret.sh`) + the `workgroup_root`. The calling
+    /// `onboard_apply` worker passes both from its own context (the same
+    /// `workgroup_root` its sibling verbs like `service_add::gather` take).
+    #[must_use]
+    pub fn resolve(repo_dir: &Path, workgroup_root: &Path) -> Self {
+        Self {
+            role_path: mde_role::default_role_path(),
+            store: SecretStore::resolve(repo_dir, workgroup_root),
+        }
+    }
+
+    /// Explicit constructor with an injected role path + store — the seam the
+    /// round-trip tests drive (a temp `role.toml` + a `LocalAead` store over a
+    /// throwaway age identity).
+    #[must_use]
+    pub fn new(role_path: PathBuf, store: SecretStore) -> Self {
+        Self { role_path, store }
+    }
+}
+
+impl Applier for LocalApplier {
+    fn apply_one(&self, action: &Action) -> Result<(), RemotePushError> {
+        match action {
+            Action::PinRole { role, media } => {
+                let role: Role = role.parse().map_err(|e| RemotePushError::ActionFailed {
+                    action: action.redacted(),
+                    why: format!("{e}"),
+                })?;
+                let class = RoleClass {
+                    role,
+                    media: *media,
+                };
+                mde_role::pin_class_at(&self.role_path, &class)
+                    .map(|_| ())
+                    .map_err(|e| RemotePushError::ActionFailed {
+                        action: action.redacted(),
+                        why: e.to_string(),
+                    })
+            }
+            Action::SealSecret { name, secret } => {
+                self.store
+                    .put(name, secret)
+                    .map_err(|why| RemotePushError::ActionFailed {
+                        action: action.redacted(),
+                        why,
+                    })
+            }
+            // Owned by the SshBootstrap transport (the enroll-bearer SSH step),
+            // not a node-local effect — honest typed gate, never a fake apply.
+            Action::RunEnroll { .. } => Err(RemotePushError::NotWired {
+                transport: "ssh-bootstrap (enroll)",
+            }),
+            // Owned by the onboard_apply worker's Bus publish (it holds the Bus
+            // handle the broker SessionRequest goes out on).
+            Action::OpenBroker { .. } => Err(RemotePushError::NotWired {
+                transport: "bus-worker (open-broker)",
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,16 +359,17 @@ mod tests {
         };
         let actions = vec![
             Action::PinRole {
-                role: "Media".into(),
+                role: "lighthouse".into(),
+                media: true,
             },
             Action::SealSecret {
                 name: "media-spaces".into(),
-                sealed: vec![1],
+                secret: "s3-creds".into(),
             },
         ];
         assert!(apply_all(&app, &actions).is_ok());
         assert_eq!(app.applied.borrow().len(), 2);
-        assert!(app.applied.borrow()[0].contains("pin-role Media"));
+        assert!(app.applied.borrow()[0].contains("pin-role lighthouse +media"));
     }
 
     #[test]
@@ -279,11 +382,12 @@ mod tests {
         };
         let actions = vec![
             Action::PinRole {
-                role: "Media".into(),
+                role: "lighthouse".into(),
+                media: true,
             },
             Action::SealSecret {
                 name: "s".into(),
-                sealed: vec![1],
+                secret: "v".into(),
             },
             Action::OpenBroker {
                 session_id: "x".into(),
@@ -307,11 +411,12 @@ mod tests {
             target_node: "peer:lh-media".into(),
             actions: vec![
                 Action::PinRole {
-                    role: "Media".into(),
+                    role: "lighthouse".into(),
+                    media: true,
                 },
                 Action::SealSecret {
                     name: "media-spaces".into(),
-                    sealed: vec![1, 2, 3],
+                    secret: "s3-creds".into(),
                 },
             ],
             issued_at: now,
@@ -337,7 +442,8 @@ mod tests {
         // flip an action → the signing bytes change → signature no longer verifies
         let mut tampered = b.clone();
         tampered.actions[0] = Action::PinRole {
-            role: "Server".into(),
+            role: "workstation".into(),
+            media: false,
         };
         let err = tampered.verify(&sig, &k.verifying_key(), now).unwrap_err();
         assert!(matches!(err, RemotePushError::BundleRejected { .. }));
@@ -368,17 +474,104 @@ mod tests {
 
     #[test]
     fn actions_redact_secret_material() {
-        // the sealed blob + the bearer must never appear in the log line
+        // the secret value + the bearer must never appear in the log line
         let seal = Action::SealSecret {
             name: "media-spaces".into(),
-            sealed: vec![7; 32],
+            secret: "SUPER-SECRET-S3-CREDENTIAL".into(),
         };
         assert!(seal.redacted().contains("media-spaces"));
         assert!(seal.redacted().contains("redacted"));
-        assert!(!seal.redacted().contains(&7u8.to_string().repeat(2)));
+        assert!(!seal.redacted().contains("SUPER-SECRET-S3-CREDENTIAL"));
         let enroll = Action::RunEnroll {
             bearer: "SECRET-BEARER".into(),
         };
         assert!(!enroll.redacted().contains("SECRET-BEARER"));
+    }
+
+    // ── LocalApplier: the real node-local effects (no mock) ──
+
+    /// A `LocalAead` secret store over a throwaway age identity + a temp role
+    /// path — the real primitives PinRole/SealSecret drive, so these tests
+    /// exercise the actual `role.toml` write + the actual at-rest seal.
+    fn local_applier() -> (tempfile::TempDir, LocalApplier) {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("mcnf-age-key");
+        std::fs::write(
+            &key_path,
+            "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQSXKLP0E\n",
+        )
+        .unwrap();
+        let store = SecretStore::LocalAead {
+            dir: tmp.path().join("secrets"),
+            key_path,
+        };
+        let applier = LocalApplier::new(tmp.path().join("role.toml"), store);
+        (tmp, applier)
+    }
+
+    #[test]
+    fn pin_role_writes_a_real_media_lighthouse_role_toml() {
+        // OW-11's Music step: promote a plain lighthouse to Lighthouse_Media. The
+        // applier writes an actual role.toml that mde_role reads back as the media
+        // subclass — a real pin, not a recorded intent.
+        let (tmp, applier) = local_applier();
+        applier
+            .apply_one(&Action::PinRole {
+                role: "lighthouse".into(),
+                media: true,
+            })
+            .expect("pin-role applies");
+        let class = mde_role::load_class_from(&tmp.path().join("role.toml")).unwrap();
+        assert!(
+            class.is_media_lighthouse(),
+            "role.toml pinned the Lighthouse_Media subclass"
+        );
+    }
+
+    #[test]
+    fn seal_secret_encrypts_at_rest_and_reads_back() {
+        // The media-spaces secret seals into the store (ciphertext on disk) and
+        // the same store reads it back decrypted, byte-for-byte.
+        let (_tmp, applier) = local_applier();
+        let name = crate::ipc::secret_store::media_spaces_creds_ref();
+        let secret = "S3_KEY=AKIA...\nS3_SECRET=abc123\nND_ADMIN_PASS=hunter2\n";
+        applier
+            .apply_one(&Action::SealSecret {
+                name: name.clone(),
+                secret: secret.into(),
+            })
+            .expect("seal-secret applies");
+        assert_eq!(applier.store.get(&name).unwrap().as_deref(), Some(secret));
+    }
+
+    #[test]
+    fn pin_role_rejects_an_unknown_role_name_honestly() {
+        // A bogus role string is a typed ActionFailed, never a silent no-op.
+        let (_tmp, applier) = local_applier();
+        let err = applier
+            .apply_one(&Action::PinRole {
+                role: "overlord".into(),
+                media: false,
+            })
+            .unwrap_err();
+        assert!(matches!(err, RemotePushError::ActionFailed { .. }));
+    }
+
+    #[test]
+    fn enroll_and_broker_are_typed_gated_not_local_effects() {
+        // These belong to the SSH-bootstrap transport + the Bus worker; the
+        // local applier returns a typed NotWired naming the owning layer, never a
+        // fake apply (§7).
+        let (_tmp, applier) = local_applier();
+        assert!(matches!(
+            applier.apply_one(&Action::RunEnroll { bearer: "b".into() }),
+            Err(RemotePushError::NotWired { .. })
+        ));
+        assert!(matches!(
+            applier.apply_one(&Action::OpenBroker {
+                session_id: "s".into()
+            }),
+            Err(RemotePushError::NotWired { .. })
+        ));
     }
 }
