@@ -4,8 +4,9 @@
 //! not separate clients (§5, the EMBED model — there is no compositor). The dock
 //! is that shell nav: a compact vertical rail that selects which surface fills the
 //! shell body — the mesh-control [`Workbench`](Surface::Workbench) (This Node →
-//! Fleet, MV-6) or one of the three embedded app surfaces (Music / Files / Voice).
-//! One surface shows at a time; the Workbench is always one click away.
+//! Fleet, MV-6), the brokered VM [`Desktop`](Surface::Desktop) (VDI, egui-native),
+//! or one of the three embedded app surfaces (Music / Files / Voice). One surface
+//! shows at a time; the Workbench is always one click away.
 //!
 //! The rail is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
@@ -24,6 +25,9 @@ pub(crate) enum Surface {
     /// The five-plane mesh-control Workbench (This Node → Fleet).
     #[default]
     Workbench,
+    /// The VDI **Desktop** surface — a brokered VM desktop rendered egui-native
+    /// (`mde-vdi-rdp` / `mde-vdi-vnc`), the point of E12 "Quasar".
+    Desktop,
     /// The embedded Music surface (`mde-music-egui`).
     Music,
     /// The embedded Files surface (`mde-files-egui`).
@@ -34,9 +38,10 @@ pub(crate) enum Surface {
 
 impl Surface {
     /// The dock entries in nav order — the Workbench (mesh-control home) first,
-    /// then the three app surfaces.
-    pub(crate) const ALL: [Surface; 4] = [
+    /// then the brokered Desktop, then the three app surfaces.
+    pub(crate) const ALL: [Surface; 5] = [
         Surface::Workbench,
+        Surface::Desktop,
         Surface::Music,
         Surface::Files,
         Surface::Voice,
@@ -46,6 +51,7 @@ impl Surface {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Surface::Workbench => "Workbench",
+            Surface::Desktop => "Desktop",
             Surface::Music => "Music",
             Surface::Files => "Files",
             Surface::Voice => "Voice",
@@ -59,6 +65,7 @@ impl Surface {
             Surface::Workbench => {
                 "Mesh control — This Node, Controller, Network, Fleet, Provisioning."
             }
+            Surface::Desktop => "View a brokered VM desktop (RDP / VNC), rendered in-shell.",
             Surface::Music => "Play the mesh music library (Subsonic / Airsonic).",
             Surface::Files => "Browse local + peer folders and Send-To across the mesh.",
             Surface::Voice => "Place and receive mesh voice calls (SIP).",
@@ -99,11 +106,16 @@ mod tests {
     use super::Surface;
 
     #[test]
-    fn the_dock_lists_the_workbench_plus_the_three_app_surfaces() {
-        // Exactly four entries, Workbench first, the three embedded surfaces after.
-        assert_eq!(Surface::ALL.len(), 4);
+    fn the_dock_lists_the_workbench_the_desktop_plus_the_three_app_surfaces() {
+        // Exactly five entries, Workbench first, then Desktop + the three surfaces.
+        assert_eq!(Surface::ALL.len(), 5);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
-        for s in [Surface::Music, Surface::Files, Surface::Voice] {
+        for s in [
+            Surface::Desktop,
+            Surface::Music,
+            Surface::Files,
+            Surface::Voice,
+        ] {
             assert!(Surface::ALL.contains(&s), "{s:?} missing from the dock");
         }
     }
@@ -118,7 +130,11 @@ mod tests {
         let mut labels: Vec<&str> = Surface::ALL.iter().map(|s| s.label()).collect();
         labels.sort_unstable();
         labels.dedup();
-        assert_eq!(labels.len(), 4, "dock labels must be distinct");
+        assert_eq!(
+            labels.len(),
+            Surface::ALL.len(),
+            "dock labels must be distinct"
+        );
     }
 
     #[test]

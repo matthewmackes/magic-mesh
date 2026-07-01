@@ -18,6 +18,7 @@ mod chrome;
 mod datacenter;
 mod dock;
 mod session;
+mod vdi;
 mod workbench;
 
 use mde_egui::eframe::CreationContext;
@@ -72,6 +73,11 @@ struct Shell {
     /// The Voice surface, owned + built once (its SIP agent wakes the shell's egui
     /// context on every update). Rendered via `mde_voice_egui::voice_panel`.
     voice: VoiceApp,
+    /// The VDI Desktop surface — a brokered VM desktop decoded by `mde-vdi-rdp` /
+    /// `mde-vdi-vnc` and uploaded to an egui texture. Holds no live session until
+    /// the gated wire transport (E12-4) attaches one; the panel shows its honest
+    /// "no desktop" EmptyState until then.
+    vdi: vdi::VdiState,
 }
 
 impl Shell {
@@ -87,6 +93,7 @@ impl Shell {
             music: MusicApp::new(cc),
             files: mde_files_egui::real_browser(),
             voice: VoiceApp::new(cc),
+            vdi: vdi::VdiState::default(),
         }
     }
 
@@ -111,6 +118,21 @@ impl Shell {
         match self.nav.surface {
             Surface::Workbench => {
                 workbench::show(ui, &mut self.nav.plane, &mut self.datacenter);
+            }
+            Surface::Desktop => {
+                // The VDI desktop fills the body. It reserves an Esc chord that
+                // asks to return to the mesh-control chrome — honour it by falling
+                // back to the Workbench so a fullscreen session is never a trap.
+                let vdi = &mut self.vdi;
+                let leave = ui
+                    .push_id("shell-desktop", |ui| {
+                        vdi::vdi_panel(ui, vdi);
+                        vdi.take_return_to_chrome()
+                    })
+                    .inner;
+                if leave {
+                    self.nav.surface = Surface::Workbench;
+                }
             }
             Surface::Music => {
                 music_pump(&mut self.music);

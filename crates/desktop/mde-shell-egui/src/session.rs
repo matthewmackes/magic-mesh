@@ -20,7 +20,9 @@ pub(crate) fn show(ui: &mut egui::Ui) {
 }
 
 /// A centred EmptyState: a drawn monitor glyph over a title and a dim subtitle.
-fn empty_state(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+/// Shared with the Desktop surface (`vdi`), which paints the same honest
+/// "no desktop yet" story before a session is brokered in.
+pub(crate) fn empty_state(ui: &mut egui::Ui, title: &str, subtitle: &str) {
     // Push the block toward the vertical middle of the panel. The block is the
     // glyph + title + subtitle stack — roughly four XL steps tall.
     let lead = (ui.available_height() - Style::SP_XL * 4.0).max(Style::SP_XL) * 0.5;

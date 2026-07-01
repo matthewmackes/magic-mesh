@@ -49,5 +49,13 @@ mde-music-egui = { path = "../mde-music-egui" }
 mde-files-egui = { path = "../mde-files-egui" }
 mde-voice-egui = { path = "../mde-voice-egui" }
 
+# E12-5a — the VDI Desktop surface. These two decoder crates turn a remote RDP /
+# VNC framebuffer into an egui `ColorImage` the shell uploads to a `TextureHandle`
+# (lock 21, render egui-native — no external viewer). The shell's `vdi` panel is
+# their first caller; the edge points sideways-inward within the desktop-shell
+# tier (§6), sharing the one `mde-egui` toolkit resolution.
+mde-vdi-rdp = { path = "../mde-vdi-rdp" }
+mde-vdi-vnc = { path = "../mde-vdi-vnc" }
+
 [lints]
 workspace = true
