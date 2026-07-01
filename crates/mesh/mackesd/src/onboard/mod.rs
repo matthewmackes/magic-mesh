@@ -75,6 +75,7 @@ pub mod invite;
 pub mod mesh_create;
 pub mod mesh_dns;
 pub mod network;
+pub mod remote_push;
 pub mod role_provision;
 pub mod self_test;
 pub mod service_add;
