@@ -67,8 +67,13 @@ impl Plane {
 
 /// Render the expanded Workbench: a title, the plane rail, and the selected
 /// plane's content pane. `selected` is read and written, so a rail click changes
-/// the active plane.
-pub(crate) fn show(ui: &mut egui::Ui, selected: &mut Plane) {
+/// the active plane. The Fleet plane renders live per-node KVM reality from
+/// `datacenter` (MV-6); the other planes still show descriptive copy.
+pub(crate) fn show(
+    ui: &mut egui::Ui,
+    selected: &mut Plane,
+    datacenter: &mut crate::datacenter::DatacenterState,
+) {
     ui.add_space(Style::SP_L);
     ui.heading(
         RichText::new("Workbench")
@@ -113,10 +118,16 @@ pub(crate) fn show(ui: &mut egui::Ui, selected: &mut Plane) {
             ui.add_space(Style::SP_XS);
             ui.colored_label(Style::TEXT_DIM, selected.blurb());
             ui.add_space(Style::SP_M);
-            ui.colored_label(
-                Style::TEXT_DIM,
-                "Live mesh data wires into this plane in a later unit.",
-            );
+            if *selected == Plane::Fleet {
+                // MV-6 — the Fleet plane drives live KVM host health + the VM
+                // roster off the Bus (Podman container rows follow once MV-4 lands).
+                datacenter.show(ui);
+            } else {
+                ui.colored_label(
+                    Style::TEXT_DIM,
+                    "Live mesh data wires into this plane in a later unit.",
+                );
+            }
         });
     });
 }

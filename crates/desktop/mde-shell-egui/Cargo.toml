@@ -13,12 +13,23 @@ name = "mde-shell-egui"
 path = "src/main.rs"
 
 [dependencies]
-# The §4/§5 harness is the shell's one inward dependency (§6 layered tiers): it
-# provides run_client (the eframe Wayland-client runner), the shared Style, the
+# The §4/§5 harness is the shell's primary inward dependency (§6 layered tiers):
+# it provides run_client (the eframe Wayland-client runner), the shared Style, the
 # Motion table, and re-exports egui/eframe so the shell shares one toolkit
-# resolution. No mesh/services deps — the skeleton renders only; Bus wiring lands
-# with the panels.
+# resolution.
 mde-egui = { path = "../../shared/mde-egui" }
+
+# MV-6 — the Fleet plane subscribes to the mackesd virt workers' Bus topics
+# (`event/kvm/services` / `event/vm/instances`) and publishes host-targeted
+# `action/vm/lifecycle` requests via the persist-first publish path. mde-bus is
+# the platform-services tier; the dependency edge points inward (§6).
+mde-bus = { path = "../../platform/mde-bus" }
+
+# The Bus payloads are a JSON boundary: the Fleet plane mirrors the worker
+# payloads with local serde structs rather than depending on the mackesd daemon
+# crate (keeps the shell in the desktop-shell tier).
+serde      = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

@@ -15,6 +15,7 @@
 //! plug into.
 
 mod chrome;
+mod datacenter;
 mod session;
 mod workbench;
 
@@ -30,6 +31,9 @@ struct Shell {
     expanded: bool,
     /// The Workbench plane shown when expanded.
     plane: Plane,
+    /// Fleet plane — live per-node KVM host health + VM roster, and the
+    /// host-targeted VM lifecycle controls (MV-6). Subscribes to the Bus.
+    datacenter: datacenter::DatacenterState,
 }
 
 impl Shell {
@@ -41,6 +45,14 @@ impl Shell {
 
 impl eframe::App for Shell {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The Fleet plane subscribes to the live KVM/VM Bus topics. Poll on the
+        // shared cadence while expanded (the read is a cheap local scan) so a host
+        // health flip or a new VM surfaces without operator input; the poll
+        // self-gates and keeps the repaint heartbeat alive.
+        if self.expanded {
+            self.datacenter.poll(ctx);
+        }
+
         // The thin persistent chrome bar (48px = SP_XL + SP_M).
         egui::TopBottomPanel::top("mcnf-chrome")
             .exact_height(Style::SP_XL + Style::SP_M)
@@ -65,7 +77,7 @@ impl eframe::App for Shell {
                 ui.set_opacity(a);
                 // A small rise as the Workbench settles in.
                 ui.add_space((1.0 - a) * Style::SP_S);
-                workbench::show(ui, &mut self.plane);
+                workbench::show(ui, &mut self.plane, &mut self.datacenter);
             }
         });
 
