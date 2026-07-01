@@ -224,7 +224,7 @@ enum Cmd {
         #[arg(long, value_name = "ID")]
         node_id: Option<String>,
         /// A fresh join token/invite to re-enroll with. Absent ⇒ the plan is blocked
-        /// (mint one on a lighthouse with `mackesd onboard invite`, then retry).
+        /// (mint one on a lighthouse with `mackesd onboard invite-issue`, then retry).
         #[arg(long, value_name = "TOKEN")]
         token: Option<String>,
         /// Print the plan + ordered steps + passive-revocation status without enrolling.

@@ -269,7 +269,7 @@ impl RecoveryBlockedReason {
     pub const fn hint(self) -> &'static str {
         match self {
             Self::NoJoinToken => {
-                "mint a fresh single-use invite on a lighthouse (`mackesd onboard invite`), then retry"
+                "mint a fresh single-use invite on a lighthouse (`mackesd onboard invite-issue`), then retry"
             }
         }
     }
@@ -828,7 +828,7 @@ mod tests {
         );
         assert!(plan.retry_available());
         assert!(plan.steps().is_empty());
-        assert!(plan.human().contains("mackesd onboard invite"));
+        assert!(plan.human().contains("mackesd onboard invite-issue"));
     }
 
     #[test]
