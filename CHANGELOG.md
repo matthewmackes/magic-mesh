@@ -13,6 +13,15 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+## [11.3.1] — 2026-07-01
+Patch: a security-relevant fix found by live-verifying 11.3.0 on the fleet.
+### Fixed
+- **Nebula Certificate V2 fingerprint parsing** — `nebula-cert print -json` emits a
+  JSON *array* for V2 certs (V1 was a single object); `parse_fingerprint_json` read
+  the array as absent, so on a V2 fleet the OW-10 self-test cert probe false-FAILED
+  and the `leave` verb's revocation-eviction silently couldn't fingerprint a cert to
+  blocklist it. Now accepts both shapes (+ a V2 wire-shape test).
+
 ## [11.3.0] — 2026-07-01
 Feature release: the `mackesd onboard` engine gains its VDI + services verbs, and
 the two operator-active iced-`mde-workbench` GUI epics (CTRLSURF, NOTIFY-REDESIGN)
