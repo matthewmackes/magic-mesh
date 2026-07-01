@@ -104,13 +104,19 @@ typed Bus verbs (§9) over the CA-rooted overlay.
   Ed25519 key — the **same trust primitive the SEC-6 blocklist already uses**
   (`ca/blocklist.rs` signs revocations with the node identity's `verifying_key()`).
   The target's `onboard_apply` worker: (1) resolves the *claimed issuer's* identity
-  pubkey from the replicated peer roster, (2) verifies the signature against it (proves
-  the claimant holds that identity), and (3) **authorizes** by requiring the issuer to
-  be a current **leader** (`health.rs::is_leader` / the leader lock) — so only a
-  leader-eligible node may push a role-pin / secret-seal to a peer (§8 privileged
-  issuer; a compromised low-priv node cannot). *Rationale:* reuses mesh-native identity
-  + roster + election (no new distributed authority key, no coupling to Nebula CA-key
-  extraction). The bundle therefore carries an `issuer` node-id field (signed).
+  pubkey from the CA **`nodes` registry** (the mackesd SQLite `nodes` table —
+  `node_id → public_key, role`, populated at enrollment from the request's
+  `public_key_hex`; see `nebula_roster.rs` / `enrollment.rs` — **NOT** the
+  `PeerRecord` roster, which carries no identity key), (2) verifies the signature
+  against it (proves the claimant holds that identity), and (3) **authorizes** by
+  requiring the issuer's registered `role` to be leader-eligible (**Lighthouse**) — so
+  only a lighthouse may push a role-pin / secret-seal to a peer (§8 privileged issuer;
+  a compromised workstation cannot). *Rationale:* reuses mesh-native identity + the
+  enrollment registry (no new distributed authority key, no coupling to Nebula CA-key
+  extraction). The bundle carries an `issuer` node-id field (signed). *Scope:* the
+  registry lives on CA-holding nodes; OW-11's day-2 targets (media-lighthouses) hold
+  it, so the first cut is covered — a non-CA target would need the issuer pubkey
+  delivered another way (future, tracked when a non-CA day-2 target appears).
   → `process_apply` already takes the trusted `signer: &VerifyingKey` injected, so the
   worker owns resolution (roster-lookup + leader-check) and the pure core is unchanged.
 - **`SshBootstrap` auth scope = the single-use enroll bearer** (OW-4's mint), matching
