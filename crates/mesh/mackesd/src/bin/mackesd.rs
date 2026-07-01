@@ -1268,6 +1268,16 @@ enum OnboardCmd {
         #[arg(long)]
         label: Option<String>,
     },
+    /// OW-4 — mint a short-TTL, mesh-scoped join invite on THIS enrolled node: an
+    /// authenticated bearer (recorded in the bearer ledger so it can be verified +
+    /// revoked), emitted as a typeable code + a QR string a new box presents to
+    /// join. `--ttl` overrides the default lifetime (minutes).
+    InviteIssue {
+        /// Invite lifetime in minutes (default: 15). Kept short — a join code is
+        /// meant to be presented promptly.
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
 }
 
 /// DDNS-EGRESS-3 — `mackesd ddns <sub>` subcommands. Each calls the same
@@ -2340,6 +2350,31 @@ fn main() -> anyhow::Result<()> {
                         .status();
                 }
                 print!("{}", report.human());
+            }
+            OnboardCmd::InviteIssue { ttl } => {
+                // Mint a short-TTL, mesh-scoped invite on THIS node, record it in
+                // the bearer ledger, and print both encodings headlessly.
+                let node_id = default_node_id();
+                let root = mackesd_core::default_qnm_shared_root();
+                let mesh_id = mackesd_core::onboard::invite::resolve_mesh_id(&root, &node_id);
+                let minutes = ttl.unwrap_or(mackesd_core::onboard::invite::DEFAULT_TTL_MINUTES);
+                let issued = mackesd_core::onboard::invite::issue(
+                    &root,
+                    &mesh_id,
+                    std::time::Duration::from_secs(minutes.saturating_mul(60)),
+                )?;
+                println!(
+                    "invite-issue: mesh '{mesh_id}' — expires in {minutes} min \
+                     (exp {} epoch-ms){}",
+                    issued.invite.exp_ms,
+                    if issued.recorded {
+                        ""
+                    } else {
+                        " [NOT recorded — zero TTL]"
+                    }
+                );
+                println!("  code: {}", issued.code);
+                println!("  qr:   {}", issued.qr);
             }
         },
         Cmd::DnsLeakCheck { expected } => {

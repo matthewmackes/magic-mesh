@@ -19,17 +19,20 @@
 //!   derived from the `mde_role` rank model (the same tiering
 //!   [`crate::worker_role`] gates the in-process workers by).
 //!
-//! # Verbs owned by the sibling OW units — deliberately NOT declared here (§7)
-//! The complex verbs each land in their own unit with their real implementation;
-//! this engine does **not** carry a stub / `todo!()` variant for any of them:
-//! `invite-issue` (OW-4), `enroll` (OW-5), and `mesh-dns` + `network` (OW-6). A
-//! front-end sequences those units' entry points around the verbs here.
+//! # Landed since OW-2: OW-3 [`mesh_create`] + OW-4 [`invite`]
+//! * [`mesh_create`] (OW-3) founds a lone Workstation's mesh-of-one (mint CA +
+//!   LAN-only overlay, offline) — a thin idempotent wrapper over the ENT-4
+//!   [`crate::mesh_init`] bootstrap (reuse, not a reimplementation).
+//! * [`invite`] (OW-4) mints a short-TTL, mesh-scoped join invite (an authenticated
+//!   bearer recorded in [`crate::bearer_ledger`], a typeable code + a QR string) and
+//!   exposes the pure redemption check the joiner (OW-5) pairs with the ledger.
 //!
-//! # Landed since: OW-3 — [`mesh_create`]
-//! [`mesh_create`] founds a lone Workstation's mesh-of-one (mint CA + LAN-only
-//! overlay, offline), a thin idempotent wrapper over the ENT-4
-//! [`crate::mesh_init`] bootstrap — reuse, not a reimplementation.
+//! # Verbs still owned by the sibling OW units — deliberately NOT declared here (§7)
+//! The remaining complex verbs land in their own units with real implementations;
+//! this engine carries no stub / `todo!()` variant for any: `enroll` (OW-5) and
+//! `mesh-dns` + `network` (OW-6).
 
+pub mod invite;
 pub mod mesh_create;
 pub mod role_provision;
 pub mod self_test;
