@@ -1,5 +1,5 @@
-//! EPIC-MESH-PROBE (Q7) — typed probe facts over the `mde-card`
-//! schema.
+//! EPIC-MESH-PROBE (Q7) — typed probe facts over the universal
+//! card schema.
 //!
 //! The probe inventory is a stream of Cards: one [`CardKind::Host`]
 //! Card per discovered host, with one [`CardKind::Service`] child Card
@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::schema::{Card, CardKind};
+use super::schema::{Card, CardKind};
 
 /// Metadata key the probe facts serialize under (one nested object,
 /// so adding a fact field never touches the top-level `Card` schema).

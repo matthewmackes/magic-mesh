@@ -32,7 +32,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// ships them around the mesh as plain `.json` files.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Card {
-    /// Stable mesh-merged identifier (see [`crate::stable_id_for`]).
+    /// Stable mesh-merged identifier (see [`crate::card::stable_id_for`]).
     pub id: String,
 
     /// Schema version this card was written under. Default = current
@@ -116,7 +116,7 @@ pub enum CardKind {
     Note,
     /// Network host discovered by EPIC-MESH-PROBE (a mesh peer, LAN
     /// device, or operator-arbitrary target). Probe facts live in
-    /// `metadata`; see [`crate::probe`].
+    /// `metadata`; see [`crate::card::probe`].
     Host,
     /// A network service on a [`CardKind::Host`] (one open port +
     /// its nmap-identified product/version). Rendered as a child Card
@@ -155,7 +155,7 @@ impl Card {
     /// current, timestamps both = `now_ts`, no children, no tags.
     pub fn new(kind: CardKind, title: impl Into<String>, now_ts: u64) -> Self {
         let title = title.into();
-        let id = crate::id::stable_id_for(&kind, &title);
+        let id = super::id::stable_id_for(&kind, &title);
         Self {
             id,
             schema_version: SCHEMA_VERSION,

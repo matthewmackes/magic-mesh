@@ -2967,7 +2967,7 @@ fn main() -> anyhow::Result<()> {
                 nse_dir,
             } => {
                 use mackesd_core::probe_nmap::{scan, Profile};
-                use mde_card::probe::HostSource;
+                use mackesd_core::card::probe::HostSource;
                 let src = match source.as_str() {
                     "lan" => HostSource::Lan,
                     "arbitrary" => HostSource::Arbitrary,

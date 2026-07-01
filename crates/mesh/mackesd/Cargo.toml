@@ -81,10 +81,10 @@ mde-kdc-host = { path = "../../kdc/mde-kdc-host", optional = true }
 # types, no I/O or async runtime needed in the base build.
 mde-kdc-proto = { path = "../../kdc/mde-kdc-proto" }
 
-# EPIC-MESH-PROBE (MESH-PROBE-2) — the probe inventory IS mde-card
+# EPIC-MESH-PROBE (MESH-PROBE-2) — the probe inventory IS universal
 # Cards (Q7): the nmap parser emits Host cards with Service children
-# via `mde_card::probe`. Pure lib (serde + sha2), no feature gate.
-mde-card = { path = "../../shared/mde-card" }
+# via `crate::card::probe` (the subsystem folded in from the retired
+# mde-card crate under E12-14c; serde + sha2 were already deps here).
 # SWAY-4 (v6.0 Q89/Q94) — marks_state worker uses Persist + rpc::reply_topic
 # to serve action/marks/* Bus action topics. Optional (async-services gate).
 mde-bus = { path = "../../platform/mde-bus", optional = true }

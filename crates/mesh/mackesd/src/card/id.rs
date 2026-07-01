@@ -17,7 +17,7 @@
 
 use sha2::{Digest, Sha256};
 
-use crate::schema::CardKind;
+use super::schema::CardKind;
 
 /// Derive a stable mesh-merged ID for a Card.
 ///

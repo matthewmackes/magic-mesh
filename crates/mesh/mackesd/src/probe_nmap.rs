@@ -6,7 +6,7 @@
 //!     and a deep `-sV`/NSE identification pass. Both emit `-oX -`
 //!     (XML to stdout) and are `-T`-rate-limited (never `-T5`).
 //!   * [`parse_nmap_xml`] — roxmltree parse of `-oX` output into
-//!     `mde_card` Host cards with Service children (Q7).
+//!     [`crate::card`] Host cards with Service children (Q7).
 //!   * [`scan`] — shell `nmap`, parse the result; nmap-absent ⇒ empty
 //!     + warn (no panic). The `Requires: nmap` RPM dep (MESH-PROBE-3)
 //!     guarantees the binary in production; this graceful-degrade is
@@ -20,10 +20,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use mde_card::probe::{
+use crate::card::probe::{
     host_card, host_facts, service_card, service_facts, HostFacts, HostSource, ServiceFacts,
 };
-use mde_card::Card;
+use crate::card::Card;
 
 /// Curated port set both profiles scan. Union of the media ports the
 /// EPIC-SYNC-APP-CONFIG discovery needs (Airsonic 4040, Jellyfin
@@ -840,7 +840,7 @@ pub fn run_probe_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mde_card::CardKind;
+    use crate::card::CardKind;
 
     // A faithful `nmap -sV -oX -` sample: one up host (10.42.0.5,
     // peer-a.mesh.mde) with two open service ports (Airsonic 4040,

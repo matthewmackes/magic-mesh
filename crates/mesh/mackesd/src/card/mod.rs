@@ -1,4 +1,6 @@
-//! `mde-card` — Universal cards subsystem (Portal-31).
+//! Universal cards subsystem (Portal-31) — folded into `mackesd_core`
+//! from the retired standalone `mde-card` crate (E12-14c: once the
+//! Workbench retired, the daemon was its sole consumer).
 //!
 //! Every Object surfaced by the mesh renders as a Card: apps, files,
 //! peers, activities, contacts, containers, workspaces, tray items,
@@ -11,8 +13,9 @@
 //! GUI-4 (sweep H3) removed the unreached Portal-era surfaces: the
 //! `migration` registry, `RenderMode`, and `TemplateSpec` — consumers
 //! use `schema::{Card, CardKind}` + `probe::*` only.
-
-#![forbid(unsafe_code)]
+//!
+//! (`unsafe_code` is forbidden crate-wide in `mackesd_core`'s root, so
+//! the standalone crate's `#![forbid(unsafe_code)]` carries over.)
 
 pub mod id;
 pub mod probe;

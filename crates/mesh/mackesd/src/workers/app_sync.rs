@@ -482,7 +482,7 @@ mod tests {
         // Seed a probe inventory (MESH-PROBE-7 source): peer-a runs
         // jellyfin, peer-b runs navidrome (a Subsonic-family server →
         // KIND_AIRSONIC), peer-c runs ssh (ignored — not a media kind).
-        use mde_card::probe::{host_card, service_card, HostFacts, HostSource, ServiceFacts};
+        use crate::card::probe::{host_card, service_card, HostFacts, HostSource, ServiceFacts};
         let root = tmp_home("probe-discover");
         let seed = |peer: &str, ip: &str, kind: &str, port: u16| {
             let dir = root.join(peer).join("mackesd");

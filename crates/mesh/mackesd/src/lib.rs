@@ -17,6 +17,12 @@ pub mod audit;
 // subcommand (NF-2.6). The whole module lands together per
 // §0.12; no scaffold-only commit.
 pub mod ca;
+// E12-14c — the Portal-31 universal-card subsystem (schema + stable
+// IDs + probe facts), folded in from the retired standalone
+// `mde-card` crate: the daemon (probe_nmap / surrounding_hosts /
+// app_sync / the probe CLI) became its sole consumer once the
+// Workbench retired.
+pub mod card;
 // MESH-A-7 (v5.0.0) — well-known port → connect-action mappings,
 // consumed by the `mackesd connect` CLI + (future) host-card UI.
 pub mod connect_actions;

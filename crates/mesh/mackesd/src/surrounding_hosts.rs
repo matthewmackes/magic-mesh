@@ -6,7 +6,7 @@
 //! [`TrustState`]s (R8-Q10) — plus the pure [`classify`] heuristic
 //! that turns a discovery pass's [`HostSignals`] into a best-guess
 //! type. `TrustState` serialises to the same lowercase strings the
-//! `mde_card::probe::HostFacts.trust_state` field already carries (its
+//! [`crate::card::probe::HostFacts`]'s `trust_state` field already carries (its
 //! doc-comment names this module as the taxonomy owner).
 //!
 //! The discovery collectors that gather [`HostSignals`] from the wire
@@ -96,7 +96,7 @@ impl HostType {
 }
 
 /// Trust classification (R8-Q10). Serialises to the lowercase strings
-/// `mde_card::probe::HostFacts.trust_state` carries.
+/// [`crate::card::probe::HostFacts`]'s `trust_state` carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustState {
@@ -118,7 +118,7 @@ impl Default for TrustState {
 
 impl TrustState {
     /// Stable lowercase wire name (matches the serde rename + the
-    /// `mde_card::probe::HostFacts.trust_state` strings).
+    /// [`crate::card::probe::HostFacts`]'s `trust_state` strings).
     #[must_use]
     pub fn wire_name(self) -> &'static str {
         match self {
