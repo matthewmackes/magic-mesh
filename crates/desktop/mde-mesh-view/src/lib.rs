@@ -9,9 +9,10 @@
 //! themed through the shared [`mde_egui::Style`] / [`mde_egui::Motion`] — there
 //! is no raw colour and no bespoke motion engine (§4).
 //!
-//! The widget renders **only** the [`MeshState`] it is handed. There is no
-//! embedded demo data in the render path; the runnable sample lives in
-//! `examples/mesh_view.rs`:
+//! The widget renders **only** the [`MeshState`] it is handed — there is no
+//! embedded demo data in the render path. An empty state (no nodes) paints an
+//! honest "waiting for mesh" `EmptyState`, never a blank canvas or fabricated
+//! peers (§6/§7). The runnable sample lives in `examples/mesh_view.rs`:
 //!
 //! ```text
 //! cargo run -p mde-mesh-view --example mesh_view

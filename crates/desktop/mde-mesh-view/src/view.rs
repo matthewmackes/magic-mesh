@@ -7,13 +7,15 @@
 //! (`ui.input(|i| i.time)` + `request_repaint`), so links pulse and the leader
 //! ring breathes continuously. The render path draws **only** the [`MeshState`]
 //! it is handed — there is no embedded demo data here (the runnable sample lives
-//! in `examples/mesh_view.rs`).
+//! in `examples/mesh_view.rs`). When that state has no nodes — no mesh data yet,
+//! or a mesh with no reachable peers — it paints an honest "waiting for mesh"
+//! `EmptyState` rather than a blank canvas or fabricated peers (§6/§7).
 
 use std::collections::HashMap;
-use std::f32::consts::TAU;
+use std::f32::consts::{FRAC_PI_2, TAU};
 
 use mde_egui::egui::{
-    self, Align2, Color32, FontFamily, FontId, Pos2, Response, Sense, Stroke, Ui, Vec2,
+    self, Align2, Color32, FontFamily, FontId, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2,
 };
 use mde_egui::{Motion, Style};
 
@@ -45,6 +47,19 @@ const LINK_BASE_W: f32 = 1.0;
 const LINK_ACTIVE_W: f32 = 2.0;
 /// Radius of a travelling activity pulse dot.
 const PULSE_DOT_R: f32 = 3.0;
+
+// ── Empty-state glyph (the no-nodes canvas) ─────────────────────────────────
+// A dim hub-and-spoke emblem shown when the mesh has no nodes. Sizes are
+// spacing-shaped (`Style::SP_*`) so the glyph scales on the shared grid.
+/// Satellite-ring radius of the empty-state glyph — icon-scale, so it reads as
+/// an emblem of an idle mesh rather than as peer data.
+const EMPTY_GLYPH_R: f32 = Style::SP_XL;
+/// Satellites drawn around the empty-state glyph hub.
+const EMPTY_GLYPH_SPOKES: usize = 5;
+/// Hub disc radius of the empty-state glyph.
+const EMPTY_GLYPH_HUB_R: f32 = Style::SP_S;
+/// Satellite disc radius of the empty-state glyph.
+const EMPTY_GLYPH_SAT_R: f32 = Style::SP_XS;
 
 impl Role {
     /// Drawn disc radius for this role.
@@ -123,6 +138,13 @@ impl<'a> MeshView<'a> {
         let (response, painter) = ui.allocate_painter(desired, Sense::hover());
         let area = response.rect;
 
+        // No nodes ⇒ nothing to place or animate: draw the honest "waiting for
+        // mesh" canvas instead of a blank rect or fabricated peers (§6/§7).
+        if self.state.nodes.is_empty() {
+            Self::paint_empty_state(&painter, area);
+            return response;
+        }
+
         let centres = layout::place(self.state, area, self.margin);
         let index: HashMap<&str, usize> = self
             .state
@@ -194,6 +216,58 @@ impl<'a> MeshView<'a> {
         response
     }
 
+    /// Paint the honest "waiting for mesh" `EmptyState` into `area`: a dim
+    /// hub-and-spoke glyph over a title and subtitle, vertically centred. Drawn
+    /// when the [`MeshState`] has no nodes, so an un-populated canvas reads as
+    /// *waiting for the mesh* — never a blank rect, never fabricated peers
+    /// (§6/§7). Every colour, space and type value comes from [`Style`].
+    fn paint_empty_state(painter: &egui::Painter, area: Rect) {
+        // Centre the glyph + title + subtitle block: the glyph's full height
+        // plus the two stacked text lines and the gaps between them.
+        let block_h =
+            EMPTY_GLYPH_R * 2.0 + Style::SP_M + Style::HEADING + Style::SP_XS + Style::BODY;
+        let cx = area.center().x;
+        let glyph_c = Pos2::new(cx, area.center().y - block_h * 0.5 + EMPTY_GLYPH_R);
+
+        // Dim hub-and-spoke emblem — hairline links out to unfilled discs in one
+        // muted tone, so it reads as an icon of an idle mesh, not as peer data.
+        for v in layout::ring(
+            glyph_c.to_vec2(),
+            EMPTY_GLYPH_R,
+            EMPTY_GLYPH_SPOKES,
+            -FRAC_PI_2,
+        ) {
+            let sat = v.to_pos2();
+            painter.line_segment([glyph_c, sat], Stroke::new(LINK_BASE_W, Style::BORDER));
+            painter.circle_stroke(
+                sat,
+                EMPTY_GLYPH_SAT_R,
+                Stroke::new(NODE_STROKE_W, Style::TEXT_DIM),
+            );
+        }
+        painter.circle_stroke(
+            glyph_c,
+            EMPTY_GLYPH_HUB_R,
+            Stroke::new(NODE_STROKE_W, Style::TEXT_DIM),
+        );
+
+        // Title + dim subtitle, centre-top-anchored beneath the glyph.
+        let title = painter.text(
+            Pos2::new(cx, glyph_c.y + EMPTY_GLYPH_R + Style::SP_M),
+            Align2::CENTER_TOP,
+            "Waiting for mesh",
+            FontId::new(Style::HEADING, FontFamily::Monospace),
+            Style::TEXT,
+        );
+        painter.text(
+            Pos2::new(cx, title.bottom() + Style::SP_XS),
+            Align2::CENTER_TOP,
+            "Peers and links appear here as nodes join.",
+            FontId::new(Style::BODY, FontFamily::Monospace),
+            Style::TEXT_DIM,
+        );
+    }
+
     /// Travelling activity dot(s) along `a → b`. When reduced motion is set, a
     /// single static mid-dot conveys "active" without movement.
     fn paint_activity(
@@ -237,5 +311,77 @@ impl<'a> MeshView<'a> {
             base + pulse * LEADER_RING_PULSE,
             Stroke::new(NODE_STROKE_W, Style::ACCENT.gamma_multiply(1.0 - pulse)),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MeshView;
+    use crate::state::{Health, MeshLink, MeshNode, MeshState, Role};
+    use mde_egui::egui::{self, pos2, vec2, Rect};
+    use mde_egui::Style;
+
+    /// Drive one headless egui frame that shows `state`, then tessellate the
+    /// result on the CPU so any paint-path fault (bad shape/text/geometry)
+    /// surfaces as a test failure. This is the same `Context::run` →
+    /// `tessellate` path the DRM runner drives, minus the GPU — no window, no
+    /// wgpu. It makes the paint code (untestable via the pure `layout` fns)
+    /// runtime-reachable in `cargo test`.
+    fn render(state: &MeshState, reduce_motion: bool, time: f64) {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0))),
+            time: Some(time),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                MeshView::new(state).reduce_motion(reduce_motion).show(ui);
+            });
+        });
+        // Tessellation is where a malformed shape or text call would blow up;
+        // a non-empty primitive list confirms the frame actually drew something.
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(!prims.is_empty(), "frame produced no draw primitives");
+    }
+
+    #[test]
+    fn empty_state_paints_instead_of_a_blank_canvas() {
+        // No nodes ⇒ the honest "waiting for mesh" EmptyState path (§6/§7),
+        // exercised end-to-end (glyph geometry + both text lines).
+        render(&MeshState::default(), false, 0.0);
+    }
+
+    #[test]
+    fn populated_state_paints_the_full_animated_path() {
+        // Leader ring + Ok/Warn/Down health + active, idle and dangling links
+        // exercise every branch of the animated paint path.
+        let state = MeshState {
+            nodes: vec![
+                MeshNode::new("lh", "lighthouse", Role::Lighthouse, Health::Ok).leader(),
+                MeshNode::new("a", "peer-a", Role::Workstation, Health::Warn),
+                MeshNode::new("b", "peer-b", Role::Workstation, Health::Down),
+            ],
+            links: vec![
+                MeshLink::new("lh", "a", 0.9),     // active: travelling pulses
+                MeshLink::new("lh", "b", 0.0),     // idle: hairline only
+                MeshLink::new("lh", "ghost", 0.5), // unknown endpoint → skipped
+            ],
+        };
+        render(&state, false, 0.75);
+    }
+
+    #[test]
+    fn reduce_motion_takes_the_static_branches() {
+        let state = MeshState {
+            nodes: vec![
+                MeshNode::new("lh", "lighthouse", Role::Lighthouse, Health::Ok).leader(),
+                MeshNode::new("a", "peer-a", Role::Workstation, Health::Ok),
+            ],
+            links: vec![MeshLink::new("lh", "a", 0.7)],
+        };
+        // Static mid-dot + static leader ring (the reduced-motion branches).
+        render(&state, true, 1.5);
     }
 }

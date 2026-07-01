@@ -10,7 +10,9 @@
 //! ```
 //!
 //! The sample lives **here**, in the example. The [`MeshView`] widget itself
-//! draws only the [`MeshState`] it is handed — no embedded demo data.
+//! draws only the [`MeshState`] it is handed — no embedded demo data. An "empty
+//! (no mesh)" checkbox hands it an empty state to preview the honest "waiting
+//! for mesh" `EmptyState`.
 
 use mde_egui::egui;
 use mde_egui::{eframe, run_client, Style};
@@ -19,6 +21,7 @@ use mde_mesh_view::{Health, MeshLink, MeshNode, MeshState, MeshView, Role};
 struct MeshViewDemo {
     state: MeshState,
     reduce_motion: bool,
+    show_empty: bool,
 }
 
 impl eframe::App for MeshViewDemo {
@@ -33,6 +36,8 @@ impl eframe::App for MeshViewDemo {
                 );
                 ui.add_space(Style::SP_M);
                 ui.checkbox(&mut self.reduce_motion, "reduce motion");
+                ui.add_space(Style::SP_M);
+                ui.checkbox(&mut self.show_empty, "empty (no mesh)");
             });
             ui.colored_label(
                 Style::TEXT_DIM,
@@ -40,7 +45,11 @@ impl eframe::App for MeshViewDemo {
             );
             ui.add_space(Style::SP_S);
 
-            MeshView::new(&self.state)
+            // Preview the empty canvas by handing the widget an empty state —
+            // the same honest "waiting for mesh" path a caller with no data hits.
+            let empty = MeshState::default();
+            let state = if self.show_empty { &empty } else { &self.state };
+            MeshView::new(state)
                 .reduce_motion(self.reduce_motion)
                 .show(ui);
         });
@@ -79,6 +88,7 @@ fn main() -> eframe::Result<()> {
         MeshViewDemo {
             state: sample_state(),
             reduce_motion: false,
+            show_empty: false,
         }
     })
 }
