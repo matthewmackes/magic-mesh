@@ -102,8 +102,11 @@ impl<T: ChTransport> Vm<T> {
         VmInfo::from_json(&resp.body)
     }
 
-    /// A checked `PUT` (shared by the bodyless verbs + `vm.create`).
-    fn put(&self, endpoint: &str, body: Option<&str>) -> Result<ChResponse, KvmError> {
+    /// A checked `PUT` (shared by the bodyless verbs + `vm.create`, and by the
+    /// migration executor in [`crate::migrate`], which drives the
+    /// `vm.receive-migration`/`vm.send-migration` verbs through this same
+    /// non-2xx mapping).
+    pub(crate) fn put(&self, endpoint: &str, body: Option<&str>) -> Result<ChResponse, KvmError> {
         self.request("PUT", endpoint, body)
     }
 

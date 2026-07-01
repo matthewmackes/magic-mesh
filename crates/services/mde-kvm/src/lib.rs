@@ -53,8 +53,16 @@
 //!   slice and refuses a per-device VMM attach with a typed
 //!   [`UsbError::UnsupportedByVmm`] pointing at the protocol-side RDP
 //!   redirection (`mde-vdi-rdp`) — never a fabricated knob.
+//! - **Live migration**: [`plan_migration`] (pure) orders the typed steps
+//!   `PrepareReceive` → `SendMigration` → `VerifyRunning` with the exact
+//!   `vm.receive-migration`/`vm.send-migration` bodies; [`run_migration`]
+//!   drives them through the [`ChTransport`] seam against the target + source
+//!   VMMs. Cross-host, the destination URL is the target's **Nebula overlay
+//!   IP** so the guest streams inside the mesh; the live run is gated in
+//!   `tests/live_boot.rs` (`MDE_KVM_TEST_MIGRATE_*`).
 
 mod config;
+mod migrate;
 mod spec;
 mod transport;
 mod usb;
@@ -67,6 +75,10 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub use config::build_ch_config;
+pub use migrate::{
+    plan_migration, run_migration, MigrateError, MigrateRequest, MigrationPlan, MigrationSide,
+    MigrationStep, MigrationUrl, DEFAULT_MIGRATION_PORT, MIGRATION_STEPS,
+};
 pub use spec::{
     api_socket_path, gpu_socket_path, running_disk_path, virtiofs_socket_path, Nic, NicRole,
     SharedFolder, VmSpec, DEFAULT_FIRMWARE, MESH_SHARE_TAG, RUNTIME_DIR,
