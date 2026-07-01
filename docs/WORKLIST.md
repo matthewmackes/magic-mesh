@@ -2604,9 +2604,9 @@ _Design: `docs/design/workbench-control-surface.md` (locked 2026-06-29 via the o
 - [✓] **CTRLSURF-6: one universal sidebar + scope-first nav taxonomy** _(landed dabc1fa; reconciled 2026-07-01)_
   As an operator, I want a single left nav with plain-language scope-first sections + sub-groups, so the two stacked rails and the SHOUTING labels are gone.
   - [✓] the Front Door rail folds into `sidebar.rs`; `model.rs` renders the scope-first sections (Overview/This Node/Mesh/Fleet/Datacenter/Monitoring/System) with sub-group headers; no SHOUTING labels; `Group::from_slug` round-trips every section
-- [>] **CTRLSURF-7: shared zebra `striped_list` helper** *(session=819545e6, agent a444da3 on BigBoy)*
+- [✓] **CTRLSURF-7: shared zebra `striped_list` helper** _(landed 67b718d)_
   As an operator, I want every list zebra-striped, so dense rows are scannable.
-  - [ ] a shared helper (the `mde-notify-center` zebra idiom) backs the list/table panels; Carbon tokens only (§4)
+  - [✓] a shared helper (the `mde-notify-center` zebra idiom) backs the list/table panels; Carbon tokens only (§4) — new `striped_list` module (`row_shade`/`striped_row`) over a new `Palette::zebra_row(index)` mde-theme token (reuses the two layer shades, no literal, backed by a token test); routes all_services / mesh_pending / fleet_logs / network_hosts; `mde-notify-center` deduped onto it; `peers.rs` deliberately skipped (its row bg signals expand-state). Farm-green: mde-theme 233, mde-workbench 1316+, clippy 0.
 - [ ] **CTRLSURF-8: subtle density pass + new Workbench icon**
   As an operator, I want tightened spacing + a mesh-native app icon, so the console reads denser and on-brand.
   - [ ] redundant triple titles dropped; fixed-height output boxes flex; the new mesh-control glyph replaces the Carbon tools icon in `assets/icons/carbon/workbench.svg` + the launcher tile
