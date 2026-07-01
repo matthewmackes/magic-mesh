@@ -18,7 +18,8 @@ pub mod view;
 use mde_egui::{eframe, egui};
 use mde_files::backend::RealBackend;
 
-use model::FileBrowser;
+pub use model::FileBrowser;
+pub use view::files_panel;
 
 /// The eframe application: a single [`FileBrowser`] rendered each frame.
 pub struct FilesApp {
@@ -44,6 +45,12 @@ impl Default for FilesApp {
 
 impl eframe::App for FilesApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        view::show(ctx, &mut self.browser);
+        // Thin frame wrapper (E12-3, EMBED): the binary only owns the window
+        // `CentralPanel`; the surface itself renders through the shared
+        // [`files_panel`] fn — the exact same call the E12 shell makes to mount
+        // Files as an embedded panel, so standalone and embedded are identical.
+        egui::CentralPanel::default().show(ctx, |ui| {
+            files_panel(ui, &mut self.browser);
+        });
     }
 }

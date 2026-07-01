@@ -31,12 +31,21 @@ enum Action {
     Send,
 }
 
-/// Render the whole Files surface for one frame.
-pub fn show(ctx: &egui::Context, browser: &mut FileBrowser) {
+/// Render the whole Files surface into the given `ui` — the top bar, the mesh
+/// sidebar, and the central listing.
+///
+/// This is the surface's one reusable entry point (E12-3, EMBED). The standalone
+/// binary calls it inside its window [`egui::CentralPanel`]; the E12 shell
+/// (`mde-shell-egui`, E12-3b) calls the SAME fn to mount Files as an embedded
+/// panel in its own `egui::Context`. The internal panels use `show_inside`, so
+/// the surface lays out its top/side/central regions within whatever `ui` region
+/// it is handed — a full window standalone, a shell panel when embedded — with no
+/// standalone-vs-embedded branch in the render path.
+pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     let mut actions: Vec<Action> = Vec::new();
-    top_bar(ctx, browser, &mut actions);
-    sidebar(ctx, browser, &mut actions);
-    listing(ctx, browser, &mut actions);
+    top_bar(ui, browser, &mut actions);
+    sidebar(ui, browser, &mut actions);
+    listing(ui, browser, &mut actions);
     for action in actions {
         apply(browser, action);
     }
@@ -61,8 +70,8 @@ fn apply(browser: &mut FileBrowser, action: Action) {
 
 // ── Top bar ─────────────────────────────────────────────────────────────────
 
-fn top_bar(ctx: &egui::Context, b: &FileBrowser, actions: &mut Vec<Action>) {
-    egui::TopBottomPanel::top("files-top").show(ctx, |ui| {
+fn top_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    egui::TopBottomPanel::top("files-top").show_inside(ui, |ui| {
         ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
             ui.heading(
@@ -126,10 +135,10 @@ fn pane_title(pane: &Pane) -> String {
 
 // ── Sidebar ─────────────────────────────────────────────────────────────────
 
-fn sidebar(ctx: &egui::Context, b: &FileBrowser, actions: &mut Vec<Action>) {
+fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
     egui::SidePanel::left("files-side")
         .default_width(Style::SP_XL * 7.0)
-        .show(ctx, |ui| {
+        .show_inside(ui, |ui| {
             ui.add_space(Style::SP_S);
             let host = if b.self_node().host.is_empty() {
                 "this node"
@@ -204,8 +213,8 @@ fn peer_row(
 
 // ── Central listing ─────────────────────────────────────────────────────────
 
-fn listing(ctx: &egui::Context, b: &FileBrowser, actions: &mut Vec<Action>) {
-    egui::CentralPanel::default().show(ctx, |ui| {
+fn listing(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    egui::CentralPanel::default().show_inside(ui, |ui| {
         ui.add_space(Style::SP_S);
         ui.colored_label(Style::TEXT_DIM, format!("{} items", b.rows().len()));
         ui.add_space(Style::SP_XS);
@@ -370,5 +379,66 @@ const fn peer_color(status: PeerStatus) -> Color32 {
         PeerStatus::Online | PeerStatus::Self_ => Style::OK,
         PeerStatus::Idle => Style::WARN,
         PeerStatus::Offline => Style::TEXT_DIM,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::files_panel;
+    use crate::model::FileBrowser;
+    use mde_egui::egui::{self, pos2, vec2, Rect};
+    use mde_egui::Style;
+    use mde_files::backend::DemoBackend;
+
+    /// Drive one headless egui frame that renders [`files_panel`] into a real
+    /// `CentralPanel`, then tessellate the result on the CPU so any paint-path
+    /// fault (a bad shape, text, or geometry call) surfaces as a test failure.
+    ///
+    /// This is the same `Context::run` → `tessellate` path the DRM runner drives,
+    /// minus the GPU — no window, no wgpu, no live mesh Bus. It proves the panel
+    /// is embeddable: it renders into a plain `ui` off-GPU, which is exactly how
+    /// the E12 shell will mount it (E12-3b). A non-empty primitive list confirms
+    /// the frame actually drew something.
+    fn render(browser: &mut FileBrowser) {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                files_panel(ui, browser);
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(!prims.is_empty(), "files_panel produced no draw primitives");
+    }
+
+    #[test]
+    fn files_panel_renders_the_populated_path() {
+        // DemoBackend ships a curated roster + a populated per-peer listing (no
+        // live Bus), so browsing a peer runs the FULL paint path: the top bar +
+        // Send button, every sidebar peer row + status dot, and each listing row
+        // through `format_row`. The same view the shell mounts, tessellated
+        // off-GPU.
+        let mut browser = FileBrowser::new(Box::new(DemoBackend::new()));
+        browser.open_peer("pine");
+        assert!(!browser.rows().is_empty(), "fixture peer must be populated");
+        render(&mut browser);
+    }
+
+    #[test]
+    fn files_panel_renders_the_empty_no_mesh_state() {
+        // The empty/error branch POLISH-files added: browsing an unknown peer over
+        // a mesh-less backend yields an empty listing AND `mesh_overlay() == None`,
+        // so `empty_state` paints its honest "No mesh connection" copy and the
+        // sidebar its "Standalone" badge — proven runtime-reachable, not just
+        // unit-asserted on the model.
+        let mut browser = FileBrowser::new(Box::new(DemoBackend::new()));
+        browser.open_peer("ghost");
+        assert!(browser.rows().is_empty());
+        assert!(browser.mesh_overlay().is_none());
+        render(&mut browser);
     }
 }
