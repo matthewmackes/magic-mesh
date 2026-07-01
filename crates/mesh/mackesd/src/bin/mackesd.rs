@@ -1259,6 +1259,15 @@ enum OnboardCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// OW-3 — found this Workstation's mesh: mint the Nebula CA + bring up a
+    /// LAN-only overlay (no lighthouse, no internet) so a lone box is a working
+    /// mesh-of-one. Idempotent — re-running on an already-founded node is a safe
+    /// no-op. `--label <friendly>` cosmetically names the mesh.
+    MeshCreate {
+        /// Optional friendly label folded into the mesh-id (cosmetic).
+        #[arg(long)]
+        label: Option<String>,
+    },
 }
 
 /// DDNS-EGRESS-3 — `mackesd ddns <sub>` subcommands. Each calls the same
@@ -2296,6 +2305,41 @@ fn main() -> anyhow::Result<()> {
                 if failed > 0 {
                     std::process::exit(1);
                 }
+            }
+            OnboardCmd::MeshCreate { label } => {
+                // Found a mesh-of-one on this Workstation, reusing mesh_init's
+                // CA-bootstrap. Resolve the LAN/underlay address best-effort — a
+                // truly offline lone box has no default route, so fall back to
+                // loopback (OW-6 wires the real mesh-DNS / network); the founding
+                // node's lighthouse entry is self-referential on a mesh-of-one.
+                let conn = mackesd_core::store::open(&db_path)
+                    .with_context(|| format!("opening store at {}", db_path.display()))?;
+                mackesd_core::store::migrate(&conn).context("migrating store")?;
+                let root = mackesd_core::default_qnm_shared_root();
+                let node_id = default_node_id();
+                let external_addr = detect_primary_ipv4()
+                    .map(|ip| format!("{ip}:4242"))
+                    .unwrap_or_else(|_| "127.0.0.1:4242".to_string());
+                let report = mackesd_core::onboard::mesh_create::create(
+                    &mackesd_core::ca::SubprocessBackend,
+                    &conn,
+                    &root,
+                    &node_id,
+                    std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.crt"),
+                    std::path::Path::new("/var/lib/mackesd/nebula-ca/ca.key"),
+                    std::path::Path::new("/var/lib/mackesd/nebula-ca/scratch"),
+                    &external_addr,
+                    label.as_deref(),
+                )?;
+                // Best-effort overlay start on a fresh founding (mirrors
+                // mesh-init; the next serve's supervisor also materializes +
+                // starts). A no-op founding leaves the running overlay untouched.
+                if report.created {
+                    let _ = std::process::Command::new("systemctl")
+                        .args(["start", "nebula.service"])
+                        .status();
+                }
+                print!("{}", report.human());
             }
         },
         Cmd::DnsLeakCheck { expected } => {

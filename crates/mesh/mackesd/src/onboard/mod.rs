@@ -22,9 +22,14 @@
 //! # Verbs owned by the sibling OW units — deliberately NOT declared here (§7)
 //! The complex verbs each land in their own unit with their real implementation;
 //! this engine does **not** carry a stub / `todo!()` variant for any of them:
-//! `mesh-create` (OW-3), `invite-issue` (OW-4), `enroll` (OW-5), and
-//! `mesh-dns` + `network` (OW-6). A front-end sequences those units' entry points
-//! around the two verbs above.
+//! `invite-issue` (OW-4), `enroll` (OW-5), and `mesh-dns` + `network` (OW-6). A
+//! front-end sequences those units' entry points around the verbs here.
+//!
+//! # Landed since: OW-3 — [`mesh_create`]
+//! [`mesh_create`] founds a lone Workstation's mesh-of-one (mint CA + LAN-only
+//! overlay, offline), a thin idempotent wrapper over the ENT-4
+//! [`crate::mesh_init`] bootstrap — reuse, not a reimplementation.
 
+pub mod mesh_create;
 pub mod role_provision;
 pub mod self_test;
