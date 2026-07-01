@@ -101,6 +101,67 @@ impl Nic {
     }
 }
 
+/// The conventional in-guest mount tag for the **mesh-share** folder — the common
+/// case ([`SharedFolder::mesh_share`]): a Syncthing-replicated mesh directory the
+/// guest mounts read-write (`mount -t virtiofs mesh-share /mnt/mesh-share`). Distinct
+/// from the XCP server path's `mesh-storage` tag; this is the E12 desktop bridge.
+pub const MESH_SHARE_TAG: &str = "mesh-share";
+
+/// A host directory exported into the guest over **virtio-fs** (E12-9, the mesh-share
+/// bridge). Mirrors [`Nic`]: a plain typed field on [`VmSpec`] that
+/// [`crate::config::build_ch_config`] folds into the cloud-hypervisor config. A VM
+/// can carry zero or more shared folders.
+///
+/// The host side of each folder is a **virtiofsd** process exporting `host_path` on a
+/// per-folder unix socket ([`virtiofs_socket_path`]); cloud-hypervisor's `fs` device
+/// connects to that socket and the guest mounts it under `tag`. `read_only` is a
+/// *host-side* property (it drives virtiofsd's `--readonly`), so — exactly like a
+/// NIC's [`NicRole`] — it does **not** appear in the CH `fs` entry, only in the live
+/// launch behind [`VirtiofsLauncher`](crate::VirtiofsLauncher).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SharedFolder {
+    /// The in-guest virtio-fs mount tag (e.g. [`MESH_SHARE_TAG`]) — what the guest
+    /// passes to `mount -t virtiofs <tag> <mountpoint>`. Also names the per-folder
+    /// virtiofsd socket ([`virtiofs_socket_path`]).
+    pub tag: String,
+    /// The host directory virtiofsd exports — for the mesh-share this is the
+    /// Syncthing-replicated mesh dir, so a file dropped in it appears in the guest.
+    pub host_path: PathBuf,
+    /// Export read-only. `false` ⇒ the guest can write back (the mesh-share default,
+    /// so guest edits replicate back out); `true` ⇒ virtiofsd exports `--readonly`.
+    pub read_only: bool,
+}
+
+impl SharedFolder {
+    /// A shared folder exporting `host_path` under guest mount `tag`, read-write by
+    /// default (flip with [`SharedFolder::with_read_only`]).
+    #[must_use]
+    pub fn new(tag: impl Into<String>, host_path: impl Into<PathBuf>) -> Self {
+        Self {
+            tag: tag.into(),
+            host_path: host_path.into(),
+            read_only: false,
+        }
+    }
+
+    /// The common case: the **mesh-share** folder — a Syncthing-replicated mesh
+    /// directory `host_path` mounted read-write under [`MESH_SHARE_TAG`], so a file
+    /// dropped in the mesh-share appears inside the guest (and guest writes replicate
+    /// back out over the mesh).
+    #[must_use]
+    pub fn mesh_share(host_path: impl Into<PathBuf>) -> Self {
+        Self::new(MESH_SHARE_TAG, host_path)
+    }
+
+    /// Export read-only (builder style) — the guest sees the folder but cannot write
+    /// back into the mesh dir.
+    #[must_use]
+    pub fn with_read_only(mut self, yes: bool) -> Self {
+        self.read_only = yes;
+        self
+    }
+}
+
 /// A local cloud-hypervisor VM spec (lock 11). The exact, minimal description the
 /// shell/`vm-lifecycle` worker hands to the broker; [`crate::config::build_ch_config`]
 /// turns it into cloud-hypervisor's `VmConfig` JSON.
@@ -126,6 +187,11 @@ pub struct VmSpec {
     /// The guest's NICs. For a dual-homed desktop (lock 19) this is one
     /// [`NicRole::Mesh`] + one [`NicRole::Lan`].
     pub nics: Vec<Nic>,
+    /// The guest's **virtio-fs** shared folders (E12-9, the mesh-share bridge). Zero
+    /// or more host directories exported into the guest; the mesh-share folder is the
+    /// common case ([`SharedFolder::mesh_share`]). Each becomes a cloud-hypervisor
+    /// `fs` device backed by a virtiofsd socket.
+    pub shared_folders: Vec<SharedFolder>,
 }
 
 impl VmSpec {
@@ -141,6 +207,7 @@ impl VmSpec {
             firmware: None,
             virtio_gpu: false,
             nics: Vec::new(),
+            shared_folders: Vec::new(),
         }
     }
 
@@ -163,6 +230,14 @@ impl VmSpec {
     #[must_use]
     pub fn with_nic(mut self, nic: Nic) -> Self {
         self.nics.push(nic);
+        self
+    }
+
+    /// Attach a virtio-fs shared folder (builder style). Order is preserved; a VM
+    /// can carry several (e.g. the mesh-share plus a read-only reference export).
+    #[must_use]
+    pub fn with_shared_folder(mut self, folder: SharedFolder) -> Self {
+        self.shared_folders.push(folder);
         self
     }
 
@@ -191,10 +266,81 @@ pub fn gpu_socket_path(name: &str) -> PathBuf {
     PathBuf::from(RUNTIME_DIR).join(name).join("gpu.sock")
 }
 
+/// The virtiofsd unix-socket path for VM `name`'s shared folder tagged `tag`
+/// (`/run/mde-kvm/<name>/fs-<tag>.sock`). One socket per folder (a VM can export
+/// several), so the two ends — the [`VirtiofsLauncher`](crate::VirtiofsLauncher) that
+/// binds virtiofsd here and the `fs` device [`crate::config::build_ch_config`] points
+/// at it — agree by both deriving the path from this one pure function, never
+/// colliding across a fan-out of folders.
+#[must_use]
+pub fn virtiofs_socket_path(name: &str, tag: &str) -> PathBuf {
+    PathBuf::from(RUNTIME_DIR)
+        .join(name)
+        .join(format!("fs-{tag}.sock"))
+}
+
 /// The running-disk path under a `~/Local` directory for a VM named `name`
 /// (`<local_dir>/<name>.img`). Per lock 18 the broker copies a mesh golden base
 /// to this local, never-synced path and points [`VmSpec::disk`] at it before boot.
 #[must_use]
 pub fn running_disk_path(local_dir: &Path, name: &str) -> PathBuf {
     local_dir.join(format!("{name}.img"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mesh_share_is_the_read_write_syncthing_dir_under_the_mesh_share_tag() {
+        let sf = SharedFolder::mesh_share("/home/op/Mesh/Share");
+        assert_eq!(sf.tag, MESH_SHARE_TAG);
+        assert_eq!(sf.host_path, PathBuf::from("/home/op/Mesh/Share"));
+        // the mesh-share defaults read-write so guest edits replicate back out.
+        assert!(!sf.read_only);
+    }
+
+    #[test]
+    fn new_defaults_read_write_and_with_read_only_flips_it() {
+        let rw = SharedFolder::new("docs", "/srv/docs");
+        assert_eq!(rw.tag, "docs");
+        assert!(!rw.read_only);
+        let ro = SharedFolder::new("ref", "/srv/ref").with_read_only(true);
+        assert!(ro.read_only);
+    }
+
+    #[test]
+    fn a_spec_carries_zero_or_more_shared_folders_in_order() {
+        // zero by default…
+        let plain = VmSpec::new("plain", 1, 512, "/d.img");
+        assert!(plain.shared_folders.is_empty());
+        // …and the builder preserves attach order.
+        let spec = VmSpec::new("web1", 2, 2048, "/web1.img")
+            .with_shared_folder(SharedFolder::mesh_share("/home/op/Mesh/Share"))
+            .with_shared_folder(SharedFolder::new("ref", "/srv/ref").with_read_only(true));
+        assert_eq!(spec.shared_folders.len(), 2);
+        assert_eq!(spec.shared_folders[0].tag, MESH_SHARE_TAG);
+        assert_eq!(spec.shared_folders[1].tag, "ref");
+    }
+
+    #[test]
+    fn virtiofs_socket_is_per_vm_and_per_tag() {
+        assert_eq!(
+            virtiofs_socket_path("web1", MESH_SHARE_TAG),
+            PathBuf::from("/run/mde-kvm/web1/fs-mesh-share.sock")
+        );
+        // a second folder on the same VM gets its own socket (no collision).
+        assert_ne!(
+            virtiofs_socket_path("web1", "mesh-share"),
+            virtiofs_socket_path("web1", "ref")
+        );
+    }
+
+    #[test]
+    fn shared_folder_serde_round_trips() {
+        let sf = SharedFolder::mesh_share("/home/op/Mesh/Share").with_read_only(true);
+        let json = serde_json::to_string(&sf).expect("serialize");
+        let back: SharedFolder = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(sf, back);
+    }
 }

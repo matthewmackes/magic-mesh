@@ -6,10 +6,15 @@
 //!
 //! - [`VmSpec`] + [`Nic`] model a VM, including the **dual-homing** lock (19):
 //!   every guest is its own Nebula mesh peer *and* carries a LAN-bridged NIC.
+//! - [`SharedFolder`] models a **virtio-fs** shared folder (E12-9, the mesh-share
+//!   bridge): a host directory (a Syncthing-replicated mesh dir) exported into the
+//!   guest, so a file dropped in it appears inside the VM. [`build_ch_config`] folds
+//!   each into a cloud-hypervisor `fs` device; the injectable [`VirtiofsLauncher`]
+//!   owns the (integration-gated) live `virtiofsd` spawn behind that device.
 //! - [`build_ch_config`] is the **load-bearing pure core** — a [`VmSpec`] → the
 //!   exact cloud-hypervisor `VmConfig` JSON. It is heavily unit-tested
-//!   (spec→JSON correctness, the dual-homed NIC mapping, the virtio-gpu device)
-//!   because it is the one place that mapping lives.
+//!   (spec→JSON correctness, the dual-homed NIC mapping, the virtio-gpu device, the
+//!   virtio-fs shared folders) because it is the one place that mapping lives.
 //! - [`Vm`] drives the lifecycle (`create`/`boot`/`shutdown`/`info`/`delete`) over
 //!   cloud-hypervisor's **HTTP-on-a-unix-socket** API. The transport
 //!   ([`ChTransport`]) is injectable, so the lifecycle wiring is unit-tested with
@@ -26,10 +31,17 @@
 //! golden image — none present on the build farm — so the end-to-end boot is the
 //! `#[ignore]`d `tests/live_boot.rs`, gated on `MDE_KVM_TEST_SOCKET`. The
 //! lifecycle calls themselves are fully implemented; only the live VMM is parked.
+//!
+//! The **virtio-fs shared folders** are gated the same way: the [`SharedFolder`]
+//! model + the CH `fs` mapping are pure + unit-tested, but spawning the live
+//! `virtiofsd` (which needs the binary + the host mesh-share export) is parked behind
+//! [`VirtiofsLauncher`], whose production impl ([`LiveVirtiofsLauncher`]) returns a
+//! typed integration-gated error rather than faking success.
 
 mod config;
 mod spec;
 mod transport;
+mod virtiofs;
 mod vm;
 
 use std::path::PathBuf;
@@ -38,12 +50,13 @@ use thiserror::Error;
 
 pub use config::build_ch_config;
 pub use spec::{
-    api_socket_path, gpu_socket_path, running_disk_path, Nic, NicRole, VmSpec, DEFAULT_FIRMWARE,
-    RUNTIME_DIR,
+    api_socket_path, gpu_socket_path, running_disk_path, virtiofs_socket_path, Nic, NicRole,
+    SharedFolder, VmSpec, DEFAULT_FIRMWARE, MESH_SHARE_TAG, RUNTIME_DIR,
 };
 pub use transport::{
     build_http_request, parse_http_response, ChResponse, ChTransport, UnixSocketTransport,
 };
+pub use virtiofs::{LiveVirtiofsLauncher, VirtiofsError, VirtiofsLauncher};
 pub use vm::{Vm, VmInfo};
 
 /// A VM-broker failure.

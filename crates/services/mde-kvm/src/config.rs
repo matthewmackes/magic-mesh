@@ -10,10 +10,15 @@
 
 use serde_json::{json, Value};
 
-use crate::spec::{gpu_socket_path, Nic, VmSpec};
+use crate::spec::{gpu_socket_path, virtiofs_socket_path, Nic, SharedFolder, VmSpec};
 
 /// MiB → bytes (cloud-hypervisor's `memory.size` is bytes).
 const MIB: u64 = 1024 * 1024;
+
+/// cloud-hypervisor virtio-fs queue sizing (its `FsConfig` defaults): a single
+/// request virtqueue, 1024 descriptors deep — ample for a desktop mesh-share.
+const FS_NUM_QUEUES: usize = 1;
+const FS_QUEUE_SIZE: u16 = 1024;
 
 /// Build the cloud-hypervisor `VmConfig` JSON for `spec`.
 ///
@@ -27,6 +32,10 @@ const MIB: u64 = 1024 * 1024;
 /// - `gpu` ← a vhost-user-gpu device at [`gpu_socket_path`] when
 ///   [`VmSpec::virtio_gpu`] (lock 12); the `console` is then `Off` because the
 ///   GPU is the display.
+/// - `fs` ← one entry per [`VmSpec::shared_folders`] (E12-9, the mesh-share bridge):
+///   the guest mount `tag` + the per-folder virtiofsd `socket`
+///   ([`virtiofs_socket_path`]). The host `host_path`/`read_only` are virtiofsd's
+///   concern (the live launch), not cloud-hypervisor's, so they are not emitted.
 /// - `rng`/`serial` ← entropy + a debug serial, always present.
 #[must_use]
 pub fn build_ch_config(spec: &VmSpec) -> Value {
@@ -67,6 +76,20 @@ pub fn build_ch_config(spec: &VmSpec) -> Value {
         ]);
     }
 
+    // The virtio-fs shared folders (E12-9, the mesh-share bridge): each folder → a
+    // cloud-hypervisor `fs` device pointed at its per-folder virtiofsd socket. The
+    // host `host_path`/`read_only` drive the virtiofsd launch, so — like the NIC
+    // role — they do not appear here; only the guest mount `tag` + the socket the
+    // device dials.
+    if !spec.shared_folders.is_empty() {
+        let fs: Vec<Value> = spec
+            .shared_folders
+            .iter()
+            .map(|sf| shared_folder_to_fs(&spec.name, sf))
+            .collect();
+        config["fs"] = Value::Array(fs);
+    }
+
     config
 }
 
@@ -85,10 +108,29 @@ fn nic_to_net(nic: &Nic) -> Value {
     entry
 }
 
+/// One [`SharedFolder`] → a cloud-hypervisor `FsConfig` entry: the guest mount `tag`,
+/// the per-folder virtiofsd `socket` ([`virtiofs_socket_path`], derived from the VM
+/// name + tag so it matches the launcher's binding), and the queue sizing. The host
+/// `host_path` + `read_only` are virtiofsd's concern (the [`VirtiofsLauncher`] launch),
+/// not cloud-hypervisor's, so they are deliberately not emitted here.
+///
+/// [`VirtiofsLauncher`]: crate::VirtiofsLauncher
+fn shared_folder_to_fs(vm_name: &str, folder: &SharedFolder) -> Value {
+    json!({
+        "tag": folder.tag,
+        "socket": virtiofs_socket_path(vm_name, &folder.tag).to_string_lossy(),
+        "num_queues": FS_NUM_QUEUES,
+        "queue_size": FS_QUEUE_SIZE,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::{gpu_socket_path, Nic, VmSpec, DEFAULT_FIRMWARE};
+    use crate::spec::{
+        gpu_socket_path, virtiofs_socket_path, Nic, SharedFolder, VmSpec, DEFAULT_FIRMWARE,
+        MESH_SHARE_TAG,
+    };
 
     /// A representative dual-homed desktop spec for the mapping tests.
     fn web1() -> VmSpec {
@@ -175,6 +217,42 @@ mod tests {
         let spec = VmSpec::new("fw", 1, 512, "/d.img").with_firmware("/opt/edk2/CLOUDHV.fd");
         let cfg = build_ch_config(&spec);
         assert_eq!(cfg["payload"]["firmware"], json!("/opt/edk2/CLOUDHV.fd"));
+    }
+
+    #[test]
+    fn shared_folders_map_to_fs_entries_with_tag_and_socket() {
+        // THE mesh-share acceptance at the config layer: each SharedFolder → one `fs`
+        // device carrying the guest mount tag + its per-folder virtiofsd socket.
+        let spec = VmSpec::new("web1", 2, 2048, "/home/op/Local/web1.img")
+            .with_shared_folder(SharedFolder::mesh_share("/home/op/Mesh/Share"))
+            .with_shared_folder(SharedFolder::new("ref", "/srv/ref").with_read_only(true));
+        let cfg = build_ch_config(&spec);
+        let fs = cfg["fs"].as_array().expect("fs array");
+        assert_eq!(fs.len(), 2);
+        // folder 0: the mesh-share, tagged + pointed at its per-folder virtiofsd socket.
+        assert_eq!(fs[0]["tag"], json!(MESH_SHARE_TAG));
+        assert_eq!(
+            fs[0]["socket"],
+            json!(virtiofs_socket_path("web1", MESH_SHARE_TAG).to_string_lossy())
+        );
+        assert_eq!(fs[0]["num_queues"], json!(1));
+        assert_eq!(fs[0]["queue_size"], json!(1024));
+        // folder 1: a second export gets its own tag + its own socket (no collision).
+        assert_eq!(fs[1]["tag"], json!("ref"));
+        assert_eq!(
+            fs[1]["socket"],
+            json!(virtiofs_socket_path("web1", "ref").to_string_lossy())
+        );
+        // host_path + read_only are the virtiofsd launcher's concern, not CH's — they
+        // never appear in the `fs` entry (mirrors the dual-homed NIC role).
+        assert!(fs[0].get("host_path").is_none());
+        assert!(fs[1].get("read_only").is_none());
+    }
+
+    #[test]
+    fn no_shared_folders_leaves_no_fs_key() {
+        let cfg = build_ch_config(&VmSpec::new("plain", 2, 2048, "/p.img"));
+        assert!(cfg.get("fs").is_none());
     }
 
     #[test]
