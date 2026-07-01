@@ -286,7 +286,7 @@ pub(crate) fn discovery_panel(ui: &mut egui::Ui, state: &mut DiscoveryState) {
                         clicked = Some(i);
                     }
                     ui.add_space(Style::SP_S);
-                    ui.colored_label(Style::TEXT_DIM, RichText::new(&vm.state).size(Style::SMALL));
+                    mde_egui::muted_note(ui, &vm.state);
                 });
             }
         });
@@ -310,21 +310,15 @@ pub(crate) fn discovery_panel(ui: &mut egui::Ui, state: &mut DiscoveryState) {
         }
         if let Some(vm) = state.selected.and_then(|i| state.vms.get(i)) {
             ui.add_space(Style::SP_S);
-            ui.colored_label(
-                Style::TEXT_DIM,
-                RichText::new(format!("\u{2192} {} on {}", vm.name, vm.host)).size(Style::SMALL),
-            );
+            mde_egui::muted_note(ui, format!("\u{2192} {} on {}", vm.name, vm.host));
         }
     });
 
     ui.add_space(Style::SP_XS);
-    ui.colored_label(
-        Style::TEXT_DIM,
-        RichText::new(
-            "Connecting brokers the desktop over the mesh — the live cross-peer transport is \
+    mde_egui::muted_note(
+        ui,
+        "Connecting brokers the desktop over the mesh — the live cross-peer transport is \
              gated (E12-4).",
-        )
-        .size(Style::SMALL),
     );
 }
 

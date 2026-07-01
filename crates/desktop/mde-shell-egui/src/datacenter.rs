@@ -471,12 +471,9 @@ impl DatacenterState {
                 }
                 // MV-6b lands the container roster read-only; container run/stop
                 // lifecycle-drive (action/container/lifecycle) is a follow-up.
-                ui.colored_label(
-                    Style::TEXT_DIM,
-                    RichText::new(
-                        "Container rows are read-only — run/stop lifecycle-drive is a follow-up.",
-                    )
-                    .size(Style::SMALL),
+                mde_egui::muted_note(
+                    ui,
+                    "Container rows are read-only — run/stop lifecycle-drive is a follow-up.",
                 );
             });
 
@@ -572,10 +569,7 @@ fn show_node(
                 ui.colored_label(color, RichText::new(text).size(Style::SMALL));
             }
             None => {
-                ui.colored_label(
-                    Style::TEXT_DIM,
-                    RichText::new("KVM health not yet reported").size(Style::SMALL),
-                );
+                mde_egui::muted_note(ui, "KVM health not yet reported");
             }
         }
     });
@@ -621,7 +615,7 @@ fn show_node(
             } else {
                 "VM roster not yet reported."
             };
-            ui.colored_label(Style::TEXT_DIM, RichText::new(msg).size(Style::SMALL));
+            mde_egui::muted_note(ui, msg);
         } else {
             for inst in &node.instances {
                 ui.horizontal(|ui| {
@@ -649,7 +643,7 @@ fn show_node(
             } else {
                 "Container roster not yet reported."
             };
-            ui.colored_label(Style::TEXT_DIM, RichText::new(msg).size(Style::SMALL));
+            mde_egui::muted_note(ui, msg);
         } else {
             for c in &node.containers {
                 ui.horizontal(|ui| {
@@ -670,9 +664,9 @@ fn show_container_row(ui: &mut egui::Ui, c: &Container) {
     ui.add_space(Style::SP_XS);
     ui.label(RichText::new(&c.name).color(Style::TEXT).size(Style::SMALL));
     ui.add_space(Style::SP_S);
-    ui.colored_label(Style::TEXT_DIM, RichText::new(&c.image).size(Style::SMALL));
+    mde_egui::muted_note(ui, &c.image);
     ui.add_space(Style::SP_S);
-    ui.colored_label(Style::TEXT_DIM, RichText::new(&c.state).size(Style::SMALL));
+    mde_egui::muted_note(ui, &c.state);
 }
 
 /// One VM roster row: a state pip + name + raw state, and a Start (when not
@@ -693,10 +687,7 @@ fn show_instance_row(
             .size(Style::SMALL),
     );
     ui.add_space(Style::SP_S);
-    ui.colored_label(
-        Style::TEXT_DIM,
-        RichText::new(&inst.state).size(Style::SMALL),
-    );
+    mde_egui::muted_note(ui, &inst.state);
     ui.add_space(Style::SP_S);
     if running {
         if ui

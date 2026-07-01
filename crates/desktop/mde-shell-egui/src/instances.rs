@@ -249,10 +249,9 @@ pub(crate) fn instances_panel(ui: &mut egui::Ui, state: &mut InstancesState) {
             }
         }
     });
-    ui.colored_label(
-        Style::TEXT_DIM,
-        RichText::new("cloud-hypervisor VMs on this workstation — each a dual-homed mesh peer.")
-            .size(Style::SMALL),
+    mde_egui::muted_note(
+        ui,
+        "cloud-hypervisor VMs on this workstation — each a dual-homed mesh peer.",
     );
     ui.add_space(Style::SP_S);
     ui.separator();
@@ -327,15 +326,14 @@ fn show_vm(
 
     ui.indent((vm.spec.name.as_str(), "body"), |ui| {
         // Resources.
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new(format!(
+        mde_egui::muted_note(
+            ui,
+            format!(
                 "{} vCPU · {} MiB · {}",
                 vm.spec.vcpus,
                 vm.spec.mem_mib,
                 vm.spec.disk.display()
-            ))
-            .size(Style::SMALL),
+            ),
         );
 
         // Dual-homed NICs (lock 19).
@@ -385,16 +383,10 @@ fn show_nic(ui: &mut egui::Ui, nic: &Nic) {
         ui.add_space(Style::SP_XS);
         ui.colored_label(color, RichText::new(role).size(Style::SMALL));
         ui.add_space(Style::SP_XS);
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new(format!("tap {}", nic.tap)).size(Style::SMALL),
-        );
+        mde_egui::muted_note(ui, format!("tap {}", nic.tap));
         if let Some(mac) = &nic.mac {
             ui.add_space(Style::SP_XS);
-            ui.colored_label(
-                Style::TEXT_DIM,
-                RichText::new(format!("· {mac}")).size(Style::SMALL),
-            );
+            mde_egui::muted_note(ui, format!("· {mac}"));
         }
     });
 }
@@ -418,10 +410,9 @@ fn show_create_form(
     form_field(ui, "vCPUs", &mut form.vcpus);
     form_field(ui, "RAM (MiB)", &mut form.mem_mib);
     form_field(ui, "Running disk", &mut form.disk);
-    ui.colored_label(
-        Style::TEXT_DIM,
-        RichText::new("Both NICs (Nebula mesh peer + LAN bridge) are derived from the name.")
-            .size(Style::SMALL),
+    mde_egui::muted_note(
+        ui,
+        "Both NICs (Nebula mesh peer + LAN bridge) are derived from the name.",
     );
 
     if let Some(err) = form.error.as_deref() {

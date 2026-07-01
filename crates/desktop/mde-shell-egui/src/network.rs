@@ -395,14 +395,11 @@ fn show_status(ui: &mut egui::Ui, status: &NetStatus) {
 
             // Honest boundary (§6/§7): live per-link tunnel telemetry isn't on this
             // world-readable surface — never fake a gauge.
-            ui.colored_label(
-                Style::TEXT_DIM,
-                RichText::new(
-                    "Live link throughput, latency, and per-tunnel handshake state aren't \
+            mde_egui::muted_note(
+                ui,
+                "Live link throughput, latency, and per-tunnel handshake state aren't \
                      published to this surface — the shell reads the mesh directory, not live \
                      Nebula tunnel telemetry.",
-                )
-                .size(Style::SMALL),
             );
         });
 }
@@ -459,10 +456,7 @@ fn show_overlay(ui: &mut egui::Ui, status: &NetStatus) {
                 ui.colored_label(Style::TEXT, RichText::new(leader).size(Style::SMALL));
                 if status.is_leader() {
                     ui.add_space(Style::SP_XS);
-                    ui.colored_label(
-                        Style::TEXT_DIM,
-                        RichText::new("\u{00B7} this node").size(Style::SMALL),
-                    );
+                    mde_egui::muted_note(ui, "\u{00B7} this node");
                 }
             });
         }
@@ -474,10 +468,7 @@ fn show_overlay(ui: &mut egui::Ui, status: &NetStatus) {
 /// (presence dot · hostname · this-node / lighthouse chips · overlay IP · presence).
 fn show_links(ui: &mut egui::Ui, status: &NetStatus) {
     if status.peers.is_empty() {
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new("No peers in the directory yet.").size(Style::SMALL),
-        );
+        mde_egui::muted_note(ui, "No peers in the directory yet.");
         return;
     }
 
@@ -518,10 +509,7 @@ fn show_links(ui: &mut egui::Ui, status: &NetStatus) {
             );
             if peer.is_self {
                 ui.add_space(Style::SP_XS);
-                ui.colored_label(
-                    Style::TEXT_DIM,
-                    RichText::new("\u{00B7} this node").size(Style::SMALL),
-                );
+                mde_egui::muted_note(ui, "\u{00B7} this node");
             }
             if peer.is_lighthouse {
                 ui.add_space(Style::SP_XS);
@@ -531,10 +519,7 @@ fn show_links(ui: &mut egui::Ui, status: &NetStatus) {
                 );
             }
             ui.add_space(Style::SP_S);
-            ui.colored_label(
-                Style::TEXT_DIM,
-                RichText::new(peer.overlay_ip.as_deref().unwrap_or("—")).size(Style::SMALL),
-            );
+            mde_egui::muted_note(ui, peer.overlay_ip.as_deref().unwrap_or("—"));
             if let Some(p) = &peer.presence {
                 ui.add_space(Style::SP_S);
                 ui.colored_label(tone, RichText::new(p).size(Style::SMALL));
@@ -548,11 +533,7 @@ fn show_links(ui: &mut egui::Ui, status: &NetStatus) {
 /// status record.
 fn show_services(ui: &mut egui::Ui, status: &NetStatus) {
     if status.services.is_empty() {
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new("Network service health not yet reported by this node.")
-                .size(Style::SMALL),
-        );
+        mde_egui::muted_note(ui, "Network service health not yet reported by this node.");
         return;
     }
     for (label, up) in &status.services {
@@ -575,10 +556,7 @@ fn show_services(ui: &mut egui::Ui, status: &NetStatus) {
 /// and the default gateway — or an honest note when the snapshot carries none.
 fn show_routing(ui: &mut egui::Ui, status: &NetStatus) {
     if status.routing_empty() {
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new("No overlay routes or gateways published yet.").size(Style::SMALL),
-        );
+        mde_egui::muted_note(ui, "No overlay routes or gateways published yet.");
         return;
     }
     if !status.gateway_endpoints.is_empty() {

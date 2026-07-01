@@ -342,13 +342,10 @@ fn show_status(ui: &mut egui::Ui, status: &NodeStatus) {
 
             // Honest boundary (§6/§7): node-local hardware telemetry isn't on this
             // world-readable surface — never fake a gauge.
-            ui.colored_label(
-                Style::TEXT_DIM,
-                RichText::new(
-                    "Live CPU, memory, and disk aren't published to this surface — the shell \
+            mde_egui::muted_note(
+                ui,
+                "Live CPU, memory, and disk aren't published to this surface — the shell \
                      reads the mesh directory, not node-local telemetry.",
-                )
-                .size(Style::SMALL),
             );
         });
 }
@@ -405,10 +402,7 @@ fn show_identity(ui: &mut egui::Ui, status: &NodeStatus) {
                 ui.colored_label(tone, RichText::new(p).size(Style::SMALL));
                 if let Some(age) = status.heartbeat_label() {
                     ui.add_space(Style::SP_S);
-                    ui.colored_label(
-                        Style::TEXT_DIM,
-                        RichText::new(format!("\u{00B7} heartbeat {age}")).size(Style::SMALL),
-                    );
+                    mde_egui::muted_note(ui, format!("\u{00B7} heartbeat {age}"));
                 }
             });
         }
@@ -455,7 +449,7 @@ fn show_services(ui: &mut egui::Ui, status: &NodeStatus) {
         } else {
             "This node hasn't published a status record yet."
         };
-        ui.colored_label(Style::TEXT_DIM, RichText::new(msg).size(Style::SMALL));
+        mde_egui::muted_note(ui, msg);
         return;
     }
     for (label, up) in &status.services {

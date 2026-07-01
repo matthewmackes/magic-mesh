@@ -349,16 +349,13 @@ fn show_status(ui: &mut egui::Ui, status: &CtrlStatus) {
 
             // Honest boundary (§6/§7): live consensus telemetry isn't on this
             // world-readable surface — never fake a gauge.
-            ui.colored_label(
-                Style::TEXT_DIM,
-                RichText::new(
-                    "Live etcd raft term, quorum size, and per-member health aren't published to \
+            mde_egui::muted_note(
+                ui,
+                "Live etcd raft term, quorum size, and per-member health aren't published to \
                      this surface — the shell reads the mesh directory (the leader lease etcd \
                      backs), not live consensus telemetry. The scheduler, session-broker, and \
                      session-roaming run inside the mesh daemon, so the Mesh-daemon row reflects \
                      them rather than reporting a separate service.",
-                )
-                .size(Style::SMALL),
             );
         });
 }
@@ -396,10 +393,7 @@ fn show_controller(ui: &mut egui::Ui, status: &CtrlStatus) {
             ui.colored_label(Style::TEXT, RichText::new(leader).size(Style::SMALL));
             if status.is_leader() {
                 ui.add_space(Style::SP_XS);
-                ui.colored_label(
-                    Style::TEXT_DIM,
-                    RichText::new("\u{00B7} this node").size(Style::SMALL),
-                );
+                mde_egui::muted_note(ui, "\u{00B7} this node");
             }
         });
         field(
@@ -449,10 +443,7 @@ fn show_controller(ui: &mut egui::Ui, status: &CtrlStatus) {
 /// empty.
 fn show_control_services(ui: &mut egui::Ui, status: &CtrlStatus) {
     if status.nodes.is_empty() {
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new("No nodes in the directory yet.").size(Style::SMALL),
-        );
+        mde_egui::muted_note(ui, "No nodes in the directory yet.");
         return;
     }
 
@@ -495,10 +486,7 @@ fn show_control_services(ui: &mut egui::Ui, status: &CtrlStatus) {
             );
             if node.is_self {
                 ui.add_space(Style::SP_XS);
-                ui.colored_label(
-                    Style::TEXT_DIM,
-                    RichText::new("\u{00B7} this node").size(Style::SMALL),
-                );
+                mde_egui::muted_note(ui, "\u{00B7} this node");
             }
             if node.is_leader {
                 ui.add_space(Style::SP_XS);
@@ -523,7 +511,7 @@ fn show_control_services(ui: &mut egui::Ui, status: &CtrlStatus) {
                 } else {
                     "control status not yet reported"
                 };
-                ui.colored_label(Style::TEXT_DIM, RichText::new(msg).size(Style::SMALL));
+                mde_egui::muted_note(ui, msg);
             } else {
                 for (label, up) in &node.services {
                     control_chip(ui, label, *up);

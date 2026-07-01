@@ -365,14 +365,11 @@ fn show_status(ui: &mut egui::Ui, status: &ProvStatus) {
 
             // Honest boundary (§6/§7): a live onboarding wizard's state / in-progress
             // install steps aren't on this world-readable surface — never fake one.
-            ui.colored_label(
-                Style::TEXT_DIM,
-                RichText::new(
-                    "Live install progress and a node's onboarding-wizard state aren't published \
+            mde_egui::muted_note(
+                ui,
+                "Live install progress and a node's onboarding-wizard state aren't published \
                      to this surface — the shell reads the mesh directory, not the onboarding \
                      engine.",
-                )
-                .size(Style::SMALL),
             );
         });
 }
@@ -389,19 +386,13 @@ fn show_posture(ui: &mut egui::Ui, status: &ProvStatus) {
         );
         ui.add_space(Style::SP_S);
         let total = status.nodes.len();
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new(format!("{total} node{}", plural(total))).size(Style::SMALL),
-        );
+        mde_egui::muted_note(ui, format!("{total} node{}", plural(total)));
     });
     ui.add_space(Style::SP_XS);
 
     let rollup = status.role_rollup();
     if rollup.is_empty() {
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new("No nodes in the directory yet.").size(Style::SMALL),
-        );
+        mde_egui::muted_note(ui, "No nodes in the directory yet.");
         return;
     }
     for (tier, n) in rollup {
@@ -478,10 +469,7 @@ fn show_versions(ui: &mut egui::Ui, status: &ProvStatus) {
 /// tier · reported build · provisioning state.
 fn show_nodes(ui: &mut egui::Ui, status: &ProvStatus) {
     if status.nodes.is_empty() {
-        ui.colored_label(
-            Style::TEXT_DIM,
-            RichText::new("No nodes in the directory yet.").size(Style::SMALL),
-        );
+        mde_egui::muted_note(ui, "No nodes in the directory yet.");
         return;
     }
     for node in &status.nodes {
@@ -499,18 +487,12 @@ fn show_nodes(ui: &mut egui::Ui, status: &ProvStatus) {
             );
             if node.is_self {
                 ui.add_space(Style::SP_XS);
-                ui.colored_label(
-                    Style::TEXT_DIM,
-                    RichText::new("\u{00B7} this node").size(Style::SMALL),
-                );
+                mde_egui::muted_note(ui, "\u{00B7} this node");
             }
             ui.add_space(Style::SP_XS);
             ui.colored_label(Style::ACCENT, RichText::new(node.tier).size(Style::SMALL));
             ui.add_space(Style::SP_S);
-            ui.colored_label(
-                Style::TEXT_DIM,
-                RichText::new(node.version.as_deref().unwrap_or("—")).size(Style::SMALL),
-            );
+            mde_egui::muted_note(ui, node.version.as_deref().unwrap_or("—"));
             ui.add_space(Style::SP_S);
             let (label, tone) = node.state();
             ui.colored_label(tone, RichText::new(label).size(Style::SMALL));
