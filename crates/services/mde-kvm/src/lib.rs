@@ -47,10 +47,17 @@
 //!   viability) via [`preflight_vfio`] over the injectable [`VfioProbe`] seam,
 //!   whose live [`SysfsVfioProbe`] reads the real sysfs — the full live check
 //!   is gated on passthrough hardware.
+//! - **USB redirection** — honest about the VMM: cloud-hypervisor has **no
+//!   USB support** (no emulated controller, nothing USB-shaped in its API),
+//!   so [`plan_usb_redirect`] maps a whole-controller request onto the VFIO
+//!   slice and refuses a per-device VMM attach with a typed
+//!   [`UsbError::UnsupportedByVmm`] pointing at the protocol-side RDP
+//!   redirection (`mde-vdi-rdp`) — never a fabricated knob.
 
 mod config;
 mod spec;
 mod transport;
+mod usb;
 mod vfio;
 mod virtiofs;
 mod vm;
@@ -67,6 +74,7 @@ pub use spec::{
 pub use transport::{
     build_http_request, parse_http_response, ChResponse, ChTransport, UnixSocketTransport,
 };
+pub use usb::{plan_usb_redirect, UsbDeviceId, UsbError, UsbPlan, UsbRedirect};
 pub use vfio::{
     ensure_vfio_opt_in, preflight_vfio, PciAddress, SysfsVfioProbe, VfioDevice, VfioError,
     VfioProbe, VFIO_PCI_DRIVER,
