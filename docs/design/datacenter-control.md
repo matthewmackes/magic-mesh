@@ -19,7 +19,7 @@ become a deployable platform role, and a New-Mesh wizard can **give birth to a n
 
 | Zone | Compute | Workloads | IaC state |
 |------|---------|-----------|-----------|
-| **Dev** | Xen hosts only (3 XCP-ng dom0s) | build + test/CI | `infra/tofu/` |
+| **Dev** | Xen hosts only (**4** XCP-ng dom0s → 4 build VMs; see `install-helpers/farm-topology.sh`) | build + test/CI | `infra/tofu/` |
 | **Production** | DigitalOcean droplets + **Eagle** (LAN member) | the real fleet (lighthouse-anchored) | `infra/tofu/zone1-do/` |
 
 The plane presents **separate per-zone top tabs** (Dev / Prod) **+ a Gateway tab**. Separate
