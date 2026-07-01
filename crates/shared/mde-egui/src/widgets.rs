@@ -36,6 +36,23 @@ pub fn status_dot(ui: &mut Ui, color: Color32) {
         .circle_filled(rect.center(), diameter * 0.28, color);
 }
 
+/// A **labelled value row** on the spacing grid — a dim [`Style::SMALL`] `label`,
+/// a [`Style::SP_S`] gutter, then a `tone`-coloured `value` at the same size.
+///
+/// The single source for the "field" row that several shell panels hand-rolled
+/// byte-identically. `tone` is a `Style` palette token (never a raw literal).
+pub fn field(ui: &mut Ui, label: &str, value: &str, tone: Color32) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label)
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_S);
+        ui.colored_label(tone, RichText::new(value).size(Style::SMALL));
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +84,8 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 status_dot(ui, Style::OK);
                 status_dot(ui, Style::DANGER);
+                // The labelled-value row lays out (dim label + toned value).
+                field(ui, "role", "lighthouse", Style::OK);
             });
         });
     }
