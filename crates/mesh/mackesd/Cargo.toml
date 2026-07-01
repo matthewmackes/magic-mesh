@@ -370,7 +370,7 @@ assets = [
     # graphical surface now that the iced GUIs are stripped (E12-14b), with a .desktop
     # so it's launchable from a session too.
     { source = "target/release/mde-shell-egui",     dest = "/usr/bin/mde-shell-egui",     mode = "755" },
-    { source = "packaging/applications/org.magicmesh.Shell.desktop", dest = "/usr/share/applications/org.magicmesh.Shell.desktop", mode = "644" },
+    # (the org.magicmesh.Shell.desktop launcher ships via the packaging/applications/*.desktop glob below)
     # E12-14b — the obsolete Cosmic-era surfaces were dropped: the live-map
     # layer-shell wallpaper (mde-mesh-wallpaper) + the notify-hub bins
     # (mde-notify-{center,toast,capture}), AND the four iced/libcosmic GUIs that
