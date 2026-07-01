@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::{self, RichText};
-use mde_egui::Style;
+use mde_egui::{Motion, Style};
 use serde::Serialize;
 
 use mde_bus::hooks::config::Priority;
@@ -50,6 +50,10 @@ const ACTION_TOPIC: &str = "action/vdi/session";
 /// a slow, human-paced event, so a 5 s poll surfaces a new/removed VM without
 /// spinning — the same cadence the Fleet plane refreshes at.
 const REFRESH: Duration = Duration::from_secs(5);
+
+/// A filled-circle status dot — the shared glyph the datacenter rows / chrome pip
+/// / This Node / Network use, so a VM state dot reads one `Style` size + colour.
+const DOT: &str = "\u{25CF}";
 
 // ─────────────────────────── the Open request (wire mirror) ───────────────────────────
 
@@ -245,20 +249,17 @@ pub(crate) fn discovery_panel(ui: &mut egui::Ui, state: &mut DiscoveryState) {
     }
 
     if state.vms.is_empty() {
-        crate::session::empty_state(
-            ui,
-            "No remote desktops available",
-            "No peer is advertising a VM — start one on a mesh node and it appears here.",
-        );
+        let (title, subtitle) = empty_copy(state.bus_root.is_some());
+        crate::session::empty_state(ui, title, subtitle);
         return;
     }
 
+    // Section label — the mature planes' idiom (dim, small, sentence case).
     ui.add_space(Style::SP_S);
     ui.label(
-        RichText::new("REMOTE DESKTOPS")
+        RichText::new("Remote desktops")
             .color(Style::TEXT_DIM)
-            .size(Style::SMALL)
-            .strong(),
+            .size(Style::SMALL),
     );
     ui.add_space(Style::SP_XS);
 
@@ -273,7 +274,7 @@ pub(crate) fn discovery_panel(ui: &mut egui::Ui, state: &mut DiscoveryState) {
                 let running = vm.state.trim() == "running";
                 let dot = if running { Style::OK } else { Style::TEXT_DIM };
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("\u{25CF}").color(dot).size(Style::SMALL));
+                    ui.label(RichText::new(DOT).color(dot).size(Style::SMALL));
                     ui.add_space(Style::SP_XS);
                     if ui
                         .selectable_label(
@@ -298,6 +299,14 @@ pub(crate) fn discovery_panel(ui: &mut egui::Ui, state: &mut DiscoveryState) {
     // the hand-off to the Desktop surface.
     ui.add_space(Style::SP_S);
     let can_connect = state.selected.is_some_and(|i| i < state.vms.len());
+    // Row-select feedback: the picked-target hint eases in on the shared FAST
+    // curve (§4 — motion via the shared table only, no bespoke engine).
+    let hint = Motion::animate(
+        ui.ctx(),
+        "discovery-connect-hint",
+        can_connect,
+        Motion::FAST,
+    );
     ui.horizontal(|ui| {
         if ui
             .add_enabled(
@@ -310,7 +319,10 @@ pub(crate) fn discovery_panel(ui: &mut egui::Ui, state: &mut DiscoveryState) {
         }
         if let Some(vm) = state.selected.and_then(|i| state.vms.get(i)) {
             ui.add_space(Style::SP_S);
-            mde_egui::muted_note(ui, format!("\u{2192} {} on {}", vm.name, vm.host));
+            ui.scope(|ui| {
+                ui.set_opacity(hint);
+                mde_egui::muted_note(ui, format!("\u{2192} {} on {}", vm.name, vm.host));
+            });
         }
     });
 
@@ -320,6 +332,23 @@ pub(crate) fn discovery_panel(ui: &mut egui::Ui, state: &mut DiscoveryState) {
         "Connecting brokers the desktop over the mesh — the live cross-peer transport is \
              gated (E12-4).",
     );
+}
+
+/// The empty-picker copy — honest about *why* there is nothing to connect to.
+/// With no mesh Bus directory the VM inventory is unreadable (a gated read),
+/// which must not render as a live-looking "no desktops" (§7).
+const fn empty_copy(has_bus: bool) -> (&'static str, &'static str) {
+    if has_bus {
+        (
+            "No remote desktops available",
+            "No peer is advertising a VM — start one on a mesh node and it appears here within a few seconds.",
+        )
+    } else {
+        (
+            "Remote desktops unavailable",
+            "No mesh Bus directory on this node, so the VM inventory can't be read — joining the mesh (the mde-bus spool) unblocks the picker.",
+        )
+    }
 }
 
 #[cfg(test)]
@@ -375,6 +404,20 @@ mod tests {
         );
         // Rendering the empty state raises no connect target.
         assert!(state.take_connect().is_none());
+    }
+
+    #[test]
+    fn empty_copy_distinguishes_a_missing_bus_from_a_quiet_inventory() {
+        // A live-but-quiet inventory reads as "no desktops"; a missing Bus must
+        // NOT (§7 — a gated read never renders as a live-looking empty state).
+        let (title, _) = empty_copy(true);
+        assert_eq!(title, "No remote desktops available");
+        let (title, subtitle) = empty_copy(false);
+        assert_eq!(title, "Remote desktops unavailable");
+        assert!(
+            subtitle.contains("Bus") && subtitle.contains("unblocks"),
+            "the gated copy names what's missing and what unblocks it: {subtitle}"
+        );
     }
 
     #[test]

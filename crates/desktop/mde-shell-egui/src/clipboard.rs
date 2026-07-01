@@ -95,11 +95,8 @@ impl ClipboardState {
     /// Render the clipboard history into `ui`.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         if self.entries.is_empty() {
-            crate::session::empty_state(
-                ui,
-                "Clipboard history is empty",
-                "Text you copy will appear here once the clipboard_sync worker captures it.",
-            );
+            let (title, subtitle) = empty_copy(self.bus_root.is_some());
+            crate::session::empty_state(ui, title, subtitle);
             return;
         }
 
@@ -109,13 +106,9 @@ impl ClipboardState {
                 for entry in &self.entries {
                     ui.group(|ui| {
                         let preview = truncate_clip(&entry.text);
-                        ui.label(RichText::new(preview).color(Style::TEXT));
+                        ui.label(RichText::new(preview).color(Style::TEXT).size(Style::BODY));
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(&entry.source)
-                                    .color(Style::TEXT_DIM)
-                                    .size(Style::SMALL),
-                            );
+                            mde_egui::muted_note(ui, &entry.source);
                             if entry.pinned {
                                 ui.label(
                                     RichText::new("pinned")
@@ -124,17 +117,30 @@ impl ClipboardState {
                                 );
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(&entry.time)
-                                        .color(Style::TEXT_DIM)
-                                        .size(Style::SMALL),
-                                );
+                                mde_egui::muted_note(ui, &entry.time);
                             });
                         });
                     });
-                    ui.add_space(Style::SP_XS);
+                    ui.add_space(Style::SP_S);
                 }
             });
+    }
+}
+
+/// The empty-panel copy — honest about *why* nothing is listed. With no mesh Bus
+/// directory the clip topic is unreadable (a gated read), which must not render
+/// as a live-looking "empty history" (§7).
+const fn empty_copy(has_bus: bool) -> (&'static str, &'static str) {
+    if has_bus {
+        (
+            "Clipboard history is empty",
+            "Text you copy appears here once the clipboard_sync worker captures it to the mesh Bus.",
+        )
+    } else {
+        (
+            "Clipboard history unavailable",
+            "No mesh Bus directory on this node, so event/clipboard/clip can't be read — joining the mesh (the mde-bus spool) unblocks this panel.",
+        )
     }
 }
 
@@ -155,7 +161,21 @@ fn truncate_clip(text: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_clip;
+    use super::{empty_copy, truncate_clip};
+
+    #[test]
+    fn empty_copy_distinguishes_a_missing_bus_from_an_empty_history() {
+        // An empty history reads as "nothing copied yet"; a missing Bus must NOT
+        // (§7 — a gated read never renders as a live-looking empty state).
+        let (title, _) = empty_copy(true);
+        assert_eq!(title, "Clipboard history is empty");
+        let (title, subtitle) = empty_copy(false);
+        assert_eq!(title, "Clipboard history unavailable");
+        assert!(
+            subtitle.contains("Bus") && subtitle.contains("unblocks"),
+            "the gated copy names what's missing and what unblocks it: {subtitle}"
+        );
+    }
 
     #[test]
     fn truncate_returns_first_line() {

@@ -18,6 +18,7 @@
 //! EmptyState, never a placeholder render of a fake desktop (§7).
 
 use mde_egui::egui::{self, Sense, TextureHandle, TextureOptions};
+use mde_egui::Motion;
 
 use mde_vdi_rdp::RdpSession;
 use mde_vdi_vnc::VncSession;
@@ -180,24 +181,41 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
             }
             forward_input(ui, state);
         }
-        None => match state.requested.as_ref() {
-            // The discovery picker chose a target but no live decoder is attached
-            // yet (the wire transport is gated) — an honest "connecting" caption
-            // naming the VM, never a placeholder desktop (§7).
-            Some(target) => crate::session::empty_state(
-                ui,
-                &format!("Connecting to {}", target.name),
-                &format!(
-                    "Brokering the desktop from {} — the live transport (E12-4) is gated.",
-                    target.serving_peer
+        None => {
+            // Connect-state feedback: the "connecting" caption eases in on the
+            // shared BASE curve when the picker hands a target over (§4 — motion
+            // via the shared table only, no bespoke engine).
+            let t = Motion::animate(
+                ui.ctx(),
+                "vdi-connecting",
+                state.requested.is_some(),
+                Motion::BASE,
+            );
+            match state.requested.as_ref() {
+                // The discovery picker chose a target but no live decoder is
+                // attached yet (the wire transport is gated) — an honest
+                // "connecting" caption naming the VM, never a placeholder
+                // desktop (§7).
+                Some(target) => {
+                    ui.scope(|ui| {
+                        ui.set_opacity(t);
+                        crate::session::empty_state(
+                            ui,
+                            &format!("Connecting to {}", target.name),
+                            &format!(
+                                "Brokering the desktop from {} — the live transport (E12-4) is gated.",
+                                target.serving_peer
+                            ),
+                        );
+                    });
+                }
+                None => crate::session::empty_state(
+                    ui,
+                    "No desktop connected",
+                    "Broker a VM desktop (RDP / VNC) — it renders here in the shell.",
                 ),
-            ),
-            None => crate::session::empty_state(
-                ui,
-                "No desktop connected",
-                "Broker a VM desktop (RDP / VNC) — it renders here in the shell.",
-            ),
-        },
+            }
+        }
     }
 }
 

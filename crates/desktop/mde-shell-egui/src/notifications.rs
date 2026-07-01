@@ -67,11 +67,8 @@ impl NotificationsState {
     /// Render the notifications list into `ui`.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         if self.items.is_empty() {
-            crate::session::empty_state(
-                ui,
-                "No alerts",
-                "Mesh alerts — security, presence, firewall, compute — appear here.",
-            );
+            let (title, subtitle) = empty_copy(self.bus_root.is_some());
+            crate::session::empty_state(ui, title, subtitle);
             return;
         }
 
@@ -81,33 +78,41 @@ impl NotificationsState {
                 for item in &self.items {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
-                            ui.colored_label(severity_color(item.severity), &item.title);
+                            ui.colored_label(
+                                severity_color(item.severity),
+                                RichText::new(&item.title).size(Style::BODY).strong(),
+                            );
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(
-                                    RichText::new(item.source.label())
-                                        .color(Style::TEXT_DIM)
-                                        .size(Style::SMALL),
-                                );
+                                mde_egui::muted_note(ui, item.source.label());
                             });
                         });
                         if !item.body.is_empty() {
-                            ui.label(
-                                RichText::new(&item.body)
-                                    .color(Style::TEXT_DIM)
-                                    .size(Style::SMALL),
-                            );
+                            mde_egui::muted_note(ui, &item.body);
                         }
                         if let Some(host) = &item.host {
-                            ui.label(
-                                RichText::new(format!("from {host}"))
-                                    .color(Style::TEXT_DIM)
-                                    .size(Style::SMALL),
-                            );
+                            mde_egui::muted_note(ui, format!("from {host}"));
                         }
                     });
-                    ui.add_space(Style::SP_XS);
+                    ui.add_space(Style::SP_S);
                 }
             });
+    }
+}
+
+/// The empty-panel copy — honest about *why* nothing is listed. With no mesh Bus
+/// directory the alert lanes are unreadable (a gated read), which must not render
+/// as a live-looking "no alerts" (§7).
+const fn empty_copy(has_bus: bool) -> (&'static str, &'static str) {
+    if has_bus {
+        (
+            "No alerts",
+            "Mesh alerts — security, presence, firewall, compute — appear here as the Bus lanes report them.",
+        )
+    } else {
+        (
+            "Alerts unavailable",
+            "No mesh Bus directory on this node, so the alert lanes can't be read — joining the mesh (the mde-bus spool) unblocks this panel.",
+        )
     }
 }
 
@@ -123,7 +128,7 @@ fn severity_color(s: Severity) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{severity_color, Severity, Style};
+    use super::{empty_copy, severity_color, Severity, Style};
 
     #[test]
     fn severity_color_maps_all_variants_without_raw_hex() {
@@ -132,5 +137,19 @@ mod tests {
         assert_eq!(severity_color(Severity::Warning), Style::WARN);
         assert_eq!(severity_color(Severity::Info), Style::ACCENT);
         assert_eq!(severity_color(Severity::Success), Style::OK);
+    }
+
+    #[test]
+    fn empty_copy_distinguishes_a_missing_bus_from_a_quiet_mesh() {
+        // A quiet mesh reads as "no alerts"; a missing Bus must NOT (§7 — a gated
+        // read never renders as a live-looking empty state).
+        let (title, _) = empty_copy(true);
+        assert_eq!(title, "No alerts");
+        let (title, subtitle) = empty_copy(false);
+        assert_eq!(title, "Alerts unavailable");
+        assert!(
+            subtitle.contains("Bus") && subtitle.contains("unblocks"),
+            "the gated copy names what's missing and what unblocks it: {subtitle}"
+        );
     }
 }

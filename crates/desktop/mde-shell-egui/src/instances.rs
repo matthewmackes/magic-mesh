@@ -22,9 +22,13 @@
 //! state pip. Never a crash, never a fake "running" (§7).
 
 use mde_egui::egui::{self, Color32, RichText};
-use mde_egui::Style;
+use mde_egui::{Motion, Style};
 
 use mde_kvm::{api_socket_path, KvmError, Nic, NicRole, Vm, VmSpec};
+
+/// A filled-circle status dot — the shared glyph the datacenter rows / chrome pip
+/// / This Node / Network use, so a VM state pip reads one `Style` size + colour.
+const DOT: &str = "\u{25CF}";
 
 /// One lifecycle verb the panel drives against a local VM.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -276,11 +280,25 @@ pub(crate) fn instances_panel(ui: &mut egui::Ui, state: &mut InstancesState) {
     // Collect at most one action this frame, applied after the render borrow ends.
     let mut pending: Option<Action> = None;
 
+    // The New-VM form reveal eases in on the shared BASE curve (§4 — motion via
+    // the shared table only; the form still mounts/unmounts on the toggle).
+    let reveal = Motion::animate(
+        ui.ctx(),
+        "instances-create-form",
+        *show_create,
+        Motion::BASE,
+    );
+
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             if *show_create {
-                ui.group(|ui| show_create_form(ui, form, show_create, &mut pending));
+                ui.scope(|ui| {
+                    ui.set_opacity(reveal);
+                    // A small rise as the form settles in (the shell-expand idiom).
+                    ui.add_space((1.0 - reveal) * Style::SP_S);
+                    ui.group(|ui| show_create_form(ui, form, show_create, &mut pending));
+                });
                 ui.add_space(Style::SP_S);
             }
             for (idx, vm) in vms.iter().enumerate() {
@@ -306,7 +324,7 @@ fn show_vm(
     let (color, label) = vm.state.pip();
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new("\u{25CF}").color(color).size(Style::SMALL));
+        ui.label(RichText::new(DOT).color(color).size(Style::SMALL));
         ui.add_space(Style::SP_XS);
         if ui
             .selectable_label(
