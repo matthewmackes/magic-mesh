@@ -31,7 +31,7 @@ mod worker;
 
 use mde_egui::{eframe, run_client};
 
-pub use app::{music_panel, MusicApp};
+pub use app::{music_header, music_panel, music_pump, MusicApp};
 
 /// Stand the music surface up as an `eframe` Wayland client on the shared
 /// harness. Blocks until the window closes.

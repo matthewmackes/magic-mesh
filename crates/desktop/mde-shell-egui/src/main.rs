@@ -16,21 +16,46 @@
 
 mod chrome;
 mod datacenter;
+mod dock;
 mod session;
 mod workbench;
 
+use mde_egui::eframe::CreationContext;
 use mde_egui::{eframe, egui, run_client, Motion, Style};
 
+use mde_files_egui::{files_panel, FileBrowser};
+use mde_music_egui::{music_header, music_panel, music_pump, MusicApp};
+use mde_voice_egui::{voice_header, voice_panel, voice_pump, VoiceApp};
+
+use dock::Surface;
 use workbench::Plane;
 
-/// The shell's whole UI state: whether the chrome bar is expanded into the
-/// Workbench, and which plane the Workbench has selected.
+/// The shell's pure navigation state: whether the chrome bar is expanded into the
+/// shell body, and — once expanded — which plane the Workbench has selected. Kept
+/// separate from the surface apps (which need an eframe `CreationContext` to
+/// build) so the nav invariants stay unit-testable without a GPU.
 #[derive(Default)]
-struct Shell {
-    /// `true` while the chrome bar is expanded into the full Workbench.
+struct Nav {
+    /// `true` while the chrome bar is expanded into the shell body.
     expanded: bool,
-    /// The Workbench plane shown when expanded.
+    /// Which surface fills the shell body (Workbench by default).
+    surface: Surface,
+    /// The Workbench plane shown when the Workbench surface is active.
     plane: Plane,
+}
+
+impl Nav {
+    /// Flip between the collapsed session view and the expanded shell body.
+    fn toggle_expand(&mut self) {
+        self.expanded = !self.expanded;
+    }
+}
+
+/// The whole shell: the nav state, the live chrome/Fleet Bus state, and the three
+/// embedded mesh-control surfaces it owns and drives per frame (E12-3b EMBED).
+struct Shell {
+    /// Expand state + the selected Workbench plane.
+    nav: Nav,
     /// Fleet plane — live per-node KVM host health + VM roster, and the
     /// host-targeted VM lifecycle controls (MV-6). Subscribes to the Bus.
     datacenter: datacenter::DatacenterState,
@@ -38,22 +63,91 @@ struct Shell {
     /// from the world-readable mesh-status snapshot, polled on the shared cadence
     /// (self-gating inside `chrome::show`).
     chrome: chrome::ChromeState,
+    /// The Music surface, owned + built once (its worker thread wakes the shell's
+    /// egui context on every update). Rendered via `mde_music_egui::music_panel`.
+    music: MusicApp,
+    /// The Files surface model, owned + built once over the production backend.
+    /// Rendered via `mde_files_egui::files_panel`.
+    files: FileBrowser,
+    /// The Voice surface, owned + built once (its SIP agent wakes the shell's egui
+    /// context on every update). Rendered via `mde_voice_egui::voice_panel`.
+    voice: VoiceApp,
 }
 
 impl Shell {
-    /// Flip between the collapsed session view and the expanded Workbench.
-    fn toggle_expand(&mut self) {
-        self.expanded = !self.expanded;
+    /// Build the shell and its three embedded surfaces once, off the eframe
+    /// creation context (the surfaces' workers clone its egui `Context` so their
+    /// off-thread updates repaint the one shell). This is the single "built once"
+    /// mount point of E12-3b.
+    fn new(cc: &CreationContext<'_>) -> Self {
+        Self {
+            nav: Nav::default(),
+            datacenter: datacenter::DatacenterState::default(),
+            chrome: chrome::ChromeState::default(),
+            music: MusicApp::new(cc),
+            files: mde_files_egui::real_browser(),
+            voice: VoiceApp::new(cc),
+        }
+    }
+
+    /// The expanded shell body: the dock rail plus the one active surface.
+    ///
+    /// The shell owns the frame loop, so it drives the active surface itself —
+    /// its per-frame **pump** (the worker-update drain the surface kept out of the
+    /// panel fn), then its **header**, then its central **panel** — because the
+    /// surface's own `App::update` is never called here. Each mounted surface is
+    /// scoped under a unique [`egui::Ui::push_id`] so its internal egui ids (esp.
+    /// Files' fixed `files-top` / `files-side` panels) can't collide with another
+    /// surface's in the shell's one `Context`. The Workbench keeps its live Fleet
+    /// plane (MV-6).
+    fn body(&mut self, ui: &mut egui::Ui) {
+        egui::SidePanel::left("shell-dock")
+            .resizable(false)
+            .exact_width(Style::SP_XL * 4.0)
+            .show_inside(ui, |ui| {
+                dock::rail(ui, &mut self.nav.surface);
+            });
+
+        match self.nav.surface {
+            Surface::Workbench => {
+                workbench::show(ui, &mut self.nav.plane, &mut self.datacenter);
+            }
+            Surface::Music => {
+                music_pump(&mut self.music);
+                let music = &mut self.music;
+                ui.push_id("shell-music", |ui| {
+                    music_header(ui, music);
+                    ui.separator();
+                    music_panel(ui, music);
+                });
+            }
+            Surface::Files => {
+                let files = &mut self.files;
+                ui.push_id("shell-files", |ui| {
+                    files_panel(ui, files);
+                });
+            }
+            Surface::Voice => {
+                voice_pump(&mut self.voice);
+                let voice = &mut self.voice;
+                ui.push_id("shell-voice", |ui| {
+                    voice_header(ui, voice);
+                    ui.separator();
+                    voice_panel(ui, voice);
+                });
+            }
+        }
     }
 }
 
 impl eframe::App for Shell {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // The Fleet plane subscribes to the live KVM/VM Bus topics. Poll on the
-        // shared cadence while expanded (the read is a cheap local scan) so a host
-        // health flip or a new VM surfaces without operator input; the poll
-        // self-gates and keeps the repaint heartbeat alive.
-        if self.expanded {
+        // shared cadence while the Workbench surface is in view (the read is a
+        // cheap local scan) so a host health flip or a new VM surfaces without
+        // operator input; the poll self-gates and keeps the repaint heartbeat
+        // alive. The app surfaces drive their own repaints from their workers.
+        if self.nav.expanded && self.nav.surface == Surface::Workbench {
             self.datacenter.poll(ctx);
         }
 
@@ -61,27 +155,28 @@ impl eframe::App for Shell {
         egui::TopBottomPanel::top("mcnf-chrome")
             .exact_height(Style::SP_XL + Style::SP_M)
             .show(ctx, |ui| {
-                if chrome::show(ui, &mut self.chrome, self.expanded) {
-                    self.toggle_expand();
+                if chrome::show(ui, &mut self.chrome, self.nav.expanded) {
+                    self.nav.toggle_expand();
                 }
             });
 
-        // Expand transition: 0.0 = collapsed (session), 1.0 = expanded (Workbench).
-        let t = Motion::animate(ctx, "shell-expand", self.expanded, Motion::BASE);
+        // Expand transition: 0.0 = collapsed (session), 1.0 = expanded (shell body
+        // — the dock + the active surface).
+        let t = Motion::animate(ctx, "shell-expand", self.nav.expanded, Motion::BASE);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // Cross-fade the two central views through the midpoint so they never
             // fight for layout: the session fades out over the first half, the
-            // Workbench fades in over the second.
+            // shell body fades in over the second.
             if t < 0.5 {
                 ui.set_opacity((1.0 - t * 2.0).clamp(0.0, 1.0));
                 session::show(ui);
             } else {
                 let a = (t * 2.0 - 1.0).clamp(0.0, 1.0);
                 ui.set_opacity(a);
-                // A small rise as the Workbench settles in.
+                // A small rise as the shell body settles in.
                 ui.add_space((1.0 - a) * Style::SP_S);
-                workbench::show(ui, &mut self.plane, &mut self.datacenter);
+                self.body(ui);
             }
         });
 
@@ -93,30 +188,75 @@ impl eframe::App for Shell {
 }
 
 fn main() -> eframe::Result<()> {
-    run_client("org.magicmesh.Shell", "MCNF", |_cc| Shell::default())
+    run_client("org.magicmesh.Shell", "MCNF", Shell::new)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Plane, Shell};
+    use super::{dock, files_panel, Nav, Plane, Surface};
+    use mde_egui::egui::{self, pos2, vec2, Rect};
+    use mde_egui::Style;
 
     #[test]
-    fn shell_starts_collapsed_on_this_node() {
-        let s = Shell::default();
+    fn shell_starts_collapsed_on_the_workbench() {
+        let n = Nav::default();
         assert!(
-            !s.expanded,
-            "the shell opens to the session view, not the Workbench"
+            !n.expanded,
+            "the shell opens to the session view, not the shell body"
         );
-        assert_eq!(s.plane, Plane::ThisNode);
+        assert_eq!(n.surface, Surface::Workbench);
+        assert_eq!(n.plane, Plane::ThisNode);
     }
 
     #[test]
-    fn toggle_expand_flips_the_workbench() {
-        let mut s = Shell::default();
+    fn toggle_expand_flips_the_shell_body() {
+        let mut s = Nav::default();
         assert!(!s.expanded);
         s.toggle_expand();
         assert!(s.expanded);
         s.toggle_expand();
         assert!(!s.expanded);
+    }
+
+    /// Drive one headless frame that reproduces the shell's expanded **body mount**
+    /// — the dock rail plus a surface scoped under `push_id`, inside the shell's
+    /// `CentralPanel` — then tessellate it on the CPU so any paint-path fault
+    /// surfaces as a failure. This is the same `Context::run` → `tessellate` path
+    /// the DRM runner drives, minus the GPU (no window, no wgpu).
+    ///
+    /// Files is the surface a unit test can build (`MusicApp`/`VoiceApp` need an
+    /// eframe `CreationContext`, which only `eframe::run_native` supplies, and
+    /// Voice would spawn its SIP agent). It renders over the **real** backend — no
+    /// demo data; with no `mackesd` Bus on the build host it shows its honest
+    /// "standalone / no mesh" state, which is still a full paint path. This proves
+    /// the shell's mount mechanism (dock + `push_id` scoping + the surface's own
+    /// `files-top`/`files-side` panels nested in the shell's one `Context`) is
+    /// runtime-reachable and actually draws. Music and Voice mount through the
+    /// identical `body` path with their own headless render tests proving
+    /// `music_panel`/`voice_panel` + header tessellate.
+    #[test]
+    fn shell_mounts_and_renders_a_surface() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut files = mde_files_egui::real_browser();
+        let mut active = Surface::Files;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::SidePanel::left("shell-dock")
+                    .resizable(false)
+                    .exact_width(Style::SP_XL * 4.0)
+                    .show_inside(ui, |ui| dock::rail(ui, &mut active));
+                ui.push_id("shell-files", |ui| files_panel(ui, &mut files));
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the mounted surface produced no draw primitives"
+        );
     }
 }

@@ -21,6 +21,20 @@ use mde_files::backend::RealBackend;
 pub use model::FileBrowser;
 pub use view::files_panel;
 
+/// Build the production [`FileBrowser`] over the [`RealBackend`] — the local
+/// filesystem for local panes and the mesh Bus for peer panes + Send-To.
+///
+/// This is the one construction path for a live Files model, shared by the
+/// standalone [`FilesApp`] and the E12 shell (`mde-shell-egui`, E12-3b), which
+/// owns the [`FileBrowser`] directly and mounts it with [`files_panel`]. Factored
+/// out because [`FileBrowser::new`] takes a `Box<dyn Backend>` and only this crate
+/// knows the production backend — so the shell doesn't have to depend on
+/// `mde-files` to build one.
+#[must_use]
+pub fn real_browser() -> FileBrowser {
+    FileBrowser::new(Box::new(RealBackend::new()))
+}
+
 /// The eframe application: a single [`FileBrowser`] rendered each frame.
 pub struct FilesApp {
     browser: FileBrowser,
@@ -32,7 +46,7 @@ impl FilesApp {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            browser: FileBrowser::new(Box::new(RealBackend::new())),
+            browser: real_browser(),
         }
     }
 }

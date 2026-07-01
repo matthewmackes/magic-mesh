@@ -293,16 +293,34 @@ pub fn music_panel(ui: &mut egui::Ui, app: &mut MusicApp) {
     }
 }
 
+/// Drain the worker's updates into the surface state — the per-frame **state
+/// pump**. The standalone [`MusicApp`]'s `update` calls this at the top of every
+/// frame; the E12 shell (E12-3b) calls it for the mounted surface each frame too,
+/// because the shell owns the one frame loop and never calls the surface's
+/// `App::update`. Non-blocking (`try_recv`) and a no-op when the worker has sent
+/// nothing — or when no worker is running (the unconfigured, no-creds surface).
+pub fn music_pump(app: &mut MusicApp) {
+    while let Ok(update) = app.updates.try_recv() {
+        app.state.apply(update);
+    }
+}
+
+/// Render the surface **header** strip — title · server host · transport controls
+/// for the now-playing track — into `ui`. The standalone app frames it in the
+/// window's top panel; the E12 shell renders it above the mounted [`music_panel`]
+/// so the embedded surface keeps its transport + server identity, the same chrome
+/// the standalone binary shows. The header stays out of [`music_panel`] because
+/// the shell supplies its own surrounding chrome.
+pub fn music_header(ui: &mut egui::Ui, app: &MusicApp) {
+    app.render_header(ui);
+}
+
 impl App for MusicApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         // Drain everything the worker has sent since the last frame.
-        while let Ok(update) = self.updates.try_recv() {
-            self.state.apply(update);
-        }
+        music_pump(self);
 
-        egui::TopBottomPanel::top("music-header").show(ctx, |ui| {
-            self.render_header(ui);
-        });
+        egui::TopBottomPanel::top("music-header").show(ctx, |ui| music_header(ui, self));
 
         // The central content is the shared `music_panel` body, so the standalone
         // window and the embedded shell panel (E12-3b) render identically.

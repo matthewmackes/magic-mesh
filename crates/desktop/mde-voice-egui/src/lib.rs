@@ -43,7 +43,7 @@ use mde_voice_hud::sip::SipAccount;
 
 use crate::model::{Command, Update, VoiceState};
 
-pub use view::voice_panel;
+pub use view::{header as voice_header, voice_panel};
 
 /// The voice surface: the view-model, the dial buffer, and the channel to its
 /// worker threads.
@@ -100,12 +100,22 @@ impl VoiceApp {
     }
 }
 
+/// Drain the worker's updates into the surface state — the per-frame **state
+/// pump**. The standalone [`VoiceApp`]'s `update` calls this at the top of every
+/// frame; the E12 shell (E12-3b) calls it for the mounted surface each frame too,
+/// because the shell owns the one frame loop and never calls the surface's
+/// `App::update`. Non-blocking (`try_recv`) and a no-op when the SIP agent has
+/// sent nothing since the last frame.
+pub fn voice_pump(app: &mut VoiceApp) {
+    while let Ok(update) = app.updates.try_recv() {
+        app.state.apply(update);
+    }
+}
+
 impl App for VoiceApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         // Drain everything the worker has sent since the last frame.
-        while let Ok(update) = self.updates.try_recv() {
-            self.state.apply(update);
-        }
+        voice_pump(self);
 
         egui::TopBottomPanel::top("voice-header").show(ctx, |ui| view::header(ui, self));
 

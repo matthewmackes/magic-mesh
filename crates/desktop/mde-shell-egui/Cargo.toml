@@ -40,5 +40,14 @@ serde_json = { workspace = true }
 # the egui panel client (mde-panel-egui) makes.
 mde-cosmic-applet = { path = "../../platform/mde-cosmic-applet", default-features = false }
 
+# E12-3b EMBED — the three polished mesh-control surfaces are mounted as in-shell
+# panels (Quasar §5: panels in the one shell, not separate clients). Each is a
+# desktop-shell-tier lib the shell owns the App of and drives per-frame (pump +
+# header + `*_panel`). The dependency edge points sideways-inward within the
+# desktop-shell tier (§6) — the same toolkit resolution (`mde-egui`) flows through.
+mde-music-egui = { path = "../mde-music-egui" }
+mde-files-egui = { path = "../mde-files-egui" }
+mde-voice-egui = { path = "../mde-voice-egui" }
+
 [lints]
 workspace = true
