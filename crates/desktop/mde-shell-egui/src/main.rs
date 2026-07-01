@@ -19,6 +19,7 @@ mod datacenter;
 mod discovery;
 mod dock;
 mod instances;
+mod network;
 mod session;
 mod thisnode;
 mod vdi;
@@ -67,6 +68,11 @@ struct Shell {
     /// heartbeat freshness, daemon health, peer/leader context), folded from the
     /// world-readable mesh-status snapshot (WB-ThisNode). Reads no `mackesd` IPC.
     thisnode: thisnode::ThisNodeState,
+    /// Network plane — the mesh network fabric's live status (overlay IP + cipher,
+    /// the elected leader, the peer directory as network links, network-scoped
+    /// service health, overlay routing), folded from the same world-readable
+    /// mesh-status snapshot (WB-Network). Reads no `mackesd` IPC.
+    network: network::NetworkState,
     /// The always-visible chrome bar's live state — peers + mesh status folded
     /// from the world-readable mesh-status snapshot, polled on the shared cadence
     /// (self-gating inside `chrome::show`).
@@ -106,6 +112,7 @@ impl Shell {
             nav: Nav::default(),
             datacenter: datacenter::DatacenterState::default(),
             thisnode: thisnode::ThisNodeState::default(),
+            network: network::NetworkState::default(),
             chrome: chrome::ChromeState::default(),
             music: MusicApp::new(cc),
             files: mde_files_egui::real_browser(),
@@ -141,6 +148,7 @@ impl Shell {
                     &mut self.nav.plane,
                     &mut self.datacenter,
                     &self.thisnode,
+                    &self.network,
                 );
             }
             Surface::Desktop => {
@@ -217,15 +225,16 @@ impl Shell {
 
 impl eframe::App for Shell {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // The Fleet + This Node planes subscribe to live mesh state. Poll on the
-        // shared cadence while the Workbench surface is in view (both reads are
-        // cheap local scans) so a host health flip, a new VM, or this node's own
-        // heartbeat / service flip surfaces without operator input; the polls
-        // self-gate and keep the repaint heartbeat alive. The app surfaces drive
-        // their own repaints from their workers.
+        // The Fleet, This Node + Network planes subscribe to live mesh state. Poll
+        // on the shared cadence while the Workbench surface is in view (the reads
+        // are cheap local scans) so a host health flip, a new VM, this node's own
+        // heartbeat / service flip, or a peer join / leader change surfaces without
+        // operator input; the polls self-gate and keep the repaint heartbeat alive.
+        // The app surfaces drive their own repaints from their workers.
         if self.nav.expanded && self.nav.surface == Surface::Workbench {
             self.datacenter.poll(ctx);
             self.thisnode.poll(ctx);
+            self.network.poll(ctx);
         }
 
         // The Desktop surface's picker (E12-5b) subscribes to the same live VM

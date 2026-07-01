@@ -3,10 +3,12 @@
 //! E12-3 shipped the *skeleton*: the five scope-first planes as a selectable rail
 //! beside an honest content pane. Live data then wires into each plane: **This
 //! Node** (WB-ThisNode — this host's role / overlay IP / presence + heartbeat /
-//! daemon health, off the mesh-status snapshot) and **Fleet** (MV-6 — per-node KVM
-//! reality off the Bus) are live; Controller / Network / Provisioning still show
-//! descriptive copy until their units land. Nothing here fakes a metric (governance
-//! §7) — a plane shows live data or an honest blurb, never stand-in data.
+//! daemon health, off the mesh-status snapshot), **Network** (WB-Network — the
+//! overlay IP + cipher, elected leader, the peer directory as network links, and
+//! overlay routing, off the same snapshot), and **Fleet** (MV-6 — per-node KVM
+//! reality off the Bus) are live; Controller / Provisioning still show descriptive
+//! copy until their units land. Nothing here fakes a metric (governance §7) — a
+//! plane shows live data or an honest blurb, never stand-in data.
 
 use mde_egui::egui::{self, RichText};
 use mde_egui::Style;
@@ -71,15 +73,19 @@ impl Plane {
 /// Render the expanded Workbench: a title, the plane rail, and the selected
 /// plane's content pane. `selected` is read and written, so a rail click changes
 /// the active plane. The This Node plane renders this host's live status from
-/// `thisnode` (WB-ThisNode) and the Fleet plane renders live per-node KVM reality
-/// from `datacenter` (MV-6); the remaining planes still show descriptive copy.
+/// `thisnode` (WB-ThisNode), the Network plane renders the mesh fabric's live
+/// status from `network` (WB-Network), and the Fleet plane renders live per-node
+/// KVM reality from `datacenter` (MV-6); the remaining planes still show
+/// descriptive copy.
 pub(crate) fn show(
     ui: &mut egui::Ui,
     selected: &mut Plane,
     datacenter: &mut crate::datacenter::DatacenterState,
-    // Read-only: the This Node plane only renders its polled status (`&self`),
-    // unlike the Fleet plane whose `datacenter` publishes lifecycle actions.
+    // Read-only: the This Node + Network planes only render their polled status
+    // (`&self`), unlike the Fleet plane whose `datacenter` publishes lifecycle
+    // actions.
     thisnode: &crate::thisnode::ThisNodeState,
+    network: &crate::network::NetworkState,
 ) {
     ui.add_space(Style::SP_L);
     ui.heading(
@@ -130,9 +136,15 @@ pub(crate) fn show(
                 // presence + heartbeat, daemon health, peer/leader context) off the
                 // world-readable mesh-status snapshot.
                 Plane::ThisNode => thisnode.show(ui),
+                // WB-Network — the mesh fabric's live status (overlay IP + cipher,
+                // elected leader, the peer directory as network links, network
+                // service health, overlay routing) off the same snapshot.
+                Plane::Network => network.show(ui),
                 // MV-6 — the Fleet plane drives live KVM host health + the VM
                 // roster off the Bus (Podman container rows follow once MV-4 lands).
                 Plane::Fleet => datacenter.show(ui),
+                // Controller / Provisioning still show descriptive copy until their
+                // units land.
                 _ => {
                     ui.colored_label(
                         Style::TEXT_DIM,
