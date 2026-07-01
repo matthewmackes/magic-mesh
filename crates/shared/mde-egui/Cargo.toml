@@ -1,6 +1,6 @@
 [package]
 name        = "mde-egui"
-description = "MCNF E12 egui harness — the shared eframe Wayland-client runner, the single-source Style/Visuals design system, and the motion (duration/easing) table that every E12 surface renders through. Replaces the retired libcosmic/iced + Carbon-token (mde-theme) stack."
+description = "MCNF E12 egui harness — the shared eframe runner (the bare DRM-seat path + the windowed-client fallback), the single-source Style/Visuals design system, and the motion (duration/easing) table that every E12 surface renders through. Replaces the retired Cosmic-era toolkit + Carbon-token theme stack."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
