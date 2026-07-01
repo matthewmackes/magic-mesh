@@ -13,7 +13,11 @@
 //! * [`self_test`] — a node self-diagnostic: KVM virtualization stack readiness
 //!   (over [`crate::kvm::KVM_SERVICES`]), the mesh peer directory, and
 //!   identity + CA presence, folded into a headless JSON/human report with a
-//!   critical-fail exit code.
+//!   critical-fail exit code. **Extended (OW-10)** with the per-item live checks —
+//!   overlay reachable, role daemons active (reused role→units model), CA-signed
+//!   cert, lighthouse pingable — each a pure classification over a fact from an
+//!   injectable probe seam that returns a typed gated `Unknown` when it can't run
+//!   headless (never a faked pass, never a hard-fail on a gated probe).
 //! * [`role_provision`] — apply a deployment role's systemd unit set: enable the
 //!   units the role runs and mask the ones it does not, with the role→units set
 //!   derived from the `mde_role` rank model (the same tiering
