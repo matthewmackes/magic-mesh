@@ -96,6 +96,12 @@ mde-notify = { path = "../../services/mde-notify", optional = true }
 # the gating logic is available regardless of feature set.
 mde-role = { path = "../../platform/mde-role" }
 
+# OW-8 (first-desktop) — the `onboard first-desktop` verb builds an mde-kvm VmSpec
+# (running-disk clone + dual-homed NIC) for the first local VM desktop. Non-optional:
+# `onboard` is feature-agnostic (compiles in the lean, no-async-services library too),
+# and mde-kvm is a dependency-light pure spec→VmConfig crate.
+mde-kvm = { path = "../../services/mde-kvm" }
+
 # VV-1 / VV-1.5 (v4.1.0) — pure-function config generator for
 # the kamailio-mde + rtpengine-mde stack. Consumed by the
 # `mackesd voice render-config` CLI which both unit files invoke

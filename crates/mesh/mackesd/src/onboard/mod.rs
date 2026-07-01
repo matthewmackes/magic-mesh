@@ -46,11 +46,22 @@
 //!   core + the injectable [`spawn_lighthouse::Provisioner`] apply seam (production
 //!   `LiveProvisioner` is honestly integration-gated); the no-cloud-token case is a
 //!   real `LanOnly` + retry branch, not a stub.
+//! * [`first_desktop`] (OW-8, first-desktop slice) plans + offers this Workstation's
+//!   **first local VM desktop**: it selects a golden image from the PLANES-22 image
+//!   catalog, builds an mde-kvm `VmSpec` (running-disk clone + dual-homed NIC), plans
+//!   create→boot, and emits the broker's `SessionRequest::Open` so the shell's
+//!   Desktop surface renders it. This slice is the pure `plan_first_desktop` core +
+//!   the injectable [`first_desktop::FirstDesktopApply`] seam (production
+//!   `LiveFirstDesktop` is honestly integration-gated — needs a live cloud-hypervisor
+//!   + the golden image on disk); the create/reconnect/no-image branches are all real
+//!   outcomes, not stubs. The shell/DRM-boot half (E12-2/E12-3) is hardware-gated and
+//!   lands in its own units.
 //!
 //! # Verbs still owned by the sibling OW units — deliberately NOT declared here (§7)
 //! The remaining complex verbs land in their own units with real implementations;
 //! this engine carries no stub / `todo!()` variant for any: `enroll` (its own OW unit).
 
+pub mod first_desktop;
 pub mod invite;
 pub mod mesh_create;
 pub mod mesh_dns;

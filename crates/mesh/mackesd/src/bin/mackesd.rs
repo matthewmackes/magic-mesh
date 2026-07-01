@@ -1365,6 +1365,19 @@ enum OnboardCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// OW-8 (first-desktop slice) — bring up this Workstation's FIRST local VM
+    /// desktop: select a golden image from the mesh image catalog, build an mde-kvm
+    /// VM (running-disk clone + dual-homed NIC), plan its create→boot, and open a
+    /// broker session the shell's Desktop surface renders. A desktop VM already
+    /// present ⇒ reconnect (offer it, not a duplicate); no VM golden image ⇒ a real
+    /// no-image outcome (see Services ▸ Images). The live create/boot/session is
+    /// integration-gated behind the FirstDesktopApply seam; `--dry-run` prints the
+    /// plan + ordered steps without creating anything.
+    FirstDesktop {
+        /// Print the plan + ordered steps without creating / booting / opening.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// DDNS-EGRESS-3 — `mackesd ddns <sub>` subcommands. Each calls the same
@@ -2575,6 +2588,36 @@ fn main() -> anyhow::Result<()> {
                     }
                     Err(e) => {
                         eprintln!("  spawn-lighthouse failed (live provisioning is integration-gated): {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            OnboardCmd::FirstDesktop { dry_run } => {
+                // Plan the first local VM desktop: gather this node's facts (mesh-id,
+                // image catalog, whether a desktop VM already exists), fold into a
+                // create/reconnect/no-image plan. The live create/boot + broker
+                // session publish is integration-gated behind the FirstDesktopApply
+                // seam; --dry-run stops at the plan + ordered steps.
+                use mackesd_core::onboard::first_desktop as fd;
+                let node_id = default_node_id();
+                let root = mackesd_core::default_qnm_shared_root();
+                let facts = fd::gather(&root, &node_id);
+                let plan = fd::plan_first_desktop(&facts);
+                println!("onboard first-desktop: {}", plan.human());
+                if dry_run {
+                    for (i, step) in plan.steps().iter().enumerate() {
+                        println!("  {}. {}", i + 1, step.describe());
+                    }
+                    return Ok(());
+                }
+                // Live path: drive the integration-gated FirstDesktopApply seam
+                // (create+boot → open-session).
+                match fd::execute(&plan, &fd::LiveFirstDesktop) {
+                    Ok(outcome) => println!("  {}", outcome.human()),
+                    Err(e) => {
+                        eprintln!(
+                            "  first-desktop failed (live VM create/boot + session is integration-gated): {e}"
+                        );
                         std::process::exit(1);
                     }
                 }
