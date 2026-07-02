@@ -62,8 +62,9 @@ impl HttpsFallbackState {
     }
 }
 
-/// One ICE-style candidate sourced from STUN (Phase 12.17) for a
-/// peer. Nebula's lighthouse endpoint set is seeded with the
+/// One ICE-style candidate sourced from STUN (Phase 12.17) for a peer.
+///
+/// Nebula's lighthouse endpoint set is seeded with the
 /// `reflexive` address ahead of its own NAT-traversal probe so
 /// symmetric-NAT edges find a hole-punch path inside the 1.5 s
 /// candidate-gather budget locked by Q8 in

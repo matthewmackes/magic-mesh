@@ -87,9 +87,7 @@ impl EncryptionKind {
             crate::TransportKind::NebulaDirect => Self::Aes256Gcm,
             crate::TransportKind::NebulaLighthouseRelay => Self::ChaCha20Poly1305,
             // TLS 1.3 inside the overlay.
-            crate::TransportKind::NebulaHttps443 | crate::TransportKind::KdcTls => {
-                Self::Aes256Gcm
-            }
+            crate::TransportKind::NebulaHttps443 | crate::TransportKind::KdcTls => Self::Aes256Gcm,
         }
     }
 }

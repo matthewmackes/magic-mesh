@@ -168,8 +168,9 @@ impl TransportKind {
     }
 }
 
-/// Q11 Phase 1 (2026-05-26 — EPIC-RETIRE-TRANSPORT partial). The
-/// internal-Nebula mode discriminant. Used by
+/// The internal-Nebula mode discriminant (Q11 Phase 1, 2026-05-26 — EPIC-RETIRE-TRANSPORT partial).
+///
+/// Used by
 /// `TransportKind::nebula_mode()` to give consumers a smaller-
 /// surface enum to match against. Phase 2 will collapse the parent
 /// `TransportKind` enum to `{ Nebula(NebulaMode), KdcTls }`; this
@@ -201,6 +202,10 @@ impl NebulaMode {
             TransportKind::NebulaDirect => Self::Direct,
             TransportKind::NebulaHttps443 => Self::Https443,
             TransportKind::NebulaLighthouseRelay => Self::LighthouseRelay,
+            #[allow(
+                clippy::panic,
+                reason = "programmer-error guard: KdcTls has no NebulaMode; callers use nebula_mode()"
+            )]
             TransportKind::KdcTls => {
                 panic!("NebulaMode::from_transport_kind called with KdcTls — use TransportKind::nebula_mode() instead")
             }
@@ -309,6 +314,8 @@ pub struct Capabilities {
 ///     when `NebulaDirect` is unhealthy).
 ///   * `Notification` — dual-send, idempotent at receiver. Router
 ///     sends through every healthy transport; receiver dedupes.
+// A flag set — one bool per message class is the natural representation.
+#[allow(clippy::struct_excessive_bools, reason = "one bool per message class")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MessageClassSet {
     /// Control messages (e.g. KDC commands).
@@ -373,8 +380,9 @@ pub enum MessageClass {
     Notification,
 }
 
-/// Connection handle returned by `Transport::open()`. The trait is
-/// intentionally minimal — implementations hold the actual socket /
+/// Connection handle returned by `Transport::open()`.
+///
+/// The trait is intentionally minimal — implementations hold the actual socket /
 /// TLS session / queue inside their own `Connection` type and erase
 /// it behind this boxed handle.
 ///

@@ -46,6 +46,9 @@ pub trait ConformanceFixture: Send + Sync {
 /// `async`: every Transport method is async, so the harness is
 /// too. Callers run this in a tokio runtime / `pollster::block_on`
 /// / similar.
+///
+/// # Errors
+/// Returns the first failing conformance check's description string.
 pub async fn run_conformance(
     transport: &dyn Transport,
     fixture: &dyn ConformanceFixture,
@@ -150,6 +153,9 @@ impl ConformanceReport {
 // Individual conformance checks. Each returns true on pass.
 // ────────────────────────────────────────────────────────────────
 
+// The conformance helpers are uniformly `async` by contract (the harness
+// `.await`s every one); this one happens not to await.
+#[allow(clippy::unused_async, reason = "uniform async harness contract")]
 async fn c1_kind_stable(t: &dyn Transport) -> bool {
     let k1 = t.kind();
     let k2 = t.kind();
@@ -180,17 +186,16 @@ async fn c6_health_unpaired_is_down(t: &dyn Transport, f: &dyn ConformanceFixtur
 }
 
 async fn c7_open_unpaired_is_unreachable(t: &dyn Transport, f: &dyn ConformanceFixture) -> bool {
-    match t.open(f.unpaired_peer_id()).await {
-        Err(crate::TransportError::Unreachable { .. }) => true,
-        _ => false,
-    }
+    matches!(
+        t.open(f.unpaired_peer_id()).await,
+        Err(crate::TransportError::Unreachable { .. })
+    )
 }
 
 async fn c8_open_paired_returns_connection(t: &dyn Transport, f: &dyn ConformanceFixture) -> bool {
-    match t.open(f.paired_peer_id()).await {
-        Ok(conn) => !conn.id().is_empty(),
-        Err(_) => false,
-    }
+    t.open(f.paired_peer_id())
+        .await
+        .is_ok_and(|conn| !conn.id().is_empty())
 }
 
 async fn c9_open_idempotent_or_distinct(t: &dyn Transport, f: &dyn ConformanceFixture) -> bool {

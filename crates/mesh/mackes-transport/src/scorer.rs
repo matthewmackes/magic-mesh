@@ -89,7 +89,7 @@ impl Policy {
     /// Default policy — baseline weights, mild flap penalty,
     /// no pins, no denies, AES-256-class content floor (§3).
     #[must_use]
-    pub fn baseline() -> Self {
+    pub const fn baseline() -> Self {
         Self {
             weights: ClassWeights::baseline(),
             flap_penalty: 0.25,
@@ -109,7 +109,7 @@ impl Default for Policy {
 /// Per-transport snapshot the scorer needs. Built either by
 /// [`select`] (which calls probe + capabilities on a real
 /// Transport set) or hand-crafted in unit tests.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportSample {
     /// Which transport this sample is for.
     pub kind: TransportKind,
@@ -152,7 +152,7 @@ impl TransportSample {
 
 /// Scorer output. Reported back to the mesh-router so it can
 /// emit a `PathSwitch` audit-chain entry with the reason.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScoredSelection {
     /// Transport the router should send through.
     pub primary: TransportKind,
@@ -284,8 +284,9 @@ pub fn score(
     })
 }
 
-/// Async wrapper around [`score`] that probes the live
-/// transports. Used by [`crate::Transport`] impls' integration
+/// Async wrapper around [`score`] that probes the live transports.
+///
+/// Used by [`crate::Transport`] impls' integration
 /// tests + (eventually) the `mesh_router` worker. Lives behind
 /// no feature gate — it depends only on the trait.
 pub async fn select(
