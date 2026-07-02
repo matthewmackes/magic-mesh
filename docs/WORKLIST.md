@@ -1995,7 +1995,7 @@ the plane and it **survives killing the current zone leader**.
     - [✓] each wake timed → rolling per-host average drives a phased progress bar (POST→XCP→toolstack) with a live ETA _(reconciled 2026-06-30: workers/wol.rs + ipc/dc_power.rs wake + live wake-progress bar (commit 19875e0))_
 
 ### Phase 4 — Rollout, genesis, DO & promotion
-- [ ] **DATACENTER-17: XCP host rollout as a first-class Hypervisor role.** *(hygiene 2026-06-23: shipped + merged to master this session)* _(reconciled 2026-06-30: OVER-MARK reverted: no unattended XCP-ng installer/answerfile, no 'Hypervisor' node_role, no rolling-patch (evacuate-first) day-2 code found)_
+- [✗] **DATACENTER-17: XCP host rollout as a first-class Hypervisor role. — DROPPED / SUPERSEDED (2026-07-02).** *(hygiene 2026-06-23: shipped + merged to master this session)* _(reconciled 2026-06-30: OVER-MARK reverted: no unattended XCP-ng installer/answerfile, no 'Hypervisor' node_role, no rolling-patch (evacuate-first) day-2 code found)_
   **As** the platform, **I want** XCP-ng hosts deployed + cared-for like any node role, **so that** new hypervisors
   are part of setup/onboarding/care, not hand-built.
   **Acceptance**:
