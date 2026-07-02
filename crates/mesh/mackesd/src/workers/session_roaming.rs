@@ -15,6 +15,23 @@
 //!   surface lands on which monitor, with geometry) is persisted per-peer so the
 //!   arrangement is restored on the arriving Workstation. A [`RoamingState`] bundles
 //!   a user's open sessions + their layout under the per-peer key.
+//! - **Per-monitor different VMs (E12-10):** a layout may pin a *distinct* session
+//!   (⇒ a distinct VM desktop) to each monitor via
+//!   [`MonitorLayout::monitor_sessions`], keyed by a **replug-stable** [`MonitorId`].
+//!   [`place_sessions`] / [`reconcile_roaming_placed`] resolve where every roamed
+//!   session reopens on the arriving Workstation; a session whose pinned monitor is
+//!   missing there falls back **deterministically to the primary monitor**, and a
+//!   conflicted layout (one session on two monitors / two sessions on one monitor)
+//!   is refused with a typed [`LayoutConflict`]. The pins are also validated
+//!   against the **live session set** every placement: a monitor whose pinned
+//!   session died is left honestly **unassigned**
+//!   ([`ResolvedPlacement::unassigned_monitors`]) — never a fabricated session.
+//!   Producers edit the mapping through [`MonitorLayout::assign`] (steal
+//!   semantics keep it 1:1 by construction) / [`MonitorLayout::unassign`]. The
+//!   default — no pins, and the shape every pre-E12-10 persisted layout
+//!   deserializes to — stays single-session-fullscreen. The live
+//!   two-monitors-two-VMs demo stays **hardware-gated** (it needs a real
+//!   multi-head Workstation driving two VM desktops; nothing here fakes it).
 //! - **Disconnect policy:** [`on_disconnect`] honors a per-VM [`DisconnectPolicy`] —
 //!   the default [`DisconnectPolicy::KeepRunning`] leaves the VM running and the
 //!   session reconnectable (design lock 5), while `Suspend` / `Shutdown` are honored
@@ -121,6 +138,115 @@ pub struct MonitorAssignment {
     pub primary: bool,
 }
 
+/// A **replug-stable** monitor identity: the EDID `vendor:model:serial` triple when
+/// the panel exposes one, else the connector name (`DP-1`, `HDMI-A-2`, …).
+///
+/// [`MonitorAssignment::monitor`] keys geometry on the 0-based *enumeration index*,
+/// which reshuffles when cables are replugged or the Workstation reboots. The
+/// per-monitor session pins ([`MonitorLayout::monitor_sessions`]) key on this stable
+/// id instead, so "the left DELL shows the build VM" survives a replug.
+pub type MonitorId = String;
+
+/// One per-monitor session pin (E12-10): the monitor with stable identity
+/// `monitor_id` shows `session_id`'s VM desktop.
+///
+/// Distinct sessions on distinct monitors is how "two monitors show two different
+/// VMs" is expressed; [`MonitorLayout::validate`] enforces the 1:1 shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MonitorSession {
+    /// The replug-stable monitor identity (see [`MonitorId`]).
+    pub monitor_id: MonitorId,
+    /// The session whose desktop is pinned to that monitor (a broker
+    /// [`SessionId`] — the VM rides the session, so distinct sessions ⇒ distinct
+    /// VM surfaces).
+    pub session_id: SessionId,
+}
+
+impl MonitorSession {
+    /// Pin `session_id` to the monitor with stable id `monitor_id`.
+    #[must_use]
+    pub fn new(monitor_id: impl Into<MonitorId>, session_id: impl Into<SessionId>) -> Self {
+        Self {
+            monitor_id: monitor_id.into(),
+            session_id: session_id.into(),
+        }
+    }
+}
+
+/// What an [`MonitorLayout::assign`] displaced to keep the pin set 1:1 — the
+/// steal-semantics receipt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Displaced {
+    /// The monitor the assigned session was **stolen** from (it had been pinned
+    /// elsewhere; that monitor is now unpinned).
+    pub stolen_from: Option<MonitorId>,
+    /// The session that was **replaced** on the target monitor (it is now
+    /// unpinned — back to the primary-monitor default).
+    pub replaced: Option<SessionId>,
+}
+
+impl Displaced {
+    /// Whether the assign displaced nothing (a fresh pin, or a re-asserted one).
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.stolen_from.is_none() && self.replaced.is_none()
+    }
+}
+
+/// A typed conflict in a [`MonitorLayout`]'s per-monitor session pins — the layout
+/// is refused (by the fold and by [`place_sessions`]) rather than silently
+/// last-wins'd.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayoutConflict {
+    /// The same session is pinned to two monitors — a session drives exactly one
+    /// monitor surface per layout.
+    SessionOnTwoMonitors {
+        /// The doubly-pinned session.
+        session_id: SessionId,
+        /// The first monitor it was pinned to.
+        first: MonitorId,
+        /// The second (conflicting) monitor.
+        second: MonitorId,
+    },
+    /// Two sessions are pinned to the same monitor — a monitor shows exactly one
+    /// session's desktop.
+    TwoSessionsOnOneMonitor {
+        /// The doubly-assigned monitor.
+        monitor_id: MonitorId,
+        /// The first session pinned to it.
+        first: SessionId,
+        /// The second (conflicting) session.
+        second: SessionId,
+    },
+}
+
+impl std::fmt::Display for LayoutConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionOnTwoMonitors {
+                session_id,
+                first,
+                second,
+            } => write!(
+                f,
+                "session {session_id} is pinned to two monitors ({first} and {second}); \
+                 a session drives exactly one monitor per layout"
+            ),
+            Self::TwoSessionsOnOneMonitor {
+                monitor_id,
+                first,
+                second,
+            } => write!(
+                f,
+                "monitor {monitor_id} is pinned to two sessions ({first} and {second}); \
+                 a monitor shows exactly one session"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LayoutConflict {}
+
 /// A user's multi-monitor layout: which VM surface lands on which monitor, with
 /// geometry.
 ///
@@ -131,21 +257,43 @@ pub struct MonitorLayout {
     /// One assignment per shown VM surface. Ordering is not significant; lookups
     /// go through the helper methods.
     pub assignments: Vec<MonitorAssignment>,
+    /// The per-monitor session pins (E12-10): which session's VM desktop shows on
+    /// which **replug-stable** [`MonitorId`]. **Empty ⇒ single-session
+    /// fullscreen** — the pre-E12-10 default (and the shape every previously
+    /// persisted layout deserializes to): every session resolves to the primary
+    /// monitor and the shell drives the focused one fullscreen. An empty pin set
+    /// also serializes away, so a legacy layout round-trips byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monitor_sessions: Vec<MonitorSession>,
 }
 
 impl MonitorLayout {
-    /// The empty layout (no surfaces mapped yet).
+    /// The empty layout (no surfaces mapped, no per-monitor pins —
+    /// single-session-fullscreen).
     #[must_use]
     pub const fn empty() -> Self {
         Self {
             assignments: Vec::new(),
+            monitor_sessions: Vec::new(),
         }
     }
 
-    /// Build a layout from a set of assignments.
+    /// Build a layout from a set of assignments (no per-monitor pins — the
+    /// single-session default; pin with [`MonitorLayout::with_monitor_sessions`]).
     #[must_use]
     pub const fn new(assignments: Vec<MonitorAssignment>) -> Self {
-        Self { assignments }
+        Self {
+            assignments,
+            monitor_sessions: Vec::new(),
+        }
+    }
+
+    /// Pin per-monitor sessions onto this layout (builder — E12-10). Check the
+    /// 1:1 shape with [`MonitorLayout::validate`].
+    #[must_use]
+    pub fn with_monitor_sessions(mut self, monitor_sessions: Vec<MonitorSession>) -> Self {
+        self.monitor_sessions = monitor_sessions;
+        self
     }
 
     /// How many surfaces the layout maps.
@@ -164,6 +312,159 @@ impl MonitorLayout {
     #[must_use]
     pub fn primary(&self) -> Option<&MonitorAssignment> {
         self.assignments.iter().find(|a| a.primary)
+    }
+
+    /// Whether this layout pins sessions per-monitor (E12-10) rather than the
+    /// single-session-fullscreen default.
+    #[must_use]
+    pub fn is_per_monitor(&self) -> bool {
+        !self.monitor_sessions.is_empty()
+    }
+
+    /// The session pinned to the monitor with stable id `monitor_id`, if any.
+    #[must_use]
+    pub fn session_on(&self, monitor_id: &str) -> Option<&SessionId> {
+        self.monitor_sessions
+            .iter()
+            .find(|m| m.monitor_id == monitor_id)
+            .map(|m| &m.session_id)
+    }
+
+    /// The monitor `session_id` is pinned to, if any.
+    #[must_use]
+    pub fn monitor_of(&self, session_id: &str) -> Option<&MonitorId> {
+        self.monitor_sessions
+            .iter()
+            .find(|m| m.session_id == session_id)
+            .map(|m| &m.monitor_id)
+    }
+
+    /// Pin `session_id` to `monitor_id` with **steal semantics** — the 1:1 shape
+    /// is kept by construction, so an [`MonitorLayout::assign`]-edited layout
+    /// always [`MonitorLayout::validate`]s:
+    ///
+    /// - a session already pinned to another monitor is **stolen** from it (the
+    ///   pin moves; the old monitor is left unpinned), and
+    /// - a session already showing on the target monitor is **replaced** (it
+    ///   becomes unpinned — back to the primary-monitor default).
+    ///
+    /// What was displaced comes back as [`Displaced`], so a producer (the shell's
+    /// layout editor, ahead of a [`RoamingRequest::SaveLayout`]) can surface the
+    /// side effects. Re-asserting an existing pin is a no-op.
+    pub fn assign(
+        &mut self,
+        monitor_id: impl Into<MonitorId>,
+        session_id: impl Into<SessionId>,
+    ) -> Displaced {
+        let monitor_id = monitor_id.into();
+        let session_id = session_id.into();
+        let mut displaced = Displaced::default();
+        // One pass: drop every pin sharing the session (steal) or the monitor
+        // (replace) — also self-healing should a conflicted layout sneak in.
+        self.monitor_sessions.retain(|pin| {
+            if pin.session_id == session_id {
+                if pin.monitor_id != monitor_id {
+                    displaced.stolen_from = Some(pin.monitor_id.clone());
+                }
+                return false;
+            }
+            if pin.monitor_id == monitor_id {
+                displaced.replaced = Some(pin.session_id.clone());
+                return false;
+            }
+            true
+        });
+        self.monitor_sessions.push(MonitorSession {
+            monitor_id,
+            session_id,
+        });
+        displaced
+    }
+
+    /// Clear the pin on `monitor_id`, returning the session that was unpinned
+    /// (now back to the primary-monitor default). `None` when the monitor had no
+    /// pin.
+    pub fn unassign(&mut self, monitor_id: &str) -> Option<SessionId> {
+        let pos = self
+            .monitor_sessions
+            .iter()
+            .position(|pin| pin.monitor_id == monitor_id)?;
+        Some(self.monitor_sessions.remove(pos).session_id)
+    }
+
+    /// Validate the per-monitor session pins: every pin is 1:1. The same session
+    /// on two monitors, or two sessions on one monitor (including a duplicated
+    /// pin), is a typed [`LayoutConflict`]. The single-session default (no pins)
+    /// is trivially valid.
+    ///
+    /// # Errors
+    /// The first [`LayoutConflict`], scanning pins in order (deterministic).
+    pub fn validate(&self) -> Result<(), LayoutConflict> {
+        let mut by_monitor: BTreeMap<&str, &SessionId> = BTreeMap::new();
+        let mut by_session: BTreeMap<&str, &MonitorId> = BTreeMap::new();
+        for pin in &self.monitor_sessions {
+            if let Some(prev) = by_monitor.insert(pin.monitor_id.as_str(), &pin.session_id) {
+                return Err(LayoutConflict::TwoSessionsOnOneMonitor {
+                    monitor_id: pin.monitor_id.clone(),
+                    first: prev.clone(),
+                    second: pin.session_id.clone(),
+                });
+            }
+            if let Some(prev) = by_session.insert(pin.session_id.as_str(), &pin.monitor_id) {
+                return Err(LayoutConflict::SessionOnTwoMonitors {
+                    session_id: pin.session_id.clone(),
+                    first: prev.clone(),
+                    second: pin.monitor_id.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The monitor inventory of a (potentially arriving) Workstation: the primary
+/// monitor plus any others, all by **replug-stable** [`MonitorId`].
+///
+/// Rides the [`RoamingRequest::Arrive`] wire verb (optional — the pre-E12-10 shape
+/// without it still parses) and anchors the deterministic placement fallback: a
+/// session pinned to a monitor **not** present here reopens on `primary`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkstationMonitors {
+    /// The primary monitor — the deterministic fallback target for sessions whose
+    /// pinned monitor is missing, and where single-session-fullscreen desktops
+    /// land.
+    pub primary: MonitorId,
+    /// The other present monitors. `primary` need not be repeated here.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub others: BTreeSet<MonitorId>,
+}
+
+impl WorkstationMonitors {
+    /// An inventory of `primary` plus `others`.
+    #[must_use]
+    pub fn new(
+        primary: impl Into<MonitorId>,
+        others: impl IntoIterator<Item = impl Into<MonitorId>>,
+    ) -> Self {
+        Self {
+            primary: primary.into(),
+            others: others.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// A single-monitor Workstation.
+    #[must_use]
+    pub fn single(primary: impl Into<MonitorId>) -> Self {
+        Self {
+            primary: primary.into(),
+            others: BTreeSet::new(),
+        }
+    }
+
+    /// Whether the monitor with stable id `monitor_id` is present.
+    #[must_use]
+    pub fn is_present(&self, monitor_id: &str) -> bool {
+        self.primary == monitor_id || self.others.contains(monitor_id)
     }
 }
 
@@ -434,6 +735,134 @@ pub fn reconcile_roaming(
     out
 }
 
+/// Where each roamed session reopens on an arriving Workstation — the resolved
+/// per-monitor placement ([`place_sessions`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedPlacement {
+    /// session → the present monitor its desktop reopens on.
+    pub on_monitor: BTreeMap<SessionId, MonitorId>,
+    /// The sessions that fell back to the primary monitor because their pinned
+    /// monitor is absent from the arriving Workstation.
+    pub fell_back: BTreeSet<SessionId>,
+    /// Present monitors whose **pin went stale** — the pinned session is gone
+    /// from the live session set (died / closed / never existed). Each is left
+    /// honestly **unassigned**: it shows no desktop, and no session is ever
+    /// fabricated for it. Unpinned monitors are not listed (under the
+    /// single-session default they are simply idle, not a stale mapping).
+    pub unassigned_monitors: BTreeSet<MonitorId>,
+}
+
+impl ResolvedPlacement {
+    /// The sessions placed on `monitor_id`, in id order (deterministic).
+    #[must_use]
+    pub fn sessions_on(&self, monitor_id: &str) -> Vec<&SessionId> {
+        self.on_monitor
+            .iter()
+            .filter(|(_, m)| m.as_str() == monitor_id)
+            .map(|(s, _)| s)
+            .collect()
+    }
+}
+
+/// Resolve where every publishable session in `sessions` reopens on a Workstation
+/// with `monitors` present, honoring `layout`'s per-monitor pins (E12-10).
+///
+/// - A session **pinned to a present monitor** reopens on exactly that monitor —
+///   two monitors show two different VMs.
+/// - A session **pinned to a missing monitor** (the user roamed to a Workstation
+///   with fewer monitors) falls back to the **primary monitor** — the
+///   deterministic, documented fallback — and is recorded in
+///   [`ResolvedPlacement::fell_back`].
+/// - An **unpinned** session — and every session under the single-session default
+///   (no pins) — resolves to the primary monitor; the shell drives the focused
+///   one fullscreen.
+/// - A pin whose **session is dead** (absent from `sessions`, or terminal) is
+///   validated against the live session set and its present monitor is left
+///   honestly **unassigned** ([`ResolvedPlacement::unassigned_monitors`]) —
+///   never a fake session.
+///
+/// Terminal / non-publishable sessions are not placed. Deterministic (id-sorted).
+/// Placement never changes *which* sessions reopen (that is
+/// [`reconcile_roaming`]'s diff) nor their per-session [`DisconnectPolicy`] — it
+/// only answers *where*.
+///
+/// # Errors
+/// A [`LayoutConflict`] when `layout`'s pins are not 1:1 (validated first —
+/// nothing is placed off a conflicted layout).
+pub fn place_sessions(
+    layout: &MonitorLayout,
+    monitors: &WorkstationMonitors,
+    sessions: &[VdiSession],
+) -> Result<ResolvedPlacement, LayoutConflict> {
+    layout.validate()?;
+    let by_id: BTreeMap<&SessionId, &VdiSession> = sessions.iter().map(|s| (&s.id, s)).collect();
+    let mut placement = ResolvedPlacement::default();
+    for (id, session) in by_id {
+        if !session.state.is_publishable() {
+            continue;
+        }
+        let monitor = match layout.monitor_of(id) {
+            Some(pinned) if monitors.is_present(pinned) => pinned.clone(),
+            Some(_missing) => {
+                placement.fell_back.insert(id.clone());
+                monitors.primary.clone()
+            }
+            None => monitors.primary.clone(),
+        };
+        placement.on_monitor.insert(id.clone(), monitor);
+    }
+    // Validate the pins against the LIVE session set: a present monitor whose
+    // pinned session was not placed (the session is dead — absent or terminal)
+    // is left honestly unassigned; nothing is fabricated onto it. (A live,
+    // publishable, pinned session on a present monitor is always placed exactly
+    // there, so "not placed" ⇔ "the session is gone".)
+    for pin in &layout.monitor_sessions {
+        if monitors.is_present(&pin.monitor_id)
+            && !placement.on_monitor.contains_key(&pin.session_id)
+        {
+            placement.unassigned_monitors.insert(pin.monitor_id.clone());
+        }
+    }
+    Ok(placement)
+}
+
+/// The E12-10 per-monitor roaming reconcile result.
+///
+/// Bundles [`reconcile_roaming`]'s minimal action diff **plus** the resolved
+/// monitor placement for the (already-roamed) desired sessions on the arriving
+/// Workstation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedRoaming {
+    /// The plane writes ([`reconcile_roaming`] — unchanged semantics).
+    pub actions: Vec<RoamingAction>,
+    /// Where each desired session reopens ([`place_sessions`]).
+    pub placement: ResolvedPlacement,
+}
+
+/// Reconcile a roaming arrival **with** per-monitor placement (E12-10).
+///
+/// The same minimal [`RoamingAction`] diff as [`reconcile_roaming`] (each assigned
+/// session reopens; per-session [`DisconnectPolicy`] handling is untouched), plus
+/// where every reopened session lands on the arriving Workstation's `monitors` per
+/// `layout` — a pinned-but-missing monitor falls back to the primary
+/// ([`place_sessions`]).
+///
+/// # Errors
+/// A [`LayoutConflict`] when `layout` is invalid — nothing is reconciled off a
+/// conflicted layout.
+pub fn reconcile_roaming_placed(
+    desired: &[VdiSession],
+    observed: &BTreeMap<SessionId, VdiSession>,
+    layout: &MonitorLayout,
+    monitors: &WorkstationMonitors,
+) -> Result<PlacedRoaming, LayoutConflict> {
+    let placement = place_sessions(layout, monitors, desired)?;
+    Ok(PlacedRoaming {
+        actions: reconcile_roaming(desired, observed),
+        placement,
+    })
+}
+
 /// The reconnect-on-node-loss decision: hold a session reconnectable when its
 /// `serving_peer` leaves the mesh.
 ///
@@ -469,7 +898,19 @@ pub fn on_node_loss(
     out
 }
 
-/// Compose one convergence tick's full [`RoamingAction`] set from the folded policy
+/// One convergence tick's full decision: the [`RoamingAction`] plane writes plus
+/// the per-arrival monitor placements (E12-10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoamingPlan {
+    /// The plane writes, de-duplicated by session id, deterministic (id-sorted).
+    pub actions: Vec<RoamingAction>,
+    /// Per arriving Workstation: where each roamed session reopens — only for
+    /// arrivals whose monitor inventory is known ([`RoamingRequest::Arrive`]
+    /// carried [`WorkstationMonitors`]).
+    pub placements: BTreeMap<NodeId, ResolvedPlacement>,
+}
+
+/// Compose one convergence tick's full [`RoamingPlan`] from the folded policy
 /// inputs over the `observed` shared plane.
 ///
 /// Roaming arrivals ([`reconcile_roaming`] over [`roam_to`]) + the per-VM disconnect
@@ -477,17 +918,28 @@ pub fn on_node_loss(
 /// session id (last decision wins: node-loss over disconnect-policy over roaming) so
 /// each session gets at most one write per tick, and deterministic (id-sorted). Pure
 /// — the worker's `converge` applies the result through the store.
+///
+/// **Per-monitor placement (E12-10):** `monitors` and `layouts` are keyed by the
+/// peer they apply to (the fold re-keys a roaming user's layout onto the arriving
+/// Workstation). For each arrival whose monitor inventory is known, the plan also
+/// resolves *where* each roamed session reopens ([`reconcile_roaming_placed`]) —
+/// the single-session default applies when no layout is persisted. The action diff
+/// is identical either way: placement answers *where*, never *whether*.
 #[must_use]
 pub fn plan_roaming(
     arrivals: &BTreeMap<NodeId, NodeId>,
+    monitors: &BTreeMap<NodeId, WorkstationMonitors>,
+    layouts: &BTreeMap<NodeId, MonitorLayout>,
     policies: &BTreeMap<VmId, DisconnectPolicy>,
     observed: &BTreeMap<SessionId, VdiSession>,
     live: &BTreeSet<NodeId>,
     now_ms: u64,
-) -> Vec<RoamingAction> {
+) -> RoamingPlan {
     let mut by_id: BTreeMap<SessionId, RoamingAction> = BTreeMap::new();
+    let mut placements: BTreeMap<NodeId, ResolvedPlacement> = BTreeMap::new();
     // 1. Roaming: for each arrival, roam the sessions driven from `from` onto
-    //    `workstation` and reconcile them into the plane.
+    //    `workstation` and reconcile them into the plane — with per-monitor
+    //    placement when the arriving Workstation's monitors are known.
     for (from, workstation) in arrivals {
         let user_obs: BTreeMap<SessionId, VdiSession> = observed
             .iter()
@@ -496,8 +948,23 @@ pub fn plan_roaming(
             .collect();
         let user_sessions: Vec<VdiSession> = user_obs.values().cloned().collect();
         let desired = roam_to(&user_sessions, workstation, now_ms);
-        for action in reconcile_roaming(&desired, &user_obs) {
-            by_id.insert(action.session_id(), action);
+        // The fold refuses conflicted layouts, so the placed reconcile only errs
+        // on a caller-supplied invalid layout — the sessions still roam then,
+        // just un-placed.
+        let single_session = MonitorLayout::empty();
+        let placed = monitors.get(workstation).and_then(|mons| {
+            let layout = layouts.get(workstation).unwrap_or(&single_session);
+            reconcile_roaming_placed(&desired, &user_obs, layout, mons).ok()
+        });
+        if let Some(p) = placed {
+            placements.insert(workstation.clone(), p.placement);
+            for action in p.actions {
+                by_id.insert(action.session_id(), action);
+            }
+        } else {
+            for action in reconcile_roaming(&desired, &user_obs) {
+                by_id.insert(action.session_id(), action);
+            }
         }
     }
     // 2. Disconnect policy: a Shutdown-policy VM whose session is Disconnected ends
@@ -515,7 +982,10 @@ pub fn plan_roaming(
     for action in on_node_loss(&all, live, now_ms) {
         by_id.insert(action.session_id(), action);
     }
-    by_id.into_values().collect()
+    RoamingPlan {
+        actions: by_id.into_values().collect(),
+        placements,
+    }
 }
 
 // ───────────────────────────── layout store seam ─────────────────────────────
@@ -660,6 +1130,11 @@ pub enum RoamingRequest {
         from: NodeId,
         /// The Workstation the user has arrived at.
         workstation: NodeId,
+        /// The arriving Workstation's monitor inventory (replug-stable ids), when
+        /// the shell knows it — enables per-monitor placement (E12-10). Absent on
+        /// the pre-E12-10 wire shape, which still parses (and roams un-placed).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        monitors: Option<WorkstationMonitors>,
     },
     /// Set a VM's disconnect policy (default [`DisconnectPolicy::KeepRunning`]).
     SetPolicy {
@@ -684,17 +1159,38 @@ pub enum RoamingRequest {
 struct RoamingFold {
     /// Latest arrival target per driving peer (`from` → `workstation`).
     arrivals: BTreeMap<NodeId, NodeId>,
+    /// Latest known monitor inventory per Workstation (from
+    /// [`RoamingRequest::Arrive`]).
+    monitors: BTreeMap<NodeId, WorkstationMonitors>,
     /// Per-VM disconnect policy.
     policies: BTreeMap<VmId, DisconnectPolicy>,
-    /// Per-peer persisted monitor layout.
+    /// Per-peer persisted monitor layout (validated — a conflicted save is
+    /// refused, never folded, never persisted).
     layouts: BTreeMap<NodeId, MonitorLayout>,
 }
 
 impl RoamingFold {
     /// Fold one drained request into the view (latest-wins by key).
+    ///
+    /// An [`RoamingRequest::Arrive`] also re-keys the roaming user's layout onto
+    /// the arriving Workstation — desktops follow me, so the arrangement follows
+    /// too (the origin peer keeps its copy for a roam back) — and records the
+    /// arriving monitor inventory when the wire carried one. A
+    /// [`RoamingRequest::SaveLayout`] with conflicted per-monitor pins is refused
+    /// with the typed [`LayoutConflict`] (logged) rather than silently folded.
     fn apply(&mut self, req: RoamingRequest) {
         match req {
-            RoamingRequest::Arrive { from, workstation } => {
+            RoamingRequest::Arrive {
+                from,
+                workstation,
+                monitors,
+            } => {
+                if let Some(inventory) = monitors {
+                    self.monitors.insert(workstation.clone(), inventory);
+                }
+                if let Some(layout) = self.layouts.get(&from).cloned() {
+                    self.layouts.insert(workstation.clone(), layout);
+                }
                 self.arrivals.insert(from, workstation);
             }
             RoamingRequest::SetPolicy { vm_id, policy } => {
@@ -703,9 +1199,18 @@ impl RoamingFold {
             RoamingRequest::SaveLayout {
                 client_peer,
                 layout,
-            } => {
-                self.layouts.insert(client_peer, layout);
-            }
+            } => match layout.validate() {
+                Ok(()) => {
+                    self.layouts.insert(client_peer, layout);
+                }
+                Err(conflict) => {
+                    tracing::warn!(
+                        peer = %client_peer,
+                        error = %conflict,
+                        "session_roaming: refused conflicted monitor layout"
+                    );
+                }
+            },
         }
     }
 }
@@ -859,10 +1364,33 @@ impl SessionRoamingWorker {
             }
         };
         let live = self.live_nodes.live();
-        for action in plan_roaming(&fold.arrivals, &fold.policies, &observed, &live, now_ms()) {
+        let plan = plan_roaming(
+            &fold.arrivals,
+            &fold.monitors,
+            &fold.layouts,
+            &fold.policies,
+            &observed,
+            &live,
+            now_ms(),
+        );
+        for action in plan.actions {
             if let Err(e) = action.apply(self.store.as_ref()) {
                 tracing::warn!(error = %e, "session_roaming: roaming action failed");
             }
+        }
+        // The leader's placement record (E12-10): which session reopens on which
+        // monitor of the arriving Workstation — the shell-side renderer resolves
+        // the same pure decision; this is its converge-time trace (incl. the
+        // deterministic primary fallback for missing monitors and the honestly
+        // unassigned monitors whose pinned session died).
+        for (workstation, placement) in &plan.placements {
+            tracing::info!(
+                workstation = %workstation,
+                on_monitor = ?placement.on_monitor,
+                fell_back = ?placement.fell_back,
+                unassigned = ?placement.unassigned_monitors,
+                "session_roaming: per-monitor placement resolved"
+            );
         }
         // Persist any folded layouts through the companion (gated) seam.
         for (peer, layout) in &fold.layouts {
@@ -968,6 +1496,373 @@ mod tests {
         let json = serde_json::to_string(&layout).expect("serialize");
         let back: MonitorLayout = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, layout);
+    }
+
+    // ── E12-10: per-monitor session pins ──
+
+    #[test]
+    fn monitor_layout_old_json_shape_still_deserializes() {
+        // The exact JSON shape the pre-E12-10 code persisted (no
+        // `monitor_sessions` field) — a stored layout must keep deserializing.
+        let old = r#"{"assignments":[{"monitor":0,"session_id":"s1","vm_id":"uuid-1","geometry":{"x":0,"y":0,"width":1920,"height":1080},"primary":true}]}"#;
+        let layout: MonitorLayout = serde_json::from_str(old).expect("old shape deserializes");
+        assert!(
+            layout.monitor_sessions.is_empty(),
+            "defaults to single-session-fullscreen"
+        );
+        assert!(!layout.is_per_monitor());
+        assert_eq!(layout.surface_count(), 1);
+        layout.validate().expect("the default is trivially valid");
+        // And it re-serializes byte-identical (the empty pin set serializes
+        // away), so legacy layouts stay stable through latest-wins folds.
+        assert_eq!(serde_json::to_string(&layout).expect("serialize"), old);
+    }
+
+    #[test]
+    fn per_monitor_layout_round_trips_and_looks_up() {
+        let layout = MonitorLayout::empty().with_monitor_sessions(vec![
+            MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
+            MonitorSession::new("edid:LEN:P27:2", "s2"),
+        ]);
+        assert!(layout.is_per_monitor());
+        assert_eq!(layout.session_on("edid:LEN:P27:2"), Some(&"s2".to_string()));
+        assert_eq!(
+            layout.monitor_of("s1"),
+            Some(&"edid:DEL:U2720Q:1".to_string())
+        );
+        assert!(layout.session_on("edid:GONE:9").is_none());
+        assert!(layout.monitor_of("s9").is_none());
+        layout.validate().expect("distinct 1:1 pins are valid");
+        let json = serde_json::to_string(&layout).expect("serialize");
+        let back: MonitorLayout = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, layout);
+    }
+
+    #[test]
+    fn validate_rejects_one_session_on_two_monitors() {
+        let layout = MonitorLayout::empty().with_monitor_sessions(vec![
+            MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
+            MonitorSession::new("edid:LEN:P27:2", "s1"),
+        ]);
+        match layout.validate() {
+            Err(LayoutConflict::SessionOnTwoMonitors {
+                session_id,
+                first,
+                second,
+            }) => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(first, "edid:DEL:U2720Q:1");
+                assert_eq!(second, "edid:LEN:P27:2");
+            }
+            other => panic!("expected SessionOnTwoMonitors, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_two_sessions_on_one_monitor() {
+        let layout = MonitorLayout::empty().with_monitor_sessions(vec![
+            MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
+            MonitorSession::new("edid:DEL:U2720Q:1", "s2"),
+        ]);
+        match layout.validate() {
+            Err(LayoutConflict::TwoSessionsOnOneMonitor {
+                monitor_id,
+                first,
+                second,
+            }) => {
+                assert_eq!(monitor_id, "edid:DEL:U2720Q:1");
+                assert_eq!(first, "s1");
+                assert_eq!(second, "s2");
+            }
+            other => panic!("expected TwoSessionsOnOneMonitor, got {other:?}"),
+        }
+        // The conflict is a real std error with a human-readable message.
+        let err = layout.validate().unwrap_err();
+        assert!(err.to_string().contains("edid:DEL:U2720Q:1"));
+    }
+
+    // ── E12-10: assign / steal (the mapping edits keep 1:1 by construction) ──
+
+    #[test]
+    fn assign_pins_a_session_and_reasserting_is_a_noop() {
+        let mut layout = MonitorLayout::empty();
+        let displaced = layout.assign("edid:DEL:U2720Q:1", "s1");
+        assert!(displaced.is_clean(), "a fresh pin displaces nothing");
+        assert_eq!(
+            layout.session_on("edid:DEL:U2720Q:1"),
+            Some(&"s1".to_string())
+        );
+        layout.validate().expect("assign keeps the layout valid");
+        // Re-asserting the same pin changes nothing and displaces nothing.
+        let again = layout.assign("edid:DEL:U2720Q:1", "s1");
+        assert!(again.is_clean());
+        assert_eq!(layout.monitor_sessions.len(), 1, "no duplicate pin");
+        layout.validate().expect("still valid");
+    }
+
+    #[test]
+    fn assign_steals_a_session_from_its_old_monitor() {
+        // s1 shows on the DELL; assigning it to the LENOVO STEALS it — the pin
+        // moves, the DELL is left unpinned, and the steal is reported.
+        let mut layout = MonitorLayout::empty();
+        layout.assign("edid:DEL:U2720Q:1", "s1");
+        let displaced = layout.assign("edid:LEN:P27:2", "s1");
+        assert_eq!(displaced.stolen_from, Some("edid:DEL:U2720Q:1".to_string()));
+        assert_eq!(displaced.replaced, None);
+        assert_eq!(layout.monitor_of("s1"), Some(&"edid:LEN:P27:2".to_string()));
+        assert!(
+            layout.session_on("edid:DEL:U2720Q:1").is_none(),
+            "the old monitor is unpinned, not left with a stale copy"
+        );
+        layout.validate().expect("a steal keeps the layout 1:1");
+    }
+
+    #[test]
+    fn assign_replaces_the_session_on_an_occupied_monitor() {
+        // The DELL shows s1; assigning s2 there REPLACES s1 (which becomes
+        // unpinned — back to the primary-monitor default), reported as such.
+        let mut layout = MonitorLayout::empty();
+        layout.assign("edid:DEL:U2720Q:1", "s1");
+        let displaced = layout.assign("edid:DEL:U2720Q:1", "s2");
+        assert_eq!(displaced.replaced, Some("s1".to_string()));
+        assert_eq!(displaced.stolen_from, None);
+        assert_eq!(
+            layout.session_on("edid:DEL:U2720Q:1"),
+            Some(&"s2".to_string())
+        );
+        assert!(layout.monitor_of("s1").is_none(), "s1 is unpinned");
+        layout.validate().expect("a replace keeps the layout 1:1");
+        // Steal + replace at once: s2 is on the DELL, s3 on the LENOVO; moving
+        // s3 onto the DELL steals it from the LENOVO AND replaces s2.
+        layout.assign("edid:LEN:P27:2", "s3");
+        let both = layout.assign("edid:DEL:U2720Q:1", "s3");
+        assert_eq!(both.stolen_from, Some("edid:LEN:P27:2".to_string()));
+        assert_eq!(both.replaced, Some("s2".to_string()));
+        assert_eq!(layout.monitor_sessions.len(), 1, "one pin remains");
+        layout.validate().expect("still 1:1");
+    }
+
+    #[test]
+    fn unassign_clears_a_monitor_pin() {
+        let mut layout = MonitorLayout::empty();
+        layout.assign("edid:DEL:U2720Q:1", "s1");
+        assert_eq!(layout.unassign("edid:DEL:U2720Q:1"), Some("s1".to_string()));
+        assert!(
+            !layout.is_per_monitor(),
+            "back to the single-session default"
+        );
+        assert_eq!(layout.unassign("edid:DEL:U2720Q:1"), None, "already clear");
+    }
+
+    // ── E12-10: placement (two monitors show two different VMs) ──
+
+    #[test]
+    fn place_sessions_puts_two_vms_on_two_monitors() {
+        // The E12-10 acceptance: two monitors show two DIFFERENT VMs.
+        let sessions = vec![
+            sess("s1", "peer:ws", "peer:h1", SessionState::Active),
+            sess("s2", "peer:ws", "peer:h2", SessionState::Active),
+        ];
+        assert_ne!(sessions[0].vm_id, sessions[1].vm_id, "distinct VMs");
+        let layout = MonitorLayout::empty().with_monitor_sessions(vec![
+            MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
+            MonitorSession::new("edid:LEN:P27:2", "s2"),
+        ]);
+        let monitors = WorkstationMonitors::new("edid:DEL:U2720Q:1", ["edid:LEN:P27:2"]);
+        let placed = place_sessions(&layout, &monitors, &sessions).expect("valid layout places");
+        assert_eq!(placed.on_monitor["s1"], "edid:DEL:U2720Q:1");
+        assert_eq!(placed.on_monitor["s2"], "edid:LEN:P27:2");
+        assert_eq!(placed.sessions_on("edid:DEL:U2720Q:1"), [&"s1".to_string()]);
+        assert_eq!(placed.sessions_on("edid:LEN:P27:2"), [&"s2".to_string()]);
+        assert!(placed.fell_back.is_empty(), "both monitors are present");
+        assert!(placed.unassigned_monitors.is_empty(), "both pins are live");
+    }
+
+    #[test]
+    fn place_sessions_falls_back_to_primary_on_missing_monitor() {
+        // Roam to a Workstation with FEWER monitors: the session pinned to the
+        // missing monitor deterministically reopens on the primary (documented
+        // fallback), and the fallback is recorded.
+        let sessions = vec![
+            sess("s1", "peer:ws", "peer:h1", SessionState::Active),
+            sess("s2", "peer:ws", "peer:h2", SessionState::Active),
+        ];
+        let layout = MonitorLayout::empty().with_monitor_sessions(vec![
+            MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
+            MonitorSession::new("edid:LEN:P27:2", "s2"),
+        ]);
+        let single = WorkstationMonitors::single("edid:DEL:U2720Q:1");
+        let placed = place_sessions(&layout, &single, &sessions).expect("places");
+        assert_eq!(placed.on_monitor["s1"], "edid:DEL:U2720Q:1");
+        assert_eq!(
+            placed.on_monitor["s2"], "edid:DEL:U2720Q:1",
+            "missing monitor → primary"
+        );
+        assert_eq!(placed.fell_back, ["s2".to_string()].into());
+        // Deterministic: the same inputs place identically.
+        assert_eq!(
+            placed,
+            place_sessions(&layout, &single, &sessions).expect("places")
+        );
+    }
+
+    #[test]
+    fn place_sessions_default_layout_is_single_session_on_primary() {
+        // No pins (the default and every legacy layout): everything publishable
+        // lands on the primary — single-session fullscreen. Terminal sessions
+        // are not placed.
+        let sessions = vec![
+            sess("s1", "peer:ws", "peer:h1", SessionState::Active),
+            sess("s2", "peer:ws", "peer:h2", SessionState::Closed), // terminal
+        ];
+        let monitors = WorkstationMonitors::new("edid:DEL:U2720Q:1", ["edid:LEN:P27:2"]);
+        let placed = place_sessions(&MonitorLayout::empty(), &monitors, &sessions).expect("places");
+        assert_eq!(
+            placed.on_monitor.len(),
+            1,
+            "the terminal session is not placed"
+        );
+        assert_eq!(placed.on_monitor["s1"], "edid:DEL:U2720Q:1");
+        assert!(placed.fell_back.is_empty(), "the default is not a fallback");
+        // An UNPINNED session under a per-monitor layout also lands on primary.
+        let layout = MonitorLayout::empty()
+            .with_monitor_sessions(vec![MonitorSession::new("edid:LEN:P27:2", "s3")]);
+        let more = vec![
+            sess("s1", "peer:ws", "peer:h1", SessionState::Active),
+            sess("s3", "peer:ws", "peer:h3", SessionState::Active),
+        ];
+        let placed = place_sessions(&layout, &monitors, &more).expect("places");
+        assert_eq!(placed.on_monitor["s3"], "edid:LEN:P27:2");
+        assert_eq!(
+            placed.on_monitor["s1"], "edid:DEL:U2720Q:1",
+            "unpinned → primary"
+        );
+        assert!(placed.fell_back.is_empty());
+        assert!(
+            placed.unassigned_monitors.is_empty(),
+            "an unpinned monitor is idle, not a stale mapping"
+        );
+    }
+
+    #[test]
+    fn place_sessions_leaves_a_dead_sessions_monitor_unassigned() {
+        // The pins are validated against the LIVE session set: s2's session died
+        // (terminal) and s9's never existed — their present monitors are left
+        // honestly UNASSIGNED, and no fake session is fabricated onto them.
+        let layout = MonitorLayout::empty().with_monitor_sessions(vec![
+            MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
+            MonitorSession::new("edid:LEN:P27:2", "s2"),
+            MonitorSession::new("edid:AOC:24B:7", "s9"),
+        ]);
+        let monitors =
+            WorkstationMonitors::new("edid:DEL:U2720Q:1", ["edid:LEN:P27:2", "edid:AOC:24B:7"]);
+        let sessions = vec![
+            sess("s1", "peer:ws", "peer:h1", SessionState::Active),
+            sess("s2", "peer:ws", "peer:h2", SessionState::Closed), // died
+                                                                    // s9: absent entirely
+        ];
+        let placed = place_sessions(&layout, &monitors, &sessions).expect("places");
+        assert_eq!(placed.on_monitor.len(), 1, "only the live session places");
+        assert_eq!(placed.on_monitor["s1"], "edid:DEL:U2720Q:1");
+        assert!(
+            !placed.on_monitor.contains_key("s2"),
+            "the dead session is never resurrected"
+        );
+        assert_eq!(
+            placed.unassigned_monitors,
+            ["edid:LEN:P27:2".to_string(), "edid:AOC:24B:7".to_string()].into(),
+            "monitors whose pinned session died are honestly unassigned"
+        );
+        assert!(placed.sessions_on("edid:LEN:P27:2").is_empty());
+        assert!(
+            placed.fell_back.is_empty(),
+            "nothing fell back — it is gone"
+        );
+    }
+
+    #[test]
+    fn reconcile_roaming_placed_reopens_each_session_on_its_monitor() {
+        // A user roams peer:old → peer:new (both monitors present): both sessions
+        // Reopen — the exact same minimal diff as reconcile_roaming — and each
+        // lands on its pinned monitor. Disconnect policy is untouched (it stays
+        // the per-session concern of on_disconnect / plan_roaming step 2).
+        let observed = roster_of(&[
+            sess("s1", "peer:old", "peer:h1", SessionState::Disconnected),
+            sess("s2", "peer:old", "peer:h2", SessionState::Active),
+        ]);
+        let user_sessions: Vec<VdiSession> = observed.values().cloned().collect();
+        let desired = roam_to(&user_sessions, &"peer:new".to_string(), 700);
+        let layout = MonitorLayout::empty().with_monitor_sessions(vec![
+            MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
+            MonitorSession::new("edid:LEN:P27:2", "s2"),
+        ]);
+        let monitors = WorkstationMonitors::new("edid:DEL:U2720Q:1", ["edid:LEN:P27:2"]);
+        let placed = reconcile_roaming_placed(&desired, &observed, &layout, &monitors)
+            .expect("valid layout reconciles");
+        assert_eq!(
+            placed.actions,
+            reconcile_roaming(&desired, &observed),
+            "the action diff is unchanged — placement answers where, not whether"
+        );
+        assert_eq!(placed.actions.len(), 2, "both sessions reopen");
+        assert_eq!(placed.placement.on_monitor["s1"], "edid:DEL:U2720Q:1");
+        assert_eq!(placed.placement.on_monitor["s2"], "edid:LEN:P27:2");
+        assert!(placed.placement.fell_back.is_empty());
+        assert!(placed.placement.unassigned_monitors.is_empty());
+    }
+
+    #[test]
+    fn reconcile_roaming_placed_dead_session_releases_and_unassigns() {
+        // s2 died (Closed) before the user roamed: the reconcile path both
+        // Releases it from the plane AND leaves its pinned monitor honestly
+        // unassigned — the mapping is consulted, and no fake session appears.
+        let observed = roster_of(&[
+            sess("s1", "peer:old", "peer:h1", SessionState::Disconnected),
+            sess("s2", "peer:old", "peer:h2", SessionState::Closed),
+        ]);
+        let user_sessions: Vec<VdiSession> = observed.values().cloned().collect();
+        // roam_to drops the terminal session — only s1 is desired on peer:new.
+        let desired = roam_to(&user_sessions, &"peer:new".to_string(), 700);
+        let layout = MonitorLayout::empty().with_monitor_sessions(vec![
+            MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
+            MonitorSession::new("edid:LEN:P27:2", "s2"),
+        ]);
+        let monitors = WorkstationMonitors::new("edid:DEL:U2720Q:1", ["edid:LEN:P27:2"]);
+        let placed = reconcile_roaming_placed(&desired, &observed, &layout, &monitors)
+            .expect("valid layout reconciles");
+        assert!(
+            placed
+                .actions
+                .contains(&RoamingAction::Release("s2".into())),
+            "the dead session is released from the plane"
+        );
+        assert!(
+            !placed.placement.on_monitor.contains_key("s2"),
+            "never a fake session for the dead pin"
+        );
+        assert_eq!(
+            placed.placement.unassigned_monitors,
+            ["edid:LEN:P27:2".to_string()].into(),
+            "its monitor falls back honestly — unassigned"
+        );
+        assert_eq!(placed.placement.on_monitor["s1"], "edid:DEL:U2720Q:1");
+    }
+
+    #[test]
+    fn reconcile_roaming_placed_rejects_a_conflicted_layout() {
+        let desired = vec![sess("s1", "peer:new", "peer:h", SessionState::Active)];
+        let layout = MonitorLayout::empty().with_monitor_sessions(vec![
+            MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
+            MonitorSession::new("edid:LEN:P27:2", "s1"),
+        ]);
+        let err = reconcile_roaming_placed(
+            &desired,
+            &BTreeMap::new(),
+            &layout,
+            &WorkstationMonitors::single("edid:DEL:U2720Q:1"),
+        )
+        .expect_err("a conflicted layout must not reconcile");
+        assert!(matches!(err, LayoutConflict::SessionOnTwoMonitors { .. }));
     }
 
     // ── disconnect policy ──
@@ -1203,7 +2098,20 @@ mod tests {
             [("uuid-s2".to_string(), DisconnectPolicy::Shutdown)].into();
         let live = live_set(&["live"]);
 
-        let out = plan_roaming(&arrivals, &policies, &observed, &live, 42);
+        let plan = plan_roaming(
+            &arrivals,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &policies,
+            &observed,
+            &live,
+            42,
+        );
+        assert!(
+            plan.placements.is_empty(),
+            "no monitor inventory ⇒ no placement"
+        );
+        let out = plan.actions;
         // Deterministic (id-sorted): s1 Reopen, s2 Release, s3 Hold.
         assert_eq!(out.len(), 3);
         match &out[0] {
@@ -1235,8 +2143,71 @@ mod tests {
             SessionState::Disconnected,
         )]);
         let live = live_set(&["live"]);
-        let out = plan_roaming(&BTreeMap::new(), &BTreeMap::new(), &observed, &live, 42);
-        assert!(out.is_empty(), "KeepRunning holds without a plane write");
+        let plan = plan_roaming(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &observed,
+            &live,
+            42,
+        );
+        assert!(
+            plan.actions.is_empty(),
+            "KeepRunning holds without a plane write"
+        );
+        assert!(plan.placements.is_empty());
+    }
+
+    #[test]
+    fn plan_roaming_resolves_per_monitor_placement_for_an_arrival() {
+        // A user with two per-monitor sessions roams peer:old → peer:new, but
+        // peer:new has only the primary monitor: both sessions still roam
+        // (Reopen), s1 lands on its pinned monitor, s2 falls back to the primary.
+        let observed = roster_of(&[
+            sess("s1", "peer:old", "peer:live", SessionState::Disconnected),
+            sess("s2", "peer:old", "peer:live", SessionState::Disconnected),
+        ]);
+        let arrivals: BTreeMap<NodeId, NodeId> =
+            [("peer:old".to_string(), "peer:new".to_string())].into();
+        let monitors: BTreeMap<NodeId, WorkstationMonitors> = [(
+            "peer:new".to_string(),
+            WorkstationMonitors::single("edid:DEL:U2720Q:1"),
+        )]
+        .into();
+        // Keyed by the arriving peer — exactly how the fold re-keys a roaming
+        // user's layout on Arrive.
+        let layouts: BTreeMap<NodeId, MonitorLayout> = [(
+            "peer:new".to_string(),
+            MonitorLayout::empty().with_monitor_sessions(vec![
+                MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
+                MonitorSession::new("edid:LEN:P27:2", "s2"),
+            ]),
+        )]
+        .into();
+        let live = live_set(&["live"]);
+
+        let plan = plan_roaming(
+            &arrivals,
+            &monitors,
+            &layouts,
+            &BTreeMap::new(),
+            &observed,
+            &live,
+            42,
+        );
+        assert_eq!(plan.actions.len(), 2, "both sessions roam regardless");
+        assert!(plan
+            .actions
+            .iter()
+            .all(|a| matches!(a, RoamingAction::Reopen(s) if s.client_peer == "peer:new")));
+        let placement = &plan.placements["peer:new"];
+        assert_eq!(placement.on_monitor["s1"], "edid:DEL:U2720Q:1");
+        assert_eq!(
+            placement.on_monitor["s2"], "edid:DEL:U2720Q:1",
+            "pinned monitor missing on arrival ⇒ deterministic primary fallback"
+        );
+        assert_eq!(placement.fell_back, ["s2".to_string()].into());
     }
 
     // ── store seams ──
@@ -1340,11 +2311,17 @@ mod tests {
     }
 
     #[test]
-    fn fake_layout_store_round_trips() {
+    fn fake_layout_store_round_trips_a_per_monitor_layout() {
+        // The E12-10 persistence round-trip: the per-monitor pins survive the
+        // per-peer layout seam intact.
         let store = FakeLayoutStore::default();
         let peer = "peer:c".to_string();
-        store.publish(&peer, &MonitorLayout::empty()).unwrap();
-        assert_eq!(store.list().unwrap().len(), 1);
+        let mut layout = MonitorLayout::empty();
+        layout.assign("edid:DEL:U2720Q:1", "s1");
+        layout.assign("edid:LEN:P27:2", "s2");
+        store.publish(&peer, &layout).unwrap();
+        let listed = store.list().unwrap();
+        assert_eq!(listed, vec![(peer.clone(), layout)]);
         store.remove(&peer).unwrap();
         assert!(store.list().unwrap().is_empty());
     }
@@ -1353,6 +2330,7 @@ mod tests {
 
     #[test]
     fn parse_request_round_trips_ops() {
+        // The pre-E12-10 wire shape (no `monitors`) MUST keep parsing.
         let arrive = parse_request(r#"{"op":"arrive","from":"peer:old","workstation":"peer:new"}"#)
             .expect("arrive parses");
         assert_eq!(
@@ -1360,6 +2338,28 @@ mod tests {
             RoamingRequest::Arrive {
                 from: "peer:old".into(),
                 workstation: "peer:new".into(),
+                monitors: None,
+            }
+        );
+        // And it re-serializes without the absent field — old wire shape stable.
+        assert_eq!(
+            serde_json::to_string(&arrive).expect("serialize"),
+            r#"{"op":"arrive","from":"peer:old","workstation":"peer:new"}"#
+        );
+        // The E12-10 shape carries the arriving monitor inventory.
+        let placed_arrive = parse_request(
+            r#"{"op":"arrive","from":"peer:old","workstation":"peer:new","monitors":{"primary":"edid:DEL:U2720Q:1","others":["edid:LEN:P27:2"]}}"#,
+        )
+        .expect("arrive with monitors parses");
+        assert_eq!(
+            placed_arrive,
+            RoamingRequest::Arrive {
+                from: "peer:old".into(),
+                workstation: "peer:new".into(),
+                monitors: Some(WorkstationMonitors::new(
+                    "edid:DEL:U2720Q:1",
+                    ["edid:LEN:P27:2"]
+                )),
             }
         );
         let policy = parse_request(r#"{"op":"set_policy","vm_id":"u1","policy":"shutdown"}"#)
@@ -1373,6 +2373,54 @@ mod tests {
         );
         assert!(parse_request("nonsense").is_err());
         assert!(parse_request(r#"{"op":"teleport"}"#).is_err());
+    }
+
+    // ── fold (E12-10: layout follows the user; conflicted saves refused) ──
+
+    #[test]
+    fn fold_carries_the_layout_and_monitors_on_arrive() {
+        let mut fold = RoamingFold::default();
+        let layout = MonitorLayout::empty()
+            .with_monitor_sessions(vec![MonitorSession::new("edid:DEL:U2720Q:1", "s1")]);
+        fold.apply(RoamingRequest::SaveLayout {
+            client_peer: "peer:old".into(),
+            layout: layout.clone(),
+        });
+        fold.apply(RoamingRequest::Arrive {
+            from: "peer:old".into(),
+            workstation: "peer:new".into(),
+            monitors: Some(WorkstationMonitors::single("edid:DEL:U2720Q:1")),
+        });
+        assert_eq!(
+            fold.layouts.get("peer:new"),
+            Some(&layout),
+            "the layout follows the user to the arriving Workstation"
+        );
+        assert_eq!(
+            fold.layouts.get("peer:old"),
+            Some(&layout),
+            "the origin keeps its arrangement for a roam back"
+        );
+        assert_eq!(
+            fold.monitors.get("peer:new"),
+            Some(&WorkstationMonitors::single("edid:DEL:U2720Q:1"))
+        );
+    }
+
+    #[test]
+    fn fold_refuses_a_conflicted_save_layout() {
+        let mut fold = RoamingFold::default();
+        fold.apply(RoamingRequest::SaveLayout {
+            client_peer: "peer:c".into(),
+            layout: MonitorLayout::empty().with_monitor_sessions(vec![
+                MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
+                MonitorSession::new("edid:DEL:U2720Q:1", "s2"),
+            ]),
+        });
+        assert!(
+            fold.layouts.is_empty(),
+            "a conflicted layout is never folded (and thus never persisted)"
+        );
     }
 
     #[test]
@@ -1392,7 +2440,11 @@ mod tests {
     /// Seed a temp bus with `action/vdi/roaming` bodies and return its root.
     fn seed_bus(reqs: &[RoamingRequest]) -> PathBuf {
         use mde_bus::hooks::config::Priority;
-        let dir = std::env::temp_dir().join(format!("mde-sr-{}-{}", now_ms(), reqs.len()));
+        // A process-wide sequence keeps parallel tests seeded in the same
+        // millisecond from colliding on the temp dir.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("mde-sr-{}-{seq}-{}", now_ms(), reqs.len()));
         let persist = Persist::open(dir.clone()).expect("open bus");
         for r in reqs {
             persist
@@ -1423,6 +2475,7 @@ mod tests {
             RoamingRequest::Arrive {
                 from: "peer:old".into(),
                 workstation: "peer:new".into(),
+                monitors: None,
             },
             RoamingRequest::SaveLayout {
                 client_peer: "peer:new".into(),
@@ -1472,6 +2525,86 @@ mod tests {
         // The monitor layout was persisted through the companion seam.
         let saved = layout_rows.lock().expect("layout mutex");
         assert_eq!(saved.get("peer:new"), Some(&layout));
+        drop(saved);
+
+        let _ = std::fs::remove_dir_all(&bus);
+        let _ = std::fs::remove_dir_all(&wg);
+    }
+
+    #[tokio::test]
+    async fn worker_roams_two_monitor_sessions_and_the_layout_follows() {
+        // E12-10 end-to-end: two sessions (two DIFFERENT VMs) pinned to two
+        // monitors on peer:old. The user arrives at single-monitor peer:new —
+        // both sessions roam Active onto peer:new through the reused store
+        // (placement falls back deterministically, never drops a desktop), and
+        // the per-monitor layout follows the user through the layout seam.
+        let layout = MonitorLayout::empty().with_monitor_sessions(vec![
+            MonitorSession::new("edid:DEL:U2720Q:1", "s1"),
+            MonitorSession::new("edid:LEN:P27:2", "s2"),
+        ]);
+        let bus = seed_bus(&[
+            RoamingRequest::SaveLayout {
+                client_peer: "peer:old".into(),
+                layout: layout.clone(),
+            },
+            RoamingRequest::Arrive {
+                from: "peer:old".into(),
+                workstation: "peer:new".into(),
+                monitors: Some(WorkstationMonitors::single("edid:DEL:U2720Q:1")),
+            },
+        ]);
+        let wg = std::env::temp_dir().join(format!("mde-sr-wg2-{}", now_ms()));
+        std::fs::create_dir_all(&wg).expect("mk workgroup");
+
+        let store = FakeStore::default();
+        store
+            .publish(&sess(
+                "s1",
+                "peer:old",
+                "peer:h1",
+                SessionState::Disconnected,
+            ))
+            .unwrap();
+        store
+            .publish(&sess(
+                "s2",
+                "peer:old",
+                "peer:h2",
+                SessionState::Disconnected,
+            ))
+            .unwrap();
+        let rows = store.rows.clone();
+        let layouts = FakeLayoutStore::default();
+        let layout_rows = layouts.rows.clone();
+
+        let w = SessionRoamingWorker::new(wg.clone(), "peer:a".to_string())
+            .with_store(Box::new(store))
+            .with_layout_store(Box::new(layouts))
+            .with_live_nodes(Box::new(FakeLiveNodes(live_set(&["h1", "h2"]))))
+            .with_bus_root(bus.clone());
+
+        let mut cursor = None;
+        let mut fold = RoamingFold::default();
+        drain(&bus, &mut cursor, &mut fold);
+        w.converge(&fold);
+
+        let published = rows.lock().expect("rows mutex");
+        assert_eq!(published.len(), 2, "both per-monitor sessions roamed");
+        for id in ["s1", "s2"] {
+            assert_eq!(published[id].client_peer, "peer:new", "desktop followed");
+            assert_eq!(published[id].state, SessionState::Active, "reconnected");
+        }
+        assert_ne!(
+            published["s1"].vm_id, published["s2"].vm_id,
+            "two monitors, two different VMs"
+        );
+        drop(published);
+        let saved = layout_rows.lock().expect("layout mutex");
+        assert_eq!(
+            saved.get("peer:new"),
+            Some(&layout),
+            "the per-monitor layout followed the user to the arriving peer"
+        );
         drop(saved);
 
         let _ = std::fs::remove_dir_all(&bus);
