@@ -26,6 +26,7 @@ mod notifications;
 mod provisioning;
 mod services_flow;
 mod session;
+mod system;
 mod thisnode;
 mod vdi;
 mod workbench;
@@ -127,6 +128,11 @@ struct Shell {
     /// The Clipboard surface — tails `event/clipboard/clip` and shows recent mesh
     /// clipboard entries captured by the clipboard_sync worker, newest first.
     clipboard: clipboard::ClipboardState,
+    /// The System surface — this seat's host controls, folded from the ONE
+    /// `mde-seat` `Seat` (lock 1): mixer / Bluetooth / displays / power & battery /
+    /// backlight / hotkeys. Its cached snapshot also feeds the three read-only
+    /// chrome status icons (E12-15). Absent backends render honestly (§7).
+    system: system::SystemState,
 }
 
 impl Shell {
@@ -159,6 +165,7 @@ impl Shell {
             instances: instances::InstancesState::default(),
             notifications: notifications::NotificationsState::default(),
             clipboard: clipboard::ClipboardState::default(),
+            system: system::SystemState::default(),
         }
     }
 
@@ -273,6 +280,17 @@ impl Shell {
                     clipboard.show(ui);
                 });
             }
+            Surface::System => {
+                // This seat's host controls, folded from the one `mde-seat` Seat
+                // (E12-15). Scoped under its own `push_id` like every mounted
+                // surface so its egui ids can't collide in the shell's one
+                // `Context`. The snapshot is refreshed in `render` (it also feeds
+                // the chrome icons), so the panel only renders here.
+                let system = &self.system;
+                ui.push_id("shell-system", |ui| {
+                    system.show(ui);
+                });
+            }
         }
     }
 }
@@ -326,11 +344,22 @@ impl Shell {
             self.clipboard.poll(ctx);
         }
 
+        // The seat snapshot feeds BOTH the System surface and the always-visible
+        // chrome status icons, so poll it every frame (self-gating on the shared
+        // cadence) — the chrome's Bluetooth/Volume icons stay live even while the
+        // System surface isn't the one in view.
+        self.system.poll(ctx);
+
         // The thin persistent chrome bar (48px = SP_XL + SP_M).
         egui::TopBottomPanel::top("mcnf-chrome")
             .exact_height(Style::SP_XL + Style::SP_M)
             .show(ctx, |ui| {
-                if chrome::show(ui, &mut self.chrome, self.nav.expanded) {
+                if chrome::show(
+                    ui,
+                    &mut self.chrome,
+                    self.system.snapshot(),
+                    self.nav.expanded,
+                ) {
                     self.nav.toggle_expand();
                 }
             });

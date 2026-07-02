@@ -26,6 +26,8 @@ use mde_egui::Style;
 
 use mde_cosmic_applet::{lighthouse_health_from_snapshot, LighthouseHealth};
 
+use mde_seat::{Probe, SeatSnapshot};
+
 /// The world-readable mesh-status snapshot the root timer writes. The shell reads
 /// peers + lighthouse health from it exactly like the panel client — the desktop
 /// user can't read the root-only replicated peer directory, so this JSON is the
@@ -193,6 +195,134 @@ fn status_view(s: &MeshSummary) -> SlotView {
     }
 }
 
+// ───────────────────── read-only seat status icons (E12-15) ─────────────────
+//
+// Lock 3: the chrome bar carries read-only iconic status only — Signal · Bluetooth
+// · Volume — and no controls; ALL host-control interaction lives on
+// `Surface::System`. These fold the SAME `mde-seat` snapshot the System surface
+// renders (the shell polls one `Seat`), so the icon and the panel can't diverge.
+// Each is the familiar dot+name+value slot, so the read-only status reads exactly
+// like the mesh slots beside it.
+
+/// The Signal slot: mesh reachability, reused from the chrome's own mesh summary
+/// (the presence source lock 3 points the Signal icon at) — online when any peer
+/// is reachable, an honest "isolated" when the directory is populated but nobody
+/// answers, "no peers" when it's empty, and "Connecting…" before the first read.
+fn signal_view(s: &MeshSummary) -> SlotView {
+    if !s.seen {
+        return SlotView::connecting();
+    }
+    if s.peers_total == 0 {
+        return SlotView {
+            dot: Style::TEXT_DIM,
+            value: "no peers".to_string(),
+            value_color: Style::TEXT_DIM,
+            tooltip: Some("Signal — no peers in the mesh directory yet.".to_string()),
+        };
+    }
+    if s.peers_online == 0 {
+        return SlotView {
+            dot: Style::WARN,
+            value: "isolated".to_string(),
+            value_color: Style::WARN,
+            tooltip: Some("Signal — the directory is populated but no peer is online.".to_string()),
+        };
+    }
+    SlotView {
+        dot: Style::OK,
+        value: "online".to_string(),
+        value_color: Style::TEXT,
+        tooltip: Some(format!(
+            "Signal — {}/{} peers reachable on the mesh.",
+            s.peers_online, s.peers_total
+        )),
+    }
+}
+
+/// The Bluetooth slot: adapter power + connected-device count from the seat
+/// snapshot. `Absent` (no `BlueZ` / no bus — the build-host case) reads as a dim
+/// "off" carrying the honest reason; never a fabricated radio state (§7).
+fn bluetooth_view(seat: Option<&SeatSnapshot>) -> SlotView {
+    match seat.map(|s| &s.bluetooth) {
+        None => seat_reading("Bluetooth"),
+        Some(Probe::Absent { reason, .. }) => seat_unavailable(reason),
+        Some(Probe::Present(bt)) => {
+            if bt.any_adapter_powered() {
+                let connected = bt.connected_devices();
+                let value = if connected > 0 {
+                    format!("on \u{00B7} {connected}")
+                } else {
+                    "on".to_string()
+                };
+                SlotView {
+                    dot: Style::OK,
+                    value,
+                    value_color: Style::TEXT,
+                    tooltip: Some(format!(
+                        "Bluetooth on — {connected} device(s) connected of {} known.",
+                        bt.devices.len()
+                    )),
+                }
+            } else {
+                SlotView {
+                    dot: Style::TEXT_DIM,
+                    value: "off".to_string(),
+                    value_color: Style::TEXT_DIM,
+                    tooltip: Some("Bluetooth adapter powered off.".to_string()),
+                }
+            }
+        }
+    }
+}
+
+/// The Volume slot: master mute / level from the seat snapshot's mixer. `Absent`
+/// (the `PipeWire` binding lands in E12-16, so this is the build-host state today)
+/// reads as a dim "unavailable" carrying the honest reason; never a fake level.
+fn volume_view(seat: Option<&SeatSnapshot>) -> SlotView {
+    match seat.map(|s| &s.mixer) {
+        None => seat_reading("Volume"),
+        Some(Probe::Absent { reason, .. }) => seat_unavailable(reason),
+        Some(Probe::Present(m)) => {
+            if m.master.muted {
+                SlotView {
+                    dot: Style::WARN,
+                    value: "muted".to_string(),
+                    value_color: Style::WARN,
+                    tooltip: Some("Master output muted.".to_string()),
+                }
+            } else {
+                SlotView {
+                    dot: Style::OK,
+                    value: format!("{}%", m.master.volume),
+                    value_color: Style::TEXT,
+                    tooltip: Some(format!("Master output at {}%.", m.master.volume)),
+                }
+            }
+        }
+    }
+}
+
+/// The pre-first-snapshot seat state, shared by the Bluetooth + Volume icons.
+fn seat_reading(what: &str) -> SlotView {
+    SlotView {
+        dot: Style::TEXT_DIM,
+        value: "\u{2014}".to_string(),
+        value_color: Style::TEXT_DIM,
+        tooltip: Some(format!("Reading {what} status from the seat…")),
+    }
+}
+
+/// A seat backend that is honestly absent on this host — a dim "unavailable"
+/// carrying the typed reason (§7 / interlock 4), never a fabricated state.
+fn seat_unavailable(reason: &str) -> SlotView {
+    SlotView {
+        dot: Style::TEXT_DIM,
+        value: "unavailable".to_string(),
+        value_color: Style::TEXT_DIM,
+        tooltip: Some(reason.to_string()),
+    }
+}
+
 /// The Sessions slot: honest "No session" until `mde-vdi` connects a live VM
 /// desktop (a later unit) and drives this slot. Never a fabricated count (§7) —
 /// the same truth the collapsed session empty state shows.
@@ -252,13 +382,24 @@ impl ChromeState {
 /// summary (self-gating on the shared cadence), draws the brand mark + the three
 /// live slots, and returns `true` when the Expand/Collapse toggle was clicked this
 /// frame.
-pub(crate) fn show(ui: &mut egui::Ui, chrome: &mut ChromeState, expanded: bool) -> bool {
+pub(crate) fn show(
+    ui: &mut egui::Ui,
+    chrome: &mut ChromeState,
+    seat: Option<&SeatSnapshot>,
+    expanded: bool,
+) -> bool {
     chrome.poll(ui.ctx());
 
+    // The mesh slots, then the read-only seat status icons (lock 3: Signal ·
+    // Bluetooth · Volume) folded from the same seat snapshot the System surface
+    // renders.
     let slots = [
         ("Peers", peers_view(&chrome.summary)),
         ("Sessions", session_view()),
         ("Status", status_view(&chrome.summary)),
+        ("Signal", signal_view(&chrome.summary)),
+        ("BT", bluetooth_view(seat)),
+        ("Vol", volume_view(seat)),
     ];
 
     let mut toggled = false;
@@ -426,5 +567,113 @@ mod tests {
         assert_eq!(c.snapshot_path, PathBuf::from(SNAPSHOT_PATH));
         assert!(!c.summary.seen);
         assert!(c.last_poll.is_none());
+    }
+
+    // ── the read-only seat status icons (E12-15, lock 3) ─────────────────────
+
+    use mde_seat::{Backend, BtAdapter, BtDevice, BtStatus, MixerStatus};
+
+    /// A typed-absent probe of any section (the honest build-host state).
+    fn absent<T>() -> Probe<T> {
+        Probe::Absent {
+            backend: Backend::PipeWire,
+            reason: "PipeWire is not available: test".to_string(),
+        }
+    }
+
+    /// A snapshot with a chosen Bluetooth, every other section Absent. The mixer is
+    /// always Absent here: its `MixerStatus` can't be constructed off the shell
+    /// crate (the `StripOrigin` field type isn't re-exported), and Absent is the
+    /// real build-host mixer state until E12-16 anyway — mde-seat's own tests cover
+    /// a Present mixer fold.
+    fn seat_snapshot(bluetooth: Probe<BtStatus>) -> SeatSnapshot {
+        let mixer: Probe<MixerStatus> = absent();
+        SeatSnapshot {
+            bluetooth,
+            batteries: absent(),
+            power: absent(),
+            displays: absent(),
+            backlights: absent(),
+            mixer,
+            ddc: absent(),
+        }
+    }
+
+    #[test]
+    fn seat_icons_read_unavailable_when_the_backend_is_absent() {
+        // The build-host reality: no PipeWire mixer, no BlueZ — the icons must read
+        // an honest dim "unavailable", never a fabricated on/level (§7).
+        let snap = seat_snapshot(absent());
+        let bt = bluetooth_view(Some(&snap));
+        assert_eq!(bt.value, "unavailable");
+        assert_eq!(bt.dot, Style::TEXT_DIM);
+        assert!(bt.tooltip.is_some_and(|t| t.contains("not available")));
+        let vol = volume_view(Some(&snap));
+        assert_eq!(vol.value, "unavailable");
+        assert_eq!(vol.dot, Style::TEXT_DIM);
+    }
+
+    #[test]
+    fn seat_icons_are_a_dim_dash_before_the_first_snapshot() {
+        // No snapshot yet (pre-poll) is distinct from Absent — a dim placeholder,
+        // never blank.
+        assert_eq!(bluetooth_view(None).value, "\u{2014}");
+        assert_eq!(volume_view(None).value, "\u{2014}");
+    }
+
+    #[test]
+    fn bluetooth_icon_folds_powered_adapter_and_connected_count() {
+        let bt = BtStatus {
+            adapters: vec![BtAdapter {
+                path: "/org/bluez/hci0".into(),
+                name: "hci0".into(),
+                powered: true,
+                discovering: false,
+            }],
+            devices: vec![BtDevice {
+                path: "/org/bluez/hci0/dev_x".into(),
+                alias: "MX Keys".into(),
+                paired: true,
+                connected: true,
+                trusted: true,
+                battery_percent: Some(80),
+                icon: None,
+            }],
+        };
+        let v = bluetooth_view(Some(&seat_snapshot(Probe::Present(bt))));
+        assert_eq!(v.value, "on \u{00B7} 1");
+        assert_eq!(v.dot, Style::OK);
+
+        // A powered-off adapter with nothing connected reads a dim "off".
+        let bare = BtStatus {
+            adapters: vec![BtAdapter {
+                path: "/org/bluez/hci0".into(),
+                name: "hci0".into(),
+                powered: false,
+                discovering: false,
+            }],
+            devices: Vec::new(),
+        };
+        let off = bluetooth_view(Some(&seat_snapshot(Probe::Present(bare))));
+        assert_eq!(off.value, "off");
+        assert_eq!(off.dot, Style::TEXT_DIM);
+    }
+
+    #[test]
+    fn signal_icon_folds_mesh_reachability_from_the_summary() {
+        // Any peer online → green "online".
+        let up = MeshSummary::from_snapshot(&snapshot("online", "online", "offline"));
+        let v = signal_view(&up);
+        assert_eq!(v.value, "online");
+        assert_eq!(v.dot, Style::OK);
+
+        // A populated directory with nobody online → amber "isolated".
+        let down = MeshSummary::from_snapshot(&snapshot("offline", "offline", "offline"));
+        let v = signal_view(&down);
+        assert_eq!(v.value, "isolated");
+        assert_eq!(v.dot, Style::WARN);
+
+        // Before the first snapshot → the shared connecting state.
+        assert_eq!(signal_view(&MeshSummary::default()).value, "Connecting…");
     }
 }

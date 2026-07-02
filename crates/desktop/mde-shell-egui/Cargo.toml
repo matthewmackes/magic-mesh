@@ -78,5 +78,13 @@ mde-kvm = { path = "../../services/mde-kvm" }
 # the standalone notify center. Services tier; the edge points inward (§6).
 mde-notify = { path = "../../services/mde-notify" }
 
+# E12-15 — the Surface::System seat panel + the three read-only chrome status
+# icons render from `mde-seat`, the ONE hardware-access library (lock 1). The
+# shell consumes its typed `Seat::snapshot()` directly, in-process; every section
+# is a `Probe` so an absent backend renders honestly (§7). Desktop-shell tier —
+# the edge points sideways-inward within the tier (§6), sharing the one `mde-egui`
+# toolkit resolution.
+mde-seat = { path = "../mde-seat" }
+
 [lints]
 workspace = true
