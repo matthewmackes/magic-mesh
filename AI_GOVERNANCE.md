@@ -138,7 +138,9 @@ auth, SIP digest) stand as recorded.
   **session-broker + vm-lifecycle + container** workers (the shell renders; mackesd
   brokers — §1/§9).
 - **Delivery:** **one immutable bootc/ostree image for every role** (egui-DRM shell +
-  cloud-hypervisor + ironrdp/virtio-gpu + `mackesd` + Podman + Nebula baked in; VM disks
+  cloud-hypervisor + ironrdp/virtio-gpu + `mackesd` + Podman + Nebula baked in, plus the
+  **seat services — PipeWire/WirePlumber · BlueZ · UPower** — per the host-controls locks,
+  `docs/design/quasar-host-controls.md` / E12-15..19; VM disks
   + mesh state on the writable partition). The **role is a config flag**, not a separate
   build — a Lighthouse runs the same image with the desktop units masked (Option 1),
   role-features migrating to managed Podman/VM workloads over time (Option 2). The
