@@ -82,7 +82,10 @@ fn egl_err(e: impl std::fmt::Display) -> DrmError {
 }
 
 /// A DRM primary node wrapped so it implements the `drm` device traits (KMS).
-struct Card(File);
+///
+/// Public because it appears in [`set_layout`]'s signature (`gbm::Device<Card>`);
+/// its inner fd is private, so it is only ever produced inside this module.
+pub struct Card(File);
 
 impl AsFd for Card {
     fn as_fd(&self) -> BorrowedFd<'_> {
@@ -112,18 +115,45 @@ fn open_primary_node() -> Result<(PathBuf, File), DrmError> {
     Err(DrmError::NoDrmMaster(last))
 }
 
-/// The resolved scanout target: the connector to drive, a CRTC for it, and the mode.
-struct Output {
-    connector: connector::Handle,
-    crtc: crtc::Handle,
-    mode: Mode,
+/// The resolved scanout target: the connector to drive, a CRTC for it, the mode,
+/// and — for the **multi-head** path (E12-18) — its top-left position in the
+/// virtual desktop. The single-head [`run_drm`] loop ignores `position` (it drives
+/// one output at the origin); [`resolve_outputs`] fills it left-to-right.
+///
+/// Public so the multi-CRTC drive ([`set_layout`], for E12-19's `host_state`
+/// worker + the per-monitor-VM demo) has a nameable resolved-head type; its fields
+/// carry `drm` crate handles the caller only round-trips back into `set_layout`.
+pub struct Output {
+    /// The connector (physical output) this head drives.
+    pub connector: connector::Handle,
+    /// The CRTC scanning this head out (distinct per head under [`resolve_outputs`]).
+    pub crtc: crtc::Handle,
+    /// The mode (resolution/refresh) set on this head.
+    pub mode: Mode,
+    /// Top-left of this output in the virtual desktop (px). `(0, 0)` for the
+    /// primary; abutting offsets for the rest under [`resolve_outputs`].
+    pub position: (i32, i32),
 }
 
-/// Resolve a connected output (connector + preferred mode + a compatible CRTC).
-fn resolve_output(card: &Card) -> Result<Output, DrmError> {
+/// Resolve **every** connected output — one distinct CRTC per connector — and lay
+/// them out left-to-right (E12-18's multi-CRTC enumeration; the atomic-modeset core
+/// [`set_layout`] drives them).
+///
+/// It walks all
+/// connectors, keeps the connected ones with a mode, and assigns each a CRTC that
+/// no earlier output already took (a shared CRTC can't scan out two heads). The
+/// first output sits at the origin; each subsequent output abuts the previous at
+/// its width — the v1 single-row relative arrangement (matches `mde-seat`'s
+/// `DisplayLayout::auto_arrange`). Headless-degrades exactly like the single path
+/// ([`DrmError::NoOutput`] when nothing is connected).
+fn resolve_outputs(card: &Card) -> Result<Vec<Output>, DrmError> {
     let res = card
         .resource_handles()
         .map_err(|e| DrmError::NoOutput(format!("resource_handles: {e}")))?;
+
+    let mut outputs: Vec<Output> = Vec::new();
+    let mut used_crtcs: Vec<crtc::Handle> = Vec::new();
+    let mut x = 0_i32;
 
     for &conn_handle in res.connectors() {
         let Ok(conn) = card.get_connector(conn_handle, false) else {
@@ -135,22 +165,97 @@ fn resolve_output(card: &Card) -> Result<Output, DrmError> {
         let Some(&mode) = conn.modes().first() else {
             continue;
         };
-        let crtc = conn
+        // Prefer this connector's current CRTC, else any compatible one, skipping
+        // CRTCs an earlier head already claimed so two outputs never collide.
+        let candidates = conn
             .current_encoder()
             .and_then(|enc| card.get_encoder(enc).ok())
-            .and_then(|enc| res.filter_crtcs(enc.possible_crtcs()).first().copied())
-            .or_else(|| res.crtcs().first().copied())
-            .ok_or_else(|| DrmError::NoOutput("no CRTC for the connected connector".into()))?;
-
-        return Ok(Output {
+            .map(|enc| res.filter_crtcs(enc.possible_crtcs()))
+            .unwrap_or_default();
+        let crtc = candidates
+            .iter()
+            .chain(res.crtcs())
+            .copied()
+            .find(|c| !used_crtcs.contains(c));
+        let Some(crtc) = crtc else {
+            // Out of CRTCs — more heads than the GPU can scan out. The ones we
+            // resolved still drive; the extra connector is left dark (honest).
+            continue;
+        };
+        used_crtcs.push(crtc);
+        let (w, _h) = mode.size();
+        outputs.push(Output {
             connector: conn_handle,
             crtc,
             mode,
+            position: (x, 0),
         });
+        x += i32::from(w);
     }
-    Err(DrmError::NoOutput(
-        "no connected connector with a mode".into(),
-    ))
+
+    if outputs.is_empty() {
+        return Err(DrmError::NoOutput(
+            "no connected connector with a mode".into(),
+        ));
+    }
+    Ok(outputs)
+}
+
+/// Drive a resolved multi-head layout: `set_crtc` each output onto its framebuffer
+/// at its mode, and blank any CRTC not in the layout (enable/disable + per-output
+/// mode set + relative arrangement — the atomic-modeset core, E12-18).
+///
+/// `fbs` supplies one framebuffer per `outputs` entry (same order); a caller with
+/// one shared framebuffer (mirrored heads) passes the same handle repeatedly, a
+/// caller scanning a different VM texture per head (the E12-10 demo) passes
+/// distinct ones. Every CRTC on the card that no output claims is disabled with
+/// `set_crtc(None)` so a de-arranged head goes properly dark.
+///
+/// This is the hardware-bound drive: the farm can only *compile* it (no DRM
+/// master), so it stays behind the `drm` feature and is exercised live only on a
+/// real seat (the hardware-gated multi-monitor demo). Kept `pub` so E12-19's
+/// `host_state` worker + the demo can call it without it reading as dead code.
+///
+/// # Errors
+/// [`DrmError::Present`] if a `set_crtc` fails, or if `fbs` is shorter than
+/// `outputs` (a caller contract the type can't express).
+pub fn set_layout(
+    gbm: &gbm::Device<Card>,
+    outputs: &[Output],
+    fbs: &[drm::control::framebuffer::Handle],
+) -> Result<(), DrmError> {
+    if fbs.len() < outputs.len() {
+        return Err(DrmError::Present(format!(
+            "set_layout: {} framebuffers for {} outputs",
+            fbs.len(),
+            outputs.len()
+        )));
+    }
+    let res = gbm
+        .resource_handles()
+        .map_err(|e| DrmError::Present(format!("resource_handles: {e}")))?;
+    let claimed: Vec<crtc::Handle> = outputs.iter().map(|o| o.crtc).collect();
+
+    for (out, &fb) in outputs.iter().zip(fbs) {
+        // A CRTC's scanout origin is the head's position in the virtual desktop,
+        // so a single shared framebuffer shows each head its own slice.
+        let (x, y) = out.position;
+        gbm.set_crtc(
+            out.crtc,
+            Some(fb),
+            (u32::try_from(x).unwrap_or(0), u32::try_from(y).unwrap_or(0)),
+            &[out.connector],
+            Some(out.mode),
+        )
+        .map_err(|e| DrmError::Present(format!("set_crtc({:?}): {e}", out.connector)))?;
+    }
+    // Disable every CRTC not in the layout — a de-arranged head goes dark cleanly.
+    for &c in res.crtcs() {
+        if !claimed.contains(&c) {
+            let _ = gbm.set_crtc(c, None, (0, 0), &[], None);
+        }
+    }
+    Ok(())
 }
 
 /// libinput device opener for a bare seat (root on a VT). The present loop pumps
@@ -374,8 +479,29 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     let _ = app_id;
     let (_node, file) = open_primary_node()?;
     let card = Card(file);
-    let output = resolve_output(&card)?;
-    let (w, h) = output.mode.size();
+    // Enumerate every connected head (E12-18 multi-CRTC). The primary drives the
+    // GBM/EGL surface + present loop; additional heads with the SAME mode size
+    // mirror it (clone mode) — a real second-monitor drive with legacy page-flip.
+    // Heterogeneous heads (different modes / a distinct VM texture per head — the
+    // two-monitors-two-VMs demo) are the hardware-gated drive E12-19 does with the
+    // same [`set_layout`] primitive over per-head framebuffers + atomic commits.
+    let resolved = resolve_outputs(&card)?;
+    let primary_size = resolved[0].mode.size();
+    let heads: Vec<Output> = {
+        let mut it = resolved.into_iter();
+        let mut v = vec![it.next().expect("resolve_outputs is non-empty on Ok")];
+        for o in it {
+            if o.mode.size() == primary_size {
+                // Mirror at the origin — same framebuffer, same viewport.
+                v.push(Output {
+                    position: (0, 0),
+                    ..o
+                });
+            }
+        }
+        v
+    };
+    let (w, h) = heads[0].mode.size();
     let (wp, hp) = (u32::from(w), u32::from(h));
 
     // GBM device from the DRM fd (the `gbm::Device` also drives KMS via
@@ -624,24 +750,26 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
             .add_framebuffer(&bo, fb_depth, fb_bpp)
             .map_err(|e| DrmError::Present(format!("add_framebuffer: {e}")))?;
         if prev.is_none() {
-            gbm.set_crtc(
-                output.crtc,
-                Some(fb),
-                (0, 0),
-                &[output.connector],
-                Some(output.mode),
-            )
-            .map_err(|e| DrmError::Present(format!("set_crtc: {e}")))?;
+            // First frame: the atomic-modeset core lights every head onto this
+            // framebuffer (each at its viewport) and blanks any unclaimed CRTC.
+            // Single-head → one set_crtc at the origin, identical to before.
+            let fbs = vec![fb; heads.len()];
+            set_layout(&gbm, &heads, &fbs)?;
         } else {
-            gbm.page_flip(output.crtc, fb, drm::control::PageFlipFlags::EVENT, None)
-                .map_err(|e| DrmError::Present(format!("page_flip: {e}")))?;
-            'flip: loop {
+            // Flip every head to the new front buffer, then drain one PageFlip
+            // completion per head before recycling buffers (vblank sync).
+            for head in &heads {
+                gbm.page_flip(head.crtc, fb, drm::control::PageFlipFlags::EVENT, None)
+                    .map_err(|e| DrmError::Present(format!("page_flip: {e}")))?;
+            }
+            let mut pending = heads.len();
+            while pending > 0 {
                 let evs = gbm
                     .receive_events()
                     .map_err(|e| DrmError::Present(format!("receive_events: {e}")))?;
                 for ev in evs {
                     if matches!(ev, drm::control::Event::PageFlip(_)) {
-                        break 'flip;
+                        pending -= 1;
                     }
                 }
             }
