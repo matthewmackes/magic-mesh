@@ -725,6 +725,25 @@ cryptsetup = "*"
 parted = "*"
 qemu-img = "*"
 
+# SURFACE-1 (Microsoft Surface tablet/laptop enablement,
+# docs/design/surface-tablet-enablement.md locks 1 + 10) — the `surface-tools`
+# runtime bits that resolve from the BASE Fedora repos, so a plain
+# `dnf install magic-mesh` on ANY node (Surface or not) pulls them WITHOUT the
+# linux-surface channel enabled. Both are inert on non-Surface hardware, matching
+# the "one Workstation image, conditionally-relevant, inert off-Surface" doctrine
+# (lock 10). The Surface-specific packages that live ONLY in the linux-surface
+# repo (iptsd, surface-control) are WEAK deps below — a hard Require on them would
+# break a plain-Fedora install that lacks that channel; the bootc image bakes them
+# via the linux-surface layer (Containerfile).
+#   · fwupd    — the LVFS firmware client the SURFACE-5 firmware panel drives
+#                (UEFI / touch-controller / SAM updates). Universal — any node has
+#                updatable firmware — and in the base Fedora repos.
+#   · libwacom — the pen/tablet device DB (base Fedora). The Surface overlay is
+#                `libwacom-surface` from the linux-surface layer, but the base pkg
+#                is the safe universal hard Require here; inert without a digitizer.
+fwupd = "*"
+libwacom = "*"
+
 # EFF-42 — ansible-core is a WEAK dep (Recommends): only the Server-tier
 # ansible_pull/job_exec workers shell to it, and they degrade gracefully
 # (spawn failure → recoverable error + back-off) when it's absent. A
@@ -762,6 +781,20 @@ NetworkManager = "*"
 firewalld = "*"
 podman = "*"
 rsync = "*"
+# SURFACE-1 (surface-tablet-enablement.md locks 1 + 10) — the `surface-tools`
+# bits that live ONLY in the linux-surface repo (pkg.surfacelinux.com), NOT the
+# base Fedora channel; the bootc Workstation image bakes them via the
+# linux-surface layer (Containerfile). As RPM deps they're WEAK — exactly like
+# cosmic-disks above — so a node with the linux-surface repo enabled pulls them,
+# while their absence on a plain-Fedora install never blocks `magic-mesh`. Both
+# are inert on non-Surface hardware (iptsd's socket only activates on a real IPTS
+# digitizer; surface-control no-ops without a Surface Aggregator device):
+#   · iptsd           — the Intel Precise Touch & Stylus daemon (touch + pen) the
+#                       SURFACE-3 surface_enable worker activates.
+#   · surface-control — the surface-control CLI (SAM perf profile / DTX latch /
+#                       dGPU) that same worker drives via typed verbs.
+iptsd = "*"
+surface-control = "*"
 
 # EFF-42 — upgrade continuity: the pre-pivot package name was `mde-core`
 # (the E8-era RPM; see config/daemon.rs's template note). Obsolete it so

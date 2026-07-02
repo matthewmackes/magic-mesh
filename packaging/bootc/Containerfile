@@ -123,6 +123,63 @@ RUN set -eux; \
         qemu-img; \
     dnf clean all
 
+# SURFACE-1 (Microsoft Surface tablet/laptop enablement, docs/design/
+# surface-tablet-enablement.md locks 1 + 10) — the conditional **linux-surface**
+# layer. ONE Workstation image serves every node (lock 10, like the seat/storage
+# blocks above); this set is INERT on non-Surface hardware — iptsd only activates
+# on a real /dev/ipts digitizer, the Surface kernel modules only bind Surface
+# Aggregator (SAM) hardware, surface-control no-ops without a SAM device — so
+# baking it universally makes a Surface boot tablet-ready with NO day-2 kernel
+# surgery (lock 1: enablement rides the image; update = image swap) while costing
+# an idle non-Surface box nothing. Source = the canonical linux-surface project
+# (github.com/linux-surface); its Fedora channel is pkg.surfacelinux.com, packages
+# signed by the project key (surface.asc on the linux-surface GitHub repo).
+#   · kernel-surface     — the patched kernel + Surface modules (IPTS touch/pen,
+#                          SAM battery/thermal/perf, Type Cover, sensors/accel,
+#                          WiFi/BT quirks, S0ix suspend). A mainline superset — its
+#                          extra modules stay dormant on non-Surface silicon.
+#   · iptsd              — the Intel Precise Touch & Stylus userspace daemon; a
+#                          systemd socket that self-activates ONLY on a real IPTS
+#                          digitizer, so it idles on non-Surface hardware.
+#   · libwacom-surface   — the Surface pen/tablet device-DB overlay for libwacom.
+#   · surface-control    — the surface-control CLI (SAM perf profile / DTX latch /
+#                          dGPU) the SURFACE-3 surface_enable worker drives.
+#   · surface-secureboot — stages the linux-surface MOK signing cert for the
+#                          SURFACE-3 guided `mokutil --import` Secure-Boot flow
+#                          (the modules are signed by this key).
+#   · fwupd              — the LVFS firmware client the SURFACE-5 firmware panel
+#                          drives (UEFI / touch-controller / SAM); a standard
+#                          Fedora package, universal on every role.
+# The repo pins skip_if_unavailable so a transient mirror outage degrades to "no
+# surface packages" rather than failing the whole image build; gpgcheck stays ON
+# (packages are project-signed; repo_gpgcheck off matches upstream's repodata).
+# $releasever expands to the bootc base's Fedora release, so an F43 rebase tracks
+# the matching linux-surface channel. --allowerasing lets kernel-surface REPLACE
+# the base kernel (the intended single-kernel bootc image; the surface kernel is
+# the mainline superset described above). Network egress to pkg.surfacelinux.com +
+# raw.githubusercontent.com is needed here (gated like the cloud-hypervisor fetch
+# below); airgapped builders point at a LAN mirror.
+RUN set -eux; \
+    rpm --import https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc || { \
+        echo "GATED[SURFACE-1/key]: cannot fetch the linux-surface signing key"; \
+        echo "  the builder needs egress to raw.githubusercontent.com here (or a LAN mirror)"; \
+        exit 1; }; \
+    printf '%s\n' \
+        '[linux-surface]' \
+        'name=linux-surface' \
+        'baseurl=https://pkg.surfacelinux.com/fedora/f$releasever/' \
+        'enabled=1' \
+        'gpgcheck=1' \
+        'repo_gpgcheck=0' \
+        'skip_if_unavailable=1' \
+        'gpgkey=https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc' \
+        > /etc/yum.repos.d/linux-surface.repo; \
+    dnf -y --allowerasing install \
+        kernel-surface iptsd libwacom-surface \
+        surface-control surface-secureboot \
+        fwupd; \
+    dnf clean all
+
 # The other half of the VDI substrate: **cloud-hypervisor, baked in** (§5 /
 # E12-13). Fedora 42 does not package it, so pin the upstream static-musl
 # release binary and verify its sha256 — the pin makes every rebuild
