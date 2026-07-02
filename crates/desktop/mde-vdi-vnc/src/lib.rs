@@ -32,8 +32,16 @@
 //!   decoders and the `FramebufferUpdate` parser.
 //! * [`input`] — the [`egui::Event`] → [`VncInputEvent`] mapping (X11 keysyms +
 //!   the pointer button model).
-//! * [`wire`] — the [`RfbClientMessage`] (`PointerEvent` / `KeyEvent`) byte encoder.
+//! * [`wire`] — the [`RfbClientMessage`] (`PointerEvent` / `KeyEvent`) and
+//!   [`RfbControlMessage`] (`SetPixelFormat` / `SetEncodings`) byte encoders.
 //! * [`session`] — [`VncSession`] tying decode + input together.
+//! * The **adaptive codec (E12-10)**: [`link`] holds the protocol-neutral
+//!   link-quality estimator + the hysteresis [`QualityTier`] ladder (a weak
+//!   link degrades fast, a recovered one upgrades slowly), and [`tier`] maps
+//!   each tier onto the RFB knobs this client really has — pixel depth
+//!   (32-bpp → RGB565 → BGR233), update-request pacing, and the encoding
+//!   preference. RFB is client-steered at runtime, so tier changes apply
+//!   **live** ([`TierApplication::Live`]) through the session's control queue.
 //!
 //! The live RFB transport — the handshake (`ProtocolVersion` / security /
 //! `ServerInit`) plus the TCP read pump that fills the framebuffer and flushes
@@ -52,8 +60,10 @@ pub use mde_egui::egui;
 pub mod config;
 pub mod encoding;
 pub mod input;
+pub mod link;
 pub mod pixel;
 pub mod session;
+pub mod tier;
 pub mod wire;
 
 pub use config::{ConfigError, VncConfig};
@@ -65,6 +75,11 @@ pub use input::{
     keysym_for, keysym_for_char, map_button, map_event, map_text, Button, ModifierState,
     VncInputEvent,
 };
+pub use link::{
+    LadderConfig, LinkEstimate, LinkEstimator, LinkGrade, LinkThresholds, QualityLadder,
+    QualityMode, QualityTier, TierApplication, TierChange,
+};
 pub use pixel::{Framebuffer, FramebufferError, PixelFormat};
 pub use session::VncSession;
-pub use wire::RfbClientMessage;
+pub use tier::{VncTierSettings, PREFERRED_ENCODINGS};
+pub use wire::{RfbClientMessage, RfbControlMessage};

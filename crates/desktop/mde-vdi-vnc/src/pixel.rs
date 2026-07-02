@@ -108,6 +108,27 @@ impl PixelFormat {
         }
     }
 
+    /// The 8-bpp BGR233 true-colour format — the lightest layout the RFB
+    /// true-colour model expresses (blue in the top two bits, then three bits
+    /// each of green and red). One byte per wire pixel: a quarter of the
+    /// default traffic per rectangle, which is why the adaptive-codec ladder
+    /// ([`crate::tier`]) requests it on its low tiers.
+    #[must_use]
+    pub const fn bgr233() -> Self {
+        Self {
+            bits_per_pixel: 8,
+            depth: 8,
+            big_endian: false,
+            true_color: true,
+            red_max: 7,
+            green_max: 7,
+            blue_max: 3,
+            red_shift: 0,
+            green_shift: 3,
+            blue_shift: 6,
+        }
+    }
+
     /// Bytes in one wire pixel (`bits_per_pixel / 8`), 1 / 2 / 4.
     #[must_use]
     pub const fn bytes_per_pixel(self) -> usize {
@@ -408,9 +429,21 @@ mod tests {
     }
 
     #[test]
+    fn bgr233_scales_channels_to_8_bit() {
+        let f = PixelFormat::bgr233();
+        // Full red (3-bit max 7), green (3-bit), blue (2-bit max 3) -> 0xFF.
+        assert_eq!(f.decode(0x07), [0xFF, 0x00, 0x00, 0xFF]);
+        assert_eq!(f.decode(0x38), [0x00, 0xFF, 0x00, 0xFF]);
+        assert_eq!(f.decode(0xC0), [0x00, 0x00, 0xFF, 0xFF]);
+        // Mid red (4/7) scales to 146 = round(4*255/7).
+        assert_eq!(f.decode(0x04)[0], 146);
+    }
+
+    #[test]
     fn support_predicate_rejects_palette_and_odd_bpp() {
         assert!(PixelFormat::rgba8888().is_supported());
         assert!(PixelFormat::rgb565().is_supported());
+        assert!(PixelFormat::bgr233().is_supported());
         let palette = PixelFormat {
             true_color: false,
             ..PixelFormat::rgba8888()
