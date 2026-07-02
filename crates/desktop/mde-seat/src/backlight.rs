@@ -146,12 +146,12 @@ mod tests {
     }
 
     fn scratch() -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "mde-seat-bl-{}-{}",
-            std::process::id(),
-            // vary by a monotonic-ish nonce so parallel tests don't collide
-            line!()
-        ));
+        // A process-unique, monotonically increasing nonce: `line!()` here would
+        // expand to THIS line for every caller (colliding under parallel tests),
+        // so use an atomic counter instead.
+        static NONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("mde-seat-bl-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
