@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 ///   * `mesh_relay` — peer agrees to relay messages through the
 ///     mesh for phones paired only with another MDE peer.
 ///   * `peer_card_probe_share` — peer agrees to share its
-///     `PeerProbe` enrichment cache so [[project_v2_1_kdc2_native]]
+///     `PeerProbe` enrichment cache so `[[project_v2_1_kdc2_native]]`
 ///     two-MDE pairs avoid duplicate online enrichment lookups.
 ///   * `notification_dual_send_ack` — peer acks idempotent
 ///     dual-send so the sender can drop redundant copies once
@@ -129,8 +129,8 @@ pub struct Packet {
 impl Default for Packet {
     /// Default packet — empty body, kind == empty string. Useful
     /// for tests + builders that want `..Default::default()` to
-    /// fill in the optional fields (mde_caps / payload_size /
-    /// payload_transfer_info).
+    /// fill in the optional fields (`mde_caps` / `payload_size` /
+    /// `payload_transfer_info`).
     fn default() -> Self {
         Self {
             id: 0,
@@ -163,7 +163,7 @@ impl Packet {
     /// `mdeCaps` header is present). False when from a stock
     /// KDC client.
     #[must_use]
-    pub fn from_mde_peer(&self) -> bool {
+    pub const fn from_mde_peer(&self) -> bool {
         self.mde_caps.is_some()
     }
 }

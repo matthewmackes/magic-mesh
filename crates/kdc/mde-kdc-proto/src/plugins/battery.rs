@@ -34,11 +34,11 @@ impl BatteryBody {
     /// directly.
     #[must_use]
     pub fn charge_pct(&self) -> Option<u8> {
-        if (0..=100).contains(&self.current_charge) {
-            Some(self.current_charge as u8)
-        } else {
-            None
-        }
+        // Same acceptance window as `(0..=100).contains(...)`:
+        // `try_from` rejects negatives, the filter rejects > 100.
+        u8::try_from(self.current_charge)
+            .ok()
+            .filter(|&pct| pct <= 100)
     }
 }
 
@@ -50,7 +50,7 @@ impl BatteryBody {
     /// and renders nothing — the clean "not a battery" answer the
     /// KDC-PLUGINS epic calls for.
     #[must_use]
-    pub fn not_a_battery() -> Self {
+    pub const fn not_a_battery() -> Self {
         Self {
             current_charge: -1,
             is_charging: false,
@@ -80,6 +80,11 @@ impl BatteryBody {
 }
 
 /// Build a `kdeconnect.battery` packet.
+///
+/// # Panics
+///
+/// Panics if `BatteryBody` fails to serialize — impossible: every
+/// field is a plain JSON-representable type.
 #[must_use]
 pub fn battery_packet(id_ms: i64, body: BatteryBody) -> Packet {
     Packet {
@@ -94,8 +99,10 @@ pub fn battery_packet(id_ms: i64, body: BatteryBody) -> Packet {
 
 /// Build a `kdeconnect.battery.request` packet — the empty-bodied
 /// poll a peer sends to ask the other side for its current battery
-/// snapshot. Stock KDE Connect emits `{ "request": true }`; we
-/// match that so a phone re-polls our desktop on demand.
+/// snapshot.
+///
+/// Stock KDE Connect emits `{ "request": true }`; we match that so
+/// a phone re-polls our desktop on demand.
 #[must_use]
 pub fn battery_request_packet(id_ms: i64) -> Packet {
     Packet {
@@ -306,7 +313,7 @@ impl BatteryPlugin {
     /// New plugin defaulting the host snapshot to "not a battery"
     /// (a desktop / server — the common mesh-host case).
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             received: Vec::new(),
             local: BatteryBody::not_a_battery(),
@@ -323,7 +330,7 @@ impl BatteryPlugin {
 
     /// The host snapshot the plugin currently answers requests with.
     #[must_use]
-    pub fn local_battery(&self) -> &BatteryBody {
+    pub const fn local_battery(&self) -> &BatteryBody {
         &self.local
     }
 
@@ -335,7 +342,7 @@ impl BatteryPlugin {
 
     /// Items currently queued.
     #[must_use]
-    pub fn pending_count(&self) -> usize {
+    pub const fn pending_count(&self) -> usize {
         self.received.len()
     }
 }
@@ -358,7 +365,9 @@ impl crate::plugins::Plugin for BatteryPlugin {
             // A peer is polling us — answer with this host's snapshot.
             let id_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis() as i64);
+                .ok()
+                .and_then(|d| i64::try_from(d.as_millis()).ok())
+                .unwrap_or(0);
             return vec![battery_packet(id_ms, self.local.clone())];
         }
         if let Ok(body) = crate::plugins::from_packet_body::<BatteryBody>(packet) {

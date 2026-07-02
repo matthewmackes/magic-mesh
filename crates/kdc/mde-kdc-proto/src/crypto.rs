@@ -8,7 +8,7 @@
 //! (`ring` vs. `rust-crypto`; the v2.1 KDC2 lock keeps that open
 //! until KDC2-2.4 explicitly surveys it).
 //!
-//! ## KeyStore is the seam for future post-quantum
+//! ## `KeyStore` is the seam for future post-quantum
 //!
 //! v2.1 explicitly omits post-quantum crypto per the KDC2 lock,
 //! but the `KeyStore` trait below is where a future PQ adapter
@@ -65,11 +65,11 @@ pub enum CryptoError {
 impl fmt::Display for CryptoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CryptoError::SignatureInvalid => write!(f, "signature_invalid"),
-            CryptoError::UnknownKey(k) => write!(f, "unknown_key({k})"),
-            CryptoError::AeadAuthFailed => write!(f, "aead_auth_failed"),
-            CryptoError::WrongAlgorithm => write!(f, "wrong_algorithm"),
-            CryptoError::Io { code } => write!(f, "io({code})"),
+            Self::SignatureInvalid => write!(f, "signature_invalid"),
+            Self::UnknownKey(k) => write!(f, "unknown_key({k})"),
+            Self::AeadAuthFailed => write!(f, "aead_auth_failed"),
+            Self::WrongAlgorithm => write!(f, "wrong_algorithm"),
+            Self::Io { code } => write!(f, "io({code})"),
         }
     }
 }
@@ -122,9 +122,10 @@ impl Drop for StoredKey {
 }
 
 /// In-memory [`KeyStore`] impl backed by ring 0.17's `SystemRandom`
-/// for handle-id generation. Holds session keys in a `Mutex<Vec<
-/// StoredKey>>` so it's `Sync` (the host integration crosses an
-/// async task boundary).
+/// for handle-id generation.
+///
+/// Holds session keys in a `Mutex<Vec<StoredKey>>` so it's `Sync`
+/// (the host integration crosses an async task boundary).
 ///
 /// Persistence is **deliberately not in this crate** — `mde-kdc`
 /// (KDC2-3) wraps a `RingKeyStore` with a file-backed
@@ -150,6 +151,11 @@ impl RingKeyStore {
 
     /// How many session keys are currently held. Exposed for
     /// instrumentation + tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior thread
+    /// panicked while holding it).
     #[must_use]
     pub fn key_count(&self) -> usize {
         self.keys.lock().expect("RingKeyStore mutex poisoned").len()
@@ -243,6 +249,8 @@ impl PairingKeyPair {
     /// host (KDC2-3) to load a previously-persisted key on
     /// daemon restart.
     ///
+    /// # Errors
+    ///
     /// Returns `Err(CryptoError::WrongAlgorithm)` if the bytes
     /// don't decode as a valid RSA private key.
     pub fn from_pkcs8(der: &[u8]) -> Result<Self, CryptoError> {
@@ -263,6 +271,8 @@ impl PairingKeyPair {
     /// Sign `message` with RSA-PKCS1-v1_5 over SHA-256. Matches
     /// upstream KDE Connect's signing algorithm for handshake
     /// challenges.
+    ///
+    /// # Errors
     ///
     /// Errors with `CryptoError::Io` if ring's signer fails (this
     /// is essentially impossible with a valid keypair — left as
@@ -310,6 +320,8 @@ impl Drop for PairingKeyPair {
 /// public key (in DER form). Used by the host integration when
 /// a paired peer sends a signed handshake challenge.
 ///
+/// # Errors
+///
 /// Returns `Ok(())` on valid signature, `Err(CryptoError::
 /// SignatureInvalid)` on tampered / wrong-key signatures.
 pub fn verify_signature(
@@ -356,6 +368,12 @@ pub const SESSION_NONCE_LEN: usize = NONCE_LEN;
 /// the same `(session_key, nonce)` pair across two seal calls
 /// breaks confidentiality + integrity. The host (KDC2-3) owns a
 /// monotonic per-session counter that feeds this helper.
+///
+/// # Errors
+///
+/// Returns `CryptoError::WrongAlgorithm` when `session_key` is not
+/// exactly [`SESSION_KEY_LEN`] bytes, or `CryptoError::Io` if
+/// ring's sealer fails.
 pub fn seal_session(
     session_key: &[u8],
     nonce: [u8; SESSION_NONCE_LEN],
@@ -379,12 +397,18 @@ pub fn seal_session(
 }
 
 /// Open `ciphertext` under `session_key` + `nonce` with
-/// AES-256-GCM AEAD. Returns the plaintext on successful
-/// authentication; `CryptoError::AeadAuthFailed` on tampered
-/// ciphertext / tag mismatch / wrong key / wrong nonce.
+/// AES-256-GCM AEAD.
+///
+/// Returns the plaintext on successful authentication.
 ///
 /// Same nonce-uniqueness contract as [`seal_session`]: the caller
 /// must hand the matching counter value the sender used.
+///
+/// # Errors
+///
+/// Returns `CryptoError::WrongAlgorithm` when `session_key` is not
+/// exactly [`SESSION_KEY_LEN`] bytes, or `CryptoError::AeadAuthFailed`
+/// on tampered ciphertext / tag mismatch / wrong key / wrong nonce.
 pub fn open_session(
     session_key: &[u8],
     nonce: [u8; SESSION_NONCE_LEN],
@@ -409,6 +433,8 @@ pub fn open_session(
 /// Generate a fresh AES-256-GCM session key (32 random bytes from
 /// ring's `SystemRandom`). Used at the end of the RSA pairing
 /// handshake to seed the session.
+///
+/// # Errors
 ///
 /// Returns `CryptoError::Io` only if ring's RNG fails — vanishingly
 /// rare on a working Linux box; defensive against syscall errors.

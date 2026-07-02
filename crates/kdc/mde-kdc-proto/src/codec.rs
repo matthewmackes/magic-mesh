@@ -18,6 +18,8 @@ use crate::wire::Packet;
 /// Encode a single packet to its KDC wire form (one line of JSON,
 /// terminated by `\n`).
 ///
+/// # Errors
+///
 /// Errors propagate from `serde_json` — a `Packet` that holds a
 /// `serde_json::Value` body which can't be serialized (numeric
 /// `NaN` / `Infinity`) returns the underlying error so the caller
@@ -36,18 +38,25 @@ pub fn encode_frame(packet: &Packet) -> Result<String, serde_json::Error> {
 /// first newline is ignored — the caller is responsible for
 /// re-feeding the remainder). Stream-aware buffering lives in
 /// [`FrameDecoder`].
+///
+/// # Errors
+///
+/// Returns the underlying `serde_json` error when the leading line
+/// is not a valid JSON `Packet`.
 pub fn decode_frame(raw: &[u8]) -> Result<Packet, serde_json::Error> {
     // Stop at the first newline; KDC wire is line-delimited.
     let line: &[u8] = raw.split(|&b| b == b'\n').next().unwrap_or(raw);
     serde_json::from_slice(line)
 }
 
-/// Hard cap on partial-frame buffer size. KDC frames are bounded
-/// by the largest plugin payload — KDC2-3.1's MTU survey will
-/// fine-tune; until then 1 MiB matches upstream KDE Connect's own
-/// `Q_LONG_LONG` framing cap. Any peer that sends a single frame
-/// larger than this is malicious or broken — the decoder drops
-/// the buffer and surfaces a [`DecodeError::FrameTooLarge`].
+/// Hard cap on partial-frame buffer size.
+///
+/// KDC frames are bounded by the largest plugin payload —
+/// KDC2-3.1's MTU survey will fine-tune; until then 1 MiB matches
+/// upstream KDE Connect's own `Q_LONG_LONG` framing cap. Any peer
+/// that sends a single frame larger than this is malicious or
+/// broken — the decoder drops the buffer and surfaces a
+/// [`DecodeError::FrameTooLarge`].
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Stream-aware frame decoder. Holds a partial-frame buffer
@@ -82,7 +91,7 @@ pub struct FrameDecoder {
 impl FrameDecoder {
     /// Empty decoder. No allocations until the first `feed()` call.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self { buf: Vec::new() }
     }
 
@@ -96,9 +105,12 @@ impl FrameDecoder {
     ///   * `Ok(Some(packet))` — a complete frame was decoded.
     ///   * `Ok(None)` — no newline yet in the buffer; caller
     ///     should `feed()` more bytes.
-    ///   * `Err(DecodeError)` — either a malformed frame or a
-    ///     bounded-buffer breach. The buffer is cleared on error
-    ///     so the next valid frame can be parsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(DecodeError)` on either a malformed frame or a
+    /// bounded-buffer breach. The buffer is cleared on error so the
+    /// next valid frame can be parsed.
     pub fn next_frame(&mut self) -> Result<Option<Packet>, DecodeError> {
         // Bounded-allocation guard: a peer that never sends a
         // newline can't trap us holding an unbounded buffer.
@@ -128,7 +140,7 @@ impl FrameDecoder {
     /// Total bytes currently held in the partial-frame buffer.
     /// Exposed for instrumentation + tests.
     #[must_use]
-    pub fn buffered_bytes(&self) -> usize {
+    pub const fn buffered_bytes(&self) -> usize {
         self.buf.len()
     }
 }
@@ -147,8 +159,8 @@ pub enum DecodeError {
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DecodeError::Json(e) => write!(f, "json: {e}"),
-            DecodeError::FrameTooLarge => write!(f, "frame_too_large"),
+            Self::Json(e) => write!(f, "json: {e}"),
+            Self::FrameTooLarge => write!(f, "frame_too_large"),
         }
     }
 }

@@ -42,7 +42,7 @@
 //!   the [`CapabilitiesHeader`] every handshake carries.
 //!
 //! Per the v2.1 KDC2 lock the v13.0 `mackes-kdc` crate's schema
-//! (re-exported as [[project_v13_kdeconnect]]) is **superseded**;
+//! (re-exported as `[[project_v13_kdeconnect]]`) is **superseded**;
 //! the new wire types in this crate are the single source of
 //! truth.
 

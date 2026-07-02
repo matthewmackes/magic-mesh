@@ -38,12 +38,13 @@ pub use telephony::{telephony_packet, TelephonyBody, TelephonyEvent, TelephonyPl
 use std::fmt;
 
 /// The canonical set of KDE Connect plugin types v2.1 KDC2 ships
-/// at wire-compat parity with upstream — plus `RunCommand`,
-/// which exists in upstream as an optional non-default plugin
-/// and ships deny-default in MDE's policy.toml per the v2.1
-/// security-review lock.
+/// at wire-compat parity with upstream.
 ///
-/// The serde token (snake_case via Display) matches the `Packet
+/// Also includes `RunCommand`, which exists in upstream as an
+/// optional non-default plugin and ships deny-default in MDE's
+/// `policy.toml` per the v2.1 security-review lock.
+///
+/// The serde token (`snake_case` via Display) matches the `Packet
 /// .kind` suffix (`kdeconnect.<token>`). Adding a new plugin
 /// means a new variant here + a `PluginRegistry::default()`
 /// update.
@@ -86,18 +87,18 @@ impl PluginKind {
     /// in a deterministic shape (some KDC clients are sensitive to
     /// list order during pairing).
     #[must_use]
-    pub const fn all() -> [PluginKind; 10] {
+    pub const fn all() -> [Self; 10] {
         [
-            PluginKind::Ping,
-            PluginKind::Clipboard,
-            PluginKind::Share,
-            PluginKind::Notification,
-            PluginKind::FindMyPhone,
-            PluginKind::Battery,
-            PluginKind::Mpris,
-            PluginKind::Sms,
-            PluginKind::Telephony,
-            PluginKind::RunCommand,
+            Self::Ping,
+            Self::Clipboard,
+            Self::Share,
+            Self::Notification,
+            Self::FindMyPhone,
+            Self::Battery,
+            Self::Mpris,
+            Self::Sms,
+            Self::Telephony,
+            Self::RunCommand,
         ]
     }
 
@@ -105,16 +106,16 @@ impl PluginKind {
     #[must_use]
     pub const fn token(self) -> &'static str {
         match self {
-            PluginKind::Ping => "ping",
-            PluginKind::Clipboard => "clipboard",
-            PluginKind::Share => "share.request",
-            PluginKind::Notification => "notification",
-            PluginKind::FindMyPhone => "findmyphone.request",
-            PluginKind::Battery => "battery",
-            PluginKind::Mpris => "mpris",
-            PluginKind::Sms => "sms.messages",
-            PluginKind::Telephony => "telephony",
-            PluginKind::RunCommand => "runcommand",
+            Self::Ping => "ping",
+            Self::Clipboard => "clipboard",
+            Self::Share => "share.request",
+            Self::Notification => "notification",
+            Self::FindMyPhone => "findmyphone.request",
+            Self::Battery => "battery",
+            Self::Mpris => "mpris",
+            Self::Sms => "sms.messages",
+            Self::Telephony => "telephony",
+            Self::RunCommand => "runcommand",
         }
     }
 

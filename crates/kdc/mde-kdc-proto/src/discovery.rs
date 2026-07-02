@@ -42,11 +42,12 @@ pub struct Announce {
     pub outgoing_capabilities: Vec<String>,
 }
 
-/// KDC's coarse device-type enumeration. Stays in lock-step with
-/// the legacy v13.0 `mackes-kdc::DeviceKind` for serde token
-/// compatibility (`phone`, `tablet`, `desktop`, `unknown`) — the
-/// v2.1 KDC2 lock keeps these tokens stable so paired phones
-/// don't re-classify on the v2.0 → v2.1 upgrade.
+/// KDC's coarse device-type enumeration.
+///
+/// Stays in lock-step with the legacy v13.0 `mackes-kdc::DeviceKind`
+/// for serde token compatibility (`phone`, `tablet`, `desktop`,
+/// `unknown`) — the v2.1 KDC2 lock keeps these tokens stable so
+/// paired phones don't re-classify on the v2.0 → v2.1 upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceType {
@@ -66,7 +67,7 @@ pub enum DeviceType {
 /// layer.
 ///
 /// KDC2-2.1 ships the data model + signature placeholder; the
-/// actual SyntheticAnnounce verification + drop-if-stale logic
+/// actual `SyntheticAnnounce` verification + drop-if-stale logic
 /// lands with the KDC2-4 mesh-shunt work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyntheticAnnounce {
@@ -89,16 +90,17 @@ impl SyntheticAnnounce {
     /// this default (90 s) matches upstream KDC's own broadcast
     /// cadence.
     #[must_use]
-    pub fn is_fresh(&self, now_ms: i64) -> bool {
+    pub const fn is_fresh(&self, now_ms: i64) -> bool {
         now_ms.saturating_sub(self.relayed_at_ms) <= STALE_WINDOW_MS
     }
 }
 
-/// Staleness window (ms). Announce records older than this are
-/// dropped from the registry on every `prune_stale` call.
-/// Matches upstream KDE Connect's broadcast cadence — phones
-/// re-announce every ~60 s, so a 90 s window covers the
-/// expected jitter without holding ghosts.
+/// Staleness window (ms).
+///
+/// Announce records older than this are dropped from the registry
+/// on every `prune_stale` call. Matches upstream KDE Connect's
+/// broadcast cadence — phones re-announce every ~60 s, so a 90 s
+/// window covers the expected jitter without holding ghosts.
 pub const STALE_WINDOW_MS: i64 = 90_000;
 
 // ──────────────────────────────────────────────────────────────────
@@ -126,9 +128,11 @@ pub const STALE_WINDOW_MS: i64 = 90_000;
 pub const KDC_UDP_PORT: u16 = 1716;
 
 /// Maximum bytes a receiver should accept from a single UDP
-/// datagram before discarding. 8 KiB is generous — real-world
-/// announces are < 1 KiB — and shields against a malicious
-/// peer broadcasting a giant identity body.
+/// datagram before discarding.
+///
+/// 8 KiB is generous — real-world announces are < 1 KiB — and
+/// shields against a malicious peer broadcasting a giant identity
+/// body.
 pub const MAX_BROADCAST_BYTES: usize = 8 * 1024;
 
 /// Errors the broadcast encoder/decoder may surface.
@@ -150,10 +154,10 @@ pub enum BroadcastError {
 impl std::fmt::Display for BroadcastError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BroadcastError::Encode(s) => write!(f, "encode: {s}"),
-            BroadcastError::Decode(s) => write!(f, "decode: {s}"),
-            BroadcastError::WrongPacketKind(s) => write!(f, "wrong_packet_kind: {s}"),
-            BroadcastError::TooLarge(n) => write!(f, "too_large: {n} bytes"),
+            Self::Encode(s) => write!(f, "encode: {s}"),
+            Self::Decode(s) => write!(f, "decode: {s}"),
+            Self::WrongPacketKind(s) => write!(f, "wrong_packet_kind: {s}"),
+            Self::TooLarge(n) => write!(f, "too_large: {n} bytes"),
         }
     }
 }
@@ -165,6 +169,12 @@ impl std::error::Error for BroadcastError {}
 ///
 /// `ts_ms` populates the packet `id` — receivers use it as a
 /// dedupe key.
+///
+/// # Errors
+///
+/// Returns `BroadcastError::Encode` when serde fails to serialize
+/// the announce body or packet — cannot happen for valid
+/// `Announce` data; kept for forward compatibility.
 pub fn encode_announce_datagram(
     announce: &Announce,
     ts_ms: i64,
@@ -186,6 +196,13 @@ pub fn encode_announce_datagram(
 /// Decode a UDP/1716 broadcast datagram into an `Announce`.
 /// Tolerates trailing newline / whitespace and rejects packets
 /// whose `type` isn't `kdeconnect.identity`.
+///
+/// # Errors
+///
+/// Returns `BroadcastError::TooLarge` for datagrams over
+/// [`MAX_BROADCAST_BYTES`], `BroadcastError::Decode` for malformed
+/// JSON, and `BroadcastError::WrongPacketKind` for non-identity
+/// packets.
 pub fn decode_announce_datagram(bytes: &[u8]) -> Result<Announce, BroadcastError> {
     if bytes.len() > MAX_BROADCAST_BYTES {
         return Err(BroadcastError::TooLarge(bytes.len()));
@@ -229,9 +246,10 @@ fn trim_trailing_whitespace(bytes: &[u8]) -> &[u8] {
 pub const KDC_MDNS_SERVICE_TYPE: &str = "_kdeconnect._udp.local.";
 
 /// Encode an `Announce` as the TXT-record key/value pairs to
-/// publish under the `_kdeconnect._udp` mDNS service. Stable key
-/// names match upstream's choices so phones browsing for the
-/// service decode our records cleanly.
+/// publish under the `_kdeconnect._udp` mDNS service.
+///
+/// Stable key names match upstream's choices so phones browsing
+/// for the service decode our records cleanly.
 ///
 /// Capability lists are comma-joined — upstream uses the same
 /// shape so it round-trips against stock-client receivers.
@@ -263,9 +281,15 @@ pub fn encode_mdns_txt_records(announce: &Announce) -> Vec<(String, String)> {
 }
 
 /// Decode a TXT-record map (typically what mdns-sd yields from a
-/// `ServiceResolved` event) into an `Announce`. Unknown keys are
-/// ignored — upstream may add forward-compat fields, and the
-/// receiver shouldn't reject a peer for them.
+/// `ServiceResolved` event) into an `Announce`.
+///
+/// Unknown keys are ignored — upstream may add forward-compat
+/// fields, and the receiver shouldn't reject a peer for them.
+///
+/// # Errors
+///
+/// Returns `BroadcastError::Decode` when the required `id` / `name`
+/// keys are missing or the `protocol` value isn't a number.
 pub fn decode_mdns_txt_records<'a, I>(records: I) -> Result<Announce, BroadcastError>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -322,7 +346,7 @@ fn split_capabilities(raw: &str) -> Vec<String> {
     }
     raw.split(',')
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+        .map(ToString::to_string)
         .collect()
 }
 
@@ -333,8 +357,8 @@ fn split_capabilities(raw: &str) -> Vec<String> {
 /// announces via [`DiscoveryRegistry::inject_real`]; the mesh-
 /// shunt worker (KDC2-4.3) feeds synthetic announces (relayed
 /// from neighbors' `phones.json`) via [`inject_synthetic`].
-/// Downstream consumers (`KdcHost::open` for outbound pairing
-/// + the egui Workbench's peer list) drain via
+/// Downstream consumers (`KdcHost::open` for outbound
+/// pairing + the egui Workbench's peer list) drain via
 /// [`take_fresh`] on each tick.
 ///
 /// Receivers can't distinguish real from synthetic — both
@@ -343,8 +367,8 @@ fn split_capabilities(raw: &str) -> Vec<String> {
 /// way.
 #[derive(Debug, Default)]
 pub struct DiscoveryRegistry {
-    /// (relayer_id, relayed_at_ms, announce) — relayer_id is
-    /// `"self"` for real broadcasts; mesh-shunt records carry
+    /// (`relayer_id`, `relayed_at_ms`, `announce`) — `relayer_id`
+    /// is `"self"` for real broadcasts; mesh-shunt records carry
     /// the actual neighbor peer-id. Tuple instead of struct so
     /// the Vec stays cheap to drain.
     entries: Vec<RegistryEntry>,
@@ -366,7 +390,7 @@ struct RegistryEntry {
 impl DiscoveryRegistry {
     /// Empty registry.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             entries: Vec::new(),
         }
@@ -375,13 +399,13 @@ impl DiscoveryRegistry {
     /// How many announce records the registry is currently
     /// holding (including stale ones until the next prune).
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// True when no announces are queued.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
