@@ -28,16 +28,24 @@
 //!     (crdt.rs).
 //!   * [`FaviconStore`] — the **content-addressed, deduped** favicon blob store
 //!     (lock Q6), a grow-only conflict-free map (favicon.rs).
+//!   * [`import_file`] / [`plan_import`] — the **browser importers** (BOOKMARKS-3):
+//!     Firefox `places.sqlite` (bookmarks only, read-only + immutable), Chromium
+//!     `Bookmarks` JSON, and universal Netscape HTML (Safari via export). They
+//!     parse each format into the model via the existing CRDT ops, dedup by
+//!     normalized URL, and re-import idempotently under `Imported/<Browser>`.
+//!     **Never read logins/cookies/history** — bookmarks only (import/).
 //!
-//! **Zero I/O**: no Servo, no Syncthing, no Bus, no wall clock, no credentials —
-//! the live plumbing is the BOOKMARKS-2 worker's. Services tier: no
-//! desktop-shell dep (the layered-tiers gate).
+//! **No CRDT/mesh I/O**: no Servo, no Syncthing, no Bus, no wall clock, no
+//! credentials — the live plumbing is the BOOKMARKS-2 worker's. The only I/O in
+//! the crate is the BOOKMARKS-3 importers reading local browser export files
+//! read-only. Services tier: no desktop-shell dep (the layered-tiers gate).
 
 #![forbid(unsafe_code)]
 
 mod crdt;
 mod favicon;
 mod hlc;
+mod import;
 mod model;
 mod op;
 mod order;
@@ -45,6 +53,11 @@ mod order;
 pub use crdt::{Collection, ItemState, Reg};
 pub use favicon::{hash_bytes, FaviconStore};
 pub use hlc::{Author, Hlc, HlcClock, NodeId, UserId};
+pub use import::{
+    detect_format, import_file, import_file_as, normalize_url, parse_file, plan_import,
+    scan_profiles, ImportCandidate, ImportError, ImportFormat, ImportOutcome, ParsedBookmark,
+    ParsedNode, ParsedTree,
+};
 pub use model::{Bookmark, ContentHash, Folder, Item, ItemKind, Source};
 pub use op::{Edit, Op, OpKind};
 pub use order::key_between;

@@ -1,0 +1,48 @@
+{
+  "checksum": "0123456789abcdef0123456789abcdef",
+  "roots": {
+    "bookmark_bar": {
+      "type": "folder",
+      "name": "Bookmarks bar",
+      "date_added": "13300000000000000",
+      "children": [
+        {
+          "type": "url",
+          "name": "Example",
+          "url": "https://example.com/",
+          "date_added": "13300000000000000"
+        },
+        {
+          "type": "folder",
+          "name": "Work",
+          "children": [
+            {
+              "type": "url",
+              "name": "Docs",
+              "url": "https://docs.example/guide",
+              "date_added": "13300000000000000"
+            }
+          ]
+        }
+      ]
+    },
+    "other": {
+      "type": "folder",
+      "name": "Other bookmarks",
+      "children": [
+        {
+          "type": "url",
+          "name": "Other Link",
+          "url": "https://other.example/?utm_medium=email&id=9",
+          "date_added": "13300000000000000"
+        }
+      ]
+    },
+    "synced": {
+      "type": "folder",
+      "name": "Mobile bookmarks",
+      "children": []
+    }
+  },
+  "version": 1
+}

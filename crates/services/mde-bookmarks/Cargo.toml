@@ -33,6 +33,19 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # identical icons dedup to one blob. Same dep the KDC / mackesd already hash
 # with — never openssl.
 sha2 = "0.10"
+# BOOKMARKS-3 importers (import.rs). Firefox `places.sqlite` is opened
+# READ-ONLY + immutable and queried for the bookmark tables ONLY — never
+# logins/cookies/history (operator security lock). Same rusqlite 0.32 + bundled
+# SQLite that mackesd / mde-bus already link (one shared libsqlite3-sys version,
+# no fork), so it stays airgapped-buildable (the C source is vendored, no
+# build-time network).
+rusqlite = { version = "0.32", features = ["bundled"] }
+# URL normalization for the dedup key (lock Q15: lowercase host, drop fragment,
+# strip tracking params) and to build the `file:…?immutable=1` open URI safely.
+url = "2"
+# Copy-to-temp fallback when a live `places.sqlite` cannot be opened immutable
+# (locked / WAL): the ORIGINAL is never mutated — we read a private copy.
+tempfile = "3"
 
 [dev-dependencies]
 # The convergence property test shuffles op order and asserts an identical

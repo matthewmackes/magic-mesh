@@ -3779,9 +3779,12 @@ name = "mde-bookmarks"
 version = "12.0.0"
 dependencies = [
  "proptest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
+ "url",
  "uuid 1.23.4",
 ]
 
