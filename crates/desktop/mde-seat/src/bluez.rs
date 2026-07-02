@@ -6,9 +6,11 @@
 //! object. One `GetManagedObjects` round-trip is therefore the entire read; the
 //! fold from that tree into [`BtStatus`] is pure and unit-tested headless.
 //!
-//! E12-15 scope is **enumeration** (this snapshot feeds the System surface's
-//! Bluetooth section + the chrome icon); the pairing agent, scan/pair/trust/
-//! connect verbs and proximity announce are E12-17, layered on this client.
+//! E12-15 gave this client **enumeration** (the snapshot feeds the System
+//! surface's Bluetooth section + the chrome icon). E12-17 layers the full
+//! pairing manager on top: the adapter/scan/pair/trust/connect/forget verbs and
+//! the seat-start auto-reconnect below, the [`ScanTracker`] proximity-announce
+//! fold, and the PIN/passkey pairing agent in [`crate::pairing`].
 
 use crate::bus::SysBus;
 use crate::error::{Backend, SeatError};
@@ -16,6 +18,13 @@ use crate::props::{bool_prop, str_prop, u8_prop, PropMap};
 
 /// The `BlueZ` well-known bus name.
 const BLUEZ: &str = "org.bluez";
+/// The adapter interface (`StartDiscovery`, `RemoveDevice`, `Powered`…).
+const ADAPTER1: &str = "org.bluez.Adapter1";
+/// The device interface (`Pair`, `Connect`, `Trusted`…).
+const DEVICE1: &str = "org.bluez.Device1";
+/// The FDO properties interface — how a `bool` toggle (`Powered`, `Trusted`,
+/// `Discoverable`, `Pairable`) is written on either object.
+const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
 /// One Bluetooth adapter (an `org.bluez.Adapter1` object).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,14 +83,189 @@ impl BtStatus {
     }
 }
 
-/// The `BlueZ` client seam. The production impl is [`ZbusBluez`]; tests (and the
-/// shell's headless tests) inject a fake.
+/// One trusted device the auto-reconnect pass tried to bring back at seat start.
+///
+/// [`BluezClient::reconnect_trusted`] never fails as a whole — a per-device
+/// failure lands here so the shell can log "couldn't reach the keyboard" while
+/// the rest reconnect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconnectAttempt {
+    /// The device object path.
+    pub path: String,
+    /// Whether the `Connect` call succeeded.
+    pub connected: bool,
+    /// The typed error message when it did not — `None` on success.
+    pub error: Option<String>,
+}
+
+/// The device paths a seat-start reconnect should target: trusted (the operator
+/// keeps them) but not currently connected. Pure — the drive logic in
+/// [`BluezClient::reconnect_trusted`] folds over this.
+#[must_use]
+pub fn trusted_reconnect_targets(status: &BtStatus) -> Vec<String> {
+    status
+        .devices
+        .iter()
+        .filter(|d| d.trusted && !d.connected)
+        .map(|d| d.path.clone())
+        .collect()
+}
+
+/// The `BlueZ` client seam — enumeration (E12-15) plus the full pairing-manager
+/// verb set (E12-17). The production impl is [`ZbusBluez`]; tests inject a fake.
+///
+/// Every verb is fire-and-observe over the standard `org.bluez` interfaces: a
+/// missing adapter / dead bus comes back as a typed [`SeatError::Unavailable`]
+/// (the honest not-available render, §7 / interlock 4), never a silent no-op.
+/// The pairing *agent* that answers PIN/passkey prompts during [`Self::pair`] is
+/// registered separately — see [`crate::pairing::PairingAgent`].
 pub trait BluezClient: Send {
     /// Enumerate adapters + devices.
     ///
     /// # Errors
     /// Typed: [`SeatError::Unavailable`] when `BlueZ` / the system bus is absent.
     fn status(&self) -> Result<BtStatus, SeatError>;
+
+    /// Power an adapter radio on or off (`Adapter1.Powered`).
+    ///
+    /// # Errors
+    /// Typed: absent adapter / bus → [`SeatError::Unavailable`], else `Backend`.
+    fn set_adapter_powered(&self, adapter: &str, on: bool) -> Result<(), SeatError>;
+
+    /// Make an adapter discoverable to nearby devices (`Adapter1.Discoverable`).
+    ///
+    /// # Errors
+    /// Typed as the other adapter verbs.
+    fn set_discoverable(&self, adapter: &str, on: bool) -> Result<(), SeatError>;
+
+    /// Allow an adapter to accept incoming pairings (`Adapter1.Pairable`).
+    ///
+    /// # Errors
+    /// Typed as the other adapter verbs.
+    fn set_pairable(&self, adapter: &str, on: bool) -> Result<(), SeatError>;
+
+    /// Start a device-discovery scan (`Adapter1.StartDiscovery`). The shell then
+    /// polls [`Self::status`] and folds it through a [`ScanTracker`] to surface
+    /// newly-found devices (the proximity-announce popups).
+    ///
+    /// # Errors
+    /// Typed as the other adapter verbs.
+    fn start_discovery(&self, adapter: &str) -> Result<(), SeatError>;
+
+    /// Stop a device-discovery scan (`Adapter1.StopDiscovery`).
+    ///
+    /// # Errors
+    /// Typed as the other adapter verbs.
+    fn stop_discovery(&self, adapter: &str) -> Result<(), SeatError>;
+
+    /// Pair (bond) with a device (`Device1.Pair`). PIN/passkey prompts are
+    /// answered by the registered [`crate::pairing::PairingAgent`]; without one
+    /// registered, `BlueZ` fails the pairing typed rather than hanging.
+    ///
+    /// # Errors
+    /// Typed: absent device / bus → `Unavailable`, a rejected/failed pairing →
+    /// `Backend`.
+    fn pair(&self, device: &str) -> Result<(), SeatError>;
+
+    /// Abort an in-flight pairing (`Device1.CancelPairing`).
+    ///
+    /// # Errors
+    /// Typed as [`Self::pair`].
+    fn cancel_pairing(&self, device: &str) -> Result<(), SeatError>;
+
+    /// Trust or untrust a device for auto-reconnect (`Device1.Trusted`).
+    ///
+    /// # Errors
+    /// Typed: absent device / bus → `Unavailable`, else `Backend`.
+    fn set_trusted(&self, device: &str, trusted: bool) -> Result<(), SeatError>;
+
+    /// Connect to a paired device (`Device1.Connect`).
+    ///
+    /// # Errors
+    /// Typed as [`Self::set_trusted`].
+    fn connect(&self, device: &str) -> Result<(), SeatError>;
+
+    /// Disconnect a connected device (`Device1.Disconnect`).
+    ///
+    /// # Errors
+    /// Typed as [`Self::set_trusted`].
+    fn disconnect(&self, device: &str) -> Result<(), SeatError>;
+
+    /// Forget a device — drop the bond + link keys (`Adapter1.RemoveDevice`).
+    /// `adapter` is the owning adapter path; `device` the device path to remove.
+    ///
+    /// # Errors
+    /// Typed: an invalid `device` path → [`SeatError::Protocol`]; absent adapter
+    /// / bus → `Unavailable`, else `Backend`.
+    fn remove_device(&self, adapter: &str, device: &str) -> Result<(), SeatError>;
+
+    /// Reconnect every trusted-but-disconnected device — the seat-start
+    /// auto-reconnect the shell calls once on init. Drives [`Self::status`] +
+    /// [`Self::connect`]; never fails as a whole, capturing each device's outcome
+    /// in a [`ReconnectAttempt`].
+    ///
+    /// # Errors
+    /// Only the initial [`Self::status`] read can fail the call as a whole
+    /// (no adapter / bus → `Unavailable`); per-device connect failures are
+    /// returned inline, not raised.
+    fn reconnect_trusted(&self) -> Result<Vec<ReconnectAttempt>, SeatError> {
+        let status = self.status()?;
+        Ok(trusted_reconnect_targets(&status)
+            .into_iter()
+            .map(|path| match self.connect(&path) {
+                Ok(()) => ReconnectAttempt {
+                    path,
+                    connected: true,
+                    error: None,
+                },
+                Err(e) => ReconnectAttempt {
+                    path,
+                    connected: false,
+                    error: Some(e.to_string()),
+                },
+            })
+            .collect())
+    }
+}
+
+/// Tracks which devices an active scan has already surfaced, so each poll yields
+/// only the devices that newly appeared.
+///
+/// This is the data behind the Android-style proximity-announce popup (lock 5).
+/// The shell drives one tracker per scan:
+/// after [`BluezClient::start_discovery`], poll [`BluezClient::status`] on a
+/// cadence and feed each snapshot to [`ScanTracker::poll`]; every returned device
+/// is a fresh "Found X — Pair?" candidate. Already-paired devices are never
+/// announced (they are already known). Pure + unit-tested.
+#[derive(Debug, Default)]
+pub struct ScanTracker {
+    seen: std::collections::HashSet<String>,
+}
+
+impl ScanTracker {
+    /// A fresh tracker that has surfaced nothing yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold this poll's snapshot: return the not-yet-surfaced, un-paired devices
+    /// that appeared since the last poll (announce candidates), and remember
+    /// them so they do not re-announce.
+    pub fn poll(&mut self, status: &BtStatus) -> Vec<BtDevice> {
+        status
+            .devices
+            .iter()
+            .filter(|d| !d.paired && self.seen.insert(d.path.clone()))
+            .cloned()
+            .collect()
+    }
+
+    /// Forget every surfaced device — call when a new scan starts so devices
+    /// still nearby announce again.
+    pub fn reset(&mut self) {
+        self.seen.clear();
+    }
 }
 
 /// The production `BlueZ` client — one `ObjectManager.GetManagedObjects` call,
@@ -106,6 +290,27 @@ impl Default for ZbusBluez {
     }
 }
 
+impl ZbusBluez {
+    /// Write a `bool` property on a `BlueZ` object via the FDO `Properties.Set`
+    /// (`ssv`) — the one path for every radio/link toggle (`Powered`, `Trusted`,
+    /// `Discoverable`, `Pairable`).
+    fn set_bool_prop(
+        &self,
+        path: &str,
+        interface: &str,
+        name: &str,
+        value: bool,
+    ) -> Result<(), SeatError> {
+        self.bus.call_unit(
+            BLUEZ,
+            path,
+            PROPERTIES,
+            "Set",
+            &(interface, name, zbus::zvariant::Value::from(value)),
+        )
+    }
+}
+
 impl BluezClient for ZbusBluez {
     fn status(&self) -> Result<BtStatus, SeatError> {
         let objects: zbus::fdo::ManagedObjects = self.bus.call(
@@ -116,6 +321,62 @@ impl BluezClient for ZbusBluez {
             &(),
         )?;
         Ok(fold_bluez(&objects))
+    }
+
+    fn set_adapter_powered(&self, adapter: &str, on: bool) -> Result<(), SeatError> {
+        self.set_bool_prop(adapter, ADAPTER1, "Powered", on)
+    }
+
+    fn set_discoverable(&self, adapter: &str, on: bool) -> Result<(), SeatError> {
+        self.set_bool_prop(adapter, ADAPTER1, "Discoverable", on)
+    }
+
+    fn set_pairable(&self, adapter: &str, on: bool) -> Result<(), SeatError> {
+        self.set_bool_prop(adapter, ADAPTER1, "Pairable", on)
+    }
+
+    fn start_discovery(&self, adapter: &str) -> Result<(), SeatError> {
+        self.bus
+            .call_unit(BLUEZ, adapter, ADAPTER1, "StartDiscovery", &())
+    }
+
+    fn stop_discovery(&self, adapter: &str) -> Result<(), SeatError> {
+        self.bus
+            .call_unit(BLUEZ, adapter, ADAPTER1, "StopDiscovery", &())
+    }
+
+    fn pair(&self, device: &str) -> Result<(), SeatError> {
+        self.bus.call_unit(BLUEZ, device, DEVICE1, "Pair", &())
+    }
+
+    fn cancel_pairing(&self, device: &str) -> Result<(), SeatError> {
+        self.bus
+            .call_unit(BLUEZ, device, DEVICE1, "CancelPairing", &())
+    }
+
+    fn set_trusted(&self, device: &str, trusted: bool) -> Result<(), SeatError> {
+        self.set_bool_prop(device, DEVICE1, "Trusted", trusted)
+    }
+
+    fn connect(&self, device: &str) -> Result<(), SeatError> {
+        self.bus.call_unit(BLUEZ, device, DEVICE1, "Connect", &())
+    }
+
+    fn disconnect(&self, device: &str) -> Result<(), SeatError> {
+        self.bus
+            .call_unit(BLUEZ, device, DEVICE1, "Disconnect", &())
+    }
+
+    fn remove_device(&self, adapter: &str, device: &str) -> Result<(), SeatError> {
+        // RemoveDevice's arg is an `o` (object path), not a string — an invalid
+        // path is a typed Protocol error, never a mis-typed wire call.
+        let dev =
+            zbus::zvariant::ObjectPath::try_from(device).map_err(|e| SeatError::Protocol {
+                backend: Backend::Bluetooth,
+                reason: format!("invalid device path {device:?}: {e}"),
+            })?;
+        self.bus
+            .call_unit(BLUEZ, adapter, ADAPTER1, "RemoveDevice", &(dev,))
     }
 }
 
@@ -197,7 +458,7 @@ mod tests {
             .into()
     }
 
-    /// A BlueZ tree: one powered adapter, a connected keyboard reporting 87%
+    /// A `BlueZ` tree: one powered adapter, a connected keyboard reporting 87%
     /// charge, and an unconnected speaker — plus an unrelated object that must
     /// be ignored.
     fn tree() -> zbus::fdo::ManagedObjects {
@@ -310,5 +571,197 @@ mod tests {
             }
             Err(e) => assert_eq!(e.backend(), Backend::Bluetooth),
         }
+    }
+
+    #[test]
+    fn every_control_verb_on_this_host_answers_typed_never_panics() {
+        // Same §7 contract for the write verbs: on a host with no adapter/bus
+        // each must fold to a typed SeatError tagged Bluetooth, never a panic
+        // and never a silent success.
+        let c = ZbusBluez::new();
+        let check = |r: Result<(), SeatError>| {
+            if let Err(e) = r {
+                assert_eq!(e.backend(), Backend::Bluetooth);
+            }
+        };
+        check(c.set_adapter_powered("/org/bluez/hci0", true));
+        check(c.set_discoverable("/org/bluez/hci0", true));
+        check(c.set_pairable("/org/bluez/hci0", true));
+        check(c.start_discovery("/org/bluez/hci0"));
+        check(c.stop_discovery("/org/bluez/hci0"));
+        check(c.pair("/org/bluez/hci0/dev_AA_BB"));
+        check(c.cancel_pairing("/org/bluez/hci0/dev_AA_BB"));
+        check(c.set_trusted("/org/bluez/hci0/dev_AA_BB", true));
+        check(c.connect("/org/bluez/hci0/dev_AA_BB"));
+        check(c.disconnect("/org/bluez/hci0/dev_AA_BB"));
+        check(c.remove_device("/org/bluez/hci0", "/org/bluez/hci0/dev_AA_BB"));
+    }
+
+    #[test]
+    fn remove_device_rejects_a_malformed_object_path_typed() {
+        // A non-path device string is caught before any wire call — the honest
+        // Protocol error, not a mangled D-Bus message.
+        let e = ZbusBluez::new()
+            .remove_device("/org/bluez/hci0", "not a path")
+            .expect_err("a malformed path must be refused");
+        assert!(matches!(e, SeatError::Protocol { .. }), "{e}");
+        assert_eq!(e.backend(), Backend::Bluetooth);
+    }
+
+    fn dev(path: &str, paired: bool, connected: bool, trusted: bool) -> BtDevice {
+        BtDevice {
+            path: path.to_owned(),
+            alias: path_tail(path),
+            paired,
+            connected,
+            trusted,
+            battery_percent: None,
+            icon: None,
+        }
+    }
+
+    #[test]
+    fn scan_tracker_surfaces_each_unpaired_device_once() {
+        let mut tracker = ScanTracker::new();
+
+        // First poll of an empty scan surfaces nothing.
+        assert!(tracker.poll(&BtStatus::default()).is_empty());
+
+        // A speaker appears — surfaced once.
+        let mut status = BtStatus {
+            adapters: vec![],
+            devices: vec![dev("/dev/spk", false, false, false)],
+        };
+        let fresh = tracker.poll(&status);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].path, "/dev/spk");
+
+        // Same speaker on the next poll is NOT re-announced; a new headset is.
+        status.devices.push(dev("/dev/hdst", false, false, false));
+        let fresh = tracker.poll(&status);
+        assert_eq!(fresh.len(), 1, "only the new device announces");
+        assert_eq!(fresh[0].path, "/dev/hdst");
+
+        // A reset re-arms every still-nearby device.
+        tracker.reset();
+        assert_eq!(tracker.poll(&status).len(), 2);
+    }
+
+    #[test]
+    fn scan_tracker_never_announces_an_already_paired_device() {
+        let mut tracker = ScanTracker::new();
+        let status = BtStatus {
+            adapters: vec![],
+            devices: vec![
+                dev("/dev/known", true, true, true),
+                dev("/dev/new", false, false, false),
+            ],
+        };
+        let fresh = tracker.poll(&status);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(
+            fresh[0].path, "/dev/new",
+            "paired devices are already known"
+        );
+    }
+
+    #[test]
+    fn reconnect_targets_are_trusted_and_disconnected_only() {
+        let status = BtStatus {
+            adapters: vec![],
+            devices: vec![
+                dev("/dev/kbd", true, false, true),    // trusted, offline → target
+                dev("/dev/mouse", true, true, true),   // trusted but already up
+                dev("/dev/rando", true, false, false), // offline but not trusted
+            ],
+        };
+        assert_eq!(
+            trusted_reconnect_targets(&status),
+            vec!["/dev/kbd".to_owned()]
+        );
+    }
+
+    /// A fake client: a canned enumeration + a recording of which devices got a
+    /// `connect`, with a chosen device forced to fail — exercises the default
+    /// `reconnect_trusted` drive logic headless.
+    struct FakeBluez {
+        status: BtStatus,
+        connects: std::sync::Mutex<Vec<String>>,
+        fail: Option<String>,
+    }
+
+    impl BluezClient for FakeBluez {
+        fn status(&self) -> Result<BtStatus, SeatError> {
+            Ok(self.status.clone())
+        }
+        fn connect(&self, device: &str) -> Result<(), SeatError> {
+            self.connects.lock().unwrap().push(device.to_owned());
+            if self.fail.as_deref() == Some(device) {
+                return Err(SeatError::Backend {
+                    backend: Backend::Bluetooth,
+                    reason: "device off".into(),
+                });
+            }
+            Ok(())
+        }
+        // The rest are unused by this test — honest no-ops that never lie Ok.
+        fn set_adapter_powered(&self, _: &str, _: bool) -> Result<(), SeatError> {
+            unreachable!()
+        }
+        fn set_discoverable(&self, _: &str, _: bool) -> Result<(), SeatError> {
+            unreachable!()
+        }
+        fn set_pairable(&self, _: &str, _: bool) -> Result<(), SeatError> {
+            unreachable!()
+        }
+        fn start_discovery(&self, _: &str) -> Result<(), SeatError> {
+            unreachable!()
+        }
+        fn stop_discovery(&self, _: &str) -> Result<(), SeatError> {
+            unreachable!()
+        }
+        fn pair(&self, _: &str) -> Result<(), SeatError> {
+            unreachable!()
+        }
+        fn cancel_pairing(&self, _: &str) -> Result<(), SeatError> {
+            unreachable!()
+        }
+        fn set_trusted(&self, _: &str, _: bool) -> Result<(), SeatError> {
+            unreachable!()
+        }
+        fn disconnect(&self, _: &str) -> Result<(), SeatError> {
+            unreachable!()
+        }
+        fn remove_device(&self, _: &str, _: &str) -> Result<(), SeatError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn reconnect_trusted_drives_connect_and_captures_each_outcome() {
+        let fake = FakeBluez {
+            status: BtStatus {
+                adapters: vec![],
+                devices: vec![
+                    dev("/dev/kbd", true, false, true),  // reconnects OK
+                    dev("/dev/spk", true, false, true),  // forced failure
+                    dev("/dev/mouse", true, true, true), // already up — skipped
+                ],
+            },
+            connects: std::sync::Mutex::new(vec![]),
+            fail: Some("/dev/spk".to_owned()),
+        };
+
+        let attempts = fake.reconnect_trusted().expect("status read is fine");
+
+        // Only the two trusted-and-offline devices were dialed.
+        assert_eq!(
+            *fake.connects.lock().unwrap(),
+            vec!["/dev/kbd".to_owned(), "/dev/spk".to_owned()]
+        );
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts[0].connected && attempts[0].error.is_none());
+        assert!(!attempts[1].connected);
+        assert!(attempts[1].error.as_deref().unwrap().contains("Bluetooth"));
     }
 }

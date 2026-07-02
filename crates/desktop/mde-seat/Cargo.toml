@@ -19,6 +19,12 @@ path = "src/lib.rs"
 # shell's pump thread — zbus runs its own internal runtime for block_on.
 zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
 
+# The BlueZ pairing agent (E12-17) is an object BlueZ calls BACK on, so it needs
+# an async connection served on its own thread + runtime (the mde-musicd MPRIS
+# pattern) — a `spawn_blocking` hop runs the shell's blocking dialog callback off
+# the reactor. Same tokio 1 the rest of the workspace pins.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
 # The read-only DRM connector prober (connectors / modes / EDID sizes). Pure-Rust
 # ioctl bindings — the same crate + version the mde-egui DRM runner pins; probing
 # needs none of the heavy GBM/EGL/libinput stack, so it is a normal (non-optional)

@@ -13,7 +13,11 @@
 //! only I/O. The seams:
 //!
 //! - [`BluezClient`] — `BlueZ` adapter/device enumeration (incl. `Battery1`
-//!   peripheral batteries) over the system D-Bus `ObjectManager`.
+//!   peripheral batteries) over the system D-Bus `ObjectManager`, **plus the
+//!   full pairing-manager verbs** (power/scan/pair/trust/connect/forget +
+//!   seat-start auto-reconnect); [`ScanTracker`] folds a scan's polls into
+//!   proximity-announce candidates and [`pairing::PairingAgent`] answers the
+//!   PIN/passkey prompts (E12-17).
 //! - [`UPowerClient`] — battery enumeration (internal, UPS, BT peripherals).
 //! - [`LogindClient`] — session lock + suspend/reboot/poweroff verbs and their
 //!   `CanX` availability probe (confirm-gating is the caller's duty, lock 12).
@@ -39,12 +43,16 @@ mod error;
 pub mod hotkeys;
 mod logind;
 mod mixer;
+pub mod pairing;
 mod props;
 mod snapshot;
 mod upower;
 
 pub use backlight::{Backlight, BacklightClient, SysfsBacklight};
-pub use bluez::{BluezClient, BtAdapter, BtDevice, BtStatus, ZbusBluez};
+pub use bluez::{
+    trusted_reconnect_targets, BluezClient, BtAdapter, BtDevice, BtStatus, ReconnectAttempt,
+    ScanTracker, ZbusBluez,
+};
 pub use ddc::{DdcClient, DdcDisplay, UnboundDdc};
 pub use display::{Connector, ConnectorStatus, DisplayMode, DisplayProber, DrmProber};
 pub use error::{Backend, SeatError};
@@ -53,6 +61,10 @@ pub use logind::{Avail, LogindClient, PowerCaps, PowerVerb, ZbusLogind};
 pub use mixer::{
     fold_graph, MixerClient, MixerStatus, MixerStrip, PwCli, PwGraph, PwRunner, StripOrigin,
     UnboundMixer,
+};
+pub use pairing::{
+    resolve_confirm, resolve_passkey, resolve_pin, AgentPrompt, PairingAgent, PairingReply,
+    PairingResponder, Refusal,
 };
 pub use snapshot::{Probe, Seat, SeatSnapshot};
 pub use upower::{Battery, BatteryKind, BatteryState, UPowerClient, ZbusUPower};
