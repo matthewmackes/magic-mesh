@@ -45,6 +45,10 @@ pub(crate) enum Surface {
     /// The Clipboard surface — recent mesh clipboard entries from
     /// `event/clipboard/clip`, newest first.
     Clipboard,
+    /// The Chat surface — the ICQ roster + conversation panes (NOTIFY-CHAT-3):
+    /// every mesh host is a contact, its alerts are its messages, over the
+    /// `state/chat/roster` + `state/chat/conversation/<key>` worker read-model.
+    Chat,
     /// The System surface — this seat's host controls (audio mixer, Bluetooth,
     /// displays, power & battery, backlight, hotkeys), folded from `mde-seat`
     /// (E12-15). Owns ALL host-control interaction (lock 3); the chrome bar keeps
@@ -57,7 +61,7 @@ impl Surface {
     /// then the local VM Instances broker + the brokered Desktop, then the three
     /// app surfaces, then the two mesh information surfaces, and finally this
     /// seat's host-controls System surface.
-    pub(crate) const ALL: [Surface; 9] = [
+    pub(crate) const ALL: [Surface; 10] = [
         Surface::Workbench,
         Surface::Instances,
         Surface::Desktop,
@@ -66,6 +70,7 @@ impl Surface {
         Surface::Voice,
         Surface::Notifications,
         Surface::Clipboard,
+        Surface::Chat,
         Surface::System,
     ];
 
@@ -80,6 +85,7 @@ impl Surface {
             Surface::Voice => "Voice",
             Surface::Notifications => "Alerts",
             Surface::Clipboard => "Clipboard",
+            Surface::Chat => "Chat",
             Surface::System => "System",
         }
     }
@@ -102,6 +108,9 @@ impl Surface {
                 "Mesh-wide alerts — security, presence, firewall, compute events."
             }
             Surface::Clipboard => "Recent clipboard copies from across the mesh, newest first.",
+            Surface::Chat => {
+                "Mesh chat (ICQ) — every host is a contact, its alerts are its messages."
+            }
             Surface::System => {
                 "This seat's host controls — audio mixer, Bluetooth, displays, power, hotkeys."
             }
@@ -143,10 +152,10 @@ mod tests {
 
     #[test]
     fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
-        // Nine entries: Workbench first, two VM surfaces (Instances / Desktop),
-        // three app surfaces (Music / Files / Voice), two info surfaces
-        // (Notifications / Clipboard), and the host-controls System surface.
-        assert_eq!(Surface::ALL.len(), 9);
+        // Workbench first, two VM surfaces (Instances / Desktop), three app
+        // surfaces (Music / Files / Voice), the info surfaces (Notifications /
+        // Clipboard / Chat), and the host-controls System surface.
+        assert_eq!(Surface::ALL.len(), 10);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
             Surface::Instances,
@@ -156,6 +165,7 @@ mod tests {
             Surface::Voice,
             Surface::Notifications,
             Surface::Clipboard,
+            Surface::Chat,
             Surface::System,
         ] {
             assert!(Surface::ALL.contains(&s), "{s:?} missing from the dock");

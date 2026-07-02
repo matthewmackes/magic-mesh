@@ -14,6 +14,7 @@
 //! the skeleton the panels (Workbench/Files/Music/Voice) and the VM session-view
 //! plug into.
 
+mod chat;
 mod chrome;
 mod clipboard;
 mod controller;
@@ -131,6 +132,10 @@ struct Shell {
     /// The Clipboard surface — tails `event/clipboard/clip` and shows recent mesh
     /// clipboard entries captured by the clipboard_sync worker, newest first.
     clipboard: clipboard::ClipboardState,
+    /// The Chat surface (NOTIFY-CHAT-3) — the ICQ roster + conversation panes over
+    /// the chat worker's `state/chat/roster` + `state/chat/conversation/<key>`
+    /// read-model. A pure renderer; sends via `action/chat/send`.
+    chat: chat::ChatState,
     /// The System surface — this seat's host controls, folded from the ONE
     /// `mde-seat` `Seat` (lock 1): mixer / Bluetooth / displays / power & battery /
     /// backlight / hotkeys. Its cached snapshot also feeds the three read-only
@@ -173,6 +178,7 @@ impl Shell {
             instances: instances::InstancesState::default(),
             notifications: notifications::NotificationsState::default(),
             clipboard: clipboard::ClipboardState::default(),
+            chat: chat::ChatState::default(),
             system: system::SystemState::default(),
             toasts: toast_bridge::ToastBridge::default(),
         }
@@ -289,6 +295,12 @@ impl Shell {
                     clipboard.show(ui);
                 });
             }
+            Surface::Chat => {
+                let chat = &mut self.chat;
+                ui.push_id("shell-chat", |ui| {
+                    chat.show(ui);
+                });
+            }
             Surface::System => {
                 // This seat's host controls, folded from the one `mde-seat` Seat
                 // (E12-15). Scoped under its own `push_id` like every mounted
@@ -355,6 +367,7 @@ impl Shell {
         if self.nav.expanded {
             self.notifications.poll(ctx);
             self.clipboard.poll(ctx);
+            self.chat.poll(ctx);
         }
 
         // The seat snapshot feeds BOTH the System surface and the always-visible

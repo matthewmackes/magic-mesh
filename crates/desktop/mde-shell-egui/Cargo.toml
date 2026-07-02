@@ -78,6 +78,14 @@ mde-kvm = { path = "../../services/mde-kvm" }
 # the standalone notify center. Services tier; the edge points inward (§6).
 mde-notify = { path = "../../services/mde-notify" }
 
+# NOTIFY-CHAT-3 — the Surface::Chat ICQ UI renders the pure `mde-chat` model
+# (Roster / Contact / Presence / Message / MessageKind) it reads off the Bus
+# state topics (`state/chat/roster`, `state/chat/conversation/<key>`). The GUI is
+# a pure renderer over the chat worker's read-model — it never depends on the
+# mackesd daemon crate (§6 mesh/desktop boundary; the Bus JSON is the seam), just
+# on the shared services-tier model. The edge points inward (§6).
+mde-chat = { path = "../../services/mde-chat" }
+
 # E12-15 — the Surface::System seat panel + the three read-only chrome status
 # icons render from `mde-seat`, the ONE hardware-access library (lock 1). The
 # shell consumes its typed `Seat::snapshot()` directly, in-process; every section
