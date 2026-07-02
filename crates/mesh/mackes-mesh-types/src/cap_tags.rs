@@ -13,7 +13,7 @@
 //!   agent runs fully.
 //! - `hypervisor` — an XCP-ng dom0 joined as a static-Nebula member
 //!   that advertises compute capacity (DATACENTER-17). Orthogonal to
-//!   the §5 role: a `hypervisor` pins the Server tier (PeerRole flattens
+//!   the §5 role: a `hypervisor` pins the Server tier (`PeerRole` flattens
 //!   to Host/Peer, so it is surfaced as a capability tag, not a 4th cert
 //!   role) and the `xcp_host` worker self-gates on the dom0 marker.
 //!
@@ -49,21 +49,21 @@ impl CapabilityTag {
     /// any surface should iterate (the fleet `tags --json` census, profile
     /// validation, the Node-roles editor) instead of hand-maintaining a
     /// parallel list that silently drops a tag (DATACENTER-17 added a 4th).
-    pub const ALL: [CapabilityTag; 4] = [
-        CapabilityTag::Hop,
-        CapabilityTag::Execution,
-        CapabilityTag::Headless,
-        CapabilityTag::Hypervisor,
+    pub const ALL: [Self; 4] = [
+        Self::Hop,
+        Self::Execution,
+        Self::Headless,
+        Self::Hypervisor,
     ];
 
     /// Stable wire token.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
-            CapabilityTag::Hop => "hop",
-            CapabilityTag::Execution => "execution",
-            CapabilityTag::Headless => "headless",
-            CapabilityTag::Hypervisor => "hypervisor",
+            Self::Hop => "hop",
+            Self::Execution => "execution",
+            Self::Headless => "headless",
+            Self::Hypervisor => "hypervisor",
         }
     }
 
@@ -72,10 +72,10 @@ impl CapabilityTag {
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "hop" => Some(CapabilityTag::Hop),
-            "execution" => Some(CapabilityTag::Execution),
-            "headless" => Some(CapabilityTag::Headless),
-            "hypervisor" => Some(CapabilityTag::Hypervisor),
+            "hop" => Some(Self::Hop),
+            "execution" => Some(Self::Execution),
+            "headless" => Some(Self::Headless),
+            "hypervisor" => Some(Self::Hypervisor),
             _ => None,
         }
     }

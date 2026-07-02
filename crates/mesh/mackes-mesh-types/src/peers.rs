@@ -81,7 +81,7 @@ pub struct PeerRecord {
 /// Skip-serializer for a defaulted `false` bool — keeps a non-media record's
 /// JSON byte-for-byte identical to a pre-MEDIA-1 writer's.
 #[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_false(b: &bool) -> bool {
+const fn is_false(b: &bool) -> bool {
     !*b
 }
 
@@ -232,7 +232,7 @@ pub fn peers_dir(mesh_home: &Path) -> PathBuf {
 }
 
 /// Resolve the mesh-home mount: `$MDE_MESH_HOME` if set, else
-/// `~/.mde-mesh` (the coordination mount per AI_GOVERNANCE §3.1).
+/// `~/.mde-mesh` (the coordination mount per `AI_GOVERNANCE` §3.1).
 #[must_use]
 pub fn default_mesh_home() -> PathBuf {
     if let Ok(p) = std::env::var("MDE_MESH_HOME") {

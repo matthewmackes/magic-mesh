@@ -30,8 +30,8 @@ use crate::{HealthState, MessageClass, MessageClassSet, SwitchReason, Transport,
 /// class."
 ///
 /// Loose semantic baseline (locked in tests):
-///   * Clipboard — small, latency-bound → favor NebulaDirect.
-///   * FileBulk  — large, throughput-bound → favor KdcTls.
+///   * Clipboard — small, latency-bound → favor `NebulaDirect`.
+///   * `FileBulk`  — large, throughput-bound → favor `KdcTls`.
 ///   * Notification — dual-send idempotent → any reachable
 ///     transport is fine, but slight bias toward the most-
 ///     reliable one.
@@ -40,7 +40,7 @@ use crate::{HealthState, MessageClass, MessageClassSet, SwitchReason, Transport,
 pub struct ClassWeights {
     /// Latency bias for Clipboard / Control.
     pub latency: f32,
-    /// Throughput bias for FileBulk.
+    /// Throughput bias for `FileBulk`.
     pub throughput: f32,
     /// Reliability bias for Notification.
     pub reliability: f32,
@@ -50,7 +50,7 @@ impl ClassWeights {
     /// v2.1 KDC2 baseline weights — picked to match the
     /// connectivity-scope lock's latency/throughput targets.
     #[must_use]
-    pub fn baseline() -> Self {
+    pub const fn baseline() -> Self {
         Self {
             latency: 0.7,
             throughput: 0.7,
@@ -68,15 +68,15 @@ pub struct Policy {
     /// Penalty (score points) applied to a transport that has
     /// failed within the recent flap window.
     pub flap_penalty: f32,
-    /// Hard preference: when a TransportKind appears in this
+    /// Hard preference: when a `TransportKind` appears in this
     /// list, it's pinned as primary regardless of scoring.
     /// Empty (default) means "no pinning."
     pub pinned_primary: Vec<TransportKind>,
-    /// Hard denylist: TransportKinds in this list are never
+    /// Hard denylist: `TransportKinds` in this list are never
     /// selected, even when they're the only reachable option.
     pub denylist: Vec<TransportKind>,
     /// CV-1 — minimum transport-encryption strength for
-    /// content-carrying message classes (Clipboard / FileBulk /
+    /// content-carrying message classes (Clipboard / `FileBulk` /
     /// Notification — i.e. clipboard contents, files, SMS bodies).
     /// `Control` frames (ring, find, presence) are exempt. A
     /// transport whose [`EncryptionKind::strength_rank`] falls
@@ -117,7 +117,7 @@ pub struct TransportSample {
     pub health: HealthState,
     /// Message classes this transport carries.
     pub carries: MessageClassSet,
-    /// Recent-failure count from the FailureWindow (drives the
+    /// Recent-failure count from the `FailureWindow` (drives the
     /// flap penalty). Zero means no penalty.
     pub recent_failures: u32,
     /// CV-1 — transport-level encryption guarantee, checked
@@ -131,7 +131,7 @@ impl TransportSample {
     /// pieces. Convenience for tests; encryption defaults to the
     /// transport kind's guarantee ([`EncryptionKind::for_transport`]).
     #[must_use]
-    pub fn healthy(kind: TransportKind, carries: MessageClassSet) -> Self {
+    pub const fn healthy(kind: TransportKind, carries: MessageClassSet) -> Self {
         Self {
             kind,
             health: HealthState::Healthy,
@@ -144,7 +144,7 @@ impl TransportSample {
     /// Override the encryption guarantee (tests / a future
     /// transport that negotiates its cipher at runtime).
     #[must_use]
-    pub fn with_encryption(mut self, encryption: EncryptionKind) -> Self {
+    pub const fn with_encryption(mut self, encryption: EncryptionKind) -> Self {
         self.encryption = encryption;
         self
     }
@@ -256,7 +256,7 @@ pub fn score(
         .collect();
 
     // Sort ascending by score; tie-break on TransportKind::all() order.
-    let mut sorted = scored.clone();
+    let mut sorted = scored;
     sorted.sort_by(|a, b| {
         a.0.partial_cmp(&b.0)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -286,7 +286,7 @@ pub fn score(
 
 /// Async wrapper around [`score`] that probes the live
 /// transports. Used by [`crate::Transport`] impls' integration
-/// tests + (eventually) the mesh_router worker. Lives behind
+/// tests + (eventually) the `mesh_router` worker. Lives behind
 /// no feature gate — it depends only on the trait.
 pub async fn select(
     transports: &[Arc<dyn Transport>],

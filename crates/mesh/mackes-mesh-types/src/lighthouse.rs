@@ -76,7 +76,7 @@ pub const BEAM_HEALTHY_DIVISOR: u16 = 4;
 /// positions; unhealthy beacons spin a step every tick AND strobe (blank on the
 /// even phase) for an at-a-glance alarm.
 #[must_use]
-pub fn beam_frame(healthy: bool, beam_step: u16) -> &'static str {
+pub const fn beam_frame(healthy: bool, beam_step: u16) -> &'static str {
     let n = BEAM_ARROWS.len() as u16;
     if healthy {
         BEAM_ARROWS[((beam_step / BEAM_HEALTHY_DIVISOR) % n) as usize]
@@ -196,10 +196,11 @@ pub fn media_lighthouse_records(peers: &[PeerRecord]) -> Vec<PeerRecord> {
 pub const HA_MIN_LIGHTHOUSES: usize = 2;
 
 /// HA-4 — `true` when the mesh has too few lighthouses for HA (`< `[`HA_MIN_LIGHTHOUSES`]).
+///
 /// Drives the non-blocking `degraded: no HA` health flag + the founding warning;
 /// it is a posture signal, never a hard gate (a 1-lighthouse mesh still works).
 #[must_use]
-pub fn ha_degraded(lighthouse_count: usize) -> bool {
+pub const fn ha_degraded(lighthouse_count: usize) -> bool {
     lighthouse_count < HA_MIN_LIGHTHOUSES
 }
 
@@ -288,7 +289,7 @@ pub fn roster_with_self(
 /// service. The first failing condition (checked in escalation order) picks the
 /// red variant.
 #[must_use]
-pub fn classify(
+pub const fn classify(
     has_data: bool,
     online: bool,
     overlay_up: bool,
@@ -311,10 +312,10 @@ pub fn classify(
 /// the derivation is deterministic + testable).
 ///
 /// The booleans handed to [`classify`] are read off the row:
-/// - **has_data** — the row carries a real timestamp (`last_seen_ms > 0`).
+/// - **`has_data`** — the row carries a real timestamp (`last_seen_ms > 0`).
 /// - **online** — fresh within `stale_ms` AND not self-reported `unreachable`.
-/// - **overlay_up** — the node recorded its own overlay IP this heartbeat.
-/// - **master_service_up** — for the leader, the Netdata-derived health tier is
+/// - **`overlay_up`** — the node recorded its own overlay IP this heartbeat.
+/// - **`master_service_up`** — for the leader, the Netdata-derived health tier is
 ///   `healthy` (a degraded leader trips an alarm → degraded/critical/etc.).
 #[must_use]
 pub fn beacon_for(peer: &PeerRecord, is_master: bool, now_ms: u64, stale_ms: u64) -> Beacon {

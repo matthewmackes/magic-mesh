@@ -9,7 +9,7 @@
 //! Why a stand-alone crate (instead of a module inside `mackesd`)?
 //!
 //! - `mde-kdc` (host integration, KDC2-3) implements `Transport` and
-//!   shouldn't drag in `mackesd`'s SQLite + zbus + worker pool just to
+//!   shouldn't drag in `mackesd`'s `SQLite` + zbus + worker pool just to
 //!   compile.
 //! - Future transport impls (`mackes-https-tunnel`, BLE/LoRa/Matrix
 //!   per the v2.1 KDC2 lock's deferred items) land as new workspace
@@ -49,7 +49,7 @@ pub use transport_capabilities::{EncryptionKind, TransportCapabilities};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportKind {
-    /// Best-case: direct UDP between two peers' WireGuard sockets
+    /// Best-case: direct UDP between two peers' `WireGuard` sockets
     /// (matches `EdgeKind::NebulaDirect`).
     NebulaDirect,
     /// Nebula lighthouse-relay fallback (matches `EdgeKind::NebulaLighthouseRelay`).
@@ -69,23 +69,23 @@ impl TransportKind {
     /// + capabilities. Lower-latency transports come first.
     ///
     /// This order is locked by the v12 throughput-first routing
-    /// survey (`project_v12_connectivity_scope.md`): NebulaDirect >
-    /// KdcTls > NebulaLighthouseRelay > NebulaHttps443. KdcTls outranks NebulaLighthouseRelay
+    /// survey (`project_v12_connectivity_scope.md`): `NebulaDirect` >
+    /// `KdcTls` > `NebulaLighthouseRelay` > `NebulaHttps443`. `KdcTls` outranks `NebulaLighthouseRelay`
     /// because the KDC handshake reuses a long-lived TLS session
     /// (~0 RTT for steady-state messages), where the relay requires a
     /// fresh client every minute.
     #[must_use]
-    pub const fn all() -> [TransportKind; 4] {
+    pub const fn all() -> [Self; 4] {
         [
-            TransportKind::NebulaDirect,
-            TransportKind::KdcTls,
-            TransportKind::NebulaLighthouseRelay,
-            TransportKind::NebulaHttps443,
+            Self::NebulaDirect,
+            Self::KdcTls,
+            Self::NebulaLighthouseRelay,
+            Self::NebulaHttps443,
         ]
     }
 
     /// Stable string identifier used in metric labels + audit log
-    /// entries. Matches the `serde` snake_case rendering so a
+    /// entries. Matches the `serde` `snake_case` rendering so a
     /// machine reading audit JSON sees the same token in both
     /// places.
     ///
@@ -93,16 +93,16 @@ impl TransportKind {
     /// transitions, NOT before digit groups — so `NebulaHttps443`
     /// becomes `https443`, not `https_443`. `EdgeKind::NebulaHttps443`
     /// already serializes that way in production audit chains
-    /// (mackesd::topology unit test locks the token); the
+    /// (`mackesd::topology` unit test locks the token); the
     /// `Display` and `as_str` outputs must stay aligned to avoid
     /// silent token drift between the two enums.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            TransportKind::NebulaDirect => "nebula_direct",
-            TransportKind::NebulaLighthouseRelay => "nebula_lighthouse_relay",
-            TransportKind::NebulaHttps443 => "nebula_https443",
-            TransportKind::KdcTls => "kdc_tls",
+            Self::NebulaDirect => "nebula_direct",
+            Self::NebulaLighthouseRelay => "nebula_lighthouse_relay",
+            Self::NebulaHttps443 => "nebula_https443",
+            Self::KdcTls => "kdc_tls",
         }
     }
 
@@ -139,7 +139,7 @@ impl TransportKind {
     // ------------------------------------------------------------------
 
     /// Q11 Phase 1 helper — true when this transport is any of the
-    /// three Nebula variants (Direct / Https443 / LighthouseRelay).
+    /// three Nebula variants (Direct / Https443 / `LighthouseRelay`).
     /// Consumers that previously pattern-matched all three Nebula
     /// arms identically can now write `if kind.is_nebula() { … }`
     /// in one branch.
@@ -147,23 +147,23 @@ impl TransportKind {
     pub const fn is_nebula(self) -> bool {
         matches!(
             self,
-            TransportKind::NebulaDirect
-                | TransportKind::NebulaHttps443
-                | TransportKind::NebulaLighthouseRelay
+            Self::NebulaDirect
+                | Self::NebulaHttps443
+                | Self::NebulaLighthouseRelay
         )
     }
 
     /// Q11 Phase 1 helper — return the `NebulaMode` when this
-    /// transport is Nebula, or `None` for KdcTls. Lets consumers
-    /// match on `NebulaMode` (3 variants) instead of TransportKind
+    /// transport is Nebula, or `None` for `KdcTls`. Lets consumers
+    /// match on `NebulaMode` (3 variants) instead of `TransportKind`
     /// (4 variants with 3-of-4 being Nebula-mode) in the hot path.
     #[must_use]
     pub const fn nebula_mode(self) -> Option<NebulaMode> {
         match self {
-            TransportKind::NebulaDirect => Some(NebulaMode::Direct),
-            TransportKind::NebulaHttps443 => Some(NebulaMode::Https443),
-            TransportKind::NebulaLighthouseRelay => Some(NebulaMode::LighthouseRelay),
-            TransportKind::KdcTls => None,
+            Self::NebulaDirect => Some(NebulaMode::Direct),
+            Self::NebulaHttps443 => Some(NebulaMode::Https443),
+            Self::NebulaLighthouseRelay => Some(NebulaMode::LighthouseRelay),
+            Self::KdcTls => None,
         }
     }
 }
@@ -177,7 +177,7 @@ impl TransportKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NebulaMode {
-    /// Direct UDP between two peers' WireGuard sockets.
+    /// Direct UDP between two peers' `WireGuard` sockets.
     Direct,
     /// HTTPS-tunneled TCP/443 fallback.
     Https443,
@@ -189,7 +189,7 @@ impl NebulaMode {
     /// Construct from the parent `TransportKind`, panicking if the
     /// caller passes `KdcTls`. Prefer `TransportKind::nebula_mode()`
     /// which returns `Option<NebulaMode>` and lets the caller handle
-    /// the KdcTls case explicitly; this `From`-style constructor is
+    /// the `KdcTls` case explicitly; this `From`-style constructor is
     /// for sites where the caller has already proven the variant is
     /// Nebula (e.g., after `is_nebula()` returned true).
     ///
@@ -198,25 +198,25 @@ impl NebulaMode {
     #[must_use]
     pub const fn from_transport_kind(kind: TransportKind) -> Self {
         match kind {
-            TransportKind::NebulaDirect => NebulaMode::Direct,
-            TransportKind::NebulaHttps443 => NebulaMode::Https443,
-            TransportKind::NebulaLighthouseRelay => NebulaMode::LighthouseRelay,
+            TransportKind::NebulaDirect => Self::Direct,
+            TransportKind::NebulaHttps443 => Self::Https443,
+            TransportKind::NebulaLighthouseRelay => Self::LighthouseRelay,
             TransportKind::KdcTls => {
                 panic!("NebulaMode::from_transport_kind called with KdcTls — use TransportKind::nebula_mode() instead")
             }
         }
     }
 
-    /// Stable string identifier (snake_case). Matches the
+    /// Stable string identifier (`snake_case`). Matches the
     /// `TransportKind::as_str()` shape after the `nebula_` prefix:
     /// `Direct → "direct"`, `Https443 → "https443"`,
     /// `LighthouseRelay → "lighthouse_relay"`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            NebulaMode::Direct => "direct",
-            NebulaMode::Https443 => "https443",
-            NebulaMode::LighthouseRelay => "lighthouse_relay",
+            Self::Direct => "direct",
+            Self::Https443 => "https443",
+            Self::LighthouseRelay => "lighthouse_relay",
         }
     }
 
@@ -226,9 +226,9 @@ impl NebulaMode {
     #[must_use]
     pub const fn to_transport_kind(self) -> TransportKind {
         match self {
-            NebulaMode::Direct => TransportKind::NebulaDirect,
-            NebulaMode::Https443 => TransportKind::NebulaHttps443,
-            NebulaMode::LighthouseRelay => TransportKind::NebulaLighthouseRelay,
+            Self::Direct => TransportKind::NebulaDirect,
+            Self::Https443 => TransportKind::NebulaHttps443,
+            Self::LighthouseRelay => TransportKind::NebulaLighthouseRelay,
         }
     }
 }
@@ -269,7 +269,7 @@ impl HealthState {
     /// `Down` never.
     #[must_use]
     pub const fn is_sendable(self) -> bool {
-        matches!(self, HealthState::Healthy | HealthState::Degraded)
+        matches!(self, Self::Healthy | Self::Degraded)
     }
 }
 
@@ -306,7 +306,7 @@ pub struct Capabilities {
 ///   * `Control` — KDC always (paired-device commands, ring, find).
 ///   * `Clipboard` — best-path (latency-bound, small frames).
 ///   * `FileBulk` — throughput-best (large frames, relay/HTTPS only
-///     when NebulaDirect is unhealthy).
+///     when `NebulaDirect` is unhealthy).
 ///   * `Notification` — dual-send, idempotent at receiver. Router
 ///     sends through every healthy transport; receiver dedupes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -393,7 +393,7 @@ pub trait Connection: Send + Sync + std::fmt::Debug {
 ///
 /// Implementations live in their own crates (`mde-kdc` for KDC2,
 /// `mackes-https-tunnel` for 12.18, `mackesd::transport::direct_udp`
-/// for the WireGuard path).
+/// for the `WireGuard` path).
 #[async_trait]
 pub trait Transport: Send + Sync + std::fmt::Debug {
     /// What flavor of transport is this. The router uses this to
@@ -461,10 +461,10 @@ impl TransportError {
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match self {
-            TransportError::Unreachable { code }
-            | TransportError::HandshakeFailed { code }
-            | TransportError::Misconfigured { code }
-            | TransportError::Io { code } => code,
+            Self::Unreachable { code }
+            | Self::HandshakeFailed { code }
+            | Self::Misconfigured { code }
+            | Self::Io { code } => code,
         }
     }
 
@@ -474,10 +474,10 @@ impl TransportError {
     #[must_use]
     pub const fn family(&self) -> &'static str {
         match self {
-            TransportError::Unreachable { .. } => "unreachable",
-            TransportError::HandshakeFailed { .. } => "handshake_failed",
-            TransportError::Misconfigured { .. } => "misconfigured",
-            TransportError::Io { .. } => "io",
+            Self::Unreachable { .. } => "unreachable",
+            Self::HandshakeFailed { .. } => "handshake_failed",
+            Self::Misconfigured { .. } => "misconfigured",
+            Self::Io { .. } => "io",
         }
     }
 }

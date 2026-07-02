@@ -29,16 +29,16 @@ use crate::vpn::{Method, TunnelDef};
 pub enum Provider {
     /// Mullvad — WireGuard-first (account-number auth, `mullvad` CLI available).
     Mullvad,
-    /// ProtonVPN — WireGuard configs from the dashboard/API (`protonvpn-cli`).
+    /// `ProtonVPN` — `WireGuard` configs from the dashboard/API (`protonvpn-cli`).
     Proton,
-    /// IVPN — WireGuard configs/API (`ivpn` CLI).
+    /// IVPN — `WireGuard` configs/API (`ivpn` CLI).
     Ivpn,
-    /// NordVPN — NordLynx (WireGuard) primarily via the `nordvpn` CLI; manual
-    /// WireGuard via the access-token API; OpenVPN configs also published.
+    /// `NordVPN` — `NordLynx` (`WireGuard`) primarily via the `nordvpn` CLI; manual
+    /// `WireGuard` via the access-token API; `OpenVPN` configs also published.
     Nord,
-    /// Surfshark — WireGuard + OpenVPN configs from the dashboard.
+    /// Surfshark — `WireGuard` + `OpenVPN` configs from the dashboard.
     Surfshark,
-    /// Generic "paste any WireGuard config".
+    /// Generic "paste any `WireGuard` config".
     GenericWg,
     /// Generic "import any .ovpn".
     GenericOvpn,
@@ -132,7 +132,7 @@ impl Provider {
     /// Whether the provider's ToS/keys allow the same account to run multiple
     /// concurrent tunnels (multi-instance). The model allows distinct
     /// `mvpn-<id>` interfaces regardless; this drives the UI's per-provider
-    /// guidance. All current providers permit it (NordVPN caps the *count* per
+    /// guidance. All current providers permit it (`NordVPN` caps the *count* per
     /// account, which the route assignment — not this flag — enforces).
     #[must_use]
     pub const fn allows_multi_instance(self) -> bool {
@@ -152,12 +152,12 @@ pub const NEUTRAL_EXIT_CHECK_HOST: &str = "https://ipinfo.io/json";
 pub struct WgSetup {
     /// Operator-chosen tunnel id (drives `mvpn-<id>`). Required.
     pub id: String,
-    /// The client's WireGuard private key (base64). Required.
+    /// The client's `WireGuard` private key (base64). Required.
     pub private_key: String,
     /// The client's tunnel address(es), e.g. `10.64.0.2/32` (+ an optional v6).
-    /// Provider-issued; required — WireGuard won't come up without it.
+    /// Provider-issued; required — `WireGuard` won't come up without it.
     pub address: String,
-    /// The server's WireGuard public key (base64). Required.
+    /// The server's `WireGuard` public key (base64). Required.
     pub peer_public_key: String,
     /// The server endpoint host (hostname or IP), e.g. `us-nyc-wg-301.relays...`.
     /// Required. A `:port` suffix overrides [`Provider::default_wg_port`].
@@ -175,7 +175,7 @@ pub struct WgSetup {
 }
 
 /// A produced tunnel: the [`TunnelDef`] for the durable config + the rendered
-/// secret material (a WireGuard `.conf` body or an `.ovpn` body) to hand to the
+/// secret material (a `WireGuard` `.conf` body or an `.ovpn` body) to hand to the
 /// secret store. The secret is kept OUT of the `TunnelDef` (which only carries a
 /// `creds_ref`); callers age-encrypt `secret` and set `def.creds_ref`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,7 +195,7 @@ pub enum SecretKind {
     /// A `wg-quick(8)` interface config (`[Interface]`/`[Peer]`), written to
     /// `/etc/wireguard/<ifname>.conf`.
     WgQuick,
-    /// An OpenVPN client config (`.ovpn`), written to the openvpn config dir.
+    /// An `OpenVPN` client config (`.ovpn`), written to the openvpn config dir.
     Ovpn,
 }
 
@@ -216,8 +216,8 @@ pub enum AdapterError {
 impl std::fmt::Display for AdapterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AdapterError::Missing(field) => write!(f, "missing required field: {field}"),
-            AdapterError::Invalid { field, reason } => {
+            Self::Missing(field) => write!(f, "missing required field: {field}"),
+            Self::Invalid { field, reason } => {
                 write!(f, "invalid {field}: {reason}")
             }
         }
@@ -226,7 +226,7 @@ impl std::fmt::Display for AdapterError {
 
 impl std::error::Error for AdapterError {}
 
-/// Is `s` plausibly a base64 WireGuard key? A WG key is 32 bytes → exactly 44
+/// Is `s` plausibly a base64 `WireGuard` key? A WG key is 32 bytes → exactly 44
 /// base64 chars: 43 from the alphabet `[A-Za-z0-9+/]` followed by a single `=`
 /// of padding (the `=` only ever appears as the final char). We don't decode
 /// (no extra dep); we check the length + charset + padding shape so an
@@ -325,9 +325,9 @@ fn normalize_endpoint(endpoint: &str, default_port: u16) -> Result<String, Adapt
     }
 }
 
-/// Build a WireGuard adapter setup for a first-class provider (or generic-wg),
+/// Build a `WireGuard` adapter setup for a first-class provider (or generic-wg),
 /// producing a `wg-quick` config + the [`TunnelDef`]. The five providers share
-/// the WireGuard config shape; only the defaults (port, label, verification
+/// the `WireGuard` config shape; only the defaults (port, label, verification
 /// host) differ — captured by [`Provider`]. Pure + deterministic.
 ///
 /// # Errors
@@ -434,7 +434,7 @@ fn normalize_dns(dns: &str) -> String {
     out.join(", ")
 }
 
-/// A parsed WireGuard config (the "paste any WG config" generic path). Captures
+/// A parsed `WireGuard` config (the "paste any WG config" generic path). Captures
 /// just the fields the adapter needs to (a) sanity-check the paste and (b)
 /// derive a [`WgSetup`] so the same render/standup path is reused.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -455,14 +455,14 @@ pub struct ParsedWgConf {
     pub allowed_ips: String,
 }
 
-/// Parse a pasted WireGuard `.conf` (the generic path). Tolerant of comments
+/// Parse a pasted `WireGuard` `.conf` (the generic path). Tolerant of comments
 /// (`#`/`;`), blank lines, and `key=value` with surrounding spaces; section
 /// headers (`[Interface]`/`[Peer]`) are honored so a `PublicKey` under `[Peer]`
 /// isn't confused with an interface key. Pure.
 ///
 /// # Errors
-/// [`AdapterError`] if the required WireGuard fields (PrivateKey, Address, the
-/// peer PublicKey, Endpoint) are absent — an unusable paste is caught here.
+/// [`AdapterError`] if the required `WireGuard` fields (`PrivateKey`, Address, the
+/// peer `PublicKey`, Endpoint) are absent — an unusable paste is caught here.
 pub fn parse_wg_conf(text: &str) -> Result<ParsedWgConf, AdapterError> {
     #[derive(PartialEq)]
     enum Section {
@@ -521,7 +521,7 @@ pub fn parse_wg_conf(text: &str) -> Result<ParsedWgConf, AdapterError> {
 }
 
 /// The "paste a WG config" path: parse the pasted config, then run it through
-/// the same WireGuard adapter so the produced tunnel is identical in shape to a
+/// the same `WireGuard` adapter so the produced tunnel is identical in shape to a
 /// first-class one. `id`/`server` are operator-supplied (the paste has no tunnel
 /// id). `provider` tags the result — usually [`Provider::GenericWg`], but a
 /// named provider's dashboard-exported `.conf` keeps that provider's label (and
@@ -530,7 +530,7 @@ pub fn parse_wg_conf(text: &str) -> Result<ParsedWgConf, AdapterError> {
 ///
 /// # Errors
 /// [`AdapterError`] from parsing, from [`build_wg`], or if `provider` is not a
-/// WireGuard provider.
+/// `WireGuard` provider.
 pub fn import_wg_paste(
     provider: Provider,
     id: &str,
@@ -560,7 +560,8 @@ pub fn import_wg_paste(
     build_wg(provider, &setup)
 }
 
-/// A minimal parse of an OpenVPN `.ovpn` (the "import any .ovpn" generic path).
+/// A minimal parse of an `OpenVPN` `.ovpn` (the "import any .ovpn" generic path).
+///
 /// `.ovpn` is verbatim config — we don't re-render it (it's handed to `openvpn`
 /// as-is), so we only extract what's needed to build a [`TunnelDef`] + to catch
 /// an obviously-broken file before it's stored.

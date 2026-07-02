@@ -322,18 +322,18 @@ impl crate::Connection for MockConnection {
 }
 
 /// Canonical fixture for the [`MockTransport`]. Downstream crates
-/// can ship their own ConformanceFixture impl seeded with their
+/// can ship their own `ConformanceFixture` impl seeded with their
 /// own paired/unpaired/degraded ids.
 pub struct MockFixture;
 
 impl ConformanceFixture for MockFixture {
-    fn paired_peer_id(&self) -> &str {
+    fn paired_peer_id(&self) -> &'static str {
         "paired"
     }
-    fn unpaired_peer_id(&self) -> &str {
+    fn unpaired_peer_id(&self) -> &'static str {
         "unpaired"
     }
-    fn degraded_peer_id(&self) -> &str {
+    fn degraded_peer_id(&self) -> &'static str {
         "degraded"
     }
 }

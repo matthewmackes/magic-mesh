@@ -472,7 +472,7 @@ impl EgressRoute {
     ///
     /// This is the pure failover decision: feeding it the live down-set (from the
     /// health checker, VPN-GW-6) yields exactly which tunnel the gateway should
-    /// be NATing out of right now, and a single drop walks it to the next.
+    /// be `NATing` out of right now, and a single drop walks it to the next.
     ///
     /// [`kill_switch`]: Self::kill_switch
     #[must_use]

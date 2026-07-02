@@ -2,7 +2,7 @@
 //! (design: `docs/design/ddns-egress.md`).
 //!
 //! When a VPN exit (or WAN) IP changes, DDNS rewrites a stable hostname under
-//! `services.matthewmackes.com` to the new IP via the DigitalOcean DNS API. This
+//! `services.matthewmackes.com` to the new IP via the `DigitalOcean` DNS API. This
 //! crate holds the durable `[ddns]` config (TOML on the shared substrate), the
 //! record-name templating (`{node}-{provider}` → a FQDN in the zone), and the
 //! **change-detection predicate** (only a real diff from the last-published value
@@ -118,7 +118,7 @@ pub struct DdnsConfig {
     /// Master enable.
     #[serde(default)]
     pub enabled: bool,
-    /// DnsWriter adapter (`digitalocean` in v1).
+    /// `DnsWriter` adapter (`digitalocean` in v1).
     #[serde(default = "default_provider")]
     pub provider: String,
     /// The DNS zone records live under.
@@ -141,7 +141,7 @@ fn default_provider() -> String {
 fn default_zone() -> String {
     "services.matthewmackes.com".to_string()
 }
-fn default_ttl() -> u32 {
+const fn default_ttl() -> u32 {
     60
 }
 
@@ -215,7 +215,7 @@ pub fn needs_update(last: Option<&str>, current: &str) -> bool {
 }
 
 /// The A/AAAA record type for an IP literal — `AAAA` for IPv6 (contains `:`),
-/// else `A`. Pure helper for the DigitalOcean writer.
+/// else `A`. Pure helper for the `DigitalOcean` writer.
 #[must_use]
 pub fn record_type(ip: &str) -> &'static str {
     if ip.contains(':') {
@@ -225,7 +225,7 @@ pub fn record_type(ip: &str) -> &'static str {
     }
 }
 
-/// DDNS-EGRESS-2 — the DigitalOcean DNS API request to **upsert** a record: a
+/// DDNS-EGRESS-2 — the `DigitalOcean` DNS API request to **upsert** a record: a
 /// `PUT …/records/{id}` when `existing_id` is known, else a `POST …/records` to
 /// create. Returns `(method, path, json_body)`; the daemon adapter attaches the
 /// bearer token + executes. `name` is the bare label (the part before the zone).
@@ -249,7 +249,7 @@ pub fn do_upsert_request(
     }
 }
 
-/// DDNS-EGRESS-2 — the DigitalOcean request to **delete** a record by id
+/// DDNS-EGRESS-2 — the `DigitalOcean` request to **delete** a record by id
 /// (`on_down = remove`). Returns `(method, path)`. Pure.
 #[must_use]
 pub fn do_delete_request(domain: &str, id: &str) -> (&'static str, String) {

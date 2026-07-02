@@ -18,11 +18,11 @@
 //!
 //!   * `group_color` (R12-Q21) — drives focused-border tinting + the
 //!     transient previous-workspace segment color.
-//!   * `preferred_output` (R12-Q2) — workspace::init routes a tag-
+//!   * `preferred_output` (R12-Q2) — `workspace::init` routes a tag-
 //!     owned workspace to this output.
 //!   * `default_layout` (R12-Q4) — splith/splitv/tabbed/stacked
 //!     baseline for new windows in a tag-owned workspace.
-//!   * `autostart` (R12-Q16) — `Vec<String>` app_ids that launch
+//!   * `autostart` (R12-Q16) — `Vec<String>` `app_ids` that launch
 //!     on first init of a tag-owned workspace per mded-lifetime.
 //!
 //! Three tag flavors are locked (R1-Q103 + R1-Q63):
@@ -55,7 +55,7 @@ pub struct Tag {
     pub flavor: TagFlavor,
     /// Members — explicit list for Manual tags, ignored for Smart
     /// (whose predicate computes membership at query time) and
-    /// Preset (whose launch_bundle is the click-action, not a
+    /// Preset (whose `launch_bundle` is the click-action, not a
     /// membership set).
     #[serde(default)]
     pub members: Vec<TagMember>,
@@ -64,7 +64,7 @@ pub struct Tag {
     /// platform default (Material blue).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_color: Option<String>,
-    /// R12-Q2 — workspace::init routes a tag-owned workspace to
+    /// R12-Q2 — `workspace::init` routes a tag-owned workspace to
     /// this sway output name (e.g. `HDMI-A-1`). `None` lets sway
     /// pick naturally.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -74,14 +74,14 @@ pub struct Tag {
     /// `stacked`. `None` follows sway's parent default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_layout: Option<String>,
-    /// R12-Q16 — app_ids to launch on first init of a tag-owned
+    /// R12-Q16 — `app_ids` to launch on first init of a tag-owned
     /// workspace per mded-lifetime. NOT XDG-autostart-compliant;
     /// tag-driven is the only mechanism.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub autostart: Vec<String>,
 }
 
-fn default_flavor() -> TagFlavor {
+const fn default_flavor() -> TagFlavor {
     TagFlavor::Manual
 }
 
@@ -101,7 +101,7 @@ pub enum TagFlavor {
     /// Preset launch-bundle (R1-Q63). Click fires `swaymsg exec
     /// <cmd>` for each entry — does not contribute members.
     Preset {
-        /// app_ids (or shell commands) launched on tag-card click.
+        /// `app_ids` (or shell commands) launched on tag-card click.
         launch_bundle: Vec<String>,
     },
 }
@@ -136,7 +136,7 @@ pub enum TagMember {
         /// Podman container name.
         name: String,
     },
-    /// Tray (StatusNotifierItem) bus name.
+    /// Tray (`StatusNotifierItem`) bus name.
     Tray {
         /// SNI bus name (e.g. `org.freedesktop.StatusNotifier-1234-1`).
         bus_name: String,
@@ -185,7 +185,7 @@ impl Default for TagStore {
     }
 }
 
-fn schema_version_default() -> u32 {
+const fn schema_version_default() -> u32 {
     1
 }
 
@@ -199,7 +199,7 @@ pub enum TagStoreError {
     /// Tag with the given name already exists (case-sensitive
     /// exact match).
     DuplicateName(String),
-    /// The tag-store path can't be resolved (XDG_DATA_HOME
+    /// The tag-store path can't be resolved (`XDG_DATA_HOME`
     /// unset AND $HOME unset — vanishingly rare).
     PathResolution,
 }
@@ -245,7 +245,7 @@ impl TagStore {
             return Ok(Self::default());
         }
         let raw = fs::read_to_string(path)?;
-        let store: TagStore = serde_json::from_str(&raw)?;
+        let store: Self = serde_json::from_str(&raw)?;
         Ok(store)
     }
 
@@ -300,7 +300,7 @@ impl TagStore {
         self.tags.iter().find(|t| t.name == name)
     }
 
-    /// Mutable find_by_name for in-place edits.
+    /// Mutable `find_by_name` for in-place edits.
     pub fn find_by_name_mut(&mut self, name: &str) -> Option<&mut Tag> {
         self.tags.iter_mut().find(|t| t.name == name)
     }

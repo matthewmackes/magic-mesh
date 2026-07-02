@@ -18,10 +18,10 @@ pub const IFNAME_MAX: usize = 15;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Method {
-    /// WireGuard via `wg-quick` on a rendered config (the primary path).
+    /// `WireGuard` via `wg-quick` on a rendered config (the primary path).
     #[default]
     Wg,
-    /// OpenVPN via `openvpn` on an imported `.ovpn`.
+    /// `OpenVPN` via `openvpn` on an imported `.ovpn`.
     Ovpn,
     /// A provider CLI (`mullvad`/`protonvpn-cli`/`nordvpn`).
     Cli,
@@ -43,7 +43,7 @@ pub struct TunnelDef {
     /// Server/region selector (provider-specific; may be empty for generic).
     #[serde(default)]
     pub server: String,
-    /// Transport hint (`udp`/`tcp`); OpenVPN obfuscation → tcp.
+    /// Transport hint (`udp`/`tcp`); `OpenVPN` obfuscation → tcp.
     #[serde(default)]
     pub protocol: String,
     /// Reference to the age-encrypted creds in the mesh secret store.
@@ -61,7 +61,7 @@ impl TunnelDef {
         let body: String = self
             .id
             .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
+            .filter(char::is_ascii_alphanumeric)
             .take(IFNAME_MAX - PREFIX.len())
             .collect();
         format!("{PREFIX}{body}")

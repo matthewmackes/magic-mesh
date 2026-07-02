@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 pub enum EncryptionKind {
     /// No transport-level encryption. Loopback / dev only.
     None,
-    /// AES-128-GCM (e.g. WireGuard tunnel default).
+    /// AES-128-GCM (e.g. `WireGuard` tunnel default).
     Aes128Gcm,
     /// AES-256-GCM (KDC2 + TLS 1.3 default).
     Aes256Gcm,
@@ -45,10 +45,10 @@ impl EncryptionKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            EncryptionKind::None => "none",
-            EncryptionKind::Aes128Gcm => "aes128_gcm",
-            EncryptionKind::Aes256Gcm => "aes256_gcm",
-            EncryptionKind::ChaCha20Poly1305 => "chacha20_poly1305",
+            Self::None => "none",
+            Self::Aes128Gcm => "aes128_gcm",
+            Self::Aes256Gcm => "aes256_gcm",
+            Self::ChaCha20Poly1305 => "chacha20_poly1305",
         }
     }
 
@@ -56,7 +56,7 @@ impl EncryptionKind {
     /// (AEAD). All current variants except `None` are AEADs.
     #[must_use]
     pub const fn is_authenticated(self) -> bool {
-        !matches!(self, EncryptionKind::None)
+        !matches!(self, Self::None)
     }
 
     /// CV-1 — comparable strength rank for the router's
@@ -66,9 +66,9 @@ impl EncryptionKind {
     #[must_use]
     pub const fn strength_rank(self) -> u8 {
         match self {
-            EncryptionKind::None => 0,
-            EncryptionKind::Aes128Gcm => 1,
-            EncryptionKind::Aes256Gcm | EncryptionKind::ChaCha20Poly1305 => 2,
+            Self::None => 0,
+            Self::Aes128Gcm => 1,
+            Self::Aes256Gcm | Self::ChaCha20Poly1305 => 2,
         }
     }
 
@@ -84,11 +84,11 @@ impl EncryptionKind {
         match kind {
             // Nebula tunnel cipher (§3): AES-256-GCM (relay paths may
             // negotiate ChaCha20-Poly1305 — equal rank either way).
-            crate::TransportKind::NebulaDirect => EncryptionKind::Aes256Gcm,
-            crate::TransportKind::NebulaLighthouseRelay => EncryptionKind::ChaCha20Poly1305,
+            crate::TransportKind::NebulaDirect => Self::Aes256Gcm,
+            crate::TransportKind::NebulaLighthouseRelay => Self::ChaCha20Poly1305,
             // TLS 1.3 inside the overlay.
             crate::TransportKind::NebulaHttps443 | crate::TransportKind::KdcTls => {
-                EncryptionKind::Aes256Gcm
+                Self::Aes256Gcm
             }
         }
     }
@@ -123,7 +123,7 @@ impl TransportCapabilities {
     /// WireGuard-era AES-128 default — this mesh's substrate is
     /// Nebula, whose cipher is AES-256-GCM.
     #[must_use]
-    pub fn direct_udp_default() -> Self {
+    pub const fn direct_udp_default() -> Self {
         Self {
             supports_bulk: false,
             supports_streaming: false,
@@ -137,7 +137,7 @@ impl TransportCapabilities {
     /// streaming yes, bulk yes via `share.request`, unbounded
     /// MTU within the TLS session, AES-256-GCM).
     #[must_use]
-    pub fn kdc_tls_default() -> Self {
+    pub const fn kdc_tls_default() -> Self {
         Self {
             supports_bulk: true,
             supports_streaming: true,
@@ -150,7 +150,7 @@ impl TransportCapabilities {
     /// Default lighthouse-relay capabilities (Nebula lighthouse-relay: small
     /// frames, no bulk, ChaCha20-Poly1305).
     #[must_use]
-    pub fn derp_relay_default() -> Self {
+    pub const fn derp_relay_default() -> Self {
         Self {
             supports_bulk: false,
             supports_streaming: false,

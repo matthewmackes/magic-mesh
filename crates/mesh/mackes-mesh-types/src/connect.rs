@@ -21,7 +21,7 @@ pub enum PeerKind {
     Desktop,
     /// Always-on server peer (no display, no operator at console).
     Server,
-    /// Headless embedded device (Pi, NAS, IoT).
+    /// Headless embedded device (Pi, NAS, `IoT`).
     Embedded,
     /// Android handset paired via KDC.
     Phone,
@@ -35,14 +35,14 @@ impl PeerKind {
     /// Every variant in stable order — used by tests + the
     /// future operator-facing "filter by kind" dropdown.
     #[must_use]
-    pub const fn all() -> [PeerKind; 6] {
+    pub const fn all() -> [Self; 6] {
         [
-            PeerKind::Desktop,
-            PeerKind::Server,
-            PeerKind::Embedded,
-            PeerKind::Phone,
-            PeerKind::Tablet,
-            PeerKind::Unknown,
+            Self::Desktop,
+            Self::Server,
+            Self::Embedded,
+            Self::Phone,
+            Self::Tablet,
+            Self::Unknown,
         ]
     }
 
@@ -51,19 +51,19 @@ impl PeerKind {
     /// sections (battery / ring / find).
     #[must_use]
     pub const fn is_handheld(self) -> bool {
-        matches!(self, PeerKind::Phone | PeerKind::Tablet)
+        matches!(self, Self::Phone | Self::Tablet)
     }
 
     /// Stable display token. Matches the serde rendering.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            PeerKind::Desktop => "desktop",
-            PeerKind::Server => "server",
-            PeerKind::Embedded => "embedded",
-            PeerKind::Phone => "phone",
-            PeerKind::Tablet => "tablet",
-            PeerKind::Unknown => "unknown",
+            Self::Desktop => "desktop",
+            Self::Server => "server",
+            Self::Embedded => "embedded",
+            Self::Phone => "phone",
+            Self::Tablet => "tablet",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -95,10 +95,10 @@ impl PairingState {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            PairingState::Unpaired => "unpaired",
-            PairingState::Pairing => "pairing",
-            PairingState::Paired => "paired",
-            PairingState::KeyMismatch => "key_mismatch",
+            Self::Unpaired => "unpaired",
+            Self::Pairing => "pairing",
+            Self::Paired => "paired",
+            Self::KeyMismatch => "key_mismatch",
         }
     }
 }
@@ -173,7 +173,7 @@ impl ConnectFacts {
     /// Used by the workbench to render the device-row green
     /// vs. grey.
     #[must_use]
-    pub fn is_online(&self, now_epoch_s: i64) -> bool {
+    pub const fn is_online(&self, now_epoch_s: i64) -> bool {
         matches!(self.pairing, PairingState::Paired) && {
             // "Recent" = within the last 90s (matches the KDC
             // identity-broadcast cadence — every peer
@@ -185,7 +185,7 @@ impl ConnectFacts {
     /// True when this peer should surface the phone-only UI
     /// sections (battery / ring / find / SMS / share).
     #[must_use]
-    pub fn shows_phone_sections(&self) -> bool {
+    pub const fn shows_phone_sections(&self) -> bool {
         self.kind.is_handheld()
     }
 }

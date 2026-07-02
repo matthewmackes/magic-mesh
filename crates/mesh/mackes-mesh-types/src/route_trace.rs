@@ -222,7 +222,7 @@ impl PathGraph {
 
     /// True when the path reaches the destination unblocked.
     #[must_use]
-    pub fn is_reachable(&self) -> bool {
+    pub const fn is_reachable(&self) -> bool {
         self.blocked_at.is_none()
     }
 

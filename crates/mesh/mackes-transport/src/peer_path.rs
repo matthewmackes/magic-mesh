@@ -4,8 +4,8 @@
 //! peer. It tracks which transport is currently primary for that
 //! peer, which is fallback, when the last switch happened, and
 //! why. Per-message-class overrides let an operator pin (for
-//! example) a `FileBulk` transport to KdcTls even when the
-//! router's health-based default would pick NebulaDirect.
+//! example) a `FileBulk` transport to `KdcTls` even when the
+//! router's health-based default would pick `NebulaDirect`.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -16,11 +16,12 @@ use serde::{Deserialize, Serialize};
 use crate::{MessageClass, TransportKind};
 
 /// Phase 12.18 — per-peer HTTPS-tunnel activation state.
+///
 /// The mesh-router observes probe outcomes per peer + feeds them
 /// into a per-peer `FailureWindow` (re-exported from
 /// `mackesd::https_fallback`). When the failure window meets the
 /// 3-cycle threshold, this state advances from `Inactive` to
-/// `Activating`; once the NebulaHttps443 transport reports a successful
+/// `Activating`; once the `NebulaHttps443` transport reports a successful
 /// TLS handshake, to `Active`. A fresh direct-UDP-or-relay success
 /// snaps it back to `Inactive`.
 ///
@@ -49,14 +50,14 @@ impl HttpsFallbackState {
     /// `true` when the routing layer should treat the HTTPS
     /// tunnel as the active path.
     #[must_use]
-    pub fn is_active(self) -> bool {
+    pub const fn is_active(self) -> bool {
         matches!(self, Self::Active)
     }
 
     /// `true` when the UI should surface the "connecting via
     /// HTTPS…" toast.
     #[must_use]
-    pub fn is_activating(self) -> bool {
+    pub const fn is_activating(self) -> bool {
         matches!(self, Self::Activating)
     }
 }
@@ -76,7 +77,7 @@ pub struct StunCandidate {
     /// The STUN server that produced this candidate. Useful for
     /// audit + diagnostic logs when multiple servers respond.
     pub server: SocketAddr,
-    /// SystemTime when the candidate was last refreshed. Stale
+    /// `SystemTime` when the candidate was last refreshed. Stale
     /// candidates (older than the Q13 backoff-cap, 5 min) get
     /// pruned by the gather worker.
     pub observed_at: SystemTime,
@@ -123,13 +124,13 @@ impl SwitchReason {
     #[must_use]
     pub fn audit_token(&self) -> String {
         match self {
-            SwitchReason::Initial => "initial".to_string(),
-            SwitchReason::HealthDegraded(t) => format!("health_degraded_{}", t.as_str()),
-            SwitchReason::Policy => "policy".to_string(),
-            SwitchReason::ManualOverride => "manual_override".to_string(),
-            SwitchReason::FlapPenalty => "flap_penalty".to_string(),
-            SwitchReason::MeshShuntActivated => "mesh_shunt_activated".to_string(),
-            SwitchReason::DirectLanRecovered => "direct_lan_recovered".to_string(),
+            Self::Initial => "initial".to_string(),
+            Self::HealthDegraded(t) => format!("health_degraded_{}", t.as_str()),
+            Self::Policy => "policy".to_string(),
+            Self::ManualOverride => "manual_override".to_string(),
+            Self::FlapPenalty => "flap_penalty".to_string(),
+            Self::MeshShuntActivated => "mesh_shunt_activated".to_string(),
+            Self::DirectLanRecovered => "direct_lan_recovered".to_string(),
         }
     }
 }
@@ -159,7 +160,7 @@ pub struct PeerPath {
     /// transport. Used by the mesh-router tie-break.
     pub health_score: f32,
     /// Per-message-class overrides. When a class is in this map,
-    /// the router uses the mapped TransportKind for that class
+    /// the router uses the mapped `TransportKind` for that class
     /// regardless of `primary` / health.
     pub message_class_overrides: BTreeMap<MessageClass, TransportKind>,
     /// Phase 12.17 — STUN candidates the router can hand to
@@ -193,7 +194,7 @@ impl PeerPath {
     /// Construct a fresh `PeerPath` with `Initial` switch reason.
     /// Used by the router when it first sees a peer.
     #[must_use]
-    pub fn initial(peer_id: String, primary: TransportKind) -> Self {
+    pub const fn initial(peer_id: String, primary: TransportKind) -> Self {
         Self {
             peer_id,
             primary,

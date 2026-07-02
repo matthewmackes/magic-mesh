@@ -121,13 +121,13 @@ pub enum RouterError {
 impl RouterError {
     /// Stable audit-token for the audit chain.
     #[must_use]
-    pub fn audit_token(&self) -> &'static str {
+    pub const fn audit_token(&self) -> &'static str {
         match self {
-            RouterError::Unreachable => "unreachable",
-            RouterError::HandshakeFailed => "handshake_failed",
-            RouterError::PolicyDenied => "policy_denied",
-            RouterError::BackendBusy => "backend_busy",
-            RouterError::Timeout => "timeout",
+            Self::Unreachable => "unreachable",
+            Self::HandshakeFailed => "handshake_failed",
+            Self::PolicyDenied => "policy_denied",
+            Self::BackendBusy => "backend_busy",
+            Self::Timeout => "timeout",
         }
     }
 }

@@ -95,7 +95,7 @@ impl LighthouseProbe {
 
     /// Human-readable handshake label for the card (`—` when unknown).
     #[must_use]
-    pub fn handshake_word(&self) -> &'static str {
+    pub const fn handshake_word(&self) -> &'static str {
         match self.handshake {
             Some(true) => "established",
             Some(false) => "no tunnel",
