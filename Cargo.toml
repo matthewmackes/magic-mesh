@@ -39,6 +39,7 @@ members = [
     "crates/desktop/mde-mesh-view",
     "crates/desktop/mde-music-egui",
     "crates/desktop/mde-files-egui",
+    "crates/desktop/mde-bookmarks-egui",
     "crates/desktop/mde-voice-egui",
     "crates/desktop/mde-vdi-rdp",
     "crates/desktop/mde-vdi-vnc",

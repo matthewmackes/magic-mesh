@@ -1,0 +1,46 @@
+# MCNF E12 "Quasar" — `mde-bookmarks-egui`: the Surface::Bookmarks manager
+# (BOOKMARKS-4; design: `docs/design/mesh-bookmarks.md`).
+#
+# An `eframe` app on the shared `mde-egui` harness that REUSES `mde-bookmarks`'
+# pure model + CRDT — the `Collection`/`Bookmark`/`Folder` tree and the
+# append-only `Op` set — driving every edit through those ops (§6
+# glue-not-reimplementation). Renders the locked three-region manager (folder
+# tree · list · detail pane) plus the addenda's left vertical tab rail, all
+# through the shared Carbon `Style` tokens (§4 — no raw hex).
+#
+# Tier (§6): desktop-shell. The edges point inward — `mde-egui` (shared harness)
+# and `mde-bookmarks` (services model, consumed headless). The live Servo browser
+# (BOOKMARKS-5/6) and the Syncthing persistence worker (BOOKMARKS-2) are separate
+# later units; the detail pane carries an honest browser seam and the model
+# accepts a worker-supplied `Collection` at construction.
+[package]
+name        = "mde-bookmarks-egui"
+description = "MCNF E12 Quasar — the egui Surface::Bookmarks manager on the mde-egui harness that reuses mde-bookmarks' pure Collection/CRDT: a three-region manager (folder tree · list · detail pane) plus a left vertical tab rail, with folder CRUD, manual + sort-by order, live title/URL search, Ctrl/Shift multi-select bulk ops, and drag reorder/move — every edit driving a real mde-bookmarks Op. Renders through the shared Carbon Style (no raw hex); the live Servo browser (BOOKMARKS-5/6) is an honest detail-pane seam, not a stub."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_bookmarks_egui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mde-bookmarks-egui"
+path = "src/main.rs"
+
+[dependencies]
+# The §4/§5 egui harness — `run_client` + the shared `Style` + the re-exported
+# `egui`/`eframe` (one toolkit resolution for every surface).
+mde-egui = { path = "../../shared/mde-egui" }
+# REUSE: the pure Bookmarks model + CRDT ops. Consumed headless (it has no GUI);
+# every UI edit mints one of its `Op`s and applies it to the `Collection`.
+mde-bookmarks = { path = "../../services/mde-bookmarks" }
+# The per-item CRDT key type (`Uuid`) that mde-bookmarks' API returns, and
+# `new_v4` to mint the id for an added bookmark/folder (lock Q1).
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true
