@@ -28,11 +28,14 @@ mod services_flow;
 mod session;
 mod system;
 mod thisnode;
+mod toast_bridge;
 mod vdi;
 mod workbench;
 
 use mde_egui::eframe::CreationContext;
 use mde_egui::{eframe, egui, run_client, Motion, Style};
+
+use mde_seat::{Probe, SeatSnapshot};
 
 use mde_files_egui::{files_panel, FileBrowser};
 use mde_music_egui::{music_header, music_panel, music_pump, MusicApp};
@@ -133,6 +136,11 @@ struct Shell {
     /// backlight / hotkeys. Its cached snapshot also feeds the three read-only
     /// chrome status icons (E12-15). Absent backends render honestly (§7).
     system: system::SystemState,
+    /// The KIRON chyron bridge (KIRON-2) — the shell's one `ToastHost` plus its
+    /// `event/toast/show` Bus subscription, suppression posture, and the single
+    /// notification-sound seam. Driven every frame; its lower-third band + OSD
+    /// float above whatever surface (or fullscreen guest) is in view.
+    toasts: toast_bridge::ToastBridge,
 }
 
 impl Shell {
@@ -166,6 +174,7 @@ impl Shell {
             notifications: notifications::NotificationsState::default(),
             clipboard: clipboard::ClipboardState::default(),
             system: system::SystemState::default(),
+            toasts: toast_bridge::ToastBridge::default(),
         }
     }
 
@@ -388,7 +397,37 @@ impl Shell {
         if t > 0.001 && t < 0.999 {
             ctx.request_repaint();
         }
+
+        // The KIRON chyron (KIRON-2) — driven last so its lower-third band + OSD
+        // float (Foreground order) above the chrome, the surface, and any
+        // fullscreen guest. Refresh the suppression posture (lock 10) first: a
+        // fullscreen VDI guest in front is a per-session focus mute, and the seat's
+        // audio-mute hushes a non-critical's sound. (DND has no shell toggle yet —
+        // NOTIFY-CHAT owns it; a Critical breaks through regardless.)
+        let focus_mute =
+            self.nav.surface == Surface::Desktop && self.vdi.requested_target().is_some();
+        let muted = self.system.snapshot().is_some_and(seat_master_muted);
+        self.toasts.set_suppression(false, focus_mute, muted);
+        if let Some(nav) = self.toasts.drive(ctx) {
+            // A clicked chyron action navigates — THIS is where the verb executes
+            // (KIRON-1 deliberately only reported it). Any target expands the shell.
+            self.nav.expanded = true;
+            match nav {
+                toast_bridge::Navigate::Surface(surface) => self.nav.surface = surface,
+                toast_bridge::Navigate::Plane(plane) => {
+                    self.nav.surface = Surface::Workbench;
+                    self.nav.plane = plane;
+                }
+            }
+        }
     }
+}
+
+/// The seat's master-output mute, if the mixer probe answered — gates a
+/// non-critical chyron's notification sound (KIRON lock 8). No mixer backend reads
+/// as *not* muted (an absent probe never silences an alert).
+fn seat_master_muted(snap: &SeatSnapshot) -> bool {
+    matches!(&snap.mixer, Probe::Present(status) if status.master.muted)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
