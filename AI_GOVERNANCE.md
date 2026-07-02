@@ -170,6 +170,14 @@ The dependency graph is **three lint-gated tiers**:
   is default-deny; MCNF only ever *widens* it for an explicitly-exposed service;
   intra-mesh trust stays flat / open-mesh (§8).
 
+> **Notification interface (NOTIFY-CHAT, operator survey 2026-07-02 — `docs/design/mesh-chat-icq.md`).**
+> The one notification surface is an **ICQ-style mesh chat**: every host (local + remote, incl. VM
+> guests) is a roster **contact with its hostname as the username**, and its system alerts + clipboard
+> copies arrive as **signed messages from that contact** (a mackesd `chat` worker subscribes every alert
+> lane and folds them, no emitter changes). Group + 1:1 chat over **Bus-live + Syncthing-history**
+> (Ed25519-signed, Nebula transit). This **subsumes and removes** the standalone Notifications AND
+> Clipboard surfaces. Successor to the retired-iced NOTIFY-REDESIGN.
+
 ## §7 — Definition of Done
 
 *(Carried forward unchanged from E11 — still load-bearing.)* A change is done only
