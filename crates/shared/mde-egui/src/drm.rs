@@ -807,6 +807,15 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     // touchscreen — the honest hardware gate).
     let mut touch = TouchTranslator::new(TouchTransform::new(wp, hp, ppp));
 
+    // SURFACE-11 (lock 16): fold the SAME multitouch contact stream into gestures —
+    // two-finger scroll, pinch-zoom, long-press → secondary click, and edge-swipes.
+    // It shares `touch`'s transform (never re-deriving coordinates, §6); its outputs
+    // become egui scroll/zoom/secondary-click events, and edge-swipes are pushed on the
+    // seat→shell side channel the shell drains to reveal the dock/tablet bar.
+    let mut gestures =
+        crate::gestures::GestureRecognizer::new(crate::gestures::GestureConfig::default());
+    let mut gesture_out: Vec<crate::gestures::Gesture> = Vec::new();
+
     // SURFACE-9 (locks 9 + 15): formfactor signal + auto-rotation, both driven off the
     // seat's live evdev/iio streams and the shared pure cores in `crate::formfactor`.
     //
@@ -908,6 +917,15 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                             pointer = touch.transform().to_points(u, v);
                         }
                         touch.feed(contact, &mut events);
+                        // SURFACE-11: the same contact also folds into the gesture
+                        // recognizer (multitouch scroll/zoom/long-press/edge-swipe),
+                        // over the identical transform so gestures track the display.
+                        gestures.feed(
+                            contact,
+                            touch.transform(),
+                            start.elapsed(),
+                            &mut gesture_out,
+                        );
                     }
                 }
                 LiEvent::Keyboard(KeyboardEvent::Key(k)) => {
@@ -988,6 +1006,42 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                 _ => {}
             }
         }
+
+        // SURFACE-11 (lock 16): advance the time-driven gestures (a finger held still
+        // long-presses without any new contact event), then translate every recognized
+        // gesture into egui input: two-finger scroll → a wheel delta, pinch → a zoom,
+        // long-press → a synthesized secondary (right) click, and edge-swipes onto the
+        // shell side channel (the dock/tablet-bar reveal).
+        gestures.tick(start.elapsed(), &mut gesture_out);
+        for gesture in &gesture_out {
+            match *gesture {
+                crate::gestures::Gesture::Scroll(delta) => {
+                    events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                }
+                crate::gestures::Gesture::Zoom(factor) => {
+                    events.push(egui::Event::Zoom(factor));
+                }
+                crate::gestures::Gesture::SecondaryClick(pos) => {
+                    events.push(egui::Event::PointerMoved(pos));
+                    for pressed in [true, false] {
+                        events.push(egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Secondary,
+                            pressed,
+                            modifiers: egui::Modifiers::default(),
+                        });
+                    }
+                }
+                crate::gestures::Gesture::EdgeSwipe(edge) => {
+                    crate::gestures::push_edge_swipe(edge);
+                }
+            }
+        }
+        gesture_out.clear();
 
         // SURFACE-9 (lock 15): drain the shell's rotation commands (Config tab /
         // hotkey) — a lock freezes auto-rotate, a manual override forces + holds an

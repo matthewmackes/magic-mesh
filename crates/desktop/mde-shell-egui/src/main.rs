@@ -39,7 +39,7 @@ mod vdi;
 mod workbench;
 
 use mde_egui::eframe::CreationContext;
-use mde_egui::{eframe, egui, run_client, Motion, Style};
+use mde_egui::{eframe, egui, run_client, Density, Motion, Style};
 
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
@@ -508,6 +508,19 @@ impl Shell {
         // SURFACE-10 (lock 14): the same flip feeds the OSK so it auto-raises on Tablet.
         if let Some(formfactor) = self.formfactor.pump() {
             self.keyboard.set_formfactor(formfactor);
+            // SURFACE-11 (lock 16): the same flip re-installs the interaction density —
+            // Tablet grows hit targets + spacing (touch), Laptop reverts to the compact
+            // pointer metrics. Keyed off the real SURFACE-9 signal, mesh-wide.
+            Style::install_with_density(ctx, Density::for_formfactor(formfactor));
+        }
+
+        // SURFACE-11 (lock 16): a swipe from the left/bottom edge reveals the shell body
+        // (the dock / tablet bar). Drained from the seat's gesture side channel; empty
+        // on the windowed fallback, so the reveal self-gates to the real DRM seat.
+        for edge in mde_egui::drain_edge_swipes() {
+            if matches!(edge, mde_egui::Edge::Left | mde_egui::Edge::Bottom) {
+                self.nav.expanded = true;
+            }
         }
 
         let host_keys = mde_egui::hostkeys::drain_host_keys();

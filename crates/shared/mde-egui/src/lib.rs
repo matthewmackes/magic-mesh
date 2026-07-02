@@ -27,6 +27,7 @@
 pub mod display;
 pub mod fonts;
 pub mod formfactor;
+pub mod gestures;
 pub mod hostkeys;
 pub mod motion;
 pub mod runner;
@@ -50,9 +51,12 @@ pub use formfactor::{
     HeadlessRotate, Orientation, RotateCommand, RotateError, RotationApply, SensorError,
     SwitchState, SysfsAccel,
 };
+pub use gestures::{
+    drain_edge_swipes, push_edge_swipe, Edge, Gesture, GestureConfig, GestureRecognizer,
+};
 pub use motion::Motion;
 pub use runner::run_client;
-pub use style::Style;
+pub use style::{Density, Style};
 pub use toast::{
     ChyronInteraction, Dwell, OsdKind, OsdLevel, Severity, Tier, Toast, ToastAction, ToastHost,
 };

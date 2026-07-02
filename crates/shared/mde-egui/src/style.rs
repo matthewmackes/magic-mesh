@@ -10,6 +10,58 @@
 
 use egui::{Color32, Context, Stroke};
 
+use crate::formfactor::Formfactor;
+
+/// The **interaction density** of a surface — how large hit targets and spacing are
+/// (SURFACE-11, design lock 16).
+///
+/// A pointer (laptop) wants the compact desktop metrics; a finger (tablet) wants larger
+/// targets and more breathing room. The shell installs the density
+/// [`for the current formfactor`](Density::for_formfactor) and re-installs it on every
+/// Tablet↔Laptop flip, so the same UI grows under touch and reverts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Density {
+    /// Pointer density — the compact desktop metrics (laptop / windowed fallback).
+    #[default]
+    Mouse,
+    /// Touch density — larger hit targets and wider spacing (tablet formfactor).
+    Touch,
+}
+
+impl Density {
+    /// The density a formfactor engages: Tablet → [`Touch`](Self::Touch), Laptop →
+    /// [`Mouse`](Self::Mouse). The single mapping the shell keys off the SURFACE-9
+    /// signal.
+    #[must_use]
+    pub const fn for_formfactor(formfactor: Formfactor) -> Self {
+        match formfactor {
+            Formfactor::Tablet => Self::Touch,
+            Formfactor::Laptop => Self::Mouse,
+        }
+    }
+
+    /// The minimum interactive **hit-target** height in points. Touch grows it to a
+    /// finger-sized target (the ~44 pt touch-target convention); mouse keeps the
+    /// compact control height.
+    #[must_use]
+    pub const fn min_hit_target(self) -> f32 {
+        match self {
+            Self::Mouse => 24.0,
+            Self::Touch => 44.0,
+        }
+    }
+
+    /// The multiplier applied to the base 8px spacing grid (item spacing, button
+    /// padding, indent) so a touch surface has more breathing room between targets.
+    #[must_use]
+    pub const fn spacing_scale(self) -> f32 {
+        match self {
+            Self::Mouse => 1.0,
+            Self::Touch => 1.5,
+        }
+    }
+}
+
 /// The shared egui design system. All fields are `const` so they are usable in
 /// `const` contexts and read directly at call sites.
 pub struct Style;
@@ -66,9 +118,18 @@ impl Style {
     /// Section heading.
     pub const HEADING: f32 = 22.0;
 
-    /// Install the shared look on an egui [`Context`]. Call once per surface,
-    /// from the harness runner's creation hook (see [`crate::run_client`]).
+    /// Install the shared look on an egui [`Context`] at the default (pointer)
+    /// density. Call once per surface, from the harness runner's creation hook (see
+    /// [`crate::run_client`]).
     pub fn install(ctx: &Context) {
+        Self::install_with_density(ctx, Density::Mouse);
+    }
+
+    /// Install the shared look at an explicit [`Density`] (SURFACE-11, lock 16). The
+    /// palette/type scale are identical across densities — only the interaction
+    /// metrics (hit-target size + spacing) grow under [`Density::Touch`], so the shell
+    /// can flip Tablet↔Laptop by re-installing at the new density.
+    pub fn install_with_density(ctx: &Context, density: Density) {
         // Fira Code is the default font set for every surface (governance §4).
         crate::fonts::install(ctx);
 
@@ -112,11 +173,16 @@ impl Style {
         v.widgets.active.bg_stroke = Stroke::new(1.0, Self::ACCENT_HI);
         v.widgets.active.fg_stroke = Stroke::new(1.0, Self::BG);
 
+        // SURFACE-11: the density scales the interaction metrics — targets and spacing
+        // grow under touch, the palette does not.
+        let sp = density.spacing_scale();
         ctx.style_mut(|s| {
             s.visuals = v;
-            s.spacing.item_spacing = egui::vec2(Self::SP_S, Self::SP_S);
-            s.spacing.button_padding = egui::vec2(Self::SP_M, Self::SP_S);
-            s.spacing.indent = Self::SP_M;
+            s.spacing.item_spacing = egui::vec2(Self::SP_S * sp, Self::SP_S * sp);
+            s.spacing.button_padding = egui::vec2(Self::SP_M * sp, Self::SP_S * sp);
+            s.spacing.indent = Self::SP_M * sp;
+            // The minimum interactive size is the finger/pointer hit target.
+            s.spacing.interact_size.y = density.min_hit_target();
         });
     }
 }
@@ -124,7 +190,8 @@ impl Style {
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants, clippy::float_cmp)]
 mod tests {
-    use super::Style;
+    use super::{Density, Style};
+    use crate::formfactor::Formfactor;
 
     #[test]
     fn spacing_follows_the_8px_grid() {
@@ -159,5 +226,57 @@ mod tests {
         assert_eq!(ctx.style().visuals.panel_fill, Style::BG);
         assert_eq!(ctx.style().visuals.hyperlink_color, Style::ACCENT);
         assert_eq!(ctx.style().spacing.indent, Style::SP_M);
+    }
+
+    // --- SURFACE-11: touch density -------------------------------------------------
+
+    #[test]
+    fn touch_density_grows_hit_targets_and_spacing() {
+        // The whole point of the touch density: bigger targets, more spacing.
+        assert!(
+            Density::Touch.min_hit_target() > Density::Mouse.min_hit_target(),
+            "touch hit targets must be larger than pointer ones"
+        );
+        assert!(
+            Density::Touch.spacing_scale() > Density::Mouse.spacing_scale(),
+            "touch spacing must be wider than pointer spacing"
+        );
+    }
+
+    #[test]
+    fn density_is_selected_by_formfactor() {
+        // The single mapping the shell keys off the SURFACE-9 signal.
+        assert_eq!(Density::for_formfactor(Formfactor::Tablet), Density::Touch);
+        assert_eq!(Density::for_formfactor(Formfactor::Laptop), Density::Mouse);
+    }
+
+    #[test]
+    fn installing_touch_density_enlarges_the_context_metrics() {
+        // Runtime-observable: the same install path, at Touch density, lands larger
+        // interaction metrics on the egui context than the Mouse (default) density.
+        let mouse = egui::Context::default();
+        Style::install_with_density(&mouse, Density::Mouse);
+        let touch = egui::Context::default();
+        Style::install_with_density(&touch, Density::Touch);
+
+        assert!(
+            touch.style().spacing.interact_size.y > mouse.style().spacing.interact_size.y,
+            "touch hit target grew on the context"
+        );
+        assert!(
+            touch.style().spacing.item_spacing.x > mouse.style().spacing.item_spacing.x,
+            "touch spacing grew on the context"
+        );
+        assert!(
+            touch.style().spacing.button_padding.x > mouse.style().spacing.button_padding.x,
+            "touch button padding grew on the context"
+        );
+        // Bare `install` is the pointer density (unchanged default).
+        let d = egui::Context::default();
+        Style::install(&d);
+        assert_eq!(
+            d.style().spacing.interact_size.y,
+            mouse.style().spacing.interact_size.y
+        );
     }
 }
