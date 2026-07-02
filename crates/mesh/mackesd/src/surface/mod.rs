@@ -28,6 +28,13 @@ use std::path::Path;
 /// machine, built on this module's [`SurfaceDevice`]/[`SurfaceProfile`].
 pub mod enable;
 
+/// SURFACE-4 — the day-2 verify half: per-subsystem live probes folded to a
+/// tri-state board (Ok/Failed/Degraded + NeedsGesture) across this module's
+/// [`SurfaceProfile`] checklist, plus the compact `state/hardware/surface/<node>`
+/// fleet summary (lock #7). Injectable [`verify::SurfaceProbes`] seam; live
+/// reads integration-gated.
+pub mod verify;
+
 /// The four DMI fields the Surface identity fold reads, already
 /// trimmed. A field the firmware/kernel doesn't expose is the empty
 /// string (never an error) — best-effort, like every other mackesd

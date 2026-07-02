@@ -7894,6 +7894,23 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("surface_enable".into());
 
+        // SURFACE-4 — the per-node surface_verify worker. On a recognised
+        // Microsoft Surface it probes each profile-claimed subsystem into a
+        // tri-state board (Ok/Failed/Degraded + NeedsGesture, each with a real
+        // reason) published to state/hardware/surface/<node>/probes (the Test
+        // tab), and publishes the compact enablement summary (model, %, red
+        // count) to state/hardware/surface/<node> for the fleet rollup. On a
+        // non-Surface node it idles. Live probes are integration-gated (honest
+        // typed states headless, never faked green).
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::SurfaceVerifyWorker::new(node_id.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("surface_verify".into());
+
         // MON-1.b (v2.6) — Netdata aggregator-IP publisher.
         // Pairs with `apply_netdata_monitor`'s baseline
         // /etc/netdata/netdata.conf: when this peer wins

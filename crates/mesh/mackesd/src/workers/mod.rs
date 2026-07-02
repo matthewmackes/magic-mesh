@@ -659,6 +659,14 @@ pub mod action;
 // it through the workers namespace like every other worker.
 #[cfg(feature = "async-services")]
 pub use crate::surface::enable::SurfaceEnableWorker;
+// SURFACE-4 — the per-node `surface_verify` worker (a leader-of-self worker:
+// it probes its OWN hardware into a tri-state board + publishes the compact
+// fleet summary, never a remote node). Sibling of the SURFACE-2 detection +
+// SURFACE-3 enable under `crate::surface::verify`; re-exported here so the
+// supervisor spawn site reaches it through the workers namespace like every
+// other worker.
+#[cfg(feature = "async-services")]
+pub use crate::surface::verify::SurfaceVerifyWorker;
 
 /// Every worker registered with the supervisor implements this
 /// trait. The trait is `async_trait` because the supervisor stores
