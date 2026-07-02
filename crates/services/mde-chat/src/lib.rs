@@ -14,7 +14,13 @@
 //!     [`Signature`] (message.rs).
 //!   * [`Conversation`] + [`Room`] — an append-only, bounded **ring buffer**
 //!     (evicts oldest, lock 8) with a stable total order (sender timestamp,
-//!     signature tiebreak — lock 22) (conversation.rs).
+//!     signature tiebreak — lock 22); ad-hoc rooms + the auto system rooms
+//!     ([`system_room_descriptors`]: All Fleet + per-severity), open self-join,
+//!     creator-only dissolve (lock 7/25) (conversation.rs).
+//!   * [`NotifyPrefs`] — the pure **notification policy** (NOTIFY-CHAT-5):
+//!     per-contact / per-room mute + a global per-severity threshold, deciding
+//!     whether an event *rings* (KIRON chyron + sound) or stays silent — a
+//!     muted / below-threshold event is silent but STILL logged (notify.rs).
 //!   * [`Roster`] / [`Contact`] / [`Presence`] — a contact is a mesh member
 //!     (hostname identity + cosmetic nickname + free-text status, lock 21);
 //!     presence is auto (Online/Away/Offline) ∪ manual (Away/DND/Invisible/
@@ -34,9 +40,14 @@
 mod alert;
 mod conversation;
 mod message;
+mod notify;
 mod roster;
 
 pub use alert::{alert_flag, fold_alert, Severity};
-pub use conversation::{Conversation, Room, RoomDescriptor};
+pub use conversation::{
+    severity_room_id, system_room_descriptors, Conversation, Room, RoomDescriptor, RoomKind,
+    SYS_ALL_FLEET_ID,
+};
 pub use message::{sign, Message, MessageId, MessageKind, Signature};
+pub use notify::NotifyPrefs;
 pub use roster::{Contact, NodeRole, Presence, Roster};

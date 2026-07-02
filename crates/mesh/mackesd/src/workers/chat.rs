@@ -55,8 +55,9 @@ use ed25519_dalek::SigningKey;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, StoredMessage};
 use mde_chat::{
-    Contact, Conversation, Message, MessageId, MessageKind, NodeRole, Presence, Roster, Severity,
-    fold_alert, sign,
+    fold_alert, severity_room_id, sign, system_room_descriptors, Contact, Conversation, Message,
+    MessageId, MessageKind, NodeRole, NotifyPrefs, Presence, Room, RoomDescriptor, RoomKind,
+    Roster, Severity,
 };
 use serde::{Deserialize, Serialize};
 
@@ -64,10 +65,14 @@ use super::{ShutdownToken, Worker};
 
 /// The UI's outbound verb: a chat message to send.
 pub const ACTION_CHAT_SEND: &str = "action/chat/send";
+/// The UI's room-lifecycle verb (NOTIFY-CHAT-5): create / self-join / dissolve.
+pub const ACTION_CHAT_ROOM: &str = "action/chat/room";
 /// The signed-envelope delivery lane (fast path; the log is the durable copy).
 pub const EVENT_CHAT_MESSAGE: &str = "event/chat/message";
 /// The presence roster mirror the UI reads.
 pub const STATE_CHAT_ROSTER: &str = "state/chat/roster";
+/// The room-registry mirror the UI reads (all known rooms + membership).
+pub const STATE_CHAT_ROOMS: &str = "state/chat/rooms";
 /// Prefix for the per-conversation read-model the UI renders.
 pub const STATE_CHAT_CONVERSATION_PREFIX: &str = "state/chat/conversation/";
 /// The KIRON chyron lane (`docs/design/kiron-toast-pattern.md`, lock 7).
@@ -190,6 +195,61 @@ impl SendRequest {
     }
 }
 
+/// A room-lifecycle op (NOTIFY-CHAT-5): open-join is the model, so `create` +
+/// `join` are always permitted; only `dissolve` is guarded (creator-of-an-ad-hoc-
+/// room, enforced by [`Room::can_dissolve`]).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RoomOp {
+    /// Create a new ad-hoc room owned by this node.
+    Create,
+    /// Self-join an existing room (open-join).
+    Join,
+    /// Dissolve an ad-hoc room this node created.
+    Dissolve,
+}
+
+/// The UI's `action/chat/room` request body.
+#[derive(Debug, Clone, Deserialize)]
+struct RoomRequest {
+    /// The lifecycle op.
+    op: RoomOp,
+    /// The room id acted on.
+    id: String,
+    /// The display name (create only; defaults to the id).
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// A one-line headline for a **chat-message** chyron (NOTIFY-CHAT-5, KIRON lock
+/// 9): a new human message raises a `CHAT` toast whose headline previews the
+/// body. Folded alerts have their own [`alert_headline`]; this is the message
+/// side.
+fn message_headline(kind: &MessageKind) -> String {
+    match kind {
+        MessageKind::Text(t) => t.clone(),
+        MessageKind::Clipboard { preview, .. } => format!("clipboard: {preview}"),
+        MessageKind::File { name, .. } => format!("file: {name}"),
+        MessageKind::CallAction { .. } => "wants to start a call".to_string(),
+        MessageKind::RemoteAction { .. } => "wants a remote-desktop session".to_string(),
+        // An Alert kind on the message path is unexpected (alerts fold via the
+        // alert lane); fall back to its flag so nothing renders blank.
+        MessageKind::Alert { flag, .. } => flag.clone(),
+    }
+}
+
+/// Insert `host` into a room descriptor's sorted, unique member list (the same
+/// canonical invariant [`Room::join`] keeps). Returns `true` if newly added.
+fn descriptor_join(d: &mut RoomDescriptor, host: &str) -> bool {
+    match d.members.binary_search_by(|m| m.as_str().cmp(host)) {
+        Ok(_) => false,
+        Err(pos) => {
+            d.members.insert(pos, host.to_string());
+            true
+        }
+    }
+}
+
 /// The local conversation key for a peer/room envelope.
 ///
 /// Also encodes whether THIS node is a participant: a 1:1 not involving
@@ -291,11 +351,14 @@ fn alert_headline(fields: &BTreeMap<String, String>, flag: &str) -> String {
     flag.to_string()
 }
 
-/// Build the `event/toast/show` body for a folded alert — `Some` for **Warning+**
-/// (which surfaces as a transient chyron), `None` for **Info** (lock 11 taming:
-/// Info folds to the durable chat ring-log but stays out of the lower-third) and
-/// for any non-alert kind. The click-through routes to the Notifications surface,
-/// where the same alert lives as a chat message (lock 9/11).
+/// Build the `event/toast/show` **body** for a folded alert (the click-through
+/// routes to the Notifications surface, where the same alert lives as a chat
+/// message — lock 9/11). `None` only for a non-alert kind.
+///
+/// This just *shapes* the chyron; **whether it is emitted** is the caller's
+/// [`NotifyPrefs::should_ring_alert`] gate (severity threshold, per-contact mute,
+/// DND) — so the firehose taming (Info silent, a muted host silent) is one
+/// policy, not a second hardcoded rule here (NOTIFY-CHAT-5).
 fn toast_for_alert(msg: &Message) -> Option<ToastShow> {
     let MessageKind::Alert {
         severity,
@@ -306,9 +369,6 @@ fn toast_for_alert(msg: &Message) -> Option<ToastShow> {
     else {
         return None;
     };
-    if *severity == Severity::Info {
-        return None;
-    }
     Some(ToastShow {
         severity: severity.tag(),
         source_host: msg.sender.clone(),
@@ -317,6 +377,34 @@ fn toast_for_alert(msg: &Message) -> Option<ToastShow> {
         action_label: Some("Open".to_string()),
         action_verb: Some("shell/goto/notifications".to_string()),
     })
+}
+
+/// The alert severity carried by a folded [`MessageKind::Alert`], for the ring
+/// gate; `None` for any other kind.
+const fn alert_severity(msg: &Message) -> Option<Severity> {
+    if let MessageKind::Alert { severity, .. } = &msg.kind {
+        Some(*severity)
+    } else {
+        None
+    }
+}
+
+/// Build the `event/toast/show` body for a new **chat message** (KIRON lock 9): a
+/// `CHAT`-flagged, Info-tier chyron. Info-tier means the shell's one chime plays
+/// the soft "new message" sound (vs the sharp alert cue for Warning+) — so the
+/// per-kind sound (E12-16 mixer, DND-aware) falls out of the shared
+/// severity-to-sound mapping the [`ToastShow`] host already owns; this unit only
+/// emits. Emission is gated by [`NotifyPrefs::should_ring_message`] (mute + DND)
+/// at the call site.
+fn toast_for_message(msg: &Message) -> ToastShow {
+    ToastShow {
+        severity: Severity::Info.tag(),
+        source_host: msg.sender.clone(),
+        flag: "CHAT".to_string(),
+        headline: message_headline(&msg.kind),
+        action_label: Some("Open".to_string()),
+        action_verb: Some("shell/goto/notifications".to_string()),
+    }
 }
 
 // ── presence ───────────────────────────────────────────────────────────────
@@ -422,6 +510,46 @@ fn presence_path(root: &Path, host: &str) -> PathBuf {
     root.join(host).join("chat").join("presence.json")
 }
 
+/// This node's persisted ad-hoc room registry (NOTIFY-CHAT-5). Replicated like
+/// the presence gossip so a peer sees rooms this node created on the next union.
+fn rooms_path(root: &Path, host: &str) -> PathBuf {
+    root.join(host).join("chat").join("rooms.json")
+}
+
+/// This seat's local notification policy (mute + severity threshold). Seat-local
+/// (not gossiped): each operator's mute list is their own.
+fn notify_path(root: &Path, self_host: &str) -> PathBuf {
+    root.join(self_host).join("chat").join("notify.json")
+}
+
+/// Serialize + publish a KIRON `event/toast/show` chyron body (the one lane;
+/// KIRON-2 owns the render + sound + suppression — this unit only emits).
+fn emit_toast(persist: &Persist, show: &ToastShow) {
+    if let Ok(body) = serde_json::to_string(show) {
+        publish(persist, EVENT_TOAST_SHOW, &body);
+    }
+}
+
+/// Merge a discovered room descriptor into the registry: union its members into
+/// an existing room (keeping the seeded system kind), or insert it wholesale. So
+/// a room another node created — or additional members — surfaces on the union
+/// without clobbering local membership.
+fn merge_room(rooms: &mut BTreeMap<String, RoomDescriptor>, incoming: RoomDescriptor) {
+    match rooms.get_mut(&incoming.id) {
+        Some(existing) => {
+            for host in incoming.members {
+                descriptor_join(existing, &host);
+            }
+            if existing.creator.is_empty() && !incoming.creator.is_empty() {
+                existing.creator = incoming.creator;
+            }
+        }
+        None => {
+            rooms.insert(incoming.id.clone(), incoming);
+        }
+    }
+}
+
 /// Read a ring-log file as a message vec (missing/corrupt ⇒ empty — the union
 /// tolerates a half-synced or absent file).
 fn read_log(path: &Path) -> Vec<Message> {
@@ -504,6 +632,35 @@ fn discover_persisted_keys(root: &Path) -> BTreeSet<String> {
     keys
 }
 
+/// Load this seat's [`NotifyPrefs`] from `<self>/chat/notify.json`; a missing or
+/// corrupt file is the permissive default (nothing muted, Warning threshold).
+fn load_notify_prefs(root: &Path, self_host: &str) -> NotifyPrefs {
+    std::fs::read_to_string(notify_path(root, self_host))
+        .ok()
+        .and_then(|s| serde_json::from_str::<NotifyPrefs>(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Union every host's persisted ad-hoc room registry (`<host>/chat/rooms.json`).
+/// Tolerates a missing/half-synced file — the import-union stays best-effort like
+/// the conversation logs.
+fn load_all_rooms(root: &Path) -> Vec<RoomDescriptor> {
+    let mut out = Vec::new();
+    let Ok(hosts) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for h in hosts.flatten() {
+        let host = h.file_name().to_string_lossy().to_string();
+        if let Some(rooms) = std::fs::read_to_string(rooms_path(root, &host))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Vec<RoomDescriptor>>(&s).ok())
+        {
+            out.extend(rooms);
+        }
+    }
+    out
+}
+
 // ── the worker ─────────────────────────────────────────────────────────────
 
 /// The mackesd `chat` worker (NOTIFY-CHAT-2). Runs on every node.
@@ -573,15 +730,36 @@ impl ChatWorker {
                 state.convos.insert(key, conv);
             }
         }
+        // Seat-local notification policy (mute + threshold, NOTIFY-CHAT-5).
+        state.notify = load_notify_prefs(&self.workgroup_root, &self.self_host);
+        // Seed the auto system rooms (All Fleet + per-severity), then union every
+        // host's persisted ad-hoc rooms so cross-node rooms surface on restart.
+        for d in system_room_descriptors() {
+            state.rooms.insert(d.id.clone(), d);
+        }
+        for d in load_all_rooms(&self.workgroup_root) {
+            merge_room(&mut state.rooms, d);
+        }
+        state.rooms_dirty = true; // publish the seeded registry on the first tick
+    }
+
+    /// Whether this seat is in Do-Not-Disturb (the operator's manual override) —
+    /// the DND axis of the notification gate (lock 5/12/13). Focus-mute + audio-
+    /// mute stay the shell's (KIRON-2) suppression; the worker only knows DND.
+    fn self_dnd(&self) -> bool {
+        self.manual_presence == Some(Presence::Dnd)
     }
 
     /// One poll pass — the headless-testable core (drives the whole worker with
     /// an injected Persist + tempdir root, no tokio timer, no live mesh).
     fn tick_once(&self, persist: &Persist, state: &mut ChatState, now_ms: i64) {
+        let dnd = self.self_dnd();
         self.drain_sends(persist, state, now_ms);
-        self.drain_inbound(persist, state);
-        self.drain_alerts(persist, state);
+        self.drain_room_ops(persist, state);
+        self.drain_inbound(persist, state, dnd);
+        self.drain_alerts(persist, state, dnd);
         self.publish_roster(persist, state);
+        self.publish_rooms(persist, state);
         flush_dirty(persist, state);
     }
 
@@ -632,7 +810,7 @@ impl ChatWorker {
     /// fold peer/room messages this node participates in into memory. Others'
     /// messages are NOT re-persisted (write-own-file); their durable copy is the
     /// sender's Syncthing log, which the union rehydrates on restart.
-    fn drain_inbound(&self, persist: &Persist, state: &mut ChatState) {
+    fn drain_inbound(&self, persist: &Persist, state: &mut ChatState, dnd: bool) {
         for m in take_new(persist, &mut state.cursors, EVENT_CHAT_MESSAGE) {
             let Some(body) = m.body.as_deref() else {
                 continue;
@@ -657,18 +835,36 @@ impl ChatWorker {
             else {
                 continue;
             };
-            state
+            let sender = env.message.sender.clone();
+            let room_id = matches!(env.scope, Scope::Room).then(|| env.to.clone());
+            let inserted = state
                 .convos
                 .entry(key.clone())
                 .or_insert_with(|| Conversation::new(key.as_str()))
-                .insert(env.message);
+                .insert(env.message.clone());
             state.dirty.insert(key);
+            // Raise a CHAT chyron for a genuinely NEW message (not a Syncthing
+            // backfill re-fold), gated by the per-contact / per-room mute + DND
+            // (NOTIFY-CHAT-5 / KIRON lock 9). A muted contact is silent here but
+            // was still logged into the ring above.
+            if inserted
+                && state
+                    .notify
+                    .should_ring_message(&sender, room_id.as_deref(), dnd)
+            {
+                emit_toast(persist, &toast_for_message(&env.message));
+            }
         }
     }
 
     /// Drain every alert/event lane ([`ALERT_LANE_PREFIXES`]) and fold each new
-    /// message into its origin host's `alert:<host>` conversation (lock 11/20).
-    fn drain_alerts(&self, persist: &Persist, state: &mut ChatState) {
+    /// message into its origin host's `alert:<host>` conversation (lock 11/20),
+    /// **and** into the matching per-severity system room (NOTIFY-CHAT-5) so the
+    /// `Critical Alerts` / `Warnings` / `Info` rooms are real, populated views.
+    /// A Warning+ alert also raises a transient chyron unless the notification
+    /// gate ([`NotifyPrefs::should_ring_alert`]: threshold + per-contact mute +
+    /// DND) silences it — a silenced alert is still logged into both rings.
+    fn drain_alerts(&self, persist: &Persist, state: &mut ChatState, dnd: bool) {
         let topics = match persist.list_topics() {
             Ok(t) => t,
             Err(e) => {
@@ -680,27 +876,120 @@ impl ChatWorker {
             for m in take_new(persist, &mut state.cursors, topic) {
                 let body = m.body.as_deref().unwrap_or("");
                 let msg = alert_message(topic, &m.ulid, body, m.ts_unix_ms, &self.self_host);
-                let key = alert_key(&msg.sender);
+                let origin = msg.sender.clone();
+                let severity = alert_severity(&msg);
                 // Build the chyron body before the ring consumes the message.
                 let show = toast_for_alert(&msg);
+                let key = alert_key(&origin);
                 let inserted = state
                     .convos
                     .entry(key.clone())
                     .or_insert_with(|| Conversation::new(key.as_str()))
-                    .insert(msg);
+                    .insert(msg.clone());
                 state.dirty.insert(key);
-                // Raise the transient lower-third only for a genuinely NEW Warning+
-                // alert. The ring's insert-return dedups a live alert against its
-                // later re-fold / Syncthing backfill (same deterministic
-                // `alert-<ulid>` id ⇒ no second toast); the durable record stays
-                // the chat ring-log (lock 11 — the chyron is transient).
-                if inserted {
-                    if let Some(show) = show {
-                        if let Ok(body) = serde_json::to_string(&show) {
-                            publish(persist, EVENT_TOAST_SHOW, &body);
-                        }
+                if !inserted {
+                    // A re-fold / Syncthing backfill of the same alert (same
+                    // deterministic id) — already logged + toasted; skip both the
+                    // severity-room duplicate and a second chyron.
+                    continue;
+                }
+                // Fan the alert into its per-severity system room (a curated view
+                // of the firehose an operator can watch or mute per band).
+                if let Some(sev) = severity {
+                    let room = room_key(&severity_room_id(sev));
+                    state
+                        .convos
+                        .entry(room.clone())
+                        .or_insert_with(|| Conversation::new(room.as_str()))
+                        .insert(msg);
+                    state.dirty.insert(room);
+                }
+                // Raise the transient lower-third only when the gate permits it.
+                if let (Some(show), Some(sev)) = (show, severity) {
+                    if state.notify.should_ring_alert(&origin, sev, dnd) {
+                        emit_toast(persist, &show);
                     }
                 }
+            }
+        }
+    }
+
+    /// Drain `action/chat/room`: create / self-join / dissolve (NOTIFY-CHAT-5,
+    /// lock 25). Open-join means create + join always succeed; dissolve is guarded
+    /// to an ad-hoc room's own creator ([`Room::can_dissolve`]). Room *messages*
+    /// fan out via the same Syncthing union as DMs (`drain_sends`, `Scope::Room`),
+    /// so this only maintains the room registry + membership the UI renders.
+    fn drain_room_ops(&self, persist: &Persist, state: &mut ChatState) {
+        for m in take_new(persist, &mut state.cursors, ACTION_CHAT_ROOM) {
+            let Some(body) = m.body.as_deref() else {
+                continue;
+            };
+            let req = match serde_json::from_str::<RoomRequest>(body) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(target: "mackesd::chat", error = %e, "bad action/chat/room body");
+                    continue;
+                }
+            };
+            match req.op {
+                RoomOp::Create => {
+                    // A fresh ad-hoc room owned + joined by this node. Re-creating
+                    // an existing id is a no-op (keep the original creator).
+                    if let std::collections::btree_map::Entry::Vacant(slot) =
+                        state.rooms.entry(req.id.clone())
+                    {
+                        let name = req.name.unwrap_or_else(|| req.id.clone());
+                        let room = Room::new(req.id.clone(), name, self.self_host.as_str());
+                        slot.insert(room.descriptor);
+                        state.rooms_dirty = true;
+                    }
+                }
+                RoomOp::Join => {
+                    if let Some(d) = state.rooms.get_mut(&req.id) {
+                        if descriptor_join(d, &self.self_host) {
+                            state.rooms_dirty = true;
+                        }
+                    } else {
+                        tracing::debug!(target: "mackesd::chat", id = %req.id, "join of an unknown room ignored");
+                    }
+                }
+                RoomOp::Dissolve => {
+                    let allowed = state.rooms.get(&req.id).is_some_and(|d| {
+                        Room::from_descriptor(d.clone()).can_dissolve(&self.self_host)
+                    });
+                    if allowed {
+                        state.rooms.remove(&req.id);
+                        state.rooms_dirty = true;
+                    } else {
+                        tracing::debug!(target: "mackesd::chat", id = %req.id, "dissolve refused (not the ad-hoc creator)");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Persist this node's room registry + republish the `state/chat/rooms`
+    /// mirror the UI reads — only when it changed this tick (Syncthing-friendly).
+    fn publish_rooms(&self, persist: &Persist, state: &mut ChatState) {
+        if !state.rooms_dirty {
+            return;
+        }
+        state.rooms_dirty = false;
+        let rooms: Vec<&RoomDescriptor> = state.rooms.values().collect();
+        if let Ok(body) = serde_json::to_string(&rooms) {
+            publish(persist, STATE_CHAT_ROOMS, &body);
+        }
+        // Persist only the ad-hoc rooms (the system rooms are seeded on every node
+        // at bootstrap and need no replication).
+        let adhoc: Vec<&RoomDescriptor> = state
+            .rooms
+            .values()
+            .filter(|d| d.kind == RoomKind::AdHoc)
+            .collect();
+        if let Ok(body) = serde_json::to_string(&adhoc) {
+            if let Err(e) = write_atomic(&rooms_path(&self.workgroup_root, &self.self_host), &body)
+            {
+                tracing::warn!(target: "mackesd::chat", error = %e, "room registry persist failed");
             }
         }
     }
@@ -794,6 +1083,16 @@ struct ChatState {
     /// The last written self-gossip JSON — skip rewriting an identical file
     /// (avoids churning Syncthing every tick).
     last_gossip: Option<String>,
+    /// This seat's notification policy (mute + severity threshold, NOTIFY-CHAT-5),
+    /// loaded from `<self>/chat/notify.json` at bootstrap. A silence-only gate on
+    /// toasts/sound; the conversation ring is always written regardless.
+    notify: NotifyPrefs,
+    /// The known room registry (system rooms + ad-hoc), keyed by room id. Seeded
+    /// with the auto system rooms at bootstrap, then unioned from every host's
+    /// `rooms.json` and mutated by `action/chat/room`.
+    rooms: BTreeMap<String, RoomDescriptor>,
+    /// Whether the room registry changed this tick (republish + persist).
+    rooms_dirty: bool,
 }
 
 /// New messages on `topic` since the cursor, seeding the cursor to the current
@@ -880,6 +1179,7 @@ impl Worker for ChatWorker {
         // Rehydrate history + publish it (and the initial roster) immediately.
         self.bootstrap(&mut state);
         self.publish_roster(&persist, &mut state);
+        self.publish_rooms(&persist, &mut state);
         flush_dirty(&persist, &mut state);
         let mut tick = tokio::time::interval(self.poll_interval);
         tick.tick().await;
@@ -899,6 +1199,7 @@ impl Worker for ChatWorker {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+    use mde_chat::SYS_ALL_FLEET_ID;
     use rand::rngs::OsRng;
 
     fn key() -> SigningKey {
@@ -1208,12 +1509,10 @@ mod tests {
             MessageKind::Alert { .. }
         ));
         // And the read-model mirror is published for the UI.
-        assert!(
-            !persist
-                .list_since(&conversation_topic(&k), None)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(!persist
+            .list_since(&conversation_topic(&k), None)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1278,13 +1577,17 @@ mod tests {
     }
 
     #[test]
-    fn info_alert_folds_to_chat_but_never_toasts() {
-        // Lock 11 taming: an Info alert is a durable chat message but no chyron.
+    fn info_alert_folds_to_chat_but_the_default_gate_keeps_it_silent() {
+        // Lock 11 taming: an Info alert is a durable chat message; the default
+        // notification gate (Warning threshold) keeps it out of the band. The
+        // chyron *shape* is built regardless — emission is the gate's call.
         let body = r#"{"severity":"info","host":"nyc3","summary":"heartbeat ok"}"#;
         let msg = alert_message("event/dc/health/etcd", "01I", body, 1, "eagle");
+        assert!(toast_for_alert(&msg).is_some(), "the body is shaped");
+        let prefs = NotifyPrefs::new();
         assert!(
-            toast_for_alert(&msg).is_none(),
-            "Info stays out of the band"
+            !prefs.should_ring_alert("nyc3", alert_severity(&msg).unwrap(), false),
+            "but the default Warning threshold silences an Info alert"
         );
     }
 
@@ -1360,6 +1663,284 @@ mod tests {
             })
             .map(|m| m.ulid)
             .expect("the live alert exists")
+    }
+
+    // ── muting + the notification gate (NOTIFY-CHAT-5) ──────────────────
+
+    #[test]
+    fn a_muted_contact_alert_is_silent_but_still_logged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let w = worker(root); // self = eagle
+        let persist = persist_at(root);
+        let mut state = ChatState::default();
+        state.notify.mute_contact("nyc3");
+        // Prime + seed the lane (forward-only), then land a Critical from nyc3.
+        persist
+            .write(
+                "event/security/alert",
+                Priority::Min,
+                None,
+                Some(r#"{"severity":"info","host":"nyc3","summary":"pre"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 100);
+        persist
+            .write(
+                "event/security/alert",
+                Priority::Urgent,
+                None,
+                Some(r#"{"severity":"critical","host":"nyc3","summary":"intrusion"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 200);
+        // Logged: the alert is in nyc3's conversation ring …
+        let k = alert_key("nyc3");
+        assert_eq!(state.convos.get(&k).map(Conversation::len), Some(1));
+        // … but no chyron reached the shell (a muted contact is silent, even a
+        // Critical — the operator explicitly asked for silence).
+        assert!(
+            persist
+                .list_since(EVENT_TOAST_SHOW, None)
+                .unwrap()
+                .is_empty(),
+            "a muted contact raises no toast"
+        );
+    }
+
+    #[test]
+    fn an_inbound_message_toasts_as_chat_unless_the_contact_is_muted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let w = worker(root); // self = eagle
+        let persist = persist_at(root);
+        let mut state = ChatState::default();
+        w.tick_once(&persist, &mut state, 100); // seed cursors
+
+        let deliver = |persist: &Persist, ts: i64, text: &str| {
+            let mut m = Message::text("nyc3", ts, text);
+            sign(&mut m, &key());
+            let env = ChatEnvelope {
+                scope: Scope::Peer,
+                to: "eagle".into(),
+                message: m,
+            };
+            persist
+                .write(
+                    EVENT_CHAT_MESSAGE,
+                    Priority::Default,
+                    None,
+                    Some(&serde_json::to_string(&env).unwrap()),
+                )
+                .unwrap();
+        };
+
+        deliver(&persist, 150, "ping from nyc3");
+        w.tick_once(&persist, &mut state, 200);
+        let toasts = persist.list_since(EVENT_TOAST_SHOW, None).unwrap();
+        assert_eq!(toasts.len(), 1, "a new message raises one CHAT chyron");
+        let j: serde_json::Value = serde_json::from_str(toasts[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(j["flag"], "CHAT");
+        assert_eq!(j["severity"], "info", "a message is Info-tier (soft sound)");
+        assert_eq!(j["source_host"], "nyc3");
+        assert_eq!(j["headline"], "ping from nyc3");
+
+        // Mute the contact: the next message is logged but silent.
+        state.notify.mute_contact("nyc3");
+        deliver(&persist, 300, "second ping");
+        w.tick_once(&persist, &mut state, 400);
+        assert_eq!(
+            persist.list_since(EVENT_TOAST_SHOW, None).unwrap().len(),
+            1,
+            "the muted contact's second message raises no new chyron"
+        );
+        let k = dm_key("eagle", "nyc3");
+        assert_eq!(
+            state.convos.get(&k).map(Conversation::len),
+            Some(2),
+            "both messages are still logged"
+        );
+    }
+
+    #[test]
+    fn dnd_hushes_a_warning_but_a_critical_breaks_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let w = worker(root).with_manual_presence(Presence::Dnd);
+        let persist = persist_at(root);
+        let mut state = ChatState::default();
+        persist
+            .write(
+                "event/security/alert",
+                Priority::Min,
+                None,
+                Some(r#"{"severity":"info","host":"nyc3","summary":"pre"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 100); // seed
+                                                // A Warning under DND is silent …
+        persist
+            .write(
+                "event/security/alert",
+                Priority::High,
+                None,
+                Some(r#"{"severity":"warning","host":"nyc3","summary":"disk 90%"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 200);
+        assert!(
+            persist
+                .list_since(EVENT_TOAST_SHOW, None)
+                .unwrap()
+                .is_empty(),
+            "DND hushes a Warning chyron"
+        );
+        // … a Critical still breaks through.
+        persist
+            .write(
+                "event/security/alert",
+                Priority::Urgent,
+                None,
+                Some(r#"{"severity":"critical","host":"nyc3","summary":"intrusion"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 300);
+        assert_eq!(
+            persist.list_since(EVENT_TOAST_SHOW, None).unwrap().len(),
+            1,
+            "a Critical breaks through DND"
+        );
+    }
+
+    #[test]
+    fn a_folded_alert_is_fanned_into_its_per_severity_system_room() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let w = worker(root);
+        let persist = persist_at(root);
+        let mut state = ChatState::default();
+        persist
+            .write(
+                "event/firewall/h",
+                Priority::Min,
+                None,
+                Some(r#"{"severity":"info","host":"fra1","summary":"pre"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 100); // seed
+        persist
+            .write(
+                "event/firewall/h",
+                Priority::High,
+                None,
+                Some(r#"{"severity":"warning","host":"fra1","summary":"port scan"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 200);
+        // The Warning lands both in the origin timeline and the Warnings room.
+        let warnings_room = room_key(&severity_room_id(Severity::Warning));
+        assert_eq!(
+            state.convos.get(&warnings_room).map(Conversation::len),
+            Some(1),
+            "the per-severity Warnings room is a real, populated view"
+        );
+        // It is NOT in the Critical room.
+        assert!(!state
+            .convos
+            .contains_key(&room_key(&severity_room_id(Severity::Critical))));
+    }
+
+    // ── room lifecycle: create · open-join · creator-only dissolve ──────
+
+    #[test]
+    fn room_create_join_and_creator_only_dissolve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let w = worker(root); // self = eagle
+        let persist = persist_at(root);
+        let mut state = ChatState::default();
+        w.tick_once(&persist, &mut state, 100); // seed the room-op lane cursor
+
+        let room_op = |persist: &Persist, body: &str| {
+            persist
+                .write(ACTION_CHAT_ROOM, Priority::Default, None, Some(body))
+                .unwrap();
+        };
+
+        // Create → an ad-hoc room owned + joined by eagle, mirror published.
+        room_op(&persist, r#"{"op":"create","id":"ops","name":"Ops"}"#);
+        w.tick_once(&persist, &mut state, 200);
+        let d = state.rooms.get("ops").expect("room created");
+        assert_eq!(d.creator, "eagle");
+        assert_eq!(d.members, vec!["eagle"]);
+        assert!(matches!(d.kind, RoomKind::AdHoc));
+        let mirror = persist.list_since(STATE_CHAT_ROOMS, None).unwrap();
+        assert!(
+            !mirror.is_empty(),
+            "the room registry is published for the UI"
+        );
+
+        // Join a system room (open self-join — it was seeded? no bootstrap here,
+        // so seed it, then join).
+        state.rooms.insert(
+            SYS_ALL_FLEET_ID.to_string(),
+            system_room_descriptors()[0].clone(),
+        );
+        room_op(
+            &persist,
+            &format!(r#"{{"op":"join","id":"{SYS_ALL_FLEET_ID}"}}"#),
+        );
+        w.tick_once(&persist, &mut state, 300);
+        assert!(state.rooms[SYS_ALL_FLEET_ID]
+            .members
+            .contains(&"eagle".to_string()));
+
+        // A non-creator cannot dissolve: fake nyc3 as creator by editing, then
+        // eagle's dissolve is refused.
+        state.rooms.get_mut("ops").unwrap().creator = "nyc3".into();
+        room_op(&persist, r#"{"op":"dissolve","id":"ops"}"#);
+        w.tick_once(&persist, &mut state, 400);
+        assert!(
+            state.rooms.contains_key("ops"),
+            "eagle cannot dissolve a room nyc3 created"
+        );
+        // The creator can.
+        state.rooms.get_mut("ops").unwrap().creator = "eagle".into();
+        room_op(&persist, r#"{"op":"dissolve","id":"ops"}"#);
+        w.tick_once(&persist, &mut state, 500);
+        assert!(!state.rooms.contains_key("ops"), "the creator dissolves it");
+    }
+
+    #[test]
+    fn bootstrap_seeds_system_rooms_and_reloads_notify_prefs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A persisted mute list + a created ad-hoc room from a prior run.
+        let mut prefs = NotifyPrefs::new();
+        prefs.mute_contact("nyc3");
+        write_atomic(
+            &notify_path(root, "eagle"),
+            &serde_json::to_string(&prefs).unwrap(),
+        )
+        .unwrap();
+        let saved = Room::new("ops", "Ops", "eagle");
+        write_atomic(
+            &rooms_path(root, "eagle"),
+            &serde_json::to_string(&vec![saved.descriptor]).unwrap(),
+        )
+        .unwrap();
+
+        let w = worker(root);
+        let mut state = ChatState::default();
+        w.bootstrap(&mut state);
+        // System rooms are seeded …
+        assert!(state.rooms.contains_key(SYS_ALL_FLEET_ID));
+        assert!(state
+            .rooms
+            .contains_key(&severity_room_id(Severity::Critical)));
+        // … the ad-hoc room reloaded, and the mute list restored.
+        assert!(state.rooms.contains_key("ops"));
+        assert!(state.notify.is_contact_muted("nyc3"));
     }
 
     #[test]
