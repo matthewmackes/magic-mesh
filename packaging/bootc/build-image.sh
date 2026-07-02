@@ -39,6 +39,7 @@ LANE="repo"
 RPM_PATH=""
 DISK_TYPE=""
 OUT_DIR="$BOOTC_DIR/out"
+OUT_DIR_SET=""
 # bootc-image-builder — the upstream disk-image builder for bootc images.
 BIB_IMAGE="${MCNF_BIB_IMAGE:-quay.io/centos-bootc/bootc-image-builder:latest}"
 PULL_TIMEOUT="${MCNF_PULL_TIMEOUT:-120}"
@@ -87,7 +88,7 @@ while [ $# -gt 0 ]; do
         --tag)  TAG="${2:?--tag needs an image:tag}"; shift 2 ;;
         --base) BASE="${2:?--base needs an image ref}"; shift 2 ;;
         --disk) DISK_TYPE="${2:?--disk needs qcow2|raw|anaconda-iso}"; shift 2 ;;
-        --out)  OUT_DIR="${2:?--out needs a dir}"; shift 2 ;;
+        --out)  OUT_DIR="${2:?--out needs a dir}"; OUT_DIR_SET=1; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "FATAL: unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -110,6 +111,9 @@ if [ "$LANE" = "local" ]; then
         esac
     fi
 fi
+
+[ -n "$OUT_DIR_SET" ] && [ -z "$DISK_TYPE" ] && \
+    missing+=("--out only applies to the --disk lane (an image build writes no files there) — add --disk or drop --out")
 
 if [ -n "$DISK_TYPE" ]; then
     case "$DISK_TYPE" in

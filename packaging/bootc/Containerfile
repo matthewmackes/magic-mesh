@@ -70,9 +70,11 @@ COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
 # RPM; its post-install scriptlet runs here and its `systemctl enable` calls are
 # offline-safe symlink creation). Weak deps stay ON — this is the full
 # Workstation image; a Lighthouse runs the same bits with the seat masked (§5).
-# podman + cloud-hypervisor are the §5 VDI substrate (mackesd's kvm probe
-# checks podman.socket; vm_lifecycle shells cloud-hypervisor); nebula arrives
-# as the RPM's hard Require.
+# podman is half the §5 VDI substrate (mackesd's kvm probe checks
+# podman.socket) — the fedora-bootc base already ships it, the explicit install
+# is a no-op guard against future base slimming; nebula arrives as the RPM's
+# hard Require. cloud-hypervisor is baked separately below (NOT in Fedora 42 —
+# proven live: `No match for argument: cloud-hypervisor`, farm build 2026-07-01).
 RUN set -eux; \
     if [ "${MCNF_RPM_LANE}" = "local" ]; then \
         ls /tmp/mcnf-rpms/magic-mesh-*.rpm >/dev/null 2>&1 || { \
@@ -83,20 +85,46 @@ RUN set -eux; \
     else \
         dnf -y install magic-mesh; \
     fi; \
-    dnf -y install podman cloud-hypervisor; \
+    dnf -y install podman; \
     dnf clean all; \
     rm -rf /tmp/mcnf-rpms
 
+# The other half of the VDI substrate: **cloud-hypervisor, baked in** (§5 /
+# E12-13). Fedora 42 does not package it, so pin the upstream static-musl
+# release binary and verify its sha256 — the pin makes every rebuild
+# tamper-evident; bump CH_VERSION + CH_SHA256 together. Installed at
+# /usr/bin/cloud-hypervisor, the FIRST path mackesd's local_virt_ready() probe
+# checks (spawn_lighthouse.rs); mde-kvm drives the running VMM over its
+# api-socket, so the one binary is the whole requirement (ch-remote is a debug
+# nicety, deliberately not baked). CH_URL is overridable for a LAN mirror on
+# an airgapped builder; the sha256 gate still applies to the mirror's copy.
+ARG CH_VERSION=v52.0
+ARG CH_SHA256=829af01ff075bb96c4f183905134c453a88d68cbabdc6b87df21098842581ee9
+ARG CH_URL=https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static
+RUN set -eux; \
+    command -v curl >/dev/null 2>&1 || dnf -y install curl; \
+    curl -sfL --retry 3 -o /tmp/cloud-hypervisor "${CH_URL}" || { \
+        echo "GATED[E12-13/ch-release]: cannot fetch cloud-hypervisor ${CH_VERSION} from ${CH_URL}"; \
+        echo "  the builder needs GitHub egress here — or point CH_URL at a LAN mirror"; \
+        echo "  (--build-arg CH_URL=…); the sha256 pin below still guards the mirror copy."; \
+        exit 1; }; \
+    echo "${CH_SHA256}  /tmp/cloud-hypervisor" | sha256sum -c -; \
+    install -m 0755 /tmp/cloud-hypervisor /usr/bin/cloud-hypervisor; \
+    rm -f /tmp/cloud-hypervisor; \
+    /usr/bin/cloud-hypervisor --version
+
 # The DRM-seat unit (bootc lane only — the dnf/RPM lane keeps the .desktop
-# launcher). Boot-to-seat: quasar-vdi-desktop.md lock 34.
+# launcher) + its preset. Boot-to-seat: quasar-vdi-desktop.md lock 34.
 COPY packaging/bootc/units/mde-shell-egui.service /usr/lib/systemd/system/mde-shell-egui.service
+COPY packaging/bootc/system-preset/45-mcnf-quasar.preset /usr/lib/systemd/system-preset/45-mcnf-quasar.preset
 
 # Workstation-role wiring. The RPM post-install already enabled the all-roles
 # set (mackesd, nebula, mesh-health.timer, mesh-status.timer, the first-boot
 # setup oneshots, magic-setup, magic-mesh-brand + the mde-musicd user unit);
-# this adds the VDI seat + the podman API socket and boots to graphical.
-# NOTHING is masked by default (§5): the seat unit self-gates on the role flag,
-# so this one image serves every role unmodified.
+# this adds the VDI seat + the podman API socket (the preset above is the
+# declared policy, the enable materializes it in the image /etc now) and boots
+# to graphical. NOTHING is masked by default (§5): the seat unit self-gates on
+# the role flag, so this one image serves every role unmodified.
 RUN systemctl enable mde-shell-egui.service podman.socket && \
     systemctl set-default graphical.target
 
