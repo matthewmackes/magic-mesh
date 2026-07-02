@@ -35,6 +35,12 @@ pub mod enable;
 /// reads integration-gated.
 pub mod verify;
 
+/// SURFACE-5 — the fwupd/LVFS firmware panel: list this node's updatable
+/// firmware (current/available versions via `fwupdmgr get-devices`/`get-updates`),
+/// a typed-armed `fw-apply` verb, and a verify re-run after a successful apply
+/// (lock #8). Injectable [`firmware::Fwupd`] seam; live calls integration-gated.
+pub mod firmware;
+
 /// The four DMI fields the Surface identity fold reads, already
 /// trimmed. A field the firmware/kernel doesn't expose is the empty
 /// string (never an error) — best-effort, like every other mackesd

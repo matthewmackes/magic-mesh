@@ -7911,6 +7911,23 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("surface_verify".into());
 
+        // SURFACE-5 — the per-node surface_firmware worker. On a recognised
+        // Microsoft Surface it publishes the fwupd/LVFS inventory (current +
+        // available versions per device) to state/hardware/surface/<node>/firmware
+        // (the Install tab's firmware panel), drains typed-armed apply requests
+        // on action/hardware/surface/<node>/fw-apply, and on a successful apply
+        // re-runs SURFACE-4's verify. An un-armed apply is refused; live fwupd
+        // calls are integration-gated (honest typed errors, never a faked
+        // update). On a non-Surface node it idles.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::SurfaceFirmwareWorker::new(node_id.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("surface_firmware".into());
+
         // MON-1.b (v2.6) — Netdata aggregator-IP publisher.
         // Pairs with `apply_netdata_monitor`'s baseline
         // /etc/netdata/netdata.conf: when this peer wins

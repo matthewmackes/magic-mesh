@@ -667,6 +667,13 @@ pub use crate::surface::enable::SurfaceEnableWorker;
 // other worker.
 #[cfg(feature = "async-services")]
 pub use crate::surface::verify::SurfaceVerifyWorker;
+// SURFACE-5 — the per-node `surface_firmware` worker (a leader-of-self worker:
+// it lists + applies its OWN firmware via fwupd/LVFS, never a remote node, and
+// re-runs SURFACE-4's verify after a successful apply). Sibling of the
+// SURFACE-2/3/4 units under `crate::surface::firmware`; re-exported here so the
+// supervisor spawn site reaches it through the workers namespace.
+#[cfg(feature = "async-services")]
+pub use crate::surface::firmware::SurfaceFirmwareWorker;
 
 /// Every worker registered with the supervisor implements this
 /// trait. The trait is `async_trait` because the supervisor stores
