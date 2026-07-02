@@ -689,7 +689,6 @@ pub fn check_wall(
             VirtualInUseStatus::Unknown => {
                 return Err(VirtualWallRefusal::VolumeInUseUnknown(vol.to_string()))
             }
-            VirtualInUseStatus::InUseByVm(_) => {}
         }
     }
     Ok(())
@@ -2056,9 +2055,12 @@ mod tests {
     }
     impl VirtualExecutor for FakeExec {
         fn apply(&self, op: &VirtualStorageOp) -> Result<(), VExecError> {
-            let mut n = self.seen.lock().unwrap();
-            let this = *n;
-            *n += 1;
+            let this = {
+                let mut n = self.seen.lock().unwrap();
+                let this = *n;
+                *n += 1;
+                this
+            };
             if self.fail_at == Some(this) {
                 return Err(VExecError::QemuImg(QemuImgError::Failed {
                     op: "create",
@@ -2085,7 +2087,7 @@ mod tests {
         let exec = FakeExec::ok();
         let mut progress = vec![];
         let outcome = apply_queue(&q, &live, &snap, &exec, |i, s| {
-            progress.push((i, s.clone()))
+            progress.push((i, s.clone()));
         });
         assert!(outcome.is_success());
         assert_eq!(outcome.applied, 2);
@@ -2270,12 +2272,11 @@ mod tests {
                 .into(),
         });
         let snap = VirtualInUseSnapshot {
-            vm_images: [(img_path.to_string_lossy().into_owned(), "web1".to_string())]
-                .into_iter()
-                .collect(),
-            container_volumes: [("pgdata".to_string(), "pg".to_string())]
-                .into_iter()
-                .collect(),
+            vm_images: BTreeMap::from([(
+                img_path.to_string_lossy().into_owned(),
+                "web1".to_string(),
+            )]),
+            container_volumes: BTreeMap::from([("pgdata".to_string(), "pg".to_string())]),
             vm_tool: true,
             container_tool: true,
         };

@@ -140,10 +140,11 @@ pub enum QemuImgError {
     Parse(String),
 }
 
-/// The `qemu-img` I/O seam: create/resize/convert/snapshot an image + read its
-/// info. Production is [`LiveQemuImg`]; tests inject a fake so the whole
-/// image-lifecycle folds headless (mirrors [`crate::ChTransport`] /
-/// `DdcRunner`).
+/// The `qemu-img` I/O seam.
+///
+/// Create/resize/convert/snapshot an image + read its info. Production is
+/// [`LiveQemuImg`]; tests inject a fake so the whole image-lifecycle folds
+/// headless (mirrors [`crate::ChTransport`] / `DdcRunner`).
 pub trait QemuImgRunner: Send + Sync {
     /// `qemu-img info --output=json <path>` → the parsed [`ImageInfo`].
     ///
