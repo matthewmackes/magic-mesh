@@ -25,6 +25,7 @@
 //! harness-pinned egui version (no cross-surface version skew).
 
 pub mod fonts;
+pub mod hostkeys;
 pub mod motion;
 pub mod runner;
 pub mod style;

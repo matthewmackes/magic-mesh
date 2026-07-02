@@ -680,6 +680,14 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                     if code == 1 && pressed {
                         quit = true; // ESC exits the DRM shell
                     }
+                    // E12-19 (lock 8): the XF86 media/system keys + the Super leader
+                    // have no egui::Key, so forward the host-relevant scancodes on
+                    // the host-key side channel. The shell drains them each frame and
+                    // dispatches them host-first (even over a fullscreen guest); they
+                    // are NOT emitted as egui events, so the guest never sees them.
+                    if crate::hostkeys::is_host_key(code) {
+                        crate::hostkeys::push_host_key(code, pressed);
+                    }
                     let modifiers = egui::Modifiers {
                         alt,
                         ctrl,
