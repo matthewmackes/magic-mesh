@@ -55,8 +55,8 @@ use ed25519_dalek::SigningKey;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, StoredMessage};
 use mde_chat::{
-    fold_alert, sign, Contact, Conversation, Message, MessageId, MessageKind, NodeRole, Presence,
-    Roster,
+    Contact, Conversation, Message, MessageId, MessageKind, NodeRole, Presence, Roster, Severity,
+    fold_alert, sign,
 };
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +70,11 @@ pub const EVENT_CHAT_MESSAGE: &str = "event/chat/message";
 pub const STATE_CHAT_ROSTER: &str = "state/chat/roster";
 /// Prefix for the per-conversation read-model the UI renders.
 pub const STATE_CHAT_CONVERSATION_PREFIX: &str = "state/chat/conversation/";
+/// The KIRON chyron lane (`docs/design/kiron-toast-pattern.md`, lock 7).
+///
+/// A Warning+ folded alert also raises a transient lower-third here; must match
+/// the shell's `toast_bridge::TOAST_TOPIC` byte-for-byte.
+pub const EVENT_TOAST_SHOW: &str = "event/toast/show";
 
 /// The `state/chat/conversation/<key>` topic for one conversation key.
 #[must_use]
@@ -244,6 +249,74 @@ pub fn alert_message(
     }
     msg.id = MessageId::new(format!("alert-{bus_ulid}"));
     msg
+}
+
+// ── the KIRON chyron emitter (lock 7/9/11) ──────────────────────────────────
+
+/// The `event/toast/show` wire body a Warning+ folded alert raises — a
+/// **serialize-only** local mirror of the shell's `toast_bridge::ToastMsg`
+/// decoder (§6 mesh/desktop boundary: the worker never depends on the shell
+/// crate). The severity is the shared lowercase tag (`warning`/`critical`), so
+/// the shell decodes it byte-for-byte; the action pair is optional (`None` ⇒ the
+/// fields are simply omitted, and the decoder's `#[serde(default)]` accepts it).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct ToastShow {
+    /// Lowercase severity string — `mde_chat::Severity::tag`.
+    severity: &'static str,
+    /// The host the alert is *about* (the folded message's sender).
+    source_host: String,
+    /// The category chip, upper-cased for the news-style flag (`SECURITY`/…).
+    flag: String,
+    /// The single-line headline drawn in the band.
+    headline: String,
+    /// The optional click-through caption (present ⇔ `action_verb`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_label: Option<String>,
+    /// The optional shell-nav verb (`shell/goto/<surface>`) the click resolves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_verb: Option<String>,
+}
+
+/// The human headline for the chyron: the first present of a small preference of
+/// the alert's folded string fields, else the flag so a bare alert still reads.
+fn alert_headline(fields: &BTreeMap<String, String>, flag: &str) -> String {
+    const PREFERRED: [&str; 5] = ["summary", "headline", "title", "alert", "body"];
+    for k in PREFERRED {
+        if let Some(v) = fields.get(k) {
+            if !v.trim().is_empty() {
+                return v.clone();
+            }
+        }
+    }
+    flag.to_string()
+}
+
+/// Build the `event/toast/show` body for a folded alert — `Some` for **Warning+**
+/// (which surfaces as a transient chyron), `None` for **Info** (lock 11 taming:
+/// Info folds to the durable chat ring-log but stays out of the lower-third) and
+/// for any non-alert kind. The click-through routes to the Notifications surface,
+/// where the same alert lives as a chat message (lock 9/11).
+fn toast_for_alert(msg: &Message) -> Option<ToastShow> {
+    let MessageKind::Alert {
+        severity,
+        flag,
+        fields,
+        ..
+    } = &msg.kind
+    else {
+        return None;
+    };
+    if *severity == Severity::Info {
+        return None;
+    }
+    Some(ToastShow {
+        severity: severity.tag(),
+        source_host: msg.sender.clone(),
+        flag: flag.to_ascii_uppercase(),
+        headline: alert_headline(fields, flag),
+        action_label: Some("Open".to_string()),
+        action_verb: Some("shell/goto/notifications".to_string()),
+    })
 }
 
 // ── presence ───────────────────────────────────────────────────────────────
@@ -608,12 +681,26 @@ impl ChatWorker {
                 let body = m.body.as_deref().unwrap_or("");
                 let msg = alert_message(topic, &m.ulid, body, m.ts_unix_ms, &self.self_host);
                 let key = alert_key(&msg.sender);
-                state
+                // Build the chyron body before the ring consumes the message.
+                let show = toast_for_alert(&msg);
+                let inserted = state
                     .convos
                     .entry(key.clone())
                     .or_insert_with(|| Conversation::new(key.as_str()))
                     .insert(msg);
                 state.dirty.insert(key);
+                // Raise the transient lower-third only for a genuinely NEW Warning+
+                // alert. The ring's insert-return dedups a live alert against its
+                // later re-fold / Syncthing backfill (same deterministic
+                // `alert-<ulid>` id ⇒ no second toast); the durable record stays
+                // the chat ring-log (lock 11 — the chyron is transient).
+                if inserted {
+                    if let Some(show) = show {
+                        if let Ok(body) = serde_json::to_string(&show) {
+                            publish(persist, EVENT_TOAST_SHOW, &body);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1121,10 +1208,12 @@ mod tests {
             MessageKind::Alert { .. }
         ));
         // And the read-model mirror is published for the UI.
-        assert!(!persist
-            .list_since(&conversation_topic(&k), None)
-            .unwrap()
-            .is_empty());
+        assert!(
+            !persist
+                .list_since(&conversation_topic(&k), None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1150,6 +1239,127 @@ mod tests {
         conv.insert(a);
         assert!(!conv.insert(b), "same id ⇒ no double");
         assert_eq!(conv.len(), 1);
+    }
+
+    // ── the KIRON chyron emitter (lock 7/9/11) ──────────────────────────
+
+    /// Re-parse a serialized `ToastShow` as generic JSON so the assertions read
+    /// the exact wire the shell's `toast_bridge::ToastMsg` decoder sees.
+    fn toast_json(show: &ToastShow) -> serde_json::Value {
+        serde_json::from_str(&serde_json::to_string(show).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn warning_alert_builds_a_shell_decodable_toast() {
+        let body =
+            r#"{"severity":"warning","host":"nyc3","summary":"disk at 90%","priority":"high"}"#;
+        let msg = alert_message("event/security/alert", "01ABC", body, 1_000, "eagle");
+        let show = toast_for_alert(&msg).expect("Warning+ emits a chyron");
+        // The exact wire shape the shell decodes: lowercase severity, the origin
+        // host, an upper-cased flag chip, the summary headline, and a resolvable
+        // action pair (`shell/goto/<surface>`).
+        let j = toast_json(&show);
+        assert_eq!(j["severity"], "warning");
+        assert_eq!(j["source_host"], "nyc3");
+        assert_eq!(j["flag"], "SECURITY");
+        assert_eq!(j["headline"], "disk at 90%");
+        assert_eq!(j["action_label"], "Open");
+        assert_eq!(j["action_verb"], "shell/goto/notifications");
+    }
+
+    #[test]
+    fn critical_alert_toasts_and_falls_back_to_the_flag_headline() {
+        // No summary/title/body field → the headline degrades to the flag chip.
+        let body = r#"{"severity":"critical","host":"lh1"}"#;
+        let msg = alert_message("event/firewall/h", "01Z", body, 1, "eagle");
+        let show = toast_for_alert(&msg).expect("Critical emits");
+        assert_eq!(show.severity, "critical");
+        assert_eq!(show.headline, "firewall", "flag is the headline fallback");
+    }
+
+    #[test]
+    fn info_alert_folds_to_chat_but_never_toasts() {
+        // Lock 11 taming: an Info alert is a durable chat message but no chyron.
+        let body = r#"{"severity":"info","host":"nyc3","summary":"heartbeat ok"}"#;
+        let msg = alert_message("event/dc/health/etcd", "01I", body, 1, "eagle");
+        assert!(
+            toast_for_alert(&msg).is_none(),
+            "Info stays out of the band"
+        );
+    }
+
+    #[test]
+    fn alert_lane_raises_one_chyron_and_dedups_a_refold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let w = worker(root);
+        let persist = persist_at(root);
+        let mut state = ChatState::default();
+        // Prime + seed the lane (forward-only), then land a live Warning alert.
+        persist
+            .write(
+                "event/security/alert",
+                Priority::Min,
+                None,
+                Some(r#"{"severity":"info","host":"nyc3","summary":"pre-existing"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 100);
+        persist
+            .write(
+                "event/security/alert",
+                Priority::Urgent,
+                None,
+                Some(r#"{"severity":"warning","host":"nyc3","summary":"intrusion probe"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 200);
+
+        // Exactly one well-formed chyron reached the shell lane.
+        let toasts = persist.list_since(EVENT_TOAST_SHOW, None).unwrap();
+        assert_eq!(toasts.len(), 1, "one Warning alert ⇒ one chyron");
+        let j: serde_json::Value = serde_json::from_str(toasts[0].body.as_ref().unwrap()).unwrap();
+        assert_eq!(j["severity"], "warning");
+        assert_eq!(j["source_host"], "nyc3");
+        assert_eq!(j["headline"], "intrusion probe");
+
+        // A re-fold of the SAME Bus ulid (deterministic id) must not double-toast.
+        let refold = alert_message(
+            "event/security/alert",
+            &toasts_source_ulid(&persist),
+            r#"{"severity":"warning","host":"nyc3","summary":"intrusion probe"}"#,
+            200,
+            "eagle",
+        );
+        let key = alert_key(&refold.sender);
+        let show = toast_for_alert(&refold);
+        let inserted = state.convos.get_mut(&key).unwrap().insert(refold);
+        assert!(!inserted, "same id ⇒ ring rejects the re-fold");
+        assert!(
+            show.is_some() && !inserted,
+            "the emitter is gated on the insert-return, so no second toast"
+        );
+        assert_eq!(
+            persist.list_since(EVENT_TOAST_SHOW, None).unwrap().len(),
+            1,
+            "still one chyron after the re-fold"
+        );
+    }
+
+    /// The Bus ulid of the live (Urgent) security alert — the id the re-fold
+    /// reuses to prove the dedup.
+    fn toasts_source_ulid(persist: &Persist) -> String {
+        persist
+            .list_since("event/security/alert", None)
+            .unwrap()
+            .into_iter()
+            .find(|m| {
+                m.body
+                    .as_deref()
+                    .is_some_and(|b| b.contains("intrusion probe"))
+            })
+            .map(|m| m.ulid)
+            .expect("the live alert exists")
     }
 
     #[test]
