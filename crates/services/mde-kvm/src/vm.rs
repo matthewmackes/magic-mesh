@@ -94,6 +94,33 @@ impl<T: ChTransport> Vm<T> {
         self.put("/vm.delete", None).map(|_| ())
     }
 
+    /// `PUT /api/v1/vm.add-disk` — hot-plug the image at `path` into the running
+    /// guest as a virtio-blk device pinned to `id` (E12-22 attach). Reuses the live
+    /// guest — no lifecycle reimplementation; the disk id lets [`Vm::remove_device`]
+    /// detach exactly this image later.
+    ///
+    /// # Errors
+    /// Serialization, transport, or a non-2xx API response.
+    pub fn add_disk(
+        &self,
+        id: &str,
+        path: &std::path::Path,
+        readonly: bool,
+    ) -> Result<(), KvmError> {
+        let body = serde_json::to_string(&crate::config::disk_hotplug_body(id, path, readonly))?;
+        self.put("/vm.add-disk", Some(&body)).map(|_| ())
+    }
+
+    /// `PUT /api/v1/vm.remove-device` — detach the hot-plugged device named `id`
+    /// (E12-22 detach).
+    ///
+    /// # Errors
+    /// Serialization, transport, or a non-2xx API response.
+    pub fn remove_device(&self, id: &str) -> Result<(), KvmError> {
+        let body = serde_json::to_string(&crate::config::remove_device_body(id))?;
+        self.put("/vm.remove-device", Some(&body)).map(|_| ())
+    }
+
     /// `GET /api/v1/vm.info` — the guest's current state + effective config.
     ///
     /// # Errors
@@ -322,6 +349,36 @@ mod tests {
         assert!(msg.contains("/api/v1/vm.create"), "{msg}");
         assert!(msg.contains("500"), "{msg}");
         assert!(msg.contains("vmm: bad config"), "{msg}");
+    }
+
+    #[test]
+    fn add_disk_and_remove_device_put_the_hotplug_bodies() {
+        // attach: PUT vm.add-disk carrying the DiskConfig (path + readonly + id).
+        let vm = Vm::with_transport(MockTransport::ok());
+        vm.add_disk(
+            "disk-data",
+            std::path::Path::new("/home/op/Local/data.qcow2"),
+            false,
+        )
+        .expect("add-disk");
+        let calls = vm.transport.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].method, "PUT");
+        assert_eq!(calls[0].path, "/api/v1/vm.add-disk");
+        let sent: serde_json::Value =
+            serde_json::from_str(calls[0].body.as_ref().expect("body")).expect("json");
+        assert_eq!(sent["path"], serde_json::json!("/home/op/Local/data.qcow2"));
+        assert_eq!(sent["readonly"], serde_json::json!(false));
+        assert_eq!(sent["id"], serde_json::json!("disk-data"));
+
+        // detach: PUT vm.remove-device carrying just the id.
+        let vm = Vm::with_transport(MockTransport::ok());
+        vm.remove_device("disk-data").expect("remove-device");
+        let calls = vm.transport.calls();
+        assert_eq!(calls[0].path, "/api/v1/vm.remove-device");
+        let sent: serde_json::Value =
+            serde_json::from_str(calls[0].body.as_ref().expect("body")).expect("json");
+        assert_eq!(sent, serde_json::json!({"id": "disk-data"}));
     }
 
     #[test]

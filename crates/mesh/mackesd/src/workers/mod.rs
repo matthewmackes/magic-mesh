@@ -545,6 +545,13 @@ pub mod container;
 // per-op Bus progress, and the `state/storage/<node>` mirror + `action/storage/
 // <node>` verbs. Injectable UDisks2/executor/wall seams keep it headless-testable.
 pub mod storage;
+// E12-22 — virtual disks first-class: KVM images (qemu-img) + Podman storage as
+// citizens of the Storage plane's staged op queue, beside the physical StorageOp
+// queue. A parallel VirtualStorageOp pipeline (create/resize/snapshot/revert/convert/
+// clone/attach-detach + volume create/remove/prune) walled by the same in-use sources
+// (a running VM's image / a mounted volume), published to the sibling
+// `state/storage/<node>/virtual` mirror. Owned by the storage worker (no new spawn).
+pub mod virtual_storage;
 // MV-5a — the scheduler worker: the placement slice of the no-center scheduler.
 // Drains `action/schedule/place`, folds each node's latest `event/kvm/services`
 // capacity, chooses the target node (healthy pin → most-active → node_id

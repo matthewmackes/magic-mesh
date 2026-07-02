@@ -63,6 +63,7 @@
 
 mod config;
 mod migrate;
+mod qemu_img;
 mod spec;
 mod transport;
 mod usb;
@@ -74,10 +75,15 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-pub use config::build_ch_config;
+pub use config::{build_ch_config, disk_hotplug_body, hotplug_disk_id, remove_device_body};
 pub use migrate::{
     plan_migration, run_migration, MigrateError, MigrateRequest, MigrationPlan, MigrationSide,
     MigrationStep, MigrationUrl, DEFAULT_MIGRATION_PORT, MIGRATION_STEPS,
+};
+pub use qemu_img::{
+    convert_argv, create_argv, info_argv, parse_image_info, resize_argv, snapshot_argv,
+    ImageFormat, ImageInfo, ImageSnapshot, LiveQemuImg, QemuImgError, QemuImgRunner,
+    SnapshotAction, DEFAULT_QEMU_IMG_TIMEOUT,
 };
 pub use spec::{
     api_socket_path, gpu_socket_path, running_disk_path, virtiofs_socket_path, Nic, NicRole,

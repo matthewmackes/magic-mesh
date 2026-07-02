@@ -148,6 +148,42 @@ fn vfio_to_device(device: &VfioDevice) -> Value {
     json!({ "path": device.address.sysfs_path().to_string_lossy() })
 }
 
+/// The cloud-hypervisor `vm.add-disk` `DiskConfig` body for hot-plugging `path`.
+///
+/// Attaches the image at `path` into a running guest (E12-22 attach) — the same
+/// `DiskConfig` shape [`build_ch_config`] emits in `disks[0]`, with an explicit `id`
+/// so a later [`remove_device_body`] can detach exactly this disk.
+///
+/// Reuses the running VM (the caller drives it through [`crate::Vm::add_disk`]); it
+/// does **not** reimplement the VM lifecycle — the guest keeps running, this only
+/// adds a virtio-blk device backed by the image at rest.
+#[must_use]
+pub fn disk_hotplug_body(id: &str, path: &std::path::Path, readonly: bool) -> Value {
+    json!({
+        "path": path.to_string_lossy(),
+        "readonly": readonly,
+        "id": id,
+    })
+}
+
+/// The cloud-hypervisor `vm.remove-device` body — detach the hot-plugged device
+/// named `id` (the `id` a prior [`disk_hotplug_body`] pinned).
+#[must_use]
+pub fn remove_device_body(id: &str) -> Value {
+    json!({ "id": id })
+}
+
+/// The conventional hot-plug disk id for an image attached to a VM: `disk-<stem>`
+/// where `<stem>` is the image file stem (so attach + detach agree by construction,
+/// like the virtiofs socket paths).
+#[must_use]
+pub fn hotplug_disk_id(image: &std::path::Path) -> String {
+    let stem = image
+        .file_stem()
+        .map_or_else(|| "image".to_string(), |s| s.to_string_lossy().into_owned());
+    format!("disk-{stem}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,6 +368,33 @@ mod tests {
                 "console": { "mode": "Tty" },
                 "net": [ { "tap": "mvm-snap-mesh" } ],
             })
+        );
+    }
+
+    #[test]
+    fn hotplug_bodies_and_id_are_stable_and_match_the_disk_shape() {
+        // the attach body is the same DiskConfig shape as disks[0], plus the id.
+        assert_eq!(
+            disk_hotplug_body(
+                "disk-data",
+                std::path::Path::new("/home/op/Local/data.qcow2"),
+                true
+            ),
+            json!({ "path": "/home/op/Local/data.qcow2", "readonly": true, "id": "disk-data" })
+        );
+        // detach carries just the id.
+        assert_eq!(
+            remove_device_body("disk-data"),
+            json!({ "id": "disk-data" })
+        );
+        // the id derives from the file stem so attach + detach agree.
+        assert_eq!(
+            hotplug_disk_id(std::path::Path::new("/home/op/Local/data.qcow2")),
+            "disk-data"
+        );
+        assert_eq!(
+            hotplug_disk_id(std::path::Path::new("/x/noext")),
+            "disk-noext"
         );
     }
 }

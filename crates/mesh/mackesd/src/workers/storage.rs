@@ -1936,6 +1936,10 @@ pub struct StorageWorker {
     heartbeat: Duration,
     /// Bus root override (tests). `None` ⇒ [`default_bus_root`].
     bus_root_override: Option<PathBuf>,
+    /// The E12-22 virtual-disks sub-worker (KVM images + Podman storage), drained +
+    /// published in the same loop (no separate mackesd spawn line). See
+    /// [`super::virtual_storage`].
+    virtual_storage: super::virtual_storage::VirtualStorage,
 }
 
 impl StorageWorker {
@@ -1945,6 +1949,7 @@ impl StorageWorker {
     #[must_use]
     pub fn new(node_id: String) -> Self {
         Self {
+            virtual_storage: super::virtual_storage::VirtualStorage::production(node_id.clone()),
             node_id,
             udisks: Arc::new(ZbusUDisks2Client::new()),
             executor: Arc::new(UDisks2Executor::new()),
@@ -1953,6 +1958,13 @@ impl StorageWorker {
             heartbeat: PUBLISH_HEARTBEAT,
             bus_root_override: None,
         }
+    }
+
+    /// Inject the virtual-disks sub-worker (tests).
+    #[must_use]
+    pub fn with_virtual(mut self, virtual_storage: super::virtual_storage::VirtualStorage) -> Self {
+        self.virtual_storage = virtual_storage;
+        self
     }
 
     /// Inject the `UDisks2` client (tests).
@@ -2160,6 +2172,10 @@ impl Worker for StorageWorker {
         let mut cursor = bus_root
             .as_deref()
             .and_then(|r| prime_cursor(r, &action_topic(&self.node_id)));
+        // The E12-22 virtual queue drains its own sibling topic; prime its cursor too.
+        let mut virtual_cursor = bus_root
+            .as_deref()
+            .and_then(|r| self.virtual_storage.prime_cursor(r));
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
         loop {
@@ -2171,6 +2187,16 @@ impl Worker for StorageWorker {
                         false
                     };
                     self.publish_snapshot(&mut last_pub, changed).await;
+                    // The virtual sub-worker shells qemu-img/podman (blocking, bounded
+                    // by EFF-20), so run its tick off the runtime thread.
+                    if let Some(root) = &bus_root {
+                        let vs = self.virtual_storage.clone();
+                        let root = root.clone();
+                        let cur = virtual_cursor.clone();
+                        virtual_cursor = tokio::task::spawn_blocking(move || vs.tick(&root, cur))
+                            .await
+                            .unwrap_or(virtual_cursor);
+                    }
                 }
                 () = shutdown.wait() => break,
             }
