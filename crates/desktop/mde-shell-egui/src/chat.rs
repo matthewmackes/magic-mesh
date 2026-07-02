@@ -34,7 +34,10 @@ use std::{
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
-use mde_chat::{Contact, Conversation, Message, MessageKind, Presence, Roster, Severity};
+use mde_chat::{
+    Contact, Conversation, Message, MessageKind, Presence, RoomDescriptor, RoomKind, Roster,
+    Severity,
+};
 use mde_egui::egui::{self, Align, Color32, Layout, RichText, ScrollArea};
 use mde_egui::Style;
 
@@ -47,10 +50,17 @@ const REFRESH: Duration = Duration::from_secs(2);
 
 /// The presence roster mirror the worker publishes (latest-wins).
 const ROSTER_TOPIC: &str = "state/chat/roster";
+/// The room-registry mirror the worker publishes — every known room + its
+/// membership descriptor (NOTIFY-CHAT-5), latest-wins as a JSON array.
+const ROOMS_TOPIC: &str = "state/chat/rooms";
 /// Prefix for the per-conversation read-model the worker republishes each change.
 const CONVERSATION_PREFIX: &str = "state/chat/conversation/";
 /// The UI's outbound verb — a chat message to send.
 const ACTION_CHAT_SEND: &str = "action/chat/send";
+/// The UI's room-lifecycle verb (NOTIFY-CHAT-5): create / self-join / dissolve a
+/// room. `{op:"create"|"join"|"dissolve", id, name?}` — the worker replicates the
+/// signed descriptor and enforces creator-only dissolve.
+const ACTION_CHAT_ROOM: &str = "action/chat/room";
 /// The voice worker's dial verb (lock 15 — Call hands off to `mde-voice`). Chat is
 /// the launch point; a running SIP agent draining this is integration-gated.
 const ACTION_VOICE_DIAL: &str = "action/voice/dial";
@@ -78,6 +88,22 @@ fn dm_key(a: &str, b: &str) -> String {
 /// The conversation key for a host's folded-alert timeline (mirrors the worker).
 fn alert_key(host: &str) -> String {
     format!("alert:{host}")
+}
+
+/// The conversation key for a room's shared log (mirrors the worker's `room_key`).
+fn room_key(id: &str) -> String {
+    format!("room:{id}")
+}
+
+/// What the operator has open in the conversation pane: a 1:1 contact (its merged
+/// human+alert timeline) or a room (its shared log). A single selection so exactly
+/// one pane is open at a time (the ICQ single-window idiom on a DRM seat).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Selection {
+    /// A contact host — its `dm:` ∪ `alert:` timeline.
+    Contact(String),
+    /// A room id — its `room:<id>` shared log.
+    Room(String),
 }
 
 /// Every conversation key that folds into a contact's one ICQ timeline (lock 2 —
@@ -168,10 +194,16 @@ pub(crate) struct ChatState {
     roster: Option<Roster>,
     /// host → the contact's merged (DM ∪ alert) ring, rebuilt each refresh.
     convos: BTreeMap<String, Conversation>,
-    /// The selected contact host (its conversation pane is open).
-    selected: Option<String>,
+    /// The room registry the worker publishes (system + ad-hoc), latest-wins.
+    rooms: Vec<RoomDescriptor>,
+    /// room id → its shared log ring, rebuilt each refresh from `room:<id>`.
+    room_convos: BTreeMap<String, Conversation>,
+    /// The selected contact or room (its conversation pane is open).
+    selected: Option<Selection>,
     /// The composer buffer for the open conversation.
     draft: String,
+    /// The new-room name buffer for the roster's create affordance (NOTIFY-CHAT-5).
+    new_room: String,
     /// The Send-To composer's file path buffer (typed or drag-dropped) — an empty
     /// string hides the attach row's Send button (NOTIFY-CHAT-4, file kind).
     attach_path: String,
@@ -188,8 +220,11 @@ impl Default for ChatState {
             bus_root: mde_bus::client_data_dir(),
             roster: None,
             convos: BTreeMap::new(),
+            rooms: Vec::new(),
+            room_convos: BTreeMap::new(),
             selected: None,
             draft: String::new(),
+            new_room: String::new(),
             attach_path: String::new(),
             seen: BTreeMap::new(),
             last_poll: None,
@@ -242,6 +277,28 @@ impl ChatState {
             convos.insert(contact.host.clone(), conv);
         }
         self.convos = convos;
+
+        // Rooms (NOTIFY-CHAT-5): the registry mirror + each room's shared log.
+        if let Some(rooms) = latest_json::<Vec<RoomDescriptor>>(&persist, ROOMS_TOPIC) {
+            self.rooms = rooms;
+        }
+        let mut room_convos = BTreeMap::new();
+        for descriptor in &self.rooms {
+            let mut conv = Conversation::new(descriptor.id.as_str());
+            if let Some(ring) = latest_json::<Vec<Message>>(
+                &persist,
+                &conversation_topic(&room_key(&descriptor.id)),
+            ) {
+                for msg in ring {
+                    conv.insert(msg);
+                }
+            }
+            self.seen
+                .entry(room_key(&descriptor.id))
+                .or_insert(conv.len());
+            room_convos.insert(descriptor.id.clone(), conv);
+        }
+        self.room_convos = room_convos;
     }
 
     /// Unread count for `host` — new messages since the read watermark, clamped so
@@ -249,6 +306,14 @@ impl ChatState {
     fn unread(&self, host: &str) -> usize {
         let now = self.convos.get(host).map_or(0, Conversation::len);
         let seen = self.seen.get(host).copied().unwrap_or(now);
+        now.saturating_sub(seen)
+    }
+
+    /// Unread count for room `id` — same watermark logic, keyed by the `room:<id>`
+    /// conversation key so it never collides with a contact hostname.
+    fn room_unread(&self, id: &str) -> usize {
+        let now = self.room_convos.get(id).map_or(0, Conversation::len);
+        let seen = self.seen.get(&room_key(id)).copied().unwrap_or(now);
         now.saturating_sub(seen)
     }
 
@@ -269,21 +334,31 @@ impl ChatState {
             });
 
         match self.selected.clone() {
-            Some(host) if roster.get(&host).is_some() => {
+            Some(Selection::Contact(host)) if roster.get(&host).is_some() => {
                 // Opening the pane marks it read (watermark → current length).
                 let now = self.convos.get(&host).map_or(0, Conversation::len);
                 self.seen.insert(host.clone(), now);
                 self.conversation_pane(ui, &roster, &host);
             }
+            Some(Selection::Room(id)) if self.room_descriptor(&id).is_some() => {
+                let now = self.room_convos.get(&id).map_or(0, Conversation::len);
+                self.seen.insert(room_key(&id), now);
+                self.room_pane(ui, &roster, &id);
+            }
             _ => {
                 crate::session::empty_state(
                     ui,
-                    "Pick a contact",
-                    "Select a host on the left to open its conversation — its messages and its \
-                     alerts share one timeline.",
+                    "Pick a contact or room",
+                    "Select a host or a room on the left to open its conversation — a contact's \
+                     messages and its alerts share one timeline.",
                 );
             }
         }
+    }
+
+    /// The registry descriptor for room `id`, if the worker has published it.
+    fn room_descriptor(&self, id: &str) -> Option<&RoomDescriptor> {
+        self.rooms.iter().find(|d| d.id == id)
     }
 
     /// The roster rail — the ICQ Online / Offline groups (lock 4).
@@ -313,7 +388,101 @@ impl ChatState {
                 self.roster_group(ui, roster, "Online", &roster.online());
                 ui.add_space(Style::SP_S);
                 self.roster_group(ui, roster, "Offline", &roster.offline());
+                ui.add_space(Style::SP_S);
+                self.rooms_group(ui);
             });
+    }
+
+    /// The Rooms group under the contact roster (NOTIFY-CHAT-5): the auto system
+    /// rooms (All Fleet + per-severity alert bands) and any ad-hoc rooms, each a
+    /// selectable row whose shared log opens in the pane. Rendered even when empty
+    /// only if the worker has published a registry — a solo host with no room
+    /// mirror shows nothing (no fabricated rooms, §7).
+    fn rooms_group(&mut self, ui: &mut egui::Ui) {
+        if self.rooms.is_empty() {
+            return;
+        }
+        ui.label(
+            RichText::new(format!("ROOMS ({})", self.rooms.len()))
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL)
+                .strong(),
+        );
+        ui.add_space(Style::SP_XS);
+        // System rooms first (the always-present fleet bands), then ad-hoc.
+        let ids: Vec<(String, String, RoomKind)> = self
+            .rooms
+            .iter()
+            .map(|d| (d.id.clone(), d.name.clone(), d.kind))
+            .collect();
+        for (id, name, kind) in ids {
+            self.room_row(ui, &id, &name, kind);
+        }
+        // Create an ad-hoc room (open-join, lock 25): a name field + a Create button
+        // that fires the worker's `action/chat/room` create op. The worker seeds the
+        // id from the name and replicates the signed descriptor.
+        ui.add_space(Style::SP_XS);
+        let mut create = false;
+        ui.horizontal(|ui| {
+            let field = egui::TextEdit::singleline(&mut self.new_room)
+                .desired_width(f32::INFINITY)
+                .hint_text("New room name…");
+            let resp = ui.add(field);
+            create = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let ready = !self.new_room.trim().is_empty();
+            if ui.add_enabled(ready, egui::Button::new("Create")).clicked() {
+                create = true;
+            }
+        });
+        let name = self.new_room.trim().to_string();
+        if create && !name.is_empty() {
+            self.create_room(&name);
+            self.new_room.clear();
+        }
+    }
+
+    /// One room row: a room glyph, the name (bold when unread), a kind tag
+    /// (system / ad-hoc), and an unread count badge.
+    fn room_row(&mut self, ui: &mut egui::Ui, id: &str, name: &str, kind: RoomKind) {
+        let unread = self.room_unread(id);
+        let selected = self.selected == Some(Selection::Room(id.to_string()));
+        let label = RichText::new(name).size(Style::BODY);
+        let label = if unread > 0 {
+            label.color(Style::TEXT).strong()
+        } else {
+            label.color(Style::TEXT_DIM)
+        };
+        let tag = match kind {
+            RoomKind::System => "system",
+            RoomKind::AdHoc => "room",
+        };
+        let clicked = ui
+            .horizontal(|ui| {
+                ui.label(
+                    RichText::new("\u{0023}")
+                        .color(Style::ACCENT)
+                        .size(Style::BODY),
+                ); // #
+                let clicked = ui.selectable_label(selected, label).clicked();
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if unread > 0 {
+                        ui.label(
+                            RichText::new(unread.to_string())
+                                .color(Style::ACCENT)
+                                .size(Style::SMALL)
+                                .strong(),
+                        );
+                    }
+                    mde_egui::muted_note(ui, tag);
+                });
+                clicked
+            })
+            .inner;
+        if clicked {
+            self.selected = Some(Selection::Room(id.to_string()));
+            self.draft.clear();
+        }
+        ui.add_space(Style::SP_XS);
     }
 
     /// One ICQ group header + its contact rows.
@@ -343,7 +512,7 @@ impl ChatState {
     /// status message, and an unread count badge.
     fn contact_row(&mut self, ui: &mut egui::Ui, contact: &Contact) {
         let unread = self.unread(&contact.host);
-        let selected = self.selected.as_deref() == Some(contact.host.as_str());
+        let selected = self.selected == Some(Selection::Contact(contact.host.clone()));
         let name = RichText::new(contact.display_name()).size(Style::BODY);
         let name = if unread > 0 {
             name.color(Style::TEXT).strong()
@@ -371,7 +540,7 @@ impl ChatState {
             clicked
         });
         if resp.inner {
-            self.selected = Some(contact.host.clone());
+            self.selected = Some(Selection::Contact(contact.host.clone()));
             self.draft.clear();
         }
         if let Some(status) = &contact.status_message {
@@ -546,6 +715,170 @@ impl ChatState {
         .to_string();
         publish(self.bus_root.as_deref(), ACTION_CHAT_SEND, &offer);
     }
+
+    /// The conversation pane for the open room (NOTIFY-CHAT-5): header (name, kind,
+    /// member count), a Join / Dissolve action bar, the shared room log timeline,
+    /// and a composer that sends `{scope:"room"}`.
+    fn room_pane(&mut self, ui: &mut egui::Ui, roster: &Roster, id: &str) {
+        let bus_root = self.bus_root.clone();
+        let self_host = roster.self_host().to_string();
+        let Some((name, kind, members, is_member, can_dissolve)) =
+            self.room_descriptor(id).map(|d| {
+                let is_member = d.members.iter().any(|m| m == &self_host);
+                let can_dissolve = d.kind == RoomKind::AdHoc && d.creator == self_host;
+                (
+                    d.name.clone(),
+                    d.kind,
+                    d.members.len(),
+                    is_member,
+                    can_dissolve,
+                )
+            })
+        else {
+            return;
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("\u{0023}")
+                    .color(Style::ACCENT)
+                    .size(Style::HEADING),
+            );
+            ui.label(RichText::new(&name).color(Style::TEXT).size(Style::HEADING));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let tag = match kind {
+                    RoomKind::System => "system room",
+                    RoomKind::AdHoc => "room",
+                };
+                mde_egui::muted_note(ui, format!("{tag} · {members} members"));
+            });
+        });
+        mde_egui::field(ui, "id", id, Style::TEXT_DIM);
+
+        // Lifecycle actions: self-join an open room, or dissolve one you created.
+        ui.horizontal(|ui| {
+            if is_member {
+                mde_egui::muted_note(ui, "joined");
+            } else if ui
+                .button("Join")
+                .on_hover_text("Self-join this open room")
+                .clicked()
+            {
+                self.room_action("join", id, None);
+            }
+            if can_dissolve
+                && ui
+                    .button("Dissolve")
+                    .on_hover_text("Dissolve this room you created")
+                    .clicked()
+            {
+                self.room_action("dissolve", id, None);
+                self.selected = None;
+            }
+        });
+        ui.separator();
+
+        // Composer pinned to the bottom; the shared log fills the rest above it.
+        egui::TopBottomPanel::bottom("chat-room-composer")
+            .resizable(false)
+            .show_inside(ui, |ui| {
+                self.room_composer(ui, id, members);
+            });
+
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| match self.room_convos.get(id) {
+                Some(conv) if !conv.is_empty() => {
+                    for msg in conv.messages() {
+                        // A room has no single recipient presence — pass None so my
+                        // outgoing line reads a neutral "Sent" (the honest room state;
+                        // per-member delivery is the worker's fan-out, lock 22).
+                        message_row(ui, msg, &self_host, None, bus_root.as_deref());
+                        ui.add_space(Style::SP_XS);
+                    }
+                }
+                _ => {
+                    crate::session::empty_state(
+                        ui,
+                        "No messages",
+                        "This room's shared log is empty — say hello, or wait for a fleet alert to \
+                         land here.",
+                    );
+                }
+            });
+    }
+
+    /// The room composer — a text field + Send that writes `action/chat/send`
+    /// `{scope:"room"}`. A room fans out to each online member, so the honest hint
+    /// is the member count, not a single-recipient delivery checkmark (lock 22).
+    fn room_composer(&mut self, ui: &mut egui::Ui, id: &str, members: usize) {
+        ui.add_space(Style::SP_XS);
+        let mut send = false;
+        ui.horizontal(|ui| {
+            let field = egui::TextEdit::singleline(&mut self.draft)
+                .desired_width(f32::INFINITY)
+                .hint_text("Message the room…");
+            let resp = ui.add(field);
+            send = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.button("Send").clicked() {
+                send = true;
+            }
+        });
+        mde_egui::muted_note(ui, format!("\u{2192} {members} members"));
+        ui.add_space(Style::SP_XS);
+        let text = self.draft.trim().to_string();
+        if send && !text.is_empty() {
+            self.send_room(id, &text);
+            self.draft.clear();
+        }
+    }
+
+    /// Publish `action/chat/send` `{scope:"room", to:<id>, text}` — the worker signs
+    /// it, appends to the room's shared Syncthing log, and fans it out to each online
+    /// member (best-effort; a missing Bus is a silent no-op).
+    fn send_room(&self, id: &str, text: &str) {
+        let body = serde_json::json!({ "scope": "room", "to": id, "text": text }).to_string();
+        publish(self.bus_root.as_deref(), ACTION_CHAT_SEND, &body);
+    }
+
+    /// Create an ad-hoc room named `name`: derive a stable id from the name and fire
+    /// the worker's `action/chat/room` create op (the worker owns + joins it).
+    fn create_room(&self, name: &str) {
+        let id = room_id_from_name(name);
+        if id.is_empty() {
+            return;
+        }
+        let body = serde_json::json!({ "op": "create", "id": id, "name": name }).to_string();
+        publish(self.bus_root.as_deref(), ACTION_CHAT_ROOM, &body);
+    }
+
+    /// Fire an `action/chat/room` lifecycle op (`join` / `dissolve`) for room `id`.
+    fn room_action(&self, op: &str, id: &str, name: Option<&str>) {
+        let mut obj = serde_json::json!({ "op": op, "id": id });
+        if let Some(n) = name {
+            obj["name"] = serde_json::Value::String(n.to_string());
+        }
+        publish(self.bus_root.as_deref(), ACTION_CHAT_ROOM, &obj.to_string());
+    }
+}
+
+/// Derive a stable, canonical room id from an operator-typed name: lowercase, ASCII
+/// alphanumerics kept, every other run collapsed to a single `-`, trimmed. So
+/// "Build Farm!" → "build-farm" — the same id on every node that types that name.
+fn room_id_from_name(name: &str) -> String {
+    let mut id = String::new();
+    let mut prev_dash = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            id.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !id.is_empty() {
+            id.push('-');
+            prev_dash = true;
+        }
+    }
+    id.trim_end_matches('-').to_string()
 }
 
 /// Publish `body` to `topic` on the local Bus via the persist-first path (the same
@@ -888,7 +1221,7 @@ mod tests {
         conv.insert(Message::text("nyc3", 20, "pong"));
         state.convos.insert("nyc3".into(), conv);
         state.seen.insert("nyc3".into(), 1); // one unread
-        state.selected = Some("nyc3".into());
+        state.selected = Some(Selection::Contact("nyc3".into()));
 
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
@@ -1007,7 +1340,7 @@ mod tests {
         ));
         state.convos.insert("nyc3".into(), conv);
         state.seen.insert("nyc3".into(), 6);
-        state.selected = Some("nyc3".into());
+        state.selected = Some(Selection::Contact("nyc3".into()));
 
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 720.0))),
@@ -1023,5 +1356,113 @@ mod tests {
             !prims.is_empty(),
             "the mixed-kind conversation produced no draw primitives"
         );
+    }
+
+    // ── NOTIFY-CHAT-5 surfacing: rooms in the roster + the room pane ───────────
+
+    /// A typed room name derives the same canonical id on every node — lowercase,
+    /// non-alphanumerics collapsed to single dashes, trimmed.
+    #[test]
+    fn room_id_from_name_is_a_stable_canonical_slug() {
+        assert_eq!(room_id_from_name("Build Farm!"), "build-farm");
+        assert_eq!(room_id_from_name("  Ops   Room  "), "ops-room");
+        assert_eq!(room_id_from_name("nyc3//fra1"), "nyc3-fra1");
+        // Nothing alphanumeric → empty (the caller refuses to create it).
+        assert_eq!(room_id_from_name("***"), "");
+    }
+
+    /// The room unread watermark is keyed by the `room:<id>` conversation key, so a
+    /// room id can never collide with a contact hostname's unread count.
+    #[test]
+    fn room_unread_watermarks_then_counts_new_without_colliding_with_a_contact() {
+        let mut state = ChatState::default();
+        let mut room = Conversation::new("sys:all-fleet");
+        room.insert(Message::text("nyc3", 10, "fleet up"));
+        state.room_convos.insert("sys:all-fleet".into(), room);
+        state.seen.insert(room_key("sys:all-fleet"), 1);
+        assert_eq!(state.room_unread("sys:all-fleet"), 0);
+        // A same-named contact watermark is independent.
+        let mut conv = Conversation::new("sys:all-fleet");
+        conv.insert(Message::text("x", 5, "dm"));
+        conv.insert(Message::text("x", 6, "dm2"));
+        state.convos.insert("sys:all-fleet".into(), conv);
+        state.seen.insert("sys:all-fleet".into(), 0);
+        assert_eq!(state.unread("sys:all-fleet"), 2, "contact key is separate");
+        // A new room message → one unread.
+        let mut room = state.room_convos.remove("sys:all-fleet").unwrap();
+        room.insert(Message::text("fra1", 20, "new"));
+        state.room_convos.insert("sys:all-fleet".into(), room);
+        assert_eq!(state.room_unread("sys:all-fleet"), 1);
+    }
+
+    /// Headless mount + tessellate with a selected room: the roster shows the Rooms
+    /// group and the room pane renders the shared log over real model state — proving
+    /// rooms surface and open without a live display (no demo data).
+    #[test]
+    fn room_surfaces_in_the_roster_and_its_pane_tessellates() {
+        use mde_egui::egui::{pos2, vec2, Rect};
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        let mut state = ChatState::default();
+        let mut roster = Roster::new("eagle");
+        roster.upsert(Contact::new("nyc3", NodeRole::Headless).with_presence(Presence::Online));
+        state.roster = Some(roster);
+
+        // A system room + an ad-hoc room I created (so Dissolve is reachable).
+        state.rooms = vec![
+            RoomDescriptor {
+                id: "sys:all-fleet".into(),
+                name: "All Fleet".into(),
+                kind: RoomKind::System,
+                creator: String::new(),
+                members: vec!["eagle".into(), "nyc3".into()],
+            },
+            RoomDescriptor {
+                id: "ops".into(),
+                name: "Ops".into(),
+                kind: RoomKind::AdHoc,
+                creator: "eagle".into(),
+                members: vec!["eagle".into()],
+            },
+        ];
+        let mut log = Conversation::new("sys:all-fleet");
+        log.insert(Message::text("nyc3", 10, "fleet chatter"));
+        state.room_convos.insert("sys:all-fleet".into(), log);
+        state.seen.insert(room_key("sys:all-fleet"), 0); // one unread
+        state.selected = Some(Selection::Room("sys:all-fleet".into()));
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 720.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.push_id("shell-chat", |ui| state.show(ui));
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the room pane produced no draw primitives"
+        );
+        // Opening the room watermarked it read.
+        assert_eq!(state.room_unread("sys:all-fleet"), 0);
+    }
+
+    /// The room lifecycle + send helpers are best-effort: with no Bus directory they
+    /// are silent no-ops (the honest solo-host state), never a panic.
+    #[test]
+    fn room_action_helpers_are_silent_without_a_bus() {
+        let state = ChatState {
+            bus_root: None,
+            ..ChatState::default()
+        };
+        state.send_room("sys:all-fleet", "hi");
+        state.create_room("Build Farm");
+        state.create_room("***"); // empty slug → refused, still no panic
+        state.room_action("join", "ops", None);
+        state.room_action("create", "ops", Some("Ops"));
     }
 }
