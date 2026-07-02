@@ -50,14 +50,15 @@ impl Default for FormfactorPublisher {
 }
 
 impl FormfactorPublisher {
-    /// Drain the seat's latest formfactor flip (if any) and publish it. Called each
-    /// frame; a no-op when the seat reported no transition since the last pump, so the
-    /// Bus sees exactly one message per real formfactor change.
-    pub(crate) fn pump(&self) {
-        let Some(formfactor) = mde_egui::drain_formfactor() else {
-            return;
-        };
+    /// Drain the seat's latest formfactor flip (if any), publish it, and return it so
+    /// the caller can drive the shell's tablet-mode UX (the OSK auto-raise, SURFACE-10)
+    /// off the same transition. Called each frame; returns `None` — and publishes
+    /// nothing — when the seat reported no change since the last pump, so the Bus sees
+    /// exactly one message per real formfactor change.
+    pub(crate) fn pump(&self) -> Option<Formfactor> {
+        let formfactor = mde_egui::drain_formfactor()?;
         self.publish(formfactor);
+        Some(formfactor)
     }
 
     /// Write one formfactor transition to [`FORMFACTOR_TOPIC`]. A serialize/spool

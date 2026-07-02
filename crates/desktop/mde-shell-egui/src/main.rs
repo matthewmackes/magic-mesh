@@ -25,6 +25,7 @@ mod formfactor;
 mod host_mirror;
 mod hotkeys;
 mod instances;
+mod keyboard;
 mod network;
 mod notifications;
 mod provisioning;
@@ -166,6 +167,10 @@ struct Shell {
     /// Type-Cover formfactor transitions to the mesh Bus (`event/hardware/formfactor`)
     /// so the tablet-mode UX reacts. Empty on the windowed fallback (self-gates).
     formfactor: formfactor::FormfactorPublisher,
+    /// SURFACE-10 (lock 14): the native on-screen keyboard overlay. Auto-raises when
+    /// the formfactor (fed from the publisher above) is Tablet and a text field has
+    /// focus, injecting key presses into the same egui input pipeline. Inert on Laptop.
+    keyboard: keyboard::Keyboard,
 }
 
 impl Shell {
@@ -204,6 +209,7 @@ impl Shell {
             toasts: toast_bridge::ToastBridge::default(),
             hotkeys: hotkeys::HotkeyRouter::default(),
             formfactor: formfactor::FormfactorPublisher::default(),
+            keyboard: keyboard::Keyboard::default(),
         }
     }
 
@@ -395,6 +401,11 @@ impl Shell {
     /// (`run_drm`), which owns the seat with a bare `Context` and no eframe `Frame`.
     /// The body never touched `Frame`, so both runners render identically.
     fn render(&mut self, ctx: &egui::Context) {
+        // SURFACE-10: flush any key the OSK queued last frame into THIS frame's input,
+        // before the focused field draws, so it consumes them exactly like a hardware
+        // key (a no-op when nothing is queued).
+        self.keyboard.flush_pending(ctx);
+
         // The Fleet, This Node, Network, Controller + Provisioning planes subscribe
         // to live mesh state. Poll on the shared cadence while the Workbench surface
         // is in view (the reads are cheap local scans) so a host health flip, a new
@@ -494,7 +505,10 @@ impl Shell {
         // SURFACE-9 (lock 9): republish the seat's debounced formfactor transitions to
         // the mesh Bus each frame (a no-op unless the seat reported a Tablet↔Laptop
         // flip). Empty on the windowed fallback, so it self-gates to the real seat.
-        self.formfactor.pump();
+        // SURFACE-10 (lock 14): the same flip feeds the OSK so it auto-raises on Tablet.
+        if let Some(formfactor) = self.formfactor.pump() {
+            self.keyboard.set_formfactor(formfactor);
+        }
 
         let host_keys = mde_egui::hostkeys::drain_host_keys();
         let presses = ctx.input(|i| hotkeys::egui_key_presses(&i.events));
@@ -524,6 +538,12 @@ impl Shell {
                 }
             }
         }
+
+        // SURFACE-10 (lock 14): the on-screen keyboard overlay — drawn last (Foreground)
+        // so it floats above the chrome, the active surface, and any fullscreen guest.
+        // It reads the live focus + the cached formfactor and self-manages its raise /
+        // dismiss; on a Laptop (or the windowed fallback) it stays inert.
+        self.keyboard.show(ctx);
     }
 }
 
