@@ -34,8 +34,10 @@ use std::sync::Arc;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
 
-use drm::control::{connector, crtc, Device as ControlDevice, Mode};
+use drm::control::{connector, crtc, Device as ControlDevice, Mode, ModeTypeFlags};
 use drm::Device as BasicDevice;
+
+use crate::display::{PanelInfo, PanelMode};
 use gbm::AsRaw;
 use input::event::keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait};
 use input::event::pointer::{ButtonState, PointerEvent};
@@ -256,6 +258,42 @@ pub fn set_layout(
         }
     }
     Ok(())
+}
+
+/// Convert a live `drm` KMS [`Mode`] into the toolkit-agnostic [`PanelMode`]
+/// (SURFACE-7 lock 12), carrying its preferred flag so the mode-list build knows the
+/// native timing.
+fn from_drm_mode(mode: &Mode) -> PanelMode {
+    let (w, h) = mode.size();
+    PanelMode::new(
+        u32::from(w),
+        u32::from(h),
+        mode.vrefresh(),
+        mode.mode_type().contains(ModeTypeFlags::PREFERRED),
+    )
+}
+
+/// Build the typed [`PanelInfo`] (native mode + physical size + full mode list) from
+/// a live connector (SURFACE-7 locks 11 + 12).
+///
+/// The native mode is the connector's PREFERRED timing if it flags one, else its
+/// first mode (the driver's own preference order). Physical size comes from the
+/// connector's reported mm (EDID-derived by the kernel); `(0, 0)` when unknown, which
+/// makes the fractional scale fall back to 1.0. Returns `None` when the connector
+/// advertises no modes (nothing to drive).
+fn panel_from_connector(conn: &connector::Info) -> Option<PanelInfo> {
+    let modes = conn.modes();
+    if modes.is_empty() {
+        return None;
+    }
+    let native = modes
+        .iter()
+        .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+        .or_else(|| modes.first())
+        .map(from_drm_mode)?;
+    let raw: Vec<PanelMode> = modes.iter().map(from_drm_mode).collect();
+    let phys_mm = conn.size().unwrap_or((0, 0));
+    Some(PanelInfo::new(native, phys_mm, &raw))
 }
 
 /// libinput device opener for a bare seat (root on a VT). The present loop pumps
@@ -622,13 +660,35 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     let egui_ctx = egui::Context::default();
     crate::Style::install(&egui_ctx);
 
+    // SURFACE-7 lock 11: detect the primary panel (native mode + physical size) and
+    // drive a FRACTIONAL HiDPI egui scale from its DPI, so UI is crisp + correctly
+    // sized on a high-PPI panel (a Surface Pro lands ~2.25) instead of the 1.0
+    // default. The mode LIST + native detect are real here; the live native↔HD
+    // KMS switch (lock 12) is driven through the injectable [`display::ModesetSeam`]
+    // — its headless arm returns an honest gated error and the running loop's live
+    // surface-rebuild switch is the hardware-gated follow-up, so the seat starts at
+    // native (no faked hot-switch). `gbm` also speaks KMS, so it reads the connector.
+    let ppp = gbm
+        .get_connector(heads[0].connector, false)
+        .ok()
+        .and_then(|conn| panel_from_connector(&conn))
+        .map_or(1.0, |panel| panel.scale());
+    if (ppp - 1.0).abs() > f32::EPSILON {
+        egui_ctx.set_pixels_per_point(ppp);
+    }
+
     let mut libinput = Libinput::new_with_udev(SeatInterface);
     libinput
         .udev_assign_seat("seat0")
         .map_err(|()| DrmError::Present("libinput: udev_assign_seat(seat0) failed".into()))?;
 
-    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(wp as f32, hp as f32));
-    let mut pointer = egui::pos2(wp as f32 / 2.0, hp as f32 / 2.0);
+    // egui works in POINTS = pixels / pixels_per_point. The framebuffer is `wp × hp`
+    // physical pixels; the layout + pointer live in points, so a fractional scale
+    // sizes the UI correctly. With ppp == 1.0 this is byte-identical to the old
+    // pixel-space path.
+    let (pw, ph) = (wp as f32 / ppp, hp as f32 / ppp);
+    let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(pw, ph));
+    let mut pointer = egui::pos2(pw / 2.0, ph / 2.0);
     let start = std::time::Instant::now();
     // The previous frame's scanout buffer + framebuffer, freed only after the next
     // flip completes (GBM hands out a small ring of buffers).
@@ -648,14 +708,15 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
         for event in &mut libinput {
             match event {
                 LiEvent::Pointer(PointerEvent::Motion(m)) => {
-                    pointer.x = (pointer.x + m.dx() as f32).clamp(0.0, wp as f32);
-                    pointer.y = (pointer.y + m.dy() as f32).clamp(0.0, hp as f32);
+                    // libinput deltas are physical pixels; egui pointer is in points.
+                    pointer.x = (pointer.x + m.dx() as f32 / ppp).clamp(0.0, pw);
+                    pointer.y = (pointer.y + m.dy() as f32 / ppp).clamp(0.0, ph);
                     events.push(egui::Event::PointerMoved(pointer));
                 }
                 LiEvent::Pointer(PointerEvent::MotionAbsolute(m)) => {
                     pointer = egui::pos2(
-                        m.absolute_x_transformed(wp) as f32,
-                        m.absolute_y_transformed(hp) as f32,
+                        m.absolute_x_transformed(wp) as f32 / ppp,
+                        m.absolute_y_transformed(hp) as f32 / ppp,
                     );
                     events.push(egui::Event::PointerMoved(pointer));
                 }

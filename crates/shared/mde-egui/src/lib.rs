@@ -24,6 +24,7 @@
 //! only on `egui`/`eframe`. Both are re-exported so every surface resolves to the one
 //! harness-pinned egui version (no cross-surface version skew).
 
+pub mod display;
 pub mod fonts;
 pub mod hostkeys;
 pub mod motion;
@@ -36,6 +37,11 @@ pub mod widgets;
 #[cfg(feature = "drm")]
 pub mod drm;
 
+pub use display::{
+    build_mode_list, fractional_scale, panel_dpi, parse_edid, scale_for_panel, select_mode,
+    DisplayController, EdidError, EdidPanel, HeadlessModeset, ModeClass, ModesetError, ModesetSeam,
+    PanelInfo, PanelMode,
+};
 pub use motion::Motion;
 pub use runner::run_client;
 pub use style::Style;
