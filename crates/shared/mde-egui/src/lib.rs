@@ -26,6 +26,7 @@
 
 pub mod display;
 pub mod fonts;
+pub mod formfactor;
 pub mod hostkeys;
 pub mod motion;
 pub mod runner;
@@ -42,6 +43,12 @@ pub use display::{
     build_mode_list, fractional_scale, panel_dpi, parse_edid, scale_for_panel, select_mode,
     DisplayController, EdidError, EdidPanel, HeadlessModeset, ModeClass, ModesetError, ModesetSeam,
     PanelInfo, PanelMode,
+};
+pub use formfactor::{
+    apply_rotation, drain_formfactor, orientation_from_accel, push_formfactor, request_rotation,
+    take_rotation_commands, AccelSensor, AutoRotate, Formfactor, FormfactorDebounce,
+    HeadlessRotate, Orientation, RotateCommand, RotateError, RotationApply, SensorError,
+    SwitchState, SysfsAccel,
 };
 pub use motion::Motion;
 pub use runner::run_client;

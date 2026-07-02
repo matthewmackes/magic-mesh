@@ -34,18 +34,28 @@ use std::sync::Arc;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::OpenOptionsExt;
 
-use drm::control::{connector, crtc, Device as ControlDevice, Mode, ModeTypeFlags};
+use drm::control::{
+    connector, crtc, plane, property, Device as ControlDevice, Mode, ModeTypeFlags,
+};
 use drm::Device as BasicDevice;
 
 use crate::display::{PanelInfo, PanelMode};
 use gbm::AsRaw;
+use input::event::device::DeviceEvent;
 use input::event::keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait};
 use input::event::pointer::{ButtonState, PointerEvent};
+use input::event::switch::{Switch, SwitchEvent, SwitchState as LiSwitchState};
 use input::event::touch::{TouchEvent, TouchEventPosition, TouchEventSlot};
-use input::{Event as LiEvent, Libinput, LibinputInterface};
+use input::event::EventTrait;
+use input::{DeviceCapability, Event as LiEvent, Libinput, LibinputInterface};
 use khronos_egl as egl;
 
-use crate::touch::{RawContact, TouchTransform, TouchTranslator};
+use crate::formfactor::{
+    apply_rotation, orientation_from_accel, push_formfactor, take_rotation_commands, AccelSensor,
+    AutoRotate, FormfactorDebounce, RotateCommand, RotateError, RotationApply, SwitchState,
+    SysfsAccel,
+};
+use crate::touch::{RawContact, Rotation, TouchTransform, TouchTranslator};
 
 /// Why the bare-seat backend could not start / present. The shell treats any
 /// variant as "no usable seat here" and falls back to the windowed runner.
@@ -261,6 +271,92 @@ pub fn set_layout(
         }
     }
     Ok(())
+}
+
+/// The `DRM_MODE_ROTATE_*` bit for a [`Rotation`], as the KMS plane `rotation`
+/// property expects it (a bitmask; we set exactly the one rotate bit, no reflect).
+const fn rotate_bits(rotation: Rotation) -> u64 {
+    match rotation {
+        Rotation::None => 1,      // DRM_MODE_ROTATE_0
+        Rotation::Rotate90 => 2,  // DRM_MODE_ROTATE_90
+        Rotation::Rotate180 => 4, // DRM_MODE_ROTATE_180
+        Rotation::Rotate270 => 8, // DRM_MODE_ROTATE_270
+    }
+}
+
+/// Discover the active primary plane's `rotation` property for a CRTC, if the driver
+/// exposes one. Returns the `(plane, property)` handles the live [`PlaneRotate`] seam
+/// drives; `None` when no bound plane carries a `rotation` property (many simple /
+/// virtual KMS drivers don't) — SURFACE-9 then honestly leaves rotation un-applied so
+/// display + touch never desync.
+fn discover_rotation_prop(
+    dev: &gbm::Device<Card>,
+    crtc: crtc::Handle,
+) -> Option<(plane::Handle, property::Handle)> {
+    let planes = dev.plane_handles().ok()?;
+    for ph in planes {
+        let Ok(info) = dev.get_plane(ph) else {
+            continue;
+        };
+        // The plane already scanning this CRTC out is its primary plane.
+        if info.crtc() != Some(crtc) {
+            continue;
+        }
+        let Ok(props) = dev.get_properties(ph) else {
+            continue;
+        };
+        let (handles, _values) = props.as_props_and_values();
+        for &prop in handles {
+            if let Ok(pinfo) = dev.get_property(prop) {
+                if pinfo.name().to_str() == Ok("rotation") {
+                    return Some((ph, prop));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The live KMS scanout-rotation seam (SURFACE-9 lock 15): sets the primary plane's
+/// `rotation` property so the framebuffer scans out rotated to match the touch matrix.
+/// Constructed per-apply over the borrowed KMS device + the discovered handles; it
+/// honestly returns [`RotateError::Commit`] when the legacy property set is rejected
+/// (e.g. a driver that only rotates via an atomic commit) — never a faked turn.
+struct PlaneRotate<'a> {
+    dev: &'a gbm::Device<Card>,
+    plane: plane::Handle,
+    prop: property::Handle,
+}
+
+impl RotationApply for PlaneRotate<'_> {
+    fn apply(&mut self, rotation: Rotation) -> Result<(), RotateError> {
+        self.dev
+            .set_property(self.plane, self.prop, rotate_bits(rotation))
+            .map_err(|e| RotateError::Commit(format!("set plane rotation: {e}")))
+    }
+}
+
+/// Apply a committed rotation to **both** the scanout and the touch matrix (lock 15).
+/// When the driver exposed no rotation property (`rot_prop` is `None`) or the KMS
+/// commit fails, the touch matrix is left unrotated so the two stay in sync, and the
+/// honest reason is reported once (the live rotate is the hardware-gated path).
+fn drive_rotation(
+    dev: &gbm::Device<Card>,
+    rot_prop: Option<(plane::Handle, property::Handle)>,
+    touch: &mut TouchTranslator,
+    rotation: Rotation,
+) {
+    let Some((plane, prop)) = rot_prop else {
+        eprintln!(
+            "mde-egui: auto-rotate to {rotation:?} — no KMS rotation property on this \
+             scanout; display + touch left unrotated (hardware-gated)"
+        );
+        return;
+    };
+    let mut seam = PlaneRotate { dev, plane, prop };
+    if let Err(e) = apply_rotation(rotation, &mut seam, touch) {
+        eprintln!("mde-egui: auto-rotate to {rotation:?} failed ({e}); touch left in sync");
+    }
 }
 
 /// Convert a live `drm` KMS [`Mode`] into the toolkit-agnostic [`PanelMode`]
@@ -711,6 +807,31 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     // touchscreen — the honest hardware gate).
     let mut touch = TouchTranslator::new(TouchTransform::new(wp, hp, ppp));
 
+    // SURFACE-9 (locks 9 + 15): formfactor signal + auto-rotation, both driven off the
+    // seat's live evdev/iio streams and the shared pure cores in `crate::formfactor`.
+    //
+    // Formfactor: `SW_TABLET_MODE` (libinput switch) + Type-Cover attach/detach
+    // (keyboard-capable device add/remove) fold into a debounced Tablet/Laptop, pushed
+    // on the side channel the shell republishes to the mesh Bus. We start assuming no
+    // cover (Tablet); libinput replays every existing device as `Added` on the first
+    // dispatch, so a present cover settles to Laptop within the debounce window.
+    let mut kbd_count: u32 = 0;
+    let mut switches = SwitchState {
+        tablet_mode: false,
+        cover_attached: false,
+    };
+    let mut formfactor = FormfactorDebounce::new(switches.raw_formfactor());
+    push_formfactor(formfactor.current()); // a startup baseline for the shell.
+
+    // Auto-rotation: the iio accelerometer (real sysfs reads; `None` + honestly inert
+    // on a host without one) folds into an orientation, debounced into a KMS rotation
+    // that drives BOTH the scanout plane and the touch matrix as one. The live plane
+    // rotation is discovered once; when the driver exposes none it degrades honestly.
+    let mut auto = AutoRotate::new();
+    let mut accel = SysfsAccel::discover().ok();
+    let rot_prop = discover_rotation_prop(&gbm, heads[0].crtc);
+    let mut last_accel = std::time::Instant::now();
+
     while !quit {
         // 1. drain libinput → egui events
         libinput
@@ -832,7 +953,67 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                         }
                     }
                 }
+                // SURFACE-9 (lock 9): the SW_TABLET_MODE switch → formfactor. A folded
+                // lid puts the device in the touch-first posture regardless of the cover.
+                LiEvent::Switch(SwitchEvent::Toggle(t)) => {
+                    if t.switch() == Some(Switch::TabletMode) {
+                        switches.tablet_mode = t.switch_state() == LiSwitchState::On;
+                        if let Some(f) = formfactor.observe(switches.raw_formfactor()) {
+                            push_formfactor(f);
+                        }
+                    }
+                }
+                // SURFACE-9 (lock 9): Type-Cover attach/detach shows up as a
+                // keyboard-capable device add/remove; a detached cover → Tablet.
+                LiEvent::Device(dev_ev) => {
+                    let added_dev = match dev_ev {
+                        DeviceEvent::Added(e) => Some((true, e.device())),
+                        DeviceEvent::Removed(e) => Some((false, e.device())),
+                        _ => None,
+                    };
+                    if let Some((added, device)) = added_dev {
+                        if device.has_capability(DeviceCapability::Keyboard) {
+                            kbd_count = if added {
+                                kbd_count + 1
+                            } else {
+                                kbd_count.saturating_sub(1)
+                            };
+                            switches.cover_attached = kbd_count > 0;
+                            if let Some(f) = formfactor.observe(switches.raw_formfactor()) {
+                                push_formfactor(f);
+                            }
+                        }
+                    }
+                }
                 _ => {}
+            }
+        }
+
+        // SURFACE-9 (lock 15): drain the shell's rotation commands (Config tab /
+        // hotkey) — a lock freezes auto-rotate, a manual override forces + holds an
+        // orientation, applied to BOTH scanout + touch immediately.
+        for cmd in take_rotation_commands() {
+            match cmd {
+                RotateCommand::Lock(locked) => auto.set_user_lock(locked),
+                RotateCommand::Manual(rotation) => {
+                    let applied = auto.apply_manual(rotation);
+                    drive_rotation(&gbm, rot_prop, &mut touch, applied);
+                }
+            }
+        }
+
+        // SURFACE-9 (lock 15): sample the accelerometer a few times a second (not every
+        // frame — it is a sysfs read and the orientation is slow), fold it to an
+        // orientation, and on a debounced change rotate display + touch as one. Inert +
+        // honest when there is no sensor (`accel` is `None`) or auto-rotate is locked.
+        if last_accel.elapsed().as_millis() >= 200 {
+            last_accel = std::time::Instant::now();
+            if let Some(sensor) = accel.as_mut() {
+                if let Ok((ax, ay, az)) = sensor.read() {
+                    if let Some(rotation) = auto.observe(orientation_from_accel(ax, ay, az)) {
+                        drive_rotation(&gbm, rot_prop, &mut touch, rotation);
+                    }
+                }
             }
         }
 

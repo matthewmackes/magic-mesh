@@ -21,6 +21,7 @@ mod controller;
 mod datacenter;
 mod discovery;
 mod dock;
+mod formfactor;
 mod host_mirror;
 mod hotkeys;
 mod instances;
@@ -161,6 +162,10 @@ struct Shell {
     /// seat's forwarded host keys (XF86 media + Super) and this frame's egui key
     /// presses into typed actions the shell applies to the seat / nav.
     hotkeys: hotkeys::HotkeyRouter,
+    /// SURFACE-9 (lock 9): republishes the seat's debounced `SW_TABLET_MODE` /
+    /// Type-Cover formfactor transitions to the mesh Bus (`event/hardware/formfactor`)
+    /// so the tablet-mode UX reacts. Empty on the windowed fallback (self-gates).
+    formfactor: formfactor::FormfactorPublisher,
 }
 
 impl Shell {
@@ -198,6 +203,7 @@ impl Shell {
             storage: storage::StorageState::default(),
             toasts: toast_bridge::ToastBridge::default(),
             hotkeys: hotkeys::HotkeyRouter::default(),
+            formfactor: formfactor::FormfactorPublisher::default(),
         }
     }
 
@@ -485,6 +491,11 @@ impl Shell {
         // fallback, so the wiring self-gates to the real DRM seat) and this frame's
         // egui key presses, route them through the fixed table, and apply each typed
         // action to the seat / nav.
+        // SURFACE-9 (lock 9): republish the seat's debounced formfactor transitions to
+        // the mesh Bus each frame (a no-op unless the seat reported a Tablet↔Laptop
+        // flip). Empty on the windowed fallback, so it self-gates to the real seat.
+        self.formfactor.pump();
+
         let host_keys = mde_egui::hostkeys::drain_host_keys();
         let presses = ctx.input(|i| hotkeys::egui_key_presses(&i.events));
         for action in self.hotkeys.dispatch(&host_keys, &presses) {
