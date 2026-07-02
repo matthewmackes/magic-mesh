@@ -184,6 +184,36 @@ impl Seat {
     pub fn power(&self, verb: PowerVerb) -> Result<(), SeatError> {
         self.logind.act(verb)
     }
+
+    /// Set a mixer strip's volume (0–100). Used by the mixer faders (E12-16) and
+    /// the volume hotkeys (E12-19), which drive the master strip through here.
+    ///
+    /// # Errors
+    /// The mixer client's typed errors ([`SeatError::Unavailable`] with no
+    /// `PipeWire`, [`SeatError::Backend`] on a control failure).
+    pub fn set_strip_volume(&self, strip_id: &str, volume: u8) -> Result<(), SeatError> {
+        self.mixer.set_volume(strip_id, volume)
+    }
+
+    /// Set a mixer strip's mute. The mute/mic-mute hotkeys (E12-19) toggle the
+    /// master (and, once modelled, the capture) strip through here.
+    ///
+    /// # Errors
+    /// The mixer client's typed errors (as [`Self::set_strip_volume`]).
+    pub fn set_strip_muted(&self, strip_id: &str, muted: bool) -> Result<(), SeatError> {
+        self.mixer.set_muted(strip_id, muted)
+    }
+
+    /// Power a Bluetooth adapter's radio on/off (`Adapter1.Powered`). The BT-toggle
+    /// hotkey (E12-19) and the remote BT verb (the `host_state` worker) both flip
+    /// the adapter through here.
+    ///
+    /// # Errors
+    /// The `BlueZ` client's typed errors (absent adapter / dead bus →
+    /// [`SeatError::Unavailable`], else [`SeatError::Backend`]).
+    pub fn set_bt_powered(&self, adapter: &str, on: bool) -> Result<(), SeatError> {
+        self.bluez.set_adapter_powered(adapter, on)
+    }
 }
 
 impl Default for Seat {
@@ -213,6 +243,26 @@ mod tests {
                 assert!(reason.contains("PipeWire"));
             }
             Probe::Present(_) => panic!("expected Absent"),
+        }
+    }
+
+    #[test]
+    fn the_control_verbs_answer_typed_on_a_headless_seat_never_panic() {
+        // On the headless farm host every backend is Absent, so each control verb
+        // (the ones the hotkeys + the remote host_state worker drive) must return a
+        // typed SeatError tagged its own backend — never panic, never a fake Ok.
+        let seat = Seat::new();
+        match seat.set_strip_volume("0", 50) {
+            Ok(()) => {}
+            Err(e) => assert_eq!(e.backend(), Backend::PipeWire),
+        }
+        match seat.set_strip_muted("0", true) {
+            Ok(()) => {}
+            Err(e) => assert_eq!(e.backend(), Backend::PipeWire),
+        }
+        match seat.set_bt_powered("/org/bluez/hci0", true) {
+            Ok(()) => {}
+            Err(e) => assert_eq!(e.backend(), Backend::Bluetooth),
         }
     }
 
