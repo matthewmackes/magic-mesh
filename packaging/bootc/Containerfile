@@ -89,6 +89,21 @@ RUN set -eux; \
     dnf clean all; \
     rm -rf /tmp/mcnf-rpms
 
+# E12-19 (Quasar host controls) — the seat services the compositor-less shell
+# owns in-process (audio / Bluetooth / power / DDC brightness). The RPM's
+# `requires` pull these on a dnf install, but the bootc image is composed
+# offline, so install them explicitly here too: PipeWire + WirePlumber (the DAW
+# mixer's graph, lock 2) with the pipewire-alsa shim for the existing ALSA
+# users, BlueZ (pairing + BT hotkey), UPower (multi-battery telemetry), and
+# ddcutil + i2c-tools (external-monitor DDC/CI brightness, lock 13). The seat
+# self-gates on the Workstation role, so a Lighthouse image carries them idle.
+RUN set -eux; \
+    dnf -y install \
+        pipewire wireplumber pipewire-alsa \
+        bluez upower \
+        ddcutil i2c-tools; \
+    dnf clean all
+
 # The other half of the VDI substrate: **cloud-hypervisor, baked in** (§5 /
 # E12-13). Fedora 42 does not package it, so pin the upstream static-musl
 # release binary and verify its sha256 — the pin makes every rebuild

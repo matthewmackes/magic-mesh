@@ -672,6 +672,28 @@ alsa-lib = "*"
 # so hard-Require them.
 btop = "*"
 mc = "*"
+# E12-19 (Quasar host controls) — the seat services the compositor-less shell
+# owns in-process (mde-seat, design quasar-host-controls.md). With no settings
+# daemon these have no other owner, and the shell's Mixer/Bluetooth/Power
+# sections + the hotkeys drive them directly, so hard-Require the runtimes:
+#   · PipeWire + WirePlumber = the audio graph the DAW mixer reads via pw-dump /
+#     drives via wpctl (lock 2); pipewire-alsa keeps the existing ALSA users
+#     (mde-musicd, mde-voice-hud) working on the shim, unchanged.
+#   · bluez = the BlueZ system service the pairing manager + BT hotkey talk to.
+#   · upower = the multi-battery telemetry (internal / UPS / BT-peripheral).
+# One RPM serves every role; a headless Lighthouse installs them but the seat
+# self-gates (the shell only runs on a Workstation), matching the alsa-lib line.
+pipewire = "*"
+wireplumber = "*"
+pipewire-alsa = "*"
+bluez = "*"
+upower = "*"
+# DDC/CI external-monitor brightness (lock 13) shells `ddcutil` over i2c-dev;
+# i2c-tools carries the i2c-dev tooling/module wiring. A monitor that rejects
+# DDC renders an honest "not controllable" state (§7), so these back a real
+# feature without ever faking a control.
+ddcutil = "*"
+i2c-tools = "*"
 
 # EFF-42 — ansible-core is a WEAK dep (Recommends): only the Server-tier
 # ansible_pull/job_exec workers shell to it, and they degrade gracefully
