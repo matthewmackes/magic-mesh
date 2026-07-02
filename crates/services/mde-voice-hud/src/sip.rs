@@ -72,6 +72,57 @@ pub struct VoiceAccounts {
     pub outbound: Option<SharedOutbound>,
 }
 
+/// VOIP-GW-7 — the result of lifting a legacy flat `account.toml` onto the
+/// split model (locks 13 + 18).
+///
+/// The pre-split config was ONE flat account doing both inbound and outbound.
+/// The migration lifts that account's trunk identity to the fleet-level
+/// [`SharedOutbound`] (leader-held — keeping outbound alive through the flag
+/// day) and records that this node now needs its OWN inbound Vitelity
+/// sub-account: it can no longer lean on the shared flat account for its
+/// callable inbound identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyLift {
+    /// The fleet shared-outbound trunk lifted from the flat account.
+    pub shared_outbound: SharedOutbound,
+    /// This node needs an inbound sub-account provisioned (it had only the flat
+    /// account before). Always `true` for a legacy lift; carried explicitly so
+    /// the caller (the cutover driver) reads intent, not a bare bool.
+    pub needs_inbound_sub: bool,
+}
+
+impl VoiceAccounts {
+    /// VOIP-GW-7 — whether this is still the legacy single-account (flat) model:
+    /// an inbound account with no fleet shared-outbound half split out yet.
+    #[must_use]
+    pub const fn is_legacy_flat(&self) -> bool {
+        self.outbound.is_none()
+    }
+
+    /// VOIP-GW-7 — the migration fold (locks 13 + 18): detect a legacy flat
+    /// config and lift its account into the fleet shared-outbound config, marking
+    /// this node as needing its own inbound sub-account. `None` when already on
+    /// the split model (nothing to migrate — idempotent, so a second pass over an
+    /// already-cutover node is a no-op).
+    ///
+    /// Pure: the single decision point for "legacy flat → lifted", unit-tested
+    /// without any I/O. The flat account WAS the shared trunk, so its identity
+    /// becomes the shared caller-ID and its server the trunk host.
+    #[must_use]
+    pub fn lift_if_legacy(&self) -> Option<LegacyLift> {
+        if !self.is_legacy_flat() {
+            return None;
+        }
+        Some(LegacyLift {
+            shared_outbound: SharedOutbound {
+                caller_id: self.inbound.username.clone(),
+                trunk_host: self.inbound.server_host.clone(),
+            },
+            needs_inbound_sub: true,
+        })
+    }
+}
+
 /// On-disk shape of `account.toml`.
 ///
 /// Back-compat: the legacy **flat** form (`username`/`server`/… at top level)
@@ -2544,6 +2595,38 @@ mod tests {
         let out = a.outbound.expect("shared outbound");
         assert_eq!(out.caller_id, "+15551230000");
         assert_eq!(out.trunk_host, "outbound.vitelity.net");
+    }
+
+    // ── VOIP-GW-7: the legacy-flat → shared-outbound lift fold ──
+
+    #[test]
+    fn lift_if_legacy_lifts_a_flat_account_to_shared_outbound() {
+        // A legacy flat account.toml (the one shared account doing both legs)
+        // lifts to the fleet shared-outbound config: its identity becomes the
+        // shared caller-ID, its server the trunk host, and this node is marked
+        // as needing its own inbound sub-account (locks 13 + 18).
+        let accts = SipAccount::accounts_from_toml(
+            "username = \"15551234567\"\npassword = \"pw\"\nserver = \"sip.vitelity.net\"\n",
+        )
+        .unwrap();
+        assert!(accts.is_legacy_flat());
+        let lift = accts.lift_if_legacy().expect("a flat account lifts");
+        assert_eq!(lift.shared_outbound.caller_id, "15551234567");
+        assert_eq!(lift.shared_outbound.trunk_host, "sip.vitelity.net");
+        assert!(lift.needs_inbound_sub);
+    }
+
+    #[test]
+    fn lift_if_legacy_is_noop_on_the_split_model() {
+        // Already split → nothing to migrate (idempotent — a second cutover pass
+        // over a done node is a no-op).
+        let accts = SipAccount::accounts_from_toml(
+            "[inbound_sub]\nusername = \"eagle\"\nserver = \"sip.vitelity.net\"\n\n\
+             [shared_outbound]\ncaller_id = \"15551230000\"\ntrunk = \"out.vitelity.net\"\n",
+        )
+        .unwrap();
+        assert!(!accts.is_legacy_flat());
+        assert!(accts.lift_if_legacy().is_none());
     }
 
     #[test]

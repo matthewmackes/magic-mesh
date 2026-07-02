@@ -107,6 +107,28 @@ pub const FAILOVER_TOPIC: &str = "action/voice/failover";
 /// node). The body is a JSON array of [`Did`].
 pub const DIDS_TOPIC: &str = "state/voice-dids";
 
+/// VOIP-GW-7 — the "Apply to fleet" verb: apply the leader-held shared-outbound.
+///
+/// The typed verb the Voice panel publishes to apply the one leader-held
+/// **shared-outbound** (fleet) config (lock 13). Body: [`SharedConfigRequest`].
+/// A message forces an immediate reconcile so the operator sees the config take.
+/// Typed verb in the canonical `action/<domain>/<verb>` namespace (§9).
+pub const SHARED_CONFIG_TOPIC: &str = "action/voice/shared-config";
+
+/// VOIP-GW-7 — the Bus topic the fleet **cutover status** is published to.
+///
+/// A single fleet-wide row (NOT under [`STATE_TOPIC_PREFIX`], which is one row
+/// per node — the same choice [`DIDS_TOPIC`] makes), so the panel's per-node
+/// board never mistakes it for a node (lock 18). Body: [`CutoverStatus`].
+pub const CUTOVER_TOPIC: &str = "state/voice-cutover";
+
+/// VOIP-GW-7 — the Bus topic the current leader-held shared-outbound is mirrored to.
+///
+/// So the panel can show the operator the value that is actually in force (e.g.
+/// a lifted legacy caller-ID, lock 13). A single fleet-wide row alongside
+/// [`CUTOVER_TOPIC`]. Body: [`SharedOutboundConfig`].
+pub const SHARED_STATE_TOPIC: &str = "state/voice-shared";
+
 /// Fallback SIP realm used to render a node's `<user>@<realm>` address when
 /// Vitelity hasn't reported the sub-account's realm yet. The live client
 /// fills the real realm from the create/get response.
@@ -119,6 +141,17 @@ pub const DEFAULT_REALM: &str = "sip.vitelity.net";
 #[must_use]
 pub fn master_creds_ref() -> String {
     "voice/vitelity-master".to_string()
+}
+
+/// VOIP-GW-7 — the secret-store key the leader-held **shared-outbound** config
+/// is sealed under (lock 13).
+///
+/// ONE entry for the whole fleet, held by the leader/provisioner only (the same
+/// store the master key uses). Its presence is what marks the fleet "lifted off
+/// the single-account model".
+#[must_use]
+pub fn shared_outbound_ref() -> String {
+    "voice/shared-outbound".to_string()
 }
 
 /// The per-node secret-store key a node's sealed SIP creds live under
@@ -788,6 +821,250 @@ fn error_state(
     }
 }
 
+// ── VOIP-GW-7: the hard-cutover migration (locks 13 + 18) ────────────────────
+
+/// The one leader-held **shared-outbound** (fleet) config (lock 13).
+///
+/// Sealed once at the leader; carries the shared caller-ID + the outbound trunk
+/// label. The panel's "Apply to fleet" verb sets it; the reconcile persists +
+/// mirrors it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SharedOutboundConfig {
+    /// The shared caller-ID number all outbound PSTN presents (lock 4/13).
+    pub caller_id: String,
+    /// The shared outbound trunk label / account.
+    pub outbound_trunk: String,
+}
+
+/// The `action/voice/shared-config` body the panel publishes (lock 13).
+#[derive(Debug, serde::Deserialize)]
+struct SharedConfigRequest {
+    caller_id: String,
+    outbound_trunk: String,
+}
+
+/// The fleet migration phase (lock 18 — hard cutover).
+///
+/// A single fleet-wide state machine the leader drives each pass, computed
+/// purely from whether the shared-outbound has been lifted and how many nodes
+/// are reprovisioned onto the split model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CutoverPhase {
+    /// The fleet is still on the pre-split single (flat) account model — the
+    /// shared-outbound config has not been lifted to the fleet yet.
+    Legacy,
+    /// The shared-outbound config is lifted (leader-held) and keeps outbound
+    /// alive, but no node has yet been reprovisioned onto its own inbound
+    /// sub-account.
+    LiftedSharedOutbound,
+    /// Some nodes have crossed onto the split model; others are still pending —
+    /// the flag day is in progress.
+    NodesReprovisioning,
+    /// Every enrolled node is on the split model — the cutover is done.
+    CutoverComplete,
+}
+
+impl CutoverPhase {
+    /// A one-line operator headline for the panel banner.
+    #[must_use]
+    pub const fn headline(self) -> &'static str {
+        match self {
+            Self::Legacy => {
+                "Legacy single-account model — apply the fleet shared-outbound to begin"
+            }
+            Self::LiftedSharedOutbound => {
+                "Shared-outbound lifted — outbound alive; reprovisioning nodes onto the split model"
+            }
+            Self::NodesReprovisioning => {
+                "Cutover in progress — some nodes still on the legacy model"
+            }
+            Self::CutoverComplete => "Cutover complete — every node on the split model",
+        }
+    }
+}
+
+/// Pure cutover fold (lock 18): derive the migration [`CutoverPhase`].
+///
+/// From whether the shared-outbound has been lifted (leader-held config present)
+/// and how many of the `total` enrolled nodes are reprovisioned onto the split
+/// model. The single decision point — unit-tested without any I/O.
+#[must_use]
+pub const fn cutover_phase(lifted: bool, total: usize, reprovisioned: usize) -> CutoverPhase {
+    if !lifted {
+        return CutoverPhase::Legacy;
+    }
+    if total == 0 || reprovisioned == 0 {
+        return CutoverPhase::LiftedSharedOutbound;
+    }
+    if reprovisioned >= total {
+        CutoverPhase::CutoverComplete
+    } else {
+        CutoverPhase::NodesReprovisioning
+    }
+}
+
+/// The fleet cutover status published to [`CUTOVER_TOPIC`] (lock 18).
+///
+/// The phase plus the reprovision progress + the node ids still on the legacy
+/// model, so the panel prompts the operator clearly through the flag day.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CutoverStatus {
+    /// The single fleet-wide migration phase.
+    pub phase: CutoverPhase,
+    /// Enrolled nodes total.
+    pub total_nodes: usize,
+    /// How many are reprovisioned onto the split model (their own inbound sub).
+    pub reprovisioned: usize,
+    /// The nodes still on the legacy model (hostname, or node id) — the panel
+    /// shows exactly which remain.
+    pub pending_nodes: Vec<String>,
+    /// Whether the fleet shared-outbound config is lifted (leader-held).
+    pub shared_outbound_lifted: bool,
+    /// When this status was produced (epoch seconds).
+    pub updated_at_s: u64,
+}
+
+/// A node counts as **reprovisioned** onto the split model once it has its own
+/// inbound sub-account provisioned + sealed — i.e. it is Registered or (the
+/// steady state) Unregistered. A node still Provisioning (awaiting the master
+/// key) or in Error has not crossed over yet.
+const fn is_reprovisioned(reg: &RegState) -> bool {
+    matches!(reg, RegState::Registered | RegState::Unregistered)
+}
+
+/// Pure fold (lock 18): derive the [`CutoverStatus`].
+///
+/// From the reconcile's per-node states + the lift flag. A node not yet
+/// reprovisioned lands in `pending_nodes` (named by hostname, falling back to
+/// node id).
+#[must_use]
+pub fn derive_cutover_status(states: &[NodeVoiceState], lifted: bool) -> CutoverStatus {
+    let total = states.len();
+    let mut reprovisioned = 0usize;
+    let mut pending_nodes = Vec::new();
+    for st in states {
+        if is_reprovisioned(&st.reg_state) {
+            reprovisioned += 1;
+        } else if st.hostname.trim().is_empty() {
+            pending_nodes.push(st.node_id.clone());
+        } else {
+            pending_nodes.push(st.hostname.clone());
+        }
+    }
+    CutoverStatus {
+        phase: cutover_phase(lifted, total, reprovisioned),
+        total_nodes: total,
+        reprovisioned,
+        pending_nodes,
+        shared_outbound_lifted: lifted,
+        updated_at_s: now_epoch_s(),
+    }
+}
+
+/// The hard-cutover invariant (lock 18): no node left dual-model.
+///
+/// `CutoverComplete` is reached ONLY when every enrolled node is reprovisioned
+/// onto the split model — never while one still straddles the legacy account. We
+/// never declare the flag day done while any node remains pending. Returns
+/// `true` when the status honors the invariant.
+#[must_use]
+pub fn no_node_left_dual_model(status: &CutoverStatus) -> bool {
+    match status.phase {
+        CutoverPhase::CutoverComplete => {
+            status.pending_nodes.is_empty()
+                && status.total_nodes > 0
+                && status.reprovisioned == status.total_nodes
+        }
+        _ => true,
+    }
+}
+
+/// Fold the retained `action/voice/shared-config` messages into the desired
+/// fleet shared-outbound config (lock 13), latest-wins (ULID order is
+/// oldest→newest). `None` when the operator hasn't applied one yet.
+fn read_desired_shared_config(persist: &Persist) -> Option<SharedOutboundConfig> {
+    let mut latest: Option<SharedOutboundConfig> = None;
+    if let Ok(msgs) = persist.list_since(SHARED_CONFIG_TOPIC, None) {
+        for msg in msgs {
+            if let Some(body) = msg.body {
+                if let Ok(req) = serde_json::from_str::<SharedConfigRequest>(&body) {
+                    latest = Some(SharedOutboundConfig {
+                        caller_id: req.caller_id,
+                        outbound_trunk: req.outbound_trunk,
+                    });
+                }
+            }
+        }
+    }
+    latest
+}
+
+/// Whether the fleet shared-outbound config is lifted (present in the leader
+/// store). A store fault is treated as "not lifted" (honest — the pass will
+/// re-attempt the persist and surface the real error there).
+fn shared_outbound_is_lifted(store: &SecretStore) -> bool {
+    matches!(store.get(&shared_outbound_ref()), Ok(Some(_)))
+}
+
+/// VOIP-GW-7 — apply the operator's "Apply to fleet" shared-outbound config.
+///
+/// Folds the latest retained `action/voice/shared-config` verb (lock 13) and
+/// persists it to the leader-held store — the real "Apply to fleet" effect GW-5
+/// left as an observable-only verb. Returns whether the fleet is now lifted off
+/// the single-account model (the shared-outbound is present).
+fn apply_shared_config(store: &SecretStore, persist: &Persist) -> bool {
+    if let Some(cfg) = read_desired_shared_config(persist) {
+        match serde_json::to_string(&cfg) {
+            Ok(body) => {
+                if let Err(e) = store.put(&shared_outbound_ref(), &body) {
+                    tracing::warn!(
+                        target: "mackesd::voice_provision",
+                        error = %e,
+                        "sealing the fleet shared-outbound config failed"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "mackesd::voice_provision",
+                error = %e,
+                "serializing the fleet shared-outbound config failed"
+            ),
+        }
+    }
+    shared_outbound_is_lifted(store)
+}
+
+/// Publish the fleet cutover status to [`CUTOVER_TOPIC`] (lock 18).
+/// `Priority::Min` — a silent data topic the panel reads. Best-effort.
+pub fn publish_cutover(persist: &Persist, status: &CutoverStatus) {
+    let Ok(body) = serde_json::to_string(status) else {
+        return;
+    };
+    if let Err(e) = persist.write(CUTOVER_TOPIC, Priority::Min, None, Some(&body)) {
+        tracing::debug!(
+            target: "mackesd::voice_provision",
+            error = %e,
+            "publishing voice cutover status failed"
+        );
+    }
+}
+
+/// Mirror the current leader-held shared-outbound config to [`SHARED_STATE_TOPIC`]
+/// (lock 13) so the panel can show the value in force (e.g. a lifted legacy
+/// caller-ID). Best-effort; publishes nothing when none is set.
+fn publish_shared_state(persist: &Persist, store: &SecretStore) {
+    if let Ok(Some(body)) = store.get(&shared_outbound_ref()) {
+        if let Err(e) = persist.write(SHARED_STATE_TOPIC, Priority::Min, None, Some(&body)) {
+            tracing::debug!(
+                target: "mackesd::voice_provision",
+                error = %e,
+                "mirroring shared-outbound config failed"
+            );
+        }
+    }
+}
+
 /// Resolve the master Vitelity creds from the secret store and build the live
 /// client (leader-only path, lock 7). `Ok(None)` when the operator hasn't
 /// sealed the master creds yet (honest "not provisionable"); `Err` on a store
@@ -958,8 +1235,17 @@ impl VoiceProvisionWorker {
     /// Leader-only is enforced by the caller. Returns the outcome for logging.
     fn reconcile_and_publish(&self, persist: &Persist) -> Option<ReconcileOutcome> {
         let store = self.store();
+        // VOIP-GW-7 — apply + mirror the leader-held shared-outbound config first
+        // (lock 13), so the cutover phase below reflects the current lift state
+        // even when no node is enrolled yet.
+        let lifted = apply_shared_config(&store, persist);
+        publish_shared_state(persist, &store);
+
         let desired = self.read_desired();
         if desired.is_empty() {
+            // No enrolled nodes, but still drive the cutover machine off the lift
+            // flag (Legacy vs LiftedSharedOutbound) so the panel prompts honestly.
+            publish_cutover(persist, &derive_cutover_status(&[], lifted));
             return None;
         }
         // Fold the operator's retained DID-route + failover intents off the Bus
@@ -1000,6 +1286,10 @@ impl VoiceProvisionWorker {
         // Publish the master DID inventory so the panel can offer the route
         // control (lock 11). Best-effort; empty on an unreachable Vitelity.
         publish_dids(persist, &outcome.dids);
+        // VOIP-GW-7 — drive + publish the fleet cutover status (lock 18) from the
+        // per-node states + the lift flag: which nodes have crossed onto the
+        // split model, and which still remain.
+        publish_cutover(persist, &derive_cutover_status(&outcome.states, lifted));
         Some(outcome)
     }
 }
@@ -1184,6 +1474,10 @@ impl Worker for VoiceProvisionWorker {
         let mut did_cursor: Option<String> = persist.latest_ulid(DID_ROUTE_TOPIC).ok().flatten();
         let mut failover_cursor: Option<String> =
             persist.latest_ulid(FAILOVER_TOPIC).ok().flatten();
+        // VOIP-GW-7 — the "Apply to fleet" shared-outbound verb (lock 13) also
+        // forces an immediate reconcile so the lift + cutover take promptly.
+        let mut shared_cursor: Option<String> =
+            persist.latest_ulid(SHARED_CONFIG_TOPIC).ok().flatten();
 
         loop {
             // Drain the panel verbs (lock 8/10/11). A follower still advances
@@ -1198,6 +1492,12 @@ impl Worker for VoiceProvisionWorker {
             if let Ok(msgs) = persist.list_since(DID_ROUTE_TOPIC, did_cursor.as_deref()) {
                 for msg in msgs {
                     did_cursor = Some(msg.ulid);
+                    button_pressed = true;
+                }
+            }
+            if let Ok(msgs) = persist.list_since(SHARED_CONFIG_TOPIC, shared_cursor.as_deref()) {
+                for msg in msgs {
+                    shared_cursor = Some(msg.ulid);
                     button_pressed = true;
                 }
             }
@@ -1787,6 +2087,178 @@ mod tests {
                 number: "15550001111".into()
             }
         );
+    }
+
+    // ── VOIP-GW-7: the hard-cutover migration (locks 13 + 18) ──
+
+    fn voice_state(node_id: &str, host: &str, reg: RegState) -> NodeVoiceState {
+        NodeVoiceState {
+            node_id: node_id.to_string(),
+            hostname: host.to_string(),
+            username: sub_account_username(host),
+            sip_uri: String::new(),
+            reg_state: reg,
+            routed_dids: Vec::new(),
+            failover: None,
+            updated_at_s: 0,
+        }
+    }
+
+    #[test]
+    fn cutover_phase_walks_legacy_to_complete() {
+        // Not lifted → Legacy, regardless of node counts.
+        assert_eq!(cutover_phase(false, 3, 3), CutoverPhase::Legacy);
+        // Lifted but nothing reprovisioned → LiftedSharedOutbound (outbound alive).
+        assert_eq!(
+            cutover_phase(true, 3, 0),
+            CutoverPhase::LiftedSharedOutbound
+        );
+        // Lifted, no nodes yet → still LiftedSharedOutbound (never a fake done).
+        assert_eq!(
+            cutover_phase(true, 0, 0),
+            CutoverPhase::LiftedSharedOutbound
+        );
+        // Partway → NodesReprovisioning.
+        assert_eq!(cutover_phase(true, 3, 1), CutoverPhase::NodesReprovisioning);
+        // All crossed over → CutoverComplete.
+        assert_eq!(cutover_phase(true, 3, 3), CutoverPhase::CutoverComplete);
+    }
+
+    #[test]
+    fn derive_cutover_status_lists_the_pending_nodes() {
+        // One node reprovisioned (Unregistered = provisioned), one still awaiting
+        // (Provisioning), one failing (Error) → two remain, named by hostname.
+        let states = vec![
+            voice_state("peer:eagle", "eagle", RegState::Unregistered),
+            voice_state("peer:pine", "pine", RegState::Provisioning),
+            voice_state(
+                "peer:oak",
+                "oak",
+                RegState::Error {
+                    reason: "boom".into(),
+                },
+            ),
+        ];
+        let derived = derive_cutover_status(&states, true);
+        assert_eq!(derived.phase, CutoverPhase::NodesReprovisioning);
+        assert_eq!(derived.total_nodes, 3);
+        assert_eq!(derived.reprovisioned, 1);
+        assert_eq!(derived.pending_nodes, vec!["pine", "oak"]);
+        assert!(derived.shared_outbound_lifted);
+    }
+
+    #[test]
+    fn no_node_left_dual_model_never_completes_with_a_pending_node() {
+        // The invariant (lock 18): a mixed fleet is NEVER reported CutoverComplete
+        // while any node is still legacy — no node is left straddling both models.
+        let mixed = derive_cutover_status(
+            &[
+                voice_state("peer:eagle", "eagle", RegState::Registered),
+                voice_state("peer:pine", "pine", RegState::Provisioning),
+            ],
+            true,
+        );
+        assert_ne!(mixed.phase, CutoverPhase::CutoverComplete);
+        assert!(no_node_left_dual_model(&mixed));
+
+        // Every node reprovisioned → complete, and the invariant holds.
+        let done = derive_cutover_status(
+            &[
+                voice_state("peer:eagle", "eagle", RegState::Registered),
+                voice_state("peer:pine", "pine", RegState::Unregistered),
+            ],
+            true,
+        );
+        assert_eq!(done.phase, CutoverPhase::CutoverComplete);
+        assert!(no_node_left_dual_model(&done));
+        assert!(done.pending_nodes.is_empty());
+
+        // A hand-built inconsistent status (Complete but a node pending) is caught
+        // by the invariant — the guard the acceptance turns on.
+        let bogus = CutoverStatus {
+            phase: CutoverPhase::CutoverComplete,
+            total_nodes: 2,
+            reprovisioned: 1,
+            pending_nodes: vec!["pine".into()],
+            shared_outbound_lifted: true,
+            updated_at_s: 0,
+        };
+        assert!(!no_node_left_dual_model(&bogus));
+    }
+
+    #[test]
+    fn read_desired_shared_config_folds_latest_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        persist
+            .write(
+                SHARED_CONFIG_TOPIC,
+                Priority::Default,
+                None,
+                Some(r#"{"caller_id":"15551110000","outbound_trunk":"old"}"#),
+            )
+            .unwrap();
+        // A later apply supersedes the earlier one.
+        persist
+            .write(
+                SHARED_CONFIG_TOPIC,
+                Priority::Default,
+                None,
+                Some(r#"{"caller_id":"15559990000","outbound_trunk":"shared-vitelity"}"#),
+            )
+            .unwrap();
+        let cfg = read_desired_shared_config(&persist).expect("a config was applied");
+        assert_eq!(cfg.caller_id, "15559990000");
+        assert_eq!(cfg.outbound_trunk, "shared-vitelity");
+    }
+
+    #[test]
+    fn apply_shared_config_persists_the_lifted_config_and_marks_lifted() {
+        // The panel's "Apply to fleet" round-trip: the verb is consumed and the
+        // shared-outbound is sealed to the leader store — the fleet is now lifted.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = seeded_store(tmp.path());
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        // Before any apply: not lifted → the cutover is Legacy.
+        assert!(!shared_outbound_is_lifted(&store));
+
+        persist
+            .write(
+                SHARED_CONFIG_TOPIC,
+                Priority::Default,
+                None,
+                Some(r#"{"caller_id":"15551234567","outbound_trunk":"shared"}"#),
+            )
+            .unwrap();
+        let lifted = apply_shared_config(&store, &persist);
+        assert!(lifted, "applying the shared config lifts the fleet");
+
+        // The sealed config reads back byte-consistent (lock 13).
+        let body = store.get(&shared_outbound_ref()).unwrap().unwrap();
+        let cfg: SharedOutboundConfig = serde_json::from_str(&body).unwrap();
+        assert_eq!(cfg.caller_id, "15551234567");
+        assert_eq!(cfg.outbound_trunk, "shared");
+    }
+
+    #[test]
+    fn cutover_status_serializes_for_the_panel() {
+        // The published body carries the phase (kebab-case) + the pending nodes so
+        // the panel banner renders the flag-day prompt.
+        let status = CutoverStatus {
+            phase: CutoverPhase::NodesReprovisioning,
+            total_nodes: 2,
+            reprovisioned: 1,
+            pending_nodes: vec!["pine".into()],
+            shared_outbound_lifted: true,
+            updated_at_s: 7,
+        };
+        let body = serde_json::to_string(&status).unwrap();
+        assert!(body.contains("\"phase\":\"nodes-reprovisioning\""));
+        assert!(body.contains("pine"));
+        // And it round-trips back (the panel mirror deserialises the same shape).
+        let back: CutoverStatus = serde_json::from_str(&body).unwrap();
+        assert_eq!(back, status);
     }
 
     #[tokio::test]

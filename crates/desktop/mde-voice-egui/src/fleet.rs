@@ -75,6 +75,16 @@ pub const DID_ROUTE_TOPIC: &str = "action/voice/did-route";
 /// lock 10). The leader applies it via the Vitelity client.
 pub const FAILOVER_TOPIC: &str = "action/voice/failover";
 
+/// The single fleet-wide topic the migration **cutover status** is published to
+/// (VOIP-GW-7, design lock 18). Distinct from [`STATE_PREFIX`] (a per-node
+/// prefix), so the board projection never mistakes it for a node row.
+const CUTOVER_TOPIC: &str = "state/voice-cutover";
+
+/// The single fleet-wide topic the leader-held **shared-outbound** config in
+/// force is mirrored to (VOIP-GW-7, design lock 13), so the panel can show the
+/// value that is actually applied (e.g. a lifted legacy caller-ID).
+const SHARED_STATE_TOPIC: &str = "state/voice-shared";
+
 /// How often the tab re-reads the Bus. Voice provisioning is slow-changing, so a
 /// 5 s cadence matches the datacenter surface without hammering the index.
 const REFRESH: Duration = Duration::from_secs(5);
@@ -175,6 +185,78 @@ pub struct DidRow {
     /// The sub-account username it currently rings, or `None` for the main line.
     #[serde(default)]
     pub routed_to: Option<String>,
+}
+
+/// The fleet migration phase (VOIP-GW-7, design lock 18). The local mirror of
+/// the worker's `CutoverPhase` (its kebab-case serde), deserialised from the
+/// published `state/voice-cutover` body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CutoverPhase {
+    /// Still on the pre-split single-account model.
+    Legacy,
+    /// Shared-outbound lifted (outbound alive); nodes not yet reprovisioned.
+    LiftedSharedOutbound,
+    /// Some nodes crossed onto the split model; others pending — the flag day.
+    NodesReprovisioning,
+    /// Every node is on the split model — cutover done.
+    CutoverComplete,
+}
+
+impl CutoverPhase {
+    /// A one-line operator headline for the banner.
+    const fn headline(self) -> &'static str {
+        match self {
+            Self::Legacy => "Legacy single-account model",
+            Self::LiftedSharedOutbound => "Shared-outbound lifted — outbound stays alive",
+            Self::NodesReprovisioning => "Cutover in progress",
+            Self::CutoverComplete => "Cutover complete",
+        }
+    }
+
+    /// The banner tone — amber while mid-flag-day, green when done, dim on the
+    /// pre-migration legacy state (a `Style` token, never a raw literal — §4).
+    const fn tone(self) -> Color32 {
+        match self {
+            Self::Legacy => Style::TEXT_DIM,
+            Self::LiftedSharedOutbound | Self::NodesReprovisioning => Style::WARN,
+            Self::CutoverComplete => Style::OK,
+        }
+    }
+}
+
+/// The fleet cutover status, mirrored from [`CUTOVER_TOPIC`] (design lock 18).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct CutoverStatus {
+    /// The single fleet-wide migration phase.
+    pub phase: CutoverPhase,
+    /// Enrolled nodes total.
+    #[serde(default)]
+    pub total_nodes: usize,
+    /// How many are reprovisioned onto the split model.
+    #[serde(default)]
+    pub reprovisioned: usize,
+    /// The nodes still on the legacy model (the panel shows exactly which).
+    #[serde(default)]
+    pub pending_nodes: Vec<String>,
+    /// Whether the fleet shared-outbound config is lifted (leader-held).
+    #[serde(default)]
+    pub shared_outbound_lifted: bool,
+    /// When this status was produced (epoch seconds).
+    #[serde(default)]
+    pub updated_at_s: u64,
+}
+
+/// The leader-held shared-outbound config in force, mirrored from
+/// [`SHARED_STATE_TOPIC`] (design lock 13). Read-only view of what is applied.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct SharedOutboundView {
+    /// The shared caller-ID all outbound PSTN presents.
+    #[serde(default)]
+    pub caller_id: String,
+    /// The shared outbound trunk label / account.
+    #[serde(default)]
+    pub outbound_trunk: String,
 }
 
 impl NodeRow {
@@ -349,6 +431,12 @@ pub struct FleetState {
     edits: HashMap<String, NodeEdit>,
     /// The shared-account fleet-config form.
     shared: SharedForm,
+    /// The live fleet cutover status (VOIP-GW-7, design lock 18); `None` until
+    /// the worker publishes one.
+    cutover: Option<CutoverStatus>,
+    /// The leader-held shared-outbound config in force (design lock 13), mirrored
+    /// for a read-only display above the edit form.
+    shared_current: Option<SharedOutboundView>,
 }
 
 impl Default for FleetState {
@@ -361,6 +449,8 @@ impl Default for FleetState {
             last_error: None,
             edits: HashMap::new(),
             shared: SharedForm::default(),
+            cutover: None,
+            shared_current: None,
         }
     }
 }
@@ -398,6 +488,8 @@ impl FleetState {
         };
         self.nodes = read_board(&persist);
         self.dids = read_dids(&persist);
+        self.cutover = read_cutover(&persist);
+        self.shared_current = read_shared(&persist);
     }
 
     /// Render the Fleet tab into `ui`.
@@ -411,6 +503,8 @@ impl FleetState {
             last_error,
             edits,
             shared,
+            cutover,
+            shared_current,
             ..
         } = self;
 
@@ -419,6 +513,12 @@ impl FleetState {
         if let Some(err) = last_error.as_deref() {
             ui.colored_label(Style::DANGER, err);
             ui.add_space(Style::SP_S);
+        }
+
+        // VOIP-GW-7 — the migration cutover banner (design lock 18): prompt the
+        // operator clearly through the flag day (phase + which nodes remain).
+        if let Some(status) = cutover.as_ref() {
+            show_cutover(ui, status);
         }
 
         // Fleet-wide header + Provision-all.
@@ -459,7 +559,7 @@ impl FleetState {
                 }
 
                 ui.add_space(Style::SP_M);
-                show_shared(ui, shared, &mut pending);
+                show_shared(ui, shared, shared_current.as_ref(), &mut pending);
             });
 
         if let Some(action) = pending {
@@ -483,6 +583,14 @@ impl FleetState {
     #[cfg(test)]
     fn with_dids(mut self, dids: Vec<DidRow>) -> Self {
         self.dids = dids;
+        self
+    }
+
+    /// Test seam: inject the cutover status directly (bypassing the Bus) so a
+    /// headless render exercises the migration banner (VOIP-GW-7).
+    #[cfg(test)]
+    fn with_cutover(mut self, status: CutoverStatus) -> Self {
+        self.cutover = Some(status);
         self
     }
 }
@@ -529,6 +637,69 @@ fn read_dids(persist: &Persist) -> Vec<DidRow> {
         .unwrap_or_default();
     rows.sort_by(|a, b| a.number.cmp(&b.number));
     rows
+}
+
+/// Read the latest fleet cutover status from [`CUTOVER_TOPIC`] (design lock 18).
+/// A missing / malformed body yields `None` (the banner just doesn't render) —
+/// never a fabricated phase. Pure over the Persist handle (unit-testable).
+fn read_cutover(persist: &Persist) -> Option<CutoverStatus> {
+    persist
+        .list_since(CUTOVER_TOPIC, None)
+        .unwrap_or_default()
+        .into_iter()
+        .next_back()
+        .and_then(|m| m.body)
+        .and_then(|body| serde_json::from_str::<CutoverStatus>(&body).ok())
+}
+
+/// Read the leader-held shared-outbound config in force from
+/// [`SHARED_STATE_TOPIC`] (design lock 13). `None` when none is applied yet.
+fn read_shared(persist: &Persist) -> Option<SharedOutboundView> {
+    persist
+        .list_since(SHARED_STATE_TOPIC, None)
+        .unwrap_or_default()
+        .into_iter()
+        .next_back()
+        .and_then(|m| m.body)
+        .and_then(|body| serde_json::from_str::<SharedOutboundView>(&body).ok())
+}
+
+/// Render the migration cutover banner (design lock 18): the phase headline, the
+/// reprovision progress, and exactly which nodes still remain on the legacy
+/// model — a clear operator prompt through the flag day.
+fn show_cutover(ui: &mut egui::Ui, status: &CutoverStatus) {
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            mde_egui::status_dot(ui, status.phase.tone());
+            ui.add_space(Style::SP_XS);
+            ui.label(
+                RichText::new(status.phase.headline())
+                    .size(Style::BODY)
+                    .strong()
+                    .color(status.phase.tone()),
+            );
+        });
+        ui.add_space(Style::SP_XS);
+        mde_egui::field(
+            ui,
+            "Reprovisioned",
+            &format!("{} of {} nodes", status.reprovisioned, status.total_nodes),
+            Style::TEXT,
+        );
+        if status.pending_nodes.is_empty() {
+            if status.phase == CutoverPhase::CutoverComplete {
+                mde_egui::muted_note(ui, "No node left on the legacy model.");
+            }
+        } else {
+            mde_egui::field(
+                ui,
+                "Still legacy",
+                &status.pending_nodes.join(", "),
+                Style::WARN,
+            );
+        }
+    });
+    ui.add_space(Style::SP_S);
 }
 
 /// Render one node card: the reg-state pip + label, its SIP address, the DID +
@@ -738,7 +909,12 @@ fn show_failover(
 
 /// Render the shared-account (leader-held outbound trunk + caller-ID) fleet
 /// config section: the display + edit affordance, applied as a typed verb.
-fn show_shared(ui: &mut egui::Ui, shared: &mut SharedForm, pending: &mut Option<Pending>) {
+fn show_shared(
+    ui: &mut egui::Ui,
+    shared: &mut SharedForm,
+    current: Option<&SharedOutboundView>,
+    pending: &mut Option<Pending>,
+) {
     ui.separator();
     ui.add_space(Style::SP_S);
     ui.label(
@@ -753,6 +929,20 @@ fn show_shared(ui: &mut egui::Ui, shared: &mut SharedForm, pending: &mut Option<
         "One leader-held account carries all outbound PSTN and presents the shared \
          caller-ID (design lock 4/13).",
     );
+    // Show the config in force (e.g. a lifted legacy caller-ID) so the operator
+    // sees what "Apply to fleet" actually persisted — read-only, from the leader.
+    if let Some(cur) = current {
+        ui.add_space(Style::SP_XS);
+        let caller = if cur.caller_id.is_empty() {
+            "— (none)"
+        } else {
+            cur.caller_id.as_str()
+        };
+        mde_egui::field(ui, "In force · caller ID", caller, Style::TEXT);
+        if !cur.outbound_trunk.is_empty() {
+            mde_egui::field(ui, "In force · trunk", &cur.outbound_trunk, Style::TEXT);
+        }
+    }
     ui.add_space(Style::SP_S);
     ui.horizontal(|ui| {
         ui.label(
@@ -1094,6 +1284,86 @@ mod tests {
         let body = msgs[0].body.as_deref().unwrap();
         assert!(body.contains("Forward"));
         assert!(body.contains("15550001111"));
+    }
+
+    // ── VOIP-GW-7: the migration cutover banner (design lock 18) ──
+
+    #[test]
+    fn deserialises_a_cutover_status_body() {
+        // The exact JSON shape VOIP-GW-7 publishes to `state/voice-cutover`
+        // (phase kebab-case + the pending nodes).
+        let body = r#"{"phase":"nodes-reprovisioning","total_nodes":2,"reprovisioned":1,
+            "pending_nodes":["pine"],"shared_outbound_lifted":true,"updated_at_s":7}"#;
+        let status: CutoverStatus = serde_json::from_str(body).unwrap();
+        assert_eq!(status.phase, CutoverPhase::NodesReprovisioning);
+        assert_eq!(status.reprovisioned, 1);
+        assert_eq!(status.pending_nodes, vec!["pine".to_string()]);
+        assert_eq!(status.phase.tone(), Style::WARN);
+    }
+
+    #[test]
+    fn read_cutover_projects_the_latest_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        persist
+            .write(
+                CUTOVER_TOPIC,
+                Priority::Min,
+                None,
+                Some(r#"{"phase":"legacy","total_nodes":0,"reprovisioned":0,"pending_nodes":[]}"#),
+            )
+            .unwrap();
+        // A later status wins.
+        persist
+            .write(
+                CUTOVER_TOPIC,
+                Priority::Min,
+                None,
+                Some(r#"{"phase":"cutover-complete","total_nodes":2,"reprovisioned":2,"pending_nodes":[]}"#),
+            )
+            .unwrap();
+        let status = read_cutover(&persist).expect("a cutover status");
+        assert_eq!(status.phase, CutoverPhase::CutoverComplete);
+        assert_eq!(status.reprovisioned, 2);
+    }
+
+    #[test]
+    fn fleet_tab_renders_the_cutover_banner_with_pending_nodes() {
+        // The mid-flag-day banner mounts + tessellates, naming the node still on
+        // the legacy model — the operator prompt the acceptance turns on.
+        let mut fleet = FleetState::new()
+            .with_nodes(vec![NodeRow {
+                node_id: "peer:eagle".into(),
+                hostname: "eagle".into(),
+                username: "eagle".into(),
+                sip_uri: "eagle@sip.vitelity.net".into(),
+                reg_state: RegState::Registered,
+                routed_dids: Vec::new(),
+                failover: None,
+                updated_at_s: 1,
+            }])
+            .with_cutover(CutoverStatus {
+                phase: CutoverPhase::NodesReprovisioning,
+                total_nodes: 2,
+                reprovisioned: 1,
+                pending_nodes: vec!["pine".into()],
+                shared_outbound_lifted: true,
+                updated_at_s: 1,
+            });
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(520.0, 520.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| fleet.show(ui));
+        });
+        assert!(!ctx.tessellate(out.shapes, out.pixels_per_point).is_empty());
     }
 
     #[test]
