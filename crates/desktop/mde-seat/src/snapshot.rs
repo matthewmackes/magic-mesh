@@ -11,10 +11,10 @@
 
 use crate::backlight::{Backlight, BacklightClient, SysfsBacklight};
 use crate::bluez::{BluezClient, BtStatus, ZbusBluez};
-use crate::ddc::{DdcClient, DdcDisplay, UnboundDdc};
+use crate::ddc::{DdcClient, DdcCtl, DdcDisplay};
 use crate::display::{Connector, DisplayProber, DrmProber};
 use crate::error::{Backend, SeatError};
-use crate::logind::{LogindClient, PowerCaps, ZbusLogind};
+use crate::logind::{LogindClient, PowerCaps, PowerVerb, ZbusLogind};
 use crate::mixer::{MixerClient, MixerStatus, PwGraph};
 use crate::upower::{Battery, UPowerClient, ZbusUPower};
 
@@ -97,8 +97,8 @@ pub struct Seat {
 
 impl Seat {
     /// A seat over the real host: system-bus BlueZ/UPower/logind, the DRM prober,
-    /// sysfs backlight, the `PipeWire` mixer (E12-16), and the not-yet-bound DDC
-    /// seam (E12-18).
+    /// sysfs backlight, the `PipeWire` mixer (E12-16), and the DDC/CI client over
+    /// `ddcutil` (E12-18).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -108,7 +108,7 @@ impl Seat {
             display: Box::new(DrmProber::new()),
             backlight: Box::new(SysfsBacklight::new()),
             mixer: Box::new(PwGraph::new()),
-            ddc: Box::new(UnboundDdc),
+            ddc: Box::new(DdcCtl::new()),
         }
     }
 
@@ -148,6 +148,42 @@ impl Seat {
             ddc: Probe::from_result(self.ddc.displays()),
         }
     }
+
+    // ── control verbs (E12-18: the Displays + Power sections act through these) ──
+    //
+    // The shell holds the ONE seat (lock 1) and drives hardware in-process through
+    // these; the same methods are what E12-19's `host_state` worker calls for the
+    // remote allowlisted verbs. Confirm-gating (power) + the last-console interlock
+    // (displays) are the caller's duty — see `PowerVerb::needs_confirm` and
+    // `DisplayLayout::guard_disable`.
+
+    /// Set a sysfs backlight panel's raw brightness (lock 13, internal panels).
+    ///
+    /// # Errors
+    /// The backlight client's typed errors ([`SeatError::OutOfRange`] above the
+    /// device max, [`SeatError::Unavailable`] when absent).
+    pub fn set_backlight(&self, name: &str, value: u32) -> Result<(), SeatError> {
+        self.backlight.set_brightness(name, value)
+    }
+
+    /// Set an external monitor's DDC/CI brightness (0–100), keyed by i2c bus label
+    /// (lock 13, external monitors).
+    ///
+    /// # Errors
+    /// The DDC client's typed errors ([`SeatError::Backend`] when the monitor
+    /// rejects DDC, [`SeatError::Unavailable`] when `ddcutil` is absent).
+    pub fn set_ddc_brightness(&self, bus: &str, percent: u8) -> Result<(), SeatError> {
+        self.ddc.set_brightness(bus, percent)
+    }
+
+    /// Execute a logind power verb (lock 12). The caller has already confirm-gated
+    /// it ([`PowerVerb::needs_confirm`]).
+    ///
+    /// # Errors
+    /// The logind client's typed errors (a polkit refusal / absent logind).
+    pub fn power(&self, verb: PowerVerb) -> Result<(), SeatError> {
+        self.logind.act(verb)
+    }
 }
 
 impl Default for Seat {
@@ -181,16 +217,18 @@ mod tests {
     }
 
     #[test]
-    fn a_real_seat_snapshots_without_panicking_and_the_mixer_answers_typed() {
+    fn a_real_seat_snapshots_without_panicking_and_every_bound_section_answers_typed() {
         // On the headless build host every D-Bus/DRM section is legitimately
-        // Absent; the point is snapshot() never panics. The mixer now drives the
-        // real PipeWire client (E12-16): with no pw-dump it is Absent(PipeWire),
-        // with a live graph it is Present — either way tagged PipeWire, never a
-        // fabricated reading. The DDC seam stays Absent until E12-18.
+        // Absent; the point is snapshot() never panics. The mixer drives the real
+        // PipeWire client (E12-16) and DDC the real ddcutil client (E12-18): with
+        // no pw-dump / no ddcutil each is Absent tagged its own backend, with a live
+        // backend Present — either way typed, never a fabricated reading.
         let snap = Seat::new().snapshot();
         if let Probe::Absent { backend, .. } = &snap.mixer {
             assert_eq!(*backend, Backend::PipeWire);
         }
-        assert!(!snap.ddc.is_present(), "ddc must be Absent until E12-18");
+        if let Probe::Absent { backend, .. } = &snap.ddc {
+            assert_eq!(*backend, Backend::Ddc);
+        }
     }
 }

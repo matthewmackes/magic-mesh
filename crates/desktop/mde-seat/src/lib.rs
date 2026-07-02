@@ -24,16 +24,21 @@
 //! - [`DisplayProber`] — a **read-only** DRM connector/mode probe (the modeset
 //!   drive itself stays in the `mde-egui` DRM runner; multi-CRTC is E12-18).
 //! - [`BacklightClient`] — sysfs backlight enumeration + brightness write.
-//! - [`MixerClient`] / [`DdcClient`] — the `PipeWire` graph and DDC/CI clients.
-//!   Their real bindings are E12-16 / E12-18; until then the bound impls answer
-//!   with a typed [`SeatError::Unavailable`] — an honest probe state, never a
-//!   stub that lies (§7).
+//! - [`MixerClient`] — the `PipeWire` graph client (E12-16).
+//! - [`DdcClient`] — DDC/CI external-monitor brightness (E12-18), bound via a typed
+//!   `ddcutil` runner ([`DdcCtl`]); a host without `ddcutil` or a monitor that
+//!   rejects DDC answers a typed [`SeatError`] — an honest not-controllable state,
+//!   never a dead slider (§7). [`UnboundDdc`] stays as the no-backend fallback.
+//! - [`DisplayLayout`] — the desired multi-head arrangement (enable/mode/position,
+//!   [`MonitorId`]-keyed) with the typed "never black the last console" guard
+//!   (E12-18); the DRM drive itself is the `mde-egui` runner's multi-CRTC core.
 //!
 //! [`Seat::snapshot`] folds every client into a [`SeatSnapshot`] of typed
 //! [`Probe`] states — the one model the shell's System surface and chrome status
 //! icons render from. The fixed compiled-in hotkey table (lock 9) lives in
 //! [`hotkeys`]; its dispatch is E12-19's work.
 
+mod arrange;
 mod backlight;
 mod bluez;
 mod bus;
@@ -48,12 +53,16 @@ mod props;
 mod snapshot;
 mod upower;
 
+pub use arrange::{ArrangeError, DisplayLayout, MonitorId, OutputArrangement};
 pub use backlight::{Backlight, BacklightClient, SysfsBacklight};
 pub use bluez::{
     trusted_reconnect_targets, BluezClient, BtAdapter, BtDevice, BtStatus, ReconnectAttempt,
     ScanTracker, ZbusBluez,
 };
-pub use ddc::{DdcClient, DdcDisplay, UnboundDdc};
+pub use ddc::{
+    parse_detect, parse_getvcp_brightness, DdcClient, DdcCtl, DdcDisplay, DdcRunner, DdcUtil,
+    UnboundDdc,
+};
 pub use display::{Connector, ConnectorStatus, DisplayMode, DisplayProber, DrmProber};
 pub use error::{Backend, SeatError};
 pub use hotkeys::{Hotkey, HotkeyAction, HOTKEYS};
