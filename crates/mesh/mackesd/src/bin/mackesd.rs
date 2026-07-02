@@ -7454,6 +7454,33 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("action".into());
 
+        // FILEMGR-5 — the mesh-mount worker owns the sshfs mount lifecycle over
+        // the Nebula overlay for the Files surface (design `file-manager-full.md`
+        // locks 11/13/15/17): it drains `action/mesh-mount/<host>` (typed verb —
+        // mount home / escalate to `/` / unmount), holds the node-sealed shared
+        // mesh SSH key (FILEMGR-6), and publishes `state/mesh-mount/*` with
+        // idle-unmount + reconnect-backoff + frozen-mount recovery. The live
+        // sshfs/fusermount impl is integration-gated behind the injectable
+        // `MountBackend` seam (§9 — no raw shell in the action layer; §7 — it
+        // returns an honest typed error headless, never a faked mount). A desktop
+        // feature (Workstation tier); idles gracefully with no mount requests.
+        if mackesd_core::worker_role::runs("mesh_mount", role_rank) {
+            let runtime_base = mackesd_core::workers::mesh_mount::resolve_runtime_base();
+            let repo_dir = mackesd_core::ipc::secret_store::repo_root();
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::mesh_mount::MeshMountWorker::new(
+                    runtime_base,
+                    repo_dir,
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("mesh_mount".into());
+        }
+
         // VOIP-GW-3 — the leader-gated voice_provision worker. Spawned on every
         // node so failover is seamless, but LEADER-gated internally (lock 7):
         // only the elected node provisions per-node Vitelity sub-accounts, seals

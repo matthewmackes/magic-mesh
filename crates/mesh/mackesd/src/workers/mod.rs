@@ -188,6 +188,13 @@ pub mod mesh_latency;
 // (no nft / non-root / pre-delta). Cheap at idle: one `nft list` + one
 // reconcile per tick, never a busy loop.
 pub mod link_traffic;
+// FILEMGR-5 — the mesh-mount worker: owns the sshfs mount lifecycle over the
+// Nebula overlay for the Files surface. Drains `action/mesh-mount/<host>` +
+// publishes `state/mesh-mount/*` (home-vs-escalated scope, idle-unmount,
+// reconnect+backoff, frozen-mount recovery). The live sshfs/fusermount impl is
+// integration-gated behind the injectable `MountBackend` seam (§9, §7); the
+// planning + state-machine folds are pure + unit-tested.
+pub mod mesh_mount;
 pub mod mesh_router;
 // NF-3.4 (v2.5) — Nebula supervisor worker (CA mint +
 // role-marker management + bundle-watch + systemctl

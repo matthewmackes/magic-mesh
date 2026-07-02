@@ -90,6 +90,10 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     ("job_exec", 1),
     ("voice_config", 1),
     ("clipboard_sync", 1),
+    // FILEMGR-5 — the Files-surface sshfs mesh-mount worker. A desktop feature
+    // (the seated user browses peers), so Workstation-tier; it idles gracefully
+    // with no mount requests on a headless box.
+    ("mesh_mount", 1),
     ("kdc_host", 1),
     ("remmina-sync", 1),
     // MEDIA-8 — Workstation music auto-config: a desktop worker (no seated user
@@ -304,7 +308,9 @@ mod tests {
         // +1 music_autoconfig (MEDIA-8 — Workstation music birthright: writes the
         // desktop user's airsonic-creds.json from the published mesh shared account).
         // +1 link-traffic (MESHMAP-6 — per-link byte-counter collector, rank 0).
-        assert_eq!(WORKER_TIERS.len(), 30);
+        // +1 mesh_mount (FILEMGR-5 — the Files-surface sshfs mesh-mount worker,
+        // Workstation-tier: a seated-user desktop feature).
+        assert_eq!(WORKER_TIERS.len(), 31);
     }
 
     #[test]
@@ -332,8 +338,8 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            8,
-            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8)"
+            9,
+            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5)"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
@@ -395,11 +401,11 @@ mod tests {
     fn workers_for_rank_is_a_growing_superset() {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        // 22 lighthouse control-plane workers; Workstation adds the 8 fleet +
-        // desktop workers for the full 30 (the retired Server tier folded into
+        // 22 lighthouse control-plane workers; Workstation adds the 9 fleet +
+        // desktop workers for the full 31 (the retired Server tier folded into
         // Workstation in the 2-role model).
         assert_eq!(lh.len(), 22);
-        assert_eq!(ws.len(), 30);
+        assert_eq!(ws.len(), 31);
         // Strict superset: every lighthouse worker is also in the workstation set.
         assert!(lh.iter().all(|w| ws.contains(w)));
     }
