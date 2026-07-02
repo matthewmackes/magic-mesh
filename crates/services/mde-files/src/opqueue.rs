@@ -31,6 +31,7 @@
 //! The returned [`OpOutcome`] reports exactly what finished, so nothing
 //! half-done is ever claimed complete.
 
+use crate::archive::ArchiveFormat;
 use crate::backend::OpId;
 use crate::fileops::{free_duplicate_name, FileOps};
 use std::io;
@@ -65,14 +66,29 @@ pub enum OpKind {
     /// confirm dialog upstream is the safeguard (lock 3/6). Cancellable between
     /// entries; already-deleted entries stay deleted (honestly reported).
     Delete { items: Vec<PathBuf> },
+    /// Compress `items` (named relative to `base_dir`) into a new `archive` in
+    /// the chosen `format` (FILEMGR-3). Built + progress-reported per member on
+    /// the same queue; a cancel leaves no half-archive. See [`crate::archive`].
+    Compress {
+        items: Vec<PathBuf>,
+        base_dir: PathBuf,
+        archive: PathBuf,
+        format: ArchiveFormat,
+    },
+    /// Extract every member of `archive` into `dest_dir` — the extract-here /
+    /// extract-to verb (FILEMGR-3). Path-traversal-guarded; progress per member.
+    Extract { archive: PathBuf, dest_dir: PathBuf },
 }
 
 impl OpKind {
     fn items(&self) -> &[PathBuf] {
         match self {
-            OpKind::Copy { items, .. } | OpKind::Move { items, .. } | OpKind::Delete { items } => {
-                items
-            }
+            OpKind::Copy { items, .. }
+            | OpKind::Move { items, .. }
+            | OpKind::Delete { items }
+            | OpKind::Compress { items, .. } => items,
+            // The archive is a single file, not a source-item set to scan.
+            OpKind::Extract { .. } => &[],
         }
     }
 }
@@ -313,8 +329,9 @@ impl OpControl {
 
     /// The worker's cooperative gate: returns `true` to proceed, `false` when
     /// cancelled. Blocks while paused (and returns `false` if cancelled during
-    /// the pause).
-    fn proceed(&self) -> bool {
+    /// the pause). `pub(crate)` so the archive engine ([`crate::archive`]) shares
+    /// the exact same pause/cancel checkpoint between members.
+    pub(crate) fn proceed(&self) -> bool {
         let mut st = guard(&self.inner.state);
         loop {
             match *st {
@@ -454,6 +471,26 @@ pub fn execute(
     resolver: &mut dyn ConflictResolver,
     sink: &mut dyn FnMut(Progress),
 ) -> OpOutcome {
+    // Archive ops (FILEMGR-3) run their own member-walk + progress engine; they
+    // ride the same queue/OpEvent path but don't use the copy/move conflict
+    // machinery (no `resolver`, no scan_items over source items).
+    match op {
+        OpKind::Compress {
+            items,
+            base_dir,
+            archive,
+            format,
+        } => {
+            return crate::archive::compress(
+                ops, items, base_dir, archive, *format, control, op_id, sink,
+            );
+        }
+        OpKind::Extract { archive, dest_dir } => {
+            return crate::archive::extract(ops, archive, dest_dir, control, op_id, sink);
+        }
+        OpKind::Copy { .. } | OpKind::Move { .. } | OpKind::Delete { .. } => {}
+    }
+
     let (files_total, bytes_total) = scan_items(ops, op.items());
     let mut ex = Exec {
         ops,
@@ -485,6 +522,8 @@ pub fn execute(
         OpKind::Copy { items, dest_dir } => ex.run_transfer(items, dest_dir, false, &mut outcome),
         OpKind::Move { items, dest_dir } => ex.run_transfer(items, dest_dir, true, &mut outcome),
         OpKind::Delete { items } => ex.run_delete(items, &mut outcome),
+        // Archive ops early-returned above before the Exec was built.
+        OpKind::Compress { .. } | OpKind::Extract { .. } => unreachable!("archive ops dispatched"),
     }
     outcome.files_done = ex.files_done;
     outcome.bytes_done = ex.bytes_done;
@@ -1478,5 +1517,61 @@ mod tests {
         let outcome = handle.join().expect("join");
         assert!(outcome.cancelled);
         assert_eq!(outcome.items_completed, 0);
+    }
+
+    // ── archive ops ride the same queue (FILEMGR-3) ──────────────────────────
+
+    #[test]
+    fn queue_runs_compress_then_extract() {
+        use crate::archive::ArchiveFormat;
+        use std::collections::HashMap;
+
+        let fs = scratch(&[("/src/proj/a.txt", b"alpha"), ("/src/proj/b.txt", b"bravo")]);
+        fs.create_dir(Path::new("/out")).expect("mkdir /out");
+        let (etx, erx) = channel::<OpEvent>();
+        let queue = OpQueue::spawn(fs, etx);
+
+        let compress_op = QueuedOp {
+            op_id: 1,
+            kind: OpKind::Compress {
+                items: vec![PathBuf::from("/src/proj")],
+                base_dir: PathBuf::from("/src"),
+                archive: PathBuf::from("/out/proj.zip"),
+                format: ArchiveFormat::Zip,
+            },
+            control: OpControl::new(),
+            resolver: Box::new(FixedResolution::overwrite()),
+        };
+        assert!(queue.submit(compress_op).is_ok(), "submit compress");
+        let extract_op = QueuedOp {
+            op_id: 2,
+            kind: OpKind::Extract {
+                archive: PathBuf::from("/out/proj.zip"),
+                dest_dir: PathBuf::from("/dst"),
+            },
+            control: OpControl::new(),
+            resolver: Box::new(FixedResolution::overwrite()),
+        };
+        assert!(queue.submit(extract_op).is_ok(), "submit extract");
+
+        // The queue runs them in order (compress, then extract of what it wrote).
+        let mut finished: HashMap<OpId, OpOutcome> = HashMap::new();
+        while finished.len() < 2 {
+            match erx.recv_timeout(Duration::from_secs(5)) {
+                Ok(OpEvent::Finished(o)) => {
+                    finished.insert(o.op_id, o);
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let comp = finished.get(&1).expect("compress finished");
+        assert!(comp.error.is_none(), "compress: {:?}", comp.error);
+        assert_eq!(comp.items_completed, 1);
+        let ext = finished.get(&2).expect("extract finished");
+        assert!(ext.error.is_none(), "extract: {:?}", ext.error);
+        assert_eq!(ext.items_completed, 1);
+        // 3 members extracted: proj, proj/a.txt, proj/b.txt.
+        assert_eq!(ext.files_done, 3);
     }
 }

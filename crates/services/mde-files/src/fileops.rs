@@ -72,6 +72,12 @@ pub trait FileOps {
     /// The target of a symbolic link.
     fn read_link(&self, path: &Path) -> io::Result<PathBuf>;
 
+    /// Read an entire **regular file** into memory (follows symlinks, the
+    /// `std::fs::read` shape). The archive engine ([`crate::archive`]) reads an
+    /// archive's bytes and each member's bytes through this so it never touches
+    /// `std::fs` directly and stays testable against [`FakeFileOps`].
+    fn read_file(&self, path: &Path) -> io::Result<Vec<u8>>;
+
     // ── primitives ──────────────────────────────────────────────────────────
 
     /// Copy one **regular file** `src` → `dst`, returning the byte count. Callers
@@ -90,6 +96,11 @@ pub trait FileOps {
     fn create_dir_all(&self, path: &Path) -> io::Result<()>;
     /// Create a new empty file; errors if it already exists (`O_CREAT|O_EXCL`).
     fn create_file(&self, path: &Path) -> io::Result<()>;
+    /// Write `data` to `path`, creating it or truncating an existing regular
+    /// file (the `std::fs::write` shape). The parent directory must exist. The
+    /// archive engine writes each extracted member and the finished archive
+    /// through this.
+    fn write_file(&self, path: &Path, data: &[u8]) -> io::Result<()>;
     /// Create a symbolic link `link` pointing at `target`.
     fn symlink(&self, target: &Path, link: &Path) -> io::Result<()>;
     /// Create a hard link `link` to the existing file `target`.
@@ -225,6 +236,10 @@ impl FileOps for LiveFileOps {
         std::fs::read_link(path)
     }
 
+    fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+        std::fs::read(path)
+    }
+
     fn copy_file(&self, src: &Path, dst: &Path) -> io::Result<u64> {
         std::fs::copy(src, dst)
     }
@@ -255,6 +270,10 @@ impl FileOps for LiveFileOps {
             .create_new(true)
             .open(path)
             .map(|_| ())
+    }
+
+    fn write_file(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        std::fs::write(path, data)
     }
 
     fn symlink(&self, target: &Path, link: &Path) -> io::Result<()> {
@@ -577,6 +596,18 @@ impl FileOps for FakeFileOps {
         }
     }
 
+    fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
+        let st = self.state.borrow();
+        let ino = st.follow(path)?;
+        match &st.inodes[&ino].kind {
+            FakeKind::File(data) => Ok(data.clone()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read_file on a non-regular file",
+            )),
+        }
+    }
+
     fn copy_file(&self, src: &Path, dst: &Path) -> io::Result<u64> {
         let mut st = self.state.borrow_mut();
         let ino = st.follow(src)?;
@@ -721,6 +752,25 @@ impl FileOps for FakeFileOps {
         }
         st.require_parent_dir(path)?;
         st.insert_node(path, FakeKind::File(Vec::new()), 0o644);
+        Ok(())
+    }
+
+    fn write_file(&self, path: &Path, data: &[u8]) -> io::Result<()> {
+        let mut st = self.state.borrow_mut();
+        st.require_parent_dir(path)?;
+        if let Some(&ino) = st.paths.get(path) {
+            return match st.inodes.get_mut(&ino).map(|n| &mut n.kind) {
+                Some(FakeKind::File(buf)) => {
+                    *buf = data.to_vec();
+                    Ok(())
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "write_file: path exists and is not a regular file",
+                )),
+            };
+        }
+        st.insert_node(path, FakeKind::File(data.to_vec()), 0o644);
         Ok(())
     }
 

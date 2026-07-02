@@ -23,6 +23,7 @@
 // harness. E12-14b stripped the Cosmic-era iced GUI + all modules that
 // only that GUI used (archive, bookmarks, desktop, fileops, grid, mime,
 // panels, properties, search, selection, smb, thumbnails, trash).
+pub mod archive;
 pub mod backend;
 #[cfg(feature = "dbus")]
 pub mod bus_backend;
@@ -39,6 +40,7 @@ pub mod send_to;
 // is retired. MCNF 12.0 "Quasar" renders Files as an egui panel
 // (`mde-files-egui::files_panel`) inside `mde-shell-egui`, reusing the
 // render-agnostic backend/model/send_to above. No `gui` feature remains.
+pub use archive::{browse as browse_archive, compress, extract, ArchiveEntry, ArchiveFormat};
 pub use backend::{
     AuditEntry, Backend, BackendError, ConflictPolicy, Destination, LocalFsBackend, OpId, SendMode,
 };
