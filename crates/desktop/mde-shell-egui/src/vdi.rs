@@ -18,7 +18,6 @@
 //! EmptyState, never a placeholder render of a fake desktop (§7).
 
 use mde_egui::egui::{self, Sense, TextureHandle, TextureOptions};
-use mde_egui::Motion;
 
 use mde_vdi_rdp::RdpSession;
 use mde_vdi_vnc::VncSession;
@@ -182,37 +181,34 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
             forward_input(ui, state);
         }
         None => {
-            // Connect-state feedback: the "connecting" caption eases in on the
-            // shared BASE curve when the picker hands a target over (§4 — motion
-            // via the shared table only, no bespoke engine).
-            let t = Motion::animate(
-                ui.ctx(),
-                "vdi-connecting",
-                state.requested.is_some(),
-                Motion::BASE,
-            );
+            // No live desktop texture: the empty Desktop surface paints the BRAND-1
+            // backdrop — the centered logo lockup (full opacity, breathing while
+            // idle) with any honest status relocated to a small line BELOW the image
+            // (lock 2), never over it. The backdrop owns the crossfade/breathe motion
+            // (lock 10), so there is no bespoke caption ease here.
             match state.requested.as_ref() {
-                // The discovery picker chose a target but no live decoder is
-                // attached yet (the wire transport is gated) — an honest
-                // "connecting" caption naming the VM, never a placeholder
-                // desktop (§7).
+                // The discovery picker chose a target but no live decoder is attached
+                // yet (the wire transport is gated) — the status honestly names the
+                // VM being brokered, below the logo; never a placeholder desktop (§7).
                 Some(target) => {
-                    ui.scope(|ui| {
-                        ui.set_opacity(t);
-                        crate::session::empty_state(
-                            ui,
-                            &format!("Connecting to {}", target.name),
-                            &format!(
-                                "Brokering the desktop from {} — the live transport (E12-4) is gated.",
-                                target.serving_peer
-                            ),
-                        );
-                    });
+                    let title = format!("Connecting to {}", target.name);
+                    let detail = format!(
+                        "Brokering the desktop from {} — the live transport (E12-4) is gated.",
+                        target.serving_peer
+                    );
+                    crate::backdrop::show(
+                        ui,
+                        crate::backdrop::Coverage::Empty,
+                        Some((title.as_str(), detail.as_str())),
+                    );
                 }
-                None => crate::session::empty_state(
+                None => crate::backdrop::show(
                     ui,
-                    "No desktop connected",
-                    "Broker a VM desktop (RDP / VNC) — it renders here in the shell.",
+                    crate::backdrop::Coverage::Empty,
+                    Some((
+                        "No desktop connected",
+                        "Broker a VM desktop (RDP / VNC) — it renders here in the shell.",
+                    )),
                 ),
             }
         }
@@ -297,7 +293,7 @@ mod tests {
         assert!(state.texture.is_none(), "no frame attached, so no texture");
         assert!(
             drew,
-            "the no-desktop EmptyState produced no draw primitives"
+            "the no-desktop BRAND-1 logo backdrop produced no draw primitives"
         );
     }
 
@@ -314,7 +310,10 @@ mod tests {
         );
         let drew = run_panel(&mut state, body_input());
         assert!(state.texture.is_none(), "no frame attached, so no texture");
-        assert!(drew, "the connecting caption produced no draw primitives");
+        assert!(
+            drew,
+            "the connecting backdrop (logo + status below) produced no draw primitives"
+        );
 
         // Backing out clears the target so the surface returns to the picker.
         state.clear_target();

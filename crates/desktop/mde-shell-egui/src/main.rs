@@ -14,6 +14,7 @@
 //! the skeleton the panels (Workbench/Files/Music/Voice) and the VM session-view
 //! plug into.
 
+mod backdrop;
 mod chat;
 mod chrome;
 mod controller;

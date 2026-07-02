@@ -4030,6 +4030,7 @@ dependencies = [
  "mde-vdi-rdp",
  "mde-vdi-vnc",
  "mde-voice-egui",
+ "png",
  "serde",
  "serde_json",
 ]

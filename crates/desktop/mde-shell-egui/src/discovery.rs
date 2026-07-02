@@ -267,14 +267,31 @@ pub(crate) fn request_host_desktop(bus_root: Option<&Path>, host: &str) {
 /// (peer · name · state) with a Connect action, or an honest `EmptyState` when no
 /// peer is advertising a VM.
 pub(crate) fn discovery_panel(ui: &mut egui::Ui, state: &mut DiscoveryState) {
+    let empty = state.vms.is_empty();
+
+    // BRAND-1 — the bottom-most brand backdrop, painted FIRST so the rest of the
+    // picker floats over it: the centered logo lockup at full opacity plus the honest
+    // empty-picker copy below it while nothing is advertised, dropping to a low
+    // watermark once the VM list covers the display (lock 6). The empty root desktop
+    // is one of the two paths this backdrop replaces (the other is `vdi`).
+    let status = if empty {
+        Some(empty_copy(state.bus_root.is_some()))
+    } else {
+        None
+    };
+    let coverage = if empty {
+        crate::backdrop::Coverage::Empty
+    } else {
+        crate::backdrop::Coverage::Covered
+    };
+    crate::backdrop::show(ui, coverage, status);
+
     if let Some(err) = state.last_error.as_deref() {
         ui.colored_label(Style::DANGER, err);
         ui.add_space(Style::SP_S);
     }
 
-    if state.vms.is_empty() {
-        let (title, subtitle) = empty_copy(state.bus_root.is_some());
-        crate::session::empty_state(ui, title, subtitle);
+    if empty {
         return;
     }
 
@@ -424,7 +441,7 @@ mod tests {
         let mut state = state_with(&[]);
         assert!(
             run_panel(&mut state),
-            "the no-desktops EmptyState produced no draw primitives"
+            "the no-desktops BRAND-1 logo backdrop produced no draw primitives"
         );
         // Rendering the empty state raises no connect target.
         assert!(state.take_connect().is_none());

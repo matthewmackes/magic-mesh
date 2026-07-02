@@ -40,6 +40,12 @@ mde-bus = { path = "../../platform/mde-bus" }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 
+# BRAND-1 — the empty-desktop brand backdrop (`backdrop.rs`) decodes the embedded
+# 1270² RGBA logo lockup once to a cached egui texture. `png` is the lean decoder
+# `mde-files` already builds thumbnails on; a leaf registry crate, so it adds no
+# tier edge (§6 — the layered-tiers gate only flags outward workspace deps).
+png = "0.18"
+
 # The chrome bar's live Peers + Status fold the world-readable mesh-status
 # snapshot, reusing the render-agnostic LIGHTHOUSE-7 model
 # (`lighthouse_health_from_snapshot` / `LighthouseHealth`) so the bar's health
