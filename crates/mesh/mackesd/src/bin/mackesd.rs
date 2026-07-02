@@ -2600,7 +2600,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 // Live path: drive the integration-gated Provisioner seam
                 // (provision → push-enroll → migrate-CA).
-                match sl::execute(&plan, &sl::LiveProvisioner) {
+                match sl::execute(&plan, &sl::LiveProvisioner::default()) {
                     Ok(sl::SpawnOutcome::Provisioned { endpoint }) => {
                         println!("  lighthouse provisioned at {}", endpoint.host);
                     }
@@ -2633,7 +2633,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 // Live path: drive the integration-gated FirstDesktopApply seam
                 // (create+boot → open-session).
-                match fd::execute(&plan, &fd::LiveFirstDesktop) {
+                match fd::execute(&plan, &fd::LiveFirstDesktop::default()) {
                     Ok(outcome) => println!("  {}", outcome.human()),
                     Err(e) => {
                         eprintln!(
@@ -2688,7 +2688,7 @@ fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
                 // Live path: drive the integration-gated ServiceApply seam.
-                match sa::execute(&plan, &sa::LiveServiceApply) {
+                match sa::execute(&plan, &sa::LiveServiceApply::default()) {
                     Ok(outcome) => println!("  {}", outcome.human()),
                     Err(e) => {
                         eprintln!(
@@ -6570,6 +6570,30 @@ fn run_serve(
                 .lock()
                 .expect("worker_names mutex")
                 .push("service_onboard".into());
+        }
+        // OW-15 (target-side, day-2) — the onboard_apply worker: the §9-native
+        // receiver for the BusApply remote-push transport. Drains
+        // `action/onboard/apply` (a signed JobBundle + the claimed issuer) and
+        // applies it ONLY when addressed to this node, from a leadership-authorized
+        // issuer (the CA `nodes` registry resolves the issuer to a leader-eligible
+        // lighthouse identity key), validly signed/fresh/single-use — reusing the
+        // pure onboard::remote_push core (allow-listed Action enum, no raw shell —
+        // §9). Rank-0 default (any enrolled peer can be a target; each node applies
+        // only bundles addressed to it). Publishes the typed observed-state /
+        // rejection on `event/onboard/apply`; the live cross-node round-trip is
+        // operator/live-gated behind BusApply (§7).
+        if mackesd_core::worker_role::runs("onboard_apply", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::onboard_apply::OnboardApplyWorker::new(
+                    &workgroup_root,
+                    node_id.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("onboard_apply".into());
         }
         // E12-9 — the clipboard_bridge worker: the first of the E12-9 VDI client↔VM
         // bridges. Drains `action/vdi/clipboard`, applies a per-session policy

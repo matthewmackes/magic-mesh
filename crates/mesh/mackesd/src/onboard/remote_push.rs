@@ -136,7 +136,7 @@ pub trait RemotePush {
 /// worker validates the signature + freshness against the mesh CA before
 /// applying, so a peer only ever runs allow-listed actions authored by a
 /// trusted signer (§8).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobBundle {
     /// The enrolled target's mesh node id.
     pub target_node: String,
@@ -408,6 +408,101 @@ pub fn process_apply(
         node: bundle.target_node.clone(),
         applied: bundle.actions.iter().map(Action::redacted).collect(),
     })
+}
+
+// ─────────────────── production transports (the hybrid, C) ───────────────────
+
+/// Production [`RemotePush`] for **bootstrap** targets — bearer-scoped SSH to a
+/// not-yet-enrolled box (OW-7's accepted `push_enroll` model), used ONLY for the
+/// bootstrap instant. It refuses:
+/// * an [`Target::Enrolled`] peer — a mesh member must be driven over the §9
+///   [`BusApply`] path, never raw SSH; and
+/// * any action other than [`Action::RunEnroll`] — the only thing a fresh box
+///   does over the single-use enroll bearer is run enroll (§8/§9 blast radius).
+///
+/// Reaching the box over live SSH and running the RPM-shipped enroll is the
+/// integration-gated live path (operator/live acceptance 2): with no live SSH
+/// runner wired on this build, [`RemotePush::apply`] returns a typed
+/// [`RemotePushError::NotWired`] — a real error, never a fake success (§7). The
+/// target is left completely unchanged.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SshBootstrap;
+
+impl RemotePush for SshBootstrap {
+    fn apply(&self, target: &Target, actions: &[Action]) -> Result<(), RemotePushError> {
+        match target {
+            Target::Enrolled { node_id } => {
+                return Err(RemotePushError::BundleRejected {
+                    why: format!(
+                        "SshBootstrap refuses the enrolled peer `{node_id}` — a mesh member is \
+                         driven over the §9 BusApply path, not raw SSH"
+                    ),
+                });
+            }
+            Target::Bootstrap { .. } => {}
+        }
+        // The bootstrap instant runs ONLY enroll over the single-use bearer; any
+        // other action on a not-yet-enrolled box is out of scope.
+        for action in actions {
+            if !matches!(action, Action::RunEnroll { .. }) {
+                return Err(RemotePushError::BundleRejected {
+                    why: format!(
+                        "SshBootstrap only runs run-enroll during the bootstrap instant; refused \
+                         `{}`",
+                        action.redacted()
+                    ),
+                });
+            }
+        }
+        Err(RemotePushError::NotWired {
+            transport: "ssh-bootstrap (bearer-scoped SSH enroll)",
+        })
+    }
+}
+
+/// Production [`RemotePush`] for **day-2** targets — the §9-native signed-bundle
+/// Bus verb to an already-enrolled peer (OW-11's role-pin + secret-seal, OW-8's
+/// broker open). It refuses:
+/// * a [`Target::Bootstrap`] host — a not-yet-enrolled box is not on the Bus yet
+///   (chicken-and-egg), so it takes [`SshBootstrap`]; and
+/// * an [`Action::RunEnroll`] — enroll is a bootstrap-only SSH step, never a
+///   day-2 Bus action.
+///
+/// Signing a [`JobBundle`] with the issuing node's identity key, publishing it on
+/// `action/onboard/apply`, and awaiting the target `onboard_apply` worker's
+/// observed-state reply over the overlay is the integration-gated live path
+/// (operator/live acceptance 1): with no live cross-node Bus round-trip wired on
+/// this build, [`RemotePush::apply`] returns a typed [`RemotePushError::NotWired`]
+/// — never a fake success (§7). The pure sign/verify/apply core (built + tested
+/// above) is what the live round-trip carries once wired; the target is left
+/// unchanged until then.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BusApply;
+
+impl RemotePush for BusApply {
+    fn apply(&self, target: &Target, actions: &[Action]) -> Result<(), RemotePushError> {
+        match target {
+            Target::Bootstrap { host } => {
+                return Err(RemotePushError::BundleRejected {
+                    why: format!(
+                        "BusApply refuses the bootstrap host `{host}` — a not-yet-enrolled box is \
+                         not on the Bus; use SshBootstrap"
+                    ),
+                });
+            }
+            Target::Enrolled { .. } => {}
+        }
+        for action in actions {
+            if matches!(action, Action::RunEnroll { .. }) {
+                return Err(RemotePushError::BundleRejected {
+                    why: "run-enroll is a bootstrap step, not a day-2 Bus action".to_string(),
+                });
+            }
+        }
+        Err(RemotePushError::NotWired {
+            transport: "bus-apply (signed-bundle cross-node round-trip)",
+        })
+    }
 }
 
 #[cfg(test)]
@@ -738,5 +833,110 @@ mod tests {
             &applier
         )
         .is_ok());
+    }
+
+    // ── production transports: honest gate + refusal boundaries (§7) ──
+
+    #[test]
+    fn ssh_bootstrap_refuses_an_enrolled_target() {
+        // A mesh member must go over the §9 BusApply path, never raw SSH.
+        let err = SshBootstrap
+            .apply(
+                &Target::Enrolled {
+                    node_id: "peer:lh".into(),
+                },
+                &[Action::RunEnroll { bearer: "b".into() }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, RemotePushError::BundleRejected { .. }));
+    }
+
+    #[test]
+    fn ssh_bootstrap_refuses_any_action_but_enroll() {
+        // The bootstrap instant runs ONLY enroll; a role-pin over the enroll
+        // bearer is out of scope and refused (allow-list boundary).
+        let err = SshBootstrap
+            .apply(
+                &Target::Bootstrap {
+                    host: "203.0.113.7".into(),
+                },
+                &[Action::PinRole {
+                    role: "lighthouse".into(),
+                    media: true,
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, RemotePushError::BundleRejected { .. }));
+    }
+
+    #[test]
+    fn ssh_bootstrap_gates_the_live_enroll_honestly() {
+        // A valid bootstrap enroll: no live SSH runner ⇒ a typed NotWired, never
+        // a fake success. The target is untouched.
+        let err = SshBootstrap
+            .apply(
+                &Target::Bootstrap {
+                    host: "203.0.113.7".into(),
+                },
+                &[Action::RunEnroll { bearer: "b".into() }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, RemotePushError::NotWired { .. }));
+    }
+
+    #[test]
+    fn bus_apply_refuses_a_bootstrap_target() {
+        // A not-yet-enrolled box isn't on the Bus — chicken-and-egg.
+        let err = BusApply
+            .apply(
+                &Target::Bootstrap {
+                    host: "203.0.113.7".into(),
+                },
+                &[Action::PinRole {
+                    role: "lighthouse".into(),
+                    media: true,
+                }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, RemotePushError::BundleRejected { .. }));
+    }
+
+    #[test]
+    fn bus_apply_refuses_enroll_as_a_day2_action() {
+        // Enroll is a bootstrap-only SSH step, never a day-2 Bus action.
+        let err = BusApply
+            .apply(
+                &Target::Enrolled {
+                    node_id: "peer:lh".into(),
+                },
+                &[Action::RunEnroll { bearer: "b".into() }],
+            )
+            .unwrap_err();
+        assert!(matches!(err, RemotePushError::BundleRejected { .. }));
+    }
+
+    #[test]
+    fn bus_apply_gates_the_live_round_trip_honestly() {
+        // The OW-11 day-2 bundle (pin Media role + seal media-spaces): no live
+        // cross-node round-trip ⇒ a typed NotWired, never a fake success. The
+        // target is untouched.
+        let err = BusApply
+            .apply(
+                &Target::Enrolled {
+                    node_id: "peer:lh-media".into(),
+                },
+                &[
+                    Action::PinRole {
+                        role: "lighthouse".into(),
+                        media: true,
+                    },
+                    Action::SealSecret {
+                        name: "media-spaces".into(),
+                        secret: "s3".into(),
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert!(matches!(err, RemotePushError::NotWired { .. }));
     }
 }

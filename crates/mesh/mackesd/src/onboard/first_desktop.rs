@@ -503,14 +503,45 @@ pub fn session_open_request(open: &SessionOpen) -> crate::workers::session_broke
 
 /// Production [`FirstDesktopApply`] — the live VM create/boot + Bus session publish.
 ///
-/// This slice (OW-8) delivers the pure core + the seam; the live executors (the
-/// golden-base clone, the mde-kvm create/boot over a live cloud-hypervisor
-/// api-socket, and the real Bus publish of the broker session-open) are wired by a
-/// later unit. Until then each method returns a typed
-/// [`FirstDesktopError::IntegrationGated`] naming exactly what the live call needs —
-/// never a fake success (§7).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LiveFirstDesktop;
+/// OW-8's **open-session** is a **day-2** remote push (the serving host is an
+/// enrolled mesh member): [`open_session`](Self::open_session) drives the shared
+/// OW-15 [`RemotePush`](crate::onboard::remote_push::RemotePush) executor over the
+/// §9-native [`BusApply`](crate::onboard::remote_push::BusApply) transport (an
+/// [`Action::OpenBroker`](crate::onboard::remote_push::Action::OpenBroker) to the
+/// serving peer). The transport is an **injectable seam** (default: the
+/// honestly-gated production `BusApply`; tests use a fake), and the live cross-node
+/// round-trip stays operator/live-gated (§7).
+///
+/// `create_and_boot` (the golden-base clone + mde-kvm create/boot over a live
+/// cloud-hypervisor api-socket) is a node-LOCAL VMM concern, not a remote push, and
+/// stays honestly integration-gated on its own live prerequisite.
+pub struct LiveFirstDesktop {
+    /// The OW-15 day-2 remote-push transport. Default: [`BusApply`]; tests inject a
+    /// recording fake to prove the wiring without a live round-trip.
+    ///
+    /// [`BusApply`]: crate::onboard::remote_push::BusApply
+    remote_push: std::sync::Arc<dyn crate::onboard::remote_push::RemotePush + Send + Sync>,
+}
+
+impl Default for LiveFirstDesktop {
+    fn default() -> Self {
+        Self {
+            remote_push: std::sync::Arc::new(crate::onboard::remote_push::BusApply),
+        }
+    }
+}
+
+impl LiveFirstDesktop {
+    /// Inject the remote-push transport (tests use a recording fake).
+    #[must_use]
+    pub fn with_remote_push(
+        mut self,
+        transport: std::sync::Arc<dyn crate::onboard::remote_push::RemotePush + Send + Sync>,
+    ) -> Self {
+        self.remote_push = transport;
+        self
+    }
+}
 
 impl FirstDesktopApply for LiveFirstDesktop {
     fn create_and_boot(
@@ -531,13 +562,36 @@ impl FirstDesktopApply for LiveFirstDesktop {
     }
 
     fn open_session(&self, open: &SessionOpen) -> Result<(), FirstDesktopError> {
-        Err(FirstDesktopError::IntegrationGated {
-            step: "open-session",
-            reason: format!(
-                "session `{}` → needs the live Bus to publish a broker SessionRequest::Open on \
-                 `{ACTION_TOPIC}` so the shell's Desktop surface renders VM `{}`",
-                open.session_id, open.vm_id
-            ),
+        // OW-15 day-2 remote push: ask the serving peer (an enrolled mesh member)
+        // to open the broker session over the §9 BusApply transport.
+        let target = crate::onboard::remote_push::Target::Enrolled {
+            node_id: open.serving_peer.clone(),
+        };
+        let actions = [crate::onboard::remote_push::Action::OpenBroker {
+            session_id: open.session_id.clone(),
+        }];
+        self.remote_push.apply(&target, &actions).map_err(|e| {
+            use crate::onboard::remote_push::RemotePushError as R;
+            let detail = e.to_string();
+            match e {
+                R::NotWired { .. } | R::Unreachable { .. } => FirstDesktopError::IntegrationGated {
+                    step: "open-session",
+                    reason: format!(
+                        "session `{}` → needs the live Bus to publish a broker \
+                         SessionRequest::Open on `{ACTION_TOPIC}` (over the §9 BusApply transport: \
+                         {detail}) so the shell's Desktop surface renders VM `{}`",
+                        open.session_id, open.vm_id
+                    ),
+                },
+                R::BundleRejected { why } => FirstDesktopError::Failed {
+                    step: "open-session",
+                    reason: why,
+                },
+                R::ActionFailed { action, why } => FirstDesktopError::Failed {
+                    step: "open-session",
+                    reason: format!("{action}: {why}"),
+                },
+            }
         })
     }
 }
@@ -990,7 +1044,7 @@ mod tests {
 
     #[test]
     fn live_first_desktop_is_integration_gated_not_fake_success() {
-        let apply = LiveFirstDesktop;
+        let apply = LiveFirstDesktop::default();
         let spec = build_desktop_spec("desktop-eagle", Path::new("/home/op/Local"));
         let err = apply
             .create_and_boot(
@@ -1036,7 +1090,7 @@ mod tests {
             None,
             vec![manifest("win10-gold", "vm", "3.2", Some("workstation"))],
         ));
-        let err = execute(&plan, &LiveFirstDesktop).expect_err("live path is gated");
+        let err = execute(&plan, &LiveFirstDesktop::default()).expect_err("live path is gated");
         assert!(matches!(
             err,
             FirstDesktopError::IntegrationGated {
@@ -1044,6 +1098,46 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── OW-15 wiring: open_session drives the day-2 RemotePush (fake) ──
+
+    #[test]
+    fn open_session_drives_the_remote_push_with_open_broker() {
+        use crate::onboard::remote_push::{Action, RemotePush, RemotePushError, Target};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct RecordingPush {
+            seen: Mutex<Vec<(Target, Vec<Action>)>>,
+        }
+        impl RemotePush for RecordingPush {
+            fn apply(&self, target: &Target, actions: &[Action]) -> Result<(), RemotePushError> {
+                self.seen
+                    .lock()
+                    .expect("seen mutex")
+                    .push((target.clone(), actions.to_vec()));
+                Ok(())
+            }
+        }
+
+        let push = Arc::new(RecordingPush::default());
+        let apply = LiveFirstDesktop::default().with_remote_push(push.clone());
+        let open = session_for("desktop-eagle", "peer:eagle");
+        apply
+            .open_session(&open)
+            .expect("fake transport ⇒ wiring proven");
+
+        let seen = push.seen.lock().expect("seen mutex");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].0,
+            Target::Enrolled {
+                node_id: open.serving_peer.clone()
+            },
+            "day-2 broker open targets the enrolled serving peer"
+        );
+        assert!(matches!(&seen[0].1[0], Action::OpenBroker { .. }));
     }
 
     #[test]

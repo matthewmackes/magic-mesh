@@ -287,7 +287,7 @@ impl ServiceOnboardWorker {
             workgroup_root,
             node_id,
             leader_lock,
-            apply: Box::new(crate::onboard::service_add::LiveServiceApply),
+            apply: Box::new(crate::onboard::service_add::LiveServiceApply::default()),
             publisher: Box::new(BusPublisher),
             poll: DEFAULT_POLL_INTERVAL,
             bus_root_override: None,
@@ -652,7 +652,7 @@ mod tests {
         let ev = resolve(
             &action(ServiceKind::Music, None, false),
             &facts_with_media_lighthouse(),
-            &LiveServiceApply,
+            &LiveServiceApply::default(),
         );
         let Some(WireServiceError::IntegrationGated { step, reason }) = &ev.error else {
             panic!("expected the typed gated error, got {:?}", ev.error);

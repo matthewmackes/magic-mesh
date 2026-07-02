@@ -585,13 +585,73 @@ pub trait Provisioner {
 
 /// Production [`Provisioner`] — the live cloud/local spawn + SSH push + CA move.
 ///
-/// This slice (OW-7) delivers the pure core + the seam; the live executors (the
-/// `do-lighthouse-join` / `doctl` cloud path, the cloud-hypervisor spawn, the SSH
-/// push, and the real CA move) are wired by a later OW unit. Until then each method
-/// returns a typed [`ProvisionError::IntegrationGated`] naming exactly what the
-/// live call needs — never a fake success (§7).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LiveProvisioner;
+/// OW-7's **push-enroll** is a **bootstrap** remote push (the target box is not on
+/// the mesh yet): [`push_enroll`](Self::push_enroll) drives the shared OW-15
+/// [`RemotePush`](crate::onboard::remote_push::RemotePush) executor over the
+/// bearer-scoped [`SshBootstrap`](crate::onboard::remote_push::SshBootstrap)
+/// transport (the single-use enroll bearer, no ambient SSH key). The transport is
+/// an **injectable seam** (default: the honestly-gated production `SshBootstrap`;
+/// tests use a fake), and reaching the box over live SSH stays operator/live-gated
+/// (§7 — a typed error, never a fake success).
+///
+/// `provision` (the cloud/VM spawn) and `migrate_ca` (the CA move) are not
+/// remote-push concerns and stay honestly integration-gated on their own live
+/// prerequisites (a cloud token / the CA signer).
+pub struct LiveProvisioner {
+    /// The OW-15 bootstrap remote-push transport. Default: [`SshBootstrap`]; tests
+    /// inject a recording fake to prove the wiring without a live SSH round-trip.
+    ///
+    /// [`SshBootstrap`]: crate::onboard::remote_push::SshBootstrap
+    remote_push: std::sync::Arc<dyn crate::onboard::remote_push::RemotePush + Send + Sync>,
+}
+
+impl Default for LiveProvisioner {
+    fn default() -> Self {
+        Self {
+            remote_push: std::sync::Arc::new(crate::onboard::remote_push::SshBootstrap),
+        }
+    }
+}
+
+impl LiveProvisioner {
+    /// Inject the bootstrap remote-push transport (tests use a recording fake).
+    #[must_use]
+    pub fn with_remote_push(
+        mut self,
+        transport: std::sync::Arc<dyn crate::onboard::remote_push::RemotePush + Send + Sync>,
+    ) -> Self {
+        self.remote_push = transport;
+        self
+    }
+}
+
+/// Map an OW-15 [`RemotePushError`](crate::onboard::remote_push::RemotePushError)
+/// into the provisioner seam's typed error for the push-enroll step.
+fn remote_push_to_provision_error(
+    e: crate::onboard::remote_push::RemotePushError,
+    endpoint: &Endpoint,
+) -> ProvisionError {
+    use crate::onboard::remote_push::RemotePushError as R;
+    let detail = e.to_string();
+    match e {
+        R::NotWired { .. } | R::Unreachable { .. } => ProvisionError::IntegrationGated {
+            step: "push-enroll",
+            reason: format!(
+                "needs live SSH to {} to run the lighthouse enroll over the single-use bearer \
+                 (OW-15 SshBootstrap transport: {detail})",
+                endpoint.host
+            ),
+        },
+        R::BundleRejected { why } => ProvisionError::Failed {
+            step: "push-enroll",
+            reason: why,
+        },
+        R::ActionFailed { action, why } => ProvisionError::Failed {
+            step: "push-enroll",
+            reason: format!("{action}: {why}"),
+        },
+    }
+}
 
 impl Provisioner for LiveProvisioner {
     fn provision(&self, spec: &ProvisionSpec) -> Result<Endpoint, ProvisionError> {
@@ -613,15 +673,21 @@ impl Provisioner for LiveProvisioner {
     fn push_enroll(
         &self,
         endpoint: &Endpoint,
-        _enroll: &EnrollBootstrap,
+        enroll: &EnrollBootstrap,
     ) -> Result<(), ProvisionError> {
-        Err(ProvisionError::IntegrationGated {
-            step: "push-enroll",
-            reason: format!(
-                "needs live SSH to {} to run the lighthouse enroll",
-                endpoint.host
-            ),
-        })
+        // OW-15 bootstrap remote push: reach the fresh box over bearer-scoped SSH
+        // and run ONLY the enroll step (the single-use bearer, no ambient key). The
+        // enroll invocation (carrying the join-token placeholder substituted at
+        // apply time) rides the RunEnroll action; SshBootstrap refuses anything else.
+        let target = crate::onboard::remote_push::Target::Bootstrap {
+            host: endpoint.host.clone(),
+        };
+        let actions = [crate::onboard::remote_push::Action::RunEnroll {
+            bearer: enroll.command.clone(),
+        }];
+        self.remote_push
+            .apply(&target, &actions)
+            .map_err(|e| remote_push_to_provision_error(e, endpoint))
     }
 
     fn migrate_ca(
@@ -1006,7 +1072,7 @@ mod tests {
 
     #[test]
     fn live_provisioner_is_integration_gated_not_fake_success() {
-        let prov = LiveProvisioner;
+        let prov = LiveProvisioner::default();
         let spec = render_spec(&SpawnTarget::default_cloud());
         let err = prov
             .provision(&spec)
@@ -1046,7 +1112,7 @@ mod tests {
     fn execute_propagates_the_integration_gated_error() {
         // Through the LIVE provisioner, execute surfaces the first typed error.
         let plan = plan_spawn(&cloud_req(false), &facts(true, false, true));
-        let err = execute(&plan, &LiveProvisioner).expect_err("live path is gated");
+        let err = execute(&plan, &LiveProvisioner::default()).expect_err("live path is gated");
         assert!(matches!(
             err,
             ProvisionError::IntegrationGated {
@@ -1054,5 +1120,50 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── OW-15 wiring: push_enroll drives the bootstrap RemotePush (fake) ──
+
+    #[test]
+    fn push_enroll_drives_the_bootstrap_remote_push_with_run_enroll() {
+        use crate::onboard::remote_push::{Action, RemotePush, RemotePushError, Target};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct RecordingPush {
+            seen: Mutex<Vec<(Target, Vec<Action>)>>,
+        }
+        impl RemotePush for RecordingPush {
+            fn apply(&self, target: &Target, actions: &[Action]) -> Result<(), RemotePushError> {
+                self.seen
+                    .lock()
+                    .expect("seen mutex")
+                    .push((target.clone(), actions.to_vec()));
+                Ok(())
+            }
+        }
+
+        let push = Arc::new(RecordingPush::default());
+        let prov = LiveProvisioner::default().with_remote_push(push.clone());
+        let ep = Endpoint {
+            host: "203.0.113.7".to_string(),
+            overlay_ip: None,
+        };
+        prov.push_enroll(&ep, &enroll_bootstrap("home-deadbeef"))
+            .expect("fake transport ⇒ wiring proven");
+
+        let seen = push.seen.lock().expect("seen mutex");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].0,
+            Target::Bootstrap {
+                host: "203.0.113.7".into()
+            },
+            "bootstrap push targets the fresh box over SSH"
+        );
+        assert!(
+            matches!(&seen[0].1[0], Action::RunEnroll { .. }),
+            "the bootstrap instant runs only enroll"
+        );
     }
 }

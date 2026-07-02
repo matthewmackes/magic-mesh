@@ -648,14 +648,100 @@ pub trait ServiceApply {
 
 /// Production [`ServiceApply`] — the live Navidrome provision + SIP registration.
 ///
-/// This slice (OW-11) delivers the pure core + the seam; the live executors (the
-/// `setup-media-navidrome.sh` rclone-mount + rootless-podman Navidrome on the
-/// target lighthouse over live SSH, the DO Spaces bucket, and the external SIP
-/// `REGISTER`) are wired by a later unit. Until then each method returns a typed
-/// [`ServiceError::IntegrationGated`] naming exactly what the live call needs —
-/// never a fake success (§7).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LiveServiceApply;
+/// OW-11's Music branch is a **day-2** remote push (the target lighthouse is an
+/// enrolled mesh member): [`provision_music`](Self::provision_music) drives the
+/// shared OW-15 [`RemotePush`](crate::onboard::remote_push::RemotePush) executor —
+/// pinning the Media role on the target + sealing the `media-spaces` secret there
+/// over the §9-native [`BusApply`](crate::onboard::remote_push::BusApply)
+/// transport. Once both land, the target's `navidrome_supervisor` /
+/// `media_registry` self-provision Navidrome + publish `music.mesh`
+/// (capability-driven, live on the fleet). The transport is an **injectable seam**
+/// (default: the honestly-gated production `BusApply`; tests use a fake), and the
+/// live cross-node round-trip stays operator/live-gated (§7 — a typed error on the
+/// wire, never a fake success).
+///
+/// Voice ([`register_voice`](Self::register_voice)) is an external-SIP
+/// registration (not a remote push) and stays honestly integration-gated.
+pub struct LiveServiceApply {
+    /// The OW-15 day-2 remote-push transport. Default: [`BusApply`]; tests inject a
+    /// recording fake to prove the wiring without a live round-trip.
+    ///
+    /// [`BusApply`]: crate::onboard::remote_push::BusApply
+    remote_push: std::sync::Arc<dyn crate::onboard::remote_push::RemotePush + Send + Sync>,
+    /// This authoring node's local secret store, when available — the source of the
+    /// `media-spaces` plaintext that gets sealed into the target's bundle. `None`
+    /// ⇒ only the Media-role pin is pushed (the live push delivers the seal).
+    local_secrets: Option<crate::ipc::secret_store::SecretStore>,
+}
+
+impl Default for LiveServiceApply {
+    fn default() -> Self {
+        Self {
+            remote_push: std::sync::Arc::new(crate::onboard::remote_push::BusApply),
+            local_secrets: None,
+        }
+    }
+}
+
+impl LiveServiceApply {
+    /// Inject the remote-push transport (tests use a recording fake). Production
+    /// uses the honestly-gated [`BusApply`](crate::onboard::remote_push::BusApply).
+    #[must_use]
+    pub fn with_remote_push(
+        mut self,
+        transport: std::sync::Arc<dyn crate::onboard::remote_push::RemotePush + Send + Sync>,
+    ) -> Self {
+        self.remote_push = transport;
+        self
+    }
+
+    /// Inject this node's local secret store (the source of the sealed
+    /// `media-spaces` plaintext).
+    #[must_use]
+    pub fn with_local_secrets(mut self, store: crate::ipc::secret_store::SecretStore) -> Self {
+        self.local_secrets = Some(store);
+        self
+    }
+}
+
+/// Map an OW-15 [`RemotePushError`](crate::onboard::remote_push::RemotePushError)
+/// into the service seam's typed error — an honest gate becomes `IntegrationGated`
+/// (naming the live round-trip that's still operator-gated + the capability-driven
+/// self-provision it unblocks), a validation/apply failure becomes `Failed`. Never
+/// a fake success (§7).
+fn remote_push_to_service_error(
+    e: crate::onboard::remote_push::RemotePushError,
+    target: &MediaLighthouseTarget,
+    creds_ref: &str,
+    server_url: &str,
+) -> ServiceError {
+    use crate::onboard::remote_push::RemotePushError as R;
+    let detail = e.to_string();
+    match e {
+        R::NotWired { .. } | R::Unreachable { .. } => ServiceError::IntegrationGated {
+            step: "provision-music",
+            reason: format!(
+                "media-lighthouse `{}` provisions Navidrome *itself* once it carries the Media \
+                 role + the `{creds_ref}` (DO Spaces) secret: its `navidrome_supervisor` worker \
+                 runs the RPM-shipped `setup-media-navidrome.sh` when the unit is missing, and \
+                 `media_registry` publishes {server_url} (this capability-driven path is live on \
+                 the fleet's media lighthouses). What is gated is the live REMOTE push from this \
+                 authoring node — pinning the Media role on `{}` + sealing the secret there over \
+                 the §9 BusApply transport ({detail}); the signed-bundle core is built + tested, \
+                 the live cross-node round-trip is operator/live-gated.",
+                target.hostname, target.hostname
+            ),
+        },
+        R::BundleRejected { why } => ServiceError::Failed {
+            step: "provision-music",
+            reason: why,
+        },
+        R::ActionFailed { action, why } => ServiceError::Failed {
+            step: "provision-music",
+            reason: format!("{action}: {why}"),
+        },
+    }
+}
 
 impl ServiceApply for LiveServiceApply {
     fn provision_music(
@@ -664,22 +750,34 @@ impl ServiceApply for LiveServiceApply {
         creds_ref: &str,
         server_url: &str,
     ) -> Result<MusicEndpoint, ServiceError> {
-        Err(ServiceError::IntegrationGated {
-            step: "provision-music",
-            reason: format!(
-                "media-lighthouse `{}` provisions Navidrome *itself* once it carries the Media \
-                 role + the `{creds_ref}` (DO Spaces) secret: its `navidrome_supervisor` worker \
-                 runs the RPM-shipped `setup-media-navidrome.sh` when the unit is missing, and \
-                 `media_registry` publishes {server_url} (this capability-driven path is live on \
-                 the fleet's media lighthouses). What is gated is the REMOTE push from this \
-                 authoring node — pinning the Media role on `{}` + sealing the secret there — via \
-                 the onboard-family live executor (the same unbuilt SSH/typed-verb seam OW-7's \
-                 `push_enroll` needs; no onboard verb wires live remote push yet). Until it lands, \
-                 pin the Media role on the target lighthouse directly and provisioning + \
-                 registration come up automatically.",
-                target.hostname, target.hostname
-            ),
-        })
+        // OW-15 day-2 remote push over the §9 BusApply transport: pin the Media
+        // role on the target lighthouse + seal the media-spaces secret there. Once
+        // both land, the target self-provisions Navidrome + publishes music.mesh.
+        let rp_target = crate::onboard::remote_push::Target::Enrolled {
+            node_id: target.hostname.clone(),
+        };
+        let mut actions = vec![crate::onboard::remote_push::Action::PinRole {
+            role: "lighthouse".to_string(),
+            media: true,
+        }];
+        // Seal the media-spaces secret when this authoring node holds it (the
+        // plaintext travels inside the signed, encrypted-transport bundle; redacted
+        // in logs — §8). If it isn't held locally the transport gates below anyway.
+        if let Some(store) = &self.local_secrets {
+            if let Ok(Some(secret)) = store.get(creds_ref) {
+                actions.push(crate::onboard::remote_push::Action::SealSecret {
+                    name: creds_ref.to_string(),
+                    secret,
+                });
+            }
+        }
+        self.remote_push
+            .apply(&rp_target, &actions)
+            .map(|()| MusicEndpoint {
+                host: target.hostname.clone(),
+                server_url: server_url.to_string(),
+            })
+            .map_err(|e| remote_push_to_service_error(e, target, creds_ref, server_url))
     }
 
     fn register_voice(&self, account: &SipAccount) -> Result<(), ServiceError> {
@@ -1228,7 +1326,7 @@ mod tests {
 
     #[test]
     fn live_provision_music_is_integration_gated_not_fake_success() {
-        let apply = LiveServiceApply;
+        let apply = LiveServiceApply::default();
         let target = MediaLighthouseTarget {
             hostname: "lh-media".into(),
             overlay_ip: Some("10.42.0.2".into()),
@@ -1270,7 +1368,7 @@ mod tests {
 
     #[test]
     fn live_register_voice_is_integration_gated_not_fake_success() {
-        let apply = LiveServiceApply;
+        let apply = LiveServiceApply::default();
         let acct = SipAccount::new("sip.provider.net", "provider.net", "alice");
         let err = apply
             .register_voice(&acct)
@@ -1302,13 +1400,85 @@ mod tests {
             &req(ServiceKind::Music, None),
             &facts(vec![lh("lh-media", None, true)]),
         );
-        let err = execute(&plan, &LiveServiceApply).expect_err("live path is gated");
+        let err = execute(&plan, &LiveServiceApply::default()).expect_err("live path is gated");
         assert!(matches!(
             err,
             ServiceError::IntegrationGated {
                 step: "provision-music",
                 ..
             }
+        ));
+    }
+
+    // ── OW-15 wiring: provision_music drives RemotePush (fake transport) ──
+
+    #[test]
+    fn provision_music_drives_the_remote_push_with_pin_and_seal() {
+        use crate::onboard::remote_push::{Action, RemotePush, RemotePushError, Target};
+        use std::sync::{Arc, Mutex};
+
+        // A recording transport: proves provision_music drives RemotePush (not the
+        // old IntegrationGated return) and pushes the day-2 Media-role pin + the
+        // media-spaces seal to the enrolled target — then reports success.
+        #[derive(Default)]
+        struct RecordingPush {
+            seen: Mutex<Vec<(Target, Vec<Action>)>>,
+        }
+        impl RemotePush for RecordingPush {
+            fn apply(&self, target: &Target, actions: &[Action]) -> Result<(), RemotePushError> {
+                self.seen
+                    .lock()
+                    .expect("seen mutex")
+                    .push((target.clone(), actions.to_vec()));
+                Ok(())
+            }
+        }
+
+        // A real LocalAead store holding the media-spaces secret, so the seal is
+        // built from an actual plaintext (not a placeholder).
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join("mcnf-age-key");
+        std::fs::write(
+            &key_path,
+            "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQSXKLP0E\n",
+        )
+        .unwrap();
+        let store = crate::ipc::secret_store::SecretStore::LocalAead {
+            dir: tmp.path().join("secrets"),
+            key_path,
+        };
+        let creds = media_spaces_creds_ref();
+        store.put(&creds, "S3_KEY=AKIA...\n").expect("seed secret");
+
+        let push = Arc::new(RecordingPush::default());
+        let apply = LiveServiceApply::default()
+            .with_remote_push(push.clone())
+            .with_local_secrets(store);
+
+        let target = MediaLighthouseTarget {
+            hostname: "lh-media".into(),
+            overlay_ip: Some("10.42.0.2".into()),
+            already_media: false,
+        };
+        let ep = apply
+            .provision_music(&target, &creds, &music_mesh_server_url())
+            .expect("fake transport ⇒ wiring proven, success reported");
+        assert_eq!(ep.host, "lh-media");
+
+        let seen = push.seen.lock().expect("seen mutex");
+        assert_eq!(seen.len(), 1, "one remote push");
+        assert_eq!(
+            seen[0].0,
+            Target::Enrolled {
+                node_id: "lh-media".into()
+            },
+            "day-2 push targets the enrolled peer"
+        );
+        // Media-role pin + the media-spaces seal, in order.
+        assert!(matches!(&seen[0].1[0], Action::PinRole { media: true, .. }));
+        assert!(matches!(
+            &seen[0].1[1],
+            Action::SealSecret { name, .. } if name == &creds
         ));
     }
 

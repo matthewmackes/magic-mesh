@@ -610,6 +610,18 @@ pub mod clipboard_bridge;
 // `LiveServiceApply`, whose typed `IntegrationGated` is the honest live answer
 // today (§7 — never a fake success).
 pub mod service_onboard;
+// OW-15 (target-side, day-2) — the onboard_apply worker: the §9-native receiver
+// for the BusApply remote-push transport. Drains `action/onboard/apply` (a signed
+// JobBundle + the claimed issuer), applies it ONLY when addressed to this node,
+// from a leadership-authorized issuer (the CA `nodes` registry resolves the issuer
+// to a leader-eligible `host`/lighthouse identity key), and validly
+// signed/fresh/single-use — reusing the pure `onboard::remote_push` core verbatim
+// (allow-listed Action enum, no raw shell — §9). A failure at any gate leaves the
+// target unchanged (§7) and publishes a typed rejection on `event/onboard/apply`;
+// the observed-state echo carries only redacted (secret-free) actions (§8). Runs
+// on every node (any peer can be a target); the live cross-node round-trip is
+// operator/live-gated behind BusApply.
+pub mod onboard_apply;
 // NOTIFY-CHAT-2 — the mackesd `chat` worker: the live plumbing behind the pure
 // `mde-chat` model (design docs/design/mesh-chat-icq.md). Runs on EVERY node incl.
 // headless (emit + relay, no UI). Drains `action/chat/send` (signs + relays a
