@@ -156,7 +156,11 @@ pub trait FileOps {
 /// Pick the first "`<stem> copy<n>.<ext>`" sibling of `path` for which
 /// `exists(candidate)` is `false`. `n` is empty for the first copy, then ` 2`,
 /// ` 3`, … The extension and parent directory are preserved.
-fn free_duplicate_name(path: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+///
+/// `pub(crate)` so the FILEMGR-2 conflict engine ([`crate::opqueue`]) mints the
+/// same "Keep both" auto-rename the Duplicate verb uses — one naming convention
+/// across the app (§6 reuse, not a re-implementation).
+pub(crate) fn free_duplicate_name(path: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new(""));
     let stem = path
         .file_stem()

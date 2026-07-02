@@ -30,6 +30,7 @@ pub mod fileops;
 #[cfg(feature = "dbus")]
 pub mod mesh_backend;
 pub mod model;
+pub mod opqueue;
 pub mod send_to;
 
 // ── E12-14b — the windowed Cosmic-era surface was stripped ──────────────────
@@ -43,3 +44,8 @@ pub use backend::{
 };
 pub use fileops::{FakeFileOps, FileOps, FileStat, LiveFileOps};
 pub use model::{FileRow, Layout, Mime, Peer, PeerKind, PeerStatus, SelfNode, Tab, View};
+pub use opqueue::{
+    channel_resolver, execute, ChannelResolver, Conflict, ConflictChoice, ConflictPrompt,
+    ConflictResolver, FixedResolution, FnResolver, OpControl, OpEvent, OpKind, OpOutcome, OpQueue,
+    Progress, QueuedOp, Resolution,
+};
