@@ -140,7 +140,9 @@ auth, SIP digest) stand as recorded.
 - **Delivery:** **one immutable bootc/ostree image for every role** (egui-DRM shell +
   cloud-hypervisor + ironrdp/virtio-gpu + `mackesd` + Podman + Nebula baked in, plus the
   **seat services — PipeWire/WirePlumber · BlueZ · UPower** — per the host-controls locks,
-  `docs/design/quasar-host-controls.md` / E12-15..19; VM disks
+  `docs/design/quasar-host-controls.md` / E12-15..19, and **UDisks2 + the fs toolchain**
+  (e2fsprogs/xfsprogs/btrfs-progs/exfatprogs/ntfs-3g/cryptsetup/qemu-img) per the Storage-plane
+  locks, `docs/design/workbench-storage-plane.md` / E12-20..23; VM disks
   + mesh state on the writable partition). The **role is a config flag**, not a separate
   build — a Lighthouse runs the same image with the desktop units masked (Option 1),
   role-features migrating to managed Podman/VM workloads over time (Option 2). The
