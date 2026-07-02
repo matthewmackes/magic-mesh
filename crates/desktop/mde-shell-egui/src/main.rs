@@ -295,9 +295,13 @@ impl Shell {
                 // surface so its egui ids can't collide in the shell's one
                 // `Context`. The snapshot is refreshed in `render` (it also feeds
                 // the chrome icons), so the panel only renders here.
-                let system = &self.system;
+                // The System panel drives Displays + Power live (E12-18); its
+                // per-VM power rows reuse the Instances broker (§6), so it takes a
+                // `&mut` to that roster — two disjoint field borrows of the shell.
+                let system = &mut self.system;
+                let instances = &mut self.instances;
                 ui.push_id("shell-system", |ui| {
-                    system.show(ui);
+                    system.show(ui, instances);
                 });
             }
         }

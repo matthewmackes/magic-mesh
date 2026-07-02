@@ -200,6 +200,51 @@ pub(crate) struct InstancesState {
     last_error: Option<String>,
 }
 
+/// A read view of one VM's power state — what the System panel's Power section
+/// renders for its per-VM power row (§6: the Instances roster, a second view).
+pub(crate) struct VmPowerRow {
+    /// The VM name.
+    pub name: String,
+    /// The operator-facing runtime state label.
+    pub state: &'static str,
+    /// Whether the VM is (last-known) running — picks Boot vs Shutdown affordance.
+    pub running: bool,
+    /// Whether the last op was gated (no live VMM) — toned honestly in the row.
+    pub gated: bool,
+}
+
+impl InstancesState {
+    /// The per-VM power rows for the System panel's Power section — the SAME roster
+    /// the Instances surface drives, surfaced read-only for a second view (§6 /
+    /// lock 12: per-VM power rows reuse the Instances broker verbs).
+    pub(crate) fn power_rows(&self) -> Vec<VmPowerRow> {
+        self.vms
+            .iter()
+            .map(|vm| VmPowerRow {
+                name: vm.spec.name.clone(),
+                state: vm.state.pip().1,
+                running: vm.state == VmRunState::Running,
+                gated: vm.state == VmRunState::Gated,
+            })
+            .collect()
+    }
+
+    /// Drive a VM power verb from the Power section, reusing the ONE Instances
+    /// broker (`Op::Boot`/`Op::Shutdown`) — no reimplementation of VM power (§6).
+    /// `boot` selects Boot; otherwise Shutdown. Folds the result into the roster +
+    /// the shared inline error exactly like the Instances surface's own buttons.
+    pub(crate) fn drive_power(&mut self, idx: usize, boot: bool) {
+        let op = if boot { Op::Boot } else { Op::Shutdown };
+        apply_action(
+            &mut self.vms,
+            &mut self.selected,
+            &mut self.last_error,
+            &*self.broker,
+            Action::Lifecycle { idx, op },
+        );
+    }
+}
+
 impl Default for InstancesState {
     fn default() -> Self {
         Self {
