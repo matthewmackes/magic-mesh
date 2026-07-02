@@ -9,6 +9,13 @@
 //! * [`RdpSession::send_input`] maps an [`egui::Event`] to RDP input intents
 //!   (pointer / key / wheel / text), synthesising modifier key transitions from
 //!   egui's modifier snapshot, and queues them for the wire pump.
+//! * The **adaptive-codec surface (E12-10)**: the wire pump feeds link probes
+//!   ([`RdpSession::record_rtt`] / [`RdpSession::record_stall`] /
+//!   [`RdpSession::record_frame`]), [`RdpSession::autotune`] steps the target
+//!   [`QualityTier`] on a weak link (manual pin via
+//!   [`RdpSession::set_quality_mode`]), and — because RDP encoding knobs are
+//!   connect-time only — [`RdpSession::needs_reconnect`] reports honestly when
+//!   the target can only apply on the next reconnect (see [`crate::tier`]).
 //!
 //! This state machine is **ironrdp-free and fully unit-tested without a server**:
 //! decode is fed through [`RdpSession::apply_rect`] / [`RdpSession::apply_full_frame`]
@@ -21,7 +28,12 @@
 use crate::config::{ConfigError, RdpConfig};
 use crate::egui::{ColorImage, Event};
 use crate::input::{map_event, map_text, ModifierState, RdpInputEvent};
+use crate::link::{
+    LadderConfig, LinkEstimate, LinkEstimator, LinkThresholds, QualityLadder, QualityMode,
+    QualityTier, TierChange,
+};
 use crate::pixel::{Framebuffer, FramebufferError, PixelFormat};
+use crate::tier::RdpTierSettings;
 
 /// The egui-facing RDP desktop: a framebuffer the shell renders + an input queue
 /// the wire pump drains.
@@ -36,6 +48,19 @@ pub struct RdpSession {
     pointer: (u16, u16),
     /// Modifier keys already held on the guest (synthesised from egui snapshots).
     modifiers: ModifierState,
+    /// Rolling link-quality estimates, fed by the wire pump's probe seam
+    /// (E12-10 adaptive codec).
+    link: LinkEstimator,
+    /// The auto-quality ladder driving the target tier from the link grades.
+    ladder: QualityLadder,
+    /// Auto adaptation vs an operator-pinned tier.
+    quality_mode: QualityMode,
+    /// Grade cut-offs for [`RdpSession::autotune`].
+    thresholds: LinkThresholds,
+    /// The tier the *current connection* was negotiated with. RDP encoding
+    /// knobs are connect-time only ([`RdpTierSettings::APPLICATION`]), so a
+    /// target tier differing from this raises [`RdpSession::needs_reconnect`].
+    applied_tier: QualityTier,
 }
 
 impl RdpSession {
@@ -55,6 +80,11 @@ impl RdpSession {
             pending: Vec::new(),
             pointer: (0, 0),
             modifiers: ModifierState::default(),
+            link: LinkEstimator::new(),
+            ladder: QualityLadder::new(QualityTier::Full, LadderConfig::default()),
+            quality_mode: QualityMode::Auto,
+            thresholds: LinkThresholds::default(),
+            applied_tier: QualityTier::Full,
         })
     }
 
@@ -172,6 +202,134 @@ impl RdpSession {
     pub fn take_input(&mut self) -> Vec<RdpInputEvent> {
         std::mem::take(&mut self.pending)
     }
+
+    // ── Adaptive quality (E12-10) ───────────────────────────────────────────
+    //
+    // RDP negotiates its encoding surface at connect time only (see
+    // `crate::tier`), so this session tracks a *target* tier: the ladder / a
+    // pin moves the target, `needs_reconnect` reports the gap, and the connect
+    // layer closes it by reconnecting with `connect_settings` and calling
+    // `mark_tier_applied`. A tier change is never silently a no-op.
+
+    /// The auto/pinned quality mode.
+    #[must_use]
+    pub const fn quality_mode(&self) -> QualityMode {
+        self.quality_mode
+    }
+
+    /// The effective *target* tier: the pinned tier, or the auto ladder's.
+    #[must_use]
+    pub const fn quality_tier(&self) -> QualityTier {
+        match self.quality_mode {
+            QualityMode::Pinned(tier) => tier,
+            QualityMode::Auto => self.ladder.tier(),
+        }
+    }
+
+    /// The tier the current connection was negotiated with.
+    #[must_use]
+    pub const fn applied_tier(&self) -> QualityTier {
+        self.applied_tier
+    }
+
+    /// Pin a tier or return to auto, reporting the target-tier change if any.
+    ///
+    /// RDP applies tiers **on reconnect only** ([`RdpTierSettings::APPLICATION`]):
+    /// a returned change moves the *target*, and the session raises
+    /// [`RdpSession::needs_reconnect`] until the connect layer reconnects with
+    /// [`RdpSession::connect_settings`] and calls
+    /// [`RdpSession::mark_tier_applied`]. Returning to auto resumes the ladder
+    /// from the pinned tier (hysteresis streaks cleared) instead of replaying
+    /// stale pre-pin state.
+    pub fn set_quality_mode(&mut self, mode: QualityMode, now_ms: u64) -> Option<TierChange> {
+        let from = self.quality_tier();
+        if matches!(
+            (self.quality_mode, mode),
+            (QualityMode::Pinned(_), QualityMode::Auto)
+        ) {
+            self.ladder.reset_to(from);
+        }
+        self.quality_mode = mode;
+        let to = self.quality_tier();
+        (to != from).then(|| {
+            tracing::info!(
+                from = from.label(),
+                to = to.label(),
+                "rdp quality target changed (applies on reconnect)"
+            );
+            TierChange {
+                from,
+                to,
+                at_ms: now_ms,
+            }
+        })
+    }
+
+    /// Whether the target tier differs from the negotiated one — the change
+    /// can only take effect on a reconnect built from
+    /// [`RdpSession::connect_settings`].
+    #[must_use]
+    pub fn needs_reconnect(&self) -> bool {
+        self.quality_tier() != self.applied_tier
+    }
+
+    /// The connect-time settings for the target tier — what the next
+    /// (re)connect must be built from.
+    #[must_use]
+    pub fn connect_settings(&self) -> RdpTierSettings {
+        RdpTierSettings::for_tier(self.quality_tier())
+    }
+
+    /// The connect layer reconnected with [`RdpSession::connect_settings`]:
+    /// the target tier is now the negotiated one.
+    pub const fn mark_tier_applied(&mut self) {
+        self.applied_tier = self.quality_tier();
+    }
+
+    /// Feed a measured round trip from the wire pump's probe seam.
+    pub fn record_rtt(&mut self, rtt_ms: u32) {
+        self.link.record_rtt(rtt_ms);
+    }
+
+    /// Feed a loss/stall event (read timeout, aborted frame) at `now_ms`.
+    pub fn record_stall(&mut self, now_ms: u64) {
+        self.link.record_stall(now_ms);
+    }
+
+    /// Feed the payload size of one decoded update at `now_ms` (the effective
+    /// frame-throughput signal).
+    pub fn record_frame(&mut self, now_ms: u64, bytes: usize) {
+        self.link.record_frame(now_ms, bytes);
+    }
+
+    /// The rolling link estimate as of `now_ms` (HUD / diagnostics).
+    #[must_use]
+    pub fn link_estimate(&self, now_ms: u64) -> LinkEstimate {
+        self.link.estimate(now_ms)
+    }
+
+    /// Replace the link-grade thresholds (shell/operator tuning).
+    pub const fn set_link_thresholds(&mut self, thresholds: LinkThresholds) {
+        self.thresholds = thresholds;
+    }
+
+    /// One auto-quality step: grade the current link estimate and let the
+    /// ladder move the target tier (degrade fast, upgrade slow). A no-op when
+    /// a tier is pinned. A returned change moved the *target* only — see
+    /// [`RdpSession::needs_reconnect`] for how it takes effect.
+    pub fn autotune(&mut self, now_ms: u64) -> Option<TierChange> {
+        if self.quality_mode != QualityMode::Auto {
+            return None;
+        }
+        let grade = self.link.estimate(now_ms).grade(&self.thresholds);
+        let change = self.ladder.observe(now_ms, grade)?;
+        tracing::info!(
+            from = change.from.label(),
+            to = change.to.label(),
+            "rdp auto quality step (applies on reconnect)"
+        );
+        Some(change)
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +338,7 @@ mod tests {
     use crate::config::RdpConfig;
     use crate::egui::{Color32, Event, Key, Modifiers, Pos2};
     use crate::input::{RdpInputEvent, Scancode};
+    use crate::link::{QualityMode, QualityTier};
     use crate::pixel::PixelFormat;
 
     // The smallest RDP-legal desktop (validate() enforces a 200px minimum); tests
@@ -307,5 +466,95 @@ mod tests {
             }
         ));
         assert_eq!(s.pointer_position(), (1, 0));
+    }
+
+    // ── Adaptive quality (E12-10) ───────────────────────────────────────────
+
+    #[test]
+    fn quality_starts_auto_full_with_nothing_pending() {
+        let s = session();
+        assert_eq!(s.quality_mode(), QualityMode::Auto);
+        assert_eq!(s.quality_tier(), QualityTier::Full);
+        assert_eq!(s.applied_tier(), QualityTier::Full);
+        assert!(!s.needs_reconnect());
+    }
+
+    #[test]
+    fn pinning_a_tier_raises_needs_reconnect_until_marked_applied() {
+        let mut s = session();
+        let change = s
+            .set_quality_mode(QualityMode::Pinned(QualityTier::Compressed), 1_000)
+            .expect("target changed");
+        assert_eq!(change.from, QualityTier::Full);
+        assert_eq!(change.to, QualityTier::Compressed);
+        assert!(s.needs_reconnect(), "RDP tiers are reconnect-gated");
+        assert_eq!(s.connect_settings().color_depth, 16);
+        // The connect layer reconnects with those settings…
+        s.mark_tier_applied();
+        assert!(!s.needs_reconnect());
+        assert_eq!(s.applied_tier(), QualityTier::Compressed);
+        // Re-pinning the same tier is not a change.
+        assert!(s
+            .set_quality_mode(QualityMode::Pinned(QualityTier::Compressed), 2_000)
+            .is_none());
+    }
+
+    #[test]
+    fn autotune_degrades_the_target_on_a_sustained_bad_link() {
+        let mut s = session();
+        // Three straight samples with a laggy RTT (>= 250 ms grades Bad).
+        s.record_rtt(600);
+        for i in 1..=3_u64 {
+            let step = s.autotune(i * 1_000);
+            if i < 3 {
+                assert!(step.is_none(), "hysteresis: not before 3 bad samples");
+            } else {
+                let change = step.expect("third bad sample steps down");
+                assert!(change.is_degrade());
+                assert_eq!(change.to, QualityTier::Reduced);
+            }
+        }
+        assert_eq!(s.quality_tier(), QualityTier::Reduced);
+        assert!(
+            s.needs_reconnect(),
+            "the step is honest: reconnect required"
+        );
+        assert_eq!(s.applied_tier(), QualityTier::Full, "nothing switched live");
+    }
+
+    #[test]
+    fn pinned_mode_blocks_autotune_and_unpin_resumes_from_the_pin() {
+        let mut s = session();
+        s.set_quality_mode(QualityMode::Pinned(QualityTier::Minimal), 0);
+        s.mark_tier_applied();
+        s.record_rtt(600);
+        for i in 0..10_u64 {
+            assert!(s.autotune(i * 1_000).is_none(), "pinned: no auto steps");
+        }
+        assert_eq!(s.quality_tier(), QualityTier::Minimal);
+        // Back to auto: the ladder resumes from the pinned tier, not from Full.
+        assert!(s.set_quality_mode(QualityMode::Auto, 20_000).is_none());
+        assert_eq!(s.quality_tier(), QualityTier::Minimal);
+        // A recovered link then upgrades slowly from there.
+        s.record_rtt(10);
+        for _ in 0..64 {
+            s.record_rtt(10); // converge the EWMA well under good_rtt
+        }
+        assert!(s.autotune(21_000).is_none());
+        let change = s.autotune(36_000).expect("15s of good upgrades one step");
+        assert_eq!(change.to, QualityTier::Compressed);
+        assert!(s.needs_reconnect());
+    }
+
+    #[test]
+    fn link_probes_shape_the_estimate() {
+        let mut s = session();
+        s.record_rtt(100);
+        s.record_stall(1_000);
+        s.record_frame(2_000, 5_000);
+        let est = s.link_estimate(2_000);
+        assert_eq!(est.rtt_ms, Some(100));
+        assert_eq!(est.stalls_in_window, 1);
+        assert_eq!(est.throughput_bps, Some(4_000), "5000 B over a 10 s window");
     }
 }
