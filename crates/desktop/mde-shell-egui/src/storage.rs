@@ -65,6 +65,8 @@ use serde::{Deserialize, Serialize};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 
+use crate::toast_bridge::TOAST_TOPIC;
+
 /// Topic prefix for the per-node topology mirror (`state/storage/<node>`).
 const STATE_PREFIX: &str = "state/storage/";
 
@@ -1073,6 +1075,11 @@ impl StorageState {
             return;
         }
 
+        // A walled row (advisory in-use note here, or a `Refused` progress row
+        // below) can deep-link to Instances to free the guest holding the disk.
+        // Collected across the render, published once after the borrows end.
+        let mut goto_instances = false;
+
         // Disks — segment bar + partition table + advisory locked rows.
         for dev in devices {
             ui.group(|ui| {
@@ -1080,7 +1087,8 @@ impl StorageState {
                     ui,
                     dev,
                     self.selected_device.as_deref() == Some(dev.name.as_str()),
-                )
+                    &mut goto_instances,
+                );
             });
             // A tap on the disk header selects it as the compose target.
             ui.add_space(Style::SP_XS);
@@ -1145,7 +1153,13 @@ impl StorageState {
 
         // ── Progress lane ──
         ui.add_space(Style::SP_M);
-        show_progress(ui, &self.progress);
+        show_progress(ui, &self.progress, &mut goto_instances);
+
+        // A walled-row deep-link hands off to Instances via the shell's one nav
+        // grammar (a `shell/goto/instances` toast the KIRON bridge resolves).
+        if goto_instances {
+            self.emit_goto(&node.host, INSTANCES_SURFACE);
+        }
     }
 
     /// Publish a request to `action/storage/<node>` via the persist-first path.
@@ -1171,7 +1185,35 @@ impl StorageState {
             Err(e) => self.last_error = Some(format!("Couldn't publish storage action: {e}")),
         }
     }
+
+    /// Emit a shell-navigation deep-link for a walled row: a toast carrying the
+    /// `shell/goto/<surface>` verb the KIRON toast bridge resolves through the
+    /// shell's ONE navigation grammar ([`crate::toast_bridge::resolve_action`], no
+    /// second copy). This is how a row blocked by the worker's in-use wall hands the
+    /// operator off to the surface that frees it — a running-VM backer routes to the
+    /// **Instances** surface, where the guest can be stopped, then the apply retried.
+    /// Reuses the same persist-first publish path as a storage action; a missing Bus
+    /// dir is a silent no-op (the button simply can't navigate).
+    fn emit_goto(&self, source: &str, surface: &str) {
+        let Some(root) = self.bus_root.as_ref() else {
+            return;
+        };
+        let body = serde_json::json!({
+            "severity": "info",
+            "source_host": source,
+            "flag": "STORAGE",
+            "headline": format!("Free the disk on {source} to apply"),
+            "action_label": "Open Instances",
+            "action_verb": format!("shell/goto/{surface}"),
+        })
+        .to_string();
+        let _ = Persist::open(root.clone())
+            .and_then(|p| p.write(TOAST_TOPIC, Priority::Default, None, Some(&body)));
+    }
 }
+
+/// The dock surface a running-VM/container wall routes to (free the guest there).
+const INSTANCES_SURFACE: &str = "instances";
 
 /// The per-node action topic (`action/storage/<node>`).
 fn action_topic(node: &str) -> String {
@@ -1236,7 +1278,7 @@ fn fs_tone(filesystem: Option<&str>) -> Color32 {
 
 /// Render one disk: header (name / size / removable / table / lock), the segment
 /// bar, and the partition table. `is_target` marks the compose target.
-fn show_disk(ui: &mut egui::Ui, dev: &BlockDevice, is_target: bool) {
+fn show_disk(ui: &mut egui::Ui, dev: &BlockDevice, is_target: bool, goto_instances: &mut bool) {
     let protected = dev.protected_reason();
     ui.horizontal(|ui| {
         ui.label(
@@ -1290,12 +1332,22 @@ fn show_disk(ui: &mut egui::Ui, dev: &BlockDevice, is_target: bool) {
         }
     }
 
-    // In-use wall reminder (not visible in the topology — worker-enforced).
+    // In-use wall reminder (not visible in the topology — worker-enforced) with a
+    // live deep-link to the surface that frees it (lock 7 → Instances).
     ui.add_space(Style::SP_XS);
-    mde_egui::muted_note(
-        ui,
-        "A disk backing a running VM/container is refused at apply-time — free it in Instances first.",
-    );
+    ui.horizontal_wrapped(|ui| {
+        mde_egui::muted_note(
+            ui,
+            "A disk backing a running VM/container is refused at apply-time —",
+        );
+        if ui
+            .button(RichText::new("free it in Instances").size(Style::SMALL))
+            .on_hover_text("Jump to the Instances surface to stop the guest holding this disk.")
+            .clicked()
+        {
+            *goto_instances = true;
+        }
+    });
 }
 
 /// The `GParted`-style horizontal segment bar: one coloured segment per partition
@@ -1673,7 +1725,7 @@ fn show_queue_and_apply(
 }
 
 /// The progress lane — the latest per-op terminal state of the current apply.
-fn show_progress(ui: &mut egui::Ui, progress: &[StorageProgress]) {
+fn show_progress(ui: &mut egui::Ui, progress: &[StorageProgress], goto_instances: &mut bool) {
     ui.label(
         RichText::new("Apply progress")
             .color(Style::TEXT)
@@ -1704,10 +1756,18 @@ fn show_progress(ui: &mut egui::Ui, progress: &[StorageProgress]) {
             ui.indent(("storage-progress", p.op_index), |ui| {
                 mde_egui::muted_note(ui, detail);
                 if matches!(p.state, ProgressState::Refused { .. }) {
-                    mde_egui::muted_note(
-                        ui,
-                        "\u{2192} free the disk in the Instances surface, then re-apply.",
-                    );
+                    ui.horizontal_wrapped(|ui| {
+                        mde_egui::muted_note(ui, "\u{2192} free the disk, then re-apply:");
+                        if ui
+                            .button(RichText::new("Open Instances").size(Style::SMALL))
+                            .on_hover_text(
+                                "Jump to the Instances surface to stop the guest holding this disk.",
+                            )
+                            .clicked()
+                        {
+                            *goto_instances = true;
+                        }
+                    });
                 }
             });
         }
@@ -2050,6 +2110,17 @@ mod tests {
         let node = s.selected().expect("a node is selected");
         assert!(!node.available(), "the backend is unavailable");
         assert!(renders(&mut s), "the unavailable state still fully paints");
+    }
+
+    #[test]
+    fn instances_deep_link_resolves_through_the_shell_nav_grammar() {
+        // The walled-row deep-link must name a surface the shell's ONE resolver
+        // accepts — guard against the constant drifting out of the goto grammar.
+        assert!(
+            crate::toast_bridge::resolve_action(&format!("shell/goto/{INSTANCES_SURFACE}"))
+                .is_some(),
+            "the Instances deep-link must resolve to a real dock surface"
+        );
     }
 
     #[test]
