@@ -24,8 +24,9 @@
 //! together by [`RdpSession`] — is `ironrdp`-free and fully unit-tested with
 //! synthetic inputs (governance §7: the tested logic is real, not mocked). The
 //! live connection sequence + session pump that talks to a real peer is the
-//! `ironrdp`-dependent layer; a live connect needs a server, so it is exercised
-//! by an example / integration test, never the unit path.
+//! `ironrdp`-dependent layer (`connect`, behind the `live-connect` feature); a
+//! live connect needs a server, so it is exercised by the env-gated
+//! `tests/live_rdp.rs` integration proof, never the unit path.
 //!
 //! **Adaptive codec (E12-10):** [`link`] holds the protocol-neutral
 //! link-quality estimator + the hysteresis [`QualityTier`] ladder (a weak link
@@ -44,6 +45,8 @@
 pub use mde_egui::egui;
 
 pub mod config;
+#[cfg(feature = "live-connect")]
+pub mod connect;
 pub mod input;
 pub mod link;
 pub mod pixel;
@@ -51,6 +54,8 @@ pub mod session;
 pub mod tier;
 
 pub use config::{ConfigError, RdpConfig};
+#[cfg(feature = "live-connect")]
+pub use connect::{ConnectError, Negotiated, PumpOutcome, RdpConnection};
 pub use input::{map_event, map_text, scancode_for, MouseButton, RdpInputEvent, Scancode};
 pub use link::{
     LadderConfig, LinkEstimate, LinkEstimator, LinkGrade, LinkThresholds, QualityLadder,

@@ -22,8 +22,8 @@
 //! exactly as the live wire pump feeds it, and queued input is drained with
 //! [`RdpSession::take_input`]. The live connection sequence that fills the
 //! framebuffer from a real peer and flushes the queue onto the wire is layered on
-//! in [`crate::wire`] (gated, see that module) — it calls these same methods, so
-//! the tested path and the shipped path do not diverge.
+//! in `connect` (behind the `live-connect` feature) — it calls these same
+//! methods, so the tested path and the shipped path do not diverge.
 
 use crate::config::{ConfigError, RdpConfig};
 use crate::egui::{ColorImage, Event};

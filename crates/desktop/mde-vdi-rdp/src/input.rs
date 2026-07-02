@@ -5,8 +5,9 @@
 //! scancode**, and unicode text. It is `ironrdp`-free and fully unit-tested with
 //! synthetic events (governance §7). The thin adapter that turns an
 //! [`RdpInputEvent`] into an actual `ironrdp` input PDU is layered on top in
-//! [`crate::wire`]; keeping the egui→intent mapping pure here means the
-//! egui-facing surface is real and tested independent of the wire encoder.
+//! `connect` (behind the `live-connect` feature); keeping the egui→intent
+//! mapping pure here means the egui-facing surface is real and tested
+//! independent of the wire encoder.
 
 use crate::egui::{Event, Key, MouseWheelUnit, PointerButton, Vec2};
 

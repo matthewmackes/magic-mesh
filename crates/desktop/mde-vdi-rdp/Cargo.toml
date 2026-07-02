@@ -53,11 +53,17 @@ optional = true
 [dependencies.ironrdp-tls]
 version = "0.2"
 optional = true
+# rustls backend only — the workspace substrate lock (§3 / deny.toml) bans any
+# OpenSSL linkage; ironrdp-tls's `rustls` feature rides tokio-rustls.
+features = ["rustls"]
 
 [dependencies.tokio]
 version = "1"
 optional = true
-features = ["net", "rt", "io-util"]
+# `time` drives the pump/connect timeouts (a dead peer must surface as a typed
+# stall/timeout, not a hang); no `macros`/`rt-multi-thread` — the connect layer
+# owns one small current-thread runtime behind a blocking facade.
+features = ["net", "rt", "io-util", "time"]
 
 [lints]
 workspace = true
