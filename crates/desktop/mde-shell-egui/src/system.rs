@@ -33,8 +33,9 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
-use mde_egui::{field, muted_note, Style};
+use mde_egui::{field, muted_note, OsdKind, OsdLevel, Style};
 
+use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{
     Avail, Backlight, BtStatus, Connector, ConnectorStatus, DdcDisplay, DisplayLayout, DisplayMode,
     MixerStatus, MixerStrip, MonitorId, OutputArrangement, PowerCaps, PowerVerb, Probe, Seat,
@@ -49,6 +50,10 @@ const REFRESH: Duration = Duration::from_secs(5);
 
 /// A filled-circle status dot — the shared glyph the rest of the platform uses.
 const DOT: &str = "\u{25CF}";
+
+/// One volume/brightness hotkey press moves the level this many points (0–100).
+/// A coarse-but-responsive step — five taps span the range.
+const HOTKEY_STEP: i16 = 5;
 
 // ──────────────────────────── the System state ────────────────────────────
 
@@ -249,6 +254,208 @@ impl SystemState {
                 }
                 SysAction::VmPower { idx, boot } => instances.drive_power(idx, boot),
             }
+        }
+    }
+
+    // ── hotkey dispatch (E12-19) ────────────────────────────────────────────
+    //
+    // The shell's hotkey router (`crate::hotkeys`) turns a matched chord into a
+    // typed `HotkeyAction`; the *hardware* actions (volume / brightness / mute /
+    // Bluetooth / lock) act through the ONE seat here (lock 1), reusing the same
+    // control verbs the panel's sliders drive. Volume + brightness return an
+    // `OsdLevel` the shell flashes on the KIRON OSD tier (lock 11 / KIRON-3). The
+    // navigation actions (session/monitor switch, return-to-chrome, open-system)
+    // are the shell's to apply, not the seat's — this returns `None` for them.
+
+    /// Act on a hardware hotkey against the seat, returning the OSD level to flash
+    /// (volume / brightness) or `None`. A failed or unavailable backend folds to the
+    /// same honest inline error the panel controls use — never a panic, never a
+    /// silent no-op.
+    pub(crate) fn dispatch_hotkey(&mut self, action: HotkeyAction) -> Option<OsdLevel> {
+        match action {
+            HotkeyAction::VolumeUp => self.nudge_master_volume(HOTKEY_STEP),
+            HotkeyAction::VolumeDown => self.nudge_master_volume(-HOTKEY_STEP),
+            HotkeyAction::VolumeMute => self.toggle_master_mute(),
+            HotkeyAction::MicMute => self.toggle_mic_mute(),
+            HotkeyAction::BrightnessUp => self.nudge_brightness(HOTKEY_STEP),
+            HotkeyAction::BrightnessDown => self.nudge_brightness(-HOTKEY_STEP),
+            HotkeyAction::BluetoothToggle => {
+                self.toggle_bluetooth();
+                None
+            }
+            HotkeyAction::Lock => {
+                if let Err(e) = self.seat.power(PowerVerb::Lock) {
+                    self.error = Some(format!("Lock: {e}"));
+                } else {
+                    self.error = None;
+                }
+                None
+            }
+            // Navigation — the shell applies these (they don't touch hardware).
+            HotkeyAction::SessionSwitch
+            | HotkeyAction::MonitorFocusSwitch
+            | HotkeyAction::ReturnToChrome
+            | HotkeyAction::OpenSystem => None,
+        }
+    }
+
+    /// The cached master strip, if the mixer probe answered — the hotkeys' target.
+    fn master_strip(&self) -> Option<&MixerStrip> {
+        match self.snapshot.as_ref()?.mixer {
+            Probe::Present(ref m) => Some(&m.master),
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// Nudge the master output volume by `delta` (clamped 0–100), driving the seat
+    /// and updating the cached level so rapid taps accumulate before the next poll.
+    fn nudge_master_volume(&mut self, delta: i16) -> Option<OsdLevel> {
+        let (id, cur) = {
+            let m = self.master_strip()?;
+            (m.id.clone(), i16::from(m.volume))
+        };
+        let next = u8::try_from((cur + delta).clamp(0, 100)).unwrap_or(0);
+        match self.seat.set_strip_volume(&id, next) {
+            Ok(()) => {
+                self.error = None;
+                if let Some(m) = self.master_strip_mut() {
+                    m.volume = next;
+                }
+                Some(OsdLevel::new(OsdKind::Volume, f32::from(next) / 100.0))
+            }
+            Err(e) => {
+                self.error = Some(format!("volume: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Toggle the master output mute, driving the seat and updating the cache. The
+    /// OSD shows the muted glyph when it goes muted, the level bar when it comes back.
+    fn toggle_master_mute(&mut self) -> Option<OsdLevel> {
+        let (id, muted, vol) = {
+            let m = self.master_strip()?;
+            (m.id.clone(), m.muted, m.volume)
+        };
+        match self.seat.set_strip_muted(&id, !muted) {
+            Ok(()) => {
+                self.error = None;
+                if let Some(m) = self.master_strip_mut() {
+                    m.muted = !muted;
+                }
+                let kind = if muted {
+                    OsdKind::Volume
+                } else {
+                    OsdKind::Muted
+                };
+                Some(OsdLevel::new(kind, f32::from(vol) / 100.0))
+            }
+            Err(e) => {
+                self.error = Some(format!("mute: {e}"));
+                None
+            }
+        }
+    }
+
+    /// The mixer model is output-only (master + playback strips), so there is no
+    /// capture strip to mute — an honest not-available state, never a dead key.
+    fn toggle_mic_mute(&mut self) -> Option<OsdLevel> {
+        self.error = Some("Microphone mute: no capture strip on this seat.".to_owned());
+        None
+    }
+
+    /// Nudge display brightness by `delta`: the first sysfs backlight panel if
+    /// present, else the first DDC/CI monitor, else an honest not-controllable note.
+    /// The live 0–100 value tracks the same maps the sliders own, so a hotkey tap
+    /// and a slider drag stay in sync.
+    fn nudge_brightness(&mut self, delta: i16) -> Option<OsdLevel> {
+        // Prefer an internal panel (sysfs backlight).
+        if let Some((name, max, seed)) = self.first_backlight() {
+            let cur = i16::from(*self.panel_brightness.entry(name.clone()).or_insert(seed));
+            let next = u8::try_from((cur + delta).clamp(0, 100)).unwrap_or(0);
+            let raw = u32::from(next) * max / 100;
+            return match self.seat.set_backlight(&name, raw) {
+                Ok(()) => {
+                    self.error = None;
+                    self.panel_brightness.insert(name, next);
+                    Some(OsdLevel::new(OsdKind::Brightness, f32::from(next) / 100.0))
+                }
+                Err(e) => {
+                    self.error = Some(format!("brightness: {e}"));
+                    None
+                }
+            };
+        }
+        // Else an external monitor over DDC/CI.
+        if let Some((bus, seed)) = self.first_ddc() {
+            let cur = i16::from(*self.ddc_brightness.entry(bus.clone()).or_insert(seed));
+            let next = u8::try_from((cur + delta).clamp(0, 100)).unwrap_or(0);
+            return match self.seat.set_ddc_brightness(&bus, next) {
+                Ok(()) => {
+                    self.error = None;
+                    self.ddc_brightness.insert(bus, next);
+                    Some(OsdLevel::new(OsdKind::Brightness, f32::from(next) / 100.0))
+                }
+                Err(e) => {
+                    self.error = Some(format!("brightness (DDC): {e}"));
+                    None
+                }
+            };
+        }
+        self.error = Some("Brightness: not controllable (no backlight / DDC).".to_owned());
+        None
+    }
+
+    /// Toggle the first Bluetooth adapter's radio power, driving the seat + cache.
+    fn toggle_bluetooth(&mut self) {
+        let Some(snap) = self.snapshot.as_ref() else {
+            return;
+        };
+        let Probe::Present(bt) = &snap.bluetooth else {
+            self.error = Some("Bluetooth: no adapter.".to_owned());
+            return;
+        };
+        let Some(adapter) = bt.adapters.first() else {
+            self.error = Some("Bluetooth: no adapter.".to_owned());
+            return;
+        };
+        let (path, on) = (adapter.path.clone(), !adapter.powered);
+        match self.seat.set_bt_powered(&path, on) {
+            Ok(()) => {
+                self.error = None;
+                if let Some(Probe::Present(bt)) = self.snapshot.as_mut().map(|s| &mut s.bluetooth) {
+                    if let Some(a) = bt.adapters.iter_mut().find(|a| a.path == path) {
+                        a.powered = on;
+                    }
+                }
+            }
+            Err(e) => self.error = Some(format!("Bluetooth: {e}")),
+        }
+    }
+
+    /// Mutable view of the cached master strip (for the accumulate-in-place update).
+    fn master_strip_mut(&mut self) -> Option<&mut MixerStrip> {
+        match self.snapshot.as_mut()?.mixer {
+            Probe::Present(ref mut m) => Some(&mut m.master),
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// The first backlight panel's `(name, max, seed %)`, if the probe answered.
+    fn first_backlight(&self) -> Option<(String, u32, u8)> {
+        match self.snapshot.as_ref()?.backlights {
+            Probe::Present(ref panels) => {
+                panels.first().map(|p| (p.name.clone(), p.max, p.percent()))
+            }
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// The first DDC monitor's `(bus, seed %)`, if the probe answered.
+    fn first_ddc(&self) -> Option<(String, u8)> {
+        match self.snapshot.as_ref()?.ddc {
+            Probe::Present(ref list) => list.first().map(|d| (d.bus.clone(), d.brightness)),
+            Probe::Absent { .. } => None,
         }
     }
 }
@@ -870,6 +1077,31 @@ mod tests {
         assert!(is_internal("eDP-1"));
         assert!(is_internal("card0-eDP-1"));
         assert!(!is_internal("DP-1"));
+    }
+
+    #[test]
+    fn hotkey_dispatch_acts_on_a_headless_seat_without_panicking() {
+        // On the farm host every backend is Absent, so the hardware hotkeys have no
+        // target: they must fold to `None` (no OSD) or an honest inline error, never
+        // panic. The live OSD-returning path needs real PipeWire/backlight hardware
+        // (integration-gated); this proves the dispatch seam is total + reachable.
+        let ctx = egui::Context::default();
+        let mut st = SystemState::default();
+        st.poll(&ctx); // one real snapshot (all Absent on the farm)
+
+        // No mixer → no OSD, no panic.
+        assert!(st.dispatch_hotkey(HotkeyAction::VolumeUp).is_none());
+        assert!(st.dispatch_hotkey(HotkeyAction::VolumeMute).is_none());
+        // The mic key is honestly not-available (output-only mixer model).
+        assert!(st.dispatch_hotkey(HotkeyAction::MicMute).is_none());
+        assert!(st.error.as_deref().unwrap().contains("Microphone"));
+        // No backlight / DDC → the honest not-controllable note.
+        assert!(st.dispatch_hotkey(HotkeyAction::BrightnessDown).is_none());
+        assert!(st.error.as_deref().unwrap().contains("Brightness"));
+        // A navigation action never touches the seat (the shell applies it).
+        assert!(st.dispatch_hotkey(HotkeyAction::SessionSwitch).is_none());
+        // Lock reaches logind (Absent here → an error, never a real lock/panic).
+        assert!(st.dispatch_hotkey(HotkeyAction::Lock).is_none());
     }
 
     #[test]

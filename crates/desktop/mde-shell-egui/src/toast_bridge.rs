@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use mde_bus::persist::Persist;
 use mde_egui::egui;
-use mde_egui::{Severity, Tier, Toast, ToastHost};
+use mde_egui::{OsdLevel, Severity, Tier, Toast, ToastHost};
 use serde::Deserialize;
 
 use crate::dock::Surface;
@@ -277,6 +277,16 @@ impl ToastBridge {
         };
     }
 
+    /// Flash the center-bottom OSD level bar (volume / brightness), replacing any
+    /// current one in place. This is the emitter KIRON-2 left waiting on the OSD tier
+    /// (KIRON-3): the seat's volume/brightness hotkeys (E12-19) call it directly —
+    /// the OSD is an instant hardware-feedback channel, never the Bus alert lane
+    /// (lock 7). Because it is a direct in-shell call, DND / focus-mute suppression
+    /// never applies (that governs *alert* chyrons, not a level flash).
+    pub(crate) fn flash_osd(&mut self, level: OsdLevel) {
+        self.host.flash_osd(level);
+    }
+
     /// The per-frame drive: advance the countdowns by the real frame delta, drain
     /// any new `event/toast/show`, then paint the OSD tier + the lower-third chyron.
     /// Returns the navigation a clicked action verb resolved to, if any — the shell
@@ -514,6 +524,25 @@ mod tests {
         assert!(!dnd.hides_chyron(Severity::Critical));
         assert!(dnd.hushes_sound(Severity::Warning));
         assert!(!dnd.hushes_sound(Severity::Critical));
+    }
+
+    // ── the OSD emitter (KIRON-3 — the seat hotkeys flash it) ─────────────────
+
+    #[test]
+    fn flash_osd_lights_the_osd_channel_without_touching_the_alert_queue() {
+        use mde_egui::{OsdKind, OsdLevel};
+        let rec = Recorder::default();
+        let mut b = bridge_with(&rec);
+        // A pending Critical alert must be untouched by an OSD flash (separate tier).
+        b.admit(decode(&body("critical", "lh1", "intrusion")).unwrap());
+        b.flash_osd(OsdLevel::new(OsdKind::Volume, 0.4));
+        assert!(b.host.osd_active(), "the volume hotkey lit the OSD tier");
+        assert!(
+            b.host.has_critical(),
+            "the OSD flash left the alert queue alone"
+        );
+        // The OSD is a direct channel — it never rings the notification chime.
+        assert_eq!(*rec.0.borrow(), vec![Severity::Critical]);
     }
 
     // ── the drain wiring renders a real band (mount-tessellate, §7) ────────────

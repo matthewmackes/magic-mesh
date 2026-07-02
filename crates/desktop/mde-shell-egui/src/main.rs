@@ -21,6 +21,7 @@ mod controller;
 mod datacenter;
 mod discovery;
 mod dock;
+mod hotkeys;
 mod instances;
 mod network;
 mod notifications;
@@ -37,6 +38,7 @@ mod workbench;
 use mde_egui::eframe::CreationContext;
 use mde_egui::{eframe, egui, run_client, Motion, Style};
 
+use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
 
 use mde_files_egui::{files_panel, FileBrowser};
@@ -153,6 +155,11 @@ struct Shell {
     /// notification-sound seam. Driven every frame; its lower-third band + OSD
     /// float above whatever surface (or fullscreen guest) is in view.
     toasts: toast_bridge::ToastBridge,
+    /// The hotkey dispatcher (E12-19) — the fixed `mde_seat` table on the shell
+    /// input path (lock 8/9). Carries only the leader latch; each frame it folds the
+    /// seat's forwarded host keys (XF86 media + Super) and this frame's egui key
+    /// presses into typed actions the shell applies to the seat / nav.
+    hotkeys: hotkeys::HotkeyRouter,
 }
 
 impl Shell {
@@ -189,6 +196,41 @@ impl Shell {
             system: system::SystemState::default(),
             storage: storage::StorageState::default(),
             toasts: toast_bridge::ToastBridge::default(),
+            hotkeys: hotkeys::HotkeyRouter::default(),
+        }
+    }
+
+    /// Apply one dispatched hotkey action (E12-19). Hardware actions act on the ONE
+    /// seat through the System state (volume/brightness flash the KIRON OSD tier);
+    /// navigation actions move the shell itself — leaving a fullscreen guest is the
+    /// Esc-chord reservation generalized (lock 8).
+    fn apply_hotkey(&mut self, action: HotkeyAction) {
+        match action {
+            HotkeyAction::SessionSwitch | HotkeyAction::MonitorFocusSwitch => {
+                // Bring the guest session to the front. One desktop session exists
+                // today; cycling across multiple sessions / monitors is the gated
+                // multi-session broker (E12-4/E12-10), so this shows the Desktop
+                // surface rather than silently doing nothing.
+                self.nav.expanded = true;
+                self.nav.surface = Surface::Desktop;
+            }
+            HotkeyAction::ReturnToChrome => {
+                // Leave a fullscreen guest for the mesh-control chrome — release any
+                // VDI target and show the Workbench (a session is never a trap).
+                self.vdi.clear_target();
+                self.nav.expanded = true;
+                self.nav.surface = Surface::Workbench;
+            }
+            HotkeyAction::OpenSystem => {
+                self.nav.expanded = true;
+                self.nav.surface = Surface::System;
+            }
+            // Hardware — act on the seat; a volume/brightness change flashes the OSD.
+            hardware => {
+                if let Some(level) = self.system.dispatch_hotkey(hardware) {
+                    self.toasts.flash_osd(level);
+                }
+            }
         }
     }
 
@@ -434,6 +476,18 @@ impl Shell {
         // Keep painting while the transition is in flight.
         if t > 0.001 && t < 0.999 {
             ctx.request_repaint();
+        }
+
+        // E12-19 — hotkey dispatch (lock 8), driven each frame before the OSD paint
+        // so a volume/brightness flash lands this same frame. Drain the seat's
+        // forwarded host keys (XF86 media + the Super leader; empty on the windowed
+        // fallback, so the wiring self-gates to the real DRM seat) and this frame's
+        // egui key presses, route them through the fixed table, and apply each typed
+        // action to the seat / nav.
+        let host_keys = mde_egui::hostkeys::drain_host_keys();
+        let presses = ctx.input(|i| hotkeys::egui_key_presses(&i.events));
+        for action in self.hotkeys.dispatch(&host_keys, &presses) {
+            self.apply_hotkey(action);
         }
 
         // The KIRON chyron (KIRON-2) — driven last so its lower-third band + OSD
