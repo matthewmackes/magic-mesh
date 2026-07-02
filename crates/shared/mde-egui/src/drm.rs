@@ -41,8 +41,11 @@ use crate::display::{PanelInfo, PanelMode};
 use gbm::AsRaw;
 use input::event::keyboard::{KeyState, KeyboardEvent, KeyboardEventTrait};
 use input::event::pointer::{ButtonState, PointerEvent};
+use input::event::touch::{TouchEvent, TouchEventPosition, TouchEventSlot};
 use input::{Event as LiEvent, Libinput, LibinputInterface};
 use khronos_egl as egl;
+
+use crate::touch::{RawContact, TouchTransform, TouchTranslator};
 
 /// Why the bare-seat backend could not start / present. The shell treats any
 /// variant as "no usable seat here" and falls back to the windowed runner.
@@ -699,6 +702,15 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     let mut ctrl = false;
     let mut alt = false;
 
+    // SURFACE-8 (lock 13): the touchscreen shares this one input pipeline. The
+    // translator maps libinput's normalized multitouch contacts through the active
+    // mode + fractional scale + rotation into egui touch + synthesized-pointer events;
+    // rotation starts at None here (SURFACE-9 drives it live via `set_rotation`). The
+    // pure transform + translation are unit-tested in `crate::touch`; this is the live
+    // libinput read that only a real seat exercises (the farm compiles it, no
+    // touchscreen — the honest hardware gate).
+    let mut touch = TouchTranslator::new(TouchTransform::new(wp, hp, ppp));
+
     while !quit {
         // 1. drain libinput → egui events
         libinput
@@ -727,6 +739,55 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                         pressed: b.button_state() == ButtonState::Pressed,
                         modifiers: egui::Modifiers::default(),
                     });
+                }
+                // SURFACE-8 (lock 13): touchscreen contacts. libinput reports a
+                // per-contact slot + a position transformed into the *unrotated* panel
+                // pixel space (`x_transformed(wp)`); normalise it and let the shared
+                // translator apply the mode/scale/rotation transform + synthesize the
+                // single-touch pointer. Down/Motion carry a position; Up/Cancel do not
+                // (the translator reuses the contact's last position). Frame events
+                // (contact-set boundaries) don't map to an egui event.
+                LiEvent::Touch(te) => {
+                    // A device without slots reports None → fall back to the seat slot
+                    // so a single-touch panel still tracks one coherent contact.
+                    let slot_of = |s: Option<u32>, seat: u32| s.unwrap_or(seat);
+                    // Normalise a libinput panel-pixel coordinate to [0,1] for the
+                    // mode/scale/rotation transform. The casts are bounded (display
+                    // spans < ~16k px, the position lies within the panel), so the
+                    // f64→f32 / u32→f32 narrowing is exact here.
+                    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+                    let norm = |pos: f64, span: u32| (pos as f32 / span as f32).clamp(0.0, 1.0);
+                    let contact = match te {
+                        TouchEvent::Down(d) => Some(RawContact::Down {
+                            slot: slot_of(d.slot(), d.seat_slot()),
+                            u: norm(d.x_transformed(wp), wp),
+                            v: norm(d.y_transformed(hp), hp),
+                            force: None,
+                        }),
+                        TouchEvent::Motion(m) => Some(RawContact::Move {
+                            slot: slot_of(m.slot(), m.seat_slot()),
+                            u: norm(m.x_transformed(wp), wp),
+                            v: norm(m.y_transformed(hp), hp),
+                            force: None,
+                        }),
+                        TouchEvent::Up(u) => Some(RawContact::Up {
+                            slot: slot_of(u.slot(), u.seat_slot()),
+                        }),
+                        TouchEvent::Cancel(c) => Some(RawContact::Cancel {
+                            slot: slot_of(c.slot(), c.seat_slot()),
+                        }),
+                        _ => None,
+                    };
+                    if let Some(contact) = contact {
+                        // Keep the software cursor in step with a single-finger tap so
+                        // the drawn crosshair follows touch too.
+                        if let RawContact::Down { u, v, .. } | RawContact::Move { u, v, .. } =
+                            contact
+                        {
+                            pointer = touch.transform().to_points(u, v);
+                        }
+                        touch.feed(contact, &mut events);
+                    }
                 }
                 LiEvent::Keyboard(KeyboardEvent::Key(k)) => {
                     let pressed = k.key_state() == KeyState::Pressed;
