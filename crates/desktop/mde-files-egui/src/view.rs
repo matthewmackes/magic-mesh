@@ -372,7 +372,97 @@ mod tests {
     use crate::model::FileBrowser;
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
-    use mde_files::backend::DemoBackend;
+    use mde_files::backend::{
+        AuditEntry, Backend, BackendError, ConflictPolicy, Destination, MeshOverlayBadge, OpId,
+        SendMode,
+    };
+    use mde_files::model::{FileRow, Mime, Peer, PeerKind, PeerStatus, SelfNode};
+    use std::path::PathBuf;
+
+    /// A compact `#[cfg(test)]` backend double for the render tests: a small
+    /// peer roster + a curated per-peer listing, no live Bus. Replaced the
+    /// deleted `DemoBackend` mockup (§7). Exercises the full paint path — the
+    /// sidebar peer rows + status dots and each listing row through `format_row`.
+    struct RenderFixture {
+        peers: Vec<Peer>,
+        rows: Vec<FileRow>,
+    }
+
+    impl RenderFixture {
+        fn populated() -> Self {
+            Self {
+                peers: vec![
+                    Peer {
+                        id: "pine".into(),
+                        host: "pine.mesh".into(),
+                        label: "workstation".into(),
+                        kind: PeerKind::Desktop,
+                        addr: "10.0.0.14".into(),
+                        status: PeerStatus::Online,
+                        latency: Some(14),
+                        files: 0,
+                        shared: 0,
+                        last: "now".into(),
+                    },
+                    Peer {
+                        id: "cedar".into(),
+                        host: "cedar.mesh".into(),
+                        label: "build runner".into(),
+                        kind: PeerKind::Server,
+                        addr: String::new(),
+                        status: PeerStatus::Offline,
+                        latency: None,
+                        files: 0,
+                        shared: 0,
+                        last: "2 h".into(),
+                    },
+                ],
+                rows: vec![
+                    FileRow::local("design-notes.md", Mime::Doc, "8 KB", "4 min"),
+                    FileRow::local("screenshots/", Mime::Folder, "— · 122 items", "—"),
+                ],
+            }
+        }
+    }
+
+    impl Backend for RenderFixture {
+        fn self_node(&self) -> SelfNode {
+            SelfNode {
+                host: "fixture.mesh".into(),
+                ..SelfNode::default()
+            }
+        }
+        fn peers(&self) -> Vec<Peer> {
+            self.peers.clone()
+        }
+        fn list(&self, path: &str) -> Vec<FileRow> {
+            if let Some(id) = path.strip_prefix("peer:") {
+                if id == "pine" {
+                    return self.rows.clone();
+                }
+                return Vec::new();
+            }
+            self.rows.clone()
+        }
+        fn audit_log(&self) -> Vec<AuditEntry> {
+            Vec::new()
+        }
+        fn send_to(
+            &mut self,
+            _sources: &[PathBuf],
+            destination: Destination,
+            _mode: SendMode,
+            _conflict: ConflictPolicy,
+        ) -> Result<OpId, BackendError> {
+            Err(BackendError::DestinationUnreachable(destination))
+        }
+        fn rollback(&mut self, op_id: OpId) -> Result<OpId, BackendError> {
+            Err(BackendError::NotFound(op_id))
+        }
+        fn mesh_overlay(&self) -> Option<MeshOverlayBadge> {
+            None
+        }
+    }
 
     /// Drive one headless egui frame that renders [`files_panel`] into a real
     /// `CentralPanel`, then tessellate the result on the CPU so any paint-path
@@ -401,12 +491,12 @@ mod tests {
 
     #[test]
     fn files_panel_renders_the_populated_path() {
-        // DemoBackend ships a curated roster + a populated per-peer listing (no
-        // live Bus), so browsing a peer runs the FULL paint path: the top bar +
-        // Send button, every sidebar peer row + status dot, and each listing row
-        // through `format_row`. The same view the shell mounts, tessellated
-        // off-GPU.
-        let mut browser = FileBrowser::new(Box::new(DemoBackend::new()));
+        // The fixture backend carries a curated roster + a populated per-peer
+        // listing (no live Bus), so browsing a peer runs the FULL paint path: the
+        // top bar + Send button, every sidebar peer row + status dot, and each
+        // listing row through `format_row`. The same view the shell mounts,
+        // tessellated off-GPU.
+        let mut browser = FileBrowser::new(Box::new(RenderFixture::populated()));
         browser.open_peer("pine");
         assert!(!browser.rows().is_empty(), "fixture peer must be populated");
         render(&mut browser);
@@ -419,7 +509,7 @@ mod tests {
         // so `empty_state` paints its honest "No mesh connection" copy and the
         // sidebar its "Standalone" badge — proven runtime-reachable, not just
         // unit-asserted on the model.
-        let mut browser = FileBrowser::new(Box::new(DemoBackend::new()));
+        let mut browser = FileBrowser::new(Box::new(RenderFixture::populated()));
         browser.open_peer("ghost");
         assert!(browser.rows().is_empty());
         assert!(browser.mesh_overlay().is_none());

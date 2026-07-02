@@ -26,7 +26,7 @@
 pub mod backend;
 #[cfg(feature = "dbus")]
 pub mod bus_backend;
-pub mod demo_data;
+pub mod fileops;
 #[cfg(feature = "dbus")]
 pub mod mesh_backend;
 pub mod model;
@@ -39,6 +39,7 @@ pub mod send_to;
 // (`mde-files-egui::files_panel`) inside `mde-shell-egui`, reusing the
 // render-agnostic backend/model/send_to above. No `gui` feature remains.
 pub use backend::{
-    AuditEntry, Backend, BackendError, ConflictPolicy, DemoBackend, Destination, OpId, SendMode,
+    AuditEntry, Backend, BackendError, ConflictPolicy, Destination, LocalFsBackend, OpId, SendMode,
 };
+pub use fileops::{FakeFileOps, FileOps, FileStat, LiveFileOps};
 pub use model::{FileRow, Layout, Mime, Peer, PeerKind, PeerStatus, SelfNode, Tab, View};

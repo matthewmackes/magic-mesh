@@ -12,8 +12,8 @@
 //! the canonical [`SendToRequest`], and the send itself dispatches through
 //! [`Backend::send_to`] — the same surfaces the retired file-manager GUI rendered.
 //! In production the backend is `RealBackend` (local FS + the mesh Bus); tests
-//! drive the model with the shipped `DemoBackend`/`LocalFsBackend` and a small
-//! in-test double for the states only a live mesh produces.
+//! drive the model with the shipped `LocalFsBackend` and a small `#[cfg(test)]`
+//! fixture double for the roster/listing states only a live mesh produces.
 
 use std::path::PathBuf;
 
@@ -110,7 +110,7 @@ pub enum SendOutcome {
 /// The whole render-agnostic state of the Files surface.
 pub struct FileBrowser {
     /// The data + transfer surface. `RealBackend` in production; a shipped
-    /// `DemoBackend`/`LocalFsBackend` (or an in-test double) under test.
+    /// `LocalFsBackend` (or a `#[cfg(test)]` fixture) under test.
     backend: Box<dyn Backend>,
     /// Cached self-identity (sidebar header).
     self_node: SelfNode,
@@ -373,20 +373,24 @@ impl FileBrowser {
 mod tests {
     use super::*;
     use mde_files::backend::LocalFsBackend;
-    use mde_files::backend::{AuditEntry, ConflictPolicy, DemoBackend, SendMode};
+    use mde_files::backend::{AuditEntry, ConflictPolicy, SendMode};
     use mde_files::model::{Mime, PeerKind, PeerStatus};
+    use std::collections::HashMap;
 
     // ── In-test backend double ──────────────────────────────────────────────
     //
     // Production's `RealBackend` is the only shipped backend that exposes BOTH a
     // local listing with real file paths AND a peer roster at once — and it needs
     // a live mesh Bus, which a unit test has no business standing up. This double
-    // reproduces just that shape (a configurable roster + a path-bearing local
-    // listing) so the plan/guard/dispatch state machine can be exercised
-    // offline. It is `#[cfg(test)]` only — never shipped (§7).
+    // reproduces just that shape (a configurable roster, a path-bearing local
+    // listing, and per-peer virtual listings) so the plan/guard/dispatch state
+    // machine can be exercised offline. It is `#[cfg(test)]` only — never shipped
+    // (§7); it replaced the deleted `DemoBackend`/`demo_data.rs` mockup.
     struct FixtureBackend {
         peers: Vec<Peer>,
         rows: Vec<FileRow>,
+        /// Per-peer virtual listings, keyed by peer id (the `peer:<id>` route).
+        peer_rows: HashMap<String, Vec<FileRow>>,
         next_op: OpId,
         mesh: Option<MeshOverlayBadge>,
     }
@@ -396,9 +400,16 @@ mod tests {
             Self {
                 peers,
                 rows,
+                peer_rows: HashMap::new(),
                 next_op: 1,
                 mesh: None,
             }
+        }
+
+        /// Attach a curated listing for a peer's `peer:<id>` route.
+        fn with_peer(mut self, id: &str, rows: Vec<FileRow>) -> Self {
+            self.peer_rows.insert(id.to_string(), rows);
+            self
         }
 
         /// Give this fixture a live Nebula overlay, the way `RealBackend` reports
@@ -419,7 +430,12 @@ mod tests {
         fn peers(&self) -> Vec<Peer> {
             self.peers.clone()
         }
-        fn list(&self, _path: &str) -> Vec<FileRow> {
+        fn list(&self, path: &str) -> Vec<FileRow> {
+            // A `peer:<id>` route returns that peer's curated listing (empty for
+            // an unknown peer — no fabrication); anything else is the local list.
+            if let Some(id) = path.strip_prefix("peer:") {
+                return self.peer_rows.get(id).cloned().unwrap_or_default();
+            }
             self.rows.clone()
         }
         fn audit_log(&self) -> Vec<AuditEntry> {
@@ -474,6 +490,30 @@ mod tests {
         FileBrowser::new(Box::new(FixtureBackend::new(peers, rows)))
     }
 
+    /// A curated roster fixture reproducing the shape the deleted `DemoBackend`
+    /// mockup used to hand tests: pine+birch Online, oak Idle, cedar Offline
+    /// (→ 3 reachable), with virtual per-peer listings for pine and birch. The
+    /// peer rows are path-less (virtual), so they are never a Send-To source.
+    fn roster_fixture() -> FixtureBackend {
+        let peers = vec![
+            peer("pine", PeerStatus::Online),
+            peer("birch", PeerStatus::Online),
+            peer("oak", PeerStatus::Idle),
+            peer("cedar", PeerStatus::Offline),
+        ];
+        let pine = vec![
+            FileRow::local("design-notes.md", Mime::Doc, "8 KB", "4 min"),
+            FileRow::local("screenshots/", Mime::Folder, "— · 122 items", "—"),
+        ];
+        let birch = vec![
+            FileRow::local("media/", Mime::Folder, "— · 612 items", "—"),
+            FileRow::local("backups/", Mime::Folder, "— · 211 items", "—"),
+        ];
+        FixtureBackend::new(peers, Vec::new())
+            .with_peer("pine", pine)
+            .with_peer("birch", birch)
+    }
+
     // ── Pane → backend path ─────────────────────────────────────────────────
 
     #[test]
@@ -503,18 +543,18 @@ mod tests {
 
     #[test]
     fn open_peer_surfaces_the_backend_listing() {
-        // DemoBackend ships a curated per-peer listing; the model surfaces it
-        // verbatim through the same `list()` every consumer uses.
-        let mut b = FileBrowser::new(Box::new(DemoBackend::new()));
+        // The fixture backend carries a curated per-peer listing; the model
+        // surfaces it verbatim through the same `list()` every consumer uses.
+        let mut b = FileBrowser::new(Box::new(roster_fixture()));
         b.open_peer("pine");
         assert!(b.pane().is_peer());
-        assert_eq!(b.rows().len(), mde_files::demo_data::pine_files().len());
+        assert_eq!(b.rows().len(), 2);
         assert!(!b.rows().is_empty());
     }
 
     #[test]
     fn open_unknown_peer_is_an_honest_empty_listing() {
-        let mut b = FileBrowser::new(Box::new(DemoBackend::new()));
+        let mut b = FileBrowser::new(Box::new(roster_fixture()));
         b.open_peer("ghost");
         assert!(b.rows().is_empty(), "unknown peer must not fabricate rows");
         assert!(b.selected_row().is_none());
@@ -546,8 +586,8 @@ mod tests {
 
     #[test]
     fn reachable_destinations_excludes_offline_peers() {
-        // DemoBackend: pine+birch Online, oak Idle, cedar Offline → 3 reachable.
-        let b = FileBrowser::new(Box::new(DemoBackend::new()));
+        // Roster fixture: pine+birch Online, oak Idle, cedar Offline → 3 reachable.
+        let b = FileBrowser::new(Box::new(roster_fixture()));
         let reachable = b.reachable_destinations();
         assert_eq!(reachable.len(), 3);
         assert!(reachable.iter().all(|p| p.status.is_reachable()));
@@ -561,12 +601,14 @@ mod tests {
 
     #[test]
     fn mesh_overlay_is_none_without_a_live_mesh() {
-        // The demo/local/fixture backends have no Nebula source, so the model
+        // The local/fixture backends have no Nebula source, so the model
         // surfaces an honest `None` — the view draws a "standalone" state, never
         // a fabricated mesh badge.
-        assert!(FileBrowser::new(Box::new(DemoBackend::new()))
-            .mesh_overlay()
-            .is_none());
+        assert!(
+            FileBrowser::new(Box::new(FixtureBackend::new(Vec::new(), Vec::new())))
+                .mesh_overlay()
+                .is_none()
+        );
         assert!(fixture_browser().mesh_overlay().is_none());
     }
 
@@ -594,7 +636,7 @@ mod tests {
 
     #[test]
     fn selection_round_trips_and_ignores_out_of_range() {
-        let mut b = FileBrowser::new(Box::new(DemoBackend::new()));
+        let mut b = FileBrowser::new(Box::new(roster_fixture()));
         b.open_peer("pine");
         assert!(b.selected_row().is_none());
         b.select(0);
@@ -608,7 +650,7 @@ mod tests {
 
     #[test]
     fn navigation_drops_a_stale_selection() {
-        let mut b = FileBrowser::new(Box::new(DemoBackend::new()));
+        let mut b = FileBrowser::new(Box::new(roster_fixture()));
         b.open_peer("pine");
         b.select(0);
         assert!(b.selected().is_some());
@@ -650,9 +692,9 @@ mod tests {
 
     #[test]
     fn peer_rows_are_not_a_send_source() {
-        // DemoBackend peer rows are virtual (no path); even with a reachable
+        // The fixture's peer rows are virtual (no path); even with a reachable
         // destination chosen, the path guard blocks the send.
-        let mut b = FileBrowser::new(Box::new(DemoBackend::new()));
+        let mut b = FileBrowser::new(Box::new(roster_fixture()));
         b.open_peer("pine");
         b.select(0);
         b.set_destination("birch"); // reachable
@@ -664,9 +706,9 @@ mod tests {
 
     #[test]
     fn dispatch_drives_a_real_backend_and_returns_op_ids() {
-        // DemoBackend is a shipped backend: dispatching a real request records an
-        // audit row and returns an increasing op id.
-        let mut b = FileBrowser::new(Box::new(DemoBackend::new()));
+        // Dispatching a real request through a backend that accepts it returns an
+        // increasing op id (the fixture stands in for a live mesh backend here).
+        let mut b = FileBrowser::new(Box::new(FixtureBackend::new(Vec::new(), Vec::new())));
         let req = SendToRequest::copy_ask(
             vec![PathBuf::from("/tmp/x")],
             Destination::Peer("pine".into()),

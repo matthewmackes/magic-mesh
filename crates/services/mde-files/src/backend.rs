@@ -1,10 +1,9 @@
 //! Backend trait — the surface Artifact Manager renders against.
 //!
-//! Three concrete impls ship as of v4.0.1 AF-* (2026-05-23):
+//! Two concrete impls ship (the `demo_data.rs` mockup + its
+//! `DemoBackend` wrapper were deleted in FILEMGR-1, §7 no mockups —
+//! tests now drive real backends or `#[cfg(test)]` fixtures):
 //!
-//!   * [`DemoBackend`] — wraps `demo_data::*` so unit tests +
-//!     the "panel boots in 200 ms" smoke gate render the curated
-//!     dummy roster without any I/O.
 //!   * [`LocalFsBackend`] — real local filesystem reads
 //!     (`$HOME`, `$HOME/Downloads`, `$HOME/Documents`, …). Mesh
 //!     methods return empty / "this node" placeholders so the
@@ -155,11 +154,9 @@ impl std::error::Error for BackendError {}
 /// top of `App::view()` so individual view fns take one parameter
 /// instead of the seven they'd otherwise need.
 ///
-/// Added v4.0.1 AF-* (2026-05-23). Replaces the `crate::demo_data
-/// as data` direct reads that the prototype shipped — every UI
-/// fn now reads through this snapshot regardless of whether the
-/// underlying backend is `DemoBackend`, `LocalFsBackend`, or
-/// `RealBackend`.
+/// Added v4.0.1 AF-* (2026-05-23). Every UI fn reads through this
+/// snapshot regardless of whether the underlying backend is
+/// `LocalFsBackend` or `RealBackend`.
 #[derive(Debug, Clone, Default)]
 pub struct BackendSnapshot {
     pub self_node: SelfNode,
@@ -324,110 +321,6 @@ fn local_recent_from(home: &Option<std::ffi::OsString>) -> Vec<FileRow> {
     };
     let rows = LocalFsBackend::list_dir(Path::new(home));
     rows.into_iter().take(6).collect()
-}
-
-/// v2.0.0 Phase 2.2 — in-memory `Backend` impl wrapping the demo
-/// data. Used for headless tests + the panel-boot smoke gate.
-pub struct DemoBackend {
-    next_op_id: OpId,
-    audit: Vec<AuditEntry>,
-}
-
-impl Default for DemoBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl DemoBackend {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            next_op_id: 1,
-            audit: Vec::new(),
-        }
-    }
-
-    fn alloc_id(&mut self) -> OpId {
-        let id = self.next_op_id;
-        self.next_op_id += 1;
-        id
-    }
-}
-
-impl Backend for DemoBackend {
-    fn self_node(&self) -> SelfNode {
-        crate::demo_data::self_node()
-    }
-
-    fn peers(&self) -> Vec<Peer> {
-        crate::demo_data::peers()
-    }
-
-    fn list(&self, path: &str) -> Vec<FileRow> {
-        match path {
-            "" | "/" => crate::demo_data::inbox(),
-            "downloads" => crate::demo_data::downloads(),
-            "peer:pine" => crate::demo_data::pine_files(),
-            "peer:birch" => crate::demo_data::birch_files(),
-            "peer:oak" => crate::demo_data::oak_files(),
-            _ => Vec::new(),
-        }
-    }
-
-    fn audit_log(&self) -> Vec<AuditEntry> {
-        self.audit.iter().rev().cloned().collect()
-    }
-
-    fn send_to(
-        &mut self,
-        sources: &[PathBuf],
-        destination: Destination,
-        mode: SendMode,
-        _conflict: ConflictPolicy,
-    ) -> Result<OpId, BackendError> {
-        if sources.is_empty() {
-            return Err(BackendError::Rejected("empty source list".into()));
-        }
-        let id = self.alloc_id();
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let total_bytes: u64 = sources
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
-            .sum();
-        self.audit.push(AuditEntry {
-            op_id: id,
-            kind: "send_to",
-            source: sources[0].clone(),
-            destination,
-            mode,
-            bytes: total_bytes,
-            at_ms: now_ms,
-            ok: true,
-        });
-        Ok(id)
-    }
-
-    fn rollback(&mut self, op_id: OpId) -> Result<OpId, BackendError> {
-        let original = self.audit.iter().find(|a| a.op_id == op_id).cloned();
-        let Some(original) = original else {
-            return Err(BackendError::NotFound(op_id));
-        };
-        let id = self.alloc_id();
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        self.audit.push(AuditEntry {
-            op_id: id,
-            kind: "rollback",
-            source: original.source.clone(),
-            destination: original.destination.clone(),
-            mode: original.mode,
-            bytes: original.bytes,
-            at_ms: now_ms,
-            ok: true,
-        });
-        Ok(id)
-    }
 }
 
 /// v4.0.1 AF-* (2026-05-23) — real-filesystem `Backend` impl.
@@ -960,48 +853,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn demo_backend_returns_demo_self_node() {
-        let b = DemoBackend::new();
-        let self_node = b.self_node();
-        assert_eq!(self_node.host, "yew.mesh");
-    }
-
-    #[test]
-    fn demo_backend_peers_match_demo_data() {
-        let b = DemoBackend::new();
-        assert_eq!(b.peers().len(), crate::demo_data::peers().len());
-    }
-
-    #[test]
-    fn demo_backend_list_returns_inbox_for_empty_path() {
-        let b = DemoBackend::new();
-        let rows = b.list("");
-        assert_eq!(rows.len(), crate::demo_data::inbox().len());
-    }
-
-    #[test]
-    fn demo_backend_list_returns_per_peer_files() {
-        let b = DemoBackend::new();
-        assert!(!b.list("peer:pine").is_empty());
-        assert!(!b.list("peer:birch").is_empty());
-        assert!(!b.list("peer:oak").is_empty());
-    }
-
-    #[test]
-    fn demo_backend_list_returns_empty_for_unknown_path() {
-        let b = DemoBackend::new();
-        assert!(b.list("not-a-real-path").is_empty());
-    }
-
-    #[test]
-    fn demo_backend_audit_log_starts_empty() {
-        let b = DemoBackend::new();
-        assert!(b.audit_log().is_empty());
-    }
-
-    #[test]
     fn send_to_rejects_empty_source_list() {
-        let mut b = DemoBackend::new();
+        // The empty-source guard is common to every backend; exercise it on the
+        // shipped `LocalFsBackend` now that the `DemoBackend` mockup is gone.
+        let mut b = LocalFsBackend::new();
         let r = b.send_to(
             &[],
             Destination::Peer("pine".into()),
@@ -1012,53 +867,8 @@ mod tests {
     }
 
     #[test]
-    fn send_to_records_audit_row_and_returns_increasing_op_ids() {
-        let mut b = DemoBackend::new();
-        let id1 = b
-            .send_to(
-                &[PathBuf::from("/tmp/a")],
-                Destination::Peer("pine".into()),
-                SendMode::Copy,
-                ConflictPolicy::Ask,
-            )
-            .expect("send_to");
-        let id2 = b
-            .send_to(
-                &[PathBuf::from("/tmp/b")],
-                Destination::Peer("birch".into()),
-                SendMode::Move,
-                ConflictPolicy::Overwrite,
-            )
-            .expect("send_to");
-        assert_eq!(id1, 1);
-        assert_eq!(id2, 2);
-        let log = b.audit_log();
-        assert_eq!(log.len(), 2);
-        assert_eq!(log[0].op_id, id2);
-        assert_eq!(log[1].op_id, id1);
-    }
-
-    #[test]
-    fn rollback_records_rollback_audit_row() {
-        let mut b = DemoBackend::new();
-        let original = b
-            .send_to(
-                &[PathBuf::from("/tmp/x")],
-                Destination::Peer("oak".into()),
-                SendMode::Copy,
-                ConflictPolicy::Ask,
-            )
-            .expect("send_to");
-        let rb = b.rollback(original).expect("rollback");
-        assert_ne!(original, rb);
-        let log = b.audit_log();
-        assert_eq!(log[0].op_id, rb);
-        assert_eq!(log[0].kind, "rollback");
-    }
-
-    #[test]
     fn rollback_unknown_id_returns_not_found() {
-        let mut b = DemoBackend::new();
+        let mut b = LocalFsBackend::new();
         let r = b.rollback(999);
         assert!(matches!(r, Err(BackendError::NotFound(999))));
     }

@@ -1,18 +1,110 @@
 //! Phase 6.3 — Send-To matrix tests.
 //!
-//! Exercises every (destination × mode × conflict-policy) triple
-//! against `DemoBackend` and asserts the audit row that lands has
-//! the expected shape. Today's matrix size:
+//! Exercises every (destination × mode × conflict-policy) triple against a
+//! backend and asserts the audit row that lands has the expected shape.
+//! Today's matrix size:
 //!
 //!   4 Destination variants × 5 SendMode variants × 4 ConflictPolicy
 //!   = 80 triples.
 //!
-//! Each triple is one test invocation; failures point at the
-//! specific tuple that broke so regressions are diagnosable.
+//! FILEMGR-1 deleted the shipped `DemoBackend` mockup (§7 no mockups). This
+//! test now drives a `#[cfg(test)]` `RecordingBackend` defined right here — a
+//! legitimate in-test double (never shipped) that records one audit row per
+//! send and allocates increasing op ids, which is exactly the contract the
+//! matrix locks. Each triple is one assertion; failures point at the specific
+//! tuple that broke so regressions are diagnosable.
 
 use std::path::PathBuf;
 
-use mde_files::backend::{Backend, ConflictPolicy, DemoBackend, Destination, SendMode};
+use mde_files::backend::{
+    AuditEntry, Backend, BackendError, ConflictPolicy, Destination, OpId, SendMode,
+};
+use mde_files::model::{Peer, SelfNode};
+
+/// In-test `Backend` that records a send/rollback audit row per call and hands
+/// out monotonically increasing op ids. Reproduces just the send-audit contract
+/// the matrix asserts, with no filesystem or mesh — never shipped (§7).
+#[derive(Default)]
+struct RecordingBackend {
+    next_op_id: OpId,
+    audit: Vec<AuditEntry>,
+}
+
+impl RecordingBackend {
+    fn new() -> Self {
+        Self {
+            next_op_id: 1,
+            audit: Vec::new(),
+        }
+    }
+
+    fn alloc_id(&mut self) -> OpId {
+        let id = self.next_op_id;
+        self.next_op_id += 1;
+        id
+    }
+}
+
+impl Backend for RecordingBackend {
+    fn self_node(&self) -> SelfNode {
+        SelfNode::default()
+    }
+
+    fn peers(&self) -> Vec<Peer> {
+        Vec::new()
+    }
+
+    fn list(&self, _path: &str) -> Vec<mde_files::model::FileRow> {
+        Vec::new()
+    }
+
+    fn audit_log(&self) -> Vec<AuditEntry> {
+        self.audit.iter().rev().cloned().collect()
+    }
+
+    fn send_to(
+        &mut self,
+        sources: &[PathBuf],
+        destination: Destination,
+        mode: SendMode,
+        _conflict: ConflictPolicy,
+    ) -> Result<OpId, BackendError> {
+        if sources.is_empty() {
+            return Err(BackendError::Rejected("empty source list".into()));
+        }
+        let id = self.alloc_id();
+        self.audit.push(AuditEntry {
+            op_id: id,
+            kind: "send_to",
+            source: sources[0].clone(),
+            destination,
+            mode,
+            bytes: 0,
+            at_ms: 0,
+            ok: true,
+        });
+        Ok(id)
+    }
+
+    fn rollback(&mut self, op_id: OpId) -> Result<OpId, BackendError> {
+        let original = self.audit.iter().find(|a| a.op_id == op_id).cloned();
+        let Some(original) = original else {
+            return Err(BackendError::NotFound(op_id));
+        };
+        let id = self.alloc_id();
+        self.audit.push(AuditEntry {
+            op_id: id,
+            kind: "rollback",
+            source: original.source.clone(),
+            destination: original.destination.clone(),
+            mode: original.mode,
+            bytes: original.bytes,
+            at_ms: 0,
+            ok: true,
+        });
+        Ok(id)
+    }
+}
 
 fn destinations() -> Vec<Destination> {
     vec![
@@ -44,7 +136,7 @@ fn policies() -> Vec<ConflictPolicy> {
 
 #[test]
 fn every_send_to_triple_records_one_audit_row() {
-    let mut backend = DemoBackend::new();
+    let mut backend = RecordingBackend::new();
     let mut sent = 0;
     for d in destinations() {
         for m in modes() {
@@ -65,7 +157,7 @@ fn every_send_to_triple_records_one_audit_row() {
 
 #[test]
 fn audit_row_destination_matches_call() {
-    let mut backend = DemoBackend::new();
+    let mut backend = RecordingBackend::new();
     for d in destinations() {
         let id = backend
             .send_to(
@@ -86,7 +178,7 @@ fn audit_row_destination_matches_call() {
 
 #[test]
 fn audit_row_mode_matches_call() {
-    let mut backend = DemoBackend::new();
+    let mut backend = RecordingBackend::new();
     for m in modes() {
         let id = backend
             .send_to(
@@ -107,7 +199,7 @@ fn audit_row_mode_matches_call() {
 
 #[test]
 fn op_ids_are_unique_across_every_triple() {
-    let mut backend = DemoBackend::new();
+    let mut backend = RecordingBackend::new();
     let mut seen = std::collections::HashSet::new();
     for d in destinations() {
         for m in modes() {
@@ -125,7 +217,7 @@ fn op_ids_are_unique_across_every_triple() {
 #[test]
 fn rollback_round_trip_works_for_every_destination() {
     for d in destinations() {
-        let mut backend = DemoBackend::new();
+        let mut backend = RecordingBackend::new();
         let original = backend
             .send_to(
                 &[PathBuf::from("/tmp/r")],
