@@ -545,6 +545,13 @@ pub mod container;
 // per-op Bus progress, and the `state/storage/<node>` mirror + `action/storage/
 // <node>` verbs. Injectable UDisks2/executor/wall seams keep it headless-testable.
 pub mod storage;
+// E12-23 — filesystem depth: the typed fs-tooling verb layer under the storage
+// executor's format/label/resize/LUKS/subvolume verbs. The honest per-fs capability
+// matrix (lock 6), the pure shrink/move choreography state machine (lock 4), and the
+// injectable FsToolRunner (production LiveFsTools shells mkfs.*/resize2fs/xfs_growfs/
+// btrfs/ntfsresize/cryptsetup/parted; absent tool → typed Unavailable). No raw shell
+// in the executor (§9); the whole matrix + mid-failure choreography fold headless.
+pub mod fs_tools;
 // E12-22 — virtual disks first-class: KVM images (qemu-img) + Podman storage as
 // citizens of the Storage plane's staged op queue, beside the physical StorageOp
 // queue. A parallel VirtualStorageOp pipeline (create/resize/snapshot/revert/convert/

@@ -695,6 +695,36 @@ upower = "*"
 ddcutil = "*"
 i2c-tools = "*"
 
+# E12-23 (Storage plane filesystem depth, docs/design/workbench-storage-plane.md
+# lock 6) — the Storage worker's UDisks2 executor + fs-tooling verb layer
+# (workers/fs_tools.rs) shells these to actually format/label/resize/encrypt on a
+# shipped node; without them a locked format renders an honest FsToolError::
+# Unavailable instead of working. Hard-Require the whole matrix (all universal +
+# small, in the base Fedora repos):
+#   · udisks2       — the D-Bus block-topology backend the worker enumerates over.
+#   · e2fsprogs     — ext4 mkfs/e2label/e2fsck/resize2fs (grow online, shrink offline).
+#   · xfsprogs      — xfs mkfs.xfs/xfs_admin/xfs_growfs (grow-only; shrink honestly
+#                     unsupported).
+#   · btrfs-progs   — btrfs mkfs/label/resize + subvolume list/create/delete/snapshot.
+#   · exfatprogs    — exfat mkfs.exfat/exfatlabel/fsck.exfat.
+#   · dosfstools    — vfat mkfs.vfat/fatlabel/fsck.vfat (the vfat leg of lock 6).
+#   · ntfs-3g + ntfsprogs — ntfs mkfs.ntfs/ntfslabel/ntfsresize/ntfsfix.
+#   · cryptsetup    — LUKS create/open/close + format-inside-LUKS (one staged op).
+#   · parted        — the partition-geometry step of the shrink/move choreography.
+#   · qemu-img      — the E12-22 virtual-disk lifecycle (create/resize/snapshot/
+#                     convert/clone); provided by the qemu-img package.
+udisks2 = "*"
+e2fsprogs = "*"
+xfsprogs = "*"
+btrfs-progs = "*"
+exfatprogs = "*"
+dosfstools = "*"
+ntfs-3g = "*"
+ntfsprogs = "*"
+cryptsetup = "*"
+parted = "*"
+qemu-img = "*"
+
 # EFF-42 — ansible-core is a WEAK dep (Recommends): only the Server-tier
 # ansible_pull/job_exec workers shell to it, and they degrade gracefully
 # (spawn failure → recoverable error + back-off) when it's absent. A
@@ -892,6 +922,20 @@ assets = [
 nebula = "*"
 nmap = "*"
 alsa-lib = "*"
+# E12-23 — the storage worker is universal (any node has disks), and a Server
+# hosts compute, so the headless variant carries the same fs-tooling matrix as the
+# base (lock 6). See the base requires block for the per-tool rationale.
+udisks2 = "*"
+e2fsprogs = "*"
+xfsprogs = "*"
+btrfs-progs = "*"
+exfatprogs = "*"
+dosfstools = "*"
+ntfs-3g = "*"
+ntfsprogs = "*"
+cryptsetup = "*"
+parted = "*"
+qemu-img = "*"
 
 # XPA-6 — the headless variant's weak deps: the Server-tier shell-outs only.
 # Dropped vs the base: the desktop-only cosmic-disks, the voice binaries

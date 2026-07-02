@@ -64,6 +64,9 @@ use thiserror::Error;
 
 use crate::workers::proc::{output_with_timeout, DEFAULT_CMD_TIMEOUT};
 
+use super::fs_tools::{
+    self, CapabilityRefusal, FsToolRunner, LiveFsTools, ResizeDirection, ResizeTarget,
+};
 use super::{ShutdownToken, Worker};
 
 // ───────────────────────────── topics ─────────────────────────────
@@ -168,6 +171,26 @@ impl Filesystem {
             Self::Luks => "luks",
         }
     }
+
+    /// Parse the filesystem id `UDisks`/`blkid` reports (`Block.IdType`) into the
+    /// typed [`Filesystem`], so a resize/subvolume op can resolve the target's
+    /// current fs from the live topology. `None` for an id the plane doesn't manage
+    /// (the caller treats that as "unknown filesystem" — a data-loss-safe refusal,
+    /// never a guess).
+    #[must_use]
+    pub fn from_id(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ext2" | "ext3" | "ext4" => Some(Self::Ext4),
+            "xfs" => Some(Self::Xfs),
+            "vfat" | "fat" | "fat16" | "fat32" | "msdos" => Some(Self::Vfat),
+            "exfat" => Some(Self::Exfat),
+            "btrfs" => Some(Self::Btrfs),
+            "ntfs" => Some(Self::Ntfs),
+            "swap" | "swsuspend" => Some(Self::Swap),
+            "crypto_luks" | "luks" => Some(Self::Luks),
+            _ => None,
+        }
+    }
 }
 
 /// One typed storage operation — the queue element (lock 5, `GParted` parity). Sizes
@@ -263,6 +286,69 @@ pub enum StorageOp {
         /// The new start offset (MiB from the disk head).
         new_start_mib: u64,
     },
+    /// LUKS-format a partition into an encrypted container, optionally opening it and
+    /// making an inner filesystem — **one staged op** (lock 6). The keyfile is a
+    /// path the operator provisioned; an interactive passphrase is never carried on
+    /// the Bus (the executor integration-gates a keyless format).
+    LuksFormat {
+        /// The partition device to encrypt.
+        partition: String,
+        /// The mapper name to open the container as (for the inner-fs step).
+        mapper_name: String,
+        /// The inner filesystem to create inside the opened container, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inner_filesystem: Option<Filesystem>,
+        /// The keyfile path (provisioned out-of-band — never the passphrase itself).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keyfile: Option<PathBuf>,
+        /// Optional label for the inner filesystem.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// Unlock (open) an existing LUKS partition as `/dev/mapper/<mapper_name>`.
+    LuksOpen {
+        /// The LUKS partition device.
+        partition: String,
+        /// The mapper name to open as.
+        mapper_name: String,
+        /// The keyfile path (never the passphrase).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keyfile: Option<PathBuf>,
+    },
+    /// Lock (close) an open LUKS container. Carries its backing `partition` so the
+    /// wall + arming resolve the whole disk uniformly.
+    LuksClose {
+        /// The LUKS partition device backing the mapper.
+        partition: String,
+        /// The open mapper name to close.
+        mapper_name: String,
+    },
+    /// Create a btrfs subvolume under the partition's mount point (lock 6).
+    SubvolumeCreate {
+        /// The (mounted) btrfs partition.
+        partition: String,
+        /// The subvolume name (relative to the mount point).
+        name: String,
+    },
+    /// Delete a btrfs subvolume.
+    SubvolumeDelete {
+        /// The (mounted) btrfs partition.
+        partition: String,
+        /// The subvolume name to delete.
+        name: String,
+    },
+    /// Snapshot a btrfs subvolume (`readonly` ⇒ a `-r` snapshot).
+    SubvolumeSnapshot {
+        /// The (mounted) btrfs partition.
+        partition: String,
+        /// The source subvolume name.
+        source: String,
+        /// The destination snapshot name.
+        dest: String,
+        /// Whether the snapshot is read-only.
+        #[serde(default)]
+        readonly: bool,
+    },
 }
 
 impl StorageOp {
@@ -290,7 +376,13 @@ impl StorageOp {
             | Self::Unmount { partition }
             | Self::Grow { partition, .. }
             | Self::Shrink { partition, .. }
-            | Self::Move { partition, .. } => Some(partition.as_str()),
+            | Self::Move { partition, .. }
+            | Self::LuksFormat { partition, .. }
+            | Self::LuksOpen { partition, .. }
+            | Self::LuksClose { partition, .. }
+            | Self::SubvolumeCreate { partition, .. }
+            | Self::SubvolumeDelete { partition, .. }
+            | Self::SubvolumeSnapshot { partition, .. } => Some(partition.as_str()),
             Self::CreateTable { .. } | Self::CreatePartition { .. } => None,
         }
     }
@@ -324,6 +416,12 @@ impl StorageOp {
             Self::Grow { .. } => "grow",
             Self::Shrink { .. } => "shrink",
             Self::Move { .. } => "move",
+            Self::LuksFormat { .. } => "luks_format",
+            Self::LuksOpen { .. } => "luks_open",
+            Self::LuksClose { .. } => "luks_close",
+            Self::SubvolumeCreate { .. } => "subvolume_create",
+            Self::SubvolumeDelete { .. } => "subvolume_delete",
+            Self::SubvolumeSnapshot { .. } => "subvolume_snapshot",
         }
     }
 }
@@ -527,6 +625,17 @@ pub enum OpInvalid {
         /// The partition.
         partition: String,
     },
+    /// An op that needs a specific filesystem (a subvolume op needs btrfs) on a
+    /// partition carrying a different one.
+    #[error("partition {partition} is {found}, not {need} — op needs {need}")]
+    WrongFilesystem {
+        /// The partition.
+        partition: String,
+        /// The filesystem the op requires.
+        need: String,
+        /// The filesystem the partition actually carries.
+        found: String,
+    },
     /// A resize whose target size doesn't move in the requested direction, or is
     /// otherwise out of range.
     #[error("partition {partition}: invalid resize to {new_size_mib} MiB (current {current_mib})")]
@@ -583,14 +692,22 @@ pub fn validate_op(op: &StorageOp, topo: &Topology) -> Result<(), OpInvalid> {
             }
             Ok(())
         }
+        // Destructive/relocating ops (+ a LUKS-format, which erases contents) must be
+        // unmounted.
         StorageOp::DeletePartition { partition }
         | StorageOp::Format { partition, .. }
-        | StorageOp::Move { partition, .. } => {
+        | StorageOp::Move { partition, .. }
+        | StorageOp::LuksFormat { partition, .. } => {
             let p = require_partition(topo, partition)?;
             require_unmounted(p)?;
             Ok(())
         }
-        StorageOp::SetLabel { partition, .. } | StorageOp::SetFlags { partition, .. } => {
+        // Ops that only need the partition to exist (label/flags + LUKS open/close,
+        // which address the container itself with no mount precondition).
+        StorageOp::SetLabel { partition, .. }
+        | StorageOp::SetFlags { partition, .. }
+        | StorageOp::LuksOpen { partition, .. }
+        | StorageOp::LuksClose { partition, .. } => {
             require_partition(topo, partition)?;
             Ok(())
         }
@@ -616,45 +733,80 @@ pub fn validate_op(op: &StorageOp, topo: &Topology) -> Result<(), OpInvalid> {
         StorageOp::Grow {
             partition,
             new_size_mib,
-        } => {
-            let p = require_partition(topo, partition)?;
-            if *new_size_mib <= p.size_mib {
-                return Err(OpInvalid::InvalidResize {
-                    partition: partition.clone(),
-                    new_size_mib: *new_size_mib,
-                    current_mib: p.size_mib,
-                });
-            }
-            // Growth must fit the disk's free space beyond the partition.
-            if let Some(disk) = topo.parent_disk_of(partition) {
-                let grow_by = new_size_mib - p.size_mib;
-                if grow_by > disk.free_mib() {
-                    return Err(OpInvalid::NotEnoughSpace {
-                        device: disk.name.clone(),
-                        need_mib: grow_by,
-                        free_mib: disk.free_mib(),
-                    });
-                }
-            }
-            Ok(())
-        }
+        } => validate_grow(topo, partition, *new_size_mib),
         StorageOp::Shrink {
             partition,
             new_size_mib,
-        } => {
-            let p = require_partition(topo, partition)?;
-            // Shrink is offline (lock 4 choreography): must be unmounted, and the
-            // target must be strictly smaller than the current size but non-zero.
-            require_unmounted(p)?;
-            if *new_size_mib == 0 || *new_size_mib >= p.size_mib {
-                return Err(OpInvalid::InvalidResize {
-                    partition: partition.clone(),
-                    new_size_mib: *new_size_mib,
-                    current_mib: p.size_mib,
-                });
-            }
-            Ok(())
+        } => validate_shrink(topo, partition, *new_size_mib),
+        // Subvolume ops need a mounted btrfs (the tool operates on the mount point).
+        StorageOp::SubvolumeCreate { partition, .. }
+        | StorageOp::SubvolumeDelete { partition, .. }
+        | StorageOp::SubvolumeSnapshot { partition, .. } => validate_subvolume(topo, partition),
+    }
+}
+
+/// Validate a `Grow`: the target must move up and fit the disk's free space.
+fn validate_grow(topo: &Topology, partition: &str, new_size_mib: u64) -> Result<(), OpInvalid> {
+    let p = require_partition(topo, partition)?;
+    if new_size_mib <= p.size_mib {
+        return Err(OpInvalid::InvalidResize {
+            partition: partition.to_string(),
+            new_size_mib,
+            current_mib: p.size_mib,
+        });
+    }
+    if let Some(disk) = topo.parent_disk_of(partition) {
+        let grow_by = new_size_mib - p.size_mib;
+        if grow_by > disk.free_mib() {
+            return Err(OpInvalid::NotEnoughSpace {
+                device: disk.name.clone(),
+                need_mib: grow_by,
+                free_mib: disk.free_mib(),
+            });
         }
+    }
+    Ok(())
+}
+
+/// Validate a `Shrink`: offline (lock 4 choreography) — must be unmounted and the
+/// target strictly smaller than the current size but non-zero.
+fn validate_shrink(topo: &Topology, partition: &str, new_size_mib: u64) -> Result<(), OpInvalid> {
+    let p = require_partition(topo, partition)?;
+    require_unmounted(p)?;
+    if new_size_mib == 0 || new_size_mib >= p.size_mib {
+        return Err(OpInvalid::InvalidResize {
+            partition: partition.to_string(),
+            new_size_mib,
+            current_mib: p.size_mib,
+        });
+    }
+    Ok(())
+}
+
+/// Validate a btrfs subvolume op: the partition must be a mounted btrfs.
+fn validate_subvolume(topo: &Topology, partition: &str) -> Result<(), OpInvalid> {
+    let p = require_partition(topo, partition)?;
+    require_btrfs(p)?;
+    if p.mountpoint.is_none() {
+        return Err(OpInvalid::NotMounted {
+            partition: partition.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Require that a partition carries a btrfs filesystem (subvolume ops) — a typed
+/// [`OpInvalid::WrongFilesystem`] otherwise (never a guess).
+fn require_btrfs(p: &Partition) -> Result<(), OpInvalid> {
+    let found = p.filesystem.as_deref().unwrap_or("unknown");
+    if Filesystem::from_id(found) == Some(Filesystem::Btrfs) {
+        Ok(())
+    } else {
+        Err(OpInvalid::WrongFilesystem {
+            partition: p.name.clone(),
+            need: "btrfs".to_string(),
+            found: found.to_string(),
+        })
     }
 }
 
@@ -1314,47 +1466,350 @@ pub trait UDisks2Client: Send + Sync {
     async fn enumerate(&self) -> Result<Topology, StorageError>;
 }
 
-/// Apply one [`StorageOp`] against the live backend.
+/// The resolved-from-topology context an op needs to execute.
 ///
-/// Production [`UDisks2Executor`]'s live parted/udisks2 verb wiring is the E12-23 slice, so
-/// it returns [`StorageError::IntegrationGated`] today; tests inject a recording fake that
-/// mutates an in-memory topology.
+/// The target's live filesystem, its current size, its parent-disk identity and its
+/// mount point (lock 4 choreography + lock 6 per-fs tooling). Built by
+/// [`resolve_context`] from the live topology (which the executor itself doesn't see).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpContext {
+    /// The filesystem the target partition carries (Format carries its own; a
+    /// resize/subvolume op resolves it from the live topology). `None` ⇒ unknown.
+    pub filesystem: Option<Filesystem>,
+    /// The target partition's current size (MiB) — the resize choreography anchor.
+    pub current_size_mib: u64,
+    /// The target partition's start offset (MiB from the disk head).
+    pub start_mib: u64,
+    /// The parent whole disk (`/dev/sdb`) — the parted geometry target.
+    pub disk: Option<String>,
+    /// The 1-based partition number (parted geometry).
+    pub number: u32,
+    /// The mount point, when mounted (online resize + subvolume tools).
+    pub mountpoint: Option<String>,
+}
+
+/// Resolve the [`OpContext`] for `op` from the live topology. Pure.
+///
+/// For a `Format`/`LuksFormat`, the filesystem is the op's own target; for a
+/// resize/subvolume op it's the target partition's *current* fs (parsed from the
+/// `UDisks` id via [`Filesystem::from_id`]).
+#[must_use]
+pub fn resolve_context(op: &StorageOp, live: &Topology) -> OpContext {
+    let mut ctx = OpContext::default();
+    if let StorageOp::Format { filesystem, .. } = op {
+        ctx.filesystem = Some(*filesystem);
+    }
+    let Some(part_name) = op.partition() else {
+        return ctx;
+    };
+    if let Some(disk) = live.parent_disk_of(part_name) {
+        ctx.disk = Some(disk.name.clone());
+    }
+    if let Some(p) = live.partition(part_name) {
+        ctx.current_size_mib = p.size_mib;
+        ctx.start_mib = p.start_mib;
+        ctx.number = p.number;
+        ctx.mountpoint.clone_from(&p.mountpoint);
+        // For a non-Format op the fs is the partition's current one.
+        if ctx.filesystem.is_none() {
+            ctx.filesystem = p.filesystem.as_deref().and_then(Filesystem::from_id);
+        }
+    }
+    ctx
+}
+
+/// The capability pre-check (lock 6): whether the target filesystem honestly
+/// supports a resize op in the requested direction.
+///
+/// Run BEFORE the executor so an unsupported resize (xfs/exfat/swap shrink,
+/// exfat/swap grow) becomes a typed [`OpStatus::Unsupported`] halt — never a silent
+/// no-op. `Ok(())` for every non-resize op. Pure.
+///
+/// # Errors
+/// A [`CapabilityRefusal`] naming the honest reason.
+pub fn capability_check(op: &StorageOp, ctx: &OpContext) -> Result<(), CapabilityRefusal> {
+    let (direction, partition) = match op {
+        StorageOp::Grow { partition, .. } => (ResizeDirection::Grow, partition),
+        StorageOp::Shrink { partition, .. } => (ResizeDirection::Shrink, partition),
+        _ => return Ok(()),
+    };
+    let operation = op.kind();
+    let Some(fs) = ctx.filesystem else {
+        return Err(CapabilityRefusal::UnknownFilesystem {
+            partition: partition.clone(),
+            operation,
+        });
+    };
+    let support = match direction {
+        ResizeDirection::Grow => fs.capabilities().grow,
+        ResizeDirection::Shrink => fs.capabilities().shrink,
+    };
+    if support.is_supported() {
+        Ok(())
+    } else {
+        Err(match direction {
+            ResizeDirection::Grow => CapabilityRefusal::GrowUnsupported { fs },
+            ResizeDirection::Shrink => CapabilityRefusal::ShrinkUnsupported { fs },
+        })
+    }
+}
+
+/// Apply one [`StorageOp`] against the live backend, given its resolved
+/// [`OpContext`].
+///
+/// Production [`UDisks2Executor`] drives the per-fs tooling (lock 6) + the shrink/move
+/// choreography (lock 4) through the typed [`FsToolRunner`] verb layer (§9 — no raw
+/// shell). Tests inject a recording fake that mutates an in-memory topology.
 pub trait StorageExecutor: Send + Sync {
-    /// Execute `op` (the queue is already validated + walled by the caller).
+    /// Execute `op` (the queue is already validated, walled + capability-checked by
+    /// the caller). `ctx` carries the live-topology facts the executor needs.
     ///
     /// # Errors
     /// [`StorageError::OpFailed`] / [`StorageError::IntegrationGated`].
-    fn apply(&self, op: &StorageOp) -> Result<(), StorageError>;
+    fn apply(&self, op: &StorageOp, ctx: &OpContext) -> Result<(), StorageError>;
 }
 
-/// Production [`StorageExecutor`].
+/// Production [`StorageExecutor`]: the per-fs tooling + shrink/move choreography over
+/// the injectable [`FsToolRunner`] (production [`LiveFsTools`] shells the real tools).
 ///
-/// The typed op model + queue engine + walls are live now; the privileged parted/udisks2
-/// execution (with the lock-4 shrink/move choreography + the lock-6 per-fs tooling) is the
-/// E12-23 slice, so each op returns a typed [`StorageError::IntegrationGated`] naming
-/// exactly what the live call needs — never a fake success (§7). Mirrors
-/// `session_roaming`'s `MeshLayoutStore` gating precedent.
-#[derive(Debug, Clone, Default)]
-pub struct UDisks2Executor;
+/// The **filesystem depth** (format/label/resize/LUKS/subvolume) is live now; the
+/// **partition-table geometry** ops (create/delete a table or partition, set flags,
+/// mount/unmount, move) remain UDisks2/parted work outside this fs-depth slice, so
+/// they answer a typed [`StorageError::IntegrationGated`] naming what's needed — never
+/// a fake success (§7). On the headless build host the tools themselves are absent, so
+/// even the wired ops answer a typed `FsToolError::Unavailable`, honestly.
+#[derive(Clone)]
+pub struct UDisks2Executor {
+    tools: Arc<dyn FsToolRunner>,
+}
+
+impl Default for UDisks2Executor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl UDisks2Executor {
-    /// The production executor.
+    /// The production executor over the live fs tooling.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self {
+            tools: Arc::new(LiveFsTools::new()),
+        }
+    }
+
+    /// Inject the fs-tool runner (tests).
+    #[must_use]
+    pub fn with_tools(tools: Arc<dyn FsToolRunner>) -> Self {
+        Self { tools }
+    }
+
+    /// A parted geometry op this fs-depth slice doesn't wire — a typed honest gate.
+    fn gated_geometry(op: &StorageOp) -> StorageError {
+        StorageError::IntegrationGated(format!(
+            "{} → partition-table geometry (create/delete table+partition, flags, \
+             mount/unmount, move) is UDisks2/parted work outside the E12-23 fs-depth \
+             slice; the filesystem/LUKS/subvolume verbs + the shrink/move \
+             choreography are live",
+            op.kind()
+        ))
+    }
+
+    /// Run a resize choreography (lock 4) through the tool runner, mapping a
+    /// mid-plan failure to a typed op error (never a silent partial).
+    fn run_resize(
+        &self,
+        op: &StorageOp,
+        ctx: &OpContext,
+        new_size_mib: u64,
+        direction: ResizeDirection,
+    ) -> Result<(), StorageError> {
+        let (fs, disk, partition) = self.resize_facts(op, ctx)?;
+        let target = ResizeTarget {
+            partition: PathBuf::from(partition),
+            disk: PathBuf::from(disk),
+            number: ctx.number,
+            start_mib: ctx.start_mib,
+            fs,
+            mountpoint: ctx.mountpoint.clone(),
+        };
+        let plan = fs_tools::resize_plan(&target, new_size_mib, direction).map_err(|e| {
+            StorageError::OpFailed {
+                op: op.kind(),
+                reason: e.to_string(),
+            }
+        })?;
+        let outcome = fs_tools::run_plan(&plan, &*self.tools, |_, _| {});
+        outcome.failure_summary(&plan).map_or(Ok(()), |reason| {
+            Err(StorageError::OpFailed {
+                op: op.kind(),
+                reason,
+            })
+        })
+    }
+
+    /// The (filesystem, disk, partition) a resize needs, or a typed error when the
+    /// live topology couldn't resolve them.
+    fn resize_facts<'a>(
+        &self,
+        op: &'a StorageOp,
+        ctx: &'a OpContext,
+    ) -> Result<(Filesystem, &'a str, &'a str), StorageError> {
+        let _ = self;
+        let partition = op.partition().ok_or_else(|| StorageError::OpFailed {
+            op: op.kind(),
+            reason: "resize op has no partition".into(),
+        })?;
+        let fs = ctx.filesystem.ok_or_else(|| StorageError::OpFailed {
+            op: op.kind(),
+            reason: format!("cannot resize {partition}: filesystem unknown"),
+        })?;
+        let disk = ctx.disk.as_deref().ok_or_else(|| StorageError::OpFailed {
+            op: op.kind(),
+            reason: format!("cannot resize {partition}: parent disk unresolved"),
+        })?;
+        Ok((fs, disk, partition))
     }
 }
 
 impl StorageExecutor for UDisks2Executor {
-    fn apply(&self, op: &StorageOp) -> Result<(), StorageError> {
+    fn apply(&self, op: &StorageOp, ctx: &OpContext) -> Result<(), StorageError> {
+        let mkfs_err = |op: &StorageOp, e: fs_tools::FsToolError| StorageError::OpFailed {
+            op: op.kind(),
+            reason: e.to_string(),
+        };
+        match op {
+            // ── lock 6: per-fs format/label ──
+            StorageOp::Format {
+                partition,
+                filesystem,
+                label,
+            } => {
+                if matches!(filesystem, Filesystem::Luks) {
+                    // A bare LUKS format with no inner fs still needs a keyfile — the
+                    // executor gates a keyless one (no passphrase on the Bus).
+                    return self
+                        .tools
+                        .luks_format(Path::new(partition), None)
+                        .map_err(|e| mkfs_err(op, e));
+                }
+                self.tools
+                    .mkfs(*filesystem, Path::new(partition), label.as_deref())
+                    .map_err(|e| mkfs_err(op, e))
+            }
+            StorageOp::SetLabel { partition, label } => {
+                let fs = ctx.filesystem.ok_or_else(|| StorageError::OpFailed {
+                    op: op.kind(),
+                    reason: format!("cannot label {partition}: filesystem unknown"),
+                })?;
+                self.tools
+                    .set_label(fs, Path::new(partition), label)
+                    .map_err(|e| mkfs_err(op, e))
+            }
+            // ── lock 4: shrink/move choreography ──
+            StorageOp::Grow {
+                new_size_mib: n, ..
+            } => self.run_resize(op, ctx, *n, ResizeDirection::Grow),
+            StorageOp::Shrink {
+                new_size_mib: n, ..
+            } => self.run_resize(op, ctx, *n, ResizeDirection::Shrink),
+            // ── lock 6: LUKS create/unlock/lock (+ format-inside as one staged op) ──
+            StorageOp::LuksFormat { .. } => self.apply_luks_format(op),
+            StorageOp::LuksOpen {
+                partition,
+                mapper_name,
+                keyfile,
+            } => self
+                .tools
+                .luks_open(Path::new(partition), mapper_name, keyfile.as_deref())
+                .map_err(|e| mkfs_err(op, e)),
+            StorageOp::LuksClose { mapper_name, .. } => self
+                .tools
+                .luks_close(mapper_name)
+                .map_err(|e| mkfs_err(op, e)),
+            // ── lock 6: btrfs subvolumes ──
+            StorageOp::SubvolumeCreate { .. }
+            | StorageOp::SubvolumeDelete { .. }
+            | StorageOp::SubvolumeSnapshot { .. } => self.apply_subvolume(op, ctx),
+            // ── partition-table geometry: outside this fs-depth slice ──
+            StorageOp::CreateTable { .. }
+            | StorageOp::CreatePartition { .. }
+            | StorageOp::DeletePartition { .. }
+            | StorageOp::SetFlags { .. }
+            | StorageOp::Mount { .. }
+            | StorageOp::Unmount { .. }
+            | StorageOp::Move { .. } => Err(Self::gated_geometry(op)),
+        }
+    }
+}
+
+impl UDisks2Executor {
+    /// Map a fs-tool error to the typed op-level failure.
+    fn op_failed(op: &StorageOp, e: &fs_tools::FsToolError) -> StorageError {
+        StorageError::OpFailed {
+            op: op.kind(),
+            reason: e.to_string(),
+        }
+    }
+
+    /// LUKS-format `op`'s partition, and — when it names an inner filesystem — open
+    /// the fresh container and mkfs inside it (the format-inside-LUKS staged op, lock
+    /// 6). The whole thing halts typed on the first tool failure (no silent partial).
+    fn apply_luks_format(&self, op: &StorageOp) -> Result<(), StorageError> {
+        let StorageOp::LuksFormat {
+            partition,
+            mapper_name,
+            inner_filesystem,
+            keyfile,
+            label,
+        } = op
+        else {
+            return Ok(());
+        };
+        let dev = Path::new(partition);
+        let kf = keyfile.as_deref();
+        self.tools
+            .luks_format(dev, kf)
+            .map_err(|e| Self::op_failed(op, &e))?;
+        if let Some(inner) = inner_filesystem {
+            self.tools
+                .luks_open(dev, mapper_name, kf)
+                .map_err(|e| Self::op_failed(op, &e))?;
+            let mapper = PathBuf::from("/dev/mapper").join(mapper_name);
+            self.tools
+                .mkfs(*inner, &mapper, label.as_deref())
+                .map_err(|e| Self::op_failed(op, &e))?;
+        }
+        Ok(())
+    }
+
+    /// Dispatch a btrfs subvolume op to the tool runner against the (mounted) fs.
+    fn apply_subvolume(&self, op: &StorageOp, ctx: &OpContext) -> Result<(), StorageError> {
+        let mp = self.subvol_mount(op, ctx)?;
+        let r = match op {
+            StorageOp::SubvolumeCreate { name, .. } => self.tools.subvol_create(&mp, name),
+            StorageOp::SubvolumeDelete { name, .. } => self.tools.subvol_delete(&mp, name),
+            StorageOp::SubvolumeSnapshot {
+                source,
+                dest,
+                readonly,
+                ..
+            } => self.tools.subvol_snapshot(&mp, source, dest, *readonly),
+            _ => return Ok(()),
+        };
+        r.map_err(|e| Self::op_failed(op, &e))
+    }
+
+    /// The btrfs mount point a subvolume op operates on (validation already required
+    /// it mounted) — a typed error if the live topology lost it.
+    fn subvol_mount(&self, op: &StorageOp, ctx: &OpContext) -> Result<String, StorageError> {
         let _ = self;
-        Err(StorageError::IntegrationGated(format!(
-            "{} → needs the privileged UDisks2/parted verb wiring (E12-23) with the \
-             per-fs tooling (e2fsprogs/xfsprogs/btrfs-progs/cryptsetup/…) + the \
-             shrink/move choreography; the typed op model, queue engine, walls and \
-             arming are live",
-            op.kind()
-        )))
+        ctx.mountpoint
+            .clone()
+            .ok_or_else(|| StorageError::OpFailed {
+                op: op.kind(),
+                reason: "subvolume op needs the btrfs mounted".into(),
+            })
     }
 }
 
@@ -1372,6 +1827,9 @@ pub enum OpStatus {
     /// Invalid against the live topology or drifted since staging — the queue
     /// halted here (never applied against a stale/invalid picture).
     Invalidated(OpInvalid),
+    /// The target filesystem honestly can't do this op (lock 6 — e.g. an xfs shrink)
+    /// — the queue halted here with a typed capability state, never a silent no-op.
+    Unsupported(CapabilityRefusal),
     /// The backend execution failed — the queue halted here (no silent partial).
     Failed(String),
 }
@@ -1383,12 +1841,13 @@ impl OpStatus {
         matches!(self, Self::Applied)
     }
 
-    /// Whether this op is a halt point (a refusal / invalidation / failure).
+    /// Whether this op is a halt point (a refusal / invalidation / unsupported /
+    /// failure).
     #[must_use]
     pub const fn is_halt(&self) -> bool {
         matches!(
             self,
-            Self::Refused(_) | Self::Invalidated(_) | Self::Failed(_)
+            Self::Refused(_) | Self::Invalidated(_) | Self::Unsupported(_) | Self::Failed(_)
         )
     }
 }
@@ -1468,8 +1927,17 @@ pub fn apply_queue(
             halted_at = Some(i);
             break;
         }
-        // 4. Execute.
-        match executor.apply(op) {
+        // 4. Honest per-fs capability gate (lock 6) — an unsupported resize is a
+        //    typed state, never a silent no-op. Resolve the op's live-topology facts.
+        let ctx = resolve_context(op, live);
+        if let Err(refusal) = capability_check(op, &ctx) {
+            statuses[i] = OpStatus::Unsupported(refusal);
+            on_progress(i, &statuses[i]);
+            halted_at = Some(i);
+            break;
+        }
+        // 5. Execute.
+        match executor.apply(op, &ctx) {
             Ok(()) => {
                 statuses[i] = OpStatus::Applied;
                 applied += 1;
@@ -1833,6 +2301,11 @@ pub enum ProgressState {
         /// The invalidation text.
         reason: String,
     },
+    /// The target filesystem honestly can't do the op (lock 6 capability state).
+    Unsupported {
+        /// The capability-refusal text.
+        reason: String,
+    },
     /// Backend execution failed.
     Failed {
         /// The failure text.
@@ -1853,6 +2326,9 @@ impl ProgressState {
             }),
             OpStatus::Invalidated(i) => Some(Self::Invalidated {
                 reason: i.to_string(),
+            }),
+            OpStatus::Unsupported(c) => Some(Self::Unsupported {
+                reason: c.to_string(),
             }),
             OpStatus::Failed(f) => Some(Self::Failed { reason: f.clone() }),
         }
@@ -2734,7 +3210,7 @@ mod tests {
         }
     }
     impl StorageExecutor for FakeExecutor {
-        fn apply(&self, op: &StorageOp) -> Result<(), StorageError> {
+        fn apply(&self, op: &StorageOp, _ctx: &OpContext) -> Result<(), StorageError> {
             let mut n = self.seen.lock().unwrap();
             let this = *n;
             *n += 1;
@@ -2856,6 +3332,306 @@ mod tests {
         assert!(matches!(
             outcome.statuses[0],
             OpStatus::Invalidated(OpInvalid::NotMounted { .. })
+        ));
+    }
+
+    // ── E12-23: filesystem depth ──
+
+    fn xfs_topo() -> Topology {
+        Topology::new(vec![BlockDevice {
+            name: "/dev/sdb".into(),
+            size_mib: 100 * 1024,
+            table: Some(PartitionTable::Gpt),
+            removable: true,
+            partitions: vec![Partition {
+                name: "/dev/sdb1".into(),
+                number: 1,
+                start_mib: 1,
+                size_mib: 10 * 1024,
+                filesystem: Some("xfs".into()),
+                label: None,
+                mountpoint: None,
+                uuid: None,
+            }],
+        }])
+    }
+
+    #[test]
+    fn filesystem_from_id_maps_udisks_strings() {
+        assert_eq!(Filesystem::from_id("ext4"), Some(Filesystem::Ext4));
+        assert_eq!(Filesystem::from_id("EXT3"), Some(Filesystem::Ext4));
+        assert_eq!(Filesystem::from_id("crypto_LUKS"), Some(Filesystem::Luks));
+        assert_eq!(Filesystem::from_id("btrfs"), Some(Filesystem::Btrfs));
+        assert_eq!(Filesystem::from_id("zfs"), None);
+    }
+
+    #[test]
+    fn resolve_context_pulls_fs_disk_number_and_mount() {
+        let mut topo = sample_topo();
+        topo.devices[0].partitions[0].mountpoint = Some("/mnt/x".into());
+        let ctx = resolve_context(
+            &StorageOp::Shrink {
+                partition: "/dev/sdb1".into(),
+                new_size_mib: 5 * 1024,
+            },
+            &topo,
+        );
+        assert_eq!(ctx.filesystem, Some(Filesystem::Ext4));
+        assert_eq!(ctx.disk.as_deref(), Some("/dev/sdb"));
+        assert_eq!(ctx.number, 1);
+        assert_eq!(ctx.current_size_mib, 10 * 1024);
+        assert_eq!(ctx.mountpoint.as_deref(), Some("/mnt/x"));
+        // Format carries its OWN target fs, not the partition's current one.
+        let fctx = resolve_context(
+            &StorageOp::Format {
+                partition: "/dev/sdb1".into(),
+                filesystem: Filesystem::Btrfs,
+                label: None,
+            },
+            &topo,
+        );
+        assert_eq!(fctx.filesystem, Some(Filesystem::Btrfs));
+    }
+
+    #[test]
+    fn apply_queue_reports_unsupported_xfs_shrink_typed() {
+        // An xfs shrink must halt as a typed Unsupported capability state, never a
+        // silent no-op — and the executor must never be called for it.
+        let topo = xfs_topo();
+        let q = StorageQueue::new(vec![StorageOp::Shrink {
+            partition: "/dev/sdb1".into(),
+            new_size_mib: 5 * 1024,
+        }]);
+        let exec = FakeExecutor::ok();
+        let outcome = apply_queue(&q, &topo, &topo, &free_interlocks(), &exec, |_, _| {});
+        assert!(!outcome.is_success());
+        assert!(matches!(
+            outcome.statuses[0],
+            OpStatus::Unsupported(CapabilityRefusal::ShrinkUnsupported {
+                fs: Filesystem::Xfs
+            })
+        ));
+        assert!(exec.applied.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn validate_subvolume_needs_btrfs_and_mount() {
+        // ext4 partition → WrongFilesystem.
+        let topo = sample_topo();
+        assert!(matches!(
+            validate_op(
+                &StorageOp::SubvolumeCreate {
+                    partition: "/dev/sdb1".into(),
+                    name: "home".into(),
+                },
+                &topo
+            ),
+            Err(OpInvalid::WrongFilesystem { .. })
+        ));
+        // btrfs but unmounted → NotMounted.
+        let mut btrfs = sample_topo();
+        btrfs.devices[0].partitions[0].filesystem = Some("btrfs".into());
+        assert!(matches!(
+            validate_op(
+                &StorageOp::SubvolumeCreate {
+                    partition: "/dev/sdb1".into(),
+                    name: "home".into(),
+                },
+                &btrfs
+            ),
+            Err(OpInvalid::NotMounted { .. })
+        ));
+        // btrfs + mounted → ok.
+        btrfs.devices[0].partitions[0].mountpoint = Some("/mnt/b".into());
+        assert!(validate_op(
+            &StorageOp::SubvolumeSnapshot {
+                partition: "/dev/sdb1".into(),
+                source: "home".into(),
+                dest: "home-snap".into(),
+                readonly: true,
+            },
+            &btrfs
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn luks_format_requires_unmounted_and_round_trips() {
+        let mut topo = sample_topo();
+        topo.devices[0].partitions[0].mountpoint = Some("/mnt/x".into());
+        assert!(matches!(
+            validate_op(
+                &StorageOp::LuksFormat {
+                    partition: "/dev/sdb1".into(),
+                    mapper_name: "cryptdata".into(),
+                    inner_filesystem: Some(Filesystem::Ext4),
+                    keyfile: Some(PathBuf::from("/run/key")),
+                    label: None,
+                },
+                &topo
+            ),
+            Err(OpInvalid::PartitionMounted { .. })
+        ));
+        // JSON is self-describing.
+        let op = StorageOp::LuksOpen {
+            partition: "/dev/sdb1".into(),
+            mapper_name: "cryptdata".into(),
+            keyfile: None,
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        assert!(json.contains(r#""op":"luks_open""#));
+        assert_eq!(serde_json::from_str::<StorageOp>(&json).unwrap(), op);
+    }
+
+    /// A recording fs-tool runner: succeeds, logging each verb.
+    #[derive(Default)]
+    struct RecordingTools(Mutex<Vec<String>>);
+    impl fs_tools::FsToolRunner for RecordingTools {
+        fn mkfs(
+            &self,
+            fs: Filesystem,
+            _: &Path,
+            _: Option<&str>,
+        ) -> Result<(), fs_tools::FsToolError> {
+            self.0.lock().unwrap().push(format!("mkfs:{}", fs.as_str()));
+            Ok(())
+        }
+        fn set_label(&self, _: Filesystem, _: &Path, _: &str) -> Result<(), fs_tools::FsToolError> {
+            self.0.lock().unwrap().push("set_label".into());
+            Ok(())
+        }
+        fn fs_check(&self, _: Filesystem, _: &Path) -> Result<(), fs_tools::FsToolError> {
+            self.0.lock().unwrap().push("fs_check".into());
+            Ok(())
+        }
+        fn fs_resize(
+            &self,
+            _: Filesystem,
+            _: &Path,
+            _: Option<&str>,
+            _: u64,
+            _: fs_tools::ResizeDirection,
+        ) -> Result<(), fs_tools::FsToolError> {
+            self.0.lock().unwrap().push("fs_resize".into());
+            Ok(())
+        }
+        fn part_resize(&self, _: &Path, _: u32, _: u64) -> Result<(), fs_tools::FsToolError> {
+            self.0.lock().unwrap().push("part_resize".into());
+            Ok(())
+        }
+        fn luks_format(&self, _: &Path, _: Option<&Path>) -> Result<(), fs_tools::FsToolError> {
+            self.0.lock().unwrap().push("luks_format".into());
+            Ok(())
+        }
+        fn luks_open(
+            &self,
+            _: &Path,
+            _: &str,
+            _: Option<&Path>,
+        ) -> Result<(), fs_tools::FsToolError> {
+            self.0.lock().unwrap().push("luks_open".into());
+            Ok(())
+        }
+        fn luks_close(&self, _: &str) -> Result<(), fs_tools::FsToolError> {
+            self.0.lock().unwrap().push("luks_close".into());
+            Ok(())
+        }
+        fn subvol_list(&self, _: &str) -> Result<Vec<String>, fs_tools::FsToolError> {
+            self.0.lock().unwrap().push("subvol_list".into());
+            Ok(vec![])
+        }
+        fn subvol_create(&self, _: &str, _: &str) -> Result<(), fs_tools::FsToolError> {
+            self.0.lock().unwrap().push("subvol_create".into());
+            Ok(())
+        }
+        fn subvol_delete(&self, _: &str, _: &str) -> Result<(), fs_tools::FsToolError> {
+            self.0.lock().unwrap().push("subvol_delete".into());
+            Ok(())
+        }
+        fn subvol_snapshot(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: bool,
+        ) -> Result<(), fs_tools::FsToolError> {
+            self.0.lock().unwrap().push("subvol_snapshot".into());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn executor_drives_fs_tooling_and_gates_geometry() {
+        let tools = Arc::new(RecordingTools::default());
+        let exec =
+            UDisks2Executor::with_tools(Arc::clone(&tools) as Arc<dyn fs_tools::FsToolRunner>);
+        // Format → mkfs through the typed verb layer.
+        exec.apply(
+            &StorageOp::Format {
+                partition: "/dev/sdb1".into(),
+                filesystem: Filesystem::Btrfs,
+                label: Some("data".into()),
+            },
+            &OpContext {
+                filesystem: Some(Filesystem::Btrfs),
+                ..OpContext::default()
+            },
+        )
+        .unwrap();
+        // LuksFormat with an inner fs → format → open → mkfs (one staged op).
+        exec.apply(
+            &StorageOp::LuksFormat {
+                partition: "/dev/sdb1".into(),
+                mapper_name: "cryptdata".into(),
+                inner_filesystem: Some(Filesystem::Ext4),
+                keyfile: Some(PathBuf::from("/run/key")),
+                label: None,
+            },
+            &OpContext::default(),
+        )
+        .unwrap();
+        // A shrink runs the check→fs→part choreography.
+        exec.apply(
+            &StorageOp::Shrink {
+                partition: "/dev/sdb1".into(),
+                new_size_mib: 4096,
+            },
+            &OpContext {
+                filesystem: Some(Filesystem::Ext4),
+                current_size_mib: 10 * 1024,
+                start_mib: 1,
+                disk: Some("/dev/sdb".into()),
+                number: 1,
+                mountpoint: None,
+            },
+        )
+        .unwrap();
+        let calls = {
+            let guard = tools.0.lock().unwrap();
+            guard.clone()
+        };
+        assert_eq!(
+            calls,
+            vec![
+                "mkfs:btrfs",
+                "luks_format",
+                "luks_open",
+                "mkfs:ext4",
+                "fs_check",
+                "fs_resize",
+                "part_resize",
+            ]
+        );
+        // A partition-table geometry op is honestly integration-gated (§7).
+        assert!(matches!(
+            exec.apply(
+                &StorageOp::Move {
+                    partition: "/dev/sdb1".into(),
+                    new_start_mib: 2,
+                },
+                &OpContext::default(),
+            ),
+            Err(StorageError::IntegrationGated(_))
         ));
     }
 

@@ -104,6 +104,25 @@ RUN set -eux; \
         ddcutil i2c-tools; \
     dnf clean all
 
+# E12-23 (Storage plane filesystem depth, workbench-storage-plane.md lock 6) — the
+# fs-tooling matrix the Storage worker's UDisks2 executor + fs_tools verb layer
+# shells to format/label/resize/encrypt on a shipped node. The RPM's `requires`
+# pull these on a dnf install, but the bootc image is composed offline, so install
+# them explicitly here too (mirroring the seat block above): udisks2 (the D-Bus
+# block backend), e2fsprogs/xfsprogs/btrfs-progs/exfatprogs/dosfstools/ntfs-3g+
+# ntfsprogs (the per-fs mkfs/label/check/resize tools), cryptsetup (LUKS), parted
+# (the partition-geometry step of the shrink/move choreography), and qemu-img (the
+# E12-22 virtual-disk lifecycle). A fresh bootc image thus carries every tool so no
+# locked format degrades to an honest "unavailable" on a shipped node.
+RUN set -eux; \
+    dnf -y install \
+        udisks2 \
+        e2fsprogs xfsprogs btrfs-progs exfatprogs dosfstools \
+        ntfs-3g ntfsprogs \
+        cryptsetup parted \
+        qemu-img; \
+    dnf clean all
+
 # The other half of the VDI substrate: **cloud-hypervisor, baked in** (§5 /
 # E12-13). Fedora 42 does not package it, so pin the upstream static-musl
 # release binary and verify its sha256 — the pin makes every rebuild
