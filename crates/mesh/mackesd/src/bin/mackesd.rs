@@ -7836,6 +7836,25 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("hardware_probe".into());
 
+        // E12-19 (Quasar host controls) — host_state. Mirrors this node's seat
+        // snapshot (published by the shell) to state/host/<node>/seat for the
+        // Workbench + remote peers, and authorizes remote typed verbs on
+        // action/host/<node>/verb behind the allowlist + safety interlocks
+        // (never-black-the-last-console, leader-aware power, two-phase confirm),
+        // forwarding an approved verb to the shell's local apply lane. Runs on
+        // every node.
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::host_state::HostStateWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("host_state".into());
+
         // MON-1.b (v2.6) — Netdata aggregator-IP publisher.
         // Pairs with `apply_netdata_monitor`'s baseline
         // /etc/netdata/netdata.conf: when this peer wins

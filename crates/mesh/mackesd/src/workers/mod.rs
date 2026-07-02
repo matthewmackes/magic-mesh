@@ -375,6 +375,11 @@ pub mod probe;
 // hardware probe + writes it to the replicated directory so the
 // Workbench Hardware panel renders the fleet. Spawned in run_serve.
 pub mod hardware_probe;
+// E12-19 (Quasar host controls) — mirrors this node's seat snapshot to
+// state/host/<node>/seat and executes remote typed verbs (volume/BT/
+// display/power) behind the allowlist + safety interlocks. Runs on every
+// node; spawned in run_serve.
+pub mod host_state;
 // notification_relay retired in BUS-4.2 (2026-05-26). Cross-peer
 // notification routing is now handled by the BUS-4.4 FDO bridge:
 // every Notify call publishes to `fdo/<app>` on the Mackes Bus,
