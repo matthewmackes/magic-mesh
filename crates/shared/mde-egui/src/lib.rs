@@ -28,6 +28,7 @@ pub mod fonts;
 pub mod motion;
 pub mod runner;
 pub mod style;
+pub mod toast;
 pub mod widgets;
 
 // E12-2: the bare-seat DRM/KMS backend (no compositor), behind `feature = "drm"`.
@@ -37,6 +38,9 @@ pub mod drm;
 pub use motion::Motion;
 pub use runner::run_client;
 pub use style::Style;
+pub use toast::{
+    ChyronInteraction, Dwell, OsdKind, OsdLevel, Severity, Tier, Toast, ToastAction, ToastHost,
+};
 pub use widgets::{field, muted_note, status_dot};
 
 #[cfg(feature = "drm")]
