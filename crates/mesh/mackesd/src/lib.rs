@@ -171,6 +171,14 @@ pub mod validation;
 // builds the per-peer `priority` weights baked into
 // dispatcher.list rows.
 pub mod voice;
+// VOIP-GW-2 — the typed Vitelity API client (per-node SIP design,
+// `docs/design/voice-vitelity-per-node-sip.md`, locks 11 + 14):
+// sub-account create/list/get, DID list/route (existing DIDs only),
+// failover/voicemail config, behind an injectable `VitelityClient`
+// seam. Pure request/response folds unit-tested; the live impl is
+// integration-gated (needs the master API key + net), never faked.
+// Consumed by the VOIP-GW-3 `voice_provision` worker.
+pub mod vitelity;
 // VOIP-4 (v5.0.0) — Vitelity-link RTT telemetry: measures the RTT to the
 // Vitelity SIP edge + publishes `voip/link-rtt/<peer>`. Consumed by the
 // `mackesd voip-rtt` CLI (VOIP-4.a) + the 60s broadcast worker (VOIP-4.b).
