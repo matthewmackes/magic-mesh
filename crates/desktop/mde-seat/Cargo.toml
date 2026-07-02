@@ -32,5 +32,12 @@ thiserror = "1"
 # payloads serialized to the mde-bus); matches the workspace serde 1 + derive pin.
 serde = { version = "1", features = ["derive"] }
 
+# The PipeWire mixer client (E12-16) reads the graph via `pw-dump`'s JSON. The
+# native `pipewire` crate needs libpipewire-0.3 dev headers + clang/bindgen, which
+# don't resolve under the airgapped 1.94 farm pin — so the client's I/O seam is the
+# `pw-dump` / `wpctl` JSON path (a typed runner, not raw product shell), and the
+# whole fold is pure over serde_json::Value + unit-tested headless.
+serde_json.workspace = true
+
 [lints]
 workspace = true

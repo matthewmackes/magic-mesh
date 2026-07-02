@@ -15,7 +15,7 @@ use crate::ddc::{DdcClient, DdcDisplay, UnboundDdc};
 use crate::display::{Connector, DisplayProber, DrmProber};
 use crate::error::{Backend, SeatError};
 use crate::logind::{LogindClient, PowerCaps, ZbusLogind};
-use crate::mixer::{MixerClient, MixerStatus, UnboundMixer};
+use crate::mixer::{MixerClient, MixerStatus, PwGraph};
 use crate::upower::{Battery, UPowerClient, ZbusUPower};
 
 /// A typed per-section state: a real reading, or a typed absence.
@@ -75,7 +75,8 @@ pub struct SeatSnapshot {
     pub displays: Probe<Vec<Connector>>,
     /// sysfs backlight panels.
     pub backlights: Probe<Vec<Backlight>>,
-    /// The audio mixer (`PipeWire`; `Absent` until E12-16).
+    /// The audio mixer (`PipeWire` graph via [`PwGraph`]; `Absent` when no
+    /// `PipeWire`/`pw-dump` is present, e.g. a headless host).
     pub mixer: Probe<MixerStatus>,
     /// DDC/CI external monitors (`Absent` until E12-18).
     pub ddc: Probe<Vec<DdcDisplay>>,
@@ -96,7 +97,8 @@ pub struct Seat {
 
 impl Seat {
     /// A seat over the real host: system-bus BlueZ/UPower/logind, the DRM prober,
-    /// sysfs backlight, and the not-yet-bound mixer/DDC seams (E12-16/E12-18).
+    /// sysfs backlight, the `PipeWire` mixer (E12-16), and the not-yet-bound DDC
+    /// seam (E12-18).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -105,7 +107,7 @@ impl Seat {
             logind: Box::new(ZbusLogind::new()),
             display: Box::new(DrmProber::new()),
             backlight: Box::new(SysfsBacklight::new()),
-            mixer: Box::new(UnboundMixer),
+            mixer: Box::new(PwGraph::new()),
             ddc: Box::new(UnboundDdc),
         }
     }
@@ -179,18 +181,16 @@ mod tests {
     }
 
     #[test]
-    fn a_real_seat_snapshots_without_panicking_and_mixer_ddc_are_absent() {
+    fn a_real_seat_snapshots_without_panicking_and_the_mixer_answers_typed() {
         // On the headless build host every D-Bus/DRM section is legitimately
-        // Absent; the point is snapshot() never panics and the not-yet-bound
-        // seams are honestly Absent, never fabricated Present.
+        // Absent; the point is snapshot() never panics. The mixer now drives the
+        // real PipeWire client (E12-16): with no pw-dump it is Absent(PipeWire),
+        // with a live graph it is Present — either way tagged PipeWire, never a
+        // fabricated reading. The DDC seam stays Absent until E12-18.
         let snap = Seat::new().snapshot();
-        assert!(
-            !snap.mixer.is_present(),
-            "mixer must be Absent until E12-16"
-        );
-        assert!(!snap.ddc.is_present(), "ddc must be Absent until E12-18");
-        if let Probe::Absent { backend, .. } = snap.mixer {
-            assert_eq!(backend, Backend::PipeWire);
+        if let Probe::Absent { backend, .. } = &snap.mixer {
+            assert_eq!(*backend, Backend::PipeWire);
         }
+        assert!(!snap.ddc.is_present(), "ddc must be Absent until E12-18");
     }
 }

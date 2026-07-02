@@ -50,6 +50,9 @@ pub use display::{Connector, ConnectorStatus, DisplayMode, DisplayProber, DrmPro
 pub use error::{Backend, SeatError};
 pub use hotkeys::{Hotkey, HotkeyAction, HOTKEYS};
 pub use logind::{Avail, LogindClient, PowerCaps, PowerVerb, ZbusLogind};
-pub use mixer::{MixerClient, MixerStatus, MixerStrip, UnboundMixer};
+pub use mixer::{
+    fold_graph, MixerClient, MixerStatus, MixerStrip, PwCli, PwGraph, PwRunner, StripOrigin,
+    UnboundMixer,
+};
 pub use snapshot::{Probe, Seat, SeatSnapshot};
 pub use upower::{Battery, BatteryKind, BatteryState, UPowerClient, ZbusUPower};
