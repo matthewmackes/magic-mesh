@@ -497,6 +497,9 @@ pub mod subprocess_tick;
 // `systemctl try-reload-or-restart` on kamailio-mde +
 // rtpengine-mde when it changes.
 pub mod voice_config;
+// VOIP-GW-3 — leader-gated Vitelity per-node SIP sub-account provisioner
+// (create + seal creds + reconcile + publish state/voice/<node>).
+pub mod voice_provision;
 pub mod wol;
 // BUS-1.1 (v6.x Mackes Bus) — `mde-bus` subprocess supervisor.
 // Spawns `mde-bus daemon`, restarts on exit, gracefully degrades

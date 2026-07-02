@@ -7453,6 +7453,28 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("action".into());
 
+        // VOIP-GW-3 — the leader-gated voice_provision worker. Spawned on every
+        // node so failover is seamless, but LEADER-gated internally (lock 7):
+        // only the elected node provisions per-node Vitelity sub-accounts, seals
+        // each node's SIP creds to its per-node key in the mesh secret store,
+        // reconciles Vitelity ⇄ roster idempotently + rate-limited, and holds
+        // the master API key (never distributed). Each node's reg-state is
+        // published to `state/voice/<node>` for the Voice panel fleet board
+        // (VOIP-GW-5). The live Vitelity transport is integration-gated (a typed
+        // error), never faked — a fresh mesh with no sealed master key simply
+        // shows every node `Provisioning` rather than a fake online (§7).
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::voice_provision::VoiceProvisionWorker::new(
+                workgroup_root.clone(),
+                node_id.clone(),
+            ),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("voice_provision".into());
+
         // PRINT-2..PRINT-6 + PRINT-8 (v5.0.0) — auto CUPS print
         // sharing + sync. Spawned on headless + full; SKIPPED on
         // lighthouse (routing-only, no printers — Q8 lock). The
