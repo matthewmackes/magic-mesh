@@ -10,11 +10,11 @@ use thiserror::Error;
 /// probe failure folds into the right section's typed not-available state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
-    /// The PipeWire audio graph (the mixer). Real binding: E12-16.
+    /// The `PipeWire` audio graph (the mixer). Real binding: E12-16.
     PipeWire,
-    /// BlueZ over the system D-Bus.
+    /// `BlueZ` over the system D-Bus.
     Bluetooth,
-    /// UPower over the system D-Bus.
+    /// `UPower` over the system D-Bus.
     UPower,
     /// systemd-logind over the system D-Bus.
     Logind,
@@ -31,13 +31,13 @@ impl Backend {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Backend::PipeWire => "PipeWire",
-            Backend::Bluetooth => "Bluetooth (BlueZ)",
-            Backend::UPower => "UPower",
-            Backend::Logind => "logind",
-            Backend::Display => "DRM display",
-            Backend::Backlight => "backlight",
-            Backend::Ddc => "DDC/CI",
+            Self::PipeWire => "PipeWire",
+            Self::Bluetooth => "Bluetooth (BlueZ)",
+            Self::UPower => "UPower",
+            Self::Logind => "logind",
+            Self::Display => "DRM display",
+            Self::Backlight => "backlight",
+            Self::Ddc => "DDC/CI",
         }
     }
 }
@@ -48,9 +48,11 @@ impl std::fmt::Display for Backend {
     }
 }
 
-/// Why a seat client call failed. `Unavailable` is the load-bearing variant: it
-/// is the *typed* "this backend does not exist here" state the System surface
-/// and chrome icons render honestly instead of a fake control (§7 / interlock 4).
+/// Why a seat client call failed.
+///
+/// `Unavailable` is the load-bearing variant: it is the *typed* "this backend
+/// does not exist here" state the System surface and chrome icons render
+/// honestly instead of a fake control (§7 / interlock 4).
 #[derive(Debug, Error)]
 pub enum SeatError {
     /// The backend is not present on this host (service not running, no device
@@ -108,11 +110,11 @@ impl SeatError {
     #[must_use]
     pub const fn backend(&self) -> Backend {
         match self {
-            SeatError::Unavailable { backend, .. }
-            | SeatError::Backend { backend, .. }
-            | SeatError::Io { backend, .. }
-            | SeatError::Protocol { backend, .. }
-            | SeatError::OutOfRange { backend, .. } => *backend,
+            Self::Unavailable { backend, .. }
+            | Self::Backend { backend, .. }
+            | Self::Io { backend, .. }
+            | Self::Protocol { backend, .. }
+            | Self::OutOfRange { backend, .. } => *backend,
         }
     }
 }
@@ -120,14 +122,14 @@ impl SeatError {
 /// Is this D-Bus error name the "service is simply not running here" family?
 /// Those map to [`SeatError::Unavailable`] (an absent backend), not a failure.
 #[must_use]
-pub(crate) fn unavailable_error_name(name: &str) -> bool {
+pub fn unavailable_error_name(name: &str) -> bool {
     name.ends_with(".ServiceUnknown") || name.ends_with(".NameHasNoOwner")
 }
 
 /// Fold a zbus call error into a typed [`SeatError`]: a missing service / dead
 /// bus is [`SeatError::Unavailable`] (the backend is absent), anything else is
 /// [`SeatError::Backend`] (present but failing). `ctx` names the failing call.
-pub(crate) fn classify_call(backend: Backend, ctx: &str, e: &zbus::Error) -> SeatError {
+pub fn classify_call(backend: Backend, ctx: &str, e: &zbus::Error) -> SeatError {
     match e {
         zbus::Error::MethodError(name, detail, _) => {
             if unavailable_error_name(name.as_str()) {

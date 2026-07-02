@@ -1,6 +1,6 @@
-//! The BlueZ client — adapter + device enumeration over the system D-Bus.
+//! The `BlueZ` client — adapter + device enumeration over the system D-Bus.
 //!
-//! BlueZ publishes its whole world as one `ObjectManager` tree on `org.bluez`:
+//! `BlueZ` publishes its whole world as one `ObjectManager` tree on `org.bluez`:
 //! adapters (`org.bluez.Adapter1`), devices (`org.bluez.Device1`), and — for
 //! peripherals that report charge — `org.bluez.Battery1` on the same device
 //! object. One `GetManagedObjects` round-trip is therefore the entire read; the
@@ -14,7 +14,7 @@ use crate::bus::SysBus;
 use crate::error::{Backend, SeatError};
 use crate::props::{bool_prop, str_prop, u8_prop, PropMap};
 
-/// The BlueZ well-known bus name.
+/// The `BlueZ` well-known bus name.
 const BLUEZ: &str = "org.bluez";
 
 /// One Bluetooth adapter (an `org.bluez.Adapter1` object).
@@ -47,7 +47,7 @@ pub struct BtDevice {
     /// The peripheral's own battery charge (`org.bluez.Battery1`), when the
     /// device reports one. `None` = not reported — never a fabricated value.
     pub battery_percent: Option<u8>,
-    /// The BlueZ icon hint (`"input-keyboard"`, `"audio-headset"`, …), when set.
+    /// The `BlueZ` icon hint (`"input-keyboard"`, `"audio-headset"`, …), when set.
     pub icon: Option<String>,
 }
 
@@ -74,17 +74,17 @@ impl BtStatus {
     }
 }
 
-/// The BlueZ client seam. The production impl is [`ZbusBluez`]; tests (and the
+/// The `BlueZ` client seam. The production impl is [`ZbusBluez`]; tests (and the
 /// shell's headless tests) inject a fake.
 pub trait BluezClient: Send {
     /// Enumerate adapters + devices.
     ///
     /// # Errors
-    /// Typed: [`SeatError::Unavailable`] when BlueZ / the system bus is absent.
+    /// Typed: [`SeatError::Unavailable`] when `BlueZ` / the system bus is absent.
     fn status(&self) -> Result<BtStatus, SeatError>;
 }
 
-/// The production BlueZ client — one `ObjectManager.GetManagedObjects` call,
+/// The production `BlueZ` client — one `ObjectManager.GetManagedObjects` call,
 /// folded by the pure [`fold_bluez`].
 pub struct ZbusBluez {
     bus: SysBus,
@@ -129,15 +129,15 @@ fn iface<'a>(
         .find_map(|(k, v)| (k.as_str() == name).then_some(v))
 }
 
-/// The last path segment — the fallback identity when BlueZ names are absent.
+/// The last path segment — the fallback identity when `BlueZ` names are absent.
 fn path_tail(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_owned()
 }
 
-/// Fold the BlueZ object tree into [`BtStatus`]. Pure — unit-tested with
+/// Fold the `BlueZ` object tree into [`BtStatus`]. Pure — unit-tested with
 /// hand-built trees; tolerant of missing properties (§7: absent reads as the
 /// honest default, never an invented value).
-pub(crate) fn fold_bluez(objects: &zbus::fdo::ManagedObjects) -> BtStatus {
+pub fn fold_bluez(objects: &zbus::fdo::ManagedObjects) -> BtStatus {
     let mut status = BtStatus::default();
     for (path, interfaces) in objects {
         let path_str = path.as_str();
@@ -153,8 +153,8 @@ pub(crate) fn fold_bluez(objects: &zbus::fdo::ManagedObjects) -> BtStatus {
         }
         if let Some(props) = iface(interfaces, "org.bluez.Device1") {
             // A peripheral's charge rides the SAME object as Battery1.
-            let battery = iface(interfaces, "org.bluez.Battery1")
-                .and_then(|b| u8_prop(b, "Percentage"));
+            let battery =
+                iface(interfaces, "org.bluez.Battery1").and_then(|b| u8_prop(b, "Percentage"));
             status.devices.push(BtDevice {
                 path: path_str.to_owned(),
                 alias: str_prop(props, "Alias")

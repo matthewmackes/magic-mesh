@@ -42,6 +42,7 @@ members = [
     "crates/desktop/mde-vdi-rdp",
     "crates/desktop/mde-vdi-vnc",
     "crates/desktop/mde-panel-egui",
+    "crates/desktop/mde-seat",
     "crates/shared/mde-disclaimer",
     "crates/shared/mde-egui",
     "crates/kdc/mde-kdc-host",

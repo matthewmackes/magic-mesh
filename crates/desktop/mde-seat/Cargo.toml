@@ -28,5 +28,9 @@ drm = "0.14"
 # Typed error enum, matching the mde-kvm / mackes-xcp convention.
 thiserror = "1"
 
+# Serde derives for the Bus-mirrored snapshot types (state/inventory-class
+# payloads serialized to the mde-bus); matches the workspace serde 1 + derive pin.
+serde = { version = "1", features = ["derive"] }
+
 [lints]
 workspace = true

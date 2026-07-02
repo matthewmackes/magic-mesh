@@ -15,7 +15,7 @@ use crate::error::{classify_call, Backend, SeatError};
 
 /// A lazily-dialled, cached system-bus connection scoped to one backend (so its
 /// failures classify under that backend's [`Backend`] tag).
-pub(crate) struct SysBus {
+pub struct SysBus {
     backend: Backend,
     conn: Mutex<Option<Connection>>,
 }
@@ -39,6 +39,13 @@ impl SysBus {
 
     /// The cached connection, dialling the system bus on first use. A host
     /// without a system bus (headless CI) folds to `Unavailable`.
+    // The guard is deliberately held across `Connection::system()` so two threads
+    // cannot both dial the bus and race to cache — tightening the drop would open
+    // that double-dial window. (nursery lint; the wide lock is the intent.)
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the guard serializes first-use bus dialing on purpose"
+    )]
     fn connection(&self) -> Result<Connection, SeatError> {
         let mut slot = self.slot();
         if let Some(c) = slot.as_ref() {
@@ -138,10 +145,7 @@ mod tests {
         let e = r.expect_err("a missing service must not answer");
         assert_eq!(e.backend(), Backend::UPower);
         assert!(
-            matches!(
-                e,
-                SeatError::Unavailable { .. } | SeatError::Backend { .. }
-            ),
+            matches!(e, SeatError::Unavailable { .. } | SeatError::Backend { .. }),
             "{e}"
         );
     }

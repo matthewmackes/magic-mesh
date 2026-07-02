@@ -12,7 +12,7 @@
 //! typed errors, pure folds unit-tested headless, and a production impl that does
 //! only I/O. The seams:
 //!
-//! - [`BluezClient`] — BlueZ adapter/device enumeration (incl. `Battery1`
+//! - [`BluezClient`] — `BlueZ` adapter/device enumeration (incl. `Battery1`
 //!   peripheral batteries) over the system D-Bus `ObjectManager`.
 //! - [`UPowerClient`] — battery enumeration (internal, UPS, BT peripherals).
 //! - [`LogindClient`] — session lock + suspend/reboot/poweroff verbs and their
@@ -20,7 +20,7 @@
 //! - [`DisplayProber`] — a **read-only** DRM connector/mode probe (the modeset
 //!   drive itself stays in the `mde-egui` DRM runner; multi-CRTC is E12-18).
 //! - [`BacklightClient`] — sysfs backlight enumeration + brightness write.
-//! - [`MixerClient`] / [`DdcClient`] — the PipeWire graph and DDC/CI clients.
+//! - [`MixerClient`] / [`DdcClient`] — the `PipeWire` graph and DDC/CI clients.
 //!   Their real bindings are E12-16 / E12-18; until then the bound impls answer
 //!   with a typed [`SeatError::Unavailable`] — an honest probe state, never a
 //!   stub that lies (§7).

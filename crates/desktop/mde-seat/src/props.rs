@@ -1,5 +1,5 @@
 //! Tolerant typed readers over a D-Bus property map (`a{sv}`) — shared by the
-//! BlueZ and UPower folds. A missing or wrongly-typed property reads as `None`;
+//! `BlueZ` and `UPower` folds. A missing or wrongly-typed property reads as `None`;
 //! the folds decide what is required (§7: never invent a value).
 
 use std::collections::HashMap;
@@ -7,15 +7,15 @@ use std::collections::HashMap;
 use zbus::zvariant::OwnedValue;
 
 /// The `a{sv}` property map shape every fold consumes.
-pub(crate) type PropMap = HashMap<String, OwnedValue>;
+pub type PropMap = HashMap<String, OwnedValue>;
 
 /// A `b` property.
-pub(crate) fn bool_prop(props: &PropMap, key: &str) -> Option<bool> {
+pub fn bool_prop(props: &PropMap, key: &str) -> Option<bool> {
     props.get(key).and_then(|v| v.downcast_ref::<bool>().ok())
 }
 
 /// An `s` property, owned.
-pub(crate) fn str_prop(props: &PropMap, key: &str) -> Option<String> {
+pub fn str_prop(props: &PropMap, key: &str) -> Option<String> {
     props
         .get(key)
         .and_then(|v| v.downcast_ref::<&str>().ok())
@@ -23,17 +23,17 @@ pub(crate) fn str_prop(props: &PropMap, key: &str) -> Option<String> {
 }
 
 /// A `y` (byte) property.
-pub(crate) fn u8_prop(props: &PropMap, key: &str) -> Option<u8> {
+pub fn u8_prop(props: &PropMap, key: &str) -> Option<u8> {
     props.get(key).and_then(|v| v.downcast_ref::<u8>().ok())
 }
 
 /// A `u` property.
-pub(crate) fn u32_prop(props: &PropMap, key: &str) -> Option<u32> {
+pub fn u32_prop(props: &PropMap, key: &str) -> Option<u32> {
     props.get(key).and_then(|v| v.downcast_ref::<u32>().ok())
 }
 
 /// A `d` property.
-pub(crate) fn f64_prop(props: &PropMap, key: &str) -> Option<f64> {
+pub fn f64_prop(props: &PropMap, key: &str) -> Option<f64> {
     props.get(key).and_then(|v| v.downcast_ref::<f64>().ok())
 }
 
@@ -48,10 +48,7 @@ pub(crate) mod testutil {
 
     /// A `PropMap` from (key, value) pairs.
     pub(crate) fn props(pairs: Vec<(&str, OwnedValue)>) -> PropMap {
-        pairs
-            .into_iter()
-            .map(|(k, v)| (k.to_owned(), v))
-            .collect()
+        pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
     }
 
     /// An owned string value (`s`).

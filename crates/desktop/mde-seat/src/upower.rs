@@ -1,7 +1,7 @@
-//! The UPower client — battery enumeration over the system D-Bus (lock 6:
+//! The `UPower` client — battery enumeration over the system D-Bus (lock 6:
 //! **multi-battery**, incl. UPSes and Bluetooth-peripheral batteries).
 //!
-//! UPower's `EnumerateDevices` lists every power device it tracks; each is one
+//! `UPower`'s `EnumerateDevices` lists every power device it tracks; each is one
 //! `org.freedesktop.UPower.Device` property bag. The fold from that bag into a
 //! typed [`Battery`] is pure and unit-tested; line-power adjacents (the AC
 //! adapter) and devices without a charge reading are skipped honestly rather
@@ -11,10 +11,10 @@ use crate::bus::SysBus;
 use crate::error::{Backend, SeatError};
 use crate::props::{bool_prop, f64_prop, str_prop, u32_prop, PropMap};
 
-/// The UPower well-known bus name (also the manager interface name).
+/// The `UPower` well-known bus name (also the manager interface name).
 const UPOWER: &str = "org.freedesktop.UPower";
 
-/// What kind of power device a [`Battery`] is — folded from UPower's `Type`.
+/// What kind of power device a [`Battery`] is — folded from `UPower`'s `Type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatteryKind {
     /// An internal system battery (a laptop pack).
@@ -22,7 +22,7 @@ pub enum BatteryKind {
     /// An uninterruptible power supply.
     Ups,
     /// A peripheral's own battery (mouse, keyboard, headset, phone, …) with
-    /// UPower's device-class label.
+    /// `UPower`'s device-class label.
     Peripheral(&'static str),
     /// A type code this fold does not know — shown as-is, never guessed.
     Unknown(u32),
@@ -33,15 +33,15 @@ impl BatteryKind {
     #[must_use]
     pub fn label(&self) -> String {
         match self {
-            BatteryKind::Internal => "internal battery".to_owned(),
-            BatteryKind::Ups => "UPS".to_owned(),
-            BatteryKind::Peripheral(class) => (*class).to_owned(),
-            BatteryKind::Unknown(code) => format!("power device (type {code})"),
+            Self::Internal => "internal battery".to_owned(),
+            Self::Ups => "UPS".to_owned(),
+            Self::Peripheral(class) => (*class).to_owned(),
+            Self::Unknown(code) => format!("power device (type {code})"),
         }
     }
 }
 
-/// Charging state — folded from UPower's `State` code.
+/// Charging state — folded from `UPower`'s `State` code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatteryState {
     /// Charging.
@@ -56,7 +56,7 @@ pub enum BatteryState {
     PendingCharge,
     /// Pending discharge.
     PendingDischarge,
-    /// UPower reported no usable state.
+    /// `UPower` reported no usable state.
     Unknown,
 }
 
@@ -65,25 +65,25 @@ impl BatteryState {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            BatteryState::Charging => "charging",
-            BatteryState::Discharging => "discharging",
-            BatteryState::Empty => "empty",
-            BatteryState::FullyCharged => "full",
-            BatteryState::PendingCharge => "pending charge",
-            BatteryState::PendingDischarge => "pending discharge",
-            BatteryState::Unknown => "state unknown",
+            Self::Charging => "charging",
+            Self::Discharging => "discharging",
+            Self::Empty => "empty",
+            Self::FullyCharged => "full",
+            Self::PendingCharge => "pending charge",
+            Self::PendingDischarge => "pending discharge",
+            Self::Unknown => "state unknown",
         }
     }
 }
 
-/// One battery UPower tracks.
+/// One battery `UPower` tracks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Battery {
     /// The operator-facing name (`Model` → `NativePath` → the object path tail).
     pub model: String,
     /// What kind of device carries this battery.
     pub kind: BatteryKind,
-    /// Charge percentage (0–100, as UPower reports it).
+    /// Charge percentage (0–100, as `UPower` reports it).
     pub percentage: f64,
     /// Charging state.
     pub state: BatteryState,
@@ -92,16 +92,16 @@ pub struct Battery {
     pub power_supply: bool,
 }
 
-/// The UPower client seam. Production impl: [`ZbusUPower`]; tests inject fakes.
+/// The `UPower` client seam. Production impl: [`ZbusUPower`]; tests inject fakes.
 pub trait UPowerClient: Send {
-    /// Enumerate every battery UPower tracks.
+    /// Enumerate every battery `UPower` tracks.
     ///
     /// # Errors
-    /// Typed: [`SeatError::Unavailable`] when UPower / the system bus is absent.
+    /// Typed: [`SeatError::Unavailable`] when `UPower` / the system bus is absent.
     fn batteries(&self) -> Result<Vec<Battery>, SeatError>;
 }
 
-/// The production UPower client: `EnumerateDevices`, then one `GetAll` per
+/// The production `UPower` client: `EnumerateDevices`, then one `GetAll` per
 /// device, folded by the pure [`fold_battery`].
 pub struct ZbusUPower {
     bus: SysBus,
@@ -145,12 +145,16 @@ impl UPowerClient for ZbusUPower {
                 out.push(b);
             }
         }
-        out.sort_by(|a, b| b.power_supply.cmp(&a.power_supply).then(a.model.cmp(&b.model)));
+        out.sort_by(|a, b| {
+            b.power_supply
+                .cmp(&a.power_supply)
+                .then(a.model.cmp(&b.model))
+        });
         Ok(out)
     }
 }
 
-/// UPower `Type` code → [`BatteryKind`]. `LinePower`/unset are not batteries.
+/// `UPower` `Type` code → [`BatteryKind`]. `LinePower`/unset are not batteries.
 const fn kind_from_type(code: u32) -> Option<BatteryKind> {
     Some(match code {
         0 | 1 => return None, // Unknown / LinePower — not a battery.
@@ -185,7 +189,7 @@ const fn kind_from_type(code: u32) -> Option<BatteryKind> {
     })
 }
 
-/// UPower `State` code → [`BatteryState`].
+/// `UPower` `State` code → [`BatteryState`].
 const fn state_from_code(code: u32) -> BatteryState {
     match code {
         1 => BatteryState::Charging,
@@ -198,10 +202,10 @@ const fn state_from_code(code: u32) -> BatteryState {
     }
 }
 
-/// Fold one UPower device property bag into a [`Battery`]. Pure. Returns `None`
+/// Fold one `UPower` device property bag into a [`Battery`]. Pure. Returns `None`
 /// for non-batteries (line power), devices explicitly not present, and devices
 /// without a charge reading — skipped honestly, never fabricated (§7).
-pub(crate) fn fold_battery(path: &str, props: &PropMap) -> Option<Battery> {
+pub fn fold_battery(path: &str, props: &PropMap) -> Option<Battery> {
     let kind = kind_from_type(u32_prop(props, "Type").unwrap_or(0))?;
     if bool_prop(props, "IsPresent") == Some(false) {
         return None;

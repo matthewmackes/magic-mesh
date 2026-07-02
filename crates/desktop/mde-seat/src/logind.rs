@@ -38,10 +38,10 @@ impl PowerVerb {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            PowerVerb::Lock => "Lock",
-            PowerVerb::Suspend => "Suspend",
-            PowerVerb::Reboot => "Reboot",
-            PowerVerb::PowerOff => "Power off",
+            Self::Lock => "Lock",
+            Self::Suspend => "Suspend",
+            Self::Reboot => "Reboot",
+            Self::PowerOff => "Power off",
         }
     }
 
@@ -49,7 +49,7 @@ impl PowerVerb {
     /// Locking is benign; everything that takes the host down is gated.
     #[must_use]
     pub const fn needs_confirm(self) -> bool {
-        !matches!(self, PowerVerb::Lock)
+        !matches!(self, Self::Lock)
     }
 
     /// The logind **Manager** method behind this verb — `None` for
@@ -57,10 +57,10 @@ impl PowerVerb {
     #[must_use]
     pub(crate) const fn manager_method(self) -> Option<&'static str> {
         match self {
-            PowerVerb::Lock => None,
-            PowerVerb::Suspend => Some("Suspend"),
-            PowerVerb::Reboot => Some("Reboot"),
-            PowerVerb::PowerOff => Some("PowerOff"),
+            Self::Lock => None,
+            Self::Suspend => Some("Suspend"),
+            Self::Reboot => Some("Reboot"),
+            Self::PowerOff => Some("PowerOff"),
         }
     }
 
@@ -68,10 +68,10 @@ impl PowerVerb {
     #[must_use]
     pub(crate) const fn can_method(self) -> Option<&'static str> {
         match self {
-            PowerVerb::Lock => None,
-            PowerVerb::Suspend => Some("CanSuspend"),
-            PowerVerb::Reboot => Some("CanReboot"),
-            PowerVerb::PowerOff => Some("CanPowerOff"),
+            Self::Lock => None,
+            Self::Suspend => Some("CanSuspend"),
+            Self::Reboot => Some("CanReboot"),
+            Self::PowerOff => Some("CanPowerOff"),
         }
     }
 }
@@ -95,27 +95,27 @@ impl Avail {
     #[must_use]
     pub fn from_reply(reply: &str) -> Self {
         match reply {
-            "yes" => Avail::Yes,
-            "no" => Avail::No,
-            "challenge" => Avail::Challenge,
-            _ => Avail::Na,
+            "yes" => Self::Yes,
+            "no" => Self::No,
+            "challenge" => Self::Challenge,
+            _ => Self::Na,
         }
     }
 
     /// Can the verb be offered as an affordance (it could succeed)?
     #[must_use]
     pub const fn offerable(self) -> bool {
-        matches!(self, Avail::Yes | Avail::Challenge)
+        matches!(self, Self::Yes | Self::Challenge)
     }
 
     /// The operator-facing availability label.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Avail::Yes => "available",
-            Avail::No => "refused by policy",
-            Avail::Challenge => "needs authorization",
-            Avail::Na => "not supported",
+            Self::Yes => "available",
+            Self::No => "refused by policy",
+            Self::Challenge => "needs authorization",
+            Self::Na => "not supported",
         }
     }
 }
@@ -204,6 +204,12 @@ impl LogindClient for ZbusLogind {
         })
     }
 
+    // A `match` keeps the two arms' distinct comments + differing call paths
+    // legible; `map_or_else` would fold them into closures and lose that.
+    #[allow(
+        clippy::option_if_let_else,
+        reason = "the two arms document distinct D-Bus paths; a match reads clearer"
+    )]
     fn act(&self, verb: PowerVerb) -> Result<(), SeatError> {
         match verb.manager_method() {
             // `session/auto` is the caller's own session — the always-allowed
@@ -218,9 +224,10 @@ impl LogindClient for ZbusLogind {
             // interactive=false: the shell already confirm-gated the action;
             // a polkit refusal comes back as a typed error, not a GUI prompt
             // (there is no agent on a bare seat).
-            Some(method) => self
-                .bus
-                .call_unit(LOGIN1, MANAGER_PATH, MANAGER_IFACE, method, &(false,)),
+            Some(method) => {
+                self.bus
+                    .call_unit(LOGIN1, MANAGER_PATH, MANAGER_IFACE, method, &(false,))
+            }
         }
     }
 }
