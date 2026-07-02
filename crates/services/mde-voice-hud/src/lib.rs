@@ -26,4 +26,5 @@
 pub mod media;
 pub mod resolve;
 pub mod roster;
+pub mod secure;
 pub mod sip;

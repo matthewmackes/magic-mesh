@@ -37,6 +37,13 @@ rsip = "0.4"
 tokio = { version = "1", default-features = false, features = ["rt"] }
 cpal = "0.17"
 
+# VOIP-GW-4 — secure SIP register over SIP/TLS (5061). Synchronous rustls
+# client (ring provider + std) matching the workspace substrate lock (no
+# OpenSSL linkage — deny.toml); the system trust store is loaded via
+# rustls-native-certs, the same versions mackesd's https443 transport pins.
+rustls              = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+
 # VOIP-28 / E7.5 — publish the persistent SIP agent's registration + listener
 # state to the Bus (`state/voice/status`) so the birthright commissioning
 # dashboard (and any other reader) can attest the softphone is up cross-process.

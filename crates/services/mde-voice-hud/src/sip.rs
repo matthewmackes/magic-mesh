@@ -21,7 +21,16 @@ use rsip::headers::Header;
 use rsip::services::DigestGenerator;
 use rsip::{Method, Uri};
 
+use crate::secure::{SecurityPolicy, SipTransport};
+
 /// A SIP account, the credentials the softphone registers with.
+///
+/// VOIP-GW-4 — this is the **inbound sub-account** half of the split: the
+/// per-node Vitelity sub-account this node REGISTERs as its callable identity.
+/// The shared-outbound trunk config (fleet caller-ID) is a separate
+/// [`SharedOutbound`]; outbound PSTN is bridged onto the shared trunk
+/// Vitelity-side, so this node performs a **single** REGISTER — of the
+/// sub-account only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SipAccount {
     pub username: String,
@@ -30,20 +39,91 @@ pub struct SipAccount {
     pub server_port: u16,
     pub display_name: String,
     pub expires: u32,
+    /// The confidentiality policy for this account's REGISTER leg (lock 17):
+    /// prefer TLS with an honest UDP fallback, require TLS, or UDP-only.
+    pub security: SecurityPolicy,
+}
+
+/// VOIP-GW-4 — the fleet-level **shared-outbound** trunk config (lock 4/13).
+///
+/// The ONE shared Vitelity account's caller-ID + trunk, held once for the
+/// fleet. A node does NOT register this — Vitelity bridges the sub-account's
+/// outbound onto the shared trunk — so it carries no SIP password here; it is
+/// purely the caller-ID this node's external calls present, published so the
+/// callee (and the panel) see the shared number.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SharedOutbound {
+    /// The shared caller-ID number presented on all outbound PSTN (the ONE
+    /// fleet number; verified on the callee).
+    pub caller_id: String,
+    /// The shared trunk host (informational — the bridge is configured
+    /// Vitelity-side; the client never registers it).
+    pub trunk_host: String,
+}
+
+/// VOIP-GW-4 — the split voice config a node loads: the inbound sub-account it
+/// registers, plus the optional fleet shared-outbound trunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceAccounts {
+    /// The per-node sub-account this node REGISTERs (its inbound identity).
+    pub inbound: SipAccount,
+    /// The fleet shared-outbound trunk (caller-ID). `None` on a legacy
+    /// single-account config or a registrar-less P2P identity.
+    pub outbound: Option<SharedOutbound>,
 }
 
 /// On-disk shape of `account.toml`.
+///
+/// Back-compat: the legacy **flat** form (`username`/`server`/… at top level)
+/// still parses. VOIP-GW-4 adds the split form with `[inbound_sub]` +
+/// `[shared_outbound]` tables; [`SipAccount::from_toml`] accepts either.
 #[derive(serde::Deserialize)]
 struct AccountFile {
+    #[serde(default)]
     username: String,
     #[serde(default)]
     password: String,
     /// Registrar, as `host` or `host:port`.
+    #[serde(default)]
     server: String,
     #[serde(default)]
     display_name: Option<String>,
     #[serde(default = "default_expires")]
     expires: u32,
+    /// Transport policy token (`prefer-tls` / `require-tls` / `udp`). Absent →
+    /// the secure default (`prefer-tls`).
+    #[serde(default)]
+    transport: Option<String>,
+    /// VOIP-GW-4 split form: the inbound sub-account table.
+    #[serde(default)]
+    inbound_sub: Option<InboundSubFile>,
+    /// VOIP-GW-4 split form: the shared-outbound trunk table.
+    #[serde(default)]
+    shared_outbound: Option<SharedOutboundFile>,
+}
+
+/// The `[inbound_sub]` table of the split config.
+#[derive(serde::Deserialize)]
+struct InboundSubFile {
+    username: String,
+    #[serde(default)]
+    password: String,
+    server: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default = "default_expires")]
+    expires: u32,
+    #[serde(default)]
+    transport: Option<String>,
+}
+
+/// The `[shared_outbound]` table of the split config.
+#[derive(serde::Deserialize)]
+struct SharedOutboundFile {
+    #[serde(default)]
+    caller_id: String,
+    #[serde(default, alias = "trunk")]
+    trunk_host: String,
 }
 
 fn default_expires() -> u32 {
@@ -73,14 +153,29 @@ impl SipAccount {
     /// Load the account: the **mesh-wide** gateway (QNM-Shared, set once in the
     /// Workbench for all clients) wins, then a node-local `account.toml`, else
     /// `None` (P2P-only — the HUD shows "Not registered"). VOIP-GW-1.
+    ///
+    /// This returns the inbound sub-account alone (back-compat with every
+    /// existing caller); [`load_accounts`](Self::load_accounts) returns the
+    /// full split (inbound + shared-outbound).
     pub fn load() -> Option<SipAccount> {
+        Self::load_accounts().map(|a| a.inbound)
+    }
+
+    /// VOIP-GW-4 — load the full split voice config (inbound sub-account +
+    /// optional shared-outbound trunk). Same source precedence as [`load`]: the
+    /// mesh-wide gateway wins, then the node-local file.
+    ///
+    /// [`load`](Self::load) is this with the outbound dropped, so existing
+    /// single-account callers are unchanged.
+    #[must_use]
+    pub fn load_accounts() -> Option<VoiceAccounts> {
         if let Ok(text) = std::fs::read_to_string(Self::mesh_gateway_path()) {
-            if let Ok(acct) = Self::from_toml(&text) {
-                return Some(acct);
+            if let Ok(accts) = Self::accounts_from_toml(&text) {
+                return Some(accts);
             }
         }
         let text = std::fs::read_to_string(Self::config_path()).ok()?;
-        Self::from_toml(&text).ok()
+        Self::accounts_from_toml(&text).ok()
     }
 
     /// VOIP-P2P — a registrar-less local identity for direct peer calls: no
@@ -102,27 +197,74 @@ impl SipAccount {
             server_port: 5060,
             display_name: host,
             expires: 0,
+            // Registrar-less P2P: no REGISTER leg, so no TLS to attempt.
+            security: SecurityPolicy::UdpOnly,
         }
     }
 
+    /// Parse the inbound sub-account alone — a test-only convenience over
+    /// [`accounts_from_toml`](Self::accounts_from_toml) (production code loads
+    /// the full split via [`load_accounts`](Self::load_accounts)).
+    #[cfg(test)]
     fn from_toml(text: &str) -> Result<SipAccount, String> {
+        Self::accounts_from_toml(text).map(|a| a.inbound)
+    }
+
+    /// VOIP-GW-4 — parse the split config, accepting both the new
+    /// `[inbound_sub]`/`[shared_outbound]` form and the legacy flat form.
+    fn accounts_from_toml(text: &str) -> Result<VoiceAccounts, String> {
         let f: AccountFile = toml::from_str(text).map_err(|e| e.to_string())?;
-        let (server_host, server_port) = split_host_port(&f.server, 5060);
-        if f.username.trim().is_empty() || server_host.is_empty() {
-            return Err("account.toml needs a username and a server".to_string());
+
+        // Split form: the `[inbound_sub]` table is the registered identity.
+        let (username, password, server, display_name, expires, transport) =
+            if let Some(sub) = f.inbound_sub {
+                (
+                    sub.username,
+                    sub.password,
+                    sub.server,
+                    sub.display_name,
+                    sub.expires,
+                    sub.transport,
+                )
+            } else {
+                // Legacy flat form.
+                (
+                    f.username,
+                    f.password,
+                    f.server,
+                    f.display_name,
+                    f.expires,
+                    f.transport,
+                )
+            };
+
+        let security = SecurityPolicy::parse(transport.as_deref().unwrap_or_default());
+        // Default the primary port to 5060 (back-compat with every legacy flat
+        // `account.toml`). The TLS leg targets 5061 via [`SipAccount::tls_addr`]
+        // unless the operator pinned an explicit non-default port.
+        let (server_host, server_port) = split_host_port(&server, SipTransport::Udp.default_port());
+        if username.trim().is_empty() || server_host.is_empty() {
+            return Err("voice config needs a username and a server".to_string());
         }
-        let display_name = f
-            .display_name
+        let display_name = display_name
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| f.username.clone());
-        Ok(SipAccount {
-            username: f.username,
-            password: f.password,
+            .unwrap_or_else(|| username.clone());
+        let inbound = SipAccount {
+            username,
+            password,
             server_host,
             server_port,
             display_name,
-            expires: f.expires.max(1),
-        })
+            expires: expires.max(1),
+            security,
+        };
+
+        let outbound = f.shared_outbound.map(|o| SharedOutbound {
+            caller_id: o.caller_id,
+            trunk_host: o.trunk_host,
+        });
+
+        Ok(VoiceAccounts { inbound, outbound })
     }
 
     /// `user@host` address-of-record.
@@ -133,6 +275,23 @@ impl SipAccount {
     /// The registrar request-URI (`sip:host`).
     fn registrar_uri(&self) -> String {
         format!("sip:{}", self.server_host)
+    }
+
+    /// VOIP-GW-4 — the port for a given transport. The configured
+    /// `server_port` is the UDP port; the TLS leg uses 5061 unless the operator
+    /// pinned an explicit non-default (`!= 5060`) port, which is honored as-is.
+    #[must_use]
+    pub const fn port_for(&self, transport: SipTransport) -> u16 {
+        match transport {
+            SipTransport::Udp => self.server_port,
+            SipTransport::Tls => {
+                if self.server_port == SipTransport::Udp.default_port() {
+                    SipTransport::Tls.default_port()
+                } else {
+                    self.server_port
+                }
+            }
+        }
     }
 }
 
@@ -285,6 +444,7 @@ fn build_register(
     account: &SipAccount,
     local_host: &str,
     local_port: u16,
+    transport: SipTransport,
     ids: &TxnIds,
     auth: Option<(&str, &str)>,
 ) -> String {
@@ -295,7 +455,8 @@ fn build_register(
     let _ = write!(m, "REGISTER {} SIP/2.0\r\n", account.registrar_uri());
     let _ = write!(
         m,
-        "Via: SIP/2.0/UDP {local_host}:{local_port};branch={};rport\r\n",
+        "Via: SIP/2.0/{} {local_host}:{local_port};branch={};rport\r\n",
+        transport.token(),
         ids.branch
     );
     m.push_str("Max-Forwards: 70\r\n");
@@ -843,6 +1004,45 @@ pub fn looks_like_peer(dialed: &str) -> bool {
     dialed.chars().any(|c| c.is_ascii_alphabetic())
 }
 
+/// VOIP-GW-4 — how a dialed target routes (lock 12: intra-mesh stays P2P; only
+/// external PSTN uses Vitelity — the mesh never hairpins internal calls through
+/// the trunk).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallRoute {
+    /// A mesh peer — dialed DIRECTLY over the Nebula overlay, registrar-less.
+    /// `peer_host` is the resolvable overlay host. NEVER touches Vitelity.
+    MeshP2p { peer_host: String },
+    /// An external number — placed via the shared Vitelity outbound trunk,
+    /// presenting the shared caller-ID.
+    ExternalTrunk,
+}
+
+impl CallRoute {
+    /// Whether this route uses Vitelity (the external trunk). A mesh peer
+    /// never does — the guard the "no hairpin" acceptance turns on.
+    #[must_use]
+    pub const fn uses_vitelity(&self) -> bool {
+        matches!(self, Self::ExternalTrunk)
+    }
+}
+
+/// VOIP-GW-4 — decide how a dialed string routes.
+///
+/// A peer name (any letter) resolves to a direct P2P overlay call; a pure
+/// number/extension routes to the shared Vitelity trunk. Pure — the single
+/// decision point for the "intra-mesh stays P2P, no Vitelity hairpin"
+/// invariant. Reuses [`looks_like_peer`] + [`peer_host_for`].
+#[must_use]
+pub fn route_call(dialed: &str) -> CallRoute {
+    if looks_like_peer(dialed) {
+        CallRoute::MeshP2p {
+            peer_host: peer_host_for(dialed),
+        }
+    } else {
+        CallRoute::ExternalTrunk
+    }
+}
+
 /// VOIP-P2P — normalize a dialed peer name to a resolvable overlay host. A bare
 /// name gets the `.mesh.mde` mesh-DNS suffix (which resolves to the peer's
 /// overlay IP); an already-qualified host (contains `.`), or a `sip:`/`user@`
@@ -1208,7 +1408,7 @@ fn route_source_ip(peer: std::net::SocketAddr) -> Option<String> {
     Some(probe.local_addr().ok()?.ip().to_string())
 }
 
-/// REGISTER on the agent's shared socket (send_to/recv_from the registrar),
+/// REGISTER on the agent's shared UDP socket (send_to/recv_from the registrar),
 /// honouring one digest challenge. Returns the resulting state.
 fn agent_register(
     sock: &UdpSocket,
@@ -1223,7 +1423,7 @@ fn agent_register(
         branch: format!("z9hG4bK{}", gen_token("")),
         cseq: 1,
     };
-    let req = build_register(account, local_ip, local_port, &ids, None);
+    let req = build_register(account, local_ip, local_port, SipTransport::Udp, &ids, None);
     if sock.send_to(req.as_bytes(), registrar).is_err() {
         return RegistrationState::Failed("REGISTER send failed".into());
     }
@@ -1239,7 +1439,7 @@ fn agent_register(
         let code = u16::from(resp.status_code.clone());
         if code == 200 {
             return RegistrationState::Registered {
-                server: format!("{}:{}", account.server_host, account.server_port),
+                server: format!("{}:{} · UDP", account.server_host, registrar.port()),
                 expires: account.expires,
             };
         }
@@ -1262,24 +1462,362 @@ fn agent_register(
                 branch: format!("z9hG4bK{}", gen_token("")),
                 cseq: 2,
             };
-            let req2 = build_register(account, local_ip, local_port, &ids2, Some((name, &auth)));
+            let req2 = build_register(
+                account,
+                local_ip,
+                local_port,
+                SipTransport::Udp,
+                &ids2,
+                Some((name, &auth)),
+            );
             let _ = sock.send_to(req2.as_bytes(), registrar);
         }
     }
     RegistrationState::Failed("no REGISTER reply".into())
 }
 
+/// Load the system trust store into a rustls client config (ring provider +
+/// TLS 1.2/1.3), matching mackesd's https443 transport. `Err` when no CA roots
+/// are available (`ca-certificates` missing) — an honest reason, not a
+/// certificate-verification bypass.
+fn tls_client_config() -> Result<std::sync::Arc<rustls::ClientConfig>, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    let loaded = rustls_native_certs::load_native_certs();
+    for cert in loaded.certs {
+        let _ = roots.add(cert);
+    }
+    if roots.is_empty() {
+        return Err("no system trust store (ca-certificates missing)".to_string());
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("rustls protocol setup failed ({e})"))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(std::sync::Arc::new(cfg))
+}
+
+/// Read one framed SIP message from a byte stream (SIP-over-TCP/TLS): headers
+/// to the blank line, then `Content-Length` body bytes. Used by the TLS
+/// register leg.
+fn read_sip_over_stream<S: std::io::Read>(s: &mut S) -> Result<rsip::Response, String> {
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut tmp = [0u8; 2048];
+    loop {
+        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            let head = &buf[..pos];
+            let content_len = content_length_of(head);
+            let total = pos + 4 + content_len;
+            if buf.len() >= total {
+                return rsip::Response::try_from(&buf[..total])
+                    .map_err(|e| format!("malformed TLS SIP reply ({e})"));
+            }
+        }
+        let n = s
+            .read(&mut tmp)
+            .map_err(|e| format!("TLS read failed ({e})"))?;
+        if n == 0 {
+            if buf.is_empty() {
+                return Err("TLS connection closed before a reply".to_string());
+            }
+            return rsip::Response::try_from(buf.as_slice())
+                .map_err(|e| format!("truncated TLS SIP reply ({e})"));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+}
+
+/// First index of `needle` in `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Parse the `Content-Length` from a raw header block (case-insensitive), 0 if
+/// absent/unparseable (typical for a REGISTER response).
+fn content_length_of(head: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(head);
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                return v.trim().parse::<usize>().unwrap_or(0);
+            }
+        }
+    }
+    0
+}
+
+/// VOIP-GW-4 — REGISTER over SIP/TLS (a **real** rustls handshake).
+///
+/// Opens a TCP connection to the registrar's TLS port (5061 unless the operator
+/// pinned a non-default port), completes the TLS handshake against the system
+/// trust store, then runs the same digest REGISTER exchange over the encrypted
+/// stream.
+///
+/// `Err(reason)` means the **TLS transport is unavailable** (no route /
+/// connect / handshake / config failure): the caller downgrades (`PreferTls`)
+/// or surfaces it as an honest `Error` (`RequireTls`) — never a silent
+/// plaintext register. `Ok(state)` means the TLS channel came up: `Registered`
+/// on a 200, or a `Failed` when the credentials were rejected over a good
+/// channel. Blocking.
+fn tls_register(
+    account: &SipAccount,
+    local_ip: &str,
+    local_port: u16,
+) -> Result<RegistrationState, String> {
+    use std::io::Write as _;
+
+    let host = account.server_host.clone();
+    let port = account.port_for(SipTransport::Tls);
+    let addr = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {host}:{port} failed ({e})"))?
+        .next()
+        .ok_or_else(|| format!("no address for {host}:{port}"))?;
+    let mut tcp = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| format!("TLS connect to {addr} failed ({e})"))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    let config = tls_client_config()?;
+    let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+        .map_err(|e| format!("bad TLS server name {host} ({e})"))?;
+    let mut conn = rustls::ClientConnection::new(config, server_name)
+        .map_err(|e| format!("TLS client init failed ({e})"))?;
+    let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
+
+    // First REGISTER — the first write drives the TLS handshake; a handshake
+    // failure surfaces here as an io error → "TLS transport unavailable".
+    let ids = TxnIds {
+        call_id: gen_token("reg-"),
+        from_tag: gen_token("t"),
+        branch: format!("z9hG4bK{}", gen_token("")),
+        cseq: 1,
+    };
+    let req = build_register(account, local_ip, local_port, SipTransport::Tls, &ids, None);
+    tls.write_all(req.as_bytes())
+        .map_err(|e| format!("TLS handshake/write failed ({e})"))?;
+    let _ = tls.flush();
+
+    let mut authed = false;
+    for _ in 0..2 {
+        let resp = match read_sip_over_stream(&mut tls) {
+            Ok(r) => r,
+            Err(e) => return Ok(RegistrationState::Failed(e)),
+        };
+        let code = u16::from(resp.status_code.clone());
+        if code == 200 {
+            return Ok(RegistrationState::Registered {
+                server: format!("{host}:{port} · TLS"),
+                expires: account.expires,
+            });
+        }
+        if (code == 401 || code == 407) && !authed {
+            authed = true;
+            let Some(ch) = parse_challenge(&resp) else {
+                return Ok(RegistrationState::Failed(
+                    "TLS auth challenge unparseable".into(),
+                ));
+            };
+            let auth = match authorization_value(account, &ch, &gen_token("c"), 1) {
+                Ok(a) => a,
+                Err(e) => return Ok(RegistrationState::Failed(format!("digest failed ({e})"))),
+            };
+            let name = if ch.proxy {
+                "Proxy-Authorization"
+            } else {
+                "Authorization"
+            };
+            let ids2 = TxnIds {
+                call_id: ids.call_id.clone(),
+                from_tag: ids.from_tag.clone(),
+                branch: format!("z9hG4bK{}", gen_token("")),
+                cseq: 2,
+            };
+            let req2 = build_register(
+                account,
+                local_ip,
+                local_port,
+                SipTransport::Tls,
+                &ids2,
+                Some((name, &auth)),
+            );
+            if let Err(e) = tls.write_all(req2.as_bytes()) {
+                return Ok(RegistrationState::Failed(format!("TLS write failed ({e})")));
+            }
+            let _ = tls.flush();
+        } else {
+            return Ok(RegistrationState::Failed(format!(
+                "registrar rejected REGISTER over TLS ({code})"
+            )));
+        }
+    }
+    Ok(RegistrationState::Failed(
+        "REGISTER not accepted over TLS".into(),
+    ))
+}
+
+/// VOIP-GW-4 — register the account under its [`SecurityPolicy`].
+///
+/// Returns the resulting state + the resolved [`TransportChoice`] (`None` only
+/// when `RequireTls` failed with no reachable secure endpoint — the caller
+/// publishes the honest `Error`). The TLS attempt itself is the availability
+/// probe: a connect/handshake failure drives the policy's fallback via
+/// [`crate::secure::select_transport`].
+fn register_with_policy(
+    sock: &UdpSocket,
+    account: &SipAccount,
+    local_ip: &str,
+    local_port: u16,
+) -> (RegistrationState, Option<crate::secure::TransportChoice>) {
+    use crate::secure::{select_transport, SecurityPolicy};
+
+    // Resolve the UDP registrar address once (used by UDP-only + the downgrade).
+    let udp_register = |sock: &UdpSocket| -> RegistrationState {
+        match (
+            account.server_host.as_str(),
+            account.port_for(SipTransport::Udp),
+        )
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.next())
+        {
+            Some(r) => agent_register(sock, r, account, local_ip, local_port),
+            None => RegistrationState::Failed("cannot resolve UDP registrar".into()),
+        }
+    };
+
+    if account.security == SecurityPolicy::UdpOnly {
+        let choice = select_transport(SecurityPolicy::UdpOnly, false).ok();
+        return (udp_register(sock), choice);
+    }
+
+    // Prefer/Require TLS: the real TLS attempt doubles as the availability probe.
+    match tls_register(account, local_ip, local_port) {
+        Ok(state) => {
+            // The TLS channel worked (state may be Registered or a creds Failed).
+            let choice = select_transport(account.security, true).ok();
+            (state, choice)
+        }
+        Err(reason) => match select_transport(account.security, false) {
+            // PreferTls → honest downgrade to UDP; log why TLS was unavailable.
+            Ok(choice) => {
+                tracing::warn!(reason = %reason, "voice-hud: TLS unavailable, downgrading to UDP");
+                (udp_register(sock), Some(choice))
+            }
+            // RequireTls → no fallback; surface the real reason as Error.
+            Err(err) => (RegistrationState::Failed(format!("{err}: {reason}")), None),
+        },
+    }
+}
+
+/// Map an in-process [`RegistrationState`] to the published (lock 9) phase +
+/// reason.
+fn reg_phase_of(st: &RegistrationState) -> (crate::secure::RegPhase, String) {
+    use crate::secure::RegPhase;
+    match st {
+        RegistrationState::Registered { .. } => (RegPhase::Registered, String::new()),
+        RegistrationState::Registering => (RegPhase::Provisioning, String::new()),
+        RegistrationState::NoAccount => (RegPhase::Unregistered, String::new()),
+        RegistrationState::Failed(reason) => (RegPhase::Error, reason.clone()),
+    }
+}
+
+/// VOIP-GW-4 — publish this node's registration state to `state/voice/<node>`.
+///
+/// The lock-9 shape (`Registered/Unregistered/Provisioning/Error+reason` + the
+/// live transport + honest downgrade flag + caller-ID) for the VOIP-GW-3 worker
+/// to mirror to the fleet board. Best-effort (a missing Bus is ignored).
+pub fn publish_node_reg_state(
+    st: &RegistrationState,
+    choice: Option<crate::secure::TransportChoice>,
+    caller_id: &str,
+) {
+    let Some(dir) = mde_bus::default_data_dir() else {
+        return;
+    };
+    let Ok(persist) = mde_bus::persist::Persist::open(dir) else {
+        return;
+    };
+    let node = crate::secure::node_name();
+    let (phase, reason) = reg_phase_of(st);
+    let server = match st {
+        RegistrationState::Registered { server, .. } => server.clone(),
+        _ => String::new(),
+    };
+    let body = crate::secure::node_reg_state_json(
+        &node,
+        phase,
+        &reason,
+        choice,
+        &server,
+        caller_id,
+        now_unix(),
+    );
+    let topic = crate::secure::node_reg_topic(&node);
+    if let Err(e) = persist.write(
+        &topic,
+        mde_bus::hooks::config::Priority::Default,
+        None,
+        Some(&body),
+    ) {
+        tracing::debug!(error = %e, "voice agent: node reg-state publish failed");
+    }
+}
+
 /// The persistent SIP agent: binds a stable socket on the route-to-registrar
 /// interface, registers (Contact = that socket), and serves inbound INVITE/BYE
 /// + UI answer/decline commands until told to shut down. Blocking — run on a
 /// dedicated thread. Never panics; transport failures end the loop cleanly.
+///
+/// Registers only the **inbound sub-account** (`account`) — a single REGISTER,
+/// under its [`SecurityPolicy`] (TLS-preferred with an honest UDP fallback).
+/// Outbound is bridged onto the shared trunk Vitelity-side, so there is no
+/// second registration here.
 pub fn run_agent(
     account: &SipAccount,
     events: &std::sync::mpsc::Sender<AgentEvent>,
     commands: &std::sync::mpsc::Receiver<AgentCommand>,
 ) {
+    run_agent_inner(account, "", events, commands);
+}
+
+/// VOIP-GW-4 — the split-aware agent entry.
+///
+/// Registers `accounts.inbound` and publishes the shared-outbound caller-ID
+/// (from `accounts.outbound`) in the per-node reg-state (`state/voice/<node>`)
+/// so the callee/board see the shared number. `run_agent` is this with no
+/// outbound (caller-ID empty).
+pub fn run_agent_accounts(
+    accounts: &VoiceAccounts,
+    events: &std::sync::mpsc::Sender<AgentEvent>,
+    commands: &std::sync::mpsc::Receiver<AgentCommand>,
+) {
+    let caller_id = accounts
+        .outbound
+        .as_ref()
+        .map(|o| o.caller_id.as_str())
+        .unwrap_or_default();
+    run_agent_inner(&accounts.inbound, caller_id, events, commands);
+}
+
+fn run_agent_inner(
+    account: &SipAccount,
+    caller_id: &str,
+    events: &std::sync::mpsc::Sender<AgentEvent>,
+    commands: &std::sync::mpsc::Receiver<AgentCommand>,
+) {
     use std::sync::mpsc::TryRecvError;
     use std::time::Instant;
+
+    // VOIP-GW-4 — re-REGISTER backoff bounds (lock 19): the normal refresh
+    // period applies on success; on a failed attempt the retry backs off
+    // exponentially from `base` to `cap`, then resumes the refresh cadence.
+    let backoff_base = Duration::from_secs(2);
+    let backoff_cap = Duration::from_secs(300);
+    let mut consecutive_failures: u32 = 0;
+    // The last resolved transport choice, republished with each state change.
+    let mut choice: Option<crate::secure::TransportChoice> = None;
 
     // VOIP-P2P — registrar-less mode (no `server_host`): skip REGISTER and bind
     // the well-known SIP port on the overlay so peers can dial us directly.
@@ -1330,7 +1868,15 @@ pub fn run_agent(
     // The socket is bound, so the agent is now listening for inbound INVITEs;
     // `listening` stays true for the rest of the loop.
     let mut reg_state = match registrar {
-        Some(registrar) => agent_register(&sock, registrar, account, &local_ip, local_port),
+        Some(_) => {
+            // VOIP-GW-4 — register the sub-account under its security policy
+            // (TLS-preferred, honest UDP fallback). `registrar` staying `Some`
+            // keeps the UDP inbound listener + re-REGISTER cadence below.
+            let (st, ch) = register_with_policy(&sock, account, &local_ip, local_port);
+            choice = ch;
+            consecutive_failures = u32::from(!matches!(st, RegistrationState::Registered { .. }));
+            st
+        }
         // VOIP-P2P — no registrar: we are reachable on the overlay directly.
         None => RegistrationState::Registered {
             server: format!("{local_ip}:{local_port} · P2P overlay"),
@@ -1338,6 +1884,7 @@ pub fn run_agent(
         },
     };
     publish_voice_status(&reg_state, true);
+    publish_node_reg_state(&reg_state, choice, caller_id);
     let _ = events.send(AgentEvent::Registration(reg_state.clone()));
     let mut next_reg = Instant::now() + reg_period;
     let mut next_status = Instant::now() + Duration::from_secs(STATUS_HEARTBEAT_SECS);
@@ -1440,12 +1987,27 @@ pub fn run_agent(
 
         // VOIP-P2P — only re-REGISTER when there is a registrar; a registrar-less
         // P2P agent just keeps listening (no registration to refresh).
-        if let Some(registrar) = registrar {
-            if Instant::now() >= next_reg {
-                reg_state = agent_register(&sock, registrar, account, &local_ip, local_port);
-                publish_voice_status(&reg_state, true);
-                let _ = events.send(AgentEvent::Registration(reg_state.clone()));
+        if registrar.is_some() && Instant::now() >= next_reg {
+            let (st, ch) = register_with_policy(&sock, account, &local_ip, local_port);
+            reg_state = st;
+            choice = ch;
+            publish_voice_status(&reg_state, true);
+            publish_node_reg_state(&reg_state, choice, caller_id);
+            let _ = events.send(AgentEvent::Registration(reg_state.clone()));
+            // VOIP-GW-4 — auto-recover on drop with backoff: a successful
+            // register resumes the steady refresh cadence; a failed one retries
+            // sooner, backing off exponentially (capped) as failures persist.
+            if matches!(reg_state, RegistrationState::Registered { .. }) {
+                consecutive_failures = 0;
                 next_reg = Instant::now() + reg_period;
+            } else {
+                let delay = crate::secure::reregister_backoff(
+                    consecutive_failures,
+                    backoff_base,
+                    backoff_cap,
+                );
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                next_reg = Instant::now() + delay;
             }
         }
 
@@ -1495,6 +2057,7 @@ mod tests {
             server_port: 5060,
             display_name: "Alice".into(),
             expires: 3600,
+            security: SecurityPolicy::UdpOnly,
         }
     }
 
@@ -1552,7 +2115,14 @@ mod tests {
             branch: "z9hG4bKbranch1".into(),
             cseq: 1,
         };
-        let msg = build_register(&sample_account(), "192.168.1.5", 5062, &ids, None);
+        let msg = build_register(
+            &sample_account(),
+            "192.168.1.5",
+            5062,
+            SipTransport::Udp,
+            &ids,
+            None,
+        );
         assert!(msg.starts_with("REGISTER sip:sip.example.com SIP/2.0\r\n"));
         assert!(msg.contains("Via: SIP/2.0/UDP 192.168.1.5:5062;branch=z9hG4bKbranch1;rport\r\n"));
         assert!(msg.contains("From: <sip:alice@sip.example.com>;tag=tag1\r\n"));
@@ -1579,6 +2149,7 @@ mod tests {
             &sample_account(),
             "10.0.0.2",
             5060,
+            SipTransport::Udp,
             &ids,
             Some(("Authorization", "Digest realm=\"r\"")),
         );
@@ -1596,6 +2167,7 @@ mod tests {
             server_port: 5060,
             display_name: "Mufasa".into(),
             expires: 60,
+            security: SecurityPolicy::UdpOnly,
         };
         let ch = Challenge {
             realm: "testrealm@host.com".into(),
@@ -1931,5 +2503,123 @@ mod tests {
         // sip: / user@ forms reduce to the host part.
         assert_eq!(peer_host_for("sip:pine"), "pine.mesh.mde");
         assert_eq!(peer_host_for("sip:matt@birch.mesh.mde"), "birch.mesh.mde");
+    }
+
+    // ── VOIP-GW-4: account split, transport ports, mesh-vs-external routing ──
+
+    #[test]
+    fn legacy_flat_account_still_parses_to_inbound_only() {
+        let a = SipAccount::accounts_from_toml(
+            "username = \"alice\"\npassword = \"secret\"\nserver = \"sip.example.com:5080\"\n",
+        )
+        .unwrap();
+        assert_eq!(a.inbound.username, "alice");
+        assert_eq!(a.inbound.server_port, 5080);
+        // No transport → the secure default.
+        assert_eq!(a.inbound.security, SecurityPolicy::PreferTls);
+        // A flat config has no shared-outbound trunk.
+        assert!(a.outbound.is_none());
+    }
+
+    #[test]
+    fn split_config_parses_inbound_sub_and_shared_outbound() {
+        let toml = "\
+            [inbound_sub]\n\
+            username = \"eagle\"\n\
+            password = \"subpw\"\n\
+            server = \"sip.vitelity.net\"\n\
+            transport = \"require-tls\"\n\
+            expires = 1800\n\
+            \n\
+            [shared_outbound]\n\
+            caller_id = \"+15551230000\"\n\
+            trunk = \"outbound.vitelity.net\"\n";
+        let a = SipAccount::accounts_from_toml(toml).unwrap();
+        // The registered identity is the sub-account.
+        assert_eq!(a.inbound.username, "eagle");
+        assert_eq!(a.inbound.password, "subpw");
+        assert_eq!(a.inbound.expires, 1800);
+        assert_eq!(a.inbound.security, SecurityPolicy::RequireTls);
+        // The shared-outbound trunk carries the fleet caller-ID, no password.
+        let out = a.outbound.expect("shared outbound");
+        assert_eq!(out.caller_id, "+15551230000");
+        assert_eq!(out.trunk_host, "outbound.vitelity.net");
+    }
+
+    #[test]
+    fn split_config_defaults_transport_to_prefer_tls() {
+        let toml = "\
+            [inbound_sub]\n\
+            username = \"pine\"\n\
+            server = \"sip.vitelity.net\"\n";
+        let a = SipAccount::accounts_from_toml(toml).unwrap();
+        assert_eq!(a.inbound.security, SecurityPolicy::PreferTls);
+    }
+
+    #[test]
+    fn tls_port_defaults_to_5061_but_honors_explicit() {
+        // Configured on the UDP default → TLS leg uses 5061.
+        let a = SipAccount::accounts_from_toml(
+            "username = \"a\"\nserver = \"h\"\ntransport = \"prefer-tls\"\n",
+        )
+        .unwrap()
+        .inbound;
+        assert_eq!(a.server_port, 5060);
+        assert_eq!(a.port_for(SipTransport::Udp), 5060);
+        assert_eq!(a.port_for(SipTransport::Tls), 5061);
+
+        // An operator-pinned non-default port is honored for both legs.
+        let b = SipAccount::accounts_from_toml("username = \"a\"\nserver = \"h:5070\"\n")
+            .unwrap()
+            .inbound;
+        assert_eq!(b.port_for(SipTransport::Tls), 5070);
+        assert_eq!(b.port_for(SipTransport::Udp), 5070);
+    }
+
+    #[test]
+    fn mesh_peer_routes_p2p_never_through_vitelity() {
+        // A peer NAME → direct P2P over the overlay, no Vitelity hairpin.
+        let r = route_call("pine");
+        assert_eq!(
+            r,
+            CallRoute::MeshP2p {
+                peer_host: "pine.mesh.mde".into()
+            }
+        );
+        assert!(
+            !r.uses_vitelity(),
+            "intra-mesh must not hairpin to Vitelity"
+        );
+        assert!(!route_call("UNIT-EAGLE").uses_vitelity());
+        assert!(!route_call("sip:matt@birch.mesh.mde").uses_vitelity());
+    }
+
+    #[test]
+    fn external_number_routes_to_shared_trunk() {
+        assert_eq!(route_call("915551234567"), CallRoute::ExternalTrunk);
+        assert!(route_call("915551234567").uses_vitelity());
+        assert!(route_call("+15551234567").uses_vitelity());
+    }
+
+    #[test]
+    fn content_length_of_reads_header_case_insensitively() {
+        assert_eq!(
+            content_length_of(b"SIP/2.0 200 OK\r\nContent-Length: 42"),
+            42
+        );
+        assert_eq!(content_length_of(b"SIP/2.0 200 OK\r\ncontent-length: 7"), 7);
+        // Absent → 0 (typical REGISTER response).
+        assert_eq!(content_length_of(b"SIP/2.0 200 OK\r\nVia: x"), 0);
+    }
+
+    #[test]
+    fn read_sip_over_stream_frames_by_content_length() {
+        // A 200 with a zero-length body arrives in one chunk.
+        let raw = b"SIP/2.0 200 OK\r\nVia: SIP/2.0/TLS h:5061;branch=z9hG4bKx\r\n\
+                    From: <sip:a@h>;tag=t\r\nTo: <sip:a@h>;tag=s\r\n\
+                    Call-ID: c\r\nCSeq: 1 REGISTER\r\nContent-Length: 0\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(raw.to_vec());
+        let resp = read_sip_over_stream(&mut cursor).expect("framed reply");
+        assert_eq!(u16::from(resp.status_code), 200);
     }
 }
