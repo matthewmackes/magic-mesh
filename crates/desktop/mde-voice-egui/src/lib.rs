@@ -29,6 +29,7 @@
 //! Tier (§6): desktop-shell — it depends only on the harness and the voice
 //! service (both inward edges), pulling in no mesh-substrate crate.
 
+pub mod fleet;
 pub mod model;
 
 mod view;
@@ -41,7 +42,8 @@ use mde_egui::egui::{self, Context};
 
 use mde_voice_hud::sip::SipAccount;
 
-use crate::model::{Command, Update, VoiceState};
+use crate::fleet::FleetState;
+use crate::model::{Command, Tab, Update, VoiceState};
 
 pub use view::{header as voice_header, voice_panel};
 
@@ -62,6 +64,12 @@ pub struct VoiceApp {
     /// identity) — gates the header's Retry affordance, which is meaningless
     /// (a dead-end) for a P2P node with no registrar to re-register against.
     registrar_backed: bool,
+    /// Which face is showing — the local dialer or the fleet board.
+    tab: Tab,
+    /// The VOIP-GW-5 fleet config board: the live per-node reg-state read off the
+    /// Bus + the shared-account config, with the provision/inbound/nickname
+    /// verbs. Its own Bus handle (read `state/voice/*`, publish `action/voice/*`).
+    fleet: FleetState,
 }
 
 impl VoiceApp {
@@ -99,6 +107,8 @@ impl VoiceApp {
             updates: update_rx,
             identity,
             registrar_backed,
+            tab: Tab::default(),
+            fleet: FleetState::new(),
         }
     }
 

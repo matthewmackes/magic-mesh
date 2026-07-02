@@ -12,7 +12,7 @@ use mde_egui::Style;
 
 use mde_voice_hud::sip::CallState;
 
-use crate::model::{call_tone, dial_ready, registration_tone, Command, Tone, VoiceState};
+use crate::model::{call_tone, dial_ready, registration_tone, Command, Tab, Tone, VoiceState};
 use crate::VoiceApp;
 
 /// The header strip rendered into `ui`: the surface title, the account identity,
@@ -78,6 +78,42 @@ pub fn header(ui: &mut egui::Ui, app: &VoiceApp) {
 /// The registration header and the per-frame worker-update drain stay with the
 /// standalone app's chrome ([`VoiceApp`]) — the shell owns those.
 pub fn voice_panel(ui: &mut egui::Ui, app: &mut VoiceApp) {
+    // A ringing inbound call takes precedence over tab browsing — Answer/Decline
+    // is urgent and must surface whichever tab is open, so the dialer stays
+    // reachable while the fleet board is up.
+    if app.state.ringing_in() {
+        let mut cmds = Vec::new();
+        ui.add_space(Style::SP_S);
+        incoming_card(ui, &app.state, &mut cmds);
+        for cmd in cmds {
+            app.send(cmd);
+        }
+        return;
+    }
+
+    // The section toggle: the local dialer, or the VOIP-GW-5 fleet board. The
+    // dialer keeps working; the fleet board is an added tab (design lock 5/16).
+    ui.add_space(Style::SP_XS);
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut app.tab, Tab::Dialer, "Dialer");
+        ui.add_space(Style::SP_XS);
+        ui.selectable_value(&mut app.tab, Tab::Fleet, "Fleet");
+    });
+    ui.add_space(Style::SP_XS);
+    ui.separator();
+
+    match app.tab {
+        Tab::Dialer => dialer_tab(ui, app),
+        Tab::Fleet => {
+            app.fleet.poll(ui.ctx());
+            app.fleet.show(ui);
+        }
+    }
+}
+
+/// The local dialer face: the transient error banner, then the dialer or the
+/// active-call card. Its intents flow to the SIP worker through `app`.
+fn dialer_tab(ui: &mut egui::Ui, app: &mut VoiceApp) {
     let mut cmds = Vec::new();
     if let Some(error) = &app.state.error {
         ui.add_space(Style::SP_XS);
@@ -85,9 +121,7 @@ pub fn voice_panel(ui: &mut egui::Ui, app: &mut VoiceApp) {
         ui.add_space(Style::SP_XS);
     }
     ui.add_space(Style::SP_S);
-    if app.state.ringing_in() {
-        incoming_card(ui, &app.state, &mut cmds);
-    } else if app.state.show_dialer() {
+    if app.state.show_dialer() {
         dialer(ui, &app.state, &mut app.dial, &mut cmds);
     } else {
         active_card(ui, &app.state, &mut cmds);
@@ -228,6 +262,8 @@ mod tests {
             updates,
             identity: identity.to_string(),
             registrar_backed,
+            tab: crate::model::Tab::default(),
+            fleet: crate::fleet::FleetState::new(),
         }
     }
 

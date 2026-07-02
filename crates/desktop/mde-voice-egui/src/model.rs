@@ -89,6 +89,20 @@ pub enum Command {
     Reregister,
 }
 
+/// Which face of the Voice surface is showing.
+///
+/// A section toggle beside the dialer: the local dialer, or the VOIP-GW-5 fleet
+/// config board. The dialer keeps working; the fleet board is an added tab
+/// (design lock 5/16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tab {
+    /// The local dialer / call surface (the pre-existing face).
+    #[default]
+    Dialer,
+    /// The per-node fleet config board.
+    Fleet,
+}
+
 /// A coarse, render-agnostic status tone — the view maps it to a `Style` colour
 /// so the colour choice stays out of the (GPU-free, testable) model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

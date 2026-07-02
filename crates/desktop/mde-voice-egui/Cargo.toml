@@ -40,6 +40,20 @@ mde-egui = { path = "../../shared/mde-egui" }
 # `hang_up`, `AgentEvent`/`AgentCommand`, the routing helpers) and the `media`
 # engine — all already tested there.
 mde-voice-hud = { path = "../../services/mde-voice-hud", default-features = false }
+# §6/§9 — the Fleet tab (VOIP-GW-5) reads the per-node reg-state the mackesd
+# `voice_provision` worker (VOIP-GW-3) publishes to `state/voice/*` and publishes
+# the typed `action/voice/*` verbs back, over the persist-first Bus path. mde-bus
+# is platform-services (rank 2), an INWARD edge from this desktop-shell crate
+# (rank 3) — the same path mde-shell-egui/mde-panel-egui already lean on.
+mde-bus = { path = "../../platform/mde-bus" }
+# The Bus payloads are (de)serialised with LOCAL serde structs (below) rather than
+# depending on the mackesd daemon — keeps the tier edge clean (§6).
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The Fleet-tab poll/publish round-trip test drives a real on-disk Bus spool.
+tempfile = "3"
 
 [lints]
 workspace = true
