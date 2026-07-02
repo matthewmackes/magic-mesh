@@ -241,3 +241,29 @@ Servo-free; only 5/6/7-engine/9 carry the Servo compile.
   quarantine); the browser inside VM sessions; live-watch import (on-demand only); a standalone window
   (shell surface only); requiring Firefox/NSS installed; CA-signed anything; the egress proxy
   (declined); perfect anti-fingerprint/anti-adblock.
+
+## Enterprise + delight addenda (survey round 2 — in progress, E1..E25)
+
+> A second operator survey (25 Q) hardening the browser to enterprise-class + delightful.
+> Locked so far (E1–E8) + two concrete UI revisions:
+
+- **Tabs = a LEFT vertical tab rail** (revises Q34/Q35's top strip) — tabs stack down the left
+  side of the GUI; the address/nav chrome stays on top. Pairs well with tab-heavy enterprise use.
+- **New-tab / home page = a Carbon-themed card grid of the mesh's published services** (E4) — the
+  new-tab page reads the mesh service registry (music.mesh, the Workbench, and any published
+  `<svc>.mesh`) and renders each as a clickable Carbon card the browser opens. A mesh-native
+  service launcher, not a blank page. Operator-brandable.
+- **E1 — Managed layer:** operator-pushed **managed bookmarks + locked settings** (read-only,
+  undeletable, fleet-synced, worker-enforced) distinct from users' own editable bookmarks.
+- **E2 — No kiosk mode** (full browser always).
+- **E3 — Direct connection only** (no corporate proxy).
+- **E5 — CA trust:** trust the **mesh CA + operator-addable enterprise CAs** on top of the system
+  bundle (internal/mesh HTTPS services are first-class, no warnings).
+- **E6 — Never audit** (privacy-only; no per-URL browsing log, no toggle).
+- **E7 — mTLS client-cert:** present the **node/mesh identity** as a client cert to mesh/allowlisted
+  services that request one (SSO-style access to internal services; never to public sites).
+- **E8 — Session hygiene:** policy idle **auto-lock + clear-session-on-close** + a manual
+  "end session / clear" button (shared-terminal safety; composes with the ephemeral default).
+
+*(E9–E25 pending: reading/viewing delight, productivity/navigation, tab/session UX, theming,
+accessibility — to be appended when the survey resumes.)*
