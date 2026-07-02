@@ -1,0 +1,39 @@
+# mde-chat — the pure model + logic for the ICQ-style Mesh Chat
+# (NOTIFY-CHAT-1, docs/design/mesh-chat-icq.md).
+#
+# Services tier: Message/Conversation/Room/Roster/Presence, an append-only
+# ring-buffer conversation log, Ed25519 sign+verify over the message bytes, and
+# the pure alert-fold (a Bus alert payload -> a Message from its origin host).
+# ZERO I/O: no Bus, no Syncthing, no zbus — that live plumbing is the
+# NOTIFY-CHAT-2 worker's job. Everything here is headless + unit-tested (the
+# mde-kvm / mde-notify pattern). No desktop-shell dep (layered-tiers gate).
+[package]
+name        = "mde-chat"
+description = "NOTIFY-CHAT-1 (Mesh Chat) — the pure, headless model for the ICQ-style unified messaging + notification interface: Message (Text/Clipboard/Alert/File/Call/Remote kinds), the append-only ring-buffer Conversation/Room log, Roster/Contact/Presence, Ed25519 sign+verify binding a message to its sender host, and the pure alert-fold that turns a Bus alert into a message from the originating host. No I/O; the live Bus/Syncthing/presence plumbing is the mackesd chat worker (NOTIFY-CHAT-2)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+# The unforgeable "from <host>" identity (lock 10): rustls-family Ed25519, the
+# same dep the mackesd node identity + CA blocklist sign with — never openssl.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Sortable, unique message ids minted from the INJECTED timestamp (lock 8/22
+# ordering). serde so an id round-trips through the Syncthing ring log as JSON.
+ulid = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+# Only the tests mint fresh keypairs / random ULID entropy; the model itself is
+# handed a SigningKey by the worker and never touches an RNG.
+rand = "0.8"
+
+[lints]
+workspace = true
