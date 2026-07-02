@@ -20,7 +20,7 @@
 //!
 //! The wire body is a JSON boundary (local serde structs, not a `mackesd`
 //! dependency — §6 mesh/desktop boundary), the same pattern the Fleet plane and
-//! the Clipboard surface use for their topics.
+//! the Chat surface use for their topics.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -48,7 +48,7 @@ const REFRESH: Duration = Duration::from_secs(1);
 ///
 /// `{ "severity": "info|warning|critical", "source_host": "nyc3", "flag":
 /// "SECURITY", "headline": "…", "action_label": "Open", "action_verb":
-/// "shell/goto/notifications" }` — `action_*` optional (both or neither).
+/// "shell/goto/chat" }` — `action_*` optional (both or neither).
 #[derive(Debug, Clone, Deserialize)]
 struct ToastMsg {
     /// The alert severity (drives color + dwell + preempt).
@@ -218,9 +218,12 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         "music" => Some(Surface::Music),
         "files" => Some(Surface::Files),
         "voice" => Some(Surface::Voice),
-        "notifications" => Some(Surface::Notifications),
-        "clipboard" => Some(Surface::Clipboard),
+        // The ONE notification interface (NOTIFY-CHAT-6) — the retired
+        // `notifications` / `clipboard` verbs now resolve here so a forward emitter's
+        // old `shell/goto/notifications` still reaches a live surface.
+        "chat" | "notifications" | "clipboard" => Some(Surface::Chat),
         "system" => Some(Surface::System),
+        "storage" => Some(Surface::Storage),
         _ => None,
     }
 }
@@ -425,11 +428,11 @@ mod tests {
 
     #[test]
     fn decode_carries_an_optional_action_when_both_fields_present() {
-        let raw = r#"{"severity":"info","source_host":"lh1","flag":"CHAT","headline":"new message","action_label":"Open","action_verb":"shell/goto/notifications"}"#;
+        let raw = r#"{"severity":"info","source_host":"lh1","flag":"CHAT","headline":"new message","action_label":"Open","action_verb":"shell/goto/chat"}"#;
         let toast = decode(raw).expect("decodes");
         let action = toast.action.expect("action set");
         assert_eq!(action.label, "Open");
-        assert_eq!(action.verb, "shell/goto/notifications");
+        assert_eq!(action.verb, "shell/goto/chat");
     }
 
     #[test]
@@ -497,8 +500,18 @@ mod tests {
     #[test]
     fn resolve_action_maps_goto_and_plane_verbs() {
         assert!(matches!(
+            resolve_action("shell/goto/chat"),
+            Some(Navigate::Surface(Surface::Chat))
+        ));
+        // The retired notify/clipboard verbs now resolve to the ONE Chat surface
+        // (NOTIFY-CHAT-6) so a forward emitter's old verb still reaches a surface.
+        assert!(matches!(
             resolve_action("shell/goto/notifications"),
-            Some(Navigate::Surface(Surface::Notifications))
+            Some(Navigate::Surface(Surface::Chat))
+        ));
+        assert!(matches!(
+            resolve_action("shell/goto/clipboard"),
+            Some(Navigate::Surface(Surface::Chat))
         ));
         assert!(matches!(
             resolve_action("shell/plane/fleet"),
@@ -559,7 +572,7 @@ mod tests {
         let rec = Recorder::default();
         let mut b = bridge_with(&rec);
         b.admit(
-            decode(r#"{"severity":"info","source_host":"nyc3","flag":"CHAT","headline":"a message","action_label":"Open","action_verb":"shell/goto/notifications"}"#)
+            decode(r#"{"severity":"info","source_host":"nyc3","flag":"CHAT","headline":"a message","action_label":"Open","action_verb":"shell/goto/chat"}"#)
                 .unwrap(),
         );
 

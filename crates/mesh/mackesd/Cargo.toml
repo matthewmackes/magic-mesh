@@ -88,12 +88,10 @@ mde-kdc-proto = { path = "../../kdc/mde-kdc-proto" }
 # SWAY-4 (v6.0 Q89/Q94) — marks_state worker uses Persist + rpc::reply_topic
 # to serve action/marks/* Bus action topics. Optional (async-services gate).
 mde-bus = { path = "../../platform/mde-bus", optional = true }
-# NOTIFY-DIST-2 — the alert-mirror worker reuses the alert-lane predicate +
-# shared-dir mirror helpers (async-services gate, with mde-bus).
-mde-notify = { path = "../../services/mde-notify", optional = true }
 # NOTIFY-CHAT-2 — the chat worker drives the pure mde-chat model (Message /
-# Conversation ring / Roster / Ed25519 sign+verify / alert-fold). Optional under
-# async-services (the worker is async-services-gated), like mde-bus/mde-notify.
+# Conversation ring / Roster / Ed25519 sign+verify / alert-fold). It is the ONE
+# notification path now (the retired shared-alert-mirror worker folded into it,
+# NOTIFY-CHAT-6). Optional under async-services (the worker is async-services-gated).
 mde-chat = { path = "../../services/mde-chat", optional = true }
 # E1.2 — role-gated worker subsets: run_serve gates each worker spawn by the
 # pinned deployment role (mde_role::load → rank). Non-optional + zero-dep, so
@@ -314,7 +312,6 @@ async-services = [
     "dep:futures-util",
     "dep:etcd-client",
     "dep:mde-bus",
-    "dep:mde-notify",
     "dep:mde-chat",
 ]
 

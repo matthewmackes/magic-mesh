@@ -32,7 +32,6 @@ members = [
     "crates/services/mde-files",
     "crates/services/mde-kvm",
     "crates/services/mde-musicd",
-    "crates/services/mde-notify",
     "crates/services/mde-voice-config",
     "crates/services/mde-voice-hud",
     "crates/desktop/mde-shell-egui",

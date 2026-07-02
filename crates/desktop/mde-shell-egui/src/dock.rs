@@ -7,8 +7,9 @@
 //! Fleet, MV-6), this node's local VM [`Instances`](Surface::Instances) (the
 //! cloud-hypervisor broker, E12-7), the brokered VM [`Desktop`](Surface::Desktop)
 //! (VDI, egui-native), the three embedded app surfaces (Music / Files / Voice),
-//! plus the two mesh information surfaces (Notifications / Clipboard). One surface
-//! shows at a time; the Workbench is always one click away.
+//! plus the unified [`Chat`](Surface::Chat) surface — the ONE notification
+//! interface (ICQ roster + folded alerts + clipboard clips, NOTIFY-CHAT). One
+//! surface shows at a time; the Workbench is always one click away.
 //!
 //! The rail is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
@@ -39,15 +40,11 @@ pub(crate) enum Surface {
     Files,
     /// The embedded Voice / SIP surface (`mde-voice-egui`).
     Voice,
-    /// The Notifications surface — mesh-wide alerts (security, presence,
-    /// firewall, compute) tailed from the Bus alert lanes.
-    Notifications,
-    /// The Clipboard surface — recent mesh clipboard entries from
-    /// `event/clipboard/clip`, newest first.
-    Clipboard,
-    /// The Chat surface — the ICQ roster + conversation panes (NOTIFY-CHAT-3):
-    /// every mesh host is a contact, its alerts are its messages, over the
-    /// `state/chat/roster` + `state/chat/conversation/<key>` worker read-model.
+    /// The Chat surface — the ONE unified notification interface (NOTIFY-CHAT):
+    /// every mesh host is a contact, and its alerts + clipboard copies are its
+    /// messages, over the `state/chat/roster` + `state/chat/conversation/<key>`
+    /// worker read-model. Subsumes the retired standalone Notifications +
+    /// Clipboard surfaces (NOTIFY-CHAT-6 cutover).
     Chat,
     /// The System surface — this seat's host controls (audio mixer, Bluetooth,
     /// displays, power & battery, backlight, hotkeys), folded from `mde-seat`
@@ -64,17 +61,15 @@ pub(crate) enum Surface {
 impl Surface {
     /// The dock entries in nav order — the Workbench (mesh-control home) first,
     /// then the local VM Instances broker + the brokered Desktop, then the three
-    /// app surfaces, then the two mesh information surfaces, and finally this
-    /// seat's host-controls System surface.
-    pub(crate) const ALL: [Surface; 11] = [
+    /// app surfaces, then the unified Chat surface (the ONE notification
+    /// interface), and finally this seat's host-controls System + Storage surfaces.
+    pub(crate) const ALL: [Surface; 9] = [
         Surface::Workbench,
         Surface::Instances,
         Surface::Desktop,
         Surface::Music,
         Surface::Files,
         Surface::Voice,
-        Surface::Notifications,
-        Surface::Clipboard,
         Surface::Chat,
         Surface::System,
         Surface::Storage,
@@ -89,8 +84,6 @@ impl Surface {
             Surface::Music => "Music",
             Surface::Files => "Files",
             Surface::Voice => "Voice",
-            Surface::Notifications => "Alerts",
-            Surface::Clipboard => "Clipboard",
             Surface::Chat => "Chat",
             Surface::System => "System",
             Surface::Storage => "Storage",
@@ -111,12 +104,8 @@ impl Surface {
             Surface::Music => "Play the mesh music library (Subsonic / Airsonic).",
             Surface::Files => "Browse local + peer folders and Send-To across the mesh.",
             Surface::Voice => "Place and receive mesh voice calls (SIP).",
-            Surface::Notifications => {
-                "Mesh-wide alerts — security, presence, firewall, compute events."
-            }
-            Surface::Clipboard => "Recent clipboard copies from across the mesh, newest first.",
             Surface::Chat => {
-                "Mesh chat (ICQ) — every host is a contact, its alerts are its messages."
+                "Mesh chat (ICQ) — every host is a contact; its alerts + clipboard copies are its messages."
             }
             Surface::System => {
                 "This seat's host controls — audio mixer, Bluetooth, displays, power, hotkeys."
@@ -162,11 +151,12 @@ mod tests {
 
     #[test]
     fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
-        // Eleven entries: Workbench first, two VM surfaces (Instances / Desktop),
-        // three app surfaces (Music / Files / Voice), the info surfaces
-        // (Notifications / Clipboard / Chat), the host-controls System surface,
-        // and the Storage surface (GParted-authentic disk management, E12-21).
-        assert_eq!(Surface::ALL.len(), 11);
+        // Nine entries: Workbench first, two VM surfaces (Instances / Desktop),
+        // three app surfaces (Music / Files / Voice), the unified Chat surface
+        // (the ONE notification interface — the standalone Notifications +
+        // Clipboard surfaces are retired, NOTIFY-CHAT-6), the host-controls System
+        // surface, and the Storage surface (GParted-authentic disk mgmt, E12-21).
+        assert_eq!(Surface::ALL.len(), 9);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
             Surface::Instances,
@@ -174,8 +164,6 @@ mod tests {
             Surface::Music,
             Surface::Files,
             Surface::Voice,
-            Surface::Notifications,
-            Surface::Clipboard,
             Surface::Chat,
             Surface::System,
             Surface::Storage,

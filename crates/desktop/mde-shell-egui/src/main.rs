@@ -16,7 +16,6 @@
 
 mod chat;
 mod chrome;
-mod clipboard;
 mod controller;
 mod datacenter;
 mod discovery;
@@ -27,7 +26,6 @@ mod hotkeys;
 mod instances;
 mod keyboard;
 mod network;
-mod notifications;
 mod provisioning;
 mod services_flow;
 mod session;
@@ -138,12 +136,6 @@ struct Shell {
     /// lifecycle; with no live VMM the ops surface mde-kvm's typed gated error, and
     /// an empty roster shows the honest "No local VMs" EmptyState.
     instances: instances::InstancesState,
-    /// The Notifications surface — tails the Bus alert lanes (security, presence,
-    /// firewall, compute, FDO) and accumulates mesh-wide alerts newest-first.
-    notifications: notifications::NotificationsState,
-    /// The Clipboard surface — tails `event/clipboard/clip` and shows recent mesh
-    /// clipboard entries captured by the clipboard_sync worker, newest first.
-    clipboard: clipboard::ClipboardState,
     /// The Chat surface (NOTIFY-CHAT-3) — the ICQ roster + conversation panes over
     /// the chat worker's `state/chat/roster` + `state/chat/conversation/<key>`
     /// read-model. A pure renderer; sends via `action/chat/send`.
@@ -208,8 +200,6 @@ impl Shell {
             vdi: vdi::VdiState::default(),
             discovery: discovery::DiscoveryState::default(),
             instances: instances::InstancesState::default(),
-            notifications: notifications::NotificationsState::default(),
-            clipboard: clipboard::ClipboardState::default(),
             chat: chat::ChatState::default(),
             system: system::SystemState::default(),
             storage: storage::StorageState::default(),
@@ -250,6 +240,21 @@ impl Shell {
                 if let Some(level) = self.system.dispatch_hotkey(hardware) {
                     self.toasts.flash_osd(level);
                 }
+            }
+        }
+    }
+
+    /// Apply a resolved [`toast_bridge::Navigate`] to the shell nav — the ONE place
+    /// a `shell/goto/<surface>` / `shell/plane/<plane>` verb executes, shared by the
+    /// KIRON chyron action and the chrome unread indicator (NOTIFY-CHAT-6). Any
+    /// target expands the shell (a navigation is never a no-op behind the session).
+    fn apply_nav(&mut self, nav: toast_bridge::Navigate) {
+        self.nav.expanded = true;
+        match nav {
+            toast_bridge::Navigate::Surface(surface) => self.nav.surface = surface,
+            toast_bridge::Navigate::Plane(plane) => {
+                self.nav.surface = Surface::Workbench;
+                self.nav.plane = plane;
             }
         }
     }
@@ -354,18 +359,6 @@ impl Shell {
                     voice_panel(ui, voice);
                 });
             }
-            Surface::Notifications => {
-                let notifications = &mut self.notifications;
-                ui.push_id("shell-notifications", |ui| {
-                    notifications.show(ui);
-                });
-            }
-            Surface::Clipboard => {
-                let clipboard = &mut self.clipboard;
-                ui.push_id("shell-clipboard", |ui| {
-                    clipboard.show(ui);
-                });
-            }
             Surface::Chat => {
                 let chat = &mut self.chat;
                 ui.push_id("shell-chat", |ui| {
@@ -443,13 +436,14 @@ impl Shell {
             self.discovery.poll(ctx);
         }
 
-        // The Notifications and Clipboard surfaces tail their respective bus
-        // topics whenever the shell is expanded — cheap incremental reads that
-        // keep the panels live so data is ready the instant the operator switches
-        // to either surface (no cold-start 5-second wait).
+        // The Chat surface — the ONE notification interface (folded alerts +
+        // clipboard clips + human chat) — tails its `state/chat/*` read-model
+        // whenever the shell is expanded: a cheap incremental read that keeps the
+        // roster + conversations live so data is ready the instant the operator
+        // switches to it, and drives the chrome unread indicator (no cold-start
+        // wait). This subsumes the retired Notifications + Clipboard polls
+        // (NOTIFY-CHAT-6).
         if self.nav.expanded {
-            self.notifications.poll(ctx);
-            self.clipboard.poll(ctx);
             self.chat.poll(ctx);
         }
 
@@ -467,16 +461,27 @@ impl Shell {
         self.system.poll(ctx);
 
         // The thin persistent chrome bar (48px = SP_XL + SP_M).
+        let unread = self.chat.total_unread();
         egui::TopBottomPanel::top("mcnf-chrome")
             .exact_height(Style::SP_XL + Style::SP_M)
             .show(ctx, |ui| {
-                if chrome::show(
+                let outcome = chrome::show(
                     ui,
                     &mut self.chrome,
                     self.system.snapshot(),
                     self.nav.expanded,
-                ) {
+                    unread,
+                );
+                if outcome.toggled {
                     self.nav.toggle_expand();
+                }
+                // The unread indicator opens the unified Chat surface through the
+                // ONE `shell/goto/chat` nav grammar (the same resolver the KIRON
+                // chyron uses) — no second navigation path in the chrome.
+                if outcome.open_chat {
+                    if let Some(nav) = toast_bridge::resolve_action("shell/goto/chat") {
+                        self.apply_nav(nav);
+                    }
                 }
             });
 
@@ -551,14 +556,7 @@ impl Shell {
         if let Some(nav) = self.toasts.drive(ctx) {
             // A clicked chyron action navigates — THIS is where the verb executes
             // (KIRON-1 deliberately only reported it). Any target expands the shell.
-            self.nav.expanded = true;
-            match nav {
-                toast_bridge::Navigate::Surface(surface) => self.nav.surface = surface,
-                toast_bridge::Navigate::Plane(plane) => {
-                    self.nav.surface = Surface::Workbench;
-                    self.nav.plane = plane;
-                }
-            }
+            self.apply_nav(nav);
         }
 
         // SURFACE-10 (lock 14): the on-screen keyboard overlay — drawn last (Foreground)

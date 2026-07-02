@@ -317,6 +317,18 @@ impl ChatState {
         now.saturating_sub(seen)
     }
 
+    /// The total unread across every contact **and** room — the count the shell's
+    /// chrome unread indicator shows (NOTIFY-CHAT-6). Because Chat is the ONE
+    /// notification interface, this is the whole-mesh unread tally (folded alerts +
+    /// clipboard clips + human chat), summed over the same per-conversation
+    /// watermarks the roster badges use, so the chrome badge can't diverge from the
+    /// surface. Zero on a solo host with a quiet mesh (the honest empty state).
+    pub(crate) fn total_unread(&self) -> usize {
+        let contacts: usize = self.convos.keys().map(|h| self.unread(h)).sum();
+        let rooms: usize = self.rooms.iter().map(|d| self.room_unread(&d.id)).sum();
+        contacts + rooms
+    }
+
     /// Render the ICQ surface: the roster rail on the left, the selected
     /// contact's conversation pane filling the rest.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
@@ -1393,6 +1405,38 @@ mod tests {
         room.insert(Message::text("fra1", 20, "new"));
         state.room_convos.insert("sys:all-fleet".into(), room);
         assert_eq!(state.room_unread("sys:all-fleet"), 1);
+    }
+
+    /// The chrome unread indicator's tally (NOTIFY-CHAT-6) sums every contact AND
+    /// room unread, over the same watermarks the roster badges use — so the chrome
+    /// badge can't diverge from the surface. A quiet mesh is an honest zero.
+    #[test]
+    fn total_unread_sums_contacts_and_rooms() {
+        let mut state = ChatState::default();
+        // A quiet host: nothing unread.
+        assert_eq!(state.total_unread(), 0);
+
+        // A contact with 2 new messages since the watermark.
+        let mut dm = Conversation::new("nyc3");
+        dm.insert(Message::text("nyc3", 10, "hi"));
+        dm.insert(Message::text("nyc3", 20, "still there?"));
+        state.convos.insert("nyc3".into(), dm);
+        state.seen.insert("nyc3".into(), 0);
+
+        // A room with 1 new message; only rooms in the registry are counted.
+        let mut room = Conversation::new("ops");
+        room.insert(Message::text("fra1", 30, "deploy done"));
+        state.room_convos.insert("ops".into(), room);
+        state.seen.insert(room_key("ops"), 0);
+        state.rooms = vec![RoomDescriptor {
+            id: "ops".into(),
+            name: "Ops".into(),
+            kind: RoomKind::AdHoc,
+            creator: "eagle".into(),
+            members: vec!["eagle".into()],
+        }];
+
+        assert_eq!(state.total_unread(), 3, "2 contact + 1 room unread");
     }
 
     /// Headless mount + tessellate with a selected room: the roster shows the Rooms

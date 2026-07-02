@@ -142,13 +142,13 @@ pub mod descriptors;
 pub mod image_build;
 // SURFACE-2 — DMI detection + per-model Surface profile (the hardware-
 // truth entry point for the Surface enablement epic).
-pub mod surface;
 pub mod image_catalog;
 pub mod install_profiles;
 pub mod leave;
 pub mod lifecycle;
 pub mod mesh_init;
 pub mod mirrors;
+pub mod surface;
 pub mod syncthing;
 // NET-INTROSPECT (PD-6/PD-7) — direct-vs-relay tunnel classification via
 // Nebula's loopback debug SSH server. Consumed by nebula_supervisor (renders
@@ -286,9 +286,9 @@ pub const CANONICAL_QNM_MOUNT: &str = "/mnt/mesh-storage";
 /// Under SUBSTRATE-V2 `/mnt/mesh-storage` ([`CANONICAL_QNM_MOUNT`]) is a plain
 /// Syncthing-replicated directory — writable **iff the dir actually exists**. A
 /// missing/unprovisioned share (early boot, before the first Syncthing sync)
-/// must NOT be written, or the shared-state writers (the heartbeat, the
-/// `alert-mirror` feeding the Hub's shared-alerts pane, `ssh-pubkey gossip`, the
-/// clipboard history) would silently land on a bare local dir. Any other root (a
+/// must NOT be written, or the shared-state writers (the heartbeat, the `chat`
+/// worker's replicated conversation logs, `ssh-pubkey gossip`, the clipboard
+/// history) would silently land on a bare local dir. Any other root (a
 /// dev `~/QNM-Shared`, a tempdir) is always writable, so dev/test is unaffected.
 #[must_use]
 pub fn shared_root_writable(root: &std::path::Path) -> bool {
@@ -362,7 +362,7 @@ mod shared_root_tests {
     fn canonical_writable_iff_dir_exists() {
         // SUBSTRATE-V2: the plain Syncthing dir is writable iff it exists —
         // fixes the post-cutover silent-drop of every shared-state write
-        // (heartbeat / alert-mirror / ssh-gossip / clipboard).
+        // (heartbeat / chat logs / ssh-gossip / clipboard).
         assert!(shared_root_writable_core(
             Path::new("/mnt/mesh-storage"),
             true

@@ -8,8 +8,9 @@
 //! (the canonical incremental query) and publish each *distinct* denial —
 //! deduped by `comm + source-type + target-type + class + perms` within a window
 //! (AVCs repeat noisily) — to the security lane `fleet/sec/selinux/<host>`. The
-//! panel classifies `fleet/sec*` as the Security group; the alert-mirror worker
-//! federates it; every node's Alert Center then shows it.
+//! `chat` worker folds `fleet/sec*` into the Security alert timeline of the ONE
+//! notification interface and federates it mesh-wide over the replicated chat log
+//! (NOTIFY-CHAT); every node's Chat surface then shows it.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -311,8 +311,9 @@ fn kdc_event_alert(ev: &HostEvent) -> Option<(String, &'static str)> {
 }
 
 /// NOTIFY-SRC-3 — publish a KDC device event to the bus alert lane
-/// `fdo/KDE Connect` (the panel's DesktopApp group); the `alert-mirror` worker
-/// federates it mesh-wide. Best-effort (open+write+drop; `Persist` is `!Send`).
+/// `fdo/KDE Connect`; the `chat` worker folds it into the ONE notification
+/// interface and federates it mesh-wide over the replicated chat log
+/// (NOTIFY-CHAT). Best-effort (open+write+drop; `Persist` is `!Send`).
 fn publish_kdc_alert(summary: &str, severity: &str) {
     let Some(dir) = mde_bus::default_data_dir() else {
         return;

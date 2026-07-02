@@ -378,16 +378,30 @@ impl ChromeState {
     }
 }
 
+/// What the chrome bar reported this frame — the Expand/Collapse toggle and/or a
+/// click on the unread indicator (NOTIFY-CHAT-6). The shell applies each; the
+/// unread click routes through the one `shell/goto/chat` nav grammar so the chrome
+/// has no second copy of the navigation.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ChromeOutcome {
+    /// The Expand/Collapse toggle was clicked this frame.
+    pub toggled: bool,
+    /// The unread indicator was clicked — open the unified Chat surface.
+    pub open_chat: bool,
+}
+
 /// Render the chrome bar's contents inside a top panel. Polls the live mesh
-/// summary (self-gating on the shared cadence), draws the brand mark + the three
-/// live slots, and returns `true` when the Expand/Collapse toggle was clicked this
-/// frame.
+/// summary (self-gating on the shared cadence), draws the brand mark + the live
+/// slots + the unread indicator, and reports the Expand toggle / unread click this
+/// frame. `unread` is the whole-mesh Chat tally (folded alerts + clipboard clips +
+/// human chat) — the ONE notification interface's badge.
 pub(crate) fn show(
     ui: &mut egui::Ui,
     chrome: &mut ChromeState,
     seat: Option<&SeatSnapshot>,
     expanded: bool,
-) -> bool {
+    unread: usize,
+) -> ChromeOutcome {
     chrome.poll(ui.ctx());
 
     // The mesh slots, then the read-only seat status icons (lock 3: Signal ·
@@ -402,7 +416,7 @@ pub(crate) fn show(
         ("Vol", volume_view(seat)),
     ];
 
-    let mut toggled = false;
+    let mut outcome = ChromeOutcome::default();
     ui.horizontal_centered(|ui| {
         // Brand mark — keeps the bar identifiable when a session is fullscreen.
         ui.label(
@@ -422,15 +436,59 @@ pub(crate) fn show(
             draw_slot(ui, name, view);
         }
 
-        // Expand / Collapse, pinned to the right edge.
+        // Expand / Collapse, pinned to the right edge, with the unread indicator
+        // just inside it (the ONE notification interface's badge — NOTIFY-CHAT-6).
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let label = if expanded { "Collapse" } else { "Expand" };
             if ui.button(label).clicked() {
-                toggled = true;
+                outcome.toggled = true;
+            }
+            ui.add_space(Style::SP_S);
+            if chat_indicator(ui, unread).clicked() {
+                outcome.open_chat = true;
             }
         });
     });
-    toggled
+    outcome
+}
+
+/// The unread indicator — a filled dot plus the word "Chat" and, when the mesh has
+/// unread notifications (folded alerts + clipboard clips + human chat, all one
+/// Chat surface now), a count badge. Accent when something waits, dim when quiet;
+/// always clickable so the operator can open Chat regardless. Reads the same
+/// `Style` dot glyph as the status slots (no emoji-font tofu risk), returns the
+/// click response (the caller routes it through `shell/goto/chat`). The tooltip is
+/// honest about the count so a dim dot never reads as a fabricated "all clear".
+fn chat_indicator(ui: &mut egui::Ui, unread: usize) -> egui::Response {
+    let (color, tooltip) = if unread > 0 {
+        (
+            Style::ACCENT,
+            format!("{unread} unread — open Chat (alerts, clipboard, messages)."),
+        )
+    } else {
+        (
+            Style::TEXT_DIM,
+            "No unread — open Chat (alerts, clipboard, messages).".to_string(),
+        )
+    };
+    let label = if unread > 0 {
+        // Cap the badge so a firehose can't stretch the bar.
+        let shown = if unread > 99 {
+            "99+".to_string()
+        } else {
+            unread.to_string()
+        };
+        RichText::new(format!("{DOT} Chat {shown}"))
+            .color(color)
+            .size(Style::SMALL)
+            .strong()
+    } else {
+        RichText::new(format!("{DOT} Chat"))
+            .color(color)
+            .size(Style::SMALL)
+    };
+    ui.add(egui::Button::new(label).frame(unread > 0))
+        .on_hover_text(tooltip)
 }
 
 /// One status slot: a tone dot, the slot name, and its live value (with a hover
@@ -559,6 +617,40 @@ mod tests {
         assert_eq!(v.value, "No session");
         assert_eq!(v.dot, Style::TEXT_DIM);
         assert!(v.tooltip.is_some_and(|t| t.contains("mde-vdi")));
+    }
+
+    #[test]
+    fn chrome_outcome_defaults_to_no_action() {
+        let o = ChromeOutcome::default();
+        assert!(!o.toggled);
+        assert!(!o.open_chat);
+    }
+
+    #[test]
+    fn chrome_bar_with_the_unread_indicator_tessellates() {
+        // The chrome bar (incl. the NOTIFY-CHAT-6 unread indicator) mounts + paints
+        // headless with a live unread count — proving the new indicator draws real
+        // geometry, the same CPU paint path the DRM runner drives.
+        use mde_egui::egui::{pos2, vec2, Rect};
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut chrome = ChromeState::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 48.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::TopBottomPanel::top("mcnf-chrome").show(ctx, |ui| {
+                let outcome = show(ui, &mut chrome, None, false, 7);
+                // No pointer events → neither affordance fires this frame.
+                assert!(!outcome.toggled && !outcome.open_chat);
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the chrome bar produced no draw primitives"
+        );
     }
 
     #[test]

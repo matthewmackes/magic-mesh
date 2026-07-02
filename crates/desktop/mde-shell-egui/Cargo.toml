@@ -73,11 +73,6 @@ mde-vdi-vnc = { path = "../mde-vdi-vnc" }
 # edge points inward to the services tier (§6).
 mde-kvm = { path = "../../services/mde-kvm" }
 
-# The Notifications surface reuses the `mde-notify` shared model (AlertTail +
-# AlertItem + severity classification) so alert rendering stays consistent with
-# the standalone notify center. Services tier; the edge points inward (§6).
-mde-notify = { path = "../../services/mde-notify" }
-
 # NOTIFY-CHAT-3 — the Surface::Chat ICQ UI renders the pure `mde-chat` model
 # (Roster / Contact / Presence / Message / MessageKind) it reads off the Bus
 # state topics (`state/chat/roster`, `state/chat/conversation/<key>`). The GUI is
