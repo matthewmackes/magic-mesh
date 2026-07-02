@@ -23,6 +23,11 @@
 
 use std::path::Path;
 
+/// SURFACE-3 — the day-2 activation half: the `surface_enable` verb/worker
+/// (iptsd activate + per-model config) and the guided MOK enrollment state
+/// machine, built on this module's [`SurfaceDevice`]/[`SurfaceProfile`].
+pub mod enable;
+
 /// The four DMI fields the Surface identity fold reads, already
 /// trimmed. A field the firmware/kernel doesn't expose is the empty
 /// string (never an error) — best-effort, like every other mackesd
@@ -86,7 +91,7 @@ pub const MS_VENDOR: &str = "Microsoft Corporation";
 /// One line-item subsystem the linux-surface matrix enables (design
 /// lock #2). A [`SurfaceProfile`] declares which of these a given model
 /// *has*; the verify board (SURFACE-4) probes exactly that set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Subsystem {
     /// Capacitive touchscreen (iptsd).
     Touch,

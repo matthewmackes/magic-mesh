@@ -7877,6 +7877,23 @@ fn run_serve(
             .expect("worker_names mutex")
             .push("host_state".into());
 
+        // SURFACE-3 — the per-node surface_enable worker. On a recognised
+        // Microsoft Surface it drains action/hardware/surface/<node>/enable
+        // (the Install tab's activate + MOK request), activates iptsd +
+        // applies the per-model config, walks the guided MOK enrollment
+        // (typed-armed reboot, honest firmware copy), and publishes the typed
+        // EnableResult to state/hardware/surface/<node>/enable. On a
+        // non-Surface node it idles (never touches the Bus). Live actions are
+        // integration-gated (honest typed errors, never faked).
+        sup.spawn(Spawn::new(
+            mackesd_core::workers::SurfaceEnableWorker::new(node_id.clone()),
+            RestartPolicy::Always,
+        ));
+        worker_names
+            .lock()
+            .expect("worker_names mutex")
+            .push("surface_enable".into());
+
         // MON-1.b (v2.6) — Netdata aggregator-IP publisher.
         // Pairs with `apply_netdata_monitor`'s baseline
         // /etc/netdata/netdata.conf: when this peer wins

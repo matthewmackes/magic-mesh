@@ -651,6 +651,14 @@ pub mod copilot;
 // lifecycle verb), writes a hash-chain audit row (the events plane — §8), and
 // replies. Leader-gated; graceful degrade. NO raw-shell/arbitrary-command channel.
 pub mod action;
+// SURFACE-3 — the per-node `surface_enable` worker (a leader-of-self worker:
+// it activates iptsd + applies the per-model config + walks the guided MOK
+// enrollment on its OWN hardware, never a remote node). It lives beside its
+// SURFACE-2 detection sibling under `crate::surface::enable` (not a file under
+// workers/); re-exported here so the supervisor spawn site + SURFACE-4 reach
+// it through the workers namespace like every other worker.
+#[cfg(feature = "async-services")]
+pub use crate::surface::enable::SurfaceEnableWorker;
 
 /// Every worker registered with the supervisor implements this
 /// trait. The trait is `async_trait` because the supervisor stores
