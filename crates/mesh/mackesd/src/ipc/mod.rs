@@ -52,6 +52,10 @@ pub mod route;
 // VPN-GW-2 — leader-managed, age-encrypted tunnel-secret distribution over the
 // mesh secret store; consumed by vpn_gw on add-tunnel (put) + tunnel-up (get).
 pub mod secret_store;
+// FILEMGR-6 — the shared mesh SSH key provisioner + sshd overlay bind: generates
+// + seals the shared keypair under `mesh-ssh-key` (the ref FILEMGR-5's mesh_mount
+// worker reads), installs the public half overlay-only, and owns the re-key path.
+pub mod mesh_ssh_key;
 // VPN-GW-1 — action/vpn/* tunnel CRUD + wg-quick/openvpn bring-up responder.
 pub mod vpn_gw;
 // VPN-GW-6 — tunnel health + exit-IP/leak verification + auto-failover + alerts.

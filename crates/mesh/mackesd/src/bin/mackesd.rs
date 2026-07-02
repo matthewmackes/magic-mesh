@@ -1173,6 +1173,53 @@ enum Cmd {
         /// `<XDG_DATA_HOME>/mde/tags.json` with `TagFlavor::Preset`.
         tag: String,
     },
+
+    /// FILEMGR-6 — provision / re-key the shared mesh SSH key (sshfs auth over
+    /// the overlay). The keypair is sealed in the mesh secret store under
+    /// `mesh-ssh-key` (the ref the FILEMGR-5 mesh-mount worker reads); the public
+    /// half installs for the mesh user behind an overlay-only sshd Match block.
+    MeshSshKey {
+        #[command(subcommand)]
+        cmd: MeshSshKeyCmd,
+    },
+}
+
+/// FILEMGR-6 — `mackesd mesh-ssh-key <sub>`: the shared-key lifecycle
+/// (provision / install / rotate / status). The re-key path is `rotate`.
+#[derive(Subcommand)]
+enum MeshSshKeyCmd {
+    /// Provision the shared key: generate + seal it if absent (idempotent), then
+    /// install the public half + the overlay-only sshd drop-in on THIS node.
+    Provision(MeshSshKeyArgs),
+    /// Install the already-sealed key's public half + the sshd drop-in on THIS
+    /// node (no generation). Fails honestly if nothing is sealed yet.
+    Install(MeshSshKeyArgs),
+    /// Re-key (revoke + rotate): generate a fresh keypair, reseal (revoking the
+    /// old private half), and re-install so the old public key drops.
+    Rotate(MeshSshKeyArgs),
+    /// Print whether the shared key is sealed + its installed public line.
+    Status(MeshSshKeyArgs),
+}
+
+/// Shared flags for the `mesh-ssh-key` verbs.
+#[derive(clap::Args)]
+struct MeshSshKeyArgs {
+    /// Repo root holding `automation/secrets/mcnf-secret.sh` (defaults to
+    /// `MCNF_REPO` / `/root/magic-mesh`) — selects the etcd-backed Mesh store
+    /// when present, else the local-AEAD fallback under the workgroup root.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    /// Workgroup root for the local-AEAD fallback store (defaults to
+    /// `MDE_WORKGROUP_ROOT` / the canonical mesh mount).
+    #[arg(long)]
+    workgroup_root: Option<PathBuf>,
+    /// Override the mesh SSH login user the key authorizes (default `root`).
+    #[arg(long)]
+    mesh_user: Option<String>,
+    /// Skip the live `systemctl reload sshd` — write the config only (the
+    /// activation stays deploy-gated). Also the default off-node behaviour.
+    #[arg(long)]
+    no_reload: bool,
 }
 
 /// #13 — `mackesd lighthouse <sub>` subcommands: the turn-key add/retire lifecycle.
@@ -4592,6 +4639,9 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::RemovePeer { node_id, force } => {
             return cmd_remove_peer(&db_path, &node_id, force);
+        }
+        Cmd::MeshSshKey { cmd } => {
+            return cmd_mesh_ssh_key(cmd);
         }
         Cmd::Secret { cmd } => {
             return cmd_secret(cmd);
@@ -9953,6 +10003,91 @@ fn cmd_secret(cmd: SecretCmd) -> anyhow::Result<()> {
                 std::process::exit(3);
             }
         },
+    }
+    Ok(())
+}
+
+/// FILEMGR-6 — `mackesd mesh-ssh-key <provision|install|rotate|status>`. The
+/// shared mesh SSH keypair is sealed under `mesh-ssh-key` (the ref the FILEMGR-5
+/// mesh-mount worker reads); the public half installs for the mesh user behind an
+/// overlay-only sshd Match block. `rotate` is the documented re-key path.
+fn cmd_mesh_ssh_key(cmd: MeshSshKeyCmd) -> anyhow::Result<()> {
+    use mackesd_core::ipc::mesh_ssh_key::{MeshKeyProvisioner, ProvisionOutcome, SshdReload};
+    use mackesd_core::ipc::secret_store::{repo_root, SecretStore};
+
+    let (args, verb) = match &cmd {
+        MeshSshKeyCmd::Provision(a) => (a, "provision"),
+        MeshSshKeyCmd::Install(a) => (a, "install"),
+        MeshSshKeyCmd::Rotate(a) => (a, "rotate"),
+        MeshSshKeyCmd::Status(a) => (a, "status"),
+    };
+    let repo = args.repo.clone().unwrap_or_else(repo_root);
+    let workgroup_root = args
+        .workgroup_root
+        .clone()
+        .unwrap_or_else(mackesd_core::default_qnm_shared_root);
+    let store = SecretStore::resolve(&repo, &workgroup_root);
+
+    let mut prov = MeshKeyProvisioner::new(store);
+    if let Some(user) = args.mesh_user.clone() {
+        prov = prov.with_mesh_user(user);
+    }
+    // Off-node / `--no-reload`: write the config but never fake the sshd reload.
+    if args.no_reload {
+        prov = prov.with_sshd_unit(None);
+    }
+
+    let report = |o: &ProvisionOutcome| {
+        let what = if o.rekeyed {
+            "re-keyed"
+        } else if o.generated {
+            "generated + sealed"
+        } else {
+            "reused sealed key"
+        };
+        println!("mesh-ssh-key {verb}: {what}");
+        println!("  public: {}", o.public_line);
+        match &o.reload {
+            SshdReload::Reloaded => println!("  sshd:   reloaded"),
+            SshdReload::Skipped => {
+                println!("  sshd:   config written (reload skipped — deploy-gated)")
+            }
+            SshdReload::Gated(why) => {
+                println!("  sshd:   config written, reload gated: {why}");
+            }
+        }
+    };
+
+    match cmd {
+        MeshSshKeyCmd::Provision(_) => report(&prov.provision().map_err(|e| anyhow::anyhow!(e))?),
+        MeshSshKeyCmd::Rotate(_) => report(&prov.rotate().map_err(|e| anyhow::anyhow!(e))?),
+        MeshSshKeyCmd::Install(_) => {
+            let line = prov
+                .sealed_public_line()
+                .map_err(|e| anyhow::anyhow!(e))?
+                .context(
+                "no shared mesh SSH key is sealed yet — run `mackesd mesh-ssh-key provision` first",
+            )?;
+            let reload = prov.apply(&line).map_err(|e| anyhow::anyhow!(e))?;
+            report(&ProvisionOutcome {
+                generated: false,
+                rekeyed: false,
+                public_line: line,
+                reload,
+            });
+        }
+        MeshSshKeyCmd::Status(_) => {
+            match prov.sealed_public_line().map_err(|e| anyhow::anyhow!(e))? {
+                Some(line) => {
+                    println!("mesh-ssh-key status: sealed");
+                    println!("  public: {line}");
+                }
+                None => {
+                    println!("mesh-ssh-key status: NOT provisioned");
+                    std::process::exit(3);
+                }
+            }
+        }
     }
     Ok(())
 }
