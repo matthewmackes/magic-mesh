@@ -32,6 +32,7 @@ mod provisioning;
 mod services_flow;
 mod session;
 mod storage;
+mod surface_card;
 mod system;
 mod thisnode;
 mod toast_bridge;
@@ -84,6 +85,11 @@ struct Shell {
     /// heartbeat freshness, daemon health, peer/leader context), folded from the
     /// world-readable mesh-status snapshot (WB-ThisNode). Reads no `mackesd` IPC.
     thisnode: thisnode::ThisNodeState,
+    /// The This Node plane's SURFACE-6 "Surface / Hardware Enablement" card — a
+    /// model-gated card that renders the `mackesd` surface workers' typed state
+    /// (SURFACE-2/3/4/5/7) off the Bus and drives their typed verbs. Appears only
+    /// on a detected Surface (the summary topic is the gate); inert otherwise.
+    surface_card: surface_card::SurfaceCardState,
     /// Network plane — the mesh network fabric's live status (overlay IP + cipher,
     /// the elected leader, the peer directory as network links, network-scoped
     /// service health, overlay routing), folded from the same world-readable
@@ -190,6 +196,7 @@ impl Shell {
             nav: Nav::default(),
             datacenter: datacenter::DatacenterState::default(),
             thisnode: thisnode::ThisNodeState::default(),
+            surface_card: surface_card::SurfaceCardState::default(),
             network: network::NetworkState::default(),
             controller: controller::ControllerState::default(),
             provisioning: provisioning::ProvisioningState::default(),
@@ -272,6 +279,7 @@ impl Shell {
                     &mut self.nav.plane,
                     &mut self.datacenter,
                     &self.thisnode,
+                    &mut self.surface_card,
                     &self.network,
                     &self.controller,
                     &self.provisioning,
@@ -416,6 +424,7 @@ impl Shell {
         if self.nav.expanded && self.nav.surface == Surface::Workbench {
             self.datacenter.poll(ctx);
             self.thisnode.poll(ctx);
+            self.surface_card.poll(ctx);
             self.network.poll(ctx);
             self.controller.poll(ctx);
             self.provisioning.poll(ctx);

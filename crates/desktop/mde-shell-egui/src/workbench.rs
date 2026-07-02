@@ -94,6 +94,10 @@ pub(crate) fn show(
     // render their polled status (`&self`), unlike the Fleet plane whose
     // `datacenter` publishes lifecycle actions.
     thisnode: &crate::thisnode::ThisNodeState,
+    // Mutable: the SURFACE-6 card reads the surface workers' typed state off the
+    // Bus and publishes typed enable / fw-apply requests (it holds the in-flight
+    // arm inputs + the in-process display controller).
+    surface_card: &mut crate::surface_card::SurfaceCardState,
     network: &crate::network::NetworkState,
     controller: &crate::controller::ControllerState,
     provisioning: &crate::provisioning::ProvisioningState,
@@ -152,7 +156,15 @@ pub(crate) fn show(
                 // WB-ThisNode — this host's live status (role, overlay IP,
                 // presence + heartbeat, daemon health, peer/leader context) off the
                 // world-readable mesh-status snapshot.
-                Plane::ThisNode => thisnode.show(ui),
+                Plane::ThisNode => {
+                    thisnode.show(ui);
+                    // SURFACE-6 — the model-gated Surface / Hardware Enablement
+                    // card. It draws only on a detected Surface (the summary
+                    // topic is the gate); on every other node it's inert.
+                    if surface_card.is_surface() {
+                        surface_card.show(ui);
+                    }
+                }
                 // WB-Controller — the mesh control plane's live status (the elected
                 // controller + its leader lease, and the fleet-wide control-service
                 // health rollup) off the same snapshot.
