@@ -1,0 +1,44 @@
+# mde-bookmarks — the pure model + CRDT for the mesh-synced Bookmarks
+# collection (BOOKMARKS-1, docs/design/mesh-bookmarks.md).
+#
+# Services tier: the strict one-parent bookmark tree (Bookmark / Folder), the
+# append-only op set (AddBookmark / EditBookmark / MoveItem / DeleteItem /
+# AddFolder / RenameFolder), the Hybrid Logical Clock that stamps each op, the
+# LSEQ-style fractional-index order keys, the last-writer-wins CRDT merge (LWW
+# on every field INCLUDING delete — no tombstones, lock Q4), and the
+# content-addressed favicon store. ZERO I/O: no Servo, no credentials, no
+# Syncthing, no Bus — that live plumbing is the BOOKMARKS-2 worker's job.
+# Everything here is headless + unit/property-tested (the mde-chat pattern).
+# No desktop-shell dep (layered-tiers gate).
+[package]
+name        = "mde-bookmarks"
+description = "BOOKMARKS-1 — the pure, headless model + CRDT for the mesh-synced Bookmarks collection: the strict one-parent Bookmark/Folder tree, UUID item ids, a Hybrid Logical Clock stamping each op, LSEQ-style fractional-index order keys, the append-only op set (Add/Edit/Move/Delete bookmark + Add/Rename folder), a last-writer-wins CRDT merge (LWW on every field incl. delete — no tombstones), and a content-addressed deduped favicon store. No I/O; the live Syncthing/Bus plumbing is the BOOKMARKS-2 worker (mackesd)."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+# The per-item CRDT key (lock Q1): a v4 UUID minted at creation. serde so an id
+# round-trips through the Syncthing op segments as JSON.
+uuid = { version = "1", features = ["v4", "serde"] }
+# The content-addressed favicon store (lock Q6): SHA-256 hashes the bytes so
+# identical icons dedup to one blob. Same dep the KDC / mackesd already hash
+# with — never openssl.
+sha2 = "0.10"
+
+[dev-dependencies]
+# The convergence property test shuffles op order and asserts an identical
+# converged tree; proptest drives the permutations (already an in-tree dep of
+# mde-kdc-proto, so it rides plain `cargo test` + CI).
+proptest = "1"
+
+[lints]
+workspace = true
