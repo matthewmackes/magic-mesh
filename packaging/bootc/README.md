@@ -11,9 +11,11 @@ monolithic `magic-mesh` RPM.
 Contents:
 
 - `Containerfile` — FROM `quay.io/fedora/fedora-bootc:42`, installs the
-  `magic-mesh` RPM (two lanes, below), adds the VDI substrate
-  (`podman` + `cloud-hypervisor`), wires the DRM seat, boots to
-  `graphical.target`. The writable-partition doctrine is documented inline.
+  `magic-mesh` RPM (two lanes, below), adds the VDI substrate: `podman`
+  (ships in the base; the install is a no-op guard) + **cloud-hypervisor
+  baked in as the pinned upstream static binary, sha256-verified** — Fedora
+  42 does not package it (proven live on the farm). Wires the DRM seat,
+  boots to `graphical.target`. The writable-partition doctrine is inline.
 - `units/mde-shell-egui.service` — the Quasar **DRM-seat unit** (greetd-style,
   no display manager, no compositor — `quasar-vdi-desktop.md` lock 34). Image
   lane only; the dnf/RPM lane keeps launching the shell from a session via
@@ -25,8 +27,17 @@ Contents:
   expected outcome on the airgap-ish farm; never a raw podman splat mid-build).
   An image already in local storage skips the pull probe entirely, so a
   side-loaded base (`podman load`) builds fully offline. Shellcheck-clean.
+- `system-preset/45-mcnf-quasar.preset` — the image-lane systemd preset (the
+  declared seat policy; the Containerfile's `systemctl enable` materializes
+  it, the preset keeps factory-reset/`preset-all` flows honest).
+- `verify-image.sh` — **static** acceptance checks against the built image
+  (payload binaries, seat unit + preset, enablement symlinks, graphical
+  default, doctrine artifacts). Explicitly not a boot test.
 - `rpms/` — staging dir for the local-RPM lane (populated by
   `build-image.sh --rpm`; only `.gitkeep` is committed).
+- `context.containerignore` — build-context allowlist (only `packaging/`
+  reaches the builder), passed via `--ignorefile` so no other container
+  build inherits it.
 
 ## Building
 
@@ -139,26 +150,51 @@ is untouched — a failed update is one `bootc rollback` away. Publishing the
 image to a registry (so `bootc upgrade` has a source) is **operator-gated**
 alongside the RPM channel publish (/release).
 
-## Verification status (2026-07-01)
+## Verification status (2026-07-01, re-run on .170 — supersedes the killed
+## worker's .130 capture)
 
-- **Verified**: `build-image.sh` shellcheck-clean; its refusal gates exercised
-  (bad `--rpm` path, bad `--disk` type → itemized `REFUSING to run`, rc 2);
-  unit-name set cross-checked against `packaging/systemd/` + mackesd's
-  `generate-rpm` assets/scriptlets; every state path grep-verified against the
-  units/sources it comes from.
-- **Real-build attempt** (`podman build`, farm host mm@172.20.0.130, podman
-  5.4.1, lane `repo`): **fails at the base-image pull** — the farm host cannot
-  reach `quay.io`:
+**Authoring-lane checks (worktree):**
 
-  ```text
-  Error: creating build container: initializing source
-  docker://quay.io/fedora/fedora-bootc:42: pinging container registry quay.io:
-  Get "https://quay.io/v2/": dial tcp: lookup quay.io: no such host
-  ```
+- `bash -n` + shellcheck clean on both scripts; `systemd-analyze verify` on
+  the seat unit clean (only the expected missing-binary note off-fleet).
+- Refusal gates exercised live: multi-fault itemized refusal (bad `--rpm` +
+  bad `--disk`; `--out` without `--disk`) → rc 2. Typed base gate exercised
+  live with an RFC-2606 `.invalid` registry → `GATED[E12-13/base-image]`,
+  rc 3.
+- Every doctrine claim grep-verified at source: role regex ≡
+  `magic-mesh-brand.service`; bus/workgroup env pins ≡ `mackesd.service`;
+  the enabled-unit set ≡ the RPM `post_install_script`; tmpfiles + `/etc`
+  unit + `.repo` destinations ≡ the `generate-rpm` assets.
 
-  (Verbatim failure re-captured in the E12-13 report; the farm's dnf flows go
-  through the LAN mirror — there is no container-registry egress.)
-- **Live-gated**: a green end-to-end `podman build` + first boot of the image
-  (needs a host with registry egress, or the base image side-loaded via
-  `podman load`); the `--disk` bootc-image-builder lane (root podman + the
-  same egress); registry publish (operator-gated, /release).
+**Real farm builds (mm@172.20.0.170, podman 5.4.1, rootless):**
+
+- The earlier ".130 cannot reach quay.io" story is **not** the current farm
+  truth: **.170 pulls `quay.io/fedora/fedora-bootc:42` fine**, and the
+  resolve gate's local-storage path was also proven ("offline OK", zero
+  network, on rebuilds).
+- **Channel lane: fails typed at dnf, not at the registry** — the gh-pages
+  channel 404s for fedora-42 repodata (`No match for argument: magic-mesh`).
+  The channel lane is therefore gated on the operator `/release` channel
+  publish, not on reachability.
+- **Local lane: GREEN end-to-end** with the farm-built
+  `magic-mesh-11.4.5-1.x86_64.rpm` → `localhost/magic-mesh-bootc:latest`.
+  Found + fixed live: **Fedora 42 does not package cloud-hypervisor**
+  (`No match for argument`), and podman already ships in the bootc base —
+  hence the pinned sha256-verified upstream static bake (v52.0, `--version`
+  proven in-build). `bootc container lint`: 9 passed / 4 warnings (the
+  documented `/var` seeding + dnf log noise; non-fatal by design).
+- **`verify-image.sh`: all static checks pass** against the built image —
+  payload binaries (incl. `cloud-hypervisor v52.0` executing), seat unit +
+  preset, role gate, the 7 enablement symlinks, `graphical.target` default,
+  `.repo` + tmpfiles doctrine. Static container inspection only — **not** a
+  boot.
+
+**Still live-gated (unchanged in kind, updated in cause):**
+
+- **Boot acceptance** — needs a boot target; the `--disk`
+  bootc-image-builder lane additionally needs root podman on the farm VM.
+  No boot was faked.
+- **Channel-lane image build** — operator-gated `/release` channel publish
+  (the 404 above).
+- **Registry publish** of the bootc image (what gives `bootc upgrade` a
+  source) — operator-gated alongside the RPM channel publish.
