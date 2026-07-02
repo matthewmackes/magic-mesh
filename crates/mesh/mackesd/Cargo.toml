@@ -91,6 +91,10 @@ mde-bus = { path = "../../platform/mde-bus", optional = true }
 # NOTIFY-DIST-2 — the alert-mirror worker reuses the alert-lane predicate +
 # shared-dir mirror helpers (async-services gate, with mde-bus).
 mde-notify = { path = "../../services/mde-notify", optional = true }
+# NOTIFY-CHAT-2 — the chat worker drives the pure mde-chat model (Message /
+# Conversation ring / Roster / Ed25519 sign+verify / alert-fold). Optional under
+# async-services (the worker is async-services-gated), like mde-bus/mde-notify.
+mde-chat = { path = "../../services/mde-chat", optional = true }
 # E1.2 — role-gated worker subsets: run_serve gates each worker spawn by the
 # pinned deployment role (mde_role::load → rank). Non-optional + zero-dep, so
 # the gating logic is available regardless of feature set.
@@ -311,6 +315,7 @@ async-services = [
     "dep:etcd-client",
     "dep:mde-bus",
     "dep:mde-notify",
+    "dep:mde-chat",
 ]
 
 [package.metadata.docs.rs]

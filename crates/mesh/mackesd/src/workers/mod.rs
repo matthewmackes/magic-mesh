@@ -588,6 +588,17 @@ pub mod clipboard_bridge;
 // `LiveServiceApply`, whose typed `IntegrationGated` is the honest live answer
 // today (§7 — never a fake success).
 pub mod service_onboard;
+// NOTIFY-CHAT-2 — the mackesd `chat` worker: the live plumbing behind the pure
+// `mde-chat` model (design docs/design/mesh-chat-icq.md). Runs on EVERY node incl.
+// headless (emit + relay, no UI). Drains `action/chat/send` (signs + relays a
+// Message on `event/chat/message` + persists it to this node's Syncthing ring-log
+// for offline backfill), folds every alert/event Bus lane into a message from the
+// originating host (lock 11, no emitter changes), derives presence from the
+// mesh-status snapshot + manual gossip, and republishes the `state/chat/roster` +
+// `state/chat/conversation/<key>` read-model the Surface::Chat UI (NOTIFY-CHAT-3)
+// renders. Bus + Syncthing roots are injectable seams so the whole worker is
+// headless-testable; live 2-node delivery + real backfill are integration-gated.
+pub mod chat;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
 // text clip on the bus + appends to ONE mesh-global `clipboard/history.json`

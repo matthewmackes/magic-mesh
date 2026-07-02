@@ -9184,6 +9184,43 @@ fn run_serve(
             worker_names.lock().expect("worker_names mutex").push("clipboard_sync".into());
         }
 
+        // NOTIFY-CHAT-2 — the `chat` worker: live Bus send/recv (signs +
+        // relays on event/chat/message, persists to this node's Syncthing
+        // ring-log for offline backfill), folds every alert/event lane into a
+        // message from the originating host (lock 11), derives presence from
+        // the mesh-status snapshot + manual gossip, and republishes the
+        // state/chat/roster + state/chat/conversation/<key> read-model the
+        // Surface::Chat UI renders. Runs on EVERY node incl. headless (emit +
+        // relay, no UI) so alerts flow fleet-wide; unknown-worker rank-0
+        // default runs it everywhere. self_host is the bare hostname (the
+        // roster/DM identity), signed with the persisted node identity key.
+        // NOTE (E12-20 storage worker adds its own spawn line to this block —
+        // keep-both merge expected).
+        if mackesd_core::worker_role::runs("chat", role_rank) {
+            match mackesd_core::node_key::load_or_create(std::path::Path::new(
+                mackesd_core::node_key::DEFAULT_KEY_PATH,
+            )) {
+                Ok(signing_key) => {
+                    let self_host =
+                        node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string();
+                    sup.spawn(Spawn::new(
+                        mackesd_core::workers::chat::ChatWorker::new(
+                            workgroup_root.clone(),
+                            self_host,
+                            signing_key,
+                        ),
+                        RestartPolicy::OnFailure,
+                    ));
+                    worker_names.lock().expect("worker_names mutex").push("chat".into());
+                }
+                Err(e) => tracing::warn!(
+                    target: "mackesd::chat",
+                    error = %e,
+                    "chat worker: node signing key unavailable; not spawning",
+                ),
+            }
+        }
+
         // TUNE-3.b (2026-05-26) — wire the v1.3.0 Fleet ansible-pull
         // worker. `crates/mackesd/src/workers/ansible_pull.rs::build`
         // has shipped since v2.0.0 Phase B.6 but stayed dead;
