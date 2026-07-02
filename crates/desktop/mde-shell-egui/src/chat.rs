@@ -28,7 +28,7 @@
 
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -37,6 +37,9 @@ use mde_bus::persist::Persist;
 use mde_chat::{Contact, Conversation, Message, MessageKind, Presence, Roster, Severity};
 use mde_egui::egui::{self, Align, Color32, Layout, RichText, ScrollArea};
 use mde_egui::Style;
+
+use crate::discovery::request_host_desktop;
+use crate::toast_bridge::{resolve_action, TOAST_TOPIC};
 
 /// Poll cadence — matches the chat worker's own 2s tick so the roster and open
 /// conversation stay live without a cold-start wait.
@@ -48,6 +51,13 @@ const ROSTER_TOPIC: &str = "state/chat/roster";
 const CONVERSATION_PREFIX: &str = "state/chat/conversation/";
 /// The UI's outbound verb — a chat message to send.
 const ACTION_CHAT_SEND: &str = "action/chat/send";
+/// The voice worker's dial verb (lock 15 — Call hands off to `mde-voice`). Chat is
+/// the launch point; a running SIP agent draining this is integration-gated.
+const ACTION_VOICE_DIAL: &str = "action/voice/dial";
+/// The `mde-files` Send-To verb (lock 15) — the sender's mackesd copies the source
+/// into the target peer's replicated inbox (the exact wire `bus_backend::send_to`
+/// publishes; a §6 JSON boundary, not a crate dep).
+const ACTION_FILE_SEND_TO: &str = "action/file-ops/send-to";
 
 /// The `state/chat/conversation/<key>` topic for one conversation key.
 fn conversation_topic(key: &str) -> String {
@@ -162,6 +172,9 @@ pub(crate) struct ChatState {
     selected: Option<String>,
     /// The composer buffer for the open conversation.
     draft: String,
+    /// The Send-To composer's file path buffer (typed or drag-dropped) — an empty
+    /// string hides the attach row's Send button (NOTIFY-CHAT-4, file kind).
+    attach_path: String,
     /// host → message count when last viewed; unread = current − watermark. A
     /// host first seen is watermarked at its current length so pre-existing
     /// backfilled history isn't flagged unread (unread = new since you looked).
@@ -177,6 +190,7 @@ impl Default for ChatState {
             convos: BTreeMap::new(),
             selected: None,
             draft: String::new(),
+            attach_path: String::new(),
             seen: BTreeMap::new(),
             last_poll: None,
         }
@@ -373,6 +387,7 @@ impl ChatState {
     /// a composer (peers only — the self-contact's alert timeline is read-only).
     fn conversation_pane(&mut self, ui: &mut egui::Ui, roster: &Roster, host: &str) {
         let is_self = roster.is_self(host);
+        let bus_root = self.bus_root.clone();
         // Header.
         if let Some(contact) = roster.get(host) {
             ui.horizontal(|ui| {
@@ -391,6 +406,12 @@ impl ChatState {
             }
             if let Some(status) = &contact.status_message {
                 mde_egui::muted_note(ui, status);
+            }
+            // Per-contact actions (lock 15) — chat is the launch point for voice +
+            // remote desktop. Only for a peer: you don't Call / Remote-Control your
+            // own node (the self-contact is alerts/clips only, lock 17).
+            if !is_self {
+                contact_actions(ui, bus_root.as_deref(), host);
             }
         }
         ui.separator();
@@ -412,7 +433,7 @@ impl ChatState {
             .show(ui, |ui| match self.convos.get(host) {
                 Some(conv) if !conv.is_empty() => {
                     for msg in conv.messages() {
-                        message_row(ui, msg, self_host, recipient);
+                        message_row(ui, msg, self_host, recipient, bus_root.as_deref());
                         ui.add_space(Style::SP_XS);
                     }
                 }
@@ -446,6 +467,31 @@ impl ChatState {
             let (glyph, label) = Delivery::for_recipient(Some(c)).badge();
             mde_egui::muted_note(ui, format!("{glyph} {label} → {}", c.presence.label()));
         }
+
+        // Send-To affordance (lock 15, file kind): a drag-dropped or typed path is
+        // handed to `mde-files` over the mesh. A DRM seat has no native file dialog,
+        // so drag-drop + a path field is the honest attach path.
+        if let Some(dropped) = ui
+            .ctx()
+            .input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()))
+        {
+            self.attach_path = dropped.to_string_lossy().into_owned();
+        }
+        let mut send_file = false;
+        ui.horizontal(|ui| {
+            mde_egui::muted_note(ui, "\u{1F4CE}"); // 📎
+            let field = egui::TextEdit::singleline(&mut self.attach_path)
+                .desired_width(f32::INFINITY)
+                .hint_text("Attach a file — path, or drop one here…");
+            ui.add(field);
+            let ready = !self.attach_path.trim().is_empty();
+            if ui
+                .add_enabled(ready, egui::Button::new("Send file"))
+                .clicked()
+            {
+                send_file = true;
+            }
+        });
         ui.add_space(Style::SP_XS);
 
         let text = self.draft.trim().to_string();
@@ -453,21 +499,86 @@ impl ChatState {
             self.send(host, &text);
             self.draft.clear();
         }
+        let path = self.attach_path.trim().to_string();
+        if send_file && !path.is_empty() {
+            self.send_file(host, Path::new(&path));
+            self.attach_path.clear();
+        }
     }
 
     /// Publish `action/chat/send` `{scope:"peer", to, text}` to the local Bus —
     /// the worker signs, persists, and relays it (best-effort; a missing Bus is a
     /// silent no-op, the honest solo-host state).
     fn send(&self, to: &str, text: &str) {
-        let Some(root) = self.bus_root.clone() else {
-            return;
-        };
-        let Ok(persist) = Persist::open(root) else {
-            return;
-        };
         let body = serde_json::json!({ "scope": "peer", "to": to, "text": text }).to_string();
-        let _ = persist.write(ACTION_CHAT_SEND, Priority::Default, None, Some(&body));
+        publish(self.bus_root.as_deref(), ACTION_CHAT_SEND, &body);
     }
+
+    /// Offer `path` to the `to` contact (lock 15, file kind): fire the real
+    /// `mde-files` Send-To so the bytes copy into the peer's replicated inbox
+    /// (reachable now), AND post the offer into the conversation as a chat message
+    /// carrying an inline `file` descriptor. The worker relaying the descriptor into
+    /// a rich [`MessageKind::File`] card is the integration seam — until then the
+    /// offer still shows as its human-readable `text`, never faked.
+    fn send_file(&self, to: &str, path: &Path) {
+        let name = path.file_name().map_or_else(
+            || path.to_string_lossy().into_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let size_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        // 1) The real transfer — the exact `bus_backend::send_to` wire (§6 boundary).
+        let send_to = serde_json::json!({
+            "sources": [path.to_string_lossy()],
+            "selector": format!("peer:{to}"),
+            "mode": "copy",
+            "conflict": "rename",
+        })
+        .to_string();
+        publish(self.bus_root.as_deref(), ACTION_FILE_SEND_TO, &send_to);
+        // 2) The conversation offer — human text now, an upgradeable `file` field for
+        //    the worker's File-card fold.
+        let offer = serde_json::json!({
+            "scope": "peer",
+            "to": to,
+            "text": format!("\u{1F4CE} sent file {name} ({size_bytes} bytes)"),
+            "file": { "name": name, "size_bytes": size_bytes },
+        })
+        .to_string();
+        publish(self.bus_root.as_deref(), ACTION_CHAT_SEND, &offer);
+    }
+}
+
+/// Publish `body` to `topic` on the local Bus via the persist-first path (the same
+/// discipline as [`ChatState::send`] and `discovery::publish`). Best-effort — a
+/// missing Bus directory / open failure is a silent no-op (the honest solo-host
+/// state), never a panic.
+fn publish(bus_root: Option<&Path>, topic: &str, body: &str) {
+    let Some(root) = bus_root else {
+        return;
+    };
+    let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        return;
+    };
+    let _ = persist.write(topic, Priority::Default, None, Some(body));
+}
+
+/// Raise a click-to-navigate chyron on the shell's ONE toast lane
+/// (`event/toast/show`) so KIRON-2's bridge — the shell's single navigation
+/// authority (main.rs owns `nav.surface`) — carries the operator to `verb`'s
+/// target. The Chat surface never mutates `nav.surface` itself (it must not touch
+/// the dock/Surface plumbing); routing the resolved verb through the existing
+/// consumer is how a chat action reaches shell navigation.
+fn navigate_via_toast(bus_root: Option<&Path>, source_host: &str, headline: &str, verb: &str) {
+    let body = serde_json::json!({
+        "severity": "info",
+        "source_host": source_host,
+        "flag": "CHAT",
+        "headline": headline,
+        "action_label": "Open",
+        "action_verb": verb,
+    })
+    .to_string();
+    publish(bus_root, TOAST_TOPIC, &body);
 }
 
 /// Read the newest (latest-wins) message on `topic` and deserialize its body.
@@ -478,10 +589,16 @@ fn latest_json<T: serde::de::DeserializeOwned>(persist: &Persist, topic: &str) -
 }
 
 /// Render one message row (human text, a clipboard copy, a folded alert card, or
-/// a file/call/remote hand-off). Rich kind interaction (re-copy, launch Call /
-/// Remote) is NOTIFY-CHAT-4; here every kind renders honestly read-only, and my
-/// own outgoing text carries its delivery checkmark (lock 19).
-fn message_row(ui: &mut egui::Ui, msg: &Message, self_host: &str, recipient: Option<&Contact>) {
+/// a file/call/remote hand-off). Each kind renders **and acts** (NOTIFY-CHAT-4 —
+/// re-copy, run an alert verb, download a file, re-launch Call / Remote); my own
+/// outgoing text carries its delivery checkmark (lock 19).
+fn message_row(
+    ui: &mut egui::Ui,
+    msg: &Message,
+    self_host: &str,
+    recipient: Option<&Contact>,
+    bus_root: Option<&Path>,
+) {
     let mine = msg.sender == self_host;
     ui.group(|ui| {
         ui.horizontal(|ui| {
@@ -501,17 +618,22 @@ fn message_row(ui: &mut egui::Ui, msg: &Message, self_host: &str, recipient: Opt
                 }
             });
         });
-        message_body(ui, msg);
+        message_body(ui, msg, bus_root);
     });
 }
 
-/// The body of a message row, by kind.
-fn message_body(ui: &mut egui::Ui, msg: &Message) {
+/// The body of a message row, by kind — each kind now *acts*, not just renders
+/// (NOTIFY-CHAT-4): a clipboard re-copies, an alert card runs its inline verb, a
+/// file offers a download, a Call / Remote row re-launches its session.
+fn message_body(ui: &mut egui::Ui, msg: &Message, bus_root: Option<&Path>) {
     match &msg.kind {
+        // Text (emoji is just text — the font renders the glyphs verbatim).
         MessageKind::Text(text) => {
             ui.label(RichText::new(text).color(Style::TEXT).size(Style::BODY));
         }
-        MessageKind::Clipboard { preview, .. } => {
+        // Clipboard — monospace preview + a one-click re-copy onto the local
+        // clipboard (egui's output command; the DRM/windowed backend owns the wire).
+        MessageKind::Clipboard { preview, full } => {
             ui.horizontal(|ui| {
                 mde_egui::muted_note(ui, "clipboard");
                 ui.label(
@@ -520,13 +642,25 @@ fn message_body(ui: &mut egui::Ui, msg: &Message) {
                         .size(Style::BODY)
                         .monospace(),
                 );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .button("Copy")
+                        .on_hover_text("Re-copy to clipboard")
+                        .clicked()
+                    {
+                        ui.ctx().copy_text(full.clone());
+                    }
+                });
             });
         }
+        // System alert card — severity-colored, its fields listed, and (when the
+        // fold carried a resolvable `action/shell/goto/<surface>`) an inline action
+        // button that runs the verb through the shell's one navigation authority.
         MessageKind::Alert {
             severity,
             flag,
             fields,
-            ..
+            action_verb,
         } => {
             let title = fields
                 .get("summary")
@@ -536,8 +670,26 @@ fn message_body(ui: &mut egui::Ui, msg: &Message) {
                 severity_color(*severity),
                 RichText::new(title).size(Style::BODY).strong(),
             );
-            mde_egui::muted_note(ui, format!("alert · {flag}"));
+            for (k, v) in fields {
+                if k == "summary" || k == "title" {
+                    continue; // already the card title
+                }
+                mde_egui::field(ui, k, v, Style::TEXT_DIM);
+            }
+            ui.horizontal(|ui| {
+                mde_egui::muted_note(ui, format!("alert · {flag}"));
+                if let Some(verb) = alert_nav_verb(action_verb.as_deref()) {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Go to \u{2192}").clicked() {
+                            navigate_via_toast(bus_root, "chat", title, &verb);
+                        }
+                    });
+                }
+            });
         }
+        // File offer — name + size and a download affordance. The bytes already
+        // replicated into this node's mesh inbox (the sender's Send-To); "Save"
+        // jumps to Files where they landed.
         MessageKind::File {
             name, size_bytes, ..
         } => {
@@ -545,15 +697,81 @@ fn message_body(ui: &mut egui::Ui, msg: &Message) {
                 mde_egui::muted_note(ui, "file");
                 ui.label(RichText::new(name).color(Style::TEXT).size(Style::BODY));
                 mde_egui::muted_note(ui, format!("{size_bytes} bytes"));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .button("Save")
+                        .on_hover_text("Open the mesh inbox in Files")
+                        .clicked()
+                    {
+                        navigate_via_toast(bus_root, "chat", name, "shell/goto/files");
+                    }
+                });
             });
         }
+        // Call / Remote rows are a record of a launched session — re-launchable.
         MessageKind::CallAction { target_host } => {
-            mde_egui::field(ui, "call", target_host, Style::ACCENT);
+            ui.horizontal(|ui| {
+                mde_egui::field(ui, "call", target_host, Style::ACCENT);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Call again").clicked() {
+                        dial_peer(bus_root, target_host);
+                    }
+                });
+            });
         }
         MessageKind::RemoteAction { target_host } => {
-            mde_egui::field(ui, "remote control", target_host, Style::ACCENT);
+            ui.horizontal(|ui| {
+                mde_egui::field(ui, "remote control", target_host, Style::ACCENT);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Connect again").clicked() {
+                        request_host_desktop(bus_root, target_host);
+                    }
+                });
+            });
         }
     }
+}
+
+/// The per-contact action bar under the conversation header: **Call** (SIP) and
+/// **Remote Control** (VDI), the two per-contact hand-offs of lock 15. Both fire
+/// their owning crate's Bus verb; the live SIP register+call and live VDI connect
+/// are integration-gated (a running agent / broker / guest), so this is the honest
+/// reachable near half — the launch, never a faked session.
+fn contact_actions(ui: &mut egui::Ui, bus_root: Option<&Path>, host: &str) {
+    ui.horizontal(|ui| {
+        if ui
+            .button("\u{1F4DE} Call")
+            .on_hover_text(format!("Place a SIP call to {host}"))
+            .clicked()
+        {
+            dial_peer(bus_root, host);
+        }
+        if ui
+            .button("\u{1F5A5} Remote Control")
+            .on_hover_text(format!("Open {host}'s remote desktop"))
+            .clicked()
+        {
+            request_host_desktop(bus_root, host);
+        }
+    });
+}
+
+/// Fire the voice worker's dial verb for `host` (lock 15 — Call hands off to
+/// `mde-voice`). The publish is reachable now; a running SIP agent draining it +
+/// the live register/call is integration-gated.
+fn dial_peer(bus_root: Option<&Path>, host: &str) {
+    let body = serde_json::json!({ "peer": host }).to_string();
+    publish(bus_root, ACTION_VOICE_DIAL, &body);
+}
+
+/// Translate a folded alert's `action_verb` (`action/shell/goto/<surface>`, lock
+/// 15) into the KIRON toast/nav grammar (`shell/goto/<surface>`), returning it only
+/// when it resolves to a real shell target — the shell's ONE resolver
+/// ([`resolve_action`]) is the gate, so a bare/unknown verb offers no button.
+fn alert_nav_verb(action_verb: Option<&str>) -> Option<String> {
+    let verb = action_verb?;
+    let nav = verb.strip_prefix("action/").unwrap_or(verb);
+    resolve_action(nav).map(|_| nav.to_string())
 }
 
 /// The empty-panel copy — honest about *why* nothing is listed. With no mesh Bus
@@ -685,6 +903,125 @@ mod tests {
         assert!(
             !prims.is_empty(),
             "the chat surface produced no draw primitives"
+        );
+    }
+
+    // ── NOTIFY-CHAT-4: message kinds + per-contact actions ────────────────────
+
+    /// The alert action button is offered only for a verb the shell's ONE resolver
+    /// accepts — a bare `action/shell/goto` or an unknown surface yields no button.
+    #[test]
+    fn alert_nav_verb_resolves_only_a_known_shell_target() {
+        assert_eq!(
+            alert_nav_verb(Some("action/shell/goto/system")).as_deref(),
+            Some("shell/goto/system"),
+        );
+        // Already in the KIRON grammar (no `action/` prefix) still resolves.
+        assert_eq!(
+            alert_nav_verb(Some("shell/goto/files")).as_deref(),
+            Some("shell/goto/files"),
+        );
+        // A bare verb without a surface, an unknown surface, and None → no button.
+        assert!(alert_nav_verb(Some("action/shell/goto")).is_none());
+        assert!(alert_nav_verb(Some("action/shell/goto/nope")).is_none());
+        assert!(alert_nav_verb(None).is_none());
+    }
+
+    /// The Bus-writing action helpers are best-effort: with no Bus directory they
+    /// are a silent no-op (the honest solo-host state), never a panic.
+    #[test]
+    fn action_helpers_are_silent_without_a_bus() {
+        publish(None, "action/x", "{}");
+        navigate_via_toast(None, "chat", "hi", "shell/goto/files");
+        dial_peer(None, "nyc3");
+        // send_file opens no Bus either — a ChatState with no bus_root.
+        let state = ChatState {
+            bus_root: None,
+            ..ChatState::default()
+        };
+        state.send_file("nyc3", Path::new("/tmp/does-not-matter.txt"));
+    }
+
+    /// Every one of the six kinds renders *and* draws its action affordance: build a
+    /// conversation carrying all six (emoji text, a clipboard clip, an alert card
+    /// with a resolvable verb, a file offer, a Call + a Remote row) and tessellate
+    /// the open pane. Proves each kind paints geometry over real model state — the
+    /// same CPU paint path the DRM runner drives.
+    #[test]
+    fn every_message_kind_renders_its_action() {
+        use mde_egui::egui::{pos2, vec2, Rect};
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        let mut state = ChatState::default();
+        let mut roster = Roster::new("eagle");
+        roster.upsert(Contact::new("nyc3", NodeRole::Workstation).with_presence(Presence::Online));
+        state.roster = Some(roster);
+
+        let mut conv = Conversation::new("nyc3");
+        conv.insert(Message::text("eagle", 10, "hello 👋 🎉")); // emoji is just text
+        conv.insert(Message::new(
+            "nyc3",
+            20,
+            MessageKind::Clipboard {
+                preview: "ssh nyc3".into(),
+                full: "ssh root@nyc3.mesh".into(),
+            },
+        ));
+        let mut fields = BTreeMap::new();
+        fields.insert("summary".to_string(), "disk 92%".to_string());
+        fields.insert("host".to_string(), "nyc3".to_string());
+        conv.insert(Message::new(
+            "nyc3",
+            30,
+            MessageKind::Alert {
+                severity: Severity::Warning,
+                flag: "storage".into(),
+                fields,
+                action_verb: Some("action/shell/goto/system".into()),
+            },
+        ));
+        conv.insert(Message::new(
+            "nyc3",
+            40,
+            MessageKind::File {
+                name: "report.pdf".into(),
+                size_bytes: 12_345,
+                mime: None,
+            },
+        ));
+        conv.insert(Message::new(
+            "eagle",
+            50,
+            MessageKind::CallAction {
+                target_host: "nyc3".into(),
+            },
+        ));
+        conv.insert(Message::new(
+            "eagle",
+            60,
+            MessageKind::RemoteAction {
+                target_host: "nyc3".into(),
+            },
+        ));
+        state.convos.insert("nyc3".into(), conv);
+        state.seen.insert("nyc3".into(), 6);
+        state.selected = Some("nyc3".into());
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 720.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.push_id("shell-chat", |ui| state.show(ui));
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the mixed-kind conversation produced no draw primitives"
         );
     }
 }

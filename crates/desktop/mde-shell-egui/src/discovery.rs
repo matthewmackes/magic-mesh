@@ -239,6 +239,30 @@ impl DiscoveryState {
     }
 }
 
+/// NOTIFY-CHAT-4 — the Chat surface's per-contact **Remote Control** reuses this
+/// exact broker `Open` wire path (§6, no second copy of the shape): open `host`'s
+/// desktop by publishing the same `SessionRequest::Open` the picker's Connect
+/// emits, naming the contact host as both the serving peer and the target. The
+/// near half — publishing the request — is reachable now; the broker actually
+/// serving a **host** (vs a VM) desktop is integration-gated (a running leader +
+/// guest), exactly like `connect_selected`. Best-effort: a missing Bus is a silent
+/// no-op (the honest solo-host state), the same discipline as `ChatState::send`.
+pub(crate) fn request_host_desktop(bus_root: Option<&Path>, host: &str) {
+    let Some(root) = bus_root else {
+        return;
+    };
+    let body = ConnectRequest::Open {
+        id: mint_session_id(host, now_ms()),
+        serving_peer: host.to_string(),
+        vm_id: host.to_string(),
+        client_peer: local_peer(),
+    }
+    .to_body();
+    if let Ok(persist) = Persist::open(root.to_path_buf()) {
+        let _ = persist.write(ACTION_TOPIC, Priority::Default, None, Some(&body));
+    }
+}
+
 /// Render the remote-desktop picker into `ui`: the mesh's advertised VMs
 /// (peer · name · state) with a Connect action, or an honest `EmptyState` when no
 /// peer is advertising a VM.

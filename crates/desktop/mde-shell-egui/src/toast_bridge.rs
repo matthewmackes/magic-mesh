@@ -193,7 +193,12 @@ pub(crate) enum Navigate {
 /// Resolve an opaque chyron action `verb` to shell navigation. The verb grammar is
 /// `shell/goto/<surface>` or `shell/plane/<plane>`; an unknown verb is a no-op
 /// (`None`) — a forward-compatible emitter never breaks the shell.
-fn resolve_action(verb: &str) -> Option<Navigate> {
+///
+/// `pub(crate)` so the Chat surface (NOTIFY-CHAT-4) reuses this ONE resolver to
+/// decide whether a folded alert's inline action verb names a reachable target
+/// before it offers the button — the shell has a single navigation grammar, not a
+/// second copy in `chat.rs`.
+pub(crate) fn resolve_action(verb: &str) -> Option<Navigate> {
     let rest = verb.strip_prefix("shell/")?;
     if let Some(name) = rest.strip_prefix("goto/") {
         return surface_by_name(name).map(Navigate::Surface);
