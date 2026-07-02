@@ -532,6 +532,14 @@ pub mod vm_lifecycle;
 // `event/podman/containers`. Universal like vm_lifecycle — every node can host
 // datacenter containers.
 pub mod container;
+// E12-20 — the storage worker: the privileged owner of the Workbench Storage plane
+// (GParted for the mesh, docs/design/workbench-storage-plane.md). Owns a typed
+// StorageOp pending-queue executor over a live UDisks2 zbus topology — stage-time
+// advisory + apply-time authoritative validation, hard-wall interlocks (root/boot/
+// EFI · mesh-storage backer · in-use VM/container backers), typed arming (lock 8),
+// per-op Bus progress, and the `state/storage/<node>` mirror + `action/storage/
+// <node>` verbs. Injectable UDisks2/executor/wall seams keep it headless-testable.
+pub mod storage;
 // MV-5a — the scheduler worker: the placement slice of the no-center scheduler.
 // Drains `action/schedule/place`, folds each node's latest `event/kvm/services`
 // capacity, chooses the target node (healthy pin → most-active → node_id

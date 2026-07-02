@@ -6488,6 +6488,26 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("container".into());
         }
+        // E12-20 — the storage worker: the privileged owner of the Workbench
+        // Storage plane (GParted for the mesh). Owns a typed StorageOp pending
+        // queue over a live UDisks2 zbus topology, validates each op at stage-time
+        // (advisory) + apply-time (authoritative), enforces the hard-wall
+        // interlocks (root/boot/EFI · mesh-storage backer · in-use VM/container)
+        // and the typed-arming echo IN the executor (a UI bug can't bypass), and
+        // publishes the `state/storage/<node>` topology mirror + drains
+        // `action/storage/<node>` verbs. Universal like vm_lifecycle/container —
+        // any node has disks — so it gates through the rank-0-default resolver.
+        // node_id is the per-node topic namespace + the mirror `host` stamp.
+        if mackesd_core::worker_role::runs("storage", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::storage::StorageWorker::new(node_id.clone()),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("storage".into());
+        }
         // MV-5a — the scheduler worker: the placement slice of the no-center
         // scheduler. Drains `action/schedule/place`, folds each node's latest
         // `event/kvm/services` capacity, chooses the target node (healthy pin →
