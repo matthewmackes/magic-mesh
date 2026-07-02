@@ -81,6 +81,9 @@ pub(crate) struct SystemState {
     confirm: Option<PowerVerb>,
     /// The last control action's honest inline error (a refused write / interlock).
     error: Option<String>,
+    /// Publishes each fresh snapshot to the node-local mirror topic so the `mackesd`
+    /// `host_state` worker can mirror this node mesh-wide (E12-19, lock 1).
+    mirror: crate::host_mirror::HostMirrorPublisher,
 }
 
 impl Default for SystemState {
@@ -95,6 +98,7 @@ impl Default for SystemState {
             ddc_brightness: BTreeMap::new(),
             confirm: None,
             error: None,
+            mirror: crate::host_mirror::HostMirrorPublisher::default(),
         }
     }
 }
@@ -131,6 +135,10 @@ impl SystemState {
             self.last_poll = Some(Instant::now());
             let snap = self.seat.snapshot();
             self.reconcile(&snap);
+            // Mirror the fresh snapshot mesh-wide (E12-19, lock 1): the host_state
+            // worker republishes it to state/host/<node>/seat for every peer's
+            // Workbench. Published on the shared cadence, not per-frame.
+            self.mirror.publish(&snap);
             self.snapshot = Some(snap);
         }
         ctx.request_repaint_after(REFRESH);

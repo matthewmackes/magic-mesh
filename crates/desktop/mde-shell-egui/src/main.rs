@@ -21,6 +21,7 @@ mod controller;
 mod datacenter;
 mod discovery;
 mod dock;
+mod host_mirror;
 mod hotkeys;
 mod instances;
 mod network;
