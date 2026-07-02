@@ -52,7 +52,7 @@
 
 #![cfg(feature = "async-services")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -63,7 +63,8 @@ use super::{ShutdownToken, Worker};
 use crate::ipc::secret_store::{self, SecretStore};
 use crate::vitelity::model::VitelityCredentials;
 use crate::vitelity::{
-    CreateSubAccount, LiveVitelityClient, SubAccountCredentials, VitelityClient,
+    CreateSubAccount, Did, DidRouting, FailoverPolicy, LiveVitelityClient, SubAccountCredentials,
+    VitelityClient,
 };
 
 /// Reconcile cadence — voice provisioning is slow-changing (a node is
@@ -85,6 +86,26 @@ pub const PROVISION_TOPIC: &str = "action/voice/provision";
 /// Bus topic prefix the per-node reg-state / fleet-board row is published
 /// under (lock 9). The Voice panel (VOIP-GW-5) drains `state/voice/*`.
 pub const STATE_TOPIC_PREFIX: &str = "state/voice/";
+
+/// The typed verb the Voice panel publishes to route an **existing** master
+/// DID to a node's sub-account (lock 11 — route-only, never a new-DID provision).
+///
+/// Body: [`DidRouteRequest`]. A message forces an immediate reconcile so the
+/// operator sees the route take promptly. Typed verb in the canonical
+/// `action/<domain>/<verb>` namespace (§9).
+pub const DID_ROUTE_TOPIC: &str = "action/voice/did-route";
+
+/// The typed verb the Voice panel publishes to set a node's offline-inbound
+/// failover policy (lock 10). Body: [`FailoverRequest`].
+pub const FAILOVER_TOPIC: &str = "action/voice/failover";
+
+/// The Bus topic the master account's existing DID inventory is published to
+/// (lock 11).
+///
+/// The Voice panel reads it to offer the route control; it is a single
+/// fleet-wide list, NOT under [`STATE_TOPIC_PREFIX`] (which is one row per
+/// node). The body is a JSON array of [`Did`].
+pub const DIDS_TOPIC: &str = "state/voice-dids";
 
 /// Fallback SIP realm used to render a node's `<user>@<realm>` address when
 /// Vitelity hasn't reported the sub-account's realm yet. The live client
@@ -200,6 +221,17 @@ pub struct NodeVoiceState {
     /// The provisioning / registration state.
     #[serde(flatten)]
     pub reg_state: RegState,
+    /// The master-account DIDs currently routed to this node's sub-account
+    /// (lock 11). Reflects the **actual** Vitelity routing after the pass — a
+    /// route that failed to apply is absent, never fabricated (§7). Empty when
+    /// no DID targets this node.
+    #[serde(default)]
+    pub routed_dids: Vec<String>,
+    /// The node's offline-inbound failover policy that was successfully applied
+    /// this pass (lock 10). `None` when the operator hasn't set one (or the
+    /// apply failed) — never a fabricated policy.
+    #[serde(default)]
+    pub failover: Option<FailoverPolicy>,
     /// When this row was produced (epoch seconds).
     pub updated_at_s: u64,
 }
@@ -297,6 +329,115 @@ pub fn plan_reconcile(
     actions
 }
 
+/// A desired DID→node route the operator set from the panel (lock 11).
+///
+/// The reconcile drives `route_did` to make it so; `node_id == None` means
+/// "route this DID back to the master account's main line" (unroute).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesiredDidRoute {
+    /// The existing master-account DID to route (never a new-DID provision).
+    pub did: String,
+    /// The node whose sub-account the DID should ring, or `None` for the main
+    /// account.
+    pub node_id: Option<String>,
+}
+
+/// A desired per-node failover policy the operator set from the panel (lock 10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesiredFailover {
+    /// The node the policy applies to.
+    pub node_id: String,
+    /// The offline-inbound policy (voicemail / forward / none).
+    pub policy: FailoverPolicy,
+}
+
+/// One idempotent DID-routing action (lock 11 + 19).
+///
+/// A pure diff of desired (operator intent) vs actual (Vitelity's current
+/// `routed_to`) so it is unit-testable without any I/O. Never creates a DID —
+/// it only re-points an existing one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DidAction {
+    /// Point an existing DID at a node's sub-account username.
+    Route {
+        /// The DID to re-point.
+        did: String,
+        /// The sub-account username it should ring.
+        username: String,
+    },
+    /// Point an existing DID back at the master account's main line.
+    Unroute {
+        /// The DID to release back to the main account.
+        did: String,
+    },
+}
+
+/// Pure DID-routing diff (lock 11 + 19): desired routes vs Vitelity's actual
+/// DID inventory → the idempotent action list.
+///
+/// - A DID the master account does **not** own is skipped (route-existing only,
+///   lock 11 — we never invent a DID).
+/// - A route to a node whose username can't be resolved (unprovisioned) is
+///   skipped until the node is provisioned.
+/// - A DID already pointed at the desired target is a no-op (idempotent).
+#[must_use]
+pub fn plan_did_routes(
+    routes: &[DesiredDidRoute],
+    node_username: &HashMap<String, String, impl std::hash::BuildHasher>,
+    actual: &[Did],
+) -> Vec<DidAction> {
+    let mut actions = Vec::new();
+    for route in routes {
+        // Lock 11: only route a DID the master account already owns.
+        let Some(current) = actual.iter().find(|d| d.number == route.did) else {
+            continue;
+        };
+        match &route.node_id {
+            Some(node_id) => {
+                let Some(username) = node_username.get(node_id) else {
+                    continue;
+                };
+                if current.routed_to.as_deref() != Some(username.as_str()) {
+                    actions.push(DidAction::Route {
+                        did: route.did.clone(),
+                        username: username.clone(),
+                    });
+                }
+            }
+            None => {
+                if current.routed_to.is_some() {
+                    actions.push(DidAction::Unroute {
+                        did: route.did.clone(),
+                    });
+                }
+            }
+        }
+    }
+    actions
+}
+
+/// Pure failover plan (lock 10 + 19): the set-failover ops for every desired
+/// policy whose node resolves to a sub-account username.
+///
+/// The Vitelity seam has no read-back for a sub-account's failover, so the
+/// reconcile re-asserts the desired policy each (rate-limited) pass —
+/// idempotent by construction (the same set), and self-healing against any
+/// silent Vitelity-side drift.
+#[must_use]
+pub fn plan_failover(
+    desired: &[DesiredFailover],
+    node_username: &HashMap<String, String, impl std::hash::BuildHasher>,
+) -> Vec<(String, FailoverPolicy, String)> {
+    desired
+        .iter()
+        .filter_map(|f| {
+            node_username
+                .get(&f.node_id)
+                .map(|u| (u.clone(), f.policy.clone(), f.node_id.clone()))
+        })
+        .collect()
+}
+
 /// The JSON body a node's sealed SIP creds are stored as (lock 7). The node
 /// (VOIP-GW-4) reads this back to build its inbound SIP account. Kept minimal:
 /// the sub-account SIP auth pair + the realm needed to form the REGISTER.
@@ -330,6 +471,10 @@ pub struct ReconcileOutcome {
     pub states: Vec<NodeVoiceState>,
     /// How many sub-accounts this pass created (for logging / tests).
     pub provisioned: usize,
+    /// The master account's existing DID inventory as of this pass (lock 11).
+    /// The panel reads it (via [`DIDS_TOPIC`]) to offer the route control.
+    /// Empty when Vitelity was unreachable / not yet wired.
+    pub dids: Vec<Did>,
 }
 
 /// Seal a node's SIP creds to its per-node key in the secret store (lock 7).
@@ -377,6 +522,8 @@ pub fn reconcile_once(
     client: &dyn VitelityClient,
     store: &SecretStore,
     desired: &[DesiredNode],
+    did_routes: &[DesiredDidRoute],
+    failover: &[DesiredFailover],
     realm: &str,
 ) -> ReconcileOutcome {
     // Actual side 1: Vitelity's existing sub-accounts. A list failure is
@@ -396,12 +543,15 @@ pub fn reconcile_once(
                     reg_state: RegState::Error {
                         reason: reason.clone(),
                     },
+                    routed_dids: Vec::new(),
+                    failover: None,
                     updated_at_s: now_epoch_s(),
                 })
                 .collect();
             return ReconcileOutcome {
                 states,
                 provisioned: 0,
+                dids: Vec::new(),
             };
         }
     };
@@ -449,6 +599,8 @@ pub fn reconcile_once(
                                     username: username.clone(),
                                     sip_uri: sip_uri(username, account_realm),
                                     reg_state: RegState::Unregistered,
+                                    routed_dids: Vec::new(),
+                                    failover: None,
                                     updated_at_s: now_epoch_s(),
                                 });
                             }
@@ -514,14 +666,102 @@ pub fn reconcile_once(
             username: username.clone(),
             sip_uri: sip_uri(&username, realm),
             reg_state: RegState::Unregistered,
+            routed_dids: Vec::new(),
+            failover: None,
             updated_at_s: now_epoch_s(),
         });
+    }
+
+    // ── DID routing + failover reconcile (lock 10 + 11 + 19) ──
+    //
+    // Both run only after the sub-account list succeeded (the honesty gate
+    // above): the integration-gated live client fails `list_sub_accounts`
+    // first, so the whole fleet is already an honest Error and this code is
+    // never reached with a faked Vitelity. With a reachable Vitelity (the fake
+    // in tests, or a wired live transport) these apply the operator's intent.
+    let node_username: HashMap<String, String> = desired
+        .iter()
+        .filter_map(|n| {
+            let u = sub_account_username(&n.hostname);
+            (!u.is_empty()).then(|| (n.node_id.clone(), u))
+        })
+        .collect();
+
+    let (dids, did_by_username) = reconcile_did_routes(client, did_routes, &node_username);
+    let failover_by_node = reconcile_failover(client, failover, &node_username);
+
+    // Attach the real post-apply DID mapping + applied failover to each row.
+    for st in &mut states {
+        if let Some(username) = node_username.get(&st.node_id) {
+            if let Some(dids) = did_by_username.get(username) {
+                st.routed_dids = dids.clone();
+            }
+        }
+        st.failover = failover_by_node.get(&st.node_id).cloned();
     }
 
     ReconcileOutcome {
         states,
         provisioned,
+        dids,
     }
+}
+
+/// Reconcile the desired DID routes against Vitelity's actual inventory
+/// (lock 11): list the master account's DIDs, apply each drift action, then
+/// re-list so the returned mapping reflects the **real** post-apply routing —
+/// a route that failed to apply is simply absent, never fabricated (§7).
+///
+/// Returns the DID inventory (for the panel) plus a `username → routed DIDs`
+/// map (to fill each fleet row). A list failure yields empty maps (honest
+/// "unknown"), not a guess.
+fn reconcile_did_routes(
+    client: &dyn VitelityClient,
+    routes: &[DesiredDidRoute],
+    node_username: &HashMap<String, String>,
+) -> (Vec<Did>, HashMap<String, Vec<String>>) {
+    let Ok(actual) = client.list_dids() else {
+        return (Vec::new(), HashMap::new());
+    };
+    for action in plan_did_routes(routes, node_username, &actual) {
+        let _ = match action {
+            DidAction::Route { did, username } => {
+                client.route_did(&did, &DidRouting::SubAccount(username))
+            }
+            DidAction::Unroute { did } => client.route_did(&did, &DidRouting::MainAccount),
+        };
+    }
+    // Re-list to reflect the true state after applying (a failed route won't
+    // appear). Fall back to the pre-apply list if the re-list itself fails.
+    let post = client.list_dids().unwrap_or(actual);
+    let mut by_username: HashMap<String, Vec<String>> = HashMap::new();
+    for did in &post {
+        if let Some(username) = &did.routed_to {
+            by_username
+                .entry(username.clone())
+                .or_default()
+                .push(did.number.clone());
+        }
+    }
+    (post, by_username)
+}
+
+/// Re-assert every desired failover policy (lock 10). The seam has no
+/// read-back, so the reconcile idempotently re-applies the desired policy each
+/// pass; only a policy that actually applied is returned (and thus published),
+/// so a failed apply never shows a fabricated policy (§7).
+fn reconcile_failover(
+    client: &dyn VitelityClient,
+    desired: &[DesiredFailover],
+    node_username: &HashMap<String, String>,
+) -> HashMap<String, FailoverPolicy> {
+    let mut applied = HashMap::new();
+    for (username, policy, node_id) in plan_failover(desired, node_username) {
+        if client.configure_failover(&username, &policy).is_ok() {
+            applied.insert(node_id, policy);
+        }
+    }
+    applied
 }
 
 /// Build an `Error` fleet-board row (honest failure — lock 9).
@@ -542,6 +782,8 @@ fn error_state(
             sip_uri(username, realm)
         },
         reg_state: RegState::Error { reason },
+        routed_dids: Vec::new(),
+        failover: None,
         updated_at_s: now_epoch_s(),
     }
 }
@@ -720,15 +962,34 @@ impl VoiceProvisionWorker {
         if desired.is_empty() {
             return None;
         }
+        // Fold the operator's retained DID-route + failover intents off the Bus
+        // (latest-wins per key) so the reconcile drives them idempotently every
+        // pass — the desired side of lock 10 + 11 + 19.
+        let did_routes = read_desired_did_routes(persist);
+        let failover = read_desired_failover(persist);
         // Resolve the client: the injected test client, else the live client
         // built from the sealed master creds. No master creds → publish a
         // Provisioning state for every node (honest "awaiting the master key")
         // and skip the API.
         let outcome = if let Some(client) = self.client_override.as_deref() {
-            reconcile_once(client, &store, &desired, &self.realm)
+            reconcile_once(
+                client,
+                &store,
+                &desired,
+                &did_routes,
+                &failover,
+                &self.realm,
+            )
         } else {
             match resolve_live_client(&store) {
-                Ok(Some(client)) => reconcile_once(&client, &store, &desired, &self.realm),
+                Ok(Some(client)) => reconcile_once(
+                    &client,
+                    &store,
+                    &desired,
+                    &did_routes,
+                    &failover,
+                    &self.realm,
+                ),
                 Ok(None) => awaiting_master_key(&desired, &self.realm),
                 Err(e) => master_key_error(&desired, &self.realm, &e),
             }
@@ -736,7 +997,82 @@ impl VoiceProvisionWorker {
         for state in &outcome.states {
             publish_state(persist, state);
         }
+        // Publish the master DID inventory so the panel can offer the route
+        // control (lock 11). Best-effort; empty on an unreachable Vitelity.
+        publish_dids(persist, &outcome.dids);
         Some(outcome)
+    }
+}
+
+/// The `action/voice/did-route` body the panel publishes: route an existing
+/// DID to a node's sub-account, or (`node_id == None`) back to the main line.
+#[derive(Debug, serde::Deserialize)]
+struct DidRouteRequest {
+    did: String,
+    #[serde(default)]
+    node_id: Option<String>,
+}
+
+/// The `action/voice/failover` body the panel publishes: a node's desired
+/// offline-inbound policy.
+#[derive(Debug, serde::Deserialize)]
+struct FailoverRequest {
+    node_id: String,
+    policy: FailoverPolicy,
+}
+
+/// Fold the retained `action/voice/did-route` messages into the desired route
+/// set (lock 11), latest-wins per DID (ULID order is oldest→newest).
+fn read_desired_did_routes(persist: &Persist) -> Vec<DesiredDidRoute> {
+    let mut latest: HashMap<String, Option<String>> = HashMap::new();
+    if let Ok(msgs) = persist.list_since(DID_ROUTE_TOPIC, None) {
+        for msg in msgs {
+            if let Some(body) = msg.body {
+                if let Ok(req) = serde_json::from_str::<DidRouteRequest>(&body) {
+                    latest.insert(req.did, req.node_id);
+                }
+            }
+        }
+    }
+    latest
+        .into_iter()
+        .map(|(did, node_id)| DesiredDidRoute { did, node_id })
+        .collect()
+}
+
+/// Fold the retained `action/voice/failover` messages into the desired policy
+/// set (lock 10), latest-wins per node.
+fn read_desired_failover(persist: &Persist) -> Vec<DesiredFailover> {
+    let mut latest: HashMap<String, FailoverPolicy> = HashMap::new();
+    if let Ok(msgs) = persist.list_since(FAILOVER_TOPIC, None) {
+        for msg in msgs {
+            if let Some(body) = msg.body {
+                if let Ok(req) = serde_json::from_str::<FailoverRequest>(&body) {
+                    latest.insert(req.node_id, req.policy);
+                }
+            }
+        }
+    }
+    latest
+        .into_iter()
+        .map(|(node_id, policy)| DesiredFailover { node_id, policy })
+        .collect()
+}
+
+/// Publish the master DID inventory to [`DIDS_TOPIC`] (lock 11).
+///
+/// The single fleet-wide list the panel reads to offer the route control.
+/// `Priority::Min` (a silent data topic); a failed write is logged, never fatal.
+pub fn publish_dids(persist: &Persist, dids: &[Did]) {
+    let Ok(body) = serde_json::to_string(dids) else {
+        return;
+    };
+    if let Err(e) = persist.write(DIDS_TOPIC, Priority::Min, None, Some(&body)) {
+        tracing::debug!(
+            target: "mackesd::voice_provision",
+            error = %e,
+            "publishing voice DID inventory failed"
+        );
     }
 }
 
@@ -757,6 +1093,8 @@ fn awaiting_master_key(desired: &[DesiredNode], realm: &str) -> ReconcileOutcome
                 },
                 username,
                 reg_state: RegState::Provisioning,
+                routed_dids: Vec::new(),
+                failover: None,
                 updated_at_s: now_epoch_s(),
             }
         })
@@ -764,6 +1102,7 @@ fn awaiting_master_key(desired: &[DesiredNode], realm: &str) -> ReconcileOutcome
     ReconcileOutcome {
         states,
         provisioned: 0,
+        dids: Vec::new(),
     }
 }
 
@@ -784,6 +1123,7 @@ fn master_key_error(desired: &[DesiredNode], realm: &str, err: &str) -> Reconcil
     ReconcileOutcome {
         states,
         provisioned: 0,
+        dids: Vec::new(),
     }
 }
 
@@ -837,17 +1177,33 @@ impl Worker for VoiceProvisionWorker {
                 return Ok(());
             }
         };
-        // Cursor for the panel-button verb — start at the tail so we only act
-        // on requests published after we come up.
+        // Cursors for the panel verbs — start at each tail so we only act on
+        // requests published after we come up. Provision (lock 8), DID-route
+        // (lock 11) and failover (lock 10) all force an immediate reconcile.
         let mut cursor: Option<String> = persist.latest_ulid(PROVISION_TOPIC).ok().flatten();
+        let mut did_cursor: Option<String> = persist.latest_ulid(DID_ROUTE_TOPIC).ok().flatten();
+        let mut failover_cursor: Option<String> =
+            persist.latest_ulid(FAILOVER_TOPIC).ok().flatten();
 
         loop {
-            // Drain the panel-button verb (lock 8). A follower still advances
-            // the cursor + skips (the leader acts), so failover is seamless.
+            // Drain the panel verbs (lock 8/10/11). A follower still advances
+            // the cursors + skips (the leader acts), so failover is seamless.
             let mut button_pressed = false;
             if let Ok(msgs) = persist.list_since(PROVISION_TOPIC, cursor.as_deref()) {
                 for msg in msgs {
                     cursor = Some(msg.ulid);
+                    button_pressed = true;
+                }
+            }
+            if let Ok(msgs) = persist.list_since(DID_ROUTE_TOPIC, did_cursor.as_deref()) {
+                for msg in msgs {
+                    did_cursor = Some(msg.ulid);
+                    button_pressed = true;
+                }
+            }
+            if let Ok(msgs) = persist.list_since(FAILOVER_TOPIC, failover_cursor.as_deref()) {
+                for msg in msgs {
+                    failover_cursor = Some(msg.ulid);
                     button_pressed = true;
                 }
             }
@@ -1009,7 +1365,7 @@ mod tests {
         let client = FakeVitelityClient::new("sip.vitelity.net");
         let desired = vec![node("peer:eagle", "eagle")];
 
-        let outcome = reconcile_once(&client, &store, &desired, DEFAULT_REALM);
+        let outcome = reconcile_once(&client, &store, &desired, &[], &[], DEFAULT_REALM);
         assert_eq!(outcome.provisioned, 1);
         assert_eq!(outcome.states.len(), 1);
         let st = &outcome.states[0];
@@ -1033,10 +1389,10 @@ mod tests {
         let client = FakeVitelityClient::new("sip.vitelity.net");
         let desired = vec![node("peer:eagle", "eagle")];
 
-        let first = reconcile_once(&client, &store, &desired, DEFAULT_REALM);
+        let first = reconcile_once(&client, &store, &desired, &[], &[], DEFAULT_REALM);
         assert_eq!(first.provisioned, 1);
         // Second pass: sub-account exists + creds sealed → no new provisioning.
-        let second = reconcile_once(&client, &store, &desired, DEFAULT_REALM);
+        let second = reconcile_once(&client, &store, &desired, &[], &[], DEFAULT_REALM);
         assert_eq!(second.provisioned, 0);
         assert_eq!(second.states[0].reg_state, RegState::Unregistered);
         // Exactly one sub-account was ever created (idempotent, lock 19).
@@ -1052,12 +1408,12 @@ mod tests {
         let store = seeded_store(tmp.path());
         let client = FakeVitelityClient::new("sip.vitelity.net");
         let desired = vec![node("peer:eagle", "eagle")];
-        let _ = reconcile_once(&client, &store, &desired, DEFAULT_REALM);
+        let _ = reconcile_once(&client, &store, &desired, &[], &[], DEFAULT_REALM);
 
         // Simulate a re-image: the node's local disk is wiped, but the leader's
         // replicated store + Vitelity are untouched. A fresh reconcile pass
         // provisions nothing and the sealed creds are still readable.
-        let healed = reconcile_once(&client, &store, &desired, DEFAULT_REALM);
+        let healed = reconcile_once(&client, &store, &desired, &[], &[], DEFAULT_REALM);
         assert_eq!(healed.provisioned, 0);
         assert!(store.get(&node_creds_ref("peer:eagle")).unwrap().is_some());
     }
@@ -1073,7 +1429,7 @@ mod tests {
             "MASTER-KEY".to_string(),
         ));
         let desired = vec![node("peer:eagle", "eagle")];
-        let outcome = reconcile_once(&client, &store, &desired, DEFAULT_REALM);
+        let outcome = reconcile_once(&client, &store, &desired, &[], &[], DEFAULT_REALM);
         assert_eq!(outcome.provisioned, 0);
         assert!(matches!(
             outcome.states[0].reg_state,
@@ -1099,7 +1455,7 @@ mod tests {
             })
             .unwrap();
         let desired = vec![node("peer:eagle", "eagle")];
-        let outcome = reconcile_once(&client, &store, &desired, DEFAULT_REALM);
+        let outcome = reconcile_once(&client, &store, &desired, &[], &[], DEFAULT_REALM);
         assert_eq!(outcome.provisioned, 0);
         match &outcome.states[0].reg_state {
             RegState::Error { reason } => assert!(reason.contains("Re-provision")),
@@ -1145,6 +1501,292 @@ mod tests {
         ));
         let w = VoiceProvisionWorker::new(tmp.path().to_path_buf(), "peer:us".into());
         assert!(!w.is_leader());
+    }
+
+    // ── lock 11: the pure DID-route diff ──
+
+    fn username_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(id, u)| ((*id).to_string(), (*u).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn plan_did_routes_routes_an_unrouted_did_to_the_node() {
+        let routes = vec![DesiredDidRoute {
+            did: "15551234567".into(),
+            node_id: Some("peer:eagle".into()),
+        }];
+        let map = username_map(&[("peer:eagle", "eagle")]);
+        let actual = vec![Did {
+            number: "15551234567".into(),
+            routed_to: None,
+        }];
+        assert_eq!(
+            plan_did_routes(&routes, &map, &actual),
+            vec![DidAction::Route {
+                did: "15551234567".into(),
+                username: "eagle".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_did_routes_is_noop_when_already_routed() {
+        // Idempotent (lock 19): a DID already at the desired target → no action.
+        let routes = vec![DesiredDidRoute {
+            did: "15551234567".into(),
+            node_id: Some("peer:eagle".into()),
+        }];
+        let map = username_map(&[("peer:eagle", "eagle")]);
+        let actual = vec![Did {
+            number: "15551234567".into(),
+            routed_to: Some("eagle".into()),
+        }];
+        assert!(plan_did_routes(&routes, &map, &actual).is_empty());
+    }
+
+    #[test]
+    fn plan_did_routes_unroutes_back_to_main() {
+        let routes = vec![DesiredDidRoute {
+            did: "15551234567".into(),
+            node_id: None,
+        }];
+        let actual = vec![Did {
+            number: "15551234567".into(),
+            routed_to: Some("eagle".into()),
+        }];
+        assert_eq!(
+            plan_did_routes(&routes, &HashMap::new(), &actual),
+            vec![DidAction::Unroute {
+                did: "15551234567".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_did_routes_never_touches_a_did_the_account_does_not_own() {
+        // Lock 11: routing a DID absent from the master inventory is skipped —
+        // we never invent / provision a new DID.
+        let routes = vec![DesiredDidRoute {
+            did: "19999999999".into(),
+            node_id: Some("peer:eagle".into()),
+        }];
+        let map = username_map(&[("peer:eagle", "eagle")]);
+        assert!(plan_did_routes(&routes, &map, &[]).is_empty());
+    }
+
+    #[test]
+    fn plan_did_routes_skips_an_unprovisioned_target() {
+        // The node has no resolvable username yet → wait, don't route.
+        let routes = vec![DesiredDidRoute {
+            did: "15551234567".into(),
+            node_id: Some("peer:new".into()),
+        }];
+        let actual = vec![Did {
+            number: "15551234567".into(),
+            routed_to: None,
+        }];
+        assert!(plan_did_routes(&routes, &HashMap::new(), &actual).is_empty());
+    }
+
+    // ── lock 10: the failover plan ──
+
+    #[test]
+    fn plan_failover_resolves_usernames_and_skips_unknown_nodes() {
+        let desired = vec![
+            DesiredFailover {
+                node_id: "peer:eagle".into(),
+                policy: FailoverPolicy::Voicemail,
+            },
+            DesiredFailover {
+                node_id: "peer:ghost".into(),
+                policy: FailoverPolicy::None,
+            },
+        ];
+        let map = username_map(&[("peer:eagle", "eagle")]);
+        let ops = plan_failover(&desired, &map);
+        assert_eq!(
+            ops,
+            vec![(
+                "eagle".to_string(),
+                FailoverPolicy::Voicemail,
+                "peer:eagle".to_string()
+            )]
+        );
+    }
+
+    // ── the full reconcile: DID routing + failover applied + published ──
+
+    #[test]
+    fn reconcile_routes_a_did_and_publishes_the_mapping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = seeded_store(tmp.path());
+        // A master DID exists (lock 11 — pre-owned, not provisioned).
+        let client = FakeVitelityClient::new("sip.vitelity.net").with_did("15551234567", None);
+        let desired = vec![node("peer:eagle", "eagle")];
+        let routes = vec![DesiredDidRoute {
+            did: "15551234567".into(),
+            node_id: Some("peer:eagle".into()),
+        }];
+
+        let outcome = reconcile_once(&client, &store, &desired, &routes, &[], DEFAULT_REALM);
+        // The node's row shows the real routed DID.
+        assert_eq!(
+            outcome.states[0].routed_dids,
+            vec!["15551234567".to_string()]
+        );
+        // The published inventory reflects the applied route.
+        assert_eq!(outcome.dids.len(), 1);
+        assert_eq!(outcome.dids[0].routed_to, Some("eagle".to_string()));
+        // Vitelity actually recorded the route (no new DID created).
+        assert_eq!(client.list_dids().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reconcile_reapplies_drifted_did_routing() {
+        // Acceptance: the reconcile re-applies a DID whose routing drifted away.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = seeded_store(tmp.path());
+        // The DID drifted to the wrong sub-account.
+        let client = FakeVitelityClient::new("sip.vitelity.net")
+            .with_did("15551234567", Some("someone-else".into()));
+        let desired = vec![node("peer:eagle", "eagle")];
+        let routes = vec![DesiredDidRoute {
+            did: "15551234567".into(),
+            node_id: Some("peer:eagle".into()),
+        }];
+        let outcome = reconcile_once(&client, &store, &desired, &routes, &[], DEFAULT_REALM);
+        assert_eq!(outcome.dids[0].routed_to, Some("eagle".to_string()));
+        assert_eq!(
+            outcome.states[0].routed_dids,
+            vec!["15551234567".to_string()]
+        );
+    }
+
+    #[test]
+    fn reconcile_sets_and_publishes_failover_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = seeded_store(tmp.path());
+        let client = FakeVitelityClient::new("sip.vitelity.net");
+        let desired = vec![node("peer:eagle", "eagle")];
+        let failover = vec![DesiredFailover {
+            node_id: "peer:eagle".into(),
+            policy: FailoverPolicy::Forward {
+                number: "15550001111".into(),
+            },
+        }];
+        let outcome = reconcile_once(&client, &store, &desired, &[], &failover, DEFAULT_REALM);
+        assert_eq!(
+            outcome.states[0].failover,
+            Some(FailoverPolicy::Forward {
+                number: "15550001111".into()
+            })
+        );
+        // Vitelity recorded it against the sub-account username.
+        assert_eq!(
+            client.failover_of("eagle"),
+            Some(FailoverPolicy::Forward {
+                number: "15550001111".into()
+            })
+        );
+    }
+
+    #[test]
+    fn reconcile_does_not_provision_a_new_did() {
+        // Acceptance: no new DID is ever created — with an empty inventory a
+        // route intent is a no-op (route-existing only, lock 11).
+        let tmp = tempfile::tempdir().unwrap();
+        let store = seeded_store(tmp.path());
+        let client = FakeVitelityClient::new("sip.vitelity.net");
+        let desired = vec![node("peer:eagle", "eagle")];
+        let routes = vec![DesiredDidRoute {
+            did: "15551234567".into(),
+            node_id: Some("peer:eagle".into()),
+        }];
+        let outcome = reconcile_once(&client, &store, &desired, &routes, &[], DEFAULT_REALM);
+        assert!(outcome.dids.is_empty(), "no DID must be invented");
+        assert!(outcome.states[0].routed_dids.is_empty());
+    }
+
+    #[test]
+    fn did_route_state_serializes_for_the_panel() {
+        // The published body carries the routed DID + failover so the panel's
+        // live columns render (lock 9/10/11).
+        let st = NodeVoiceState {
+            node_id: "peer:eagle".into(),
+            hostname: "eagle".into(),
+            username: "eagle".into(),
+            sip_uri: "eagle@sip.vitelity.net".into(),
+            reg_state: RegState::Registered,
+            routed_dids: vec!["15551234567".into()],
+            failover: Some(FailoverPolicy::Voicemail),
+            updated_at_s: 1,
+        };
+        let body = serde_json::to_string(&st).unwrap();
+        assert!(body.contains("15551234567"));
+        assert!(body.contains("routed_dids"));
+        assert!(body.contains("Voicemail"));
+    }
+
+    // ── the Bus intent readers (desired side of lock 10 + 11) ──
+
+    #[test]
+    fn read_desired_did_routes_folds_latest_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        persist
+            .write(
+                DID_ROUTE_TOPIC,
+                Priority::Default,
+                None,
+                Some(r#"{"did":"15551234567","node_id":"peer:eagle"}"#),
+            )
+            .unwrap();
+        // A later message re-points the same DID → it wins.
+        persist
+            .write(
+                DID_ROUTE_TOPIC,
+                Priority::Default,
+                None,
+                Some(r#"{"did":"15551234567","node_id":"peer:pine"}"#),
+            )
+            .unwrap();
+        let routes = read_desired_did_routes(&persist);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].did, "15551234567");
+        assert_eq!(routes[0].node_id, Some("peer:pine".to_string()));
+    }
+
+    #[test]
+    fn read_desired_failover_folds_latest_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        persist
+            .write(
+                FAILOVER_TOPIC,
+                Priority::Default,
+                None,
+                Some(r#"{"node_id":"peer:eagle","policy":"Voicemail"}"#),
+            )
+            .unwrap();
+        persist
+            .write(
+                FAILOVER_TOPIC,
+                Priority::Default,
+                None,
+                Some(r#"{"node_id":"peer:eagle","policy":{"Forward":{"number":"15550001111"}}}"#),
+            )
+            .unwrap();
+        let failover = read_desired_failover(&persist);
+        assert_eq!(failover.len(), 1);
+        assert_eq!(
+            failover[0].policy,
+            FailoverPolicy::Forward {
+                number: "15550001111".into()
+            }
+        );
     }
 
     #[tokio::test]

@@ -46,6 +46,11 @@ use mde_bus::persist::Persist;
 /// (VOIP-GW-3, design lock 9). One topic per node; the tail is the node id.
 const STATE_PREFIX: &str = "state/voice/";
 
+/// The single fleet-wide topic the master account's existing DID inventory is
+/// published to (VOIP-GW-6, design lock 11). Distinct from [`STATE_PREFIX`] (a
+/// per-node prefix), so the board projection never mistakes it for a node row.
+const DIDS_TOPIC: &str = "state/voice-dids";
+
 /// The typed verb the panel publishes to request a (re-)provision (design
 /// lock 8). VOIP-GW-3 drains it and forces an immediate reconcile pass.
 pub const PROVISION_TOPIC: &str = "action/voice/provision";
@@ -59,6 +64,16 @@ pub const NICKNAME_TOPIC: &str = "action/voice/nickname";
 /// Typed verb: apply the one shared-account (leader-held outbound trunk +
 /// caller-ID) fleet config.
 pub const SHARED_CONFIG_TOPIC: &str = "action/voice/shared-config";
+
+/// Typed verb: route an existing master-account DID to a node's sub-account.
+///
+/// VOIP-GW-6, design lock 11 — route-only, never a new-DID provision. The
+/// leader's `voice_provision` worker drains it and applies the route.
+pub const DID_ROUTE_TOPIC: &str = "action/voice/did-route";
+
+/// Typed verb: set a node's offline-inbound failover policy (VOIP-GW-6, design
+/// lock 10). The leader applies it via the Vitelity client.
+pub const FAILOVER_TOPIC: &str = "action/voice/failover";
 
 /// How often the tab re-reads the Bus. Voice provisioning is slow-changing, so a
 /// 5 s cadence matches the datacenter surface without hammering the index.
@@ -106,9 +121,60 @@ pub struct NodeRow {
     /// The provisioning / registration state (the flattened `state` tag).
     #[serde(flatten)]
     pub reg_state: RegState,
+    /// The master-account DIDs currently routed to this node (VOIP-GW-6, design
+    /// lock 11). The **actual** Vitelity routing — a route that didn't apply is
+    /// simply absent, never fabricated.
+    #[serde(default)]
+    pub routed_dids: Vec<String>,
+    /// The node's applied offline-inbound failover policy (design lock 10), or
+    /// `None` when the operator hasn't set one.
+    #[serde(default)]
+    pub failover: Option<FailoverPolicy>,
     /// When this row was produced (epoch seconds).
     #[serde(default)]
     pub updated_at_s: u64,
+}
+
+/// A node's offline-inbound failover policy (design lock 10).
+///
+/// The local desktop-tier mirror of the worker's `vitelity::FailoverPolicy`.
+/// Externally-tagged serde matching the worker's derive, so it deserialises the
+/// published body and serialises the operator's chosen policy for the
+/// `action/voice/failover` verb. Mirrored here (not imported) to keep the
+/// desktop→services tier edge clean, the same choice [`NodeRow`] makes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FailoverPolicy {
+    /// Send unanswered/offline calls to the sub-account's voicemail.
+    Voicemail,
+    /// Forward to a PSTN number when the node is unreachable.
+    Forward {
+        /// The E.164 number to forward to.
+        number: String,
+    },
+    /// No failover — the caller hears an unavailable signal.
+    None,
+}
+
+impl FailoverPolicy {
+    /// A short operator-facing label for the row's Failover column.
+    fn label(&self) -> String {
+        match self {
+            Self::Voicemail => "Voicemail".to_string(),
+            Self::Forward { number } => format!("Forward → {number}"),
+            Self::None => "None".to_string(),
+        }
+    }
+}
+
+/// One master-account DID mirrored from [`DIDS_TOPIC`] (design lock 11). The
+/// panel lists these to offer the route control; it never provisions a new one.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DidRow {
+    /// The DID (E.164-ish digits as Vitelity returns them).
+    pub number: String,
+    /// The sub-account username it currently rings, or `None` for the main line.
+    #[serde(default)]
+    pub routed_to: Option<String>,
 }
 
 impl NodeRow {
@@ -167,6 +233,21 @@ struct SharedConfigRequest {
     outbound_trunk: String,
 }
 
+/// `action/voice/did-route` — route an existing DID to a node's sub-account
+/// (design lock 11). `node_id == None` routes it back to the main account.
+#[derive(Debug, Clone, Serialize)]
+struct DidRouteRequest {
+    did: String,
+    node_id: Option<String>,
+}
+
+/// `action/voice/failover` — set a node's offline-inbound failover policy.
+#[derive(Debug, Clone, Serialize)]
+struct FailoverRequest {
+    node_id: String,
+    policy: FailoverPolicy,
+}
+
 /// One operator intent collected during a render frame, published after the
 /// render borrow ends (the egui idiom — one action per frame).
 enum Pending {
@@ -181,6 +262,16 @@ enum Pending {
         caller_id: String,
         outbound_trunk: String,
     },
+    /// Route an existing DID to a node's sub-account (`None` = back to main).
+    DidRoute {
+        did: String,
+        node_id: Option<String>,
+    },
+    /// Set a node's offline-inbound failover policy.
+    Failover {
+        node_id: String,
+        policy: FailoverPolicy,
+    },
 }
 
 /// The local, per-node edit buffers. Neither the nickname nor the inbound-enabled
@@ -193,6 +284,12 @@ struct NodeEdit {
     nickname: String,
     /// The desired inbound-enabled toggle (defaults to enabled).
     inbound_enabled: bool,
+    /// The DID number selected in this node's route picker (empty = none).
+    did_pick: String,
+    /// The failover kind selected in this node's failover picker.
+    failover_kind: FailoverKind,
+    /// The forward-number buffer (used when [`FailoverKind::Forward`]).
+    forward_number: String,
 }
 
 impl NodeEdit {
@@ -200,8 +297,26 @@ impl NodeEdit {
         Self {
             nickname: String::new(),
             inbound_enabled: true,
+            did_pick: String::new(),
+            failover_kind: FailoverKind::Voicemail,
+            forward_number: String::new(),
         }
     }
+}
+
+/// The failover kind a node's picker selects — the tag half of the operator's
+/// choice; the forward number lives in [`NodeEdit::forward_number`]. Kept
+/// separate from the wire [`FailoverPolicy`] so the picker can hold a partial
+/// (a Forward whose number isn't typed yet) without fabricating a policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum FailoverKind {
+    /// Route to voicemail.
+    #[default]
+    Voicemail,
+    /// Forward to a PSTN number.
+    Forward,
+    /// No failover.
+    None,
 }
 
 /// The shared-account (leader-held outbound trunk) edit form.
@@ -222,6 +337,10 @@ pub struct FleetState {
     bus_root: Option<PathBuf>,
     /// The live per-node board, sorted by node id.
     nodes: Vec<NodeRow>,
+    /// The master account's existing DID inventory (design lock 11), read from
+    /// [`DIDS_TOPIC`]. The route picker offers these; the panel never invents a
+    /// DID.
+    dids: Vec<DidRow>,
     /// When the Bus was last polled (drives the cadence).
     last_poll: Option<Instant>,
     /// The last publish/read error, surfaced inline (honest, not swallowed).
@@ -237,6 +356,7 @@ impl Default for FleetState {
         Self {
             bus_root: mde_bus::client_data_dir(),
             nodes: Vec::new(),
+            dids: Vec::new(),
             last_poll: None,
             last_error: None,
             edits: HashMap::new(),
@@ -277,6 +397,7 @@ impl FleetState {
             return;
         };
         self.nodes = read_board(&persist);
+        self.dids = read_dids(&persist);
     }
 
     /// Render the Fleet tab into `ui`.
@@ -286,6 +407,7 @@ impl FleetState {
         let Self {
             bus_root,
             nodes,
+            dids,
             last_error,
             edits,
             shared,
@@ -331,7 +453,7 @@ impl FleetState {
                         let edit = edits
                             .entry(node.node_id.clone())
                             .or_insert_with(NodeEdit::new);
-                        ui.group(|ui| show_node(ui, node, edit, &mut pending));
+                        ui.group(|ui| show_node(ui, node, edit, dids, &mut pending));
                         ui.add_space(Style::SP_S);
                     }
                 }
@@ -353,6 +475,14 @@ impl FleetState {
         // A test never touches disk — pin the poll so `poll` is a no-op.
         self.last_poll = Some(Instant::now());
         self.bus_root = None;
+        self
+    }
+
+    /// Test seam: inject the DID inventory directly (bypassing the Bus) so a
+    /// headless render exercises the live route picker.
+    #[cfg(test)]
+    fn with_dids(mut self, dids: Vec<DidRow>) -> Self {
+        self.dids = dids;
         self
     }
 }
@@ -383,12 +513,31 @@ fn read_board(persist: &Persist) -> Vec<NodeRow> {
     rows
 }
 
+/// Read the master account's existing DID inventory from [`DIDS_TOPIC`] (design
+/// lock 11): the latest retained body's JSON array, sorted by number. A missing
+/// / malformed body yields an empty list (the picker just shows none) — never a
+/// fabricated DID. Pure over the Persist handle so it is unit-testable.
+fn read_dids(persist: &Persist) -> Vec<DidRow> {
+    let latest = persist
+        .list_since(DIDS_TOPIC, None)
+        .unwrap_or_default()
+        .into_iter()
+        .next_back()
+        .and_then(|m| m.body);
+    let mut rows: Vec<DidRow> = latest
+        .and_then(|body| serde_json::from_str::<Vec<DidRow>>(&body).ok())
+        .unwrap_or_default();
+    rows.sort_by(|a, b| a.number.cmp(&b.number));
+    rows
+}
+
 /// Render one node card: the reg-state pip + label, its SIP address, the DID +
 /// failover columns, an honest error reason, and the per-node controls.
 fn show_node(
     ui: &mut egui::Ui,
     node: &NodeRow,
     edit: &mut NodeEdit,
+    dids: &[DidRow],
     pending: &mut Option<Pending>,
 ) {
     ui.horizontal(|ui| {
@@ -419,10 +568,18 @@ fn show_node(
         node.sip_uri.as_str()
     };
     mde_egui::field(ui, "SIP address", sip, Style::TEXT);
-    // DID routing + failover policy are populated by VOIP-GW-6; until then the
-    // columns show the honest "not yet routed" rather than a fabricated value.
-    mde_egui::field(ui, "DID routing", "— (VOIP-GW-6)", Style::TEXT_DIM);
-    mde_egui::field(ui, "Failover", "— (VOIP-GW-6)", Style::TEXT_DIM);
+    // DID routing + failover are the live VOIP-GW-6 columns: the real mapping /
+    // policy the worker published (a route/policy that didn't apply is absent,
+    // never fabricated — §7).
+    if node.routed_dids.is_empty() {
+        mde_egui::field(ui, "DID routing", "— (none routed)", Style::TEXT_DIM);
+    } else {
+        mde_egui::field(ui, "DID routing", &node.routed_dids.join(", "), Style::TEXT);
+    }
+    match &node.failover {
+        Some(policy) => mde_egui::field(ui, "Failover", &policy.label(), Style::TEXT),
+        None => mde_egui::field(ui, "Failover", "— (not set)", Style::TEXT_DIM),
+    }
 
     if let RegState::Error { reason } = &node.reg_state {
         ui.add_space(Style::SP_XS);
@@ -464,6 +621,117 @@ fn show_node(
         ui.add_space(Style::SP_M);
         if ui.button("Re-provision").clicked() {
             *pending = Some(Pending::Provision(Some(node.node_id.clone())));
+        }
+    });
+
+    show_did_route(ui, node, edit, dids, pending);
+    show_failover(ui, node, edit, pending);
+}
+
+/// The per-node DID-route control (design lock 11): a picker over the master
+/// account's existing DIDs (never a new-DID field) + a Route button that fires
+/// the `action/voice/did-route` verb. Only enabled once the node is provisioned
+/// (it needs a sub-account username to ring).
+fn show_did_route(
+    ui: &mut egui::Ui,
+    node: &NodeRow,
+    edit: &mut NodeEdit,
+    dids: &[DidRow],
+    pending: &mut Option<Pending>,
+) {
+    ui.add_space(Style::SP_XS);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Route DID")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_XS);
+        if dids.is_empty() {
+            mde_egui::muted_note(ui, "no master DIDs published yet");
+            return;
+        }
+        let selected = if edit.did_pick.is_empty() {
+            "select…".to_string()
+        } else {
+            edit.did_pick.clone()
+        };
+        egui::ComboBox::from_id_salt((node.node_id.as_str(), "did-pick"))
+            .selected_text(selected)
+            .show_ui(ui, |ui| {
+                for did in dids {
+                    // Show where each DID currently points so the operator isn't
+                    // blind to a DID already ringing another node.
+                    let label = did.routed_to.as_ref().map_or_else(
+                        || format!("{}  (main)", did.number),
+                        |u| format!("{}  → {u}", did.number),
+                    );
+                    ui.selectable_value(&mut edit.did_pick, did.number.clone(), label);
+                }
+            });
+        ui.add_space(Style::SP_XS);
+        let ready = !edit.did_pick.is_empty() && !node.username.is_empty();
+        if ui
+            .add_enabled(ready, egui::Button::new("Route here"))
+            .clicked()
+        {
+            *pending = Some(Pending::DidRoute {
+                did: edit.did_pick.clone(),
+                node_id: Some(node.node_id.clone()),
+            });
+        }
+    });
+}
+
+/// The per-node failover control (design lock 10): a Voicemail / Forward / None
+/// selector (+ a forward-number field) and an Apply button firing the
+/// `action/voice/failover` verb.
+fn show_failover(
+    ui: &mut egui::Ui,
+    node: &NodeRow,
+    edit: &mut NodeEdit,
+    pending: &mut Option<Pending>,
+) {
+    ui.add_space(Style::SP_XS);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Set failover")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_XS);
+        ui.selectable_value(
+            &mut edit.failover_kind,
+            FailoverKind::Voicemail,
+            "Voicemail",
+        );
+        ui.selectable_value(&mut edit.failover_kind, FailoverKind::Forward, "Forward");
+        ui.selectable_value(&mut edit.failover_kind, FailoverKind::None, "None");
+        if edit.failover_kind == FailoverKind::Forward {
+            ui.add_space(Style::SP_XS);
+            ui.add(
+                egui::TextEdit::singleline(&mut edit.forward_number)
+                    .hint_text("+1 555 0100")
+                    .desired_width(Style::SP_XL * 4.0),
+            );
+        }
+        ui.add_space(Style::SP_XS);
+        // A Forward with no number isn't a valid policy — don't fabricate one.
+        let ready = !node.username.is_empty()
+            && (edit.failover_kind != FailoverKind::Forward
+                || !edit.forward_number.trim().is_empty());
+        if ui.add_enabled(ready, egui::Button::new("Apply")).clicked() {
+            let policy = match edit.failover_kind {
+                FailoverKind::Voicemail => FailoverPolicy::Voicemail,
+                FailoverKind::Forward => FailoverPolicy::Forward {
+                    number: edit.forward_number.trim().to_string(),
+                },
+                FailoverKind::None => FailoverPolicy::None,
+            };
+            *pending = Some(Pending::Failover {
+                node_id: node.node_id.clone(),
+                policy,
+            });
         }
     });
 }
@@ -561,6 +829,20 @@ fn publish(bus_root: Option<&Path>, last_error: &mut Option<String>, action: &Pe
                 outbound_trunk: outbound_trunk.clone(),
             }),
         ),
+        Pending::DidRoute { did, node_id } => (
+            DID_ROUTE_TOPIC,
+            serde_json::to_string(&DidRouteRequest {
+                did: did.clone(),
+                node_id: node_id.clone(),
+            }),
+        ),
+        Pending::Failover { node_id, policy } => (
+            FAILOVER_TOPIC,
+            serde_json::to_string(&FailoverRequest {
+                node_id: node_id.clone(),
+                policy: policy.clone(),
+            }),
+        ),
     };
     let body = match body {
         Ok(b) => b,
@@ -590,6 +872,8 @@ mod tests {
             reg_state: RegState::Error {
                 reason: reason.to_string(),
             },
+            routed_dids: Vec::new(),
+            failover: None,
             updated_at_s: 0,
         }
     }
@@ -648,17 +932,24 @@ mod tests {
     /// `Context::run` → `tessellate` path the DRM runner drives, no GPU/Bus.
     #[test]
     fn fleet_tab_mounts_and_tessellates_with_real_states() {
-        let mut fleet = FleetState::new().with_nodes(vec![
-            NodeRow {
-                node_id: "peer:eagle".into(),
-                hostname: "eagle".into(),
-                username: "eagle".into(),
-                sip_uri: "eagle@sip.vitelity.net".into(),
-                reg_state: RegState::Registered,
-                updated_at_s: 1,
-            },
-            err_row("peer:pine", "pine", "provision failed: master key missing"),
-        ]);
+        let mut fleet = FleetState::new()
+            .with_nodes(vec![
+                NodeRow {
+                    node_id: "peer:eagle".into(),
+                    hostname: "eagle".into(),
+                    username: "eagle".into(),
+                    sip_uri: "eagle@sip.vitelity.net".into(),
+                    reg_state: RegState::Registered,
+                    routed_dids: vec!["15551234567".into()],
+                    failover: Some(FailoverPolicy::Voicemail),
+                    updated_at_s: 1,
+                },
+                err_row("peer:pine", "pine", "provision failed: master key missing"),
+            ])
+            .with_dids(vec![DidRow {
+                number: "15551234567".into(),
+                routed_to: Some("eagle".into()),
+            }]);
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -715,6 +1006,94 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         let body = msgs[0].body.as_deref().unwrap();
         assert!(body.contains("peer:eagle"));
+    }
+
+    #[test]
+    fn deserialises_a_row_with_routed_dids_and_failover() {
+        // The VOIP-GW-6 body carries the live DID mapping + applied failover.
+        let body = r#"{"node_id":"peer:eagle","hostname":"eagle","username":"eagle",
+            "sip_uri":"eagle@sip.vitelity.net","state":"registered",
+            "routed_dids":["15551234567"],"failover":{"Forward":{"number":"15550001111"}},
+            "updated_at_s":42}"#;
+        let row: NodeRow = serde_json::from_str(body).unwrap();
+        assert_eq!(row.routed_dids, vec!["15551234567".to_string()]);
+        assert_eq!(
+            row.failover,
+            Some(FailoverPolicy::Forward {
+                number: "15550001111".into()
+            })
+        );
+    }
+
+    #[test]
+    fn read_dids_projects_the_latest_inventory_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        // A stale then a fresh inventory — the fresh (later ULID) wins.
+        persist
+            .write(DIDS_TOPIC, Priority::Min, None, Some("[]"))
+            .unwrap();
+        persist
+            .write(
+                DIDS_TOPIC,
+                Priority::Min,
+                None,
+                Some(r#"[{"number":"15559990000","routed_to":null},{"number":"15551234567","routed_to":"eagle"}]"#),
+            )
+            .unwrap();
+        let dids = read_dids(&persist);
+        assert_eq!(dids.len(), 2);
+        assert_eq!(dids[0].number, "15551234567", "sorted by number");
+        assert_eq!(dids[0].routed_to, Some("eagle".to_string()));
+        assert_eq!(dids[1].routed_to, None);
+    }
+
+    #[test]
+    fn did_route_verb_round_trips_through_the_bus() {
+        // The Route control's real effect: a typed `action/voice/did-route`
+        // message lands, readable back — the live-consumed verb (VOIP-GW-6).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let mut err = None;
+        publish(
+            Some(root.as_path()),
+            &mut err,
+            &Pending::DidRoute {
+                did: "15551234567".into(),
+                node_id: Some("peer:eagle".into()),
+            },
+        );
+        assert!(err.is_none(), "publish should succeed: {err:?}");
+        let persist = Persist::open(root).unwrap();
+        let msgs = persist.list_since(DID_ROUTE_TOPIC, None).unwrap();
+        assert_eq!(msgs.len(), 1);
+        let body = msgs[0].body.as_deref().unwrap();
+        assert!(body.contains("15551234567"));
+        assert!(body.contains("peer:eagle"));
+    }
+
+    #[test]
+    fn failover_verb_round_trips_through_the_bus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let mut err = None;
+        publish(
+            Some(root.as_path()),
+            &mut err,
+            &Pending::Failover {
+                node_id: "peer:eagle".into(),
+                policy: FailoverPolicy::Forward {
+                    number: "15550001111".into(),
+                },
+            },
+        );
+        assert!(err.is_none(), "publish should succeed: {err:?}");
+        let persist = Persist::open(root).unwrap();
+        let msgs = persist.list_since(FAILOVER_TOPIC, None).unwrap();
+        assert_eq!(msgs.len(), 1);
+        let body = msgs[0].body.as_deref().unwrap();
+        assert!(body.contains("Forward"));
+        assert!(body.contains("15550001111"));
     }
 
     #[test]
