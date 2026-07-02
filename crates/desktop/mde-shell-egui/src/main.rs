@@ -27,6 +27,7 @@ mod notifications;
 mod provisioning;
 mod services_flow;
 mod session;
+mod storage;
 mod system;
 mod thisnode;
 mod toast_bridge;
@@ -141,6 +142,12 @@ struct Shell {
     /// backlight / hotkeys. Its cached snapshot also feeds the three read-only
     /// chrome status icons (E12-15). Absent backends render honestly (§7).
     system: system::SystemState,
+    /// The Storage surface — GParted-authentic disk/partition management (E12-21).
+    /// Folds `state/storage/<node>` mirrors (UDisks2 topology + backend availability)
+    /// per peer, renders segment bars + partition tables + a typed-armed pending-op
+    /// queue, and drives `action/storage/<node>` back onto the Bus. The `mackesd`
+    /// storage worker owns the hard walls + the executor (live apply is E12-23).
+    storage: storage::StorageState,
     /// The KIRON chyron bridge (KIRON-2) — the shell's one `ToastHost` plus its
     /// `event/toast/show` Bus subscription, suppression posture, and the single
     /// notification-sound seam. Driven every frame; its lower-third band + OSD
@@ -180,6 +187,7 @@ impl Shell {
             clipboard: clipboard::ClipboardState::default(),
             chat: chat::ChatState::default(),
             system: system::SystemState::default(),
+            storage: storage::StorageState::default(),
             toasts: toast_bridge::ToastBridge::default(),
         }
     }
@@ -316,6 +324,12 @@ impl Shell {
                     system.show(ui, instances);
                 });
             }
+            Surface::Storage => {
+                // GParted disk/partition management (E12-21) — scoped under its own
+                // `push_id` like every surface; the storage worker owns the walls.
+                let storage = &mut self.storage;
+                ui.push_id("shell-storage", |ui| storage.show(ui));
+            }
         }
     }
 }
@@ -368,6 +382,13 @@ impl Shell {
             self.notifications.poll(ctx);
             self.clipboard.poll(ctx);
             self.chat.poll(ctx);
+        }
+
+        // The Storage surface tails the `state/storage/*` mirrors + the selected
+        // peer's progress lane while it's in view — a cheap local scan so a UDisks2
+        // change on any peer surfaces without operator input (E12-21).
+        if self.nav.expanded && self.nav.surface == Surface::Storage {
+            self.storage.poll(ctx);
         }
 
         // The seat snapshot feeds BOTH the System surface and the always-visible

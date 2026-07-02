@@ -54,6 +54,11 @@ pub(crate) enum Surface {
     /// (E12-15). Owns ALL host-control interaction (lock 3); the chrome bar keeps
     /// only read-only status icons.
     System,
+    /// The Storage surface — GParted-authentic disk/partition management (E12-21),
+    /// folded from `state/storage/<node>` and driven back via `action/storage/<node>`.
+    /// Segment bars + partition tables + a typed-armed pending-op queue, for this
+    /// node and any mesh peer; the `mackesd` storage worker owns the walls + executor.
+    Storage,
 }
 
 impl Surface {
@@ -61,7 +66,7 @@ impl Surface {
     /// then the local VM Instances broker + the brokered Desktop, then the three
     /// app surfaces, then the two mesh information surfaces, and finally this
     /// seat's host-controls System surface.
-    pub(crate) const ALL: [Surface; 10] = [
+    pub(crate) const ALL: [Surface; 11] = [
         Surface::Workbench,
         Surface::Instances,
         Surface::Desktop,
@@ -72,6 +77,7 @@ impl Surface {
         Surface::Clipboard,
         Surface::Chat,
         Surface::System,
+        Surface::Storage,
     ];
 
     /// The short dock label.
@@ -87,6 +93,7 @@ impl Surface {
             Surface::Clipboard => "Clipboard",
             Surface::Chat => "Chat",
             Surface::System => "System",
+            Surface::Storage => "Storage",
         }
     }
 
@@ -113,6 +120,9 @@ impl Surface {
             }
             Surface::System => {
                 "This seat's host controls — audio mixer, Bluetooth, displays, power, hotkeys."
+            }
+            Surface::Storage => {
+                "Disks & partitions across the mesh — stage a queue, arm the target, apply."
             }
         }
     }
@@ -152,10 +162,11 @@ mod tests {
 
     #[test]
     fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
-        // Workbench first, two VM surfaces (Instances / Desktop), three app
-        // surfaces (Music / Files / Voice), the info surfaces (Notifications /
-        // Clipboard / Chat), and the host-controls System surface.
-        assert_eq!(Surface::ALL.len(), 10);
+        // Eleven entries: Workbench first, two VM surfaces (Instances / Desktop),
+        // three app surfaces (Music / Files / Voice), the info surfaces
+        // (Notifications / Clipboard / Chat), the host-controls System surface,
+        // and the Storage surface (GParted-authentic disk management, E12-21).
+        assert_eq!(Surface::ALL.len(), 11);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
             Surface::Instances,
@@ -167,6 +178,7 @@ mod tests {
             Surface::Clipboard,
             Surface::Chat,
             Surface::System,
+            Surface::Storage,
         ] {
             assert!(Surface::ALL.contains(&s), "{s:?} missing from the dock");
         }
