@@ -29,6 +29,10 @@ Nebula overlay, authenticated by the shared mesh SSH key.
 | 14 | Content palette | **Carbon-derived default 16-color palette + bundled classic presets** (Solarized/Gruvbox/Nord/…), user-pickable. The chrome (tabs/titlebars/splitters) stays pure Carbon §4. |
 | 15 | Keybindings | **Terminator-compatible defaults, fully rebindable** (Ctrl+Shift+E/O split, Alt+arrows navigate, etc.). |
 | 16 | Per-terminal extras | **Editable titles + activity/silence watch (→ the Chat/notification path) + configurable bell.** |
+| 17 | Mouse reporting | **Full SGR (1006) mouse reporting** so TUI apps (vim/htop/tmux/mc) get click/drag/scroll/hover; **hold Shift to bypass** into native text selection. |
+| 18 | Session persistence | **Remote panes persist + reattach; local ephemeral.** A shell on a mesh node keeps running if the surface closes/crashes — the mackesd broker holds it and the pane can reattach later. Local shells end on close (Terminator behavior). |
+| 19 | Right-click actions | **User-defined custom commands** (run on the selection, Terminator parity) **+ built-in mesh actions**: send-selection-to-Chat, open-path-in-Files, open-URL-in-browser, new-terminal-here. |
+| 20 | Rendering fidelity | **Bundled monospace + programming ligatures + 24-bit true-color** (and 256-color). Inline images (sixel/kitty) deferred to a follow-up. |
 
 ## Architecture
 
