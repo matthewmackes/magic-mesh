@@ -1,41 +1,49 @@
-//! `mde-editor-egui` — the MCNF **"Quasar"** native code-editor surface (EDITOR-1).
+//! `mde-editor-egui` — the MCNF **"Quasar"** native code-editor surface.
 //!
 //! A Zed-style, keyboard-driven Rust code editor adapted to the DRM-native egui
-//! shell (design: `docs/design/editor.md`). This crate opens with EDITOR-1: the
-//! MOUNTABLE SHELL only. It exposes an [`EditorSurface`] state struct + the
-//! [`editor_panel`] seam that renders the editor chrome and an honest empty state
-//! ("No file open — open a file to start editing", §7 — a real reachable state,
-//! never a `todo!()` stub), mounted in the one Quasar shell (`mde-shell-egui`) as
-//! `Surface::Editor` through the exact seam `mde-files-egui` gives the shell
-//! (`files_panel` / `real_browser`): the shell owns the surface state and drives
-//! it per-frame with the `*_panel` fn.
+//! shell (design: `docs/design/editor.md`). It exposes an [`EditorSurface`] state
+//! struct + the [`editor_panel`] seam, mounted in the one Quasar shell
+//! (`mde-shell-egui`) as `Surface::Editor` through the exact seam `mde-files-egui`
+//! gives the shell (`files_panel` / `real_browser`): the shell owns the surface
+//! state and drives it per-frame with the `*_panel` fn.
 //!
-//! The rope buffer (EDITOR-2), the custom egui text widget with multi-cursor
-//! (EDITOR-3), tree-sitter highlighting, tabs + splittable panes, and the fuzzy
-//! finder / command palette / project search land in the following units. They
-//! grow [`EditorSurface`] and render into [`editor_panel`] without re-wiring the
-//! shell — that is the point of landing the mount seam first.
+//! What has landed:
 //!
-//! Layering (§6): the surface state + render seam live in [`panel`]; the only
-//! in-workspace edge points inward to [`mde_egui`] (the harness + the shared
-//! Carbon `Style`).
+//! * EDITOR-1 — the mountable surface + the honest "No file open" empty state (§7).
+//! * EDITOR-2 — the rope [`Buffer`]: the real editable document model.
+//! * EDITOR-3 — the custom text [`widget`]: viewport-culled render + gutter,
+//!   caret + selection, mouse hit-testing (click / drag / word / line), keyboard
+//!   editing + motion, undo/redo, scroll, and a soft-wrap toggle. The widget
+//!   edits the live rope (§7 — runtime-reachable, not a mockup).
+//!
+//! Tree-sitter highlighting + multi-cursor (EDITOR-4/5), tabs + splittable panes,
+//! and the fuzzy finder / command palette land in the following units; they grow
+//! [`EditorSurface`] / [`EditorView`] and render into [`editor_panel`] without
+//! re-wiring the shell.
+//!
+//! Layering (§6): the surface state + render seam live in [`panel`], the widget in
+//! [`widget`], the document model in [`buffer`]; the only in-workspace edge points
+//! inward to [`mde_egui`] (the harness + the shared Carbon `Style`).
 
 pub mod buffer;
 pub mod panel;
+pub mod widget;
 
 use mde_egui::{eframe, egui};
 
 pub use buffer::Buffer;
 pub use panel::{editor_panel, EditorSurface};
+pub use widget::{editor_widget, EditorView};
 
 /// Build the production [`EditorSurface`] the E12 shell owns and mounts with
 /// [`editor_panel`] — the editor analogue of `mde_files_egui::real_browser()`.
 ///
-/// EDITOR-1 is the mountable shell, so this is a bare surface holding no open
-/// document (the rope buffer + tab/pane model land in EDITOR-2/3); the panel
-/// renders the honest empty state until then (§7). Factored out so the shell
-/// mounts the surface through one named constructor, exactly as it builds Files
-/// via `real_browser()` and Terminal via `real_terminal()`.
+/// The surface opens to the honest empty state with no document (§7); the
+/// operator opens one through the scratch affordance or, once they land, the
+/// fuzzy-open / Files send (EDITOR-7/9 call [`EditorSurface::open_path`] /
+/// [`EditorSurface::open_text`]). Factored out so the shell mounts the surface
+/// through one named constructor, exactly as it builds Files via `real_browser()`
+/// and Terminal via `real_terminal()`.
 #[must_use]
 pub fn real_editor() -> EditorSurface {
     EditorSurface::default()
