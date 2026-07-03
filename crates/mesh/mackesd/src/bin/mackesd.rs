@@ -7776,6 +7776,38 @@ fn run_serve(
                 .push("navidrome_supervisor".into());
         }
 
+        // MEDIA-15 — the mesh media server + DLNA/UPnP + aggregation (design
+        // `mesh-media-player.md`, rows 27 "Mesh library" + 30 "Server role"):
+        // the PRODUCER half MEDIA-14 discovers + MEDIA-8 renders. Scans this
+        // node's chosen shared folders into a `media-library.json` share
+        // manifest written to the replicated QNM-Shared plane
+        // (<host>/media-library.json — the SAME plane media-registry.json rides,
+        // no new channel), binds the mesh HTTP media server on MESH_MEDIA_PORT
+        // (9600) so the localhost descriptor probe folds `mde-media` into this
+        // peer's descriptors.media and peers' MEDIA-14 find it, and serves a
+        // DLNA/UPnP MediaServer (device description + DIDL-Lite; the SSDP
+        // multicast announce is the honestly-gated live leg — §7). Reads every
+        // peer's manifest off the plane + folds them into ONE deduped, per-node-
+        // attributed mesh library on `state/media/library` for the MEDIA-8
+        // Library panel. A desktop feature (Workstation tier); keyed by the
+        // hostname (fw_host) like media_registry so its manifest lands on the
+        // same replicated <host>/ dir the aggregators read. Idles gracefully on
+        // a headless box (empty share, empty library).
+        if mackesd_core::worker_role::runs("media_server", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::media_server::MediaServerWorker::new(
+                    node_id.clone(),
+                    fw_host.clone(),
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("media_server".into());
+        }
+
         // APPS-LIVE-1 — apps_running: mirror this node's set of currently-
         // running launchable apps to <QNM-Shared>/<host>/running-apps.json
         // every 10 s so every node's Applications-menu launcher can badge each

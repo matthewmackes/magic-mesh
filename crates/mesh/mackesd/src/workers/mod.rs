@@ -638,6 +638,18 @@ pub mod desktop_sources;
 // — never a blocking probe; music-only services (navidrome/mpd) are honestly
 // excluded (mde-music's domain), and SSDP-only DLNA is a `gated:` mDNS-lane note.
 pub mod media_sources;
+// MEDIA-15 — the media_server worker: the mesh-side (§6) PRODUCER half of the
+// mesh media plane (docs/design/mesh-media-player.md, rows 27 + 30). Scans this
+// node's chosen shared folders into a `media-library.json` share manifest on the
+// replicated QNM-Shared plane (so peers aggregate it), binds the mesh HTTP media
+// server on MESH_MEDIA_PORT — which the localhost descriptor probe folds into
+// this peer's `descriptors.media` as the `mde-media` service so peers' MEDIA-14
+// discovery finds it — and serves a DLNA/UPnP MediaServer (device description +
+// DIDL-Lite; the SSDP multicast announce is the honestly-gated live leg). Reads
+// every peer's manifest off the plane + folds them into ONE deduped, per-node-
+// attributed mesh library published to `state/media/library` for the MEDIA-8
+// Library panel.
+pub mod media_server;
 // OW-11 (Bus half) — the service_onboard worker: `onboard service-add` reachable
 // over the Bus for the shell's Services flow. Drains `action/onboard/service-add`
 // (a typed ServiceAddAction: ServiceKind + optional SIP params + dry_run), runs

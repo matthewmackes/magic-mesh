@@ -20,11 +20,20 @@ use mackes_mesh_types::peers::{
 
 /// The pinned localhost media-port scan list (L12) — a constant,
 /// never user input.
-pub const MEDIA_PORTS: [(&str, u16); 4] = [
+///
+/// MEDIA-15 adds `mde-media` on 9600 (= `media_server::MESH_MEDIA_PORT`, kept a
+/// literal here because `descriptors` compiles without the `async-services`
+/// worker layer): when this node's mesh media server is bound, the probe folds
+/// `mde-media` into `descriptors.media` so peers' MEDIA-14 discovery
+/// (`media_sources::SERVICE_MESH_PLAYER`) finds this node as a mesh media
+/// source. No new advertisement channel is minted — this reuses the heartbeat's
+/// existing descriptor probe.
+pub const MEDIA_PORTS: [(&str, u16); 5] = [
     ("jellyfin", 8096),
     ("navidrome-airsonic", 4533),
     ("mpd", 6600),
     ("dlna", 8200),
+    ("mde-media", 9600),
 ];
 
 /// Per-port connect budget — localhost answers in microseconds; 200 ms
@@ -410,7 +419,7 @@ mod tests {
         // pin makes adding a port a deliberate reviewed change.
         assert_eq!(
             MEDIA_PORTS.map(|(n, _)| n),
-            ["jellyfin", "navidrome-airsonic", "mpd", "dlna"]
+            ["jellyfin", "navidrome-airsonic", "mpd", "dlna", "mde-media"]
         );
     }
 }
