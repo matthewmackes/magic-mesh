@@ -20,9 +20,10 @@ use mde_jellyfin::{
     ServerStore, StreamMediaType,
 };
 use mde_media_core::{
-    AbLoop, BrowseQuery, Library, LibraryItem, MediaEngine, MediaKind, MpvCapabilities,
-    PlaybackControls, Player, PlayerEvent, PlayerState, Playlist, PlaylistItem, RepeatMode,
-    ScreenshotMode, SortKey, Track, TrackKind, TrackSelect, TrackSelection,
+    classify_url, AbLoop, BrowseQuery, Library, LibraryItem, MediaEngine, MediaKind,
+    MpvCapabilities, PlaybackControls, Player, PlayerEvent, PlayerState, Playlist, PlaylistItem,
+    RepeatMode, ScreenshotMode, SortKey, Track, TrackKind, TrackSelect, TrackSelection, UrlKind,
+    YtDlpError, YtDlpResolver,
 };
 
 /// The seed used when the operator toggles shuffle on.
@@ -85,6 +86,9 @@ pub struct UiState {
     pub search_input: String,
     /// The text buffer behind the "index a folder" field on Sources.
     pub folder_input: String,
+    /// The text buffer behind the "Open URL" (network stream / web video) field on
+    /// Sources (MEDIA-12).
+    pub url_input: String,
     /// The text buffer behind the Jellyfin "server name" field on Sources.
     pub jellyfin_name_input: String,
     /// The text buffer behind the Jellyfin "server URL" field on Sources.
@@ -492,6 +496,66 @@ impl<E: MediaEngine> MediaController<E> {
             }
             Err(e) => self.ui.status = Some(format!("Could not index {path}: {e}")),
         }
+    }
+
+    // ── network streams + yt-dlp (MEDIA-12) ──────────────────────────────────────
+
+    /// Open the URL / path in [`UiState::url_input`] (MEDIA-12): classify it with the
+    /// core [`classify_url`] fold, then route it. Direct streams + local files are
+    /// handed straight to the core [`Player::load`] (mpv plays `http(s)`/`hls`/`rtsp`/
+    /// `mms`/`rtmp`/`srt` natively); a web page is resolved through the injected
+    /// [`YtDlpResolver`] seam and its direct URL loaded. Reports every outcome
+    /// honestly on the status line — an unsupported string, and (§7) an absent
+    /// `yt-dlp` — never a stub. Glue: the resolve → play path reuses the same
+    /// `Player::load` the local + Jellyfin paths do.
+    ///
+    /// # Errors
+    /// A status string when the input is not playable, `yt-dlp` is absent / fails,
+    /// or the core rejects the load. On success the field is cleared and the surface
+    /// jumps to the Player view.
+    pub fn open_url<R: YtDlpResolver>(&mut self, input: &str, resolver: &R) -> Result<(), String> {
+        let target = input.trim().to_owned();
+        match classify_url(&target) {
+            UrlKind::DirectStream | UrlKind::LocalFile => {
+                self.player.load(target.clone()).map_err(err)?;
+                self.finish_open(format!("Opening {target}"));
+                Ok(())
+            }
+            UrlKind::WebPage => self.open_web_page(&target, resolver),
+            UrlKind::Invalid => {
+                let msg = format!("Not a stream URL or web link: {target}");
+                self.ui.status = Some(msg.clone());
+                Err(msg)
+            }
+        }
+    }
+
+    /// Resolve a web-page URL through `yt-dlp` and play its direct media URL — the
+    /// [`UrlKind::WebPage`] arm of [`open_url`](Self::open_url). Honest-gates on the
+    /// tool being present (§7) before invoking it.
+    fn open_web_page<R: YtDlpResolver>(&mut self, page: &str, resolver: &R) -> Result<(), String> {
+        if !resolver.is_available() {
+            let msg = "yt-dlp not installed — install it to open web videos (streams still work)."
+                .to_owned();
+            self.ui.status = Some(msg.clone());
+            return Err(msg);
+        }
+        let media = resolver.resolve(page).map_err(ytdlp_err)?;
+        let url = media
+            .primary()
+            .ok_or_else(|| "yt-dlp resolved no playable media URL.".to_owned())?
+            .to_owned();
+        self.player.load(url).map_err(err)?;
+        let title = media.title.unwrap_or_else(|| page.to_owned());
+        self.finish_open(format!("Playing {title}"));
+        Ok(())
+    }
+
+    /// Shared success tail of an open: report it, clear the field, jump to Player.
+    fn finish_open(&mut self, status: String) {
+        self.ui.status = Some(status);
+        self.ui.url_input.clear();
+        self.ui.tab = MediaTab::Player;
     }
 
     // ── the per-frame pump ──────────────────────────────────────────────────────
@@ -1103,6 +1167,18 @@ fn jellyfin_err(e: JellyfinError) -> String {
     format!("Jellyfin: {e}")
 }
 
+/// Map a [`YtDlpError`] to an honest status string (MEDIA-12). The tool-absent case
+/// gets a plain install hint rather than a raw error (§7).
+#[allow(clippy::needless_pass_by_value)]
+fn ytdlp_err(e: YtDlpError) -> String {
+    match e {
+        YtDlpError::NotInstalled => {
+            "yt-dlp not installed — install it to open web videos.".to_owned()
+        }
+        other => format!("yt-dlp: {other}"),
+    }
+}
+
 /// The display title of a Jellyfin item — its name, else its id (never empty).
 #[must_use]
 pub fn jellyfin_item_title(item: &BaseItemDto) -> String {
@@ -1407,6 +1483,160 @@ mod tests {
         c.dispatch(TransportAction::PlayPath("clip.mkv".to_owned()));
         c.pump(); // FileLoaded → Playing
         c
+    }
+
+    // ── network streams + yt-dlp (MEDIA-12) ──────────────────────────────────────
+
+    /// A fake `yt-dlp` seam: scripted availability + a fixed [`ResolvedMedia`], so
+    /// the open-URL glue is driven with no real tool and no network.
+    struct FakeResolver {
+        available: bool,
+        resolved: mde_media_core::ResolvedMedia,
+    }
+
+    impl FakeResolver {
+        /// An available resolver that returns `url` (titled `title`) for any page.
+        fn ready(title: &str, url: &str) -> Self {
+            Self {
+                available: true,
+                resolved: mde_media_core::ResolvedMedia {
+                    source_url: String::new(),
+                    title: Some(title.to_owned()),
+                    urls: vec![url.to_owned()],
+                },
+            }
+        }
+
+        /// An absent resolver (the honest tool-absent gate).
+        const fn absent() -> Self {
+            Self {
+                available: false,
+                resolved: mde_media_core::ResolvedMedia {
+                    source_url: String::new(),
+                    title: None,
+                    urls: Vec::new(),
+                },
+            }
+        }
+    }
+
+    impl YtDlpResolver for FakeResolver {
+        fn is_available(&self) -> bool {
+            self.available
+        }
+
+        fn resolve(&self, page_url: &str) -> Result<mde_media_core::ResolvedMedia, YtDlpError> {
+            if !self.available {
+                return Err(YtDlpError::NotInstalled);
+            }
+            let mut out = self.resolved.clone();
+            out.source_url = page_url.to_owned();
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn open_url_direct_stream_loads_the_core_player() {
+        let mut c = controller();
+        // A direct stream URL is handed straight to the core Player (no yt-dlp).
+        c.open_url("rtsp://cam.mesh:554/live", &FakeResolver::absent())
+            .expect("direct stream opens without a resolver");
+        assert_eq!(c.player().media(), Some("rtsp://cam.mesh:554/live"));
+        assert_eq!(c.player().state(), PlayerState::Loading);
+        assert_eq!(c.ui().tab, MediaTab::Player);
+        assert!(c.ui().url_input.is_empty(), "the field is cleared on open");
+        c.pump();
+        assert_eq!(c.player().state(), PlayerState::Playing);
+    }
+
+    #[test]
+    fn open_url_http_media_file_is_a_direct_stream() {
+        let mut c = controller();
+        c.open_url("https://cdn.example/movie.mp4", &FakeResolver::absent())
+            .expect("an http media file plays directly");
+        assert_eq!(c.player().media(), Some("https://cdn.example/movie.mp4"));
+    }
+
+    #[test]
+    fn open_url_local_path_loads_the_core_player() {
+        let mut c = controller();
+        c.open_url("/media/movies/clip.mkv", &FakeResolver::absent())
+            .expect("a local path opens");
+        assert_eq!(c.player().media(), Some("/media/movies/clip.mkv"));
+    }
+
+    #[test]
+    fn open_url_web_page_resolves_via_ytdlp_then_plays() {
+        let mut c = controller();
+        let resolver = FakeResolver::ready(
+            "Never Gonna Give You Up",
+            "https://cdn.example/direct-stream.mp4",
+        );
+        c.open_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ", &resolver)
+            .expect("a web page resolves + plays");
+        // The core Player loaded the *resolved* direct URL, not the web page.
+        assert_eq!(
+            c.player().media(),
+            Some("https://cdn.example/direct-stream.mp4")
+        );
+        assert_eq!(c.player().state(), PlayerState::Loading);
+        assert_eq!(c.ui().tab, MediaTab::Player);
+        assert_eq!(
+            c.ui().status.as_deref(),
+            Some("Playing Never Gonna Give You Up")
+        );
+    }
+
+    #[test]
+    fn open_url_web_page_is_honest_gated_when_ytdlp_is_absent() {
+        let mut c = controller();
+        let err = c
+            .open_url("https://youtu.be/dQw4w9WgXcQ", &FakeResolver::absent())
+            .expect_err("no yt-dlp → honest refusal, not a stub");
+        assert!(
+            err.contains("yt-dlp not installed"),
+            "honest message: {err}"
+        );
+        // Nothing loaded, the field is kept so the operator can retry.
+        assert_eq!(c.player().state(), PlayerState::Idle);
+        assert_eq!(c.player().media(), None);
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("yt-dlp"));
+    }
+
+    #[test]
+    fn open_url_invalid_input_surfaces_honestly_and_loads_nothing() {
+        let mut c = controller();
+        let err = c
+            .open_url("mailto:someone@example.com", &FakeResolver::absent())
+            .expect_err("an unsupported scheme is refused");
+        assert!(err.contains("Not a stream URL"), "honest message: {err}");
+        assert_eq!(c.player().state(), PlayerState::Idle);
+        assert_eq!(c.player().media(), None);
+    }
+
+    #[test]
+    fn open_url_resolver_failure_surfaces_on_the_status_line() {
+        // An available resolver that returns no URL → an honest NoMedia refusal.
+        struct EmptyResolver;
+        impl YtDlpResolver for EmptyResolver {
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn resolve(&self, _: &str) -> Result<mde_media_core::ResolvedMedia, YtDlpError> {
+                Err(YtDlpError::Failed("Unsupported URL".to_owned()))
+            }
+        }
+        let mut c = controller();
+        let err = c
+            .open_url("https://example.com/article", &EmptyResolver)
+            .expect_err("a yt-dlp failure surfaces");
+        assert!(err.starts_with("yt-dlp:"), "honest message: {err}");
+        assert_eq!(c.player().state(), PlayerState::Idle);
     }
 
     // ── transport glue (the surface drives the core) ─────────────────────────────

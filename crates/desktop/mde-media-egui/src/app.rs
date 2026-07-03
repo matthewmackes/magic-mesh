@@ -19,7 +19,9 @@ use mde_egui::{muted_note, status_dot, Style};
 use mde_jellyfin::{
     BaseItemDto, ClientInfo, ItemsQuery, JellyfinClient, ReqwestTransport, ServerConfig,
 };
-use mde_media_core::{MediaEngine, MediaKind, PlayerState, ScreenshotMode, SortKey, TrackKind};
+use mde_media_core::{
+    MediaEngine, MediaKind, PlayerState, ScreenshotMode, SortKey, TrackKind, YtDlpCli,
+};
 
 use crate::model::{
     format_time, item_title, jellyfin_item_title, library_row_texts, now_playing_title,
@@ -252,6 +254,9 @@ fn sources_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
         controller.index_current_folder();
     }
 
+    // The open-a-URL row (MEDIA-12): a direct stream, or a web link resolved by yt-dlp.
+    open_url_row(ui, controller);
+
     ui.add_space(Style::SP_S);
 
     let mut open_source: Option<String> = None;
@@ -309,6 +314,37 @@ fn sources_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
     if let Some(path) = open_source {
         controller.set_search(path);
         controller.ui_mut().tab = MediaTab::Library;
+    }
+}
+
+/// The "Open URL" row (MEDIA-12): a field for a direct stream URL (`http(s)`/`hls`/
+/// `rtsp`/`mms`/`rtmp`/`srt`) or a web-page link, and an Open button that routes it
+/// through [`MediaController::open_url`] — direct streams to the core Player, web
+/// links resolved by the bundled `yt-dlp`. All chrome is drawn from Carbon [`Style`]
+/// tokens (§4). The live resolve is honest-gated on `yt-dlp` being present.
+fn open_url_row<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
+    let mut url = controller.ui().url_input.clone();
+    let mut do_open = false;
+    ui.horizontal(|ui| {
+        let field = egui::TextEdit::singleline(&mut url)
+            .hint_text("https://…  ·  rtsp://…  ·  a web video link")
+            .desired_width(Style::SP_XL * 8.0);
+        let resp = ui.add(field);
+        // Enter in the field, or the button, opens it.
+        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            do_open = true;
+        }
+        if ui.button("Open URL").clicked() {
+            do_open = true;
+        }
+    });
+    controller.ui_mut().url_input = url;
+    if do_open {
+        // The real subprocess resolver; runtime-gated (honest "not installed" when
+        // absent — §7). Only invoked on an explicit Open, so headless renders never
+        // spawn it. The controller sets the status line for every outcome.
+        let target = controller.ui().url_input.clone();
+        let _ = controller.open_url(&target, &YtDlpCli);
     }
 }
 
@@ -1248,7 +1284,11 @@ mod tests {
         let mut c = controller();
         render(&mut c, sources_view); // honest empty first-run
         populate(&mut c);
+        // The MEDIA-12 Open-URL field renders with text in it (never spawns yt-dlp
+        // without an explicit Open click, which headless rendering cannot deliver).
+        c.ui_mut().url_input = "https://youtu.be/dQw4w9WgXcQ".to_owned();
         render(&mut c, sources_view);
+        assert_eq!(c.player().state(), PlayerState::Idle, "render never opens");
     }
 
     #[test]

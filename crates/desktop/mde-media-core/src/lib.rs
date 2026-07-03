@@ -99,6 +99,21 @@
 //! does not link mpv (hardware decode is a runtime GPU property, deliberately not
 //! promised here).
 //!
+//! # Network streams + yt-dlp (MEDIA-12)
+//!
+//! [`classify_url`] is the pure, per-scheme fold that sorts an opened string into a
+//! [`UrlKind`] — a direct stream mpv plays natively (`http(s)` to a media file /
+//! manifest, or an explicit `rtsp`/`rtmp`/`mms`/`hls`/`srt` scheme), a web page to
+//! resolve, a local file, or nonsense. Direct streams + local files are handed
+//! straight to [`Player::load`] (the existing play path — mpv/ffmpeg opens them);
+//! web pages are resolved through the [`YtDlpResolver`] seam. [`YtDlpCli`] is the
+//! real resolver (it shells out to a bundled `yt-dlp` — always compiled, since it
+//! links nothing — and is **honest-gated at runtime**: an absent tool is
+//! [`YtDlpError::NotInstalled`], never a stub). [`parse_dump_json`] projects
+//! `yt-dlp`'s output into a [`ResolvedMedia`]; it is pure + fixture-tested, so URL
+//! detection and the resolution seam are exercised with no real `yt-dlp` and no
+//! network — the live resolve is honest-gated exactly like the `mpv` real-clip path.
+//!
 //! ```
 //! use mde_media_core::{FakeMpv, Player, PlayerState};
 //!
@@ -125,8 +140,10 @@ pub mod opensubtitles;
 pub mod player;
 pub mod playlist;
 pub mod resume;
+pub mod stream;
 pub mod subtitle;
 pub mod video;
+pub mod ytdlp;
 
 #[cfg(feature = "mpv")]
 pub mod mpv;
@@ -143,8 +160,10 @@ pub use opensubtitles::{parse_search_response, request_headers, search_url, Subt
 pub use player::{Player, PlayerError, PlayerEvent, PlayerState};
 pub use playlist::{Playlist, PlaylistItem, RepeatMode};
 pub use resume::{ResumeEntry, ResumeState};
+pub use stream::{classify_url, UrlKind};
 pub use subtitle::{
     track_by_language, AssOverride, ExternalSub, SubLoad, SubtitleConfig, TrackSelect,
     TrackSelection,
 };
 pub use video::{AspectRatio, Crop, Deinterlace, HwDecode, Rotation, VideoConfig, VideoFilter};
+pub use ytdlp::{parse_dump_json, ResolvedMedia, YtDlpCli, YtDlpError, YtDlpResolver};
