@@ -43,14 +43,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::{
     self, FontId, RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions,
 };
 use mde_egui::{muted_note, status_dot, Style};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::auth::{
     self, AuthStage, CredentialPrompt, CredentialStore, DesktopAuth, MeshCredentialStore,
@@ -75,8 +75,9 @@ const REFRESH: Duration = Duration::from_secs(5);
 const CARD_WIDTH: f32 = Style::SP_XL * 7.0;
 
 /// Card height — a fixed height keeps the grid regular across nodes so rows
-/// read as one lattice (design lock 2).
-const CARD_HEIGHT: f32 = Style::SP_XL * 5.5;
+/// read as one lattice (design lock 2). Sized to seat the CHOOSER-7 local-VM
+/// power-control row under the badges without crowding a non-VM card.
+const CARD_HEIGHT: f32 = Style::SP_XL * 7.0;
 
 /// The thumbnail well's height — CHOOSER-3's periodic preview fills this area
 /// with a decoded snapshot; a source with no (or an undecodable) snapshot ref
@@ -325,6 +326,188 @@ fn group_by_node(sources: &[DesktopSource]) -> Vec<(&str, Vec<&DesktopSource>)> 
         }
     }
     groups
+}
+
+// ─────────────────── CHOOSER-7: local-VM power controls ───────────────────
+
+/// The `action/vm/lifecycle` request topic the MV-3 `vm_lifecycle` worker drains
+/// (flat; host-targeted by the request's `host` field). MUST equal
+/// `mackesd::workers::vm_lifecycle::ACTION_TOPIC` (cross-checked in tests).
+const LIFECYCLE_TOPIC: &str = "action/vm/lifecycle";
+
+/// A power action a local-VM card button drives onto the mackesd `vm_lifecycle`
+/// worker. The card renders only the ops valid for the VM's live power state
+/// (§7 — never a button that can't act).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerOp {
+    /// Boot a shut-off VM (`vm_lifecycle` Start).
+    Start,
+    /// Gracefully stop a running/paused VM (`vm_lifecycle` Stop, non-force).
+    Stop,
+    /// Suspend a running VM (`vm_lifecycle` Pause).
+    Pause,
+    /// Wake a paused VM (`vm_lifecycle` Resume).
+    Resume,
+}
+
+impl PowerOp {
+    /// The card button label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Start => "Start",
+            Self::Stop => "Stop",
+            Self::Pause => "Pause",
+            Self::Resume => "Resume",
+        }
+    }
+
+    /// The present-progressive verb for the inline "applying…" note.
+    const fn verb(self) -> &'static str {
+        match self {
+            Self::Start => "Starting",
+            Self::Stop => "Stopping",
+            Self::Pause => "Pausing",
+            Self::Resume => "Resuming",
+        }
+    }
+
+    /// The host-targeted `vm_lifecycle` request this op maps to. `host` is the VM's
+    /// node (the worker there acts only on requests that `targets()` its id).
+    fn to_request(self, host: &str, name: &str) -> VmPowerRequest {
+        let host = host.to_string();
+        let name = name.to_string();
+        match self {
+            Self::Start => VmPowerRequest::Start { host, name },
+            Self::Stop => VmPowerRequest::Stop {
+                host,
+                name,
+                force: false,
+            },
+            Self::Pause => VmPowerRequest::Pause { host, name },
+            Self::Resume => VmPowerRequest::Resume { host, name },
+        }
+    }
+}
+
+/// The shell-side mirror of the verbs the CHOOSER-7 card power controls emit onto
+/// the MV-3 `vm_lifecycle` worker — internally `op`-tagged exactly like the
+/// worker's `LifecycleAction` (`#[serde(tag = "op", rename_all = "snake_case")]`),
+/// so its `parse_action` accepts the body verbatim. This reuses the worker + its
+/// topic (§6), mirroring them locally like `datacenter::Lifecycle` /
+/// `discovery::ConnectRequest` do — the shell leans inward only on `mde-bus`,
+/// never the daemon crate. `host` is always a concrete node id.
+#[derive(Debug, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum VmPowerRequest {
+    /// Boot a defined VM.
+    Start { host: String, name: String },
+    /// Stop a running/paused VM (graceful unless `force`).
+    Stop {
+        host: String,
+        name: String,
+        force: bool,
+    },
+    /// Suspend a running VM.
+    Pause { host: String, name: String },
+    /// Resume a suspended VM.
+    Resume { host: String, name: String },
+}
+
+impl VmPowerRequest {
+    /// Serialize to the request body. A fixed, derive-backed shape → serialization
+    /// cannot realistically fail; an empty body (never produced here) is simply
+    /// rejected by the worker's parser.
+    fn to_body(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// Publish a VM power request to `action/vm/lifecycle` via the persist-first path
+/// (`mde-bus publish`'s own path): recorded locally + replicated to the target
+/// node by the Bus. Records any failure in `last_error` — never panics. The exact
+/// persist-write discipline as `discovery::publish` / `datacenter::publish` (§6).
+fn publish_power(bus_root: Option<&Path>, last_error: &mut Option<String>, req: &VmPowerRequest) {
+    let Some(root) = bus_root else {
+        *last_error = Some("No mesh Bus directory — VM power actions unavailable.".to_string());
+        return;
+    };
+    match mde_bus::persist::Persist::open(root.to_path_buf()).and_then(|p| {
+        p.write(
+            LIFECYCLE_TOPIC,
+            mde_bus::hooks::config::Priority::Default,
+            None,
+            Some(&req.to_body()),
+        )
+    }) {
+        Ok(_) => *last_error = None,
+        Err(e) => *last_error = Some(format!("Couldn't publish VM power action: {e}")),
+    }
+}
+
+/// A local VM's coarse power state, read from the aggregator's published
+/// `power_state` string (§7 — the truth comes from the worker's roster, never
+/// guessed here). Drives which power buttons a card offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerState {
+    /// `running` — the console answers; Stop/Pause offered.
+    Running,
+    /// `paused` — suspended; Resume/Stop offered.
+    Paused,
+    /// `shut off` (or `crashed`) — Start offered (the "one click away" flow).
+    ShutOff,
+    /// A state this build doesn't map — no action offered (honest).
+    Unknown,
+}
+
+impl PowerState {
+    /// Map the aggregator's raw libvirt state string.
+    fn from_wire(s: &str) -> Self {
+        match s.trim() {
+            "running" => Self::Running,
+            "paused" => Self::Paused,
+            "shut off" | "crashed" => Self::ShutOff,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// The power ops offered from this state — the shell-side mirror of the
+    /// worker's lifecycle state machine, so the card never shows a button the
+    /// worker would reject.
+    const fn actions(self) -> &'static [PowerOp] {
+        match self {
+            Self::ShutOff => &[PowerOp::Start],
+            Self::Running => &[PowerOp::Stop, PowerOp::Pause],
+            Self::Paused => &[PowerOp::Resume, PowerOp::Stop],
+            Self::Unknown => &[],
+        }
+    }
+}
+
+/// The honest no-local-hypervisor gate (§7): the `local-kvm` lane's published
+/// status when it reports the hypervisor toolchain is unavailable
+/// (`gated: …` / `error: …`), else `None` when a live hypervisor is present. When
+/// `Some`, a local-VM card shows its power buttons disabled with this reason,
+/// never a control that pretends to act.
+fn local_hypervisor_gate(lanes: &[LaneStatus]) -> Option<String> {
+    lanes
+        .iter()
+        .find(|l| l.lane == "local-kvm")
+        .filter(|l| {
+            let s = l.status.trim_start();
+            s.starts_with("gated") || s.starts_with("error")
+        })
+        .map(|l| l.status.clone())
+}
+
+/// Build the host-targeted `vm_lifecycle` request a card power click drives — the
+/// pure card→worker mapping. `None` when the source isn't a **local** VM (a peer
+/// VM is powered from its own node, not from here) or has left the roster.
+fn build_power_request(sources: &[DesktopSource], id: &str, op: PowerOp) -> Option<VmPowerRequest> {
+    let source = sources.iter().find(|s| s.id == id)?;
+    if source.origin != SourceOrigin::LocalVm {
+        return None;
+    }
+    Some(op.to_request(&source.node, &source.name))
 }
 
 // ───────────────────── CHOOSER-3: the thumbnail cache ─────────────────────
@@ -843,6 +1026,31 @@ impl ChooserState {
         self.pending = None;
     }
 
+    /// CHOOSER-7 — a local-VM card power button was clicked: publish the
+    /// host-targeted `vm_lifecycle` request to `action/vm/lifecycle` (the ONE
+    /// shared emitter, §6). The action targets the VM's own node (the worker there
+    /// drops anything that doesn't `targets()` its id), and the discovery
+    /// aggregator republishes the VM's new power state, which the card reflects on
+    /// the next poll — never a faked local state flip here (§7). A publish failure
+    /// surfaces on `last_error`, never a panic.
+    fn power_action(&mut self, sources: &[DesktopSource], id: &str, op: PowerOp) {
+        let Some(request) = build_power_request(sources, id, op) else {
+            return;
+        };
+        publish_power(self.bus_root.as_deref(), &mut self.last_error, &request);
+        if self.last_error.is_none() {
+            if let Some(source) = sources.iter().find(|s| s.id == id) {
+                self.note = Some(format!(
+                    "{} {} on {} — the vm_lifecycle worker is applying it; the card reflects \
+                     the new power state on the next refresh.",
+                    op.verb(),
+                    source.name,
+                    source.node,
+                ));
+            }
+        }
+    }
+
     /// Connect one source with the picked options: build the [`ConnectRequest`]
     /// for the Desktop surface, and — for a mesh-brokered source — publish the
     /// broker `SessionRequest::Open` through the ONE existing wire path
@@ -976,6 +1184,14 @@ enum CardAction {
     Confirm,
     /// The connect picker was dismissed.
     Cancel,
+    /// CHOOSER-7 — a local-VM power button was clicked (drive the `vm_lifecycle`
+    /// worker for that VM).
+    Power {
+        /// The source id (the roster key back to its node + name).
+        id: String,
+        /// The lifecycle op the button maps to.
+        op: PowerOp,
+    },
 }
 
 /// Render the Chooser into `ui`: the BRAND-1 backdrop first (full hero +
@@ -1020,6 +1236,12 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
     // values + two disjoint `&mut` fields, never `state` wholesale (borrow clean).
     let pending_id = state.pending.as_ref().map(|d| d.source_id.clone());
     let note = state.note.clone();
+    // CHOOSER-7 — the honest no-local-hypervisor gate, read once from the roster's
+    // lane status and threaded to every local-VM card's power row.
+    let power_gate: Option<String> = state
+        .state
+        .as_ref()
+        .and_then(|s| local_hypervisor_gate(&s.lanes));
     let degraded: Vec<String> = state
         .state
         .as_ref()
@@ -1051,7 +1273,9 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
                 ui.horizontal_wrapped(|ui| {
                     for source in members {
                         let pending = pending_id.as_deref() == Some(source.id.as_str());
-                        if let Some(a) = source_card(ui, source, pending, thumbs) {
+                        if let Some(a) =
+                            source_card(ui, source, pending, thumbs, power_gate.as_deref())
+                        {
                             action = Some(a);
                         }
                         ui.add_space(Style::SP_S);
@@ -1088,6 +1312,7 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
         Some(CardAction::Activate(id)) => state.activate(&sources, &id),
         Some(CardAction::Confirm) => state.confirm_connect(&sources),
         Some(CardAction::Cancel) => state.cancel_connect(),
+        Some(CardAction::Power { id, op }) => state.power_action(&sources, &id, op),
         None => {}
     }
 }
@@ -1102,63 +1327,75 @@ fn source_card(
     source: &DesktopSource,
     pending: bool,
     thumbs: &mut ThumbnailCache,
+    gate: Option<&str>,
 ) -> Option<CardAction> {
     let card = egui::vec2(CARD_WIDTH, CARD_HEIGHT);
-    let response = ui
-        .allocate_ui(card, |ui| {
-            ui.set_min_size(card);
-            ui.set_max_width(CARD_WIDTH);
-            let rect = ui.max_rect();
-            let hovered = source.connectable() && ui.rect_contains_pointer(rect);
-
-            // The card plate — painted first so the content lays out over it.
-            let fill = if hovered {
-                Style::SURFACE_HI
-            } else {
-                Style::SURFACE
-            };
-            let border = if pending {
-                Style::ACCENT_HI
-            } else if hovered {
-                Style::ACCENT
-            } else {
-                Style::BORDER
-            };
-            ui.painter().rect_filled(rect, Style::RADIUS, fill);
-            ui.painter().rect_stroke(
-                rect,
-                Style::RADIUS,
-                Stroke::new(1.0, border),
-                StrokeKind::Inside,
-            );
-
-            if !source.connectable() {
-                ui.set_opacity(OFFLINE_OPACITY);
-            }
-            ui.horizontal(|ui| {
-                ui.add_space(Style::SP_S);
-                ui.vertical(|ui| {
-                    ui.set_width(Style::SP_S.mul_add(-2.0, CARD_WIDTH));
-                    ui.add_space(Style::SP_S);
-                    card_body(ui, source, thumbs);
-                });
-            });
-        })
-        .response;
-
+    // Activating a connectable card opens its console (the VDI connect path); an
+    // offline card senses hover only. Its power buttons stay live regardless.
     let sense = if source.connectable() {
         Sense::click()
     } else {
         Sense::hover()
     };
-    let resp = ui
-        .interact(
-            response.rect,
-            egui::Id::new(("chooser-card", source.id.as_str())),
-            sense,
-        )
-        .on_hover_text(card_tooltip(source));
-    resp.clicked()
+    // The whole card is ONE interactive container. `UiBuilder::sense` registers the
+    // card's click BELOW any widget inside it, so a power button (added within)
+    // receives its own click instead — a Stop/Pause tap never doubles as a
+    // console-open activate (the CHOOSER-7 co-existence, egui's documented idiom).
+    let scoped = ui.scope_builder(egui::UiBuilder::new().sense(sense), |ui| {
+        // Reserve exactly the card so the grid stays regular; the plate is painted
+        // over this fixed rect and the body lays out within it.
+        ui.set_min_size(card);
+        ui.set_max_width(CARD_WIDTH);
+        let rect = egui::Rect::from_min_size(ui.min_rect().min, card);
+        let hovered = source.connectable() && ui.rect_contains_pointer(rect);
+
+        // The card plate — painted first so the content lays out over it.
+        let fill = if hovered {
+            Style::SURFACE_HI
+        } else {
+            Style::SURFACE
+        };
+        let border = if pending {
+            Style::ACCENT_HI
+        } else if hovered {
+            Style::ACCENT
+        } else {
+            Style::BORDER
+        };
+        ui.painter().rect_filled(rect, Style::RADIUS, fill);
+        ui.painter().rect_stroke(
+            rect,
+            Style::RADIUS,
+            Stroke::new(1.0, border),
+            StrokeKind::Inside,
+        );
+
+        if !source.connectable() {
+            ui.set_opacity(OFFLINE_OPACITY);
+        }
+        ui.horizontal(|ui| {
+            ui.add_space(Style::SP_S);
+            ui.vertical(|ui| {
+                ui.set_width(Style::SP_S.mul_add(-2.0, CARD_WIDTH));
+                ui.add_space(Style::SP_S);
+                card_body(ui, source, thumbs, gate)
+            })
+            .inner
+        })
+        .inner
+    });
+    let power = scoped.inner;
+    let response = scoped.response.on_hover_text(card_tooltip(source));
+
+    // A power click takes precedence over (and suppresses) the console-open.
+    if let Some(op) = power {
+        return Some(CardAction::Power {
+            id: source.id.clone(),
+            op,
+        });
+    }
+    response
+        .clicked()
         .then(|| CardAction::Activate(source.id.clone()))
 }
 
@@ -1196,8 +1433,14 @@ fn fit_centered(bounds: egui::Rect, img: egui::Vec2) -> egui::Rect {
     egui::Rect::from_center_size(bounds.center(), egui::vec2(img.x * scale, img.y * scale))
 }
 
-/// The card's content rows, top to bottom inside the plate.
-fn card_body(ui: &mut egui::Ui, source: &DesktopSource, thumbs: &mut ThumbnailCache) {
+/// The card's content rows, top to bottom inside the plate. Returns the power op
+/// clicked this frame on a local-VM card (CHOOSER-7), if any.
+fn card_body(
+    ui: &mut egui::Ui,
+    source: &DesktopSource,
+    thumbs: &mut ThumbnailCache,
+    gate: Option<&str>,
+) -> Option<PowerOp> {
     thumbnail_well(ui, source, thumbs);
     ui.add_space(Style::SP_XS);
 
@@ -1251,6 +1494,55 @@ fn card_body(ui: &mut egui::Ui, source: &DesktopSource, thumbs: &mut ThumbnailCa
             }
         }
     });
+
+    // CHOOSER-7 — the local-VM power controls. Only a local VM (this node's
+    // libvirt) is powered from here; a peer VM is powered from its own node.
+    if source.origin == SourceOrigin::LocalVm {
+        ui.add_space(Style::SP_XS);
+        power_row(ui, source, gate)
+    } else {
+        None
+    }
+}
+
+/// The local-VM power-control row (CHOOSER-7): buttons appropriate to the VM's
+/// live power state — Start a stopped desktop (one click away), Stop/Pause a
+/// running one, Resume a paused one. When the node has no local hypervisor
+/// (`gate` is `Some`) the buttons render disabled with the honest reason, never a
+/// control that pretends to act (§7). Returns the op clicked this frame, if any.
+fn power_row(ui: &mut egui::Ui, source: &DesktopSource, gate: Option<&str>) -> Option<PowerOp> {
+    let state = source
+        .power_state
+        .as_deref()
+        .map_or(PowerState::Unknown, PowerState::from_wire);
+    let ops = state.actions();
+    // A live hypervisor + an unmapped state offers no honest action — draw nothing.
+    if ops.is_empty() && gate.is_none() {
+        return None;
+    }
+    // Power controls read at full strength even on a dimmed (offline) card — a
+    // stopped desktop's Start button must look one click away, not greyed out.
+    ui.set_opacity(1.0);
+    let enabled = gate.is_none();
+    let mut clicked = None;
+    ui.horizontal(|ui| {
+        for op in ops {
+            if ui
+                .add_enabled(
+                    enabled,
+                    egui::Button::new(RichText::new(op.label()).size(Style::SMALL)),
+                )
+                .clicked()
+            {
+                clicked = Some(*op);
+            }
+            ui.add_space(Style::SP_XS);
+        }
+    });
+    if let Some(reason) = gate {
+        muted_note(ui, format!("no local hypervisor — {reason}"));
+    }
+    clicked
 }
 
 /// The card tooltip — the honest connection detail (origin, dial address, OS
@@ -2378,6 +2670,208 @@ mod tests {
         assert!(
             state.thumbs.slots.values().all(|s| s.texture.is_some()),
             "the card's snapshot decoded to a live texture"
+        );
+    }
+
+    // ── CHOOSER-7: local-VM power controls ──
+
+    /// A local-KVM source row in the exact `source_from_vm` shape (Spice console,
+    /// reachability + reason derived from the power state) — the aggregator's
+    /// `local-kvm` lane projection this surface renders.
+    fn local_vm(name: &str, node: &str, power: &str) -> DesktopSource {
+        let live = matches!(power.trim(), "running" | "paused");
+        DesktopSource {
+            id: format!("vm:{node}:{name}"),
+            name: name.to_string(),
+            node: node.to_string(),
+            host: node.to_string(),
+            protocols: vec![ProtocolOffer {
+                protocol: Protocol::Spice,
+                port: None,
+            }],
+            origin: SourceOrigin::LocalVm,
+            reachability: if live {
+                Reachability::Reachable
+            } else {
+                Reachability::Unreachable
+            },
+            reason: (!live).then(|| format!("vm {power}")),
+            os_hint: None,
+            power_state: Some(power.to_string()),
+            thumbnail_ref: None,
+        }
+    }
+
+    fn lane(name: &str, status: &str) -> LaneStatus {
+        LaneStatus {
+            lane: name.to_string(),
+            status: status.to_string(),
+        }
+    }
+
+    #[test]
+    fn power_state_reflection_offers_state_appropriate_actions() {
+        // State reflection: the card offers only the ops valid for the published
+        // power state — a stopped VM starts (one click away), a running one
+        // stops/pauses, a paused one resumes/stops, an unmapped state nothing.
+        assert_eq!(
+            PowerState::from_wire("shut off").actions().to_vec(),
+            vec![PowerOp::Start]
+        );
+        assert_eq!(
+            PowerState::from_wire("crashed").actions().to_vec(),
+            vec![PowerOp::Start],
+            "a crashed VM can be re-Started"
+        );
+        assert_eq!(
+            PowerState::from_wire("running").actions().to_vec(),
+            vec![PowerOp::Stop, PowerOp::Pause]
+        );
+        assert_eq!(
+            PowerState::from_wire("paused").actions().to_vec(),
+            vec![PowerOp::Resume, PowerOp::Stop]
+        );
+        assert!(
+            PowerState::from_wire("pmsuspended").actions().is_empty(),
+            "an unmapped state offers no blind action (§7)"
+        );
+    }
+
+    #[test]
+    fn the_lifecycle_topic_matches_the_worker_contract() {
+        // Cross-check: MUST equal mackesd::workers::vm_lifecycle::ACTION_TOPIC.
+        assert_eq!(LIFECYCLE_TOPIC, "action/vm/lifecycle");
+    }
+
+    #[test]
+    fn power_ops_map_to_the_host_targeted_vm_lifecycle_verbs() {
+        // Action dispatch (wire): each op serialises to the worker's LifecycleAction
+        // shape, host-targeted so it can only act on the named node.
+        let body = |op: PowerOp| op.to_request("elm", "dev").to_body();
+        let start: serde_json::Value = serde_json::from_str(&body(PowerOp::Start)).unwrap();
+        assert_eq!(start["op"], "start");
+        let stop: serde_json::Value = serde_json::from_str(&body(PowerOp::Stop)).unwrap();
+        assert_eq!(stop["op"], "stop");
+        assert_eq!(stop["force"], false, "the card issues a graceful stop");
+        let pause: serde_json::Value = serde_json::from_str(&body(PowerOp::Pause)).unwrap();
+        assert_eq!(pause["op"], "pause");
+        let resume: serde_json::Value = serde_json::from_str(&body(PowerOp::Resume)).unwrap();
+        assert_eq!(resume["op"], "resume");
+        for op in [
+            PowerOp::Start,
+            PowerOp::Stop,
+            PowerOp::Pause,
+            PowerOp::Resume,
+        ] {
+            let v: serde_json::Value = serde_json::from_str(&body(op)).unwrap();
+            assert_eq!(v["host"], "elm", "host-targeted");
+            assert_eq!(v["name"], "dev");
+        }
+    }
+
+    #[test]
+    fn build_power_request_targets_local_vms_and_skips_peers() {
+        // Action dispatch (source→request): a local VM maps to a Start for its own
+        // node + name; a peer VM/seat is powered from ITS node, never from here.
+        let sources = vec![
+            local_vm("dev", "elm", "shut off"),
+            source("peer:oak", "oak", &[Protocol::Rdp]),
+        ];
+        let req = build_power_request(&sources, "vm:elm:dev", PowerOp::Start).expect("local maps");
+        let v: serde_json::Value = serde_json::from_str(&req.to_body()).unwrap();
+        assert_eq!(v["op"], "start");
+        assert_eq!(v["host"], "elm");
+        assert_eq!(v["name"], "dev");
+        assert!(
+            build_power_request(&sources, "peer:oak", PowerOp::Stop).is_none(),
+            "a peer source is not driven from here"
+        );
+        assert!(
+            build_power_request(&sources, "vm:elm:ghost", PowerOp::Start).is_none(),
+            "a vanished id maps to nothing"
+        );
+    }
+
+    #[test]
+    fn the_no_hypervisor_gate_reads_the_local_kvm_lane_status() {
+        // The honest-gate fold: a gated/errored local-kvm lane surfaces its reason
+        // (power controls disable); a live "ok" lane does not gate.
+        assert_eq!(
+            local_hypervisor_gate(&[lane("local-kvm", "gated: virsh not found")]).as_deref(),
+            Some("gated: virsh not found")
+        );
+        assert!(
+            local_hypervisor_gate(&[lane("local-kvm", "error: libvirt refused")]).is_some(),
+            "a backend error also gates"
+        );
+        assert!(
+            local_hypervisor_gate(&[lane("local-kvm", "ok (2 vms)")]).is_none(),
+            "a live hypervisor does not gate"
+        );
+        assert!(
+            local_hypervisor_gate(&[lane("mdns", "ok")]).is_none(),
+            "no local-kvm lane → no gate"
+        );
+        assert!(local_hypervisor_gate(&[]).is_none());
+    }
+
+    #[test]
+    fn a_local_vm_power_click_routes_through_the_lifecycle_emitter() {
+        // Driving a card power op with no Bus root records the honest publish error
+        // (never a panic) — proving the click reaches the shared vm_lifecycle
+        // emitter rather than faking a local state flip (§7).
+        let mut state = state_with(Some(roster(vec![local_vm("dev", "elm", "shut off")])));
+        let sources = state.sources_snapshot();
+        state.power_action(&sources, "vm:elm:dev", PowerOp::Start);
+        assert!(
+            state
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("Bus")),
+            "no Bus dir surfaces an honest error, not a panic: {:?}",
+            state.last_error
+        );
+
+        // A peer/non-local source is a no-op here (no error, no note).
+        let mut peer = state_with(Some(roster(vec![source(
+            "peer:oak",
+            "oak",
+            &[Protocol::Rdp],
+        )])));
+        let peers = peer.sources_snapshot();
+        peer.power_action(&peers, "peer:oak", PowerOp::Start);
+        assert!(
+            peer.last_error.is_none() && peer.note.is_none(),
+            "a non-local source is never driven from the Chooser"
+        );
+    }
+
+    #[test]
+    fn a_stopped_local_vm_card_renders_the_power_controls() {
+        // The shut-off local VM greys (offline) but its Start button draws at full
+        // strength — the "one click away" affordance tessellates, and rendering it
+        // is not a connect.
+        let mut state = state_with(Some(roster(vec![local_vm("dev", "elm", "shut off")])));
+        assert!(
+            run_panel(&mut state),
+            "the local-VM power row produced no draw primitives"
+        );
+        assert!(state.take_connect().is_none());
+    }
+
+    #[test]
+    fn a_gated_local_kvm_lane_renders_disabled_power_controls_with_the_reason() {
+        // A LocalVm card while the local-kvm lane reports no hypervisor: the buttons
+        // render disabled and the honest reason draws (§7 — never a control that
+        // pretends to act).
+        let state = DesktopSourcesState {
+            sources: vec![local_vm("dev", "elm", "running")],
+            lanes: vec![lane("local-kvm", "gated: virsh not found")],
+        };
+        let mut cs = state_with(Some(state));
+        assert!(
+            run_panel(&mut cs),
+            "the gated power row produced no draw primitives"
         );
     }
 }

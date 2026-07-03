@@ -36,13 +36,15 @@
 //!
 //! Implemented (this slice): **create-from-image** (a per-VM qcow2 overlay backed
 //! by a golden image, or a blank disk of `disk_gb`), **start**, **stop**
-//! (graceful `virsh shutdown` or `force` `virsh destroy`), **destroy** (force-off
-//! then `virsh undefine`, optional `--remove-all-storage`), **list**, **info**,
-//! and the default dir storage-pool + default NAT-network ensure helpers.
+//! (graceful `virsh shutdown` or `force` `virsh destroy`), **pause/resume**
+//! (`virsh suspend`/`virsh resume` — the CHOOSER-7 card power controls drive
+//! these to suspend/wake a running console), **destroy** (force-off then
+//! `virsh undefine`, optional `--remove-all-storage`), **list**, **info**, and
+//! the default dir storage-pool + default NAT-network ensure helpers.
 //!
 //! Deferred (intentionally NOT stubbed with `todo!()` — each rides an existing or
 //! future worker): live/cold **migration** (VIRT-8 `compute_migrate`),
-//! **snapshots** (DATACENTER-12 `dc_snap_scheduler`), pause/resume, vCPU/RAM
+//! **snapshots** (DATACENTER-12 `dc_snap_scheduler`), vCPU/RAM
 //! hotplug, cloud-init **identity seeding** (VIRT-6 `compute_provision`, the
 //! desktop/mesh-peer create path), console/VNC brokering (E12 egui VDI), UEFI
 //! nvram cleanup on undefine, and richer per-VM telemetry (VIRT-1
@@ -156,6 +158,21 @@ pub enum LifecycleAction {
         #[serde(default)]
         force: bool,
     },
+    /// Pause a running VM — `virsh suspend` (the CPU is frozen, RAM retained). The
+    /// console stays attachable; [`Resume`](Self::Resume) wakes it.
+    Pause {
+        /// Target node id.
+        host: String,
+        /// Domain name.
+        name: String,
+    },
+    /// Resume a paused VM — `virsh resume` (un-freeze a suspended domain).
+    Resume {
+        /// Target node id.
+        host: String,
+        /// Domain name.
+        name: String,
+    },
     /// Destroy a VM: force-off (if running) then `virsh undefine`, optionally
     /// wiping its storage.
     Destroy {
@@ -183,6 +200,8 @@ impl LifecycleAction {
             Self::Create { host, .. }
             | Self::Start { host, .. }
             | Self::Stop { host, .. }
+            | Self::Pause { host, .. }
+            | Self::Resume { host, .. }
             | Self::Destroy { host, .. }
             | Self::Refresh { host } => host,
         }
@@ -307,6 +326,10 @@ pub enum LifecycleOp {
     Start,
     /// Stop a running domain.
     Stop,
+    /// Suspend a running domain (freeze).
+    Pause,
+    /// Un-freeze a suspended domain.
+    Resume,
     /// Remove a domain.
     Destroy,
 }
@@ -320,6 +343,10 @@ pub enum Transition {
     Started,
     /// Now shut off.
     Stopped,
+    /// Now suspended.
+    Paused,
+    /// Un-frozen — running again.
+    Resumed,
     /// Removed.
     Removed,
 }
@@ -339,6 +366,12 @@ pub enum TransitionError {
     /// Stop on a VM that isn't running.
     #[error("not running")]
     NotRunning,
+    /// Pause on a VM that's already suspended.
+    #[error("already paused")]
+    AlreadyPaused,
+    /// Resume on a VM that isn't paused.
+    #[error("not paused")]
+    NotPaused,
     /// The op isn't valid from the current state.
     #[error("cannot {op:?} a VM in state {state:?}")]
     Invalid {
@@ -381,6 +414,20 @@ pub fn plan_transition(
             state,
         }),
 
+        (LifecycleOp::Pause, None) => Err(TransitionError::NotFound),
+        (LifecycleOp::Pause, Some(VmState::Running)) => Ok(Transition::Paused),
+        (LifecycleOp::Pause, Some(VmState::Paused)) => Err(TransitionError::AlreadyPaused),
+        (LifecycleOp::Pause, Some(state)) => Err(TransitionError::Invalid {
+            op: LifecycleOp::Pause,
+            state,
+        }),
+
+        (LifecycleOp::Resume, None) => Err(TransitionError::NotFound),
+        (LifecycleOp::Resume, Some(VmState::Paused)) => Ok(Transition::Resumed),
+        // Resume only wakes a paused VM; anything else (running/shut-off/crashed)
+        // simply isn't paused.
+        (LifecycleOp::Resume, Some(_)) => Err(TransitionError::NotPaused),
+
         (LifecycleOp::Destroy, None) => Err(TransitionError::NotFound),
         (LifecycleOp::Destroy, Some(_)) => Ok(Transition::Removed),
     }
@@ -412,6 +459,18 @@ pub fn build_define_argv(xml_path: &str) -> Vec<String> {
 #[must_use]
 pub fn build_start_argv(name: &str) -> Vec<String> {
     vec!["start".into(), name.into()]
+}
+
+/// `virsh suspend <name>` — freeze a running domain (the pause verb).
+#[must_use]
+pub fn build_suspend_argv(name: &str) -> Vec<String> {
+    vec!["suspend".into(), name.into()]
+}
+
+/// `virsh resume <name>` — un-freeze a suspended domain.
+#[must_use]
+pub fn build_resume_argv(name: &str) -> Vec<String> {
+    vec!["resume".into(), name.into()]
 }
 
 /// `virsh shutdown <name>` (graceful) or `virsh destroy <name>` (`force`). NOTE
@@ -732,6 +791,18 @@ pub trait LibvirtBackend {
     /// Spawn / non-zero virsh failures.
     fn start(&self, name: &str) -> Result<(), LibvirtError>;
 
+    /// Suspend a running domain (freeze; RAM retained).
+    ///
+    /// # Errors
+    /// Spawn / non-zero virsh failures.
+    fn pause(&self, name: &str) -> Result<(), LibvirtError>;
+
+    /// Resume a suspended domain.
+    ///
+    /// # Errors
+    /// Spawn / non-zero virsh failures.
+    fn resume(&self, name: &str) -> Result<(), LibvirtError>;
+
     /// Stop a domain — graceful, or a hard force-off when `force`.
     ///
     /// # Errors
@@ -897,6 +968,14 @@ impl LibvirtBackend for VirshCli {
         self.virsh_status(&build_start_argv(name))
     }
 
+    fn pause(&self, name: &str) -> Result<(), LibvirtError> {
+        self.virsh_status(&build_suspend_argv(name))
+    }
+
+    fn resume(&self, name: &str) -> Result<(), LibvirtError> {
+        self.virsh_status(&build_resume_argv(name))
+    }
+
     fn stop(&self, name: &str, force: bool) -> Result<(), LibvirtError> {
         self.virsh_status(&build_stop_argv(name, force))
     }
@@ -953,6 +1032,8 @@ pub fn apply_action(backend: &dyn LibvirtBackend, action: &LifecycleAction) -> R
         LifecycleAction::Create { spec, .. } => (spec.name.as_str(), LifecycleOp::Create),
         LifecycleAction::Start { name, .. } => (name.as_str(), LifecycleOp::Start),
         LifecycleAction::Stop { name, .. } => (name.as_str(), LifecycleOp::Stop),
+        LifecycleAction::Pause { name, .. } => (name.as_str(), LifecycleOp::Pause),
+        LifecycleAction::Resume { name, .. } => (name.as_str(), LifecycleOp::Resume),
         LifecycleAction::Destroy { name, .. } => (name.as_str(), LifecycleOp::Destroy),
     };
     let current = backend
@@ -969,6 +1050,8 @@ pub fn apply_action(backend: &dyn LibvirtBackend, action: &LifecycleAction) -> R
             backend.create(spec).map_err(|e| e.to_string())
         }
         LifecycleAction::Start { name, .. } => backend.start(name).map_err(|e| e.to_string()),
+        LifecycleAction::Pause { name, .. } => backend.pause(name).map_err(|e| e.to_string()),
+        LifecycleAction::Resume { name, .. } => backend.resume(name).map_err(|e| e.to_string()),
         LifecycleAction::Stop { name, force, .. } => {
             backend.stop(name, *force).map_err(|e| e.to_string())
         }
@@ -1268,6 +1351,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_pause_and_resume_actions() {
+        assert_eq!(
+            parse_action(r#"{"op":"pause","host":"n","name":"web1"}"#).unwrap(),
+            LifecycleAction::Pause {
+                host: "n".into(),
+                name: "web1".into(),
+            }
+        );
+        assert_eq!(
+            parse_action(r#"{"op":"resume","host":"n","name":"web1"}"#).unwrap(),
+            LifecycleAction::Resume {
+                host: "n".into(),
+                name: "web1".into(),
+            }
+        );
+    }
+
+    #[test]
     fn parse_refresh_and_reject_malformed() {
         assert_eq!(
             parse_action(r#"{"op":"refresh","host":"n"}"#).unwrap(),
@@ -1295,6 +1396,8 @@ mod tests {
         assert_eq!(build_dominfo_argv("web1"), vec!["dominfo", "web1"]);
         assert_eq!(build_define_argv("/t/d.xml"), vec!["define", "/t/d.xml"]);
         assert_eq!(build_start_argv("web1"), vec!["start", "web1"]);
+        assert_eq!(build_suspend_argv("web1"), vec!["suspend", "web1"]);
+        assert_eq!(build_resume_argv("web1"), vec!["resume", "web1"]);
         // libvirt `destroy` is a FORCE-OFF, not a delete.
         assert_eq!(build_stop_argv("web1", true), vec!["destroy", "web1"]);
         assert_eq!(build_stop_argv("web1", false), vec!["shutdown", "web1"]);
@@ -1560,6 +1663,49 @@ mod tests {
     }
 
     #[test]
+    fn plan_transition_pause_resume() {
+        // Pause: only a running VM freezes.
+        assert_eq!(
+            plan_transition(Some(VmState::Running), LifecycleOp::Pause),
+            Ok(Transition::Paused)
+        );
+        assert_eq!(
+            plan_transition(Some(VmState::Paused), LifecycleOp::Pause),
+            Err(TransitionError::AlreadyPaused)
+        );
+        assert_eq!(
+            plan_transition(Some(VmState::ShutOff), LifecycleOp::Pause),
+            Err(TransitionError::Invalid {
+                op: LifecycleOp::Pause,
+                state: VmState::ShutOff,
+            })
+        );
+        assert_eq!(
+            plan_transition(None, LifecycleOp::Pause),
+            Err(TransitionError::NotFound)
+        );
+
+        // Resume: only a paused VM wakes.
+        assert_eq!(
+            plan_transition(Some(VmState::Paused), LifecycleOp::Resume),
+            Ok(Transition::Resumed)
+        );
+        assert_eq!(
+            plan_transition(Some(VmState::Running), LifecycleOp::Resume),
+            Err(TransitionError::NotPaused),
+            "a running VM isn't paused"
+        );
+        assert_eq!(
+            plan_transition(Some(VmState::ShutOff), LifecycleOp::Resume),
+            Err(TransitionError::NotPaused)
+        );
+        assert_eq!(
+            plan_transition(None, LifecycleOp::Resume),
+            Err(TransitionError::NotFound)
+        );
+    }
+
+    #[test]
     fn plan_transition_destroy() {
         assert_eq!(
             plan_transition(Some(VmState::Running), LifecycleOp::Destroy),
@@ -1626,6 +1772,22 @@ mod tests {
         }
         fn start(&self, name: &str) -> Result<(), LibvirtError> {
             self.record(&format!("start:{name}"));
+            self.domains
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), VmState::Running);
+            Ok(())
+        }
+        fn pause(&self, name: &str) -> Result<(), LibvirtError> {
+            self.record(&format!("pause:{name}"));
+            self.domains
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), VmState::Paused);
+            Ok(())
+        }
+        fn resume(&self, name: &str) -> Result<(), LibvirtError> {
+            self.record(&format!("resume:{name}"));
             self.domains
                 .lock()
                 .unwrap()
@@ -1734,6 +1896,53 @@ mod tests {
         apply_action(&fake, &destroy).expect("destroy ok");
         assert_eq!(fake.state_of("web1"), None); // removed
         assert!(fake.calls().iter().any(|c| c == "destroy:web1:rm=true"));
+    }
+
+    #[test]
+    fn apply_pause_resume_lifecycle() {
+        // A running VM pauses → suspended; resume wakes it back to running. Each
+        // step drives the injected backend and advances the recorded state.
+        let fake = FakeLibvirt::with_domain("web1", VmState::Running);
+        let pause = LifecycleAction::Pause {
+            host: "node-a".into(),
+            name: "web1".into(),
+        };
+        apply_action(&fake, &pause).expect("pause ok");
+        assert_eq!(fake.state_of("web1"), Some(VmState::Paused));
+        assert!(fake.calls().iter().any(|c| c == "pause:web1"));
+
+        let resume = LifecycleAction::Resume {
+            host: "node-a".into(),
+            name: "web1".into(),
+        };
+        apply_action(&fake, &resume).expect("resume ok");
+        assert_eq!(fake.state_of("web1"), Some(VmState::Running));
+        assert!(fake.calls().iter().any(|c| c == "resume:web1"));
+
+        // Pausing a shut-off VM is rejected by the state machine (no backend call).
+        let off = FakeLibvirt::with_domain("db1", VmState::ShutOff);
+        let err = apply_action(
+            &off,
+            &LifecycleAction::Pause {
+                host: "node-a".into(),
+                name: "db1".into(),
+            },
+        )
+        .expect_err("cannot pause a shut-off VM");
+        assert!(err.contains("cannot"), "{err}");
+        assert!(off.calls().is_empty());
+
+        // Resuming a VM that isn't paused is rejected honestly.
+        let running = FakeLibvirt::with_domain("web2", VmState::Running);
+        let err = apply_action(
+            &running,
+            &LifecycleAction::Resume {
+                host: "node-a".into(),
+                name: "web2".into(),
+            },
+        )
+        .expect_err("cannot resume a running VM");
+        assert!(err.contains("not paused"), "{err}");
     }
 
     #[test]
