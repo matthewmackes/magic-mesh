@@ -6,9 +6,19 @@
 //! ([`SeatError::OutOfRange`]), never clamped silently. A host with no backlight
 //! class (a desktop with only external monitors) answers
 //! [`SeatError::Unavailable`] — an honest "no panel here", never a fake slider.
+//!
+//! **Writing brightness (BUG-BRIGHTNESS-1).** `/sys/class/backlight/<dev>/brightness`
+//! ships `root:root 0644`, so the non-root DRM shell session cannot write it —
+//! a raw write is `Permission denied`. Desktops don't write that file directly;
+//! they ask logind. So the write path is: try logind's session
+//! `SetBrightness` first (the caller's active session is privileged for it — no
+//! root, no udev), and fall back to the direct sysfs write only when logind is
+//! absent/refuses (a headless or root context). The honest error surfaces only
+//! if *both* legs fail.
 
 use std::path::{Path, PathBuf};
 
+use crate::bus::SysBus;
 use crate::error::{Backend, SeatError};
 
 /// One sysfs backlight device (a laptop panel, typically `intel_backlight`).
@@ -51,23 +61,80 @@ pub trait BacklightClient: Send {
     fn set_brightness(&self, name: &str, value: u32) -> Result<(), SeatError>;
 }
 
+/// The session-privileged brightness sink tried before the raw sysfs write.
+///
+/// Production impl [`LogindBrightness`] calls logind's
+/// `org.freedesktop.login1.Session.SetBrightness`; tests inject a fake to
+/// exercise the primary-then-fallback chain without a live bus.
+trait BrightnessSink: Send {
+    /// Set `subsystem`/`name` to raw `value` via the session-privileged path.
+    ///
+    /// # Errors
+    /// Typed: [`SeatError::Unavailable`] when logind / the system bus is absent
+    /// (the fallback trigger), [`SeatError::Backend`] on a refusal.
+    fn set(&self, subsystem: &str, name: &str, value: u32) -> Result<(), SeatError>;
+}
+
+/// The production sink: logind session `SetBrightness` over the system bus.
+///
+/// The caller's own active logind session is privileged to set its seat's
+/// backlight, so this needs no root and no udev rule. `SetBrightness` takes
+/// `(subsystem: s, name: s, brightness: u)` on the `session/auto` object (the
+/// caller's session), mirroring the [`crate::logind`] self-lock path.
+struct LogindBrightness {
+    bus: SysBus,
+}
+
+impl LogindBrightness {
+    const fn new() -> Self {
+        Self {
+            bus: SysBus::new(Backend::Backlight),
+        }
+    }
+}
+
+impl BrightnessSink for LogindBrightness {
+    fn set(&self, subsystem: &str, name: &str, value: u32) -> Result<(), SeatError> {
+        self.bus.call_unit(
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1/session/auto",
+            "org.freedesktop.login1.Session",
+            "SetBrightness",
+            &(subsystem, name, value),
+        )
+    }
+}
+
 /// The production client over `/sys/class/backlight`. The root is injectable
 /// ([`SysfsBacklight::with_root`]) so enumeration + range logic test headless.
 pub struct SysfsBacklight {
     root: PathBuf,
+    /// The session-brightness sink tried before the direct sysfs write. `None`
+    /// on the [`SysfsBacklight::with_root`] test seam — hermetic, so a test over
+    /// a scratch root can never reach out and dim a real panel.
+    logind: Option<Box<dyn BrightnessSink>>,
 }
 
 impl SysfsBacklight {
-    /// A client over the real `/sys/class/backlight`.
+    /// A client over the real `/sys/class/backlight`, preferring logind's
+    /// session `SetBrightness` for writes (BUG-BRIGHTNESS-1).
     #[must_use]
     pub fn new() -> Self {
-        Self::with_root("/sys/class/backlight")
+        Self {
+            root: PathBuf::from("/sys/class/backlight"),
+            logind: Some(Box::new(LogindBrightness::new())),
+        }
     }
 
-    /// A client over an alternate class root (the test seam).
+    /// A client over an alternate class root (the test seam). No logind sink:
+    /// writes land straight on the scratch sysfs so enumeration + range logic
+    /// test headless without touching a real session bus.
     #[must_use]
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            logind: None,
+        }
     }
 
     fn read_u32(path: &Path) -> Result<u32, SeatError> {
@@ -125,6 +192,18 @@ impl BacklightClient for SysfsBacklight {
                 max,
             });
         }
+        // Primary: logind's session `SetBrightness` — the privileged path a
+        // non-root desktop session uses, so `brightness` staying root:root 0644
+        // is not a wall (BUG-BRIGHTNESS-1). On absence/refusal (headless or a
+        // root context with no session bus) fall through to the raw write.
+        if let Some(sink) = &self.logind {
+            if sink.set("backlight", name, value).is_ok() {
+                return Ok(());
+            }
+        }
+        // Fallback: the direct sysfs write. Its error is the honest final word
+        // (the `Permission denied` the operator saw) when logind is unavailable
+        // AND this too fails.
         let path = dir.join("brightness");
         std::fs::write(&path, value.to_string()).map_err(|source| SeatError::Io {
             backend: Backend::Backlight,
@@ -227,9 +306,106 @@ mod tests {
             ),
             "{e}"
         );
-        // an in-range write lands
+        // an in-range write lands (with_root has no logind sink → sysfs write)
         cl.set_brightness("edp", 75).unwrap();
         assert_eq!(cl.devices().unwrap()[0].brightness, 75);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A recording fake for the logind seam — captures every `SetBrightness`
+    /// call and answers Ok/Err on demand, so the primary-then-fallback chain is
+    /// testable without a live session bus.
+    #[derive(Clone)]
+    struct FakeSink {
+        fail: bool,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, u32)>>>,
+    }
+
+    impl FakeSink {
+        fn new(fail: bool) -> Self {
+            Self {
+                fail,
+                seen: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+        fn calls(&self) -> Vec<(String, String, u32)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl BrightnessSink for FakeSink {
+        fn set(&self, subsystem: &str, name: &str, value: u32) -> Result<(), SeatError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((subsystem.to_string(), name.to_string(), value));
+            if self.fail {
+                Err(SeatError::Unavailable {
+                    backend: Backend::Backlight,
+                    reason: "fake: no logind session".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn logind_takes_the_write_with_the_right_args_and_skips_sysfs() {
+        let root = scratch();
+        fake_device(&root, "intel_backlight", 100, 255);
+        let sink = FakeSink::new(false);
+        let probe = sink.clone();
+        let cl = SysfsBacklight {
+            root: root.clone(),
+            logind: Some(Box::new(sink)),
+        };
+        cl.set_brightness("intel_backlight", 200).unwrap();
+        // logind carried the write with (subsystem, name, raw value)...
+        assert_eq!(
+            probe.calls(),
+            vec![("backlight".into(), "intel_backlight".into(), 200)]
+        );
+        // ...and the sysfs file was NOT touched — still the seeded 100.
+        assert_eq!(cl.devices().unwrap()[0].brightness, 100);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_logind_failure_falls_back_to_the_sysfs_write() {
+        let root = scratch();
+        fake_device(&root, "intel_backlight", 100, 255);
+        let sink = FakeSink::new(true);
+        let probe = sink.clone();
+        let cl = SysfsBacklight {
+            root: root.clone(),
+            logind: Some(Box::new(sink)),
+        };
+        cl.set_brightness("intel_backlight", 200).unwrap();
+        // logind was tried first...
+        assert_eq!(probe.calls().len(), 1);
+        // ...and on its failure the raw sysfs write landed the new value.
+        assert_eq!(cl.devices().unwrap()[0].brightness, 200);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn out_of_range_is_refused_before_either_write_path() {
+        let root = scratch();
+        fake_device(&root, "intel_backlight", 100, 255);
+        let sink = FakeSink::new(false);
+        let probe = sink.clone();
+        let cl = SysfsBacklight {
+            root: root.clone(),
+            logind: Some(Box::new(sink)),
+        };
+        let e = cl
+            .set_brightness("intel_backlight", 999)
+            .expect_err("over-max must be refused");
+        assert!(matches!(e, SeatError::OutOfRange { max: 255, .. }), "{e}");
+        // Neither logind nor sysfs was written — the range check is the gate.
+        assert!(probe.calls().is_empty());
+        assert_eq!(cl.devices().unwrap()[0].brightness, 100);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -1,0 +1,9 @@
+# BUG-BRIGHTNESS-1 — let the non-root DRM shell session set panel brightness.
+#
+# `/sys/class/backlight/<dev>/brightness` ships root:root 0644, so the seat
+# user's brightness slider hits EACCES on a raw write. The primary fix is
+# logind's session `SetBrightness` (mde-seat tries it first); this rule is the
+# belt-and-suspenders fallback for hosts without an active logind session
+# (headless/kiosk): hand the `brightness` attribute to the `video` group so a
+# member can write it directly. Matches the long-standing desktop convention.
+ACTION=="add", SUBSYSTEM=="backlight", RUN+="/bin/chgrp video /sys/class/backlight/%k/brightness", RUN+="/bin/chmod g+w /sys/class/backlight/%k/brightness"

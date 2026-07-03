@@ -638,6 +638,11 @@ assets = [
     { source = "packaging/systemd/mcnf-farm-autoscale-reconcile.timer",   dest = "/usr/lib/systemd/system/mcnf-farm-autoscale-reconcile.timer",   mode = "644" },
     { source = "packaging/systemd/mcnf-dr-backup.service", dest = "/usr/lib/systemd/system/mcnf-dr-backup.service", mode = "644" },
     { source = "packaging/systemd/mcnf-dr-backup.timer",   dest = "/usr/lib/systemd/system/mcnf-dr-backup.timer",   mode = "644" },
+    # BUG-BRIGHTNESS-1 — the belt-and-suspenders backlight udev rule. mde-seat's
+    # slider prefers logind's session SetBrightness (no root), but on a host with
+    # no active logind session this rule hands /sys/class/backlight/*/brightness
+    # to the `video` group so a member can write it directly (the desktop idiom).
+    { source = "packaging/udev/90-mde-backlight.rules", dest = "/usr/lib/udev/rules.d/90-mde-backlight.rules", mode = "644" },
 ]
 # EFF-14 — install/upgrade/remove scriptlets: register the daemon unit, create
 # the config dir, refresh icon/desktop caches; clean up on removal. Guards keep
