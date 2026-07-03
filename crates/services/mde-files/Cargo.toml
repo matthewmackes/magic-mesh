@@ -32,6 +32,14 @@ flate2     = "1"
 image      = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 png        = "0.18"
 md5        = "0.7"
+# FILEMGR-4 — recursive search: name-glob matching (`globset`) + content grep
+# (`regex`, binary-safe `regex::bytes`). Both are already resolved in the
+# workspace lockfile (globset 0.4.18, regex 1.12.4 — pulled transitively), so a
+# direct edge at those same versions is fetch-free on the airgapped farm. The
+# recursive traversal itself reuses the `FileOps` seam (not `walkdir`/`ignore`),
+# so it stays testable against `FakeFileOps`.
+globset    = "0.4"
+regex      = "1"
 # mackesd-IPC opt-in deps. Behind the `dbus` feature so the headless
 # crate (DemoBackend only) keeps a minimal dep graph. zbus was dropped
 # at E0.3.2 when the last D-Bus client (Fleet.Files) moved to the Bus.

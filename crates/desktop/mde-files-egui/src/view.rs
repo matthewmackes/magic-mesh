@@ -39,11 +39,13 @@ use mde_egui::{field, muted_note, status_dot, Style};
 
 use mde_files::model::{Mime, PeerStatus};
 use mde_files::opqueue::{Progress, Resolution};
+use mde_files::search::TypeFilter;
 
 use crate::dialogs::{Perm, PermClass};
 use crate::mesh_mount::{MountPhase, MountView};
 use crate::model::{
-    mount_host_of, FileBrowser, Location, SendOutcome, SortKey, SortSpec, ViewMode, LOCAL_SPOTS,
+    mount_host_of, FileBrowser, Location, SearchForm, SendOutcome, SortKey, SortSpec, ViewMode,
+    LOCAL_SPOTS,
 };
 use crate::preview::{
     Pixels, PreviewData, PreviewKind, PreviewState, ThumbState, TokenKind, TokenSpan,
@@ -180,6 +182,16 @@ enum Action {
     ResumeOp(u64),
     CancelOp(u64),
     DismissOp(u64),
+    /// FILEMGR-4 — toggle the recursive-search bar.
+    ToggleSearchBar,
+    /// FILEMGR-4 — commit an edit to the search entry/filter form.
+    SetSearchForm(SearchForm),
+    /// FILEMGR-4 — run the search over `pane`'s current directory.
+    RunSearch(usize),
+    /// FILEMGR-4 — cancel the running search (results so far stay on screen).
+    CancelSearch,
+    /// FILEMGR-4 — leave search mode and restore `pane`'s folder listing.
+    ClearSearch(usize),
 }
 
 /// Render the whole Files surface into `ui`. The one reusable entry point: the
@@ -205,6 +217,14 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     browser.pump_mounts();
     if browser.any_mount_transitional() {
         ui.ctx().request_repaint_after(Duration::from_secs(1));
+    }
+    // FILEMGR-4 — fold the recursive-search worker's streamed hits into the
+    // results tab before the frame reads the listing, and keep a heartbeat alive
+    // while it walks so results appear live without input. The walk itself runs
+    // off-thread (never this paint path).
+    browser.pump_search();
+    if browser.search_running() {
+        ui.ctx().request_repaint_after(Duration::from_millis(80));
     }
 
     let mut actions: Vec<Action> = Vec::new();
@@ -290,6 +310,11 @@ fn operation_dialogs(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) 
 
 /// Apply a captured intent to the model. `ctx` is threaded through so the
 /// clipboard writes (Cut/Copy) can put the paths on the shared shell clipboard.
+// A flat one-arm-per-`Action` dispatch: it exceeds the line heuristic purely
+// because the surface's intent set is large (FILEMGR-4's search verbs are the
+// latest to land). Splitting it would only scatter a trivial 1:1 mapping across
+// helpers, so the length is allowed here.
+#[allow(clippy::too_many_lines)]
 fn apply(ctx: &egui::Context, browser: &mut FileBrowser, action: Action) {
     match action {
         Action::Focus(p) => browser.set_active_pane(p),
@@ -396,6 +421,11 @@ fn apply(ctx: &egui::Context, browser: &mut FileBrowser, action: Action) {
         Action::ResumeOp(id) => browser.resume_op(id),
         Action::CancelOp(id) => browser.cancel_op(id),
         Action::DismissOp(id) => browser.dismiss_op(id),
+        Action::ToggleSearchBar => browser.toggle_search_bar(),
+        Action::SetSearchForm(form) => browser.set_search_form(form),
+        Action::RunSearch(p) => browser.start_search(p),
+        Action::CancelSearch => browser.cancel_search(),
+        Action::ClearSearch(p) => browser.clear_search(p),
     }
 }
 
@@ -463,6 +493,14 @@ fn top_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
             {
                 actions.push(Action::TogglePreviewPane);
             }
+            // FILEMGR-4 — the recursive-search bar toggle.
+            if ui
+                .selectable_label(b.search_form().open, "Search")
+                .on_hover_text("Recursive search from here (name + content, with filters)")
+                .clicked()
+            {
+                actions.push(Action::ToggleSearchBar);
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let can = b.can_send();
@@ -480,7 +518,188 @@ fn top_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
                 }
             });
         });
+        // FILEMGR-4 — the expandable recursive-search bar.
+        if b.search_form().open {
+            ui.separator();
+            search_bar(ui, b, actions);
+        }
         ui.add_space(Style::SP_XS);
+    });
+}
+
+// ── Recursive search bar (FILEMGR-4) ──────────────────────────────────────────
+
+/// The recursive-search entry + filter controls, plus the live run status. The
+/// results render as an ordinary listing in the active pane's tab (so selection
+/// and every op apply to a hit directly) — this bar only drives the query and
+/// shows progress. The view edits a clone of the model's [`SearchForm`] and hands
+/// it back through one [`Action::SetSearchForm`], matching the surface's
+/// render → intents → apply flow.
+fn search_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    let active = b.active_pane_index();
+    let mut form = b.search_form().clone();
+    let before = form.clone();
+
+    search_query_row(ui, b, active, &mut form, actions);
+    search_filter_row(ui, &mut form);
+    search_status_row(ui, b);
+
+    // One intents hand-back for the whole form (only when something changed).
+    if form != before {
+        actions.push(Action::SetSearchForm(form));
+    }
+}
+
+/// Row 1 — the name-glob + content-grep entries and the Search / Cancel / Clear
+/// controls. Edits land on `form`; the run controls push their own actions.
+fn search_query_row(
+    ui: &mut egui::Ui,
+    b: &FileBrowser,
+    active: usize,
+    form: &mut SearchForm,
+    actions: &mut Vec<Action>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Name")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut form.name_glob)
+                .desired_width(Style::SP_XL * 4.0)
+                .hint_text("*.rs, report-*"),
+        );
+        ui.add_space(Style::SP_S);
+        ui.label(
+            RichText::new("Contains")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut form.content)
+                .desired_width(Style::SP_XL * 5.0)
+                .hint_text("text in file"),
+        );
+        ui.selectable_value(&mut form.content_regex, true, "re")
+            .on_hover_text("Interpret the contents text as a regular expression");
+        ui.selectable_value(&mut form.content_regex, false, "abc")
+            .on_hover_text("Interpret the contents text as a literal substring");
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if b.search_active() {
+                if ui
+                    .button("Clear")
+                    .on_hover_text("Leave search and show the folder again")
+                    .clicked()
+                {
+                    actions.push(Action::ClearSearch(active));
+                }
+                if b.search_running()
+                    && ui
+                        .button(RichText::new("Cancel").color(Style::DANGER))
+                        .on_hover_text("Stop the search (results so far stay)")
+                        .clicked()
+                {
+                    actions.push(Action::CancelSearch);
+                }
+            }
+            let runnable = form.to_query().is_some();
+            let btn = egui::Button::new(RichText::new("Search").color(Style::BG).strong())
+                .fill(Style::ACCENT);
+            if ui
+                .add_enabled(runnable, btn)
+                .on_hover_text("Search this folder and everything under it")
+                .clicked()
+            {
+                actions.push(Action::RunSearch(active));
+            }
+        });
+    });
+}
+
+/// Row 2 — the type / extension / size / mtime filter controls (all edit `form`).
+fn search_filter_row(ui: &mut egui::Ui, form: &mut SearchForm) {
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("files-search-kind")
+            .selected_text(form.kind.label())
+            .show_ui(ui, |ui| {
+                for kind in TypeFilter::ALL {
+                    ui.selectable_value(&mut form.kind, kind, kind.label());
+                }
+            });
+        ui.add_space(Style::SP_S);
+        ui.label(
+            RichText::new("ext")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut form.ext)
+                .desired_width(Style::SP_XL * 1.6)
+                .hint_text("pdf"),
+        );
+        ui.add_space(Style::SP_S);
+        ui.label(
+            RichText::new("size KB")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut form.min_size_kb)
+                .desired_width(Style::SP_XL * 1.6)
+                .hint_text("min"),
+        );
+        ui.label(RichText::new("\u{2013}").color(Style::TEXT_DIM));
+        ui.add(
+            egui::TextEdit::singleline(&mut form.max_size_kb)
+                .desired_width(Style::SP_XL * 1.6)
+                .hint_text("max"),
+        );
+        ui.add_space(Style::SP_S);
+        ui.label(
+            RichText::new("modified \u{2264}")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut form.within_days)
+                .desired_width(Style::SP_XL * 1.6)
+                .hint_text("days"),
+        );
+    });
+}
+
+/// Row 3 — live run status: the streaming hit count, a done / cancelled summary,
+/// and the honest "remote mount is slower" note when the root is an sshfs mount.
+fn search_status_row(ui: &mut egui::Ui, b: &FileBrowser) {
+    let Some(p) = b.search_progress() else {
+        return;
+    };
+    ui.horizontal(|ui| {
+        if p.running {
+            let verb = if p.cancelled { "Stopping" } else { "Searching" };
+            ui.colored_label(
+                Style::ACCENT,
+                format!("{verb} {} \u{2014} {} found", p.root_label, p.matched),
+            );
+        } else if p.cancelled {
+            ui.colored_label(
+                Style::WARN,
+                format!(
+                    "Cancelled \u{2014} {} found (scanned {})",
+                    p.matched, p.scanned
+                ),
+            );
+        } else {
+            ui.colored_label(
+                Style::OK,
+                format!("{} results (scanned {})", p.matched, p.scanned),
+            );
+        }
+        if p.remote {
+            muted_note(ui, "\u{b7} remote mount \u{2014} slower");
+        }
     });
 }
 

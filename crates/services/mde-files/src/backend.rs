@@ -783,7 +783,11 @@ fn nebula_status_to_badge(s: NebulaStatus) -> MeshOverlayBadge {
 
 // ---- helpers --------------------------------------------------
 
-fn mime_of(p: &Path, is_dir: bool) -> Mime {
+// `pub(crate)` so the FILEMGR-4 search fold ([`crate::search`]) mints result
+// rows with the *same* MIME classification / size + age formatting the directory
+// listing uses — one row-shaping convention across the surface (§6 reuse, not a
+// re-implementation).
+pub(crate) fn mime_of(p: &Path, is_dir: bool) -> Mime {
     if is_dir {
         return Mime::Folder;
     }
@@ -801,7 +805,7 @@ fn mime_of(p: &Path, is_dir: bool) -> Mime {
     }
 }
 
-fn fmt_bytes(n: u64) -> String {
+pub(crate) fn fmt_bytes(n: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
@@ -816,7 +820,7 @@ fn fmt_bytes(n: u64) -> String {
     }
 }
 
-fn fmt_age(t: SystemTime) -> String {
+pub(crate) fn fmt_age(t: SystemTime) -> String {
     let Ok(elapsed) = t.elapsed() else {
         return "—".into();
     };

@@ -32,6 +32,11 @@ pub mod fileops;
 pub mod mesh_backend;
 pub mod model;
 pub mod opqueue;
+// FILEMGR-4 — async recursive search: a streaming, cancellable traversal over the
+// `FileOps` seam (name-glob + content grep + type/size/mtime filters) whose hits
+// are `FileRow`s, so a result set renders as a normal file view and every op
+// applies. Render-agnostic (no GUI toolkit) — `mde-files-egui` runs it off-thread.
+pub mod search;
 pub mod send_to;
 // FILEMGR-7 — direct peer-to-peer transfer routing + the queued transfer. The
 // pure routing/plan/progress folds are always compiled; the live Bus dispatch
@@ -54,6 +59,10 @@ pub use opqueue::{
     channel_resolver, execute, ChannelResolver, Conflict, ConflictChoice, ConflictPrompt,
     ConflictResolver, FixedResolution, FnResolver, OpControl, OpEvent, OpKind, OpOutcome, OpQueue,
     Progress, QueuedOp, Resolution,
+};
+pub use search::{
+    run_search, CompiledQuery, ContentMode, ContentQuery, Filters, SearchError, SearchEvent,
+    SearchQuery, SearchRun, SearchStats, TypeFilter,
 };
 pub use transfer::{
     classify_endpoint, parse_direct_reply, parse_progress2_line, relay_op, route_transfer,

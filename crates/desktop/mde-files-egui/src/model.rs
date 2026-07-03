@@ -19,12 +19,16 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use mde_files::backend::{Backend, BackendError, Destination, MeshOverlayBadge, OpId};
 use mde_files::fileops::{FileOps, LiveFileOps};
 use mde_files::model::{FileRow, Mime, Peer, SelfNode};
 use mde_files::opqueue::OpKind;
+use mde_files::search::{
+    ContentMode, ContentQuery, Filters, SearchEvent, SearchQuery, SearchRun, SearchStats,
+    TypeFilter,
+};
 use mde_files::send_to::{SendToEntry, SendToRequest};
 
 use crate::chat_bridge::{BusChatBridge, ChatBridge};
@@ -515,6 +519,28 @@ impl Tab {
         self.anchor = None;
     }
 
+    /// FILEMGR-4 — reset this tab to hold a fresh, empty search-results listing.
+    /// Hidden entries are shown so a name/content hit on a dotfile isn't filtered
+    /// back out of its own result set.
+    fn begin_search(&mut self) {
+        self.all_rows.clear();
+        self.rows.clear();
+        self.selection.clear();
+        self.anchor = None;
+        self.show_hidden = true;
+    }
+
+    /// FILEMGR-4 — append one streamed search hit. Rows are **append-only** so a
+    /// live-growing result list never shifts an existing index — a selection or a
+    /// pending op stays valid while results keep arriving. The hidden filter is
+    /// honored exactly as in a normal listing.
+    fn push_search_hit(&mut self, row: FileRow) {
+        if self.show_hidden || !is_hidden(&row.name) {
+            self.rows.push(row.clone());
+        }
+        self.all_rows.push(row);
+    }
+
     // ── read side (the view consumes these) ─────────────────────────────────
 
     /// Where this tab is pointed.
@@ -779,6 +805,130 @@ struct ClipEntry {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// FILEMGR-4 — recursive search: the entry/filter form + the live run.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The search bar's current entry + filter values.
+///
+/// Pure data (no egui), persisted across frames on the model so the view binds to
+/// it and [`FileBrowser::start_search`] compiles a [`SearchQuery`] from it. Sizes
+/// are entered in KB and ages in days (the friendly units);
+/// [`to_query`](Self::to_query) converts to bytes / instants.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchForm {
+    /// Whether the search bar is expanded (a toolbar toggle).
+    pub open: bool,
+    /// The name-glob (`*.rs`, `report-*`). Empty = no name predicate.
+    pub name_glob: String,
+    /// The content grep text. Empty = no content predicate.
+    pub content: String,
+    /// Interpret [`content`](Self::content) as a regex rather than a substring.
+    pub content_regex: bool,
+    /// Restrict to files / folders / any.
+    pub kind: TypeFilter,
+    /// Restrict to this extension (no dot). Empty = unset.
+    pub ext: String,
+    /// Minimum size in KB (parsed; blank/garbage = unset).
+    pub min_size_kb: String,
+    /// Maximum size in KB (parsed; blank/garbage = unset).
+    pub max_size_kb: String,
+    /// "Modified within the last N days" (parsed; blank/garbage = unset).
+    pub within_days: String,
+}
+
+impl SearchForm {
+    /// Build a [`SearchQuery`] from the form, or `None` when it carries no active
+    /// predicate (an empty search — the view keeps the Search button disabled in
+    /// that case, and this is the belt-and-braces guard). The search *root* is not
+    /// part of the query; the caller passes it to [`SearchRun::spawn`] separately.
+    #[must_use]
+    pub fn to_query(&self) -> Option<SearchQuery> {
+        let name = non_blank(&self.name_glob);
+        let content = non_blank(&self.content).map(|pat| ContentQuery {
+            pattern: pat,
+            mode: if self.content_regex {
+                ContentMode::Regex
+            } else {
+                ContentMode::Substring
+            },
+            case_insensitive: true,
+        });
+        let ext = non_blank(&self.ext).map(|e| e.trim_start_matches('.').to_ascii_lowercase());
+        let min_size = parse_kb(&self.min_size_kb);
+        let max_size = parse_kb(&self.max_size_kb);
+        let modified_after = parse_within_days(&self.within_days);
+
+        let query = SearchQuery {
+            name_glob: name,
+            name_case_insensitive: true,
+            content,
+            filters: Filters {
+                kinds: self.kind,
+                ext,
+                min_size,
+                max_size,
+                modified_after,
+                modified_before: None,
+            },
+            ..SearchQuery::default()
+        };
+        query.is_meaningful().then_some(query)
+    }
+}
+
+/// Trim `s`; return `Some(owned)` only when non-empty.
+fn non_blank(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// Parse a KB count into bytes (`None` on blank/garbage/overflow).
+fn parse_kb(s: &str) -> Option<u64> {
+    s.trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|kb| kb.checked_mul(1024))
+}
+
+/// Parse "within the last N days" into the earliest modified instant to accept.
+fn parse_within_days(s: &str) -> Option<SystemTime> {
+    let days = s.trim().parse::<u64>().ok().filter(|d| *d > 0)?;
+    let secs = days.checked_mul(86_400)?;
+    SystemTime::now().checked_sub(Duration::from_secs(secs))
+}
+
+/// A read-only snapshot of the live search, for the status line.
+#[derive(Debug, Clone)]
+pub struct SearchProgress {
+    /// Human label for the searched root (a directory path or a mounted peer).
+    pub root_label: String,
+    /// `true` while the worker is still walking.
+    pub running: bool,
+    /// `true` once the walk was cancelled.
+    pub cancelled: bool,
+    /// Hits streamed so far.
+    pub matched: u64,
+    /// Entries visited so far (final tally after Done).
+    pub scanned: u64,
+    /// The root is a mounted mesh path — the view shows the honest "slower" note.
+    pub remote: bool,
+}
+
+/// The in-flight search: the worker handle, where its results render (pane + tab
+/// index), and the running tallies. At most one search runs at a time.
+struct SearchState {
+    run: SearchRun,
+    pane: usize,
+    tab: usize,
+    root_label: String,
+    remote: bool,
+    scanned: u64,
+    matched: u64,
+    done: bool,
+    cancelled: bool,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // The whole surface model.
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -836,6 +986,12 @@ pub struct FileBrowser {
     /// FILEMGR-10 — the preview/thumbnail decode worker + bounded caches +
     /// pane/quick-look toggles (render-agnostic; the view uploads textures).
     previews: Previews,
+    /// FILEMGR-4 — the search bar's entry + filter values (persist across frames).
+    search_form: SearchForm,
+    /// FILEMGR-4 — the live recursive search, if one is running. Its streamed
+    /// hits accumulate into the tab it was launched from, so a result set is an
+    /// ordinary file view and every op applies.
+    search: Option<SearchState>,
 }
 
 impl FileBrowser {
@@ -891,6 +1047,8 @@ impl FileBrowser {
             last_send: SendOutcome::Idle,
             last_note: None,
             previews: Previews::spawn(),
+            search_form: SearchForm::default(),
+            search: None,
         };
         me.refresh_roster();
         me.reload(0);
@@ -1159,6 +1317,155 @@ impl FileBrowser {
     pub fn reload_all(&mut self) {
         self.reload(0);
         self.reload(1);
+    }
+
+    // ── recursive search (FILEMGR-4) ─────────────────────────────────────────
+
+    /// The search bar's current entry + filter values.
+    #[must_use]
+    pub fn search_form(&self) -> &SearchForm {
+        &self.search_form
+    }
+
+    /// Replace the search form (the view edits a clone, then hands it back — the
+    /// same render → intents → apply flow the rest of the surface uses).
+    pub fn set_search_form(&mut self, form: SearchForm) {
+        self.search_form = form;
+    }
+
+    /// Toggle the search bar's expanded state.
+    pub fn toggle_search_bar(&mut self) {
+        self.search_form.open = !self.search_form.open;
+    }
+
+    /// `true` while a search's results are showing (running or finished, until
+    /// [`clear_search`](Self::clear_search) restores the folder listing).
+    #[must_use]
+    pub fn search_active(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// `true` while the worker is still walking (drives the repaint heartbeat).
+    #[must_use]
+    pub fn search_running(&self) -> bool {
+        self.search.as_ref().is_some_and(|s| !s.done)
+    }
+
+    /// A snapshot of the live search for the status line, or `None` when idle.
+    #[must_use]
+    pub fn search_progress(&self) -> Option<SearchProgress> {
+        self.search.as_ref().map(|s| SearchProgress {
+            root_label: s.root_label.clone(),
+            running: !s.done,
+            cancelled: s.cancelled,
+            matched: s.matched,
+            scanned: s.scanned,
+            remote: s.remote,
+        })
+    }
+
+    /// Start a recursive search rooted at `pane`'s current directory, streaming
+    /// results into that pane's active tab. An empty query, or a pane that isn't
+    /// on a browsable local/mounted directory (e.g. a virtual peer folder with no
+    /// real path), is an honest no-op with a note — never a hang. A mounted mesh
+    /// path is a valid root; it just walks slower (the view says so).
+    pub fn start_search(&mut self, pane: usize) {
+        if pane > 1 {
+            return;
+        }
+        self.set_active_pane(pane);
+        let ti = self.tab_index(pane);
+        let Some(root) = self.panes[pane].tabs[ti].current_dir() else {
+            self.last_note = Some(
+                "Search needs a real directory — open a local folder or a mounted peer first."
+                    .to_string(),
+            );
+            return;
+        };
+        let Some(query) = self.search_form.to_query() else {
+            self.last_note =
+                Some("Enter a name pattern or some content text to search.".to_string());
+            return;
+        };
+        match SearchRun::spawn(&query, root.clone()) {
+            Ok(run) => {
+                let remote = self.is_remote_path(&root.to_string_lossy());
+                self.panes[pane].tabs[ti].begin_search();
+                self.search = Some(SearchState {
+                    run,
+                    pane,
+                    tab: ti,
+                    root_label: root.display().to_string(),
+                    remote,
+                    scanned: 0,
+                    matched: 0,
+                    done: false,
+                    cancelled: false,
+                });
+                self.last_note = None;
+            }
+            Err(err) => {
+                self.last_note = Some(format!("Search failed to start: {err}"));
+            }
+        }
+    }
+
+    /// Signal the running search to stop; results found so far stay on screen.
+    pub fn cancel_search(&mut self) {
+        if let Some(s) = &self.search {
+            s.run.cancel();
+        }
+    }
+
+    /// Leave search mode: drop the (possibly still-running) worker and reload the
+    /// tab's real folder listing.
+    pub fn clear_search(&mut self, pane: usize) {
+        if let Some(s) = &self.search {
+            // Ask the worker to stop; dropping the handle also disconnects it.
+            s.run.cancel();
+        }
+        self.search = None;
+        if pane <= 1 {
+            self.reload(pane);
+        }
+    }
+
+    /// Fold the worker's streamed hits into the results tab (call once per frame).
+    /// Returns `true` when anything landed, so the view repaints. Each hit is an
+    /// ordinary [`FileRow`] with a real path — appended in discovery order so the
+    /// list grows live without disturbing a selection.
+    pub fn pump_search(&mut self) -> bool {
+        let Some(search) = self.search.as_mut() else {
+            return false;
+        };
+        let events = search.run.drain();
+        if events.is_empty() {
+            return false;
+        }
+        let (pane, ti) = (search.pane, search.tab);
+        let mut hits: Vec<FileRow> = Vec::new();
+        let mut final_stats: Option<SearchStats> = None;
+        for ev in events {
+            match ev {
+                SearchEvent::Hit(row) => hits.push(row),
+                SearchEvent::Done(stats) => final_stats = Some(stats),
+            }
+        }
+        search.matched += hits.len() as u64;
+        if let Some(stats) = final_stats {
+            search.scanned = stats.scanned;
+            search.matched = stats.matched;
+            search.done = true;
+            search.cancelled = stats.cancelled;
+        }
+        // The `search` field borrow ends above; `panes` is a disjoint field.
+        if !hits.is_empty() {
+            let tab = &mut self.panes[pane].tabs[ti];
+            for row in hits {
+                tab.push_search_hit(row);
+            }
+        }
+        true
     }
 
     /// Point `pane`'s active tab at `loc`, pushing the prior location onto its
@@ -2725,6 +3032,103 @@ mod tests {
             .expect("temp file listed");
         assert!(row.path.is_some());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── recursive search (FILEMGR-4) ─────────────────────────────────────────
+
+    #[test]
+    fn search_streams_an_operable_results_tab_over_the_real_fs() {
+        // A real temp tree, searched recursively: hits stream into the active tab
+        // as ordinary rows with real paths, so selection + ops apply to a result.
+        let dir = std::env::temp_dir().join(format!(
+            "mde-files-fm4-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(dir.join("nested")).expect("mkdir");
+        std::fs::write(dir.join("alpha.log"), b"needle here").expect("write");
+        std::fs::write(dir.join("beta.txt"), b"nothing").expect("write");
+        std::fs::write(dir.join("nested/gamma.log"), b"deeper needle").expect("write");
+
+        let mut b = FileBrowser::new(Box::new(LocalFsBackend::new()));
+        b.navigate(0, Location::Local(dir.to_string_lossy().into_owned()));
+
+        b.set_search_form(SearchForm {
+            name_glob: "*.log".to_string(),
+            ..Default::default()
+        });
+        b.start_search(0);
+        assert!(b.search_active(), "a search is now running");
+
+        // Drain the stream to completion (bounded so a bug can't hang the suite).
+        for _ in 0..2000 {
+            b.pump_search();
+            if !b.search_running() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        b.pump_search();
+        assert!(!b.search_running(), "search must finish");
+
+        let mut names: Vec<String> = b
+            .active_tab()
+            .rows()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["alpha.log", "gamma.log"], "recursive name hits");
+
+        // Results are a normal file view: every hit carries a real path, so the op
+        // surface (selected_paths → copy/move/delete/Send-To) applies directly.
+        b.select_all(0);
+        let paths = b.active_tab().selected_paths();
+        assert_eq!(paths.len(), 2, "both hits are operable");
+        assert!(paths.iter().all(|p| p.exists()), "paths are live on disk");
+
+        // Leaving search restores the folder's own listing.
+        b.clear_search(0);
+        assert!(!b.search_active());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn search_form_to_query_guards_the_empty_case() {
+        let empty = SearchForm::default();
+        assert!(empty.to_query().is_none(), "nothing typed ⇒ no query");
+
+        let named = SearchForm {
+            name_glob: "*.rs".to_string(),
+            ..Default::default()
+        };
+        assert!(named.to_query().is_some());
+
+        // A lone filter (folders only) is enough to be meaningful.
+        let filtered = SearchForm {
+            kind: TypeFilter::DirsOnly,
+            ..Default::default()
+        };
+        assert!(filtered.to_query().is_some());
+    }
+
+    #[test]
+    fn start_search_on_a_pathless_view_is_an_honest_no_op() {
+        // A virtual peer folder has no real directory, so a search there can't
+        // root — it must note the reason, not spin.
+        let mut b = browser_over(roster_backend());
+        b.navigate(0, Location::Peer("pine".into()));
+        b.set_search_form(SearchForm {
+            name_glob: "*.rs".to_string(),
+            ..Default::default()
+        });
+        b.start_search(0);
+        assert!(!b.search_active(), "no root ⇒ no search");
+        assert!(b.last_note().is_some(), "the reason is surfaced");
     }
 
     // ── mesh-mount sidebar tree (FILEMGR-9) ──────────────────────────────────
