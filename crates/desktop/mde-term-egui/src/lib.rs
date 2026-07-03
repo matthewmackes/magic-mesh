@@ -79,12 +79,24 @@
 //!   single-writer-per-node directory under the Syncthing-replicated workgroup
 //!   root, so a layout saved on one node is launchable on another once synced.
 //!   [`layout_ui::LayoutManager`] is the save/launch overlay (`Ctrl+Shift+L`).
+//!
+//! - [`palette`] + [`presets`] + [`appearance`] (TERM-11) — **palette + look**.
+//!   [`palette::Palette`] is the runtime content colour scheme (the 16 ANSI slots
+//!   with the default fg/bg/cursor); [`palette::Palette::from_tokens`] is the
+//!   Quasar default derived from `Style` tokens, and [`presets`] holds the
+//!   bundled classics (Solarized dark/light, Gruvbox, Nord) — the one sanctioned
+//!   home for their defining hex. [`appearance::Appearance`] bundles the three
+//!   knobs (scheme, font size, cursor style) and [`appearance::AppearancePicker`]
+//!   is the simple picker (`Ctrl+Shift+P`); the surface pushes the appearance
+//!   into every pane each frame, so a change reaches every live shell at once.
 
+pub mod appearance;
 pub mod engine;
 pub mod layout;
 pub mod layout_ui;
 pub mod palette;
 pub mod picker;
+pub mod presets;
 pub mod pty;
 pub mod remote;
 pub mod roster;
@@ -96,10 +108,13 @@ pub mod splits;
 pub mod tabs;
 pub mod widget;
 
+pub use appearance::{Appearance, AppearancePicker, CursorShape};
 pub use engine::{Terminal, DEFAULT_SCROLLBACK};
 pub use layout::{LayoutPane, LayoutStore, LayoutTab, PaneSpec, SavedLayout};
 pub use layout_ui::{LayoutIntent, LayoutManager};
+pub use palette::Palette;
 pub use picker::{RemotePicker, RemoteTarget};
+pub use presets::Preset;
 pub use pty::{LocalPty, SpawnOptions};
 pub use remote::{BusPtyClient, PtyBus, RemotePty, RemoteStatus};
 pub use roster::{BusRoster, Presence, RosterClient, RosterSnapshot};

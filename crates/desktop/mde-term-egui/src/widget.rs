@@ -35,7 +35,8 @@ use mde_egui::egui::{
 };
 use mde_egui::Style;
 
-use crate::palette;
+use crate::appearance::{Appearance, CursorShape};
+use crate::palette::{self, Palette};
 use crate::pty::LocalPty;
 use crate::remote::RemotePty;
 use crate::screen::{Cell, Screen};
@@ -134,15 +135,17 @@ struct SearchBar {
     tone: egui::Color32,
 }
 
-/// How the cursor cell paints this frame.
+/// How the cursor cell paints this frame. The *shape* it fills (block / bar /
+/// underline) is [`PaintSpec::cursor_shape`]; this is only its visibility/focus.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CursorPaint {
     /// Not drawn (scrolled into history, blink-off phase, or session ended).
     Hidden,
-    /// The unfocused outline.
+    /// The unfocused outline (a hollow block, whatever the shape).
     Hollow,
-    /// The focused filled block (glyph repainted in the bg token over it).
-    Block,
+    /// The focused, filled cursor — painted in the configured shape, glyph
+    /// repainted in the palette bg over a block.
+    Filled,
 }
 
 /// Everything the paint pass needs besides the screen itself. Bundled so the
@@ -150,6 +153,11 @@ enum CursorPaint {
 struct PaintSpec {
     font_id: FontId,
     cell: Vec2,
+    /// The active content colour scheme (TERM-11): the grid fill + every cell's
+    /// resolved colour flow through this, so a preset repaints the content.
+    palette: Palette,
+    /// The focused cursor's shape (block / bar / underline).
+    cursor_shape: CursorShape,
     first_abs: usize,
     selection: Option<Selection>,
     cursor: CursorPaint,
@@ -175,6 +183,10 @@ pub struct TerminalWidget {
     session: Session,
     font_size: f32,
     cursor_blink: bool,
+    /// The focused cursor's shape (TERM-11 knob).
+    cursor_shape: CursorShape,
+    /// The active content colour scheme (TERM-11): Quasar default or a preset.
+    palette: Palette,
     /// Lines scrolled back into history; `0` = live.
     scroll_offset: usize,
     /// Fractional wheel remainder (smooth trackpads scroll in sub-lines).
@@ -226,6 +238,8 @@ impl TerminalWidget {
             session,
             font_size: Style::BODY,
             cursor_blink: true,
+            cursor_shape: CursorShape::default(),
+            palette: Palette::from_tokens(),
             scroll_offset: 0,
             scroll_accum: 0.0,
             selection: None,
@@ -247,11 +261,36 @@ impl TerminalWidget {
         self
     }
 
-    /// Whether the focused block cursor blinks (lock 13: cursor style knob).
+    /// Whether the focused cursor blinks (lock 13: cursor style knob).
     #[must_use]
     pub const fn with_cursor_blink(mut self, blink: bool) -> Self {
         self.cursor_blink = blink;
         self
+    }
+
+    /// The focused cursor's shape — block / bar / underline (lock 13/Q13).
+    #[must_use]
+    pub const fn with_cursor_shape(mut self, shape: CursorShape) -> Self {
+        self.cursor_shape = shape;
+        self
+    }
+
+    /// The active content colour scheme — the Quasar default or a preset (TERM-11).
+    #[must_use]
+    pub const fn with_palette(mut self, palette: Palette) -> Self {
+        self.palette = palette;
+        self
+    }
+
+    /// Adopt the surface's [`Appearance`] (TERM-11): scheme + font size + cursor
+    /// style. The split multiplexer calls this on every pane each frame, so a
+    /// change in the appearance picker reaches every live shell at once. A no-op
+    /// when nothing changed (the fields are plain assignments).
+    pub const fn apply_appearance(&mut self, a: &Appearance) {
+        self.palette = a.palette;
+        self.font_size = a.font_size;
+        self.cursor_shape = a.cursor_shape;
+        self.cursor_blink = a.cursor_blink;
     }
 
     /// Smart-clipboard toggles (copy-on-select, middle-click paste — Q12).
@@ -300,6 +339,15 @@ impl TerminalWidget {
             peer: r.peer().to_string(),
             label: r.node_label().to_string(),
         })
+    }
+
+    /// This pane's active content scheme (TERM-11) — the appearance the split
+    /// multiplexer last pushed in. Test-only: production reads the surface's own
+    /// [`Appearance`], never a pane's copy.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn palette(&self) -> Palette {
+        self.palette
     }
 
     /// Render one frame into `ui`, consuming this frame's input. Fills all
@@ -360,7 +408,7 @@ impl TerminalWidget {
         } else if !response.has_focus() {
             CursorPaint::Hollow
         } else if !self.cursor_blink || blink_on(ui.input(|i| i.time)) {
-            CursorPaint::Block
+            CursorPaint::Filled
         } else {
             CursorPaint::Hidden
         };
@@ -375,6 +423,8 @@ impl TerminalWidget {
             &PaintSpec {
                 font_id,
                 cell,
+                palette: self.palette,
+                cursor_shape: self.cursor_shape,
                 first_abs,
                 selection: self.selection,
                 cursor,
@@ -1028,8 +1078,8 @@ struct RunStyle {
 }
 
 impl RunStyle {
-    fn of(cell: &Cell) -> Self {
-        let (fg, bg) = palette::cell_colors(cell);
+    fn of(cell: &Cell, palette: &Palette) -> Self {
+        let (fg, bg) = palette::cell_colors(cell, palette);
         Self {
             fg,
             bg,
@@ -1040,9 +1090,10 @@ impl RunStyle {
     }
 
     /// True for a cell that paints nothing (default-bg blank, no decoration)
-    /// — trailing runs of these are skipped entirely.
-    fn is_blank(&self, ch: char) -> bool {
-        ch == ' ' && self.bg == Style::BG && !self.underline && !self.strikeout
+    /// — trailing runs of these are skipped entirely. `default_bg` is the active
+    /// palette's background (the grid fill), so a preset's blanks trim too.
+    fn is_blank(&self, ch: char, default_bg: egui::Color32) -> bool {
+        ch == ' ' && self.bg == default_bg && !self.underline && !self.strikeout
     }
 }
 
@@ -1062,7 +1113,9 @@ fn cell_span_rect(origin: Pos2, cell: Vec2, row: usize, col: usize, width: usize
 /// Paint one screen window into `rect`. Free of widget state so the headless
 /// render tests drive the exact production paint path.
 fn paint_grid(painter: &egui::Painter, rect: Rect, screen: &Screen, spec: &PaintSpec) {
-    painter.rect_filled(rect, 0.0, Style::BG);
+    // The grid base is the active scheme's background (content, TERM-11); the
+    // chrome painted over it below stays `Style` tokens.
+    painter.rect_filled(rect, 0.0, spec.palette.bg);
 
     for row in 0..screen.rows() {
         if let Some(cells) = screen.row(row) {
@@ -1140,19 +1193,22 @@ fn paint_grid(painter: &egui::Painter, rect: Rect, screen: &Screen, spec: &Paint
 /// Paint one row as batched same-style runs: one bg rect + one galley per run
 /// (never a galley per cell), with the trailing default-blank tail trimmed.
 fn paint_row(painter: &egui::Painter, origin: Pos2, spec: &PaintSpec, row: usize, cells: &[Cell]) {
+    let default_bg = spec.palette.bg;
     let mut end = cells.len();
-    while end > 0 && RunStyle::of(&cells[end - 1]).is_blank(cells[end - 1].ch) {
+    while end > 0
+        && RunStyle::of(&cells[end - 1], &spec.palette).is_blank(cells[end - 1].ch, default_bg)
+    {
         end -= 1;
     }
     let mut col = 0;
     while col < end {
-        let style = RunStyle::of(&cells[col]);
+        let style = RunStyle::of(&cells[col], &spec.palette);
         let mut run_end = col + 1;
-        while run_end < end && RunStyle::of(&cells[run_end]) == style {
+        while run_end < end && RunStyle::of(&cells[run_end], &spec.palette) == style {
             run_end += 1;
         }
         let run = cell_span_rect(origin, spec.cell, row, col, run_end - col);
-        if style.bg != Style::BG {
+        if style.bg != default_bg {
             painter.rect_filled(run, 0.0, style.bg);
         }
         let text: String = cells[col..run_end].iter().map(|c| c.ch).collect();
@@ -1177,8 +1233,9 @@ fn paint_row(painter: &egui::Painter, origin: Pos2, spec: &PaintSpec, row: usize
     }
 }
 
-/// The cursor block: filled + glyph repainted in the bg token (focused), or
-/// the hollow outline (unfocused).
+/// The cursor, in the active scheme's cursor colour (TERM-11 content carve-out):
+/// the configured shape filled — a full block repaints the glyph over it in the
+/// palette bg — when focused, or a hollow block outline when not.
 fn paint_cursor(painter: &egui::Painter, origin: Pos2, screen: &Screen, spec: &PaintSpec) {
     let cur = screen.cursor();
     let cols = screen.cols();
@@ -1187,27 +1244,32 @@ fn paint_cursor(painter: &egui::Painter, origin: Pos2, screen: &Screen, spec: &P
     }
     let col = cur.col.min(cols - 1);
     let block = cell_span_rect(origin, spec.cell, cur.row, col, 1);
+    let cursor_color = spec.palette.cursor;
     match spec.cursor {
-        CursorPaint::Block => {
-            painter.rect_filled(block, 0.0, Style::TEXT);
+        CursorPaint::Filled => {
+            let shape = spec.cursor_shape.rect(block);
+            painter.rect_filled(shape, 0.0, cursor_color);
+            // Only a full-cell block sits over the glyph, so only it repaints the
+            // glyph (in the palette bg) to stay legible; a bar/underline leaves
+            // the glyph untouched.
             let ch = screen.cell(cur.row, col).map_or(' ', |c| c.ch);
-            if ch != ' ' {
+            if spec.cursor_shape == CursorShape::Block && ch != ' ' {
                 let galley = painter.layout_job(LayoutJob::single_section(
                     ch.to_string(),
                     TextFormat {
                         font_id: spec.font_id.clone(),
-                        color: Style::BG,
+                        color: spec.palette.bg,
                         ..TextFormat::default()
                     },
                 ));
-                painter.galley(block.min, galley, Style::BG);
+                painter.galley(block.min, galley, spec.palette.bg);
             }
         }
         CursorPaint::Hollow => {
             painter.rect_stroke(
                 block,
                 0.0,
-                Stroke::new(1.0, Style::TEXT),
+                Stroke::new(1.0, cursor_color),
                 StrokeKind::Inside,
             );
         }
@@ -1428,9 +1490,11 @@ mod tests {
         PaintSpec {
             font_id,
             cell,
+            palette: Palette::from_tokens(),
+            cursor_shape: CursorShape::Block,
             first_abs: 0,
             selection: None,
-            cursor: CursorPaint::Block,
+            cursor: CursorPaint::Filled,
             scrolled: 0,
             node: None,
             note: None,
@@ -1462,8 +1526,12 @@ mod tests {
             matches!(tc.bg, crate::screen::CellColor::Rgb(..)),
             "engine kept the 24-bit bg"
         );
-        assert!(has(palette::cell_colors(tc).1), "truecolor bg rect");
-        // Chrome: the grid base is the BG token; the block cursor is TEXT.
+        assert!(
+            has(palette::cell_colors(tc, &Palette::from_tokens()).1),
+            "truecolor bg rect"
+        );
+        // The default scheme's roles are the chrome tokens: grid base = BG,
+        // block cursor = the cursor colour (TEXT).
         assert!(has(Style::BG), "background fill");
         assert!(has(Style::TEXT), "block cursor fill");
     }
@@ -1476,6 +1544,8 @@ mod tests {
         let colors = tessellate_colors(&screen, |font_id, cell| PaintSpec {
             font_id,
             cell,
+            palette: Palette::from_tokens(),
+            cursor_shape: CursorShape::Block,
             first_abs: 0,
             selection: Some(sel((0, 0), (1, 2))),
             cursor: CursorPaint::Hollow,
@@ -1505,6 +1575,8 @@ mod tests {
         let colors = tessellate_colors(&screen, |font_id, cell| PaintSpec {
             font_id,
             cell,
+            palette: Palette::from_tokens(),
+            cursor_shape: CursorShape::Block,
             first_abs: 0,
             selection: None,
             cursor: CursorPaint::Hidden,
@@ -1575,6 +1647,103 @@ mod tests {
             out.shapes.len() < 50,
             "idle 200x60 grid should paint a handful of shapes, got {}",
             out.shapes.len()
+        );
+    }
+
+    #[test]
+    fn a_preset_palette_repaints_the_content_into_the_primitives() {
+        use crate::presets::Preset;
+
+        // TERM-11: selecting a preset must actually drive the renderer — the
+        // scheme's 16 ANSI colours and its background must reach the draw stream,
+        // and the default table must NOT (proving the preset applied, not chrome).
+        let mut term = Terminal::new(20, 3, 100);
+        term.feed(b"\x1b[31mred\x1b[0m \x1b[34mblue\x1b[0m");
+        let screen = term.viewport();
+        let nord = Preset::Nord.palette();
+
+        let colors = tessellate_colors(&screen, |font_id, cell| PaintSpec {
+            palette: nord,
+            ..plain_spec(font_id, cell)
+        });
+        let has = |c: egui::Color32| colors.contains(&c);
+
+        // The scheme's slot-1 (red) and slot-4 (blue) painted the glyph runs.
+        assert!(has(nord.color(1)), "the preset's red reached the vertices");
+        assert!(has(nord.color(4)), "the preset's blue reached the vertices");
+        // The scheme's background filled the grid …
+        assert!(has(nord.bg), "the preset background filled the grid");
+        // … and its cursor colour drew the block cursor.
+        assert!(has(nord.cursor), "the preset cursor colour drew the cursor");
+        // The Quasar default's content red is gone — this is genuinely the
+        // preset painting the grid, not the default table. (Style::BG can't be
+        // used as a negative witness: the egui CentralPanel frame paints it
+        // behind the grid regardless of the scheme.)
+        assert!(
+            !has(palette::RED),
+            "the default red must not paint under a preset"
+        );
+    }
+
+    #[test]
+    fn the_cursor_style_knob_drives_the_paint_path() {
+        // TERM-11: every cursor shape the knob offers paints a cursor through the
+        // real paint path (the shape's geometry itself is asserted by
+        // `CursorShape::rect`'s pure test in the appearance module).
+        let mut term = Terminal::new(20, 3, 100);
+        term.feed(b"x");
+        let screen = term.viewport();
+        let cursor = Palette::from_tokens().cursor;
+        for shape in CursorShape::ALL {
+            let colors = tessellate_colors(&screen, |font_id, cell| PaintSpec {
+                cursor_shape: shape,
+                ..plain_spec(font_id, cell)
+            });
+            assert!(
+                colors.contains(&cursor),
+                "the {} cursor reached the draw stream",
+                shape.label()
+            );
+        }
+    }
+
+    #[test]
+    fn the_font_size_knob_changes_the_grid_density() {
+        // TERM-11: the font-size knob drives the widget's cell metrics, so a
+        // larger font yields a coarser grid over the same rect (the sizing path
+        // the live widget uses each frame).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut small_cell = Vec2::ZERO;
+        let mut big_cell = Vec2::ZERO;
+        let input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 500.0))),
+            ..RawInput::default()
+        };
+        // Two frames: the font atlas warms on the first, so the second measures
+        // real glyph metrics.
+        for _ in 0..2 {
+            let _ = ctx.run(input(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.fonts(|f| {
+                        let small = FontId::monospace(Style::BODY);
+                        let big = FontId::monospace(Style::BODY * 2.0);
+                        small_cell = Vec2::new(f.glyph_width(&small, 'M'), f.row_height(&small));
+                        big_cell = Vec2::new(f.glyph_width(&big, 'M'), f.row_height(&big));
+                    });
+                });
+            });
+        }
+        assert!(
+            big_cell.x > small_cell.x && big_cell.y > small_cell.y,
+            "bigger font, bigger cell"
+        );
+        let avail = vec2(900.0, 500.0);
+        let (small_cols, small_rows) = grid_size(avail, small_cell);
+        let (big_cols, big_rows) = grid_size(avail, big_cell);
+        assert!(
+            big_cols < small_cols && big_rows < small_rows,
+            "a larger font packs fewer cells: {big_cols}x{big_rows} vs {small_cols}x{small_rows}"
         );
     }
 

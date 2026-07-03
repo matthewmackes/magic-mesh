@@ -7,25 +7,37 @@
 //! stable ANSI-shaped hues whatever the chrome looks like: the red in
 //! `ls --color` belongs to the program, not the design system. The
 //! mesh-terminal design (lock 14) therefore carves the content palette out
-//! explicitly: **this module is the only place in the crate a raw colour value
-//! may appear**, every raw value is a named ANSI-slot constant, and the chrome
-//! around the grid (background, cursor, selection, chips) still renders purely
-//! through `Style` tokens.
+//! explicitly: **this module and [`crate::presets`] are the only places in the
+//! crate a raw colour value may appear**, and the chrome around the grid (tab
+//! bar, chips, borders, selection overlay, focus ring, the pickers) still
+//! renders purely through `Style` tokens.
 //!
-//! The default table is **Quasar-derived wherever a token carries the same
-//! meaning** — red = `DANGER`, green = `OK`, yellow = `WARN`, blue = `ACCENT`,
-//! white = `TEXT`, bright blue = `ACCENT_HI`, black = `BG` — so terminal
-//! content sits naturally on the platform look. Slots with no token
-//! equivalent (magenta, cyan, the remaining brights) are standard ANSI hues
-//! tuned for the dark Quasar background. The classic preset tables
-//! (Solarized/Gruvbox/Nord, user-pickable) are TERM-11.
+//! ## The [`Palette`] model (TERM-11)
+//!
+//! Where TERM-3 shipped one fixed table, TERM-11 makes the content palette a
+//! runtime value: a [`Palette`] carries the 16 ANSI slots plus the terminal's
+//! default foreground / background / cursor colours (the three "role" colours a
+//! `SGR 0` reset and the cursor resolve to). [`Palette::from_tokens`] is the
+//! **Quasar default, derived from `mde-theme`/`Style` tokens wherever a token
+//! carries the same meaning** — red = `DANGER`, green = `OK`, yellow = `WARN`,
+//! blue = `ACCENT`, white = `TEXT`, bright blue = `ACCENT_HI`, black/bg = `BG`,
+//! fg/cursor = `TEXT` — so terminal content sits naturally on the platform
+//! look. Slots with no token equivalent (magenta, cyan, the remaining brights)
+//! are standard ANSI hues tuned for the dark Quasar background.
+//!
+//! The **classic presets** (Solarized dark/light, Gruvbox, Nord), user-pickable
+//! via the appearance picker, are data in [`crate::presets`]: their defining hex
+//! is the one legitimate place those literals live, and they build [`Palette`]s
+//! of the exact same shape. A preset's default fg/bg/cursor *are* content (they
+//! theme the grid area), so the grid background and default-cell colours follow
+//! the active palette; the surrounding chrome stays pure `Style` tokens.
 
 use mde_egui::egui::Color32;
 use mde_egui::Style;
 
 use crate::screen::{Cell, CellColor};
 
-// ── The 16 ANSI slots (0..=7 normal, 8..=15 bright) ────────────────────────
+// ── The 16 ANSI slots of the Quasar default (0..=7 normal, 8..=15 bright) ────
 
 /// Slot 0 — black. The app background token, so "black" content melts into
 /// the chrome exactly as it does in a classic dark terminal.
@@ -62,7 +74,7 @@ pub const BRIGHT_CYAN: Color32 = Color32::from_rgb(0x8A, 0xD7, 0xE1);
 /// Slot 15 — bright white.
 pub const BRIGHT_WHITE: Color32 = Color32::from_rgb(0xFF, 0xFF, 0xFF);
 
-/// The 16-slot ANSI table, indexed by slot number.
+/// The Quasar default 16-slot ANSI table, indexed by slot number.
 pub const ANSI16: [Color32; 16] = [
     BLACK,
     RED,
@@ -82,6 +94,61 @@ pub const ANSI16: [Color32; 16] = [
     BRIGHT_WHITE,
 ];
 
+/// A terminal colour scheme: the 16 ANSI slots plus the three "role" colours a
+/// reset / cursor resolve to.
+///
+/// The 16 ANSI slots redefine what `SGR 30..37`/`90..97` and `38;5;0..15` paint;
+/// the higher 256-colour range (`16..=255`) is the fixed xterm cube + greyscale
+/// ([`indexed`]) and is intentionally *not* themed, exactly as every classic
+/// scheme leaves it. `fg`/`bg` are the default foreground/background a `SGR 0`
+/// reset resolves to (and `bg` fills the grid); `cursor` is the block/bar/
+/// underline cursor's colour. All are the content carve-out — a preset themes
+/// the grid area, while the app chrome stays `Style` tokens.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Palette {
+    /// The 16 ANSI slots (`0..=7` normal, `8..=15` bright).
+    pub ansi: [Color32; 16],
+    /// The default foreground (`SGR 0` / [`CellColor::Default`] fg).
+    pub fg: Color32,
+    /// The default background (the grid fill + [`CellColor::Default`] bg).
+    pub bg: Color32,
+    /// The cursor colour (block fill / bar / underline / hollow outline).
+    pub cursor: Color32,
+}
+
+impl Palette {
+    /// The **Quasar default**, derived from `mde-theme`/`Style` tokens — the
+    /// platform look (see the module docs). Not hand-picked hex: every slot that
+    /// carries a token meaning *is* that token.
+    #[must_use]
+    pub const fn from_tokens() -> Self {
+        Self {
+            ansi: ANSI16,
+            fg: Style::TEXT,
+            bg: Style::BG,
+            cursor: Style::TEXT,
+        }
+    }
+
+    /// Resolve a 256-colour palette slot against this scheme: the 16 ANSI slots
+    /// come from [`Self::ansi`]; `16..=255` is the fixed xterm cube + greyscale
+    /// ([`indexed`]), unthemed. Total over every `u8`.
+    #[must_use]
+    pub const fn color(&self, slot: u8) -> Color32 {
+        if (slot as usize) < self.ansi.len() {
+            self.ansi[slot as usize]
+        } else {
+            indexed(slot)
+        }
+    }
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Self::from_tokens()
+    }
+}
+
 /// One level of the xterm 6×6×6 colour cube: `0, 95, 135, 175, 215, 255` —
 /// the standard 256-colour table every terminal program calibrates against.
 const fn cube_level(step: u8) -> u8 {
@@ -92,9 +159,12 @@ const fn cube_level(step: u8) -> u8 {
     }
 }
 
-/// Resolve a 256-colour palette slot: the 16 ANSI names, then the xterm
-/// 6×6×6 colour cube (`16..=231`), then the 24-step greyscale ramp
-/// (`232..=255`). Total function — every `u8` is a defined colour.
+/// Resolve a 256-colour palette slot against the **Quasar default**.
+///
+/// The 16 ANSI names, then the xterm 6×6×6 colour cube (`16..=231`), then the
+/// 24-step greyscale ramp (`232..=255`) — a total function, every `u8` a defined
+/// colour. [`Palette::color`] overrides only the `0..16` range per scheme; the
+/// cube + greyscale it defers to here are shared by every palette.
 #[must_use]
 pub const fn indexed(slot: u8) -> Color32 {
     match slot {
@@ -130,23 +200,23 @@ const fn lift(c: Color32) -> Color32 {
     Color32::from_rgb(ch(c.r()), ch(c.g()), ch(c.b()))
 }
 
-/// Resolve one cell to concrete `(fg, bg)` paint colours.
+/// Resolve one cell to concrete `(fg, bg)` paint colours **through `palette`**.
 ///
-/// - `Default` maps to the chrome tokens (`TEXT` on `BG`) so untouched text
-///   *is* the platform look;
-/// - `Palette(n)` resolves through [`indexed`], with bold promoting the low
-///   slots to their bright twins (the classic `SGR 1` behaviour);
+/// - `Default` maps to the palette's role colours (`fg` on `bg`) so untouched
+///   text *is* the active scheme (the Quasar default's are the platform tokens);
+/// - `Palette(n)` resolves through [`Palette::color`], with bold promoting the
+///   low slots to their bright twins (the classic `SGR 1` behaviour);
 /// - `Rgb` passes straight through — **true-colour already works** (design
 ///   lock 13/20: the engine carries `Rgb` cells end-to-end; TERM-13 only adds
 ///   the remaining fidelity extras);
 /// - `bold` lifts, `dim` fades, `inverse` swaps, `hidden` conceals (fg = bg —
 ///   the glyph vanishes but stays real for selection/copy).
 #[must_use]
-pub fn cell_colors(cell: &Cell) -> (Color32, Color32) {
+pub fn cell_colors(cell: &Cell, palette: &Palette) -> (Color32, Color32) {
     let attrs = cell.attrs;
     let mut fg = match cell.fg {
-        CellColor::Default => Style::TEXT,
-        CellColor::Palette(slot) => indexed(if attrs.bold && slot < 8 {
+        CellColor::Default => palette.fg,
+        CellColor::Palette(slot) => palette.color(if attrs.bold && slot < 8 {
             slot + 8
         } else {
             slot
@@ -154,8 +224,8 @@ pub fn cell_colors(cell: &Cell) -> (Color32, Color32) {
         CellColor::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
     };
     let mut bg = match cell.bg {
-        CellColor::Default => Style::BG,
-        CellColor::Palette(slot) => indexed(slot),
+        CellColor::Default => palette.bg,
+        CellColor::Palette(slot) => palette.color(slot),
         CellColor::Rgb(r, g, b) => Color32::from_rgb(r, g, b),
     };
     if attrs.bold {
@@ -206,6 +276,42 @@ mod tests {
     }
 
     #[test]
+    fn the_default_palette_is_the_token_derivation() {
+        // TERM-11: the default `Palette` is not hand-picked hex — it is the
+        // token table plus the platform role colours.
+        let p = Palette::from_tokens();
+        assert_eq!(p.ansi, ANSI16);
+        assert_eq!(p.fg, Style::TEXT);
+        assert_eq!(p.bg, Style::BG);
+        assert_eq!(p.cursor, Style::TEXT);
+        // `color` reads the scheme's slots for the low range …
+        assert_eq!(p.color(1), Style::DANGER);
+        assert_eq!(p.color(4), Style::ACCENT);
+        // … and defers to the fixed xterm cube/greyscale above it.
+        assert_eq!(p.color(196), indexed(196));
+        assert_eq!(p.color(244), indexed(244));
+        assert_eq!(Palette::default(), Palette::from_tokens());
+    }
+
+    #[test]
+    fn a_scheme_repaints_the_low_slots_but_not_the_256_cube() {
+        // A hand-built scheme with a distinctive slot-1 proves `color` reads the
+        // scheme, and that the fixed cube/greyscale range is untouched by it.
+        let mut ansi = ANSI16;
+        ansi[1] = Color32::from_rgb(0x01, 0x02, 0x03);
+        let scheme = Palette {
+            ansi,
+            fg: Color32::WHITE,
+            bg: Color32::BLACK,
+            cursor: Color32::WHITE,
+        };
+        assert_eq!(scheme.color(1), Color32::from_rgb(0x01, 0x02, 0x03));
+        assert_ne!(scheme.color(1), indexed(1));
+        // The 6×6×6 cube slot is identical across schemes.
+        assert_eq!(scheme.color(196), indexed(196));
+    }
+
+    #[test]
     fn the_colour_cube_matches_the_xterm_levels() {
         // Corners of the 6×6×6 cube.
         assert_eq!(indexed(16), Color32::from_rgb(0, 0, 0));
@@ -227,75 +333,105 @@ mod tests {
     }
 
     #[test]
-    fn default_cells_are_the_chrome_tokens() {
-        let (fg, bg) = cell_colors(&cell(
-            CellColor::Default,
-            CellColor::Default,
-            CellAttrs::default(),
-        ));
+    fn default_cells_are_the_palette_role_colours() {
+        let p = Palette::from_tokens();
+        let (fg, bg) = cell_colors(
+            &cell(CellColor::Default, CellColor::Default, CellAttrs::default()),
+            &p,
+        );
+        // The Quasar default's role colours are the chrome tokens.
         assert_eq!(fg, Style::TEXT);
         assert_eq!(bg, Style::BG);
     }
 
     #[test]
+    fn a_preset_scheme_repaints_the_default_cell() {
+        // Under a different scheme the reset fg/bg follow the palette (content
+        // carve-out) — a program's plain text *is* the active theme.
+        let scheme = Palette {
+            ansi: ANSI16,
+            fg: Color32::from_rgb(0x83, 0x94, 0x96),
+            bg: Color32::from_rgb(0x00, 0x2b, 0x36),
+            cursor: Color32::from_rgb(0x83, 0x94, 0x96),
+        };
+        let (fg, bg) = cell_colors(
+            &cell(CellColor::Default, CellColor::Default, CellAttrs::default()),
+            &scheme,
+        );
+        assert_eq!(fg, Color32::from_rgb(0x83, 0x94, 0x96));
+        assert_eq!(bg, Color32::from_rgb(0x00, 0x2b, 0x36));
+    }
+
+    #[test]
     fn truecolor_passes_straight_through() {
         // Lock 13/20: the engine carries Rgb cells, so 24-bit colour already
-        // renders — no palette quantisation on this path.
-        let (fg, bg) = cell_colors(&cell(
-            CellColor::Rgb(10, 20, 30),
-            CellColor::Rgb(200, 100, 50),
-            CellAttrs::default(),
-        ));
+        // renders — no palette quantisation on this path (or scheme influence).
+        let (fg, bg) = cell_colors(
+            &cell(
+                CellColor::Rgb(10, 20, 30),
+                CellColor::Rgb(200, 100, 50),
+                CellAttrs::default(),
+            ),
+            &Palette::from_tokens(),
+        );
         assert_eq!(fg, Color32::from_rgb(10, 20, 30));
         assert_eq!(bg, Color32::from_rgb(200, 100, 50));
     }
 
     #[test]
     fn bold_promotes_low_slots_and_visibly_lifts_everything() {
+        let p = Palette::from_tokens();
         let bold = CellAttrs {
             bold: true,
             ..CellAttrs::default()
         };
         // SGR 1 + red → the bright-red slot (then lifted).
-        let (fg, _) = cell_colors(&cell(CellColor::Palette(1), CellColor::Default, bold));
+        let (fg, _) = cell_colors(&cell(CellColor::Palette(1), CellColor::Default, bold), &p);
         assert_eq!(fg, lift(BRIGHT_RED));
         // A high slot is not promoted, only lifted.
-        let (fg, _) = cell_colors(&cell(CellColor::Palette(123), CellColor::Default, bold));
+        let (fg, _) = cell_colors(&cell(CellColor::Palette(123), CellColor::Default, bold), &p);
         assert_eq!(fg, lift(indexed(123)));
         // Default-fg bold (the everyday `\e[1m`) must be visibly distinct.
-        let (plain, _) = cell_colors(&cell(
-            CellColor::Default,
-            CellColor::Default,
-            CellAttrs::default(),
-        ));
-        let (bolded, _) = cell_colors(&cell(CellColor::Default, CellColor::Default, bold));
+        let (plain, _) = cell_colors(
+            &cell(CellColor::Default, CellColor::Default, CellAttrs::default()),
+            &p,
+        );
+        let (bolded, _) = cell_colors(&cell(CellColor::Default, CellColor::Default, bold), &p);
         assert_ne!(plain, bolded, "bold default text must not paint like plain");
     }
 
     #[test]
     fn inverse_swaps_and_hidden_conceals() {
+        let p = Palette::from_tokens();
         let inverse = CellAttrs {
             inverse: true,
             ..CellAttrs::default()
         };
-        let (fg, bg) = cell_colors(&cell(CellColor::Palette(1), CellColor::Palette(4), inverse));
+        let (fg, bg) = cell_colors(
+            &cell(CellColor::Palette(1), CellColor::Palette(4), inverse),
+            &p,
+        );
         assert_eq!((fg, bg), (BLUE, RED));
 
         let hidden = CellAttrs {
             hidden: true,
             ..CellAttrs::default()
         };
-        let (fg, bg) = cell_colors(&cell(CellColor::Palette(1), CellColor::Palette(4), hidden));
+        let (fg, bg) = cell_colors(
+            &cell(CellColor::Palette(1), CellColor::Palette(4), hidden),
+            &p,
+        );
         assert_eq!(fg, bg, "a concealed glyph paints invisibly");
     }
 
     #[test]
     fn dim_fades_the_foreground() {
+        let p = Palette::from_tokens();
         let dim = CellAttrs {
             dim: true,
             ..CellAttrs::default()
         };
-        let (faint, _) = cell_colors(&cell(CellColor::Default, CellColor::Default, dim));
+        let (faint, _) = cell_colors(&cell(CellColor::Default, CellColor::Default, dim), &p);
         assert_ne!(faint, Style::TEXT, "dim text must not paint like plain");
     }
 }

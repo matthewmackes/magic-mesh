@@ -40,6 +40,7 @@ use mde_egui::egui::{
 };
 use mde_egui::Style;
 
+use crate::appearance::{Appearance, AppearancePicker};
 use crate::layout::SavedLayout;
 use crate::layout_ui::{LayoutIntent, LayoutManager};
 use crate::picker::{RemotePicker, RemoteTarget};
@@ -87,6 +88,9 @@ pub enum TabCommand {
     /// Toggle the saved-layouts overlay (`Ctrl+Shift+L`, TERM-10) — the keyboard
     /// twin of the tab-bar layouts button.
     ToggleLayouts,
+    /// Toggle the appearance picker (`Ctrl+Shift+P`, TERM-11) — the keyboard twin
+    /// of the tab-bar appearance button.
+    ToggleAppearance,
 }
 
 /// Decode and **consume** this frame's tab-strip chords before any pane widget
@@ -125,6 +129,9 @@ pub fn consume_tab_commands(ctx: &Context) -> Vec<TabCommand> {
         }
         if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::L) {
             cmds.push(TabCommand::ToggleLayouts);
+        }
+        if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::P) {
+            cmds.push(TabCommand::ToggleAppearance);
         }
         cmds
     })
@@ -220,6 +227,10 @@ pub struct TabbedTerminal {
     remote: RemoteHub,
     /// The saved-layouts overlay + its mesh-synced store (TERM-10).
     layouts: LayoutManager,
+    /// The surface-wide appearance (TERM-11): scheme + font size + cursor style.
+    appearance: Appearance,
+    /// The appearance picker overlay that edits [`Self::appearance`] (TERM-11).
+    appearance_picker: AppearancePicker,
 }
 
 impl TabbedTerminal {
@@ -254,6 +265,8 @@ impl TabbedTerminal {
             error: None,
             remote,
             layouts: LayoutManager::local(),
+            appearance: Appearance::default(),
+            appearance_picker: AppearancePicker::new(),
         })
     }
 
@@ -311,6 +324,7 @@ impl TabbedTerminal {
             }
             TabCommand::ToggleRemote => self.remote.picker.toggle(),
             TabCommand::ToggleLayouts => self.layouts.toggle(),
+            TabCommand::ToggleAppearance => self.appearance_picker.toggle(),
         }
     }
 
@@ -504,7 +518,11 @@ impl TabbedTerminal {
 
         self.show_tab_bar(ui, bar);
 
+        let appearance = self.appearance;
         if let Some(tab) = self.tabs.get_mut(self.active) {
+            // Push the surface appearance into the active tab before it renders,
+            // so a picker change reaches every visible pane (TERM-11).
+            tab.term.set_appearance(appearance);
             let mut body_ui = ui.new_child(UiBuilder::new().max_rect(body).id_salt("term-body"));
             tab.term.show(&mut body_ui);
         }
@@ -514,6 +532,9 @@ impl TabbedTerminal {
         // The saved-layouts overlay floats over the body (TERM-10); save captures
         // this surface, launch rebuilds a stored one.
         self.show_layout_overlay(ui.ctx());
+        // The appearance picker floats over the body (TERM-11); it edits the
+        // surface scheme / font / cursor in place.
+        self.appearance_picker.show(ui.ctx(), &mut self.appearance);
 
         // A tab whose last pane just closed empties its split terminal — close
         // the tab (the tab-level echo of TERM-4's last-pane lifecycle).
@@ -542,7 +563,8 @@ impl TabbedTerminal {
             vec2(TAB_BAR_H, TAB_BAR_H),
         );
         // The remote-terminal button sits just left of the new-tab `+` (TERM-8),
-        // and the saved-layouts button just left of that (TERM-10).
+        // the saved-layouts button just left of that (TERM-10), and the appearance
+        // button just left of that (TERM-11).
         let remote_rect = Rect::from_min_size(
             pos2(new_rect.min.x - TAB_BAR_H, bar.min.y),
             vec2(TAB_BAR_H, TAB_BAR_H),
@@ -551,10 +573,17 @@ impl TabbedTerminal {
             pos2(remote_rect.min.x - TAB_BAR_H, bar.min.y),
             vec2(TAB_BAR_H, TAB_BAR_H),
         );
-        let strip = Rect::from_min_max(bar.min, pos2(layouts_rect.min.x, bar.max.y));
+        let appearance_rect = Rect::from_min_size(
+            pos2(layouts_rect.min.x - TAB_BAR_H, bar.min.y),
+            vec2(TAB_BAR_H, TAB_BAR_H),
+        );
+        let strip = Rect::from_min_max(bar.min, pos2(appearance_rect.min.x, bar.max.y));
 
         let slots = self.tab_slots(ui, strip);
         self.paint_tabs(ui, strip, &slots);
+        if Self::paint_appearance_button(ui, appearance_rect, self.appearance_picker.is_open()) {
+            self.appearance_picker.toggle();
+        }
         if Self::paint_layouts_button(ui, layouts_rect, self.layouts.is_open()) {
             self.layouts.toggle();
         }
@@ -761,6 +790,35 @@ impl TabbedTerminal {
             rect.center(),
             Align2::CENTER_CENTER,
             "\u{25EB}",
+            FontId::monospace(Style::BODY),
+            if hot { Style::ACCENT } else { Style::TEXT_DIM },
+        );
+        resp.clicked()
+    }
+
+    /// The appearance button (TERM-11): a token plate with a half-disc glyph
+    /// (light/dark theming) that lights the accent when the picker is open or
+    /// hovered. Returns whether it was clicked. All `Style` tokens (§4).
+    fn paint_appearance_button(ui: &Ui, rect: Rect, open: bool) -> bool {
+        let resp = ui
+            .interact(rect, ui.id().with("term-appearance-btn"), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("Appearance \u{2014} palette + look (Ctrl+Shift+P)");
+        let painter = ui.painter();
+        let hot = open || resp.hovered();
+        if hot {
+            painter.rect_filled(rect, 0.0, Style::SURFACE_HI);
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(1.0, Style::ACCENT),
+                StrokeKind::Inside,
+            );
+        }
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "\u{25D0}",
             FontId::monospace(Style::BODY),
             if hot { Style::ACCENT } else { Style::TEXT_DIM },
         );
@@ -1210,6 +1268,56 @@ mod tests {
         assert!(term.layouts.is_open(), "the overlay opened");
         term.apply_tab(TabCommand::ToggleLayouts);
         assert!(!term.layouts.is_open(), "the overlay closed");
+    }
+
+    // ── appearance picker (TERM-11) ──────────────────────────────────────────
+
+    #[test]
+    fn ctrl_shift_p_decodes_the_appearance_toggle() {
+        let ctx = Context::default();
+        let raw = RawInput {
+            events: vec![key_event(Key::P, Modifiers::CTRL | Modifiers::SHIFT)],
+            ..RawInput::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            assert_eq!(
+                consume_tab_commands(ctx),
+                vec![TabCommand::ToggleAppearance]
+            );
+        });
+    }
+
+    #[test]
+    fn the_appearance_toggle_opens_and_closes_the_picker() {
+        let mut term = tabs();
+        assert!(!term.appearance_picker.is_open());
+        term.apply_tab(TabCommand::ToggleAppearance);
+        assert!(term.appearance_picker.is_open(), "the picker opened");
+        term.apply_tab(TabCommand::ToggleAppearance);
+        assert!(!term.appearance_picker.is_open(), "the picker closed");
+    }
+
+    #[test]
+    fn the_surface_appearance_reaches_the_active_tabs_panes() {
+        use crate::presets::Preset;
+
+        // TERM-11 end to end: a scheme set on the surface propagates through the
+        // active tab into its panes across a rendered frame.
+        let ctx = Context::default();
+        Style::install(&ctx);
+        let mut term = tabs();
+        term.appearance = Appearance {
+            palette: Preset::SolarizedDark.palette(),
+            ..Appearance::default()
+        };
+        settle(&ctx, &mut term, 1);
+        let split = term.tab(0).expect("tab 0");
+        let pane = split.focused_session();
+        assert_eq!(
+            split.pane_palette(pane),
+            Some(Preset::SolarizedDark.palette()),
+            "the active tab's pane adopted the surface scheme"
+        );
     }
 
     #[test]

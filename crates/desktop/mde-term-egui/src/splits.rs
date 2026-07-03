@@ -54,6 +54,7 @@ use mde_egui::egui::{
 };
 use mde_egui::Style;
 
+use crate::appearance::Appearance;
 use crate::layout::{cwd_of_pid, LayoutPane, LayoutTab, PaneSpec};
 use crate::picker::RemoteTarget;
 use crate::pty::{LocalPty, SpawnOptions};
@@ -783,6 +784,9 @@ pub struct SplitTerminal {
     /// Named-group membership: a pane's leaf → its group label. A pane not in
     /// the map is ungrouped; an entry is dropped when its pane closes.
     groups: HashMap<SessionId, String>,
+    /// The surface appearance (TERM-11): scheme + font size + cursor style,
+    /// pushed into every pane each frame so a picker change reaches all shells.
+    appearance: Appearance,
 }
 
 impl SplitTerminal {
@@ -832,7 +836,16 @@ impl SplitTerminal {
             error: None,
             broadcast: Broadcast::Off,
             groups: HashMap::new(),
+            appearance: Appearance::default(),
         }
+    }
+
+    /// Adopt the surface [`Appearance`] (TERM-11). The tabbed surface calls this
+    /// on the active tab each frame before rendering; [`Self::show_panes`] then
+    /// hands it to every live pane, so a scheme / font / cursor change reaches
+    /// all shells at once.
+    pub const fn set_appearance(&mut self, appearance: Appearance) {
+        self.appearance = appearance;
     }
 
     /// `true` once every pane has closed — the surface should close with it.
@@ -845,6 +858,14 @@ impl SplitTerminal {
     #[must_use]
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// Pane `id`'s active content scheme (TERM-11). Test-only — lets the tabbed
+    /// surface's tests assert the appearance actually reached the panes.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn pane_palette(&self, id: SessionId) -> Option<crate::palette::Palette> {
+        self.sessions.get(&id).map(TerminalWidget::palette)
     }
 
     /// The tree-focused session.
@@ -1379,6 +1400,9 @@ impl SplitTerminal {
                 debug_assert!(false, "tree leaf {sid:?} missing from the session registry");
                 continue;
             };
+            // Push the surface appearance (scheme + font + cursor) into the pane
+            // before it renders (TERM-11).
+            widget.apply_appearance(&self.appearance);
             let mut pane_ui = ui.new_child(
                 UiBuilder::new()
                     .max_rect(*rect)
@@ -2005,6 +2029,41 @@ mod tests {
             rows_of(&term, b),
             rows_of(&term, a)
         );
+    }
+
+    #[test]
+    fn set_appearance_reaches_every_pane_on_the_next_frame() {
+        use crate::appearance::Appearance;
+        use crate::palette::Palette;
+        use crate::presets::Preset;
+
+        // TERM-11: a scheme chosen in the picker (set on the surface) must reach
+        // every live pane's renderer. Two panes, both default; set Nord, render a
+        // frame, and both panes now carry the Nord palette (§7 — the real render
+        // path applied it, not a stored flag).
+        let ctx = test_ctx();
+        let mut term = SplitTerminal::new(sh_opts()).expect("first shell");
+        term.apply(Command::Split(SplitDir::V));
+        settle(&ctx, &mut term, 1);
+        let ids: Vec<SessionId> = term.sessions.keys().copied().collect();
+        assert_eq!(ids.len(), 2);
+        for id in &ids {
+            assert_eq!(term.sessions[id].palette(), Palette::from_tokens());
+        }
+
+        let nord = Preset::Nord.palette();
+        term.set_appearance(Appearance {
+            palette: nord,
+            ..Appearance::default()
+        });
+        settle(&ctx, &mut term, 1);
+        for id in &ids {
+            assert_eq!(
+                term.sessions[id].palette(),
+                nord,
+                "the surface pushed the scheme into every pane"
+            );
+        }
     }
 
     #[test]
