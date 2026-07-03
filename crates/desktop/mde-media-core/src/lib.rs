@@ -114,6 +114,20 @@
 //! detection and the resolution seam are exercised with no real `yt-dlp` and no
 //! network — the live resolve is honest-gated exactly like the `mpv` real-clip path.
 //!
+//! # Capture devices (MEDIA-13)
+//!
+//! [`parse_v4l2_listing`] is the pure fold that projects a `v4l2-ctl --list-devices`
+//! listing into typed [`CaptureDevice`]s — a webcam / TV tuner / capture card, each
+//! with its name, bus info, and classified `/dev/...` [`CaptureNode`]s. The playable
+//! node is the device's first `/dev/videoN`; [`v4l2_play_url`] builds the
+//! `av://v4l2:/dev/videoN` URL mpv opens natively, handed straight to [`Player::load`]
+//! (the existing play path — no re-derived player). [`V4l2Cli`] is the real enumerator
+//! behind the injectable [`CaptureEnumerator`] seam (it shells out to `v4l2-ctl` —
+//! always compiled, since it links nothing — and is **honest-gated at runtime**: absent
+//! tooling is [`CaptureError::ToolMissing`], no hardware is an empty list, never a fake
+//! device). The parser + open path are fixture-tested with no real `/dev/video`, so the
+//! whole enumeration → open → play glue runs airgap-safe.
+//!
 //! ```
 //! use mde_media_core::{FakeMpv, Player, PlayerState};
 //!
@@ -132,6 +146,7 @@
 
 pub mod audio;
 pub mod capabilities;
+pub mod capture;
 pub mod controls;
 pub mod engine;
 pub mod fake;
@@ -152,6 +167,10 @@ pub use audio::{
     AudioConfig, AudioDriver, AudioFilter, AudioOutput, EqBand, LoudnessNorm, ReplayGainMode,
 };
 pub use capabilities::MpvCapabilities;
+pub use capture::{
+    parse_v4l2_listing, v4l2_play_url, CaptureDevice, CaptureEnumerator, CaptureError, CaptureNode,
+    CaptureNodeKind, V4l2Cli,
+};
 pub use controls::{AbLoop, PlaybackControls, ScreenshotMode};
 pub use engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
 pub use fake::FakeMpv;

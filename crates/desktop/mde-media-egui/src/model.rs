@@ -20,10 +20,11 @@ use mde_jellyfin::{
     ServerStore, StreamMediaType,
 };
 use mde_media_core::{
-    classify_url, AbLoop, BrowseQuery, Library, LibraryItem, MediaEngine, MediaKind,
-    MpvCapabilities, PlaybackControls, Player, PlayerEvent, PlayerState, Playlist, PlaylistItem,
-    RepeatMode, ScreenshotMode, SortKey, Track, TrackKind, TrackSelect, TrackSelection, UrlKind,
-    YtDlpError, YtDlpResolver,
+    classify_url, AbLoop, BrowseQuery, CaptureDevice, CaptureEnumerator, CaptureError,
+    CaptureNodeKind, Library, LibraryItem, MediaEngine, MediaKind, MpvCapabilities,
+    PlaybackControls, Player, PlayerEvent, PlayerState, Playlist, PlaylistItem, RepeatMode,
+    ScreenshotMode, SortKey, Track, TrackKind, TrackSelect, TrackSelection, UrlKind, YtDlpError,
+    YtDlpResolver,
 };
 
 /// The seed used when the operator toggles shuffle on.
@@ -117,6 +118,50 @@ pub struct SourceRow {
     pub path: String,
     /// How many indexed items live under this root.
     pub item_count: usize,
+}
+
+/// The capture-devices Sources state (MEDIA-13).
+///
+/// The last enumerated v4l2 devices plus whether the surface has probed at least
+/// once and whether v4l2 tooling was present. Empty + un-probed until the operator
+/// scans; refreshed on demand through an injected [`CaptureEnumerator`] so no
+/// `/dev/video` is touched in tests.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureUiState {
+    /// The devices from the last enumeration (all with at least one node).
+    devices: Vec<CaptureDevice>,
+    /// Whether an enumeration has run at least once (so the view distinguishes
+    /// "not scanned yet" from "scanned, none found").
+    probed: bool,
+    /// Whether the last enumeration found the v4l2 tooling present.
+    available: bool,
+}
+
+impl CaptureUiState {
+    /// The enumerated devices (read-only).
+    #[must_use]
+    pub fn devices(&self) -> &[CaptureDevice] {
+        &self.devices
+    }
+
+    /// The playable devices — those exposing a `/dev/videoN` capture node — the
+    /// rows the Sources view offers a "Watch" action on.
+    #[must_use]
+    pub fn playable(&self) -> Vec<&CaptureDevice> {
+        self.devices.iter().filter(|d| d.is_playable()).collect()
+    }
+
+    /// Whether an enumeration has run at least once.
+    #[must_use]
+    pub const fn probed(&self) -> bool {
+        self.probed
+    }
+
+    /// Whether the v4l2 tooling was present at the last enumeration.
+    #[must_use]
+    pub const fn available(&self) -> bool {
+        self.available
+    }
 }
 
 /// A configured Jellyfin server as a Sources row — its display name, base URL,
@@ -363,6 +408,9 @@ pub struct MediaController<E: MediaEngine> {
     /// The Jellyfin Sources state (MEDIA-10) — configured servers, the negotiated
     /// capability profile, the last browse, and the active playback session.
     jellyfin: JellyfinState,
+    /// The capture-devices Sources state (MEDIA-13) — the last enumerated v4l2
+    /// capture inputs. Refreshed on demand; the enumerator is injected.
+    capture: CaptureUiState,
     /// The non-core UI state.
     ui: UiState,
 }
@@ -375,6 +423,7 @@ impl<E: MediaEngine> MediaController<E> {
             player,
             library: Library::new(),
             jellyfin: JellyfinState::default(),
+            capture: CaptureUiState::default(),
             ui: UiState::default(),
         }
     }
@@ -556,6 +605,73 @@ impl<E: MediaEngine> MediaController<E> {
         self.ui.status = Some(status);
         self.ui.url_input.clear();
         self.ui.tab = MediaTab::Player;
+    }
+
+    // ── capture devices (MEDIA-13) ────────────────────────────────────────────────
+
+    /// The capture-devices Sources state (read-only) — the last enumerated v4l2
+    /// devices + the probe/availability flags the view renders.
+    #[must_use]
+    pub const fn capture(&self) -> &CaptureUiState {
+        &self.capture
+    }
+
+    /// Re-enumerate the local v4l2 capture devices (MEDIA-13) through the injected
+    /// [`CaptureEnumerator`] and record the result, reporting the outcome honestly on
+    /// the status line. An empty result — or absent v4l2 tooling ([`CaptureError::ToolMissing`])
+    /// — surfaces as an honest "no capture devices found" state, never a stub / fake
+    /// device (§7). Glue: the enumeration lives in the core; the surface only stores +
+    /// renders it.
+    pub fn refresh_capture_devices<C: CaptureEnumerator>(&mut self, enumerator: &C) {
+        self.capture.probed = true;
+        match enumerator.enumerate() {
+            Ok(devices) => {
+                self.capture.available = true;
+                let playable = devices.iter().filter(|d| d.is_playable()).count();
+                self.capture.devices = devices;
+                self.ui.status = Some(if playable == 0 {
+                    "No capture devices found.".to_owned()
+                } else {
+                    format!("Found {playable} capture device(s).")
+                });
+            }
+            Err(CaptureError::ToolMissing) => {
+                self.capture.devices.clear();
+                self.capture.available = false;
+                self.ui.status = Some(
+                    "No capture devices found — v4l2 tooling (v4l2-ctl) not installed.".to_owned(),
+                );
+            }
+            Err(e) => {
+                self.capture.devices.clear();
+                self.ui.status = Some(format!("Capture: {e}"));
+            }
+        }
+    }
+
+    /// Open an enumerated v4l2 capture device (by its `/dev/videoN` node path) in the
+    /// core [`Player`] (MEDIA-13): build its `av://v4l2:` URL and hand it to
+    /// [`Player::load`] — the same play path the local + stream + Jellyfin sources use
+    /// (§6 glue, no re-derived player). Jumps to the Player view on success.
+    ///
+    /// # Errors
+    /// A status string when `dev_path` is not among the enumerated capture nodes, the
+    /// device has no playable node, or the core rejects the load.
+    pub fn open_capture_device(&mut self, dev_path: &str) -> Result<(), String> {
+        let device = self
+            .capture
+            .devices
+            .iter()
+            .find(|d| d.path() == Some(dev_path))
+            .ok_or_else(|| format!("No such capture device: {dev_path}"))?;
+        let url = device
+            .play_url()
+            .ok_or_else(|| format!("{dev_path} has no capture node."))?;
+        let name = device.name.clone();
+        // `device`'s borrow of `self.capture` ends here (url + name are owned).
+        self.player.load(url).map_err(err)?;
+        self.finish_open(format!("Opening capture {name}"));
+        Ok(())
     }
 
     // ── the per-frame pump ──────────────────────────────────────────────────────
@@ -1270,6 +1386,32 @@ pub fn source_label(path: &str) -> String {
         .to_owned()
 }
 
+/// The one-line detail a capture-device row shows (MEDIA-13).
+///
+/// Its capture node path, then its bus info and any extra capability nodes beyond the
+/// primary video capture (a `vbi` teletext / `radio` node) — the honest "path · caps"
+/// line. A pure fold, so it is unit-tested.
+#[must_use]
+pub fn capture_detail(device: &CaptureDevice) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(path) = device.path() {
+        parts.push(path.to_owned());
+    }
+    if let Some(bus) = device.bus_info.as_deref() {
+        parts.push(bus.to_owned());
+    }
+    let extra: Vec<&str> = device
+        .capabilities()
+        .into_iter()
+        .filter(|kind| !matches!(kind, CaptureNodeKind::Video))
+        .map(CaptureNodeKind::label)
+        .collect();
+    if !extra.is_empty() {
+        parts.push(extra.join(", "));
+    }
+    parts.join(" · ")
+}
+
 /// The `(title, subtitle)` a Library row renders: the title, then a `kind · duration ·
 /// artist · album` line omitting any part the metadata does not carry. A pure fold.
 #[must_use]
@@ -1637,6 +1779,119 @@ mod tests {
             .expect_err("a yt-dlp failure surfaces");
         assert!(err.starts_with("yt-dlp:"), "honest message: {err}");
         assert_eq!(c.player().state(), PlayerState::Idle);
+    }
+
+    // ── capture devices (MEDIA-13) ───────────────────────────────────────────────
+
+    /// A fake v4l2 enumerator: scripted availability + a recorded listing, so the
+    /// enumerate → open → play glue is driven with no real `/dev/video` and no tool.
+    struct FakeCapture {
+        available: bool,
+        listing: String,
+    }
+
+    impl FakeCapture {
+        /// A tool present with one webcam (`/dev/video0`) + one `PCIe` tuner
+        /// (`/dev/video2`, with a VBI teletext node).
+        fn two_devices() -> Self {
+            Self {
+                available: true,
+                listing: "UVC Camera (usb-0000:00:14.0-1):\n\t/dev/video0\n\t/dev/media0\n\n\
+                    WinTV-HVR (PCI:0000:03:00.0):\n\t/dev/video2\n\t/dev/vbi0\n"
+                    .to_owned(),
+            }
+        }
+    }
+
+    impl CaptureEnumerator for FakeCapture {
+        fn is_available(&self) -> bool {
+            self.available
+        }
+
+        fn enumerate(&self) -> Result<Vec<CaptureDevice>, CaptureError> {
+            if !self.available {
+                return Err(CaptureError::ToolMissing);
+            }
+            Ok(mde_media_core::parse_v4l2_listing(&self.listing))
+        }
+    }
+
+    #[test]
+    fn refresh_capture_devices_stores_enumerated_devices() {
+        let mut c = controller();
+        assert!(!c.capture().probed());
+        c.refresh_capture_devices(&FakeCapture::two_devices());
+        assert!(c.capture().probed());
+        assert!(c.capture().available());
+        assert_eq!(c.capture().playable().len(), 2);
+        assert_eq!(c.ui().status.as_deref(), Some("Found 2 capture device(s)."));
+    }
+
+    #[test]
+    fn open_capture_device_loads_the_core_player_over_av_v4l2() {
+        let mut c = controller();
+        c.refresh_capture_devices(&FakeCapture::two_devices());
+        c.open_capture_device("/dev/video2")
+            .expect("open an enumerated capture device");
+        // The core Player loaded the device's `av://v4l2:` URL — the existing play path.
+        assert_eq!(c.player().media(), Some("av://v4l2:/dev/video2"));
+        assert_eq!(c.player().state(), PlayerState::Loading);
+        assert_eq!(c.ui().tab, MediaTab::Player);
+        c.pump();
+        assert_eq!(c.player().state(), PlayerState::Playing);
+    }
+
+    #[test]
+    fn open_unknown_capture_device_is_an_honest_refusal() {
+        let mut c = controller();
+        c.refresh_capture_devices(&FakeCapture::two_devices());
+        let err = c
+            .open_capture_device("/dev/video9")
+            .expect_err("an un-enumerated device is refused, not faked");
+        assert!(err.contains("No such capture device"), "honest: {err}");
+        assert_eq!(c.player().state(), PlayerState::Idle);
+    }
+
+    #[test]
+    fn refresh_capture_devices_no_hardware_is_honest_no_devices() {
+        // The tool is present but the host has no capture hardware → honest, empty.
+        let mut c = controller();
+        c.refresh_capture_devices(&FakeCapture {
+            available: true,
+            listing: String::new(),
+        });
+        assert!(c.capture().probed());
+        assert!(c.capture().playable().is_empty());
+        assert_eq!(c.ui().status.as_deref(), Some("No capture devices found."));
+    }
+
+    #[test]
+    fn refresh_capture_devices_absent_tool_is_honest_gated() {
+        // No v4l2 tooling → an honest "not installed" note, never a stub device (§7).
+        let mut c = controller();
+        c.refresh_capture_devices(&FakeCapture {
+            available: false,
+            listing: String::new(),
+        });
+        assert!(c.capture().probed());
+        assert!(!c.capture().available());
+        assert!(c.capture().playable().is_empty());
+        assert_eq!(
+            c.ui().status.as_deref(),
+            Some("No capture devices found — v4l2 tooling (v4l2-ctl) not installed.")
+        );
+    }
+
+    #[test]
+    fn capture_detail_renders_path_bus_and_extra_caps() {
+        let devices = mde_media_core::parse_v4l2_listing(
+            "WinTV-HVR (PCI:0000:03:00.0):\n\t/dev/video2\n\t/dev/vbi0\n",
+        );
+        // path · bus · the extra (non-video) capability nodes.
+        assert_eq!(
+            capture_detail(&devices[0]),
+            "/dev/video2 · PCI:0000:03:00.0 · vbi"
+        );
     }
 
     // ── transport glue (the surface drives the core) ─────────────────────────────

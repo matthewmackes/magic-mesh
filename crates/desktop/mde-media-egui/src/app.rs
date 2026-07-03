@@ -20,13 +20,13 @@ use mde_jellyfin::{
     BaseItemDto, ClientInfo, ItemsQuery, JellyfinClient, ReqwestTransport, ServerConfig,
 };
 use mde_media_core::{
-    MediaEngine, MediaKind, PlayerState, ScreenshotMode, SortKey, TrackKind, YtDlpCli,
+    MediaEngine, MediaKind, PlayerState, ScreenshotMode, SortKey, TrackKind, V4l2Cli, YtDlpCli,
 };
 
 use crate::model::{
-    format_time, item_title, jellyfin_item_title, library_row_texts, now_playing_title,
-    osd_should_show, play_pause_label, progress_fraction, repeat_label, state_word, track_label,
-    MediaController, MediaTab, TransportAction,
+    capture_detail, format_time, item_title, jellyfin_item_title, library_row_texts,
+    now_playing_title, osd_should_show, play_pause_label, progress_fraction, repeat_label,
+    state_word, track_label, MediaController, MediaTab, TransportAction,
 };
 use crate::{build_engine, Engine};
 
@@ -300,6 +300,9 @@ fn sources_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
                 }
             }
 
+            // ── capture devices (MEDIA-13) ──
+            capture_section(ui, controller);
+
             // ── Jellyfin servers (MEDIA-10) ──
             jellyfin_section(ui, controller);
 
@@ -345,6 +348,82 @@ fn open_url_row<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
         // spawn it. The controller sets the status line for every outcome.
         let target = controller.ui().url_input.clone();
         let _ = controller.open_url(&target, &YtDlpCli);
+    }
+}
+
+/// The "Capture devices" sub-section of Sources (MEDIA-13): a Scan button that
+/// enumerates the local v4l2 capture inputs (webcams / TV tuners / capture cards)
+/// through the real [`V4l2Cli`], then a row per playable device with a Watch action
+/// that opens it in the core Player over `av://v4l2:/dev/videoN`. All chrome is drawn
+/// from Carbon [`Style`] tokens (§4). Honest-gated (§7): before a scan it shows a plain
+/// hint; a host with no device — or no v4l2 tooling — shows a plain "no capture devices
+/// found" note, never a fake device.
+fn capture_section<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
+    ui.add_space(Style::SP_S);
+    let mut do_scan = false;
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Capture devices")
+                .size(Style::SMALL)
+                .strong()
+                .color(Style::TEXT_DIM),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Scan").clicked() {
+                do_scan = true;
+            }
+        });
+    });
+    ui.add_space(Style::SP_XS);
+
+    if do_scan {
+        // The real v4l2 enumerator; runtime-gated (honest "no devices" when absent —
+        // §7). Only invoked on an explicit Scan, so headless renders never spawn it.
+        // The controller sets the status line for every outcome.
+        controller.refresh_capture_devices(&V4l2Cli);
+    }
+
+    // Before any scan, invite one; after, distinguish "none found" from a device list.
+    if !controller.capture().probed() {
+        muted_note(
+            ui,
+            "Scan for local capture inputs (webcams, TV tuners, capture cards).",
+        );
+        return;
+    }
+    // Collect owned row data so the immutable borrow of `controller` is released
+    // before the (mutable) Watch open below.
+    let rows: Vec<(String, String, String)> = controller
+        .capture()
+        .playable()
+        .iter()
+        .filter_map(|device| {
+            device
+                .path()
+                .map(|path| (device.name.clone(), path.to_owned(), capture_detail(device)))
+        })
+        .collect();
+    if rows.is_empty() {
+        muted_note(ui, "No capture devices found.");
+        return;
+    }
+
+    let mut open: Option<String> = None;
+    for (name, path, detail) in &rows {
+        ui.horizontal(|ui| {
+            status_dot(ui, Style::OK);
+            ui.label(RichText::new(name).size(Style::BODY).color(Style::TEXT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Watch").clicked() {
+                    open = Some(path.clone());
+                }
+                muted_note(ui, detail);
+            });
+        });
+        ui.add_space(Style::SP_XS);
+    }
+    if let Some(path) = open {
+        let _ = controller.open_capture_device(&path);
     }
 }
 
@@ -1282,12 +1361,42 @@ mod tests {
     #[test]
     fn sources_view_renders_empty_and_populated() {
         let mut c = controller();
-        render(&mut c, sources_view); // honest empty first-run
+        render(&mut c, sources_view); // honest empty first-run (capture un-probed hint)
         populate(&mut c);
         // The MEDIA-12 Open-URL field renders with text in it (never spawns yt-dlp
         // without an explicit Open click, which headless rendering cannot deliver).
         c.ui_mut().url_input = "https://youtu.be/dQw4w9WgXcQ".to_owned();
         render(&mut c, sources_view);
+        assert_eq!(c.player().state(), PlayerState::Idle, "render never opens");
+    }
+
+    /// A headless v4l2 enumerator (a recorded listing) so the populated capture
+    /// section renders with no real `/dev/video` and no `v4l2-ctl` subprocess.
+    struct FakeCapture(String);
+    impl mde_media_core::CaptureEnumerator for FakeCapture {
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn enumerate(
+            &self,
+        ) -> Result<Vec<mde_media_core::CaptureDevice>, mde_media_core::CaptureError> {
+            Ok(mde_media_core::parse_v4l2_listing(&self.0))
+        }
+    }
+
+    #[test]
+    fn sources_view_renders_capture_devices_and_no_device_state() {
+        let mut c = controller();
+        // Probed with devices → the Watch rows tessellate (MEDIA-13).
+        c.refresh_capture_devices(&FakeCapture(
+            "UVC Camera (usb-0000:00:14.0-1):\n\t/dev/video0\n\t/dev/media0\n".to_owned(),
+        ));
+        render(&mut c, sources_view);
+        assert_eq!(c.capture().playable().len(), 1);
+        // Probed with no hardware → the honest "no capture devices found" note renders.
+        c.refresh_capture_devices(&FakeCapture(String::new()));
+        render(&mut c, sources_view);
+        assert!(c.capture().playable().is_empty());
         assert_eq!(c.player().state(), PlayerState::Idle, "render never opens");
     }
 
