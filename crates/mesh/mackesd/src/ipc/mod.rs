@@ -56,6 +56,12 @@ pub mod secret_store;
 // + seals the shared keypair under `mesh-ssh-key` (the ref FILEMGR-5's mesh_mount
 // worker reads), installs the public half overlay-only, and owns the re-key path.
 pub mod mesh_ssh_key;
+// FILEMGR-7 — the peer-side direct-transfer helper: serves `action/mesh-transfer/
+// direct` and drives a remote-to-remote rsync A→B over the overlay (reusing the
+// FILEMGR-5/6 shared key + `<host>.mesh` DNS + mount scope) so a cross-node copy
+// never double-hops through the browsing node. The live ssh/rsync leg is honestly
+// gated behind an injectable backend seam (§9/§7); the plan + parsing folds are pure.
+pub mod mesh_transfer;
 // VPN-GW-1 — action/vpn/* tunnel CRUD + wg-quick/openvpn bring-up responder.
 pub mod vpn_gw;
 // VPN-GW-6 — tunnel health + exit-IP/leak verification + auto-failover + alerts.

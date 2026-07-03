@@ -9226,6 +9226,28 @@ fn run_serve(
                         reply: Box::new(move |verb, body| xfer_ops.file_ops_reply(verb, body)),
                     },
                 ];
+                // FILEMGR-7 — the peer-side direct-transfer helper: a cross-node
+                // A→B copy rsyncs straight over the overlay (not double-hopped
+                // through us). Reuses the FILEMGR-5/6 shared key + `<host>.mesh`
+                // DNS + published mount scope; the live ssh/rsync leg is honestly
+                // gated (§7) — an unprovisioned key/absent ssh replies `gated` so
+                // the Files surface falls back to the sshfs relay.
+                {
+                    use mackesd_core::ipc::mesh_transfer;
+                    let runtime_base = mackesd_core::workers::mesh_mount::resolve_runtime_base();
+                    let mesh_bus_dir = mde_bus::default_data_dir();
+                    let xfer = mesh_transfer::MeshTransfer::new(
+                        runtime_base,
+                        mackesd_core::ipc::secret_store::repo_root(),
+                        mackes_mesh_types::peers::default_workgroup_root(),
+                    )
+                    .with_bus_dir(mesh_bus_dir);
+                    surfaces.push(files::Surface {
+                        prefix: mesh_transfer::MESH_TRANSFER_PREFIX,
+                        verbs: &mesh_transfer::MESH_TRANSFER_VERBS,
+                        reply: Box::new(move |verb, body| xfer.reply(verb, body)),
+                    });
+                }
                 // Fleet.Files joins only when sqlite opens; its stub
                 // siblings serve regardless.
                 match mackesd_core::store::open(&db_path) {

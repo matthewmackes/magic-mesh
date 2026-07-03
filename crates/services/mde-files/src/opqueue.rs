@@ -800,7 +800,11 @@ fn child_name(child: &Path) -> Result<PathBuf, Stop> {
 /// one entry / zero bytes, a directory one entry plus its subtree, a regular
 /// file one entry plus its length. Missing sources contribute nothing (the
 /// error surfaces when execution reaches them).
-fn scan_items(ops: &dyn FileOps, items: &[PathBuf]) -> (u64, u64) {
+///
+/// `pub(crate)` so FILEMGR-7's [`crate::transfer`] seeds a direct-transfer's
+/// [`crate::transfer::DirectProgress`] with the same scanned totals the local
+/// copy engine uses — one scan definition, no drift.
+pub(crate) fn scan_items(ops: &dyn FileOps, items: &[PathBuf]) -> (u64, u64) {
     let mut files = 0;
     let mut bytes = 0;
     for item in items {
