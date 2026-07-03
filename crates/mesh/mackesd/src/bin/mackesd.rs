@@ -7621,6 +7621,40 @@ fn run_serve(
                 .push("adfilter".into());
         }
 
+        // BOOKMARKS-8 — the mesh-wide browser/ad-blocker POLICY worker (fleet
+        // governance ENFORCED mesh-side, not just in the UI). Every node writes its
+        // own operator-authored policy doc into the encrypted Syncthing share
+        // (`workgroup_root`, the same substrate the adfilter/bookmarks workers use)
+        // and converges on the newest-authored doc mesh-wide; it folds that doc for
+        // THIS node's deployment role and enforces at the browser launch/spawn seam
+        // — draining action/browser/{launch,navigate,set-adblock} to refuse a
+        // launch on a disallowed role, inject the forced ad-blocker + URL allowlist
+        // + custom lists on a granted launch, and reject out-of-policy navigate /
+        // adblock-off actions. Draining action/browser-policy/set authors the fleet
+        // policy. Disable stops the browser-data sync + hides the surface but
+        // retains the node-local data (no destructive wipe). Publishes
+        // state/browser-policy/<node> for the Workbench fleet view. Offline-first:
+        // the node-local doc + data survive a down share, and nothing is written
+        // into a bare unprovisioned mount (`shared_root_writable`). A desktop-
+        // governance feature (Workstation tier); idles gracefully on a headless box.
+        if mackesd_core::worker_role::runs("browser_policy", role_rank) {
+            let local_root = mackesd_core::workers::browser_policy::resolve_local_root();
+            let role = mackesd_core::worker_role::role_name(role_rank).to_string();
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::browser_policy::BrowserPolicyWorker::new(
+                    node_id.clone(),
+                    role,
+                    local_root,
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("browser_policy".into());
+        }
+
         // CHOOSER-1 — the desktop-source discovery aggregator (design
         // `desktop-chooser.md` §Architecture, locks 5/14): collects every
         // desktop source — mesh-peer advertised (the replicated peers plane's

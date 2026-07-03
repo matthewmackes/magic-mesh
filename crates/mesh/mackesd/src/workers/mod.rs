@@ -170,6 +170,17 @@ pub mod bookmarks;
 // state/adfilter/<node>. No external transport to fake — file I/O against the same
 // /mnt/mesh-storage share the bookmarks / ssh-gossip / chat workers use.
 pub mod adfilter;
+// BOOKMARKS-8 — the mesh-wide browser/ad-blocker POLICY worker. Replicates the
+// operator-authored fleet policy doc over the encrypted Syncthing share (per-node
+// single-writer doc.json, LWW-converged by the newest authored stamp), folds it
+// for THIS node's role, and enforces at the browser launch/spawn seam: it refuses
+// to spawn the browser on a disallowed role, injects the forced ad-blocker + URL
+// allowlist + custom filter lists on launch, and rejects out-of-policy navigate /
+// adblock-off actions (draining action/browser/*). Disable stops the browser-data
+// sync + hides the surface but retains the node-local data (no destructive wipe).
+// Publishes state/browser-policy/<node> for the Workbench fleet view. No external
+// transport to fake — file I/O against the same share the adfilter worker uses.
+pub mod browser_policy;
 pub mod heartbeat;
 // OV-7.a (v2.6) — Health reconciler. Reads each known peer's
 // QNM-Shared heartbeat.json on a 5 s tick, applies the

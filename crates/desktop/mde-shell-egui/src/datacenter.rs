@@ -50,6 +50,16 @@ const CONTAINERS_TOPIC: &str = "event/podman/containers";
 /// `host` field, never the topic.
 const ACTION_TOPIC: &str = "action/vm/lifecycle";
 
+/// BOOKMARKS-7 — the per-node ad-block stats topic prefix (`state/adfilter/<node>`,
+/// published by the `adfilter` worker). The Fleet view folds these into per-host
+/// ad-block rows (enabled lists / rules / allowlist / staleness).
+const ADFILTER_STATE_PREFIX: &str = "state/adfilter/";
+/// BOOKMARKS-8 — the per-node browser-policy topic prefix
+/// (`state/browser-policy/<node>`, published by the `browser_policy` worker). The
+/// Fleet view folds these into the per-host browser-governance row (enabled /
+/// forced ad-blocker / allowlist size / policy source + enforcement counters).
+const BROWSER_POLICY_STATE_PREFIX: &str = "state/browser-policy/";
+
 /// Poll cadence for the two live topics — a node's health flip or a new VM
 /// surfaces within this window. Matches the panel shell's 5 s refresh; the read
 /// is a cheap local `SQLite` scan so the cadence can stay tight.
@@ -129,6 +139,161 @@ struct ContainerReport {
     containers: Vec<Container>,
     /// Publish time (ms since the Unix epoch) — the latest-wins fold key.
     published_at_ms: u64,
+}
+
+// ─────────────── JSON boundary: browser + ad-block fleet state ───────────────
+// BOOKMARKS-8 — mirrors of the `adfilter` (BOOKMARKS-7) + `browser_policy` worker
+// status payloads. serde ignores the wire fields we don't render.
+
+/// How fresh the filter lists are — mirrors `mde_adblock::Staleness` (externally
+/// tagged: `"Fresh"` / `"NeverSynced"` / `{"Stale":{"age_ms":N}}`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+enum Staleness {
+    /// Synced from upstream within the freshness window.
+    Fresh,
+    /// Last upstream sync is older than the window.
+    Stale {
+        /// How long since the last successful sync (ms).
+        age_ms: u64,
+    },
+    /// Never synced — running on the bundled seed.
+    NeverSynced,
+}
+
+/// Per-node ad-block stats — mirrors `adfilter::AdfilterStatus` (BOOKMARKS-7).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct AdblockStat {
+    /// Publishing node id.
+    node: String,
+    /// Enabled filter sources (the engine compiles these).
+    enabled_sources: usize,
+    /// Total filter sources.
+    total_sources: usize,
+    /// Network block+allow rules the compiled engine holds.
+    network_rules: usize,
+    /// Cosmetic hide+unhide rules the compiled engine holds.
+    cosmetic_rules: usize,
+    /// Sites currently allowlisted (blocking off) mesh-wide.
+    allowlisted_sites: usize,
+    /// How fresh the lists are (the honest staleness indicator).
+    staleness: Staleness,
+    /// Wall-clock ms of the last flush (latest-wins fold key).
+    last_flush_ms: u64,
+}
+
+/// One custom filter list — mirrors `browser_policy::CustomFilterList`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct CustomFilterList {
+    /// The list's stable name.
+    name: String,
+}
+
+/// Per-node browser-governance state — mirrors `browser_policy::BrowserPolicyStatus`
+/// (BOOKMARKS-8).
+// A read-side status mirror is legitimately bool-heavy (enabled/hidden/forced/…);
+// each bool is an independent honest flag the Fleet view renders.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct BrowserPolicyStat {
+    /// Publishing node id.
+    node: String,
+    /// The role the policy was folded for.
+    role: String,
+    /// Whether the browser is enabled on this node's role.
+    browser_enabled: bool,
+    /// Whether the surface is hidden (== the browser being disabled).
+    surface_hidden: bool,
+    /// Whether the ad-blocker is forced on.
+    force_adblock: bool,
+    /// The enforced URL navigation allowlist (empty = unrestricted).
+    url_allowlist: Vec<String>,
+    /// The custom filter lists injected on launch.
+    custom_filter_lists: Vec<CustomFilterList>,
+    /// The node that authored the converged policy (empty = the default baseline).
+    policy_source: String,
+    /// How many launches this node has refused (disallowed role).
+    launches_refused: u64,
+    /// How many navigations this node has rejected (out of allowlist).
+    navigations_rejected: u64,
+    /// How many ad-block toggle-offs this node has rejected (force-on).
+    adblock_toggles_rejected: u64,
+    /// Whether the node-local browser data survives a disable (never wiped).
+    local_data_retained: bool,
+    /// Wall-clock ms of the last flush (latest-wins fold key).
+    last_flush_ms: u64,
+}
+
+/// One node's browser + ad-block fleet reality, folded from the latest
+/// `state/adfilter/*` + `state/browser-policy/*` messages seen for that host.
+#[derive(Debug, Clone)]
+struct BrowserFleetRow {
+    /// Node id.
+    host: String,
+    /// Latest ad-block stats, once any has arrived.
+    adblock: Option<AdblockStat>,
+    /// Latest browser-policy state, once any has arrived.
+    policy: Option<BrowserPolicyStat>,
+}
+
+/// Fold `state/adfilter/*` + `state/browser-policy/*` bodies into a sorted-by-host
+/// per-node view. Latest message wins per host (each stream tracked by its own
+/// `last_flush_ms`). Pure — no Bus, no GPU.
+fn project_browser(adfilter_bodies: &[String], policy_bodies: &[String]) -> Vec<BrowserFleetRow> {
+    let mut rows: BTreeMap<String, BrowserFleetRow> = BTreeMap::new();
+
+    for body in adfilter_bodies {
+        let Ok(s) = serde_json::from_str::<AdblockStat>(body) else {
+            continue;
+        };
+        let entry = rows
+            .entry(s.node.clone())
+            .or_insert_with(|| BrowserFleetRow {
+                host: s.node.clone(),
+                adblock: None,
+                policy: None,
+            });
+        if entry
+            .adblock
+            .as_ref()
+            .is_none_or(|cur| s.last_flush_ms >= cur.last_flush_ms)
+        {
+            entry.adblock = Some(s);
+        }
+    }
+
+    for body in policy_bodies {
+        let Ok(s) = serde_json::from_str::<BrowserPolicyStat>(body) else {
+            continue;
+        };
+        let entry = rows
+            .entry(s.node.clone())
+            .or_insert_with(|| BrowserFleetRow {
+                host: s.node.clone(),
+                adblock: None,
+                policy: None,
+            });
+        if entry
+            .policy
+            .as_ref()
+            .is_none_or(|cur| s.last_flush_ms >= cur.last_flush_ms)
+        {
+            entry.policy = Some(s);
+        }
+    }
+
+    rows.into_values().collect()
+}
+
+/// A compact staleness label + tone for the ad-block row.
+fn staleness_label(s: &Staleness) -> (Color32, String) {
+    match s {
+        Staleness::Fresh => (Style::OK, "lists fresh".to_string()),
+        Staleness::NeverSynced => (Style::TEXT_DIM, "bundled seed (never synced)".to_string()),
+        Staleness::Stale { age_ms } => {
+            let days = age_ms / (24 * 60 * 60 * 1000);
+            (Style::WARN, format!("lists stale ({days}d old)"))
+        }
+    }
 }
 
 // ──────────────────────────── projected view ────────────────────────────
@@ -367,6 +532,8 @@ pub(crate) struct DatacenterState {
     /// The latest projection, sorted by host. Empty until the first message lands
     /// (drives the loading state).
     nodes: Vec<NodeView>,
+    /// BOOKMARKS-8 — the latest browser + ad-block fleet projection, sorted by host.
+    browser: Vec<BrowserFleetRow>,
     /// The host whose inline "New VM" create form is open, if any.
     create_for: Option<String>,
     /// The (single, one-open-at-a-time) create form's fields.
@@ -382,6 +549,7 @@ impl Default for DatacenterState {
         Self {
             bus_root: mde_bus::client_data_dir(),
             nodes: Vec::new(),
+            browser: Vec::new(),
             create_for: None,
             form: CreateForm::default(),
             last_error: None,
@@ -419,6 +587,12 @@ impl DatacenterState {
         let instances = read_bodies(&persist, INSTANCES_TOPIC);
         let containers = read_bodies(&persist, CONTAINERS_TOPIC);
         self.nodes = project(&health, &instances, &containers);
+        // BOOKMARKS-8 — the per-node fan-out state topics (one topic per node) are
+        // enumerated by prefix, not a fixed name.
+        let topics = persist.list_topics().unwrap_or_default();
+        let adfilter = read_bodies_by_prefix(&persist, &topics, ADFILTER_STATE_PREFIX);
+        let policy = read_bodies_by_prefix(&persist, &topics, BROWSER_POLICY_STATE_PREFIX);
+        self.browser = project_browser(&adfilter, &policy);
     }
 
     /// Render the Fleet plane's live datacenter content: per-node KVM
@@ -430,6 +604,7 @@ impl DatacenterState {
         let Self {
             bus_root,
             nodes,
+            browser,
             create_for,
             form,
             last_error,
@@ -441,14 +616,14 @@ impl DatacenterState {
             ui.add_space(Style::SP_S);
         }
 
-        if nodes.is_empty() {
+        if nodes.is_empty() && browser.is_empty() {
             ui.add_space(Style::SP_S);
             ui.colored_label(Style::TEXT_DIM, "Waiting for KVM host health…");
             ui.add_space(Style::SP_XS);
             ui.label(
                 RichText::new(
                     "Each mesh node publishes its libvirt/Podman stack health, VM roster, \
-                     and container roster to the Bus.",
+                     container roster, and browser/ad-block policy state to the Bus.",
                 )
                 .color(Style::TEXT_DIM)
                 .size(Style::SMALL),
@@ -469,12 +644,32 @@ impl DatacenterState {
                     });
                     ui.add_space(Style::SP_S);
                 }
-                // MV-6b lands the container roster read-only; container run/stop
-                // lifecycle-drive (action/container/lifecycle) is a follow-up.
-                mde_egui::muted_note(
-                    ui,
-                    "Container rows are read-only — run/stop lifecycle-drive is a follow-up.",
-                );
+                if !nodes.is_empty() {
+                    // MV-6b lands the container roster read-only; container run/stop
+                    // lifecycle-drive (action/container/lifecycle) is a follow-up.
+                    mde_egui::muted_note(
+                        ui,
+                        "Container rows are read-only — run/stop lifecycle-drive is a follow-up.",
+                    );
+                }
+                // BOOKMARKS-8 — the browser + ad-block fleet section (its own per-node
+                // rows; the state comes from the `adfilter` + `browser_policy` workers).
+                if !browser.is_empty() {
+                    ui.add_space(Style::SP_M);
+                    ui.label(
+                        RichText::new("Browser & ad-block policy")
+                            .color(Style::TEXT)
+                            .size(Style::BODY)
+                            .strong(),
+                    );
+                    ui.add_space(Style::SP_XS);
+                    for row in browser.iter() {
+                        ui.group(|ui| {
+                            show_browser_row(ui, row);
+                        });
+                        ui.add_space(Style::SP_S);
+                    }
+                }
             });
 
         if let Some(action) = pending {
@@ -490,6 +685,17 @@ fn read_bodies(persist: &Persist, topic: &str) -> Vec<String> {
         .unwrap_or_default()
         .into_iter()
         .filter_map(|m| m.body)
+        .collect()
+}
+
+/// Read the JSON bodies of every retained message on every topic under `prefix`
+/// (the per-node `state/<service>/<node>` fan-out), oldest first. `topics` is the
+/// already-enumerated topic list so a single `list_topics` serves several prefixes.
+fn read_bodies_by_prefix(persist: &Persist, topics: &[String], prefix: &str) -> Vec<String> {
+    topics
+        .iter()
+        .filter(|t| t.starts_with(prefix))
+        .flat_map(|t| read_bodies(persist, t))
         .collect()
 }
 
@@ -616,6 +822,144 @@ fn show_container_row(ui: &mut egui::Ui, c: &Container) {
     mde_egui::muted_note(ui, &c.image);
     ui.add_space(Style::SP_S);
     mde_egui::muted_note(ui, &c.state);
+}
+
+/// Render one node's browser + ad-block fleet section (read-only): the header +
+/// the enforced browser-policy state (BOOKMARKS-8) and the ad-block stats
+/// (BOOKMARKS-7). Honest empty notes when a stream hasn't reported yet.
+fn show_browser_row(ui: &mut egui::Ui, row: &BrowserFleetRow) {
+    // Header — host + the browser enabled/disabled tone.
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(&row.host)
+                .color(Style::TEXT)
+                .size(Style::BODY)
+                .strong(),
+        );
+        ui.add_space(Style::SP_S);
+        match &row.policy {
+            Some(p) => {
+                let (dot, label) = if p.browser_enabled {
+                    (Style::OK, "browser enabled")
+                } else {
+                    (Style::WARN, "browser disabled (surface hidden)")
+                };
+                ui.label(RichText::new("\u{25CF}").color(dot).size(Style::SMALL));
+                ui.add_space(Style::SP_XS);
+                let tone = if p.browser_enabled {
+                    Style::TEXT_DIM
+                } else {
+                    Style::WARN
+                };
+                ui.colored_label(tone, RichText::new(label).size(Style::SMALL));
+            }
+            None => {
+                mde_egui::muted_note(ui, "browser policy not yet reported");
+            }
+        }
+    });
+
+    // Enforced browser-policy detail (BOOKMARKS-8).
+    if let Some(p) = &row.policy {
+        ui.indent((row.host.as_str(), "policy"), |ui| {
+            show_policy_detail(ui, p);
+        });
+    }
+
+    // Ad-block stats (BOOKMARKS-7).
+    ui.add_space(Style::SP_XS);
+    ui.indent((row.host.as_str(), "adblock"), |ui| {
+        show_adblock_stats(ui, row.adblock.as_ref());
+    });
+}
+
+/// The enforced browser-policy detail rows: the folded role + forced-ad-blocker
+/// state, the navigation allowlist / custom lists, the policy source, the honest
+/// data-retention note, and the enforcement counters.
+fn show_policy_detail(ui: &mut egui::Ui, p: &BrowserPolicyStat) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!("role: {}", p.role))
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_S);
+        let (dot, label) = if p.force_adblock {
+            (Style::OK, "ad-blocker forced on")
+        } else {
+            (Style::TEXT_DIM, "ad-blocker optional")
+        };
+        ui.label(RichText::new("\u{25CF}").color(dot).size(Style::SMALL));
+        ui.add_space(Style::SP_XS);
+        ui.colored_label(Style::TEXT_DIM, RichText::new(label).size(Style::SMALL));
+    });
+    // Navigation allowlist + custom filter lists.
+    let allow = if p.url_allowlist.is_empty() {
+        "navigation unrestricted".to_string()
+    } else {
+        format!("navigation allowlist: {} domain(s)", p.url_allowlist.len())
+    };
+    let lists = if p.custom_filter_lists.is_empty() {
+        String::new()
+    } else {
+        format!(" · {} custom list(s)", p.custom_filter_lists.len())
+    };
+    mde_egui::muted_note(ui, format!("{allow}{lists}"));
+    // Policy source.
+    let src = if p.policy_source.is_empty() {
+        "default baseline (no fleet policy authored)".to_string()
+    } else {
+        format!("policy from {}", p.policy_source)
+    };
+    mde_egui::muted_note(ui, src);
+    // Honest data-retention (a disabled browser retains its local data).
+    if !p.browser_enabled && p.local_data_retained {
+        ui.colored_label(
+            Style::OK,
+            RichText::new("local data retained (no wipe)").size(Style::SMALL),
+        );
+    }
+    // Enforcement counters (only when something has been rejected).
+    let rejected = p.launches_refused + p.navigations_rejected + p.adblock_toggles_rejected;
+    if rejected > 0 {
+        ui.colored_label(
+            Style::WARN,
+            RichText::new(format!(
+                "enforced: {} launch · {} navigation · {} ad-block-off rejected",
+                p.launches_refused, p.navigations_rejected, p.adblock_toggles_rejected
+            ))
+            .size(Style::SMALL),
+        );
+    }
+}
+
+/// The ad-block stats rows (BOOKMARKS-7): a staleness pip + the lists / rules /
+/// allowlist counts, or an honest "not yet reported" note.
+fn show_adblock_stats(ui: &mut egui::Ui, adblock: Option<&AdblockStat>) {
+    match adblock {
+        Some(a) => {
+            ui.horizontal(|ui| {
+                let (dot, label) = staleness_label(&a.staleness);
+                ui.label(RichText::new("\u{25CF}").color(dot).size(Style::SMALL));
+                ui.add_space(Style::SP_XS);
+                ui.colored_label(dot, RichText::new(label).size(Style::SMALL));
+            });
+            mde_egui::muted_note(
+                ui,
+                format!(
+                    "{}/{} lists · {} network + {} cosmetic rules · {} site(s) allowlisted",
+                    a.enabled_sources,
+                    a.total_sources,
+                    a.network_rules,
+                    a.cosmetic_rules,
+                    a.allowlisted_sites
+                ),
+            );
+        }
+        None => {
+            mde_egui::muted_note(ui, "ad-block stats not yet reported");
+        }
+    }
 }
 
 /// One VM roster row: a state pip + name + raw state, and a Start (when not
@@ -770,6 +1114,90 @@ mod tests {
             r#"{{"host":"{host}","containers":[{}],"published_at_ms":{at}}}"#,
             cs.join(",")
         )
+    }
+
+    /// A faithful `state/adfilter/<node>` body (BOOKMARKS-7 `AdfilterStatus`).
+    fn adfilter_body(node: &str, enabled: usize, net_rules: usize, at: u64) -> String {
+        format!(
+            r#"{{"node":"{node}","enabled_sources":{enabled},"total_sources":{enabled},"network_rules":{net_rules},"cosmetic_rules":2,"allowlisted_sites":1,"staleness":"NeverSynced","age_ms":null,"synced_ms":null,"peers":0,"share_reachable":true,"last_flush_ms":{at}}}"#
+        )
+    }
+
+    /// A faithful `state/browser-policy/<node>` body (BOOKMARKS-8).
+    fn policy_body(node: &str, role: &str, enabled: bool, force: bool, at: u64) -> String {
+        format!(
+            r#"{{"node":"{node}","role":"{role}","browser_enabled":{enabled},"surface_hidden":{},"force_adblock":{force},"url_allowlist":["example.com"],"custom_filter_lists":[{{"name":"Corp","url":null}}],"policy_updated_ms":1000,"policy_source":"operator@eagle","last_launch_refused":false,"launches_granted":2,"launches_refused":1,"navigations_rejected":0,"adblock_toggles_rejected":0,"peers":0,"share_reachable":true,"local_data_retained":true,"last_flush_ms":{at}}}"#,
+            !enabled
+        )
+    }
+
+    #[test]
+    fn project_browser_folds_one_row_per_host_sorted_with_both_streams() {
+        let adfilter = vec![
+            adfilter_body("node-b", 3, 40, 1),
+            adfilter_body("node-a", 4, 55, 1),
+        ];
+        let policy = vec![policy_body("node-a", "workstation", true, true, 1)];
+        let rows = project_browser(&adfilter, &policy);
+        assert_eq!(rows.len(), 2, "one row per host");
+        assert_eq!(rows[0].host, "node-a"); // BTreeMap sorted
+        assert_eq!(rows[1].host, "node-b");
+        // node-a folds BOTH the ad-block stats and the browser policy.
+        let a = &rows[0];
+        assert!(a.adblock.as_ref().is_some_and(|s| s.enabled_sources == 4));
+        assert!(a
+            .policy
+            .as_ref()
+            .is_some_and(|p| p.browser_enabled && p.force_adblock));
+        // node-b has ad-block stats but no policy reported yet.
+        assert!(rows[1].adblock.is_some());
+        assert!(rows[1].policy.is_none());
+    }
+
+    #[test]
+    fn project_browser_latest_flush_wins_per_stream() {
+        let adfilter = vec![
+            adfilter_body("node-a", 3, 30, 10),
+            adfilter_body("node-a", 5, 60, 20),
+        ];
+        let rows = project_browser(&adfilter, &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].adblock.as_ref().map(|s| s.enabled_sources),
+            Some(5),
+            "the newer flush wins"
+        );
+    }
+
+    #[test]
+    fn project_browser_surfaces_a_disabled_policy_with_retained_data() {
+        // A lighthouse node with the browser DISABLED — the fleet view must surface
+        // the honest disabled + retained-data state (BOOKMARKS-8 acceptance).
+        let policy = vec![policy_body("peer:lh", "lighthouse", false, true, 1)];
+        let rows = project_browser(&[], &policy);
+        assert_eq!(rows.len(), 1);
+        let p = rows[0].policy.as_ref().expect("policy folded");
+        assert!(!p.browser_enabled);
+        assert!(p.surface_hidden, "a disabled browser hides the surface");
+        assert!(p.local_data_retained, "the disable retains local data");
+    }
+
+    #[test]
+    fn project_browser_skips_malformed_bodies() {
+        let adfilter = vec!["not json".to_string(), "{}".to_string()];
+        let policy = vec![r#"{"unexpected":true}"#.to_string()];
+        assert!(project_browser(&adfilter, &policy).is_empty());
+    }
+
+    #[test]
+    fn staleness_label_tones() {
+        assert_eq!(staleness_label(&Staleness::Fresh).0, Style::OK);
+        assert_eq!(staleness_label(&Staleness::NeverSynced).0, Style::TEXT_DIM);
+        let (tone, text) = staleness_label(&Staleness::Stale {
+            age_ms: 8 * 24 * 60 * 60 * 1000,
+        });
+        assert_eq!(tone, Style::WARN);
+        assert!(text.contains("8d"));
     }
 
     #[test]

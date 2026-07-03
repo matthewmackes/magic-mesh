@@ -101,6 +101,14 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // while still replicating peers' filter-store blobs over Syncthing and, when
     // leader, compiling the shared engine blob.
     ("adfilter", 1),
+    // BOOKMARKS-8 — the mesh-wide browser/ad-blocker POLICY worker. Reads the
+    // Syncthing-synced fleet policy doc, folds it for THIS node's role, and
+    // enforces at the browser launch/spawn seam (refuse-to-spawn on a disallowed
+    // role, inject the forced ad-blocker + URL allowlist + custom lists, reject
+    // out-of-policy navigate / adblock-off actions). A desktop-governance feature,
+    // so Workstation-tier; it idles gracefully on a headless box (no browser, no
+    // action/browser/* requests) while still replicating the policy doc.
+    ("browser_policy", 1),
     // FILEMGR-5 — the Files-surface sshfs mesh-mount worker. A desktop feature
     // (the seated user browses peers), so Workstation-tier; it idles gracefully
     // with no mount requests on a headless box.
@@ -187,6 +195,20 @@ pub fn required_capability(worker: &str) -> Option<Capability> {
         .iter()
         .find(|(n, _)| *n == worker)
         .map(|(_, c)| *c)
+}
+
+/// BOOKMARKS-8 — the canonical role name for a resolved `rank`.
+///
+/// The browser-policy worker folds its per-role fleet policy by this name. An
+/// unknown rank falls back to the top tier, matching the tolerant [`resolve_rank`]
+/// posture.
+#[must_use]
+pub fn role_name(rank: u8) -> &'static str {
+    Role::all()
+        .into_iter()
+        .find(|r| r.rank() == rank)
+        .unwrap_or(Role::Workstation)
+        .as_str()
 }
 
 /// Resolve the deployment rank that gates worker spawns: the pinned role's
@@ -354,7 +376,10 @@ mod tests {
         // +1 adfilter (BOOKMARKS-7 — the mesh-wide ad-blocker worker replicating the
         // filter-store blob + leader-compiling the engine, Workstation-tier: a
         // seated-user desktop feature backing the mde-web-preview browser).
-        assert_eq!(WORKER_TIERS.len(), 37);
+        // +1 browser_policy (BOOKMARKS-8 — the mesh-wide browser/ad-blocker POLICY
+        // worker: reads the synced fleet policy doc + enforces at the browser
+        // launch seam, Workstation-tier: a seated-user desktop-governance feature).
+        assert_eq!(WORKER_TIERS.len(), 38);
     }
 
     #[test]
@@ -382,8 +407,8 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            15,
-            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7)"
+            16,
+            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7)"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
@@ -436,6 +461,16 @@ mod tests {
     }
 
     #[test]
+    fn role_name_maps_each_rank_to_its_canonical_name() {
+        // BOOKMARKS-8 — the browser-policy worker folds its per-role policy by
+        // this name, so it MUST match the role.toml canonical names.
+        assert_eq!(role_name(Role::Lighthouse.rank()), "lighthouse");
+        assert_eq!(role_name(Role::Workstation.rank()), "workstation");
+        // An out-of-range rank falls back to the top tier (tolerant posture).
+        assert_eq!(role_name(9), "workstation");
+    }
+
+    #[test]
     fn unknown_worker_defaults_to_lighthouse() {
         assert_eq!(min_rank("some-future-worker"), 0);
         assert!(runs("some-future-worker", Role::Lighthouse.rank()));
@@ -445,11 +480,11 @@ mod tests {
     fn workers_for_rank_is_a_growing_superset() {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        // 22 lighthouse control-plane workers; Workstation adds the 15 fleet +
-        // desktop workers for the full 37 (the retired Server tier folded into
+        // 22 lighthouse control-plane workers; Workstation adds the 16 fleet +
+        // desktop workers for the full 38 (the retired Server tier folded into
         // Workstation in the 2-role model).
         assert_eq!(lh.len(), 22);
-        assert_eq!(ws.len(), 37);
+        assert_eq!(ws.len(), 38);
         // Strict superset: every lighthouse worker is also in the workstation set.
         assert!(lh.iter().all(|w| ws.contains(w)));
     }
