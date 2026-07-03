@@ -997,6 +997,41 @@ impl SplitTerminal {
         }
     }
 
+    /// The focused pane's widget (TERM-12 pane actions target this).
+    fn focused_widget_mut(&mut self) -> Option<&mut TerminalWidget> {
+        self.sessions.get_mut(&self.focused)
+    }
+
+    /// Begin renaming the focused pane (the `RenamePane` action, TERM-12).
+    pub fn begin_rename_focused(&mut self) {
+        if let Some(w) = self.focused_widget_mut() {
+            w.begin_rename();
+        }
+    }
+
+    /// Toggle watch-for-activity on the focused pane (TERM-12).
+    pub fn toggle_activity_watch_focused(&mut self) {
+        if let Some(w) = self.focused_widget_mut() {
+            w.toggle_activity_watch();
+        }
+    }
+
+    /// Toggle watch-for-silence on the focused pane (TERM-12).
+    pub fn toggle_silence_watch_focused(&mut self) {
+        if let Some(w) = self.focused_widget_mut() {
+            w.toggle_silence_watch();
+        }
+    }
+
+    /// The focused pane's shown title (TERM-12) — used by the tab strip to echo
+    /// the active pane's label.
+    #[must_use]
+    pub fn focused_title(&self) -> Option<&str> {
+        self.sessions
+            .get(&self.focused)
+            .map(TerminalWidget::title_text)
+    }
+
     /// The current broadcast routing mode.
     #[must_use]
     pub const fn broadcast(&self) -> Broadcast {

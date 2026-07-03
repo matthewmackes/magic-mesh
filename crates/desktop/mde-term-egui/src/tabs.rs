@@ -41,6 +41,7 @@ use mde_egui::egui::{
 use mde_egui::Style;
 
 use crate::appearance::{Appearance, AppearancePicker};
+use crate::keymap::{Action, Keymap};
 use crate::layout::SavedLayout;
 use crate::layout_ui::{LayoutIntent, LayoutManager};
 use crate::picker::{RemotePicker, RemoteTarget};
@@ -231,6 +232,9 @@ pub struct TabbedTerminal {
     appearance: Appearance,
     /// The appearance picker overlay that edits [`Self::appearance`] (TERM-11).
     appearance_picker: AppearancePicker,
+    /// The rebindable keymap (TERM-12): the single action table every chord
+    /// resolves through, driving both tab and split commands + the pane actions.
+    keymap: Keymap,
 }
 
 impl TabbedTerminal {
@@ -267,6 +271,7 @@ impl TabbedTerminal {
             layouts: LayoutManager::local(),
             appearance: Appearance::default(),
             appearance_picker: AppearancePicker::new(),
+            keymap: Keymap::default(),
         })
     }
 
@@ -325,6 +330,44 @@ impl TabbedTerminal {
             TabCommand::ToggleRemote => self.remote.picker.toggle(),
             TabCommand::ToggleLayouts => self.layouts.toggle(),
             TabCommand::ToggleAppearance => self.appearance_picker.toggle(),
+        }
+    }
+
+    /// The rebindable keymap (TERM-12) — the shell reads it to render a settings
+    /// pane and rebinds through [`Self::keymap_mut`].
+    #[must_use]
+    pub const fn keymap(&self) -> &Keymap {
+        &self.keymap
+    }
+
+    /// Mutable access to the keymap, for rebinding / applying a config override.
+    pub const fn keymap_mut(&mut self) -> &mut Keymap {
+        &mut self.keymap
+    }
+
+    /// Decode this frame's chords through the rebindable [`Keymap`] and apply
+    /// each resolved [`Action`] — tab commands to the surface, split commands to
+    /// the active tab, and the TERM-12 pane actions to the active tab's focused
+    /// pane. Replaces the old hardcoded `consume_tab_commands` +
+    /// `consume_commands` ladders in the binary's update loop (§6: the same
+    /// `consume_key` decode, now table-driven).
+    pub fn dispatch_keys(&mut self, ctx: &Context) {
+        for action in self.keymap.consume(ctx) {
+            if let Some(tab_cmd) = action.as_tab_command() {
+                self.apply_tab(tab_cmd);
+            } else if let Some(cmd) = action.as_command() {
+                if let Some(active) = self.active_mut() {
+                    active.apply(cmd);
+                }
+            } else if let Some(active) = self.active_mut() {
+                // The TERM-12 pane actions have no legacy enum.
+                match action {
+                    Action::RenamePane => active.begin_rename_focused(),
+                    Action::ToggleActivityWatch => active.toggle_activity_watch_focused(),
+                    Action::ToggleSilenceWatch => active.toggle_silence_watch_focused(),
+                    _ => {}
+                }
+            }
         }
     }
 

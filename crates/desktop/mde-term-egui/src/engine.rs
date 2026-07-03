@@ -8,6 +8,8 @@
 //! motion, clears, wrapping, tab stops, scroll-off into history — is handled by
 //! the mature engine; this module only bridges its grid to [`crate::screen`].
 
+use std::sync::{Arc, Mutex, PoisonError};
+
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
@@ -23,16 +25,44 @@ use crate::screen::{Cell, CellAttrs, CellColor, CursorPos, Screen};
 /// unbounded in practice, bounded so a runaway `yes` can't exhaust memory.
 pub const DEFAULT_SCROLLBACK: usize = 100_000;
 
-/// An `alacritty_terminal` event listener that drops every event.
+/// A window-facing event the engine surfaced while parsing.
 ///
-/// The headless core has no window to react to (title/bell/clipboard events are
-/// wired by later TERM units through their own sink); a listener that ignores
-/// events is the complete, correct behaviour here — not a stub.
-#[derive(Clone, Copy, Default)]
-struct EventSink;
+/// The small subset TERM-12 acts on (per-pane titles + the bell) — a local
+/// mirror of the alacritty `Event`s we care about, so callers never depend on
+/// the engine crate's enum.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TermEvent {
+    /// The running program set the terminal title (OSC 0/2) — the auto-derived
+    /// pane title (TERM-12).
+    Title(String),
+    /// The running program reset the title to its default.
+    ResetTitle,
+    /// The terminal rang the bell (`BEL`, `0x07`).
+    Bell,
+}
+
+/// An `alacritty_terminal` event listener that records the [`TermEvent`]s
+/// TERM-12 consumes (title + bell) into a shared queue the owning [`Terminal`]
+/// drains each frame; every other engine event is ignored (there is no window
+/// here to service clipboard/resize/wakeup requests).
+#[derive(Clone, Default)]
+struct EventSink {
+    events: Arc<Mutex<Vec<TermEvent>>>,
+}
 
 impl EventListener for EventSink {
-    fn send_event(&self, _event: Event) {}
+    fn send_event(&self, event: Event) {
+        let mapped = match event {
+            Event::Title(title) => TermEvent::Title(title),
+            Event::ResetTitle => TermEvent::ResetTitle,
+            Event::Bell => TermEvent::Bell,
+            _ => return,
+        };
+        self.events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(mapped);
+    }
 }
 
 /// A minimal [`Dimensions`] carrier for `Term::new`/`Term::resize`.
@@ -63,6 +93,11 @@ impl Dimensions for GridDims {
 pub struct Terminal {
     term: Term<EventSink>,
     parser: Processor,
+    /// The event queue the [`EventSink`] fills (title/bell), drained per frame.
+    events: Arc<Mutex<Vec<TermEvent>>>,
+    /// Monotonic count of bytes fed — the activity/silence watcher (TERM-12)
+    /// samples this to tell "new output this frame" apart from a quiet pane.
+    bytes_seen: u64,
 }
 
 impl Terminal {
@@ -79,10 +114,19 @@ impl Terminal {
             columns: cols.max(1),
             screen_lines: rows.max(1),
         };
-        let term = Term::new(config, &dims, EventSink);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let term = Term::new(
+            config,
+            &dims,
+            EventSink {
+                events: Arc::clone(&events),
+            },
+        );
         Self {
             term,
             parser: Processor::new(),
+            events,
+            bytes_seen: 0,
         }
     }
 
@@ -94,9 +138,24 @@ impl Terminal {
 
     /// Feed a run of PTY bytes through the ANSI/xterm parser, updating the grid.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.bytes_seen = self.bytes_seen.wrapping_add(bytes.len() as u64);
         for &byte in bytes {
             self.parser.advance(&mut self.term, byte);
         }
+    }
+
+    /// Drain the window events (title/bell) the parser surfaced since the last
+    /// drain — the TERM-12 pane chrome reads these each frame.
+    #[must_use]
+    pub fn drain_events(&self) -> Vec<TermEvent> {
+        std::mem::take(&mut *self.events.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// The monotonic count of bytes fed into the engine — the activity/silence
+    /// watcher (TERM-12) folds the delta between frames.
+    #[must_use]
+    pub const fn bytes_seen(&self) -> u64 {
+        self.bytes_seen
     }
 
     /// Resize the visible grid to `cols × rows` (clamped to at least `1×1`).
@@ -268,6 +327,32 @@ mod tests {
         assert_eq!(ch(&s, 0, 0), 'h');
         assert_eq!(ch(&s, 0, 1), 'i');
         assert_eq!(s.cursor(), CursorPos { row: 0, col: 2 });
+    }
+
+    #[test]
+    fn an_osc_title_and_a_bel_surface_as_drainable_events() {
+        let mut term = Terminal::with_default_scrollback(20, 5);
+        let before = term.bytes_seen();
+        // OSC 0 sets the title (BEL-terminated); the terminator BEL is not a bell.
+        term.feed(b"\x1b]0;deploy\x07");
+        assert!(
+            term.bytes_seen() > before,
+            "feeding advanced the byte counter"
+        );
+        // A lone BEL rings.
+        term.feed(b"\x07");
+
+        let events = term.drain_events();
+        assert!(
+            events.contains(&TermEvent::Title("deploy".to_owned())),
+            "the running command's title was captured: {events:?}"
+        );
+        assert!(
+            events.contains(&TermEvent::Bell),
+            "the lone BEL was captured: {events:?}"
+        );
+        // Draining is one-shot.
+        assert!(term.drain_events().is_empty());
     }
 
     #[test]

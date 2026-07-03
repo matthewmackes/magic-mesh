@@ -36,6 +36,9 @@ use mde_egui::egui::{
 use mde_egui::Style;
 
 use crate::appearance::{Appearance, CursorShape};
+use crate::bell::{Bell, BellConfig};
+use crate::engine::TermEvent;
+use crate::notify::{BusNotifyClient, NoticeLevel, NotifyBus, TermNotice};
 use crate::palette::{self, Palette};
 use crate::pty::LocalPty;
 use crate::remote::RemotePty;
@@ -43,6 +46,8 @@ use crate::screen::{Cell, Screen};
 use crate::search::Search;
 use crate::session::Session;
 use crate::smart::{self, BusLaunchClient, LaunchBus};
+use crate::title::PaneTitle;
+use crate::watch::{ActivityWatch, WatchEvent, WatchMode};
 
 /// Repaint cadence while the session is live. PTY output arrives on the pump
 /// thread with no egui waker, so the surface heartbeats at ~30 fps and stops
@@ -51,6 +56,13 @@ const LIVE_REPAINT: Duration = Duration::from_millis(33);
 
 /// Cursor blink half-period in seconds (the classic ~500 ms phase).
 const BLINK_HALF_PERIOD: f64 = 0.5;
+
+/// Height of the per-pane title strip (TERM-12) — a compact caption bar above
+/// the grid (`SMALL` type padded on the 4px half-step).
+const TITLE_STRIP_H: f32 = Style::SMALL + Style::SP_XS * 2.0;
+
+/// Peak opacity (0–255) of the visual-bell flash overlay at the ring instant.
+const BELL_FLASH_PEAK: f32 = 90.0;
 
 /// A cell address in **absolute snapshot space**: `row` counts from the top of
 /// the retained scrollback (row `history` is the first live viewport row).
@@ -214,6 +226,18 @@ pub struct TerminalWidget {
     /// The Bus seam a Ctrl-clicked URL/path is dispatched over (TERM-9): the
     /// mesh surface-launch path. Injectable so tests record it.
     launch_bus: Arc<dyn LaunchBus>,
+    /// The pane's title (TERM-12): auto-derived from the running command's OSC
+    /// title, user-overridable via rename, shown in the pane's chrome strip.
+    title: PaneTitle,
+    /// The activity/silence watcher (TERM-12): per-pane toggles that fire a
+    /// notice through the [`Self::notify_bus`] seam on the matching output edge.
+    watch: ActivityWatch,
+    /// The configurable bell (TERM-12): visual flash and/or an audible notice on
+    /// the terminal `BEL`.
+    bell: Bell,
+    /// The notification Bus seam (TERM-12) the watcher + audible bell publish
+    /// over — a desktop toast. Injectable so tests record it.
+    notify_bus: Arc<dyn NotifyBus>,
 }
 
 impl TerminalWidget {
@@ -251,6 +275,10 @@ impl TerminalWidget {
             clip: ClipboardOptions::default(),
             primary: None,
             launch_bus: Arc::new(BusLaunchClient::from_env()),
+            title: PaneTitle::new("shell"),
+            watch: ActivityWatch::default(),
+            bell: Bell::default(),
+            notify_bus: Arc::new(BusNotifyClient::from_env()),
         }
     }
 
@@ -308,6 +336,72 @@ impl TerminalWidget {
         self
     }
 
+    /// Inject the notification Bus seam (TERM-12) — tests record the raised
+    /// notices; production resolves the live Bus via [`Self::over`].
+    #[must_use]
+    pub fn with_notify_bus(mut self, bus: Arc<dyn NotifyBus>) -> Self {
+        self.notify_bus = bus;
+        self
+    }
+
+    /// Seed the pane's fallback title (its stable ordinal), shown until the
+    /// running command sets its own OSC title (TERM-12).
+    #[must_use]
+    pub fn with_title_fallback(mut self, fallback: impl Into<String>) -> Self {
+        self.title = PaneTitle::new(fallback);
+        self
+    }
+
+    /// This pane's title (TERM-12) — its shown label + override/edit state.
+    #[must_use]
+    pub const fn pane_title(&self) -> &PaneTitle {
+        &self.title
+    }
+
+    /// The pane's shown title text (override → derived → fallback).
+    #[must_use]
+    pub fn title_text(&self) -> &str {
+        self.title.display()
+    }
+
+    /// Begin renaming this pane (the `RenamePane` action / a title-strip click).
+    pub fn begin_rename(&mut self) {
+        self.title.begin_edit();
+    }
+
+    /// Set the pane's title override outright — a programmatic rename (an empty
+    /// name reverts to the derived/fallback title).
+    pub fn set_title_override(&mut self, name: impl Into<String>) {
+        self.title.set_override(name);
+    }
+
+    /// This pane's activity/silence watch state (TERM-12).
+    #[must_use]
+    pub const fn watch(&self) -> ActivityWatch {
+        self.watch
+    }
+
+    /// Toggle watch-for-activity on this pane (the `ToggleActivityWatch` action).
+    pub fn toggle_activity_watch(&mut self) {
+        self.watch.toggle(WatchMode::Activity);
+    }
+
+    /// Toggle watch-for-silence on this pane (the `ToggleSilenceWatch` action).
+    pub fn toggle_silence_watch(&mut self) {
+        self.watch.toggle(WatchMode::Silence);
+    }
+
+    /// This pane's bell configuration (TERM-12).
+    #[must_use]
+    pub const fn bell_config(&self) -> BellConfig {
+        self.bell.config()
+    }
+
+    /// Set this pane's bell style (visual / audible / off).
+    pub const fn set_bell_config(&mut self, config: BellConfig) {
+        self.bell.set_config(config);
+    }
+
     /// Whether the pane should reap (close) — a local child exit, or a remote
     /// clean shell exit (a remote failure lingers). The split multiplexer's
     /// close-on-exit (TERM-4) reads this.
@@ -358,9 +452,27 @@ impl TerminalWidget {
         self.session.poll();
         // One frame of local input only: last frame's broadcast echo is spent.
         self.input_echo.clear();
+        let now = ui.input(|i| i.time);
+        // TERM-12: fold the engine's title/bell events + the activity/silence
+        // watcher into pane state (raising any due notices) before rendering.
+        self.pump_pane_events(now);
+
         let font_id = FontId::monospace(self.font_size);
         let cell = ui.fonts(|f| Vec2::new(f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+
+        // Carve the pane into a TERM-12 title strip and the grid below it.
+        let area = ui.available_rect_before_wrap();
+        let strip_h = TITLE_STRIP_H.min(area.height());
+        let strip_rect = Rect::from_min_size(area.min, Vec2::new(area.width(), strip_h));
+        let rect = Rect::from_min_max(Pos2::new(area.min.x, area.min.y + strip_h), area.max);
+        self.show_title_strip(ui, strip_rect);
+
+        let response = ui.allocate_rect(rect, Sense::click_and_drag());
+        // A rename in progress holds the keyboard on this pane (so its shell —
+        // and any other pane — doesn't also see the typed name, TERM-12).
+        if self.title.is_editing() {
+            response.request_focus();
+        }
         let (cols, rows) = grid_size(rect.size(), cell);
 
         // A changed rect maps to a new grid: engine reflow + a resize to the
@@ -436,10 +548,157 @@ impl TerminalWidget {
             },
         );
 
+        // TERM-12 visual bell: a brief translucent flash over the pane that
+        // decays over `bell::FLASH_SECS`.
+        let flash = self.bell.flash_alpha(now);
+        if flash > 0.0 {
+            // `flash * peak` is bounded to 0..255 by the clamp, so the cast is exact.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let alpha = (flash * BELL_FLASH_PEAK).clamp(0.0, 255.0) as u8;
+            ui.painter_at(rect)
+                .rect_filled(rect, 0.0, egui::Color32::from_white_alpha(alpha));
+        }
+
         if live {
+            ui.ctx().request_repaint_after(LIVE_REPAINT);
+        } else if self.bell.is_flashing(now) || self.watch.is_active() {
+            // Keep frames coming for the flash decay + the silence timer even
+            // when the shell itself is idle.
             ui.ctx().request_repaint_after(LIVE_REPAINT);
         }
         response
+    }
+
+    /// Fold this frame's engine title/bell events + the activity/silence
+    /// watcher into pane state, raising any due notices through the notify seam.
+    /// `now` is the egui frame clock (seconds).
+    fn pump_pane_events(&mut self, now: f64) {
+        // One engine read for both the drained events and the output counter.
+        let (events, seq) = self
+            .session
+            .with_terminal(|t| (t.drain_events(), t.bytes_seen()));
+        for event in events {
+            match event {
+                TermEvent::Title(title) => self.title.set_derived(title),
+                TermEvent::ResetTitle => self.title.reset_derived(),
+                TermEvent::Bell => self.ring_bell(now),
+            }
+        }
+        self.tick_watch(seq, now);
+    }
+
+    /// Fold a terminal `BEL` at frame time `now`: start the visual flash (if the
+    /// bell is visual) and publish an audible notice (if audible), per the pane's
+    /// [`BellConfig`]. Split out so the config wiring is unit-testable.
+    fn ring_bell(&mut self, now: f64) {
+        let effect = self.bell.ring(now);
+        if effect.notify {
+            self.raise_notice(
+                NoticeLevel::Warning,
+                format!("bell \u{2014} {}", self.title.display()),
+            );
+        }
+    }
+
+    /// Fold one watcher observation and publish a notice on an edge. Split out so
+    /// the wiring is unit-testable with a synthetic output counter + clock.
+    fn tick_watch(&mut self, seq: u64, now: f64) -> Option<WatchEvent> {
+        let edge = self.watch.observe(seq, now)?;
+        let what = match edge {
+            WatchEvent::Activity => "activity",
+            WatchEvent::Silence => "silence",
+        };
+        self.raise_notice(
+            NoticeLevel::Info,
+            format!("{what} \u{2014} {}", self.title.display()),
+        );
+        Some(edge)
+    }
+
+    /// Publish a desktop notice through the shared notify seam (best-effort — a
+    /// no-Bus node degrades to a silently dropped notice, never a panic/hang).
+    fn raise_notice(&self, level: NoticeLevel, headline: String) {
+        let _ = self.notify_bus.notify(&TermNotice::new(
+            level,
+            crate::layout::local_node(),
+            headline,
+        ));
+    }
+
+    /// The per-pane title strip (TERM-12): the shown title (or the live rename
+    /// buffer) on the left, the watch badge on the right. A click begins a
+    /// rename. All chrome resolves through `Style` tokens (§4).
+    fn show_title_strip(&mut self, ui: &Ui, rect: Rect) {
+        let resp = ui.interact(rect, ui.id().with("term-title"), Sense::click());
+        if resp.clicked() && !self.title.is_editing() {
+            self.title.begin_edit();
+        }
+
+        let painter = ui.painter_at(rect);
+        let editing = self.title.is_editing();
+        let bg = if editing {
+            Style::SURFACE_HI
+        } else {
+            Style::SURFACE
+        };
+        painter.rect_filled(rect, 0.0, bg);
+        painter.hline(rect.x_range(), rect.max.y, Stroke::new(1.0, Style::BORDER));
+
+        let font = FontId::proportional(Style::SMALL);
+        let (text, color) = if editing {
+            (
+                format!("{}\u{2502}", self.title.edit_buffer().unwrap_or_default()),
+                Style::TEXT,
+            )
+        } else if self.title.is_overridden() {
+            (self.title.display().to_owned(), Style::TEXT)
+        } else {
+            (self.title.display().to_owned(), Style::TEXT_DIM)
+        };
+        painter.text(
+            Pos2::new(rect.min.x + Style::SP_XS, rect.center().y),
+            Align2::LEFT_CENTER,
+            text,
+            font.clone(),
+            color,
+        );
+
+        // Right-aligned watch badge, when a watch is armed.
+        if let Some((label, tone)) = watch_badge(self.watch.mode()) {
+            let galley = painter.layout_no_wrap(label.to_owned(), font, tone);
+            let x = rect.max.x - Style::SP_XS - galley.size().x;
+            painter.galley(
+                Pos2::new(x, rect.center().y - galley.size().y / 2.0),
+                galley,
+                tone,
+            );
+        }
+    }
+
+    /// Drive an in-progress rename from one event (the `search_event` idiom):
+    /// type into the buffer, backspace, commit (Enter) or cancel (Escape).
+    /// Anything else is swallowed so it never reaches the shell mid-rename.
+    fn rename_event(&mut self, event: &Event) {
+        match event {
+            Event::Text(text) => {
+                if let Some(buf) = self.title.edit_buffer_mut() {
+                    buf.extend(text.chars().filter(|c| !c.is_control()));
+                }
+            }
+            Event::Key {
+                key, pressed: true, ..
+            } => match key {
+                Key::Backspace => {
+                    if let Some(buf) = self.title.edit_buffer_mut() {
+                        buf.pop();
+                    }
+                }
+                Key::Enter => self.title.commit_edit(),
+                Key::Escape => self.title.cancel_edit(),
+                _ => {}
+            },
+            _ => {}
+        }
     }
 
     /// Keyboard + clipboard + wheel, from this frame's event stream.
@@ -483,6 +742,12 @@ impl TerminalWidget {
                 if response.hovered() {
                     self.wheel(*unit, delta.y, cell.y, rows, history);
                 }
+                continue;
+            }
+            // A rename in progress (TERM-12) captures the keyboard — typed keys
+            // edit the pane title and never reach the shell.
+            if self.title.is_editing() {
+                self.rename_event(&event);
                 continue;
             }
             if !focused {
@@ -855,6 +1120,17 @@ impl TerminalWidget {
     /// so a fan-out can never re-fan.
     pub fn feed_broadcast(&mut self, bytes: &[u8]) {
         self.write_input(bytes);
+    }
+}
+
+/// The right-aligned title-strip badge for a pane's watch mode (TERM-12), or
+/// `None` when unwatched. `Style` tokens (§4): accent for activity, warn for
+/// silence.
+const fn watch_badge(mode: WatchMode) -> Option<(&'static str, egui::Color32)> {
+    match mode {
+        WatchMode::Off => None,
+        WatchMode::Activity => Some(("watch: activity", Style::ACCENT)),
+        WatchMode::Silence => Some(("watch: silence", Style::WARN)),
     }
 }
 
@@ -1790,6 +2066,124 @@ mod tests {
                 u16::try_from(rows).expect("rows")
             ))
         );
+    }
+
+    // ── TERM-12: per-pane title, watch → notify, bell → notify ──────────────
+
+    /// A notify seam that records every raised notice (the recorder half of the
+    /// injectable [`NotifyBus`], mirroring the launch-bus recorder idiom).
+    #[derive(Default)]
+    struct RecordingNotifier {
+        notices: std::sync::Mutex<Vec<TermNotice>>,
+    }
+
+    impl NotifyBus for RecordingNotifier {
+        fn notify(&self, notice: &TermNotice) -> Result<(), String> {
+            self.notices
+                .lock()
+                .expect("notices lock")
+                .push(notice.clone());
+            Ok(())
+        }
+    }
+
+    /// A headless widget over a remote pane with no Bus — no shell spawn, no
+    /// threads. The activity watcher is driven with a synthetic output counter,
+    /// so the backing produces nothing itself.
+    fn headless_widget() -> TerminalWidget {
+        let bus: Arc<dyn crate::remote::PtyBus> =
+            Arc::new(crate::remote::BusPtyClient::with_root(None));
+        let remote = RemotePty::open(bus, "oak", "oak", 80, 24);
+        TerminalWidget::new_remote(remote)
+    }
+
+    fn key_press(key: Key) -> Event {
+        Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_pane_title_derives_from_the_command_and_takes_a_rename() {
+        let mut w = headless_widget();
+        assert_eq!(w.title_text(), "shell"); // the fallback ordinal
+                                             // The running command's OSC title becomes the shown title.
+        w.title.set_derived("vim README");
+        assert_eq!(w.title_text(), "vim README");
+
+        // A rename via the in-widget edit idiom (Text appends, Enter commits).
+        w.begin_rename(); // seeds the buffer with the display
+        w.rename_event(&Event::Text("!".to_owned()));
+        w.rename_event(&key_press(Key::Enter));
+        assert_eq!(w.title_text(), "vim README!");
+        assert!(w.pane_title().is_overridden());
+
+        // Escape abandons a rename, leaving the title untouched.
+        w.begin_rename();
+        w.rename_event(&Event::Text("junk".to_owned()));
+        w.rename_event(&key_press(Key::Escape));
+        assert_eq!(w.title_text(), "vim README!");
+    }
+
+    #[test]
+    fn a_silence_watch_publishes_one_notice_through_the_seam() {
+        let rec = Arc::new(RecordingNotifier::default());
+        let mut w = headless_widget().with_notify_bus(rec.clone());
+        w.toggle_silence_watch();
+        assert_eq!(w.watch().mode(), WatchMode::Silence);
+
+        // Baseline at t=0, then cross the (default 10s) window with no output.
+        assert_eq!(w.tick_watch(0, 0.0), None);
+        assert_eq!(w.tick_watch(0, 100.0), Some(WatchEvent::Silence));
+        // It does not re-fire while it stays quiet.
+        assert_eq!(w.tick_watch(0, 200.0), None);
+
+        let notices = rec.notices.lock().expect("lock").clone();
+        assert_eq!(notices.len(), 1, "one silence notice");
+        assert!(
+            notices[0].headline.contains("silence"),
+            "headline: {}",
+            notices[0].headline
+        );
+        assert_eq!(notices[0].level, NoticeLevel::Info);
+    }
+
+    #[test]
+    fn an_activity_watch_publishes_on_output_after_quiet() {
+        let rec = Arc::new(RecordingNotifier::default());
+        let mut w = headless_widget().with_notify_bus(rec.clone());
+        w.toggle_activity_watch();
+
+        assert_eq!(w.tick_watch(0, 0.0), None); // baseline
+                                                // Output after > 10s of quiet fires activity.
+        assert_eq!(w.tick_watch(50, 30.0), Some(WatchEvent::Activity));
+        // Continuous output does not re-fire.
+        assert_eq!(w.tick_watch(60, 30.5), None);
+        assert_eq!(rec.notices.lock().expect("lock").len(), 1);
+    }
+
+    #[test]
+    fn an_audible_bell_publishes_but_a_visual_one_does_not() {
+        let rec = Arc::new(RecordingNotifier::default());
+        let mut w = headless_widget().with_notify_bus(rec.clone());
+
+        // Visual-only (the default): a flash, no notice.
+        w.set_bell_config(BellConfig::visual_only());
+        w.ring_bell(1.0);
+        assert!(rec.notices.lock().expect("lock").is_empty());
+        assert!(w.bell.is_flashing(1.0));
+
+        // Audible: a notice on the seam.
+        w.set_bell_config(BellConfig::audible_only());
+        w.ring_bell(2.0);
+        let notices = rec.notices.lock().expect("lock").clone();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].headline.contains("bell"));
+        assert_eq!(notices[0].level, NoticeLevel::Warning);
     }
 
     #[test]

@@ -29,7 +29,7 @@
 //! (capture + rebuild + the synced store) all lives in [`TabbedTerminal`].
 
 use mde_egui::{eframe, egui, run_client, Style};
-use mde_term_egui::{consume_commands, consume_tab_commands, SpawnOptions, TabbedTerminal};
+use mde_term_egui::{SpawnOptions, TabbedTerminal};
 
 /// The Terminal surface app: a tabbed split-pane terminal filling the window —
 /// or the honest spawn error if the OS refused the first PTY.
@@ -52,17 +52,10 @@ impl TermApp {
 impl eframe::App for TermApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Ok(term) = &mut self.term {
-            // Tab chords first, then the active tab's split chords — both
-            // consumed before the panes read input this frame.
-            for tcmd in consume_tab_commands(ctx) {
-                term.apply_tab(tcmd);
-            }
-            let split_cmds = consume_commands(ctx);
-            if let Some(active) = term.active_mut() {
-                for cmd in split_cmds {
-                    active.apply(cmd);
-                }
-            }
+            // One rebindable table (TERM-12) decodes every chord — tab + split
+            // commands and the pane actions — before the panes read input this
+            // frame, so a chord never doubles as shell input.
+            term.dispatch_keys(ctx);
         }
         // Full-bleed: the tab bar caps the window, the active split tree owns
         // the rest, so the rect → cols/rows mapping is the window size (no

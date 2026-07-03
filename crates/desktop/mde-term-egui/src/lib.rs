@@ -91,9 +91,12 @@
 //!   into every pane each frame, so a change reaches every live shell at once.
 
 pub mod appearance;
+pub mod bell;
 pub mod engine;
+pub mod keymap;
 pub mod layout;
 pub mod layout_ui;
+pub mod notify;
 pub mod palette;
 pub mod picker;
 pub mod presets;
@@ -106,12 +109,17 @@ pub mod session;
 pub mod smart;
 pub mod splits;
 pub mod tabs;
+pub mod title;
+pub mod watch;
 pub mod widget;
 
 pub use appearance::{Appearance, AppearancePicker, CursorShape};
-pub use engine::{Terminal, DEFAULT_SCROLLBACK};
+pub use bell::{Bell, BellConfig, BellEffect};
+pub use engine::{TermEvent, Terminal, DEFAULT_SCROLLBACK};
+pub use keymap::{Action, Chord, Keymap, KeymapConfig};
 pub use layout::{LayoutPane, LayoutStore, LayoutTab, PaneSpec, SavedLayout};
 pub use layout_ui::{LayoutIntent, LayoutManager};
+pub use notify::{BusNotifyClient, NoticeLevel, NotifyBus, TermNotice, TOAST_TOPIC};
 pub use palette::Palette;
 pub use picker::{RemotePicker, RemoteTarget};
 pub use presets::Preset;
@@ -129,4 +137,6 @@ pub use splits::{
     consume_commands, Broadcast, Command, NavDir, Pane, SessionId, SplitDir, SplitTerminal,
 };
 pub use tabs::{consume_tab_commands, RemoteHub, TabCommand, TabbedTerminal};
+pub use title::PaneTitle;
+pub use watch::{ActivityWatch, WatchEvent, WatchMode};
 pub use widget::{ClipboardOptions, TerminalWidget};
