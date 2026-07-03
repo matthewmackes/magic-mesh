@@ -36,7 +36,9 @@ use mde_egui::Style;
 
 use crate::palette;
 use crate::pty::LocalPty;
+use crate::remote::RemotePty;
 use crate::screen::{Cell, Screen};
+use crate::session::Session;
 
 /// Repaint cadence while the session is live. PTY output arrives on the pump
 /// thread with no egui waker, so the surface heartbeats at ~30 fps and stops
@@ -112,14 +114,19 @@ struct PaintSpec {
     cursor: CursorPaint,
     /// Lines currently scrolled back (paints the position chip when > 0).
     scrolled: usize,
-    /// The child exited — paint the honest session-ended chip.
-    ended: bool,
+    /// A node marker for a remote pane (`None` for a local one) — the pane is
+    /// visually marked with the mesh node its shell runs on (TERM-8).
+    node: Option<String>,
+    /// An honest status chip (text + colour): a local "session ended", or a
+    /// remote connecting / reconnecting / ended / failed note (§7).
+    note: Option<(String, egui::Color32)>,
 }
 
-/// The interactive terminal pane: one [`LocalPty`] session rendered as an
-/// egui widget. See the module docs for the frame anatomy.
+/// The interactive terminal pane: one [`Session`] (a local PTY shell or a remote
+/// mesh shell) rendered as an egui widget. See the module docs for the frame
+/// anatomy.
 pub struct TerminalWidget {
-    pty: LocalPty,
+    session: Session,
     font_size: f32,
     cursor_blink: bool,
     /// Lines scrolled back into history; `0` = live.
@@ -136,12 +143,25 @@ pub struct TerminalWidget {
 }
 
 impl TerminalWidget {
-    /// Wrap a spawned session. The widget sizes the PTY to its rect on the
+    /// Wrap a spawned local shell. The widget sizes the PTY to its rect on the
     /// first frame, so the spawn dimensions only cover the gap until then.
     #[must_use]
     pub const fn new(pty: LocalPty) -> Self {
+        Self::over(Session::Local(pty))
+    }
+
+    /// Wrap a remote mesh shell (TERM-8), driven over the broker. The widget
+    /// resizes it to its rect on the first frame exactly as it does a local one.
+    #[must_use]
+    pub fn new_remote(remote: RemotePty) -> Self {
+        Self::over(Session::Remote(Box::new(remote)))
+    }
+
+    /// Wrap either backing behind the shared render/input path.
+    #[must_use]
+    const fn over(session: Session) -> Self {
         Self {
-            pty,
+            session,
             font_size: Style::BODY,
             cursor_blink: true,
             scroll_offset: 0,
@@ -166,15 +186,33 @@ impl TerminalWidget {
         self
     }
 
-    /// The underlying session (splits/broadcast in TERM-4/6 route through it).
+    /// Whether the pane should reap (close) — a local child exit, or a remote
+    /// clean shell exit (a remote failure lingers). The split multiplexer's
+    /// close-on-exit (TERM-4) reads this.
     #[must_use]
-    pub const fn pty(&self) -> &LocalPty {
-        &self.pty
+    pub fn is_output_closed(&self) -> bool {
+        self.session.is_output_closed()
+    }
+
+    /// Run `f` against this pane's engine state (tests + the splits registry read
+    /// the grid through it).
+    pub fn with_terminal<R>(&self, f: impl FnOnce(&crate::engine::Terminal) -> R) -> R {
+        self.session.with_terminal(f)
+    }
+
+    /// The local PTY when this pane is a local shell (the reap / child-pid tests
+    /// read through it); `None` for a remote pane.
+    #[must_use]
+    pub const fn local_pty(&self) -> Option<&LocalPty> {
+        self.session.local()
     }
 
     /// Render one frame into `ui`, consuming this frame's input. Fills all
     /// available space.
     pub fn show(&mut self, ui: &mut Ui) -> Response {
+        // Drain any pending backing work first (a remote pane reads its Bus state
+        // log; a local pane pumps on its own threads, so this is a no-op there).
+        self.session.poll();
         // One frame of local input only: last frame's broadcast echo is spent.
         self.input_echo.clear();
         let font_id = FontId::monospace(self.font_size);
@@ -182,28 +220,31 @@ impl TerminalWidget {
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let (cols, rows) = grid_size(rect.size(), cell);
 
-        // A changed rect maps to a new grid: engine reflow + TIOCSWINSZ.
+        // A changed rect maps to a new grid: engine reflow + a resize to the
+        // backing (TIOCSWINSZ locally, a `pty/resize` verb remotely).
         if self.last_grid != Some((cols, rows)) {
-            self.pty.resize(cols, rows);
+            self.session.resize(cols, rows);
             self.last_grid = Some((cols, rows));
         }
 
         // Input first, so a scroll/snap lands in this frame's snapshot.
         let history = self
-            .pty
+            .session
             .with_terminal(crate::engine::Terminal::scrollback_len);
         self.handle_input(ui, &response, cell, usize::from(rows), history);
         self.scroll_offset = self.scroll_offset.min(history);
 
-        // One engine lock for the visible window (O(rows × cols), never the
+        // One engine read for the visible window (O(rows × cols), never the
         // full history).
-        let screen = self.pty.with_terminal(|t| t.window(self.scroll_offset));
+        let screen = self.session.with_terminal(|t| t.window(self.scroll_offset));
         let first_abs = history - self.scroll_offset;
 
         self.handle_pointer(&response, rect, cell, first_abs, &screen);
 
-        let ended = self.pty.is_output_closed();
-        let cursor = if ended || self.scroll_offset > 0 {
+        // The backing's render chrome: liveness (cursor + repaint), the node
+        // marker (remote), and the honest status note (§7).
+        let render = self.session.render_state();
+        let cursor = if !render.live || self.scroll_offset > 0 {
             CursorPaint::Hidden
         } else if !response.has_focus() {
             CursorPaint::Hollow
@@ -213,6 +254,7 @@ impl TerminalWidget {
             CursorPaint::Hidden
         };
 
+        let live = render.live;
         paint_grid(
             &ui.painter_at(rect),
             rect,
@@ -224,11 +266,12 @@ impl TerminalWidget {
                 selection: self.selection,
                 cursor,
                 scrolled: self.scroll_offset,
-                ended,
+                node: render.node,
+                note: render.note,
             },
         );
 
-        if !ended {
+        if live {
             ui.ctx().request_repaint_after(LIVE_REPAINT);
         }
         response
@@ -248,7 +291,7 @@ impl TerminalWidget {
         }
         // A lone terminal grabs the keyboard at launch (TERM-4's split panes
         // manage focus explicitly; here "nothing focused" means us).
-        if ui.memory(|m| m.focused().is_none()) && !self.pty.is_output_closed() {
+        if ui.memory(|m| m.focused().is_none()) && !self.session.is_output_closed() {
             response.request_focus();
         }
 
@@ -405,7 +448,9 @@ impl TerminalWidget {
     fn copy_selection(&self, ctx: &Context) {
         if let Some(sel) = self.selection {
             // One-shot full snapshot: the selection may live in history.
-            let text = self.pty.with_terminal(|t| selected_text(&t.full(), &sel));
+            let text = self
+                .session
+                .with_terminal(|t| selected_text(&t.full(), &sel));
             if !text.is_empty() {
                 ctx.copy_text(text);
             }
@@ -428,7 +473,7 @@ impl TerminalWidget {
     fn write_input(&mut self, bytes: &[u8]) {
         self.scroll_offset = 0;
         self.scroll_accum = 0.0;
-        let _ = self.pty.send_input(bytes);
+        let _ = self.session.send_input(bytes);
     }
 
     /// Take this frame's locally-typed bytes for broadcast fan-out. The pane
@@ -709,7 +754,17 @@ fn paint_grid(painter: &egui::Painter, rect: Rect, screen: &Screen, spec: &Paint
 
     paint_cursor(painter, rect.min, screen, spec);
 
-    // Chrome chips (pure Style tokens): scrollback position + session end.
+    // Chrome chips (pure Style tokens): the node marker (remote pane), the
+    // scrollback position, and the honest status note.
+    if let Some(node) = &spec.node {
+        chip(
+            painter,
+            Pos2::new(rect.min.x + Style::SP_S, rect.min.y + Style::SP_S),
+            Align2::LEFT_TOP,
+            &format!("\u{2325} {node}"),
+            Style::ACCENT,
+        );
+    }
     if spec.scrolled > 0 {
         chip(
             painter,
@@ -719,14 +774,8 @@ fn paint_grid(painter: &egui::Painter, rect: Rect, screen: &Screen, spec: &Paint
             Style::TEXT_DIM,
         );
     }
-    if spec.ended {
-        chip(
-            painter,
-            rect.center(),
-            Align2::CENTER_CENTER,
-            "session ended",
-            Style::TEXT_DIM,
-        );
+    if let Some((text, color)) = &spec.note {
+        chip(painter, rect.center(), Align2::CENTER_CENTER, text, *color);
     }
 }
 
@@ -1025,7 +1074,8 @@ mod tests {
             selection: None,
             cursor: CursorPaint::Block,
             scrolled: 0,
-            ended: false,
+            node: None,
+            note: None,
         }
     }
 
@@ -1070,7 +1120,8 @@ mod tests {
             selection: Some(sel((0, 0), (1, 2))),
             cursor: CursorPaint::Hollow,
             scrolled: 7,
-            ended: true,
+            node: Some("oak".to_string()),
+            note: Some(("session ended".to_string(), Style::TEXT_DIM)),
         });
         let has = |c: egui::Color32| colors.contains(&c);
         assert!(
@@ -1079,6 +1130,7 @@ mod tests {
         );
         assert!(has(Style::SURFACE), "chip plate");
         assert!(has(Style::TEXT_DIM), "chip label");
+        assert!(has(Style::ACCENT), "the remote node marker chip");
     }
 
     #[test]
@@ -1145,7 +1197,7 @@ mod tests {
 
         // The resize mapped the rect to a real grid on both the engine and
         // the kernel side (§7: runtime-observable, not a mock).
-        let (cols, rows) = widget.pty().with_terminal(|t| (t.cols(), t.rows()));
+        let (cols, rows) = widget.with_terminal(|t| (t.cols(), t.rows()));
         assert!(
             cols > 40 && rows > 10,
             "grid resized to the rect: {cols}x{rows}"

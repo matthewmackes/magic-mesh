@@ -789,7 +789,32 @@ impl SplitTerminal {
     /// ([`LocalPty::spawn`]). Later spawn failures (splits) surface as an
     /// in-pane error chip instead, since a session is already running.
     pub fn new(spawn_opts: SpawnOptions) -> io::Result<Self> {
-        let mut this = Self {
+        let mut this = Self::bare(spawn_opts);
+        let first = this.spawn_session()?;
+        this.tree = Some(Pane::leaf(first));
+        this.focused = first;
+        Ok(this)
+    }
+
+    /// Open the multiplexer with a **remote** mesh shell as its first pane
+    /// (TERM-8), driven over the TERM-7 broker. Infallible: opening a remote pane
+    /// only publishes the request, and a publish failure (no Bus) surfaces as the
+    /// pane's honest `Failed` chip — never a spawn error. Later splits within this
+    /// tab reuse `spawn_opts` for local shells, as elsewhere.
+    #[must_use]
+    pub fn from_remote(remote: crate::remote::RemotePty, spawn_opts: SpawnOptions) -> Self {
+        let mut this = Self::bare(spawn_opts);
+        let id = SessionId(this.next_id);
+        this.next_id += 1;
+        this.sessions.insert(id, TerminalWidget::new_remote(remote));
+        this.tree = Some(Pane::leaf(id));
+        this.focused = id;
+        this
+    }
+
+    /// A registry/tree-less shell sharing the common field defaults.
+    fn bare(spawn_opts: SpawnOptions) -> Self {
+        Self {
             tree: None,
             sessions: HashMap::new(),
             pane_ids: HashMap::new(),
@@ -801,11 +826,7 @@ impl SplitTerminal {
             error: None,
             broadcast: Broadcast::Off,
             groups: HashMap::new(),
-        };
-        let first = this.spawn_session()?;
-        this.tree = Some(Pane::leaf(first));
-        this.focused = first;
-        Ok(this)
+        }
     }
 
     /// `true` once every pane has closed — the surface should close with it.
@@ -1212,7 +1233,7 @@ impl SplitTerminal {
         let ended: Vec<SessionId> = self
             .sessions
             .iter()
-            .filter(|(_, widget)| widget.pty().is_output_closed())
+            .filter(|(_, widget)| widget.is_output_closed())
             .map(|(id, _)| *id)
             .collect();
         for id in ended {
@@ -1825,15 +1846,11 @@ mod tests {
     }
 
     fn cols_of(term: &SplitTerminal, id: SessionId) -> usize {
-        term.sessions[&id]
-            .pty()
-            .with_terminal(crate::engine::Terminal::cols)
+        term.sessions[&id].with_terminal(crate::engine::Terminal::cols)
     }
 
     fn rows_of(term: &SplitTerminal, id: SessionId) -> usize {
-        term.sessions[&id]
-            .pty()
-            .with_terminal(crate::engine::Terminal::rows)
+        term.sessions[&id].with_terminal(crate::engine::Terminal::rows)
     }
 
     #[test]
@@ -1961,7 +1978,7 @@ mod tests {
         term.apply(Command::Split(SplitDir::V));
         let b = term.focused_session();
         settle(&ctx, &mut term, 2);
-        let pid_b = term.sessions[&b].pty().child_pid();
+        let pid_b = term.sessions[&b].local_pty().expect("local").child_pid();
 
         term.apply(Command::Close);
         assert_eq!(term.session_count(), 1);
@@ -1970,7 +1987,7 @@ mod tests {
         assert!(!term.is_empty());
 
         // Closing the last pane empties the surface.
-        let pid_a = term.sessions[&a].pty().child_pid();
+        let pid_a = term.sessions[&a].local_pty().expect("local").child_pid();
         term.apply(Command::Close);
         assert!(term.is_empty());
         assert_eq!(term.session_count(), 0);
@@ -1988,11 +2005,12 @@ mod tests {
 
         // The user types `exit` in pane B; the shell ends on its own.
         term.sessions[&b]
-            .pty()
+            .local_pty()
+            .expect("local")
             .send_input(b"exit\n")
             .expect("queue exit");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !term.sessions[&b].pty().is_output_closed() {
+        while !term.sessions[&b].is_output_closed() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "timed out waiting for the shell to exit"
@@ -2085,7 +2103,7 @@ mod tests {
 
     /// A pane's shell output (scrollback + viewport) joined into one string.
     fn pane_text(term: &SplitTerminal, id: SessionId) -> String {
-        term.sessions[&id].pty().with_terminal(|t| {
+        term.sessions[&id].with_terminal(|t| {
             let full = t.full();
             (0..full.rows())
                 .map(|r| full.line_text(r))
@@ -2300,6 +2318,60 @@ mod tests {
             term.group_of(a),
             None,
             "an empty label clears rather than names"
+        );
+    }
+
+    // ── remote pane (TERM-8) rendered through the shared grid ────────────────
+
+    #[test]
+    fn a_remote_first_pane_streams_broker_output_into_the_grid() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+
+        use crate::remote::test_support::FakeBus;
+        use crate::remote::RemotePty;
+
+        let ctx = test_ctx();
+        // A remote session on a fake broker, polling every frame (ZERO throttle).
+        let bus = FakeBus::new();
+        let remote = RemotePty::open(Arc::new(bus.clone()), "oak", "oak", 80, 24)
+            .with_poll_interval(Duration::ZERO);
+        let id = remote.session_id().to_string();
+        // The broker opens the session and streams a base64 output chunk.
+        let open_rec =
+            r#"{"id":"ID","peer":"oak","phase":"open","seq":1,"since_ms":0}"#.replace("ID", &id);
+        let out_rec = format!(
+            r#"{{"id":"{id}","peer":"oak","phase":"open","seq":2,"data":"{}","since_ms":1}}"#,
+            B64.encode("remote-online")
+        );
+        bus.push_state(&id, &open_rec);
+        bus.push_state(&id, &out_rec);
+
+        // Mount it as a split's first pane and drive frames — the SAME TERM-3
+        // widget + engine renders it (§6, no second emulator).
+        let mut term = SplitTerminal::from_remote(remote, sh_opts());
+        let pane = term.focused_session();
+        settle(&ctx, &mut term, 2);
+
+        let text = term.sessions[&pane].with_terminal(|t| {
+            let full = t.full();
+            (0..full.rows())
+                .map(|r| full.line_text(r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        assert!(
+            text.contains("remote-online"),
+            "the broker's base64 output decoded into the reused engine grid: {text:?}"
+        );
+        // The open verb went to the broker; the pane never faked a shell (§7).
+        assert_eq!(bus.verb_count("open"), 1);
+        assert!(
+            !term.is_empty(),
+            "a live remote pane keeps the surface open"
         );
     }
 }

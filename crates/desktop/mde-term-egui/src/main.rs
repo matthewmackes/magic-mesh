@@ -13,6 +13,13 @@
 //! or because its shell exited), the surface closes with it — the classic
 //! terminal-window lifecycle. If the OS refuses the very first PTY, the honest
 //! spawn error is all that renders (no fake shell, §7).
+//!
+//! TERM-8 adds the **remote** path: the tab bar's globe button (or `Ctrl+Shift+R`)
+//! opens the "new terminal on → <peer>" picker — the mesh presence roster + a
+//! manual host field — and a pick opens a new tab whose first pane is a shell on
+//! that mesh node, driven over the TERM-7 broker. That wiring lives in
+//! [`TabbedTerminal`]; the `TabbedTerminal::new` here resolves the live Bus +
+//! roster from the environment ([`mde_term_egui::RemoteHub::from_env`]).
 
 use mde_egui::{eframe, egui, run_client, Style};
 use mde_term_egui::{consume_commands, consume_tab_commands, SpawnOptions, TabbedTerminal};

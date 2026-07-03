@@ -31,6 +31,7 @@
 //! reached only through the panes.
 
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::{
@@ -39,7 +40,10 @@ use mde_egui::egui::{
 };
 use mde_egui::Style;
 
+use crate::picker::{RemotePicker, RemoteTarget};
 use crate::pty::SpawnOptions;
+use crate::remote::{BusPtyClient, PtyBus, RemotePty};
+use crate::roster::{BusRoster, RosterClient};
 use crate::splits::SplitTerminal;
 use crate::widget::chip;
 
@@ -75,6 +79,9 @@ pub enum TabCommand {
     MoveLeft,
     /// Move the active tab one place right (`Ctrl+Shift+PageDown`).
     MoveRight,
+    /// Toggle the "new terminal on → <peer>" remote picker (`Ctrl+Shift+R`,
+    /// TERM-8) — the keyboard twin of the tab-bar remote button.
+    ToggleRemote,
 }
 
 /// Decode and **consume** this frame's tab-strip chords before any pane widget
@@ -108,8 +115,59 @@ pub fn consume_tab_commands(ctx: &Context) -> Vec<TabCommand> {
         if input.consume_key(Modifiers::CTRL, Key::PageUp) {
             cmds.push(TabCommand::Prev);
         }
+        if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::R) {
+            cmds.push(TabCommand::ToggleRemote);
+        }
         cmds
     })
+}
+
+/// The remote-terminal subsystem (TERM-8): the Bus seam that opens broker
+/// sessions, the roster source the picker reads, and the picker itself.
+///
+/// Bundled so a headless test injects fakes for the whole flow via
+/// [`TabbedTerminal::with_remote_hub`].
+pub struct RemoteHub {
+    /// The Bus seam remote panes drive their broker verbs over.
+    bus: Arc<dyn PtyBus>,
+    /// The presence-roster source the picker reads.
+    roster: Arc<dyn RosterClient>,
+    /// The "new terminal on → <peer>" picker + manual host entry.
+    picker: RemotePicker,
+}
+
+impl RemoteHub {
+    /// The production hub — the live Bus + roster resolved from the environment.
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            bus: Arc::new(BusPtyClient::from_env()),
+            roster: Arc::new(BusRoster::from_env()),
+            picker: RemotePicker::new(),
+        }
+    }
+
+    /// Construct with explicit seams (tests inject fakes).
+    #[must_use]
+    pub fn with_clients(bus: Arc<dyn PtyBus>, roster: Arc<dyn RosterClient>) -> Self {
+        Self {
+            bus,
+            roster,
+            picker: RemotePicker::new(),
+        }
+    }
+
+    /// Open a remote session on `target` at the given initial grid (the pane's
+    /// first frame corrects the geometry).
+    fn make_remote(&self, target: &RemoteTarget, cols: u16, rows: u16) -> RemotePty {
+        RemotePty::open(
+            Arc::clone(&self.bus),
+            &target.peer,
+            &target.label,
+            cols,
+            rows,
+        )
+    }
 }
 
 /// One tab: a whole split layout plus a stable strip label.
@@ -150,6 +208,8 @@ pub struct TabbedTerminal {
     drag: Option<usize>,
     /// The last new-tab spawn failure, chip-displayed until [`ERROR_TTL`].
     error: Option<(String, Instant)>,
+    /// The remote-terminal subsystem (TERM-8): the broker seam + roster + picker.
+    remote: RemoteHub,
 }
 
 impl TabbedTerminal {
@@ -162,6 +222,15 @@ impl TabbedTerminal {
     /// ([`SplitTerminal::new`]). Later new-tab failures surface as the strip's
     /// error chip instead, since a session is already running.
     pub fn new(spawn_opts: SpawnOptions) -> io::Result<Self> {
+        Self::with_remote_hub(spawn_opts, RemoteHub::from_env())
+    }
+
+    /// Open the surface with an explicit [`RemoteHub`] (tests inject fake broker +
+    /// roster seams; production uses [`Self::new`] → [`RemoteHub::from_env`]).
+    ///
+    /// # Errors
+    /// The first local shell's spawn failure ([`SplitTerminal::new`]).
+    pub fn with_remote_hub(spawn_opts: SpawnOptions, remote: RemoteHub) -> io::Result<Self> {
         let term = SplitTerminal::new(spawn_opts.clone())?;
         Ok(Self {
             tabs: vec![Tab {
@@ -173,6 +242,7 @@ impl TabbedTerminal {
             next_no: 2,
             drag: None,
             error: None,
+            remote,
         })
     }
 
@@ -228,6 +298,36 @@ impl TabbedTerminal {
                     self.move_tab(self.active, self.active + 1);
                 }
             }
+            TabCommand::ToggleRemote => self.remote.picker.toggle(),
+        }
+    }
+
+    /// Open a fresh tab whose first pane is a **remote** mesh shell on `target`
+    /// (TERM-8), driven over the TERM-7 broker. The pane surfaces its own honest
+    /// connecting / unreachable state — opening never fails here (§7). Splits
+    /// within the tab reuse the local spawn recipe, as elsewhere.
+    pub fn open_remote_tab(&mut self, target: &RemoteTarget) {
+        let remote = self
+            .remote
+            .make_remote(target, self.spawn_opts.cols, self.spawn_opts.rows);
+        let term = SplitTerminal::from_remote(remote, self.spawn_opts.clone());
+        self.tabs.push(Tab {
+            term,
+            title: self.next_no.to_string(),
+        });
+        self.next_no += 1;
+        self.active = self.tabs.len() - 1;
+    }
+
+    /// Render the remote picker overlay (when open) and open a tab on a pick.
+    fn show_remote_picker(&mut self, ctx: &Context) {
+        // Disjoint field borrows: the picker (mut) reads the roster (shared).
+        let target = {
+            let hub = &mut self.remote;
+            hub.picker.show(ctx, hub.roster.as_ref())
+        };
+        if let Some(target) = target {
+            self.open_remote_tab(&target);
         }
     }
 
@@ -319,6 +419,8 @@ impl TabbedTerminal {
             tab.term.show(&mut body_ui);
         }
         self.paint_error(ui, body);
+        // The remote picker floats over the body (TERM-8); a pick opens a tab.
+        self.show_remote_picker(ui.ctx());
 
         // A tab whose last pane just closed empties its split terminal — close
         // the tab (the tab-level echo of TERM-4's last-pane lifecycle).
@@ -346,10 +448,18 @@ impl TabbedTerminal {
             pos2(bar.max.x - TAB_BAR_H, bar.min.y),
             vec2(TAB_BAR_H, TAB_BAR_H),
         );
-        let strip = Rect::from_min_max(bar.min, pos2(new_rect.min.x, bar.max.y));
+        // The remote-terminal button sits just left of the new-tab `+` (TERM-8).
+        let remote_rect = Rect::from_min_size(
+            pos2(new_rect.min.x - TAB_BAR_H, bar.min.y),
+            vec2(TAB_BAR_H, TAB_BAR_H),
+        );
+        let strip = Rect::from_min_max(bar.min, pos2(remote_rect.min.x, bar.max.y));
 
         let slots = self.tab_slots(ui, strip);
         self.paint_tabs(ui, strip, &slots);
+        if Self::paint_remote_button(ui, remote_rect, self.remote.picker.is_open()) {
+            self.remote.picker.toggle();
+        }
         Self::paint_new_button(ui, new_rect);
 
         // Interact + apply. Close wins its sub-rect (registered after the plate,
@@ -498,6 +608,35 @@ impl TabbedTerminal {
         );
     }
 
+    /// The remote-terminal button (TERM-8): a token plate with a globe glyph that
+    /// lights the accent when the picker is open or hovered. Returns whether it was
+    /// clicked. All `Style` tokens (§4).
+    fn paint_remote_button(ui: &Ui, rect: Rect, open: bool) -> bool {
+        let resp = ui
+            .interact(rect, ui.id().with("term-remote-btn"), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("New terminal on a mesh node (Ctrl+Shift+R)");
+        let painter = ui.painter();
+        let hot = open || resp.hovered();
+        if hot {
+            painter.rect_filled(rect, 0.0, Style::SURFACE_HI);
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(1.0, Style::ACCENT),
+                StrokeKind::Inside,
+            );
+        }
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "\u{2325}",
+            FontId::monospace(Style::BODY),
+            if hot { Style::ACCENT } else { Style::TEXT_DIM },
+        );
+        resp.clicked()
+    }
+
     /// While a tab is in flight, reorder it live as the pointer crosses slots.
     fn drag_reorder(&mut self, ui: &Ui, slots: &[TabSlot]) {
         let Some(cur) = self.drag else { return };
@@ -559,6 +698,9 @@ mod tests {
 
     use super::*;
     use crate::pty::SpawnOptions;
+    use crate::remote::test_support::FakeBus;
+    use crate::roster::test_support::FakeRoster;
+    use crate::roster::Presence;
 
     // ── fixtures ────────────────────────────────────────────────────────────
 
@@ -571,6 +713,15 @@ mod tests {
 
     fn tabs() -> TabbedTerminal {
         TabbedTerminal::new(sh_opts()).expect("first shell")
+    }
+
+    /// A surface with fake broker + roster seams (one online peer, `oak`).
+    fn tabs_with_fakes() -> (TabbedTerminal, FakeBus) {
+        let bus = FakeBus::new();
+        let roster = FakeRoster::with_peers("eagle", &[("oak", Presence::Online)]);
+        let hub = RemoteHub::with_clients(Arc::new(bus.clone()), Arc::new(roster));
+        let term = TabbedTerminal::with_remote_hub(sh_opts(), hub).expect("first shell");
+        (term, bus)
     }
 
     fn key_event(key: Key, modifiers: Modifiers) -> Event {
@@ -859,5 +1010,51 @@ mod tests {
             assert!(consume_tab_commands(ctx).is_empty());
             ctx.input(|i| assert_eq!(i.events.len(), 1, "left for the widget"));
         });
+    }
+
+    // ── remote terminal (TERM-8) ────────────────────────────────────────────
+
+    #[test]
+    fn ctrl_shift_r_decodes_the_remote_toggle() {
+        let ctx = Context::default();
+        let raw = RawInput {
+            events: vec![key_event(Key::R, Modifiers::CTRL | Modifiers::SHIFT)],
+            ..RawInput::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            assert_eq!(consume_tab_commands(ctx), vec![TabCommand::ToggleRemote]);
+        });
+    }
+
+    #[test]
+    fn the_remote_toggle_opens_and_closes_the_picker() {
+        let (mut term, _bus) = tabs_with_fakes();
+        assert!(!term.remote.picker.is_open());
+        term.apply_tab(TabCommand::ToggleRemote);
+        assert!(term.remote.picker.is_open(), "the picker opened");
+        term.apply_tab(TabCommand::ToggleRemote);
+        assert!(!term.remote.picker.is_open(), "the picker closed");
+    }
+
+    #[test]
+    fn opening_a_remote_tab_adds_a_focused_tab_and_publishes_open() {
+        let ctx = Context::default();
+        Style::install(&ctx);
+        let (mut term, bus) = tabs_with_fakes();
+        term.open_remote_tab(&RemoteTarget {
+            peer: "oak".into(),
+            label: "oak".into(),
+        });
+        // A second tab opened, focused, with one (remote) pane.
+        assert_eq!(term.tab_count(), 2);
+        assert_eq!(term.active_index(), 1);
+        assert_eq!(term.tab(1).expect("remote tab").session_count(), 1);
+        // The pane drove the broker: an `open` verb went to oak's topic slot (§7 —
+        // a real caller of the TERM-7 contract, not a stub).
+        assert_eq!(bus.verb_count("open"), 1);
+        assert_eq!(bus.published()[0].peer, "oak");
+        // The surface renders the remote pane without panicking.
+        settle(&ctx, &mut term, 2);
+        assert!(!term.is_empty());
     }
 }

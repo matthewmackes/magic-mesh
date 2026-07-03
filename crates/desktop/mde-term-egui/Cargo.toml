@@ -53,6 +53,20 @@ alacritty_terminal = "0.24"
 # feature — to flip the master fd back to blocking for its pump threads
 # (alacritty's `tty::new` force-sets O_NONBLOCK for its own poll loop).
 rustix = { version = "0.38", features = ["std", "termios", "pty", "fs"] }
+# TERM-8 — the desktop half of the TERM-7 mesh PTY-broker contract. The remote
+# terminal drives the broker's typed verbs over the Bus (`action/pty/<peer>`)
+# and streams its append-log state back (`state/pty/<id>`); the peer picker
+# mirrors the presence roster (`state/chat/roster`). §6 keeps this in the
+# desktop tier leaning inward on `mde-bus` only — never the `mackesd` daemon
+# crate (its worker types are gated behind the heavy `async-services` feature).
+# The wire shapes are LOCAL serde mirrors, exactly as `mde-files-egui` mirrors
+# the mesh-mount worker's structs.
+mde-bus = { path = "../../platform/mde-bus" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Terminal output chunks + keystroke input ride the wire base64-encoded (the
+# broker's `state/pty/<id>` `data` field), so both halves speak the same codec.
+base64 = "0.22"
 
 [lints]
 workspace = true

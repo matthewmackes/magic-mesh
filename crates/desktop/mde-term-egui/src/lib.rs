@@ -47,21 +47,36 @@
 //!   the mode toggles by `Ctrl+Shift+A`/`Ctrl+Shift+G` or the on-surface chip,
 //!   and panes are assigned to named groups from a per-pane badge.
 //!
-//! The mackesd mesh PTY broker arrives in TERM-7 onward.
+//! - [`remote`] (TERM-8) — the desktop half of the TERM-7 mesh PTY-broker
+//!   contract: [`remote::RemotePty`] opens a shell on a mesh peer over the Bus
+//!   (`action/pty/<peer>` verbs) and streams its append-log state
+//!   (`state/pty/<id>`, base64 chunks) into the **same** reused VT engine + grid,
+//!   with honest connecting / reconnecting / unreachable / closed states (§7).
+//!   [`roster`] mirrors the presence roster and [`picker::RemotePicker`] is the
+//!   "new terminal on → <peer>" picker + manual host entry; [`session::Session`]
+//!   is the local-or-remote backing the one [`widget::TerminalWidget`] renders.
 
 pub mod engine;
 pub mod palette;
+pub mod picker;
 pub mod pty;
+pub mod remote;
+pub mod roster;
 pub mod screen;
+pub mod session;
 pub mod splits;
 pub mod tabs;
 pub mod widget;
 
 pub use engine::{Terminal, DEFAULT_SCROLLBACK};
+pub use picker::{RemotePicker, RemoteTarget};
 pub use pty::{LocalPty, SpawnOptions};
+pub use remote::{BusPtyClient, PtyBus, RemotePty, RemoteStatus};
+pub use roster::{BusRoster, Presence, RosterClient, RosterSnapshot};
 pub use screen::{Cell, CellAttrs, CellColor, CursorPos, Screen};
+pub use session::Session;
 pub use splits::{
     consume_commands, Broadcast, Command, NavDir, Pane, SessionId, SplitDir, SplitTerminal,
 };
-pub use tabs::{consume_tab_commands, TabCommand, TabbedTerminal};
+pub use tabs::{consume_tab_commands, RemoteHub, TabCommand, TabbedTerminal};
 pub use widget::TerminalWidget;
