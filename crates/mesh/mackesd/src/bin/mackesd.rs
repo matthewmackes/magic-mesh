@@ -7531,6 +7531,36 @@ fn run_serve(
                 .push("mesh_mount".into());
         }
 
+        // TERM-7 — the mesh PTY-broker worker owns the remote-shell lifecycle
+        // over the Nebula overlay for the mde-term-egui terminal surface (design
+        // `mesh-terminal.md`): it drains `action/pty/<peer>` (typed verb —
+        // open/write/resize/close, each carrying the client-minted session id),
+        // opens a real remote shell via `ssh -tt` on the node-sealed shared mesh
+        // SSH key (FILEMGR-6, reused from mesh_mount), and publishes an append
+        // log on `state/pty/<id>` (base64 output chunks + the terminal exit) with
+        // idle-reap + dead-session reap. The live ssh impl is integration-gated
+        // behind the injectable `PtyBackend` seam (§9 — a typed argv, no
+        // shell-string injection; §7 — it returns an honest typed Gated/
+        // Unreachable state headless, never a faked session). A desktop feature
+        // (Workstation tier); idles gracefully with no pty requests on a headless
+        // box.
+        if mackesd_core::worker_role::runs("pty_broker", role_rank) {
+            let runtime_base = mackesd_core::workers::pty_broker::resolve_runtime_base();
+            let repo_dir = mackesd_core::ipc::secret_store::repo_root();
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::pty_broker::PtyBrokerWorker::new(
+                    runtime_base,
+                    repo_dir,
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("pty_broker".into());
+        }
+
         // BOOKMARKS-2 — the mesh-synced bookmarks worker (design
         // `mesh-bookmarks.md` locks Q17-Q24/Q90/Q91): it drains
         // `action/bookmarks/*` (add/edit/move/delete/add-folder/rename — minting

@@ -203,7 +203,18 @@ pub mod link_traffic;
 // integration-gated behind the injectable `MountBackend` seam (§9, §7); the
 // planning + state-machine folds are pure + unit-tested.
 pub mod mesh_mount;
+// TERM-7 — the mesh PTY-broker worker: owns the remote-shell lifecycle over the
+// Nebula overlay for the mde-term-egui terminal surface. Drains
+// `action/pty/<peer>` (typed verb — open/write/resize/close, each carrying the
+// client-minted session id) + publishes an append log on `state/pty/<id>`
+// (base64 output chunks + the terminal exit). Opens a real remote shell via
+// `ssh -tt` on the sealed mesh key (FILEMGR-6, reused from mesh_mount), with
+// honest typed gating on an unreachable peer / unprovisioned key (never fakes a
+// session) + idle/dead-session reap. The live ssh impl is integration-gated
+// behind the injectable `PtyBackend` seam (§9, §7); the plan + state-machine +
+// reap folds are pure + unit-tested.
 pub mod mesh_router;
+pub mod pty_broker;
 // NF-3.4 (v2.5) — Nebula supervisor worker (CA mint +
 // role-marker management + bundle-watch + systemctl
 // reload).

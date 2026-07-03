@@ -120,6 +120,11 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // media folders), so Workstation-tier; it idles gracefully on a headless
     // box (empty share manifest, empty aggregated library).
     ("media_server", 1),
+    // TERM-7 — the mesh PTY-broker: opens remote shells on peers over the
+    // overlay for the mde-term-egui terminal surface. A desktop feature (the
+    // seated user opens a terminal on a mesh node), so Workstation-tier; it
+    // idles gracefully on a headless box (no action/pty/* requests arrive).
+    ("pty_broker", 1),
 ];
 
 /// MEDIA-1 — workers that ALSO require a capability tag beyond their rank tier.
@@ -338,7 +343,9 @@ mod tests {
         // aggregator, Workstation-tier: a seated-user desktop feature).
         // +1 media_server (MEDIA-15 — the mesh media server + DLNA + aggregation,
         // the PRODUCER half; Workstation-tier: a seated-user desktop feature).
-        assert_eq!(WORKER_TIERS.len(), 35);
+        // +1 pty_broker (TERM-7 — the mesh PTY-broker opening remote shells over
+        // the overlay, Workstation-tier: a seated-user desktop feature).
+        assert_eq!(WORKER_TIERS.len(), 36);
     }
 
     #[test]
@@ -366,8 +373,8 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            13,
-            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15)"
+            14,
+            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7)"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
@@ -429,11 +436,11 @@ mod tests {
     fn workers_for_rank_is_a_growing_superset() {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        // 22 lighthouse control-plane workers; Workstation adds the 13 fleet +
-        // desktop workers for the full 35 (the retired Server tier folded into
+        // 22 lighthouse control-plane workers; Workstation adds the 14 fleet +
+        // desktop workers for the full 36 (the retired Server tier folded into
         // Workstation in the 2-role model).
         assert_eq!(lh.len(), 22);
-        assert_eq!(ws.len(), 35);
+        assert_eq!(ws.len(), 36);
         // Strict superset: every lighthouse worker is also in the workstation set.
         assert!(lh.iter().all(|w| ws.contains(w)));
     }
