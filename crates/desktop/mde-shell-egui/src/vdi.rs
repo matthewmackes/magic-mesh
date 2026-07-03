@@ -87,6 +87,124 @@ impl RequestedTarget {
     }
 }
 
+/// The desktop protocol a connect routes to — the VDI tier's *routable* set. The
+/// Chooser's wire [`crate::chooser::Protocol`] additionally carries an `Unknown`
+/// badge for a tag this build can't render; only a routable protocol reaches a
+/// [`ConnectRequest`], so this enum has no unknown arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VdiProtocol {
+    /// Remote Desktop Protocol — `mde-vdi-rdp` (the primary).
+    Rdp,
+    /// VNC / RFB — `mde-vdi-vnc` (the universal console fallback).
+    Vnc,
+    /// Spice — `mde-vdi-spice` (CHOOSER-5; honest-gated until the crate lands).
+    Spice,
+}
+
+impl VdiProtocol {
+    /// The decoder crate this protocol renders through.
+    pub(crate) const fn client_crate(self) -> &'static str {
+        match self {
+            Self::Rdp => "mde-vdi-rdp",
+            Self::Vnc => "mde-vdi-vnc",
+            Self::Spice => "mde-vdi-spice",
+        }
+    }
+
+    /// Whether a decoder crate exists to render this protocol today. Spice's
+    /// client is CHOOSER-5 — a Spice request is built honestly but never faked
+    /// into a live session (§7).
+    pub(crate) const fn has_client(self) -> bool {
+        matches!(self, Self::Rdp | Self::Vnc)
+    }
+
+    /// The short picker / caption label.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Rdp => "RDP",
+            Self::Vnc => "VNC",
+            Self::Spice => "Spice",
+        }
+    }
+}
+
+/// Fullscreen under the thin chrome bar (the E12 VDI idiom) or a windowed desktop
+/// — a per-connection choice (design lock 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisplayMode {
+    /// The desktop fills the shell body under the thin chrome bar.
+    Fullscreen,
+    /// The desktop runs in a window inside the shell.
+    Windowed,
+}
+
+impl DisplayMode {
+    /// The picker / caption label.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Fullscreen => "fullscreen",
+            Self::Windowed => "windowed",
+        }
+    }
+}
+
+/// Span the guest across every local display or confine it to a single one — a
+/// per-connection choice (design lock 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MonitorSpan {
+    /// A single display.
+    Single,
+    /// Span all local displays.
+    All,
+}
+
+impl MonitorSpan {
+    /// The picker / caption label.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Single => "single display",
+            Self::All => "span all displays",
+        }
+    }
+}
+
+/// A fully-specified desktop connect the Chooser's always-ask picker produces
+/// (CHOOSER-4): the chosen [`VdiProtocol`] (always-asked when a source offered
+/// several — lock 6), the [`DisplayMode`] (lock 9), the [`MonitorSpan`] (lock
+/// 12), and the [`RequestedTarget`] the session attaches to. The Desktop surface
+/// routes it to the matching decoder crate ([`VdiProtocol::client_crate`]); the
+/// live wire transport that constructs the session is the gated E12-4 layer, and
+/// a Spice route is honest-gated on CHOOSER-5 until `mde-vdi-spice` lands — the
+/// request is still built truthfully, but no session is ever faked (§7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConnectRequest {
+    /// The desktop the session attaches to (serving peer + VM/host name).
+    pub target: RequestedTarget,
+    /// The protocol the operator chose.
+    pub protocol: VdiProtocol,
+    /// Fullscreen vs windowed (lock 9).
+    pub display: DisplayMode,
+    /// Single vs span-all (lock 12).
+    pub monitors: MonitorSpan,
+}
+
+impl ConnectRequest {
+    /// Assemble a request from the picked target + the three display choices.
+    pub(crate) const fn new(
+        target: RequestedTarget,
+        protocol: VdiProtocol,
+        display: DisplayMode,
+        monitors: MonitorSpan,
+    ) -> Self {
+        Self {
+            target,
+            protocol,
+            display,
+            monitors,
+        }
+    }
+}
+
 /// The Desktop surface's state: the active session (if any), the desktop texture
 /// the framebuffer is uploaded into, the decode → upload hand-off slot, and the
 /// picked target the discovery picker requested before a live session attaches.
@@ -107,10 +225,11 @@ pub(crate) struct VdiState {
     /// Raised when the operator presses the reserved Esc chord over the desktop —
     /// the shell reads it to release the fullscreen desktop back to the chrome.
     return_to_chrome: bool,
-    /// The desktop target the Chooser chose, held until the gated live
-    /// transport attaches a `session`. Drives the honest "connecting" caption and
-    /// tells the shell to show the Desktop surface rather than the Chooser.
-    requested: Option<RequestedTarget>,
+    /// The connect the Chooser's picker chose (CHOOSER-4 — protocol + display +
+    /// monitors + target), held until the gated live transport attaches a
+    /// `session`. Drives the honest "connecting" caption (which names the chosen
+    /// protocol + display) and tells the shell to show the Desktop surface.
+    requested: Option<ConnectRequest>,
 }
 
 impl VdiState {
@@ -120,20 +239,20 @@ impl VdiState {
         std::mem::take(&mut self.return_to_chrome)
     }
 
-    /// Record the target the Chooser chose (CHOOSER-2). The surface then shows a
-    /// "connecting" state naming it until the gated wire transport attaches the
-    /// live decoder session.
-    pub(crate) fn request_target(&mut self, target: RequestedTarget) {
-        self.requested = Some(target);
+    /// Record the connect the Chooser's picker chose (CHOOSER-4). The surface then
+    /// shows a "connecting" state naming the target + chosen protocol until the
+    /// gated wire transport attaches the live decoder session.
+    pub(crate) fn request_connect(&mut self, request: ConnectRequest) {
+        self.requested = Some(request);
     }
 
     /// The picked target, if any — the shell reads it to decide whether the Desktop
     /// surface shows the Chooser (none) or the connecting/desktop state.
     pub(crate) fn requested_target(&self) -> Option<&RequestedTarget> {
-        self.requested.as_ref()
+        self.requested.as_ref().map(|r| &r.target)
     }
 
-    /// Clear the pending target — the operator backed out before a live session
+    /// Clear the pending connect — the operator backed out before a live session
     /// attached, so the Desktop surface falls back to the Chooser.
     pub(crate) fn clear_target(&mut self) {
         self.requested = None;
@@ -188,15 +307,33 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
             // (lock 2), never over it. The backdrop owns the crossfade/breathe motion
             // (lock 10), so there is no bespoke caption ease here.
             match state.requested.as_ref() {
-                // The Chooser chose a target but no live decoder is attached
-                // yet (the wire transport is gated) — the status honestly names the
-                // desktop being brokered, below the logo; never a placeholder (§7).
-                Some(target) => {
-                    let title = format!("Connecting to {}", target.name);
-                    let detail = format!(
-                        "Brokering the desktop from {} — the live transport (E12-4) is gated.",
-                        target.serving_peer
+                // The Chooser's picker chose a connect but no live decoder is
+                // attached yet (the wire transport is gated) — the status honestly
+                // names the desktop + the chosen protocol/display below the logo,
+                // never a placeholder render (§7). A Spice route says its client is
+                // CHOOSER-5, so it's plain no session was faked.
+                Some(req) => {
+                    let title = format!(
+                        "Connecting to {} via {}",
+                        req.target.name,
+                        req.protocol.label()
                     );
+                    let detail = if req.protocol.has_client() {
+                        format!(
+                            "Brokering the {} desktop from {} ({} \u{00B7} {}) — the live transport (E12-4) is gated.",
+                            req.protocol.client_crate(),
+                            req.target.serving_peer,
+                            req.display.label(),
+                            req.monitors.label(),
+                        )
+                    } else {
+                        format!(
+                            "Spice desktop from {} ({} \u{00B7} {}) — the Spice client lands in CHOOSER-5; no session is faked.",
+                            req.target.serving_peer,
+                            req.display.label(),
+                            req.monitors.label(),
+                        )
+                    };
                     crate::backdrop::show(
                         ui,
                         crate::backdrop::Coverage::Empty,
@@ -299,12 +436,17 @@ mod tests {
     }
 
     #[test]
-    fn a_requested_target_paints_the_connecting_caption() {
-        // The Chooser handed a target but no live decoder is attached yet
-        // (the wire transport is gated): the surface shows the connecting caption,
-        // still with no texture and no fake desktop.
+    fn a_requested_connect_paints_the_connecting_caption() {
+        // The Chooser's picker handed a connect but no live decoder is attached
+        // yet (the wire transport is gated): the surface shows the connecting
+        // caption, still with no texture and no fake desktop.
         let mut state = VdiState::default();
-        state.request_target(RequestedTarget::new("node-a", "web1"));
+        state.request_connect(ConnectRequest::new(
+            RequestedTarget::new("node-a", "web1"),
+            VdiProtocol::Rdp,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+        ));
         assert_eq!(
             state.requested_target().map(|t| t.name.as_str()),
             Some("web1")
@@ -316,9 +458,60 @@ mod tests {
             "the connecting backdrop (logo + status below) produced no draw primitives"
         );
 
-        // Backing out clears the target so the surface returns to the picker.
+        // Backing out clears the connect so the surface returns to the picker.
         state.clear_target();
         assert!(state.requested_target().is_none());
+    }
+
+    #[test]
+    fn a_gated_spice_connect_paints_without_faking_a_session() {
+        // A Spice request is constructed honestly, but no client crate exists
+        // (CHOOSER-5), so the surface stays on the connecting caption — it never
+        // constructs a `Session::Spice` (there is none) nor a fake desktop (§7).
+        let mut state = VdiState::default();
+        state.request_connect(ConnectRequest::new(
+            RequestedTarget::new("oak", "win11"),
+            VdiProtocol::Spice,
+            DisplayMode::Windowed,
+            MonitorSpan::All,
+        ));
+        let drew = run_panel(&mut state, body_input());
+        assert!(state.session.is_none(), "no Spice session is faked");
+        assert!(state.texture.is_none(), "no fake desktop texture");
+        assert!(
+            drew,
+            "the gated-Spice connecting caption produced no draw primitives"
+        );
+    }
+
+    #[test]
+    fn the_vdi_protocol_routes_map_to_the_right_client_crate() {
+        assert_eq!(VdiProtocol::Rdp.client_crate(), "mde-vdi-rdp");
+        assert_eq!(VdiProtocol::Vnc.client_crate(), "mde-vdi-vnc");
+        assert_eq!(VdiProtocol::Spice.client_crate(), "mde-vdi-spice");
+        // RDP/VNC render today; Spice is CHOOSER-5-gated.
+        assert!(VdiProtocol::Rdp.has_client());
+        assert!(VdiProtocol::Vnc.has_client());
+        assert!(!VdiProtocol::Spice.has_client());
+    }
+
+    #[test]
+    fn a_connect_request_carries_the_three_display_choices() {
+        // The request-construction fold: the picked target + the three choices
+        // land on the request verbatim.
+        let req = ConnectRequest::new(
+            RequestedTarget::new("oak", "web1"),
+            VdiProtocol::Vnc,
+            DisplayMode::Windowed,
+            MonitorSpan::All,
+        );
+        assert_eq!(req.target.serving_peer, "oak");
+        assert_eq!(req.target.name, "web1");
+        assert_eq!(req.protocol, VdiProtocol::Vnc);
+        assert_eq!(req.display, DisplayMode::Windowed);
+        assert_eq!(req.monitors, MonitorSpan::All);
+        assert_eq!(req.display.label(), "windowed");
+        assert_eq!(req.monitors.label(), "span all displays");
     }
 
     #[test]

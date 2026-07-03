@@ -301,9 +301,10 @@ impl Shell {
                 // The Desktop surface's no-session face IS the Desktop Chooser
                 // (CHOOSER-2, superseding the E12-5b flat picker): with nothing
                 // requested it shows the discovered-desktop card grid over the
-                // BRAND-1 backdrop; a card connect hands a target to `vdi`, and
-                // the surface flips to the desktop (connecting caption until the
-                // gated E12-4 wire transport attaches the live decoder).
+                // BRAND-1 backdrop; the CHOOSER-4 picker hands a `ConnectRequest`
+                // (protocol + display + monitors) to `vdi`, and the surface flips
+                // to the desktop (connecting caption until the gated E12-4 wire
+                // transport attaches the live decoder).
                 if self.vdi.requested_target().is_none() {
                     let chooser = &mut self.chooser;
                     let picked = ui
@@ -312,8 +313,8 @@ impl Shell {
                             chooser.take_connect()
                         })
                         .inner;
-                    if let Some(target) = picked {
-                        self.vdi.request_target(target);
+                    if let Some(request) = picked {
+                        self.vdi.request_connect(request);
                     }
                 } else {
                     // The VDI desktop fills the body. It reserves an Esc chord that

@@ -16,13 +16,17 @@
 //!   worker — the shell leans inward on `mde-bus` only, never on `mackesd` (§6).
 //!   The [`DesktopSourcesClient`] seam is injectable so the model is unit-tested
 //!   headless (a fake) while production talks the Bus ([`BusDesktopSources`]).
-//! * **Connect** — a card click hands a [`RequestedTarget`] to [`crate::vdi`]
+//! * **Connect** (CHOOSER-4) — activating a card raises the always-ask picker: the
+//!   protocol when several are offered (lock 6 — never a silent default), the
+//!   fullscreen/windowed choice (lock 9), and the single/span-all monitor choice
+//!   (lock 12). Confirming hands a [`crate::vdi::ConnectRequest`] to [`crate::vdi`]
 //!   (the Desktop surface takes over) and, for a mesh-brokered source (a peer
 //!   seat / peer VM / local VM), publishes the broker `SessionRequest::Open`
 //!   through [`crate::discovery::publish_open`] — the ONE copy of that wire
 //!   shape (§6). An off-mesh endpoint (mDNS / manual) has no broker verb; its
-//!   direct RDP/VNC/Spice client transport is the gated E12-4/CHOOSER-5 layer,
-//!   stated honestly on the card's note (§7 — never a silent stub).
+//!   direct RDP/VNC transport is the gated E12-4 layer and a Spice route is gated
+//!   on CHOOSER-5 — both stated honestly on the note (§7 — never a silent stub,
+//!   never a faked session).
 //! * **Auto-popup** (lock 1) — the fold keeps a **seen set** of source ids; a
 //!   genuinely new id after the first fold raises a one-shot popup flag the
 //!   shell drains to surface the Chooser through its normal central-view
@@ -33,9 +37,9 @@
 //! floats over the same backdrop dimmed to its watermark (lock 6). Reachability
 //! is **read from the published state, never probed here** (lock 14): an
 //! offline source renders greyed with the worker's reason and stays
-//! non-interactive. Protocol choice for a multi-protocol source is CHOOSER-4;
-//! until it lands the card raises a clearly-labelled confirm affordance that
-//! connects via the first offered protocol only when the operator confirms.
+//! non-interactive. Activating a connectable card raises the CHOOSER-4 always-ask
+//! picker (protocol · display · monitors) and nothing connects until the operator
+//! confirms it (lock 6 — never a silent protocol default).
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -48,7 +52,7 @@ use mde_egui::egui::{
 use mde_egui::{muted_note, status_dot, Style};
 use serde::Deserialize;
 
-use crate::vdi::RequestedTarget;
+use crate::vdi::{ConnectRequest, DisplayMode, MonitorSpan, RequestedTarget, VdiProtocol};
 
 /// The retained-latest state topic the CHOOSER-1 worker publishes the merged
 /// roster to. MUST equal `mackesd::workers::desktop_sources::SOURCES_TOPIC`
@@ -118,6 +122,18 @@ impl Protocol {
             Self::Vnc => "VNC",
             Self::Spice => "SPICE",
             Self::Unknown => "?",
+        }
+    }
+
+    /// The VDI route this protocol maps to, or `None` for a tag this build can't
+    /// render (badged, never connected blind — §7). Spice routes to the CHOOSER-5
+    /// client, which is honest-gated downstream in [`crate::vdi`].
+    const fn route(self) -> Option<VdiProtocol> {
+        match self {
+            Self::Rdp => Some(VdiProtocol::Rdp),
+            Self::Vnc => Some(VdiProtocol::Vnc),
+            Self::Spice => Some(VdiProtocol::Spice),
+            Self::Unknown => None,
         }
     }
 }
@@ -535,9 +551,25 @@ impl DesktopSourcesClient for BusDesktopSources {
 
 // ───────────────────────────── the Chooser state ─────────────────────────────
 
+/// The in-progress connect the operator is configuring in the CHOOSER-4 picker
+/// (locks 6/9/12): which source, and the three choices — protocol (seeded to the
+/// first routable offer, always-asked when several exist), display mode (seeded to
+/// fullscreen — the E12 idiom), and monitor span (seeded to single). Raised when a
+/// connectable card is activated; drained into a [`ConnectRequest`] on confirm.
+struct ConnectDraft {
+    /// The source id being configured — the picker's key back into the roster.
+    source_id: String,
+    /// The protocol selected in the picker.
+    protocol: VdiProtocol,
+    /// Fullscreen vs windowed (lock 9).
+    display: DisplayMode,
+    /// Single vs span-all displays (lock 12).
+    monitors: MonitorSpan,
+}
+
 /// The Chooser's state: the injectable roster read seam, the last published
-/// roster, the auto-popup **seen set** (lock 1), the pending CHOOSER-4 confirm
-/// ask, and the one-shot connect hand-off the shell drains into
+/// roster, the auto-popup **seen set** (lock 1), the pending CHOOSER-4 connect
+/// picker, and the one-shot connect hand-off the shell drains into
 /// [`crate::vdi::VdiState`].
 pub(crate) struct ChooserState {
     /// The roster read seam ([`BusDesktopSources`] in production).
@@ -565,12 +597,12 @@ pub(crate) struct ChooserState {
     /// An honest inline note about the last connect (what was requested, and
     /// which leg is gated).
     note: Option<String>,
-    /// The source id awaiting the multi-protocol confirm — the clearly
-    /// labelled stand-in until the CHOOSER-4 always-ask picker lands.
-    pending_multi: Option<String>,
-    /// The target chosen this frame, if a connect fired — drained by the
-    /// shell via [`Self::take_connect`] and handed to [`crate::vdi::VdiState`].
-    connect: Option<RequestedTarget>,
+    /// The connect the operator is configuring in the always-ask picker (lock 6/9/
+    /// 12) — `None` when no card is being connected.
+    pending: Option<ConnectDraft>,
+    /// The request chosen this frame, if a connect fired — drained by the shell
+    /// via [`Self::take_connect`] and handed to [`crate::vdi::VdiState`].
+    connect: Option<ConnectRequest>,
     /// CHOOSER-3 — the bounded, throttled decode cache backing the card
     /// thumbnail wells (source `thumbnail_ref` → egui texture).
     thumbs: ThumbnailCache,
@@ -605,7 +637,7 @@ impl ChooserState {
             last_poll: None,
             last_error: None,
             note: None,
-            pending_multi: None,
+            pending: None,
             connect: None,
             thumbs: ThumbnailCache::default(),
         }
@@ -650,9 +682,9 @@ impl ChooserState {
         }
         self.seen.extend(fresh);
         self.seeded = true;
-        if let Some(pending) = self.pending_multi.as_ref() {
-            if !state.sources.iter().any(|s| &s.id == pending) {
-                self.pending_multi = None;
+        if let Some(draft) = self.pending.as_ref() {
+            if !state.sources.iter().any(|s| s.id == draft.source_id) {
+                self.pending = None;
             }
         }
         self.state = Some(state);
@@ -664,10 +696,10 @@ impl ChooserState {
         std::mem::take(&mut self.popup)
     }
 
-    /// Take (and clear) the target a card connect chose this frame — the
-    /// shell hands it to [`crate::vdi::VdiState`] so the Desktop surface
+    /// Take (and clear) the [`ConnectRequest`] a card connect chose this frame —
+    /// the shell hands it to [`crate::vdi::VdiState`] so the Desktop surface
     /// takes over.
-    pub(crate) const fn take_connect(&mut self) -> Option<RequestedTarget> {
+    pub(crate) const fn take_connect(&mut self) -> Option<ConnectRequest> {
         self.connect.take()
     }
 
@@ -680,11 +712,12 @@ impl ChooserState {
             .unwrap_or_default()
     }
 
-    /// A card was activated: a single-protocol source connects directly; a
-    /// multi-protocol source raises the CHOOSER-4 confirm ask (lock 6 says
-    /// always-ask — the picker itself is CHOOSER-4, so until then nothing
-    /// connects without the explicit confirm). Offline cards never connect
-    /// (lock 14).
+    /// A connectable card was activated: raise the CHOOSER-4 always-ask picker,
+    /// seeded to the first routable offer + the default display choices. Nothing
+    /// connects here (lock 6 — always-ask; locks 9/12 make the display + monitor
+    /// choice per-connection), so even a single-protocol source opens the picker.
+    /// A source offering only a tag this build can't route opens no picker and
+    /// says so honestly (§7). Offline cards never connect (lock 14).
     fn activate(&mut self, sources: &[DesktopSource], id: &str) {
         let Some(source) = sources.iter().find(|s| s.id == id) else {
             return;
@@ -692,40 +725,52 @@ impl ChooserState {
         if !source.connectable() {
             return;
         }
-        match source.protocols.len() {
-            0 => {
-                // A roster row with no offer (shouldn't happen; honest anyway).
-                self.note = Some(format!("{} offers no connectable protocol.", source.name));
-            }
-            1 => self.connect_source(source),
-            _ => self.pending_multi = Some(source.id.clone()),
+        // The routable offers seed the picker; with none, there is nothing to
+        // connect to — say so rather than raise an empty picker (§7).
+        let Some(first) = source.protocols.iter().find_map(|o| o.protocol.route()) else {
+            self.note = Some(format!("{} offers no connectable protocol.", source.name));
+            return;
+        };
+        self.pending = Some(ConnectDraft {
+            source_id: source.id.clone(),
+            protocol: first,
+            display: DisplayMode::Fullscreen,
+            monitors: MonitorSpan::Single,
+        });
+    }
+
+    /// The operator confirmed the picker: build the [`ConnectRequest`] from the
+    /// draft's chosen protocol + display + monitors and connect.
+    fn confirm_connect(&mut self, sources: &[DesktopSource]) {
+        let Some(draft) = self.pending.take() else {
+            return;
+        };
+        // The roster can move under the picker; if the source vanished, drop the
+        // draft silently (it's already taken).
+        if let Some(source) = sources.iter().find(|s| s.id == draft.source_id) {
+            self.connect_source(source, draft.protocol, draft.display, draft.monitors);
         }
     }
 
-    /// The operator confirmed the multi-protocol ask: connect via the FIRST
-    /// offered protocol (the interim CHOOSER-4 behaviour the affordance
-    /// states in so many words).
-    fn confirm_multi(&mut self, sources: &[DesktopSource]) {
-        if let Some(id) = self.pending_multi.clone() {
-            match sources.iter().find(|s| s.id == id) {
-                Some(source) => self.connect_source(source),
-                None => self.pending_multi = None, // the roster moved under the ask
-            }
-        }
+    /// The operator backed out of the picker.
+    fn cancel_connect(&mut self) {
+        self.pending = None;
     }
 
-    /// The operator backed out of the multi-protocol ask.
-    fn cancel_multi(&mut self) {
-        self.pending_multi = None;
-    }
-
-    /// Connect one source: hand the [`RequestedTarget`] to the Desktop
-    /// surface, and — for a mesh-brokered source — publish the broker
-    /// `SessionRequest::Open` through the ONE existing wire path
+    /// Connect one source with the picked options: build the [`ConnectRequest`]
+    /// for the Desktop surface, and — for a mesh-brokered source — publish the
+    /// broker `SessionRequest::Open` through the ONE existing wire path
     /// ([`crate::discovery::publish_open`], §6). An off-mesh endpoint has no
-    /// broker verb, so only the hand-off happens and the note says honestly
-    /// which leg is gated (§7).
-    fn connect_source(&mut self, source: &DesktopSource) {
+    /// broker verb, so only the hand-off happens; either way the note says which
+    /// leg is gated, and a Spice route is honest-gated on CHOOSER-5 — no session
+    /// is ever faked (§7).
+    fn connect_source(
+        &mut self,
+        source: &DesktopSource,
+        protocol: VdiProtocol,
+        display: DisplayMode,
+        monitors: MonitorSpan,
+    ) {
         if source.origin.is_mesh_brokered() {
             // A peer seat's roster row has `name == node`, so `name` is the
             // broker's vm_id handle for seats AND VMs (the same handle the
@@ -738,24 +783,35 @@ impl ChooserState {
                 &self.client_peer,
             );
             self.note = Some(format!(
-                "Requested {} from {} — brokering over the mesh.",
-                source.name, source.node
+                "Requested {} from {} via {} ({} \u{00B7} {}) — brokering over the mesh.",
+                source.name,
+                source.node,
+                protocol.label(),
+                display.label(),
+                monitors.label(),
             ));
         } else {
-            let badge = source
-                .protocols
-                .first()
-                .map_or("?", |offer| offer.protocol.badge());
             self.note = Some(format!(
-                "Direct {badge} connect to {} — the live client transport attaches in \
-                 E12-4/CHOOSER-5.",
-                source.host
+                "Direct {} connect to {} ({} \u{00B7} {}) — the live client transport attaches \
+                 in E12-4.",
+                protocol.label(),
+                source.host,
+                display.label(),
+                monitors.label(),
             ));
         }
-        self.pending_multi = None;
-        self.connect = Some(RequestedTarget::new(
-            source.node.clone(),
-            source.name.clone(),
+        // A Spice route is constructed honestly but its client is CHOOSER-5 —
+        // name the gate so the note never implies a live Spice session (§7).
+        if !protocol.has_client() {
+            if let Some(note) = self.note.as_mut() {
+                note.push_str(" The Spice client lands in CHOOSER-5 — no session is faked.");
+            }
+        }
+        self.connect = Some(ConnectRequest::new(
+            RequestedTarget::new(source.node.clone(), source.name.clone()),
+            protocol,
+            display,
+            monitors,
         ));
     }
 
@@ -803,12 +859,12 @@ impl ChooserState {
 /// What a card interaction asked for this frame — applied after the grid loop
 /// so the render borrows and the state mutation never fight.
 enum CardAction {
-    /// A card was clicked (connect / raise the protocol ask).
+    /// A card was clicked (raise the CHOOSER-4 connect picker).
     Activate(String),
-    /// The multi-protocol ask was confirmed (connect via the first offer).
-    ConfirmMulti,
-    /// The multi-protocol ask was dismissed.
-    CancelMulti,
+    /// The connect picker was confirmed (connect with the chosen options).
+    Confirm,
+    /// The connect picker was dismissed.
+    Cancel,
 }
 
 /// Render the Chooser into `ui`: the BRAND-1 backdrop first (full hero +
@@ -849,9 +905,9 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
     ui.add_space(Style::SP_XS);
 
     // Pull the state fields the grid closure reads out to locals FIRST, then
-    // borrow `thumbs` mutably — so the closure captures only owned values + the
-    // one `&mut ThumbnailCache`, never `state` wholesale (disjoint-borrow clean).
-    let pending_id = state.pending_multi.clone();
+    // borrow `thumbs` + `pending` mutably — so the closure captures only owned
+    // values + two disjoint `&mut` fields, never `state` wholesale (borrow clean).
+    let pending_id = state.pending.as_ref().map(|d| d.source_id.clone());
     let note = state.note.clone();
     let degraded: Vec<String> = state
         .state
@@ -865,6 +921,7 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
         })
         .unwrap_or_default();
     let thumbs = &mut state.thumbs;
+    let pending_draft = &mut state.pending;
 
     let mut action: Option<CardAction> = None;
     egui::ScrollArea::vertical()
@@ -891,14 +948,13 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
                 });
             }
 
-            // The multi-protocol confirm — the clearly-labelled CHOOSER-4
-            // stand-in: nothing connects unless the operator confirms.
-            if let Some(pending) = pending_id
-                .as_deref()
-                .and_then(|id| sources.iter().find(|s| s.id == id))
-            {
-                if let Some(a) = protocol_ask(ui, pending) {
-                    action = Some(a);
+            // The CHOOSER-4 always-ask connect picker — nothing connects unless
+            // the operator confirms it (lock 6). The radios mutate the live draft.
+            if let Some(draft) = pending_draft.as_mut() {
+                if let Some(source) = sources.iter().find(|s| s.id == draft.source_id) {
+                    if let Some(a) = connect_picker(ui, source, draft) {
+                        action = Some(a);
+                    }
                 }
             }
 
@@ -919,8 +975,8 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
 
     match action {
         Some(CardAction::Activate(id)) => state.activate(&sources, &id),
-        Some(CardAction::ConfirmMulti) => state.confirm_multi(&sources),
-        Some(CardAction::CancelMulti) => state.cancel_multi(),
+        Some(CardAction::Confirm) => state.confirm_connect(&sources),
+        Some(CardAction::Cancel) => state.cancel_connect(),
         None => {}
     }
 }
@@ -1116,51 +1172,105 @@ fn protocol_badge(ui: &mut egui::Ui, offer: ProtocolOffer) {
     }
 }
 
-/// The multi-protocol confirm affordance — the clearly-labelled CHOOSER-4
-/// stand-in (§7, never a silent stub): it names the offers, says the always-ask
-/// picker is CHOOSER-4, and connects via the FIRST offered protocol only on an
-/// explicit confirm.
-fn protocol_ask(ui: &mut egui::Ui, source: &DesktopSource) -> Option<CardAction> {
+/// The CHOOSER-4 always-ask connect picker (§7, never a silent stub): a protocol
+/// radio row when the source offered several routable protocols (lock 6 — never a
+/// silent default), the fullscreen/windowed choice (lock 9), and the single/span-
+/// all monitor choice (lock 12), then Connect / Cancel. The radios mutate the live
+/// `draft`; §4 chrome via `Style` tokens. Returns the confirm/cancel action.
+fn connect_picker(
+    ui: &mut egui::Ui,
+    source: &DesktopSource,
+    draft: &mut ConnectDraft,
+) -> Option<CardAction> {
     let mut action = None;
     ui.add_space(Style::SP_M);
     ui.separator();
     ui.add_space(Style::SP_S);
     ui.label(
-        RichText::new("Choose protocol (CHOOSER-4)")
+        RichText::new(format!("Connect to {}", source.name))
             .color(Style::TEXT)
             .size(Style::BODY)
             .strong(),
     );
     ui.add_space(Style::SP_XS);
-    let offers: Vec<&str> = source
+
+    // The routable offers this source advertises, in the worker's stable order.
+    let routable: Vec<VdiProtocol> = source
         .protocols
         .iter()
-        .map(|o| o.protocol.badge())
+        .filter_map(|o| o.protocol.route())
         .collect();
-    let first = offers.first().copied().unwrap_or("?");
-    muted_note(
-        ui,
-        format!(
-            "{} offers {}. The always-ask protocol picker lands in CHOOSER-4 — confirming \
-             here connects via {first} (the first offered) for now.",
-            source.name,
-            offers.join(" \u{00B7} "),
-        ),
-    );
+
+    // Protocol — always-ask as a radio row when several are routable (lock 6).
+    // A single routable protocol is stated (no false choice) so WHAT will be used
+    // is still explicit.
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Protocol")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        if routable.len() > 1 {
+            for proto in &routable {
+                ui.radio_value(&mut draft.protocol, *proto, proto.label());
+            }
+        } else {
+            ui.label(RichText::new(draft.protocol.label()).color(Style::TEXT));
+        }
+    });
+
+    // Display mode — fullscreen or windowed (lock 9).
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Display")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.radio_value(&mut draft.display, DisplayMode::Fullscreen, "Fullscreen");
+        ui.radio_value(&mut draft.display, DisplayMode::Windowed, "Windowed");
+    });
+
+    // Monitor span — a single display or span all (lock 12).
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Monitors")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.radio_value(&mut draft.monitors, MonitorSpan::Single, "Single display");
+        ui.radio_value(&mut draft.monitors, MonitorSpan::All, "Span all");
+    });
+
+    // A Spice route is built honestly but its client is CHOOSER-5 — say so, never
+    // imply a live session (§7).
+    if !draft.protocol.has_client() {
+        ui.add_space(Style::SP_XS);
+        muted_note(
+            ui,
+            format!(
+                "The {} client lands in CHOOSER-5 — the request is recorded, but no session is \
+                 faked.",
+                draft.protocol.label()
+            ),
+        );
+    }
+
     ui.add_space(Style::SP_S);
     ui.horizontal(|ui| {
         if ui
-            .button(RichText::new(format!("Connect via {first}")).size(Style::BODY))
+            .button(
+                RichText::new(format!("Connect via {}", draft.protocol.label())).size(Style::BODY),
+            )
             .clicked()
         {
-            action = Some(CardAction::ConfirmMulti);
+            action = Some(CardAction::Confirm);
         }
         ui.add_space(Style::SP_S);
         if ui
             .button(RichText::new("Cancel").size(Style::BODY))
             .clicked()
         {
-            action = Some(CardAction::CancelMulti);
+            action = Some(CardAction::Cancel);
         }
     });
     action
@@ -1435,29 +1545,64 @@ mod tests {
         assert!(!state.take_popup(), "a seen source must not re-pop");
     }
 
-    // ── the connect flow ──
+    // ── the connect flow (CHOOSER-4) ──
 
     #[test]
-    fn a_single_protocol_mesh_source_connects_and_hands_off_once() {
+    fn the_protocol_route_maps_wire_tags_to_vdi_routes() {
+        // The routing fold: each renderable wire tag maps to its VDI route; an
+        // unknown tag has none (badged, never connected blind — §7).
+        assert_eq!(Protocol::Rdp.route(), Some(VdiProtocol::Rdp));
+        assert_eq!(Protocol::Vnc.route(), Some(VdiProtocol::Vnc));
+        assert_eq!(Protocol::Spice.route(), Some(VdiProtocol::Spice));
+        assert_eq!(Protocol::Unknown.route(), None);
+    }
+
+    #[test]
+    fn a_single_protocol_source_still_asks_display_options_then_hands_off_once() {
         let mut state = state_with(Some(roster(vec![source(
             "peer-vm:oak:web1",
             "oak",
             &[Protocol::Spice],
         )])));
         let sources = state.sources_snapshot();
-        state.activate(&sources, "peer-vm:oak:web1");
 
-        // The broker publish had no Bus root → the honest inline error (the
-        // same discipline as the E12-5b picker), but the Desktop hand-off
-        // still happens so the surface reflects the pending connect.
+        // Even a single protocol opens the picker: fullscreen/windowed + the
+        // monitor span are per-connection choices (locks 9/12), so activate must
+        // NOT connect — it seeds the draft to the one offer.
+        state.activate(&sources, "peer-vm:oak:web1");
+        assert!(
+            state.take_connect().is_none(),
+            "activate opens the picker, not a connect"
+        );
+        assert_eq!(
+            state.pending.as_ref().map(|d| d.protocol),
+            Some(VdiProtocol::Spice)
+        );
+
+        state.confirm_connect(&sources);
+        // The broker publish had no Bus root → the honest inline error (the same
+        // discipline as the E12-5b picker), but the Desktop hand-off still
+        // happens so the surface reflects the pending connect.
         assert!(state
             .last_error
             .as_deref()
             .is_some_and(|e| e.contains("Bus")));
-        let target = state.take_connect().expect("a target was handed off");
-        assert_eq!(target.serving_peer, "oak");
-        assert_eq!(target.name, "web1");
+        let req = state.take_connect().expect("a request was handed off");
+        assert_eq!(req.target.serving_peer, "oak");
+        assert_eq!(req.target.name, "web1");
+        assert_eq!(req.protocol, VdiProtocol::Spice);
+        assert_eq!(req.display, DisplayMode::Fullscreen, "seeded to fullscreen");
+        assert_eq!(
+            req.monitors,
+            MonitorSpan::Single,
+            "seeded to single display"
+        );
         assert!(state.take_connect().is_none(), "the hand-off drains once");
+        // The Spice route is gated on CHOOSER-5 — the note says so, no fake.
+        assert!(state
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("CHOOSER-5")));
     }
 
     #[test]
@@ -1474,6 +1619,7 @@ mod tests {
 
         let sources = state.sources_snapshot();
         state.activate(&sources, "mdns:192.168.1.60:3389:rdp");
+        state.confirm_connect(&sources);
         // No broker verb was attempted (no Bus error), and the note names the
         // gated direct-transport leg honestly (§7).
         assert!(state.last_error.is_none());
@@ -1481,8 +1627,9 @@ mod tests {
             .note
             .as_deref()
             .is_some_and(|n| n.contains("RDP") && n.contains("E12-4")));
-        let target = state.take_connect().expect("hand-off");
-        assert_eq!(target.name, "OfficePC");
+        let req = state.take_connect().expect("hand-off");
+        assert_eq!(req.target.name, "OfficePC");
+        assert_eq!(req.protocol, VdiProtocol::Rdp);
     }
 
     #[test]
@@ -1494,11 +1641,50 @@ mod tests {
         let sources = state.sources_snapshot();
         state.activate(&sources, "peer:ash");
         assert!(state.take_connect().is_none(), "greyed cards don't connect");
-        assert!(state.pending_multi.is_none());
+        assert!(
+            state.pending.is_none(),
+            "greyed cards don't open the picker"
+        );
     }
 
     #[test]
-    fn a_multi_protocol_source_asks_and_connects_only_on_confirm() {
+    fn an_unknown_only_source_offers_no_connectable_protocol() {
+        // A source advertising only a tag this build can't route: activation opens
+        // no picker and says so honestly — never a blind connect (§7).
+        let mut state = state_with(Some(roster(vec![source(
+            "peer:oak",
+            "oak",
+            &[Protocol::Unknown],
+        )])));
+        let sources = state.sources_snapshot();
+        state.activate(&sources, "peer:oak");
+        assert!(state.pending.is_none(), "no routable protocol → no picker");
+        assert!(state.take_connect().is_none());
+        assert!(state
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("no connectable protocol")));
+    }
+
+    #[test]
+    fn the_picker_seeds_the_first_routable_offer_skipping_unknown() {
+        // [Unknown, Rdp]: the unknown tag is badged but never routed — the picker
+        // seeds to RDP (the first routable offer).
+        let mut state = state_with(Some(roster(vec![source(
+            "peer:oak",
+            "oak",
+            &[Protocol::Unknown, Protocol::Rdp],
+        )])));
+        let sources = state.sources_snapshot();
+        state.activate(&sources, "peer:oak");
+        assert_eq!(
+            state.pending.as_ref().map(|d| d.protocol),
+            Some(VdiProtocol::Rdp)
+        );
+    }
+
+    #[test]
+    fn a_multi_protocol_source_asks_the_protocol_and_connects_only_on_confirm() {
         let mut state = state_with(Some(roster(vec![source(
             "peer:oak",
             "oak",
@@ -1506,21 +1692,39 @@ mod tests {
         )])));
         let sources = state.sources_snapshot();
 
-        // Activation raises the CHOOSER-4 ask — it must NOT connect.
+        // Activation raises the CHOOSER-4 picker seeded to the first offer — it
+        // must NOT connect (lock 6 — always-ask, never a silent first-pick).
         state.activate(&sources, "peer:oak");
-        assert_eq!(state.pending_multi.as_deref(), Some("peer:oak"));
+        assert_eq!(
+            state.pending.as_ref().map(|d| d.source_id.as_str()),
+            Some("peer:oak")
+        );
+        assert_eq!(
+            state.pending.as_ref().map(|d| d.protocol),
+            Some(VdiProtocol::Rdp)
+        );
         assert!(state.take_connect().is_none(), "no silent first-pick");
 
         // Cancel backs out.
-        state.cancel_multi();
-        assert!(state.pending_multi.is_none());
+        state.cancel_connect();
+        assert!(state.pending.is_none());
 
-        // Ask again, then an explicit confirm connects (via the first offer).
+        // Ask again, pick VNC + windowed + span-all, then confirm — the request
+        // is built from exactly those choices (the CHOOSER-4 construction fold).
         state.activate(&sources, "peer:oak");
-        state.confirm_multi(&sources);
-        assert!(state.pending_multi.is_none());
-        let target = state.take_connect().expect("confirm connects");
-        assert_eq!(target.serving_peer, "oak");
+        {
+            let draft = state.pending.as_mut().expect("the picker is open");
+            draft.protocol = VdiProtocol::Vnc;
+            draft.display = DisplayMode::Windowed;
+            draft.monitors = MonitorSpan::All;
+        }
+        state.confirm_connect(&sources);
+        assert!(state.pending.is_none());
+        let req = state.take_connect().expect("confirm connects");
+        assert_eq!(req.target.serving_peer, "oak");
+        assert_eq!(req.protocol, VdiProtocol::Vnc);
+        assert_eq!(req.display, DisplayMode::Windowed);
+        assert_eq!(req.monitors, MonitorSpan::All);
     }
 
     // ── headless mount renders (the DRM runner's path, minus the GPU) ──
@@ -1611,7 +1815,7 @@ mod tests {
     }
 
     #[test]
-    fn the_raised_protocol_ask_renders_the_chooser4_affordance() {
+    fn the_raised_connect_picker_renders_the_chooser4_affordance() {
         let mut state = state_with(Some(roster(vec![source(
             "peer:oak",
             "oak",
@@ -1621,10 +1825,28 @@ mod tests {
         state.activate(&sources, "peer:oak");
         assert!(
             run_panel(&mut state),
-            "the protocol-ask affordance produced no draw primitives"
+            "the connect-picker affordance produced no draw primitives"
         );
-        // Rendering the ask is not a connect.
+        // Rendering the picker is not a connect.
         assert!(state.take_connect().is_none());
+    }
+
+    #[test]
+    fn a_gated_spice_picker_renders_the_chooser5_note() {
+        // A Spice-only source: the picker renders, and the gated-Spice note is
+        // present (§7 — the request is honest, no session faked).
+        let mut state = state_with(Some(roster(vec![source(
+            "peer-vm:oak:win11",
+            "oak",
+            &[Protocol::Spice],
+        )])));
+        let sources = state.sources_snapshot();
+        state.activate(&sources, "peer-vm:oak:win11");
+        assert!(
+            run_panel(&mut state),
+            "the gated-Spice picker produced no draw primitives"
+        );
+        assert!(state.take_connect().is_none(), "rendering is not a connect");
     }
 
     // ── CHOOSER-3: the thumbnail decode + bounded/throttled cache ──
