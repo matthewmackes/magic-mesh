@@ -99,6 +99,20 @@ pub trait UPowerClient: Send {
     /// # Errors
     /// Typed: [`SeatError::Unavailable`] when `UPower` / the system bus is absent.
     fn batteries(&self) -> Result<Vec<Battery>, SeatError>;
+
+    /// Whether the host is on external (AC) power, read from the `LinePower`
+    /// adapter's `Online` property — the honest on-AC vs on-battery answer that
+    /// [`Self::batteries`] deliberately drops (line power is not a battery).
+    ///
+    /// - `Ok(Some(true))` — a `LinePower` adapter is present and online (on AC).
+    /// - `Ok(Some(false))` — present but offline (on battery).
+    /// - `Ok(None)` — no `LinePower` device tracked (a desktop with no such
+    ///   adapter, or one without an `Online` reading): AC state is unknown, not
+    ///   guessed (§7).
+    ///
+    /// # Errors
+    /// Typed: [`SeatError::Unavailable`] when `UPower` / the system bus is absent.
+    fn on_ac(&self) -> Result<Option<bool>, SeatError>;
 }
 
 /// The production `UPower` client: `EnumerateDevices`, then one `GetAll` per
@@ -151,6 +165,31 @@ impl UPowerClient for ZbusUPower {
                 .then(a.model.cmp(&b.model))
         });
         Ok(out)
+    }
+
+    fn on_ac(&self) -> Result<Option<bool>, SeatError> {
+        let devices: Vec<zbus::zvariant::OwnedObjectPath> = self.bus.call(
+            UPOWER,
+            "/org/freedesktop/UPower",
+            UPOWER,
+            "EnumerateDevices",
+            &(),
+        )?;
+        // The first LinePower adapter with an `Online` reading answers on-AC.
+        // Absent (a desktop) folds to `None` — honest "unknown", not a guess.
+        for path in devices {
+            let props: PropMap = self.bus.call(
+                UPOWER,
+                path.as_str(),
+                "org.freedesktop.DBus.Properties",
+                "GetAll",
+                &("org.freedesktop.UPower.Device",),
+            )?;
+            if let Some(online) = fold_line_power_online(&props) {
+                return Ok(Some(online));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -222,6 +261,22 @@ pub fn fold_battery(path: &str, props: &PropMap) -> Option<Battery> {
         state: state_from_code(u32_prop(props, "State").unwrap_or(0)),
         power_supply: bool_prop(props, "PowerSupply").unwrap_or(false),
     })
+}
+
+/// Fold one `UPower` device property bag into its AC-present reading. Pure.
+/// Returns `Some(online)` only for the `LinePower` adapter (`Type` == 1) that
+/// carries an `Online` bool; `None` for any other device kind or a `LinePower`
+/// with no `Online` reading — so a desktop with no adapter reads honestly as
+/// "AC unknown", never a fabricated on-AC (§7). Kept separate from
+/// [`fold_battery`], which still drops line power as a *battery*.
+#[must_use]
+pub fn fold_line_power_online(props: &PropMap) -> Option<bool> {
+    // Type 1 is UPower's `LinePower` (the AC adapter); everything else is not
+    // the mains reading we want here.
+    if u32_prop(props, "Type") != Some(1) {
+        return None;
+    }
+    bool_prop(props, "Online")
 }
 
 #[cfg(test)]
@@ -306,6 +361,92 @@ mod tests {
     }
 
     #[test]
+    fn line_power_online_folds_to_the_ac_present_reading() {
+        // Present + online: the AC adapter is plugged in.
+        let online = props(vec![
+            ("Type", OwnedValue::from(1_u32)),
+            ("Online", OwnedValue::from(true)),
+        ]);
+        assert_eq!(fold_line_power_online(&online), Some(true));
+
+        // Present + offline: the adapter exists but the host runs on battery.
+        let offline = props(vec![
+            ("Type", OwnedValue::from(1_u32)),
+            ("Online", OwnedValue::from(false)),
+        ]);
+        assert_eq!(fold_line_power_online(&offline), Some(false));
+
+        // A battery (Type 2) is not the line-power reading → None.
+        let battery = props(vec![
+            ("Type", OwnedValue::from(2_u32)),
+            ("Online", OwnedValue::from(true)),
+        ]);
+        assert_eq!(fold_line_power_online(&battery), None);
+
+        // A LinePower device with no `Online` prop is honestly unknown → None,
+        // never defaulted to on-AC (§7).
+        let mute = props(vec![("Type", OwnedValue::from(1_u32))]);
+        assert_eq!(fold_line_power_online(&mute), None);
+    }
+
+    /// A test double over the trait seam: it holds the device property bags a
+    /// live `UPower` would enumerate and runs the *real* pure folds over them —
+    /// so the on-AC read is exercised without a system bus.
+    struct FakeUPower {
+        devices: Vec<PropMap>,
+    }
+
+    impl UPowerClient for FakeUPower {
+        fn batteries(&self) -> Result<Vec<Battery>, SeatError> {
+            Ok(self
+                .devices
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| fold_battery(&format!("/u/dev_{i}"), p))
+                .collect())
+        }
+
+        fn on_ac(&self) -> Result<Option<bool>, SeatError> {
+            Ok(self.devices.iter().find_map(fold_line_power_online))
+        }
+    }
+
+    #[test]
+    fn fake_client_reports_on_ac_from_the_line_power_device() {
+        let line_power = |online: bool| {
+            props(vec![
+                ("Type", OwnedValue::from(1_u32)),
+                ("Online", OwnedValue::from(online)),
+            ])
+        };
+        let battery = || {
+            props(vec![
+                ("Type", OwnedValue::from(2_u32)),
+                ("Percentage", OwnedValue::from(80.0_f64)),
+                ("IsPresent", OwnedValue::from(true)),
+            ])
+        };
+
+        // Present + online (adapter alongside a battery) → on AC.
+        let plugged = FakeUPower {
+            devices: vec![battery(), line_power(true)],
+        };
+        assert_eq!(plugged.on_ac().expect("fake never errors"), Some(true));
+
+        // Present + offline → on battery.
+        let unplugged = FakeUPower {
+            devices: vec![line_power(false), battery()],
+        };
+        assert_eq!(unplugged.on_ac().expect("fake never errors"), Some(false));
+
+        // Absent (a desktop / battery-only enumeration) → None, not guessed.
+        let desktop = FakeUPower {
+            devices: vec![battery()],
+        };
+        assert_eq!(desktop.on_ac().expect("fake never errors"), None);
+    }
+
+    #[test]
     fn the_real_client_on_this_host_answers_typed_never_panics() {
         match ZbusUPower::new().batteries() {
             Ok(batteries) => {
@@ -313,6 +454,12 @@ mod tests {
                     assert!((0.0..=100.0).contains(&b.percentage), "{b:?}");
                 }
             }
+            Err(e) => assert_eq!(e.backend(), Backend::UPower),
+        }
+        // The on-AC probe is likewise typed: a reading (Some/None) on a live
+        // host, or a UPower-tagged error on a headless one — never a panic.
+        match ZbusUPower::new().on_ac() {
+            Ok(_) => {}
             Err(e) => assert_eq!(e.backend(), Backend::UPower),
         }
     }

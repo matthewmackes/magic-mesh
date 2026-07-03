@@ -69,6 +69,11 @@ pub struct SeatSnapshot {
     pub bluetooth: Probe<BtStatus>,
     /// Power devices (multi-battery incl. peripherals).
     pub batteries: Probe<Vec<Battery>>,
+    /// On external (AC) power, from the `UPower` `LinePower` adapter's `Online`
+    /// reading: `Present(Some(true))` on AC, `Present(Some(false))` on battery,
+    /// `Present(None)` when no adapter is tracked (a desktop — AC state unknown),
+    /// `Absent` when `UPower`/the bus is down.
+    pub on_ac: Probe<Option<bool>>,
     /// logind power capabilities (which verbs are available).
     pub power: Probe<PowerCaps>,
     /// DRM connectors + their modes (read-only probe).
@@ -141,6 +146,7 @@ impl Seat {
         SeatSnapshot {
             bluetooth: Probe::from_result(self.bluez.status()),
             batteries: Probe::from_result(self.upower.batteries()),
+            on_ac: Probe::from_result(self.upower.on_ac()),
             power: Probe::from_result(self.logind.caps()),
             displays: Probe::from_result(self.display.connectors()),
             backlights: Probe::from_result(self.backlight.devices()),
@@ -388,6 +394,11 @@ mod tests {
         }
         if let Probe::Absent { backend, .. } = &snap.ddc {
             assert_eq!(*backend, Backend::Ddc);
+        }
+        // The on-AC read shares UPower's backend: a headless host has no bus, so
+        // it is Absent tagged UPower; a live host answers Present(Some/None).
+        if let Probe::Absent { backend, .. } = &snap.on_ac {
+            assert_eq!(*backend, Backend::UPower);
         }
     }
 }

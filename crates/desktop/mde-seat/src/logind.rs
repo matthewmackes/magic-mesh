@@ -25,8 +25,10 @@ const MANAGER_IFACE: &str = "org.freedesktop.login1.Manager";
 pub enum PowerVerb {
     /// Lock this session (logind's `session/auto` — the caller's own session).
     Lock,
-    /// Suspend the host.
+    /// Suspend the host (suspend-to-RAM).
     Suspend,
+    /// Hibernate the host (suspend-to-disk).
+    Hibernate,
     /// Reboot the host.
     Reboot,
     /// Power the host off.
@@ -40,6 +42,7 @@ impl PowerVerb {
         match self {
             Self::Lock => "Lock",
             Self::Suspend => "Suspend",
+            Self::Hibernate => "Hibernate",
             Self::Reboot => "Reboot",
             Self::PowerOff => "Power off",
         }
@@ -59,6 +62,7 @@ impl PowerVerb {
         match self {
             Self::Lock => None,
             Self::Suspend => Some("Suspend"),
+            Self::Hibernate => Some("Hibernate"),
             Self::Reboot => Some("Reboot"),
             Self::PowerOff => Some("PowerOff"),
         }
@@ -70,6 +74,7 @@ impl PowerVerb {
         match self {
             Self::Lock => None,
             Self::Suspend => Some("CanSuspend"),
+            Self::Hibernate => Some("CanHibernate"),
             Self::Reboot => Some("CanReboot"),
             Self::PowerOff => Some("CanPowerOff"),
         }
@@ -125,6 +130,8 @@ impl Avail {
 pub struct PowerCaps {
     /// `CanSuspend`.
     pub suspend: Avail,
+    /// `CanHibernate`.
+    pub hibernate: Avail,
     /// `CanReboot`.
     pub reboot: Avail,
     /// `CanPowerOff`.
@@ -138,6 +145,7 @@ impl PowerCaps {
         match verb {
             PowerVerb::Lock => Avail::Yes,
             PowerVerb::Suspend => self.suspend,
+            PowerVerb::Hibernate => self.hibernate,
             PowerVerb::Reboot => self.reboot,
             PowerVerb::PowerOff => self.poweroff,
         }
@@ -199,6 +207,7 @@ impl LogindClient for ZbusLogind {
     fn caps(&self) -> Result<PowerCaps, SeatError> {
         Ok(PowerCaps {
             suspend: self.can(PowerVerb::Suspend)?,
+            hibernate: self.can(PowerVerb::Hibernate)?,
             reboot: self.can(PowerVerb::Reboot)?,
             poweroff: self.can(PowerVerb::PowerOff)?,
         })
@@ -256,17 +265,23 @@ mod tests {
         // Lock targets the session object, not the Manager.
         assert_eq!(PowerVerb::Lock.manager_method(), None);
         assert_eq!(PowerVerb::Suspend.manager_method(), Some("Suspend"));
+        assert_eq!(PowerVerb::Hibernate.manager_method(), Some("Hibernate"));
         assert_eq!(PowerVerb::Reboot.manager_method(), Some("Reboot"));
         assert_eq!(PowerVerb::PowerOff.manager_method(), Some("PowerOff"));
 
         assert_eq!(PowerVerb::Suspend.can_method(), Some("CanSuspend"));
+        assert_eq!(PowerVerb::Hibernate.can_method(), Some("CanHibernate"));
         assert_eq!(PowerVerb::Reboot.can_method(), Some("CanReboot"));
         assert_eq!(PowerVerb::PowerOff.can_method(), Some("CanPowerOff"));
+
+        // The operator-facing label.
+        assert_eq!(PowerVerb::Hibernate.label(), "Hibernate");
 
         // Lock 12: everything that takes the host down is confirm-gated;
         // locking is not.
         assert!(!PowerVerb::Lock.needs_confirm());
         assert!(PowerVerb::Suspend.needs_confirm());
+        assert!(PowerVerb::Hibernate.needs_confirm());
         assert!(PowerVerb::Reboot.needs_confirm());
         assert!(PowerVerb::PowerOff.needs_confirm());
     }
@@ -275,13 +290,40 @@ mod tests {
     fn caps_route_each_verb_to_its_probe() {
         let caps = PowerCaps {
             suspend: Avail::Yes,
+            hibernate: Avail::Na,
             reboot: Avail::Challenge,
             poweroff: Avail::No,
         };
         assert_eq!(caps.for_verb(PowerVerb::Lock), Avail::Yes);
         assert_eq!(caps.for_verb(PowerVerb::Suspend), Avail::Yes);
+        // A host with swap too small for suspend-to-disk answers `na` — the
+        // Hibernate button renders as unavailable, never a dead control.
+        assert_eq!(caps.for_verb(PowerVerb::Hibernate), Avail::Na);
         assert_eq!(caps.for_verb(PowerVerb::Reboot), Avail::Challenge);
         assert_eq!(caps.for_verb(PowerVerb::PowerOff), Avail::No);
+    }
+
+    #[test]
+    fn a_can_hibernate_reply_folds_into_the_hibernate_cap() {
+        // The same path `caps()` walks for Hibernate: logind's `CanHibernate`
+        // reply string → typed `Avail` → the `PowerCaps.hibernate` field →
+        // `for_verb(Hibernate)`. A "yes" is offerable; a too-small-swap "na" is
+        // not (rendered unavailable, never a dead button — interlock 4).
+        let yes = PowerCaps {
+            suspend: Avail::Na,
+            hibernate: Avail::from_reply("yes"),
+            reboot: Avail::Na,
+            poweroff: Avail::Na,
+        };
+        assert_eq!(yes.for_verb(PowerVerb::Hibernate), Avail::Yes);
+        assert!(yes.for_verb(PowerVerb::Hibernate).offerable());
+
+        let na = PowerCaps {
+            hibernate: Avail::from_reply("na"),
+            ..yes
+        };
+        assert_eq!(na.for_verb(PowerVerb::Hibernate), Avail::Na);
+        assert!(!na.for_verb(PowerVerb::Hibernate).offerable());
     }
 
     #[test]
