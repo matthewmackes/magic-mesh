@@ -55,6 +55,17 @@
 //!   [`roster`] mirrors the presence roster and [`picker::RemotePicker`] is the
 //!   "new terminal on → <peer>" picker + manual host entry; [`session::Session`]
 //!   is the local-or-remote backing the one [`widget::TerminalWidget`] renders.
+//!
+//! - [`search`] + [`smart`] (TERM-9) — scrollback search + a smart clipboard,
+//!   both pure folds over the reused grid/scrollback [`screen::Screen`] (§6).
+//!   [`search::Search`] finds a literal-or-regex query row-by-row with smart
+//!   case, next/prev, and wrap; the widget highlights the hits through `Style`
+//!   tokens and scrolls the current one into view. [`smart`] classifies the
+//!   token under a double-click (word / URL / path) or a triple-click (line),
+//!   drives copy-on-select + middle-click paste, and — per design lock Q12 —
+//!   routes a Ctrl-clicked URL to the Bookmarks browser / a path to the Files
+//!   surface over the Bus ([`smart::LaunchBus`], published on
+//!   [`smart::OPEN_TOPIC`]).
 
 pub mod engine;
 pub mod palette;
@@ -63,7 +74,9 @@ pub mod pty;
 pub mod remote;
 pub mod roster;
 pub mod screen;
+pub mod search;
 pub mod session;
+pub mod smart;
 pub mod splits;
 pub mod tabs;
 pub mod widget;
@@ -74,9 +87,14 @@ pub use pty::{LocalPty, SpawnOptions};
 pub use remote::{BusPtyClient, PtyBus, RemotePty, RemoteStatus};
 pub use roster::{BusRoster, Presence, RosterClient, RosterSnapshot};
 pub use screen::{Cell, CellAttrs, CellColor, CursorPos, Screen};
+pub use search::{CaseMode, Match, Search};
 pub use session::Session;
+pub use smart::{
+    detect_launch, line_span, route, smart_span, BusLaunchClient, LaunchBus, LaunchRequest,
+    LaunchRoute, SmartKind, OPEN_TOPIC,
+};
 pub use splits::{
     consume_commands, Broadcast, Command, NavDir, Pane, SessionId, SplitDir, SplitTerminal,
 };
 pub use tabs::{consume_tab_commands, RemoteHub, TabCommand, TabbedTerminal};
-pub use widget::TerminalWidget;
+pub use widget::{ClipboardOptions, TerminalWidget};

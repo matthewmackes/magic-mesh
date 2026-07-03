@@ -25,6 +25,7 @@
 //! and session-ended chips) is `Style` tokens; the only colour table lives in
 //! [`palette`] with its documented carve-out.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use mde_egui::egui::text::LayoutJob;
@@ -38,7 +39,9 @@ use crate::palette;
 use crate::pty::LocalPty;
 use crate::remote::RemotePty;
 use crate::screen::{Cell, Screen};
+use crate::search::Search;
 use crate::session::Session;
+use crate::smart::{self, BusLaunchClient, LaunchBus};
 
 /// Repaint cadence while the session is live. PTY output arrives on the pump
 /// thread with no egui waker, so the surface heartbeats at ~30 fps and stops
@@ -93,6 +96,44 @@ impl Selection {
     }
 }
 
+/// The smart-clipboard behaviour toggles (design lock Q12: "optional
+/// copy-on-select + paste-on-middle-click").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ClipboardOptions {
+    /// Copy a finished selection to the clipboard the moment the drag ends (no
+    /// explicit `Ctrl+Shift+C` needed). Off by default — the conservative
+    /// choice, so a stray drag never clobbers the clipboard.
+    pub copy_on_select: bool,
+    /// Middle-click pastes the last selection (the X11 PRIMARY convention,
+    /// emulated in-process). On by default.
+    pub paste_on_middle_click: bool,
+}
+
+impl Default for ClipboardOptions {
+    fn default() -> Self {
+        Self {
+            copy_on_select: false,
+            paste_on_middle_click: true,
+        }
+    }
+}
+
+/// A search match projected into the current window: `len` cells at `col` on
+/// window-local `row`, `current` for the focused hit. Built each frame from
+/// [`Search`] and painted through `Style` tokens.
+struct SearchHit {
+    row: usize,
+    col: usize,
+    len: usize,
+    current: bool,
+}
+
+/// The search-overlay label + tone for this frame (`None` when search is off).
+struct SearchBar {
+    label: String,
+    tone: egui::Color32,
+}
+
 /// How the cursor cell paints this frame.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CursorPaint {
@@ -120,6 +161,11 @@ struct PaintSpec {
     /// An honest status chip (text + colour): a local "session ended", or a
     /// remote connecting / reconnecting / ended / failed note (§7).
     note: Option<(String, egui::Color32)>,
+    /// Scrollback-search hits within this window (TERM-9), painted as a token
+    /// underlay; the current hit reads brighter.
+    search_hits: Vec<SearchHit>,
+    /// The search-overlay chip (`None` when the overlay is closed).
+    search_bar: Option<SearchBar>,
 }
 
 /// The interactive terminal pane: one [`Session`] (a local PTY shell or a remote
@@ -140,13 +186,29 @@ pub struct TerminalWidget {
     /// as the pane types, drained by [`Self::take_input_echo`], and cleared at
     /// the top of every [`Self::show`] so it only ever holds one frame's input.
     input_echo: Vec<u8>,
+    /// Scrollback search state (TERM-9): the overlay + query + match list.
+    search: Search,
+    /// The scrollback length at the last search rescan — a change (new output)
+    /// re-triggers a rescan while the overlay is open.
+    search_history: usize,
+    /// A pending "scroll the current match into view" request (set on
+    /// open/type/next/prev, consumed in [`Self::show`]).
+    search_follow: bool,
+    /// Smart-clipboard behaviour toggles (copy-on-select, middle-click paste).
+    clip: ClipboardOptions,
+    /// The last selection, kept as an in-process PRIMARY buffer that a
+    /// middle-click pastes — X11's select-to-copy without a real X server.
+    primary: Option<String>,
+    /// The Bus seam a Ctrl-clicked URL/path is dispatched over (TERM-9): the
+    /// mesh surface-launch path. Injectable so tests record it.
+    launch_bus: Arc<dyn LaunchBus>,
 }
 
 impl TerminalWidget {
     /// Wrap a spawned local shell. The widget sizes the PTY to its rect on the
     /// first frame, so the spawn dimensions only cover the gap until then.
     #[must_use]
-    pub const fn new(pty: LocalPty) -> Self {
+    pub fn new(pty: LocalPty) -> Self {
         Self::over(Session::Local(pty))
     }
 
@@ -159,7 +221,7 @@ impl TerminalWidget {
 
     /// Wrap either backing behind the shared render/input path.
     #[must_use]
-    const fn over(session: Session) -> Self {
+    fn over(session: Session) -> Self {
         Self {
             session,
             font_size: Style::BODY,
@@ -169,6 +231,12 @@ impl TerminalWidget {
             selection: None,
             last_grid: None,
             input_echo: Vec::new(),
+            search: Search::new(),
+            search_history: 0,
+            search_follow: false,
+            clip: ClipboardOptions::default(),
+            primary: None,
+            launch_bus: Arc::new(BusLaunchClient::from_env()),
         }
     }
 
@@ -183,6 +251,21 @@ impl TerminalWidget {
     #[must_use]
     pub const fn with_cursor_blink(mut self, blink: bool) -> Self {
         self.cursor_blink = blink;
+        self
+    }
+
+    /// Smart-clipboard toggles (copy-on-select, middle-click paste — Q12).
+    #[must_use]
+    pub const fn with_clipboard_options(mut self, opts: ClipboardOptions) -> Self {
+        self.clip = opts;
+        self
+    }
+
+    /// Inject the surface-launch Bus seam (tests record the routed opens;
+    /// production resolves the live Bus via [`Self::over`]).
+    #[must_use]
+    pub fn with_launch_bus(mut self, bus: Arc<dyn LaunchBus>) -> Self {
+        self.launch_bus = bus;
         self
     }
 
@@ -232,6 +315,21 @@ impl TerminalWidget {
             .session
             .with_terminal(crate::engine::Terminal::scrollback_len);
         self.handle_input(ui, &response, cell, usize::from(rows), history);
+
+        // Scrollback search (TERM-9): rescan on a query/mode change or new
+        // output, then scroll the current match into view. The full-history
+        // snapshot is taken only when a rescan is actually due.
+        if self.search.active() && (self.search.dirty() || history != self.search_history) {
+            let full = self.session.with_terminal(crate::engine::Terminal::full);
+            self.search.recompute(&full);
+            self.search_history = history;
+        }
+        if self.search_follow {
+            if let Some(row) = self.search.current_row() {
+                self.scroll_offset = scroll_for_row(row, history, usize::from(rows));
+            }
+            self.search_follow = false;
+        }
         self.scroll_offset = self.scroll_offset.min(history);
 
         // One engine read for the visible window (O(rows × cols), never the
@@ -239,7 +337,8 @@ impl TerminalWidget {
         let screen = self.session.with_terminal(|t| t.window(self.scroll_offset));
         let first_abs = history - self.scroll_offset;
 
-        self.handle_pointer(&response, rect, cell, first_abs, &screen);
+        let modifiers = ui.input(|i| i.modifiers);
+        self.handle_pointer(&response, rect, cell, first_abs, &screen, modifiers);
 
         // The backing's render chrome: liveness (cursor + repaint), the node
         // marker (remote), and the honest status note (§7).
@@ -255,6 +354,8 @@ impl TerminalWidget {
         };
 
         let live = render.live;
+        let search_hits = self.search_hits(first_abs, screen.rows());
+        let search_bar = self.search_bar();
         paint_grid(
             &ui.painter_at(rect),
             rect,
@@ -268,6 +369,8 @@ impl TerminalWidget {
                 scrolled: self.scroll_offset,
                 node: render.node,
                 note: render.note,
+                search_hits,
+                search_bar,
             },
         );
 
@@ -313,12 +416,38 @@ impl TerminalWidget {
 
         let (events, shift_held) = ui.input(|i| (i.events.clone(), i.modifiers.shift));
         for event in events {
-            match event {
-                // Wheel scrolling works on hover, focused or not.
-                Event::MouseWheel { unit, delta, .. } if response.hovered() => {
-                    self.wheel(unit, delta.y, cell.y, rows, history);
+            // Wheel scrolling works on hover, focused or not.
+            if let Event::MouseWheel { unit, delta, .. } = &event {
+                if response.hovered() {
+                    self.wheel(*unit, delta.y, cell.y, rows, history);
                 }
-                _ if !focused => {}
+                continue;
+            }
+            if !focused {
+                continue;
+            }
+            // Ctrl+Shift+F opens / closes the scrollback-search overlay (TERM-9)
+            // — claimed before the query grabs plain keys below.
+            if let Event::Key {
+                key: Key::F,
+                pressed: true,
+                modifiers,
+                ..
+            } = &event
+            {
+                if modifiers.ctrl && modifiers.shift {
+                    self.search.toggle();
+                    self.search_follow = self.search.active();
+                    continue;
+                }
+            }
+            // With the overlay open, typed keys drive the query, not the shell
+            // (shell input resumes when it closes).
+            if self.search.active() {
+                self.search_event(&event);
+                continue;
+            }
+            match event {
                 Event::Text(text) => self.send(text.as_bytes()),
                 Event::Key {
                     key,
@@ -412,7 +541,133 @@ impl TerminalWidget {
         self.scroll_offset = usize::try_from(next).unwrap_or(usize::MAX).min(history);
     }
 
-    /// Mouse selection: press anchors, drag extends, plain click clears.
+    /// Drive the search overlay from one event: type into the query, delete,
+    /// navigate matches, or toggle regex/case. Anything else is swallowed so it
+    /// never reaches the shell while the overlay is open.
+    fn search_event(&mut self, event: &Event) {
+        match event {
+            Event::Text(text) => {
+                self.search.push_str(text);
+                self.search_follow = true;
+            }
+            Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => match key {
+                Key::Backspace => {
+                    self.search.pop_char();
+                    self.search_follow = true;
+                }
+                Key::Escape => self.search.close(),
+                // Enter / F3 step forward, Shift+ steps back — the classic
+                // find-next / find-previous.
+                Key::Enter | Key::F3 => {
+                    if modifiers.shift {
+                        self.search.prev_match();
+                    } else {
+                        self.search.next_match();
+                    }
+                    self.search_follow = true;
+                }
+                // Alt+R flips literal ⇄ regex; Alt+C cycles the case mode.
+                Key::R if modifiers.alt => self.search.toggle_regex(),
+                Key::C if modifiers.alt => self.search.cycle_case(),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// The search matches falling inside the current window, projected to
+    /// window-local rows for the painter (TERM-9).
+    fn search_hits(&self, first_abs: usize, rows: usize) -> Vec<SearchHit> {
+        if !self.search.active() {
+            return Vec::new();
+        }
+        self.search
+            .matches()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                let row = m.row.checked_sub(first_abs)?;
+                (row < rows).then_some(SearchHit {
+                    row,
+                    col: m.col,
+                    len: m.len,
+                    current: self.search.current_index() == Some(i),
+                })
+            })
+            .collect()
+    }
+
+    /// The search-overlay chip for this frame (`None` when closed).
+    fn search_bar(&self) -> Option<SearchBar> {
+        if !self.search.active() {
+            return None;
+        }
+        let mut flags = String::new();
+        if self.search.is_regex() {
+            flags.push_str("re ");
+        }
+        flags.push_str(self.search.case().label());
+        // A tuple match keeps the four states flat (and clear of the nursery's
+        // if-let/else rewrite): error → empty → no-match → the i/n counter.
+        let (status, tone) = match (
+            self.search.error(),
+            self.search.query().is_empty(),
+            self.search.count(),
+        ) {
+            (Some(err), _, _) => (format!("regex: {err}"), Style::DANGER),
+            (None, true, _) => ("type to search".to_string(), Style::TEXT_DIM),
+            (None, false, 0) => ("no matches".to_string(), Style::TEXT_DIM),
+            (None, false, n) => {
+                let at = self.search.current_index().map_or(0, |i| i + 1);
+                (format!("{at}/{n}"), Style::ACCENT)
+            }
+        };
+        Some(SearchBar {
+            label: format!("find: {}  {status}  [{flags}]", self.search.query()),
+            tone,
+        })
+    }
+
+    /// Set the selection to `[start, end)` cells on absolute `row` (the
+    /// [`Selection`] head is inclusive, so it lands on `end - 1`).
+    const fn set_span_selection(&mut self, row: usize, start: usize, end: usize) {
+        if end <= start {
+            return;
+        }
+        self.selection = Some(Selection {
+            anchor: CellPos { row, col: start },
+            head: CellPos { row, col: end - 1 },
+        });
+    }
+
+    /// Finish a selection: refresh the in-process PRIMARY buffer (what a
+    /// middle-click pastes) and, when copy-on-select is on, mirror it to the
+    /// clipboard. A one-shot full snapshot — the selection may live in history.
+    fn after_select(&mut self, ctx: &Context) {
+        let Some(sel) = self.selection else {
+            return;
+        };
+        let text = self
+            .session
+            .with_terminal(|t| selected_text(&t.full(), &sel));
+        if text.is_empty() {
+            return;
+        }
+        if self.clip.copy_on_select {
+            ctx.copy_text(text.clone());
+        }
+        self.primary = Some(text);
+    }
+
+    /// Mouse selection + the smart-clipboard gestures (TERM-9): double-click
+    /// smart-selects a word/URL/path, triple-click a line, middle-click pastes
+    /// the PRIMARY buffer, Ctrl+click opens a detected URL/path; press anchors,
+    /// drag extends, plain click clears.
     fn handle_pointer(
         &mut self,
         response: &Response,
@@ -420,7 +675,10 @@ impl TerminalWidget {
         cell: Vec2,
         first_abs: usize,
         screen: &Screen,
+        modifiers: Modifiers,
     ) {
+        let ctx = &response.ctx;
+        let pos_to_local = |pos: Pos2| cell_at(rect.min, cell, pos, screen.cols(), screen.rows());
         let pos_to_cell = |pos: Pos2| {
             let (row, col) = cell_at(rect.min, cell, pos, screen.cols(), screen.rows());
             CellPos {
@@ -428,6 +686,49 @@ impl TerminalWidget {
                 col,
             }
         };
+
+        // Triple-click → whole visible line; double-click → word/URL/path.
+        if response.triple_clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let (row, _) = pos_to_local(pos);
+                if let Some((s, e)) = smart::line_span(&row_chars(screen, row)) {
+                    self.set_span_selection(first_abs + row, s, e);
+                    self.after_select(ctx);
+                }
+            }
+            return;
+        }
+        if response.double_clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let (row, col) = pos_to_local(pos);
+                if let Some((_, s, e)) = smart::smart_span(&row_chars(screen, row), col) {
+                    self.set_span_selection(first_abs + row, s, e);
+                    self.after_select(ctx);
+                }
+            }
+            return;
+        }
+        // Middle-click pastes the PRIMARY buffer (X11 select-to-paste emulation).
+        if response.middle_clicked() {
+            if self.clip.paste_on_middle_click {
+                if let Some(text) = self.primary.clone() {
+                    self.send(&paste_bytes(&text));
+                }
+            }
+            return;
+        }
+        // Ctrl+click a detected URL/path → dispatch it to its surface over the
+        // Bus (URL → Bookmarks, path → Files). A miss falls through to a click.
+        if response.clicked() && (modifiers.command || modifiers.ctrl) {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let (row, col) = pos_to_local(pos);
+                if let Some(route) = smart::detect_launch(&row_chars(screen, row), col) {
+                    let _ = self.launch_bus.open(&route);
+                    return;
+                }
+            }
+        }
+
         if response.drag_started() {
             if let Some(pos) = response.interact_pointer_pos() {
                 let p = pos_to_cell(pos);
@@ -439,6 +740,8 @@ impl TerminalWidget {
             {
                 sel.head = pos_to_cell(pos);
             }
+        } else if response.drag_stopped() {
+            self.after_select(ctx);
         } else if response.clicked() {
             self.selection = None;
         }
@@ -683,6 +986,23 @@ fn blink_on(time: f64) -> bool {
     (time / BLINK_HALF_PERIOD).rem_euclid(2.0) < 1.0
 }
 
+/// A window row's glyphs as a `char` slice — the input the smart-selection and
+/// launch-detection folds ([`crate::smart`]) read (one cell = one column).
+fn row_chars(screen: &Screen, row: usize) -> Vec<char> {
+    screen
+        .row(row)
+        .map(|cells| cells.iter().map(|c| c.ch).collect())
+        .unwrap_or_default()
+}
+
+/// The scrollback offset that brings absolute `row` into the viewport with a
+/// quarter-window of context above it. `0` keeps the live view; a deep history
+/// row scrolls up. Used to follow the current search match (TERM-9).
+fn scroll_for_row(row: usize, history: usize, rows: usize) -> usize {
+    let top = row.saturating_sub(rows / 4);
+    history.saturating_sub(top).min(history)
+}
+
 // ── The paint pass ──────────────────────────────────────────────────────────
 
 /// The style identity of a run: cells with equal keys batch into one galley.
@@ -738,6 +1058,21 @@ fn paint_grid(painter: &egui::Painter, rect: Rect, screen: &Screen, spec: &Paint
         }
     }
 
+    // Search-match underlay (TERM-9): every hit in the WARN token, the current
+    // one brighter — the same token-blend discipline the selection overlay uses.
+    for hit in &spec.search_hits {
+        let tone = if hit.current {
+            Style::WARN.gamma_multiply(0.55)
+        } else {
+            Style::WARN.gamma_multiply(0.28)
+        };
+        painter.rect_filled(
+            cell_span_rect(rect.min, spec.cell, hit.row, hit.col, hit.len),
+            0.0,
+            tone,
+        );
+    }
+
     // Selection overlay — the same token blend `Style::install` uses for
     // egui's own text selection, so highlights read identically platform-wide.
     if let Some(sel) = &spec.selection {
@@ -776,6 +1111,17 @@ fn paint_grid(painter: &egui::Painter, rect: Rect, screen: &Screen, spec: &Paint
     }
     if let Some((text, color)) = &spec.note {
         chip(painter, rect.center(), Align2::CENTER_CENTER, text, *color);
+    }
+    // The search overlay chip sits bottom-left (TERM-9), out of the way of the
+    // scrollback-position chip top-right.
+    if let Some(bar) = &spec.search_bar {
+        chip(
+            painter,
+            Pos2::new(rect.min.x + Style::SP_S, rect.max.y - Style::SP_S),
+            Align2::LEFT_BOTTOM,
+            &bar.label,
+            bar.tone,
+        );
     }
 }
 
@@ -1076,6 +1422,8 @@ mod tests {
             scrolled: 0,
             node: None,
             note: None,
+            search_hits: Vec::new(),
+            search_bar: None,
         }
     }
 
@@ -1122,6 +1470,8 @@ mod tests {
             scrolled: 7,
             node: Some("oak".to_string()),
             note: Some(("session ended".to_string(), Style::TEXT_DIM)),
+            search_hits: Vec::new(),
+            search_bar: None,
         });
         let has = |c: egui::Color32| colors.contains(&c);
         assert!(
@@ -1131,6 +1481,56 @@ mod tests {
         assert!(has(Style::SURFACE), "chip plate");
         assert!(has(Style::TEXT_DIM), "chip label");
         assert!(has(Style::ACCENT), "the remote node marker chip");
+    }
+
+    #[test]
+    fn search_highlights_and_bar_render_through_tokens() {
+        // TERM-9: the match underlay + overlay chip reach the draw stream as
+        // pure `Style` tokens (the visual gate is lifted; tokens + tests suffice).
+        let mut term = Terminal::new(20, 3, 100);
+        term.feed(b"error here\r\nok\r\nmore error");
+        let screen = term.viewport();
+        let colors = tessellate_colors(&screen, |font_id, cell| PaintSpec {
+            font_id,
+            cell,
+            first_abs: 0,
+            selection: None,
+            cursor: CursorPaint::Hidden,
+            scrolled: 0,
+            node: None,
+            note: None,
+            search_hits: vec![
+                SearchHit {
+                    row: 0,
+                    col: 0,
+                    len: 5,
+                    current: true,
+                },
+                SearchHit {
+                    row: 2,
+                    col: 5,
+                    len: 5,
+                    current: false,
+                },
+            ],
+            search_bar: Some(SearchBar {
+                label: "find: error  1/2  [smart]".to_string(),
+                tone: Style::ACCENT,
+            }),
+        });
+        let has = |c: egui::Color32| colors.contains(&c);
+        assert!(has(Style::WARN.gamma_multiply(0.55)), "current-match tone");
+        assert!(has(Style::WARN.gamma_multiply(0.28)), "other-match tone");
+        assert!(has(Style::SURFACE), "search-bar chip plate");
+        assert!(has(Style::ACCENT), "search-bar accent label");
+    }
+
+    #[test]
+    fn scroll_for_row_follows_a_match_with_context() {
+        // history=100, rows=24 → a quarter-window (6 rows) of context above.
+        assert_eq!(scroll_for_row(10, 100, 24), 96); // deep history, near top
+        assert_eq!(scroll_for_row(2, 100, 24), 100); // top clamps to full depth
+        assert_eq!(scroll_for_row(120, 100, 24), 0); // a live row keeps live view
     }
 
     #[test]

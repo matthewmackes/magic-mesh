@@ -67,6 +67,10 @@ serde_json = { workspace = true }
 # Terminal output chunks + keystroke input ride the wire base64-encoded (the
 # broker's `state/pty/<id>` `data` field), so both halves speak the same codec.
 base64 = "0.22"
+# TERM-9 scrollback search — literal + regex find over the grid rows (`search`
+# module). Already in the workspace graph (`mde-files`), so it adds no new lock
+# entry; the same `1.x` line resolves.
+regex = "1"
 
 [lints]
 workspace = true
