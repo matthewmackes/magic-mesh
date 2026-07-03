@@ -153,6 +153,14 @@ pub mod ansible_pull;
 // (Sublime Music / Delfin). Replaces the retired `media_sync`
 // subprocess worker + the Python `media_sync_daemon.py` it drove.
 pub mod app_sync;
+// BOOKMARKS-2 — the mesh-synced bookmarks worker: per-node append-only op
+// segments in the encrypted Syncthing share, replay-merge through the pure
+// mde-bookmarks CRDT, snapshot/prune for bounded growth, in-memory index +
+// periodic-flush durability, and offline-first editing. Drains
+// action/bookmarks/* + publishes state/bookmarks/*. No external transport to
+// fake — file I/O against the same /mnt/mesh-storage share the ssh-gossip /
+// chat workers use; the honest gate is the shared_root_writable offline state.
+pub mod bookmarks;
 pub mod heartbeat;
 // OV-7.a (v2.6) — Health reconciler. Reads each known peer's
 // QNM-Shared heartbeat.json on a 5 s tick, applies the

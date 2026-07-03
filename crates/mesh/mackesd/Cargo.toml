@@ -93,6 +93,13 @@ mde-bus = { path = "../../platform/mde-bus", optional = true }
 # notification path now (the retired shared-alert-mirror worker folded into it,
 # NOTIFY-CHAT-6). Optional under async-services (the worker is async-services-gated).
 mde-chat = { path = "../../services/mde-chat", optional = true }
+# BOOKMARKS-2 — the bookmarks worker drives the pure mde-bookmarks CRDT model
+# (Collection / Op / HLC / fractional-index order). It mints ops, folds every
+# peer's Syncthing op segment into one converged collection, and publishes
+# state/bookmarks/*. Optional under async-services (the worker is
+# async-services-gated); `uuid` (v4) mints the per-item CRDT ids the ops carry.
+mde-bookmarks = { path = "../../services/mde-bookmarks", optional = true }
+uuid = { version = "1", features = ["v4", "serde"], optional = true }
 # E1.2 — role-gated worker subsets: run_serve gates each worker spawn by the
 # pinned deployment role (mde_role::load → rank). Non-optional + zero-dep, so
 # the gating logic is available regardless of feature set.
@@ -313,6 +320,8 @@ async-services = [
     "dep:etcd-client",
     "dep:mde-bus",
     "dep:mde-chat",
+    "dep:mde-bookmarks",
+    "dep:uuid",
 ]
 
 [package.metadata.docs.rs]

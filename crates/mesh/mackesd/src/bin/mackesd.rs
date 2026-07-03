@@ -7531,6 +7531,37 @@ fn run_serve(
                 .push("mesh_mount".into());
         }
 
+        // BOOKMARKS-2 — the mesh-synced bookmarks worker (design
+        // `mesh-bookmarks.md` locks Q17-Q24/Q90/Q91): it drains
+        // `action/bookmarks/*` (add/edit/move/delete/add-folder/rename — minting
+        // real mde-bookmarks CRDT ops), writes this node's append-only op segment
+        // into the encrypted Syncthing share (`workgroup_root`, the same
+        // /mnt/mesh-storage substrate ssh-gossip/chat use), replay-merges every
+        // peer's segment into one converged collection, snapshot+prunes for
+        // bounded growth, and publishes `state/bookmarks/*`. Offline-first: edits
+        // apply to a node-local durable store immediately and auto-resume when the
+        // share reappears. No external transport to fake (§7) — the honest gate is
+        // `shared_root_writable`, published as an offline SyncStatus, never a faked
+        // converge. A desktop feature (Workstation tier); idles gracefully with no
+        // requests on a headless box.
+        if mackesd_core::worker_role::runs("bookmarks", role_rank) {
+            let local_root = mackesd_core::workers::bookmarks::resolve_local_root();
+            let user = mackesd_core::workers::bookmarks::resolve_user();
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::bookmarks::BookmarksWorker::new(
+                    node_id.clone(),
+                    user,
+                    local_root,
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("bookmarks".into());
+        }
+
         // VOIP-GW-3 — the leader-gated voice_provision worker. Spawned on every
         // node so failover is seamless, but LEADER-gated internally (lock 7):
         // only the elected node provisions per-node Vitelity sub-accounts, seals
