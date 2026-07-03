@@ -18,7 +18,23 @@ the shell now paints its own UI and owns its branding directly.
 | 5 | Version placement | **All four:** shell chrome/status bar · About/System panel · DRM boot-splash · Mesh Map / fleet (per-node version, so fleet version-skew is visible). |
 | 6 | Version format | **Semver + codename** — `12.0.0 "Quasar"` in chrome + splash; the About panel additionally shows the full build-info. |
 | 7 | Build identity | **Baked via `build.rs`** — version + short git hash + build date + release channel + codename stamped at compile time into `mde-theme::brand::build`; `--version` and every surface read it. |
-| 8 | Boot-splash | **Logo + wordmark + version** — centered product mark + wordmark + `12.0.0 "Quasar"` on the Carbon field while the shell initializes. |
+| 8 | Boot-splash | **Logo + wordmark + version** — centered product mark + wordmark + the version line on the Carbon field while the shell initializes. |
+
+## Official artwork + placement map (operator-locked 2026-07-03, round 2)
+
+The operator supplied the official brand artwork (`assets/brand/MDE-QUAZAR-*.png`,
+commit `35fef34`) and locked its placement in a 2-round survey:
+
+| # | Decision | Lock |
+|---|----------|------|
+| 9 | **Canonical codename spelling = "Quazar"** (Z, per the artwork) | The 12.x codename is **Quazar** — version line `12.0.0 "Quazar"`; supersedes the earlier "Quasar" spelling in code/docs/release notes. |
+| 10 | Product name (user-facing) | **"MDE Quazar — Mackes Display Environment"** in About/splash/chrome; `magic-mesh` stays the infra/mesh + package name underneath (GNOME vs gnome-shell split). |
+| 11 | DRM boot-splash image | **`MDE-QUAZAR-WALLPAPER1.png`** (centered mark + wordmark + the loading bar) — the shell animates real progress along the artwork's bar, version line beneath. |
+| 12 | Default desktop wallpaper | **`MDE-QUAZAR-WALLPAPER4.png`**; **all five wallpapers ship** in the RPM as a selectable set. |
+| 13 | About / System panel | **`MDE-QUAZAR-MAIN.png`** lockup at the top; build-info + links beneath. |
+| 14 | README banner | **`MDE-QUAZAR-WALLPAPER2.png`** replaces `readme-banner-dark/light.svg`. |
+| 15 | Product icon | **Crop the round mesh-node mark** from the artwork into the square app icon (16–512px rasters, replaces `app-icon.png`/favicon via QBRAND-9) **AND vector-trace it** so the in-shell dock/chrome mark is tintable + DPI-perfect. |
+| 16 | SVG glyph set reconciliation | The QBRAND-10 set's 17 surface/role/node glyphs are KEPT; its placeholder `mark.svg` + `wordmark.svg` (authored pre-artwork) are **replaced by faithful traces of the official mark + MDE Quazar lockup**. |
 
 ## Architecture
 
