@@ -17,6 +17,7 @@ use libmpv2::{mpv_end_file_reason, Mpv};
 
 use crate::audio::AudioConfig;
 use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
+use crate::video::VideoConfig;
 
 /// The real mpv-backed engine.
 ///
@@ -195,6 +196,21 @@ impl MediaEngine for MpvEngine {
             .set_property("af", config.af_graph().as_str())
             .map_err(backend)?;
         // ao / audio-device / replaygain* / gapless-audio.
+        for (key, value) in config.properties() {
+            self.mpv
+                .set_property(key.as_str(), value.as_str())
+                .map_err(backend)?;
+        }
+        Ok(())
+    }
+
+    fn apply_video_config(&mut self, config: &VideoConfig) -> Result<(), EngineError> {
+        // The user video-filter chain (an empty string clears mpv's `vf`).
+        self.mpv
+            .set_property("vf", config.vf_graph().as_str())
+            .map_err(backend)?;
+        // hwdec (VA-API / software) / video-aspect-override / video-zoom /
+        // video-pan-* / video-crop / video-rotate / deinterlace.
         for (key, value) in config.properties() {
             self.mpv
                 .set_property(key.as_str(), value.as_str())

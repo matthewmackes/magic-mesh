@@ -14,6 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::audio::AudioConfig;
+use crate::video::VideoConfig;
 
 /// A failure surfaced by a [`MediaEngine`].
 ///
@@ -130,6 +131,7 @@ pub enum EngineSignal {
 /// | [`tracks`]         | `get_property track-list`             |
 /// | [`poll`]           | drain `wait_event`                    |
 /// | [`apply_audio_config`] | set `af` + `ao`/`replaygain`/… props |
+/// | [`apply_video_config`] | set `vf` + `hwdec`/`video-*`/… props |
 ///
 /// [`load_file`]: MediaEngine::load_file
 /// [`set_paused`]: MediaEngine::set_paused
@@ -140,6 +142,7 @@ pub enum EngineSignal {
 /// [`tracks`]: MediaEngine::tracks
 /// [`poll`]: MediaEngine::poll
 /// [`apply_audio_config`]: MediaEngine::apply_audio_config
+/// [`apply_video_config`]: MediaEngine::apply_video_config
 pub trait MediaEngine {
     /// Begin loading `url` (local path or stream URL). Playback readiness arrives
     /// later as an [`EngineSignal::FileLoaded`] from [`poll`](Self::poll).
@@ -192,4 +195,18 @@ pub trait MediaEngine {
     /// # Errors
     /// Returns [`EngineError::Backend`] if the backend rejects a property set.
     fn apply_audio_config(&mut self, config: &AudioConfig) -> Result<(), EngineError>;
+
+    /// Apply a [`VideoConfig`] (MEDIA-4): select the `hwdec` decode mode (VA-API
+    /// with software fallback), set the `video-*` aspect/zoom/pan/crop/rotate
+    /// adjustments + `deinterlace`, and install the `vf` filter graph. Like the
+    /// audio path these are global mpv properties settable with or without media
+    /// loaded, so no [`EngineError::NotLoaded`] arises here.
+    ///
+    /// §6: pure hwdec/vf/`video-*` property glue — the config *folds* to the mpv
+    /// strings; no decoder or scaler is reimplemented. Whether VA-API actually
+    /// engages is a host-GPU property (honest-gated to the real-clip smoke).
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Backend`] if the backend rejects a property set.
+    fn apply_video_config(&mut self, config: &VideoConfig) -> Result<(), EngineError>;
 }

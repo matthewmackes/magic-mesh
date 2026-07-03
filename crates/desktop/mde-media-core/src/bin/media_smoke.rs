@@ -14,8 +14,8 @@
 //! [`FakeMpv`]: mde_media_core::FakeMpv
 
 use mde_media_core::{
-    AudioConfig, EqBand, FakeMpv, LoudnessNorm, Player, PlayerState, ReplayGainMode, Track,
-    TrackKind,
+    AspectRatio, AudioConfig, Crop, Deinterlace, EqBand, FakeMpv, HwDecode, LoudnessNorm, Player,
+    PlayerState, ReplayGainMode, Rotation, Track, TrackKind, VideoConfig, VideoFilter,
 };
 
 fn sample_tracks() -> Vec<Track> {
@@ -80,6 +80,24 @@ fn run_fake_smoke() {
     println!("  audio af-graph: {}", player.audio_config().af_graph());
     println!("  audio props:    {:?}", player.audio_config().properties());
     println!("  engine applied: af={:?}", player.engine().applied_af());
+
+    // MEDIA-4: configure VA-API hardware decode (with software fallback) + the
+    // video adjustments — a forced 16:9 aspect, a letterbox crop, a 90° rotation,
+    // deinterlacing, and a denoise filter — and show the folded mpv hwdec/video-*
+    // property set + `vf` graph the engine actually receives.
+    let video = VideoConfig {
+        hwdec: HwDecode::VaApi,
+        aspect: AspectRatio::SIXTEEN_NINE,
+        crop: Some(Crop::new(1920, 800, 0, 140)),
+        rotate: Rotation::Cw90,
+        deinterlace: Deinterlace::On,
+        filters: vec![VideoFilter::bare("hqdn3d".to_owned())],
+        ..VideoConfig::new()
+    };
+    player.set_video_config(video).expect("apply video config");
+    println!("  video vf-graph: {}", player.video_config().vf_graph());
+    println!("  video props:    {:?}", player.video_config().properties());
+    println!("  engine applied: vf={:?}", player.engine().applied_vf());
 
     player.engine_mut().advance(30.0);
     player.pump();

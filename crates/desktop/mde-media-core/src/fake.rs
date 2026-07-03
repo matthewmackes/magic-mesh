@@ -14,8 +14,15 @@ use std::collections::VecDeque;
 
 use crate::audio::AudioConfig;
 use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track};
+use crate::video::VideoConfig;
 
 /// A scriptable fake engine — see the [module docs](self).
+///
+/// The `fail_*` flags are independent scripted-failure toggles (one per fallible
+/// seam method), not a state machine — a `#[allow]` rather than the lint's
+/// suggested refactor keeps each failure axis orthogonal and the builders
+/// composable.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub struct FakeMpv {
     loaded: Option<String>,
@@ -26,12 +33,17 @@ pub struct FakeMpv {
     signals: VecDeque<EngineSignal>,
     fail_load: bool,
     fail_audio: bool,
+    fail_video: bool,
     /// Every `loadfile`/`seek`/`stop` issued, for assertion.
     commands: Vec<String>,
     /// The last `af` graph string applied via [`MediaEngine::apply_audio_config`].
     applied_af: Option<String>,
     /// The last non-`af` properties applied via [`MediaEngine::apply_audio_config`].
     applied_properties: Vec<(String, String)>,
+    /// The last `vf` graph string applied via [`MediaEngine::apply_video_config`].
+    applied_vf: Option<String>,
+    /// The last non-`vf` properties applied via [`MediaEngine::apply_video_config`].
+    applied_video_properties: Vec<(String, String)>,
 }
 
 impl FakeMpv {
@@ -67,6 +79,14 @@ impl FakeMpv {
     #[must_use]
     pub const fn failing_audio(mut self) -> Self {
         self.fail_audio = true;
+        self
+    }
+
+    /// Make every `apply_video_config` fail with a backend error (to exercise the
+    /// video-config error path through the [`Player`](crate::Player)).
+    #[must_use]
+    pub const fn failing_video(mut self) -> Self {
+        self.fail_video = true;
         self
     }
 
@@ -126,6 +146,20 @@ impl FakeMpv {
     #[must_use]
     pub fn applied_properties(&self) -> &[(String, String)] {
         &self.applied_properties
+    }
+
+    /// The last `vf` filter graph applied via
+    /// [`apply_video_config`](MediaEngine::apply_video_config), if any.
+    #[must_use]
+    pub fn applied_vf(&self) -> Option<&str> {
+        self.applied_vf.as_deref()
+    }
+
+    /// The last non-`vf` properties applied via
+    /// [`apply_video_config`](MediaEngine::apply_video_config).
+    #[must_use]
+    pub fn applied_video_properties(&self) -> &[(String, String)] {
+        &self.applied_video_properties
     }
 }
 
@@ -196,6 +230,17 @@ impl MediaEngine for FakeMpv {
         // properties without a real mpv.
         self.applied_af = Some(config.af_graph());
         self.applied_properties = config.properties();
+        Ok(())
+    }
+
+    fn apply_video_config(&mut self, config: &VideoConfig) -> Result<(), EngineError> {
+        if self.fail_video {
+            return Err(EngineError::Backend("video config rejected".to_owned()));
+        }
+        // Record exactly what the fold produced, so tests assert the vf graph +
+        // hwdec/video-* properties without a real mpv (or a real GPU).
+        self.applied_vf = Some(config.vf_graph());
+        self.applied_video_properties = config.properties();
         Ok(())
     }
 }
@@ -279,5 +324,40 @@ mod tests {
             Err(EngineError::Backend(_))
         ));
         assert_eq!(e.applied_af(), None);
+    }
+
+    #[test]
+    fn apply_video_config_records_fold_without_media_or_gpu() {
+        use crate::video::{HwDecode, VideoConfig, VideoFilter};
+
+        let mut e = FakeMpv::new();
+        // No media loaded, no GPU — the decode/adjust properties are global and
+        // still apply (whether VA-API engages is honest-gated to a real GPU).
+        assert_eq!(e.applied_vf(), None);
+        let cfg = VideoConfig {
+            hwdec: HwDecode::VaApi,
+            filters: vec![VideoFilter::bare("hqdn3d".to_owned())],
+            ..VideoConfig::new()
+        };
+        e.apply_video_config(&cfg).expect("apply");
+        assert_eq!(e.applied_vf(), Some("hqdn3d"));
+        assert!(e
+            .applied_video_properties()
+            .contains(&("hwdec".to_owned(), "vaapi".to_owned())));
+        assert!(e
+            .applied_video_properties()
+            .contains(&("deinterlace".to_owned(), "no".to_owned())));
+    }
+
+    #[test]
+    fn failing_video_surfaces_backend_error() {
+        use crate::video::VideoConfig;
+
+        let mut e = FakeMpv::new().failing_video();
+        assert!(matches!(
+            e.apply_video_config(&VideoConfig::new()),
+            Err(EngineError::Backend(_))
+        ));
+        assert_eq!(e.applied_vf(), None);
     }
 }

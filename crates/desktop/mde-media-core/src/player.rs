@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::AudioConfig;
 use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track};
+use crate::video::VideoConfig;
 
 /// The authoritative playback state.
 ///
@@ -115,6 +116,10 @@ pub struct Player<E: MediaEngine> {
     /// [`set_audio_config`](Player::set_audio_config); mpv keeps these ao/af/
     /// `ReplayGain`/gapless properties across loads, so it is apply-on-change.
     audio: AudioConfig,
+    /// The applied video decode + adjustments config (MEDIA-4). Set via
+    /// [`set_video_config`](Player::set_video_config); mpv keeps these hwdec/vf/
+    /// `video-*`/deinterlace properties across loads, so it is apply-on-change.
+    video: VideoConfig,
     events: VecDeque<PlayerEvent>,
 }
 
@@ -131,6 +136,7 @@ impl<E: MediaEngine> Player<E> {
             duration: None,
             tracks: Vec::new(),
             audio: AudioConfig::new(),
+            video: VideoConfig::new(),
             events: VecDeque::new(),
         }
     }
@@ -171,6 +177,12 @@ impl<E: MediaEngine> Player<E> {
     #[must_use]
     pub const fn audio_config(&self) -> &AudioConfig {
         &self.audio
+    }
+
+    /// The applied video decode + adjustments config (MEDIA-4).
+    #[must_use]
+    pub const fn video_config(&self) -> &VideoConfig {
+        &self.video
     }
 
     /// Borrow the underlying engine (tests drive [`FakeMpv`](crate::FakeMpv)
@@ -361,6 +373,25 @@ impl<E: MediaEngine> Player<E> {
     pub fn set_audio_config(&mut self, config: AudioConfig) -> Result<(), PlayerError> {
         self.engine.apply_audio_config(&config)?;
         self.audio = config;
+        Ok(())
+    }
+
+    // ── video (MEDIA-4) ──────────────────────────────────────────────────────
+
+    /// Apply a video decode + adjustments [`VideoConfig`] to the engine — the
+    /// `hwdec` decode mode (VA-API with software fallback), the aspect / zoom /
+    /// pan / crop / rotate / deinterlace `video-*` properties, and the `vf` filter
+    /// graph — and record it as the current config on success.
+    ///
+    /// Valid in any state (these are global mpv properties that persist across
+    /// loads); the config is left unchanged if the engine rejects it.
+    ///
+    /// # Errors
+    /// Returns [`PlayerError::Engine`] if the engine rejects a property set; the
+    /// stored config is then untouched.
+    pub fn set_video_config(&mut self, config: VideoConfig) -> Result<(), PlayerError> {
+        self.engine.apply_video_config(&config)?;
+        self.video = config;
         Ok(())
     }
 
@@ -817,5 +848,66 @@ mod tests {
         assert!(matches!(err, PlayerError::Engine(EngineError::Backend(_))));
         // Rejected → the stored config is unchanged (still the default).
         assert_eq!(p.audio_config(), &before);
+    }
+
+    #[test]
+    fn default_video_config_requests_auto_safe_hwdec() {
+        use crate::video::HwDecode;
+        let p = player();
+        assert_eq!(p.video_config().hwdec, HwDecode::Auto);
+        assert!(p.video_config().filters.is_empty());
+    }
+
+    #[test]
+    fn set_video_config_applies_fold_to_engine_and_stores_it() {
+        use crate::video::{
+            AspectRatio, Crop, Deinterlace, HwDecode, Rotation, VideoConfig, VideoFilter,
+        };
+
+        let mut p = player();
+        p.load("x").expect("load");
+        p.pump();
+
+        let cfg = VideoConfig {
+            hwdec: HwDecode::VaApi,
+            aspect: AspectRatio::SIXTEEN_NINE,
+            crop: Some(Crop::new(1280, 536, 0, 92)),
+            rotate: Rotation::Cw90,
+            deinterlace: Deinterlace::On,
+            filters: vec![VideoFilter::bare("hqdn3d".to_owned())],
+            ..VideoConfig::new()
+        };
+        p.set_video_config(cfg.clone()).expect("apply video config");
+
+        // The engine received exactly the folded vf graph + properties.
+        assert_eq!(p.engine().applied_vf(), Some(cfg.vf_graph().as_str()));
+        assert_eq!(
+            p.engine().applied_video_properties(),
+            cfg.properties().as_slice()
+        );
+        // The VA-API decode mode reached the engine verbatim.
+        assert!(p
+            .engine()
+            .applied_video_properties()
+            .contains(&("hwdec".to_owned(), "vaapi".to_owned())));
+        // And the player stored it.
+        assert_eq!(p.video_config(), &cfg);
+    }
+
+    #[test]
+    fn set_video_config_error_leaves_stored_config_untouched() {
+        use crate::video::{HwDecode, VideoConfig};
+
+        let mut p = Player::new(FakeMpv::new().failing_video());
+        let before = p.video_config().clone();
+        let err = p
+            .set_video_config(VideoConfig {
+                hwdec: HwDecode::VaApi,
+                ..VideoConfig::new()
+            })
+            .expect_err("engine rejects video config");
+        assert!(matches!(err, PlayerError::Engine(EngineError::Backend(_))));
+        // Rejected → the stored config is unchanged (still the default).
+        assert_eq!(p.video_config(), &before);
     }
 }

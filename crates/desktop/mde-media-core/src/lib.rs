@@ -34,6 +34,15 @@
 //! graph + properties (unit-tested against [`FakeMpv`]); the audible `PipeWire`
 //! result is honest-gated to the `mpv`-feature real-clip smoke.
 //!
+//! # Video (MEDIA-4)
+//!
+//! [`Player::set_video_config`] applies a typed [`VideoConfig`] — the [`HwDecode`]
+//! mode (VA-API with software fallback), the [`AspectRatio`] override,
+//! zoom/pan, [`Crop`], [`Rotation`], [`Deinterlace`], and extra [`VideoFilter`]s.
+//! It *folds* to mpv's `hwdec`/`video-*`/`deinterlace` properties + the `vf` graph
+//! (unit-tested against [`FakeMpv`]); whether VA-API actually engages is a
+//! host-GPU property, honest-gated to the `mpv`-feature real-clip smoke.
+//!
 //! ```
 //! use mde_media_core::{FakeMpv, Player, PlayerState};
 //!
@@ -54,6 +63,7 @@ pub mod audio;
 pub mod engine;
 pub mod fake;
 pub mod player;
+pub mod video;
 
 #[cfg(feature = "mpv")]
 pub mod mpv;
@@ -64,3 +74,4 @@ pub use audio::{
 pub use engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
 pub use fake::FakeMpv;
 pub use player::{Player, PlayerError, PlayerEvent, PlayerState};
+pub use video::{AspectRatio, Crop, Deinterlace, HwDecode, Rotation, VideoConfig, VideoFilter};
