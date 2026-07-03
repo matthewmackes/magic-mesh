@@ -25,10 +25,12 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use mde_egui::egui::{self, RichText, Ui};
+use mde_egui::egui::{self, Key, Modifiers, RichText, Ui};
 use mde_egui::Style;
 
 use crate::buffer::Buffer;
+use crate::finder::{self, FileFinder};
+use crate::palette::{self, CommandPalette, PaletteCommand};
 use crate::project_tree::{self, ProjectTree};
 use crate::widget::{editor_widget, EditorView};
 
@@ -84,6 +86,10 @@ pub struct EditorSurface {
     project: Option<ProjectTree>,
     /// Whether the project-tree side panel is shown beside the editor body.
     show_tree: bool,
+    /// The fuzzy file-finder overlay (EDITOR-7, `Cmd`/`Ctrl-P`).
+    finder: FileFinder,
+    /// The command-palette overlay (EDITOR-7, `Cmd`/`Ctrl-Shift-P`).
+    palette: CommandPalette,
 }
 
 impl EditorSurface {
@@ -145,6 +151,99 @@ impl EditorSurface {
     pub fn close(&mut self) {
         self.doc = None;
     }
+
+    // ── EDITOR-7: the fuzzy finder + command palette ─────────────────────────
+
+    /// Whether a modal overlay (the fuzzy file-finder or the command palette) is
+    /// currently up. The shell can key off this to suppress its own global chords
+    /// while the editor surface is capturing the keyboard for an overlay.
+    #[must_use]
+    pub const fn overlay_active(&self) -> bool {
+        self.finder.is_open() || self.palette.is_open()
+    }
+
+    /// Open the fuzzy file-finder (the `Cmd`/`Ctrl-P` seam), rooted at the open
+    /// project root if there is one, else the current working directory — so
+    /// `Cmd`/`Ctrl-P` is always reachable. A silent no-op if neither root resolves.
+    pub(crate) fn open_finder(&mut self) {
+        let root = self
+            .project
+            .as_ref()
+            .map(|tree| tree.root().to_path_buf())
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(root) = root {
+            self.palette.close(); // only one overlay at a time
+            self.finder.open_at(&root);
+        }
+    }
+
+    /// Toggle the command palette (the `Cmd`/`Ctrl-Shift-P` seam), closing the
+    /// finder so only one overlay is up at a time.
+    pub(crate) fn toggle_palette(&mut self) {
+        self.finder.close();
+        self.palette.toggle();
+    }
+
+    /// Run one [`PaletteCommand`] against the live surface seams — the dispatch the
+    /// palette's Enter/click routes to. Each arm invokes a real seam (§7 — no dead
+    /// entries): Save writes the buffer, the toggles flip real view/panel state,
+    /// Close/Open act on the document, Open Folder roots the tree at the cwd. A
+    /// command whose precondition is absent (Save/Toggle-Wrap with no open
+    /// document) is a genuine no-op, never a panic.
+    pub(crate) fn run_command(&mut self, cmd: PaletteCommand) {
+        match cmd {
+            PaletteCommand::Save => {
+                if let Some(doc) = self.doc.as_mut() {
+                    // A scratch buffer (no path) can't save; that's an honest no-op,
+                    // surfaced by the dirty marker staying lit — not a panic.
+                    let _ = doc.buffer.save();
+                }
+            }
+            PaletteCommand::OpenScratch => self.open_scratch(),
+            PaletteCommand::ToggleTree => self.show_tree = !self.show_tree,
+            PaletteCommand::ToggleWrap => {
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.view.toggle_wrap();
+                }
+            }
+            PaletteCommand::CloseDoc => self.close(),
+            PaletteCommand::OpenFolderCwd => {
+                if let Ok(cwd) = std::env::current_dir() {
+                    self.open_folder(cwd);
+                }
+            }
+        }
+    }
+
+    /// Intercept the overlay trigger chords at the panel level — consumed BEFORE
+    /// the text widget reads this frame's events (it clones `ui.input` events
+    /// during its own render), so `Cmd`/`Ctrl-P` opens the finder and
+    /// `Cmd`/`Ctrl-Shift-P` toggles the palette instead of typing `p` into the
+    /// document. The more-specific Shift chord is consumed first.
+    fn handle_overlay_triggers(&mut self, ui: &Ui) {
+        let open_palette =
+            ui.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::P));
+        let open_finder = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P));
+        if open_palette {
+            self.toggle_palette();
+        }
+        if open_finder {
+            self.open_finder();
+        }
+    }
+
+    /// Render the EDITOR-7 overlays on top of the editor body and route the
+    /// operator's pick to its seam: a finder pick opens the file
+    /// ([`open_path`](Self::open_path)); a palette pick runs its command.
+    fn render_overlays(&mut self, ui: &Ui) {
+        let ctx = ui.ctx();
+        if let Some(path) = finder::show(ctx, &mut self.finder) {
+            self.open_selected(&path);
+        }
+        if let Some(cmd) = palette::show(ctx, &mut self.palette) {
+            self.run_command(cmd);
+        }
+    }
 }
 
 /// Render the editor surface into the shell body — mirrors `files_panel`.
@@ -156,6 +255,12 @@ impl EditorSurface {
 /// exercisable before fuzzy-open lands. `surface` is the mount seam the shell
 /// wires (the analogue of `files_panel`'s `&mut FileBrowser`).
 pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
+    // EDITOR-7 — panel-level keybind intercept. Consume the overlay trigger chords
+    // FIRST, before the tree/central body render (the text widget clones this
+    // frame's `ui.input` events during its own render below), so `Cmd`/`Ctrl-P`
+    // and `Cmd`/`Ctrl-Shift-P` open the overlays instead of typing into the buffer.
+    surface.handle_overlay_triggers(ui);
+
     // EDITOR-9 — the toggleable project-tree side panel, drawn BEFORE the central
     // body so the editor fills the area to its right (the `files_panel` idiom). A
     // file click routes through the EDITOR-3 open seam; a "no folder" state offers
@@ -199,6 +304,10 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
         // Disjoint field borrows: the widget edits `&mut view` + `&mut buffer`.
         editor_widget(ui, &mut doc.view, &mut doc.buffer);
     });
+
+    // EDITOR-7 — the finder + palette overlays float above the body (rendered last
+    // so they paint on top); each returns the operator's pick, routed to its seam.
+    surface.render_overlays(ui);
 }
 
 /// The project tree's "no folder open" face (§7) — an honest note plus a reachable
@@ -345,11 +454,40 @@ fn empty_state(ui: &mut Ui) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{editor_panel, EditorSurface, NO_FILE_HINT, NO_FILE_TITLE, SCRATCH_SEED};
+    use crate::palette::PaletteCommand;
     use crate::real_editor;
-    use mde_egui::egui::{self, pos2, vec2, Rect};
+    use mde_egui::egui::{self, pos2, vec2, Event, Key, Modifiers, Rect};
     use mde_egui::Style;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Build a key-press event for the headless driver (mirrors `widget.rs`'s test
+    /// helper): pressed, non-repeat, with the given modifiers.
+    fn key_press(key: Key, modifiers: Modifiers) -> Event {
+        Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// Drive one real `editor_panel` frame on a *persistent* `ctx` with injected
+    /// `events`, so a multi-frame interaction (open an overlay, then act on it)
+    /// exercises the true render + routing path — not a mocked seam.
+    fn run_frame(ctx: &egui::Context, surface: &mut EditorSurface, events: Vec<Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor_panel(ui, surface);
+            });
+        });
+    }
 
     /// A unique temp dir for a live editor test, cleaned up on drop (the crate has
     /// no `tempfile` dev-dep — the same idiom `project_tree`'s tests use).
@@ -488,6 +626,183 @@ mod tests {
         assert!(
             tessellate_panel(&mut surface) > 0,
             "the editor + project tree produced no draw primitives"
+        );
+    }
+
+    // ── EDITOR-7: the fuzzy finder + command palette ─────────────────────────
+
+    #[test]
+    fn cmd_p_then_enter_opens_the_selected_file_through_open_path() {
+        // The full select→open routing, driven end-to-end through the real panel:
+        // Cmd+P opens the finder (rooted at the project), Enter opens the
+        // highlighted file via `open_path`. No mocked seam — real frames + events.
+        let d = TempDir::new("finder-route");
+        let file = d.join("routing_target.rs");
+        std::fs::write(&file, b"fn go() {}\n").expect("write");
+
+        let mut surface = real_editor();
+        surface.open_folder(d.0.clone());
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        // Frame 1: Cmd+P opens the finder over the one seeded file (empty query
+        // lists it, selection at row 0).
+        run_frame(
+            &ctx,
+            &mut surface,
+            vec![key_press(Key::P, Modifiers::COMMAND)],
+        );
+        assert!(surface.finder.is_open(), "Cmd+P opened the file finder");
+        assert!(!surface.is_open(), "no document is open yet");
+
+        // Frame 2: Enter opens the highlighted result, routed to `open_path`.
+        run_frame(
+            &ctx,
+            &mut surface,
+            vec![key_press(Key::Enter, Modifiers::NONE)],
+        );
+        assert!(surface.is_open(), "Enter opened a document");
+        assert_eq!(
+            surface.current_path(),
+            Some(file.as_path()),
+            "the finder opened the exact file through open_path"
+        );
+        assert!(
+            !surface.finder.is_open(),
+            "the finder closed after the pick"
+        );
+    }
+
+    #[test]
+    fn cmd_shift_p_toggles_the_palette_at_the_panel_level() {
+        // The palette chord is intercepted at the panel level (not the widget), so
+        // pressing it opens the overlay; pressing it again closes it.
+        let mut surface = real_editor();
+        surface.open_text("fn main() {}\n");
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        let chord = || {
+            key_press(
+                Key::P,
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::COMMAND
+                },
+            )
+        };
+        run_frame(&ctx, &mut surface, vec![chord()]);
+        assert!(surface.palette.is_open(), "Cmd+Shift+P opened the palette");
+        run_frame(&ctx, &mut surface, vec![chord()]);
+        assert!(
+            !surface.palette.is_open(),
+            "Cmd+Shift+P again closed the palette"
+        );
+    }
+
+    #[test]
+    fn palette_command_save_writes_the_buffer_to_disk() {
+        let d = TempDir::new("cmd-save");
+        let file = d.join("save.txt");
+        std::fs::write(&file, b"abc").expect("seed file");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+        // Dirty the buffer, then dispatch Save through the palette seam.
+        surface.doc.as_mut().expect("doc").buffer.insert(3, "DEF");
+        assert!(surface.doc.as_ref().expect("doc").buffer.is_dirty());
+
+        surface.run_command(PaletteCommand::Save);
+
+        assert!(
+            !surface.doc.as_ref().expect("doc").buffer.is_dirty(),
+            "Save cleared the dirty flag"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("read back"),
+            b"abcDEF",
+            "the Save command wrote the on-disk bytes (buffer.save)"
+        );
+    }
+
+    #[test]
+    fn palette_command_open_scratch_opens_a_document() {
+        let mut surface = real_editor();
+        assert!(!surface.is_open());
+        surface.run_command(PaletteCommand::OpenScratch);
+        assert!(surface.is_open(), "Open Scratch opened a document");
+    }
+
+    #[test]
+    fn palette_command_toggle_tree_flips_the_side_panel() {
+        let mut surface = real_editor();
+        let before = surface.show_tree;
+        surface.run_command(PaletteCommand::ToggleTree);
+        assert_ne!(
+            surface.show_tree, before,
+            "Toggle Project Tree flipped the side panel"
+        );
+    }
+
+    #[test]
+    fn palette_command_toggle_wrap_flips_the_editor_wrap() {
+        let mut surface = real_editor();
+        surface.open_text("a long line\n");
+        let before = surface.doc.as_ref().expect("doc").view.wrap();
+        surface.run_command(PaletteCommand::ToggleWrap);
+        assert_ne!(
+            surface.doc.as_ref().expect("doc").view.wrap(),
+            before,
+            "Toggle Soft-Wrap flipped the view's wrap"
+        );
+    }
+
+    #[test]
+    fn palette_command_close_document_returns_to_empty_state() {
+        let mut surface = real_editor();
+        surface.open_text("x\n");
+        assert!(surface.is_open());
+        surface.run_command(PaletteCommand::CloseDoc);
+        assert!(
+            !surface.is_open(),
+            "Close Document returned to the empty state"
+        );
+    }
+
+    #[test]
+    fn palette_command_open_folder_roots_the_tree() {
+        let mut surface = real_editor();
+        assert!(!surface.has_project());
+        surface.run_command(PaletteCommand::OpenFolderCwd);
+        assert!(
+            surface.has_project(),
+            "Open Folder rooted the project tree at the cwd"
+        );
+    }
+
+    #[test]
+    fn the_finder_overlay_paints_when_open() {
+        let d = TempDir::new("finder-paint");
+        std::fs::write(d.join("a.rs"), b"a").expect("write");
+        let mut surface = real_editor();
+        surface.open_folder(d.0.clone());
+        surface.open_finder();
+        assert!(surface.finder.is_open());
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the open finder overlay produced no draw primitives"
+        );
+    }
+
+    #[test]
+    fn the_palette_overlay_paints_when_open() {
+        let mut surface = real_editor();
+        surface.toggle_palette();
+        assert!(surface.palette.is_open());
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the open palette overlay produced no draw primitives"
         );
     }
 }

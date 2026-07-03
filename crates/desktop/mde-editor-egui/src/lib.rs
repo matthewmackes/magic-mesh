@@ -15,17 +15,24 @@
 //!   caret + selection, mouse hit-testing (click / drag / word / line), keyboard
 //!   editing + motion, undo/redo, scroll, and a soft-wrap toggle. The widget
 //!   edits the live rope (§7 — runtime-reachable, not a mockup).
+//! * EDITOR-7 — the **fuzzy file finder** ([`finder`], `Cmd`/`Ctrl-P`) + the
+//!   **command palette** ([`palette`], `Cmd`/`Ctrl-Shift-P`): two overlays whose
+//!   trigger chords are intercepted at the panel level (before the widget reads
+//!   this frame's events) and which drive the existing surface seams over a small
+//!   self-contained [`fuzzy`] matcher.
 //!
-//! Tree-sitter highlighting + multi-cursor (EDITOR-4/5), tabs + splittable panes,
-//! and the fuzzy finder / command palette land in the following units; they grow
-//! [`EditorSurface`] / [`EditorView`] and render into [`editor_panel`] without
-//! re-wiring the shell.
+//! Tree-sitter highlighting + multi-cursor (EDITOR-4/5) and tabs + splittable
+//! panes land in the following units; they grow [`EditorSurface`] / [`EditorView`]
+//! and render into [`editor_panel`] without re-wiring the shell.
 //!
 //! Layering (§6): the surface state + render seam live in [`panel`], the widget in
 //! [`widget`], the document model in [`buffer`]; the only in-workspace edge points
 //! inward to [`mde_egui`] (the harness + the shared Carbon `Style`).
 
 pub mod buffer;
+mod finder;
+mod fuzzy;
+mod palette;
 pub mod panel;
 pub mod project_tree;
 pub mod widget;
