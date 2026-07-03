@@ -5,15 +5,17 @@ Environment shell loads at runtime. Every file in this pack is
 **designed to be replaced** — drop in your own SVG/PNG with the
 same basename and the running MDE picks it up.
 
-> **Current state (2026-06-09):** all 7 slots re-cut from the
-> operator-supplied **MCNF** master (fedora-penguin mesh emblem,
-> navy `srgb(18,37,67)` ground) — archived as
-> `raw/mcnf-master-2026-06-09.png`. The hicolor app-icon set
-> (16–512 px) lives in `../icons/hicolor/<size>/apps/magic-mesh.png`
-> plus `favicon.ico` here. The previous placeholder SVGs remain in
-> `baked/` as the `include_bytes!` ultimate fallback. Replace any
-> `<basename>.png` with a hand-traced `<basename>.svg` to upgrade
-> that slot to vector + tintable.
+> **Current state (2026-07-03, QBRAND-9):** the product icon is
+> single-sourced from the official **Quazar** mark — the
+> `quasar/app-icon-<N>.png` crops (16–512 px, cut from
+> `MDE-QUAZAR-MAIN.png` box (40,88)→(768,816) by
+> `install-helpers/regen-app-icon.sh`) are installed by the RPM to
+> `/usr/share/icons/hicolor/<N>x<N>/apps/magic-mesh.png`, and
+> `favicon.ico` here is a multi-res (16+32+48) cut of the same
+> crops. The previous placeholder SVGs remain in `baked/` as the
+> `include_bytes!` ultimate fallback. Replace any `<basename>.png`
+> with a hand-traced `<basename>.svg` to upgrade that slot to
+> vector + tintable.
 
 ---
 

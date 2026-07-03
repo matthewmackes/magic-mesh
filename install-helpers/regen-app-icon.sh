@@ -1,40 +1,93 @@
 #!/usr/bin/env bash
-# BRAND — regenerate the single default app icon (`magic-mesh`) across every size
-# from one source image. Every .desktop in packaging/ uses `Icon=magic-mesh`,
-# resolved from the hicolor theme, so regenerating this set re-brands ALL apps.
+# QBRAND-9 — regenerate the single-source Quazar product icon set from the
+# OFFICIAL brand artwork. One mark everywhere: the RPM installs the
+# `assets/brand/quasar/app-icon-<N>.png` crops into the standard hicolor
+# dirs (`/usr/share/icons/hicolor/<N>x<N>/apps/magic-mesh.png` — see the
+# `[package.metadata.generate-rpm]` assets in crates/mesh/mackesd/Cargo.toml),
+# every .desktop in packaging/ uses `Icon=magic-mesh` resolved from that set,
+# and the favicon is cut from the same crops. Regenerating here re-brands ALL.
 #
-# Usage:  ./install-helpers/regen-app-icon.sh <source-icon.png>
+# SINGLE SOURCE: `assets/brand/MDE-QUAZAR-MAIN.png`, crop box (40,88)→(768,816)
+# — the 728×728 square around the round mesh-node mark (centered on the mark's
+# bbox with ~8% padding on the artwork's black ground; placement lock #15 in
+# docs/design/quasar-branding.md, official crops landed in fcc5422). Pass an
+# explicit source image to override (non-square sources are center-cropped).
 #
-# Regenerates:
-#   * assets/icons/hicolor/<size>/apps/magic-mesh.png  (16…512 — the app icon)
-#   * assets/brand/app-icon.png                         (580² brand master)
-#   * assets/brand/monogram.png                         (256² monogram)
-# Requires ImageMagick (`magick`/`convert`).
+# Usage:  ./install-helpers/regen-app-icon.sh [source-icon.png]
+#
+# Regenerates (PIL LANCZOS — the same method that cut the official rasters):
+#   * assets/brand/quasar/app-icon-<N>.png   N = 16 22 24 32 48 64 128 256 512
+#   * assets/brand/app-icon.png              (512² brand master)
+#   * assets/brand/monogram.png              (256² monogram / Plymouth watermark)
+#   * assets/brand/favicon.ico               (real multi-res .ico: 16+32+48)
+# Requires python3 + Pillow (PIL).
 set -euo pipefail
 
 SRC="${1:-}"
-[ -n "$SRC" ] && [ -f "$SRC" ] || { echo "usage: $0 <source-icon.png>" >&2; exit 2; }
+if [ -n "$SRC" ] && [ ! -f "$SRC" ]; then
+  echo "usage: $0 [source-icon.png]  (default: the official MDE-QUAZAR-MAIN.png crop)" >&2
+  exit 2
+fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-HICOLOR="$ROOT/assets/icons/hicolor"
-BRAND="$ROOT/assets/brand"
 
-# Prefer `magick` (IM7); fall back to `convert` (IM6).
-if command -v magick >/dev/null 2>&1; then IM="magick"; else IM="convert"; fi
+SRC="$SRC" python3 - "$ROOT" <<'PY'
+import os
+import sys
 
-SIZES="16 22 24 32 48 64 128 256 512"
-for s in $SIZES; do
-  dst="$HICOLOR/${s}x${s}/apps/magic-mesh.png"
-  mkdir -p "$(dirname "$dst")"
-  # -strip metadata; fill the square (^) + center-crop (-extent) so a near-square
-  # source gets no transparent bars or distortion; high-quality downscale, alpha kept.
-  $IM "$SRC" -strip -resize "${s}x${s}^" -background none -gravity center -extent "${s}x${s}" "$dst"
-  echo "wrote $dst"
-done
+from PIL import Image
 
-$IM "$SRC" -strip -resize 580x580^ -background none -gravity center -extent 580x580 "$BRAND/app-icon.png"
-echo "wrote $BRAND/app-icon.png"
-$IM "$SRC" -strip -resize 256x256^ -background none -gravity center -extent 256x256 "$BRAND/monogram.png"
-echo "wrote $BRAND/monogram.png"
+root = sys.argv[1]
+brand = os.path.join(root, "assets", "brand")
+quasar = os.path.join(brand, "quasar")
 
-echo "done — re-brand the fleet by cutting a release (the magic-mesh hicolor set + brand masters ship in the RPM; %post runs gtk-update-icon-cache)."
+# The one official source: the round mesh-node mark cropped from the artwork.
+# Crop box (40,88)→(768,816) of MDE-QUAZAR-MAIN.png (728×728, mark-centered).
+CROP_BOX = (40, 88, 768, 816)
+
+src = os.environ.get("SRC") or ""
+if src:
+    img = Image.open(src).convert("RGBA")
+    if img.width != img.height:  # center-crop a non-square override to square
+        side = min(img.size)
+        left = (img.width - side) // 2
+        top = (img.height - side) // 2
+        img = img.crop((left, top, left + side, top + side))
+    print(f"source: {src} ({img.width}x{img.height})")
+else:
+    main = os.path.join(brand, "MDE-QUAZAR-MAIN.png")
+    img = Image.open(main).convert("RGBA").crop(CROP_BOX)
+    print(f"source: {main} crop {CROP_BOX} ({img.width}x{img.height})")
+
+sizes = (16, 22, 24, 32, 48, 64, 128, 256, 512)
+crops = {n: img.resize((n, n), Image.LANCZOS) for n in sizes}
+
+for n in sizes:
+    dst = os.path.join(quasar, f"app-icon-{n}.png")
+    crops[n].save(dst, "PNG", optimize=True)
+    print(f"wrote {dst}")
+
+dst = os.path.join(brand, "app-icon.png")
+crops[512].save(dst, "PNG", optimize=True)
+print(f"wrote {dst}")
+
+dst = os.path.join(brand, "monogram.png")
+crops[256].save(dst, "PNG", optimize=True)
+print(f"wrote {dst}")
+
+# Multi-res favicon from the 16/32/48 crops (not one image auto-resized).
+# The base frame must be the LARGEST — Pillow's ICO writer drops any listed
+# size bigger than the base image, even when append_images provides it.
+dst = os.path.join(brand, "favicon.ico")
+crops[48].save(
+    dst,
+    format="ICO",
+    append_images=[crops[16], crops[32]],
+    sizes=[(16, 16), (32, 32), (48, 48)],
+)
+ico_sizes = sorted(Image.open(dst).ico.sizes())
+assert ico_sizes == [(16, 16), (32, 32), (48, 48)], f"favicon not multi-res: {ico_sizes}"
+print(f"wrote {dst} (sizes: {ico_sizes})")
+PY
+
+echo "done — re-brand the fleet by cutting a release (the quasar hicolor set + brand masters ship in the RPM; %post runs gtk-update-icon-cache)."
