@@ -12,6 +12,39 @@ v2.x–v6.x phase plans) lives in the git log and `docs/design/` — this file
 starts at the first packaged release line.
 
 ## [Unreleased]
+### Added
+- **BOOKMARKS-9 — the Servo browser packaged + documented (ships securely).**
+  - The `mde-web-preview` Servo helper is a first-class RPM asset
+    (`/usr/bin/mde-web-preview`) in the base (Workstation) `magic-mesh` package,
+    so it is present in the base bootc image; the BOOKMARKS-8 `browser_policy`
+    worker runtime-gates whether it may spawn. Not in the headless
+    `magic-mesh-server` variant.
+  - The RPM declares Servo's **runtime libs as hard Requires** — mesa (EGL/GL/
+    GLES/gbm/DRI), Vulkan (`mesa-vulkan-drivers` + `vulkan-loader`), and the font
+    stack (`fontconfig`/`freetype`/`harfbuzz`) + `libxkbcommon`. **Deliberately no
+    `firefox`/`gecko`/`nss`/`nspr`** — Servo is self-contained (rustls system-CA
+    TLS).
+  - The ad-filter **seed lists** ship loose at `/usr/share/magic-mesh/adblock/`,
+    `include_str!`'d into the `mde-adblock` engine from
+    `crates/services/mde-adblock/seed/*.txt` (one source, no drift).
+  - A confined **enforcing SELinux domain** for the helper
+    (`mde_web_preview_t`, `packaging/selinux/mde-web-preview.te`/`.fc`) ships and
+    is compiled + loaded by the RPM `%post`
+    (`setup-selinux-web-preview.sh`); least-privilege, default-deny to the
+    operator's home/keys/mesh data. It is defense-in-depth over the helper's
+    in-process OS sandbox and self-skips where SELinux is disabled (the platform
+    standard) — never a permissive stub.
+  - New **`docs/THREAT_MODEL.md`** — the browser attack surface, the sandbox +
+    SELinux confinement layers, and the accepted residual risks (unrestricted
+    egress, Servo fidelity, monthly-tracked churn).
+### Security
+- **Servo pin + update cadence.** The browser engine is pinned to the
+  `servo = "0.3"` crates.io publication (its own excluded workspace + `Cargo.lock`,
+  so the pin is reproducible + tamper-evident per build). Cadence: **track Servo
+  monthly** — re-pin to a current release each cycle to carry upstream security
+  fixes, minding the API churn of a young engine. The helper runs the SpiderMonkey
+  JIT on untrusted web content, so a stale pin is a security-relevant defect;
+  bump it with the rest of the fleet.
 
 ## [11.3.1] — 2026-07-01
 Patch: a security-relevant fix found by live-verifying 11.3.0 on the fleet.

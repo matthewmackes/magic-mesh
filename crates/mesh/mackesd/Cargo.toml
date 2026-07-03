@@ -389,6 +389,20 @@ assets = [
     # .desktop so it's launchable from a session too.
     { source = "target/release/mde-shell-egui",     dest = "/usr/bin/mde-shell-egui",     mode = "755" },
     # (the org.magicmesh.Shell.desktop launcher ships via the packaging/applications/*.desktop glob below)
+    # BOOKMARKS-9 — the out-of-process, OS-sandboxed Servo browser helper
+    # (BOOKMARKS-5). The shell spawns it per browser session; it renders offscreen
+    # into a shared-memory frame the Browser surface uploads to an egui texture.
+    # It ships in the BASE (Workstation) RPM so `mde-web-preview` is present in the
+    # base bootc image, then the BOOKMARKS-8 `browser_policy` worker RUNTIME-GATES
+    # whether it may spawn (per-role enable/disable). NOT in the server variant (a
+    # headless Server has no browser). It is its OWN workspace root (Servo drags a
+    # conflicting native sqlite link — see the crate manifest), so it is NOT built
+    # by `cargo build --workspace`; build-rpm-fedora43.sh compiles it into the same
+    # CARGO_TARGET_DIR right after the workspace release build, so this
+    # `target/release/mde-web-preview` path resolves (cargo-generate-rpm rewrites
+    # the `target/` prefix to the active target dir). Its confined SELinux domain +
+    # Servo runtime-lib Requires ship below.
+    { source = "target/release/mde-web-preview",     dest = "/usr/bin/mde-web-preview",     mode = "755" },
     # E12-14b — the obsolete Cosmic-era surfaces were dropped: the live-map
     # layer-shell wallpaper (mde-mesh-wallpaper) + the notify-hub bins
     # (mde-notify-{center,toast,capture}), AND the four Cosmic-era GUIs that
@@ -553,6 +567,20 @@ assets = [
     # split by precondition so a missing optional type only skips that module.
     { source = "install-helpers/selinux/*.cil", dest = "/usr/share/magic-mesh/selinux/", mode = "644" },
     { source = "install-helpers/setup-selinux-policy.sh", dest = "/usr/libexec/mackesd/setup-selinux-policy", mode = "755" },
+    # BOOKMARKS-9 — the confined ENFORCING SELinux domain for the Servo browser
+    # helper (mde_web_preview_t). The .te/.fc source ships + the loader compiles it
+    # into a loadable module and installs it (%post below). Defense-in-depth over
+    # the helper's in-process OS sandbox; self-skips where SELinux is disabled (the
+    # platform standard) or the policy toolchain is absent — never a permissive stub.
+    { source = "packaging/selinux/mde-web-preview.te", dest = "/usr/share/magic-mesh/selinux/mde-web-preview/mde-web-preview.te", mode = "644" },
+    { source = "packaging/selinux/mde-web-preview.fc", dest = "/usr/share/magic-mesh/selinux/mde-web-preview/mde-web-preview.fc", mode = "644" },
+    { source = "install-helpers/setup-selinux-web-preview.sh", dest = "/usr/libexec/mackesd/setup-selinux-web-preview", mode = "755" },
+    # BOOKMARKS-9 — the bundled ad-filter SEED lists (the offline fallback the
+    # mde-adblock engine compiles before a node's first upstream sync). These are
+    # the SAME bytes `mde-adblock` `include_str!`s into the shipped shell binary
+    # (one source, no drift); shipping them loose makes the "bundles the seed filter
+    # lists" acceptance observable in `rpm -qlp` and operator-inspectable on disk.
+    { source = "crates/services/mde-adblock/seed/*.txt", dest = "/usr/share/magic-mesh/adblock/", mode = "644" },
     # DAR-46 — DEVOPS-AUTOMATION-REBUILD: ship the backoffice/control-VM plane so a
     # rebuilt/rebooted control VM re-converges with no manual step (the deploy root
     # is /opt/mcnf — the mcnf-* units WorkingDirectory + cmd_found's MCNF_REPO
@@ -640,6 +668,12 @@ systemctl enable magic-setup.service >/dev/null 2>&1 || :
 # Enforcing (no AVC flood from mackesd's podman transition / libvirt /proc scans;
 # no repeating "SELinux security alert" toasts). Self-skips if SELinux is off.
 /usr/libexec/mackesd/setup-selinux-policy >/dev/null 2>&1 || :
+# BOOKMARKS-9 — compile + load the confined ENFORCING domain for the Servo
+# browser helper (mde_web_preview_t), then relabel /usr/bin/mde-web-preview.
+# Defense-in-depth over the helper's in-process OS sandbox; self-skips where
+# SELinux is disabled (the platform standard set just above) or the policy
+# toolchain is absent (never a fake success — the OS sandbox stays operative).
+/usr/libexec/mackesd/setup-selinux-web-preview >/dev/null 2>&1 || :
 # MUSIC-DAEMON-AUTOSTART — enable the mde-musicd USER service for every user so
 # the music library has its action/music/* responder in the desktop session
 # (the GUI talks to it over the bus). It self-gates on Workstation rank
@@ -660,8 +694,9 @@ fi
 post_uninstall_script = """
 systemctl daemon-reload >/dev/null 2>&1 || :
 # SELINUX-1 — drop the local policy modules on a full removal (not an upgrade).
+# BOOKMARKS-9 — also drop the confined browser-helper domain (mde-web-preview).
 if [ "$1" = 0 ]; then
-  semodule -r magicmesh-base magicmesh-podman magicmesh-libvirt >/dev/null 2>&1 || :
+  semodule -r magicmesh-base magicmesh-podman magicmesh-libvirt mde-web-preview >/dev/null 2>&1 || :
 fi
 """
 
@@ -758,6 +793,35 @@ qemu-img = "*"
 fwupd = "*"
 libwacom = "*"
 
+# BOOKMARKS-9 (browser packaging, design mesh-bookmarks.md Q81) — the Servo
+# browser helper (mde-web-preview) dynamically links the system graphics/text
+# stack, so declare those runtime libs as hard Requires (Servo is a SELF-CONTAINED
+# engine — it brings its own JS/layout/net/TLS, so there is DELIBERATELY **no
+# firefox / gecko / nss / nspr** dep here; the helper does system-CA TLS via
+# rustls). One RPM serves every role; a headless Lighthouse installs these but the
+# browser self-gates (it only spawns on a Workstation under the BOOKMARKS-8
+# browser_policy), exactly like the seat runtimes (pipewire/bluez) above. The
+# leaf soname deps (expat/libpng/zlib for fontconfig/freetype) resolve
+# transitively. Reconcile the definitive set against `ldd /usr/bin/mde-web-preview`
+# on a full Servo build (operator-gated build host).
+#   · fontconfig / freetype / harfbuzz — font discovery, rasterization, shaping.
+#   · mesa-libEGL / mesa-libGL / mesa-libGLES / mesa-libgbm / mesa-dri-drivers —
+#     the offscreen GL/EGL + surfaceless GBM path Servo renders through (GPU-required).
+#   · mesa-vulkan-drivers / vulkan-loader — the Vulkan ICD + loader for the wgpu
+#     GPU backend (webrender/webgpu).
+#   · libxkbcommon — keymap handling for forwarded keyboard input.
+fontconfig = "*"
+freetype = "*"
+harfbuzz = "*"
+mesa-libEGL = "*"
+mesa-libGL = "*"
+mesa-libGLES = "*"
+mesa-libgbm = "*"
+mesa-dri-drivers = "*"
+mesa-vulkan-drivers = "*"
+vulkan-loader = "*"
+libxkbcommon = "*"
+
 # EFF-42 — ansible-core is a WEAK dep (Recommends): only the Server-tier
 # ansible_pull/job_exec workers shell to it, and they degrade gracefully
 # (spawn failure → recoverable error + back-off) when it's absent. A
@@ -809,6 +873,16 @@ rsync = "*"
 #                       dGPU) that same worker drives via typed verbs.
 iptsd = "*"
 surface-control = "*"
+# BOOKMARKS-9 — the policy-build toolchain the browser-helper SELinux loader
+# (setup-selinux-web-preview) uses to compile mde-web-preview.te into a loadable
+# module. WEAK: the operator platform runs SELinux disabled (2026-06-20), so a
+# default install does not strictly need it, and the loader honestly self-skips
+# when it is absent (the helper's OS sandbox stays operative). Present it so a node
+# that DOES enable SELinux can enforce the confined browser domain with no manual
+# step. selinux-policy-devel supplies the refpolicy /usr/share/selinux/devel/
+# Makefile + interfaces; checkpolicy the checkmodule fallback path.
+selinux-policy-devel = "*"
+checkpolicy = "*"
 
 # EFF-42 — upgrade continuity: the pre-pivot package name was `mde-core`
 # (the E8-era RPM; see config/daemon.rs's template note). Obsolete it so

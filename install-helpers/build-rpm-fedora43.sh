@@ -98,6 +98,30 @@ if [ "${MODE:-full}" = "server" ]; then
 else
   echo "[f43] building workspace (release) — this is the long part"
   cargo build --workspace --release --locked
+  # BOOKMARKS-9 — the Servo browser helper (mde-web-preview) is its OWN workspace
+  # root (excluded from the parent workspace: Servo drags a conflicting native
+  # sqlite link — see the crate manifest), so `--workspace` above did NOT build it.
+  # Build it here into the SAME CARGO_TARGET_DIR so it lands at
+  # $CARGO_TARGET_DIR/release/mde-web-preview, which the generate-rpm asset
+  # `target/release/mde-web-preview` resolves to (cargo-generate-rpm rewrites the
+  # `target/` prefix to the active target dir). Servo needs the system graphics/
+  # text -devel headers + libclang (mozjs bindgen) at build time; the container has
+  # network here, so its crates fetch. A hard step: the full RPM ships the browser.
+  echo "[f43] installing the Servo browser-helper build deps"
+  dnf install -y --setopt=install_weak_deps=False \
+      clang llvm python3 \
+      fontconfig-devel freetype-devel harfbuzz-devel \
+      mesa-libEGL-devel mesa-libGL-devel mesa-libgbm-devel \
+      libxkbcommon-devel >/tmp/dnf-servo.log 2>&1 || { tail -20 /tmp/dnf-servo.log; exit 1; }
+  echo "[f43] building the Servo browser helper (mde-web-preview) — heavy; needs network"
+  cargo build --release --locked \
+      --manifest-path crates/desktop/mde-web-preview/Cargo.toml || {
+    echo "GATED[BOOKMARKS-9/servo]: mde-web-preview (Servo) failed to build."
+    echo "  The full magic-mesh RPM ships the browser helper, so this is a hard stop."
+    echo "  The builder needs egress to crates.io for the servo crate tree + the"
+    echo "  graphics/text -devel headers installed above; point at a LAN mirror on"
+    echo "  an airgapped builder. (A headless RPM has no browser: use --server.)"
+    exit 1; }
   echo "[f43] generating RPM"
   cargo generate-rpm -p crates/mesh/mackesd
 fi

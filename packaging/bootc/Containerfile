@@ -123,6 +123,26 @@ RUN set -eux; \
         qemu-img; \
     dnf clean all
 
+# BOOKMARKS-9 (browser packaging, docs/design/mesh-bookmarks.md + docs/THREAT_MODEL.md)
+# — the Servo browser helper. `/usr/bin/mde-web-preview` ships IN the magic-mesh
+# RPM installed above, so the base bootc image already carries the browser binary
+# (its confined SELinux domain loads via the RPM %post where SELinux is enabled;
+# on the disabled-SELinux platform standard the helper's in-process OS sandbox is
+# the confinement). WHETHER it may spawn is decided at RUNTIME by the BOOKMARKS-8
+# `browser_policy` worker (per-role enable/disable), never baked into the image.
+# The helper's Servo runtime libs are HARD Requires of the RPM, so the install
+# above already pulled them; install them explicitly too (mirroring the seat +
+# storage blocks) so an offline compose from a staged local RPM cannot miss them:
+# the offscreen GL/EGL + surfaceless GBM stack, Vulkan ICD + loader, and the
+# font/shaping stack. NO firefox/nss — Servo is self-contained (rustls system-CA
+# TLS). Inert on a Lighthouse (the browser self-gates on the Workstation role).
+RUN set -eux; \
+    dnf -y install \
+        mesa-libEGL mesa-libGL mesa-libGLES mesa-libgbm mesa-dri-drivers \
+        mesa-vulkan-drivers vulkan-loader \
+        fontconfig freetype harfbuzz libxkbcommon; \
+    dnf clean all
+
 # SURFACE-1 (Microsoft Surface tablet/laptop enablement, docs/design/
 # surface-tablet-enablement.md locks 1 + 10) — the conditional **linux-surface**
 # layer. ONE Workstation image serves every node (lock 10, like the seat/storage
