@@ -103,5 +103,22 @@ mde-chat = { path = "../../services/mde-chat" }
 # toolkit resolution.
 mde-seat = { path = "../mde-seat" }
 
+# BOOKMARKS-6 — the Surface::Browser IPC + shm texture bridge. The shell's `web`
+# panel is this crate's first caller: it spawns the sandboxed `mde-web-preview`
+# helper per session, drives it over the typed session socket, and uploads each
+# paint-ready shm frame to an egui `TextureHandle` (the same decode→upload shape
+# the VDI decoder crates use). The edge points sideways-inward within the
+# desktop-shell tier (§6), sharing the one `mde-egui` toolkit resolution; it does
+# NOT reach the workspace-excluded Servo helper crate — only the shared wire seam.
+mde-web-preview-client = { path = "../mde-web-preview-client" }
+
+[dev-dependencies]
+# The Browser-surface render tests drive a real session over the client's
+# in-process fake helper (a socketpair peer publishing a genuine MWP1 shm frame),
+# so the panel's paint-ready → texture-upload + crash paths are exercised
+# headlessly with no Servo process — the `testkit` feature gates that scaffolding
+# out of the release build.
+mde-web-preview-client = { path = "../mde-web-preview-client", features = ["testkit"] }
+
 [lints]
 workspace = true

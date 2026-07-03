@@ -1,0 +1,776 @@
+//! The typed, length-prefixed message set that travels on the per-session Unix
+//! socket — the socket half of the BOOKMARKS-6 seam.
+//!
+//! Two directions, both framed identically on the wire:
+//!
+//! ```text
+//!   [u32 LE payload-length][payload]
+//! ```
+//!
+//! * [`ControlMsg`] — shell → helper: navigate / reload / history / resize / input.
+//! * [`EventMsg`] — helper → shell: the shm fd is attached (`AttachFrame`, carrying
+//!   the descriptor out-of-band via `SCM_RIGHTS`), a fresh frame was painted
+//!   (`PaintReady`), the title / nav-state changed, or the page crashed.
+//!
+//! The payload is a compact, hand-rolled binary encoding (a `u8` tag then LE
+//! fields) — no serde dependency, and every field is length- or bounds-checked on
+//! decode so a malformed or hostile frame is a typed [`WireError`], never a panic
+//! (§9). The key contract ([`KeyCode`]) is engine-neutral on purpose: the shell
+//! maps egui keys onto it and the sandboxed helper maps it onto Servo, so neither
+//! end leaks its toolkit's key numbering onto the wire.
+
+use std::fmt;
+
+/// A frame's declared payload length may not exceed this.
+///
+/// A guard against a corrupt/hostile length prefix allocating unboundedly.
+/// Control/event payloads are tiny (a URL string at most); 1 MiB is enormous
+/// headroom.
+pub const MAX_FRAME_LEN: usize = 1 << 20;
+
+/// Why a wire message could not be decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireError {
+    /// The buffer ended before a field was fully read.
+    UnexpectedEnd,
+    /// A message/enum tag byte was not a known variant.
+    BadTag(u8),
+    /// A declared length exceeded [`MAX_FRAME_LEN`].
+    TooLong(usize),
+    /// A string field was not valid UTF-8.
+    BadUtf8,
+}
+
+impl fmt::Display for WireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedEnd => f.write_str("wire message ended mid-field"),
+            Self::BadTag(t) => write!(f, "unknown wire tag {t}"),
+            Self::TooLong(n) => write!(f, "wire length {n} exceeds the cap"),
+            Self::BadUtf8 => f.write_str("wire string was not valid UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for WireError {}
+
+/// A pointer button, engine-neutral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PointerButton {
+    /// The primary (usually left) button.
+    Primary = 0,
+    /// The secondary (usually right) button.
+    Secondary = 1,
+    /// The middle button.
+    Middle = 2,
+}
+
+impl PointerButton {
+    const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Primary),
+            1 => Some(Self::Secondary),
+            2 => Some(Self::Middle),
+            _ => None,
+        }
+    }
+}
+
+/// Keyboard-modifier bitflags, engine-neutral (matches the common egui set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Modifiers(pub u8);
+
+impl Modifiers {
+    /// `Ctrl` is held.
+    pub const CTRL: u8 = 1 << 0;
+    /// `Shift` is held.
+    pub const SHIFT: u8 = 1 << 1;
+    /// `Alt` is held.
+    pub const ALT: u8 = 1 << 2;
+    /// The platform command key (`Super`/`Cmd`) is held.
+    pub const COMMAND: u8 = 1 << 3;
+
+    /// Whether `flag` (one of the associated constants) is set.
+    #[must_use]
+    pub const fn has(self, flag: u8) -> bool {
+        self.0 & flag != 0
+    }
+}
+
+/// An engine-neutral key.
+///
+/// The shell maps [`egui::Key`](crate::egui::Key) onto this and the helper maps it
+/// onto Servo, so the wire never carries either toolkit's private key numbering.
+/// Keys neither side has a mapping for are dropped (best-effort input) — printable
+/// characters ride [`InputEvent::Text`] anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+#[allow(missing_docs, reason = "the variants are self-describing key names")]
+pub enum KeyCode {
+    Enter = 0,
+    Escape,
+    Backspace,
+    Tab,
+    Space,
+    Delete,
+    Insert,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+    Num0,
+    Num1,
+    Num2,
+    Num3,
+    Num4,
+    Num5,
+    Num6,
+    Num7,
+    Num8,
+    Num9,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+}
+
+impl KeyCode {
+    /// The wire discriminant.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self as u16
+    }
+
+    /// Decode a wire discriminant back to a [`KeyCode`].
+    #[must_use]
+    pub const fn from_u16(v: u16) -> Option<Self> {
+        // The variants are a dense 0..=63 range, so a bounds check + transmute
+        // would be sound, but an explicit match keeps this `unsafe`-free.
+        Some(match v {
+            0 => Self::Enter,
+            1 => Self::Escape,
+            2 => Self::Backspace,
+            3 => Self::Tab,
+            4 => Self::Space,
+            5 => Self::Delete,
+            6 => Self::Insert,
+            7 => Self::Home,
+            8 => Self::End,
+            9 => Self::PageUp,
+            10 => Self::PageDown,
+            11 => Self::ArrowUp,
+            12 => Self::ArrowDown,
+            13 => Self::ArrowLeft,
+            14 => Self::ArrowRight,
+            15 => Self::A,
+            16 => Self::B,
+            17 => Self::C,
+            18 => Self::D,
+            19 => Self::E,
+            20 => Self::F,
+            21 => Self::G,
+            22 => Self::H,
+            23 => Self::I,
+            24 => Self::J,
+            25 => Self::K,
+            26 => Self::L,
+            27 => Self::M,
+            28 => Self::N,
+            29 => Self::O,
+            30 => Self::P,
+            31 => Self::Q,
+            32 => Self::R,
+            33 => Self::S,
+            34 => Self::T,
+            35 => Self::U,
+            36 => Self::V,
+            37 => Self::W,
+            38 => Self::X,
+            39 => Self::Y,
+            40 => Self::Z,
+            41 => Self::Num0,
+            42 => Self::Num1,
+            43 => Self::Num2,
+            44 => Self::Num3,
+            45 => Self::Num4,
+            46 => Self::Num5,
+            47 => Self::Num6,
+            48 => Self::Num7,
+            49 => Self::Num8,
+            50 => Self::Num9,
+            51 => Self::F1,
+            52 => Self::F2,
+            53 => Self::F3,
+            54 => Self::F4,
+            55 => Self::F5,
+            56 => Self::F6,
+            57 => Self::F7,
+            58 => Self::F8,
+            59 => Self::F9,
+            60 => Self::F10,
+            61 => Self::F11,
+            62 => Self::F12,
+            _ => return None,
+        })
+    }
+}
+
+/// One forwarded input event, in the helper's **device pixels** (the shell has
+/// already multiplied logical coordinates by `pixels_per_point`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputEvent {
+    /// The pointer moved to `(x, y)` device pixels.
+    PointerMoved {
+        /// Device-pixel X.
+        x: f32,
+        /// Device-pixel Y.
+        y: f32,
+    },
+    /// A pointer button changed state at `(x, y)` device pixels.
+    PointerButton {
+        /// Device-pixel X.
+        x: f32,
+        /// Device-pixel Y.
+        y: f32,
+        /// Which button.
+        button: PointerButton,
+        /// `true` on press, `false` on release.
+        pressed: bool,
+    },
+    /// The pointer left the view (so the helper can clear hover).
+    PointerGone,
+    /// A scroll/wheel delta in device pixels.
+    Scroll {
+        /// Horizontal delta.
+        delta_x: f32,
+        /// Vertical delta.
+        delta_y: f32,
+    },
+    /// A key changed state.
+    Key {
+        /// The engine-neutral key.
+        key: KeyCode,
+        /// `true` on press, `false` on release.
+        pressed: bool,
+        /// Held modifiers.
+        modifiers: Modifiers,
+    },
+    /// Committed text (IME / typed characters).
+    Text(String),
+}
+
+impl InputEvent {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::PointerMoved { x, y } => {
+                out.push(0);
+                put_f32(out, *x);
+                put_f32(out, *y);
+            }
+            Self::PointerButton {
+                x,
+                y,
+                button,
+                pressed,
+            } => {
+                out.push(1);
+                put_f32(out, *x);
+                put_f32(out, *y);
+                out.push(*button as u8);
+                out.push(u8::from(*pressed));
+            }
+            Self::PointerGone => out.push(2),
+            Self::Scroll { delta_x, delta_y } => {
+                out.push(3);
+                put_f32(out, *delta_x);
+                put_f32(out, *delta_y);
+            }
+            Self::Key {
+                key,
+                pressed,
+                modifiers,
+            } => {
+                out.push(4);
+                put_u16(out, key.as_u16());
+                out.push(u8::from(*pressed));
+                out.push(modifiers.0);
+            }
+            Self::Text(s) => {
+                out.push(5);
+                put_str(out, s);
+            }
+        }
+    }
+
+    fn decode(c: &mut Cursor<'_>) -> Result<Self, WireError> {
+        Ok(match c.u8()? {
+            0 => Self::PointerMoved {
+                x: c.f32()?,
+                y: c.f32()?,
+            },
+            1 => Self::PointerButton {
+                x: c.f32()?,
+                y: c.f32()?,
+                button: PointerButton::from_u8(c.u8()?).ok_or(WireError::BadTag(0))?,
+                pressed: c.bool()?,
+            },
+            2 => Self::PointerGone,
+            3 => Self::Scroll {
+                delta_x: c.f32()?,
+                delta_y: c.f32()?,
+            },
+            4 => Self::Key {
+                key: KeyCode::from_u16(c.u16()?).ok_or(WireError::BadTag(4))?,
+                pressed: c.bool()?,
+                modifiers: Modifiers(c.u8()?),
+            },
+            5 => Self::Text(c.string()?),
+            t => return Err(WireError::BadTag(t)),
+        })
+    }
+}
+
+/// A message the shell sends to drive the helper.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ControlMsg {
+    /// Navigate to `url`.
+    Load(String),
+    /// Reload the current page.
+    Reload,
+    /// Go back one history entry.
+    Back,
+    /// Go forward one history entry.
+    Forward,
+    /// The view was resized to `width` x `height` **device** pixels.
+    Resize {
+        /// New width in device pixels.
+        width: u32,
+        /// New height in device pixels.
+        height: u32,
+    },
+    /// Forward one input event (device pixels).
+    Input(InputEvent),
+}
+
+impl ControlMsg {
+    /// Encode to the payload bytes (no length prefix — see [`frame`]).
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            Self::Load(url) => {
+                out.push(0);
+                put_str(&mut out, url);
+            }
+            Self::Reload => out.push(1),
+            Self::Back => out.push(2),
+            Self::Forward => out.push(3),
+            Self::Resize { width, height } => {
+                out.push(4);
+                put_u32(&mut out, *width);
+                put_u32(&mut out, *height);
+            }
+            Self::Input(ev) => {
+                out.push(5);
+                ev.encode(&mut out);
+            }
+        }
+        out
+    }
+
+    /// Decode from a single payload (no length prefix).
+    ///
+    /// # Errors
+    /// Returns a [`WireError`] if the payload is truncated or carries an unknown
+    /// tag / bad string.
+    pub fn decode(payload: &[u8]) -> Result<Self, WireError> {
+        let mut c = Cursor::new(payload);
+        let msg = match c.u8()? {
+            0 => Self::Load(c.string()?),
+            1 => Self::Reload,
+            2 => Self::Back,
+            3 => Self::Forward,
+            4 => Self::Resize {
+                width: c.u32()?,
+                height: c.u32()?,
+            },
+            5 => Self::Input(InputEvent::decode(&mut c)?),
+            t => return Err(WireError::BadTag(t)),
+        };
+        Ok(msg)
+    }
+}
+
+/// A message the helper sends back to the shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventMsg {
+    /// The shm frame region's fd is attached to THIS message via `SCM_RIGHTS`.
+    /// Sent once, before the first [`Self::PaintReady`]; the receiver maps the
+    /// carried descriptor read-only.
+    AttachFrame,
+    /// A fresh frame (sequence `seq`, always even/stable) is published on the shm
+    /// channel — the shell reads it and uploads it to its texture. Frames are
+    /// **not** streamed; this is the paint-ready signal.
+    PaintReady {
+        /// The published seqlock sequence (even = a stable frame).
+        seq: u64,
+    },
+    /// The page title changed.
+    Title(String),
+    /// The navigation state changed (drives the chrome's back/forward/reload +
+    /// address bar).
+    NavState {
+        /// A back-history entry exists.
+        can_back: bool,
+        /// A forward-history entry exists.
+        can_forward: bool,
+        /// A load is in progress.
+        loading: bool,
+        /// The committed URL.
+        url: String,
+    },
+    /// The page/engine crashed; `reason` is a short human string.
+    Crashed {
+        /// Why it crashed.
+        reason: String,
+    },
+}
+
+impl EventMsg {
+    /// Encode to the payload bytes (no length prefix).
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            Self::AttachFrame => out.push(0),
+            Self::PaintReady { seq } => {
+                out.push(1);
+                put_u64(&mut out, *seq);
+            }
+            Self::Title(t) => {
+                out.push(2);
+                put_str(&mut out, t);
+            }
+            Self::NavState {
+                can_back,
+                can_forward,
+                loading,
+                url,
+            } => {
+                out.push(3);
+                out.push(u8::from(*can_back));
+                out.push(u8::from(*can_forward));
+                out.push(u8::from(*loading));
+                put_str(&mut out, url);
+            }
+            Self::Crashed { reason } => {
+                out.push(4);
+                put_str(&mut out, reason);
+            }
+        }
+        out
+    }
+
+    /// Decode from a single payload (no length prefix).
+    ///
+    /// # Errors
+    /// Returns a [`WireError`] if the payload is truncated or carries an unknown
+    /// tag / bad string.
+    pub fn decode(payload: &[u8]) -> Result<Self, WireError> {
+        let mut c = Cursor::new(payload);
+        let msg = match c.u8()? {
+            0 => Self::AttachFrame,
+            1 => Self::PaintReady { seq: c.u64()? },
+            2 => Self::Title(c.string()?),
+            3 => Self::NavState {
+                can_back: c.bool()?,
+                can_forward: c.bool()?,
+                loading: c.bool()?,
+                url: c.string()?,
+            },
+            4 => Self::Crashed {
+                reason: c.string()?,
+            },
+            t => return Err(WireError::BadTag(t)),
+        };
+        Ok(msg)
+    }
+}
+
+/// Wrap a payload in the on-wire length prefix: `[u32 LE len][payload]`.
+#[must_use]
+pub fn frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + payload.len());
+    put_len(&mut out, payload.len());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Pop one complete length-prefixed frame's payload off the front of `buf`,
+/// draining the consumed bytes. Returns:
+///
+/// * `Ok(Some(payload))` — a full frame was available and removed;
+/// * `Ok(None)` — not enough bytes buffered yet (leave `buf` intact, read more);
+/// * `Err` — the length prefix exceeds [`MAX_FRAME_LEN`] (a corrupt stream).
+///
+/// # Errors
+/// [`WireError::TooLong`] if the declared length is over the cap.
+pub fn take_frame(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>, WireError> {
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if len > MAX_FRAME_LEN {
+        return Err(WireError::TooLong(len));
+    }
+    if buf.len() < 4 + len {
+        return Ok(None);
+    }
+    let payload = buf[4..4 + len].to_vec();
+    buf.drain(..4 + len);
+    Ok(Some(payload))
+}
+
+// ── Primitive put/get helpers ────────────────────────────────────────────────
+
+fn put_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+fn put_f32(out: &mut Vec<u8>, v: f32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+/// Write a byte-length as a `u32` prefix. Lengths on this wire are bounded by
+/// [`MAX_FRAME_LEN`] (and a `u32`-length frame is rejected on decode), so a
+/// buffer large enough to truncate cannot occur; a saturating cast keeps the
+/// helper panic-free.
+fn put_len(out: &mut Vec<u8>, len: usize) {
+    put_u32(out, u32::try_from(len).unwrap_or(u32::MAX));
+}
+fn put_str(out: &mut Vec<u8>, s: &str) {
+    put_len(out, s.len());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// A bounds-checked forward reader over a payload.
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], WireError> {
+        let end = self.pos.checked_add(n).ok_or(WireError::UnexpectedEnd)?;
+        let slice = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or(WireError::UnexpectedEnd)?;
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn u8(&mut self) -> Result<u8, WireError> {
+        Ok(self.take(1)?[0])
+    }
+    fn bool(&mut self) -> Result<bool, WireError> {
+        Ok(self.u8()? != 0)
+    }
+    fn u16(&mut self) -> Result<u16, WireError> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn u32(&mut self) -> Result<u32, WireError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn u64(&mut self) -> Result<u64, WireError> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+    fn f32(&mut self) -> Result<f32, WireError> {
+        let b = self.take(4)?;
+        Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    fn string(&mut self) -> Result<String, WireError> {
+        let len = self.u32()? as usize;
+        if len > MAX_FRAME_LEN {
+            return Err(WireError::TooLong(len));
+        }
+        let b = self.take(len)?;
+        std::str::from_utf8(b)
+            .map(ToOwned::to_owned)
+            .map_err(|_| WireError::BadUtf8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_control(msg: &ControlMsg) {
+        let payload = msg.encode();
+        assert_eq!(&ControlMsg::decode(&payload).expect("decode"), msg);
+        // And through the length-prefix framing + streaming parser.
+        let mut buf = frame(&payload);
+        let popped = take_frame(&mut buf).expect("no error").expect("one frame");
+        assert!(buf.is_empty(), "the framer left trailing bytes");
+        assert_eq!(&ControlMsg::decode(&popped).expect("decode"), msg);
+    }
+
+    fn round_event(msg: &EventMsg) {
+        let payload = msg.encode();
+        assert_eq!(&EventMsg::decode(&payload).expect("decode"), msg);
+    }
+
+    #[test]
+    fn control_messages_round_trip() {
+        round_control(&ControlMsg::Load("https://example.test/a?b=1".to_owned()));
+        round_control(&ControlMsg::Reload);
+        round_control(&ControlMsg::Back);
+        round_control(&ControlMsg::Forward);
+        round_control(&ControlMsg::Resize {
+            width: 1280,
+            height: 800,
+        });
+        round_control(&ControlMsg::Input(InputEvent::PointerMoved {
+            x: 12.5,
+            y: 7.25,
+        }));
+        round_control(&ControlMsg::Input(InputEvent::PointerButton {
+            x: 3.0,
+            y: 4.0,
+            button: PointerButton::Secondary,
+            pressed: true,
+        }));
+        round_control(&ControlMsg::Input(InputEvent::PointerGone));
+        round_control(&ControlMsg::Input(InputEvent::Scroll {
+            delta_x: -2.0,
+            delta_y: 40.0,
+        }));
+        round_control(&ControlMsg::Input(InputEvent::Key {
+            key: KeyCode::Enter,
+            pressed: true,
+            modifiers: Modifiers(Modifiers::CTRL | Modifiers::SHIFT),
+        }));
+        round_control(&ControlMsg::Input(InputEvent::Text("héllo →".to_owned())));
+    }
+
+    #[test]
+    fn event_messages_round_trip() {
+        round_event(&EventMsg::AttachFrame);
+        round_event(&EventMsg::PaintReady { seq: 42 });
+        round_event(&EventMsg::Title("A Page".to_owned()));
+        round_event(&EventMsg::NavState {
+            can_back: true,
+            can_forward: false,
+            loading: true,
+            url: "https://example.test/".to_owned(),
+        });
+        round_event(&EventMsg::Crashed {
+            reason: "engine SIGSEGV".to_owned(),
+        });
+    }
+
+    #[test]
+    fn every_keycode_round_trips_its_discriminant() {
+        for raw in 0u16..=62 {
+            let key = KeyCode::from_u16(raw).expect("dense 0..=62 range");
+            assert_eq!(key.as_u16(), raw);
+        }
+        assert_eq!(KeyCode::from_u16(63), None, "out-of-range key rejected");
+    }
+
+    #[test]
+    fn a_truncated_payload_is_a_typed_error_not_a_panic() {
+        assert_eq!(ControlMsg::decode(&[]), Err(WireError::UnexpectedEnd));
+        // Load with a length claiming 8 bytes but none present.
+        let mut bad = vec![0u8]; // tag Load
+        bad.extend_from_slice(&8u32.to_le_bytes());
+        assert_eq!(ControlMsg::decode(&bad), Err(WireError::UnexpectedEnd));
+        assert!(matches!(
+            ControlMsg::decode(&[99]),
+            Err(WireError::BadTag(99))
+        ));
+    }
+
+    #[test]
+    fn take_frame_reassembles_across_partial_reads() {
+        // Two frames concatenated, delivered in three arbitrary chunks.
+        let a = frame(&ControlMsg::Reload.encode());
+        let b = frame(&ControlMsg::Load("x".to_owned()).encode());
+        let mut stream: Vec<u8> = Vec::new();
+        stream.extend_from_slice(&a);
+        stream.extend_from_slice(&b);
+
+        // Feed only the first 2 bytes: not a whole length prefix yet.
+        let mut buf = stream[..2].to_vec();
+        assert_eq!(take_frame(&mut buf).expect("ok"), None);
+        // Now the rest arrives.
+        buf.extend_from_slice(&stream[2..]);
+        let f1 = take_frame(&mut buf).expect("ok").expect("frame 1");
+        assert_eq!(ControlMsg::decode(&f1).expect("decode"), ControlMsg::Reload);
+        let f2 = take_frame(&mut buf).expect("ok").expect("frame 2");
+        assert_eq!(
+            ControlMsg::decode(&f2).expect("decode"),
+            ControlMsg::Load("x".to_owned())
+        );
+        assert!(take_frame(&mut buf).expect("ok").is_none());
+    }
+
+    #[test]
+    fn take_frame_rejects_an_absurd_length_prefix() {
+        // u32::MAX is far above MAX_FRAME_LEN (1 MiB), so the framer rejects it.
+        let mut buf = u32::MAX.to_le_bytes().to_vec();
+        assert!(matches!(take_frame(&mut buf), Err(WireError::TooLong(_))));
+    }
+}

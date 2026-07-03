@@ -37,6 +37,7 @@ mod system;
 mod thisnode;
 mod toast_bridge;
 mod vdi;
+mod web;
 mod workbench;
 
 use mde_egui::eframe::CreationContext;
@@ -175,6 +176,12 @@ struct Shell {
     /// the formfactor (fed from the publisher above) is Tablet and a text field has
     /// focus, injecting key presses into the same egui input pipeline. Inert on Laptop.
     keyboard: keyboard::Keyboard,
+    /// The Browser surface (BOOKMARKS-6) — the sandboxed `mde-web-preview` Servo
+    /// helper driven over the per-session IPC socket and displayed by uploading its
+    /// shm frames to an egui texture (`mde-web-preview-client`). Holds no live tab
+    /// until the gated `live-helper` spawn attaches one; the panel shows its honest
+    /// gated EmptyState until then, exactly like the VDI Desktop surface.
+    web: web::WebState,
 }
 
 impl Shell {
@@ -213,6 +220,7 @@ impl Shell {
             hotkeys: hotkeys::HotkeyRouter::default(),
             formfactor: formfactor::FormfactorPublisher::default(),
             keyboard: keyboard::Keyboard::default(),
+            web: web::WebState::default(),
         }
     }
 
@@ -366,6 +374,25 @@ impl Shell {
                     ui.separator();
                     voice_panel(ui, voice);
                 });
+            }
+            Surface::Browser => {
+                // The sandboxed Servo browser (BOOKMARKS-6) — the `mde-web-preview`
+                // helper driven over IPC and displayed by uploading its shm frames
+                // to an egui texture. Scoped under its own `push_id` like every
+                // mounted surface. The panel polls + drives its own tabs; a live
+                // session attaches only via the gated `live-helper` spawn (else the
+                // honest gated EmptyState), so nothing is faked here (§7).
+                let web = &mut self.web;
+                ui.push_id("shell-web", |ui| {
+                    web::web_panel(ui, web);
+                });
+                // Respawn-on-reload: a crashed tab's Reload asked to restart. The
+                // live helper spawn is the client crate's gated `live-helper` path
+                // (honest-gated to a GPU seat), so the shell drains + acknowledges
+                // the request here; a live build swaps in a fresh session. No live
+                // tabs exist in the default build, so this is inert (never a faked
+                // page, §7).
+                let _restart_requested = self.web.take_respawn_request();
             }
             Surface::Chat => {
                 let chat = &mut self.chat;
