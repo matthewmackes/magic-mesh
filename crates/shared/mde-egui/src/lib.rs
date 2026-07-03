@@ -34,6 +34,7 @@ pub mod runner;
 pub mod style;
 pub mod toast;
 pub mod touch;
+pub mod video_plane;
 pub mod widgets;
 
 // E12-2: the bare-seat DRM/KMS backend (no compositor), behind `feature = "drm"`.
@@ -61,10 +62,15 @@ pub use toast::{
     ChyronInteraction, Dwell, OsdKind, OsdLevel, Severity, Tier, Toast, ToastAction, ToastHost,
 };
 pub use touch::{RawContact, Rotation, TouchTransform, TouchTranslator};
+pub use video_plane::{
+    clamp_and_crop, fit_rect, plane_placement, present_frame, FakeCatalog, FallbackReason, FbToken,
+    PaneRect, Placement, PlaneCatalog, PlaneInfo, PlaneKind, PlaneSet, RecordingScanout, VideoPath,
+    VideoPlaneError, VideoPlanePlan, VideoScanout,
+};
 pub use widgets::{field, muted_note, status_dot};
 
 #[cfg(feature = "drm")]
-pub use drm::run_drm;
+pub use drm::{probe_primary_video_plane, probe_video_plane, run_drm, DrmVideoScanout};
 
 // Re-export the toolkit so surfaces depend on `mde-egui` alone and share one
 // egui/eframe resolution.

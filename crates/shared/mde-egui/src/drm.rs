@@ -56,6 +56,10 @@ use crate::formfactor::{
     SysfsAccel,
 };
 use crate::touch::{RawContact, Rotation, TouchTransform, TouchTranslator};
+use crate::video_plane::{
+    PaneRect, PlaneInfo, PlaneKind, PlaneSet, VideoPath, VideoPlaneError, VideoPlanePlan,
+    VideoScanout,
+};
 
 /// Why the bare-seat backend could not start / present. The shell treats any
 /// variant as "no usable seat here" and falls back to the windowed runner.
@@ -1153,6 +1157,233 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     }
     painter.destroy();
     Ok(())
+}
+
+// ── MEDIA-2: the live overlay video-plane wiring (hardware-gated) ─────────────
+//
+// The pure plane-selection + geometry seam lives in [`crate::video_plane`] and is unit-
+// tested against a fake catalog. This is its live half: it reads REAL DRM planes (type
+// / zpos / possible_crtcs) into a [`PlaneSet`] so `plan_video` can pick a hardware
+// overlay plane beneath the egui shell, and drives KMS `set_plane` to scan a
+// framebuffer out on it. It compiles on the farm (behind `feature = "drm"`) but only
+// *presents* on a real seat — the same honest posture as [`run_drm`]; a headless host
+// degrades cleanly to [`DrmError::NoDrmMaster`] and the caller uses the render-to-
+// texture fallback ([`VideoPath::texture_no_drm`]).
+
+/// Read a named property's raw value off `plane`, if the driver exposes it.
+fn plane_prop_value(dev: &gbm::Device<Card>, plane: plane::Handle, name: &str) -> Option<u64> {
+    let props = dev.get_properties(plane).ok()?;
+    for (&handle, &value) in props.iter() {
+        if let Ok(info) = dev.get_property(handle) {
+            if info.name().to_str() == Ok(name) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// Read a named property's *handle* off `plane` (to `set_property` it later).
+fn plane_prop_handle(
+    dev: &gbm::Device<Card>,
+    plane: plane::Handle,
+    name: &str,
+) -> Option<property::Handle> {
+    let props = dev.get_properties(plane).ok()?;
+    let (handles, _values) = props.as_props_and_values();
+    for &handle in handles {
+        if let Ok(info) = dev.get_property(handle) {
+            if info.name().to_str() == Ok(name) {
+                return Some(handle);
+            }
+        }
+    }
+    None
+}
+
+/// Enumerate this card's planes into a [`PlaneSet`] for the CRTC `crtc`.
+///
+/// Reads each plane's `type` (→ [`PlaneKind`]), `zpos`, and `possible_crtcs`, and
+/// identifies the primary plane bound to `crtc` as the egui plane (excluded from video,
+/// ordered above the video plane).
+///
+/// The live enumerate half of the MEDIA-2 seam. On a headless host `plane_handles`
+/// yields nothing (or the primary only), so [`PlaneSet::plan_video`] returns the
+/// render-to-texture fallback — no faked plane.
+///
+/// # Errors
+/// [`VideoPlaneError::Enumerate`] when the KMS resource / plane list cannot be read, or
+/// the target `crtc` is not in the card's CRTC list.
+pub fn probe_video_plane(
+    dev: &gbm::Device<Card>,
+    crtc: crtc::Handle,
+) -> Result<PlaneSet, VideoPlaneError> {
+    let res = dev
+        .resource_handles()
+        .map_err(|e| VideoPlaneError::Enumerate(format!("resource_handles: {e}")))?;
+    // A plane's `possible_crtcs` bit N addresses the N-th CRTC in this list, so the
+    // target CRTC's list index IS its bit position — the pure seam's `crtc_index`.
+    let crtc_index =
+        u32::try_from(res.crtcs().iter().position(|&c| c == crtc).ok_or_else(|| {
+            VideoPlaneError::Enumerate("target CRTC not in resource list".into())
+        })?)
+        .map_err(|_| VideoPlaneError::Enumerate("CRTC index out of range".into()))?;
+
+    let handles = dev
+        .plane_handles()
+        .map_err(|e| VideoPlaneError::Enumerate(format!("plane_handles: {e}")))?;
+
+    let crtc_list = res.crtcs();
+    let mut planes: Vec<PlaneInfo> = Vec::new();
+    let mut egui_plane_id = 0u32;
+    let mut egui_zpos = None;
+    for ph in handles {
+        let Ok(info) = dev.get_plane(ph) else {
+            continue;
+        };
+        let id = u32::from(ph);
+        let kind =
+            plane_prop_value(dev, ph, "type").map_or(PlaneKind::Unknown, PlaneKind::from_drm_type);
+        let zpos = plane_prop_value(dev, ph, "zpos");
+        // Rebuild the possible-CRTC bitmask in terms of this list's indices (the `drm`
+        // crate hides the raw mask; `filter_crtcs` gives the handles it addresses).
+        let possible_crtcs = res
+            .filter_crtcs(info.possible_crtcs())
+            .iter()
+            .fold(0u32, |acc, c| match crtc_list.iter().position(|x| x == c) {
+                Some(idx) if idx < 32 => acc | (1u32 << idx),
+                _ => acc,
+            });
+        // The egui shell scans out through the primary plane bound to this CRTC.
+        if kind == PlaneKind::Primary && info.crtc() == Some(crtc) {
+            egui_plane_id = id;
+            egui_zpos = zpos;
+        }
+        planes.push(PlaneInfo {
+            id,
+            kind,
+            possible_crtcs,
+            zpos,
+        });
+    }
+
+    Ok(PlaneSet {
+        planes,
+        egui_plane_id,
+        egui_zpos,
+        crtc_index,
+    })
+}
+
+/// The live [`VideoScanout`]: drives KMS `set_plane` to scan a decoded framebuffer out
+/// on the chosen overlay plane beneath the egui shell (or clear it).
+///
+/// Its `Frame` is a real `drm` framebuffer handle — the mpv render API imports the
+/// decoded frame as a dmabuf/KMS framebuffer (MEDIA-3/4/8) and hands the handle here.
+///
+/// Compiles on the farm; only commits on a real seat (the hardware-gated live scanout,
+/// the same posture as [`run_drm`]). The pure geometry + selection it consumes is unit-
+/// tested via `crate::video_plane`'s `RecordingScanout`.
+pub struct DrmVideoScanout<'a> {
+    dev: &'a gbm::Device<Card>,
+    crtc: crtc::Handle,
+}
+
+impl<'a> DrmVideoScanout<'a> {
+    /// A live scanout that composites the video plane onto `crtc` via `dev`.
+    #[must_use]
+    pub const fn new(dev: &'a gbm::Device<Card>, crtc: crtc::Handle) -> Self {
+        Self { dev, crtc }
+    }
+
+    /// Reconstruct a `drm` plane handle from the pure seam's `u32` plane id.
+    fn plane_handle(id: u32) -> Result<plane::Handle, VideoPlaneError> {
+        drm::control::from_u32::<plane::Handle>(id)
+            .ok_or_else(|| VideoPlaneError::Commit(format!("invalid plane id {id}")))
+    }
+}
+
+impl VideoScanout for DrmVideoScanout<'_> {
+    type Frame = drm::control::framebuffer::Handle;
+
+    fn present(
+        &mut self,
+        frame: Self::Frame,
+        plan: &VideoPlanePlan,
+    ) -> Result<(), VideoPlaneError> {
+        let plane = Self::plane_handle(plan.plane_id)?;
+        let Some(placement) = plan.placement else {
+            // Nothing visible this frame → detach the plane rather than program a
+            // degenerate rect.
+            return self.clear(plan.plane_id);
+        };
+        // Order the video plane below the egui plane where the driver lets us. An
+        // immutable `zpos` (no property, or a read-only one) is honestly left as the
+        // driver's fixed ordering — never faked.
+        if let Some(z) = plan.zpos {
+            if let Some(prop) = plane_prop_handle(self.dev, plane, "zpos") {
+                let _ = self.dev.set_property(plane, prop, z);
+            }
+        }
+        self.dev
+            .set_plane(
+                plane,
+                self.crtc,
+                Some(frame),
+                0,
+                placement.crtc_rect,
+                placement.src_rect_16_16,
+            )
+            .map_err(|e| VideoPlaneError::Commit(format!("set_plane: {e}")))
+    }
+
+    fn clear(&mut self, plane_id: u32) -> Result<(), VideoPlaneError> {
+        let plane = Self::plane_handle(plane_id)?;
+        self.dev
+            .set_plane(plane, self.crtc, None, 0, (0, 0, 0, 0), (0, 0, 0, 0))
+            .map_err(|e| VideoPlaneError::Commit(format!("clear set_plane: {e}")))
+    }
+}
+
+/// Bring the DRM seat up far enough to enumerate its planes and resolve the MEDIA-2
+/// video-plane decision for the primary output.
+///
+/// The hardware-gated live surface for the overlay seam (driven by the
+/// `hello_video_plane` example).
+///
+/// Returns the enumerated [`PlaneSet`] and the resolved [`VideoPath`] for a `video`
+/// frame of `(w, h)` shown in `pane`. When an overlay plane is chosen it also drives a
+/// live `clear` on it (a harmless liveness check that the plane detaches) — the actual
+/// video-frame present is the mpv-gated leg (MEDIA-3/4/8), so this proves the plane
+/// path end-to-end short of a decoded frame.
+///
+/// # Errors
+/// [`DrmError::NoDrmMaster`] on a headless host (the caller then uses the render-to-
+/// texture fallback), or the other [`DrmError`]s when the seat cannot be brought up.
+pub fn probe_primary_video_plane(
+    video: (u32, u32),
+    pane: PaneRect,
+) -> Result<(PlaneSet, VideoPath), DrmError> {
+    let (_node, file) = open_primary_node()?;
+    let card = Card(file);
+    let outputs = resolve_outputs(&card)?;
+    let crtc = outputs[0].crtc;
+    let (w, h) = outputs[0].mode.size();
+    let screen = (u32::from(w), u32::from(h));
+
+    let gbm = gbm::Device::new(card).map_err(|e| DrmError::Gbm(format!("gbm device: {e}")))?;
+    let set = probe_video_plane(&gbm, crtc).map_err(|e| DrmError::Present(e.to_string()))?;
+    let path = set.plan_video(video, pane, screen);
+
+    if let VideoPath::Overlay(plan) = &path {
+        let mut scanout = DrmVideoScanout::new(&gbm, crtc);
+        if let Err(e) = scanout.clear(plan.plane_id) {
+            eprintln!(
+                "mde-egui: video-plane liveness clear failed ({e}); plane path still resolved"
+            );
+        }
+    }
+    Ok((set, path))
 }
 
 #[cfg(test)]

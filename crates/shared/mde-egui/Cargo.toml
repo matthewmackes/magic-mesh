@@ -50,6 +50,13 @@ name = "hello_drm"
 path = "examples/hello_drm.rs"
 required-features = ["drm"]
 
+# MEDIA-2 overlay video-plane acceptance surface — enumerates real DRM planes and
+# resolves the overlay-vs-render-to-texture decision; only built with the `drm` feature.
+[[example]]
+name = "hello_video_plane"
+path = "examples/hello_video_plane.rs"
+required-features = ["drm"]
+
 # E12-2: this crate carries the bare-seat FFI backend (DRM/GBM/EGL/GL/libinput),
 # which inherently needs `unsafe`. The workspace FORBIDS unsafe; mirror the workspace
 # lints here but DENY (overridable) rather than forbid it, so the FFI `drm` module can
