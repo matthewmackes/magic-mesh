@@ -627,6 +627,17 @@ pub mod clipboard_bridge;
 // Reachability derives from roster presence / VM power state — never a
 // blocking probe (design lock 14).
 pub mod desktop_sources;
+// MEDIA-14 — the media_sources worker: the mesh-side (§6) media-source
+// discovery aggregator behind the mde-media Sources panel (docs/design/
+// mesh-media-player.md, row 26). Folds two lanes into one deduped roster
+// published to `state/media/sources`: the mesh-registry peer-advertised media
+// (each peer's `descriptors.media` Jellyfin/DLNA rows + its `descriptors.mesh_fs`
+// file share — the same peers plane desktop_sources reads, no new channel), and
+// mDNS `_jellyfin._tcp` on the local LAN (the mdns_relay machinery + its
+// anti-loop TXT guard). Reachability derives from roster presence / peer health
+// — never a blocking probe; music-only services (navidrome/mpd) are honestly
+// excluded (mde-music's domain), and SSDP-only DLNA is a `gated:` mDNS-lane note.
+pub mod media_sources;
 // OW-11 (Bus half) — the service_onboard worker: `onboard service-add` reachable
 // over the Bus for the shell's Services flow. Drains `action/onboard/service-add`
 // (a typed ServiceAddAction: ServiceKind + optional SIP params + dry_run), runs

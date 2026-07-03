@@ -110,6 +110,11 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // on a Lighthouse, so Workstation-tier), reads the published shared
     // account off the registry plane + writes the desktop user's creds.
     ("music_autoconfig", 1),
+    // MEDIA-14 — the mesh media-source discovery aggregator behind the
+    // mde-media Sources panel. A desktop feature (the seated user picks a media
+    // source to play), so Workstation-tier; it idles gracefully on a headless
+    // box (the aggregation is cheap and simply publishes an empty roster).
+    ("media_sources", 1),
 ];
 
 /// MEDIA-1 — workers that ALSO require a capability tag beyond their rank tier.
@@ -324,7 +329,9 @@ mod tests {
         // Workstation-tier: a seated-user desktop feature).
         // +1 desktop_sources (CHOOSER-1 — the desktop-source discovery
         // aggregator, Workstation-tier: a seated-user desktop feature).
-        assert_eq!(WORKER_TIERS.len(), 33);
+        // +1 media_sources (MEDIA-14 — the mesh media-source discovery
+        // aggregator, Workstation-tier: a seated-user desktop feature).
+        assert_eq!(WORKER_TIERS.len(), 34);
     }
 
     #[test]
@@ -352,8 +359,8 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            11,
-            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + desktop_sources (CHOOSER-1)"
+            12,
+            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14)"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
@@ -415,11 +422,11 @@ mod tests {
     fn workers_for_rank_is_a_growing_superset() {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        // 22 lighthouse control-plane workers; Workstation adds the 11 fleet +
-        // desktop workers for the full 33 (the retired Server tier folded into
+        // 22 lighthouse control-plane workers; Workstation adds the 12 fleet +
+        // desktop workers for the full 34 (the retired Server tier folded into
         // Workstation in the 2-role model).
         assert_eq!(lh.len(), 22);
-        assert_eq!(ws.len(), 33);
+        assert_eq!(ws.len(), 34);
         // Strict superset: every lighthouse worker is also in the workstation set.
         assert!(lh.iter().all(|w| ws.contains(w)));
     }

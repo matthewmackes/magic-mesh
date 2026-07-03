@@ -7592,6 +7592,33 @@ fn run_serve(
                 .push("desktop_sources".into());
         }
 
+        // MEDIA-14 — the mesh media-source discovery aggregator (design
+        // `mesh-media-player.md`, row 26 "Mesh discovery"): folds two lanes into
+        // ONE deduped roster and publishes `state/media/sources` for the
+        // mde-media Sources panel (MEDIA-8). Lane 1 (mesh-registry) reads the
+        // replicated peers plane's `descriptors.media` Jellyfin/DLNA rows + each
+        // peer's `descriptors.mesh_fs` file share — the SAME plane desktop_sources
+        // reads, no new advertisement channel (§6 glue). Lane 2 (mDNS) browses
+        // `_jellyfin._tcp` on the local LAN via the mdns_relay machinery + its
+        // anti-loop TXT guard. Reachability derives from roster presence / peer
+        // health, never a blocking probe; music-only services (navidrome/mpd) are
+        // honestly excluded (mde-music's domain), and SSDP-only DLNA is surfaced
+        // as a `gated:` mDNS-lane note rather than faked (§7). A desktop feature
+        // (Workstation tier); idles gracefully on a headless box.
+        if mackesd_core::worker_role::runs("media_sources", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::media_sources::MediaSourcesWorker::new(
+                    node_id.clone(),
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("media_sources".into());
+        }
+
         // VOIP-GW-3 — the leader-gated voice_provision worker. Spawned on every
         // node so failover is seamless, but LEADER-gated internally (lock 7):
         // only the elected node provisions per-node Vitelity sub-accounts, seals
