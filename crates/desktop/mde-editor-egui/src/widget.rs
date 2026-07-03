@@ -1,4 +1,4 @@
-//! The **custom code-editor text widget** (EDITOR-3): the immediate-mode egui
+//! The **custom code-editor text widget** (EDITOR-3/4): the immediate-mode egui
 //! surface that renders + edits a live rope [`Buffer`](crate::buffer::Buffer).
 //!
 //! This is the core of the editor. It is NOT a mockup: the widget reads the real
@@ -9,21 +9,23 @@
 //! The split of concerns:
 //!
 //! * [`EditorView`] holds the **widget state** the buffer itself has no business
-//!   knowing — the caret (a char index into the rope), the selection anchor, the
-//!   sticky goal column for vertical motion, and the soft-wrap toggle. It carries
-//!   the *pure* cursor-movement, selection, and edit-application logic so those
-//!   are unit-testable **without** a live egui frame (the `EditorView::*` methods
-//!   below take a `&Buffer`/`&mut Buffer` and a synthetic [`egui::Event`], never a
-//!   `Ui`).
+//!   knowing — the carets (each a char index into the rope plus a selection
+//!   anchor and a sticky goal column), the primary caret, the soft-wrap toggle,
+//!   and a widget-level undo log. It carries the *pure* cursor-movement,
+//!   selection, and edit-application logic so those are unit-testable **without**
+//!   a live egui frame (the `EditorView::*` methods below take a `&Buffer`/`&mut
+//!   Buffer` and a synthetic [`egui::Event`], never a `Ui`).
 //! * [`editor_widget`] is the one egui entry point: it lays the view out inside a
 //!   scroll area, maps the pointer to a rope char index through the monospace
-//!   glyph metrics (click / drag / double- / triple-click), routes this frame's
-//!   key events into the view, and paints the gutter + text + selection + caret
-//!   through the shared Carbon [`Style`] tokens (§4 — no raw hex, no scattered
-//!   metric).
+//!   glyph metrics (click / drag / double- / triple-click / Alt-click / Alt-drag),
+//!   routes this frame's key events into the view, and paints the gutter + text +
+//!   selection + carets through the shared Carbon [`Style`] tokens (§4 — no raw
+//!   hex, no scattered metric).
 //!
-//! Multi-cursor, tree-sitter highlighting, and the fuzzy finder land in
-//! EDITOR-4/5+; this unit is the single-caret editing core they build on.
+//! Multi-cursor + column selection land here (EDITOR-4): the single `(caret,
+//! anchor)` generalizes to a `Vec` of carets, every edit fans out across all of
+//! them, and overlapping carets merge. Tree-sitter highlighting + the fuzzy
+//! finder follow in EDITOR-5+.
 
 // `EditorView` is the domain name for this module's widget-state type; renaming
 // it to dodge the `widget` echo would be worse (the same call `buffer.rs` makes).
@@ -32,11 +34,20 @@
 // is allowed for the layout arithmetic: `origin + col * glyph_w` reads far
 // clearer than the `mul_add` rewrite, and the precision/throughput gain is
 // irrelevant for a few pixel positions per row (same rationale + repo precedent
-// as `mde-mesh-view` / `mde-panel-egui`).
+// as `mde-mesh-view` / `mde-panel-egui`). The cast lints are allowed
+// module-wide: the multi-cursor geometry + fan-out edit arithmetic convert
+// between char indices (`usize`), signed shift accumulators (`isize`), and
+// row/column-to-pixel offsets (`f32`); every conversion is bounded by the
+// document size, so the precision/truncation/sign/wrap lints are noise here
+// (this generalizes the inline allows EDITOR-3 already carried at each site).
 #![allow(
     clippy::module_name_repetitions,
     clippy::missing_const_for_fn,
-    clippy::suboptimal_flops
+    clippy::suboptimal_flops,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
 )]
 
 use std::ops::Range;
@@ -196,6 +207,33 @@ fn prev_word(buffer: &Buffer, idx: usize) -> usize {
     i
 }
 
+/// The next occurrence of `needle` (a char slice) at or after `from`, wrapping
+/// past the end back to the document start — the `Ctrl`+D "add cursor at next
+/// match" search. Reads the rope char-by-char (O(log n) each), so it never
+/// materializes the whole document; `needle` is a short selection, so the
+/// naive scan is cheap for a user-driven gesture.
+fn find_next(buffer: &Buffer, needle: &[char], from: usize) -> Option<usize> {
+    let n = buffer.len_chars();
+    let m = needle.len();
+    if m == 0 || m > n {
+        return None;
+    }
+    let rope = buffer.rope();
+    let last = n - m;
+    let matches = |start: usize| (0..m).all(|k| rope.char(start + k) == needle[k]);
+    for start in from..=last {
+        if matches(start) {
+            return Some(start);
+        }
+    }
+    for start in 0..from.min(last + 1) {
+        if matches(start) {
+            return Some(start);
+        }
+    }
+    None
+}
+
 /// A prefix-sum map from logical lines to **visual rows** for soft-wrap, so the
 /// widget can virtualize (cull) a wrapped document by row without an O(n) walk
 /// per frame.
@@ -300,18 +338,14 @@ fn body_font() -> FontId {
     FontId::monospace(Style::BODY)
 }
 
-/// The widget state for one open document (EDITOR-3).
+/// One caret in the view: a char index into the rope plus a selection anchor and
+/// a sticky goal column. A single-cursor editor is exactly a one-element
+/// [`EditorView`] caret vec; multi-cursor (EDITOR-4) grows it.
 ///
-/// Holds the caret, the selection anchor, the vertical-motion goal column, and
-/// the soft-wrap toggle — everything the pure [`Buffer`](crate::buffer::Buffer)
-/// does not itself track.
-///
-/// The caret and anchor are **char indices** into the rope (not `(line, col)`),
-/// so they compose directly with `Buffer::insert`/`remove`; `(line, col)` is
-/// derived on demand through the rope's O(log n) line index. All movement,
-/// selection, and edit-application logic lives here as `&Buffer`/`&mut Buffer`
-/// methods so it is unit-testable without a live egui frame.
-pub struct EditorView {
+/// The cursor and anchor are **char indices** into the rope (not `(line, col)`),
+/// so they compose directly with `Buffer::insert`/`remove`.
+#[derive(Clone, Copy)]
+struct Caret {
     /// Caret position — a char index into the rope.
     cursor: usize,
     /// Selection anchor — the fixed end of the selection, or `None` when there is
@@ -321,6 +355,92 @@ pub struct EditorView {
     /// across a run of them so the caret tracks the same column over short lines,
     /// cleared by any horizontal move or edit.
     goal_col: Option<usize>,
+}
+
+impl Caret {
+    /// A bare caret at `cursor` with no selection and no goal column.
+    const fn at(cursor: usize) -> Self {
+        Self {
+            cursor,
+            anchor: None,
+            goal_col: None,
+        }
+    }
+
+    /// This caret's selection as a char range, or `None` when nothing is selected
+    /// (no anchor, or the anchor coincides with the cursor).
+    fn selection(&self) -> Option<Range<usize>> {
+        let anchor = self.anchor?;
+        let (lo, hi) = (anchor.min(self.cursor), anchor.max(self.cursor));
+        (lo < hi).then_some(lo..hi)
+    }
+
+    /// The `[lo, hi]` char span this caret occupies — its selection, or the caret
+    /// point (`lo == hi`) with no selection. Drives overlap-merge + the fan-out
+    /// edit order.
+    fn span(&self) -> (usize, usize) {
+        match self.anchor {
+            Some(a) => (a.min(self.cursor), a.max(self.cursor)),
+            None => (self.cursor, self.cursor),
+        }
+    }
+
+    /// Move this caret to `new`, extending the selection when `extend` (Shift):
+    /// the first extend drops an anchor at the old cursor; a non-extend move
+    /// clears the selection.
+    fn move_to(&mut self, new: usize, extend: bool) {
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.cursor);
+            }
+        } else {
+            self.anchor = None;
+        }
+        self.cursor = new;
+    }
+}
+
+/// Which kind of edit a widget undo step coalesces with: a run of same-kind
+/// single-caret edits (typing, or a run of deletions) merges into one undo step,
+/// matching the EDITOR-3 buffer grouping semantics.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    Insert,
+    Delete,
+}
+
+/// One widget-level undo step: how many buffer groups it spans (so undo/redo can
+/// unwind them together) plus the full caret set before and after, so undo
+/// restores **every** caret of a fan-out edit — one step per multi-caret edit.
+struct LogEntry {
+    /// Number of buffer undo groups this step spans (one per buffer mutation; a
+    /// fan-out edit spans several).
+    groups: usize,
+    /// The caret set + primary index before the edit (restored on undo).
+    before: (Vec<Caret>, usize),
+    /// The caret set + primary index after the edit (restored on redo).
+    after: (Vec<Caret>, usize),
+}
+
+/// The widget state for one open document (EDITOR-3/4).
+///
+/// Holds the carets, the primary caret, the vertical-motion goal columns, the
+/// soft-wrap toggle, and a widget-level undo log — everything the pure
+/// [`Buffer`](crate::buffer::Buffer) does not itself track.
+///
+/// All movement, selection, and edit-application logic lives here as
+/// `&Buffer`/`&mut Buffer` methods so it is unit-testable without a live egui
+/// frame. Every edit **fans out** across all carets (highest-index-safe via an
+/// ascending offset accumulator); overlapping carets **merge**; `Esc` collapses
+/// to the single primary caret.
+pub struct EditorView {
+    /// The carets, normalized (sorted + merged) after each gesture. Always
+    /// non-empty; a single-cursor view is a one-element vec (all EDITOR-3
+    /// behavior + tests). Every edit fans out across all of them.
+    carets: Vec<Caret>,
+    /// Index of the **primary** caret — the one whose viewport-reveal + status
+    /// line the surface honors (EDITOR-3's single caret).
+    primary: usize,
     /// Soft-wrap toggle: on wraps long lines to the viewport (no horizontal
     /// scroll), off keeps lines unwrapped and scrolls horizontally.
     wrap: bool,
@@ -330,9 +450,23 @@ pub struct EditorView {
     max_line_chars: usize,
     /// Cached wrap prefix sums, rebuilt lazily when wrap is on.
     wrap_map: WrapMap,
-    /// Set by any caret move/edit; consumed by the renderer to scroll the caret
-    /// back into view exactly once (so it doesn't fight the user's own scroll).
+    /// Set by any caret move/edit; consumed by the renderer to scroll the primary
+    /// caret back into view exactly once (so it doesn't fight the user's scroll).
     reveal_caret: bool,
+    /// Widget-level undo stack (newest last). Groups a whole fan-out edit into
+    /// one step so undo/redo restore every caret; single-caret runs coalesce.
+    undo_log: Vec<LogEntry>,
+    /// Undone steps available for redo.
+    redo_log: Vec<LogEntry>,
+    /// Whether the newest [`LogEntry`] still accepts a coalescing same-kind edit.
+    group_open: bool,
+    /// The kind of the newest logged edit, for coalescing.
+    last_kind: Option<EditKind>,
+    /// Snapshot captured at the start of the in-flight edit (its before-state).
+    edit_before: Option<(Vec<Caret>, usize)>,
+    /// Anchor cell `(visual row, column)` of an in-progress Alt+drag column
+    /// (box) selection, or `None` when no box drag is active.
+    box_anchor: Option<(usize, usize)>,
 }
 
 impl Default for EditorView {
@@ -342,33 +476,49 @@ impl Default for EditorView {
 }
 
 impl EditorView {
-    /// A fresh view over a document: caret at the top, no selection, wrap off.
+    /// A fresh view over a document: one caret at the top, no selection, wrap off.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cursor: 0,
-            anchor: None,
-            goal_col: None,
+            carets: vec![Caret::at(0)],
+            primary: 0,
             wrap: false,
             max_line_chars: 0,
             wrap_map: WrapMap::default(),
             reveal_caret: false,
+            undo_log: Vec::new(),
+            redo_log: Vec::new(),
+            group_open: false,
+            last_kind: None,
+            edit_before: None,
+            box_anchor: None,
         }
     }
 
-    /// The caret's char index into the rope.
-    #[must_use]
-    pub const fn cursor(&self) -> usize {
-        self.cursor
+    /// The primary caret (shared read seam for the EDITOR-3 accessors).
+    fn primary_caret(&self) -> &Caret {
+        &self.carets[self.primary.min(self.carets.len().saturating_sub(1))]
     }
 
-    /// The current selection as a char range, or `None` when nothing is selected
-    /// (no anchor, or the anchor coincides with the caret).
+    /// The primary caret's char index into the rope.
+    #[must_use]
+    pub fn cursor(&self) -> usize {
+        self.primary_caret().cursor
+    }
+
+    /// The primary caret's selection as a char range, or `None` when nothing is
+    /// selected (no anchor, or the anchor coincides with the caret).
     #[must_use]
     pub fn selection(&self) -> Option<Range<usize>> {
-        let anchor = self.anchor?;
-        let (lo, hi) = (anchor.min(self.cursor), anchor.max(self.cursor));
-        (lo < hi).then_some(lo..hi)
+        self.primary_caret().selection()
+    }
+
+    /// Every caret's non-empty selection, sorted by start — the copy/cut source
+    /// and the render's selection bands.
+    fn selections(&self) -> Vec<Range<usize>> {
+        let mut v: Vec<Range<usize>> = self.carets.iter().filter_map(Caret::selection).collect();
+        v.sort_by_key(|r| r.start);
+        v
     }
 
     /// Whether soft-wrap is on.
@@ -382,167 +532,536 @@ impl EditorView {
         self.wrap = !self.wrap;
     }
 
-    /// The caret's 1-based `(line, column)` for the status strip.
+    /// The primary caret's 1-based `(line, column)` for the status strip.
     #[must_use]
     pub fn line_col(&self, buffer: &Buffer) -> (usize, usize) {
-        let cursor = self.cursor.min(buffer.len_chars());
+        let cursor = self.primary_caret().cursor.min(buffer.len_chars());
         let line = buffer.char_to_line(cursor);
         (line + 1, cursor - buffer.line_to_char(line) + 1)
     }
 
-    /// Place the caret at char index `idx` (clamped), clearing any selection — the
-    /// seam a Files-send / finder jump (EDITOR-7/9) uses to reveal a location.
+    /// Place a single caret at char index `idx` (clamped), dropping any other
+    /// carets + selection — the seam a Files-send / finder jump (EDITOR-7/9) uses
+    /// to reveal a location.
     pub fn place_cursor(&mut self, buffer: &Buffer, idx: usize) {
-        self.cursor = idx.min(buffer.len_chars());
-        self.anchor = None;
-        self.goal_col = None;
+        self.carets = vec![Caret::at(idx.min(buffer.len_chars()))];
+        self.primary = 0;
+        self.group_open = false;
+        self.box_anchor = None;
         self.reveal_caret = true;
     }
 
-    /// Clamp the caret + anchor back inside the buffer (called each frame in case
-    /// the rope shrank underneath the view).
+    /// Clamp every caret back inside the buffer (called each frame in case the
+    /// rope shrank underneath the view) and keep the primary index valid.
     fn clamp(&mut self, buffer: &Buffer) {
         let len = buffer.len_chars();
-        self.cursor = self.cursor.min(len);
-        if let Some(a) = self.anchor {
-            self.anchor = Some(a.min(len));
+        for c in &mut self.carets {
+            c.cursor = c.cursor.min(len);
+            if let Some(a) = c.anchor {
+                c.anchor = Some(a.min(len));
+            }
+        }
+        if self.carets.is_empty() {
+            self.carets.push(Caret::at(0));
+        }
+        if self.primary >= self.carets.len() {
+            self.primary = self.carets.len() - 1;
         }
     }
 
     // ── caret geometry ──────────────────────────────────────────────────────
 
-    /// The caret's logical line.
+    /// The primary caret's logical line.
     fn cur_line(&self, buffer: &Buffer) -> usize {
-        buffer.char_to_line(self.cursor.min(buffer.len_chars()))
+        buffer.char_to_line(self.primary_caret().cursor.min(buffer.len_chars()))
     }
 
-    /// The caret's column within its logical line.
-    fn cur_col(&self, buffer: &Buffer) -> usize {
-        let line = self.cur_line(buffer);
-        self.cursor - buffer.line_to_char(line)
-    }
+    // ── normalization (merge overlapping carets) ─────────────────────────────
 
-    // ── selection-aware cursor placement ────────────────────────────────────
-
-    /// Move the caret to `new`, extending the selection when `extend` (Shift):
-    /// the first extend drops an anchor at the old caret; a non-extend move drops
-    /// the selection.
-    fn set_cursor(&mut self, new: usize, extend: bool) {
-        if extend {
-            if self.anchor.is_none() {
-                self.anchor = Some(self.cursor);
+    /// Sort the carets by span start and merge any that overlap or touch, so a
+    /// gesture that runs two carets together leaves exactly one. A no-op for a
+    /// single caret (so EDITOR-3's reverse-oriented selections keep their
+    /// direction); the primary is re-found by its cursor position afterward.
+    fn normalize(&mut self) {
+        if self.carets.len() <= 1 {
+            return;
+        }
+        let pc = self.carets[self.primary.min(self.carets.len() - 1)].cursor;
+        self.carets.sort_by_key(|c| c.span().0);
+        let mut merged: Vec<Caret> = Vec::with_capacity(self.carets.len());
+        for c in std::mem::take(&mut self.carets) {
+            if let Some(prev) = merged.last_mut() {
+                let (plo, phi) = prev.span();
+                let (clo, chi) = c.span();
+                if clo <= phi {
+                    // Overlap or touch → fuse into the previous caret's span.
+                    let nlo = plo.min(clo);
+                    let nhi = phi.max(chi);
+                    if nhi > nlo {
+                        prev.anchor = Some(nlo);
+                        prev.cursor = nhi;
+                    } else {
+                        prev.anchor = None;
+                        prev.cursor = nlo;
+                    }
+                    prev.goal_col = None;
+                    continue;
+                }
             }
-        } else {
-            self.anchor = None;
+            merged.push(c);
         }
-        self.cursor = new;
-        self.reveal_caret = true;
+        self.carets = merged;
+        self.primary = self
+            .carets
+            .iter()
+            .position(|c| {
+                let (lo, hi) = c.span();
+                pc >= lo && pc <= hi
+            })
+            .unwrap_or(0);
     }
 
-    // ── edits (selection-aware) ─────────────────────────────────────────────
+    // ── widget-level undo log ────────────────────────────────────────────────
 
-    /// Insert `text` at the caret, replacing the selection first if there is one.
-    /// The caret lands after the inserted text.
+    /// A deep snapshot of the caret set + primary index.
+    fn snapshot(&self) -> (Vec<Caret>, usize) {
+        (self.carets.clone(), self.primary)
+    }
+
+    /// Capture the before-state at the start of an edit (once per edit).
+    fn begin_edit(&mut self) {
+        if self.edit_before.is_none() {
+            self.edit_before = Some(self.snapshot());
+        }
+    }
+
+    /// Close out an edit: record `groups` buffer groups + the caret before/after
+    /// as one undo step, coalescing a same-kind single-caret run into the open
+    /// step so a type run undoes at once. A zero-group (no-op) edit records
+    /// nothing. A `multi` edit always starts its own closed step.
+    fn finish_edit(&mut self, groups: usize, kind: EditKind, multi: bool) {
+        let before = self.edit_before.take();
+        if groups == 0 {
+            return;
+        }
+        self.reveal_caret = true;
+        self.redo_log.clear();
+        let after = self.snapshot();
+        if !multi && self.group_open && self.last_kind == Some(kind) {
+            if let Some(e) = self.undo_log.last_mut() {
+                e.groups += groups;
+                e.after = after;
+                return;
+            }
+        }
+        self.undo_log.push(LogEntry {
+            groups,
+            before: before.unwrap_or_else(|| after.clone()),
+            after,
+        });
+        self.group_open = !multi;
+        self.last_kind = Some(kind);
+    }
+
+    /// The ascending fan-out order: caret indices sorted by their span start, so
+    /// an edit walks left-to-right accumulating a signed offset.
+    fn fanout_order(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..self.carets.len()).collect();
+        order.sort_by_key(|&i| self.carets[i].span().0);
+        order
+    }
+
+    // ── edits (selection-aware, fan out across every caret) ──────────────────
+
+    /// Insert `text` at every caret, replacing each caret's selection first. Walks
+    /// carets left-to-right with a running offset so earlier edits don't
+    /// invalidate later carets' indices; each buffer op is its own group so the
+    /// whole fan-out undoes as one widget step.
     fn insert(&mut self, buffer: &mut Buffer, text: &str) {
-        if let Some(range) = self.selection() {
-            buffer.remove(range.clone());
-            self.cursor = range.start;
+        let multi = self.carets.len() > 1;
+        self.begin_edit();
+        let l = text.chars().count();
+        let order = self.fanout_order();
+        let mut shift: isize = 0;
+        let mut groups = 0usize;
+        for &i in &order {
+            let (s, e) = self.carets[i].span();
+            let s2 = (s as isize + shift) as usize;
+            let e2 = (e as isize + shift) as usize;
+            if e2 > s2 {
+                buffer.remove(s2..e2);
+                buffer.commit_group();
+                groups += 1;
+            }
+            if l > 0 {
+                buffer.insert(s2, text);
+                buffer.commit_group();
+                groups += 1;
+            }
+            self.carets[i].cursor = s2 + l;
+            self.carets[i].anchor = None;
+            self.carets[i].goal_col = None;
+            shift += l as isize - (e as isize - s as isize);
         }
-        self.anchor = None;
-        self.goal_col = None;
-        buffer.insert(self.cursor, text);
-        self.cursor += text.chars().count();
-        self.reveal_caret = true;
+        self.normalize();
+        self.finish_edit(groups, EditKind::Insert, multi);
     }
 
-    /// Backspace: delete the selection if any, else the char before the caret.
+    /// Backspace at every caret: delete each caret's selection if any, else the
+    /// char before it. Fan-out with a running offset.
     fn backspace(&mut self, buffer: &mut Buffer) {
-        if let Some(range) = self.selection() {
-            buffer.remove(range.clone());
-            self.cursor = range.start;
-            self.anchor = None;
-        } else if self.cursor > 0 {
-            buffer.remove(self.cursor - 1..self.cursor);
-            self.cursor -= 1;
+        let multi = self.carets.len() > 1;
+        self.begin_edit();
+        let order = self.fanout_order();
+        let mut shift: isize = 0;
+        let mut groups = 0usize;
+        for &i in &order {
+            let (s, e) = self.carets[i].span();
+            if e > s {
+                let s2 = (s as isize + shift) as usize;
+                let e2 = (e as isize + shift) as usize;
+                buffer.remove(s2..e2);
+                buffer.commit_group();
+                groups += 1;
+                self.carets[i].cursor = s2;
+                shift -= (e - s) as isize;
+            } else {
+                let c2 = (self.carets[i].cursor as isize + shift) as usize;
+                if c2 > 0 {
+                    buffer.remove(c2 - 1..c2);
+                    buffer.commit_group();
+                    groups += 1;
+                    self.carets[i].cursor = c2 - 1;
+                    shift -= 1;
+                } else {
+                    self.carets[i].cursor = c2;
+                }
+            }
+            self.carets[i].anchor = None;
+            self.carets[i].goal_col = None;
         }
-        self.goal_col = None;
-        self.reveal_caret = true;
+        self.normalize();
+        self.finish_edit(groups, EditKind::Delete, multi);
     }
 
-    /// Forward-delete: delete the selection if any, else the char at the caret.
+    /// Forward-delete at every caret: delete each caret's selection if any, else
+    /// the char at it. Fan-out with a running offset.
     fn delete(&mut self, buffer: &mut Buffer) {
-        if let Some(range) = self.selection() {
-            buffer.remove(range.clone());
-            self.cursor = range.start;
-            self.anchor = None;
-        } else if self.cursor < buffer.len_chars() {
-            buffer.remove(self.cursor..self.cursor + 1);
+        let multi = self.carets.len() > 1;
+        self.begin_edit();
+        let order = self.fanout_order();
+        let mut shift: isize = 0;
+        let mut groups = 0usize;
+        for &i in &order {
+            let (s, e) = self.carets[i].span();
+            if e > s {
+                let s2 = (s as isize + shift) as usize;
+                let e2 = (e as isize + shift) as usize;
+                buffer.remove(s2..e2);
+                buffer.commit_group();
+                groups += 1;
+                self.carets[i].cursor = s2;
+                shift -= (e - s) as isize;
+            } else {
+                let c2 = (self.carets[i].cursor as isize + shift) as usize;
+                if c2 < buffer.len_chars() {
+                    buffer.remove(c2..c2 + 1);
+                    buffer.commit_group();
+                    groups += 1;
+                    shift -= 1;
+                }
+                self.carets[i].cursor = c2;
+            }
+            self.carets[i].anchor = None;
+            self.carets[i].goal_col = None;
         }
-        self.goal_col = None;
-        self.reveal_caret = true;
+        self.normalize();
+        self.finish_edit(groups, EditKind::Delete, multi);
     }
 
-    /// Select the whole buffer.
+    /// Delete only the carets' selections (no char fallback) — the Cut edit. A
+    /// caret with no selection is left in place.
+    fn delete_selections(&mut self, buffer: &mut Buffer) {
+        let multi = self.carets.len() > 1;
+        self.begin_edit();
+        let order = self.fanout_order();
+        let mut shift: isize = 0;
+        let mut groups = 0usize;
+        for &i in &order {
+            let (s, e) = self.carets[i].span();
+            if e > s {
+                let s2 = (s as isize + shift) as usize;
+                let e2 = (e as isize + shift) as usize;
+                buffer.remove(s2..e2);
+                buffer.commit_group();
+                groups += 1;
+                self.carets[i].cursor = s2;
+                shift -= (e - s) as isize;
+            } else {
+                self.carets[i].cursor = (self.carets[i].cursor as isize + shift) as usize;
+            }
+            self.carets[i].anchor = None;
+            self.carets[i].goal_col = None;
+        }
+        self.normalize();
+        self.finish_edit(groups, EditKind::Delete, multi);
+    }
+
+    /// Select the whole buffer (collapses to one caret).
     fn select_all(&mut self, buffer: &Buffer) {
-        self.anchor = Some(0);
-        self.cursor = buffer.len_chars();
-        self.goal_col = None;
+        self.carets = vec![Caret {
+            cursor: buffer.len_chars(),
+            anchor: Some(0),
+            goal_col: None,
+        }];
+        self.primary = 0;
+        self.group_open = false;
         self.reveal_caret = true;
     }
 
-    /// Undo one group, restoring the caret to the buffer's returned hint.
-    fn undo(&mut self, buffer: &mut Buffer) {
-        if let Some(hint) = buffer.undo() {
-            self.cursor = hint.min(buffer.len_chars());
-            self.anchor = None;
-            self.goal_col = None;
-            self.reveal_caret = true;
+    /// Undo one widget step, unwinding its buffer groups and restoring every
+    /// caret. Returns whether it changed anything.
+    fn undo(&mut self, buffer: &mut Buffer) -> bool {
+        buffer.commit_group();
+        let Some(entry) = self.undo_log.pop() else {
+            return false;
+        };
+        for _ in 0..entry.groups {
+            buffer.undo();
         }
+        self.carets = entry.before.0.clone();
+        self.primary = entry.before.1.min(self.carets.len().saturating_sub(1));
+        self.redo_log.push(entry);
+        self.group_open = false;
+        self.last_kind = None;
+        self.reveal_caret = true;
+        true
     }
 
-    /// Redo one group, restoring the caret to the buffer's returned hint.
-    fn redo(&mut self, buffer: &mut Buffer) {
-        if let Some(hint) = buffer.redo() {
-            self.cursor = hint.min(buffer.len_chars());
-            self.anchor = None;
-            self.goal_col = None;
+    /// Redo one widget step, re-applying its buffer groups and restoring every
+    /// caret. Returns whether it changed anything.
+    fn redo(&mut self, buffer: &mut Buffer) -> bool {
+        buffer.commit_group();
+        let Some(entry) = self.redo_log.pop() else {
+            return false;
+        };
+        for _ in 0..entry.groups {
+            buffer.redo();
+        }
+        self.carets = entry.after.0.clone();
+        self.primary = entry.after.1.min(self.carets.len().saturating_sub(1));
+        self.undo_log.push(entry);
+        self.group_open = false;
+        self.last_kind = None;
+        self.reveal_caret = true;
+        true
+    }
+
+    // ── multi-cursor gestures ────────────────────────────────────────────────
+
+    /// Add a caret one logical line above (`delta = -1`) or below (`delta = +1`)
+    /// the primary, at its goal column, and make the new caret primary — the
+    /// `Ctrl`+`Alt`+Up/Down "add cursor above/below". Returns `false` when there
+    /// is no room (already at the document edge).
+    fn add_caret_vertical(&mut self, buffer: &mut Buffer, delta: isize) -> bool {
+        buffer.commit_group();
+        self.group_open = false;
+        let len = buffer.len_chars();
+        let p = *self.primary_caret();
+        let line = buffer.char_to_line(p.cursor.min(len));
+        let col = p.cursor - buffer.line_to_char(line);
+        let goal = p.goal_col.unwrap_or(col);
+        let max_line = buffer.len_lines().saturating_sub(1);
+        let tline = (line as isize + delta).clamp(0, max_line as isize) as usize;
+        if tline == line {
+            return false;
+        }
+        let mut nc = Caret::at(char_at(buffer, tline, goal));
+        nc.goal_col = Some(goal);
+        self.carets.push(nc);
+        self.primary = self.carets.len() - 1;
+        self.reveal_caret = true;
+        self.normalize();
+        true
+    }
+
+    /// `Ctrl`+D: the first press with no selection selects the word under the
+    /// primary caret; each later press adds a caret selecting the **next**
+    /// occurrence of the primary selection (wrapping), and makes it primary.
+    fn add_next_match(&mut self, buffer: &mut Buffer) -> bool {
+        buffer.commit_group();
+        self.group_open = false;
+        let p = *self.primary_caret();
+        let (needle, from): (Vec<char>, usize) = if let Some(sel) = p.selection() {
+            (buffer.rope().slice(sel.clone()).chars().collect(), sel.end)
+        } else {
+            let span = word_span(buffer, p.cursor);
+            if span.start >= span.end {
+                return false;
+            }
+            self.carets[self.primary].anchor = Some(span.start);
+            self.carets[self.primary].cursor = span.end;
             self.reveal_caret = true;
+            return true;
+        };
+        if needle.is_empty() {
+            return false;
+        }
+        let m = needle.len();
+        let Some(start) = find_next(buffer, &needle, from) else {
+            return false;
+        };
+        let new_span = (start, start + m);
+        if self.carets.iter().any(|c| c.span() == new_span) {
+            // Every match already has a caret; nothing new to add.
+            return true;
+        }
+        let mut nc = Caret::at(start + m);
+        nc.anchor = Some(start);
+        self.carets.push(nc);
+        self.primary = self.carets.len() - 1;
+        self.reveal_caret = true;
+        self.normalize();
+        true
+    }
+
+    /// Toggle a caret at char `idx` (Alt-click): remove the caret whose span
+    /// covers `idx` if there is one (never the last caret), else add a bare caret
+    /// there and make it primary.
+    fn toggle_caret_at(&mut self, buffer: &mut Buffer, idx: usize) {
+        buffer.commit_group();
+        self.group_open = false;
+        self.box_anchor = None;
+        if let Some(pos) = self.carets.iter().position(|c| {
+            let (lo, hi) = c.span();
+            idx >= lo && idx <= hi
+        }) {
+            if self.carets.len() > 1 {
+                self.carets.remove(pos);
+                self.primary = self.primary.min(self.carets.len() - 1);
+            }
+            // A lone caret at `idx` stays — the view always keeps ≥ 1 caret.
+        } else {
+            self.carets.push(Caret::at(idx));
+            self.primary = self.carets.len() - 1;
+        }
+        self.reveal_caret = true;
+        self.normalize();
+    }
+
+    /// Column (box) selection: replace the carets with one per visual row from
+    /// `r0..=r1`, each selecting the `c0..c1` column band (clamped to the row's
+    /// content) — the Alt+drag gesture. The drag-end row is primary.
+    fn column_select(
+        &mut self,
+        buffer: &Buffer,
+        r0: usize,
+        c0: usize,
+        r1: usize,
+        c1: usize,
+        cols: usize,
+    ) {
+        let (rlo, rhi) = (r0.min(r1), r0.max(r1));
+        let (clo, chi) = (c0.min(c1), c0.max(c1));
+        let mut carets = Vec::with_capacity(rhi - rlo + 1);
+        for vr in rlo..=rhi {
+            let row = self.vis_row(buffer, vr, cols);
+            let rlen = row.end - row.start;
+            let a = row.start + clo.min(rlen);
+            let b = row.start + chi.min(rlen);
+            let mut caret = Caret::at(b);
+            if b > a {
+                caret.anchor = Some(a);
+            }
+            carets.push(caret);
+        }
+        if carets.is_empty() {
+            return;
+        }
+        self.primary = r1.saturating_sub(rlo).min(carets.len() - 1);
+        self.carets = carets;
+        self.group_open = false;
+        self.reveal_caret = true;
+    }
+
+    /// Collapse to the single primary caret (`Esc`), dropping the rest and any
+    /// selection; if already single, clear its selection (EDITOR-3). Returns
+    /// whether anything changed.
+    fn collapse(&mut self) -> bool {
+        if self.carets.len() > 1 {
+            let cursor = self.primary_caret().cursor;
+            self.carets = vec![Caret::at(cursor)];
+            self.primary = 0;
+            self.group_open = false;
+            self.reveal_caret = true;
+            true
+        } else if self.carets[0].anchor.take().is_some() {
+            self.reveal_caret = true;
+            true
+        } else {
+            false
         }
     }
 
     // ── pointer selection ───────────────────────────────────────────────────
 
-    /// Click at char `idx`: place the caret (extend on Shift-click), closing the
-    /// current undo group so a later type run starts fresh.
+    /// Click at char `idx`: place a single caret (extend from the primary on
+    /// Shift-click), closing the current undo group so a later type run starts
+    /// fresh.
     fn click(&mut self, buffer: &mut Buffer, idx: usize, extend: bool) {
         buffer.commit_group();
-        self.goal_col = None;
-        self.set_cursor(idx, extend);
-    }
-
-    /// Drag to char `idx`: extend the selection from the drag's anchor.
-    fn drag(&mut self, idx: usize) {
-        self.goal_col = None;
-        self.set_cursor(idx, true);
-    }
-
-    /// Double-click: select the word under `idx`.
-    fn select_word(&mut self, buffer: &mut Buffer, idx: usize) {
-        buffer.commit_group();
-        let span = word_span(buffer, idx);
-        self.anchor = Some(span.start);
-        self.cursor = span.end;
-        self.goal_col = None;
+        self.group_open = false;
+        self.box_anchor = None;
+        let caret = if extend {
+            let mut c = *self.primary_caret();
+            c.goal_col = None;
+            c.move_to(idx, true);
+            c
+        } else {
+            Caret::at(idx)
+        };
+        self.carets = vec![caret];
+        self.primary = 0;
         self.reveal_caret = true;
     }
 
-    /// Triple-click: select the logical line under `idx`.
+    /// Drag to char `idx`: extend a single selection from the drag's anchor.
+    fn drag(&mut self, idx: usize) {
+        let mut caret = *self.primary_caret();
+        caret.goal_col = None;
+        caret.move_to(idx, true);
+        self.carets = vec![caret];
+        self.primary = 0;
+        self.reveal_caret = true;
+    }
+
+    /// Double-click: select the word under `idx` (collapses to one caret).
+    fn select_word(&mut self, buffer: &mut Buffer, idx: usize) {
+        buffer.commit_group();
+        self.group_open = false;
+        self.box_anchor = None;
+        let span = word_span(buffer, idx);
+        self.carets = vec![Caret {
+            cursor: span.end,
+            anchor: Some(span.start),
+            goal_col: None,
+        }];
+        self.primary = 0;
+        self.reveal_caret = true;
+    }
+
+    /// Triple-click: select the logical line under `idx` (collapses to one caret).
     fn select_line(&mut self, buffer: &mut Buffer, idx: usize) {
         buffer.commit_group();
+        self.group_open = false;
+        self.box_anchor = None;
         let span = line_span(buffer, idx);
-        self.anchor = Some(span.start);
-        self.cursor = span.end;
-        self.goal_col = None;
+        self.carets = vec![Caret {
+            cursor: span.end,
+            anchor: Some(span.start),
+            goal_col: None,
+        }];
+        self.primary = 0;
         self.reveal_caret = true;
     }
 
@@ -572,67 +1091,59 @@ impl EditorView {
         }
     }
 
-    /// The key half of [`apply_event`](Self::apply_event): motion, editing, and
-    /// undo/redo. `Ctrl`/`Cmd` is `modifiers.command`; `Shift` extends selection.
+    /// The key half of [`apply_event`](Self::apply_event): motion, editing,
+    /// multi-cursor, and undo/redo. `Ctrl`/`Cmd` is `modifiers.command`; `Shift`
+    /// extends selection; `Ctrl`+`Alt`+Up/Down add carets; `Ctrl`+D adds the next
+    /// match.
     #[allow(clippy::too_many_lines)]
     fn apply_key(&mut self, buffer: &mut Buffer, key: Key, mods: Modifiers, rows: usize) -> bool {
         let shift = mods.shift;
         let cmd = mods.command;
+        let alt = mods.alt;
         match key {
-            // ── horizontal motion ──
-            Key::ArrowLeft => {
-                buffer.commit_group();
-                self.goal_col = None;
-                let target = if cmd {
-                    prev_word(buffer, self.cursor)
-                } else {
-                    self.cursor.saturating_sub(1)
-                };
-                self.set_cursor(target, shift);
-                true
-            }
-            Key::ArrowRight => {
-                buffer.commit_group();
-                self.goal_col = None;
-                let target = if cmd {
-                    next_word(buffer, self.cursor)
-                } else {
-                    (self.cursor + 1).min(buffer.len_chars())
-                };
-                self.set_cursor(target, shift);
-                true
-            }
+            // ── horizontal motion (fans across every caret) ──
+            Key::ArrowLeft => self.move_horizontal(buffer, cmd, shift, false),
+            Key::ArrowRight => self.move_horizontal(buffer, cmd, shift, true),
             Key::Home => {
                 buffer.commit_group();
-                self.goal_col = None;
-                let target = if cmd {
-                    0
-                } else {
-                    buffer.line_to_char(self.cur_line(buffer))
-                };
-                self.set_cursor(target, shift);
+                self.group_open = false;
+                let len = buffer.len_chars();
+                for c in &mut self.carets {
+                    c.goal_col = None;
+                    let line = buffer.char_to_line(c.cursor.min(len));
+                    let t = if cmd { 0 } else { buffer.line_to_char(line) };
+                    c.move_to(t, shift);
+                }
+                self.reveal_caret = true;
+                self.normalize();
                 true
             }
             Key::End => {
                 buffer.commit_group();
-                self.goal_col = None;
-                let target = if cmd {
-                    buffer.len_chars()
-                } else {
-                    let line = self.cur_line(buffer);
-                    buffer.line_to_char(line) + line_len(buffer, line)
-                };
-                self.set_cursor(target, shift);
+                self.group_open = false;
+                let len = buffer.len_chars();
+                for c in &mut self.carets {
+                    c.goal_col = None;
+                    let line = buffer.char_to_line(c.cursor.min(len));
+                    let t = if cmd {
+                        len
+                    } else {
+                        buffer.line_to_char(line) + line_len(buffer, line)
+                    };
+                    c.move_to(t, shift);
+                }
+                self.reveal_caret = true;
+                self.normalize();
                 true
             }
-            // ── vertical motion (keeps the goal column) ──
+            // ── vertical motion / add-cursor above/below ──
+            Key::ArrowUp if cmd && alt => self.add_caret_vertical(buffer, -1),
+            Key::ArrowDown if cmd && alt => self.add_caret_vertical(buffer, 1),
             Key::ArrowUp => self.vertical(buffer, -1, shift),
             Key::ArrowDown => self.vertical(buffer, 1, shift),
-            #[allow(clippy::cast_possible_wrap)]
             Key::PageUp => self.vertical(buffer, -(rows.max(1) as isize), shift),
-            #[allow(clippy::cast_possible_wrap)]
             Key::PageDown => self.vertical(buffer, rows.max(1) as isize, shift),
-            // ── editing ──
+            // ── editing (fans out) ──
             Key::Enter => {
                 self.insert(buffer, "\n");
                 true
@@ -649,48 +1160,65 @@ impl EditorView {
                 self.delete(buffer);
                 true
             }
-            // ── selection / history ──
+            // ── selection / multi-cursor / history ──
             Key::A if cmd => {
                 self.select_all(buffer);
                 true
             }
-            Key::Z if cmd && shift => {
-                self.redo(buffer);
-                true
-            }
-            Key::Z if cmd => {
-                self.undo(buffer);
-                true
-            }
-            Key::Y if cmd => {
-                self.redo(buffer);
-                true
-            }
-            Key::Escape => {
-                if self.anchor.take().is_some() {
-                    self.reveal_caret = true;
-                    return true;
-                }
-                false
-            }
+            Key::D if cmd => self.add_next_match(buffer),
+            Key::Z if cmd && shift => self.redo(buffer),
+            Key::Z if cmd => self.undo(buffer),
+            Key::Y if cmd => self.redo(buffer),
+            Key::Escape => self.collapse(),
             _ => false,
         }
     }
 
-    /// Vertical caret motion by `delta` lines, preserving the goal column so a
-    /// run of Up/Down tracks the same column across short lines. Always returns
-    /// `true` (it moved the caret) so it composes in the key-dispatch match.
+    /// Horizontal motion for every caret: by word when `cmd`, extending on
+    /// `shift`, in the `forward` direction. Always reports a change.
+    fn move_horizontal(&mut self, buffer: &mut Buffer, cmd: bool, shift: bool, forward: bool) -> bool {
+        buffer.commit_group();
+        self.group_open = false;
+        let len = buffer.len_chars();
+        for c in &mut self.carets {
+            c.goal_col = None;
+            let t = if forward {
+                if cmd {
+                    next_word(buffer, c.cursor)
+                } else {
+                    (c.cursor + 1).min(len)
+                }
+            } else if cmd {
+                prev_word(buffer, c.cursor)
+            } else {
+                c.cursor.saturating_sub(1)
+            };
+            c.move_to(t, shift);
+        }
+        self.reveal_caret = true;
+        self.normalize();
+        true
+    }
+
+    /// Vertical caret motion by `delta` lines for every caret, each preserving its
+    /// own goal column so a run of Up/Down tracks the same column across short
+    /// lines. Always returns `true`.
     fn vertical(&mut self, buffer: &mut Buffer, delta: isize, extend: bool) -> bool {
         buffer.commit_group();
-        let line = self.cur_line(buffer);
-        let col = self.cur_col(buffer);
-        let goal = self.goal_col.unwrap_or(col);
+        self.group_open = false;
         let max_line = buffer.len_lines().saturating_sub(1);
-        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
-        let target_line = (line as isize + delta).clamp(0, max_line as isize) as usize;
-        let target = char_at(buffer, target_line, goal);
-        self.set_cursor(target, extend);
-        self.goal_col = Some(goal);
+        let len = buffer.len_chars();
+        for c in &mut self.carets {
+            let line = buffer.char_to_line(c.cursor.min(len));
+            let col = c.cursor - buffer.line_to_char(line);
+            let goal = c.goal_col.unwrap_or(col);
+            let target_line = (line as isize + delta).clamp(0, max_line as isize) as usize;
+            let target = char_at(buffer, target_line, goal);
+            c.move_to(target, extend);
+            c.goal_col = Some(goal);
+        }
+        self.reveal_caret = true;
+        self.normalize();
         true
     }
 
@@ -728,10 +1256,11 @@ impl EditorView {
         }
     }
 
-    /// The caret's `(visual row, column-within-row)` for painting.
-    fn caret_cell(&self, buffer: &Buffer, cols: usize) -> (usize, usize) {
-        let line = self.cur_line(buffer);
-        let col = self.cur_col(buffer);
+    /// The `(visual row, column-within-row)` for a caret at char index `cursor`.
+    fn caret_cell_at(&self, buffer: &Buffer, cursor: usize, cols: usize) -> (usize, usize) {
+        let cursor = cursor.min(buffer.len_chars());
+        let line = buffer.char_to_line(cursor);
+        let col = cursor - buffer.line_to_char(line);
         if self.wrap {
             let cols = cols.max(1);
             let llen = line_len(buffer, line);
@@ -747,22 +1276,27 @@ impl EditorView {
             (line, col)
         }
     }
+
+    /// The primary caret's `(visual row, column-within-row)` — the reveal target.
+    fn caret_cell(&self, buffer: &Buffer, cols: usize) -> (usize, usize) {
+        self.caret_cell_at(buffer, self.primary_caret().cursor, cols)
+    }
 }
 
 /// Render + edit an open [`Buffer`](crate::buffer::Buffer) through its
-/// [`EditorView`] — the one egui entry point for the code editor (EDITOR-3).
+/// [`EditorView`] — the one egui entry point for the code editor (EDITOR-3/4).
 ///
 /// Fills the available space with a scroll area, paints only the visible rows
 /// (viewport culling), maps the pointer to a rope char index for click/drag/
-/// double-/triple-click selection, routes this frame's key events into the view,
-/// and draws the gutter + text + selection + caret through [`Style`] tokens (§4).
-/// Returns the content [`Response`] so the surface can observe focus/hover.
+/// double-/triple-/Alt-click/Alt-drag selection, routes this frame's key events
+/// into the view, and draws the gutter + text + selections + carets through
+/// [`Style`] tokens (§4). Returns the content [`Response`] so the surface can
+/// observe focus/hover.
 pub fn editor_widget(ui: &mut Ui, view: &mut EditorView, buffer: &mut Buffer) -> Response {
     view.clamp(buffer);
 
     let font = body_font();
-    let (glyph_w, row_h) =
-        ui.fonts(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
+    let (glyph_w, row_h) = ui.fonts(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
     let gutter_w = gutter_width(buffer.len_lines(), glyph_w);
     let metrics = Metrics {
         glyph_w,
@@ -821,8 +1355,7 @@ fn editor_body(
         let text_w = view.max_line_chars as f32 * m.glyph_w + m.glyph_w;
         (m.gutter_w + text_w).max(clip.width())
     };
-    let (rect, resp) =
-        ui.allocate_exact_size(vec2(content_w, content_h), Sense::click_and_drag());
+    let (rect, resp) = ui.allocate_exact_size(vec2(content_w, content_h), Sense::click_and_drag());
     let origin = rect.min;
 
     // Viewport height in rows, for PageUp/PageDown.
@@ -861,7 +1394,7 @@ fn editor_body(
 
     paint(ui, view, buffer, m, origin, first, last, wrap_cols, &resp);
 
-    // Reveal the caret exactly once after a move/edit (don't fight user scroll).
+    // Reveal the primary caret exactly once after a move/edit (don't fight scroll).
     if std::mem::take(&mut view.reveal_caret) {
         let (vr, xcol) = view.caret_cell(buffer, wrap_cols);
         #[allow(clippy::cast_precision_loss)]
@@ -881,7 +1414,7 @@ fn editor_body(
 }
 
 /// Map the pointer to a rope char index and drive click / drag / double- /
-/// triple-click selection.
+/// triple-click selection, plus the Alt-click / Alt-drag multi-cursor gestures.
 #[allow(clippy::too_many_arguments)]
 fn handle_pointer(
     resp: &Response,
@@ -896,16 +1429,35 @@ fn handle_pointer(
     if resp.clicked() || resp.drag_started() || resp.double_clicked() || resp.triple_clicked() {
         resp.request_focus();
     }
-    let shift = ui.input(|i| i.modifiers.shift);
+    let (shift, alt) = ui.input(|i| (i.modifiers.shift, i.modifiers.alt));
 
-    // Resolve the pointer to a char index while only borrowing the view/buffer
-    // immutably, then mutate — a closure capturing them would clash with the
-    // `&mut` the selection gestures need.
-    let idx = resp
-        .interact_pointer_pos()
-        .map(|pos| hit_char(view, buffer, m, origin, total_rows, wrap_cols, pos));
-    let Some(idx) = idx else { return };
+    // Resolve the pointer while only borrowing the view/buffer immutably, then
+    // mutate — a closure capturing them would clash with the `&mut` the gestures
+    // need.
+    let Some(pos) = resp.interact_pointer_pos() else {
+        return;
+    };
+    let idx = hit_char(view, buffer, m, origin, total_rows, wrap_cols, pos);
+    let cell = hit_cell(m, origin, total_rows, pos);
 
+    if alt {
+        // Alt gestures: box (column) drag + toggle-caret click.
+        if resp.drag_started() {
+            view.box_anchor = Some(cell);
+        }
+        if resp.dragged() {
+            if let Some((r0, c0)) = view.box_anchor {
+                view.column_select(buffer, r0, c0, cell.0, cell.1, wrap_cols);
+            }
+        } else if resp.clicked() {
+            view.toggle_caret_at(buffer, idx);
+        }
+        return;
+    }
+
+    if resp.clicked() || resp.drag_started() {
+        view.box_anchor = None;
+    }
     if resp.triple_clicked() {
         view.select_line(buffer, idx);
     } else if resp.double_clicked() {
@@ -929,16 +1481,21 @@ fn hit_char(
     wrap_cols: usize,
     pos: Pos2,
 ) -> usize {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let vr = (((pos.y - origin.y) / m.row_h).floor().max(0.0) as usize)
-        .min(total_rows.saturating_sub(1));
+    let (vr, col) = hit_cell(m, origin, total_rows, pos);
     let row = view.vis_row(buffer, vr, wrap_cols);
     let span = row.end - row.start;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    row.start + col.min(span)
+}
+
+/// The `(visual row, column)` cell under a screen `pos`, rounded to the nearest
+/// glyph boundary. The shared basis for [`hit_char`] and the Alt-drag box.
+fn hit_cell(m: Metrics, origin: Pos2, total_rows: usize, pos: Pos2) -> (usize, usize) {
+    let vr = (((pos.y - origin.y) / m.row_h).floor().max(0.0) as usize)
+        .min(total_rows.saturating_sub(1));
     let col = (((pos.x - origin.x - m.gutter_w) / m.glyph_w) + 0.5)
         .floor()
         .max(0.0) as usize;
-    row.start + col.min(span)
+    (vr, col)
 }
 
 /// Route this frame's key + clipboard events into the view while it is focused.
@@ -971,11 +1528,17 @@ fn handle_keys(resp: &Response, ui: &Ui, view: &mut EditorView, buffer: &mut Buf
     for event in &events {
         match event {
             Event::Copy | Event::Cut => {
-                if let Some(range) = view.selection() {
-                    let text = buffer.rope().slice(range).to_string();
+                let sels = view.selections();
+                if !sels.is_empty() {
+                    // Join every caret's selection with a newline (top-to-bottom).
+                    let text = sels
+                        .iter()
+                        .map(|r| buffer.rope().slice(r.clone()).to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     ui.ctx().copy_text(text);
                     if matches!(event, Event::Cut) {
-                        view.delete(buffer);
+                        view.delete_selections(buffer);
                     }
                 }
             }
@@ -986,8 +1549,9 @@ fn handle_keys(resp: &Response, ui: &Ui, view: &mut EditorView, buffer: &mut Buf
     }
 }
 
-/// Paint the visible rows: current-line highlight, selection, gutter numbers,
-/// text glyphs, and the blinking caret — all through [`Style`] tokens (§4).
+/// Paint the visible rows: current-line highlight (per caret line), selection
+/// bands (per caret), gutter numbers, text glyphs, and the blinking carets — all
+/// through [`Style`] tokens (§4).
 #[allow(clippy::too_many_arguments)]
 fn paint(
     ui: &Ui,
@@ -1007,16 +1571,22 @@ fn paint(
     let text_clip = Rect::from_min_max(pos2(clip.left() + m.gutter_w, clip.top()), clip.max);
     let text_painter = painter.with_clip_rect(text_clip);
     let text_x0 = origin.x + m.gutter_w;
-    let cursor_line = view.cur_line(buffer);
-    let selection = view.selection();
+    let len = buffer.len_chars();
+    let caret_lines: Vec<usize> = view
+        .carets
+        .iter()
+        .map(|c| buffer.char_to_line(c.cursor.min(len)))
+        .collect();
+    let selections = view.selections();
 
     for vr in first..last {
         let row = view.vis_row(buffer, vr, wrap_cols);
         #[allow(clippy::cast_precision_loss)]
         let y = origin.y + vr as f32 * m.row_h;
 
-        // Current-line highlight (subtle raised fill across the text area).
-        if row.line == cursor_line {
+        // Current-line highlight (subtle raised fill across the text area) for
+        // every caret's line.
+        if caret_lines.contains(&row.line) {
             text_painter.rect_filled(
                 Rect::from_min_max(pos2(text_clip.left(), y), pos2(clip.right(), y + m.row_h)),
                 0.0,
@@ -1024,8 +1594,8 @@ fn paint(
             );
         }
 
-        // Selection band for this row.
-        if let Some(sel) = &selection {
+        // Selection bands for this row (one per caret selection).
+        for sel in &selections {
             paint_selection(&text_painter, &row, sel, text_x0, y, m);
         }
 
@@ -1042,8 +1612,8 @@ fn paint(
         }
     }
 
-    paint_gutter(&painter, view, buffer, m, origin, clip, first, last, wrap_cols, cursor_line);
-    paint_caret(&text_painter, ui, view, buffer, m, origin, wrap_cols, resp);
+    paint_gutter(&painter, view, buffer, m, origin, clip, first, last, wrap_cols, &caret_lines);
+    paint_carets(&text_painter, ui, view, buffer, m, origin, wrap_cols, resp);
 }
 
 /// Paint the selection band for one visual row, with a trailing hint when the
@@ -1090,7 +1660,7 @@ fn paint_gutter(
     first: usize,
     last: usize,
     wrap_cols: usize,
-    cursor_line: usize,
+    caret_lines: &[usize],
 ) {
     // Pin the gutter to the visible left edge even under horizontal scroll.
     let gx = clip.left();
@@ -1112,7 +1682,7 @@ fn paint_gutter(
         }
         #[allow(clippy::cast_precision_loss)]
         let y = origin.y + vr as f32 * m.row_h;
-        let color = if row.line == cursor_line {
+        let color = if caret_lines.contains(&row.line) {
             Style::TEXT
         } else {
             Style::TEXT_DIM
@@ -1127,10 +1697,10 @@ fn paint_gutter(
     }
 }
 
-/// Paint the caret: a solid accent beam while focused (blinking on the frame
+/// Paint every caret: a solid accent beam while focused (blinking on the frame
 /// clock), a hollow beam when unfocused.
 #[allow(clippy::too_many_arguments)]
-fn paint_caret(
+fn paint_carets(
     painter: &egui::Painter,
     ui: &Ui,
     view: &EditorView,
@@ -1140,26 +1710,31 @@ fn paint_caret(
     wrap_cols: usize,
     resp: &Response,
 ) {
-    let (vr, xcol) = view.caret_cell(buffer, wrap_cols);
-    #[allow(clippy::cast_precision_loss)]
-    let x = origin.x + m.gutter_w + xcol as f32 * m.glyph_w;
-    #[allow(clippy::cast_precision_loss)]
-    let y = origin.y + vr as f32 * m.row_h;
-    let caret = Rect::from_min_size(pos2(x, y), vec2(CARET_W, m.row_h));
-    if resp.has_focus() {
-        let time = ui.input(|i| i.time);
-        if blink_on(time) {
-            painter.rect_filled(caret, 0.0, Style::ACCENT);
+    let focused = resp.has_focus();
+    let on = focused && blink_on(ui.input(|i| i.time));
+    for c in &view.carets {
+        let (vr, xcol) = view.caret_cell_at(buffer, c.cursor, wrap_cols);
+        #[allow(clippy::cast_precision_loss)]
+        let x = origin.x + m.gutter_w + xcol as f32 * m.glyph_w;
+        #[allow(clippy::cast_precision_loss)]
+        let y = origin.y + vr as f32 * m.row_h;
+        let caret = Rect::from_min_size(pos2(x, y), vec2(CARET_W, m.row_h));
+        if focused {
+            if on {
+                painter.rect_filled(caret, 0.0, Style::ACCENT);
+            }
+        } else {
+            painter.rect_stroke(
+                caret,
+                0.0,
+                Stroke::new(1.0, Style::TEXT_DIM),
+                egui::StrokeKind::Middle,
+            );
         }
+    }
+    if focused {
         // Keep frames coming so the caret actually blinks while idle.
         ui.ctx().request_repaint_after(Duration::from_secs_f64(0.5));
-    } else {
-        painter.rect_stroke(
-            caret,
-            0.0,
-            Stroke::new(1.0, Style::TEXT_DIM),
-            egui::StrokeKind::Middle,
-        );
     }
 }
 
@@ -1182,7 +1757,7 @@ fn gutter_width(lines: usize, glyph_w: f32) -> f32 {
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod tests {
-    use super::{editor_widget, line_len, line_span, word_span, EditorView};
+    use super::{editor_widget, find_next, line_len, line_span, word_span, Caret, EditorView};
     use crate::buffer::Buffer;
     use mde_egui::egui::{self, pos2, vec2, Event, Key, Modifiers, Rect};
     use mde_egui::Style;
@@ -1208,7 +1783,15 @@ mod tests {
         Modifiers::COMMAND
     }
 
-    // ── cursor movement ──────────────────────────────────────────────────────
+    /// `Ctrl`/`Cmd` + `Alt` — the add-cursor-above/below chord.
+    fn cmd_alt() -> Modifiers {
+        Modifiers {
+            alt: true,
+            ..Modifiers::COMMAND
+        }
+    }
+
+    // ── cursor movement (EDITOR-3, must still pass) ──────────────────────────
 
     #[test]
     fn arrows_move_the_caret_across_chars_and_lines() {
@@ -1262,7 +1845,7 @@ mod tests {
         assert_eq!(view.line_col(&buf), (3, 6), "goal column restored on line 2");
     }
 
-    // ── selection ────────────────────────────────────────────────────────────
+    // ── selection (EDITOR-3) ─────────────────────────────────────────────────
 
     #[test]
     fn shift_arrows_extend_and_a_plain_move_drops_the_selection() {
@@ -1306,7 +1889,7 @@ mod tests {
         assert_eq!(view.selection(), Some(6..10));
     }
 
-    // ── edit through the view ────────────────────────────────────────────────
+    // ── edit through the view (EDITOR-3) ─────────────────────────────────────
 
     #[test]
     fn a_text_event_inserts_into_the_real_buffer() {
@@ -1360,7 +1943,7 @@ mod tests {
         assert_eq!(view.cursor(), 0);
     }
 
-    // ── undo / redo via the view ─────────────────────────────────────────────
+    // ── undo / redo via the view (EDITOR-3) ──────────────────────────────────
 
     #[test]
     fn undo_and_redo_run_through_the_view_and_restore_the_caret() {
@@ -1373,7 +1956,7 @@ mod tests {
         // Ctrl+Z undoes the whole coalesced type run and restores the caret to 0.
         view.apply_event(&mut buf, &key(Key::Z, cmd()), 10);
         assert_eq!(buf.rope().to_string(), "");
-        assert_eq!(view.cursor(), 0, "undo restored the pre-run caret hint");
+        assert_eq!(view.cursor(), 0, "undo restored the pre-run caret");
         // Ctrl+Y redoes it, caret back at the end.
         view.apply_event(&mut buf, &key(Key::Y, cmd()), 10);
         assert_eq!(buf.rope().to_string(), "hi");
@@ -1387,7 +1970,7 @@ mod tests {
         assert_eq!(buf.rope().to_string(), "hi");
     }
 
-    // ── pure helpers ─────────────────────────────────────────────────────────
+    // ── pure helpers (EDITOR-3) ──────────────────────────────────────────────
 
     #[test]
     fn line_len_excludes_the_trailing_newline() {
@@ -1396,6 +1979,137 @@ mod tests {
         assert_eq!(line_len(&buf, 1), 0, "a blank line has zero length");
         assert_eq!(line_len(&buf, 2), 2);
         assert_eq!(line_len(&buf, 3), 0, "the final empty line");
+    }
+
+    // ── multi-cursor (EDITOR-4) ──────────────────────────────────────────────
+
+    #[test]
+    fn add_cursor_below_and_above_stack_carets() {
+        let mut buf = Buffer::from_text("aaa\nbbb\nccc");
+        let mut view = EditorView::new();
+        view.place_cursor(&buf, 1); // line 0, col 1
+        // Ctrl+Alt+Down adds a caret on line 1 at the same column, made primary.
+        view.apply_event(&mut buf, &key(Key::ArrowDown, cmd_alt()), 10);
+        assert_eq!(view.carets.len(), 2);
+        assert_eq!(view.cursor(), 5, "line 1 col 1");
+        // Again → line 2.
+        view.apply_event(&mut buf, &key(Key::ArrowDown, cmd_alt()), 10);
+        assert_eq!(view.carets.len(), 3);
+        assert_eq!(view.cursor(), 9, "line 2 col 1");
+        let mut cs: Vec<usize> = view.carets.iter().map(|c| c.cursor).collect();
+        cs.sort_unstable();
+        assert_eq!(cs, vec![1, 5, 9]);
+        // Add-above from the bottom caret re-lands on line 1 → merges with the
+        // existing caret there, so the count does not grow.
+        view.apply_event(&mut buf, &key(Key::ArrowUp, cmd_alt()), 10);
+        assert_eq!(view.carets.len(), 3, "add-above onto an existing caret merges");
+    }
+
+    #[test]
+    fn add_cursor_at_next_match_selects_then_adds() {
+        let mut buf = Buffer::from_text("foo bar foo baz foo");
+        let mut view = EditorView::new();
+        view.place_cursor(&buf, 1); // inside the first "foo"
+        // First Ctrl+D selects the word.
+        view.apply_event(&mut buf, &key(Key::D, cmd()), 10);
+        assert_eq!(view.carets.len(), 1);
+        assert_eq!(view.selection(), Some(0..3), "first Ctrl+D selects the word");
+        // Second Ctrl+D adds a caret at the next "foo" (chars 8..11), now primary.
+        view.apply_event(&mut buf, &key(Key::D, cmd()), 10);
+        assert_eq!(view.carets.len(), 2);
+        assert_eq!(view.selection(), Some(8..11));
+        // Third adds the last "foo" (16..19).
+        view.apply_event(&mut buf, &key(Key::D, cmd()), 10);
+        assert_eq!(view.carets.len(), 3);
+        assert_eq!(view.selection(), Some(16..19));
+        // find_next wraps back to the top match after the last one.
+        assert_eq!(find_next(&buf, &['f', 'o', 'o'], 19), Some(0));
+    }
+
+    #[test]
+    fn column_select_stacks_a_caret_per_row() {
+        let buf = Buffer::from_text("abcd\nefgh\nijkl");
+        let mut view = EditorView::new();
+        // Box from row 0 col 1 to row 2 col 3 → one caret per row, each selecting
+        // the col 1..3 band of its row (line starts 0, 5, 10).
+        view.column_select(&buf, 0, 1, 2, 3, 80);
+        assert_eq!(view.carets.len(), 3);
+        assert_eq!(view.selections(), vec![1..3, 6..8, 11..13]);
+    }
+
+    #[test]
+    fn a_fan_out_insert_edits_every_caret_and_undoes_as_one_step() {
+        let mut buf = Buffer::from_text("a\nb\nc");
+        let mut view = EditorView::new();
+        // A caret at the start of each of the three lines.
+        view.place_cursor(&buf, 0);
+        view.apply_event(&mut buf, &key(Key::ArrowDown, cmd_alt()), 10);
+        view.apply_event(&mut buf, &key(Key::ArrowDown, cmd_alt()), 10);
+        assert_eq!(view.carets.len(), 3);
+        // Typing fans out to every caret (proves it edits the real rope N times).
+        view.apply_event(&mut buf, &Event::Text("X".to_owned()), 10);
+        assert_eq!(buf.rope().to_string(), "Xa\nXb\nXc", "every caret inserted");
+        // One undo reverts the whole fan-out and restores every caret.
+        view.apply_event(&mut buf, &key(Key::Z, cmd()), 10);
+        assert_eq!(buf.rope().to_string(), "a\nb\nc", "one undo reverts the fan-out");
+        assert_eq!(view.carets.len(), 3, "undo restored every caret");
+        // Redo puts the text + carets back.
+        view.apply_event(&mut buf, &key(Key::Y, cmd()), 10);
+        assert_eq!(buf.rope().to_string(), "Xa\nXb\nXc");
+        assert_eq!(view.carets.len(), 3);
+    }
+
+    #[test]
+    fn fan_out_backspace_deletes_at_every_caret() {
+        let mut buf = Buffer::from_text("Xa\nXb\nXc");
+        let mut view = EditorView::new();
+        // Carets just after each leading 'X' (cols 1 of each line): 1, 4, 7.
+        view.place_cursor(&buf, 1);
+        view.apply_event(&mut buf, &key(Key::ArrowDown, cmd_alt()), 10);
+        view.apply_event(&mut buf, &key(Key::ArrowDown, cmd_alt()), 10);
+        assert_eq!(view.carets.len(), 3);
+        view.apply_event(&mut buf, &key(Key::Backspace, Modifiers::NONE), 10);
+        assert_eq!(buf.rope().to_string(), "a\nb\nc", "backspace fanned out");
+    }
+
+    #[test]
+    fn overlapping_carets_merge_on_normalize() {
+        let mut buf = Buffer::from_text("abcdef");
+        let mut view = EditorView::new();
+        // Two selections that overlap (0..3 and 2..5).
+        view.carets = vec![
+            Caret {
+                cursor: 3,
+                anchor: Some(0),
+                goal_col: None,
+            },
+            Caret {
+                cursor: 5,
+                anchor: Some(2),
+                goal_col: None,
+            },
+        ];
+        view.primary = 1;
+        // A no-op motion (Right without shift would move; use normalize directly).
+        view.normalize();
+        assert_eq!(view.carets.len(), 1, "overlapping selections merged into one");
+        assert_eq!(view.selection(), Some(0..5));
+        let _ = &mut buf;
+    }
+
+    #[test]
+    fn escape_collapses_to_a_single_primary_caret() {
+        let mut buf = Buffer::from_text("aaa\nbbb\nccc");
+        let mut view = EditorView::new();
+        view.place_cursor(&buf, 1);
+        view.apply_event(&mut buf, &key(Key::ArrowDown, cmd_alt()), 10);
+        view.apply_event(&mut buf, &key(Key::ArrowDown, cmd_alt()), 10);
+        assert_eq!(view.carets.len(), 3);
+        let primary_cursor = view.cursor();
+        let changed = view.apply_event(&mut buf, &key(Key::Escape, Modifiers::NONE), 10);
+        assert!(changed, "Esc collapsed the multi-cursor");
+        assert_eq!(view.carets.len(), 1, "Esc collapsed to one caret");
+        assert_eq!(view.cursor(), primary_cursor, "the primary caret survives");
     }
 
     // ── headless render ──────────────────────────────────────────────────────
@@ -1421,6 +2135,30 @@ mod tests {
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         assert!(!prims.is_empty(), "the editor widget produced no primitives");
+    }
+
+    #[test]
+    fn multi_caret_widget_paints_every_caret() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut buf = Buffer::from_text("one\ntwo\nthree");
+        let mut view = EditorView::new();
+        // Stack three carets so the paint pass loops all of them.
+        view.place_cursor(&buf, 0);
+        view.apply_event(&mut buf, &key(Key::ArrowDown, cmd_alt()), 10);
+        view.apply_event(&mut buf, &key(Key::ArrowDown, cmd_alt()), 10);
+        assert_eq!(view.carets.len(), 3);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor_widget(ui, &mut view, &mut buf);
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(!prims.is_empty(), "the multi-caret editor produced no primitives");
     }
 
     #[test]
