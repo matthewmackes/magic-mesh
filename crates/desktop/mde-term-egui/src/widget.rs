@@ -35,13 +35,14 @@ use std::time::Duration;
 use mde_egui::egui::text::LayoutJob;
 use mde_egui::egui::{
     self, Align2, Context, Event, EventFilter, FontId, Key, Modifiers, MouseWheelUnit, Pos2, Rect,
-    Response, Sense, Stroke, StrokeKind, TextFormat, Ui, Vec2,
+    Response, RichText, Sense, Stroke, StrokeKind, TextFormat, Ui, Vec2,
 };
 use mde_egui::Style;
 
 use crate::appearance::{Appearance, CursorShape};
 use crate::bell::{Bell, BellConfig};
 use crate::engine::TermEvent;
+use crate::menu::{BusChatClient, ChatBus, CommandRunner, ContextMenu, OsCommandRunner};
 use crate::mouse::{encode_sgr, MouseButton, MouseEvent};
 use crate::notify::{BusNotifyClient, NoticeLevel, NotifyBus, TermNotice};
 use crate::palette::{self, Palette};
@@ -247,6 +248,37 @@ pub struct TerminalWidget {
     /// The notification Bus seam (TERM-12) the watcher + audible bell publish
     /// over — a desktop toast. Injectable so tests record it.
     notify_bus: Arc<dyn NotifyBus>,
+    /// The selection context menu (TERM-15): the user's custom commands + the
+    /// Chat recipient. The four built-in mesh actions are always offered.
+    menu: ContextMenu,
+    /// The Bus seam send-selection-to-Chat publishes over (TERM-15) — the
+    /// NOTIFY-CHAT `action/chat/send` verb. Injectable so tests record it.
+    chat_bus: Arc<dyn ChatBus>,
+    /// The dispatch seam a custom command's argv runs through (TERM-15) —
+    /// production spawns it detached in the pane's cwd. Injectable so tests
+    /// record it.
+    runner: Arc<dyn CommandRunner>,
+    /// Set when the context menu's **new-terminal-here** item is chosen; the
+    /// split multiplexer drains it ([`Self::take_new_terminal_here`]) and splits
+    /// the pane inheriting its cwd (TERM-15 reuses the TERM-4/5 spawn).
+    new_terminal_here: bool,
+}
+
+/// The item a TERM-15 context-menu click selected, recorded inside the menu
+/// closure and dispatched after it returns (so no `self` borrow crosses the
+/// closure). `Custom` carries the index into the config's command list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MenuChoice {
+    /// A user-defined custom command by list index.
+    Custom(usize),
+    /// Send the selection to Chat.
+    Chat,
+    /// Open the selection as a path in Files.
+    Files,
+    /// Open the selection as a URL in the mesh browser.
+    Browser,
+    /// Split a new terminal here, inheriting the pane's cwd.
+    NewHere,
 }
 
 impl TerminalWidget {
@@ -289,6 +321,10 @@ impl TerminalWidget {
             watch: ActivityWatch::default(),
             bell: Bell::default(),
             notify_bus: Arc::new(BusNotifyClient::from_env()),
+            menu: ContextMenu::default(),
+            chat_bus: Arc::new(BusChatClient::from_env()),
+            runner: Arc::new(OsCommandRunner),
+            new_terminal_here: false,
         }
     }
 
@@ -352,6 +388,54 @@ impl TerminalWidget {
     pub fn with_notify_bus(mut self, bus: Arc<dyn NotifyBus>) -> Self {
         self.notify_bus = bus;
         self
+    }
+
+    /// The selection context menu config (TERM-15): the user's custom commands +
+    /// the Chat recipient. The split multiplexer pushes the surface's shared menu
+    /// into every pane, so a config change reaches every live shell.
+    #[must_use]
+    pub fn with_context_menu(mut self, menu: ContextMenu) -> Self {
+        self.menu = menu;
+        self
+    }
+
+    /// Adopt the surface's context-menu config (TERM-15) — the split multiplexer
+    /// calls this on every pane, mirroring [`Self::apply_appearance`]. A no-op
+    /// when nothing changed.
+    pub fn apply_context_menu(&mut self, menu: &ContextMenu) {
+        if &self.menu != menu {
+            self.menu = menu.clone();
+        }
+    }
+
+    /// Inject the Chat Bus seam (TERM-15) — tests record the sends; production
+    /// resolves the live Bus via [`Self::over`].
+    #[must_use]
+    pub fn with_chat_bus(mut self, bus: Arc<dyn ChatBus>) -> Self {
+        self.chat_bus = bus;
+        self
+    }
+
+    /// Inject the custom-command runner seam (TERM-15) — tests record the argv;
+    /// production spawns the process via [`Self::over`].
+    #[must_use]
+    pub fn with_command_runner(mut self, runner: Arc<dyn CommandRunner>) -> Self {
+        self.runner = runner;
+        self
+    }
+
+    /// Take (and clear) the pending **new-terminal-here** request the context menu
+    /// raised (TERM-15). The split multiplexer polls this after rendering the pane
+    /// and, when set, splits the pane inheriting its cwd.
+    pub fn take_new_terminal_here(&mut self) -> bool {
+        std::mem::take(&mut self.new_terminal_here)
+    }
+
+    /// Raise a new-terminal-here request as if the context menu were chosen —
+    /// the split multiplexer's drain test drives the reused spawn through this.
+    #[cfg(test)]
+    pub(crate) const fn request_new_terminal_here(&mut self) {
+        self.new_terminal_here = true;
     }
 
     /// Seed the pane's fallback title (its stable ordinal), shown until the
@@ -594,6 +678,11 @@ impl TerminalWidget {
             // when the shell itself is idle.
             ui.ctx().request_repaint_after(LIVE_REPAINT);
         }
+
+        // TERM-15: the selection context menu (custom commands + mesh actions),
+        // right-click on the grid. Attached last so it reads this frame's
+        // selection.
+        self.show_selection_menu(&response);
         response
     }
 
@@ -1040,6 +1129,122 @@ impl TerminalWidget {
             ctx.copy_text(text.clone());
         }
         self.primary = Some(text);
+    }
+
+    /// The current selection's text (a one-shot full snapshot — the selection may
+    /// live in history), or `None` when nothing is selected or it is empty. The
+    /// input every TERM-15 context-menu action folds over.
+    fn selection_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        let text = self
+            .session
+            .with_terminal(|t| selected_text(&t.full(), &sel));
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// This pane's live cwd — the local shell's `/proc/<pid>/cwd`, the same source
+    /// the TERM-10 layout capture reads. `None` for a remote pane or a gone pid.
+    fn pane_cwd(&self) -> Option<std::path::PathBuf> {
+        self.local_pty()
+            .and_then(|pty| crate::layout::cwd_of_pid(pty.child_pid()))
+    }
+
+    /// The selection context menu (TERM-15): the user's custom commands over the
+    /// selection (Terminator parity), then the four built-in mesh actions, each
+    /// reusing an existing surface-launch verb (§6). Right-click on the grid.
+    ///
+    /// The closure only *records* the chosen item (no `self` borrow inside it);
+    /// the effect is dispatched afterwards through the injectable seams, so each
+    /// action is unit-tested headless via the recorders. §4 Carbon tokens carry
+    /// the section captions; the menu chrome itself renders through the installed
+    /// [`Style`] visuals.
+    fn show_selection_menu(&mut self, response: &Response) {
+        let Some(text) = self.selection_text() else {
+            return;
+        };
+        let commands = self.menu.commands.clone();
+        let mut chosen: Option<MenuChoice> = None;
+        response.context_menu(|ui| {
+            ui.set_max_width(220.0);
+            if !commands.is_empty() {
+                ui.label(
+                    RichText::new("Custom commands")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                for (i, cmd) in commands.iter().enumerate() {
+                    if ui.button(&cmd.label).clicked() {
+                        chosen = Some(MenuChoice::Custom(i));
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+            }
+            ui.label(
+                RichText::new("Mesh actions")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            );
+            if ui.button("Send selection to Chat").clicked() {
+                chosen = Some(MenuChoice::Chat);
+                ui.close_menu();
+            }
+            if ui.button("Open path in Files").clicked() {
+                chosen = Some(MenuChoice::Files);
+                ui.close_menu();
+            }
+            if ui.button("Open URL in browser").clicked() {
+                chosen = Some(MenuChoice::Browser);
+                ui.close_menu();
+            }
+            if ui.button("New terminal here").clicked() {
+                chosen = Some(MenuChoice::NewHere);
+                ui.close_menu();
+            }
+        });
+        match chosen {
+            Some(MenuChoice::Custom(i)) => {
+                if let Some(cmd) = commands.get(i) {
+                    self.run_custom_command(cmd, &text);
+                }
+            }
+            Some(MenuChoice::Chat) => self.send_selection_to_chat(&text),
+            Some(MenuChoice::Files) => self.open_selection_in_files(&text),
+            Some(MenuChoice::Browser) => self.open_selection_url(&text),
+            Some(MenuChoice::NewHere) => self.new_terminal_here = true,
+            None => {}
+        }
+    }
+
+    /// Dispatch a custom command over the selection (TERM-15): substitute the
+    /// selection into the template's argv and run it in the pane's cwd. Best-
+    /// effort — a spawn failure is swallowed (the runner degrades honestly).
+    pub(crate) fn run_custom_command(&self, cmd: &crate::menu::CustomCommand, selection: &str) {
+        let _ = self
+            .runner
+            .run(&cmd.argv(selection), self.pane_cwd().as_deref());
+    }
+
+    /// Send the selection to Chat (TERM-15) — reuse the NOTIFY-CHAT
+    /// `action/chat/send` verb via the [`ChatBus`] seam, to the config's recipient.
+    pub(crate) fn send_selection_to_chat(&self, selection: &str) {
+        let _ = self.chat_bus.send(&self.menu.chat_recipient, selection);
+    }
+
+    /// Open the selection as a path in the Files surface (TERM-15) — reuse the
+    /// TERM-9 [`smart::LaunchRoute::Files`] surface-launch path.
+    pub(crate) fn open_selection_in_files(&self, selection: &str) {
+        let _ = self
+            .launch_bus
+            .open(&smart::LaunchRoute::Files(selection.to_string()));
+    }
+
+    /// Open the selection as a URL in the mesh browser (TERM-15) — reuse the
+    /// TERM-9 [`smart::LaunchRoute::Bookmarks`] surface-launch path.
+    pub(crate) fn open_selection_url(&self, selection: &str) {
+        let _ = self
+            .launch_bus
+            .open(&smart::LaunchRoute::Bookmarks(selection.to_string()));
     }
 
     /// Mouse selection + the smart-clipboard gestures (TERM-9): double-click
@@ -2373,5 +2578,96 @@ mod tests {
         assert!(blink_on(0.0));
         assert!(!blink_on(0.6));
         assert!(blink_on(1.1));
+    }
+
+    // ── TERM-15: selection context-menu action dispatch ─────────────────────
+
+    /// Recording twins of the TERM-15 seams (the launch-bus recorder idiom).
+    #[derive(Default)]
+    struct RecLaunch {
+        routes: std::sync::Mutex<Vec<smart::LaunchRoute>>,
+    }
+    impl LaunchBus for RecLaunch {
+        fn open(&self, route: &smart::LaunchRoute) -> Result<(), String> {
+            self.routes.lock().expect("lock").push(route.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecChat {
+        sends: std::sync::Mutex<Vec<(String, String)>>,
+    }
+    impl ChatBus for RecChat {
+        fn send(&self, to: &str, text: &str) -> Result<(), String> {
+            self.sends
+                .lock()
+                .expect("lock")
+                .push((to.to_string(), text.to_string()));
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecRunner {
+        argvs: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+    impl CommandRunner for RecRunner {
+        fn run(&self, argv: &[String], _cwd: Option<&std::path::Path>) -> Result<(), String> {
+            self.argvs.lock().expect("lock").push(argv.to_vec());
+            Ok(())
+        }
+    }
+
+    /// Each built-in mesh action dispatches the RIGHT existing verb/launch, and a
+    /// custom command runs the selection-substituted argv — all headless over the
+    /// injected recorders (no Bus, no process spawn, no grid read).
+    #[test]
+    fn each_menu_action_dispatches_its_reused_verb() {
+        let launch = Arc::new(RecLaunch::default());
+        let chat = Arc::new(RecChat::default());
+        let runner = Arc::new(RecRunner::default());
+        let menu = ContextMenu {
+            commands: vec![crate::menu::CustomCommand::new("open", "xdg-open {}")],
+            chat_recipient: "eagle".to_string(),
+        };
+        let mut w = headless_widget()
+            .with_launch_bus(launch.clone())
+            .with_chat_bus(chat.clone())
+            .with_command_runner(runner.clone())
+            .with_context_menu(menu);
+
+        // open-path-in-Files → the TERM-9 Files surface-launch route.
+        w.open_selection_in_files("/etc/hosts");
+        // open-URL-in-mesh-browser → the TERM-9 Bookmarks route.
+        w.open_selection_url("https://mesh.local");
+        assert_eq!(
+            launch.routes.lock().expect("lock").as_slice(),
+            &[
+                smart::LaunchRoute::Files("/etc/hosts".to_string()),
+                smart::LaunchRoute::Bookmarks("https://mesh.local".to_string()),
+            ]
+        );
+
+        // send-selection-to-Chat → the NOTIFY-CHAT send verb, to the config peer.
+        w.send_selection_to_chat("build failed");
+        assert_eq!(
+            chat.sends.lock().expect("lock").as_slice(),
+            &[("eagle".to_string(), "build failed".to_string())]
+        );
+
+        // custom command → the substituted argv (selection injected).
+        let cmd = w.menu.commands[0].clone();
+        w.run_custom_command(&cmd, "report.pdf");
+        assert_eq!(
+            runner.argvs.lock().expect("lock").as_slice(),
+            &[vec!["xdg-open".to_string(), "report.pdf".to_string()]]
+        );
+
+        // new-terminal-here → the flag the split multiplexer drains (once).
+        assert!(!w.take_new_terminal_here());
+        w.new_terminal_here = true;
+        assert!(w.take_new_terminal_here());
+        assert!(!w.take_new_terminal_here());
     }
 }

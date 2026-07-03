@@ -99,6 +99,17 @@
 //!   → [`palette::cell_colors`] un-quantized (`Rgb`/`Palette` straight to
 //!   `Color32`). [`fonts`] bundles **Fira Code** (programming ligatures) in the
 //!   crate and registers it as the grid's monospace face.
+//!
+//! - [`menu`] (TERM-15) — the **selection context menu**: user-defined
+//!   [`menu::CustomCommand`]s (a label + a `{}`/`%s` template the selection
+//!   substitutes into an argv, Terminator parity, run by [`menu::CommandRunner`])
+//!   plus four built-in mesh actions on the selection, each reusing an existing
+//!   surface-launch verb (§6) — send-to-Chat over the NOTIFY-CHAT
+//!   [`menu::ACTION_CHAT_SEND`] verb ([`menu::ChatBus`]), open-path-in-Files /
+//!   open-URL-in-browser over the TERM-9 [`smart::LaunchBus`], and
+//!   new-terminal-here over the TERM-4/5 [`splits`] spawn inheriting the pane's
+//!   cwd. The widget renders it on the grid's right-click; the split multiplexer
+//!   drains the new-terminal-here flag.
 
 pub mod appearance;
 pub mod bell;
@@ -107,6 +118,7 @@ pub mod fonts;
 pub mod keymap;
 pub mod layout;
 pub mod layout_ui;
+pub mod menu;
 pub mod mouse;
 pub mod notify;
 pub mod palette;
@@ -132,6 +144,10 @@ pub use engine::{TermEvent, Terminal, DEFAULT_SCROLLBACK};
 pub use keymap::{Action, Chord, Keymap, KeymapConfig};
 pub use layout::{LayoutPane, LayoutStore, LayoutTab, PaneSpec, SavedLayout};
 pub use layout_ui::{LayoutIntent, LayoutManager};
+pub use menu::{
+    BusChatClient, ChatBus, CommandRunner, ContextMenu, CustomCommand, OsCommandRunner,
+    ACTION_CHAT_SEND,
+};
 pub use mouse::{encode_sgr, MouseButton, MouseEvent};
 pub use notify::{BusNotifyClient, NoticeLevel, NotifyBus, TermNotice, TOAST_TOPIC};
 pub use palette::Palette;

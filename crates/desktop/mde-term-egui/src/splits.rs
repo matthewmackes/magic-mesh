@@ -787,6 +787,10 @@ pub struct SplitTerminal {
     /// The surface appearance (TERM-11): scheme + font size + cursor style,
     /// pushed into every pane each frame so a picker change reaches all shells.
     appearance: Appearance,
+    /// The selection context menu (TERM-15): the user's custom commands + the
+    /// Chat recipient, pushed into every pane each frame (like [`Self::appearance`])
+    /// so a config change — and every freshly split pane — carries the same menu.
+    menu: crate::menu::ContextMenu,
 }
 
 impl SplitTerminal {
@@ -837,6 +841,7 @@ impl SplitTerminal {
             broadcast: Broadcast::Off,
             groups: HashMap::new(),
             appearance: Appearance::default(),
+            menu: crate::menu::ContextMenu::default(),
         }
     }
 
@@ -846,6 +851,14 @@ impl SplitTerminal {
     /// all shells at once.
     pub const fn set_appearance(&mut self, appearance: Appearance) {
         self.appearance = appearance;
+    }
+
+    /// Adopt the surface's selection context menu (TERM-15). The tabbed surface
+    /// calls this on the active tab each frame; [`Self::show_panes`] then hands it
+    /// to every live pane, so a config change — and every freshly split pane —
+    /// carries the same custom commands + Chat recipient.
+    pub fn set_context_menu(&mut self, menu: crate::menu::ContextMenu) {
+        self.menu = menu;
     }
 
     /// `true` once every pane has closed — the surface should close with it.
@@ -1115,30 +1128,43 @@ impl SplitTerminal {
             .collect()
     }
 
-    /// Spawn a shell into the registry (not yet in the tree).
+    /// Spawn a shell into the registry (not yet in the tree) from the tab's
+    /// recipe.
     fn spawn_session(&mut self) -> io::Result<SessionId> {
-        let pty = LocalPty::spawn(self.spawn_opts.clone())?;
+        self.spawn_session_opts(self.spawn_opts.clone())
+    }
+
+    /// Spawn a shell into the registry from an explicit recipe (the cwd-inheriting
+    /// new-terminal-here path reuses this with an overridden cwd).
+    fn spawn_session_opts(&mut self, opts: SpawnOptions) -> io::Result<SessionId> {
+        let pty = LocalPty::spawn(opts)?;
         let id = SessionId(self.next_id);
         self.next_id += 1;
         self.sessions.insert(id, TerminalWidget::new(pty));
         Ok(id)
     }
 
-    /// Split the focused pane in `dir` with a fresh shell; the new pane takes
-    /// focus (Terminator behaviour). A spawn failure leaves the tree as-is
-    /// and raises the error chip.
+    /// Split the focused pane in `dir` with a fresh shell from the tab's recipe;
+    /// the new pane takes focus (Terminator behaviour).
     fn split_focused(&mut self, dir: SplitDir) {
+        self.split_at(self.focused, dir, self.spawn_opts.clone());
+    }
+
+    /// Split `at`'s pane in `dir` with a fresh shell spawned from `opts`; the new
+    /// pane takes focus. A spawn failure leaves the tree as-is and raises the
+    /// error chip. The one spawn+split path both the keyboard split and the
+    /// TERM-15 new-terminal-here reuse.
+    fn split_at(&mut self, at: SessionId, dir: SplitDir, opts: SpawnOptions) {
         if self.tree.is_none() {
             return;
         }
-        let new = match self.spawn_session() {
+        let new = match self.spawn_session_opts(opts) {
             Ok(id) => id,
             Err(err) => {
                 self.error = Some((format!("could not start a shell: {err}"), Instant::now()));
                 return;
             }
         };
-        let at = self.focused;
         let split_ok = self
             .tree
             .as_mut()
@@ -1147,9 +1173,42 @@ impl SplitTerminal {
             self.focused = new;
             self.zoomed = None;
         } else {
-            // The focused id was not in the tree (defensive) — release the
-            // freshly spawned shell rather than leak it.
+            // `at` was not in the tree (defensive) — release the freshly spawned
+            // shell rather than leak it.
             self.sessions.remove(&new);
+        }
+    }
+
+    /// A local pane's live cwd, read from `/proc/<pid>/cwd` — the same source
+    /// [`Self::capture_spec`] uses. `None` for a remote pane or a gone pid.
+    fn pane_cwd(&self, id: SessionId) -> Option<std::path::PathBuf> {
+        self.sessions
+            .get(&id)
+            .and_then(TerminalWidget::local_pty)
+            .and_then(|pty| cwd_of_pid(pty.child_pid()))
+    }
+
+    /// Drain each pane's pending TERM-15 **new-terminal-here** request and split
+    /// it — a fresh shell beside the source pane inheriting its cwd (the TERM-4/5
+    /// spawn reused). A vertical split (side-by-side), Terminator's default
+    /// "new terminal" placement.
+    fn drain_new_terminal_requests(&mut self, lay: &Layout) {
+        let requests: Vec<SessionId> = lay
+            .leaves
+            .iter()
+            .filter(|(sid, _)| {
+                self.sessions
+                    .get_mut(sid)
+                    .is_some_and(TerminalWidget::take_new_terminal_here)
+            })
+            .map(|(sid, _)| *sid)
+            .collect();
+        for at in requests {
+            let opts = SpawnOptions {
+                cwd: self.pane_cwd(at),
+                ..self.spawn_opts.clone()
+            };
+            self.split_at(at, SplitDir::V, opts);
         }
     }
 
@@ -1225,6 +1284,9 @@ impl SplitTerminal {
 
         self.prefocus(ui);
         let responses = self.show_panes(ui, &lay);
+        // TERM-15: any pane whose context menu chose "new terminal here" splits
+        // now, inheriting that pane's cwd (the TERM-4/5 spawn reused).
+        self.drain_new_terminal_requests(&lay);
         // Fan the focused pane's just-typed bytes to the broadcasting set,
         // using the focus that held the keyboard *this* frame (before the
         // click reconcile below can move it).
@@ -1436,8 +1498,10 @@ impl SplitTerminal {
                 continue;
             };
             // Push the surface appearance (scheme + font + cursor) into the pane
-            // before it renders (TERM-11).
+            // before it renders (TERM-11), plus the shared selection context menu
+            // (TERM-15), so a config change reaches every live shell.
             widget.apply_appearance(&self.appearance);
+            widget.apply_context_menu(&self.menu);
             let mut pane_ui = ui.new_child(
                 UiBuilder::new()
                     .max_rect(*rect)
@@ -2064,6 +2128,39 @@ mod tests {
             rows_of(&term, b),
             rows_of(&term, a)
         );
+    }
+
+    #[test]
+    fn new_terminal_here_splits_inheriting_the_pane_cwd() {
+        // TERM-15: the context-menu "new terminal here" splits the pane with a
+        // fresh shell that inherits its cwd (the TERM-4/5 spawn reused). Start a
+        // shell in a known dir, flag the pane as the menu would, and render — one
+        // frame drains the request and splits.
+        let ctx = test_ctx();
+        let mut term = SplitTerminal::new(SpawnOptions {
+            cwd: Some(std::path::PathBuf::from("/tmp")),
+            ..sh_opts()
+        })
+        .expect("first shell");
+        let src = term.focused_session();
+        settle(&ctx, &mut term, 2);
+        assert_eq!(term.session_count(), 1, "one shell to start");
+
+        term.sessions
+            .get_mut(&src)
+            .expect("source pane")
+            .request_new_terminal_here();
+        frame(&ctx, &mut term, Vec::new(), Modifiers::NONE);
+        settle(&ctx, &mut term, 2);
+
+        assert_eq!(term.session_count(), 2, "a new pane split in");
+        let new = term.focused_session();
+        assert_ne!(new, src, "the new pane took focus");
+        // The new shell inherited the source pane's cwd, read live from /proc
+        // (§7: the real spawn, not a stored flag).
+        let src_cwd = term.pane_cwd(src);
+        assert!(src_cwd.is_some(), "the source pane's cwd is readable");
+        assert_eq!(term.pane_cwd(new), src_cwd, "new pane inherited the cwd");
     }
 
     #[test]

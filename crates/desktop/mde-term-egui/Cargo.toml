@@ -68,6 +68,11 @@ mde-bus = { path = "../../platform/mde-bus" }
 # is serde-only, so this adds no heavy mesh graph. Mirrors `mde-panel-egui`'s
 # reuse of the same types crate from the desktop tier (§6 glue, not a re-impl).
 mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
+# REUSE (§6, TERM-15): send-selection-to-Chat rides the NOTIFY-CHAT
+# `action/chat/send` verb carrying a real `mde_chat::MessageKind::Text` — the same
+# typed message-kind `mde-files-egui::chat_bridge` posts, not a hand-rolled shape.
+# A serde-only service crate, so it adds no heavy mesh graph.
+mde-chat = { path = "../../services/mde-chat" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Terminal output chunks + keystroke input ride the wire base64-encoded (the
