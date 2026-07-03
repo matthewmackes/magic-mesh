@@ -48,6 +48,7 @@ use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
 
 use mde_files_egui::{files_panel, FileBrowser};
+use mde_media_egui::{media_header, media_panel, media_pump, real_media, MediaSurface};
 use mde_music_egui::{music_header, music_panel, music_pump, MusicApp};
 use mde_voice_egui::{voice_header, voice_panel, voice_pump, VoiceApp};
 
@@ -120,6 +121,12 @@ struct Shell {
     /// The Music surface, owned + built once (its worker thread wakes the shell's
     /// egui context on every update). Rendered via `mde_music_egui::music_panel`.
     music: MusicApp,
+    /// The Media surface (MEDIA-18) — the production `MediaController` over the real
+    /// `mde_media_core` backend (Player / Library / Playlist), built once by
+    /// `mde_media_egui::real_media()`. Driven per-frame (pump + header + panel) the
+    /// same way Music/Files/Voice are, so the whole media player (Sources / Library /
+    /// Player / Queue) is reachable as an in-shell surface — no demo data (§7).
+    media: MediaSurface,
     /// The Files surface model, owned + built once over the production backend.
     /// Rendered via `mde_files_egui::files_panel`.
     files: FileBrowser,
@@ -209,6 +216,7 @@ impl Shell {
             services: services_flow::ServicesFlowState::default(),
             chrome: chrome::ChromeState::default(),
             music: MusicApp::new_with_ctx(ctx),
+            media: real_media(),
             files: mde_files_egui::real_browser(),
             voice: VoiceApp::new_with_ctx(ctx),
             vdi: vdi::VdiState::default(),
@@ -360,6 +368,25 @@ impl Shell {
                     ui.separator();
                     music_panel(ui, music);
                 });
+            }
+            Surface::Media => {
+                // The full media player (MEDIA-18) over the real `mde_media_core`
+                // backend — Sources / Library / Player / Queue. Mounted exactly like
+                // Music/Voice: drive its per-frame pump, then its header + central
+                // panel, scoped under its own `push_id` so its egui ids can't collide
+                // in the shell's one `Context`.
+                media_pump(&mut self.media);
+                let media = &mut self.media;
+                ui.push_id("shell-media", |ui| {
+                    media_header(ui, media);
+                    ui.separator();
+                    media_panel(ui, media);
+                });
+                // Keep the frame loop ticking while playing so the core's live clock
+                // advances (the standalone MediaApp requests the same in its update).
+                if self.media.is_playing() {
+                    ui.ctx().request_repaint();
+                }
             }
             Surface::Files => {
                 let files = &mut self.files;
@@ -642,7 +669,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dock, files_panel, Nav, Plane, Surface};
+    use super::{dock, files_panel, media_header, media_panel, real_media, Nav, Plane, Surface};
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
 
@@ -706,6 +733,44 @@ mod tests {
         assert!(
             !prims.is_empty(),
             "the mounted surface produced no draw primitives"
+        );
+    }
+
+    /// The Media surface (MEDIA-18) mounts through the same `body` path — the dock
+    /// rail plus the media header + `media_panel` scoped under `push_id` — over the
+    /// **real** `mde_media_core` backend (`real_media()`, no demo data; with no media
+    /// indexed it shows the honest first-run Sources view, still a full paint path).
+    /// Tessellating it on the CPU proves the whole media player is runtime-reachable
+    /// as an in-shell surface and actually draws — the media analogue of
+    /// [`shell_mounts_and_renders_a_surface`]. This is the RESCUE the unit is: before
+    /// it, `mde-media-egui` was mounted nowhere.
+    #[test]
+    fn shell_mounts_and_renders_the_media_surface() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut media = real_media();
+        let mut active = Surface::Media;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::SidePanel::left("shell-dock")
+                    .resizable(false)
+                    .exact_width(Style::SP_XL * 4.0)
+                    .show_inside(ui, |ui| dock::rail(ui, &mut active));
+                ui.push_id("shell-media", |ui| {
+                    media_header(ui, &mut media);
+                    ui.separator();
+                    media_panel(ui, &mut media);
+                });
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the mounted media surface produced no draw primitives"
         );
     }
 }

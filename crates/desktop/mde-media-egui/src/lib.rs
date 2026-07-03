@@ -81,6 +81,32 @@ pub(crate) fn build_engine() -> Engine {
     mde_media_core::mpv::MpvEngine::new().expect("mpv engine init requires system libmpv")
 }
 
+/// The production media surface the E12 shell embeds.
+///
+/// A [`MediaController`] over the default [`Engine`] (airgap-safe `FakeMpv`, or the
+/// real mpv engine under `--features mpv`) — the media analogue of `mde-files-egui`'s
+/// `FileBrowser`: the render-agnostic surface state the shell holds directly and
+/// drives with [`media_pump`] / [`media_header`] / [`media_panel`], the exact same
+/// seam the standalone [`MediaApp`] renders into its own window.
+pub type MediaSurface = MediaController<Engine>;
+
+/// Build the production [`MediaSurface`] over the default [`Engine`].
+///
+/// The one construction path for a live media surface, shared by the standalone
+/// [`MediaApp`] and the E12 shell (`mde-shell-egui`, MEDIA-18), which owns the
+/// controller directly and mounts it with [`media_panel`]. Mirrors `mde-files-egui`'s
+/// `real_browser()` (the shell doesn't have to know how to wire the core
+/// `Player`/`Engine`).
+///
+/// It enables roaming playback by default (MEDIA-16): a seat with no provisioned mesh
+/// workgroup root is a silent honest no-op (never a fabricated resume, §7).
+#[must_use]
+pub fn real_media() -> MediaSurface {
+    let mut controller = MediaController::new(mde_media_core::Player::new(build_engine()));
+    controller.enable_roaming_default();
+    controller
+}
+
 /// Stand the media surface up as an `eframe` client on the shared harness. Blocks
 /// until the window closes.
 ///

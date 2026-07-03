@@ -36,6 +36,10 @@ pub(crate) enum Surface {
     Instances,
     /// The embedded Music surface (`mde-music-egui`).
     Music,
+    /// The embedded Media surface (`mde-media-egui`) — the full media player
+    /// (Sources / Library / Player / Queue) over the real `mde_media_core`
+    /// backend (MEDIA-18).
+    Media,
     /// The embedded Files surface (`mde-files-egui`).
     Files,
     /// The embedded Voice / SIP surface (`mde-voice-egui`).
@@ -61,16 +65,22 @@ pub(crate) enum Surface {
     Storage,
 }
 
+// This nav enum spells its variants `Surface::Music` rather than `Self::Music` on
+// purpose: the explicit type keeps the `ALL` table, the labels, and the hints
+// scannable side by side (a launcher reads clearer than a wall of `Self::`). Opt the
+// block out of `clippy::use_self` rather than thread `Self::` through every arm.
+#[allow(clippy::use_self)]
 impl Surface {
     /// The dock entries in nav order — the Workbench (mesh-control home) first,
     /// then the local VM Instances broker + the brokered Desktop, then the three
     /// app surfaces, then the unified Chat surface (the ONE notification
     /// interface), and finally this seat's host-controls System + Storage surfaces.
-    pub(crate) const ALL: [Surface; 10] = [
+    pub(crate) const ALL: [Surface; 11] = [
         Surface::Workbench,
         Surface::Instances,
         Surface::Desktop,
         Surface::Music,
+        Surface::Media,
         Surface::Files,
         Surface::Voice,
         Surface::Browser,
@@ -86,6 +96,7 @@ impl Surface {
             Surface::Instances => "Instances",
             Surface::Desktop => "Desktop",
             Surface::Music => "Music",
+            Surface::Media => "Media",
             Surface::Files => "Files",
             Surface::Voice => "Voice",
             Surface::Browser => "Browser",
@@ -109,6 +120,9 @@ impl Surface {
                 "Pick a discovered desktop (mesh peers, LAN, local VMs) and view it in-shell."
             }
             Surface::Music => "Play the mesh music library (Subsonic / Airsonic).",
+            Surface::Media => {
+                "Play local, Jellyfin & mesh media — Sources, Library, Player, Queue."
+            }
             Surface::Files => "Browse local + peer folders and Send-To across the mesh.",
             Surface::Voice => "Place and receive mesh voice calls (SIP).",
             Surface::Browser => {
@@ -161,18 +175,19 @@ mod tests {
 
     #[test]
     fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
-        // Ten entries: Workbench first, two VM surfaces (Instances / Desktop),
-        // the app surfaces (Music / Files / Voice / Browser — the sandboxed Servo
-        // browser, BOOKMARKS-6), the unified Chat surface (the ONE notification
-        // interface — the standalone Notifications + Clipboard surfaces are retired,
-        // NOTIFY-CHAT-6), the host-controls System surface, and the Storage surface
-        // (GParted-authentic disk mgmt, E12-21).
-        assert_eq!(Surface::ALL.len(), 10);
+        // Eleven entries: Workbench first, two VM surfaces (Instances / Desktop),
+        // the app surfaces (Music / Media — the full media player, MEDIA-18 / Files /
+        // Voice / Browser — the sandboxed Servo browser, BOOKMARKS-6), the unified
+        // Chat surface (the ONE notification interface — the standalone Notifications
+        // + Clipboard surfaces are retired, NOTIFY-CHAT-6), the host-controls System
+        // surface, and the Storage surface (GParted-authentic disk mgmt, E12-21).
+        assert_eq!(Surface::ALL.len(), 11);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
             Surface::Instances,
             Surface::Desktop,
             Surface::Music,
+            Surface::Media,
             Surface::Files,
             Surface::Voice,
             Surface::Browser,

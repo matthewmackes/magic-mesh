@@ -71,6 +71,12 @@ mde-cosmic-applet = { path = "../../platform/mde-cosmic-applet", default-feature
 mde-music-egui = { path = "../mde-music-egui" }
 mde-files-egui = { path = "../mde-files-egui" }
 mde-voice-egui = { path = "../mde-voice-egui" }
+# MEDIA-18 — the Surface::Media player, mounted exactly like Music/Files/Voice: the
+# shell holds its production `MediaSurface` (a `MediaController` over the default
+# engine, built by `real_media()`) and drives it per-frame (pump + header + panel)
+# over the real `mde_media_core` backend. Desktop-shell tier; the edge points
+# sideways-inward, sharing the one `mde-egui` toolkit resolution (§6).
+mde-media-egui = { path = "../mde-media-egui" }
 
 # E12-5a — the VDI Desktop surface. These two decoder crates turn a remote RDP /
 # VNC framebuffer into an egui `ColorImage` the shell uploads to a `TextureHandle`

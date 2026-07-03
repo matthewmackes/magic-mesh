@@ -30,7 +30,7 @@ use crate::model::{
     state_word, track_label, MediaController, MediaTab, TransportAction, EBU_R128_DEFAULT,
     EQ_GAIN_DB_LIMIT,
 };
-use crate::{build_engine, Engine};
+use crate::Engine;
 
 /// The alpha/darken factor applied to [`Style::BG`] for the translucent dark media OSD
 /// scrim drawn over the video (design Q34). Derived from the palette token — the same
@@ -79,13 +79,11 @@ impl MediaApp {
     }
 
     fn with_engine() -> Self {
-        let mut controller = MediaController::new(mde_media_core::Player::new(build_engine()));
-        // MEDIA-16: pick up a roaming playback session — resume where another seat
-        // left off + take the single owned lease. Best-effort: a seat with no mesh
-        // workgroup root is a silent honest no-op (never a fabricated resume).
-        controller.enable_roaming_default();
+        // The one production construction path — the same `real_media()` seam the E12
+        // shell holds directly (MEDIA-18). It wires the default engine + enables
+        // roaming playback (MEDIA-16: a silent no-op with no mesh workgroup root).
         Self {
-            controller,
+            controller: crate::real_media(),
             applied_fullscreen: false,
             roam_poll_frames: 0,
         }
