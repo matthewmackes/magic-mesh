@@ -263,12 +263,12 @@ impl Surface {
 /// `main.rs` mounts the bottom panel at exactly this height. (`pub`, not
 /// `pub(crate)`, is the `clippy::redundant_pub_crate` form for a crate-visible item
 /// in a private module — this is the one dock symbol `main.rs` reads.)
-pub const TASKBAR_H: f32 = Style::SP_XL + Style::SP_M;
+pub const TASKBAR_H: f32 = Style::SP_XL + Style::SP_L;
 
 /// The fixed width of one glyph cell — room for the ~24px glyph plus its tiny
 /// always-on caption beneath (design lock #5/#6). Two base units (`SP_XL * 2`).
 /// Private: only the bar's own layout + tests read it.
-const CELL_W: f32 = Style::SP_XL * 2.0;
+const CELL_W: f32 = Style::SP_XL * 2.5;
 
 /// The glyph edge in logical points — the ~24px brand icon that leads each cell
 /// (design lock #6). Rasterized crisp at the physical pixel size by `icon_texture`.
@@ -293,9 +293,9 @@ pub(crate) fn taskbar(ui: &mut egui::Ui, active: &mut Surface) {
         .hline(ui.max_rect().x_range(), ui.max_rect().top(), hairline);
 
     ui.horizontal(|ui| {
-        // A seamless, edge-to-edge bar (design lock #8): no inter-cell gaps — each
-        // cell carries its own internal padding around the centred glyph.
-        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+        // Cells breathe with a small horizontal gap (un-cramp, operator 2026-07-03) —
+        // each cell still carries its own internal padding around the centred glyph.
+        ui.spacing_mut().item_spacing = egui::vec2(Style::SP_XS, 0.0);
 
         // NAVBAR-2 — mesh-control, a thin divider, then apps (both left-packed).
         render_group(ui, Group::MeshControl, active);
@@ -307,7 +307,7 @@ pub(crate) fn taskbar(ui: &mut egui::Ui, active: &mut Surface) {
         // packs System · Storage · About against the right edge (About furthest
         // right), leaving room on the right for the status-tray fold-in (NAVBAR-4).
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            ui.spacing_mut().item_spacing = egui::vec2(Style::SP_XS, 0.0);
             for surface in Surface::ALL
                 .iter()
                 .rev()
