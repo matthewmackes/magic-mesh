@@ -1,0 +1,48 @@
+[package]
+name        = "mde-vdi-spice"
+description = "MCNF E12 'Quasar' VDI — render a remote SPICE desktop into an egui texture (Spice, design lock CHOOSER-5). The pure-Rust `spice-client` stack drives the SPICE wire protocol (main/display/inputs channels, image decode); this crate turns each decoded display surface into an egui ColorImage and forwards egui input as SPICE key/pointer events. NO external viewer — the shell uploads the ColorImage to a TextureHandle, exactly like mde-vdi-rdp/-vnc. The egui-facing decode + input surface is `spice-client`-free and fully unit-tested without a server; the live SPICE transport (async connect over Nebula) is the integration-gated layer, proven headless against a loopback MockSpiceServer and env-gated against a real KVM SPICE console."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_vdi_spice"
+path = "src/lib.rs"
+
+[dependencies]
+# egui comes via the harness so this VDI backend resolves to the ONE
+# harness-pinned egui (no cross-surface version skew, §4). We use only the egui
+# types (ColorImage / Event / Key / ...).
+mde-egui = { path = "../../shared/mde-egui" }
+
+# Structured logs in the workspace JSON-line format.
+tracing = "0.1"
+
+# The pure-Rust SPICE client (arsfeld/quickemu-manager). SPICE-native, airgap
+# fetched + built --locked on the farm (CHOOSER-5 airgap-verify: a real pure-Rust
+# Spice stack IS obtainable, so this is a first-class Spice client, NOT the
+# honest VNC-compat fallback the design doc allowed as a floor). Default features
+# only: the optional `backend-gtk4` (gtk4/gstreamer C libs) stays OFF — those are
+# not airgap-present and the shell owns rendering (egui), not the crate. We use
+# the native `SpiceClient` + `channels::DisplaySurface`/`InputEvent` types + the
+# `test-utils` MockSpiceServer (dev only).
+spice-client = { version = "0.2", default-features = false }
+
+# The live SPICE transport drives `spice-client`'s async client. It pulls tokio
+# transitively already (a mandatory native dep of `spice-client`); we take a
+# direct handle on it for the blocking facade the sync egui shell drives the
+# connect loop through (a small current-thread runtime, mirroring mde-vdi-rdp's
+# connect layer).
+tokio = { version = "1", features = ["rt", "net", "io-util", "time"] }
+
+[dev-dependencies]
+# A small multi-thread runtime drives the headless connect-path proof
+# (`tests/loopback_spice.rs`) — the async transport against a closed loopback
+# port, so the connect seam is exercised end-to-end with no external server.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+[lints]
+workspace = true

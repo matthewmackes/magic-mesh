@@ -56,6 +56,7 @@ members = [
     "crates/desktop/mde-voice-egui",
     "crates/desktop/mde-vdi-rdp",
     "crates/desktop/mde-vdi-vnc",
+    "crates/desktop/mde-vdi-spice",
     "crates/desktop/mde-panel-egui",
     "crates/desktop/mde-seat",
     "crates/desktop/mde-term-egui",
