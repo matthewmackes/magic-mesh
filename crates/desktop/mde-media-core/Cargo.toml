@@ -14,11 +14,25 @@ path = "src/lib.rs"
 
 [dependencies]
 # The player-state record + track model serialize (MEDIA-16 session roaming
-# consumes them), and mpv's `track-list` property is parsed from JSON.
+# consumes them), and mpv's `track-list` property + the OpenSubtitles REST
+# response are parsed from JSON.
 serde      = { workspace = true }
 serde_json = { workspace = true }
 # Error enum, matching the mde-kvm / mackes-xcp convention.
 thiserror  = "1"
+
+# MEDIA-5 OpenSubtitles online fetch (egress) — the real HTTPS client is OPTIONAL
+# and OFF by default. reqwest (0.12, already in the workspace via mde-bus/mde-musicd)
+# with `rustls-tls` gives airgap-friendly HTTPS (no system OpenSSL). It is gated
+# behind the `opensubtitles` feature, so the default build/test/clippy compile only
+# the pure, fixture-tested hash + request-builder + response-parser (no network, no
+# reqwest). The live fetch is honest-gated to a host with egress + an API key,
+# exactly like the `mpv` real-clip smoke.
+[dependencies.reqwest]
+version          = "0.12"
+default-features = false
+features         = ["blocking", "rustls-tls"]
+optional         = true
 
 # The real engine — libmpv2 (mpv 2.x client API) — is OPTIONAL and OFF by
 # default. It (via libmpv2-sys/bindgen) links the system `libmpv` + its C
@@ -36,6 +50,10 @@ optional = true
 default = []
 # The real libmpv2 engine (`src/mpv.rs`) + the real-clip path of the smoke bin.
 mpv = ["dep:libmpv2"]
+# The live OpenSubtitles HTTPS client (`opensubtitles::OpenSubtitlesClient`). OFF
+# by default; the hash + request-builder + response-parser stay in the default
+# build. Enabling it is honest-gated on a host with egress + an API key.
+opensubtitles = ["dep:reqwest"]
 
 [lints]
 workspace = true

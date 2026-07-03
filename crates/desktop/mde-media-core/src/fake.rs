@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 
 use crate::audio::AudioConfig;
 use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track};
+use crate::subtitle::{SubtitleConfig, TrackSelection};
 use crate::video::VideoConfig;
 
 /// A scriptable fake engine — see the [module docs](self).
@@ -34,6 +35,8 @@ pub struct FakeMpv {
     fail_load: bool,
     fail_audio: bool,
     fail_video: bool,
+    fail_tracks: bool,
+    fail_subtitle: bool,
     /// Every `loadfile`/`seek`/`stop` issued, for assertion.
     commands: Vec<String>,
     /// The last `af` graph string applied via [`MediaEngine::apply_audio_config`].
@@ -44,6 +47,15 @@ pub struct FakeMpv {
     applied_vf: Option<String>,
     /// The last non-`vf` properties applied via [`MediaEngine::apply_video_config`].
     applied_video_properties: Vec<(String, String)>,
+    /// The last `aid`/`vid`/`sid` properties applied via
+    /// [`MediaEngine::apply_track_selection`].
+    applied_track_properties: Vec<(String, String)>,
+    /// The `sub-add` command argv lists applied via
+    /// [`MediaEngine::apply_subtitle_config`].
+    applied_sub_commands: Vec<Vec<String>>,
+    /// The last `sub-*` styling properties applied via
+    /// [`MediaEngine::apply_subtitle_config`].
+    applied_subtitle_properties: Vec<(String, String)>,
 }
 
 impl FakeMpv {
@@ -87,6 +99,22 @@ impl FakeMpv {
     #[must_use]
     pub const fn failing_video(mut self) -> Self {
         self.fail_video = true;
+        self
+    }
+
+    /// Make every `apply_track_selection` fail with a backend error (to exercise
+    /// the track-selection error path through the [`Player`](crate::Player)).
+    #[must_use]
+    pub const fn failing_tracks(mut self) -> Self {
+        self.fail_tracks = true;
+        self
+    }
+
+    /// Make every `apply_subtitle_config` fail with a backend error (to exercise
+    /// the subtitle-config error path through the [`Player`](crate::Player)).
+    #[must_use]
+    pub const fn failing_subtitle(mut self) -> Self {
+        self.fail_subtitle = true;
         self
     }
 
@@ -160,6 +188,27 @@ impl FakeMpv {
     #[must_use]
     pub fn applied_video_properties(&self) -> &[(String, String)] {
         &self.applied_video_properties
+    }
+
+    /// The last `aid`/`vid`/`sid` properties applied via
+    /// [`apply_track_selection`](MediaEngine::apply_track_selection).
+    #[must_use]
+    pub fn applied_track_properties(&self) -> &[(String, String)] {
+        &self.applied_track_properties
+    }
+
+    /// The `sub-add` command argv lists applied via
+    /// [`apply_subtitle_config`](MediaEngine::apply_subtitle_config).
+    #[must_use]
+    pub fn applied_sub_commands(&self) -> &[Vec<String>] {
+        &self.applied_sub_commands
+    }
+
+    /// The last `sub-*` styling properties applied via
+    /// [`apply_subtitle_config`](MediaEngine::apply_subtitle_config).
+    #[must_use]
+    pub fn applied_subtitle_properties(&self) -> &[(String, String)] {
+        &self.applied_subtitle_properties
     }
 }
 
@@ -241,6 +290,25 @@ impl MediaEngine for FakeMpv {
         // hwdec/video-* properties without a real mpv (or a real GPU).
         self.applied_vf = Some(config.vf_graph());
         self.applied_video_properties = config.properties();
+        Ok(())
+    }
+
+    fn apply_track_selection(&mut self, selection: &TrackSelection) -> Result<(), EngineError> {
+        if self.fail_tracks {
+            return Err(EngineError::Backend("track selection rejected".to_owned()));
+        }
+        // Record the folded aid/vid/sid property set for assertion (no real mpv).
+        self.applied_track_properties = selection.properties();
+        Ok(())
+    }
+
+    fn apply_subtitle_config(&mut self, config: &SubtitleConfig) -> Result<(), EngineError> {
+        if self.fail_subtitle {
+            return Err(EngineError::Backend("subtitle config rejected".to_owned()));
+        }
+        // Record the folded sub-add commands + sub-* properties for assertion.
+        self.applied_sub_commands = config.commands();
+        self.applied_subtitle_properties = config.properties();
         Ok(())
     }
 }
@@ -359,5 +427,74 @@ mod tests {
             Err(EngineError::Backend(_))
         ));
         assert_eq!(e.applied_vf(), None);
+    }
+
+    #[test]
+    fn apply_track_selection_records_aid_vid_sid() {
+        use crate::subtitle::{TrackSelect, TrackSelection};
+
+        let mut e = FakeMpv::new();
+        assert!(e.applied_track_properties().is_empty());
+        let sel = TrackSelection {
+            audio: TrackSelect::Id(2),
+            video: TrackSelect::Auto,
+            subtitle: TrackSelect::Off,
+        };
+        e.apply_track_selection(&sel).expect("apply");
+        assert!(e
+            .applied_track_properties()
+            .contains(&("aid".to_owned(), "2".to_owned())));
+        assert!(e
+            .applied_track_properties()
+            .contains(&("sid".to_owned(), "no".to_owned())));
+    }
+
+    #[test]
+    fn failing_tracks_surfaces_backend_error() {
+        use crate::subtitle::TrackSelection;
+
+        let mut e = FakeMpv::new().failing_tracks();
+        assert!(matches!(
+            e.apply_track_selection(&TrackSelection::new()),
+            Err(EngineError::Backend(_))
+        ));
+        assert!(e.applied_track_properties().is_empty());
+    }
+
+    #[test]
+    fn apply_subtitle_config_records_commands_and_properties() {
+        use crate::subtitle::{ExternalSub, SubtitleConfig};
+
+        let mut e = FakeMpv::new();
+        assert!(e.applied_sub_commands().is_empty());
+        let cfg = SubtitleConfig {
+            external: vec![ExternalSub::new("/subs/x.srt")],
+            delay: 0.5,
+            ..SubtitleConfig::new()
+        };
+        e.apply_subtitle_config(&cfg).expect("apply");
+        assert_eq!(
+            e.applied_sub_commands(),
+            &[vec![
+                "sub-add".to_owned(),
+                "/subs/x.srt".to_owned(),
+                "select".to_owned()
+            ]]
+        );
+        assert!(e
+            .applied_subtitle_properties()
+            .contains(&("sub-delay".to_owned(), "0.5".to_owned())));
+    }
+
+    #[test]
+    fn failing_subtitle_surfaces_backend_error() {
+        use crate::subtitle::SubtitleConfig;
+
+        let mut e = FakeMpv::new().failing_subtitle();
+        assert!(matches!(
+            e.apply_subtitle_config(&SubtitleConfig::new()),
+            Err(EngineError::Backend(_))
+        ));
+        assert!(e.applied_sub_commands().is_empty());
     }
 }

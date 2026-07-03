@@ -14,8 +14,9 @@
 //! [`FakeMpv`]: mde_media_core::FakeMpv
 
 use mde_media_core::{
-    AspectRatio, AudioConfig, Crop, Deinterlace, EqBand, FakeMpv, HwDecode, LoudnessNorm, Player,
-    PlayerState, ReplayGainMode, Rotation, Track, TrackKind, VideoConfig, VideoFilter,
+    opensubtitles, AspectRatio, AudioConfig, Crop, Deinterlace, EqBand, ExternalSub, FakeMpv,
+    HwDecode, LoudnessNorm, Player, PlayerState, ReplayGainMode, Rotation, SubtitleConfig, Track,
+    TrackKind, TrackSelect, TrackSelection, VideoConfig, VideoFilter,
 };
 
 fn sample_tracks() -> Vec<Track> {
@@ -38,10 +39,31 @@ fn sample_tracks() -> Vec<Track> {
             default: true,
             selected: true,
         },
+        Track {
+            id: 2,
+            kind: TrackKind::Audio,
+            title: None,
+            lang: Some("jpn".into()),
+            codec: Some("aac".into()),
+            default: false,
+            selected: false,
+        },
+        Track {
+            id: 1,
+            kind: TrackKind::Subtitle,
+            title: None,
+            lang: Some("eng".into()),
+            codec: Some("ass".into()),
+            default: false,
+            selected: false,
+        },
     ]
 }
 
 /// Drive the fake-engine transport cycle, printing what the surface would render.
+// A linear, top-to-bottom smoke that walks every MEDIA-1/3/4/5 surface in one
+// pass; splitting it would only scatter the single narrative it prints.
+#[allow(clippy::too_many_lines)]
 fn run_fake_smoke() {
     let mut player = Player::new(
         FakeMpv::new()
@@ -98,6 +120,65 @@ fn run_fake_smoke() {
     println!("  video vf-graph: {}", player.video_config().vf_graph());
     println!("  video props:    {:?}", player.video_config().properties());
     println!("  engine applied: vf={:?}", player.engine().applied_vf());
+
+    // MEDIA-5: select the Japanese audio + English subtitle by language label,
+    // load an external .srt, and style/position/delay the subtitles — showing the
+    // folded aid/vid/sid + sub-add commands + sub-* properties the engine receives.
+    player
+        .set_track_selection(TrackSelection {
+            audio: TrackSelect::Auto,
+            video: TrackSelect::Auto,
+            subtitle: TrackSelect::Auto,
+        })
+        .expect("apply track selection");
+    let picked_audio = player
+        .select_track_by_language(TrackKind::Audio, "jpn")
+        .expect("select audio by language");
+    let picked_sub = player
+        .select_track_by_language(TrackKind::Subtitle, "eng")
+        .expect("select subtitle by language");
+    println!("  track pick: jpn audio={picked_audio} eng sub={picked_sub}");
+    println!("  track props: {:?}", player.track_selection().properties());
+    println!(
+        "  engine applied: aid/vid/sid={:?}",
+        player.engine().applied_track_properties()
+    );
+
+    let subtitles = SubtitleConfig {
+        external: vec![ExternalSub {
+            path: "/subs/big-buck-bunny.eng.srt".into(),
+            load: mde_media_core::SubLoad::Select,
+            title: Some("English (external)".into()),
+            lang: Some("eng".into()),
+        }],
+        pos: 95,
+        scale: 1.1,
+        delay: 0.25,
+        ..SubtitleConfig::new()
+    };
+    player
+        .set_subtitle_config(subtitles)
+        .expect("apply subtitle config");
+    println!(
+        "  sub commands: {:?}",
+        player.engine().applied_sub_commands()
+    );
+    println!(
+        "  sub props:    {:?}",
+        player.subtitle_config().properties()
+    );
+
+    // MEDIA-5: the OpenSubtitles movie hash + the query URL it drives (the online
+    // fetch itself is honest-gated to a host with egress + an API key). Hash a
+    // synthetic 128 KiB clip in memory so the smoke needs no real file.
+    let clip = vec![0u8; 128 * 1024];
+    let mut cursor = std::io::Cursor::new(clip);
+    let hash = opensubtitles::hash_reader(&mut cursor).expect("hash");
+    println!(
+        "  opensubtitles: hash={} url={}",
+        opensubtitles::format_hash(hash),
+        opensubtitles::search_url(hash)
+    );
 
     player.engine_mut().advance(30.0);
     player.pump();

@@ -19,7 +19,8 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 
 use crate::audio::AudioConfig;
-use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track};
+use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
+use crate::subtitle::{track_by_language, SubtitleConfig, TrackSelect, TrackSelection};
 use crate::video::VideoConfig;
 
 /// The authoritative playback state.
@@ -120,6 +121,14 @@ pub struct Player<E: MediaEngine> {
     /// [`set_video_config`](Player::set_video_config); mpv keeps these hwdec/vf/
     /// `video-*`/deinterlace properties across loads, so it is apply-on-change.
     video: VideoConfig,
+    /// The active audio/video/subtitle track selection (MEDIA-5). Set via
+    /// [`set_track_selection`](Player::set_track_selection); the `aid`/`vid`/`sid`
+    /// ids are per-file, so a fresh `load` resets it to [`TrackSelection::new`].
+    tracks_selection: TrackSelection,
+    /// The applied subtitle config (MEDIA-5). Set via
+    /// [`set_subtitle_config`](Player::set_subtitle_config); the `sub-*` styling
+    /// persists across loads but the loaded external files are per-session.
+    subtitle: SubtitleConfig,
     events: VecDeque<PlayerEvent>,
 }
 
@@ -137,6 +146,8 @@ impl<E: MediaEngine> Player<E> {
             tracks: Vec::new(),
             audio: AudioConfig::new(),
             video: VideoConfig::new(),
+            tracks_selection: TrackSelection::new(),
+            subtitle: SubtitleConfig::new(),
             events: VecDeque::new(),
         }
     }
@@ -185,6 +196,18 @@ impl<E: MediaEngine> Player<E> {
         &self.video
     }
 
+    /// The active audio/video/subtitle track selection (MEDIA-5).
+    #[must_use]
+    pub const fn track_selection(&self) -> &TrackSelection {
+        &self.tracks_selection
+    }
+
+    /// The applied subtitle config (MEDIA-5).
+    #[must_use]
+    pub const fn subtitle_config(&self) -> &SubtitleConfig {
+        &self.subtitle
+    }
+
     /// Borrow the underlying engine (tests drive [`FakeMpv`](crate::FakeMpv)
     /// through this).
     #[must_use]
@@ -217,6 +240,9 @@ impl<E: MediaEngine> Player<E> {
         if !self.tracks.is_empty() {
             self.tracks.clear();
         }
+        // The `aid`/`vid`/`sid` ids are per-file — a new title enumerates fresh
+        // tracks, so the selection returns to mpv's automatic choice.
+        self.tracks_selection = TrackSelection::new();
         self.set_state(PlayerState::Loading);
         Ok(())
     }
@@ -392,6 +418,68 @@ impl<E: MediaEngine> Player<E> {
     pub fn set_video_config(&mut self, config: VideoConfig) -> Result<(), PlayerError> {
         self.engine.apply_video_config(&config)?;
         self.video = config;
+        Ok(())
+    }
+
+    // ── subtitles + multi-track (MEDIA-5) ────────────────────────────────────
+
+    /// Apply a [`TrackSelection`] — the `aid`/`vid`/`sid` ids selecting one
+    /// enumerated [`Track`] per kind — and record it on success.
+    ///
+    /// Valid in any state; the selection is left unchanged if the engine rejects
+    /// it. The ids reference the current [`tracks`](Self::tracks) (MEDIA-1), so a
+    /// selection is meaningful only once media is loaded.
+    ///
+    /// # Errors
+    /// Returns [`PlayerError::Engine`] if the engine rejects a property set; the
+    /// stored selection is then untouched.
+    pub fn set_track_selection(&mut self, selection: TrackSelection) -> Result<(), PlayerError> {
+        self.engine.apply_track_selection(&selection)?;
+        self.tracks_selection = selection;
+        Ok(())
+    }
+
+    /// Select the track of `kind` whose language label matches `lang` (via
+    /// [`track_by_language`] over the loaded [`tracks`](Self::tracks)), applying
+    /// the updated [`TrackSelection`]. Returns `true` when a matching track was
+    /// found + selected, `false` when none matched (the selection is left
+    /// unchanged) — the "select by language label" acceptance, tied to the real
+    /// enumerated tracks.
+    ///
+    /// # Errors
+    /// Returns [`PlayerError::Engine`] if the engine rejects the property set.
+    pub fn select_track_by_language(
+        &mut self,
+        kind: TrackKind,
+        lang: &str,
+    ) -> Result<bool, PlayerError> {
+        let Some(id) = track_by_language(&self.tracks, kind, lang) else {
+            return Ok(false);
+        };
+        let mut selection = self.tracks_selection.clone();
+        match kind {
+            TrackKind::Audio => selection.audio = TrackSelect::Id(id),
+            TrackKind::Video => selection.video = TrackSelect::Id(id),
+            TrackKind::Subtitle => selection.subtitle = TrackSelect::Id(id),
+        }
+        self.set_track_selection(selection)?;
+        Ok(true)
+    }
+
+    /// Apply a [`SubtitleConfig`] — load its external `.srt`/`.ass` files
+    /// (`sub-add`) and set the `sub-*` styling/position/delay properties — and
+    /// record it on success.
+    ///
+    /// Valid in any state; the config is left unchanged if the engine rejects it.
+    /// mpv rejects `sub-add` with nothing loaded, so loading external subtitles is
+    /// meaningful only once media is open.
+    ///
+    /// # Errors
+    /// Returns [`PlayerError::Engine`] if the engine rejects a command or property
+    /// set; the stored config is then untouched.
+    pub fn set_subtitle_config(&mut self, config: SubtitleConfig) -> Result<(), PlayerError> {
+        self.engine.apply_subtitle_config(&config)?;
+        self.subtitle = config;
         Ok(())
     }
 
@@ -909,5 +997,134 @@ mod tests {
         assert!(matches!(err, PlayerError::Engine(EngineError::Backend(_))));
         // Rejected → the stored config is unchanged (still the default).
         assert_eq!(p.video_config(), &before);
+    }
+
+    // ── subtitles + multi-track (MEDIA-5) ────────────────────────────────────
+
+    #[test]
+    fn default_track_selection_and_subtitle_config_are_auto() {
+        let p = player();
+        assert_eq!(p.track_selection(), &TrackSelection::new());
+        assert_eq!(p.subtitle_config(), &SubtitleConfig::new());
+    }
+
+    #[test]
+    fn set_track_selection_applies_fold_and_stores_it() {
+        let mut p = player();
+        p.load("x").expect("load");
+        p.pump();
+
+        let sel = TrackSelection {
+            audio: TrackSelect::Id(1),
+            video: TrackSelect::Id(1),
+            subtitle: TrackSelect::Id(1),
+        };
+        p.set_track_selection(sel.clone()).expect("apply selection");
+        assert_eq!(p.engine().applied_track_properties(), sel.properties());
+        assert_eq!(p.track_selection(), &sel);
+    }
+
+    #[test]
+    fn select_track_by_language_selects_enumerated_track() {
+        // sample_tracks() carries an eng audio (id 1) + an eng subtitle (id 1).
+        let mut p = player();
+        p.load("x").expect("load");
+        p.pump();
+
+        let found = p
+            .select_track_by_language(TrackKind::Subtitle, "eng")
+            .expect("select");
+        assert!(found, "the eng subtitle track exists");
+        assert_eq!(p.track_selection().subtitle, TrackSelect::Id(1));
+        // The fold reached the engine.
+        assert!(p
+            .engine()
+            .applied_track_properties()
+            .contains(&("sid".to_owned(), "1".to_owned())));
+
+        // A language with no track leaves the selection unchanged, no error.
+        let before = p.track_selection().clone();
+        let missing = p
+            .select_track_by_language(TrackKind::Audio, "fra")
+            .expect("no-match is not an error");
+        assert!(!missing);
+        assert_eq!(p.track_selection(), &before);
+    }
+
+    #[test]
+    fn set_subtitle_config_applies_commands_and_properties() {
+        use crate::subtitle::{AssOverride, ExternalSub};
+
+        let mut p = player();
+        p.load("x").expect("load");
+        p.pump();
+
+        let cfg = SubtitleConfig {
+            external: vec![ExternalSub::new("/subs/movie.eng.srt")],
+            ass_override: AssOverride::Force,
+            pos: 95,
+            delay: 0.5,
+            ..SubtitleConfig::new()
+        };
+        p.set_subtitle_config(cfg.clone())
+            .expect("apply subtitle config");
+
+        assert_eq!(p.engine().applied_sub_commands(), cfg.commands().as_slice());
+        assert_eq!(
+            p.engine().applied_subtitle_properties(),
+            cfg.properties().as_slice()
+        );
+        assert!(p
+            .engine()
+            .applied_sub_commands()
+            .iter()
+            .any(|argv| argv.contains(&"/subs/movie.eng.srt".to_owned())));
+        assert_eq!(p.subtitle_config(), &cfg);
+    }
+
+    #[test]
+    fn set_subtitle_config_error_leaves_stored_config_untouched() {
+        use crate::subtitle::{ExternalSub, SubtitleConfig};
+
+        let mut p = Player::new(FakeMpv::new().failing_subtitle());
+        let before = p.subtitle_config().clone();
+        let err = p
+            .set_subtitle_config(SubtitleConfig {
+                external: vec![ExternalSub::new("x.srt")],
+                ..SubtitleConfig::new()
+            })
+            .expect_err("engine rejects subtitle config");
+        assert!(matches!(err, PlayerError::Engine(EngineError::Backend(_))));
+        assert_eq!(p.subtitle_config(), &before);
+    }
+
+    #[test]
+    fn set_track_selection_error_leaves_stored_selection_untouched() {
+        let mut p = Player::new(FakeMpv::new().failing_tracks());
+        let before = p.track_selection().clone();
+        let err = p
+            .set_track_selection(TrackSelection {
+                audio: TrackSelect::Id(2),
+                ..TrackSelection::new()
+            })
+            .expect_err("engine rejects track selection");
+        assert!(matches!(err, PlayerError::Engine(EngineError::Backend(_))));
+        assert_eq!(p.track_selection(), &before);
+    }
+
+    #[test]
+    fn load_resets_track_selection_to_auto() {
+        let mut p = player();
+        p.load("first").expect("load");
+        p.pump();
+        p.set_track_selection(TrackSelection {
+            audio: TrackSelect::Id(2),
+            ..TrackSelection::new()
+        })
+        .expect("select");
+        assert_eq!(p.track_selection().audio, TrackSelect::Id(2));
+        // A new title enumerates fresh tracks → selection returns to auto.
+        p.load("second").expect("reload");
+        assert_eq!(p.track_selection(), &TrackSelection::new());
     }
 }

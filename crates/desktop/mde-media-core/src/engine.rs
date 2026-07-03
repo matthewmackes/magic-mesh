@@ -14,6 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::audio::AudioConfig;
+use crate::subtitle::{SubtitleConfig, TrackSelection};
 use crate::video::VideoConfig;
 
 /// A failure surfaced by a [`MediaEngine`].
@@ -132,6 +133,8 @@ pub enum EngineSignal {
 /// | [`poll`]           | drain `wait_event`                    |
 /// | [`apply_audio_config`] | set `af` + `ao`/`replaygain`/… props |
 /// | [`apply_video_config`] | set `vf` + `hwdec`/`video-*`/… props |
+/// | [`apply_track_selection`] | set `aid`/`vid`/`sid` props |
+/// | [`apply_subtitle_config`] | `sub-add` cmds + `sub-*` props |
 ///
 /// [`load_file`]: MediaEngine::load_file
 /// [`set_paused`]: MediaEngine::set_paused
@@ -143,6 +146,8 @@ pub enum EngineSignal {
 /// [`poll`]: MediaEngine::poll
 /// [`apply_audio_config`]: MediaEngine::apply_audio_config
 /// [`apply_video_config`]: MediaEngine::apply_video_config
+/// [`apply_track_selection`]: MediaEngine::apply_track_selection
+/// [`apply_subtitle_config`]: MediaEngine::apply_subtitle_config
 pub trait MediaEngine {
     /// Begin loading `url` (local path or stream URL). Playback readiness arrives
     /// later as an [`EngineSignal::FileLoaded`] from [`poll`](Self::poll).
@@ -209,4 +214,31 @@ pub trait MediaEngine {
     /// # Errors
     /// Returns [`EngineError::Backend`] if the backend rejects a property set.
     fn apply_video_config(&mut self, config: &VideoConfig) -> Result<(), EngineError>;
+
+    /// Apply a [`TrackSelection`] (MEDIA-5): set the `aid` / `vid` / `sid`
+    /// properties that pick one enumerated [`Track`] per kind. These are global
+    /// mpv properties (settable with or without media loaded — though the ids only
+    /// resolve once a `track-list` exists), so no [`EngineError::NotLoaded`] arises
+    /// here.
+    ///
+    /// §6: pure `aid`/`vid`/`sid` property glue — the selection *folds* to the mpv
+    /// strings; no demuxer is reimplemented.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Backend`] if the backend rejects a property set.
+    fn apply_track_selection(&mut self, selection: &TrackSelection) -> Result<(), EngineError>;
+
+    /// Apply a [`SubtitleConfig`] (MEDIA-5): run the `sub-add` commands that load
+    /// external subtitle files (`.srt`/`.ass`), then set the `sub-*`
+    /// visibility/ASS-override/position/scale/delay styling properties. Loading an
+    /// external subtitle before any media is open is rejected by mpv, so this may
+    /// surface [`EngineError::Backend`]; the styling properties are global.
+    ///
+    /// §6: pure `sub-add`/`sub-*` glue — the config *folds* to the mpv
+    /// commands/strings; no subtitle renderer is reimplemented.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Backend`] if the backend rejects a command or
+    /// property set.
+    fn apply_subtitle_config(&mut self, config: &SubtitleConfig) -> Result<(), EngineError>;
 }

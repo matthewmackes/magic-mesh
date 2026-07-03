@@ -43,6 +43,20 @@
 //! (unit-tested against [`FakeMpv`]); whether VA-API actually engages is a
 //! host-GPU property, honest-gated to the `mpv`-feature real-clip smoke.
 //!
+//! # Subtitles + multi-track (MEDIA-5)
+//!
+//! [`Player::set_track_selection`] applies a typed [`TrackSelection`] — the
+//! `aid`/`vid`/`sid` ids picking one enumerated [`Track`] per kind, with
+//! [`track_by_language`]/[`Player::select_track_by_language`] resolving a language
+//! label to a track. [`Player::set_subtitle_config`] applies a [`SubtitleConfig`] —
+//! external `.srt`/`.ass` [`ExternalSub`] loads (`sub-add`) plus the `sub-*`
+//! visibility / [`AssOverride`] styling / position / scale / delay. Both *fold* to
+//! mpv commands + properties (unit-tested against [`FakeMpv`]). The
+//! [`opensubtitles`] module fetches subtitles by movie hash — a pure, fixture-tested
+//! [`hash_file`](opensubtitles::hash_file) + [`parse_search_response`], with the one
+//! HTTPS egress behind the `opensubtitles` feature, honest-gated like the real-clip
+//! `mpv` path.
+//!
 //! ```
 //! use mde_media_core::{FakeMpv, Player, PlayerState};
 //!
@@ -62,7 +76,9 @@
 pub mod audio;
 pub mod engine;
 pub mod fake;
+pub mod opensubtitles;
 pub mod player;
+pub mod subtitle;
 pub mod video;
 
 #[cfg(feature = "mpv")]
@@ -73,5 +89,10 @@ pub use audio::{
 };
 pub use engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
 pub use fake::FakeMpv;
+pub use opensubtitles::{parse_search_response, request_headers, search_url, SubtitleSearchResult};
 pub use player::{Player, PlayerError, PlayerEvent, PlayerState};
+pub use subtitle::{
+    track_by_language, AssOverride, ExternalSub, SubLoad, SubtitleConfig, TrackSelect,
+    TrackSelection,
+};
 pub use video::{AspectRatio, Crop, Deinterlace, HwDecode, Rotation, VideoConfig, VideoFilter};

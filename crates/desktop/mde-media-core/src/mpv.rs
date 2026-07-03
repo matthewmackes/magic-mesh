@@ -17,6 +17,7 @@ use libmpv2::{mpv_end_file_reason, Mpv};
 
 use crate::audio::AudioConfig;
 use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
+use crate::subtitle::{SubtitleConfig, TrackSelection};
 use crate::video::VideoConfig;
 
 /// The real mpv-backed engine.
@@ -211,6 +212,34 @@ impl MediaEngine for MpvEngine {
             .map_err(backend)?;
         // hwdec (VA-API / software) / video-aspect-override / video-zoom /
         // video-pan-* / video-crop / video-rotate / deinterlace.
+        for (key, value) in config.properties() {
+            self.mpv
+                .set_property(key.as_str(), value.as_str())
+                .map_err(backend)?;
+        }
+        Ok(())
+    }
+
+    fn apply_track_selection(&mut self, selection: &TrackSelection) -> Result<(), EngineError> {
+        // aid / vid / sid — the active audio/video/subtitle track ids.
+        for (key, value) in selection.properties() {
+            self.mpv
+                .set_property(key.as_str(), value.as_str())
+                .map_err(backend)?;
+        }
+        Ok(())
+    }
+
+    fn apply_subtitle_config(&mut self, config: &SubtitleConfig) -> Result<(), EngineError> {
+        // Load the external subtitle files first (`sub-add <path> <flags> …`).
+        for argv in config.commands() {
+            let (name, rest) = argv
+                .split_first()
+                .expect("SubtitleConfig::commands() argv is never empty");
+            let args: Vec<&str> = rest.iter().map(String::as_str).collect();
+            self.mpv.command(name, &args).map_err(backend)?;
+        }
+        // sub-visibility / sub-ass-override / sub-pos / sub-scale / sub-delay.
         for (key, value) in config.properties() {
             self.mpv
                 .set_property(key.as_str(), value.as_str())
