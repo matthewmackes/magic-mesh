@@ -31,8 +31,18 @@
 //! `media-smoke`. Live decode on a real GPU seat rides the DRM overlay plane (MEDIA-2)
 //! and is honest-gated to a host with system libmpv, exactly like the core.
 //!
-//! Tier (§6): desktop-shell — it depends only on the harness and the media core (both
-//! inward edges), pulling in no mesh-substrate crate.
+//! # Jellyfin sources (MEDIA-10)
+//!
+//! The Sources plane wires in [`mde_jellyfin`]: a configured server browses its
+//! libraries through the typed client, and selecting a title negotiates a
+//! `PlaybackDecision` (direct-play / direct-stream / transcode) from the item's
+//! `MediaSources` + the player's `MpvCapabilities`, then drives the core
+//! [`Player`](mde_media_core::Player) through the negotiated URL and reports
+//! progress. The negotiation + report construction are unit-tested; the live
+//! browse / play / report legs are honest-gated to a real server.
+//!
+//! Tier (§6): desktop-shell — it depends only on the harness, the media core, and
+//! the Jellyfin client core (all inward edges), pulling in no mesh-substrate crate.
 
 #![allow(clippy::module_name_repetitions, clippy::must_use_candidate)]
 
@@ -43,7 +53,11 @@ mod app;
 use mde_egui::{eframe, run_client};
 
 pub use app::{media_header, media_panel, media_pump, pip_window, MediaApp};
-pub use model::{MediaController, MediaTab, SourceRow, TransportAction, UiState};
+pub use model::{
+    client_capabilities, jellyfin_item_title, stream_media_type, JellyfinSession,
+    JellyfinSourceRow, JellyfinState, MediaController, MediaTab, SourceRow, TransportAction,
+    UiState,
+};
 
 /// The engine the surface drives (the real mpv engine, under `--features mpv`).
 #[cfg(feature = "mpv")]

@@ -16,12 +16,13 @@ use mde_egui::egui::{
 };
 use mde_egui::{muted_note, status_dot, Style};
 
+use mde_jellyfin::{ClientInfo, ItemsQuery, JellyfinClient, ReqwestTransport};
 use mde_media_core::{MediaEngine, MediaKind, PlayerState, ScreenshotMode, SortKey, TrackKind};
 
 use crate::model::{
-    format_time, item_title, library_row_texts, now_playing_title, osd_should_show,
-    play_pause_label, progress_fraction, repeat_label, state_word, track_label, MediaController,
-    MediaTab, TransportAction,
+    format_time, item_title, jellyfin_item_title, library_row_texts, now_playing_title,
+    osd_should_show, play_pause_label, progress_fraction, repeat_label, state_word, track_label,
+    MediaController, MediaTab, TransportAction,
 };
 use crate::{build_engine, Engine};
 
@@ -226,8 +227,9 @@ fn status_line<E: MediaEngine>(ui: &mut egui::Ui, controller: &MediaController<E
 
 // ── Sources view ───────────────────────────────────────────────────────────────────
 
-/// The Sources view: the "index a folder" field, the indexed local roots, and an
-/// honest note about where mesh / Jellyfin sources land (MEDIA-9/14/15, not yet wired).
+/// The Sources view: the "index a folder" field, the indexed local roots, the
+/// configured Jellyfin servers (MEDIA-10 — browse + play), and an honest note
+/// about where mesh sources land (MEDIA-14/15, not yet wired).
 fn sources_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
     section_title(ui, "Sources");
 
@@ -250,17 +252,18 @@ fn sources_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
 
     ui.add_space(Style::SP_S);
 
-    let rows = controller.sources();
     let mut open_source: Option<String> = None;
-    if rows.is_empty() {
-        muted_note(
-            ui,
-            "No local sources yet — index a folder above to build the library.",
-        );
-    } else {
-        ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
+    ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            // ── local roots ──
+            let rows = controller.sources();
+            if rows.is_empty() {
+                muted_note(
+                    ui,
+                    "No local sources yet — index a folder above to build the library.",
+                );
+            } else {
                 for row in &rows {
                     let resp = ui.group(|ui| {
                         ui.set_min_width(ui.available_width());
@@ -288,19 +291,212 @@ fn sources_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
                     }
                     ui.add_space(Style::SP_XS);
                 }
-            });
-    }
+            }
 
-    ui.add_space(Style::SP_S);
-    muted_note(
-        ui,
-        "Mesh + Jellyfin sources appear here once discovered (MEDIA-9/14/15).",
-    );
+            // ── Jellyfin servers (MEDIA-10) ──
+            jellyfin_section(ui, controller);
 
-    // Clicking a source jumps to the Library filtered to that root's path.
+            ui.add_space(Style::SP_S);
+            muted_note(
+                ui,
+                "Mesh sources appear here once discovered (MEDIA-14/15).",
+            );
+        });
+
+    // Clicking a local source jumps to the Library filtered to that root's path.
     if let Some(path) = open_source {
         controller.set_search(path);
         controller.ui_mut().tab = MediaTab::Library;
+    }
+}
+
+/// The Jellyfin sub-section of the Sources view: add a server, list the configured
+/// servers (Connect browses their libraries), and list the browsed titles — a
+/// click negotiates a [`PlaybackDecision`](mde_jellyfin::PlaybackDecision) and
+/// drives the core Player (MEDIA-10). The live browse/play legs need a real server
+/// (honest-gated); the negotiation + report construction are tested in `model`.
+#[allow(clippy::too_many_lines)]
+fn jellyfin_section<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
+    ui.add_space(Style::SP_S);
+    ui.label(
+        RichText::new("Jellyfin servers")
+            .size(Style::SMALL)
+            .strong()
+            .color(Style::TEXT_DIM),
+    );
+    ui.add_space(Style::SP_XS);
+
+    // Add-a-server row (name + base URL).
+    let mut name = controller.ui().jellyfin_name_input.clone();
+    let mut url = controller.ui().jellyfin_url_input.clone();
+    let mut add = false;
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut name)
+                .hint_text("Name")
+                .desired_width(Style::SP_XL * 3.0),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut url)
+                .hint_text("https://jelly.mesh:8096")
+                .desired_width(Style::SP_XL * 5.0),
+        );
+        if ui.button("Add server").clicked() {
+            add = true;
+        }
+    });
+    controller.ui_mut().jellyfin_name_input = name;
+    controller.ui_mut().jellyfin_url_input = url;
+    if add {
+        add_jellyfin_from_inputs(controller);
+    }
+
+    // Configured servers.
+    let rows = controller.jellyfin_sources();
+    let mut connect_id: Option<String> = None;
+    let mut select_id: Option<String> = None;
+    if rows.is_empty() {
+        muted_note(
+            ui,
+            "No Jellyfin servers yet — add one above, then Connect to browse.",
+        );
+    } else {
+        for row in &rows {
+            ui.horizontal(|ui| {
+                status_dot(
+                    ui,
+                    if row.signed_in {
+                        Style::OK
+                    } else {
+                        Style::TEXT_DIM
+                    },
+                );
+                let color = if row.selected {
+                    Style::ACCENT
+                } else {
+                    Style::TEXT
+                };
+                let clicked = ui
+                    .label(RichText::new(&row.label).size(Style::BODY).color(color))
+                    .interact(Sense::click())
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked();
+                if clicked {
+                    select_id = Some(row.id.clone());
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Connect").clicked() {
+                        connect_id = Some(row.id.clone());
+                    }
+                });
+            });
+            muted_note(ui, &row.base_url);
+            ui.add_space(Style::SP_XS);
+        }
+    }
+    if let Some(id) = select_id {
+        controller.select_jellyfin_server(&id);
+    }
+    if let Some(id) = connect_id {
+        connect_jellyfin(controller, &id);
+    }
+
+    // Browsed titles — a click negotiates + plays through the core Player.
+    let items = controller.jellyfin_items().to_vec();
+    let mut play_index: Option<usize> = None;
+    if !items.is_empty() {
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new("Titles")
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+        for (index, item) in items.iter().enumerate() {
+            let clicked = ui
+                .label(
+                    RichText::new(jellyfin_item_title(item))
+                        .size(Style::BODY)
+                        .color(Style::TEXT),
+                )
+                .interact(Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .clicked();
+            if clicked {
+                play_index = Some(index);
+            }
+            ui.add_space(Style::SP_XS);
+        }
+    }
+    if let Some(index) = play_index {
+        if let Some(item) = controller.jellyfin_items().get(index).cloned() {
+            if controller.play_jellyfin_item(&item).is_ok() {
+                controller.ui_mut().tab = MediaTab::Player;
+            }
+        }
+    }
+}
+
+/// The client identity the surface presents to a Jellyfin server (the token is
+/// bound to the `DeviceId`).
+fn jellyfin_device() -> ClientInfo {
+    ClientInfo::new(
+        "mde-media",
+        "mde-media-egui",
+        "mde-media-egui-seat",
+        "12.0.0",
+    )
+}
+
+/// Add / update a Jellyfin server from the Sources input fields (no network).
+/// The base URL is its stable id; an empty URL is reported honestly.
+fn add_jellyfin_from_inputs<E: MediaEngine>(controller: &mut MediaController<E>) {
+    let url = controller.ui().jellyfin_url_input.trim().to_owned();
+    if url.is_empty() {
+        controller.ui_mut().status = Some("Enter a Jellyfin server URL.".to_owned());
+        return;
+    }
+    let name = controller.ui().jellyfin_name_input.trim().to_owned();
+    let label = if name.is_empty() { url.clone() } else { name };
+    controller.add_jellyfin_server(url.clone(), label, url.clone());
+    controller.select_jellyfin_server(&url);
+    controller.ui_mut().jellyfin_name_input.clear();
+    controller.ui_mut().jellyfin_url_input.clear();
+    controller.ui_mut().status = Some(format!("Added Jellyfin server {url}."));
+}
+
+/// Connect to a configured Jellyfin server: build a real [`ReqwestTransport`]
+/// client and browse its playable titles into the Sources list (hydrating
+/// `MediaSources` so a click can negotiate). A live server is honest-gated — the
+/// blocking fetch is deliberately simple; only the wire leg needs egress.
+fn connect_jellyfin<E: MediaEngine>(controller: &mut MediaController<E>, server_id: &str) {
+    let Some(server) = controller.jellyfin().server(server_id).cloned() else {
+        controller.ui_mut().status = Some("Unknown Jellyfin server.".to_owned());
+        return;
+    };
+    let transport = match ReqwestTransport::new() {
+        Ok(transport) => transport,
+        Err(e) => {
+            controller.ui_mut().status = Some(format!("Jellyfin transport error: {e}"));
+            return;
+        }
+    };
+    let mut client = JellyfinClient::new(server.base_url.clone(), jellyfin_device(), transport);
+    if let Some(auth) = &server.auth {
+        client = client.with_auth(auth.access_token.clone(), auth.user_id.clone());
+    }
+    // Browse the server's playable leaves, hydrating MediaSources for negotiation.
+    let query = ItemsQuery::default()
+        .recursive()
+        .include_item_types(["Movie", "Episode", "Audio"])
+        .sort_by(["SortName"])
+        .fields(["Overview", "Genres", "MediaSources"]);
+    controller.select_jellyfin_server(server_id);
+    match controller.browse_jellyfin(&client, &query) {
+        Ok(count) => {
+            controller.ui_mut().status =
+                Some(format!("Loaded {count} title(s) from {}.", server.name));
+        }
+        Err(message) => controller.ui_mut().status = Some(message),
     }
 }
 
@@ -986,5 +1182,42 @@ mod tests {
             render(&mut c, media_panel);
             assert_eq!(c.ui().tab, tab);
         }
+    }
+
+    /// A fixture transport serving one direct-playable Jellyfin movie — no network.
+    struct JellyStub;
+    impl mde_jellyfin::HttpTransport for JellyStub {
+        fn execute(
+            &self,
+            _request: &mde_jellyfin::HttpRequest,
+        ) -> Result<mde_jellyfin::HttpResponse, mde_jellyfin::TransportError> {
+            let body = r#"{"Items":[{"Id":"m1","Name":"Movie One","Type":"Movie",
+                "MediaSources":[{"Id":"s1","Container":"mkv","MediaStreams":[
+                {"Type":"Video","Codec":"h264","Index":0},
+                {"Type":"Audio","Codec":"aac","Index":1}]}]}],
+                "TotalRecordCount":1,"StartIndex":0}"#;
+            Ok(mde_jellyfin::HttpResponse {
+                status: 200,
+                body: body.as_bytes().to_vec(),
+            })
+        }
+    }
+
+    #[test]
+    fn sources_view_renders_jellyfin_servers_and_titles() {
+        let mut c = controller();
+        c.add_jellyfin_server("srv", "Home", "https://jelly.mesh:8096");
+        c.select_jellyfin_server("srv");
+        // A configured server (no titles yet) renders the server row + add fields.
+        render(&mut c, sources_view);
+        // Browse a title through a stub client, then the playable row tessellates.
+        let device = mde_jellyfin::ClientInfo::new("mde-media", "test", "dev", "12.0.0");
+        let client =
+            mde_jellyfin::JellyfinClient::new("https://jelly.mesh:8096", device, JellyStub)
+                .with_auth("T", "u");
+        c.browse_jellyfin(&client, &mde_jellyfin::ItemsQuery::default().recursive())
+            .expect("browse");
+        assert_eq!(c.jellyfin_items().len(), 1);
+        render(&mut c, sources_view);
     }
 }

@@ -70,6 +70,22 @@
 //! assert!(req.url.contains("/Users/user-abc/Items"));
 //! assert!(req.url.contains("IncludeItemTypes=Movie"));
 //! ```
+//!
+//! # Playback + sync (MEDIA-10)
+//!
+//! [`playback`] negotiates how to play a title: [`decide_method`] chooses
+//! direct-play / direct-stream / transcode from a [`ClientCapabilities`] set (the
+//! player's decode profile, built in the app from `mde-media-core`'s
+//! `MpvCapabilities`) and an item's [`MediaSourceInfo`], and
+//! [`build_playback_decision`] forms the stream URL — pure, fixture-tested folds.
+//! [`sync`] is the progress loop: [`PlaybackReport`] +
+//! [`build_report_start_request`] / [`build_report_progress_request`] /
+//! [`build_report_stopped_request`] (`/Sessions/Playing*`), cross-device resume
+//! via [`resume_position_secs`], and mark-played. Live-TV / DVR
+//! ([`JellyfinClient::live_tv_channels`] / [`live_tv_guide`](JellyfinClient::live_tv_guide)
+//! / [`recordings`](JellyfinClient::recordings)) + music playback ride the same
+//! client patterns; a real server round-trip is honest-gated, the builders + the
+//! negotiation are tested.
 
 // Pragmatic pedantic allows, matching the mde-media-core / mde-media-egui idiom:
 // the type names intentionally echo their module (`HttpTransport` in `net`), and
@@ -81,7 +97,9 @@ pub mod browse;
 pub mod client;
 pub mod models;
 pub mod net;
+pub mod playback;
 pub mod store;
+pub mod sync;
 
 pub use browse::{build_show_tree, group_by_type, SeasonNode, ShowTree};
 pub use client::{
@@ -89,9 +107,20 @@ pub use client::{
     JellyfinError, SortOrder,
 };
 pub use models::{
-    AuthenticationResult, BaseItemDto, ItemsResponse, PublicUser, QuickConnectState, UserData,
+    AuthenticationResult, BaseItemDto, ItemsResponse, MediaSourceInfo, MediaStream,
+    PlaybackInfoResponse, PublicUser, QuickConnectState, StreamKind, UserData,
 };
 pub use net::{
     HttpMethod, HttpRequest, HttpResponse, HttpTransport, ReqwestTransport, TransportError,
 };
+pub use playback::{
+    build_playback_decision, build_playback_info_request, decide_method, direct_play_url,
+    direct_stream_url, transcode_url, ClientCapabilities, PlaybackDecision, PlaybackMethod,
+    StreamMediaType,
+};
 pub use store::{ServerAuth, ServerConfig, ServerStore, StoreError};
+pub use sync::{
+    build_mark_played_request, build_mark_unplayed_request, build_report_progress_request,
+    build_report_start_request, build_report_stopped_request, resume_position_secs, secs_to_ticks,
+    ticks_to_secs, PlaybackReport, TICKS_PER_SECOND,
+};

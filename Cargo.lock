@@ -4154,6 +4154,7 @@ name = "mde-media-egui"
 version = "12.0.0"
 dependencies = [
  "mde-egui",
+ "mde-jellyfin",
  "mde-media-core",
 ]
 

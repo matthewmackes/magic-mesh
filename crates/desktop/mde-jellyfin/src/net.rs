@@ -5,16 +5,21 @@
 //! is the one egress point; tests implement the same trait over recorded bytes,
 //! so no request-builder or response-parser needs a live network to be tested.
 
-/// The HTTP method of a Jellyfin request. Jellyfin's browse + auth surface only
-/// needs `GET` (browse, Quick Connect poll) and `POST` (login, Quick Connect
-/// exchange).
+/// The HTTP method of a Jellyfin request.
+///
+/// The browse + auth + playback surface needs `GET` (browse, Quick Connect
+/// poll), `POST` (login, Quick Connect exchange, `PlaybackInfo`, the
+/// `/Sessions/Playing*` progress reports, mark-played), and `DELETE`
+/// (mark-unplayed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
     /// A read request (browse, Quick Connect initiate/poll).
     Get,
-    /// A write request with a JSON body (username/password + Quick Connect
-    /// exchange).
+    /// A write request with a JSON body (login, Quick Connect exchange,
+    /// `PlaybackInfo`, progress reports, mark-played).
     Post,
+    /// A delete request (mark-unplayed clears the played flag).
+    Delete,
 }
 
 /// A fully-formed HTTP request — the pure output of every request builder.
@@ -55,6 +60,17 @@ impl HttpRequest {
             url: url.into(),
             headers,
             body: Some(body),
+        }
+    }
+
+    /// A `DELETE` for `url` carrying `headers` (no body).
+    #[must_use]
+    pub fn delete(url: impl Into<String>, headers: Vec<(String, String)>) -> Self {
+        Self {
+            method: HttpMethod::Delete,
+            url: url.into(),
+            headers,
+            body: None,
         }
     }
 }
@@ -99,6 +115,16 @@ pub trait HttpTransport {
     fn execute(&self, request: &HttpRequest) -> Result<HttpResponse, TransportError>;
 }
 
+/// A boxed transport is a transport — so a caller that picks the transport at
+/// runtime (the `mde-media-egui` Sources plane: a real [`ReqwestTransport`] on a
+/// seat, a fixture transport in tests) can hold one monomorphic
+/// `JellyfinClient<Box<dyn HttpTransport>>`.
+impl<T: HttpTransport + ?Sized> HttpTransport for Box<T> {
+    fn execute(&self, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
+        (**self).execute(request)
+    }
+}
+
 /// The real egress transport: a single `reqwest::blocking` client over rustls.
 ///
 /// Airgap-safe to compile (rustls pulls no system OpenSSL); only exercising it
@@ -134,6 +160,7 @@ impl HttpTransport for ReqwestTransport {
         let mut builder = match request.method {
             HttpMethod::Get => self.http.get(&request.url),
             HttpMethod::Post => self.http.post(&request.url),
+            HttpMethod::Delete => self.http.delete(&request.url),
         };
         for (name, value) in &request.headers {
             builder = builder.header(name, value);
@@ -226,6 +253,31 @@ mod tests {
             body: vec![]
         }
         .is_success());
+    }
+
+    #[test]
+    fn delete_request_has_no_body() {
+        let req = HttpRequest::delete("https://jelly.mesh/x", vec![]);
+        assert_eq!(req.method, HttpMethod::Delete);
+        assert!(req.body.is_none());
+    }
+
+    #[test]
+    fn boxed_transport_forwards_to_inner() {
+        struct Echo(u16);
+        impl HttpTransport for Echo {
+            fn execute(&self, _request: &HttpRequest) -> Result<HttpResponse, TransportError> {
+                Ok(HttpResponse {
+                    status: self.0,
+                    body: b"{}".to_vec(),
+                })
+            }
+        }
+        let boxed: Box<dyn HttpTransport> = Box::new(Echo(204));
+        let resp = boxed
+            .execute(&HttpRequest::get("https://jelly.mesh/x", vec![]))
+            .expect("boxed transport forwards");
+        assert_eq!(resp.status, 204);
     }
 
     #[test]

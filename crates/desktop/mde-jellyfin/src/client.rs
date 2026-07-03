@@ -8,8 +8,13 @@
 
 use serde::de::DeserializeOwned;
 
-use crate::models::{AuthenticationResult, ItemsResponse, QuickConnectState};
+use crate::models::{AuthenticationResult, ItemsResponse, PlaybackInfoResponse, QuickConnectState};
 use crate::net::{encode_query_component, HttpRequest, HttpResponse, HttpTransport};
+use crate::playback::{build_playback_info_request, ClientCapabilities};
+use crate::sync::{
+    build_mark_played_request, build_mark_unplayed_request, build_report_progress_request,
+    build_report_start_request, build_report_stopped_request, PlaybackReport,
+};
 
 /// The calling app's identity, sent in Jellyfin's `Authorization` header on
 /// every request (Jellyfin binds the `AccessToken` to this device).
@@ -67,12 +72,16 @@ pub fn authorization_header(device: &ClientInfo, token: Option<&str>) -> String 
 }
 
 /// Trim exactly one trailing `/` from a base URL so path joins never double it.
-fn trim_base(base_url: &str) -> &str {
+pub(crate) fn trim_base(base_url: &str) -> &str {
     base_url.strip_suffix('/').unwrap_or(base_url)
 }
 
 /// The standard JSON headers for a request, with the `Authorization` line.
-fn json_headers(device: &ClientInfo, token: Option<&str>, post: bool) -> Vec<(String, String)> {
+pub(crate) fn json_headers(
+    device: &ClientInfo,
+    token: Option<&str>,
+    post: bool,
+) -> Vec<(String, String)> {
     let mut headers = vec![
         (
             "Authorization".to_string(),
@@ -88,7 +97,7 @@ fn json_headers(device: &ClientInfo, token: Option<&str>, post: bool) -> Vec<(St
 
 /// Render `pairs` (skipping empty values) as a `?k=v&…` suffix with each value
 /// percent-encoded. Returns an empty string when nothing is set.
-fn render_query(pairs: &[(&str, String)]) -> String {
+pub(crate) fn render_query(pairs: &[(&str, String)]) -> String {
     let parts: Vec<String> = pairs
         .iter()
         .filter(|(_, v)| !v.is_empty())
@@ -143,8 +152,18 @@ pub struct ItemsQuery {
     pub genre_ids: Vec<String>,
     /// A free-text search term.
     pub search_term: Option<String>,
-    /// Extra fields to hydrate (`"Overview"`, `"Genres"`, …).
+    /// Extra fields to hydrate (`"Overview"`, `"Genres"`, `"MediaSources"`, …).
     pub fields: Vec<String>,
+    /// Restrict to these media kinds (`"Video"`, `"Audio"`) — the cross-media
+    /// filter a mixed search narrows on.
+    pub media_types: Vec<String>,
+    /// Server-side state filters (`"IsPlayed"`, `"IsUnplayed"`, `"IsFavorite"`,
+    /// `"IsResumable"`).
+    pub filters: Vec<String>,
+    /// Restrict to these production years.
+    pub years: Vec<i32>,
+    /// Restrict to favorited (`Some(true)`) / non-favorited (`Some(false)`) items.
+    pub is_favorite: Option<bool>,
     /// Page offset.
     pub start_index: Option<i64>,
     /// Page size.
@@ -224,6 +243,45 @@ impl ItemsQuery {
         self
     }
 
+    /// Restrict to these media kinds (`"Video"`, `"Audio"`).
+    #[must_use]
+    pub fn media_types<I, S>(mut self, kinds: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.media_types = kinds.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Apply these server-side state filters (`"IsPlayed"`, `"IsUnplayed"`, …).
+    #[must_use]
+    pub fn filters<I, S>(mut self, filters: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.filters = filters.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Restrict to these production years.
+    #[must_use]
+    pub fn years<I>(mut self, years: I) -> Self
+    where
+        I: IntoIterator<Item = i32>,
+    {
+        self.years = years.into_iter().collect();
+        self
+    }
+
+    /// Restrict to favorited (`true`) / non-favorited (`false`) items.
+    #[must_use]
+    pub const fn is_favorite(mut self, favorite: bool) -> Self {
+        self.is_favorite = Some(favorite);
+        self
+    }
+
     /// Set the page offset + size.
     #[must_use]
     pub const fn page(mut self, start_index: i64, limit: i64) -> Self {
@@ -255,6 +313,20 @@ impl ItemsQuery {
             ("GenreIds", self.genre_ids.join(",")),
             ("SearchTerm", self.search_term.clone().unwrap_or_default()),
             ("Fields", self.fields.join(",")),
+            ("MediaTypes", self.media_types.join(",")),
+            ("Filters", self.filters.join(",")),
+            (
+                "Years",
+                self.years
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            (
+                "IsFavorite",
+                self.is_favorite.map(|f| f.to_string()).unwrap_or_default(),
+            ),
             (
                 "StartIndex",
                 self.start_index.map(|n| n.to_string()).unwrap_or_default(),
@@ -377,6 +449,57 @@ fn build_genres_request(
             ("userId", user_id.to_string()),
             ("parentId", parent_id.unwrap_or_default().to_string()),
         ]),
+    );
+    HttpRequest::get(url, json_headers(device, token, false))
+}
+
+/// Build the `/LiveTv/Channels` request (the Live-TV channel list). A live
+/// server with a tuner is required, so a real fetch is honest-gated.
+fn build_live_tv_channels_request(
+    base_url: &str,
+    user_id: &str,
+    device: &ClientInfo,
+    token: Option<&str>,
+) -> HttpRequest {
+    let url = format!(
+        "{}/LiveTv/Channels{}",
+        trim_base(base_url),
+        render_query(&[("userId", user_id.to_string())]),
+    );
+    HttpRequest::get(url, json_headers(device, token, false))
+}
+
+/// Build the `/LiveTv/Programs` request (the guide, optionally scoped to
+/// `channel_ids`).
+fn build_live_tv_programs_request(
+    base_url: &str,
+    user_id: &str,
+    channel_ids: &[String],
+    device: &ClientInfo,
+    token: Option<&str>,
+) -> HttpRequest {
+    let url = format!(
+        "{}/LiveTv/Programs{}",
+        trim_base(base_url),
+        render_query(&[
+            ("userId", user_id.to_string()),
+            ("channelIds", channel_ids.join(",")),
+        ]),
+    );
+    HttpRequest::get(url, json_headers(device, token, false))
+}
+
+/// Build the `/LiveTv/Recordings` request (the DVR recordings list).
+fn build_recordings_request(
+    base_url: &str,
+    user_id: &str,
+    device: &ClientInfo,
+    token: Option<&str>,
+) -> HttpRequest {
+    let url = format!(
+        "{}/LiveTv/Recordings{}",
+        trim_base(base_url),
+        render_query(&[("userId", user_id.to_string())]),
     );
     HttpRequest::get(url, json_headers(device, token, false))
 }
@@ -589,6 +712,12 @@ impl<T: HttpTransport> JellyfinClient<T> {
         self.user_id.as_deref()
     }
 
+    /// Borrow the underlying transport (tests inspect a recording transport
+    /// through this, mirroring `Player::engine`).
+    pub const fn transport(&self) -> &T {
+        &self.transport
+    }
+
     /// The `UserId`, or [`JellyfinError::NotAuthenticated`].
     fn require_user(&self) -> Result<&str, JellyfinError> {
         self.user_id
@@ -608,6 +737,22 @@ impl<T: HttpTransport> JellyfinClient<T> {
             });
         }
         serde_json::from_slice(&response.body).map_err(|e| JellyfinError::Parse(e.to_string()))
+    }
+
+    /// Execute `request` for a 2xx status only, ignoring the body — the
+    /// `/Sessions/Playing*` reports + mark-played answer `204 No Content`.
+    fn execute_ok(&self, request: &HttpRequest) -> Result<(), JellyfinError> {
+        let response: HttpResponse = self
+            .transport
+            .execute(request)
+            .map_err(|e| JellyfinError::Transport(e.to_string()))?;
+        if response.is_success() {
+            Ok(())
+        } else {
+            Err(JellyfinError::Http {
+                status: response.status,
+            })
+        }
     }
 
     // ── auth ────────────────────────────────────────────────────────────────
@@ -771,6 +916,176 @@ impl<T: HttpTransport> JellyfinClient<T> {
             self.token.as_deref(),
         );
         self.send(&req)
+    }
+
+    /// A cross-library recursive search (`/Users/{id}/Items` with `SearchTerm` +
+    /// `Recursive`), optionally narrowed to `media_types` (`"Video"`, `"Audio"`).
+    ///
+    /// # Errors
+    /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
+    /// HTTP / parse error.
+    pub fn search(&self, term: &str, media_types: &[&str]) -> Result<ItemsResponse, JellyfinError> {
+        let mut query = ItemsQuery::default()
+            .search_term(term)
+            .recursive()
+            .sort_by(["SortName"])
+            .fields(["Overview", "Genres", "MediaSources"]);
+        if !media_types.is_empty() {
+            query = query.media_types(media_types.iter().copied());
+        }
+        self.items(&query)
+    }
+
+    // ── Live-TV / DVR (MEDIA-10; a live server is required, honest-gated) ──────
+
+    /// The Live-TV channels via `/LiveTv/Channels`. A live server with a tuner
+    /// backend is required to answer, so a real fetch is honest-gated; the request
+    /// + response parse are fixture-tested.
+    ///
+    /// # Errors
+    /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
+    /// HTTP / parse error.
+    pub fn live_tv_channels(&self) -> Result<ItemsResponse, JellyfinError> {
+        let user = self.require_user()?;
+        let req = build_live_tv_channels_request(
+            &self.base_url,
+            user,
+            &self.device,
+            self.token.as_deref(),
+        );
+        self.send(&req)
+    }
+
+    /// The Live-TV guide via `/LiveTv/Programs` (optionally scoped to
+    /// `channel_ids`). Honest-gated like [`live_tv_channels`](Self::live_tv_channels).
+    ///
+    /// # Errors
+    /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
+    /// HTTP / parse error.
+    pub fn live_tv_guide(&self, channel_ids: &[String]) -> Result<ItemsResponse, JellyfinError> {
+        let user = self.require_user()?;
+        let req = build_live_tv_programs_request(
+            &self.base_url,
+            user,
+            channel_ids,
+            &self.device,
+            self.token.as_deref(),
+        );
+        self.send(&req)
+    }
+
+    /// The DVR recordings via `/LiveTv/Recordings`. Honest-gated like
+    /// [`live_tv_channels`](Self::live_tv_channels).
+    ///
+    /// # Errors
+    /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
+    /// HTTP / parse error.
+    pub fn recordings(&self) -> Result<ItemsResponse, JellyfinError> {
+        let user = self.require_user()?;
+        let req =
+            build_recordings_request(&self.base_url, user, &self.device, self.token.as_deref());
+        self.send(&req)
+    }
+
+    // ── playback negotiation + progress (MEDIA-10) ────────────────────────────
+
+    /// Resolve the playable sources for this client's capability profile via
+    /// `POST /Items/{id}/PlaybackInfo` — the server returns the sources (with its
+    /// own `Supports*` verdicts + a `PlaySessionId`) that
+    /// [`build_playback_decision`](crate::build_playback_decision) then negotiates.
+    ///
+    /// # Errors
+    /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
+    /// HTTP / parse error.
+    pub fn playback_info(
+        &self,
+        item_id: &str,
+        caps: &ClientCapabilities,
+    ) -> Result<PlaybackInfoResponse, JellyfinError> {
+        let user = self.require_user()?;
+        let req = build_playback_info_request(
+            &self.base_url,
+            user,
+            item_id,
+            caps,
+            &self.device,
+            self.token.as_deref(),
+        );
+        self.send(&req)
+    }
+
+    /// Report that playback opened (`POST /Sessions/Playing`).
+    ///
+    /// # Errors
+    /// A transport / HTTP error (the endpoint answers `204 No Content`).
+    pub fn report_playback_start(&self, report: &PlaybackReport) -> Result<(), JellyfinError> {
+        let req =
+            build_report_start_request(&self.base_url, report, &self.device, self.token.as_deref());
+        self.execute_ok(&req)
+    }
+
+    /// Report a progress heartbeat (`POST /Sessions/Playing/Progress`) — this
+    /// advances the server-side resume point another device restores.
+    ///
+    /// # Errors
+    /// A transport / HTTP error.
+    pub fn report_playback_progress(&self, report: &PlaybackReport) -> Result<(), JellyfinError> {
+        let req = build_report_progress_request(
+            &self.base_url,
+            report,
+            &self.device,
+            self.token.as_deref(),
+        );
+        self.execute_ok(&req)
+    }
+
+    /// Report that playback stopped (`POST /Sessions/Playing/Stopped`) — the final
+    /// position is persisted as the resume point.
+    ///
+    /// # Errors
+    /// A transport / HTTP error.
+    pub fn report_playback_stopped(&self, report: &PlaybackReport) -> Result<(), JellyfinError> {
+        let req = build_report_stopped_request(
+            &self.base_url,
+            report,
+            &self.device,
+            self.token.as_deref(),
+        );
+        self.execute_ok(&req)
+    }
+
+    /// Mark an item played (`POST /Users/{id}/PlayedItems/{itemId}`).
+    ///
+    /// # Errors
+    /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
+    /// HTTP error.
+    pub fn mark_played(&self, item_id: &str) -> Result<(), JellyfinError> {
+        let user = self.require_user()?;
+        let req = build_mark_played_request(
+            &self.base_url,
+            user,
+            item_id,
+            &self.device,
+            self.token.as_deref(),
+        );
+        self.execute_ok(&req)
+    }
+
+    /// Mark an item unplayed (`DELETE /Users/{id}/PlayedItems/{itemId}`).
+    ///
+    /// # Errors
+    /// [`JellyfinError::NotAuthenticated`] with no `UserId`, else a transport /
+    /// HTTP error.
+    pub fn mark_unplayed(&self, item_id: &str) -> Result<(), JellyfinError> {
+        let user = self.require_user()?;
+        let req = build_mark_unplayed_request(
+            &self.base_url,
+            user,
+            item_id,
+            &self.device,
+            self.token.as_deref(),
+        );
+        self.execute_ok(&req)
     }
 }
 

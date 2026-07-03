@@ -90,6 +90,15 @@
 //! the path with no dependency; embedded-tag `artist`/`album`/`duration` enrichment
 //! + the online `TMDB`/`TVDB` scrape are honest-gated egress (like `opensubtitles`).
 //!
+//! # Direct-play capabilities (MEDIA-10)
+//!
+//! [`MpvCapabilities`] is the pure container + codec support floor the Jellyfin
+//! surface reads to negotiate direct-play / direct-stream vs a server transcode.
+//! [`MpvCapabilities::baseline`] is the honest software-decode set ffmpeg carries
+//! everywhere, so the negotiation is testable with no libmpv and no network; it
+//! does not link mpv (hardware decode is a runtime GPU property, deliberately not
+//! promised here).
+//!
 //! ```
 //! use mde_media_core::{FakeMpv, Player, PlayerState};
 //!
@@ -107,6 +116,7 @@
 #![allow(clippy::module_name_repetitions, clippy::must_use_candidate)]
 
 pub mod audio;
+pub mod capabilities;
 pub mod controls;
 pub mod engine;
 pub mod fake;
@@ -124,6 +134,7 @@ pub mod mpv;
 pub use audio::{
     AudioConfig, AudioDriver, AudioFilter, AudioOutput, EqBand, LoudnessNorm, ReplayGainMode,
 };
+pub use capabilities::MpvCapabilities;
 pub use controls::{AbLoop, PlaybackControls, ScreenshotMode};
 pub use engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
 pub use fake::FakeMpv;

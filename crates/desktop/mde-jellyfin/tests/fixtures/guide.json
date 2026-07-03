@@ -1,0 +1,8 @@
+{
+  "Items": [
+    { "Id": "prog-1", "Name": "Evening Report", "Type": "Program", "ParentId": "ch-news" },
+    { "Id": "prog-2", "Name": "Late Movie", "Type": "Program", "ParentId": "ch-movies" }
+  ],
+  "TotalRecordCount": 2,
+  "StartIndex": 0
+}

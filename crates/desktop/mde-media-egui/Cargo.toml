@@ -39,6 +39,13 @@ mde-egui       = { path = "../../shared/mde-egui" }
 # controls), browse its Library (MEDIA-7), render its Playlist / Queue (MEDIA-6), and
 # read its ResumeState (MEDIA-7). All already tested there against FakeMpv.
 mde-media-core = { path = "../mde-media-core" }
+# §6 reuse — the Jellyfin client core (MEDIA-9). MEDIA-10 wires it in: the Sources
+# plane browses a configured server through its typed client, negotiates a
+# PlaybackDecision from the item's MediaSources + mde-media-core's MpvCapabilities,
+# drives the Player through the negotiated URL, and reports progress. Its request
+# builders + negotiation folds are tested there against fixtures (no live network);
+# the live browse/play/report legs are honest-gated to a real server.
+mde-jellyfin   = { path = "../mde-jellyfin" }
 
 [features]
 default = []

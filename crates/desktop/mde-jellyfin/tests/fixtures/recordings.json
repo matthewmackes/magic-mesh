@@ -1,0 +1,7 @@
+{
+  "Items": [
+    { "Id": "rec-1", "Name": "Recorded Documentary", "Type": "Recording", "ProductionYear": 2021 }
+  ],
+  "TotalRecordCount": 1,
+  "StartIndex": 0
+}

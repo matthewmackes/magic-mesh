@@ -1,0 +1,21 @@
+{
+  "MediaSources": [
+    {
+      "Id": "src-4k",
+      "Container": "mkv",
+      "Path": "/media/movies/Interstellar.mkv",
+      "Protocol": "File",
+      "SupportsDirectPlay": true,
+      "SupportsDirectStream": true,
+      "SupportsTranscoding": true,
+      "RunTimeTicks": 72000000000,
+      "Bitrate": 42000000,
+      "MediaStreams": [
+        { "Type": "Video", "Codec": "hevc", "Index": 0, "Width": 3840, "Height": 2160 },
+        { "Type": "Audio", "Codec": "eac3", "Index": 1, "IsDefault": true, "Channels": 6, "Language": "eng" },
+        { "Type": "Subtitle", "Codec": "subrip", "Index": 2, "Language": "eng" }
+      ]
+    }
+  ],
+  "PlaySessionId": "play-session-7"
+}

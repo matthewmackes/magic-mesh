@@ -84,6 +84,194 @@ pub struct BaseItemDto {
     /// query requested it.
     #[serde(default)]
     pub user_data: Option<UserData>,
+    /// The playable [`MediaSourceInfo`]s for this item — the container + the
+    /// per-stream codecs playback negotiation (MEDIA-10) reads. Populated when a
+    /// browse requests the `MediaSources` field, or by
+    /// [`playback_info`](crate::JellyfinClient::playback_info).
+    #[serde(default)]
+    pub media_sources: Vec<MediaSourceInfo>,
+}
+
+/// One playable source of an item — the physical file the server would stream,
+/// with the container + the codecs playback negotiation (MEDIA-10) reasons over.
+///
+/// A single item can carry several ([`BaseItemDto::media_sources`]) — different
+/// versions / qualities; each is negotiated independently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaSourceInfo {
+    /// The media-source GUID — the `mediaSourceId` a stream/transcode URL keys on.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// The container format (`"mkv"`, `"mp4"`, …) — the key input to the
+    /// direct-play vs direct-stream decision.
+    #[serde(default)]
+    pub container: Option<String>,
+    /// The server-side path / URL of the source, if reported.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The delivery protocol (`"File"`, `"Http"`, `"Hls"`), if reported.
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// The server's own verdict that the client may stream the bytes untouched.
+    #[serde(default)]
+    pub supports_direct_play: bool,
+    /// The server's own verdict that the source may be remuxed without re-encode.
+    #[serde(default)]
+    pub supports_direct_stream: bool,
+    /// The server's own verdict that the source can be transcoded.
+    #[serde(default)]
+    pub supports_transcoding: bool,
+    /// The server-supplied transcoding URL (an HLS `.m3u8`), when it built one.
+    #[serde(default)]
+    pub transcoding_url: Option<String>,
+    /// The container the server would transcode into, if reported.
+    #[serde(default)]
+    pub transcoding_container: Option<String>,
+    /// The transcode sub-protocol (`"hls"`), if reported.
+    #[serde(default)]
+    pub transcoding_sub_protocol: Option<String>,
+    /// The source runtime in 100-ns ticks, if reported.
+    #[serde(default)]
+    pub run_time_ticks: Option<i64>,
+    /// The overall bitrate in bits/s, if reported.
+    #[serde(default)]
+    pub bitrate: Option<i64>,
+    /// The audio/video/subtitle streams inside this source.
+    #[serde(default)]
+    pub media_streams: Vec<MediaStream>,
+}
+
+impl MediaSourceInfo {
+    /// The codecs of every video stream in this source (in stream order).
+    pub fn video_codecs(&self) -> impl Iterator<Item = &str> {
+        self.media_streams
+            .iter()
+            .filter(|s| s.is_video())
+            .filter_map(|s| s.codec.as_deref())
+    }
+
+    /// The codecs of every audio stream in this source (in stream order).
+    pub fn audio_codecs(&self) -> impl Iterator<Item = &str> {
+        self.media_streams
+            .iter()
+            .filter(|s| s.is_audio())
+            .filter_map(|s| s.codec.as_deref())
+    }
+
+    /// The index of the default (or first) audio stream, for a playback report.
+    #[must_use]
+    pub fn default_audio_index(&self) -> Option<i32> {
+        self.default_stream_index(StreamKind::Audio)
+    }
+
+    /// The index of the default (or first) subtitle stream, for a playback report.
+    #[must_use]
+    pub fn default_subtitle_index(&self) -> Option<i32> {
+        self.default_stream_index(StreamKind::Subtitle)
+    }
+
+    /// The index of the default stream of `kind`, falling back to the first.
+    fn default_stream_index(&self, kind: StreamKind) -> Option<i32> {
+        let of_kind = || self.media_streams.iter().filter(|s| s.kind() == Some(kind));
+        of_kind()
+            .find(|s| s.is_default)
+            .or_else(|| of_kind().next())
+            .map(|s| s.index)
+    }
+}
+
+/// The kind of a [`MediaStream`] — the `Type` discriminator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    /// A video stream.
+    Video,
+    /// An audio stream.
+    Audio,
+    /// A subtitle stream.
+    Subtitle,
+}
+
+/// One elementary stream inside a [`MediaSourceInfo`] — its kind + codec are the
+/// per-stream facts negotiation checks against the player's decode capabilities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct MediaStream {
+    /// The stream kind (`"Video"`, `"Audio"`, `"Subtitle"`, …).
+    #[serde(rename = "Type", default)]
+    pub stream_type: Option<String>,
+    /// The codec short name (`"h264"`, `"aac"`, `"ass"`, …), if reported.
+    #[serde(default)]
+    pub codec: Option<String>,
+    /// The stream's index within the source (the `AudioStreamIndex` /
+    /// `SubtitleStreamIndex` a playback report carries).
+    #[serde(default)]
+    pub index: i32,
+    /// The BCP-47 / ISO language tag, if reported.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// A human display title, if reported.
+    #[serde(default)]
+    pub display_title: Option<String>,
+    /// Whether the container marks this stream default.
+    #[serde(default)]
+    pub is_default: bool,
+    /// The channel count (audio), if reported.
+    #[serde(default)]
+    pub channels: Option<i32>,
+    /// The pixel width (video), if reported.
+    #[serde(default)]
+    pub width: Option<i32>,
+    /// The pixel height (video), if reported.
+    #[serde(default)]
+    pub height: Option<i32>,
+}
+
+impl MediaStream {
+    /// The typed [`StreamKind`] of this stream, or [`None`] for an unknown type.
+    #[must_use]
+    pub fn kind(&self) -> Option<StreamKind> {
+        match self.stream_type.as_deref() {
+            Some("Video") => Some(StreamKind::Video),
+            Some("Audio") => Some(StreamKind::Audio),
+            Some("Subtitle") => Some(StreamKind::Subtitle),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a video stream.
+    #[must_use]
+    pub fn is_video(&self) -> bool {
+        self.kind() == Some(StreamKind::Video)
+    }
+
+    /// Whether this is an audio stream.
+    #[must_use]
+    pub fn is_audio(&self) -> bool {
+        self.kind() == Some(StreamKind::Audio)
+    }
+
+    /// Whether this is a subtitle stream.
+    #[must_use]
+    pub fn is_subtitle(&self) -> bool {
+        self.kind() == Some(StreamKind::Subtitle)
+    }
+}
+
+/// The response of `POST /Items/{id}/PlaybackInfo`.
+///
+/// The server's playable [`MediaSourceInfo`]s (with its own `Supports*` verdicts
+/// and any transcode URL) plus the `PlaySessionId` that ties the progress
+/// reports to this playback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub struct PlaybackInfoResponse {
+    /// The playable sources the server resolved for the item.
+    #[serde(default)]
+    pub media_sources: Vec<MediaSourceInfo>,
+    /// The session id to echo back in `/Sessions/Playing*` progress reports.
+    #[serde(default)]
+    pub play_session_id: Option<String>,
 }
 
 /// The per-user playback state attached to a [`BaseItemDto`].
@@ -253,6 +441,59 @@ mod tests {
         assert_eq!(res.server_id.as_deref(), Some("srv-1"));
         assert_eq!(res.user.id, "user-9");
         assert_eq!(res.user.name, "matthew");
+    }
+
+    #[test]
+    fn base_item_parses_media_sources_and_streams() {
+        let json = r#"{
+            "Id": "movie-1",
+            "Type": "Movie",
+            "MediaSources": [{
+                "Id": "src-a",
+                "Container": "mkv",
+                "Protocol": "File",
+                "SupportsDirectPlay": true,
+                "RunTimeTicks": 12000000000,
+                "MediaStreams": [
+                    { "Type": "Video", "Codec": "h264", "Index": 0, "Height": 1080 },
+                    { "Type": "Audio", "Codec": "aac", "Index": 1, "IsDefault": true, "Channels": 6 },
+                    { "Type": "Subtitle", "Codec": "subrip", "Index": 2 }
+                ]
+            }]
+        }"#;
+        let item: BaseItemDto = serde_json::from_str(json).expect("parse item with sources");
+        assert_eq!(item.media_sources.len(), 1);
+        let src = &item.media_sources[0];
+        assert_eq!(src.container.as_deref(), Some("mkv"));
+        assert!(src.supports_direct_play);
+        assert_eq!(src.video_codecs().collect::<Vec<_>>(), vec!["h264"]);
+        assert_eq!(src.audio_codecs().collect::<Vec<_>>(), vec!["aac"]);
+        // The default audio stream (index 1) + the only subtitle (index 2).
+        assert_eq!(src.default_audio_index(), Some(1));
+        assert_eq!(src.default_subtitle_index(), Some(2));
+        assert!(src.media_streams[2].is_subtitle());
+    }
+
+    #[test]
+    fn default_audio_index_falls_back_to_first_when_none_default() {
+        let src: MediaSourceInfo = serde_json::from_str(
+            r#"{"MediaStreams":[{"Type":"Audio","Index":3},{"Type":"Audio","Index":5}]}"#,
+        )
+        .expect("parse source");
+        // No IsDefault → the first audio stream (index 3).
+        assert_eq!(src.default_audio_index(), Some(3));
+        assert_eq!(src.default_subtitle_index(), None);
+    }
+
+    #[test]
+    fn playback_info_response_projects_sources_and_session() {
+        let json = r#"{
+            "MediaSources": [{ "Id": "s1", "Container": "mp4" }],
+            "PlaySessionId": "session-xyz"
+        }"#;
+        let resp: PlaybackInfoResponse = serde_json::from_str(json).expect("parse playbackinfo");
+        assert_eq!(resp.media_sources.len(), 1);
+        assert_eq!(resp.play_session_id.as_deref(), Some("session-xyz"));
     }
 
     #[test]

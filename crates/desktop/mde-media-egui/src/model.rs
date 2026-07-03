@@ -13,10 +13,15 @@
 //! the default build — the whole controller is unit-tested below (the transport glue
 //! against the real player, the browse/source/OSD folds as pure functions).
 
+use mde_jellyfin::{
+    build_playback_decision, BaseItemDto, ClientCapabilities, HttpTransport, ItemsQuery,
+    JellyfinClient, JellyfinError, MediaSourceInfo, PlaybackDecision, PlaybackMethod,
+    PlaybackReport, ServerConfig, ServerStore, StreamMediaType,
+};
 use mde_media_core::{
-    AbLoop, BrowseQuery, Library, LibraryItem, MediaEngine, MediaKind, PlaybackControls, Player,
-    PlayerEvent, PlayerState, Playlist, PlaylistItem, RepeatMode, ScreenshotMode, SortKey, Track,
-    TrackKind, TrackSelect, TrackSelection,
+    AbLoop, BrowseQuery, Library, LibraryItem, MediaEngine, MediaKind, MpvCapabilities,
+    PlaybackControls, Player, PlayerEvent, PlayerState, Playlist, PlaylistItem, RepeatMode,
+    ScreenshotMode, SortKey, Track, TrackKind, TrackSelect, TrackSelection,
 };
 
 /// The seed used when the operator toggles shuffle on.
@@ -79,6 +84,10 @@ pub struct UiState {
     pub search_input: String,
     /// The text buffer behind the "index a folder" field on Sources.
     pub folder_input: String,
+    /// The text buffer behind the Jellyfin "server name" field on Sources.
+    pub jellyfin_name_input: String,
+    /// The text buffer behind the Jellyfin "server URL" field on Sources.
+    pub jellyfin_url_input: String,
     /// Whether the `PiP` mini-player (design Q31/Q32) is shown.
     pub pip: bool,
     /// Whether the surface is in immersive fullscreen (design Q32).
@@ -103,6 +112,141 @@ pub struct SourceRow {
     pub path: String,
     /// How many indexed items live under this root.
     pub item_count: usize,
+}
+
+/// A configured Jellyfin server as a Sources row — its display name, base URL,
+/// and whether it is signed in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JellyfinSourceRow {
+    /// The stable local id (the [`ServerStore`] key).
+    pub id: String,
+    /// The server's display name.
+    pub label: String,
+    /// The base URL.
+    pub base_url: String,
+    /// Whether a saved token is present (signed in).
+    pub signed_in: bool,
+    /// Whether this is the currently selected server.
+    pub selected: bool,
+}
+
+/// The active Jellyfin playback — the ids + method a progress report echoes back
+/// (MEDIA-10 sync).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JellyfinSession {
+    /// The base URL of the server the item streams from.
+    pub base_url: String,
+    /// The bearer token (echoed as `api_key`), if signed in.
+    pub token: Option<String>,
+    /// The item being played.
+    pub item_id: String,
+    /// The negotiated media source id.
+    pub media_source_id: Option<String>,
+    /// The `PlaySessionId` (when a `PlaybackInfo` opened the session).
+    pub play_session_id: Option<String>,
+    /// The negotiated delivery method (`PlayMethod`).
+    pub method: PlaybackMethod,
+    /// The default audio stream index, for the report.
+    pub audio_index: Option<i32>,
+    /// The default subtitle stream index, for the report.
+    pub subtitle_index: Option<i32>,
+}
+
+/// The Jellyfin Sources state the controller holds (MEDIA-10).
+///
+/// Configuration only — the [`ServerStore`] (loaded from the `0600` token store,
+/// no network) + the negotiated capability profile + the materialized items of
+/// the last live browse + the active playback session. Every live call (browse,
+/// `PlaybackInfo`, progress report) is a generic method that takes an injected
+/// [`JellyfinClient`], so the struct carries no transport and the pure negotiation
+/// / report folds are unit-tested with no network.
+#[derive(Debug, Clone)]
+pub struct JellyfinState {
+    /// Configured servers + saved tokens.
+    store: ServerStore,
+    /// The player's decode profile the negotiation runs against (from the
+    /// `mde-media-core` [`MpvCapabilities`] baseline by default).
+    capabilities: ClientCapabilities,
+    /// The materialized items of the last browse (libraries, titles, search
+    /// results, or a Live-TV list). Populated by a live browse; empty until then.
+    items: Vec<BaseItemDto>,
+    /// The selected server id (whose base URL + token the play path uses).
+    selected: Option<String>,
+    /// The active playback session, for progress / stop reports.
+    session: Option<JellyfinSession>,
+}
+
+impl Default for JellyfinState {
+    fn default() -> Self {
+        Self {
+            store: ServerStore::new(),
+            capabilities: client_capabilities(&MpvCapabilities::baseline()),
+            items: Vec::new(),
+            selected: None,
+            session: None,
+        }
+    }
+}
+
+impl JellyfinState {
+    /// The configured servers (read-only).
+    #[must_use]
+    pub const fn store(&self) -> &ServerStore {
+        &self.store
+    }
+
+    /// The negotiated capability profile (read-only).
+    #[must_use]
+    pub const fn capabilities(&self) -> &ClientCapabilities {
+        &self.capabilities
+    }
+
+    /// The materialized items of the last browse.
+    #[must_use]
+    pub fn items(&self) -> &[BaseItemDto] {
+        &self.items
+    }
+
+    /// The selected server config, if one is selected.
+    #[must_use]
+    pub fn selected_server(&self) -> Option<&ServerConfig> {
+        self.selected.as_deref().and_then(|id| self.store.get(id))
+    }
+
+    /// The config of the server with `id`, if configured.
+    #[must_use]
+    pub fn server(&self, id: &str) -> Option<&ServerConfig> {
+        self.store.get(id)
+    }
+
+    /// The active playback session, if one is open.
+    #[must_use]
+    pub const fn session(&self) -> Option<&JellyfinSession> {
+        self.session.as_ref()
+    }
+}
+
+/// Build the Jellyfin client capability profile from the player's mpv decode set.
+///
+/// The §6 bridge that ties `mde-media-core`'s [`MpvCapabilities`] to the
+/// negotiation input, so a title is direct-played exactly when the local player
+/// can actually decode it.
+#[must_use]
+pub fn client_capabilities(caps: &MpvCapabilities) -> ClientCapabilities {
+    ClientCapabilities::new()
+        .with_containers(caps.containers().iter().map(String::as_str))
+        .with_video_codecs(caps.video_codecs().iter().map(String::as_str))
+        .with_audio_codecs(caps.audio_codecs().iter().map(String::as_str))
+}
+
+/// The stream media type an item plays as — music (`Audio`, `MusicAlbum`) rides
+/// the `Audio` stream endpoints, everything else the `Video` ones.
+#[must_use]
+pub fn stream_media_type(item: &BaseItemDto) -> StreamMediaType {
+    match item.item_type.as_deref() {
+        Some("Audio" | "MusicAlbum" | "MusicArtist" | "MusicVideo") => StreamMediaType::Audio,
+        _ => StreamMediaType::Video,
+    }
 }
 
 /// A UI intent the views raise.
@@ -175,6 +319,9 @@ pub struct MediaController<E: MediaEngine> {
     /// The core local-media index (MEDIA-7). The surface browses it; it does not
     /// re-implement indexing.
     library: Library,
+    /// The Jellyfin Sources state (MEDIA-10) — configured servers, the negotiated
+    /// capability profile, the last browse, and the active playback session.
+    jellyfin: JellyfinState,
     /// The non-core UI state.
     ui: UiState,
 }
@@ -186,6 +333,7 @@ impl<E: MediaEngine> MediaController<E> {
         Self {
             player,
             library: Library::new(),
+            jellyfin: JellyfinState::default(),
             ui: UiState::default(),
         }
     }
@@ -431,6 +579,294 @@ impl<E: MediaEngine> MediaController<E> {
         }
         Ok(())
     }
+
+    // ── Jellyfin Sources (MEDIA-10) ──────────────────────────────────────────────
+
+    /// The Jellyfin Sources state (read-only) — configured servers, the negotiated
+    /// capability profile, the last browse, and the active session.
+    #[must_use]
+    pub const fn jellyfin(&self) -> &JellyfinState {
+        &self.jellyfin
+    }
+
+    /// Replace the configured Jellyfin servers — e.g. after a
+    /// [`ServerStore::load`] at startup (no network).
+    pub fn set_jellyfin_store(&mut self, store: ServerStore) {
+        self.jellyfin.store = store;
+    }
+
+    /// Override the negotiated capability profile (the default is the
+    /// `mde-media-core` mpv baseline) — e.g. to reflect a constrained seat.
+    pub fn set_jellyfin_capabilities(&mut self, caps: ClientCapabilities) {
+        self.jellyfin.capabilities = caps;
+    }
+
+    /// Add / update a configured Jellyfin server (no network) — the Sources
+    /// "add a server" affordance.
+    pub fn add_jellyfin_server(
+        &mut self,
+        id: impl Into<String>,
+        name: impl Into<String>,
+        base_url: impl Into<String>,
+    ) {
+        self.jellyfin
+            .store
+            .upsert(ServerConfig::new(id, name, base_url));
+    }
+
+    /// Select the server future play actions stream from. A no-op for an unknown id.
+    pub fn select_jellyfin_server(&mut self, id: &str) {
+        if self.jellyfin.store.get(id).is_some() {
+            self.jellyfin.selected = Some(id.to_owned());
+        }
+    }
+
+    /// The Jellyfin server rows the Sources view renders.
+    #[must_use]
+    pub fn jellyfin_sources(&self) -> Vec<JellyfinSourceRow> {
+        let selected = self.jellyfin.selected.as_deref();
+        self.jellyfin
+            .store
+            .servers
+            .iter()
+            .map(|server| JellyfinSourceRow {
+                id: server.id.clone(),
+                label: server.name.clone(),
+                base_url: server.base_url.clone(),
+                signed_in: server.is_authenticated(),
+                selected: selected == Some(server.id.as_str()),
+            })
+            .collect()
+    }
+
+    /// The materialized items of the last Jellyfin browse — the playable rows.
+    #[must_use]
+    pub fn jellyfin_items(&self) -> &[BaseItemDto] {
+        self.jellyfin.items()
+    }
+
+    /// Browse a Jellyfin server through its typed client, materializing the items
+    /// (a library's titles / a search / a channel list). Returns the count.
+    ///
+    /// A real call into `mde-jellyfin`'s client — a live server is honest-gated;
+    /// tests drive it through a fixture transport.
+    ///
+    /// # Errors
+    /// The Jellyfin error, mapped to a status string.
+    pub fn browse_jellyfin<T: HttpTransport>(
+        &mut self,
+        client: &JellyfinClient<T>,
+        query: &ItemsQuery,
+    ) -> Result<usize, String> {
+        let resp = client.items(query).map_err(jellyfin_err)?;
+        let count = resp.items.len();
+        self.jellyfin.items = resp.items;
+        Ok(count)
+    }
+
+    /// Materialize a Jellyfin server's Live-TV channels (MEDIA-10). Honest-gated
+    /// to a server with a tuner; the request + parse are tested in `mde-jellyfin`.
+    ///
+    /// # Errors
+    /// The Jellyfin error, mapped to a status string.
+    pub fn load_jellyfin_live_tv<T: HttpTransport>(
+        &mut self,
+        client: &JellyfinClient<T>,
+    ) -> Result<usize, String> {
+        let resp = client.live_tv_channels().map_err(jellyfin_err)?;
+        let count = resp.items.len();
+        self.jellyfin.items = resp.items;
+        Ok(count)
+    }
+
+    /// Negotiate + play `item` from the selected server (MEDIA-10).
+    ///
+    /// Picks the item's first [`MediaSourceInfo`], chooses direct-play /
+    /// direct-stream / transcode from the player's decode capabilities, loads the
+    /// negotiated URL into the core [`Player`], and opens a sync session. Pure (no
+    /// network) — negotiation + load are unit-tested.
+    ///
+    /// # Errors
+    /// A status string when no server is selected, the item has no source, or the
+    /// core rejects the load.
+    pub fn play_jellyfin_item(&mut self, item: &BaseItemDto) -> Result<PlaybackDecision, String> {
+        let (base_url, token) = self.selected_endpoint()?;
+        let Some(source) = item.media_sources.first() else {
+            return Err(format!(
+                "{} has no playable source yet — browse the library first.",
+                jellyfin_item_title(item)
+            ));
+        };
+        let media_type = stream_media_type(item);
+        let decision = self.negotiate_and_load(
+            &base_url,
+            token.as_deref(),
+            &item.id,
+            source,
+            media_type,
+            None,
+        )?;
+        self.ui.status = Some(format!(
+            "Playing {} · {}",
+            jellyfin_item_title(item),
+            decision.method.as_wire()
+        ));
+        Ok(decision)
+    }
+
+    /// Open + play a Jellyfin item end-to-end through the client (MEDIA-10, the
+    /// full live path): resolve the sources via `PlaybackInfo`, negotiate, load the
+    /// [`Player`], and report the playback start.
+    ///
+    /// A real transport-driving call (honest-gated); tests drive it through a
+    /// fixture transport.
+    ///
+    /// # Errors
+    /// The Jellyfin / core error as a status string.
+    pub fn open_jellyfin_item<T: HttpTransport>(
+        &mut self,
+        client: &JellyfinClient<T>,
+        base_url: &str,
+        token: Option<&str>,
+        item_id: &str,
+        media_type: StreamMediaType,
+    ) -> Result<PlaybackDecision, String> {
+        let info = client
+            .playback_info(item_id, &self.jellyfin.capabilities)
+            .map_err(jellyfin_err)?;
+        let Some(source) = info.media_sources.first() else {
+            return Err(format!("Server returned no playable source for {item_id}."));
+        };
+        let play_session = info.play_session_id.clone();
+        let decision = self.negotiate_and_load(
+            base_url,
+            token,
+            item_id,
+            source,
+            media_type,
+            play_session.as_deref(),
+        )?;
+        if let Some(report) = self.jellyfin_progress_report() {
+            client
+                .report_playback_start(&report)
+                .map_err(jellyfin_err)?;
+        }
+        Ok(decision)
+    }
+
+    /// Build a progress report for the active Jellyfin session at the live
+    /// position, or [`None`] when no session is open. Pure (testable).
+    #[must_use]
+    pub fn jellyfin_progress_report(&self) -> Option<PlaybackReport> {
+        self.jellyfin
+            .session
+            .as_ref()
+            .map(|session| self.session_report(session))
+    }
+
+    /// Report the active session's progress through the client (MEDIA-10 sync —
+    /// advances the server-side resume point). Honest-gated to a live server.
+    ///
+    /// # Errors
+    /// The Jellyfin error as a status string.
+    pub fn report_jellyfin_progress<T: HttpTransport>(
+        &self,
+        client: &JellyfinClient<T>,
+    ) -> Result<(), String> {
+        self.jellyfin_progress_report().map_or(Ok(()), |report| {
+            client
+                .report_playback_progress(&report)
+                .map_err(jellyfin_err)
+        })
+    }
+
+    /// End the active Jellyfin session, reporting the final position through the
+    /// client and clearing the session. A no-op when no session is open.
+    ///
+    /// # Errors
+    /// The Jellyfin error as a status string.
+    pub fn report_jellyfin_stopped<T: HttpTransport>(
+        &mut self,
+        client: &JellyfinClient<T>,
+    ) -> Result<(), String> {
+        let Some(report) = self.end_jellyfin_session() else {
+            return Ok(());
+        };
+        client
+            .report_playback_stopped(&report)
+            .map_err(jellyfin_err)
+    }
+
+    /// Take the active session (clearing it), returning its final stop report.
+    /// Pure (testable) — the report side of "stop this title".
+    pub fn end_jellyfin_session(&mut self) -> Option<PlaybackReport> {
+        let report = self
+            .jellyfin
+            .session
+            .as_ref()
+            .map(|session| self.session_report(session));
+        self.jellyfin.session = None;
+        report
+    }
+
+    /// The base URL + token of the selected server, or a status error.
+    fn selected_endpoint(&self) -> Result<(String, Option<String>), String> {
+        let server = self
+            .jellyfin
+            .selected_server()
+            .ok_or_else(|| "Select a Jellyfin server first.".to_owned())?;
+        let token = server.auth.as_ref().map(|auth| auth.access_token.clone());
+        Ok((server.base_url.clone(), token))
+    }
+
+    /// Negotiate `source` against the capability profile, load the resulting URL,
+    /// and record the sync session — the shared body of the two play paths.
+    fn negotiate_and_load(
+        &mut self,
+        base_url: &str,
+        token: Option<&str>,
+        item_id: &str,
+        source: &MediaSourceInfo,
+        media_type: StreamMediaType,
+        play_session_id: Option<&str>,
+    ) -> Result<PlaybackDecision, String> {
+        let decision = build_playback_decision(
+            base_url,
+            item_id,
+            source,
+            &self.jellyfin.capabilities,
+            media_type,
+            token,
+            play_session_id,
+        );
+        self.player.load(decision.url.clone()).map_err(err)?;
+        self.jellyfin.session = Some(JellyfinSession {
+            base_url: base_url.to_owned(),
+            token: token.map(ToOwned::to_owned),
+            item_id: item_id.to_owned(),
+            media_source_id: decision.media_source_id.clone(),
+            play_session_id: decision.play_session_id.clone(),
+            method: decision.method,
+            audio_index: source.default_audio_index(),
+            subtitle_index: source.default_subtitle_index(),
+        });
+        Ok(decision)
+    }
+
+    /// Build a [`PlaybackReport`] for `session` at the live player position + state.
+    fn session_report(&self, session: &JellyfinSession) -> PlaybackReport {
+        let mut report = PlaybackReport::new(&session.item_id)
+            .with_session(
+                session.media_source_id.clone(),
+                session.play_session_id.clone(),
+            )
+            .with_method(session.method)
+            .paused(self.player.state() != PlayerState::Playing)
+            .at_secs(self.player.position());
+        report.audio_stream_index = session.audio_index;
+        report.subtitle_stream_index = session.subtitle_index;
+        report
+    }
 }
 
 /// Map a [`mde_media_core::PlayerError`] to a status string. Taken by value so the
@@ -438,6 +874,21 @@ impl<E: MediaEngine> MediaController<E> {
 #[allow(clippy::needless_pass_by_value)]
 fn err(e: mde_media_core::PlayerError) -> String {
     e.to_string()
+}
+
+/// Map a [`JellyfinError`] to a status string (point-free `.map_err(jellyfin_err)`).
+#[allow(clippy::needless_pass_by_value)]
+fn jellyfin_err(e: JellyfinError) -> String {
+    format!("Jellyfin: {e}")
+}
+
+/// The display title of a Jellyfin item — its name, else its id (never empty).
+#[must_use]
+pub fn jellyfin_item_title(item: &BaseItemDto) -> String {
+    item.name
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| item.id.clone())
 }
 
 /// Put `select` into the `kind` slot of a [`TrackSelection`].
@@ -654,6 +1105,7 @@ pub fn now_playing_title<E: MediaEngine>(player: &Player<E>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mde_jellyfin::{ClientInfo, HttpRequest, HttpResponse, MediaStream, TransportError};
     use mde_media_core::{FakeMpv, MediaMetadata};
 
     fn tracks() -> Vec<Track> {
@@ -1002,5 +1454,178 @@ mod tests {
             c.ui().status.as_deref(),
             Some("Enter a folder path to index.")
         );
+    }
+
+    // ── Jellyfin Sources (MEDIA-10) ──────────────────────────────────────────────
+
+    fn jelly_device() -> ClientInfo {
+        ClientInfo::new("mde-media", "workstation", "device-42", "12.0.0")
+    }
+
+    /// A Jellyfin movie with one direct-playable (mkv / h264 / aac) source.
+    fn jelly_movie() -> BaseItemDto {
+        BaseItemDto {
+            id: "m1".into(),
+            name: Some("Movie One".into()),
+            item_type: Some("Movie".into()),
+            media_sources: vec![MediaSourceInfo {
+                id: Some("s1".into()),
+                container: Some("mkv".into()),
+                media_streams: vec![
+                    MediaStream {
+                        stream_type: Some("Video".into()),
+                        codec: Some("h264".into()),
+                        index: 0,
+                        ..MediaStream::default()
+                    },
+                    MediaStream {
+                        stream_type: Some("Audio".into()),
+                        codec: Some("aac".into()),
+                        index: 1,
+                        is_default: true,
+                        ..MediaStream::default()
+                    },
+                ],
+                ..MediaSourceInfo::default()
+            }],
+            ..BaseItemDto::default()
+        }
+    }
+
+    /// A fixture transport: `PlaybackInfo` + `/Items` serve JSON, `/Sessions` 204.
+    struct StubTransport;
+    impl HttpTransport for StubTransport {
+        fn execute(&self, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
+            if request.url.contains("/Sessions/Playing") {
+                return Ok(HttpResponse {
+                    status: 204,
+                    body: Vec::new(),
+                });
+            }
+            let body = if request.url.contains("/PlaybackInfo") {
+                r#"{"MediaSources":[{"Id":"s1","Container":"mkv","MediaStreams":[
+                    {"Type":"Video","Codec":"h264","Index":0},
+                    {"Type":"Audio","Codec":"aac","Index":1,"IsDefault":true}]}],
+                    "PlaySessionId":"sess-1"}"#
+            } else if request.url.contains("/Items") {
+                r#"{"Items":[{"Id":"m1","Name":"Movie One","Type":"Movie",
+                    "MediaSources":[{"Id":"s1","Container":"mkv","MediaStreams":[
+                    {"Type":"Video","Codec":"h264","Index":0},
+                    {"Type":"Audio","Codec":"aac","Index":1}]}]}],
+                    "TotalRecordCount":1,"StartIndex":0}"#
+            } else {
+                "{}"
+            };
+            Ok(HttpResponse {
+                status: 200,
+                body: body.as_bytes().to_vec(),
+            })
+        }
+    }
+
+    fn stub_client() -> JellyfinClient<StubTransport> {
+        JellyfinClient::new("https://jelly.mesh:8096", jelly_device(), StubTransport)
+            .with_auth("TOKEN", "user-1")
+    }
+
+    #[test]
+    fn client_capabilities_bridge_reflects_the_mpv_baseline() {
+        // The §6 bridge: the mpv baseline flows into the negotiation profile, so a
+        // stock title direct-plays.
+        let caps = client_capabilities(&MpvCapabilities::baseline());
+        assert!(caps.supports_container("mkv"));
+        assert!(caps.supports_video_codec("h264"));
+        assert!(caps.supports_audio_codec("aac"));
+    }
+
+    #[test]
+    fn play_jellyfin_item_negotiates_direct_play_and_opens_a_session() {
+        let mut c = controller();
+        c.add_jellyfin_server("srv", "Home", "https://jelly.mesh:8096");
+        c.select_jellyfin_server("srv");
+        let decision = c.play_jellyfin_item(&jelly_movie()).expect("play");
+        assert_eq!(decision.method, PlaybackMethod::DirectPlay);
+        // The negotiated URL is what the core Player loaded.
+        assert_eq!(c.player().media(), Some(decision.url.as_str()));
+        assert!(decision.url.contains("/Videos/m1/stream?"));
+        // A sync session is open, carrying the source id + default audio index.
+        let report = c.jellyfin_progress_report().expect("session open");
+        assert_eq!(report.item_id, "m1");
+        assert_eq!(report.media_source_id.as_deref(), Some("s1"));
+        assert_eq!(report.audio_stream_index, Some(1));
+    }
+
+    #[test]
+    fn play_without_a_selected_server_is_refused_honestly() {
+        let mut c = controller();
+        let error = c.play_jellyfin_item(&jelly_movie()).expect_err("no server");
+        assert!(error.contains("Select a Jellyfin server"));
+        assert!(c.jellyfin_progress_report().is_none());
+    }
+
+    #[test]
+    fn browse_jellyfin_materializes_items_through_the_client() {
+        let mut c = controller();
+        let count = c
+            .browse_jellyfin(&stub_client(), &ItemsQuery::default().recursive())
+            .expect("browse");
+        assert_eq!(count, 1);
+        assert_eq!(c.jellyfin_items().len(), 1);
+        assert_eq!(c.jellyfin_items()[0].id, "m1");
+    }
+
+    #[test]
+    fn open_jellyfin_item_runs_playbackinfo_then_reports_start_and_stop() {
+        let mut c = controller();
+        c.add_jellyfin_server("srv", "Home", "https://jelly.mesh:8096");
+        c.select_jellyfin_server("srv");
+        let client = stub_client();
+        let decision = c
+            .open_jellyfin_item(
+                &client,
+                "https://jelly.mesh:8096",
+                Some("TOKEN"),
+                "m1",
+                StreamMediaType::Video,
+            )
+            .expect("open");
+        assert_eq!(decision.method, PlaybackMethod::DirectPlay);
+        // The PlaySessionId from PlaybackInfo threads into the session.
+        assert_eq!(decision.play_session_id.as_deref(), Some("sess-1"));
+        let report = c.jellyfin_progress_report().expect("session");
+        assert_eq!(report.play_session_id.as_deref(), Some("sess-1"));
+        // Progress + stop both drive the client; stop clears the session.
+        c.report_jellyfin_progress(&client).expect("progress");
+        c.report_jellyfin_stopped(&client).expect("stop");
+        assert!(c.jellyfin_progress_report().is_none());
+    }
+
+    #[test]
+    fn jellyfin_sources_lists_configured_servers_with_state() {
+        let mut c = controller();
+        c.add_jellyfin_server("a", "Anvil", "https://a.mesh");
+        c.add_jellyfin_server("b", "Backup", "https://b.mesh");
+        c.select_jellyfin_server("b");
+        let rows = c.jellyfin_sources();
+        assert_eq!(rows.len(), 2);
+        let b = rows.iter().find(|r| r.id == "b").expect("b row");
+        assert!(b.selected);
+        assert!(!b.signed_in);
+    }
+
+    #[test]
+    fn stream_media_type_routes_music_to_the_audio_path() {
+        let mut audio = jelly_movie();
+        audio.item_type = Some("Audio".into());
+        assert_eq!(stream_media_type(&audio), StreamMediaType::Audio);
+        assert_eq!(stream_media_type(&jelly_movie()), StreamMediaType::Video);
+    }
+
+    #[test]
+    fn jellyfin_item_title_falls_back_to_id() {
+        let mut item = jelly_movie();
+        assert_eq!(jellyfin_item_title(&item), "Movie One");
+        item.name = None;
+        assert_eq!(jellyfin_item_title(&item), "m1");
     }
 }
