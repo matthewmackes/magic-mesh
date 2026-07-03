@@ -875,17 +875,24 @@ impl ChatWorker {
     /// gossiped for peers + republished on `state/chat/roster` by
     /// [`publish_roster`] this same tick (latest-wins), so the self roster entry
     /// the UI reads reflects it live — a real round-trip, not local-only UI state.
+    /// Parse an `action/chat/*` message body into the typed request `T`, or `None`
+    /// (skip the message): a missing body or malformed JSON logs a warn and is
+    /// dropped — the shared shape the four action drains use.
+    fn parse_action_body<T: serde::de::DeserializeOwned>(m: &StoredMessage, verb: &str) -> Option<T> {
+        let body = m.body.as_deref()?;
+        match serde_json::from_str::<T>(body) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(target: "mackesd::chat", error = %e, "bad action/chat/{verb} body");
+                None
+            }
+        }
+    }
+
     fn drain_presence(&mut self, persist: &Persist, state: &mut ChatState) {
         for m in take_new(persist, &mut state.cursors, ACTION_CHAT_PRESENCE) {
-            let Some(body) = m.body.as_deref() else {
+            let Some(req) = Self::parse_action_body::<PresenceRequest>(&m, "presence") else {
                 continue;
-            };
-            let req = match serde_json::from_str::<PresenceRequest>(body) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(target: "mackesd::chat", error = %e, "bad action/chat/presence body");
-                    continue;
-                }
             };
             if let Some(choice) = req.presence {
                 self.manual_presence = choice.to_manual();
@@ -905,15 +912,8 @@ impl ChatWorker {
     fn drain_mutes(&self, persist: &Persist, state: &mut ChatState) {
         let mut changed = false;
         for m in take_new(persist, &mut state.cursors, ACTION_CHAT_MUTE) {
-            let Some(body) = m.body.as_deref() else {
+            let Some(req) = Self::parse_action_body::<MuteRequest>(&m, "mute") else {
                 continue;
-            };
-            let req = match serde_json::from_str::<MuteRequest>(body) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(target: "mackesd::chat", error = %e, "bad action/chat/mute body");
-                    continue;
-                }
             };
             let applied = match req.target {
                 MuteTarget::Contact => {
@@ -949,15 +949,8 @@ impl ChatWorker {
     /// offline-queue copy), relay on `event/chat/message`, fold into memory.
     fn drain_sends(&self, persist: &Persist, state: &mut ChatState, now_ms: i64) {
         for m in take_new(persist, &mut state.cursors, ACTION_CHAT_SEND) {
-            let Some(body) = m.body.as_deref() else {
+            let Some(req) = Self::parse_action_body::<SendRequest>(&m, "send") else {
                 continue;
-            };
-            let req = match serde_json::from_str::<SendRequest>(body) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(target: "mackesd::chat", error = %e, "bad action/chat/send body");
-                    continue;
-                }
             };
             let Some((scope, to, kind)) = req.resolve() else {
                 continue;
@@ -1103,15 +1096,8 @@ impl ChatWorker {
     /// so this only maintains the room registry + membership the UI renders.
     fn drain_room_ops(&self, persist: &Persist, state: &mut ChatState) {
         for m in take_new(persist, &mut state.cursors, ACTION_CHAT_ROOM) {
-            let Some(body) = m.body.as_deref() else {
+            let Some(req) = Self::parse_action_body::<RoomRequest>(&m, "room") else {
                 continue;
-            };
-            let req = match serde_json::from_str::<RoomRequest>(body) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(target: "mackesd::chat", error = %e, "bad action/chat/room body");
-                    continue;
-                }
             };
             match req.op {
                 RoomOp::Create => {
