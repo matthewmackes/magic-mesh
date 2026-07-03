@@ -221,17 +221,9 @@ fn find_next(buffer: &Buffer, needle: &[char], from: usize) -> Option<usize> {
     let rope = buffer.rope();
     let last = n - m;
     let matches = |start: usize| (0..m).all(|k| rope.char(start + k) == needle[k]);
-    for start in from..=last {
-        if matches(start) {
-            return Some(start);
-        }
-    }
-    for start in 0..from.min(last + 1) {
-        if matches(start) {
-            return Some(start);
-        }
-    }
-    None
+    (from..=last)
+        .chain(0..from.min(last + 1))
+        .find(|&start| matches(start))
 }
 
 /// A prefix-sum map from logical lines to **visual rows** for soft-wrap, so the
@@ -379,10 +371,9 @@ impl Caret {
     /// point (`lo == hi`) with no selection. Drives overlap-merge + the fan-out
     /// edit order.
     fn span(&self) -> (usize, usize) {
-        match self.anchor {
-            Some(a) => (a.min(self.cursor), a.max(self.cursor)),
-            None => (self.cursor, self.cursor),
-        }
+        self.anchor.map_or((self.cursor, self.cursor), |a| {
+            (a.min(self.cursor), a.max(self.cursor))
+        })
     }
 
     /// Move this caret to `new`, extending the selection when `extend` (Shift):
@@ -829,7 +820,7 @@ impl EditorView {
         for _ in 0..entry.groups {
             buffer.undo();
         }
-        self.carets = entry.before.0.clone();
+        self.carets.clone_from(&entry.before.0);
         self.primary = entry.before.1.min(self.carets.len().saturating_sub(1));
         self.redo_log.push(entry);
         self.group_open = false;
@@ -848,7 +839,7 @@ impl EditorView {
         for _ in 0..entry.groups {
             buffer.redo();
         }
-        self.carets = entry.after.0.clone();
+        self.carets.clone_from(&entry.after.0);
         self.primary = entry.after.1.min(self.carets.len().saturating_sub(1));
         self.undo_log.push(entry);
         self.group_open = false;
