@@ -4084,6 +4084,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mde-jellyfin"
+version = "12.0.0"
+dependencies = [
+ "dirs",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mde-kdc-host"
 version = "0.0.0"
 dependencies = [

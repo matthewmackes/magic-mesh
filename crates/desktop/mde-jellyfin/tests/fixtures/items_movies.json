@@ -1,0 +1,41 @@
+{
+  "Items": [
+    {
+      "Name": "Big Buck Bunny",
+      "Id": "movie-bbb",
+      "Type": "Movie",
+      "Overview": "A large rabbit deals with three bullies.",
+      "ProductionYear": 2008,
+      "RunTimeTicks": 5960000000,
+      "Genres": ["Animation", "Short", "Comedy"],
+      "CollectionType": null,
+      "ImageTags": { "Primary": "prim-bbb-tag", "Logo": "logo-bbb-tag" },
+      "BackdropImageTags": ["backdrop-bbb-1"],
+      "UserData": {
+        "PlaybackPositionTicks": 0,
+        "PlayCount": 2,
+        "Played": true,
+        "IsFavorite": true,
+        "PlayedPercentage": 100.0
+      }
+    },
+    {
+      "Name": "Sintel",
+      "Id": "movie-sintel",
+      "Type": "Movie",
+      "Overview": "A girl searches for a dragon she raised.",
+      "ProductionYear": 2010,
+      "RunTimeTicks": 8880000000,
+      "Genres": ["Animation", "Fantasy"],
+      "ImageTags": { "Primary": "prim-sintel-tag" },
+      "UserData": {
+        "PlaybackPositionTicks": 3000000000,
+        "PlayCount": 0,
+        "Played": false,
+        "IsFavorite": false
+      }
+    }
+  ],
+  "TotalRecordCount": 2,
+  "StartIndex": 0
+}

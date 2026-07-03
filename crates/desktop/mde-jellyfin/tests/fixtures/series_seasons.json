@@ -1,0 +1,28 @@
+{
+  "Items": [
+    {
+      "Name": "Season 2",
+      "Id": "season-s2",
+      "Type": "Season",
+      "IndexNumber": 2,
+      "SeriesId": "series-cosmos",
+      "SeriesName": "Cosmos",
+      "ParentId": "series-cosmos",
+      "ChildCount": 2,
+      "ImageTags": { "Primary": "prim-s2" }
+    },
+    {
+      "Name": "Season 1",
+      "Id": "season-s1",
+      "Type": "Season",
+      "IndexNumber": 1,
+      "SeriesId": "series-cosmos",
+      "SeriesName": "Cosmos",
+      "ParentId": "series-cosmos",
+      "ChildCount": 2,
+      "ImageTags": { "Primary": "prim-s1" }
+    }
+  ],
+  "TotalRecordCount": 2,
+  "StartIndex": 0
+}

@@ -1,0 +1,18 @@
+{
+  "Items": [
+    {
+      "Name": "Animation",
+      "Id": "genre-animation",
+      "Type": "Genre",
+      "ImageTags": { "Primary": "prim-genre-anim" }
+    },
+    {
+      "Name": "Documentary",
+      "Id": "genre-documentary",
+      "Type": "Genre",
+      "ImageTags": { "Primary": "prim-genre-doc" }
+    }
+  ],
+  "TotalRecordCount": 2,
+  "StartIndex": 0
+}

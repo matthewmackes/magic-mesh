@@ -1,0 +1,42 @@
+{
+  "Items": [
+    {
+      "Name": "S2E1 — Some of the Things That Molecules Do",
+      "Id": "ep-s2e1",
+      "Type": "Episode",
+      "IndexNumber": 1,
+      "ParentIndexNumber": 2,
+      "SeriesId": "series-cosmos",
+      "SeriesName": "Cosmos",
+      "SeasonId": "season-s2",
+      "RunTimeTicks": 26400000000,
+      "UserData": { "PlaybackPositionTicks": 0, "Played": false }
+    },
+    {
+      "Name": "S1E2 — Some of the Things That Vessels Do",
+      "Id": "ep-s1e2",
+      "Type": "Episode",
+      "IndexNumber": 2,
+      "ParentIndexNumber": 1,
+      "SeriesId": "series-cosmos",
+      "SeriesName": "Cosmos",
+      "SeasonId": "season-s1",
+      "RunTimeTicks": 26400000000,
+      "UserData": { "PlaybackPositionTicks": 12000000000, "Played": false }
+    },
+    {
+      "Name": "S1E1 — Standing Up in the Milky Way",
+      "Id": "ep-s1e1",
+      "Type": "Episode",
+      "IndexNumber": 1,
+      "ParentIndexNumber": 1,
+      "SeriesId": "series-cosmos",
+      "SeriesName": "Cosmos",
+      "SeasonId": "season-s1",
+      "RunTimeTicks": 26400000000,
+      "UserData": { "PlaybackPositionTicks": 0, "Played": true }
+    }
+  ],
+  "TotalRecordCount": 3,
+  "StartIndex": 0
+}

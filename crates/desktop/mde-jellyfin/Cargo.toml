@@ -1,0 +1,45 @@
+[package]
+name        = "mde-jellyfin"
+description = "MEDIA-9 — a reqwest+serde Jellyfin API client CORE (library, no UI). Holds N configured Jellyfin servers (base URL + saved token auth), authenticates by Quick Connect (initiate→poll→exchange) and username/password, and models the browse surface (shows→seasons→episodes, movies, music, collections, genres, Continue-Watching + Next-Up, artwork URLs) as typed request builders + serde response structs. The HTTP layer is injected behind an `HttpTransport` trait so every request-builder, response-parser, and browse-tree fold is fixture-tested with NO live network; the real reqwest transport (rustls, airgap-safe to compile) is the one egress point. §6 glue — a typed client others consume (mde-media-egui Sources), never a reimplementation. Tokens persist in a 0600 JSON at the user config dir; no plaintext password is ever written."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_jellyfin"
+path = "src/lib.rs"
+
+[dependencies]
+# The Jellyfin REST responses (Items/NextUp/Resume/Genres, the auth + Quick
+# Connect payloads) are serde structs, and the persisted server store round-trips
+# through serde_json — same stack the media core uses.
+serde      = { workspace = true }
+serde_json = { workspace = true }
+# Error enum, matching the mde-media-core / mackes-xcp convention.
+thiserror  = "1"
+# The user config dir for the saved-token store (`dirs::config_dir()`); already
+# in the workspace lock via mde-bus / mackesd / mde-voice-hud.
+dirs       = "5"
+
+# The one egress point: the real `ReqwestTransport` (behind the injectable
+# `HttpTransport` trait). reqwest 0.12 is already in the workspace lock; `json`
+# matches mde-bus/mde-musicd, `blocking` matches mde-musicd/mde-media-core, and
+# `rustls-tls` (matching mde-media-core) gives airgap-safe HTTPS with NO system
+# OpenSSL — so the crate COMPILES on the airgapped farm (only a live Jellyfin
+# server, out of scope here, needs egress). default-features off keeps the
+# transitive set to what those crates already resolved: no new lock entries.
+[dependencies.reqwest]
+version          = "0.12"
+default-features = false
+features         = ["blocking", "json", "rustls-tls"]
+
+[dev-dependencies]
+# The store persistence tests write to a scratch dir (same idiom as mde-musicd's
+# creds tests); tempfile is already in the workspace lock.
+tempfile = "3"
+
+[lints]
+workspace = true

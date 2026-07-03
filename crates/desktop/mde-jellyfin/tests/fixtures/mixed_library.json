@@ -1,0 +1,35 @@
+{
+  "Items": [
+    {
+      "Name": "Abbey Road",
+      "Id": "album-abbey",
+      "Type": "MusicAlbum",
+      "ProductionYear": 1969,
+      "Genres": ["Rock"],
+      "ImageTags": { "Primary": "prim-abbey" }
+    },
+    {
+      "Name": "The Beatles",
+      "Id": "artist-beatles",
+      "Type": "MusicArtist",
+      "ImageTags": { "Primary": "prim-beatles" }
+    },
+    {
+      "Name": "The Blender Shorts Collection",
+      "Id": "boxset-blender",
+      "Type": "BoxSet",
+      "ChildCount": 3,
+      "CollectionType": "boxsets",
+      "ImageTags": { "Primary": "prim-blender-set" }
+    },
+    {
+      "Name": "Tears of Steel",
+      "Id": "movie-tos",
+      "Type": "Movie",
+      "ProductionYear": 2012,
+      "ImageTags": { "Primary": "prim-tos" }
+    }
+  ],
+  "TotalRecordCount": 4,
+  "StartIndex": 0
+}

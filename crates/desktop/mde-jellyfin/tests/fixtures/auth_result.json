@@ -1,0 +1,10 @@
+{
+  "User": {
+    "Id": "user-9f3a",
+    "Name": "matthew",
+    "ServerId": "srv-77"
+  },
+  "SessionInfo": { "Id": "sess-1" },
+  "AccessToken": "eyJhbGci-ACCESS-TOKEN",
+  "ServerId": "srv-77"
+}

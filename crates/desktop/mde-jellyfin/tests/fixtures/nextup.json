@@ -1,0 +1,17 @@
+{
+  "Items": [
+    {
+      "Name": "S2E2 — A Sky Full of Ghosts",
+      "Id": "ep-s2e2",
+      "Type": "Episode",
+      "IndexNumber": 2,
+      "ParentIndexNumber": 2,
+      "SeriesId": "series-cosmos",
+      "SeriesName": "Cosmos",
+      "SeasonId": "season-s2",
+      "UserData": { "PlaybackPositionTicks": 0, "Played": false }
+    }
+  ],
+  "TotalRecordCount": 1,
+  "StartIndex": 0
+}

@@ -1,0 +1,20 @@
+{
+  "Items": [
+    {
+      "Name": "Sintel",
+      "Id": "movie-sintel",
+      "Type": "Movie",
+      "ProductionYear": 2010,
+      "RunTimeTicks": 8880000000,
+      "ImageTags": { "Primary": "prim-sintel-tag" },
+      "UserData": {
+        "PlaybackPositionTicks": 3000000000,
+        "PlayCount": 1,
+        "Played": false,
+        "PlayedPercentage": 33.8
+      }
+    }
+  ],
+  "TotalRecordCount": 1,
+  "StartIndex": 0
+}
