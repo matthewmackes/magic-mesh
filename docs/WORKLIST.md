@@ -2848,6 +2848,15 @@ Moves the surface launcher from the left vertical rail to a **full-width bottom 
 - [ ] **NAVBAR-7: overflow 'More' (⋯) tray.** **As** a user on a narrow panel, **I want** every surface reachable, **so that** none is lost. **Acceptance:** when grouped glyphs + tray overflow the width, trailing/low-priority surfaces collapse into a `⋯` popup (`egui::menu`); nothing is silently dropped; measured before painting. *(serialises after NAVBAR-2)*
 - [ ] **NAVBAR-8: tie the bar to the compact↔expand mode.** **As** a user, **I want** the bar to match the shell density, **so that** compact mode reclaims space. **Acceptance:** the locked compact/expand mode selects the bar variant — expand = 48px + labels; compact = a shorter icon-only bar; one mode drives the whole shell (reuse the control-surface enum). *(serialises after NAVBAR-1/3)*
 
+### NAVBAR-UNION — merge the Nav Bar + Desktop Chooser into one picker (operator 2026-07-03 follow-up survey; design: docs/design/workbench-navbar.md "one picker")
+
+The bar and `chooser.rs` (the Picker) become one picker system sharing one `ChooserState`. Rides **after NAVBAR-1..3**; touches `dock.rs`/`chooser.rs`/`main.rs` — serialise on those files.
+
+- [ ] **NAVBAR-U1: Desktop entry as a split button.** **As** a user, **I want** one click to return to my desktop, **so that** reconnecting is instant. **Acceptance:** the Desktop cell renders as a split button — main click reconnects the last/active remote desktop (from `ChooserState`), or opens the picker if none; a caret opens the source flyout (U2). Token-styled; keyboard-reachable.
+- [ ] **NAVBAR-U2: source flyout in the bar.** **As** a user, **I want** to pick a desktop source from the bar, **so that** I don't have to enter the full grid first. **Acceptance:** the caret opens a bar popup listing discovered + pinned sources (reuse `connect_picker`/a slim `chooser_grid` reading the shared `ChooserState`); selecting one connects; reuses the NAVBAR-7 flyout/overflow machinery.
+- [ ] **NAVBAR-U3: active sessions as temporary bar entries.** **As** a user, **I want** my open desktops in the bar, **so that** I can switch like a taskbar. **Acceptance:** each connected remote desktop shows a live glyph in the bar (a 'desktops' run), appearing on connect + removed on disconnect; click focuses that session; a session/count badge (reuse NAVBAR-5).
+- [ ] **NAVBAR-U4: one state, two faces.** **As** a user, **I want** the bar picker + the chooser surface to agree, **so that** there's no split brain. **Acceptance:** the bar flyout (compact) and `chooser_panel` (expanded) read/mutate the SAME `ChooserState` (single source of truth for sources/pins/sessions); the compact↔expand mode (NAVBAR-8) selects which face shows; no second store.
+
 ## TESTVM — Spice/VNC/RDP test endpoints for the VDI bed (operator 2026-07-03; `/plan`; design: docs/design/vdi-test-endpoints.md)
 
 Throwaway XCP-ng VMs on a dom0 (LAN-bridged, `172.20.x`) giving the shell's Desktop/VDI surface real targets. Basic connection only. AUTHORIZED (live VDI test bed + blanket op-authorize) — provisioning is live-infra; probe the classifier before exec.

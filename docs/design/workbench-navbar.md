@@ -104,4 +104,33 @@ The dock stays "pure chrome" (reads + writes the active [`Surface`]); only its
   needs it).
 - Per-user themes/skins for the bar (single platform brand, QBRAND).
 
-## Tasks → see `docs/WORKLIST.md` NAVBAR-1..8.
+## Nav Bar ⇄ Chooser union — "one picker" (operator 2026-07-03, follow-up survey)
+
+The operator locked a **full merge**: the bar and the Desktop **Chooser** (`chooser.rs`,
+the "Picker" — a grid of discovered display sources: mesh peers, LAN, local VMs, the
+TESTVM endpoints) become **one picker system** with two faces, sharing one
+`ChooserState`. The Nav Bar picks *surfaces* (what) and *sources* (which remote desktop)
+in one place; the standalone chooser becomes the picker's expanded view.
+
+| # | Decision | Lock |
+|---|----------|------|
+| U1 | Degree of union | **Full merge into one picker** — surfaces + desktop sources + live sessions in one bar-anchored model; the chooser surface is its expanded face, not a separate island. |
+| U2 | Desktop entry | **Split button** — main click reconnects the last/active remote desktop (opens the picker if none); the caret opens a **source flyout** (the chooser's discovered+pinned sources as a bar popup). |
+| U3 | Live sessions | **Temporary bar entries** — each connected remote desktop shows as its own live glyph in the bar (taskbar running-window model), appearing on connect, removed on disconnect; click focuses that session. |
+| U4 | Two faces, one state | The bar flyout (compact) and the `chooser.rs` surface (expanded) **share one `ChooserState`** — single source of truth for sources/pins/sessions; the compact↔expand mode (#15) selects which face shows. |
+
+**Mechanism:** `chooser.rs` already owns `ChooserState` (sources, `ChooserPrefs` pins,
+`take_connect`, `poll`, thumbnails) + `chooser_grid`/`connect_picker`. The union lifts a
+**compact projection** of that state into the bar: (a) the Desktop cell renders as a
+split button reading `ChooserState` for the last/active target + a caret popup that
+reuses `connect_picker`/a slim `chooser_grid`; (b) a `sessions()` view of active VDI
+connections (from the `vdi`/chooser session state) drives the temporary bar entries; (c)
+the full `chooser_panel` stays as the expanded surface, now reading the *same* state the
+bar mutates — no second store. Reuses the NAVBAR-5 badge + NAVBAR-7 flyout/overflow +
+NAVBAR-8 compact↔expand machinery (§6: glue, not a second picker).
+
+**Sequencing:** these ride **after** NAVBAR-1..3 (the bar must exist first) and touch
+`dock.rs` + `chooser.rs` + `main.rs` — serialise with the other NAVBAR tasks on those
+files.
+
+## Tasks → see `docs/WORKLIST.md` NAVBAR-1..8 + NAVBAR-U1..U4.
