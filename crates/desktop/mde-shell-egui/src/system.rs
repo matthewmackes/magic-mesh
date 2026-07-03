@@ -39,12 +39,13 @@ use mde_egui::{field, muted_note, OsdKind, OsdLevel, Severity, Style, Toast};
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{
     Avail, Backlight, BtAdapter, BtDevice, BtStatus, Connector, ConnectorStatus, DdcDisplay,
-    DisplayLayout, DisplayMode, MixerStatus, MixerStrip, MonitorId, OutputArrangement,
+    DisplayLayout, DisplayMode, LidState, MixerStatus, MixerStrip, MonitorId, OutputArrangement,
     PairingAgent, PowerCaps, PowerVerb, Probe, Seat, SeatError, SeatSnapshot, HOTKEYS,
 };
 
 use crate::bt_pairing::{pairing_dialog, PairingBridge};
 use crate::instances::InstancesState;
+use crate::power_honor::PowerHonorConfig;
 use crate::power_settings;
 
 /// Poll cadence — a device plug, a battery drain, or a BT connect surfaces within
@@ -106,6 +107,11 @@ pub(crate) struct SystemState {
     /// Control-error alerts raised by a Bluetooth write — drained by the shell into
     /// the one `ToastBridge` after `show()` (§7: a refused/absent write is surfaced).
     pending_toasts: Vec<Toast>,
+    /// The POWER-5 idle-suspend + lid-close policy the operator edits in the Power
+    /// section — the source of truth the [`crate::power_honor`] honorer reads every
+    /// frame. Loaded from disk on start; saved on change. Safe defaults (idle Never,
+    /// lid Suspend) until the operator picks otherwise.
+    power_honor_config: PowerHonorConfig,
 }
 
 impl Default for SystemState {
@@ -127,6 +133,7 @@ impl Default for SystemState {
             agent_attempted: false,
             pin_input: String::new(),
             pending_toasts: Vec::new(),
+            power_honor_config: PowerHonorConfig::load(),
         }
     }
 }
@@ -159,6 +166,9 @@ pub(crate) enum SysAction {
     /// Set the battery charge-stop cap 0–100 (POWER-4) — routed to
     /// [`Seat::set_charge_threshold`].
     SetChargeThreshold(u8),
+    /// Persist the POWER-5 idle/lid policy after a picker change — the config has
+    /// already been mutated in place; this writes it to disk.
+    SavePowerHonorConfig,
     /// Drive a VM power verb through the Instances broker (§6).
     VmPower { idx: usize, boot: bool },
     // ── Bluetooth control verbs (E12-17) ────────────────────────────────────
@@ -236,6 +246,32 @@ impl SystemState {
         self.snapshot.as_ref()
     }
 
+    /// The POWER-5 idle/lid policy the honorer reads each tick (the source of truth
+    /// the Power section edits).
+    pub(crate) const fn power_honor_config(&self) -> &PowerHonorConfig {
+        &self.power_honor_config
+    }
+
+    /// The latest lid reading for the POWER-5 honorer: `Some` only when the snapshot's
+    /// lid probe is `Present` (a laptop with a lid device); `None` on a desktop
+    /// (`Absent`) or before the first poll — the honorer never acts on a fabricated
+    /// state.
+    pub(crate) fn lid_state(&self) -> Option<LidState> {
+        self.snapshot.as_ref()?.lid.present().copied()
+    }
+
+    /// Drive a power verb from the POWER-5 honorer through the ONE seat (lock 1) —
+    /// the idle timer and lid handler act here (Suspend / Lock). The confirm-gate is
+    /// deliberately bypassed: the honorer's arming IS the operator's consent (a
+    /// chosen idle timeout / lid action), exactly as swayidle/logind would act
+    /// unattended. A typed failure is returned for an honest note, never a panic.
+    ///
+    /// # Errors
+    /// The logind client's typed errors (a polkit refusal / absent logind).
+    pub(crate) fn honor_power(&self, verb: PowerVerb) -> Result<(), SeatError> {
+        self.seat.power(verb)
+    }
+
     /// Render the surface's live content, driving Displays + Power against the seat
     /// and the shared Instances broker (per-VM power rows, §6).
     pub(crate) fn show(&mut self, ui: &mut egui::Ui, instances: &mut InstancesState) {
@@ -251,6 +287,7 @@ impl SystemState {
                 error,
                 pairing,
                 pin_input,
+                power_honor_config,
                 ..
             } = self;
             let snap = snapshot.as_ref();
@@ -282,6 +319,7 @@ impl SystemState {
                             snap,
                             *confirm,
                             charge_threshold,
+                            power_honor_config,
                             instances,
                             &mut actions,
                         );
@@ -346,6 +384,8 @@ impl SystemState {
                 // success (§7).
                 SysAction::SetPowerProfile(name) => self.drive_power_profile(name),
                 SysAction::SetChargeThreshold(pct) => self.drive_charge_threshold(pct),
+                // POWER-5: persist the idle/lid policy the picker just mutated.
+                SysAction::SavePowerHonorConfig => self.power_honor_config.save(),
                 SysAction::VmPower { idx, boot } => instances.drive_power(idx, boot),
                 // ── Bluetooth writes (E12-17) — each drives the ONE seat's BlueZ
                 // client, folds a typed failure to the inline error + a toast, and
@@ -1312,6 +1352,7 @@ fn power_section(
     snap: Option<&SeatSnapshot>,
     confirm: Option<PowerVerb>,
     charge_threshold: &mut Option<u8>,
+    power_honor_config: &mut PowerHonorConfig,
     instances: &InstancesState,
     actions: &mut Vec<SysAction>,
 ) {
@@ -1330,6 +1371,13 @@ fn power_section(
             power_verb_row(ui, PowerVerb::PowerOff, caps.poweroff, confirm, actions);
         },
     );
+
+    // Idle-suspend + lid-close policy (POWER-5) — the honorer that enforces these
+    // lives in `crate::power_honor` and reads this config every frame, so the
+    // pickers are §7-real (never inert). Safe defaults: idle Never, lid Suspend.
+    ui.add_space(Style::SP_XS);
+    power_settings::idle_timeout_body(ui, power_honor_config, actions);
+    power_settings::lid_action_body(ui, power_honor_config, actions);
 
     // Power profile (POWER-4) — the daemon's available set + current active. When
     // power-profiles-daemon is Absent the probe renders the honest "unavailable"

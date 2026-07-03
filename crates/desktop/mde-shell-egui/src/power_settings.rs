@@ -22,17 +22,22 @@
 //! - **Rich telemetry** — time-to-empty / time-to-full + draw rate
 //!   ([`battery_telemetry`]), formatted compactly, omitted honestly when absent.
 //!
-//! Idle-suspend-timeout and lid-close-action are deliberately NOT here — those
-//! are POWER-5 (they need the idle/lid honorer to not be inert).
+//! POWER-5 adds two more, now non-inert: the **idle-suspend timeout** picker
+//! ([`idle_timeout_body`]) and the **lid-close action** dropdown
+//! ([`lid_action_body`]). These edit the persisted [`PowerHonorConfig`] the
+//! [`crate::power_honor`] honorer enforces every frame — so they are §7-real
+//! (the timer really suspends on idle, the lid handler really acts), never a dead
+//! control. The safe defaults live in the config: idle **Never**, lid **Suspend**.
 //!
 //! Token-only styling (§4): every colour/size/space is a [`Style`] constant.
 
 use std::time::Duration;
 
-use mde_egui::egui::{self, RichText, Slider};
+use mde_egui::egui::{self, ComboBox, RichText, Slider};
 use mde_egui::{field, muted_note, Style};
 use mde_seat::{Battery, ProfileState, SeatError};
 
+use crate::power_honor::{LidAction, PowerHonorConfig};
 use crate::system::SysAction;
 
 /// The charge-stop cap slider's range. Below ~50% is rarely a useful pack-sparing
@@ -212,6 +217,101 @@ pub(crate) fn battery_telemetry(b: &Battery) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("  \u{00B7}  "))
 }
 
+// ──────────────────────────── idle-suspend + lid (POWER-5) ────────────────────────────
+
+/// The idle-suspend timeout options, in picker order. `None` = Never (off) — the
+/// SAFE DEFAULT so a fresh install never surprise-suspends until the operator arms
+/// it; the rest are the familiar 1 / 5 / 10 / 30-minute steps.
+const IDLE_OPTIONS: [Option<u64>; 5] = [None, Some(1), Some(5), Some(10), Some(30)];
+
+/// The operator-facing label for an idle-timeout option.
+#[must_use]
+pub(crate) fn idle_option_label(mins: Option<u64>) -> String {
+    mins.map_or_else(|| "Never".to_owned(), |m| format!("{m} min"))
+}
+
+/// The idle-suspend timeout picker (POWER-5) — Never / 1 / 5 / 10 / 30 min, editing
+/// the honorer's persisted [`PowerHonorConfig`]. A real change writes the new value
+/// into `config` and dispatches [`SysAction::SavePowerHonorConfig`] so it persists;
+/// an unchanged re-pick is not re-saved (§7: no inert write). The honorer reads this
+/// config every frame, so the choice is enforced — never a dead control.
+pub(crate) fn idle_timeout_body(
+    ui: &mut egui::Ui,
+    config: &mut PowerHonorConfig,
+    actions: &mut Vec<SysAction>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Suspend when idle")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_S);
+        ComboBox::from_id_salt("power5-idle-timeout")
+            .selected_text(
+                RichText::new(idle_option_label(config.idle_timeout_min)).size(Style::SMALL),
+            )
+            .show_ui(ui, |ui| {
+                for opt in IDLE_OPTIONS {
+                    let selected = config.idle_timeout_min == opt;
+                    if ui
+                        .selectable_label(
+                            selected,
+                            RichText::new(idle_option_label(opt)).size(Style::SMALL),
+                        )
+                        .clicked()
+                        && !selected
+                    {
+                        config.idle_timeout_min = opt;
+                        actions.push(SysAction::SavePowerHonorConfig);
+                    }
+                }
+            });
+    });
+    muted_note(
+        ui,
+        "Suspends this seat after the chosen idle time; \u{201C}Never\u{201D} keeps it awake.",
+    );
+}
+
+/// The lid-close action dropdown (POWER-5) — Suspend / Lock / Do nothing, editing
+/// the honorer's persisted [`PowerHonorConfig`]. Suspend is the default. A real
+/// change writes the choice and dispatches [`SysAction::SavePowerHonorConfig`]; the
+/// honorer acts on the next Open→Closed lid edge, so this is §7-real.
+pub(crate) fn lid_action_body(
+    ui: &mut egui::Ui,
+    config: &mut PowerHonorConfig,
+    actions: &mut Vec<SysAction>,
+) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("When the lid closes")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_S);
+        ComboBox::from_id_salt("power5-lid-action")
+            .selected_text(RichText::new(config.lid_action.label()).size(Style::SMALL))
+            .show_ui(ui, |ui| {
+                for action in LidAction::ALL {
+                    let selected = config.lid_action == action;
+                    if ui
+                        .selectable_label(selected, RichText::new(action.label()).size(Style::SMALL))
+                        .clicked()
+                        && !selected
+                    {
+                        config.lid_action = action;
+                        actions.push(SysAction::SavePowerHonorConfig);
+                    }
+                }
+            });
+    });
+    muted_note(
+        ui,
+        "A desktop with no lid device honestly ignores this (nothing to close).",
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +481,31 @@ mod tests {
         );
         // The supported slider seeded its live value from the probe (80).
         assert_eq!(live, Some(80));
+    }
+
+    #[test]
+    fn the_idle_option_labels_read_never_and_minutes() {
+        assert_eq!(idle_option_label(None), "Never");
+        assert_eq!(idle_option_label(Some(1)), "1 min");
+        assert_eq!(idle_option_label(Some(30)), "30 min");
+    }
+
+    #[test]
+    fn the_power5_pickers_draw_and_dispatch_nothing_on_an_untouched_frame() {
+        let mut actions: Vec<SysAction> = Vec::new();
+        let mut config = PowerHonorConfig::default();
+        let drew = paints(|ui| {
+            idle_timeout_body(ui, &mut config, &mut actions);
+            lid_action_body(ui, &mut config, &mut actions);
+        });
+        assert!(drew, "the POWER-5 pickers drew nothing");
+        // No interaction was injected → no config write may dispatch (§7: a picker
+        // acts on a real selection, never spuriously on paint).
+        assert!(
+            actions.is_empty(),
+            "an untouched frame must not dispatch a save"
+        );
+        // The safe defaults are unchanged by a mere paint.
+        assert_eq!(config, PowerHonorConfig::default());
     }
 }

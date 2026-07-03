@@ -32,6 +32,7 @@ mod instances;
 mod keyboard;
 mod mesh_view;
 mod network;
+mod power_honor;
 mod power_settings;
 mod provisioning;
 mod services_flow;
@@ -234,6 +235,11 @@ struct Shell {
     /// the shell auto-opens the Mesh Map. The receive half of a flow whose publish
     /// half is integration-gated, exactly like the VDI / Browser transports.
     self_test: mesh_view::SelfTestWatch,
+    /// The POWER-5 idle + lid honorer — the compositorless DRM shell's own
+    /// swayidle/logind-lid replacement. Ticked once per frame; enforces the
+    /// operator's idle-suspend timeout + lid-close action (read from the System
+    /// state's persisted config) against the ONE seat. Safe by default (idle off).
+    power_honor: power_honor::PowerHonor,
 }
 
 impl Shell {
@@ -274,6 +280,7 @@ impl Shell {
             editor_launch: EditorLaunchWatch::from_env(),
             mesh_view: mesh_view::MeshViewState::default(),
             self_test: mesh_view::SelfTestWatch::default(),
+            power_honor: power_honor::PowerHonor::default(),
         }
     }
 
@@ -705,6 +712,13 @@ impl Shell {
         // cadence) — the chrome's Bluetooth/Volume icons stay live even while the
         // System surface isn't the one in view.
         self.system.poll(ctx);
+
+        // POWER-5 — the DRM-native idle + lid honorer: one tick per frame folds this
+        // frame's input + the seat's lid reading into the idle-suspend / lid-close
+        // decision and drives it through the ONE seat (a self-contained block so an
+        // EDITOR-9 merge stays trivial). Safe by default — idle-suspend is off until
+        // the operator arms it in the Power section.
+        self.power_honor.tick(ctx, &self.system);
 
         // E12-17 — the BlueZ pairing agent is live only while the System surface is
         // in view: register on entry (once an adapter is present), drop
