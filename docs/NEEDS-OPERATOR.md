@@ -64,3 +64,10 @@ operator-provided cred/host — drop any and the loop wires + live-verifies it:
   MEDIA-2) + an **external SIP account** (Voice) so `LiveServiceApply` can provision /
   register.
 - **OW-12** (parked 2026-07-03) — Quasar/headless WS kickstart authored (packaging/kickstart/magic-on-quasar.ks, bash -n + shellcheck clean); remaining acceptance is LIVE-BOOT-GATED (boot the ISO to confirm display + headless WS onboard) + the .iso cut is OPERATOR-GATED (/release, incl. RPM signing + bootc registry publish)
+
+## Scope decisions (operator, 2026-07-03)
+- **E12-9 remote audio DESCOPED** — remote RDPSND audio is WON'T-DO for the current release (avoids an ironrdp bump on a pinned dep). Local CH virtio-sound stays in scope (CH-support-gated). Clipboard + mesh-share bridges already done. E12-9 stays [>] on the local-audio remainder.
+- **MOTION-TRANS-4 + MOTION-PERF-4 → [✗] WON'T-DO** — their acceptance targets the retired iced/Cosmic compositor; carrying the polish to the egui/Quasar shell would be net-new work, not completion (mirrors GUI-9).
+- **ROUTER-6 → stays [!] DEFERRED-YAGNI** — single EdgeRouter; un-defer only at a 2nd appliance (migrating live prod DHCP/firewall state for zero current benefit is pure risk).
+- **12.1 release: KEEP ACCUMULATING** — no cut yet; drain the DAR live tail + VDI bed first.
+- **AUTHORIZED (2026-07-03): standing prod-SSH + XCP cloud create/delete + maintenance window** (DAR DevOps-rebuild live tail) + **stand up the live Quasar VDI test bed** (E12 VDI live legs).
