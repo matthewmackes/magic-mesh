@@ -15,6 +15,18 @@
 
 [workspace]
 resolver = "2"
+# mde-web-preview (BOOKMARKS-5, the sandboxed Servo browser helper) is EXCLUDED
+# from the main workspace lockfile ON PURPOSE: the `servo` engine pulls
+# `servo-storage` → rusqlite 0.37 → libsqlite3-sys 0.35 (a NON-optional dep, no
+# feature gate), which collides on the native `links = "sqlite3"` uniqueness rule
+# with the mesh's rusqlite 0.32 / libsqlite3-sys 0.30 (mackesd CA/nebula daemon,
+# mde-bus, mde-files, mde-bookmarks). Two packages can't link the same native lib
+# in one Cargo.lock. Isolating the browser into its own lock/target keeps that
+# heavy, security-critical engine out of the live-fleet daemon's resolution.
+# Follow-up (design Q52): unify the workspace on rusqlite 0.37 so this crate can
+# rejoin the single-workspace build. Build it standalone:
+#   cargo build --manifest-path crates/desktop/mde-web-preview/Cargo.toml
+exclude = ["crates/desktop/mde-web-preview"]
 members = [
     "crates/platform/mde-bus",
     "crates/platform/mde-role",
