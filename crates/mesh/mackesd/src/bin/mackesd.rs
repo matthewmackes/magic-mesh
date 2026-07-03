@@ -10746,6 +10746,75 @@ fn backoffice_up_script_path() -> std::path::PathBuf {
     repo.join("automation/backoffice/backoffice-up.sh")
 }
 
+/// OW-4 — redeem a wizard-minted `MDEINV1-…` invite (or its `mde-invite:` QR
+/// twin) on the join side. Validates the presented code — mesh-scope + TTL
+/// offline, then the bearer ledger — and maps it to the same v3 CSR the
+/// lighthouse signs (`invite::redeem`). The MDEINV1 envelope is endpoint-less
+/// by design (a code is presented over many transports and stays QR-short), so
+/// the live network-enroll leg (CSR → signed bundle → overlay IP) is
+/// integration-gated with a typed error rather than faked: a code alone cannot
+/// contact a lighthouse. The operator completes a live join with the
+/// endpoint-bearing v3 token from `mackesd found`.
+fn cmd_join_invite(
+    raw_token: &str,
+    parsed: mde_role::Role,
+    _name: Option<String>,
+    workgroup_root: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use mackesd_core::onboard::invite;
+
+    let root = workgroup_root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
+    let node_id = default_node_id();
+
+    // Decode up front to learn the invite's declared mesh: a box already on a
+    // mesh must present an invite FOR that mesh (cross-mesh codes refused),
+    // while a fresh box ADOPTS the mesh the invite names.
+    let decoded = invite::Invite::decode(raw_token)
+        .ok_or_else(|| anyhow::anyhow!("invite refused: {}", invite::RedeemError::Malformed))?;
+    let founded = mackesd_core::ca::bundle::read_bundle(&mackesd_core::ca::bundle::bundle_path(
+        &root, &node_id,
+    ))
+    .is_ok();
+    let expected_mesh = if founded {
+        invite::resolve_mesh_id(&root, &node_id)
+    } else {
+        decoded.mesh_id
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+
+    // Validate: mesh-scope + TTL + the bearer ledger. Expired / foreign /
+    // tampered codes are refused here with a typed error, never a panic.
+    let redeemed = invite::validate_for_redeem(&root, raw_token, now_ms, &expected_mesh)
+        .map_err(|e| anyhow::anyhow!("invite refused ({}): {e}", e.reason()))?;
+
+    // Pin the role when unpinned, matching the v3 join.
+    match mde_role::load() {
+        Ok(existing) => println!("role already pinned: {existing}"),
+        Err(mde_role::LoadError::NotPinned) => {
+            mde_role::pin(parsed).map_err(|e| anyhow::anyhow!("pinning role: {e}"))?;
+            println!("role pinned: {}", parsed.as_str());
+        }
+        Err(e) => anyhow::bail!("reading role: {e}"),
+    }
+
+    // Validated — but the envelope has no `/enroll` endpoint, so the live enroll
+    // leg needs the lighthouse address the invite cannot supply. Gate it
+    // honestly rather than fake an endpoint: the redemption mapping is proven by
+    // unit tests to yield the same v3 CSR inputs, and the 2-box network leg is
+    // integration-gated.
+    anyhow::bail!(
+        "invite for mesh `{}` validated (live + ledger-recorded) — its redemption \
+         maps to the same v3 CSR the lighthouse signs, but an MDEINV1 code is \
+         endpoint-less; the live enroll leg needs the lighthouse `/enroll` endpoint. \
+         Complete a network join now with the endpoint-bearing token from \
+         `mackesd found` (mesh:<id>@<ip>:<port>#<bearer>?fp=<sha256>). [OW-4]",
+        redeemed.mesh_id,
+    );
+}
+
 /// ONBOARD-4 — the `join` verb. One-command peer join: pin role +
 /// fingerprint-pinned network-enroll + materialize /etc/nebula.
 fn cmd_join(
@@ -10769,6 +10838,16 @@ fn cmd_join(
     let parsed: mde_role::Role = role
         .parse()
         .map_err(|_| anyhow::anyhow!("unknown role `{role}` — expected lighthouse|workstation"))?;
+
+    // OW-4 — a wizard-minted `MDEINV1-…` invite (or its `mde-invite:` QR twin) is
+    // a DIFFERENT token type than the v3 `mesh:<id>@<ip>:<port>#<bearer>` join
+    // token, so `parse_join_token` would reject it. Redeem it on this branch:
+    // validate mesh-scope + TTL + the bearer ledger, then gate the endpoint-
+    // needing live leg (the envelope is endpoint-less by design).
+    if mackesd_core::onboard::invite::looks_like_invite(&raw_token) {
+        return cmd_join_invite(&raw_token, parsed, name, workgroup_root);
+    }
+
     let token = mackesd_core::nebula_enroll::parse_join_token(&raw_token).ok_or_else(|| {
         anyhow::anyhow!("invalid join token (expected mesh:<id>@<ip>:<port>#<bearer>?fp=<sha256>)")
     })?;
