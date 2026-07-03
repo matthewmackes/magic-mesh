@@ -2525,7 +2525,7 @@ Reproducible + portable per-mesh DevOps backoffice on a dedicated control VM, re
   - When set, found runs the full existing flow then writes `/mcnf/backoffice/intent {tier,host,ts}` (verify via etcd range) and prints the literal next command `backoffice-up.sh --tier <t>`; `--tier bogus` exits non-zero; re-run overwrites (not duplicates) the key.
   - Without the flag, found is byte-for-byte unchanged (regression test asserts no backoffice call); cargo build + clippy + the mackesd suite stay green.
 
-- [ ] **DAR-19 — Control VM provisioner (`control-vm-provision.sh`): xen-xapi apply → mesh peer → on-VM keygen → reseal → backoffice-up** `(live-gated)`
+- [>] **DAR-19 — Control VM provisioner (`control-vm-provision.sh`): xen-xapi apply → mesh peer → on-VM keygen → reseal → backoffice-up** `(live-gated)`
   As the platform, I want the control VM stood up on the founding dom0 and enrolled as a full mesh peer with its own key, so the backoffice runs on a dedicated VM with no master secret in state.
   - `tofu apply`s `infra/tofu/control-vm` to create one VM on the founding dom0; after boot it runs `mackesd join <token> --role server` and the VM appears in `mackesd peers --json` with an overlay IP, and `mcnf-secret.sh init-self` has registered `/mcnf/age-recipients/<node-id>`.
   - The provisioner runs (or prompts the operator to run) `mcnf-secret.sh reseal-to <vm-recipient>` then ssh-execs `backoffice-up.sh --tier <t>` and streams the phase log.
