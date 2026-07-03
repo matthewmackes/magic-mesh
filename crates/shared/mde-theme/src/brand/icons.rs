@@ -3,9 +3,10 @@
 //! The 19 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10) embedded as
 //! inline SVG consts behind [`IconId`], plus the SVG→raster loader
 //! ([`icon_image`]) every surface draws them through. The glyphs are authored
-//! 100% in `currentColor`, so ONE embedded set serves every tint: the loader
-//! substitutes the caller's color pre-parse and rasterizes with `resvg` at the
-//! exact requested pixel size — DPI-crisp at any scale, no pre-baked PNG ladder.
+//! in `currentColor` (the text-lockup wordmark excepted — see below), so ONE
+//! embedded set serves every tint: the loader substitutes the caller's color
+//! pre-parse and rasterizes with `resvg` at the exact requested pixel size —
+//! DPI-crisp at any scale, no pre-baked PNG ladder.
 //!
 //! ## Toolkit-free by design
 //!
@@ -26,14 +27,17 @@
 //!
 //! ## The wordmark logotype
 //!
-//! [`IconId::Wordmark`] carries a `<text>` element for the "Magic Mesh"
-//! logotype. `resvg` is built here without its `text`/fontdb features (the
-//! minimal, farm-vendorable configuration), so the logotype text is *skipped*
-//! at raster time: the wordmark renders its mesh-mark lockup and leaves the
-//! text region blank — it parses, rasterizes non-empty and never panics. The
-//! SVG's own `<desc>` flags this; the designed fix is outlining the logotype
-//! to paths in the asset (a QBRAND-10 follow-up), with resvg's `text` feature
-//! + a bundled fontdb as the heavier alternative.
+//! [`IconId::Wordmark`] is the official stacked text lockup ("MDE" / "Quazar"
+//! / "Mackes Display Environment") — pure `<text>` elements carrying their own
+//! brand fills (it is the one glyph NOT authored in `currentColor`, so the
+//! tint does not recolor it). `resvg` is built here without its `text`/fontdb
+//! features (the minimal, farm-vendorable configuration), so the lockup
+//! parses and keeps its 320×184 aspect but rasterizes fully transparent — it
+//! never panics, and callers wanting the visible lockup should use the
+//! official raster assets (`assets/brand/quasar/app-icon-*.png` /
+//! `brand::logo`, QBRAND-3). The SVG's own `<desc>` flags the designed fix:
+//! outlining the letterforms to paths, with resvg's `text` feature + a
+//! bundled fontdb as the heavier alternative.
 
 use std::fmt;
 
@@ -57,10 +61,13 @@ macro_rules! quasar_svg {
 /// embedded source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IconId {
-    /// The hexagonal mesh product mark (`mark.svg`).
+    /// The round mesh-node constellation product mark (`mark.svg`, the 64×64
+    /// trace of the official artwork; the blue plane rides a 0.55-opacity
+    /// group so single-color tinting keeps the two-tone hierarchy).
     Mark,
-    /// The mark + "Magic Mesh" logotype lockup (`wordmark.svg`, 210×48 —
-    /// see the module docs for the logotype's fontdb caveat).
+    /// The stacked "MDE / Quazar / Mackes Display Environment" text lockup
+    /// (`wordmark.svg`, 320×184 — rasterizes transparent without a fontdb;
+    /// see the module docs).
     Wordmark,
     /// A single mesh node/peer glyph (`node.svg`), health-tinted by callers.
     Node,
@@ -122,8 +129,9 @@ impl IconId {
         Self::Lighthouse,
     ];
 
-    /// The embedded SVG source for this glyph — `currentColor` line-art,
-    /// `viewBox 0 0 32 32` (the wordmark alone is `0 0 210 48`).
+    /// The embedded SVG source for this glyph — `currentColor` line-art in a
+    /// square viewBox (`0 0 32 32` for the surface/role/node glyphs, `0 0 64
+    /// 64` for the mark); the wordmark alone is a `0 0 320 184` text lockup.
     #[must_use]
     pub const fn svg(self) -> &'static str {
         match self {
@@ -248,9 +256,11 @@ impl std::error::Error for IconError {}
 /// Rasterize a brand glyph at exactly `size_px` tall, tinted `[r, g, b, a]`.
 ///
 /// The glyph's `currentColor` is substituted with the tint's RGB *before*
-/// parsing (the set is 100% `currentColor` line-art, so a string substitution
-/// colors every stroke and fill); the tint's alpha is applied per-pixel after
-/// rasterization, since SVG hex colors carry no alpha channel. The raster
+/// parsing (the line-art glyphs are authored in `currentColor`, so a string
+/// substitution colors every stroke and fill; per-glyph `opacity` groups keep
+/// the traced artwork's tonal hierarchy under the single color); the tint's
+/// alpha is applied per-pixel after rasterization, since SVG hex colors carry
+/// no alpha channel. The raster
 /// height is exactly `size_px` and the width follows the source aspect ratio —
 /// `size_px × size_px` for the square glyphs, proportionally wider for the
 /// wordmark — so the result is DPI-crisp at whatever physical size the caller
@@ -329,9 +339,14 @@ mod tests {
         rgba.chunks_exact(4).filter(|px| px[3] > 0).count()
     }
 
-    /// Index of pixel `(x, y)`'s first byte in a raster of `width` pixels.
-    fn px_index(img: &super::IconImage, x: usize, y: usize) -> usize {
-        (y * img.size_usize()[0] + x) * 4
+    /// Byte index of the strongest-coverage pixel — a geometry-independent
+    /// anchor for the tint assertions (the official mark trace has no
+    /// guaranteed feature at any fixed coordinate).
+    fn max_alpha_index(rgba: &[u8]) -> usize {
+        rgba.chunks_exact(4)
+            .enumerate()
+            .max_by_key(|(_, px)| px[3])
+            .map_or(0, |(i, _)| i * 4)
     }
 
     #[test]
@@ -344,51 +359,79 @@ mod tests {
                 assert!(img.width >= size, "{id:?} @ {size}px width {}", img.width);
                 let [w, h] = img.size_usize();
                 assert_eq!(img.rgba.len(), w * h * 4, "{id:?} @ {size}px buffer len");
-                assert!(
-                    opaque_pixels(&img.rgba) > 0,
-                    "{id:?} @ {size}px rasterized empty"
-                );
+                // The wordmark is pure <text> and rasterizes transparent
+                // without a fontdb (module docs; the dedicated wordmark test
+                // pins that behavior) — every other glyph must show ink.
+                if id != IconId::Wordmark {
+                    assert!(
+                        opaque_pixels(&img.rgba) > 0,
+                        "{id:?} @ {size}px rasterized empty"
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn tint_rgb_lands_on_the_mark_center_dot() {
-        // mark.svg fills a solid circle (r 2.6) at the exact viewBox center
-        // (16, 16); at 32 px (scale 1.0) the raster pixel (16, 16) sits deep
-        // inside it, away from any anti-aliased edge.
-        let img = icon_image(IconId::Mark, 32, [0xff, 0x00, 0x00, 0xff]).expect("mark rasterizes");
-        let idx = px_index(&img, 16, 16);
-        assert_eq!(
-            &img.rgba[idx..idx + 4],
-            &[0xff, 0x00, 0x00, 0xff],
-            "center dot must carry the tint"
+    fn tint_rgb_covers_every_inked_pixel() {
+        // The mark is pure currentColor, so after the pre-parse substitution
+        // EVERY covered pixel must carry exactly the tint's RGB (demultiply
+        // is exact for 0x00/0xff channels), whatever the traced geometry.
+        let img = icon_image(IconId::Mark, 64, [0xff, 0x00, 0x00, 0xff]).expect("mark rasterizes");
+        let mut inked = 0_usize;
+        for px in img.rgba.chunks_exact(4) {
+            if px[3] > 0 {
+                inked += 1;
+                assert_eq!(&px[..3], &[0xff, 0x00, 0x00], "inked pixel off-tint");
+            }
+        }
+        assert!(inked > 0, "mark rasterized empty");
+        // Something renders at real strength too: the blue-plane node fills
+        // sit in a 0.55-opacity group (≈ alpha 140), the white plane at full.
+        let idx = max_alpha_index(&img.rgba);
+        assert!(
+            img.rgba[idx + 3] >= 128,
+            "mark strongest coverage too faint: {}",
+            img.rgba[idx + 3]
         );
     }
 
     #[test]
     fn tint_alpha_scales_coverage() {
-        // A fully covered pixel under a half-alpha tint lands at exactly the
-        // tint's alpha (255 × 128 / 255 = 128).
-        let img = icon_image(IconId::Mark, 32, [0xff, 0xff, 0xff, 0x80]).expect("mark rasterizes");
-        let idx = px_index(&img, 16, 16);
-        assert_eq!(img.rgba[idx + 3], 0x80, "tint alpha must scale coverage");
+        // Same glyph, same size, tint alpha 255 vs 128: the coverage raster
+        // is identical, so each pixel's alpha must land at exactly
+        // (coverage × 128 + 127) / 255 — checked at the strongest pixel,
+        // independent of the traced geometry.
+        let full = icon_image(IconId::Mark, 64, [0xff, 0xff, 0xff, 0xff]).expect("full-alpha mark");
+        let half = icon_image(IconId::Mark, 64, [0xff, 0xff, 0xff, 0x80]).expect("half-alpha mark");
+        let idx = max_alpha_index(&full.rgba);
+        let coverage = full.rgba[idx + 3]; // scale_alpha(c, 255) == c
+        assert!(coverage > 0, "mark rasterized empty");
+        let expected = u8::try_from((u16::from(coverage) * 0x80 + 127) / 255).unwrap_or(u8::MAX);
+        assert_eq!(
+            half.rgba[idx + 3],
+            expected,
+            "tint alpha must scale coverage {coverage}"
+        );
     }
 
     #[test]
-    fn wordmark_rasterizes_the_lockup_without_a_fontdb() {
-        // The logotype <text> is skipped (resvg built without text/fontdb —
-        // see the module docs); the mesh-mark lockup must still rasterize
-        // non-empty, keeping the wide 210×48 aspect, with no panic.
-        let img = icon_image(IconId::Wordmark, 48, TINT).expect("wordmark rasterizes");
+    fn wordmark_is_empty_without_a_fontdb_but_never_panics() {
+        // The official wordmark is a pure-<text> stacked lockup; resvg is
+        // built here without text/fontdb (module docs), so it must parse,
+        // keep its wide 320×184 aspect and return a fully transparent raster
+        // — gracefully, no panic. The visible lockup ships via the official
+        // raster assets (app-icon-*.png / brand::logo, QBRAND-3).
+        let img = icon_image(IconId::Wordmark, 48, TINT).expect("wordmark parses + rasterizes");
         assert_eq!(img.height, 48);
-        assert!(
-            img.width > img.height * 2,
-            "wordmark keeps its wide aspect (got {}x{})",
-            img.width,
-            img.height
+        assert_eq!(img.width, 83, "320×184 aspect at 48px tall");
+        let [w, h] = img.size_usize();
+        assert_eq!(img.rgba.len(), w * h * 4);
+        assert_eq!(
+            opaque_pixels(&img.rgba),
+            0,
+            "text lockup unexpectedly rendered without a fontdb"
         );
-        assert!(opaque_pixels(&img.rgba) > 0, "wordmark rasterized empty");
     }
 
     #[test]
