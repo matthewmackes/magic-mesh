@@ -26,6 +26,14 @@
 //! `Stopped`/`Ended`), the live position/duration, the enumerated [`Track`]s, and
 //! an ordered [`PlayerEvent`] stream the surface renders from.
 //!
+//! # Audio (MEDIA-3)
+//!
+//! [`Player::set_audio_config`] applies a typed [`AudioConfig`] — `PipeWire` ao
+//! (the seat audio path), a graphic [`EqBand`] EQ, [`LoudnessNorm`]/[`ReplayGainMode`]
+//! normalization, extra [`AudioFilter`]s, and gapless. It *folds* to mpv's `af`
+//! graph + properties (unit-tested against [`FakeMpv`]); the audible `PipeWire`
+//! result is honest-gated to the `mpv`-feature real-clip smoke.
+//!
 //! ```
 //! use mde_media_core::{FakeMpv, Player, PlayerState};
 //!
@@ -42,6 +50,7 @@
 // rather than a `#[must_use]`-critical API surface.
 #![allow(clippy::module_name_repetitions, clippy::must_use_candidate)]
 
+pub mod audio;
 pub mod engine;
 pub mod fake;
 pub mod player;
@@ -49,6 +58,9 @@ pub mod player;
 #[cfg(feature = "mpv")]
 pub mod mpv;
 
+pub use audio::{
+    AudioConfig, AudioDriver, AudioFilter, AudioOutput, EqBand, LoudnessNorm, ReplayGainMode,
+};
 pub use engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
 pub use fake::FakeMpv;
 pub use player::{Player, PlayerError, PlayerEvent, PlayerState};

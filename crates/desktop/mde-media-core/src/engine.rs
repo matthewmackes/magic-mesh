@@ -13,6 +13,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::audio::AudioConfig;
+
 /// A failure surfaced by a [`MediaEngine`].
 ///
 /// The real engine maps mpv's `mpv_error` codes into these; [`FakeMpv`] raises
@@ -127,6 +129,7 @@ pub enum EngineSignal {
 /// | [`duration`]       | `get_property duration`               |
 /// | [`tracks`]         | `get_property track-list`             |
 /// | [`poll`]           | drain `wait_event`                    |
+/// | [`apply_audio_config`] | set `af` + `ao`/`replaygain`/… props |
 ///
 /// [`load_file`]: MediaEngine::load_file
 /// [`set_paused`]: MediaEngine::set_paused
@@ -136,6 +139,7 @@ pub enum EngineSignal {
 /// [`duration`]: MediaEngine::duration
 /// [`tracks`]: MediaEngine::tracks
 /// [`poll`]: MediaEngine::poll
+/// [`apply_audio_config`]: MediaEngine::apply_audio_config
 pub trait MediaEngine {
     /// Begin loading `url` (local path or stream URL). Playback readiness arrives
     /// later as an [`EngineSignal::FileLoaded`] from [`poll`](Self::poll).
@@ -176,4 +180,16 @@ pub trait MediaEngine {
     /// Drain any pending engine signals. Returns them in arrival order; an empty
     /// vec means nothing happened since the last poll.
     fn poll(&mut self) -> Vec<EngineSignal>;
+
+    /// Apply an [`AudioConfig`] (MEDIA-3): route the ao (the `PipeWire` seat audio
+    /// path), install the EQ + loudness `af` filter graph, and set the
+    /// `ReplayGain` + gapless properties. These are global mpv properties settable
+    /// with or without media loaded, so no [`EngineError::NotLoaded`] arises here.
+    ///
+    /// §6: pure ao/af/property glue — the config *folds* to the mpv strings; no
+    /// DSP is reimplemented.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Backend`] if the backend rejects a property set.
+    fn apply_audio_config(&mut self, config: &AudioConfig) -> Result<(), EngineError>;
 }

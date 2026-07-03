@@ -18,6 +18,7 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
+use crate::audio::AudioConfig;
 use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track};
 
 /// The authoritative playback state.
@@ -110,6 +111,10 @@ pub struct Player<E: MediaEngine> {
     position: f64,
     duration: Option<f64>,
     tracks: Vec<Track>,
+    /// The applied audio-processing config (MEDIA-3). Set via
+    /// [`set_audio_config`](Player::set_audio_config); mpv keeps these ao/af/
+    /// `ReplayGain`/gapless properties across loads, so it is apply-on-change.
+    audio: AudioConfig,
     events: VecDeque<PlayerEvent>,
 }
 
@@ -125,6 +130,7 @@ impl<E: MediaEngine> Player<E> {
             position: 0.0,
             duration: None,
             tracks: Vec::new(),
+            audio: AudioConfig::new(),
             events: VecDeque::new(),
         }
     }
@@ -159,6 +165,12 @@ impl<E: MediaEngine> Player<E> {
     #[must_use]
     pub fn media(&self) -> Option<&str> {
         self.media.as_deref()
+    }
+
+    /// The applied audio-processing config (MEDIA-3).
+    #[must_use]
+    pub const fn audio_config(&self) -> &AudioConfig {
+        &self.audio
     }
 
     /// Borrow the underlying engine (tests drive [`FakeMpv`](crate::FakeMpv)
@@ -331,6 +343,24 @@ impl<E: MediaEngine> Player<E> {
         self.set_position(0.0);
         self.duration = None;
         self.set_state(PlayerState::Stopped);
+        Ok(())
+    }
+
+    // ── audio (MEDIA-3) ──────────────────────────────────────────────────────
+
+    /// Apply an audio-processing [`AudioConfig`] to the engine — the `PipeWire` ao,
+    /// the EQ + loudness `af` graph, and the `ReplayGain` + gapless properties —
+    /// and record it as the current config on success.
+    ///
+    /// Valid in any state (these are global mpv properties that persist across
+    /// loads); the config is left unchanged if the engine rejects it.
+    ///
+    /// # Errors
+    /// Returns [`PlayerError::Engine`] if the engine rejects a property set; the
+    /// stored config is then untouched.
+    pub fn set_audio_config(&mut self, config: AudioConfig) -> Result<(), PlayerError> {
+        self.engine.apply_audio_config(&config)?;
+        self.audio = config;
         Ok(())
     }
 
@@ -728,5 +758,64 @@ mod tests {
         assert!(ev
             .iter()
             .any(|e| matches!(e, PlayerEvent::Error(m) if m == "decode blew up")));
+    }
+
+    #[test]
+    fn default_audio_config_is_pipewire() {
+        use crate::audio::AudioDriver;
+        let p = player();
+        assert_eq!(p.audio_config().output.driver, AudioDriver::PipeWire);
+        assert!(p.audio_config().eq.is_empty());
+    }
+
+    #[test]
+    fn set_audio_config_applies_fold_to_engine_and_stores_it() {
+        use crate::audio::{AudioConfig, EqBand, LoudnessNorm, ReplayGainMode};
+
+        let mut p = player();
+        p.load("x").expect("load");
+        p.pump();
+
+        let cfg = AudioConfig {
+            eq: EqBand::iso_10_band([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0]),
+            loudness: LoudnessNorm::Ebu {
+                target_lufs: -16.0,
+                true_peak_db: -1.5,
+                range_lu: 11.0,
+            },
+            replaygain: ReplayGainMode::Album,
+            gapless: true,
+            ..AudioConfig::new()
+        };
+        p.set_audio_config(cfg.clone()).expect("apply audio config");
+
+        // The engine received exactly the folded af graph + properties.
+        assert_eq!(p.engine().applied_af(), Some(cfg.af_graph().as_str()));
+        assert_eq!(p.engine().applied_properties(), cfg.properties().as_slice());
+        // The graph ends with the loudness filter after the 10 EQ bands.
+        assert!(p
+            .engine()
+            .applied_af()
+            .unwrap()
+            .ends_with("loudnorm=I=-16:TP=-1.5:LRA=11"));
+        // And the player stored it.
+        assert_eq!(p.audio_config(), &cfg);
+    }
+
+    #[test]
+    fn set_audio_config_error_leaves_stored_config_untouched() {
+        use crate::audio::{AudioConfig, ReplayGainMode};
+
+        let mut p = Player::new(FakeMpv::new().failing_audio());
+        let before = p.audio_config().clone();
+        let err = p
+            .set_audio_config(AudioConfig {
+                replaygain: ReplayGainMode::Track,
+                ..AudioConfig::new()
+            })
+            .expect_err("engine rejects audio config");
+        assert!(matches!(err, PlayerError::Engine(EngineError::Backend(_))));
+        // Rejected → the stored config is unchanged (still the default).
+        assert_eq!(p.audio_config(), &before);
     }
 }

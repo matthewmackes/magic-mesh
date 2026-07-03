@@ -15,6 +15,7 @@
 use libmpv2::events::{Event, PropertyData};
 use libmpv2::{mpv_end_file_reason, Mpv};
 
+use crate::audio::AudioConfig;
 use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
 
 /// The real mpv-backed engine.
@@ -39,7 +40,10 @@ fn backend(e: impl std::fmt::Display) -> EngineError {
 impl MpvEngine {
     /// Create an mpv instance with the platform defaults suitable for the
     /// player core (video enabled, terminal control off — the shell owns the
-    /// seat). MEDIA-2/3/4 layer the DRM plane / PipeWire / VA-API options on top.
+    /// seat). Audio defaults to the seat's **PipeWire** ao (MEDIA-3, design Q5);
+    /// [`apply_audio_config`](MediaEngine::apply_audio_config) then layers the
+    /// device / EQ / loudness / ReplayGain / gapless on top. MEDIA-2/4 layer the
+    /// DRM plane / VA-API options similarly.
     ///
     /// # Errors
     /// Returns [`EngineError::Backend`] if mpv fails to initialise.
@@ -51,6 +55,8 @@ impl MpvEngine {
             let _ = init.set_property("input-default-bindings", "no");
             let _ = init.set_property("input-vo-keyboard", "no");
             let _ = init.set_property("osc", "no");
+            // MEDIA-3: audio leaves on the seat's PipeWire server by default.
+            let _ = init.set_property("ao", "pipewire");
             Ok(())
         })
         .map_err(backend)?;
@@ -181,5 +187,19 @@ impl MediaEngine for MpvEngine {
             }
         }
         out
+    }
+
+    fn apply_audio_config(&mut self, config: &AudioConfig) -> Result<(), EngineError> {
+        // The EQ + loudness filter chain (an empty string clears mpv's `af`).
+        self.mpv
+            .set_property("af", config.af_graph().as_str())
+            .map_err(backend)?;
+        // ao / audio-device / replaygain* / gapless-audio.
+        for (key, value) in config.properties() {
+            self.mpv
+                .set_property(key.as_str(), value.as_str())
+                .map_err(backend)?;
+        }
+        Ok(())
     }
 }

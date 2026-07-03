@@ -13,7 +13,10 @@
 //! [`Player`]: mde_media_core::Player
 //! [`FakeMpv`]: mde_media_core::FakeMpv
 
-use mde_media_core::{FakeMpv, Player, PlayerState, Track, TrackKind};
+use mde_media_core::{
+    AudioConfig, EqBand, FakeMpv, LoudnessNorm, Player, PlayerState, ReplayGainMode, Track,
+    TrackKind,
+};
 
 fn sample_tracks() -> Vec<Track> {
     vec![
@@ -58,6 +61,25 @@ fn run_fake_smoke() {
         player.duration(),
         player.tracks().len()
     );
+
+    // MEDIA-3: configure the PipeWire audio path + a graphic EQ + EBU R128
+    // loudness normalization + per-album ReplayGain, and show the folded mpv
+    // af-graph / property set the engine actually receives.
+    let audio = AudioConfig {
+        eq: EqBand::iso_10_band([3.0, 2.0, 1.0, 0.0, -1.0, 0.0, 1.0, 2.0, 3.0, 2.0]),
+        loudness: LoudnessNorm::Ebu {
+            target_lufs: -16.0,
+            true_peak_db: -1.5,
+            range_lu: 11.0,
+        },
+        replaygain: ReplayGainMode::Album,
+        gapless: true,
+        ..AudioConfig::new()
+    };
+    player.set_audio_config(audio).expect("apply audio config");
+    println!("  audio af-graph: {}", player.audio_config().af_graph());
+    println!("  audio props:    {:?}", player.audio_config().properties());
+    println!("  engine applied: af={:?}", player.engine().applied_af());
 
     player.engine_mut().advance(30.0);
     player.pump();

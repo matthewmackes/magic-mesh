@@ -12,6 +12,7 @@
 
 use std::collections::VecDeque;
 
+use crate::audio::AudioConfig;
 use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track};
 
 /// A scriptable fake engine — see the [module docs](self).
@@ -24,8 +25,13 @@ pub struct FakeMpv {
     tracks: Vec<Track>,
     signals: VecDeque<EngineSignal>,
     fail_load: bool,
+    fail_audio: bool,
     /// Every `loadfile`/`seek`/`stop` issued, for assertion.
     commands: Vec<String>,
+    /// The last `af` graph string applied via [`MediaEngine::apply_audio_config`].
+    applied_af: Option<String>,
+    /// The last non-`af` properties applied via [`MediaEngine::apply_audio_config`].
+    applied_properties: Vec<(String, String)>,
 }
 
 impl FakeMpv {
@@ -53,6 +59,14 @@ impl FakeMpv {
     #[must_use]
     pub const fn failing_load(mut self) -> Self {
         self.fail_load = true;
+        self
+    }
+
+    /// Make every `apply_audio_config` fail with a backend error (to exercise the
+    /// audio-config error path through the [`Player`](crate::Player)).
+    #[must_use]
+    pub const fn failing_audio(mut self) -> Self {
+        self.fail_audio = true;
         self
     }
 
@@ -98,6 +112,20 @@ impl FakeMpv {
     #[must_use]
     pub fn commands(&self) -> &[String] {
         &self.commands
+    }
+
+    /// The last `af` filter graph applied via
+    /// [`apply_audio_config`](MediaEngine::apply_audio_config), if any.
+    #[must_use]
+    pub fn applied_af(&self) -> Option<&str> {
+        self.applied_af.as_deref()
+    }
+
+    /// The last non-`af` properties applied via
+    /// [`apply_audio_config`](MediaEngine::apply_audio_config).
+    #[must_use]
+    pub fn applied_properties(&self) -> &[(String, String)] {
+        &self.applied_properties
     }
 }
 
@@ -159,6 +187,17 @@ impl MediaEngine for FakeMpv {
     fn poll(&mut self) -> Vec<EngineSignal> {
         self.signals.drain(..).collect()
     }
+
+    fn apply_audio_config(&mut self, config: &AudioConfig) -> Result<(), EngineError> {
+        if self.fail_audio {
+            return Err(EngineError::Backend("audio config rejected".to_owned()));
+        }
+        // Record exactly what the fold produced, so tests assert the af graph +
+        // properties without a real mpv.
+        self.applied_af = Some(config.af_graph());
+        self.applied_properties = config.properties();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -206,5 +245,39 @@ mod tests {
         e.stop().expect("stop");
         assert_eq!(e.poll(), vec![EngineSignal::EndFile(EndReason::Stopped)]);
         assert_eq!(e.position(), None);
+    }
+
+    #[test]
+    fn apply_audio_config_records_fold_without_media() {
+        use crate::audio::{AudioConfig, EqBand, ReplayGainMode};
+
+        let mut e = FakeMpv::new();
+        // No media loaded — audio properties are global and still apply.
+        assert_eq!(e.applied_af(), None);
+        let cfg = AudioConfig {
+            eq: vec![EqBand::new(1000.0, 3.0, 1.0)],
+            replaygain: ReplayGainMode::Track,
+            ..AudioConfig::new()
+        };
+        e.apply_audio_config(&cfg).expect("apply");
+        assert_eq!(e.applied_af(), Some("equalizer=f=1000:t=q:w=1:g=3"));
+        assert!(e
+            .applied_properties()
+            .contains(&("replaygain".to_owned(), "track".to_owned())));
+        assert!(e
+            .applied_properties()
+            .contains(&("ao".to_owned(), "pipewire".to_owned())));
+    }
+
+    #[test]
+    fn failing_audio_surfaces_backend_error() {
+        use crate::audio::AudioConfig;
+
+        let mut e = FakeMpv::new().failing_audio();
+        assert!(matches!(
+            e.apply_audio_config(&AudioConfig::new()),
+            Err(EngineError::Backend(_))
+        ));
+        assert_eq!(e.applied_af(), None);
     }
 }
