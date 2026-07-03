@@ -20,7 +20,7 @@ use mde_egui::egui::{
 use mde_egui::{Motion, Style};
 
 use crate::layout;
-use crate::state::{Health, MeshState, Role};
+use crate::state::{Health, MeshNode, MeshState, Role};
 
 // ── Canvas geometry (pixels) ────────────────────────────────────────────────
 // Colours come exclusively from `Style`; these are the inherent *dimensions* of
@@ -30,6 +30,8 @@ use crate::state::{Health, MeshState, Role};
 
 /// Node disc radius for a Lighthouse (the largest role).
 const NODE_R_LIGHTHOUSE: f32 = 12.0;
+/// Node disc radius for a headless Server (between the anchor and a workstation).
+const NODE_R_SERVER: f32 = 9.0;
 /// Node disc radius for a Workstation peer (the smaller role).
 const NODE_R_WORKSTATION: f32 = 6.5;
 /// Stroke width of a node's health ring.
@@ -47,6 +49,8 @@ const LINK_BASE_W: f32 = 1.0;
 const LINK_ACTIVE_W: f32 = 2.0;
 /// Radius of a travelling activity pulse dot.
 const PULSE_DOT_R: f32 = 3.0;
+/// Gap between the hostname label and the version sub-label stacked beneath it.
+const LABEL_LINE_GAP: f32 = 1.0;
 
 // ── Empty-state glyph (the no-nodes canvas) ─────────────────────────────────
 // A dim hub-and-spoke emblem shown when the mesh has no nodes. Sizes are
@@ -62,10 +66,14 @@ const EMPTY_GLYPH_HUB_R: f32 = Style::SP_S;
 const EMPTY_GLYPH_SAT_R: f32 = Style::SP_XS;
 
 impl Role {
-    /// Drawn disc radius for this role.
-    const fn radius(self) -> f32 {
+    /// Drawn disc radius for this role. Public so a caller overlaying its own
+    /// per-node adornment (e.g. the shell's brand role badge, QBRAND-8) can size
+    /// and place it against the same disc the widget draws.
+    #[must_use]
+    pub const fn radius(self) -> f32 {
         match self {
             Self::Lighthouse => NODE_R_LIGHTHOUSE,
+            Self::Server => NODE_R_SERVER,
             Self::Workstation => NODE_R_WORKSTATION,
         }
     }
@@ -79,6 +87,18 @@ impl Health {
             Self::Warn => Style::WARN,
             Self::Down => Style::DANGER,
         }
+    }
+}
+
+/// The version sub-label text + colour for a node: the running build in
+/// [`Style::TEXT_DIM`], an older build (`stale`) marked and drawn in
+/// [`Style::WARN`] so it stands out, and an honest `—` in dim when the source
+/// carries no version (never a fabricated build string, §7).
+fn version_line(node: &MeshNode) -> (String, Color32) {
+    match &node.version {
+        Some(v) if node.stale => (format!("{v} · old"), Style::WARN),
+        Some(v) => (v.clone(), Style::TEXT_DIM),
+        None => ("—".to_string(), Style::TEXT_DIM),
     }
 }
 
@@ -197,12 +217,24 @@ impl<'a> MeshView<'a> {
             } else {
                 Style::TEXT
             };
-            painter.text(
+            let label = painter.text(
                 c + Vec2::new(0.0, r + Style::SP_XS),
                 Align2::CENTER_TOP,
                 &node.label,
                 FontId::new(Style::SMALL, FontFamily::Monospace),
                 label_color,
+            );
+
+            // The node's running build, stacked under the hostname (QBRAND-8). A
+            // node on an older build reads WARN so it stands out; an absent version
+            // draws an honest `—`, never a fabricated build string (§7).
+            let (version, version_color) = version_line(node);
+            painter.text(
+                Pos2::new(c.x, label.bottom() + LABEL_LINE_GAP),
+                Align2::CENTER_TOP,
+                version,
+                FontId::new(Style::SMALL, FontFamily::Monospace),
+                version_color,
             );
         }
 
@@ -316,7 +348,7 @@ impl<'a> MeshView<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::MeshView;
+    use super::{version_line, MeshView};
     use crate::state::{Health, MeshLink, MeshNode, MeshState, Role};
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
@@ -355,13 +387,17 @@ mod tests {
 
     #[test]
     fn populated_state_paints_the_full_animated_path() {
-        // Leader ring + Ok/Warn/Down health + active, idle and dangling links
-        // exercise every branch of the animated paint path.
+        // Leader ring + Ok/Warn/Down health + Server role + active, idle and
+        // dangling links exercise every branch of the animated paint path; the
+        // version sub-labels cover current / older-build / absent-version lines.
         let state = MeshState {
             nodes: vec![
-                MeshNode::new("lh", "lighthouse", Role::Lighthouse, Health::Ok).leader(),
-                MeshNode::new("a", "peer-a", Role::Workstation, Health::Warn),
-                MeshNode::new("b", "peer-b", Role::Workstation, Health::Down),
+                MeshNode::new("lh", "lighthouse", Role::Lighthouse, Health::Ok)
+                    .leader()
+                    .version("12.0.0"),
+                MeshNode::new("srv", "server-01", Role::Server, Health::Ok).version("12.0.0"),
+                MeshNode::new("a", "peer-a", Role::Workstation, Health::Warn).version("11.4.1"), // older build
+                MeshNode::new("b", "peer-b", Role::Workstation, Health::Down), // no version → "—"
             ],
             links: vec![
                 MeshLink::new("lh", "a", 0.9),     // active: travelling pulses
@@ -369,7 +405,29 @@ mod tests {
                 MeshLink::new("lh", "ghost", 0.5), // unknown endpoint → skipped
             ],
         };
+        // Mark the older-build peer stale so the WARN version branch renders.
+        let mut state = state;
+        state.nodes[2].stale = true;
         render(&state, false, 0.75);
+    }
+
+    #[test]
+    fn version_line_renders_current_stale_and_absent_honestly() {
+        // Current build → dim; older build → marked + WARN so it stands out;
+        // absent version → an honest "—", never a fabricated build (§7).
+        let current = MeshNode::new("a", "a", Role::Workstation, Health::Ok).version("12.0.0");
+        assert_eq!(version_line(&current), ("12.0.0".to_string(), Style::TEXT_DIM));
+
+        let old = MeshNode::new("b", "b", Role::Workstation, Health::Warn)
+            .version("11.4.1")
+            .stale();
+        let (text, color) = version_line(&old);
+        assert!(text.starts_with("11.4.1"), "keeps the build string: {text}");
+        assert!(text.contains("old"), "flags the older build: {text}");
+        assert_eq!(color, Style::WARN, "an older build reads WARN");
+
+        let none = MeshNode::new("c", "c", Role::Server, Health::Ok);
+        assert_eq!(version_line(&none), ("—".to_string(), Style::TEXT_DIM));
     }
 
     #[test]

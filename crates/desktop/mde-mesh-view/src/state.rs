@@ -16,6 +16,10 @@ use mde_egui::egui::Vec2;
 pub enum Role {
     /// A lighthouse — the always-on mesh anchor / relay (drawn largest, centred).
     Lighthouse,
+    /// A headless server tier — an always-on box carrying storage / broker
+    /// services but no interactive seat (drawn between the lighthouse and a
+    /// workstation, ringed with the peers).
+    Server,
     /// A workstation peer (an interactive seat; a headless box is a workstation
     /// without a local display).
     Workstation,
@@ -44,6 +48,15 @@ pub struct MeshNode {
     pub role: Role,
     /// Current health (node colour).
     pub health: Health,
+    /// The node's running build version (e.g. `"12.0.0"`), drawn as a sub-label
+    /// beneath the hostname. `None` ⇒ the source carries no version for this node
+    /// and the widget draws an honest `—` placeholder rather than a fabricated
+    /// build string.
+    pub version: Option<String>,
+    /// Whether this node runs an **older** build than the newest on the mesh — a
+    /// node the fleet has moved past. Flagged in the widget (WARN-tinted version
+    /// line) so an out-of-date peer is distinguishable at a glance.
+    pub stale: bool,
     /// Whether this node is the elected leader — gets the pulsing accent ring.
     pub is_leader: bool,
     /// Optional fixed position, **normalized** to `0.0..=1.0` of the canvas.
@@ -65,9 +78,26 @@ impl MeshNode {
             label: label.into(),
             role,
             health,
+            version: None,
+            stale: false,
             is_leader: false,
             pos: None,
         }
+    }
+
+    /// Set this node's running build version (builder).
+    #[must_use]
+    pub fn version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
+
+    /// Mark this node as running an older build than the newest on the mesh
+    /// (builder) — the widget flags it so an out-of-date peer stands out.
+    #[must_use]
+    pub const fn stale(mut self) -> Self {
+        self.stale = true;
+        self
     }
 
     /// Mark this node as the elected leader (builder).

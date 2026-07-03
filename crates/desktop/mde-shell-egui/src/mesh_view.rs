@@ -28,15 +28,18 @@
 //! are unit-tested directly; the only IO is the snapshot read + the Bus drain in the
 //! two `poll` seams.
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use mde_bus::persist::Persist;
-use mde_egui::egui;
+use mde_egui::egui::{self, Color32, Pos2, Rect, TextureHandle};
+use mde_egui::Style;
+use mde_theme::brand::icons::{icon_image, IconId};
 use serde_json::Value;
 
-use mde_mesh_view::{Health, MeshLink, MeshNode, MeshState, MeshView, Role};
+use mde_mesh_view::{layout, Health, MeshLink, MeshNode, MeshState, MeshView, Role};
 
 /// The world-readable mesh-status snapshot — the same source This Node / Network /
 /// the chrome bar read (the desktop user can't read the root-only replicated peer
@@ -90,9 +93,14 @@ fn string_list(obj: Option<&Value>, key: &str) -> Vec<String> {
 ///
 /// The mapping is glue over the directory the Network plane already renders:
 /// * a node's `role`/`overlay_ip` → [`Role::Lighthouse`] (an overlay anchor: role is
-///   `lighthouse`, or its IP is in `lighthouse_ips`) vs [`Role::Workstation`];
+///   `lighthouse`, or its IP is in `lighthouse_ips`), [`Role::Server`] (a headless
+///   `server`-tier box) or [`Role::Workstation`] — each drawn with its brand role
+///   badge in the map overlay;
 /// * its directory `presence` → [`Health`] (online → Ok, idle → Warn, offline → Down,
 ///   unknown → Warn — surfaced as a concern, never a fabricated "OK");
+/// * its per-node `version` → the node's version sub-label, and the snapshot's
+///   `update` flag → the stale marker (a node the fleet has moved past); an absent
+///   version stays `None`, drawn as an honest `—`, never a fabricated build (§7);
 /// * the elected `leader` → the pulsing leader ring.
 ///
 /// Links draw the real overlay topology — every node tunnels to the lighthouse
@@ -119,12 +127,18 @@ fn project(snapshot: &str) -> MeshState {
             continue;
         };
         let overlay_ip = nonempty(n, "overlay_ip");
-        let is_lighthouse = nonempty(n, "role").as_deref() == Some("lighthouse")
+        let role_field = nonempty(n, "role");
+        // A node is a lighthouse by Nebula membership (its overlay IP anchors the
+        // static_host_map) OR by its declared role — the storage anchors run the
+        // Server tier but are lighthouses, so the IP check catches them (§7).
+        let is_lighthouse = role_field.as_deref() == Some("lighthouse")
             || overlay_ip
                 .as_deref()
                 .is_some_and(|ip| lighthouse_ips.iter().any(|l| l == ip));
         let role = if is_lighthouse {
             Role::Lighthouse
+        } else if role_field.as_deref() == Some("server") {
+            Role::Server
         } else {
             Role::Workstation
         };
@@ -138,6 +152,16 @@ fn project(snapshot: &str) -> MeshState {
         let mut node = MeshNode::new(hostname.clone(), hostname.clone(), role, health);
         if leader.as_deref() == Some(hostname.as_str()) {
             node = node.leader();
+        }
+        // The node's running build + whether the fleet has moved past it: the
+        // snapshot's per-node `version` (from each node's shell-status) and the
+        // `update` flag it derives against the newest version on the mesh. Absent
+        // version ⇒ left `None`, drawn as an honest `—` (never a fabricated build).
+        if let Some(version) = nonempty(n, "version") {
+            node = node.version(version);
+        }
+        if n.get("update").and_then(Value::as_bool).unwrap_or(false) {
+            node = node.stale();
         }
         if is_lighthouse {
             lighthouse_hosts.push(hostname.clone());
@@ -198,6 +222,9 @@ pub(crate) struct MeshViewState {
     state: MeshState,
     /// When the snapshot was last polled (drives the fixed cadence).
     last_poll: Option<Instant>,
+    /// The health-tinted brand role badges overlaid on the map, rasterized once
+    /// per (glyph, tint) and cached.
+    badges: BadgeCache,
 }
 
 impl Default for MeshViewState {
@@ -206,6 +233,7 @@ impl Default for MeshViewState {
             snapshot_path: PathBuf::from(SNAPSHOT_PATH),
             state: MeshState::default(),
             last_poll: None,
+            badges: BadgeCache::default(),
         }
     }
 }
@@ -228,10 +256,103 @@ impl MeshViewState {
     }
 
     /// Render the live mesh canvas into `ui` — the `mde-mesh-view` painter fed the
-    /// current [`MeshState`]. The widget draws everything (nodes, links, the leader
-    /// ring, or the `EmptyState` when the mesh has no nodes).
-    pub(crate) fn show(&self, ui: &mut egui::Ui) {
-        MeshView::new(&self.state).show(ui);
+    /// current [`MeshState`] — then overlay each node's brand role badge. The widget
+    /// draws the topology (nodes, links, the leader ring, the version sub-labels, or
+    /// the `EmptyState` when the mesh has no nodes); this pass lays a health-tinted
+    /// [`brand::icons`](mde_theme::brand::icons) role badge over each node so its
+    /// Workstation / Server / Lighthouse role reads at a glance (QBRAND-8).
+    pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
+        let response = MeshView::new(&self.state).show(ui);
+        self.overlay_role_badges(ui, response.rect);
+    }
+
+    /// Overlay the health-tinted brand role badge on every node, pinned to the same
+    /// disc the widget painted (re-resolving the shared `layout::place` over the
+    /// widget's own [`MeshView::DEFAULT_MARGIN`], so the badge lands exactly on its
+    /// node). No nodes ⇒ nothing to badge (the widget already painted its honest
+    /// `EmptyState`). The badge sits as a pip at the disc's NE edge, sized to the
+    /// node's role radius. Reuses the QBRAND-2 icon raster + texture wrap (§6).
+    fn overlay_role_badges(&mut self, ui: &egui::Ui, area: Rect) {
+        if self.state.nodes.is_empty() {
+            return;
+        }
+        let centres = layout::place(&self.state, area, MeshView::DEFAULT_MARGIN);
+        let ctx = ui.ctx().clone();
+        let painter = ui.painter_at(area);
+        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+        for (node, centre) in self.state.nodes.iter().zip(&centres) {
+            let icon = role_icon(node.role);
+            let tint = health_tint(node.health);
+            let Some(texture) = self.badges.texture(&ctx, icon, tint) else {
+                continue; // unreachable zero-size / asset-parse path — skip, never panic
+            };
+            let r = node.role.radius();
+            let diameter = (r * BADGE_SCALE).max(BADGE_MIN_PX);
+            let pip = *centre + egui::vec2(r, -r); // NE edge of the node disc
+            let rect = Rect::from_center_size(pip, egui::Vec2::splat(diameter));
+            painter.image(texture.id(), rect, uv, Color32::WHITE);
+        }
+    }
+}
+
+/// Pixel size the role badges are rasterized at — crisp, then displayed scaled to
+/// each node's disc.
+const BADGE_TEX_PX: u32 = 32;
+/// Badge display diameter as a multiple of the node's disc radius.
+const BADGE_SCALE: f32 = 1.5;
+/// Floor on the badge display diameter so a small workstation pip stays legible.
+const BADGE_MIN_PX: f32 = 13.0;
+
+/// The brand role badge glyph for a mesh role (QBRAND-2 `brand::icons`).
+const fn role_icon(role: Role) -> IconId {
+    match role {
+        Role::Lighthouse => IconId::Lighthouse,
+        Role::Server => IconId::Server,
+        Role::Workstation => IconId::Workstation,
+    }
+}
+
+/// The health → badge tint, from the shared status tokens (no raw hex, §4):
+/// Ok → [`Style::OK`], Warn → [`Style::WARN`], Down → [`Style::DANGER`].
+const fn health_tint(health: Health) -> [u8; 4] {
+    let color = match health {
+        Health::Ok => Style::OK,
+        Health::Warn => Style::WARN,
+        Health::Down => Style::DANGER,
+    };
+    [color.r(), color.g(), color.b(), color.a()]
+}
+
+/// Rasterizes the brand role badges once per (glyph, health-tint) and caches the
+/// egui textures for the map overlay — 3 roles × 3 health tints at most, loaded
+/// lazily on first use. Reuses the QBRAND-2 `brand::icons` raster + the one-line
+/// texture wrap (§6): no second icon source, no redraw.
+#[derive(Default)]
+struct BadgeCache {
+    textures: HashMap<(IconId, [u8; 4]), TextureHandle>,
+}
+
+impl BadgeCache {
+    /// The cached texture for a role glyph at a health tint, rasterizing + loading
+    /// it on first use. `None` only on the unreachable zero-size / asset-parse error
+    /// paths (the badge is then simply skipped, never a panic).
+    fn texture(
+        &mut self,
+        ctx: &egui::Context,
+        icon: IconId,
+        tint: [u8; 4],
+    ) -> Option<&TextureHandle> {
+        match self.textures.entry((icon, tint)) {
+            Entry::Occupied(slot) => Some(slot.into_mut()),
+            Entry::Vacant(slot) => {
+                let img = icon_image(icon, BADGE_TEX_PX, tint).ok()?;
+                let color = egui::ColorImage::from_rgba_unmultiplied(img.size_usize(), &img.rgba);
+                let [r, g, b, a] = tint;
+                let name = format!("qbrand8-role-{}-{r:02x}{g:02x}{b:02x}{a:02x}", icon.name());
+                let handle = ctx.load_texture(name, color, egui::TextureOptions::LINEAR);
+                Some(slot.insert(handle))
+            }
+        }
     }
 }
 
@@ -361,10 +482,11 @@ mod tests {
           "self": "ws-1",
           "online": 2,
           "total": 3,
+          "latest_version": "12.0.0",
           "nodes": [
-            {"hostname":"lh-01","overlay_ip":"10.42.0.1","presence":"online","role":"lighthouse"},
-            {"hostname":"ws-1","overlay_ip":"10.42.0.7","presence":"online","role":"workstation"},
-            {"hostname":"ws-2","overlay_ip":"10.42.0.9","presence":"offline","role":"workstation"}
+            {"hostname":"lh-01","overlay_ip":"10.42.0.1","presence":"online","role":"lighthouse","version":"12.0.0","update":false},
+            {"hostname":"ws-1","overlay_ip":"10.42.0.7","presence":"online","role":"workstation","version":"12.0.0","update":false},
+            {"hostname":"ws-2","overlay_ip":"10.42.0.9","presence":"offline","role":"workstation","version":"11.4.1","update":true}
           ],
           "network": {"leader":"lh-01","lighthouse_ips":["10.42.0.1"],"cipher":"AES-256-GCM"}
         }"#
@@ -420,6 +542,13 @@ mod tests {
         assert_eq!(node("lh-01").health, Health::Ok);
         assert_eq!(node("ws-2").health, Health::Down);
 
+        // Per-node versions surface from the snapshot; the node the fleet has moved
+        // past (`update:true`) is flagged stale so it's distinguishable (QBRAND-8).
+        assert_eq!(node("lh-01").version.as_deref(), Some("12.0.0"));
+        assert_eq!(node("ws-2").version.as_deref(), Some("11.4.1"));
+        assert!(node("ws-2").stale, "an older-build node is flagged stale");
+        assert!(!node("ws-1").stale, "a current-build node is not stale");
+
         // The elected leader gets the pulsing ring; the peers don't.
         assert!(node("lh-01").is_leader, "the elected leader pulses");
         assert!(!node("ws-1").is_leader);
@@ -472,6 +601,71 @@ mod tests {
             state.nodes.iter().find(|n| n.id == "c").unwrap().health,
             Health::Warn
         );
+    }
+
+    #[test]
+    fn a_server_node_folds_to_the_server_role_and_absent_version_stays_none() {
+        // A `server`-tier node that isn't a lighthouse anchor folds to Role::Server;
+        // a node with no version stays None (drawn as an honest "—", not fabricated).
+        let snap = r#"{"nodes":[
+            {"hostname":"srv","overlay_ip":"10.42.0.20","presence":"online","role":"server","version":"12.0.0"},
+            {"hostname":"ws","overlay_ip":"10.42.0.21","presence":"idle","role":"workstation"}
+          ],"network":{"leader":"srv"}}"#;
+        let state = project(snap);
+        let srv = state.nodes.iter().find(|n| n.id == "srv").expect("server node");
+        assert_eq!(srv.role, Role::Server);
+        assert_eq!(srv.version.as_deref(), Some("12.0.0"));
+        let ws = state.nodes.iter().find(|n| n.id == "ws").expect("workstation");
+        assert_eq!(ws.version, None, "absent version stays None (honest placeholder)");
+        assert!(!ws.stale);
+    }
+
+    #[test]
+    fn the_map_overlays_health_tinted_role_badges() {
+        // Driving a real headless frame through `show` exercises the overlay pass
+        // end-to-end: it rasterizes each node's brand role badge at its health tint,
+        // loads the texture, and paints it — the whole map tessellates.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut mv = MeshViewState {
+            state: project(&snapshot()),
+            ..Default::default()
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(480.0, 360.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                mv.show(ui);
+            });
+        });
+        assert!(
+            !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty(),
+            "the map + badge overlay produced no draw primitives"
+        );
+        // lh-01(Lighthouse,Ok), ws-1(Workstation,Ok), ws-2(Workstation,Down) →
+        // three distinct (glyph, tint) badges rasterized + cached.
+        assert_eq!(mv.badges.textures.len(), 3, "one badge per (role, health)");
+    }
+
+    #[test]
+    fn the_empty_map_overlays_no_badges() {
+        // No nodes ⇒ the widget paints its honest EmptyState and the overlay adds
+        // nothing (no fabricated node, no badge).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut mv = MeshViewState::default(); // default state has no nodes
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(480.0, 360.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                mv.show(ui);
+            });
+        });
+        assert!(mv.badges.textures.is_empty(), "no nodes ⇒ no badges");
     }
 
     #[test]

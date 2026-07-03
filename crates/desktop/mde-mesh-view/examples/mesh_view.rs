@@ -57,17 +57,23 @@ impl eframe::App for MeshViewDemo {
 }
 
 /// The SAMPLE mesh — example-only data, never in the widget render path: three
-/// lighthouses (nyc3 is the elected leader, sfo3 degraded) and four workstation
-/// peers (one Down), and a spread of active links. All auto-placed, so the
-/// lighthouses cluster on the inner ring and the peers ring around them.
+/// lighthouses (nyc3 is the elected leader, sfo3 degraded), a headless server
+/// tier, and three workstation peers (one Down, one on an older build), each
+/// carrying its running version, and a spread of active links. All auto-placed,
+/// so the lighthouses cluster on the inner ring and the peers ring around them.
 fn sample_state() -> MeshState {
     let nodes = vec![
-        MeshNode::new("lh-nyc3", "lighthouse-nyc3", Role::Lighthouse, Health::Ok).leader(),
-        MeshNode::new("lh-fra1", "lighthouse-fra1", Role::Lighthouse, Health::Ok),
-        MeshNode::new("lh-sfo3", "lighthouse-sfo3", Role::Lighthouse, Health::Warn),
-        MeshNode::new("eagle", "eagle", Role::Workstation, Health::Ok),
-        MeshNode::new("media", "media-server", Role::Workstation, Health::Warn),
-        MeshNode::new("ws-01", "workstation-01", Role::Workstation, Health::Ok),
+        MeshNode::new("lh-nyc3", "lighthouse-nyc3", Role::Lighthouse, Health::Ok)
+            .leader()
+            .version("12.0.0"),
+        MeshNode::new("lh-fra1", "lighthouse-fra1", Role::Lighthouse, Health::Ok).version("12.0.0"),
+        MeshNode::new("lh-sfo3", "lighthouse-sfo3", Role::Lighthouse, Health::Warn)
+            .version("12.0.0"),
+        MeshNode::new("media", "media-server", Role::Server, Health::Ok).version("12.0.0"),
+        MeshNode::new("eagle", "eagle", Role::Workstation, Health::Ok).version("12.0.0"),
+        MeshNode::new("ws-01", "workstation-01", Role::Workstation, Health::Warn)
+            .version("11.4.1")
+            .stale(), // an older build — flagged so it stands out
         MeshNode::new("ws-02", "workstation-02", Role::Workstation, Health::Down),
     ];
     let links = vec![
