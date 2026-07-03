@@ -22,6 +22,9 @@
 //! session attached this surface shows an honest gated `EmptyState`, never a fake
 //! page (§7).
 
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::Persist;
+use mde_chat::MessageKind;
 use mde_egui::egui::{self, RichText, Sense, TextureHandle, TextureOptions};
 use mde_egui::{muted_note, Style};
 
@@ -166,9 +169,157 @@ fn crash_reason(session: &WebSession) -> String {
     }
 }
 
+// ── BOOKMARKS-10: mesh integration (Send-in-Chat + copy-URL + add-from-page) ──
+//
+// The Browser surface composes the live page with two mesh services by REUSING
+// their existing Bus verbs (§6 JSON boundaries — a local mirror of each topic,
+// never a dep on the mackesd worker, never a re-derived store):
+//
+//   * add-from-page → `action/bookmarks/add` — the BOOKMARKS-2 worker (the
+//                      single writer of this node's op-log segment + HLC clock,
+//                      the services/desktop tier boundary) drains it, mints the
+//                      real `Op::Add`, persists it, and Syncthing-syncs it across
+//                      the mesh. `source` is omitted → the honest `Source::Manual`.
+//   * Send-in-Chat  → `action/chat/send` — the SAME verb the shell's Chat composer
+//                      and Files' `chat_bridge` publish; a link rides the
+//                      NOTIFY-CHAT `Clipboard` message-kind (a `kind` wins over
+//                      `text` in the worker), addressed to this node's own Chat
+//                      contact (the notification hub where its clips land).
+//   * copy-URL      → the shell clipboard — egui's output command (the DRM /
+//                      windowed backend owns the wire), the same one-click re-copy
+//                      the Chat clipboard card uses.
+
+/// The mackesd bookmarks worker's add verb (`action/bookmarks/<verb>`, §9).
+const ACTION_BOOKMARKS_ADD: &str = "action/bookmarks/add";
+
+/// The mackesd chat worker's send verb (reused, never re-invented).
+const ACTION_CHAT_SEND: &str = "action/chat/send";
+
+/// Build the `action/bookmarks/add` body for the live page. Pure — the wire shape
+/// is asserted headless. `source` is omitted, so the worker mints the default
+/// `Source::Manual` (a page the user bookmarked in-app).
+fn bookmark_add_body(url: &str, title: &str) -> String {
+    serde_json::json!({ "url": url, "title": title }).to_string()
+}
+
+/// Build the `action/chat/send` body sharing the live page into Chat. A link is
+/// carried as the NOTIFY-CHAT [`MessageKind::Clipboard`] kind — its `preview`
+/// (the title, falling back to the URL) shows in the timeline and its `full` (the
+/// exact URL) is what a one-click re-copy puts back. Pure: the `kind` is a real
+/// `mde_chat::MessageKind`, so it round-trips straight into what the worker
+/// accepts (the same shape Files' `chat_bridge` writes).
+fn chat_share_body(to: &str, url: &str, title: &str) -> String {
+    let preview = if title.trim().is_empty() { url } else { title };
+    let kind = MessageKind::Clipboard {
+        preview: preview.to_string(),
+        full: url.to_string(),
+    };
+    let kind_val = serde_json::to_value(&kind).unwrap_or(serde_json::Value::Null);
+    serde_json::json!({ "scope": "peer", "to": to, "kind": kind_val }).to_string()
+}
+
+/// Publish `body` on `topic` via the persist-first path (the same discipline as
+/// the shell's Chat composer + Files' `chat_bridge`). Best-effort: no Bus on this
+/// node / a transient open failure is a silent no-op — the honest solo-host
+/// state, never a panic.
+fn publish(topic: &str, body: &str) {
+    let Some(root) = mde_bus::client_data_dir() else {
+        return;
+    };
+    let Ok(persist) = Persist::open(root) else {
+        return;
+    };
+    let _ = persist.write(topic, Priority::Default, None, Some(body));
+}
+
+/// The local hostname — the mesh identity a Send-in-Chat addresses (lock 2/21:
+/// the hostname *is* the chat contact username). `$HOSTNAME` →
+/// `/proc/sys/kernel/hostname` → `/etc/hostname` → `"localhost"`.
+fn local_hostname() -> String {
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        let h = h.trim();
+        if !h.is_empty() {
+            return h.to_string();
+        }
+    }
+    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        if let Ok(h) = std::fs::read_to_string(path) {
+            let h = h.trim();
+            if !h.is_empty() {
+                return h.to_string();
+            }
+        }
+    }
+    "localhost".to_string()
+}
+
+/// The Browser page-actions menu (BOOKMARKS-10): the three mesh-integration verbs
+/// on the current page. Rendered by BOTH the toolbar menu button and the address
+/// bar's right-click context menu (one body, two entry points). Each item greys
+/// out with no live URL to act on. §4 Carbon tokens on the chrome.
+fn page_actions_menu(ui: &mut egui::Ui, url: &str, title: &str) {
+    let has_page = !url.trim().is_empty();
+    // Add-from-page → the mesh-synced bookmarks store (via the worker's add verb).
+    if ui
+        .add_enabled(
+            has_page,
+            egui::Button::new(RichText::new("\u{2606}  Add bookmark").color(Style::TEXT)),
+        )
+        .clicked()
+    {
+        publish(ACTION_BOOKMARKS_ADD, &bookmark_add_body(url, title));
+        ui.close_menu();
+    }
+    // Copy-URL → the shell clipboard (egui's output command).
+    if ui
+        .add_enabled(
+            has_page,
+            egui::Button::new(RichText::new("\u{29C9}  Copy URL").color(Style::TEXT)),
+        )
+        .clicked()
+    {
+        ui.ctx().copy_text(url.to_string());
+        ui.close_menu();
+    }
+    // Send-in-Chat → the NOTIFY-CHAT send verb.
+    if ui
+        .add_enabled(
+            has_page,
+            egui::Button::new(RichText::new("\u{1F4AC}  Send in Chat").color(Style::TEXT)),
+        )
+        .clicked()
+    {
+        publish(
+            ACTION_CHAT_SEND,
+            &chat_share_body(&local_hostname(), url, title),
+        );
+        ui.close_menu();
+    }
+}
+
+/// The toolbar star that opens the BOOKMARKS-10 [`page_actions_menu`]; the glyph
+/// dims with no live page (the menu items disable themselves too). Split out of
+/// [`nav_chrome`] to keep that toolbar within its line budget.
+fn page_actions_button(ui: &mut egui::Ui, has_page: bool, url: &str, title: &str) {
+    let color = if has_page {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    ui.menu_button(
+        RichText::new("\u{2606}").size(Style::BODY).color(color),
+        |ui| {
+            page_actions_menu(ui, url, title);
+        },
+    )
+    .response
+    .on_hover_text("Page actions \u{2014} bookmark, copy URL, send in Chat");
+}
+
 /// The navigation chrome bar — a §4-token toolbar. Back / forward / reload act on
 /// the active session; the address bar loads on submit. On a crashed tab, Reload
-/// becomes a respawn request.
+/// becomes a respawn request. The page-actions menu (BOOKMARKS-10) hangs off both
+/// the toolbar star button and the address bar's right-click.
 fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
     let crashed = state
         .tabs
@@ -185,6 +336,19 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         .tabs
         .get(state.active)
         .map_or(0, |t| t.session.blocked_count());
+    // BOOKMARKS-10 — the live page's URL + title, owned clones so the page-actions
+    // closures never borrow `state`; empty when there is no live tab to act on.
+    let page_url = state
+        .tabs
+        .get(state.active)
+        .map(|t| t.session.nav().url.clone())
+        .unwrap_or_default();
+    let page_title = state
+        .tabs
+        .get(state.active)
+        .map(|t| t.session.title().to_string())
+        .unwrap_or_default();
+    let has_page = has_tab && !crashed && !page_url.trim().is_empty();
 
     ui.horizontal(|ui| {
         // Back / forward — enabled only when the live session offers the history.
@@ -217,6 +381,11 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             }
         }
 
+        // BOOKMARKS-10 — the page-actions menu (bookmark this page / copy its URL /
+        // send it in Chat). The SAME three verbs also hang off the address bar's
+        // right-click (below), so both the toolbar and the context menu reach them.
+        page_actions_button(ui, has_page, &page_url, &page_title);
+
         // BOOKMARKS-7 — a compact "N blocked" shield when the ad-filter has dropped
         // requests on this page (honest 0 stays hidden). Reads the session's
         // per-page counter; the engine is compiled from the mackesd `adfilter` blob.
@@ -241,6 +410,9 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             .hint_text("Enter an address")
             .text_color(Style::TEXT);
         let resp = ui.add_enabled(has_tab && !crashed, field);
+        // BOOKMARKS-10 — right-click the address bar for the same page actions
+        // (bookmark / copy URL / Send-in-Chat) the toolbar star exposes.
+        resp.context_menu(|ui| page_actions_menu(ui, &page_url, &page_title));
         let submit = resp.lost_focus()
             && ui.input(|i| i.key_pressed(egui::Key::Enter))
             && has_tab
@@ -508,6 +680,57 @@ mod tests {
         assert!(
             run_until_texture(&mut state),
             "the respawned tab never uploaded a frame"
+        );
+    }
+
+    // ── BOOKMARKS-10: mesh integration ─────────────────────────────────────────
+
+    #[test]
+    fn bookmark_add_body_is_the_workers_add_verb_shape() {
+        let body = bookmark_add_body("https://example.com/", "Example Domain");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["url"], "https://example.com/");
+        assert_eq!(v["title"], "Example Domain");
+        // `source` is omitted so the worker mints the default `Source::Manual`.
+        assert!(v.get("source").is_none());
+    }
+
+    #[test]
+    fn chat_share_body_round_trips_into_a_clipboard_message_kind() {
+        let body = chat_share_body("eagle", "https://example.com/", "Example Domain");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["scope"], "peer");
+        assert_eq!(v["to"], "eagle");
+        // Prove it's the REAL NOTIFY-CHAT message-kind (snake_case-tagged), not a
+        // hand-rolled shape: the `kind` deserializes straight back into MessageKind.
+        let kind: MessageKind = serde_json::from_value(v["kind"].clone()).expect("a MessageKind");
+        assert!(matches!(kind, MessageKind::Clipboard { .. }));
+        assert_eq!(v["kind"]["clipboard"]["preview"], "Example Domain");
+        assert_eq!(v["kind"]["clipboard"]["full"], "https://example.com/");
+    }
+
+    #[test]
+    fn chat_share_preview_falls_back_to_the_url_when_the_title_is_blank() {
+        let body = chat_share_body("eagle", "https://example.com/", "   ");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["kind"]["clipboard"]["preview"], "https://example.com/");
+    }
+
+    #[test]
+    fn the_live_page_url_and_title_feed_the_page_actions() {
+        let (session, _helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default();
+        state.push_session(session);
+        run_until_texture(&mut state);
+        // The three page-actions all read the active session's live nav + title
+        // (the testkit helper reports `about:blank` for both).
+        let tab = &state.tabs[0];
+        assert_eq!(tab.session.nav().url, "about:blank");
+        assert_eq!(tab.session.title(), "about:blank");
+        // The chrome now carrying the page-actions star menu still renders.
+        assert!(
+            run_panel(&mut state),
+            "the page-actions chrome produced no draw"
         );
     }
 }
