@@ -48,6 +48,19 @@ mde-bus = { path = "../../platform/mde-bus" }
 # mirrors the storage worker's payloads.
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+# FILEMGR-10 — thumbnail + preview decode on the worker thread (never the paint
+# path). `image` 0.25 is already in the workspace lock (mde-files' freedesktop
+# thumbnails pull the same decoders), so this add is fetch-free on the airgapped
+# farm; the feature set mirrors what the lock already resolves (png/jpeg/gif/
+# bmp/webp/tiff). Formats with no locked decoder (heic/avif/svg) are honestly
+# labeled "no built-in decoder" instead of pulling a new crate.
+image      = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp", "tiff"] }
+# FILEMGR-10 — the preview pane's media metadata (duration/codec/rate/channels)
+# is a *container-header probe* via Symphonia, the exact crate+features the
+# mde-musicd playback engine already locks — fetch-free, and never an audio or
+# video decode. The lock ships no video *codec* (no ffmpeg/h264/vp9), so video
+# rows get an honest metadata-only preview, never a fake frame.
+symphonia  = { version = "0.5", default-features = false, features = ["flac", "mp3", "vorbis", "aac", "isomp4", "ogg", "pcm", "wav"] }
 
 [lints]
 workspace = true

@@ -29,6 +29,7 @@ use mde_files::send_to::{SendToEntry, SendToRequest};
 
 use crate::mesh_mount::{BusMeshMount, MeshMountClient, MeshMountVerb, MountView};
 use crate::ops::Ops;
+use crate::preview::{PreviewState, Previews, ThumbState};
 
 /// How often the Mesh sidebar re-reads `state/mesh-mount/*` from the Bus. The read
 /// is a cheap local spool scan; a worker transition surfaces within this window.
@@ -667,6 +668,18 @@ impl Tab {
         self.anchor = covered.iter().next().copied();
         self.selection = covered;
     }
+
+    /// The row the preview pane / quick-look targets (FILEMGR-10): the
+    /// selection anchor when it is still selected, else the highest-index
+    /// selected row, else `None`.
+    #[must_use]
+    pub fn focused_row(&self) -> Option<&FileRow> {
+        let idx = self
+            .anchor
+            .filter(|i| self.selection.contains(i))
+            .or_else(|| self.selection.iter().next_back().copied())?;
+        self.rows.get(idx)
+    }
 }
 
 /// One pane (viewport): its own tab strip.
@@ -756,6 +769,9 @@ pub struct FileBrowser {
     destination: Option<String>,
     last_send: SendOutcome,
     last_note: Option<String>,
+    /// FILEMGR-10 — the preview/thumbnail decode worker + bounded caches +
+    /// pane/quick-look toggles (render-agnostic; the view uploads textures).
+    previews: Previews,
 }
 
 impl FileBrowser {
@@ -794,6 +810,7 @@ impl FileBrowser {
             destination: None,
             last_send: SendOutcome::Idle,
             last_note: None,
+            previews: Previews::spawn(),
         };
         me.refresh_roster();
         me.reload(0);
@@ -1113,8 +1130,9 @@ impl FileBrowser {
     }
 
     /// Activate row `idx` in `pane` (a double-click / Enter): descend into a
-    /// directory. Opening a file for preview is FILEMGR-10, so a file is a no-op
-    /// here (not a stub — there is simply nothing for the shell to do yet).
+    /// directory, or open a **file** in the built-in quick-look viewer
+    /// (FILEMGR-10 / lock 23 — built-in viewers only, never an external
+    /// program spawn §9).
     pub fn open_row(&mut self, pane: usize, idx: usize) {
         let ti = self.tab_index(pane);
         let Some(row) = self.panes[pane].tabs[ti].rows.get(idx).cloned() else {
@@ -1126,6 +1144,11 @@ impl FileBrowser {
             }
             // A virtual peer folder has no local path — descent needs the mesh
             // mount (FILEMGR-9); honestly a no-op until then.
+        } else {
+            // Select it (so the quick-look target fold finds it) and open the
+            // built-in viewer overlay.
+            self.panes[pane].tabs[ti].click(idx);
+            self.previews.set_quick_look(true);
         }
     }
 
@@ -1347,6 +1370,120 @@ impl FileBrowser {
     #[must_use]
     pub fn last_note(&self) -> Option<&str> {
         self.last_note.as_deref()
+    }
+
+    // ── previews + thumbnails + quick-look (FILEMGR-10) ─────────────────────
+
+    /// Fold finished decodes into the caches (call once per frame). Returns
+    /// `true` when anything landed, so the view repaints.
+    pub fn pump_previews(&mut self) -> bool {
+        self.previews.pump()
+    }
+
+    /// `true` while any thumbnail/preview decode is still in flight (the view
+    /// keeps a repaint heartbeat alive so results appear without input).
+    #[must_use]
+    pub fn previews_pending(&self) -> bool {
+        self.previews.any_pending()
+    }
+
+    /// The thumbnail slot for `path` (`None` = never requested / evicted).
+    #[must_use]
+    pub fn thumb_state(&self, path: &str) -> Option<&ThumbState> {
+        self.previews.thumb(path)
+    }
+
+    /// The preview slot for `path` (`None` = never requested / evicted).
+    #[must_use]
+    pub fn preview_state(&self, path: &str) -> Option<&PreviewState> {
+        self.previews.preview(path)
+    }
+
+    /// Want a thumbnail for `path` — decodes off-thread when cold, keeps the
+    /// LRU slot warm when already cached. The view calls this every frame a
+    /// cell is actually visible, so eviction order tracks visibility.
+    pub fn request_thumb(&mut self, path: &str) {
+        self.previews.request_thumb(path);
+    }
+
+    /// Want a pane/quick-look preview for `path` (same contract as
+    /// [`request_thumb`](Self::request_thumb)).
+    pub fn request_preview(&mut self, path: &str) {
+        self.previews.request_preview(path);
+    }
+
+    /// Bust the preview/thumbnail caches (lock 18 — a manual refresh
+    /// re-decodes; a changed file re-thumbnails on the next request).
+    pub fn clear_previews(&mut self) {
+        self.previews.clear();
+    }
+
+    /// Whether the right-hand preview pane is shown.
+    #[must_use]
+    pub fn preview_pane_open(&self) -> bool {
+        self.previews.pane_open()
+    }
+
+    /// Toggle the preview pane.
+    pub fn toggle_preview_pane(&mut self) {
+        self.previews.toggle_pane();
+    }
+
+    /// Whether the List view shows its thumbnail column (Grid always does).
+    #[must_use]
+    pub fn list_thumbs(&self) -> bool {
+        self.previews.list_thumbs()
+    }
+
+    /// Toggle the List view's thumbnail column.
+    pub fn toggle_list_thumbs(&mut self) {
+        self.previews.toggle_list_thumbs();
+    }
+
+    /// Whether the quick-look overlay is up.
+    #[must_use]
+    pub fn quick_look_open(&self) -> bool {
+        self.previews.quick_look()
+    }
+
+    /// Space: toggle the quick-look overlay. Opening requires a focused row —
+    /// with nothing selected there is honestly nothing to look at.
+    pub fn toggle_quick_look(&mut self) {
+        if self.previews.quick_look() {
+            self.previews.set_quick_look(false);
+        } else if self.preview_target().is_some() {
+            self.previews.set_quick_look(true);
+        }
+    }
+
+    /// Close the quick-look overlay (Escape / a backdrop click).
+    pub fn close_quick_look(&mut self) {
+        self.previews.set_quick_look(false);
+    }
+
+    /// The row the preview pane / quick-look shows: the active tab's focused
+    /// selection.
+    #[must_use]
+    pub fn preview_target(&self) -> Option<&FileRow> {
+        self.active_tab().focused_row()
+    }
+
+    /// `true` when `path` sits under a mesh mount — the stable
+    /// `/run/user/<uid>/mde-mesh/<host>` root (lock 11) or any mountpoint the
+    /// FILEMGR-5 worker has published. Remote files are never bulk-decoded
+    /// (lock 18): thumbnails only when selected, previews on demand.
+    #[must_use]
+    pub fn is_remote_path(&self, path: &str) -> bool {
+        if path.contains("/mde-mesh/") {
+            return true;
+        }
+        self.mounts
+            .values()
+            .filter_map(|m| m.path.as_deref())
+            .any(|mp| {
+                path.strip_prefix(mp)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
     }
 
     // ── Send-To (mesh transfer — carried from E12-11) ───────────────────────
@@ -2016,5 +2153,94 @@ mod tests {
         let fake = FakeMeshMount::new().with_view("pine", mounting);
         let b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
         assert!(b.any_mount_transitional());
+    }
+
+    // ── previews + quick-look (FILEMGR-10) ───────────────────────────────────
+
+    /// A browser over two local files with real paths (a text file + an image).
+    fn preview_browser() -> FileBrowser {
+        let rows = vec![
+            FileRow::local("notes.md", Mime::Doc, "1 KB", "now").with_path("/d/notes.md"),
+            FileRow::local("photo.png", Mime::Image, "80 KB", "2 h").with_path("/d/photo.png"),
+        ];
+        browser_over(FixtureBackend::new(Vec::new(), rows))
+    }
+
+    #[test]
+    fn preview_target_follows_the_selection_anchor() {
+        let mut b = preview_browser();
+        assert!(b.preview_target().is_none(), "nothing selected → no target");
+        b.click(0, 0);
+        assert_eq!(b.preview_target().expect("target").name, "notes.md");
+        // Ctrl-click adds row 1 and moves the anchor there.
+        b.ctrl_click(0, 1);
+        assert_eq!(b.preview_target().expect("target").name, "photo.png");
+        // Ctrl-click the anchor off again → falls back to the last selected.
+        b.ctrl_click(0, 1);
+        assert_eq!(b.preview_target().expect("target").name, "notes.md");
+        b.clear_selection(0);
+        assert!(b.preview_target().is_none());
+    }
+
+    #[test]
+    fn quick_look_only_opens_with_a_target_and_closes_cleanly() {
+        let mut b = preview_browser();
+        b.toggle_quick_look();
+        assert!(!b.quick_look_open(), "no selection → nothing to look at");
+        b.click(0, 1);
+        b.toggle_quick_look();
+        assert!(b.quick_look_open());
+        b.toggle_quick_look();
+        assert!(!b.quick_look_open(), "Space toggles closed");
+        b.toggle_quick_look();
+        b.close_quick_look();
+        assert!(!b.quick_look_open(), "Escape closes");
+    }
+
+    #[test]
+    fn double_clicking_a_file_opens_the_built_in_quick_look() {
+        // Lock 23: activating a file opens the built-in viewer — never an
+        // external program spawn.
+        let mut b = preview_browser();
+        b.open_row(0, 1);
+        assert!(b.quick_look_open());
+        assert_eq!(b.preview_target().expect("target").name, "photo.png");
+    }
+
+    #[test]
+    fn preview_toggles_start_at_the_locked_defaults() {
+        let mut b = preview_browser();
+        assert!(b.preview_pane_open(), "the pane ships on (lock 22)");
+        assert!(b.list_thumbs(), "the List thumbnail column ships on");
+        b.toggle_preview_pane();
+        assert!(!b.preview_pane_open());
+        b.toggle_list_thumbs();
+        assert!(!b.list_thumbs());
+    }
+
+    #[test]
+    fn refresh_busts_the_preview_caches() {
+        let mut b = preview_browser();
+        // A request against a path that can't decode still occupies a slot…
+        b.request_thumb("/d/photo.png");
+        assert!(b.thumb_state("/d/photo.png").is_some());
+        // …until the lock-18 cache bust clears it.
+        b.clear_previews();
+        assert!(b.thumb_state("/d/photo.png").is_none());
+    }
+
+    #[test]
+    fn remote_paths_are_detected_by_mount_root_and_published_mountpoints() {
+        let fake =
+            FakeMeshMount::new().with_view("pine", mounted_view("/mnt/pine-x", MountScope::Home));
+        let b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
+        // The stable lock-11 root is always remote, even before state arrives.
+        assert!(b.is_remote_path("/run/user/1000/mde-mesh/pine/docs/a.png"));
+        // A worker-published mountpoint is remote…
+        assert!(b.is_remote_path("/mnt/pine-x/file.txt"));
+        assert!(b.is_remote_path("/mnt/pine-x"));
+        // …but a sibling that merely shares the prefix is not.
+        assert!(!b.is_remote_path("/mnt/pine-xylophone/file.txt"));
+        assert!(!b.is_remote_path("/home/mac/file.txt"));
     }
 }

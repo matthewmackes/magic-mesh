@@ -3931,8 +3931,13 @@ dependencies = [
 name = "mde-files-egui"
 version = "12.0.0"
 dependencies = [
+ "image",
+ "mde-bus",
  "mde-egui",
  "mde-files",
+ "serde",
+ "serde_json",
+ "symphonia",
 ]
 
 [[package]]

@@ -16,15 +16,26 @@
 //! with Ctrl) within a pane and between the two panes — every drop is a real
 //! transfer run through the FILEMGR-2 op queue, with live progress on the bottom
 //! strip.
+//!
+//! FILEMGR-10 adds the preview surfaces: lazy cached thumbnails in the Grid
+//! tiles + an optional List column, a toggleable right-hand preview pane
+//! (image / highlighted text / media metadata), and the Space quick-look
+//! overlay. Decodes never happen on this paint path — the view *requests*
+//! (through [`Action`]s, which doubles as the cache-recency signal), draws an
+//! icon placeholder, and the [`crate::preview`] worker delivers off-thread.
+//! Every viewer is built in (§9 / lock 23): nothing here spawns a program.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use mde_egui::egui::load::SizedTexture;
 use mde_egui::egui::{
     self, Align2, Color32, FontId, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
+    TextureHandle, TextureOptions,
 };
-use mde_egui::{muted_note, status_dot, Style};
+use mde_egui::{field, muted_note, status_dot, Style};
 
 use mde_files::model::{Mime, PeerStatus};
 use mde_files::opqueue::Progress;
@@ -32,6 +43,9 @@ use mde_files::opqueue::Progress;
 use crate::mesh_mount::{MountPhase, MountView};
 use crate::model::{
     mount_host_of, FileBrowser, Location, SendOutcome, SortKey, SortSpec, ViewMode, LOCAL_SPOTS,
+};
+use crate::preview::{
+    Pixels, PreviewData, PreviewKind, PreviewState, ThumbState, TokenKind, TokenSpan,
 };
 
 // Details-view column widths (right-hand columns; name takes the rest).
@@ -62,6 +76,10 @@ struct EntryView {
     is_dir: bool,
     selected: bool,
     path: Option<String>,
+    /// FILEMGR-10 — what this row can preview as (extension-keyed, honest).
+    kind: PreviewKind,
+    /// FILEMGR-10 — on a mesh mount: thumbnails only when selected (lock 18).
+    remote: bool,
 }
 
 /// A user intent captured during a render, applied after the frame releases its
@@ -102,6 +120,19 @@ enum Action {
     EscalatePeer(String),
     /// FILEMGR-9 — unmount a peer.
     UnmountPeer(String),
+    /// FILEMGR-10 — want a thumbnail for this path (pushed every frame the
+    /// cell is visible; the model dedups + uses it as the LRU recency signal).
+    NeedThumb(String),
+    /// FILEMGR-10 — want a pane/quick-look preview for this path.
+    NeedPreview(String),
+    /// FILEMGR-10 — toggle the right-hand preview pane.
+    TogglePreviewPane,
+    /// FILEMGR-10 — toggle the List view's thumbnail column.
+    ToggleListThumbs,
+    /// FILEMGR-10 — Space: toggle the quick-look overlay.
+    ToggleQuickLook,
+    /// FILEMGR-10 — Escape / backdrop click: close the quick-look overlay.
+    CloseQuickLook,
     Send,
     PauseOp(u64),
     ResumeOp(u64),
@@ -118,6 +149,14 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     if browser.ops().any_running() {
         ui.ctx().request_repaint();
     }
+    // FILEMGR-10 — fold finished thumbnail/preview decodes in before the frame
+    // reads them, and keep a short heartbeat while any decode is in flight so
+    // results appear without input. Decoding itself NEVER runs on this paint
+    // path — the worker thread owns it.
+    browser.pump_previews();
+    if browser.previews_pending() {
+        ui.ctx().request_repaint_after(Duration::from_millis(100));
+    }
     // FILEMGR-9 — refresh the mesh-mount state (a cheap, cadence-gated local Bus
     // read; never a peer probe). While a mount is still coming up, keep a repaint
     // heartbeat alive so the sidebar pip animates mounting → mounted without input.
@@ -133,6 +172,11 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
         status_line(ui, browser);
     });
     sidebar(ui, browser, &mut actions);
+    // FILEMGR-10 — the toggleable preview pane sits between the listing and the
+    // window edge, previewing the focused selection with built-in viewers only.
+    if browser.preview_pane_open() {
+        preview_pane(ui, browser, &mut actions);
+    }
     egui::CentralPanel::default().show_inside(ui, |ui| {
         if browser.is_dual() {
             ui.columns(2, |cols| {
@@ -143,6 +187,8 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
             pane_view(ui, browser, 0, &mut actions);
         }
     });
+    // FILEMGR-10 — the Space quick-look modal, over everything.
+    quick_look_overlay(ui, browser, &mut actions);
 
     for action in actions {
         apply(browser, action);
@@ -162,7 +208,12 @@ fn apply(browser: &mut FileBrowser, action: Action) {
         Action::Up(p) => browser.go_up(p),
         Action::SetPathEdit(p, text) => browser.set_path_edit(p, text),
         Action::OpenPathEdit(p) => browser.open_path_edit(p),
-        Action::OpenRow(p, i) => browser.open_row(p, i),
+        Action::OpenRow(p, i) => {
+            // Focus follows the activation, so a quick-look opened from the
+            // other pane targets the row that was actually opened.
+            browser.set_active_pane(p);
+            browser.open_row(p, i);
+        }
         Action::SetView(p, m) => browser.set_view(p, m),
         Action::SortBy(p, k) => browser.sort_by(p, k),
         Action::ToggleHidden(p) => browser.toggle_hidden(p),
@@ -171,6 +222,9 @@ fn apply(browser: &mut FileBrowser, action: Action) {
         Action::Refresh => {
             browser.refresh_roster();
             browser.reload_all();
+            // Lock 18 — a manual refresh busts the thumbnail/preview caches so
+            // changed files re-decode.
+            browser.clear_previews();
         }
         Action::Click(p, i) => browser.click(p, i),
         Action::CtrlClick(p, i) => browser.ctrl_click(p, i),
@@ -195,6 +249,12 @@ fn apply(browser: &mut FileBrowser, action: Action) {
         }
         Action::EscalatePeer(host) => browser.escalate_peer(&host),
         Action::UnmountPeer(host) => browser.unmount_peer(&host),
+        Action::NeedThumb(path) => browser.request_thumb(&path),
+        Action::NeedPreview(path) => browser.request_preview(&path),
+        Action::TogglePreviewPane => browser.toggle_preview_pane(),
+        Action::ToggleListThumbs => browser.toggle_list_thumbs(),
+        Action::ToggleQuickLook => browser.toggle_quick_look(),
+        Action::CloseQuickLook => browser.close_quick_look(),
         Action::Send => {
             browser.send();
         }
@@ -253,6 +313,21 @@ fn top_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
                 .clicked()
             {
                 actions.push(Action::ToggleDual);
+            }
+            // FILEMGR-10 — the preview toggles.
+            if ui
+                .selectable_label(b.list_thumbs(), "Thumbs")
+                .on_hover_text("Thumbnails in the List view (the Grid always thumbnails)")
+                .clicked()
+            {
+                actions.push(Action::ToggleListThumbs);
+            }
+            if ui
+                .selectable_label(b.preview_pane_open(), "Preview")
+                .on_hover_text("Preview pane \u{2014} Space quick-looks the selection")
+                .clicked()
+            {
+                actions.push(Action::TogglePreviewPane);
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -547,8 +622,11 @@ fn tab_strip(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut V
 // ── The listing (List / Grid / Details) + selection + DnD + rubber-band ───────
 
 fn listing(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut Vec<Action>) {
-    // Keyboard shortcuts act on the focused pane.
-    if b.active_pane_index() == pane_ix {
+    // Keyboard shortcuts act on the focused pane — but never while a text
+    // field (the path box) owns the keyboard, so typing a space or Ctrl+A
+    // edits the text instead of hijacking the listing.
+    if b.active_pane_index() == pane_ix && !ui.ctx().wants_keyboard_input() {
+        let quick_look = b.quick_look_open();
         ui.input_mut(|i| {
             if i.consume_key(Modifiers::COMMAND, Key::A) {
                 actions.push(Action::SelectAll(pane_ix));
@@ -556,8 +634,16 @@ fn listing(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut Vec
             if i.consume_key(Modifiers::COMMAND, Key::H) {
                 actions.push(Action::ToggleHidden(pane_ix));
             }
+            // FILEMGR-10 — Space quick-looks the focused selection.
+            if i.consume_key(Modifiers::NONE, Key::Space) {
+                actions.push(Action::ToggleQuickLook);
+            }
             if i.consume_key(Modifiers::NONE, Key::Escape) {
-                actions.push(Action::ClearSelection(pane_ix));
+                if quick_look {
+                    actions.push(Action::CloseQuickLook);
+                } else {
+                    actions.push(Action::ClearSelection(pane_ix));
+                }
             }
         });
     }
@@ -577,6 +663,8 @@ fn listing(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut Vec
             is_dir: r.is_dir(),
             selected: tab.is_selected(idx),
             path: r.path.clone(),
+            kind: PreviewKind::detect(&r.name, r.is_dir()),
+            remote: r.path.as_deref().is_some_and(|p| b.is_remote_path(p)),
         })
         .collect();
 
@@ -618,8 +706,8 @@ fn listing(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut Vec
                 empty_state(ui, b, pane_ix);
             } else {
                 match view {
-                    ViewMode::List => list_view(ui, pane_ix, &entries, &mut rects, actions),
-                    ViewMode::Grid => grid_view(ui, pane_ix, &entries, &mut rects, actions),
+                    ViewMode::List => list_view(ui, b, pane_ix, &entries, &mut rects, actions),
+                    ViewMode::Grid => grid_view(ui, b, pane_ix, &entries, &mut rects, actions),
                     ViewMode::Details => details_view(ui, pane_ix, &entries, &mut rects, actions),
                 }
             }
@@ -631,12 +719,14 @@ fn listing(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut Vec
 
 fn list_view(
     ui: &mut egui::Ui,
+    b: &FileBrowser,
     pane_ix: usize,
     entries: &[EntryView],
     rects: &mut Vec<(usize, Rect)>,
     actions: &mut Vec<Action>,
 ) {
     let width = ui.available_width();
+    let thumbs = b.list_thumbs();
     for e in entries {
         let (rect, resp) =
             ui.allocate_exact_size(egui::vec2(width, ROW_H), Sense::click_and_drag());
@@ -645,14 +735,27 @@ fn list_view(
         let cy = rect.center().y;
         let tag_x = rect.left() + Style::SP_S;
         let name_x = tag_x + Style::SP_L;
-        let painter = ui.painter();
-        painter.text(
-            egui::pos2(tag_x, cy),
-            Align2::LEFT_CENTER,
-            mime_tag(e.mime),
-            FontId::monospace(Style::SMALL),
-            Style::TEXT_DIM,
-        );
+        // FILEMGR-10 — the optional thumbnail column: a decoded thumb replaces
+        // the type tag; anything not (yet) decoded keeps the honest tag.
+        let thumbed = if thumbs {
+            want_thumb(ui, e, rect, actions);
+            let cell = Rect::from_min_size(
+                egui::pos2(rect.left() + Style::SP_XS, rect.top() + 1.0),
+                egui::vec2(ROW_H - 2.0, ROW_H - 2.0),
+            );
+            draw_thumb(ui, b, e, cell)
+        } else {
+            false
+        };
+        if !thumbed {
+            ui.painter().text(
+                egui::pos2(tag_x, cy),
+                Align2::LEFT_CENTER,
+                mime_tag(e.mime),
+                FontId::monospace(Style::SMALL),
+                Style::TEXT_DIM,
+            );
+        }
         let name_clip = Rect::from_min_max(
             egui::pos2(name_x, rect.top()),
             egui::pos2(rect.right() - Style::SP_S, rect.bottom()),
@@ -670,6 +773,7 @@ fn list_view(
 
 fn grid_view(
     ui: &mut egui::Ui,
+    b: &FileBrowser,
     pane_ix: usize,
     entries: &[EntryView],
     rects: &mut Vec<(usize, Rect)>,
@@ -681,18 +785,26 @@ fn grid_view(
                 ui.allocate_exact_size(egui::vec2(TILE_W, TILE_H), Sense::click_and_drag());
             rects.push((e.idx, rect));
             paint_entry_bg(ui, rect, e.selected, resp.hovered());
-            let painter = ui.painter();
-            painter.text(
-                egui::pos2(rect.center().x, rect.top() + Style::SP_L),
-                Align2::CENTER_CENTER,
-                mime_tag(e.mime),
-                FontId::monospace(Style::HEADING),
-                if e.is_dir {
-                    Style::ACCENT
-                } else {
-                    Style::TEXT_DIM
-                },
+            // FILEMGR-10 — a decoded thumbnail fills the tile art area; until
+            // (or unless) one exists, the honest type tag stays the icon.
+            want_thumb(ui, e, rect, actions);
+            let art = Rect::from_min_max(
+                egui::pos2(rect.left() + Style::SP_XS, rect.top() + Style::SP_XS),
+                egui::pos2(rect.right() - Style::SP_XS, rect.bottom() - Style::SP_L),
             );
+            if !draw_thumb(ui, b, e, art) {
+                ui.painter().text(
+                    egui::pos2(rect.center().x, rect.top() + Style::SP_L),
+                    Align2::CENTER_CENTER,
+                    mime_tag(e.mime),
+                    FontId::monospace(Style::HEADING),
+                    if e.is_dir {
+                        Style::ACCENT
+                    } else {
+                        Style::TEXT_DIM
+                    },
+                );
+            }
             let name_clip = Rect::from_min_max(
                 egui::pos2(rect.left() + Style::SP_XS, rect.bottom() - Style::SP_L),
                 egui::pos2(rect.right() - Style::SP_XS, rect.bottom()),
@@ -961,6 +1073,401 @@ fn pane_drop(
             });
         }
     }
+}
+
+// ── Previews + thumbnails + quick-look (FILEMGR-10) ───────────────────────────
+
+/// Push the "want a thumbnail" intent for a visible image cell. Pushed every
+/// frame the cell is on screen — the model dedups, and the stream of wants is
+/// exactly the LRU recency signal, so eviction tracks visibility. A **remote**
+/// (mesh-mount) file is only requested while *selected* (lock 18): a remote
+/// directory is never bulk-decoded over sshfs just by being scrolled past.
+fn want_thumb(ui: &egui::Ui, e: &EntryView, rect: Rect, actions: &mut Vec<Action>) {
+    if e.kind != PreviewKind::Image {
+        return;
+    }
+    let Some(path) = &e.path else { return };
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    if e.remote && !e.selected {
+        return;
+    }
+    actions.push(Action::NeedThumb(path.clone()));
+}
+
+/// Paint a decoded thumbnail fitted into `cell`. Returns `false` when there is
+/// nothing decoded to draw (pending / failed / not an image) — the caller then
+/// paints the honest type tag as the placeholder icon.
+fn draw_thumb(ui: &egui::Ui, b: &FileBrowser, e: &EntryView, cell: Rect) -> bool {
+    if e.kind != PreviewKind::Image {
+        return false;
+    }
+    let Some(path) = &e.path else { return false };
+    let Some(ThumbState::Ready { stamp, pixels }) = b.thumb_state(path) else {
+        return false;
+    };
+    let tex = preview_texture(ui, &format!("t:{path}"), *stamp, pixels);
+    let fitted = fit_rect(cell, pixels.size);
+    egui::Image::new(SizedTexture::new(tex.id(), fitted.size())).paint_at(ui, fitted);
+    true
+}
+
+/// The GPU-texture cache over the decoded rasters, held in egui memory so the
+/// stateless `files_panel` entry point stays state-free. Keyed by
+/// `t:<path>` / `p:<path>` with the delivery stamp — a re-decode (cache bust)
+/// re-uploads, and the count-bounded prune drops the oldest stamps so GPU
+/// memory stays bounded alongside the pixel LRUs.
+fn preview_texture(ui: &egui::Ui, key: &str, stamp: u64, pixels: &Pixels) -> TextureHandle {
+    #[derive(Clone, Default)]
+    struct TexCache(Arc<Mutex<HashMap<String, (u64, TextureHandle)>>>);
+    /// Slightly over the pixel caches' combined cap, so pruning here is rare.
+    const TEX_CAP: usize = 600;
+
+    // Fetch the shared map handle only inside `data_mut`; the upload itself
+    // runs outside it (a `load_texture` inside `data_mut` re-enters the ctx
+    // lock and deadlocks — same caveat as the shell backdrop).
+    let cache = ui.ctx().data_mut(|d| {
+        d.get_temp_mut_or_default::<TexCache>(egui::Id::new("files-preview-tex"))
+            .clone()
+    });
+    let mut map = cache
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((cached_stamp, tex)) = map.get(key) {
+        if *cached_stamp == stamp {
+            return tex.clone();
+        }
+    }
+    let image = egui::ColorImage::from_rgba_unmultiplied(pixels.size, &pixels.rgba);
+    let tex = ui.ctx().load_texture(
+        format!("files-preview:{key}"),
+        image,
+        TextureOptions::LINEAR,
+    );
+    map.insert(key.to_string(), (stamp, tex.clone()));
+    if map.len() > TEX_CAP {
+        // Stamps are monotonic — drop the oldest down to the cap.
+        let mut stamps: Vec<u64> = map.values().map(|(s, _)| *s).collect();
+        stamps.sort_unstable();
+        let cutoff = stamps[map.len() - TEX_CAP];
+        map.retain(|_, (s, _)| *s >= cutoff);
+    }
+    tex
+}
+
+/// Center `size` (a decoded raster) inside `cell`, scaled to fit while keeping
+/// aspect.
+#[allow(clippy::cast_precision_loss)] // raster dims are ≤ PREVIEW_PX — exact in f32.
+fn fit_rect(cell: Rect, size: [usize; 2]) -> Rect {
+    let (w, h) = (size[0] as f32, size[1] as f32);
+    if w <= 0.0 || h <= 0.0 {
+        return Rect::from_center_size(cell.center(), egui::Vec2::ZERO);
+    }
+    let scale = (cell.width() / w).min(cell.height() / h);
+    Rect::from_center_size(cell.center(), egui::vec2(w * scale, h * scale))
+}
+
+/// A per-frame snapshot of the preview target (the active tab's focused
+/// selection), so the pane/overlay hold no `&FileRow` while pushing intents.
+struct PreviewTarget {
+    name: String,
+    size: String,
+    age: String,
+    mime: Mime,
+    path: Option<String>,
+    remote: bool,
+    kind: PreviewKind,
+}
+
+fn preview_target_of(b: &FileBrowser) -> Option<PreviewTarget> {
+    let r = b.preview_target()?;
+    Some(PreviewTarget {
+        name: r.name.clone(),
+        size: r.size.clone(),
+        age: r.age.clone(),
+        mime: r.mime,
+        path: r.path.clone(),
+        remote: r.path.as_deref().is_some_and(|p| b.is_remote_path(p)),
+        kind: PreviewKind::detect(&r.name, r.is_dir()),
+    })
+}
+
+/// FILEMGR-10 — the toggleable right-hand preview pane.
+fn preview_pane(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    egui::SidePanel::right("files-preview")
+        .default_width(Style::SP_XL * 9.0)
+        .show_inside(ui, |ui| {
+            ui.add_space(Style::SP_S);
+            section_header(ui, "PREVIEW");
+            ui.add_space(Style::SP_XS);
+            let Some(target) = preview_target_of(b) else {
+                muted_note(
+                    ui,
+                    "Select a file to preview it \u{2014} Space quick-looks.",
+                );
+                return;
+            };
+            preview_body(ui, b, &target, false, actions);
+        });
+}
+
+/// The shared preview renderer — the pane and the quick-look overlay draw the
+/// same content with different size budgets (`big`). Draw-only: every decode
+/// request goes out as an [`Action`] and runs on the worker thread.
+fn preview_body(
+    ui: &mut egui::Ui,
+    b: &FileBrowser,
+    t: &PreviewTarget,
+    big: bool,
+    actions: &mut Vec<Action>,
+) {
+    // Identity + the cheap metadata the listing already carries (no stat here).
+    let title_size = if big { Style::HEADING } else { Style::BODY };
+    ui.label(
+        RichText::new(&t.name)
+            .color(Style::TEXT)
+            .strong()
+            .size(title_size),
+    );
+    let mut meta = format!("{} \u{b7} {}", mime_tag(t.mime), t.size);
+    if !t.age.is_empty() && t.age != "\u{2014}" {
+        meta.push_str(" \u{b7} ");
+        meta.push_str(&t.age);
+    }
+    if t.remote {
+        meta.push_str(" \u{b7} remote");
+    }
+    muted_note(ui, meta);
+    ui.add_space(Style::SP_S);
+
+    match t.kind {
+        PreviewKind::Folder => {
+            muted_note(ui, "Folder \u{2014} open it to browse.");
+        }
+        // Lock 23 — unviewable/unknown types get an honest "no handler",
+        // never an external-app spawn.
+        PreviewKind::NoViewer(label) => {
+            muted_note(ui, format!("No built-in viewer \u{2014} {label}."));
+        }
+        PreviewKind::ImageNoDecoder => {
+            muted_note(ui, "Image \u{2014} no built-in decoder for this format.");
+        }
+        PreviewKind::VideoNoProbe => {
+            muted_note(
+                ui,
+                "Video \u{2014} no built-in reader for this container: no frame preview or duration.",
+            );
+        }
+        PreviewKind::Image | PreviewKind::Text(_) | PreviewKind::Audio | PreviewKind::Video => {
+            preview_decoded_body(ui, b, t, big, actions);
+        }
+    }
+}
+
+/// The worker-decoded part of a preview (image / text / media), by cache state.
+fn preview_decoded_body(
+    ui: &mut egui::Ui,
+    b: &FileBrowser,
+    t: &PreviewTarget,
+    big: bool,
+    actions: &mut Vec<Action>,
+) {
+    let Some(path) = &t.path else {
+        muted_note(
+            ui,
+            "No local path \u{2014} mount the peer (Mesh sidebar) to preview.",
+        );
+        return;
+    };
+    match b.preview_state(path) {
+        // Lock 18 — a remote file is never auto-read over sshfs: an honest
+        // on-demand affordance instead.
+        None if t.remote => {
+            muted_note(ui, "Remote file \u{2014} preview on demand.");
+            if ui.button("Load preview").clicked() {
+                actions.push(Action::NeedPreview(path.clone()));
+            }
+        }
+        // A cold local slot requests the decode; a Pending one just keeps its
+        // LRU slot warm — both draw the same honest loading note.
+        None | Some(PreviewState::Pending) => {
+            actions.push(Action::NeedPreview(path.clone()));
+            muted_note(ui, "Loading preview\u{2026}");
+        }
+        Some(PreviewState::Failed(reason)) => {
+            actions.push(Action::NeedPreview(path.clone()));
+            ui.colored_label(Style::WARN, format!("No preview \u{2014} {reason}"));
+        }
+        Some(PreviewState::Ready { stamp, data }) => {
+            // The re-push keeps the LRU slot warm while it's on screen.
+            actions.push(Action::NeedPreview(path.clone()));
+            render_preview_data(ui, path, *stamp, data.as_ref(), t, big);
+        }
+    }
+}
+
+fn render_preview_data(
+    ui: &mut egui::Ui,
+    path: &str,
+    stamp: u64,
+    data: &PreviewData,
+    t: &PreviewTarget,
+    big: bool,
+) {
+    match data {
+        PreviewData::Image { pixels, full } => {
+            let budget_h = if big {
+                (ui.available_height() - Style::SP_XL).max(Style::SP_XL)
+            } else {
+                Style::SP_XL * 8.0
+            };
+            let cell =
+                Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), budget_h));
+            let fitted = fit_rect(cell, pixels.size);
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), fitted.height()),
+                Sense::hover(),
+            );
+            let draw = Rect::from_center_size(rect.center(), fitted.size());
+            let tex = preview_texture(ui, &format!("p:{path}"), stamp, pixels);
+            egui::Image::new(SizedTexture::new(tex.id(), draw.size())).paint_at(ui, draw);
+            muted_note(ui, format!("{} \u{d7} {} px", full[0], full[1]));
+        }
+        PreviewData::Text { lines, truncated } => {
+            let budget_h = if big {
+                (ui.available_height() - Style::SP_L).max(Style::SP_XL)
+            } else {
+                Style::SP_XL * 10.0
+            };
+            egui::ScrollArea::vertical()
+                .id_salt(("files-preview-text", big))
+                .max_height(budget_h)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.label(text_layout_job(lines));
+                });
+            if *truncated {
+                muted_note(ui, "\u{2026} preview truncated.");
+            }
+        }
+        PreviewData::Media(meta) => {
+            match meta.duration_secs {
+                Some(secs) => field(ui, "Duration", &fmt_duration(secs), Style::TEXT),
+                None => field(ui, "Duration", "unknown", Style::TEXT_DIM),
+            }
+            if let Some(codec) = &meta.codec {
+                field(ui, "Codec", codec, Style::TEXT);
+            }
+            if let Some(rate) = meta.sample_rate {
+                field(ui, "Sample rate", &format!("{rate} Hz"), Style::TEXT);
+            }
+            if let Some(ch) = meta.channels {
+                field(ui, "Channels", &ch.to_string(), Style::TEXT);
+            }
+            if t.kind == PreviewKind::Video {
+                ui.add_space(Style::SP_XS);
+                muted_note(
+                    ui,
+                    "Container metadata only \u{2014} the shell ships no video frame decoder.",
+                );
+            }
+        }
+    }
+}
+
+/// Lay the worker-tokenized lines out as one monospace galley, each token in
+/// its Carbon tone (§4 — tokens only, no raw colours).
+fn text_layout_job(lines: &[Vec<TokenSpan>]) -> egui::text::LayoutJob {
+    let fmt = |kind: TokenKind| egui::TextFormat {
+        font_id: FontId::monospace(Style::SMALL),
+        color: token_color(kind),
+        ..egui::TextFormat::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            job.append("\n", 0.0, fmt(TokenKind::Plain));
+        }
+        for (span, kind) in line {
+            job.append(span, 0.0, fmt(*kind));
+        }
+    }
+    job
+}
+
+/// The Carbon tone for a syntax-ish token class (§4 — no raw hex).
+const fn token_color(kind: TokenKind) -> Color32 {
+    match kind {
+        TokenKind::Plain => Style::TEXT,
+        TokenKind::Keyword => Style::ACCENT_HI,
+        TokenKind::Comment => Style::TEXT_DIM,
+        TokenKind::Str => Style::OK,
+        TokenKind::Number => Style::WARN,
+        TokenKind::Heading => Style::ACCENT,
+    }
+}
+
+/// `m:ss` / `h:mm:ss` for a probed duration.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // durations are small +ve.
+fn fmt_duration(secs: f64) -> String {
+    let total = secs.round().max(0.0) as u64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// FILEMGR-10 — the Space quick-look: a modal overlay dimming the shell and
+/// centering the built-in viewer at full size. Space / Escape / a backdrop
+/// click closes it. Same `preview_body` the pane draws — one viewer, two
+/// surfaces, zero external programs (§9).
+fn quick_look_overlay(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    if !b.quick_look_open() {
+        return;
+    }
+    let Some(target) = preview_target_of(b) else {
+        // The selection vanished under the overlay — nothing left to look at.
+        actions.push(Action::CloseQuickLook);
+        return;
+    };
+    let ctx = ui.ctx().clone();
+    let screen = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("files-quicklook"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(&ctx, |ui| {
+            // The dim backdrop swallows pointer input under the modal; a click
+            // on it closes.
+            let dim = ui.interact(screen, egui::Id::new("files-quicklook-dim"), Sense::click());
+            ui.painter()
+                .rect_filled(screen, 0.0, Style::BG.gamma_multiply(0.94));
+            if dim.clicked() {
+                actions.push(Action::CloseQuickLook);
+            }
+            let card = Rect::from_center_size(
+                screen.center(),
+                egui::vec2(screen.width() * 0.72, screen.height() * 0.84),
+            );
+            ui.painter()
+                .rect_filled(card, Style::RADIUS, Style::SURFACE);
+            ui.painter().rect_stroke(
+                card,
+                Style::RADIUS,
+                Stroke::new(1.0, Style::BORDER),
+                StrokeKind::Inside,
+            );
+            let inner = card.shrink(Style::SP_M);
+            let mut body = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(inner)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            preview_body(&mut body, b, &target, true, actions);
+        });
 }
 
 // ── Bottom: op-queue progress strip + status line ─────────────────────────────
@@ -1402,6 +1909,111 @@ mod tests {
             FileBrowser::with_file_ops(Box::new(RenderFixture::populated()), FakeFileOps::new())
                 .with_mesh_mount(Box::new(fake));
         assert!(b.any_mount_transitional());
+        mount(&mut b);
+    }
+
+    // ── previews + thumbnails + quick-look (FILEMGR-10) ──────────────────────
+
+    use crate::preview::{PreviewState, ThumbState};
+    use std::time::{Duration, Instant};
+
+    /// Write a real PNG to a scratch path so the decode worker exercises the
+    /// exact production read → decode → deliver → texture-upload pipeline.
+    fn scratch_png(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("mde-files-view-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir scratch");
+        let path = dir.join(name);
+        let img = image::RgbaImage::from_pixel(48, 24, image::Rgba([40, 160, 220, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .save_with_format(&path, image::ImageFormat::Png)
+            .expect("write scratch png");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// A browser whose first row is a real on-disk PNG (name sorts it first).
+    fn browser_with_real_image(path: &str) -> FileBrowser {
+        let rows = vec![
+            FileRow::local("art.png", Mime::Image, "1 KB", "now").with_path(path),
+            FileRow::local("report.pdf", Mime::Pdf, "2.4 MB", "4 min")
+                .with_path("/data/report.pdf"),
+        ];
+        let fixture = RenderFixture {
+            peers: Vec::new(),
+            rows,
+        };
+        FileBrowser::with_file_ops(Box::new(fixture), FakeFileOps::new())
+    }
+
+    /// Pump until both the thumbnail and the preview for `path` are decoded.
+    fn wait_decoded(b: &mut FileBrowser, path: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            b.pump_previews();
+            let thumb = matches!(b.thumb_state(path), Some(ThumbState::Ready { .. }));
+            let preview = matches!(b.preview_state(path), Some(PreviewState::Ready { .. }));
+            if thumb && preview {
+                return;
+            }
+            assert!(Instant::now() < deadline, "decode worker never delivered");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn preview_pane_renders_an_honest_no_viewer_for_a_pdf() {
+        let mut b = browser();
+        assert!(b.preview_pane_open(), "the pane ships open");
+        // Sorted display: [alpha/, photo.png, report.pdf] → index 2 = the PDF,
+        // which has no built-in viewer (lock 23) → the honest "no handler".
+        b.click(0, 2);
+        assert_eq!(b.preview_target().expect("target").name, "report.pdf");
+        mount(&mut b);
+    }
+
+    #[test]
+    fn quick_look_renders_over_the_surface_even_while_loading() {
+        let mut b = browser();
+        // photo.png's fixture path doesn't exist on disk — the decode fails
+        // honestly off-thread while the overlay renders its loading state.
+        b.click(0, 1);
+        b.toggle_quick_look();
+        assert!(b.quick_look_open());
+        mount(&mut b);
+    }
+
+    #[test]
+    fn thumbnails_and_previews_decode_and_render_headless() {
+        // The full FILEMGR-10 pipeline, no GPU: a real PNG on disk is decoded
+        // by the worker thread, delivered over the channel, uploaded as a
+        // texture, and drawn in the Grid tile, the List thumbnail column, the
+        // preview pane, and the quick-look overlay.
+        let path = scratch_png("art.png");
+        let mut b = browser_with_real_image(&path);
+        b.click(0, 0);
+        assert_eq!(b.preview_target().expect("target").name, "art.png");
+        b.request_thumb(&path);
+        b.request_preview(&path);
+        wait_decoded(&mut b, &path);
+        let Some(PreviewState::Ready { data, .. }) = b.preview_state(&path) else {
+            unreachable!("wait_decoded proved the Ready state");
+        };
+        assert!(
+            matches!(
+                data.as_ref(),
+                crate::preview::PreviewData::Image { full: [48, 24], .. }
+            ),
+            "the preview carries the file's real dimensions"
+        );
+        // Grid tiles + the preview pane.
+        b.set_view(0, ViewMode::Grid);
+        mount(&mut b);
+        // The List thumbnail column.
+        b.set_view(0, ViewMode::List);
+        assert!(b.list_thumbs());
+        mount(&mut b);
+        // The quick-look overlay at full size.
+        b.toggle_quick_look();
+        assert!(b.quick_look_open());
         mount(&mut b);
     }
 }

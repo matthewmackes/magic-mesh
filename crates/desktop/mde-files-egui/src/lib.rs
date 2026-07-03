@@ -10,9 +10,11 @@
 //! between panes — every drop a real transfer through the queue with live progress.
 //!
 //! Layering (§6): the decision logic lives in [`model`] (no egui — unit-tested
-//! without a GPU); [`ops`] wires the FILEMGR-2 queue; [`view`] turns the model
-//! into egui widgets. The production backend is `mde_files::backend::RealBackend`
-//! (local filesystem + the mesh Bus); the retired Cosmic-era GUI is never pulled.
+//! without a GPU); [`ops`] wires the FILEMGR-2 queue; [`preview`] owns the
+//! FILEMGR-10 thumbnail/preview decode worker + bounded caches (also egui-free);
+//! [`view`] turns the model into egui widgets. The production backend is
+//! `mde_files::backend::RealBackend` (local filesystem + the mesh Bus); the
+//! retired Cosmic-era GUI is never pulled.
 
 // `missing_const_for_fn` (clippy nursery) is over-eager for this crate: it flags
 // trivial field getters, `&mut self` setters, and an owned-`Vec`-taking
@@ -25,6 +27,7 @@
 pub mod mesh_mount;
 pub mod model;
 pub mod ops;
+pub mod preview;
 pub mod view;
 
 use mde_egui::{eframe, egui};
