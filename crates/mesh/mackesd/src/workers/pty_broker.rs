@@ -44,12 +44,29 @@
 //! key, no reachable peer) [`SshPtyBackend`] returns a typed [`PtyError::Gated`]
 //! — it NEVER fakes a session (§7).
 //!
+//! ## TERM-14 — session persistence + reattach
+//!
+//! A **brokered** (remote) session outlives its client: when the surface closes or
+//! crashes the shell keeps running and its output keeps accruing into a bounded
+//! per-session **ring buffer** ([`RING_CAP_BYTES`]). The client's liveness is a
+//! [`PtyVerb::Heartbeat`] the surface repeats while a pane is attached; ceasing to
+//! hear it past [`Self::client_grace`] flags the session *detached* in the
+//! reattachable-session index the broker publishes on [`SESSIONS_TOPIC`]. A later
+//! surface **reattaches** ([`PtyVerb::Reattach`]) to a still-running session — the
+//! broker replays the ring as a one-shot scrollback snapshot and resumes streaming
+//! the live PTY, so the SAME shell (buffered output + live bytes) is seen. An
+//! [`PtyVerb::Detach`] is the polite close-but-keep. A session with **no client**
+//! past [`Self::orphan_ttl`] is reaped (bounded cleanup of the abandoned); any
+//! client signal resets that clock. Local panes never reach the broker, so they
+//! stay ephemeral — only remote/brokered sessions persist.
+//!
 //! ## Scope (what this unit is NOT)
 //!
 //! A dropped/exited remote shell lands honestly in `Closed` with its exit code —
 //! this worker does **not** auto-reconnect (a shell is stateful; reviving it
-//! would hand back a *different* shell). Surviving a surface disconnect +
-//! reattach is a separate unit (TERM-14). Because mackesd `#![forbid(unsafe_code)]`
+//! would hand back a *different* shell). A reattach reconnects a client to a shell
+//! that is *still running*; it never revives a dead one. Because mackesd
+//! `#![forbid(unsafe_code)]`
 //! (no `pre_exec` for a local controlling PTY), a mid-session **remote** window-
 //! change can't be propagated over the pipe-backed ssh transport; the `resize`
 //! verb is fully wired + the geometry recorded, but the live reflow of an
@@ -111,6 +128,31 @@ pub const DEFAULT_CLOSED_LINGER: Duration = Duration::from_secs(3);
 /// Bounded ssh connect timeout (never a wedged open — the honest dead-end path).
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// TERM-14 — how long the broker keeps a **client-less** (detached / crashed-away)
+/// session alive before reaping it as orphaned.
+///
+/// Generous, so a user can reattach to a long job well after the surface closed;
+/// bounded, so a genuinely abandoned ssh child + its remote shell don't linger
+/// forever. Reattaching (or any client signal) resets the clock.
+pub const DEFAULT_ORPHAN_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// TERM-14 — how long a live session may go without any client signal (a
+/// [`PtyVerb::Heartbeat`] or other verb) before it reads *detached* in the
+/// published index. A few missed heartbeats — a closed/crashed surface stops
+/// heart-beating. Only flips the index flag; the reap is [`DEFAULT_ORPHAN_TTL`].
+pub const DEFAULT_CLIENT_GRACE: Duration = Duration::from_secs(45);
+
+/// TERM-14 — cap on a session's recent-output ring buffer: the bounded scrollback
+/// replayed to a reattaching client. 256 KiB ≈ a few thousand lines; the oldest
+/// bytes are evicted first.
+pub const RING_CAP_BYTES: usize = 256 * 1024;
+
+/// TERM-14 — the retained-latest topic the broker publishes its reattachable-
+/// session index on: one JSON [`PtySessionIndex`] of the node's live sessions,
+/// read by the surface's reattach picker. Deliberately NOT under [`STATE_PREFIX`]
+/// so it never collides with a `state/pty/<id>` session log.
+pub const SESSIONS_TOPIC: &str = "state/pty-sessions";
+
 /// Fallback grid geometry when the `open` verb omits it (0 = unspecified).
 pub const DEFAULT_COLS: u16 = 80;
 /// Fallback grid geometry when the `open` verb omits it (0 = unspecified).
@@ -163,6 +205,30 @@ pub enum PtyVerb {
         /// Target session id.
         id: String,
     },
+    /// TERM-14 — detach a client WITHOUT tearing the session down: the surface is
+    /// closing but the remote shell keeps running (+ buffering) for a later
+    /// reattach. The polite counterpart of a crash (which stops [`Self::Heartbeat`]).
+    Detach {
+        /// Target session id.
+        id: String,
+    },
+    /// TERM-14 — reattach a client to a still-running session: the broker replays
+    /// the buffered output (the ring) as a one-shot scrollback snapshot and resumes
+    /// streaming the live PTY. A no-op if the id isn't a live session.
+    Reattach {
+        /// Target session id.
+        id: String,
+    },
+    /// TERM-14 — a client liveness ping: refreshes the session's client clock so a
+    /// present-but-quiet client isn't flagged detached. A crashed surface stops
+    /// sending these, which is how the broker notices the client is gone.
+    Heartbeat {
+        /// Target session id.
+        id: String,
+    },
+    /// TERM-14 — ask the broker to (re)publish its reattachable-session index on
+    /// [`SESSIONS_TOPIC`] (e.g. when a surface's reattach picker first opens).
+    List,
 }
 
 impl PtyVerb {
@@ -174,17 +240,25 @@ impl PtyVerb {
             Self::Write { .. } => "write",
             Self::Resize { .. } => "resize",
             Self::Close { .. } => "close",
+            Self::Detach { .. } => "detach",
+            Self::Reattach { .. } => "reattach",
+            Self::Heartbeat { .. } => "heartbeat",
+            Self::List => "list",
         }
     }
 
-    /// The session id every verb carries.
+    /// The session id a verb carries, or `""` for the id-less [`Self::List`].
     #[must_use]
     pub fn id(&self) -> &str {
         match self {
             Self::Open { id, .. }
             | Self::Write { id, .. }
             | Self::Resize { id, .. }
-            | Self::Close { id } => id,
+            | Self::Close { id }
+            | Self::Detach { id }
+            | Self::Reattach { id }
+            | Self::Heartbeat { id } => id,
+            Self::List => "",
         }
     }
 }
@@ -302,6 +376,14 @@ pub fn closed_reap_due(closed_elapsed: Duration, linger: Duration) -> bool {
     closed_elapsed >= linger
 }
 
+/// TERM-14 orphan-reap decision: a session whose client has been gone (no verb /
+/// heartbeat) for at least `orphan_ttl` is due to be reaped. Kept a pure fold so
+/// the "no client past a TTL is reaped" acceptance is unit-tested without a clock.
+#[must_use]
+pub fn orphan_reap_due(client_absent: Duration, orphan_ttl: Duration) -> bool {
+    client_absent >= orphan_ttl
+}
+
 // ── the state machine (pure) ───────────────────────────────────────────────
 
 /// The lifecycle phase of one session. Published (via [`Self::tag`]) on
@@ -353,6 +435,9 @@ pub enum PtyEvent {
     Dropped,
     /// The idle window elapsed.
     IdleTimeout,
+    /// TERM-14 — no client (heartbeat) past the orphan TTL; reap the abandoned
+    /// session (distinct from an idle reap, which is I/O-quiet, not client-less).
+    Orphaned,
     /// An explicit `close` request.
     CloseReq,
 }
@@ -395,6 +480,8 @@ pub const fn transition(phase: PtyPhase, event: PtyEvent) -> (PtyPhase, PtyStepA
         (P::Open, E::Exited) => (P::Closed, A::None),
         (P::Open, E::Dropped) => (P::Closed, A::Kill),
         (P::Open, E::IdleTimeout) => (P::Closed, A::Kill),
+        // TERM-14: an orphaned (client-less) session is reaped like an idle one.
+        (P::Open, E::Orphaned) => (P::Closed, A::Kill),
 
         // Explicit close from any phase (idempotent teardown).
         (_, E::CloseReq) => (P::Closed, A::Kill),
@@ -697,7 +784,49 @@ pub struct PtyState {
     /// A human-readable reason on a degrade path (unreachable/gated/dropped).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// TERM-14 — set on the reattach scrollback-replay record: the buffered ring
+    /// handed to a reattaching client, distinct from a live output chunk. (The
+    /// surface feeds it into the VT engine just the same; the flag is for clarity
+    /// + observability.)
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub snapshot: bool,
     /// Wall-clock epoch millis of this record.
+    pub since_ms: u64,
+}
+
+/// Serde skip helper — omit a `false` flag from the wire so existing records are
+/// byte-for-byte unchanged.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// TERM-14 — one reattachable session in the broker's published index.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PtySessionSummary {
+    /// The session id (`state/pty/<id>` key + the reattach target).
+    pub id: String,
+    /// The peer/node the shell runs on (the reattach picker groups by this).
+    pub peer: String,
+    /// The phase tag (`opening` / `open`).
+    pub phase: String,
+    /// Whether a client is currently attached (a heartbeat seen within the grace).
+    pub attached: bool,
+    /// Current grid columns.
+    pub cols: u16,
+    /// Current grid rows.
+    pub rows: u16,
+    /// Bytes of buffered scrollback in the ring (a reattach hint).
+    pub buffered_bytes: u64,
+}
+
+/// TERM-14 — the retained-latest index published on [`SESSIONS_TOPIC`]: this
+/// node's reattachable sessions. The surface reads the newest record.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PtySessionIndex {
+    /// The live (reattachable) sessions, sorted by `(peer, id)` for a stable list.
+    pub sessions: Vec<PtySessionSummary>,
+    /// Wall-clock epoch millis of this snapshot.
     pub since_ms: u64,
 }
 
@@ -720,10 +849,21 @@ struct SessionEntry {
     closed_at: Option<Instant>,
     /// The last degrade reason, surfaced in the published record.
     reason: Option<String>,
+    /// TERM-14 — whether a client is currently attached (a heartbeat/verb seen
+    /// within [`PtyBrokerWorker::client_grace`]). A detached session keeps running
+    /// + buffering for a later reattach.
+    attached: bool,
+    /// TERM-14 — last time ANY client signal (a verb or a heartbeat) touched this
+    /// session. Drives the `attached` flag and the orphan reap.
+    last_client_seen: Instant,
+    /// TERM-14 — bounded ring of recent output bytes: the scrollback replayed to a
+    /// reattaching client, capped at [`RING_CAP_BYTES`] (oldest evicted first).
+    ring: VecDeque<u8>,
 }
 
 impl SessionEntry {
     fn new(peer: String, cols: u16, rows: u16) -> Self {
+        let now = Instant::now();
         Self {
             peer,
             // Starts Opening; the OpenReq event keeps it Opening and drives the
@@ -732,11 +872,35 @@ impl SessionEntry {
             session: None,
             cols: cols.max(1),
             rows: rows.max(1),
-            last_activity: Instant::now(),
+            last_activity: now,
             seq: 0,
             closed_at: None,
             reason: None,
+            attached: true,
+            last_client_seen: now,
+            ring: VecDeque::new(),
         }
+    }
+
+    /// TERM-14 — append output to the bounded ring, evicting the oldest bytes once
+    /// past the cap so a chatty long-running session never grows unbounded.
+    fn push_ring(&mut self, bytes: &[u8]) {
+        self.ring.extend(bytes.iter().copied());
+        let overflow = self.ring.len().saturating_sub(RING_CAP_BYTES);
+        if overflow > 0 {
+            self.ring.drain(..overflow);
+        }
+    }
+
+    /// TERM-14 — the buffered ring as a contiguous `Vec` (the reattach snapshot).
+    fn ring_bytes(&self) -> Vec<u8> {
+        self.ring.iter().copied().collect()
+    }
+
+    /// TERM-14 — record a client signal: refresh the client clock + mark attached.
+    fn touch_client(&mut self) {
+        self.last_client_seen = Instant::now();
+        self.attached = true;
     }
 }
 
@@ -758,6 +922,10 @@ pub struct PtyBrokerWorker {
     idle_timeout: Duration,
     /// Terminal-entry linger before reap.
     closed_linger: Duration,
+    /// TERM-14 — how long a client-less session lives before the orphan reap.
+    orphan_ttl: Duration,
+    /// TERM-14 — how long without a client signal before a session reads detached.
+    client_grace: Duration,
     /// Poll/pump/reap cadence.
     tick: Duration,
     /// Bus spool root override (tests point this at a tempdir).
@@ -766,6 +934,9 @@ pub struct PtyBrokerWorker {
     sessions: HashMap<String, SessionEntry>,
     /// Per-topic request cursors (`action/pty/<peer>` → last ULID).
     cursors: HashMap<String, String>,
+    /// TERM-14 — set when the reattachable-session index needs republishing;
+    /// flushed once per tick so a burst of changes is one publish.
+    registry_dirty: bool,
 }
 
 impl PtyBrokerWorker {
@@ -790,10 +961,13 @@ impl PtyBrokerWorker {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             closed_linger: DEFAULT_CLOSED_LINGER,
+            orphan_ttl: DEFAULT_ORPHAN_TTL,
+            client_grace: DEFAULT_CLIENT_GRACE,
             tick: DEFAULT_TICK_INTERVAL,
             bus_root_override: None,
             sessions: HashMap::new(),
             cursors: HashMap::new(),
+            registry_dirty: false,
         }
     }
 
@@ -832,6 +1006,20 @@ impl PtyBrokerWorker {
         self
     }
 
+    /// TERM-14 — override the orphan-reap TTL (tests use a short value).
+    #[must_use]
+    pub const fn with_orphan_ttl(mut self, d: Duration) -> Self {
+        self.orphan_ttl = d;
+        self
+    }
+
+    /// TERM-14 — override the client-presence grace (tests use a short value).
+    #[must_use]
+    pub const fn with_client_grace(mut self, d: Duration) -> Self {
+        self.client_grace = d;
+        self
+    }
+
     /// Override the poll/pump cadence (tests use a short value).
     #[must_use]
     pub const fn with_tick(mut self, d: Duration) -> Self {
@@ -850,6 +1038,26 @@ impl PtyBrokerWorker {
     /// attaches an optional output chunk (base64) + exit code, and folds in the
     /// current phase/peer/reason.
     fn publish(&mut self, persist: &Persist, id: &str, data: Option<&[u8]>, exit: Option<i32>) {
+        self.publish_rec(persist, id, data, exit, false);
+    }
+
+    /// TERM-14 — publish the reattach scrollback-replay record: the buffered ring
+    /// as a single `snapshot` chunk (or a bare phase confirmation when empty), so a
+    /// reattaching client repaints the buffered output then streams the live PTY.
+    fn publish_snapshot(&mut self, persist: &Persist, id: &str, bytes: &[u8]) {
+        let data = (!bytes.is_empty()).then_some(bytes);
+        self.publish_rec(persist, id, data, None, true);
+    }
+
+    /// The record-publish core shared by [`Self::publish`] + [`Self::publish_snapshot`].
+    fn publish_rec(
+        &mut self,
+        persist: &Persist,
+        id: &str,
+        data: Option<&[u8]>,
+        exit: Option<i32>,
+        snapshot: bool,
+    ) {
         let Some(entry) = self.sessions.get_mut(id) else {
             return;
         };
@@ -862,12 +1070,43 @@ impl PtyBrokerWorker {
             data: data.map(|b| B64.encode(b)),
             exit,
             reason: entry.reason.clone(),
+            snapshot,
             since_ms: now_ms(),
         };
         let body = serde_json::to_string(&rec).unwrap_or_default();
         let topic = format!("{STATE_PREFIX}{id}");
         if let Err(e) = persist.write(&topic, Priority::Default, None, Some(&body)) {
             tracing::warn!(target: "mackesd::pty_broker", id, error = %e, "state publish failed");
+        }
+    }
+
+    /// TERM-14 — publish the reattachable-session index on [`SESSIONS_TOPIC`]: the
+    /// node's live (`opening`/`open`) sessions, sorted by `(peer, id)`, each with
+    /// its attach state + buffered-scrollback hint. The surface's reattach picker
+    /// reads the newest record and groups by peer.
+    fn publish_registry(&mut self, persist: &Persist) {
+        let mut sessions: Vec<PtySessionSummary> = self
+            .sessions
+            .iter()
+            .filter(|(_, e)| matches!(e.phase, PtyPhase::Open | PtyPhase::Opening))
+            .map(|(id, e)| PtySessionSummary {
+                id: id.clone(),
+                peer: e.peer.clone(),
+                phase: e.phase.tag().to_string(),
+                attached: e.attached,
+                cols: e.cols,
+                rows: e.rows,
+                buffered_bytes: u64::try_from(e.ring.len()).unwrap_or(u64::MAX),
+            })
+            .collect();
+        sessions.sort_by(|a, b| a.peer.cmp(&b.peer).then_with(|| a.id.cmp(&b.id)));
+        let index = PtySessionIndex {
+            sessions,
+            since_ms: now_ms(),
+        };
+        let body = serde_json::to_string(&index).unwrap_or_default();
+        if let Err(e) = persist.write(SESSIONS_TOPIC, Priority::Default, None, Some(&body)) {
+            tracing::warn!(target: "mackesd::pty_broker", error = %e, "session index publish failed");
         }
     }
 
@@ -972,6 +1211,7 @@ impl PtyBrokerWorker {
                 self.sessions
                     .insert(id.clone(), SessionEntry::new(peer.to_string(), cols, rows));
                 self.apply(persist, &id, PtyEvent::OpenReq);
+                self.registry_dirty = true;
             }
             PtyVerb::Write { id, data } => {
                 let bytes = match B64.decode(data.as_bytes()) {
@@ -988,6 +1228,8 @@ impl PtyBrokerWorker {
                         }
                         entry.last_activity = Instant::now();
                     }
+                    // Input is both I/O activity AND proof a client is present.
+                    entry.touch_client();
                 }
             }
             PtyVerb::Resize { id, cols, rows } => {
@@ -998,6 +1240,7 @@ impl PtyBrokerWorker {
                         let _ = session.resize(entry.cols, entry.rows);
                     }
                     entry.last_activity = Instant::now();
+                    entry.touch_client();
                 }
             }
             PtyVerb::Close { id } => {
@@ -1006,8 +1249,50 @@ impl PtyBrokerWorker {
                     if let Some(entry) = self.sessions.get_mut(&id) {
                         entry.closed_at = Some(Instant::now());
                     }
+                    self.registry_dirty = true;
                 }
             }
+            // TERM-14 — the client is leaving cleanly but wants the shell to keep
+            // running. Mark detached (the reap clock runs from now); NEVER kill.
+            PtyVerb::Detach { id } => {
+                if let Some(entry) = self.sessions.get_mut(&id) {
+                    entry.last_client_seen = Instant::now();
+                    entry.attached = false;
+                    self.registry_dirty = true;
+                    tracing::debug!(target: "mackesd::pty_broker", id = %id, "client detached; session kept alive");
+                }
+            }
+            // TERM-14 — a client reclaims a still-running session: replay the ring
+            // as a scrollback snapshot + resume streaming. A no-op for a gone /
+            // terminal id (the surface then just opens fresh).
+            PtyVerb::Reattach { id } => {
+                let replay = self.sessions.get_mut(&id).and_then(|e| {
+                    (e.phase == PtyPhase::Open).then(|| {
+                        e.touch_client();
+                        e.ring_bytes()
+                    })
+                });
+                if let Some(bytes) = replay {
+                    self.publish_snapshot(persist, &id, &bytes);
+                    self.registry_dirty = true;
+                    tracing::info!(target: "mackesd::pty_broker", id = %id, bytes = bytes.len(), "client reattached; replayed scrollback");
+                } else {
+                    tracing::debug!(target: "mackesd::pty_broker", id = %id, "reattach to a non-live session ignored");
+                }
+            }
+            // TERM-14 — a liveness ping: refresh the client clock (a re-attach if it
+            // had been flagged detached) so a present-but-quiet client isn't reaped.
+            PtyVerb::Heartbeat { id } => {
+                if let Some(entry) = self.sessions.get_mut(&id) {
+                    let was_attached = entry.attached;
+                    entry.touch_client();
+                    if !was_attached {
+                        self.registry_dirty = true;
+                    }
+                }
+            }
+            // TERM-14 — republish the index on demand (a picker just opened).
+            PtyVerb::List => self.publish_registry(persist),
         }
     }
 
@@ -1073,6 +1358,9 @@ impl PtyBrokerWorker {
                     self.publish(persist, &id, Some(&bytes), None);
                     if let Some(entry) = self.sessions.get_mut(&id) {
                         entry.last_activity = now;
+                        // TERM-14: accrue into the bounded scrollback ring so a
+                        // reattaching client can be handed the recent output.
+                        entry.push_ring(&bytes);
                     }
                 }
             }
@@ -1094,10 +1382,45 @@ impl PtyBrokerWorker {
                         (code == 255).then(|| "ssh transport error / peer unreachable".to_string());
                 }
                 self.publish(persist, &id, None, Some(code));
+                self.registry_dirty = true;
                 continue;
             }
 
-            // 3. Idle-reap a live session untouched past the window.
+            // 3a. TERM-14 detached-flag sweep: a live session with no client signal
+            //     past the grace reads *detached* in the index (a closed/crashed
+            //     surface stopped heart-beating). Flips the flag only — the reap is
+            //     the orphan TTL below.
+            if let Some(entry) = self.sessions.get_mut(&id) {
+                if entry.attached
+                    && entry.phase == PtyPhase::Open
+                    && now.duration_since(entry.last_client_seen) >= self.client_grace
+                {
+                    entry.attached = false;
+                    self.registry_dirty = true;
+                }
+            }
+
+            // 3b. TERM-14 orphan-reap: a live session whose client has been gone
+            //     past the orphan TTL is reaped (kill + Closed). Any client signal
+            //     (verb/heartbeat/reattach) resets `last_client_seen`, so an
+            //     actively-used or freshly-reattached session is never reaped here.
+            let orphaned = self.sessions.get(&id).is_some_and(|e| {
+                e.phase == PtyPhase::Open
+                    && orphan_reap_due(now.duration_since(e.last_client_seen), self.orphan_ttl)
+            });
+            if orphaned {
+                if let Some(entry) = self.sessions.get_mut(&id) {
+                    entry.reason = Some("orphaned: no client reattached".to_string());
+                }
+                self.apply(persist, &id, PtyEvent::Orphaned);
+                if let Some(entry) = self.sessions.get_mut(&id) {
+                    entry.closed_at = Some(now);
+                }
+                self.registry_dirty = true;
+                continue;
+            }
+
+            // 3c. Idle-reap a live session untouched past the window.
             let idle = self.sessions.get(&id).is_some_and(|e| {
                 e.phase == PtyPhase::Open
                     && idle_reap_due(now.duration_since(e.last_activity), self.idle_timeout)
@@ -1110,6 +1433,7 @@ impl PtyBrokerWorker {
                 if let Some(entry) = self.sessions.get_mut(&id) {
                     entry.closed_at = Some(now);
                 }
+                self.registry_dirty = true;
                 continue;
             }
 
@@ -1120,7 +1444,15 @@ impl PtyBrokerWorker {
             });
             if reap {
                 self.sessions.remove(&id);
+                self.registry_dirty = true;
             }
+        }
+
+        // TERM-14: flush the reattachable-session index once per tick if anything
+        // changed (an open/close/detach/reattach/orphan or an attach-flag flip).
+        if self.registry_dirty {
+            self.publish_registry(persist);
+            self.registry_dirty = false;
         }
     }
 }
@@ -1159,6 +1491,9 @@ impl Worker for PtyBrokerWorker {
                 }
             }
         }
+        // TERM-14: publish an initial (empty) index so the surface's reattach picker
+        // sees a topic even before the first session opens.
+        self.publish_registry(&persist);
         let mut tick = tokio::time::interval(self.tick);
         tick.tick().await; // burn the immediate first tick
         loop {
@@ -1774,5 +2109,270 @@ mod tests {
         assert_eq!(w.sessions["s1"].phase, PtyPhase::Open);
         assert_eq!(w.sessions["s1"].peer, "oak");
         assert_eq!(backend.opens.load(Ordering::SeqCst), 1);
+    }
+
+    // ── TERM-14: persistence + reattach + idle/TTL orphan reap ───────────
+
+    /// The newest reattachable-session index the broker published.
+    fn sessions_index(persist: &Persist) -> PtySessionIndex {
+        let recs = persist.list_since(SESSIONS_TOPIC, None).unwrap();
+        let body = recs
+            .last()
+            .expect("a session index record")
+            .body
+            .clone()
+            .unwrap();
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[test]
+    fn verb_parse_roundtrips_the_reattach_verbs() {
+        assert_eq!(
+            parse_verb(r#"{"verb":"detach","id":"a"}"#).unwrap(),
+            PtyVerb::Detach { id: "a".into() }
+        );
+        assert_eq!(
+            parse_verb(r#"{"verb":"reattach","id":"a"}"#).unwrap(),
+            PtyVerb::Reattach { id: "a".into() }
+        );
+        assert_eq!(
+            parse_verb(r#"{"verb":"heartbeat","id":"a"}"#).unwrap(),
+            PtyVerb::Heartbeat { id: "a".into() }
+        );
+        assert_eq!(parse_verb(r#"{"verb":"list"}"#).unwrap(), PtyVerb::List);
+        // the id-less List has an empty id slot.
+        assert_eq!(PtyVerb::List.id(), "");
+        assert_eq!(PtyVerb::List.tag(), "list");
+    }
+
+    #[test]
+    fn orphan_transition_reaps_a_client_less_session() {
+        // Open + Orphaned → Closed + Kill (reap the abandoned ssh child).
+        assert_eq!(
+            transition(PtyPhase::Open, PtyEvent::Orphaned),
+            (PtyPhase::Closed, PtyStepAction::Kill)
+        );
+        // Orphaned while already terminal is a no-op self-loop (never a panic).
+        assert_eq!(
+            transition(PtyPhase::Closed, PtyEvent::Orphaned),
+            (PtyPhase::Closed, PtyStepAction::None)
+        );
+    }
+
+    #[test]
+    fn orphan_reap_decision_fires_at_the_ttl() {
+        assert!(!orphan_reap_due(
+            Duration::from_secs(59),
+            Duration::from_secs(60)
+        ));
+        assert!(orphan_reap_due(
+            Duration::from_secs(60),
+            Duration::from_secs(60)
+        ));
+    }
+
+    /// THE TWO-PHASE ACCEPTANCE — open a remote session → disconnect (drop the
+    /// client) → reattach → the SAME running shell is seen (its buffered output +
+    /// the live PTY), with no second shell ever spawned.
+    #[test]
+    fn session_survives_disconnect_and_reattach_sees_the_same_shell() {
+        let (_d, persist) = temp_persist();
+        let backend = FakeBackend::ok();
+        // The remote shell has already produced a line of a long job.
+        backend
+            .shared
+            .lock()
+            .unwrap()
+            .output
+            .push_back(b"long-job: step 1\n".to_vec());
+        let mut w = worker_with(backend.clone());
+
+        // Phase 1 — open the remote session; its output accrues into the ring.
+        w.handle_verb(&persist, "oak", open_verb("s1"));
+        assert_eq!(w.sessions["s1"].phase, PtyPhase::Open);
+        w.pump_sessions(&persist);
+        assert_eq!(backend.opens.load(Ordering::SeqCst), 1);
+        assert!(
+            !w.sessions["s1"].ring.is_empty(),
+            "output buffered into the ring while attached"
+        );
+
+        // Disconnect: the surface closes → a detach keeps the shell ALIVE.
+        w.handle_verb(&persist, "oak", PtyVerb::Detach { id: "s1".into() });
+        assert!(!w.sessions["s1"].attached, "flagged detached");
+        assert_eq!(w.sessions["s1"].phase, PtyPhase::Open, "still running");
+        assert!(
+            w.sessions["s1"].session.is_some(),
+            "the live shell was NOT torn down on disconnect"
+        );
+
+        // Phase 2 — reattach: the SAME shell (opens still 1), scrollback replayed.
+        w.handle_verb(&persist, "oak", PtyVerb::Reattach { id: "s1".into() });
+        assert_eq!(
+            backend.opens.load(Ordering::SeqCst),
+            1,
+            "reattach reconnected the SAME shell — no second spawn"
+        );
+        assert!(w.sessions["s1"].attached, "reattached");
+        let recs = states(&persist, "s1");
+        let snap = recs
+            .iter()
+            .find(|r| r.snapshot)
+            .expect("a reattach scrollback snapshot record");
+        let replayed = B64.decode(snap.data.as_ref().unwrap()).unwrap();
+        assert_eq!(replayed, b"long-job: step 1\n", "buffered output replayed");
+
+        // The live PTY keeps streaming AFTER reattach — same running shell.
+        backend
+            .shared
+            .lock()
+            .unwrap()
+            .output
+            .push_back(b"step 2\n".to_vec());
+        w.pump_sessions(&persist);
+        let recs = states(&persist, "s1");
+        assert!(
+            recs.iter().any(|r| r
+                .data
+                .as_ref()
+                .and_then(|d| B64.decode(d).ok())
+                .is_some_and(|b| b == b"step 2\n")),
+            "live output streamed after reattach"
+        );
+    }
+
+    #[test]
+    fn a_detached_long_job_keeps_running_and_buffering() {
+        let (_d, persist) = temp_persist();
+        let backend = FakeBackend::ok();
+        let mut w = worker_with(backend.clone());
+        w.handle_verb(&persist, "oak", open_verb("s1"));
+        w.handle_verb(&persist, "oak", PtyVerb::Detach { id: "s1".into() });
+        // The job keeps producing output while detached; pumps keep buffering it,
+        // never reaping it (default TTLs are long).
+        for i in 0..3 {
+            backend
+                .shared
+                .lock()
+                .unwrap()
+                .output
+                .push_back(format!("line {i}\n").into_bytes());
+            w.pump_sessions(&persist);
+        }
+        assert_eq!(w.sessions["s1"].phase, PtyPhase::Open, "detached but alive");
+        assert!(!backend.shared.lock().unwrap().killed);
+        assert!(!w.sessions["s1"].ring.is_empty());
+    }
+
+    #[test]
+    fn orphaned_session_is_reaped_after_the_ttl() {
+        let (_d, persist) = temp_persist();
+        let backend = FakeBackend::ok();
+        let mut w = worker_with(backend.clone()).with_orphan_ttl(Duration::from_millis(0));
+        w.handle_verb(&persist, "oak", open_verb("s1"));
+        assert_eq!(w.sessions["s1"].phase, PtyPhase::Open);
+        // With a 0 orphan TTL, the first pump finds a client-less session + reaps it.
+        w.pump_sessions(&persist);
+        assert_eq!(w.sessions["s1"].phase, PtyPhase::Closed);
+        assert!(
+            backend.shared.lock().unwrap().killed,
+            "the abandoned remote shell was killed"
+        );
+        let recs = states(&persist, "s1");
+        assert!(recs
+            .iter()
+            .any(|r| r.reason.as_deref().is_some_and(|m| m.contains("orphaned"))));
+    }
+
+    #[test]
+    fn a_quiet_session_reads_detached_after_the_grace() {
+        let (_d, persist) = temp_persist();
+        let backend = FakeBackend::ok();
+        let mut w = worker_with(backend).with_client_grace(Duration::from_millis(0));
+        w.handle_verb(&persist, "oak", open_verb("s1"));
+        assert!(w.sessions["s1"].attached);
+        w.pump_sessions(&persist);
+        assert!(
+            !w.sessions["s1"].attached,
+            "no client signal past the grace → detached"
+        );
+        // and the published index reflects the detached flag.
+        let idx = sessions_index(&persist);
+        let s = idx
+            .sessions
+            .iter()
+            .find(|s| s.id == "s1")
+            .expect("s1 in the index");
+        assert!(!s.attached);
+    }
+
+    #[test]
+    fn a_heartbeat_keeps_a_session_attached() {
+        let (_d, persist) = temp_persist();
+        let backend = FakeBackend::ok();
+        let mut w = worker_with(backend).with_client_grace(Duration::from_millis(0));
+        w.handle_verb(&persist, "oak", open_verb("s1"));
+        w.pump_sessions(&persist);
+        assert!(
+            !w.sessions["s1"].attached,
+            "flipped detached with a 0 grace"
+        );
+        // a heartbeat re-attaches (a present-but-quiet client).
+        w.handle_verb(&persist, "oak", PtyVerb::Heartbeat { id: "s1".into() });
+        assert!(
+            w.sessions["s1"].attached,
+            "heartbeat re-attached the client"
+        );
+    }
+
+    #[test]
+    fn index_lists_reattachable_sessions_per_node() {
+        let (_d, persist) = temp_persist();
+        let backend = FakeBackend::ok();
+        let mut w = worker_with(backend);
+        w.handle_verb(&persist, "oak", open_verb("s1"));
+        w.handle_verb(&persist, "oak", open_verb("s2"));
+        w.handle_verb(&persist, "birch", open_verb("s3"));
+        // A List verb republishes the index immediately.
+        w.handle_verb(&persist, "oak", PtyVerb::List);
+        let idx = sessions_index(&persist);
+        assert_eq!(idx.sessions.len(), 3);
+        // Sorted by (peer, id): birch/s3, then oak/s1, oak/s2.
+        assert_eq!(idx.sessions[0].peer, "birch");
+        assert_eq!(idx.sessions[1].peer, "oak");
+        assert!(idx.sessions.iter().all(|s| s.phase == "open"));
+        let oak = idx.sessions.iter().filter(|s| s.peer == "oak").count();
+        assert_eq!(oak, 2, "both oak sessions listed under the node");
+    }
+
+    #[test]
+    fn the_output_ring_is_bounded() {
+        let (_d, persist) = temp_persist();
+        let backend = FakeBackend::ok();
+        // A single chunk larger than the cap.
+        backend
+            .shared
+            .lock()
+            .unwrap()
+            .output
+            .push_back(vec![b'x'; RING_CAP_BYTES + 512]);
+        let mut w = worker_with(backend);
+        w.handle_verb(&persist, "oak", open_verb("s1"));
+        w.pump_sessions(&persist);
+        assert_eq!(
+            w.sessions["s1"].ring.len(),
+            RING_CAP_BYTES,
+            "the scrollback ring is capped at the bound (oldest evicted)"
+        );
+    }
+
+    #[test]
+    fn reattach_to_an_unknown_session_is_a_harmless_noop() {
+        let (_d, persist) = temp_persist();
+        let backend = FakeBackend::ok();
+        let mut w = worker_with(backend);
+        // No panic, no snapshot record for a never-opened id.
+        w.handle_verb(&persist, "oak", PtyVerb::Reattach { id: "ghost".into() });
+        assert!(states(&persist, "ghost").is_empty());
     }
 }

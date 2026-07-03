@@ -44,7 +44,7 @@ use crate::appearance::{Appearance, AppearancePicker};
 use crate::keymap::{Action, Keymap};
 use crate::layout::SavedLayout;
 use crate::layout_ui::{LayoutIntent, LayoutManager};
-use crate::picker::{RemotePicker, RemoteTarget};
+use crate::picker::{PickOutcome, ReattachTarget, RemotePicker, RemoteTarget};
 use crate::pty::SpawnOptions;
 use crate::remote::{BusPtyClient, PtyBus, RemotePty};
 use crate::roster::{BusRoster, RosterClient};
@@ -183,6 +183,24 @@ impl RemoteHub {
             cols,
             rows,
         )
+    }
+
+    /// TERM-14 — reattach a pane to a still-running brokered session (the reattach
+    /// picker's pick), routing through [`RemotePty::reattach`] instead of `open`.
+    fn make_reattach(&self, target: &ReattachTarget, cols: u16, rows: u16) -> RemotePty {
+        RemotePty::reattach(
+            Arc::clone(&self.bus),
+            &target.peer,
+            &target.label,
+            &target.id,
+            cols,
+            rows,
+        )
+    }
+
+    /// TERM-14 — the broker's reattachable-session index (drives the picker list).
+    fn reattachable(&self) -> Vec<crate::remote::SessionSummary> {
+        self.bus.list_sessions()
     }
 }
 
@@ -388,6 +406,23 @@ impl TabbedTerminal {
         self.active = self.tabs.len() - 1;
     }
 
+    /// TERM-14 — open a fresh tab whose first pane **reattaches** to a still-running
+    /// brokered session (from the reattach picker). The pane replays the session's
+    /// buffered scrollback then streams the live PTY; it surfaces its own honest
+    /// connecting/failed state, so reattaching never fails here (§7).
+    pub fn open_reattach_tab(&mut self, target: &ReattachTarget) {
+        let remote = self
+            .remote
+            .make_reattach(target, self.spawn_opts.cols, self.spawn_opts.rows);
+        let term = SplitTerminal::from_remote(remote, self.spawn_opts.clone());
+        self.tabs.push(Tab {
+            term,
+            title: self.next_no.to_string(),
+        });
+        self.next_no += 1;
+        self.active = self.tabs.len() - 1;
+    }
+
     // ── TERM-10: capture the whole surface into a saved layout, and launch one ──
 
     /// Capture the whole surface — every tab's split tree + per-pane relaunch spec
@@ -448,15 +483,21 @@ impl TabbedTerminal {
         Ok(added)
     }
 
-    /// Render the remote picker overlay (when open) and open a tab on a pick.
+    /// Render the remote picker overlay (when open) and act on a pick: open a fresh
+    /// remote tab, or reattach a still-running session (TERM-14).
     fn show_remote_picker(&mut self, ctx: &Context) {
+        // The reattachable-session index is read first (a shared &self borrow),
+        // then handed to the picker alongside the roster.
+        let sessions = self.remote.reattachable();
         // Disjoint field borrows: the picker (mut) reads the roster (shared).
-        let target = {
+        let outcome = {
             let hub = &mut self.remote;
-            hub.picker.show(ctx, hub.roster.as_ref())
+            hub.picker.show(ctx, hub.roster.as_ref(), &sessions)
         };
-        if let Some(target) = target {
-            self.open_remote_tab(&target);
+        match outcome {
+            Some(PickOutcome::New(target)) => self.open_remote_tab(&target),
+            Some(PickOutcome::Reattach(target)) => self.open_reattach_tab(&target),
+            None => {}
         }
     }
 
@@ -1285,6 +1326,32 @@ mod tests {
         assert_eq!(bus.verb_count("open"), 1);
         assert_eq!(bus.published()[0].peer, "oak");
         // The surface renders the remote pane without panicking.
+        settle(&ctx, &mut term, 2);
+        assert!(!term.is_empty());
+    }
+
+    #[test]
+    fn opening_a_reattach_tab_adds_a_focused_tab_and_publishes_reattach() {
+        let ctx = Context::default();
+        Style::install(&ctx);
+        let (mut term, bus) = tabs_with_fakes();
+        // TERM-14: reattach to a still-running session (from the picker's index).
+        term.open_reattach_tab(&ReattachTarget {
+            id: "term-oak-persisted".into(),
+            peer: "oak".into(),
+            label: "oak".into(),
+        });
+        assert_eq!(term.tab_count(), 2);
+        assert_eq!(term.active_index(), 1);
+        assert_eq!(term.tab(1).expect("reattach tab").session_count(), 1);
+        // The pane REATTACHED over the broker (a `reattach` verb, never `open`).
+        assert_eq!(bus.verb_count("reattach"), 1);
+        assert_eq!(
+            bus.verb_count("open"),
+            0,
+            "reattach never opens a new shell"
+        );
+        assert_eq!(bus.published()[0].peer, "oak");
         settle(&ctx, &mut term, 2);
         assert!(!term.is_empty());
     }

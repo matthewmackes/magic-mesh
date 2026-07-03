@@ -26,8 +26,14 @@
 //!   keystrokes base64-encoded.
 //! * **resize** — [`RemotePty::resize`] reflows the engine grid and publishes
 //!   `{"verb":"resize",…}` on a geometry change.
-//! * **close** — [`RemotePty::close`] (and [`Drop`]) publishes `{"verb":"close",…}`
-//!   so a closed tab tears the remote shell down.
+//! * **close** — [`RemotePty::close`] publishes `{"verb":"close",…}` to tear the
+//!   remote shell down explicitly.
+//! * **persist + reattach (TERM-14)** — a brokered session outlives the surface:
+//!   [`Drop`] publishes `{"verb":"detach",…}` (keep-alive, not kill), a live pane
+//!   pings `{"verb":"heartbeat",…}` so a quiet client isn't reaped, and
+//!   [`RemotePty::reattach`] rebinds a pane to a still-running session (the broker
+//!   replays its buffered scrollback, then streams the live PTY). The reattachable
+//!   sessions per node are read from the broker's [`SESSIONS_TOPIC`] index.
 //!
 //! ## Honest states (§7 — never a faked session)
 //!
@@ -65,6 +71,11 @@ pub const ACTION_PREFIX: &str = "action/pty/";
 /// `mackesd::workers::pty_broker::STATE_PREFIX` (cross-checked in tests).
 pub const STATE_PREFIX: &str = "state/pty/";
 
+/// TERM-14 — the retained-latest topic the broker publishes its reattachable-
+/// session index on. MUST equal the worker's
+/// `mackesd::workers::pty_broker::SESSIONS_TOPIC` (cross-checked in tests).
+pub const SESSIONS_TOPIC: &str = "state/pty-sessions";
+
 /// The request topic for one peer (`action/pty/<peer>`).
 #[must_use]
 pub fn action_topic(peer: &str) -> String {
@@ -91,6 +102,11 @@ const SSH_TRANSPORT_EXIT: i32 = 255;
 /// the widget repaints at ~30 fps; the overlay RTT dominates either way.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(40);
 
+/// TERM-14 — how often a live remote pane pings the broker with a `heartbeat` verb
+/// so a present-but-quiet client (a user reading a long job, sending no input)
+/// isn't flagged detached and reaped. Well under the broker's client grace.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
 // ── the typed request verb (mirror of the worker's `PtyVerb`) ────────────────
 
 /// The typed body of an `action/pty/<peer>` request — a local mirror of the
@@ -108,6 +124,14 @@ enum ClientVerb {
     Resize { id: String, cols: u16, rows: u16 },
     /// Tear a session down.
     Close { id: String },
+    /// TERM-14 — detach WITHOUT tearing down: the pane is closing but the remote
+    /// shell keeps running for a later reattach.
+    Detach { id: String },
+    /// TERM-14 — reattach to a still-running session (the broker replays its
+    /// buffered scrollback + resumes streaming).
+    Reattach { id: String },
+    /// TERM-14 — a liveness ping so a present-but-quiet client isn't reaped.
+    Heartbeat { id: String },
 }
 
 impl ClientVerb {
@@ -144,6 +168,47 @@ pub struct PtyRecord {
     /// A human reason on a degrade path (unreachable / transport drop).
     #[serde(default)]
     pub reason: Option<String>,
+    /// TERM-14 — set on the broker's reattach scrollback-replay record. The engine
+    /// feeds it like any output chunk; the flag is projected for clarity + tests.
+    #[serde(default)]
+    pub snapshot: bool,
+}
+
+// ── the reattachable-session index (mirror of the worker's `PtySessionIndex`) ──
+
+/// One reattachable session in the broker's published index — a local mirror of
+/// the worker's `PtySessionSummary`. Drives the reattach picker's list.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SessionSummary {
+    /// The session id (`state/pty/<id>` key + the reattach target).
+    pub id: String,
+    /// The peer/node the shell runs on (the picker groups by this).
+    #[serde(default)]
+    pub peer: String,
+    /// The phase tag (`opening` / `open`).
+    #[serde(default)]
+    pub phase: String,
+    /// Whether a client is currently attached (a heartbeat seen recently).
+    #[serde(default)]
+    pub attached: bool,
+    /// Bytes of buffered scrollback in the ring (a reattach hint).
+    #[serde(default)]
+    pub buffered_bytes: u64,
+}
+
+/// The `state/pty-sessions` index body — a local mirror of the worker's
+/// `PtySessionIndex`. Serde ignores any wire field this surface doesn't project.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SessionIndex {
+    /// The node's reattachable sessions.
+    #[serde(default)]
+    pub sessions: Vec<SessionSummary>,
+}
+
+/// Parse a `state/pty-sessions` index body; `None` on malformed JSON.
+#[must_use]
+pub fn parse_index(raw: &str) -> Option<SessionIndex> {
+    serde_json::from_str(raw).ok()
 }
 
 /// Parse a `state/pty/<id>` record body; `None` on malformed JSON (an honest
@@ -295,6 +360,14 @@ pub trait PtyBus: Send + Sync {
     /// as `(ulid, body)` pairs. A non-blocking local spool scan — never a peer
     /// probe; an empty result on any transient error (an honest miss).
     fn read_since(&self, id: &str, cursor: Option<&str>) -> Vec<(String, String)>;
+
+    /// TERM-14 — the newest reattachable-session index the broker published on
+    /// [`SESSIONS_TOPIC`] (the reattach picker's list). A non-blocking local scan;
+    /// an empty list on any miss. Defaulted so a seam that doesn't model the index
+    /// (a minimal fake) simply reports no reattachable sessions.
+    fn list_sessions(&self) -> Vec<SessionSummary> {
+        Vec::new()
+    }
 }
 
 /// The live Bus-backed client — a synchronous local `Persist` read/write, the
@@ -361,6 +434,25 @@ impl PtyBus for BusPtyClient {
             .into_iter()
             .filter_map(|m| m.body.map(|b| (m.ulid, b)))
             .collect()
+    }
+
+    fn list_sessions(&self) -> Vec<SessionSummary> {
+        let Some(root) = self.bus_root.clone() else {
+            return Vec::new();
+        };
+        let Ok(persist) = mde_bus::persist::Persist::open(root) else {
+            return Vec::new();
+        };
+        // The index is retained-latest: read the newest record on the topic.
+        persist
+            .list_since(SESSIONS_TOPIC, None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|m| m.body)
+            .next_back()
+            .and_then(|b| parse_index(&b))
+            .map(|idx| idx.sessions)
+            .unwrap_or_default()
     }
 }
 
@@ -433,6 +525,8 @@ pub struct RemotePty {
     last_poll: Option<Instant>,
     /// The poll cadence (tests use `Duration::ZERO`).
     poll_interval: Duration,
+    /// TERM-14 — last time a `heartbeat` verb was emitted (client-presence ping).
+    last_heartbeat: Option<Instant>,
 }
 
 impl RemotePty {
@@ -459,9 +553,67 @@ impl RemotePty {
             reconnects_left: RECONNECT_BUDGET,
             last_poll: None,
             poll_interval: DEFAULT_POLL_INTERVAL,
+            last_heartbeat: None,
         };
         this.emit_open();
         this
+    }
+
+    /// TERM-14 — reattach a pane to a **still-running** brokered session `id` on
+    /// `peer` (from the reattach picker's index). Unlike [`Self::open`] this does
+    /// NOT mint a fresh id and does NOT `open` a new shell: it binds the existing
+    /// id, seeds the read cursor past the session's prior log tail (so old history
+    /// isn't re-shown), and publishes a `reattach` verb — the broker replies with a
+    /// scrollback snapshot then resumes streaming the live PTY. A publish failure
+    /// lands the pane in an honest [`RemoteStatus::Failed`] (§7).
+    #[must_use]
+    pub fn reattach(
+        bus: Arc<dyn PtyBus>,
+        peer: &str,
+        label: &str,
+        id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Self {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        let terminal = Terminal::new(usize::from(cols), usize::from(rows), DEFAULT_SCROLLBACK);
+        // Seed the cursor at the session log's current tail so the pane streams the
+        // reattach snapshot + live output forward, not the whole (possibly large)
+        // prior history — the broker's ring IS the bounded scrollback we replay.
+        let cursor = bus
+            .read_since(id, None)
+            .last()
+            .map(|(ulid, _)| ulid.clone());
+        let mut this = Self {
+            bus,
+            peer: peer.to_string(),
+            label: label.to_string(),
+            id: id.to_string(),
+            terminal,
+            cursor,
+            status: RemoteStatus::Connecting,
+            cols,
+            rows,
+            ever_open: false,
+            reconnects_left: RECONNECT_BUDGET,
+            last_poll: None,
+            poll_interval: DEFAULT_POLL_INTERVAL,
+            last_heartbeat: None,
+        };
+        this.emit_reattach();
+        this
+    }
+
+    /// Publish the `reattach` verb for the bound id, folding a publish failure into
+    /// an honest [`RemoteStatus::Failed`].
+    fn emit_reattach(&mut self) {
+        let verb = ClientVerb::Reattach {
+            id: self.id.clone(),
+        };
+        if let Err(e) = self.bus.publish(&self.peer, &verb.body()) {
+            self.status = RemoteStatus::Failed { reason: e };
+        }
     }
 
     /// Override the poll cadence (tests use `Duration::ZERO` to poll every call).
@@ -558,10 +710,36 @@ impl RemotePty {
         }
     }
 
-    /// Publish a `close` verb (best-effort) so the remote shell is torn down.
+    /// Publish a `close` verb (best-effort) so the remote shell is **torn down**.
     /// Idempotent — a stale id the worker no longer tracks is a harmless no-op.
+    /// This kills the remote session; use [`Self::detach`] to keep it running.
     pub fn close(&self) {
         let verb = ClientVerb::Close {
+            id: self.id.clone(),
+        };
+        let _ = self.bus.publish(&self.peer, &verb.body());
+    }
+
+    /// TERM-14 — publish a `detach` verb (best-effort) so the remote shell **keeps
+    /// running** after the pane goes away, reattachable later. This is the drop
+    /// path: closing the surface (or a crash) must not kill a brokered session.
+    pub fn detach(&self) {
+        let verb = ClientVerb::Detach {
+            id: self.id.clone(),
+        };
+        let _ = self.bus.publish(&self.peer, &verb.body());
+    }
+
+    /// TERM-14 — publish a throttled `heartbeat` verb while the session is live.
+    fn emit_heartbeat(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.last_heartbeat {
+            if now.duration_since(last) < HEARTBEAT_INTERVAL {
+                return;
+            }
+        }
+        self.last_heartbeat = Some(now);
+        let verb = ClientVerb::Heartbeat {
             id: self.id.clone(),
         };
         let _ = self.bus.publish(&self.peer, &verb.body());
@@ -586,6 +764,9 @@ impl RemotePty {
         if !self.status.is_live() {
             return;
         }
+        // TERM-14: keep the broker's client clock fresh so a quiet-but-present pane
+        // (reading a long job, no keystrokes) isn't flagged detached + reaped.
+        self.emit_heartbeat();
         let records = self.bus.read_since(&self.id, self.cursor.as_deref());
         for (ulid, body) in records {
             self.cursor = Some(ulid);
@@ -667,9 +848,12 @@ impl RemotePty {
 
 impl Drop for RemotePty {
     fn drop(&mut self) {
-        // Best-effort teardown so a closed tab reaps the remote shell (TERM-8:
-        // `pty/close` on tab close).
-        self.close();
+        // TERM-14: a brokered session PERSISTS across the surface closing — dropping
+        // the pane (tab close, window close, or a crash where this never runs)
+        // DETACHES rather than kills, so a long job keeps running and can be
+        // reattached. An explicit teardown calls `close()` first (killing the
+        // shell); the broker reaps a truly-abandoned session on its orphan TTL.
+        self.detach();
     }
 }
 
@@ -705,7 +889,7 @@ pub(crate) mod test_support {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    use super::PtyBus;
+    use super::{PtyBus, SessionSummary};
 
     /// A recorded request: the peer topic slot + the raw JSON body.
     #[derive(Clone, Debug)]
@@ -728,6 +912,8 @@ pub(crate) mod test_support {
         logs: Arc<Mutex<LogMap>>,
         /// When set, `publish` returns this error (the honest no-Bus path).
         fail: Arc<Mutex<Option<String>>>,
+        /// TERM-14 — the reattachable-session index `list_sessions` reports.
+        sessions_index: Arc<Mutex<Vec<SessionSummary>>>,
     }
 
     impl FakeBus {
@@ -741,6 +927,11 @@ pub(crate) mod test_support {
             let this = Self::default();
             *this.fail.lock().expect("fail lock") = Some(reason.to_string());
             this
+        }
+
+        /// TERM-14 — seed the reattachable-session index `list_sessions` returns.
+        pub fn set_sessions(&self, sessions: Vec<SessionSummary>) {
+            *self.sessions_index.lock().expect("sessions lock") = sessions;
         }
 
         /// Seed one state-log record for `id` (auto-numbered ULID-ish cursor).
@@ -800,6 +991,10 @@ pub(crate) mod test_support {
                 .into_iter()
                 .filter(|(ulid, _)| cursor.is_none_or(|c| ulid.as_str() > c))
                 .collect()
+        }
+
+        fn list_sessions(&self) -> Vec<SessionSummary> {
+            self.sessions_index.lock().expect("sessions lock").clone()
         }
     }
 }
@@ -989,19 +1184,41 @@ mod tests {
         assert_eq!(bus.verb_count("resize"), before);
     }
 
-    // ── close on drop ─────────────────────────────────────────────────────────
+    // ── TERM-14: dropping a remote pane DETACHES (keep-alive), never closes ─────
 
     #[test]
-    fn dropping_publishes_a_close_verb() {
+    fn dropping_detaches_to_persist_the_session() {
         let bus = FakeBus::new();
         let remote = open_on(Arc::new(bus.clone()));
         let id = remote.session_id().to_string();
         drop(remote);
+        // Persistence: a dropped pane keeps the remote shell running for reattach,
+        // so it publishes `detach`, NOT `close`.
+        let detach = bus
+            .published_verbs()
+            .into_iter()
+            .find(|v| v["verb"] == "detach")
+            .expect("detach verb on drop (session persists)");
+        assert_eq!(detach["id"], id);
+        assert_eq!(
+            bus.verb_count("close"),
+            0,
+            "a drop must not kill the session"
+        );
+    }
+
+    #[test]
+    fn explicit_close_kills_the_remote_session() {
+        let bus = FakeBus::new();
+        let remote = open_on(Arc::new(bus.clone()));
+        let id = remote.session_id().to_string();
+        // An explicit teardown publishes `close` (kills the shell).
+        remote.close();
         let close = bus
             .published_verbs()
             .into_iter()
             .find(|v| v["verb"] == "close")
-            .expect("close verb on drop");
+            .expect("close verb on explicit teardown");
         assert_eq!(close["id"], id);
     }
 
@@ -1135,5 +1352,127 @@ mod tests {
         let b = mint_id("oak.mesh host");
         assert_ne!(a, b, "ids are unique even within a millisecond");
         assert!(!a.contains('/') && !a.contains(' ') && !a.contains('.'));
+    }
+
+    // ── TERM-14: persistence + reattach client contract ──────────────────────
+
+    /// A broker reattach snapshot record body (phase `open`, `snapshot:true`).
+    fn snapshot_body(id: &str, data_b64: &str) -> String {
+        serde_json::json!({
+            "id": id, "peer": "oak", "phase": "open", "seq": 9,
+            "data": data_b64, "snapshot": true, "since_ms": 0,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn sessions_topic_matches_the_worker_contract() {
+        // Cross-check: MUST equal mackesd::workers::pty_broker::SESSIONS_TOPIC.
+        assert_eq!(SESSIONS_TOPIC, "state/pty-sessions");
+    }
+
+    #[test]
+    fn persistence_verbs_serialise_to_the_worker_wire_shape() {
+        assert_eq!(
+            ClientVerb::Detach { id: "s1".into() }.body(),
+            r#"{"verb":"detach","id":"s1"}"#
+        );
+        assert_eq!(
+            ClientVerb::Reattach { id: "s1".into() }.body(),
+            r#"{"verb":"reattach","id":"s1"}"#
+        );
+        assert_eq!(
+            ClientVerb::Heartbeat { id: "s1".into() }.body(),
+            r#"{"verb":"heartbeat","id":"s1"}"#
+        );
+    }
+
+    #[test]
+    fn parse_index_reads_the_worker_session_index() {
+        let raw = r#"{"sessions":[
+            {"id":"s1","peer":"oak","phase":"open","attached":true,"cols":80,"rows":24,"buffered_bytes":42},
+            {"id":"s2","peer":"birch","phase":"open","attached":false,"cols":80,"rows":24,"buffered_bytes":0}
+        ],"since_ms":9}"#;
+        let idx = parse_index(raw).expect("parses the worker index");
+        assert_eq!(idx.sessions.len(), 2);
+        assert_eq!(idx.sessions[0].peer, "oak");
+        assert!(idx.sessions[0].attached);
+        assert_eq!(idx.sessions[0].buffered_bytes, 42);
+        assert!(!idx.sessions[1].attached);
+        assert!(parse_index("not json").is_none());
+    }
+
+    #[test]
+    fn list_sessions_flows_through_the_bus_seam() {
+        let bus = FakeBus::new();
+        bus.set_sessions(vec![SessionSummary {
+            id: "s1".into(),
+            peer: "oak".into(),
+            phase: "open".into(),
+            attached: false,
+            buffered_bytes: 12,
+        }]);
+        let got = bus.list_sessions();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].peer, "oak");
+    }
+
+    #[test]
+    fn reattach_binds_the_existing_id_and_replays_scrollback() {
+        let bus = FakeBus::new();
+        // The session already ran (pre-disconnect history) under a known id.
+        let id = "term-oak-persisted";
+        bus.push_state(
+            id,
+            &state_body(id, "open", Some(&B64.encode("OLD-HISTORY")), None, None),
+        );
+        // Reattach binds THIS id (no fresh mint) + publishes a `reattach` verb, and
+        // seeds its cursor past the prior tail so old history isn't re-shown.
+        let mut remote = RemotePty::reattach(Arc::new(bus.clone()), "oak", "oak", id, 80, 24)
+            .with_poll_interval(Duration::ZERO);
+        assert_eq!(remote.session_id(), id, "reattach kept the broker's id");
+        assert_eq!(bus.verb_count("reattach"), 1);
+        assert_eq!(
+            bus.verb_count("open"),
+            0,
+            "reattach never opens a new shell"
+        );
+        // The broker replies with a scrollback snapshot (the ring), then streams.
+        bus.push_state(id, &snapshot_body(id, &B64.encode("SCROLLBACK")));
+        remote.poll_once();
+        assert_eq!(*remote.status(), RemoteStatus::Open);
+        let text = full_text(&remote);
+        assert!(
+            text.contains("SCROLLBACK"),
+            "the replayed scrollback painted"
+        );
+        assert!(
+            !text.contains("OLD-HISTORY"),
+            "pre-reattach history was skipped by the seeded cursor"
+        );
+    }
+
+    #[test]
+    fn reattach_without_a_bus_fails_honestly() {
+        let bus = FakeBus::failing("No mesh Bus directory");
+        let remote = RemotePty::reattach(Arc::new(bus), "oak", "oak", "s1", 80, 24);
+        assert!(
+            matches!(remote.status(), RemoteStatus::Failed { reason } if reason.contains("No mesh Bus")),
+            "expected an honest Failed, got {:?}",
+            remote.status()
+        );
+    }
+
+    #[test]
+    fn a_live_pane_heartbeats_the_broker() {
+        let bus = FakeBus::new();
+        let mut remote = open_on(Arc::new(bus.clone()));
+        let id = remote.session_id().to_string();
+        bus.push_state(&id, &state_body(&id, "open", None, None, None));
+        remote.poll_once();
+        assert!(
+            bus.verb_count("heartbeat") >= 1,
+            "a live pane pings the broker so a quiet client isn't reaped"
+        );
     }
 }
