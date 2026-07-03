@@ -64,10 +64,11 @@ impl Session {
     }
 }
 
-/// A desktop target the discovery picker (E12-5b) handed to the surface: the VM
-/// the operator chose. Recorded so the surface reflects the pending connect *by
-/// name* until the gated E12-4 wire transport attaches the live decoder `session`
-/// — an honest "connecting" caption, never a fake desktop (§7).
+/// A desktop target the Chooser (CHOOSER-2, née the E12-5b picker) handed to the
+/// surface: the desktop the operator chose. Recorded so the surface reflects the
+/// pending connect *by name* until the gated E12-4 wire transport attaches the
+/// live decoder `session` — an honest "connecting" caption, never a fake desktop
+/// (§7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RequestedTarget {
     /// The peer serving the VM (a scheduler node id).
@@ -106,9 +107,9 @@ pub(crate) struct VdiState {
     /// Raised when the operator presses the reserved Esc chord over the desktop —
     /// the shell reads it to release the fullscreen desktop back to the chrome.
     return_to_chrome: bool,
-    /// The desktop target the discovery picker chose, held until the gated live
+    /// The desktop target the Chooser chose, held until the gated live
     /// transport attaches a `session`. Drives the honest "connecting" caption and
-    /// tells the shell to show the Desktop surface rather than the picker.
+    /// tells the shell to show the Desktop surface rather than the Chooser.
     requested: Option<RequestedTarget>,
 }
 
@@ -119,21 +120,21 @@ impl VdiState {
         std::mem::take(&mut self.return_to_chrome)
     }
 
-    /// Record the target the discovery picker chose (E12-5b). The surface then
-    /// shows a "connecting" state naming it until the gated wire transport attaches
-    /// the live decoder session.
+    /// Record the target the Chooser chose (CHOOSER-2). The surface then shows a
+    /// "connecting" state naming it until the gated wire transport attaches the
+    /// live decoder session.
     pub(crate) fn request_target(&mut self, target: RequestedTarget) {
         self.requested = Some(target);
     }
 
     /// The picked target, if any — the shell reads it to decide whether the Desktop
-    /// surface shows the discovery picker (none) or the connecting/desktop state.
+    /// surface shows the Chooser (none) or the connecting/desktop state.
     pub(crate) fn requested_target(&self) -> Option<&RequestedTarget> {
         self.requested.as_ref()
     }
 
     /// Clear the pending target — the operator backed out before a live session
-    /// attached, so the Desktop surface falls back to the discovery picker.
+    /// attached, so the Desktop surface falls back to the Chooser.
     pub(crate) fn clear_target(&mut self) {
         self.requested = None;
     }
@@ -187,9 +188,9 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
             // (lock 2), never over it. The backdrop owns the crossfade/breathe motion
             // (lock 10), so there is no bespoke caption ease here.
             match state.requested.as_ref() {
-                // The discovery picker chose a target but no live decoder is attached
+                // The Chooser chose a target but no live decoder is attached
                 // yet (the wire transport is gated) — the status honestly names the
-                // VM being brokered, below the logo; never a placeholder desktop (§7).
+                // desktop being brokered, below the logo; never a placeholder (§7).
                 Some(target) => {
                     let title = format!("Connecting to {}", target.name);
                     let detail = format!(
@@ -299,7 +300,7 @@ mod tests {
 
     #[test]
     fn a_requested_target_paints_the_connecting_caption() {
-        // The discovery picker handed a target but no live decoder is attached yet
+        // The Chooser handed a target but no live decoder is attached yet
         // (the wire transport is gated): the surface shows the connecting caption,
         // still with no texture and no fake desktop.
         let mut state = VdiState::default();

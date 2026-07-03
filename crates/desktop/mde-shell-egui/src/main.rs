@@ -16,6 +16,7 @@
 
 mod backdrop;
 mod chat;
+mod chooser;
 mod chrome;
 mod controller;
 mod datacenter;
@@ -128,10 +129,14 @@ struct Shell {
     /// the gated wire transport (E12-4) attaches one; the panel shows its honest
     /// "no desktop" EmptyState until then.
     vdi: vdi::VdiState,
-    /// The remote-desktop picker (E12-5b) — the Desktop surface's no-session face:
-    /// lists the mesh's advertised VMs (reusing the Fleet inventory) and, on
-    /// Connect, emits the broker `Open` request + hands the target to `vdi`.
-    discovery: discovery::DiscoveryState,
+    /// The Desktop Chooser (CHOOSER-2) — the Desktop surface's no-session face:
+    /// the card grid of every discovered desktop (mesh peers · LAN mDNS · local
+    /// VMs · manual), grouped by node over the BRAND-1 backdrop, rendered from
+    /// the CHOOSER-1 worker's `state/desktops/sources` roster. A card connect
+    /// emits the broker `Open` request (via the `discovery` wire path) + hands
+    /// the target to `vdi`; its seen-set fold auto-pops the Chooser when a new
+    /// source is discovered (design lock 1).
+    chooser: chooser::ChooserState,
     /// The Instances surface — this workstation's local cloud-hypervisor VMs via
     /// the `mde-kvm` broker (E12-7). Create / boot / shutdown drive mde-kvm's real
     /// lifecycle; with no live VMM the ops surface mde-kvm's typed gated error, and
@@ -199,7 +204,7 @@ impl Shell {
             files: mde_files_egui::real_browser(),
             voice: VoiceApp::new_with_ctx(ctx),
             vdi: vdi::VdiState::default(),
-            discovery: discovery::DiscoveryState::default(),
+            chooser: chooser::ChooserState::default(),
             instances: instances::InstancesState::default(),
             chat: chat::ChatState::default(),
             system: system::SystemState::default(),
@@ -293,17 +298,18 @@ impl Shell {
                 );
             }
             Surface::Desktop => {
-                // The Desktop surface's no-session face IS the E12-5b remote-desktop
-                // picker: with nothing requested it lists the mesh's VMs; Connect
-                // hands a target to `vdi`, and the surface flips to the desktop
-                // (connecting caption until the gated E12-4 wire transport attaches
-                // the live decoder). This mirrors E12-5a driving the surface.
+                // The Desktop surface's no-session face IS the Desktop Chooser
+                // (CHOOSER-2, superseding the E12-5b flat picker): with nothing
+                // requested it shows the discovered-desktop card grid over the
+                // BRAND-1 backdrop; a card connect hands a target to `vdi`, and
+                // the surface flips to the desktop (connecting caption until the
+                // gated E12-4 wire transport attaches the live decoder).
                 if self.vdi.requested_target().is_none() {
-                    let discovery = &mut self.discovery;
+                    let chooser = &mut self.chooser;
                     let picked = ui
-                        .push_id("shell-discovery", |ui| {
-                            discovery::discovery_panel(ui, discovery);
-                            discovery.take_connect()
+                        .push_id("shell-chooser", |ui| {
+                            chooser::chooser_panel(ui, chooser);
+                            chooser.take_connect()
                         })
                         .inner;
                     if let Some(target) = picked {
@@ -427,14 +433,19 @@ impl Shell {
             self.services.poll(ctx);
         }
 
-        // The Desktop surface's picker (E12-5b) subscribes to the same live VM
-        // roster while it's in view with no session requested — the cheap local
-        // scan surfaces a new/removed remote desktop without operator input.
-        if self.nav.expanded
-            && self.nav.surface == Surface::Desktop
-            && self.vdi.requested_target().is_none()
-        {
-            self.discovery.poll(ctx);
+        // The Desktop Chooser (CHOOSER-2) tails the CHOOSER-1 worker's
+        // `state/desktops/sources` roster on its shared cadence EVERY frame, not
+        // just while in view: the auto-popup lock (design lock 1) needs the fold
+        // to see a newly-discovered source id whenever it lands. The read is the
+        // same cheap local spool scan the other planes poll (it self-gates).
+        self.chooser.poll(ctx);
+        if self.chooser.take_popup() && self.vdi.requested_target().is_none() {
+            // A new desktop source surfaces the Chooser through the same
+            // central-view switch the hotkeys/chyron drive — but never over a
+            // live/pending session (a popup must not yank an attached desktop;
+            // the drained event is deliberately dropped in that case).
+            self.nav.expanded = true;
+            self.nav.surface = Surface::Desktop;
         }
 
         // The Chat surface — the ONE notification interface (folded alerts +

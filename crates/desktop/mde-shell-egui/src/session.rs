@@ -51,8 +51,10 @@ pub(crate) fn empty_state(ui: &mut egui::Ui, title: &str, subtitle: &str) {
 }
 
 /// Draw a simple monitor outline within `area` using line segments only — no
-/// rect/corner-radius API, so it is robust across egui point releases.
-fn draw_monitor(painter: &egui::Painter, area: Rect) {
+/// rect/corner-radius API, so it is robust across egui point releases. Also
+/// the Chooser card's thumbnail-well icon fallback (CHOOSER-2) until the
+/// CHOOSER-3 preview pipeline fills the well with a live snapshot.
+pub(crate) fn draw_monitor(painter: &egui::Painter, area: Rect) {
     let stroke = Stroke::new(2.0, Style::TEXT_DIM);
     let inset = Style::SP_XS;
     let screen = Rect::from_min_max(

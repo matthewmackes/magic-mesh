@@ -100,7 +100,9 @@ impl Surface {
             Surface::Instances => {
                 "Manage this node's local VMs (cloud-hypervisor) — create, boot, shut down."
             }
-            Surface::Desktop => "View a brokered VM desktop (RDP / VNC), rendered in-shell.",
+            Surface::Desktop => {
+                "Pick a discovered desktop (mesh peers, LAN, local VMs) and view it in-shell."
+            }
             Surface::Music => "Play the mesh music library (Subsonic / Airsonic).",
             Surface::Files => "Browse local + peer folders and Send-To across the mesh.",
             Surface::Voice => "Place and receive mesh voice calls (SIP).",
