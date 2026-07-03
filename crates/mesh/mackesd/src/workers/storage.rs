@@ -3786,7 +3786,11 @@ mod tests {
         let handle = tokio::spawn(async move { w.run(token).await });
         tokio::time::sleep(Duration::from_millis(30)).await;
         tx.send(true).expect("signal shutdown");
-        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        // The worker exits within one ~10ms poll of the shutdown signal (~0.3s wall on
+        // an idle host). The generous 10s ceiling is wall-clock slack so this assertion
+        // stays green when the test's runtime is CPU-starved under concurrent farm
+        // builds — it must catch a worker that never exits, not a scheduler stall.
+        let joined = tokio::time::timeout(Duration::from_secs(10), handle).await;
         assert!(joined.is_ok(), "worker must exit promptly on shutdown");
         assert!(joined.unwrap().expect("join").is_ok());
     }
