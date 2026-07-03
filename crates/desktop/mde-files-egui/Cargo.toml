@@ -61,6 +61,13 @@ image      = { version = "0.25", default-features = false, features = ["png", "j
 # video decode. The lock ships no video *codec* (no ffmpeg/h264/vp9), so video
 # rows get an honest metadata-only preview, never a fake frame.
 symphonia  = { version = "0.5", default-features = false, features = ["flac", "mp3", "vorbis", "aac", "isomp4", "ogg", "pcm", "wav"] }
+# FILEMGR-11 — the Properties dialog offers `chown` only when the process may
+# (root / CAP_CHOWN). `geteuid` is that honest euid probe: rustix's is a *safe*
+# wrapper (this crate keeps `unsafe_code = forbid`), and it's the exact running-
+# uid seam mackesd's seal path already uses. rustix is in the workspace lock
+# (winit/eframe pull it), so enabling its `process` feature is fetch-free on the
+# airgapped farm — no new crate, no `libc`.
+rustix     = { version = "1", features = ["process"] }
 
 [lints]
 workspace = true

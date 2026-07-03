@@ -27,9 +27,11 @@ use mde_files::model::{FileRow, Mime, Peer, SelfNode};
 use mde_files::opqueue::OpKind;
 use mde_files::send_to::{SendToEntry, SendToRequest};
 
+use crate::dialogs::{Arming, ConfirmDelete, Perm, PermClass, PropertiesDialog};
 use crate::mesh_mount::{BusMeshMount, MeshMountClient, MeshMountVerb, MountView};
 use crate::ops::Ops;
 use crate::preview::{PreviewState, Previews, ThumbState};
+use mde_files::opqueue::{ConflictChoice, Resolution};
 
 /// How often the Mesh sidebar re-reads `state/mesh-mount/*` from the Bus. The read
 /// is a cheap local spool scan; a worker transition surfaces within this window.
@@ -750,6 +752,20 @@ pub fn plan_transfer(sources: Vec<PathBuf>, dest_dir: PathBuf, copy: bool) -> Op
 pub struct FileBrowser {
     backend: Box<dyn Backend>,
     ops: Ops,
+    /// FILEMGR-11 — a synchronous [`FileOps`] for the *immediate* metadata ops
+    /// the Properties dialog drives (`metadata` / `chmod` / `chown`), separate
+    /// from the queue's worker-owned `FileOps` (which runs the long transfers).
+    /// Production is [`LiveFileOps`] (the same real filesystem as the queue);
+    /// tests inject a [`FakeFileOps`](mde_files::fileops::FakeFileOps).
+    meta_ops: Box<dyn FileOps>,
+    /// FILEMGR-11 — whether this caller may `chown` (root / `CAP_CHOWN`). Probed
+    /// once from the effective uid in production; the Properties dialog offers the
+    /// owner/group control only when this is `true` (lock 8).
+    chown_permitted: bool,
+    /// FILEMGR-11 — the open Properties dialog, if any.
+    properties: Option<PropertiesDialog>,
+    /// FILEMGR-11 — the pending permanent-delete confirm, if any.
+    confirm_delete: Option<ConfirmDelete>,
     /// FILEMGR-9 — the mesh-mount client (reads `state/mesh-mount/*`, writes
     /// `action/mesh-mount/<host>`). Injectable so the model is unit-tested
     /// headless; production is [`BusMeshMount`].
@@ -779,10 +795,16 @@ impl FileBrowser {
     pub const HOME: &'static str = "local:home";
 
     /// Build a browser over `backend`, running file operations through a queue
-    /// over the real filesystem ([`LiveFileOps`]). This is the production path.
+    /// over the real filesystem ([`LiveFileOps`]). This is the production path —
+    /// it probes the effective uid so the Properties dialog offers `chown` only
+    /// when this process actually may (root / `CAP_CHOWN`, lock 8).
     #[must_use]
     pub fn new(backend: Box<dyn Backend>) -> Self {
-        Self::with_file_ops(backend, LiveFileOps::new())
+        let mut me = Self::with_file_ops(backend, LiveFileOps::new());
+        // rustix's `geteuid` is a safe wrapper (no `unsafe` in this crate), the
+        // same running-uid probe mackesd's seal path uses.
+        me.chown_permitted = rustix::process::geteuid().is_root();
+        me
     }
 
     /// Build a browser over `backend` with an explicit [`FileOps`] for the op
@@ -797,6 +819,14 @@ impl FileBrowser {
         let mut me = Self {
             backend,
             ops: Ops::spawn(fileops),
+            // A second immediate-ops handle for Properties. Production overrides
+            // nothing (both are the real FS); a headless Properties test injects
+            // a fake via `with_meta_ops`. `chown_permitted` defaults off — only
+            // the production `new` probes the real euid.
+            meta_ops: Box::new(LiveFileOps::new()),
+            chown_permitted: false,
+            properties: None,
+            confirm_delete: None,
             mesh: Box::new(BusMeshMount::from_env()),
             mounts: HashMap::new(),
             last_mount_poll: None,
@@ -825,6 +855,22 @@ impl FileBrowser {
     pub fn with_mesh_mount(mut self, mesh: Box<dyn MeshMountClient>) -> Self {
         self.mesh = mesh;
         self.read_mounts();
+        self
+    }
+
+    /// Swap in the [`FileOps`] the Properties dialog reads/writes through, plus
+    /// whether this caller may `chown` (FILEMGR-11). Tests inject a seeded
+    /// [`FakeFileOps`](mde_files::fileops::FakeFileOps) with an explicit privilege
+    /// so the whole load → edit → apply round-trip runs headless; production keeps
+    /// the [`LiveFileOps`] + euid-probed permission from [`Self::new`].
+    #[must_use]
+    pub fn with_meta_ops<F: FileOps + 'static>(
+        mut self,
+        meta_ops: F,
+        chown_permitted: bool,
+    ) -> Self {
+        self.meta_ops = Box::new(meta_ops);
+        self.chown_permitted = chown_permitted;
         self
     }
 
@@ -1353,11 +1399,10 @@ impl FileBrowser {
         }
     }
 
-    /// Cancel a running op (rolls back its in-flight item).
+    /// Cancel a running op (rolls back its in-flight item). Also releases any
+    /// collision prompt it's parked on, so a cancel-during-conflict takes effect.
     pub fn cancel_op(&mut self, op_id: OpId) {
-        if let Some(op) = self.ops.active().iter().find(|o| o.op_id == op_id) {
-            op.control.cancel();
-        }
+        self.ops.cancel(op_id);
     }
 
     /// Dismiss a finished op from the strip.
@@ -1370,6 +1415,222 @@ impl FileBrowser {
     #[must_use]
     pub fn last_note(&self) -> Option<&str> {
         self.last_note.as_deref()
+    }
+
+    // ── the operation dialogs (FILEMGR-11) ───────────────────────────────────
+
+    /// The collision an in-flight op is blocked on, if the user hasn't answered
+    /// it — the op id + the [`Conflict`](mde_files::opqueue::Conflict) the conflict
+    /// dialog renders. Populated from the FILEMGR-2 channel resolver by
+    /// [`pump_ops`](Self::pump_ops).
+    #[must_use]
+    pub fn pending_conflict(&self) -> Option<(OpId, &mde_files::opqueue::Conflict)> {
+        self.ops.pending_conflict()
+    }
+
+    /// `true` while any op is parked on a collision (keeps a repaint heartbeat).
+    #[must_use]
+    pub fn any_pending_conflict(&self) -> bool {
+        self.ops.any_pending_conflict()
+    }
+
+    /// Answer the collision op `op_id` is blocked on — the user's
+    /// Overwrite/Skip/Keep-both pick, and whether it applies to every remaining
+    /// collision in this op (the apply-to-all checkbox). Unparks the worker.
+    pub fn resolve_conflict(&mut self, op_id: OpId, resolution: Resolution, apply_to_all: bool) {
+        self.ops.answer_conflict(
+            op_id,
+            ConflictChoice {
+                resolution,
+                apply_to_all,
+            },
+        );
+    }
+
+    /// Open the permanent-delete confirm for `pane`'s current selection (lock 3/6
+    /// — no trash, no undo). When any target lives on a remote / escalated mesh
+    /// mount the confirm demands typed-arming (lock 19); a local delete needs only
+    /// the confirm itself. An empty selection is an honest note, not a dialog.
+    pub fn request_delete(&mut self, pane: usize) {
+        let targets = self.pane(pane).active_tab().selected_paths();
+        if targets.is_empty() {
+            self.last_note = Some("Nothing selected to delete.".to_string());
+            return;
+        }
+        let names = targets
+            .iter()
+            .map(|p| {
+                p.file_name().map_or_else(
+                    || p.display().to_string(),
+                    |s| s.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        let arming = self.arming_for(&targets);
+        self.confirm_delete = Some(ConfirmDelete::new(targets, names, arming));
+    }
+
+    /// The pending permanent-delete confirm, if one is open.
+    #[must_use]
+    pub fn pending_delete(&self) -> Option<&ConfirmDelete> {
+        self.confirm_delete.as_ref()
+    }
+
+    /// Record a keystroke in the confirm's typed-arming echo field.
+    pub fn set_delete_echo(&mut self, text: String) {
+        if let Some(cd) = self.confirm_delete.as_mut() {
+            cd.echo = text;
+        }
+    }
+
+    /// Fire the pending delete if it is armed (a local delete always is; a
+    /// remote / escalated one needs the typed node echo). Submits an
+    /// [`OpKind::Delete`] to the queue and closes the confirm. A no-op while
+    /// unarmed (the view keeps the button disabled too).
+    pub fn confirm_delete(&mut self) {
+        let armed = self
+            .confirm_delete
+            .as_ref()
+            .is_some_and(ConfirmDelete::armed);
+        if !armed {
+            return;
+        }
+        let Some(cd) = self.confirm_delete.take() else {
+            return;
+        };
+        let count = cd.count();
+        let noun = if count == 1 { "item" } else { "items" };
+        self.ops.submit(
+            OpKind::Delete { items: cd.targets },
+            format!("Permanently deleting {count} {noun}"),
+        );
+        self.last_note = None;
+    }
+
+    /// Dismiss the delete confirm without deleting anything.
+    pub fn cancel_delete(&mut self) {
+        self.confirm_delete = None;
+    }
+
+    /// Open the Properties dialog for `pane`'s focused selection (lock 8). Reads
+    /// the entry's metadata through the FILEMGR-1 [`FileOps`] seam and offers the
+    /// rwx grid + octal + owner/group; the chown control is offered only when this
+    /// caller may (`chown_permitted`). A pathless (virtual peer) row or a stat
+    /// failure is an honest note, never a half-open dialog.
+    pub fn open_properties(&mut self, pane: usize) {
+        let (path, name) = {
+            let Some(row) = self.pane(pane).active_tab().focused_row() else {
+                self.last_note = Some("Select a file to see its properties.".to_string());
+                return;
+            };
+            let Some(path) = row.path.clone() else {
+                self.last_note = Some(
+                    "This entry has no local path \u{2014} mount the peer to inspect it."
+                        .to_string(),
+                );
+                return;
+            };
+            (path, row.name.clone())
+        };
+        match PropertiesDialog::load(
+            self.meta_ops.as_ref(),
+            PathBuf::from(&path),
+            name,
+            self.chown_permitted,
+        ) {
+            Ok(dlg) => {
+                self.properties = Some(dlg);
+                self.last_note = None;
+            }
+            Err(e) => self.last_note = Some(format!("Couldn't read properties: {e}")),
+        }
+    }
+
+    /// The open Properties dialog, if any (the view renders it).
+    #[must_use]
+    pub fn properties(&self) -> Option<&PropertiesDialog> {
+        self.properties.as_ref()
+    }
+
+    /// Toggle one rwx grid cell in the open Properties dialog.
+    pub fn properties_toggle_perm(&mut self, class: PermClass, perm: Perm) {
+        if let Some(d) = self.properties.as_mut() {
+            d.toggle_perm(class, perm);
+        }
+    }
+
+    /// Update the Properties dialog's octal field (moves the grid when valid).
+    pub fn properties_set_octal(&mut self, text: String) {
+        if let Some(d) = self.properties.as_mut() {
+            d.set_octal_edit(text);
+        }
+    }
+
+    /// Update the Properties dialog's owner uid text (only heeded on Apply when
+    /// chown is permitted).
+    pub fn properties_set_uid(&mut self, text: String) {
+        if let Some(d) = self.properties.as_mut() {
+            d.uid_edit = text;
+        }
+    }
+
+    /// Update the Properties dialog's owner gid text.
+    pub fn properties_set_gid(&mut self, text: String) {
+        if let Some(d) = self.properties.as_mut() {
+            d.gid_edit = text;
+        }
+    }
+
+    /// Apply the Properties dialog's pending chmod / chown through the
+    /// [`FileOps`] seam, then reload the pane so the listing reflects any change.
+    pub fn properties_apply(&mut self, pane: usize) {
+        if let Some(d) = self.properties.as_mut() {
+            d.apply(self.meta_ops.as_ref());
+        }
+        self.reload(pane);
+    }
+
+    /// Close the Properties dialog.
+    pub fn close_properties(&mut self) {
+        self.properties = None;
+    }
+
+    /// The mesh node a local `path` belongs to, if it sits under a mesh mount:
+    /// the stable `/run/user/<uid>/mde-mesh/<host>` root (lock 11) or any
+    /// worker-published mountpoint. `None` for a genuinely-local path.
+    #[must_use]
+    fn mount_host_for_path(&self, path: &str) -> Option<String> {
+        if let Some(rest) = path.split("/mde-mesh/").nth(1) {
+            let host = rest.split('/').next().unwrap_or("");
+            if !host.is_empty() {
+                return Some(host.to_string());
+            }
+        }
+        self.mounts.iter().find_map(|(host, m)| {
+            let mp = m.path.as_deref()?;
+            let hit = path == mp
+                || path
+                    .strip_prefix(mp)
+                    .is_some_and(|rest| rest.starts_with('/'));
+            hit.then(|| host.clone())
+        })
+    }
+
+    /// The typed-arming challenge a delete of `targets` demands, or `None` when
+    /// every target is local (no arming). The first target on a remote /
+    /// escalated mount decides the node to type + whether it's a full-fs mount
+    /// (lock 19).
+    fn arming_for(&self, targets: &[PathBuf]) -> Option<Arming> {
+        targets.iter().find_map(|p| {
+            let s = p.to_string_lossy();
+            let host = self.mount_host_for_path(&s)?;
+            let full_fs = self.mounts.get(&host).is_some_and(MountView::is_full);
+            Some(Arming {
+                node: host,
+                full_fs,
+                path: s.into_owned(),
+            })
+        })
     }
 
     // ── previews + thumbnails + quick-look (FILEMGR-10) ─────────────────────
@@ -2242,5 +2503,201 @@ mod tests {
         // …but a sibling that merely shares the prefix is not.
         assert!(!b.is_remote_path("/mnt/pine-xylophone/file.txt"));
         assert!(!b.is_remote_path("/home/mac/file.txt"));
+    }
+
+    // ── the operation dialogs (FILEMGR-11) ───────────────────────────────────
+
+    /// A browser over a real fake FS with a `/dst` and a source row, so a queued
+    /// transfer really runs (and a collision really surfaces).
+    fn transfer_browser(collide: bool) -> (FileBrowser, PathBuf) {
+        let fs = FakeFileOps::new();
+        fs.create_dir(Path::new("/d")).expect("mkdir");
+        fs.create_dir(Path::new("/dst")).expect("mkdir");
+        fs.seed_file("/d/f0.txt", b"payload").expect("seed");
+        if collide {
+            fs.seed_file("/dst/f0.txt", b"older")
+                .expect("seed collision");
+        }
+        let rows = vec![FileRow::local("f0.txt", Mime::Doc, "1 KB", "now").with_path("/d/f0.txt")];
+        let b = FileBrowser::with_file_ops(Box::new(FixtureBackend::new(Vec::new(), rows)), fs);
+        (b, PathBuf::from("/dst"))
+    }
+
+    #[test]
+    fn a_local_delete_confirm_arms_without_typing_and_submits_on_confirm() {
+        let mut b = five_row_browser();
+        b.select_all(0);
+        b.request_delete(0);
+        let confirm = b.pending_delete().expect("a confirm opened");
+        assert_eq!(confirm.count(), 5);
+        assert!(confirm.arming.is_none(), "a local delete needs no arming");
+        assert!(confirm.armed(), "and is armed immediately");
+        // Confirming submits a real Delete op to the queue.
+        b.confirm_delete();
+        assert!(b.pending_delete().is_none(), "the confirm closed");
+        assert_eq!(b.ops().active().len(), 1, "a Delete op is queued");
+    }
+
+    #[test]
+    fn an_empty_selection_delete_is_an_honest_note_not_a_dialog() {
+        let mut b = five_row_browser();
+        b.clear_selection(0);
+        b.request_delete(0);
+        assert!(b.pending_delete().is_none());
+        assert!(b.last_note().is_some(), "an honest note explains why");
+    }
+
+    #[test]
+    fn a_remote_delete_demands_the_typed_node_and_flags_escalation() {
+        // A row on the stable lock-11 mount root for peer `oak`, whose worker
+        // state reports an escalated (full-filesystem) mount.
+        let remote = "/run/user/1000/mde-mesh/oak/docs/report.txt";
+        let rows = vec![FileRow::local("report.txt", Mime::Doc, "1 KB", "now").with_path(remote)];
+        let fake = FakeMeshMount::new().with_view("oak", mounted_view(remote, MountScope::Full));
+        let mut b = FileBrowser::with_file_ops(
+            Box::new(FixtureBackend::new(Vec::new(), rows)),
+            FakeFileOps::new(),
+        )
+        .with_mesh_mount(Box::new(fake));
+        b.click(0, 0);
+        b.request_delete(0);
+        let confirm = b.pending_delete().expect("a confirm opened");
+        let arming = confirm.arming.as_ref().expect("a remote delete arms");
+        assert_eq!(arming.node, "oak");
+        assert!(arming.full_fs, "the escalated full-fs mount is flagged");
+        assert!(!confirm.armed(), "un-typed → not armed");
+        // A confirm while unarmed is a no-op (the button is disabled too).
+        b.confirm_delete();
+        assert!(
+            b.pending_delete().is_some(),
+            "an unarmed confirm never fires"
+        );
+        assert!(b.ops().active().is_empty());
+        // The exact node name arms it, and it then submits.
+        b.set_delete_echo("oak".into());
+        assert!(b.pending_delete().expect("still open").armed());
+        b.confirm_delete();
+        assert_eq!(b.ops().active().len(), 1, "the armed delete submitted");
+    }
+
+    #[test]
+    fn a_home_mount_delete_arms_on_the_node_but_is_not_escalated() {
+        let remote = "/run/user/1000/mde-mesh/oak/docs/a.txt";
+        let rows = vec![FileRow::local("a.txt", Mime::Doc, "1 KB", "now").with_path(remote)];
+        let mut b = FileBrowser::with_file_ops(
+            Box::new(FixtureBackend::new(Vec::new(), rows)),
+            FakeFileOps::new(),
+        );
+        b.click(0, 0);
+        b.request_delete(0);
+        let arming = b
+            .pending_delete()
+            .and_then(|c| c.arming.as_ref())
+            .expect("the stable mesh root arms even with no worker state");
+        assert_eq!(arming.node, "oak");
+        assert!(!arming.full_fs, "a home mount is not escalated");
+    }
+
+    #[test]
+    fn a_conflict_surfaces_to_the_model_and_the_answer_completes_the_op() {
+        let (mut b, dst) = transfer_browser(true);
+        b.click(0, 0);
+        let id = b
+            .drop_transfer(0, dst, true)
+            .expect("a local copy is queued");
+        // Pump until the collision surfaces through the model.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            b.pump_ops();
+            if b.pending_conflict().is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "collision never surfaced");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (blocked, _) = b.pending_conflict().expect("pending");
+        assert_eq!(blocked, id);
+        assert!(b.any_pending_conflict());
+        // Answer keep-both through the model; the op then finishes.
+        b.resolve_conflict(id, Resolution::KeepBoth, false);
+        assert!(!b.any_pending_conflict(), "the prompt was consumed");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            b.pump_ops();
+            let done = b
+                .ops()
+                .active()
+                .iter()
+                .find(|o| o.op_id == id)
+                .is_some_and(crate::ops::ActiveOp::is_done);
+            if done {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "op never finished after the answer"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let outcome = b
+            .ops()
+            .active()
+            .iter()
+            .find(|o| o.op_id == id)
+            .and_then(|o| o.outcome.as_ref())
+            .expect("finished");
+        assert_eq!(
+            outcome.items_completed, 1,
+            "keep-both copied the incoming file"
+        );
+    }
+
+    #[test]
+    fn properties_load_edit_and_apply_run_through_the_injected_meta_ops() {
+        // A seeded fake FS is BOTH the source of truth for Properties and where a
+        // chmod actually lands — the model drives it through the meta-ops seam.
+        let meta = FakeFileOps::privileged();
+        meta.create_dir(Path::new("/d")).expect("mkdir");
+        meta.seed_file("/d/report.txt", b"hello").expect("seed");
+        meta.set_permissions(Path::new("/d/report.txt"), 0o644)
+            .expect("seed mode");
+        let rows =
+            vec![FileRow::local("report.txt", Mime::Doc, "5 B", "now").with_path("/d/report.txt")];
+        let mut b = FileBrowser::with_file_ops(
+            Box::new(FixtureBackend::new(Vec::new(), rows)),
+            FakeFileOps::new(),
+        )
+        .with_meta_ops(meta, true);
+        b.click(0, 0);
+        b.open_properties(0);
+        assert_eq!(b.properties().expect("open").perms.octal(), "0644");
+        // Toggle owner-exec via the model, then apply — the chmod really takes.
+        b.properties_toggle_perm(PermClass::Owner, Perm::Exec);
+        assert_eq!(b.properties().expect("open").octal_edit, "0744");
+        b.properties_apply(0);
+        assert!(matches!(
+            b.properties().expect("still open").outcome,
+            Some(Ok(()))
+        ));
+        assert_eq!(
+            b.properties().expect("open").perms.octal(),
+            "0744",
+            "the dialog re-synced to the applied mode"
+        );
+        b.close_properties();
+        assert!(b.properties().is_none());
+    }
+
+    #[test]
+    fn open_properties_on_a_pathless_peer_row_is_an_honest_note() {
+        let mut b = browser_over(roster_backend());
+        b.navigate(0, Location::Peer("pine".into()));
+        b.click(0, 0); // a virtual peer row (no path)
+        b.open_properties(0);
+        assert!(
+            b.properties().is_none(),
+            "no dialog opens for a pathless row"
+        );
+        assert!(b.last_note().is_some());
     }
 }

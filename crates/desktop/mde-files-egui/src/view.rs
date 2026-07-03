@@ -38,8 +38,9 @@ use mde_egui::egui::{
 use mde_egui::{field, muted_note, status_dot, Style};
 
 use mde_files::model::{Mime, PeerStatus};
-use mde_files::opqueue::Progress;
+use mde_files::opqueue::{Progress, Resolution};
 
+use crate::dialogs::{Perm, PermClass};
 use crate::mesh_mount::{MountPhase, MountView};
 use crate::model::{
     mount_host_of, FileBrowser, Location, SendOutcome, SortKey, SortSpec, ViewMode, LOCAL_SPOTS,
@@ -133,6 +134,34 @@ enum Action {
     ToggleQuickLook,
     /// FILEMGR-10 — Escape / backdrop click: close the quick-look overlay.
     CloseQuickLook,
+    /// FILEMGR-11 — open the permanent-delete confirm for the pane's selection.
+    RequestDelete(usize),
+    /// FILEMGR-11 — a keystroke in the delete confirm's typed-arming echo.
+    DeleteEcho(String),
+    /// FILEMGR-11 — fire the armed permanent delete.
+    ConfirmDelete,
+    /// FILEMGR-11 — dismiss the delete confirm.
+    CancelDelete,
+    /// FILEMGR-11 — answer the collision an op is parked on.
+    ResolveConflict {
+        op_id: u64,
+        resolution: Resolution,
+        apply_to_all: bool,
+    },
+    /// FILEMGR-11 — open the Properties dialog for the pane's focused selection.
+    OpenProperties(usize),
+    /// FILEMGR-11 — toggle one rwx grid cell in the Properties dialog.
+    PropToggle(PermClass, Perm),
+    /// FILEMGR-11 — a keystroke in the Properties octal field.
+    PropSetOctal(String),
+    /// FILEMGR-11 — a keystroke in the Properties owner-uid field.
+    PropSetUid(String),
+    /// FILEMGR-11 — a keystroke in the Properties owner-gid field.
+    PropSetGid(String),
+    /// FILEMGR-11 — apply the Properties dialog's chmod / chown (reloads `pane`).
+    PropApply(usize),
+    /// FILEMGR-11 — close the Properties dialog.
+    PropClose,
     Send,
     PauseOp(u64),
     ResumeOp(u64),
@@ -189,9 +218,25 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     });
     // FILEMGR-10 — the Space quick-look modal, over everything.
     quick_look_overlay(ui, browser, &mut actions);
+    // FILEMGR-11 — the operation dialogs, topmost. At most one shows at a time
+    // (a worker parked on a collision is the most urgent, so it wins).
+    operation_dialogs(ui, browser, &mut actions);
 
     for action in actions {
         apply(browser, action);
+    }
+}
+
+/// FILEMGR-11 — render whichever operation dialog is active (conflict / confirm-
+/// delete / properties), each as a modal over a dimmed shell. The conflict dialog
+/// wins because its op's worker is blocked waiting for the answer.
+fn operation_dialogs(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    if b.pending_conflict().is_some() {
+        conflict_dialog(ui, b, actions);
+    } else if b.pending_delete().is_some() {
+        delete_dialog(ui, b, actions);
+    } else if b.properties().is_some() {
+        properties_dialog(ui, b, actions);
     }
 }
 
@@ -255,6 +300,22 @@ fn apply(browser: &mut FileBrowser, action: Action) {
         Action::ToggleListThumbs => browser.toggle_list_thumbs(),
         Action::ToggleQuickLook => browser.toggle_quick_look(),
         Action::CloseQuickLook => browser.close_quick_look(),
+        Action::RequestDelete(p) => browser.request_delete(p),
+        Action::DeleteEcho(text) => browser.set_delete_echo(text),
+        Action::ConfirmDelete => browser.confirm_delete(),
+        Action::CancelDelete => browser.cancel_delete(),
+        Action::ResolveConflict {
+            op_id,
+            resolution,
+            apply_to_all,
+        } => browser.resolve_conflict(op_id, resolution, apply_to_all),
+        Action::OpenProperties(p) => browser.open_properties(p),
+        Action::PropToggle(class, perm) => browser.properties_toggle_perm(class, perm),
+        Action::PropSetOctal(text) => browser.properties_set_octal(text),
+        Action::PropSetUid(text) => browser.properties_set_uid(text),
+        Action::PropSetGid(text) => browser.properties_set_gid(text),
+        Action::PropApply(p) => browser.properties_apply(p),
+        Action::PropClose => browser.close_properties(),
         Action::Send => {
             browser.send();
         }
@@ -622,10 +683,12 @@ fn tab_strip(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut V
 // ── The listing (List / Grid / Details) + selection + DnD + rubber-band ───────
 
 fn listing(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut Vec<Action>) {
-    // Keyboard shortcuts act on the focused pane — but never while a text
-    // field (the path box) owns the keyboard, so typing a space or Ctrl+A
-    // edits the text instead of hijacking the listing.
-    if b.active_pane_index() == pane_ix && !ui.ctx().wants_keyboard_input() {
+    // Keyboard shortcuts act on the focused pane — but never while a text field
+    // (the path box, a dialog's arming/octal entry) owns the keyboard, and never
+    // while an operation dialog is up (its own buttons/keys drive it).
+    let dialog_open =
+        b.pending_conflict().is_some() || b.pending_delete().is_some() || b.properties().is_some();
+    if b.active_pane_index() == pane_ix && !ui.ctx().wants_keyboard_input() && !dialog_open {
         let quick_look = b.quick_look_open();
         ui.input_mut(|i| {
             if i.consume_key(Modifiers::COMMAND, Key::A) {
@@ -637,6 +700,10 @@ fn listing(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut Vec
             // FILEMGR-10 — Space quick-looks the focused selection.
             if i.consume_key(Modifiers::NONE, Key::Space) {
                 actions.push(Action::ToggleQuickLook);
+            }
+            // FILEMGR-11 — Delete opens the permanent-delete confirm.
+            if i.consume_key(Modifiers::NONE, Key::Delete) {
+                actions.push(Action::RequestDelete(pane_ix));
             }
             if i.consume_key(Modifiers::NONE, Key::Escape) {
                 if quick_look {
@@ -972,6 +1039,26 @@ fn entry_interactions(
             actions.push(Action::Click(pane_ix, e.idx));
         }
     }
+    // FILEMGR-11 — a right-click selects the row (if it wasn't) and opens the
+    // op menu: Properties + permanent Delete drive the real dialogs.
+    if resp.secondary_clicked() {
+        actions.push(Action::Focus(pane_ix));
+        if !e.selected {
+            actions.push(Action::Click(pane_ix, e.idx));
+        }
+    }
+    resp.context_menu(|ui| {
+        if ui.button("Properties").clicked() {
+            actions.push(Action::OpenProperties(pane_ix));
+            ui.close_menu();
+        }
+        ui.separator();
+        let del = egui::Button::new(RichText::new("Delete\u{2026}").color(Style::DANGER));
+        if ui.add(del).clicked() {
+            actions.push(Action::RequestDelete(pane_ix));
+            ui.close_menu();
+        }
+    });
     resp.dnd_set_drag_payload(FilesDrag {
         source_pane: pane_ix,
     });
@@ -1467,6 +1554,368 @@ fn quick_look_overlay(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>)
                     .layout(egui::Layout::top_down(egui::Align::Min)),
             );
             preview_body(&mut body, b, &target, true, actions);
+        });
+}
+
+// ── The operation dialogs (FILEMGR-11) ────────────────────────────────────────
+
+/// A dim, full-screen backdrop beneath a modal dialog: it darkens the shell and
+/// swallows a click (returned so the caller maps it to its own dismiss). Drawn at
+/// `Order::Middle` so the dialog `Window` (shown right after) floats on top.
+fn modal_backdrop(ctx: &egui::Context, id: &str) -> bool {
+    let screen = ctx.screen_rect();
+    let mut clicked = false;
+    egui::Area::new(egui::Id::new(id))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            let hit = ui.interact(screen, egui::Id::new(format!("{id}-hit")), Sense::click());
+            ui.painter()
+                .rect_filled(screen, 0.0, Style::BG.gamma_multiply(0.82));
+            clicked = hit.clicked();
+        });
+    clicked
+}
+
+/// The interactive conflict dialog (FILEMGR-11 / lock 4): the worker is parked on
+/// this collision until the user picks Overwrite / Skip / Keep-both. The
+/// apply-to-all checkbox rides in the [`Resolution`] answer so the FILEMGR-2
+/// engine stops asking for the rest of the op. The backdrop is inert here — the
+/// only way out is an answer (or cancelling the op on the strip).
+fn conflict_dialog(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    let Some((op_id, conflict)) = b.pending_conflict() else {
+        return;
+    };
+    let dst_name = conflict.dst.file_name().map_or_else(
+        || conflict.dst.display().to_string(),
+        |s| s.to_string_lossy().into_owned(),
+    );
+    let both_dirs = conflict.src_is_dir && conflict.dst_is_dir;
+    let kind = if conflict.dst_is_dir {
+        "folder"
+    } else {
+        "file"
+    };
+    let _ = modal_backdrop(ui.ctx(), "files-conflict-dim");
+
+    let all_id = egui::Id::new("files-conflict-apply-all");
+    let mut apply_all = ui.data(|d| d.get_temp::<bool>(all_id).unwrap_or(false));
+    egui::Window::new("Name collision")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(Style::SP_XL * 12.0);
+            ui.colored_label(
+                Style::TEXT,
+                format!("A {kind} named \u{201c}{dst_name}\u{201d} already exists here."),
+            );
+            muted_note(
+                ui,
+                if both_dirs {
+                    "Overwrite merges the folders \u{2014} existing files are kept unless a child collides."
+                } else {
+                    "Overwrite replaces it. Keep both copies in alongside an auto-renamed name."
+                },
+            );
+            ui.add_space(Style::SP_S);
+            ui.checkbox(&mut apply_all, "Apply to every remaining collision");
+            ui.add_space(Style::SP_S);
+            ui.horizontal(|ui| {
+                let keep = egui::Button::new(RichText::new("Keep both").color(Style::BG).strong())
+                    .fill(Style::ACCENT);
+                if ui.add(keep).clicked() {
+                    push_resolution(actions, op_id, Resolution::KeepBoth, apply_all);
+                }
+                if ui.button("Skip").clicked() {
+                    push_resolution(actions, op_id, Resolution::Skip, apply_all);
+                }
+                let overwrite =
+                    egui::Button::new(RichText::new("Overwrite").color(Style::BG).strong())
+                        .fill(Style::DANGER);
+                if ui.add(overwrite).clicked() {
+                    push_resolution(actions, op_id, Resolution::Overwrite, apply_all);
+                }
+            });
+        });
+    ui.data_mut(|d| d.insert_temp(all_id, apply_all));
+}
+
+/// Push a conflict answer and clear the apply-to-all memory so the next op's first
+/// collision starts unchecked.
+fn push_resolution(
+    actions: &mut Vec<Action>,
+    op_id: u64,
+    resolution: Resolution,
+    apply_to_all: bool,
+) {
+    actions.push(Action::ResolveConflict {
+        op_id,
+        resolution,
+        apply_to_all,
+    });
+}
+
+/// The permanent-delete confirm (FILEMGR-11 / lock 3/6): names the items, spells
+/// out that the delete is final (no trash, no undo), and — when the target is on a
+/// remote / escalated mesh mount — layers typed-arming on top (lock 19): the
+/// Delete button stays disabled until the node name is typed.
+fn delete_dialog(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    let Some(cd) = b.pending_delete() else {
+        return;
+    };
+    if modal_backdrop(ui.ctx(), "files-delete-dim") {
+        actions.push(Action::CancelDelete);
+    }
+    let count = cd.count();
+    let noun = if count == 1 { "item" } else { "items" };
+    egui::Window::new("Permanent delete")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(Style::SP_XL * 13.0);
+            ui.colored_label(
+                Style::TEXT,
+                RichText::new(format!("Permanently delete {count} {noun}?")).strong(),
+            );
+            ui.colored_label(
+                Style::DANGER,
+                "This can\u{2019}t be undone \u{2014} there is no trash and no restore.",
+            );
+            ui.add_space(Style::SP_XS);
+            for name in cd.names.iter().take(8) {
+                muted_note(ui, format!("\u{2022} {name}"));
+            }
+            if cd.names.len() > 8 {
+                muted_note(ui, format!("\u{2026} and {} more", cd.names.len() - 8));
+            }
+
+            // Lock 19 — typed-arming for a remote / escalated target.
+            if let Some(arming) = &cd.arming {
+                ui.add_space(Style::SP_S);
+                ui.separator();
+                let scope = if arming.full_fs {
+                    " (full-filesystem mount)"
+                } else {
+                    ""
+                };
+                ui.colored_label(
+                    Style::WARN,
+                    format!(
+                        "This deletes on the remote node \u{201c}{}\u{201d}{scope}.",
+                        arming.node
+                    ),
+                );
+                field(ui, "Target", &arming.path, Style::TEXT_DIM);
+                ui.add_space(Style::SP_XS);
+                ui.label(
+                    RichText::new(format!(
+                        "Type the node name \u{201c}{}\u{201d} to arm:",
+                        arming.node
+                    ))
+                    .color(Style::TEXT)
+                    .size(Style::SMALL),
+                );
+                let mut echo = cd.echo.clone();
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut echo)
+                        .hint_text(arming.node.as_str())
+                        .desired_width(Style::SP_XL * 6.0),
+                );
+                if resp.changed() {
+                    actions.push(Action::DeleteEcho(echo));
+                }
+            }
+
+            ui.add_space(Style::SP_S);
+            ui.horizontal(|ui| {
+                let armed = cd.armed();
+                let del = egui::Button::new(
+                    RichText::new("Delete permanently")
+                        .color(Style::BG)
+                        .strong(),
+                )
+                .fill(Style::DANGER);
+                if ui
+                    .add_enabled(armed, del)
+                    .on_disabled_hover_text("Type the node name to arm this delete")
+                    .clicked()
+                {
+                    actions.push(Action::ConfirmDelete);
+                }
+                if ui.button("Cancel").clicked() {
+                    actions.push(Action::CancelDelete);
+                }
+            });
+        });
+}
+
+/// The Properties rwx grid + octal field (FILEMGR-11 / lock 8), always in
+/// lock-step (a grid toggle rewrites the octal; a valid octal moves the grid).
+fn properties_perms(
+    ui: &mut egui::Ui,
+    d: &crate::dialogs::PropertiesDialog,
+    actions: &mut Vec<Action>,
+) {
+    section_header(ui, "PERMISSIONS");
+    egui::Grid::new("files-perm-grid")
+        .num_columns(4)
+        .spacing(egui::vec2(Style::SP_M, Style::SP_XS))
+        .show(ui, |ui| {
+            ui.label("");
+            for perm in Perm::ALL {
+                ui.label(
+                    RichText::new(perm.glyph())
+                        .color(Style::TEXT_DIM)
+                        .monospace(),
+                );
+            }
+            ui.end_row();
+            for class in PermClass::ALL {
+                ui.label(RichText::new(class.label()).color(Style::TEXT));
+                for perm in Perm::ALL {
+                    let mut on = d.perms.get(class, perm);
+                    if ui.checkbox(&mut on, "").changed() {
+                        actions.push(Action::PropToggle(class, perm));
+                    }
+                }
+                ui.end_row();
+            }
+        });
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Octal")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        let mut octal = d.octal_edit.clone();
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut octal)
+                .desired_width(Style::SP_XL * 2.0)
+                .font(FontId::monospace(Style::BODY)),
+        );
+        if resp.changed() {
+            actions.push(Action::PropSetOctal(octal));
+        }
+        if d.octal_is_valid() {
+            muted_note(ui, d.perms.symbolic());
+        } else {
+            ui.colored_label(Style::DANGER, "not a valid octal mode");
+        }
+    });
+}
+
+/// The Properties owner/group row (FILEMGR-11 / lock 8): editable ids only when
+/// this caller may chown, honestly read-only otherwise.
+fn properties_owner(
+    ui: &mut egui::Ui,
+    d: &crate::dialogs::PropertiesDialog,
+    actions: &mut Vec<Action>,
+) {
+    section_header(ui, "OWNER");
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("User")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        if d.chown_permitted {
+            let mut uid = d.uid_edit.clone();
+            if ui
+                .add(egui::TextEdit::singleline(&mut uid).desired_width(Style::SP_XL * 2.0))
+                .changed()
+            {
+                actions.push(Action::PropSetUid(uid));
+            }
+        } else {
+            ui.colored_label(Style::TEXT, d.uid.to_string());
+        }
+        ui.add_space(Style::SP_M);
+        ui.label(
+            RichText::new("Group")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        if d.chown_permitted {
+            let mut gid = d.gid_edit.clone();
+            if ui
+                .add(egui::TextEdit::singleline(&mut gid).desired_width(Style::SP_XL * 2.0))
+                .changed()
+            {
+                actions.push(Action::PropSetGid(gid));
+            }
+        } else {
+            ui.colored_label(Style::TEXT, d.gid.to_string());
+        }
+    });
+    if !d.chown_permitted {
+        muted_note(
+            ui,
+            "Changing the owner needs root / CAP_CHOWN \u{2014} not available here.",
+        );
+    }
+}
+
+/// The Properties / permissions dialog (FILEMGR-11 / lock 8): a live rwx grid in
+/// lock-step with the octal field, the owner/group ids, and — only when this
+/// caller may chown — editable owner fields. Apply drives a real chmod / chown
+/// through the [`FileOps`](mde_files::fileops::FileOps) seam.
+fn properties_dialog(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    let Some(d) = b.properties() else {
+        return;
+    };
+    let pane = b.active_pane_index();
+    if modal_backdrop(ui.ctx(), "files-props-dim") {
+        actions.push(Action::PropClose);
+    }
+    egui::Window::new("Properties")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(Style::SP_XL * 13.0);
+            ui.label(
+                RichText::new(&d.name)
+                    .color(Style::TEXT)
+                    .strong()
+                    .size(Style::BODY),
+            );
+            muted_note(
+                ui,
+                format!(
+                    "{} \u{b7} {} bytes",
+                    if d.is_dir { "Folder" } else { "File" },
+                    d.size
+                ),
+            );
+            field(ui, "Path", &d.path.display().to_string(), Style::TEXT_DIM);
+
+            ui.add_space(Style::SP_S);
+            properties_perms(ui, d, actions);
+
+            ui.add_space(Style::SP_S);
+            properties_owner(ui, d, actions);
+
+            if let Some(outcome) = &d.outcome {
+                ui.add_space(Style::SP_XS);
+                match outcome {
+                    Ok(()) => ui.colored_label(Style::OK, "Applied."),
+                    Err(reason) => ui.colored_label(Style::DANGER, reason),
+                };
+            }
+
+            ui.add_space(Style::SP_S);
+            ui.horizontal(|ui| {
+                let apply = egui::Button::new(RichText::new("Apply").color(Style::BG).strong())
+                    .fill(Style::ACCENT);
+                if ui.add_enabled(d.can_apply(), apply).clicked() {
+                    actions.push(Action::PropApply(pane));
+                }
+                if ui.button("Close").clicked() {
+                    actions.push(Action::PropClose);
+                }
+            });
         });
 }
 
@@ -2014,6 +2463,107 @@ mod tests {
         // The quick-look overlay at full size.
         b.toggle_quick_look();
         assert!(b.quick_look_open());
+        mount(&mut b);
+    }
+
+    // ── the operation dialogs (FILEMGR-11) ───────────────────────────────────
+
+    #[test]
+    fn mounts_and_renders_the_local_delete_confirm() {
+        let mut b = browser();
+        // Sorted display: [alpha/, photo.png, report.pdf] → select a couple.
+        b.click(0, 1);
+        b.request_delete(0);
+        assert!(b.pending_delete().is_some(), "the confirm opened");
+        assert!(
+            b.pending_delete().and_then(|c| c.arming.as_ref()).is_none(),
+            "a local delete has no typed-arming"
+        );
+        mount(&mut b);
+    }
+
+    #[test]
+    fn mounts_and_renders_the_delete_confirm_with_typed_arming() {
+        use crate::mesh_mount::test_support::FakeMeshMount;
+        use crate::mesh_mount::{MountPhase, MountScope, MountView};
+        // A row on peer `oak`'s escalated full-fs mount → the confirm demands the
+        // node be typed. The render exercises the arming field + disabled Delete.
+        let remote = "/run/user/1000/mde-mesh/oak/report.txt";
+        let fixture = RenderFixture {
+            peers: Vec::new(),
+            rows: vec![FileRow::local("report.txt", Mime::Doc, "1 KB", "now").with_path(remote)],
+        };
+        let fake = FakeMeshMount::new().with_view(
+            "oak",
+            MountView {
+                phase: MountPhase::Mounted,
+                scope: Some(MountScope::Full),
+                path: Some("/run/user/1000/mde-mesh/oak".into()),
+                reason: None,
+            },
+        );
+        let mut b = FileBrowser::with_file_ops(Box::new(fixture), FakeFileOps::new())
+            .with_mesh_mount(Box::new(fake));
+        b.click(0, 0);
+        b.request_delete(0);
+        assert!(
+            b.pending_delete().and_then(|c| c.arming.as_ref()).is_some(),
+            "a remote delete arms"
+        );
+        mount(&mut b);
+    }
+
+    #[test]
+    fn mounts_and_renders_the_conflict_dialog() {
+        use std::path::Path;
+        use std::time::{Duration, Instant};
+        // A real fake-FS collision so an op parks on the conflict prompt, which
+        // the dialog then renders.
+        let fs = FakeFileOps::new();
+        fs.create_dir(Path::new("/d")).expect("mkdir");
+        fs.create_dir(Path::new("/dst")).expect("mkdir");
+        fs.seed_file("/d/f.txt", b"new").expect("seed");
+        fs.seed_file("/dst/f.txt", b"old").expect("seed collision");
+        let fixture = RenderFixture {
+            peers: Vec::new(),
+            rows: vec![FileRow::local("f.txt", Mime::Doc, "1 KB", "now").with_path("/d/f.txt")],
+        };
+        let mut b = FileBrowser::with_file_ops(Box::new(fixture), fs);
+        b.click(0, 0);
+        let id = b
+            .drop_transfer(0, PathBuf::from("/dst"), true)
+            .expect("queued");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while b.pending_conflict().is_none() {
+            b.pump_ops();
+            assert!(Instant::now() < deadline, "collision never surfaced");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        mount(&mut b); // renders the conflict dialog over the shell
+                       // Answer so the worker unparks cleanly (Drop would also fail-safe it).
+        b.resolve_conflict(id, mde_files::opqueue::Resolution::Skip, true);
+    }
+
+    #[test]
+    fn mounts_and_renders_the_properties_dialog() {
+        use std::path::Path;
+        // The Properties dialog reads through the injected meta-ops seam, so a
+        // seeded fake FS backs it (no real disk touch), and chown is permitted so
+        // the owner fields render editable.
+        let meta = FakeFileOps::privileged();
+        meta.create_dir(Path::new("/d")).expect("mkdir");
+        meta.seed_file("/d/report.txt", b"hello").expect("seed");
+        let fixture = RenderFixture {
+            peers: Vec::new(),
+            rows: vec![
+                FileRow::local("report.txt", Mime::Doc, "5 B", "now").with_path("/d/report.txt")
+            ],
+        };
+        let mut b = FileBrowser::with_file_ops(Box::new(fixture), FakeFileOps::new())
+            .with_meta_ops(meta, true);
+        b.click(0, 0);
+        b.open_properties(0);
+        assert!(b.properties().is_some(), "the dialog opened");
         mount(&mut b);
     }
 }
