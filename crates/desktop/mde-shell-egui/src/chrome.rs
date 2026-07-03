@@ -366,8 +366,10 @@ impl ChromeState {
     /// has elapsed, then keep the repaint heartbeat alive so a peer join/leave or a
     /// lighthouse flip surfaces without input. Cheap enough to call every frame —
     /// it self-gates. A missing / unreadable snapshot yields the unseen summary
-    /// (honest "Connecting…"), never a panic.
-    fn poll(&mut self, ctx: &egui::Context) {
+    /// (honest "Connecting…"), never a panic. `pub(crate)` so the QBRAND-4
+    /// boot-splash can bank its "first mesh snapshot poll" milestone by running
+    /// THIS real fold (the first dock frame then opens with a live chrome).
+    pub(crate) fn poll(&mut self, ctx: &egui::Context) {
         let due = self.last_poll.is_none_or(|t| t.elapsed() >= REFRESH);
         if due {
             self.last_poll = Some(Instant::now());

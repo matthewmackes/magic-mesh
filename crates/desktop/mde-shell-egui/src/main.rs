@@ -34,6 +34,7 @@ mod provisioning;
 mod services_flow;
 mod session;
 mod spawn_lighthouse_flow;
+mod splash;
 mod storage;
 mod surface_card;
 mod system;
@@ -43,7 +44,6 @@ mod vdi;
 mod web;
 mod workbench;
 
-use mde_egui::eframe::CreationContext;
 use mde_egui::{eframe, egui, run_client, Density, Motion, Style};
 
 use mde_seat::hotkeys::HotkeyAction;
@@ -220,17 +220,11 @@ struct Shell {
 }
 
 impl Shell {
-    /// Build the shell and its three embedded surfaces once, off the eframe
-    /// creation context (the surfaces' workers clone its egui `Context` so their
-    /// off-thread updates repaint the one shell). This is the single "built once"
-    /// mount point of E12-3b.
-    fn new(cc: &CreationContext<'_>) -> Self {
-        Self::new_for_ctx(&cc.egui_ctx)
-    }
-
-    /// Build the shell + its embedded surfaces over a bare egui [`egui::Context`] —
-    /// the DRM-seat path (`run_drm`) has no eframe `CreationContext`, so `new` (the
-    /// windowed `run_client` path) delegates here and both runners build one shell.
+    /// Build the shell + its embedded surfaces once over a bare egui
+    /// [`egui::Context`] (the surfaces' workers clone it so their off-thread
+    /// updates repaint the one shell) — the single "built once" mount point of
+    /// E12-3b. Called mid-boot by [`Boot::frame`] (the QBRAND-4 `Surfaces`
+    /// milestone), on the DRM seat and the windowed fallback alike.
     fn new_for_ctx(ctx: &egui::Context) -> Self {
         Self {
             nav: Nav::default(),
@@ -508,9 +502,62 @@ impl Shell {
     }
 }
 
-impl eframe::App for Shell {
+/// The boot driver both runners share (QBRAND-4): the branded splash owns the
+/// screen while the shell's real init milestones land, then the built shell
+/// renders every frame. One driver, so the DRM seat and the windowed fallback
+/// boot identically — splash, milestones, first dock frame.
+#[derive(Default)]
+struct Boot {
+    /// The boot-splash: the official artwork + the banked init milestones.
+    splash: splash::Splash,
+    /// The shell, built once mid-boot (the `Surfaces` milestone).
+    shell: Option<Shell>,
+}
+
+impl Boot {
+    /// Drive one frame. While the splash owns the screen it paints FIRST — so
+    /// the frame on display while a slow init step runs shows the progress
+    /// already banked — then exactly one real milestone advances; the next
+    /// frame's bar shows it land. Once the splash dismisses (init complete +
+    /// the eased bar settled), the shell renders — the first dock frame
+    /// replaces the splash.
+    fn frame(&mut self, ctx: &egui::Context) {
+        if !self.splash.dismissed() {
+            self.splash.show(ctx);
+            if !self.splash.is_complete(splash::Milestone::Seat) {
+                // This callback running at all proves the seat came up — the
+                // runner (DRM/KMS + wgpu, or the windowed client) finishes
+                // that init before it can call back.
+                self.splash.complete(splash::Milestone::Seat);
+            } else if self.shell.is_none() {
+                // Surface construction — every backend the shell owns (music
+                // worker, media core, files browser, voice SIP agent, the
+                // terminal's real PTY, …) built once.
+                self.shell = Some(Shell::new_for_ctx(ctx));
+                self.splash.complete(splash::Milestone::Surfaces);
+            } else if !self.splash.is_complete(splash::Milestone::MeshSnapshot) {
+                // The shell's FIRST mesh-status snapshot poll — the same
+                // world-readable fold the chrome bar runs on its cadence, so
+                // the first dock frame opens with a live chrome instead of a
+                // cold "Connecting…" whenever a snapshot exists.
+                if let Some(shell) = self.shell.as_mut() {
+                    shell.chrome.poll(ctx);
+                }
+                self.splash.complete(splash::Milestone::MeshSnapshot);
+            }
+            // Keep boot frames flowing while the eased bar plays out.
+            ctx.request_repaint();
+            return;
+        }
+        self.shell
+            .get_or_insert_with(|| Shell::new_for_ctx(ctx))
+            .render(ctx);
+    }
+}
+
+impl eframe::App for Boot {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.render(ctx);
+        self.frame(ctx);
     }
 }
 
@@ -736,12 +783,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // compositor already holds the seat) — the exact fallback E12-2 designed in.
     #[cfg(feature = "drm")]
     {
-        let mut shell: Option<Shell> = None;
-        match mde_egui::run_drm("org.magicmesh.Shell", |ctx| {
-            shell
-                .get_or_insert_with(|| Shell::new_for_ctx(ctx))
-                .render(ctx);
-        }) {
+        // QBRAND-4 — the branded boot-splash owns the seat until every real
+        // init milestone lands and the artwork's bar fills; the first dock
+        // frame then replaces it. `Boot::frame` drives the whole sequence.
+        let mut boot = Boot::default();
+        match mde_egui::run_drm("org.magicmesh.Shell", |ctx| boot.frame(ctx)) {
             Ok(()) => return Ok(()),
             Err(mde_egui::drm::DrmError::NoDrmMaster(why)) => {
                 eprintln!(
@@ -751,14 +797,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => return Err(Box::new(e)),
         }
     }
-    run_client("org.magicmesh.Shell", "MCNF", Shell::new).map_err(Into::into)
+    // The windowed fallback boots through the SAME driver — splash, milestones,
+    // then the shell (built mid-boot from the window's egui context).
+    run_client("org.magicmesh.Shell", "MCNF", |_cc| Boot::default()).map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        dock, files_panel, media_header, media_panel, real_media, real_terminal, terminal_panel,
-        Nav, Plane, Surface,
+        dock, files_panel, media_header, media_panel, real_media, real_terminal, splash,
+        terminal_panel, Boot, Nav, Plane, Surface,
     };
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
@@ -782,6 +830,37 @@ mod tests {
         assert!(s.expanded);
         s.toggle_expand();
         assert!(!s.expanded);
+    }
+
+    /// One headless boot frame through the SAME `Boot::frame` both runners
+    /// drive (QBRAND-4): the splash paints real primitives, the `Seat`
+    /// milestone banks (this frame running IS the proof the runner's init
+    /// completed), and surface construction is deferred to a later frame — so
+    /// the operator sees the splash *before* the heavy build, and the dock
+    /// only replaces it after dismissal. (Later frames would build the full
+    /// `Shell` — its worker threads (SIP agent, PTY) are the surface tests'
+    /// territory, so this test stops at the first frame.)
+    #[test]
+    fn the_first_boot_frame_paints_the_splash_and_banks_the_seat() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut boot = Boot::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 720.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| boot.frame(ctx));
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(!prims.is_empty(), "the boot splash painted no primitives");
+        assert!(
+            boot.splash.is_complete(splash::Milestone::Seat),
+            "the first frame must bank the Seat milestone"
+        );
+        assert!(
+            boot.shell.is_none(),
+            "surfaces must build on a later frame, behind the splash"
+        );
+        assert!(!boot.splash.dismissed(), "dismissed before init completed");
     }
 
     /// Drive one headless frame that reproduces the shell's expanded **body mount**

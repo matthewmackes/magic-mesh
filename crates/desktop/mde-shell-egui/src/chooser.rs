@@ -953,7 +953,14 @@ fn decode_data_uri_png(ref_str: &str) -> Option<egui::ColorImage> {
 /// Decode 8-bit PNG bytes (RGBA or RGB) to an [`egui::ColorImage`], the same
 /// `png`-crate path `backdrop::decode_rgba` uses; RGB is expanded opaque.
 /// Fail-soft on any other shape (paletted/grayscale/16-bit → `None`).
-fn decode_png_rgba(bytes: &[u8]) -> Option<egui::ColorImage> {
+/// `pub(crate)` because the QBRAND-4 boot-splash (`crate::splash`) decodes its
+/// embedded artwork — an RGB8 wallpaper export — on this same path.
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) items in a private surface module are this crate's idiom \
+              (ChromeState, ChromeOutcome, …); the splash module consumes this"
+)]
+pub(crate) fn decode_png_rgba(bytes: &[u8]) -> Option<egui::ColorImage> {
     let mut reader = png::Decoder::new(Cursor::new(bytes)).read_info().ok()?;
     let mut buf = vec![0u8; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
