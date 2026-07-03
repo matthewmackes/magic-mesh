@@ -77,6 +77,13 @@ mde-voice-egui = { path = "../mde-voice-egui" }
 # over the real `mde_media_core` backend. Desktop-shell tier; the edge points
 # sideways-inward, sharing the one `mde-egui` toolkit resolution (§6).
 mde-media-egui = { path = "../mde-media-egui" }
+# TERM-16 — the Surface::Terminal surface, mounted exactly like Media: the shell
+# holds its production `TerminalSurface` (the TERM-4/5/8 `TabbedTerminal` over a
+# real local PTY, built by `real_terminal()`) and drives it per-frame (pump +
+# panel). This is the RESCUE that makes the whole TERM epic reachable — before it,
+# `mde-term-egui` was mounted nowhere. Desktop-shell tier; the edge points
+# sideways-inward, sharing the one `mde-egui` toolkit resolution (§6).
+mde-term-egui = { path = "../mde-term-egui" }
 
 # E12-5a — the VDI Desktop surface. These two decoder crates turn a remote RDP /
 # VNC framebuffer into an egui `ColorImage` the shell uploads to a `TextureHandle`

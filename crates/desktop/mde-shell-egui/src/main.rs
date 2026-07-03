@@ -50,6 +50,7 @@ use mde_seat::{Probe, SeatSnapshot};
 use mde_files_egui::{files_panel, FileBrowser};
 use mde_media_egui::{media_header, media_panel, media_pump, real_media, MediaSurface};
 use mde_music_egui::{music_header, music_panel, music_pump, MusicApp};
+use mde_term_egui::{real_terminal, terminal_panel, terminal_pump, TerminalSurface};
 use mde_voice_egui::{voice_header, voice_panel, voice_pump, VoiceApp};
 
 use dock::Surface;
@@ -190,6 +191,13 @@ struct Shell {
     /// until the gated `live-helper` spawn attaches one; the panel shows its honest
     /// gated EmptyState until then, exactly like the VDI Desktop surface.
     web: web::WebState,
+    /// The Terminal surface (TERM-16) — the production `TerminalSurface` (the
+    /// TERM-4/5/8 `TabbedTerminal`: tabs / splits / broadcast / a shell on any mesh
+    /// peer) over a real local PTY, built once by `mde_term_egui::real_terminal()`.
+    /// Driven per-frame (pump + panel) the same way Media is, so the whole
+    /// Terminator-class terminal is reachable as an in-shell surface — no demo data
+    /// (§7). This is the RESCUE: before it, `mde-term-egui` was mounted nowhere.
+    terminal: TerminalSurface,
 }
 
 impl Shell {
@@ -230,6 +238,7 @@ impl Shell {
             formfactor: formfactor::FormfactorPublisher::default(),
             keyboard: keyboard::Keyboard::default(),
             web: web::WebState::default(),
+            terminal: real_terminal(),
         }
     }
 
@@ -421,6 +430,21 @@ impl Shell {
                 // tabs exist in the default build, so this is inert (never a faked
                 // page, §7).
                 let _restart_requested = self.web.take_respawn_request();
+            }
+            Surface::Terminal => {
+                // The Terminator-class terminal (TERM-16) over a real local PTY —
+                // tabs / splits / broadcast / a shell on any mesh peer. Mounted
+                // exactly like Media: drive its per-frame pump (which lands the
+                // bundled ligature face + drains the chord keymap BEFORE the panes
+                // read input), then its panel, scoped under its own `push_id` so its
+                // egui ids can't collide in the shell's one `Context`. The pane
+                // widget heartbeats its own repaints while live, so the shell adds
+                // none.
+                terminal_pump(&mut self.terminal, ui.ctx());
+                let terminal = &mut self.terminal;
+                ui.push_id("shell-terminal", |ui| {
+                    terminal_panel(ui, terminal);
+                });
             }
             Surface::Chat => {
                 let chat = &mut self.chat;
@@ -669,7 +693,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dock, files_panel, media_header, media_panel, real_media, Nav, Plane, Surface};
+    use super::{
+        dock, files_panel, media_header, media_panel, real_media, real_terminal, terminal_panel,
+        Nav, Plane, Surface,
+    };
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
 
@@ -771,6 +798,40 @@ mod tests {
         assert!(
             !prims.is_empty(),
             "the mounted media surface produced no draw primitives"
+        );
+    }
+
+    /// The Terminal surface (TERM-16) mounts through the same `body` path — the
+    /// dock rail plus `terminal_panel` scoped under `push_id` — over a **real**
+    /// local PTY (`real_terminal()`, no demo data; a refused first PTY renders the
+    /// honest spawn error, still a full paint path). Tessellating it on the CPU
+    /// proves the whole Terminator-class terminal is runtime-reachable as an
+    /// in-shell surface and actually draws — the terminal analogue of
+    /// [`shell_mounts_and_renders_the_media_surface`]. This is the RESCUE the unit
+    /// is: before it, `mde-term-egui` was mounted nowhere.
+    #[test]
+    fn shell_mounts_and_renders_the_terminal_surface() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut terminal = real_terminal();
+        let mut active = Surface::Terminal;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::SidePanel::left("shell-dock")
+                    .resizable(false)
+                    .exact_width(Style::SP_XL * 4.0)
+                    .show_inside(ui, |ui| dock::rail(ui, &mut active));
+                ui.push_id("shell-terminal", |ui| terminal_panel(ui, &mut terminal));
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the mounted terminal surface produced no draw primitives"
         );
     }
 }

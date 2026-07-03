@@ -47,6 +47,10 @@ pub(crate) enum Surface {
     /// The Browser surface — the sandboxed Servo browser (`mde-web-preview`)
     /// rendered egui-native over the BOOKMARKS-6 IPC + shm texture bridge.
     Browser,
+    /// The embedded Terminal surface (`mde-term-egui`) — the full Terminator-class
+    /// terminal (tabs / splits / broadcast / a shell on any mesh peer, TERM-4/5/8)
+    /// over a real local PTY, mounted as an in-shell panel (TERM-16).
+    Terminal,
     /// The Chat surface — the ONE unified notification interface (NOTIFY-CHAT):
     /// every mesh host is a contact, and its alerts + clipboard copies are its
     /// messages, over the `state/chat/roster` + `state/chat/conversation/<key>`
@@ -75,7 +79,7 @@ impl Surface {
     /// then the local VM Instances broker + the brokered Desktop, then the three
     /// app surfaces, then the unified Chat surface (the ONE notification
     /// interface), and finally this seat's host-controls System + Storage surfaces.
-    pub(crate) const ALL: [Surface; 11] = [
+    pub(crate) const ALL: [Surface; 12] = [
         Surface::Workbench,
         Surface::Instances,
         Surface::Desktop,
@@ -84,6 +88,7 @@ impl Surface {
         Surface::Files,
         Surface::Voice,
         Surface::Browser,
+        Surface::Terminal,
         Surface::Chat,
         Surface::System,
         Surface::Storage,
@@ -100,6 +105,7 @@ impl Surface {
             Surface::Files => "Files",
             Surface::Voice => "Voice",
             Surface::Browser => "Browser",
+            Surface::Terminal => "Terminal",
             Surface::Chat => "Chat",
             Surface::System => "System",
             Surface::Storage => "Storage",
@@ -127,6 +133,9 @@ impl Surface {
             Surface::Voice => "Place and receive mesh voice calls (SIP).",
             Surface::Browser => {
                 "Browse the web in a sandboxed Servo browser rendered here in the shell."
+            }
+            Surface::Terminal => {
+                "Open a shell — tabs, splits, broadcast input, and a shell on any mesh peer."
             }
             Surface::Chat => {
                 "Mesh chat (ICQ) — every host is a contact; its alerts + clipboard copies are its messages."
@@ -175,13 +184,14 @@ mod tests {
 
     #[test]
     fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
-        // Eleven entries: Workbench first, two VM surfaces (Instances / Desktop),
+        // Twelve entries: Workbench first, two VM surfaces (Instances / Desktop),
         // the app surfaces (Music / Media — the full media player, MEDIA-18 / Files /
-        // Voice / Browser — the sandboxed Servo browser, BOOKMARKS-6), the unified
-        // Chat surface (the ONE notification interface — the standalone Notifications
-        // + Clipboard surfaces are retired, NOTIFY-CHAT-6), the host-controls System
-        // surface, and the Storage surface (GParted-authentic disk mgmt, E12-21).
-        assert_eq!(Surface::ALL.len(), 11);
+        // Voice / Browser — the sandboxed Servo browser, BOOKMARKS-6 / Terminal — the
+        // Terminator-class terminal over a real PTY, TERM-16), the unified Chat surface
+        // (the ONE notification interface — the standalone Notifications + Clipboard
+        // surfaces are retired, NOTIFY-CHAT-6), the host-controls System surface, and
+        // the Storage surface (GParted-authentic disk mgmt, E12-21).
+        assert_eq!(Surface::ALL.len(), 12);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
             Surface::Instances,
@@ -191,6 +201,7 @@ mod tests {
             Surface::Files,
             Surface::Voice,
             Surface::Browser,
+            Surface::Terminal,
             Surface::Chat,
             Surface::System,
             Surface::Storage,
