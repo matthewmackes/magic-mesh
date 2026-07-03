@@ -20,13 +20,15 @@ use mde_jellyfin::{
     BaseItemDto, ClientInfo, ItemsQuery, JellyfinClient, ReqwestTransport, ServerConfig,
 };
 use mde_media_core::{
-    MediaEngine, MediaKind, PlayerState, ScreenshotMode, SortKey, TrackKind, V4l2Cli, YtDlpCli,
+    EqBand, LoudnessNorm, MediaEngine, MediaKind, PlayerState, ReplayGainMode, ScreenshotMode,
+    SortKey, TrackKind, V4l2Cli, YtDlpCli,
 };
 
 use crate::model::{
     capture_detail, format_time, item_title, jellyfin_item_title, library_row_texts,
     now_playing_title, osd_should_show, play_pause_label, progress_fraction, repeat_label,
-    state_word, track_label, MediaController, MediaTab, TransportAction,
+    state_word, track_label, MediaController, MediaTab, TransportAction, EBU_R128_DEFAULT,
+    EQ_GAIN_DB_LIMIT,
 };
 use crate::{build_engine, Engine};
 
@@ -1060,8 +1062,131 @@ fn player_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControll
     // Track menus (audio / subtitle), from the enumerated tracks (MEDIA-5).
     track_menus(ui, controller, &mut action);
 
+    // Audio processing (MEDIA-3): the graphic EQ, loudness, ReplayGain, gapless.
+    ui.add_space(Style::SP_XS);
+    audio_controls(ui, controller, &mut action);
+
     if let Some(action) = action {
         controller.dispatch(action);
+    }
+}
+
+/// The MEDIA-3 audio-processing controls, tucked in a collapsing "Audio & EQ" section
+/// under the transport: a ten-band graphic EQ, loudness normalization, `ReplayGain`,
+/// and gapless. Every change raises a [`TransportAction`] that folds the core
+/// [`AudioConfig`](mde_media_core::AudioConfig) back to mpv's `af` graph + properties
+/// (§6 — the surface reimplements no DSP). All chrome is Carbon [`Style`] tokens (§4).
+fn audio_controls<E: MediaEngine>(
+    ui: &mut egui::Ui,
+    controller: &MediaController<E>,
+    action: &mut Option<TransportAction>,
+) {
+    egui::CollapsingHeader::new(
+        RichText::new("Audio & EQ")
+            .size(Style::SMALL)
+            .color(Style::TEXT_DIM),
+    )
+    .show(ui, |ui| audio_processing_body(ui, controller, action));
+}
+
+/// The body of the audio-processing section (factored out so the whole surface — the
+/// EQ sliders + the mode rows — is tessellated by a headless mount test, §7, without a
+/// pointer to expand the collapsing header).
+fn audio_processing_body<E: MediaEngine>(
+    ui: &mut egui::Ui,
+    controller: &MediaController<E>,
+    action: &mut Option<TransportAction>,
+) {
+    // The ten-band graphic EQ, one vertical slider per ISO octave centre (MEDIA-3).
+    let gains = controller.eq_gains();
+    ui.horizontal(|ui| {
+        for (band, (&freq_hz, mut gain)) in EqBand::ISO_10_BAND_HZ.iter().zip(gains).enumerate() {
+            ui.vertical(|ui| {
+                let resp = ui.add(
+                    Slider::new(&mut gain, -EQ_GAIN_DB_LIMIT..=EQ_GAIN_DB_LIMIT)
+                        .vertical()
+                        .show_value(false),
+                );
+                if resp.changed() {
+                    *action = Some(TransportAction::SetEqGain(band, gain));
+                }
+                ui.label(
+                    RichText::new(fmt_hz(freq_hz))
+                        .monospace()
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+            });
+        }
+        ui.add_space(Style::SP_M);
+        if ui.button("Flat").clicked() {
+            *action = Some(TransportAction::ResetEq);
+        }
+    });
+
+    ui.add_space(Style::SP_S);
+
+    // Loudness normalization — Off / EBU R128 (loudnorm) / Dynamic (dynaudnorm).
+    let loudness = controller.audio_config().loudness;
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Loudness")
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+        if ui
+            .selectable_label(loudness == LoudnessNorm::Off, "Off")
+            .clicked()
+        {
+            *action = Some(TransportAction::SetLoudness(LoudnessNorm::Off));
+        }
+        if ui
+            .selectable_label(matches!(loudness, LoudnessNorm::Ebu { .. }), "EBU R128")
+            .clicked()
+        {
+            *action = Some(TransportAction::SetLoudness(EBU_R128_DEFAULT));
+        }
+        if ui
+            .selectable_label(loudness == LoudnessNorm::Dynamic, "Dynamic")
+            .clicked()
+        {
+            *action = Some(TransportAction::SetLoudness(LoudnessNorm::Dynamic));
+        }
+    });
+
+    // ReplayGain — tag-based volume levelling: Off / Track / Album.
+    let replaygain = controller.audio_config().replaygain;
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("ReplayGain")
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+        for (mode, label) in [
+            (ReplayGainMode::Off, "Off"),
+            (ReplayGainMode::Track, "Track"),
+            (ReplayGainMode::Album, "Album"),
+        ] {
+            if ui.selectable_label(replaygain == mode, label).clicked() {
+                *action = Some(TransportAction::SetReplayGain(mode));
+            }
+        }
+    });
+
+    // Gapless across the queue (mpv's gapless-audio).
+    let gapless = controller.audio_config().gapless;
+    if ui.selectable_label(gapless, "Gapless").clicked() {
+        *action = Some(TransportAction::ToggleGapless);
+    }
+}
+
+/// A compact axis label for an EQ band centre frequency (`1000.0` → `"1k"`,
+/// `16000.0` → `"16k"`, `250.0` → `"250"`).
+fn fmt_hz(hz: f64) -> String {
+    if hz >= 1000.0 {
+        format!("{:.0}k", hz / 1000.0)
+    } else {
+        format!("{:.0}", hz.round())
     }
 }
 
@@ -1453,6 +1578,32 @@ mod tests {
         // Idle-hidden OSD branch.
         c.ui_mut().osd_idle_secs = crate::model::OSD_HIDE_SECS + 1.0;
         render(&mut c, player_view);
+    }
+
+    #[test]
+    fn audio_processing_surface_renders_and_reflects_the_config() {
+        let mut c = controller();
+        // Flat default: the EQ sliders + mode rows tessellate (§7 — the whole audio
+        // surface is proven reachable, not just the collapsing header).
+        render(&mut c, |ui, c| {
+            let mut action = None;
+            audio_processing_body(ui, c, &mut action);
+        });
+        // With a shaped EQ + loudness + ReplayGain + gapless-off, the surface reflects
+        // the live core AudioConfig (the sliders seed from it, the modes light up).
+        c.dispatch(TransportAction::SetEqGain(9, 6.0));
+        c.dispatch(TransportAction::SetLoudness(EBU_R128_DEFAULT));
+        c.dispatch(TransportAction::SetReplayGain(ReplayGainMode::Album));
+        c.dispatch(TransportAction::ToggleGapless);
+        assert!((c.eq_gains()[9] - 6.0).abs() < f64::EPSILON);
+        assert!(!c.audio_config().gapless);
+        render(&mut c, |ui, c| {
+            let mut action = None;
+            audio_processing_body(ui, c, &mut action);
+        });
+        // The collapsing wrapper itself renders inside the full player view.
+        render(&mut c, player_view);
+        assert_eq!(c.player().state(), PlayerState::Idle, "render never plays");
     }
 
     #[test]

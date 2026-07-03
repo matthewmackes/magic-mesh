@@ -20,11 +20,12 @@ use mde_jellyfin::{
     ServerStore, StreamMediaType,
 };
 use mde_media_core::{
-    classify_url, unix_millis, AbLoop, BrowseQuery, CaptureDevice, CaptureEnumerator, CaptureError,
-    CaptureNodeKind, Library, LibraryItem, LoginOutcome, MediaEngine, MediaKind, MpvCapabilities,
-    PlaybackControls, Player, PlayerEvent, PlayerState, Playlist, PlaylistItem, PollOutcome,
-    RepeatMode, RoamingSession, ScreenshotMode, SortKey, Track, TrackKind, TrackSelect,
-    TrackSelection, UrlKind, YtDlpError, YtDlpResolver,
+    classify_url, unix_millis, AbLoop, AudioConfig, BrowseQuery, CaptureDevice, CaptureEnumerator,
+    CaptureError, CaptureNodeKind, EqBand, Library, LibraryItem, LoginOutcome, LoudnessNorm,
+    MediaEngine, MediaKind, MpvCapabilities, PlaybackControls, Player, PlayerEvent, PlayerState,
+    Playlist, PlaylistItem, PollOutcome, RepeatMode, ReplayGainMode, RoamingSession,
+    ScreenshotMode, SortKey, Track, TrackKind, TrackSelect, TrackSelection, UrlKind, YtDlpError,
+    YtDlpResolver,
 };
 
 /// The seed used when the operator toggles shuffle on.
@@ -37,6 +38,20 @@ pub const SHUFFLE_SEED: u64 = 0x5EED_5EED_5EED_5EED;
 /// How many seconds of pointer inactivity hide the auto-hiding media OSD (design
 /// Q32). Named here rather than scattered so the dwell lives in one place.
 pub const OSD_HIDE_SECS: f64 = 3.0;
+
+/// The graphic-EQ per-band boost/cut limit (dB) the audio controls (MEDIA-3) expose —
+/// the ±range of each of the ten [`EqBand::ISO_10_BAND_HZ`] sliders.
+pub const EQ_GAIN_DB_LIMIT: f64 = 12.0;
+
+/// The EBU R128 target the audio controls apply when loudness normalization is on.
+///
+/// Streaming-loudness **-16 LUFS**, a **-1.5 dBTP** true-peak ceiling, **11 LU** range —
+/// a named default so the surface and its tests agree on one target.
+pub const EBU_R128_DEFAULT: LoudnessNorm = LoudnessNorm::Ebu {
+    target_lufs: -16.0,
+    true_peak_db: -1.5,
+    range_lu: 11.0,
+};
 
 /// The four top-level views of the media app (design Q31).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -390,6 +405,18 @@ pub enum TransportAction {
     MoveQueueItem(usize, usize),
     /// Clear the whole queue ([`Playlist::clear`]).
     ClearQueue,
+    /// Set graphic-EQ band `index`'s gain in dB (MEDIA-3), initializing the flat
+    /// 10-band ISO EQ ([`EqBand::iso_10_band`]) if the config carries no bands. Folds
+    /// through [`Player::set_audio_config`] to mpv's `af` graph.
+    SetEqGain(usize, f64),
+    /// Flatten the graphic EQ — clear every band ([`Player::set_audio_config`]).
+    ResetEq,
+    /// Set the live loudness-normalization mode (MEDIA-3 — `loudnorm`/`dynaudnorm`).
+    SetLoudness(LoudnessNorm),
+    /// Set the tag-based `ReplayGain` mode (MEDIA-3 — mpv's `replaygain` property).
+    SetReplayGain(ReplayGainMode),
+    /// Toggle gapless audio across the queue (MEDIA-3 — mpv's `gapless-audio`).
+    ToggleGapless,
 }
 
 /// The media surface controller.
@@ -501,6 +528,20 @@ impl<E: MediaEngine> MediaController<E> {
     #[must_use]
     pub fn is_playing(&self) -> bool {
         self.player.state() == PlayerState::Playing
+    }
+
+    /// The live audio-processing config (MEDIA-3) the audio controls render — the
+    /// `PipeWire` out, the graphic EQ, loudness / `ReplayGain`, and gapless.
+    #[must_use]
+    pub const fn audio_config(&self) -> &AudioConfig {
+        self.player.audio_config()
+    }
+
+    /// The ten graphic-EQ band gains (dB) the audio controls draw as sliders — the
+    /// config's own bands when it holds the 10-band ISO EQ, else a flat set (MEDIA-3).
+    #[must_use]
+    pub fn eq_gains(&self) -> [f64; 10] {
+        eq_gains_of(self.player.audio_config())
     }
 
     // ── search wiring ───────────────────────────────────────────────────────────
@@ -852,8 +893,29 @@ impl<E: MediaEngine> MediaController<E> {
                 self.player.playlist_mut().reorder(from, to);
             }
             TransportAction::ClearQueue => self.player.playlist_mut().clear(),
+            TransportAction::SetEqGain(band, gain) => self.set_audio(|cfg| {
+                let mut gains = eq_gains_of(cfg);
+                if let Some(slot) = gains.get_mut(band) {
+                    *slot = gain;
+                }
+                cfg.eq = EqBand::iso_10_band(gains);
+            })?,
+            TransportAction::ResetEq => self.set_audio(|cfg| cfg.eq.clear())?,
+            TransportAction::SetLoudness(mode) => self.set_audio(|cfg| cfg.loudness = mode)?,
+            TransportAction::SetReplayGain(mode) => self.set_audio(|cfg| cfg.replaygain = mode)?,
+            TransportAction::ToggleGapless => self.set_audio(|cfg| cfg.gapless = !cfg.gapless)?,
         }
         Ok(())
+    }
+
+    /// Fold an audio-processing edit into the engine (MEDIA-3): clone the live
+    /// [`AudioConfig`], apply `edit`, and re-apply it through
+    /// [`Player::set_audio_config`] (the shared body behind every audio
+    /// [`TransportAction`]). A failed apply leaves the stored config untouched.
+    fn set_audio(&mut self, edit: impl FnOnce(&mut AudioConfig)) -> Result<(), String> {
+        let mut cfg = self.player.audio_config().clone();
+        edit(&mut cfg);
+        self.player.set_audio_config(cfg).map_err(err)
     }
 
     /// The A-B loop state machine: the first mark records A at the live position; the
@@ -1433,6 +1495,22 @@ pub const fn next_repeat(mode: RepeatMode) -> RepeatMode {
         RepeatMode::All => RepeatMode::One,
         RepeatMode::One => RepeatMode::Off,
     }
+}
+
+/// The ten graphic-EQ band gains (dB) a [`AudioConfig`] presents to the audio controls.
+///
+/// The config's own gains when it carries the 10-band ISO EQ, else a flat set (MEDIA-3).
+/// A pure fold, so the EQ surface always renders a stable ten-slider model and the
+/// mapping is unit-tested.
+#[must_use]
+pub fn eq_gains_of(cfg: &AudioConfig) -> [f64; 10] {
+    let mut gains = [0.0_f64; 10];
+    if cfg.eq.len() == gains.len() {
+        for (slot, band) in gains.iter_mut().zip(&cfg.eq) {
+            *slot = band.gain_db;
+        }
+    }
+    gains
 }
 
 /// The Sources rows for a [`Library`]: one per indexed root, each with the count of
@@ -2203,6 +2281,107 @@ mod tests {
         assert_eq!(c.player().playlist().shuffle_seed(), Some(SHUFFLE_SEED));
         c.dispatch(TransportAction::ToggleShuffle);
         assert!(!c.player().playlist().is_shuffled());
+    }
+
+    // ── audio processing (MEDIA-3) ───────────────────────────────────────────────
+
+    /// Assert two ten-band gain arrays match within a tight tolerance (the gains flow
+    /// through verbatim, but the exact-float compare trips `clippy::float_cmp`).
+    fn assert_gains_eq(got: [f64; 10], want: [f64; 10]) {
+        assert!(
+            got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-9),
+            "eq gains {got:?} != {want:?}",
+        );
+    }
+
+    #[test]
+    fn eq_gains_of_reads_bands_or_falls_back_flat() {
+        // No bands → a flat ten-slider model.
+        assert_gains_eq(eq_gains_of(&AudioConfig::new()), [0.0; 10]);
+        // A ten-band ISO EQ → its own gains, in band order.
+        let gains = [2.0, 1.0, 0.0, -1.0, -2.0, 0.0, 1.0, 2.0, 3.0, -4.5];
+        let cfg = AudioConfig {
+            eq: EqBand::iso_10_band(gains),
+            ..AudioConfig::new()
+        };
+        assert_gains_eq(eq_gains_of(&cfg), gains);
+    }
+
+    #[test]
+    fn set_eq_gain_seeds_flat_10_band_and_folds_to_the_engine() {
+        let mut c = controller();
+        // Starts flat: no bands, empty af graph.
+        assert_gains_eq(c.eq_gains(), [0.0; 10]);
+        assert!(c.audio_config().af_graph().is_empty());
+
+        // Nudging one band seeds the whole ISO EQ and re-applies it to the engine.
+        c.dispatch(TransportAction::SetEqGain(9, 6.0));
+        assert_eq!(c.audio_config().eq.len(), 10);
+        let mut expect = [0.0; 10];
+        expect[9] = 6.0;
+        assert_gains_eq(c.eq_gains(), expect);
+        // The engine received the matching af-graph (the MEDIA-3 fold reached mpv).
+        let af = c.audio_config().af_graph();
+        assert!(af.contains("equalizer=f=16000"), "{af}");
+        assert_eq!(c.player().engine().applied_af(), Some(af.as_str()));
+
+        // A second band edits in place (does not reset the first).
+        c.dispatch(TransportAction::SetEqGain(0, -3.0));
+        assert!((c.eq_gains()[0] + 3.0).abs() < f64::EPSILON);
+        assert!((c.eq_gains()[9] - 6.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn reset_eq_flattens_and_clears_the_engine_graph() {
+        let mut c = controller();
+        c.dispatch(TransportAction::SetEqGain(3, 4.0));
+        assert!(!c.audio_config().eq.is_empty());
+        c.dispatch(TransportAction::ResetEq);
+        assert!(c.audio_config().eq.is_empty());
+        assert_gains_eq(c.eq_gains(), [0.0; 10]);
+        // A flat config folds to an empty af graph, which clears mpv's chain.
+        assert_eq!(c.player().engine().applied_af(), Some(""));
+    }
+
+    #[test]
+    fn loudness_and_replaygain_and_gapless_fold_to_engine_properties() {
+        let mut c = controller();
+        // Default: PipeWire ao pinned (seat audio), gapless on.
+        assert!(c
+            .audio_config()
+            .properties()
+            .contains(&("ao".to_owned(), "pipewire".to_owned())));
+
+        c.dispatch(TransportAction::SetLoudness(EBU_R128_DEFAULT));
+        assert_eq!(c.audio_config().loudness, EBU_R128_DEFAULT);
+        assert!(c
+            .player()
+            .engine()
+            .applied_af()
+            .is_some_and(|af| af.contains("loudnorm=I=-16")));
+
+        c.dispatch(TransportAction::SetLoudness(LoudnessNorm::Dynamic));
+        assert!(c
+            .player()
+            .engine()
+            .applied_af()
+            .is_some_and(|af| af.contains("dynaudnorm")));
+
+        c.dispatch(TransportAction::SetReplayGain(ReplayGainMode::Album));
+        assert!(c
+            .player()
+            .engine()
+            .applied_properties()
+            .contains(&("replaygain".to_owned(), "album".to_owned())));
+
+        assert!(c.audio_config().gapless);
+        c.dispatch(TransportAction::ToggleGapless);
+        assert!(!c.audio_config().gapless);
+        assert!(c
+            .player()
+            .engine()
+            .applied_properties()
+            .contains(&("gapless-audio".to_owned(), "no".to_owned())));
     }
 
     // ── library browse fold ──────────────────────────────────────────────────────
