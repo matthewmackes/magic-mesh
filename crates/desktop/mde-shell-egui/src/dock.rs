@@ -263,7 +263,7 @@ impl Surface {
 /// `main.rs` mounts the bottom panel at exactly this height. (`pub`, not
 /// `pub(crate)`, is the `clippy::redundant_pub_crate` form for a crate-visible item
 /// in a private module — this is the one dock symbol `main.rs` reads.)
-pub const TASKBAR_H: f32 = Style::SP_XL + Style::SP_L;
+pub const TASKBAR_H: f32 = Style::SP_XL * 2.0 + Style::SP_S;
 
 /// The fixed width of one glyph cell — room for the ~24px glyph plus its tiny
 /// always-on caption beneath (design lock #5/#6). Two base units (`SP_XL * 2`).
@@ -272,7 +272,7 @@ const CELL_W: f32 = Style::SP_XL * 2.5;
 
 /// The glyph edge in logical points — the ~24px brand icon that leads each cell
 /// (design lock #6). Rasterized crisp at the physical pixel size by `icon_texture`.
-const ICON_LOGICAL: f32 = Style::SP_L;
+const ICON_LOGICAL: f32 = Style::SP_L + Style::SP_XS;
 
 /// Render the surface launcher as a full-width bottom **taskbar** into `ui`,
 /// selecting the active [`Surface`] (NAVBAR-1..3). A click on a cell makes that
@@ -350,7 +350,10 @@ fn divider(ui: &mut egui::Ui) {
 /// hover highlight + `hint` tooltip, and a click that selects the surface.
 fn cell(ui: &mut egui::Ui, surface: Surface, active: &mut Surface) {
     let selected = *active == surface;
-    let cell_h = ui.available_height();
+    // Fill the full bar height so the icon+label stack sits vertically centred with
+    // breathing room above and below (not jammed at the top), and the whole bar is
+    // clickable — not just a short content band.
+    let cell_h = TASKBAR_H;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(CELL_W, cell_h), egui::Sense::click());
     // Hover reveals the surface's one-line hint (design lock #10).
     let response = response.on_hover_text(surface.hint());
@@ -389,7 +392,7 @@ fn cell(ui: &mut egui::Ui, surface: Surface, active: &mut Surface) {
 
     // The glyph + caption vertical stack, centred in the cell. A glyph load failure
     // fails soft to the caption alone (§7).
-    let content_h = ICON_LOGICAL + Style::SP_XS + Style::SMALL;
+    let content_h = ICON_LOGICAL + Style::SP_S + Style::SMALL;
     let glyph_top = rect.top() + (cell_h - content_h) / 2.0;
     if let Some(tex) = icon_texture(ui.ctx(), surface.icon_id(), ICON_LOGICAL, tint) {
         let icon_rect = egui::Rect::from_min_size(
@@ -403,7 +406,7 @@ fn cell(ui: &mut egui::Ui, surface: Surface, active: &mut Surface) {
     painter.text(
         egui::pos2(
             rect.center().x,
-            glyph_top + ICON_LOGICAL + Style::SP_XS + Style::SMALL / 2.0,
+            glyph_top + ICON_LOGICAL + Style::SP_S + Style::SMALL / 2.0,
         ),
         Align2::CENTER_CENTER,
         surface.label(),
@@ -671,10 +674,11 @@ mod tests {
         Style::install(&ctx);
         let mut active = Surface::About;
         let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 600.0));
-        // The first cell is flush-left (edge-to-edge, lock #8); its centre is one
-        // half-cell in from the left, at the bar's mid-height — derived from the
-        // layout constants, not a magic number.
-        let click = egui::pos2(CELL_W / 2.0, 600.0 - TASKBAR_H / 2.0);
+        // The first cell is flush-left; its centre is one half-cell in from the left,
+        // and the clickable content sits in the upper band of the bar (icon+label,
+        // top-aligned), so target a point a short way down from the bar's top edge —
+        // derived from the layout constants, not a magic number.
+        let click = egui::pos2(CELL_W / 2.0, 600.0 - TASKBAR_H + Style::SP_M);
         let run = |active: &mut Surface, events: Vec<egui::Event>| {
             let input = egui::RawInput {
                 screen_rect: Some(screen),
