@@ -45,11 +45,18 @@ const SPEED_PRESETS: [f64; 5] = [0.5, 1.0, 1.25, 1.5, 2.0];
 /// The seek step (seconds) of the skip-back / skip-forward transport buttons.
 const SKIP_SECS: f64 = 10.0;
 
+/// How many frames between playback-roaming convergence polls (MEDIA-16). The poll
+/// reads the shared session plane, so it runs on a coarse cadence (~1 s at 60 fps),
+/// not every frame — the same human-paced convergence the mesh workers use.
+const ROAM_POLL_INTERVAL_FRAMES: u32 = 60;
+
 /// The media surface: the controller plus the applied-fullscreen mirror so the app
 /// only issues a viewport command when the immersive state actually flips.
 pub struct MediaApp {
     controller: MediaController<Engine>,
     applied_fullscreen: bool,
+    /// Frames since start, gating the MEDIA-16 roaming poll to a coarse cadence.
+    roam_poll_frames: u32,
 }
 
 impl MediaApp {
@@ -70,9 +77,15 @@ impl MediaApp {
     }
 
     fn with_engine() -> Self {
+        let mut controller = MediaController::new(mde_media_core::Player::new(build_engine()));
+        // MEDIA-16: pick up a roaming playback session — resume where another seat
+        // left off + take the single owned lease. Best-effort: a seat with no mesh
+        // workgroup root is a silent honest no-op (never a fabricated resume).
+        controller.enable_roaming_default();
         Self {
-            controller: MediaController::new(mde_media_core::Player::new(build_engine())),
+            controller,
             applied_fullscreen: false,
+            roam_poll_frames: 0,
         }
     }
 }
@@ -81,6 +94,14 @@ impl App for MediaApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         accumulate_osd_idle(ctx, &mut self.controller);
         media_pump(&mut self.controller);
+
+        // MEDIA-16: converge the roaming lease on a coarse cadence — checkpoint this
+        // seat's position while it owns the session, or release (pause) when another
+        // seat has claimed it, so only one seat ever plays.
+        self.roam_poll_frames = self.roam_poll_frames.wrapping_add(1);
+        if self.roam_poll_frames % ROAM_POLL_INTERVAL_FRAMES == 0 {
+            self.controller.poll_roaming();
+        }
 
         // Immersive fullscreen (design Q32) — sync only on a flip so we don't spam the
         // viewport each frame.

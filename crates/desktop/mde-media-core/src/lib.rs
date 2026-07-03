@@ -114,6 +114,19 @@
 //! detection and the resolution seam are exercised with no real `yt-dlp` and no
 //! network — the live resolve is honest-gated exactly like the `mpv` real-clip path.
 //!
+//! # Session roaming (MEDIA-16)
+//!
+//! [`SessionRecord`] snapshots the live [`Player`] (title / position / queue /
+//! tracks / [`PlayerState`]) bound to the mesh identity, and [`RoamingStore`] syncs
+//! it **the way mesh peer records + bookmarks sync** — one atomic JSON file per seat
+//! under the Syncthing-replicated workgroup root
+//! ([`mackes_mesh_types::peers::default_workgroup_root`]), folded on read (no new
+//! transport, no Syncthing write-conflict). A monotonic [`SessionRecord::lease_gen`]
+//! is the **single owned lease**: [`RoamingSession::login`] at a new seat acquires
+//! the highest generation (resume-where-paused + release the old seat), so
+//! [`resolve_owner`] elects exactly one playing seat — the two-seat, no-double-play
+//! acceptance, unit-tested against [`FakeMpv`] with a tempdir root (airgap-safe).
+//!
 //! # Capture devices (MEDIA-13)
 //!
 //! [`parse_v4l2_listing`] is the pure fold that projects a `v4l2-ctl --list-devices`
@@ -155,6 +168,7 @@ pub mod opensubtitles;
 pub mod player;
 pub mod playlist;
 pub mod resume;
+pub mod roaming;
 pub mod stream;
 pub mod subtitle;
 pub mod video;
@@ -179,6 +193,10 @@ pub use opensubtitles::{parse_search_response, request_headers, search_url, Subt
 pub use player::{Player, PlayerError, PlayerEvent, PlayerState};
 pub use playlist::{Playlist, PlaylistItem, RepeatMode};
 pub use resume::{ResumeEntry, ResumeState};
+pub use roaming::{
+    next_lease_gen, resolve_identity, resolve_owner, resolve_seat, unix_millis, LoginOutcome,
+    PollOutcome, RoamingSession, RoamingStore, SessionRecord, SESSIONS_SUBDIR,
+};
 pub use stream::{classify_url, UrlKind};
 pub use subtitle::{
     track_by_language, AssOverride, ExternalSub, SubLoad, SubtitleConfig, TrackSelect,

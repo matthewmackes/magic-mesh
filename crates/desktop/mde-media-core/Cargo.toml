@@ -21,6 +21,15 @@ serde_json = { workspace = true }
 # Error enum, matching the mde-kvm / mackes-xcp convention.
 thiserror  = "1"
 
+# MEDIA-16 session roaming: the canonical Syncthing-replicated workgroup root
+# (`default_workgroup_root` — resolves `$MDE_WORKGROUP_ROOT`, never a hardcoded
+# `/mnt/mesh-storage`, so it can't reintroduce the peers/CLI split-brain). This is
+# the lightweight shared-types crate (serde/serde_json/toml/dirs — no substrate),
+# hosted specifically so UI/desktop consumers can reuse the mesh record idiom
+# without depending on the heavy `mackesd` crate; already in the workspace lock via
+# `mde-term-egui`, so it adds no lock entry and stays airgap-safe.
+mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
+
 # MEDIA-5 OpenSubtitles online fetch (egress) — the real HTTPS client is OPTIONAL
 # and OFF by default. reqwest (0.12, already in the workspace via mde-bus/mde-musicd)
 # with `rustls-tls` gives airgap-friendly HTTPS (no system OpenSSL). It is gated
@@ -54,6 +63,12 @@ mpv = ["dep:libmpv2"]
 # by default; the hash + request-builder + response-parser stay in the default
 # build. Enabling it is honest-gated on a host with egress + an API key.
 opensubtitles = ["dep:reqwest"]
+
+[dev-dependencies]
+# MEDIA-16 session-roaming tests write per-seat records into a scratch workgroup
+# root; tempfile is already in the workspace lock (mde-jellyfin / mde-media-egui
+# dev-deps), so this adds no new lock entry and stays airgap-safe.
+tempfile = "3"
 
 [lints]
 workspace = true

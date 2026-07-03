@@ -11,7 +11,11 @@
 #
 # Tier (§6): desktop-shell. The dependency edges point strictly INWARD — desktop →
 # harness (`mde-egui`) and desktop → the media core (`mde-media-core`); it pulls in
-# no mesh-substrate crate, so the substrate stays headless-capable.
+# no heavy mesh-substrate crate (mde-bus / mackesd), so the substrate stays
+# headless-capable. The one mesh edge is transitive + light: MEDIA-16 session
+# roaming reaches the canonical Syncthing workgroup root through the shared-types
+# crate `mackes-mesh-types` (serde-only, the UI-consumer types split), the same
+# edge the sibling `mde-term-egui` surface already carries.
 [package]
 name        = "mde-media-egui"
 description = "MCNF MEDIA-8 — the egui-native media app surface. Renders + drives mde-media-core (Player / Library / Playlist / PlaybackControls / ResumeState) as a full app: Sources, Library browse, a Player view with the MEDIA-6 transport + advanced controls, a Queue, and a PiP mini-player, all through the shared mde-egui Carbon Style (§4). The render-agnostic controller + view-model folds are unit-tested without a GPU; live decode on a seat rides the honest-gated mpv feature."

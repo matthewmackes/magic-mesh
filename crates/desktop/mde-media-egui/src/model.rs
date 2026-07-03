@@ -20,11 +20,11 @@ use mde_jellyfin::{
     ServerStore, StreamMediaType,
 };
 use mde_media_core::{
-    classify_url, AbLoop, BrowseQuery, CaptureDevice, CaptureEnumerator, CaptureError,
-    CaptureNodeKind, Library, LibraryItem, MediaEngine, MediaKind, MpvCapabilities,
-    PlaybackControls, Player, PlayerEvent, PlayerState, Playlist, PlaylistItem, RepeatMode,
-    ScreenshotMode, SortKey, Track, TrackKind, TrackSelect, TrackSelection, UrlKind, YtDlpError,
-    YtDlpResolver,
+    classify_url, unix_millis, AbLoop, BrowseQuery, CaptureDevice, CaptureEnumerator, CaptureError,
+    CaptureNodeKind, Library, LibraryItem, LoginOutcome, MediaEngine, MediaKind, MpvCapabilities,
+    PlaybackControls, Player, PlayerEvent, PlayerState, Playlist, PlaylistItem, PollOutcome,
+    RepeatMode, RoamingSession, ScreenshotMode, SortKey, Track, TrackKind, TrackSelect,
+    TrackSelection, UrlKind, YtDlpError, YtDlpResolver,
 };
 
 /// The seed used when the operator toggles shuffle on.
@@ -411,6 +411,11 @@ pub struct MediaController<E: MediaEngine> {
     /// The capture-devices Sources state (MEDIA-13) — the last enumerated v4l2
     /// capture inputs. Refreshed on demand; the enumerator is injected.
     capture: CaptureUiState,
+    /// The playback session roaming seam (MEDIA-16) — the mesh-synced session record
+    /// plus the single owned lease that follows the operator between seats. [`None`]
+    /// until [`enable_roaming`](Self::enable_roaming) wires it (the render tests never
+    /// do, so a headless mount touches no workgroup root).
+    roaming: Option<RoamingSession>,
     /// The non-core UI state.
     ui: UiState,
 }
@@ -424,6 +429,7 @@ impl<E: MediaEngine> MediaController<E> {
             library: Library::new(),
             jellyfin: JellyfinState::default(),
             capture: CaptureUiState::default(),
+            roaming: None,
             ui: UiState::default(),
         }
     }
@@ -678,12 +684,82 @@ impl<E: MediaEngine> MediaController<E> {
 
     /// Advance the core one tick ([`Player::pump`]) and fold any surfaced
     /// [`PlayerEvent::Error`] onto the status line. Called at the top of every frame.
+    ///
+    /// Also lands a pending roaming resume seek (MEDIA-16) once the engine has the
+    /// file open — cheap + I/O-free, so it is safe to run every frame.
     pub fn pump(&mut self) {
         self.player.pump();
+        if let Some(roaming) = self.roaming.as_mut() {
+            roaming.apply_pending(&mut self.player);
+        }
         for event in self.player.drain_events() {
             if let PlayerEvent::Error(msg) = event {
                 self.ui.status = Some(msg);
             }
+        }
+    }
+
+    // ── session roaming (MEDIA-16) ────────────────────────────────────────────────
+
+    /// Wire a playback-roaming session (MEDIA-16) and log in at this seat: resume any
+    /// paused session that followed the operator here and take the single owned lease.
+    /// The outcome is reflected honestly on the status line (a real resume, or
+    /// nothing when there is no prior session / no mesh volume). Returns the outcome.
+    ///
+    /// Injectable — tests wire a [`RoamingSession`] over a tempdir root; the app uses
+    /// [`enable_roaming_default`](Self::enable_roaming_default).
+    pub fn enable_roaming(&mut self, session: RoamingSession) -> LoginOutcome {
+        let mut session = session;
+        let outcome = session.login(&mut self.player, unix_millis());
+        if let LoginOutcome::Resumed {
+            title,
+            position_secs,
+        } = &outcome
+        {
+            let what = title.as_deref().unwrap_or("your session");
+            self.ui.status = Some(format!(
+                "Resumed {what} at {} — playback followed you to this seat.",
+                format_time(*position_secs)
+            ));
+            self.ui.tab = MediaTab::Player;
+        }
+        self.roaming = Some(session);
+        outcome
+    }
+
+    /// Wire roaming over the canonical workgroup root with the mesh identity + seat
+    /// resolved from the environment, and log in ([`enable_roaming`](Self::enable_roaming)).
+    /// A silent no-op on a seat with no provisioned mesh volume.
+    pub fn enable_roaming_default(&mut self) -> LoginOutcome {
+        self.enable_roaming(RoamingSession::open_default())
+    }
+
+    /// Whether playback roaming is wired on this controller.
+    #[must_use]
+    pub const fn roaming_enabled(&self) -> bool {
+        self.roaming.is_some()
+    }
+
+    /// Converge the roaming lease with the shared plane (MEDIA-16): checkpoint this
+    /// seat's live position when it still owns the session, or **release** — pausing
+    /// playback — when another seat has claimed it (no double-play). Called on an
+    /// interval by the app. A no-op when roaming is not enabled.
+    pub fn poll_roaming(&mut self) {
+        let Some(roaming) = self.roaming.as_mut() else {
+            return;
+        };
+        if roaming.poll(&mut self.player, unix_millis()) == PollOutcome::Released {
+            self.ui.status = Some(
+                "Playback moved to another seat — released here to avoid double-play.".to_owned(),
+            );
+        }
+    }
+
+    /// Checkpoint the live player into the mesh session record (MEDIA-16) after a
+    /// playback change. A no-op when roaming is not enabled / offline.
+    fn publish_roaming(&mut self) {
+        if let Some(roaming) = self.roaming.as_mut() {
+            roaming.publish(&self.player, unix_millis());
         }
     }
 
@@ -693,8 +769,11 @@ impl<E: MediaEngine> MediaController<E> {
     /// line. This is the whole glue seam (§6): each arm is one core call — the surface
     /// reimplements no playback, queue, or index logic.
     pub fn dispatch(&mut self, action: TransportAction) {
-        if let Err(msg) = self.apply(action) {
-            self.ui.status = Some(msg);
+        match self.apply(action) {
+            Err(msg) => self.ui.status = Some(msg),
+            // A successful playback change checkpoints the mesh session record
+            // (MEDIA-16), so a seat the operator roams to picks up the latest state.
+            Ok(()) => self.publish_roaming(),
         }
     }
 
@@ -1625,6 +1704,91 @@ mod tests {
         c.dispatch(TransportAction::PlayPath("clip.mkv".to_owned()));
         c.pump(); // FileLoaded → Playing
         c
+    }
+
+    // ── session roaming (MEDIA-16) ────────────────────────────────────────────────
+
+    /// The end-to-end surface glue: a paused session on one seat resumes on a second
+    /// seat and releases the first — driven entirely through the controller (dispatch
+    /// → publish, login → resume, poll → release), over a shared tempdir workgroup
+    /// root, so the whole roaming path is exercised with no mesh volume.
+    #[test]
+    fn roaming_resumes_a_paused_session_at_a_new_seat_and_releases_the_old() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+
+        // Seat A: enable roaming, play, then pause at 30s (each dispatch checkpoints).
+        let mut a = controller();
+        let outcome = a.enable_roaming(RoamingSession::new(
+            mde_media_core::RoamingStore::new(root.clone()),
+            "matthew",
+            "seat-a",
+        ));
+        assert_eq!(outcome, LoginOutcome::FreshLease);
+        a.dispatch(TransportAction::PlayPath("movie.mkv".to_owned()));
+        a.pump();
+        a.dispatch(TransportAction::SeekTo(30.0));
+        a.dispatch(TransportAction::TogglePlay); // Playing → Paused
+        assert_eq!(a.player().state(), PlayerState::Paused);
+
+        // Seat B logs in at a NEW seat → resumes where paused.
+        let mut b = controller();
+        let outcome_b = b.enable_roaming(RoamingSession::new(
+            mde_media_core::RoamingStore::new(root.clone()),
+            "matthew",
+            "seat-b",
+        ));
+        assert!(matches!(outcome_b, LoginOutcome::Resumed { .. }));
+        assert_eq!(
+            b.ui().tab,
+            MediaTab::Player,
+            "resume jumps to the Player view"
+        );
+        assert!(b
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("followed you"));
+        b.pump(); // Loading → Playing, then the pending resume seek lands
+        assert_eq!(b.player().state(), PlayerState::Paused);
+        assert!((b.player().position() - 30.0).abs() < f64::EPSILON);
+
+        // Seat A converges: it lost the lease → released (no double-play).
+        a.player_mut().play().expect("A briefly resumes locally");
+        assert_eq!(a.player().state(), PlayerState::Playing);
+        a.poll_roaming();
+        assert_eq!(a.player().state(), PlayerState::Paused);
+        assert!(a
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("another seat"));
+        // B still owns on its own poll.
+        b.poll_roaming();
+        assert_eq!(
+            mde_media_core::RoamingStore::new(root)
+                .owner_seat("matthew")
+                .as_deref(),
+            Some("seat-b")
+        );
+    }
+
+    #[test]
+    fn roaming_is_a_silent_no_op_without_a_mesh_volume() {
+        // A controller with no roaming wired renders + drives exactly as before.
+        let mut c = loaded();
+        assert!(!c.roaming_enabled());
+        c.poll_roaming(); // no-op, no panic
+                          // Enabling over an unprovisioned root is honest offline — no resume, no status.
+        let outcome = c.enable_roaming(RoamingSession::new(
+            mde_media_core::RoamingStore::new(std::path::PathBuf::from("/no/such/mesh/root")),
+            "matthew",
+            "seat-a",
+        ));
+        assert_eq!(outcome, LoginOutcome::Offline);
+        assert!(c.roaming_enabled());
     }
 
     // ── network streams + yt-dlp (MEDIA-12) ──────────────────────────────────────
