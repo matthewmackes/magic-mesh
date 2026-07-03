@@ -934,6 +934,7 @@ mod tests {
         SeatSnapshot {
             bluetooth,
             batteries: absent(),
+            on_ac: absent(),
             power: absent(),
             displays: absent(),
             backlights: absent(),
@@ -1014,6 +1015,7 @@ mod tests {
         SeatSnapshot {
             bluetooth: absent(),
             batteries,
+            on_ac: absent(),
             power: absent(),
             displays: absent(),
             backlights: absent(),
