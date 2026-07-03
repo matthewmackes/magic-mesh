@@ -4130,6 +4130,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mde-media-egui"
+version = "12.0.0"
+dependencies = [
+ "mde-egui",
+ "mde-media-core",
+]
+
+[[package]]
 name = "mde-mesh-view"
 version = "12.0.0"
 dependencies = [
