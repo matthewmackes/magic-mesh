@@ -62,6 +62,12 @@ rustix = { version = "0.38", features = ["std", "termios", "pty", "fs"] }
 # The wire shapes are LOCAL serde mirrors, exactly as `mde-files-egui` mirrors
 # the mesh-mount worker's structs.
 mde-bus = { path = "../../platform/mde-bus" }
+# TERM-10 saved layouts persist to the SAME Syncthing-replicated workgroup root
+# every mesh surface shares. `default_workgroup_root` is single-sourced here (the
+# split-brain fix — one mount resolver for the daemon + every GUI), and the crate
+# is serde-only, so this adds no heavy mesh graph. Mirrors `mde-panel-egui`'s
+# reuse of the same types crate from the desktop tier (§6 glue, not a re-impl).
+mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Terminal output chunks + keystroke input ride the wire base64-encoded (the
@@ -71,6 +77,12 @@ base64 = "0.22"
 # module). Already in the workspace graph (`mde-files`), so it adds no new lock
 # entry; the same `1.x` line resolves.
 regex = "1"
+
+[dev-dependencies]
+# TERM-10 layout-store tests write layouts into a throwaway "synced" root — the
+# same tempdir seam the mesh-side bookmarks/mesh-types tests use. Already in the
+# workspace graph, so it adds no new lock line.
+tempfile = "3"
 
 [lints]
 workspace = true

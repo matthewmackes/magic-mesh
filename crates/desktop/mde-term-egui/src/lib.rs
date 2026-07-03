@@ -66,8 +66,23 @@
 //!   routes a Ctrl-clicked URL to the Bookmarks browser / a path to the Files
 //!   surface over the Bus ([`smart::LaunchBus`], published on
 //!   [`smart::OPEN_TOPIC`]).
+//!
+//! - [`layout`] + [`layout_ui`] (TERM-10) — **mesh-synced saved layouts**. A
+//!   [`layout::SavedLayout`] is the serializable projection of a whole surface:
+//!   every tab's split tree (mirroring [`splits::Pane`] + reusing
+//!   [`splits::SplitDir`]) with, per pane, a relaunch [`layout::PaneSpec`] — a
+//!   local pane's cwd + command, or a remote pane's [`RemoteTarget`].
+//!   [`TabbedTerminal::capture_layout`] reads the live surface into one and
+//!   [`TabbedTerminal::launch_layout`] rebuilds it — respawning local shells and
+//!   reconnecting remote panes through the same TERM-7/8 broker path. Persistence
+//!   is the bookmarks idiom reused verbatim ([`layout::LayoutStore`]): a
+//!   single-writer-per-node directory under the Syncthing-replicated workgroup
+//!   root, so a layout saved on one node is launchable on another once synced.
+//!   [`layout_ui::LayoutManager`] is the save/launch overlay (`Ctrl+Shift+L`).
 
 pub mod engine;
+pub mod layout;
+pub mod layout_ui;
 pub mod palette;
 pub mod picker;
 pub mod pty;
@@ -82,6 +97,8 @@ pub mod tabs;
 pub mod widget;
 
 pub use engine::{Terminal, DEFAULT_SCROLLBACK};
+pub use layout::{LayoutPane, LayoutStore, LayoutTab, PaneSpec, SavedLayout};
+pub use layout_ui::{LayoutIntent, LayoutManager};
 pub use picker::{RemotePicker, RemoteTarget};
 pub use pty::{LocalPty, SpawnOptions};
 pub use remote::{BusPtyClient, PtyBus, RemotePty, RemoteStatus};

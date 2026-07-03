@@ -40,6 +40,8 @@ use mde_egui::egui::{
 };
 use mde_egui::Style;
 
+use crate::layout::SavedLayout;
+use crate::layout_ui::{LayoutIntent, LayoutManager};
 use crate::picker::{RemotePicker, RemoteTarget};
 use crate::pty::SpawnOptions;
 use crate::remote::{BusPtyClient, PtyBus, RemotePty};
@@ -82,6 +84,9 @@ pub enum TabCommand {
     /// Toggle the "new terminal on → <peer>" remote picker (`Ctrl+Shift+R`,
     /// TERM-8) — the keyboard twin of the tab-bar remote button.
     ToggleRemote,
+    /// Toggle the saved-layouts overlay (`Ctrl+Shift+L`, TERM-10) — the keyboard
+    /// twin of the tab-bar layouts button.
+    ToggleLayouts,
 }
 
 /// Decode and **consume** this frame's tab-strip chords before any pane widget
@@ -117,6 +122,9 @@ pub fn consume_tab_commands(ctx: &Context) -> Vec<TabCommand> {
         }
         if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::R) {
             cmds.push(TabCommand::ToggleRemote);
+        }
+        if input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::L) {
+            cmds.push(TabCommand::ToggleLayouts);
         }
         cmds
     })
@@ -210,6 +218,8 @@ pub struct TabbedTerminal {
     error: Option<(String, Instant)>,
     /// The remote-terminal subsystem (TERM-8): the broker seam + roster + picker.
     remote: RemoteHub,
+    /// The saved-layouts overlay + its mesh-synced store (TERM-10).
+    layouts: LayoutManager,
 }
 
 impl TabbedTerminal {
@@ -243,6 +253,7 @@ impl TabbedTerminal {
             drag: None,
             error: None,
             remote,
+            layouts: LayoutManager::local(),
         })
     }
 
@@ -299,6 +310,7 @@ impl TabbedTerminal {
                 }
             }
             TabCommand::ToggleRemote => self.remote.picker.toggle(),
+            TabCommand::ToggleLayouts => self.layouts.toggle(),
         }
     }
 
@@ -319,6 +331,66 @@ impl TabbedTerminal {
         self.active = self.tabs.len() - 1;
     }
 
+    // ── TERM-10: capture the whole surface into a saved layout, and launch one ──
+
+    /// Capture the whole surface — every tab's split tree + per-pane relaunch spec
+    /// — into a named [`SavedLayout`], stamped with the `origin` node. The pure
+    /// projection the [`crate::layout::LayoutStore`] persists to the mesh-synced
+    /// share; empty tabs (none, in practice) are skipped.
+    #[must_use]
+    pub fn capture_layout(
+        &self,
+        name: impl Into<String>,
+        origin: impl Into<String>,
+    ) -> SavedLayout {
+        let tabs = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.term.capture_tab(t.title.clone()))
+            .collect();
+        SavedLayout {
+            name: name.into(),
+            origin: origin.into(),
+            tabs,
+            active: self.active,
+        }
+    }
+
+    /// Launch a saved layout: **append** each of its tabs to the surface,
+    /// rebuilding every pane — local shells respawned at their saved cwd +
+    /// command, remote panes reconnected to their target node over the TERM-7
+    /// broker — and focus the first appended tab. Appending (rather than replacing)
+    /// keeps the current work intact, so a layout is a repeatable add-on anywhere.
+    /// Returns the number of tabs added.
+    ///
+    /// # Errors
+    /// The first local shell's spawn failure ([`SplitTerminal::from_layout`]);
+    /// tabs opened before it stay open (the surface never half-closes).
+    pub fn launch_layout(&mut self, layout: &SavedLayout) -> io::Result<usize> {
+        let base = self.spawn_opts.clone();
+        let cols = self.spawn_opts.cols;
+        let rows = self.spawn_opts.rows;
+        let first_new = self.tabs.len();
+        for lt in &layout.tabs {
+            let term = {
+                // Disjoint field borrow: the remote hub (shared) mints each remote
+                // pane; the tab vec is pushed after this block releases the borrow.
+                let remote = &self.remote;
+                let mut make_remote =
+                    |target: &RemoteTarget| remote.make_remote(target, cols, rows);
+                SplitTerminal::from_layout(lt, base.clone(), &mut make_remote)?
+            };
+            let title = self.next_no.to_string();
+            self.tabs.push(Tab { term, title });
+            self.next_no += 1;
+        }
+        let added = self.tabs.len() - first_new;
+        if added > 0 {
+            self.active = first_new;
+        }
+        Ok(added)
+    }
+
     /// Render the remote picker overlay (when open) and open a tab on a pick.
     fn show_remote_picker(&mut self, ctx: &Context) {
         // Disjoint field borrows: the picker (mut) reads the roster (shared).
@@ -328,6 +400,24 @@ impl TabbedTerminal {
         };
         if let Some(target) = target {
             self.open_remote_tab(&target);
+        }
+    }
+
+    /// Render the saved-layouts overlay (when open) and act on its intent: a save
+    /// captures this whole surface and persists it (stamped with this node); a
+    /// launch rebuilds the stored arrangement, appending its tabs.
+    fn show_layout_overlay(&mut self, ctx: &Context) {
+        match self.layouts.show(ctx) {
+            Some(LayoutIntent::Save(name)) => {
+                let origin = crate::layout::local_node();
+                let layout = self.capture_layout(name, origin);
+                self.layouts.persist(&layout);
+            }
+            Some(LayoutIntent::Launch(layout)) => {
+                let added = self.launch_layout(&layout);
+                self.layouts.note_launch(&layout.name, &added);
+            }
+            None => {}
         }
     }
 
@@ -421,6 +511,9 @@ impl TabbedTerminal {
         self.paint_error(ui, body);
         // The remote picker floats over the body (TERM-8); a pick opens a tab.
         self.show_remote_picker(ui.ctx());
+        // The saved-layouts overlay floats over the body (TERM-10); save captures
+        // this surface, launch rebuilds a stored one.
+        self.show_layout_overlay(ui.ctx());
 
         // A tab whose last pane just closed empties its split terminal — close
         // the tab (the tab-level echo of TERM-4's last-pane lifecycle).
@@ -448,15 +541,23 @@ impl TabbedTerminal {
             pos2(bar.max.x - TAB_BAR_H, bar.min.y),
             vec2(TAB_BAR_H, TAB_BAR_H),
         );
-        // The remote-terminal button sits just left of the new-tab `+` (TERM-8).
+        // The remote-terminal button sits just left of the new-tab `+` (TERM-8),
+        // and the saved-layouts button just left of that (TERM-10).
         let remote_rect = Rect::from_min_size(
             pos2(new_rect.min.x - TAB_BAR_H, bar.min.y),
             vec2(TAB_BAR_H, TAB_BAR_H),
         );
-        let strip = Rect::from_min_max(bar.min, pos2(remote_rect.min.x, bar.max.y));
+        let layouts_rect = Rect::from_min_size(
+            pos2(remote_rect.min.x - TAB_BAR_H, bar.min.y),
+            vec2(TAB_BAR_H, TAB_BAR_H),
+        );
+        let strip = Rect::from_min_max(bar.min, pos2(layouts_rect.min.x, bar.max.y));
 
         let slots = self.tab_slots(ui, strip);
         self.paint_tabs(ui, strip, &slots);
+        if Self::paint_layouts_button(ui, layouts_rect, self.layouts.is_open()) {
+            self.layouts.toggle();
+        }
         if Self::paint_remote_button(ui, remote_rect, self.remote.picker.is_open()) {
             self.remote.picker.toggle();
         }
@@ -631,6 +732,35 @@ impl TabbedTerminal {
             rect.center(),
             Align2::CENTER_CENTER,
             "\u{2325}",
+            FontId::monospace(Style::BODY),
+            if hot { Style::ACCENT } else { Style::TEXT_DIM },
+        );
+        resp.clicked()
+    }
+
+    /// The saved-layouts button (TERM-10): a token plate with a split-pane glyph
+    /// that lights the accent when the overlay is open or hovered. Returns whether
+    /// it was clicked. All `Style` tokens (§4).
+    fn paint_layouts_button(ui: &Ui, rect: Rect, open: bool) -> bool {
+        let resp = ui
+            .interact(rect, ui.id().with("term-layouts-btn"), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("Saved layouts (Ctrl+Shift+L)");
+        let painter = ui.painter();
+        let hot = open || resp.hovered();
+        if hot {
+            painter.rect_filled(rect, 0.0, Style::SURFACE_HI);
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(1.0, Style::ACCENT),
+                StrokeKind::Inside,
+            );
+        }
+        painter.text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "\u{25EB}",
             FontId::monospace(Style::BODY),
             if hot { Style::ACCENT } else { Style::TEXT_DIM },
         );
@@ -1056,5 +1186,123 @@ mod tests {
         // The surface renders the remote pane without panicking.
         settle(&ctx, &mut term, 2);
         assert!(!term.is_empty());
+    }
+
+    // ── saved layouts (TERM-10) ──────────────────────────────────────────────
+
+    #[test]
+    fn ctrl_shift_l_decodes_the_layouts_toggle() {
+        let ctx = Context::default();
+        let raw = RawInput {
+            events: vec![key_event(Key::L, Modifiers::CTRL | Modifiers::SHIFT)],
+            ..RawInput::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            assert_eq!(consume_tab_commands(ctx), vec![TabCommand::ToggleLayouts]);
+        });
+    }
+
+    #[test]
+    fn the_layouts_toggle_opens_and_closes_the_overlay() {
+        let mut term = tabs();
+        assert!(!term.layouts.is_open());
+        term.apply_tab(TabCommand::ToggleLayouts);
+        assert!(term.layouts.is_open(), "the overlay opened");
+        term.apply_tab(TabCommand::ToggleLayouts);
+        assert!(!term.layouts.is_open(), "the overlay closed");
+    }
+
+    #[test]
+    fn capture_then_launch_folds_the_whole_arrangement() {
+        use crate::splits::{Command, Pane, SplitDir};
+
+        let mut term = tabs(); // one tab, one local shell
+                               // Split the active tab so it holds two panes.
+        term.active_mut()
+            .expect("active tab")
+            .apply(Command::Split(SplitDir::V));
+        assert_eq!(term.tab(0).expect("tab 0").session_count(), 2);
+
+        // Capture the surface into a layout.
+        let layout = term.capture_layout("Two panes", "eagle");
+        assert_eq!(layout.tabs.len(), 1);
+        assert_eq!(layout.tabs[0].root.pane_count(), 2);
+        assert_eq!(layout.origin, "eagle");
+
+        // Launch it: a fresh tab is appended, rebuilt to the same shape.
+        let added = term.launch_layout(&layout).expect("launch");
+        assert_eq!(added, 1);
+        assert_eq!(term.tab_count(), 2);
+        let rebuilt = term.tab(1).expect("rebuilt tab");
+        assert_eq!(rebuilt.session_count(), 2, "both panes came back");
+        assert!(matches!(
+            rebuilt.tree(),
+            Some(Pane::Split {
+                dir: SplitDir::V,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_captured_layout_records_local_recipe_and_remote_target() {
+        use crate::layout::LayoutPane;
+
+        let ctx = Context::default();
+        Style::install(&ctx);
+        let (mut term, _bus) = tabs_with_fakes();
+        // Add a remote tab (on oak) beside the first local tab.
+        term.open_remote_tab(&RemoteTarget {
+            peer: "oak".into(),
+            label: "oak".into(),
+        });
+
+        let layout = term.capture_layout("Mixed", "eagle");
+        assert_eq!(layout.tabs.len(), 2);
+
+        // Tab 0: the local shell — its cwd (live, from /proc) + the shell recipe.
+        let LayoutPane::Leaf(local) = &layout.tabs[0].root else {
+            panic!("tab 0 is a lone local pane");
+        };
+        assert!(!local.is_remote());
+        assert_eq!(local.command.as_deref(), Some("/bin/sh"));
+        assert!(local.cwd.is_some(), "captured the live cwd");
+
+        // Tab 1: the remote pane — its target node, ready to reconnect.
+        let LayoutPane::Leaf(remote) = &layout.tabs[1].root else {
+            panic!("tab 1 is a lone remote pane");
+        };
+        assert!(remote.is_remote());
+        assert_eq!(remote.target.as_ref().expect("target").peer, "oak");
+    }
+
+    #[test]
+    fn launching_a_remote_layout_reconnects_to_its_target_node() {
+        use crate::layout::{LayoutPane, LayoutTab, PaneSpec, SavedLayout};
+
+        let (mut term, bus) = tabs_with_fakes();
+        // A layout whose single pane is a remote shell on oak.
+        let layout = SavedLayout {
+            name: "On oak".into(),
+            origin: "eagle".into(),
+            tabs: vec![LayoutTab {
+                title: "1".into(),
+                root: LayoutPane::leaf(PaneSpec::remote(RemoteTarget {
+                    peer: "oak".into(),
+                    label: "oak".into(),
+                })),
+            }],
+            active: 0,
+        };
+
+        let added = term.launch_layout(&layout).expect("launch");
+        assert_eq!(added, 1);
+        let rebuilt = term.tab(term.active_index()).expect("rebuilt tab");
+        assert_eq!(rebuilt.session_count(), 1);
+
+        // Rebuilding the remote pane drove the TERM-7 broker: an `open` verb to
+        // oak's topic slot — the reconnect request, really constructed (§7).
+        assert_eq!(bus.verb_count("open"), 1);
+        assert_eq!(bus.published()[0].peer, "oak");
     }
 }

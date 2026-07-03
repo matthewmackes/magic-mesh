@@ -54,7 +54,10 @@ use mde_egui::egui::{
 };
 use mde_egui::Style;
 
+use crate::layout::{cwd_of_pid, LayoutPane, LayoutTab, PaneSpec};
+use crate::picker::RemoteTarget;
 use crate::pty::{LocalPty, SpawnOptions};
+use crate::remote::RemotePty;
 use crate::widget::{chip, TerminalWidget};
 
 /// Divider strip thickness in points — the visible gap between sibling panes.
@@ -96,7 +99,10 @@ pub struct SessionId(pub u64);
 /// Named after the **cut**, exactly as Terminator names its actions: `H` is
 /// "split horizontally" (a horizontal divider — children stacked above/below),
 /// `V` is "split vertically" (a vertical divider — children side-by-side).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+///
+/// Serde-serializable so a saved layout (TERM-10) records the surface's own cut
+/// direction rather than a parallel copy.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum SplitDir {
     /// A horizontal cut: child `a` above, child `b` below.
     H,
@@ -845,6 +851,118 @@ impl SplitTerminal {
     #[must_use]
     pub const fn focused_session(&self) -> SessionId {
         self.focused
+    }
+
+    /// The split tree, for reading the layout out (TERM-10 capture); `None` once
+    /// every pane has closed.
+    #[must_use]
+    pub const fn tree(&self) -> Option<&Pane> {
+        self.tree.as_ref()
+    }
+
+    // ── TERM-10: capture this tab into a saved layout, and rebuild one ──────────
+
+    /// Capture this tab's live arrangement into a serializable [`LayoutTab`]: the
+    /// split tree's exact shape (reusing [`Pane`] + [`SplitDir`]) plus each pane's
+    /// relaunch spec. `None` when the tab is empty (nothing to save).
+    #[must_use]
+    pub fn capture_tab(&self, title: impl Into<String>) -> Option<LayoutTab> {
+        let root = self.capture_pane(self.tree.as_ref()?);
+        Some(LayoutTab {
+            title: title.into(),
+            root,
+        })
+    }
+
+    /// Project the runtime [`Pane`] tree into a [`LayoutPane`] tree, resolving each
+    /// leaf's [`SessionId`] into its relaunch [`PaneSpec`].
+    fn capture_pane(&self, node: &Pane) -> LayoutPane {
+        match node {
+            Pane::Leaf(id) => LayoutPane::Leaf(self.capture_spec(*id)),
+            Pane::Split { dir, ratio, a, b } => LayoutPane::Split {
+                dir: *dir,
+                ratio: *ratio,
+                a: Box::new(self.capture_pane(a)),
+                b: Box::new(self.capture_pane(b)),
+            },
+        }
+    }
+
+    /// The relaunch spec for one live leaf: a remote pane records its target node
+    /// (peer + marker); a local pane records its live cwd (from `/proc`) and the
+    /// tab's shell recipe. A vanished id degrades to a default local pane.
+    fn capture_spec(&self, id: SessionId) -> PaneSpec {
+        let Some(widget) = self.sessions.get(&id) else {
+            return PaneSpec::default();
+        };
+        if let Some(target) = widget.remote_target() {
+            return PaneSpec::remote(target);
+        }
+        let cwd = widget
+            .local_pty()
+            .and_then(|pty| cwd_of_pid(pty.child_pid()));
+        PaneSpec::local(cwd, self.spawn_opts.shell.clone())
+    }
+
+    /// Rebuild a whole tab from a saved [`LayoutTab`]: recreate the split tree's
+    /// shape, spawning a fresh local shell for each local pane (at its saved cwd +
+    /// command) and reconnecting each remote pane through `make_remote` (the
+    /// TERM-7 broker path). `base` is the fallback spawn recipe for the tab's
+    /// local panes.
+    ///
+    /// # Errors
+    /// The first local shell's spawn failure (whatever the OS refused) — the same
+    /// contract as [`Self::new`]; remote panes never fail to *open* (an
+    /// unreachable node surfaces its own honest chip).
+    pub fn from_layout(
+        tab: &LayoutTab,
+        base: SpawnOptions,
+        make_remote: &mut impl FnMut(&RemoteTarget) -> RemotePty,
+    ) -> io::Result<Self> {
+        let mut this = Self::bare(base);
+        let tree = this.build_pane(&tab.root, make_remote)?;
+        let first = tree.first_leaf();
+        this.tree = Some(tree);
+        this.focused = first;
+        Ok(this)
+    }
+
+    /// Recursively rebuild one [`LayoutPane`] into a live [`Pane`], minting a fresh
+    /// [`SessionId`] + widget per leaf and inserting it into the registry.
+    fn build_pane(
+        &mut self,
+        node: &LayoutPane,
+        make_remote: &mut impl FnMut(&RemoteTarget) -> RemotePty,
+    ) -> io::Result<Pane> {
+        match node {
+            LayoutPane::Leaf(spec) => {
+                let id = SessionId(self.next_id);
+                self.next_id += 1;
+                let widget = match &spec.target {
+                    Some(target) => TerminalWidget::new_remote(make_remote(target)),
+                    None => {
+                        let opts = SpawnOptions {
+                            cwd: spec.cwd.clone(),
+                            shell: spec.command.clone(),
+                            ..self.spawn_opts.clone()
+                        };
+                        TerminalWidget::new(LocalPty::spawn(opts)?)
+                    }
+                };
+                self.sessions.insert(id, widget);
+                Ok(Pane::Leaf(id))
+            }
+            LayoutPane::Split { dir, ratio, a, b } => {
+                let a = self.build_pane(a, make_remote)?;
+                let b = self.build_pane(b, make_remote)?;
+                Ok(Pane::Split {
+                    dir: *dir,
+                    ratio: clamp_ratio(*ratio),
+                    a: Box::new(a),
+                    b: Box::new(b),
+                })
+            }
+        }
     }
 
     /// Apply one keyboard [`Command`].
@@ -2373,5 +2491,54 @@ mod tests {
             !term.is_empty(),
             "a live remote pane keeps the surface open"
         );
+    }
+
+    // ── TERM-10: rebuild a tab from a saved layout ──────────────────────────────
+
+    #[test]
+    fn from_layout_rebuilds_a_nested_local_tree_and_recaptures_identically() {
+        use crate::layout::{LayoutPane, LayoutTab, PaneSpec};
+
+        // A three-pane tree: an H-split of one pane over a V-split of two panes.
+        let leaf = || LayoutPane::leaf(PaneSpec::local(None, Some("/bin/sh".into())));
+        let tab = LayoutTab {
+            title: "1".into(),
+            root: LayoutPane::Split {
+                dir: SplitDir::H,
+                ratio: 0.5,
+                a: Box::new(leaf()),
+                b: Box::new(LayoutPane::Split {
+                    dir: SplitDir::V,
+                    ratio: 0.5,
+                    a: Box::new(leaf()),
+                    b: Box::new(leaf()),
+                }),
+            },
+        };
+        // No remote panes here — the reconnect closure must never fire.
+        let mut make_remote =
+            |_: &RemoteTarget| -> RemotePty { unreachable!("this layout has no remote panes") };
+        let term = SplitTerminal::from_layout(&tab, sh_opts(), &mut make_remote).expect("rebuild");
+
+        // Every leaf became a real local shell, and the tree kept its shape.
+        assert_eq!(term.session_count(), 3, "three local shells rebuilt");
+        assert!(matches!(
+            term.tree(),
+            Some(Pane::Split {
+                dir: SplitDir::H,
+                ..
+            })
+        ));
+
+        // Round-trip: capturing the rebuilt surface reproduces the same shape.
+        let recaptured = term.capture_tab("1").expect("capture the rebuilt tree");
+        assert_eq!(recaptured.root.pane_count(), 3);
+        assert!(matches!(
+            recaptured.root,
+            LayoutPane::Split {
+                dir: SplitDir::H,
+                ..
+            }
+        ));
     }
 }

@@ -102,6 +102,16 @@ impl Session {
         }
     }
 
+    /// The remote shell, when this is a remote session (TERM-10 layout capture
+    /// reads its peer + node marker through it).
+    #[must_use]
+    pub fn remote(&self) -> Option<&RemotePty> {
+        match self {
+            Self::Remote(remote) => Some(remote.as_ref()),
+            Self::Local(_) => None,
+        }
+    }
+
     /// This frame's render chrome — liveness, node marker, honest status note.
     #[must_use]
     pub fn render_state(&self) -> RenderState {

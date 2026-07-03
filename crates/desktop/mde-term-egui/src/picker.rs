@@ -33,7 +33,10 @@ const PIP_RADIUS: f32 = 4.0;
 
 /// A chosen remote target: the mesh peer short-name (the `action/pty/<peer>` verb
 /// slot) and a display label for the pane's node marker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serde-serializable so a saved layout (TERM-10) records a remote pane's target
+/// node and, on launch, feeds this exact struct back into the remote-open path.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RemoteTarget {
     /// The mesh peer short-name — the broker verb slot + the ssh `<peer>.mesh` host.
     pub peer: String,

@@ -20,6 +20,13 @@
 //! that mesh node, driven over the TERM-7 broker. That wiring lives in
 //! [`TabbedTerminal`]; the `TabbedTerminal::new` here resolves the live Bus +
 //! roster from the environment ([`mde_term_egui::RemoteHub::from_env`]).
+//!
+//! TERM-10 adds **saved layouts**: the tab bar's split-pane button (or
+//! `Ctrl+Shift+L`) opens the saved-layouts overlay — save the current tab/split
+//! arrangement under a name, or launch any layout the mesh has synced here.
+//! Layouts persist to the Syncthing-replicated workgroup root (the bookmarks
+//! store idiom), so one saved on any node is launchable on another; the wiring
+//! (capture + rebuild + the synced store) all lives in [`TabbedTerminal`].
 
 use mde_egui::{eframe, egui, run_client, Style};
 use mde_term_egui::{consume_commands, consume_tab_commands, SpawnOptions, TabbedTerminal};

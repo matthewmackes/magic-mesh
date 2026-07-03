@@ -290,6 +290,18 @@ impl TerminalWidget {
         self.session.local()
     }
 
+    /// This pane's remote target — its peer + node marker — when it is a remote
+    /// shell (TERM-10 layout capture records it); `None` for a local pane. Rebuilt
+    /// straight into the remote-open path, so a saved remote pane reconnects to
+    /// the same node.
+    #[must_use]
+    pub fn remote_target(&self) -> Option<crate::picker::RemoteTarget> {
+        self.session.remote().map(|r| crate::picker::RemoteTarget {
+            peer: r.peer().to_string(),
+            label: r.node_label().to_string(),
+        })
+    }
+
     /// Render one frame into `ui`, consuming this frame's input. Fills all
     /// available space.
     pub fn show(&mut self, ui: &mut Ui) -> Response {
