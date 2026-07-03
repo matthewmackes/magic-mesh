@@ -205,6 +205,64 @@ impl SelfTestReport {
     }
 }
 
+// ───────────────────────── OW-10 §6 wire mirror + Bus publish ─────────────────────────
+
+/// Bus topic the onboard self-test verdict is published on.
+///
+/// The `event/<domain>/<verb>` lane named alongside the sibling onboard verbs'
+/// `event/onboard/apply` (`workers::onboard_apply`) and `event/onboard/service-add`
+/// (`workers::service_onboard`). The egui shell tails this and opens its Mesh Map
+/// when a green verdict lands.
+pub const EVENT_TOPIC: &str = "event/onboard/self-test";
+
+/// §6 wire mirror of the self-test's overall pass/fail.
+///
+/// The ONLY thing that crosses the tier boundary. The full [`SelfTestReport`]
+/// (its per-check bodies) stays mackesd-internal; the shell — which never links
+/// the daemon crate — decodes just this minimal verdict, the same wire-mirror
+/// discipline the other onboard verbs use rather than publishing the internal
+/// report type. `ok` mirrors [`SelfTestReport::ok`] verbatim: a green verdict iff
+/// no *critical* check failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SelfTestVerdict {
+    /// The overall pass/fail — `true` iff every critical check passed.
+    pub ok: bool,
+}
+
+impl SelfTestReport {
+    /// The §6 wire verdict for this report — the overall `ok`, nothing else.
+    #[must_use]
+    pub const fn verdict(&self) -> SelfTestVerdict {
+        SelfTestVerdict { ok: self.ok }
+    }
+
+    /// Publish this report's [`SelfTestVerdict`] on [`EVENT_TOPIC`] through the
+    /// injected `publish` seam. The body is the serialized wire mirror —
+    /// `{"ok":true}` / `{"ok":false}` — exactly what the shell's decoder reads.
+    /// Pure but for the seam (no subprocess, no I/O), so the request→publish
+    /// wiring is unit-testable with a recorder in place of `mde-bus`.
+    pub fn publish_verdict_with(&self, publish: impl FnOnce(&str, &str)) {
+        // `SelfTestVerdict` is a plain `{ ok: bool }` — serialization is
+        // infallible, but degrade honestly to a red verdict rather than unwrap.
+        let body = serde_json::to_string(&self.verdict())
+            .unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+        publish(EVENT_TOPIC, &body);
+    }
+
+    /// Production publish: shell `mde-bus publish event/onboard/self-test
+    /// --body-flag <json>` through the detached reaper — the SAME one-shot
+    /// `mde-bus publish` path [`crate::ca::revoke`] fires on, never a new
+    /// transport. Best-effort: a missing `mde-bus` (pre-RPM dev box) or a failed
+    /// spawn is swallowed, exactly like every other fire-and-forget Bus publish.
+    pub fn publish_verdict(&self) {
+        self.publish_verdict_with(|topic, body| {
+            let mut cmd = std::process::Command::new("mde-bus");
+            cmd.args(["publish", topic, "--body-flag", body]);
+            crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
+        });
+    }
+}
+
 /// Pure fold: turn gathered [`Probes`] into a [`SelfTestReport`]. No I/O, no
 /// clock, no systemd — fully unit-testable. The verdict ([`SelfTestReport::ok`])
 /// is `false` iff a *critical* check failed.
@@ -667,6 +725,57 @@ mod tests {
 
     fn check<'a>(r: &'a SelfTestReport, id: &str) -> &'a Check {
         r.checks.iter().find(|c| c.id == id).expect("check present")
+    }
+
+    /// Drive the publish seam with a recorder in place of `mde-bus` and return the
+    /// `(topic, body)` it emitted — the exact wire the egui shell decodes.
+    fn published(r: &SelfTestReport) -> (String, String) {
+        let mut captured: Option<(String, String)> = None;
+        r.publish_verdict_with(|topic, body| {
+            captured = Some((topic.to_string(), body.to_string()));
+        });
+        captured.expect("verdict published exactly once")
+    }
+
+    #[test]
+    fn verdict_mirrors_report_ok() {
+        // The wire mirror carries the overall `ok` verbatim — nothing else.
+        assert_eq!(
+            assemble(&probes((6, 6), 3, true, true)).verdict(),
+            SelfTestVerdict { ok: true }
+        );
+        assert_eq!(
+            assemble(&probes((6, 6), 3, false, true)).verdict(),
+            SelfTestVerdict { ok: false }
+        );
+    }
+
+    #[test]
+    fn publishes_green_verdict_when_all_items_pass() {
+        // A fully-healthy node → green verdict → the shell opens the Mesh Map.
+        let r = assemble(&probes((6, 6), 3, true, true));
+        assert!(r.ok, "healthy node is a green verdict");
+        let (topic, body) = published(&r);
+        // The exact topic + payload the shell's `SelfTestVerdict { ok }` decoder
+        // reads — a green verdict is the map-open signal.
+        assert_eq!(topic, "event/onboard/self-test");
+        assert_eq!(body, r#"{"ok":true}"#);
+        // Round-trips back through the wire mirror the shell deserializes.
+        let v: SelfTestVerdict = serde_json::from_str(&body).expect("wire mirror parses");
+        assert!(v.ok);
+    }
+
+    #[test]
+    fn publishes_red_verdict_when_a_critical_check_fails() {
+        // Missing identity → critical Fail → NOT ok. The verdict still publishes,
+        // but `{"ok":false}` — the shell must keep the map closed (no-open).
+        let r = assemble(&probes((6, 6), 3, false, true));
+        assert!(!r.ok);
+        let (topic, body) = published(&r);
+        assert_eq!(topic, "event/onboard/self-test");
+        assert_eq!(body, r#"{"ok":false}"#);
+        let v: SelfTestVerdict = serde_json::from_str(&body).expect("wire mirror parses");
+        assert!(!v.ok, "a red verdict — the shell keeps the map closed");
     }
 
     #[test]

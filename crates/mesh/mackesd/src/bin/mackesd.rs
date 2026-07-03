@@ -2434,6 +2434,13 @@ fn main() -> anyhow::Result<()> {
                 let root = mackesd_core::default_qnm_shared_root();
                 let probes = mackesd_core::onboard::self_test::gather(&node_id, &db_path, &root);
                 let report = mackesd_core::onboard::self_test::assemble(&probes);
+                // OW-10 (send half) — publish the overall verdict on the mesh Bus
+                // (`event/onboard/self-test`) so the egui shell's Mesh Map opens
+                // when onboarding goes all-green. Best-effort, before the print +
+                // verdict exit; the same one-shot `mde-bus publish` path
+                // `ca::revoke` fires on. The published `{ ok }` is the REAL
+                // computed verdict (green iff no critical check failed).
+                report.publish_verdict();
                 if json {
                     println!("{}", serde_json::to_string(&report)?);
                 } else {
