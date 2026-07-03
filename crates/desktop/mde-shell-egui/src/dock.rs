@@ -74,6 +74,12 @@ pub(crate) enum Surface {
     /// Segment bars + partition tables + a typed-armed pending-op queue, for this
     /// node and any mesh peer; the `mackesd` storage worker owns the walls + executor.
     Storage,
+    /// The About surface — the canonical "about this platform" screen (QBRAND-6,
+    /// placement lock #13): the official `MDE-QUAZAR-MAIN.png` lockup, the product
+    /// name + tagline, the full build identity (version · git hash · date · channel),
+    /// and the shipped legal docs + source URL. A pure renderer of the
+    /// [`mde_theme::brand`] constants (`crate::about`).
+    About,
 }
 
 // This nav enum spells its variants `Surface::Music` rather than `Self::Music` on
@@ -85,9 +91,9 @@ impl Surface {
     /// The dock entries in nav order — the Workbench (mesh-control home) first,
     /// then the live Mesh Map, then the local VM Instances broker + the brokered
     /// Desktop, then the three app surfaces, then the unified Chat surface (the ONE
-    /// notification interface), and finally this seat's host-controls System +
-    /// Storage surfaces.
-    pub(crate) const ALL: [Surface; 13] = [
+    /// notification interface), then this seat's host-controls System + Storage
+    /// surfaces, and finally the About surface (the platform-identity screen).
+    pub(crate) const ALL: [Surface; 14] = [
         Surface::Workbench,
         Surface::MeshView,
         Surface::Instances,
@@ -101,6 +107,7 @@ impl Surface {
         Surface::Chat,
         Surface::System,
         Surface::Storage,
+        Surface::About,
     ];
 
     /// The short dock label.
@@ -119,6 +126,7 @@ impl Surface {
             Surface::Chat => "Chat",
             Surface::System => "System",
             Surface::Storage => "Storage",
+            Surface::About => "About",
         }
     }
 
@@ -159,6 +167,9 @@ impl Surface {
             Surface::Storage => {
                 "Disks & partitions across the mesh — stage a queue, arm the target, apply."
             }
+            Surface::About => {
+                "About MDE Quazar — the product lockup, the full build identity, and the shipped licenses."
+            }
         }
     }
 
@@ -182,6 +193,10 @@ impl Surface {
             Surface::Chat => IconId::Chat,
             Surface::System => IconId::System,
             Surface::Storage => IconId::Storage,
+            // The About surface wears the product **mark** — the mesh-node
+            // constellation glyph that IS the platform identity — fitting the
+            // "about this platform" screen and distinct from every surface glyph.
+            Surface::About => IconId::Mark,
         }
     }
 }
@@ -336,15 +351,15 @@ mod tests {
 
     #[test]
     fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
-        // Thirteen entries: Workbench first, the live Mesh Map (OW-10, `mde-mesh-view`),
+        // Fourteen entries: Workbench first, the live Mesh Map (OW-10, `mde-mesh-view`),
         // two VM surfaces (Instances / Desktop), the app surfaces (Music / Media — the
         // full media player, MEDIA-18 / Files / Voice / Browser — the sandboxed Servo
         // browser, BOOKMARKS-6 / Terminal — the Terminator-class terminal over a real
         // PTY, TERM-16), the unified Chat surface (the ONE notification interface — the
         // standalone Notifications + Clipboard surfaces are retired, NOTIFY-CHAT-6), the
-        // host-controls System surface, and the Storage surface (GParted-authentic disk
-        // mgmt, E12-21).
-        assert_eq!(Surface::ALL.len(), 13);
+        // host-controls System surface, the Storage surface (GParted-authentic disk
+        // mgmt, E12-21), and the About surface (the platform-identity screen, QBRAND-6).
+        assert_eq!(Surface::ALL.len(), 14);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
             Surface::MeshView,
@@ -359,6 +374,7 @@ mod tests {
             Surface::Chat,
             Surface::System,
             Surface::Storage,
+            Surface::About,
         ] {
             assert!(Surface::ALL.contains(&s), "{s:?} missing from the dock");
         }
@@ -406,11 +422,16 @@ mod tests {
             (Surface::Chat, IconId::Chat),
             (Surface::System, IconId::System),
             (Surface::Storage, IconId::Storage),
+            (Surface::About, IconId::Mark),
         ];
         assert_eq!(cases.len(), Surface::ALL.len(), "a surface is unmapped");
         for (surface, id) in cases {
             assert_eq!(surface.icon_id(), id, "{surface:?} → wrong glyph");
-            assert_ne!(id, IconId::Wordmark, "{surface:?} maps to the blank wordmark");
+            assert_ne!(
+                id,
+                IconId::Wordmark,
+                "{surface:?} maps to the blank wordmark"
+            );
         }
         // The map is injective — 13 surfaces, 13 distinct glyph names.
         let mut names: Vec<&str> = Surface::ALL.iter().map(|s| s.icon_id().name()).collect();

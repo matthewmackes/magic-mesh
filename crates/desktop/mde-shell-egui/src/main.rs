@@ -14,6 +14,7 @@
 //! the skeleton the panels (Workbench/Files/Music/Voice) and the VM session-view
 //! plug into.
 
+mod about;
 mod auth;
 mod backdrop;
 mod chat;
@@ -497,6 +498,14 @@ impl Shell {
                 // `push_id` like every surface; the storage worker owns the walls.
                 let storage = &mut self.storage;
                 ui.push_id("shell-storage", |ui| storage.show(ui));
+            }
+            Surface::About => {
+                // The platform-identity screen (QBRAND-6): the brand lockup, the
+                // product name + tagline, the full build stamp, and the shipped
+                // legal docs. A pure renderer of the `mde_theme::brand` constants —
+                // it holds no shell state and drives no worker — scoped under its
+                // own `push_id` like every mounted surface.
+                ui.push_id("shell-about", about::about_panel);
             }
         }
     }
