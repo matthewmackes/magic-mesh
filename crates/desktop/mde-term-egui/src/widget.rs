@@ -775,7 +775,15 @@ fn paint_cursor(painter: &egui::Painter, origin: Pos2, screen: &Screen, spec: &P
 }
 
 /// A small status chip: SURFACE plate, hairline border, dimmed label.
-fn chip(painter: &egui::Painter, at: Pos2, anchor: Align2, label: &str, color: egui::Color32) {
+/// Crate-shared: the split surface (TERM-4) paints its zoom/error chips
+/// through the same primitive, so all terminal chrome chips match.
+pub(crate) fn chip(
+    painter: &egui::Painter,
+    at: Pos2,
+    anchor: Align2,
+    label: &str,
+    color: egui::Color32,
+) {
     let galley = painter.layout_no_wrap(label.to_owned(), FontId::monospace(Style::SMALL), color);
     let text_rect = anchor.anchor_size(at, galley.size() + Vec2::splat(2.0 * Style::SP_XS));
     painter.rect_filled(text_rect, Style::RADIUS, Style::SURFACE);

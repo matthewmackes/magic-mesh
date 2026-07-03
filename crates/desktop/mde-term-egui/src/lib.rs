@@ -21,20 +21,29 @@
 //!   palette), block cursor, mouse selection + clipboard, a scrollback
 //!   viewport, and rect→cols/rows resizing wired to the PTY. The `mde-term-egui`
 //!   binary mounts one over a login shell on the shared harness.
+//! - [`splits`] (TERM-4) — Terminator's split model: a pure
+//!   `Leaf | Split { dir, ratio, a, b }` binary tree (split to any depth,
+//!   close-collapses, drag-reparent — all unit-tested headless) rendered by
+//!   [`splits::SplitTerminal`], which multiplexes one TERM-3 widget per leaf
+//!   over a session registry. Draggable Style-token dividers, zoom
+//!   (maximize/restore), Alt-drag rearrange, and focus that follows clicks,
+//!   splits, closes and `Alt+arrow` navigation. The binary now mounts it.
 //! - [`palette`] — the 16/256-colour **content** palette (the documented §4
 //!   carve-out): Quasar-token-derived where a token carries the meaning,
 //!   standard ANSI hues elsewhere; the only raw colour values in the crate.
 //!
-//! The mackesd mesh PTY broker, splits, tabs, and broadcast arrive in TERM-4
+//! Tabs, broadcast input, and the mackesd mesh PTY broker arrive in TERM-5
 //! onward.
 
 pub mod engine;
 pub mod palette;
 pub mod pty;
 pub mod screen;
+pub mod splits;
 pub mod widget;
 
 pub use engine::{Terminal, DEFAULT_SCROLLBACK};
 pub use pty::{LocalPty, SpawnOptions};
 pub use screen::{Cell, CellAttrs, CellColor, CursorPos, Screen};
+pub use splits::{consume_commands, Command, NavDir, Pane, SessionId, SplitDir, SplitTerminal};
 pub use widget::TerminalWidget;
