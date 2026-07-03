@@ -45,6 +45,7 @@ use mde_seat::{
 
 use crate::bt_pairing::{pairing_dialog, PairingBridge};
 use crate::instances::InstancesState;
+use crate::power_settings;
 
 /// Poll cadence — a device plug, a battery drain, or a BT connect surfaces within
 /// this window.
@@ -81,6 +82,10 @@ pub(crate) struct SystemState {
     ddc_brightness: BTreeMap<String, u8>,
     /// An armed power verb awaiting its second (confirm) click (lock 12).
     confirm: Option<PowerVerb>,
+    /// Live battery charge-stop cap (0–100) the POWER-4 threshold slider owns,
+    /// seeded from the snapshot's `charge_limit` so a drag stays smooth. `None`
+    /// until a battery is seen advertising the attribute (`Present(Some(_))`).
+    charge_threshold: Option<u8>,
     /// The last control action's honest inline error (a refused write / interlock).
     error: Option<String>,
     /// Publishes each fresh snapshot to the node-local mirror topic so the `mackesd`
@@ -114,6 +119,7 @@ impl Default for SystemState {
             panel_brightness: BTreeMap::new(),
             ddc_brightness: BTreeMap::new(),
             confirm: None,
+            charge_threshold: None,
             error: None,
             mirror: crate::host_mirror::HostMirrorPublisher::default(),
             pairing: PairingBridge::default(),
@@ -127,7 +133,10 @@ impl Default for SystemState {
 
 /// One control action collected during the render borrow, applied after it ends
 /// (the egui idiom the Instances panel uses) so the drive can take `&mut` freely.
-enum SysAction {
+///
+/// `pub(crate)` so the POWER-4 body-builders in [`crate::power_settings`] emit the
+/// same actions the section's `apply()` drives.
+pub(crate) enum SysAction {
     /// Enable/disable an output (gated by the last-console interlock).
     ToggleOutput(MonitorId, bool),
     /// Choose an output's mode.
@@ -144,6 +153,12 @@ enum SysAction {
     Power(PowerVerb),
     /// Cancel an armed confirmation.
     CancelConfirm,
+    /// Switch the active power profile (POWER-4) — routed to
+    /// [`Seat::set_power_profile`]; only ever an offered profile name.
+    SetPowerProfile(String),
+    /// Set the battery charge-stop cap 0–100 (POWER-4) — routed to
+    /// [`Seat::set_charge_threshold`].
+    SetChargeThreshold(u8),
     /// Drive a VM power verb through the Instances broker (§6).
     VmPower { idx: usize, boot: bool },
     // ── Bluetooth control verbs (E12-17) ────────────────────────────────────
@@ -209,6 +224,11 @@ impl SystemState {
                     .or_insert(d.brightness);
             }
         }
+        // Seed the charge-cap slider from the first battery that advertises the
+        // attribute, without clobbering an in-flight operator drag (POWER-4).
+        if let Probe::Present(Some(pct)) = &snap.charge_limit {
+            self.charge_threshold.get_or_insert(*pct);
+        }
     }
 
     /// The latest seat snapshot, for the chrome status icons ([`crate::chrome`]).
@@ -227,6 +247,7 @@ impl SystemState {
                 panel_brightness,
                 ddc_brightness,
                 confirm,
+                charge_threshold,
                 error,
                 pairing,
                 pin_input,
@@ -256,7 +277,14 @@ impl SystemState {
                         );
                     });
                     section(ui, "Power & Battery", |ui| {
-                        power_section(ui, snap, *confirm, instances, &mut actions);
+                        power_section(
+                            ui,
+                            snap,
+                            *confirm,
+                            charge_threshold,
+                            instances,
+                            &mut actions,
+                        );
                     });
                     section(ui, "Wallpaper", wallpaper_section);
                     section(ui, "Hotkeys", hotkeys_section);
@@ -312,6 +340,12 @@ impl SystemState {
                         self.error = None;
                     }
                 }
+                // POWER-4: the profile switch + charge-cap write route to their
+                // own drive methods (mirroring the mixer/BT verb helpers) so each
+                // folds a typed failure to the honest inline error, never a pretend
+                // success (§7).
+                SysAction::SetPowerProfile(name) => self.drive_power_profile(name),
+                SysAction::SetChargeThreshold(pct) => self.drive_charge_threshold(pct),
                 SysAction::VmPower { idx, boot } => instances.drive_power(idx, boot),
                 // ── Bluetooth writes (E12-17) — each drives the ONE seat's BlueZ
                 // client, folds a typed failure to the inline error + a toast, and
@@ -376,6 +410,33 @@ impl SystemState {
                     }
                 }
             }
+        }
+    }
+
+    /// Drive a POWER-4 profile switch through the real seat: on success
+    /// optimistically reflect the new active so the segmented control settles
+    /// before the next 5s poll; a refused/absent switch is surfaced honestly and
+    /// the cached active is NOT flipped (§7 — a failed switch never lies "active").
+    fn drive_power_profile(&mut self, name: String) {
+        if let Err(e) = self.seat.set_power_profile(&name) {
+            self.error = Some(power_settings::profile_error(&e));
+        } else {
+            self.error = None;
+            if let Some(Probe::Present(p)) = self.snapshot.as_mut().map(|s| &mut s.power_profile) {
+                p.active = name;
+            }
+        }
+    }
+
+    /// Drive a POWER-4 charge-cap write through the real seat. A refused/absent
+    /// write or the EACCES on the root-owned sysfs attribute is surfaced honestly
+    /// inline, never a pretend cap (§7).
+    fn drive_charge_threshold(&mut self, pct: u8) {
+        if let Err(e) = self.seat.set_charge_threshold(pct) {
+            self.error = Some(power_settings::charge_error(&e));
+        } else {
+            self.error = None;
+            self.charge_threshold = Some(pct);
         }
     }
 
@@ -1240,17 +1301,23 @@ fn is_internal(name: &str) -> bool {
 
 // ──────────────────────────── Power & Battery (E12-18) ────────────────────────────
 
-/// The Power & Battery section — confirm-gated logind verbs, multi-battery
-/// telemetry, and per-VM power rows (reusing the Instances broker, §6).
+/// The Power & Battery section — confirm-gated logind verbs (incl. Hibernate),
+/// the power-profile + charge-cap controls, the on-AC source line, multi-battery
+/// telemetry, and per-VM power rows (reusing the Instances broker, §6). Every
+/// POWER-4 control drives the real seat / reads the real snapshot — no inert
+/// affordance (§7). Idle-suspend + lid-close are deliberately out of scope here
+/// (POWER-5, once the honorer is not inert).
 fn power_section(
     ui: &mut egui::Ui,
     snap: Option<&SeatSnapshot>,
     confirm: Option<PowerVerb>,
+    charge_threshold: &mut Option<u8>,
     instances: &InstancesState,
     actions: &mut Vec<SysAction>,
 ) {
-    // Host power verbs — Lock is always offered; the host-down verbs are gated by
-    // logind's CanX and a two-click confirm (lock 12).
+    // Host power verbs — Lock is always offered; the host-down verbs (Suspend,
+    // Hibernate, Reboot, PowerOff) are gated by logind's CanX and a two-click
+    // confirm (lock 12). Hibernate (POWER-4) rides the same row + gate as Suspend.
     probe_section(
         ui,
         snap,
@@ -1258,12 +1325,36 @@ fn power_section(
         |ui, caps: &PowerCaps| {
             power_verb_row(ui, PowerVerb::Lock, Avail::Yes, confirm, actions);
             power_verb_row(ui, PowerVerb::Suspend, caps.suspend, confirm, actions);
+            power_verb_row(ui, PowerVerb::Hibernate, caps.hibernate, confirm, actions);
             power_verb_row(ui, PowerVerb::Reboot, caps.reboot, confirm, actions);
             power_verb_row(ui, PowerVerb::PowerOff, caps.poweroff, confirm, actions);
         },
     );
 
-    // Batteries (multi + peripherals, lock 6).
+    // Power profile (POWER-4) — the daemon's available set + current active. When
+    // power-profiles-daemon is Absent the probe renders the honest "unavailable"
+    // reason, never a fabricated active (§7).
+    ui.add_space(Style::SP_XS);
+    probe_section(ui, snap, |s| &s.power_profile, |ui, state| {
+        power_settings::profile_body(ui, state, actions);
+    });
+
+    // On-AC / on-battery source line (POWER-4) — the honest UPower LinePower
+    // reading, "unknown" when no adapter is tracked, "unavailable" when Absent.
+    ui.add_space(Style::SP_XS);
+    probe_section(ui, snap, |s| &s.on_ac, |ui, on_ac: &Option<bool>| {
+        power_settings::ac_source_body(ui, *on_ac);
+    });
+
+    // Charge limit (POWER-4) — the charge-stop cap slider when a battery
+    // advertises the attribute, an honest "not supported" when Present(None), and
+    // the probe's "unavailable" reason when Absent (no power-supply class).
+    ui.add_space(Style::SP_XS);
+    probe_section(ui, snap, |s| &s.charge_limit, |ui, cap: &Option<u8>| {
+        power_settings::charge_threshold_body(ui, *cap, charge_threshold, actions);
+    });
+
+    // Batteries (multi + peripherals, lock 6) + rich telemetry (POWER-4).
     ui.add_space(Style::SP_XS);
     probe_section(
         ui,
@@ -1281,6 +1372,13 @@ fn power_section(
                     battery.state.label()
                 );
                 field(ui, &battery.model, &value, Style::TEXT);
+                // Time-to-empty / time-to-full + draw rate when UPower reported
+                // them; an honest omission (no second line) otherwise (§7).
+                if let Some(tele) = power_settings::battery_telemetry(battery) {
+                    ui.indent((battery.model.as_str(), "battery-tele"), |ui| {
+                        muted_note(ui, tele);
+                    });
+                }
             }
         },
     );
@@ -1449,6 +1547,7 @@ fn hotkeys_section(ui: &mut egui::Ui) {
 mod tests {
     use super::*;
     use mde_egui::egui::{pos2, vec2, Rect};
+    use mde_seat::{Battery, BatteryKind, BatteryState, ProfileState};
 
     /// Drive one headless frame of the System panel over a real seat + a given
     /// Instances roster, and tessellate on the CPU (the DRM runner's path minus GPU).
@@ -1560,6 +1659,104 @@ mod tests {
         assert_eq!(st.confirm, Some(PowerVerb::Reboot));
         st.apply(vec![SysAction::CancelConfirm], &mut inst);
         assert!(st.confirm.is_none());
+    }
+
+    // ── Power Settings (POWER-4) ──────────────────────────────────────────────
+
+    #[test]
+    fn a_live_power_panel_renders_the_power4_controls() {
+        // Inject Present POWER-4 probes over an otherwise-real (Absent) snapshot
+        // and prove the profile segmented control, the AC source line, the charge
+        // slider, and the rich battery telemetry all tessellate real geometry —
+        // reachable controls driving the real seat, not a mockup.
+        let mut st = SystemState::default();
+        let mut snap = Seat::new().snapshot();
+        snap.power_profile = Probe::Present(ProfileState {
+            active: "balanced".to_owned(),
+            available: vec![
+                "power-saver".to_owned(),
+                "balanced".to_owned(),
+                "performance".to_owned(),
+            ],
+        });
+        snap.on_ac = Probe::Present(Some(false));
+        snap.charge_limit = Probe::Present(Some(80));
+        snap.batteries = Probe::Present(vec![Battery {
+            model: "BAT0".to_owned(),
+            kind: BatteryKind::Internal,
+            percentage: 61.0,
+            state: BatteryState::Discharging,
+            power_supply: true,
+            time_to_empty: Some(Duration::from_secs(5400)),
+            time_to_full: None,
+            energy_rate: Some(11.7),
+        }]);
+        // Exercise the reconcile seam (it seeds the charge-slider live value from
+        // the probe) before rendering, matching the live poll path.
+        st.reconcile(&snap);
+        st.snapshot = Some(snap);
+        let mut inst = InstancesState::default();
+        assert!(
+            renders(&mut st, &mut inst),
+            "the live POWER-4 panel drew nothing"
+        );
+        assert_eq!(
+            st.charge_threshold,
+            Some(80),
+            "reconcile seeds the charge-slider from the probe"
+        );
+    }
+
+    #[test]
+    fn a_refused_power_profile_switch_never_lies_about_the_active_profile() {
+        // With a Present profile (active=balanced), a switch to "performance" on
+        // the headless farm host has no daemon → a typed error. apply must surface
+        // it inline AND withhold the optimistic active flip (§7: a failed switch
+        // never reports the new profile as active). Asserted as the honest
+        // coupling so a build host that DID have the daemon can't make it flaky.
+        let mut st = SystemState::default();
+        let mut snap = Seat::new().snapshot();
+        snap.power_profile = Probe::Present(ProfileState {
+            active: "balanced".to_owned(),
+            available: vec!["balanced".to_owned(), "performance".to_owned()],
+        });
+        st.snapshot = Some(snap);
+        let mut inst = InstancesState::default();
+        st.apply(
+            vec![SysAction::SetPowerProfile("performance".to_owned())],
+            &mut inst,
+        );
+        let active = match st.snapshot.as_ref().map(|s| &s.power_profile) {
+            Some(Probe::Present(p)) => p.active.clone(),
+            _ => unreachable!("the profile probe stays Present"),
+        };
+        // error set ⇔ the switch failed ⇔ active stays balanced (never a lie).
+        assert_eq!(
+            st.error.is_some(),
+            active == "balanced",
+            "a failed switch must not flip the cached active profile"
+        );
+    }
+
+    #[test]
+    fn a_charge_threshold_write_either_succeeds_or_is_surfaced_honestly() {
+        // The charge-cap write on the headless farm host has no advertising
+        // battery / is unprivileged → a typed error apply must surface inline
+        // (§7), never a silent success. On a machine that genuinely has the attr
+        // + privilege it would succeed and seed the live cap — asserted as the
+        // honest either/or so the test holds on any host.
+        let mut st = SystemState::default();
+        let mut inst = InstancesState::default();
+        st.apply(vec![SysAction::SetChargeThreshold(70)], &mut inst);
+        let ok = st.error.is_none() && st.charge_threshold == Some(70);
+        let surfaced = st
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("Charge limit"));
+        assert!(
+            ok || surfaced,
+            "the write must either honestly succeed or surface a typed error"
+        );
     }
 
     // ── Bluetooth control panel (E12-17) ──────────────────────────────────────

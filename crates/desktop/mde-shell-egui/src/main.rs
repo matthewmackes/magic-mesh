@@ -32,6 +32,7 @@ mod instances;
 mod keyboard;
 mod mesh_view;
 mod network;
+mod power_settings;
 mod provisioning;
 mod services_flow;
 mod session;
