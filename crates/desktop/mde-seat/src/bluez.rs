@@ -14,7 +14,7 @@
 
 use crate::bus::SysBus;
 use crate::error::{Backend, SeatError};
-use crate::props::{bool_prop, str_prop, u8_prop, PropMap};
+use crate::props::{bool_prop, i16_prop, str_prop, u8_prop, PropMap};
 
 /// The `BlueZ` well-known bus name.
 const BLUEZ: &str = "org.bluez";
@@ -27,6 +27,10 @@ const DEVICE1: &str = "org.bluez.Device1";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
 /// One Bluetooth adapter (an `org.bluez.Adapter1` object).
+// The four flags mirror `Adapter1`'s independent boolean properties (Powered /
+// Discovering / Discoverable / Pairable) one-for-one; folding them into enums
+// would fight the D-Bus shape they read from, not clarify it.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BtAdapter {
     /// The D-Bus object path (e.g. `/org/bluez/hci0`) — the stable identity.
@@ -38,6 +42,12 @@ pub struct BtAdapter {
     pub powered: bool,
     /// Whether a device discovery scan is running.
     pub discovering: bool,
+    /// Whether the adapter is visible to nearby devices (`Adapter1.Discoverable`)
+    /// — the state the panel's Discoverable toggle reads.
+    pub discoverable: bool,
+    /// Whether the adapter accepts incoming pairings (`Adapter1.Pairable`) — the
+    /// state the panel's Pairable toggle reads.
+    pub pairable: bool,
 }
 
 /// One remote Bluetooth device (an `org.bluez.Device1` object).
@@ -47,6 +57,14 @@ pub struct BtDevice {
     pub path: String,
     /// The operator-facing name (`Alias` → `Name` → `Address` → path tail).
     pub alias: String,
+    /// The hardware MAC address (`Device1.Address`), when known — the stable
+    /// operator-visible identity a scan list shows beside the name. `None` when the
+    /// device object has no `Address` (never fabricated).
+    pub address: Option<String>,
+    /// The last-seen signal strength in dBm (`Device1.RSSI`). `BlueZ` only reports
+    /// it while a device is in range of an active scan, so it is `None` outside a
+    /// scan — a scan list uses it to sort/annotate signal, never invented.
+    pub rssi: Option<i16>,
     /// Paired (bonded) with this host.
     pub paired: bool,
     /// Currently connected.
@@ -410,6 +428,8 @@ pub fn fold_bluez(objects: &zbus::fdo::ManagedObjects) -> BtStatus {
                     .unwrap_or_else(|| path_tail(path_str)),
                 powered: bool_prop(props, "Powered").unwrap_or(false),
                 discovering: bool_prop(props, "Discovering").unwrap_or(false),
+                discoverable: bool_prop(props, "Discoverable").unwrap_or(false),
+                pairable: bool_prop(props, "Pairable").unwrap_or(false),
             });
         }
         if let Some(props) = iface(interfaces, "org.bluez.Device1") {
@@ -422,6 +442,8 @@ pub fn fold_bluez(objects: &zbus::fdo::ManagedObjects) -> BtStatus {
                     .or_else(|| str_prop(props, "Name"))
                     .or_else(|| str_prop(props, "Address"))
                     .unwrap_or_else(|| path_tail(path_str)),
+                address: str_prop(props, "Address"),
+                rssi: i16_prop(props, "RSSI"),
                 paired: bool_prop(props, "Paired").unwrap_or(false),
                 connected: bool_prop(props, "Connected").unwrap_or(false),
                 trusted: bool_prop(props, "Trusted").unwrap_or(false),
@@ -470,7 +492,9 @@ mod tests {
             props(vec![
                 ("Alias", s("eagle")),
                 ("Powered", OwnedValue::from(true)),
-                ("Discovering", OwnedValue::from(false)),
+                ("Discovering", OwnedValue::from(true)),
+                ("Discoverable", OwnedValue::from(true)),
+                ("Pairable", OwnedValue::from(false)),
             ]),
         );
         objects.insert(opath("/org/bluez/hci0"), adapter);
@@ -480,6 +504,7 @@ mod tests {
             oiface("org.bluez.Device1"),
             props(vec![
                 ("Alias", s("MX Keys")),
+                ("Address", s("AA:BB:CC:DD:EE:01")),
                 ("Paired", OwnedValue::from(true)),
                 ("Connected", OwnedValue::from(true)),
                 ("Trusted", OwnedValue::from(true)),
@@ -497,6 +522,8 @@ mod tests {
             oiface("org.bluez.Device1"),
             props(vec![
                 ("Alias", s("Anker Motion")),
+                ("Address", s("AA:BB:CC:DD:EE:02")),
+                ("RSSI", OwnedValue::from(-61_i16)),
                 ("Paired", OwnedValue::from(true)),
                 ("Connected", OwnedValue::from(false)),
             ]),
@@ -520,7 +547,9 @@ mod tests {
         assert_eq!(a.path, "/org/bluez/hci0");
         assert_eq!(a.name, "eagle");
         assert!(a.powered);
-        assert!(!a.discovering);
+        assert!(a.discovering);
+        assert!(a.discoverable, "Adapter1.Discoverable is folded");
+        assert!(!a.pairable, "Adapter1.Pairable is folded (false here)");
         assert!(status.any_adapter_powered());
 
         // Connected first, then by alias.
@@ -529,11 +558,27 @@ mod tests {
         assert!(status.devices[0].connected);
         assert_eq!(status.devices[0].battery_percent, Some(87));
         assert_eq!(status.devices[0].icon.as_deref(), Some("input-keyboard"));
+        // The MAC folds from Device1.Address; a connected (not-in-scan) device has
+        // no RSSI — honest None, never a fabricated signal.
+        assert_eq!(
+            status.devices[0].address.as_deref(),
+            Some("AA:BB:CC:DD:EE:01")
+        );
+        assert_eq!(status.devices[0].rssi, None);
         assert_eq!(status.devices[1].alias, "Anker Motion");
         assert!(!status.devices[1].connected);
         assert_eq!(
             status.devices[1].battery_percent, None,
             "no Battery1 ⇒ no invented charge"
+        );
+        assert_eq!(
+            status.devices[1].address.as_deref(),
+            Some("AA:BB:CC:DD:EE:02")
+        );
+        assert_eq!(
+            status.devices[1].rssi,
+            Some(-61),
+            "an in-scan device folds Device1.RSSI"
         );
         assert_eq!(status.connected_devices(), 1);
     }
@@ -549,6 +594,9 @@ mod tests {
         assert_eq!(status.adapters.len(), 1);
         assert_eq!(status.adapters[0].name, "hci1");
         assert!(!status.adapters[0].powered);
+        // Absent Discoverable/Pairable read as the honest false, never invented.
+        assert!(!status.adapters[0].discoverable);
+        assert!(!status.adapters[0].pairable);
         assert!(!status.any_adapter_powered());
     }
 
@@ -612,6 +660,8 @@ mod tests {
         BtDevice {
             path: path.to_owned(),
             alias: path_tail(path),
+            address: None,
+            rssi: None,
             paired,
             connected,
             trusted,

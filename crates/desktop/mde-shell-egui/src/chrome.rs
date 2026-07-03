@@ -884,10 +884,14 @@ mod tests {
                 name: "hci0".into(),
                 powered: true,
                 discovering: false,
+                discoverable: false,
+                pairable: false,
             }],
             devices: vec![BtDevice {
                 path: "/org/bluez/hci0/dev_x".into(),
                 alias: "MX Keys".into(),
+                address: Some("AA:BB:CC:DD:EE:FF".into()),
+                rssi: None,
                 paired: true,
                 connected: true,
                 trusted: true,
@@ -906,6 +910,8 @@ mod tests {
                 name: "hci0".into(),
                 powered: false,
                 discovering: false,
+                discoverable: false,
+                pairable: false,
             }],
             devices: Vec::new(),
         };

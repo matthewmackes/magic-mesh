@@ -17,6 +17,7 @@
 mod about;
 mod auth;
 mod backdrop;
+mod bt_pairing;
 mod chat;
 mod chooser;
 mod chrome;
@@ -682,6 +683,13 @@ impl Shell {
         // System surface isn't the one in view.
         self.system.poll(ctx);
 
+        // E12-17 — the BlueZ pairing agent is live only while the System surface is
+        // in view: register on entry (once an adapter is present), drop
+        // (unregister) on leave. So a pairing PIN/passkey prompt is answered by the
+        // panel's modal, and no default agent lingers on the system bus otherwise.
+        self.system
+            .sync_pairing_agent(self.nav.expanded && self.nav.surface == Surface::System);
+
         // The thin persistent chrome bar (48px = SP_XL + SP_M).
         let unread = self.chat.total_unread();
         egui::TopBottomPanel::top("mcnf-chrome")
@@ -730,6 +738,14 @@ impl Shell {
         // Keep painting while the transition is in flight.
         if t > 0.001 && t < 0.999 {
             ctx.request_repaint();
+        }
+
+        // Route the System surface's own control-error alerts (a refused / absent
+        // Bluetooth write, a pairing-agent registration failure — §7) into the ONE
+        // ToastBridge, applying the same suppression + sound policy as a Bus alert.
+        // Drained here, after the surface's render borrow has ended.
+        for toast in self.system.take_toasts() {
+            self.toasts.raise(toast);
         }
 
         // E12-19 — hotkey dispatch (lock 8), driven each frame before the OSD paint

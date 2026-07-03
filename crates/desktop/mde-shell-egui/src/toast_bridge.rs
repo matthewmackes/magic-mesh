@@ -288,6 +288,15 @@ impl ToastBridge {
         };
     }
 
+    /// Raise a locally-generated alert directly, applying the SAME suppression +
+    /// single-sound policy (locks 8/10) as a Bus-borne alert. The one local-raise
+    /// seam so a surface (e.g. the System panel's refused-Bluetooth-write error)
+    /// never opens a second toast channel — it hands its [`Toast`] here and the one
+    /// [`ToastHost`] renders it.
+    pub(crate) fn raise(&mut self, toast: Toast) {
+        self.admit(toast);
+    }
+
     /// Flash the center-bottom OSD level bar (volume / brightness), replacing any
     /// current one in place. This is the emitter KIRON-2 left waiting on the OSD tier
     /// (KIRON-3): the seat's volume/brightness hotkeys (E12-19) call it directly —

@@ -30,18 +30,20 @@
 //! shared pump cadence; the same cached snapshot feeds the chrome icons.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
-use mde_egui::{field, muted_note, OsdKind, OsdLevel, Style};
+use mde_egui::{field, muted_note, OsdKind, OsdLevel, Severity, Style, Toast};
 
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{
-    Avail, Backlight, BtStatus, Connector, ConnectorStatus, DdcDisplay, DisplayLayout, DisplayMode,
-    MixerStatus, MixerStrip, MonitorId, OutputArrangement, PowerCaps, PowerVerb, Probe, Seat,
-    SeatSnapshot, HOTKEYS,
+    Avail, Backlight, BtAdapter, BtDevice, BtStatus, Connector, ConnectorStatus, DdcDisplay,
+    DisplayLayout, DisplayMode, MixerStatus, MixerStrip, MonitorId, OutputArrangement,
+    PairingAgent, PowerCaps, PowerVerb, Probe, Seat, SeatError, SeatSnapshot, HOTKEYS,
 };
 
+use crate::bt_pairing::{pairing_dialog, PairingBridge};
 use crate::instances::InstancesState;
 
 /// Poll cadence — a device plug, a battery drain, or a BT connect surfaces within
@@ -84,6 +86,21 @@ pub(crate) struct SystemState {
     /// Publishes each fresh snapshot to the node-local mirror topic so the `mackesd`
     /// `host_state` worker can mirror this node mesh-wide (E12-19, lock 1).
     mirror: crate::host_mirror::HostMirrorPublisher,
+    /// The `BlueZ` pairing bridge (E12-17): the shared mailbox the registered agent
+    /// posts PIN/passkey prompts to and the panel's modal drains. Cloned into the
+    /// agent's responder on register.
+    pairing: PairingBridge,
+    /// The registered pairing agent — live only while the System surface is in view
+    /// and an adapter is present; dropped (which unregisters it) on leave.
+    agent: Option<PairingAgent>,
+    /// Whether an agent registration has already been attempted this active-visit,
+    /// so a failure toasts once rather than every frame.
+    agent_attempted: bool,
+    /// The pairing dialog's PIN/passkey entry buffer (persists across frames).
+    pin_input: String,
+    /// Control-error alerts raised by a Bluetooth write — drained by the shell into
+    /// the one `ToastBridge` after `show()` (§7: a refused/absent write is surfaced).
+    pending_toasts: Vec<Toast>,
 }
 
 impl Default for SystemState {
@@ -99,6 +116,11 @@ impl Default for SystemState {
             confirm: None,
             error: None,
             mirror: crate::host_mirror::HostMirrorPublisher::default(),
+            pairing: PairingBridge::default(),
+            agent: None,
+            agent_attempted: false,
+            pin_input: String::new(),
+            pending_toasts: Vec::new(),
         }
     }
 }
@@ -124,6 +146,25 @@ enum SysAction {
     CancelConfirm,
     /// Drive a VM power verb through the Instances broker (§6).
     VmPower { idx: usize, boot: bool },
+    // ── Bluetooth control verbs (E12-17) ────────────────────────────────────
+    /// Power an adapter radio on/off (`adapter path`, `on`).
+    BtPower(String, bool),
+    /// Make an adapter discoverable to nearby devices (`adapter path`, `on`).
+    BtDiscoverable(String, bool),
+    /// Let an adapter accept incoming pairings (`adapter path`, `on`).
+    BtPairable(String, bool),
+    /// Start (`true`) / stop (`false`) a device-discovery scan on `adapter path`.
+    BtScan(String, bool),
+    /// Connect to a device (`device path`).
+    BtConnect(String),
+    /// Disconnect a device (`device path`).
+    BtDisconnect(String),
+    /// Pair (bond) with a device (`device path`) — the agent answers any prompt.
+    BtPair(String),
+    /// Forget a device — drop the bond (`adapter path`, `device path`).
+    BtForget { adapter: String, device: String },
+    /// Trust / untrust a device for auto-reconnect (`device path`, `trusted`).
+    BtTrust(String, bool),
 }
 
 impl SystemState {
@@ -187,6 +228,8 @@ impl SystemState {
                 ddc_brightness,
                 confirm,
                 error,
+                pairing,
+                pin_input,
                 ..
             } = self;
             let snap = snapshot.as_ref();
@@ -199,7 +242,9 @@ impl SystemState {
                         ui.add_space(Style::SP_S);
                     }
                     section(ui, "Mixer", |ui| mixer_section(ui, snap));
-                    section(ui, "Bluetooth", |ui| bluetooth_section(ui, snap));
+                    section(ui, "Bluetooth", |ui| {
+                        bluetooth_section(ui, snap, &mut actions);
+                    });
                     section(ui, "Displays", |ui| {
                         displays_section(
                             ui,
@@ -216,6 +261,12 @@ impl SystemState {
                     section(ui, "Wallpaper", wallpaper_section);
                     section(ui, "Hotkeys", hotkeys_section);
                 });
+
+            // The BlueZ pairing modal (E12-17): a ctx-level dialog that shows only
+            // while a PIN/passkey/confirm prompt is in flight, draining the shared
+            // bridge the registered agent posts to. Rendered here so it lives only
+            // while the System surface is shown, never blocking the render thread.
+            pairing_dialog(ui.ctx(), pairing, pin_input);
         }
         self.apply(actions, instances);
     }
@@ -262,8 +313,140 @@ impl SystemState {
                     }
                 }
                 SysAction::VmPower { idx, boot } => instances.drive_power(idx, boot),
+                // ── Bluetooth writes (E12-17) — each drives the ONE seat's BlueZ
+                // client, folds a typed failure to the inline error + a toast, and
+                // optimistically reflects the cheap boolean toggles so the switch
+                // doesn't flip back before the next 5s poll.
+                SysAction::BtPower(path, on) => {
+                    let r = self.seat.set_bt_powered(&path, on);
+                    if self.bt_result(r, "power") {
+                        if let Some(a) = self.bt_adapter_mut(&path) {
+                            a.powered = on;
+                        }
+                    }
+                }
+                SysAction::BtDiscoverable(path, on) => {
+                    let r = self.seat.set_bt_discoverable(&path, on);
+                    if self.bt_result(r, "discoverable") {
+                        if let Some(a) = self.bt_adapter_mut(&path) {
+                            a.discoverable = on;
+                        }
+                    }
+                }
+                SysAction::BtPairable(path, on) => {
+                    let r = self.seat.set_bt_pairable(&path, on);
+                    if self.bt_result(r, "pairable") {
+                        if let Some(a) = self.bt_adapter_mut(&path) {
+                            a.pairable = on;
+                        }
+                    }
+                }
+                SysAction::BtScan(path, start) => {
+                    let r = if start {
+                        self.seat.bt_start_discovery(&path)
+                    } else {
+                        self.seat.bt_stop_discovery(&path)
+                    };
+                    if self.bt_result(r, "scan") {
+                        if let Some(a) = self.bt_adapter_mut(&path) {
+                            a.discovering = start;
+                        }
+                    }
+                }
+                SysAction::BtConnect(device) => {
+                    // Connect/disconnect/pair/forget resolve over the link, so no
+                    // optimistic flip — the next poll reflects the real state.
+                    self.bt_result(self.seat.bt_connect(&device), "connect");
+                }
+                SysAction::BtDisconnect(device) => {
+                    self.bt_result(self.seat.bt_disconnect(&device), "disconnect");
+                }
+                SysAction::BtPair(device) => {
+                    self.bt_result(self.seat.bt_pair(&device), "pair");
+                }
+                SysAction::BtForget { adapter, device } => {
+                    self.bt_result(self.seat.bt_remove_device(&adapter, &device), "forget");
+                }
+                SysAction::BtTrust(device, trusted) => {
+                    let r = self.seat.set_bt_trusted(&device, trusted);
+                    if self.bt_result(r, "trust") {
+                        if let Some(d) = self.bt_device_mut(&device) {
+                            d.trusted = trusted;
+                        }
+                    }
+                }
             }
         }
+    }
+
+    /// Fold a Bluetooth write's typed result: clear the inline error on success,
+    /// else surface it inline AND raise a toast (§7 — a refused/absent write is an
+    /// honest alert, never a silent no-op). Returns whether the write succeeded, so
+    /// the caller can optimistically update the cached snapshot.
+    fn bt_result(&mut self, r: Result<(), SeatError>, verb: &str) -> bool {
+        match r {
+            Ok(()) => {
+                self.error = None;
+                true
+            }
+            Err(e) => {
+                self.pending_toasts.push(bt_error_toast(verb, &e));
+                self.error = Some(format!("Bluetooth {verb}: {e}"));
+                false
+            }
+        }
+    }
+
+    /// A mutable view of a cached adapter (for the optimistic toggle update).
+    fn bt_adapter_mut(&mut self, path: &str) -> Option<&mut BtAdapter> {
+        match self.snapshot.as_mut()?.bluetooth {
+            Probe::Present(ref mut bt) => bt.adapters.iter_mut().find(|a| a.path == path),
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// A mutable view of a cached device (for the optimistic trust update).
+    fn bt_device_mut(&mut self, path: &str) -> Option<&mut BtDevice> {
+        match self.snapshot.as_mut()?.bluetooth {
+            Probe::Present(ref mut bt) => bt.devices.iter_mut().find(|d| d.path == path),
+            Probe::Absent { .. } => None,
+        }
+    }
+
+    /// Register or drop the `BlueZ` pairing agent to track the System surface's
+    /// visibility (E12-17). Registered only once an adapter is present (a headless
+    /// host has nothing to pair, and `register` would just answer Unavailable);
+    /// dropping the handle unregisters it. A registration failure toasts once.
+    pub(crate) fn sync_pairing_agent(&mut self, active: bool) {
+        if !active {
+            // Leaving the panel: drop the agent (Drop unregisters) and re-arm.
+            self.agent = None;
+            self.agent_attempted = false;
+            return;
+        }
+        if self.agent.is_some() || self.agent_attempted {
+            return;
+        }
+        let has_adapter = matches!(
+            self.snapshot.as_ref().map(|s| &s.bluetooth),
+            Some(Probe::Present(bt)) if !bt.adapters.is_empty()
+        );
+        if !has_adapter {
+            return;
+        }
+        self.agent_attempted = true;
+        match PairingAgent::register(Arc::new(self.pairing.clone())) {
+            Ok(agent) => self.agent = Some(agent),
+            Err(e) => self
+                .pending_toasts
+                .push(bt_error_toast("pairing agent", &e)),
+        }
+    }
+
+    /// Drain the Bluetooth control-error toasts for the shell to raise into the one
+    /// `ToastBridge` (called after `show()`, once the render borrow has ended).
+    pub(crate) fn take_toasts(&mut self) -> Vec<Toast> {
+        std::mem::take(&mut self.pending_toasts)
     }
 
     // ── hotkey dispatch (E12-19) ────────────────────────────────────────────
@@ -540,8 +723,52 @@ fn strip_row(ui: &mut egui::Ui, strip: &MixerStrip, master: bool) {
     field(ui, &label, &value, tone);
 }
 
-/// The Bluetooth section — read-only status (pairing verbs are E12-17).
-fn bluetooth_section(ui: &mut egui::Ui, snap: Option<&SeatSnapshot>) {
+/// Whether the passed device state offers each action button (the pure
+/// button-enable logic, unit-tested headless). `connect`/`disconnect` are
+/// mutually exclusive on the connected flag; `pair`/`forget` on the paired flag,
+/// and Forget needs the owning adapter path.
+// Four independent per-button enables — the whole point is one flag per action;
+// a state machine would obscure, not clarify, the row's button set.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, PartialEq, Eq)]
+struct DeviceActions {
+    /// Offer Connect (the device is not currently connected).
+    connect: bool,
+    /// Offer Disconnect (the device is currently connected).
+    disconnect: bool,
+    /// Offer Pair (the device is not yet bonded).
+    pair: bool,
+    /// Offer Forget (the device is bonded AND the adapter path is known).
+    forget: bool,
+}
+
+/// Decide which action buttons a device row offers, given its state and whether
+/// the owning adapter path is known.
+const fn device_actions(device: &BtDevice, adapter_path: Option<&str>) -> DeviceActions {
+    DeviceActions {
+        connect: !device.connected,
+        disconnect: device.connected,
+        pair: !device.paired,
+        forget: device.paired && adapter_path.is_some(),
+    }
+}
+
+/// A Bluetooth control error as a Warning chyron (§7) — local (no source host),
+/// flagged `BLUETOOTH`.
+fn bt_error_toast(verb: &str, e: &SeatError) -> Toast {
+    Toast::alert(
+        Severity::Warning,
+        String::new(),
+        "BLUETOOTH",
+        format!("Bluetooth {verb}: {e}"),
+    )
+}
+
+/// The Bluetooth section — a live control panel (E12-17): per-adapter power /
+/// discoverable / pairable / scan, and per-device connect / pair / trust / forget,
+/// each driving the real `BlueZ` backend through the one seat. `Absent` renders the
+/// shared honest not-available note.
+fn bluetooth_section(ui: &mut egui::Ui, snap: Option<&SeatSnapshot>, actions: &mut Vec<SysAction>) {
     probe_section(
         ui,
         snap,
@@ -549,35 +776,206 @@ fn bluetooth_section(ui: &mut egui::Ui, snap: Option<&SeatSnapshot>) {
         |ui, bt: &BtStatus| {
             if bt.adapters.is_empty() {
                 muted_note(ui, "No Bluetooth adapter.");
+                return;
             }
             for adapter in &bt.adapters {
-                let (word, tone) = if adapter.powered {
-                    ("powered", Style::OK)
-                } else {
-                    ("off", Style::TEXT_DIM)
-                };
-                field(ui, &adapter.name, word, tone);
+                adapter_row(ui, adapter, actions);
+            }
+            // Devices hang off the first adapter (the RemoveDevice owner). A scan
+            // annotates each row with live RSSI.
+            let adapter_path = bt.adapters.first().map(|a| a.path.as_str());
+            let scanning = bt.adapters.iter().any(|a| a.discovering);
+            if bt.devices.is_empty() {
+                muted_note(ui, "No devices — scan to discover nearby devices.");
             }
             for device in &bt.devices {
-                let mut value = if device.connected {
-                    "connected".to_owned()
-                } else if device.paired {
-                    "paired".to_owned()
-                } else {
-                    "known".to_owned()
-                };
-                if let Some(pct) = device.battery_percent {
-                    value = format!("{value} \u{00B7} {pct}%");
-                }
-                let tone = if device.connected {
-                    Style::TEXT
-                } else {
-                    Style::TEXT_DIM
-                };
-                field(ui, &device.alias, &value, tone);
+                device_row(ui, device, adapter_path, scanning, actions);
             }
         },
     );
+}
+
+/// One adapter's control row: a status header, then Powered / Discoverable /
+/// Pairable toggles and a Scan toggle (with a spinner while discovering).
+fn adapter_row(ui: &mut egui::Ui, adapter: &BtAdapter, actions: &mut Vec<SysAction>) {
+    let (word, tone) = if adapter.powered {
+        ("on", Style::OK)
+    } else {
+        ("off", Style::TEXT_DIM)
+    };
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(DOT).color(tone).size(Style::SMALL));
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new(&adapter.name)
+                .color(Style::TEXT)
+                .size(Style::SMALL)
+                .strong(),
+        );
+        ui.add_space(Style::SP_S);
+        ui.colored_label(tone, RichText::new(word).size(Style::SMALL));
+    });
+
+    ui.indent((adapter.path.as_str(), "bt-adapter"), |ui| {
+        let mut powered = adapter.powered;
+        if ui
+            .checkbox(&mut powered, RichText::new("Powered").size(Style::SMALL))
+            .changed()
+        {
+            actions.push(SysAction::BtPower(adapter.path.clone(), powered));
+        }
+
+        // Discoverable / Pairable / Scan are only meaningful on a powered radio.
+        if !adapter.powered {
+            return;
+        }
+        let mut discoverable = adapter.discoverable;
+        if ui
+            .checkbox(
+                &mut discoverable,
+                RichText::new("Discoverable").size(Style::SMALL),
+            )
+            .changed()
+        {
+            actions.push(SysAction::BtDiscoverable(
+                adapter.path.clone(),
+                discoverable,
+            ));
+        }
+        let mut pairable = adapter.pairable;
+        if ui
+            .checkbox(&mut pairable, RichText::new("Pairable").size(Style::SMALL))
+            .changed()
+        {
+            actions.push(SysAction::BtPairable(adapter.path.clone(), pairable));
+        }
+        ui.horizontal(|ui| {
+            if adapter.discovering {
+                if ui
+                    .button(RichText::new("Stop scan").size(Style::SMALL))
+                    .clicked()
+                {
+                    actions.push(SysAction::BtScan(adapter.path.clone(), false));
+                }
+                ui.add_space(Style::SP_XS);
+                ui.spinner();
+                ui.colored_label(
+                    Style::TEXT_DIM,
+                    RichText::new("Scanning…").size(Style::SMALL),
+                );
+            } else if ui
+                .button(RichText::new("Scan").size(Style::SMALL))
+                .clicked()
+            {
+                actions.push(SysAction::BtScan(adapter.path.clone(), true));
+            }
+        });
+    });
+    ui.add_space(Style::SP_XS);
+}
+
+/// One device's control row: a status header, a meta line (address · battery ·
+/// in-scan RSSI), then Connect/Disconnect, Pair/Forget, and a Trust checkbox that
+/// reflect the device's live state.
+fn device_row(
+    ui: &mut egui::Ui,
+    device: &BtDevice,
+    adapter_path: Option<&str>,
+    scanning: bool,
+    actions: &mut Vec<SysAction>,
+) {
+    let (word, tone) = if device.connected {
+        ("connected", Style::OK)
+    } else if device.paired {
+        ("paired", Style::TEXT_DIM)
+    } else {
+        ("available", Style::TEXT_DIM)
+    };
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(DOT).color(tone).size(Style::SMALL));
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new(&device.alias)
+                .color(Style::TEXT)
+                .size(Style::SMALL)
+                .strong(),
+        );
+        ui.add_space(Style::SP_S);
+        ui.colored_label(tone, RichText::new(word).size(Style::SMALL));
+    });
+
+    ui.indent((device.path.as_str(), "bt-dev"), |ui| {
+        // Meta line — only the parts BlueZ actually reported (§7: never invented).
+        let mut meta: Vec<String> = Vec::new();
+        if let Some(address) = &device.address {
+            meta.push(address.clone());
+        }
+        if let Some(pct) = device.battery_percent {
+            meta.push(format!("{pct}% battery"));
+        }
+        // RSSI is only meaningful during a scan (BlueZ clears it otherwise).
+        if scanning {
+            if let Some(rssi) = device.rssi {
+                meta.push(format!("{rssi} dBm"));
+            }
+        }
+        if !meta.is_empty() {
+            ui.colored_label(
+                Style::TEXT_DIM,
+                RichText::new(meta.join("  \u{00B7}  ")).size(Style::SMALL),
+            );
+        }
+
+        let acts = device_actions(device, adapter_path);
+        ui.horizontal(|ui| {
+            if acts.disconnect {
+                if ui
+                    .button(RichText::new("Disconnect").size(Style::SMALL))
+                    .clicked()
+                {
+                    actions.push(SysAction::BtDisconnect(device.path.clone()));
+                }
+            } else if acts.connect
+                && ui
+                    .button(RichText::new("Connect").size(Style::SMALL))
+                    .clicked()
+            {
+                actions.push(SysAction::BtConnect(device.path.clone()));
+            }
+
+            if acts.pair {
+                if ui
+                    .button(RichText::new("Pair").size(Style::SMALL))
+                    .clicked()
+                {
+                    actions.push(SysAction::BtPair(device.path.clone()));
+                }
+            } else if ui
+                // Forget needs the owning adapter path; disabled honestly if unknown.
+                .add_enabled(
+                    acts.forget,
+                    egui::Button::new(RichText::new("Forget").size(Style::SMALL)),
+                )
+                .clicked()
+            {
+                if let Some(adapter) = adapter_path {
+                    actions.push(SysAction::BtForget {
+                        adapter: adapter.to_owned(),
+                        device: device.path.clone(),
+                    });
+                }
+            }
+
+            let mut trusted = device.trusted;
+            if ui
+                .checkbox(&mut trusted, RichText::new("Trust").size(Style::SMALL))
+                .changed()
+            {
+                actions.push(SysAction::BtTrust(device.path.clone(), trusted));
+            }
+        });
+    });
+    ui.add_space(Style::SP_XS);
 }
 
 // ──────────────────────────── Displays (E12-18) ────────────────────────────
@@ -1162,5 +1560,178 @@ mod tests {
         assert_eq!(st.confirm, Some(PowerVerb::Reboot));
         st.apply(vec![SysAction::CancelConfirm], &mut inst);
         assert!(st.confirm.is_none());
+    }
+
+    // ── Bluetooth control panel (E12-17) ──────────────────────────────────────
+
+    fn bt_device(path: &str, paired: bool, connected: bool, trusted: bool) -> BtDevice {
+        BtDevice {
+            path: path.to_owned(),
+            alias: path.to_owned(),
+            address: Some("AA:BB:CC:DD:EE:FF".to_owned()),
+            rssi: Some(-55),
+            paired,
+            connected,
+            trusted,
+            battery_percent: Some(72),
+            icon: None,
+        }
+    }
+
+    #[test]
+    fn device_actions_reflect_bluetooth_state() {
+        // An available (un-paired, un-connected) device: Connect + Pair, no
+        // Disconnect, no Forget (Forget is a paired-only verb).
+        let available = bt_device("/dev/a", false, false, false);
+        assert_eq!(
+            device_actions(&available, Some("/org/bluez/hci0")),
+            DeviceActions {
+                connect: true,
+                disconnect: false,
+                pair: true,
+                forget: false,
+            }
+        );
+
+        // A paired-but-offline device: Connect + Forget (adapter known), no Pair.
+        let paired = bt_device("/dev/b", true, false, true);
+        assert_eq!(
+            device_actions(&paired, Some("/org/bluez/hci0")),
+            DeviceActions {
+                connect: true,
+                disconnect: false,
+                pair: false,
+                forget: true,
+            }
+        );
+        // …but Forget is withheld when the owning adapter path is unknown.
+        assert_eq!(
+            device_actions(&paired, None),
+            DeviceActions {
+                connect: true,
+                disconnect: false,
+                pair: false,
+                forget: false,
+            }
+        );
+
+        // A connected + paired device: Disconnect + Forget, no Connect, no Pair.
+        let connected = bt_device("/dev/c", true, true, true);
+        assert_eq!(
+            device_actions(&connected, Some("/org/bluez/hci0")),
+            DeviceActions {
+                connect: false,
+                disconnect: true,
+                pair: false,
+                forget: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_bluetooth_error_is_a_flagged_warning_alert() {
+        let e = SeatError::Unavailable {
+            backend: mde_seat::Backend::Bluetooth,
+            reason: "no adapter".into(),
+        };
+        let toast = bt_error_toast("connect", &e);
+        assert_eq!(toast.flag, "BLUETOOTH");
+        assert!(toast.headline.contains("connect"));
+        assert!(toast.headline.contains("no adapter"));
+    }
+
+    #[test]
+    fn a_live_bluetooth_panel_renders_its_controls() {
+        // Inject a Present Bluetooth probe over an otherwise-real (Absent) snapshot
+        // and prove the control rows tessellate real geometry — the reachable panel,
+        // not a mockup. No button is clicked in a headless frame, so no seat write
+        // fires.
+        let mut st = SystemState::default();
+        let mut snap = Seat::new().snapshot();
+        snap.bluetooth = Probe::Present(BtStatus {
+            adapters: vec![BtAdapter {
+                path: "/org/bluez/hci0".to_owned(),
+                name: "eagle".to_owned(),
+                powered: true,
+                discovering: true,
+                discoverable: true,
+                pairable: false,
+            }],
+            devices: vec![
+                bt_device("/org/bluez/hci0/dev_AA", true, true, true),
+                bt_device("/org/bluez/hci0/dev_BB", false, false, false),
+            ],
+        });
+        st.snapshot = Some(snap);
+
+        let mut inst = InstancesState::default();
+        assert!(
+            renders(&mut st, &mut inst),
+            "the live Bluetooth control panel drew nothing"
+        );
+    }
+
+    #[test]
+    fn a_bluetooth_toggle_couples_the_cache_update_to_the_real_write() {
+        // A Discoverable toggle drives the real seat. On the headless farm host the
+        // write fails (no bus/adapter) → a toast is raised and the optimistic cache
+        // update is withheld (§7: a failed write never lies "on"). The optimistic
+        // flip only lands on a real success — the two outcomes are asserted together
+        // so a live build-host adapter can't make the test flaky.
+        let mut st = SystemState::default();
+        let mut snap = Seat::new().snapshot();
+        snap.bluetooth = Probe::Present(BtStatus {
+            adapters: vec![BtAdapter {
+                path: "/org/bluez/hci0".to_owned(),
+                name: "eagle".to_owned(),
+                powered: true,
+                discovering: false,
+                discoverable: false,
+                pairable: false,
+            }],
+            devices: vec![],
+        });
+        st.snapshot = Some(snap);
+        let mut inst = InstancesState::default();
+
+        st.apply(
+            vec![SysAction::BtDiscoverable(
+                "/org/bluez/hci0".to_owned(),
+                true,
+            )],
+            &mut inst,
+        );
+        let toasts = st.take_toasts();
+        let cached_on = matches!(
+            st.snapshot.as_ref().map(|s| &s.bluetooth),
+            Some(Probe::Present(bt)) if bt.adapters[0].discoverable
+        );
+        // Failure ⇒ exactly one toast + cache stays false; success ⇒ no toast + the
+        // optimistic flip landed. Never a toast with a lying "on" cache.
+        assert_eq!(
+            toasts.len() == 1,
+            !cached_on,
+            "the cache update must track the write outcome"
+        );
+    }
+
+    #[test]
+    fn leaving_the_system_surface_drops_the_pairing_agent() {
+        // sync_pairing_agent(false) always releases the agent + re-arms, and with no
+        // adapter present sync_pairing_agent(true) is a no-op (nothing to pair) —
+        // never a bus error on a headless host.
+        let mut st = SystemState {
+            agent_attempted: true,
+            ..SystemState::default()
+        };
+        st.sync_pairing_agent(false);
+        assert!(st.agent.is_none());
+        assert!(!st.agent_attempted);
+        // Active but no snapshot/adapter yet → does not attempt (stays un-attempted).
+        st.sync_pairing_agent(true);
+        assert!(
+            !st.agent_attempted,
+            "no adapter ⇒ no agent registration attempt"
+        );
     }
 }

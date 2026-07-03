@@ -214,6 +214,101 @@ impl Seat {
     pub fn set_bt_powered(&self, adapter: &str, on: bool) -> Result<(), SeatError> {
         self.bluez.set_adapter_powered(adapter, on)
     }
+
+    // ── Bluetooth pairing-manager verbs (E12-17) ────────────────────────────────
+    //
+    // The System surface's Bluetooth panel drives the full manager through the ONE
+    // seat's `BluezClient` (lock 1), the same seam the enumeration folds from. Each
+    // forwards a typed `SeatError` (absent adapter/device or dead bus →
+    // `Unavailable`, a refused write → `Backend`) so the panel surfaces an honest
+    // failure, never a silent no-op. The PIN/passkey prompts a `pair` raises are
+    // answered by a separately-registered [`crate::pairing::PairingAgent`].
+
+    /// Make a Bluetooth adapter visible to nearby devices (`Adapter1.Discoverable`).
+    ///
+    /// # Errors
+    /// The `BlueZ` client's typed errors (absent adapter / dead bus →
+    /// [`SeatError::Unavailable`], else [`SeatError::Backend`]).
+    pub fn set_bt_discoverable(&self, adapter: &str, on: bool) -> Result<(), SeatError> {
+        self.bluez.set_discoverable(adapter, on)
+    }
+
+    /// Let a Bluetooth adapter accept incoming pairings (`Adapter1.Pairable`).
+    ///
+    /// # Errors
+    /// As [`Self::set_bt_discoverable`].
+    pub fn set_bt_pairable(&self, adapter: &str, on: bool) -> Result<(), SeatError> {
+        self.bluez.set_pairable(adapter, on)
+    }
+
+    /// Start a device-discovery scan (`Adapter1.StartDiscovery`).
+    ///
+    /// # Errors
+    /// As [`Self::set_bt_discoverable`].
+    pub fn bt_start_discovery(&self, adapter: &str) -> Result<(), SeatError> {
+        self.bluez.start_discovery(adapter)
+    }
+
+    /// Stop a device-discovery scan (`Adapter1.StopDiscovery`).
+    ///
+    /// # Errors
+    /// As [`Self::set_bt_discoverable`].
+    pub fn bt_stop_discovery(&self, adapter: &str) -> Result<(), SeatError> {
+        self.bluez.stop_discovery(adapter)
+    }
+
+    /// Pair (bond) with a device (`Device1.Pair`). PIN/passkey prompts are answered
+    /// by the registered [`crate::pairing::PairingAgent`].
+    ///
+    /// # Errors
+    /// The `BlueZ` client's typed errors (absent device / bus → `Unavailable`, a
+    /// rejected/failed pairing → `Backend`).
+    pub fn bt_pair(&self, device: &str) -> Result<(), SeatError> {
+        self.bluez.pair(device)
+    }
+
+    /// Abort an in-flight pairing (`Device1.CancelPairing`).
+    ///
+    /// # Errors
+    /// As [`Self::bt_pair`].
+    pub fn bt_cancel_pairing(&self, device: &str) -> Result<(), SeatError> {
+        self.bluez.cancel_pairing(device)
+    }
+
+    /// Trust or untrust a device for auto-reconnect (`Device1.Trusted`).
+    ///
+    /// # Errors
+    /// The `BlueZ` client's typed errors (absent device / bus → `Unavailable`, else
+    /// `Backend`).
+    pub fn set_bt_trusted(&self, device: &str, trusted: bool) -> Result<(), SeatError> {
+        self.bluez.set_trusted(device, trusted)
+    }
+
+    /// Connect to a paired device (`Device1.Connect`).
+    ///
+    /// # Errors
+    /// As [`Self::set_bt_trusted`].
+    pub fn bt_connect(&self, device: &str) -> Result<(), SeatError> {
+        self.bluez.connect(device)
+    }
+
+    /// Disconnect a connected device (`Device1.Disconnect`).
+    ///
+    /// # Errors
+    /// As [`Self::set_bt_trusted`].
+    pub fn bt_disconnect(&self, device: &str) -> Result<(), SeatError> {
+        self.bluez.disconnect(device)
+    }
+
+    /// Forget a device — drop the bond + link keys (`Adapter1.RemoveDevice`).
+    /// `adapter` is the owning adapter path; `device` the device path to remove.
+    ///
+    /// # Errors
+    /// An invalid `device` path → [`SeatError::Protocol`]; absent adapter / bus →
+    /// `Unavailable`, else `Backend`.
+    pub fn bt_remove_device(&self, adapter: &str, device: &str) -> Result<(), SeatError> {
+        self.bluez.remove_device(adapter, device)
+    }
 }
 
 impl Default for Seat {
@@ -260,10 +355,24 @@ mod tests {
             Ok(()) => {}
             Err(e) => assert_eq!(e.backend(), Backend::PipeWire),
         }
-        match seat.set_bt_powered("/org/bluez/hci0", true) {
-            Ok(()) => {}
-            Err(e) => assert_eq!(e.backend(), Backend::Bluetooth),
-        }
+        // The BT pairing-manager verbs (E12-17) all forward through the one seat;
+        // each folds to a typed Bluetooth error on a host with no adapter/bus.
+        let bt = |r: Result<(), SeatError>| {
+            if let Err(e) = r {
+                assert_eq!(e.backend(), Backend::Bluetooth);
+            }
+        };
+        bt(seat.set_bt_powered("/org/bluez/hci0", true));
+        bt(seat.set_bt_discoverable("/org/bluez/hci0", true));
+        bt(seat.set_bt_pairable("/org/bluez/hci0", true));
+        bt(seat.bt_start_discovery("/org/bluez/hci0"));
+        bt(seat.bt_stop_discovery("/org/bluez/hci0"));
+        bt(seat.bt_pair("/org/bluez/hci0/dev_AA_BB"));
+        bt(seat.bt_cancel_pairing("/org/bluez/hci0/dev_AA_BB"));
+        bt(seat.set_bt_trusted("/org/bluez/hci0/dev_AA_BB", true));
+        bt(seat.bt_connect("/org/bluez/hci0/dev_AA_BB"));
+        bt(seat.bt_disconnect("/org/bluez/hci0/dev_AA_BB"));
+        bt(seat.bt_remove_device("/org/bluez/hci0", "/org/bluez/hci0/dev_AA_BB"));
     }
 
     #[test]
