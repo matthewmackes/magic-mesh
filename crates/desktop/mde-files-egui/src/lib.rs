@@ -1,18 +1,29 @@
-//! `mde-files-egui` — the MCNF **E12 "Quasar"** egui file-manager surface (E12-11).
+//! `mde-files-egui` — the MCNF **"Quasar"** egui file-manager surface (FILEMGR-8).
 //!
 //! An `eframe` app on the shared [`mde_egui`] harness that reuses `mde-files`'
-//! render-agnostic core — the `Backend` trait, the `FileRow`/`Peer` model, and
-//! the `SendToRequest` transfer shape — over the mesh Bus. The first slice browses
-//! a local directory and a mesh-peer folder and initiates a Send-To, all rendered
-//! through the shared [`mde_egui::Style`].
+//! render-agnostic core — the `Backend` trait, the `FileRow`/`Peer` model, the
+//! `SendToRequest` transfer shape, and the FILEMGR-2 op queue — over the mesh Bus.
+//! It is the full desktop file-manager shell: List/Grid/Details views (sortable,
+//! remembered per folder, show-hidden), breadcrumbs + editable path + back/forward
+//! history + tabs + dual-pane + a Places/Mesh sidebar, click/Ctrl/Shift/Ctrl-A/
+//! rubber-band selection, and drag-and-drop (move default, Ctrl=copy) within and
+//! between panes — every drop a real transfer through the queue with live progress.
 //!
 //! Layering (§6): the decision logic lives in [`model`] (no egui — unit-tested
-//! without a GPU); [`view`] turns that model into egui widgets. The production
-//! backend is `mde_files::backend::RealBackend` (local filesystem + the mesh Bus);
-//! the retired Cosmic-era file-manager GUI is never pulled (`mde-files` is
-//! consumed with its `gui` feature off).
+//! without a GPU); [`ops`] wires the FILEMGR-2 queue; [`view`] turns the model
+//! into egui widgets. The production backend is `mde_files::backend::RealBackend`
+//! (local filesystem + the mesh Bus); the retired Cosmic-era GUI is never pulled.
+
+// `missing_const_for_fn` (clippy nursery) is over-eager for this crate: it flags
+// trivial field getters, `&mut self` setters, and an owned-`Vec`-taking
+// constructor alike as "could be const". const-ifying setters + owned-collection
+// constructors is churn and a premature const commitment for no runtime win, so we
+// allow this ONE nursery lint crate-wide rather than annotate ~20 sites. Every
+// other clippy lint (incl. the substantive pedantic ones) stays on.
+#![allow(clippy::missing_const_for_fn)]
 
 pub mod model;
+pub mod ops;
 pub mod view;
 
 use mde_egui::{eframe, egui};
