@@ -71,3 +71,12 @@ operator-provided cred/host — drop any and the loop wires + live-verifies it:
 - **ROUTER-6 → stays [!] DEFERRED-YAGNI** — single EdgeRouter; un-defer only at a 2nd appliance (migrating live prod DHCP/firewall state for zero current benefit is pure risk).
 - **12.1 release: KEEP ACCUMULATING** — no cut yet; drain the DAR live tail + VDI bed first.
 - **AUTHORIZED (2026-07-03): standing prod-SSH + XCP cloud create/delete + maintenance window** (DAR DevOps-rebuild live tail) + **stand up the live Quasar VDI test bed** (E12 VDI live legs).
+- **DAR-19** (parked 2026-07-03) — Genesis-fresh control VM is STAGED + de-risked: mcnf-control (a68ab38b) live at 172.20.145.190, magic-mesh 11.3.1 + nebula installed (channel repo path fix: fedora-43-x86_64), both LHs' external-addr set. FINAL BLOCKER: the 11.3.1 enroll-token emits the OVERLAY endpoint (10.42.0.1:4242) not the public enroll endpoint (:4243), so a fresh non-overlay node's CSR can't reach the LH signer. Needs the mesh bootstrap-enroll path for a fresh box (cf. LH-JOIN-QNM-1) — operator/focused-mesh work.
+
+## DAR genesis-fresh — STAGED, final enroll layer blocked (2026-07-03)
+Control plane rebuild is de-risked to its last mile. State to resume:
+- **Control VM:** `mcnf-control` UUID `a68ab38b-a9aa-8f97-ef36-705aead0e34a` on founder `.193`, live at `172.20.145.190` (ssh `mm@` with `id_ed25519`). `magic-mesh 11.3.1` + `nebula` installed. A `cidata` VDI (`d8103f1d`) supplies the seed (CONTROLVM-9 workaround — the proper fix is a control-plane golden delivering cidata, or the golden reading XenStore `vm-data/user-data`).
+- **LHs:** both external-addr set to public IPs (`165.227.188.238:4242`, `104.131.64.207:4242`).
+- **FINAL BLOCKER:** `mackesd enroll --token` on the fresh node published a CSR but the LH never signed ("no bundle in 30s"). The 11.3.1 `enroll-token` embeds `mesh:magic-mesh@10.42.0.1:4242` (overlay + nebula port), but a non-overlay bootstrap needs the LH's public IP at the **enroll port `:4243`** (as the original seed token `@167.71.247.150:4243` did). Need the fresh-box bootstrap-enroll path against the live 11.3.1 LHs — connects to worklist **LH-JOIN-QNM-1**.
+- **Reversible:** destroy `a68ab38b` + the `cidata` VDI to clean up; LH external-addr changes are corrective (safe to keep).
+- **Proper IaC follow-on:** bake a control-plane golden (magic-mesh RPM installed) so `tofu apply` produces an enroll-ready VM (DAR-34/49); the CONTROLVM-9 cidata-delivery fix belongs in the `control-vm` tofu root.
