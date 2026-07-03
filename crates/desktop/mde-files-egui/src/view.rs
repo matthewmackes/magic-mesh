@@ -19,16 +19,20 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use mde_egui::egui::{
-    self, Align2, FontId, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
+    self, Align2, Color32, FontId, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
 };
 use mde_egui::{muted_note, status_dot, Style};
 
 use mde_files::model::{Mime, PeerStatus};
 use mde_files::opqueue::Progress;
 
-use crate::model::{FileBrowser, Location, SendOutcome, SortKey, SortSpec, ViewMode, LOCAL_SPOTS};
+use crate::mesh_mount::{MountPhase, MountView};
+use crate::model::{
+    mount_host_of, FileBrowser, Location, SendOutcome, SortKey, SortSpec, ViewMode, LOCAL_SPOTS,
+};
 
 // Details-view column widths (right-hand columns; name takes the rest).
 const COL_SIZE_W: f32 = 96.0;
@@ -92,6 +96,12 @@ enum Action {
         copy: bool,
     },
     SetDestination(String),
+    /// FILEMGR-9 — navigate into a peer: request its mount + browse it.
+    MountPeer(usize, String),
+    /// FILEMGR-9 — escalate a peer from home to full-filesystem access.
+    EscalatePeer(String),
+    /// FILEMGR-9 — unmount a peer.
+    UnmountPeer(String),
     Send,
     PauseOp(u64),
     ResumeOp(u64),
@@ -107,6 +117,13 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     browser.pump_ops();
     if browser.ops().any_running() {
         ui.ctx().request_repaint();
+    }
+    // FILEMGR-9 — refresh the mesh-mount state (a cheap, cadence-gated local Bus
+    // read; never a peer probe). While a mount is still coming up, keep a repaint
+    // heartbeat alive so the sidebar pip animates mounting → mounted without input.
+    browser.pump_mounts();
+    if browser.any_mount_transitional() {
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
     }
 
     let mut actions: Vec<Action> = Vec::new();
@@ -172,6 +189,12 @@ fn apply(browser: &mut FileBrowser, action: Action) {
             browser.drop_transfer(source_pane, dest_dir, copy);
         }
         Action::SetDestination(id) => browser.set_destination(id),
+        Action::MountPeer(p, host) => {
+            browser.set_active_pane(p);
+            browser.open_peer(p, &host);
+        }
+        Action::EscalatePeer(host) => browser.escalate_peer(&host),
+        Action::UnmountPeer(host) => browser.unmount_peer(&host),
         Action::Send => {
             browser.send();
         }
@@ -298,6 +321,10 @@ fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
         });
 }
 
+/// One Mesh sidebar tree row: a peer with a live presence pip, its worker-
+/// published mount phase, and the home↔full-filesystem escalation + eject
+/// controls (FILEMGR-9). An offline peer is honestly greyed and inert — its label
+/// isn't a button, so there's no dead-end and no blocking probe.
 fn peer_row(
     ui: &mut egui::Ui,
     b: &FileBrowser,
@@ -305,18 +332,37 @@ fn peer_row(
     active: usize,
     actions: &mut Vec<Action>,
 ) {
+    let host = mount_host_of(peer);
+    let reachable = peer.status.is_reachable();
+    let mount = b.peer_mount(peer);
+    let browsing = matches!(
+        b.active_tab().location(),
+        Location::Peer(id) if id.as_str() == peer.id.as_str()
+    );
+
+    // Line 1 — presence pip + host name (click = request the mount + browse it).
     ui.horizontal(|ui| {
         status_dot(ui, peer_color(peer.status));
-        let browsing = matches!(b.active_tab().location(), Location::Peer(id) if id.as_str() == peer.id.as_str());
-        if ui
-            .selectable_label(browsing, peer.host.as_str())
-            .on_hover_text("Browse this peer's shared folder")
-            .clicked()
-        {
-            actions.push(Action::Navigate(active, Location::Peer(peer.id.clone())));
+        if reachable {
+            if ui
+                .selectable_label(browsing, peer.host.as_str())
+                .on_hover_text("Mount this peer over the mesh and browse it")
+                .clicked()
+            {
+                actions.push(Action::MountPeer(active, host.to_string()));
+            }
+        } else {
+            // Honestly greyed: an offline peer can't be mounted, so its name is
+            // rendered inert (a disabled, frameless label) rather than a live link.
+            ui.add_enabled(
+                false,
+                egui::Button::new(RichText::new(peer.host.as_str()).color(Style::TEXT_DIM))
+                    .frame(false),
+            )
+            .on_hover_text("Peer is offline \u{2014} can't be mounted");
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if peer.status.is_reachable() {
+            if reachable {
                 let is_dest = b.destination() == Some(peer.id.as_str());
                 if ui
                     .selectable_label(is_dest, "dest")
@@ -330,6 +376,72 @@ fn peer_row(
             }
         });
     });
+
+    // Line 2 — the indented mount state + escalation/eject (reachable peers only).
+    if reachable {
+        ui.horizontal(|ui| {
+            ui.add_space(Style::SP_L);
+            peer_mount_chip(ui, mount);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Home ↔ full-filesystem escalation (lock 14 — the `escalate` verb).
+                let full = mount.is_some_and(MountView::is_full);
+                if ui
+                    .selectable_label(full, "Full FS")
+                    .on_hover_text(if full {
+                        "Mounted with full-filesystem access"
+                    } else {
+                        "Escalate this mount to full-filesystem (/) access"
+                    })
+                    .clicked()
+                {
+                    actions.push(Action::EscalatePeer(host.to_string()));
+                }
+                // Eject a live mount.
+                if mount.is_some_and(|m| m.phase.is_mounted())
+                    && ui
+                        .small_button("Eject")
+                        .on_hover_text("Unmount this peer")
+                        .clicked()
+                {
+                    actions.push(Action::UnmountPeer(host.to_string()));
+                }
+            });
+        });
+    }
+}
+
+/// The per-peer mount-state chip: the worker's live phase (mounting / mounted /
+/// reconnecting / unreachable) in a Carbon-token colour, with the mounted scope
+/// folded in and any degrade reason on hover. A peer never navigated to has no
+/// published state, shown as an honest "not mounted".
+fn peer_mount_chip(ui: &mut egui::Ui, mount: Option<&MountView>) {
+    let Some(mount) = mount else {
+        muted_note(ui, "not mounted");
+        return;
+    };
+    let mut label = mount.phase.label().to_string();
+    if mount.phase.is_mounted() {
+        if let Some(scope) = mount.scope {
+            label = format!("mounted \u{b7} {}", scope.label());
+        }
+    }
+    let resp = ui.colored_label(
+        mount_phase_color(mount.phase),
+        RichText::new(label).size(Style::SMALL),
+    );
+    if let Some(reason) = mount.reason.as_deref() {
+        resp.on_hover_text(reason);
+    }
+}
+
+/// The Carbon token for a mount phase (§4 — no raw hex).
+const fn mount_phase_color(phase: MountPhase) -> Color32 {
+    match phase {
+        MountPhase::Mounted => Style::OK,
+        MountPhase::Mounting | MountPhase::Reconnecting => Style::WARN,
+        MountPhase::Unreachable => Style::DANGER,
+        MountPhase::Unmounted => Style::TEXT_DIM,
+    }
 }
 
 // ── One pane ──────────────────────────────────────────────────────────────────
@@ -1236,6 +1348,60 @@ mod tests {
         b.click(0, 2);
         b.drop_transfer(0, PathBuf::from("/dst"), true);
         assert!(!b.ops().active().is_empty(), "an op is on the strip");
+        mount(&mut b);
+    }
+
+    // ── the Mesh sidebar tree states (FILEMGR-9) ─────────────────────────────
+
+    #[test]
+    fn mounts_and_renders_the_mesh_sidebar_states() {
+        use crate::mesh_mount::test_support::FakeMeshMount;
+        use crate::mesh_mount::{MountPhase, MountScope, MountView};
+        // pine (Online) shown mounted + escalated to full FS (its short mount host is
+        // its roster label, "workstation"); cedar (Offline) is honestly greyed. The
+        // render exercises both the mount chip + the Full FS escalation control.
+        let fake = FakeMeshMount::new().with_view(
+            "workstation",
+            MountView {
+                phase: MountPhase::Mounted,
+                scope: Some(MountScope::Full),
+                path: Some("/run/user/1000/mde-mesh/workstation".into()),
+                reason: None,
+            },
+        );
+        let mut b =
+            FileBrowser::with_file_ops(Box::new(RenderFixture::populated()), FakeFileOps::new())
+                .with_mesh_mount(Box::new(fake));
+        mount(&mut b);
+    }
+
+    #[test]
+    fn mounts_and_renders_a_transitional_and_unreachable_peer() {
+        use crate::mesh_mount::test_support::FakeMeshMount;
+        use crate::mesh_mount::{MountPhase, MountView};
+        let fake = FakeMeshMount::new()
+            .with_view(
+                "workstation",
+                MountView {
+                    phase: MountPhase::Mounting,
+                    scope: None,
+                    path: None,
+                    reason: None,
+                },
+            )
+            .with_view(
+                "build runner",
+                MountView {
+                    phase: MountPhase::Unreachable,
+                    scope: None,
+                    path: None,
+                    reason: Some("unreachable: offline".into()),
+                },
+            );
+        let mut b =
+            FileBrowser::with_file_ops(Box::new(RenderFixture::populated()), FakeFileOps::new())
+                .with_mesh_mount(Box::new(fake));
+        assert!(b.any_mount_transitional());
         mount(&mut b);
     }
 }

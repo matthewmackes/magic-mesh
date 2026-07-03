@@ -22,6 +22,7 @@
 // other clippy lint (incl. the substantive pedantic ones) stays on.
 #![allow(clippy::missing_const_for_fn)]
 
+pub mod mesh_mount;
 pub mod model;
 pub mod ops;
 pub mod view;

@@ -36,6 +36,18 @@ mde-egui = { path = "../../shared/mde-egui" }
 # routes over `action/file-ops/send-to` and peer folders list over
 # `action/fleet-files/list-peer`.
 mde-files = { path = "../../services/mde-files", default-features = false, features = ["dbus"] }
+# FILEMGR-9 — the Mesh sidebar tree reads `state/mesh-mount/<host>` + writes
+# `action/mesh-mount/<host>` directly on the Bus, the same persist-first path the
+# other desktop planes take (`mde-shell-egui::storage` → `state/storage/*`). A
+# local `Persist` read/write only (no tokio, no rpc round-trip), so an offline
+# peer can never hang the UI.
+mde-bus = { path = "../../platform/mde-bus" }
+# FILEMGR-9 — the `state/mesh-mount/*` record + the `action/mesh-mount/<host>`
+# verb are a JSON boundary; the surface owns local serde mirrors of the FILEMGR-5
+# worker's wire shapes (never a dep on `mackesd`), exactly as `mde-shell-egui`
+# mirrors the storage worker's payloads.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lints]
 workspace = true

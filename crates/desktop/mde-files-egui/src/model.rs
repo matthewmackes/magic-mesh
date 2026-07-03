@@ -19,6 +19,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use mde_files::backend::{Backend, BackendError, Destination, MeshOverlayBadge, OpId};
 use mde_files::fileops::{FileOps, LiveFileOps};
@@ -26,7 +27,28 @@ use mde_files::model::{FileRow, Mime, Peer, SelfNode};
 use mde_files::opqueue::OpKind;
 use mde_files::send_to::{SendToEntry, SendToRequest};
 
+use crate::mesh_mount::{BusMeshMount, MeshMountClient, MeshMountVerb, MountView};
 use crate::ops::Ops;
+
+/// How often the Mesh sidebar re-reads `state/mesh-mount/*` from the Bus. The read
+/// is a cheap local spool scan; a worker transition surfaces within this window.
+/// Matches the other Bus surfaces' cadence.
+const MOUNT_POLL: Duration = Duration::from_secs(2);
+
+/// The short mount hostname for a peer — the `<host>` verb slot.
+///
+/// The FILEMGR-5 worker keys `action/mesh-mount/<host>` + `state/mesh-mount/<host>`
+/// on this. Both roster sources (`WirePeer` / Nebula) carry the short name in
+/// `label`; `id` (a `peer:<node>` or bare name) is the honest fallback when a
+/// label is absent.
+#[must_use]
+pub fn mount_host_of(peer: &Peer) -> &str {
+    if peer.label.is_empty() {
+        peer.id.as_str()
+    } else {
+        peer.label.as_str()
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Where a pane is pointed.
@@ -715,6 +737,15 @@ pub fn plan_transfer(sources: Vec<PathBuf>, dest_dir: PathBuf, copy: bool) -> Op
 pub struct FileBrowser {
     backend: Box<dyn Backend>,
     ops: Ops,
+    /// FILEMGR-9 — the mesh-mount client (reads `state/mesh-mount/*`, writes
+    /// `action/mesh-mount/<host>`). Injectable so the model is unit-tested
+    /// headless; production is [`BusMeshMount`].
+    mesh: Box<dyn MeshMountClient>,
+    /// FILEMGR-9 — the latest worker-published mount view per peer (`host` →
+    /// [`MountView`]), refreshed on the [`MOUNT_POLL`] cadence.
+    mounts: HashMap<String, MountView>,
+    /// When the mount state was last polled (drives the fixed cadence).
+    last_mount_poll: Option<Instant>,
     self_node: SelfNode,
     peers: Vec<Peer>,
     mesh_overlay: Option<MeshOverlayBadge>,
@@ -750,6 +781,9 @@ impl FileBrowser {
         let mut me = Self {
             backend,
             ops: Ops::spawn(fileops),
+            mesh: Box::new(BusMeshMount::from_env()),
+            mounts: HashMap::new(),
+            last_mount_poll: None,
             self_node: SelfNode::default(),
             peers: Vec::new(),
             mesh_overlay: None,
@@ -765,6 +799,16 @@ impl FileBrowser {
         me.reload(0);
         me.reload(1);
         me
+    }
+
+    /// Swap in an explicit [`MeshMountClient`] (tests inject a fake; production
+    /// keeps the [`BusMeshMount`] from [`Self::with_file_ops`]). Re-reads the
+    /// mount state through the new client so the sidebar reflects it immediately.
+    #[must_use]
+    pub fn with_mesh_mount(mut self, mesh: Box<dyn MeshMountClient>) -> Self {
+        self.mesh = mesh;
+        self.read_mounts();
+        self
     }
 
     // ── roster / identity ───────────────────────────────────────────────────
@@ -807,6 +851,122 @@ impl FileBrowser {
             .iter()
             .filter(|p| p.status.is_reachable())
             .collect()
+    }
+
+    // ── mesh-mount (FILEMGR-9 — the Mesh sidebar tree) ───────────────────────
+
+    /// Re-read `state/mesh-mount/*` into the cache. A local spool scan — never a
+    /// peer probe — so it can't hang the UI (lock 15).
+    fn read_mounts(&mut self) {
+        self.mounts = self.mesh.views();
+        self.last_mount_poll = Some(Instant::now());
+    }
+
+    /// Refresh the mount state on the [`MOUNT_POLL`] cadence (call once per frame;
+    /// it self-gates, so it's cheap to call every frame). A worker transition —
+    /// mounting → mounted, a drop → reconnecting — surfaces within the window.
+    pub fn pump_mounts(&mut self) {
+        let due = self
+            .last_mount_poll
+            .is_none_or(|t| t.elapsed() >= MOUNT_POLL);
+        if due {
+            self.read_mounts();
+        }
+    }
+
+    /// The worker's published mount view for a peer host (`None` when the worker
+    /// has never reported on it — i.e. it's never been navigated to).
+    #[must_use]
+    pub fn mount_view(&self, host: &str) -> Option<&MountView> {
+        self.mounts.get(host)
+    }
+
+    /// The mount view for a specific roster peer (keyed by its short mount host).
+    #[must_use]
+    pub fn peer_mount(&self, peer: &Peer) -> Option<&MountView> {
+        self.mounts.get(mount_host_of(peer))
+    }
+
+    /// `true` when any peer's mount is still moving (mounting / reconnecting) — the
+    /// view keeps a repaint heartbeat alive so those pips animate to completion.
+    #[must_use]
+    pub fn any_mount_transitional(&self) -> bool {
+        self.mounts.values().any(|m| m.phase.is_transitional())
+    }
+
+    /// Navigate `pane` into peer `host` (its short mount name): request the mount
+    /// (FILEMGR-5) and browse it. If the worker already reports it mounted, browse
+    /// the live sshfs mountpoint directly; otherwise request a mount and browse the
+    /// peer's virtual listing meanwhile (the sidebar pip shows it coming up). An
+    /// **offline** peer is an honest no-op with a note — never a request, never a
+    /// hang (reachability is read from the roster, not a blocking probe).
+    pub fn open_peer(&mut self, pane: usize, host: &str) {
+        let Some(peer) = self
+            .peers
+            .iter()
+            .find(|p| mount_host_of(p) == host)
+            .cloned()
+        else {
+            return;
+        };
+        if !peer.status.is_reachable() {
+            self.last_note = Some(format!("{host} is offline \u{2014} can't mount it."));
+            return;
+        }
+        // Already mounted with a live path → browse it directly (and keep it warm
+        // so the idle-unmount clock resets on the worker side).
+        let mounted_path = self
+            .peer_mount(&peer)
+            .and_then(MountView::mountpoint)
+            .map(str::to_string);
+        if let Some(mountpoint) = mounted_path {
+            let _ = self.mesh.request(host, MeshMountVerb::Mount);
+            self.navigate(pane, Location::Local(mountpoint));
+            self.last_note = None;
+            return;
+        }
+        // Otherwise request the mount + browse the peer's virtual listing while it
+        // comes up. The request is a local Bus append the worker drains on its tick.
+        match self.mesh.request(host, MeshMountVerb::Mount) {
+            Ok(()) => self.last_note = None,
+            Err(e) => self.last_note = Some(e),
+        }
+        self.navigate(pane, Location::Peer(peer.id));
+        self.read_mounts();
+    }
+
+    /// Escalate peer `host` from home to **full-filesystem** access (lock 14 — the
+    /// `escalate` verb). The GUI action behind the sidebar's "full FS" control.
+    /// Offline peers are an honest no-op.
+    pub fn escalate_peer(&mut self, host: &str) {
+        if self
+            .peers
+            .iter()
+            .find(|p| mount_host_of(p) == host)
+            .is_some_and(|p| !p.status.is_reachable())
+        {
+            self.last_note = Some(format!("{host} is offline \u{2014} can't escalate it."));
+            return;
+        }
+        match self.mesh.request(host, MeshMountVerb::Escalate) {
+            Ok(()) => {
+                self.last_note = Some(format!(
+                    "Escalating {host} to full-filesystem access\u{2026}"
+                ));
+            }
+            Err(e) => self.last_note = Some(e),
+        }
+        self.read_mounts();
+    }
+
+    /// Unmount peer `host` (the `unmount` verb) — tears the mount down + forgets
+    /// it. The sidebar's eject control.
+    pub fn unmount_peer(&mut self, host: &str) {
+        match self.mesh.request(host, MeshMountVerb::Unmount) {
+            Ok(()) => self.last_note = Some(format!("Unmounting {host}\u{2026}")),
+            Err(e) => self.last_note = Some(e),
+        }
+        self.read_mounts();
     }
 
     // ── pane / tab structure ────────────────────────────────────────────────
@@ -1737,5 +1897,124 @@ mod tests {
             .expect("temp file listed");
         assert!(row.path.is_some());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── mesh-mount sidebar tree (FILEMGR-9) ──────────────────────────────────
+
+    use crate::mesh_mount::test_support::FakeMeshMount;
+    use crate::mesh_mount::{MeshMountVerb, MountPhase, MountScope, MountView};
+
+    fn mounted_view(path: &str, scope: MountScope) -> MountView {
+        MountView {
+            phase: MountPhase::Mounted,
+            scope: Some(scope),
+            path: Some(path.to_string()),
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn peer_mount_view_projects_from_the_client() {
+        let fake = FakeMeshMount::new().with_view(
+            "pine",
+            mounted_view("/run/user/1000/mde-mesh/pine", MountScope::Home),
+        );
+        let b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
+        let view = b.mount_view("pine").expect("pine's state is projected");
+        assert_eq!(view.phase, MountPhase::Mounted);
+        assert_eq!(view.mountpoint(), Some("/run/user/1000/mde-mesh/pine"));
+        // And it's reachable through the roster peer, keyed by the short mount host.
+        let pine = b
+            .peers()
+            .iter()
+            .find(|p| p.label == "pine")
+            .expect("pine is in the roster");
+        assert!(b.peer_mount(pine).is_some());
+    }
+
+    #[test]
+    fn navigating_a_reachable_peer_requests_a_mount_and_browses() {
+        let fake = FakeMeshMount::new();
+        let probe = fake.clone();
+        let mut b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
+        b.open_peer(0, "pine"); // pine is Online → reachable
+        assert_eq!(probe.verbs_for("pine"), vec![MeshMountVerb::Mount]);
+        // Not mounted yet → browse the peer's virtual listing while it comes up.
+        assert_eq!(*b.active_tab().location(), Location::Peer("pine".into()));
+    }
+
+    #[test]
+    fn navigating_a_mounted_peer_browses_the_live_path() {
+        let fake = FakeMeshMount::new().with_view(
+            "pine",
+            mounted_view("/run/user/1000/mde-mesh/pine", MountScope::Home),
+        );
+        let probe = fake.clone();
+        let mut b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
+        b.open_peer(0, "pine");
+        // Browses the live sshfs mountpoint (a local path), not the virtual peer.
+        assert_eq!(
+            *b.active_tab().location(),
+            Location::Local("/run/user/1000/mde-mesh/pine".into())
+        );
+        // Still re-requests a mount to keep the idle clock warm.
+        assert_eq!(probe.verbs_for("pine"), vec![MeshMountVerb::Mount]);
+    }
+
+    #[test]
+    fn navigating_an_offline_peer_is_an_honest_no_op() {
+        let fake = FakeMeshMount::new();
+        let probe = fake.clone();
+        let mut b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
+        let before = b.active_tab().location().clone();
+        b.open_peer(0, "cedar"); // cedar is Offline
+        assert_eq!(
+            probe.request_count(),
+            0,
+            "no mount request is issued for an offline peer"
+        );
+        assert_eq!(*b.active_tab().location(), before, "location is unchanged");
+        assert!(b.last_note().is_some(), "an honest note explains why");
+    }
+
+    #[test]
+    fn escalate_requests_the_escalate_verb_for_a_reachable_peer() {
+        let fake = FakeMeshMount::new();
+        let probe = fake.clone();
+        let mut b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
+        b.escalate_peer("pine");
+        assert_eq!(probe.verbs_for("pine"), vec![MeshMountVerb::Escalate]);
+    }
+
+    #[test]
+    fn escalate_is_a_no_op_for_an_offline_peer() {
+        let fake = FakeMeshMount::new();
+        let probe = fake.clone();
+        let mut b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
+        b.escalate_peer("cedar"); // Offline
+        assert_eq!(probe.request_count(), 0);
+        assert!(b.last_note().is_some());
+    }
+
+    #[test]
+    fn unmount_requests_the_unmount_verb() {
+        let fake = FakeMeshMount::new();
+        let probe = fake.clone();
+        let mut b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
+        b.unmount_peer("pine");
+        assert_eq!(probe.verbs_for("pine"), vec![MeshMountVerb::Unmount]);
+    }
+
+    #[test]
+    fn transitional_mounts_flag_a_repaint_heartbeat() {
+        let mounting = MountView {
+            phase: MountPhase::Mounting,
+            scope: Some(MountScope::Home),
+            path: None,
+            reason: None,
+        };
+        let fake = FakeMeshMount::new().with_view("pine", mounting);
+        let b = browser_over(roster_backend()).with_mesh_mount(Box::new(fake));
+        assert!(b.any_mount_transitional());
     }
 }
