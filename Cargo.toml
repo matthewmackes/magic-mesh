@@ -66,6 +66,7 @@ members = [
     "crates/desktop/mde-term-egui",
     "crates/shared/mde-disclaimer",
     "crates/shared/mde-egui",
+    "crates/shared/mde-theme",
     "crates/kdc/mde-kdc-host",
     "crates/kdc/mde-kdc-proto",
 ]

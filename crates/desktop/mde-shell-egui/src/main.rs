@@ -719,6 +719,17 @@ fn seat_master_muted(snap: &SeatSnapshot) -> bool {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // QBRAND-1 — `--version` prints the single baked build-identity line (version
+    // · git hash · date · channel), shared verbatim with `mackesd --version` and
+    // the About panel. Handled before standing up the seat so it works headless.
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
+        println!("{}", mde_theme::brand::build::full());
+        return Ok(());
+    }
+
     // E12-3 — the shell OWNS the DRM/KMS seat directly (no compositor, no display
     // manager) when built `--features drm` and a seat is available. It falls back to
     // the windowed eframe client only when there is no DRM master (a dev host, or a

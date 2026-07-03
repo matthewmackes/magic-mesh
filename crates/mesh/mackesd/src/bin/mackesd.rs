@@ -13,7 +13,11 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "mackesd",
-    version,
+    // QBRAND-1 — `--version` prints the single baked build-identity line
+    // (version · git hash · date · channel) from the brand crate, not a bare
+    // `CARGO_PKG_VERSION`. Shared verbatim with `mde-shell-egui --version`.
+    // `full_static` is the memoized `&'static str` clap's `Str` requires.
+    version = mde_theme::brand::build::full_static(),
     about = "MCNF control plane — secure no-fixed-center workgroup mesh on Fedora-Cosmic"
 )]
 struct Cli {

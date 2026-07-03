@@ -1,0 +1,22 @@
+[package]
+name        = "mde-theme"
+description = "MCNF Quazar branding + build-identity — the single source of truth for the platform's version line, codename and (QBRAND) build stamp that every egui surface, the RPM and `--version` read from. Toolkit-free so the shell About, the daemon `--version` and packaging share one canonical copy without a GUI dependency."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_theme"
+path = "src/lib.rs"
+
+# QBRAND-1 — `build.rs` stamps the build identity (version · git short-hash ·
+# UTC date · channel) into the crate at compile time via `cargo:rustc-env`; the
+# `brand::build` module reads it back with `env!`. No build-dependencies: the
+# script is std-only (git via `std::process::Command`, date via a civil-calendar
+# routine) so it builds on the airgapped farm with no extra crates.
+
+[lints]
+workspace = true

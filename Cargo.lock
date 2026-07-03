@@ -3827,6 +3827,7 @@ dependencies = [
  "mde-kdc-proto",
  "mde-kvm",
  "mde-role",
+ "mde-theme",
  "mde-voice-config",
  "mdns-sd",
  "rand 0.8.6",
@@ -4243,6 +4244,7 @@ dependencies = [
  "mde-kvm",
  "mde-music-egui",
  "mde-seat",
+ "mde-theme",
  "mde-vdi-rdp",
  "mde-vdi-vnc",
  "mde-voice-egui",
@@ -4260,6 +4262,10 @@ dependencies = [
  "mde-egui",
  "rustix 0.38.44",
 ]
+
+[[package]]
+name = "mde-theme"
+version = "12.0.0"
 
 [[package]]
 name = "mde-vdi-rdp"

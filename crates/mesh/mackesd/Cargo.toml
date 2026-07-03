@@ -132,6 +132,12 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # CLI parsing: clap derive macro for declarative subcommand routing.
 clap = { version = "4.5", features = ["derive", "env"] }
 
+# QBRAND-1 — the single brand/build-identity source. `mackesd --version` routes
+# clap's version through `mde_theme::brand::build::full()` (version · git hash ·
+# date · channel) instead of the bare `CARGO_PKG_VERSION`. A toolkit-free leaf
+# crate; the edge points inward (§6).
+mde-theme = { path = "../../shared/mde-theme" }
+
 # JSON for revisions + events + QNM-Shared heartbeat files. Serde
 # everything; explicit (de)serializers per type.
 serde       = { version = "1", features = ["derive"] }

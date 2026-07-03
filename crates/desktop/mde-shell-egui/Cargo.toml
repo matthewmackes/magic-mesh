@@ -28,6 +28,12 @@ drm = ["mde-egui/drm"]
 # resolution.
 mde-egui = { path = "../../shared/mde-egui" }
 
+# QBRAND-1 — the single brand/build-identity source. `main.rs` routes
+# `--version` through `mde_theme::brand::build::full()` (and the chrome/splash +
+# About read `version_line()`/`full()`), so the shell never hand-rolls a version
+# string. A toolkit-free leaf crate; the edge points inward (§6).
+mde-theme = { path = "../../shared/mde-theme" }
+
 # MV-6 — the Fleet plane subscribes to the mackesd virt workers' Bus topics
 # (`event/kvm/services` / `event/vm/instances`) and publishes host-targeted
 # `action/vm/lifecycle` requests via the persist-first publish path. mde-bus is
