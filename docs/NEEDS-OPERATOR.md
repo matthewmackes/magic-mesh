@@ -63,3 +63,4 @@ operator-provided cred/host — drop any and the loop wires + live-verifies it:
 - **OW-11 service-add** — _needs:_ **DO Spaces creds** (Music → Navidrome, overlaps
   MEDIA-2) + an **external SIP account** (Voice) so `LiveServiceApply` can provision /
   register.
+- **OW-12** (parked 2026-07-03) — Quasar/headless WS kickstart authored (packaging/kickstart/magic-on-quasar.ks, bash -n + shellcheck clean); remaining acceptance is LIVE-BOOT-GATED (boot the ISO to confirm display + headless WS onboard) + the .iso cut is OPERATOR-GATED (/release, incl. RPM signing + bootc registry publish)
