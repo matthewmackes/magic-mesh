@@ -20,11 +20,13 @@ use mde_jellyfin::{
     ServerStore, StreamMediaType,
 };
 use mde_media_core::{
-    classify_url, unix_millis, AbLoop, AudioConfig, BrowseQuery, CaptureDevice, CaptureEnumerator,
-    CaptureError, CaptureNodeKind, EqBand, Library, LibraryItem, LoginOutcome, LoudnessNorm,
-    MediaEngine, MediaKind, MpvCapabilities, PlaybackControls, Player, PlayerEvent, PlayerState,
-    Playlist, PlaylistItem, PollOutcome, RepeatMode, ReplayGainMode, RoamingSession,
-    ScreenshotMode, SortKey, Track, TrackKind, TrackSelect, TrackSelection, UrlKind, YtDlpError,
+    classify_url, discover_all, unix_millis, AbLoop, AudioConfig, BrowseQuery, CaptureDevice,
+    CaptureEnumerator, CaptureError, CaptureNodeKind, CastError, CastKind, CastRequest, CastTarget,
+    Caster, EqBand, JoinOutcome, Library, LibraryItem, LoginOutcome, LoudnessNorm, MediaEngine,
+    MediaKind, MeshRoster, MpvCapabilities, NetworkCaster, PartyPoll, PartySession,
+    PlaybackControls, Player, PlayerEvent, PlayerState, Playlist, PlaylistItem, PollOutcome,
+    RendererDiscovery, RepeatMode, ReplayGainMode, RoamingSession, ScreenshotMode, SortKey,
+    SsdpProbe, SyncCommand, Track, TrackKind, TrackSelect, TrackSelection, UrlKind, YtDlpError,
     YtDlpResolver,
 };
 
@@ -119,9 +121,40 @@ pub struct UiState {
     /// The pending A-marker of an A-B loop awaiting its B (design Q12). `None` when no
     /// A-B loop is being defined.
     pub ab_pending: Option<f64>,
+    /// The text buffer behind the "party name" field (MEDIA-17 — the shared watch-together
+    /// room this seat hosts / joins).
+    pub party_input: String,
     /// A transient status / error line (the last refused transport, a snapshot
     /// confirmation, an index result). Rendered honestly, never swallowed (§7).
     pub status: Option<String>,
+}
+
+/// The cast-picker state (MEDIA-17) — the last discovered renderers + whether a probe
+/// has run.
+///
+/// So the surface can honest-gate the cast affordance: a plain "no renderer found" note
+/// before / when a probe turns up nothing, never a fabricated device (§7).
+#[derive(Debug, Clone, Default)]
+pub struct CastUiState {
+    /// The renderers the last discovery turned up (empty until a probe / when none).
+    targets: Vec<CastTarget>,
+    /// Whether a discovery probe has run at least once (so the empty list reads as
+    /// "none found" rather than "not yet looked").
+    probed: bool,
+}
+
+impl CastUiState {
+    /// The discovered renderers (read-only).
+    #[must_use]
+    pub fn targets(&self) -> &[CastTarget] {
+        &self.targets
+    }
+
+    /// Whether a discovery probe has run.
+    #[must_use]
+    pub const fn probed(&self) -> bool {
+        self.probed
+    }
 }
 
 /// A row in the Sources list — one indexed local root and how much it holds.
@@ -443,6 +476,13 @@ pub struct MediaController<E: MediaEngine> {
     /// until [`enable_roaming`](Self::enable_roaming) wires it (the render tests never
     /// do, so a headless mount touches no workgroup root).
     roaming: Option<RoamingSession>,
+    /// The sync-play party session (MEDIA-17) — the shared watch-together plane several
+    /// seats join, propagating play/pause/seek in sync. [`None`] until the operator
+    /// hosts / joins a party ([`join_party`](Self::join_party)); a plain single-seat
+    /// player never touches a party root.
+    party: Option<PartySession>,
+    /// The cast-picker state (MEDIA-17) — the last discovered renderers.
+    cast: CastUiState,
     /// The non-core UI state.
     ui: UiState,
 }
@@ -457,6 +497,8 @@ impl<E: MediaEngine> MediaController<E> {
             jellyfin: JellyfinState::default(),
             capture: CaptureUiState::default(),
             roaming: None,
+            party: None,
+            cast: CastUiState::default(),
             ui: UiState::default(),
         }
     }
@@ -733,6 +775,9 @@ impl<E: MediaEngine> MediaController<E> {
         if let Some(roaming) = self.roaming.as_mut() {
             roaming.apply_pending(&mut self.player);
         }
+        if let Some(party) = self.party.as_mut() {
+            party.apply_pending(&mut self.player);
+        }
         for event in self.player.drain_events() {
             if let PlayerEvent::Error(msg) = event {
                 self.ui.status = Some(msg);
@@ -804,17 +849,192 @@ impl<E: MediaEngine> MediaController<E> {
         }
     }
 
+    // ── sync-play party mode (MEDIA-17) ───────────────────────────────────────────
+
+    /// Whether this seat has joined a watch-together party.
+    #[must_use]
+    pub const fn party_enabled(&self) -> bool {
+        self.party.is_some()
+    }
+
+    /// The party (room) id this seat is in, if any.
+    #[must_use]
+    pub fn party_name(&self) -> Option<&str> {
+        self.party.as_ref().map(PartySession::party)
+    }
+
+    /// The seats currently in this seat's party (a live members fold; empty with no
+    /// party).
+    #[must_use]
+    pub fn party_members(&self) -> Vec<String> {
+        self.party
+            .as_ref()
+            .map_or_else(Vec::new, PartySession::members)
+    }
+
+    /// Join a watch-together party over an injected [`PartySession`] (MEDIA-17): sync
+    /// this seat's player to any in-progress title and report the outcome honestly.
+    /// Tests wire a session over a tempdir root; the app uses
+    /// [`join_party`](Self::join_party).
+    pub fn enable_party(&mut self, session: PartySession) -> JoinOutcome {
+        let mut session = session;
+        let outcome = session.join(&mut self.player, unix_millis());
+        match &outcome {
+            JoinOutcome::Joined { synced } => {
+                let party = session.party().to_owned();
+                self.ui.status = Some(if *synced {
+                    format!("Joined party \"{party}\" — synced to the title in progress.")
+                } else {
+                    format!("Joined party \"{party}\" — waiting for the host to start.")
+                });
+                self.ui.tab = MediaTab::Player;
+            }
+            JoinOutcome::Offline => {
+                self.ui.status = Some(
+                    "Party mode needs a provisioned mesh volume — not joined here.".to_owned(),
+                );
+            }
+        }
+        self.party = Some(session);
+        outcome
+    }
+
+    /// Join the party `name` over the canonical workgroup root, with the seat resolved
+    /// from the environment ([`enable_party`](Self::enable_party) over
+    /// [`PartySession::open_default`]). A silent honest no-op on a seat with no mesh
+    /// volume.
+    pub fn join_party(&mut self, name: impl Into<String>) -> JoinOutcome {
+        self.enable_party(PartySession::open_default(name))
+    }
+
+    /// Leave the joined party — drop this seat's record and stop propagating. A no-op
+    /// when no party is joined.
+    pub fn leave_party(&mut self) {
+        if let Some(mut party) = self.party.take() {
+            let name = party.party().to_owned();
+            let _ = party.leave();
+            self.ui.status = Some(format!("Left party \"{name}\"."));
+        }
+    }
+
+    /// Converge with the party plane (MEDIA-17): apply any newer transport control
+    /// another seat issued, so play/pause/seek stay in sync. Called on an interval by
+    /// the app. A no-op when no party is joined.
+    pub fn poll_party(&mut self) {
+        let Some(party) = self.party.as_mut() else {
+            return;
+        };
+        if let PartyPoll::Applied(command) = party.poll(&mut self.player, unix_millis()) {
+            self.ui.status = Some(format!(
+                "Party: {} from another seat.",
+                sync_command_label(&command)
+            ));
+        }
+    }
+
+    // ── casting (MEDIA-17) ────────────────────────────────────────────────────────
+
+    /// The cast-picker state (read-only) — the last discovered renderers + whether a
+    /// probe has run.
+    #[must_use]
+    pub const fn cast(&self) -> &CastUiState {
+        &self.cast
+    }
+
+    /// Discover cast renderers over an injected [`RendererDiscovery`] (MEDIA-17) and
+    /// record them for the picker. Tests inject a canned discovery; the app uses
+    /// [`discover_cast_targets`](Self::discover_cast_targets). Honest — an empty result
+    /// reads as "no renderer found", never a fabricated device.
+    pub fn refresh_cast_targets<D: RendererDiscovery>(&mut self, discovery: &D) {
+        self.cast.targets = discovery.discover();
+        self.cast.probed = true;
+        self.ui.status = Some(if self.cast.targets.is_empty() {
+            "No cast renderer found on this network.".to_owned()
+        } else {
+            format!("Found {} cast renderer(s).", self.cast.targets.len())
+        });
+    }
+
+    /// Discover cast renderers over the live sources (the replicated mesh roster +
+    /// an SSDP probe) — the app's "find renderers" affordance. Real `std::net`
+    /// discovery, honest-gated to a network with responders.
+    pub fn discover_cast_targets(&mut self) {
+        let sources: [&dyn RendererDiscovery; 2] = [&MeshRoster, &SsdpProbe::default()];
+        self.refresh_cast_targets(&SliceDiscovery(&sources));
+    }
+
+    /// Cast the current playback to the discovered target `id` over an injected
+    /// [`Caster`] (MEDIA-17), surfacing the honest outcome — a real cast, or the typed
+    /// gate naming what a live cast needs (never a faked success). Tests inject a fake
+    /// caster; the app uses [`cast_current`](Self::cast_current).
+    pub fn cast_to<C: Caster>(&mut self, id: &str, caster: &C) {
+        let Some(target) = self.cast.targets.iter().find(|t| t.id == id).cloned() else {
+            self.ui.status = Some("That cast target is no longer listed.".to_owned());
+            return;
+        };
+        let Some(media) = self.player.media().map(ToOwned::to_owned) else {
+            self.ui.status = Some("Load something to cast first.".to_owned());
+            return;
+        };
+        let request = CastRequest {
+            media_url: media,
+            title: self
+                .player
+                .playlist()
+                .current()
+                .and_then(|item| item.title.clone()),
+            position_secs: self.player.position(),
+        };
+        match caster.cast(&target, &request) {
+            Ok(outcome) => {
+                self.ui.status = Some(format!(
+                    "Casting to {} ({}).",
+                    outcome.target.name,
+                    outcome.target.kind.label()
+                ));
+            }
+            Err(error) => self.ui.status = Some(cast_err(target.kind, &error)),
+        }
+    }
+
+    /// Cast the current playback to the discovered target `id` over the live
+    /// [`NetworkCaster`] — the app's cast affordance (DLNA/UPnP casts for real; a
+    /// Chromecast / mesh-node throw is the honest typed gate).
+    pub fn cast_current(&mut self, id: &str) {
+        self.cast_to(id, &NetworkCaster::default());
+    }
+
     // ── the transport glue ──────────────────────────────────────────────────────
 
     /// Apply a [`TransportAction`] to the core, recording any refusal on the status
     /// line. This is the whole glue seam (§6): each arm is one core call — the surface
     /// reimplements no playback, queue, or index logic.
     pub fn dispatch(&mut self, action: TransportAction) {
-        match self.apply(action) {
-            Err(msg) => self.ui.status = Some(msg),
-            // A successful playback change checkpoints the mesh session record
-            // (MEDIA-16), so a seat the operator roams to picks up the latest state.
-            Ok(()) => self.publish_roaming(),
+        // What to propagate to a joined party (MEDIA-17), captured *before* `apply`
+        // consumes the action — only the shared transport verbs. Opening a title carries
+        // its URL from the action; play/pause + seek + queue-advance read the *post-apply*
+        // player so the propagated intent is the resulting state. Local-only controls
+        // (frame-step, snapshot, EQ, speed, …) map to [`PartyPropagate::Local`] and stay
+        // on this seat.
+        let propagate = self.party.is_some().then(|| PartyPropagate::of(&action));
+        if let Err(msg) = self.apply(action) {
+            self.ui.status = Some(msg);
+            return;
+        }
+        // A successful playback change checkpoints the mesh session record (MEDIA-16), so
+        // a seat the operator roams to picks up the latest state, and — when a party is
+        // joined (MEDIA-17) — broadcasts the transport control so every other seat applies
+        // it in sync.
+        self.publish_roaming();
+        if let Some(command) = propagate.and_then(|p| p.finalize(self)) {
+            self.broadcast_party(command);
+        }
+    }
+
+    /// Broadcast a transport `command` to the joined party (a no-op with no party).
+    fn broadcast_party(&mut self, command: SyncCommand) {
+        if let Some(party) = self.party.as_mut() {
+            party.broadcast(command, &self.player, unix_millis());
         }
     }
 
@@ -1436,6 +1656,100 @@ fn ytdlp_err(e: YtDlpError) -> String {
     }
 }
 
+/// A short human label for a propagated party control (MEDIA-17), for the status line.
+const fn sync_command_label(command: &SyncCommand) -> &'static str {
+    match command {
+        SyncCommand::Open { .. } => "opened a new title",
+        SyncCommand::Play => "resumed playback",
+        SyncCommand::Pause => "paused",
+        SyncCommand::Seek { .. } => "seeked",
+    }
+}
+
+/// What a just-dispatched [`TransportAction`] propagates to a joined party (MEDIA-17).
+///
+/// Captured from the action *before* [`MediaController::apply`] consumes it, then
+/// [`finalize`](Self::finalize)d against the *post-apply* player so the propagated
+/// [`SyncCommand`] reflects the resulting state (the toggle's new run state, the landed
+/// seek position, the advanced queue item).
+enum PartyPropagate {
+    /// Play/pause — resolves to the post-apply run state.
+    Toggle,
+    /// A seek — resolves to the post-apply position.
+    Seek,
+    /// Open a specific title (its URL carried from the action).
+    Open(String),
+    /// Advance the queue — resolves to the post-apply current media.
+    OpenCurrent,
+    /// A local-only control — nothing propagates.
+    Local,
+}
+
+impl PartyPropagate {
+    /// Which shared transport verb `action` is (before `apply` consumes it).
+    fn of(action: &TransportAction) -> Self {
+        match action {
+            TransportAction::TogglePlay => Self::Toggle,
+            TransportAction::SeekBy(_) | TransportAction::SeekTo(_) => Self::Seek,
+            TransportAction::PlayPath(url) => Self::Open(url.clone()),
+            TransportAction::Next
+            | TransportAction::Prev
+            | TransportAction::SelectQueueIndex(_) => Self::OpenCurrent,
+            _ => Self::Local,
+        }
+    }
+
+    /// The concrete [`SyncCommand`] to broadcast, read from the post-apply `controller`
+    /// ([`None`] for a local-only control or a queue-advance that loaded nothing).
+    fn finalize<E: MediaEngine>(self, controller: &MediaController<E>) -> Option<SyncCommand> {
+        match self {
+            Self::Toggle => Some(if controller.is_playing() {
+                SyncCommand::Play
+            } else {
+                SyncCommand::Pause
+            }),
+            Self::Seek => Some(SyncCommand::Seek {
+                position_secs: controller.player().position(),
+            }),
+            Self::Open(url) => Some(SyncCommand::Open {
+                media: url,
+                title: None,
+            }),
+            Self::OpenCurrent => controller.player().media().map(|m| SyncCommand::Open {
+                media: m.to_owned(),
+                title: None,
+            }),
+            Self::Local => None,
+        }
+    }
+}
+
+/// Map a [`CastError`] to an honest status string (MEDIA-17). The gate cases name what a
+/// live cast to that renderer needs — never a swallowed error and never a faked cast (§7).
+fn cast_err(kind: CastKind, error: &CastError) -> String {
+    match error {
+        CastError::NoRenderers => "No cast renderer found on this network.".to_owned(),
+        CastError::Gated { needs, .. } => {
+            format!(
+                "Casting to a {} is not wired yet — needs {needs}.",
+                kind.label()
+            )
+        }
+        other => format!("Cast to {} failed: {other}", kind.label()),
+    }
+}
+
+/// Fold a slice of discovery sources into one [`RendererDiscovery`] (MEDIA-17), so the
+/// live mesh-roster + SSDP probe present as a single de-duplicated source to
+/// [`MediaController::refresh_cast_targets`].
+struct SliceDiscovery<'a>(&'a [&'a dyn RendererDiscovery]);
+
+impl RendererDiscovery for SliceDiscovery<'_> {
+    fn discover(&self) -> Vec<CastTarget> {
+        discover_all(self.0)
+    }
+}
+
 /// The display title of a Jellyfin item — its name, else its id (never empty).
 #[must_use]
 pub fn jellyfin_item_title(item: &BaseItemDto) -> String {
@@ -1867,6 +2181,183 @@ mod tests {
         ));
         assert_eq!(outcome, LoginOutcome::Offline);
         assert!(c.roaming_enabled());
+    }
+
+    // ── sync-play party mode + casting (MEDIA-17) ─────────────────────────────────
+
+    fn party(root: &std::path::Path, seat: &str) -> PartySession {
+        PartySession::new(
+            mde_media_core::PartyStore::new(root.to_path_buf()),
+            "movie-night",
+            seat,
+        )
+    }
+
+    /// The end-to-end surface glue: two seats join one party and a play/pause/seek on
+    /// one propagates in sync to the other — driven entirely through the controller
+    /// (dispatch → broadcast, join → sync, poll → apply) over a shared tempdir root.
+    #[test]
+    fn party_two_seats_watch_together_in_sync_through_the_controller() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        // Seat A hosts, opens a title, and plays it (each dispatch broadcasts).
+        let mut a = controller();
+        assert!(matches!(
+            a.enable_party(party(root, "seat-a")),
+            JoinOutcome::Joined { synced: false }
+        ));
+        assert!(a.party_enabled());
+        a.dispatch(TransportAction::PlayPath("movie.mkv".to_owned()));
+        a.pump(); // Loading → Playing
+
+        // Seat B joins mid-watch → it syncs to the in-progress title.
+        let mut b = controller();
+        assert!(matches!(
+            b.enable_party(party(root, "seat-b")),
+            JoinOutcome::Joined { synced: true }
+        ));
+        assert_eq!(
+            b.ui().tab,
+            MediaTab::Player,
+            "joining jumps to the Player view"
+        );
+        b.pump(); // Loading → Playing, then the pending sync lands
+        assert_eq!(b.player().media(), Some("movie.mkv"));
+        assert_eq!(b.player().state(), PlayerState::Playing);
+        assert_eq!(a.party_members(), vec!["seat-a", "seat-b"]);
+
+        // Seat A seeks + pauses; B converges on its next poll (no double-drive).
+        a.dispatch(TransportAction::SeekTo(45.0));
+        a.dispatch(TransportAction::TogglePlay); // Playing → Paused
+        assert_eq!(a.player().state(), PlayerState::Paused);
+
+        b.poll_party();
+        assert_eq!(b.player().state(), PlayerState::Paused, "B paused in sync");
+        assert!(
+            (b.player().position() - 45.0).abs() < 1.0,
+            "B seeked in sync"
+        );
+        assert!(b
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("another seat"));
+
+        // Leaving drops the seat from the party membership.
+        b.leave_party();
+        assert!(!b.party_enabled());
+        assert_eq!(a.party_members(), vec!["seat-a"]);
+    }
+
+    #[test]
+    fn party_is_honest_offline_without_a_mesh_volume() {
+        let mut c = loaded();
+        assert!(!c.party_enabled());
+        c.poll_party(); // no-op, no panic
+        let outcome = c.enable_party(PartySession::new(
+            mde_media_core::PartyStore::new(std::path::PathBuf::from("/no/such/mesh/root")),
+            "movie-night",
+            "seat-a",
+        ));
+        assert_eq!(outcome, JoinOutcome::Offline);
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("mesh volume"));
+    }
+
+    /// A canned discovery + a scripted caster, so the cast picker + throw are exercised
+    /// with no real network (the fixture path).
+    struct FakeDiscovery(Vec<CastTarget>);
+    impl RendererDiscovery for FakeDiscovery {
+        fn discover(&self) -> Vec<CastTarget> {
+            self.0.clone()
+        }
+    }
+    struct FakeCaster(Result<(), CastError>);
+    impl Caster for FakeCaster {
+        fn cast(
+            &self,
+            target: &CastTarget,
+            _req: &CastRequest,
+        ) -> Result<mde_media_core::CastOutcome, CastError> {
+            self.0.clone().map(|()| mde_media_core::CastOutcome {
+                target: target.clone(),
+            })
+        }
+    }
+
+    fn dlna_target() -> CastTarget {
+        CastTarget {
+            kind: CastKind::DlnaUpnp,
+            id: "tv-1".to_owned(),
+            name: "Living Room TV".to_owned(),
+            location: "http://192.168.1.50:8200/desc.xml".to_owned(),
+        }
+    }
+
+    #[test]
+    fn cast_lists_discovered_targets_and_throws_via_the_seam() {
+        let mut c = loaded();
+        c.refresh_cast_targets(&FakeDiscovery(vec![dlna_target()]));
+        assert!(c.cast().probed());
+        assert_eq!(c.cast().targets().len(), 1);
+
+        c.cast_to("tv-1", &FakeCaster(Ok(())));
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Casting to Living Room TV"));
+    }
+
+    #[test]
+    fn cast_is_honest_when_no_renderer_and_reports_the_typed_gate() {
+        // The empty-discovery honest gate.
+        let mut c = loaded();
+        c.refresh_cast_targets(&FakeDiscovery(vec![]));
+        assert!(c.cast().probed());
+        assert!(c.cast().targets().is_empty());
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("No cast renderer"));
+
+        // A typed gate from the caster is surfaced with what it needs (never faked).
+        c.refresh_cast_targets(&FakeDiscovery(vec![dlna_target()]));
+        c.cast_to(
+            "tv-1",
+            &FakeCaster(Err(CastError::Gated {
+                kind: "a Chromecast",
+                needs: "the CASTV2 launch handshake",
+            })),
+        );
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("CASTV2"));
+    }
+
+    #[test]
+    fn cast_needs_something_loaded_first() {
+        let mut c = controller(); // nothing loaded
+        c.refresh_cast_targets(&FakeDiscovery(vec![dlna_target()]));
+        c.cast_to("tv-1", &FakeCaster(Ok(())));
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Load something to cast"));
     }
 
     // ── network streams + yt-dlp (MEDIA-12) ──────────────────────────────────────

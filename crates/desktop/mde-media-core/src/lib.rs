@@ -127,6 +127,23 @@
 //! [`resolve_owner`] elects exactly one playing seat — the two-seat, no-double-play
 //! acceptance, unit-tested against [`FakeMpv`] with a tempdir root (airgap-safe).
 //!
+//! # Sync-play party mode + casting (MEDIA-17)
+//!
+//! The mirror image of roaming: several seats join ONE [`PartySession`] and play
+//! **together**. A transport control is a [`SyncCommand`] (`Open`/`Play`/`Pause`/
+//! `Seek`); a seat that issues one [`broadcast`](PartySession::broadcast)s a
+//! [`SyncEvent`] at the next party-global sequence, every other seat elects the
+//! highest-sequence event as the head ([`resolve_head`]) and applies it via the pure
+//! [`plan_sync`] fold — the play/pause/seek → sync-event → apply logic, exhaustively
+//! unit-tested with no engine, plus a two-seat in-sync test against [`FakeMpv`] over a
+//! tempdir root (the same Syncthing per-seat-file seam as roaming, no new transport).
+//! **Casting** ([`cast`]) throws the stream at a renderer: [`mesh_render_targets`] /
+//! [`parse_ssdp_responses`] / [`parse_chromecast_records`] are the real, fixture-tested
+//! discovery folds ([`MeshRoster`] / [`SsdpProbe`] probe live, returning nothing when
+//! nothing answers), and [`NetworkCaster`] casts to a live DLNA/UPnP renderer for real
+//! while returning a typed [`CastError::Gated`] — naming exactly what a live Chromecast /
+//! mesh-node cast needs — instead of ever faking a cast (§7, the `mesh_mount` gate idiom).
+//!
 //! # Capture devices (MEDIA-13)
 //!
 //! [`parse_v4l2_listing`] is the pure fold that projects a `v4l2-ctl --list-devices`
@@ -160,11 +177,13 @@
 pub mod audio;
 pub mod capabilities;
 pub mod capture;
+pub mod cast;
 pub mod controls;
 pub mod engine;
 pub mod fake;
 pub mod library;
 pub mod opensubtitles;
+pub mod party;
 pub mod player;
 pub mod playlist;
 pub mod resume;
@@ -185,11 +204,21 @@ pub use capture::{
     parse_v4l2_listing, v4l2_play_url, CaptureDevice, CaptureEnumerator, CaptureError, CaptureNode,
     CaptureNodeKind, V4l2Cli,
 };
+pub use cast::{
+    discover_all, dlna_control_url, mesh_render_targets, parse_chromecast_records,
+    parse_ssdp_responses, CastError, CastKind, CastOutcome, CastRequest, CastTarget, Caster,
+    MeshRoster, NetworkCaster, RendererDiscovery, SsdpProbe,
+};
 pub use controls::{AbLoop, PlaybackControls, ScreenshotMode};
 pub use engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
 pub use fake::FakeMpv;
 pub use library::{BrowseQuery, Library, LibraryItem, MediaKind, MediaMetadata, SortKey};
 pub use opensubtitles::{parse_search_response, request_headers, search_url, SubtitleSearchResult};
+pub use party::{
+    next_seq, plan_sync, resolve_head, JoinOutcome, PartyPoll, PartySeatRecord, PartySession,
+    PartyStore, SyncApply, SyncCommand, SyncEvent, TransportSnapshot, PARTY_SUBDIR,
+    SYNC_SEEK_EPSILON_SECS,
+};
 pub use player::{Player, PlayerError, PlayerEvent, PlayerState};
 pub use playlist::{Playlist, PlaylistItem, RepeatMode};
 pub use resume::{ResumeEntry, ResumeState};

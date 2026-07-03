@@ -101,6 +101,9 @@ impl App for MediaApp {
         self.roam_poll_frames = self.roam_poll_frames.wrapping_add(1);
         if self.roam_poll_frames % ROAM_POLL_INTERVAL_FRAMES == 0 {
             self.controller.poll_roaming();
+            // MEDIA-17: on the same cadence, converge the party plane — apply any
+            // play/pause/seek another seat issued so a shared session stays in sync.
+            self.controller.poll_party();
         }
 
         // Immersive fullscreen (design Q32) — sync only on a flip so we don't spam the
@@ -1067,6 +1070,134 @@ fn player_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControll
     if let Some(action) = action {
         controller.dispatch(action);
     }
+
+    // Watch-together party + cast (MEDIA-17). Rendered after the transport dispatch so a
+    // just-broadcast control is reflected; it drives the controller directly.
+    ui.add_space(Style::SP_XS);
+    party_cast_controls(ui, controller);
+}
+
+/// A click intent from the [`party_cast_controls`] section — collected while rendering
+/// (immutable controller reads), applied after, to keep egui's borrows clean.
+enum PartyCastIntent {
+    /// Host / join the named party.
+    JoinParty(String),
+    /// Leave the joined party.
+    LeaveParty,
+    /// Probe the network for cast renderers.
+    DiscoverCast,
+    /// Cast the current playback to the target with this id.
+    Cast(String),
+}
+
+/// The MEDIA-17 "Party & Cast" section: host/join a watch-together party (play/pause/seek
+/// propagate to every joined seat) and throw the current playback at a discovered
+/// renderer. All chrome is Carbon [`Style`] tokens (§4); the cast list honest-gates on an
+/// empty probe ("no renderer found"), never a fabricated device (§7).
+fn party_cast_controls<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
+    let mut intent: Option<PartyCastIntent> = None;
+    egui::CollapsingHeader::new(
+        RichText::new("Party & Cast")
+            .size(Style::BODY)
+            .color(Style::TEXT),
+    )
+    .id_salt("media-party-cast")
+    .show(ui, |ui| {
+        // ── Watch-together party ──
+        ui.label(
+            RichText::new("Watch together")
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+        if let Some(name) = controller.party_name() {
+            let members = controller.party_members();
+            ui.horizontal(|ui| {
+                status_dot(ui, Style::OK);
+                ui.label(
+                    RichText::new(format!("In \"{name}\" · {} seat(s)", members.len().max(1)))
+                        .size(Style::BODY)
+                        .color(Style::TEXT),
+                );
+                if ui.button("Leave").clicked() {
+                    intent = Some(PartyCastIntent::LeaveParty);
+                }
+            });
+            if !members.is_empty() {
+                muted_note(ui, members.join(", "));
+            }
+        } else {
+            let mut party = controller.ui().party_input.clone();
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut party)
+                        .hint_text("party name")
+                        .desired_width(Style::SP_XL * 5.0),
+                );
+                let trimmed = party.trim().to_owned();
+                if ui
+                    .add_enabled(!trimmed.is_empty(), egui::Button::new("Host / Join"))
+                    .clicked()
+                {
+                    intent = Some(PartyCastIntent::JoinParty(trimmed));
+                }
+            });
+            controller.ui_mut().party_input = party;
+            muted_note(
+                ui,
+                "Several seats join one session; play/pause/seek stay in sync.",
+            );
+        }
+
+        ui.add_space(Style::SP_S);
+        ui.separator();
+
+        // ── Cast ──
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Cast to")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            );
+            if ui.button("Find renderers").clicked() {
+                intent = Some(PartyCastIntent::DiscoverCast);
+            }
+        });
+        let targets = controller.cast().targets();
+        if targets.is_empty() {
+            // The honest gate: nothing found (or not yet probed).
+            let note = if controller.cast().probed() {
+                "No cast renderer found on this network."
+            } else {
+                "No renderers discovered yet — Find renderers to look."
+            };
+            muted_note(ui, note);
+        } else {
+            for target in targets {
+                ui.horizontal(|ui| {
+                    status_dot(ui, Style::ACCENT);
+                    ui.label(
+                        RichText::new(&target.name)
+                            .size(Style::BODY)
+                            .color(Style::TEXT),
+                    );
+                    muted_note(ui, target.kind.label());
+                    if ui.button("Cast").clicked() {
+                        intent = Some(PartyCastIntent::Cast(target.id.clone()));
+                    }
+                });
+            }
+        }
+    });
+
+    match intent {
+        Some(PartyCastIntent::JoinParty(name)) => {
+            controller.join_party(name);
+        }
+        Some(PartyCastIntent::LeaveParty) => controller.leave_party(),
+        Some(PartyCastIntent::DiscoverCast) => controller.discover_cast_targets(),
+        Some(PartyCastIntent::Cast(id)) => controller.cast_current(&id),
+        None => {}
+    }
 }
 
 /// The MEDIA-3 audio-processing controls, tucked in a collapsing "Audio & EQ" section
@@ -1576,6 +1707,52 @@ mod tests {
         // Idle-hidden OSD branch.
         c.ui_mut().osd_idle_secs = crate::model::OSD_HIDE_SECS + 1.0;
         render(&mut c, player_view);
+    }
+
+    /// A canned discovery so the cast list renders with no real network probe.
+    struct FakeDiscovery(Vec<mde_media_core::CastTarget>);
+    impl mde_media_core::RendererDiscovery for FakeDiscovery {
+        fn discover(&self) -> Vec<mde_media_core::CastTarget> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn party_and_cast_section_renders_all_branches() {
+        let mut c = controller();
+        c.dispatch(TransportAction::PlayPath("clip.mkv".to_owned()));
+        c.pump();
+
+        // Not joined + un-probed: the party name field + the honest "look" hint.
+        render(&mut c, party_cast_controls);
+
+        // A discovered renderer draws a Cast row (§7 — the whole cast picker is reachable).
+        c.refresh_cast_targets(&FakeDiscovery(vec![mde_media_core::CastTarget {
+            kind: mde_media_core::CastKind::DlnaUpnp,
+            id: "tv-1".to_owned(),
+            name: "Living Room TV".to_owned(),
+            location: "http://192.168.1.50:8200/desc.xml".to_owned(),
+        }]));
+        render(&mut c, party_cast_controls);
+
+        // The empty-probe honest gate renders its "no renderer found" note.
+        c.refresh_cast_targets(&FakeDiscovery(vec![]));
+        render(&mut c, party_cast_controls);
+
+        // Joined over a tempdir root: the in-party branch (members + Leave) renders.
+        let dir = tempfile::tempdir().expect("tempdir");
+        c.enable_party(mde_media_core::PartySession::new(
+            mde_media_core::PartyStore::new(dir.path().to_path_buf()),
+            "movie-night",
+            "seat-a",
+        ));
+        render(&mut c, party_cast_controls);
+        assert!(c.party_enabled());
+        assert_eq!(
+            c.player().state(),
+            PlayerState::Playing,
+            "render never stops"
+        );
     }
 
     #[test]

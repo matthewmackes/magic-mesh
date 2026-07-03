@@ -55,8 +55,8 @@ use mde_egui::{eframe, run_client};
 pub use app::{media_header, media_panel, media_pump, pip_window, MediaApp};
 pub use model::{
     capture_detail, client_capabilities, jellyfin_item_title, stream_media_type, CaptureUiState,
-    JellyfinSession, JellyfinSourceRow, JellyfinState, MediaController, MediaTab, SourceRow,
-    TransportAction, UiState,
+    CastUiState, JellyfinSession, JellyfinSourceRow, JellyfinState, MediaController, MediaTab,
+    SourceRow, TransportAction, UiState,
 };
 
 /// The engine the surface drives (the real mpv engine, under `--features mpv`).
