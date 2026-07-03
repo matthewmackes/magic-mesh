@@ -6,7 +6,8 @@
 //! tab's whole layout + live shells. The update loop consumes the tab chords
 //! (`Ctrl+Shift+T` new, `Ctrl+PageDown`/`PageUp` switch, `Ctrl+Shift+PageDown`/
 //! `PageUp` reorder) and the split-surface chords (`Ctrl+Shift+O/E/W/X`,
-//! `Alt+arrows`) **before** any pane widget clones the event stream, so a chord
+//! `Alt+arrows`, and the `Ctrl+Shift+A`/`Ctrl+Shift+G` broadcast toggles)
+//! **before** any pane widget clones the event stream, so a chord
 //! never doubles as shell input; everything else reaches the focused shell
 //! exactly as in TERM-3. When the last pane of the last tab closes (explicitly
 //! or because its shell exited), the surface closes with it — the classic

@@ -128,6 +128,11 @@ pub struct TerminalWidget {
     scroll_accum: f32,
     selection: Option<Selection>,
     last_grid: Option<(u16, u16)>,
+    /// This frame's locally-typed bytes, kept so the split multiplexer can fan
+    /// them out to grouped panes (TERM-6 broadcast). Filled by [`Self::send`]
+    /// as the pane types, drained by [`Self::take_input_echo`], and cleared at
+    /// the top of every [`Self::show`] so it only ever holds one frame's input.
+    input_echo: Vec<u8>,
 }
 
 impl TerminalWidget {
@@ -143,6 +148,7 @@ impl TerminalWidget {
             scroll_accum: 0.0,
             selection: None,
             last_grid: None,
+            input_echo: Vec::new(),
         }
     }
 
@@ -169,6 +175,8 @@ impl TerminalWidget {
     /// Render one frame into `ui`, consuming this frame's input. Fills all
     /// available space.
     pub fn show(&mut self, ui: &mut Ui) -> Response {
+        // One frame of local input only: last frame's broadcast echo is spent.
+        self.input_echo.clear();
         let font_id = FontId::monospace(self.font_size);
         let cell = ui.fonts(|f| Vec2::new(f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
@@ -404,13 +412,39 @@ impl TerminalWidget {
         }
     }
 
-    /// Queue bytes to the shell and snap the view back to live. A dead
-    /// session refuses input; the ended chip already tells that story, so the
-    /// error is deliberately dropped here.
+    /// Queue locally-typed `bytes` to this pane's shell and record them for
+    /// broadcast fan-out, then snap the view back to live. Recording here (not
+    /// in [`Self::write_input`]) is what makes the *typed* bytes — and only
+    /// those — the source the multiplexer replays to grouped panes.
     fn send(&mut self, bytes: &[u8]) {
+        self.input_echo.extend_from_slice(bytes);
+        self.write_input(bytes);
+    }
+
+    /// Write `bytes` to the PTY and snap to live — the shared tail of local
+    /// typing ([`Self::send`]) and broadcast fan-out ([`Self::feed_broadcast`]).
+    /// A dead session refuses input; the ended chip already tells that story,
+    /// so the error is deliberately dropped here.
+    fn write_input(&mut self, bytes: &[u8]) {
         self.scroll_offset = 0;
         self.scroll_accum = 0.0;
         let _ = self.pty.send_input(bytes);
+    }
+
+    /// Take this frame's locally-typed bytes for broadcast fan-out. The pane
+    /// has already sent them to its own shell; this hands the multiplexer a
+    /// copy to replay into the other panes of the broadcasting set (TERM-6).
+    #[must_use]
+    pub fn take_input_echo(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.input_echo)
+    }
+
+    /// Replay broadcast `bytes` (another pane's typing) into this pane's shell
+    /// through the identical [`LocalPty`] write path local input uses (§6 —
+    /// this widget still owns every PTY write). Not re-recorded into the echo,
+    /// so a fan-out can never re-fan.
+    pub fn feed_broadcast(&mut self, bytes: &[u8]) {
+        self.write_input(bytes);
     }
 }
 

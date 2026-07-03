@@ -39,7 +39,15 @@
 //!   layout + live PTYs; the last tab closing empties the surface. The binary
 //!   mounts it above the splits.
 //!
-//! Broadcast input and the mackesd mesh PTY broker arrive in TERM-6 onward.
+//! - [`splits`] also carries **broadcast/grouped input** (TERM-6): the focused
+//!   pane's typing fans out to every pane ([`Broadcast::All`]) or to the panes
+//!   sharing its named group ([`Broadcast::Group`]), each replayed through the
+//!   target pane's own [`LocalPty`] write path (§6 — no PTY write is
+//!   re-implemented). The panes in the live set wear a `Style::WARN` border;
+//!   the mode toggles by `Ctrl+Shift+A`/`Ctrl+Shift+G` or the on-surface chip,
+//!   and panes are assigned to named groups from a per-pane badge.
+//!
+//! The mackesd mesh PTY broker arrives in TERM-7 onward.
 
 pub mod engine;
 pub mod palette;
@@ -52,6 +60,8 @@ pub mod widget;
 pub use engine::{Terminal, DEFAULT_SCROLLBACK};
 pub use pty::{LocalPty, SpawnOptions};
 pub use screen::{Cell, CellAttrs, CellColor, CursorPos, Screen};
-pub use splits::{consume_commands, Command, NavDir, Pane, SessionId, SplitDir, SplitTerminal};
+pub use splits::{
+    consume_commands, Broadcast, Command, NavDir, Pane, SessionId, SplitDir, SplitTerminal,
+};
 pub use tabs::{consume_tab_commands, TabCommand, TabbedTerminal};
 pub use widget::TerminalWidget;

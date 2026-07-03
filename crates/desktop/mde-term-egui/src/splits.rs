@@ -31,6 +31,14 @@
 //!   geometrically, a split focuses the new pane, a close falls back to the
 //!   collapsed sibling. The focused pane wears a hairline [`Style::ACCENT`]
 //!   ring whenever more than one pane is up.
+//! - **broadcast/grouped input** (TERM-6, design lock Q5): the focused pane's
+//!   typing can fan out to every pane ([`Broadcast::All`]) or to the panes
+//!   sharing its named group ([`Broadcast::Group`]); each fan-out byte is
+//!   replayed through the target pane's own PTY-write path (§6 — the widget
+//!   still owns encoding + the write). Panes in the live set wear a
+//!   [`Style::WARN`] indicator border; the mode toggles by `Ctrl+Shift+A` /
+//!   `Ctrl+Shift+G` or the on-surface chip, and panes are assigned to named
+//!   groups from the per-pane badge.
 //!
 //! §4: every colour here is a `Style` token (dividers, focus ring, drop
 //! previews, chips) — the terminal *content* palette stays [`crate::palette`]'s
@@ -41,8 +49,8 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::{
-    pos2, vec2, Align2, Context, CursorIcon, Event, Id, Key, Modifiers, Pos2, Rect, Response,
-    Sense, Stroke, StrokeKind, Ui, UiBuilder,
+    pos2, vec2, Align2, Context, CursorIcon, Event, FontId, Id, Key, Modifiers, Pos2, Rect,
+    Response, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2,
 };
 use mde_egui::Style;
 
@@ -66,6 +74,17 @@ pub const MIN_RATIO: f32 = 0.05;
 
 /// How long the spawn-failure chip stays up.
 const ERROR_TTL: Duration = Duration::from_secs(6);
+
+/// The broadcast indicator border thickness — a [`Style::WARN`] ring on every
+/// pane in the fan-out set, a touch heavier than the focus ring so it reads
+/// first (nested just inside the ring, so a focused broadcasting pane shows
+/// both cues).
+const BROADCAST_BORDER_PX: f32 = 2.0;
+
+/// The named groups the per-pane badge assigns into, in cycle order (ungrouped
+/// → each in turn → ungrouped). A free-text group namer is a TERM-12 titlebar
+/// refinement; this fixed ring is the reachable "named group" set today.
+const GROUP_RING: [&str; 3] = ["A", "B", "C"];
 
 /// A shell session's identity in the registry and the tree. Ids are handed
 /// out once per spawn and never reused within a surface's lifetime.
@@ -114,6 +133,34 @@ pub enum Command {
     ToggleZoom,
     /// Move focus to the geometrically adjacent pane (`Alt+arrows`).
     Focus(NavDir),
+    /// Toggle a broadcast routing mode on, or back off if already active
+    /// (`Ctrl+Shift+A` = [`Broadcast::All`], `Ctrl+Shift+G` = [`Broadcast::Group`]).
+    ToggleBroadcast(Broadcast),
+}
+
+/// Where typed input in the focused pane is routed — Terminator's broadcast
+/// (design lock Q5): only the focused pane, every pane, or a named group.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Broadcast {
+    /// Input reaches only the focused pane (the default).
+    #[default]
+    Off,
+    /// Input fans out to every pane in the active split tree.
+    All,
+    /// Input fans out to every pane sharing the focused pane's named group.
+    Group,
+}
+
+impl Broadcast {
+    /// The next mode in the on-surface chip's cycle: `Off → All → Group → Off`.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::Group,
+            Self::Group => Self::Off,
+        }
+    }
 }
 
 // ── The split tree (pure — no toolkit, no PTY) ──────────────────────────────
@@ -671,6 +718,13 @@ pub fn consume_commands(ctx: &Context) -> Vec<Command> {
         if input.consume_key(cs, Key::X) || input.consume_key(cs, Key::Z) {
             cmds.push(Command::ToggleZoom);
         }
+        // Broadcast toggles (Terminator-style): all-panes / same-group.
+        if input.consume_key(cs, Key::A) {
+            cmds.push(Command::ToggleBroadcast(Broadcast::All));
+        }
+        if input.consume_key(cs, Key::G) {
+            cmds.push(Command::ToggleBroadcast(Broadcast::Group));
+        }
         let shifted_ctrl =
             input.modifiers.shift && (input.modifiers.ctrl || input.modifiers.command);
         if shifted_ctrl {
@@ -718,6 +772,11 @@ pub struct SplitTerminal {
     spawn_opts: SpawnOptions,
     /// The last spawn failure, chip-displayed until [`ERROR_TTL`] passes.
     error: Option<(String, Instant)>,
+    /// The current broadcast routing mode (TERM-6).
+    broadcast: Broadcast,
+    /// Named-group membership: a pane's leaf → its group label. A pane not in
+    /// the map is ungrouped; an entry is dropped when its pane closes.
+    groups: HashMap<SessionId, String>,
 }
 
 impl SplitTerminal {
@@ -740,6 +799,8 @@ impl SplitTerminal {
             next_id: 0,
             spawn_opts,
             error: None,
+            broadcast: Broadcast::Off,
+            groups: HashMap::new(),
         };
         let first = this.spawn_session()?;
         this.tree = Some(Pane::leaf(first));
@@ -772,7 +833,91 @@ impl SplitTerminal {
             Command::Close => self.close_session(self.focused),
             Command::ToggleZoom => self.toggle_zoom(),
             Command::Focus(dir) => self.focus_dir(dir),
+            Command::ToggleBroadcast(mode) => self.toggle_broadcast(mode),
         }
+    }
+
+    /// The current broadcast routing mode.
+    #[must_use]
+    pub const fn broadcast(&self) -> Broadcast {
+        self.broadcast
+    }
+
+    /// Set the broadcast routing mode outright (the on-surface chip cycles
+    /// through this).
+    pub const fn set_broadcast(&mut self, mode: Broadcast) {
+        self.broadcast = mode;
+    }
+
+    /// Toggle `mode` on, or back to [`Broadcast::Off`] when it is already
+    /// active — the keybind semantics, so the same chord turns its mode off.
+    pub fn toggle_broadcast(&mut self, mode: Broadcast) {
+        self.broadcast = if self.broadcast == mode {
+            Broadcast::Off
+        } else {
+            mode
+        };
+    }
+
+    /// The named group a pane is labelled into, if any.
+    #[must_use]
+    pub fn group_of(&self, id: SessionId) -> Option<&str> {
+        self.groups.get(&id).map(String::as_str)
+    }
+
+    /// Assign `id` to a named `group`, or clear its membership with `None`. An
+    /// empty label also clears, so no unnameable group can be created.
+    pub fn assign_group(&mut self, id: SessionId, group: Option<String>) {
+        match group.filter(|g| !g.is_empty()) {
+            Some(g) => {
+                self.groups.insert(id, g);
+            }
+            None => {
+                self.groups.remove(&id);
+            }
+        }
+    }
+
+    /// Cycle `id`'s label one step through [`GROUP_RING`]: ungrouped → the
+    /// first named group → … → the last → ungrouped again (the badge action).
+    pub fn cycle_group(&mut self, id: SessionId) {
+        let next = self.group_of(id).map_or(Some(GROUP_RING[0]), |cur| {
+            GROUP_RING
+                .iter()
+                .position(|g| *g == cur)
+                .and_then(|i| GROUP_RING.get(i + 1).copied())
+        });
+        self.assign_group(id, next.map(str::to_owned));
+    }
+
+    /// Whether `id` is in the live broadcasting set: it wears the indicator
+    /// and — unless it is the focused pane — receives the fan-out. In
+    /// [`Broadcast::Group`] a pane broadcasts only when it shares the focused
+    /// pane's group (so an ungrouped focus broadcasts to nobody).
+    #[must_use]
+    pub fn is_broadcasting(&self, id: SessionId) -> bool {
+        match self.broadcast {
+            Broadcast::Off => false,
+            Broadcast::All => self.tree.as_ref().is_some_and(|t| t.contains(id)),
+            Broadcast::Group => matches!(
+                (self.groups.get(&self.focused), self.groups.get(&id)),
+                (Some(focus_group), Some(id_group)) if focus_group == id_group
+            ),
+        }
+    }
+
+    /// The fan-out recipients of the focused pane's typing this frame: every
+    /// pane in the broadcasting set **except** the focused one (which already
+    /// got the keystrokes directly), in tree reading order. Empty when
+    /// broadcast is off, or the selected group holds only the focused pane.
+    fn broadcast_targets(&self) -> Vec<SessionId> {
+        let Some(tree) = &self.tree else {
+            return Vec::new();
+        };
+        tree.leaves()
+            .into_iter()
+            .filter(|id| *id != self.focused && self.is_broadcasting(*id))
+            .collect()
     }
 
     /// Spawn a shell into the registry (not yet in the tree).
@@ -827,6 +972,7 @@ impl SplitTerminal {
         }
         drop(self.sessions.remove(&id));
         self.pane_ids.remove(&id);
+        self.groups.remove(&id);
         if self.zoomed == Some(id) {
             self.zoomed = None;
         }
@@ -884,11 +1030,180 @@ impl SplitTerminal {
 
         self.prefocus(ui);
         let responses = self.show_panes(ui, &lay);
+        // Fan the focused pane's just-typed bytes to the broadcasting set,
+        // using the focus that held the keyboard *this* frame (before the
+        // click reconcile below can move it).
+        self.fan_out_broadcast();
         self.show_dividers(ui, &lay);
         self.show_pane_drag(ui, &lay);
+        self.paint_broadcast_indicators(ui, &lay);
         self.paint_focus_ring(ui, &lay);
+        self.show_group_badges(ui, &lay);
+        self.show_broadcast_control(ui, full);
         self.paint_chips(ui, full);
         self.reconcile_focus(&responses);
+    }
+
+    /// Replay the focused pane's just-typed bytes into every other pane of the
+    /// broadcasting set, each through its own [`TerminalWidget::feed_broadcast`]
+    /// → [`LocalPty`] write path (§6 glue — no PTY write is re-implemented, and
+    /// the split-tree leaf enumeration is reused via [`Self::broadcast_targets`]).
+    /// A no-op when broadcast is off, the set is a lone pane, or nothing typed.
+    fn fan_out_broadcast(&mut self) {
+        if self.broadcast == Broadcast::Off {
+            return;
+        }
+        let targets = self.broadcast_targets();
+        if targets.is_empty() {
+            return;
+        }
+        let Some(bytes) = self
+            .sessions
+            .get_mut(&self.focused)
+            .map(TerminalWidget::take_input_echo)
+        else {
+            return;
+        };
+        if bytes.is_empty() {
+            return;
+        }
+        for id in targets {
+            if let Some(widget) = self.sessions.get_mut(&id) {
+                widget.feed_broadcast(&bytes);
+            }
+        }
+    }
+
+    /// The [`Style::WARN`] indicator border every pane in the live broadcasting
+    /// set wears (§7 — the visible cue for which panes receive fan-out), nested
+    /// just inside the [`Style::ACCENT`] focus ring so a focused broadcasting
+    /// pane shows both.
+    fn paint_broadcast_indicators(&self, ui: &Ui, lay: &Layout) {
+        if self.broadcast == Broadcast::Off {
+            return;
+        }
+        for (sid, rect) in &lay.leaves {
+            if self.is_broadcasting(*sid) {
+                ui.painter().rect_stroke(
+                    rect.shrink(1.0),
+                    0.0,
+                    Stroke::new(BROADCAST_BORDER_PX, Style::WARN),
+                    StrokeKind::Inside,
+                );
+            }
+        }
+    }
+
+    /// The clickable broadcast-mode chip (bottom-left, only with more than one
+    /// pane): shows the current routing and cycles `Off → All → Group → Off` on
+    /// click — the UI half of the keybind toggle. WARN while fan-out is live,
+    /// dim when off.
+    fn show_broadcast_control(&mut self, ui: &Ui, full: Rect) {
+        if self.sessions.len() <= 1 {
+            return;
+        }
+        let label = match self.broadcast {
+            Broadcast::Off => "cast: off".to_owned(),
+            Broadcast::All => "cast: all".to_owned(),
+            Broadcast::Group => self.group_of(self.focused).map_or_else(
+                || "cast: grp \u{2014}".to_owned(),
+                |g| format!("cast: grp {g}"),
+            ),
+        };
+        let accent = if self.broadcast == Broadcast::Off {
+            Style::TEXT_DIM
+        } else {
+            Style::WARN
+        };
+        let at = pos2(full.min.x + Style::SP_S, full.max.y - Style::SP_S);
+        let resp = Self::chip_button(
+            ui,
+            ui.id().with("term-broadcast"),
+            at,
+            Align2::LEFT_BOTTOM,
+            &label,
+            accent,
+        );
+        if resp.clicked() {
+            self.set_broadcast(self.broadcast.next());
+        }
+    }
+
+    /// Per-pane group badges (bottom-right, only with more than one pane): a
+    /// small clickable tag showing the pane's group label (or `+` when
+    /// ungrouped) that cycles it through [`GROUP_RING`] — the UI to
+    /// assign/label panes into a named broadcast group. WARN while the pane is
+    /// in the live broadcasting set.
+    fn show_group_badges(&mut self, ui: &Ui, lay: &Layout) {
+        if self.sessions.len() <= 1 {
+            return;
+        }
+        let mut to_cycle = None;
+        for (sid, rect) in &lay.leaves {
+            let label = self
+                .group_of(*sid)
+                .map_or_else(|| "+".to_owned(), str::to_owned);
+            let color = if self.is_broadcasting(*sid) {
+                Style::WARN
+            } else {
+                Style::TEXT_DIM
+            };
+            let at = pos2(rect.max.x - Style::SP_XS, rect.max.y - Style::SP_XS);
+            let resp = Self::chip_button(
+                ui,
+                ui.id().with(("term-group", sid.0)),
+                at,
+                Align2::RIGHT_BOTTOM,
+                &label,
+                color,
+            );
+            if resp.clicked() {
+                to_cycle = Some(*sid);
+            }
+        }
+        if let Some(sid) = to_cycle {
+            self.cycle_group(sid);
+        }
+    }
+
+    /// A small interactive chip (the [`crate::widget::chip`] look, but hit-
+    /// tested): a SURFACE plate + hairline that lights `accent` on hover, its
+    /// `id`/rect anchored by `anchor` at `at`. Registered after the panes, so
+    /// it claims the pointer within its rect (egui's later-interact rule) and a
+    /// click on it never doubles as terminal input.
+    fn chip_button(
+        ui: &Ui,
+        id: Id,
+        at: Pos2,
+        anchor: Align2,
+        label: &str,
+        accent: mde_egui::egui::Color32,
+    ) -> Response {
+        let font = FontId::monospace(Style::SMALL);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(label.to_owned(), font, Style::TEXT);
+        let rect = anchor.anchor_size(at, galley.size() + Vec2::splat(2.0 * Style::SP_XS));
+        let resp = ui
+            .interact(rect, id, Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand);
+        let painter = ui.painter();
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE);
+        painter.rect_stroke(
+            rect,
+            Style::RADIUS,
+            Stroke::new(
+                1.0,
+                if resp.hovered() {
+                    accent
+                } else {
+                    Style::BORDER
+                },
+            ),
+            StrokeKind::Inside,
+        );
+        painter.galley(rect.min + Vec2::splat(Style::SP_XS), galley, accent);
+        resp
     }
 
     /// Terminator's close-on-exit: a shell that ended closes its pane (the
@@ -1764,5 +2079,227 @@ mod tests {
         assert_eq!(term.drag, None);
         assert_eq!(term.focused_session(), a, "the moved pane keeps focus");
         assert_eq!(term.session_count(), 3, "no session was lost in the move");
+    }
+
+    // ── broadcast / grouped input (TERM-6) ──────────────────────────────────
+
+    /// A pane's shell output (scrollback + viewport) joined into one string.
+    fn pane_text(term: &SplitTerminal, id: SessionId) -> String {
+        term.sessions[&id].pty().with_terminal(|t| {
+            let full = t.full();
+            (0..full.rows())
+                .map(|r| full.line_text(r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
+
+    /// Poll a pane's shell output until `needle` appears. The PTY pumps are
+    /// asynchronous, so tests wait on observed bytes — never a bare sleep.
+    fn wait_for_text(term: &SplitTerminal, id: SessionId, needle: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !pane_text(term, id).contains(needle) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {needle:?} in pane {id:?}"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// A three-pane split `a | (b / c)` over real `/bin/sh` PTYs, with `a`
+    /// focused (both in the tree and, after settling, holding egui's keyboard).
+    fn three_panes(ctx: &Context) -> (SplitTerminal, SessionId, SessionId, SessionId) {
+        let mut term = SplitTerminal::new(sh_opts()).expect("first shell");
+        let a = term.focused_session();
+        term.apply(Command::Split(SplitDir::V));
+        let b = term.focused_session();
+        term.apply(Command::Split(SplitDir::H));
+        let c = term.focused_session();
+        assert_eq!(term.session_count(), 3);
+        term.focused = a;
+        settle(ctx, &mut term, 3);
+        (term, a, b, c)
+    }
+
+    #[test]
+    fn broadcast_next_cycles_off_all_group() {
+        assert_eq!(Broadcast::Off.next(), Broadcast::All);
+        assert_eq!(Broadcast::All.next(), Broadcast::Group);
+        assert_eq!(Broadcast::Group.next(), Broadcast::Off);
+    }
+
+    #[test]
+    fn broadcast_targets_track_mode_group_and_close() {
+        let ctx = test_ctx();
+        let (mut term, a, b, c) = three_panes(&ctx);
+
+        // Off (default): nobody broadcasts, no fan-out targets.
+        assert_eq!(term.broadcast(), Broadcast::Off);
+        assert!(term.broadcast_targets().is_empty());
+        assert!(!term.is_broadcasting(a));
+
+        // All: the other two panes (the focused one already got the keystrokes).
+        term.set_broadcast(Broadcast::All);
+        assert_eq!(term.broadcast_targets(), vec![b, c]);
+        assert!(term.is_broadcasting(a) && term.is_broadcasting(b) && term.is_broadcasting(c));
+
+        // Named group: an ungrouped focus routes nowhere; once a+b share "A",
+        // it targets b (and never the ungrouped c).
+        term.set_broadcast(Broadcast::Group);
+        assert!(term.broadcast_targets().is_empty(), "focus is ungrouped");
+        term.assign_group(a, Some("A".to_owned()));
+        term.assign_group(b, Some("A".to_owned()));
+        assert_eq!(term.broadcast_targets(), vec![b]);
+        assert!(term.is_broadcasting(a) && term.is_broadcasting(b));
+        assert!(!term.is_broadcasting(c), "c is not in group A");
+
+        // A membership change re-targets: move b to "B" and a is alone in "A".
+        term.assign_group(b, Some("B".to_owned()));
+        assert!(term.broadcast_targets().is_empty(), "b left a's group");
+        term.assign_group(b, Some("A".to_owned()));
+        assert_eq!(term.broadcast_targets(), vec![b]);
+
+        // A closed pane drops from the set and clears its membership.
+        term.close_session(b);
+        assert!(term.group_of(b).is_none(), "closed pane's group cleared");
+        assert!(
+            term.broadcast_targets().is_empty(),
+            "the group lost its only peer"
+        );
+        term.set_broadcast(Broadcast::All);
+        assert_eq!(
+            term.broadcast_targets(),
+            vec![c],
+            "closed b is gone from All too"
+        );
+    }
+
+    #[test]
+    fn broadcast_all_fans_typed_input_to_every_real_pty() {
+        let ctx = test_ctx();
+        let (mut term, a, b, c) = three_panes(&ctx);
+        term.set_broadcast(Broadcast::All);
+
+        // Type a quoted command into the focused pane: a real frame drives the
+        // widget's own input path, and the multiplexer fans the captured bytes
+        // out to b and c through their PTYs.
+        frame(
+            &ctx,
+            &mut term,
+            vec![
+                Event::Text("echo bx-'all'".to_owned()),
+                key_event(Key::Enter, Modifiers::NONE),
+            ],
+            Modifiers::NONE,
+        );
+
+        // Every shell ran it — the fan-out reached all three real PTYs. The
+        // quoted tail keeps the echoed *input* line from matching "bx-all".
+        for id in [a, b, c] {
+            wait_for_text(&term, id, "bx-all");
+        }
+    }
+
+    #[test]
+    fn broadcast_group_fans_only_to_the_named_group() {
+        let ctx = test_ctx();
+        let (mut term, a, b, c) = three_panes(&ctx);
+        term.assign_group(a, Some("net".to_owned()));
+        term.assign_group(c, Some("net".to_owned()));
+        // b is left ungrouped.
+        term.set_broadcast(Broadcast::Group);
+
+        // Model routing: only c is a fan-out target of the focused a.
+        assert_eq!(term.broadcast_targets(), vec![c]);
+        assert!(!term.is_broadcasting(b));
+
+        frame(
+            &ctx,
+            &mut term,
+            vec![
+                Event::Text("echo bx-'grp'".to_owned()),
+                key_event(Key::Enter, Modifiers::NONE),
+            ],
+            Modifiers::NONE,
+        );
+
+        // Both grouped panes ran it: a typed it, c received the fan-out. The
+        // ungrouped b's exclusion is proven above at the model level (a
+        // timing-based negative over a real shell would be flaky).
+        wait_for_text(&term, a, "bx-grp");
+        wait_for_text(&term, c, "bx-grp");
+    }
+
+    #[test]
+    fn broadcast_chords_decode_and_toggle_the_mode() {
+        // Decode: Ctrl+Shift+A / Ctrl+Shift+G map to the broadcast toggles and
+        // are consumed, so they never leak to a shell.
+        let cs = Modifiers::CTRL | Modifiers::SHIFT;
+        let ctx = Context::default();
+        let raw = RawInput {
+            modifiers: cs,
+            events: vec![key_event(Key::A, cs), key_event(Key::G, cs)],
+            ..RawInput::default()
+        };
+        let _ = ctx.run(raw, |ctx| {
+            assert_eq!(
+                consume_commands(ctx),
+                vec![
+                    Command::ToggleBroadcast(Broadcast::All),
+                    Command::ToggleBroadcast(Broadcast::Group),
+                ]
+            );
+            ctx.input(|i| assert!(i.events.is_empty(), "chords consumed"));
+        });
+
+        // Toggle semantics through apply: the same chord turns its mode off.
+        let mut term = SplitTerminal::new(sh_opts()).expect("first shell");
+        term.apply(Command::ToggleBroadcast(Broadcast::All));
+        assert_eq!(term.broadcast(), Broadcast::All);
+        term.apply(Command::ToggleBroadcast(Broadcast::Group));
+        assert_eq!(
+            term.broadcast(),
+            Broadcast::Group,
+            "the other chord switches modes"
+        );
+        term.apply(Command::ToggleBroadcast(Broadcast::Group));
+        assert_eq!(
+            term.broadcast(),
+            Broadcast::Off,
+            "the same chord toggles off"
+        );
+    }
+
+    #[test]
+    fn cycle_group_walks_the_named_ring_and_assign_clears() {
+        let mut term = SplitTerminal::new(sh_opts()).expect("first shell");
+        let a = term.focused_session();
+        assert_eq!(term.group_of(a), None);
+        term.cycle_group(a);
+        assert_eq!(term.group_of(a), Some("A"));
+        term.cycle_group(a);
+        assert_eq!(term.group_of(a), Some("B"));
+        term.cycle_group(a);
+        assert_eq!(term.group_of(a), Some("C"));
+        term.cycle_group(a);
+        assert_eq!(
+            term.group_of(a),
+            None,
+            "past the last group wraps to ungrouped"
+        );
+
+        // assign_group sets an explicit label and clears on None / an empty one.
+        term.assign_group(a, Some("ops".to_owned()));
+        assert_eq!(term.group_of(a), Some("ops"));
+        term.assign_group(a, None);
+        assert_eq!(term.group_of(a), None);
+        term.assign_group(a, Some("ops".to_owned()));
+        term.assign_group(a, Some(String::new()));
+        assert_eq!(
+            term.group_of(a),
+            None,
+            "an empty label clears rather than names"
+        );
     }
 }
