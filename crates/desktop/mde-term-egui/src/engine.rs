@@ -140,6 +140,21 @@ impl Terminal {
         self.snapshot(true)
     }
 
+    /// Snapshot a viewport-sized window whose top edge sits `offset` lines
+    /// above the live viewport's top — the scrollback viewport (TERM-3).
+    ///
+    /// `window(0)` is exactly [`Self::viewport`]; `offset` clamps to the
+    /// retained history. A renderer scrolled deep into a 100k-line history
+    /// pays only O(rows × cols) per frame here, never the full-history copy
+    /// of [`Self::full`].
+    #[must_use]
+    // offset ≤ history, far below i32::MAX.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    pub fn window(&self, offset: usize) -> Screen {
+        let offset = offset.min(self.scrollback_len());
+        self.snapshot_rows(Line(-(offset as i32)), self.rows())
+    }
+
     // Grid indices are `i32`/`usize` bounded by the terminal dimensions (a few
     // thousand at most), so the row/column casts below cannot truncate or wrap.
     #[allow(
@@ -149,23 +164,38 @@ impl Terminal {
     )]
     fn snapshot(&self, include_history: bool) -> Screen {
         let grid = self.term.grid();
-        let cols = grid.columns();
         let top = if include_history {
             grid.topmost_line()
         } else {
             Line(0)
         };
         let bottom = grid.bottommost_line();
-
         let row_count = (bottom.0 - top.0 + 1).max(0) as usize;
+        self.snapshot_rows(top, row_count)
+    }
+
+    // Same bounded-index casts as `snapshot`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_sign_loss
+    )]
+    fn snapshot_rows(&self, top: Line, row_count: usize) -> Screen {
+        let grid = self.term.grid();
+        let cols = grid.columns();
+
         let mut cells = Vec::with_capacity(row_count.saturating_mul(cols));
-        for line in top.0..=bottom.0 {
+        for row in 0..row_count {
+            let line = Line(top.0 + row as i32);
             for col in 0..cols {
-                let src = &grid[Point::new(Line(line), Column(col))];
+                let src = &grid[Point::new(line, Column(col))];
                 cells.push(convert_cell(src));
             }
         }
 
+        // Rows from the top of THIS snapshot; a cursor below the window (deep
+        // scrollback view) lands at `row >= row_count`, which renderers treat
+        // as "not visible".
         let cursor_point = grid.cursor.point;
         let cursor = CursorPos {
             row: (cursor_point.line.0 - top.0).max(0) as usize,
@@ -347,6 +377,37 @@ mod tests {
         // Default tab stops every 8 columns: tab from col 0 -> col 8.
         let s = run(20, 1, b"\tX");
         assert_eq!(ch(&s, 0, 8), 'X');
+    }
+
+    #[test]
+    fn window_slices_history_at_the_requested_depth() {
+        // 2 visible rows; L1/L2 scroll into history, viewport = L3/L4.
+        let mut term = Terminal::new(10, 2, 1000);
+        term.feed(b"L1\r\nL2\r\nL3\r\nL4");
+        assert_eq!(term.scrollback_len(), 2);
+
+        // Depth 0 is exactly the live viewport.
+        assert_eq!(term.window(0), term.viewport());
+
+        // One line back: the window spans L2/L3.
+        let w1 = term.window(1);
+        assert_eq!(
+            (w1.line_text(0), w1.line_text(1)),
+            ("L2".into(), "L3".into())
+        );
+
+        // Full depth — and any over-ask clamps to it.
+        let w2 = term.window(2);
+        assert_eq!(
+            (w2.line_text(0), w2.line_text(1)),
+            ("L1".into(), "L2".into())
+        );
+        assert_eq!(term.window(99), w2);
+
+        // The live cursor sits below a scrolled window: its snapshot row is
+        // pushed past the window height (renderers read that as "hidden").
+        assert!(w2.cursor().row >= w2.rows(), "cursor is off-window");
+        assert_eq!(term.window(0).cursor(), term.viewport().cursor());
     }
 
     #[test]

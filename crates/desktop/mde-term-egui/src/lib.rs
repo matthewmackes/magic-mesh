@@ -16,14 +16,25 @@
 //!   `/bin/sh`) on a fresh PTY, pumped into the engine by reader/writer
 //!   threads; typed argv spawn (§9), `TIOCSWINSZ` on resize, clean child reap
 //!   on close.
+//! - [`widget::TerminalWidget`] (TERM-3) — the interactive egui pane: the cell
+//!   grid painted as batched same-style runs (fg/bg/attrs through the content
+//!   palette), block cursor, mouse selection + clipboard, a scrollback
+//!   viewport, and rect→cols/rows resizing wired to the PTY. The `mde-term-egui`
+//!   binary mounts one over a login shell on the shared harness.
+//! - [`palette`] — the 16/256-colour **content** palette (the documented §4
+//!   carve-out): Quasar-token-derived where a token carries the meaning,
+//!   standard ANSI hues elsewhere; the only raw colour values in the crate.
 //!
-//! The egui surface, the mackesd mesh PTY broker, splits, tabs, and broadcast
-//! arrive in TERM-3 onward.
+//! The mackesd mesh PTY broker, splits, tabs, and broadcast arrive in TERM-4
+//! onward.
 
 pub mod engine;
+pub mod palette;
 pub mod pty;
 pub mod screen;
+pub mod widget;
 
 pub use engine::{Terminal, DEFAULT_SCROLLBACK};
 pub use pty::{LocalPty, SpawnOptions};
 pub use screen::{Cell, CellAttrs, CellColor, CursorPos, Screen};
+pub use widget::TerminalWidget;

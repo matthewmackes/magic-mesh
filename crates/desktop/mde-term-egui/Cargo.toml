@@ -9,12 +9,12 @@
 # broker) render and feed. TERM-1 is the headless core only: no egui view yet,
 # but a real, buildable workspace member.
 #
-# Tier (§6): desktop-shell. Its only in-workspace edges (added by later units)
-# point inward to `crates/shared/*` (the egui harness + Carbon look). The VT
-# engine is an external crate.
+# Tier (§6): desktop-shell. Its only in-workspace edge points inward to
+# `crates/shared/mde-egui` (the harness + the shared Style). The VT engine is
+# an external crate.
 [package]
 name        = "mde-term-egui"
-description = "MCNF Quasar — the mesh terminal surface. TERM-1 lands the VT engine core: alacritty_terminal (mature xterm/VT100 parsing, §6 — no re-implemented VT) wrapped behind a render-agnostic screen model (cell grid with fg/bg/attrs + a soft-capped scrollback ring). TERM-2 wires a real local shell to it: the user's $SHELL as a login shell on a fresh PTY (alacritty's own tty layer — typed argv spawn, §9), pump threads both ways, TIOCSWINSZ resize, clean child reap."
+description = "MCNF Quasar — the mesh terminal surface. TERM-1 lands the VT engine core: alacritty_terminal (mature xterm/VT100 parsing, §6 — no re-implemented VT) wrapped behind a render-agnostic screen model (cell grid with fg/bg/attrs + a soft-capped scrollback ring). TERM-2 wires a real local shell to it: the user's $SHELL as a login shell on a fresh PTY (alacritty's own tty layer — typed argv spawn, §9), pump threads both ways, TIOCSWINSZ resize, clean child reap. TERM-3 paints it: an interactive egui widget (batched same-style glyph runs, content palette with true-color pass-through, block cursor, mouse selection + clipboard, scrollback viewport, rect-driven cols/rows) and the runnable surface binary on the mde-egui harness."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -26,7 +26,16 @@ repository.workspace   = true
 name = "mde_term_egui"
 path = "src/lib.rs"
 
+[[bin]]
+name = "mde-term-egui"
+path = "src/main.rs"
+
 [dependencies]
+# The §4/§5 egui harness — `run_client` + the shared `Style` + the re-exported
+# `egui`/`eframe` (one toolkit resolution for every surface). The TERM-3 widget
+# renders all chrome through `Style`; the ANSI content palette (the documented
+# §4 carve-out) lives in this crate's `palette` module.
+mde-egui = { path = "../../shared/mde-egui" }
 # REUSE (§6): the mature VT/xterm engine. `alacritty_terminal` owns the ANSI
 # parser (its bundled `vte`), the cell grid, and the scrollback — the exact
 # fidelity the design doc's Q1 lock demands. We consume it headless (no
