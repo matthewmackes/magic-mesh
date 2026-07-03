@@ -28,6 +28,12 @@ pub(crate) enum Surface {
     /// The five-plane mesh-control Workbench (This Node → Fleet).
     #[default]
     Workbench,
+    /// The live **Mesh Map** — the egui reincarnation of MESHMAP (`mde-mesh-view`):
+    /// a procedural canvas of the current mesh (nodes by role + health, the elected
+    /// leader, and the links between them), folded from the same world-readable
+    /// mesh-status snapshot the Workbench planes read. An all-green onboard
+    /// self-test auto-opens it (OW-10).
+    MeshView,
     /// The VDI **Desktop** surface — a brokered VM desktop rendered egui-native
     /// (`mde-vdi-rdp` / `mde-vdi-vnc`), the point of E12 "Quasar".
     Desktop,
@@ -76,11 +82,13 @@ pub(crate) enum Surface {
 #[allow(clippy::use_self)]
 impl Surface {
     /// The dock entries in nav order — the Workbench (mesh-control home) first,
-    /// then the local VM Instances broker + the brokered Desktop, then the three
-    /// app surfaces, then the unified Chat surface (the ONE notification
-    /// interface), and finally this seat's host-controls System + Storage surfaces.
-    pub(crate) const ALL: [Surface; 12] = [
+    /// then the live Mesh Map, then the local VM Instances broker + the brokered
+    /// Desktop, then the three app surfaces, then the unified Chat surface (the ONE
+    /// notification interface), and finally this seat's host-controls System +
+    /// Storage surfaces.
+    pub(crate) const ALL: [Surface; 13] = [
         Surface::Workbench,
+        Surface::MeshView,
         Surface::Instances,
         Surface::Desktop,
         Surface::Music,
@@ -98,6 +106,7 @@ impl Surface {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Surface::Workbench => "Workbench",
+            Surface::MeshView => "Mesh Map",
             Surface::Instances => "Instances",
             Surface::Desktop => "Desktop",
             Surface::Music => "Music",
@@ -118,6 +127,9 @@ impl Surface {
         match self {
             Surface::Workbench => {
                 "Mesh control — This Node, Controller, Network, Fleet, Provisioning."
+            }
+            Surface::MeshView => {
+                "The live mesh map — nodes by role and health, the elected leader, and the links between them."
             }
             Surface::Instances => {
                 "Manage this node's local VMs (cloud-hypervisor) — create, boot, shut down."
@@ -184,16 +196,18 @@ mod tests {
 
     #[test]
     fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
-        // Twelve entries: Workbench first, two VM surfaces (Instances / Desktop),
-        // the app surfaces (Music / Media — the full media player, MEDIA-18 / Files /
-        // Voice / Browser — the sandboxed Servo browser, BOOKMARKS-6 / Terminal — the
-        // Terminator-class terminal over a real PTY, TERM-16), the unified Chat surface
-        // (the ONE notification interface — the standalone Notifications + Clipboard
-        // surfaces are retired, NOTIFY-CHAT-6), the host-controls System surface, and
-        // the Storage surface (GParted-authentic disk mgmt, E12-21).
-        assert_eq!(Surface::ALL.len(), 12);
+        // Thirteen entries: Workbench first, the live Mesh Map (OW-10, `mde-mesh-view`),
+        // two VM surfaces (Instances / Desktop), the app surfaces (Music / Media — the
+        // full media player, MEDIA-18 / Files / Voice / Browser — the sandboxed Servo
+        // browser, BOOKMARKS-6 / Terminal — the Terminator-class terminal over a real
+        // PTY, TERM-16), the unified Chat surface (the ONE notification interface — the
+        // standalone Notifications + Clipboard surfaces are retired, NOTIFY-CHAT-6), the
+        // host-controls System surface, and the Storage surface (GParted-authentic disk
+        // mgmt, E12-21).
+        assert_eq!(Surface::ALL.len(), 13);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
+            Surface::MeshView,
             Surface::Instances,
             Surface::Desktop,
             Surface::Music,

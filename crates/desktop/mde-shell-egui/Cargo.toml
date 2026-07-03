@@ -79,6 +79,12 @@ mde-cosmic-applet = { path = "../../platform/mde-cosmic-applet", default-feature
 mde-music-egui = { path = "../mde-music-egui" }
 mde-files-egui = { path = "../mde-files-egui" }
 mde-voice-egui = { path = "../mde-voice-egui" }
+# OW-10 — the Surface::MeshView "Mesh Map": the egui reincarnation of MESHMAP. The
+# shell folds the world-readable mesh-status snapshot into `mde_mesh_view::MeshState`
+# and hands it to the `MeshView` painter each frame (the shell is its first caller).
+# A pure desktop-shell-tier canvas widget over the shared `mde-egui` harness — no
+# mesh-substrate dependency — so the edge points sideways-inward within the tier (§6).
+mde-mesh-view = { path = "../mde-mesh-view" }
 # MEDIA-18 — the Surface::Media player, mounted exactly like Music/Files/Voice: the
 # shell holds its production `MediaSurface` (a `MediaController` over the default
 # engine, built by `real_media()`) and drives it per-frame (pump + header + panel)

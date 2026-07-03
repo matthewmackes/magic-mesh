@@ -28,6 +28,7 @@ mod host_mirror;
 mod hotkeys;
 mod instances;
 mod keyboard;
+mod mesh_view;
 mod network;
 mod provisioning;
 mod services_flow;
@@ -198,6 +199,16 @@ struct Shell {
     /// Terminator-class terminal is reachable as an in-shell surface — no demo data
     /// (§7). This is the RESCUE: before it, `mde-term-egui` was mounted nowhere.
     terminal: TerminalSurface,
+    /// The Mesh Map surface (OW-10) — the live `mde-mesh-view` canvas, fed a
+    /// `MeshState` folded from the same world-readable mesh-status snapshot the
+    /// Workbench planes read. Polled while in view; opens the honest "waiting for
+    /// mesh" EmptyState until a snapshot lands.
+    mesh_view: mesh_view::MeshViewState,
+    /// The onboard self-test watch (OW-10) — observes the `event/onboard/self-test`
+    /// verdict lane and raises a one-shot edge the instant a node goes all-green, so
+    /// the shell auto-opens the Mesh Map. The receive half of a flow whose publish
+    /// half is integration-gated, exactly like the VDI / Browser transports.
+    self_test: mesh_view::SelfTestWatch,
 }
 
 impl Shell {
@@ -239,6 +250,8 @@ impl Shell {
             keyboard: keyboard::Keyboard::default(),
             web: web::WebState::default(),
             terminal: real_terminal(),
+            mesh_view: mesh_view::MeshViewState::default(),
+            self_test: mesh_view::SelfTestWatch::default(),
         }
     }
 
@@ -322,6 +335,14 @@ impl Shell {
                     &self.provisioning,
                     &mut self.services,
                 );
+            }
+            Surface::MeshView => {
+                // The live Mesh Map (OW-10) — the `mde-mesh-view` painter fed the
+                // MeshState folded from the mesh-status snapshot. Scoped under its own
+                // `push_id` like every mounted surface; the poll refreshes the fold in
+                // `render` while this surface is in view.
+                let mesh_view = &mut self.mesh_view;
+                ui.push_id("shell-mesh-view", |ui| mesh_view.show(ui));
             }
             Surface::Desktop => {
                 // The Desktop surface's no-session face IS the Desktop Chooser
@@ -511,6 +532,24 @@ impl Shell {
             // The Services flow only actually reads while a request is in
             // flight (it self-gates on `pending`), so this is free otherwise.
             self.services.poll(ctx);
+        }
+
+        // OW-10 — the onboard self-test watch: an all-green verdict landing on the
+        // mesh Bus auto-opens the live Mesh Map, through the SAME
+        // `shell/goto/<surface>` nav grammar the chrome unread indicator + the KIRON
+        // chyron use (no second navigation path). The watch self-gates on the shared
+        // cadence; the Mesh Map is independently reachable from the dock rail besides.
+        self.self_test.poll(ctx);
+        if self.self_test.take_all_green() {
+            if let Some(nav) = toast_bridge::resolve_action("shell/goto/mesh-map") {
+                self.apply_nav(nav);
+            }
+        }
+
+        // The Mesh Map surface refolds the mesh-status snapshot while it's in view —
+        // the same cheap local scan the Workbench planes poll (it self-gates).
+        if self.nav.expanded && self.nav.surface == Surface::MeshView {
+            self.mesh_view.poll(ctx);
         }
 
         // The Desktop Chooser (CHOOSER-2) tails the CHOOSER-1 worker's

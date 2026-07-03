@@ -213,6 +213,9 @@ pub(crate) fn resolve_action(verb: &str) -> Option<Navigate> {
 fn surface_by_name(name: &str) -> Option<Surface> {
     match name.to_ascii_lowercase().as_str() {
         "workbench" => Some(Surface::Workbench),
+        // OW-10 — the live Mesh Map. An all-green onboard self-test auto-opens it
+        // through this same grammar (accepting the `mde-mesh-view` variant name too).
+        "mesh-map" | "meshview" | "mesh" => Some(Surface::MeshView),
         "desktop" => Some(Surface::Desktop),
         "instances" => Some(Surface::Instances),
         "music" => Some(Surface::Music),
