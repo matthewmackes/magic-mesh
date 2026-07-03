@@ -3772,7 +3772,14 @@ mod tests {
         assert_eq!(w.name(), "storage");
     }
 
-    #[tokio::test]
+    // multi_thread runtime so the spawned worker task runs on its OWN thread rather
+    // than being serialized behind the test body on a single current-thread executor.
+    // On a heavily-loaded farm node (e.g. a concurrent Servo compile pushing load >12)
+    // a current-thread runtime starved the worker's shutdown poll past even a 10s wall
+    // ceiling; giving it a real thread pool + a generous 30s ceiling makes the
+    // assertion robust to scheduler starvation while still catching a worker that
+    // genuinely never exits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tick_loop_exits_on_shutdown() {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = tokio::sync::watch::channel(false);
@@ -3786,11 +3793,10 @@ mod tests {
         let handle = tokio::spawn(async move { w.run(token).await });
         tokio::time::sleep(Duration::from_millis(30)).await;
         tx.send(true).expect("signal shutdown");
-        // The worker exits within one ~10ms poll of the shutdown signal (~0.3s wall on
-        // an idle host). The generous 10s ceiling is wall-clock slack so this assertion
-        // stays green when the test's runtime is CPU-starved under concurrent farm
-        // builds — it must catch a worker that never exits, not a scheduler stall.
-        let joined = tokio::time::timeout(Duration::from_secs(10), handle).await;
+        // Worker exits within one ~10ms poll of shutdown (~0.3s on an idle host); the
+        // 30s ceiling is pure wall-clock slack for a CPU-starved node — it must catch a
+        // worker that never exits, not a scheduler stall.
+        let joined = tokio::time::timeout(Duration::from_secs(30), handle).await;
         assert!(joined.is_ok(), "worker must exit promptly on shutdown");
         assert!(joined.unwrap().expect("join").is_ok());
     }
