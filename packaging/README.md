@@ -22,8 +22,16 @@ into the filesystem; the hicolor icon set lives in `../assets/icons/`.
   image with the desktop seat skipped/masked). Containerfile + the DRM-seat
   unit + preset + `build-image.sh` (typed-gated) + `verify-image.sh` (static
   image acceptance); doctrine + verification status in `bootc/README.md`.
-- `kickstart/`    → the Magic-on-Cosmic ISO kickstart (PKG-9) with the
-  install-time role-chooser `%post` (PKG-5); built with livemedia-creator.
+- `kickstart/`    → the install ISO kickstarts + boot-menu profile snippets.
+  `magic-on-quasar.ks` (OW-12) is the current **Quasar Workstation** kickstart:
+  a bootc/ostree-native installer that `ostreecontainer`-deploys the immutable
+  bootc WS image (`bootc/`, so the magic-mesh RPM + the egui DRM-seat unit +
+  cloud-hypervisor arrive baked in — it references that image, never re-packages
+  it), with a `%post` that pins the role from the boot menu and supports a
+  headless (no-seat, mesh-daemons-only) variant via `mde.headless`; its menu is
+  `quasar-bootmenu.cfg`, cut through the bootc anaconda-iso lane. The heritage
+  `magic-on-cosmic.ks` (PKG-9) + `profile-bootmenu.cfg` remain the retired
+  Cosmic-era package lane (`@^fedora-cosmic-desktop-environment`, livemedia-creator).
 - `repo/`         → the GitHub-hosted `.repo` (PKG-8) + the committed public
   signing key `RPM-GPG-KEY-magic-mesh` (EFF-17). Both ship inside the main
   `magic-mesh` RPM (one-RPM design, §5 — no separate release sub-package):
