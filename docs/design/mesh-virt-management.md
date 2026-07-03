@@ -1,5 +1,14 @@
 # Mesh virtualization management + same-stack — design lock
 
+> **PARTIALLY SUPERSEDED 2026-07-03 by `docs/design/quasar-cloud.md` (QUASAR-CLOUD,
+> 90-Q survey).** Pillar 1's **cloud-hypervisor** choice and the §"management
+> layer" **mesh-native #5 scheduler** lock are superseded: the VM plane is now
+> **Nova + Placement on libvirt/QEMU-KVM** (Kolla containers, mackesd-supervised),
+> and **Cockpit's interim console retires at cutover**. Still standing from this
+> doc: the **two-role model**, **same stack on every machine / role is
+> configuration**, the XCP-ng demotion to day-2 adoption, and the Podman
+> container plane.
+
 **Status:** LOCKED 2026-06-30 (operator: "Go Option B", "same stack on all machines", "lock it").
 **Companion:** `docs/design/onboarding-wizard.md` (the 2-role model + onboarding flow).
 

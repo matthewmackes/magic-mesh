@@ -64,6 +64,11 @@ master rule.)*
 - **Public boundary — 3 tiers (CONNECT):** Public (Nebula/4242 + SSH/22 +
   enroll/4243) · Mesh · Ingress-exposed (lighthouse reverse-proxy). Posture is
   **mesh-allow / public-deny**, drift-corrected firewalld on every node.
+- **QUASAR-CLOUD additions (2026-07-03, `docs/design/quasar-cloud.md`):** the
+  mesh etcd also serves **tooz** coordination for the OpenStack services;
+  **Designate becomes the mesh name service**, fed (and re-seedable) by the
+  etcd peer directory. Nebula remains the substrate — Neutron/OVN rides on top
+  and never replaces it.
 
 ## §2 — The Bus (not D-Bus)
 
@@ -81,7 +86,11 @@ values, asserted by config tests: **Ed25519** node identity · **AES-256-GCM** /
 **ChaCha20-Poly1305** · **XChaCha20-Poly1305** CA backup · **RSA-4096** KDC device
 identity. No OpenSSL — **rustls** throughout. The loopback debug-SSH
 (NET-INTROSPECT) and documented MD5 interop exceptions (thumbnail cache, Subsonic
-auth, SIP digest) stand as recorded.
+auth, SIP digest) stand as recorded. **Clarified 2026-07-03 (QUASAR-CLOUD Q13):
+the no-OpenSSL/rustls lock governs MCNF's own code; hosted workloads (e.g. the
+Kolla OpenStack containers) bring their own crypto stacks.** The OpenStack APIs
+bind **plaintext to the Nebula interface only** — the overlay is their transport
+security (Q23).
 
 ## §4 — Look & toolkit: egui-native (E12 — replaces strictly-Carbon)
 
@@ -110,6 +119,22 @@ auth, SIP digest) stand as recorded.
 > **Revised 2026-06-30** (50-Q `/plan` survey → `docs/design/quasar-vdi-desktop.md`).
 > The forked-`cosmic-comp` desktop is **retired** before any code landed; MCNF does
 > **not** fork or ship a Wayland compositor.
+
+> **REVISED 2026-07-03 — QUASAR-CLOUD (90-Q `/plan` survey →
+> `docs/design/quasar-cloud.md`). The VM plane is now OpenStack.**
+> **Nova + Placement replace the mesh-native VM scheduler** (the
+> `mesh-virt-management.md` "mesh-native #5" lock is superseded); the hypervisor
+> is **libvirt/QEMU-KVM** — **cloud-hypervisor is retired** wherever this section
+> (or `mde-kvm`) names it. OpenStack services run as **Kolla containers under
+> Podman**, supervised by a **mackesd `openstack` worker** rendering config from
+> fleet state (one-state doctrine) — control plane **distributed, APIs on every
+> node, no controller box**; role stays configuration (services are pure
+> workloads — the 2-role lock stands). VDI desktops become **Nova instances +
+> a broker overlay** (display path / roaming / seat binding). Glance+DIB replace
+> the golden-image script; Cinder (LVM) adds volumes; **Cockpit's interim
+> console retires at cutover**; the Podman container plane, ISO installer, and
+> build farm are unchanged. Old-stack code is **deleted on per-node hard
+> cutover** (§7).
 
 - **The host is an egui thin client, not a general desktop.** The whole UI is a
   single **egui shell that owns the DRM/KMS seat directly** (the §4 `mde-egui` smithay
@@ -207,6 +232,16 @@ revocation evicts the data plane; unpinned node fails closed; hash-chain audit).
 > operators** (extends ENT-12), guests stay **default-deny inbound**, and
 > per-service ACLs are revisited if the envelope grows materially.
 
+> **QUASAR-CLOUD revision (2026-07-03 — `docs/design/quasar-cloud.md`).**
+> **Cloud instances are "inside" without certs:** they live on one flat
+> Neutron/OVN provider network bridged into the mesh, with **default-open
+> security groups** — no per-instance Nebula certs (the VDI dual-homing
+> precedent does not extend to cloud instances). The **§8 envelope is raised
+> for compute nodes** (control plane stays workgroup-small; compute scales to
+> dozens). Two guardrails temper the flat trust: **hard per-user Keystone
+> quotas** (the mesh's first hard authorization boundary — a documented
+> departure from §9 no-RBAC) and the extended ENT-12 blast-radius doc.
+
 ## §9 — The five planes
 
 *(Carried forward from E11, restated for egui.)* The Workbench's mesh IA is **five
@@ -222,6 +257,18 @@ only coordinates) · **remote execution is typed verbs + signed job bundles only
 the renderers-not-authorities doctrine are unchanged. **E12 adds** the desktop
 plane's per-peer workspace + mesh-overlay state to the one-state doctrine
 (etcd/Syncthing-backed).
+
+> **QUASAR-CLOUD revision (2026-07-03).** **The Controller plane BECOMES the
+> Cloud plane** — OpenStack is now the control brain this plane described:
+> instances · volumes+snapshots · images · networks+stacks, self-served by
+> **every mesh member** (invisible SSO via the Keystone identity bridge;
+> **Keystone absorbs human identity**, the CA/KDC narrows to machine certs).
+> The doctrines hold: GUIs stay renderers, **typed mackesd verbs wrap the
+> OpenStack APIs** (surfaces never speak raw OpenStack), fleet state stays
+> authoritative and *renders* Heat. **mde-bus remains THE platform bus** —
+> RabbitMQ is OpenStack-internal RPC only (§2 untouched). One amendment:
+> **hard per-user quotas** are enforced in the cloud plane (see §8) — the
+> documented exception to "no RBAC".
 
 ## §10 — Build & development environment (canonical — do not rediscover)
 
