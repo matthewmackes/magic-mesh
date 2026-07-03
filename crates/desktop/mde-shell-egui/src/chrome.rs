@@ -936,6 +936,9 @@ mod tests {
             batteries: absent(),
             on_ac: absent(),
             power: absent(),
+            power_profile: absent(),
+            charge_limit: absent(),
+            lid: absent(),
             displays: absent(),
             backlights: absent(),
             mixer,
@@ -1017,6 +1020,9 @@ mod tests {
             batteries,
             on_ac: absent(),
             power: absent(),
+            power_profile: absent(),
+            charge_limit: absent(),
+            lid: absent(),
             displays: absent(),
             backlights: absent(),
             mixer: absent(),
@@ -1032,6 +1038,9 @@ mod tests {
             percentage,
             state,
             power_supply,
+            time_to_empty: None,
+            time_to_full: None,
+            energy_rate: None,
         }
     }
 

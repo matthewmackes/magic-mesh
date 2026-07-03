@@ -11,11 +11,14 @@
 
 use crate::backlight::{Backlight, BacklightClient, SysfsBacklight};
 use crate::bluez::{BluezClient, BtStatus, ZbusBluez};
+use crate::charge_threshold::{ChargeThresholdClient, SysfsChargeThreshold};
 use crate::ddc::{DdcClient, DdcCtl, DdcDisplay};
 use crate::display::{Connector, DisplayProber, DrmProber};
 use crate::error::{Backend, SeatError};
+use crate::lid::{LidClient, LidState, ProcLid};
 use crate::logind::{LogindClient, PowerCaps, PowerVerb, ZbusLogind};
 use crate::mixer::{MixerClient, MixerStatus, PwGraph};
+use crate::powerprofiles::{ProfileState, ProfilesClient, ZbusProfiles};
 use crate::upower::{Battery, UPowerClient, ZbusUPower};
 
 /// A typed per-section state: a real reading, or a typed absence.
@@ -76,6 +79,18 @@ pub struct SeatSnapshot {
     pub on_ac: Probe<Option<bool>>,
     /// logind power capabilities (which verbs are available).
     pub power: Probe<PowerCaps>,
+    /// The active + available power profiles (`net.hadess.PowerProfiles`).
+    /// `Absent` when power-profiles-daemon is not running — the honest
+    /// "unavailable", never a fabricated active profile (§7).
+    pub power_profile: Probe<ProfileState>,
+    /// The battery charge-stop cap (`charge_control_end_threshold`, 0–100):
+    /// `Present(Some(pct))` when a battery advertises it, `Present(None)` when
+    /// the power-supply class exists but no battery has the attribute (most
+    /// machines), `Absent` when there is no power-supply class at all.
+    pub charge_limit: Probe<Option<u8>>,
+    /// The laptop lid state (`/proc/acpi/button/lid`). `Absent` on a desktop
+    /// (no lid device) — never a fabricated "open".
+    pub lid: Probe<LidState>,
     /// DRM connectors + their modes (read-only probe).
     pub displays: Probe<Vec<Connector>>,
     /// sysfs backlight panels.
@@ -98,6 +113,9 @@ pub struct Seat {
     backlight: Box<dyn BacklightClient>,
     mixer: Box<dyn MixerClient>,
     ddc: Box<dyn DdcClient>,
+    profiles: Box<dyn ProfilesClient>,
+    charge: Box<dyn ChargeThresholdClient>,
+    lid: Box<dyn LidClient>,
 }
 
 impl Seat {
@@ -114,11 +132,18 @@ impl Seat {
             backlight: Box::new(SysfsBacklight::new()),
             mixer: Box::new(PwGraph::new()),
             ddc: Box::new(DdcCtl::new()),
+            profiles: Box::new(ZbusProfiles::new()),
+            charge: Box::new(SysfsChargeThreshold::new()),
+            lid: Box::new(ProcLid::new()),
         }
     }
 
     /// Assemble a seat from explicit clients (the test seam).
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the test seam mirrors every injectable client one-to-one"
+    )]
     pub fn from_parts(
         bluez: Box<dyn BluezClient>,
         upower: Box<dyn UPowerClient>,
@@ -127,6 +152,9 @@ impl Seat {
         backlight: Box<dyn BacklightClient>,
         mixer: Box<dyn MixerClient>,
         ddc: Box<dyn DdcClient>,
+        profiles: Box<dyn ProfilesClient>,
+        charge: Box<dyn ChargeThresholdClient>,
+        lid: Box<dyn LidClient>,
     ) -> Self {
         Self {
             bluez,
@@ -136,6 +164,9 @@ impl Seat {
             backlight,
             mixer,
             ddc,
+            profiles,
+            charge,
+            lid,
         }
     }
 
@@ -148,6 +179,9 @@ impl Seat {
             batteries: Probe::from_result(self.upower.batteries()),
             on_ac: Probe::from_result(self.upower.on_ac()),
             power: Probe::from_result(self.logind.caps()),
+            power_profile: Probe::from_result(self.profiles.state()),
+            charge_limit: Probe::from_result(self.charge.end_threshold()),
+            lid: Probe::from_result(self.lid.state()),
             displays: Probe::from_result(self.display.connectors()),
             backlights: Probe::from_result(self.backlight.devices()),
             mixer: Probe::from_result(self.mixer.status()),
@@ -189,6 +223,29 @@ impl Seat {
     /// The logind client's typed errors (a polkit refusal / absent logind).
     pub fn power(&self, verb: PowerVerb) -> Result<(), SeatError> {
         self.logind.act(verb)
+    }
+
+    /// Switch the active power profile (`net.hadess.PowerProfiles`), by name
+    /// (`power-saver` / `balanced` / `performance`). The caller (POWER-4) reads
+    /// [`SeatSnapshot::power_profile`] for the offered set first.
+    ///
+    /// # Errors
+    /// The power-profiles client's typed errors ([`SeatError::Unavailable`] when
+    /// power-profiles-daemon is absent, [`SeatError::Backend`] when it refuses an
+    /// unknown name).
+    pub fn set_power_profile(&self, name: &str) -> Result<(), SeatError> {
+        self.profiles.set_active(name)
+    }
+
+    /// Set the battery charge-stop cap (`charge_control_end_threshold`, 0–100).
+    ///
+    /// # Errors
+    /// The charge-threshold client's typed errors ([`SeatError::OutOfRange`]
+    /// above 100, [`SeatError::Unavailable`] when no battery advertises the
+    /// attribute, [`SeatError::Io`] on an unprivileged write — surfaced
+    /// honestly, never a pretend success).
+    pub fn set_charge_threshold(&self, pct: u8) -> Result<(), SeatError> {
+        self.charge.set_end_threshold(pct)
     }
 
     /// Set a mixer strip's volume (0–100). Used by the mixer faders (E12-16) and
@@ -400,5 +457,42 @@ mod tests {
         if let Probe::Absent { backend, .. } = &snap.on_ac {
             assert_eq!(*backend, Backend::UPower);
         }
+        // The POWER-3 backends: each is legitimately Absent on the headless host
+        // (no power-profiles-daemon, no power-supply class, no lid button), and
+        // every Absent carries its own backend — never a fabricated reading (§7).
+        if let Probe::Absent { backend, .. } = &snap.power_profile {
+            assert_eq!(*backend, Backend::PowerProfiles);
+        }
+        if let Probe::Absent { backend, .. } = &snap.charge_limit {
+            assert_eq!(*backend, Backend::ChargeThreshold);
+        }
+        if let Probe::Absent { backend, .. } = &snap.lid {
+            assert_eq!(*backend, Backend::Lid);
+        }
+    }
+
+    #[test]
+    fn the_power3_drive_methods_answer_typed_on_a_headless_seat_never_panic() {
+        // The profile switch + charge-cap write (POWER-4 drives these) fold to a
+        // typed error tagged their own backend on a host without the daemon /
+        // the sysfs attribute — never a panic, never a fake Ok.
+        let seat = Seat::new();
+        match seat.set_power_profile("balanced") {
+            Ok(()) => {}
+            Err(e) => assert_eq!(e.backend(), Backend::PowerProfiles),
+        }
+        match seat.set_charge_threshold(80) {
+            Ok(()) => {}
+            Err(e) => assert_eq!(e.backend(), Backend::ChargeThreshold),
+        }
+        // An over-100 cap is refused OutOfRange before any I/O, regardless of host.
+        assert!(matches!(
+            seat.set_charge_threshold(150),
+            Err(SeatError::OutOfRange {
+                backend: Backend::ChargeThreshold,
+                max: 100,
+                ..
+            })
+        ));
     }
 }

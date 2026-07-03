@@ -37,6 +37,11 @@ pub fn u32_prop(props: &PropMap, key: &str) -> Option<u32> {
     props.get(key).and_then(|v| v.downcast_ref::<u32>().ok())
 }
 
+/// An `x` (int64) property — e.g. `UPower`'s `TimeToEmpty`/`TimeToFull` (seconds).
+pub fn i64_prop(props: &PropMap, key: &str) -> Option<i64> {
+    props.get(key).and_then(|v| v.downcast_ref::<i64>().ok())
+}
+
 /// A `d` property.
 pub fn f64_prop(props: &PropMap, key: &str) -> Option<f64> {
     props.get(key).and_then(|v| v.downcast_ref::<f64>().ok())
@@ -78,6 +83,7 @@ mod tests {
             ("State", OwnedValue::from(2_u32)),
             ("Charge", OwnedValue::from(93_u8)),
             ("RSSI", OwnedValue::from(-58_i16)),
+            ("TimeToEmpty", OwnedValue::from(5400_i64)),
         ]);
         assert_eq!(bool_prop(&map, "Powered"), Some(true));
         assert_eq!(str_prop(&map, "Alias").as_deref(), Some("keyboard"));
@@ -85,10 +91,12 @@ mod tests {
         assert_eq!(u32_prop(&map, "State"), Some(2));
         assert_eq!(u8_prop(&map, "Charge"), Some(93));
         assert_eq!(i16_prop(&map, "RSSI"), Some(-58));
+        assert_eq!(i64_prop(&map, "TimeToEmpty"), Some(5400));
 
         // Absent key → None (never a default that lies).
         assert_eq!(bool_prop(&map, "Discovering"), None);
         assert_eq!(i16_prop(&map, "TxPower"), None);
+        assert_eq!(i64_prop(&map, "TimeToFull"), None);
         // Wrong type → None, not a panic (a hostile/buggy service can't crash
         // the seat).
         assert_eq!(bool_prop(&map, "Alias"), None);

@@ -7,9 +7,11 @@
 //! adapter) and devices without a charge reading are skipped honestly rather
 //! than rendered as fake batteries (§7).
 
+use std::time::Duration;
+
 use crate::bus::SysBus;
 use crate::error::{Backend, SeatError};
-use crate::props::{bool_prop, f64_prop, str_prop, u32_prop, PropMap};
+use crate::props::{bool_prop, f64_prop, i64_prop, str_prop, u32_prop, PropMap};
 
 /// The `UPower` well-known bus name (also the manager interface name).
 const UPOWER: &str = "org.freedesktop.UPower";
@@ -90,6 +92,18 @@ pub struct Battery {
     /// Whether this battery powers the whole system (`PowerSupply`) — `false`
     /// for peripheral batteries.
     pub power_supply: bool,
+    /// Estimated time until empty while discharging, from `UPower`'s
+    /// `TimeToEmpty` (seconds). `None` when not discharging / not estimated /
+    /// the reading is 0 or absent — an honest "no estimate", never a fake ETA
+    /// (§7).
+    pub time_to_empty: Option<Duration>,
+    /// Estimated time until full while charging, from `TimeToFull` (seconds).
+    /// `None` when not charging / not estimated / 0 or absent.
+    pub time_to_full: Option<Duration>,
+    /// Instantaneous power draw (discharging) or charge rate, in watts, from
+    /// `EnergyRate`. `None` when the reading is 0 or absent (a peripheral that
+    /// reports no rate) — never a fabricated 0 W.
+    pub energy_rate: Option<f64>,
 }
 
 /// The `UPower` client seam. Production impl: [`ZbusUPower`]; tests inject fakes.
@@ -260,7 +274,21 @@ pub fn fold_battery(path: &str, props: &PropMap) -> Option<Battery> {
         percentage,
         state: state_from_code(u32_prop(props, "State").unwrap_or(0)),
         power_supply: bool_prop(props, "PowerSupply").unwrap_or(false),
+        // UPower reports 0 for a rate/ETA it has not estimated yet (e.g. right
+        // after a state change) — fold those to an honest `None`, never a "0s"
+        // that reads as "empty now" or a "0 W" idle draw (§7).
+        time_to_empty: duration_secs(i64_prop(props, "TimeToEmpty")),
+        time_to_full: duration_secs(i64_prop(props, "TimeToFull")),
+        energy_rate: f64_prop(props, "EnergyRate").filter(|w| *w > 0.0),
     })
+}
+
+/// A `UPower` `x` seconds reading → a [`Duration`], dropping the non-positive
+/// (0 = "not estimated", negative = malformed) values to an honest `None`.
+fn duration_secs(secs: Option<i64>) -> Option<Duration> {
+    secs.filter(|s| *s > 0)
+        .and_then(|s| u64::try_from(s).ok())
+        .map(Duration::from_secs)
 }
 
 /// Fold one `UPower` device property bag into its AC-present reading. Pure.
@@ -305,6 +333,46 @@ mod tests {
         assert_eq!(b.state, BatteryState::Charging);
         assert!(b.power_supply);
         assert_eq!(b.state.label(), "charging");
+        // No telemetry props in this bag → honest `None`, never a fabricated ETA
+        // or 0 W draw (§7).
+        assert_eq!(b.time_to_empty, None);
+        assert_eq!(b.time_to_full, None);
+        assert_eq!(b.energy_rate, None);
+    }
+
+    #[test]
+    fn folds_rich_battery_telemetry_and_drops_zeroes() {
+        // A discharging pack with a live rate + time-to-empty estimate; the
+        // charging estimate is 0 (UPower's "no estimate") and must fold to None.
+        let bag = props(vec![
+            ("Type", OwnedValue::from(2_u32)),
+            ("Percentage", OwnedValue::from(61.0_f64)),
+            ("State", OwnedValue::from(2_u32)),
+            ("IsPresent", OwnedValue::from(true)),
+            ("PowerSupply", OwnedValue::from(true)),
+            ("TimeToEmpty", OwnedValue::from(5400_i64)),
+            ("TimeToFull", OwnedValue::from(0_i64)),
+            ("EnergyRate", OwnedValue::from(11.7_f64)),
+        ]);
+        let b = fold_battery("/u/battery_BAT0", &bag).expect("a battery folds");
+        assert_eq!(b.time_to_empty, Some(Duration::from_secs(5400)));
+        assert_eq!(b.time_to_full, None, "a 0s estimate is not a real ETA");
+        assert_eq!(b.energy_rate, Some(11.7));
+
+        // A charging pack: the mirror case — TimeToFull present, EnergyRate 0
+        // (idle sensor) drops, and a negative ETA is refused as malformed.
+        let charging = props(vec![
+            ("Type", OwnedValue::from(2_u32)),
+            ("Percentage", OwnedValue::from(80.0_f64)),
+            ("State", OwnedValue::from(1_u32)),
+            ("TimeToFull", OwnedValue::from(1800_i64)),
+            ("TimeToEmpty", OwnedValue::from(-1_i64)),
+            ("EnergyRate", OwnedValue::from(0.0_f64)),
+        ]);
+        let c = fold_battery("/u/battery_BAT0", &charging).expect("folds");
+        assert_eq!(c.time_to_full, Some(Duration::from_secs(1800)));
+        assert_eq!(c.time_to_empty, None, "a negative ETA is malformed → None");
+        assert_eq!(c.energy_rate, None, "a 0 W reading is not a real draw");
     }
 
     #[test]

@@ -42,13 +42,16 @@ mod arrange;
 mod backlight;
 mod bluez;
 mod bus;
+mod charge_threshold;
 mod ddc;
 mod display;
 mod error;
 pub mod hotkeys;
+mod lid;
 mod logind;
 mod mixer;
 pub mod pairing;
+mod powerprofiles;
 mod props;
 mod snapshot;
 mod upower;
@@ -59,6 +62,7 @@ pub use bluez::{
     trusted_reconnect_targets, BluezClient, BtAdapter, BtDevice, BtStatus, ReconnectAttempt,
     ScanTracker, ZbusBluez,
 };
+pub use charge_threshold::{ChargeThresholdClient, SysfsChargeThreshold};
 pub use ddc::{
     parse_detect, parse_getvcp_brightness, DdcClient, DdcCtl, DdcDisplay, DdcRunner, DdcUtil,
     UnboundDdc,
@@ -66,6 +70,7 @@ pub use ddc::{
 pub use display::{Connector, ConnectorStatus, DisplayMode, DisplayProber, DrmProber};
 pub use error::{Backend, SeatError};
 pub use hotkeys::{Hotkey, HotkeyAction, HOTKEYS};
+pub use lid::{parse_lid_state, LidClient, LidState, ProcLid};
 pub use logind::{Avail, LogindClient, PowerCaps, PowerVerb, ZbusLogind};
 pub use mixer::{
     fold_graph, MixerClient, MixerStatus, MixerStrip, PwCli, PwGraph, PwRunner, StripOrigin,
@@ -75,5 +80,6 @@ pub use pairing::{
     resolve_confirm, resolve_passkey, resolve_pin, AgentPrompt, PairingAgent, PairingReply,
     PairingResponder, Refusal,
 };
+pub use powerprofiles::{fold_profiles, ProfileState, ProfilesClient, ZbusProfiles};
 pub use snapshot::{Probe, Seat, SeatSnapshot};
 pub use upower::{Battery, BatteryKind, BatteryState, UPowerClient, ZbusUPower};

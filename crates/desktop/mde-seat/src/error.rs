@@ -24,6 +24,13 @@ pub enum Backend {
     Backlight,
     /// DDC/CI monitor control over i2c-dev. Real binding: E12-18.
     Ddc,
+    /// `net.hadess.PowerProfiles` (power-profiles-daemon) over the system D-Bus.
+    PowerProfiles,
+    /// The sysfs power-supply charge-threshold class
+    /// (`/sys/class/power_supply/*/charge_control_end_threshold`).
+    ChargeThreshold,
+    /// The laptop lid switch (`/proc/acpi/button/lid`, or an evdev `SW_LID`).
+    Lid,
 }
 
 impl Backend {
@@ -38,6 +45,9 @@ impl Backend {
             Self::Display => "DRM display",
             Self::Backlight => "backlight",
             Self::Ddc => "DDC/CI",
+            Self::PowerProfiles => "power-profiles-daemon",
+            Self::ChargeThreshold => "charge threshold",
+            Self::Lid => "lid switch",
         }
     }
 }
