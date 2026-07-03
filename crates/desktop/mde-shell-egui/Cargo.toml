@@ -44,7 +44,15 @@ serde_json = { workspace = true }
 # 1270² RGBA logo lockup once to a cached egui texture. `png` is the lean decoder
 # `mde-files` already builds thumbnails on; a leaf registry crate, so it adds no
 # tier edge (§6 — the layered-tiers gate only flags outward workspace deps).
+# CHOOSER-3 reuses the same decoder for the Chooser card thumbnails (`chooser.rs`).
 png = "0.18"
+
+# CHOOSER-3 — the Desktop Chooser's periodic preview thumbnails travel inline in
+# the `state/desktops/sources` record as `data:image/png;base64,…` snapshot refs
+# (a mesh peer's published snapshot rides the replicated state plane); the shell
+# base64-decodes the ref before the `png` decode. Same 0.22 pin the mackesd + music
+# workers already vendor; a leaf registry crate, no tier edge (§6).
+base64 = "0.22"
 
 # The chrome bar's live Peers + Status fold the world-readable mesh-status
 # snapshot, reusing the render-agnostic LIGHTHOUSE-7 model
