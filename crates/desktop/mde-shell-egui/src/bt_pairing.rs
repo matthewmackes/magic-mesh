@@ -83,14 +83,10 @@ impl PairingResponder for PairingBridge {
     fn prompt(&self, prompt: AgentPrompt) -> PairingReply {
         match prompt {
             // BlueZ aborted: unblock any awaiting prompt with a Cancel and drop the
-            // dialog. The Cancel call's own reply is ignored.
+            // dialog (reusing `answer`, the single owner of take-slot-and-send). The
+            // Cancel call's own reply is ignored.
             AgentPrompt::Cancel => {
-                let taken = self.guard().take();
-                if let Some(mut pending) = taken {
-                    if let Some(tx) = pending.reply.take() {
-                        let _ = tx.send(PairingReply::Cancel);
-                    }
-                }
+                self.answer(PairingReply::Cancel);
                 PairingReply::Dismiss
             }
             // Informational: show it for the operator, but return AT ONCE — the
