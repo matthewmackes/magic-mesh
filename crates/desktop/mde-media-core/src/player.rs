@@ -22,6 +22,7 @@ use crate::audio::AudioConfig;
 use crate::controls::{PlaybackControls, ScreenshotMode};
 use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
 use crate::playlist::Playlist;
+use crate::resume::ResumeState;
 use crate::subtitle::{track_by_language, SubtitleConfig, TrackSelect, TrackSelection};
 use crate::video::VideoConfig;
 
@@ -143,6 +144,11 @@ pub struct Player<E: MediaEngine> {
     /// [`play_next`](Player::play_next)/[`play_prev`](Player::play_prev) and
     /// auto-advances it on end-of-file per its [`RepeatMode`](crate::RepeatMode).
     playlist: Playlist,
+    /// The resume / watch-history store (MEDIA-7). The player resumes from the stored
+    /// position when a title finishes loading, updates it on seek / stop, marks a
+    /// title completed at its natural end, and counts a play on each load. Empty by
+    /// default (so a player with no history behaves exactly as before).
+    resume: ResumeState,
     events: VecDeque<PlayerEvent>,
 }
 
@@ -164,6 +170,7 @@ impl<E: MediaEngine> Player<E> {
             subtitle: SubtitleConfig::new(),
             controls: PlaybackControls::new(),
             playlist: Playlist::new(),
+            resume: ResumeState::new(),
             events: VecDeque::new(),
         }
     }
@@ -245,6 +252,38 @@ impl<E: MediaEngine> Player<E> {
     /// [`Playlist::load`](crate::Playlist::load).
     pub fn set_playlist(&mut self, playlist: Playlist) {
         self.playlist = playlist;
+    }
+
+    /// The resume / watch-history store (MEDIA-7) — read
+    /// [`continue_watching`](crate::ResumeState::continue_watching) /
+    /// [`recents`](crate::ResumeState::recents) /
+    /// [`most_played`](crate::ResumeState::most_played) from it.
+    #[must_use]
+    pub const fn resume_state(&self) -> &ResumeState {
+        &self.resume
+    }
+
+    /// Mutably borrow the resume store (e.g. to
+    /// [`forget`](crate::ResumeState::forget) an item).
+    pub const fn resume_state_mut(&mut self) -> &mut ResumeState {
+        &mut self.resume
+    }
+
+    /// Replace the whole resume store (MEDIA-7) — e.g. after a
+    /// [`ResumeState::load`](crate::ResumeState::load) at startup so playback resumes
+    /// across sessions.
+    pub fn set_resume_state(&mut self, resume: ResumeState) {
+        self.resume = resume;
+    }
+
+    /// Checkpoint the current playback position into the resume store on demand — a
+    /// surface calls this periodically (e.g. every few seconds) so a crash still
+    /// leaves a resume point. A no-op when nothing is loaded.
+    pub fn checkpoint_resume(&mut self) {
+        if let Some(media) = self.media.clone() {
+            self.resume
+                .record_position(&media, self.position, self.duration);
+        }
     }
 
     /// Borrow the underlying engine (tests drive [`FakeMpv`](crate::FakeMpv)
@@ -383,6 +422,10 @@ impl<E: MediaEngine> Player<E> {
                 let target = self.clamp_position(position_secs);
                 self.engine.seek_absolute(target)?;
                 self.set_position(target);
+                // Remember where the user seeked to (MEDIA-7 resume).
+                if let Some(media) = self.media.clone() {
+                    self.resume.record_position(&media, target, self.duration);
+                }
                 if self.state == PlayerState::Ended {
                     // Left EOF — settle to Paused at the new position.
                     self.paused_intent = true;
@@ -414,7 +457,13 @@ impl<E: MediaEngine> Player<E> {
                 state: self.state,
             });
         }
+        // Remember where playback was stopped (MEDIA-7 resume) before unloading.
+        let resume_key = self.media.clone();
+        let (resume_pos, resume_dur) = (self.position, self.duration);
         self.engine.stop()?;
+        if let Some(key) = resume_key {
+            self.resume.record_position(&key, resume_pos, resume_dur);
+        }
         self.media = None;
         self.tracks.clear();
         self.set_position(0.0);
@@ -718,6 +767,17 @@ impl<E: MediaEngine> Player<E> {
                     let tracks = self.engine.tracks();
                     self.tracks.clone_from(&tracks);
                     self.events.push_back(PlayerEvent::TracksChanged(tracks));
+                    // MEDIA-7: count a play, and resume from the stored position when
+                    // one exists (empty history → a no-op, so the load is unchanged).
+                    if let Some(media) = self.media.clone() {
+                        self.resume.mark_started(&media);
+                        if let Some(pos) = self.resume.resume_position(&media) {
+                            let target = self.clamp_position(pos);
+                            if self.engine.seek_absolute(target).is_ok() {
+                                self.set_position(target);
+                            }
+                        }
+                    }
                     let next = if self.paused_intent {
                         PlayerState::Paused
                     } else {
@@ -728,6 +788,11 @@ impl<E: MediaEngine> Player<E> {
             }
             EngineSignal::EndFile(EndReason::Eof) => {
                 if self.state.has_media() {
+                    // MEDIA-7: the item played to its natural end → mark it completed
+                    // so it starts over (not resumes) next time (continue-watching).
+                    if let Some(finished) = self.media.clone() {
+                        self.resume.mark_completed(&finished, self.duration);
+                    }
                     // A queued next item (per the playlist's repeat/shuffle)
                     // auto-advances the player; an empty/exhausted queue ends it.
                     if !self.try_advance_on_eof() {
@@ -1551,5 +1616,103 @@ mod tests {
         // Repeat-one reloads "a", never advancing to "b".
         assert_eq!(p.media(), Some("a"));
         assert_eq!(p.playlist().current_index(), Some(0));
+    }
+
+    // ── local library + resume (MEDIA-7) ─────────────────────────────────────
+
+    #[test]
+    fn resume_on_load_seeks_to_stored_position() {
+        let mut p = player(); // duration 120
+        p.resume_state_mut()
+            .record_position("movie.mkv", 45.0, Some(120.0));
+
+        p.load("movie.mkv").expect("load");
+        p.pump(); // FileLoaded → resume seek to the stored position
+        assert_eq!(p.state(), PlayerState::Playing);
+        assert!((p.position() - 45.0).abs() < f64::EPSILON);
+        // The resume actually reached the engine as a seek.
+        assert!(p
+            .engine()
+            .commands()
+            .iter()
+            .any(|c| c.starts_with("seek 45")));
+    }
+
+    #[test]
+    fn empty_history_load_does_not_seek() {
+        // With no stored position, a load behaves exactly as before (no resume seek).
+        let mut p = player();
+        p.load("fresh.mkv").expect("load");
+        p.pump();
+        assert!(p.position().abs() < f64::EPSILON);
+        assert!(!p.engine().commands().iter().any(|c| c.starts_with("seek")));
+    }
+
+    #[test]
+    fn seek_and_stop_update_the_resume_store() {
+        let mut p = player();
+        p.load("clip.mkv").expect("load");
+        p.pump();
+
+        p.seek(30.0).expect("seek");
+        assert_eq!(p.resume_state().resume_position("clip.mkv"), Some(30.0));
+
+        // Stop remembers where playback was left, before the file is unloaded.
+        p.seek(60.0).expect("seek again");
+        p.stop().expect("stop");
+        assert_eq!(p.media(), None);
+        assert_eq!(p.resume_state().resume_position("clip.mkv"), Some(60.0));
+    }
+
+    #[test]
+    fn checkpoint_resume_records_the_live_position() {
+        let mut p = player();
+        p.load("c.mkv").expect("load");
+        p.pump();
+        p.engine_mut().advance(20.0);
+        p.pump(); // live clock → position 20
+        p.checkpoint_resume();
+        assert_eq!(p.resume_state().resume_position("c.mkv"), Some(20.0));
+    }
+
+    #[test]
+    fn natural_end_marks_completed_so_it_does_not_resume() {
+        let mut p = player(); // duration 120
+        p.load("ep.mkv").expect("load");
+        p.pump();
+        p.seek(50.0).expect("seek"); // a mid-title resume point
+        assert_eq!(p.resume_state().resume_position("ep.mkv"), Some(50.0));
+
+        p.engine_mut().reach_eof();
+        p.pump();
+        assert_eq!(p.state(), PlayerState::Ended);
+        // Watched to the end → next time it starts over, not resumes.
+        assert_eq!(p.resume_state().resume_position("ep.mkv"), None);
+        assert!(p.resume_state().get("ep.mkv").expect("entry").completed);
+    }
+
+    #[test]
+    fn each_load_counts_a_play_for_recents_and_most_played() {
+        let mut p = player();
+        for url in ["a.mkv", "b.mkv", "a.mkv"] {
+            p.load(url).expect("load");
+            p.pump();
+        }
+        // "a" played twice, "b" once.
+        assert_eq!(p.resume_state().most_played(10), vec!["a.mkv", "b.mkv"]);
+        // The last thing loaded leads the recents.
+        assert_eq!(p.resume_state().recents(10), vec!["a.mkv", "b.mkv"]);
+    }
+
+    #[test]
+    fn set_resume_state_replaces_the_store_and_resumes() {
+        let mut p = player();
+        let mut restored = ResumeState::new();
+        restored.record_position("x.mkv", 33.0, Some(200.0));
+        p.set_resume_state(restored);
+
+        p.load("x.mkv").expect("load");
+        p.pump();
+        assert!((p.position() - 33.0).abs() < f64::EPSILON);
     }
 }

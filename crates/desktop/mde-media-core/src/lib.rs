@@ -73,6 +73,23 @@
 //! commands. All fold to mpv (unit-tested against [`FakeMpv`]); the on-seat result
 //! is honest-gated to the `mpv`-feature real-clip smoke.
 //!
+//! # Local library + resume (MEDIA-7)
+//!
+//! [`Library`] is the browsable, serde-persisted index of chosen folders — a pure
+//! model that walks each root ([`Library::index_folder`], dependency-free `std::fs`),
+//! records every media file as a [`LibraryItem`] with a typed [`MediaMetadata`], and
+//! answers [`Library::browse`] folds (search + [`MediaKind`] filter + [`SortKey`]).
+//! [`ResumeState`] is the per-item watch-history store — where each title was last
+//! left ([`ResumeState::resume_position`]), plus [`ResumeState::continue_watching`] /
+//! [`recents`](ResumeState::recents) / [`most_played`](ResumeState::most_played). The
+//! [`Player`] embeds a [`ResumeState`] ([`Player::resume_state`]): it resumes from the
+//! stored position on load and updates it on seek / stop, and counts a play on each
+//! load — all unit-tested against [`FakeMpv`], with the live position capture
+//! honest-gated to the `mpv`-feature real-clip smoke. Both stores round-trip through
+//! [`serde`], like the MEDIA-6 [`Playlist`]. `title` + [`MediaKind`] are derived from
+//! the path with no dependency; embedded-tag `artist`/`album`/`duration` enrichment
+//! + the online `TMDB`/`TVDB` scrape are honest-gated egress (like `opensubtitles`).
+//!
 //! ```
 //! use mde_media_core::{FakeMpv, Player, PlayerState};
 //!
@@ -93,9 +110,11 @@ pub mod audio;
 pub mod controls;
 pub mod engine;
 pub mod fake;
+pub mod library;
 pub mod opensubtitles;
 pub mod player;
 pub mod playlist;
+pub mod resume;
 pub mod subtitle;
 pub mod video;
 
@@ -108,9 +127,11 @@ pub use audio::{
 pub use controls::{AbLoop, PlaybackControls, ScreenshotMode};
 pub use engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
 pub use fake::FakeMpv;
+pub use library::{BrowseQuery, Library, LibraryItem, MediaKind, MediaMetadata, SortKey};
 pub use opensubtitles::{parse_search_response, request_headers, search_url, SubtitleSearchResult};
 pub use player::{Player, PlayerError, PlayerEvent, PlayerState};
 pub use playlist::{Playlist, PlaylistItem, RepeatMode};
+pub use resume::{ResumeEntry, ResumeState};
 pub use subtitle::{
     track_by_language, AssOverride, ExternalSub, SubLoad, SubtitleConfig, TrackSelect,
     TrackSelection,
