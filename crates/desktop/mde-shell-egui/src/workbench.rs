@@ -81,8 +81,10 @@ impl Plane {
 /// KVM reality from `datacenter` (MV-6), and the Provisioning plane's live
 /// deployment / version / enrollment posture from `provisioning` (WB-Provisioning)
 /// — every plane now renders live status. The Provisioning plane additionally
-/// hosts the day-2 Services flow (`services`, OW-11): pick Music/Files/Voice,
-/// preview the daemon's plan, apply over the Bus.
+/// hosts two Bus-driven onboarding flows: the Spawn Lighthouse flow
+/// (`spawn_lighthouse`, OW-7) — promote a LAN-only mesh by standing up its first
+/// lighthouse + migrating the CA — and the day-2 Services flow (`services`,
+/// OW-11): pick Music/Files/Voice, preview the daemon's plan, apply over the Bus.
 // One state struct per mounted plane view — the Workbench is the single place
 // they all meet, so the arity IS the plane count, not a design smell.
 #[allow(clippy::too_many_arguments)]
@@ -104,6 +106,9 @@ pub(crate) fn show(
     // Mutable like `datacenter`: the Services flow publishes service-add
     // requests onto the Bus and holds the daemon's typed answer.
     services: &mut crate::services_flow::ServicesFlowState,
+    // Mutable like `services`: the Spawn Lighthouse flow (OW-7) publishes
+    // spawn-lighthouse requests onto the Bus and holds the daemon's typed answer.
+    spawn_lighthouse: &mut crate::spawn_lighthouse_flow::SpawnLighthouseFlowState,
 ) {
     ui.add_space(Style::SP_L);
     ui.heading(
@@ -183,6 +188,13 @@ pub(crate) fn show(
                 // provisioning work: `onboard service-add` over the Bus).
                 Plane::Provisioning => {
                     provisioning.show(ui);
+                    ui.add_space(Style::SP_M);
+                    ui.separator();
+                    ui.add_space(Style::SP_M);
+                    // OW-7 — promote a LAN-only mesh: spawn its first lighthouse +
+                    // migrate the CA (the durable off-desktop CA home is provisioning
+                    // work), over the Bus against the spawn_lighthouse_onboard worker.
+                    spawn_lighthouse.show(ui);
                     ui.add_space(Style::SP_M);
                     ui.separator();
                     ui.add_space(Style::SP_M);

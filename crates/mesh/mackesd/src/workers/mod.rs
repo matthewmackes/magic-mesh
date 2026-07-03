@@ -691,6 +691,17 @@ pub mod media_server;
 // `LiveServiceApply`, whose typed `IntegrationGated` is the honest live answer
 // today (§7 — never a fake success).
 pub mod service_onboard;
+// OW-7 (Bus half) — the spawn_lighthouse_onboard worker: `onboard spawn-lighthouse`
+// reachable over the Bus for the shell's Spawn Lighthouse flow. Drains
+// `action/onboard/spawn-lighthouse` (a typed SpawnLighthouseAction: cloud-vs-local
+// target + the --pair HA flag + dry_run), runs the EXISTING onboard::spawn_lighthouse
+// engine (`plan_spawn` + the injectable `Provisioner` seam — §6 glue, no re-planning),
+// and — leader-gated so an N-node mesh answers once — publishes the typed
+// SpawnLighthouseEvent (plan summary / CA-migration steps / LAN-only retry hint /
+// typed error) on `event/onboard/spawn-lighthouse`. Production provisions run over
+// `LiveProvisioner`, whose typed `IntegrationGated` is the honest live answer today
+// (§7 — the live cloud/SSH provision + CA-migrate stays gated, never a fake success).
+pub mod spawn_lighthouse_onboard;
 // OW-15 (target-side, day-2) — the onboard_apply worker: the §9-native receiver
 // for the BusApply remote-push transport. Drains `action/onboard/apply` (a signed
 // JobBundle + the claimed issuer), applies it ONLY when addressed to this node,

@@ -6628,6 +6628,29 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("service_onboard".into());
         }
+        // OW-7 (Bus half) — the spawn_lighthouse_onboard worker: `onboard
+        // spawn-lighthouse` reachable over the Bus. Drains
+        // `action/onboard/spawn-lighthouse`, runs the EXISTING
+        // onboard::spawn_lighthouse engine (plan_spawn + the injectable Provisioner
+        // seam — §6 glue), and — leader-gated like service_onboard so an N-node mesh
+        // answers each request once — publishes the typed result event on
+        // `event/onboard/spawn-lighthouse` for the shell's Spawn Lighthouse flow.
+        // Rank-0-default like service_onboard (runs everywhere); real provisions run
+        // over LiveProvisioner, whose typed IntegrationGated is the honest live answer
+        // today (the live cloud/SSH provision + CA-migrate stays gated, §7).
+        if mackesd_core::worker_role::runs("spawn_lighthouse_onboard", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::spawn_lighthouse_onboard::SpawnLighthouseOnboardWorker::new(
+                    workgroup_root.clone(),
+                    node_id.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("spawn_lighthouse_onboard".into());
+        }
         // OW-15 (target-side, day-2) — the onboard_apply worker: the §9-native
         // receiver for the BusApply remote-push transport. Drains
         // `action/onboard/apply` (a signed JobBundle + the claimed issuer) and

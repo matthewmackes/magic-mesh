@@ -33,6 +33,7 @@ mod network;
 mod provisioning;
 mod services_flow;
 mod session;
+mod spawn_lighthouse_flow;
 mod storage;
 mod surface_card;
 mod system;
@@ -116,6 +117,13 @@ struct Shell {
     /// pick Music/Files/Voice, preview the daemon's plan (dry-run), apply over
     /// the Bus, and render the `service_onboard` worker's typed answer.
     services: services_flow::ServicesFlowState,
+    /// The Spawn Lighthouse flow (OW-7) — the Provisioning plane's promote-to-
+    /// lighthouse action: pick a cloud (zone1-do) or local (cloud-hypervisor)
+    /// target, optionally an HA pair, preview the daemon's plan (dry-run), spawn
+    /// over the Bus, and render the `spawn_lighthouse_onboard` worker's typed
+    /// answer (plan summary / CA-migration steps / LAN-only retry hint / typed
+    /// gated error).
+    spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState,
     /// The always-visible chrome bar's live state — peers + mesh status folded
     /// from the world-readable mesh-status snapshot, polled on the shared cadence
     /// (self-gating inside `chrome::show`).
@@ -233,6 +241,7 @@ impl Shell {
             controller: controller::ControllerState::default(),
             provisioning: provisioning::ProvisioningState::default(),
             services: services_flow::ServicesFlowState::default(),
+            spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState::default(),
             chrome: chrome::ChromeState::default(),
             music: MusicApp::new_with_ctx(ctx),
             media: real_media(),
@@ -334,6 +343,7 @@ impl Shell {
                     &self.controller,
                     &self.provisioning,
                     &mut self.services,
+                    &mut self.spawn_lighthouse,
                 );
             }
             Surface::MeshView => {
@@ -532,6 +542,9 @@ impl Shell {
             // The Services flow only actually reads while a request is in
             // flight (it self-gates on `pending`), so this is free otherwise.
             self.services.poll(ctx);
+            // The Spawn Lighthouse flow (OW-7) self-gates on `pending` too — free
+            // unless a spawn request is awaiting the worker's answer.
+            self.spawn_lighthouse.poll(ctx);
         }
 
         // OW-10 — the onboard self-test watch: an all-green verdict landing on the
