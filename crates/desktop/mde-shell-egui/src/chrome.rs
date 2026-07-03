@@ -28,6 +28,9 @@ use mde_cosmic_applet::{lighthouse_health_from_snapshot, LighthouseHealth};
 
 use mde_seat::{Probe, SeatSnapshot};
 
+use mde_theme::brand::build;
+use mde_theme::brand::icons::{icon_image, IconId};
+
 /// The world-readable mesh-status snapshot the root timer writes. The shell reads
 /// peers + lighthouse health from it exactly like the panel client — the desktop
 /// user can't read the root-only replicated peer directory, so this JSON is the
@@ -61,6 +64,13 @@ struct MeshSummary {
     lh_healthy: usize,
     /// `total` lighthouses behind `health` (for the Status tooltip).
     lh_total: usize,
+    /// This node's pinned deployment role, folded from the snapshot's own `self`
+    /// directory row (`lighthouse`/`server`/`workstation`) — the same role source
+    /// the This-Node plane reads, off the SAME snapshot the bar already polls (no
+    /// new IO, no new dependency). `None` when the snapshot names no `self`, this
+    /// node isn't in the directory yet, or its row carries no role → the honest
+    /// neutral node badge, never a guessed role (§7).
+    role: Option<String>,
     /// `true` once a snapshot has been parsed — distinguishes "no snapshot yet"
     /// (the connecting/loading state) from a parsed-but-empty mesh.
     seen: bool,
@@ -76,6 +86,7 @@ impl Default for MeshSummary {
             health: LighthouseHealth::None,
             lh_healthy: 0,
             lh_total: 0,
+            role: None,
             seen: false,
         }
     }
@@ -99,15 +110,38 @@ impl MeshSummary {
             .iter()
             .filter(|n| n.get("presence").and_then(serde_json::Value::as_str) == Some("online"))
             .count();
+        // This node's role: match the snapshot's own `self` marker to its directory
+        // row and read that row's `role` (the exact idiom This Node / Fleet fold).
+        // A missing `self`, an absent own row, or a blank role → `None` (no guess).
+        let self_host = nonempty(&v, "self");
+        let role = self_host.and_then(|host| {
+            nodes
+                .iter()
+                .find(|n| {
+                    n.get("hostname").and_then(serde_json::Value::as_str) == Some(host.as_str())
+                })
+                .and_then(|n| nonempty(n, "role"))
+        });
         Self {
             peers_total,
             peers_online,
             health,
             lh_healthy,
             lh_total,
+            role,
             seen: true,
         }
     }
+}
+
+/// Read a non-empty, trimmed string field off a JSON object, or `None` — the same
+/// tolerant field read the This Node plane uses (blank/whitespace reads as absent).
+fn nonempty(val: &serde_json::Value, key: &str) -> Option<String> {
+    val.get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 // ──────────────────────────── slot view mapping ───────────────────────────
@@ -337,6 +371,66 @@ fn session_view() -> SlotView {
     }
 }
 
+// ─────────────────────────── the node role badge ──────────────────────────
+//
+// The chrome carries this node's identity: the subtle build tag plus a small role
+// badge. The badge reuses QBRAND-2's role glyphs (`IconId::Workstation/Server/
+// Lighthouse`) — the brand crate owns the artwork, this bar only tints + places it
+// (§4/§6). The role itself is folded from the mesh snapshot the bar already reads
+// (`MeshSummary::role`), so there's no second role source to drift.
+
+/// The resolved role badge: which brand glyph to draw, the `Style` token to tint it
+/// with, and the hover text. A known role reads at full text tone; an unknown role
+/// falls back to the neutral mesh-node glyph, dimmed — honest, never a guessed role.
+struct Badge {
+    /// The brand glyph to raster (a role badge, or the neutral node glyph).
+    icon: IconId,
+    /// The `Style` token the glyph is tinted with (full tone known, dim unknown).
+    tint: Color32,
+    /// The hover text naming the role (or its honest absence).
+    tooltip: &'static str,
+}
+
+/// Map this node's pinned role string to its badge. The three deployment roles map
+/// to their QBRAND-2 glyphs at full text tone; anything else (including a genuinely
+/// unknown / not-yet-published role) is the dim neutral node glyph — the honest
+/// fallback the design calls for, never a fabricated role (§7).
+fn role_badge(role: Option<&str>) -> Badge {
+    match role {
+        Some("workstation") => Badge {
+            icon: IconId::Workstation,
+            tint: Style::TEXT,
+            tooltip: "This node's role: Workstation.",
+        },
+        Some("server") => Badge {
+            icon: IconId::Server,
+            tint: Style::TEXT,
+            tooltip: "This node's role: Server.",
+        },
+        Some("lighthouse") => Badge {
+            icon: IconId::Lighthouse,
+            tint: Style::TEXT,
+            tooltip: "This node's role: Lighthouse.",
+        },
+        _ => Badge {
+            icon: IconId::Node,
+            tint: Style::TEXT_DIM,
+            tooltip: "This node's role isn't published to the mesh snapshot yet.",
+        },
+    }
+}
+
+/// The badge's raster size in physical pixels: a `Style`-grid point size scaled by
+/// the context's device pixel ratio, so the glyph is DPI-crisp (never a raw metric,
+/// §4). Clamped ≥ 1px so `icon_image` never sees a zero size.
+#[allow(
+    clippy::cast_possible_truncation, // rounded, clamped-positive f32 → u32
+    clippy::cast_sign_loss            // ≥ 1.0 by the .max(1.0) clamp
+)]
+fn badge_px(points: f32, pixels_per_point: f32) -> u32 {
+    (points * pixels_per_point).round().max(1.0) as u32
+}
+
 // ──────────────────────────── the chrome state ────────────────────────────
 
 /// The chrome bar's live state: the projected mesh summary plus the small IO
@@ -349,6 +443,11 @@ pub(crate) struct ChromeState {
     summary: MeshSummary,
     /// When the snapshot was last polled (drives the fixed cadence).
     last_poll: Option<Instant>,
+    /// The cached role-badge texture, keyed by `(glyph, tint)` so the SVG only
+    /// re-rasterizes when the resolved role (or its tint) changes — not every
+    /// frame. `None` until the first badge draws (or if rasterization ever fails —
+    /// the cluster then shows the build tag alone, never a panic).
+    badge: Option<(IconId, [u8; 4], egui::TextureHandle)>,
 }
 
 impl Default for ChromeState {
@@ -357,6 +456,7 @@ impl Default for ChromeState {
             snapshot_path: PathBuf::from(SNAPSHOT_PATH),
             summary: MeshSummary::default(),
             last_poll: None,
+            badge: None,
         }
     }
 }
@@ -377,6 +477,40 @@ impl ChromeState {
             self.summary = MeshSummary::from_snapshot(&snapshot);
         }
         ctx.request_repaint_after(REFRESH);
+    }
+
+    /// Resolve the role-badge texture for `badge`, rasterizing + uploading the brand
+    /// glyph on first use (and only re-rasterizing when the glyph or its tint
+    /// changes — the cache is keyed by both). Returns a cheap clone of the cached
+    /// [`egui::TextureHandle`], or `None` if the glyph can't rasterize (never a
+    /// panic — the caller then draws the build tag alone). The one-line SVG→texture
+    /// wrap is QBRAND-2's documented recipe; the tint comes straight from a `Style`
+    /// token, so this bar never re-derives the design system's colours (§4/§6).
+    fn badge_texture(&mut self, ctx: &egui::Context, badge: &Badge) -> Option<egui::TextureHandle> {
+        let tint = [
+            badge.tint.r(),
+            badge.tint.g(),
+            badge.tint.b(),
+            badge.tint.a(),
+        ];
+        let fresh = self
+            .badge
+            .as_ref()
+            .is_none_or(|(id, key, _)| *id != badge.icon || *key != tint);
+        if fresh {
+            let px = badge_px(Style::SP_M, ctx.pixels_per_point());
+            match icon_image(badge.icon, px, tint) {
+                Ok(img) => {
+                    let color =
+                        egui::ColorImage::from_rgba_unmultiplied(img.size_usize(), &img.rgba);
+                    let tex =
+                        ctx.load_texture(badge.icon.name(), color, egui::TextureOptions::LINEAR);
+                    self.badge = Some((badge.icon, tint, tex));
+                }
+                Err(_) => self.badge = None,
+            }
+        }
+        self.badge.as_ref().map(|(_, _, tex)| tex.clone())
     }
 }
 
@@ -427,6 +561,33 @@ pub(crate) fn show(
                 .size(Style::BODY)
                 .strong(),
         );
+
+        // This node's role badge — the pinned deployment role rendered small, folded
+        // from the SAME snapshot the bar already reads (the node's own `self` row).
+        // An unknown role falls back to the neutral node glyph (honest, never a
+        // guessed role). The brand crate owns the glyph; this bar only tints + sizes
+        // it off `Style` tokens (§4).
+        let badge = role_badge(chrome.summary.role.as_deref());
+        if let Some(tex) = chrome.badge_texture(ui.ctx(), &badge) {
+            ui.add_space(Style::SP_S);
+            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                tex.id(),
+                egui::vec2(Style::SP_M, Style::SP_M),
+            )))
+            .on_hover_text(badge.tooltip);
+        }
+
+        // The subtle build tag in the dim Carbon token — single-sourced from
+        // brand::build so it can't drift from the splash / About / --version line
+        // (§4/§6); hovering reveals the full stamp (hash · date · channel).
+        ui.add_space(Style::SP_S);
+        ui.label(
+            RichText::new(build::version_line())
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        )
+        .on_hover_text(build::full());
+
         ui.add_space(Style::SP_M);
 
         for (i, (name, view)) in slots.iter().enumerate() {
@@ -769,5 +930,111 @@ mod tests {
 
         // Before the first snapshot → the shared connecting state.
         assert_eq!(signal_view(&MeshSummary::default()).value, "Connecting…");
+    }
+
+    // ── the node role badge (QBRAND-5) ───────────────────────────────────────
+
+    #[test]
+    fn role_folds_from_this_nodes_own_self_row() {
+        // The snapshot names this node via `self`; the badge reads THIS node's own
+        // directory row (a lighthouse), not a peer's role.
+        let snap = r#"{"self":"lh-01","nodes":[
+            {"hostname":"lh-01","overlay_ip":"10.42.0.1","presence":"online","role":"lighthouse"},
+            {"hostname":"ws-1","overlay_ip":"10.42.0.50","presence":"online","role":"workstation"}
+        ],"network":{"lighthouse_ips":["10.42.0.1"]}}"#;
+        let s = MeshSummary::from_snapshot(snap);
+        assert_eq!(s.role.as_deref(), Some("lighthouse"));
+        assert_eq!(role_badge(s.role.as_deref()).icon, IconId::Lighthouse);
+    }
+
+    #[test]
+    fn role_is_none_without_a_self_row_and_falls_back_to_the_node_glyph() {
+        // No `self` marker (the test snapshot helper omits it) → no honest role, so
+        // the badge is the dim neutral node glyph, never a guessed role (§7).
+        let s = MeshSummary::from_snapshot(&snapshot("online", "online", "online"));
+        assert!(
+            s.role.is_none(),
+            "a missing `self` marker must not guess a role"
+        );
+        let badge = role_badge(s.role.as_deref());
+        assert_eq!(badge.icon, IconId::Node);
+        assert_eq!(badge.tint, Style::TEXT_DIM);
+    }
+
+    #[test]
+    fn role_badge_maps_each_known_role_to_its_glyph_at_full_tone() {
+        for (role, icon) in [
+            ("workstation", IconId::Workstation),
+            ("server", IconId::Server),
+            ("lighthouse", IconId::Lighthouse),
+        ] {
+            let badge = role_badge(Some(role));
+            assert_eq!(badge.icon, icon, "{role} → wrong glyph");
+            // A known role reads at full text tone; the tag beside it stays dim.
+            assert_eq!(badge.tint, Style::TEXT, "{role} tint");
+        }
+        // An unrecognised token buckets to the honest neutral fallback.
+        assert_eq!(role_badge(Some("xcp-ng")).icon, IconId::Node);
+        assert_eq!(role_badge(None).icon, IconId::Node);
+    }
+
+    #[test]
+    fn badge_px_scales_with_dpi_and_never_zeros() {
+        assert_eq!(badge_px(Style::SP_M, 1.0), 16);
+        assert_eq!(badge_px(Style::SP_M, 2.0), 32);
+        // A degenerate ppp can't produce a zero raster (icon_image would reject it).
+        assert!(badge_px(Style::SP_M, 0.0) >= 1);
+    }
+
+    #[test]
+    fn chrome_bar_renders_the_version_tag_and_a_real_role_badge() {
+        // The bar mounts + paints headless with a known role folded in: the role
+        // badge SVG rasterizes + uploads a real texture (the known-role path), the
+        // dim build tag draws, and the whole bar tessellates to real geometry — the
+        // same CPU paint path the DRM runner drives.
+        use mde_egui::egui::{pos2, vec2, Rect};
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        // Fold a lighthouse role directly, and suppress the re-poll so `show`'s
+        // poll (the real snapshot path is absent under test) can't wipe it.
+        let mut chrome = ChromeState {
+            summary: MeshSummary {
+                role: Some("lighthouse".to_string()),
+                seen: true,
+                ..MeshSummary::default()
+            },
+            last_poll: Some(Instant::now()),
+            ..ChromeState::default()
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 48.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::TopBottomPanel::top("mcnf-chrome").show(ctx, |ui| {
+                show(ui, &mut chrome, None, false, 0);
+            });
+        });
+        // The lighthouse role badge rasterized + cached its texture.
+        assert!(
+            matches!(chrome.badge, Some((IconId::Lighthouse, _, _))),
+            "the lighthouse role badge texture was not cached"
+        );
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the chrome bar produced no draw primitives"
+        );
+    }
+
+    #[test]
+    fn the_build_tag_is_the_shared_brand_line() {
+        // The chrome tag is single-sourced from brand::build — the same line the
+        // splash / About / --version show, so they can never diverge (§4/§6).
+        assert_eq!(
+            build::version_line(),
+            mde_theme::brand::build::version_line()
+        );
+        assert!(!build::version_line().is_empty());
     }
 }
