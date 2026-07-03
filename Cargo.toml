@@ -40,6 +40,7 @@ members = [
     "crates/mesh/mackesd",
     "crates/mesh/mde-enroll",
     "crates/mesh/magic-fleet",
+    "crates/services/mde-adblock",
     "crates/services/mde-bookmarks",
     "crates/services/mde-chat",
     "crates/services/mde-files",
