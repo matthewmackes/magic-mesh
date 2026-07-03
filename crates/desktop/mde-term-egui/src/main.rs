@@ -80,9 +80,9 @@ impl eframe::App for TermApp {
 
 fn main() -> eframe::Result<()> {
     run_client("org.magicmesh.Terminal", "MCNF Terminal", |cc| {
-        // TERM-13: layer the bundled Fira Code ligature face onto the shared
-        // font set (additive over `Style::install`), so the grid renders a
-        // crisp monospace with programming ligatures.
+        // Layer the bundled Droid Sans Mono face onto the shared font set
+        // (additive over `Style::install`), so the grid renders the platform
+        // default: a crisp, clean monospace (no programming ligatures).
         mde_term_egui::fonts::install(&cc.egui_ctx);
         TermApp::new()
     })

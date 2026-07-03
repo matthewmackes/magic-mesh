@@ -97,8 +97,9 @@
 //!   **Shift-bypass** so Shift+drag always does native text selection. 24-bit
 //!   true-colour + 256-colour already pass through the engine → [`screen::Cell`]
 //!   → [`palette::cell_colors`] un-quantized (`Rgb`/`Palette` straight to
-//!   `Color32`). [`fonts`] bundles **Fira Code** (programming ligatures) in the
-//!   crate and registers it as the grid's monospace face.
+//!   `Color32`). [`fonts`] bundles **Droid Sans Mono** (a clean monospace, no
+//!   programming ligatures) in the crate and registers it as the grid's
+//!   monospace face.
 //!
 //! - [`menu`] (TERM-15) — the **selection context menu**: user-defined
 //!   [`menu::CustomCommand`]s (a label + a `{}`/`%s` template the selection

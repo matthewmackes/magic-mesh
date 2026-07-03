@@ -95,8 +95,8 @@ pub enum OsdKind {
 }
 
 impl OsdKind {
-    /// The short monospace glyph label painted beside the level bar. Fira Code
-    /// carries these ASCII forms on every seat (no icon-font dependency).
+    /// The short monospace glyph label painted beside the level bar. Droid Sans
+    /// Mono carries these ASCII forms on every seat (no icon-font dependency).
     #[must_use]
     pub const fn glyph(self) -> &'static str {
         match self {

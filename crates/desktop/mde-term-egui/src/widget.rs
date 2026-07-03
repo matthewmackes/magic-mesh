@@ -552,8 +552,8 @@ impl TerminalWidget {
         self.pump_pane_events(now);
 
         // The grid paints monospace; `crate::fonts::install` puts the bundled
-        // Fira Code ligature face (TERM-13) first in the Monospace family, so
-        // this `FontId` resolves to it.
+        // Droid Sans Mono face first in the Monospace family, so this `FontId`
+        // resolves to it.
         let font_id = FontId::monospace(self.font_size);
         let cell = ui.fonts(|f| Vec2::new(f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
 

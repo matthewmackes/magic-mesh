@@ -729,7 +729,7 @@ fn grip(ui: &mut egui::Ui) -> Response {
 }
 
 /// One list line's text: a fixed-width kind tag, the display label, and (for
-/// bookmarks) the URL — Fira Code is monospace, so the tag column lines up.
+/// bookmarks) the URL — Droid Sans Mono is monospace, so the tag column lines up.
 fn row_label(item: &Item) -> String {
     match item {
         Item::Folder(f) => format!("DIR  {}", f.name),

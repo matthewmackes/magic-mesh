@@ -130,7 +130,7 @@ impl Style {
     /// metrics (hit-target size + spacing) grow under [`Density::Touch`], so the shell
     /// can flip Tablet↔Laptop by re-installing at the new density.
     pub fn install_with_density(ctx: &Context, density: Density) {
-        // Fira Code is the default font set for every surface (governance §4).
+        // Droid Sans Mono is the default font set for every surface (governance §4).
         crate::fonts::install(ctx);
 
         let mut v = egui::Visuals::dark();
