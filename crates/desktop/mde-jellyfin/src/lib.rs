@@ -86,6 +86,19 @@
 //! / [`recordings`](JellyfinClient::recordings)) + music playback ride the same
 //! client patterns; a real server round-trip is honest-gated, the builders + the
 //! negotiation are tested.
+//!
+//! # Offline + profiles (MEDIA-11)
+//!
+//! [`cache`] downloads a title's untouched direct-play bytes through the same
+//! [`HttpTransport`] seam ([`JellyfinClient::download`]) into a managed local
+//! [`OfflineCache`] — a cache root + JSON manifest with a real lifecycle (add /
+//! evict / size-budget / staleness), so a title plays from a local
+//! [`local_path`](OfflineCache::local_path) with no server. And a
+//! [`ServerConfig`](store::ServerConfig) now holds **N user profiles** (each its
+//! own [`ServerAuth`]), one active at a time
+//! ([`switch_profile`](store::ServerConfig::switch_profile)) — per-profile token
+//! isolation, in the same [`ServerStore`]. Both are fixture-tested: the cache with
+//! synthetic bytes, the profiles as pure store folds.
 
 // Pragmatic pedantic allows, matching the mde-media-core / mde-media-egui idiom:
 // the type names intentionally echo their module (`HttpTransport` in `net`), and
@@ -94,6 +107,7 @@
 #![allow(clippy::module_name_repetitions, clippy::must_use_candidate)]
 
 pub mod browse;
+pub mod cache;
 pub mod client;
 pub mod models;
 pub mod net;
@@ -102,6 +116,7 @@ pub mod store;
 pub mod sync;
 
 pub use browse::{build_show_tree, group_by_type, SeasonNode, ShowTree};
+pub use cache::{CacheEntry, CacheError, CacheRequest, OfflineCache};
 pub use client::{
     build_items_request, image_url, ClientInfo, ImageQuery, ImageType, ItemsQuery, JellyfinClient,
     JellyfinError, SortOrder,

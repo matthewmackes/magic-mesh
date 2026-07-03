@@ -1087,6 +1087,40 @@ impl<T: HttpTransport> JellyfinClient<T> {
         );
         self.execute_ok(&req)
     }
+
+    // ── offline download (MEDIA-11) ───────────────────────────────────────────
+
+    /// Download the raw bytes at `url` through the injected transport — the seam
+    /// the offline cache ([`crate::cache`]) reuses to store a title for offline
+    /// playback (MEDIA-11).
+    ///
+    /// `url` is a fully-formed stream URL (e.g. from
+    /// [`direct_play_url`](crate::direct_play_url), whose `api_key` query already
+    /// carries the token), so this GET only adds the client `Authorization` line.
+    /// Unlike [`send`](Self::send) it returns the body bytes untouched rather than
+    /// parsing JSON, and — like every other call here — runs over the same
+    /// [`HttpTransport`], so it is fixture-tested with synthetic bytes and no
+    /// network.
+    ///
+    /// # Errors
+    /// [`JellyfinError::Transport`] on a connect / read failure, or
+    /// [`JellyfinError::Http`] on a non-2xx status.
+    pub fn download(&self, url: &str) -> Result<Vec<u8>, JellyfinError> {
+        let headers = vec![(
+            "Authorization".to_string(),
+            crate::client::authorization_header(&self.device, self.token.as_deref()),
+        )];
+        let response = self
+            .transport
+            .execute(&HttpRequest::get(url, headers))
+            .map_err(|e| JellyfinError::Transport(e.to_string()))?;
+        if !response.is_success() {
+            return Err(JellyfinError::Http {
+                status: response.status,
+            });
+        }
+        Ok(response.body)
+    }
 }
 
 #[cfg(test)]
@@ -1264,5 +1298,51 @@ mod tests {
             &ImageQuery::default(),
         );
         assert_eq!(url, "https://j.mesh/Items/i/Images/Backdrop");
+    }
+
+    #[test]
+    fn download_returns_raw_bytes_over_the_transport() {
+        use crate::net::{HttpResponse, HttpTransport, TransportError};
+
+        // A transport that echoes fixed "media" bytes for any GET, and records the
+        // Authorization line it saw (the offline-cache download seam — no network).
+        struct Bytes;
+        impl HttpTransport for Bytes {
+            fn execute(&self, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
+                assert!(request
+                    .headers
+                    .iter()
+                    .any(|(k, v)| k == "Authorization" && v.contains("Token=\"T\"")));
+                Ok(HttpResponse {
+                    status: 200,
+                    body: b"SYNTHETIC-MEDIA-BYTES".to_vec(),
+                })
+            }
+        }
+        let client = JellyfinClient::new("https://j.mesh", device(), Bytes).with_auth("T", "u");
+        let bytes = client
+            .download("https://j.mesh/Videos/m1/stream?static=true&api_key=T")
+            .expect("download");
+        assert_eq!(bytes, b"SYNTHETIC-MEDIA-BYTES");
+    }
+
+    #[test]
+    fn download_surfaces_a_non_2xx_as_http_error() {
+        use crate::net::{HttpResponse, HttpTransport, TransportError};
+
+        struct NotFound;
+        impl HttpTransport for NotFound {
+            fn execute(&self, _request: &HttpRequest) -> Result<HttpResponse, TransportError> {
+                Ok(HttpResponse {
+                    status: 404,
+                    body: Vec::new(),
+                })
+            }
+        }
+        let client = JellyfinClient::new("https://j.mesh", device(), NotFound);
+        let err = client
+            .download("https://j.mesh/Videos/x/stream")
+            .expect_err("404");
+        assert!(matches!(err, JellyfinError::Http { status: 404 }));
     }
 }

@@ -47,6 +47,12 @@ mde-media-core = { path = "../mde-media-core" }
 # the live browse/play/report legs are honest-gated to a real server.
 mde-jellyfin   = { path = "../mde-jellyfin" }
 
+[dev-dependencies]
+# The offline-cache (MEDIA-11) tests download synthetic bytes into a scratch cache
+# root; tempfile is already in the workspace lock (mde-jellyfin dev-dep), so this
+# adds no new lock entry.
+tempfile = "3"
+
 [features]
 default = []
 # The real libmpv engine, forwarded to mde-media-core's `mpv` feature. OFF by default

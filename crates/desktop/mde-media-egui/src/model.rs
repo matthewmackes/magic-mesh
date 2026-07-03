@@ -14,9 +14,10 @@
 //! against the real player, the browse/source/OSD folds as pure functions).
 
 use mde_jellyfin::{
-    build_playback_decision, BaseItemDto, ClientCapabilities, HttpTransport, ItemsQuery,
-    JellyfinClient, JellyfinError, MediaSourceInfo, PlaybackDecision, PlaybackMethod,
-    PlaybackReport, ServerConfig, ServerStore, StreamMediaType,
+    build_playback_decision, direct_play_url, BaseItemDto, CacheEntry, CacheRequest,
+    ClientCapabilities, HttpTransport, ItemsQuery, JellyfinClient, JellyfinError, MediaSourceInfo,
+    OfflineCache, PlaybackDecision, PlaybackMethod, PlaybackReport, ServerAuth, ServerConfig,
+    ServerStore, StreamMediaType,
 };
 use mde_media_core::{
     AbLoop, BrowseQuery, Library, LibraryItem, MediaEngine, MediaKind, MpvCapabilities,
@@ -115,7 +116,7 @@ pub struct SourceRow {
 }
 
 /// A configured Jellyfin server as a Sources row — its display name, base URL,
-/// and whether it is signed in.
+/// whether it is signed in, and its user profiles (MEDIA-11).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JellyfinSourceRow {
     /// The stable local id (the [`ServerStore`] key).
@@ -128,6 +129,32 @@ pub struct JellyfinSourceRow {
     pub signed_in: bool,
     /// Whether this is the currently selected server.
     pub selected: bool,
+    /// The active profile's display name, if any (MEDIA-11).
+    pub active_profile: Option<String>,
+    /// The user profiles configured on this server, for the switcher (MEDIA-11).
+    pub profiles: Vec<JellyfinProfileRow>,
+}
+
+/// One user profile of a Jellyfin server, as a switcher chip (MEDIA-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JellyfinProfileRow {
+    /// The user GUID — the profile key the switcher acts on.
+    pub user_id: String,
+    /// The display label (the user's name, else the id).
+    pub label: String,
+    /// Whether this is the active profile.
+    pub active: bool,
+}
+
+/// One cached title, as an offline-list row the Sources view renders (MEDIA-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfflineRow {
+    /// The Jellyfin item id (the play / evict key).
+    pub item_id: String,
+    /// The title.
+    pub label: String,
+    /// A human size (`"812 MB"`).
+    pub size: String,
 }
 
 /// The active Jellyfin playback — the ids + method a progress report echoes back
@@ -174,6 +201,9 @@ pub struct JellyfinState {
     selected: Option<String>,
     /// The active playback session, for progress / stop reports.
     session: Option<JellyfinSession>,
+    /// The managed offline cache (MEDIA-11) — downloaded titles + their manifest,
+    /// with the add / evict / size-budget / staleness lifecycle.
+    cache: OfflineCache,
 }
 
 impl Default for JellyfinState {
@@ -184,6 +214,7 @@ impl Default for JellyfinState {
             items: Vec::new(),
             selected: None,
             session: None,
+            cache: OfflineCache::new(),
         }
     }
 }
@@ -223,6 +254,12 @@ impl JellyfinState {
     #[must_use]
     pub const fn session(&self) -> Option<&JellyfinSession> {
         self.session.as_ref()
+    }
+
+    /// The offline cache (read-only) — the downloaded titles + budget (MEDIA-11).
+    #[must_use]
+    pub const fn cache(&self) -> &OfflineCache {
+        &self.cache
     }
 }
 
@@ -621,7 +658,177 @@ impl<E: MediaEngine> MediaController<E> {
         }
     }
 
-    /// The Jellyfin server rows the Sources view renders.
+    // ── Jellyfin user profiles (MEDIA-11) ─────────────────────────────────────
+
+    /// Add / refresh a user profile on a server (each its own token + user), the
+    /// store side of a per-server sign-in. Returns whether the server exists.
+    pub fn add_jellyfin_profile(&mut self, server_id: &str, auth: ServerAuth) -> bool {
+        self.jellyfin.store.add_profile(server_id, auth)
+    }
+
+    /// Switch the active user profile on a server, so subsequent browse / play use
+    /// that profile's token. Reports the outcome on the status line; returns
+    /// whether the switch happened.
+    pub fn switch_jellyfin_profile(&mut self, server_id: &str, user_id: &str) -> bool {
+        let switched = self.jellyfin.store.switch_profile(server_id, user_id);
+        if switched {
+            let who = self
+                .jellyfin
+                .store
+                .get(server_id)
+                .and_then(ServerConfig::active_auth)
+                .map_or_else(|| user_id.to_owned(), profile_label);
+            self.ui.status = Some(format!("Switched to {who}."));
+        } else {
+            self.ui.status = Some("No such profile on that server.".to_owned());
+        }
+        switched
+    }
+
+    // ── Jellyfin offline cache (MEDIA-11) ─────────────────────────────────────
+
+    /// Point the offline cache at `root` (the tests use a scratch dir; the app uses
+    /// the default under the config dir) and reload its manifest. Reports a load
+    /// failure honestly.
+    pub fn set_jellyfin_offline_root(&mut self, root: impl Into<std::path::PathBuf>) {
+        let root = root.into();
+        match OfflineCache::load_from(&root) {
+            Ok(cache) => self.jellyfin.cache = cache,
+            Err(e) => {
+                self.jellyfin.cache = OfflineCache::with_root(root);
+                self.ui.status = Some(format!("Offline cache: {e}"));
+            }
+        }
+    }
+
+    /// Whether `item_id` is downloaded for offline playback.
+    #[must_use]
+    pub fn is_offline_available(&self, item_id: &str) -> bool {
+        self.jellyfin.cache.contains(item_id)
+    }
+
+    /// The offline-list rows the Sources view renders — one per downloaded title.
+    #[must_use]
+    pub fn offline_rows(&self) -> Vec<OfflineRow> {
+        self.jellyfin
+            .cache
+            .entries()
+            .iter()
+            .map(|entry| OfflineRow {
+                item_id: entry.item_id.clone(),
+                label: entry.title.clone(),
+                size: human_bytes(entry.byte_len),
+            })
+            .collect()
+    }
+
+    /// The offline cache usage as a `"used / budget"` label for the Sources view.
+    #[must_use]
+    pub fn offline_usage(&self) -> String {
+        let used = human_bytes(self.jellyfin.cache.total_bytes());
+        self.jellyfin.cache.size_budget().map_or_else(
+            || format!("{used} offline"),
+            |budget| format!("{used} / {} offline", human_bytes(budget)),
+        )
+    }
+
+    /// Download `item`'s untouched direct-play bytes through the client and store
+    /// them in the offline cache (MEDIA-11) — the download→cache half of the offline
+    /// path. Reuses the client transport seam ([`JellyfinClient::download`]) + the
+    /// managed [`OfflineCache`]; a live server is honest-gated, tests drive it
+    /// through a fixture transport with synthetic bytes.
+    ///
+    /// # Errors
+    /// A status string when no server is selected, the item has no source, the
+    /// download fails, or the cache write fails.
+    pub fn download_jellyfin_item<T: HttpTransport>(
+        &mut self,
+        client: &JellyfinClient<T>,
+        item: &BaseItemDto,
+        now: u64,
+    ) -> Result<CacheEntry, String> {
+        let (base_url, token) = self.selected_endpoint()?;
+        let server_id = self
+            .jellyfin
+            .selected
+            .clone()
+            .ok_or_else(|| "Select a Jellyfin server first.".to_owned())?;
+        let Some(source) = item.media_sources.first() else {
+            return Err(format!(
+                "{} has no downloadable source yet — browse the library first.",
+                jellyfin_item_title(item)
+            ));
+        };
+        // The untouched original bytes (static direct-play) so the file plays
+        // offline with no server transcode.
+        let url = direct_play_url(
+            &base_url,
+            &item.id,
+            source.id.as_deref(),
+            stream_media_type(item),
+            token.as_deref(),
+        );
+        let bytes = client.download(&url).map_err(jellyfin_err)?;
+        let request = CacheRequest {
+            item_id: item.id.clone(),
+            server_id,
+            source_id: source.id.clone(),
+            title: jellyfin_item_title(item),
+            container: source.container.clone().unwrap_or_else(|| "bin".to_owned()),
+        };
+        let entry = self
+            .jellyfin
+            .cache
+            .store(&request, &bytes, now)
+            .map_err(|e| format!("Offline cache: {e}"))?;
+        self.ui.status = Some(format!(
+            "Downloaded {} for offline ({}).",
+            entry.title,
+            human_bytes(entry.byte_len)
+        ));
+        Ok(entry)
+    }
+
+    /// Play a downloaded title from the offline cache (MEDIA-11) — load its local
+    /// file into the core [`Player`] and bump its LRU last-access. No network: the
+    /// offline half of the path.
+    ///
+    /// # Errors
+    /// A status string when the item is not cached or the core rejects the load.
+    pub fn play_offline_item(&mut self, item_id: &str, now: u64) -> Result<(), String> {
+        let path = self
+            .jellyfin
+            .cache
+            .local_path(item_id)
+            .ok_or_else(|| format!("{item_id} is not downloaded for offline playback."))?;
+        let url = path.to_string_lossy().into_owned();
+        self.player.load(url).map_err(err)?;
+        // Best-effort LRU touch; a manifest write failure must not fail playback.
+        let _ = self.jellyfin.cache.touch(item_id, now);
+        self.ui.status = Some(format!(
+            "Playing {} offline.",
+            self.jellyfin
+                .cache
+                .get(item_id)
+                .map_or(item_id, |e| e.title.as_str())
+        ));
+        Ok(())
+    }
+
+    /// Evict a downloaded title from the offline cache (delete its file + manifest
+    /// row). Reports the outcome honestly.
+    pub fn evict_offline_item(&mut self, item_id: &str) {
+        match self.jellyfin.cache.evict(item_id) {
+            Ok(Some(entry)) => {
+                self.ui.status = Some(format!("Removed {} from offline.", entry.title));
+            }
+            Ok(None) => {}
+            Err(e) => self.ui.status = Some(format!("Offline cache: {e}")),
+        }
+    }
+
+    /// The Jellyfin server rows the Sources view renders (with their user
+    /// profiles, MEDIA-11).
     #[must_use]
     pub fn jellyfin_sources(&self) -> Vec<JellyfinSourceRow> {
         let selected = self.jellyfin.selected.as_deref();
@@ -629,12 +836,26 @@ impl<E: MediaEngine> MediaController<E> {
             .store
             .servers
             .iter()
-            .map(|server| JellyfinSourceRow {
-                id: server.id.clone(),
-                label: server.name.clone(),
-                base_url: server.base_url.clone(),
-                signed_in: server.is_authenticated(),
-                selected: selected == Some(server.id.as_str()),
+            .map(|server| {
+                let active_id = server.active_profile.as_deref();
+                let profiles = server
+                    .profiles()
+                    .iter()
+                    .map(|p| JellyfinProfileRow {
+                        user_id: p.user_id.clone(),
+                        label: profile_label(p),
+                        active: active_id == Some(p.user_id.as_str()),
+                    })
+                    .collect();
+                JellyfinSourceRow {
+                    id: server.id.clone(),
+                    label: server.name.clone(),
+                    base_url: server.base_url.clone(),
+                    signed_in: server.is_authenticated(),
+                    selected: selected == Some(server.id.as_str()),
+                    active_profile: server.active_auth().map(profile_label),
+                    profiles,
+                }
             })
             .collect()
     }
@@ -889,6 +1110,39 @@ pub fn jellyfin_item_title(item: &BaseItemDto) -> String {
         .clone()
         .filter(|name| !name.trim().is_empty())
         .unwrap_or_else(|| item.id.clone())
+}
+
+/// A user profile's display label — its user name, else its user id (MEDIA-11).
+#[must_use]
+pub fn profile_label(auth: &ServerAuth) -> String {
+    auth.user_name
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| auth.user_id.clone())
+}
+
+/// A compact human byte size (`"0 B"`, `"812 MB"`, `"1.4 GB"`) for the offline
+/// list. Binary units (1024) matching the cache budget; a pure fold, so it is
+/// unit-tested.
+#[must_use]
+#[allow(clippy::cast_precision_loss)]
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    // One decimal below 10 (1.4 GB), none above (812 MB) — a tidy, stable width.
+    if value < 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
 }
 
 /// Put `select` into the `kind` slot of a [`TrackSelection`].
@@ -1627,5 +1881,159 @@ mod tests {
         assert_eq!(jellyfin_item_title(&item), "Movie One");
         item.name = None;
         assert_eq!(jellyfin_item_title(&item), "m1");
+    }
+
+    // ── Jellyfin offline + profiles (MEDIA-11) ───────────────────────────────────
+
+    /// A transport that serves synthetic media bytes for a stream download and JSON
+    /// for a browse — the offline download seam, no network.
+    struct DownloadStub;
+    impl HttpTransport for DownloadStub {
+        fn execute(&self, request: &HttpRequest) -> Result<HttpResponse, TransportError> {
+            let body: Vec<u8> = if request.url.contains("/stream") {
+                b"SYNTHETIC-OFFLINE-MEDIA".to_vec()
+            } else {
+                br#"{"Items":[{"Id":"m1","Name":"Movie One","Type":"Movie",
+                    "MediaSources":[{"Id":"s1","Container":"mkv","MediaStreams":[
+                    {"Type":"Video","Codec":"h264","Index":0},
+                    {"Type":"Audio","Codec":"aac","Index":1}]}]}],
+                    "TotalRecordCount":1,"StartIndex":0}"#
+                    .to_vec()
+            };
+            Ok(HttpResponse { status: 200, body })
+        }
+    }
+
+    fn download_client() -> JellyfinClient<DownloadStub> {
+        JellyfinClient::new("https://jelly.mesh:8096", jelly_device(), DownloadStub)
+            .with_auth("TOKEN", "user-1")
+    }
+
+    #[test]
+    fn download_caches_a_title_then_plays_it_offline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut c = controller();
+        c.add_jellyfin_server("srv", "Home", "https://jelly.mesh:8096");
+        c.select_jellyfin_server("srv");
+        c.set_jellyfin_offline_root(dir.path());
+
+        // Download → cache: the synthetic bytes land under the scratch root.
+        let entry = c
+            .download_jellyfin_item(&download_client(), &jelly_movie(), 1000)
+            .expect("download");
+        assert_eq!(entry.item_id, "m1");
+        assert_eq!(entry.byte_len, "SYNTHETIC-OFFLINE-MEDIA".len() as u64);
+        assert!(c.is_offline_available("m1"));
+        // The file is really on disk with the exact bytes.
+        let cached = c.jellyfin().cache().local_path("m1").expect("path");
+        assert!(cached.starts_with(dir.path()));
+        assert_eq!(
+            std::fs::read(&cached).expect("read cached"),
+            b"SYNTHETIC-OFFLINE-MEDIA"
+        );
+
+        // Offline play → the core Player loads the local file (no network).
+        c.play_offline_item("m1", 2000).expect("offline play");
+        assert_eq!(c.player().media(), Some(cached.to_string_lossy().as_ref()));
+        // The offline list + usage reflect the one cached title.
+        let rows = c.offline_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].item_id, "m1");
+        assert!(c.offline_usage().contains('/'));
+    }
+
+    #[test]
+    fn evicting_an_offline_title_removes_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut c = controller();
+        c.add_jellyfin_server("srv", "Home", "https://jelly.mesh:8096");
+        c.select_jellyfin_server("srv");
+        c.set_jellyfin_offline_root(dir.path());
+        c.download_jellyfin_item(&download_client(), &jelly_movie(), 1)
+            .expect("download");
+        assert!(c.is_offline_available("m1"));
+        c.evict_offline_item("m1");
+        assert!(!c.is_offline_available("m1"));
+        assert!(c.offline_rows().is_empty());
+    }
+
+    #[test]
+    fn download_without_a_selected_server_is_refused_honestly() {
+        let mut c = controller();
+        let err = c
+            .download_jellyfin_item(&download_client(), &jelly_movie(), 1)
+            .expect_err("no server");
+        assert!(err.contains("Select a Jellyfin server"));
+        assert!(!c.is_offline_available("m1"));
+    }
+
+    #[test]
+    fn play_offline_missing_title_is_refused_honestly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut c = controller();
+        c.set_jellyfin_offline_root(dir.path());
+        let err = c.play_offline_item("ghost", 1).expect_err("not cached");
+        assert!(err.contains("not downloaded"));
+    }
+
+    fn auth(user_id: &str, name: &str, token: &str) -> ServerAuth {
+        ServerAuth {
+            access_token: token.into(),
+            user_id: user_id.into(),
+            user_name: Some(name.into()),
+            server_id: Some("srv".into()),
+        }
+    }
+
+    #[test]
+    fn profiles_switch_per_server_with_token_isolation() {
+        let mut c = controller();
+        c.add_jellyfin_server("srv", "Home", "https://jelly.mesh:8096");
+        c.select_jellyfin_server("srv");
+        assert!(c.add_jellyfin_profile("srv", auth("user-a", "matthew", "TOKEN-A")));
+        assert!(c.add_jellyfin_profile("srv", auth("user-b", "guest", "TOKEN-B")));
+
+        // The first profile is active; the row exposes both + the active name.
+        let row = &c.jellyfin_sources()[0];
+        assert!(row.signed_in);
+        assert_eq!(row.active_profile.as_deref(), Some("matthew"));
+        assert_eq!(row.profiles.len(), 2);
+        assert!(row
+            .profiles
+            .iter()
+            .any(|p| p.user_id == "user-a" && p.active));
+
+        // Switching flips the active profile — and the selected server's token.
+        assert!(c.switch_jellyfin_profile("srv", "user-b"));
+        let row = &c.jellyfin_sources()[0];
+        assert_eq!(row.active_profile.as_deref(), Some("guest"));
+        assert!(row
+            .profiles
+            .iter()
+            .any(|p| p.user_id == "user-b" && p.active));
+        let active_token = c
+            .jellyfin()
+            .selected_server()
+            .and_then(ServerConfig::active_auth)
+            .map(|a| a.access_token.clone());
+        assert_eq!(active_token.as_deref(), Some("TOKEN-B"));
+
+        // Switching to an unknown profile is refused honestly.
+        assert!(!c.switch_jellyfin_profile("srv", "nobody"));
+        assert!(c
+            .ui()
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("No such profile"));
+    }
+
+    #[test]
+    fn human_bytes_scales_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(human_bytes(15 * 1024 * 1024), "15 MB");
     }
 }

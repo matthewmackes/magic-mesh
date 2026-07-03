@@ -48,7 +48,13 @@ pub struct ServerAuth {
     pub server_id: Option<String>,
 }
 
-/// One configured Jellyfin server: where it is + how we're signed in.
+/// One configured Jellyfin server: where it is + who is signed in.
+///
+/// A server can hold **N user profiles** ([`profiles`](Self::profiles)) — each its
+/// own [`ServerAuth`] (`AccessToken` + `UserId`), keyed by the user's GUID — with
+/// one [`active_profile`](Self::active_profile) at a time. The [`auth`](Self::auth)
+/// field mirrors the active profile so the whole browse / play / report path keeps
+/// reading "the signed-in credentials" without knowing profiles exist (MEDIA-11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ServerConfig {
     /// A stable local id for this entry (the server GUID once known, else a
@@ -58,13 +64,23 @@ pub struct ServerConfig {
     pub name: String,
     /// The base URL, e.g. `https://jelly.mesh:8096` (no trailing slash needed).
     pub base_url: String,
-    /// The saved auth, once the user has signed in.
+    /// The active profile's saved auth — a **mirror** of the
+    /// [`active_profile`](Self::active_profile) entry in [`profiles`](Self::profiles),
+    /// kept so the existing browse/play path reads one field. Switching a profile
+    /// re-points this.
     #[serde(default)]
     pub auth: Option<ServerAuth>,
+    /// The configured user profiles (each its own token + user), keyed by
+    /// [`ServerAuth::user_id`]. Empty until the first sign-in.
+    #[serde(default)]
+    pub profiles: Vec<ServerAuth>,
+    /// The `user_id` of the active profile, if one is selected.
+    #[serde(default)]
+    pub active_profile: Option<String>,
 }
 
 impl ServerConfig {
-    /// A server entry with no saved auth yet.
+    /// A server entry with no saved auth / profiles yet.
     pub fn new(
         id: impl Into<String>,
         name: impl Into<String>,
@@ -75,13 +91,96 @@ impl ServerConfig {
             name: name.into(),
             base_url: base_url.into(),
             auth: None,
+            profiles: Vec::new(),
+            active_profile: None,
         }
     }
 
-    /// Whether this entry is signed in (has a saved token).
+    /// Whether this entry has any signed-in profile (an active token).
     #[must_use]
     pub const fn is_authenticated(&self) -> bool {
         self.auth.is_some()
+    }
+
+    /// The configured user profiles (each its own token + user).
+    #[must_use]
+    pub fn profiles(&self) -> &[ServerAuth] {
+        &self.profiles
+    }
+
+    /// The active profile's auth, if one is selected (same as [`auth`](Self::auth)).
+    #[must_use]
+    pub const fn active_auth(&self) -> Option<&ServerAuth> {
+        self.auth.as_ref()
+    }
+
+    /// Add or replace a user profile (keyed by its [`user_id`](ServerAuth::user_id)).
+    ///
+    /// The first profile added becomes the active one; a later add keeps the
+    /// current selection but refreshes that profile's token if it matches. The
+    /// mirrored [`auth`](Self::auth) is re-synced either way.
+    pub fn add_profile(&mut self, auth: ServerAuth) {
+        let user_id = auth.user_id.clone();
+        if let Some(existing) = self.profiles.iter_mut().find(|p| p.user_id == user_id) {
+            *existing = auth;
+        } else {
+            self.profiles.push(auth);
+        }
+        if self.active_profile.is_none() {
+            self.active_profile = Some(user_id);
+        }
+        self.sync_active_auth();
+    }
+
+    /// Switch the active profile to the one with `user_id`. Returns whether such a
+    /// profile exists (a no-op + `false` for an unknown user).
+    pub fn switch_profile(&mut self, user_id: &str) -> bool {
+        if self.profiles.iter().any(|p| p.user_id == user_id) {
+            self.active_profile = Some(user_id.to_owned());
+            self.sync_active_auth();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove the profile with `user_id`. Returns whether one was removed; if it
+    /// was the active profile, the first remaining profile (or none) takes over.
+    pub fn remove_profile(&mut self, user_id: &str) -> bool {
+        let before = self.profiles.len();
+        self.profiles.retain(|p| p.user_id != user_id);
+        let removed = self.profiles.len() != before;
+        if removed {
+            if self.active_profile.as_deref() == Some(user_id) {
+                self.active_profile = self.profiles.first().map(|p| p.user_id.clone());
+            }
+            self.sync_active_auth();
+        }
+        removed
+    }
+
+    /// Re-point the mirrored [`auth`](Self::auth) at the active profile (or `None`).
+    fn sync_active_auth(&mut self) {
+        self.auth = self
+            .active_profile
+            .as_ref()
+            .and_then(|id| self.profiles.iter().find(|p| &p.user_id == id))
+            .cloned();
+    }
+
+    /// Reconcile the profile fields with a possibly-older on-disk shape: seed a
+    /// profile from a lone [`auth`](Self::auth) (a pre-MEDIA-11 store), or adopt the
+    /// first profile as active when none is selected, then re-sync the mirror.
+    fn normalize(&mut self) {
+        if self.profiles.is_empty() {
+            if let Some(auth) = self.auth.clone() {
+                self.active_profile = Some(auth.user_id.clone());
+                self.profiles.push(auth);
+            }
+        } else if self.active_profile.is_none() {
+            self.active_profile = self.profiles.first().map(|p| p.user_id.clone());
+        }
+        self.sync_active_auth();
     }
 }
 
@@ -136,15 +235,39 @@ impl ServerStore {
         self.servers.len() != before
     }
 
-    /// Attach / replace the saved auth on the server with `id`. Returns whether
-    /// that server exists.
+    /// Attach / replace the saved auth on the server with `id` — a sign-in. Adds
+    /// (or refreshes) the matching user profile and makes it active. Returns
+    /// whether that server exists.
     pub fn set_auth(&mut self, id: &str, auth: ServerAuth) -> bool {
-        if let Some(server) = self.servers.iter_mut().find(|s| s.id == id) {
-            server.auth = Some(auth);
-            true
-        } else {
-            false
-        }
+        self.add_profile(id, auth)
+    }
+
+    /// Add / refresh a user profile on the server with `id` (MEDIA-11 multi-user).
+    /// Returns whether that server exists.
+    pub fn add_profile(&mut self, id: &str, auth: ServerAuth) -> bool {
+        self.servers
+            .iter_mut()
+            .find(|s| s.id == id)
+            .map(|server| server.add_profile(auth))
+            .is_some()
+    }
+
+    /// Switch the active profile on the server with `id` to `user_id`. Returns
+    /// whether both the server and that profile exist.
+    pub fn switch_profile(&mut self, id: &str, user_id: &str) -> bool {
+        self.servers
+            .iter_mut()
+            .find(|s| s.id == id)
+            .is_some_and(|server| server.switch_profile(user_id))
+    }
+
+    /// Remove a user profile from the server with `id`. Returns whether one was
+    /// removed.
+    pub fn remove_profile(&mut self, id: &str, user_id: &str) -> bool {
+        self.servers
+            .iter_mut()
+            .find(|s| s.id == id)
+            .is_some_and(|server| server.remove_profile(user_id))
     }
 
     /// The default store path: `<config dir>/mde/jellyfin/servers.json`.
@@ -153,22 +276,30 @@ impl ServerStore {
     /// `$HOME/.config` when it cannot be resolved.
     #[must_use]
     pub fn default_path() -> PathBuf {
-        let base = dirs::config_dir().unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-            Path::new(&home).join(".config")
-        });
-        base.join("mde").join("jellyfin").join("servers.json")
+        config_base()
+            .join("mde")
+            .join("jellyfin")
+            .join("servers.json")
     }
 
     /// Load the store from `path`, distinguishing a first-run absence
-    /// ([`StoreError::Missing`]) from an io / parse failure.
+    /// ([`StoreError::Missing`]) from an io / parse failure. The loaded store is
+    /// [`normalize`](ServerConfig::normalize)d, so a pre-MEDIA-11 shape (a lone
+    /// `auth`, no profiles) is migrated into a single active profile.
     ///
     /// # Errors
     /// [`StoreError::Missing`] when absent, [`StoreError::Io`] /
     /// [`StoreError::Parse`] otherwise.
     pub fn load_from(path: &Path) -> Result<Self, StoreError> {
         match std::fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text).map_err(|e| StoreError::Parse(e.to_string())),
+            Ok(text) => {
+                let mut store: Self =
+                    serde_json::from_str(&text).map_err(|e| StoreError::Parse(e.to_string()))?;
+                for server in &mut store.servers {
+                    server.normalize();
+                }
+                Ok(store)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(StoreError::Missing(path.to_path_buf()))
             }
@@ -222,6 +353,16 @@ impl AuthenticationResult {
             server_id: self.server_id,
         }
     }
+}
+
+/// The user config base dir: `dirs::config_dir()` (honoring `XDG_CONFIG_HOME`),
+/// falling back to `$HOME/.config`. Shared by the server store + the offline
+/// cache ([`crate::cache`]) so both root under the same `mde/jellyfin/` tree.
+pub(crate) fn config_base() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+        Path::new(&home).join(".config")
+    })
 }
 
 /// Write `bytes` to `path` with owner-only (`0600`) permissions.
@@ -379,6 +520,149 @@ mod tests {
             p.ends_with("mde/jellyfin/servers.json"),
             "got {}",
             p.display()
+        );
+    }
+
+    fn profile(user_id: &str, name: &str, token: &str) -> ServerAuth {
+        ServerAuth {
+            access_token: token.into(),
+            user_id: user_id.into(),
+            user_name: Some(name.into()),
+            server_id: Some("srv-a".into()),
+        }
+    }
+
+    #[test]
+    fn set_auth_seeds_a_first_active_profile() {
+        let mut store = ServerStore::new();
+        store.upsert(ServerConfig::new("srv-a", "Anvil", "https://a.mesh"));
+        assert!(store.set_auth("srv-a", profile("user-a", "matthew", "TOKEN-A")));
+        let server = store.get("srv-a").expect("srv-a");
+        // The lone sign-in became the sole, active profile, and mirrored to `auth`.
+        assert_eq!(server.profiles().len(), 1);
+        assert_eq!(server.active_profile.as_deref(), Some("user-a"));
+        assert_eq!(
+            server.active_auth().expect("active").access_token,
+            "TOKEN-A"
+        );
+    }
+
+    #[test]
+    fn multiple_profiles_switch_with_per_profile_token_isolation() {
+        let mut store = ServerStore::new();
+        store.upsert(ServerConfig::new("srv-a", "Anvil", "https://a.mesh"));
+        store.add_profile("srv-a", profile("user-a", "matthew", "TOKEN-A"));
+        store.add_profile("srv-a", profile("user-b", "guest", "TOKEN-B"));
+
+        let server = store.get("srv-a").expect("srv-a");
+        assert_eq!(server.profiles().len(), 2);
+        // The first-added profile is active; its token mirrors to `auth`.
+        assert_eq!(server.active_profile.as_deref(), Some("user-a"));
+        assert_eq!(server.active_auth().expect("a").access_token, "TOKEN-A");
+
+        // Switching flips the active token — each profile keeps its own.
+        assert!(store.switch_profile("srv-a", "user-b"));
+        let server = store.get("srv-a").expect("srv-a");
+        assert_eq!(server.active_auth().expect("b").access_token, "TOKEN-B");
+        assert_eq!(server.active_auth().expect("b").user_id, "user-b");
+        // Both tokens still live in the store, unmixed.
+        let tokens: Vec<&str> = server
+            .profiles()
+            .iter()
+            .map(|p| p.access_token.as_str())
+            .collect();
+        assert!(tokens.contains(&"TOKEN-A") && tokens.contains(&"TOKEN-B"));
+
+        // Switching to an unknown user is refused, leaving the selection intact.
+        assert!(!store.switch_profile("srv-a", "nobody"));
+        assert_eq!(
+            store
+                .get("srv-a")
+                .expect("srv-a")
+                .active_auth()
+                .expect("b")
+                .access_token,
+            "TOKEN-B"
+        );
+    }
+
+    #[test]
+    fn re_adding_a_profile_refreshes_its_token_without_reordering() {
+        let mut store = ServerStore::new();
+        store.upsert(ServerConfig::new("srv-a", "Anvil", "https://a.mesh"));
+        store.add_profile("srv-a", profile("user-a", "matthew", "OLD"));
+        store.add_profile("srv-a", profile("user-b", "guest", "TOKEN-B"));
+        store.switch_profile("srv-a", "user-b");
+        // Refresh user-a's token; the active profile (user-b) is unchanged.
+        store.add_profile("srv-a", profile("user-a", "matthew", "NEW"));
+        let server = store.get("srv-a").expect("srv-a");
+        assert_eq!(server.profiles().len(), 2);
+        assert_eq!(server.active_profile.as_deref(), Some("user-b"));
+        let a = server
+            .profiles()
+            .iter()
+            .find(|p| p.user_id == "user-a")
+            .expect("user-a");
+        assert_eq!(a.access_token, "NEW");
+    }
+
+    #[test]
+    fn removing_the_active_profile_promotes_another() {
+        let mut store = ServerStore::new();
+        store.upsert(ServerConfig::new("srv-a", "Anvil", "https://a.mesh"));
+        store.add_profile("srv-a", profile("user-a", "matthew", "TOKEN-A"));
+        store.add_profile("srv-a", profile("user-b", "guest", "TOKEN-B"));
+        // user-a is active; removing it promotes the remaining profile.
+        assert!(store.remove_profile("srv-a", "user-a"));
+        let server = store.get("srv-a").expect("srv-a");
+        assert_eq!(server.profiles().len(), 1);
+        assert_eq!(server.active_profile.as_deref(), Some("user-b"));
+        assert_eq!(server.active_auth().expect("b").access_token, "TOKEN-B");
+        // Removing the last profile leaves the server signed-out.
+        assert!(store.remove_profile("srv-a", "user-b"));
+        let server = store.get("srv-a").expect("srv-a");
+        assert!(server.profiles().is_empty());
+        assert!(!server.is_authenticated());
+        assert!(server.active_profile.is_none());
+    }
+
+    #[test]
+    fn legacy_store_with_lone_auth_migrates_to_a_profile_on_load() {
+        // A pre-MEDIA-11 store: `auth` set, no `profiles` / `active_profile`.
+        let legacy = r#"{"servers":[{"id":"srv-a","name":"Anvil",
+            "base_url":"https://a.mesh","auth":{"access_token":"T","user_id":"u1",
+            "user_name":"matthew","server_id":"srv-a"}}]}"#;
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("servers.json");
+        std::fs::write(&path, legacy).expect("write");
+        let store = ServerStore::load_from(&path).expect("load");
+        let server = store.get("srv-a").expect("srv-a");
+        // The lone auth is migrated into a single active profile.
+        assert_eq!(server.profiles().len(), 1);
+        assert_eq!(server.active_profile.as_deref(), Some("u1"));
+        assert_eq!(server.active_auth().expect("auth").access_token, "T");
+    }
+
+    #[test]
+    fn profiles_round_trip_through_json() {
+        let mut store = ServerStore::new();
+        store.upsert(ServerConfig::new("srv-a", "Anvil", "https://a.mesh"));
+        store.add_profile("srv-a", profile("user-a", "matthew", "TOKEN-A"));
+        store.add_profile("srv-a", profile("user-b", "guest", "TOKEN-B"));
+        store.switch_profile("srv-a", "user-b");
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("servers.json");
+        store.save_to(&path).expect("save");
+        let loaded = ServerStore::load_from(&path).expect("load");
+        assert_eq!(loaded, store);
+        assert_eq!(
+            loaded
+                .get("srv-a")
+                .expect("srv-a")
+                .active_auth()
+                .expect("active")
+                .access_token,
+            "TOKEN-B"
         );
     }
 

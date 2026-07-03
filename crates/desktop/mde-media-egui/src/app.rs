@@ -16,7 +16,9 @@ use mde_egui::egui::{
 };
 use mde_egui::{muted_note, status_dot, Style};
 
-use mde_jellyfin::{ClientInfo, ItemsQuery, JellyfinClient, ReqwestTransport};
+use mde_jellyfin::{
+    BaseItemDto, ClientInfo, ItemsQuery, JellyfinClient, ReqwestTransport, ServerConfig,
+};
 use mde_media_core::{MediaEngine, MediaKind, PlayerState, ScreenshotMode, SortKey, TrackKind};
 
 use crate::model::{
@@ -311,10 +313,12 @@ fn sources_view<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaControl
 }
 
 /// The Jellyfin sub-section of the Sources view: add a server, list the configured
-/// servers (Connect browses their libraries), and list the browsed titles — a
-/// click negotiates a [`PlaybackDecision`](mde_jellyfin::PlaybackDecision) and
-/// drives the core Player (MEDIA-10). The live browse/play legs need a real server
-/// (honest-gated); the negotiation + report construction are tested in `model`.
+/// servers (Connect browses their libraries) with a per-server user-profile
+/// switcher (MEDIA-11), the browsed titles — a click negotiates a
+/// [`PlaybackDecision`](mde_jellyfin::PlaybackDecision) and drives the core Player
+/// (MEDIA-10), a Download for offline — and the downloaded (offline) list a click
+/// plays with no server (MEDIA-11). The live browse/play/download legs need a real
+/// server (honest-gated); the negotiation + cache folds are tested in `model`.
 #[allow(clippy::too_many_lines)]
 fn jellyfin_section<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
     ui.add_space(Style::SP_S);
@@ -351,10 +355,11 @@ fn jellyfin_section<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaCon
         add_jellyfin_from_inputs(controller);
     }
 
-    // Configured servers.
+    // Configured servers, each with its user-profile switcher (MEDIA-11).
     let rows = controller.jellyfin_sources();
     let mut connect_id: Option<String> = None;
     let mut select_id: Option<String> = None;
+    let mut switch_profile: Option<(String, String)> = None;
     if rows.is_empty() {
         muted_note(
             ui,
@@ -391,19 +396,42 @@ fn jellyfin_section<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaCon
                 });
             });
             muted_note(ui, &row.base_url);
+            // The per-server profile switcher: a chip per user, the active one lit.
+            if !row.profiles.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Profile")
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                    );
+                    for profile in &row.profiles {
+                        if ui
+                            .selectable_label(profile.active, &profile.label)
+                            .clicked()
+                        {
+                            switch_profile = Some((row.id.clone(), profile.user_id.clone()));
+                        }
+                    }
+                });
+            }
             ui.add_space(Style::SP_XS);
         }
     }
     if let Some(id) = select_id {
         controller.select_jellyfin_server(&id);
     }
+    if let Some((server_id, user_id)) = switch_profile {
+        controller.switch_jellyfin_profile(&server_id, &user_id);
+    }
     if let Some(id) = connect_id {
         connect_jellyfin(controller, &id);
     }
 
-    // Browsed titles — a click negotiates + plays through the core Player.
+    // Browsed titles — a click plays through the core Player; Download caches for
+    // offline (MEDIA-11), and a cached title shows an offline badge.
     let items = controller.jellyfin_items().to_vec();
     let mut play_index: Option<usize> = None;
+    let mut download_index: Option<usize> = None;
     if !items.is_empty() {
         ui.add_space(Style::SP_XS);
         ui.label(
@@ -412,18 +440,28 @@ fn jellyfin_section<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaCon
                 .color(Style::TEXT_DIM),
         );
         for (index, item) in items.iter().enumerate() {
-            let clicked = ui
-                .label(
-                    RichText::new(jellyfin_item_title(item))
-                        .size(Style::BODY)
-                        .color(Style::TEXT),
-                )
-                .interact(Sense::click())
-                .on_hover_cursor(CursorIcon::PointingHand)
-                .clicked();
-            if clicked {
-                play_index = Some(index);
-            }
+            let cached = controller.is_offline_available(&item.id);
+            ui.horizontal(|ui| {
+                let clicked = ui
+                    .label(
+                        RichText::new(jellyfin_item_title(item))
+                            .size(Style::BODY)
+                            .color(Style::TEXT),
+                    )
+                    .interact(Sense::click())
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked();
+                if clicked {
+                    play_index = Some(index);
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if cached {
+                        ui.colored_label(Style::OK, RichText::new("Offline ✓").size(Style::SMALL));
+                    } else if ui.button("Download").clicked() {
+                        download_index = Some(index);
+                    }
+                });
+            });
             ui.add_space(Style::SP_XS);
         }
     }
@@ -433,6 +471,74 @@ fn jellyfin_section<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaCon
                 controller.ui_mut().tab = MediaTab::Player;
             }
         }
+    }
+    if let Some(index) = download_index {
+        if let Some(item) = controller.jellyfin_items().get(index).cloned() {
+            download_jellyfin(controller, &item);
+        }
+    }
+
+    // The downloaded (offline) list — a click plays with no server (MEDIA-11).
+    offline_section(ui, controller);
+}
+
+/// The offline (downloaded) titles sub-section: the cache usage, then a row per
+/// downloaded title with Play (offline, no network) + Remove (MEDIA-11).
+fn offline_section<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
+    let rows = controller.offline_rows();
+    if rows.is_empty() {
+        return;
+    }
+    ui.add_space(Style::SP_S);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Downloaded (offline)")
+                .size(Style::SMALL)
+                .strong()
+                .color(Style::TEXT_DIM),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            muted_note(ui, controller.offline_usage());
+        });
+    });
+    ui.add_space(Style::SP_XS);
+
+    let mut play_offline: Option<String> = None;
+    let mut evict: Option<String> = None;
+    for row in &rows {
+        ui.horizontal(|ui| {
+            status_dot(ui, Style::OK);
+            let clicked = ui
+                .label(
+                    RichText::new(&row.label)
+                        .size(Style::BODY)
+                        .color(Style::TEXT),
+                )
+                .interact(Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .clicked();
+            if clicked {
+                play_offline = Some(row.item_id.clone());
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("Remove").clicked() {
+                    evict = Some(row.item_id.clone());
+                }
+                muted_note(ui, &row.size);
+            });
+        });
+        ui.add_space(Style::SP_XS);
+    }
+    if let Some(item_id) = play_offline {
+        if controller
+            .play_offline_item(&item_id, mde_jellyfin::cache::unix_now())
+            .is_ok()
+        {
+            controller.ui_mut().tab = MediaTab::Player;
+        }
+    }
+    if let Some(item_id) = evict {
+        controller.evict_offline_item(&item_id);
     }
 }
 
@@ -464,26 +570,35 @@ fn add_jellyfin_from_inputs<E: MediaEngine>(controller: &mut MediaController<E>)
     controller.ui_mut().status = Some(format!("Added Jellyfin server {url}."));
 }
 
-/// Connect to a configured Jellyfin server: build a real [`ReqwestTransport`]
-/// client and browse its playable titles into the Sources list (hydrating
-/// `MediaSources` so a click can negotiate). A live server is honest-gated — the
-/// blocking fetch is deliberately simple; only the wire leg needs egress.
+/// Build a real [`ReqwestTransport`] client for `server`, carrying its active
+/// profile's saved token when signed in. The shared factory behind Connect +
+/// Download; a live server is honest-gated (only the wire leg needs egress).
+fn jellyfin_client(server: &ServerConfig) -> Result<JellyfinClient<ReqwestTransport>, String> {
+    let transport =
+        ReqwestTransport::new().map_err(|e| format!("Jellyfin transport error: {e}"))?;
+    let mut client = JellyfinClient::new(server.base_url.clone(), jellyfin_device(), transport);
+    if let Some(auth) = server.active_auth() {
+        client = client.with_auth(auth.access_token.clone(), auth.user_id.clone());
+    }
+    Ok(client)
+}
+
+/// Connect to a configured Jellyfin server: build a real client and browse its
+/// playable titles into the Sources list (hydrating `MediaSources` so a click can
+/// negotiate). A live server is honest-gated — the blocking fetch is deliberately
+/// simple; only the wire leg needs egress.
 fn connect_jellyfin<E: MediaEngine>(controller: &mut MediaController<E>, server_id: &str) {
     let Some(server) = controller.jellyfin().server(server_id).cloned() else {
         controller.ui_mut().status = Some("Unknown Jellyfin server.".to_owned());
         return;
     };
-    let transport = match ReqwestTransport::new() {
-        Ok(transport) => transport,
-        Err(e) => {
-            controller.ui_mut().status = Some(format!("Jellyfin transport error: {e}"));
+    let client = match jellyfin_client(&server) {
+        Ok(client) => client,
+        Err(message) => {
+            controller.ui_mut().status = Some(message);
             return;
         }
     };
-    let mut client = JellyfinClient::new(server.base_url.clone(), jellyfin_device(), transport);
-    if let Some(auth) = &server.auth {
-        client = client.with_auth(auth.access_token.clone(), auth.user_id.clone());
-    }
     // Browse the server's playable leaves, hydrating MediaSources for negotiation.
     let query = ItemsQuery::default()
         .recursive()
@@ -497,6 +612,29 @@ fn connect_jellyfin<E: MediaEngine>(controller: &mut MediaController<E>, server_
                 Some(format!("Loaded {count} title(s) from {}.", server.name));
         }
         Err(message) => controller.ui_mut().status = Some(message),
+    }
+}
+
+/// Download a browsed title's bytes into the offline cache (MEDIA-11) — build a
+/// real client for the selected server and store the untouched direct-play bytes.
+/// A live server is honest-gated; the cache write + lifecycle are tested in
+/// `model`. The controller sets the success status; a failure is surfaced here.
+fn download_jellyfin<E: MediaEngine>(controller: &mut MediaController<E>, item: &BaseItemDto) {
+    let Some(server) = controller.jellyfin().selected_server().cloned() else {
+        controller.ui_mut().status = Some("Select a Jellyfin server first.".to_owned());
+        return;
+    };
+    let client = match jellyfin_client(&server) {
+        Ok(client) => client,
+        Err(message) => {
+            controller.ui_mut().status = Some(message);
+            return;
+        }
+    };
+    if let Err(message) =
+        controller.download_jellyfin_item(&client, item, mde_jellyfin::cache::unix_now())
+    {
+        controller.ui_mut().status = Some(message);
     }
 }
 
@@ -1218,6 +1356,62 @@ mod tests {
         c.browse_jellyfin(&client, &mde_jellyfin::ItemsQuery::default().recursive())
             .expect("browse");
         assert_eq!(c.jellyfin_items().len(), 1);
+        render(&mut c, sources_view);
+    }
+
+    /// A fixture transport serving synthetic media bytes for a download and one
+    /// Jellyfin movie for a browse — the offline-cache seam, no network.
+    struct JellyDownloadStub;
+    impl mde_jellyfin::HttpTransport for JellyDownloadStub {
+        fn execute(
+            &self,
+            request: &mde_jellyfin::HttpRequest,
+        ) -> Result<mde_jellyfin::HttpResponse, mde_jellyfin::TransportError> {
+            let body: Vec<u8> = if request.url.contains("/stream") {
+                b"SYNTHETIC-OFFLINE-MEDIA".to_vec()
+            } else {
+                br#"{"Items":[{"Id":"m1","Name":"Movie One","Type":"Movie",
+                    "MediaSources":[{"Id":"s1","Container":"mkv","MediaStreams":[
+                    {"Type":"Video","Codec":"h264","Index":0},
+                    {"Type":"Audio","Codec":"aac","Index":1}]}]}],
+                    "TotalRecordCount":1,"StartIndex":0}"#
+                    .to_vec()
+            };
+            Ok(mde_jellyfin::HttpResponse { status: 200, body })
+        }
+    }
+
+    fn profile(user_id: &str, name: &str, token: &str) -> mde_jellyfin::ServerAuth {
+        mde_jellyfin::ServerAuth {
+            access_token: token.into(),
+            user_id: user_id.into(),
+            user_name: Some(name.into()),
+            server_id: None,
+        }
+    }
+
+    #[test]
+    fn sources_view_renders_profile_switcher_and_offline_downloads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut c = controller();
+        c.add_jellyfin_server("srv", "Home", "https://jelly.mesh:8096");
+        c.select_jellyfin_server("srv");
+        c.set_jellyfin_offline_root(dir.path());
+        // Two user profiles → the per-server profile switcher renders (MEDIA-11).
+        c.add_jellyfin_profile("srv", profile("user-a", "matthew", "A"));
+        c.add_jellyfin_profile("srv", profile("user-b", "guest", "B"));
+
+        // Browse a title, then download it → the offline badge + downloaded list draw.
+        let device = mde_jellyfin::ClientInfo::new("mde-media", "test", "dev", "12.0.0");
+        let client =
+            mde_jellyfin::JellyfinClient::new("https://jelly.mesh:8096", device, JellyDownloadStub)
+                .with_auth("A", "user-a");
+        c.browse_jellyfin(&client, &mde_jellyfin::ItemsQuery::default().recursive())
+            .expect("browse");
+        let item = c.jellyfin_items()[0].clone();
+        c.download_jellyfin_item(&client, &item, 1)
+            .expect("download");
+        assert!(c.is_offline_available("m1"));
         render(&mut c, sources_view);
     }
 }
