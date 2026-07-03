@@ -26,7 +26,7 @@ use mde_egui::Style;
 
 use mde_cosmic_applet::{lighthouse_health_from_snapshot, LighthouseHealth};
 
-use mde_seat::{Probe, SeatSnapshot};
+use mde_seat::{Battery, BatteryState, Probe, SeatSnapshot};
 
 use mde_theme::brand::build;
 use mde_theme::brand::icons::{icon_image, IconId};
@@ -46,6 +46,13 @@ const REFRESH: Duration = Duration::from_secs(5);
 /// uses (the datacenter rows, the panel pip) rather than a hand-rolled painter
 /// circle with literal metrics — so the dot reads one `Style` size + colour.
 const DOT: &str = "\u{25CF}";
+
+/// Charge (%) below which a **draining** system pack reads amber "low", and at or
+/// below which it reads red "critical" — the at-a-glance thresholds behind the
+/// battery slot's dot. A charging or full pack is never amber/red (it's improving);
+/// these bite only while the pack is actually discharging.
+const BATTERY_LOW: f64 = 20.0;
+const BATTERY_CRITICAL: f64 = 5.0;
 
 // ──────────────────────────── projected view ────────────────────────────
 
@@ -232,7 +239,7 @@ fn status_view(s: &MeshSummary) -> SlotView {
 // ───────────────────── read-only seat status icons (E12-15) ─────────────────
 //
 // Lock 3: the chrome bar carries read-only iconic status only — Signal · Bluetooth
-// · Volume — and no controls; ALL host-control interaction lives on
+// · Volume · Battery — and no controls; ALL host-control interaction lives on
 // `Surface::System`. These fold the SAME `mde-seat` snapshot the System surface
 // renders (the shell polls one `Seat`), so the icon and the panel can't diverge.
 // Each is the familiar dot+name+value slot, so the read-only status reads exactly
@@ -336,7 +343,87 @@ fn volume_view(seat: Option<&SeatSnapshot>) -> SlotView {
     }
 }
 
-/// The pre-first-snapshot seat state, shared by the Bluetooth + Volume icons.
+/// The Battery slot: the system pack's charge + charging state, folded from the
+/// SAME `SeatSnapshot.batteries` telemetry the System surface's Power section
+/// renders (the shell polls one `Seat`, so the slot and the panel can't diverge).
+/// `Absent` (no `UPower` / no bus — the build-host case) reads a dim "unavailable"
+/// carrying the honest reason; a present-but-empty snapshot (a desktop with no
+/// pack) reads a dim "No battery"; never a fabricated level (§7).
+fn battery_view(seat: Option<&SeatSnapshot>) -> SlotView {
+    match seat.map(|s| &s.batteries) {
+        None => seat_reading("Battery"),
+        Some(Probe::Absent { reason, .. }) => seat_unavailable(reason),
+        Some(Probe::Present(cells)) => {
+            let Some(b) = system_pack(cells) else {
+                return SlotView {
+                    dot: Style::TEXT_DIM,
+                    value: "No battery".to_string(),
+                    value_color: Style::TEXT_DIM,
+                    tooltip: Some("No battery on this host.".to_string()),
+                };
+            };
+            let (dot, value_color) = battery_tone(b);
+            let mut value = format!("{:.0}%", b.percentage);
+            // A charging (or pending-charge) pack carries the bolt so the slot reads
+            // "on AC" at a glance, beside the tone dot.
+            if matches!(
+                b.state,
+                BatteryState::Charging | BatteryState::PendingCharge
+            ) {
+                value.push('\u{26A1}');
+            }
+            SlotView {
+                dot,
+                value,
+                value_color,
+                tooltip: Some(format!(
+                    "Battery — {} \u{00B7} {} \u{00B7} {:.0}%",
+                    b.kind.label(),
+                    b.state.label(),
+                    b.percentage
+                )),
+            }
+        }
+    }
+}
+
+/// Pick the system pack to summarise from a multi-battery snapshot (lock 6): the
+/// `PowerSupply` pack that actually powers the host, else — when none is flagged
+/// (an all-peripheral snapshot) — the fullest cell, so the slot never invents a
+/// reading. `None` only for an empty list (the caller renders "No battery").
+fn system_pack(cells: &[Battery]) -> Option<&Battery> {
+    cells.iter().find(|b| b.power_supply).or_else(|| {
+        cells.iter().max_by(|a, b| {
+            a.percentage
+                .partial_cmp(&b.percentage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    })
+}
+
+/// The battery slot's tone — `(dot, value_color)` for the chosen system pack. A
+/// charging or full pack reads OK; a draining pack reads red under ~5% (or when
+/// `UPower` reports it empty) and amber under ~20%; anything else (a healthily
+/// draining pack, a pending state) reads the neutral dim dot with a legible value.
+fn battery_tone(b: &Battery) -> (Color32, Color32) {
+    match b.state {
+        BatteryState::Charging | BatteryState::FullyCharged => (Style::OK, Style::TEXT),
+        BatteryState::Empty => (Style::DANGER, Style::DANGER),
+        BatteryState::Discharging | BatteryState::PendingDischarge => {
+            if b.percentage <= BATTERY_CRITICAL {
+                (Style::DANGER, Style::DANGER)
+            } else if b.percentage < BATTERY_LOW {
+                (Style::WARN, Style::WARN)
+            } else {
+                (Style::TEXT_DIM, Style::TEXT)
+            }
+        }
+        BatteryState::PendingCharge | BatteryState::Unknown => (Style::TEXT_DIM, Style::TEXT),
+    }
+}
+
+/// The pre-first-snapshot seat state, shared by the Bluetooth + Volume + Battery
+/// icons.
 fn seat_reading(what: &str) -> SlotView {
     SlotView {
         dot: Style::TEXT_DIM,
@@ -550,6 +637,7 @@ pub(crate) fn show(
         ("Signal", signal_view(&chrome.summary)),
         ("BT", bluetooth_view(seat)),
         ("Vol", volume_view(seat)),
+        ("Batt", battery_view(seat)),
     ];
 
     let mut outcome = ChromeOutcome::default();
@@ -826,7 +914,7 @@ mod tests {
 
     // ── the read-only seat status icons (E12-15, lock 3) ─────────────────────
 
-    use mde_seat::{Backend, BtAdapter, BtDevice, BtStatus, MixerStatus};
+    use mde_seat::{Backend, BatteryKind, BtAdapter, BtDevice, BtStatus, MixerStatus};
 
     /// A typed-absent probe of any section (the honest build-host state).
     fn absent<T>() -> Probe<T> {
@@ -918,6 +1006,124 @@ mod tests {
         let off = bluetooth_view(Some(&seat_snapshot(Probe::Present(bare))));
         assert_eq!(off.value, "off");
         assert_eq!(off.dot, Style::TEXT_DIM);
+    }
+
+    /// A snapshot carrying a chosen battery probe, every other section Absent — the
+    /// battery-slot analogue of `seat_snapshot`.
+    fn battery_snapshot(batteries: Probe<Vec<Battery>>) -> SeatSnapshot {
+        SeatSnapshot {
+            bluetooth: absent(),
+            batteries,
+            power: absent(),
+            displays: absent(),
+            backlights: absent(),
+            mixer: absent(),
+            ddc: absent(),
+        }
+    }
+
+    /// One internal system pack at a chosen charge/state — the shape the slot folds.
+    fn pack(percentage: f64, state: BatteryState, power_supply: bool) -> Battery {
+        Battery {
+            model: "BAT0".to_string(),
+            kind: BatteryKind::Internal,
+            percentage,
+            state,
+            power_supply,
+        }
+    }
+
+    #[test]
+    fn battery_slot_folds_the_system_pack_charge_and_state() {
+        // A charging pack → OK dot, the bolt appended to the charge, an honest tip.
+        let v = battery_view(Some(&battery_snapshot(Probe::Present(vec![pack(
+            80.0,
+            BatteryState::Charging,
+            true,
+        )]))));
+        assert_eq!(v.value, "80%\u{26A1}");
+        assert_eq!(v.dot, Style::OK);
+        assert!(v
+            .tooltip
+            .is_some_and(|t| t.contains("internal battery") && t.contains("charging")));
+
+        // A low draining pack (< 20%) → amber WARN dot, no bolt.
+        let v = battery_view(Some(&battery_snapshot(Probe::Present(vec![pack(
+            12.0,
+            BatteryState::Discharging,
+            true,
+        )]))));
+        assert_eq!(v.value, "12%");
+        assert_eq!(v.dot, Style::WARN);
+        assert_eq!(v.value_color, Style::WARN);
+
+        // A full pack → OK dot, no bolt.
+        let v = battery_view(Some(&battery_snapshot(Probe::Present(vec![pack(
+            100.0,
+            BatteryState::FullyCharged,
+            true,
+        )]))));
+        assert_eq!(v.value, "100%");
+        assert_eq!(v.dot, Style::OK);
+
+        // A critically low draining pack → red DANGER dot.
+        assert_eq!(
+            battery_view(Some(&battery_snapshot(Probe::Present(vec![pack(
+                3.0,
+                BatteryState::Discharging,
+                true
+            )]))))
+            .dot,
+            Style::DANGER
+        );
+        // An empty pack → red DANGER dot too.
+        assert_eq!(
+            battery_view(Some(&battery_snapshot(Probe::Present(vec![pack(
+                0.0,
+                BatteryState::Empty,
+                true
+            )]))))
+            .dot,
+            Style::DANGER
+        );
+
+        // A healthily draining pack reads the neutral dim dot with a legible value.
+        let v = battery_view(Some(&battery_snapshot(Probe::Present(vec![pack(
+            72.0,
+            BatteryState::Discharging,
+            true,
+        )]))));
+        assert_eq!(v.value, "72%");
+        assert_eq!(v.dot, Style::TEXT_DIM);
+        assert_eq!(v.value_color, Style::TEXT);
+    }
+
+    #[test]
+    fn battery_slot_picks_the_system_pack_over_a_fuller_peripheral() {
+        // A fuller peripheral (a mouse) must not mask the low system pack: the
+        // `PowerSupply` cell is summarised even though it's the lower charge.
+        let v = battery_view(Some(&battery_snapshot(Probe::Present(vec![
+            pack(95.0, BatteryState::Discharging, false), // peripheral mouse
+            pack(15.0, BatteryState::Discharging, true),  // the system pack, low
+        ]))));
+        assert_eq!(v.value, "15%");
+        assert_eq!(v.dot, Style::WARN);
+    }
+
+    #[test]
+    fn battery_slot_is_honest_when_empty_or_absent() {
+        // Present-but-empty (a desktop with no pack) → a dim "No battery".
+        let v = battery_view(Some(&battery_snapshot(Probe::Present(Vec::new()))));
+        assert_eq!(v.value, "No battery");
+        assert_eq!(v.dot, Style::TEXT_DIM);
+
+        // Absent backend (no UPower / no bus) → the shared dim "unavailable".
+        let v = battery_view(Some(&battery_snapshot(absent())));
+        assert_eq!(v.value, "unavailable");
+        assert_eq!(v.dot, Style::TEXT_DIM);
+
+        // Before the first snapshot → the dim dash, never blank.
+        assert_eq!(battery_view(None).value, "\u{2014}");
     }
 
     #[test]
