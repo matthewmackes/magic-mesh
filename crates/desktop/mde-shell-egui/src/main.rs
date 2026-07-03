@@ -318,7 +318,8 @@ impl Shell {
         }
     }
 
-    /// The expanded shell body: the dock rail plus the one active surface.
+    /// The expanded shell body: the full-width bottom taskbar plus the one active
+    /// surface (NAVBAR-1 — the taskbar replaces the retired left rail).
     ///
     /// The shell owns the frame loop, so it drives the active surface itself —
     /// its per-frame **pump** (the worker-update drain the surface kept out of the
@@ -329,11 +330,15 @@ impl Shell {
     /// surface's in the shell's one `Context`. The Workbench keeps its live Fleet
     /// plane (MV-6).
     fn body(&mut self, ui: &mut egui::Ui) {
-        egui::SidePanel::left("shell-dock")
-            .resizable(false)
-            .exact_width(Style::SP_XL * 4.0)
+        // NAVBAR-1 — the surface launcher is now a full-width taskbar pinned to the
+        // bottom edge. Reserving the bottom panel BEFORE the surface content means
+        // the active surface fills the whole central area ABOVE the bar. Flat Carbon:
+        // a solid SURFACE fill + a hairline top divider (drawn by `dock::taskbar`).
+        egui::TopBottomPanel::bottom("shell-taskbar")
+            .exact_height(dock::TASKBAR_H)
+            .frame(egui::Frame::default().fill(Style::SURFACE))
             .show_inside(ui, |ui| {
-                dock::rail(ui, &mut self.nav.surface);
+                dock::taskbar(ui, &mut self.nav.surface);
             });
 
         match self.nav.surface {
@@ -630,7 +635,7 @@ impl Shell {
         // mesh Bus auto-opens the live Mesh Map, through the SAME
         // `shell/goto/<surface>` nav grammar the chrome unread indicator + the KIRON
         // chyron use (no second navigation path). The watch self-gates on the shared
-        // cadence; the Mesh Map is independently reachable from the dock rail besides.
+        // cadence; the Mesh Map is independently reachable from the taskbar besides.
         self.self_test.poll(ctx);
         if self.self_test.take_all_green() {
             if let Some(nav) = toast_bridge::resolve_action("shell/goto/mesh-map") {
@@ -911,7 +916,7 @@ mod tests {
     }
 
     /// Drive one headless frame that reproduces the shell's expanded **body mount**
-    /// — the dock rail plus a surface scoped under `push_id`, inside the shell's
+    /// — the bottom taskbar plus a surface scoped under `push_id`, inside the shell's
     /// `CentralPanel` — then tessellate it on the CPU so any paint-path fault
     /// surfaces as a failure. This is the same `Context::run` → `tessellate` path
     /// the DRM runner drives, minus the GPU (no window, no wgpu).
@@ -938,10 +943,10 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                egui::SidePanel::left("shell-dock")
-                    .resizable(false)
-                    .exact_width(Style::SP_XL * 4.0)
-                    .show_inside(ui, |ui| dock::rail(ui, &mut active));
+                egui::TopBottomPanel::bottom("shell-taskbar")
+                    .exact_height(dock::TASKBAR_H)
+                    .frame(egui::Frame::default().fill(Style::SURFACE))
+                    .show_inside(ui, |ui| dock::taskbar(ui, &mut active));
                 ui.push_id("shell-files", |ui| files_panel(ui, &mut files));
             });
         });
@@ -952,8 +957,8 @@ mod tests {
         );
     }
 
-    /// The Media surface (MEDIA-18) mounts through the same `body` path — the dock
-    /// rail plus the media header + `media_panel` scoped under `push_id` — over the
+    /// The Media surface (MEDIA-18) mounts through the same `body` path — the bottom
+    /// taskbar plus the media header + `media_panel` scoped under `push_id` — over the
     /// **real** `mde_media_core` backend (`real_media()`, no demo data; with no media
     /// indexed it shows the honest first-run Sources view, still a full paint path).
     /// Tessellating it on the CPU proves the whole media player is runtime-reachable
@@ -972,10 +977,10 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                egui::SidePanel::left("shell-dock")
-                    .resizable(false)
-                    .exact_width(Style::SP_XL * 4.0)
-                    .show_inside(ui, |ui| dock::rail(ui, &mut active));
+                egui::TopBottomPanel::bottom("shell-taskbar")
+                    .exact_height(dock::TASKBAR_H)
+                    .frame(egui::Frame::default().fill(Style::SURFACE))
+                    .show_inside(ui, |ui| dock::taskbar(ui, &mut active));
                 ui.push_id("shell-media", |ui| {
                     media_header(ui, &mut media);
                     ui.separator();
@@ -991,7 +996,7 @@ mod tests {
     }
 
     /// The Terminal surface (TERM-16) mounts through the same `body` path — the
-    /// dock rail plus `terminal_panel` scoped under `push_id` — over a **real**
+    /// bottom taskbar plus `terminal_panel` scoped under `push_id` — over a **real**
     /// local PTY (`real_terminal()`, no demo data; a refused first PTY renders the
     /// honest spawn error, still a full paint path). Tessellating it on the CPU
     /// proves the whole Terminator-class terminal is runtime-reachable as an
@@ -1010,10 +1015,10 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                egui::SidePanel::left("shell-dock")
-                    .resizable(false)
-                    .exact_width(Style::SP_XL * 4.0)
-                    .show_inside(ui, |ui| dock::rail(ui, &mut active));
+                egui::TopBottomPanel::bottom("shell-taskbar")
+                    .exact_height(dock::TASKBAR_H)
+                    .frame(egui::Frame::default().fill(Style::SURFACE))
+                    .show_inside(ui, |ui| dock::taskbar(ui, &mut active));
                 ui.push_id("shell-terminal", |ui| terminal_panel(ui, &mut terminal));
             });
         });
@@ -1024,8 +1029,8 @@ mod tests {
         );
     }
 
-    /// The Editor surface (EDITOR-1) mounts through the same `body` path — the dock
-    /// rail plus `editor_panel` scoped under `push_id` — over a fresh
+    /// The Editor surface (EDITOR-1) mounts through the same `body` path — the bottom
+    /// taskbar plus `editor_panel` scoped under `push_id` — over a fresh
     /// `EditorSurface` (`real_editor()`). EDITOR-1 is the scaffold, so the panel
     /// paints the editor chrome + the honest "No file open" empty state (§7, a real
     /// reachable state, not a `todo!()`). Tessellating it on the CPU proves the
@@ -1043,10 +1048,10 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                egui::SidePanel::left("shell-dock")
-                    .resizable(false)
-                    .exact_width(Style::SP_XL * 4.0)
-                    .show_inside(ui, |ui| dock::rail(ui, &mut active));
+                egui::TopBottomPanel::bottom("shell-taskbar")
+                    .exact_height(dock::TASKBAR_H)
+                    .frame(egui::Frame::default().fill(Style::SURFACE))
+                    .show_inside(ui, |ui| dock::taskbar(ui, &mut active));
                 ui.push_id("shell-editor", |ui| editor_panel(ui, &mut editor));
             });
         });
