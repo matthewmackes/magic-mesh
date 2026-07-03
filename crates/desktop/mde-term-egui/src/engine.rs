@@ -14,7 +14,7 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell as GridCell, Flags};
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, Processor};
 
 use crate::screen::{Cell, CellAttrs, CellColor, CursorPos, Screen};
@@ -156,6 +156,39 @@ impl Terminal {
     #[must_use]
     pub const fn bytes_seen(&self) -> u64 {
         self.bytes_seen
+    }
+
+    /// Whether the running program has enabled **any** mouse-tracking mode —
+    /// DECSET 1000 (click), 1002 (drag) or 1003 (any-motion). TERM-13 forwards
+    /// SGR mouse reports only when this is set, so an app that never asked for
+    /// the mouse keeps native text selection.
+    #[must_use]
+    pub fn mouse_reporting(&self) -> bool {
+        self.term.mode().intersects(
+            TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION,
+        )
+    }
+
+    /// Whether the program enabled the **SGR (1006)** extended mouse encoding —
+    /// the modern scheme TERM-13 emits (unbounded coordinates). Modern TUIs
+    /// (vim `ttymouse=sgr`, tmux, htop) all set it alongside a tracking mode.
+    #[must_use]
+    pub fn sgr_mouse(&self) -> bool {
+        self.term.mode().contains(TermMode::SGR_MOUSE)
+    }
+
+    /// Whether the program wants motion reported **while a button is held** —
+    /// DECSET 1002 button-drag tracking.
+    #[must_use]
+    pub fn mouse_drag(&self) -> bool {
+        self.term.mode().contains(TermMode::MOUSE_DRAG)
+    }
+
+    /// Whether the program wants **all** pointer motion reported, buttonless
+    /// hover included — DECSET 1003 any-motion tracking.
+    #[must_use]
+    pub fn mouse_motion(&self) -> bool {
+        self.term.mode().contains(TermMode::MOUSE_MOTION)
     }
 
     /// Resize the visible grid to `cols × rows` (clamped to at least `1×1`).
@@ -353,6 +386,33 @@ mod tests {
         );
         // Draining is one-shot.
         assert!(term.drain_events().is_empty());
+    }
+
+    #[test]
+    fn mouse_modes_track_the_decset_toggles() {
+        let mut term = Terminal::new(20, 5, 100);
+        // A fresh terminal reports nothing — native selection stays in charge.
+        assert!(!term.mouse_reporting());
+        assert!(!term.sgr_mouse());
+        assert!(!term.mouse_motion());
+
+        // htop / a modern TUI: any-motion tracking (1003) + SGR encoding (1006).
+        term.feed(b"\x1b[?1003h\x1b[?1006h");
+        assert!(term.mouse_reporting(), "1003 enables tracking");
+        assert!(term.mouse_motion(), "1003 is any-motion");
+        assert!(term.sgr_mouse(), "1006 is SGR encoding");
+
+        // On app exit the DECRST toggles clear them again.
+        term.feed(b"\x1b[?1003l\x1b[?1006l");
+        assert!(!term.mouse_reporting());
+        assert!(!term.sgr_mouse());
+        assert!(!term.mouse_motion());
+
+        // Button-drag tracking (1002) alone.
+        term.feed(b"\x1b[?1002h");
+        assert!(term.mouse_reporting(), "1002 enables tracking");
+        assert!(term.mouse_drag(), "1002 is button-drag");
+        assert!(!term.mouse_motion(), "1002 is not any-motion");
     }
 
     #[test]

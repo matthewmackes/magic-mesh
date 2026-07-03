@@ -89,13 +89,25 @@
 //!   knobs (scheme, font size, cursor style) and [`appearance::AppearancePicker`]
 //!   is the simple picker (`Ctrl+Shift+P`); the surface pushes the appearance
 //!   into every pane each frame, so a change reaches every live shell at once.
+//!
+//! - [`mouse`] + [`fonts`] (TERM-13) — **TUI fidelity**. [`mouse`] encodes egui
+//!   pointer activity into the xterm **SGR (1006)** mouse reports a program in
+//!   mouse-mode reads (click / drag / scroll / hover), which the widget forwards
+//!   to the PTY only when the engine says the app enabled tracking — with a
+//!   **Shift-bypass** so Shift+drag always does native text selection. 24-bit
+//!   true-colour + 256-colour already pass through the engine → [`screen::Cell`]
+//!   → [`palette::cell_colors`] un-quantized (`Rgb`/`Palette` straight to
+//!   `Color32`). [`fonts`] bundles **Fira Code** (programming ligatures) in the
+//!   crate and registers it as the grid's monospace face.
 
 pub mod appearance;
 pub mod bell;
 pub mod engine;
+pub mod fonts;
 pub mod keymap;
 pub mod layout;
 pub mod layout_ui;
+pub mod mouse;
 pub mod notify;
 pub mod palette;
 pub mod picker;
@@ -119,6 +131,7 @@ pub use engine::{TermEvent, Terminal, DEFAULT_SCROLLBACK};
 pub use keymap::{Action, Chord, Keymap, KeymapConfig};
 pub use layout::{LayoutPane, LayoutStore, LayoutTab, PaneSpec, SavedLayout};
 pub use layout_ui::{LayoutIntent, LayoutManager};
+pub use mouse::{encode_sgr, MouseButton, MouseEvent};
 pub use notify::{BusNotifyClient, NoticeLevel, NotifyBus, TermNotice, TOAST_TOPIC};
 pub use palette::Palette;
 pub use picker::{RemotePicker, RemoteTarget};

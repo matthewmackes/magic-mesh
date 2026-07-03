@@ -12,7 +12,11 @@
 //! - **feeds input**: printable text, editing keys and xterm escape sequences
 //!   to the PTY; `Ctrl+Shift+C` copies the selection, paste events land as PTY
 //!   input; the mouse wheel scrolls the scrollback window and any key input
-//!   snaps back to live.
+//!   snaps back to live;
+//! - **forwards the mouse** (TERM-13): when the running app enables mouse
+//!   tracking, pointer clicks/drags/scroll/hover are encoded as SGR (1006)
+//!   reports ([`crate::mouse`]) and fed to the PTY instead of driving local
+//!   selection — with a **Shift-bypass** so Shift+drag always selects natively.
 //!
 //! **Batching:** the painter never lays out one galley per cell. Each row is
 //! split into contiguous **same-style runs** (equal resolved fg/bg + the
@@ -38,6 +42,7 @@ use mde_egui::Style;
 use crate::appearance::{Appearance, CursorShape};
 use crate::bell::{Bell, BellConfig};
 use crate::engine::TermEvent;
+use crate::mouse::{encode_sgr, MouseButton, MouseEvent};
 use crate::notify::{BusNotifyClient, NoticeLevel, NotifyBus, TermNotice};
 use crate::palette::{self, Palette};
 use crate::pty::LocalPty;
@@ -204,6 +209,10 @@ pub struct TerminalWidget {
     /// Fractional wheel remainder (smooth trackpads scroll in sub-lines).
     scroll_accum: f32,
     selection: Option<Selection>,
+    /// The mouse button currently held for SGR drag reporting (TERM-13), set on
+    /// a reported press and cleared on its release, so motion reports carry the
+    /// held button. `None` when no button is down (or reporting is off).
+    mouse_report_button: Option<crate::mouse::MouseButton>,
     last_grid: Option<(u16, u16)>,
     /// This frame's locally-typed bytes, kept so the split multiplexer can fan
     /// them out to grouped panes (TERM-6 broadcast). Filled by [`Self::send`]
@@ -267,6 +276,7 @@ impl TerminalWidget {
             scroll_offset: 0,
             scroll_accum: 0.0,
             selection: None,
+            mouse_report_button: None,
             last_grid: None,
             input_echo: Vec::new(),
             search: Search::new(),
@@ -457,6 +467,9 @@ impl TerminalWidget {
         // watcher into pane state (raising any due notices) before rendering.
         self.pump_pane_events(now);
 
+        // The grid paints monospace; `crate::fonts::install` puts the bundled
+        // Fira Code ligature face (TERM-13) first in the Monospace family, so
+        // this `FontId` resolves to it.
         let font_id = FontId::monospace(self.font_size);
         let cell = ui.fonts(|f| Vec2::new(f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
 
@@ -482,11 +495,28 @@ impl TerminalWidget {
             self.last_grid = Some((cols, rows));
         }
 
+        // TERM-13 mouse reporting: forward SGR (1006) reports to the PTY when the
+        // running app enabled mouse tracking — unless Shift is held, the bypass
+        // that always keeps native text selection. Computed once here and threaded
+        // through input so the wheel routes to a scroll report, not the scrollback.
+        let modifiers = ui.input(|i| i.modifiers);
+        let mouse_report = !modifiers.shift
+            && self
+                .session
+                .with_terminal(|t| t.mouse_reporting() && t.sgr_mouse());
+
         // Input first, so a scroll/snap lands in this frame's snapshot.
         let history = self
             .session
             .with_terminal(crate::engine::Terminal::scrollback_len);
-        self.handle_input(ui, &response, cell, usize::from(rows), history);
+        self.handle_input(
+            ui,
+            &response,
+            cell,
+            usize::from(rows),
+            history,
+            mouse_report,
+        );
 
         // Scrollback search (TERM-9): rescan on a query/mode change or new
         // output, then scroll the current match into view. The full-history
@@ -509,23 +539,21 @@ impl TerminalWidget {
         let screen = self.session.with_terminal(|t| t.window(self.scroll_offset));
         let first_abs = history - self.scroll_offset;
 
-        let modifiers = ui.input(|i| i.modifiers);
-        self.handle_pointer(&response, rect, cell, first_abs, &screen, modifiers);
+        // Mouse-mode apps own the pointer (TERM-13): forward SGR reports and skip
+        // the local selection gestures. Shift-bypass (folded into `mouse_report`)
+        // and a non-tracking app both fall through to the native selection path.
+        if mouse_report {
+            self.report_mouse(ui, rect, cell, &screen);
+        } else {
+            self.mouse_report_button = None;
+            self.handle_pointer(&response, rect, cell, first_abs, &screen, modifiers);
+        }
 
         // The backing's render chrome: liveness (cursor + repaint), the node
         // marker (remote), and the honest status note (§7).
         let render = self.session.render_state();
-        let cursor = if !render.live || self.scroll_offset > 0 {
-            CursorPaint::Hidden
-        } else if !response.has_focus() {
-            CursorPaint::Hollow
-        } else if !self.cursor_blink || blink_on(ui.input(|i| i.time)) {
-            CursorPaint::Filled
-        } else {
-            CursorPaint::Hidden
-        };
-
         let live = render.live;
+        let cursor = self.cursor_paint(&response, ui.input(|i| i.time), live);
         let search_hits = self.search_hits(first_abs, screen.rows());
         let search_bar = self.search_bar();
         paint_grid(
@@ -567,6 +595,22 @@ impl TerminalWidget {
             ui.ctx().request_repaint_after(LIVE_REPAINT);
         }
         response
+    }
+
+    /// The cursor paint mode for this frame: hidden when the backing is dead or
+    /// scrolled into history, hollow when the pane is unfocused, else filled on
+    /// the blink-on phase (or always, when blink is off). `time` is the egui
+    /// frame clock (seconds).
+    fn cursor_paint(&self, response: &Response, time: f64, live: bool) -> CursorPaint {
+        if !live || self.scroll_offset > 0 {
+            CursorPaint::Hidden
+        } else if !response.has_focus() {
+            CursorPaint::Hollow
+        } else if !self.cursor_blink || blink_on(time) {
+            CursorPaint::Filled
+        } else {
+            CursorPaint::Hidden
+        }
     }
 
     /// Fold this frame's engine title/bell events + the activity/silence
@@ -702,6 +746,10 @@ impl TerminalWidget {
     }
 
     /// Keyboard + clipboard + wheel, from this frame's event stream.
+    ///
+    /// `mouse_report` (TERM-13) is true when the running app has the mouse and
+    /// Shift is up: the wheel then belongs to the app (reported as a scroll
+    /// button by [`Self::report_mouse`]), so it no longer pages the scrollback.
     fn handle_input(
         &mut self,
         ui: &Ui,
@@ -709,6 +757,7 @@ impl TerminalWidget {
         cell: Vec2,
         rows: usize,
         history: usize,
+        mouse_report: bool,
     ) {
         if response.clicked() || response.drag_started() {
             response.request_focus();
@@ -737,9 +786,11 @@ impl TerminalWidget {
 
         let (events, shift_held) = ui.input(|i| (i.events.clone(), i.modifiers.shift));
         for event in events {
-            // Wheel scrolling works on hover, focused or not.
+            // Wheel scrolling works on hover, focused or not — unless a mouse-mode
+            // app owns the wheel (TERM-13), in which case `report_mouse` forwards
+            // it as a scroll-button report instead of paging the scrollback.
             if let Event::MouseWheel { unit, delta, .. } = &event {
-                if response.hovered() {
+                if response.hovered() && !mouse_report {
                     self.wheel(*unit, delta.y, cell.y, rows, history);
                 }
                 continue;
@@ -1074,6 +1125,90 @@ impl TerminalWidget {
         }
     }
 
+    /// Forward this frame's pointer activity to the running app as SGR (1006)
+    /// mouse reports (TERM-13). Only reached when the app enabled mouse tracking
+    /// **and** Shift is up (the caller's `mouse_report` gate), so this never
+    /// steals a Shift+drag native selection.
+    ///
+    /// Presses/releases report per button; motion reports as a drag over the held
+    /// button (DECSET 1002) or, if the app asked for any-motion (1003), as a
+    /// buttonless hover; the wheel reports as the scroll pseudo-buttons. Every
+    /// report is written straight to the backing ([`Self::write_raw`]) so it
+    /// neither snaps the scrollback nor fans out to grouped panes.
+    fn report_mouse(&mut self, ui: &Ui, rect: Rect, cell: Vec2, screen: &Screen) {
+        let (motion_all, drag) = self
+            .session
+            .with_terminal(|t| (t.mouse_motion(), t.mouse_drag()));
+        let cols = screen.cols();
+        let rows = screen.rows();
+        let events = ui.input(|i| i.events.clone());
+        for event in &events {
+            match event {
+                Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers,
+                } => {
+                    if !rect.contains(*pos) {
+                        continue;
+                    }
+                    let Some(btn) = MouseButton::from_egui(*button) else {
+                        continue;
+                    };
+                    let (row, col) = cell_at(rect.min, cell, *pos, cols, rows);
+                    let kind = if *pressed {
+                        self.mouse_report_button = Some(btn);
+                        MouseEvent::Press(btn)
+                    } else {
+                        if self.mouse_report_button == Some(btn) {
+                            self.mouse_report_button = None;
+                        }
+                        MouseEvent::Release(btn)
+                    };
+                    self.write_raw(&encode_sgr(kind, col, row, *modifiers));
+                }
+                Event::PointerMoved(pos) => {
+                    if !rect.contains(*pos) {
+                        continue;
+                    }
+                    let (row, col) = cell_at(rect.min, cell, *pos, cols, rows);
+                    let mods = ui.input(|i| i.modifiers);
+                    if let Some(btn) = self.mouse_report_button {
+                        // Motion with a button held: DECSET 1002 or 1003.
+                        if drag || motion_all {
+                            self.write_raw(&encode_sgr(MouseEvent::Drag(btn), col, row, mods));
+                        }
+                    } else if motion_all {
+                        // Buttonless hover: DECSET 1003 any-motion only.
+                        self.write_raw(&encode_sgr(MouseEvent::Motion, col, row, mods));
+                    }
+                }
+                Event::MouseWheel { delta, .. } => {
+                    // egui wheel: +y is up (older content) — the scroll-up
+                    // button; a zero-y (pure horizontal) wheel reports nothing.
+                    let kind = if delta.y > 0.0 {
+                        MouseEvent::ScrollUp
+                    } else if delta.y < 0.0 {
+                        MouseEvent::ScrollDown
+                    } else {
+                        continue;
+                    };
+                    let Some(pos) = ui.input(|i| i.pointer.hover_pos()) else {
+                        continue;
+                    };
+                    if !rect.contains(pos) {
+                        continue;
+                    }
+                    let (row, col) = cell_at(rect.min, cell, pos, cols, rows);
+                    let mods = ui.input(|i| i.modifiers);
+                    self.write_raw(&encode_sgr(kind, col, row, mods));
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Copy the current selection to the clipboard (no-op without one).
     fn copy_selection(&self, ctx: &Context) {
         if let Some(sel) = self.selection {
@@ -1103,6 +1238,14 @@ impl TerminalWidget {
     fn write_input(&mut self, bytes: &[u8]) {
         self.scroll_offset = 0;
         self.scroll_accum = 0.0;
+        let _ = self.session.send_input(bytes);
+    }
+
+    /// Write synthesized bytes straight to the backing, bypassing the
+    /// scroll-snap and the broadcast echo — the path for SGR mouse reports
+    /// (TERM-13), which must not disturb the scrollback view or fan out to
+    /// grouped panes (each pane owns its own pointer).
+    fn write_raw(&self, bytes: &[u8]) {
         let _ = self.session.send_input(bytes);
     }
 
@@ -1810,6 +1953,37 @@ mod tests {
         // block cursor = the cursor colour (TEXT).
         assert!(has(Style::BG), "background fill");
         assert!(has(Style::TEXT), "block cursor fill");
+    }
+
+    #[test]
+    fn truecolor_and_256color_render_unquantized_into_primitives() {
+        // TERM-13 acceptance: 24-bit true-colour and 256-colour reach the draw
+        // stream exactly — no quantization to a nearby palette slot.
+        let mut term = Terminal::new(20, 2, 100);
+        // A 24-bit fg + bg whose channels match no ANSI/cube slot, then a
+        // 256-colour cube index on the second row.
+        term.feed(b"\x1b[38;2;17;133;219m\x1b[48;2;201;42;99mTC\x1b[0m\r\n");
+        term.feed(b"\x1b[38;5;208mIDX\x1b[0m");
+        let screen = term.viewport();
+
+        // The engine kept the 24-bit values as `Rgb` cells (not a palette slot).
+        let tc = screen.cell(0, 0).expect("truecolor cell");
+        assert_eq!(tc.fg, crate::screen::CellColor::Rgb(17, 133, 219));
+        assert_eq!(tc.bg, crate::screen::CellColor::Rgb(201, 42, 99));
+
+        let colors = tessellate_colors(&screen, plain_spec);
+        let has = |c: egui::Color32| colors.contains(&c);
+        // The exact 24-bit fg glyph + bg rect colours land in the mesh vertices.
+        assert!(
+            has(egui::Color32::from_rgb(17, 133, 219)),
+            "24-bit fg exact"
+        );
+        assert!(has(egui::Color32::from_rgb(201, 42, 99)), "24-bit bg exact");
+        // The 256-colour cube slot 208 resolves to its faithful xterm RGB.
+        assert!(
+            has(palette::indexed(208)),
+            "256-colour slot 208 rendered faithfully"
+        );
     }
 
     #[test]
