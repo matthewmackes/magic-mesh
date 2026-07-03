@@ -2881,3 +2881,100 @@ Throwaway XCP-ng VMs on a dom0 (LAN-bridged, `172.20.x`) giving the shell's Desk
 - [ ] **TESTVM-2: `testvm-lin` (Alpine) — Spice + VNC endpoints.** **As** a tester, **I want** a Linux guest serving Spice + VNC on the LAN, **so that** I can test those viewers. **Acceptance:** Alpine VM boots on the dom0, gets a `172.20.x` address, runs a Spice server (:5930) + `x11vnc` (:5900); both ports reachable from the shell host; a viewer shows its framebuffer. Basic (no/trivial auth).
 - [ ] **TESTVM-3: `testvm-win` — RDP endpoint (fallback Alpine+xrdp).** **As** a tester, **I want** an RDP target, **so that** I can test the ironrdp path. **Acceptance:** a Windows VM boots with Remote Desktop enabled (:3389) reachable on the LAN; OR — if no local Windows image — an **Alpine+`xrdp`** guest on :3389 (documented degradation, operator-flagged). `mde-vdi-rdp` connects and shows the login/desktop.
 - [ ] **TESTVM-4: shell Desktop-chooser connects to each endpoint.** **As** a user, **I want** the Desktop surface to connect to the test endpoints, **so that** the VDI path is proven end-to-end. **Acceptance:** the shell's Desktop chooser is pointed at each endpoint and establishes a basic session over VNC, Spice, and RDP respectively; each viewer renders the guest. (Live-verify; the DRM seat part may need real display hardware per the VDI-bed note.)
+
+### QUASAR-CLOUD — the mesh becomes an OpenStack cloud (design: `docs/design/quasar-cloud.md`, 90-Q `/plan` survey 2026-07-03)
+
+**Replacement epic** (operator: "replace the methods in the platform today when possible"). Nova/libvirt replace the mesh-native VM stack; Glance+DIB replace the golden-image script; Cinder adds volumes; Neutron/OVN puts instances on one flat mesh-bridged net; Designate replaces naming; the Controller plane becomes the Cloud plane. Nebula, etcd, Syncthing, Podman, mde-bus, netdata, chat, ISO installer all KEPT. Hard per-node cutover; replaced code deleted same-epic (§7). Parallel to E12; dev cloud on farm VMs.
+
+- [ ] **QC-1: host virt foundation in the image.**
+  **As** a mesh operator, **I want** libvirt/QEMU-KVM + OVN host bits baked into the one bootc image, **so that** any node can carry cloud duties without breaking immutability.
+  **Acceptance** (each runtime-observable):
+    - [ ] the image ships libvirt/qemu-kvm + OVN; `virsh version` + `ovs-vsctl show` work on a stock node
+    - [ ] cloud-hypervisor is absent from the image (Q32); the virtio-gpu→egui path re-validated on QEMU or a blocker filed
+- [ ] **QC-2: mackesd `openstack` worker.**
+  **As** the platform, **I want** a mackesd worker that renders Kolla config from fleet state and supervises the service containers, **so that** the cloud obeys the one-state doctrine with no deploy tool.
+  **Acceptance**:
+    - [ ] worker reads etcd/Syncthing fleet state and materializes per-service Podman units + Kolla config on its node
+    - [ ] per-service health published on the Bus; a killed container restarts; `[!]`-grade failures surface in chat
+- [ ] **QC-3: Kolla image transport over Syncthing.**
+  **As** an operator, **I want** service images distributed as archives on the mesh share and `podman load`ed locally, **so that** deploys need no registry and work offline.
+  **Acceptance**:
+    - [ ] a pinned Kolla release lands on `/mnt/mesh-storage`; nodes load images from it; checksums verified; no `quay.io` pull at deploy time
+- [ ] **QC-4: foundation services — DB, MQ, coordination.**
+  **As** the platform, **I want** leader-hosted MariaDB, clustered RabbitMQ (quorum queues), tooz on the mesh etcd, and per-node memcached, **so that** the control plane has no permanently-special node.
+  **Acceptance**:
+    - [ ] MariaDB rides the etcd leader and re-places on failover; APIs recover (design acceptance #3)
+    - [ ] RabbitMQ cluster survives one node down; tooz locks work against the mesh etcd
+- [ ] **QC-5: Keystone + the identity bridge.**
+  **As** a mesh member, **I want** enrollment to provision my Keystone identity and nodes to mint tokens invisibly, **so that** the mesh account IS the cloud account (Q21/62/87).
+  **Acceptance**:
+    - [ ] a newly-enrolled member exists in Keystone with no manual step; the Cloud plane opens with no login
+    - [ ] the CA/KDC no longer holds human cloud credentials (machine certs only)
+- [ ] **QC-6: core APIs on every node.**
+  **As** the platform, **I want** Keystone/Glance/Nova/Placement/Neutron/Cinder API containers on every OpenStack-carrying node, bound plaintext to the Nebula interface, **so that** the control plane is distributed and overlay-secured (Q5/22/23).
+  **Acceptance**:
+    - [ ] `openstack endpoint list` resolves to a mesh name reaching any healthy node; APIs unreachable from non-Nebula interfaces
+- [ ] **QC-7: Neutron/OVN flat mesh network.**
+  **As** a member, **I want** instances on one flat provider network bridged into the mesh with default-open security groups and LAN floating IPs, **so that** an instance is "inside" and reachable from any peer with no per-instance certs (Q43/44/45/48/49).
+  **Acceptance**:
+    - [ ] an instance is reachable from a different mesh peer with no floating IP; tenant MTU set for Geneve-over-Nebula; a LAN FIP pool exists per site
+- [ ] **QC-8: Cinder LVM + backups.**
+  **As** a member, **I want** volumes carved from each node's writable partition with cinder-backup to the object tiers, **so that** data survives instances (Q51/56/57/59).
+  **Acceptance**:
+    - [ ] create/attach/detach/snapshot round-trip green; a backup lands in the object tier and restores
+- [ ] **QC-9: Glance + DIB image pipeline.**
+  **As** an operator, **I want** Glance (local store + replication) fed by a diskimage-builder pipeline, **so that** the golden-image script retires (Q36/53).
+  **Acceptance**:
+    - [ ] DIB builds the platform's standard images into Glance; `build-mde-vm-golden.sh` deleted; images replicate across API nodes
+- [ ] **QC-10: capacity-derived flavors + hard per-user quotas.**
+  **As** the platform, **I want** flavors generated from real node shapes and quotas derived from real capacity divided into enforced per-user limits, **so that** guardrails are honest (Q29/39/89).
+  **Acceptance**:
+    - [ ] flavor set regenerates when a node joins/leaves; exceeding a per-user quota is rejected by Keystone/Nova and surfaced in the UI
+- [ ] **QC-11: typed verbs wrap the cloud.**
+  **As** the platform, **I want** the mackesd Bus verbs (boot/stop/rebuild/volume/net/image) reimplemented over the OpenStack APIs, **so that** §9's contract holds and GUIs never speak raw OpenStack (Q40).
+  **Acceptance**:
+    - [ ] every Cloud-plane action round-trips through a typed verb; verb-level integration tests (QC-16) exercise them
+- [ ] **QC-12: the Cloud plane (Controller plane replaced).**
+  **As** a member, **I want** the Workbench Controller plane to become the Cloud plane — instances, volumes+snapshots, images, networks+stacks, full launch picker, per-user usage view, **so that** every member self-serves from the shell (Q70/82/83/85).
+  **Acceptance**:
+    - [ ] full picker launches an instance end-to-end; all five resource kinds manageable; fleet-state template records render as launch presets (Q84)
+- [ ] **QC-13: instance access — console + keys.**
+  **As** a member, **I want** a one-click SPICE console (mde-vdi-spice viewer) and automatic SSH key injection, **so that** getting into my instance is trivial (Q34/88).
+  **Acceptance**:
+    - [ ] console opens from the Cloud plane row; a launched instance accepts the member's mesh-derived SSH key
+- [ ] **QC-14: VDI broker overlay on Nova.**
+  **As** a desktop user, **I want** the session-broker to place VDI desktops as Nova instances (flavor+metadata) while owning the display path/roaming/seat binding, **so that** one VM plane serves both worlds (Q33).
+  **Acceptance**:
+    - [ ] a VDI session boots via Nova and renders through the existing viewer path; roaming = rebuild per Q38
+- [ ] **QC-15: hard cutover + deletion.**
+  **As** the platform, **I want** per-node cutover flags and same-epic deletion of the replaced stack (mde-kvm scheduler paths, cloud-hypervisor glue, Cockpit VM console, golden script), **so that** no dead code survives (Q72/73/66).
+  **Acceptance**:
+    - [ ] a cutover node runs zero old-stack VM code; `/audit` finds no orphaned modules from the replaced stack; existing VMs rebuilt fresh (Q58)
+- [ ] **QC-16: verb-level CI on the farm dev cloud.**
+  **As** the platform, **I want** Rust integration tests driving boot/net/volume round-trips through the verbs against a farm-VM dev cloud, **so that** the cloud is continuously proven (Q74/75).
+  **Acceptance**:
+    - [ ] IaC brings up disposable virtual mesh nodes on the farm; the test suite runs in the GitOps lane and gates regressions
+- [ ] **QC-17: Designate replaces naming.**
+  **As** the platform, **I want** Designate serving mesh zones fed by the peer directory, **so that** nodes, instances, and services resolve by DNS everywhere (Q46).
+  **Acceptance**:
+    - [ ] node + instance records resolve mesh-wide; the peer directory can re-seed Designate from scratch
+- [ ] **QC-18: object tiers + media re-platform.**
+  **As** the workgroup, **I want** Swift as the hot object tier with DO Spaces off-site, and the media stack (Navidrome) re-platformed as instances, **so that** a real platform feature lives on the cloud (Q54/55/60).
+  **Acceptance**:
+    - [ ] Swift serves Keystone-authed objects; cinder-backups land in it; Navidrome runs as a Nova instance serving the mesh with media on the tiers
+- [ ] **QC-19: wave-2 services — Heat rendered, Octavia, Horizon.**
+  **As** an operator, **I want** Heat stacks rendered from fleet state, Octavia for instance load-balancing, and optional Horizon, **so that** wave 2 lands per the locks (Q25/47/61).
+  **Acceptance**:
+    - [ ] a fleet-state record renders + applies as a Heat stack; an Octavia LB fronts an instance service; Horizon (if deployed) is reachable mesh-only
+- [ ] **QC-20: cloud events into chat + idle nudges.**
+  **As** an operator, **I want** OpenStack notifications folded into the mesh chat (services as roster contacts) and idle instances nudging their owners, **so that** the one notification surface covers the cloud (Q65/90).
+  **Acceptance**:
+    - [ ] an instance failure arrives as a signed chat message from the service contact; an idle instance triggers an owner nudge
+- [ ] **QC-21: docs — the four deliverables.**
+  **As** an operator/member, **I want** the operator runbook, the ENT-12 blast-radius update (instances are "inside"), the replaced-vs-kept architecture map, and the member how-to, **so that** the claim is operable and honest (Q77).
+  **Acceptance**:
+    - [ ] all four docs exist and match the shipped behavior; the blast-radius doc covers default-open groups + hard quotas
+- [ ] **QC-22: SELinux tightening.**
+  **As** the platform, **I want** the initially-permissive OpenStack domains moved to enforcing with the proper policy modules, **so that** the RH-conventions claim becomes fully true (Q14).
+  **Acceptance**:
+    - [ ] OpenStack services run enforcing with zero new AVC denials over a soak; the hardening documented
