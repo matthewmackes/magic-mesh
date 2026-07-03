@@ -169,6 +169,9 @@ enum Action {
     SendToPeer(usize, String),
     /// FILEMGR-12 — right-click Send-in-Chat: transfer + drop a chat file card.
     SendInChat(usize, String),
+    /// EDITOR-9 — right-click Send-to-Editor: open the focused file in the Editor
+    /// surface (posts `action/editor/open`, drained by the shell's editor mount).
+    SendToEditor(usize),
     /// FILEMGR-12 — copy the selection's paths to the shared shell clipboard.
     ClipCopy(usize),
     /// FILEMGR-12 — cut the selection's paths (a matching in-app paste moves).
@@ -398,6 +401,9 @@ fn apply(ctx: &egui::Context, browser: &mut FileBrowser, action: Action) {
         }
         Action::SendInChat(p, peer) => {
             browser.send_in_chat(p, &peer);
+        }
+        Action::SendToEditor(p) => {
+            browser.send_to_editor(p);
         }
         // Cut/Copy stage the set in the model AND mirror the paths onto the shared
         // shell clipboard (via `ctx`), so a path copied here pastes in any surface.
@@ -1354,6 +1360,12 @@ fn entry_interactions(
         ui.menu_button("Send in Chat", |ui| {
             peer_send_submenu(ui, b, pane_ix, true, actions);
         });
+        // EDITOR-9 — open a file in the Editor surface (files only; a directory has
+        // no document to open). Posts `action/editor/open`, drained by the shell.
+        if !e.is_dir && ui.button("Open in Editor").clicked() {
+            actions.push(Action::SendToEditor(pane_ix));
+            ui.close_menu();
+        }
         ui.separator();
         // FILEMGR-12 — cut/copy/paste over the shared shell clipboard.
         if ui.button("Cut").clicked() {

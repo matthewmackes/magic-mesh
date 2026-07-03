@@ -27,12 +27,14 @@
 
 pub mod buffer;
 pub mod panel;
+pub mod project_tree;
 pub mod widget;
 
 use mde_egui::{eframe, egui};
 
 pub use buffer::Buffer;
 pub use panel::{editor_panel, EditorSurface};
+pub use project_tree::ProjectTree;
 pub use widget::{editor_widget, EditorView};
 
 /// Build the production [`EditorSurface`] the E12 shell owns and mounts with

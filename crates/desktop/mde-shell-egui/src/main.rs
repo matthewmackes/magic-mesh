@@ -53,6 +53,7 @@ use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
 
 use mde_editor_egui::{editor_panel, real_editor, EditorSurface};
+use mde_files::editor_open::EditorLaunchWatch;
 use mde_files_egui::{files_panel, FileBrowser};
 use mde_media_egui::{media_header, media_panel, media_pump, real_media, MediaSurface};
 use mde_music_egui::{music_header, music_panel, music_pump, MusicApp};
@@ -218,6 +219,11 @@ struct Shell {
     /// honest "No file open" empty state (§7); the rope buffer + text widget +
     /// tree-sitter highlighting land in EDITOR-2 onward, filling this surface.
     editor: EditorSurface,
+    /// EDITOR-9 — the Files "Send-to-Editor" drain: tails `action/editor/open` and
+    /// opens the requested path in the Editor surface (`EditorSurface::open_path`),
+    /// bringing it to the front. The receive half of the same persist-first verb
+    /// pattern the Send-To actions use; a dark Bus is an honest no-op.
+    editor_launch: EditorLaunchWatch,
     /// The Mesh Map surface (OW-10) — the live `mde-mesh-view` canvas, fed a
     /// `MeshState` folded from the same world-readable mesh-status snapshot the
     /// Workbench planes read. Polled while in view; opens the honest "waiting for
@@ -265,6 +271,7 @@ impl Shell {
             web: web::WebState::default(),
             terminal: real_terminal(),
             editor: real_editor(),
+            editor_launch: EditorLaunchWatch::from_env(),
             mesh_view: mesh_view::MeshViewState::default(),
             self_test: mesh_view::SelfTestWatch::default(),
         }
@@ -674,6 +681,16 @@ impl Shell {
         // (NOTIFY-CHAT-6).
         if self.nav.expanded {
             self.chat.poll(ctx);
+            // EDITOR-9 — pick up a Files "Send-to-Editor" (or any node's
+            // `action/editor/open`): open the requested path in the Editor surface
+            // and bring it to the front. `take` self-throttles + edge-triggers, so a
+            // per-frame call is cheap; a read failure (a vanished file) is dropped
+            // (the editor keeps its current state — never a faked open, §7).
+            if let Some(path) = self.editor_launch.take() {
+                if self.editor.open_path(&path).is_ok() {
+                    self.nav.surface = Surface::Editor;
+                }
+            }
         }
 
         // The Storage surface tails the `state/storage/*` mirrors + the selected

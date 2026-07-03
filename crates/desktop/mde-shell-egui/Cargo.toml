@@ -85,6 +85,10 @@ mde-cosmic-applet = { path = "../../platform/mde-cosmic-applet", default-feature
 mde-music-egui = { path = "../mde-music-egui" }
 mde-files-egui = { path = "../mde-files-egui" }
 mde-voice-egui = { path = "../mde-voice-egui" }
+# EDITOR-9 — the render-agnostic `mde-files` core (consumed WITHOUT its Cosmic-era
+# GUI, like mde-files-egui does), for the `EditorLaunchWatch` that drains the Files
+# "Send-to-Editor" `action/editor/open` verb into the shell's Editor surface.
+mde-files = { path = "../../services/mde-files", default-features = false, features = ["dbus"] }
 # OW-10 — the Surface::MeshView "Mesh Map": the egui reincarnation of MESHMAP. The
 # shell folds the world-readable mesh-status snapshot into `mde_mesh_view::MeshState`
 # and hands it to the `MeshView` painter each frame (the shell is its first caller).

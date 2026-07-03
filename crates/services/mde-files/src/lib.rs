@@ -27,6 +27,10 @@ pub mod archive;
 pub mod backend;
 #[cfg(feature = "dbus")]
 pub mod bus_backend;
+// EDITOR-9 — the Files → Editor cross-surface open seam ("Send-to-Editor"): the
+// `action/editor/open` verb + body (always compiled) and, behind `dbus`, the Bus
+// sender/drain the file-manager surface and the shell wire it through.
+pub mod editor_open;
 pub mod fileops;
 #[cfg(feature = "dbus")]
 pub mod mesh_backend;
@@ -53,6 +57,7 @@ pub use archive::{browse as browse_archive, compress, extract, ArchiveEntry, Arc
 pub use backend::{
     AuditEntry, Backend, BackendError, ConflictPolicy, Destination, LocalFsBackend, OpId, SendMode,
 };
+pub use editor_open::{EditorOpenRequest, ACTION_EDITOR_OPEN};
 pub use fileops::{FakeFileOps, FileOps, FileStat, LiveFileOps};
 pub use model::{FileRow, Layout, Mime, Peer, PeerKind, PeerStatus, SelfNode, Tab, View};
 pub use opqueue::{

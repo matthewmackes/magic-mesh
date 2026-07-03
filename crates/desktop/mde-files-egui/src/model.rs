@@ -2376,6 +2376,33 @@ impl FileBrowser {
         };
         Some(result)
     }
+
+    /// EDITOR-9 — "Send-to-Editor": post the pane's focused **local** file onto
+    /// [`ACTION_EDITOR_OPEN`](mde_files::editor_open::ACTION_EDITOR_OPEN) so the one
+    /// Quasar shell's editor mount opens it (`EditorSurface::open_path`) — the same
+    /// persist-first Bus verb pattern as Send-in-Chat (§6 reuse). A no-op with an
+    /// honest note when nothing local is focused (peer/virtual rows carry no path),
+    /// and a silent no-op on a node with no Bus.
+    pub fn send_to_editor(&mut self, pane: usize) {
+        let Some(path) = self
+            .pane(pane)
+            .active_tab()
+            .focused_row()
+            .and_then(|row| row.path.clone())
+            .map(PathBuf::from)
+        else {
+            self.last_note = Some(
+                "Nothing to open — select a local file first (mesh files need a mount).".into(),
+            );
+            return;
+        };
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        mde_files::editor_open::BusEditorLaunch::from_env().send(&path);
+        self.last_note = Some(format!("Sent {name} to the Editor."));
+    }
 }
 
 /// A short label for a Send-To/Send-in-Chat status line: the single file's name,
