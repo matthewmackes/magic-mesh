@@ -32,18 +32,26 @@
 //!   carve-out): Quasar-token-derived where a token carries the meaning,
 //!   standard ANSI hues elsewhere; the only raw colour values in the crate.
 //!
-//! Tabs, broadcast input, and the mackesd mesh PTY broker arrive in TERM-5
-//! onward.
+//! - [`tabs`] (TERM-5) — a tab layer over the splits: [`tabs::TabbedTerminal`]
+//!   owns one [`splits::SplitTerminal`] per tab (each an independent split tree)
+//!   plus the active index, with a Carbon-token tab bar (new/close/reorder) and
+//!   the Terminator tab chords. Switching tabs preserves each tab's whole
+//!   layout + live PTYs; the last tab closing empties the surface. The binary
+//!   mounts it above the splits.
+//!
+//! Broadcast input and the mackesd mesh PTY broker arrive in TERM-6 onward.
 
 pub mod engine;
 pub mod palette;
 pub mod pty;
 pub mod screen;
 pub mod splits;
+pub mod tabs;
 pub mod widget;
 
 pub use engine::{Terminal, DEFAULT_SCROLLBACK};
 pub use pty::{LocalPty, SpawnOptions};
 pub use screen::{Cell, CellAttrs, CellColor, CursorPos, Screen};
 pub use splits::{consume_commands, Command, NavDir, Pane, SessionId, SplitDir, SplitTerminal};
+pub use tabs::{consume_tab_commands, TabCommand, TabbedTerminal};
 pub use widget::TerminalWidget;
