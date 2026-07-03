@@ -27,6 +27,7 @@ use mde_files::model::{FileRow, Mime, Peer, SelfNode};
 use mde_files::opqueue::OpKind;
 use mde_files::send_to::{SendToEntry, SendToRequest};
 
+use crate::chat_bridge::{BusChatBridge, ChatBridge};
 use crate::dialogs::{Arming, ConfirmDelete, Perm, PermClass, PropertiesDialog};
 use crate::mesh_mount::{BusMeshMount, MeshMountClient, MeshMountVerb, MountView};
 use crate::ops::Ops;
@@ -742,6 +743,41 @@ pub fn plan_transfer(sources: Vec<PathBuf>, dest_dir: PathBuf, copy: bool) -> Op
     }
 }
 
+/// FILEMGR-12 — encode paths for the shared shell clipboard: one absolute path
+/// per line (the plain-text form any surface's paste reads back).
+fn join_clip_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// FILEMGR-12 — decode a shared-clipboard paste back into file paths: one per
+/// line, keeping only **absolute paths that exist** on this node (a mounted-peer
+/// path counts — it's a live sshfs path). Anything else (a URL, prose, a stale
+/// path) is dropped, so a cross-surface paste never queues a bogus transfer.
+fn parse_clip_paths(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute() && p.exists())
+        .collect()
+}
+
+/// FILEMGR-12 — a cut/copy set staged for Paste. The path text is mirrored onto
+/// the shared shell clipboard on Cut/Copy (in the view); this in-model record
+/// only decides move-vs-copy — a Paste of exactly this `cut` set *moves*, any
+/// other paste (incl. one from another surface) *copies*.
+#[derive(Clone)]
+struct ClipEntry {
+    /// The staged source paths.
+    paths: Vec<PathBuf>,
+    /// `true` for Cut (a matching Paste moves + clears), `false` for Copy.
+    cut: bool,
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // The whole surface model.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -770,6 +806,18 @@ pub struct FileBrowser {
     /// `action/mesh-mount/<host>`). Injectable so the model is unit-tested
     /// headless; production is [`BusMeshMount`].
     mesh: Box<dyn MeshMountClient>,
+    /// FILEMGR-12 — the "Send in Chat" hand-off seam: offers a file to a peer's
+    /// NOTIFY-CHAT conversation as the reused `mde-chat` file message-kind.
+    /// Injectable so `send_in_chat` is unit-tested headless; production is
+    /// [`BusChatBridge`] (the same persist-first path as [`BusMeshMount`]).
+    chat: Box<dyn ChatBridge>,
+    /// FILEMGR-12 — the pending cut/copy set, for the *move-vs-copy* semantics of
+    /// an in-app Paste (an external paste of the same paths still moves). `None`
+    /// until a Cut/Copy runs; a Cut's set is cleared once its Paste consumes it.
+    /// The path text is ALSO written to the shared shell clipboard on Cut/Copy so
+    /// the paste crosses surfaces (that write lives in the view — it needs the
+    /// egui `Context`).
+    clipboard: Option<ClipEntry>,
     /// FILEMGR-9 — the latest worker-published mount view per peer (`host` →
     /// [`MountView`]), refreshed on the [`MOUNT_POLL`] cadence.
     mounts: HashMap<String, MountView>,
@@ -827,6 +875,8 @@ impl FileBrowser {
             chown_permitted: false,
             properties: None,
             confirm_delete: None,
+            chat: Box::new(BusChatBridge::from_env()),
+            clipboard: None,
             mesh: Box::new(BusMeshMount::from_env()),
             mounts: HashMap::new(),
             last_mount_poll: None,
@@ -855,6 +905,15 @@ impl FileBrowser {
     pub fn with_mesh_mount(mut self, mesh: Box<dyn MeshMountClient>) -> Self {
         self.mesh = mesh;
         self.read_mounts();
+        self
+    }
+
+    /// Swap in an explicit [`ChatBridge`] (FILEMGR-12). Tests inject a recorder to
+    /// assert the "Send in Chat" offer; production keeps the [`BusChatBridge`]
+    /// from [`Self::with_file_ops`].
+    #[must_use]
+    pub fn with_chat_bridge(mut self, chat: Box<dyn ChatBridge>) -> Self {
+        self.chat = chat;
         self
     }
 
@@ -1353,6 +1412,15 @@ impl FileBrowser {
                 Some("Nothing to transfer — mesh/peer files need a mount (FILEMGR-9).".to_string());
             return None;
         }
+        Some(self.submit_transfer(sources, dest_dir, copy))
+    }
+
+    /// Queue a real Copy/Move of `sources` into `dest_dir` through the FILEMGR-2
+    /// op queue and return its op id. The one submit path shared by drag-and-drop
+    /// [`drop_transfer`](Self::drop_transfer) and clipboard
+    /// [`clip_paste`](Self::clip_paste) — the surface never re-implements a file
+    /// op (§6). Callers pre-check for an empty source list.
+    fn submit_transfer(&mut self, sources: Vec<PathBuf>, dest_dir: PathBuf, copy: bool) -> OpId {
         let count = sources.len();
         let dest = dest_dir.file_name().map_or_else(
             || dest_dir.display().to_string(),
@@ -1365,6 +1433,80 @@ impl FileBrowser {
             .ops
             .submit(kind, format!("{verb} {count} {noun} \u{2192} {dest}"));
         self.last_note = None;
+        id
+    }
+
+    // ── shared clipboard (FILEMGR-12 — cross-surface cut/copy/paste) ─────────
+
+    /// Stage `pane`'s selection for a **Copy**, returning the newline-joined path
+    /// text the view writes onto the shared shell clipboard (so another surface
+    /// can paste the paths). `None` — with an honest note — when nothing local is
+    /// selected (a peer/virtual row carries no path).
+    pub fn clip_copy(&mut self, pane: usize) -> Option<String> {
+        self.stage_clipboard(pane, false)
+    }
+
+    /// Stage `pane`'s selection for a **Cut** (a later in-app Paste of exactly
+    /// this set moves it). Like [`clip_copy`](Self::clip_copy), returns the path
+    /// text for the shared shell clipboard.
+    pub fn clip_cut(&mut self, pane: usize) -> Option<String> {
+        self.stage_clipboard(pane, true)
+    }
+
+    fn stage_clipboard(&mut self, pane: usize, cut: bool) -> Option<String> {
+        let paths = self.pane(pane).active_tab().selected_paths();
+        if paths.is_empty() {
+            self.last_note = Some(
+                "Nothing to copy — select a local file first (mesh files need a mount).".into(),
+            );
+            return None;
+        }
+        let text = join_clip_paths(&paths);
+        self.clipboard = Some(ClipEntry { paths, cut });
+        self.last_note = None;
+        Some(text)
+    }
+
+    /// Whether an in-app Paste can fire right now (drives the menu item's enabled
+    /// state) — `true` once a Cut/Copy has staged a set.
+    #[must_use]
+    pub fn can_paste(&self) -> bool {
+        self.clipboard.is_some()
+    }
+
+    /// Paste the staged in-app clipboard set into `pane`'s current directory: a
+    /// **Copy**, or a **Move** when it was Cut (then the set clears). Reuses the
+    /// FILEMGR-2 queue via [`submit_transfer`](Self::submit_transfer). `None` when
+    /// nothing is staged or the pane has no writable directory.
+    pub fn clip_paste(&mut self, pane: usize) -> Option<OpId> {
+        let entry = self.clipboard.clone()?;
+        let dest = self.pane(pane).active_tab().current_dir()?;
+        let id = self.submit_transfer(entry.paths, dest, !entry.cut);
+        if entry.cut {
+            self.clipboard = None;
+        }
+        Some(id)
+    }
+
+    /// Paste **from the shared shell clipboard text** (a Ctrl+V `Event::Paste`,
+    /// so a path copied in ANY surface pastes into Files). Parses the text into
+    /// existing absolute paths and queues a transfer into `pane`'s directory: a
+    /// Move when the pasted set is exactly what Files Cut (then clears it), else a
+    /// Copy. `None` when the text holds no real paths, or the pane has no dir.
+    pub fn clip_paste_text(&mut self, pane: usize, text: &str) -> Option<OpId> {
+        let paths = parse_clip_paths(text);
+        if paths.is_empty() {
+            return None;
+        }
+        let dest = self.pane(pane).active_tab().current_dir()?;
+        let is_cut_set = self
+            .clipboard
+            .as_ref()
+            .is_some_and(|c| c.cut && c.paths == paths);
+        let id = self.submit_transfer(paths, dest, !is_cut_set);
+        if is_cut_set {
+            self.clipboard = None;
+        }
         Some(id)
     }
 
@@ -1837,6 +1979,108 @@ impl FileBrowser {
     pub fn last_send(&self) -> &SendOutcome {
         &self.last_send
     }
+
+    // ── context-menu Send-To + Send-in-Chat (FILEMGR-12) ────────────────────
+
+    /// Right-click **Send to → `<peer>`**: send `pane`'s whole selection to
+    /// `peer_id` over the mesh. Reuses the shipped transfer path — a canonical
+    /// [`SendToRequest`] (the [`SendToEntry::ContextMenu`] entry from the locked
+    /// six-set) dispatched through [`Backend::send_to`](mde_files::backend::Backend::send_to),
+    /// the same FILEMGR-7 direct-transfer wire the toolbar Send-To uses. `None`
+    /// (with an honest note) when nothing local is selected.
+    pub fn send_to_peer(
+        &mut self,
+        pane: usize,
+        peer_id: &str,
+    ) -> Option<Result<OpId, BackendError>> {
+        let sources = self.pane(pane).active_tab().selected_paths();
+        if sources.is_empty() {
+            self.last_note = Some(
+                "Nothing to send — select a local file first (mesh files need a mount).".into(),
+            );
+            return None;
+        }
+        let file = describe_sources(&sources);
+        let req = SendToRequest::copy_ask(
+            sources,
+            Destination::Peer(peer_id.to_string()),
+            SendToEntry::ContextMenu,
+        );
+        let result = self.dispatch(req);
+        self.last_send = match &result {
+            Ok(op_id) => SendOutcome::Sent {
+                op_id: *op_id,
+                file,
+                peer: peer_id.to_string(),
+            },
+            Err(e) => SendOutcome::Failed(e.to_string()),
+        };
+        Some(result)
+    }
+
+    /// Right-click **Send in Chat → `<peer>`**: move the bytes AND drop a file
+    /// card into the peer's NOTIFY-CHAT conversation. Two reuses, no new
+    /// mechanism: (1) the real transfer runs through the same
+    /// [`send_to_peer`](Self::send_to_peer) mesh path; (2) each file is offered to
+    /// the conversation via the [`ChatBridge`] as the `mde-chat`
+    /// [`MessageKind::File`](mde_chat::MessageKind::File) on `action/chat/send`
+    /// (the worker folds it into a File card) — the offer keyed by the peer's
+    /// **host** (the chat contact username). `None` when nothing local is selected.
+    pub fn send_in_chat(
+        &mut self,
+        pane: usize,
+        peer_id: &str,
+    ) -> Option<Result<OpId, BackendError>> {
+        let sources = self.pane(pane).active_tab().selected_paths();
+        if sources.is_empty() {
+            self.last_note = Some(
+                "Nothing to send — select a local file first (mesh files need a mount).".into(),
+            );
+            return None;
+        }
+        // The chat contact is the peer's hostname (username = hostname, lock 2/21).
+        let host = self
+            .peers
+            .iter()
+            .find(|p| p.id == peer_id)
+            .map(|p| p.host.clone());
+        let file = describe_sources(&sources);
+        // 1) the real transfer (reuse FILEMGR-7 Send-To over the mesh).
+        let req = SendToRequest::copy_ask(
+            sources.clone(),
+            Destination::Peer(peer_id.to_string()),
+            SendToEntry::ContextMenu,
+        );
+        let result = self.dispatch(req);
+        // 2) hand each file to the conversation as the reused chat file-kind, but
+        //    only once the transfer was actually accepted (no card for a no-op).
+        if let (true, Some(host)) = (result.is_ok(), host.as_deref().filter(|h| !h.is_empty())) {
+            for src in &sources {
+                self.chat.offer_file(host, src);
+            }
+        }
+        self.last_send = match &result {
+            Ok(op_id) => SendOutcome::Sent {
+                op_id: *op_id,
+                file: format!("{file} (in chat)"),
+                peer: host.unwrap_or_else(|| peer_id.to_string()),
+            },
+            Err(e) => SendOutcome::Failed(e.to_string()),
+        };
+        Some(result)
+    }
+}
+
+/// A short label for a Send-To/Send-in-Chat status line: the single file's name,
+/// or "N items" for a multi-selection.
+fn describe_sources(sources: &[PathBuf]) -> String {
+    match sources {
+        [one] => one.file_name().map_or_else(
+            || one.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        ),
+        many => format!("{} items", many.len()),
+    }
 }
 
 #[cfg(test)]
@@ -2277,6 +2521,192 @@ mod tests {
         let reachable = b.reachable_destinations();
         assert_eq!(reachable.len(), 3);
         assert!(!reachable.iter().any(|p| p.id == "cedar"));
+    }
+
+    // ── mesh integration: Send-To + Send-in-Chat + clipboard (FILEMGR-12) ────
+
+    /// A `ChatBridge` recorder: captures every "Send in Chat" offer so the test
+    /// proves the transfer AND the chat hand-off both fired, keyed by the peer host.
+    struct RecordingChat {
+        log: std::sync::Arc<std::sync::Mutex<Vec<(String, PathBuf)>>>,
+    }
+
+    impl crate::chat_bridge::ChatBridge for RecordingChat {
+        fn offer_file(&self, to: &str, path: &Path) {
+            self.log
+                .lock()
+                .unwrap()
+                .push((to.to_string(), path.to_path_buf()));
+        }
+    }
+
+    #[test]
+    fn context_menu_send_to_peer_dispatches_the_selection() {
+        let rows =
+            vec![FileRow::local("notes.md", Mime::Doc, "1 KB", "now").with_path("/tmp/notes.md")];
+        let mut b = browser_over(FixtureBackend::new(
+            vec![
+                peer("pine", PeerStatus::Online),
+                peer("cedar", PeerStatus::Offline),
+            ],
+            rows,
+        ));
+        b.click(0, 0);
+        let result = b.send_to_peer(0, "pine").expect("a selected file sends");
+        assert!(result.is_ok());
+        assert!(matches!(b.last_send(), SendOutcome::Sent { peer, .. } if peer == "pine"));
+    }
+
+    #[test]
+    fn context_menu_send_to_peer_is_an_honest_no_op_with_no_selection() {
+        let mut b = browser_over(FixtureBackend::new(
+            vec![peer("pine", PeerStatus::Online)],
+            Vec::new(),
+        ));
+        assert!(b.send_to_peer(0, "pine").is_none());
+        assert!(b.last_note().is_some(), "an honest note explains why");
+    }
+
+    #[test]
+    fn send_in_chat_transfers_and_offers_the_file_kind_keyed_by_host() {
+        let rows =
+            vec![FileRow::local("notes.md", Mime::Doc, "1 KB", "now").with_path("/tmp/notes.md")];
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut b = browser_over(FixtureBackend::new(
+            vec![peer("pine", PeerStatus::Online)],
+            rows,
+        ))
+        .with_chat_bridge(Box::new(RecordingChat { log: log.clone() }));
+        b.click(0, 0);
+        let result = b
+            .send_in_chat(0, "pine")
+            .expect("a selected file sends in chat");
+        assert!(result.is_ok(), "the real transfer fired");
+        // The chat offer was handed off, keyed by the peer HOST (the contact
+        // username = hostname), carrying the exact file path.
+        let recorded = log.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "pine.mesh");
+        assert_eq!(recorded[0].1, PathBuf::from("/tmp/notes.md"));
+        assert!(matches!(b.last_send(), SendOutcome::Sent { peer, .. } if peer == "pine.mesh"));
+    }
+
+    #[test]
+    fn send_in_chat_posts_no_offer_when_nothing_is_selected() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut b = browser_over(FixtureBackend::new(
+            vec![peer("pine", PeerStatus::Online)],
+            Vec::new(),
+        ))
+        .with_chat_bridge(Box::new(RecordingChat { log: log.clone() }));
+        assert!(b.send_in_chat(0, "pine").is_none());
+        assert!(log.lock().unwrap().is_empty(), "no transfer ⇒ no chat card");
+    }
+
+    #[test]
+    fn clip_copy_stages_the_paths_and_yields_shell_clipboard_text() {
+        let rows = vec![
+            FileRow::local("a.txt", Mime::Doc, "1 KB", "now").with_path("/src/a.txt"),
+            FileRow::local("b.txt", Mime::Doc, "1 KB", "now").with_path("/src/b.txt"),
+        ];
+        let mut b = browser_over(FixtureBackend::new(Vec::new(), rows));
+        assert!(!b.can_paste());
+        b.select_all(0);
+        let text = b.clip_copy(0).expect("a selection stages");
+        assert_eq!(text, "/src/a.txt\n/src/b.txt", "one absolute path per line");
+        assert!(b.can_paste());
+    }
+
+    #[test]
+    fn clip_copy_then_paste_queues_a_copy_and_keeps_the_clipboard() {
+        let fs = FakeFileOps::new();
+        fs.create_dir(Path::new("/src")).expect("mkdir");
+        fs.create_dir(Path::new("/dst")).expect("mkdir");
+        fs.seed_file("/src/a.txt", b"x").expect("seed");
+        let rows = vec![FileRow::local("a.txt", Mime::Doc, "1 KB", "now").with_path("/src/a.txt")];
+        let mut b = FileBrowser::with_file_ops(Box::new(FixtureBackend::new(Vec::new(), rows)), fs);
+        b.click(0, 0);
+        b.clip_copy(0).expect("staged");
+        b.navigate(0, Location::Local("/dst".into()));
+        let id = b.clip_paste(0).expect("an in-app paste submits a transfer");
+        assert!(b.ops().active().iter().any(|o| o.op_id == id));
+        assert!(
+            b.can_paste(),
+            "a Copy leaves the clipboard for repeat pastes"
+        );
+    }
+
+    #[test]
+    fn clip_cut_then_paste_queues_a_move_and_clears_the_clipboard() {
+        let fs = FakeFileOps::new();
+        fs.create_dir(Path::new("/src")).expect("mkdir");
+        fs.create_dir(Path::new("/dst")).expect("mkdir");
+        fs.seed_file("/src/a.txt", b"x").expect("seed");
+        let rows = vec![FileRow::local("a.txt", Mime::Doc, "1 KB", "now").with_path("/src/a.txt")];
+        let mut b = FileBrowser::with_file_ops(Box::new(FixtureBackend::new(Vec::new(), rows)), fs);
+        b.click(0, 0);
+        b.clip_cut(0).expect("staged");
+        b.navigate(0, Location::Local("/dst".into()));
+        let id = b.clip_paste(0).expect("a cut paste submits a transfer");
+        assert!(b.ops().active().iter().any(|o| o.op_id == id));
+        assert!(!b.can_paste(), "a Cut is consumed by its paste");
+    }
+
+    #[test]
+    fn clip_copy_of_a_pathless_selection_is_an_honest_no_op() {
+        let mut b = browser_over(roster_backend());
+        b.navigate(0, Location::Peer("pine".into()));
+        b.click(0, 0); // a virtual peer row (no path)
+        assert!(b.clip_copy(0).is_none());
+        assert!(b.last_note().is_some());
+        assert!(!b.can_paste());
+    }
+
+    #[test]
+    fn clip_paste_text_pastes_shell_clipboard_paths_cross_surface() {
+        // A real temp file so the cross-surface parse (which keeps only existing
+        // absolute paths) accepts it — the path could have been copied in ANY
+        // surface, so there's no in-app clipboard entry backing it.
+        let dir = std::env::temp_dir().join(format!("mde-fm12-x-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let src = dir.join("shared.txt");
+        std::fs::write(&src, b"hi").expect("write");
+        let mut b = FileBrowser::with_file_ops(
+            Box::new(FixtureBackend::new(Vec::new(), Vec::new())),
+            FakeFileOps::new(),
+        );
+        b.navigate(0, Location::Local("/dst".into()));
+        // Text with a real path + a bogus line: only the real path transfers.
+        let pasted = format!("{}\nnot a path — just prose", src.display());
+        let id = b
+            .clip_paste_text(0, &pasted)
+            .expect("a shell-clipboard paste of a real path submits a transfer");
+        assert!(b.ops().active().iter().any(|o| o.op_id == id));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clip_paste_text_of_no_real_paths_is_a_no_op() {
+        let mut b = browser_over(FixtureBackend::new(Vec::new(), Vec::new()));
+        b.navigate(0, Location::Local("/dst".into()));
+        // A URL from another surface is not a file path — nothing transfers.
+        assert!(b.clip_paste_text(0, "https://example.com/x").is_none());
+    }
+
+    #[test]
+    fn parse_clip_paths_keeps_only_existing_absolute_paths() {
+        let dir = std::env::temp_dir().join(format!("mde-fm12-p-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let f = dir.join("real.txt");
+        std::fs::write(&f, b"x").expect("write");
+        let text = format!(
+            "{}\n/definitely/not/here/ghost.txt\nrelative.txt\n   \n",
+            f.display()
+        );
+        let got = parse_clip_paths(&text);
+        assert_eq!(got, vec![f.clone()], "only the real absolute path survives");
+        assert_eq!(join_clip_paths(&got), f.display().to_string());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

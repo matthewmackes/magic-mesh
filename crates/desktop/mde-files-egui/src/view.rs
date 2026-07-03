@@ -163,6 +163,19 @@ enum Action {
     /// FILEMGR-11 — close the Properties dialog.
     PropClose,
     Send,
+    /// FILEMGR-12 — right-click Send-To: send the selection to this peer.
+    SendToPeer(usize, String),
+    /// FILEMGR-12 — right-click Send-in-Chat: transfer + drop a chat file card.
+    SendInChat(usize, String),
+    /// FILEMGR-12 — copy the selection's paths to the shared shell clipboard.
+    ClipCopy(usize),
+    /// FILEMGR-12 — cut the selection's paths (a matching in-app paste moves).
+    ClipCut(usize),
+    /// FILEMGR-12 — paste the in-app clipboard set into the pane's directory.
+    ClipPaste(usize),
+    /// FILEMGR-12 — paste from the shared shell clipboard text (Ctrl+V), so a
+    /// path copied in another surface pastes into Files.
+    ClipPasteText(usize, String),
     PauseOp(u64),
     ResumeOp(u64),
     CancelOp(u64),
@@ -195,6 +208,10 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     }
 
     let mut actions: Vec<Action> = Vec::new();
+    // FILEMGR-12 — Ctrl+C / Ctrl+X / Ctrl+V over the active pane, sharing the shell
+    // clipboard. Kept off the text-edit path (path-edit / rename) so a paste there
+    // lands in the field, never as a file transfer.
+    clipboard_keys(ui, browser, &mut actions);
     top_bar(ui, browser, &mut actions);
     egui::TopBottomPanel::bottom("files-bottom").show_inside(ui, |ui| {
         op_strip(ui, browser, &mut actions);
@@ -222,8 +239,39 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     // (a worker parked on a collision is the most urgent, so it wins).
     operation_dialogs(ui, browser, &mut actions);
 
+    let ctx = ui.ctx().clone();
     for action in actions {
-        apply(browser, action);
+        apply(&ctx, browser, action);
+    }
+}
+
+/// FILEMGR-12 — the clipboard keyboard verbs over the active pane, sharing the
+/// one shell clipboard: Ctrl+C copies + Ctrl+X cuts the selection's paths onto
+/// it; a Ctrl+V arrives as an [`egui::Event::Paste`] carrying the shell
+/// clipboard's text, so a path copied in ANY surface pastes here. Copy/Cut are
+/// suppressed while a text field owns focus (the path-edit / rename box) so the
+/// keystroke edits text as expected; a paste there is the field's, not ours.
+fn clipboard_keys(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    let active = b.active_pane_index();
+    let editing = ui.memory(egui::Memory::focused).is_some();
+    let (copy, cut, pasted) = ui.input(|i| {
+        let copy = i.modifiers.command && i.key_pressed(egui::Key::C);
+        let cut = i.modifiers.command && i.key_pressed(egui::Key::X);
+        let pasted = i.events.iter().find_map(|e| match e {
+            egui::Event::Paste(text) => Some(text.clone()),
+            _ => None,
+        });
+        (copy, cut, pasted)
+    });
+    if !editing && copy {
+        actions.push(Action::ClipCopy(active));
+    }
+    if !editing && cut {
+        actions.push(Action::ClipCut(active));
+    }
+    // A paste with no field focused pastes the shell-clipboard paths into Files.
+    if let Some(text) = pasted.filter(|_| !editing) {
+        actions.push(Action::ClipPasteText(active, text));
     }
 }
 
@@ -240,8 +288,9 @@ fn operation_dialogs(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) 
     }
 }
 
-/// Apply a captured intent to the model.
-fn apply(browser: &mut FileBrowser, action: Action) {
+/// Apply a captured intent to the model. `ctx` is threaded through so the
+/// clipboard writes (Cut/Copy) can put the paths on the shared shell clipboard.
+fn apply(ctx: &egui::Context, browser: &mut FileBrowser, action: Action) {
     match action {
         Action::Focus(p) => browser.set_active_pane(p),
         Action::Navigate(p, loc) => {
@@ -318,6 +367,30 @@ fn apply(browser: &mut FileBrowser, action: Action) {
         Action::PropClose => browser.close_properties(),
         Action::Send => {
             browser.send();
+        }
+        Action::SendToPeer(p, peer) => {
+            browser.send_to_peer(p, &peer);
+        }
+        Action::SendInChat(p, peer) => {
+            browser.send_in_chat(p, &peer);
+        }
+        // Cut/Copy stage the set in the model AND mirror the paths onto the shared
+        // shell clipboard (via `ctx`), so a path copied here pastes in any surface.
+        Action::ClipCopy(p) => {
+            if let Some(text) = browser.clip_copy(p) {
+                ctx.copy_text(text);
+            }
+        }
+        Action::ClipCut(p) => {
+            if let Some(text) = browser.clip_cut(p) {
+                ctx.copy_text(text);
+            }
+        }
+        Action::ClipPaste(p) => {
+            browser.clip_paste(p);
+        }
+        Action::ClipPasteText(p, text) => {
+            browser.clip_paste_text(p, &text);
         }
         Action::PauseOp(id) => browser.pause_op(id),
         Action::ResumeOp(id) => browser.resume_op(id),
@@ -775,7 +848,9 @@ fn listing(ui: &mut egui::Ui, b: &FileBrowser, pane_ix: usize, actions: &mut Vec
                 match view {
                     ViewMode::List => list_view(ui, b, pane_ix, &entries, &mut rects, actions),
                     ViewMode::Grid => grid_view(ui, b, pane_ix, &entries, &mut rects, actions),
-                    ViewMode::Details => details_view(ui, pane_ix, &entries, &mut rects, actions),
+                    ViewMode::Details => {
+                        details_view(ui, b, pane_ix, &entries, &mut rects, actions);
+                    }
                 }
             }
         });
@@ -834,7 +909,7 @@ fn list_view(
             FontId::monospace(Style::BODY),
             name_color(e),
         );
-        entry_interactions(ui, pane_ix, e, &resp, actions);
+        entry_interactions(ui, b, pane_ix, e, &resp, actions);
     }
 }
 
@@ -883,13 +958,14 @@ fn grid_view(
                 FontId::monospace(Style::SMALL),
                 name_color(e),
             );
-            entry_interactions(ui, pane_ix, e, &resp, actions);
+            entry_interactions(ui, b, pane_ix, e, &resp, actions);
         }
     });
 }
 
 fn details_view(
     ui: &mut egui::Ui,
+    b: &FileBrowser,
     pane_ix: usize,
     entries: &[EntryView],
     rects: &mut Vec<(usize, Rect)>,
@@ -933,7 +1009,7 @@ fn details_view(
             FontId::monospace(Style::SMALL),
             Style::TEXT_DIM,
         );
-        entry_interactions(ui, pane_ix, e, &resp, actions);
+        entry_interactions(ui, b, pane_ix, e, &resp, actions);
     }
 }
 
@@ -1014,6 +1090,7 @@ fn details_header(ui: &mut egui::Ui, pane_ix: usize, sort: SortSpec, actions: &m
 /// Selection + open + drag-source + drop-onto-folder for one entry response.
 fn entry_interactions(
     ui: &egui::Ui,
+    b: &FileBrowser,
     pane_ix: usize,
     e: &EntryView,
     resp: &egui::Response,
@@ -1048,6 +1125,34 @@ fn entry_interactions(
         }
     }
     resp.context_menu(|ui| {
+        // FILEMGR-12 — Send-To a peer (reuse the mesh transfer) + Send-in-Chat
+        // (reuse the mesh transfer + the NOTIFY-CHAT file message-kind). Both are
+        // roster-driven submenus; offline peers are honestly greyed (no probe, no
+        // hang — the cached roster is read).
+        ui.menu_button("Send to", |ui| {
+            peer_send_submenu(ui, b, pane_ix, false, actions);
+        });
+        ui.menu_button("Send in Chat", |ui| {
+            peer_send_submenu(ui, b, pane_ix, true, actions);
+        });
+        ui.separator();
+        // FILEMGR-12 — cut/copy/paste over the shared shell clipboard.
+        if ui.button("Cut").clicked() {
+            actions.push(Action::ClipCut(pane_ix));
+            ui.close_menu();
+        }
+        if ui.button("Copy").clicked() {
+            actions.push(Action::ClipCopy(pane_ix));
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(b.can_paste(), egui::Button::new("Paste"))
+            .clicked()
+        {
+            actions.push(Action::ClipPaste(pane_ix));
+            ui.close_menu();
+        }
+        ui.separator();
         if ui.button("Properties").clicked() {
             actions.push(Action::OpenProperties(pane_ix));
             ui.close_menu();
@@ -1081,6 +1186,43 @@ fn entry_interactions(
                     copy: mods.command,
                 });
             }
+        }
+    }
+}
+
+/// FILEMGR-12 — the roster submenu behind "Send to" / "Send in Chat": one row per
+/// mesh peer. A reachable peer is a live button routing to the peer; an offline
+/// peer is honestly greyed + inert (no probe, so the menu never hangs). `in_chat`
+/// picks the chat hand-off (transfer + a NOTIFY-CHAT file card) over the plain
+/// mesh transfer. Reads the cached roster only — never a blocking peer call.
+fn peer_send_submenu(
+    ui: &mut egui::Ui,
+    b: &FileBrowser,
+    pane_ix: usize,
+    in_chat: bool,
+    actions: &mut Vec<Action>,
+) {
+    if b.peers().is_empty() {
+        muted_note(ui, "No peers connected.");
+        return;
+    }
+    for peer in b.peers() {
+        if peer.status.is_reachable() {
+            if ui.button(peer.host.as_str()).clicked() {
+                actions.push(if in_chat {
+                    Action::SendInChat(pane_ix, peer.id.clone())
+                } else {
+                    Action::SendToPeer(pane_ix, peer.id.clone())
+                });
+                ui.close_menu();
+            }
+        } else {
+            ui.add_enabled(
+                false,
+                egui::Button::new(RichText::new(peer.host.as_str()).color(Style::TEXT_DIM))
+                    .frame(false),
+            )
+            .on_hover_text("Peer is offline \u{2014} can't receive a file");
         }
     }
 }

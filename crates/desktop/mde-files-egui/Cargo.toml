@@ -48,6 +48,12 @@ mde-bus = { path = "../../platform/mde-bus" }
 # mirrors the storage worker's payloads.
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+# FILEMGR-12 — "Send in Chat" hands a file to a NOTIFY-CHAT conversation as the
+# REUSED `mde-chat` file message-kind (`MessageKind::File`), published on the
+# existing `action/chat/send` verb the mackesd `chat` worker drains — the same
+# wire `mde-shell-egui::chat::send_file` uses. A pure model type (services tier,
+# an inward edge under §6); no new message shape is invented.
+mde-chat = { path = "../../services/mde-chat" }
 # FILEMGR-10 — thumbnail + preview decode on the worker thread (never the paint
 # path). `image` 0.25 is already in the workspace lock (mde-files' freedesktop
 # thumbnails pull the same decoders), so this add is fetch-free on the airgapped
