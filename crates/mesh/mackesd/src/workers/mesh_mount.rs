@@ -668,8 +668,9 @@ impl KeyProvider for SecretStoreKeyProvider {
 }
 
 /// `true` when `bin` resolves on `$PATH` (via `which`), used by the live backend
-/// gate. Cheap + bounded.
-fn binary_on_path(bin: &str) -> bool {
+/// gate. Cheap + bounded. Shared with the CHOOSER-1 `desktop_sources` worker's
+/// virsh gate.
+pub(crate) fn binary_on_path(bin: &str) -> bool {
     Command::new("which")
         .arg(bin)
         .output()

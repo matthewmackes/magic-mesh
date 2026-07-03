@@ -7562,6 +7562,36 @@ fn run_serve(
                 .push("bookmarks".into());
         }
 
+        // CHOOSER-1 — the desktop-source discovery aggregator (design
+        // `desktop-chooser.md` §Architecture, locks 5/14): collects every
+        // desktop source — mesh-peer advertised (the replicated peers plane's
+        // RemoteAccess/vms rows), mDNS RDP/VNC/Spice on the local LAN (the
+        // mdns_relay machinery + its anti-loop TXT guard), local KVM guest
+        // consoles (the MV-3 LibvirtBackend seam), and manually-added
+        // endpoints — merges them into ONE deduped roster and publishes
+        // `state/desktops/sources` for the Chooser surface (CHOOSER-2).
+        // Drains typed `action/desktops/{add-source,remove-source,refresh}`
+        // verbs (§9). Live KVM enumeration is honestly gated (a typed Gated
+        // lane status when virsh is absent, §7 — never a faked source);
+        // reachability derives from roster presence / VM power state, never
+        // a blocking probe. A desktop feature (Workstation tier); idles
+        // gracefully on a headless box.
+        if mackesd_core::worker_role::runs("desktop_sources", role_rank) {
+            let store_root = mackesd_core::workers::desktop_sources::resolve_store_root();
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::desktop_sources::DesktopSourcesWorker::new(
+                    node_id.clone(),
+                    workgroup_root.clone(),
+                    store_root,
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("desktop_sources".into());
+        }
+
         // VOIP-GW-3 — the leader-gated voice_provision worker. Spawned on every
         // node so failover is seamless, but LEADER-gated internally (lock 7):
         // only the elected node provisions per-node Vitelity sub-accounts, seals

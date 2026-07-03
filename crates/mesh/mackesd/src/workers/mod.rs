@@ -615,6 +615,18 @@ pub mod session_roaming;
 // (typed `ClipboardAccessError::IntegrationGated`, §7); the pure model + relay
 // pipeline ship green behind the seam.
 pub mod clipboard_bridge;
+// CHOOSER-1 — the desktop_sources worker: the mesh-side (§6) desktop-source
+// discovery aggregator behind the Chooser surface (docs/design/desktop-
+// chooser.md). Folds four lanes into one deduped roster published to
+// `state/desktops/sources`: mesh-registry peer-advertised desktops (the
+// peers-plane RemoteAccess/vms rows — no second advertisement channel),
+// mDNS RDP/VNC/Spice on the local LAN (the mdns_relay machinery + its
+// anti-loop TXT guard), local KVM guest consoles (the MV-3 LibvirtBackend
+// seam, honestly Gated when virsh is absent — §7), and manual sources via
+// typed `action/desktops/{add-source,remove-source,refresh}` verbs (§9).
+// Reachability derives from roster presence / VM power state — never a
+// blocking probe (design lock 14).
+pub mod desktop_sources;
 // OW-11 (Bus half) — the service_onboard worker: `onboard service-add` reachable
 // over the Bus for the shell's Services flow. Drains `action/onboard/service-add`
 // (a typed ServiceAddAction: ServiceKind + optional SIP params + dry_run), runs

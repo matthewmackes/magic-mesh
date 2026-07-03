@@ -87,8 +87,10 @@ pub struct MdnsAnnounce {
 }
 
 /// The mdns-sd browse string for a bare type (`_jellyfin._tcp` →
-/// `_jellyfin._tcp.local.`).
-fn browse_type(bare: &str) -> String {
+/// `_jellyfin._tcp.local.`). Shared with the CHOOSER-1 `desktop_sources`
+/// worker, which browses the desktop protocol types through the same
+/// machinery.
+pub(crate) fn browse_type(bare: &str) -> String {
     format!("{bare}.local.")
 }
 
@@ -121,8 +123,9 @@ fn bare_type(s: &str) -> String {
 }
 
 /// The instance name from a resolved service's fullname, stripping the
-/// `.<type>.local.` suffix.
-fn instance_name(info: &ServiceInfo, bare: &str) -> String {
+/// `.<type>.local.` suffix. Shared with the CHOOSER-1 `desktop_sources`
+/// worker.
+pub(crate) fn instance_name(info: &ServiceInfo, bare: &str) -> String {
     let full = info.get_fullname();
     full.strip_suffix(&format!(".{}", browse_type(bare)))
         .unwrap_or(full)
