@@ -6,9 +6,10 @@
 //! lives in [`mde_egui::Style`]); this crate revives the name for the *brand*
 //! layer that sits alongside that look.
 //!
-//! Today it carries [`brand::build`] — the compile-time build identity stamped by
-//! `build.rs`. The icon/logo art ([`brand`] `::icons` / `::logo`, QBRAND-2/3)
-//! extends the same submodule so the mark, the version line and the build stamp
-//! all resolve through `mde_theme::brand`.
+//! Today it carries [`brand::build`] — the compile-time build identity stamped
+//! by `build.rs` — and [`brand::icons`] — the embedded Quasar glyph set with
+//! its tintable SVG→RGBA rasterizer (QBRAND-2). The logo lockup ([`brand`]
+//! `::logo`, QBRAND-3) extends the same submodule so the mark, the version
+//! line and the build stamp all resolve through `mde_theme::brand`.
 
 pub mod brand;

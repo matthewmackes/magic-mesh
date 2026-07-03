@@ -18,5 +18,16 @@ path = "src/lib.rs"
 # script is std-only (git via `std::process::Command`, date via a civil-calendar
 # routine) so it builds on the airgapped farm with no extra crates.
 
+[dependencies]
+# QBRAND-2 — SVG→raster for the brand icon set (`brand::icons`). `resvg` (which
+# re-exports its `usvg` parser + `tiny-skia` rasterizer) is pure Rust, so it
+# vendors cleanly on the airgapped farm. default-features OFF drops the
+# text/fontdb stack + raster-image decoding: the 19 Quasar glyphs are pure
+# `currentColor` line-art paths, and the wordmark's <text> logotype is
+# deliberately skipped until it is outlined (see the `brand::icons` docs).
+# Note: this keeps the crate toolkit-free — the loader returns plain RGBA8, no
+# egui dependency; the shell wraps the buffer into a texture.
+resvg = { version = "0.45", default-features = false }
+
 [lints]
 workspace = true
