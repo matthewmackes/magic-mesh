@@ -50,6 +50,7 @@ use mde_egui::{eframe, egui, run_client, Density, Motion, Style};
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
 
+use mde_editor_egui::{editor_panel, real_editor, EditorSurface};
 use mde_files_egui::{files_panel, FileBrowser};
 use mde_media_egui::{media_header, media_panel, media_pump, real_media, MediaSurface};
 use mde_music_egui::{music_header, music_panel, music_pump, MusicApp};
@@ -208,6 +209,13 @@ struct Shell {
     /// Terminator-class terminal is reachable as an in-shell surface — no demo data
     /// (§7). This is the RESCUE: before it, `mde-term-egui` was mounted nowhere.
     terminal: TerminalSurface,
+    /// The Editor surface (EDITOR-1) — the native Zed-style code editor
+    /// (`mde-editor-egui`), mounted exactly like Files/Terminal: the shell holds
+    /// its `EditorSurface` (built by `real_editor()`) and renders it per-frame with
+    /// `editor_panel`. EDITOR-1 is the mountable scaffold — the editor chrome + the
+    /// honest "No file open" empty state (§7); the rope buffer + text widget +
+    /// tree-sitter highlighting land in EDITOR-2 onward, filling this surface.
+    editor: EditorSurface,
     /// The Mesh Map surface (OW-10) — the live `mde-mesh-view` canvas, fed a
     /// `MeshState` folded from the same world-readable mesh-status snapshot the
     /// Workbench planes read. Polled while in view; opens the honest "waiting for
@@ -254,6 +262,7 @@ impl Shell {
             keyboard: keyboard::Keyboard::default(),
             web: web::WebState::default(),
             terminal: real_terminal(),
+            editor: real_editor(),
             mesh_view: mesh_view::MeshViewState::default(),
             self_test: mesh_view::SelfTestWatch::default(),
         }
@@ -470,6 +479,19 @@ impl Shell {
                 let terminal = &mut self.terminal;
                 ui.push_id("shell-terminal", |ui| {
                     terminal_panel(ui, terminal);
+                });
+            }
+            Surface::Editor => {
+                // The native Zed-style code editor (EDITOR-1). Mounted exactly
+                // like Files: the shell renders its `EditorSurface` through
+                // `editor_panel`, scoped under its own `push_id` so its egui ids
+                // can't collide in the shell's one `Context`. EDITOR-1 is the
+                // scaffold — the editor chrome + the honest "No file open" empty
+                // state (§7); the rope buffer + text widget land in EDITOR-2/3 and
+                // render here without re-wiring this mount.
+                let editor = &mut self.editor;
+                ui.push_id("shell-editor", |ui| {
+                    editor_panel(ui, editor);
                 });
             }
             Surface::Chat => {
@@ -814,8 +836,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dock, files_panel, media_header, media_panel, real_media, real_terminal, splash,
-        terminal_panel, Boot, Nav, Plane, Surface,
+        dock, editor_panel, files_panel, media_header, media_panel, real_editor, real_media,
+        real_terminal, splash, terminal_panel, Boot, Nav, Plane, Surface,
     };
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
@@ -983,6 +1005,39 @@ mod tests {
         assert!(
             !prims.is_empty(),
             "the mounted terminal surface produced no draw primitives"
+        );
+    }
+
+    /// The Editor surface (EDITOR-1) mounts through the same `body` path — the dock
+    /// rail plus `editor_panel` scoped under `push_id` — over a fresh
+    /// `EditorSurface` (`real_editor()`). EDITOR-1 is the scaffold, so the panel
+    /// paints the editor chrome + the honest "No file open" empty state (§7, a real
+    /// reachable state, not a `todo!()`). Tessellating it on the CPU proves the
+    /// code-editor surface is runtime-reachable as an in-shell surface and actually
+    /// draws — the editor analogue of [`shell_mounts_and_renders_the_terminal_surface`].
+    #[test]
+    fn shell_mounts_and_renders_the_editor_surface() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut editor = real_editor();
+        let mut active = Surface::Editor;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                egui::SidePanel::left("shell-dock")
+                    .resizable(false)
+                    .exact_width(Style::SP_XL * 4.0)
+                    .show_inside(ui, |ui| dock::rail(ui, &mut active));
+                ui.push_id("shell-editor", |ui| editor_panel(ui, &mut editor));
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the mounted editor surface produced no draw primitives"
         );
     }
 }

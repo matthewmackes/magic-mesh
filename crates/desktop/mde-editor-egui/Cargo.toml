@@ -1,0 +1,45 @@
+# MCNF "Quasar" — `mde-editor-egui`: the native code-editor surface (EDITOR epic;
+# design: `docs/design/editor.md`).
+#
+# A Zed-style, keyboard-driven Rust code editor adapted to the DRM-native egui
+# shell + mesh. This crate opens with EDITOR-1: the MOUNTABLE SHELL only — the
+# surface scaffold. It exposes an `EditorSurface` state struct + the
+# `editor_panel` seam that renders the editor chrome and an HONEST empty state
+# ("No file open …", §7 — a real reachable state, never a `todo!()` stub),
+# mounted in the one Quasar shell (`mde-shell-egui`) as `Surface::Editor` — the
+# exact seam `mde-files-egui` gives the shell (`files_panel` / `real_browser`).
+# The rope buffer (EDITOR-2), the custom text widget (EDITOR-3), tree-sitter
+# highlighting, tabs/splits, and the finder/palette land in the following units;
+# EDITOR-1 is the reachable, buildable dock surface those units fill.
+#
+# Tier (§6): desktop-shell. Its only in-workspace edge points inward to
+# `crates/shared/mde-egui` (the harness + the shared Carbon Style). The scaffold
+# pulls nothing else — the buffer/widget/highlighter deps land with the units
+# that add them.
+[package]
+name        = "mde-editor-egui"
+description = "MCNF Quasar — the native code-editor surface (Zed-style). EDITOR-1 lands the mountable shell: an EditorSurface state struct + the editor_panel seam that renders the editor chrome and an honest empty state (No file open — open a file to start editing, §7), mounted in the one Quasar shell as Surface::Editor exactly like mde-files-egui's files_panel/real_browser seam. The rope buffer (ropey, EDITOR-2), the custom egui text widget with multi-cursor (EDITOR-3), tree-sitter highlighting, tabs + splittable panes (reusing mde-term-egui's split machinery), and the fuzzy finder / command palette / project search land in the following units; this unit is the reachable, buildable dock surface they fill."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_editor_egui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mde-editor-egui"
+path = "src/main.rs"
+
+[dependencies]
+# The §4/§5 egui harness — `run_client` + the shared Carbon `Style` + the
+# re-exported `egui`/`eframe` (one toolkit resolution for every surface). The
+# EDITOR-1 scaffold renders all chrome + the empty state through `Style` tokens
+# (§4) and nothing else.
+mde-egui = { path = "../../shared/mde-egui" }
+
+[lints]
+workspace = true

@@ -64,6 +64,7 @@ members = [
     "crates/desktop/mde-panel-egui",
     "crates/desktop/mde-seat",
     "crates/desktop/mde-term-egui",
+    "crates/desktop/mde-editor-egui",
     "crates/shared/mde-disclaimer",
     "crates/shared/mde-egui",
     "crates/shared/mde-theme",

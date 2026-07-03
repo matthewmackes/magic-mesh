@@ -4068,6 +4068,13 @@ name = "mde-disclaimer"
 version = "12.0.0"
 
 [[package]]
+name = "mde-editor-egui"
+version = "12.0.0"
+dependencies = [
+ "mde-egui",
+]
+
+[[package]]
 name = "mde-egui"
 version = "12.0.0"
 dependencies = [
@@ -4288,6 +4295,7 @@ dependencies = [
  "mde-bus",
  "mde-chat",
  "mde-cosmic-applet",
+ "mde-editor-egui",
  "mde-egui",
  "mde-files-egui",
  "mde-kvm",

@@ -1,6 +1,6 @@
 //! `brand::icons` — the monochrome Quasar line-art icon set (QBRAND-2).
 //!
-//! The 19 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10) embedded as
+//! The 20 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10) embedded as
 //! inline SVG consts behind [`IconId`], plus the SVG→raster loader
 //! ([`icon_image`]) every surface draws them through. The glyphs are authored
 //! in `currentColor` (the text-lockup wordmark excepted — see below), so ONE
@@ -56,7 +56,7 @@ macro_rules! quasar_svg {
 
 /// Identifier for every glyph in the Quasar brand set.
 ///
-/// The product marks, the 13 dock/surface glyphs and the 3 node-role badges —
+/// The product marks, the 14 dock/surface glyphs and the 3 node-role badges —
 /// one variant per SVG in `assets/brand/quasar/`; [`IconId::svg`] resolves the
 /// embedded source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -89,6 +89,8 @@ pub enum IconId {
     Browser,
     /// The Terminal surface glyph.
     Terminal,
+    /// The Editor (code editor) surface glyph.
+    Editor,
     /// The Chat surface glyph.
     Chat,
     /// The System surface glyph.
@@ -107,7 +109,7 @@ pub enum IconId {
 
 impl IconId {
     /// Every glyph in the set, for exhaustive iteration (dock catalogs, tests).
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::Mark,
         Self::Wordmark,
         Self::Node,
@@ -120,6 +122,7 @@ impl IconId {
         Self::Voice,
         Self::Browser,
         Self::Terminal,
+        Self::Editor,
         Self::Chat,
         Self::System,
         Self::Storage,
@@ -147,6 +150,7 @@ impl IconId {
             Self::Voice => quasar_svg!("surface-voice.svg"),
             Self::Browser => quasar_svg!("surface-browser.svg"),
             Self::Terminal => quasar_svg!("surface-terminal.svg"),
+            Self::Editor => quasar_svg!("surface-editor.svg"),
             Self::Chat => quasar_svg!("surface-chat.svg"),
             Self::System => quasar_svg!("surface-system.svg"),
             Self::Storage => quasar_svg!("surface-storage.svg"),
@@ -175,6 +179,7 @@ impl IconId {
             Self::Voice => "surface-voice",
             Self::Browser => "surface-browser",
             Self::Terminal => "surface-terminal",
+            Self::Editor => "surface-editor",
             Self::Chat => "surface-chat",
             Self::System => "surface-system",
             Self::Storage => "surface-storage",
@@ -441,8 +446,8 @@ mod tests {
 
     #[test]
     fn ids_names_and_sources_are_distinct_and_exhaustive() {
-        // Guards a copy-paste slip in the two match tables: 19 ids, 19 unique
-        // names, 19 unique embedded sources, all valid-looking SVG.
+        // Guards a copy-paste slip in the two match tables: 20 ids, 20 unique
+        // names, 20 unique embedded sources, all valid-looking SVG.
         let mut names: Vec<&str> = IconId::ALL.iter().map(|id| id.name()).collect();
         names.sort_unstable();
         names.dedup();

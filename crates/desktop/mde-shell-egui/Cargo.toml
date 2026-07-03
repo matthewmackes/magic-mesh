@@ -104,6 +104,13 @@ mde-media-egui = { path = "../mde-media-egui" }
 # `mde-term-egui` was mounted nowhere. Desktop-shell tier; the edge points
 # sideways-inward, sharing the one `mde-egui` toolkit resolution (§6).
 mde-term-egui = { path = "../mde-term-egui" }
+# EDITOR-1 — the Surface::Editor surface, mounted exactly like Files/Terminal: the
+# shell holds its `EditorSurface` (built by `real_editor()`) and renders it per-
+# frame with `editor_panel`. EDITOR-1 is the mountable scaffold (the honest §7
+# empty state until the rope buffer + text widget land in EDITOR-2/3); this dep
+# makes the code-editor surface reachable from the dock. Desktop-shell tier; the
+# edge points sideways-inward, sharing the one `mde-egui` toolkit resolution (§6).
+mde-editor-egui = { path = "../mde-editor-egui" }
 
 # E12-5a — the VDI Desktop surface. These two decoder crates turn a remote RDP /
 # VNC framebuffer into an egui `ColorImage` the shell uploads to a `TextureHandle`

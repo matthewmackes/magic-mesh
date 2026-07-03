@@ -58,6 +58,11 @@ pub(crate) enum Surface {
     /// terminal (tabs / splits / broadcast / a shell on any mesh peer, TERM-4/5/8)
     /// over a real local PTY, mounted as an in-shell panel (TERM-16).
     Terminal,
+    /// The embedded Editor surface (`mde-editor-egui`) — the native Zed-style code
+    /// editor (EDITOR epic). EDITOR-1 mounts the scaffold: the editor chrome + the
+    /// honest "No file open" empty state (§7); the rope buffer + text widget +
+    /// tree-sitter highlighting + tabs/splits land in EDITOR-2 onward.
+    Editor,
     /// The Chat surface — the ONE unified notification interface (NOTIFY-CHAT):
     /// every mesh host is a contact, and its alerts + clipboard copies are its
     /// messages, over the `state/chat/roster` + `state/chat/conversation/<key>`
@@ -93,7 +98,7 @@ impl Surface {
     /// Desktop, then the three app surfaces, then the unified Chat surface (the ONE
     /// notification interface), then this seat's host-controls System + Storage
     /// surfaces, and finally the About surface (the platform-identity screen).
-    pub(crate) const ALL: [Surface; 14] = [
+    pub(crate) const ALL: [Surface; 15] = [
         Surface::Workbench,
         Surface::MeshView,
         Surface::Instances,
@@ -104,6 +109,7 @@ impl Surface {
         Surface::Voice,
         Surface::Browser,
         Surface::Terminal,
+        Surface::Editor,
         Surface::Chat,
         Surface::System,
         Surface::Storage,
@@ -123,6 +129,7 @@ impl Surface {
             Surface::Voice => "Voice",
             Surface::Browser => "Browser",
             Surface::Terminal => "Terminal",
+            Surface::Editor => "Editor",
             Surface::Chat => "Chat",
             Surface::System => "System",
             Surface::Storage => "Storage",
@@ -158,6 +165,9 @@ impl Surface {
             Surface::Terminal => {
                 "Open a shell — tabs, splits, broadcast input, and a shell on any mesh peer."
             }
+            Surface::Editor => {
+                "A native, keyboard-driven code editor — open a file to start editing."
+            }
             Surface::Chat => {
                 "Mesh chat (ICQ) — every host is a contact; its alerts + clipboard copies are its messages."
             }
@@ -190,6 +200,7 @@ impl Surface {
             Surface::Voice => IconId::Voice,
             Surface::Browser => IconId::Browser,
             Surface::Terminal => IconId::Terminal,
+            Surface::Editor => IconId::Editor,
             Surface::Chat => IconId::Chat,
             Surface::System => IconId::System,
             Surface::Storage => IconId::Storage,
@@ -351,15 +362,16 @@ mod tests {
 
     #[test]
     fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
-        // Fourteen entries: Workbench first, the live Mesh Map (OW-10, `mde-mesh-view`),
+        // Fifteen entries: Workbench first, the live Mesh Map (OW-10, `mde-mesh-view`),
         // two VM surfaces (Instances / Desktop), the app surfaces (Music / Media — the
         // full media player, MEDIA-18 / Files / Voice / Browser — the sandboxed Servo
         // browser, BOOKMARKS-6 / Terminal — the Terminator-class terminal over a real
-        // PTY, TERM-16), the unified Chat surface (the ONE notification interface — the
-        // standalone Notifications + Clipboard surfaces are retired, NOTIFY-CHAT-6), the
+        // PTY, TERM-16 / Editor — the native Zed-style code editor, EDITOR-1), the
+        // unified Chat surface (the ONE notification interface — the standalone
+        // Notifications + Clipboard surfaces are retired, NOTIFY-CHAT-6), the
         // host-controls System surface, the Storage surface (GParted-authentic disk
         // mgmt, E12-21), and the About surface (the platform-identity screen, QBRAND-6).
-        assert_eq!(Surface::ALL.len(), 14);
+        assert_eq!(Surface::ALL.len(), 15);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
             Surface::MeshView,
@@ -371,6 +383,7 @@ mod tests {
             Surface::Voice,
             Surface::Browser,
             Surface::Terminal,
+            Surface::Editor,
             Surface::Chat,
             Surface::System,
             Surface::Storage,
@@ -419,6 +432,7 @@ mod tests {
             (Surface::Voice, IconId::Voice),
             (Surface::Browser, IconId::Browser),
             (Surface::Terminal, IconId::Terminal),
+            (Surface::Editor, IconId::Editor),
             (Surface::Chat, IconId::Chat),
             (Surface::System, IconId::System),
             (Surface::Storage, IconId::Storage),
@@ -433,7 +447,7 @@ mod tests {
                 "{surface:?} maps to the blank wordmark"
             );
         }
-        // The map is injective — 13 surfaces, 13 distinct glyph names.
+        // The map is injective — 15 surfaces, 15 distinct glyph names.
         let mut names: Vec<&str> = Surface::ALL.iter().map(|s| s.icon_id().name()).collect();
         names.sort_unstable();
         names.dedup();
