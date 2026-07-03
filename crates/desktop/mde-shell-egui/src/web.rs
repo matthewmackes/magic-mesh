@@ -180,6 +180,11 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
         .map(|t| t.session.nav().clone())
         .unwrap_or_default();
     let has_tab = !state.tabs.is_empty();
+    // BOOKMARKS-7 — the per-page ad-filter blocked count the active session tracks.
+    let blocked = state
+        .tabs
+        .get(state.active)
+        .map_or(0, |t| t.session.blocked_count());
 
     ui.horizontal(|ui| {
         // Back / forward — enabled only when the live session offers the history.
@@ -210,6 +215,22 @@ fn nav_chrome(ui: &mut egui::Ui, state: &mut WebState) {
             } else if let Some(tab) = state.active_tab() {
                 tab.session.reload();
             }
+        }
+
+        // BOOKMARKS-7 — a compact "N blocked" shield when the ad-filter has dropped
+        // requests on this page (honest 0 stays hidden). Reads the session's
+        // per-page counter; the engine is compiled from the mackesd `adfilter` blob.
+        if blocked > 0 {
+            ui.add_space(Style::SP_XS);
+            ui.label(
+                RichText::new(format!("\u{2298} {blocked}"))
+                    .size(Style::BODY)
+                    .color(Style::TEXT_DIM),
+            )
+            .on_hover_text(format!(
+                "Ad-filter blocked {blocked} request{} on this page",
+                if blocked == 1 { "" } else { "s" }
+            ));
         }
 
         ui.add_space(Style::SP_XS);
@@ -418,6 +439,50 @@ mod tests {
         run_panel(&mut state); // polls all tabs
         assert!(state.tabs[0].session.is_crashed(), "tab 0 crashed");
         assert!(!state.tabs[1].session.is_crashed(), "tab 1 unaffected");
+    }
+
+    #[test]
+    fn the_ad_filter_blocked_count_surfaces_on_the_active_tab() {
+        use mde_web_preview_client::{
+            wire, EventMsg, FilterListStore, RequestFilter, ResourceType, WebSession,
+        };
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        // A bundled-filter session over a bare socketpair (no shm needed — we only
+        // drive the request-policy protocol to bump the per-page counter).
+        let (shell, helper) = UnixStream::pair().expect("socketpair");
+        let filter = RequestFilter::from_store(&FilterListStore::with_bundled());
+        let mut session = WebSession::from_stream(shell, None)
+            .expect("session")
+            .with_filter(filter);
+
+        let mut peer: &UnixStream = &helper;
+        let nav = EventMsg::NavState {
+            can_back: false,
+            can_forward: false,
+            loading: false,
+            url: "https://news.example.com/".to_owned(),
+        };
+        peer.write_all(&wire::frame(&nav.encode())).expect("nav");
+        let req = EventMsg::ResourceRequest {
+            id: 1,
+            url: "https://doubleclick.net/ad".to_owned(),
+            resource: mde_web_preview_client::resource_to_wire(ResourceType::Image),
+        };
+        peer.write_all(&wire::frame(&req.encode())).expect("req");
+        session.poll();
+        assert_eq!(
+            session.blocked_count(),
+            1,
+            "the tracker was blocked + counted"
+        );
+
+        let mut state = WebState::default();
+        state.push_session(session);
+        // The nav chrome (with the "N blocked" shield) renders without panicking.
+        assert!(run_panel(&mut state), "the browser chrome produced no draw");
+        assert_eq!(state.tabs[0].session.blocked_count(), 1);
     }
 
     #[test]

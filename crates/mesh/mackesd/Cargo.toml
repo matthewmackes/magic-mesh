@@ -99,6 +99,13 @@ mde-chat = { path = "../../services/mde-chat", optional = true }
 # state/bookmarks/*. Optional under async-services (the worker is
 # async-services-gated); `uuid` (v4) mints the per-item CRDT ids the ops carry.
 mde-bookmarks = { path = "../../services/mde-bookmarks", optional = true }
+# BOOKMARKS-7 — the adfilter worker drives the pure mde-adblock engine + store
+# (FilterListStore serde blob / Engine::from_store / Staleness / LWW merge). It
+# replicates each node's serialized store over Syncthing, leader-compiles the
+# converged engine blob, and drains action/adfilter/{allow,block} into the
+# mesh-synced allowlist. Optional under async-services (the worker is
+# async-services-gated), a services-tier (inward) dep like mde-bookmarks.
+mde-adblock = { path = "../../services/mde-adblock", optional = true }
 uuid = { version = "1", features = ["v4", "serde"], optional = true }
 # E1.2 — role-gated worker subsets: run_serve gates each worker spawn by the
 # pinned deployment role (mde_role::load → rank). Non-optional + zero-dep, so
@@ -321,6 +328,7 @@ async-services = [
     "dep:mde-bus",
     "dep:mde-chat",
     "dep:mde-bookmarks",
+    "dep:mde-adblock",
     "dep:uuid",
 ]
 

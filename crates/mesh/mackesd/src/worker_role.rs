@@ -95,6 +95,12 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // gracefully on a headless box (no action/bookmarks/* requests) while still
     // replaying peers' Syncthing segments into the shared collection.
     ("bookmarks", 1),
+    // BOOKMARKS-7 — the mesh-wide ad-blocker worker. A desktop feature (it feeds
+    // the mde-web-preview browser's block engine), so Workstation-tier; it idles
+    // gracefully on a headless box (no browser, no action/adfilter/* requests)
+    // while still replicating peers' filter-store blobs over Syncthing and, when
+    // leader, compiling the shared engine blob.
+    ("adfilter", 1),
     // FILEMGR-5 — the Files-surface sshfs mesh-mount worker. A desktop feature
     // (the seated user browses peers), so Workstation-tier; it idles gracefully
     // with no mount requests on a headless box.
@@ -345,7 +351,10 @@ mod tests {
         // the PRODUCER half; Workstation-tier: a seated-user desktop feature).
         // +1 pty_broker (TERM-7 — the mesh PTY-broker opening remote shells over
         // the overlay, Workstation-tier: a seated-user desktop feature).
-        assert_eq!(WORKER_TIERS.len(), 36);
+        // +1 adfilter (BOOKMARKS-7 — the mesh-wide ad-blocker worker replicating the
+        // filter-store blob + leader-compiling the engine, Workstation-tier: a
+        // seated-user desktop feature backing the mde-web-preview browser).
+        assert_eq!(WORKER_TIERS.len(), 37);
     }
 
     #[test]
@@ -373,8 +382,8 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            14,
-            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7)"
+            15,
+            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7)"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
@@ -436,11 +445,11 @@ mod tests {
     fn workers_for_rank_is_a_growing_superset() {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        // 22 lighthouse control-plane workers; Workstation adds the 14 fleet +
-        // desktop workers for the full 36 (the retired Server tier folded into
+        // 22 lighthouse control-plane workers; Workstation adds the 15 fleet +
+        // desktop workers for the full 37 (the retired Server tier folded into
         // Workstation in the 2-role model).
         assert_eq!(lh.len(), 22);
-        assert_eq!(ws.len(), 36);
+        assert_eq!(ws.len(), 37);
         // Strict superset: every lighthouse worker is also in the workstation set.
         assert!(lh.iter().all(|w| ws.contains(w)));
     }

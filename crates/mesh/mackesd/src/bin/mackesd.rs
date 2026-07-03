@@ -7592,6 +7592,35 @@ fn run_serve(
                 .push("bookmarks".into());
         }
 
+        // BOOKMARKS-7 — the mesh-wide ad-blocker worker (the Syncthing replication +
+        // leader compile behind the pure mde-adblock engine). Every node writes its
+        // own serialized filter-store blob into the encrypted Syncthing share
+        // (`workgroup_root`, the same /mnt/mesh-storage substrate bookmarks/ssh-gossip
+        // use) and LWW-merges every peer's into one converged store; the elected
+        // leader compiles that store into the shared engine blob the mde-web-preview
+        // browser reads + refreshes the enabled lists from an airgap-safe local mirror
+        // (honest Staleness fallback, never fabricated — §7). Drains
+        // action/adfilter/{allow,block} into the mesh-synced per-site allowlist
+        // (block-on-by-default) + publishes state/adfilter/<node>. Offline-first: the
+        // node-local store survives a down share, and nothing is written into a bare
+        // unprovisioned mount (`shared_root_writable`). A desktop feature (Workstation
+        // tier); idles gracefully on a headless box with no browser + no requests.
+        if mackesd_core::worker_role::runs("adfilter", role_rank) {
+            let local_root = mackesd_core::workers::adfilter::resolve_local_root();
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::adfilter::AdfilterWorker::new(
+                    node_id.clone(),
+                    local_root,
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::Always,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("adfilter".into());
+        }
+
         // CHOOSER-1 — the desktop-source discovery aggregator (design
         // `desktop-chooser.md` §Architecture, locks 5/14): collects every
         // desktop source — mesh-peer advertised (the replicated peers plane's

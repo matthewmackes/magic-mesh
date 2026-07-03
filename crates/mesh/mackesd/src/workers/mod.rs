@@ -161,6 +161,15 @@ pub mod app_sync;
 // fake — file I/O against the same /mnt/mesh-storage share the ssh-gossip /
 // chat workers use; the honest gate is the shared_root_writable offline state.
 pub mod bookmarks;
+// BOOKMARKS-7 — the mesh-wide ad-blocker worker: replicates each node's serialized
+// filter-list store over the encrypted Syncthing share (per-node single-writer
+// store.json, LWW-merged into one converged store), the leader compiles the
+// converged store into the shared engine blob + refreshes the enabled lists from an
+// airgap-safe local mirror (honest Staleness fallback, never fabricated), and drains
+// action/adfilter/{allow,block} into the mesh-synced per-site allowlist. Publishes
+// state/adfilter/<node>. No external transport to fake — file I/O against the same
+// /mnt/mesh-storage share the bookmarks / ssh-gossip / chat workers use.
+pub mod adfilter;
 pub mod heartbeat;
 // OV-7.a (v2.6) — Health reconciler. Reads each known peer's
 // QNM-Shared heartbeat.json on a 5 s tick, applies the

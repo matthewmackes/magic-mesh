@@ -389,6 +389,21 @@ pub enum ControlMsg {
     },
     /// Forward one input event (device pixels).
     Input(InputEvent),
+    /// The shell's verdict for a helper resource-policy query
+    /// ([`EventMsg::ResourceRequest`]) — BOOKMARKS-7 ad-filter. `allow = false`
+    /// means the ad-filter engine matched a block rule, so the helper must drop
+    /// the subresource **before** fetch.
+    ResourceVerdict {
+        /// Correlates with the [`EventMsg::ResourceRequest`] `id`.
+        id: u64,
+        /// `true` to fetch, `false` to drop (blocked before the network).
+        allow: bool,
+    },
+    /// Push the page's cosmetic user-stylesheet — the element-hide selectors the
+    /// helper injects into the rendered frame to hide leftover ad frames
+    /// (BOOKMARKS-7). JS-off safe: it is a plain `display:none` stylesheet, not a
+    /// script. Empty CSS clears any prior injection.
+    CosmeticFilters(String),
 }
 
 impl ControlMsg {
@@ -413,6 +428,15 @@ impl ControlMsg {
                 out.push(5);
                 ev.encode(&mut out);
             }
+            Self::ResourceVerdict { id, allow } => {
+                out.push(6);
+                put_u64(&mut out, *id);
+                out.push(u8::from(*allow));
+            }
+            Self::CosmeticFilters(css) => {
+                out.push(7);
+                put_str(&mut out, css);
+            }
         }
         out
     }
@@ -434,6 +458,11 @@ impl ControlMsg {
                 height: c.u32()?,
             },
             5 => Self::Input(InputEvent::decode(&mut c)?),
+            6 => Self::ResourceVerdict {
+                id: c.u64()?,
+                allow: c.bool()?,
+            },
+            7 => Self::CosmeticFilters(c.string()?),
             t => return Err(WireError::BadTag(t)),
         };
         Ok(msg)
@@ -473,6 +502,19 @@ pub enum EventMsg {
         /// Why it crashed.
         reason: String,
     },
+    /// The helper is about to issue a subresource fetch and asks the shell's
+    /// BOOKMARKS-7 ad-filter engine whether to proceed. The shell answers with a
+    /// [`ControlMsg::ResourceVerdict`] carrying the same `id`.
+    ResourceRequest {
+        /// A helper-minted id the [`ControlMsg::ResourceVerdict`] echoes.
+        id: u64,
+        /// The full request URL.
+        url: String,
+        /// The request's resource class (the ABP `$type`) as the compact wire
+        /// discriminant [`crate::filter::resource_from_wire`] maps back to
+        /// `mde_adblock::ResourceType`.
+        resource: u8,
+    },
 }
 
 impl EventMsg {
@@ -506,6 +548,12 @@ impl EventMsg {
                 out.push(4);
                 put_str(&mut out, reason);
             }
+            Self::ResourceRequest { id, url, resource } => {
+                out.push(5);
+                put_u64(&mut out, *id);
+                put_str(&mut out, url);
+                out.push(*resource);
+            }
         }
         out
     }
@@ -529,6 +577,11 @@ impl EventMsg {
             },
             4 => Self::Crashed {
                 reason: c.string()?,
+            },
+            5 => Self::ResourceRequest {
+                id: c.u64()?,
+                url: c.string()?,
+                resource: c.u8()?,
             },
             t => return Err(WireError::BadTag(t)),
         };
@@ -703,6 +756,16 @@ mod tests {
             modifiers: Modifiers(Modifiers::CTRL | Modifiers::SHIFT),
         }));
         round_control(&ControlMsg::Input(InputEvent::Text("héllo →".to_owned())));
+        // BOOKMARKS-7 ad-filter control messages.
+        round_control(&ControlMsg::ResourceVerdict {
+            id: 7,
+            allow: false,
+        });
+        round_control(&ControlMsg::ResourceVerdict { id: 9, allow: true });
+        round_control(&ControlMsg::CosmeticFilters(
+            ".ad, #banner { display: none !important; }".to_owned(),
+        ));
+        round_control(&ControlMsg::CosmeticFilters(String::new()));
     }
 
     #[test]
@@ -718,6 +781,11 @@ mod tests {
         });
         round_event(&EventMsg::Crashed {
             reason: "engine SIGSEGV".to_owned(),
+        });
+        round_event(&EventMsg::ResourceRequest {
+            id: 42,
+            url: "https://doubleclick.net/pixel.gif".to_owned(),
+            resource: 4,
         });
     }
 
