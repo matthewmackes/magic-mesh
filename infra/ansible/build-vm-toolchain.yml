@@ -47,6 +47,14 @@
           - libinput-devel
           - libdrm-devel
           - systemd-devel
+          # BOOKMARKS-5 Servo browser: its bindgen-based -sys crates (mozangle,
+          # mozjs_sys, harfbuzz-sys) hard-require libclang.so at build time; without
+          # clang-devel the mde-web-preview build dies "Unable to find libclang".
+          # clang-devel provides /usr/lib64/libclang.so; llvm is its runtime.
+          # (Also required by BOOKMARKS-9 packaging.)
+          - clang
+          - clang-devel
+          - llvm
         state: present
 
     - name: rustup present?
