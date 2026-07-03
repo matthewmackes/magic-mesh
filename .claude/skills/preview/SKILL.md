@@ -1,67 +1,104 @@
 ---
 name: preview
 description: >-
-  Render and visually verify the MCNF iced/Cosmic GUIs against the IBM
-  Carbon reference. TRIGGER when the user wants to "preview", "screenshot the
-  app", "verify the render", or confirm a visual change actually looks right
-  (Carbon Gray 10 / 90 / 100). Use this instead of trusting a green `cargo test`
-  for any UI change — launch the real app binary and inspect.
+  Render and visually verify the MCNF egui/wgpu surfaces against the Quasar
+  dark design language (Carbon-inspired, dark-only). TRIGGER when the user
+  wants to "preview", "screenshot the app", "verify the render", or confirm a
+  visual change actually looks right. Best-effort eyes-on evidence — the visual
+  gate is LIFTED (operator 2026-06-11): a green build + tests + style-leak grep
+  ships a UI change; this skill is how you *look*, never a blocker.
 ---
 
-# preview — render & accuracy verification (MCNF)
+# preview — render & accuracy verification (MCNF, E12 egui era)
 
-A green `cargo test` does **not** verify the render. The desktop shell is gone
-(Cosmic owns the desktop); what MCNF draws are its **iced 0.14 client areas** —
-the Cosmic apps + the cosmic-applet. This skill verifies those render correctly
-against the IBM-Carbon reference.
+A green `cargo test` does **not** show you the render. Every MCNF surface is an
+**egui panel** drawn through the shared `crates/shared/mde-egui` harness
+(eframe = egui + winit + wgpu): on real hardware the shell owns the DRM/KMS
+seat directly; in development each surface also runs as an ordinary **windowed
+Wayland client** via the harness's `run_client` fallback — that windowed path
+is what this skill drives.
 
-> **No bundled capture harness.** There is no `preview.sh` and no
-> `tests/accuracy/` in this repo (those were the labwc-era shell's accuracy
-> harness, retired in the E11 pivot). Verify by launching the real app binaries
-> and inspecting; back it with the `mde-theme` token tests.
+> **The visual gate is lifted (operator, 2026-06-11 — reaffirmed in the
+> 2026-07-03 design survey).** A UI change is *done* when it builds, tests
+> green, and passes the style-leak grep (see `/polish`). Preview is
+> **best-effort evidence, never a §7 gate** — do not hold a task `[>]` waiting
+> for eyes-on, and do not mark visual verification as a blocker in
+> `docs/WORKLIST.md`.
 
-## Surfaces (each is its own binary)
+## Surfaces (E12 — all egui, all in `crates/desktop/`)
 
 ```sh
-cargo run -p mde-workbench    # the Cosmic control surface (fleet, devices, mesh health)
-cargo run -p mde-files        # the file manager
-cargo run -p mde-voice-hud    # voice/SIP HUD          (mde-voice-config = its config)
-cargo run -p mde-music        # the music player        (mde-musicd = its daemon)
-cargo run -p magic-fleet      # the Automation Mesh node engine
+cargo run -p mde-shell-egui     # THE shell (chrome bar → Workbench)
+cargo run -p mde-panel-egui     # panel chrome
+cargo run -p mde-files-egui     # files panel
+cargo run -p mde-music-egui     # music panel (+ mde-media-egui)
+cargo run -p mde-voice-egui     # voice/SIP panel
+cargo run -p mde-editor-egui    # editor panel
+cargo run -p mde-term-egui      # terminal panel
+cargo run -p mde-bookmarks-egui # bookmarks panel
+cargo run -p mde-mesh-view      # mesh map view
 ```
 
-`mackesd` is a library crate (no binary); its surfaces are reached through the apps
-above and `mde-bus` subscriptions. `salvage/from-mde-binary/` holds two not-yet-
-rehomed surfaces (`birthright`, `mesh_status`) pending re-home onto Cosmic.
+Plus the VDI viewers (`mde-vdi-rdp` / `mde-vdi-spice` / `mde-vdi-vnc`) and
+`mde-web-preview-client`. The iced/libcosmic binaries (`mde-workbench`,
+`mde-files`, `mde-music`, `mde-voice-hud`, `magic-fleet`) are **retired** — if
+one still runs, that's a rescue finding for `/polish` or `/audit`, not a
+preview target.
 
 ## How to use
 
-1. **Build + launch + look.** `cargo build --workspace` first, then
-   `cargo run -p <crate>` (or `timeout 10 ./target/debug/<bin>`) and inspect the
-   client area against the change's intent. If running headless, capture with the
-   system screenshot tool of the live Cosmic/Wayland session and **Read** the PNG.
-2. **Quick no-panic check** for a single surface: `timeout 3 cargo run -p <crate>`
-   — confirm it draws and doesn't panic on launch.
-3. **One look, three grays.** The GUI is **strictly IBM Carbon**
-   (carbondesignsystem.com); the only switchable themes are Carbon's gray themes —
-   **Gray 10** (light), **Gray 90**, **Gray 100** (default dark). There are **no**
-   era themes (Win2000/Windows10/BeOS — all retired). Carbon tokens (type scale, 8px
-   spacing, components, 2px focus, motion) are single-sourced in `mde-theme`
-   (`crates/shared/mde-theme`); flip the active gray theme there or via the app's
-   own theme control, and restore it after.
-4. **Static token check** (always headless-safe): `cargo test -p mde-theme` — the
-   Carbon token / palette / metric ground truth. If a render looks off, suspect a
-   `mde-theme` token edit before the surface code.
+1. **Build + launch + look.** `cargo build -p <crate>` (ride the farm via
+   `install-helpers/xcp-build.sh` for cold builds — see `/polish`; *rendering*
+   needs a live Wayland session + GPU, so run where a session exists), then
+   `cargo run -p <crate>` and inspect the panel against the change's intent.
+2. **Quick no-panic check:** `timeout 3 cargo run -p <crate>` — confirm it
+   draws real state (not `demo_data`) and doesn't panic on launch.
+3. **Capture a PNG and `Read` it.** Until the harness grows its own capture
+   hook, screenshot the windowed client with the live session's screenshot
+   tool and **Read** the PNG. The right long-term hook is egui's
+   `ViewportCommand::Screenshot` → `Event::Screenshot` wired into `mde-egui`'s
+   `run_client` (dump a PNG on an env flag and exit) — adding it is a
+   high-value `/polish` unit, already called out there.
+4. **One theme: Quasar dark.** The look is the Carbon-inspired **Quasar dark**
+   design language (dark-only; the Gray 10/90/100 switching of the mde-theme
+   era is retired). Verify at **two scales** — 1.0 and a fractional
+   `pixels_per_point` — and, where the surface supports it, both `Density`
+   modes (Mouse/Touch): spacing may change, component dimensions must not
+   (UX-24).
+5. **Static ground truth (always headless-safe):** `cargo test -p mde-egui` —
+   the `Style`/`Motion`/fonts values are render-agnostic data with unit tests.
+   If a render looks off, suspect a shared-`Style` edit before the surface
+   code. Then run the **style-leak grep** from `/polish` (zero
+   `Color32::from_*` / literal durations in `crates/desktop`, pixel decoders
+   and the ANSI palette excluded).
+
+## What to look for (the fast checklist)
+
+- Spacing on the 8px rhythm; no cramped or ragged gutters.
+- Mono-first type (headings/nav/data in the mono, prose in the sans); no
+  off-scale sizes.
+- Soft-Carbon depth: 4–8px radii, layered soft shadows, subtle-translucent
+  scrims only (no gaussian blur).
+- Motion from the shared `mde_egui::motion` table — springs/inertia/
+  micro-interactions feel continuous, and nothing animates from a bespoke
+  literal.
+- 2px focus ring visible; the panel is keyboard-reachable.
+- Empty/loading/error states are designed (skeleton/empty-state), never a
+  blank panel or frozen spinner; absent backends render an honest
+  "not available" (§7).
+- 1px strokes land crisp on pixel boundaries at fractional scales; textures
+  (VDI planes, album art) aren't stretched.
 
 ## Notes
 
-- No raw hex / scattered metric literal lives anywhere but the `mde-theme` token
-  modules (`AI_GOVERNANCE.md` §4) — a lint gate enforces this. Cosmic draws the
-  panel/decorations; MCNF only draws its client areas.
-- Pure-Rust toolkit: iced 0.14 (wgpu) + cosmic-text (no FreeType), rustls (no
-  OpenSSL). A full build needs `gtk3-devel` + `alsa-lib-devel`.
-- Visual verification is the §7 Definition-of-Done gate for any UI change — do not
-  mark a task `[✓]` in `docs/WORKLIST.md` on a green `cargo test` alone.
+- The single source of look is `mde_egui::{Style, Motion, fonts}`
+  (`AI_GOVERNANCE.md` §4) — surfaces never hand-roll a colour or duration; the
+  style-leak grep in `/polish` is the mechanical check.
+- Pure-Rust stack: egui/eframe 0.31 on wgpu (Vulkan via Mesa on hosts), rustls.
+  Build prerequisites live in `docs/BUILD-ENVIRONMENT.md`.
+- Frame time is observed here, never gated — a hitch you can see is a bug to
+  file, not a polish gate (survey lock, 2026-07-03).
 
-See also: `/audit` (find dead/mock/stub UI), `/ship` (drain the worklist, accuracy-
-verifying each change), `/release` (operator-gated RPM cut).
+See also: `/polish` (the refinement loop this skill gives eyes to), `/audit`
+(find dead/mock/stub UI), `/ship` (drain the general worklist), `/release`
+(operator-gated RPM cut).
