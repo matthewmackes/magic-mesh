@@ -41,6 +41,8 @@
 //! picker (protocol · display · monitors) and nothing connects until the operator
 //! confirms it (lock 6 — never a silent protocol default).
 
+mod chooser_prefs;
+
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -58,6 +60,7 @@ use crate::auth::{
     SealOutcome,
 };
 use crate::vdi::{ConnectRequest, DisplayMode, MonitorSpan, RequestedTarget, VdiProtocol};
+use chooser_prefs::{unix_millis, ChooserPrefs};
 
 /// The retained-latest state topic the CHOOSER-1 worker publishes the merged
 /// roster to. MUST equal `mackesd::workers::desktop_sources::SOURCES_TOPIC`
@@ -144,6 +147,18 @@ impl Protocol {
             Self::Vnc => Some("vnc"),
             Self::Spice => Some("spice"),
             Self::Unknown => None,
+        }
+    }
+
+    /// The routable protocol a wire tag names, or `None` for one this build can't
+    /// route — the inverse of [`wire_tag`](Self::wire_tag). CHOOSER-9 re-hydrates a
+    /// roamed manual source's stored tag back through this before republishing.
+    fn from_wire_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "rdp" => Some(Self::Rdp),
+            "vnc" => Some(Self::Vnc),
+            "spice" => Some(Self::Spice),
+            _ => None,
         }
     }
 
@@ -1100,11 +1115,23 @@ pub(crate) struct ChooserState {
     /// CHOOSER-8 — the live find controls (search + node/protocol/status/OS
     /// filters + sort). A pure fold over the published roster; never a probe.
     filter: FilterSort,
-    /// CHOOSER-8 — the operator's pinned/favorite source ids. A pin floats a card
-    /// to the front of its node group and marks it — a shell-local view
-    /// preference (session-scoped; CHOOSER-9 lifts it onto the synced plane), not
-    /// a roster mutation.
+    /// CHOOSER-9 — the operator's mesh-synced prefs (favorites + recents + manual
+    /// sources) bound to the mesh identity and roamed per seat over the workgroup
+    /// root (the MEDIA-16 seam). The authoritative store; [`favorites`](Self::favorites)
+    /// / [`recents`](Self::recents) are its merged cache, refreshed each fold.
+    prefs: ChooserPrefs,
+    /// CHOOSER-9 — the merged pinned source ids (the [`prefs`](Self::prefs) view,
+    /// refreshed each fold). A pin floats a card to the front of its node group and
+    /// marks it — a view preference that follows the identity, not a roster mutation.
     favorites: HashSet<String>,
+    /// CHOOSER-9 — the merged recently-used source ids (the [`prefs`](Self::prefs)
+    /// view, refreshed each fold). A recently-connected desktop reads "recently
+    /// used" on its card wherever the operator sits.
+    recents: HashSet<String>,
+    /// CHOOSER-9 — manual source ids already re-published to THIS seat's worker from
+    /// the roamed prefs (once per session), so a manual source added on another seat
+    /// materializes here without re-publishing every poll.
+    hydrated_manual: HashSet<String>,
     /// CHOOSER-8 — the in-progress manual-source edit (context-menu → Edit), or
     /// `None`. Mutually exclusive with the connect picker.
     manual_edit: Option<ManualEdit>,
@@ -1117,21 +1144,24 @@ impl Default for ChooserState {
             mde_bus::client_data_dir(),
             crate::discovery::local_peer(),
             Box::new(MeshCredentialStore),
+            ChooserPrefs::open_default(),
         )
     }
 }
 
 impl ChooserState {
-    /// Construct over an explicit read seam + publish root + credential store
-    /// (production wires the Bus + the mesh-side sealed store; tests inject fakes
-    /// and `None`).
+    /// Construct over an explicit read seam + publish root + credential store +
+    /// CHOOSER-9 prefs session (production wires the Bus + the mesh-side sealed
+    /// store + the workgroup-root prefs; tests inject fakes, `None`, and an inert
+    /// prefs session). Hydrates the favorites/recents cache from the prefs at once.
     fn with_client(
         client: Box<dyn DesktopSourcesClient>,
         bus_root: Option<PathBuf>,
         client_peer: String,
         creds: Box<dyn CredentialStore>,
+        prefs: ChooserPrefs,
     ) -> Self {
-        Self {
+        let mut state = Self {
             client,
             creds,
             bus_root,
@@ -1147,9 +1177,23 @@ impl ChooserState {
             connect: None,
             thumbs: ThumbnailCache::default(),
             filter: FilterSort::default(),
+            prefs,
             favorites: HashSet::new(),
+            recents: HashSet::new(),
+            hydrated_manual: HashSet::new(),
             manual_edit: None,
-        }
+        };
+        state.refresh_prefs_cache();
+        state
+    }
+
+    /// CHOOSER-9 — refresh the favorites + recents caches from the merged prefs (the
+    /// synced view across every seat). Called on every fold so a pin/recent/manual
+    /// change made at another seat surfaces here on the next poll.
+    fn refresh_prefs_cache(&mut self) {
+        let merged = self.prefs.merged();
+        self.recents = merged.recents.iter().map(|r| r.id.clone()).collect();
+        self.favorites = merged.favorites;
     }
 
     /// The bus-poll seam: refresh the roster when the cadence has elapsed,
@@ -1167,10 +1211,14 @@ impl ChooserState {
 
     /// Re-read the newest published roster and fold it (split from the
     /// cadence gate). A missing record keeps the last-known state — the read
-    /// path never blanks a live grid on a transient read miss.
+    /// path never blanks a live grid on a transient read miss. Either way the
+    /// CHOOSER-9 prefs cache is re-merged so a pin/recent/manual change roamed from
+    /// another seat surfaces even when the roster itself didn't change.
     fn refresh(&mut self) {
         if let Some(state) = self.client.latest() {
             self.fold_sources(state);
+        } else {
+            self.refresh_prefs_cache();
         }
     }
 
@@ -1197,6 +1245,85 @@ impl ChooserState {
             }
         }
         self.state = Some(state);
+        // CHOOSER-9 — capture the roster's manual sources into the synced prefs so
+        // they roam, re-materialize any roamed manual source this seat's worker
+        // hasn't heard of yet, then re-merge the favorites/recents cache.
+        self.capture_manual_sources();
+        self.rematerialize_manual();
+        self.refresh_prefs_cache();
+    }
+
+    /// CHOOSER-9 — record every manual-origin source in the roster into the synced
+    /// prefs (present) so an operator-added desktop follows the identity to another
+    /// seat. Only captures a source the prefs don't already carry as present, so a
+    /// steady roster is a no-op; an edit/remove routes through the explicit prefs
+    /// mutators instead.
+    fn capture_manual_sources(&mut self) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let captures: Vec<(String, String, u16, String, Option<String>)> = state
+            .sources
+            .iter()
+            .filter(|s| s.origin == SourceOrigin::Manual)
+            .filter_map(|s| {
+                let offer = s.protocols.first()?;
+                let port = offer.port?;
+                let tag = offer.protocol.wire_tag()?;
+                let name = (s.name != format!("{}:{port}", s.host)).then(|| s.name.clone());
+                Some((s.id.clone(), s.host.clone(), port, tag.to_owned(), name))
+            })
+            .collect();
+        let now = unix_millis();
+        for (id, host, port, tag, name) in captures {
+            // Only capture an endpoint the prefs have NEVER recorded — never one
+            // that was removed (a tombstone), so a lingering roster row can't
+            // resurrect a manual source the operator deleted on another seat.
+            if !self.prefs.knows_manual(&id) {
+                self.prefs.set_manual(&id, &host, port, &tag, name, now);
+            }
+        }
+    }
+
+    /// CHOOSER-9 — re-publish any roamed manual source the synced prefs carry that
+    /// this seat's roster doesn't yet show, over the ONE existing
+    /// `action/desktops/add-source` verb (§6 — reusing the CHOOSER-8 seam, no new
+    /// worker). Guarded once-per-id per session so a slow worker never spams the
+    /// topic, and inert unless the workgroup root is actually provisioned (so an
+    /// offline seat never re-materializes a phantom source). The worker then folds
+    /// it into the roster on a later poll.
+    fn rematerialize_manual(&mut self) {
+        if !self.prefs.is_ready() {
+            return;
+        }
+        let in_roster: HashSet<String> = self
+            .state
+            .as_ref()
+            .map(|s| s.sources.iter().map(|x| x.id.clone()).collect())
+            .unwrap_or_default();
+        for entry in self.prefs.merged().manual {
+            if in_roster.contains(&entry.id) || !self.hydrated_manual.insert(entry.id.clone()) {
+                continue;
+            }
+            let Some(tag) = Protocol::from_wire_tag(&entry.protocol).and_then(Protocol::wire_tag)
+            else {
+                continue;
+            };
+            let body = AddSourceRequest {
+                name: entry.name.clone(),
+                host: entry.host.clone(),
+                port: entry.port,
+                protocol: tag,
+            }
+            .to_body();
+            publish_source_action(
+                self.bus_root.as_deref(),
+                &mut self.last_error,
+                ADD_SOURCE_TOPIC,
+                Some(&body),
+                "roamed desktop",
+            );
+        }
     }
 
     /// Take (and clear) the auto-popup request — the shell surfaces the
@@ -1360,13 +1487,14 @@ impl ChooserState {
         }
     }
 
-    /// CHOOSER-8 — toggle a source's favorite/pin. A pinned card floats to the
-    /// front of its node group and shows a pin marker; a shell-local view
-    /// preference, never a roster mutation.
-    fn toggle_favorite(&mut self, id: String) {
-        if !self.favorites.remove(&id) {
-            self.favorites.insert(id);
-        }
+    /// CHOOSER-9 — toggle a source's favorite/pin through the mesh-synced prefs. The
+    /// pin is written to this seat's per-identity record (an un-pin is a tombstone,
+    /// so it converges), roams to every other seat, and the merged cache refreshes
+    /// so the card floats to the front of its node group at once. A view preference
+    /// that follows the identity, never a roster mutation.
+    fn toggle_favorite(&mut self, id: &str) {
+        self.prefs.toggle_favorite(id, unix_millis());
+        self.refresh_prefs_cache();
     }
 
     /// CHOOSER-8 — the offline card's Retry affordance (lock 14): nudge the
@@ -1415,7 +1543,14 @@ impl ChooserState {
             Some(&body),
             "manual-source removal",
         );
-        self.favorites.remove(id);
+        // CHOOSER-9 — tombstone the synced manual register + any pin so the remove
+        // roams to every seat (never a source that reappears elsewhere), then
+        // refresh the merged cache.
+        let now = unix_millis();
+        self.prefs.remove_manual(id, now);
+        self.prefs.set_favorite(id, false, now);
+        self.hydrated_manual.remove(id);
+        self.refresh_prefs_cache();
         if self
             .manual_edit
             .as_ref()
@@ -1554,13 +1689,23 @@ impl ChooserState {
             "manual-source edit",
         );
         if self.last_error.is_none() {
+            // CHOOSER-9 — roam the edit: tombstone the old manual register (+ its
+            // pin) and record the edited endpoint under its new id, so the change
+            // follows the identity to every seat.
+            let new_id = format!("manual:{host}:{port}:{protocol_tag}");
+            let now = unix_millis();
+            self.prefs.remove_manual(&original_id, now);
+            self.prefs.set_favorite(&original_id, false, now);
+            self.prefs
+                .set_manual(&new_id, &host, port, protocol_tag, name.clone(), now);
+            self.hydrated_manual.remove(&original_id);
+            self.refresh_prefs_cache();
             let shown = name.unwrap_or_else(|| format!("{host}:{port}"));
             self.note = Some(format!(
                 "Updated {shown} ({} \u{00B7} {host}:{port}) — the roster reflects the edit on \
                  the next refresh.",
                 protocol_tag.to_ascii_uppercase(),
             ));
-            self.favorites.remove(&original_id);
             self.manual_edit = None;
         }
     }
@@ -1646,6 +1791,11 @@ impl ChooserState {
             monitors,
             auth,
         ));
+        // CHOOSER-9 — a genuine connect makes this desktop "recently used"; the
+        // record roams so the operator's recents follow them to any seat.
+        self.prefs
+            .record_recent(&source.id, &source.name, unix_millis());
+        self.refresh_prefs_cache();
     }
 
     /// The honest empty-grid copy: a missing Bus (a gated read), a worker
@@ -1771,6 +1921,7 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
     // values + those fields, never `state` wholesale (borrow clean).
     let filter = state.filter.clone();
     let favorites = state.favorites.clone();
+    let recents = state.recents.clone();
     let pending_id = state.pending.as_ref().map(|d| d.source_id.clone());
     let note = state.note.clone();
     // CHOOSER-7 — the honest no-local-hypervisor gate, read once from the roster's
@@ -1803,6 +1954,7 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
                 &sources,
                 &filter,
                 &favorites,
+                &recents,
                 pending_id.as_deref(),
                 note.as_deref(),
                 power_gate.as_deref(),
@@ -1818,7 +1970,7 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
         Some(CardAction::Confirm) => state.confirm_connect(&sources),
         Some(CardAction::Cancel) => state.cancel_connect(),
         Some(CardAction::Power { id, op }) => state.power_action(&sources, &id, op),
-        Some(CardAction::ToggleFavorite(id)) => state.toggle_favorite(id),
+        Some(CardAction::ToggleFavorite(id)) => state.toggle_favorite(&id),
         Some(CardAction::Retry(id)) => state.retry_discovery(&sources, &id),
         Some(CardAction::EditSource(id)) => state.begin_edit(&sources, &id),
         Some(CardAction::RemoveSource(id)) => state.remove_source(&sources, &id),
@@ -1839,6 +1991,7 @@ fn chooser_grid(
     sources: &[DesktopSource],
     filter: &FilterSort,
     favorites: &HashSet<String>,
+    recents: &HashSet<String>,
     pending_id: Option<&str>,
     note: Option<&str>,
     power_gate: Option<&str>,
@@ -1883,7 +2036,10 @@ fn chooser_grid(
             for source in members {
                 let pending = pending_id == Some(source.id.as_str());
                 let favorite = favorites.contains(&source.id);
-                if let Some(a) = source_card(ui, source, pending, favorite, thumbs, power_gate) {
+                let recent = recents.contains(&source.id);
+                if let Some(a) =
+                    source_card(ui, source, pending, favorite, recent, thumbs, power_gate)
+                {
                     action = Some(a);
                 }
                 ui.add_space(Style::SP_S);
@@ -2039,6 +2195,7 @@ fn source_card(
     source: &DesktopSource,
     pending: bool,
     favorite: bool,
+    recent: bool,
     thumbs: &mut ThumbnailCache,
     gate: Option<&str>,
 ) -> Option<CardAction> {
@@ -2099,7 +2256,7 @@ fn source_card(
             ui.vertical(|ui| {
                 ui.set_width(Style::SP_S.mul_add(-2.0, CARD_WIDTH));
                 ui.add_space(Style::SP_S);
-                card_body(ui, source, thumbs, gate)
+                card_body(ui, source, recent, thumbs, gate)
             })
             .inner
         })
@@ -2229,6 +2386,7 @@ fn fit_centered(bounds: egui::Rect, img: egui::Vec2) -> egui::Rect {
 fn card_body(
     ui: &mut egui::Ui,
     source: &DesktopSource,
+    recent: bool,
     thumbs: &mut ThumbnailCache,
     gate: Option<&str>,
 ) -> CardControls {
@@ -2274,14 +2432,22 @@ fn card_body(
                 muted_note(ui, reason);
             }
             _ => {
-                muted_note(
-                    ui,
+                // CHOOSER-9 — a recently-used desktop reads "recently used" wherever
+                // the operator sits (the synced recents cache drives this marker).
+                let caption = if recent {
+                    format!(
+                        "{} \u{00B7} {} \u{00B7} recently used",
+                        source.reachability.label(),
+                        source.origin.label()
+                    )
+                } else {
                     format!(
                         "{} \u{00B7} {}",
                         source.reachability.label(),
                         source.origin.label()
-                    ),
-                );
+                    )
+                };
+                muted_note(ui, caption);
             }
         }
     });
@@ -2724,6 +2890,27 @@ mod tests {
         }
     }
 
+    /// An inert CHOOSER-9 prefs session (its workgroup root is unprovisioned, so it
+    /// is a silent no-op) — favorites/recents still track session-locally, exactly
+    /// as an offline seat behaves, so the pre-CHOOSER-9 tests are unaffected.
+    fn inert_prefs() -> ChooserPrefs {
+        chooser_prefs::ChooserPrefs::new(
+            chooser_prefs::ChooserPrefsStore::new(PathBuf::from("/no/such/mesh/root")),
+            "matthew",
+            "seat-test",
+        )
+    }
+
+    /// A CHOOSER-9 prefs session over an explicit workgroup root + seat (the
+    /// two-seat sync tests point two of these at one shared tempdir).
+    fn prefs_at(root: PathBuf, seat: &str) -> ChooserPrefs {
+        chooser_prefs::ChooserPrefs::new(
+            chooser_prefs::ChooserPrefsStore::new(root),
+            "matthew",
+            seat,
+        )
+    }
+
     /// A `ChooserState` over a canned roster, with no publish root (the
     /// broker publish then records its honest error) and a fixed peer name. Most
     /// tests exercise mesh-peer sources (SSO), so the honest-gated production
@@ -2742,6 +2929,7 @@ mod tests {
             None,
             "client-node".to_string(),
             creds,
+            inert_prefs(),
         );
         s.refresh();
         s
@@ -3327,6 +3515,7 @@ mod tests {
             None,
             "client-node".to_string(),
             Box::new(MeshCredentialStore),
+            inert_prefs(),
         );
         let (title, detail) = state.empty_copy();
         assert_eq!(title, "Desktop discovery unavailable");
@@ -3796,6 +3985,27 @@ mod tests {
             bus_root,
             "client-node".to_string(),
             Box::new(MeshCredentialStore),
+            inert_prefs(),
+        );
+        s.refresh();
+        s
+    }
+
+    /// [`state_with_bus`] with a CHOOSER-9 prefs session over an explicit workgroup
+    /// root + seat — so the two-seat sync tests can pin at one seat and read the
+    /// roamed record at another over one shared mesh dir.
+    fn state_with_prefs(
+        state: Option<DesktopSourcesState>,
+        bus_root: Option<PathBuf>,
+        prefs_root: PathBuf,
+        seat: &str,
+    ) -> ChooserState {
+        let mut s = ChooserState::with_client(
+            Box::new(FakeSources(state)),
+            bus_root,
+            "client-node".to_string(),
+            Box::new(MeshCredentialStore),
+            prefs_at(prefs_root, seat),
         );
         s.refresh();
         s
@@ -4000,9 +4210,9 @@ mod tests {
             &[Protocol::Rdp],
         )])));
         assert!(!state.favorites.contains("peer:oak"));
-        state.toggle_favorite("peer:oak".to_string());
+        state.toggle_favorite("peer:oak");
         assert!(state.favorites.contains("peer:oak"), "a pin adds it");
-        state.toggle_favorite("peer:oak".to_string());
+        state.toggle_favorite("peer:oak");
         assert!(
             !state.favorites.contains("peer:oak"),
             "a second toggle unpins"
@@ -4254,10 +4464,225 @@ mod tests {
             "oak",
             &[Protocol::Rdp],
         )])));
-        state.toggle_favorite("peer:oak".to_string());
+        state.toggle_favorite("peer:oak");
         assert!(
             run_panel(&mut state),
             "the pinned card produced no draw primitives"
         );
+    }
+
+    // ── CHOOSER-9: mesh-synced favorites / recents / manual sources ──
+
+    /// A unique temp workgroup root (the crate's `std::env::temp_dir()` idiom — no
+    /// `tempfile` dep), created + cleaned up by each sync test that uses it.
+    fn temp_prefs_root(tag: &str) -> PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!("mde-chooser9-shell-{tag}-{n}"));
+        std::fs::create_dir_all(&root).expect("mkroot");
+        root
+    }
+
+    #[test]
+    fn a_pin_at_seat_a_syncs_and_appears_at_seat_b() {
+        // THE ACCEPTANCE (two-seat): pin at seat A → the per-identity record syncs
+        // over the shared workgroup root → seat B shows the pin. This drives the
+        // sync mechanism directly (the live cross-seat is the gated leg).
+        let root = temp_prefs_root("pin");
+        let oak = source("peer:oak", "oak", &[Protocol::Rdp]);
+
+        // ── Seat A pins the desktop. ──
+        let mut seat_a = state_with_prefs(
+            Some(roster(vec![oak.clone()])),
+            None,
+            root.clone(),
+            "seat-a",
+        );
+        assert!(!seat_a.favorites.contains("peer:oak"), "not pinned yet");
+        seat_a.toggle_favorite("peer:oak");
+        assert!(seat_a.favorites.contains("peer:oak"), "pinned at seat A");
+
+        // ── Seat B opens fresh over the SAME workgroup root. ──
+        let seat_b = state_with_prefs(Some(roster(vec![oak])), None, root.clone(), "seat-b");
+        assert!(
+            seat_b.favorites.contains("peer:oak"),
+            "seat A's pin roamed to seat B"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_recent_and_an_unpin_roam_between_seats() {
+        let root = temp_prefs_root("recent");
+        let oak = source("peer:oak", "oak", &[Protocol::Rdp]);
+
+        // Seat A pins + connects (a genuine "recently used").
+        let mut seat_a = state_with_prefs(
+            Some(roster(vec![oak.clone()])),
+            None,
+            root.clone(),
+            "seat-a",
+        );
+        let sources_a = seat_a.sources_snapshot();
+        seat_a.toggle_favorite("peer:oak");
+        seat_a.activate(&sources_a, "peer:oak");
+        seat_a.confirm_connect(&sources_a); // records the recent
+        assert!(seat_a.recents.contains("peer:oak"), "recorded at seat A");
+
+        // Seat B sees both the pin and the recent.
+        let mut seat_b = state_with_prefs(
+            Some(roster(vec![oak.clone()])),
+            None,
+            root.clone(),
+            "seat-b",
+        );
+        assert!(seat_b.favorites.contains("peer:oak"), "pin roamed");
+        assert!(seat_b.recents.contains("peer:oak"), "recent roamed");
+
+        // Seat B un-pins; seat A re-reads and the un-pin has converged (LWW, so the
+        // newer un-pin beats the older pin — never a grow-only set).
+        seat_b.toggle_favorite("peer:oak");
+        assert!(
+            !seat_b.favorites.contains("peer:oak"),
+            "un-pinned at seat B"
+        );
+        let seat_a2 = state_with_prefs(Some(roster(vec![oak])), None, root.clone(), "seat-a");
+        assert!(
+            !seat_a2.favorites.contains("peer:oak"),
+            "seat B's newer un-pin roamed back to seat A"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_manual_source_roams_and_rematerializes_at_a_new_seat() {
+        // A manual desktop added on seat A is captured into the synced prefs; seat B
+        // (whose worker doesn't know it yet) re-publishes it over the ONE existing
+        // add-source verb, so it appears there too — reusing the CHOOSER-8 seam.
+        let prefs_root = temp_prefs_root("manual");
+        let bus_a = temp_bus_dir("manual-a");
+        let bus_b = temp_bus_dir("manual-b");
+        let manual = manual_source("10.0.0.5", 3389, Protocol::Rdp);
+        let manual_id = manual.id.clone();
+
+        // ── Seat A folds a roster carrying the manual source → captured into prefs.
+        let seat_a = state_with_prefs(
+            Some(roster(vec![manual])),
+            Some(bus_a.clone()),
+            prefs_root.clone(),
+            "seat-a",
+        );
+        assert!(
+            seat_a
+                .prefs
+                .merged()
+                .manual
+                .iter()
+                .any(|m| m.id == manual_id),
+            "the manual source was captured into the synced prefs"
+        );
+
+        // ── Seat B has an EMPTY roster (its worker hasn't heard of the endpoint) but
+        // shares the workgroup root → it re-materializes the roamed manual source
+        // onto its own worker via the add-source verb.
+        let seat_b = state_with_prefs(
+            Some(roster(vec![])),
+            Some(bus_b.clone()),
+            prefs_root.clone(),
+            "seat-b",
+        );
+        assert!(
+            seat_b.last_error.is_none(),
+            "the re-materialize publish succeeded: {:?}",
+            seat_b.last_error
+        );
+        let persist = mde_bus::persist::Persist::open(bus_b.clone()).expect("open bus");
+        let adds = persist.list_since(ADD_SOURCE_TOPIC, None).expect("list");
+        assert_eq!(
+            adds.len(),
+            1,
+            "the roamed manual source is re-published once"
+        );
+        let v: serde_json::Value = serde_json::from_str(adds[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(v["host"], "10.0.0.5");
+        assert_eq!(v["port"], 3389);
+        assert_eq!(v["protocol"], "rdp");
+
+        let _ = std::fs::remove_dir_all(&prefs_root);
+        let _ = std::fs::remove_dir_all(&bus_a);
+        let _ = std::fs::remove_dir_all(&bus_b);
+    }
+
+    #[test]
+    fn removing_a_manual_source_tombstones_it_so_it_does_not_reappear() {
+        // Remove on seat A tombstones the synced register; a fresh seat B must NOT
+        // re-materialize it (a grow-only set would resurrect a removed desktop).
+        let prefs_root = temp_prefs_root("manual-rm");
+        let bus_a = temp_bus_dir("manual-rm-a");
+        let bus_b = temp_bus_dir("manual-rm-b");
+        let manual = manual_source("10.0.0.5", 3389, Protocol::Rdp);
+        let manual_id = manual.id.clone();
+
+        let mut seat_a = state_with_prefs(
+            Some(roster(vec![manual])),
+            Some(bus_a.clone()),
+            prefs_root.clone(),
+            "seat-a",
+        );
+        let sources_a = seat_a.sources_snapshot();
+        seat_a.remove_source(&sources_a, &manual_id);
+        assert!(
+            !seat_a
+                .prefs
+                .merged()
+                .manual
+                .iter()
+                .any(|m| m.id == manual_id),
+            "the removed manual source is tombstoned in the synced prefs"
+        );
+
+        // Seat B, empty roster, shared root: the tombstone means nothing to
+        // re-materialize — no add-source verb published.
+        let seat_b = state_with_prefs(
+            Some(roster(vec![])),
+            Some(bus_b.clone()),
+            prefs_root.clone(),
+            "seat-b",
+        );
+        let persist = mde_bus::persist::Persist::open(bus_b.clone()).expect("open bus");
+        let adds = persist.list_since(ADD_SOURCE_TOPIC, None).expect("list");
+        assert!(
+            adds.is_empty(),
+            "a removed manual source does not roam back to a new seat"
+        );
+        assert!(seat_b.favorites.is_empty());
+
+        let _ = std::fs::remove_dir_all(&prefs_root);
+        let _ = std::fs::remove_dir_all(&bus_a);
+        let _ = std::fs::remove_dir_all(&bus_b);
+    }
+
+    #[test]
+    fn a_recently_used_card_renders_its_marker() {
+        let root = temp_prefs_root("recent-render");
+        let mut state = state_with_prefs(
+            Some(roster(vec![source("peer:oak", "oak", &[Protocol::Rdp])])),
+            None,
+            root.clone(),
+            "seat-a",
+        );
+        let sources = state.sources_snapshot();
+        state.activate(&sources, "peer:oak");
+        state.confirm_connect(&sources);
+        assert!(state.recents.contains("peer:oak"));
+        assert!(
+            run_panel(&mut state),
+            "the recently-used card produced no draw primitives"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

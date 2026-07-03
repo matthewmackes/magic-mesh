@@ -40,6 +40,14 @@ mde-bus = { path = "../../platform/mde-bus" }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 
+# CHOOSER-9 — the Desktop Chooser's mesh-synced favorites/recents/manual sources
+# (`chooser/chooser_prefs.rs`) roam per mesh identity over the Syncthing-replicated
+# workgroup root. This one leaf type crate supplies the canonical
+# `default_workgroup_root()` (never a hardcoded /mnt/mesh-storage) — the same seam
+# MEDIA-16's session roaming reuses. A mesh-tier registry crate of pure types; the
+# dependency edge points inward (§6), carrying no daemon dependency.
+mackes-mesh-types = { path = "../../mesh/mackes-mesh-types" }
+
 # BRAND-1 — the empty-desktop brand backdrop (`backdrop.rs`) decodes the embedded
 # 1270² RGBA logo lockup once to a cached egui texture. `png` is the lean decoder
 # `mde-files` already builds thumbnails on; a leaf registry crate, so it adds no
