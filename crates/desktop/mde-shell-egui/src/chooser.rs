@@ -41,6 +41,7 @@
 //! picker (protocol · display · monitors) and nothing connects until the operator
 //! confirms it (lock 6 — never a silent protocol default).
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -120,6 +121,10 @@ pub(crate) enum Protocol {
 }
 
 impl Protocol {
+    /// The build-known, routable protocols — the CHOOSER-8 protocol-filter set
+    /// (the `Unknown` catch-all is never an operator-selectable filter).
+    const ALL: [Self; 3] = [Self::Rdp, Self::Vnc, Self::Spice];
+
     /// The card badge text.
     pub(crate) const fn badge(self) -> &'static str {
         match self {
@@ -127,6 +132,18 @@ impl Protocol {
             Self::Vnc => "VNC",
             Self::Spice => "SPICE",
             Self::Unknown => "?",
+        }
+    }
+
+    /// The wire tag the worker's `DesktopProtocol` serialises to (`snake_case`) —
+    /// the value the CHOOSER-8 add-source verb carries. `None` for the unknown
+    /// catch-all (a manual endpoint is only ever added over a known protocol).
+    const fn wire_tag(self) -> Option<&'static str> {
+        match self {
+            Self::Rdp => Some("rdp"),
+            Self::Vnc => Some("vnc"),
+            Self::Spice => Some("spice"),
+            Self::Unknown => None,
         }
     }
 
@@ -171,6 +188,10 @@ pub(crate) enum Reachability {
 }
 
 impl Reachability {
+    /// The states an operator can filter the grid to (CHOOSER-8) — every mirror
+    /// variant, so an `Unknown`/unverified endpoint is filterable too.
+    const ALL: [Self; 3] = [Self::Reachable, Self::Unreachable, Self::Unknown];
+
     /// The status-pip tone: live = OK, offline = danger, unverified = dim.
     const fn pip(self) -> egui::Color32 {
         match self {
@@ -186,6 +207,16 @@ impl Reachability {
             Self::Reachable => "reachable",
             Self::Unreachable => "offline",
             Self::Unknown => "unverified",
+        }
+    }
+
+    /// Sort rank for the CHOOSER-8 "status" ordering — reachable desktops float
+    /// first, unverified next, offline sinks to the bottom of its node group.
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Reachable => 0,
+            Self::Unknown => 1,
+            Self::Unreachable => 2,
         }
     }
 }
@@ -510,6 +541,267 @@ fn build_power_request(sources: &[DesktopSource], id: &str, op: PowerOp) -> Opti
     Some(op.to_request(&source.node, &source.name))
 }
 
+// ─────────────── CHOOSER-8: card actions + find + offline states ───────────────
+
+/// Typed verb: add a manual desktop source (`action/desktops/add-source`). MUST
+/// equal `mackesd::workers::desktop_sources::ADD_SOURCE_TOPIC` (cross-checked in
+/// tests). The card's Edit affordance republishes an edited manual endpoint over
+/// this verb (add is idempotent on the source id).
+const ADD_SOURCE_TOPIC: &str = "action/desktops/add-source";
+
+/// Typed verb: remove a previously-added manual source by id. MUST equal
+/// `mackesd::workers::desktop_sources::REMOVE_SOURCE_TOPIC`. Only a manual source
+/// is removable — the worker no-ops a non-manual id, and the card only offers the
+/// verb on manual origins (§7 — never a control that can't act).
+const REMOVE_SOURCE_TOPIC: &str = "action/desktops/remove-source";
+
+/// Typed verb: force a discovery re-enumerate + republish. MUST equal
+/// `mackesd::workers::desktop_sources::REFRESH_TOPIC`. The offline card's Retry
+/// affordance nudges this (a bodyless persist write) — never a shell-side probe
+/// (lock 14): the roster refreshes on the next poll, nothing blocks here.
+const REFRESH_TOPIC: &str = "action/desktops/refresh";
+
+/// The shell-side mirror of the worker's `ManualSource` — the typed body of an
+/// `action/desktops/add-source` request (§9: host + port + protocol, never a
+/// command string). Mirrored locally like [`VmPowerRequest`], so the worker's
+/// `parse_add_source` accepts it verbatim (§6 — the Bus JSON is the seam). An
+/// empty `name` is skipped so the worker defaults it to `host:port`.
+#[derive(Debug, Serialize)]
+struct AddSourceRequest {
+    /// Operator's display name, or `None` (worker defaults to `host:port`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    /// Host/IP to connect to.
+    host: String,
+    /// Port to connect to.
+    port: u16,
+    /// The protocol wire tag (`rdp` / `vnc` / `spice`).
+    protocol: &'static str,
+}
+
+/// The shell-side mirror of the worker's `RemoveSourceRequest` — the typed body
+/// of an `action/desktops/remove-source` request (the manual source id).
+#[derive(Debug, Serialize)]
+struct RemoveSourceRequest {
+    /// The `manual:<host>:<port>:<proto>` id to remove.
+    id: String,
+}
+
+impl AddSourceRequest {
+    /// Serialize to the request body (a fixed derive-backed shape — can't fail;
+    /// the worker rejects an empty body it never receives here).
+    fn to_body(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+impl RemoveSourceRequest {
+    /// Serialize to the request body.
+    fn to_body(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// Publish a typed desktop-management verb (`action/desktops/*`) via the
+/// persist-first path — the exact discipline as [`publish_power`] (§6): recorded
+/// locally + replicated by the Bus. `body` is the verb's JSON, or `None` for the
+/// bodyless refresh nudge. Records any failure in `last_error`; never panics,
+/// never blocks on a peer (lock 14). `noun` names the action in the honest
+/// no-Bus / failure message.
+fn publish_source_action(
+    bus_root: Option<&Path>,
+    last_error: &mut Option<String>,
+    topic: &str,
+    body: Option<&str>,
+    noun: &str,
+) {
+    let Some(root) = bus_root else {
+        *last_error = Some(format!("No mesh Bus directory — {noun} unavailable."));
+        return;
+    };
+    match mde_bus::persist::Persist::open(root.to_path_buf())
+        .and_then(|p| p.write(topic, mde_bus::hooks::config::Priority::Default, None, body))
+    {
+        Ok(_) => *last_error = None,
+        Err(e) => *last_error = Some(format!("Couldn't publish {noun}: {e}")),
+    }
+}
+
+/// How the filtered grid is ordered within each node group (CHOOSER-8). Favorites
+/// always float first (see [`order_members`]); this is the tiebreak below them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SortKey {
+    /// The worker's published order (grouped by node, then name) — the default,
+    /// a stable no-op tiebreak so the grid reads exactly as discovered.
+    #[default]
+    Discovered,
+    /// Name A→Z (case-insensitive) within the node group.
+    Name,
+    /// Reachable desktops first, offline last (by [`Reachability::rank`]).
+    Status,
+}
+
+impl SortKey {
+    /// Every sort key, for the picker.
+    const ALL: [Self; 3] = [Self::Discovered, Self::Name, Self::Status];
+
+    /// The picker caption.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Discovered => "As discovered",
+            Self::Name => "Name (A–Z)",
+            Self::Status => "Status (live first)",
+        }
+    }
+
+    /// The within-group ordering this key imposes (`Discovered` keeps the
+    /// published order via a stable no-op compare).
+    fn cmp_sources(self, a: &DesktopSource, b: &DesktopSource) -> Ordering {
+        match self {
+            Self::Discovered => Ordering::Equal,
+            Self::Name => a
+                .name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase()),
+            Self::Status => a.reachability.rank().cmp(&b.reachability.rank()),
+        }
+    }
+}
+
+/// The CHOOSER-8 live find controls: a free-text search plus the node / protocol
+/// / status / OS filters and the sort key. Applied as a **pure fold over the
+/// already-published roster** ([`FilterSort::matches`] + [`order_members`]) — the
+/// grid narrows live with no probe and no blocking (§6, lock 14). `None` on a
+/// filter means "any".
+#[derive(Debug, Clone, Default)]
+struct FilterSort {
+    /// Free-text query, matched case-insensitively across name / node / host / OS.
+    search: String,
+    /// Restrict to one node/host, or all.
+    node: Option<String>,
+    /// Restrict to sources offering this protocol, or any.
+    protocol: Option<Protocol>,
+    /// Restrict to this reachability, or any.
+    status: Option<Reachability>,
+    /// Restrict to this OS hint, or any.
+    os: Option<String>,
+    /// The within-group ordering.
+    sort: SortKey,
+}
+
+impl FilterSort {
+    /// Whether this source passes every active filter + the search — the pure
+    /// predicate the grid narrows through (tested headless).
+    fn matches(&self, s: &DesktopSource) -> bool {
+        let q = self.search.trim().to_ascii_lowercase();
+        if !q.is_empty() {
+            let hit = s.name.to_ascii_lowercase().contains(&q)
+                || s.node.to_ascii_lowercase().contains(&q)
+                || s.host.to_ascii_lowercase().contains(&q)
+                || s.os_hint
+                    .as_deref()
+                    .is_some_and(|o| o.to_ascii_lowercase().contains(&q));
+            if !hit {
+                return false;
+            }
+        }
+        if let Some(node) = self.node.as_deref() {
+            if !s.node.eq_ignore_ascii_case(node) {
+                return false;
+            }
+        }
+        if let Some(proto) = self.protocol {
+            if !s.protocols.iter().any(|o| o.protocol == proto) {
+                return false;
+            }
+        }
+        if let Some(status) = self.status {
+            if s.reachability != status {
+                return false;
+            }
+        }
+        if let Some(os) = self.os.as_deref() {
+            if s.os_hint.as_deref() != Some(os) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether any filter/search is narrowing the grid — drives the "Clear"
+    /// affordance and the "no match" (vs genuinely empty) copy.
+    fn is_active(&self) -> bool {
+        !self.search.trim().is_empty()
+            || self.node.is_some()
+            || self.protocol.is_some()
+            || self.status.is_some()
+            || self.os.is_some()
+    }
+
+    /// Drop every filter + the search (keeps the sort key — an ordering
+    /// preference, not a narrowing).
+    fn clear(&mut self) {
+        self.search.clear();
+        self.node = None;
+        self.protocol = None;
+        self.status = None;
+        self.os = None;
+    }
+}
+
+/// Order one node group's members: favorites float to the top (a shell-local
+/// view preference), then the [`SortKey`] tiebreak — a **stable** sort, so
+/// `Discovered` preserves the worker's published order exactly. Pure + tested.
+fn order_members(members: &mut [&DesktopSource], sort: SortKey, favorites: &HashSet<String>) {
+    members.sort_by(|a, b| {
+        let fav_a = favorites.contains(&a.id);
+        let fav_b = favorites.contains(&b.id);
+        fav_b.cmp(&fav_a).then_with(|| sort.cmp_sources(a, b))
+    });
+}
+
+/// The distinct nodes present in the roster, in first-seen (published) order —
+/// the node filter's option list.
+fn distinct_nodes(sources: &[DesktopSource]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    sources
+        .iter()
+        .filter(|s| seen.insert(s.node.to_ascii_lowercase()))
+        .map(|s| s.node.clone())
+        .collect()
+}
+
+/// The distinct OS hints present in the roster, in first-seen order — the OS
+/// filter's option list (absent when no source carries an OS hint).
+fn distinct_os(sources: &[DesktopSource]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    sources
+        .iter()
+        .filter_map(|s| s.os_hint.as_deref())
+        .filter(|o| seen.insert(o.to_string()))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The in-progress manual-source edit (CHOOSER-8, context-menu → Edit). Seeded
+/// from the source's current fields; Save republishes it through the worker's
+/// typed verbs — remove the old id, add the edited endpoint (§6, never a command
+/// string). Only manual sources are editable (their fields are the operator's).
+struct ManualEdit {
+    /// The manual source id being edited — the remove key + vanish guard.
+    original_id: String,
+    /// Editable display name (empty → the worker defaults it to `host:port`).
+    name: String,
+    /// Editable host/IP.
+    host: String,
+    /// Editable port (a string buffer; parsed + non-zero-checked on Save).
+    port: String,
+    /// Editable protocol.
+    protocol: Protocol,
+    /// An inline validation error (empty host / bad port) — never a silent drop.
+    error: Option<String>,
+}
+
 // ───────────────────── CHOOSER-3: the thumbnail cache ─────────────────────
 
 /// One cached thumbnail slot for a source id.
@@ -805,6 +1097,17 @@ pub(crate) struct ChooserState {
     /// CHOOSER-3 — the bounded, throttled decode cache backing the card
     /// thumbnail wells (source `thumbnail_ref` → egui texture).
     thumbs: ThumbnailCache,
+    /// CHOOSER-8 — the live find controls (search + node/protocol/status/OS
+    /// filters + sort). A pure fold over the published roster; never a probe.
+    filter: FilterSort,
+    /// CHOOSER-8 — the operator's pinned/favorite source ids. A pin floats a card
+    /// to the front of its node group and marks it — a shell-local view
+    /// preference (session-scoped; CHOOSER-9 lifts it onto the synced plane), not
+    /// a roster mutation.
+    favorites: HashSet<String>,
+    /// CHOOSER-8 — the in-progress manual-source edit (context-menu → Edit), or
+    /// `None`. Mutually exclusive with the connect picker.
+    manual_edit: Option<ManualEdit>,
 }
 
 impl Default for ChooserState {
@@ -843,6 +1146,9 @@ impl ChooserState {
             pending: None,
             connect: None,
             thumbs: ThumbnailCache::default(),
+            filter: FilterSort::default(),
+            favorites: HashSet::new(),
+            manual_edit: None,
         }
     }
 
@@ -928,6 +1234,9 @@ impl ChooserState {
         if !source.connectable() {
             return;
         }
+        // The connect picker and the manual-source edit form are mutually
+        // exclusive — opening one closes the other.
+        self.manual_edit = None;
         // The routable offers seed the picker; with none, there is nothing to
         // connect to — say so rather than raise an empty picker (§7).
         let Some(first) = source.protocols.iter().find_map(|o| o.protocol.route()) else {
@@ -1048,6 +1357,211 @@ impl ChooserState {
                     source.node,
                 ));
             }
+        }
+    }
+
+    /// CHOOSER-8 — toggle a source's favorite/pin. A pinned card floats to the
+    /// front of its node group and shows a pin marker; a shell-local view
+    /// preference, never a roster mutation.
+    fn toggle_favorite(&mut self, id: String) {
+        if !self.favorites.remove(&id) {
+            self.favorites.insert(id);
+        }
+    }
+
+    /// CHOOSER-8 — the offline card's Retry affordance (lock 14): nudge the
+    /// discovery worker to re-enumerate + republish by publishing the bodyless
+    /// `action/desktops/refresh` verb. This is the HONEST non-blocking retry — the
+    /// shell never probes the endpoint or blocks; the greyed card simply reflects
+    /// the fresh roster on the next 5 s poll. A publish failure surfaces on
+    /// `last_error`, never a panic.
+    fn retry_discovery(&mut self, sources: &[DesktopSource], id: &str) {
+        publish_source_action(
+            self.bus_root.as_deref(),
+            &mut self.last_error,
+            REFRESH_TOPIC,
+            Some(""),
+            "discovery refresh",
+        );
+        if self.last_error.is_none() {
+            let name = sources
+                .iter()
+                .find(|s| s.id == id)
+                .map_or("the endpoint", |s| s.name.as_str());
+            self.note = Some(format!(
+                "Re-checking discovery for {name} — the roster refreshes in a moment; \
+                 nothing is probed from here.",
+            ));
+        }
+    }
+
+    /// CHOOSER-8 — remove a manual source (context-menu → Remove, manual origins
+    /// only): publish the `action/desktops/remove-source` verb keyed on the source
+    /// id. A non-manual id is a no-op here (the card never offers the verb on a
+    /// discovered source, and the worker no-ops it too — §7). The roster drops the
+    /// card on the next poll; a publish failure surfaces on `last_error`.
+    fn remove_source(&mut self, sources: &[DesktopSource], id: &str) {
+        let Some(source) = sources.iter().find(|s| s.id == id) else {
+            return;
+        };
+        if source.origin != SourceOrigin::Manual {
+            return;
+        }
+        let body = RemoveSourceRequest { id: id.to_string() }.to_body();
+        publish_source_action(
+            self.bus_root.as_deref(),
+            &mut self.last_error,
+            REMOVE_SOURCE_TOPIC,
+            Some(&body),
+            "manual-source removal",
+        );
+        self.favorites.remove(id);
+        if self
+            .manual_edit
+            .as_ref()
+            .is_some_and(|e| e.original_id == id)
+        {
+            self.manual_edit = None;
+        }
+        if self.last_error.is_none() {
+            self.note = Some(format!(
+                "Removing {} — it drops from the roster on the next refresh.",
+                source.name,
+            ));
+        }
+    }
+
+    /// CHOOSER-8 — open the manual-source edit form (context-menu → Edit, manual
+    /// origins only), seeded from the source's current fields. Mutually exclusive
+    /// with the connect picker.
+    fn begin_edit(&mut self, sources: &[DesktopSource], id: &str) {
+        let Some(source) = sources.iter().find(|s| s.id == id) else {
+            return;
+        };
+        if source.origin != SourceOrigin::Manual {
+            return;
+        }
+        let offer = source.protocols.first();
+        // A manual source's display name defaults to `host:port` worker-side; seed
+        // the field empty in that case so an unchanged Save re-defaults it.
+        let default_name = offer.map_or_else(
+            || source.host.clone(),
+            |o| format!("{}:{}", source.host, o.port.unwrap_or_default()),
+        );
+        let name = if source.name == default_name {
+            String::new()
+        } else {
+            source.name.clone()
+        };
+        self.pending = None;
+        self.manual_edit = Some(ManualEdit {
+            original_id: source.id.clone(),
+            name,
+            host: source.host.clone(),
+            port: offer
+                .and_then(|o| o.port)
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+            protocol: offer.map_or(Protocol::Rdp, |o| o.protocol),
+            error: None,
+        });
+    }
+
+    /// CHOOSER-8 — the operator backed out of the edit form.
+    fn cancel_manual_edit(&mut self) {
+        self.manual_edit = None;
+    }
+
+    /// CHOOSER-8 — Save the edited manual source: validate host + port, then
+    /// republish through the worker's typed verbs — remove the old id, add the
+    /// edited endpoint (§6; add is idempotent on the new id). A bad host/port sets
+    /// the form's inline error and does NOT publish; a publish failure surfaces on
+    /// `last_error`. The roster reflects the change on the next poll.
+    fn save_manual_edit(&mut self, sources: &[DesktopSource]) {
+        // Read the draft's fields into owned locals FIRST, so the `self.manual_edit`
+        // borrow is dropped before any publish / error re-borrow (borrow clean).
+        let Some(edit) = self.manual_edit.as_ref() else {
+            return;
+        };
+        // The source can move under the form; if it vanished, drop the edit.
+        if !sources.iter().any(|s| s.id == edit.original_id) {
+            self.manual_edit = None;
+            return;
+        }
+        let host = edit.host.trim().to_string();
+        let port_str = edit.port.trim().to_string();
+        let name = {
+            let n = edit.name.trim();
+            (!n.is_empty()).then(|| n.to_string())
+        };
+        let protocol = edit.protocol;
+        let original_id = edit.original_id.clone();
+
+        // Validate host + port; a failure sets the form's inline error and does
+        // NOT publish (§7 — never a silent drop).
+        let validated_port: Result<u16, &str> = if host.is_empty() {
+            Err("Host must not be empty.")
+        } else {
+            match port_str.parse::<u16>() {
+                Ok(0) => Err("Port must be non-zero."),
+                Ok(p) => Ok(p),
+                Err(_) => Err("Port must be a number (1\u{2013}65535)."),
+            }
+        };
+        let port = match validated_port {
+            Ok(p) => p,
+            Err(msg) => {
+                if let Some(e) = self.manual_edit.as_mut() {
+                    e.error = Some(msg.to_string());
+                }
+                return;
+            }
+        };
+        let Some(protocol_tag) = protocol.wire_tag() else {
+            if let Some(e) = self.manual_edit.as_mut() {
+                e.error = Some("Pick a connectable protocol.".to_string());
+            }
+            return;
+        };
+        // Remove the old id, then add the edited endpoint (the worker keys manual
+        // sources on `host:port:proto`, so an edit is a remove + add).
+        let remove_body = RemoveSourceRequest {
+            id: original_id.clone(),
+        }
+        .to_body();
+        publish_source_action(
+            self.bus_root.as_deref(),
+            &mut self.last_error,
+            REMOVE_SOURCE_TOPIC,
+            Some(&remove_body),
+            "manual-source edit",
+        );
+        if self.last_error.is_some() {
+            return;
+        }
+        let add_body = AddSourceRequest {
+            name: name.clone(),
+            host: host.clone(),
+            port,
+            protocol: protocol_tag,
+        }
+        .to_body();
+        publish_source_action(
+            self.bus_root.as_deref(),
+            &mut self.last_error,
+            ADD_SOURCE_TOPIC,
+            Some(&add_body),
+            "manual-source edit",
+        );
+        if self.last_error.is_none() {
+            let shown = name.unwrap_or_else(|| format!("{host}:{port}"));
+            self.note = Some(format!(
+                "Updated {shown} ({} \u{00B7} {host}:{port}) — the roster reflects the edit on \
+                 the next refresh.",
+                protocol_tag.to_ascii_uppercase(),
+            ));
+            self.favorites.remove(&original_id);
+            self.manual_edit = None;
         }
     }
 
@@ -1192,6 +1706,18 @@ enum CardAction {
         /// The lifecycle op the button maps to.
         op: PowerOp,
     },
+    /// CHOOSER-8 — pin/unpin a card (float it first in its node group).
+    ToggleFavorite(String),
+    /// CHOOSER-8 — the offline card's Retry: nudge a discovery re-enumerate.
+    Retry(String),
+    /// CHOOSER-8 — open the manual-source edit form (manual origins only).
+    EditSource(String),
+    /// CHOOSER-8 — remove a manual source (manual origins only).
+    RemoveSource(String),
+    /// CHOOSER-8 — the manual-source edit form was confirmed.
+    SaveEdit,
+    /// CHOOSER-8 — the manual-source edit form was dismissed.
+    CancelEdit,
 }
 
 /// Render the Chooser into `ui`: the BRAND-1 backdrop first (full hero +
@@ -1231,9 +1757,20 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
     );
     ui.add_space(Style::SP_XS);
 
+    // CHOOSER-8 — the live find controls (search + node/protocol/status/OS
+    // filters + sort). Its option lists come from the roster, and it mutates the
+    // live filter BEFORE the render fold clones it, so the grid narrows this same
+    // frame — a pure fold, never a probe (§6, lock 14).
+    let nodes = distinct_nodes(&sources);
+    let oses = distinct_os(&sources);
+    filter_bar(ui, &mut state.filter, &nodes, &oses);
+    ui.add_space(Style::SP_XS);
+
     // Pull the state fields the grid closure reads out to locals FIRST, then
-    // borrow `thumbs` + `pending` mutably — so the closure captures only owned
-    // values + two disjoint `&mut` fields, never `state` wholesale (borrow clean).
+    // borrow the disjoint `&mut` fields — so the closure captures only owned
+    // values + those fields, never `state` wholesale (borrow clean).
+    let filter = state.filter.clone();
+    let favorites = state.favorites.clone();
     let pending_id = state.pending.as_ref().map(|d| d.source_id.clone());
     let note = state.note.clone();
     // CHOOSER-7 — the honest no-local-hypervisor gate, read once from the roster's
@@ -1255,57 +1792,25 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
         .unwrap_or_default();
     let thumbs = &mut state.thumbs;
     let pending_draft = &mut state.pending;
+    let edit_draft = &mut state.manual_edit;
 
     let mut action: Option<CardAction> = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for (node, members) in group_by_node(&sources) {
-                // The node/host group header (design lock 3).
-                ui.add_space(Style::SP_S);
-                ui.label(
-                    RichText::new(node)
-                        .color(Style::TEXT)
-                        .size(Style::BODY)
-                        .strong(),
-                );
-                ui.add_space(Style::SP_XS);
-                ui.horizontal_wrapped(|ui| {
-                    for source in members {
-                        let pending = pending_id.as_deref() == Some(source.id.as_str());
-                        if let Some(a) =
-                            source_card(ui, source, pending, thumbs, power_gate.as_deref())
-                        {
-                            action = Some(a);
-                        }
-                        ui.add_space(Style::SP_S);
-                    }
-                });
-            }
-
-            // The CHOOSER-4 always-ask connect picker — nothing connects unless
-            // the operator confirms it (lock 6). The radios mutate the live draft.
-            if let Some(draft) = pending_draft.as_mut() {
-                if let Some(source) = sources.iter().find(|s| s.id == draft.source_id) {
-                    if let Some(a) = connect_picker(ui, source, draft) {
-                        action = Some(a);
-                    }
-                }
-            }
-
-            if let Some(note) = note.as_deref() {
-                ui.add_space(Style::SP_S);
-                muted_note(ui, note);
-            }
-
-            // Degraded discovery lanes, named under the grid (§7 — a lane
-            // that found nothing says why, instead of silently omitting).
-            if !degraded.is_empty() {
-                ui.add_space(Style::SP_S);
-                for line in degraded {
-                    muted_note(ui, line);
-                }
-            }
+            action = chooser_grid(
+                ui,
+                &sources,
+                &filter,
+                &favorites,
+                pending_id.as_deref(),
+                note.as_deref(),
+                power_gate.as_deref(),
+                &degraded,
+                thumbs,
+                pending_draft,
+                edit_draft,
+            );
         });
 
     match action {
@@ -1313,33 +1818,239 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
         Some(CardAction::Confirm) => state.confirm_connect(&sources),
         Some(CardAction::Cancel) => state.cancel_connect(),
         Some(CardAction::Power { id, op }) => state.power_action(&sources, &id, op),
+        Some(CardAction::ToggleFavorite(id)) => state.toggle_favorite(id),
+        Some(CardAction::Retry(id)) => state.retry_discovery(&sources, &id),
+        Some(CardAction::EditSource(id)) => state.begin_edit(&sources, &id),
+        Some(CardAction::RemoveSource(id)) => state.remove_source(&sources, &id),
+        Some(CardAction::SaveEdit) => state.save_manual_edit(&sources),
+        Some(CardAction::CancelEdit) => state.cancel_manual_edit(),
         None => {}
     }
+}
+
+/// The scrollable grid body: the CHOOSER-8 live narrowing (filter → node groups
+/// ordered favorites-first + by the sort key), the "no match" copy when a filter
+/// zeroes the roster, the CHOOSER-4 connect picker, the CHOOSER-8 manual-source
+/// edit form, and the honest note + degraded-lane lines. Returns the one card
+/// action chosen this frame (applied by [`chooser_panel`] after the render).
+#[allow(clippy::too_many_arguments)]
+fn chooser_grid(
+    ui: &mut egui::Ui,
+    sources: &[DesktopSource],
+    filter: &FilterSort,
+    favorites: &HashSet<String>,
+    pending_id: Option<&str>,
+    note: Option<&str>,
+    power_gate: Option<&str>,
+    degraded: &[String],
+    thumbs: &mut ThumbnailCache,
+    pending_draft: &mut Option<ConnectDraft>,
+    edit_draft: &mut Option<ManualEdit>,
+) -> Option<CardAction> {
+    let mut action: Option<CardAction> = None;
+
+    // CHOOSER-8 — the live narrowing: filter the roster, then group by node (a
+    // filtered subsequence of the worker-sorted roster stays sorted, so
+    // consecutive runs are preserved) and order each group favorites-first + by
+    // the sort key.
+    let visible: Vec<DesktopSource> = sources
+        .iter()
+        .filter(|s| filter.matches(s))
+        .cloned()
+        .collect();
+
+    if visible.is_empty() {
+        ui.add_space(Style::SP_S);
+        muted_note(
+            ui,
+            "No desktop matches the current search and filters — clear them to see the whole \
+             roster.",
+        );
+    }
+
+    for (node, mut members) in group_by_node(&visible) {
+        order_members(&mut members, filter.sort, favorites);
+        // The node/host group header (design lock 3).
+        ui.add_space(Style::SP_S);
+        ui.label(
+            RichText::new(node)
+                .color(Style::TEXT)
+                .size(Style::BODY)
+                .strong(),
+        );
+        ui.add_space(Style::SP_XS);
+        ui.horizontal_wrapped(|ui| {
+            for source in members {
+                let pending = pending_id == Some(source.id.as_str());
+                let favorite = favorites.contains(&source.id);
+                if let Some(a) = source_card(ui, source, pending, favorite, thumbs, power_gate) {
+                    action = Some(a);
+                }
+                ui.add_space(Style::SP_S);
+            }
+        });
+    }
+
+    // The CHOOSER-4 always-ask connect picker — nothing connects unless the
+    // operator confirms it (lock 6). The radios mutate the live draft.
+    if let Some(draft) = pending_draft.as_mut() {
+        if let Some(source) = sources.iter().find(|s| s.id == draft.source_id) {
+            if let Some(a) = connect_picker(ui, source, draft) {
+                action = Some(a);
+            }
+        }
+    }
+
+    // CHOOSER-8 — the manual-source edit form (mutually exclusive with the connect
+    // picker). Its fields mutate the live edit draft; Save republishes through the
+    // worker's typed verbs.
+    if let Some(edit) = edit_draft.as_mut() {
+        if sources.iter().any(|s| s.id == edit.original_id) {
+            if let Some(a) = manual_edit_form(ui, edit) {
+                action = Some(a);
+            }
+        }
+    }
+
+    if let Some(note) = note {
+        ui.add_space(Style::SP_S);
+        muted_note(ui, note);
+    }
+
+    // Degraded discovery lanes, named under the grid (§7 — a lane that found
+    // nothing says why, instead of silently omitting).
+    if !degraded.is_empty() {
+        ui.add_space(Style::SP_S);
+        for line in degraded {
+            muted_note(ui, line);
+        }
+    }
+
+    action
+}
+
+/// The CHOOSER-8 find bar: a search box + the node / protocol / status / OS
+/// filters + the sort key, all `Style`-tokened (§4). Every control mutates the
+/// live `filter` in place, so the grid narrows on the same frame — a pure fold
+/// over the published roster (§6). `nodes` / `oses` are the roster's distinct
+/// values (the combo option lists); the OS combo is omitted when no source
+/// carries an OS hint. A Clear button appears while any filter is active.
+fn filter_bar(ui: &mut egui::Ui, filter: &mut FilterSort, nodes: &[String], oses: &[String]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut filter.search)
+                .desired_width(Style::SP_XL * 5.0)
+                .hint_text("Search name / node / OS…"),
+        );
+        ui.add_space(Style::SP_S);
+
+        // Node filter.
+        egui::ComboBox::from_id_salt("chooser-filter-node")
+            .selected_text(filter.node.as_deref().unwrap_or("All nodes"))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut filter.node, None, "All nodes");
+                for node in nodes {
+                    ui.selectable_value(&mut filter.node, Some(node.clone()), node);
+                }
+            });
+        ui.add_space(Style::SP_S);
+
+        // Protocol filter.
+        egui::ComboBox::from_id_salt("chooser-filter-proto")
+            .selected_text(filter.protocol.map_or("Any protocol", Protocol::badge))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut filter.protocol, None, "Any protocol");
+                for proto in Protocol::ALL {
+                    ui.selectable_value(&mut filter.protocol, Some(proto), proto.badge());
+                }
+            });
+        ui.add_space(Style::SP_S);
+
+        // Status filter.
+        egui::ComboBox::from_id_salt("chooser-filter-status")
+            .selected_text(filter.status.map_or("Any status", Reachability::label))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut filter.status, None, "Any status");
+                for status in Reachability::ALL {
+                    ui.selectable_value(&mut filter.status, Some(status), status.label());
+                }
+            });
+        ui.add_space(Style::SP_S);
+
+        // OS filter — only when the roster carries OS hints.
+        if !oses.is_empty() {
+            egui::ComboBox::from_id_salt("chooser-filter-os")
+                .selected_text(filter.os.as_deref().unwrap_or("Any OS"))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut filter.os, None, "Any OS");
+                    for os in oses {
+                        ui.selectable_value(&mut filter.os, Some(os.clone()), os);
+                    }
+                });
+            ui.add_space(Style::SP_S);
+        }
+
+        // Sort key.
+        ui.label(
+            RichText::new("Sort")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        egui::ComboBox::from_id_salt("chooser-sort")
+            .selected_text(filter.sort.label())
+            .show_ui(ui, |ui| {
+                for key in SortKey::ALL {
+                    ui.selectable_value(&mut filter.sort, key, key.label());
+                }
+            });
+
+        // Clear — only while something is narrowing the grid.
+        if filter.is_active() {
+            ui.add_space(Style::SP_S);
+            if ui
+                .button(RichText::new("Clear").size(Style::SMALL))
+                .clicked()
+            {
+                filter.clear();
+            }
+        }
+    });
+}
+
+/// The inline controls a card's body surfaced this frame (CHOOSER-7/8): a power
+/// op clicked, and/or the offline Retry affordance. Reconciled against the card's
+/// primary click + its context menu by [`source_card`].
+#[derive(Default)]
+struct CardControls {
+    /// A CHOOSER-7 local-VM power op clicked this frame.
+    power: Option<PowerOp>,
+    /// The CHOOSER-8 offline Retry button was clicked.
+    retry: bool,
 }
 
 /// Render one desktop card: the thumbnail well (the decoded live preview, or the
 /// honest monitor-icon fallback), the display name, the VM power state when there
 /// is one, the protocol badge row, and the status pip — greyed with the worker's
-/// reason when the source is offline (lock 14). Returns the activate action when
-/// the card is clicked.
+/// reason when the source is offline (lock 14), with a pin marker when favorited
+/// (CHOOSER-8). A left click on a connectable card activates it; a right click
+/// raises the per-card context menu (CHOOSER-8). Returns the chosen action.
 fn source_card(
     ui: &mut egui::Ui,
     source: &DesktopSource,
     pending: bool,
+    favorite: bool,
     thumbs: &mut ThumbnailCache,
     gate: Option<&str>,
 ) -> Option<CardAction> {
     let card = egui::vec2(CARD_WIDTH, CARD_HEIGHT);
-    // Activating a connectable card opens its console (the VDI connect path); an
-    // offline card senses hover only. Its power buttons stay live regardless.
-    let sense = if source.connectable() {
-        Sense::click()
-    } else {
-        Sense::hover()
-    };
+    // Every card senses clicks so it can raise the CHOOSER-8 context menu (right
+    // click) — but only a connectable card's primary click ACTIVATES (an offline
+    // card's left click is a no-op; its Retry/context menu drive it). Its inline
+    // buttons stay live regardless.
+    let sense = Sense::click();
     // The whole card is ONE interactive container. `UiBuilder::sense` registers the
-    // card's click BELOW any widget inside it, so a power button (added within)
-    // receives its own click instead — a Stop/Pause tap never doubles as a
+    // card's click BELOW any widget inside it, so a power/Retry button (added
+    // within) receives its own click instead — a Stop/Pause tap never doubles as a
     // console-open activate (the CHOOSER-7 co-existence, egui's documented idiom).
     let scoped = ui.scope_builder(egui::UiBuilder::new().sense(sense), |ui| {
         // Reserve exactly the card so the grid stays regular; the plate is painted
@@ -1369,6 +2080,16 @@ fn source_card(
             Stroke::new(1.0, border),
             StrokeKind::Inside,
         );
+        // CHOOSER-8 — the pin marker: a small accent dot in the top-right corner
+        // (a painter primitive, font-independent) at full strength even on a
+        // dimmed offline card.
+        if favorite {
+            ui.painter().circle_filled(
+                rect.right_top() + egui::vec2(-Style::SP_S, Style::SP_S),
+                Style::SP_XS * 0.75,
+                Style::ACCENT_HI,
+            );
+        }
 
         if !source.connectable() {
             ui.set_opacity(OFFLINE_OPACITY);
@@ -1384,19 +2105,88 @@ fn source_card(
         })
         .inner
     });
-    let power = scoped.inner;
+    let controls = scoped.inner;
     let response = scoped.response.on_hover_text(card_tooltip(source));
 
-    // A power click takes precedence over (and suppresses) the console-open.
-    if let Some(op) = power {
+    // CHOOSER-8 — the per-card context menu (right click). A menu pick takes
+    // precedence over the inline controls + the primary click.
+    let mut menu_action = None;
+    response.context_menu(|ui| card_context_menu(ui, source, favorite, &mut menu_action));
+    if menu_action.is_some() {
+        return menu_action;
+    }
+    // An inline button click takes precedence over (and suppresses) the console-open.
+    if let Some(op) = controls.power {
         return Some(CardAction::Power {
             id: source.id.clone(),
             op,
         });
     }
-    response
-        .clicked()
-        .then(|| CardAction::Activate(source.id.clone()))
+    if controls.retry {
+        return Some(CardAction::Retry(source.id.clone()));
+    }
+    // Only a connectable card's primary click activates (lock 14).
+    (response.clicked() && source.connectable()).then(|| CardAction::Activate(source.id.clone()))
+}
+
+/// The CHOOSER-8 per-card context menu: Connect (connectable only), Pin/Unpin,
+/// Retry discovery (offline only), the KVM power ops for a local VM (reusing the
+/// CHOOSER-7 state machine), and Edit / Remove for a manual source. Every item is
+/// offered only when it can genuinely act (§7). Writes the chosen action into
+/// `out` and closes the menu.
+fn card_context_menu(
+    ui: &mut egui::Ui,
+    source: &DesktopSource,
+    favorite: bool,
+    out: &mut Option<CardAction>,
+) {
+    if source.connectable() && ui.button("Connect…").clicked() {
+        *out = Some(CardAction::Activate(source.id.clone()));
+        ui.close_menu();
+    }
+    let pin_label = if favorite { "Unpin" } else { "Pin to front" };
+    if ui.button(pin_label).clicked() {
+        *out = Some(CardAction::ToggleFavorite(source.id.clone()));
+        ui.close_menu();
+    }
+    // The offline Retry (lock 14 — a non-blocking discovery re-enumerate, never a
+    // probe from here).
+    if !source.connectable() && ui.button("Retry discovery").clicked() {
+        *out = Some(CardAction::Retry(source.id.clone()));
+        ui.close_menu();
+    }
+    // KVM power — the CHOOSER-7 state-appropriate ops, only for a local VM.
+    if source.origin == SourceOrigin::LocalVm {
+        let ops = source
+            .power_state
+            .as_deref()
+            .map_or(PowerState::Unknown, PowerState::from_wire)
+            .actions();
+        if !ops.is_empty() {
+            ui.separator();
+            for op in ops {
+                if ui.button(op.label()).clicked() {
+                    *out = Some(CardAction::Power {
+                        id: source.id.clone(),
+                        op: *op,
+                    });
+                    ui.close_menu();
+                }
+            }
+        }
+    }
+    // Manage a manual (operator-added) source.
+    if source.origin == SourceOrigin::Manual {
+        ui.separator();
+        if ui.button("Edit…").clicked() {
+            *out = Some(CardAction::EditSource(source.id.clone()));
+            ui.close_menu();
+        }
+        if ui.button("Remove").clicked() {
+            *out = Some(CardAction::RemoveSource(source.id.clone()));
+            ui.close_menu();
+        }
+    }
 }
 
 /// The card's thumbnail well: the source's decoded live preview when its
@@ -1433,14 +2223,15 @@ fn fit_centered(bounds: egui::Rect, img: egui::Vec2) -> egui::Rect {
     egui::Rect::from_center_size(bounds.center(), egui::vec2(img.x * scale, img.y * scale))
 }
 
-/// The card's content rows, top to bottom inside the plate. Returns the power op
-/// clicked this frame on a local-VM card (CHOOSER-7), if any.
+/// The card's content rows, top to bottom inside the plate. Returns the inline
+/// controls surfaced this frame — a CHOOSER-7 power op on a local-VM card, and/or
+/// the CHOOSER-8 offline Retry.
 fn card_body(
     ui: &mut egui::Ui,
     source: &DesktopSource,
     thumbs: &mut ThumbnailCache,
     gate: Option<&str>,
-) -> Option<PowerOp> {
+) -> CardControls {
     thumbnail_well(ui, source, thumbs);
     ui.add_space(Style::SP_XS);
 
@@ -1495,14 +2286,32 @@ fn card_body(
         }
     });
 
+    let mut controls = CardControls::default();
+
     // CHOOSER-7 — the local-VM power controls. Only a local VM (this node's
     // libvirt) is powered from here; a peer VM is powered from its own node.
     if source.origin == SourceOrigin::LocalVm {
         ui.add_space(Style::SP_XS);
-        power_row(ui, source, gate)
-    } else {
-        None
+        controls.power = power_row(ui, source, gate);
     }
+
+    // CHOOSER-8 — the offline Retry affordance (lock 14). A local VM already
+    // exposes its Start button (the bring-online path), so Retry is offered on the
+    // OTHER offline cards (a peer/LAN endpoint) — a non-blocking discovery
+    // re-enumerate, never a probe. It reads at full strength on the dimmed card.
+    if !source.connectable() && source.origin != SourceOrigin::LocalVm {
+        ui.add_space(Style::SP_XS);
+        ui.set_opacity(1.0);
+        if ui
+            .add(egui::Button::new(RichText::new("Retry").size(Style::SMALL)))
+            .on_hover_text("Re-check discovery — nothing is probed from here")
+            .clicked()
+        {
+            controls.retry = true;
+        }
+    }
+
+    controls
 }
 
 /// The local-VM power-control row (CHOOSER-7): buttons appropriate to the VM's
@@ -1737,6 +2546,84 @@ fn credential_prompt_fields(ui: &mut egui::Ui, prompt: &mut CredentialPrompt) {
                 .password(true),
         );
     });
+}
+
+/// The CHOOSER-8 manual-source edit form (context-menu → Edit): editable name /
+/// host / port / protocol with an inline validation error, then Save / Cancel.
+/// Save republishes through the worker's typed add/remove verbs (§6, never a
+/// command string). The fields mutate the live `edit` draft; §4 `Style` tokens
+/// throughout. Returns the save/cancel action.
+fn manual_edit_form(ui: &mut egui::Ui, edit: &mut ManualEdit) -> Option<CardAction> {
+    let mut action = None;
+    ui.add_space(Style::SP_M);
+    ui.separator();
+    ui.add_space(Style::SP_S);
+    ui.label(
+        RichText::new("Edit manual desktop")
+            .color(Style::TEXT)
+            .size(Style::BODY)
+            .strong(),
+    );
+    ui.add_space(Style::SP_XS);
+
+    edit_field(
+        ui,
+        "Name",
+        &mut edit.name,
+        "optional \u{2014} defaults to host:port",
+    );
+    edit_field(ui, "Host", &mut edit.host, "10.0.0.5 or host.local");
+    edit_field(ui, "Port", &mut edit.port, "3389");
+
+    // Protocol radio row (rdp / vnc / spice).
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Protocol")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        for proto in Protocol::ALL {
+            ui.radio_value(&mut edit.protocol, proto, proto.badge());
+        }
+    });
+
+    // The inline validation error (empty host / bad port) — never a silent drop.
+    if let Some(err) = edit.error.as_deref() {
+        ui.add_space(Style::SP_XS);
+        ui.colored_label(Style::DANGER, err);
+    }
+
+    ui.add_space(Style::SP_S);
+    ui.horizontal(|ui| {
+        if ui.button(RichText::new("Save").size(Style::BODY)).clicked() {
+            action = Some(CardAction::SaveEdit);
+        }
+        ui.add_space(Style::SP_S);
+        if ui
+            .button(RichText::new("Cancel").size(Style::BODY))
+            .clicked()
+        {
+            action = Some(CardAction::CancelEdit);
+        }
+    });
+    action
+}
+
+/// One labelled single-line edit row for the manual-source form (§4 tokens).
+fn edit_field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(label)
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add(
+            egui::TextEdit::singleline(value)
+                .desired_width(Style::SP_XL * 6.0)
+                .hint_text(hint),
+        );
+    });
+    ui.add_space(Style::SP_XS);
 }
 
 // ───────────────────────────── tests ─────────────────────────────
@@ -2872,6 +3759,505 @@ mod tests {
         assert!(
             run_panel(&mut cs),
             "the gated power row produced no draw primitives"
+        );
+    }
+
+    // ── CHOOSER-8: card actions + find + non-blocking offline states ──
+
+    /// A manual (operator-added) source row in the aggregator's `source_from_manual`
+    /// shape — origin `Manual`, never probed (an honest `Unknown` reachability).
+    fn manual_source(host: &str, port: u16, proto: Protocol) -> DesktopSource {
+        DesktopSource {
+            id: format!("manual:{host}:{port}:{}", proto.wire_tag().unwrap_or("?")),
+            name: format!("{host}:{port}"),
+            node: host.to_string(),
+            host: host.to_string(),
+            protocols: vec![ProtocolOffer {
+                protocol: proto,
+                port: Some(port),
+            }],
+            origin: SourceOrigin::Manual,
+            reachability: Reachability::Unknown,
+            reason: None,
+            os_hint: None,
+            power_state: None,
+            thumbnail_ref: None,
+        }
+    }
+
+    /// [`state_with`] over an explicit publish Bus root (a real temp spool) so the
+    /// CHOOSER-8 verbs can be read back off the topic they land on.
+    fn state_with_bus(
+        state: Option<DesktopSourcesState>,
+        bus_root: Option<PathBuf>,
+    ) -> ChooserState {
+        let mut s = ChooserState::with_client(
+            Box::new(FakeSources(state)),
+            bus_root,
+            "client-node".to_string(),
+            Box::new(MeshCredentialStore),
+        );
+        s.refresh();
+        s
+    }
+
+    /// A unique temp Bus dir (the crate's `std::env::temp_dir()` idiom — no
+    /// `tempfile` dep), cleaned up by each test that uses it.
+    fn temp_bus_dir(tag: &str) -> PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("mde-chooser8-{tag}-{n}"))
+    }
+
+    #[test]
+    fn the_desktop_action_topics_match_the_worker_contract() {
+        // Cross-check: MUST equal the mackesd desktop_sources worker's verb topics.
+        assert_eq!(ADD_SOURCE_TOPIC, "action/desktops/add-source");
+        assert_eq!(REMOVE_SOURCE_TOPIC, "action/desktops/remove-source");
+        assert_eq!(REFRESH_TOPIC, "action/desktops/refresh");
+    }
+
+    #[test]
+    fn add_and_remove_source_bodies_match_the_worker_shape() {
+        // The add-source body carries host + port + protocol (§9 — never a command
+        // string); an absent name is skipped so the worker defaults it to host:port.
+        let add = AddSourceRequest {
+            name: Some("OfficePC".to_string()),
+            host: "10.0.0.5".to_string(),
+            port: 3389,
+            protocol: "rdp",
+        };
+        let v: serde_json::Value = serde_json::from_str(&add.to_body()).unwrap();
+        assert_eq!(v["name"], "OfficePC");
+        assert_eq!(v["host"], "10.0.0.5");
+        assert_eq!(v["port"], 3389);
+        assert_eq!(v["protocol"], "rdp");
+        let bare = AddSourceRequest {
+            name: None,
+            host: "h".to_string(),
+            port: 1,
+            protocol: "vnc",
+        };
+        let v2: serde_json::Value = serde_json::from_str(&bare.to_body()).unwrap();
+        assert!(
+            v2.get("name").is_none(),
+            "a None name is skipped on the wire"
+        );
+        // The remove-source body is just the manual id.
+        let rm = RemoveSourceRequest {
+            id: "manual:h:1:vnc".to_string(),
+        };
+        let vr: serde_json::Value = serde_json::from_str(&rm.to_body()).unwrap();
+        assert_eq!(vr["id"], "manual:h:1:vnc");
+    }
+
+    #[test]
+    fn the_search_matches_name_node_host_and_os() {
+        let state = fixture_state();
+        let mut f = FilterSort::default();
+        let hits = |f: &FilterSort| -> Vec<String> {
+            state
+                .sources
+                .iter()
+                .filter(|s| f.matches(s))
+                .map(|s| s.id.clone())
+                .collect()
+        };
+        // Name substring (case-insensitive).
+        f.search = "office".to_string();
+        assert_eq!(hits(&f), vec!["mdns:192.168.1.60:3389:rdp"]);
+        // OS hint — only the peer seat carries "linux".
+        f.search = "LINUX".to_string();
+        assert_eq!(hits(&f), vec!["peer:oak"]);
+        // Node/host substring.
+        f.search = "192.168".to_string();
+        assert_eq!(hits(&f), vec!["mdns:192.168.1.60:3389:rdp"]);
+        // A blank/whitespace query matches the whole roster.
+        f.search = "   ".to_string();
+        assert_eq!(hits(&f).len(), 3);
+    }
+
+    #[test]
+    fn filters_narrow_by_node_protocol_status_and_os() {
+        let state = fixture_state();
+        let count = |f: &FilterSort| state.sources.iter().filter(|s| f.matches(s)).count();
+
+        assert_eq!(
+            count(&FilterSort {
+                node: Some("oak".to_string()),
+                ..Default::default()
+            }),
+            2,
+            "oak groups the seat + its VM"
+        );
+        assert_eq!(
+            count(&FilterSort {
+                protocol: Some(Protocol::Spice),
+                ..Default::default()
+            }),
+            1,
+            "only the VM offers Spice"
+        );
+        assert_eq!(
+            count(&FilterSort {
+                status: Some(Reachability::Reachable),
+                ..Default::default()
+            }),
+            2
+        );
+        assert_eq!(
+            count(&FilterSort {
+                status: Some(Reachability::Unreachable),
+                ..Default::default()
+            }),
+            1,
+            "the offline VM"
+        );
+        assert_eq!(
+            count(&FilterSort {
+                os: Some("linux".to_string()),
+                ..Default::default()
+            }),
+            1
+        );
+    }
+
+    #[test]
+    fn is_active_and_clear_reset_the_narrowing_but_keep_the_sort() {
+        let mut f = FilterSort::default();
+        assert!(!f.is_active(), "a default filter narrows nothing");
+        f.search = " win ".to_string();
+        assert!(f.is_active());
+        f.search.clear();
+        f.protocol = Some(Protocol::Rdp);
+        f.node = Some("oak".to_string());
+        assert!(f.is_active());
+        f.sort = SortKey::Name;
+        f.clear();
+        assert!(!f.is_active(), "clear drops every filter + the search");
+        assert_eq!(f.sort, SortKey::Name, "clear keeps the sort preference");
+    }
+
+    #[test]
+    fn distinct_nodes_and_os_feed_the_filter_combos() {
+        let state = fixture_state();
+        // First-seen (published) order, deduped case-insensitively.
+        assert_eq!(distinct_nodes(&state.sources), vec!["oak", "192.168.1.60"]);
+        assert_eq!(distinct_os(&state.sources), vec!["linux"]);
+    }
+
+    #[test]
+    fn order_members_floats_favorites_then_applies_the_sort_key() {
+        let zeta = source("peer:zeta", "n", &[Protocol::Rdp]);
+        let alpha = source("peer:alpha", "n", &[Protocol::Rdp]);
+        let mid = source("peer:mid", "n", &[Protocol::Rdp]);
+        let ids = |m: &[&DesktopSource]| m.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+
+        // `Discovered` is a stable no-op — the published order is preserved.
+        let mut m = vec![&zeta, &alpha, &mid];
+        order_members(&mut m, SortKey::Discovered, &HashSet::new());
+        assert_eq!(ids(&m), vec!["peer:zeta", "peer:alpha", "peer:mid"]);
+
+        // `Name` sorts A→Z within the group.
+        let mut m = vec![&zeta, &alpha, &mid];
+        order_members(&mut m, SortKey::Name, &HashSet::new());
+        assert_eq!(ids(&m), vec!["peer:alpha", "peer:mid", "peer:zeta"]);
+
+        // A favorite floats first, ahead of the sort key.
+        let favs: HashSet<String> = std::iter::once("peer:zeta".to_string()).collect();
+        let mut m = vec![&zeta, &alpha, &mid];
+        order_members(&mut m, SortKey::Name, &favs);
+        assert_eq!(ids(&m), vec!["peer:zeta", "peer:alpha", "peer:mid"]);
+    }
+
+    #[test]
+    fn the_status_sort_floats_reachable_before_offline() {
+        let mut up = source("peer:up", "n", &[Protocol::Rdp]);
+        up.reachability = Reachability::Reachable;
+        let mut down = source("peer:down", "n", &[Protocol::Rdp]);
+        down.reachability = Reachability::Unreachable;
+        let mut unk = source("peer:unk", "n", &[Protocol::Rdp]);
+        unk.reachability = Reachability::Unknown;
+        let mut m = vec![&down, &unk, &up];
+        order_members(&mut m, SortKey::Status, &HashSet::new());
+        assert_eq!(
+            m.iter().map(|s| s.reachability).collect::<Vec<_>>(),
+            vec![
+                Reachability::Reachable,
+                Reachability::Unknown,
+                Reachability::Unreachable
+            ]
+        );
+    }
+
+    #[test]
+    fn toggle_favorite_pins_then_unpins() {
+        let mut state = state_with(Some(roster(vec![source(
+            "peer:oak",
+            "oak",
+            &[Protocol::Rdp],
+        )])));
+        assert!(!state.favorites.contains("peer:oak"));
+        state.toggle_favorite("peer:oak".to_string());
+        assert!(state.favorites.contains("peer:oak"), "a pin adds it");
+        state.toggle_favorite("peer:oak".to_string());
+        assert!(
+            !state.favorites.contains("peer:oak"),
+            "a second toggle unpins"
+        );
+    }
+
+    #[test]
+    fn an_offline_card_offers_retry_not_a_blind_connect() {
+        // The non-blocking offline model: a click on the greyed card never connects
+        // nor opens the picker (lock 14); Retry drives a discovery re-enumerate.
+        let mut off = source("peer:ash", "ash", &[Protocol::Rdp]);
+        off.reachability = Reachability::Unreachable;
+        off.reason = Some("peer unreachable".to_string());
+        let mut state = state_with(Some(roster(vec![off])));
+        let sources = state.sources_snapshot();
+        state.activate(&sources, "peer:ash");
+        assert!(
+            state.pending.is_none() && state.take_connect().is_none(),
+            "a greyed card never connects"
+        );
+        // Retry reaches the refresh emitter (honest no-Bus error), returning at once
+        // — never a probe, never a block.
+        state.retry_discovery(&sources, "peer:ash");
+        assert!(state
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("Bus")));
+    }
+
+    #[test]
+    fn retry_discovery_writes_the_bodyless_refresh_verb() {
+        let dir = temp_bus_dir("retry");
+        let mut off = source("peer:ash", "ash", &[Protocol::Rdp]);
+        off.reachability = Reachability::Unreachable;
+        let mut state = state_with_bus(Some(roster(vec![off])), Some(dir.clone()));
+        let sources = state.sources_snapshot();
+        state.retry_discovery(&sources, "peer:ash");
+        assert!(
+            state.last_error.is_none(),
+            "the refresh publish succeeded: {:?}",
+            state.last_error
+        );
+        let persist = mde_bus::persist::Persist::open(dir.clone()).expect("open bus");
+        let msgs = persist.list_since(REFRESH_TOPIC, None).expect("list");
+        assert_eq!(msgs.len(), 1, "one Retry ⇒ one refresh nudge");
+        assert!(state
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("Re-checking")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_source_targets_only_manual_origins() {
+        let dir = temp_bus_dir("remove");
+        let manual = manual_source("10.0.0.5", 3389, Protocol::Rdp);
+        let manual_id = manual.id.clone();
+        let mut state = state_with_bus(
+            Some(roster(vec![
+                manual,
+                source("peer:oak", "oak", &[Protocol::Rdp]),
+            ])),
+            Some(dir.clone()),
+        );
+        let sources = state.sources_snapshot();
+
+        // A discovered peer is never removed from here (no verb published).
+        state.remove_source(&sources, "peer:oak");
+        assert!(state.last_error.is_none() && state.note.is_none());
+
+        // A manual source publishes the remove-source verb keyed on its id.
+        state.remove_source(&sources, &manual_id);
+        let persist = mde_bus::persist::Persist::open(dir.clone()).expect("open bus");
+        let msgs = persist.list_since(REMOVE_SOURCE_TOPIC, None).expect("list");
+        assert_eq!(
+            msgs.len(),
+            1,
+            "only the manual source published a remove; the peer was a no-op"
+        );
+        let v: serde_json::Value = serde_json::from_str(msgs[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(v["id"], manual_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn begin_edit_seeds_from_the_manual_source_and_ignores_non_manual() {
+        let mut named = manual_source("10.0.0.5", 3389, Protocol::Rdp);
+        named.name = "OfficePC".to_string();
+        let manual_id = named.id.clone();
+        let mut state = state_with(Some(roster(vec![
+            named,
+            source("peer:oak", "oak", &[Protocol::Rdp]),
+        ])));
+        let sources = state.sources_snapshot();
+
+        // A discovered source never opens the edit form.
+        state.begin_edit(&sources, "peer:oak");
+        assert!(
+            state.manual_edit.is_none(),
+            "only a manual source is editable"
+        );
+
+        // The manual source seeds the form from its current fields.
+        state.begin_edit(&sources, &manual_id);
+        let edit = state.manual_edit.as_ref().expect("the edit form opened");
+        assert_eq!(edit.original_id, manual_id);
+        assert_eq!(edit.name, "OfficePC");
+        assert_eq!(edit.host, "10.0.0.5");
+        assert_eq!(edit.port, "3389");
+        assert_eq!(edit.protocol, Protocol::Rdp);
+    }
+
+    #[test]
+    fn begin_edit_blanks_a_default_host_port_name() {
+        // A manual source whose name is the `host:port` default seeds an EMPTY name
+        // field, so an unchanged Save lets the worker re-default it.
+        let m = manual_source("h", 5900, Protocol::Vnc);
+        let id = m.id.clone();
+        let mut state = state_with(Some(roster(vec![m])));
+        let sources = state.sources_snapshot();
+        state.begin_edit(&sources, &id);
+        let edit = state.manual_edit.as_ref().expect("form open");
+        assert!(
+            edit.name.is_empty(),
+            "a default host:port name seeds an empty field"
+        );
+        assert_eq!(edit.protocol, Protocol::Vnc);
+    }
+
+    #[test]
+    fn save_manual_edit_validates_host_and_port_without_publishing() {
+        let m = manual_source("10.0.0.5", 3389, Protocol::Rdp);
+        let id = m.id.clone();
+        let mut state = state_with(Some(roster(vec![m])));
+        let sources = state.sources_snapshot();
+        state.begin_edit(&sources, &id);
+
+        // Empty host → an inline error; the publish is never reached (no Bus error).
+        state.manual_edit.as_mut().unwrap().host = "   ".to_string();
+        state.save_manual_edit(&sources);
+        assert!(state
+            .manual_edit
+            .as_ref()
+            .and_then(|e| e.error.as_deref())
+            .is_some_and(|e| e.contains("Host")));
+        assert!(
+            state.last_error.is_none(),
+            "a validation stop never reaches the publish"
+        );
+
+        // Non-numeric port → an inline error.
+        {
+            let e = state.manual_edit.as_mut().unwrap();
+            e.host = "10.0.0.9".to_string();
+            e.port = "not-a-port".to_string();
+            e.error = None;
+        }
+        state.save_manual_edit(&sources);
+        assert!(state
+            .manual_edit
+            .as_ref()
+            .and_then(|e| e.error.as_deref())
+            .is_some_and(|e| e.contains("Port")));
+        assert!(state.last_error.is_none());
+    }
+
+    #[test]
+    fn save_manual_edit_republishes_via_remove_then_add() {
+        let dir = temp_bus_dir("edit");
+        let m = manual_source("10.0.0.5", 3389, Protocol::Rdp);
+        let original_id = m.id.clone();
+        let mut state = state_with_bus(Some(roster(vec![m])), Some(dir.clone()));
+        let sources = state.sources_snapshot();
+        state.begin_edit(&sources, &original_id);
+        {
+            let e = state.manual_edit.as_mut().unwrap();
+            e.name = "Reception".to_string();
+            e.host = "10.0.0.9".to_string();
+            e.port = "5900".to_string();
+            e.protocol = Protocol::Vnc;
+        }
+        state.save_manual_edit(&sources);
+        assert!(
+            state.last_error.is_none(),
+            "both verbs published: {:?}",
+            state.last_error
+        );
+        assert!(
+            state.manual_edit.is_none(),
+            "the form closes on a successful save"
+        );
+
+        let persist = mde_bus::persist::Persist::open(dir.clone()).expect("open bus");
+        // The old id is removed …
+        let rm = persist.list_since(REMOVE_SOURCE_TOPIC, None).expect("list");
+        assert_eq!(rm.len(), 1);
+        let rv: serde_json::Value = serde_json::from_str(rm[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(rv["id"], original_id);
+        // … and the edited endpoint added over the worker's typed add-source verb.
+        let add = persist.list_since(ADD_SOURCE_TOPIC, None).expect("list");
+        assert_eq!(add.len(), 1);
+        let av: serde_json::Value = serde_json::from_str(add[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(av["name"], "Reception");
+        assert_eq!(av["host"], "10.0.0.9");
+        assert_eq!(av["port"], 5900);
+        assert_eq!(av["protocol"], "vnc");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── CHOOSER-8 headless renders ──
+
+    #[test]
+    fn the_filter_bar_and_grid_render_together() {
+        let mut state = state_with(Some(fixture_state()));
+        assert!(
+            run_panel(&mut state),
+            "the find bar + card grid produced no draw primitives"
+        );
+    }
+
+    #[test]
+    fn a_fully_filtered_out_roster_renders_the_no_match_note() {
+        let mut state = state_with(Some(fixture_state()));
+        state.filter.search = "no-such-desktop".to_string();
+        assert!(
+            run_panel(&mut state),
+            "the no-match note produced no draw primitives"
+        );
+        assert!(state.take_connect().is_none(), "rendering never connects");
+    }
+
+    #[test]
+    fn the_manual_edit_form_renders() {
+        let m = manual_source("10.0.0.5", 3389, Protocol::Rdp);
+        let id = m.id.clone();
+        let mut state = state_with(Some(roster(vec![m])));
+        let sources = state.sources_snapshot();
+        state.begin_edit(&sources, &id);
+        assert!(
+            run_panel(&mut state),
+            "the manual-source edit form produced no draw primitives"
+        );
+    }
+
+    #[test]
+    fn a_favorited_card_renders_the_pin_marker() {
+        let mut state = state_with(Some(roster(vec![source(
+            "peer:oak",
+            "oak",
+            &[Protocol::Rdp],
+        )])));
+        state.toggle_favorite("peer:oak".to_string());
+        assert!(
+            run_panel(&mut state),
+            "the pinned card produced no draw primitives"
         );
     }
 }
