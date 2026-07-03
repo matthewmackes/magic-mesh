@@ -14,7 +14,7 @@
 # engine is an external crate.
 [package]
 name        = "mde-term-egui"
-description = "MCNF Quasar — the mesh terminal surface. TERM-1 lands the VT engine core: alacritty_terminal (mature xterm/VT100 parsing, §6 — no re-implemented VT) wrapped behind a render-agnostic screen model (cell grid with fg/bg/attrs + a soft-capped scrollback ring) that the egui panes, splits, and PTY broker of later TERM units render and feed."
+description = "MCNF Quasar — the mesh terminal surface. TERM-1 lands the VT engine core: alacritty_terminal (mature xterm/VT100 parsing, §6 — no re-implemented VT) wrapped behind a render-agnostic screen model (cell grid with fg/bg/attrs + a soft-capped scrollback ring). TERM-2 wires a real local shell to it: the user's $SHELL as a login shell on a fresh PTY (alacritty's own tty layer — typed argv spawn, §9), pump threads both ways, TIOCSWINSZ resize, clean child reap."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true
@@ -32,15 +32,18 @@ path = "src/lib.rs"
 # fidelity the design doc's Q1 lock demands. We consume it headless (no
 # alacritty windowing) and expose a simplified cell/grid/scrollback view.
 alacritty_terminal = "0.24"
-# REQUIRED (not a feature we call): `alacritty_terminal`'s always-compiled `tty`
-# module pulls `rustix-openpty`, which depends on `rustix` with
-# `default-features = false` — so its 0.38 instance omits the `std` feature.
+# Dual role. (a) REQUIRED feature unification: `alacritty_terminal`'s
+# always-compiled `tty` module pulls `rustix-openpty`, which depends on `rustix`
+# with `default-features = false` — so its 0.38 instance omits the `std` feature.
 # Nothing else in the graph unifies `std` onto that instance, so `rustix` builds
 # in its `no_std` polyfill mode and alacritty's tty code fails to compile
 # (`OwnedFd: rustix::fd::AsFd` unsatisfied). Naming `rustix` here with `std`
-# unifies the feature back on and the engine compiles. (We never call rustix
-# directly; the local-PTY layer TERM-2 will reuse alacritty's `tty`.)
-rustix = { version = "0.38", features = ["std", "termios", "pty"] }
+# unifies the feature back on and the engine compiles. (b) The local-PTY layer
+# (TERM-2, `src/pty.rs`) reuses alacritty's `tty` for all PTY/session plumbing
+# (§6) and makes exactly one direct rustix call — `fs::fcntl_setfl`, `fs`
+# feature — to flip the master fd back to blocking for its pump threads
+# (alacritty's `tty::new` force-sets O_NONBLOCK for its own poll loop).
+rustix = { version = "0.38", features = ["std", "termios", "pty", "fs"] }
 
 [lints]
 workspace = true

@@ -12,12 +12,18 @@
 //! - [`screen`] — the flat, immutable [`screen::Screen`] snapshot (a [`screen::Cell`]
 //!   grid + cursor) that later units render (the egui pane, TERM-3) and search
 //!   (scrollback, TERM-9), with no engine or toolkit types on its surface.
+//! - [`pty::LocalPty`] (TERM-2) — a real local login shell (`$SHELL`, fallback
+//!   `/bin/sh`) on a fresh PTY, pumped into the engine by reader/writer
+//!   threads; typed argv spawn (§9), `TIOCSWINSZ` on resize, clean child reap
+//!   on close.
 //!
-//! The egui surface, PTY layers (local openpty / the mackesd mesh broker),
-//! splits, tabs, and broadcast arrive in TERM-2 onward.
+//! The egui surface, the mackesd mesh PTY broker, splits, tabs, and broadcast
+//! arrive in TERM-3 onward.
 
 pub mod engine;
+pub mod pty;
 pub mod screen;
 
 pub use engine::{Terminal, DEFAULT_SCROLLBACK};
+pub use pty::{LocalPty, SpawnOptions};
 pub use screen::{Cell, CellAttrs, CellColor, CursorPos, Screen};
