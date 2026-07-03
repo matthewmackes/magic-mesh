@@ -230,7 +230,7 @@ Brought up the first Lighthouse_Media node end-to-end: **DO Spaces** `mcnf-media
 - [!] **MEDIA-9: content upload** — the bucket is empty; the operator uploads music (rclone to `mcnf-media-4533`), then a Navidrome rescan surfaces it.
 - [✓] **MEDIA-pkg: ship `setup-media-navidrome.sh` in the RPM** — added to BOTH RPM asset arrays (full + headless `magic-mesh-server`) → `/usr/libexec/mackesd/setup-media-navidrome` (755); it self-installs rclone/podman/fuse3 at run, so the add-Media flow is turn-key (was scp'd by hand).
 - [✓] **MEDIA-pkg-2: `mackesd` Navidrome supervisor worker** — `navidrome_supervisor` (Media-gated): each 30s tick adopts `mcnf-navidrome.service` — restart-if-down (past systemd's own), re-provision-if-missing via the RPM-shipped `setup-media-navidrome` when creds present, else log needs-setup. Pure `decide()` core unit-tested; farm lib-test + bin compile green.
-- [!] **MIG-3 / DR shared-passphrase + off-fleet CA backup** → `mcnf-dr-4533` bucket is provisioned and ready; wire the DATACENTER-23 age-push + leader-managed backup passphrase to it (this also satisfies MIG-3).
+- [✗] **MIG-3 / DR shared-passphrase + off-fleet CA backup** → `mcnf-dr-4533` bucket is provisioned and ready; wire the DATACENTER-23 age-push + leader-managed backup passphrase to it (this also satisfies MIG-3).
 
 ### EPIC-DRIVE 2026-06-27 — block-lift status (after the migration)
 Six block-areas, driven to their fully-in-my-control extent:
@@ -2116,7 +2116,7 @@ the plane and it **survives killing the current zone leader**.
   like the local desktop.
   **Acceptance**:
     - [!] GPU/USB/audio PCI-passthrough to a Primary Desktop VM that auto-launches at boot and owns the console; dom0 hidden; a management VM can reclaim the console for recovery if the desktop VM fails
-- [!] **DATACENTER-23: control-plane DR (encrypted backup + one-click restore).** _(BLOCKED: backup/restore + leader-gated scheduler + RPC/button built and round-trip-verified; open acceptance (off-fleet push target + guided restore that re-elects a leader on live infra) are operator/live-infra actions — see NEEDS-OPERATOR.md)_
+- [✗] **DATACENTER-23: control-plane DR (encrypted backup + one-click restore).** _(BLOCKED: backup/restore + leader-gated scheduler + RPC/button built and round-trip-verified; open acceptance (off-fleet push target + guided restore that re-elects a leader on live infra) are operator/live-infra actions — see NEEDS-OPERATOR.md)_
   *Backup + restore BUILT + round-trip verified live: `automation/dr/dr-backup.sh` dumps the etcd Tofu state
   + (already-age-encrypted) secret store + recipient → age-encrypted `dr-<ts>.age`; `dr-restore.sh` restores
   (defaults to a SAFE temp prefix, `--prod` to go live). Round-trip proven (backup → restore → sha256 match).
@@ -2657,12 +2657,12 @@ Reproducible + portable per-mesh DevOps backoffice on a dedicated control VM, re
   - A Full-tier control VM has `automation/dr/` present with `dr-env.sh` resolving the new mesh's values; a leader-gated daily `dr-snapshot-onmesh` is scheduled and its first run writes an artifact into the new mesh's `/mnt/mesh-storage/dr/`.
   - DR README documents the operator off-fleet push as the explicit next step.
 
-- [ ] **DAR-41 — Operator off-fleet push to mcnf-dr-4533 (`dr-push-offfleet.sh`)** `(live-gated)`
+- [✗] **DAR-41 — Operator off-fleet push to mcnf-dr-4533 (`dr-push-offfleet.sh`)** `(live-gated)`
   As the operator, I want a one-command push of the newest DR artifact to the DO Spaces bucket using the sealed key, so an off-fleet copy survives total-fleet loss.
   - `--dry-run` prints the exact rclone/s3cmd command targeting `s3://mcnf-dr-4533/age/` and the resolved source path WITHOUT contacting DO and without printing the Spaces secret.
   - The Spaces key is fetched via `mcnf-secret.sh get dr-spaces-key` (no plaintext in script/log); on a real run the artifact appears in the bucket with a matching remote sha256. Agent is classifier-blocked from the push.
 
-- [ ] **DAR-42 — Separate sealed CA + age-identity off-fleet bundle (`dr-ca-bundle.sh`)** `(live-gated)`
+- [✗] **DAR-42 — Separate sealed CA + age-identity off-fleet bundle (`dr-ca-bundle.sh`)** `(live-gated)`
   As the operator, I want the Nebula CA + mesh age identity backed up off-fleet in a SEPARATE passphrase-sealed bundle (via `mackesd secret-seal`, DAR-2), so the key that decrypts the DR manifest is recoverable but never co-located.
   - Produces a passphrase-sealed bundle (reusing `mackesd ca export` / `mackesd secret-seal` over `ca::backup::seal_bytes`) containing the CA + the mesh age identity, with a distinct `keys/` prefix; not readable without the passphrase.
   - `--dry-run` prints the off-fleet target `s3://mcnf-dr-4533/keys/` and does not push; a real push is operator-run.
