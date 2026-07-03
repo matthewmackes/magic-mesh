@@ -213,6 +213,7 @@ impl SystemState {
                     section(ui, "Power & Battery", |ui| {
                         power_section(ui, snap, *confirm, instances, &mut actions);
                     });
+                    section(ui, "Wallpaper", wallpaper_section);
                     section(ui, "Hotkeys", hotkeys_section);
                 });
         }
@@ -996,6 +997,43 @@ fn power_verb_row(
             actions.push(SysAction::ArmConfirm(verb));
         }
     });
+}
+
+/// The Wallpaper section (QBRAND-11) — the desktop-backdrop picker over the five
+/// official Quazar wallpapers (placement lock #12). The choice persists per seat and
+/// follows the mesh identity; the [`crate::backdrop`] desktop layer reflects it live.
+fn wallpaper_section(ui: &mut egui::Ui) {
+    let ctx = ui.ctx().clone();
+    let current = crate::backdrop::selected_wallpaper(&ctx);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Desktop wallpaper")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_S);
+        ComboBox::from_id_salt("qbrand11-wallpaper")
+            .selected_text(RichText::new(current.label()).size(Style::SMALL))
+            .show_ui(ui, |ui| {
+                for wallpaper in crate::backdrop::Wallpaper::ALL {
+                    let selected = wallpaper == current;
+                    if ui
+                        .selectable_label(
+                            selected,
+                            RichText::new(wallpaper.label()).size(Style::SMALL),
+                        )
+                        .clicked()
+                        && !selected
+                    {
+                        crate::backdrop::select_wallpaper(&ctx, wallpaper);
+                    }
+                }
+            });
+    });
+    muted_note(
+        ui,
+        "The five official Quazar wallpapers ship in the RPM; your choice follows your mesh identity when a workgroup volume is present.",
+    );
 }
 
 /// The Hotkeys section — the fixed compiled-in table (lock 9) read-only.
