@@ -36,6 +36,7 @@ members = [
     "crates/services/mde-voice-config",
     "crates/services/mde-voice-hud",
     "crates/desktop/mde-shell-egui",
+    "crates/desktop/mde-media-core",
     "crates/desktop/mde-mesh-view",
     "crates/desktop/mde-music-egui",
     "crates/desktop/mde-files-egui",

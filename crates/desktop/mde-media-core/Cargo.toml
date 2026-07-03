@@ -1,0 +1,41 @@
+[package]
+name        = "mde-media-core"
+description = "MEDIA-1 (mesh-media-player, docs/design/mesh-media-player.md) — the libmpv-backed engine + player core. A mature engine (mpv) wrapped behind an injectable `MediaEngine` seam so the `Player` state machine (Idle→Loading→Playing⇄Paused→Stopped/Ended; position/duration/state events; track enumeration) is unit-tested against `FakeMpv` WITHOUT a real mpv. The real libmpv2 engine is feature-gated (`mpv`) so the default build stays airgap-safe (no system libmpv needed); a real-clip smoke runs only where system libmpv is present. §6 glue — wraps mpv, never reimplements decode."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_media_core"
+path = "src/lib.rs"
+
+[dependencies]
+# The player-state record + track model serialize (MEDIA-16 session roaming
+# consumes them), and mpv's `track-list` property is parsed from JSON.
+serde      = { workspace = true }
+serde_json = { workspace = true }
+# Error enum, matching the mde-kvm / mackes-xcp convention.
+thiserror  = "1"
+
+# The real engine — libmpv2 (mpv 2.x client API) — is OPTIONAL and OFF by
+# default. It (via libmpv2-sys/bindgen) links the system `libmpv` + its C
+# headers, which are not present on the airgapped farm, so the default
+# build/test/clippy compile only the seam + FakeMpv (no C dependency). Adding it
+# to Cargo.lock only requires REGISTRY resolution (metadata + checksum), not
+# compilation — so the binding is verified-fetchable + pinned in the lock even
+# where it cannot be built. Building `--features mpv` (the real-clip smoke) is
+# honest-gated on a host with `mpv-libs-devel`.
+[dependencies.libmpv2]
+version  = "6"
+optional = true
+
+[features]
+default = []
+# The real libmpv2 engine (`src/mpv.rs`) + the real-clip path of the smoke bin.
+mpv = ["dep:libmpv2"]
+
+[lints]
+workspace = true
