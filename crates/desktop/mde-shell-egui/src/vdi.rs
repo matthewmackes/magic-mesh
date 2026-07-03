@@ -22,6 +22,8 @@ use mde_egui::egui::{self, Sense, TextureHandle, TextureOptions};
 use mde_vdi_rdp::RdpSession;
 use mde_vdi_vnc::VncSession;
 
+use crate::auth::DesktopAuth;
+
 /// A live VDI desktop the shell drives — RDP-primary, VNC the console fallback.
 /// Both decoder crates expose the *identical* egui-facing surface
 /// (`frame()` → [`egui::ColorImage`], `send_input(&egui::Event)`), so the panel
@@ -186,21 +188,31 @@ pub(crate) struct ConnectRequest {
     pub display: DisplayMode,
     /// Single vs span-all (lock 12).
     pub monitors: MonitorSpan,
+    /// CHOOSER-6 — how the connect authenticates: mesh-identity SSO for a
+    /// mesh-brokered source, or a sealed credential for an external endpoint. The
+    /// gated live transport (E12-4) feeds a sealed credential's secret into the
+    /// protocol config's password field; a mesh identity needs no prompt. The
+    /// secret is redacted from `Debug` ([`DesktopAuth`]), so this request is
+    /// log-safe.
+    pub auth: DesktopAuth,
 }
 
 impl ConnectRequest {
-    /// Assemble a request from the picked target + the three display choices.
+    /// Assemble a request from the picked target + the three display choices + the
+    /// resolved auth (CHOOSER-6).
     pub(crate) const fn new(
         target: RequestedTarget,
         protocol: VdiProtocol,
         display: DisplayMode,
         monitors: MonitorSpan,
+        auth: DesktopAuth,
     ) -> Self {
         Self {
             target,
             protocol,
             display,
             monitors,
+            auth,
         }
     }
 }
@@ -318,9 +330,12 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                         req.target.name,
                         req.protocol.label()
                     );
+                    // CHOOSER-6 — name the auth mode honestly (SSO vs sealed cred);
+                    // `auth.summary()` is log-safe and never carries the secret.
+                    let auth = req.auth.summary();
                     let detail = if req.protocol.has_client() {
                         format!(
-                            "Brokering the {} desktop from {} ({} \u{00B7} {}) — the live transport (E12-4) is gated.",
+                            "Brokering the {} desktop from {} ({} \u{00B7} {} \u{00B7} {auth}) — the live transport (E12-4) is gated.",
                             req.protocol.client_crate(),
                             req.target.serving_peer,
                             req.display.label(),
@@ -328,7 +343,7 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                         )
                     } else {
                         format!(
-                            "Spice desktop from {} ({} \u{00B7} {}) — the Spice client lands in CHOOSER-5; no session is faked.",
+                            "Spice desktop from {} ({} \u{00B7} {} \u{00B7} {auth}) — the Spice client lands in CHOOSER-5; no session is faked.",
                             req.target.serving_peer,
                             req.display.label(),
                             req.monitors.label(),
@@ -399,6 +414,7 @@ pub(crate) fn mock_frame() -> egui::ColorImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::{Credential, DesktopAuth};
     use mde_egui::egui::{pos2, vec2, Rect};
     use mde_egui::Style;
     use mde_vdi_rdp::RdpConfig;
@@ -446,6 +462,7 @@ mod tests {
             VdiProtocol::Rdp,
             DisplayMode::Fullscreen,
             MonitorSpan::Single,
+            DesktopAuth::mesh_identity("node-a"),
         ));
         assert_eq!(
             state.requested_target().map(|t| t.name.as_str()),
@@ -474,6 +491,7 @@ mod tests {
             VdiProtocol::Spice,
             DisplayMode::Windowed,
             MonitorSpan::All,
+            DesktopAuth::mesh_identity("oak"),
         ));
         let drew = run_panel(&mut state, body_input());
         assert!(state.session.is_none(), "no Spice session is faked");
@@ -504,6 +522,10 @@ mod tests {
             VdiProtocol::Vnc,
             DisplayMode::Windowed,
             MonitorSpan::All,
+            DesktopAuth::Sealed {
+                store_ref: "desktop/oak/vnc".to_string(),
+                credential: Credential::new("admin", "rfb-secret"),
+            },
         );
         assert_eq!(req.target.serving_peer, "oak");
         assert_eq!(req.target.name, "web1");
@@ -512,6 +534,10 @@ mod tests {
         assert_eq!(req.monitors, MonitorSpan::All);
         assert_eq!(req.display.label(), "windowed");
         assert_eq!(req.monitors.label(), "span all displays");
+        // CHOOSER-6 — the resolved auth rides the request; its secret is redacted
+        // from Debug so the request stays log-safe.
+        assert_eq!(req.auth.summary(), "sealed credential (admin)");
+        assert!(!format!("{req:?}").contains("rfb-secret"));
     }
 
     #[test]

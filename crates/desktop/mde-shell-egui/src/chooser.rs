@@ -52,6 +52,10 @@ use mde_egui::egui::{
 use mde_egui::{muted_note, status_dot, Style};
 use serde::Deserialize;
 
+use crate::auth::{
+    self, AuthStage, CredentialPrompt, CredentialStore, DesktopAuth, MeshCredentialStore,
+    SealOutcome,
+};
 use crate::vdi::{ConnectRequest, DisplayMode, MonitorSpan, RequestedTarget, VdiProtocol};
 
 /// The retained-latest state topic the CHOOSER-1 worker publishes the merged
@@ -565,6 +569,13 @@ struct ConnectDraft {
     display: DisplayMode,
     /// Single vs span-all displays (lock 12).
     monitors: MonitorSpan,
+    /// CHOOSER-6 — the one-time credential prompt for an external endpoint with no
+    /// sealed credential yet. `None` for a mesh-brokered SSO source, for an
+    /// external endpoint whose credential is already sealed (remembered), and
+    /// before the first Connect resolves auth. When `Some`, the picker shows the
+    /// masked username/password fields and Connect seals + connects. Cleared if the
+    /// operator switches protocol (the credential is keyed per protocol).
+    cred_prompt: Option<CredentialPrompt>,
 }
 
 /// The Chooser's state: the injectable roster read seam, the last published
@@ -574,6 +585,11 @@ struct ConnectDraft {
 pub(crate) struct ChooserState {
     /// The roster read seam ([`BusDesktopSources`] in production).
     client: Box<dyn DesktopSourcesClient>,
+    /// CHOOSER-6 — the sealed-credential store seam (injectable): a mesh-peer
+    /// desktop authenticates by mesh-identity SSO (never touched), an external
+    /// endpoint's credential is sealed/read here. [`MeshCredentialStore`] in
+    /// production (the live seal is honest-gated mesh-side); a fake in tests.
+    creds: Box<dyn CredentialStore>,
     /// Desktop-client Bus spool for the broker `Open` publish (the same
     /// resolved-once root the E12-5b picker held).
     bus_root: Option<PathBuf>,
@@ -614,20 +630,24 @@ impl Default for ChooserState {
             Box::new(BusDesktopSources::from_env()),
             mde_bus::client_data_dir(),
             crate::discovery::local_peer(),
+            Box::new(MeshCredentialStore),
         )
     }
 }
 
 impl ChooserState {
-    /// Construct over an explicit read seam + publish root (production wires
-    /// the Bus; tests inject a fake and `None`).
+    /// Construct over an explicit read seam + publish root + credential store
+    /// (production wires the Bus + the mesh-side sealed store; tests inject fakes
+    /// and `None`).
     fn with_client(
         client: Box<dyn DesktopSourcesClient>,
         bus_root: Option<PathBuf>,
         client_peer: String,
+        creds: Box<dyn CredentialStore>,
     ) -> Self {
         Self {
             client,
+            creds,
             bus_root,
             client_peer,
             state: None,
@@ -736,19 +756,85 @@ impl ChooserState {
             protocol: first,
             display: DisplayMode::Fullscreen,
             monitors: MonitorSpan::Single,
+            // Auth is resolved on Connect (from the final chosen protocol), not
+            // here — so a mesh peer connects SSO with no prompt and an external
+            // endpoint only prompts if its credential isn't already sealed.
+            cred_prompt: None,
         });
     }
 
-    /// The operator confirmed the picker: build the [`ConnectRequest`] from the
-    /// draft's chosen protocol + display + monitors and connect.
+    /// The operator confirmed the picker. CHOOSER-6 folds auth in here, in two
+    /// phases so a mesh peer never sees a prompt and an external endpoint prompts
+    /// only when its credential isn't already sealed:
+    ///
+    ///  * **Phase 1** (no prompt showing) — resolve the auth for the *final*
+    ///    chosen protocol. A mesh-brokered source resolves to mesh-identity SSO
+    ///    and connects straight through; an external endpoint with a sealed
+    ///    credential connects with it (remembered); an external endpoint with no
+    ///    sealed credential raises the one-time credential prompt and does NOT
+    ///    connect yet (lock 6 — nothing connects without the input).
+    ///  * **Phase 2** (prompt showing) — seal the entered credential (honest
+    ///    [`SealOutcome`]) and connect with it.
+    ///
+    /// A store fault surfaces inline rather than silently prompting (§7).
     fn confirm_connect(&mut self, sources: &[DesktopSource]) {
-        let Some(draft) = self.pending.take() else {
+        // The roster can move under the picker; if the source vanished, drop the
+        // draft silently.
+        let Some(source_id) = self.pending.as_ref().map(|d| d.source_id.clone()) else {
             return;
         };
-        // The roster can move under the picker; if the source vanished, drop the
-        // draft silently (it's already taken).
-        if let Some(source) = sources.iter().find(|s| s.id == draft.source_id) {
-            self.connect_source(source, draft.protocol, draft.display, draft.monitors);
+        let Some(source) = sources.iter().find(|s| s.id == source_id).cloned() else {
+            self.pending = None;
+            return;
+        };
+
+        // Phase 2 — the credential prompt is up: seal + connect.
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|d| d.cred_prompt.is_some())
+        {
+            let draft = self.pending.take().expect("pending present");
+            let prompt = draft.cred_prompt.expect("cred prompt present");
+            let (resolved, outcome) = auth::remember(self.creds.as_ref(), &prompt);
+            self.connect_source(
+                &source,
+                draft.protocol,
+                draft.display,
+                draft.monitors,
+                resolved,
+                Some(outcome),
+            );
+            return;
+        }
+
+        // Phase 1 — resolve auth for the final chosen protocol.
+        let (protocol, display, monitors) = {
+            let draft = self.pending.as_ref().expect("pending present");
+            (draft.protocol, draft.display, draft.monitors)
+        };
+        let is_brokered = source.origin.is_mesh_brokered();
+        match auth::resolve(
+            is_brokered,
+            &self.client_peer,
+            &source.host,
+            protocol,
+            self.creds.as_ref(),
+        ) {
+            Ok(AuthStage::Ready(resolved)) => {
+                self.pending = None;
+                self.connect_source(&source, protocol, display, monitors, resolved, None);
+            }
+            Ok(AuthStage::Prompt(prompt)) => {
+                // External endpoint, no sealed credential — raise the one-time
+                // prompt; nothing connects until it's filled + confirmed.
+                if let Some(draft) = self.pending.as_mut() {
+                    draft.cred_prompt = Some(prompt);
+                }
+            }
+            Err(e) => {
+                self.last_error = Some(format!("Credential store: {e}"));
+            }
         }
     }
 
@@ -770,7 +856,12 @@ impl ChooserState {
         protocol: VdiProtocol,
         display: DisplayMode,
         monitors: MonitorSpan,
+        auth: DesktopAuth,
+        seal: Option<SealOutcome>,
     ) {
+        // The resolved auth mode, stated honestly on the note (§7) — SSO vs a
+        // sealed credential. `summary()` is log-safe: it never carries the secret.
+        let auth_summary = auth.summary();
         if source.origin.is_mesh_brokered() {
             // A peer seat's roster row has `name == node`, so `name` is the
             // broker's vm_id handle for seats AND VMs (the same handle the
@@ -783,7 +874,8 @@ impl ChooserState {
                 &self.client_peer,
             );
             self.note = Some(format!(
-                "Requested {} from {} via {} ({} \u{00B7} {}) — brokering over the mesh.",
+                "Requested {} from {} via {} ({} \u{00B7} {}) — brokering over the mesh; \
+                 authenticating with {auth_summary}.",
                 source.name,
                 source.node,
                 protocol.label(),
@@ -793,12 +885,30 @@ impl ChooserState {
         } else {
             self.note = Some(format!(
                 "Direct {} connect to {} ({} \u{00B7} {}) — the live client transport attaches \
-                 in E12-4.",
+                 in E12-4; authenticating with {auth_summary}.",
                 protocol.label(),
                 source.host,
                 display.label(),
                 monitors.label(),
             ));
+        }
+        // CHOOSER-6 — the honest remember/seal outcome for an external credential
+        // (never a faked "remembered"; a gated seal still connects in-memory).
+        if let Some(outcome) = seal {
+            let suffix = match outcome {
+                SealOutcome::Sealed => {
+                    " The credential is sealed in the secret store (remembered).".to_string()
+                }
+                SealOutcome::Gated(reason) => {
+                    format!(" The credential drives this session but isn't remembered — {reason}.")
+                }
+                SealOutcome::Failed(reason) => {
+                    format!(" The credential couldn't be sealed — {reason}.")
+                }
+            };
+            if let Some(note) = self.note.as_mut() {
+                note.push_str(&suffix);
+            }
         }
         // A Spice route is constructed honestly but its client is CHOOSER-5 —
         // name the gate so the note never implies a live Spice session (§7).
@@ -812,6 +922,7 @@ impl ChooserState {
             protocol,
             display,
             monitors,
+            auth,
         ));
     }
 
@@ -1211,8 +1322,14 @@ fn connect_picker(
                 .size(Style::SMALL),
         );
         if routable.len() > 1 {
+            let before = draft.protocol;
             for proto in &routable {
                 ui.radio_value(&mut draft.protocol, *proto, proto.label());
+            }
+            // CHOOSER-6 — a sealed credential is keyed per protocol, so switching
+            // protocol invalidates any raised prompt (re-resolved on next Connect).
+            if draft.protocol != before {
+                draft.cred_prompt = None;
             }
         } else {
             ui.label(RichText::new(draft.protocol.label()).color(Style::TEXT));
@@ -1255,12 +1372,25 @@ fn connect_picker(
         );
     }
 
+    // CHOOSER-6 — the one-time credential prompt for an external endpoint with no
+    // sealed credential yet (raised on the first Connect). Filled once, sealed on
+    // the next Connect, then remembered.
+    let prompting = draft.cred_prompt.is_some();
+    if let Some(prompt) = draft.cred_prompt.as_mut() {
+        credential_prompt_fields(ui, prompt);
+    }
+
     ui.add_space(Style::SP_S);
     ui.horizontal(|ui| {
+        // Once the prompt is up the Connect action seals the entered credential
+        // before connecting — the label says so honestly.
+        let connect_label = if prompting {
+            format!("Save and connect via {}", draft.protocol.label())
+        } else {
+            format!("Connect via {}", draft.protocol.label())
+        };
         if ui
-            .button(
-                RichText::new(format!("Connect via {}", draft.protocol.label())).size(Style::BODY),
-            )
+            .button(RichText::new(connect_label).size(Style::BODY))
             .clicked()
         {
             action = Some(CardAction::Confirm);
@@ -1274,6 +1404,47 @@ fn connect_picker(
         }
     });
     action
+}
+
+/// The CHOOSER-6 one-time credential fields for an external endpoint: a masked
+/// username/password pair under an honest note. §4 `Style` tokens throughout (no
+/// raw hex); the password field is masked and the secret is never logged (the
+/// [`CredentialPrompt`] buffer redacts through `Debug`).
+fn credential_prompt_fields(ui: &mut egui::Ui, prompt: &mut CredentialPrompt) {
+    ui.add_space(Style::SP_S);
+    ui.separator();
+    ui.add_space(Style::SP_XS);
+    muted_note(
+        ui,
+        "This endpoint isn't on the mesh — enter its credentials once. They're sealed in the \
+         secret store and remembered for next time; never stored in plaintext.",
+    );
+    ui.add_space(Style::SP_XS);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Username")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut prompt.username)
+                .desired_width(Style::SP_XL * 6.0)
+                .hint_text("optional for VNC"),
+        );
+    });
+    ui.add_space(Style::SP_XS);
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Password")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut prompt.password)
+                .desired_width(Style::SP_XL * 6.0)
+                .password(true),
+        );
+    });
 }
 
 // ───────────────────────────── tests ─────────────────────────────
@@ -1333,13 +1504,65 @@ mod tests {
         }
     }
 
+    /// A CHOOSER-6 credential store the integration tests share (via `Rc`) to
+    /// seed + assert seals through a live [`ChooserState`]. It does a REAL
+    /// seal→store→read round-trip so "prompt once then remember" is exercised
+    /// end to end.
+    #[derive(Clone, Default)]
+    struct RecordingStore {
+        inner: std::rc::Rc<std::cell::RefCell<HashMap<String, crate::auth::Credential>>>,
+    }
+
+    impl RecordingStore {
+        /// The credential sealed under `store_ref`, if any (the round-trip proof).
+        fn get_ref(&self, store_ref: &str) -> Option<crate::auth::Credential> {
+            self.inner.borrow().get(store_ref).cloned()
+        }
+    }
+
+    impl CredentialStore for RecordingStore {
+        fn get(&self, store_ref: &str) -> Result<Option<crate::auth::Credential>, String> {
+            Ok(self.inner.borrow().get(store_ref).cloned())
+        }
+
+        fn seal(&self, store_ref: &str, credential: &crate::auth::Credential) -> SealOutcome {
+            self.inner
+                .borrow_mut()
+                .insert(store_ref.to_string(), credential.clone());
+            SealOutcome::Sealed
+        }
+    }
+
+    /// A credential store that must NEVER be touched — proves the SSO path
+    /// connects a mesh peer with no store read or seal.
+    struct ForbiddenStore;
+    impl CredentialStore for ForbiddenStore {
+        fn get(&self, _r: &str) -> Result<Option<crate::auth::Credential>, String> {
+            unreachable!("a mesh-peer SSO connect must not read the credential store")
+        }
+        fn seal(&self, _r: &str, _c: &crate::auth::Credential) -> SealOutcome {
+            unreachable!("a mesh-peer SSO connect must not seal a credential")
+        }
+    }
+
     /// A `ChooserState` over a canned roster, with no publish root (the
-    /// broker publish then records its honest error) and a fixed peer name.
+    /// broker publish then records its honest error) and a fixed peer name. Most
+    /// tests exercise mesh-peer sources (SSO), so the honest-gated production
+    /// credential store is fine; the external-cred tests inject their own store.
     fn state_with(state: Option<DesktopSourcesState>) -> ChooserState {
+        state_with_store(state, Box::new(MeshCredentialStore))
+    }
+
+    /// [`state_with`] over an explicit credential store (the CHOOSER-6 seam).
+    fn state_with_store(
+        state: Option<DesktopSourcesState>,
+        creds: Box<dyn CredentialStore>,
+    ) -> ChooserState {
         let mut s = ChooserState::with_client(
             Box::new(FakeSources(state)),
             None,
             "client-node".to_string(),
+            creds,
         );
         s.refresh();
         s
@@ -1605,9 +1828,10 @@ mod tests {
             .is_some_and(|n| n.contains("CHOOSER-5")));
     }
 
-    #[test]
-    fn an_external_endpoint_connects_without_a_broker_open() {
-        let mut state = state_with(None);
+    /// Fold a single external (mDNS) RDP endpoint into a fresh `ChooserState`
+    /// backed by `creds`, and return it + the source id.
+    fn external_state(creds: Box<dyn CredentialStore>) -> (ChooserState, String) {
+        let mut state = state_with_store(None, creds);
         let mut lan = source(
             "mdns:192.168.1.60:3389:rdp",
             "192.168.1.60",
@@ -1615,21 +1839,162 @@ mod tests {
         );
         lan.origin = SourceOrigin::Mdns;
         lan.name = "OfficePC".to_string();
+        // The dial address the credential ref is derived from (host:port).
+        lan.host = "192.168.1.60:3389".to_string();
         state.fold_sources(roster(vec![lan]));
+        (state, "mdns:192.168.1.60:3389:rdp".to_string())
+    }
 
+    #[test]
+    fn an_external_endpoint_prompts_once_seals_then_connects_without_a_broker_open() {
+        // CHOOSER-6 — the full external fold: activate → the first Connect resolves
+        // no sealed credential and raises a one-time prompt (does NOT connect) →
+        // the operator fills it → the next Connect seals it + connects.
+        let store = RecordingStore::default();
+        let (mut state, id) = external_state(Box::new(store.clone()));
         let sources = state.sources_snapshot();
-        state.activate(&sources, "mdns:192.168.1.60:3389:rdp");
+
+        // Phase 1: activate + Connect → the prompt is raised, nothing connects.
+        state.activate(&sources, &id);
         state.confirm_connect(&sources);
-        // No broker verb was attempted (no Bus error), and the note names the
-        // gated direct-transport leg honestly (§7).
-        assert!(state.last_error.is_none());
-        assert!(state
-            .note
-            .as_deref()
-            .is_some_and(|n| n.contains("RDP") && n.contains("E12-4")));
+        assert!(
+            state.take_connect().is_none(),
+            "an external endpoint with no sealed credential must not connect blind"
+        );
+        assert!(
+            state
+                .pending
+                .as_ref()
+                .is_some_and(|d| d.cred_prompt.is_some()),
+            "the one-time credential prompt is raised"
+        );
+
+        // The operator fills the prompt once.
+        {
+            let prompt = state
+                .pending
+                .as_mut()
+                .and_then(|d| d.cred_prompt.as_mut())
+                .expect("the prompt is open");
+            prompt.username = "administrator".to_string();
+            prompt.password = "s3cr3t-pw".to_string();
+        }
+
+        // Phase 2: Connect → seals the credential + connects (no broker verb, no
+        // Bus error — an external endpoint has no broker `Open`).
+        state.confirm_connect(&sources);
+        assert!(
+            state.last_error.is_none(),
+            "no broker verb for an off-mesh endpoint"
+        );
+        assert!(state.pending.is_none(), "the picker closes on connect");
+
+        // The credential really round-tripped into the store (sealed), under the
+        // derived `desktop/<host>/<proto>` ref.
+        let sealed = store
+            .get_ref("desktop/192.168.1.60:3389/rdp")
+            .expect("the credential was sealed");
+        assert_eq!(sealed.username, "administrator");
+        assert_eq!(sealed.secret.expose(), "s3cr3t-pw");
+
+        // The note names the gated direct-transport leg + that the credential is
+        // sealed (remembered), and never leaks the secret.
+        let note = state.note.clone().expect("a connect note");
+        assert!(note.contains("RDP") && note.contains("E12-4"));
+        assert!(note.contains("sealed") && note.contains("remembered"));
+        assert!(!note.contains("s3cr3t-pw"), "the note leaked the secret");
+
+        // The request carries the resolved sealed auth (secret redacted from Debug).
         let req = state.take_connect().expect("hand-off");
         assert_eq!(req.target.name, "OfficePC");
         assert_eq!(req.protocol, VdiProtocol::Rdp);
+        assert!(matches!(req.auth, DesktopAuth::Sealed { .. }));
+        assert!(!format!("{req:?}").contains("s3cr3t-pw"));
+    }
+
+    #[test]
+    fn a_remembered_external_credential_connects_without_a_second_prompt() {
+        // A store that already holds the sealed credential: activate + one Connect
+        // connects straight through, no prompt (the "then remembered" half).
+        let store = RecordingStore::default();
+        assert!(matches!(
+            store.seal(
+                "desktop/192.168.1.60:3389/rdp",
+                &crate::auth::Credential::new("administrator", "s3cr3t-pw"),
+            ),
+            SealOutcome::Sealed
+        ));
+        let (mut state, id) = external_state(Box::new(store));
+        let sources = state.sources_snapshot();
+
+        state.activate(&sources, &id);
+        state.confirm_connect(&sources);
+        // No prompt was raised (the credential was remembered) and it connected.
+        assert!(state.pending.is_none(), "a remembered cred needs no prompt");
+        let req = state
+            .take_connect()
+            .expect("connects with the remembered cred");
+        let DesktopAuth::Sealed { credential, .. } = req.auth else {
+            unreachable!("expected the remembered sealed cred")
+        };
+        assert_eq!(credential.username, "administrator");
+        assert_eq!(credential.secret.expose(), "s3cr3t-pw");
+    }
+
+    #[test]
+    fn a_mesh_peer_connects_with_no_credential_prompt_via_sso() {
+        // The SSO path: a mesh-brokered peer connects with the node's mesh identity
+        // and NEVER touches the credential store (the forbidden store panics if it
+        // does). No prompt is raised.
+        let mut state = state_with_store(
+            Some(roster(vec![source("peer:oak", "oak", &[Protocol::Rdp])])),
+            Box::new(ForbiddenStore),
+        );
+        let sources = state.sources_snapshot();
+        state.activate(&sources, "peer:oak");
+        state.confirm_connect(&sources);
+        assert!(state.pending.is_none(), "SSO needs no credential prompt");
+        let req = state.take_connect().expect("SSO connects straight through");
+        let DesktopAuth::MeshIdentity { node } = req.auth else {
+            unreachable!("expected mesh-identity SSO")
+        };
+        assert_eq!(node, "client-node");
+        // The broker publish had no Bus root → the honest inline error (mesh peer),
+        // and the note names SSO, never a credential.
+        assert!(state.note.as_deref().is_some_and(|n| n.contains("SSO")));
+    }
+
+    #[test]
+    fn the_production_credential_store_gate_is_honest_on_an_external_connect() {
+        // On the live fleet the seal is gated: an external connect still hands off
+        // (the entered credential drives the session in-memory) but the note says
+        // it isn't remembered — never a faked "sealed" (§7).
+        let (mut state, id) = external_state(Box::new(MeshCredentialStore));
+        let sources = state.sources_snapshot();
+        state.activate(&sources, &id);
+        state.confirm_connect(&sources); // phase 1 → prompt
+        {
+            let prompt = state
+                .pending
+                .as_mut()
+                .and_then(|d| d.cred_prompt.as_mut())
+                .expect("prompt open");
+            prompt.password = "in-memory-only".to_string();
+        }
+        state.confirm_connect(&sources); // phase 2 → gated seal + connect
+        let note = state.note.clone().expect("note");
+        assert!(
+            note.contains("isn't remembered"),
+            "a gated seal is honest, not faked as remembered: {note}"
+        );
+        assert!(
+            !note.contains("in-memory-only"),
+            "the note leaked the secret"
+        );
+        assert!(
+            state.take_connect().is_some(),
+            "the session still hands off"
+        );
     }
 
     #[test]
@@ -1782,6 +2147,7 @@ mod tests {
             Box::new(BusDesktopSources::with_root(None)),
             None,
             "client-node".to_string(),
+            Box::new(MeshCredentialStore),
         );
         let (title, detail) = state.empty_copy();
         assert_eq!(title, "Desktop discovery unavailable");
@@ -1829,6 +2195,33 @@ mod tests {
         );
         // Rendering the picker is not a connect.
         assert!(state.take_connect().is_none());
+    }
+
+    #[test]
+    fn the_external_credential_prompt_renders_with_masked_fields() {
+        // CHOOSER-6 — an external endpoint whose first Connect found no sealed
+        // credential renders the one-time username/password prompt (§4 tokens); it
+        // tessellates and still hasn't connected (nothing connects blind).
+        let store = RecordingStore::default();
+        let (mut state, id) = external_state(Box::new(store));
+        let sources = state.sources_snapshot();
+        state.activate(&sources, &id);
+        state.confirm_connect(&sources); // raise the prompt
+        assert!(
+            state
+                .pending
+                .as_ref()
+                .is_some_and(|d| d.cred_prompt.is_some()),
+            "the credential prompt is raised"
+        );
+        assert!(
+            run_panel(&mut state),
+            "the credential-prompt picker produced no draw primitives"
+        );
+        assert!(
+            state.take_connect().is_none(),
+            "rendering the prompt is not a connect"
+        );
     }
 
     #[test]
