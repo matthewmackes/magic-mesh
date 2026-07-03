@@ -41,5 +41,21 @@ path = "src/main.rs"
 # (§4) and nothing else.
 mde-egui = { path = "../../shared/mde-egui" }
 
+# EDITOR-2 rope buffer core: `ropey` is the pure-Rust rope the `buffer::Buffer`
+# is built on — O(log n) insert/remove + an O(log n) line index (the same rope
+# Helix/Zed-style editors use), so opening/editing a 100k-line file never does a
+# per-keystroke O(n) full-string rebuild. Dependency-light (only `smallvec` —
+# already in the workspace lock — plus the tiny pure-Rust `str_indices`), no C
+# and no build script, so it vendors/builds cleanly on the airgapped farm. Holds
+# the `1.x` line like the repo's other loose pins.
+ropey = "1"
+
+[dev-dependencies]
+# EDITOR-2 buffer tests write + read real files (the open round-trip and the
+# save-changes-the-on-disk-bytes checks) through a throwaway tempdir — the same
+# seam `mde-term-egui`'s layout tests use. Already in the workspace lock, so it
+# adds no new lock line.
+tempfile = "3"
+
 [lints]
 workspace = true

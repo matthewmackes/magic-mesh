@@ -20,10 +20,12 @@
 //! in-workspace edge points inward to [`mde_egui`] (the harness + the shared
 //! Carbon `Style`).
 
+pub mod buffer;
 pub mod panel;
 
 use mde_egui::{eframe, egui};
 
+pub use buffer::Buffer;
 pub use panel::{editor_panel, EditorSurface};
 
 /// Build the production [`EditorSurface`] the E12 shell owns and mounts with
