@@ -27,7 +27,7 @@
 //! [`Delivery`]).
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -35,8 +35,8 @@ use std::{
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_chat::{
-    Contact, Conversation, Message, MessageKind, Presence, RoomDescriptor, RoomKind, Roster,
-    Severity,
+    Contact, Conversation, Message, MessageKind, NotifyPrefs, Presence, RoomDescriptor, RoomKind,
+    Roster, Severity,
 };
 use mde_egui::egui::{self, Align, Color32, Layout, RichText, ScrollArea};
 use mde_egui::Style;
@@ -53,6 +53,10 @@ const ROSTER_TOPIC: &str = "state/chat/roster";
 /// The room-registry mirror the worker publishes — every known room + its
 /// membership descriptor (NOTIFY-CHAT-5), latest-wins as a JSON array.
 const ROOMS_TOPIC: &str = "state/chat/rooms";
+/// The seat's notification-policy mirror the worker publishes (mute state) so the
+/// per-contact / per-room mute toggles read the TRUE persisted policy, not a
+/// local guess — latest-wins.
+const NOTIFY_TOPIC: &str = "state/chat/notify";
 /// Prefix for the per-conversation read-model the worker republishes each change.
 const CONVERSATION_PREFIX: &str = "state/chat/conversation/";
 /// The UI's outbound verb — a chat message to send.
@@ -61,6 +65,15 @@ const ACTION_CHAT_SEND: &str = "action/chat/send";
 /// room. `{op:"create"|"join"|"dissolve", id, name?}` — the worker replicates the
 /// signed descriptor and enforces creator-only dissolve.
 const ACTION_CHAT_ROOM: &str = "action/chat/room";
+/// The UI's presence verb (lock 5/21): set this seat's manual presence and/or its
+/// free-text status. `{presence?: <manual|null>, status?: <text|null>}` — the
+/// worker drains it, updates its self-presence, gossips it, and republishes the
+/// self entry on `state/chat/roster`.
+const ACTION_CHAT_PRESENCE: &str = "action/chat/presence";
+/// The UI's mute verb (NOTIFY-CHAT-5): mute/unmute a contact or room.
+/// `{target:"contact"|"room", id, muted}` — the worker updates its `NotifyPrefs`
+/// and republishes [`NOTIFY_TOPIC`].
+const ACTION_CHAT_MUTE: &str = "action/chat/mute";
 /// The voice worker's dial verb (lock 15 — Call hands off to `mde-voice`). Chat is
 /// the launch point; a running SIP agent draining this is integration-gated.
 const ACTION_VOICE_DIAL: &str = "action/voice/dial";
@@ -185,6 +198,70 @@ const fn severity_color(s: Severity) -> Color32 {
     }
 }
 
+/// The ICQ self-presence picker options (lock 5) — the operator-settable subset
+/// of [`Presence`]. **Available** clears the manual override (→ auto presence),
+/// the other four map to a manual [`Presence`]. Kept separate from the model enum
+/// so the picker shows exactly the five ICQ choices, never an auto/derived state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresenceChoice {
+    /// Free-for-Chat (manual).
+    FreeForChat,
+    /// Available — clears the manual override (auto presence).
+    Available,
+    /// Away (manual).
+    Away,
+    /// Do-Not-Disturb (manual).
+    Dnd,
+    /// Invisible (manual).
+    Invisible,
+}
+
+impl PresenceChoice {
+    /// The five options, in ICQ menu order.
+    const ALL: [Self; 5] = [
+        Self::FreeForChat,
+        Self::Available,
+        Self::Away,
+        Self::Dnd,
+        Self::Invisible,
+    ];
+
+    /// The picker selection that best represents `p` (an auto state maps to the
+    /// closest operator-facing option so the current presence always shows).
+    const fn from_presence(p: Presence) -> Self {
+        match p {
+            Presence::FreeForChat => Self::FreeForChat,
+            Presence::Away | Presence::ManualAway => Self::Away,
+            Presence::Dnd => Self::Dnd,
+            Presence::Invisible => Self::Invisible,
+            Presence::Online | Presence::Offline => Self::Available,
+        }
+    }
+
+    /// The wire tag posted on `action/chat/presence` — matches the worker's
+    /// `PresenceSet` `snake_case` names (Available ⇒ clear to auto presence).
+    const fn wire(self) -> &'static str {
+        match self {
+            Self::FreeForChat => "free_for_chat",
+            Self::Available => "available",
+            Self::Away => "away",
+            Self::Dnd => "dnd",
+            Self::Invisible => "invisible",
+        }
+    }
+
+    /// The menu / selected-text label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::FreeForChat => "Free for Chat",
+            Self::Available => "Available",
+            Self::Away => "Away",
+            Self::Dnd => "Do Not Disturb",
+            Self::Invisible => "Invisible",
+        }
+    }
+}
+
 /// The Chat surface state: the last roster + each contact's merged conversation
 /// (rebuilt from the latest-wins Bus mirrors each poll), the selected contact,
 /// the composer draft, and the per-contact read watermark for unread counts.
@@ -196,6 +273,15 @@ pub(crate) struct ChatState {
     convos: BTreeMap<String, Conversation>,
     /// The room registry the worker publishes (system + ad-hoc), latest-wins.
     rooms: Vec<RoomDescriptor>,
+    /// The seat's notification policy (mute state) the worker publishes on
+    /// [`NOTIFY_TOPIC`], so the mute toggles reflect the TRUE persisted policy
+    /// (`None` until the worker first publishes it — a fresh solo host).
+    notify: Option<NotifyPrefs>,
+    /// The inline self-status editor buffer (lock 21), populated when the editor
+    /// opens; committing posts it on `action/chat/presence`.
+    status_draft: String,
+    /// Whether the self-status inline editor is open (vs. the read-only display).
+    editing_status: bool,
     /// room id → its shared log ring, rebuilt each refresh from `room:<id>`.
     room_convos: BTreeMap<String, Conversation>,
     /// The selected contact or room (its conversation pane is open).
@@ -221,6 +307,9 @@ impl Default for ChatState {
             roster: None,
             convos: BTreeMap::new(),
             rooms: Vec::new(),
+            notify: None,
+            status_draft: String::new(),
+            editing_status: false,
             room_convos: BTreeMap::new(),
             selected: None,
             draft: String::new(),
@@ -255,6 +344,9 @@ impl ChatState {
         };
         if let Some(roster) = latest_json::<Roster>(&persist, ROSTER_TOPIC) {
             self.roster = Some(roster);
+        }
+        if let Some(prefs) = latest_json::<NotifyPrefs>(&persist, NOTIFY_TOPIC) {
+            self.notify = Some(prefs);
         }
         let Some(roster) = &self.roster else {
             return;
@@ -373,10 +465,13 @@ impl ChatState {
         self.rooms.iter().find(|d| d.id == id)
     }
 
-    /// The roster rail — the ICQ Online / Offline groups (lock 4).
-    fn roster_rail(&mut self, ui: &mut egui::Ui, roster: &Roster) {
-        // Self line, pinned at the top with its own presence (lock 17).
+    /// The pinned self line (lock 17): presence dot + name, an ICQ **presence
+    /// picker** to set your own presence (lock 5), and an inline **status editor**
+    /// (lock 21). Both post real `action/chat/presence` actions the chat worker
+    /// drains + republishes on the self roster entry — never local-only UI state.
+    fn self_line(&mut self, ui: &mut egui::Ui, roster: &Roster) {
         let me = roster.self_contact();
+        let current = PresenceChoice::from_presence(me.presence);
         ui.horizontal(|ui| {
             mde_egui::status_dot(ui, presence_color(me.presence));
             ui.label(
@@ -386,13 +481,66 @@ impl ChatState {
                     .strong(),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                mde_egui::muted_note(ui, me.presence.label());
+                let mut choice = current;
+                egui::ComboBox::from_id_salt("chat-self-presence")
+                    .selected_text(choice.label())
+                    .show_ui(ui, |ui| {
+                        for opt in PresenceChoice::ALL {
+                            ui.selectable_value(&mut choice, opt, opt.label());
+                        }
+                    });
+                if choice != current {
+                    self.set_presence(choice);
+                }
             });
         });
-        if let Some(status) = &me.status_message {
-            mde_egui::muted_note(ui, status);
+        // Status: a muted read-only line + an ✎ edit affordance, or the inline
+        // editor when open. Committing posts the status (empty ⇒ clear) via the
+        // same presence action the worker republishes on the self roster entry.
+        if self.editing_status {
+            ui.horizontal(|ui| {
+                let field = egui::TextEdit::singleline(&mut self.status_draft)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Set a status…");
+                let resp = ui.add(field);
+                let commit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button("Save").clicked() || commit {
+                    self.set_status(Some(self.status_draft.trim()));
+                    self.editing_status = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.editing_status = false;
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                match &me.status_message {
+                    Some(status) => {
+                        mde_egui::muted_note(ui, status);
+                    }
+                    None => {
+                        mde_egui::muted_note(ui, "No status set");
+                    }
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .small_button("\u{270E}")
+                        .on_hover_text("Edit your status")
+                        .clicked()
+                    {
+                        self.status_draft = me.status_message.clone().unwrap_or_default();
+                        self.editing_status = true;
+                    }
+                });
+            });
         }
         ui.separator();
+    }
+
+    /// The roster rail — the ICQ Online / Offline groups (lock 4).
+    fn roster_rail(&mut self, ui: &mut egui::Ui, roster: &Roster) {
+        // Self line, pinned at the top with its own presence (lock 17).
+        self.self_line(ui, roster);
 
         ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -569,6 +717,7 @@ impl ChatState {
     fn conversation_pane(&mut self, ui: &mut egui::Ui, roster: &Roster, host: &str) {
         let is_self = roster.is_self(host);
         let bus_root = self.bus_root.clone();
+        let muted = self.is_contact_muted(host);
         // Header.
         if let Some(contact) = roster.get(host) {
             ui.horizontal(|ui| {
@@ -592,7 +741,7 @@ impl ChatState {
             // remote desktop. Only for a peer: you don't Call / Remote-Control your
             // own node (the self-contact is alerts/clips only, lock 17).
             if !is_self {
-                contact_actions(ui, bus_root.as_deref(), host);
+                contact_actions(ui, bus_root.as_deref(), host, muted);
             }
         }
         ui.separator();
@@ -613,10 +762,7 @@ impl ChatState {
             .stick_to_bottom(true)
             .show(ui, |ui| match self.convos.get(host) {
                 Some(conv) if !conv.is_empty() => {
-                    for msg in conv.messages() {
-                        message_row(ui, msg, self_host, recipient, bus_root.as_deref());
-                        ui.add_space(Style::SP_XS);
-                    }
+                    render_timeline(ui, conv.messages(), self_host, recipient, bus_root.as_deref());
                 }
                 _ => {
                     let subtitle = if is_self {
@@ -733,6 +879,7 @@ impl ChatState {
     /// and a composer that sends `{scope:"room"}`.
     fn room_pane(&mut self, ui: &mut egui::Ui, roster: &Roster, id: &str) {
         let bus_root = self.bus_root.clone();
+        let room_muted = self.is_room_muted(id);
         let self_host = roster.self_host().to_string();
         let Some((name, kind, members, is_member, can_dissolve)) =
             self.room_descriptor(id).map(|d| {
@@ -787,6 +934,7 @@ impl ChatState {
                 self.room_action("dissolve", id, None);
                 self.selected = None;
             }
+            mute_button(ui, bus_root.as_deref(), "room", id, room_muted);
         });
         ui.separator();
 
@@ -802,13 +950,10 @@ impl ChatState {
             .stick_to_bottom(true)
             .show(ui, |ui| match self.room_convos.get(id) {
                 Some(conv) if !conv.is_empty() => {
-                    for msg in conv.messages() {
-                        // A room has no single recipient presence — pass None so my
-                        // outgoing line reads a neutral "Sent" (the honest room state;
-                        // per-member delivery is the worker's fan-out, lock 22).
-                        message_row(ui, msg, &self_host, None, bus_root.as_deref());
-                        ui.add_space(Style::SP_XS);
-                    }
+                    // A room has no single recipient presence — pass None so my
+                    // outgoing line reads a neutral "Sent" (the honest room state;
+                    // per-member delivery is the worker's fan-out, lock 22).
+                    render_timeline(ui, conv.messages(), &self_host, None, bus_root.as_deref());
                 }
                 _ => {
                     crate::session::empty_state(
@@ -873,6 +1018,34 @@ impl ChatState {
         }
         publish(self.bus_root.as_deref(), ACTION_CHAT_ROOM, &obj.to_string());
     }
+
+    /// Post `action/chat/presence` to set this seat's presence (Available ⇒ clear
+    /// to auto). The worker updates its self-presence, gossips it, and republishes
+    /// the self roster entry the roster rail then reads back.
+    fn set_presence(&self, choice: PresenceChoice) {
+        let body = serde_json::json!({ "presence": choice.wire() }).to_string();
+        publish(self.bus_root.as_deref(), ACTION_CHAT_PRESENCE, &body);
+    }
+
+    /// Post `action/chat/presence` to set this seat's free-text status (empty ⇒
+    /// clear at the worker). Carried on the same action the worker republishes.
+    fn set_status(&self, status: Option<&str>) {
+        let body = serde_json::json!({ "status": status }).to_string();
+        publish(self.bus_root.as_deref(), ACTION_CHAT_PRESENCE, &body);
+    }
+
+    /// Whether contact `host` is muted per the worker's published policy (a
+    /// missing mirror — a fresh solo host — reads as not-muted).
+    fn is_contact_muted(&self, host: &str) -> bool {
+        self.notify
+            .as_ref()
+            .is_some_and(|n| n.is_contact_muted(host))
+    }
+
+    /// Whether room `id` is muted per the worker's published policy.
+    fn is_room_muted(&self, id: &str) -> bool {
+        self.notify.as_ref().is_some_and(|n| n.is_room_muted(id))
+    }
 }
 
 /// Derive a stable, canonical room id from an operator-typed name: lowercase, ASCII
@@ -933,6 +1106,94 @@ fn latest_json<T: serde::de::DeserializeOwned>(persist: &Persist, topic: &str) -
     serde_json::from_str::<T>(body).ok()
 }
 
+/// Render a conversation's messages with a muted **day separator** whenever the
+/// civil (UTC) date changes — the authentic chat idiom — each row carrying its own
+/// HH:MM timestamp ([`message_row`]). Shared by the contact + room panes so both
+/// read the same way.
+fn render_timeline(
+    ui: &mut egui::Ui,
+    messages: &VecDeque<Message>,
+    self_host: &str,
+    recipient: Option<&Contact>,
+    bus_root: Option<&Path>,
+) {
+    let mut last_date: Option<String> = None;
+    for msg in messages {
+        let date = fmt_date(msg.ts_unix_ms);
+        if last_date.as_deref() != Some(date.as_str()) {
+            day_separator(ui, &date);
+            last_date = Some(date);
+        }
+        message_row(ui, msg, self_host, recipient, bus_root);
+        ui.add_space(Style::SP_XS);
+    }
+}
+
+/// A centered, token-muted day-separator chip in the timeline.
+fn day_separator(ui: &mut egui::Ui, date: &str) {
+    ui.add_space(Style::SP_XS);
+    ui.vertical_centered(|ui| {
+        mde_egui::muted_note(ui, date);
+    });
+    ui.add_space(Style::SP_XS);
+}
+
+/// Compact wall-clock `HH:MM` (UTC) for a message's injected send time. Pure — no
+/// external time crate (there is none in this DRM seat's deps); UTC so it never
+/// claims a local zone it can't know. A non-positive timestamp yields "".
+fn fmt_hh_mm(ts_unix_ms: i64) -> String {
+    if ts_unix_ms <= 0 {
+        return String::new();
+    }
+    let tod = (ts_unix_ms / 1000).rem_euclid(86_400);
+    format!("{:02}:{:02}", tod / 3600, (tod % 3600) / 60)
+}
+
+/// A full `YYYY-MM-DD HH:MM UTC` stamp — the message-row hover.
+fn fmt_full_datetime(ts_unix_ms: i64) -> String {
+    if ts_unix_ms <= 0 {
+        return "unknown time".to_string();
+    }
+    let secs = ts_unix_ms / 1000;
+    let tod = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        tod / 3600,
+        (tod % 3600) / 60
+    )
+}
+
+/// The civil `YYYY-MM-DD` (UTC) date for a message — the day-separator key.
+fn fmt_date(ts_unix_ms: i64) -> String {
+    if ts_unix_ms <= 0 {
+        return "unknown date".to_string();
+    }
+    let (year, month, day) = civil_from_days((ts_unix_ms / 1000).div_euclid(86_400));
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Civil `(year, month, day)` from a day-count since the Unix epoch
+/// (1970-01-01), proleptic Gregorian. Howard Hinnant's `civil_from_days` — the
+/// one piece of calendar math the DRM seat needs with no time crate on the deps.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = (if shifted >= 0 { shifted } else { shifted - 146_096 }) / 146_097;
+    let day_of_era = shifted - era * 146_097; // [0, 146096]
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153; // [0, 11]
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1; // [1, 31]
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    }; // [1, 12]
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
 /// Render one message row (human text, a clipboard copy, a folded alert card, or
 /// a file/call/remote hand-off). Each kind renders **and acts** (NOTIFY-CHAT-4 —
 /// re-copy, run an alert verb, download a file, re-launch Call / Remote); my own
@@ -960,6 +1221,14 @@ fn message_row(
                     let (glyph, label) = delivery.badge();
                     ui.colored_label(delivery.color(), RichText::new(glyph).size(Style::SMALL))
                         .on_hover_text(label);
+                }
+                // Compact HH:MM (UTC) send time, token-muted, full date on hover —
+                // every message carries its injected timestamp (lock 22), so the
+                // row is no longer time-blind (the biggest "looks incomplete" tell).
+                let hhmm = fmt_hh_mm(msg.ts_unix_ms);
+                if !hhmm.is_empty() {
+                    ui.label(RichText::new(hhmm).color(Style::TEXT_DIM).size(Style::SMALL))
+                        .on_hover_text(fmt_full_datetime(msg.ts_unix_ms));
                 }
             });
         });
@@ -1077,12 +1346,14 @@ fn message_body(ui: &mut egui::Ui, msg: &Message, bus_root: Option<&Path>) {
     }
 }
 
-/// The per-contact action bar under the conversation header: **Call** (SIP) and
-/// **Remote Control** (VDI), the two per-contact hand-offs of lock 15. Both fire
-/// their owning crate's Bus verb; the live SIP register+call and live VDI connect
-/// are integration-gated (a running agent / broker / guest), so this is the honest
-/// reachable near half — the launch, never a faked session.
-fn contact_actions(ui: &mut egui::Ui, bus_root: Option<&Path>, host: &str) {
+/// The per-contact action bar under the conversation header: **Call** (SIP),
+/// **Remote Control** (VDI) — the two per-contact hand-offs of lock 15 — and a
+/// **Mute** toggle (NOTIFY-CHAT-5) that silences this contact's messages + alerts.
+/// Call/Remote fire their owning crate's Bus verb (the live SIP register+call and
+/// VDI connect are integration-gated — the honest reachable launch, never a faked
+/// session); Mute posts `action/chat/mute`, which the worker drains into its
+/// `NotifyPrefs` and republishes so `muted` reflects the true persisted policy.
+fn contact_actions(ui: &mut egui::Ui, bus_root: Option<&Path>, host: &str, muted: bool) {
     ui.horizontal(|ui| {
         if ui
             .button("\u{1F4DE} Call")
@@ -1098,7 +1369,34 @@ fn contact_actions(ui: &mut egui::Ui, bus_root: Option<&Path>, host: &str) {
         {
             request_host_desktop(bus_root, host);
         }
+        mute_button(ui, bus_root, "contact", host, muted);
     });
+}
+
+/// A **Mute / Unmute** toggle for a contact or room. `muted` is the current
+/// (worker-published) state; clicking posts `action/chat/mute` with the flipped
+/// value so the worker updates + republishes the policy (the round-trip that
+/// makes the toggle real, not a local-only switch — §7).
+fn mute_button(ui: &mut egui::Ui, bus_root: Option<&Path>, target: &str, id: &str, muted: bool) {
+    let (glyph, hint) = if muted {
+        ("\u{1F514} Unmute", format!("Unmute {id} — let it ring again"))
+    } else {
+        (
+            "\u{1F515} Mute",
+            format!("Mute {id} — silence its messages + alerts"),
+        )
+    };
+    if ui.button(glyph).on_hover_text(hint).clicked() {
+        publish_mute(bus_root, target, id, !muted);
+    }
+}
+
+/// Publish `action/chat/mute` `{target, id, muted}` to the local Bus — the worker
+/// drains it into this seat's `NotifyPrefs` (best-effort; a missing Bus is a
+/// silent no-op, the honest solo-host state).
+fn publish_mute(bus_root: Option<&Path>, target: &str, id: &str, muted: bool) {
+    let body = serde_json::json!({ "target": target, "id": id, "muted": muted }).to_string();
+    publish(bus_root, ACTION_CHAT_MUTE, &body);
 }
 
 /// Fire the voice worker's dial verb for `host` (lock 15 — Call hands off to
@@ -1508,5 +1806,110 @@ mod tests {
         state.create_room("***"); // empty slug → refused, still no panic
         state.room_action("join", "ops", None);
         state.room_action("create", "ops", Some("Ops"));
+    }
+
+    // ── timestamps + presence/status/mute (the four closed gaps) ───────────────
+
+    /// The message row's timestamp: a compact HH:MM (UTC) with a full-date hover,
+    /// derived by the pure formatters — and the row paints over a real timestamped
+    /// message. A non-positive time renders blank (never a fabricated "00:00").
+    #[test]
+    fn message_row_renders_a_timestamp() {
+        use mde_egui::egui::{pos2, vec2, Rect};
+
+        // A known epoch: 1_700_000_000_000 ms = 2023-11-14 22:13:20 UTC.
+        assert_eq!(fmt_hh_mm(1_700_000_000_000), "22:13");
+        assert_eq!(fmt_full_datetime(1_700_000_000_000), "2023-11-14 22:13 UTC");
+        assert_eq!(fmt_date(1_700_000_000_000), "2023-11-14");
+        // A civil leap-year day still resolves (2024-02-29).
+        assert_eq!(fmt_date(1_709_200_000_000), "2024-02-29");
+        // A non-positive timestamp is an honest blank, not a faked clock.
+        assert!(fmt_hh_mm(0).is_empty());
+        assert!(fmt_hh_mm(-5).is_empty());
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let msg = Message::text("nyc3", 1_700_000_000_000, "hello");
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 200.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                message_row(ui, &msg, "eagle", None, None);
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "a timestamped message row produced no draw primitives"
+        );
+    }
+
+    /// The self-presence picker maps live presence → the picker selection, and
+    /// each option → the wire tag the worker's `PresenceSet` decodes ("available"
+    /// clears to auto; the four ICQ manual states set their override).
+    #[test]
+    fn presence_choice_maps_presence_and_wire_tags() {
+        // Auto/derived states map to the closest picker option so the live
+        // presence always shows a selection.
+        assert_eq!(
+            PresenceChoice::from_presence(Presence::Online),
+            PresenceChoice::Available
+        );
+        assert_eq!(
+            PresenceChoice::from_presence(Presence::ManualAway),
+            PresenceChoice::Away
+        );
+        assert_eq!(
+            PresenceChoice::from_presence(Presence::Dnd),
+            PresenceChoice::Dnd
+        );
+        assert_eq!(
+            PresenceChoice::from_presence(Presence::FreeForChat),
+            PresenceChoice::FreeForChat
+        );
+        // Wire tags match the worker's `PresenceSet` snake_case names.
+        assert_eq!(PresenceChoice::Available.wire(), "available");
+        assert_eq!(PresenceChoice::Dnd.wire(), "dnd");
+        assert_eq!(PresenceChoice::Away.wire(), "away");
+        assert_eq!(PresenceChoice::FreeForChat.wire(), "free_for_chat");
+        assert_eq!(PresenceChoice::Invisible.wire(), "invisible");
+    }
+
+    /// The mute toggles read the worker-published `state/chat/notify` mirror — the
+    /// round-trip that makes them real, not local-only. No mirror ⇒ nothing muted.
+    #[test]
+    fn mute_state_reads_the_published_notify_mirror() {
+        let mut state = ChatState::default();
+        assert!(!state.is_contact_muted("nyc3"));
+        assert!(!state.is_room_muted("ops"));
+        let mut prefs = NotifyPrefs::new();
+        prefs.mute_contact("nyc3");
+        prefs.mute_room("ops");
+        state.notify = Some(prefs);
+        assert!(state.is_contact_muted("nyc3"));
+        assert!(state.is_room_muted("ops"));
+        assert!(
+            !state.is_contact_muted("fra1"),
+            "an unmuted contact still rings"
+        );
+    }
+
+    /// The presence / status / mute action helpers are best-effort: with no Bus
+    /// directory they are silent no-ops (the honest solo-host state), never a panic.
+    #[test]
+    fn presence_status_and_mute_helpers_are_silent_without_a_bus() {
+        let state = ChatState {
+            bus_root: None,
+            ..ChatState::default()
+        };
+        state.set_presence(PresenceChoice::Dnd);
+        state.set_presence(PresenceChoice::Available); // clear to auto
+        state.set_status(Some("brb"));
+        state.set_status(Some("")); // empty clears at the worker
+        state.set_status(None);
+        publish_mute(None, "contact", "nyc3", true);
+        publish_mute(None, "room", "ops", false);
     }
 }

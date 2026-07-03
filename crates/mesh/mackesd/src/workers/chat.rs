@@ -67,12 +67,29 @@ use super::{ShutdownToken, Worker};
 pub const ACTION_CHAT_SEND: &str = "action/chat/send";
 /// The UI's room-lifecycle verb (NOTIFY-CHAT-5): create / self-join / dissolve.
 pub const ACTION_CHAT_ROOM: &str = "action/chat/room";
+/// The UI's presence verb (NOTIFY-CHAT-3, lock 5/21).
+///
+/// Sets this seat's manual presence (Free-for-Chat / Away / DND / Invisible, or
+/// clear → auto) and/or its free-text status; drained into the worker's
+/// self-presence, gossiped, and republished on `state/chat/roster` (self entry).
+pub const ACTION_CHAT_PRESENCE: &str = "action/chat/presence";
+/// The UI's mute verb (NOTIFY-CHAT-5).
+///
+/// Mutes/unmutes a contact or room in this seat's [`NotifyPrefs`]; drained +
+/// persisted to the seat-local `notify.json` + republished on `state/chat/notify`
+/// so the UI's toggle reflects the true state.
+pub const ACTION_CHAT_MUTE: &str = "action/chat/mute";
 /// The signed-envelope delivery lane (fast path; the log is the durable copy).
 pub const EVENT_CHAT_MESSAGE: &str = "event/chat/message";
 /// The presence roster mirror the UI reads.
 pub const STATE_CHAT_ROSTER: &str = "state/chat/roster";
 /// The room-registry mirror the UI reads (all known rooms + membership).
 pub const STATE_CHAT_ROOMS: &str = "state/chat/rooms";
+/// This seat's notification-policy mirror the UI reads (mute state), latest-wins.
+///
+/// Its mute toggles reflect the true persisted [`NotifyPrefs`]. Seat-local: a
+/// read-model for the local UI, never gossiped to peers.
+pub const STATE_CHAT_NOTIFY: &str = "state/chat/notify";
 /// Prefix for the per-conversation read-model the UI renders.
 pub const STATE_CHAT_CONVERSATION_PREFIX: &str = "state/chat/conversation/";
 /// The KIRON chyron lane (`docs/design/kiron-toast-pattern.md`, lock 7).
@@ -219,6 +236,79 @@ struct RoomRequest {
     /// The display name (create only; defaults to the id).
     #[serde(default)]
     name: Option<String>,
+}
+
+/// The operator-settable presence choices (lock 5) — the ICQ subset the picker
+/// offers.
+///
+/// `Available` clears the manual override so presence reverts to auto
+/// mesh-health; the other four set a manual [`Presence`]. A distinct wire enum
+/// (not bare [`Presence`]) so "clear to auto" is an explicit `"available"`, never
+/// an ambiguous `null`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PresenceSet {
+    /// Free-for-Chat (manual).
+    FreeForChat,
+    /// Available — clears the manual override (auto presence).
+    Available,
+    /// Away (manual).
+    Away,
+    /// Do-Not-Disturb (manual).
+    Dnd,
+    /// Invisible (manual).
+    Invisible,
+}
+
+impl PresenceSet {
+    /// The manual [`Presence`] this choice sets — `None` for Available (auto).
+    const fn to_manual(self) -> Option<Presence> {
+        match self {
+            Self::FreeForChat => Some(Presence::FreeForChat),
+            Self::Available => None,
+            Self::Away => Some(Presence::ManualAway),
+            Self::Dnd => Some(Presence::Dnd),
+            Self::Invisible => Some(Presence::Invisible),
+        }
+    }
+}
+
+/// The UI's `action/chat/presence` request body (NOTIFY-CHAT-3, lock 5/21).
+///
+/// An **absent** field is left unchanged; a present `presence` sets it (Available
+/// ⇒ auto); a present `status` sets it (empty ⇒ clear). Presence + status are
+/// posted by separate UI affordances (the picker / the editor), each touching
+/// only its own field — so plain `Option`s (absent = leave) suffice.
+#[derive(Debug, Clone, Deserialize)]
+struct PresenceRequest {
+    /// The presence choice to apply, if this action sets one.
+    #[serde(default)]
+    presence: Option<PresenceSet>,
+    /// The free-text status to apply, if this action sets one (empty ⇒ clear).
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// Whether an `action/chat/mute` op targets a contact host or a room id.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MuteTarget {
+    /// A contact hostname.
+    Contact,
+    /// A room id.
+    Room,
+}
+
+/// The UI's `action/chat/mute` request body (NOTIFY-CHAT-5): set or clear a
+/// per-contact / per-room mute in this seat's [`NotifyPrefs`].
+#[derive(Debug, Clone, Deserialize)]
+struct MuteRequest {
+    /// Whether `id` is a contact host or a room id.
+    target: MuteTarget,
+    /// The contact host / room id to (un)mute.
+    id: String,
+    /// `true` mutes, `false` unmutes.
+    muted: bool,
 }
 
 /// A one-line headline for a **chat-message** chyron (NOTIFY-CHAT-5, KIRON lock
@@ -722,7 +812,7 @@ impl ChatWorker {
     /// Rehydrate the in-memory conversations from the Syncthing union so history
     /// survives a restart; each rehydrated key is marked dirty so the first tick
     /// republishes its `state/chat/conversation/<key>` mirror.
-    fn bootstrap(&self, state: &mut ChatState) {
+    fn bootstrap(&mut self, state: &mut ChatState) {
         for key in discover_persisted_keys(&self.workgroup_root) {
             let conv = load_conversation(&self.workgroup_root, &key);
             if !conv.is_empty() {
@@ -730,8 +820,20 @@ impl ChatWorker {
                 state.convos.insert(key, conv);
             }
         }
+        // Reload this seat's own last-set presence + status (lock 5/21) from its
+        // gossip file so an operator's manual override survives a restart — the
+        // same durability the notify prefs + room registry below already have. A
+        // missing file leaves the construction seed intact.
+        if let Some(g) = std::fs::read_to_string(presence_path(&self.workgroup_root, &self.self_host))
+            .ok()
+            .and_then(|s| serde_json::from_str::<PresenceGossip>(&s).ok())
+        {
+            self.manual_presence = g.manual;
+            self.status_message = g.status_message;
+        }
         // Seat-local notification policy (mute + threshold, NOTIFY-CHAT-5).
         state.notify = load_notify_prefs(&self.workgroup_root, &self.self_host);
+        state.notify_dirty = true; // publish the loaded mute mirror on the first tick
         // Seed the auto system rooms (All Fleet + per-severity), then union every
         // host's persisted ad-hoc rooms so cross-node rooms surface on restart.
         for d in system_room_descriptors() {
@@ -752,15 +854,95 @@ impl ChatWorker {
 
     /// One poll pass — the headless-testable core (drives the whole worker with
     /// an injected Persist + tempdir root, no tokio timer, no live mesh).
-    fn tick_once(&self, persist: &Persist, state: &mut ChatState, now_ms: i64) {
+    fn tick_once(&mut self, persist: &Persist, state: &mut ChatState, now_ms: i64) {
+        // Presence first — a self-set DND takes effect for this same tick's gate.
+        self.drain_presence(persist, state);
         let dnd = self.self_dnd();
         self.drain_sends(persist, state, now_ms);
         self.drain_room_ops(persist, state);
+        self.drain_mutes(persist, state);
         self.drain_inbound(persist, state, dnd);
         self.drain_alerts(persist, state, dnd);
         self.publish_roster(persist, state);
         self.publish_rooms(persist, state);
+        publish_notify(persist, state);
         flush_dirty(persist, state);
+    }
+
+    /// Drain `action/chat/presence`: set this seat's manual presence and/or its
+    /// free-text status (lock 5/21). An absent field is left unchanged; an
+    /// explicit `null` (or an empty/whitespace status) clears it. The change is
+    /// gossiped for peers + republished on `state/chat/roster` by
+    /// [`publish_roster`] this same tick (latest-wins), so the self roster entry
+    /// the UI reads reflects it live — a real round-trip, not local-only UI state.
+    fn drain_presence(&mut self, persist: &Persist, state: &mut ChatState) {
+        for m in take_new(persist, &mut state.cursors, ACTION_CHAT_PRESENCE) {
+            let Some(body) = m.body.as_deref() else {
+                continue;
+            };
+            let req = match serde_json::from_str::<PresenceRequest>(body) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(target: "mackesd::chat", error = %e, "bad action/chat/presence body");
+                    continue;
+                }
+            };
+            if let Some(choice) = req.presence {
+                self.manual_presence = choice.to_manual();
+            }
+            if let Some(s) = req.status {
+                // An empty/whitespace status clears it (no blank status line).
+                self.status_message = if s.trim().is_empty() { None } else { Some(s) };
+            }
+        }
+    }
+
+    /// Drain `action/chat/mute`: set/clear a per-contact or per-room mute in this
+    /// seat's [`NotifyPrefs`] (NOTIFY-CHAT-5), persist the seat-local `notify.json`
+    /// so it survives a restart, and mark the `state/chat/notify` mirror for
+    /// republish so the UI's toggle reflects the new state. Seat-local: a mute is
+    /// the operator's own, never gossiped to peers.
+    fn drain_mutes(&self, persist: &Persist, state: &mut ChatState) {
+        let mut changed = false;
+        for m in take_new(persist, &mut state.cursors, ACTION_CHAT_MUTE) {
+            let Some(body) = m.body.as_deref() else {
+                continue;
+            };
+            let req = match serde_json::from_str::<MuteRequest>(body) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(target: "mackesd::chat", error = %e, "bad action/chat/mute body");
+                    continue;
+                }
+            };
+            let applied = match req.target {
+                MuteTarget::Contact => {
+                    if req.muted {
+                        state.notify.mute_contact(req.id)
+                    } else {
+                        state.notify.unmute_contact(&req.id)
+                    }
+                }
+                MuteTarget::Room => {
+                    if req.muted {
+                        state.notify.mute_room(req.id)
+                    } else {
+                        state.notify.unmute_room(&req.id)
+                    }
+                }
+            };
+            changed |= applied;
+        }
+        if changed {
+            if let Ok(body) = serde_json::to_string(&state.notify) {
+                if let Err(e) =
+                    write_atomic(&notify_path(&self.workgroup_root, &self.self_host), &body)
+                {
+                    tracing::warn!(target: "mackesd::chat", error = %e, "notify prefs persist failed");
+                }
+            }
+            state.notify_dirty = true;
+        }
     }
 
     /// Drain `action/chat/send`: sign, persist to my own log (the durable +
@@ -1093,6 +1275,8 @@ struct ChatState {
     rooms: BTreeMap<String, RoomDescriptor>,
     /// Whether the room registry changed this tick (republish + persist).
     rooms_dirty: bool,
+    /// Whether the `state/chat/notify` mute mirror changed this tick (republish).
+    notify_dirty: bool,
 }
 
 /// New messages on `topic` since the cursor, seeding the cursor to the current
@@ -1134,6 +1318,19 @@ fn flush_dirty(persist: &Persist, state: &mut ChatState) {
                 publish(persist, &conversation_topic(&key), &body);
             }
         }
+    }
+}
+
+/// Republish the `state/chat/notify` mute mirror the UI reads — only when the
+/// policy changed this tick (Syncthing-free, seat-local, latest-wins). Draining
+/// the dirty flag keeps a steady mesh from rewriting the topic every tick.
+fn publish_notify(persist: &Persist, state: &mut ChatState) {
+    if !state.notify_dirty {
+        return;
+    }
+    state.notify_dirty = false;
+    if let Ok(body) = serde_json::to_string(&state.notify) {
+        publish(persist, STATE_CHAT_NOTIFY, &body);
     }
 }
 
@@ -1180,6 +1377,7 @@ impl Worker for ChatWorker {
         self.bootstrap(&mut state);
         self.publish_roster(&persist, &mut state);
         self.publish_rooms(&persist, &mut state);
+        publish_notify(&persist, &mut state);
         flush_dirty(&persist, &mut state);
         let mut tick = tokio::time::interval(self.poll_interval);
         tick.tick().await;
@@ -1372,7 +1570,7 @@ mod tests {
     fn send_signs_persists_and_relays() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let w = worker(root);
+        let mut w = worker(root);
         let persist = persist_at(root);
         let mut state = ChatState::default();
         // Tick 1 seeds cursors to head — the send lane is empty so nothing yet.
@@ -1413,7 +1611,7 @@ mod tests {
     fn inbound_verified_message_folds_into_the_peer_conversation() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let w = worker(root); // self = eagle
+        let mut w = worker(root); // self = eagle
         let persist = persist_at(root);
         let mut state = ChatState::default();
         w.tick_once(&persist, &mut state, 100); // seed cursors
@@ -1444,7 +1642,7 @@ mod tests {
     fn inbound_with_a_bad_signature_is_dropped() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let w = worker(root);
+        let mut w = worker(root);
         let persist = persist_at(root);
         let mut state = ChatState::default();
         w.tick_once(&persist, &mut state, 100);
@@ -1474,7 +1672,7 @@ mod tests {
     fn alert_lane_folds_into_the_origin_hosts_conversation() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let w = worker(root);
+        let mut w = worker(root);
         let persist = persist_at(root);
         let mut state = ChatState::default();
         // A lane is discovered only once it already has a message; on first
@@ -1595,7 +1793,7 @@ mod tests {
     fn alert_lane_raises_one_chyron_and_dedups_a_refold() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let w = worker(root);
+        let mut w = worker(root);
         let persist = persist_at(root);
         let mut state = ChatState::default();
         // Prime + seed the lane (forward-only), then land a live Warning alert.
@@ -1671,7 +1869,7 @@ mod tests {
     fn a_muted_contact_alert_is_silent_but_still_logged() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let w = worker(root); // self = eagle
+        let mut w = worker(root); // self = eagle
         let persist = persist_at(root);
         let mut state = ChatState::default();
         state.notify.mute_contact("nyc3");
@@ -1712,7 +1910,7 @@ mod tests {
     fn an_inbound_message_toasts_as_chat_unless_the_contact_is_muted() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let w = worker(root); // self = eagle
+        let mut w = worker(root); // self = eagle
         let persist = persist_at(root);
         let mut state = ChatState::default();
         w.tick_once(&persist, &mut state, 100); // seed cursors
@@ -1766,7 +1964,7 @@ mod tests {
     fn dnd_hushes_a_warning_but_a_critical_breaks_through() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let w = worker(root).with_manual_presence(Presence::Dnd);
+        let mut w = worker(root).with_manual_presence(Presence::Dnd);
         let persist = persist_at(root);
         let mut state = ChatState::default();
         persist
@@ -1816,7 +2014,7 @@ mod tests {
     fn a_folded_alert_is_fanned_into_its_per_severity_system_room() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let w = worker(root);
+        let mut w = worker(root);
         let persist = persist_at(root);
         let mut state = ChatState::default();
         persist
@@ -1856,7 +2054,7 @@ mod tests {
     fn room_create_join_and_creator_only_dissolve() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let w = worker(root); // self = eagle
+        let mut w = worker(root); // self = eagle
         let persist = persist_at(root);
         let mut state = ChatState::default();
         w.tick_once(&persist, &mut state, 100); // seed the room-op lane cursor
@@ -1930,7 +2128,7 @@ mod tests {
         )
         .unwrap();
 
-        let w = worker(root);
+        let mut w = worker(root);
         let mut state = ChatState::default();
         w.bootstrap(&mut state);
         // System rooms are seeded …
@@ -1970,11 +2168,209 @@ mod tests {
         let mut m = Message::text("eagle", 10, "earlier");
         sign(&mut m, &key());
         append_own(root, "eagle", &k, &m);
-        let w = worker(root);
+        let mut w = worker(root);
         let mut state = ChatState::default();
         w.bootstrap(&mut state);
         assert_eq!(state.convos.get(&k).map(Conversation::len), Some(1));
         assert!(state.dirty.contains(&k), "rehydrated key republishes");
+    }
+
+    // ── presence + status round-trip (NOTIFY-CHAT-3, lock 5/21) ─────────
+
+    #[test]
+    fn presence_action_sets_self_presence_and_republishes_the_roster() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut w = worker(root); // self = eagle, auto presence (Online)
+        let persist = persist_at(root);
+        let mut state = ChatState::default();
+        w.tick_once(&persist, &mut state, 100); // seed the presence lane cursor
+
+        // The UI sets Do-Not-Disturb + a status message.
+        persist
+            .write(
+                ACTION_CHAT_PRESENCE,
+                Priority::Default,
+                None,
+                Some(r#"{"presence":"dnd","status":"heads-down"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 200);
+
+        // The republished roster's SELF entry carries the new presence + status —
+        // a real round-trip through the worker, not local-only UI state.
+        let published = |p: &Persist| -> Roster {
+            let msgs = p.list_since(STATE_CHAT_ROSTER, None).unwrap();
+            serde_json::from_str(msgs.last().unwrap().body.as_ref().unwrap()).unwrap()
+        };
+        let r = published(&persist);
+        assert_eq!(r.self_contact().presence, Presence::Dnd);
+        assert_eq!(r.self_contact().status_message.as_deref(), Some("heads-down"));
+        assert!(w.self_dnd(), "self DND now gates the alert firehose");
+        // The manual override is gossiped for peers, too.
+        let g: PresenceGossip =
+            serde_json::from_str(&std::fs::read_to_string(presence_path(root, "eagle")).unwrap())
+                .unwrap();
+        assert_eq!(g.manual, Some(Presence::Dnd));
+        assert_eq!(g.status_message.as_deref(), Some("heads-down"));
+
+        // "Available" clears the manual override (→ auto Online); "" clears status.
+        persist
+            .write(
+                ACTION_CHAT_PRESENCE,
+                Priority::Default,
+                None,
+                Some(r#"{"presence":"available","status":""}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 300);
+        let r = published(&persist);
+        assert_eq!(r.self_contact().presence, Presence::Online, "cleared → auto");
+        assert_eq!(r.self_contact().status_message, None, "empty clears status");
+        assert!(!w.self_dnd());
+    }
+
+    #[test]
+    fn presence_action_can_touch_only_the_status_leaving_presence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut w = worker(root).with_manual_presence(Presence::FreeForChat);
+        let persist = persist_at(root);
+        let mut state = ChatState::default();
+        w.tick_once(&persist, &mut state, 100); // seed
+
+        // Only a status field — the manual presence must be left as-is.
+        persist
+            .write(
+                ACTION_CHAT_PRESENCE,
+                Priority::Default,
+                None,
+                Some(r#"{"status":"reviewing PRs"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 200);
+        let msgs = persist.list_since(STATE_CHAT_ROSTER, None).unwrap();
+        let r: Roster = serde_json::from_str(msgs.last().unwrap().body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            r.self_contact().presence,
+            Presence::FreeForChat,
+            "an absent presence field leaves the override unchanged"
+        );
+        assert_eq!(
+            r.self_contact().status_message.as_deref(),
+            Some("reviewing PRs")
+        );
+    }
+
+    #[test]
+    fn bootstrap_reloads_the_seats_last_presence_and_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A prior run gossiped DND + a status into this seat's presence.json.
+        let gossip = PresenceGossip {
+            manual: Some(Presence::Dnd),
+            status_message: Some("brb".into()),
+            nickname: None,
+        };
+        write_atomic(
+            &presence_path(root, "eagle"),
+            &serde_json::to_string(&gossip).unwrap(),
+        )
+        .unwrap();
+        let mut w = worker(root);
+        let mut state = ChatState::default();
+        w.bootstrap(&mut state);
+        assert_eq!(w.manual_presence, Some(Presence::Dnd));
+        assert_eq!(w.status_message.as_deref(), Some("brb"));
+        assert!(w.self_dnd(), "the reloaded DND survives a restart");
+    }
+
+    // ── mute round-trip (NOTIFY-CHAT-5) ─────────────────────────────────
+
+    #[test]
+    fn mute_action_updates_notify_prefs_persists_and_republishes_the_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut w = worker(root); // self = eagle
+        let persist = persist_at(root);
+        let mut state = ChatState::default();
+        w.tick_once(&persist, &mut state, 100); // seed the mute lane cursor
+
+        // Mute a contact and a room.
+        persist
+            .write(
+                ACTION_CHAT_MUTE,
+                Priority::Default,
+                None,
+                Some(r#"{"target":"contact","id":"nyc3","muted":true}"#),
+            )
+            .unwrap();
+        persist
+            .write(
+                ACTION_CHAT_MUTE,
+                Priority::Default,
+                None,
+                Some(r#"{"target":"room","id":"ops","muted":true}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 200);
+
+        // Worker state mutated …
+        assert!(state.notify.is_contact_muted("nyc3"));
+        assert!(state.notify.is_room_muted("ops"));
+        // … persisted to the seat-local notify.json (survives a restart) …
+        let saved = load_notify_prefs(root, "eagle");
+        assert!(saved.is_contact_muted("nyc3"));
+        assert!(saved.is_room_muted("ops"));
+        // … and republished on the mirror the UI reads to render its toggle.
+        let mirror = |p: &Persist| -> NotifyPrefs {
+            let msgs = p.list_since(STATE_CHAT_NOTIFY, None).unwrap();
+            serde_json::from_str(msgs.last().unwrap().body.as_ref().unwrap()).unwrap()
+        };
+        let prefs = mirror(&persist);
+        assert!(prefs.is_contact_muted("nyc3"));
+        assert!(prefs.is_room_muted("ops"));
+
+        // A muted contact's Critical alert is now silent (the mute actually bites).
+        persist
+            .write(
+                "event/security/alert",
+                Priority::Min,
+                None,
+                Some(r#"{"severity":"info","host":"nyc3","summary":"pre"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 250); // discover + seed the alert lane
+        let toasts_before = persist.list_since(EVENT_TOAST_SHOW, None).unwrap().len();
+        persist
+            .write(
+                "event/security/alert",
+                Priority::Urgent,
+                None,
+                Some(r#"{"severity":"critical","host":"nyc3","summary":"intrusion"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 300);
+        assert_eq!(
+            persist.list_since(EVENT_TOAST_SHOW, None).unwrap().len(),
+            toasts_before,
+            "a muted contact raises no chyron, even a Critical"
+        );
+
+        // Unmute the contact — state + mirror reflect it, room stays muted.
+        persist
+            .write(
+                ACTION_CHAT_MUTE,
+                Priority::Default,
+                None,
+                Some(r#"{"target":"contact","id":"nyc3","muted":false}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 400);
+        assert!(!state.notify.is_contact_muted("nyc3"));
+        let prefs = mirror(&persist);
+        assert!(!prefs.is_contact_muted("nyc3"));
+        assert!(prefs.is_room_muted("ops"), "the room mute is untouched");
     }
 
     #[tokio::test]
