@@ -6534,8 +6534,11 @@ fn run_serve(
         // and the typed-arming echo IN the executor (a UI bug can't bypass), and
         // publishes the `state/storage/<node>` topology mirror + drains
         // `action/storage/<node>` verbs. Universal like vm_lifecycle/container —
-        // any node has disks — so it gates through the rank-0-default resolver.
-        // node_id is the per-node topic namespace + the mirror `host` stamp.
+        // any node has disks — so it is pinned at rank 0 in the worker_role census
+        // (BUG-STORAGE-1: an EXPLICIT rank-0 entry, not the silent unknown-worker
+        // default, so a Workstation provably publishes its own mirror and the
+        // `role-workers` diagnostic lists it). node_id is the per-node topic
+        // namespace + the mirror `host` stamp.
         if mackesd_core::worker_role::runs("storage", role_rank) {
             sup.spawn(Spawn::new(
                 mackesd_core::workers::storage::StorageWorker::new(node_id.clone()),
