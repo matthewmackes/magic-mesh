@@ -49,12 +49,7 @@ impl CapabilityTag {
     /// any surface should iterate (the fleet `tags --json` census, profile
     /// validation, the Node-roles editor) instead of hand-maintaining a
     /// parallel list that silently drops a tag (DATACENTER-17 added a 4th).
-    pub const ALL: [Self; 4] = [
-        Self::Hop,
-        Self::Execution,
-        Self::Headless,
-        Self::Hypervisor,
-    ];
+    pub const ALL: [Self; 4] = [Self::Hop, Self::Execution, Self::Headless, Self::Hypervisor];
 
     /// Stable wire token.
     #[must_use]

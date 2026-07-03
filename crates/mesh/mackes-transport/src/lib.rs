@@ -147,9 +147,7 @@ impl TransportKind {
     pub const fn is_nebula(self) -> bool {
         matches!(
             self,
-            Self::NebulaDirect
-                | Self::NebulaHttps443
-                | Self::NebulaLighthouseRelay
+            Self::NebulaDirect | Self::NebulaHttps443 | Self::NebulaLighthouseRelay
         )
     }
 
