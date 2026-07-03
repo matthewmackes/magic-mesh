@@ -19,7 +19,9 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 
 use crate::audio::AudioConfig;
+use crate::controls::{PlaybackControls, ScreenshotMode};
 use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
+use crate::playlist::Playlist;
 use crate::subtitle::{track_by_language, SubtitleConfig, TrackSelect, TrackSelection};
 use crate::video::VideoConfig;
 
@@ -72,6 +74,10 @@ pub enum PlayerEvent {
     TracksChanged(Vec<Track>),
     /// The media reached its natural end.
     EndReached,
+    /// The queue advanced (via [`play_next`](Player::play_next) /
+    /// [`play_prev`](Player::play_prev), or an auto-advance on end-of-file) to the
+    /// playlist item at this index — the surface highlights the now-playing row.
+    PlaylistAdvanced(usize),
     /// An error was surfaced (engine error or invalid transport request).
     Error(String),
 }
@@ -129,6 +135,14 @@ pub struct Player<E: MediaEngine> {
     /// [`set_subtitle_config`](Player::set_subtitle_config); the `sub-*` styling
     /// persists across loads but the loaded external files are per-session.
     subtitle: SubtitleConfig,
+    /// The applied advanced-playback controls (MEDIA-6). Set via
+    /// [`set_controls`](Player::set_controls); the `speed`/`audio-delay`/`ab-loop`
+    /// properties are global mpv state, so it is apply-on-change.
+    controls: PlaybackControls,
+    /// The playback queue (MEDIA-6). The player loads from it via
+    /// [`play_next`](Player::play_next)/[`play_prev`](Player::play_prev) and
+    /// auto-advances it on end-of-file per its [`RepeatMode`](crate::RepeatMode).
+    playlist: Playlist,
     events: VecDeque<PlayerEvent>,
 }
 
@@ -148,6 +162,8 @@ impl<E: MediaEngine> Player<E> {
             video: VideoConfig::new(),
             tracks_selection: TrackSelection::new(),
             subtitle: SubtitleConfig::new(),
+            controls: PlaybackControls::new(),
+            playlist: Playlist::new(),
             events: VecDeque::new(),
         }
     }
@@ -206,6 +222,29 @@ impl<E: MediaEngine> Player<E> {
     #[must_use]
     pub const fn subtitle_config(&self) -> &SubtitleConfig {
         &self.subtitle
+    }
+
+    /// The applied advanced-playback controls (MEDIA-6).
+    #[must_use]
+    pub const fn controls(&self) -> &PlaybackControls {
+        &self.controls
+    }
+
+    /// The playback queue (MEDIA-6).
+    #[must_use]
+    pub const fn playlist(&self) -> &Playlist {
+        &self.playlist
+    }
+
+    /// Mutably borrow the playback queue to enqueue/dequeue/reorder/shuffle it.
+    pub const fn playlist_mut(&mut self) -> &mut Playlist {
+        &mut self.playlist
+    }
+
+    /// Replace the whole playback queue (MEDIA-6) — e.g. after a
+    /// [`Playlist::load`](crate::Playlist::load).
+    pub fn set_playlist(&mut self, playlist: Playlist) {
+        self.playlist = playlist;
     }
 
     /// Borrow the underlying engine (tests drive [`FakeMpv`](crate::FakeMpv)
@@ -483,6 +522,165 @@ impl<E: MediaEngine> Player<E> {
         Ok(())
     }
 
+    // ── advanced controls (MEDIA-6) ──────────────────────────────────────────
+
+    /// Apply a [`PlaybackControls`] — the `speed`, `audio-delay` A/V-sync offset,
+    /// `prefetch-playlist` gapless flag, and A-B loop — and record it on success.
+    ///
+    /// Valid in any state (these are global mpv properties that persist across
+    /// loads); the controls are left unchanged if the engine rejects them.
+    ///
+    /// # Errors
+    /// Returns [`PlayerError::Engine`] if the engine rejects a property set; the
+    /// stored controls are then untouched.
+    pub fn set_controls(&mut self, controls: PlaybackControls) -> Result<(), PlayerError> {
+        self.engine.apply_playback_controls(&controls)?;
+        self.controls = controls;
+        Ok(())
+    }
+
+    /// Step one frame forward (mpv `frame-step`). Frame-stepping needs a decoded
+    /// frame, so it is valid only while media is playable (`Playing`/`Paused`/
+    /// `Ended`) — typically while paused.
+    ///
+    /// # Errors
+    /// [`PlayerError::InvalidState`] when no frame is available;
+    /// [`PlayerError::Engine`] if the engine rejects the command.
+    pub fn frame_step(&mut self) -> Result<(), PlayerError> {
+        self.require_playable("frame-step")?;
+        self.engine.frame_step(true)?;
+        Ok(())
+    }
+
+    /// Step one frame backward (mpv `frame-back-step`). See [`frame_step`](Self::frame_step).
+    ///
+    /// # Errors
+    /// [`PlayerError::InvalidState`] when no frame is available;
+    /// [`PlayerError::Engine`] if the engine rejects the command.
+    pub fn frame_back_step(&mut self) -> Result<(), PlayerError> {
+        self.require_playable("frame-back-step")?;
+        self.engine.frame_step(false)?;
+        Ok(())
+    }
+
+    /// Take a snapshot of the current frame (mpv `screenshot`) in the given
+    /// [`ScreenshotMode`]. Valid only while media is playable.
+    ///
+    /// # Errors
+    /// [`PlayerError::InvalidState`] when no frame is available;
+    /// [`PlayerError::Engine`] if the engine rejects the command.
+    pub fn snapshot(&mut self, mode: ScreenshotMode) -> Result<(), PlayerError> {
+        self.require_playable("snapshot")?;
+        self.engine.screenshot(mode)?;
+        Ok(())
+    }
+
+    /// The current chapter index (0-based), if the media is chaptered.
+    #[must_use]
+    pub fn chapter(&self) -> Option<i64> {
+        self.engine.chapter()
+    }
+
+    /// The number of chapters in the loaded media, if known.
+    #[must_use]
+    pub fn chapter_count(&self) -> Option<i64> {
+        self.engine.chapter_count()
+    }
+
+    /// Seek to chapter `chapter` (clamped to the media's chapter range). Valid only
+    /// while media is playable.
+    ///
+    /// # Errors
+    /// [`PlayerError::InvalidState`] when nothing is playable;
+    /// [`PlayerError::Engine`] if the engine rejects the seek.
+    pub fn set_chapter(&mut self, chapter: i64) -> Result<(), PlayerError> {
+        self.require_playable("set-chapter")?;
+        let target = self.clamp_chapter(chapter);
+        self.engine.set_chapter(target)?;
+        Ok(())
+    }
+
+    /// Jump to the next chapter (clamped to the last). Valid only while playable.
+    ///
+    /// # Errors
+    /// Propagates [`set_chapter`](Self::set_chapter)'s errors.
+    pub fn chapter_next(&mut self) -> Result<(), PlayerError> {
+        let current = self.engine.chapter().unwrap_or(0);
+        self.set_chapter(current + 1)
+    }
+
+    /// Jump to the previous chapter (clamped to the first). Valid only while
+    /// playable.
+    ///
+    /// # Errors
+    /// Propagates [`set_chapter`](Self::set_chapter)'s errors.
+    pub fn chapter_prev(&mut self) -> Result<(), PlayerError> {
+        let current = self.engine.chapter().unwrap_or(0);
+        self.set_chapter(current - 1)
+    }
+
+    // ── playlist / queue (MEDIA-6) ───────────────────────────────────────────
+
+    /// Advance the queue and load its next item, per the playlist's
+    /// [`RepeatMode`](crate::RepeatMode) + shuffle order. Returns the new current
+    /// item index, or [`None`] when there is no next item (empty queue, or the end
+    /// of a non-repeating queue) — the player is then left as-is.
+    ///
+    /// # Errors
+    /// Returns [`PlayerError::Engine`] if loading the next item fails.
+    pub fn play_next(&mut self) -> Result<Option<usize>, PlayerError> {
+        self.advance_playlist(true)
+    }
+
+    /// Step the queue back and load its previous item, per the playlist's
+    /// [`RepeatMode`](crate::RepeatMode) + shuffle order. Returns the new current
+    /// item index, or [`None`] when there is no previous item.
+    ///
+    /// # Errors
+    /// Returns [`PlayerError::Engine`] if loading the previous item fails.
+    pub fn play_prev(&mut self) -> Result<Option<usize>, PlayerError> {
+        self.advance_playlist(false)
+    }
+
+    /// Move the queue cursor forward/back and load the resulting item, emitting a
+    /// [`PlayerEvent::PlaylistAdvanced`] on success.
+    fn advance_playlist(&mut self, forward: bool) -> Result<Option<usize>, PlayerError> {
+        let next_url = if forward {
+            self.playlist.next_item()
+        } else {
+            self.playlist.prev_item()
+        }
+        .map(|item| item.url.clone());
+        let Some(url) = next_url else {
+            return Ok(None);
+        };
+        let idx = self.playlist.current_index();
+        self.load(url)?;
+        if let Some(i) = idx {
+            self.events.push_back(PlayerEvent::PlaylistAdvanced(i));
+        }
+        Ok(idx)
+    }
+
+    /// End-of-file queue advance: load the next queued item (per repeat/shuffle) if
+    /// there is one. Returns whether the player auto-advanced (so the caller knows
+    /// whether to settle into [`PlayerState::Ended`] instead). A load failure is
+    /// surfaced as a [`PlayerEvent::Error`] and treated as "no advance".
+    fn try_advance_on_eof(&mut self) -> bool {
+        let Some(url) = self.playlist.next_item().map(|item| item.url.clone()) else {
+            return false;
+        };
+        let idx = self.playlist.current_index();
+        if let Err(err) = self.load(url) {
+            self.events.push_back(PlayerEvent::Error(err.to_string()));
+            return false;
+        }
+        if let Some(i) = idx {
+            self.events.push_back(PlayerEvent::PlaylistAdvanced(i));
+        }
+        true
+    }
+
     // ── the tick ─────────────────────────────────────────────────────────────
 
     /// Fold one tick of engine activity into the state machine.
@@ -530,8 +728,12 @@ impl<E: MediaEngine> Player<E> {
             }
             EngineSignal::EndFile(EndReason::Eof) => {
                 if self.state.has_media() {
-                    self.set_state(PlayerState::Ended);
-                    self.events.push_back(PlayerEvent::EndReached);
+                    // A queued next item (per the playlist's repeat/shuffle)
+                    // auto-advances the player; an empty/exhausted queue ends it.
+                    if !self.try_advance_on_eof() {
+                        self.set_state(PlayerState::Ended);
+                        self.events.push_back(PlayerEvent::EndReached);
+                    }
                 }
             }
             EngineSignal::EndFile(EndReason::Stopped) => {
@@ -583,6 +785,24 @@ impl<E: MediaEngine> Player<E> {
         let lo = pos.max(0.0);
         match self.duration {
             Some(dur) if dur > 0.0 => lo.min(dur),
+            _ => lo,
+        }
+    }
+
+    /// Refuse a control that needs a decoded frame (`frame-step`, `snapshot`,
+    /// chapter nav) unless the media is playable (`Playing`/`Paused`/`Ended`).
+    const fn require_playable(&self, op: &'static str) -> Result<(), PlayerError> {
+        match self.state {
+            PlayerState::Playing | PlayerState::Paused | PlayerState::Ended => Ok(()),
+            state => Err(PlayerError::InvalidState { op, state }),
+        }
+    }
+
+    /// Clamp a chapter index to `[0, chapter_count)` when the count is known.
+    fn clamp_chapter(&self, chapter: i64) -> i64 {
+        let lo = chapter.max(0);
+        match self.engine.chapter_count() {
+            Some(count) if count > 0 => lo.min(count - 1),
             _ => lo,
         }
     }
@@ -1126,5 +1346,210 @@ mod tests {
         // A new title enumerates fresh tracks → selection returns to auto.
         p.load("second").expect("reload");
         assert_eq!(p.track_selection(), &TrackSelection::new());
+    }
+
+    // ── advanced controls (MEDIA-6) ──────────────────────────────────────────
+
+    #[test]
+    fn default_controls_are_neutral() {
+        let p = player();
+        assert_eq!(p.controls(), &PlaybackControls::new());
+    }
+
+    #[test]
+    fn set_controls_applies_fold_to_engine_and_stores_it() {
+        use crate::controls::AbLoop;
+
+        let mut p = player();
+        p.load("x").expect("load");
+        p.pump();
+
+        let cfg = PlaybackControls {
+            speed: 2.0,
+            audio_delay: -0.1,
+            ab_loop: AbLoop::Range { a: 5.0, b: 15.0 },
+            ..PlaybackControls::new()
+        };
+        p.set_controls(cfg).expect("apply controls");
+
+        assert_eq!(
+            p.engine().applied_control_properties(),
+            cfg.properties().as_slice()
+        );
+        assert!(p
+            .engine()
+            .applied_control_properties()
+            .contains(&("speed".to_owned(), "2".to_owned())));
+        assert_eq!(p.controls(), &cfg);
+    }
+
+    #[test]
+    fn set_controls_error_leaves_stored_controls_untouched() {
+        let mut p = Player::new(FakeMpv::new().failing_controls());
+        let before = *p.controls();
+        let err = p
+            .set_controls(PlaybackControls {
+                speed: 3.0,
+                ..PlaybackControls::new()
+            })
+            .expect_err("engine rejects controls");
+        assert!(matches!(err, PlayerError::Engine(EngineError::Backend(_))));
+        assert_eq!(p.controls(), &before);
+    }
+
+    #[test]
+    fn frame_step_and_snapshot_need_a_playable_frame() {
+        // Refused with nothing loaded.
+        let mut p = player();
+        assert!(matches!(
+            p.frame_step(),
+            Err(PlayerError::InvalidState {
+                op: "frame-step",
+                ..
+            })
+        ));
+        assert!(matches!(
+            p.snapshot(ScreenshotMode::Subtitles),
+            Err(PlayerError::InvalidState { op: "snapshot", .. })
+        ));
+
+        // Once paused on a loaded clip, both drive the engine.
+        p.load("x").expect("load");
+        p.pump();
+        p.pause().expect("pause");
+        p.frame_step().expect("step forward");
+        p.frame_back_step().expect("step back");
+        assert_eq!(p.engine().frame_steps(), &[true, false]);
+        p.snapshot(ScreenshotMode::Video).expect("snapshot");
+        assert_eq!(p.engine().screenshots(), &[ScreenshotMode::Video]);
+    }
+
+    #[test]
+    fn chapter_navigation_reads_sets_and_clamps() {
+        let mut p = Player::new(FakeMpv::new().with_duration(120.0).with_chapters(4));
+
+        // Refused before load (no playable frame).
+        assert!(matches!(
+            p.set_chapter(1),
+            Err(PlayerError::InvalidState {
+                op: "set-chapter",
+                ..
+            })
+        ));
+
+        p.load("x").expect("load");
+        p.pump();
+        assert_eq!(p.chapter(), Some(0));
+        assert_eq!(p.chapter_count(), Some(4));
+
+        p.chapter_next().expect("next chapter");
+        assert_eq!(p.chapter(), Some(1));
+
+        // Set past the end clamps to the last chapter (count - 1).
+        p.set_chapter(99).expect("set clamps high");
+        assert_eq!(p.chapter(), Some(3));
+
+        // Prev past the start clamps to 0.
+        p.set_chapter(0).expect("to first");
+        p.chapter_prev().expect("prev clamps low");
+        assert_eq!(p.chapter(), Some(0));
+    }
+
+    // ── playlist / queue (MEDIA-6) ───────────────────────────────────────────
+
+    fn queued_player(urls: &[&str]) -> Player<FakeMpv> {
+        use crate::playlist::PlaylistItem;
+        let mut p = Player::new(FakeMpv::new().with_duration(5.0));
+        let items = urls.iter().map(|u| PlaylistItem::new(*u)).collect();
+        p.set_playlist(Playlist::from_items(items));
+        p
+    }
+
+    #[test]
+    fn play_next_and_prev_load_queued_items() {
+        let mut p = queued_player(&["a", "b", "c"]);
+
+        // Fresh queue current is item 0; `next` advances to item 1 and loads it.
+        let idx = p.play_next().expect("next");
+        assert_eq!(idx, Some(1));
+        assert_eq!(p.state(), PlayerState::Loading);
+        assert_eq!(p.media(), Some("b"));
+        let ev = p.drain_events();
+        assert!(ev.contains(&PlayerEvent::PlaylistAdvanced(1)));
+        p.pump();
+        assert_eq!(p.state(), PlayerState::Playing);
+
+        let back = p.play_prev().expect("prev");
+        assert_eq!(back, Some(0));
+        assert_eq!(p.media(), Some("a"));
+    }
+
+    #[test]
+    fn eof_auto_advances_the_queue_and_wraps_on_repeat_all() {
+        use crate::playlist::RepeatMode;
+
+        let mut p = queued_player(&["a", "b", "c"]);
+        p.playlist_mut().set_repeat(RepeatMode::All);
+
+        p.load("a").expect("load a");
+        p.pump();
+        assert_eq!(p.state(), PlayerState::Playing);
+        assert_eq!(p.media(), Some("a"));
+
+        // End "a" → auto-advance loads "b" (not Ended).
+        p.engine_mut().reach_eof();
+        p.pump();
+        assert_eq!(p.state(), PlayerState::Loading);
+        assert_eq!(p.media(), Some("b"));
+        assert_eq!(p.playlist().current_index(), Some(1));
+        assert!(p.drain_events().contains(&PlayerEvent::PlaylistAdvanced(1)));
+        p.pump();
+        assert_eq!(p.state(), PlayerState::Playing);
+
+        // End "b" → "c".
+        p.engine_mut().reach_eof();
+        p.pump();
+        assert_eq!(p.media(), Some("c"));
+        p.pump();
+
+        // End "c" with repeat-all → wrap back to "a".
+        p.engine_mut().reach_eof();
+        p.pump();
+        assert_eq!(p.media(), Some("a"));
+        assert_eq!(p.playlist().current_index(), Some(0));
+    }
+
+    #[test]
+    fn eof_ends_after_last_item_when_repeat_off() {
+        let mut p = queued_player(&["a", "b"]);
+
+        p.load("a").expect("load a");
+        p.pump();
+        p.engine_mut().reach_eof();
+        p.pump(); // → "b"
+        assert_eq!(p.media(), Some("b"));
+        p.pump();
+
+        // "b" is the last item, repeat off → the player ends (no wrap).
+        p.engine_mut().reach_eof();
+        p.pump();
+        assert_eq!(p.state(), PlayerState::Ended);
+        assert!(p.drain_events().contains(&PlayerEvent::EndReached));
+    }
+
+    #[test]
+    fn eof_repeat_one_reloads_the_same_item() {
+        use crate::playlist::RepeatMode;
+
+        let mut p = queued_player(&["a", "b"]);
+        p.playlist_mut().set_repeat(RepeatMode::One);
+
+        p.load("a").expect("load a");
+        p.pump();
+        p.engine_mut().reach_eof();
+        p.pump();
+        // Repeat-one reloads "a", never advancing to "b".
+        assert_eq!(p.media(), Some("a"));
+        assert_eq!(p.playlist().current_index(), Some(0));
     }
 }

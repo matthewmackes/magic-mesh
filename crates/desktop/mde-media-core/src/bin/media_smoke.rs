@@ -14,9 +14,10 @@
 //! [`FakeMpv`]: mde_media_core::FakeMpv
 
 use mde_media_core::{
-    opensubtitles, AspectRatio, AudioConfig, Crop, Deinterlace, EqBand, ExternalSub, FakeMpv,
-    HwDecode, LoudnessNorm, Player, PlayerState, ReplayGainMode, Rotation, SubtitleConfig, Track,
-    TrackKind, TrackSelect, TrackSelection, VideoConfig, VideoFilter,
+    opensubtitles, AbLoop, AspectRatio, AudioConfig, Crop, Deinterlace, EqBand, ExternalSub,
+    FakeMpv, HwDecode, LoudnessNorm, PlaybackControls, Player, PlayerState, Playlist, PlaylistItem,
+    RepeatMode, ReplayGainMode, Rotation, ScreenshotMode, SubtitleConfig, Track, TrackKind,
+    TrackSelect, TrackSelection, VideoConfig, VideoFilter,
 };
 
 fn sample_tracks() -> Vec<Track> {
@@ -180,6 +181,30 @@ fn run_fake_smoke() {
         opensubtitles::search_url(hash)
     );
 
+    // MEDIA-6: advanced playback controls — 1.25x speed, a small A/V-sync offset,
+    // gapless prefetch, and an A-B loop — plus a paused frame-step + snapshot,
+    // showing the folded speed/audio-delay/ab-loop property set + one-shot commands
+    // the engine receives.
+    let controls = PlaybackControls {
+        speed: 1.25,
+        audio_delay: -0.040,
+        gapless: true,
+        ab_loop: AbLoop::Range { a: 10.0, b: 40.0 },
+    };
+    player.set_controls(controls).expect("apply controls");
+    println!("  controls props: {:?}", player.controls().properties());
+    player.pause().expect("pause for frame-step");
+    player.frame_step().expect("frame step");
+    player
+        .snapshot(ScreenshotMode::Subtitles)
+        .expect("snapshot");
+    println!(
+        "  frame steps: {:?} screenshots: {:?}",
+        player.engine().frame_steps(),
+        player.engine().screenshots()
+    );
+    player.play().expect("resume after frame-step");
+
     player.engine_mut().advance(30.0);
     player.pump();
     report(&mut player, "after 30s");
@@ -207,7 +232,49 @@ fn run_fake_smoke() {
     report(&mut player, "stop");
     assert_eq!(player.state(), PlayerState::Stopped);
 
+    run_playlist_smoke();
+
     println!("== smoke OK: full transport cycle drove the state machine ==");
+}
+
+/// MEDIA-6: drive the playlist / queue model — a shuffled, repeat-all 3-item queue
+/// that auto-advances on end-of-file — proving the queue drives real playback.
+fn run_playlist_smoke() {
+    println!("-- MEDIA-6 playlist / queue (auto-advance on EOF) --");
+    let mut queue = Player::new(FakeMpv::new().with_duration(3.0));
+    let mut playlist = Playlist::from_items(vec![
+        PlaylistItem::titled("test://track-1.flac", "Track 1"),
+        PlaylistItem::titled("test://track-2.flac", "Track 2"),
+        PlaylistItem::titled("test://track-3.flac", "Track 3"),
+    ]);
+    playlist.set_repeat(RepeatMode::All);
+    playlist.shuffle(0x00C0_FFEE);
+    println!(
+        "  queue: {} items, repeat={:?}, shuffled={}",
+        playlist.len(),
+        playlist.repeat(),
+        playlist.is_shuffled()
+    );
+    queue.set_playlist(playlist);
+
+    // Start on the queue head, then let end-of-file walk the (shuffled) order.
+    if let Some(head) = queue.playlist().current().map(|item| item.url.clone()) {
+        queue.load(head).expect("load head");
+        queue.pump();
+        println!("  now playing: {:?}", queue.media());
+        for _ in 0..4 {
+            queue.engine_mut().reach_eof();
+            queue.pump(); // EOF auto-advances the queue (a fresh load)
+            queue.pump(); // FileLoaded → Playing
+            println!(
+                "  auto-advanced to: {:?} (index {:?})",
+                queue.media(),
+                queue.playlist().current_index()
+            );
+        }
+        assert_eq!(queue.state(), PlayerState::Playing);
+    }
+    println!("== playlist smoke OK: the queue drove auto-advance ==");
 }
 
 fn report(player: &mut Player<FakeMpv>, label: &str) {

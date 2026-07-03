@@ -13,6 +13,7 @@
 use std::collections::VecDeque;
 
 use crate::audio::AudioConfig;
+use crate::controls::{PlaybackControls, ScreenshotMode};
 use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track};
 use crate::subtitle::{SubtitleConfig, TrackSelection};
 use crate::video::VideoConfig;
@@ -37,6 +38,11 @@ pub struct FakeMpv {
     fail_video: bool,
     fail_tracks: bool,
     fail_subtitle: bool,
+    fail_controls: bool,
+    fail_chapter: bool,
+    /// The current chapter index + total, simulating mpv's `chapter`/`chapters`.
+    chapter: Option<i64>,
+    chapter_count: Option<i64>,
     /// Every `loadfile`/`seek`/`stop` issued, for assertion.
     commands: Vec<String>,
     /// The last `af` graph string applied via [`MediaEngine::apply_audio_config`].
@@ -56,6 +62,13 @@ pub struct FakeMpv {
     /// The last `sub-*` styling properties applied via
     /// [`MediaEngine::apply_subtitle_config`].
     applied_subtitle_properties: Vec<(String, String)>,
+    /// The last `speed`/`audio-delay`/`ab-loop-*` properties applied via
+    /// [`MediaEngine::apply_playback_controls`].
+    applied_control_properties: Vec<(String, String)>,
+    /// Every frame-step issued via [`MediaEngine::frame_step`] (`true` = forward).
+    frame_steps: Vec<bool>,
+    /// Every snapshot issued via [`MediaEngine::screenshot`], in order.
+    screenshots: Vec<ScreenshotMode>,
 }
 
 impl FakeMpv {
@@ -115,6 +128,31 @@ impl FakeMpv {
     #[must_use]
     pub const fn failing_subtitle(mut self) -> Self {
         self.fail_subtitle = true;
+        self
+    }
+
+    /// Make every `apply_playback_controls` fail with a backend error (to exercise
+    /// the controls error path through the [`Player`](crate::Player)).
+    #[must_use]
+    pub const fn failing_controls(mut self) -> Self {
+        self.fail_controls = true;
+        self
+    }
+
+    /// Make every `set_chapter` fail with a backend error (to exercise the chapter
+    /// error path through the [`Player`](crate::Player)).
+    #[must_use]
+    pub const fn failing_chapter(mut self) -> Self {
+        self.fail_chapter = true;
+        self
+    }
+
+    /// Pre-set the media as having `count` chapters, current chapter 0 (simulating
+    /// mpv's `chapters`/`chapter` properties on chaptered media).
+    #[must_use]
+    pub const fn with_chapters(mut self, count: i64) -> Self {
+        self.chapter_count = Some(count);
+        self.chapter = Some(0);
         self
     }
 
@@ -209,6 +247,26 @@ impl FakeMpv {
     #[must_use]
     pub fn applied_subtitle_properties(&self) -> &[(String, String)] {
         &self.applied_subtitle_properties
+    }
+
+    /// The last `speed`/`audio-delay`/`ab-loop-*` properties applied via
+    /// [`apply_playback_controls`](MediaEngine::apply_playback_controls).
+    #[must_use]
+    pub fn applied_control_properties(&self) -> &[(String, String)] {
+        &self.applied_control_properties
+    }
+
+    /// The frame-steps issued via [`frame_step`](MediaEngine::frame_step) so far
+    /// (`true` = forward, `false` = back).
+    #[must_use]
+    pub fn frame_steps(&self) -> &[bool] {
+        &self.frame_steps
+    }
+
+    /// The snapshots issued via [`screenshot`](MediaEngine::screenshot) so far.
+    #[must_use]
+    pub fn screenshots(&self) -> &[ScreenshotMode] {
+        &self.screenshots
     }
 }
 
@@ -309,6 +367,53 @@ impl MediaEngine for FakeMpv {
         // Record the folded sub-add commands + sub-* properties for assertion.
         self.applied_sub_commands = config.commands();
         self.applied_subtitle_properties = config.properties();
+        Ok(())
+    }
+
+    fn apply_playback_controls(&mut self, controls: &PlaybackControls) -> Result<(), EngineError> {
+        if self.fail_controls {
+            return Err(EngineError::Backend(
+                "playback controls rejected".to_owned(),
+            ));
+        }
+        // Record the folded speed/audio-delay/ab-loop property set for assertion.
+        self.applied_control_properties = controls.properties();
+        Ok(())
+    }
+
+    fn frame_step(&mut self, forward: bool) -> Result<(), EngineError> {
+        self.commands.push(
+            if forward {
+                "frame-step"
+            } else {
+                "frame-back-step"
+            }
+            .to_owned(),
+        );
+        self.frame_steps.push(forward);
+        Ok(())
+    }
+
+    fn screenshot(&mut self, mode: ScreenshotMode) -> Result<(), EngineError> {
+        self.commands.push(format!("screenshot {}", mode.as_mpv()));
+        self.screenshots.push(mode);
+        Ok(())
+    }
+
+    fn chapter(&self) -> Option<i64> {
+        self.loaded.as_ref().and(self.chapter)
+    }
+
+    fn chapter_count(&self) -> Option<i64> {
+        self.loaded.as_ref().and(self.chapter_count)
+    }
+
+    fn set_chapter(&mut self, chapter: i64) -> Result<(), EngineError> {
+        if self.fail_chapter {
+            return Err(EngineError::Backend("chapter set rejected".to_owned()));
+        }
+        self.commands.push(format!("set chapter {chapter}"));
+        self.chapter = Some(chapter);
         Ok(())
     }
 }
@@ -496,5 +601,81 @@ mod tests {
             Err(EngineError::Backend(_))
         ));
         assert!(e.applied_sub_commands().is_empty());
+    }
+
+    #[test]
+    fn apply_playback_controls_records_speed_delay_and_ab_loop() {
+        use crate::controls::{AbLoop, PlaybackControls};
+
+        let mut e = FakeMpv::new();
+        assert!(e.applied_control_properties().is_empty());
+        let controls = PlaybackControls {
+            speed: 1.25,
+            audio_delay: 0.05,
+            ab_loop: AbLoop::Range { a: 10.0, b: 20.0 },
+            ..PlaybackControls::new()
+        };
+        e.apply_playback_controls(&controls).expect("apply");
+        assert!(e
+            .applied_control_properties()
+            .contains(&("speed".to_owned(), "1.25".to_owned())));
+        assert!(e
+            .applied_control_properties()
+            .contains(&("ab-loop-a".to_owned(), "10".to_owned())));
+    }
+
+    #[test]
+    fn failing_controls_surfaces_backend_error() {
+        use crate::controls::PlaybackControls;
+
+        let mut e = FakeMpv::new().failing_controls();
+        assert!(matches!(
+            e.apply_playback_controls(&PlaybackControls::new()),
+            Err(EngineError::Backend(_))
+        ));
+        assert!(e.applied_control_properties().is_empty());
+    }
+
+    #[test]
+    fn frame_step_records_direction_and_command() {
+        let mut e = FakeMpv::new();
+        e.load_file("clip").expect("load");
+        e.frame_step(true).expect("step forward");
+        e.frame_step(false).expect("step back");
+        assert_eq!(e.frame_steps(), &[true, false]);
+        assert!(e.commands().contains(&"frame-step".to_owned()));
+        assert!(e.commands().contains(&"frame-back-step".to_owned()));
+    }
+
+    #[test]
+    fn screenshot_records_mode_and_command() {
+        let mut e = FakeMpv::new();
+        e.load_file("clip").expect("load");
+        e.screenshot(ScreenshotMode::Video).expect("snapshot");
+        assert_eq!(e.screenshots(), &[ScreenshotMode::Video]);
+        assert!(e.commands().contains(&"screenshot video".to_owned()));
+    }
+
+    #[test]
+    fn chapters_read_and_set_only_with_media() {
+        let mut e = FakeMpv::new().with_chapters(5);
+        // Chapterful, but nothing loaded yet → no chapter reported.
+        assert_eq!(e.chapter(), None);
+        assert_eq!(e.chapter_count(), None);
+
+        e.load_file("clip").expect("load");
+        assert_eq!(e.chapter(), Some(0));
+        assert_eq!(e.chapter_count(), Some(5));
+
+        e.set_chapter(3).expect("set chapter");
+        assert_eq!(e.chapter(), Some(3));
+        assert!(e.commands().contains(&"set chapter 3".to_owned()));
+    }
+
+    #[test]
+    fn failing_chapter_surfaces_backend_error() {
+        let mut e = FakeMpv::new().with_chapters(3).failing_chapter();
+        e.load_file("clip").expect("load");
+        assert!(matches!(e.set_chapter(1), Err(EngineError::Backend(_))));
     }
 }

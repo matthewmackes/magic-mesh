@@ -14,6 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::audio::AudioConfig;
+use crate::controls::{PlaybackControls, ScreenshotMode};
 use crate::subtitle::{SubtitleConfig, TrackSelection};
 use crate::video::VideoConfig;
 
@@ -135,6 +136,12 @@ pub enum EngineSignal {
 /// | [`apply_video_config`] | set `vf` + `hwdec`/`video-*`/… props |
 /// | [`apply_track_selection`] | set `aid`/`vid`/`sid` props |
 /// | [`apply_subtitle_config`] | `sub-add` cmds + `sub-*` props |
+/// | [`apply_playback_controls`] | set `speed`/`audio-delay`/`ab-loop-*` props |
+/// | [`frame_step`]     | `frame-step` / `frame-back-step`      |
+/// | [`screenshot`]     | `screenshot <flag>`                   |
+/// | [`chapter`]        | `get_property chapter`                |
+/// | [`chapter_count`]  | `get_property chapters`               |
+/// | [`set_chapter`]    | `set_property chapter`                |
 ///
 /// [`load_file`]: MediaEngine::load_file
 /// [`set_paused`]: MediaEngine::set_paused
@@ -148,6 +155,12 @@ pub enum EngineSignal {
 /// [`apply_video_config`]: MediaEngine::apply_video_config
 /// [`apply_track_selection`]: MediaEngine::apply_track_selection
 /// [`apply_subtitle_config`]: MediaEngine::apply_subtitle_config
+/// [`apply_playback_controls`]: MediaEngine::apply_playback_controls
+/// [`frame_step`]: MediaEngine::frame_step
+/// [`screenshot`]: MediaEngine::screenshot
+/// [`chapter`]: MediaEngine::chapter
+/// [`chapter_count`]: MediaEngine::chapter_count
+/// [`set_chapter`]: MediaEngine::set_chapter
 pub trait MediaEngine {
     /// Begin loading `url` (local path or stream URL). Playback readiness arrives
     /// later as an [`EngineSignal::FileLoaded`] from [`poll`](Self::poll).
@@ -241,4 +254,52 @@ pub trait MediaEngine {
     /// Returns [`EngineError::Backend`] if the backend rejects a command or
     /// property set.
     fn apply_subtitle_config(&mut self, config: &SubtitleConfig) -> Result<(), EngineError>;
+
+    /// Apply a [`PlaybackControls`] (MEDIA-6): set the `speed` multiplier, the
+    /// `audio-delay` A/V-sync offset, the `prefetch-playlist` gapless flag, and the
+    /// `ab-loop-a` / `ab-loop-b` loop endpoints. These are global mpv properties
+    /// settable with or without media loaded, so no [`EngineError::NotLoaded`]
+    /// arises here.
+    ///
+    /// §6: pure `speed`/`audio-delay`/`ab-loop-*` property glue — the controls
+    /// *fold* to the mpv strings; no playback engine is reimplemented.
+    ///
+    /// # Errors
+    /// Returns [`EngineError::Backend`] if the backend rejects a property set.
+    fn apply_playback_controls(&mut self, controls: &PlaybackControls) -> Result<(), EngineError>;
+
+    /// Step one frame `forward` (mpv `frame-step`) or backward (`frame-back-step`).
+    ///
+    /// Frame-stepping is only meaningful with media loaded (typically while
+    /// paused); the [`Player`](crate::Player) guards the transport state, so an
+    /// engine may map an ill-timed step to a no-op rather than an error.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] if the backend rejects the command.
+    fn frame_step(&mut self, forward: bool) -> Result<(), EngineError>;
+
+    /// Take a snapshot of the current frame (mpv `screenshot`), capturing the mode
+    /// selected by [`ScreenshotMode`] (with / without subtitles, or the whole
+    /// window).
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] if the backend rejects the command (e.g. nothing is
+    /// loaded to capture).
+    fn screenshot(&mut self, mode: ScreenshotMode) -> Result<(), EngineError>;
+
+    /// The current chapter index (mpv `chapter`, 0-based), or [`None`] when unknown
+    /// / the media is chapterless.
+    fn chapter(&self) -> Option<i64>;
+
+    /// The number of chapters in the loaded media (mpv `chapters`), or [`None`] when
+    /// unknown.
+    fn chapter_count(&self) -> Option<i64>;
+
+    /// Seek to chapter `chapter` (mpv's `chapter` property; 0-based). The
+    /// [`Player`](crate::Player) clamps to the valid range for next/prev chapter
+    /// navigation.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] if the backend rejects the property set.
+    fn set_chapter(&mut self, chapter: i64) -> Result<(), EngineError>;
 }

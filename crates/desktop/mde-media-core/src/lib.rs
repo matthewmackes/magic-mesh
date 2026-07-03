@@ -57,6 +57,22 @@
 //! HTTPS egress behind the `opensubtitles` feature, honest-gated like the real-clip
 //! `mpv` path.
 //!
+//! # Playlists + advanced controls (MEDIA-6)
+//!
+//! [`Playlist`] is the load-bearing, pure queue model — ordered [`PlaylistItem`]s
+//! with a cursor, a [`RepeatMode`] (off/one/all), and a **deterministic seedable
+//! shuffle**. It owns enqueue/dequeue/reorder + `next_item`/`prev_item` transitions
+//! and serde save/load ([`Playlist::save`]/[`Playlist::load`]), all unit-tested with
+//! no engine. The [`Player`] embeds one and drives the engine from it —
+//! [`Player::play_next`]/[`Player::play_prev`] load the next queued item, and an
+//! end-of-file **auto-advances** the queue per its repeat mode (a fresh load, not an
+//! `Ended`). [`Player::set_controls`] applies typed [`PlaybackControls`] — playback
+//! `speed`, the `audio-delay` A/V-sync offset, `prefetch-playlist` gapless, and the
+//! [`AbLoop`] A-B loop — and [`Player::frame_step`]/[`Player::snapshot`]/
+//! [`Player::chapter_next`] issue mpv's one-shot `frame-step`/`screenshot`/`chapter`
+//! commands. All fold to mpv (unit-tested against [`FakeMpv`]); the on-seat result
+//! is honest-gated to the `mpv`-feature real-clip smoke.
+//!
 //! ```
 //! use mde_media_core::{FakeMpv, Player, PlayerState};
 //!
@@ -74,10 +90,12 @@
 #![allow(clippy::module_name_repetitions, clippy::must_use_candidate)]
 
 pub mod audio;
+pub mod controls;
 pub mod engine;
 pub mod fake;
 pub mod opensubtitles;
 pub mod player;
+pub mod playlist;
 pub mod subtitle;
 pub mod video;
 
@@ -87,10 +105,12 @@ pub mod mpv;
 pub use audio::{
     AudioConfig, AudioDriver, AudioFilter, AudioOutput, EqBand, LoudnessNorm, ReplayGainMode,
 };
+pub use controls::{AbLoop, PlaybackControls, ScreenshotMode};
 pub use engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
 pub use fake::FakeMpv;
 pub use opensubtitles::{parse_search_response, request_headers, search_url, SubtitleSearchResult};
 pub use player::{Player, PlayerError, PlayerEvent, PlayerState};
+pub use playlist::{Playlist, PlaylistItem, RepeatMode};
 pub use subtitle::{
     track_by_language, AssOverride, ExternalSub, SubLoad, SubtitleConfig, TrackSelect,
     TrackSelection,

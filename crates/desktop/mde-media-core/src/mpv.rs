@@ -16,6 +16,7 @@ use libmpv2::events::{Event, PropertyData};
 use libmpv2::{mpv_end_file_reason, Mpv};
 
 use crate::audio::AudioConfig;
+use crate::controls::{PlaybackControls, ScreenshotMode};
 use crate::engine::{EndReason, EngineError, EngineSignal, MediaEngine, Track, TrackKind};
 use crate::subtitle::{SubtitleConfig, TrackSelection};
 use crate::video::VideoConfig;
@@ -246,5 +247,42 @@ impl MediaEngine for MpvEngine {
                 .map_err(backend)?;
         }
         Ok(())
+    }
+
+    fn apply_playback_controls(&mut self, controls: &PlaybackControls) -> Result<(), EngineError> {
+        // speed / audio-delay / prefetch-playlist / ab-loop-a / ab-loop-b.
+        for (key, value) in controls.properties() {
+            self.mpv
+                .set_property(key.as_str(), value.as_str())
+                .map_err(backend)?;
+        }
+        Ok(())
+    }
+
+    fn frame_step(&mut self, forward: bool) -> Result<(), EngineError> {
+        let cmd = if forward {
+            "frame-step"
+        } else {
+            "frame-back-step"
+        };
+        self.mpv.command(cmd, &[]).map_err(backend)
+    }
+
+    fn screenshot(&mut self, mode: ScreenshotMode) -> Result<(), EngineError> {
+        self.mpv
+            .command("screenshot", &[mode.as_mpv()])
+            .map_err(backend)
+    }
+
+    fn chapter(&self) -> Option<i64> {
+        self.mpv.get_property::<i64>("chapter").ok()
+    }
+
+    fn chapter_count(&self) -> Option<i64> {
+        self.mpv.get_property::<i64>("chapters").ok()
+    }
+
+    fn set_chapter(&mut self, chapter: i64) -> Result<(), EngineError> {
+        self.mpv.set_property("chapter", chapter).map_err(backend)
     }
 }
