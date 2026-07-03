@@ -1,0 +1,46 @@
+# MCNF "Quasar" — `mde-term-egui`: the mesh terminal surface (TERM epic;
+# design: `docs/design/mesh-terminal.md`).
+#
+# A Terminator-class egui-native terminal. This crate opens with the VT ENGINE
+# CORE (TERM-1): a mature xterm/VT100 parser (`alacritty_terminal`, §6 — never
+# re-implement VT parsing) wrapped behind a render-agnostic screen model — a
+# cell grid (fg/bg/attrs per cell) + a soft-capped scrollback ring — that later
+# units (the egui pane widget TERM-3, splits/tabs/broadcast, the mackesd PTY
+# broker) render and feed. TERM-1 is the headless core only: no egui view yet,
+# but a real, buildable workspace member.
+#
+# Tier (§6): desktop-shell. Its only in-workspace edges (added by later units)
+# point inward to `crates/shared/*` (the egui harness + Carbon look). The VT
+# engine is an external crate.
+[package]
+name        = "mde-term-egui"
+description = "MCNF Quasar — the mesh terminal surface. TERM-1 lands the VT engine core: alacritty_terminal (mature xterm/VT100 parsing, §6 — no re-implemented VT) wrapped behind a render-agnostic screen model (cell grid with fg/bg/attrs + a soft-capped scrollback ring) that the egui panes, splits, and PTY broker of later TERM units render and feed."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lib]
+name = "mde_term_egui"
+path = "src/lib.rs"
+
+[dependencies]
+# REUSE (§6): the mature VT/xterm engine. `alacritty_terminal` owns the ANSI
+# parser (its bundled `vte`), the cell grid, and the scrollback — the exact
+# fidelity the design doc's Q1 lock demands. We consume it headless (no
+# alacritty windowing) and expose a simplified cell/grid/scrollback view.
+alacritty_terminal = "0.24"
+# REQUIRED (not a feature we call): `alacritty_terminal`'s always-compiled `tty`
+# module pulls `rustix-openpty`, which depends on `rustix` with
+# `default-features = false` — so its 0.38 instance omits the `std` feature.
+# Nothing else in the graph unifies `std` onto that instance, so `rustix` builds
+# in its `no_std` polyfill mode and alacritty's tty code fails to compile
+# (`OwnedFd: rustix::fd::AsFd` unsatisfied). Naming `rustix` here with `std`
+# unifies the feature back on and the engine compiles. (We never call rustix
+# directly; the local-PTY layer TERM-2 will reuse alacritty's `tty`.)
+rustix = { version = "0.38", features = ["std", "termios", "pty"] }
+
+[lints]
+workspace = true
