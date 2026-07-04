@@ -47,6 +47,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use ropey::Rope;
 
@@ -301,16 +302,85 @@ impl History {
     }
 }
 
+/// A cheap fingerprint of a file's on-disk state — its last-modified time and
+/// byte length — captured whenever a [`Buffer`] loads or saves it (EDITOR-11).
+///
+/// The external-change watch reads a fresh fingerprint and compares it against
+/// the one captured at the last load/save: any difference means the file was
+/// rewritten under the open buffer. Length rides alongside mtime as a second
+/// discriminator so a rewrite that lands on the same coarse mtime (a filesystem
+/// with second-granularity timestamps, or two writes inside one tick) is still
+/// caught. Opaque to the surface: it only stores and compares stamps, never
+/// inspects the fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct DiskStamp {
+    /// The file's last-modified time, or `None` when the platform reports none.
+    modified: Option<SystemTime>,
+    /// The file's byte length — the second discriminator alongside `modified`.
+    len: u64,
+}
+
+/// The on-disk file's state relative to the buffer's last load/save (EDITOR-11).
+///
+/// The external-change signal the surface polls to offer a reload without ever
+/// silently clobbering the buffer — compared against the [`DiskStamp`] captured
+/// at the last load/save.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskState {
+    /// No path, or the file could not be stat-ed this instant (mid-write /
+    /// vanished) — no reliable signal, so the surface leaves the buffer as-is.
+    Unknown,
+    /// The file on disk still matches the last load/save.
+    Unchanged,
+    /// The file changed under the open buffer since the last load/save. Carries
+    /// the fresh stamp so the caller can adopt it (keep-mine) without the same
+    /// change re-firing on the next poll.
+    Changed(DiskStamp),
+}
+
+impl DiskState {
+    /// The fresh on-disk [`DiskStamp`] when the file [`Changed`](Self::Changed),
+    /// else `None` — the seam a keep-mine decision adopts to acknowledge a change.
+    #[must_use]
+    pub const fn changed_stamp(self) -> Option<DiskStamp> {
+        match self {
+            Self::Changed(stamp) => Some(stamp),
+            Self::Unchanged | Self::Unknown => None,
+        }
+    }
+}
+
+/// Read `path`'s current [`DiskStamp`], or `None` when it cannot be stat-ed.
+fn stamp_of(path: &Path) -> Option<DiskStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(DiskStamp {
+        modified: meta.modified().ok(),
+        len: meta.len(),
+    })
+}
+
 /// A `ropey`-backed text buffer: the editable document model (EDITOR-2).
 ///
-/// Holds the rope, the on-disk path (if any), a clean/dirty flag, whether the
-/// last open decoded lossily, and the undo/redo history. See the [module
-/// docs](self) for the full picture. Cheap on large files — every edit is an
-/// O(log n) rope splice, never a full-string rebuild.
+/// Holds the rope, the on-disk path (if any), the edit-revision counters behind
+/// the clean/dirty signal, the on-disk fingerprint for the external-change watch
+/// (EDITOR-11), whether the last open decoded lossily, and the undo/redo
+/// history. See the [module docs](self) for the full picture. Cheap on large
+/// files — every edit is an O(log n) rope splice, never a full-string rebuild.
 pub struct Buffer {
     rope: Rope,
     path: Option<PathBuf>,
-    dirty: bool,
+    /// Monotonic edit counter — bumped by every mutation (insert, remove, and
+    /// each op an undo/redo replays). Dirtiness is `revision != saved_revision`
+    /// (EDITOR-11): a real version counter vs. the last-saved revision, never a
+    /// placeholder flag.
+    revision: u64,
+    /// The `revision` value as of the last successful load/save. The buffer is
+    /// clean exactly when it still equals `revision`.
+    saved_revision: u64,
+    /// The file's on-disk fingerprint as of the last load/save (EDITOR-11), or
+    /// `None` for a pathless scratch buffer. The external-change watch compares a
+    /// fresh reading against this.
+    disk: Option<DiskStamp>,
     lossy: bool,
     history: History,
     edits: EditLedger,
@@ -323,7 +393,9 @@ impl Buffer {
         Self {
             rope: Rope::new(),
             path: None,
-            dirty: false,
+            revision: 0,
+            saved_revision: 0,
+            disk: None,
             lossy: false,
             history: History::default(),
             edits: EditLedger::default(),
@@ -337,7 +409,9 @@ impl Buffer {
         Self {
             rope: Rope::from_str(text),
             path: None,
-            dirty: false,
+            revision: 0,
+            saved_revision: 0,
+            disk: None,
             lossy: false,
             history: History::default(),
             edits: EditLedger::default(),
@@ -363,7 +437,9 @@ impl Buffer {
         Ok(Self {
             rope: Rope::from_str(&decoded),
             path: Some(path.to_path_buf()),
-            dirty: false,
+            revision: 0,
+            saved_revision: 0,
+            disk: stamp_of(path),
             lossy,
             history: History::default(),
             edits: EditLedger::default(),
@@ -376,10 +452,20 @@ impl Buffer {
         self.path.as_deref()
     }
 
-    /// Whether the buffer has unsaved edits.
+    /// Whether the buffer has unsaved edits — its edit [`revision`](Self::revision)
+    /// has moved past the revision captured at the last load/save.
     #[must_use]
     pub const fn is_dirty(&self) -> bool {
-        self.dirty
+        self.revision != self.saved_revision
+    }
+
+    /// The buffer's monotonic edit revision — bumped by every mutation. The
+    /// surface compares it across frames to spot a fresh keystroke (the autosave
+    /// debounce re-arms its idle timer whenever this moves); it never resets
+    /// except on a [`reload_from_disk`](Self::reload_from_disk).
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Whether the last [`open`](Self::open) replaced invalid `UTF-8` bytes (the
@@ -457,7 +543,7 @@ impl Buffer {
             char_idx,
             after,
         );
-        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Remove the characters in `range` (char indices), marking the buffer dirty
@@ -482,7 +568,7 @@ impl Buffer {
             end,
             start,
         );
-        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Drain the [`EditDelta`]s recorded since the last drain — the seam an
@@ -508,7 +594,7 @@ impl Buffer {
     /// or `None` if there is nothing to undo.
     pub fn undo(&mut self) -> Option<usize> {
         let cursor = self.history.undo(&mut self.rope, &mut self.edits)?;
-        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
         Some(cursor)
     }
 
@@ -517,7 +603,7 @@ impl Buffer {
     /// there is nothing to redo.
     pub fn redo(&mut self) -> Option<usize> {
         let cursor = self.history.redo(&mut self.rope, &mut self.edits)?;
-        self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
         Some(cursor)
     }
 
@@ -548,7 +634,7 @@ impl Buffer {
             ));
         };
         self.write_to(&path)?;
-        self.dirty = false;
+        self.mark_saved(&path);
         Ok(())
     }
 
@@ -560,9 +646,18 @@ impl Buffer {
     pub fn save_as<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let path = path.as_ref().to_path_buf();
         self.write_to(&path)?;
-        self.path = Some(path);
-        self.dirty = false;
+        self.path = Some(path.clone());
+        self.mark_saved(&path);
         Ok(())
+    }
+
+    /// Mark the buffer clean at its current revision and capture the file's fresh
+    /// on-disk fingerprint (so the surface's own write never re-fires the
+    /// external-change watch) — the shared tail of [`save`](Self::save) /
+    /// [`save_as`](Self::save_as).
+    fn mark_saved(&mut self, path: &Path) {
+        self.saved_revision = self.revision;
+        self.disk = stamp_of(path);
     }
 
     /// Stream the rope to `path`, creating/truncating it. Buffered + flushed so
@@ -572,6 +667,65 @@ impl Buffer {
         let mut writer = BufWriter::new(file);
         self.rope.write_to(&mut writer)?;
         writer.flush()
+    }
+
+    /// The on-disk file's state relative to the fingerprint captured at the last
+    /// load/save (EDITOR-11) — the external-change poll the surface debounces.
+    ///
+    /// [`DiskState::Changed`] means the file was rewritten under the open buffer
+    /// (its mtime or length moved); it carries the fresh stamp so the surface can
+    /// adopt it on a keep-mine decision without the same change re-firing next
+    /// poll. A pathless buffer, or a file that momentarily cannot be stat-ed
+    /// (mid-write / vanished), reports [`DiskState::Unknown`] — never a false
+    /// "changed", so the surface never prompts on noise.
+    #[must_use]
+    pub fn disk_state(&self) -> DiskState {
+        let Some(path) = self.path.as_deref() else {
+            return DiskState::Unknown;
+        };
+        let Some(now) = stamp_of(path) else {
+            return DiskState::Unknown;
+        };
+        match self.disk {
+            Some(base) if base == now => DiskState::Unchanged,
+            Some(_) => DiskState::Changed(now),
+            None => DiskState::Unknown,
+        }
+    }
+
+    /// Adopt `stamp` as the on-disk baseline without touching the buffer's text —
+    /// the keep-mine path (EDITOR-11): the operator chose their in-memory version
+    /// over the on-disk change, so acknowledge the new stamp to stop re-prompting
+    /// for the same change (a later, distinct change still fires).
+    pub fn adopt_disk_stamp(&mut self, stamp: DiskStamp) {
+        self.disk = Some(stamp);
+    }
+
+    /// Replace the buffer's content with the current on-disk file — the
+    /// reload-theirs path (EDITOR-11). Re-reads encoding-aware (re-setting the
+    /// lossy flag), drops the undo history and the highlighter's pending edit
+    /// ledger (the old deltas no longer describe the new text — a fresh parse
+    /// follows), lands the buffer clean, and re-captures the on-disk fingerprint.
+    ///
+    /// # Errors
+    /// Returns an [`io::Error`] if the buffer has no path, or if the read fails.
+    pub fn reload_from_disk(&mut self) -> io::Result<()> {
+        let Some(path) = self.path.clone() else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "buffer has no path to reload",
+            ));
+        };
+        let bytes = std::fs::read(&path)?;
+        let decoded = String::from_utf8_lossy(&bytes);
+        self.lossy = matches!(&decoded, Cow::Owned(_));
+        self.rope = Rope::from_str(&decoded);
+        self.history = History::default();
+        self.edits = EditLedger::default();
+        self.revision = 0;
+        self.saved_revision = 0;
+        self.disk = stamp_of(&path);
+        Ok(())
     }
 }
 
@@ -759,6 +913,129 @@ mod tests {
     fn save_without_a_path_errors() {
         let mut buf = Buffer::from_text("scratch");
         let err = buf.save().expect_err("scratch buffer has no path");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    // ── EDITOR-11: dirty revision, external-change detection, reload ──────────
+
+    #[test]
+    fn dirty_tracks_the_revision_against_the_last_saved_revision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rev.txt");
+        std::fs::write(&path, b"abc").expect("seed file");
+
+        let mut buf = Buffer::open(&path).expect("open");
+        assert!(!buf.is_dirty(), "a freshly opened file is clean");
+        let base = buf.revision();
+
+        buf.insert(3, "X");
+        assert!(
+            buf.is_dirty(),
+            "an edit moves the revision past the saved one"
+        );
+        assert!(
+            buf.revision() > base,
+            "the edit bumped the revision counter"
+        );
+
+        buf.save().expect("save");
+        assert!(
+            !buf.is_dirty(),
+            "save re-baselines the saved revision → clean"
+        );
+
+        buf.insert(4, "Y");
+        assert!(buf.is_dirty(), "a further edit is dirty again");
+        buf.undo();
+        assert!(
+            buf.is_dirty(),
+            "undo is itself a revision move — still off the saved baseline"
+        );
+    }
+
+    #[test]
+    fn external_change_is_detected_and_can_be_acknowledged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("watched.txt");
+        std::fs::write(&path, b"abc").expect("seed file");
+
+        let buf = Buffer::open(&path).expect("open");
+        assert_eq!(
+            buf.disk_state(),
+            super::DiskState::Unchanged,
+            "a just-opened file matches its captured stamp"
+        );
+
+        // A tool rewrites the file underneath the open buffer (a different length
+        // guarantees the change is caught regardless of mtime granularity).
+        std::fs::write(&path, b"abcdef").expect("external rewrite");
+        let stamp = buf
+            .disk_state()
+            .changed_stamp()
+            .expect("the external rewrite must be detected as Changed");
+
+        // Keep-mine acknowledges the new stamp so the same change stops firing…
+        let mut buf = buf;
+        buf.adopt_disk_stamp(stamp);
+        assert_eq!(
+            buf.disk_state(),
+            super::DiskState::Unchanged,
+            "adopting the stamp clears the pending change"
+        );
+        // …but a later, distinct change still fires.
+        std::fs::write(&path, b"abcdefghi").expect("second external rewrite");
+        assert!(matches!(buf.disk_state(), super::DiskState::Changed(_)));
+    }
+
+    #[test]
+    fn our_own_save_does_not_look_like_an_external_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mine.txt");
+        std::fs::write(&path, b"abc").expect("seed file");
+
+        let mut buf = Buffer::open(&path).expect("open");
+        buf.insert(3, "DEF");
+        buf.save().expect("save");
+        assert_eq!(
+            buf.disk_state(),
+            super::DiskState::Unchanged,
+            "the buffer's own write re-captures the stamp — never a false prompt"
+        );
+    }
+
+    #[test]
+    fn reload_replaces_content_and_lands_clean() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("reload.txt");
+        std::fs::write(&path, b"abc").expect("seed file");
+
+        let mut buf = Buffer::open(&path).expect("open");
+        buf.insert(3, "-mine"); // local unsaved edit (the conflict case)
+        assert!(buf.is_dirty());
+
+        std::fs::write(&path, b"theirs\n").expect("external rewrite");
+        buf.reload_from_disk().expect("reload");
+
+        assert_eq!(
+            buf.rope().to_string(),
+            "theirs\n",
+            "reload takes disk's copy"
+        );
+        assert!(!buf.is_dirty(), "a reloaded buffer is clean");
+        assert!(!buf.can_undo(), "reload drops the stale undo history");
+        assert_eq!(
+            buf.disk_state(),
+            super::DiskState::Unchanged,
+            "reload re-captures the stamp"
+        );
+    }
+
+    #[test]
+    fn reload_without_a_path_errors() {
+        let mut buf = Buffer::from_text("scratch");
+        let err = buf
+            .reload_from_disk()
+            .expect_err("a scratch buffer has nothing to reload");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 

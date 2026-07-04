@@ -32,13 +32,14 @@ use mde_egui::egui::{
     Response, RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder,
 };
 use mde_egui::Style;
+use serde::{Deserialize, Serialize};
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, DiskStamp, DiskState};
 use crate::finder::{self, FileFinder};
 use crate::format_bar;
 use crate::highlight::{Highlighter, Language};
-use crate::lsp::{LspClient, LspReply, Location, TextEdit, WorkspaceEdit};
-use crate::lsp_nav::{self, ReferencesPanel, RefRow, RenameBox};
+use crate::lsp::{Location, LspClient, LspReply, TextEdit, WorkspaceEdit};
+use crate::lsp_nav::{self, RefRow, ReferencesPanel, RenameBox};
 use crate::lsp_ui::{lsp_status, DiagnosticsOverlay};
 use crate::md_actions::{self, ListKind};
 use crate::menu_bar::{self, ListStyle, MenuAction, MenuContext};
@@ -121,6 +122,13 @@ struct Doc {
     /// this doc drained (EDITOR-LSP-3) — the poll gate so quiet frames skip the
     /// reply inbox.
     lsp_reply_epoch: u64,
+    /// The buffer revision observed on the previous autosave tick (EDITOR-11) —
+    /// the debounce spots a fresh keystroke by the revision moving and re-arms
+    /// [`idle_since`](Self::idle_since).
+    autosave_rev: u64,
+    /// App-time (seconds) the buffer last changed — autosave writes a dirty
+    /// buffer only once it has been idle past the configured window (EDITOR-11).
+    idle_since: f64,
 }
 
 impl Doc {
@@ -130,6 +138,7 @@ impl Doc {
     /// (it needs the resolved project root, which the surface owns).
     fn new(buffer: Buffer) -> Self {
         let highlight = buffer.path().and_then(Highlighter::for_path);
+        let autosave_rev = buffer.revision();
         Self {
             buffer,
             view: EditorView::new(),
@@ -138,6 +147,8 @@ impl Doc {
             diagnostics: DiagnosticsOverlay::default(),
             lsp_synced_gen: 0,
             lsp_reply_epoch: 0,
+            autosave_rev,
+            idle_since: 0.0,
         }
     }
 
@@ -212,6 +223,25 @@ impl Doc {
             client.on_close(path);
         }
         client.shutdown();
+    }
+
+    /// Reload this document's content from disk (EDITOR-11 reload-theirs): replace
+    /// the buffer with the on-disk copy, re-pick the highlighter for a full parse
+    /// of the new text (its old incremental tree no longer matches), re-arm the
+    /// autosave anchor, and resync the language server with the reloaded text
+    /// (full-text `didChange`) so diagnostics track disk, not the pre-reload buffer.
+    ///
+    /// # Errors
+    /// Returns any [`io::Error`] from re-reading the file.
+    fn reload(&mut self) -> io::Result<()> {
+        self.buffer.reload_from_disk()?;
+        self.highlight = self.buffer.path().and_then(Highlighter::for_path);
+        self.autosave_rev = self.buffer.revision();
+        if let (Some(client), Some(path)) = (self.lsp.as_ref(), self.buffer.path()) {
+            client.on_change(path, &self.buffer.rope().to_string());
+            self.lsp_synced_gen = self.view.edit_generation();
+        }
+        Ok(())
     }
 }
 
@@ -395,6 +425,17 @@ pub struct EditorSurface {
     /// "No definition found" / "Renamed 3 files" / "No language server" — shown
     /// in the status bar until the next action replaces it.
     lsp_notice: Option<String>,
+    /// The persisted autosave preference (EDITOR-11) — off by default, loaded
+    /// from the editor config on construction, re-saved when the operator toggles
+    /// it from the status bar.
+    autosave: AutosavePrefs,
+    /// The external-change watch (EDITOR-11): a pending reload prompt + the poll
+    /// debounce clock.
+    reload: ReloadWatch,
+    /// A short honest status line for the last save / autosave / reload action
+    /// (§7) — e.g. "Saved" / "Autosaved" / "Reloaded from disk" / a write error —
+    /// shown in the status bar until the next action replaces it.
+    notice: Option<String>,
 }
 
 impl Default for EditorSurface {
@@ -422,6 +463,9 @@ impl Default for EditorSurface {
             references: ReferencesPanel::default(),
             rename: RenameBox::default(),
             lsp_notice: None,
+            autosave: load_autosave_prefs(),
+            reload: ReloadWatch::default(),
+            notice: None,
         }
     }
 }
@@ -459,6 +503,139 @@ impl SaveAsDialog {
         self.error = None;
         self.focus_field = true;
     }
+}
+
+// ── EDITOR-11: autosave preference (persisted) ───────────────────────────────
+
+/// The default autosave idle window in seconds — the debounce so a mid-keystroke
+/// burst never triggers a write; a dirty buffer is saved only after it has been
+/// idle this long.
+const DEFAULT_AUTOSAVE_SECS: f64 = 2.0;
+
+/// The editor's config file basename under `<config>/mcnf/` (EDITOR-11). Only the
+/// production config-path resolver reads it; the suite is cfg-gated to never touch
+/// the real user config (see [`autosave_config_path`]).
+#[cfg(not(test))]
+const AUTOSAVE_CONFIG_FILE: &str = "editor-egui.json";
+
+/// How often (app-time seconds) the surface re-stats the focused buffer's file
+/// for an external change — a debounce so the poll is not a per-frame `stat`.
+const EXTERNAL_POLL_SECS: f64 = 1.5;
+
+/// The persisted editor preferences (EDITOR-11) — currently the autosave toggle
+/// and its debounce window. Serialized as `<config>/mcnf/editor-egui.json`. Off
+/// by default (the acceptance): a fresh install never autosaves until the
+/// operator opts in.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct AutosavePrefs {
+    /// Whether debounced autosave is on. Off by default.
+    #[serde(default)]
+    enabled: bool,
+    /// Idle seconds before a dirty buffer is written (the debounce window).
+    #[serde(default = "default_autosave_secs")]
+    idle_secs: f64,
+}
+
+/// The serde default for [`AutosavePrefs::idle_secs`] (a bare `#[serde(default)]`
+/// would zero it, defeating the debounce).
+const fn default_autosave_secs() -> f64 {
+    DEFAULT_AUTOSAVE_SECS
+}
+
+impl Default for AutosavePrefs {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_secs: DEFAULT_AUTOSAVE_SECS,
+        }
+    }
+}
+
+/// The editor config file path under the user config dir, or `None` when neither
+/// `XDG_CONFIG_HOME` nor `HOME` resolves. Under `cfg(test)` this is always `None`
+/// so the suite never reads or writes the real user config (the round-trip is
+/// proven against an explicit tempdir instead — the same cfg-gated seam
+/// `build_lsp_client` uses to keep the suite hermetic).
+#[cfg(not(test))]
+fn autosave_config_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("mcnf").join(AUTOSAVE_CONFIG_FILE))
+}
+
+#[cfg(test)]
+const fn autosave_config_path() -> Option<PathBuf> {
+    None
+}
+
+/// Read the persisted prefs at `path`, clamping the idle window to a sane floor
+/// (a hand-edited `0`/negative would thrash) — the shared reader for both the
+/// production load and the round-trip test.
+fn read_autosave_prefs_at(path: &Path) -> Option<AutosavePrefs> {
+    let data = std::fs::read_to_string(path).ok()?;
+    let mut prefs: AutosavePrefs = serde_json::from_str(&data).ok()?;
+    prefs.idle_secs = prefs.idle_secs.max(0.2);
+    Some(prefs)
+}
+
+/// Write `prefs` to `path` as pretty JSON, creating the parent directory — the
+/// shared writer for both the production save and the round-trip test.
+///
+/// # Errors
+/// Returns an [`io::Error`] if the directory cannot be created or the write fails.
+fn write_autosave_prefs_at(path: &Path, prefs: AutosavePrefs) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(&prefs)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    std::fs::write(path, json)
+}
+
+/// The persisted prefs from the resolved config path, or the default (off) when
+/// nothing is stored / the path does not resolve (§7 — an honest off default,
+/// never a fabricated toggle).
+fn load_autosave_prefs() -> AutosavePrefs {
+    autosave_config_path()
+        .as_deref()
+        .and_then(read_autosave_prefs_at)
+        .unwrap_or_default()
+}
+
+/// The operator's decision on the external-change reload prompt (EDITOR-11).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReloadChoice {
+    /// Discard the in-memory buffer and take the on-disk copy.
+    Reload,
+    /// Keep the in-memory buffer; acknowledge the disk change so it stops
+    /// prompting (the keep-mine side of a conflict).
+    Keep,
+}
+
+/// One pending external-change reload prompt (EDITOR-11): the file changed under
+/// the focused buffer and the operator has not yet decided.
+struct ReloadPrompt {
+    /// The file that changed — guards the decision against a tab switch under the
+    /// prompt and labels the dialog.
+    path: PathBuf,
+    /// The buffer also held unsaved edits when the change was detected — the
+    /// keep-mine / reload-theirs conflict path (never silently clobbered).
+    conflict: bool,
+    /// The fresh on-disk stamp to adopt on keep-mine, so the same change does not
+    /// re-fire on the next poll.
+    stamp: DiskStamp,
+}
+
+/// The external-change watch state (EDITOR-11): the pending prompt (if any) and
+/// the debounce clock for the next disk poll.
+#[derive(Default)]
+struct ReloadWatch {
+    /// The prompt awaiting the operator's decision, or `None` when nothing pends.
+    prompt: Option<ReloadPrompt>,
+    /// App-time (seconds) of the next external-change poll — the stat debounce.
+    next_poll: f64,
 }
 
 impl EditorSurface {
@@ -738,6 +915,7 @@ impl EditorSurface {
             || self.table_picker.open
             || self.references.is_open()
             || self.rename.is_open()
+            || self.reload.prompt.is_some()
     }
 
     /// Open the fuzzy file-finder (the `Cmd`/`Ctrl-P` seam), rooted at the open
@@ -1356,6 +1534,213 @@ impl EditorSurface {
         }
     }
 
+    // ── EDITOR-11: save / autosave / external-change reload ──────────────────
+
+    /// Ctrl-S — write the focused buffer to its path (the EDITOR-2 save seam),
+    /// clearing dirty. A pathless (scratch) buffer has nowhere to write, so this
+    /// opens the Save As overlay to prompt for a path (the honest idiom, §7); a
+    /// write failure is surfaced as a status notice, never swallowed. A no-op with
+    /// no open document.
+    fn save_focused(&mut self) {
+        let has_path = match self.doc() {
+            None => return,
+            Some(doc) => doc.buffer.path().is_some(),
+        };
+        if !has_path {
+            self.save_as.open_for(None);
+            return;
+        }
+        let result = self.doc_mut().map(|doc| doc.buffer.save());
+        self.notice = match result {
+            Some(Ok(())) => Some("Saved".to_owned()),
+            Some(Err(err)) => Some(format!("Save failed: {err}")),
+            None => None,
+        };
+    }
+
+    /// Flip the persisted autosave toggle (the status-bar control) and write the
+    /// preference back to the editor config (EDITOR-11). A config path that does
+    /// not resolve / fails to write is a silent no-op — the toggle still holds for
+    /// this session.
+    fn set_autosave(&mut self, enabled: bool) {
+        self.autosave.enabled = enabled;
+        if let Some(path) = autosave_config_path() {
+            let _ = write_autosave_prefs_at(&path, self.autosave);
+        }
+        self.notice = Some(
+            if enabled {
+                "Autosave on"
+            } else {
+                "Autosave off"
+            }
+            .to_owned(),
+        );
+    }
+
+    /// The per-frame autosave debounce (EDITOR-11). Every open buffer's idle time
+    /// is tracked — re-armed whenever its revision moves, so a mid-keystroke burst
+    /// never triggers a write — and, only when autosave is enabled, a dirty
+    /// path-backed buffer is written once it has been idle past the configured
+    /// window. `now` is egui's app-time in seconds (deterministic in headless
+    /// tests). Own writes re-baseline the buffer, so nothing re-saves until the
+    /// next edit.
+    fn tick_autosave(&mut self, now: f64) {
+        let enabled = self.autosave.enabled;
+        let idle = self.autosave.idle_secs;
+        let mut saved_any = false;
+        for pane in self.panes.values_mut() {
+            for doc in &mut pane.tabs {
+                let rev = doc.buffer.revision();
+                if rev != doc.autosave_rev {
+                    doc.autosave_rev = rev;
+                    doc.idle_since = now;
+                    continue;
+                }
+                let due = enabled
+                    && doc.buffer.is_dirty()
+                    && doc.buffer.path().is_some()
+                    && now - doc.idle_since >= idle;
+                if due && doc.buffer.save().is_ok() {
+                    saved_any = true;
+                }
+            }
+        }
+        if saved_any {
+            self.notice = Some("Autosaved".to_owned());
+        }
+    }
+
+    /// Poll the focused buffer's file for an external change (EDITOR-11), debounced
+    /// to at most once per [`EXTERNAL_POLL_SECS`]. On a detected change it opens the
+    /// reload prompt (flagging the dirty-conflict case); it never reloads on its
+    /// own — the operator decides. Skipped while any overlay/dialog (including a
+    /// prompt already up) holds the keyboard, so it never interrupts a live gesture.
+    fn poll_external_change(&mut self, now: f64) {
+        if self.overlay_active() || now < self.reload.next_poll {
+            return;
+        }
+        self.reload.next_poll = now + EXTERNAL_POLL_SECS;
+        let prompt = {
+            let Some(doc) = self.doc() else {
+                return;
+            };
+            let Some(path) = doc.buffer.path().map(Path::to_path_buf) else {
+                return;
+            };
+            match doc.buffer.disk_state() {
+                DiskState::Changed(stamp) => Some(ReloadPrompt {
+                    path,
+                    conflict: doc.buffer.is_dirty(),
+                    stamp,
+                }),
+                DiskState::Unchanged | DiskState::Unknown => None,
+            }
+        };
+        if prompt.is_some() {
+            self.reload.prompt = prompt;
+        }
+    }
+
+    /// Reload-theirs (EDITOR-11): if the focused doc still shows `path`, replace
+    /// its buffer with the on-disk copy; otherwise the tab moved under the prompt
+    /// and the decision is dropped. Surfaces the outcome as a status notice.
+    fn reload_focused(&mut self, path: &Path) {
+        let outcome = {
+            let Some(doc) = self.doc_mut() else {
+                return;
+            };
+            if doc.buffer.path() != Some(path) {
+                return;
+            }
+            doc.reload()
+        };
+        self.notice = Some(match outcome {
+            Ok(()) => "Reloaded from disk".to_owned(),
+            Err(err) => format!("Reload failed: {err}"),
+        });
+    }
+
+    /// Keep-mine (EDITOR-11): adopt the new on-disk `stamp` on the focused doc (if
+    /// it still shows `path`) so the same external change stops prompting, leaving
+    /// the operator's in-memory edits untouched.
+    fn acknowledge_disk(&mut self, path: &Path, stamp: DiskStamp) {
+        if let Some(doc) = self.doc_mut() {
+            if doc.buffer.path() == Some(path) {
+                doc.buffer.adopt_disk_stamp(stamp);
+            }
+        }
+        self.notice = Some("Kept your version".to_owned());
+    }
+
+    /// Render the EDITOR-11 external-change reload prompt and route the operator's
+    /// decision. Never clobbers: a dirty buffer's conflict offers keep-mine vs.
+    /// reload-theirs; a clean buffer offers reload vs. ignore. Escape keeps the
+    /// in-memory version (the safe default). Token-styled (§4).
+    fn render_reload_prompt(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.reload.prompt.take() else {
+            return;
+        };
+        let esc = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+        let mut decision: Option<ReloadChoice> = esc.then_some(ReloadChoice::Keep);
+        egui::Window::new("File changed on disk")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(DIALOG_W);
+                ui.label(
+                    RichText::new(prompt.path.display().to_string())
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.add_space(Style::SP_XS);
+                let (body, color) = if prompt.conflict {
+                    (
+                        "This file changed on disk and you have unsaved edits here.",
+                        Style::WARN,
+                    )
+                } else {
+                    (
+                        "This file changed on disk since you opened it.",
+                        Style::TEXT,
+                    )
+                };
+                ui.label(RichText::new(body).size(Style::BODY).color(color));
+                ui.add_space(Style::SP_S);
+                ui.horizontal(|ui| {
+                    let (reload_label, keep_label) = if prompt.conflict {
+                        ("Reload (discard mine)", "Keep mine")
+                    } else {
+                        ("Reload", "Ignore")
+                    };
+                    if ui.button(keep_label).clicked() {
+                        decision = Some(ReloadChoice::Keep);
+                    }
+                    if ui.button(reload_label).clicked() {
+                        decision = Some(ReloadChoice::Reload);
+                    }
+                });
+            });
+        match decision {
+            Some(ReloadChoice::Reload) => self.reload_focused(&prompt.path),
+            Some(ReloadChoice::Keep) => self.acknowledge_disk(&prompt.path, prompt.stamp),
+            None => self.reload.prompt = Some(prompt),
+        }
+    }
+
+    /// Intercept Ctrl-S at the panel level (EDITOR-11) — consumed before the text
+    /// widget clones this frame's events so it saves instead of typing `s`. Skipped
+    /// while an overlay/dialog holds the keyboard (so Ctrl-S in a field never fires
+    /// a background save).
+    fn handle_save_chord(&mut self, ui: &Ui) {
+        if self.overlay_active() {
+            return;
+        }
+        if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
+            self.save_focused();
+        }
+    }
+
     /// Render the EDTB-1 dialogs (Save As…, About) above the editor body and
     /// route their outcomes. Escape cancels an open dialog (consumed, mirroring
     /// the finder/palette Esc handling). Token-styled (§4).
@@ -1603,8 +1988,7 @@ impl EditorSurface {
         let goto = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12));
         let references = ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F12));
         let rename = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F2));
-        let format =
-            ui.input_mut(|i| i.consume_key(Modifiers::SHIFT | Modifiers::ALT, Key::F));
+        let format = ui.input_mut(|i| i.consume_key(Modifiers::SHIFT | Modifiers::ALT, Key::F));
         let fired = goto || references || rename || format;
         if references {
             self.lsp_find_references();
@@ -1686,7 +2070,11 @@ impl EditorSurface {
         };
         // EDITOR-LSP-3 — the last navigation action's honest status (§7).
         let notice = self.lsp_notice.clone();
+        // EDITOR-11 — the last save/autosave/reload status + the autosave toggle.
+        let save_notice = self.notice.clone();
+        let autosave_on = self.autosave.enabled;
         let mut toggle_wrap = false;
+        let mut toggle_autosave = false;
         ui.horizontal(|ui| {
             ui.add_space(Style::SP_S);
             if lossy {
@@ -1702,6 +2090,14 @@ impl EditorSurface {
                     RichText::new(notice)
                         .size(Style::SMALL)
                         .color(Style::ACCENT),
+                );
+            }
+            if let Some(save_notice) = &save_notice {
+                ui.add_space(Style::SP_M);
+                ui.label(
+                    RichText::new(save_notice)
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
                 );
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1734,12 +2130,23 @@ impl EditorSurface {
                 {
                     toggle_wrap = true;
                 }
+                ui.add_space(Style::SP_M);
+                if ui
+                    .selectable_label(autosave_on, RichText::new("Autosave").size(Style::SMALL))
+                    .on_hover_text("Save dirty buffers automatically after a short idle")
+                    .clicked()
+                {
+                    toggle_autosave = true;
+                }
             });
         });
         if toggle_wrap {
             if let Some(doc) = self.doc_mut() {
                 doc.view.toggle_wrap();
             }
+        }
+        if toggle_autosave {
+            self.set_autosave(!autosave_on);
         }
     }
 
@@ -2095,6 +2502,14 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
     // consumed here for the same reason, then drain any completed async replies
     // from the language server so this frame reflects a jump / list / edit.
     surface.handle_lsp_chords(ui);
+    // EDITOR-11 — Ctrl-S save (consumed at the panel level, before the widget
+    // clones this frame's events), then the autosave debounce tick + the
+    // external-change poll. `now` is egui's app-time in seconds; both the tick and
+    // the poll are debounced so neither fights a live edit gesture.
+    surface.handle_save_chord(ui);
+    let now = ui.input(|i| i.time);
+    surface.tick_autosave(now);
+    surface.poll_external_change(now);
     surface.pump_lsp_replies();
 
     // EDTB-4 — the compact decision, taken ONCE from the panel's available width
@@ -2210,6 +2625,9 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
 
     // EDTB-1 — the Save As / About dialogs, rendered above everything.
     surface.render_dialogs(ui.ctx());
+    // EDITOR-11 — the external-change reload prompt, above everything (never a
+    // silent clobber; the operator chooses keep-mine vs. reload-theirs).
+    surface.render_reload_prompt(ui.ctx());
 }
 
 /// The project tree's "no folder open" face (§7) — an honest note plus a reachable
@@ -3929,9 +4347,197 @@ mod tests {
         );
         surface.references.close();
         surface.rename.open_for(a.clone(), 0, 4, "x");
+        assert!(tessellate_panel(&mut surface) > 0, "the rename box paints");
+    }
+
+    // ── EDITOR-11: save / autosave / external-change reload ──────────────────
+
+    #[test]
+    fn ctrl_s_saves_the_focused_buffer_and_clears_dirty() {
+        let d = TempDir::new("save-ctrl-s");
+        let file = d.join("s.txt");
+        std::fs::write(&file, b"abc").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        // A real typed frame dirties the buffer …
+        run_frame(&ctx, &mut surface, vec![Event::Text("X".to_owned())]);
         assert!(
-            tessellate_panel(&mut surface) > 0,
-            "the rename box paints"
+            surface.doc().expect("doc").buffer.is_dirty(),
+            "the edit dirtied the buffer"
+        );
+
+        // … and Ctrl-S at the panel level writes it and clears dirty.
+        run_frame(
+            &ctx,
+            &mut surface,
+            vec![key_press(Key::S, Modifiers::COMMAND)],
+        );
+        assert!(
+            !surface.doc().expect("doc").buffer.is_dirty(),
+            "Ctrl-S cleared the dirty state"
+        );
+        let on_disk = std::fs::read_to_string(&file).expect("read back");
+        assert!(on_disk.contains('X'), "the edit reached disk: {on_disk:?}");
+    }
+
+    #[test]
+    fn ctrl_s_on_a_scratch_buffer_prompts_for_a_path() {
+        let mut surface = real_editor();
+        surface.open_scratch(); // pathless — nowhere to write yet
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        run_frame(
+            &ctx,
+            &mut surface,
+            vec![key_press(Key::S, Modifiers::COMMAND)],
+        );
+        assert!(
+            surface.save_as.open,
+            "Ctrl-S on a pathless buffer opens the Save As prompt (honest, §7)"
+        );
+    }
+
+    #[test]
+    fn autosave_writes_a_dirty_buffer_only_after_the_idle_window() {
+        let d = TempDir::new("autosave-on");
+        let file = d.join("a.txt");
+        std::fs::write(&file, b"abc").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+        surface.doc_mut().expect("doc").buffer.insert(3, "Z");
+        surface.autosave.enabled = true;
+        surface.autosave.idle_secs = 5.0;
+
+        // The first tick observes the fresh edit → arms the idle timer, no write.
+        surface.tick_autosave(100.0);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "abc",
+            "not saved on the same tick the edit landed"
+        );
+        // Still inside the debounce window.
+        surface.tick_autosave(103.0);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "abc",
+            "debounced — the buffer is still settling"
+        );
+        // Past the window → the dirty, path-backed buffer is written.
+        surface.tick_autosave(106.0);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "abcZ",
+            "autosaved once idle past the window"
+        );
+        assert!(
+            !surface.doc().expect("doc").buffer.is_dirty(),
+            "the autosave cleared dirty"
+        );
+    }
+
+    #[test]
+    fn autosave_disabled_never_writes_a_dirty_buffer() {
+        let d = TempDir::new("autosave-off");
+        let file = d.join("a.txt");
+        std::fs::write(&file, b"abc").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+        surface.doc_mut().expect("doc").buffer.insert(3, "Z");
+        assert!(!surface.autosave.enabled, "autosave is off by default");
+
+        surface.tick_autosave(100.0);
+        surface.tick_autosave(500.0); // long past any window
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "abc",
+            "autosave off → the file is never written"
+        );
+        assert!(
+            surface.doc().expect("doc").buffer.is_dirty(),
+            "the buffer stays dirty"
+        );
+    }
+
+    #[test]
+    fn an_external_change_opens_the_reload_prompt() {
+        let d = TempDir::new("reload-detect");
+        let file = d.join("a.txt");
+        std::fs::write(&file, b"abc").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+
+        // A tool rewrites the file (a different length is caught regardless of
+        // mtime granularity).
+        std::fs::write(&file, b"abcdef").expect("external write");
+        surface.poll_external_change(0.0);
+
+        let prompt = surface.reload.prompt.as_ref().expect("a change is pending");
+        assert_eq!(prompt.path, file, "the prompt names the changed file");
+        assert!(!prompt.conflict, "a clean buffer is not a conflict");
+    }
+
+    #[test]
+    fn a_dirty_external_change_is_a_conflict_and_reload_takes_disk() {
+        let d = TempDir::new("reload-conflict");
+        let file = d.join("a.txt");
+        std::fs::write(&file, b"abc").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+        // A local unsaved edit …
+        surface.doc_mut().expect("doc").buffer.insert(3, "-mine");
+        // … concurrent with an external rewrite.
+        std::fs::write(&file, b"theirs\n").expect("external write");
+        surface.poll_external_change(0.0);
+
+        let path = {
+            let prompt = surface.reload.prompt.as_ref().expect("pending");
+            assert!(
+                prompt.conflict,
+                "unsaved edits + an external change is a conflict"
+            );
+            prompt.path.clone()
+        };
+
+        // Reload-theirs replaces the buffer with the on-disk copy, landing clean.
+        surface.reload_focused(&path);
+        let doc = surface.doc().expect("doc");
+        assert_eq!(
+            doc.buffer.rope().to_string(),
+            "theirs\n",
+            "reload took the disk copy"
+        );
+        assert!(!doc.buffer.is_dirty(), "the reloaded buffer is clean");
+    }
+
+    #[test]
+    fn autosave_prefs_round_trip_through_the_config_file() {
+        let d = TempDir::new("autosave-cfg");
+        let path = d.join("editor-egui.json");
+        let prefs = super::AutosavePrefs {
+            enabled: true,
+            idle_secs: 3.5,
+        };
+        super::write_autosave_prefs_at(&path, prefs).expect("write prefs");
+        let back = super::read_autosave_prefs_at(&path).expect("read prefs");
+        assert!(back.enabled, "the enabled toggle persisted");
+        assert!(
+            (back.idle_secs - 3.5).abs() < f64::EPSILON,
+            "the interval persisted"
+        );
+    }
+
+    #[test]
+    fn a_hand_edited_zero_interval_is_clamped_on_load() {
+        let d = TempDir::new("autosave-clamp");
+        let path = d.join("editor-egui.json");
+        std::fs::write(&path, br#"{"enabled":true,"idle_secs":0.0}"#).expect("seed");
+        let prefs = super::read_autosave_prefs_at(&path).expect("read");
+        assert!(
+            prefs.idle_secs >= 0.2,
+            "a hand-edited 0 interval is clamped to a sane floor"
         );
     }
 }
