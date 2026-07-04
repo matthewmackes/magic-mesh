@@ -146,6 +146,16 @@ struct Shell {
     /// tray itself is stateless folds over `chrome` + the seat snapshot + the
     /// Chat unread tally, rendered by `dock::taskbar` (NAVBAR-W10-2).
     tray: tray::TrayState,
+    /// VDOCK-1 — the left vertical dock's auto-hide state (the Super-tap reveal
+    /// latch + the pin). Read by `dock::dock` each frame; toggled by a clean Super
+    /// tap on the hotkey path (`hotkeys::HotkeyRouter::take_dock_toggle`).
+    vdock: dock::DockState,
+    /// VDOCK-1 — the cutover flag. When `true` (the default) the shell mounts the
+    /// left vertical dock (`dock::dock`) INSTEAD of the horizontal bottom taskbar;
+    /// when `false` it mounts the legacy `dock::taskbar`. Both code paths stay
+    /// until VDOCK-6 rips the bottom bar out at the cutover; a field (not a const)
+    /// keeps both branches live so neither reads as dead code.
+    vertical_dock: bool,
     /// The Music surface, owned + built once (its worker thread wakes the shell's
     /// egui context on every update). Rendered via `mde_music_egui::music_panel`.
     music: MusicApp,
@@ -296,6 +306,11 @@ impl Shell {
             spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState::default(),
             chrome: chrome::ChromeState::default(),
             tray: tray::TrayState::default(),
+            vdock: dock::DockState::default(),
+            // VDOCK-1 cutover — the vertical dock is the live chrome (default ON);
+            // the bottom bar stays mounted only when this is flipped off (until
+            // VDOCK-6 removes it entirely).
+            vertical_dock: true,
             music: MusicApp::new_with_ctx(ctx),
             media: real_media(),
             files: mde_files_egui::real_browser(),
@@ -399,8 +414,10 @@ impl Shell {
     /// Workbench planes poll (it self-gates).
     fn poll_mesh_map(&mut self, ctx: &egui::Context) {
         self.mesh_view.poll(ctx);
-        let explorer_lens =
-            ctx.data(|d| d.get_temp::<bool>(egui::Id::new(explorer::LENS_KEY)).unwrap_or(false));
+        let explorer_lens = ctx.data(|d| {
+            d.get_temp::<bool>(egui::Id::new(explorer::LENS_KEY))
+                .unwrap_or(false)
+        });
         if explorer_lens {
             self.explorer.poll(ctx);
         }
@@ -833,33 +850,11 @@ impl Shell {
         // clock's minute flip) — the tray reads the product, no second poll.
         self.chrome.poll(ctx);
 
-        // The shell's ONE constant bar (locks W1/W13): the pixel-per-Win10
-        // bottom taskbar — the flat icon-only surface row plus the right-
-        // justified status tray + clock — mounted BEFORE the central view so it
-        // frames the session and the shell body alike, and the surface body
-        // above it fills to the top edge.
-        let unread = self.chat.total_unread();
-        let session_active = self.vdi.requested_target().is_some();
-        let mut bar_clicked = false;
-        egui::TopBottomPanel::bottom("shell-taskbar")
-            .exact_height(dock::TASKBAR_H)
-            .frame(egui::Frame::default().fill(Style::SURFACE))
-            .show(ctx, |ui| {
-                let inputs = tray::TrayInputs {
-                    mesh: self.chrome.summary(),
-                    seat: self.system.snapshot(),
-                    unread,
-                    session_active,
-                };
-                bar_clicked = dock::taskbar(ui, &mut self.nav.surface, &mut self.tray, &inputs);
-            });
-        if bar_clicked {
-            // The dock is the nav (lock W1): any bar routing — a surface cell OR
-            // a tray icon — surfaces the shell body (a navigation is never a
-            // no-op behind the session). This replaces the retired chrome
-            // Expand/Collapse toggle.
-            self.nav.expanded = true;
-        }
+        // The shell's dock chrome (VDOCK-1), mounted BEFORE the central view so it
+        // frames the session + shell body: the left vertical dock (default) or the
+        // legacy bottom taskbar behind the flag. Extracted to a helper so `render`
+        // stays within the line budget.
+        self.mount_dock_chrome(ctx);
 
         // The central view: the session↔body cross-fade — or nothing at all
         // while the settled curtain fully covers the seat (CURTAIN-1, lock 10).
@@ -915,6 +910,13 @@ impl Shell {
                 self.apply_hotkey(action);
             }
         }
+        // VDOCK-1 (lock 13) — a clean Super *tap* (press+release with no leader
+        // chord used in between) toggles the vertical dock. Always DRAINED so the
+        // router's latch never backs up; but, like every chord above, swallowed
+        // while the curtain is engaged (lock 10).
+        if self.hotkeys.take_dock_toggle() && !self.curtain.engaged() {
+            self.vdock.toggle();
+        }
 
         // The KIRON chyron (KIRON-2) — driven last so its lower-third band + OSD
         // float (Foreground order) above the chrome, the surface, and any
@@ -948,8 +950,55 @@ impl Shell {
         // (lock 10) — the pointer through the covering layer, the keyboard through
         // its per-frame focus steal plus the hotkey / edge-swipe / central-view
         // gates above. An early no-op while Unlocked.
-        self.curtain
-            .show(ctx, &mut self.media, self.system.snapshot(), self.chrome.summary());
+        self.curtain.show(
+            ctx,
+            &mut self.media,
+            self.system.snapshot(),
+            self.chrome.summary(),
+        );
+    }
+
+    /// Mount the shell's **dock chrome** for this frame (VDOCK-1). When
+    /// `vertical_dock` is on (the default) this is the left **vertical dock**
+    /// (`dock::dock`) — a floating, slide-in, auto-hide `Area` that reserves NO
+    /// gutter, so the central view fills the full width AND height (no bottom
+    /// panel). Otherwise it's the legacy pixel-per-Win10 bottom **taskbar**
+    /// (`dock::taskbar`) in a bottom panel. Either way, a routed click surfaces the
+    /// shell body (the dock IS the nav, lock W1 — a navigation is never a no-op
+    /// behind the session). Both paths stay live until VDOCK-6 rips the bottom bar
+    /// out at the cutover. Split out of `render` so each stays within the line
+    /// budget.
+    fn mount_dock_chrome(&mut self, ctx: &egui::Context) {
+        let bar_clicked = if self.vertical_dock {
+            // VDOCK-1 — the slide-in, auto-hide left dock. Its interior is empty
+            // seams here (VDOCK-2/3/4 fill the app picker + status/system quads), so
+            // no cell routes yet — the shell body is reached via the hotkeys + edge
+            // swipes until VDOCK-2 lands the app picker.
+            dock::dock(ctx, &mut self.vdock)
+        } else {
+            // The legacy bottom taskbar (locks W1/W13) — the flat icon-only surface
+            // row plus the right-justified status tray + clock. Retained behind the
+            // flag until VDOCK-6's cutover.
+            let unread = self.chat.total_unread();
+            let session_active = self.vdi.requested_target().is_some();
+            let mut clicked = false;
+            egui::TopBottomPanel::bottom("shell-taskbar")
+                .exact_height(dock::TASKBAR_H)
+                .frame(egui::Frame::default().fill(Style::SURFACE))
+                .show(ctx, |ui| {
+                    let inputs = tray::TrayInputs {
+                        mesh: self.chrome.summary(),
+                        seat: self.system.snapshot(),
+                        unread,
+                        session_active,
+                    };
+                    clicked = dock::taskbar(ui, &mut self.nav.surface, &mut self.tray, &inputs);
+                });
+            clicked
+        };
+        if bar_clicked {
+            self.nav.expanded = true;
+        }
     }
 
     /// The central view: the session↔body cross-fade through the expand

@@ -28,9 +28,17 @@
 //! The bar is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
 //! shell owns each surface's app and its per-frame pump.
+//!
+//! **VDOCK-1** adds the left **vertical dock** ([`dock`], design
+//! `docs/design/vertical-dock.md`) in parallel: a left-edge, full-height, ~48px
+//! slide-in auto-hide column that will REPLACE this bottom [`taskbar`]. VDOCK-1
+//! builds only its frame + auto-hide (Super-tap toggle + pin + slide); the app
+//! picker / status quads / system quad land in VDOCK-2/3/4. The shell mounts one
+//! or the other via a flag (default the vertical dock); this `taskbar` stays
+//! intact until VDOCK-6 rips it out at the cutover.
 
 use mde_egui::egui::{self, TextureHandle, TextureOptions};
-use mde_egui::Style;
+use mde_egui::{Motion, Style};
 use mde_theme::brand::icons::{icon_image, IconId};
 
 use crate::tray::{self, TrayInputs, TrayState};
@@ -659,12 +667,220 @@ pub fn icon_texture(
     texture
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// VDOCK-1 — the left **vertical dock** frame + auto-hide (design
+// `docs/design/vertical-dock.md`, locks #1/#9/#13/#14/#23/#24).
+//
+// The eventual replacement for the horizontal [`taskbar`] above: a left-edge,
+// full-height, ~48px, solid Carbon-dark column that slides in from the left and
+// auto-hides (hotkey + pin, no hover). VDOCK-1 builds ONLY the FRAME + the
+// slide/toggle/pin mechanism; the interior stays three empty seams for the
+// follow-ups (app picker VDOCK-2, status quads VDOCK-3, system quad VDOCK-4). It
+// mounts in parallel with the still-intact `taskbar` — the shell picks one via a
+// flag (default the vertical dock); VDOCK-6 rips the bottom bar out at the cutover.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The vertical dock's width in logical points (~48px, design #2/#23) — one
+/// column, the SAME 48px module as the horizontal taskbar's icon cell
+/// ([`CELL_W`]), so VDOCK-2's app glyphs + VDOCK-3/4's quads inherit the grid.
+/// (`pub`, not `pub(crate)` — the `clippy::redundant_pub_crate` form for a
+/// crate-visible item in a private module, like [`TASKBAR_H`].)
+pub const DOCK_W: f32 = CELL_W;
+
+/// The egui memory key for the dock's slide animation (the Motion latch that
+/// eases the reveal 0↔1). Private to the dock.
+const DOCK_SLIDE_KEY: &str = "vdock-slide";
+
+/// The stable id of the dock's floating [`egui::Area`] layer, so the shell (and
+/// the passthrough test) can name its `LayerId` — `LayerId::new(Foreground,
+/// Id::new(DOCK_AREA))`.
+const DOCK_AREA: &str = "vdock-area";
+
+/// The left vertical dock's **auto-hide state** (VDOCK-1, locks #9/#13) — the two
+/// inputs that decide whether the dock is on screen: the Super-tap **reveal**
+/// latch and the **pin**. Kept tiny + pure (no egui, no GPU) so the shell's
+/// hotkey path toggles it and the render reads [`Self::shown`] headless-testably.
+/// There is deliberately **no hover-reveal** (lock #9): the dock shows only via
+/// the hotkey or the pin.
+#[derive(Debug, Default)]
+pub struct DockState {
+    /// Toggled by a clean Super tap (lock #13) — the hotkey reveal/hide latch.
+    revealed: bool,
+    /// The pin (lock #9): while set, the dock stays on screen regardless of the
+    /// reveal latch — the "hotkey + pin" hold-open.
+    pinned: bool,
+}
+
+impl DockState {
+    /// Toggle the Super-tap **reveal** — the VDOCK-1 hotkey path calls this on a
+    /// clean Super tap (`hotkeys::HotkeyRouter::take_dock_toggle`). A pinned dock
+    /// stays shown regardless — see [`Self::shown`].
+    pub const fn toggle(&mut self) {
+        self.revealed = !self.revealed;
+    }
+
+    /// Whether the dock should be on screen this frame: revealed **or** pinned
+    /// (the pin holds it open, lock #9).
+    pub const fn shown(&self) -> bool {
+        self.revealed || self.pinned
+    }
+
+    /// Whether the dock is pinned open.
+    pub const fn pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Flip the **pin** (the in-dock pin toggle). Pinning also reveals, so the
+    /// dock never animates out from under a just-set pin; unpinning leaves the
+    /// reveal latch as it was (a Super tap then hides it).
+    pub const fn toggle_pin(&mut self) {
+        self.pinned = !self.pinned;
+        if self.pinned {
+            self.revealed = true;
+        }
+    }
+}
+
+/// Render the **left vertical dock** (VDOCK-1) — the slide-in, auto-hide chrome
+/// that will replace the bottom [`taskbar`]. A left-edge, full-height [`DOCK_W`]
+/// column: a solid Carbon-dark panel with a hairline right-edge divider (locks
+/// #1/#24, §4 tokens). Hidden off the left by default; the shell's Super-tap
+/// toggles it and the pin holds it open (`state`), sliding in/out from the left
+/// edge over the shared [`Motion`] table (~200ms, locks #13/#14).
+///
+/// Mounted as a floating [`egui::Area`] (NOT a [`egui::SidePanel`]) so it reserves
+/// **no gutter** — the central surface fills the full width whether the dock is in
+/// or out. When fully hidden **and settled** it mounts **no layer at all**, so
+/// egui hit-tests every pointer/key event straight to the surface beneath: the
+/// dock can never steal focus/input while hidden (the design's "auto-hide + DRM
+/// seat" risk; proven by the passthrough test).
+///
+/// VDOCK-1 builds the FRAME + the slide/toggle/pin only; the interior is three
+/// empty seams the follow-ups fill — a top **Workbench-lead** zone (VDOCK-2), a
+/// scrollable **app-groups** middle (VDOCK-2), and a bottom **status + system
+/// quad** zone (VDOCK-3/4). Returns `true` if a dock control routed this frame
+/// (today only the pin; VDOCK-2's picker will surface the shell body).
+pub fn dock(ctx: &egui::Context, state: &mut DockState) -> bool {
+    let shown = state.shown();
+    // Slide-in-from-left over the shared Motion table (lock #14): `t` eases
+    // 0 (fully hidden, off the left edge) → 1 (fully in, flush at x=0).
+    let t = Motion::animate(ctx, DOCK_SLIDE_KEY, shown, Motion::BASE);
+
+    // Fully hidden + settled → mount NO layer. With no Area over the left edge,
+    // egui's hit-test routes every pointer/key event to the surface beneath (the
+    // background CentralPanel), so the hidden dock steals nothing (lock #9, the
+    // DRM-seat passthrough guarantee). The slide-out's final frame lands here once
+    // `t` decays to ~0.
+    if t <= 0.001 {
+        return false;
+    }
+
+    let screen = ctx.screen_rect();
+    // The slide offset: the panel's left edge rides from -DOCK_W (fully out) to 0
+    // (fully in). `constrain(false)` below lets the Area sit at negative x.
+    let offset_x = -(1.0 - t) * DOCK_W;
+
+    let mut clicked = false;
+    egui::Area::new(egui::Id::new(DOCK_AREA))
+        .order(egui::Order::Foreground)
+        // It SLIDES (lock #14) — never egui's default fade-in.
+        .fade_in(false)
+        // Allow the negative-x off-screen slide (the Area is constrained to the
+        // screen rect by default, which would clamp the slide to x=0).
+        .constrain(false)
+        .fixed_pos(egui::pos2(offset_x, screen.top()))
+        .show(ctx, |ui| {
+            // Claim the full-height column as the Area's content rect, so while the
+            // dock is visible its layer covers the whole column (egui routes clicks
+            // over it to the dock, not the surface behind). Off-screen portions of
+            // the claim simply can't be hit; the fully-hidden case returned above.
+            let (rect, _claim) =
+                ui.allocate_exact_size(egui::vec2(DOCK_W, screen.height()), egui::Sense::hover());
+            clicked = paint_dock_frame(ui, rect, state);
+        });
+
+    // Keep frames flowing while the slide is in flight so the motion is smooth
+    // (the curtain's tween idiom) — a no-op once settled at either end.
+    if t > 0.001 && t < 0.999 {
+        ctx.request_repaint();
+    }
+    clicked
+}
+
+/// Paint the vertical dock's frame into `rect` and lay out its (VDOCK-1 empty)
+/// interior zones: the solid Carbon-dark panel + the hairline right-edge divider
+/// (lock #24, §4 tokens), the pin toggle in the top zone, and the three commented
+/// seams the follow-ups fill. Returns `true` if the pin (the only control today)
+/// was clicked this frame.
+fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
+    let painter = ui.painter().clone();
+    // Solid Carbon-dark panel fill (lock #24) — the SURFACE token (§4), the same
+    // flat fill the horizontal bar wears, so the two docks read as one chrome.
+    painter.rect_filled(rect, egui::CornerRadius::ZERO, Style::SURFACE);
+    // The hairline right-edge divider (lock #24) — a 1px BORDER rule down the
+    // dock's right edge, the seam between the dock and the surface it floats over.
+    painter.vline(
+        rect.right(),
+        rect.y_range(),
+        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+    );
+
+    // ── The three interior zones — VDOCK-1 leaves them EMPTY with clean seams ──
+    //
+    // MIDDLE zone (SEAM → VDOCK-2): between the top cell's bottom and the bottom
+    // quad zone lives the scrollable, single-column **app groups** (Comms → … →
+    // Media) — horizontal accent labels + left-rail stripes + a '…' overflow, each
+    // cell in `Surface::ALL` order. VDOCK-1 leaves it intentionally empty.
+    //
+    // BOTTOM zone (SEAM → VDOCK-3/4): the last ~DOCK_W of the column anchors the
+    // stacked 2×2 **status quads** (Chat/BT/Vol/Batt · Status/Signal/Peers/
+    // Sessions) + the **system quad** (Settings · Show-Desktop · Lock · Power).
+    // VDOCK-1 leaves it empty too.
+    //
+    // TOP zone (SEAM → VDOCK-2 mounts the pinned **Workbench lead** glyph here):
+    // for VDOCK-1 the top DOCK_W-tall cell carries the dock's **pin** toggle
+    // (lock #9), the one control this foundation wires. Returned as the frame's
+    // click result.
+    let top = egui::Rect::from_min_size(rect.min, egui::vec2(DOCK_W, DOCK_W));
+    pin_toggle(ui, top, state)
+}
+
+/// The dock's **pin** toggle (VDOCK-1, lock #9) — the minimal affordance that
+/// holds the dock open when set (the "pin" half of "hotkey + pin, no hover").
+/// The brand set has no pin glyph yet (VDOCK-4 gives the dock its real glyphs), so
+/// this is a small centred dot: a filled ACCENT disc when pinned, a dim ring when
+/// not (a hover brightens it). Every colour is a Style token (§4). Returns `true`
+/// on a click (which flips the pin via [`DockState::toggle_pin`]).
+fn pin_toggle(ui: &egui::Ui, cell: egui::Rect, state: &mut DockState) -> bool {
+    let resp = ui.interact(cell, egui::Id::new("vdock-pin"), egui::Sense::click());
+    let pinned = state.pinned();
+    let color = if pinned {
+        Style::ACCENT
+    } else if resp.hovered() {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    let r = Style::SP_S / 2.0;
+    if pinned {
+        ui.painter().circle_filled(cell.center(), r, color);
+    } else {
+        ui.painter()
+            .circle_stroke(cell.center(), r, egui::Stroke::new(HAIRLINE_W, color));
+    }
+    if resp.clicked() {
+        state.toggle_pin();
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        cell_id, group_hairline_id, group_label_id, icon_texture, taskbar, underline, Surface,
-        CELL_W, GROUPS, GROUP_GAP, HAIRLINE_W, ICON_GAP, ICON_LOGICAL, LABEL_PAD, SHOW_DESKTOP_W,
-        TASKBAR_H, TASKBAR_TOP_PAD,
+        cell_id, dock, group_hairline_id, group_label_id, icon_texture, taskbar, underline,
+        DockState, Surface, CELL_W, DOCK_AREA, DOCK_W, GROUPS, GROUP_GAP, HAIRLINE_W, ICON_GAP,
+        ICON_LOGICAL, LABEL_PAD, SHOW_DESKTOP_W, TASKBAR_H, TASKBAR_TOP_PAD,
     };
     use crate::chrome::MeshSummary;
     use crate::tray::{TrayInputs, TrayState};
@@ -1520,5 +1736,181 @@ Desktop x=[{:.1},{:.1}]",
             eprint!("{}", bar.report());
             assert_even_rhythm(&bar);
         }
+    }
+
+    // ── VDOCK-1: the left vertical dock frame + auto-hide ─────────────────────
+
+    /// Drive `frames` headless frames of the vertical dock over a surface — a
+    /// background `CentralPanel` (the surface the dock floats over) plus the dock —
+    /// on a 1280×800 screen. The same `Context::run` path the DRM runner drives.
+    fn run_vdock(ctx: &egui::Context, state: &mut DockState, frames: usize) {
+        for _ in 0..frames {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1280.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                // A stand-in surface beneath the dock (the background layer).
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = ui.button("surface");
+                });
+                let _ = dock(ctx, state);
+            });
+        }
+    }
+
+    /// The dock's floating-Area `LayerId` — `LayerId::new(Foreground, DOCK_AREA)`,
+    /// the same mapping `egui::Area::layer()` computes.
+    fn vdock_layer() -> egui::LayerId {
+        egui::LayerId::new(egui::Order::Foreground, egui::Id::new(DOCK_AREA))
+    }
+
+    #[test]
+    fn the_vertical_dock_is_a_48px_full_height_column() {
+        // Locks #2/#23 — the dock is one 48px-wide column, sharing the horizontal
+        // taskbar's 48px icon-cell module (so VDOCK-2/3/4 inherit the grid).
+        assert!((DOCK_W - 48.0).abs() < f32::EPSILON, "dock width ~48px");
+        assert!(
+            (DOCK_W - CELL_W).abs() < f32::EPSILON,
+            "dock shares the taskbar cell module"
+        );
+    }
+
+    #[test]
+    fn the_dock_state_super_toggle_and_pin_hold_it_open() {
+        // Locks #9/#13 — the pure auto-hide state machine (no GPU): the dock is
+        // hidden by default, a Super tap toggles the reveal, and the pin holds it
+        // open regardless of the reveal latch.
+        let mut s = DockState::default();
+        assert!(!s.shown(), "hidden by default (lock #9)");
+
+        s.toggle();
+        assert!(s.shown(), "a Super tap reveals it (lock #13)");
+        s.toggle();
+        assert!(!s.shown(), "a second tap hides it");
+
+        // Pin holds it open even when the reveal latch is off.
+        s.toggle_pin();
+        assert!(
+            s.pinned() && s.shown(),
+            "pinning shows + holds it (lock #9)"
+        );
+        s.toggle();
+        assert!(
+            s.shown(),
+            "a Super tap can't hide a PINNED dock — the pin holds it open"
+        );
+        // Unpinning (with the reveal latch now off) lets it hide again.
+        s.toggle_pin();
+        assert!(!s.shown(), "unpinning releases the hold");
+    }
+
+    #[test]
+    fn a_hidden_dock_mounts_no_layer_so_input_passes_through() {
+        // The design's "auto-hide + DRM seat" risk: while hidden the dock must not
+        // float a layer over the surface, or it would steal clicks/keys meant for
+        // the surface beneath. A hidden dock creates NO Area, so `layer_id_at` over
+        // its would-be column finds no dock layer — the click reaches the surface.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut hidden = DockState::default(); // hidden by default
+        run_vdock(&ctx, &mut hidden, 2);
+
+        let point = egui::pos2(DOCK_W / 2.0, 400.0); // inside the would-be column
+        assert_ne!(
+            ctx.layer_id_at(point),
+            Some(vdock_layer()),
+            "a HIDDEN dock must not float an intercepting layer (input passthrough)"
+        );
+    }
+
+    #[test]
+    fn a_shown_dock_covers_its_column_and_paints_the_carbon_panel() {
+        // The mirror of the passthrough test: a shown dock DOES claim its column
+        // (so clicks over it land on the dock, not the surface), and its frame draws
+        // real primitives (the Carbon-dark fill + the right-edge divider).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shown = DockState::default();
+        shown.toggle(); // reveal it
+        assert!(shown.shown());
+
+        // Prime one frame, then capture the second frame's output.
+        run_vdock(&ctx, &mut shown, 1);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ui.button("surface");
+            });
+            let _ = dock(ctx, &mut shown);
+        });
+
+        let point = egui::pos2(DOCK_W / 2.0, 400.0);
+        assert_eq!(
+            ctx.layer_id_at(point),
+            Some(vdock_layer()),
+            "a SHOWN dock claims its column so clicks land on the dock chrome"
+        );
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(!prims.is_empty(), "the shown dock frame painted nothing");
+    }
+
+    #[test]
+    fn clicking_the_pin_toggle_pins_the_dock_open() {
+        // The pin affordance (lock #9) is reachable: a click in the top cell flips
+        // the pin, holding the dock open. Mirrors the taskbar cell-click test —
+        // prime the layout, then press one frame + release the next.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle(); // reveal it so the Area (and its pin) is mounted
+
+        // The pin sits centred in the top DOCK_W×DOCK_W cell, flush to the top-left.
+        let click = egui::pos2(DOCK_W / 2.0, DOCK_W / 2.0);
+        let press = egui::Event::PointerButton {
+            pos: click,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        };
+        let release = egui::Event::PointerButton {
+            pos: click,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        let frame = |ctx: &egui::Context, s: &mut DockState, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(1280.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = ui.button("surface");
+                });
+                let _ = dock(ctx, s);
+            });
+        };
+        // Prime two frames so egui has the pin's rect registered (and the Area is
+        // past its first-show sizing pass), then move onto the pin + press, then
+        // release the next frame — the egui click model the taskbar test uses.
+        frame(&ctx, &mut s, Vec::new());
+        frame(&ctx, &mut s, Vec::new());
+        frame(&ctx, &mut s, vec![egui::Event::PointerMoved(click), press]);
+        frame(&ctx, &mut s, vec![release]);
+        assert!(s.pinned(), "clicking the pin holds the dock open (lock #9)");
     }
 }
