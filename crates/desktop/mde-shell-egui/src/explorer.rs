@@ -42,6 +42,37 @@
 //!   scalar-only metric (uptime) stays honestly dimmed rather than faking a
 //!   trend. The per-type action bars (EXPLORER-5) fill the same card without
 //!   re-wiring this mount.
+//!
+//! ## Per-type action bars (EXPLORER-5)
+//!
+//! The hero card grows a **launchpad** action bar under the telemetry, keyed on
+//! the focused unit's kind. Every verb drives a **real seam** (§7 — no dead
+//! buttons); a verb with no reachable seam is honestly disabled with its reason
+//! on hover, never a no-op:
+//!
+//! - **Cloud instance** — `Console` (routes to the Desktop/VDI surface when the
+//!   instance reports an address, else honestly disabled), and
+//!   `Start` / `Stop` / `Reboot` / `Delete` — each publishes an [`InstanceReq`]
+//!   on `action/cloud/<verb>`, the **QC-11** typed cloud bus the openstack worker
+//!   drains (§6 — a wire mirror, not a daemon-crate link, over the SAME Bus this
+//!   surface reads `state/units` from). A volume/image/network hero offers
+//!   `Inspect` (routes to the Cloud surface); its `Delete` is honestly disabled
+//!   (the QC-11 verb set is instance-only).
+//! - **Peer** — `Open in Fleet` (routes to the Mesh view), a live `Health-check`
+//!   (re-requests the aggregator's `action/units/get-stream` stream), and
+//!   `Evict` (honestly disabled — no bus eviction verb yet).
+//! - **LAN host** — `Invite to mesh` routes to the Provisioning plane (the
+//!   existing pairing/enrollment flow) plus a `Health-check` refresh.
+//!
+//! **Arming (§14/§15/§16).** Every destructive verb (instance stop/reboot/
+//! delete, the LAN invite) is gated behind the platform **typed-arming** confirm
+//! — the exact `surface_card` / `mde-files` idiom: the verb arms on the first
+//! click, then fires only once the operator types the unit's name back
+//! ([`ExplorerState::confirm_armed`]). Non-destructive verbs fire immediately.
+//! Routing to another surface reuses the shell's ONE navigation grammar — the
+//! `shell/goto/*` · `shell/plane/*` toast chyron [`crate::toast_bridge`] resolves
+//! (the same seam [`crate::storage`]'s walled-row hand-off publishes), so this
+//! surface never touches the dock/`Surface` plumbing itself.
 
 // This module is canvas/painter code (the hero glyphs, status ring, filmstrip
 // thumbnails). Its geometry is a few pixel positions per frame, so — exactly as
@@ -59,14 +90,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
+use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_egui::egui::{
     self, Align, Align2, Color32, FontId, Layout, Rect, RichText, Sense, Stroke, StrokeKind,
     UiBuilder, Vec2,
 };
 use mde_egui::{muted_note, Motion, Style};
+
+use crate::toast_bridge::TOAST_TOPIC;
 
 /// The memory key the mount toggles the Mesh-Map surface's **Explorer** lens on
 /// (read in `main.rs`'s poll gate + the surface arm). Kept here so the one key
@@ -408,6 +442,262 @@ impl UnitsClient for BusUnits {
     }
 }
 
+// ─────────────────────── the action-dispatch seam (EXPLORER-5) ───────────────────────
+
+/// The `action/cloud/` namespace prefix every QC-11 cloud verb request rides —
+/// a **local mirror** of `mackesd::workers::openstack::verbs::CLOUD_ACTION_PREFIX`
+/// (§6: the shell mirrors the wire contract, never links the daemon crate). A
+/// byte-pinned test keeps it equal to the worker's prefix.
+const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
+
+/// The aggregator's E9 pull verb — a mirror of
+/// `mackesd::workers::unit_aggregator::verb::UNITS_REQUEST_TOPIC`. Publishing an
+/// (empty) request forces a fresh live unit stream: the honest "health-check".
+const UNITS_REQUEST_TOPIC: &str = "action/units/get-stream";
+
+/// The Bus topic for cloud verb `verb`: `action/cloud/<verb>`.
+fn cloud_topic(verb: &str) -> String {
+    format!("{CLOUD_ACTION_PREFIX}{verb}")
+}
+
+/// The shell's mirror of the openstack worker's `InstanceRequest` — the typed
+/// body a lifecycle verb takes (§6: serialises to the identical `{"instance":…}`
+/// body `verbs::parse_instance_request` decodes, never a daemon-crate link).
+#[derive(Debug, Serialize)]
+struct InstanceReq {
+    /// The Nova server id (or name) to act on.
+    instance: String,
+}
+
+/// The injectable publish seam over the Bus — production writes each request
+/// through [`Persist`] ([`BusActions`]); tests inject a recording fake so the
+/// dispatched topic + body are asserted headless. The same seam pattern
+/// [`UnitsClient`] uses for the read side.
+trait ActionSink {
+    /// Publish `body` on `topic` (a request / navigation chyron). `Err` carries a
+    /// human-readable reason (no Bus dir, a write fault) for the honest note.
+    fn publish(&self, topic: &str, body: &str) -> Result<(), String>;
+}
+
+/// The production sink: append the request to the desktop-client Bus spool — the
+/// SAME persist-first path [`crate::services_flow`] and [`crate::storage`] publish
+/// their actions through.
+struct BusActions {
+    /// The desktop-client Bus spool root (`None` ⇒ no Bus ⇒ an honest "no Bus"
+    /// error, never a silent success).
+    bus_root: Option<PathBuf>,
+}
+
+impl ActionSink for BusActions {
+    fn publish(&self, topic: &str, body: &str) -> Result<(), String> {
+        let root = self
+            .bus_root
+            .clone()
+            .ok_or_else(|| "No mesh Bus directory — join this node to a mesh first.".to_string())?;
+        Persist::open(root)
+            .and_then(|p| p.write(topic, Priority::Default, None, Some(body)))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The Nova object id a cloud unit acts on: strip the aggregator's
+/// `cloud:<kind>:` id prefix (`sources::CloudKind::unit_id`) back to the bare
+/// object id the QC-11 verb targets; a non-cloud id falls through unchanged.
+fn cloud_object_id(unit: &Unit) -> String {
+    let mut parts = unit.id.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("cloud"), Some(_kind), Some(object)) => object.to_string(),
+        _ => unit.id.clone(),
+    }
+}
+
+/// A navigation chyron body on the shell's ONE toast lane — the same shape
+/// [`crate::storage::StorageState::emit_goto`] / `chat::navigate_via_toast`
+/// publish, so KIRON-2's bridge (the shell's single nav authority) carries the
+/// operator to `verb`'s target surface/plane.
+fn nav_body(source_host: &str, headline: &str, verb: &str) -> String {
+    serde_json::json!({
+        "severity": "info",
+        "source_host": source_host,
+        "flag": "EXPLORER",
+        "headline": headline,
+        "action_label": "Open",
+        "action_verb": verb,
+    })
+    .to_string()
+}
+
+/// One hero verb the operator can trigger, keyed on the focused unit's kind. The
+/// real seam each reaches is resolved by [`verb_seam`]; a verb whose seam is
+/// `Err` is honestly disabled (§7 — never a no-op button).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    /// Instance: open a SPICE/VNC console (routes to the Desktop/VDI surface).
+    Console,
+    /// Instance: `openstack server start`.
+    Start,
+    /// Instance: `openstack server stop` — destructive (armed).
+    Stop,
+    /// Instance: `openstack server reboot` — destructive (armed).
+    Reboot,
+    /// Instance: `openstack server delete` — destructive (armed).
+    Delete,
+    /// Volume/image/network: inspect (routes to the Cloud surface).
+    Inspect,
+    /// Volume/image/network: delete — no QC-11 verb yet (honestly disabled).
+    ObjectDelete,
+    /// Peer: open in the Fleet mesh view.
+    OpenInFleet,
+    /// Peer/LAN: re-request the live unit stream (a health refresh).
+    HealthCheck,
+    /// Peer: evict from the mesh — no bus verb yet (honestly disabled).
+    Evict,
+    /// LAN host: invite to the mesh — routes to Provisioning; destructive (armed).
+    Invite,
+}
+
+impl Verb {
+    /// The button label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Console => "Console",
+            Self::Start => "Start",
+            Self::Stop => "Stop",
+            Self::Reboot => "Reboot",
+            Self::Delete | Self::ObjectDelete => "Delete",
+            Self::Inspect => "Inspect",
+            Self::OpenInFleet => "Open in Fleet",
+            Self::HealthCheck => "Health-check",
+            Self::Evict => "Evict",
+            Self::Invite => "Invite to mesh",
+        }
+    }
+
+    /// Whether this verb mutates the fleet's trust/lifecycle state and so must
+    /// pass the typed-arming confirm before it fires. (`ObjectDelete`/`Evict`
+    /// carry the flag too, but their seam is disabled so arming is never reached.)
+    const fn destructive(self) -> bool {
+        matches!(
+            self,
+            Self::Stop
+                | Self::Reboot
+                | Self::Delete
+                | Self::ObjectDelete
+                | Self::Evict
+                | Self::Invite
+        )
+    }
+}
+
+/// The verbs a unit of `kind` offers, in bar order.
+const fn verbs_for(kind: UnitKind) -> &'static [Verb] {
+    match kind {
+        UnitKind::Instance => &[
+            Verb::Console,
+            Verb::Start,
+            Verb::Stop,
+            Verb::Reboot,
+            Verb::Delete,
+        ],
+        UnitKind::Volume | UnitKind::Image | UnitKind::Network => {
+            &[Verb::Inspect, Verb::ObjectDelete]
+        }
+        UnitKind::Peer => &[Verb::OpenInFleet, Verb::HealthCheck, Verb::Evict],
+        UnitKind::LanHost => &[Verb::Invite, Verb::HealthCheck],
+    }
+}
+
+/// A resolved real seam a verb dispatches through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HeroAction {
+    /// Publish an [`InstanceReq`] on `action/cloud/<verb>` (QC-11).
+    Cloud {
+        /// The `instance-*` verb stem.
+        verb: &'static str,
+        /// The target Nova object id.
+        instance: String,
+    },
+    /// Publish the units get-stream request (a live health refresh).
+    Refresh,
+    /// Raise a navigation chyron for `verb` (`shell/goto/*` · `shell/plane/*`).
+    Goto {
+        /// The nav-grammar verb the toast bridge resolves.
+        verb: String,
+        /// The chyron headline naming the hand-off.
+        headline: String,
+    },
+}
+
+/// Resolve a verb on `unit` to its real seam, or an honest reason it is disabled
+/// (§7 — a verb with no reachable seam is never a live no-op button).
+fn verb_seam(verb: Verb, unit: &Unit) -> Result<HeroAction, String> {
+    let cloud = |stem: &'static str| HeroAction::Cloud {
+        verb: stem,
+        instance: cloud_object_id(unit),
+    };
+    match verb {
+        Verb::Console => match unit.address.as_deref() {
+            Some(addr) if !addr.is_empty() => Ok(HeroAction::Goto {
+                verb: "shell/goto/desktop".to_string(),
+                headline: format!("Open the Desktop surface to reach {} ({addr}).", unit.name),
+            }),
+            _ => Err("No console endpoint reported yet.".to_string()),
+        },
+        Verb::Start => Ok(cloud("instance-start")),
+        Verb::Stop => Ok(cloud("instance-stop")),
+        Verb::Reboot => Ok(cloud("instance-reboot")),
+        Verb::Delete => Ok(cloud("instance-delete")),
+        Verb::Inspect => Ok(HeroAction::Goto {
+            verb: "shell/goto/instances".to_string(),
+            headline: format!("Open the Cloud surface to inspect {}.", unit.name),
+        }),
+        Verb::ObjectDelete => Err(format!(
+            "{} deletion isn't on the cloud bus yet — instance lifecycle only.",
+            unit.kind.label()
+        )),
+        Verb::OpenInFleet => Ok(HeroAction::Goto {
+            verb: "shell/goto/mesh".to_string(),
+            headline: format!("Open {} in the Fleet mesh view.", unit.name),
+        }),
+        Verb::HealthCheck => Ok(HeroAction::Refresh),
+        Verb::Evict => Err("Mesh eviction isn't exposed on the bus yet.".to_string()),
+        Verb::Invite => Ok(HeroAction::Goto {
+            verb: "shell/plane/provisioning".to_string(),
+            headline: format!("Bring {} into the mesh in Provisioning.", unit.name),
+        }),
+    }
+}
+
+/// The honest inline note after a verb fires (never a fabricated result — it
+/// states the request was published, not that the fleet has acted, §7).
+fn done_note(verb: Verb, unit: &Unit) -> String {
+    match verb {
+        Verb::Console => format!("Opening the console surface for {}…", unit.name),
+        Verb::Start => format!("Start requested for {}.", unit.name),
+        Verb::Stop => format!("Stop requested for {}.", unit.name),
+        Verb::Reboot => format!("Reboot requested for {}.", unit.name),
+        Verb::Delete => format!("Delete requested for {}.", unit.name),
+        Verb::Inspect => format!("Opening the Cloud surface for {}…", unit.name),
+        Verb::OpenInFleet => format!("Opening {} in the Fleet view…", unit.name),
+        Verb::HealthCheck => "Re-requested the live unit stream.".to_string(),
+        Verb::Invite => format!("Opening Provisioning to invite {}…", unit.name),
+        // Disabled seams never fire; kept exhaustive for the honest fallback.
+        Verb::ObjectDelete | Verb::Evict => "No reachable seam.".to_string(),
+    }
+}
+
+/// A destructive verb armed on one unit, awaiting its typed-name confirm — the
+/// platform typed-arming interlock (the `surface_card` / `mde-files` idiom).
+struct ArmedVerb {
+    /// The unit id the verb is armed against (arming is per-unit).
+    unit_id: String,
+    /// Which destructive verb is armed.
+    verb: Verb,
+    /// The operator's typed echo, matched against the unit name to arm.
+    echo: String,
+}
+
 // ─────────────────────────── pure fold ───────────────────────────
 
 /// The stable unit id a peer (or self) folds under — mirrors the aggregator's
@@ -736,6 +1026,14 @@ pub struct ExplorerState {
     filter: Option<Category>,
     /// When the Bus was last polled (drives the fixed cadence).
     last_poll: Option<Instant>,
+    /// The publish seam the action bar dispatches verbs through (EXPLORER-5) —
+    /// production writes the Bus; tests inject a recording fake.
+    action_sink: Box<dyn ActionSink>,
+    /// The destructive verb currently armed (awaiting its typed-name confirm), if
+    /// any — the typed-arming interlock (EXPLORER-5).
+    arm: Option<ArmedVerb>,
+    /// The last verb's honest inline note (`true` ⇒ an error/gated reason).
+    last_action_note: Option<(String, bool)>,
 }
 
 impl Default for ExplorerState {
@@ -750,6 +1048,11 @@ impl Default for ExplorerState {
             focus: 0,
             filter: None,
             last_poll: None,
+            action_sink: Box::new(BusActions {
+                bus_root: mde_bus::client_data_dir(),
+            }),
+            arm: None,
+            last_action_note: None,
         }
     }
 }
@@ -847,6 +1150,203 @@ impl ExplorerState {
             self.filter = filter;
             self.focus = 0;
         }
+    }
+
+    // ─────────────────── the per-type action bar (EXPLORER-5) ───────────────────
+
+    /// Arm a destructive verb on `unit_id` — the first click on a destructive
+    /// button; the UI then shows the typed-name challenge. Clears any stale note.
+    fn arm_verb(&mut self, verb: Verb, unit_id: &str) {
+        self.arm = Some(ArmedVerb {
+            unit_id: unit_id.to_string(),
+            verb,
+            echo: String::new(),
+        });
+        self.last_action_note = None;
+    }
+
+    /// Whether the armed verb's typed echo matches `expected` (the unit name) —
+    /// the gate the Confirm button enables on (the typed-arming interlock).
+    fn arm_ready(&self, expected: &str) -> bool {
+        self.arm
+            .as_ref()
+            .is_some_and(|a| a.echo.trim() == expected && !expected.is_empty())
+    }
+
+    /// The confirm path: fire the armed verb IFF the typed echo matches `unit`'s
+    /// name (the arming gate — a destructive verb does **nothing** until armed +
+    /// echoed). Returns whether it fired. The ONE place the gate lives, shared by
+    /// the Confirm button and the tests.
+    fn confirm_armed(&mut self, unit: &Unit) -> bool {
+        let armed = self
+            .arm
+            .as_ref()
+            .filter(|a| a.unit_id == unit.id)
+            .map(|a| a.verb);
+        let Some(verb) = armed else {
+            return false;
+        };
+        if !self.arm_ready(&unit.name) {
+            return false;
+        }
+        self.arm = None;
+        self.fire(verb, unit);
+        true
+    }
+
+    /// Dispatch a verb: resolve its real seam and publish it, folding the honest
+    /// result into the inline note. A disabled seam never reaches here (the button
+    /// is disabled), but stays honest if it does.
+    fn fire(&mut self, verb: Verb, unit: &Unit) {
+        match verb_seam(verb, unit) {
+            Ok(action) => {
+                let res = self.dispatch(&action);
+                self.last_action_note = Some(match res {
+                    Ok(()) => (done_note(verb, unit), false),
+                    Err(e) => (
+                        format!(
+                            "Couldn't {} {} — {e}",
+                            verb.label().to_lowercase(),
+                            unit.name
+                        ),
+                        true,
+                    ),
+                });
+            }
+            Err(reason) => self.last_action_note = Some((reason, true)),
+        }
+    }
+
+    /// Publish one resolved seam over the injected sink.
+    fn dispatch(&self, action: &HeroAction) -> Result<(), String> {
+        match action {
+            HeroAction::Cloud { verb, instance } => {
+                let body = serde_json::to_string(&InstanceReq {
+                    instance: instance.clone(),
+                })
+                .map_err(|e| e.to_string())?;
+                self.action_sink.publish(&cloud_topic(verb), &body)
+            }
+            HeroAction::Refresh => self.action_sink.publish(UNITS_REQUEST_TOPIC, "{}"),
+            HeroAction::Goto { verb, headline } => self
+                .action_sink
+                .publish(TOAST_TOPIC, &nav_body(&self.local_host, headline, verb)),
+        }
+    }
+
+    /// The launchpad action bar under the hero card: the focused unit's per-type
+    /// verbs, the typed-arming challenge for any armed destructive verb, and the
+    /// honest inline result note. Every verb drives a real seam or is honestly
+    /// disabled (§7).
+    fn action_bar(&mut self, ui: &mut egui::Ui, unit: &Unit) {
+        ui.add_space(Style::SP_M);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = Style::SP_S;
+            for &verb in verbs_for(unit.kind) {
+                self.verb_button(ui, verb, unit);
+            }
+        });
+        // The typed-name challenge when a destructive verb on THIS unit is armed.
+        if self.arm.as_ref().is_some_and(|a| a.unit_id == unit.id) {
+            self.arm_challenge(ui, unit);
+        }
+        // The honest inline result note (published, gated, or a write fault).
+        if let Some((note, is_err)) = &self.last_action_note {
+            ui.add_space(Style::SP_XS);
+            ui.label(RichText::new(note).size(Style::SMALL).color(if *is_err {
+                Style::DANGER
+            } else {
+                Style::TEXT_DIM
+            }));
+        }
+    }
+
+    /// One verb button: fires immediately when non-destructive, arms when
+    /// destructive, or is honestly disabled with its reason on hover (§7).
+    fn verb_button(&mut self, ui: &mut egui::Ui, verb: Verb, unit: &Unit) {
+        let seam = verb_seam(verb, unit);
+        let armed_here = self
+            .arm
+            .as_ref()
+            .is_some_and(|a| a.unit_id == unit.id && a.verb == verb);
+        let tint = if verb.destructive() {
+            Style::DANGER
+        } else {
+            Style::TEXT
+        };
+        let text = RichText::new(verb.label())
+            .size(Style::SMALL)
+            .color(if seam.is_ok() { tint } else { Style::TEXT_DIM });
+        let button = egui::Button::new(text)
+            .fill(Style::SURFACE)
+            .stroke(Stroke::new(
+                1.0,
+                if armed_here {
+                    Style::DANGER
+                } else {
+                    Style::BORDER
+                },
+            ));
+        let resp = ui.add_enabled(seam.is_ok(), button);
+        match &seam {
+            Err(reason) => {
+                resp.on_disabled_hover_text(reason.clone());
+            }
+            Ok(_) => {
+                if resp.clicked() {
+                    if verb.destructive() {
+                        self.arm_verb(verb, &unit.id);
+                    } else {
+                        self.fire(verb, unit);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The typed-arming challenge row: type the unit name to enable Confirm (the
+    /// `surface_card::show_mok_arm` / `mde-files` typed-echo idiom, reused not
+    /// reinvented). Confirm fires through the ONE gate ([`Self::confirm_armed`]).
+    fn arm_challenge(&mut self, ui: &mut egui::Ui, unit: &Unit) {
+        let Some(verb) = self.arm.as_ref().map(|a| a.verb) else {
+            return;
+        };
+        ui.add_space(Style::SP_S);
+        ui.label(
+            RichText::new(format!(
+                "Type \u{201C}{}\u{201D} to arm {}.",
+                unit.name,
+                verb.label().to_lowercase()
+            ))
+            .size(Style::SMALL)
+            .color(Style::WARN),
+        );
+        ui.add_space(Style::SP_XS);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = Style::SP_S;
+            if let Some(arm) = self.arm.as_mut() {
+                ui.add(
+                    egui::TextEdit::singleline(&mut arm.echo)
+                        .hint_text(unit.name.as_str())
+                        .desired_width(Style::SP_XL * 5.0),
+                );
+            }
+            let ready = self.arm_ready(&unit.name);
+            let confirm = egui::Button::new(
+                RichText::new(format!("Confirm {}", verb.label())).size(Style::SMALL),
+            )
+            .fill(Style::SURFACE)
+            .stroke(Stroke::new(1.0, Style::DANGER));
+            if ui.add_enabled(ready, confirm).clicked() {
+                self.confirm_armed(unit);
+            }
+            if ui
+                .button(RichText::new("Cancel").size(Style::SMALL))
+                .clicked()
+            {
+                self.arm = None;
+            }
+        });
     }
 
     /// Render the hero-card surface (chips · hero · filmstrip). The one public
@@ -959,8 +1459,12 @@ impl ExplorerState {
         match indices.get(self.focus).copied() {
             Some(idx) => {
                 let unit = self.units[idx].clone();
-                let history = self.history.get(&unit.id);
-                hero_card(&mut child, &unit, false, history);
+                {
+                    let history = self.history.get(&unit.id);
+                    hero_card(&mut child, &unit, false, history);
+                }
+                // The EXPLORER-5 launchpad: real per-type verbs under the card.
+                self.action_bar(&mut child, &unit);
             }
             None if self.filter.is_none() => {
                 // #23 — no mirror yet: show THIS node, discovering.
@@ -1571,10 +2075,44 @@ mod tests {
                 focus: 0,
                 filter: None,
                 last_poll: None,
+                action_sink: Box::new(BusActions { bus_root: None }),
+                arm: None,
+                last_action_note: None,
             };
             s.refresh();
             s
         }
+    }
+
+    /// A recording action sink: captures every (topic, body) the action bar
+    /// dispatches so a verb's real seam is asserted headless (no Bus).
+    #[derive(Clone, Default)]
+    struct FakeActions {
+        calls: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
+    }
+    impl ActionSink for FakeActions {
+        fn publish(&self, topic: &str, body: &str) -> Result<(), String> {
+            self.calls
+                .borrow_mut()
+                .push((topic.to_string(), body.to_string()));
+            Ok(())
+        }
+    }
+
+    impl ExplorerState {
+        /// Swap in a recording sink and return its shared log — the EXPLORER-5
+        /// verb-dispatch test seam.
+        fn recording(&mut self) -> FakeActions {
+            let fake = FakeActions::default();
+            self.action_sink = Box::new(fake.clone());
+            fake
+        }
+    }
+
+    /// The single focused unit of `s`'s current view (the hero the bar acts on).
+    fn focused(s: &ExplorerState) -> Unit {
+        let idx = s.filtered_indices()[s.focus];
+        s.units[idx].clone()
     }
 
     /// A reachable peer carrying live telemetry — the sparkline-path fixture.
@@ -2012,5 +2550,236 @@ mod tests {
             !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty(),
             "the dimmed-minimal card drew primitives"
         );
+    }
+
+    // ─────────────────────── EXPLORER-5 action bars ───────────────────────
+
+    /// A cloud instance with a known Nova id + address (the console-enabled path).
+    fn instance_unit(id: &str, name: &str) -> Unit {
+        Unit {
+            address: Some("10.0.0.5".to_string()),
+            ..unit(id, UnitKind::Instance, name, now_ms())
+        }
+    }
+
+    #[test]
+    fn topic_and_id_mirrors_match_the_worker_contract() {
+        // §6 — the shell's local mirrors must equal the openstack worker's wire.
+        assert_eq!(CLOUD_ACTION_PREFIX, "action/cloud/");
+        assert_eq!(UNITS_REQUEST_TOPIC, "action/units/get-stream");
+        assert_eq!(cloud_topic("instance-stop"), "action/cloud/instance-stop");
+        // The Nova id is the aggregator's `cloud:<kind>:<object-id>` tail.
+        assert_eq!(
+            cloud_object_id(&unit("cloud:instance:uuid-1", UnitKind::Instance, "web", 1)),
+            "uuid-1"
+        );
+        // An object id that itself contains a colon keeps its remainder.
+        assert_eq!(
+            cloud_object_id(&unit("cloud:volume:pool:vol-9", UnitKind::Volume, "v", 1)),
+            "pool:vol-9"
+        );
+    }
+
+    #[test]
+    fn instance_lifecycle_verbs_dispatch_over_the_cloud_bus() {
+        let mut s = ExplorerState::with_fake(
+            vec![UnitsState {
+                host: "me".into(),
+                units: vec![instance_unit("cloud:instance:i-9", "web")],
+            }],
+            "me",
+        );
+        let fake = s.recording();
+        let u = instance_unit("cloud:instance:i-9", "web");
+
+        // Start is non-destructive → fires immediately.
+        s.fire(Verb::Start, &u);
+        assert_eq!(
+            fake.calls.borrow().as_slice(),
+            &[(
+                "action/cloud/instance-start".to_string(),
+                r#"{"instance":"i-9"}"#.to_string()
+            )],
+            "Start publishes the QC-11 InstanceReq on action/cloud/instance-start"
+        );
+
+        // The three destructive verbs each publish their own topic once armed.
+        for (verb, topic) in [
+            (Verb::Stop, "action/cloud/instance-stop"),
+            (Verb::Reboot, "action/cloud/instance-reboot"),
+            (Verb::Delete, "action/cloud/instance-delete"),
+        ] {
+            fake.calls.borrow_mut().clear();
+            s.arm_verb(verb, &u.id);
+            s.arm.as_mut().expect("armed").echo = "web".to_string();
+            assert!(s.confirm_armed(&u), "the typed-name confirm fires the verb");
+            assert_eq!(
+                fake.calls.borrow().as_slice(),
+                &[(topic.to_string(), r#"{"instance":"i-9"}"#.to_string())],
+                "{verb:?} publishes on {topic}"
+            );
+            assert!(s.arm.is_none(), "arming clears after the confirm");
+        }
+    }
+
+    #[test]
+    fn arming_gates_the_destructive_verbs() {
+        let mut s = ExplorerState::with_fake(
+            vec![UnitsState {
+                host: "me".into(),
+                units: vec![instance_unit("cloud:instance:i-9", "web")],
+            }],
+            "me",
+        );
+        let fake = s.recording();
+        let u = instance_unit("cloud:instance:i-9", "web");
+
+        // Arm Delete but leave the echo blank / wrong → nothing dispatches.
+        s.arm_verb(Verb::Delete, &u.id);
+        assert!(
+            !s.confirm_armed(&u),
+            "an un-echoed destructive verb is a no-op"
+        );
+        s.arm.as_mut().expect("armed").echo = "wrong".to_string();
+        assert!(!s.confirm_armed(&u), "a mismatched echo never fires");
+        assert!(
+            fake.calls.borrow().is_empty(),
+            "a destructive verb publishes NOTHING until armed + echoed"
+        );
+
+        // The exact name arms it.
+        s.arm.as_mut().expect("armed").echo = "web".to_string();
+        assert!(s.arm_ready("web"));
+        assert!(s.confirm_armed(&u));
+        assert_eq!(
+            fake.calls.borrow().len(),
+            1,
+            "now it dispatches exactly once"
+        );
+    }
+
+    #[test]
+    fn peer_verbs_reach_the_fleet_and_the_live_stream() {
+        let mut s = ExplorerState::with_fake(
+            vec![UnitsState {
+                host: "me".into(),
+                units: vec![unit("peer:zeta", UnitKind::Peer, "zeta", now_ms())],
+            }],
+            "me",
+        );
+        let fake = s.recording();
+        let peer = unit("peer:zeta", UnitKind::Peer, "zeta", now_ms());
+
+        // Open in Fleet → a nav chyron carrying shell/goto/mesh.
+        s.fire(Verb::OpenInFleet, &peer);
+        {
+            let calls = fake.calls.borrow();
+            assert_eq!(calls[0].0, TOAST_TOPIC);
+            assert!(
+                calls[0].1.contains("shell/goto/mesh"),
+                "open-in-Fleet routes to the mesh view: {}",
+                calls[0].1
+            );
+        }
+
+        // Health-check → the aggregator's get-stream refresh.
+        fake.calls.borrow_mut().clear();
+        s.fire(Verb::HealthCheck, &peer);
+        assert_eq!(fake.calls.borrow()[0].0, "action/units/get-stream");
+
+        // Evict has no bus verb → honestly disabled, never a dispatch.
+        assert!(verb_seam(Verb::Evict, &peer).is_err());
+    }
+
+    #[test]
+    fn lan_invite_is_armed_and_routes_to_provisioning() {
+        let mut s = ExplorerState::with_fake(
+            vec![UnitsState {
+                host: "me".into(),
+                units: vec![unit("lan:printer", UnitKind::LanHost, "printer", now_ms())],
+            }],
+            "me",
+        );
+        let fake = s.recording();
+        let host = unit("lan:printer", UnitKind::LanHost, "printer", now_ms());
+
+        // Invite is destructive (trust change) → gated on the typed name.
+        s.arm_verb(Verb::Invite, &host.id);
+        assert!(!s.confirm_armed(&host), "invite is a no-op until echoed");
+        assert!(fake.calls.borrow().is_empty());
+        s.arm.as_mut().expect("armed").echo = "printer".to_string();
+        assert!(s.confirm_armed(&host));
+        let calls = fake.calls.borrow();
+        assert_eq!(calls[0].0, TOAST_TOPIC);
+        assert!(
+            calls[0].1.contains("shell/plane/provisioning"),
+            "invite kicks the Provisioning pairing flow: {}",
+            calls[0].1
+        );
+    }
+
+    #[test]
+    fn verbs_without_a_seam_are_honestly_disabled() {
+        // Console with no address, object delete, and evict all resolve to a
+        // reason, never a live no-op button (§7).
+        let bare_instance = unit("cloud:instance:i", UnitKind::Instance, "web", 1);
+        assert!(verb_seam(Verb::Console, &bare_instance).is_err());
+        assert!(verb_seam(Verb::Console, &instance_unit("cloud:instance:i", "web")).is_ok());
+        assert!(verb_seam(
+            Verb::ObjectDelete,
+            &unit("cloud:volume:v", UnitKind::Volume, "vol", 1)
+        )
+        .is_err());
+        assert!(verb_seam(Verb::Evict, &unit("peer:x", UnitKind::Peer, "x", 1)).is_err());
+        // Inspect routes to the Cloud surface (a real hand-off).
+        assert!(verb_seam(
+            Verb::Inspect,
+            &unit("cloud:network:n", UnitKind::Network, "net", 1)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn each_kind_offers_its_own_verbs() {
+        assert_eq!(verbs_for(UnitKind::Instance).len(), 5);
+        assert_eq!(
+            verbs_for(UnitKind::Volume),
+            [Verb::Inspect, Verb::ObjectDelete].as_slice()
+        );
+        assert_eq!(
+            verbs_for(UnitKind::Peer),
+            [Verb::OpenInFleet, Verb::HealthCheck, Verb::Evict].as_slice()
+        );
+        assert_eq!(
+            verbs_for(UnitKind::LanHost),
+            [Verb::Invite, Verb::HealthCheck].as_slice()
+        );
+    }
+
+    #[test]
+    fn the_armed_action_bar_renders_headless() {
+        // The hero + action bar + typed-arming challenge all tessellate cleanly.
+        let mut s = ExplorerState::with_fake(
+            vec![UnitsState {
+                host: "me".into(),
+                units: vec![instance_unit("cloud:instance:i-9", "web")],
+            }],
+            "me",
+        );
+        let u = focused(&s);
+        s.arm_verb(Verb::Delete, &u.id); // show the challenge row
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                Vec2::new(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| s.show(ui));
+        });
+        assert!(!ctx.tessellate(out.shapes, out.pixels_per_point).is_empty());
     }
 }
