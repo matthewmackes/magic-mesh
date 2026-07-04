@@ -49,9 +49,14 @@
 //!   inline underlines with a hover message. An absent server binary surfaces
 //!   the honest [`LspState::Unavailable`] status, never a faked session (§7).
 //!
-//! Tabs + splittable panes land in the following units; they grow
-//! [`EditorSurface`] / [`EditorView`] and render into [`editor_panel`] without
-//! re-wiring the shell.
+//! * EDITOR-6 — **tabs + splittable panes** ([`panes`]): the surface grows from
+//!   one open document into a pane registry (each pane a strip of open-buffer
+//!   **tabs**) arranged in a binary **split tree** (H/V splits to any depth,
+//!   draggable dividers), mirroring `mde-term-egui`'s pure split model (§6). The
+//!   focused pane's active tab drives the shared text widget; `Ctrl-T` opens a
+//!   tab, `Ctrl-W` closes one (collapsing an emptied pane), and `Ctrl-\` /
+//!   `Ctrl-Shift-\` split the focused pane. Every tab is a real rope [`Buffer`]
+//!   (§7 — no mock panes).
 //!
 //! Layering (§6): the surface state + render seam live in [`panel`], the widget in
 //! [`widget`], the document model in [`buffer`]; the only in-workspace edge points
@@ -69,6 +74,7 @@ pub mod md_actions;
 mod menu_bar;
 mod palette;
 pub mod panel;
+pub mod panes;
 pub mod project_tree;
 mod toolbar;
 pub mod widget;

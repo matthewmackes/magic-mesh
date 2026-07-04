@@ -22,14 +22,19 @@
 //! `&mut EditorSurface` seam matches the mount contract the shell wires for
 //! Files/Terminal, so this grows the surface without re-wiring the shell.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use mde_egui::egui::{self, Align2, Key, Modifiers, RichText, Ui};
+use mde_egui::egui::{
+    self, pos2, vec2, Align, Align2, CursorIcon, FontId, Id, Key, Layout, Modifiers, Rect, Response,
+    RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder,
+};
 use mde_egui::Style;
 
 use crate::buffer::Buffer;
 use crate::finder::{self, FileFinder};
+use crate::panes::{self, NavDir, Pane, PaneId, SplitDir};
 use crate::format_bar;
 use crate::highlight::{Highlighter, Language};
 use crate::lsp::LspClient;
@@ -227,17 +232,133 @@ fn build_lsp_client(language: Language, root: &Path) -> Option<LspClient> {
     Some(LspClient::start(language, root)) // NoServer — spawns no process
 }
 
+/// One pane's strip of open-buffer **tabs** (EDITOR-6): the [`Doc`]s open in a
+/// single leaf of the split tree, plus which one is active. An empty strip is
+/// the honest per-pane empty state (§7).
+#[derive(Default)]
+struct PaneTabs {
+    /// The open documents in this pane, left-to-right in the tab bar.
+    tabs: Vec<Doc>,
+    /// The active tab's index — only meaningful when `tabs` is non-empty; kept
+    /// in range by every mutator.
+    active: usize,
+}
+
+impl PaneTabs {
+    /// An empty pane (no open tabs) — the per-pane empty state.
+    fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Whether this pane holds no tabs.
+    fn is_empty(&self) -> bool {
+        self.tabs.is_empty()
+    }
+
+    /// The active tab's index, or `None` when the pane is empty.
+    fn active_index(&self) -> Option<usize> {
+        (!self.tabs.is_empty()).then_some(self.active)
+    }
+
+    /// The active tab's document, or `None` when the pane is empty.
+    fn active_doc(&self) -> Option<&Doc> {
+        self.tabs.get(self.active)
+    }
+
+    /// The active tab's document (mut), or `None` when the pane is empty.
+    fn active_doc_mut(&mut self) -> Option<&mut Doc> {
+        self.tabs.get_mut(self.active)
+    }
+
+    /// Append `doc` as a new tab and make it active (the open-a-buffer path).
+    fn push(&mut self, doc: Doc) {
+        self.tabs.push(doc);
+        self.active = self.tabs.len() - 1;
+    }
+
+    /// Focus the tab at `idx` (a no-op if out of range).
+    fn focus(&mut self, idx: usize) {
+        if idx < self.tabs.len() {
+            self.active = idx;
+        }
+    }
+
+    /// The index of an already-open tab showing `path`, if any — so re-opening a
+    /// file focuses its tab instead of stacking a duplicate.
+    fn find_path(&self, path: &Path) -> Option<usize> {
+        self.tabs.iter().position(|d| d.buffer.path() == Some(path))
+    }
+
+    /// Close the tab at `idx`, returning the removed [`Doc`] (the caller tears
+    /// down its language server). The active index is kept valid: closing a tab
+    /// at or before the active one shifts focus left toward the neighbour.
+    fn close(&mut self, idx: usize) -> Option<Doc> {
+        if idx >= self.tabs.len() {
+            return None;
+        }
+        let doc = self.tabs.remove(idx);
+        if self.active > idx || self.active >= self.tabs.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        Some(doc)
+    }
+
+    /// Move the tab at `from` to sit at index `to` (drag-reorder), keeping the
+    /// moved tab active. Out-of-range indices are clamped; a no-op when equal.
+    fn move_tab(&mut self, from: usize, to: usize) {
+        if from >= self.tabs.len() {
+            return;
+        }
+        let to = to.min(self.tabs.len() - 1);
+        if from == to {
+            self.active = to;
+            return;
+        }
+        let doc = self.tabs.remove(from);
+        self.tabs.insert(to, doc);
+        self.active = to;
+    }
+}
+
+/// A per-frame tab-bar / pane interaction, applied by
+/// [`EditorSurface::apply_leaf_action`] after every pane has rendered (so the
+/// tree/registry mutations happen outside the pane's own borrow).
+#[derive(Clone, Copy)]
+enum LeafAction {
+    /// Give this pane the keyboard focus (a click landed in it).
+    Focus,
+    /// Open a fresh scratch tab in this pane (the `+` affordance).
+    NewTab,
+    /// Make the tab at this index active.
+    SelectTab(usize),
+    /// Close the tab at this index.
+    CloseTab(usize),
+    /// Drag-reorder: move the tab at `from` to `to`.
+    MoveTab { from: usize, to: usize },
+}
+
 /// The code-editor surface the E12 shell embeds.
 ///
 /// The surface state the shell holds directly and drives with [`editor_panel`],
-/// mirroring `mde-files-egui`'s `FileBrowser` seam. It owns the open document as
-/// an `Option<Doc>`: `None` renders the honest empty state (§7); `Some` renders
-/// the live text widget over the real rope. EDITOR-7/9 add fuzzy-open / Files
-/// send by calling [`open_path`](Self::open_path) / [`open_text`](Self::open_text).
-#[derive(Default)]
+/// mirroring `mde-files-egui`'s `FileBrowser` seam. Under EDITOR-6 it owns a
+/// **pane registry** ([`PaneId`] → its [`PaneTabs`]) arranged in a binary split
+/// [`Pane`] tree: the focused pane's active tab is the "current document" every
+/// existing seam ([`open_path`](Self::open_path), the menu bar, the palette)
+/// reads through [`doc`](Self::doc) / [`doc_mut`](Self::doc_mut). A pane with no
+/// tabs renders the honest empty state (§7); each tab is a real rope [`Buffer`].
 pub struct EditorSurface {
-    /// The currently open document, or `None` for the empty state.
-    doc: Option<Doc>,
+    /// The pane registry: every split-tree leaf's open tabs.
+    panes: HashMap<PaneId, PaneTabs>,
+    /// The split tree of pane ids (always at least one leaf; `focus` names one).
+    tree: Pane,
+    /// The focused pane — the one whose active tab drives the widget + seams.
+    focus: PaneId,
+    /// Monotonic id source for [`PaneId`]s (never reused within a surface).
+    next_pane_id: u64,
+    /// Last frame's egui widget id per pane, so [`prefocus`](Self::prefocus) can
+    /// hand the keyboard to the focused pane's text widget before it renders
+    /// (the term-style focus-follows-pane machinery, EDITOR-6).
+    pane_widget_ids: HashMap<PaneId, Id>,
     /// The project-tree panel over the open project root (EDITOR-9), or `None`
     /// before a folder is opened (via [`open_folder`](Self::open_folder) — the
     /// Files "Send-to-Editor" send, a folder picker, or the tree toggle default).
@@ -254,6 +375,30 @@ pub struct EditorSurface {
     about_open: bool,
     /// The Insert Table grid-picker dialog (EDTB-3, Insert → Table…).
     table_picker: TablePicker,
+}
+
+impl Default for EditorSurface {
+    fn default() -> Self {
+        // Seed one empty pane so the surface always has a focused leaf to open
+        // documents into (the honest empty state until a buffer is opened).
+        let first = PaneId(0);
+        let mut panes = HashMap::new();
+        panes.insert(first, PaneTabs::empty());
+        Self {
+            panes,
+            tree: Pane::leaf(first),
+            focus: first,
+            next_pane_id: 1,
+            pane_widget_ids: HashMap::new(),
+            project: None,
+            show_tree: false,
+            finder: FileFinder::default(),
+            palette: CommandPalette::default(),
+            save_as: SaveAsDialog::default(),
+            about_open: false,
+            table_picker: TablePicker::default(),
+        }
+    }
 }
 
 /// The Insert Table grid-picker's dialog state (EDTB-3): whether the Word
@@ -292,18 +437,58 @@ impl SaveAsDialog {
 }
 
 impl EditorSurface {
-    /// Whether a document is currently open (the surface is showing the editor,
-    /// not the empty state).
+    /// Whether a document is currently open (the focused pane has an active tab)
+    /// — the surface is showing the editor, not the empty state.
     #[must_use]
-    pub const fn is_open(&self) -> bool {
-        self.doc.is_some()
+    pub fn is_open(&self) -> bool {
+        self.doc().is_some()
     }
 
-    /// The path of the open document, if it has one (a scratch buffer has none).
-    /// Exposes the active file for the chrome / a future tab title.
+    /// The path of the active document, if it has one (a scratch buffer has none).
     #[must_use]
     pub fn current_path(&self) -> Option<&Path> {
-        self.doc.as_ref().and_then(|doc| doc.buffer.path())
+        self.doc().and_then(|doc| doc.buffer.path())
+    }
+
+    // ── EDITOR-6: the focused pane's active tab is the "current document" ─────
+
+    /// The focused pane's active document — the "current document" every seam
+    /// reads (the menu bar, the palette, the widget). `None` when the focused
+    /// pane has no open tab (the empty state).
+    fn doc(&self) -> Option<&Doc> {
+        self.panes.get(&self.focus).and_then(PaneTabs::active_doc)
+    }
+
+    /// The focused pane's active document (mut) — the write seam every editing
+    /// action drives. `None` when the focused pane is empty.
+    fn doc_mut(&mut self) -> Option<&mut Doc> {
+        let focus = self.focus;
+        self.panes
+            .get_mut(&focus)
+            .and_then(PaneTabs::active_doc_mut)
+    }
+
+    /// Allocate a fresh, never-reused [`PaneId`].
+    const fn alloc_pane_id(&mut self) -> PaneId {
+        let id = PaneId(self.next_pane_id);
+        self.next_pane_id += 1;
+        id
+    }
+
+    /// Append `doc` as a new tab in the focused pane and make it active — the
+    /// one open-a-buffer path every `open_*` seam funnels through.
+    fn push_doc(&mut self, doc: Doc) {
+        let focus = self.focus;
+        if let Some(pane) = self.panes.get_mut(&focus) {
+            pane.push(doc);
+        }
+    }
+
+    /// The number of open panes (split-tree leaves) — one unless the surface has
+    /// been split.
+    #[must_use]
+    pub fn pane_count(&self) -> usize {
+        self.tree.leaf_count()
     }
 
     /// Whether a project root is open (the tree has a folder to render).
@@ -326,24 +511,34 @@ impl EditorSurface {
         let _ = self.open_path(path);
     }
 
-    /// Open an in-memory document seeded with `text` (no path). The open-a-buffer
-    /// seam the finder / Files send drive; also the scratch affordance's backing.
-    /// A pathless buffer starts no language server (§7 — nothing to serve).
+    /// Open an in-memory document seeded with `text` (no path) as a new tab in
+    /// the focused pane. The open-a-buffer seam the finder / Files send drive;
+    /// also the scratch affordance's backing. A pathless buffer starts no
+    /// language server (§7 — nothing to serve).
     pub fn open_text(&mut self, text: &str) {
-        self.set_doc(Some(Doc::new(Buffer::from_text(text))));
+        self.push_doc(Doc::new(Buffer::from_text(text)));
     }
 
-    /// Open `path` from disk into the surface, replacing any open document and
-    /// starting a language-server session for it (EDITOR-LSP-2 `didOpen`), rooted
-    /// at the open project root when there is one, else the file's directory.
+    /// Open `path` from disk as a tab in the focused pane, starting a
+    /// language-server session for it (EDITOR-LSP-2 `didOpen`), rooted at the
+    /// open project root when there is one, else the file's directory. If the
+    /// file is already open in the focused pane its existing tab is focused
+    /// instead of stacking a duplicate.
     ///
     /// # Errors
     /// Returns any [`io::Error`] from reading `path` (missing file, permissions).
     pub fn open_path<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let path = path.as_ref();
+        let focus = self.focus;
+        if let Some(pane) = self.panes.get_mut(&focus) {
+            if let Some(idx) = pane.find_path(path) {
+                pane.focus(idx);
+                return Ok(());
+            }
+        }
         let mut doc = Doc::new(Buffer::open(path)?);
         doc.start_lsp(&self.lsp_root_for(path));
-        self.set_doc(Some(doc));
+        self.push_doc(doc);
         Ok(())
     }
 
@@ -363,25 +558,142 @@ impl EditorSurface {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    /// Replace the open document, tearing down the outgoing document's language
-    /// server first (EDITOR-LSP-2 `didClose`) so no session leaks across an
-    /// open/close/switch.
-    fn set_doc(&mut self, doc: Option<Doc>) {
-        if let Some(existing) = self.doc.as_ref() {
-            existing.close_lsp();
-        }
-        self.doc = doc;
-    }
-
-    /// Open a fresh scratch buffer (the temporary EDITOR-3 exercise affordance).
+    /// Open a fresh scratch buffer as a new tab in the focused pane.
     pub fn open_scratch(&mut self) {
         self.open_text(SCRATCH_SEED);
     }
 
-    /// Close the open document, returning the surface to the empty state and
-    /// tearing down its language-server session (EDITOR-LSP-2 `didClose`).
+    /// Close the focused pane's active document/tab, tearing down its
+    /// language-server session (EDITOR-LSP-2 `didClose`). When it was the pane's
+    /// last tab and the surface is split, the emptied pane collapses to its
+    /// sibling; the last pane simply returns to the empty state.
     pub fn close(&mut self) {
-        self.set_doc(None);
+        let focus = self.focus;
+        if let Some(idx) = self.panes.get(&focus).and_then(PaneTabs::active_index) {
+            self.close_tab_at(focus, idx);
+        }
+    }
+
+    // ── EDITOR-6: tab + pane operations ──────────────────────────────────────
+
+    /// Close the tab at `idx` in pane `pid`, gracefully shutting its language
+    /// server. An emptied non-root pane collapses (its split folds to the
+    /// sibling); an emptied lone pane stays as the empty state.
+    fn close_tab_at(&mut self, pid: PaneId, idx: usize) {
+        let removed = self.panes.get_mut(&pid).and_then(|pane| pane.close(idx));
+        if let Some(doc) = removed {
+            doc.close_lsp();
+        }
+        let emptied = self.panes.get(&pid).is_some_and(PaneTabs::is_empty);
+        if emptied && self.tree.leaf_count() > 1 {
+            self.close_pane(pid);
+        }
+    }
+
+    /// Split the focused pane along `dir`, seeding the new pane with a duplicate
+    /// of the focused pane's active document (so a split immediately shows two
+    /// live buffers) and moving focus to it. A no-op if the focus is somehow not
+    /// in the tree.
+    fn split_focused(&mut self, dir: SplitDir) {
+        let focus = self.focus;
+        let new = self.alloc_pane_id();
+        if !self.tree.split(focus, dir, new) {
+            self.next_pane_id -= 1; // hand the unused id back
+            return;
+        }
+        let mut pane = PaneTabs::empty();
+        if let Some(doc) = self.duplicate_active() {
+            pane.push(doc);
+        }
+        self.panes.insert(new, pane);
+        self.focus = new;
+    }
+
+    /// A fresh [`Doc`] mirroring the focused pane's active document — a file's
+    /// current on-disk contents re-opened as an independent buffer (its own
+    /// language server), or, for a pathless / unreadable buffer, a scratch
+    /// seeded with the live text. `None` when the focused pane is empty. Every
+    /// copy is a real rope (§7) — the two panes edit independently.
+    fn duplicate_active(&self) -> Option<Doc> {
+        let src = self.doc()?;
+        if let Some(path) = src.buffer.path() {
+            let path = path.to_path_buf();
+            if let Ok(buffer) = Buffer::open(&path) {
+                let mut doc = Doc::new(buffer);
+                doc.start_lsp(&self.lsp_root_for(&path));
+                return Some(doc);
+            }
+        }
+        Some(Doc::new(Buffer::from_text(&src.buffer.rope().to_string())))
+    }
+
+    /// Close the whole pane `pid` (every tab's language server torn down) and
+    /// collapse its split to the sibling. Re-focuses the sibling that absorbs
+    /// the freed space; if `pid` was the last pane, the surface reseeds one
+    /// empty pane (the empty state) so a focused leaf always exists.
+    fn close_pane(&mut self, pid: PaneId) {
+        let Some(pane) = self.panes.remove(&pid) else {
+            return;
+        };
+        for doc in &pane.tabs {
+            doc.close_lsp();
+        }
+        let fallback = panes::sibling_first_leaf(&self.tree, pid);
+        let tree = std::mem::replace(&mut self.tree, Pane::leaf(pid));
+        let (rest, _found) = tree.close(pid);
+        if let Some(rest) = rest {
+            self.tree = rest;
+            if self.focus == pid {
+                self.focus = fallback.unwrap_or_else(|| self.tree.first_leaf());
+            }
+        } else {
+            // The surface emptied entirely — reseed one empty pane.
+            let fresh = self.alloc_pane_id();
+            self.panes.insert(fresh, PaneTabs::empty());
+            self.tree = Pane::leaf(fresh);
+            self.focus = fresh;
+        }
+    }
+
+    /// Give pane `pid` the keyboard focus (a no-op if it is gone).
+    fn focus_pane(&mut self, pid: PaneId) {
+        if self.panes.contains_key(&pid) {
+            self.focus = pid;
+        }
+    }
+
+    /// Move the focus to the geometrically adjacent pane (`Alt+arrows`), if any.
+    fn navigate_focus(&mut self, dir: NavDir) {
+        if let Some(target) = panes::navigate(&self.tree, self.focus, dir) {
+            self.focus = target;
+        }
+    }
+
+    /// Apply one deferred [`LeafAction`] from a pane's tab bar / body — run after
+    /// every pane has rendered so tree/registry edits sit outside the pane borrow.
+    fn apply_leaf_action(&mut self, pid: PaneId, action: LeafAction) {
+        match action {
+            LeafAction::Focus => self.focus_pane(pid),
+            LeafAction::NewTab => {
+                self.focus_pane(pid);
+                self.open_scratch();
+            }
+            LeafAction::SelectTab(idx) => {
+                self.focus_pane(pid);
+                if let Some(pane) = self.panes.get_mut(&pid) {
+                    pane.focus(idx);
+                }
+            }
+            LeafAction::CloseTab(idx) => {
+                self.focus_pane(pid);
+                self.close_tab_at(pid, idx);
+            }
+            LeafAction::MoveTab { from, to } => {
+                if let Some(pane) = self.panes.get_mut(&pid) {
+                    pane.move_tab(from, to);
+                }
+            }
+        }
     }
 
     // ── EDITOR-7: the fuzzy finder + command palette ─────────────────────────
@@ -430,7 +742,7 @@ impl EditorSurface {
     pub(crate) fn run_command(&mut self, cmd: PaletteCommand) {
         match cmd {
             PaletteCommand::Save => {
-                if let Some(doc) = self.doc.as_mut() {
+                if let Some(doc) = self.doc_mut() {
                     // A scratch buffer (no path) can't save; that's an honest no-op,
                     // surfaced by the dirty marker staying lit — not a panic.
                     let _ = doc.buffer.save();
@@ -439,7 +751,7 @@ impl EditorSurface {
             PaletteCommand::OpenScratch => self.open_scratch(),
             PaletteCommand::ToggleTree => self.show_tree = !self.show_tree,
             PaletteCommand::ToggleWrap => {
-                if let Some(doc) = self.doc.as_mut() {
+                if let Some(doc) = self.doc_mut() {
                     doc.view.toggle_wrap();
                 }
             }
@@ -457,7 +769,7 @@ impl EditorSurface {
     /// Snapshot the enablement + toggle/zoom state the menu bar and toolbar
     /// render from this frame — the bars' one read seam into the surface.
     pub(crate) fn menu_context(&self) -> MenuContext {
-        let doc = self.doc.as_ref();
+        let doc = self.doc();
         MenuContext {
             has_doc: doc.is_some(),
             has_selection: doc.is_some_and(|d| d.view.has_selection()),
@@ -494,12 +806,12 @@ impl EditorSurface {
             }
             MenuAction::CloseDoc => self.run_command(PaletteCommand::CloseDoc),
             MenuAction::Undo => {
-                if let Some(doc) = self.doc.as_mut() {
+                if let Some(doc) = self.doc_mut() {
                     doc.view.undo(&mut doc.buffer);
                 }
             }
             MenuAction::Redo => {
-                if let Some(doc) = self.doc.as_mut() {
+                if let Some(doc) = self.doc_mut() {
                     doc.view.redo(&mut doc.buffer);
                 }
             }
@@ -507,7 +819,7 @@ impl EditorSurface {
                 // The widget's Ctrl-X arm exactly: copy the selection, then
                 // delete it — the same two seams, menu-driven.
                 self.copy_selection(ctx);
-                if let Some(doc) = self.doc.as_mut() {
+                if let Some(doc) = self.doc_mut() {
                     doc.view.delete_selections(&mut doc.buffer);
                 }
             }
@@ -520,7 +832,7 @@ impl EditorSurface {
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             }
             MenuAction::SelectAll => {
-                if let Some(doc) = self.doc.as_mut() {
+                if let Some(doc) = self.doc_mut() {
                     doc.view.select_all(&doc.buffer);
                 }
             }
@@ -529,7 +841,7 @@ impl EditorSurface {
             MenuAction::CommandPalette => self.toggle_palette(),
             MenuAction::About => self.about_open = true,
             MenuAction::Zoom(percent) => {
-                if let Some(doc) = self.doc.as_mut() {
+                if let Some(doc) = self.doc_mut() {
                     doc.view.set_zoom_percent(percent);
                 }
             }
@@ -538,14 +850,14 @@ impl EditorSurface {
             // ONE operator undo step (the widget's `apply_md` records the
             // engine's undo-group count). A no-op with no document (§7).
             MenuAction::Heading(level) => {
-                if let Some(doc) = self.doc.as_mut() {
+                if let Some(doc) = self.doc_mut() {
                     doc.view.apply_md(&mut doc.buffer, |b, spans| {
                         md_actions::set_heading(b, spans, level)
                     });
                 }
             }
             MenuAction::Wrap(marker) => {
-                if let Some(doc) = self.doc.as_mut() {
+                if let Some(doc) = self.doc_mut() {
                     let m = marker.marker();
                     doc.view.apply_md(&mut doc.buffer, |b, spans| {
                         md_actions::toggle_wrap(b, spans, m)
@@ -553,7 +865,7 @@ impl EditorSurface {
                 }
             }
             MenuAction::List(style) => {
-                if let Some(doc) = self.doc.as_mut() {
+                if let Some(doc) = self.doc_mut() {
                     let kind = match style {
                         ListStyle::Bullet => ListKind::Bullet,
                         ListStyle::Numbered => ListKind::Numbered,
@@ -564,7 +876,7 @@ impl EditorSurface {
                 }
             }
             MenuAction::Indent(delta) => {
-                if let Some(doc) = self.doc.as_mut() {
+                if let Some(doc) = self.doc_mut() {
                     let d = isize::from(delta);
                     doc.view.apply_md(&mut doc.buffer, |b, spans| {
                         md_actions::shift_indent(b, spans, d)
@@ -581,7 +893,7 @@ impl EditorSurface {
     /// [`MenuAction::InsertTable`] dispatches (menu/test parity). One undo step;
     /// a no-op with no open document.
     fn insert_table_at_caret(&mut self, rows: u8, cols: u8) {
-        if let Some(doc) = self.doc.as_mut() {
+        if let Some(doc) = self.doc_mut() {
             let caret = doc.view.cursor();
             let (rows, cols) = (usize::from(rows), usize::from(cols));
             doc.view.apply_md(&mut doc.buffer, |b, _spans| {
@@ -594,7 +906,7 @@ impl EditorSurface {
     /// toolbar Copy, reading the exact same `EditorView::selected_text` the
     /// widget's `Ctrl-C` arm reads (§6). A no-op with no selection.
     fn copy_selection(&self, ctx: &egui::Context) {
-        if let Some(doc) = self.doc.as_ref() {
+        if let Some(doc) = self.doc() {
             if let Some(text) = doc.view.selected_text(&doc.buffer) {
                 ctx.copy_text(text);
             }
@@ -612,7 +924,7 @@ impl EditorSurface {
             self.save_as.error = Some("Enter a path to save to.".to_owned());
             return;
         }
-        let Some(doc) = self.doc.as_mut() else {
+        let Some(doc) = self.doc_mut() else {
             // The document vanished under the dialog — nothing left to save.
             self.save_as.open = false;
             return;
@@ -775,6 +1087,435 @@ impl EditorSurface {
             self.run_command(cmd);
         }
     }
+
+    // ── EDITOR-6: tabs + split chords, chrome, and the pane tree render ───────
+
+    /// Intercept the EDITOR-6 tab / split / pane-focus chords at the panel level,
+    /// consumed BEFORE the text widget clones this frame's events (mirroring
+    /// [`handle_overlay_triggers`](Self::handle_overlay_triggers)) so they never
+    /// type into the buffer. `Ctrl-T` opens a tab, `Ctrl-W` closes one, `Ctrl-\`
+    /// / `Ctrl-Shift-\` split the focused pane, and `Alt+arrows` move the focus.
+    /// The more-specific Shift chord is consumed first.
+    fn handle_pane_chords(&mut self, ui: &Ui) {
+        let split_h =
+            ui.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Backslash));
+        let split_v = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Backslash));
+        let new_tab = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T));
+        let close_tab = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::W));
+        if split_h {
+            self.split_focused(SplitDir::H);
+        }
+        if split_v {
+            self.split_focused(SplitDir::V);
+        }
+        if new_tab {
+            self.open_scratch();
+        }
+        if close_tab {
+            self.close();
+        }
+        for (key, dir) in [
+            (Key::ArrowLeft, NavDir::Left),
+            (Key::ArrowRight, NavDir::Right),
+            (Key::ArrowUp, NavDir::Up),
+            (Key::ArrowDown, NavDir::Down),
+        ] {
+            if ui.input_mut(|i| i.consume_key(Modifiers::ALT, key)) {
+                self.navigate_focus(dir);
+            }
+        }
+    }
+
+    /// The surface chrome strip above the pane tree: the project-tree toggle and
+    /// the split controls (the mouse-reachable twins of the split chords, §7).
+    /// Token-styled (§4). Per-buffer identity lives in each pane's tab bar, so
+    /// this strip stays surface-global.
+    fn top_strip(&mut self, ui: &mut Ui) {
+        ui.add_space(Style::SP_XS);
+        ui.horizontal(|ui| {
+            ui.add_space(Style::SP_S);
+            tree_toggle(ui, &mut self.show_tree);
+            ui.add_space(Style::SP_M);
+            if ui
+                .selectable_label(false, RichText::new("\u{2503}").size(Style::BODY))
+                .on_hover_text("Split right (Ctrl+\\)")
+                .clicked()
+            {
+                self.split_focused(SplitDir::V);
+            }
+            if ui
+                .selectable_label(false, RichText::new("\u{2501}").size(Style::BODY))
+                .on_hover_text("Split down (Ctrl+Shift+\\)")
+                .clicked()
+            {
+                self.split_focused(SplitDir::H);
+            }
+            if self.tree.leaf_count() > 1 {
+                ui.add_space(Style::SP_M);
+                if ui
+                    .selectable_label(false, RichText::new("Close pane").size(Style::SMALL))
+                    .on_hover_text("Close the focused pane")
+                    .clicked()
+                {
+                    let focus = self.focus;
+                    self.close_pane(focus);
+                }
+            }
+        });
+        ui.add_space(Style::SP_XS);
+        ui.separator();
+    }
+
+    /// The focused document's status line (caret position, language, LSP status,
+    /// soft-wrap toggle, lossy-decode note) — a single surface-global strip since
+    /// the tab bars already carry each buffer's name + dirty marker. Honest
+    /// chrome: every value reflects the real buffer/view (§7); token-styled (§4).
+    fn status_bar(&mut self, ui: &mut Ui) {
+        // Snapshot every displayed value, ending the `&Doc` borrow before the
+        // deferred wrap toggle needs `&mut Doc`.
+        let Some((lossy, line, col, wrap_on, lang, lsp)) = self.doc().map(|doc| {
+            let (line, col) = doc.view.line_col(&doc.buffer);
+            (
+                doc.buffer.is_lossy(),
+                line,
+                col,
+                doc.view.wrap(),
+                doc.highlight.as_ref().map(|hl| hl.language().name()),
+                doc.lsp.as_ref().and_then(lsp_status),
+            )
+        }) else {
+            return;
+        };
+        let mut toggle_wrap = false;
+        ui.horizontal(|ui| {
+            ui.add_space(Style::SP_S);
+            if lossy {
+                ui.label(
+                    RichText::new("lossy decode")
+                        .size(Style::SMALL)
+                        .color(Style::WARN),
+                );
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(Style::SP_S);
+                ui.label(
+                    RichText::new(format!("Ln {line}, Col {col}"))
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                if let Some(status) = &lsp {
+                    ui.add_space(Style::SP_M);
+                    ui.label(
+                        RichText::new(&status.text)
+                            .size(Style::SMALL)
+                            .color(status.color),
+                    );
+                }
+                if let Some(lang) = lang {
+                    ui.add_space(Style::SP_M);
+                    ui.label(
+                        RichText::new(lang)
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                    );
+                }
+                ui.add_space(Style::SP_M);
+                if ui
+                    .selectable_label(wrap_on, RichText::new("Wrap").size(Style::SMALL))
+                    .clicked()
+                {
+                    toggle_wrap = true;
+                }
+            });
+        });
+        if toggle_wrap {
+            if let Some(doc) = self.doc_mut() {
+                doc.view.toggle_wrap();
+            }
+        }
+    }
+
+    /// Hand the keyboard to the focused pane's text widget BEFORE the widgets
+    /// render (mirrors term's `prefocus`): each widget only reads keys while it
+    /// `has_focus`, so without this the first-rendered pane would capture typing.
+    /// A no-op with a single pane (the lone widget self-manages focus) or while
+    /// an overlay/dialog field holds the keyboard.
+    fn prefocus(&self, ui: &Ui) {
+        if self.tree.leaf_count() <= 1 {
+            return;
+        }
+        let Some(&want) = self.pane_widget_ids.get(&self.focus) else {
+            return;
+        };
+        let current = ui.memory(egui::Memory::focused);
+        if current == Some(want) {
+            return;
+        }
+        // Only steal focus from nothing or from another editor pane — never from
+        // an open overlay/dialog text field.
+        let ours = current.is_none_or(|id| self.pane_widget_ids.values().any(|w| *w == id));
+        if ours {
+            ui.memory_mut(|m| m.request_focus(want));
+        }
+    }
+
+    /// Lay the split tree out into `rect` and render every leaf (its tab bar +
+    /// active tab's widget), the draggable dividers, and the focus ring. Deferred
+    /// tab/pane actions are applied after all borrows release.
+    fn render_panes(&mut self, ui: &mut Ui, rect: Rect) {
+        self.prefocus(ui);
+        let lay = panes::layout(&self.tree, rect);
+        let multi = lay.leaves.len() > 1;
+        let mut outcomes: Vec<(PaneId, LeafAction)> = Vec::new();
+        let mut ids: HashMap<PaneId, Id> = HashMap::new();
+        for (pid, prect) in &lay.leaves {
+            self.render_leaf(ui, *pid, *prect, multi, &mut outcomes, &mut ids);
+        }
+        self.pane_widget_ids = ids;
+        self.render_dividers(ui, &lay);
+        if multi {
+            self.paint_focus_ring(ui, &lay);
+        }
+        for (pid, action) in outcomes {
+            self.apply_leaf_action(pid, action);
+        }
+    }
+
+    /// Render one leaf pane into `rect`: its tab bar, then the active tab's text
+    /// widget (the live rope, §7) or the honest empty-pane face. Collects the
+    /// tab-bar action + the widget's egui id for [`prefocus`](Self::prefocus).
+    fn render_leaf(
+        &mut self,
+        ui: &mut Ui,
+        pid: PaneId,
+        rect: Rect,
+        multi: bool,
+        outcomes: &mut Vec<(PaneId, LeafAction)>,
+        ids: &mut HashMap<PaneId, Id>,
+    ) {
+        let is_focused = pid == self.focus;
+        let Some(pane) = self.panes.get_mut(&pid) else {
+            return;
+        };
+        let mut child = ui.new_child(
+            UiBuilder::new()
+                .max_rect(rect)
+                .id_salt(("editor-pane", pid.0))
+                .layout(Layout::top_down(Align::Min)),
+        );
+        child.set_clip_rect(rect);
+
+        // The per-pane tab bar (open buffers, active tab, close, new).
+        if let Some(action) = tab_bar(&mut child, pane, is_focused && multi) {
+            outcomes.push((pid, action));
+        }
+        child.separator();
+
+        if let Some(doc) = pane.active_doc_mut() {
+            // EDITOR-LSP-2 — refresh, render the live widget, then sync edits.
+            doc.refresh_diagnostics();
+            let resp = editor_widget(
+                &mut child,
+                &mut doc.view,
+                &mut doc.buffer,
+                doc.highlight.as_mut(),
+                &doc.diagnostics,
+            );
+            doc.sync_lsp();
+            ids.insert(pid, resp.id);
+            if !is_focused && (resp.clicked() || resp.gained_focus()) {
+                outcomes.push((pid, LeafAction::Focus));
+            }
+        } else if empty_state(&mut child) {
+            outcomes.push((pid, LeafAction::NewTab));
+        }
+    }
+
+    /// Divider strips between sibling panes: dragging one adjusts the split ratio
+    /// (clamped so no pane collapses); hover/drag recolour the hairline through
+    /// the shared `Style` tokens (§4).
+    fn render_dividers(&mut self, ui: &Ui, lay: &panes::Layout) {
+        for div in &lay.dividers {
+            let (hit, icon, line_size) = match div.dir {
+                SplitDir::V => (
+                    div.rect.expand2(vec2(DIVIDER_HIT_SLOP, 0.0)),
+                    CursorIcon::ResizeHorizontal,
+                    vec2(1.0, div.rect.height()),
+                ),
+                SplitDir::H => (
+                    div.rect.expand2(vec2(0.0, DIVIDER_HIT_SLOP)),
+                    CursorIcon::ResizeVertical,
+                    vec2(div.rect.width(), 1.0),
+                ),
+            };
+            let resp = ui
+                .interact(hit, ui.id().with(("editor-splitter", div.path)), Sense::drag())
+                .on_hover_cursor(icon);
+            if resp.dragged() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    if let Some(ratio) = self.tree.ratio_mut(div.path) {
+                        *ratio = panes::pointer_ratio(div, pos);
+                    }
+                }
+            }
+            let color = if resp.dragged() {
+                Style::ACCENT
+            } else if resp.hovered() {
+                Style::ACCENT_HI
+            } else {
+                Style::BORDER
+            };
+            ui.painter().rect_filled(
+                Rect::from_center_size(div.rect.center(), line_size),
+                0.0,
+                color,
+            );
+        }
+    }
+
+    /// The hairline focus ring on the focused pane — only drawn once there is
+    /// more than one pane to tell apart (a lone pane stays full-bleed).
+    fn paint_focus_ring(&self, ui: &Ui, lay: &panes::Layout) {
+        if let Some((_, rect)) = lay.leaves.iter().find(|(pid, _)| *pid == self.focus) {
+            ui.painter().rect_stroke(
+                *rect,
+                Style::RADIUS,
+                Stroke::new(1.0, Style::ACCENT),
+                StrokeKind::Inside,
+            );
+        }
+    }
+}
+
+/// Extra grab slop on each side of a divider strip (the strip is thin; the hit
+/// area overlaps the panes slightly and, registered after them, wins the pointer).
+const DIVIDER_HIT_SLOP: f32 = 2.0;
+
+/// The tab's title: its file name, or "scratch" for a pathless buffer — the same
+/// naming the old single-doc chrome used.
+fn tab_title(doc: &Doc) -> String {
+    doc.buffer.path().and_then(Path::file_name).map_or_else(
+        || "scratch".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// Render one pane's tab bar (EDITOR-6): a chip per open buffer (name + dirty
+/// marker, active highlighted), a `×` close on each, a drag-to-reorder gesture,
+/// and a trailing `+` new-tab button. Returns at most one [`LeafAction`] for the
+/// caller to apply outside the pane borrow. Token-styled (§4).
+fn tab_bar(ui: &mut Ui, pane: &PaneTabs, pane_focused: bool) -> Option<LeafAction> {
+    let mut action: Option<LeafAction> = None;
+    ui.horizontal(|ui| {
+        ui.add_space(Style::SP_XS);
+        let pointer_x = ui.input(|i| i.pointer.interact_pos()).map(|p| p.x);
+        let mut rects: Vec<(usize, Rect)> = Vec::with_capacity(pane.tabs.len());
+        let mut drag_release: Option<usize> = None;
+        for (i, doc) in pane.tabs.iter().enumerate() {
+            let title = tab_title(doc);
+            let dirty = doc.buffer.is_dirty();
+            let active = i == pane.active;
+            let (resp, close_clicked) = tab_chip(ui, &title, active, dirty, active && pane_focused);
+            rects.push((i, resp.rect));
+            if close_clicked {
+                action = Some(LeafAction::CloseTab(i));
+            } else if resp.clicked() {
+                action = Some(LeafAction::SelectTab(i));
+            }
+            if resp.drag_stopped() {
+                drag_release = Some(i);
+            }
+        }
+        // Resolve a drag-reorder against the collected chip rects.
+        if let (Some(from), Some(px)) = (drag_release, pointer_x) {
+            let target = rects
+                .iter()
+                .find(|(_, r)| px >= r.min.x && px <= r.max.x)
+                .map_or(from, |(j, _)| *j);
+            if target != from {
+                action = Some(LeafAction::MoveTab { from, to: target });
+            } else if action.is_none() {
+                action = Some(LeafAction::SelectTab(from));
+            }
+        }
+        ui.add_space(Style::SP_XS);
+        if ui
+            .selectable_label(false, RichText::new("+").size(Style::BODY))
+            .on_hover_text("New tab (Ctrl+T)")
+            .clicked()
+        {
+            action = Some(LeafAction::NewTab);
+        }
+    });
+    action
+}
+
+/// One tab chip: a draggable, clickable pill (name + dirty marker) with a `×`
+/// close zone on its right edge. Returns the chip's drag/click [`Response`] plus
+/// whether the `×` was clicked. Every colour is a `Style` token (§4).
+fn tab_chip(
+    ui: &mut Ui,
+    title: &str,
+    active: bool,
+    dirty: bool,
+    show_active_underline: bool,
+) -> (Response, bool) {
+    let label = if dirty {
+        format!("{title} \u{2022}")
+    } else {
+        title.to_owned()
+    };
+    let text_color = if active { Style::TEXT } else { Style::TEXT_DIM };
+    let font = FontId::proportional(Style::SMALL);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label, font, text_color);
+    let close_w = Style::SP_M;
+    let pad = Style::SP_S;
+    let size = vec2(
+        2.0f32.mul_add(pad, galley.size().x) + close_w,
+        2.0f32.mul_add(Style::SP_XS, galley.size().y),
+    );
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    let close_rect = Rect::from_min_max(pos2(rect.max.x - close_w, rect.min.y), rect.max);
+    let close_resp = ui.interact(close_rect, resp.id.with("close"), Sense::click());
+
+    let bg = if active {
+        Style::SURFACE_HI
+    } else if resp.hovered() {
+        Style::SURFACE
+    } else {
+        Style::BG
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, Style::RADIUS, bg);
+    if show_active_underline {
+        // A hairline accent along the bottom edge marks the active tab of the
+        // focused pane (the "you are here" cue).
+        painter.rect_filled(
+            Rect::from_min_max(pos2(rect.min.x, rect.max.y - 2.0), rect.max),
+            0.0,
+            Style::ACCENT,
+        );
+    }
+    painter.galley(
+        pos2(rect.min.x + pad, rect.center().y - galley.size().y / 2.0),
+        galley,
+        text_color,
+    );
+    let x_color = if close_resp.hovered() {
+        Style::WARN
+    } else {
+        Style::TEXT_DIM
+    };
+    painter.text(
+        close_rect.center(),
+        Align2::CENTER_CENTER,
+        "\u{00d7}",
+        FontId::proportional(Style::SMALL),
+        x_color,
+    );
+    (resp, close_resp.clicked())
 }
 
 /// The markdown ATX heading level of `line` (0-based) — the leading `#`-run
@@ -808,6 +1549,9 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
     // frame's `ui.input` events during its own render below), so `Cmd`/`Ctrl-P`
     // and `Cmd`/`Ctrl-Shift-P` open the overlays instead of typing into the buffer.
     surface.handle_overlay_triggers(ui);
+    // EDITOR-6 — the tab / split / pane-focus chords, consumed at the same panel
+    // level (before the widget clones this frame's events) for the same reason.
+    surface.handle_pane_chords(ui);
 
     // EDTB-4 — the compact decision, taken ONCE from the panel's available width
     // before the bars mount so all three read one consistent layout. Each bar's
@@ -891,34 +1635,22 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
     }
 
     egui::CentralPanel::default().show_inside(ui, |ui| {
-        // No open document → the honest empty state + the scratch affordance. The
-        // diverging `else` frees the `doc` borrow, so `open_scratch` can mutate.
-        let Some(doc) = surface.doc.as_mut() else {
-            editor_chrome(ui, &mut surface.show_tree);
-            if empty_state(ui) {
-                surface.open_scratch();
-            }
-            return;
-        };
-        doc_chrome(ui, doc, &mut surface.show_tree);
-        ui.separator();
-        // EDITOR-LSP-2 — refresh the diagnostics overlay from the server's store
-        // (epoch-gated: a quiet frame skips it) so the widget paints the current
-        // gutter markers + underlines this frame.
-        doc.refresh_diagnostics();
-        // Disjoint field borrows: the widget edits `&mut view` + `&mut buffer`,
-        // syncs `&mut highlight` with this frame's edits (EDITOR-5), and reads
-        // the shared `&diagnostics` overlay to paint them (EDITOR-LSP-2).
-        editor_widget(
-            ui,
-            &mut doc.view,
-            &mut doc.buffer,
-            doc.highlight.as_mut(),
-            &doc.diagnostics,
-        );
-        // EDITOR-LSP-2 — push this frame's edits to the server (one throttled
-        // `didChange`, full-text sync) now the buffer has settled.
-        doc.sync_lsp();
+        // EDITOR-6 — the surface chrome strip (tree toggle + split controls),
+        // then the focused document's status line pinned to the bottom, then the
+        // split-pane tree filling the body. The tab bars + the widget over the
+        // live rope render inside the tree (§7 — runtime-reachable, not a mockup).
+        surface.top_strip(ui);
+        if surface.doc().is_some() {
+            egui::TopBottomPanel::bottom("editor-status")
+                .frame(
+                    egui::Frame::default()
+                        .fill(Style::SURFACE)
+                        .inner_margin(Style::SP_XS),
+                )
+                .show_inside(ui, |ui| surface.status_bar(ui));
+        }
+        let body = ui.available_rect_before_wrap();
+        surface.render_panes(ui, body);
     });
 
     // EDITOR-7 — the finder + palette overlays float above the body (rendered last
@@ -958,112 +1690,6 @@ fn tree_toggle(ui: &mut Ui, show_tree: &mut bool) {
     {
         *show_tree = !*show_tree;
     }
-}
-
-/// The open-document chrome strip: the file name (or "scratch"), a dirty marker,
-/// a soft-wrap toggle, and the caret's line:col — all through [`Style`] tokens
-/// (§4). Honest chrome: it reflects the real buffer/view, no faked state.
-fn doc_chrome(ui: &mut Ui, doc: &mut Doc, show_tree: &mut bool) {
-    // Precompute every displayed value up front (owned), so the render closures
-    // capture no borrow of `doc`; the one mutation (wrap toggle) is deferred to a
-    // flag and applied after the strip.
-    let name = doc.buffer.path().and_then(Path::file_name).map_or_else(
-        || "scratch".to_owned(),
-        |n| n.to_string_lossy().into_owned(),
-    );
-    let dirty = if doc.buffer.is_dirty() {
-        " \u{2022}"
-    } else {
-        ""
-    };
-    let lossy = doc.buffer.is_lossy();
-    let (line, col) = doc.view.line_col(&doc.buffer);
-    let wrap_on = doc.view.wrap();
-    // The detected language (EDITOR-5) — honest chrome: shown only when a real
-    // grammar is highlighting this document, absent for plain text.
-    let lang = doc.highlight.as_ref().map(|hl| hl.language().name());
-    // The language-server status (EDITOR-LSP-2) — honest chrome: an absent
-    // server binary reads "<cmd>: not found", never a faked session (§7); a
-    // serverless / stopped session shows nothing.
-    let lsp = doc.lsp.as_ref().and_then(lsp_status);
-    let mut toggle_wrap = false;
-
-    ui.add_space(Style::SP_XS);
-    ui.horizontal(|ui| {
-        ui.add_space(Style::SP_S);
-        tree_toggle(ui, show_tree);
-        ui.add_space(Style::SP_S);
-        ui.label(
-            RichText::new(format!("{name}{dirty}"))
-                .size(Style::BODY)
-                .color(Style::TEXT)
-                .strong(),
-        );
-        if lossy {
-            ui.add_space(Style::SP_S);
-            ui.label(
-                RichText::new("lossy decode")
-                    .size(Style::SMALL)
-                    .color(Style::WARN),
-            );
-        }
-        // Right-aligned: the wrap toggle + the caret position + the language.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.add_space(Style::SP_S);
-            ui.label(
-                RichText::new(format!("Ln {line}, Col {col}"))
-                    .size(Style::SMALL)
-                    .color(Style::TEXT_DIM),
-            );
-            if let Some(status) = &lsp {
-                ui.add_space(Style::SP_M);
-                ui.label(
-                    RichText::new(&status.text)
-                        .size(Style::SMALL)
-                        .color(status.color),
-                );
-            }
-            if let Some(lang) = lang {
-                ui.add_space(Style::SP_M);
-                ui.label(
-                    RichText::new(lang)
-                        .size(Style::SMALL)
-                        .color(Style::TEXT_DIM),
-                );
-            }
-            ui.add_space(Style::SP_M);
-            if ui
-                .selectable_label(wrap_on, RichText::new("Wrap").size(Style::SMALL))
-                .clicked()
-            {
-                toggle_wrap = true;
-            }
-        });
-    });
-    ui.add_space(Style::SP_XS);
-
-    if toggle_wrap {
-        doc.view.toggle_wrap();
-    }
-}
-
-/// The editor's identity strip for the empty state — a compact header naming the
-/// surface, drawn through [`Style`] tokens (§4).
-fn editor_chrome(ui: &mut Ui, show_tree: &mut bool) {
-    ui.add_space(Style::SP_XS);
-    ui.horizontal(|ui| {
-        ui.add_space(Style::SP_S);
-        tree_toggle(ui, show_tree);
-        ui.add_space(Style::SP_S);
-        ui.label(
-            RichText::new("Editor")
-                .size(Style::BODY)
-                .color(Style::TEXT)
-                .strong(),
-        );
-    });
-    ui.add_space(Style::SP_XS);
-    ui.separator();
 }
 
 /// The "no document" face — the honest empty state (§7), plus a temporary button
@@ -1253,7 +1879,7 @@ mod tests {
         let mut surface = real_editor();
         surface.open_path(&file).expect("open");
         assert!(
-            surface.doc.as_ref().expect("doc").highlight.is_some(),
+            surface.doc().expect("doc").highlight.is_some(),
             "a .rs file gets the rust highlighter"
         );
         assert!(
@@ -1263,7 +1889,7 @@ mod tests {
 
         surface.open_scratch();
         assert!(
-            surface.doc.as_ref().expect("doc").highlight.is_none(),
+            surface.doc().expect("doc").highlight.is_none(),
             "a pathless scratch buffer renders plain (no guessed grammar)"
         );
     }
@@ -1397,13 +2023,13 @@ mod tests {
         let mut surface = real_editor();
         surface.open_path(&file).expect("open");
         // Dirty the buffer, then dispatch Save through the palette seam.
-        surface.doc.as_mut().expect("doc").buffer.insert(3, "DEF");
-        assert!(surface.doc.as_ref().expect("doc").buffer.is_dirty());
+        surface.doc_mut().expect("doc").buffer.insert(3, "DEF");
+        assert!(surface.doc().expect("doc").buffer.is_dirty());
 
         surface.run_command(PaletteCommand::Save);
 
         assert!(
-            !surface.doc.as_ref().expect("doc").buffer.is_dirty(),
+            !surface.doc().expect("doc").buffer.is_dirty(),
             "Save cleared the dirty flag"
         );
         assert_eq!(
@@ -1436,10 +2062,10 @@ mod tests {
     fn palette_command_toggle_wrap_flips_the_editor_wrap() {
         let mut surface = real_editor();
         surface.open_text("a long line\n");
-        let before = surface.doc.as_ref().expect("doc").view.wrap();
+        let before = surface.doc().expect("doc").view.wrap();
         surface.run_command(PaletteCommand::ToggleWrap);
         assert_ne!(
-            surface.doc.as_ref().expect("doc").view.wrap(),
+            surface.doc().expect("doc").view.wrap(),
             before,
             "Toggle Soft-Wrap flipped the view's wrap"
         );
@@ -1540,7 +2166,7 @@ mod tests {
         std::fs::write(&file, b"abc").expect("seed");
         let mut surface = real_editor();
         surface.open_path(&file).expect("open");
-        surface.doc.as_mut().expect("doc").buffer.insert(3, "!");
+        surface.doc_mut().expect("doc").buffer.insert(3, "!");
         run_action_in_frame(&mut surface, MenuAction::Save);
         assert_eq!(
             std::fs::read(&file).expect("read back"),
@@ -1581,7 +2207,7 @@ mod tests {
             "the buffer adopted the new path"
         );
         assert!(
-            surface.doc.as_ref().expect("doc").highlight.is_some(),
+            surface.doc().expect("doc").highlight.is_some(),
             "the .rs path re-picked a highlighter for the renamed document"
         );
     }
@@ -1618,7 +2244,7 @@ mod tests {
         Style::install(&ctx);
         run_frame(&ctx, &mut surface, vec![Event::Text("X".to_owned())]);
         assert_eq!(
-            surface.doc.as_ref().expect("doc").buffer.rope().to_string(),
+            surface.doc().expect("doc").buffer.rope().to_string(),
             "Xabc",
             "the frame's Text event inserted at the caret"
         );
@@ -1626,7 +2252,7 @@ mod tests {
 
         surface.run_action(&ctx, MenuAction::Undo);
         assert_eq!(
-            surface.doc.as_ref().expect("doc").buffer.rope().to_string(),
+            surface.doc().expect("doc").buffer.rope().to_string(),
             "abc",
             "Edit > Undo unwound the typed edit"
         );
@@ -1634,7 +2260,7 @@ mod tests {
 
         surface.run_action(&ctx, MenuAction::Redo);
         assert_eq!(
-            surface.doc.as_ref().expect("doc").buffer.rope().to_string(),
+            surface.doc().expect("doc").buffer.rope().to_string(),
             "Xabc",
             "Edit > Redo re-applied the edit"
         );
@@ -1646,7 +2272,7 @@ mod tests {
         surface.open_text("hello");
         run_action_in_frame(&mut surface, MenuAction::SelectAll);
         assert_eq!(
-            surface.doc.as_ref().expect("doc").view.selection(),
+            surface.doc().expect("doc").view.selection(),
             Some(0..5),
             "Edit > Select All selected the whole document"
         );
@@ -1666,7 +2292,7 @@ mod tests {
             .any(|c| matches!(c, egui::OutputCommand::CopyText(text) if text == "hello"));
         assert!(copied, "Edit > Copy put the selection on the clipboard");
         assert_eq!(
-            surface.doc.as_ref().expect("doc").buffer.rope().to_string(),
+            surface.doc().expect("doc").buffer.rope().to_string(),
             "hello",
             "Copy leaves the buffer untouched"
         );
@@ -1685,7 +2311,7 @@ mod tests {
             .any(|c| matches!(c, egui::OutputCommand::CopyText(text) if text == "hello"));
         assert!(copied, "Edit > Cut copied the selection first");
         assert_eq!(
-            surface.doc.as_ref().expect("doc").buffer.rope().to_string(),
+            surface.doc().expect("doc").buffer.rope().to_string(),
             "",
             "Edit > Cut deleted the selection"
         );
@@ -1718,10 +2344,10 @@ mod tests {
         run_action_in_frame(&mut surface, MenuAction::ToggleTree);
         assert_ne!(surface.show_tree, tree_before, "View > Project Tree flips");
 
-        let wrap_before = surface.doc.as_ref().expect("doc").view.wrap();
+        let wrap_before = surface.doc().expect("doc").view.wrap();
         run_action_in_frame(&mut surface, MenuAction::ToggleWrap);
         assert_ne!(
-            surface.doc.as_ref().expect("doc").view.wrap(),
+            surface.doc().expect("doc").view.wrap(),
             wrap_before,
             "View > Soft-Wrap flips"
         );
@@ -1813,7 +2439,7 @@ mod tests {
 
     /// The current buffer text of the open document (test helper).
     fn text_of(surface: &EditorSurface) -> String {
-        surface.doc.as_ref().expect("doc").buffer.rope().to_string()
+        surface.doc().expect("doc").buffer.rope().to_string()
     }
 
     #[test]
@@ -1936,10 +2562,13 @@ mod tests {
             Some(2),
             "the Style box reflects the caret line's `##`"
         );
-        // A non-heading line reads back Normal (0).
+        // A non-heading line reads back Normal (0). Under EDITOR-6 this opens a
+        // second tab, so its "plain" caret line is the active read-back.
         surface.open_text("plain\n");
         assert_eq!(surface.menu_context().heading_level, Some(0));
-        // No document → no read-back (the strip greys out).
+        // Closing every open tab returns to the empty state → no read-back
+        // (the Style box greys out).
+        surface.close();
         surface.close();
         assert_eq!(surface.menu_context().heading_level, None);
     }
@@ -1995,7 +2624,7 @@ mod tests {
         let mut surface = real_editor();
         surface.open_path(&file).expect("open");
         assert!(
-            surface.doc.as_ref().expect("doc").lsp.is_some(),
+            surface.doc().expect("doc").lsp.is_some(),
             "opening a file with a known language attaches a client (didOpen)"
         );
     }
@@ -2005,7 +2634,7 @@ mod tests {
         let mut surface = real_editor();
         surface.open_scratch();
         assert!(
-            surface.doc.as_ref().expect("doc").lsp.is_none(),
+            surface.doc().expect("doc").lsp.is_none(),
             "a pathless scratch buffer has nothing to serve"
         );
     }
@@ -2018,7 +2647,7 @@ mod tests {
         let mut surface = real_editor();
         surface.open_path(&file).expect("open");
         assert!(
-            surface.doc.as_ref().expect("doc").lsp.is_none(),
+            surface.doc().expect("doc").lsp.is_none(),
             "an unknown extension has no language — no server"
         );
     }
@@ -2034,7 +2663,7 @@ mod tests {
         let mut surface = real_editor();
         surface.open_path(&file).expect("open");
         assert_eq!(
-            surface.doc.as_ref().expect("doc").lsp_synced_gen,
+            surface.doc().expect("doc").lsp_synced_gen,
             0,
             "a freshly opened doc is synced at generation 0"
         );
@@ -2043,7 +2672,7 @@ mod tests {
         Style::install(&ctx);
         run_frame(&ctx, &mut surface, vec![Event::Text("X".to_owned())]);
 
-        let doc = surface.doc.as_ref().expect("doc");
+        let doc = surface.doc().expect("doc");
         assert!(
             doc.view.edit_generation() >= 1,
             "the typed frame recorded a real edit"
@@ -2072,7 +2701,7 @@ mod tests {
             &mut surface,
             vec![key_press(Key::ArrowRight, Modifiers::NONE)],
         );
-        let doc = surface.doc.as_ref().expect("doc");
+        let doc = surface.doc().expect("doc");
         assert_eq!(
             doc.lsp_synced_gen, 0,
             "a caret-only frame is not resent to the server"
@@ -2094,9 +2723,10 @@ mod tests {
     }
 
     #[test]
-    fn switching_documents_closes_the_previous_client() {
-        // Opening a second file replaces the doc through `set_doc`, which closes
-        // the outgoing document's server first — no leaked session.
+    fn switching_documents_opens_a_second_tab_with_its_own_client() {
+        // Under EDITOR-6 opening a second file opens a second TAB (both stay
+        // open); the newly opened tab becomes the active document and attaches
+        // its own language client (didOpen).
         let d = TempDir::new("lsp-switch");
         let first = d.join("a.md");
         let second = d.join("b.md");
@@ -2108,11 +2738,11 @@ mod tests {
         assert_eq!(
             surface.current_path(),
             Some(second.as_path()),
-            "the second file is now the open document"
+            "the second file is now the active document"
         );
         assert!(
-            surface.doc.as_ref().expect("doc").lsp.is_some(),
-            "the second document has its own client"
+            surface.doc().expect("doc").lsp.is_some(),
+            "the active document has its own client"
         );
     }
 
@@ -2194,5 +2824,186 @@ mod tests {
             "## title\n",
             "the overflow Style still sets the caret-line heading"
         );
+    }
+
+    // ── EDITOR-6: tabs + splittable panes ────────────────────────────────────
+
+    use super::{Doc, PaneTabs};
+    use crate::buffer::Buffer;
+    use crate::panes::{NavDir, SplitDir};
+
+    /// The number of open tabs in the focused pane (test helper).
+    fn focused_tabs(surface: &EditorSurface) -> usize {
+        surface
+            .panes
+            .get(&surface.focus)
+            .map_or(0, |pane| pane.tabs.len())
+    }
+
+    #[test]
+    fn pane_tabs_close_keeps_the_active_index_valid() {
+        // The pure tab-strip model: closing tabs never leaves `active` dangling.
+        let mut pane = PaneTabs::empty();
+        pane.push(Doc::new(Buffer::from_text("a")));
+        pane.push(Doc::new(Buffer::from_text("b")));
+        pane.push(Doc::new(Buffer::from_text("c")));
+        assert_eq!(pane.active, 2, "push activates the new tab");
+        // Close the middle tab: active (the last) shifts left to stay in range.
+        pane.close(1);
+        assert_eq!(pane.tabs.len(), 2);
+        assert!(pane.active < pane.tabs.len(), "active stays in range");
+        // Close down to empty without panicking.
+        pane.close(0);
+        pane.close(0);
+        assert!(pane.is_empty());
+        assert_eq!(pane.active_index(), None, "an empty pane has no active tab");
+    }
+
+    #[test]
+    fn pane_tabs_move_reorders_and_follows_the_moved_tab() {
+        let mut pane = PaneTabs::empty();
+        pane.push(Doc::new(Buffer::from_text("a")));
+        pane.push(Doc::new(Buffer::from_text("b")));
+        pane.push(Doc::new(Buffer::from_text("c")));
+        // Move the first tab ("a") to the end.
+        pane.move_tab(0, 2);
+        let order: Vec<String> = pane
+            .tabs
+            .iter()
+            .map(|d| d.buffer.rope().to_string())
+            .collect();
+        assert_eq!(order, vec!["b", "c", "a"], "the tab moved to the end");
+        assert_eq!(pane.active, 2, "the moved tab stays active");
+    }
+
+    #[test]
+    fn ctrl_t_opens_a_new_tab_in_the_focused_pane() {
+        let mut surface = real_editor();
+        surface.open_text("first\n");
+        assert_eq!(focused_tabs(&surface), 1);
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        run_frame(&ctx, &mut surface, vec![key_press(Key::T, Modifiers::COMMAND)]);
+        assert_eq!(
+            focused_tabs(&surface),
+            2,
+            "Ctrl-T opened a second tab in the focused pane"
+        );
+    }
+
+    #[test]
+    fn ctrl_w_closes_the_active_tab() {
+        let mut surface = real_editor();
+        surface.open_text("one\n");
+        surface.open_text("two\n");
+        assert_eq!(focused_tabs(&surface), 2);
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        run_frame(&ctx, &mut surface, vec![key_press(Key::W, Modifiers::COMMAND)]);
+        assert_eq!(focused_tabs(&surface), 1, "Ctrl-W closed the active tab");
+        assert!(surface.is_open(), "the surviving tab is still open");
+    }
+
+    #[test]
+    fn splitting_shows_two_live_buffers_at_once() {
+        // The acceptance: a split shows two buffers at once — each a real,
+        // independently editable rope (§7).
+        let mut surface = real_editor();
+        surface.open_text("hello\n");
+        surface.split_focused(SplitDir::V);
+        assert_eq!(surface.pane_count(), 2, "the surface split into two panes");
+        let with_docs = surface
+            .panes
+            .values()
+            .filter(|pane| pane.active_doc().is_some())
+            .count();
+        assert_eq!(with_docs, 2, "both panes show a live buffer");
+        // The new pane's buffer is an independent copy of the source text.
+        for pane in surface.panes.values() {
+            assert_eq!(
+                pane.active_doc().expect("doc").buffer.rope().to_string(),
+                "hello\n",
+                "each pane holds the same text in its own rope"
+            );
+        }
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the split surface produced no draw primitives"
+        );
+    }
+
+    #[test]
+    fn the_split_chord_splits_the_focused_pane() {
+        let mut surface = real_editor();
+        surface.open_text("body\n");
+        assert_eq!(surface.pane_count(), 1);
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        // Ctrl+\ splits vertically (side by side).
+        run_frame(
+            &ctx,
+            &mut surface,
+            vec![key_press(Key::Backslash, Modifiers::COMMAND)],
+        );
+        assert_eq!(
+            surface.pane_count(),
+            2,
+            "Ctrl+\\ split the focused pane in two"
+        );
+    }
+
+    #[test]
+    fn closing_the_last_tab_in_a_split_collapses_the_pane() {
+        let mut surface = real_editor();
+        surface.open_text("a\n");
+        surface.split_focused(SplitDir::H);
+        assert_eq!(surface.pane_count(), 2);
+        // The focus is now the new (second) pane; closing its only tab collapses
+        // the split back to the sibling pane.
+        surface.close();
+        assert_eq!(
+            surface.pane_count(),
+            1,
+            "the emptied pane collapsed to its sibling"
+        );
+        assert!(surface.is_open(), "the sibling pane kept its buffer");
+    }
+
+    #[test]
+    fn navigate_focus_moves_between_split_panes() {
+        let mut surface = real_editor();
+        surface.open_text("left\n");
+        surface.split_focused(SplitDir::V); // focus is now the right pane
+        let right = surface.focus;
+        surface.navigate_focus(NavDir::Left);
+        assert_ne!(surface.focus, right, "Alt+Left moved focus to the left pane");
+        surface.navigate_focus(NavDir::Right);
+        assert_eq!(surface.focus, right, "Alt+Right moved focus back to the right");
+    }
+
+    #[test]
+    fn reopening_an_open_file_focuses_its_existing_tab() {
+        let d = TempDir::new("dedup");
+        let file = d.join("once.rs");
+        std::fs::write(&file, b"fn f() {}\n").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+        surface.open_path(&file).expect("reopen");
+        assert_eq!(
+            focused_tabs(&surface),
+            1,
+            "reopening the same file focused its tab instead of stacking a duplicate"
+        );
+    }
+
+    #[test]
+    fn a_fresh_surface_has_one_pane_and_no_tabs() {
+        let surface = real_editor();
+        assert_eq!(surface.pane_count(), 1, "the surface opens with one pane");
+        assert_eq!(focused_tabs(&surface), 0, "and no open tabs (empty state)");
+        assert!(!surface.is_open());
     }
 }
