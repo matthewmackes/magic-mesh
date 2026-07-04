@@ -49,6 +49,40 @@ struct DeviceFile {
     device: Vec<DeviceRecord>,
 }
 
+/// A pairing learned from ANOTHER node's published roster (KDC-MESH-3, design #5).
+///
+/// The mesh replicated the trust record (device id + the pinned cert fingerprint
+/// from the origin node's TOFU pairing) so THIS node recognizes the phone
+/// **without re-running the pairing handshake itself**.
+///
+/// Held separately from the own-row `devices` map because the two have different
+/// authority: `devices` is this node's OWN pairings — persisted to `devices.toml`
+/// and republished on the substrate (own-row authority) — whereas a `MeshPairing`
+/// is another node's row, reflected here for recognition only and **never
+/// republished** (that would forge the origin + loop). It is not persisted; the
+/// substrate (the Syncthing-replicated `kdc-phones/*.json` rosters) is the source
+/// of truth, reconverged into [`PairingStore::replace_synced`] each shunt tick, so
+/// recognition tracks the live mesh (a pairing that leaves the mesh stops being
+/// recognized). A `MeshPairing` MUST carry a real `fingerprint`: an empty pin is
+/// discovery, not trust — the honest gate lives in `replace_synced`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshPairing {
+    /// The phone's `Announce.device_id` (the shared, mesh-wide identity).
+    pub device_id: String,
+    /// The phone's friendly name as the origin node recorded it.
+    pub device_name: String,
+    /// The pinned SHA-256 cert fingerprint from the ORIGIN node's TOFU pairing.
+    /// A synced node has never seen the phone's cert, so it trusts this pin and
+    /// enforces it against the live handshake — no fake trust, the phone must
+    /// still present the cert the origin node pinned.
+    pub fingerprint: String,
+    /// Unix-ms when the origin node first paired the phone (audit/attribution).
+    pub paired_at_ms: i64,
+    /// The mesh host that OWNS this pairing (ran the TOFU) — so a synced node's
+    /// recognition is attributable in the audit log.
+    pub origin_host: String,
+}
+
 /// The host pairing store: this host's identity keypair, the persisted trusted
 /// peers, and an in-memory store of live AES session keys.
 pub struct PairingStore {
@@ -63,6 +97,17 @@ pub struct PairingStore {
     /// pairing surface (`pair`/`unpair` via `&self`) that mutates it — the
     /// canonical "one authoritative store" mackesd owns.
     devices: Mutex<HashMap<String, DeviceRecord>>,
+    /// KDC-MESH-3 (design #5) — mesh-replicated pairings from OTHER nodes, keyed
+    /// by device id. NOT persisted and NOT republished (own-row authority: only
+    /// `devices` is authoritative here); rebuilt from the substrate each shunt
+    /// tick via [`replace_synced`]. Checked by [`is_paired`] / [`get`] so every
+    /// node that has synced the shared pairing recognizes the phone; a node that
+    /// hasn't synced yet simply has no entry → honest gate (it never fakes trust).
+    ///
+    /// [`replace_synced`]: Self::replace_synced
+    /// [`is_paired`]: Self::is_paired
+    /// [`get`]: Self::get
+    synced: Mutex<HashMap<String, MeshPairing>>,
     sessions: RingKeyStore,
 }
 
@@ -115,6 +160,7 @@ impl PairingStore {
             keypair,
             public_key_der,
             devices: Mutex::new(devices),
+            synced: Mutex::new(HashMap::new()),
             sessions: RingKeyStore::new(),
         };
         // SEC-8 (Q34) — restore the sealed session keys so live links
@@ -189,17 +235,89 @@ impl PairingStore {
         self.devices.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether `device_id` is a trusted, persisted peer (drives
-    /// `PluginContext.paired`).
+    /// Lock the mesh-synced pairing map (design #5), panic-recovering like
+    /// [`devices`](Self::devices) — plain data, no invariant to break.
+    fn synced(&self) -> MutexGuard<'_, HashMap<String, MeshPairing>> {
+        self.synced.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether `device_id` is a trusted peer — either LOCALLY paired (own-row,
+    /// persisted in `devices.toml`) OR recognized via a mesh-synced pairing
+    /// (design #5: another node paired it and the trust record replicated here).
+    /// Drives `PluginContext.paired`, the outbound-verb gate, and the pair re-ack,
+    /// so every node that has synced the shared pairing recognizes the phone
+    /// without re-pairing. A node that hasn't synced simply returns `false` here
+    /// (the honest gate — it never fakes trust).
     #[must_use]
     pub fn is_paired(&self, device_id: &str) -> bool {
+        self.devices().contains_key(device_id) || self.synced().contains_key(device_id)
+    }
+
+    /// Look up a trusted peer's record (cloned out of the lock). An own-row
+    /// pairing wins (own-row authority); otherwise a mesh-synced pairing (design
+    /// #5) is surfaced as a [`DeviceRecord`] carrying the **origin node's pinned
+    /// fingerprint**, so the transport enforces the same cert pin a synced node
+    /// never saw at TOFU. `None` when the device is neither locally paired nor
+    /// synced (honest gate).
+    #[must_use]
+    pub fn get(&self, device_id: &str) -> Option<DeviceRecord> {
+        if let Some(rec) = self.devices().get(device_id).cloned() {
+            return Some(rec);
+        }
+        self.synced().get(device_id).map(|p| DeviceRecord {
+            device_id: p.device_id.clone(),
+            device_name: p.device_name.clone(),
+            paired_at_ms: p.paired_at_ms,
+            fingerprint: p.fingerprint.clone(),
+        })
+    }
+
+    /// Whether `device_id` is LOCALLY paired (own-row authority) — the set THIS
+    /// node persists in `devices.toml` and republishes on the substrate.
+    /// [`is_paired`](Self::is_paired) additionally recognizes mesh-synced
+    /// pairings; this is the narrower "did WE pair it" question the mesh-shunt
+    /// uses to decide what to republish (own rows only, never a synced one).
+    #[must_use]
+    pub fn is_locally_paired(&self, device_id: &str) -> bool {
         self.devices().contains_key(device_id)
     }
 
-    /// Look up a trusted peer's record (cloned out of the lock).
+    /// Whether `device_id` is recognized via a mesh-synced pairing (design #5) —
+    /// i.e. another node owns the pairing and it replicated here. Distinct from
+    /// [`is_locally_paired`](Self::is_locally_paired); both together are
+    /// [`is_paired`](Self::is_paired).
     #[must_use]
-    pub fn get(&self, device_id: &str) -> Option<DeviceRecord> {
-        self.devices().get(device_id).cloned()
+    pub fn is_synced(&self, device_id: &str) -> bool {
+        self.synced().contains_key(device_id)
+    }
+
+    /// The mesh-synced pairing for a device, if any — for attribution/audit
+    /// (which mesh host vouches for this recognized phone).
+    #[must_use]
+    pub fn synced_pairing(&self, device_id: &str) -> Option<MeshPairing> {
+        self.synced().get(device_id).cloned()
+    }
+
+    /// KDC-MESH-3 (design #5) — replace the WHOLE mesh-synced pairing set with the
+    /// merged view the shunt tick collected from every neighbor's published
+    /// roster. Replace (not merge) so recognition CONVERGES with the live mesh: a
+    /// pairing that left the substrate stops being recognized on the next tick.
+    ///
+    /// Honest gate: a pairing carrying an empty `fingerprint` is a name/discovery
+    /// relay, NOT trust — it is dropped here, so an unpinned relay never makes a
+    /// node fake trust. Own-row authority is the caller's contract: it passes only
+    /// OTHER nodes' pairings (a neighbor's roster reader already skips our own
+    /// file), and [`get`](Self::get) prefers a local pairing over a synced one, so
+    /// a device we paired ourselves is always served from our own authoritative row.
+    pub fn replace_synced(&self, pairings: Vec<MeshPairing>) {
+        let mut map = self.synced();
+        map.clear();
+        for p in pairings {
+            if p.fingerprint.is_empty() {
+                continue; // no pin ⇒ discovery, not trust (honest gate)
+            }
+            map.insert(p.device_id.clone(), p);
+        }
     }
 
     /// Every trusted peer, for enumeration — e.g. a host surfacing the paired-device
@@ -443,6 +561,85 @@ mod tests {
         std::fs::write(tmp.path().join("devices.toml"), "not valid toml { [[[").unwrap();
         let s = PairingStore::open(tmp.path()).unwrap();
         assert!(s.is_empty());
+    }
+
+    // ── KDC-MESH-3 (#5): mesh-wide pairing replication ──────────────────────
+
+    fn mesh_pairing(id: &str, fp: &str) -> MeshPairing {
+        MeshPairing {
+            device_id: id.into(),
+            device_name: "Pixel".into(),
+            fingerprint: fp.into(),
+            paired_at_ms: 42,
+            origin_host: "eagle".into(),
+        }
+    }
+
+    #[test]
+    fn mesh_synced_pairing_is_recognized_without_local_pairing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = PairingStore::open(tmp.path()).unwrap();
+        // Unsynced: the honest gate — the phone is NOT recognized, no fake trust.
+        assert!(!s.is_paired("phone-x"));
+        assert!(!s.is_synced("phone-x"));
+        assert!(s.get("phone-x").is_none());
+
+        // A fixture peer's shared pairing replicates in over the substrate.
+        s.replace_synced(vec![mesh_pairing("phone-x", "AA:BB:CC")]);
+
+        // Now recognized mesh-wide WITHOUT a local devices.toml entry (design #5).
+        assert!(s.is_paired("phone-x"), "a synced pairing is recognized");
+        assert!(s.is_synced("phone-x"));
+        assert!(
+            !s.is_locally_paired("phone-x"),
+            "recognized via the mesh, not an own-row pairing"
+        );
+        // get() surfaces the ORIGIN node's pin so the transport enforces the same
+        // cert the synced node never saw at TOFU (real trust, not a bypass).
+        assert_eq!(s.get("phone-x").unwrap().fingerprint, "AA:BB:CC");
+        assert_eq!(
+            s.synced_pairing("phone-x").unwrap().origin_host,
+            "eagle",
+            "recognition is attributable to the vouching host"
+        );
+        // Own-row authority: a synced pairing is NEVER in the republish set.
+        assert!(
+            s.records().is_empty(),
+            "synced pairings are not republished (own-row authority)"
+        );
+
+        // Convergence: an empty replace drops recognition (the pairing left the mesh).
+        s.replace_synced(vec![]);
+        assert!(!s.is_paired("phone-x"), "recognition converges away with the mesh");
+    }
+
+    #[test]
+    fn unpinned_relay_is_not_trusted_honest_gate() {
+        // A relayed row carrying no fingerprint is discovery, not trust — it must
+        // never make a node recognize the phone (design #5 honest gate).
+        let tmp = tempfile::tempdir().unwrap();
+        let s = PairingStore::open(tmp.path()).unwrap();
+        s.replace_synced(vec![mesh_pairing("phone-nopin", "")]);
+        assert!(!s.is_paired("phone-nopin"), "no pin ⇒ not trusted");
+        assert!(!s.is_synced("phone-nopin"));
+        assert!(s.get("phone-nopin").is_none());
+    }
+
+    #[test]
+    fn local_pairing_takes_precedence_over_synced() {
+        // Own-row authority: when the same device is both locally paired and
+        // synced, get() serves OUR authoritative record, not the mesh copy.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = PairingStore::open(tmp.path()).unwrap();
+        s.pair(rec("dev-1")).unwrap(); // fingerprint "AB:CD:EF"
+        s.replace_synced(vec![mesh_pairing("dev-1", "99:99:99")]);
+        assert!(s.is_locally_paired("dev-1"));
+        assert!(s.is_synced("dev-1"));
+        assert_eq!(
+            s.get("dev-1").unwrap().fingerprint,
+            "AB:CD:EF",
+            "the own-row pin wins over the synced one"
+        );
     }
 
     #[test]

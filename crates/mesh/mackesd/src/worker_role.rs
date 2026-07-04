@@ -120,6 +120,15 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // bus the chat worker folds on every role. A deliberate rank-0 census entry
     // (the BUG-STORAGE-1 lesson), never the silent unknown-worker default.
     ("notify", 0),
+    // KDC-MESH-3 (kdc-mesh.md #15) — the KDE Connect host is UNIVERSAL (rank 0):
+    // it runs on EVERY node incl. lighthouses/headless so the mesh-wide "every
+    // node recognizes the phone" (#5) + "all nodes serve the phone at once" (#6)
+    // goals actually hold. Safe on a headless/relay node because KDC-MESH-1's
+    // transport is overlay-ONLY — it binds 1716 on the Nebula overlay IP, never
+    // the public NIC, so `kdc_host` on a lighthouse opens NO public port (the
+    // firewall preset opens 1716 on the overlay/trusted zone only; public stays
+    // default-deny). Was Workstation-only (rank 1) pre-KDC-MESH-3.
+    ("kdc_host", 0),
     // ── Workstation (rank 1) — everything beyond the relay control plane: the
     //    fleet + mesh storage workers AND voice / clipboard / kdc / remmina /
     //    music. A headless box is a Workstation too (the desktop workers idle
@@ -157,7 +166,6 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // to), so Workstation-tier; it idles gracefully on a headless box (the
     // aggregation is cheap and the verbs simply never arrive).
     ("desktop_sources", 1),
-    ("kdc_host", 1),
     ("remmina-sync", 1),
     // MEDIA-8 — Workstation music auto-config: a desktop worker (no seated user
     // on a Lighthouse, so Workstation-tier), reads the published shared
@@ -431,6 +439,10 @@ mod tests {
         // +1 notify (CHAT-FIX-2 — the local-notification producer, pinned at rank 0:
         // every node reports its own peer/service/disk/journal events into the Chat
         // feed the chat worker folds; the real empty-Chat fix).
+        // KDC-MESH-3 (#15) — kdc_host MOVED from rank 1 → rank 0 (universal KDE
+        // Connect host: every node recognizes the phone, overlay-only so no public
+        // port opens). A tier move, not an add, so the total is unchanged; the
+        // rank split shifts 26/16 → 27/15 (see `tier_counts_match_the_two_role_split`).
         assert_eq!(WORKER_TIERS.len(), 42);
     }
 
@@ -454,13 +466,13 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            26,
-            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + notify (CHAT-FIX-2, universal local-notification producer)"
+            27,
+            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + notify (CHAT-FIX-2, universal local-notification producer) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port)"
         );
         assert_eq!(
             count(1),
-            16,
-            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/kdc/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7)"
+            15,
+            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7) — kdc moved to rank 0 (KDC-MESH-3)"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
@@ -482,7 +494,10 @@ mod tests {
         ] {
             assert!(runs(w, r), "Lighthouse must run {w}");
         }
-        for w in ["ansible-pull", "app-sync", "voice_config", "kdc_host"] {
+        // KDC-MESH-3 (#15) — kdc_host is NO LONGER in this list: it is now a
+        // universal rank-0 worker that DOES run on a Lighthouse (see
+        // `kdc_host_runs_on_every_role`). Overlay-only, so it opens no public port.
+        for w in ["ansible-pull", "app-sync", "voice_config"] {
             assert!(!runs(w, r), "Lighthouse must NOT run {w}");
         }
     }
@@ -608,6 +623,31 @@ mod tests {
     }
 
     #[test]
+    fn kdc_host_runs_on_every_role() {
+        // KDC-MESH-3 (kdc-mesh.md #15) — the KDE Connect host is UNIVERSAL (rank 0):
+        // it MUST spawn on EVERY node incl. a headless Lighthouse, so the mesh-wide
+        // "every node recognizes the phone" (#5) + "all nodes serve at once" (#6)
+        // goals hold. It was Workstation-only (rank 1) before; the move is safe
+        // because KDC-MESH-1's transport is overlay-only (binds 1716 on the Nebula
+        // overlay IP, never the public NIC — so a lighthouse opens no public port).
+        assert_eq!(min_rank("kdc_host"), 0, "kdc_host is a universal (rank-0) worker");
+        assert!(
+            runs("kdc_host", Role::Workstation.rank()),
+            "a Workstation still runs the KDE Connect host"
+        );
+        assert!(
+            runs("kdc_host", Role::Lighthouse.rank()),
+            "a Lighthouse now runs the KDE Connect host too (overlay-only, no public port)"
+        );
+        // A DELIBERATE census entry, so `mackesd role-workers` lists it on both roles.
+        assert!(workers_for_rank(Role::Workstation.rank()).contains(&"kdc_host"));
+        assert!(workers_for_rank(Role::Lighthouse.rank()).contains(&"kdc_host"));
+        // No capability tag — every node runs it (the overlay-only transport is the
+        // gate that keeps it safe on a headless/relay node, not a role tag).
+        assert_eq!(required_capability("kdc_host"), None);
+    }
+
+    #[test]
     fn role_name_maps_each_rank_to_its_canonical_name() {
         // BOOKMARKS-8 — the browser-policy worker folds its per-role policy by
         // this name, so it MUST match the role.toml canonical names.
@@ -627,12 +667,13 @@ mod tests {
     fn workers_for_rank_is_a_growing_superset() {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        // 26 lighthouse-tier workers (22 control-plane + the BUG-STORAGE-1 universal
+        // 27 lighthouse-tier workers (22 control-plane + the BUG-STORAGE-1 universal
         // storage mirror + the QC-2 universal openstack worker + the EXPLORER-1
-        // universal unit_aggregator + the CHAT-FIX-2 universal notify producer at
-        // rank 0); Workstation adds the 16 fleet + desktop workers for the full 42
-        // (the retired Server tier folded into Workstation in the 2-role model).
-        assert_eq!(lh.len(), 26);
+        // universal unit_aggregator + the CHAT-FIX-2 universal notify producer + the
+        // KDC-MESH-3 universal kdc_host at rank 0); Workstation adds the 15 fleet +
+        // desktop workers for the full 42 (the retired Server tier folded into
+        // Workstation in the 2-role model).
+        assert_eq!(lh.len(), 27);
         assert_eq!(ws.len(), 42);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
@@ -694,18 +735,18 @@ mod tests {
             "media ≠ workstation tier"
         );
         let set = workers_for_class(media_lh);
-        // = the 26 lighthouse-tier workers (incl. link-traffic MESHMAP-6, the
+        // = the 27 lighthouse-tier workers (incl. link-traffic MESHMAP-6, the
         // BUG-STORAGE-1 universal storage mirror, the QC-2 universal openstack
-        // worker, the EXPLORER-1 universal unit_aggregator + the CHAT-FIX-2
-        // universal notify producer) + navidrome.
-        assert_eq!(set.len(), 27);
+        // worker, the EXPLORER-1 universal unit_aggregator, the CHAT-FIX-2
+        // universal notify producer + the KDC-MESH-3 universal kdc_host) + navidrome.
+        assert_eq!(set.len(), 28);
         assert!(set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 26);
+        assert_eq!(workers_for_class(plain_lh).len(), 27);
     }
 
     #[test]

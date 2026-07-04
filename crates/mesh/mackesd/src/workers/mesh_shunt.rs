@@ -53,7 +53,7 @@ pub fn phones_dir(workgroup_root: &Path) -> PathBuf {
 }
 
 /// One published device entry (the JSON shape on the volume).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublishedDevice {
     /// KDE-Connect device identifier (stable across renames).
     pub device_id: String,
@@ -66,6 +66,27 @@ pub struct PublishedDevice {
     /// gate: no overlay IP ⇒ relayed for its name but not dialable (§7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_ip: Option<String>,
+    /// KDC-MESH-3 (design #5) — the pinned SHA-256 cert fingerprint from THIS
+    /// host's TOFU pairing of the phone. Replicated so a neighbor recognizes the
+    /// phone WITHOUT re-pairing: the neighbor trusts this pin and enforces it
+    /// against the live handshake. The fingerprint is the PUBLIC cert hash (shown
+    /// in every TLS handshake), never a secret. Empty ⇒ the row is relayed for
+    /// discovery only, not as trust (the honest gate). `#[serde(default)]` +
+    /// skip-when-empty keeps the legacy (name-relay) file shape parseable + compact.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fingerprint: String,
+    /// KDC-MESH-3 (design #5) — Unix-ms when THIS host first paired the phone,
+    /// carried with the pin so a synced pairing is attributable (audit). Optional
+    /// on the wire (skipped when zero) for back-compat + compactness.
+    #[serde(default, skip_serializing_if = "is_zero_ms")]
+    pub paired_at_ms: i64,
+}
+
+/// serde skip predicate: a zero `paired_at_ms` is omitted from the published JSON
+/// (a name-relay-only row), keeping the legacy file shape byte-compatible.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde `skip_serializing_if` needs &T
+const fn is_zero_ms(v: &i64) -> bool {
+    *v == 0
 }
 
 /// KDC-MESH-2 — the published roster document.
@@ -269,6 +290,79 @@ pub fn collect_overlay_directory(workgroup_root: &Path, self_hostname: &str) -> 
     out
 }
 
+/// One mesh-replicated pairing collected from a neighbor's roster (KDC-MESH-3 #5).
+///
+/// The phone's trust record (id, name, the origin node's pinned cert fingerprint,
+/// when it paired) plus the `origin_host` that owns it. The `kdc_host` worker maps
+/// this to a [`mde_kdc_host::MeshPairing`] and folds it into the local store so
+/// THIS node recognizes the phone without re-pairing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectedPairing {
+    /// The phone's KDE-Connect device id (the shared mesh-wide identity).
+    pub device_id: String,
+    /// The phone's friendly name as the origin host recorded it.
+    pub device_name: String,
+    /// The origin node's pinned SHA-256 cert fingerprint (non-empty — the honest
+    /// gate drops pin-less rows before they reach here).
+    pub fingerprint: String,
+    /// Unix-ms when the origin node first paired the phone (audit).
+    pub paired_at_ms: i64,
+    /// The mesh host that owns (TOFU-paired) this phone.
+    pub origin_host: String,
+}
+
+/// KDC-MESH-3 (design #5) — collect the mesh-wide PAIRINGS from every neighbor's
+/// published roster.
+///
+/// Reads each neighbor file (skipping our own — own-row authority) and returns
+/// every relayed phone that carries a real pinned fingerprint. A row without a
+/// fingerprint is a name/discovery relay, NOT a trust record, and is honestly
+/// omitted here (it never makes a node fake trust). The caller feeds the result
+/// to [`PairingStore::replace_synced`], so a phone paired on peer-A is recognized
+/// on peer-B once A's roster (with its pin) has replicated — and stops being
+/// recognized once it leaves the substrate. Junk / half-replicated files are
+/// skipped, like every other replicated reader.
+///
+/// [`PairingStore::replace_synced`]: mde_kdc_host::PairingStore::replace_synced
+#[must_use]
+pub fn collect_pairings(workgroup_root: &Path, self_hostname: &str) -> Vec<CollectedPairing> {
+    let Ok(entries) = std::fs::read_dir(phones_dir(workgroup_root)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        // Own-row authority: never fold our own published pairings back in.
+        if stem == self_hostname || path.extension().is_none_or(|x| x != "json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(roster) = parse_roster(&raw) else {
+            continue;
+        };
+        for d in roster.devices {
+            // Honest gate: only a device carrying a real pin is a trusted pairing.
+            if d.fingerprint.is_empty() {
+                continue;
+            }
+            out.push(CollectedPairing {
+                device_id: d.device_id,
+                device_name: d.device_name,
+                fingerprint: d.fingerprint,
+                paired_at_ms: d.paired_at_ms,
+                origin_host: stem.to_string(),
+            });
+        }
+    }
+    out
+}
+
 /// Inject every fresh synthetic announce into `registry` (accept any
 /// relayer — Q26/27). Returns how many were injected.
 pub fn inject_fresh(
@@ -304,6 +398,7 @@ mod tests {
             device_id: id.into(),
             device_name: name.into(),
             overlay_ip: None,
+            ..Default::default()
         }
     }
 
@@ -312,6 +407,19 @@ mod tests {
             device_id: id.into(),
             device_name: name.into(),
             overlay_ip: Some(ip.into()),
+            ..Default::default()
+        }
+    }
+
+    /// KDC-MESH-3 — a published device carrying the pinned fingerprint (a real
+    /// mesh-wide pairing, not just a name/discovery relay).
+    fn dev_paired(id: &str, name: &str, fp: &str) -> PublishedDevice {
+        PublishedDevice {
+            device_id: id.into(),
+            device_name: name.into(),
+            fingerprint: fp.into(),
+            paired_at_ms: 100,
+            ..Default::default()
         }
     }
 
@@ -435,5 +543,63 @@ mod tests {
             vec![("o1".to_string(), "10.42.0.77".parse().unwrap())],
             "the phone with a dialable overlay IP resolves; no-IP + wildcard omitted"
         );
+    }
+
+    // ── KDC-MESH-3 (#5): the pairing pin replicates through the roster ───────
+
+    #[test]
+    fn published_device_carries_the_pin_optionally_on_the_wire() {
+        // A name-relay row (no pin) omits both KDC-MESH-3 fields (compact,
+        // back-compat); a paired row carries the fingerprint + paired_at.
+        let bare = dev("d", "n");
+        let s = serde_json::to_string(&bare).unwrap();
+        assert!(!s.contains("fingerprint"), "empty pin must not serialize");
+        assert!(!s.contains("paired_at_ms"), "zero paired_at must not serialize");
+        assert_eq!(serde_json::from_str::<PublishedDevice>(&s).unwrap(), bare);
+
+        let paired = dev_paired("d", "n", "AA:BB:CC");
+        let sp = serde_json::to_string(&paired).unwrap();
+        assert!(sp.contains("AA:BB:CC") && sp.contains("paired_at_ms"));
+        assert_eq!(serde_json::from_str::<PublishedDevice>(&sp).unwrap(), paired);
+    }
+
+    #[test]
+    fn collect_pairings_returns_neighbor_pins_and_honest_gates_the_pinless() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A neighbor (oak) publishes one PAIRED phone (with a pin) + one name-relay
+        // phone (no pin). Only the pinned one is a trust record.
+        publish_phones(
+            root,
+            "oak",
+            &[
+                dev_paired("o1", "Oak Phone", "AA:BB:CC"),
+                dev("o2", "Oak Tab"),
+            ],
+        )
+        .unwrap();
+        // Our own file carries a pin too but must be skipped (own-row authority).
+        publish_phones(root, "pine", &[dev_paired("p1", "Pine", "DD:EE:FF")]).unwrap();
+
+        let pairings = collect_pairings(root, "pine");
+        assert_eq!(pairings.len(), 1, "only oak's pinned phone is a trusted pairing");
+        let p = &pairings[0];
+        assert_eq!(p.device_id, "o1");
+        assert_eq!(p.fingerprint, "AA:BB:CC");
+        assert_eq!(p.paired_at_ms, 100);
+        assert_eq!(p.origin_host, "oak", "recognition is attributable to oak");
+        // The pin-less o2 is honestly omitted (discovery relay, not trust); our own
+        // p1 is never folded back.
+        assert!(!pairings.iter().any(|c| c.device_id == "o2"));
+        assert!(!pairings.iter().any(|c| c.device_id == "p1"));
+    }
+
+    #[test]
+    fn collect_pairings_is_empty_without_neighbors() {
+        // A fresh mesh with no neighbor rosters yields no synced pairings — the
+        // honest gate at the collection layer (a node recognizes nothing it hasn't
+        // synced).
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(collect_pairings(tmp.path(), "pine").is_empty());
     }
 }

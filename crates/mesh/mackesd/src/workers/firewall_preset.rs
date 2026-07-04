@@ -56,19 +56,22 @@ pub const DEFAULT_ROLE_MARKER_PATH: &str = crate::ipc::nebula::DEFAULT_ROLE_HOST
 const NEBULA_PORTS_ALL_PEERS: &[(u16, &str)] = &[(4242, "udp")];
 const NEBULA_PORTS_LIGHTHOUSE_EXTRA: &[(u16, &str)] = &[(443, "tcp")];
 
-/// KDC-INTEROP — KDE Connect's LAN port range (TCP+UDP 1714–1764). Opened only
-/// on **Workstation-rank** peers, where the `kdc_host` worker runs and binds
-/// 1716; a paired phone discovers + connects over the LAN through these. Headless
-/// Lighthouse/Server peers don't run `kdc_host`, so they never open them (keeps
-/// their underlay attack surface to the Nebula bootstrap ports). Expressed as
-/// `firewall-cmd` port-range specs since the range is 51 ports.
-const KDE_CONNECT_PORT_SPECS: &[&str] = &["1714-1764/tcp", "1714-1764/udp"];
+/// KDC-MESH-3 (#15) — the single KDE Connect TLS link port. KDC-MESH-1 made the
+/// transport **overlay-only**: `kdc_host` binds 1716 on the Nebula overlay IP,
+/// never the public NIC, and there is no UDP broadcast discovery (KDC-MESH-2's
+/// directed announce replaces it). So the firewall opens ONLY 1716/tcp, and ONLY
+/// on the OVERLAY (trusted) zone — the whole pre-KDC-MESH LAN range (1714–1764
+/// tcp+udp on the public zone) is retired. A headless/lighthouse node running
+/// `kdc_host` therefore keeps 1716 CLOSED on the public boundary (design #15).
+const KDC_OVERLAY_PORT: u16 = 1716;
 
-/// Whether this peer runs the Workstation worker set (rank ≥ 2) — i.e. it runs
-/// `kdc_host` and therefore should open the KDE Connect ports. Tolerant resolver
+/// KDC-MESH-3 (#15) — whether THIS node runs `kdc_host`. Now a UNIVERSAL rank-0
+/// worker, so this reads the census directly (true on every node incl.
+/// lighthouses); when true the zone plan opens 1716 on the OVERLAY zone only
+/// (never the public NIC — the transport binds the overlay). Tolerant resolver
 /// (an unpinned dev box reads as Workstation), matching the worker pool's default.
 fn runs_kdc_host() -> bool {
-    crate::worker_role::resolve_rank() >= mde_role::Role::Workstation.rank()
+    crate::worker_role::runs("kdc_host", crate::worker_role::resolve_rank())
 }
 
 /// Worker handle. Tracks the last-observed role-marker state +
@@ -166,24 +169,15 @@ impl FirewallPresetWorker {
         match apply_preset(self.firewall_cmd, &ports) {
             Ok(()) => {
                 self.last_applied_lighthouse = Some(is_lighthouse);
-                // KDC-INTEROP — Workstation peers also open the KDE Connect range
-                // so a phone can pair/connect over the LAN. Best-effort: a failure
-                // here must not undo the (succeeded) Nebula preset.
-                if runs_kdc_host() {
-                    if let Err(e) = apply_port_specs(self.firewall_cmd, KDE_CONNECT_PORT_SPECS) {
-                        tracing::warn!(
-                            target: "mackesd::firewall_preset",
-                            error = %e,
-                            "nebula preset applied, but KDE Connect ports deferred (KDC-INTEROP)"
-                        );
-                    }
-                }
-                // PLANES-16 — bind the overlay to the trusted zone and the
-                // underlay to the tight public zone (W69/W70). Best-effort:
-                // a zone failure must not undo the (succeeded) port preset,
-                // so it's logged, not propagated.
+                // PLANES-16 + KDC-MESH-3 — bind the overlay to the trusted zone and
+                // the underlay to the tight public zone (W69/W70), and — when this
+                // node runs `kdc_host` (now universal, rank 0) — open 1716 on the
+                // OVERLAY zone ONLY (never the public NIC; KDC-MESH-1's transport
+                // binds the overlay). Best-effort: a zone failure must not undo the
+                // (succeeded) port preset, so it's logged, not propagated.
                 let plan = zone_plan(
                     is_lighthouse,
+                    runs_kdc_host(),
                     OVERLAY_IFACE,
                     default_underlay_iface().as_deref(),
                 );
@@ -276,10 +270,13 @@ pub const OVERLAY_ZONE: &str = "trusted";
 /// firewalld's built-in tight zone for the underlay NIC (W70).
 pub const UNDERLAY_ZONE: &str = "public";
 
-/// A firewalld zone plan (PLANES-16): interface→zone bindings plus the
-/// inbound ports each zone permits. The overlay zone needs no per-port
-/// rule (it accepts everything); the underlay zone carries the role-tight
-/// Nebula bootstrap ports.
+/// A firewalld zone plan (PLANES-16): interface→zone bindings plus the inbound
+/// ports each zone permits.
+///
+/// The overlay (trusted) zone accepts all overlay traffic and additionally pins
+/// KDE Connect's 1716 when this node runs `kdc_host` (KDC-MESH-3 #15 —
+/// overlay-only, so 1716 is NEVER on the public zone); the underlay (public) zone
+/// carries only the role-tight Nebula bootstrap ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZonePlan {
     /// `(interface, zone)` bindings to enforce with `--change-interface`.
@@ -288,21 +285,36 @@ pub struct ZonePlan {
     pub ports: Vec<(String, u16, &'static str)>,
 }
 
-/// Build the role's zone plan. `underlay_iface` is `None` when the
-/// physical NIC couldn't be determined (we still bind the overlay to
-/// trusted — that's the load-bearing W69 invariant and needs no underlay).
+/// Build the role's zone plan.
+///
+/// `underlay_iface` is `None` when the physical NIC couldn't be determined (we
+/// still bind the overlay to trusted — that's the load-bearing W69 invariant and
+/// needs no underlay). `runs_kdc` (KDC-MESH-3 #15) pins KDE Connect's 1716 on the
+/// OVERLAY zone when this node runs `kdc_host` — never on the public underlay zone.
 #[must_use]
 pub fn zone_plan(
     is_lighthouse: bool,
+    runs_kdc: bool,
     overlay_iface: &str,
     underlay_iface: Option<&str>,
 ) -> ZonePlan {
     let mut bindings = vec![(overlay_iface.to_string(), OVERLAY_ZONE.to_string())];
     let mut ports = Vec::new();
+    // KDC-MESH-3 (#15) — the KDE Connect link port (1716) opens on the OVERLAY
+    // (trusted) zone only, and NEVER on the public underlay zone: KDC-MESH-1's
+    // transport binds 1716 on the Nebula overlay IP, so a headless/lighthouse node
+    // running kdc_host keeps 1716 closed on the public boundary. The trusted zone
+    // already accepts all overlay traffic, but pinning 1716 explicitly makes the
+    // KDC overlay bind a documented, testable firewall contract that a future
+    // overlay-zone hardening can't silently close.
+    if runs_kdc {
+        ports.push((OVERLAY_ZONE.to_string(), KDC_OVERLAY_PORT, "tcp"));
+    }
     if let Some(under) = underlay_iface {
         bindings.push((under.to_string(), UNDERLAY_ZONE.to_string()));
-        // The same role-tight Nebula bootstrap ports the port preset opens,
-        // but scoped to the tight underlay zone (W70).
+        // The same role-tight Nebula bootstrap ports the port preset opens, but
+        // scoped to the tight underlay zone (W70). The KDC port is deliberately
+        // ABSENT here — overlay-only (design #15).
         for (port, proto) in desired_ports(is_lighthouse) {
             ports.push((UNDERLAY_ZONE.to_string(), port, proto));
         }
@@ -465,50 +477,6 @@ fn apply_preset(firewall_cmd: &str, ports: &[(u16, &'static str)]) -> Result<(),
     Ok(())
 }
 
-/// Shell out to `firewall-cmd --permanent --add-port <spec>` for each
-/// port-range spec (e.g. `1714-1764/tcp`) + a single `--reload`. Like
-/// [`apply_preset`] but for range specs (KDE Connect). Idempotent:
-/// `ALREADY_ENABLED` is treated as success.
-fn apply_port_specs(firewall_cmd: &str, specs: &[&str]) -> Result<(), String> {
-    if which(firewall_cmd).is_none() {
-        return Err(format!(
-            "{firewall_cmd} not on PATH; KDE Connect ports deferred until firewalld is installed"
-        ));
-    }
-    for spec in specs {
-        let mut cmd = std::process::Command::new(firewall_cmd);
-        cmd.args(["--permanent", "--add-port", spec]);
-        let out = crate::workers::proc::output_with_timeout(
-            cmd,
-            crate::workers::proc::DEFAULT_CMD_TIMEOUT,
-        )
-        .map_err(|e| format!("spawn {firewall_cmd} --add-port {spec}: {e}"))?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.contains("ALREADY_ENABLED") {
-                return Err(format!(
-                    "{firewall_cmd} --add-port {spec} failed: {}",
-                    stderr.trim()
-                ));
-            }
-        }
-    }
-    let mut reload = std::process::Command::new(firewall_cmd);
-    reload.arg("--reload");
-    let out = crate::workers::proc::output_with_timeout(
-        reload,
-        crate::workers::proc::DEFAULT_CMD_TIMEOUT,
-    )
-    .map_err(|e| format!("spawn {firewall_cmd} --reload: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "{firewall_cmd} --reload failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(())
-}
-
 /// Minimal `which`-style lookup over `$PATH`. Avoids pulling the
 /// `which` crate just for this single use.
 fn which(cmd: &str) -> Option<PathBuf> {
@@ -553,8 +521,9 @@ mod tests {
     #[test]
     fn zone_plan_always_binds_overlay_to_trusted() {
         // Even with no underlay discoverable, the W69 invariant holds:
-        // nebula1 → trusted, and nothing tightens the overlay.
-        let plan = zone_plan(false, OVERLAY_IFACE, None);
+        // nebula1 → trusted, and nothing tightens the overlay. (runs_kdc=false
+        // here; the KDC overlay port is exercised in its own test below.)
+        let plan = zone_plan(false, false, OVERLAY_IFACE, None);
         assert_eq!(plan.bindings, vec![("nebula1".into(), "trusted".into())]);
         assert!(plan.ports.is_empty(), "no underlay → no underlay ports");
     }
@@ -562,12 +531,12 @@ mod tests {
     #[test]
     fn zone_plan_tightens_underlay_per_role() {
         // Non-lighthouse: overlay→trusted, eth0→public with UDP/4242 only.
-        let node = zone_plan(false, OVERLAY_IFACE, Some("eth0"));
+        let node = zone_plan(false, false, OVERLAY_IFACE, Some("eth0"));
         assert_eq!(node.bindings[0], ("nebula1".into(), "trusted".into()));
         assert_eq!(node.bindings[1], ("eth0".into(), "public".into()));
         assert_eq!(node.ports, vec![("public".into(), 4242, "udp")]);
         // Lighthouse adds TCP/443 to the tight underlay zone (W70).
-        let lh = zone_plan(true, OVERLAY_IFACE, Some("eth0"));
+        let lh = zone_plan(true, false, OVERLAY_IFACE, Some("eth0"));
         assert_eq!(
             lh.ports,
             vec![
@@ -579,7 +548,7 @@ mod tests {
 
     #[test]
     fn zone_cmd_batches_render_change_interface_and_ports() {
-        let plan = zone_plan(true, OVERLAY_IFACE, Some("eth0"));
+        let plan = zone_plan(true, false, OVERLAY_IFACE, Some("eth0"));
         let batches = zone_cmd_batches(&plan);
         // overlay bind, underlay bind, then the two underlay ports.
         assert!(batches.contains(&vec![
@@ -678,18 +647,48 @@ mod tests {
     }
 
     #[test]
-    fn kde_connect_specs_cover_the_lan_range_tcp_and_udp() {
-        // KDC-INTEROP — the Workstation-only KDE Connect ports are the full
-        // 1714–1764 range over both TCP and UDP (discovery is UDP, links TCP).
-        assert_eq!(KDE_CONNECT_PORT_SPECS, &["1714-1764/tcp", "1714-1764/udp"]);
-    }
-
-    #[test]
-    fn apply_port_specs_skips_shell_for_empty_cmd() {
-        // Empty firewall_cmd → which() returns None → deferred (no panic, no
-        // shell-out), the same test-safe contract apply_preset honors.
-        let r = apply_port_specs("", KDE_CONNECT_PORT_SPECS);
-        assert!(r.is_err(), "empty cmd defers rather than shelling out");
+    fn kdc_1716_opens_on_the_overlay_zone_only_never_public() {
+        // KDC-MESH-3 (#15) — kdc_host is universal (rank 0) + overlay-only
+        // (KDC-MESH-1): 1716 opens on the trusted OVERLAY zone, NEVER on the public
+        // underlay zone, so a headless/lighthouse node running kdc_host keeps 1716
+        // closed on the public boundary (public stays default-deny for KDC).
+        for is_lighthouse in [false, true] {
+            let plan = zone_plan(is_lighthouse, /* runs_kdc */ true, OVERLAY_IFACE, Some("eth0"));
+            // 1716/tcp is present on the trusted (overlay) zone...
+            assert!(
+                plan.ports
+                    .contains(&(OVERLAY_ZONE.to_string(), KDC_OVERLAY_PORT, "tcp")),
+                "1716 must open on the overlay (trusted) zone"
+            );
+            // ...and the overlay iface is bound to that accept-all trusted zone.
+            assert!(plan
+                .bindings
+                .contains(&(OVERLAY_IFACE.to_string(), OVERLAY_ZONE.to_string())));
+            // The PUBLIC (underlay) zone carries ONLY the Nebula bootstrap ports —
+            // never 1716, and never any KDE Connect port (1714–1764). Public-deny.
+            for (zone, port, _) in &plan.ports {
+                if zone == UNDERLAY_ZONE {
+                    assert!(
+                        !(1714..=1764).contains(port),
+                        "no KDE Connect port may open on the public zone, saw {port}"
+                    );
+                }
+            }
+            assert!(
+                !plan
+                    .ports
+                    .iter()
+                    .any(|(zone, port, _)| zone == UNDERLAY_ZONE && *port == KDC_OVERLAY_PORT),
+                "1716 must NOT open on the public underlay zone"
+            );
+        }
+        // A node NOT running kdc_host opens no 1716 anywhere (defensive — kdc is
+        // universal now, but the plan honors the gate honestly).
+        let none = zone_plan(false, /* runs_kdc */ false, OVERLAY_IFACE, Some("eth0"));
+        assert!(
+            !none.ports.iter().any(|(_, port, _)| *port == KDC_OVERLAY_PORT),
+            "no kdc_host → no 1716 in any zone"
+        );
     }
 
     #[test]

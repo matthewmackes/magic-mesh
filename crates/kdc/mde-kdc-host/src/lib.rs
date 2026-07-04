@@ -46,7 +46,7 @@ pub use lan::{host_identity, LanConnection, LanTransport, KDC_TLS_PORT};
 pub use overlay::{
     overlay_bind_addr, resolve_overlay_ip, OverlayStatus, OverlayTransport, DEFAULT_OVERLAY_IP_PATH,
 };
-pub use pairing::{DeviceRecord, PairingStore};
+pub use pairing::{DeviceRecord, MeshPairing, PairingStore};
 pub use tls::{
     build_client_config, build_server_config, compute_fingerprint, connect_pinned_tls,
     ConnectError, FirstPairVerifier, PinnedFingerprintVerifier,

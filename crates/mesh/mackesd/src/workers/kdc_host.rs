@@ -56,7 +56,7 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use mde_kdc_host::error::HostError;
 use mde_kdc_host::pairing::{DeviceRecord, PairingStore};
-use mde_kdc_host::{EventStream, HostEvent, OverlayTransport, PeerId, Transport};
+use mde_kdc_host::{EventStream, HostEvent, MeshPairing, OverlayTransport, PeerId, Transport};
 use mde_kdc_proto::discovery::{Announce, DeviceType};
 use mde_kdc_proto::plugins::battery::BatteryBody;
 use serde_json::{json, Value};
@@ -1063,9 +1063,30 @@ fn run_shunt_tick(
     for (device_id, ip) in overlay.phones.iter().chain(overlay.hosts.iter()) {
         transport.set_peer_overlay_ip(device_id, *ip);
     }
+    // KDC-MESH-3 (design #5) — replicate neighbors' PAIRINGS into the local store
+    // so THIS node recognizes their phones without re-pairing. Own-row authority:
+    // `collect_pairings` skips our own file, `replace_synced` never republishes
+    // these, and a pin-less relay is dropped (honest gate). `replace_synced`
+    // converges recognition with the live mesh each tick — a pairing that leaves
+    // the substrate stops being recognized on the next pass.
+    let synced: Vec<MeshPairing> = super::mesh_shunt::collect_pairings(root, hostname)
+        .into_iter()
+        .map(|c| MeshPairing {
+            device_id: c.device_id,
+            device_name: c.device_name,
+            fingerprint: c.fingerprint,
+            paired_at_ms: c.paired_at_ms,
+            origin_host: c.origin_host,
+        })
+        .collect();
+    pairing.replace_synced(synced);
     // Republish THIS host's overlay identity + paired phones. Own-row authority:
-    // only our own paired phones, each tagged with its overlay IP when the (now
-    // updated) directory knows it — else `None`, an honest gate (not dialable).
+    // only our own paired phones (`records()` is the local `devices` map, never a
+    // synced pairing), each tagged with its overlay IP when the (now updated)
+    // directory knows it — else `None`, an honest gate (not dialable). KDC-MESH-3
+    // (#5): each row also carries our pinned cert fingerprint + paired-at so a
+    // neighbor recognizes the phone without re-pairing (the pin is the public cert
+    // hash, not a secret).
     let dir_snapshot: HashMap<String, IpAddr> = transport
         .peer_directory()
         .lock()
@@ -1078,6 +1099,8 @@ fn run_shunt_tick(
             device_id: r.device_id.clone(),
             device_name: r.device_name.clone(),
             overlay_ip: dir_snapshot.get(&r.device_id).map(IpAddr::to_string),
+            fingerprint: r.fingerprint.clone(),
+            paired_at_ms: r.paired_at_ms,
         })
         .collect();
     if let Err(e) = super::mesh_shunt::publish_roster(
@@ -2006,6 +2029,7 @@ mod tests {
                 device_id: "phone-1".into(),
                 device_name: "Pixel".into(),
                 overlay_ip: Some("10.42.0.77".into()),
+                ..Default::default()
             }],
         )
         .unwrap();
@@ -2069,6 +2093,79 @@ mod tests {
         let back = super::super::mesh_shunt::parse_roster(&raw).expect("our roster parses");
         assert_eq!(back.host_device_id, "hostB-devid");
         assert_eq!(back.host_overlay_ip.as_deref(), Some("10.42.0.5"));
+    }
+
+    // ── KDC-MESH-3 (#5): mesh-wide pairing replicates through the shunt tick ──
+
+    #[test]
+    fn kdc_mesh3_shunt_tick_replicates_a_neighbor_pairing_into_the_store() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let tmp = tempdir().unwrap();
+        let cfg = tmp.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        // THIS node has paired NOTHING locally (an honest, unsynced start).
+        let pairing = Arc::new(PairingStore::open(&cfg).unwrap());
+        assert!(!pairing.is_paired("phone-1"), "unsynced: honest gate, no trust");
+
+        let transport = OverlayTransport::new(local_announce(), Arc::clone(&pairing))
+            .with_overlay_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_listen_port(0);
+        let roster: Roster = Arc::new(Mutex::new(HashMap::new()));
+        let registry = std::sync::Mutex::new(mde_kdc_proto::discovery::DiscoveryRegistry::new());
+
+        // A neighbor (hostA) publishes phone-1 as a PAIRED device (carrying the pin
+        // from ITS TOFU) plus a pin-less name-relay phone-ghost.
+        let shared = tmp.path().join("shared");
+        super::super::mesh_shunt::publish_phones(
+            &shared,
+            "hostA",
+            &[
+                super::super::mesh_shunt::PublishedDevice {
+                    device_id: "phone-1".into(),
+                    device_name: "Pixel".into(),
+                    fingerprint: "AA:BB:CC".into(),
+                    paired_at_ms: 77,
+                    ..Default::default()
+                },
+                super::super::mesh_shunt::PublishedDevice {
+                    device_id: "phone-ghost".into(),
+                    device_name: "Ghost".into(),
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+
+        // THIS host's shunt tick folds neighbors' pairings into the local store.
+        let _ = run_shunt_tick(
+            &pairing,
+            &roster,
+            &shared,
+            "hostB",
+            &registry,
+            &transport,
+            HostOverlay {
+                device_id: "hostB-devid",
+                overlay_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 42, 0, 5))),
+            },
+        );
+
+        // phone-1 is now recognized mesh-wide WITHOUT a local pairing, carrying
+        // hostA's pin (so the transport enforces the same cert). phone-ghost (no
+        // pin) is NOT trusted — the honest gate.
+        assert!(pairing.is_paired("phone-1"), "the neighbor's pairing replicated in");
+        assert!(pairing.is_synced("phone-1"));
+        assert!(!pairing.is_locally_paired("phone-1"), "recognized via mesh, not own-row");
+        assert_eq!(pairing.get("phone-1").unwrap().fingerprint, "AA:BB:CC");
+        assert_eq!(pairing.synced_pairing("phone-1").unwrap().origin_host, "hostA");
+        assert!(!pairing.is_paired("phone-ghost"), "a pin-less relay stays untrusted");
+        // Own-row authority: we never republished the synced pairing as our own.
+        let raw = std::fs::read_to_string(
+            super::super::mesh_shunt::phones_dir(&shared).join("hostB.json"),
+        )
+        .unwrap();
+        let back = super::super::mesh_shunt::parse_roster(&raw).expect("our roster parses");
+        assert!(back.devices.is_empty(), "synced pairings are not republished");
     }
 
     #[test]
