@@ -2,9 +2,10 @@
 
 use thiserror::Error;
 
-/// Errors from the host layer (pairing store + event stream now; the transport
-/// later). Wraps the protocol crate's per-module errors alongside the host's own
-/// I/O, serialization, and key-generation failures.
+/// Errors from the host layer (pairing store, event stream, transport).
+///
+/// Wraps the protocol crate's per-module errors alongside the host's own I/O,
+/// serialization, and key-generation failures.
 #[derive(Debug, Error)]
 pub enum HostError {
     /// A filesystem operation on the pairing store failed.
@@ -32,6 +33,15 @@ pub enum HostError {
     /// isn't reachable).
     #[error("transport: {0}")]
     Transport(String),
+
+    /// KDC-MESH-1 — the node's Nebula **overlay IP** could not be resolved
+    /// (the node isn't on the mesh yet, or the publish file is missing/empty/
+    /// unparseable). The [`OverlayTransport`](crate::overlay::OverlayTransport)
+    /// is **unavailable** in this state and deliberately does NOT fall back to a
+    /// public / `0.0.0.0` / localhost bind — the honest gate (§7). The payload is
+    /// the human-readable reason.
+    #[error("overlay unresolved: {0}")]
+    OverlayUnresolved(String),
 
     /// RSA key generation or PKCS#8 / PKCS#1 encoding failed. The host owns
     /// keygen because the protocol crate intentionally ships none (ring 0.17 has

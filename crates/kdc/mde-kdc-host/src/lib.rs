@@ -32,6 +32,7 @@ pub mod event;
 pub mod first_pair;
 pub mod keygen;
 pub mod lan;
+pub mod overlay;
 pub mod pairing;
 pub mod session_persist;
 pub mod tls;
@@ -42,6 +43,9 @@ pub use error::HostError;
 pub use event::{EventSink, EventStream, HostEvent};
 pub use keygen::{generate_pkcs8, issue_identity_cert, KeygenError};
 pub use lan::{host_identity, LanConnection, LanTransport, KDC_TLS_PORT};
+pub use overlay::{
+    overlay_bind_addr, resolve_overlay_ip, OverlayStatus, OverlayTransport, DEFAULT_OVERLAY_IP_PATH,
+};
 pub use pairing::{DeviceRecord, PairingStore};
 pub use tls::{
     build_client_config, build_server_config, compute_fingerprint, connect_pinned_tls,

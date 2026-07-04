@@ -23,13 +23,19 @@
 //! `crates/legacy/mde-kdc{,-proto}` path-deps are gone and `cargo tree`
 //! shows one KDE Connect host (E2.2 acceptance #1/#2). **AUD-2 (2026-06-11):**
 //! the outbound drainer is live — `run_host` drains the `PendingSends` queue
-//! over the `LanTransport` once a second, so ring/sms/clipboard/share actually
+//! over the live transport once a second, so ring/sms/clipboard/share actually
 //! reach a paired device (end-to-end byte delivery is the 2-device bench).
+//!
+//! **KDC-MESH-1 (2026-07-04) — overlay-only transport.** `run_host` now runs the
+//! Nebula-overlay-only [`OverlayTransport`] instead of the LAN transport: the
+//! inbound TLS listener binds 1716 on this node's overlay IP (never `0.0.0.0`),
+//! peers are dialed by overlay IP, and there is no UDP broadcast discovery — all
+//! KDC traffic rides the encrypted overlay (design lock #3/#15). If the overlay
+//! IP can't be resolved the host serves the static roster (honest gate, §7).
 
 #![cfg(feature = "async-services")]
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -40,7 +46,7 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use mde_kdc_host::error::HostError;
 use mde_kdc_host::pairing::{DeviceRecord, PairingStore};
-use mde_kdc_host::{EventStream, HostEvent, LanTransport, PeerId, Transport, UdpDiscovery};
+use mde_kdc_host::{EventStream, HostEvent, OverlayTransport, PeerId, Transport};
 use mde_kdc_proto::discovery::{Announce, DeviceType};
 use mde_kdc_proto::plugins::battery::BatteryBody;
 use serde_json::{json, Value};
@@ -96,7 +102,7 @@ const TICK: Duration = Duration::from_secs(30);
 // `mde_kdc_proto::wire::Packet`. Intentionally simple — a `Mutex<Vec<...>>` —
 // because the throughput target is operator-scale (clicks per minute). The
 // `ring`/`sms`/`clipboard` verbs push here; a future `kdc_outbound` worker (or
-// the `LanTransport::send_to` path at the 2-device bench) drains it.
+// the `OverlayTransport::send_to` path at the 2-device bench) drains it.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One pending outbound send: a built `Packet` addressed to a paired device id.
@@ -130,7 +136,7 @@ impl PendingSends {
     }
 
     /// AUD-2 — drain the whole backlog (the `kdc_outbound` drainer takes these
-    /// + delivers each over the live `LanTransport`). Poison-tolerant.
+    /// + delivers each over the live `OverlayTransport`). Poison-tolerant.
     fn take_all(&self) -> Vec<OutboundSend> {
         std::mem::take(&mut *self.inner.lock().unwrap_or_else(PoisonError::into_inner))
     }
@@ -211,10 +217,11 @@ fn device_json(d: &DeviceRecord) -> Value {
 // ─────────────────────────────────────────────────────────────────────────────
 // Live device roster (E2.3 — the host that was the shell's `mde connect` daemon)
 //
-// The worker runs the canonical `LanTransport` (UDP discovery + the inbound TLS
-// listener) and folds its `HostEvent`s into this roster — online/battery/name —
-// which it publishes on `action/connect/devices`. The shell surfaces become
-// pure clients of the daemon's roster (one host, owned + supervised by mackesd).
+// The worker runs the canonical `OverlayTransport` (overlay-bound inbound TLS
+// listener; no UDP broadcast) and folds its `HostEvent`s into this roster —
+// online/battery/name — which it publishes on `action/connect/devices`. The
+// shell surfaces become pure clients of the daemon's roster (one host, owned +
+// supervised by mackesd).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// One paired peer as the surfaces see it (the published roster row).
@@ -515,9 +522,10 @@ fn roster_json(roster: &Roster) -> String {
     serde_json::to_string(&wires).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// Run the KDE Connect LAN host (UDP discovery + the inbound TLS listener) over
-/// the shared pairing store, folding its events into `roster`. Best-effort: a
-/// discovery-bind or transport-start failure logs + returns, leaving the worker
+/// Run the KDE Connect host over the Nebula-overlay-only [`OverlayTransport`]
+/// (the inbound TLS listener bound on this node's overlay IP) against the shared
+/// pairing store, folding its events into `roster`. Best-effort: an unresolved
+/// overlay IP or a transport-start failure logs + returns, leaving the worker
 /// serving the seeded (static) roster — never fails worker startup.
 async fn run_host(
     pairing: Arc<PairingStore>,
@@ -526,19 +534,19 @@ async fn run_host(
     config_dir: PathBuf,
 ) {
     let announce = local_announce();
-    let bind = SocketAddr::from(([0, 0, 0, 0], KDC_PORT));
-    let discovery = match UdpDiscovery::bind(bind, announce.clone()).await {
-        Ok(d) => d,
-        Err(e) => {
-            warn!(error = %e, port = KDC_PORT, "kdc-host: UDP bind failed; serving static roster");
-            return;
-        }
-    };
+    // KDC-MESH-1 — the Nebula-overlay-ONLY transport. The inbound TLS listener
+    // binds 1716 on THIS node's overlay IP (resolved from the canonical
+    // `/var/lib/mackesd/nebula/overlay-ip`, the QC-6 / `sshd_overlay_bind`
+    // source), never `0.0.0.0` / the public NIC, and it dials peers/phones by
+    // overlay IP — no LAN direct, no UDP broadcast (design lock #3/#15). Honest
+    // gate: if the overlay IP can't be resolved (node not on the mesh yet) the
+    // transport is unavailable and we keep serving the seeded (static) roster
+    // rather than fall back to a public/localhost bind.
     let transport =
-        LanTransport::new(announce, discovery, Arc::clone(&pairing)).with_listen_addr(bind);
+        OverlayTransport::new(announce, Arc::clone(&pairing)).with_listen_port(KDC_PORT);
     let (sink, mut stream) = EventStream::channel();
     if let Err(e) = transport.start(sink).await {
-        warn!(error = %e, "kdc-host: transport start failed; serving static roster");
+        warn!(error = %e, "kdc-host: overlay transport unavailable; serving static roster");
         return;
     }
     // SEC-5 — the mesh-shunt: publish this peer's paired phones to the
@@ -550,8 +558,8 @@ async fn run_host(
     let shunt_registry = std::sync::Mutex::new(mde_kdc_proto::discovery::DiscoveryRegistry::new());
     let mut shunt_tick = tokio::time::interval(super::mesh_shunt::TICK);
     // AUD-2 — the kdc_outbound drainer: every second, take the operator-queued
-    // ring/sms/clipboard/share packets and deliver each over the live
-    // LanTransport to its paired device. Failures (device offline / not yet
+    // ring/sms/clipboard/share packets and deliver each over the live overlay
+    // transport to its paired device. Failures (device offline / not yet
     // connected) are logged, not retried — operator actions are fire-and-forget.
     let mut drain_tick = tokio::time::interval(OUTBOUND_DRAIN);
     loop {
@@ -648,7 +656,7 @@ async fn run_host(
 /// a confirmation prompt can layer on later via the Connect panel.
 async fn accept_pair(
     pairing: &Arc<PairingStore>,
-    transport: &LanTransport,
+    transport: &OverlayTransport,
     roster: &Roster,
     peer: &PeerId,
 ) {
@@ -824,7 +832,7 @@ fn execute_runcommand(cmds: &[RunCmd], key: &str) -> String {
 /// runs off the reactor thread (`spawn_blocking`) so a slow command can't stall
 /// the host event loop.
 async fn handle_runcommand(
-    transport: &LanTransport,
+    transport: &OverlayTransport,
     config_dir: &std::path::Path,
     peer: &PeerId,
     body: &Value,
@@ -882,7 +890,7 @@ fn local_battery_body() -> BatteryBody {
 }
 
 /// Answer a `kdeconnect.battery.request` with this host's live snapshot.
-async fn handle_battery_request(transport: &LanTransport, peer: &PeerId) {
+async fn handle_battery_request(transport: &OverlayTransport, peer: &PeerId) {
     let body = local_battery_body();
     let pkt = build_packet(
         "kdeconnect.battery",
@@ -1264,9 +1272,9 @@ impl Worker for KdcHostWorker {
 
         // E2.3 — the single, supervised KDE Connect host. Seed the published
         // roster from the store (paired peers, offline), then run the live
-        // `LanTransport` (UDP discovery + inbound TLS listener) as a task on the
+        // `OverlayTransport` (overlay-bound inbound TLS listener) as a task on the
         // supervisor runtime, folding its events into the roster. Best-effort:
-        // a bind/start failure leaves the seeded (static) roster served.
+        // an unresolved overlay / start failure leaves the seeded (static) roster served.
         let roster: Roster = Arc::new(Mutex::new(seed_roster(&pairing_arc)));
         let host_task = tokio::spawn(run_host(
             Arc::clone(&pairing_arc),

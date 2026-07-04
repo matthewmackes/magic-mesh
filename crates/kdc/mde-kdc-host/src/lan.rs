@@ -320,35 +320,18 @@ impl LanTransport {
     /// spawn its accept loop. Called by `start` when a listen addr is configured; a bind
     /// failure is surfaced (not fatal — outbound still works).
     async fn spawn_listener(&self, addr: SocketAddr, events: EventSink) -> Result<(), HostError> {
-        let (cert, pkcs8) = host_identity(&self.pairing, &self.announce.device_id)?;
-        // KDE-Connect inbound role (KDC-INTEROP): the device that *accepts* the TCP
-        // connection is the TLS **client** — the connecting peer (the phone) sends its
-        // plaintext `kdeconnect.identity` first, then becomes the TLS **server**. So we
-        // build our mutual-TLS *client* config (presents our identity cert; accepts any
-        // server cert — trust-on-first-use, pinned at pair time), NOT a server config.
-        // The old code did `TlsAcceptor::accept` here and read the phone's plaintext
-        // identity as a TLS record → instant fatal alert, so no stock device ever paired.
-        let client_cfg = tls::build_client_config_with_identity(None, &cert, &pkcs8)
-            .ok_or_else(|| HostError::Transport("client_config".into()))?;
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| HostError::Transport(format!("bind: {e}")))?;
-        let bound = listener
-            .local_addr()
-            .map_err(|e| HostError::Transport(format!("local_addr: {e}")))?;
-        *self.bound_addr.lock().await = Some(bound);
-        let (stop_tx, stop_rx) = oneshot::channel();
-        *self.listen_shutdown.lock().await = Some(stop_tx);
-        *self.listen_task.lock().await = Some(tokio::spawn(run_listener(
-            listener,
-            Arc::new(client_cfg),
+        let handles = spawn_inbound_listener(
+            addr,
             Arc::new(self.announce.clone()),
             Arc::clone(&self.pairing),
             Arc::clone(&self.inbound),
             Arc::clone(&self.fingerprints),
             events,
-            stop_rx,
-        )));
+        )
+        .await?;
+        *self.bound_addr.lock().await = Some(handles.bound);
+        *self.listen_shutdown.lock().await = Some(handles.stop_tx);
+        *self.listen_task.lock().await = Some(handles.task);
         Ok(())
     }
 
@@ -453,6 +436,64 @@ pub fn host_identity(
     let cert = keygen::issue_identity_cert(&pkcs8, device_id)
         .map_err(|e| HostError::Transport(format!("identity cert: {e}")))?;
     Ok((cert, pkcs8))
+}
+
+/// The live handles for a spawned inbound listener: the bound address (ephemeral port
+/// resolved), the one-shot stop sender, and the accept-loop join handle. Both the LAN
+/// transport and the overlay transport ([`crate::overlay::OverlayTransport`]) drive the
+/// same inbound KDE-Connect handshake through this, differing only in the bind address.
+pub(crate) struct InboundListener {
+    pub bound: SocketAddr,
+    pub stop_tx: oneshot::Sender<()>,
+    pub task: JoinHandle<()>,
+}
+
+/// Bind the KDE-Connect inbound TLS listener on `addr` and spawn its accept loop, returning
+/// the [`InboundListener`] handles. Shared by [`LanTransport`] (binds `0.0.0.0`) and
+/// [`crate::overlay::OverlayTransport`] (binds the resolved **overlay IP** only) so the
+/// stock-KDE-Connect inbound handshake (plaintext identity → TLS-as-client → fingerprint
+/// pin) lives in exactly one place. A bind failure is returned as a
+/// [`HostError::Transport`]; the caller decides whether that is fatal.
+pub(crate) async fn spawn_inbound_listener(
+    addr: SocketAddr,
+    announce: Arc<Announce>,
+    pairing: Arc<PairingStore>,
+    inbound: Arc<AsyncMutex<HashMap<String, Box<dyn Connection>>>>,
+    fingerprints: Arc<AsyncMutex<HashMap<String, String>>>,
+    events: EventSink,
+) -> Result<InboundListener, HostError> {
+    // KDE-Connect inbound role (KDC-INTEROP): the device that *accepts* the TCP
+    // connection is the TLS **client** — the connecting peer (the phone) sends its
+    // plaintext `kdeconnect.identity` first, then becomes the TLS **server**. So we
+    // build our mutual-TLS *client* config (presents our identity cert; accepts any
+    // server cert — trust-on-first-use, pinned at pair time), NOT a server config.
+    // The old code did `TlsAcceptor::accept` here and read the phone's plaintext
+    // identity as a TLS record → instant fatal alert, so no stock device ever paired.
+    let (cert, pkcs8) = host_identity(&pairing, &announce.device_id)?;
+    let client_cfg = tls::build_client_config_with_identity(None, &cert, &pkcs8)
+        .ok_or_else(|| HostError::Transport("client_config".into()))?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| HostError::Transport(format!("bind: {e}")))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|e| HostError::Transport(format!("local_addr: {e}")))?;
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let task = tokio::spawn(run_listener(
+        listener,
+        Arc::new(client_cfg),
+        announce,
+        pairing,
+        inbound,
+        fingerprints,
+        events,
+        stop_rx,
+    ));
+    Ok(InboundListener {
+        bound,
+        stop_tx,
+        task,
+    })
 }
 
 /// Accept inbound peer links until `stop` fires. Each accepted TCP connection is handed to
