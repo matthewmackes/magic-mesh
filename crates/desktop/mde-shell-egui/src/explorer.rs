@@ -86,7 +86,8 @@
     clippy::suboptimal_flops
 )]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -174,6 +175,25 @@ const MEM_FULL_SCALE: f32 = 100.0;
 /// idle line reads low, and let a real peak above it expand the axis (never
 /// clipped) rather than pinning to a fabricated maximum.
 const LOAD_REF_CEIL: f32 = 1.0;
+
+// ── IPAM table mode (EXPLORER-10, design E7) ──
+/// The prefix length every discovered address is aggregated under: the /24
+/// broadcast-domain granularity (the conventional subnet unit the aggregator's
+/// L2/L3-adjacency edges already reason in). A live-discovered *view*, not a
+/// manual netmask allocation (E3) — the network is the source of truth.
+const IPAM_PREFIX_BITS: u32 = 24;
+/// Usable host addresses in a /24 (256 minus the network + broadcast) — the
+/// denominator for the honest free/used capacity readout.
+const IPAM_USABLE_PER_24: usize = 254;
+/// One IPAM table row's height (a productive-density row — one L grid step).
+const IPAM_ROW_H: f32 = Style::SP_L;
+/// The fixed address column width — wide enough for a full dotted-quad in the
+/// mono face. A §4-grid behaviour param, not a scattered px.
+const IPAM_ADDR_COL: f32 = Style::SP_XL * 4.0;
+/// The fixed type-badge column width (right-aligned).
+const IPAM_TYPE_COL: f32 = Style::SP_XL * 3.0;
+/// The prefix-capacity meter width (used/free bar in the prefix header).
+const IPAM_BAR_W: f32 = Style::SP_XL * 3.0;
 
 // ─────────────────────────── wire mirrors (§6) ───────────────────────────
 
@@ -873,6 +893,189 @@ fn section_for(edge: &Edge, neighbor: &Unit) -> (u8, String) {
     }
 }
 
+// ─────────────────── IPAM prefix aggregation (EXPLORER-10, E7) ───────────────────
+
+/// One occupied address within a discovered prefix — a unit that reported an IPv4
+/// address in this /24. Carries what the row renders + the id the row-click jumps
+/// to. Real discovery only (§7): a unit with no address is never a phantom slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IpamOccupant {
+    /// The occupant's IPv4 address.
+    addr: Ipv4Addr,
+    /// The occupant unit's id — the hero the row jumps to.
+    unit_id: String,
+    /// The occupant unit's display name.
+    name: String,
+    /// The occupant's kind (drives the type badge + category accent).
+    kind: UnitKind,
+}
+
+/// One discovered subnet/prefix in the IPAM table (design E7): a /24 the fold
+/// derived purely from occupant addresses, its occupants, and the category it
+/// reads as. A **live-discovered mirror** — no manual allocation, no CIDR the
+/// network didn't tell us (E3). The gateway + capacity are conventional derivations
+/// over the /24, honest about what's real (occupants) vs conventional (the .1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IpamPrefix {
+    /// The /24 network address (last octet zeroed).
+    network: Ipv4Addr,
+    /// The proximity category (from the dominant occupant kind) — the accent.
+    category: Category,
+    /// A discovered tenant-net name, when a `CloudAttach` edge links an occupant
+    /// to a `cloud:network` unit on the shelf (EXPLORER-7). `None` for mesh/LAN
+    /// prefixes (no network object to name them). Never fabricated (§7).
+    label: Option<String>,
+    /// The occupants, ordered by address then id.
+    occupants: Vec<IpamOccupant>,
+}
+
+impl IpamPrefix {
+    /// The CIDR string, e.g. `10.42.0.0/24`.
+    fn cidr(&self) -> String {
+        format!("{}/{IPAM_PREFIX_BITS}", self.network)
+    }
+
+    /// The conventional gateway address — the prefix's first host (`.1`). A derived
+    /// convention (what every IPAM tool shows), not a probed fact.
+    const fn gateway(&self) -> Ipv4Addr {
+        let o = self.network.octets();
+        Ipv4Addr::new(o[0], o[1], o[2], 1)
+    }
+
+    /// The count of **distinct** occupied addresses (two units on one address count
+    /// once) — the honest "used" tally.
+    fn used(&self) -> usize {
+        let mut n = 0;
+        let mut prev: Option<Ipv4Addr> = None;
+        for o in &self.occupants {
+            if prev != Some(o.addr) {
+                n += 1;
+                prev = Some(o.addr);
+            }
+        }
+        n
+    }
+
+    /// The free host count over the /24's usable range (never underflows).
+    fn free(&self) -> usize {
+        IPAM_USABLE_PER_24.saturating_sub(self.used())
+    }
+}
+
+/// Parse a unit address to an IPv4, tolerating a `/mask` CIDR suffix or a `:port`
+/// tail and surrounding whitespace; `None` for an absent / IPv6 / unparseable
+/// address (those units simply don't occupy an IPv4 prefix — honest, not faked).
+fn parse_ipv4(addr: &str) -> Option<Ipv4Addr> {
+    let head = addr.trim();
+    let head = head.split('/').next().unwrap_or(head);
+    if let Ok(ip) = head.parse::<Ipv4Addr>() {
+        return Some(ip);
+    }
+    head.rsplit_once(':')
+        .and_then(|(h, _)| h.parse::<Ipv4Addr>().ok())
+}
+
+/// The /24 network address an IPv4 falls in (last octet zeroed).
+const fn slash24(ip: Ipv4Addr) -> Ipv4Addr {
+    let o = ip.octets();
+    Ipv4Addr::new(o[0], o[1], o[2], 0)
+}
+
+/// The proximity category a prefix reads as: the most common occupant category,
+/// tie-broken toward proximity order (mesh → LAN → cloud) so a mixed prefix is
+/// deterministic.
+fn dominant_category(occupants: &[IpamOccupant]) -> Category {
+    let mut counts = [0usize; 3];
+    for o in occupants {
+        counts[o.kind.category().index()] += 1;
+    }
+    let mut best = Category::Mesh;
+    let mut best_n = 0usize;
+    for cat in Category::ALL {
+        if counts[cat.index()] > best_n {
+            best_n = counts[cat.index()];
+            best = cat;
+        }
+    }
+    best
+}
+
+/// A discovered tenant-net name for `occupants`, from the EXPLORER-7 edge set: the
+/// first `CloudAttach` edge that links an occupant to a `cloud:network` unit on the
+/// shelf. Occupants + edges are pre-sorted so the pick is deterministic. `None`
+/// when no network object names the prefix (mesh/LAN) — never invented (§7).
+fn network_label(
+    occupants: &[IpamOccupant],
+    edges: &[Edge],
+    by_id: &HashMap<&str, &Unit>,
+) -> Option<String> {
+    for occ in occupants {
+        for edge in edges {
+            if edge.kind != EdgeKind::CloudAttach {
+                continue;
+            }
+            let other = if edge.from == occ.unit_id {
+                &edge.to
+            } else if edge.to == occ.unit_id {
+                &edge.from
+            } else {
+                continue;
+            };
+            if let Some(net) = by_id.get(other.as_str()) {
+                if net.kind == UnitKind::Network {
+                    return Some(net.name.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Aggregate the folded unit shelf (+ the EXPLORER-7 edges) into the IPAM table:
+/// every /24 an addressed unit occupies, its occupants, capacity, and — for a
+/// tenant net — its discovered name. Pure over the fold (no probe, no allocation),
+/// so the aggregation + occupancy are unit-tested without a Bus or a render.
+fn derive_prefixes(units: &[Unit], edges: &[Edge]) -> Vec<IpamPrefix> {
+    let by_id: HashMap<&str, &Unit> = units.iter().map(|u| (u.id.as_str(), u)).collect();
+    let mut buckets: BTreeMap<Ipv4Addr, Vec<IpamOccupant>> = BTreeMap::new();
+    for unit in units {
+        let Some(addr) = unit.address.as_deref().and_then(parse_ipv4) else {
+            continue;
+        };
+        buckets
+            .entry(slash24(addr))
+            .or_default()
+            .push(IpamOccupant {
+                addr,
+                unit_id: unit.id.clone(),
+                name: unit.name.clone(),
+                kind: unit.kind,
+            });
+    }
+    let mut prefixes: Vec<IpamPrefix> = buckets
+        .into_iter()
+        .map(|(network, mut occupants)| {
+            occupants.sort_by(|a, b| a.addr.cmp(&b.addr).then_with(|| a.unit_id.cmp(&b.unit_id)));
+            let category = dominant_category(&occupants);
+            let label = network_label(&occupants, edges, &by_id);
+            IpamPrefix {
+                network,
+                category,
+                label,
+                occupants,
+            }
+        })
+        .collect();
+    // Proximity order (mesh → LAN → cloud), then by network address.
+    prefixes.sort_by(|a, b| {
+        a.category
+            .index()
+            .cmp(&b.category.index())
+            .then_with(|| a.network.cmp(&b.network))
+    });
+    prefixes
+}
+
 // ─────────────────────────── text helpers ───────────────────────────
 
 /// The reachability line (#10): "In mesh" / "On LAN" / "Cloud object · <node>",
@@ -1138,6 +1341,18 @@ fn push_bounded(ring: &mut VecDeque<f32>, v: f32) {
 
 // ─────────────────────────── the surface state ───────────────────────────
 
+/// Which surface mode the Explorer renders (design O1's three modes; the mosaic
+/// overview is EXPLORER-11). EXPLORER-10 adds the **IPAM** address table beside the
+/// hero card, toggled from the header — the category filter chips scope both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SurfaceMode {
+    /// The one-unit-at-a-time hero card (EXPLORER-3) — the default landing.
+    #[default]
+    Hero,
+    /// The NetBox-style discovered prefix/IP table (EXPLORER-10).
+    Ipam,
+}
+
 /// The Discovery-surface hero-card state (EXPLORER-3): the folded unit shelf, the
 /// focused index, the active category filter, and the Bus read seam.
 pub struct ExplorerState {
@@ -1167,6 +1382,8 @@ pub struct ExplorerState {
     arm: Option<ArmedVerb>,
     /// The last verb's honest inline note (`true` ⇒ an error/gated reason).
     last_action_note: Option<(String, bool)>,
+    /// The active surface mode — the hero card or the IPAM table (EXPLORER-10).
+    mode: SurfaceMode,
 }
 
 impl Default for ExplorerState {
@@ -1187,6 +1404,7 @@ impl Default for ExplorerState {
             }),
             arm: None,
             last_action_note: None,
+            mode: SurfaceMode::default(),
         }
     }
 }
@@ -1357,6 +1575,27 @@ impl ExplorerState {
             self.arm = None;
             self.last_action_note = None;
         }
+    }
+
+    // ─────────────────── the IPAM table mode (EXPLORER-10) ───────────────────
+
+    /// The discovered prefix/IP table for the current view: every /24 an addressed
+    /// unit occupies, scoped by the active category filter (the same chips that
+    /// scope the hero shelf). Pure over the folded state — the render's data model,
+    /// unit-tested without a Bus.
+    fn ipam_prefixes(&self) -> Vec<IpamPrefix> {
+        derive_prefixes(&self.units, &self.edges)
+            .into_iter()
+            .filter(|p| self.filter.is_none_or(|c| p.category == c))
+            .collect()
+    }
+
+    /// A row-click in the IPAM table: return to the hero card and jump its focus to
+    /// the occupant unit — reusing the surface's ONE focus-set/jump path
+    /// ([`Self::jump_to_id`], which also clears a hiding filter so the jump lands).
+    fn jump_from_ipam(&mut self, id: &str) {
+        self.mode = SurfaceMode::Hero;
+        self.jump_to_id(id);
     }
 
     // ─────────────────── the per-type action bar (EXPLORER-5) ───────────────────
@@ -1592,10 +1831,14 @@ impl ExplorerState {
         });
     }
 
-    /// Render the hero-card surface (chips · hero · filmstrip). The one public
-    /// entry the mount drives per frame.
+    /// Render the surface: the mode toggle + category chips header, then the active
+    /// mode (hero card · filmstrip, or the IPAM table). The one public entry the
+    /// mount drives per frame.
     pub fn show(&mut self, ui: &mut egui::Ui) {
-        self.handle_keys(ui);
+        // Hero paging keys only steer the hero mode.
+        if self.mode == SurfaceMode::Hero {
+            self.handle_keys(ui);
+        }
         // Keep focus valid against the freshest (possibly re-filtered) view.
         let count = self.hero_count();
         self.focus = if count == 0 {
@@ -1606,13 +1849,38 @@ impl ExplorerState {
 
         egui::TopBottomPanel::top(ui.id().with("explorer-chips"))
             .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
-            .show_inside(ui, |ui| self.chips(ui));
-        egui::TopBottomPanel::bottom(ui.id().with("explorer-strip"))
-            .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
-            .show_inside(ui, |ui| self.filmstrip(ui));
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show_inside(ui, |ui| self.hero(ui));
+            .show_inside(ui, |ui| self.header(ui));
+        match self.mode {
+            SurfaceMode::Hero => {
+                egui::TopBottomPanel::bottom(ui.id().with("explorer-strip"))
+                    .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+                    .show_inside(ui, |ui| self.filmstrip(ui));
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show_inside(ui, |ui| self.hero(ui));
+            }
+            SurfaceMode::Ipam => {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+                    .show_inside(ui, |ui| self.ipam_table(ui));
+            }
+        }
+    }
+
+    /// The header: the Hero ⇄ IPAM mode toggle (EXPLORER-10), then the category
+    /// filter chips (#8) that scope whichever mode is active.
+    fn header(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = Style::SP_S;
+            if chip(ui, "Hero", self.mode == SurfaceMode::Hero, Style::ACCENT) {
+                self.mode = SurfaceMode::Hero;
+            }
+            if chip(ui, "IPAM", self.mode == SurfaceMode::Ipam, Style::ACCENT) {
+                self.mode = SurfaceMode::Ipam;
+            }
+        });
+        ui.add_space(Style::SP_XS);
+        self.chips(ui);
     }
 
     /// Left/Right (and Home/End) paging (#6, O6 D-pad-first). Consumed from this
@@ -1839,6 +2107,52 @@ impl ExplorerState {
             });
         });
     }
+
+    /// The IPAM table mode (EXPLORER-10, design E7): a NetBox-style live address
+    /// table over the discovered prefixes — each /24 an addressed unit occupies,
+    /// its occupants, free/used capacity, and gateway. Rows jump the hero focus to
+    /// the occupant. Honest-empty when nothing is addressed yet (§7).
+    fn ipam_table(&mut self, ui: &mut egui::Ui) {
+        let prefixes = self.ipam_prefixes();
+        if prefixes.is_empty() {
+            ui.add_space(Style::SP_L);
+            let note = self.filter.map_or_else(
+                || {
+                    "No addressed units discovered yet — the table fills as units \
+                     report their addresses."
+                        .to_string()
+                },
+                |cat| format!("No {} prefixes discovered yet.", cat.label()),
+            );
+            muted_note(ui, note);
+            return;
+        }
+        let mut jump: Option<String> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for prefix in &prefixes {
+                    ipam_prefix_header(ui, prefix);
+                    ipam_column_header(ui);
+                    if prefix.occupants.is_empty() {
+                        // A discovered prefix with no occupants stays honestly empty
+                        // rather than faking a full table (§7).
+                        muted_note(ui, "No occupants discovered in this prefix.");
+                    } else {
+                        let gw = prefix.gateway();
+                        for (row, occ) in prefix.occupants.iter().enumerate() {
+                            if ipam_address_row(ui, occ, gw, row % 2 == 0) {
+                                jump = Some(occ.unit_id.clone());
+                            }
+                        }
+                    }
+                    ui.add_space(Style::SP_M);
+                }
+            });
+        if let Some(id) = jump {
+            self.jump_from_ipam(&id);
+        }
+    }
 }
 
 /// Synthesise this node's own hero unit for the honest empty state (#23) — a real
@@ -2014,6 +2328,185 @@ fn truncate(s: &str, max: usize) -> String {
         let head: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{head}…")
     }
+}
+
+// ─────────────────── IPAM table render (EXPLORER-10) ───────────────────
+
+/// The flexible occupant-name column width: the row less the fixed address + type
+/// columns and the leading indent, floored so a narrow surface still shows a name.
+fn ipam_name_col_w(avail: f32) -> f32 {
+    (avail - Style::SP_M - IPAM_ADDR_COL - IPAM_TYPE_COL).max(Style::SP_XL * 2.0)
+}
+
+/// A rough char budget for a name column of `width` at the body face — keeps a long
+/// name inside its cell rather than overrunning the type column.
+fn ipam_name_budget(width: f32) -> usize {
+    ((width / (Style::BODY * 0.6)) as usize).max(6)
+}
+
+/// A dim small-face `RichText` for a table caption / column header.
+fn ipam_dim(text: &str) -> RichText {
+    RichText::new(text)
+        .size(Style::SMALL)
+        .color(Style::TEXT_DIM)
+}
+
+/// A fixed-width table cell holding one left-aligned label (keeps the columns
+/// aligned across every prefix's rows).
+fn ipam_cell(ui: &mut egui::Ui, width: f32, text: RichText) {
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, IPAM_ROW_H),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.label(text);
+        },
+    );
+}
+
+/// The prefix header band (design E7): the CIDR + category badge + discovered
+/// tenant-net label on the left; the capacity meter, free/used tally, and gateway
+/// on the right. A subtle `SURFACE_HI` band with a category-accent tab.
+fn ipam_prefix_header(ui: &mut egui::Ui, p: &IpamPrefix) {
+    let accent = p.category.accent();
+    // Reserve the band + accent-tab slots so they paint BEHIND the row content.
+    let band = ui.painter().add(egui::Shape::Noop);
+    let tab = ui.painter().add(egui::Shape::Noop);
+    let rect = ui
+        .horizontal(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.set_min_height(IPAM_ROW_H);
+            ui.add_space(Style::SP_S);
+            ui.label(
+                RichText::new(p.cidr())
+                    .monospace()
+                    .strong()
+                    .color(Style::TEXT),
+            );
+            ui.label(
+                RichText::new(p.category.label())
+                    .size(Style::SMALL)
+                    .color(accent)
+                    .background_color(Style::SURFACE),
+            );
+            if let Some(label) = &p.label {
+                ui.label(ipam_dim(&format!("· {label}")));
+            }
+            // The right cluster: gateway · free/used · capacity meter.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(Style::SP_S);
+                let gw = p.gateway();
+                let gw_txt = p
+                    .occupants
+                    .iter()
+                    .find(|o| o.addr == gw)
+                    .map_or_else(|| format!("gw {gw}"), |o| format!("gw {gw} · {}", o.name));
+                ui.label(
+                    RichText::new(gw_txt)
+                        .monospace()
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.add_space(Style::SP_M);
+                ui.label(ipam_dim(&format!("{} used · {} free", p.used(), p.free())));
+                ui.add_space(Style::SP_S);
+                used_free_bar(ui, p.used(), accent);
+            });
+        })
+        .response
+        .rect;
+    ui.painter().set(
+        band,
+        egui::Shape::rect_filled(rect, Style::RADIUS * 0.5, Style::SURFACE_HI),
+    );
+    let tab_rect = Rect::from_min_max(rect.min, egui::pos2(rect.min.x + Style::SP_XS, rect.max.y));
+    ui.painter()
+        .set(tab, egui::Shape::rect_filled(tab_rect, 0.0, accent));
+}
+
+/// The slim column-header row under a prefix band (Address · Occupant · Type),
+/// aligned to the address rows' fixed columns.
+fn ipam_column_header(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        let name_w = ipam_name_col_w(ui.available_width());
+        ui.add_space(Style::SP_M);
+        ipam_cell(ui, IPAM_ADDR_COL, ipam_dim("Address"));
+        ipam_cell(ui, name_w, ipam_dim("Occupant"));
+        ipam_cell(ui, IPAM_TYPE_COL, ipam_dim("Type"));
+    });
+}
+
+/// One occupied-address row: the address (mono; the gateway host accent-tinted),
+/// the occupant name (a link-toned jump affordance), and its type badge. Zebra
+/// banded, hover-highlit, and clickable — a click jumps the hero focus to the
+/// occupant. Returns whether it was clicked.
+fn ipam_address_row(ui: &mut egui::Ui, occ: &IpamOccupant, gw: Ipv4Addr, zebra: bool) -> bool {
+    let accent = occ.kind.category().accent();
+    let is_gw = occ.addr == gw;
+    // Reserve the zebra band slot so it paints BEHIND the row content.
+    let band = ui.painter().add(egui::Shape::Noop);
+    let resp = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.set_min_width(ui.available_width());
+            let name_w = ipam_name_col_w(ui.available_width());
+            ui.add_space(Style::SP_M);
+            ipam_cell(
+                ui,
+                IPAM_ADDR_COL,
+                RichText::new(occ.addr.to_string())
+                    .monospace()
+                    .color(if is_gw { accent } else { Style::TEXT }),
+            );
+            ipam_cell(
+                ui,
+                name_w,
+                RichText::new(truncate(&occ.name, ipam_name_budget(name_w)))
+                    .size(Style::BODY)
+                    .color(Style::ACCENT_HI),
+            );
+            ipam_cell(
+                ui,
+                IPAM_TYPE_COL,
+                RichText::new(occ.kind.label())
+                    .size(Style::SMALL)
+                    .color(accent),
+            );
+        })
+        .response
+        .interact(Sense::click());
+    let fill = if resp.hovered() {
+        Style::SURFACE_HI
+    } else if zebra {
+        Style::SURFACE
+    } else {
+        Style::BG
+    };
+    ui.painter().set(
+        band,
+        egui::Shape::rect_filled(resp.rect, Style::RADIUS * 0.5, fill),
+    );
+    resp.on_hover_text(format!("Jump to {}", occ.name))
+        .clicked()
+}
+
+/// The prefix capacity meter: a thin bar with the used fraction of the /24 filled
+/// in the category accent over a surface track (the honest used/free ratio).
+fn used_free_bar(ui: &mut egui::Ui, used: usize, accent: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(IPAM_BAR_W, Style::SP_S), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, Style::RADIUS * 0.5, Style::SURFACE);
+    let frac = (used as f32 / IPAM_USABLE_PER_24 as f32).clamp(0.0, 1.0);
+    if frac > 0.0 {
+        let fill = Rect::from_min_size(rect.min, Vec2::new(rect.width() * frac, rect.height()));
+        painter.rect_filled(fill, Style::RADIUS * 0.5, accent);
+    }
+    painter.rect_stroke(
+        rect,
+        Style::RADIUS * 0.5,
+        Stroke::new(1.0, Style::BORDER),
+        StrokeKind::Inside,
+    );
 }
 
 /// The hero card body (#9/#10/#11/#12): the status ring + type glyph, the
@@ -2379,6 +2872,7 @@ mod tests {
                 action_sink: Box::new(BusActions { bus_root: None }),
                 arm: None,
                 last_action_note: None,
+                mode: SurfaceMode::default(),
             };
             s.refresh();
             s
@@ -3346,5 +3840,187 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| s.show(ui));
         });
         assert!(!ctx.tessellate(out.shapes, out.pixels_per_point).is_empty());
+    }
+
+    // ─────────────────────── EXPLORER-10 IPAM table ───────────────────────
+
+    /// A unit that reported an address — the IPAM-occupant fixture.
+    fn addr_unit(id: &str, kind: UnitKind, name: &str, addr: &str) -> Unit {
+        Unit {
+            address: Some(addr.to_string()),
+            ..unit(id, kind, name, now_ms())
+        }
+    }
+
+    /// A live-discovered shelf spanning a mesh /24, a LAN /24, and a cloud tenant
+    /// /24 (named by a `CloudAttach` edge), plus an address-less network + volume
+    /// that must never become occupants.
+    fn addressed_state() -> Vec<UnitsState> {
+        vec![UnitsState {
+            host: "me".into(),
+            units: vec![
+                addr_unit("peer:me", UnitKind::Peer, "me", "10.42.0.1"),
+                addr_unit("peer:anvil", UnitKind::Peer, "anvil", "10.42.0.7"),
+                addr_unit("lan:printer", UnitKind::LanHost, "printer", "172.20.0.50"),
+                addr_unit("cloud:instance:i1", UnitKind::Instance, "web", "10.0.0.5"),
+                addr_unit("cloud:instance:i2", UnitKind::Instance, "db", "10.0.0.9"),
+                unit("cloud:network:n1", UnitKind::Network, "tenant", 10),
+                unit("cloud:volume:v1", UnitKind::Volume, "data", 10),
+            ],
+            edges: vec![
+                edge(
+                    EdgeKind::CloudAttach,
+                    "cloud:instance:i1",
+                    "cloud:network:n1",
+                ),
+                edge(
+                    EdgeKind::CloudAttach,
+                    "cloud:instance:i2",
+                    "cloud:network:n1",
+                ),
+            ],
+        }]
+    }
+
+    #[test]
+    fn ipam_aggregates_addresses_into_slash24_prefixes() {
+        let s = ExplorerState::with_fake(addressed_state(), "me");
+        let prefixes = s.ipam_prefixes();
+        // Three /24s, proximity-ordered (mesh → LAN → cloud) then by network.
+        let cidrs: Vec<String> = prefixes.iter().map(IpamPrefix::cidr).collect();
+        assert_eq!(cidrs, vec!["10.42.0.0/24", "172.20.0.0/24", "10.0.0.0/24"]);
+
+        // The mesh prefix: two peers sorted by address, gateway is the .1 host.
+        let mesh = &prefixes[0];
+        assert_eq!(mesh.category, Category::Mesh);
+        assert_eq!(mesh.gateway(), "10.42.0.1".parse::<Ipv4Addr>().unwrap());
+        let names: Vec<&str> = mesh.occupants.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["me", "anvil"],
+            "occupants sorted by address (.1, .7)"
+        );
+
+        // The cloud prefix reads as Cloud; the address-less volume/network are
+        // never phantom occupants (§7).
+        let cloud = &prefixes[2];
+        assert_eq!(cloud.category, Category::Cloud);
+        assert_eq!(cloud.occupants.len(), 2);
+        assert!(cloud
+            .occupants
+            .iter()
+            .all(|o| o.unit_id != "cloud:volume:v1" && o.unit_id != "cloud:network:n1"));
+    }
+
+    #[test]
+    fn ipam_occupancy_counts_used_and_free_over_the_slash24() {
+        let s = ExplorerState::with_fake(addressed_state(), "me");
+        let prefixes = s.ipam_prefixes();
+        let mesh = &prefixes[0];
+        assert_eq!(mesh.used(), 2);
+        assert_eq!(mesh.free(), IPAM_USABLE_PER_24 - 2);
+        let lan = &prefixes[1];
+        assert_eq!(lan.used(), 1);
+        assert_eq!(lan.free(), 253);
+    }
+
+    #[test]
+    fn ipam_labels_a_tenant_prefix_from_a_cloud_attach_edge() {
+        let s = ExplorerState::with_fake(addressed_state(), "me");
+        let prefixes = s.ipam_prefixes();
+        let cloud = prefixes
+            .iter()
+            .find(|p| p.category == Category::Cloud)
+            .expect("a cloud prefix");
+        assert_eq!(
+            cloud.label.as_deref(),
+            Some("tenant"),
+            "the tenant net names its prefix via the CloudAttach edge (EXPLORER-7)"
+        );
+        // Mesh/LAN prefixes have no network object → no fabricated label (§7).
+        assert!(prefixes[0].label.is_none());
+        assert!(prefixes[1].label.is_none());
+    }
+
+    #[test]
+    fn ipam_ignores_absent_and_unparseable_addresses() {
+        // Parse tolerances: a CIDR mask + a :port tail both resolve; junk doesn't.
+        assert_eq!(parse_ipv4("10.0.0.5/24"), "10.0.0.5".parse().ok());
+        assert_eq!(parse_ipv4("10.0.0.5:5900"), "10.0.0.5".parse().ok());
+        assert!(parse_ipv4("not-an-ip").is_none());
+        assert!(
+            parse_ipv4("fe80::1").is_none(),
+            "IPv6 isn't a /24 occupant here"
+        );
+
+        // A unit with no address, and an IPv6 unit, yield no phantom prefixes.
+        let units = vec![
+            unit("peer:me", UnitKind::Peer, "me", 10),
+            addr_unit("peer:v6", UnitKind::Peer, "v6", "fe80::1"),
+            addr_unit("peer:ok", UnitKind::Peer, "ok", "10.42.0.3"),
+        ];
+        let prefixes = derive_prefixes(&units, &[]);
+        assert_eq!(prefixes.len(), 1, "only the IPv4 unit anchors a prefix");
+        assert_eq!(prefixes[0].occupants.len(), 1);
+        // A wholly empty shelf → no prefixes at all (honest-empty, §7).
+        assert!(derive_prefixes(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn ipam_filter_scopes_prefixes_by_category() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.set_filter(Some(Category::Cloud));
+        let cloud = s.ipam_prefixes();
+        assert_eq!(cloud.len(), 1);
+        assert_eq!(cloud[0].category, Category::Cloud);
+        s.set_filter(Some(Category::Lan));
+        assert_eq!(s.ipam_prefixes().len(), 1);
+        s.set_filter(None);
+        assert_eq!(s.ipam_prefixes().len(), 3);
+    }
+
+    #[test]
+    fn ipam_row_click_jumps_to_the_occupant_hero() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.mode = SurfaceMode::Ipam;
+        // A row click returns to the hero card, focused on the occupant.
+        s.jump_from_ipam("lan:printer");
+        assert_eq!(s.mode, SurfaceMode::Hero);
+        assert_eq!(focused(&s).id, "lan:printer");
+
+        // A jump from under a hiding category filter clears it so the jump lands.
+        s.mode = SurfaceMode::Ipam;
+        s.set_filter(Some(Category::Cloud));
+        s.jump_from_ipam("peer:me");
+        assert_eq!(s.mode, SurfaceMode::Hero);
+        assert_eq!(s.filter, None, "the hiding filter clears on the jump");
+        assert_eq!(focused(&s).id, "peer:me");
+    }
+
+    #[test]
+    fn ipam_table_renders_headless_and_when_empty() {
+        let mut render = |s: &mut ExplorerState| {
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    Vec2::new(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| s.show(ui));
+            });
+            !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
+        };
+        // The populated IPAM table draws its prefix bands + address rows.
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.mode = SurfaceMode::Ipam;
+        assert!(render(&mut s), "the IPAM table drew primitives");
+        // Honest-empty (no addressed units) still draws the note, never panics.
+        let mut empty = ExplorerState::with_fake(vec![], "solo");
+        empty.mode = SurfaceMode::Ipam;
+        assert!(render(&mut empty));
     }
 }
