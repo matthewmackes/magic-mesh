@@ -121,4 +121,30 @@ derivation** stage publishing a typed `Edge { kind, from_unit, to_unit, detail }
 and the surface gains an **IPAM table mode** beside Hero (E7). Adaptive density (#22)
 now spans three views (Hero / edge-rich card / IPAM table).
 
-## Tasks → `docs/WORKLIST.md` EXPLORER-1..10.
+## The overview layer + ergonomics (operator 2026-07-04, +11-Q round)
+
+"Hero **overview** interface" — the single-hero focus sits inside a whole-fleet
+overview, driven remote-first (Quasar is a DRM thin-client desktop OS).
+
+| # | Area | Lock |
+|---|------|------|
+| O1 | Overview landing | **Zoomable mosaic overview is the LANDING** — a grid/mosaic of mini hero tiles, category-clustered; picking a tile **zooms into** its full hero; Back/Esc zooms out to the mosaic. The filmstrip stays inside hero mode. Three modes total: Mosaic ⇄ Hero ⇄ IPAM (E7). |
+| O2 | Summary bar | **Fleet rollup strip** — a slim top strip: counts per category (N mesh / N LAN / N cloud), a health rollup (green/warn/down tallies), total addresses discovered; doubles as the category filter chips (#8). |
+| O3 | Zoom motion | **Shared-element zoom into the tile** — the picked tile scales/expands into the full hero (Carbon Motion); Back reverses. Spatially coherent. |
+| O4 | Ambient mode | **Idle ambient auto-cycle** — after idle, the hero slowly auto-advances (NOC-wall / living-display), pausing on any input. **Off by default**, a toggle enables it. |
+| O5 | Persistence | **Restore last view + selection + filter** — re-opening returns to the last mode, last-selected unit, and active filter (shell config); continuity across lock/unlock + restarts. |
+| O6 | Input model | **Keyboard/D-pad first, mouse equal** — full arrow/D-pad nav (mosaic grid + hero paging + action focus-ring), mouse/touch equally supported. Couch-or-desk. |
+| O7 | Search scope | **Everything** — `/` matches across name/IP/MAC/type/node/service (type "5900" → VNC hosts, "nova" → instances, a MAC prefix, a node name). |
+| O8 | Category identity | **Accent + glyph family per category** — Mesh / LAN / Cloud each get a distinct Carbon accent + coherent glyph family on tiles/chips/status-rings. Within the Carbon palette (§4 — new tokens, no raw hex). |
+| O9 | Pinning | **Pin to front + a Pinned cluster** — pin any unit; pinned sort to the front of mosaic + filmstrip + get a Pinned filter chip; persisted. |
+| O10 | Bulk actions | **Multi-select → shared verbs (armed)** — mark N units in the mosaic, apply a verb they share (reboot 3 instances, health-check 5 peers), same typed-arming on destructive, executed per-unit with a progress rollup. |
+| O11 | Accessibility | **Large-type + strong focus ring** — generous display type, a high-contrast focus ring always showing the selection (essential for D-pad nav), honoring the platform text-scale setting. |
+
+Architecture impact: the surface is now a **three-mode** view (Mosaic / Hero / IPAM)
+with a persistent summary/filter strip (O2) and remote-first input (O6); EXPLORER-3
+narrows to the **hero card mode**, and the **mosaic overview + summary strip + zoom
+transition + D-pad grid nav** become their own units, plus ambient (O4), persistence
+(O5), universal search (O7), category identity tokens (O8), pinning (O9), armed bulk
+actions (O10), and the accessibility posture (O11).
+
+## Tasks → `docs/WORKLIST.md` EXPLORER-1..18.
