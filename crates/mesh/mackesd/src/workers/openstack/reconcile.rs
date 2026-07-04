@@ -7,7 +7,10 @@
 //! whole worker tick over injected seams (headless-testable, no tokio), and
 //! [`OpenStackState`] is the honest mirror body — doctrine-gated, runtime-
 //! unavailable, image-gated, and config-gated states are all first-class,
-//! named rows, never fabricated successes (§7).
+//! named rows, never fabricated successes (§7). The start leg carries the
+//! QC-3 airgap lane: a locally-absent image is satisfied from the mesh
+//! share's operator-mirrored archive ([`super::images`]) — checksum-verified
+//! before `podman load`, never pulled (Q18).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -18,6 +21,7 @@ use crate::workers::container::{Container, ContainerState};
 
 use super::catalog::ServiceKind;
 use super::fleet::{desired_services, FleetStateSource};
+use super::images::{check_archive, ArchiveStatus};
 use super::podman::{config_rendered, KollaServiceSpec, PodmanRunner};
 
 // ─────────────────────────── converge plan ───────────────────────────
@@ -125,9 +129,10 @@ pub enum ServiceStatus {
         /// The raw podman state (`exited`, `created`, `paused`, …).
         podman_state: String,
     },
-    /// The start is honestly gated — image not mirrored yet (QC-3 lane) or
-    /// Kolla config not rendered yet (QC-4 renderer). Named reason, no
-    /// launch attempted.
+    /// The start is honestly gated — the QC-3 archive lane ("awaiting
+    /// archive <path>", "unverifiable", "checksum mismatch" — the reason
+    /// string names the sub-state and the exact path) or the Kolla config
+    /// not rendered yet (QC-4 renderer). Named reason, no launch attempted.
     Gated {
         /// Exactly what's missing.
         reason: String,
@@ -295,50 +300,166 @@ impl CycleNotes {
     }
 }
 
-/// The start leg for one missing service: gate on the mirrored image + the
+/// The QC-3 archive leg for one locally-absent image: check the mesh share
+/// for the operator-mirrored archive, verify it against `SHA256SUMS`,
+/// `podman load` it, and re-check presence. Returns whether the image is now
+/// locally present; on `false` the honest gate/failure note (and, for the
+/// trust-boundary + load failures, the `[!]` alert) is already written.
+///
+/// The trust boundary (§7): **only** a [`ArchiveStatus::Verified`] archive
+/// is ever handed to [`PodmanRunner::load_image`] — an unverifiable or
+/// mismatched archive gates the service instead, forever, until the
+/// operator re-mirrors.
+fn load_from_archive(
+    runner: &dyn PodmanRunner,
+    share_root: &Path,
+    release: &str,
+    kind: ServiceKind,
+    image: &str,
+    out: &mut CycleNotes,
+) -> bool {
+    let gate = |out: &mut CycleNotes, reason: String| {
+        out.notes.insert(kind, ServiceStatus::Gated { reason });
+        false
+    };
+    match check_archive(share_root, kind, release) {
+        ArchiveStatus::Verified { path, .. } => {
+            if let Err(e) = runner.load_image(&path) {
+                out.fail(
+                    kind,
+                    "archive load for",
+                    &format!("loading {} failed — {e}", path.display()),
+                );
+                return false;
+            }
+            out.acted = true; // the image store changed
+            match runner.image_present(image) {
+                Ok(true) => true,
+                Ok(false) => {
+                    out.fail(
+                        kind,
+                        "archive load for",
+                        &format!(
+                            "loaded {} but image {image} is still absent — the archive's \
+                             embedded tags don't match the pinned release (re-mirror it: \
+                             `podman save` keeps the source tag)",
+                            path.display()
+                        ),
+                    );
+                    false
+                }
+                Err(e) => {
+                    out.fail(kind, "post-load image check for", &e.to_string());
+                    false
+                }
+            }
+        }
+        ArchiveStatus::ShareAbsent { share_root, wanted } => gate(
+            out,
+            format!(
+                "awaiting archive {} — the mesh share {} is not mounted/provisioned \
+                 on this node (the QC-3 Syncthing lane)",
+                wanted.display(),
+                share_root.display()
+            ),
+        ),
+        ArchiveStatus::ArchiveMissing { wanted } => gate(
+            out,
+            format!(
+                "awaiting archive {} on the mesh share — operator-mirrored over the \
+                 Syncthing lane (QC-3; design Q18: no registry pull on the airgapped \
+                 fleet)",
+                wanted.display()
+            ),
+        ),
+        ArchiveStatus::SumsUnavailable {
+            archive, detail, ..
+        } => gate(
+            out,
+            format!(
+                "archive {} is present but unverifiable — {detail}; refusing to load \
+                 an unverified archive (the QC-3 trust boundary)",
+                archive.display()
+            ),
+        ),
+        ArchiveStatus::ChecksumMismatch {
+            path,
+            expected,
+            actual,
+        } => {
+            // The trust boundary tripping is `[!]`-grade: a corrupt or
+            // tampered archive is sitting on the share. Gated (not Failed):
+            // nothing was mutated, and a good re-mirror heals it.
+            let reason = format!(
+                "checksum mismatch for {} — SHA256SUMS pins {expected}, the file \
+                 hashes {actual}; refusing to load (the QC-3 trust boundary: a \
+                 corrupt/tampered archive never enters the image store)",
+                path.display()
+            );
+            out.alerts.push(format!(
+                "openstack: kolla archive verification for {} FAILED — {reason}",
+                kind.container_name()
+            ));
+            gate(out, reason)
+        }
+        ArchiveStatus::ReadFailed { path, reason } => {
+            let reason = format!(
+                "archive verification could not read {} — {reason}",
+                path.display()
+            );
+            out.alerts.push(format!(
+                "openstack: kolla archive verification for {} failed — {reason}",
+                kind.container_name()
+            ));
+            gate(out, reason)
+        }
+    }
+}
+
+/// The start leg for one missing service: ensure the image (locally present,
+/// or loaded from the share's verified archive — the QC-3 lane), gate on the
 /// rendered Kolla config, then `podman run`. Gates answer with named
 /// reasons; a failed start is alerted + mirrored `Failed`.
 fn converge_start(
     runner: &dyn PodmanRunner,
     config_root: &Path,
+    share_root: &Path,
     release: &str,
     kind: ServiceKind,
     out: &mut CycleNotes,
 ) {
     let spec = KollaServiceSpec::for_service(kind, release, config_root);
     match runner.image_present(&spec.image) {
+        Ok(true) => {}
+        // Absent locally → the airgap lane (never a pull, Q18).
         Ok(false) => {
-            out.notes.insert(
-                kind,
-                ServiceStatus::Gated {
-                    reason: format!(
-                        "kolla image {} not loaded locally — Kolla archives arrive \
-                         operator-mirrored over the Syncthing lane + `podman load` \
-                         (QC-3; design Q18: no registry pull on the airgapped fleet)",
-                        spec.image
-                    ),
-                },
-            );
+            if !load_from_archive(runner, share_root, release, kind, &spec.image, out) {
+                return; // gated/failed — the note is already written
+            }
         }
-        Ok(true) if config_rendered(config_root, kind) => match runner.run_service(&spec) {
+        Err(e) => {
+            out.fail(kind, "image check for", &e.to_string());
+            return;
+        }
+    }
+    if config_rendered(config_root, kind) {
+        match runner.run_service(&spec) {
             Ok(()) => out.acted = true,
             Err(e) => out.fail(kind, "start", &e.to_string()),
-        },
-        Ok(true) => {
-            out.notes.insert(
-                kind,
-                ServiceStatus::Gated {
-                    reason: format!(
-                        "kolla config not rendered at {} — the one-state → Kolla \
-                         config renderer lands with QC-4 (foundation services)",
-                        super::podman::kolla_config_dir(config_root, kind)
-                            .join("config.json")
-                            .display()
-                    ),
-                },
-            );
         }
-        Err(e) => out.fail(kind, "image check for", &e.to_string()),
+    } else {
+        out.notes.insert(
+            kind,
+            ServiceStatus::Gated {
+                reason: format!(
+                    "kolla config not rendered at {} — the one-state → Kolla \
+                     config renderer lands with QC-4 (foundation services)",
+                    super::podman::kolla_config_dir(config_root, kind)
+                        .join("config.json")
+                        .display()
+                ),
+            },
+        );
     }
 }
 
@@ -347,12 +468,13 @@ fn converge_start(
 fn apply_plan(
     runner: &dyn PodmanRunner,
     config_root: &Path,
+    share_root: &Path,
     release: &str,
     plan: ConvergePlan,
     out: &mut CycleNotes,
 ) {
     for kind in plan.start {
-        converge_start(runner, config_root, release, kind, out);
+        converge_start(runner, config_root, share_root, release, kind, out);
     }
     for kind in plan.restart {
         match runner.start_existing(kind.container_name()) {
@@ -414,21 +536,28 @@ fn runtime_unavailable_outcome(
 /// One whole worker tick over the injected seams.
 ///
 /// Read the doctrine, observe the runtime, converge (start missing /
-/// restart killed / stop extra — each start gated on the mirrored image +
-/// the rendered Kolla config), and fold the honest mirror. Synchronous and
-/// seam-pure — the worker drives it on a blocking task; tests drive it
-/// directly with fakes.
+/// restart killed / stop extra — each start gated on the image, satisfied
+/// locally or via the share's checksum-verified archive (`share_root`, the
+/// QC-3 lane), + the rendered Kolla config), and fold the honest mirror.
+/// Synchronous and seam-pure — the worker drives it on a blocking task;
+/// tests drive it directly with fakes.
 ///
 /// Honesty invariants (§7):
 /// - a gated/failed doctrine read converges NOTHING (never against an
 ///   unknown desired state) and mirrors the typed reason;
 /// - a podman-less host mutates nothing and mirrors the typed reason;
-/// - an absent image / unrendered config gates that service's start with a
-///   named reason instead of launching a doomed container.
+/// - an absent image first tries the operator-mirrored archive on the mesh
+///   share — loaded **only** when its `SHA256SUMS` entry verifies (the QC-3
+///   trust boundary; a mismatch alerts + gates, and never loads) — else the
+///   start gates naming the exact archive path it awaits; never a registry
+///   pull (Q18);
+/// - an unrendered config gates that service's start with a named reason
+///   instead of launching a doomed container.
 pub fn converge_cycle(
     fleet: &dyn FleetStateSource,
     runner: &dyn PodmanRunner,
     config_root: &Path,
+    share_root: &Path,
     host: &str,
 ) -> CycleOutcome {
     // 1 — doctrine.
@@ -469,6 +598,7 @@ pub fn converge_cycle(
         apply_plan(
             runner,
             config_root,
+            share_root,
             &release,
             plan_converge(&desired, &observed),
             &mut out,
@@ -524,6 +654,47 @@ mod tests {
             leader,
             kolla_release: "2024.1".into(),
         }
+    }
+
+    /// Seed `kind`'s archive with a CORRECT `SHA256SUMS` entry on the fake
+    /// share (appending, so services can share one manifest), returning the
+    /// archive path.
+    fn seed_verified_archive(share: &Path, kind: ServiceKind) -> std::path::PathBuf {
+        use super::super::images;
+        let dir = images::kolla_release_dir(share, "2024.1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = images::archive_path(share, kind, "2024.1");
+        std::fs::write(&path, b"fake kolla docker-archive").unwrap();
+        let sums = images::sums_path(share, "2024.1");
+        let mut text = std::fs::read_to_string(&sums).unwrap_or_default();
+        {
+            use std::fmt::Write as _;
+            writeln!(
+                text,
+                "{}  {}",
+                images::sha256_file(&path).unwrap(),
+                kind.archive_file_name("2024.1")
+            )
+            .unwrap();
+        }
+        std::fs::write(&sums, text).unwrap();
+        path
+    }
+
+    /// Seed `kind`'s archive with a WRONG `SHA256SUMS` digest — the
+    /// corrupt/tampered case the trust boundary must refuse.
+    fn seed_mismatched_archive(share: &Path, kind: ServiceKind) -> std::path::PathBuf {
+        use super::super::images;
+        let dir = images::kolla_release_dir(share, "2024.1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = images::archive_path(share, kind, "2024.1");
+        std::fs::write(&path, b"tampered bytes").unwrap();
+        std::fs::write(
+            images::sums_path(share, "2024.1"),
+            format!("{}  {}\n", "0".repeat(64), kind.archive_file_name("2024.1")),
+        )
+        .unwrap();
+        path
     }
 
     // ── plan_converge (the pure decision) ──
@@ -593,7 +764,8 @@ mod tests {
         let runner = FakeRunner::new();
         runner.seed_container("keystone", ContainerState::Running);
         let dir = tempfile::tempdir().unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), "node-a");
+        let share = tempfile::tempdir().unwrap();
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
         // No mutations against an unknown desired state.
         assert!(runner.calls().iter().all(|c| c.starts_with("list")));
         assert!(!out.acted);
@@ -612,7 +784,8 @@ mod tests {
         let fleet = FakeFleet::fixed(enabled_view(false));
         let runner = FakeRunner::absent();
         let dir = tempfile::tempdir().unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), "node-a");
+        let share = tempfile::tempdir().unwrap();
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
         assert!(!out.acted);
         let RuntimeStatus::Unavailable { reason } = &out.state.runtime else {
             unreachable!("wrong runtime: {:?}", out.state.runtime);
@@ -639,9 +812,13 @@ mod tests {
         let fleet = FakeFleet::fixed(enabled_view(false));
         let runner = FakeRunner::new(); // no images seeded
         let dir = tempfile::tempdir().unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), "node-a");
+        let share = tempfile::tempdir().unwrap();
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
         assert!(!out.acted, "no start may run without the image");
-        assert!(runner.calls().iter().all(|c| !c.starts_with("run:")));
+        assert!(runner
+            .calls()
+            .iter()
+            .all(|c| !c.starts_with("run:") && !c.starts_with("load:")));
         let keystone = out
             .state
             .services
@@ -651,11 +828,235 @@ mod tests {
         let ServiceStatus::Gated { reason } = &keystone.status else {
             unreachable!("wrong status: {:?}", keystone.status);
         };
+        // The QC-3 sharper gate: the row names the exact archive path it
+        // awaits on the share.
+        assert!(reason.contains("awaiting archive"), "{reason}");
         assert!(reason.contains("QC-3"), "{reason}");
+        let wanted =
+            super::super::images::archive_path(share.path(), ServiceKind::Keystone, "2024.1");
         assert!(
-            reason.contains("quay.io/openstack.kolla/keystone:2024.1"),
-            "{reason}"
+            reason.contains(&wanted.display().to_string()),
+            "{reason} must name {}",
+            wanted.display()
         );
+        assert!(
+            out.alerts.is_empty(),
+            "awaiting an archive is not [!]-grade"
+        );
+    }
+
+    // ── the QC-3 archive lane ──
+
+    #[test]
+    fn verified_archive_loads_and_the_service_proceeds() {
+        let fleet = FakeFleet::fixed(enabled_view(false));
+        let runner = FakeRunner::new();
+        let dir = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        // Every desired service: a checksum-verified archive on the share
+        // (which the fake's load deposits the pinned tag from) + rendered
+        // config — the full bootstrap-from-the-share path.
+        for kind in desired_services(&enabled_view(false)) {
+            let path = seed_verified_archive(share.path(), kind);
+            runner.seed_archive_images(&path, &[&kind.image_ref("2024.1")]);
+            let d = dir.path().join(kind.container_name());
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("config.json"), "{}").unwrap();
+        }
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        assert!(out.acted);
+        assert!(out.alerts.is_empty(), "{:?}", out.alerts);
+        let calls = runner.calls();
+        let keystone_tar =
+            super::super::images::archive_path(share.path(), ServiceKind::Keystone, "2024.1");
+        assert!(
+            calls
+                .iter()
+                .any(|c| *c == format!("load:{}", keystone_tar.display())),
+            "the verified archive must be podman-loaded: {calls:?}"
+        );
+        assert!(calls.iter().any(|c| c == "run:keystone"), "{calls:?}");
+        // Loaded + started in the same tick — the mirror shows Running.
+        assert!(
+            out.state
+                .services
+                .iter()
+                .all(|r| r.status == ServiceStatus::Running),
+            "{:?}",
+            out.state.services
+        );
+    }
+
+    #[test]
+    fn checksum_mismatch_gates_alerts_and_never_loads() {
+        let fleet = FakeFleet::fixed(enabled_view(false));
+        let runner = FakeRunner::new();
+        let dir = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        seed_mismatched_archive(share.path(), ServiceKind::Keystone);
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        // The trust boundary: an unverified archive NEVER reaches the image
+        // store, and nothing was mutated.
+        assert!(
+            runner.calls().iter().all(|c| !c.starts_with("load:")),
+            "{:?}",
+            runner.calls()
+        );
+        assert!(!out.acted);
+        let keystone = out
+            .state
+            .services
+            .iter()
+            .find(|r| r.service == "keystone")
+            .expect("keystone row");
+        let ServiceStatus::Gated { reason } = &keystone.status else {
+            unreachable!("wrong status: {:?}", keystone.status);
+        };
+        assert!(reason.contains("checksum mismatch"), "{reason}");
+        assert!(
+            reason.contains(&"0".repeat(64)),
+            "carries both digests: {reason}"
+        );
+        // ...and the tripped boundary is [!]-grade (→ chat).
+        assert!(
+            out.alerts
+                .iter()
+                .any(|a| a.contains("keystone") && a.contains("checksum mismatch")),
+            "{:?}",
+            out.alerts
+        );
+    }
+
+    #[test]
+    fn unmounted_share_gates_with_the_mount_reason() {
+        let fleet = FakeFleet::fixed(enabled_view(false));
+        let runner = FakeRunner::new();
+        let dir = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        // A share path that does not exist — /mnt/mesh-storage before the
+        // first Syncthing provision.
+        let missing = share.path().join("not-mounted");
+        let out = converge_cycle(&fleet, &runner, dir.path(), &missing, "node-a");
+        assert!(!out.acted);
+        assert!(runner.calls().iter().all(|c| !c.starts_with("load:")));
+        assert!(
+            out.alerts.is_empty(),
+            "an unmounted share is a gate, not [!]"
+        );
+        let keystone = out
+            .state
+            .services
+            .iter()
+            .find(|r| r.service == "keystone")
+            .expect("keystone row");
+        let ServiceStatus::Gated { reason } = &keystone.status else {
+            unreachable!("wrong status: {:?}", keystone.status);
+        };
+        assert!(reason.contains("not mounted"), "{reason}");
+        assert!(reason.contains("awaiting archive"), "{reason}");
+        assert!(
+            reason.contains(&missing.display().to_string()),
+            "{reason} must name the missing share root"
+        );
+    }
+
+    #[test]
+    fn archive_without_sums_gates_unverified_and_never_loads() {
+        use super::super::images;
+        let fleet = FakeFleet::fixed(enabled_view(false));
+        let runner = FakeRunner::new();
+        let dir = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        // The tar replicated in before SHA256SUMS did (a normal in-flight
+        // Syncthing state) — present but unverifiable, so untouchable.
+        let kolla = images::kolla_release_dir(share.path(), "2024.1");
+        std::fs::create_dir_all(&kolla).unwrap();
+        std::fs::write(
+            images::archive_path(share.path(), ServiceKind::Keystone, "2024.1"),
+            b"bytes",
+        )
+        .unwrap();
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        assert!(runner.calls().iter().all(|c| !c.starts_with("load:")));
+        let keystone = out
+            .state
+            .services
+            .iter()
+            .find(|r| r.service == "keystone")
+            .expect("keystone row");
+        assert!(
+            matches!(&keystone.status, ServiceStatus::Gated { reason } if reason.contains("unverifiable")),
+            "{:?}",
+            keystone.status
+        );
+    }
+
+    #[test]
+    fn load_failure_is_alerted_and_mirrored_failed() {
+        let fleet = FakeFleet::fixed(enabled_view(false));
+        let runner = FakeRunner::new();
+        let dir = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let path = seed_verified_archive(share.path(), ServiceKind::Keystone);
+        runner.fail_next_load(&path, "blob: no space left on device");
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let keystone = out
+            .state
+            .services
+            .iter()
+            .find(|r| r.service == "keystone")
+            .expect("keystone row");
+        assert!(
+            matches!(&keystone.status, ServiceStatus::Failed { reason } if reason.contains("no space left")),
+            "{:?}",
+            keystone.status
+        );
+        assert!(
+            out.alerts
+                .iter()
+                .any(|a| a.contains("archive load for keystone failed")),
+            "{:?}",
+            out.alerts
+        );
+        // Nothing may be launched off a failed load.
+        assert!(runner.calls().iter().all(|c| !c.starts_with("run:")));
+    }
+
+    #[test]
+    fn loaded_archive_with_wrong_tags_fails_honestly() {
+        let fleet = FakeFleet::fixed(enabled_view(false));
+        let runner = FakeRunner::new();
+        let dir = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        // Verified + loadable, but NOT seeded with the pinned tag: the load
+        // "succeeds" yet the wanted image ref stays absent (an archive
+        // mirrored for the wrong release) — never a silent success.
+        let path = seed_verified_archive(share.path(), ServiceKind::Keystone);
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let calls = runner.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| *c == format!("load:{}", path.display())),
+            "{calls:?}"
+        );
+        let keystone = out
+            .state
+            .services
+            .iter()
+            .find(|r| r.service == "keystone")
+            .expect("keystone row");
+        assert!(
+            matches!(&keystone.status, ServiceStatus::Failed { reason } if reason.contains("still absent")),
+            "{:?}",
+            keystone.status
+        );
+        assert!(
+            out.alerts.iter().any(|a| a.contains("keystone")),
+            "{:?}",
+            out.alerts
+        );
+        assert!(calls.iter().all(|c| !c.starts_with("run:")));
     }
 
     #[test]
@@ -664,7 +1065,8 @@ mod tests {
         let runner = FakeRunner::new();
         runner.seed_image(&ServiceKind::Keystone.image_ref("2024.1"));
         let dir = tempfile::tempdir().unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), "node-a");
+        let share = tempfile::tempdir().unwrap();
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
         let keystone = out
             .state
             .services
@@ -684,6 +1086,7 @@ mod tests {
         let fleet = FakeFleet::fixed(enabled_view(false));
         let runner = FakeRunner::new();
         let dir = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
         // Render every desired service's config + mirror every image so the
         // whole set starts.
         for kind in desired_services(&enabled_view(false)) {
@@ -692,7 +1095,7 @@ mod tests {
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join("config.json"), "{}").unwrap();
         }
-        let out = converge_cycle(&fleet, &runner, dir.path(), "node-a");
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
         assert!(out.acted);
         assert!(out.alerts.is_empty(), "{:?}", out.alerts);
         assert!(runner.calls().iter().any(|c| c == "run:keystone"));
@@ -720,7 +1123,8 @@ mod tests {
         runner.seed_container("nova_api", ContainerState::Exited);
         runner.seed_container("mariadb", ContainerState::Running);
         let dir = tempfile::tempdir().unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), "node-a");
+        let share = tempfile::tempdir().unwrap();
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
         assert!(out.acted);
         let calls = runner.calls();
         assert!(calls.iter().any(|c| c == "start:nova_api"), "{calls:?}");
@@ -744,10 +1148,11 @@ mod tests {
             runner.seed_image(&kind.image_ref("2024.1"));
         }
         let dir = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
         let d = dir.path().join("keystone");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("config.json"), "{}").unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), "node-a");
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
         let keystone = out
             .state
             .services
@@ -779,7 +1184,8 @@ mod tests {
         runner.seed_container("keystone", ContainerState::Running);
         runner.seed_container("mcnf-navidrome", ContainerState::Running); // unmanaged
         let dir = tempfile::tempdir().unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), "node-a");
+        let share = tempfile::tempdir().unwrap();
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
         assert!(out.acted);
         assert_eq!(out.state.doctrine, DoctrineStatus::Disabled);
         let calls = runner.calls();

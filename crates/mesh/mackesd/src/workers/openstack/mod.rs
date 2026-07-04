@@ -19,10 +19,11 @@
 //!   typed [`podman::RunnerError::PodmanAbsent`]).
 //! - **A pure reconcile core** ([`reconcile::plan_converge`] +
 //!   [`reconcile::converge_cycle`]): desired vs running → start missing /
-//!   restart killed / stop extra. Starts are honestly gated on the
-//!   operator-mirrored image (QC-3's Syncthing lane — design Q18, no
-//!   registry on the airgapped fleet) and the rendered Kolla config (QC-4's
-//!   renderer); a gated doctrine converges nothing.
+//!   restart killed / stop extra. A start's image is satisfied locally or
+//!   loaded from the mesh share's operator-mirrored, checksum-verified
+//!   archive ([`images`] — QC-3's Syncthing lane; design Q18, no registry
+//!   on the airgapped fleet), and additionally gated on the rendered Kolla
+//!   config (QC-4's renderer); a gated doctrine converges nothing.
 //! - **The `state/openstack/<node>` mirror** ([`reconcile::OpenStackState`])
 //!   — the same per-node Bus mirror idiom `state/storage/<node>` uses,
 //!   published on change + heartbeat via the `mde-bus` CLI fire-and-reap
@@ -31,14 +32,15 @@
 //!
 //! ## What later QC slices extend (the module map)
 //!
-//! - [`catalog`] — the service vocabulary: QC-3 maps entries to mirrored
-//!   image archives, QC-6 binds the API entries to the Nebula interface,
-//!   wave-2 services (Q25) land as new variants.
+//! - [`catalog`] — the service vocabulary: QC-6 binds the API entries to
+//!   the Nebula interface, wave-2 services (Q25) land as new variants.
 //! - [`fleet`] — QC-4 wires the live doctrine read (the `/mesh/cloud/` etcd
 //!   record + TOML companion) and richer placement (`RabbitMQ` cluster
 //!   topology); QC-10's capacity-derived quotas read the same doctrine.
-//! - [`podman`] — QC-3 adds the archive `podman load` lane beside
-//!   `image_present`; QC-4 grows per-service health probes.
+//! - [`images`] — QC-3's airgap archive lane (landed): the decided
+//!   `<share>/kolla/<release>/` layout + `SHA256SUMS` verification; QC-9's
+//!   DIB pipeline reuses the same share conventions for tenant images.
+//! - [`podman`] — QC-4 grows per-service health probes.
 //! - [`reconcile`] — QC-4 extends the mirror with API health; QC-11's typed
 //!   verbs consume the same state model.
 
@@ -46,6 +48,7 @@
 
 pub mod catalog;
 pub mod fleet;
+pub mod images;
 pub mod podman;
 pub mod reconcile;
 #[cfg(test)]
@@ -108,6 +111,10 @@ pub struct OpenstackWorker {
     /// The Kolla config root ([`DEFAULT_KOLLA_CONFIG_ROOT`]; tests point it
     /// at a tempdir).
     config_root: PathBuf,
+    /// The mesh share root the QC-3 archive lane reads
+    /// (production: the same replicated workgroup root the doctrine seam
+    /// rides — `/mnt/mesh-storage`; tests point it at a tempdir).
+    share_root: PathBuf,
     /// Converge cadence.
     poll: Duration,
     /// Mirror republish heartbeat.
@@ -117,15 +124,18 @@ pub struct OpenstackWorker {
 impl OpenstackWorker {
     /// Construct with production defaults: the gated [`MeshFleetState`]
     /// doctrine seam over `workgroup_root`, the live [`PodmanCli`] runner,
-    /// the `/etc/kolla` config root, and the default cadences. `host` is
-    /// this node's id (the mirror `host` stamp).
+    /// the `/etc/kolla` config root, `workgroup_root` doubling as the QC-3
+    /// archive share (it IS the Syncthing-replicated `/mnt/mesh-storage`),
+    /// and the default cadences. `host` is this node's id (the mirror
+    /// `host` stamp).
     #[must_use]
     pub fn new(host: String, workgroup_root: PathBuf) -> Self {
         Self {
             host,
-            fleet: Arc::new(MeshFleetState::new(workgroup_root)),
+            fleet: Arc::new(MeshFleetState::new(workgroup_root.clone())),
             runner: Arc::new(PodmanCli::new()),
             config_root: PathBuf::from(DEFAULT_KOLLA_CONFIG_ROOT),
+            share_root: workgroup_root,
             poll: DEFAULT_POLL_INTERVAL,
             heartbeat: PUBLISH_HEARTBEAT,
         }
@@ -152,6 +162,13 @@ impl OpenstackWorker {
         self
     }
 
+    /// Override the QC-3 archive share root (tests).
+    #[must_use]
+    pub fn with_share_root(mut self, root: PathBuf) -> Self {
+        self.share_root = root;
+        self
+    }
+
     /// Override the converge cadence (tests, to avoid multi-second waits).
     #[must_use]
     pub const fn with_poll(mut self, poll: Duration) -> Self {
@@ -170,9 +187,10 @@ impl OpenstackWorker {
         let fleet = Arc::clone(&self.fleet);
         let runner = Arc::clone(&self.runner);
         let config_root = self.config_root.clone();
+        let share_root = self.share_root.clone();
         let host = self.host.clone();
         let outcome: CycleOutcome = match tokio::task::spawn_blocking(move || {
-            converge_cycle(&*fleet, &*runner, &config_root, &host)
+            converge_cycle(&*fleet, &*runner, &config_root, &share_root, &host)
         })
         .await
         {

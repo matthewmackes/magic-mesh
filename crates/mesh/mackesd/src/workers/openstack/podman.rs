@@ -13,14 +13,17 @@
 //!   but a dev box may not);
 //! - the worker only *checks* image presence ([`PodmanRunner::image_present`])
 //!   and never pulls: Kolla images arrive as operator-mirrored archives over
-//!   the QC-3 Syncthing lane + `podman load` (design Q18 — no registry on the
-//!   airgapped fleet), so an absent image gates the start with a named
-//!   reason instead of a doomed pull;
+//!   the QC-3 Syncthing lane and are `podman load`ed here
+//!   ([`PodmanRunner::load_image`]) **only after** [`super::images`] verifies
+//!   the archive against `SHA256SUMS` (design Q18 — no registry on the
+//!   airgapped fleet); an absent archive gates the start with a named reason
+//!   instead of a doomed pull;
 //! - a start additionally requires the rendered Kolla config
 //!   ([`config_rendered`]) that QC-4's one-state renderer materializes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -32,6 +35,16 @@ use super::catalog::ServiceKind;
 /// The Kolla config root on the host — QC-4's renderer materializes
 /// `/etc/kolla/<service>/config.json` (+ the service config files) under it.
 pub const DEFAULT_KOLLA_CONFIG_ROOT: &str = "/etc/kolla";
+
+/// The bound on one `podman load` (QC-3).
+///
+/// Kolla archives run to a GiB+ and the load unpacks layers to disk, so
+/// the default 15 s command bound would kill every real load; ten minutes
+/// is generous for the slowest node while still freeing the converge
+/// thread if podman truly wedges. The load runs on the worker's
+/// `spawn_blocking` cycle, so a long load never pins the async runtime —
+/// it just stretches that one tick.
+pub const IMAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A podman-access failure.
 #[derive(Debug, Error)]
@@ -171,10 +184,27 @@ pub fn build_rm_argv(name: &str) -> Vec<String> {
 }
 
 /// `podman image exists <image>` — local-presence check (exit 0 present,
-/// exit 1 absent). The only image verb the worker ever runs: no pull (Q18).
+/// exit 1 absent). Never pulls (Q18).
 #[must_use]
 pub fn build_image_exists_argv(image: &str) -> Vec<String> {
     vec!["image".into(), "exists".into(), image.into()]
+}
+
+/// `podman image load -i <archive>` — load a checksum-verified,
+/// operator-mirrored Kolla archive from the mesh share (QC-3).
+///
+/// The docker-archive format `podman save` produced embeds the source tag,
+/// so the load restores exactly the [`ServiceKind::image_ref`] the worker
+/// gates on. With [`build_image_exists_argv`] these are the only two image
+/// verbs in the tree: no pull, ever (Q18).
+#[must_use]
+pub fn build_image_load_argv(archive: &Path) -> Vec<String> {
+    vec![
+        "image".into(),
+        "load".into(),
+        "-i".into(),
+        archive.display().to_string(),
+    ]
 }
 
 // ─────────────────────────── the runner seam ───────────────────────────
@@ -200,6 +230,19 @@ pub trait PodmanRunner {
     /// [`RunnerError::PodmanAbsent`] / spawn / non-zero failures (absence of
     /// the image is `Ok(false)`, not an error).
     fn image_present(&self, image: &str) -> Result<bool, RunnerError>;
+
+    /// Load an operator-mirrored archive into the local image store
+    /// (`podman image load -i`, [`build_image_load_argv`]) — the QC-3
+    /// airgap lane's write half.
+    ///
+    /// Callers MUST only pass an archive
+    /// [`super::images::check_archive`] answered
+    /// [`super::images::ArchiveStatus::Verified`] for: the checksum gate is
+    /// the trust boundary, and this seam never re-checks.
+    ///
+    /// # Errors
+    /// [`RunnerError::PodmanAbsent`] / spawn / non-zero failures.
+    fn load_image(&self, archive: &Path) -> Result<(), RunnerError>;
 
     /// Create + start a Kolla service container from `spec`
     /// (`podman run -d`, [`build_kolla_run_argv`]).
@@ -241,11 +284,18 @@ impl PodmanCli {
         Self
     }
 
-    /// Run `podman <args>` to completion (status only), bounded.
+    /// Run `podman <args>` to completion (status only), bounded by the
+    /// default command timeout.
     fn podman_status(args: &[String]) -> Result<(), RunnerError> {
+        Self::podman_status_bounded(args, DEFAULT_CMD_TIMEOUT)
+    }
+
+    /// Run `podman <args>` to completion (status only) under an explicit
+    /// bound — the `load` path needs [`IMAGE_LOAD_TIMEOUT`].
+    fn podman_status_bounded(args: &[String], timeout: Duration) -> Result<(), RunnerError> {
         let mut cmd = Command::new("podman");
         cmd.args(args);
-        let st = status_with_timeout(cmd, DEFAULT_CMD_TIMEOUT).map_err(spawn_error)?;
+        let st = status_with_timeout(cmd, timeout).map_err(spawn_error)?;
         if st.success() {
             Ok(())
         } else {
@@ -298,6 +348,10 @@ impl PodmanRunner for PodmanCli {
                 stderr: stderr.trim().to_string(),
             }),
         }
+    }
+
+    fn load_image(&self, archive: &Path) -> Result<(), RunnerError> {
+        Self::podman_status_bounded(&build_image_load_argv(archive), IMAGE_LOAD_TIMEOUT)
     }
 
     fn run_service(&self, spec: &KollaServiceSpec) -> Result<(), RunnerError> {
@@ -354,6 +408,19 @@ mod tests {
                 "image",
                 "exists",
                 "quay.io/openstack.kolla/memcached:2024.1"
+            ]
+        );
+        // QC-3 — the load half of the airgap lane, from the decided share
+        // layout.
+        assert_eq!(
+            build_image_load_argv(Path::new(
+                "/mnt/mesh-storage/kolla/2024.1/nova-api-2024.1.tar"
+            )),
+            vec![
+                "image",
+                "load",
+                "-i",
+                "/mnt/mesh-storage/kolla/2024.1/nova-api-2024.1.tar"
             ]
         );
     }

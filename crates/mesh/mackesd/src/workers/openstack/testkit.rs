@@ -3,6 +3,7 @@
 //! duplication across test modules).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::Mutex;
 
 use crate::workers::container::{Container, ContainerState};
@@ -45,6 +46,13 @@ pub struct FakeRunner {
     calls: Mutex<Vec<String>>,
     /// Container names whose next `run_service` fails with the mapped reason.
     fail_runs: Mutex<BTreeMap<String, String>>,
+    /// QC-3 — archive path (display form) → the image refs a `load_image`
+    /// of it deposits in the store. An unseeded archive loads "successfully"
+    /// but deposits nothing (a wrong-tag archive).
+    archive_images: Mutex<BTreeMap<String, Vec<String>>>,
+    /// Archive paths (display form) whose next `load_image` fails with the
+    /// mapped reason.
+    fail_loads: Mutex<BTreeMap<String, String>>,
     /// When set, every call answers [`RunnerError::PodmanAbsent`].
     absent: bool,
 }
@@ -57,6 +65,8 @@ impl FakeRunner {
             images: Mutex::new(BTreeSet::new()),
             calls: Mutex::new(Vec::new()),
             fail_runs: Mutex::new(BTreeMap::new()),
+            archive_images: Mutex::new(BTreeMap::new()),
+            fail_loads: Mutex::new(BTreeMap::new()),
             absent: false,
         }
     }
@@ -88,6 +98,25 @@ impl FakeRunner {
             .lock()
             .unwrap()
             .insert(name.to_string(), reason.to_string());
+    }
+
+    /// QC-3 — declare which image refs `archive` deposits when loaded (the
+    /// docker-archive embedded tags). Without this, loading `archive`
+    /// succeeds but deposits nothing — a mirrored archive whose tags don't
+    /// match the pinned release.
+    pub fn seed_archive_images(&self, archive: &Path, images: &[&str]) {
+        self.archive_images.lock().unwrap().insert(
+            archive.display().to_string(),
+            images.iter().map(ToString::to_string).collect(),
+        );
+    }
+
+    /// QC-3 — make the next `load_image` of `archive` fail with `reason`.
+    pub fn fail_next_load(&self, archive: &Path, reason: &str) {
+        self.fail_loads
+            .lock()
+            .unwrap()
+            .insert(archive.display().to_string(), reason.to_string());
     }
 
     /// The recorded call log (`list` / `run:<name>` / `start:<name>` / …).
@@ -132,6 +161,31 @@ impl PodmanRunner for FakeRunner {
         self.record(format!("image_present:{image}"));
         self.gate()?;
         Ok(self.images.lock().unwrap().contains(image))
+    }
+
+    fn load_image(&self, archive: &Path) -> Result<(), RunnerError> {
+        let key = archive.display().to_string();
+        self.record(format!("load:{key}"));
+        self.gate()?;
+        let planned_failure = self.fail_loads.lock().unwrap().remove(&key);
+        if let Some(reason) = planned_failure {
+            return Err(RunnerError::Command {
+                cmd: "image load".into(),
+                code: 125,
+                stderr: reason,
+            });
+        }
+        // Deposit the archive's (seeded) embedded tags; unseeded → nothing,
+        // like a real archive mirrored for the wrong release.
+        let deposited = self
+            .archive_images
+            .lock()
+            .unwrap()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        self.images.lock().unwrap().extend(deposited);
+        Ok(())
     }
 
     fn run_service(&self, spec: &KollaServiceSpec) -> Result<(), RunnerError> {

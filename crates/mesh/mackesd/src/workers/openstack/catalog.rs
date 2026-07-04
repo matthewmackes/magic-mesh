@@ -4,11 +4,12 @@
 //! The catalog is the pure vocabulary every QUASAR-CLOUD slice shares
 //! (`docs/design/quasar-cloud.md`): the MVP service set (Q24 — Nova+Placement,
 //! Neutron, Glance, Cinder, +Keystone) over the foundation trio (Q15/16/17 —
-//! leader-hosted `MariaDB`, clustered `RabbitMQ`, per-node memcached). Later QC
-//! tasks extend it in place: QC-3 maps each entry to its Syncthing-mirrored
-//! image archive, QC-4 renders each entry's Kolla config, QC-6 binds each API
-//! entry to the Nebula interface, and the wave-2 services (Q25 — Designate,
-//! Octavia, Heat, Horizon) land as new variants.
+//! leader-hosted `MariaDB`, clustered `RabbitMQ`, per-node memcached). QC-3
+//! mapped each entry to its Syncthing-mirrored image archive
+//! ([`ServiceKind::archive_file_name`] — the [`super::images`] lane). Later
+//! QC tasks keep extending it in place: QC-4 renders each entry's Kolla
+//! config, QC-6 binds each API entry to the Nebula interface, and the wave-2
+//! services (Q25 — Designate, Octavia, Heat, Horizon) land as new variants.
 
 use serde::{Deserialize, Serialize};
 
@@ -149,6 +150,16 @@ impl ServiceKind {
         format!("quay.io/openstack.kolla/{}:{release}", self.image_name())
     }
 
+    /// The archive filename this service's image travels the mesh as
+    /// (QC-3): `<image-basename>-<release>.tar` — `nova-api-2024.1.tar`.
+    /// It lives in the share's `kolla/<release>/` directory beside its
+    /// `SHA256SUMS` entry; [`super::images`] owns the full lane layout +
+    /// verification.
+    #[must_use]
+    pub fn archive_file_name(self, release: &str) -> String {
+        format!("{}-{release}.tar", self.image_name())
+    }
+
     /// Where this service places (Q5/Q15/Q22).
     #[must_use]
     pub const fn placement(self) -> Placement {
@@ -221,6 +232,27 @@ mod tests {
             "neutron_server"
         );
         assert_eq!(ServiceKind::NeutronServer.image_name(), "neutron-server");
+    }
+
+    #[test]
+    fn archive_names_follow_the_qc3_layout_and_are_unique() {
+        // QC-3 — `<image-basename>-<release>.tar`, pinned so the operator's
+        // mirrored filenames and the worker's expectations can't drift.
+        assert_eq!(
+            ServiceKind::NovaApi.archive_file_name("2024.1"),
+            "nova-api-2024.1.tar"
+        );
+        assert_eq!(
+            ServiceKind::Mariadb.archive_file_name("2024.1"),
+            "mariadb-server-2024.1.tar"
+        );
+        let mut names: Vec<String> = ServiceKind::ALL
+            .iter()
+            .map(|k| k.archive_file_name("2024.1"))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), ServiceKind::ALL.len(), "no archive collisions");
     }
 
     #[test]
