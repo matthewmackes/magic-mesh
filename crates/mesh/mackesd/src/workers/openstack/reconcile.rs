@@ -680,6 +680,7 @@ mod tests {
             enabled: true,
             leader,
             kolla_release: "2024.1".into(),
+            horizon: false,
         }
     }
 
@@ -1488,6 +1489,7 @@ mod tests {
             enabled: false,
             leader: true,
             kolla_release: "2024.1".into(),
+            horizon: false,
         });
         let runner = FakeRunner::new();
         runner.seed_container("keystone", ContainerState::Running);

@@ -96,7 +96,7 @@ use super::nebula_supervisor::DEFAULT_OVERLAY_IP_PATH;
 use super::{ShutdownToken, Worker};
 
 use capacity::NodeCapacity;
-use config_render::{render_cloud_bootstrap, OverlayBind};
+use config_render::{render_cloud_bootstrap, render_fleet_heat_stack, OverlayBind};
 use fleet::{FleetStateSource, MeshFleetState};
 use podman::{PodmanCli, PodmanRunner, DEFAULT_KOLLA_CONFIG_ROOT};
 use reconcile::{converge_cycle, CycleOutcome, DoctrineStatus, OpenStackState};
@@ -213,6 +213,24 @@ fn render_leader_bootstrap(config_root: &Path, outcome: &mut CycleOutcome) {
         Err(e) => outcome.alerts.push(format!(
             "openstack: node-capacity probe for the cloud bootstrap seed failed — {e}"
         )),
+    }
+
+    // QC-19 — the leader also renders the fleet Heat stack (Q61 — fleet renders
+    // Heat, Heat executes) from the desired service set the doctrine converged
+    // this tick: a real, fleet-derived inventory stack (no fabrication, §7), which
+    // the bootstrap seed creates idempotently. Cloud-global like the seed, so
+    // leader-only; a render failure rides the alert lane (→ chat), never a silent
+    // swallow.
+    let services: Vec<String> = outcome
+        .state
+        .services
+        .iter()
+        .map(|row| row.service.clone())
+        .collect();
+    if let Err(e) = render_fleet_heat_stack(config_root, &release, &services) {
+        outcome
+            .alerts
+            .push(format!("openstack: fleet Heat stack render failed — {e}"));
     }
 }
 
@@ -659,6 +677,9 @@ mod tests {
         }
         tx.send(true).expect("signal shutdown");
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
-        assert!(answered, "the run-loop responder must answer the cloud request");
+        assert!(
+            answered,
+            "the run-loop responder must answer the cloud request"
+        );
     }
 }

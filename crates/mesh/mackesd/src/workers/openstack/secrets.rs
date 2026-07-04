@@ -53,17 +53,35 @@ const DB_USERS: &[&str] = &[
     "nova_api",
     "neutron",
     "cinder",
+    // Wave-2 (QC-19): Heat + Octavia each own one control-plane DB.
+    "heat",
+    "octavia",
 ];
 
 /// Every Keystone service-user an API authenticates as (the
 /// `[keystone_authtoken] password`, and the `[placement]` auth password Nova
 /// carries). These are the machine service identities Keystone is bootstrapped
 /// with — the mesh account being the *human* cloud account (Q21) is separate.
-const SERVICE_USERS: &[&str] = &["glance", "placement", "nova", "neutron", "cinder"];
+const SERVICE_USERS: &[&str] = &[
+    "glance",
+    "placement",
+    "nova",
+    "neutron",
+    "cinder",
+    // Wave-2 (QC-19): Heat + Octavia authenticate to Keystone as service users
+    // (Heat also reuses its own as the `stack_domain_admin` credential).
+    "heat",
+    "octavia",
+];
 
 /// The single `RabbitMQ` `openstack` user password (Q16 — internal RPC, strictly
 /// separate from mde-bus per Q67).
 const RABBITMQ_KEY: &str = "rabbitmq_openstack";
+
+/// The Django `SECRET_KEY` the OPTIONAL Horizon dashboard signs sessions with
+/// (QC-19/Q25). A real sealed secret (never blank), so a Horizon opt-in gets a
+/// genuine session key from the leader's one-time seal like every other service.
+const HORIZON_KEY: &str = "horizon_secret_key";
 
 /// The deterministic key for `user`'s DB password.
 fn db_key(user: &str) -> String {
@@ -111,6 +129,7 @@ impl Secrets {
             secrets.insert(service_user_key(u), random_secret());
         }
         secrets.insert(RABBITMQ_KEY.to_string(), random_secret());
+        secrets.insert(HORIZON_KEY.to_string(), random_secret());
         Self { secrets }
     }
 
@@ -152,6 +171,9 @@ impl Secrets {
         if self.secrets.get(RABBITMQ_KEY).is_none_or(String::is_empty) {
             return Some(RABBITMQ_KEY.to_string());
         }
+        if self.secrets.get(HORIZON_KEY).is_none_or(String::is_empty) {
+            return Some(HORIZON_KEY.to_string());
+        }
         None
     }
 
@@ -175,6 +197,13 @@ impl Secrets {
     #[must_use]
     pub fn rabbitmq_password(&self) -> &str {
         self.get(RABBITMQ_KEY)
+    }
+
+    /// The sealed Horizon Django `SECRET_KEY` (QC-19 — the optional dashboard's
+    /// session-signing key).
+    #[must_use]
+    pub fn horizon_secret_key(&self) -> &str {
+        self.get(HORIZON_KEY)
     }
 
     /// Look a key up. Guarded by [`Self::first_missing`] at the render entry, so
@@ -336,6 +365,8 @@ mod tests {
             assert_eq!(s.service_user_password(u).len(), SECRET_LEN, "svc_{u}");
         }
         assert_eq!(s.rabbitmq_password().len(), SECRET_LEN);
+        // Wave-2 (QC-19): the Horizon session key is sealed like the rest.
+        assert_eq!(s.horizon_secret_key().len(), SECRET_LEN);
     }
 
     #[test]

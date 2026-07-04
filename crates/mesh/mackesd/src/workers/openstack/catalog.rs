@@ -33,9 +33,11 @@ pub enum Placement {
 /// One Kolla-packaged `OpenStack` service the `openstack` worker supervises.
 ///
 /// The variant set is the QC-2 skeleton catalog: the QC-4 foundation trio +
-/// the QC-5/6 identity + core-API set. Names follow the Kolla conventions the
-/// mirrored archives carry: container names use underscores (`nova_api`),
-/// image basenames use dashes (`nova-api`).
+/// the QC-5/6 identity + core-API set + the QC-7/8 OVN/Cinder plane, extended
+/// by QC-19 with the wave-2 services (Heat, Octavia, and the optional Horizon —
+/// Q25/47/61). Names follow the Kolla conventions the mirrored archives carry:
+/// container names use underscores (`nova_api`), image basenames use dashes
+/// (`nova-api`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceKind {
@@ -89,12 +91,36 @@ pub enum ServiceKind {
     /// object store are node-local LVM (Q51/59), so the backup agent runs where
     /// they live — never a controller box (Q5/22).
     CinderBackup,
+    // ── Wave-2 orchestration + load-balancing + dashboard (QC-19, Q25/47/61) ──
+    /// Heat orchestration API (Q61) — serves `openstack stack {list,create}`.
+    /// The fleet is authoritative: the worker renders stacks from fleet state
+    /// ([`super::config_render::render_fleet_heat_stack`]) and Heat executes
+    /// them; APIs on every node (Q22).
+    HeatApi,
+    /// Heat CloudFormation-compatible API (the `heat-api-cfn` endpoint the
+    /// wait-condition/metadata resources call back to).
+    HeatApiCfn,
+    /// Heat engine — the orchestration worker that realizes a stack's resources.
+    HeatEngine,
+    /// Octavia load-balancing API (Q47) — instance-workload LBs (platform
+    /// ingress keeps the Lighthouse Caddy).
+    OctaviaApi,
+    /// Octavia worker — drives the amphora lifecycle for a load balancer.
+    OctaviaWorker,
+    /// Octavia health-manager — the amphora heartbeat listener + failover.
+    OctaviaHealthManager,
+    /// Octavia housekeeping — amphora cert rotation + spares-pool/DB cleanup.
+    OctaviaHousekeeping,
+    /// Horizon dashboard (Q25/26/66) — the **OPTIONAL** web console, desired
+    /// only when the doctrine opts in (`horizon = true`); Workbench is the
+    /// primary Cloud UI (Q26), so absent-by-default is honest, not a gap.
+    Horizon,
 }
 
 impl ServiceKind {
     /// Every catalogued service, in the canonical (enum-order) sequence the
     /// mirror rows + reconcile folds iterate.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 27] = [
         Self::Mariadb,
         Self::Rabbitmq,
         Self::Memcached,
@@ -114,6 +140,14 @@ impl ServiceKind {
         Self::CinderScheduler,
         Self::CinderVolume,
         Self::CinderBackup,
+        Self::HeatApi,
+        Self::HeatApiCfn,
+        Self::HeatEngine,
+        Self::OctaviaApi,
+        Self::OctaviaWorker,
+        Self::OctaviaHealthManager,
+        Self::OctaviaHousekeeping,
+        Self::Horizon,
     ];
 
     /// The Kolla-convention container name (underscored) — the `--name` the
@@ -141,6 +175,14 @@ impl ServiceKind {
             Self::CinderScheduler => "cinder_scheduler",
             Self::CinderVolume => "cinder_volume",
             Self::CinderBackup => "cinder_backup",
+            Self::HeatApi => "heat_api",
+            Self::HeatApiCfn => "heat_api_cfn",
+            Self::HeatEngine => "heat_engine",
+            Self::OctaviaApi => "octavia_api",
+            Self::OctaviaWorker => "octavia_worker",
+            Self::OctaviaHealthManager => "octavia_health_manager",
+            Self::OctaviaHousekeeping => "octavia_housekeeping",
+            Self::Horizon => "horizon",
         }
     }
 
@@ -168,6 +210,14 @@ impl ServiceKind {
             Self::CinderScheduler => "cinder-scheduler",
             Self::CinderVolume => "cinder-volume",
             Self::CinderBackup => "cinder-backup",
+            Self::HeatApi => "heat-api",
+            Self::HeatApiCfn => "heat-api-cfn",
+            Self::HeatEngine => "heat-engine",
+            Self::OctaviaApi => "octavia-api",
+            Self::OctaviaWorker => "octavia-worker",
+            Self::OctaviaHealthManager => "octavia-health-manager",
+            Self::OctaviaHousekeeping => "octavia-housekeeping",
+            Self::Horizon => "horizon",
         }
     }
 
@@ -224,6 +274,12 @@ impl ServiceKind {
             Self::NovaApi => Some(8774),
             Self::NeutronServer => Some(9696),
             Self::CinderApi => Some(8776),
+            // Wave-2 APIs (QC-19). Heat's two endpoints (orchestration + the
+            // CFN-compatible callback API, Q61) and Octavia's LB API (Q47). The
+            // Octavia agents + Horizon carry no Keystone-catalog endpoint.
+            Self::HeatApi => Some(8004),
+            Self::HeatApiCfn => Some(8000),
+            Self::OctaviaApi => Some(9876),
             _ => None,
         }
     }
@@ -241,6 +297,9 @@ impl ServiceKind {
             Self::NovaApi => Some("nova.mesh"),
             Self::NeutronServer => Some("neutron.mesh"),
             Self::CinderApi => Some("cinder.mesh"),
+            Self::HeatApi => Some("heat.mesh"),
+            Self::HeatApiCfn => Some("heat-cfn.mesh"),
+            Self::OctaviaApi => Some("octavia.mesh"),
             _ => None,
         }
     }
@@ -365,10 +424,7 @@ mod tests {
         );
         // The chassis agent is emphatically NOT leader-only — it programs the
         // host OVS on every node.
-        assert_eq!(
-            ServiceKind::OvnController.placement(),
-            Placement::EveryNode
-        );
+        assert_eq!(ServiceKind::OvnController.placement(), Placement::EveryNode);
     }
 
     #[test]
@@ -400,6 +456,20 @@ mod tests {
             ServiceKind::CinderApi.endpoint_url().as_deref(),
             Some("http://cinder.mesh:8776")
         );
+        // Wave-2 (QC-19): Heat's two endpoints + the Octavia LB API advertise
+        // over the mesh like every other API.
+        assert_eq!(
+            ServiceKind::HeatApi.endpoint_url().as_deref(),
+            Some("http://heat.mesh:8004")
+        );
+        assert_eq!(
+            ServiceKind::HeatApiCfn.endpoint_url().as_deref(),
+            Some("http://heat-cfn.mesh:8000")
+        );
+        assert_eq!(
+            ServiceKind::OctaviaApi.endpoint_url().as_deref(),
+            Some("http://octavia.mesh:9876")
+        );
         // The foundation trio + the agent services + the OVN control plane carry
         // no tenant-facing API (the OVN DBs speak OVSDB, not a Keystone-catalog
         // HTTP endpoint).
@@ -417,6 +487,13 @@ mod tests {
             ServiceKind::CinderScheduler,
             ServiceKind::CinderVolume,
             ServiceKind::CinderBackup,
+            // Wave-2 (QC-19): Heat's engine + all four Octavia agents + the
+            // Horizon dashboard are not Keystone-catalog API endpoints.
+            ServiceKind::HeatEngine,
+            ServiceKind::OctaviaWorker,
+            ServiceKind::OctaviaHealthManager,
+            ServiceKind::OctaviaHousekeeping,
+            ServiceKind::Horizon,
         ] {
             assert_eq!(kind.api_port(), None, "{kind:?}");
             assert_eq!(kind.mesh_dns_name(), None, "{kind:?}");

@@ -125,6 +125,21 @@ const GLANCE_IMAGE_CACHE_STALL_SECS: u32 = 86_400;
 /// upload targets and the `stores`/`default_store` this renders).
 const GLANCE_FILE_STORE: &str = "file";
 
+// ── QC-19: wave-2 services — Heat, Octavia, Horizon (Q25/47/61) ──
+/// The Octavia health-manager's amphora-heartbeat UDP listen port — bound to
+/// this node's overlay IP (Q23), never the public underlay.
+const OCTAVIA_HEALTH_MANAGER_PORT: u16 = 5555;
+/// The Horizon dashboard's Apache listen port on the overlay (Q23). Horizon is
+/// a web console, not a Keystone-catalog API, so it carries no `api_port`.
+const HORIZON_PORT: u16 = 80;
+/// The rendered fleet Heat stack's filename, written beside the QC-10 cloud
+/// bootstrap seed under `<config_root>/bootstrap/` (design Q61 — the worker
+/// renders stacks, Heat executes).
+const FLEET_HEAT_STACK_FILE: &str = "fleet-stack.yaml";
+/// The stack name the leader creates the fleet-inventory stack under, so
+/// `openstack stack list` shows one authoritative, fleet-derived stack.
+const FLEET_HEAT_STACK_NAME: &str = "mcnf-fleet";
+
 /// This node's Nebula overlay bind (design Q22/23) — the resolved overlay IP
 /// every `OpenStack` API binds plaintext to (the overlay IS the transport
 /// security), or the honest reason it couldn't be resolved.
@@ -487,6 +502,26 @@ pub fn render_cloud_bootstrap(
         let _ = writeln!(body, "ensure_limit {service} {resource} {limit}");
     }
 
+    // ── QC-19: the fleet Heat stack (Q61 — fleet renders Heat, Heat executes) ──
+    // Idempotently create the fleet-inventory stack from the template the worker
+    // renders beside this seed ([`render_fleet_heat_stack`] → fleet-stack.yaml),
+    // so `openstack stack list` shows one authoritative, fleet-derived stack.
+    // Guarded (show-first), so re-applying on a later converge is a no-op; skips
+    // silently if Heat isn't in this fleet's converged set (no template written).
+    body.push_str(
+        "\n# QC-19 — the fleet Heat stack (Q61): the worker renders the stack from\n\
+         # fleet state, Heat executes it. Idempotent; skipped if the wave-2 Heat\n\
+         # service (and so its rendered template) isn't present on this fleet.\n",
+    );
+    let _ = writeln!(
+        body,
+        "FLEET_STACK_TEMPLATE=\"$(dirname \"$0\")/{FLEET_HEAT_STACK_FILE}\"\n\
+         if [ -f \"$FLEET_STACK_TEMPLATE\" ]; then\n  \
+         openstack stack show {FLEET_HEAT_STACK_NAME} >/dev/null 2>&1 \\\n    \
+         || openstack stack create -t \"$FLEET_STACK_TEMPLATE\" {FLEET_HEAT_STACK_NAME}\n\
+         fi"
+    );
+
     let dir = config_root.join("bootstrap");
     let path = dir.join(BOOTSTRAP_SEED_NAME);
     write_atomic(&path, &body).map_err(|source| RenderError::Io {
@@ -692,6 +727,17 @@ fn service_plan(
         ServiceKind::CinderScheduler => cinder("cinder-scheduler", overlay, ctx, secrets),
         ServiceKind::CinderVolume => cinder("cinder-volume", overlay, ctx, secrets),
         ServiceKind::CinderBackup => cinder("cinder-backup", overlay, ctx, secrets),
+        // ── Wave-2 (QC-19, Q25/47/61) ──
+        ServiceKind::HeatApi => heat("heat-api", overlay, ctx, secrets),
+        ServiceKind::HeatApiCfn => heat("heat-api-cfn", overlay, ctx, secrets),
+        ServiceKind::HeatEngine => heat("heat-engine", overlay, ctx, secrets),
+        ServiceKind::OctaviaApi => octavia("octavia-api", overlay, ctx, secrets),
+        ServiceKind::OctaviaWorker => octavia("octavia-worker", overlay, ctx, secrets),
+        ServiceKind::OctaviaHealthManager => {
+            octavia("octavia-health-manager", overlay, ctx, secrets)
+        }
+        ServiceKind::OctaviaHousekeeping => octavia("octavia-housekeeping", overlay, ctx, secrets),
+        ServiceKind::Horizon => horizon(overlay, secrets),
     }
 }
 
@@ -975,6 +1021,234 @@ fn ovn_controller(overlay: &str, ctx: &RenderCtx) -> ServicePlan {
             ),
         }],
     }
+}
+
+// ─────────────────── QC-19: wave-2 services (Q25/47/61) ───────────────────
+
+/// The shared Heat plan (Q61 — orchestration). All three Heat services (api /
+/// api-cfn / engine) read one `heat.conf`; only the launch command differs.
+///
+/// The fleet is authoritative: [`render_fleet_heat_stack`] renders the actual
+/// stack from fleet state, and Heat (configured here) executes it. Both API
+/// endpoints bind to the overlay (QC-6, Q22/23); the DB (Q15), RPC (Q16), and
+/// Keystone authtoken (Q21) are the same sealed seams every API shares. The
+/// `[trustee]`/`stack_domain_admin` credentials are the sealed Heat service
+/// secret (QC-5) — never a blank or fabricated password.
+fn heat(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
+    let heat_pw = secrets.service_user_password("heat");
+    ServicePlan {
+        command: command.to_string(),
+        files: vec![ConfFile {
+            name: "heat.conf",
+            dest: "/etc/heat/heat.conf",
+            owner: "heat:heat",
+            body: format!(
+                "[DEFAULT]\ndebug = False\ntransport_url = {rpc}\n\
+                 num_engine_workers = 4\n\
+                 stack_domain_admin = heat_domain_admin\n\
+                 stack_domain_admin_password = {heat_pw}\n\
+                 stack_user_domain_name = heat_user_domain\n\
+                 heat_metadata_server_url = http://{host}:{cfn_port}\n\
+                 heat_waitcondition_server_url = http://{host}:{cfn_port}/v1/waitcondition\n\
+                 [heat_api]\nbind_host = {host}\nbind_port = {api_port}\n\
+                 [heat_api_cfn]\nbind_host = {host}\nbind_port = {cfn_port}\n\
+                 [database]\nconnection = {db}\n{authtoken}\
+                 [trustee]\nauth_type = password\nauth_url = http://{ks}:{ksp}\n\
+                 username = heat\npassword = {heat_pw}\n\
+                 user_domain_name = Default\n\
+                 [clients_keystone]\nauth_uri = http://{ks}:{ksp}\n",
+                rpc = transport_url(secrets),
+                host = overlay,
+                api_port = ServiceKind::HeatApi.api_port().unwrap_or_default(),
+                cfn_port = ServiceKind::HeatApiCfn.api_port().unwrap_or_default(),
+                db = db_url("heat", overlay, ctx, secrets),
+                authtoken = authtoken("heat", overlay, secrets),
+                ks = KEYSTONE_MESH_NAME,
+                ksp = KEYSTONE_PORT,
+            ),
+        }],
+    }
+}
+
+/// The shared Octavia plan (Q47 — instance-workload load-balancing). All four
+/// Octavia services (api / worker / health-manager / housekeeping) read one
+/// `octavia.conf`; only the launch command differs.
+///
+/// This wires Octavia to Keystone (Q21), the sealed DB (Q15), and RPC (Q16),
+/// and binds the LB API + the health-manager heartbeat listener to the overlay
+/// (QC-6, Q23). Honesty (§7): actually *serving* a load balancer additionally
+/// requires the operator to provision the Octavia **amphora image**, the
+/// **management network**, and the amphora **client certificates** —
+/// deployment-specific IDs that do not exist until provisioned. Those are left
+/// **UNSET** here (a documented precondition) rather than fabricated with
+/// placeholder UUIDs; an LB create gates until the operator sets them, exactly
+/// like the QC-3 archive lane gates a start on a not-yet-mirrored image.
+fn octavia(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
+    ServicePlan {
+        command: command.to_string(),
+        files: vec![ConfFile {
+            name: "octavia.conf",
+            dest: "/etc/octavia/octavia.conf",
+            owner: "octavia:octavia",
+            body: format!(
+                "# QC-19 Octavia (Q47). The API/worker/health-manager/housekeeping are\n\
+                 # wired to Keystone, the DB, and RPC below. Serving a load balancer\n\
+                 # additionally needs the operator-provisioned amphora image + management\n\
+                 # network + amphora client certs (deployment-specific IDs that do NOT\n\
+                 # exist until provisioned) — left UNSET here rather than fabricated (§7);\n\
+                 # an LB create gates until they are set.\n\
+                 [DEFAULT]\ndebug = False\ntransport_url = {rpc}\n\
+                 [api_settings]\nbind_host = {host}\nbind_port = {api_port}\n\
+                 [database]\nconnection = {db}\n{authtoken}\
+                 [service_auth]\nauth_type = password\nauth_url = http://{ks}:{ksp}\n\
+                 username = octavia\npassword = {octavia_pw}\n\
+                 user_domain_name = Default\nproject_domain_name = Default\n\
+                 project_name = service\n\
+                 [health_manager]\nbind_ip = {host}\nbind_port = {hm_port}\n\
+                 [controller_worker]\nloadbalancer_topology = SINGLE\n",
+                rpc = transport_url(secrets),
+                host = overlay,
+                api_port = ServiceKind::OctaviaApi.api_port().unwrap_or_default(),
+                hm_port = OCTAVIA_HEALTH_MANAGER_PORT,
+                db = db_url("octavia", overlay, ctx, secrets),
+                authtoken = authtoken("octavia", overlay, secrets),
+                octavia_pw = secrets.service_user_password("octavia"),
+                ks = KEYSTONE_MESH_NAME,
+                ksp = KEYSTONE_PORT,
+            ),
+        }],
+    }
+}
+
+/// The Horizon plan (Q25/26/66 — the OPTIONAL dashboard). Renders the Django
+/// `local_settings` bound to the Nebula overlay only (Q23), Keystone-backed
+/// (Q21), with the sealed session `SECRET_KEY` (QC-5) and this node's memcached
+/// as the session cache (Q17). Served by Apache in the foreground like Keystone.
+///
+/// Horizon is desired only when the doctrine opts in
+/// ([`super::fleet::desired_services`]); when it isn't, no Horizon container is
+/// converged and no mirror row appears (honest-absent — Workbench is the primary
+/// Cloud UI, Q26). No DB, no Keystone service-user: Horizon acts as the logged-in
+/// member over their own token.
+fn horizon(overlay: &str, secrets: &Secrets) -> ServicePlan {
+    ServicePlan {
+        command: "/usr/sbin/httpd -DFOREGROUND".to_string(),
+        files: vec![ConfFile {
+            name: "local_settings",
+            dest: "/etc/openstack-dashboard/local_settings",
+            owner: "horizon:horizon",
+            body: format!(
+                "# QC-19 Horizon local_settings (Q25/26) — the OPTIONAL dashboard,\n\
+                 # bound to the Nebula overlay only (Q23), Keystone-backed (Q21).\n\
+                 DEBUG = False\n\
+                 ALLOWED_HOSTS = ['{host}', 'horizon.mesh']\n\
+                 SECRET_KEY = '{secret_key}'\n\
+                 OPENSTACK_HOST = \"{ks}\"\n\
+                 OPENSTACK_KEYSTONE_URL = \"http://{ks}:{ksp}/v3\"\n\
+                 OPENSTACK_KEYSTONE_DEFAULT_ROLE = \"member\"\n\
+                 OPENSTACK_API_VERSIONS = {{'identity': 3}}\n\
+                 OPENSTACK_KEYSTONE_MULTIDOMAIN_SUPPORT = True\n\
+                 WEBROOT = '/'\n\
+                 SESSION_ENGINE = 'django.contrib.sessions.backends.cache'\n\
+                 CACHES = {{\n    \
+                 'default': {{\n        \
+                 'BACKEND': 'django.core.cache.backends.memcached.PyMemcacheCache',\n        \
+                 'LOCATION': '{host}:{memcache}',\n    }}\n}}\n\
+                 # Apache serves the dashboard on the overlay only.\n\
+                 # Listen {host}:{port}\n",
+                host = overlay,
+                secret_key = secrets.horizon_secret_key(),
+                ks = KEYSTONE_MESH_NAME,
+                ksp = KEYSTONE_PORT,
+                memcache = MEMCACHE_PORT,
+                port = HORIZON_PORT,
+            ),
+        }],
+    }
+}
+
+/// Render the QC-19 **fleet Heat stack** (design Q61 — the fleet is
+/// authoritative; the worker renders stacks from fleet state, Heat executes
+/// them) from real fleet state.
+///
+/// `services` is the container-name set this node converged this tick — the
+/// desired set folded from the one-state doctrine ([`super::fleet`]), a genuine
+/// union of catalogued services, never hand-authored. The rendered HOT is an
+/// **inert fleet-inventory stack**: it provisions nothing (`resources: {}`) and
+/// records the fleet's pinned `release` + converged service set as stack
+/// **outputs**, so `openstack stack {create,list}` reflect the *declared* fleet
+/// without Heat ever fabricating infrastructure the doctrine didn't declare
+/// (§7). Node scoping stays authoritative in the doctrine (empty ⇒ every
+/// enrolled node, Q71) and is documented, not enumerated, here.
+///
+/// Written atomically to `<config_root>/bootstrap/fleet-stack.yaml` beside the
+/// QC-10 cloud bootstrap seed (which creates the stack idempotently). Returns
+/// the written path.
+///
+/// # Errors
+/// A [`RenderError::Io`] if the template (or its parent dir) can't be written.
+pub fn render_fleet_heat_stack(
+    config_root: &Path,
+    release: &str,
+    services: &[String],
+) -> Result<std::path::PathBuf, RenderError> {
+    use std::fmt::Write as _;
+
+    let mut body = String::new();
+    body.push_str("heat_template_version: 2021-04-16\n");
+    let _ = write!(
+        body,
+        "description: >\n  \
+         MCNF fleet-rendered orchestration stack (QUASAR-CLOUD QC-19, lock Q61).\n  \
+         Rendered by the mackesd openstack worker from the one-state fleet doctrine\n  \
+         (etcd + TOML-on-Syncthing, Q30) — the fleet is authoritative and this\n  \
+         template is DERIVED from it, never hand-authored. It provisions nothing\n  \
+         (an inert fleet inventory); `openstack stack list` reflects the declared\n  \
+         fleet. Kolla release: {release}.\n"
+    );
+    let _ = write!(
+        body,
+        "parameters:\n  \
+         kolla_release:\n    type: string\n    default: {release}\n    \
+         description: the pinned Kolla release the fleet converges on (Q69).\n"
+    );
+    // No resources — an inventory stack never fabricates infrastructure the
+    // doctrine didn't declare (§7).
+    body.push_str("resources: {}\n");
+    body.push_str("outputs:\n");
+    body.push_str(
+        "  fleet_nodes:\n    \
+         description: >\n      \
+         node scoping is authoritative in the doctrine record\n      \
+         (cloud/doctrine.toml `nodes`); empty there ⇒ every enrolled node (Q71).\n    \
+         value: from-doctrine\n",
+    );
+    body.push_str(
+        "  fleet_services:\n    \
+         description: the catalogued OpenStack services the fleet converges (Q22/24/25).\n    \
+         value:\n",
+    );
+    if services.is_empty() {
+        // Honest: an enabled-but-empty desired set (never a fabricated list).
+        body.push_str("      []\n");
+    } else {
+        for svc in services {
+            let _ = writeln!(body, "      - {svc}");
+        }
+    }
+    body.push_str(
+        "  kolla_release:\n    \
+         description: provenance — the release this stack was rendered against.\n    \
+         value: {get_param: kolla_release}\n",
+    );
+
+    let path = config_root.join("bootstrap").join(FLEET_HEAT_STACK_FILE);
+    write_atomic(&path, &body).map_err(|source| RenderError::Io {
+        service: "fleet-heat-stack".to_string(),
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -1750,5 +2024,139 @@ mod tests {
         // 1 vCPU on the 4-vCPU node — the cap tracks capacity, always a fraction.
         assert!(read_seed(big_dir.path()).contains("ensure_limit nova class:VCPU 8"));
         assert!(read_seed(small_dir.path()).contains("ensure_limit nova class:VCPU 1"));
+    }
+
+    // ─────────────────── QC-19: wave-2 services (Q25/47/61) ───────────────────
+
+    #[test]
+    fn heat_shares_one_conf_and_binds_both_apis_to_the_overlay() {
+        // Q61 — the three Heat services read one heat.conf; only the command
+        // differs. Both API endpoints bind to the overlay (QC-6/Q23), and the DB +
+        // authtoken are the shared sealed seams.
+        let dir = tempfile::tempdir().unwrap();
+        for (kind, command) in [
+            (ServiceKind::HeatApi, "heat-api"),
+            (ServiceKind::HeatApiCfn, "heat-api-cfn"),
+            (ServiceKind::HeatEngine, "heat-engine"),
+        ] {
+            render_service_config(dir.path(), kind, &ctx(false)).unwrap();
+            assert_eq!(read_command(dir.path(), kind), command);
+            let conf = read_conf(dir.path(), kind, "heat.conf");
+            assert!(conf.contains(&format!("bind_host = {OVERLAY}")), "{conf}");
+            assert!(conf.contains("bind_port = 8004"), "{conf}"); // heat_api
+            assert!(conf.contains("bind_port = 8000"), "{conf}"); // heat_api_cfn
+            assert!(conf.contains("@mariadb.mesh/heat"), "{conf}");
+            assert!(conf.contains("[keystone_authtoken]"), "{conf}");
+            assert!(conf.contains("[trustee]"), "{conf}");
+            // Never falls back off the overlay (Q23).
+            assert!(!conf.contains("0.0.0.0"), "{conf}");
+        }
+    }
+
+    #[test]
+    fn octavia_wires_keystone_but_leaves_amphora_unfabricated() {
+        // Q47 — the four Octavia services read one octavia.conf (Keystone + DB +
+        // RPC + overlay-bound API/health-manager). §7 — the amphora image /
+        // management-network / cert IDs are NOT fabricated: an honest precondition
+        // documented in the conf, not a placeholder UUID.
+        let dir = tempfile::tempdir().unwrap();
+        for (kind, command) in [
+            (ServiceKind::OctaviaApi, "octavia-api"),
+            (ServiceKind::OctaviaWorker, "octavia-worker"),
+            (ServiceKind::OctaviaHealthManager, "octavia-health-manager"),
+            (ServiceKind::OctaviaHousekeeping, "octavia-housekeeping"),
+        ] {
+            render_service_config(dir.path(), kind, &ctx(false)).unwrap();
+            assert_eq!(read_command(dir.path(), kind), command);
+            let conf = read_conf(dir.path(), kind, "octavia.conf");
+            assert!(conf.contains(&format!("bind_host = {OVERLAY}")), "{conf}");
+            assert!(conf.contains("bind_port = 9876"), "{conf}");
+            assert!(conf.contains(&format!("bind_ip = {OVERLAY}")), "{conf}"); // health-manager
+            assert!(conf.contains("@mariadb.mesh/octavia"), "{conf}");
+            assert!(conf.contains("[service_auth]"), "{conf}");
+            // The honest precondition, never a fabricated amphora UUID (§7).
+            assert!(conf.contains("provisioned"), "{conf}");
+            assert!(
+                !conf.to_lowercase().contains("amp_image_owner_id ="),
+                "{conf}"
+            );
+        }
+    }
+
+    #[test]
+    fn horizon_binds_the_overlay_keystone_and_the_sealed_session_key() {
+        // Q25/26 — the OPTIONAL dashboard: Django local_settings bound to the
+        // overlay only (Q23), Keystone-backed (Q21), with the real sealed
+        // SECRET_KEY (QC-5) — never blank.
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = Secrets::generate();
+        let session_key = secrets.horizon_secret_key().to_string();
+        render_service_config(dir.path(), ServiceKind::Horizon, &ctx_with(false, secrets)).unwrap();
+        assert_eq!(
+            read_command(dir.path(), ServiceKind::Horizon),
+            "/usr/sbin/httpd -DFOREGROUND"
+        );
+        let conf = read_conf(dir.path(), ServiceKind::Horizon, "local_settings");
+        assert!(
+            conf.contains(&format!("ALLOWED_HOSTS = ['{OVERLAY}'")),
+            "{conf}"
+        );
+        assert!(conf.contains("OPENSTACK_KEYSTONE_URL"), "{conf}");
+        assert!(
+            conf.contains(&format!("SECRET_KEY = '{session_key}'")),
+            "{conf}"
+        );
+        assert!(!session_key.is_empty(), "the sealed key is real");
+    }
+
+    #[test]
+    fn fleet_heat_stack_is_derived_from_the_service_set_no_fabrication() {
+        // Q61 — the worker renders the stack from real fleet state (the desired
+        // service set), inert (provisions nothing), no fabricated infrastructure.
+        let dir = tempfile::tempdir().unwrap();
+        let services = vec![
+            "keystone".to_string(),
+            "nova_api".to_string(),
+            "heat_api".to_string(),
+        ];
+        let path = render_fleet_heat_stack(dir.path(), "2024.1", &services).unwrap();
+        assert!(path.ends_with("bootstrap/fleet-stack.yaml"));
+        let hot = std::fs::read_to_string(&path).unwrap();
+        // A valid HOT header + the pinned release stamped from fleet state.
+        assert!(hot.contains("heat_template_version:"), "{hot}");
+        assert!(hot.contains("default: 2024.1"), "{hot}");
+        // Inert: it declares NO resources (never fabricates infra the doctrine
+        // didn't declare, §7).
+        assert!(hot.contains("resources: {}"), "{hot}");
+        // Every converged service appears, verbatim from the passed set.
+        for svc in &services {
+            assert!(hot.contains(&format!("- {svc}")), "{svc} missing: {hot}");
+        }
+        // An enabled-but-empty desired set renders an honest empty list, never a
+        // fabricated one.
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = render_fleet_heat_stack(empty_dir.path(), "2024.1", &[]).unwrap();
+        let hot_empty = std::fs::read_to_string(empty).unwrap();
+        assert!(hot_empty.contains("value:\n      []"), "{hot_empty}");
+    }
+
+    #[test]
+    fn bootstrap_seed_creates_the_fleet_stack_idempotently() {
+        // Q61 — the leader's bootstrap seed guards a create of the fleet stack
+        // (show-first), and only when the worker actually rendered the template.
+        let dir = tempfile::tempdir().unwrap();
+        render_cloud_bootstrap(dir.path(), "2024.1", &BIG_NODE).unwrap();
+        let seed = read_seed(dir.path());
+        assert!(seed.contains("openstack stack show mcnf-fleet"), "{seed}");
+        assert!(
+            seed.contains("openstack stack create -t \"$FLEET_STACK_TEMPLATE\" mcnf-fleet"),
+            "{seed}"
+        );
+        // Guarded on the template's presence (skips honestly when Heat/the stack
+        // isn't part of this fleet).
+        assert!(
+            seed.contains("if [ -f \"$FLEET_STACK_TEMPLATE\" ]"),
+            "{seed}"
+        );
     }
 }

@@ -58,6 +58,11 @@ pub struct CloudDesired {
     /// tags the QC-3 mirror lane loads; the doctrine record is the single
     /// authoritative pin.
     pub kolla_release: String,
+    /// QC-19 — the doctrine opted into the **OPTIONAL** Horizon dashboard
+    /// (Q25/26). `false` (the default) ⇒ Horizon is not converged and no mirror
+    /// row appears — honest-absent, since Workbench is the primary Cloud UI
+    /// (Q26). `true` ⇒ the fleet also runs the horizon container.
+    pub horizon: bool,
 }
 
 /// The on-substrate doctrine record.
@@ -77,6 +82,11 @@ pub struct CloudRecord {
     /// converge-everywhere default, Q71).
     #[serde(default)]
     pub nodes: Vec<String>,
+    /// QC-19 — opt into the OPTIONAL Horizon dashboard (Q25/26). Absent/`false`
+    /// ⇒ Horizon is not converged (honest-absent — Workbench is the primary UI);
+    /// `true` ⇒ the fleet also runs the horizon container.
+    #[serde(default)]
+    pub horizon: bool,
 }
 
 impl CloudRecord {
@@ -98,6 +108,7 @@ impl CloudRecord {
             enabled: self.enabled && in_scope,
             leader,
             kolla_release: self.kolla_release.clone(),
+            horizon: self.horizon,
         }
     }
 }
@@ -221,6 +232,7 @@ impl FleetStateSource for MeshFleetState {
                 enabled: false,
                 leader,
                 kolla_release: String::new(),
+                horizon: false,
             },
             |record| record.fold(&self.host, leader),
         ))
@@ -242,6 +254,9 @@ pub fn desired_services(view: &CloudDesired) -> BTreeSet<ServiceKind> {
             Placement::EveryNode => true,
             Placement::LeaderOnly => view.leader,
         })
+        // QC-19 — Horizon is the OPTIONAL dashboard (Q25/26): converged only when
+        // the doctrine opts in, honest-absent otherwise (no fabricated row).
+        .filter(|kind| *kind != ServiceKind::Horizon || view.horizon)
         .collect()
 }
 
@@ -254,6 +269,7 @@ mod tests {
             enabled,
             leader,
             kolla_release: "2024.1".into(),
+            horizon: false,
         }
     }
 
@@ -272,19 +288,28 @@ mod tests {
             .filter(|k| k.placement() == Placement::LeaderOnly)
             .count();
         let set = desired_services(&view(true, false));
-        assert_eq!(set.len(), ServiceKind::ALL.len() - leader_only);
+        // Every-node set minus the OPTIONAL Horizon dashboard, which is opt-in
+        // off in this fixture (QC-19 — honest-absent by default).
+        assert_eq!(set.len(), ServiceKind::ALL.len() - leader_only - 1);
+        assert!(
+            !set.contains(&ServiceKind::Horizon),
+            "Horizon is opt-in off"
+        );
         // The leader-hosted set stays off a non-leader.
         assert!(!set.contains(&ServiceKind::Mariadb));
         assert!(!set.contains(&ServiceKind::OvnNbDb));
         assert!(!set.contains(&ServiceKind::OvnNorthd));
         // The APIs + per-node agents (incl. the per-chassis ovn-controller) run
-        // everywhere.
+        // everywhere — including the wave-2 Heat + Octavia services (QC-19).
         assert!(set.contains(&ServiceKind::Keystone));
         assert!(set.contains(&ServiceKind::NovaCompute));
         assert!(set.contains(&ServiceKind::NeutronServer));
         assert!(set.contains(&ServiceKind::OvnController));
         assert!(set.contains(&ServiceKind::Rabbitmq));
         assert!(set.contains(&ServiceKind::Memcached));
+        assert!(set.contains(&ServiceKind::HeatApi));
+        assert!(set.contains(&ServiceKind::HeatEngine));
+        assert!(set.contains(&ServiceKind::OctaviaApi));
     }
 
     #[test]
@@ -293,27 +318,64 @@ mod tests {
         // leader, re-placed on failover (a leader flip changes the fold output,
         // nothing else).
         let set = desired_services(&view(true, true));
-        assert_eq!(set.len(), ServiceKind::ALL.len());
+        // The whole catalog minus the opt-in-off Horizon dashboard (QC-19).
+        assert_eq!(set.len(), ServiceKind::ALL.len() - 1);
+        assert!(
+            !set.contains(&ServiceKind::Horizon),
+            "Horizon is opt-in off"
+        );
         assert!(set.contains(&ServiceKind::Mariadb));
         assert!(set.contains(&ServiceKind::OvnNbDb));
         assert!(set.contains(&ServiceKind::OvnSbDb));
         assert!(set.contains(&ServiceKind::OvnNorthd));
     }
 
+    #[test]
+    fn horizon_is_desired_only_when_the_doctrine_opts_in() {
+        // QC-19 — the OPTIONAL dashboard (Q25/26): off by default (honest-absent,
+        // no fabricated row), converged only when the doctrine opts in.
+        let mut opted_in = view(true, true);
+        opted_in.horizon = true;
+        let on = desired_services(&opted_in);
+        assert!(
+            on.contains(&ServiceKind::Horizon),
+            "opt-in converges Horizon"
+        );
+        assert_eq!(
+            on.len(),
+            ServiceKind::ALL.len(),
+            "opt-in adds Horizon back to the full catalog"
+        );
+        // Off ⇒ absent from the desired set entirely.
+        assert!(!desired_services(&view(true, true)).contains(&ServiceKind::Horizon));
+    }
+
     // ── QC-4: the record parse + fold ──
 
     #[test]
     fn record_parses_and_folds_the_leader_bit() {
-        let rec = CloudRecord::from_toml(
-            "enabled = true\nkolla_release = \"2024.1\"\n",
-        )
-        .expect("valid doctrine");
+        let rec = CloudRecord::from_toml("enabled = true\nkolla_release = \"2024.1\"\n")
+            .expect("valid doctrine");
         assert_eq!(rec.kolla_release, "2024.1");
         assert!(rec.nodes.is_empty(), "no scoping ⇒ every node");
         // The leader bit rides in from the /mesh/leader fold, not the record.
         assert!(rec.fold("node-a", true).leader);
         assert!(!rec.fold("node-a", false).leader);
         assert!(rec.fold("node-a", false).enabled);
+        // QC-19 — Horizon defaults off (absent field) and folds through.
+        assert!(!rec.horizon, "absent horizon field ⇒ opt-in off");
+        assert!(!rec.fold("node-a", true).horizon);
+    }
+
+    #[test]
+    fn record_parses_the_horizon_opt_in() {
+        // QC-19 — the OPTIONAL dashboard opt-in rides the doctrine record and
+        // folds into the desired view (Q25/26).
+        let rec =
+            CloudRecord::from_toml("enabled = true\nkolla_release = \"2024.1\"\nhorizon = true\n")
+                .expect("valid doctrine");
+        assert!(rec.horizon, "the opt-in parses");
+        assert!(rec.fold("node-a", false).horizon, "and folds through");
     }
 
     #[test]
@@ -364,10 +426,7 @@ mod tests {
     fn present_record_reads_a_parsed_desired_view() {
         // A live doctrine TOML companion on the share → a parsed CloudDesired.
         let share = tempfile::tempdir().unwrap();
-        seed_doctrine(
-            share.path(),
-            "enabled = true\nkolla_release = \"2024.1\"\n",
-        );
+        seed_doctrine(share.path(), "enabled = true\nkolla_release = \"2024.1\"\n");
         let src = MeshFleetState::new("node-a".into(), share.path().to_path_buf());
         let view = src.read().expect("valid doctrine");
         assert!(view.enabled);
