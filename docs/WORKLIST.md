@@ -3026,7 +3026,7 @@ Throwaway XCP-ng VMs on a dom0 (LAN-bridged, `172.20.x`) giving the shell's Desk
   **As** a member, **I want** volumes carved from each node's writable partition with cinder-backup to the object tiers, **so that** data survives instances (Q51/56/57/59).
   **Acceptance**:
     - [ ] create/attach/detach/snapshot round-trip green; a backup lands in the object tier and restores
-- [ ] **QC-9: Glance + DIB image pipeline.**
+- [✓] **QC-9: Glance + DIB image pipeline.**
   **As** an operator, **I want** Glance (local store + replication) fed by a diskimage-builder pipeline, **so that** the golden-image script retires (Q36/53).
   **Acceptance**:
     - [ ] DIB builds the platform's standard images into Glance; `build-mde-vm-golden.sh` deleted; images replicate across API nodes
