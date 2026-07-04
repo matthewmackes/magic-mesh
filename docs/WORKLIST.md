@@ -3034,7 +3034,7 @@ Throwaway XCP-ng VMs on a dom0 (LAN-bridged, `172.20.x`) giving the shell's Desk
   **As** the platform, **I want** flavors generated from real node shapes and quotas derived from real capacity divided into enforced per-user limits, **so that** guardrails are honest (Q29/39/89).
   **Acceptance**:
     - [ ] flavor set regenerates when a node joins/leaves; exceeding a per-user quota is rejected by Keystone/Nova and surfaced in the UI
-- [ ] **QC-11: typed verbs wrap the cloud.**
+- [✓] **QC-11: typed verbs wrap the cloud.**
   **As** the platform, **I want** the mackesd Bus verbs (boot/stop/rebuild/volume/net/image) reimplemented over the OpenStack APIs, **so that** §9's contract holds and GUIs never speak raw OpenStack (Q40).
   **Acceptance**:
     - [ ] every Cloud-plane action round-trips through a typed verb; verb-level integration tests (QC-16) exercise them
