@@ -57,6 +57,32 @@ const MEMCACHE_PORT: u16 = 11211;
 /// Keystone public API port.
 const KEYSTONE_PORT: u16 = 5000;
 
+// ── QC-7: the Neutron ML2/OVN flat-mesh network (Q42/43/44/49) ──
+/// OVN northbound OVSDB port — Neutron's ML2/OVN driver writes the logical
+/// network here; `ovn-northd` reads it.
+const OVN_NB_PORT: u16 = 6641;
+/// OVN southbound OVSDB port — `ovn-northd` compiles logical → physical flows
+/// here and every chassis's `ovn-controller` reads them.
+const OVN_SB_PORT: u16 = 6642;
+/// Mesh-DNS name the leader-hosted OVN northbound DB (Q15) answers on — resolves
+/// to the current leader over the overlay (Q46, like `mariadb.mesh`).
+const OVN_NB_MESH_NAME: &str = "ovn-nb.mesh";
+/// Mesh-DNS name the leader-hosted OVN southbound DB answers on.
+const OVN_SB_MESH_NAME: &str = "ovn-sb.mesh";
+/// The single flat provider network's physnet label (Q43 — one flat provider
+/// network bridged into the mesh; every instance a peer-equivalent). Matches the
+/// `flat_networks` list, the `bridge_mappings`, and the chassis
+/// `ovn-bridge-mappings`.
+const MESH_PHYSNET: &str = "mesh";
+/// The OVS provider bridge the flat physnet maps to — patched to the Nebula
+/// interface so an instance on the flat net gets a mesh-reachable address (Q43).
+const MESH_PROVIDER_BRIDGE: &str = "br-mesh";
+/// The tenant/instance MTU on the flat net, set for Geneve-over-Nebula double
+/// encap (Q49): OVN tunnels flat-net east-west between chassis over geneve on
+/// the Nebula overlay, so the 38-byte geneve header comes off the mesh underlay
+/// (≈ 1342). Rendered as Neutron's `global_physnet_mtu`.
+const MESH_NET_MTU: u16 = 1342;
+
 /// This node's Nebula overlay bind (design Q22/23) — the resolved overlay IP
 /// every `OpenStack` API binds plaintext to (the overlay IS the transport
 /// security), or the honest reason it couldn't be resolved.
@@ -342,6 +368,18 @@ fn db_url(svc: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> Strin
     format!("mysql+pymysql://{svc}:{pw}@{host}/{svc}")
 }
 
+/// The host half of an OVN NB/SB OVSDB connection string (QC-7): the leader
+/// reaches its own local OVN databases on its overlay IP, every other node
+/// reaches them over mesh-DNS — the OVN control plane is leader-hosted like
+/// `MariaDB` (Q15/Q46), so a failover moves the name, not the config.
+const fn ovn_db_host<'a>(ctx: &RenderCtx, overlay: &'a str, mesh_name: &'a str) -> &'a str {
+    if ctx.leader {
+        overlay
+    } else {
+        mesh_name
+    }
+}
+
 /// The oslo.messaging transport URL (Q16 — internal RPC on `RabbitMQ`, strictly
 /// separate from mde-bus per Q67). Carries the sealed `RabbitMQ` password (QC-5).
 fn transport_url(secrets: &Secrets) -> String {
@@ -501,40 +539,11 @@ fn service_plan(
         ServiceKind::NovaScheduler => nova("nova-scheduler", overlay, ctx, secrets),
         ServiceKind::NovaConductor => nova("nova-conductor", overlay, ctx, secrets),
         ServiceKind::NovaCompute => nova("nova-compute", overlay, ctx, secrets),
-        ServiceKind::NeutronServer => ServicePlan {
-            command: "neutron-server --config-file /etc/neutron/neutron.conf \
-                      --config-file /etc/neutron/plugins/ml2/ml2_conf.ini"
-                .to_string(),
-            files: vec![
-                ConfFile {
-                    name: "neutron.conf",
-                    dest: "/etc/neutron/neutron.conf",
-                    owner: "neutron:neutron",
-                    body: format!(
-                        "[DEFAULT]\ndebug = False\nbind_host = {host}\nbind_port = {port}\n\
-                         core_plugin = ml2\nservice_plugins = router\n\
-                         transport_url = {rpc}\n\
-                         [database]\nconnection = {db}\n{authtoken}",
-                        host = overlay,
-                        port = ServiceKind::NeutronServer.api_port().unwrap_or_default(),
-                        rpc = transport_url(secrets),
-                        db = db_url("neutron", overlay, ctx, secrets),
-                        authtoken = authtoken("neutron", overlay, secrets),
-                    ),
-                },
-                ConfFile {
-                    name: "ml2_conf.ini",
-                    dest: "/etc/neutron/plugins/ml2/ml2_conf.ini",
-                    owner: "neutron:neutron",
-                    // ML2/OVN, one flat provider net (Q42/43).
-                    body: "[ml2]\ntype_drivers = flat,geneve\n\
-                           tenant_network_types = geneve\nmechanism_drivers = ovn\n\
-                           [ml2_type_flat]\nflat_networks = mesh\n\
-                           [ml2_type_geneve]\nmax_header_size = 38\n"
-                        .to_string(),
-                },
-            ],
-        },
+        ServiceKind::NeutronServer => neutron(overlay, ctx, secrets),
+        ServiceKind::OvnNbDb => ovn_nb_db(overlay),
+        ServiceKind::OvnSbDb => ovn_sb_db(overlay),
+        ServiceKind::OvnNorthd => ovn_northd(overlay, ctx),
+        ServiceKind::OvnController => ovn_controller(overlay, ctx),
         ServiceKind::CinderApi => cinder("cinder-api", overlay, ctx, secrets),
         ServiceKind::CinderScheduler => cinder("cinder-scheduler", overlay, ctx, secrets),
         ServiceKind::CinderVolume => cinder("cinder-volume", overlay, ctx, secrets),
@@ -597,6 +606,142 @@ fn cinder(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> S
                 rpc = transport_url(secrets),
                 db = db_url("cinder", overlay, ctx, secrets),
                 authtoken = authtoken("cinder", overlay, secrets),
+            ),
+        }],
+    }
+}
+
+// ─────────────────────── QC-7: Neutron ML2/OVN flat mesh ───────────────────────
+
+/// The Neutron server plan (Q42/43/44/49): ML2 with the **OVN** mechanism over
+/// **one flat provider network** bridged into the mesh — deliberately **no
+/// tenant overlay** (`tenant_network_types` is empty; `type_drivers` is `flat`),
+/// so an instance attaches to the flat net and gets a mesh-reachable address, a
+/// peer-equivalent "inside" the mesh with no per-instance cert (Q44).
+///
+/// - `neutron.conf`: the overlay-bound API listener (QC-6, Q22/23), the RPC
+///   transport (Q16), the DB connection (Q15), the shared Keystone authtoken,
+///   and `global_physnet_mtu` set for Geneve-over-Nebula double encap (Q49).
+/// - `ml2_conf.ini`: the flat-only ML2 config, the `mesh:br-mesh` provider
+///   bridge mapping, and the `[ovn]` section pointing at the leader-hosted OVN
+///   NB/SB OVSDBs (reached locally on the leader, over mesh-DNS elsewhere).
+fn neutron(overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
+    let nb_host = ovn_db_host(ctx, overlay, OVN_NB_MESH_NAME);
+    let sb_host = ovn_db_host(ctx, overlay, OVN_SB_MESH_NAME);
+    ServicePlan {
+        command: "neutron-server --config-file /etc/neutron/neutron.conf \
+                  --config-file /etc/neutron/plugins/ml2/ml2_conf.ini"
+            .to_string(),
+        files: vec![
+            ConfFile {
+                name: "neutron.conf",
+                dest: "/etc/neutron/neutron.conf",
+                owner: "neutron:neutron",
+                // Pure-L2 flat net: no L3/router service plugin (instances reach
+                // the mesh directly on the flat net — Q43/44). MTU set for
+                // Geneve-over-Nebula (Q49).
+                body: format!(
+                    "[DEFAULT]\ndebug = False\nbind_host = {host}\nbind_port = {port}\n\
+                     core_plugin = ml2\nservice_plugins =\n\
+                     global_physnet_mtu = {mtu}\n\
+                     transport_url = {rpc}\n\
+                     [database]\nconnection = {db}\n{authtoken}",
+                    host = overlay,
+                    port = ServiceKind::NeutronServer.api_port().unwrap_or_default(),
+                    mtu = MESH_NET_MTU,
+                    rpc = transport_url(secrets),
+                    db = db_url("neutron", overlay, ctx, secrets),
+                    authtoken = authtoken("neutron", overlay, secrets),
+                ),
+            },
+            ConfFile {
+                name: "ml2_conf.ini",
+                dest: "/etc/neutron/plugins/ml2/ml2_conf.ini",
+                owner: "neutron:neutron",
+                // ML2/OVN, ONE flat provider net (Q42/43): mechanism_drivers =
+                // ovn, type_drivers = flat, and `tenant_network_types` is empty —
+                // the flat-over-mesh posture, NOT a geneve tenant overlay (Q44).
+                // The `[ovn]` section binds to the leader-hosted NB/SB OVSDBs.
+                body: format!(
+                    "[ml2]\ntype_drivers = flat\ntenant_network_types =\n\
+                     mechanism_drivers = ovn\nextension_drivers = port_security\n\
+                     [ml2_type_flat]\nflat_networks = {MESH_PHYSNET}\n\
+                     [securitygroup]\nenable_security_group = True\n\
+                     [ovs]\nbridge_mappings = {MESH_PHYSNET}:{MESH_PROVIDER_BRIDGE}\n\
+                     [ovn]\novn_nb_connection = tcp:{nb_host}:{OVN_NB_PORT}\n\
+                     ovn_sb_connection = tcp:{sb_host}:{OVN_SB_PORT}\n\
+                     ovn_metadata_enabled = False\n",
+                ),
+            },
+        ],
+    }
+}
+
+/// The OVN northbound OVSDB plan (QC-7, leader-only) — binds the NB DB to this
+/// node's overlay IP on [`OVN_NB_PORT`], plaintext (the overlay IS the transport
+/// security, Q23; `--db-nb-create-insecure-remote=yes`). Command-only: the
+/// ovsdb daemon carries its whole config on the argv (like memcached).
+fn ovn_nb_db(overlay: &str) -> ServicePlan {
+    ServicePlan {
+        command: format!(
+            "/usr/share/ovn/scripts/ovn-ctl --db-nb-addr={overlay} --db-nb-port={OVN_NB_PORT} \
+             --db-nb-create-insecure-remote=yes run_nb_ovsdb"
+        ),
+        files: Vec::new(),
+    }
+}
+
+/// The OVN southbound OVSDB plan (QC-7, leader-only) — binds the SB DB to the
+/// overlay IP on [`OVN_SB_PORT`], plaintext over the mesh (Q23).
+fn ovn_sb_db(overlay: &str) -> ServicePlan {
+    ServicePlan {
+        command: format!(
+            "/usr/share/ovn/scripts/ovn-ctl --db-sb-addr={overlay} --db-sb-port={OVN_SB_PORT} \
+             --db-sb-create-insecure-remote=yes run_sb_ovsdb"
+        ),
+        files: Vec::new(),
+    }
+}
+
+/// The `ovn-northd` plan (QC-7, leader-only) — translates NB → SB. It runs only
+/// on the leader, where both OVSDBs are local, so it wires each to the leader's
+/// overlay IP (the [`ovn_db_host`] leader branch). Command-only.
+fn ovn_northd(overlay: &str, ctx: &RenderCtx) -> ServicePlan {
+    let nb_host = ovn_db_host(ctx, overlay, OVN_NB_MESH_NAME);
+    let sb_host = ovn_db_host(ctx, overlay, OVN_SB_MESH_NAME);
+    ServicePlan {
+        command: format!(
+            "/usr/share/ovn/scripts/ovn-ctl --ovn-nb-db=tcp:{nb_host}:{OVN_NB_PORT} \
+             --ovn-sb-db=tcp:{sb_host}:{OVN_SB_PORT} run_northd"
+        ),
+        files: Vec::new(),
+    }
+}
+
+/// The per-chassis `ovn-controller` plan (QC-7, every node) — programs the host
+/// Open vSwitch (the OVS datapath rides the image, Q12) for the flat provider
+/// net. The rendered file carries the chassis external-ids the container's
+/// entrypoint applies via `ovs-vsctl`: the SB DB remote (leader-hosted, reached
+/// over mesh-DNS off the leader), the **geneve** inter-chassis encap on this
+/// node's overlay IP (Q49 — tunnels ride the Nebula overlay), and the
+/// `mesh:br-mesh` provider bridge mapping that puts an instance on the mesh.
+fn ovn_controller(overlay: &str, ctx: &RenderCtx) -> ServicePlan {
+    let sb_host = ovn_db_host(ctx, overlay, OVN_SB_MESH_NAME);
+    ServicePlan {
+        command: "/usr/bin/ovn-controller unix:/run/openvswitch/db.sock".to_string(),
+        files: vec![ConfFile {
+            name: "ovn-controller.conf",
+            dest: "/etc/ovn/ovn-controller.conf",
+            owner: "root:root",
+            body: format!(
+                "# QC-7 chassis external-ids for the host Open vSwitch (Q12 — the\n\
+                 # OVS datapath rides the image; ovn-controller programs it).\n\
+                 # Applied by the container entrypoint via:\n\
+                 #   ovs-vsctl set open . external_ids:<key>=<value>\n\
+                 external_ids:ovn-remote = tcp:{sb_host}:{OVN_SB_PORT}\n\
+                 external_ids:ovn-encap-type = geneve\n\
+                 external_ids:ovn-encap-ip = {overlay}\n\
+                 external_ids:ovn-bridge-mappings = {MESH_PHYSNET}:{MESH_PROVIDER_BRIDGE}\n",
             ),
         }],
     }
@@ -950,5 +1095,158 @@ mod tests {
         assert!(reason.contains("not on the mesh"), "{reason}");
         // Nothing was written — no 0.0.0.0-bound config left behind.
         assert!(!config_rendered(dir.path(), ServiceKind::Keystone));
+    }
+
+    // ── QC-7: the Neutron ML2/OVN flat mesh network ──
+
+    /// Read a command-only service's launch command out of its `config.json`
+    /// (the OVN OVSDB daemons + northd carry their whole config on the argv).
+    fn read_command(root: &Path, kind: ServiceKind) -> String {
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join(kind.container_name()).join("config.json")).unwrap(),
+        )
+        .unwrap();
+        cfg["command"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn neutron_is_flat_over_mesh_not_a_tenant_overlay() {
+        // Q42/43/44 — the ML2 config is OVN + ONE flat provider net; there is NO
+        // tenant overlay (empty tenant_network_types, flat type_driver only), so
+        // an instance is a mesh peer-equivalent on the flat net, not a geneve
+        // tenant-network guest.
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::NeutronServer, &ctx(false)).unwrap();
+        let ml2 = read_conf(dir.path(), ServiceKind::NeutronServer, "ml2_conf.ini");
+        assert!(ml2.contains("mechanism_drivers = ovn"), "{ml2}");
+        assert!(ml2.contains("type_drivers = flat"), "{ml2}");
+        // The flat-over-mesh signal: no tenant overlay networks.
+        assert!(ml2.contains("tenant_network_types =\n"), "{ml2}");
+        assert!(
+            !ml2.contains("tenant_network_types = geneve"),
+            "must NOT be a geneve tenant overlay: {ml2}"
+        );
+        assert!(!ml2.contains("type_drivers = flat,geneve"), "{ml2}");
+        // The single flat provider net + its provider bridge mapping into the
+        // mesh.
+        assert!(ml2.contains("flat_networks = mesh"), "{ml2}");
+        assert!(ml2.contains("bridge_mappings = mesh:br-mesh"), "{ml2}");
+    }
+
+    #[test]
+    fn neutron_ovn_section_binds_the_leader_hosted_dbs() {
+        // QC-7/Q15 — the [ovn] section points Neutron's ML2/OVN driver at the
+        // leader-hosted NB/SB OVSDBs: over mesh-DNS from a non-leader, on the
+        // local overlay IP on the leader (a failover moves the name, not config).
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::NeutronServer, &ctx(false)).unwrap();
+        let ml2 = read_conf(dir.path(), ServiceKind::NeutronServer, "ml2_conf.ini");
+        assert!(
+            ml2.contains("ovn_nb_connection = tcp:ovn-nb.mesh:6641"),
+            "{ml2}"
+        );
+        assert!(
+            ml2.contains("ovn_sb_connection = tcp:ovn-sb.mesh:6642"),
+            "{ml2}"
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        render_service_config(dir2.path(), ServiceKind::NeutronServer, &ctx(true)).unwrap();
+        let ml2_leader = read_conf(dir2.path(), ServiceKind::NeutronServer, "ml2_conf.ini");
+        assert!(
+            ml2_leader.contains(&format!("ovn_nb_connection = tcp:{OVERLAY}:6641")),
+            "{ml2_leader}"
+        );
+        assert!(
+            ml2_leader.contains(&format!("ovn_sb_connection = tcp:{OVERLAY}:6642")),
+            "{ml2_leader}"
+        );
+    }
+
+    #[test]
+    fn neutron_sets_the_geneve_over_nebula_mtu() {
+        // Q49 — the tenant/instance MTU is set for Geneve-over-Nebula double
+        // encap (OVN tunnels flat-net east-west over geneve on the overlay).
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::NeutronServer, &ctx(false)).unwrap();
+        let neutron = read_conf(dir.path(), ServiceKind::NeutronServer, "neutron.conf");
+        assert!(neutron.contains("global_physnet_mtu = 1342"), "{neutron}");
+        // Pure-L2 flat net — no L3/router service plugin in the path.
+        assert!(neutron.contains("service_plugins =\n"), "{neutron}");
+        // The API still binds the overlay only (QC-6 preserved).
+        assert!(
+            neutron.contains(&format!("bind_host = {OVERLAY}")),
+            "{neutron}"
+        );
+    }
+
+    #[test]
+    fn ovn_dbs_bind_the_overlay_and_northd_wires_them() {
+        // QC-7 — the leader-hosted OVN OVSDBs bind their listeners to the overlay
+        // IP (Q23; plaintext, the overlay is the security), and northd (leader-
+        // local) wires both. Never 0.0.0.0/localhost.
+        let dir = tempfile::tempdir().unwrap();
+        let leader = ctx(true);
+        for (kind, addr, port) in [
+            (ServiceKind::OvnNbDb, "--db-nb-addr", 6641),
+            (ServiceKind::OvnSbDb, "--db-sb-addr", 6642),
+        ] {
+            render_service_config(dir.path(), kind, &leader).unwrap();
+            let cmd = read_command(dir.path(), kind);
+            assert!(
+                cmd.contains(&format!("{addr}={OVERLAY}")),
+                "{kind:?}: {cmd}"
+            );
+            assert!(cmd.contains(&port.to_string()), "{kind:?}: {cmd}");
+            assert!(cmd.contains("insecure-remote=yes"), "{kind:?}: {cmd}");
+            assert!(!cmd.contains("0.0.0.0"), "{kind:?}: {cmd}");
+            assert!(!cmd.contains("127.0.0.1"), "{kind:?}: {cmd}");
+        }
+        render_service_config(dir.path(), ServiceKind::OvnNorthd, &leader).unwrap();
+        let northd = read_command(dir.path(), ServiceKind::OvnNorthd);
+        // northd runs only on the leader, where both DBs are local.
+        assert!(
+            northd.contains(&format!("--ovn-nb-db=tcp:{OVERLAY}:6641")),
+            "{northd}"
+        );
+        assert!(
+            northd.contains(&format!("--ovn-sb-db=tcp:{OVERLAY}:6642")),
+            "{northd}"
+        );
+    }
+
+    #[test]
+    fn ovn_controller_maps_the_flat_bridge_on_every_chassis() {
+        // QC-7/Q43/49 — the per-chassis controller programs the host OVS: the SB
+        // remote (leader-hosted, reached over mesh-DNS off the leader), geneve
+        // inter-chassis encap on THIS node's overlay IP, and the mesh:br-mesh
+        // provider bridge mapping that puts an instance on the mesh.
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::OvnController, &ctx(false)).unwrap();
+        let chassis = read_conf(dir.path(), ServiceKind::OvnController, "ovn-controller.conf");
+        assert!(
+            chassis.contains("external_ids:ovn-remote = tcp:ovn-sb.mesh:6642"),
+            "{chassis}"
+        );
+        assert!(
+            chassis.contains("external_ids:ovn-encap-type = geneve"),
+            "{chassis}"
+        );
+        assert!(
+            chassis.contains(&format!("external_ids:ovn-encap-ip = {OVERLAY}")),
+            "{chassis}"
+        );
+        assert!(
+            chassis.contains("external_ids:ovn-bridge-mappings = mesh:br-mesh"),
+            "{chassis}"
+        );
+        // On the leader the SB DB is local (overlay IP).
+        let dir2 = tempfile::tempdir().unwrap();
+        render_service_config(dir2.path(), ServiceKind::OvnController, &ctx(true)).unwrap();
+        let chassis_leader = read_conf(dir2.path(), ServiceKind::OvnController, "ovn-controller.conf");
+        assert!(
+            chassis_leader.contains(&format!("external_ids:ovn-remote = tcp:{OVERLAY}:6642")),
+            "{chassis_leader}"
+        );
     }
 }

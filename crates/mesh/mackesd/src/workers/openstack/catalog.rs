@@ -64,6 +64,19 @@ pub enum ServiceKind {
     NovaCompute,
     /// Networking API — ML2/OVN (Q42), one flat provider net (Q43).
     NeutronServer,
+    // ── OVN control plane (QC-7 — the ML2/OVN backend for the flat mesh net) ──
+    /// OVN northbound OVSDB (Q42) — Neutron writes the logical network here.
+    /// Leader-hosted like `MariaDB` (Q15): one central DB, re-placed on failover.
+    OvnNbDb,
+    /// OVN southbound OVSDB — `ovn-northd` compiles logical → physical flows
+    /// here and every chassis's `ovn-controller` reads them. Leader-hosted.
+    OvnSbDb,
+    /// OVN northbound daemon — translates NB → SB. Single active instance, so
+    /// leader-only (Q15).
+    OvnNorthd,
+    /// The per-chassis OVN agent (Q42/43) — programs the host Open vSwitch (the
+    /// OVS datapath rides the image, Q12) for the flat provider net. Every node.
+    OvnController,
     /// Block-storage API (Q51).
     CinderApi,
     /// Block-storage scheduler.
@@ -75,7 +88,7 @@ pub enum ServiceKind {
 impl ServiceKind {
     /// Every catalogued service, in the canonical (enum-order) sequence the
     /// mirror rows + reconcile folds iterate.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 18] = [
         Self::Mariadb,
         Self::Rabbitmq,
         Self::Memcached,
@@ -87,6 +100,10 @@ impl ServiceKind {
         Self::NovaConductor,
         Self::NovaCompute,
         Self::NeutronServer,
+        Self::OvnNbDb,
+        Self::OvnSbDb,
+        Self::OvnNorthd,
+        Self::OvnController,
         Self::CinderApi,
         Self::CinderScheduler,
         Self::CinderVolume,
@@ -109,6 +126,10 @@ impl ServiceKind {
             Self::NovaConductor => "nova_conductor",
             Self::NovaCompute => "nova_compute",
             Self::NeutronServer => "neutron_server",
+            Self::OvnNbDb => "ovn_nb_db",
+            Self::OvnSbDb => "ovn_sb_db",
+            Self::OvnNorthd => "ovn_northd",
+            Self::OvnController => "ovn_controller",
             Self::CinderApi => "cinder_api",
             Self::CinderScheduler => "cinder_scheduler",
             Self::CinderVolume => "cinder_volume",
@@ -131,6 +152,10 @@ impl ServiceKind {
             Self::NovaConductor => "nova-conductor",
             Self::NovaCompute => "nova-compute",
             Self::NeutronServer => "neutron-server",
+            Self::OvnNbDb => "ovn-nb-db",
+            Self::OvnSbDb => "ovn-sb-db",
+            Self::OvnNorthd => "ovn-northd",
+            Self::OvnController => "ovn-controller",
             Self::CinderApi => "cinder-api",
             Self::CinderScheduler => "cinder-scheduler",
             Self::CinderVolume => "cinder-volume",
@@ -161,10 +186,17 @@ impl ServiceKind {
     }
 
     /// Where this service places (Q5/Q15/Q22).
+    ///
+    /// Leader-hosted (Q15): `MariaDB` and — QC-7 — the OVN control plane (the
+    /// northbound/southbound OVSDBs + `ovn-northd`, one central set re-placed on
+    /// failover). Everything else — the APIs (Q22), the per-node agents, and the
+    /// per-chassis `ovn-controller` — runs on every node.
     #[must_use]
     pub const fn placement(self) -> Placement {
         match self {
-            Self::Mariadb => Placement::LeaderOnly,
+            Self::Mariadb | Self::OvnNbDb | Self::OvnSbDb | Self::OvnNorthd => {
+                Placement::LeaderOnly
+            }
             _ => Placement::EveryNode,
         }
     }
@@ -304,15 +336,30 @@ mod tests {
     }
 
     #[test]
-    fn only_mariadb_is_leader_hosted() {
-        // Q15 — MariaDB rides the leader; everything else is every-node (Q22:
-        // APIs on every node, no controller box).
+    fn mariadb_and_the_ovn_control_plane_are_leader_hosted() {
+        // Q15 — MariaDB and (QC-7) the OVN control plane (NB/SB OVSDBs + northd)
+        // ride the leader; everything else is every-node (Q22: APIs on every
+        // node, no controller box — incl. the per-chassis ovn-controller).
         let leader_only: Vec<ServiceKind> = ServiceKind::ALL
             .iter()
             .copied()
             .filter(|k| k.placement() == Placement::LeaderOnly)
             .collect();
-        assert_eq!(leader_only, vec![ServiceKind::Mariadb]);
+        assert_eq!(
+            leader_only,
+            vec![
+                ServiceKind::Mariadb,
+                ServiceKind::OvnNbDb,
+                ServiceKind::OvnSbDb,
+                ServiceKind::OvnNorthd,
+            ]
+        );
+        // The chassis agent is emphatically NOT leader-only — it programs the
+        // host OVS on every node.
+        assert_eq!(
+            ServiceKind::OvnController.placement(),
+            Placement::EveryNode
+        );
     }
 
     #[test]
@@ -344,7 +391,9 @@ mod tests {
             ServiceKind::CinderApi.endpoint_url().as_deref(),
             Some("http://cinder.mesh:8776")
         );
-        // The foundation trio + the agent services carry no tenant-facing API.
+        // The foundation trio + the agent services + the OVN control plane carry
+        // no tenant-facing API (the OVN DBs speak OVSDB, not a Keystone-catalog
+        // HTTP endpoint).
         for kind in [
             ServiceKind::Mariadb,
             ServiceKind::Rabbitmq,
@@ -352,6 +401,10 @@ mod tests {
             ServiceKind::NovaScheduler,
             ServiceKind::NovaConductor,
             ServiceKind::NovaCompute,
+            ServiceKind::OvnNbDb,
+            ServiceKind::OvnSbDb,
+            ServiceKind::OvnNorthd,
+            ServiceKind::OvnController,
             ServiceKind::CinderScheduler,
             ServiceKind::CinderVolume,
         ] {

@@ -265,23 +265,39 @@ mod tests {
 
     #[test]
     fn every_node_hosts_the_full_set_minus_leader_only() {
-        // Q22 — APIs on every node; Q15 — MariaDB only on the leader.
+        // Q22 — APIs on every node; Q15 — MariaDB + (QC-7) the OVN control plane
+        // only on the leader.
+        let leader_only = ServiceKind::ALL
+            .iter()
+            .filter(|k| k.placement() == Placement::LeaderOnly)
+            .count();
         let set = desired_services(&view(true, false));
-        assert_eq!(set.len(), ServiceKind::ALL.len() - 1);
+        assert_eq!(set.len(), ServiceKind::ALL.len() - leader_only);
+        // The leader-hosted set stays off a non-leader.
         assert!(!set.contains(&ServiceKind::Mariadb));
+        assert!(!set.contains(&ServiceKind::OvnNbDb));
+        assert!(!set.contains(&ServiceKind::OvnNorthd));
+        // The APIs + per-node agents (incl. the per-chassis ovn-controller) run
+        // everywhere.
         assert!(set.contains(&ServiceKind::Keystone));
         assert!(set.contains(&ServiceKind::NovaCompute));
+        assert!(set.contains(&ServiceKind::NeutronServer));
+        assert!(set.contains(&ServiceKind::OvnController));
         assert!(set.contains(&ServiceKind::Rabbitmq));
         assert!(set.contains(&ServiceKind::Memcached));
     }
 
     #[test]
-    fn the_leader_adds_mariadb() {
-        // Q15 — the DB is a workload on the etcd leader, re-placed on
-        // failover (a leader flip changes the fold output, nothing else).
+    fn the_leader_adds_mariadb_and_the_ovn_control_plane() {
+        // Q15 — the DB + OVN NB/SB DBs + northd are workloads on the etcd
+        // leader, re-placed on failover (a leader flip changes the fold output,
+        // nothing else).
         let set = desired_services(&view(true, true));
         assert_eq!(set.len(), ServiceKind::ALL.len());
         assert!(set.contains(&ServiceKind::Mariadb));
+        assert!(set.contains(&ServiceKind::OvnNbDb));
+        assert!(set.contains(&ServiceKind::OvnSbDb));
+        assert!(set.contains(&ServiceKind::OvnNorthd));
     }
 
     // ── QC-4: the record parse + fold ──
