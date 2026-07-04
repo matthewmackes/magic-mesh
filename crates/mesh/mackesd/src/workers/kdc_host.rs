@@ -32,10 +32,20 @@
 //! peers are dialed by overlay IP, and there is no UDP broadcast discovery — all
 //! KDC traffic rides the encrypted overlay (design lock #3/#15). If the overlay
 //! IP can't be resolved the host serves the static roster (honest gate, §7).
+//!
+//! **KDC-MESH-2 (2026-07-04) — directed discovery over the mesh roster.** Each
+//! shunt tick now folds neighbors' published overlay IPs (every host's + every
+//! relayed phone's, off `kdc-phones/<host>.json`) into the `OverlayTransport`
+//! peer directory, and republishes THIS host's overlay identity + paired phones
+//! carrying their overlay IPs. The host then **directed-announces** — a unicast
+//! of our identity to each phone's overlay IP over the overlay (design #2) —
+//! never a UDP broadcast (which Nebula doesn't carry). A phone whose overlay IP
+//! isn't in the roster is honestly `not_discovered` (no broadcast fallback, §7).
 
 #![cfg(feature = "async-services")]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -534,6 +544,11 @@ async fn run_host(
     config_dir: PathBuf,
 ) {
     let announce = local_announce();
+    // KDC-MESH-2 — this node's KDC device id (its `/etc/machine-id`): published
+    // in the mesh-shunt roster as `host_device_id` so neighbors can resolve +
+    // dial THIS host by overlay IP (design #2). Captured before the announce
+    // moves into the transport.
+    let host_device_id = announce.device_id.clone();
     // KDC-MESH-1 — the Nebula-overlay-ONLY transport. The inbound TLS listener
     // binds 1716 on THIS node's overlay IP (resolved from the canonical
     // `/var/lib/mackesd/nebula/overlay-ip`, the QC-6 / `sshd_overlay_bind`
@@ -549,6 +564,10 @@ async fn run_host(
         warn!(error = %e, "kdc-host: overlay transport unavailable; serving static roster");
         return;
     }
+    // KDC-MESH-2 — the overlay IP `start` resolved for THIS node. Published in
+    // the roster (above) so the mesh can dial us; `None` only if the transport
+    // somehow reported unresolved after a successful start (defensive).
+    let host_overlay_ip = transport.overlay_status().await.overlay_ip();
     // SEC-5 — the mesh-shunt: publish this peer's paired phones to the
     // replicated volume + relay neighbors' phones into the roster, so a
     // phone paired on another peer shows up here (and is outbound-
@@ -632,7 +651,23 @@ async fn run_host(
                 }
             }
             _ = shunt_tick.tick() => {
-                run_shunt_tick(&pairing, &roster, &shunt_root, &shunt_host, &shunt_registry);
+                // KDC-MESH-2 — relay the roster (SEC-5 names) AND fold neighbors'
+                // published overlay IPs into the transport peer directory, then
+                // directed-announce over the overlay (no broadcast, #2) to every
+                // phone whose overlay IP we now know.
+                let phone_ids = run_shunt_tick(
+                    &pairing,
+                    &roster,
+                    &shunt_root,
+                    &shunt_host,
+                    &shunt_registry,
+                    &transport,
+                    HostOverlay {
+                        device_id: &host_device_id,
+                        overlay_ip: host_overlay_ip,
+                    },
+                );
+                directed_announce(&transport, &phone_ids).await;
             }
             _ = drain_tick.tick() => {
                 for send in outbound.take_all() {
@@ -978,36 +1013,149 @@ fn hostname_for_shunt() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// One mesh-shunt pass (SEC-5): publish our paired devices, relay
-/// neighbors' into the discovery registry, then fold every fresh
-/// relayed announce into the roster as a discovered peer.
+/// Wall-clock milliseconds since the epoch (roster freshness stamps +
+/// directed-announce packet ids).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// THIS host's overlay identity as it publishes it in the mesh-shunt roster:
+/// its KDC device id (`/etc/machine-id`) + the overlay IP `start` resolved.
+#[derive(Clone, Copy)]
+struct HostOverlay<'a> {
+    device_id: &'a str,
+    overlay_ip: Option<IpAddr>,
+}
+
+/// One mesh-shunt pass (SEC-5 + KDC-MESH-2): fold neighbors' relayed phones
+/// into the display roster AND their published overlay IPs (phones + hosts)
+/// into the [`OverlayTransport`] peer directory, then republish THIS host's
+/// overlay identity + paired phones (each tagged with the phone's overlay IP
+/// when the directory now knows it). Returns the set of phone device ids this
+/// host may directed-announce to — its locally-paired phones plus every relayed
+/// phone (hosts are excluded; we announce to phones, not hosts).
 fn run_shunt_tick(
     pairing: &Arc<PairingStore>,
     roster: &Roster,
     root: &std::path::Path,
     hostname: &str,
     registry: &std::sync::Mutex<mde_kdc_proto::discovery::DiscoveryRegistry>,
-) {
-    let mine: Vec<super::mesh_shunt::PublishedDevice> = pairing
-        .records()
-        .iter()
-        .map(|r| super::mesh_shunt::PublishedDevice {
-            device_id: r.device_id.clone(),
-            device_name: r.device_name.clone(),
-        })
-        .collect();
-    if let Err(e) = super::mesh_shunt::publish_phones(root, hostname, &mine) {
-        warn!(error = %e, "kdc-host: mesh-shunt publish failed");
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64);
+    transport: &OverlayTransport,
+    host: HostOverlay<'_>,
+) -> BTreeSet<String> {
+    let now = now_ms();
+    // SEC-5 name relay (unchanged): neighbors' phones → the display roster.
     let synthetic = super::mesh_shunt::collect_synthetic(root, hostname, now);
     super::mesh_shunt::inject_fresh(registry, synthetic, now);
     if let Ok(reg) = registry.lock() {
         if let Ok(mut m) = roster.lock() {
             for a in reg.take_fresh(now) {
                 apply_event(&mut m, HostEvent::PeerDiscovered(a));
+            }
+        }
+    }
+    // KDC-MESH-2 — fold neighbors' published overlay IPs (phones AND hosts)
+    // into the OverlayTransport peer directory so `open(&PeerId)` dials them
+    // directly over the overlay (design #2, no UDP broadcast).
+    let overlay = super::mesh_shunt::collect_overlay_directory(root, hostname);
+    for (device_id, ip) in overlay.phones.iter().chain(overlay.hosts.iter()) {
+        transport.set_peer_overlay_ip(device_id, *ip);
+    }
+    // Republish THIS host's overlay identity + paired phones. Own-row authority:
+    // only our own paired phones, each tagged with its overlay IP when the (now
+    // updated) directory knows it — else `None`, an honest gate (not dialable).
+    let dir_snapshot: HashMap<String, IpAddr> = transport
+        .peer_directory()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let mine: Vec<super::mesh_shunt::PublishedDevice> = pairing
+        .records()
+        .iter()
+        .map(|r| super::mesh_shunt::PublishedDevice {
+            device_id: r.device_id.clone(),
+            device_name: r.device_name.clone(),
+            overlay_ip: dir_snapshot.get(&r.device_id).map(IpAddr::to_string),
+        })
+        .collect();
+    if let Err(e) = super::mesh_shunt::publish_roster(
+        root,
+        hostname,
+        host.device_id,
+        host.overlay_ip.map(|ip| ip.to_string()),
+        &mine,
+    ) {
+        warn!(error = %e, "kdc-host: mesh-shunt publish failed");
+    }
+    // The phones we may directed-announce to: our locally-paired phones plus
+    // every relayed phone. Hosts are deliberately excluded.
+    let mut phone_ids: BTreeSet<String> =
+        pairing.records().into_iter().map(|r| r.device_id).collect();
+    phone_ids.extend(overlay.phones.into_iter().map(|(id, _)| id));
+    phone_ids
+}
+
+/// Build our `kdeconnect.identity` announce packet — the directed-discovery
+/// payload unicast to a phone over the overlay (design #2), the mesh-native
+/// replacement for stock KDE Connect's UDP identity broadcast (which Nebula
+/// doesn't carry).
+fn identity_packet(announce: &Announce) -> mde_kdc_proto::wire::Packet {
+    mde_kdc_proto::wire::Packet {
+        id: now_ms(),
+        kind: "kdeconnect.identity".to_string(),
+        body: serde_json::to_value(announce).unwrap_or(Value::Null),
+        ..Default::default()
+    }
+}
+
+/// KDC-MESH-2 directed-announce **target selection** (design #2): of the phones
+/// this host knows (`phone_ids`), pick exactly those whose overlay IP the peer
+/// directory has resolved — each is dialed directly at that overlay IP (a
+/// directed unicast), never a UDP broadcast. A phone absent from the directory
+/// is honestly skipped (its `open` would be `not_discovered`, §7); there is no
+/// broadcast fallback (KDC-MESH-1's posture). Sorted for a deterministic sweep.
+fn directed_announce_targets(
+    phone_ids: &BTreeSet<String>,
+    directory: &HashMap<String, IpAddr>,
+) -> Vec<(PeerId, IpAddr)> {
+    let mut out: Vec<(PeerId, IpAddr)> = phone_ids
+        .iter()
+        .filter_map(|id| directory.get(id).map(|ip| (PeerId::from(id.as_str()), *ip)))
+        .collect();
+    out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+    out
+}
+
+/// KDC-MESH-2 directed announce over the overlay: to every phone whose overlay
+/// IP we know ([`directed_announce_targets`]), open a directed connection at
+/// that overlay IP and send our identity — the mesh-native replacement for the
+/// UDP identity broadcast (design #2). Best-effort: a phone not yet paired on
+/// THIS node (`not_paired`) or unreachable is logged at debug and skipped,
+/// never broadcast to.
+async fn directed_announce(transport: &OverlayTransport, phone_ids: &BTreeSet<String>) {
+    let targets = {
+        let dir = transport.peer_directory();
+        let guard = dir.lock().unwrap_or_else(PoisonError::into_inner);
+        directed_announce_targets(phone_ids, &guard)
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let identity = identity_packet(transport.local_announce());
+    for (peer, ip) in targets {
+        match transport.open(&peer).await {
+            Ok(conn) => {
+                if let Err(e) = conn.send(identity.clone()).await {
+                    debug!(phone = %peer.as_str(), overlay_ip = %ip, error = %e, "kdc-host: directed announce send failed");
+                } else {
+                    debug!(phone = %peer.as_str(), overlay_ip = %ip, "kdc-host: directed announce");
+                }
+                conn.close().await;
+            }
+            Err(e) => {
+                debug!(phone = %peer.as_str(), overlay_ip = %ip, error = %e, "kdc-host: directed announce dial skipped");
             }
         }
     }
@@ -1819,6 +1967,108 @@ mod tests {
         assert_eq!(wires[1].id, "zeta");
         assert!(wires[1].online);
         assert_eq!(wires[1].battery, Some(80));
+    }
+
+    // ── KDC-MESH-2: directed discovery over the mesh roster ──────────────────
+
+    #[test]
+    fn kdc_mesh2_roster_feeds_directory_and_selects_the_phone() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let tmp = tempdir().unwrap();
+        let cfg = tmp.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let pairing = Arc::new(PairingStore::open(&cfg).unwrap());
+        // Locally pair phone-1 (known mesh-wide) + phone-ghost (no overlay IP).
+        for (id, name) in [("phone-1", "Pixel"), ("phone-ghost", "Ghost")] {
+            pairing
+                .pair(DeviceRecord {
+                    device_id: id.into(),
+                    device_name: name.into(),
+                    paired_at_ms: 1,
+                    fingerprint: "AB:CD".into(),
+                })
+                .unwrap();
+        }
+        let transport = OverlayTransport::new(local_announce(), Arc::clone(&pairing))
+            .with_overlay_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_listen_port(0);
+        let roster: Roster = Arc::new(Mutex::new(HashMap::new()));
+        let registry = std::sync::Mutex::new(mde_kdc_proto::discovery::DiscoveryRegistry::new());
+
+        // A neighbor ("hostA") publishes its overlay identity + phone-1's IP.
+        let shared = tmp.path().join("shared");
+        super::super::mesh_shunt::publish_roster(
+            &shared,
+            "hostA",
+            "hostA-devid",
+            Some("10.42.0.9".into()),
+            &[super::super::mesh_shunt::PublishedDevice {
+                device_id: "phone-1".into(),
+                device_name: "Pixel".into(),
+                overlay_ip: Some("10.42.0.77".into()),
+            }],
+        )
+        .unwrap();
+
+        // THIS host's shunt tick: relay + fold the overlay directory + republish.
+        let host_ip = IpAddr::V4(Ipv4Addr::new(10, 42, 0, 5));
+        let phone_ids = run_shunt_tick(
+            &pairing,
+            &roster,
+            &shared,
+            "hostB",
+            &registry,
+            &transport,
+            HostOverlay {
+                device_id: "hostB-devid",
+                overlay_ip: Some(host_ip),
+            },
+        );
+
+        // (1) The roster fed the directory: phone-1 + the neighbor host resolve.
+        let dir = transport.peer_directory();
+        let guard = dir.lock().unwrap();
+        assert_eq!(
+            guard.get("phone-1"),
+            Some(&IpAddr::V4(Ipv4Addr::new(10, 42, 0, 77))),
+            "the phone's overlay IP flowed roster→directory"
+        );
+        assert_eq!(
+            guard.get("hostA-devid"),
+            Some(&IpAddr::V4(Ipv4Addr::new(10, 42, 0, 9))),
+            "the neighbor host's overlay IP flowed roster→directory"
+        );
+
+        // (2) Directed-announce target selection: phone-1 at its overlay IP;
+        // phone-ghost (no roster IP) is honestly excluded (not_discovered); a
+        // host is never a directed-announce target.
+        let targets = directed_announce_targets(&phone_ids, &guard);
+        assert_eq!(
+            targets,
+            vec![(
+                PeerId::from("phone-1"),
+                IpAddr::V4(Ipv4Addr::new(10, 42, 0, 77))
+            )],
+            "only the known-IP phone is a directed-announce target"
+        );
+        assert!(
+            !targets.iter().any(|(p, _)| p.as_str() == "phone-ghost"),
+            "an unknown-IP phone is not_discovered, never a target (no broadcast)"
+        );
+        assert!(
+            !targets.iter().any(|(p, _)| p.as_str() == "hostA-devid"),
+            "a host is never a directed-announce target"
+        );
+        drop(guard);
+
+        // (3) We republished our own overlay identity so a third host learns us.
+        let raw = std::fs::read_to_string(
+            super::super::mesh_shunt::phones_dir(&shared).join("hostB.json"),
+        )
+        .unwrap();
+        let back = super::super::mesh_shunt::parse_roster(&raw).expect("our roster parses");
+        assert_eq!(back.host_device_id, "hostB-devid");
+        assert_eq!(back.host_overlay_ip.as_deref(), Some("10.42.0.5"));
     }
 
     #[test]
