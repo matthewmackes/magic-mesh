@@ -123,6 +123,12 @@ pub const ALERT_LANE_PREFIXES: &[&str] = &[
     "event/vm/",
     "event/podman/",
     "fdo/",
+    // CHAT-FIX-2 — the local-notification producer (`workers::notify`) publishes
+    // typed local system events (peer join/leave, updates, failed service,
+    // disk/SMART, journal WARN+) on `event/notify/<source>`; folding the prefix
+    // here routes each into this node's `alert:<self>` conversation the Chat
+    // surface renders (the real empty-Chat fix — design console-frontdoor.md Q34).
+    "event/notify/",
 ];
 
 /// Whether `topic` is one of chat's own lanes (never fold these — it would loop).

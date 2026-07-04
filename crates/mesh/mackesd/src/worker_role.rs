@@ -110,6 +110,16 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // deliberate rank-0 entry (the BUG-STORAGE-1 lesson), never the silent
     // unknown-worker default.
     ("unit_aggregator", 0),
+    // CHAT-FIX-2 — the local-notification producer worker: watches this node's
+    // OWN event sources (mesh peer join/leave, dnf/platform updates, systemctl
+    // --failed, df/SMART, journal WARN+) and publishes typed notifications the
+    // Chat surface renders as a timestamped feed + tray badge (the real empty-Chat
+    // fix — console-frontdoor.md Q34/46/47). UNIVERSAL (rank 0) like the chat
+    // worker it feeds: every node — lighthouse included — has local services /
+    // disks / a journal / peers to report on, and its notifications ride the same
+    // bus the chat worker folds on every role. A deliberate rank-0 census entry
+    // (the BUG-STORAGE-1 lesson), never the silent unknown-worker default.
+    ("notify", 0),
     // ── Workstation (rank 1) — everything beyond the relay control plane: the
     //    fleet + mesh storage workers AND voice / clipboard / kdc / remmina /
     //    music. A headless box is a Workstation too (the desktop workers idle
@@ -418,7 +428,10 @@ mod tests {
         // +1 unit_aggregator (EXPLORER-1 — the Hero unit-explorer daemon spine,
         // pinned at rank 0: every node folds + publishes its OWN unit view
         // (state/units/<node>), no center; the BUG-STORAGE-1 deliberate-entry lesson).
-        assert_eq!(WORKER_TIERS.len(), 41);
+        // +1 notify (CHAT-FIX-2 — the local-notification producer, pinned at rank 0:
+        // every node reports its own peer/service/disk/journal events into the Chat
+        // feed the chat worker folds; the real empty-Chat fix).
+        assert_eq!(WORKER_TIERS.len(), 42);
     }
 
     #[test]
@@ -441,8 +454,8 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            25,
-            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view)"
+            26,
+            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + notify (CHAT-FIX-2, universal local-notification producer)"
         );
         assert_eq!(
             count(1),
@@ -579,6 +592,22 @@ mod tests {
     }
 
     #[test]
+    fn notify_producer_runs_on_every_role() {
+        // CHAT-FIX-2 — the local-notification producer is universal (rank 0): every
+        // node has its own services / disks / journal / peers to report into the
+        // Chat feed the chat worker folds. A DELIBERATE rank-0 census entry (the
+        // BUG-STORAGE-1 lesson), never the silent unknown-worker default — so
+        // `mackesd role-workers` lists it on both roles.
+        assert_eq!(min_rank("notify"), 0, "notify is a universal (rank-0) worker");
+        assert!(runs("notify", Role::Workstation.rank()));
+        assert!(runs("notify", Role::Lighthouse.rank()));
+        assert!(workers_for_rank(Role::Workstation.rank()).contains(&"notify"));
+        assert!(workers_for_rank(Role::Lighthouse.rank()).contains(&"notify"));
+        // No capability tag — every node runs it.
+        assert_eq!(required_capability("notify"), None);
+    }
+
+    #[test]
     fn role_name_maps_each_rank_to_its_canonical_name() {
         // BOOKMARKS-8 — the browser-policy worker folds its per-role policy by
         // this name, so it MUST match the role.toml canonical names.
@@ -598,13 +627,13 @@ mod tests {
     fn workers_for_rank_is_a_growing_superset() {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        // 25 lighthouse-tier workers (22 control-plane + the BUG-STORAGE-1 universal
+        // 26 lighthouse-tier workers (22 control-plane + the BUG-STORAGE-1 universal
         // storage mirror + the QC-2 universal openstack worker + the EXPLORER-1
-        // universal unit_aggregator at rank 0); Workstation adds the 16 fleet +
-        // desktop workers for the full 41 (the retired Server tier folded into
-        // Workstation in the 2-role model).
-        assert_eq!(lh.len(), 25);
-        assert_eq!(ws.len(), 41);
+        // universal unit_aggregator + the CHAT-FIX-2 universal notify producer at
+        // rank 0); Workstation adds the 16 fleet + desktop workers for the full 42
+        // (the retired Server tier folded into Workstation in the 2-role model).
+        assert_eq!(lh.len(), 26);
+        assert_eq!(ws.len(), 42);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
@@ -665,17 +694,18 @@ mod tests {
             "media ≠ workstation tier"
         );
         let set = workers_for_class(media_lh);
-        // = the 25 lighthouse-tier workers (incl. link-traffic MESHMAP-6, the
+        // = the 26 lighthouse-tier workers (incl. link-traffic MESHMAP-6, the
         // BUG-STORAGE-1 universal storage mirror, the QC-2 universal openstack
-        // worker + the EXPLORER-1 universal unit_aggregator) + navidrome.
-        assert_eq!(set.len(), 26);
+        // worker, the EXPLORER-1 universal unit_aggregator + the CHAT-FIX-2
+        // universal notify producer) + navidrome.
+        assert_eq!(set.len(), 27);
         assert!(set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 25);
+        assert_eq!(workers_for_class(plain_lh).len(), 26);
     }
 
     #[test]

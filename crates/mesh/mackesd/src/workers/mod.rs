@@ -749,6 +749,18 @@ pub mod onboard_apply;
 // renders. Bus + Syncthing roots are injectable seams so the whole worker is
 // headless-testable; live 2-node delivery + real backfill are integration-gated.
 pub mod chat;
+// CHAT-FIX-2 — the local-notification producer worker (design
+// docs/design/console-frontdoor.md Q34/46/47). The real empty-Chat fix: with the
+// chat worker running but no peer chatter, nothing produced local system events,
+// so the Chat surface stayed blank. This worker watches the node's OWN sources
+// (mesh peer join/leave, dnf/platform updates, systemctl --failed, df/SMART,
+// journal WARN+) on bounded/edge-triggered polls and publishes typed
+// notifications on `event/notify/<source>` — a lane the chat worker already folds
+// (ALERT_LANE_PREFIXES) into the `alert:<self>` conversation the Chat surface
+// renders as a timestamped feed + tray badge. Every external source runs through
+// an injectable probe (absent binary ⇒ skipped honestly), so the whole worker is
+// headless-testable with fixtures; runs on EVERY node (rank 0).
+pub mod notify;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
 // text clip on the bus + appends to ONE mesh-global `clipboard/history.json`

@@ -9665,6 +9665,28 @@ fn run_serve(
             }
         }
 
+        // CHAT-FIX-2 — the `notify` worker: the local-notification PRODUCER that
+        // makes Chat non-empty absent peer chatter. It watches this node's OWN
+        // event sources (mesh peer join/leave via the replicated directory,
+        // dnf/platform updates, systemctl --failed, df/SMART thresholds, journal
+        // WARN+) on bounded/edge-triggered polls and publishes typed notifications
+        // on `event/notify/<source>` — a lane the chat worker above folds
+        // (ALERT_LANE_PREFIXES) into this node's `alert:<self>` conversation the
+        // Surface::Chat UI renders as a timestamped feed + tray badge. Runs on
+        // EVERY node (rank 0), same self_host identity as the chat worker; every
+        // external source degrades honestly when its binary is absent.
+        if mackesd_core::worker_role::runs("notify", role_rank) {
+            let self_host = node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string();
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::notify::NotifyWorker::new(
+                    workgroup_root.clone(),
+                    self_host,
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("notify".into());
+        }
+
         // TUNE-3.b (2026-05-26) — wire the v1.3.0 Fleet ansible-pull
         // worker. `crates/mackesd/src/workers/ansible_pull.rs::build`
         // has shipped since v2.0.0 Phase B.6 but stayed dead;
