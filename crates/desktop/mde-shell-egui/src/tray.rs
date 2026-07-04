@@ -111,7 +111,8 @@ const BT_ABSENT: &str = "Bluetooth: not available on this seat.";
 /// [`HIDDEN`]) and the click routing ([`route`]) are keyed off this — pure and
 /// unit-tested. (`pub`, not `pub(crate)`, is the `clippy::redundant_pub_crate`
 /// form for crate-visible items in this private module, like `dock::TASKBAR_H`.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Hash` so VDOCK-3's [`quad_cell_id`] can key a stable per-cell `egui::Id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrayItem {
     /// The live VDI session marker — visible ONLY while a session is
     /// connected/pending (lock W10's transient rule).
@@ -254,8 +255,17 @@ fn icon_view(item: TrayItem, inputs: &TrayInputs<'_>) -> IconView {
         badge: None,
     };
     match item {
-        // Visible only while a session is live, so its dot is honestly OK.
-        TrayItem::Sessions => plain(IconId::Sessions, Style::OK),
+        // In the horizontal strip Sessions shows ONLY while a session is live (its
+        // dot honestly OK then); in VDOCK-3's quad the cell is always present, so a
+        // quiet dot reads dim with no session connected (§7 — never a fake "live").
+        TrayItem::Sessions => plain(
+            IconId::Sessions,
+            if inputs.session_active {
+                Style::OK
+            } else {
+                Style::TEXT_DIM
+            },
+        ),
         TrayItem::Chat => IconView {
             glyph: IconId::Chat,
             dot: chat_dot(inputs.unread),
@@ -897,14 +907,31 @@ fn icon_cell(ui: &mut egui::Ui, view: &IconView, size: egui::Vec2) -> egui::Resp
         painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
     }
     let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(TRAY_ICON, TRAY_ICON));
-    if let Some(tex) = icon_texture(ui.ctx(), view.glyph, TRAY_ICON, Style::TEXT_DIM) {
+    paint_icon_view(ui, &painter, view, icon_rect, TRAY_ICON);
+    response
+}
+
+/// Paint a resolved [`IconView`] into `icon_rect` at the `icon_px` glyph edge: the
+/// glyph at the dim tray tint, the charging bolt overlaid in the same rect (lock
+/// W8), and the unread **badge** OR — in its place — the tiny corner status **dot**
+/// (lock W9). The single glyph/bolt/dot/badge painter (§6), shared by the
+/// horizontal strip's [`icon_cell`] (16px) and VDOCK-3's [`quad_cell`] (18px), so
+/// both render one way and only the glyph edge differs.
+fn paint_icon_view(
+    ui: &egui::Ui,
+    painter: &egui::Painter,
+    view: &IconView,
+    icon_rect: egui::Rect,
+    icon_px: f32,
+) {
+    if let Some(tex) = icon_texture(ui.ctx(), view.glyph, icon_px, Style::TEXT_DIM) {
         egui::Image::new(egui::load::SizedTexture::new(tex.id(), icon_rect.size()))
             .paint_at(ui, icon_rect);
     }
     // The charging bolt overlays the fill glyph in the same rect (lock W8),
-    // brighter than the outline so it reads at 16px.
+    // brighter than the outline so it reads at the small glyph edge.
     if view.bolt {
-        if let Some(tex) = icon_texture(ui.ctx(), IconId::BatteryBolt, TRAY_ICON, Style::TEXT) {
+        if let Some(tex) = icon_texture(ui.ctx(), IconId::BatteryBolt, icon_px, Style::TEXT) {
             egui::Image::new(egui::load::SizedTexture::new(tex.id(), icon_rect.size()))
                 .paint_at(ui, icon_rect);
         }
@@ -925,7 +952,6 @@ fn icon_cell(ui: &mut egui::Ui, view: &IconView, size: egui::Vec2) -> egui::Resp
         // The tiny corner status dot (lock W9) on the glyph's bottom-right.
         painter.circle_filled(icon_rect.right_bottom(), DOT_R, view.dot);
     }
-    response
 }
 
 /// The `^` chevron cell — glyph only, hover fill, no dot (it carries no state;
@@ -1286,17 +1312,115 @@ fn error_note(ui: &mut egui::Ui, error: Option<&str>) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// VDOCK-3 — the status **2×2 quads** (design `docs/design/vertical-dock.md`,
+// locks #6/#8/#15/#19). The left vertical dock drops the horizontal strip's `^`
+// chevron + micro-flyouts for two stacked 2×2 quads anchored at the dock's
+// bottom band: quad 1 = Chat[badge] · Bluetooth · Volume · Battery, quad 2 =
+// Status · Signal · Peers · Sessions. Every cell **routes** to its owning surface
+// on a click (no flyouts — lock #15), reusing the SAME pure folds (`icon_view`,
+// `route`, the battery ladder, the mesh dots, the Chat badge) the strip reads —
+// this is a re-layout, not a second status model (§6). Rendered by the dock's
+// `paint_dock_frame` into the empty `BOTTOM_ZONE_H` band VDOCK-2 reserved.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The status-quad glyph edge (~18px, design #12/#23 — smaller than the 24px app
+/// glyph) — token-derived on the 8px grid: `SP_M` (16) plus half an `SP_XS` (2).
+const QUAD_ICON: f32 = Style::SP_M + Style::SP_XS / 2.0;
+
+/// The two stacked 2×2 status quads (design #6), each row-major (top-left,
+/// top-right, bottom-left, bottom-right): the seat/Chat cluster over the mesh/
+/// session cluster. The one authority the render + the routing + the tests read.
+pub const STATUS_QUADS: [[TrayItem; 4]; 2] = [
+    [
+        TrayItem::Chat,
+        TrayItem::Bluetooth,
+        TrayItem::Volume,
+        TrayItem::Battery,
+    ],
+    [
+        TrayItem::Status,
+        TrayItem::Signal,
+        TrayItem::Peers,
+        TrayItem::Sessions,
+    ],
+];
+
+/// The stable per-item id of a quad cell, so the render + routing are unchanged
+/// but the layout is addressable — tests read a cell's settled `Rect` back to
+/// click its centre (the `dock::pick_cell_id` idiom, kept distinct so a quad cell
+/// never shares an id with a picker cell). Used by `quad_cell` (production) + the
+/// tray + dock tests, so it's crate-visible (`pub` in this private module).
+pub fn quad_cell_id(item: TrayItem) -> egui::Id {
+    egui::Id::new(("vdock-status-quad-cell", item))
+}
+
+/// Render VDOCK-3's two stacked **2×2 status quads** into the dock's bottom band
+/// (design #6/#8): `origin` is the top-left of the first quad and each quad is a
+/// `quad`-wide × `quad`-tall 2×2 grid of `quad / 2` cells (so the two quads occupy
+/// `2 · quad` of the band, VDOCK-4's system quad the remainder). Every cell folds
+/// its live [`IconView`] and **routes** to its owning [`Surface`] on a click (lock
+/// #15 — no flyouts); the Chat cell carries the CHAT-FIX-2 unread badge (#19).
+/// Paints through `ui.interact` over explicit rects (the dock's `&Ui` idiom), so
+/// it composes inside `paint_dock_frame`. Returns `true` if a cell routed.
+#[allow(
+    clippy::cast_precision_loss, // the quad / row / col indices are tiny (0..4)
+    clippy::suboptimal_flops     // layout arithmetic reads clearer than mul_add
+)]
+pub fn status_quads(
+    ui: &egui::Ui,
+    active: &mut Surface,
+    inputs: &TrayInputs<'_>,
+    origin: egui::Pos2,
+    quad: f32,
+) -> bool {
+    let cell = quad / 2.0;
+    let mut routed = false;
+    for (q, items) in STATUS_QUADS.iter().enumerate() {
+        let quad_top = origin.y + q as f32 * quad;
+        for (i, &item) in items.iter().enumerate() {
+            let (row, col) = (i / 2, i % 2);
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(origin.x + col as f32 * cell, quad_top + row as f32 * cell),
+                egui::vec2(cell, cell),
+            );
+            if quad_cell(ui, item, inputs, rect) {
+                *active = route(item);
+                routed = true;
+            }
+        }
+    }
+    routed
+}
+
+/// One status-quad cell (design #12/#15/#19): the item's live [`IconView`] painted
+/// at [`QUAD_ICON`] through the shared [`paint_icon_view`] (glyph · bolt · dot, or
+/// the Chat badge in the dot's place), a hover fill only — no tooltip. A click
+/// **routes** (returns `true`; the caller sets `active`). `&Ui` + `ui.interact`
+/// over the explicit `rect`, so it paints inside the dock's frame.
+fn quad_cell(ui: &egui::Ui, item: TrayItem, inputs: &TrayInputs<'_>, rect: egui::Rect) -> bool {
+    let view = icon_view(item, inputs);
+    let response = ui.interact(rect, quad_cell_id(item), egui::Sense::click());
+    let painter = ui.painter().clone();
+    if response.hovered() {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(QUAD_ICON, QUAD_ICON));
+    paint_icon_view(ui, &painter, &view, icon_rect, QUAD_ICON);
+    response.clicked()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         battery_fill_icon, battery_tone, charging, chat_badge, chat_dot, chat_flyout_header,
         clock_lines, connected_line, drive_bt_power, drive_master_mute, drive_master_volume,
-        icon_view, peers_dot, route, signal_dot, status_dot, strip_items, system_pack, tray,
-        volume_view, Echo, Echoes, OpenFlyout, TrayInputs, TrayItem, TrayState, TrayVerbs,
-        ECHO_TTL, HIDDEN, ROW_H,
+        icon_view, peers_dot, quad_cell_id, route, signal_dot, status_dot, status_quads,
+        strip_items, system_pack, tray, volume_view, Echo, Echoes, OpenFlyout, TrayInputs,
+        TrayItem, TrayState, TrayVerbs, ECHO_TTL, HIDDEN, ROW_H, STATUS_QUADS,
     };
     use crate::chrome::MeshSummary;
-    use crate::dock::{Surface, TASKBAR_H};
+    use crate::dock::{Surface, DOCK_W, TASKBAR_H};
     use mde_cosmic_applet::LighthouseHealth;
     use mde_egui::egui;
     use mde_egui::Style;
@@ -2043,6 +2167,235 @@ mod tests {
         assert_eq!(
             clock_lines(1_577_836_800 + 13 * 3600 + 5 * 60 + 59),
             ("13:05".to_string(), "2020-01-01".to_string())
+        );
+    }
+
+    // ── VDOCK-3: the status 2×2 quads (design #6/#8/#15/#19) ──────────────────
+
+    #[test]
+    fn the_status_quads_are_two_stacked_2x2_grids() {
+        // Design #6 — two quads, four cells each (2×2×2 = eight cells): the seat/
+        // Chat cluster over the mesh/session cluster, in the locked order.
+        assert_eq!(STATUS_QUADS.len(), 2, "two stacked quads");
+        for q in STATUS_QUADS {
+            assert_eq!(q.len(), 4, "each quad is a 2×2 grid");
+        }
+        assert_eq!(
+            STATUS_QUADS.iter().flatten().count(),
+            8,
+            "eight status cells"
+        );
+        assert_eq!(
+            STATUS_QUADS[0],
+            [
+                TrayItem::Chat,
+                TrayItem::Bluetooth,
+                TrayItem::Volume,
+                TrayItem::Battery
+            ],
+            "quad 1: Chat · BT · Vol · Batt"
+        );
+        assert_eq!(
+            STATUS_QUADS[1],
+            [
+                TrayItem::Status,
+                TrayItem::Signal,
+                TrayItem::Peers,
+                TrayItem::Sessions
+            ],
+            "quad 2: Status · Signal · Peers · Sessions"
+        );
+    }
+
+    /// Mount the two status quads alone in a `CentralPanel` (the vdock tests'
+    /// headless `ctx.run` harness) at the bottom of a `DOCK_W`-wide column, over a
+    /// present unmuted mixer, and run one frame feeding `events`. The two quads span
+    /// `2 · DOCK_W` down from `origin`.
+    fn run_quads(
+        ctx: &egui::Context,
+        active: &mut Surface,
+        unread: usize,
+        session_active: bool,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mesh = MeshSummary::default();
+        let mut s = seat();
+        s.mixer = Probe::Present(mixer(false));
+        let inputs = TrayInputs {
+            mesh: &mesh,
+            seat: Some(&s),
+            unread,
+            session_active,
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(DOCK_W, 400.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::default())
+                .show(ctx, |ui| {
+                    // Anchor the two-quad span (2 · DOCK_W tall) at the column bottom.
+                    let quads_span = 2.0 * DOCK_W;
+                    let origin = egui::pos2(0.0, 400.0 - quads_span);
+                    let _ = status_quads(ui, active, &inputs, origin, DOCK_W);
+                });
+        })
+    }
+
+    /// Every text string painted this frame (recursing shape groups). The quad
+    /// cells are icon-only, so the only text is the Chat unread badge count.
+    fn badge_texts(out: &egui::FullOutput) -> Vec<String> {
+        fn walk(shape: &egui::Shape, acc: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => acc.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, acc);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut acc = Vec::new();
+        for clipped in &out.shapes {
+            walk(&clipped.shape, &mut acc);
+        }
+        acc
+    }
+
+    #[test]
+    fn the_quads_lay_out_as_two_stacked_2x2_grids() {
+        // Design #6/#8 — the eight cells form two 2×2 grids stacked vertically: in
+        // each quad two columns × two rows of equal DOCK_W/2 cells, quad 2 a full
+        // quad directly beneath quad 1, spanning the full column width.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut active = Surface::Workbench;
+        // Prime two frames so every cell rect settles under its stable id.
+        let _ = run_quads(&ctx, &mut active, 0, true, Vec::new());
+        let _ = run_quads(&ctx, &mut active, 0, true, Vec::new());
+
+        let rect_of = |item| {
+            ctx.read_response(quad_cell_id(item))
+                .expect("quad cell registered")
+                .rect
+        };
+        let cell = DOCK_W / 2.0;
+        for quad in STATUS_QUADS {
+            let (tl, tr, bl, br) = (
+                rect_of(quad[0]),
+                rect_of(quad[1]),
+                rect_of(quad[2]),
+                rect_of(quad[3]),
+            );
+            for r in [tl, tr, bl, br] {
+                assert!((r.width() - cell).abs() < 1.0, "cell is DOCK_W/2 wide");
+                assert!((r.height() - cell).abs() < 1.0, "cell is DOCK_W/2 tall");
+            }
+            // Two columns: the left cells share a left edge, the right cells sit one
+            // cell over.
+            assert!((tl.left() - bl.left()).abs() < 1.0, "left column aligned");
+            assert!(
+                (tr.left() - tl.right()).abs() < 1.0,
+                "right column one cell over"
+            );
+            assert!((br.left() - tr.left()).abs() < 1.0, "right column aligned");
+            // Two rows: the top cells share a top edge, the bottom cells one down.
+            assert!((tl.top() - tr.top()).abs() < 1.0, "top row aligned");
+            assert!(
+                (bl.top() - tl.bottom()).abs() < 1.0,
+                "bottom row one cell down"
+            );
+            assert!((br.top() - bl.top()).abs() < 1.0, "bottom row aligned");
+        }
+        // Quad 2 is stacked a full quad below quad 1.
+        let q1_top = rect_of(STATUS_QUADS[0][0]).top();
+        let q2_top = rect_of(STATUS_QUADS[1][0]).top();
+        assert!(
+            (q2_top - (q1_top + DOCK_W)).abs() < 1.0,
+            "quad 2 sits a full quad below quad 1"
+        );
+        // The quad spans the full column width (two DOCK_W/2 columns).
+        let span = rect_of(STATUS_QUADS[0][1]).right() - rect_of(STATUS_QUADS[0][0]).left();
+        assert!(
+            (span - DOCK_W).abs() < 1.0,
+            "the quad spans the column width"
+        );
+    }
+
+    #[test]
+    fn every_status_quad_cell_routes_to_its_owning_surface() {
+        // Lock #15 — a click on any of the eight quad cells routes `active` to the
+        // surface that owns its state (no flyouts). Mount the quads, read each
+        // cell's settled centre by its stable id, click it, and assert the route.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut warm = Surface::Workbench;
+        let _ = run_quads(&ctx, &mut warm, 0, true, Vec::new());
+        let _ = run_quads(&ctx, &mut warm, 0, true, Vec::new());
+
+        let mut centers: Vec<(TrayItem, egui::Pos2)> = Vec::new();
+        for &item in STATUS_QUADS.iter().flatten() {
+            let resp = ctx.read_response(quad_cell_id(item));
+            assert!(resp.is_some(), "{item:?} quad cell rect not registered");
+            centers.push((item, resp.expect("registered above").rect.center()));
+        }
+        for (item, center) in centers {
+            let want = route(item);
+            // Start off the target surface so the route is observable.
+            let mut active = if want == Surface::Workbench {
+                Surface::About
+            } else {
+                Surface::Workbench
+            };
+            let _ = run_quads(
+                &ctx,
+                &mut active,
+                0,
+                true,
+                vec![egui::Event::PointerMoved(center), press(center, true)],
+            );
+            let _ = run_quads(&ctx, &mut active, 0, true, vec![press(center, false)]);
+            assert_eq!(
+                active, want,
+                "clicking {item:?}'s quad cell routes to {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_chat_quad_cell_carries_the_unread_badge() {
+        // Design #19 — the Chat cell's badge counts the CHAT-FIX-2 unread tally +
+        // peer messages (the SAME `unread` fold the strip counts). The quad cells
+        // are icon-only, so with unread > 0 the ONLY text in the render is the badge
+        // count; a quiet (0) tally paints no badge, and the count caps at "99+".
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut active = Surface::Workbench;
+
+        let quiet = run_quads(&ctx, &mut active, 0, false, Vec::new());
+        assert!(
+            badge_texts(&quiet).is_empty(),
+            "a quiet tray paints no badge (the quads are icon-only)"
+        );
+
+        let five = run_quads(&ctx, &mut active, 5, false, Vec::new());
+        assert_eq!(
+            badge_texts(&five),
+            vec!["5".to_string()],
+            "the Chat cell shows the unread count"
+        );
+
+        let flood = run_quads(&ctx, &mut active, 250, false, Vec::new());
+        assert_eq!(
+            badge_texts(&flood),
+            vec!["99+".to_string()],
+            "the badge caps at 99+ (the strip's cap)"
         );
     }
 }

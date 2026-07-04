@@ -39,8 +39,10 @@
 
 use mde_egui::egui::{self, TextureHandle, TextureOptions};
 use mde_egui::{Motion, Style};
+use mde_seat::SeatSnapshot;
 use mde_theme::brand::icons::{icon_image, IconId};
 
+use crate::chrome::MeshSummary;
 use crate::tray::{self, TrayInputs, TrayState};
 
 /// Which surface fills the shell body.
@@ -719,6 +721,30 @@ pub struct DockState {
     /// Whether the '…' **overflow** more-popup is open (VDOCK-2, lock #22) — set by
     /// the '…' cell, cleared on a route or a click-away.
     overflow_open: bool,
+    /// The live inputs VDOCK-3's bottom **status quads** fold each frame (the mesh
+    /// summary, the seat snapshot, the Chat unread tally, the live-session flag) —
+    /// owned so `dock()` keeps its `(ctx, state)` signature; the shell refreshes it
+    /// via [`Self::set_status_inputs`] before each `dock()`. Defaults to the honest
+    /// pre-poll state (unseen mesh, no seat, no unread, no session).
+    status: StatusInputs,
+}
+
+/// The live inputs the bottom **status quads** (VDOCK-3) fold — bundled into ONE
+/// [`DockState`] field (rather than four) so the dock keeps its bool count under
+/// the `clippy::struct_excessive_bools` bar. Owned clones, refreshed each frame by
+/// the shell through [`DockState::set_status_inputs`], so the vertical
+/// `dock(ctx, state)` needs no extra parameters. The fields mirror [`TrayInputs`],
+/// which the quad render borrows from them.
+#[derive(Debug, Default)]
+struct StatusInputs {
+    /// The world-readable mesh summary — the Status / Signal / Peers dots.
+    mesh: MeshSummary,
+    /// The `mde-seat` snapshot (Bluetooth / Volume / Battery), `None` pre-poll.
+    seat: Option<SeatSnapshot>,
+    /// The whole-mesh Chat unread tally — the Chat cell's badge (#19).
+    unread: usize,
+    /// `true` while a VDI session is live — the Sessions cell's honest tone.
+    session_active: bool,
 }
 
 impl DockState {
@@ -749,6 +775,30 @@ impl DockState {
             self.revealed = true;
         }
     }
+
+    /// Refresh the bottom **status quads'** live inputs (VDOCK-3) — the shell calls
+    /// this each frame before [`dock`] with the SAME folds the horizontal tray
+    /// reads (`chrome.summary()`, `system.snapshot()`, `chat.total_unread()`, the
+    /// live-session flag). Owned so the dock's `(ctx, state)` signature stays put;
+    /// the quads render the pre-poll dim state until the first call lands (§7).
+    // The one caller — `main.rs::mount_dock_chrome` — is a parallel VDOCK unit
+    // outside this dock.rs/tray.rs fence, so the seam lands here first (the dock
+    // tests exercise it); allow the transient dead_code until that wire arrives.
+    #[allow(dead_code)]
+    pub fn set_status_inputs(
+        &mut self,
+        mesh: MeshSummary,
+        seat: Option<SeatSnapshot>,
+        unread: usize,
+        session_active: bool,
+    ) {
+        self.status = StatusInputs {
+            mesh,
+            seat,
+            unread,
+            session_active,
+        };
+    }
 }
 
 /// Render the **left vertical dock** (VDOCK-1) — the slide-in, auto-hide chrome
@@ -766,11 +816,12 @@ impl DockState {
 /// seat" risk; proven by the passthrough test).
 ///
 /// VDOCK-1 built the FRAME + the slide/toggle/pin; **VDOCK-2** fills the top
-/// **Workbench-lead** zone + the single-column **app-groups** middle
-/// ([`paint_dock_frame`]). The bottom **status + system quad** zone stays a seam
-/// for VDOCK-3/4. Returns `true` if a dock control routed this frame — the pin, or
-/// a picker cell selecting its [`Surface`] (recorded in [`DockState`]'s active
-/// surface, which the shell reads back to surface the body).
+/// **Workbench-lead** zone + the single-column **app-groups** middle; **VDOCK-3**
+/// fills the bottom **status quads** ([`paint_dock_frame`]). Only VDOCK-4's system
+/// quad still seams the final row. Returns `true` if a dock control routed this
+/// frame — the pin, a picker cell, or a status-quad cell selecting its [`Surface`]
+/// (recorded in [`DockState`]'s active surface, which the shell reads back to
+/// surface the body).
 pub fn dock(ctx: &egui::Context, state: &mut DockState) -> bool {
     let shown = state.shown();
     // Slide-in-from-left over the shared Motion table (lock #14): `t` eases
@@ -821,8 +872,9 @@ pub fn dock(ctx: &egui::Context, state: &mut DockState) -> bool {
 /// Paint the vertical dock's frame into `rect` and lay out its interior: the solid
 /// Carbon-dark panel + the hairline right-edge divider (lock #24, §4 tokens), the
 /// **VDOCK-2** top zone (the Workbench lead + the folded-in pin) and middle zone
-/// (the single-column app groups + '…' overflow), and the bottom seam VDOCK-3/4
-/// fills. Returns `true` if the pin or a picker cell routed this frame.
+/// (the single-column app groups + '…' overflow), and the **VDOCK-3** bottom zone
+/// (the stacked 2×2 status quads; VDOCK-4's system quad still seams the final row).
+/// Returns `true` if the pin, a picker cell, or a status-quad cell routed this frame.
 fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
     let painter = ui.painter().clone();
     // Solid Carbon-dark panel fill (lock #24) — the SURFACE token (§4), the same
@@ -893,11 +945,37 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
         clicked = true;
     }
 
-    // ── BOTTOM zone (SEAM → VDOCK-3/4) — the last BOTTOM_ZONE_H of the column is
-    // reserved for the stacked 2×2 status quads (Chat/BT/Vol/Batt · Status/Signal/
-    // Peers/Sessions) + the system quad (Settings · Show-Desktop · Lock · Power);
-    // VDOCK-2 bounds the app zone above it and leaves it empty (the frame fill
-    // shows through) — VDOCK-3/4 fill it.
+    // ── BOTTOM zone (VDOCK-3 → design #6/#8/#15/#19) — the last BOTTOM_ZONE_H of
+    // the column holds the stacked 2×2 status quads: quad 1 Chat[badge]·BT·Vol·Batt
+    // over quad 2 Status·Signal·Peers·Sessions, each cell routing to its owning
+    // surface on a click (no flyouts, #15) with the Chat unread badge (#19). The two
+    // quads take the top 2·DOCK_W of the band; VDOCK-4's system quad (Settings ·
+    // Show-Desktop · Lock · Power) still seams the final DOCK_W row beneath them. The
+    // quads fold the shell-fed StatusInputs — the honest pre-poll dim state until
+    // `set_status_inputs` lands (§7). `active` is copied out so the immutable borrow
+    // of `state.status` (the TrayInputs view) releases before it's written back.
+    let quads_top = rect.bottom() - BOTTOM_ZONE_H;
+    let mut active = state.active;
+    let quads_routed = {
+        let inputs = TrayInputs {
+            mesh: &state.status.mesh,
+            seat: state.status.seat.as_ref(),
+            unread: state.status.unread,
+            session_active: state.status.session_active,
+        };
+        tray::status_quads(
+            ui,
+            &mut active,
+            &inputs,
+            egui::pos2(rect.left(), quads_top),
+            DOCK_W,
+        )
+    };
+    state.active = active;
+    if quads_routed {
+        clicked = true;
+    }
+
     clicked
 }
 
@@ -1109,8 +1187,7 @@ fn pick_group(
     // so the harness can read its rect; painted in the group accent, centred.
     let label_rect = egui::Rect::from_min_size(origin, egui::vec2(width, PICK_LABEL_H));
     ui.interact(label_rect, pick_label_id(group.label), egui::Sense::hover());
-    let galley =
-        ui.fonts(|f| f.layout_no_wrap(group.label.to_owned(), font.clone(), group.accent));
+    let galley = ui.fonts(|f| f.layout_no_wrap(group.label.to_owned(), font.clone(), group.accent));
     let lp = egui::pos2(
         label_rect.center().x - galley.size().x / 2.0,
         label_rect.center().y - galley.size().y / 2.0,
@@ -1179,7 +1256,11 @@ fn pick_overflow(
         Style::TEXT_DIM
     };
     let dots = ui.fonts(|f| {
-        f.layout_no_wrap("…".to_owned(), egui::FontId::proportional(Style::BODY), color)
+        f.layout_no_wrap(
+            "…".to_owned(),
+            egui::FontId::proportional(Style::BODY),
+            color,
+        )
     });
     ui.painter().galley(
         egui::pos2(
@@ -1212,14 +1293,22 @@ fn pick_overflow(
             let mut routed = false;
             let mut y = area.top();
             for group in hidden {
-                let (h, r) =
-                    pick_group(ui, group, egui::pos2(area.left(), y), DOCK_W, font, &mut state.active);
+                let (h, r) = pick_group(
+                    ui,
+                    group,
+                    egui::pos2(area.left(), y),
+                    DOCK_W,
+                    font,
+                    &mut state.active,
+                );
                 y += h;
                 routed |= r;
             }
             let panel = area.expand(Style::SP_S);
-            ui.painter()
-                .set(bg, egui::Shape::rect_filled(panel, Style::RADIUS, Style::SURFACE));
+            ui.painter().set(
+                bg,
+                egui::Shape::rect_filled(panel, Style::RADIUS, Style::SURFACE),
+            );
             ui.painter().rect_stroke(
                 panel,
                 Style::RADIUS,
@@ -1245,9 +1334,9 @@ fn pick_overflow(
 mod tests {
     use super::{
         cell_id, dock, group_hairline_id, group_height, group_label_id, icon_texture,
-        overflow_more_id, pick_cell_id, taskbar, underline, visible_group_count, DockState, Surface,
-        CELL_W, DOCK_AREA, DOCK_W, GROUPS, GROUP_GAP, HAIRLINE_W, ICON_GAP, ICON_LOGICAL, LABEL_PAD,
-        PIN_STRIP_H, SHOW_DESKTOP_W, TASKBAR_H, TASKBAR_TOP_PAD,
+        overflow_more_id, pick_cell_id, taskbar, underline, visible_group_count, DockState,
+        Surface, CELL_W, DOCK_AREA, DOCK_W, GROUPS, GROUP_GAP, HAIRLINE_W, ICON_GAP, ICON_LOGICAL,
+        LABEL_PAD, PIN_STRIP_H, SHOW_DESKTOP_W, TASKBAR_H, TASKBAR_TOP_PAD,
     };
     use crate::chrome::MeshSummary;
     use crate::tray::{TrayInputs, TrayState};
@@ -2323,7 +2412,12 @@ Desktop x=[{:.1},{:.1}]",
 
     /// Click `center` — press one frame, release the next (the egui click model
     /// the taskbar tests use). The caller primes the layout first.
-    fn click_vdock(ctx: &egui::Context, state: &mut DockState, center: egui::Pos2, size: egui::Vec2) {
+    fn click_vdock(
+        ctx: &egui::Context,
+        state: &mut DockState,
+        center: egui::Pos2,
+        size: egui::Vec2,
+    ) {
         drive_vdock(
             ctx,
             state,
@@ -2533,7 +2627,10 @@ Desktop x=[{:.1},{:.1}]",
             .expect("the Workbench lead cell is registered")
             .rect;
         let bar = bars[0];
-        assert!(bar.left() < 1.0, "the accent bar hugs the column's left edge");
+        assert!(
+            bar.left() < 1.0,
+            "the accent bar hugs the column's left edge"
+        );
         assert!(
             (bar.height() - wb.height()).abs() < 1.0,
             "the bar spans the active cell's height"
@@ -2583,5 +2680,40 @@ Desktop x=[{:.1},{:.1}]",
             "a click in the more-popup routes to its Surface"
         );
         assert!(!s.overflow_open, "routing from the popup closes it");
+    }
+
+    // ── VDOCK-3: the status quads wired into the dock's bottom zone ────────────
+
+    #[test]
+    fn a_status_quad_cell_routes_through_the_dock_bottom_zone() {
+        // VDOCK-3 wired end-to-end: the shell feeds the quads via `set_status_inputs`
+        // and a click on a bottom-zone quad cell routes `DockState::active` (lock
+        // #15). Mount the real dock, seed the inputs, read the Chat quad cell's centre
+        // by its tray id, and click it → `active` follows to Chat (the SAME routing
+        // the horizontal tray drove). Guards against the "compiles but isn't wired"
+        // trap — the quads must actually render + route in the live dock.
+        use crate::tray::{quad_cell_id, TrayItem};
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle(); // reveal the dock so its Area (and the quads) mount
+        s.set_status_inputs(MeshSummary::default(), None, 3, false);
+        let sz = egui::vec2(1280.0, 800.0);
+        // Prime so the quad cell rects register + settle under their stable ids.
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let chat = ctx
+            .read_response(quad_cell_id(TrayItem::Chat))
+            .expect("the Chat status-quad cell is registered in the dock's bottom zone")
+            .rect
+            .center();
+        assert_ne!(s.active, Surface::Chat, "start off the Chat surface");
+        click_vdock(&ctx, &mut s, chat, sz);
+        assert_eq!(
+            s.active,
+            Surface::Chat,
+            "clicking the Chat quad cell routes to the Chat surface (lock #15)"
+        );
     }
 }
