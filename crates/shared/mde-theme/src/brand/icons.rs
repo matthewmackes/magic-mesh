@@ -1,6 +1,6 @@
 //! `brand::icons` — the monochrome Quasar line-art icon set (QBRAND-2).
 //!
-//! The 32 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10 + the
+//! The 33 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10 + the
 //! NAVBAR-W10-1 tray set) embedded as
 //! inline SVG consts behind [`IconId`], plus the SVG→raster loader
 //! ([`icon_image`]) every surface draws them through. The glyphs are authored
@@ -57,7 +57,7 @@ macro_rules! quasar_svg {
 
 /// Identifier for every glyph in the Quasar brand set.
 ///
-/// The product marks, the 14 dock/surface glyphs, the 3 node-role badges and
+/// The product marks, the 15 dock/surface glyphs, the 3 node-role badges and
 /// the 12 Win10-taskbar tray glyphs (NAVBAR-W10-1, tuned to stay legible
 /// rasterized at 16px) — one variant per SVG in `assets/brand/quasar/`;
 /// [`IconId::svg`] resolves the embedded source.
@@ -101,6 +101,10 @@ pub enum IconId {
     Storage,
     /// The Mesh-View (topology map) surface glyph.
     MeshView,
+    /// The Settings (host-controls) surface glyph — a toothed cog. Distinct from
+    /// the spoked [`System`](Self::System) glyph; the dock's right-side Settings
+    /// button (PICKER-2) draws this gear.
+    Settings,
     /// The Workstation role badge.
     Workstation,
     /// The Server role badge.
@@ -142,7 +146,7 @@ pub enum IconId {
 
 impl IconId {
     /// Every glyph in the set, for exhaustive iteration (dock catalogs, tests).
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::Mark,
         Self::Wordmark,
         Self::Node,
@@ -160,6 +164,7 @@ impl IconId {
         Self::System,
         Self::Storage,
         Self::MeshView,
+        Self::Settings,
         Self::Workstation,
         Self::Server,
         Self::Lighthouse,
@@ -218,6 +223,7 @@ impl IconId {
             Self::System => quasar_svg!("surface-system.svg"),
             Self::Storage => quasar_svg!("surface-storage.svg"),
             Self::MeshView => quasar_svg!("surface-mesh-view.svg"),
+            Self::Settings => quasar_svg!("surface-settings.svg"),
             Self::Workstation => quasar_svg!("role-workstation.svg"),
             Self::Server => quasar_svg!("role-server.svg"),
             Self::Lighthouse => quasar_svg!("role-lighthouse.svg"),
@@ -259,6 +265,7 @@ impl IconId {
             Self::System => "surface-system",
             Self::Storage => "surface-storage",
             Self::MeshView => "surface-mesh-view",
+            Self::Settings => "surface-settings",
             Self::Workstation => "role-workstation",
             Self::Server => "role-server",
             Self::Lighthouse => "role-lighthouse",
@@ -583,8 +590,8 @@ mod tests {
 
     #[test]
     fn ids_names_and_sources_are_distinct_and_exhaustive() {
-        // Guards a copy-paste slip in the two match tables: 32 ids, 32 unique
-        // names, 32 unique embedded sources, all valid-looking SVG.
+        // Guards a copy-paste slip in the two match tables: 33 ids, 33 unique
+        // names, 33 unique embedded sources, all valid-looking SVG.
         let mut names: Vec<&str> = IconId::ALL.iter().map(|id| id.name()).collect();
         names.sort_unstable();
         names.dedup();

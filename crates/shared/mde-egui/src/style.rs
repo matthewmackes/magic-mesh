@@ -94,6 +94,27 @@ impl Style {
     /// Status — success / ok.
     pub const OK: Color32 = Color32::from_rgb(0x4F, 0xD0, 0x8A);
 
+    // ── Categorical accents (picker groups · explorer categories) ───────────
+    // Six distinct Carbon **categorical** hues that key a group's / category's
+    // identity — the ONE colour language shared across the bottom picker's group
+    // labels (PICKER-2, design L4) and the unit explorer's per-category accent
+    // (EXPLORER-15, design O8). Defined **once** here so both surfaces speak the
+    // same palette (§4 — the raw hex lives only in this token module, never at a
+    // call site). These are display accents for categorisation, distinct from the
+    // single interactive brand [`ACCENT`](Self::ACCENT).
+    /// Categorical accent — **Comms** (Carbon cyan).
+    pub const ACCENT_COMMS: Color32 = Color32::from_rgb(0x33, 0xB1, 0xFF);
+    /// Categorical accent — **Workloads** (Carbon purple).
+    pub const ACCENT_WORKLOADS: Color32 = Color32::from_rgb(0xA5, 0x6E, 0xFF);
+    /// Categorical accent — **Terminals** (Carbon teal).
+    pub const ACCENT_TERMINALS: Color32 = Color32::from_rgb(0x08, 0xBD, 0xBA);
+    /// Categorical accent — **Mesh** (Carbon green).
+    pub const ACCENT_MESH: Color32 = Color32::from_rgb(0x42, 0xBE, 0x65);
+    /// Categorical accent — **System** (Carbon gold).
+    pub const ACCENT_SYSTEM: Color32 = Color32::from_rgb(0xF1, 0xC2, 0x1B);
+    /// Categorical accent — **Media** (Carbon magenta).
+    pub const ACCENT_MEDIA: Color32 = Color32::from_rgb(0xFF, 0x7E, 0xB6);
+
     // ── Spacing (8px grid; XS is the half-step) ─────────────────────────────
     /// 4px — half-step (tight insets, icon gaps).
     pub const SP_XS: f32 = 4.0;
@@ -209,6 +230,32 @@ mod tests {
         assert_ne!(Style::TEXT, Style::TEXT_DIM);
         assert_ne!(Style::ACCENT, Style::BG);
         assert_ne!(Style::ACCENT, Style::ACCENT_HI);
+    }
+
+    #[test]
+    fn categorical_accents_are_a_distinct_palette() {
+        // PICKER-2 / EXPLORER-15 O8: the six shared picker-group / explorer-category
+        // accents must be mutually distinguishable — one colour language, six hues —
+        // and each set apart from the single interactive brand accent so a category
+        // tint never reads as an interaction affordance.
+        let cats = [
+            Style::ACCENT_COMMS,
+            Style::ACCENT_WORKLOADS,
+            Style::ACCENT_TERMINALS,
+            Style::ACCENT_MESH,
+            Style::ACCENT_SYSTEM,
+            Style::ACCENT_MEDIA,
+        ];
+        for (i, a) in cats.iter().enumerate() {
+            assert_ne!(
+                *a,
+                Style::ACCENT,
+                "a categorical accent must differ from the brand accent"
+            );
+            for b in &cats[i + 1..] {
+                assert_ne!(a, b, "categorical accents must be mutually distinct");
+            }
+        }
     }
 
     #[test]

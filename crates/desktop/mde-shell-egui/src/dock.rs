@@ -4,8 +4,8 @@
 //!
 //! Under E12 "Quasar" the mesh-control surfaces are **panels in the one shell**,
 //! not separate clients (§5, the EMBED model — there is no compositor). The dock
-//! is that shell nav: a pixel-per-Win10 taskbar (lock W3 — a 40px bar, 24px app
-//! glyphs) that selects which surface fills the shell body — the mesh-control
+//! is that shell nav: a Win10-style taskbar (lock W3 — 24px app glyphs on a bar
+//! given top breathing room) that selects which surface fills the shell body — the mesh-control
 //! [`Workbench`](Surface::Workbench), the live Mesh Map, the VM surfaces
 //! (Instances / Desktop), the embedded app surfaces (Music / Media / Files /
 //! Voice / Browser / Terminal / Editor), the unified [`Chat`](Surface::Chat)
@@ -19,7 +19,11 @@
 //! brand glyph cells kept in [`Surface::ALL`] order. The active cell still wears
 //! a **bottom-edge accent underline** + the subtle selection wash; hover is a
 //! fill only — no per-icon captions, no tooltips anywhere. After a flexible gap
-//! the bar ends in the right-justified status **tray** + clock (`tray.rs`).
+//! the right corner cluster: the **Settings** (host-controls) gear button just
+//! left of the right-justified status **tray** + clock (`tray.rs`), and — pinned
+//! to the very bottom-right corner PAST the tray — the Win10 **Show Desktop**
+//! sliver: a thin icon-only button that routes to
+//! [`Surface::Desktop`](Surface::Desktop).
 //!
 //! The bar is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
@@ -151,7 +155,10 @@ impl Surface {
             Surface::Terminal => IconId::Terminal,
             Surface::Editor => IconId::Editor,
             Surface::Chat => IconId::Chat,
-            Surface::System => IconId::System,
+            // The System (host-controls) surface is the dock's right-side Settings
+            // button (PICKER-2) — it wears the toothed **cog** glyph, the Win10
+            // settings-gear idiom, distinct from the spoked legacy System glyph.
+            Surface::System => IconId::Settings,
             Surface::Storage => IconId::Storage,
             // The About surface wears the product **mark** — the mesh-node
             // constellation glyph that IS the platform identity — fitting the
@@ -161,12 +168,19 @@ impl Surface {
     }
 }
 
-/// The taskbar height in logical points — the pixel-per-Win10 40px bar (lock
-/// W3), on the 8px grid (`SP_XL + SP_S`); `main.rs` mounts the bottom panel at
-/// exactly this height. (`pub`, not `pub(crate)`, is the
+/// The taskbar height in logical points — a Win10-style bar given extra breathing
+/// room above the icon row (`SP_XL + SP_M + SP_S` on the 8px grid = the former
+/// 40px bar plus an `SP_M` [`TASKBAR_TOP_PAD`] top strip). `main.rs` mounts the
+/// bottom panel at exactly this height. (`pub`, not `pub(crate)`, is the
 /// `clippy::redundant_pub_crate` form for a crate-visible item in a private
 /// module.)
-pub const TASKBAR_H: f32 = Style::SP_XL + Style::SP_S;
+pub const TASKBAR_H: f32 = Style::SP_XL + Style::SP_M + Style::SP_S;
+
+/// The empty breathing room ABOVE the icon row (`SP_M`) — the taller bar is
+/// bottom-biased, so the 24px glyphs sit low (Win10-taskbar feel) with this much
+/// clear space over them. The icon band is the bottom `TASKBAR_H − TASKBAR_TOP_PAD`
+/// of each cell; the active underline still hugs the very bottom edge.
+const TASKBAR_TOP_PAD: f32 = Style::SP_M;
 
 /// The fixed width of one icon-only glyph cell (lock W4 — no caption, so the
 /// cell shrinks to suit the 24px glyph): `SP_XL + SP_M` on the 8px grid.
@@ -176,6 +190,12 @@ const CELL_W: f32 = Style::SP_XL + Style::SP_M;
 /// The app glyph edge in logical points — the Win10 24px taskbar icon (lock
 /// W3, `SP_L`). Rasterized crisp at the physical pixel size by `icon_texture`.
 const ICON_LOGICAL: f32 = Style::SP_L;
+
+/// The width of the Win10 **"Show Desktop"** sliver pinned to the bar's far-right
+/// corner (past the tray) — a thin button, deliberately narrower than a normal
+/// [`CELL_W`] cell (`SP_L + SP_S` on the 8px grid), yet wide enough to centre the
+/// 24px Desktop glyph with a hair of breathing room.
+const SHOW_DESKTOP_W: f32 = Style::SP_L + Style::SP_S;
 
 /// The active cell's **bottom-edge accent underline** (lock W5 — the Win10
 /// running/active idiom, replacing the old top strip): a full-width strip,
@@ -202,75 +222,75 @@ struct Group {
     surfaces: &'static [Surface],
 }
 
-// PICKER-2: these six per-group accent colours are LOCAL placeholders. PICKER-2
-// lifts them into `mde_egui::Style` (the shared design system), keyed to the
-// SAME accents EXPLORER-15 uses for its category identity — one colour language
-// across the picker + the explorer, defined once and consumed by both. Until
-// then they live here as Carbon categorical hues; do NOT add more raw colours
-// elsewhere (§4). The Carbon-blue hairline itself reuses the existing
-// interactive-blue token [`Style::ACCENT`] — no placeholder needed there.
-const GROUP_COMMS: egui::Color32 = egui::Color32::from_rgb(0x33, 0xB1, 0xFF); // cyan
-const GROUP_WORKLOADS: egui::Color32 = egui::Color32::from_rgb(0xA5, 0x6E, 0xFF); // purple
-const GROUP_TERMINALS: egui::Color32 = egui::Color32::from_rgb(0x08, 0xBD, 0xBA); // teal
-const GROUP_MESH: egui::Color32 = egui::Color32::from_rgb(0x42, 0xBE, 0x65); // green
-const GROUP_SYSTEM: egui::Color32 = egui::Color32::from_rgb(0xF1, 0xC2, 0x1B); // gold
-const GROUP_MEDIA: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x7E, 0xB6); // magenta
+// PICKER-2: the per-group accent colours are the shared categorical tokens on
+// `Style` (`ACCENT_COMMS`..`ACCENT_MEDIA`) — the SAME six hues EXPLORER-15
+// consumes for the unit explorer's per-category identity (design O8). One colour
+// language across the picker + the explorer, defined ONCE in the token module
+// (`mde_egui::Style`) and consumed by both; the raw hex lives only there (§4, no
+// raw colours here). The Carbon-blue hairline reuses the interactive-blue token
+// [`Style::ACCENT`].
 
 /// The six labelled groups in their locked left-to-right order (L5), each
-/// listing its surfaces in [`Surface::ALL`] relative order (L7). Workbench is
-/// rendered first as the standalone lead and appears in no group; every other
-/// surface appears here exactly once (About lives in System) — the union with
-/// the Workbench lead reproduces all 15 of [`Surface::ALL`]. Drives the app-row
-/// render + the shell tests (the one grouping authority).
+/// listing its surfaces in [`Surface::ALL`] relative order (L7). THREE surfaces
+/// sit outside every group: the **Workbench** leads the row as the standalone
+/// anchor, **System** is the right-side Settings button (rendered just left of the
+/// tray), and **Desktop** is the far-right Win10 [`show_desktop_sliver`] past the
+/// tray; every other surface appears here exactly once (About lives in System's
+/// group) — the union with those three reproduces all 15 of [`Surface::ALL`].
+/// Drives the app-row render + the shell tests (the one grouping authority).
 const GROUPS: [Group; 6] = [
     Group {
         label: "Comms",
-        accent: GROUP_COMMS,
+        accent: Style::ACCENT_COMMS,
         surfaces: &[Surface::Voice, Surface::Chat],
     },
     Group {
         label: "Workloads",
-        accent: GROUP_WORKLOADS,
+        accent: Style::ACCENT_WORKLOADS,
         surfaces: &[Surface::Instances],
     },
     Group {
         label: "Terminals",
-        accent: GROUP_TERMINALS,
+        accent: Style::ACCENT_TERMINALS,
         surfaces: &[Surface::Browser, Surface::Terminal, Surface::Editor],
     },
     Group {
         label: "Mesh",
-        accent: GROUP_MESH,
-        surfaces: &[Surface::MeshView, Surface::Desktop],
+        accent: Style::ACCENT_MESH,
+        surfaces: &[Surface::MeshView],
     },
     Group {
         label: "System",
-        accent: GROUP_SYSTEM,
-        surfaces: &[
-            Surface::Files,
-            Surface::System,
-            Surface::Storage,
-            Surface::About,
-        ],
+        accent: Style::ACCENT_SYSTEM,
+        // The System *surface* is the right-side Settings button, not a member
+        // here; this group gathers the remaining system-adjacent surfaces.
+        surfaces: &[Surface::Files, Surface::Storage, Surface::About],
     },
     Group {
         label: "Media",
-        accent: GROUP_MEDIA,
+        accent: Style::ACCENT_MEDIA,
         surfaces: &[Surface::Music, Surface::Media],
     },
 ];
 
-// Compile-time guard: the Workbench lead + the six `GROUPS` place every
-// `Surface::ALL` entry EXACTLY once — so the picker can never silently drop or
-// duplicate a surface when either table changes (add a surface to `ALL` but
-// forget to group it, or list it twice, and the crate fails to compile). Keeps
-// `Surface::ALL` the authority the render is checked against. Fieldless enums
-// cast to their discriminant in const, so this compares by identity.
+// Compile-time guard: the Workbench lead + the right-side System Settings button +
+// the far-right Desktop sliver + the six `GROUPS` place every `Surface::ALL` entry
+// EXACTLY once — so the picker can never silently drop or duplicate a surface when
+// either table changes (add a surface to `ALL` but forget to group it, or list it
+// twice, and the crate fails to compile). Keeps `Surface::ALL` the authority the
+// render is checked against. Fieldless enums cast to their discriminant in const,
+// so this compares by identity.
 const _: () = {
     let mut i = 0;
     while i < Surface::ALL.len() {
         let target = Surface::ALL[i] as usize;
-        let mut count = if Surface::Workbench as usize == target {
+        // Three surfaces are placed outside every group: Workbench (standalone
+        // lead), System (right-side Settings button), Desktop (far-right
+        // Show-Desktop sliver).
+        let mut count = if Surface::Workbench as usize == target
+            || Surface::System as usize == target
+            || Surface::Desktop as usize == target
+        {
             1
         } else {
             0
@@ -289,7 +309,7 @@ const _: () = {
         }
         assert!(
             count == 1,
-            "every Surface::ALL entry must be placed exactly once across the Workbench lead + GROUPS",
+            "every Surface::ALL entry must be placed exactly once across the Workbench lead + the System Settings button + the Desktop sliver + GROUPS",
         );
         i += 1;
     }
@@ -427,11 +447,22 @@ pub fn taskbar(
             }
         }
 
-        // Lock W2 — flexible space, then the right-justified tray + clock: a
-        // right-to-left sub-layout consumes the remaining width.
+        // Lock W2 — flexible space, then the right-justified corner cluster: a
+        // right-to-left sub-layout consumes the remaining width, laying out from the
+        // RIGHT edge inward in add order. The Win10 "Show Desktop" sliver is added
+        // FIRST so it lands right-most (the bottom-right corner, PAST the tray);
+        // then the status tray + clock; then the System **Settings** button, which
+        // lands just LEFT of the tray — the last app-element before the tray, at the
+        // right end of the flexible space (PICKER-2).
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            if show_desktop_sliver(ui, active) {
+                clicked = true;
+            }
             if tray::tray(ui, tray, active, inputs) {
+                clicked = true;
+            }
+            if cell(ui, Surface::System, active) {
                 clicked = true;
             }
         });
@@ -439,18 +470,40 @@ pub fn taskbar(
     clicked
 }
 
-/// One taskbar entry — an icon-only glyph cell (locks W4/W5/W6): the 24px brand
-/// glyph centred in the cell, the accent bottom underline + selection wash when
-/// active, a hover fill only (NO tooltip), and a click that selects the
-/// surface (returned so the shell can surface the body).
+/// One ordinary taskbar entry — a full-[`CELL_W`] icon-only glyph cell.
 fn cell(ui: &mut egui::Ui, surface: Surface, active: &mut Surface) -> bool {
+    launch_cell(ui, surface, active, CELL_W, false)
+}
+
+/// The Win10 **"Show Desktop"** sliver — a thin [`SHOW_DESKTOP_W`] button pinned
+/// to the bar's far-right corner (rendered right-most in the tray sub-layout, past
+/// the tray). A left-edge divider sets it off from the tray (the Win10 corner
+/// idiom); it routes to [`Surface::Desktop`] and wears the same active/hover
+/// affordances as a cell, just narrower.
+fn show_desktop_sliver(ui: &mut egui::Ui, active: &mut Surface) -> bool {
+    launch_cell(ui, Surface::Desktop, active, SHOW_DESKTOP_W, true)
+}
+
+/// The shared render for a taskbar launch entry (locks W4/W5/W6) — used by both an
+/// ordinary [`cell`] and the far-right [`show_desktop_sliver`]: the 24px brand
+/// glyph centred in a `width`-wide, full-bar-height column, the accent bottom
+/// underline + selection wash when active, a hover fill only (NO tooltip), an
+/// optional Win10 left-edge divider (the Show-Desktop sliver), and a click that
+/// selects the surface (returned so the shell can surface the body).
+fn launch_cell(
+    ui: &mut egui::Ui,
+    surface: Surface,
+    active: &mut Surface,
+    width: f32,
+    left_divider: bool,
+) -> bool {
     let selected = *active == surface;
     // Fill the full bar height so the whole column is clickable. Interact under a
     // stable per-surface id (`cell_id`) so the render + routing are unchanged but
     // the cell's rect is addressable — tests read it back to click its centre now
     // that grouping shifts each cell off a hand-computable x.
     let (rect, _resp) = ui.allocate_exact_size(
-        egui::vec2(CELL_W, ui.available_height()),
+        egui::vec2(width, ui.available_height()),
         egui::Sense::hover(),
     );
     let response = ui.interact(rect, cell_id(surface), egui::Sense::click());
@@ -473,6 +526,16 @@ fn cell(ui: &mut egui::Ui, surface: Surface, active: &mut Surface) -> bool {
         painter.rect_filled(underline(rect), egui::CornerRadius::ZERO, Style::ACCENT);
     }
 
+    // The Win10 vertical divider marking the far-right Show-Desktop corner — a
+    // BORDER hairline down the sliver's LEFT edge, inset from the bar edges (§4).
+    if left_divider {
+        painter.vline(
+            rect.left(),
+            (rect.top() + Style::SP_XS)..=(rect.bottom() - Style::SP_XS),
+            egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+        );
+    }
+
     // Two-tone tint: the active glyph reads solid in the brand ACCENT, a hovered
     // one brightens to full TEXT, the rest sit dim at TEXT_DIM. The brand SVG
     // set is a single `currentColor` variant (no separate outline artwork), so
@@ -486,11 +549,15 @@ fn cell(ui: &mut egui::Ui, surface: Surface, active: &mut Surface) -> bool {
         Style::TEXT_DIM
     };
 
-    // The glyph, centred in the cell (lock W4 — no caption beneath it). A glyph
-    // load failure fails soft to the bare cell (§7).
+    // The glyph, centred in the cell's BOTTOM icon band (lock W4 — no caption
+    // beneath it). The band is the cell minus the TASKBAR_TOP_PAD breathing room,
+    // so the glyph sits low (bottom-biased) with clear space above it. A glyph load
+    // failure fails soft to the bare cell (§7).
     if let Some(tex) = icon_texture(ui.ctx(), surface.icon_id(), ICON_LOGICAL, tint) {
+        let icon_cy = (rect.top() + TASKBAR_TOP_PAD + rect.bottom()) / 2.0;
+        let icon_center = egui::pos2(rect.center().x, icon_cy);
         let icon_rect =
-            egui::Rect::from_center_size(rect.center(), egui::vec2(ICON_LOGICAL, ICON_LOGICAL));
+            egui::Rect::from_center_size(icon_center, egui::vec2(ICON_LOGICAL, ICON_LOGICAL));
         egui::Image::new(egui::load::SizedTexture::new(tex.id(), icon_rect.size()))
             .paint_at(ui, icon_rect);
     }
@@ -546,7 +613,8 @@ pub fn icon_texture(
 #[cfg(test)]
 mod tests {
     use super::{
-        cell_id, icon_texture, taskbar, underline, Surface, CELL_W, GROUPS, ICON_LOGICAL, TASKBAR_H,
+        cell_id, icon_texture, taskbar, underline, Surface, CELL_W, GROUPS, ICON_LOGICAL,
+        SHOW_DESKTOP_W, TASKBAR_H, TASKBAR_TOP_PAD,
     };
     use crate::chrome::MeshSummary;
     use crate::tray::{TrayInputs, TrayState};
@@ -596,11 +664,24 @@ mod tests {
 
     #[test]
     fn the_bar_wears_the_win10_metrics() {
-        // Lock W3 @100%: a 40px bar, 24px app glyphs, and the icon-only cell
-        // shrunk to 48px — all on the 8px grid, straight from Style tokens.
-        assert!((TASKBAR_H - 40.0).abs() < f32::EPSILON, "bar height");
+        // Lock W3 @100%: 24px app glyphs and the icon-only cell shrunk to 48px —
+        // all on the 8px grid, straight from Style tokens. The bar is the former
+        // 40px Win10 height plus an SP_M (16px) top breathing strip = 56px, so the
+        // glyphs sit low with clear space above them.
+        // 56px = the former 40px Win10 bar + the SP_M (16px) top strip, so the bar
+        // is taller than the old 40px for air above the icons.
+        assert!((TASKBAR_H - 56.0).abs() < f32::EPSILON, "bar height");
+        assert!(
+            (TASKBAR_TOP_PAD - 16.0).abs() < f32::EPSILON,
+            "top breathing room"
+        );
         assert!((ICON_LOGICAL - 24.0).abs() < f32::EPSILON, "app glyph edge");
         assert!((CELL_W - 48.0).abs() < f32::EPSILON, "icon-only cell width");
+        // The bar stays on the 8px grid.
+        assert!(
+            (TASKBAR_H % 8.0).abs() < f32::EPSILON,
+            "bar height on the 8px grid"
+        );
     }
 
     #[test]
@@ -654,7 +735,8 @@ mod tests {
             (Surface::Terminal, IconId::Terminal),
             (Surface::Editor, IconId::Editor),
             (Surface::Chat, IconId::Chat),
-            (Surface::System, IconId::System),
+            // The System surface is the right-side Settings button — the cog glyph.
+            (Surface::System, IconId::Settings),
             (Surface::Storage, IconId::Storage),
             (Surface::About, IconId::Mark),
         ];
@@ -860,18 +942,20 @@ mod tests {
     #[test]
     fn the_locked_group_taxonomy_and_order() {
         // L5/L7 — six groups in the locked left-to-right order, each listing its
-        // surfaces in Surface::ALL relative order; About lives in System, and the
-        // Workbench is in no group (it leads the row as the standalone anchor).
+        // surfaces in Surface::ALL relative order; About lives in the System group.
+        // THREE surfaces are in no group: the Workbench (standalone lead), the
+        // System surface (right-side Settings button), and Desktop (far-right
+        // Show-Desktop sliver).
         use Surface::{
-            About, Browser, Chat, Desktop, Editor, Files, Instances, Media, MeshView, Music,
-            Storage, System, Terminal, Voice, Workbench,
+            About, Browser, Chat, Editor, Files, Instances, Media, MeshView, Music, Storage,
+            Terminal, Voice, Workbench,
         };
         let expect: [(&str, &[Surface]); 6] = [
             ("Comms", &[Voice, Chat]),
             ("Workloads", &[Instances]),
             ("Terminals", &[Browser, Terminal, Editor]),
-            ("Mesh", &[MeshView, Desktop]),
-            ("System", &[Files, System, Storage, About]),
+            ("Mesh", &[MeshView]),
+            ("System", &[Files, Storage, About]),
             ("Media", &[Music, Media]),
         ];
         assert_eq!(GROUPS.len(), expect.len(), "six groups");
@@ -883,18 +967,48 @@ mod tests {
             );
         }
         let system = GROUPS.iter().find(|g| g.label == "System").unwrap();
-        assert!(system.surfaces.contains(&About), "About lives in System");
         assert!(
-            GROUPS.iter().all(|g| !g.surfaces.contains(&Workbench)),
-            "Workbench leads standalone, in no group"
+            system.surfaces.contains(&About),
+            "About lives in the System group"
         );
+        // The three ungrouped surfaces are placed by the lead / the Settings button
+        // / the far-right sliver, never a group.
+        for ungrouped in [Workbench, Surface::System, Surface::Desktop] {
+            assert!(
+                GROUPS.iter().all(|g| !g.surfaces.contains(&ungrouped)),
+                "{ungrouped:?} is placed outside every group"
+            );
+        }
+    }
+
+    #[test]
+    fn each_group_takes_its_shared_style_accent_token() {
+        // PICKER-2: the group labels are keyed by the shared categorical tokens on
+        // `mde_egui::Style` (the SAME six EXPLORER-15 consumes for category identity,
+        // design O8) — defined once, consumed here. No local placeholder hex survives.
+        let expect: [(&str, egui::Color32); 6] = [
+            ("Comms", Style::ACCENT_COMMS),
+            ("Workloads", Style::ACCENT_WORKLOADS),
+            ("Terminals", Style::ACCENT_TERMINALS),
+            ("Mesh", Style::ACCENT_MESH),
+            ("System", Style::ACCENT_SYSTEM),
+            ("Media", Style::ACCENT_MEDIA),
+        ];
+        for (g, (label, token)) in GROUPS.iter().zip(expect) {
+            assert_eq!(g.label, label, "group order");
+            assert_eq!(
+                g.accent, token,
+                "{label} label takes its shared Style token"
+            );
+        }
     }
 
     #[test]
     fn the_groups_cover_every_surface_once_in_surface_all_order() {
-        // The Workbench lead + the six groups reproduce all 15 of Surface::ALL,
-        // each surface placed exactly once...
-        let mut placed: Vec<Surface> = vec![Surface::Workbench];
+        // The Workbench lead + the System Settings button + the far-right Desktop
+        // sliver + the six groups reproduce all 15 of Surface::ALL, each surface
+        // placed exactly once...
+        let mut placed: Vec<Surface> = vec![Surface::Workbench, Surface::System, Surface::Desktop];
         for g in &GROUPS {
             placed.extend_from_slice(g.surfaces);
         }
@@ -907,7 +1021,7 @@ mod tests {
             assert_eq!(
                 placed.iter().filter(|&&x| x == s).count(),
                 1,
-                "{s:?} appears exactly once across the lead + groups"
+                "{s:?} appears once across the lead + Settings + the Desktop sliver + groups"
             );
         }
         // ...and L7: within each group the surfaces keep Surface::ALL relative
@@ -969,5 +1083,53 @@ mod tests {
             let _ = run_taskbar(&ctx, &mut active, vec![release]);
             assert_eq!(active, want, "clicking {want:?}'s cell selects it");
         }
+    }
+
+    #[test]
+    fn the_desktop_sliver_pins_to_the_far_right_corner_past_the_tray() {
+        // The Win10 "Show Desktop" move: Desktop is NOT a group cell — it renders as
+        // a thin sliver held in the bottom-right corner, right-most on the whole bar
+        // (past the tray). Mount the real bar, settle the layout, and read the
+        // Desktop cell rect back: its right edge hugs the bar's right edge (nothing
+        // sits further right — i.e. past the tray) and it is narrower than a normal
+        // cell (a sliver, SHOW_DESKTOP_W).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut active = Surface::Workbench;
+        let _ = run_taskbar(&ctx, &mut active, Vec::new());
+        let _ = run_taskbar(&ctx, &mut active, Vec::new());
+
+        let desktop = ctx
+            .read_response(cell_id(Surface::Desktop))
+            .expect("the Desktop sliver rect is registered")
+            .rect;
+        // The bar spans the 1280-wide screen (run_taskbar's screen_rect); the sliver
+        // hugs its right edge — the far-right corner, past the tray.
+        assert!(
+            (desktop.right() - 1280.0).abs() < 1.0,
+            "the Desktop sliver hugs the bar's right edge, got right={}",
+            desktop.right()
+        );
+        // Every group cell sits to its LEFT — nothing renders further right.
+        for s in Surface::ALL {
+            if s == Surface::Desktop {
+                continue;
+            }
+            if let Some(resp) = ctx.read_response(cell_id(s)) {
+                assert!(
+                    resp.rect.right() <= desktop.right() + f32::EPSILON,
+                    "{s:?} renders to the right of the Desktop sliver"
+                );
+            }
+        }
+        // It is a thin sliver — narrower than a normal cell.
+        assert!(
+            (desktop.width() - SHOW_DESKTOP_W).abs() < f32::EPSILON,
+            "the Desktop sliver is SHOW_DESKTOP_W wide"
+        );
+        assert!(
+            desktop.width() < CELL_W,
+            "the Desktop sliver is narrower than a normal cell"
+        );
     }
 }
