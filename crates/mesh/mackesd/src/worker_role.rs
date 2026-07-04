@@ -129,6 +129,16 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // firewall preset opens 1716 on the overlay/trusted zone only; public stays
     // default-deny). Was Workstation-only (rank 1) pre-KDC-MESH-3.
     ("kdc_host", 0),
+    // CHAT-FIX-1 — the mesh chat worker: folds every node's chat/notification
+    // traffic off the bus into the Chat surface's feed. UNIVERSAL (rank 0): it
+    // ALREADY ran on every node — a lighthouse included — via the silent
+    // "unknown worker ⇒ rank 0" default (live-verified on Eagle: boot log
+    // `starting worker: chat`), but that default OMITTED it from this census, so
+    // `mackesd role-workers` dishonestly failed to list a worker every node runs.
+    // A deliberate rank-0 census entry now (the BUG-STORAGE-1 lesson) — same rank
+    // it always had, now EXPLICIT + counted. Pairs with `notify` (CHAT-FIX-2), the
+    // producer whose events it folds.
+    ("chat", 0),
     // ── Workstation (rank 1) — everything beyond the relay control plane: the
     //    fleet + mesh storage workers AND voice / clipboard / kdc / remmina /
     //    music. A headless box is a Workstation too (the desktop workers idle
@@ -443,7 +453,11 @@ mod tests {
         // Connect host: every node recognizes the phone, overlay-only so no public
         // port opens). A tier move, not an add, so the total is unchanged; the
         // rank split shifts 26/16 → 27/15 (see `tier_counts_match_the_two_role_split`).
-        assert_eq!(WORKER_TIERS.len(), 42);
+        // +1 chat (CHAT-FIX-1 — the universal mesh chat worker, pinned at rank 0:
+        // it already ran on every node via the silent unknown-worker default; now
+        // it is an EXPLICIT census entry so `mackesd role-workers` lists it. The
+        // rank split shifts 27/15 → 28/15, len 42 → 43).
+        assert_eq!(WORKER_TIERS.len(), 43);
     }
 
     #[test]
@@ -466,8 +480,8 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            27,
-            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + notify (CHAT-FIX-2, universal local-notification producer) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port)"
+            28,
+            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + notify (CHAT-FIX-2, universal local-notification producer) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry)"
         );
         assert_eq!(
             count(1),
@@ -613,7 +627,11 @@ mod tests {
         // Chat feed the chat worker folds. A DELIBERATE rank-0 census entry (the
         // BUG-STORAGE-1 lesson), never the silent unknown-worker default — so
         // `mackesd role-workers` lists it on both roles.
-        assert_eq!(min_rank("notify"), 0, "notify is a universal (rank-0) worker");
+        assert_eq!(
+            min_rank("notify"),
+            0,
+            "notify is a universal (rank-0) worker"
+        );
         assert!(runs("notify", Role::Workstation.rank()));
         assert!(runs("notify", Role::Lighthouse.rank()));
         assert!(workers_for_rank(Role::Workstation.rank()).contains(&"notify"));
@@ -630,7 +648,11 @@ mod tests {
         // goals hold. It was Workstation-only (rank 1) before; the move is safe
         // because KDC-MESH-1's transport is overlay-only (binds 1716 on the Nebula
         // overlay IP, never the public NIC — so a lighthouse opens no public port).
-        assert_eq!(min_rank("kdc_host"), 0, "kdc_host is a universal (rank-0) worker");
+        assert_eq!(
+            min_rank("kdc_host"),
+            0,
+            "kdc_host is a universal (rank-0) worker"
+        );
         assert!(
             runs("kdc_host", Role::Workstation.rank()),
             "a Workstation still runs the KDE Connect host"
@@ -645,6 +667,31 @@ mod tests {
         // No capability tag — every node runs it (the overlay-only transport is the
         // gate that keeps it safe on a headless/relay node, not a role tag).
         assert_eq!(required_capability("kdc_host"), None);
+    }
+
+    #[test]
+    fn chat_runs_on_every_role() {
+        // CHAT-FIX-1 — the mesh chat worker is UNIVERSAL (rank 0): it MUST spawn on
+        // EVERY node incl. a headless Lighthouse (live-verified on Eagle: boot log
+        // `starting worker: chat`). It always ran everywhere via the silent
+        // "unknown worker ⇒ rank 0" default; this pins it as an EXPLICIT census
+        // entry so `mackesd role-workers` honestly lists it on both roles.
+        assert_eq!(min_rank("chat"), 0, "chat is a universal (rank-0) worker");
+        assert!(
+            runs("chat", Role::Workstation.rank()),
+            "a Workstation runs the mesh chat worker"
+        );
+        assert!(
+            runs("chat", Role::Lighthouse.rank()),
+            "a Lighthouse runs the mesh chat worker too (it always did, now explicit)"
+        );
+        // Present in the census table now, not riding the unknown-worker default.
+        assert!(WORKER_TIERS.iter().any(|(n, _)| *n == "chat"));
+        // A DELIBERATE census entry, so `mackesd role-workers` lists it on both roles.
+        assert!(workers_for_rank(Role::Workstation.rank()).contains(&"chat"));
+        assert!(workers_for_rank(Role::Lighthouse.rank()).contains(&"chat"));
+        // No capability tag — every node runs it.
+        assert_eq!(required_capability("chat"), None);
     }
 
     #[test]
@@ -667,14 +714,14 @@ mod tests {
     fn workers_for_rank_is_a_growing_superset() {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        // 27 lighthouse-tier workers (22 control-plane + the BUG-STORAGE-1 universal
+        // 28 lighthouse-tier workers (22 control-plane + the BUG-STORAGE-1 universal
         // storage mirror + the QC-2 universal openstack worker + the EXPLORER-1
         // universal unit_aggregator + the CHAT-FIX-2 universal notify producer + the
-        // KDC-MESH-3 universal kdc_host at rank 0); Workstation adds the 15 fleet +
-        // desktop workers for the full 42 (the retired Server tier folded into
-        // Workstation in the 2-role model).
-        assert_eq!(lh.len(), 27);
-        assert_eq!(ws.len(), 42);
+        // KDC-MESH-3 universal kdc_host + the CHAT-FIX-1 universal chat worker at
+        // rank 0); Workstation adds the 15 fleet + desktop workers for the full 43
+        // (the retired Server tier folded into Workstation in the 2-role model).
+        assert_eq!(lh.len(), 28);
+        assert_eq!(ws.len(), 43);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
@@ -735,18 +782,19 @@ mod tests {
             "media ≠ workstation tier"
         );
         let set = workers_for_class(media_lh);
-        // = the 27 lighthouse-tier workers (incl. link-traffic MESHMAP-6, the
+        // = the 28 lighthouse-tier workers (incl. link-traffic MESHMAP-6, the
         // BUG-STORAGE-1 universal storage mirror, the QC-2 universal openstack
         // worker, the EXPLORER-1 universal unit_aggregator, the CHAT-FIX-2
-        // universal notify producer + the KDC-MESH-3 universal kdc_host) + navidrome.
-        assert_eq!(set.len(), 28);
+        // universal notify producer, the KDC-MESH-3 universal kdc_host + the
+        // CHAT-FIX-1 universal chat worker) + navidrome.
+        assert_eq!(set.len(), 29);
         assert!(set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 27);
+        assert_eq!(workers_for_class(plain_lh).len(), 28);
     }
 
     #[test]
