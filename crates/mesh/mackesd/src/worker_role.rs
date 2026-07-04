@@ -101,6 +101,15 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // A deliberate census entry like storage's (BUG-STORAGE-1), never the
     // silent unknown-worker default.
     ("openstack", 0),
+    // EXPLORER-1 — the unit_aggregator worker: the daemon spine of the Hero unit
+    // explorer (unit-explorer.md #18). UNIVERSAL (rank 0) like storage/openstack:
+    // every node folds its OWN unit view (self-first #23) — the mesh mirror it
+    // already reads + the union of every node's openstack mirror + its LAN scan —
+    // and publishes `state/units/<node>`. There is no leader/center to elect (lock
+    // #20: "no center"); a lighthouse publishes an honest units view too. A
+    // deliberate rank-0 entry (the BUG-STORAGE-1 lesson), never the silent
+    // unknown-worker default.
+    ("unit_aggregator", 0),
     // ── Workstation (rank 1) — everything beyond the relay control plane: the
     //    fleet + mesh storage workers AND voice / clipboard / kdc / remmina /
     //    music. A headless box is a Workstation too (the desktop workers idle
@@ -406,7 +415,10 @@ mod tests {
         // pinned at rank 0: the universal-node premise (quasar-cloud.md Q1/Q5/Q22)
         // puts cloud duties on any role; the fleet doctrine, not the rank, decides
         // which services a node hosts).
-        assert_eq!(WORKER_TIERS.len(), 40);
+        // +1 unit_aggregator (EXPLORER-1 — the Hero unit-explorer daemon spine,
+        // pinned at rank 0: every node folds + publishes its OWN unit view
+        // (state/units/<node>), no center; the BUG-STORAGE-1 deliberate-entry lesson).
+        assert_eq!(WORKER_TIERS.len(), 41);
     }
 
     #[test]
@@ -429,8 +441,8 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            24,
-            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision)"
+            25,
+            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view)"
         );
         assert_eq!(
             count(1),
@@ -547,6 +559,26 @@ mod tests {
     }
 
     #[test]
+    fn unit_aggregator_runs_on_every_role() {
+        // EXPLORER-1 — the Hero unit-explorer daemon spine is universal (#18/#20:
+        // every node folds + publishes its OWN unit view, no center). It MUST spawn
+        // on every role — a lighthouse publishes an honest units view too — and it
+        // is a DELIBERATE rank-0 census entry (the BUG-STORAGE-1 lesson), never the
+        // silent unknown-worker default.
+        assert_eq!(
+            min_rank("unit_aggregator"),
+            0,
+            "unit_aggregator is a universal (rank-0) worker"
+        );
+        assert!(runs("unit_aggregator", Role::Workstation.rank()));
+        assert!(runs("unit_aggregator", Role::Lighthouse.rank()));
+        assert!(workers_for_rank(Role::Workstation.rank()).contains(&"unit_aggregator"));
+        assert!(workers_for_rank(Role::Lighthouse.rank()).contains(&"unit_aggregator"));
+        // No capability tag — every node runs it.
+        assert_eq!(required_capability("unit_aggregator"), None);
+    }
+
+    #[test]
     fn role_name_maps_each_rank_to_its_canonical_name() {
         // BOOKMARKS-8 — the browser-policy worker folds its per-role policy by
         // this name, so it MUST match the role.toml canonical names.
@@ -566,12 +598,13 @@ mod tests {
     fn workers_for_rank_is_a_growing_superset() {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        // 24 lighthouse-tier workers (22 control-plane + the BUG-STORAGE-1 universal
-        // storage mirror + the QC-2 universal openstack worker at rank 0);
-        // Workstation adds the 16 fleet + desktop workers for the full 40 (the
-        // retired Server tier folded into Workstation in the 2-role model).
-        assert_eq!(lh.len(), 24);
-        assert_eq!(ws.len(), 40);
+        // 25 lighthouse-tier workers (22 control-plane + the BUG-STORAGE-1 universal
+        // storage mirror + the QC-2 universal openstack worker + the EXPLORER-1
+        // universal unit_aggregator at rank 0); Workstation adds the 16 fleet +
+        // desktop workers for the full 41 (the retired Server tier folded into
+        // Workstation in the 2-role model).
+        assert_eq!(lh.len(), 25);
+        assert_eq!(ws.len(), 41);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
@@ -632,17 +665,17 @@ mod tests {
             "media ≠ workstation tier"
         );
         let set = workers_for_class(media_lh);
-        // = the 24 lighthouse-tier workers (incl. link-traffic MESHMAP-6, the
-        // BUG-STORAGE-1 universal storage mirror + the QC-2 universal openstack
-        // worker) + navidrome.
-        assert_eq!(set.len(), 25);
+        // = the 25 lighthouse-tier workers (incl. link-traffic MESHMAP-6, the
+        // BUG-STORAGE-1 universal storage mirror, the QC-2 universal openstack
+        // worker + the EXPLORER-1 universal unit_aggregator) + navidrome.
+        assert_eq!(set.len(), 26);
         assert!(set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 24);
+        assert_eq!(workers_for_class(plain_lh).len(), 25);
     }
 
     #[test]

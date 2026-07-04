@@ -6575,6 +6575,31 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("openstack".into());
         }
+        // EXPLORER-1 — the unit_aggregator worker: the daemon spine of the Hero
+        // unit explorer (docs/design/unit-explorer.md). Unions three sources into
+        // one typed `Unit` stream and publishes `state/units/<node>`: the mesh
+        // mirror (peers + `/mesh/leader` + health it already reads), the union of
+        // every node's `state/openstack/<node>` mirror (QC-2, deduped by object id +
+        // host-tagged, consumed through the Bus read path — never an openstack
+        // file), and the surface-gated active LAN scan (EXPLORER-2's producer seam,
+        // a no-op today). Publish-on-change + heartbeat, plus the E9
+        // `action/units/get-stream` read verb any mesh client can call. Universal
+        // (rank 0) like storage/openstack — every node publishes its own unit view,
+        // no center. node_id is the mirror `host` stamp + self unit; workgroup_root
+        // seeds the peer-directory reader.
+        if mackesd_core::worker_role::runs("unit_aggregator", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::unit_aggregator::UnitAggregatorWorker::new(
+                    node_id.clone(),
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("unit_aggregator".into());
+        }
         // MV-5a — the scheduler worker: the placement slice of the no-center
         // scheduler. Drains `action/schedule/place`, folds each node's latest
         // `event/kvm/services` capacity, chooses the target node (healthy pin →

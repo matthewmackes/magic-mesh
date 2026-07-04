@@ -599,6 +599,17 @@ pub mod container;
 // lane (→ chat, NOTIFY-CHAT lock 11). Universal (rank 0) — the doctrine, not
 // the role, decides which services a node hosts.
 pub mod openstack;
+// EXPLORER-1 — the unit_aggregator worker: the daemon spine of the Hero unit
+// explorer (docs/design/unit-explorer.md). Unions three sources into one typed
+// `Unit` stream and publishes `state/units/<node>`: the mesh mirror (peers +
+// `/mesh/leader` + health — source (a)), the union of every node's
+// `state/openstack/<node>` mirror deduped by object id + host-tagged (source (b),
+// QC-2, consumed through the Bus read path — never an openstack file), and the
+// surface-gated active LAN scan (EXPLORER-2's producer seam, a no-op today). Pure
+// fold over three injectable seams (self-first #23, first/last-seen E10), a
+// publish-on-change mirror + heartbeat, and the E9 `action/units/get-stream` read
+// verb. Universal (rank 0) — every node publishes its own unit view.
+pub mod unit_aggregator;
 // E12-20 — the storage worker: the privileged owner of the Workbench Storage plane
 // (GParted for the mesh, docs/design/workbench-storage-plane.md). Owns a typed
 // StorageOp pending-queue executor over a live UDisks2 zbus topology — stage-time

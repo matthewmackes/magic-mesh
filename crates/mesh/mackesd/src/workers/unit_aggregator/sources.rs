@@ -1,0 +1,401 @@
+//! EXPLORER-1 — the injectable source seams the aggregator unions.
+//!
+//! Three seams, each headless-testable with a fake (mirrors the QC-2 openstack
+//! worker's two-seam + testkit shape):
+//!
+//! - [`MeshMirrorSource`] — the mesh half (source (a), lock #2): the replicated
+//!   peer directory + the `/mesh/leader` lease + per-peer health the tray/Fleet
+//!   already read. Production: [`MeshDirectoryMirror`] over
+//!   `crate::substrate::peers::read_directory` + `current_leader_blocking`.
+//! - [`OpenstackMirrorSource`] — the cloud half (source (b), lock #20): the
+//!   union of every node's `state/openstack/<node>` Bus mirror (QC-2), decoded
+//!   into host-tagged cloud objects. Production: [`BusOpenstackMirror`] reads the
+//!   persisted Bus tree. It consumes the QC-2 mirror through the Bus read path —
+//!   it never touches an openstack worker file.
+//! - [`LanScanSource`] — the off-mesh half (EXPLORER-2 producer seam): the
+//!   active LAN scan, gated on the surface's scan-active flag (lock #24).
+//!   Production here is [`NoScan`] (empty); EXPLORER-2 swaps in the real
+//!   nmap-style scan.
+//!
+//! Forward-compat honesty (§7): today's `state/openstack/<node>` mirror carries
+//! Kolla *service* supervision, not tenant *objects*, so [`BusOpenstackMirror`]
+//! decodes zero cloud objects on the live fleet — cloud units are simply absent,
+//! never faked. When a later QC slice publishes a resource `objects` array on the
+//! same mirror, [`OpenstackMirrorBody`]'s tolerant decode picks it up with no
+//! change here.
+
+use std::path::PathBuf;
+
+use serde::Deserialize;
+
+use mackes_mesh_types::peers::PeerRecord;
+
+use super::unit::UnitKind;
+
+// ─────────────────────────── mesh seam ───────────────────────────
+
+/// One read of the mesh mirror: this node's id, the current leader (if any), and
+/// the live peer directory rows.
+#[derive(Debug, Clone, Default)]
+pub struct MeshSnapshot {
+    /// This node's own id — always folded as the first unit (lock #23).
+    pub self_host: String,
+    /// The hostname holding the `/mesh/leader` lease, when one is elected.
+    pub leader: Option<String>,
+    /// The replicated peer directory rows (etcd-first, fs-fallback union).
+    pub peers: Vec<PeerRecord>,
+}
+
+/// The mesh half of the union (source (a), lock #2).
+pub trait MeshMirrorSource: Send + Sync {
+    /// Read the current mesh mirror snapshot.
+    fn read(&self) -> MeshSnapshot;
+}
+
+/// Production [`MeshMirrorSource`]: the replicated peer directory + the etcd
+/// leader lease — the exact canonical readers the directory responder, the
+/// health reconciler, and the Fleet plane use.
+pub struct MeshDirectoryMirror {
+    workgroup_root: PathBuf,
+    self_host: String,
+}
+
+impl MeshDirectoryMirror {
+    /// Construct over the replicated `workgroup_root` (the peer directory lives
+    /// under it) with this node's `self_host` id.
+    #[must_use]
+    pub const fn new(workgroup_root: PathBuf, self_host: String) -> Self {
+        Self {
+            workgroup_root,
+            self_host,
+        }
+    }
+}
+
+impl MeshMirrorSource for MeshDirectoryMirror {
+    fn read(&self) -> MeshSnapshot {
+        // The canonical peer directory (etcd substrate first, fs union fallback)
+        // — the same `read_directory` the directory RPC + health reconciler use.
+        let peers = crate::substrate::peers::read_directory(&self.workgroup_root);
+        // The current `/mesh/leader` lease holder, when the coordination plane is
+        // provisioned. Best-effort: an absent/unreachable etcd yields no leader
+        // (the units still publish — we never block the fold on the leader read).
+        let leader = {
+            let eps = crate::substrate::etcd::default_endpoints();
+            if eps.is_empty() {
+                None
+            } else {
+                crate::substrate::leader::current_leader_blocking(&eps).map(|l| l.node_id)
+            }
+        };
+        MeshSnapshot {
+            self_host: self.self_host.clone(),
+            leader,
+            peers,
+        }
+    }
+}
+
+// ─────────────────────────── cloud seam ───────────────────────────
+
+/// The kind of an `OpenStack` object (lock #4: the four resource kinds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudKind {
+    /// A Nova compute instance.
+    Instance,
+    /// A Cinder volume.
+    Volume,
+    /// A Glance image.
+    Image,
+    /// A Neutron network.
+    Network,
+}
+
+impl CloudKind {
+    /// The [`UnitKind`] this cloud object folds into.
+    #[must_use]
+    pub const fn unit_kind(self) -> UnitKind {
+        match self {
+            Self::Instance => UnitKind::Instance,
+            Self::Volume => UnitKind::Volume,
+            Self::Image => UnitKind::Image,
+            Self::Network => UnitKind::Network,
+        }
+    }
+
+    /// The stable unit id for an object of this kind: `cloud:<kind>:<object-id>`
+    /// — the mesh-wide dedup key (lock #20: the same object id under two nodes'
+    /// mirrors lists once).
+    #[must_use]
+    pub fn unit_id(self, object_id: &str) -> String {
+        format!("cloud:{}:{}", self.unit_kind().as_str(), object_id)
+    }
+}
+
+/// One cloud object folded from a node's `state/openstack/<node>` mirror, tagged
+/// with the host node that runs it (lock #20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudObjectRecord {
+    /// The host node id — the object's own `host` when the mirror carries it,
+    /// else the publishing node (the `<node>` in the topic).
+    pub node: String,
+    /// The `OpenStack` object id (the dedup key across nodes).
+    pub id: String,
+    /// The resource kind.
+    pub kind: CloudKind,
+    /// The object's display name.
+    pub name: String,
+    /// A fixed/floating address, when the mirror carries one.
+    pub address: Option<String>,
+}
+
+/// The cloud half of the union (source (b), lock #20).
+pub trait OpenstackMirrorSource: Send + Sync {
+    /// Read the raw union of cloud objects across every node's mirror. Dedup by
+    /// object id is the fold's job (see `super::fold`), so this returns the whole
+    /// unioned set (possibly with cross-node duplicates).
+    fn read(&self) -> Vec<CloudObjectRecord>;
+}
+
+/// The Bus topic prefix every node's `OpenStack` mirror publishes under.
+pub const OPENSTACK_TOPIC_PREFIX: &str = "state/openstack/";
+
+/// The tolerant decode of one `state/openstack/<node>` body.
+///
+/// Only the fields the aggregator cares about are declared; serde ignores the
+/// rest (QC-2's doctrine/runtime/services). `objects` is absent on today's
+/// service-only mirror (⇒ empty, honest §7) and populated once a QC slice
+/// publishes tenant resources on the same topic — no change needed here.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenstackMirrorBody {
+    /// The publishing node id (the mirror `host` stamp), if present.
+    #[serde(default)]
+    pub host: Option<String>,
+    /// The tenant resource objects, when the mirror carries them.
+    #[serde(default)]
+    pub objects: Vec<CloudObjectWire>,
+}
+
+/// One cloud object as it rides the mirror wire.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CloudObjectWire {
+    /// The `OpenStack` object id.
+    pub id: String,
+    /// The resource kind.
+    pub kind: CloudKind,
+    /// The display name.
+    pub name: String,
+    /// A fixed/floating address, when known.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// The object's host node, when the mirror names it (overrides the
+    /// publishing node as the host tag).
+    #[serde(default)]
+    pub host: Option<String>,
+}
+
+/// The `<node>` leaf of a `state/openstack/<node>` topic, or `None` if `topic`
+/// isn't under the openstack prefix (or names no node).
+#[must_use]
+pub fn openstack_topic_node(topic: &str) -> Option<&str> {
+    topic
+        .strip_prefix(OPENSTACK_TOPIC_PREFIX)
+        .filter(|n| !n.is_empty())
+}
+
+/// Fold one mirror body (published by `topic_node`) into cloud object records.
+///
+/// The host tag prefers the object's own `host`, falling back to the publishing
+/// node. Pure — the wire→record mapping the Bus reader + the tests share.
+#[must_use]
+pub fn records_from_body(topic_node: &str, body: &OpenstackMirrorBody) -> Vec<CloudObjectRecord> {
+    let publisher = body.host.as_deref().unwrap_or(topic_node);
+    body.objects
+        .iter()
+        .map(|o| CloudObjectRecord {
+            node: o.host.as_deref().unwrap_or(publisher).to_string(),
+            id: o.id.clone(),
+            kind: o.kind,
+            name: o.name.clone(),
+            address: o.address.clone(),
+        })
+        .collect()
+}
+
+/// Production [`OpenstackMirrorSource`] — reads the persisted Bus tree.
+///
+/// Takes the latest body on each `state/openstack/<node>` topic and folds its
+/// objects. Consumes the QC-2 mirror purely through the Bus read path (never an
+/// openstack worker file).
+pub struct BusOpenstackMirror {
+    bus_root: PathBuf,
+}
+
+impl BusOpenstackMirror {
+    /// Construct over the Bus root (the persisted message tree).
+    #[must_use]
+    pub const fn new(bus_root: PathBuf) -> Self {
+        Self { bus_root }
+    }
+}
+
+impl OpenstackMirrorSource for BusOpenstackMirror {
+    fn read(&self) -> Vec<CloudObjectRecord> {
+        let persist = match mde_bus::persist::Persist::open(self.bus_root.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(target: "mackesd::units", error = %e, "openstack mirror: persist open failed");
+                return Vec::new();
+            }
+        };
+        let topics = match persist.list_topics() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(target: "mackesd::units", error = %e, "openstack mirror: list_topics failed");
+                return Vec::new();
+            }
+        };
+        let mut out = Vec::new();
+        for topic in topics {
+            let Some(node) = openstack_topic_node(&topic) else {
+                continue;
+            };
+            let Ok(msgs) = persist.list_since(&topic, None) else {
+                continue;
+            };
+            // The latest body on the topic is the live mirror row.
+            let Some(body_str) = msgs.into_iter().next_back().and_then(|m| m.body) else {
+                continue;
+            };
+            match serde_json::from_str::<OpenstackMirrorBody>(&body_str) {
+                Ok(body) => out.extend(records_from_body(node, &body)),
+                Err(e) => {
+                    tracing::debug!(target: "mackesd::units", topic = %topic, error = %e, "openstack mirror: body decode failed");
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The fallback [`OpenstackMirrorSource`] when no Bus root resolves (a headless
+/// dev box with no `dirs::data_dir()`): no cloud objects, honestly absent (§7).
+pub struct NoCloud;
+
+impl OpenstackMirrorSource for NoCloud {
+    fn read(&self) -> Vec<CloudObjectRecord> {
+        Vec::new()
+    }
+}
+
+// ─────────────────────────── LAN scan seam ───────────────────────────
+
+/// One LAN host the active scan discovered (EXPLORER-2 fills these).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanHostRecord {
+    /// The stable id key — the host's MAC (preferred) or IP (fallback).
+    pub key: String,
+    /// The display name (rDNS/mDNS name, or the address until enriched).
+    pub name: String,
+    /// The host's LAN address, when known.
+    pub address: Option<String>,
+}
+
+/// The off-mesh half (EXPLORER-2 producer seam). The active scan runs ONLY while
+/// `scan_active` is set by the open surface (lock #24); a closed surface scans
+/// nothing.
+pub trait LanScanSource: Send + Sync {
+    /// Return the discovered LAN hosts. `scan_active` is the surface-gated flag
+    /// (lock #24): an implementation MUST NOT probe the network when it is
+    /// `false` (it may still return a warm cache).
+    fn scan(&self, scan_active: bool) -> Vec<LanHostRecord>;
+}
+
+/// The EXPLORER-1 default: no scan. Always empty regardless of the flag —
+/// EXPLORER-2 swaps in the real mDNS/ARP/ping-sweep scan behind this seam.
+pub struct NoScan;
+
+impl LanScanSource for NoScan {
+    fn scan(&self, _scan_active: bool) -> Vec<LanHostRecord> {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topic_node_strips_the_openstack_prefix() {
+        assert_eq!(
+            openstack_topic_node("state/openstack/node-a"),
+            Some("node-a")
+        );
+        // Not an openstack topic → None.
+        assert_eq!(openstack_topic_node("state/storage/node-a"), None);
+        // Empty leaf → None.
+        assert_eq!(openstack_topic_node("state/openstack/"), None);
+    }
+
+    #[test]
+    fn cloud_ids_are_stable_and_kind_namespaced() {
+        assert_eq!(
+            CloudKind::Instance.unit_id("uuid-1"),
+            "cloud:instance:uuid-1"
+        );
+        assert_eq!(CloudKind::Volume.unit_id("v9"), "cloud:volume:v9");
+        // Same object id under different kinds never collides.
+        assert_ne!(
+            CloudKind::Image.unit_id("x"),
+            CloudKind::Network.unit_id("x")
+        );
+        assert_eq!(CloudKind::Instance.unit_kind(), UnitKind::Instance);
+    }
+
+    #[test]
+    fn service_only_body_folds_zero_objects() {
+        // Today's QC-2 mirror body (doctrine/runtime/services, no `objects`)
+        // decodes to zero cloud objects — honest absence, not a fake (§7).
+        let body_str = r#"{
+            "host":"node-a",
+            "doctrine":{"status":"disabled"},
+            "runtime":{"status":"available"},
+            "services":[{"service":"keystone","status":{"state":"running"}}],
+            "extras":[],
+            "published_at_ms":1
+        }"#;
+        let body: OpenstackMirrorBody = serde_json::from_str(body_str).expect("decode");
+        assert_eq!(body.host.as_deref(), Some("node-a"));
+        assert!(records_from_body("node-a", &body).is_empty());
+    }
+
+    #[test]
+    fn objects_body_folds_host_tagged_records() {
+        // A forward-compat mirror that DOES carry tenant objects folds them,
+        // host-tagged (the object's own host overrides the publishing node).
+        let body_str = r#"{
+            "host":"node-a",
+            "objects":[
+                {"id":"i1","kind":"instance","name":"web","address":"10.0.0.5"},
+                {"id":"n1","kind":"network","name":"tenant-net","host":"node-b"}
+            ]
+        }"#;
+        let body: OpenstackMirrorBody = serde_json::from_str(body_str).expect("decode");
+        let recs = records_from_body("node-a", &body);
+        assert_eq!(recs.len(), 2);
+        // Object without its own host → tagged with the publishing node.
+        assert_eq!(recs[0].node, "node-a");
+        assert_eq!(recs[0].kind, CloudKind::Instance);
+        assert_eq!(recs[0].address.as_deref(), Some("10.0.0.5"));
+        // Object with its own host → tagged there (the host-node tag, lock #20).
+        assert_eq!(recs[1].node, "node-b");
+        assert_eq!(recs[1].kind, CloudKind::Network);
+    }
+
+    #[test]
+    fn no_scan_returns_empty_regardless_of_the_flag() {
+        assert!(NoScan.scan(true).is_empty());
+        assert!(NoScan.scan(false).is_empty());
+    }
+}
