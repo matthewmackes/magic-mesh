@@ -67,6 +67,7 @@ use mde_egui::Style;
 
 use crate::buffer::Buffer;
 use crate::highlight::{HighlightSpan, Highlighter};
+use crate::lsp_ui::{severity_color, DiagnosticsOverlay};
 use crate::md_actions::MdOutcome;
 
 /// Soft-tab width: a Tab keypress inserts this many spaces (the editor is
@@ -487,6 +488,10 @@ pub struct EditorView {
     /// metric (glyph width, row height, gutter) derives from the scaled font, so
     /// hit-testing, wrap, culling, and the caret all track the zoom for free.
     zoom_percent: u16,
+    /// A monotonic counter bumped on every edit that changes the buffer (EDITOR-
+    /// LSP-2) — the panel compares it across frames to push a `didChange` to the
+    /// language server only when the text actually moved (not on caret motion).
+    edits: u64,
 }
 
 impl Default for EditorView {
@@ -513,6 +518,7 @@ impl EditorView {
             edit_before: None,
             box_anchor: None,
             zoom_percent: ZOOM_DEFAULT,
+            edits: 0,
         }
     }
 
@@ -596,6 +602,14 @@ impl EditorView {
     /// The zoom as a font-size multiplier over [`Style::BODY`] (1.0 at 100%).
     pub(crate) fn font_scale(&self) -> f32 {
         f32::from(self.zoom_percent) / 100.0
+    }
+
+    /// The edit generation — a monotonic counter bumped on every buffer-changing
+    /// edit (EDITOR-LSP-2). The panel compares it across frames to send a
+    /// `didChange` only when the text actually moved.
+    #[must_use]
+    pub(crate) fn edit_generation(&self) -> u64 {
+        self.edits
     }
 
     /// The primary caret's 1-based `(line, column)` for the status strip.
@@ -710,6 +724,8 @@ impl EditorView {
         if groups == 0 {
             return;
         }
+        // The buffer moved — signal the LSP doc-sync (EDITOR-LSP-2).
+        self.edits = self.edits.wrapping_add(1);
         self.reveal_caret = true;
         self.redo_log.clear();
         let after = self.snapshot();
@@ -985,6 +1001,7 @@ impl EditorView {
         self.group_open = false;
         self.last_kind = None;
         self.reveal_caret = true;
+        self.edits = self.edits.wrapping_add(1); // the buffer moved (EDITOR-LSP-2)
         true
     }
 
@@ -1005,6 +1022,7 @@ impl EditorView {
         self.group_open = false;
         self.last_kind = None;
         self.reveal_caret = true;
+        self.edits = self.edits.wrapping_add(1); // the buffer moved (EDITOR-LSP-2)
         true
     }
 
@@ -1460,6 +1478,7 @@ pub fn editor_widget(
     view: &mut EditorView,
     buffer: &mut Buffer,
     highlight: Option<&mut Highlighter>,
+    diagnostics: &DiagnosticsOverlay,
 ) -> Response {
     view.clamp(buffer);
 
@@ -1499,7 +1518,16 @@ pub fn editor_widget(
         .auto_shrink([false, false])
         .drag_to_scroll(false)
         .show(ui, |ui| {
-            editor_body(ui, view, buffer, highlight, metrics, wrap_cols, total_rows)
+            editor_body(
+                ui,
+                view,
+                buffer,
+                highlight,
+                metrics,
+                wrap_cols,
+                total_rows,
+                diagnostics,
+            )
         })
         .inner
 }
@@ -1515,6 +1543,7 @@ fn editor_body(
     m: Metrics,
     wrap_cols: usize,
     total_rows: usize,
+    diagnostics: &DiagnosticsOverlay,
 ) -> Response {
     let clip = ui.clip_rect();
     // Content extent: full virtual height so the scrollbar is honest; width is the
@@ -1584,7 +1613,17 @@ fn editor_body(
     });
 
     paint(
-        ui, view, buffer, m, origin, first, last, wrap_cols, &resp, &spans,
+        ui,
+        view,
+        buffer,
+        m,
+        origin,
+        first,
+        last,
+        wrap_cols,
+        &resp,
+        &spans,
+        diagnostics,
     );
 
     // Reveal the primary caret exactly once after a move/edit (don't fight scroll).
@@ -1753,6 +1792,7 @@ fn paint(
     wrap_cols: usize,
     resp: &Response,
     spans: &[HighlightSpan],
+    diagnostics: &DiagnosticsOverlay,
 ) {
     let clip = ui.clip_rect();
     let painter = ui.painter_at(clip);
@@ -1809,6 +1849,10 @@ fn paint(
             y,
             m,
         );
+
+        // EDITOR-LSP-2 — diagnostic underlines (squiggles) + hover message for
+        // any diagnostic range overlapping this row, layered over the text.
+        paint_diagnostic_underlines(&text_painter, ui, diagnostics, vr, &row, text_x0, y, m);
     }
 
     paint_gutter(
@@ -1822,8 +1866,72 @@ fn paint(
         last,
         wrap_cols,
         &caret_lines,
+        diagnostics,
     );
     paint_carets(&text_painter, ui, view, buffer, m, origin, wrap_cols, resp);
+}
+
+/// Paint the diagnostic underlines for one visual row (EDITOR-LSP-2): a squiggle
+/// in the diagnostic's [`severity_color`] under each overlapping range, plus a
+/// hover region that shows the diagnostic message. Ranges are clamped to the
+/// row, so a multi-line diagnostic underlines the visible slice on each row.
+#[allow(clippy::too_many_arguments)]
+fn paint_diagnostic_underlines(
+    painter: &egui::Painter,
+    ui: &Ui,
+    diagnostics: &DiagnosticsOverlay,
+    vr: usize,
+    row: &VisRow,
+    text_x0: f32,
+    y: f32,
+    m: Metrics,
+) {
+    for (i, mark) in diagnostics.marks().iter().enumerate() {
+        let lo = mark.chars.start.clamp(row.start, row.end);
+        let hi = mark.chars.end.clamp(row.start, row.end);
+        if hi <= lo {
+            continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let left = text_x0 + (lo - row.start) as f32 * m.glyph_w;
+        #[allow(clippy::cast_precision_loss)]
+        let right = text_x0 + (hi - row.start) as f32 * m.glyph_w;
+        let color = severity_color(mark.severity);
+        squiggle(
+            painter,
+            left,
+            right,
+            y + m.row_h - Style::SP_XS * 0.75,
+            color,
+        );
+        // A hover region over the range shows the message (unique id per row +
+        // mark so egui never sees a duplicate interaction this frame).
+        let rect = Rect::from_min_max(pos2(left, y), pos2(right, y + m.row_h));
+        let id = ui.id().with(("mde-editor-diag", vr, i));
+        ui.interact(rect, id, Sense::hover())
+            .on_hover_text(mark.message.as_str());
+    }
+}
+
+/// Paint a wavy underline from `x0` to `x1` at baseline `y` in `color` — the
+/// diagnostic squiggle, a short zig-zag of segments (crisp at any DPI, no
+/// dependency on a version-sensitive `Shape::line` signature).
+fn squiggle(painter: &egui::Painter, x0: f32, x1: f32, y: f32, color: Color32) {
+    if x1 <= x0 {
+        return;
+    }
+    let stroke = Stroke::new(1.0, color);
+    let amp = Style::SP_XS / 2.0;
+    let step = Style::SP_XS;
+    // Integer segment count across the span (≥ 1) — no float loop condition.
+    let segments = (((x1 - x0) / step).ceil() as usize).max(1);
+    let mut prev = pos2(x0, y);
+    for i in 0..segments {
+        let nx = (x0 + step * (i as f32 + 1.0)).min(x1);
+        let next = pos2(nx, if i % 2 == 0 { y - amp } else { y + amp });
+        painter.line_segment([prev, next], stroke);
+        prev = next;
+    }
 }
 
 /// Paint one visual row's glyphs, sliced by the highlight `spans` that overlap
@@ -1965,6 +2073,7 @@ fn paint_gutter(
     last: usize,
     wrap_cols: usize,
     caret_lines: &[usize],
+    diagnostics: &DiagnosticsOverlay,
 ) {
     // Pin the gutter to the visible left edge even under horizontal scroll.
     let gx = clip.left();
@@ -2000,6 +2109,16 @@ fn paint_gutter(
             FontId::monospace(Style::SMALL * m.scale),
             color,
         );
+
+        // EDITOR-LSP-2 — a severity dot at the gutter's left edge (clear of the
+        // right-aligned numbers) for any line carrying a diagnostic.
+        if let Some(severity) = diagnostics.severity_for_line(row.line) {
+            painter.circle_filled(
+                pos2(gx + Style::SP_XS * 1.5, y + m.row_h * 0.5),
+                Style::SP_XS * 0.6,
+                severity_color(severity),
+            );
+        }
     }
 }
 
@@ -2065,6 +2184,7 @@ fn gutter_width(lines: usize, glyph_w: f32) -> f32 {
 mod tests {
     use super::{editor_widget, find_next, line_len, line_span, word_span, Caret, EditorView};
     use crate::buffer::Buffer;
+    use crate::lsp_ui::DiagnosticsOverlay;
     use mde_egui::egui::{self, pos2, vec2, Event, Key, Modifiers, Rect};
     use mde_egui::Style;
 
@@ -2504,7 +2624,13 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                editor_widget(ui, &mut view, &mut buf, None);
+                editor_widget(
+                    ui,
+                    &mut view,
+                    &mut buf,
+                    None,
+                    &DiagnosticsOverlay::default(),
+                );
             });
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
@@ -2531,7 +2657,13 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                editor_widget(ui, &mut view, &mut buf, None);
+                editor_widget(
+                    ui,
+                    &mut view,
+                    &mut buf,
+                    None,
+                    &DiagnosticsOverlay::default(),
+                );
             });
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
@@ -2559,7 +2691,13 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                editor_widget(ui, &mut view, &mut buf, Some(&mut hl));
+                editor_widget(
+                    ui,
+                    &mut view,
+                    &mut buf,
+                    Some(&mut hl),
+                    &DiagnosticsOverlay::default(),
+                );
             });
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
@@ -2595,7 +2733,13 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                editor_widget(ui, &mut view, &mut buf, None);
+                editor_widget(
+                    ui,
+                    &mut view,
+                    &mut buf,
+                    None,
+                    &DiagnosticsOverlay::default(),
+                );
             });
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
@@ -2673,13 +2817,101 @@ mod tests {
                 "the 200% font measures a wider glyph cell ({w100} -> {w200})"
             );
             egui::CentralPanel::default().show(ctx, |ui| {
-                editor_widget(ui, &mut view, &mut buf, None);
+                editor_widget(
+                    ui,
+                    &mut view,
+                    &mut buf,
+                    None,
+                    &DiagnosticsOverlay::default(),
+                );
             });
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         assert!(
             !prims.is_empty(),
             "the zoomed editor produced no primitives"
+        );
+    }
+
+    // ── EDITOR-LSP-2: diagnostics paint (gutter marker + underline) ──────────
+
+    #[test]
+    fn diagnostics_paint_a_gutter_marker_and_an_underline() {
+        // A published diagnostic resolves to a gutter marker on its line + an
+        // underline over its range, and the widget paints both through a real
+        // frame (§7 — the diagnostics render path is reachable, not a mockup).
+        use crate::lsp::{Diagnostic, Severity};
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut buf = Buffer::from_text("fn main() {\n    let x = 1;\n}\n");
+        let mut view = EditorView::new();
+
+        // A warning on line 1 (0-based) over the `x` at cols 8..9.
+        let d = Diagnostic {
+            severity: Severity::Warning,
+            start_line: 1,
+            start_character: 8,
+            end_line: 1,
+            end_character: 9,
+            message: "unused variable `x`".to_owned(),
+            source: Some("rustc".to_owned()),
+        };
+        let mut diags = DiagnosticsOverlay::default();
+        diags.rebuild(1, &buf, std::slice::from_ref(&d));
+        assert_eq!(
+            diags.severity_for_line(1),
+            Some(Severity::Warning),
+            "the gutter marks the diagnostic's line"
+        );
+        assert!(
+            !diags.marks().is_empty(),
+            "the diagnostic resolved to an underline mark"
+        );
+
+        // A baseline frame with no diagnostics, then one with them: the painted
+        // geometry grows (the gutter marker + underline squiggle add vertices —
+        // the tessellator batches shapes into one mesh, so vertices, not the
+        // clipped-primitive count, is what moves).
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let vertices = |prims: &[egui::ClippedPrimitive]| -> usize {
+            prims
+                .iter()
+                .map(|p| match &p.primitive {
+                    egui::epaint::Primitive::Mesh(m) => m.vertices.len(),
+                    egui::epaint::Primitive::Callback(_) => 0,
+                })
+                .sum()
+        };
+        let plain = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor_widget(
+                    ui,
+                    &mut view,
+                    &mut buf,
+                    None,
+                    &DiagnosticsOverlay::default(),
+                );
+            });
+        });
+        let plain_v = vertices(&ctx.tessellate(plain.shapes, plain.pixels_per_point));
+
+        let out = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor_widget(ui, &mut view, &mut buf, None, &diags);
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the editor with diagnostics produced no primitives"
+        );
+        assert!(
+            vertices(&prims) > plain_v,
+            "the diagnostics added painted geometry (gutter marker + underline): {} vs {plain_v}",
+            vertices(&prims)
         );
     }
 }

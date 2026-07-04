@@ -31,7 +31,9 @@ use mde_egui::Style;
 use crate::buffer::Buffer;
 use crate::finder::{self, FileFinder};
 use crate::format_bar;
-use crate::highlight::Highlighter;
+use crate::highlight::{Highlighter, Language};
+use crate::lsp::LspClient;
+use crate::lsp_ui::{lsp_status, DiagnosticsOverlay};
 use crate::md_actions::{self, ListKind};
 use crate::menu_bar::{self, ListStyle, MenuAction, MenuContext};
 use crate::palette::{self, CommandPalette, PaletteCommand};
@@ -78,19 +80,134 @@ struct Doc {
     /// The syntax highlighter, or `None` for plain text (unknown extension /
     /// a pathless scratch buffer) — the honest no-highlight render (§7).
     highlight: Option<Highlighter>,
+    /// The per-document language-server session (EDITOR-LSP-2), or `None` for a
+    /// pathless / unrecognized buffer. A recognized language with no registered
+    /// or installed server parks in an honest gated [`LspState`](crate::lsp::LspState)
+    /// (`NoServer` / `Unavailable`), so this is `Some` whenever the file has a
+    /// language — the doc-sync calls are honest no-ops there (§7).
+    lsp: Option<LspClient>,
+    /// The diagnostics the widget paints, rebuilt from `lsp`'s store only when
+    /// its epoch moves (the §7 epoch-gate). Empty for a doc with no server.
+    diagnostics: DiagnosticsOverlay,
+    /// The [`EditorView`] edit generation last pushed to `lsp` via `didChange` —
+    /// the per-frame throttle so an unchanged buffer is not re-sent.
+    lsp_synced_gen: u64,
 }
 
 impl Doc {
     /// Wrap a freshly built buffer in a new view, picking the highlighter by
-    /// the buffer's file extension (none for scratch/unknown — plain text).
+    /// the buffer's file extension (none for scratch/unknown — plain text). The
+    /// language server is attached separately by [`start_lsp`](Self::start_lsp)
+    /// (it needs the resolved project root, which the surface owns).
     fn new(buffer: Buffer) -> Self {
         let highlight = buffer.path().and_then(Highlighter::for_path);
         Self {
             buffer,
             view: EditorView::new(),
             highlight,
+            lsp: None,
+            diagnostics: DiagnosticsOverlay::default(),
+            lsp_synced_gen: 0,
         }
     }
+
+    /// Attach a language-server session for this document's file, rooted at
+    /// `root` (EDITOR-LSP-2 lifecycle: `didOpen`). A no-op for a pathless
+    /// buffer or an extension with no known language. Recognized languages
+    /// always attach a client — a missing server binary is the honest gated
+    /// [`LspState::Unavailable`](crate::lsp::LspState) the chrome surfaces, not
+    /// a fake session (§7).
+    fn start_lsp(&mut self, root: &Path) {
+        let Some(path) = self.buffer.path().map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(language) = Language::from_path(&path) else {
+            return;
+        };
+        let Some(client) = build_lsp_client(language, root) else {
+            return;
+        };
+        // didOpen with the current full text (full-text sync, v1).
+        client.on_open(&path, &self.buffer.rope().to_string());
+        self.lsp_synced_gen = self.view.edit_generation();
+        self.lsp = Some(client);
+    }
+
+    /// Push this frame's edits to the server as one `didChange` (full-text sync)
+    /// — the per-frame sync point. Throttled on the [`EditorView`] edit
+    /// generation so a caret-only / unchanged frame sends nothing; multiple
+    /// keystrokes coalesced into one frame send exactly one `didChange`.
+    fn sync_lsp(&mut self) {
+        let Some(client) = self.lsp.as_ref() else {
+            return;
+        };
+        let Some(path) = self.buffer.path() else {
+            return;
+        };
+        let generation = self.view.edit_generation();
+        if generation == self.lsp_synced_gen {
+            return;
+        }
+        self.lsp_synced_gen = generation;
+        client.on_change(path, &self.buffer.rope().to_string());
+    }
+
+    /// Refresh the diagnostics overlay from the server's store — the §7
+    /// epoch-gate: the fetch + position recompute run only when
+    /// [`LspClient::diagnostics_epoch`](crate::lsp::LspClient::diagnostics_epoch)
+    /// has moved, so a quiet frame does nothing.
+    fn refresh_diagnostics(&mut self) {
+        let Some(client) = self.lsp.as_ref() else {
+            return;
+        };
+        let Some(path) = self.buffer.path() else {
+            return;
+        };
+        let epoch = client.diagnostics_epoch();
+        if !self.diagnostics.needs_refresh(epoch) {
+            return;
+        }
+        let diags = client.diagnostics_for(path);
+        self.diagnostics.rebuild(epoch, &self.buffer, &diags);
+    }
+
+    /// Tear down the language-server session (EDITOR-LSP-2 lifecycle:
+    /// `didClose` + graceful `shutdown`) before the doc is dropped. `Drop` on
+    /// [`LspClient`] hard-kills whatever remains, so this is the clean path.
+    fn close_lsp(&self) {
+        let Some(client) = self.lsp.as_ref() else {
+            return;
+        };
+        if let Some(path) = self.buffer.path() {
+            client.on_close(path);
+        }
+        client.shutdown();
+    }
+}
+
+/// Build the language client for `language` rooted at `root`.
+///
+/// Production starts the registered server, spawning its binary when present —
+/// the real live-diagnostics path. Under the crate's own `cfg(test)` the suite
+/// must never launch a real OS process (there is no rust-analyzer on the
+/// airgapped build host, and a real server would make the tests heavy + flaky),
+/// so only the **serverless** languages get a client — the honest
+/// [`LspState::NoServer`](crate::lsp::LspState) gated shape, which spawns
+/// nothing. The open/change/close wiring is exercised through that gated client,
+/// and the honest `Unavailable`/`Running` statuses through `lsp_ui`'s
+/// `status_of` unit tests.
+#[cfg(not(test))]
+#[allow(clippy::unnecessary_wraps)] // the cfg(test) twin returns None; keep one signature
+fn build_lsp_client(language: Language, root: &Path) -> Option<LspClient> {
+    Some(LspClient::start(language, root))
+}
+
+#[cfg(test)]
+fn build_lsp_client(language: Language, root: &Path) -> Option<LspClient> {
+    if crate::lsp::server_spec(language).is_some() {
+        return None; // never spawn a real language server in the suite
+    }
+    Some(LspClient::start(language, root)) // NoServer — spawns no process
 }
 
 /// The code-editor surface the E12 shell embeds.
@@ -194,17 +311,49 @@ impl EditorSurface {
 
     /// Open an in-memory document seeded with `text` (no path). The open-a-buffer
     /// seam the finder / Files send drive; also the scratch affordance's backing.
+    /// A pathless buffer starts no language server (§7 — nothing to serve).
     pub fn open_text(&mut self, text: &str) {
-        self.doc = Some(Doc::new(Buffer::from_text(text)));
+        self.set_doc(Some(Doc::new(Buffer::from_text(text))));
     }
 
-    /// Open `path` from disk into the surface, replacing any open document.
+    /// Open `path` from disk into the surface, replacing any open document and
+    /// starting a language-server session for it (EDITOR-LSP-2 `didOpen`), rooted
+    /// at the open project root when there is one, else the file's directory.
     ///
     /// # Errors
     /// Returns any [`io::Error`] from reading `path` (missing file, permissions).
     pub fn open_path<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
-        self.doc = Some(Doc::new(Buffer::open(path)?));
+        let path = path.as_ref();
+        let mut doc = Doc::new(Buffer::open(path)?);
+        doc.start_lsp(&self.lsp_root_for(path));
+        self.set_doc(Some(doc));
         Ok(())
+    }
+
+    /// The workspace root to root a language server at for `path`: the open
+    /// project root, else the file's parent directory, else the cwd — a server
+    /// always gets an absolute-ish root to index from.
+    fn lsp_root_for(&self, path: &Path) -> PathBuf {
+        self.project
+            .as_ref()
+            .map(|tree| tree.root().to_path_buf())
+            .or_else(|| {
+                path.parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+            })
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Replace the open document, tearing down the outgoing document's language
+    /// server first (EDITOR-LSP-2 `didClose`) so no session leaks across an
+    /// open/close/switch.
+    fn set_doc(&mut self, doc: Option<Doc>) {
+        if let Some(existing) = self.doc.as_ref() {
+            existing.close_lsp();
+        }
+        self.doc = doc;
     }
 
     /// Open a fresh scratch buffer (the temporary EDITOR-3 exercise affordance).
@@ -212,9 +361,10 @@ impl EditorSurface {
         self.open_text(SCRATCH_SEED);
     }
 
-    /// Close the open document, returning the surface to the empty state.
+    /// Close the open document, returning the surface to the empty state and
+    /// tearing down its language-server session (EDITOR-LSP-2 `didClose`).
     pub fn close(&mut self) {
-        self.doc = None;
+        self.set_doc(None);
     }
 
     // ── EDITOR-7: the fuzzy finder + command palette ─────────────────────────
@@ -727,9 +877,23 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
         };
         doc_chrome(ui, doc, &mut surface.show_tree);
         ui.separator();
-        // Disjoint field borrows: the widget edits `&mut view` + `&mut buffer`
-        // and syncs `&mut highlight` with this frame's edits (EDITOR-5).
-        editor_widget(ui, &mut doc.view, &mut doc.buffer, doc.highlight.as_mut());
+        // EDITOR-LSP-2 — refresh the diagnostics overlay from the server's store
+        // (epoch-gated: a quiet frame skips it) so the widget paints the current
+        // gutter markers + underlines this frame.
+        doc.refresh_diagnostics();
+        // Disjoint field borrows: the widget edits `&mut view` + `&mut buffer`,
+        // syncs `&mut highlight` with this frame's edits (EDITOR-5), and reads
+        // the shared `&diagnostics` overlay to paint them (EDITOR-LSP-2).
+        editor_widget(
+            ui,
+            &mut doc.view,
+            &mut doc.buffer,
+            doc.highlight.as_mut(),
+            &doc.diagnostics,
+        );
+        // EDITOR-LSP-2 — push this frame's edits to the server (one throttled
+        // `didChange`, full-text sync) now the buffer has settled.
+        doc.sync_lsp();
     });
 
     // EDITOR-7 — the finder + palette overlays float above the body (rendered last
@@ -793,6 +957,10 @@ fn doc_chrome(ui: &mut Ui, doc: &mut Doc, show_tree: &mut bool) {
     // The detected language (EDITOR-5) — honest chrome: shown only when a real
     // grammar is highlighting this document, absent for plain text.
     let lang = doc.highlight.as_ref().map(|hl| hl.language().name());
+    // The language-server status (EDITOR-LSP-2) — honest chrome: an absent
+    // server binary reads "<cmd>: not found", never a faked session (§7); a
+    // serverless / stopped session shows nothing.
+    let lsp = doc.lsp.as_ref().and_then(lsp_status);
     let mut toggle_wrap = false;
 
     ui.add_space(Style::SP_XS);
@@ -822,6 +990,14 @@ fn doc_chrome(ui: &mut Ui, doc: &mut Doc, show_tree: &mut bool) {
                     .size(Style::SMALL)
                     .color(Style::TEXT_DIM),
             );
+            if let Some(status) = &lsp {
+                ui.add_space(Style::SP_M);
+                ui.label(
+                    RichText::new(&status.text)
+                        .size(Style::SMALL)
+                        .color(status.color),
+                );
+            }
             if let Some(lang) = lang {
                 ui.add_space(Style::SP_M);
                 ui.label(
@@ -1756,6 +1932,144 @@ mod tests {
         assert!(
             tessellate_panel(&mut surface) > 0,
             "the editor with the Formatting strip produced no draw primitives"
+        );
+    }
+
+    // ── EDITOR-LSP-2: the language-server lifecycle wiring ───────────────────
+    //
+    // The suite never spawns a real OS language server (see `build_lsp_client`
+    // under `cfg(test)`): a serverless language (`.md` → NoServer) yields a
+    // gated client with no process, so the open/change/close *wiring* is
+    // exercised — the doc-sync calls are honest no-ops on the gated client. The
+    // honest gated *statuses* + the diagnostics paint are covered by `lsp_ui`'s
+    // and `widget`'s own tests.
+
+    #[test]
+    fn opening_a_recognized_file_starts_a_language_client() {
+        let d = TempDir::new("lsp-open");
+        let file = d.join("notes.md");
+        std::fs::write(&file, b"# Title\n\nbody\n").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+        assert!(
+            surface.doc.as_ref().expect("doc").lsp.is_some(),
+            "opening a file with a known language attaches a client (didOpen)"
+        );
+    }
+
+    #[test]
+    fn a_scratch_buffer_starts_no_language_client() {
+        let mut surface = real_editor();
+        surface.open_scratch();
+        assert!(
+            surface.doc.as_ref().expect("doc").lsp.is_none(),
+            "a pathless scratch buffer has nothing to serve"
+        );
+    }
+
+    #[test]
+    fn a_plain_text_file_starts_no_language_client() {
+        let d = TempDir::new("lsp-plain");
+        let file = d.join("readme.txt");
+        std::fs::write(&file, b"just prose\n").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+        assert!(
+            surface.doc.as_ref().expect("doc").lsp.is_none(),
+            "an unknown extension has no language — no server"
+        );
+    }
+
+    #[test]
+    fn editing_an_open_file_pushes_a_didchange_each_frame() {
+        // The per-frame `didChange` wiring: a real typed frame bumps the edit
+        // generation and the panel's sync point advances `lsp_synced_gen` to
+        // match — proof `on_change` fired for the settled buffer.
+        let d = TempDir::new("lsp-change");
+        let file = d.join("doc.md");
+        std::fs::write(&file, b"body\n").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+        assert_eq!(
+            surface.doc.as_ref().expect("doc").lsp_synced_gen,
+            0,
+            "a freshly opened doc is synced at generation 0"
+        );
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        run_frame(&ctx, &mut surface, vec![Event::Text("X".to_owned())]);
+
+        let doc = surface.doc.as_ref().expect("doc");
+        assert!(
+            doc.view.edit_generation() >= 1,
+            "the typed frame recorded a real edit"
+        );
+        assert_eq!(
+            doc.lsp_synced_gen,
+            doc.view.edit_generation(),
+            "the panel pushed the settled buffer to the server (didChange)"
+        );
+    }
+
+    #[test]
+    fn a_caret_only_frame_sends_no_didchange() {
+        // The throttle: an arrow-key frame moves the caret but does not change
+        // the buffer, so the sync generation must not advance.
+        let d = TempDir::new("lsp-quiet");
+        let file = d.join("doc.md");
+        std::fs::write(&file, b"abc\n").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        run_frame(
+            &ctx,
+            &mut surface,
+            vec![key_press(Key::ArrowRight, Modifiers::NONE)],
+        );
+        let doc = surface.doc.as_ref().expect("doc");
+        assert_eq!(
+            doc.lsp_synced_gen, 0,
+            "a caret-only frame is not resent to the server"
+        );
+    }
+
+    #[test]
+    fn closing_a_document_tears_down_the_client_without_panic() {
+        // Close fires didClose + shutdown then drops the client — the graceful
+        // teardown path, exercised end to end.
+        let d = TempDir::new("lsp-close");
+        let file = d.join("x.md");
+        std::fs::write(&file, b"hi\n").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+        assert!(surface.is_open());
+        surface.close();
+        assert!(!surface.is_open(), "close returned to the empty state");
+    }
+
+    #[test]
+    fn switching_documents_closes_the_previous_client() {
+        // Opening a second file replaces the doc through `set_doc`, which closes
+        // the outgoing document's server first — no leaked session.
+        let d = TempDir::new("lsp-switch");
+        let first = d.join("a.md");
+        let second = d.join("b.md");
+        std::fs::write(&first, b"a\n").expect("write");
+        std::fs::write(&second, b"b\n").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&first).expect("open first");
+        surface.open_path(&second).expect("open second");
+        assert_eq!(
+            surface.current_path(),
+            Some(second.as_path()),
+            "the second file is now the open document"
+        );
+        assert!(
+            surface.doc.as_ref().expect("doc").lsp.is_some(),
+            "the second document has its own client"
         );
     }
 }

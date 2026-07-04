@@ -42,6 +42,12 @@
 //!   grid-picker) and **Format** menus, each driving `md_actions` on the live
 //!   buffer as one operator undo step. Only the standalone Table menu (cell ops)
 //!   and Print/Spell/Find await later phases.
+//! * EDITOR-LSP-1/2 — the **LSP client** ([`lsp`]) wired into the surface: the
+//!   panel owns a per-document [`LspClient`], driving `didOpen`/`didChange`/
+//!   `didClose` off the real buffer's open/edit/close lifecycle, and the widget
+//!   paints the published diagnostics (`lsp_ui`) as gutter severity markers +
+//!   inline underlines with a hover message. An absent server binary surfaces
+//!   the honest [`LspState::Unavailable`] status, never a faked session (§7).
 //!
 //! Tabs + splittable panes land in the following units; they grow
 //! [`EditorSurface`] / [`EditorView`] and render into [`editor_panel`] without
@@ -58,6 +64,7 @@ mod format_bar;
 mod fuzzy;
 pub mod highlight;
 pub mod lsp;
+pub mod lsp_ui;
 pub mod md_actions;
 mod menu_bar;
 mod palette;
@@ -72,6 +79,7 @@ pub use buffer::Buffer;
 pub use crdt::{CollabDoc, CrdtError, EditSink, TextEdit};
 pub use highlight::{Highlighter, Language};
 pub use lsp::{Diagnostic, LspClient, LspState, Severity};
+pub use lsp_ui::DiagnosticsOverlay;
 pub use panel::{editor_panel, EditorSurface};
 pub use project_tree::ProjectTree;
 pub use widget::{editor_widget, EditorView};
