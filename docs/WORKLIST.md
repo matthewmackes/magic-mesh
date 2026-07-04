@@ -3030,7 +3030,7 @@ Throwaway XCP-ng VMs on a dom0 (LAN-bridged, `172.20.x`) giving the shell's Desk
   **As** an operator, **I want** Glance (local store + replication) fed by a diskimage-builder pipeline, **so that** the golden-image script retires (Q36/53).
   **Acceptance**:
     - [ ] DIB builds the platform's standard images into Glance; `build-mde-vm-golden.sh` deleted; images replicate across API nodes
-- [ ] **QC-10: capacity-derived flavors + hard per-user quotas.**
+- [✓] **QC-10: capacity-derived flavors + hard per-user quotas.**
   **As** the platform, **I want** flavors generated from real node shapes and quotas derived from real capacity divided into enforced per-user limits, **so that** guardrails are honest (Q29/39/89).
   **Acceptance**:
     - [ ] flavor set regenerates when a node joins/leaves; exceeding a per-user quota is rejected by Keystone/Nova and surfaced in the UI
