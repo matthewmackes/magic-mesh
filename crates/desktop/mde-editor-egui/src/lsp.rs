@@ -125,6 +125,103 @@ impl Diagnostic {
 }
 
 // ---------------------------------------------------------------------------
+// Navigation results — the typed shapes the UI-driven requests
+// (definition / references / rename / formatting, EDITOR-LSP-3) fold their
+// responses into. Positions are the LSP wire values — **zero-based** line +
+// UTF-16 `character` — exactly like [`Diagnostic`]; the `lsp_nav` UI resolves
+// them onto rope char offsets when it jumps or applies an edit.
+// ---------------------------------------------------------------------------
+
+/// A zero-based LSP range (line + UTF-16 `character`): the wire span shared by
+/// locations, text edits, and rename spans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LspRange {
+    /// Zero-based start line.
+    pub start_line: u32,
+    /// Zero-based start column (UTF-16 code units).
+    pub start_character: u32,
+    /// Zero-based end line.
+    pub end_line: u32,
+    /// Zero-based end column (UTF-16 code units), exclusive.
+    pub end_character: u32,
+}
+
+/// A resolved location: a file plus the [`LspRange`] within it — a
+/// goto-definition target or one find-references hit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Location {
+    /// The file the location points into.
+    pub path: PathBuf,
+    /// The zero-based range within the file.
+    pub range: LspRange,
+}
+
+/// One text edit: replace [`range`](Self::range) with
+/// [`new_text`](Self::new_text) — a formatting edit or one entry of a rename
+/// [`WorkspaceEdit`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextEdit {
+    /// The zero-based range the edit replaces.
+    pub range: LspRange,
+    /// The replacement text.
+    pub new_text: String,
+}
+
+/// A workspace edit: the per-file text edits a rename returns, in the server's
+/// order. A cross-file edit is honestly represented — every affected file with
+/// its own edit list (§7).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceEdit {
+    /// The affected files, each with its ordered list of edits.
+    pub changes: Vec<(PathBuf, Vec<TextEdit>)>,
+}
+
+impl WorkspaceEdit {
+    /// Whether the edit touches nothing (an honest "nothing to rename").
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+}
+
+/// A `prepareRename` result.
+///
+/// The span of the symbol under the cursor plus the server's suggested
+/// placeholder (the rename box's initial text) when it gave one. A `None` reply
+/// from the server means "not renameable here"; the UI then falls back to the
+/// word under the cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrepareRename {
+    /// The span of the renameable symbol.
+    pub range: LspRange,
+    /// The server's suggested placeholder, when it provided one.
+    pub placeholder: Option<String>,
+}
+
+/// A completed reply to one UI-driven navigation request (EDITOR-LSP-3), folded
+/// to the flat local types and delivered to the panel through the
+/// [`LspClient::take_replies`] poll seam.
+///
+/// Honest by construction (§7): a server that returns `null` yields an empty
+/// result (no locations, no edits) — never a fabricated one — and a gated /
+/// absent server never enqueues a request at all, so no reply is ever faked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LspReply {
+    /// `textDocument/definition` — the target locations (the UI jumps to the
+    /// first; empty means "no definition found").
+    Definition(Vec<Location>),
+    /// `textDocument/references` — every reference (the UI lists them).
+    References(Vec<Location>),
+    /// `textDocument/prepareRename` — the renameable span + placeholder, or
+    /// `None` when the position is not renameable.
+    PrepareRename(Option<PrepareRename>),
+    /// `textDocument/rename` — the cross-file workspace edit to apply.
+    Rename(WorkspaceEdit),
+    /// `textDocument/formatting` — the edits to apply to the buffer.
+    Format(Vec<TextEdit>),
+}
+
+// ---------------------------------------------------------------------------
 // State — every phase of a session is a typed, honest state (§7).
 // ---------------------------------------------------------------------------
 
@@ -412,12 +509,32 @@ fn notification_frame(method: &str, params: Option<Value>) -> Vec<u8> {
 // The client.
 // ---------------------------------------------------------------------------
 
-/// A request we sent and whose response drives a lifecycle step.
+/// A request we sent and whose response drives a lifecycle step or a UI-driven
+/// navigation reply.
 enum Pending {
     /// `initialize` — its response triggers `initialized` + the queue flush.
     Initialize,
     /// `shutdown` — its response triggers `exit`.
     Shutdown,
+    /// A UI-driven navigation request (EDITOR-LSP-3) — its response is folded
+    /// to the matching [`LspReply`] and pushed to the poll inbox.
+    Nav(NavKind),
+}
+
+/// Which UI-driven request is in flight, so the reader thread folds its response
+/// into the right [`LspReply`] variant (EDITOR-LSP-3).
+#[derive(Clone, Copy, Debug)]
+enum NavKind {
+    /// `textDocument/definition`.
+    Definition,
+    /// `textDocument/references`.
+    References,
+    /// `textDocument/prepareRename`.
+    PrepareRename,
+    /// `textDocument/rename`.
+    Rename,
+    /// `textDocument/formatting`.
+    Format,
 }
 
 /// State the reader thread and the client handle share under one mutex, so
@@ -437,10 +554,16 @@ struct Shared {
     diags: Mutex<HashMap<PathBuf, Vec<Diagnostic>>>,
     /// Bumped on every diagnostics change — a cheap repaint/recache signal.
     diag_epoch: AtomicU64,
-    /// In-flight lifecycle requests by JSON-RPC id.
+    /// In-flight requests (lifecycle + navigation) by JSON-RPC id.
     pending: Mutex<HashMap<i64, Pending>>,
     /// The server process, until reaped (reader thread or `Drop`).
     child: Mutex<Option<Child>>,
+    /// Completed UI-driven navigation replies (EDITOR-LSP-3), drained by the
+    /// panel each frame via [`LspClient::take_replies`].
+    replies: Mutex<Vec<LspReply>>,
+    /// Bumped on every reply pushed — the cheap poll gate the panel reads via
+    /// [`LspClient::replies_epoch`] before it locks the inbox.
+    reply_epoch: AtomicU64,
 }
 
 impl Shared {
@@ -454,6 +577,8 @@ impl Shared {
             diag_epoch: AtomicU64::new(0),
             pending: Mutex::new(HashMap::new()),
             child: Mutex::new(child),
+            replies: Mutex::new(Vec::new()),
+            reply_epoch: AtomicU64::new(0),
         }
     }
 
@@ -737,6 +862,143 @@ impl LspClient {
         let _ = tx.send(request_frame(id, "shutdown", None));
     }
 
+    // ── EDITOR-LSP-3: the UI-driven navigation requests ──────────────────────
+
+    /// Request `textDocument/definition` for the caret at zero-based `line` /
+    /// UTF-16 `character`. Returns `true` when a request was dispatched (a live
+    /// or initializing session); `false` is the honest gated no-op (§7 — an
+    /// absent / dead server enqueues nothing and produces no reply). The reply
+    /// arrives asynchronously as [`LspReply::Definition`] on [`Self::take_replies`].
+    #[must_use]
+    pub fn goto_definition(&self, path: &Path, line: u32, character: u32) -> bool {
+        let Some(uri) = path_to_file_uri(path) else {
+            return false;
+        };
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        });
+        self.send_request("textDocument/definition", params, NavKind::Definition)
+    }
+
+    /// Request `textDocument/references` (including the declaration) for the
+    /// caret. The reply arrives as [`LspReply::References`]. Returns whether a
+    /// request was dispatched (see [`Self::goto_definition`]).
+    #[must_use]
+    pub fn find_references(&self, path: &Path, line: u32, character: u32) -> bool {
+        let Some(uri) = path_to_file_uri(path) else {
+            return false;
+        };
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+            "context": { "includeDeclaration": true },
+        });
+        self.send_request("textDocument/references", params, NavKind::References)
+    }
+
+    /// Request `textDocument/prepareRename` for the caret — the pre-flight that
+    /// yields the renameable span + placeholder ([`LspReply::PrepareRename`]),
+    /// used to prefill + validate the rename box. Returns whether a request was
+    /// dispatched.
+    #[must_use]
+    pub fn prepare_rename(&self, path: &Path, line: u32, character: u32) -> bool {
+        let Some(uri) = path_to_file_uri(path) else {
+            return false;
+        };
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+        });
+        self.send_request(
+            "textDocument/prepareRename",
+            params,
+            NavKind::PrepareRename,
+        )
+    }
+
+    /// Request `textDocument/rename` of the symbol at the caret to `new_name`.
+    /// The reply arrives as [`LspReply::Rename`] carrying the cross-file
+    /// [`WorkspaceEdit`] to apply. Returns whether a request was dispatched.
+    #[must_use]
+    pub fn rename(&self, path: &Path, line: u32, character: u32, new_name: &str) -> bool {
+        let Some(uri) = path_to_file_uri(path) else {
+            return false;
+        };
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": line, "character": character },
+            "newName": new_name,
+        });
+        self.send_request("textDocument/rename", params, NavKind::Rename)
+    }
+
+    /// Request `textDocument/formatting` (four-space, spaces) for the whole
+    /// document. The reply arrives as [`LspReply::Format`] carrying the edits to
+    /// apply to the buffer. Returns whether a request was dispatched.
+    #[must_use]
+    pub fn format(&self, path: &Path) -> bool {
+        let Some(uri) = path_to_file_uri(path) else {
+            return false;
+        };
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "options": { "tabSize": 4, "insertSpaces": true },
+        });
+        self.send_request("textDocument/formatting", params, NavKind::Format)
+    }
+
+    /// Register + dispatch one navigation request, mirroring
+    /// [`Self::send_or_queue`]'s "queue-vs-send atomic with the state" discipline
+    /// so a request issued during the handshake fires after `initialized`.
+    ///
+    /// The pending entry is registered *before* the inner lock (never held across
+    /// it) so it can't deadlock with the reader thread's pending→inner response
+    /// path; a terminal/gated state cleans the speculative entry back up and
+    /// returns `false` (the honest no-op).
+    fn send_request(&self, method: &str, params: Value, kind: NavKind) -> bool {
+        let Some(tx) = &self.tx else {
+            return false; // gated (§7): no server to ask
+        };
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        lock_unpoisoned(&self.shared.pending).insert(id, Pending::Nav(kind));
+        let frame = request_frame(id, method, Some(params));
+        let mut inner = lock_unpoisoned(&self.shared.inner);
+        match inner.state {
+            LspState::Initializing => {
+                inner.preinit.push(frame);
+                true
+            }
+            LspState::Running => {
+                drop(inner);
+                let _ = tx.send(frame);
+                true
+            }
+            _ => {
+                drop(inner);
+                lock_unpoisoned(&self.shared.pending).remove(&id);
+                false
+            }
+        }
+    }
+
+    /// A counter bumped on every navigation reply pushed — the panel compares it
+    /// to a remembered value to skip locking the inbox on quiet frames (the same
+    /// epoch-gate as [`Self::diagnostics_epoch`]).
+    #[must_use]
+    pub fn replies_epoch(&self) -> u64 {
+        self.shared.reply_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Drain every completed navigation reply (EDITOR-LSP-3) — the panel calls
+    /// this once per frame (gated on [`Self::replies_epoch`]) and routes each
+    /// reply to its seam (jump / list / workspace-edit / format).
+    #[must_use]
+    pub fn take_replies(&self) -> Vec<LspReply> {
+        let mut replies = lock_unpoisoned(&self.shared.replies);
+        std::mem::take(&mut *replies)
+    }
+
     /// Queue a notification: sent immediately when `Running`, parked in the
     /// pre-init queue while `Initializing` (the reader flushes it on ready),
     /// dropped in any gated/terminal state.
@@ -975,7 +1237,156 @@ fn handle_response(shared: &Shared, tx: &Sender<Vec<u8>>, msg: &Value) {
             let _ = tx.send(notification_frame("exit", None));
             lock_unpoisoned(&shared.inner).state = LspState::Stopped;
         }
+        Pending::Nav(kind) => {
+            // A UI-driven request completed: fold the result (honestly empty on
+            // an error / null reply — never a fabricated one, §7) and hand it to
+            // the panel's poll inbox.
+            let reply = fold_reply(kind, msg);
+            lock_unpoisoned(&shared.replies).push(reply);
+            shared.reply_epoch.fetch_add(1, Ordering::Relaxed);
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Navigation response parsing (EDITOR-LSP-3) — pure `serde_json::Value` folds,
+// unit-tested with canned JSON (no server). Positions stay on the LSP wire
+// (zero-based line, UTF-16 `character`); a malformed / absent field drops that
+// element rather than fabricating one.
+// ---------------------------------------------------------------------------
+
+/// Fold one navigation response into its [`LspReply`]. An `error` reply (or a
+/// missing/`null` `result`) folds to the empty result for its kind.
+fn fold_reply(kind: NavKind, msg: &Value) -> LspReply {
+    let null = Value::Null;
+    let result = msg.get("result").unwrap_or(&null);
+    match kind {
+        NavKind::Definition => LspReply::Definition(parse_locations(result)),
+        NavKind::References => LspReply::References(parse_locations(result)),
+        NavKind::PrepareRename => LspReply::PrepareRename(parse_prepare_rename(result)),
+        NavKind::Rename => LspReply::Rename(parse_workspace_edit(result)),
+        NavKind::Format => LspReply::Format(parse_text_edits(result)),
+    }
+}
+
+/// A zero-based `{ line, character }` position, or `None` for a malformed one.
+fn parse_position(v: &Value) -> Option<(u32, u32)> {
+    let line = u32::try_from(v.get("line")?.as_u64()?).ok()?;
+    let character = u32::try_from(v.get("character")?.as_u64()?).ok()?;
+    Some((line, character))
+}
+
+/// A `{ start, end }` range, or `None` when either endpoint is malformed.
+fn parse_range(v: &Value) -> Option<LspRange> {
+    let (start_line, start_character) = parse_position(v.get("start")?)?;
+    let (end_line, end_character) = parse_position(v.get("end")?)?;
+    Some(LspRange {
+        start_line,
+        start_character,
+        end_line,
+        end_character,
+    })
+}
+
+/// One `Location` (`{ uri, range }`) or `LocationLink`
+/// (`{ targetUri, targetSelectionRange | targetRange }`) — the two shapes a
+/// definition / references response element can take.
+fn parse_location(v: &Value) -> Option<Location> {
+    if let Some(uri) = v.get("uri").and_then(Value::as_str) {
+        let path = file_uri_to_path(uri)?;
+        let range = parse_range(v.get("range")?)?;
+        return Some(Location { path, range });
+    }
+    // A LocationLink: prefer the identifier span (`targetSelectionRange`),
+    // falling back to the whole `targetRange`.
+    let uri = v.get("targetUri").and_then(Value::as_str)?;
+    let path = file_uri_to_path(uri)?;
+    let range_value = v
+        .get("targetSelectionRange")
+        .or_else(|| v.get("targetRange"))?;
+    let range = parse_range(range_value)?;
+    Some(Location { path, range })
+}
+
+/// Fold a definition / references result into flat [`Location`]s: an array of
+/// `Location`/`LocationLink`, a single `Location` object, or `null` → empty.
+fn parse_locations(result: &Value) -> Vec<Location> {
+    match result {
+        Value::Array(items) => items.iter().filter_map(parse_location).collect(),
+        Value::Object(_) => parse_location(result).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One `TextEdit` (`{ range, newText }`), or `None` when malformed.
+fn parse_text_edit(v: &Value) -> Option<TextEdit> {
+    let range = parse_range(v.get("range")?)?;
+    let new_text = v.get("newText")?.as_str()?.to_owned();
+    Some(TextEdit { range, new_text })
+}
+
+/// Fold a formatting result (an array of `TextEdit`, or `null`) into flat edits.
+fn parse_text_edits(result: &Value) -> Vec<TextEdit> {
+    match result {
+        Value::Array(items) => items.iter().filter_map(parse_text_edit).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Fold a rename result into a [`WorkspaceEdit`], preferring the ordered,
+/// versioned `documentChanges` and falling back to the `changes` map. Resource
+/// operations (create / rename / delete files) are honestly skipped — this
+/// applies text edits, and a create/delete has no text to apply.
+fn parse_workspace_edit(result: &Value) -> WorkspaceEdit {
+    let mut changes: Vec<(PathBuf, Vec<TextEdit>)> = Vec::new();
+    if let Some(doc_changes) = result.get("documentChanges").and_then(Value::as_array) {
+        for dc in doc_changes {
+            let Some(uri) = dc
+                .get("textDocument")
+                .and_then(|td| td.get("uri"))
+                .and_then(Value::as_str)
+            else {
+                continue; // a resource op — no text edits to apply
+            };
+            let Some(path) = file_uri_to_path(uri) else {
+                continue;
+            };
+            let edits = dc.get("edits").map(parse_text_edits).unwrap_or_default();
+            if !edits.is_empty() {
+                changes.push((path, edits));
+            }
+        }
+        return WorkspaceEdit { changes };
+    }
+    if let Some(map) = result.get("changes").and_then(Value::as_object) {
+        for (uri, edits) in map {
+            if let Some(path) = file_uri_to_path(uri) {
+                let edits = parse_text_edits(edits);
+                if !edits.is_empty() {
+                    changes.push((path, edits));
+                }
+            }
+        }
+    }
+    WorkspaceEdit { changes }
+}
+
+/// Fold a `prepareRename` result: a `{ range, placeholder }` object, a bare
+/// `Range`, or `null` / `{ defaultBehavior }` → `None` (the UI then falls back
+/// to the word under the cursor).
+fn parse_prepare_rename(result: &Value) -> Option<PrepareRename> {
+    if let Some(placeholder) = result.get("placeholder").and_then(Value::as_str) {
+        let range = parse_range(result.get("range")?)?;
+        return Some(PrepareRename {
+            range,
+            placeholder: Some(placeholder.to_owned()),
+        });
+    }
+    let range = parse_range(result)?;
+    Some(PrepareRename {
+        range,
+        placeholder: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1244,5 +1655,240 @@ done
             dir.path(),
         );
         assert!(matches!(client.state(), LspState::Failed { .. }));
+    }
+
+    // ── EDITOR-LSP-3: navigation response parsing (pure, no server) ───────────
+
+    #[test]
+    fn parse_locations_folds_object_array_and_location_links() {
+        // A single Location object.
+        let single = json!({
+            "uri": "file:///tmp/x.rs",
+            "range": { "start": { "line": 1, "character": 2 }, "end": { "line": 1, "character": 6 } },
+        });
+        let locs = parse_locations(&single);
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].path, PathBuf::from("/tmp/x.rs"));
+        assert_eq!(locs[0].range.start_line, 1);
+        assert_eq!(locs[0].range.end_character, 6);
+
+        // An array mixing a Location and a LocationLink (which uses
+        // `targetUri` + `targetSelectionRange`).
+        let arr = json!([
+            { "uri": "file:///tmp/a.rs", "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 3 } } },
+            { "targetUri": "file:///tmp/b.rs",
+              "targetRange": { "start": { "line": 9, "character": 0 }, "end": { "line": 12, "character": 1 } },
+              "targetSelectionRange": { "start": { "line": 9, "character": 4 }, "end": { "line": 9, "character": 7 } } },
+        ]);
+        let locs = parse_locations(&arr);
+        assert_eq!(locs.len(), 2);
+        assert_eq!(locs[1].path, PathBuf::from("/tmp/b.rs"));
+        // The link folds to the *selection* range (the identifier), not the whole range.
+        assert_eq!(
+            (locs[1].range.start_line, locs[1].range.start_character),
+            (9, 4)
+        );
+        // A null result is honestly empty — no fabricated location (§7).
+        assert!(parse_locations(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn parse_workspace_edit_reads_changes_and_document_changes() {
+        // The `changes` map shape → one entry per file.
+        let map = json!({
+            "changes": {
+                "file:///tmp/one.rs": [
+                    { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 3 } }, "newText": "bar" }
+                ],
+                "file:///tmp/two.rs": [
+                    { "range": { "start": { "line": 1, "character": 0 }, "end": { "line": 1, "character": 3 } }, "newText": "bar" }
+                ],
+            }
+        });
+        let we = parse_workspace_edit(&map);
+        assert_eq!(we.changes.len(), 2, "a cross-file rename touches both files");
+        assert!(!we.is_empty());
+
+        // The `documentChanges` shape, with a resource op that carries no text
+        // edits (honestly skipped).
+        let dc = json!({
+            "documentChanges": [
+                { "textDocument": { "uri": "file:///tmp/a.rs", "version": 3 },
+                  "edits": [ { "range": { "start": { "line": 2, "character": 4 }, "end": { "line": 2, "character": 7 } }, "newText": "baz" } ] },
+                { "kind": "create", "uri": "file:///tmp/new.rs" },
+            ]
+        });
+        let we = parse_workspace_edit(&dc);
+        assert_eq!(we.changes.len(), 1, "the create op has no text to apply");
+        assert_eq!(we.changes[0].0, PathBuf::from("/tmp/a.rs"));
+        assert_eq!(we.changes[0].1[0].new_text, "baz");
+        // A null rename result is an empty (honest "nothing to rename") edit.
+        assert!(parse_workspace_edit(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn parse_prepare_rename_handles_each_shape() {
+        // `{ range, placeholder }`.
+        let full = json!({
+            "range": { "start": { "line": 2, "character": 4 }, "end": { "line": 2, "character": 7 } },
+            "placeholder": "foo",
+        });
+        let pr = parse_prepare_rename(&full).expect("a renameable span");
+        assert_eq!(pr.placeholder.as_deref(), Some("foo"));
+        assert_eq!(pr.range.start_character, 4);
+
+        // A bare Range (no placeholder).
+        let bare = json!({ "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 5 } });
+        let pr = parse_prepare_rename(&bare).expect("a bare range");
+        assert!(pr.placeholder.is_none());
+
+        // `null` / `{ defaultBehavior }` → not renameable (fall back to the word).
+        assert!(parse_prepare_rename(&Value::Null).is_none());
+        assert!(parse_prepare_rename(&json!({ "defaultBehavior": true })).is_none());
+    }
+
+    /// A fake server that reaches `Running` then answers each EDITOR-LSP-3
+    /// request with a canned result (echoing the request id) — the LSP-1
+    /// fake-`sh`-server idiom extended to the navigation requests, so the
+    /// request → typed-reply round-trip is proven with no real server (§7).
+    const NAV_SERVER: &str = r#"
+emit() {
+    printf 'Content-Length: %s\r\n\r\n%s' "$(printf '%s' "$1" | wc -c)" "$1"
+}
+while :; do
+    len=""
+    while IFS= read -r line; do
+        line=$(printf '%s' "$line" | tr -d '\r')
+        [ -z "$line" ] && break
+        case "$line" in
+            Content-Length:*) len=$(printf '%s' "$line" | sed 's/Content-Length:[[:space:]]*//') ;;
+        esac
+    done
+    [ -z "$len" ] && exit 0
+    body=$(head -c "$len")
+    id=$(printf '%s' "$body" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    case "$body" in
+        *'"method":"initialize"'*)
+            emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"capabilities":{}}}'
+            ;;
+        *'"method":"textDocument/definition"'*)
+            emit '{"jsonrpc":"2.0","id":'"$id"',"result":[{"uri":"file:///tmp/def.rs","range":{"start":{"line":3,"character":4},"end":{"line":3,"character":9}}}]}'
+            ;;
+        *'"method":"textDocument/references"'*)
+            emit '{"jsonrpc":"2.0","id":'"$id"',"result":[{"uri":"file:///tmp/a.rs","range":{"start":{"line":1,"character":0},"end":{"line":1,"character":3}}},{"uri":"file:///tmp/b.rs","range":{"start":{"line":5,"character":2},"end":{"line":5,"character":5}}}]}'
+            ;;
+        *'"method":"textDocument/prepareRename"'*)
+            emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"range":{"start":{"line":2,"character":4},"end":{"line":2,"character":7}},"placeholder":"foo"}}'
+            ;;
+        *'"method":"textDocument/rename"'*)
+            emit '{"jsonrpc":"2.0","id":'"$id"',"result":{"changes":{"file:///tmp/one.rs":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"bar"}],"file:///tmp/two.rs":[{"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":3}},"newText":"bar"}]}}}'
+            ;;
+        *'"method":"textDocument/formatting"'*)
+            emit '{"jsonrpc":"2.0","id":'"$id"',"result":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"newText":"X"}]}'
+            ;;
+        *'"method":"shutdown"'*)
+            emit '{"jsonrpc":"2.0","id":'"$id"',"result":null}'
+            ;;
+        *'"method":"exit"'*)
+            exit 0
+            ;;
+    esac
+done
+"#;
+
+    /// Spawn a client over the nav fake server, waited to `Running`.
+    fn nav_client(root: &Path) -> LspClient {
+        let client = LspClient::start_command(Language::Rust, "sh", &["-c", NAV_SERVER], root);
+        wait_until("the initialize handshake", || {
+            matches!(client.state(), LspState::Running)
+        });
+        client
+    }
+
+    /// Fire a request, then drain the one reply it produces.
+    fn one_reply(client: &LspClient) -> LspReply {
+        wait_until("a navigation reply", || client.replies_epoch() >= 1);
+        client
+            .take_replies()
+            .into_iter()
+            .next()
+            .expect("exactly one reply")
+    }
+
+    #[test]
+    fn definition_request_round_trips_to_a_location() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = nav_client(dir.path());
+        assert!(client.goto_definition(Path::new("/tmp/src.rs"), 3, 4));
+        let LspReply::Definition(locs) = one_reply(&client) else {
+            unreachable!("the nav server answers definition with a Definition reply")
+        };
+        assert_eq!(locs.len(), 1);
+        assert_eq!(locs[0].path, PathBuf::from("/tmp/def.rs"));
+        assert_eq!(locs[0].range.start_line, 3);
+    }
+
+    #[test]
+    fn references_request_round_trips_to_a_list() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = nav_client(dir.path());
+        assert!(client.find_references(Path::new("/tmp/src.rs"), 1, 0));
+        let LspReply::References(locs) = one_reply(&client) else {
+            unreachable!("the nav server answers references with a References reply")
+        };
+        assert_eq!(locs.len(), 2, "both references are listed");
+        assert_eq!(locs[0].path, PathBuf::from("/tmp/a.rs"));
+        assert_eq!(locs[1].path, PathBuf::from("/tmp/b.rs"));
+    }
+
+    #[test]
+    fn rename_request_round_trips_to_a_cross_file_workspace_edit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = nav_client(dir.path());
+        assert!(client.rename(Path::new("/tmp/src.rs"), 0, 0, "bar"));
+        let LspReply::Rename(edit) = one_reply(&client) else {
+            unreachable!("the nav server answers rename with a Rename reply")
+        };
+        assert_eq!(edit.changes.len(), 2, "the rename spans two files");
+        let paths: Vec<_> = edit.changes.iter().map(|(p, _)| p.clone()).collect();
+        assert!(paths.contains(&PathBuf::from("/tmp/one.rs")));
+        assert!(paths.contains(&PathBuf::from("/tmp/two.rs")));
+    }
+
+    #[test]
+    fn prepare_rename_and_format_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = nav_client(dir.path());
+        assert!(client.prepare_rename(Path::new("/tmp/src.rs"), 2, 4));
+        let LspReply::PrepareRename(Some(pr)) = one_reply(&client) else {
+            unreachable!("the nav server answers prepareRename with a placeholder")
+        };
+        assert_eq!(pr.placeholder.as_deref(), Some("foo"));
+
+        assert!(client.format(Path::new("/tmp/src.rs")));
+        wait_until("the format reply", || client.replies_epoch() >= 2);
+        let reply = client.take_replies().into_iter().next().expect("a reply");
+        let LspReply::Format(edits) = reply else {
+            unreachable!("the nav server answers formatting with a Format reply")
+        };
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "X");
+    }
+
+    #[test]
+    fn navigation_on_a_gated_client_is_an_honest_no_op() {
+        // §7: an absent server binary parks the client Unavailable — every
+        // navigation request is a no-op returning `false`, and NO reply is ever
+        // fabricated.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let client = LspClient::start_with_lookup(Language::Rust, dir.path(), |_| None);
+        assert!(matches!(client.state(), LspState::Unavailable { .. }));
+        assert!(!client.goto_definition(Path::new("/tmp/x.rs"), 0, 0));
+        assert!(!client.find_references(Path::new("/tmp/x.rs"), 0, 0));
+        assert!(!client.prepare_rename(Path::new("/tmp/x.rs"), 0, 0));
+        assert!(!client.rename(Path::new("/tmp/x.rs"), 0, 0, "y"));
+        assert!(!client.format(Path::new("/tmp/x.rs")));
+        assert_eq!(client.replies_epoch(), 0);
+        assert!(client.take_replies().is_empty());
     }
 }

@@ -42,12 +42,18 @@
 //!   grid-picker) and **Format** menus, each driving `md_actions` on the live
 //!   buffer as one operator undo step. Only the standalone Table menu (cell ops)
 //!   and Print/Spell/Find await later phases.
-//! * EDITOR-LSP-1/2 — the **LSP client** ([`lsp`]) wired into the surface: the
+//! * EDITOR-LSP-1/2/3 — the **LSP client** ([`lsp`]) wired into the surface: the
 //!   panel owns a per-document [`LspClient`], driving `didOpen`/`didChange`/
 //!   `didClose` off the real buffer's open/edit/close lifecycle, and the widget
 //!   paints the published diagnostics (`lsp_ui`) as gutter severity markers +
-//!   inline underlines with a hover message. An absent server binary surfaces
-//!   the honest [`LspState::Unavailable`] status, never a faked session (§7).
+//!   inline underlines with a hover message. LSP-3 adds cross-file navigation
+//!   ([`lsp_nav`]): goto-definition (`F12`) + find-references (`Shift-F12`,
+//!   a results list) jump through the shared open+jump seam, rename (`F2`)
+//!   applies the server's cross-file `WorkspaceEdit` (undoable in open buffers,
+//!   rewritten on disk when closed), and format (`Shift-Alt-F`) applies the
+//!   returned edits. An absent server binary surfaces the honest
+//!   [`LspState::Unavailable`] status, and every navigation action on a gated
+//!   server is an honest no-op with a status — never a faked session (§7).
 //! * EDITOR-COLLAB-1/2 — **mesh co-editing**: the conflict-free replicated
 //!   document ([`crdt`], yrs) and the **share-session** ([`collab_session`]) that
 //!   carries it over the Mackes Bus as a P2P editing session — local edits
@@ -87,6 +93,7 @@ mod format_bar;
 mod fuzzy;
 pub mod highlight;
 pub mod lsp;
+pub mod lsp_nav;
 pub mod lsp_ui;
 pub mod md_actions;
 mod menu_bar;

@@ -37,7 +37,8 @@ use crate::buffer::Buffer;
 use crate::finder::{self, FileFinder};
 use crate::format_bar;
 use crate::highlight::{Highlighter, Language};
-use crate::lsp::LspClient;
+use crate::lsp::{LspClient, LspReply, Location, TextEdit, WorkspaceEdit};
+use crate::lsp_nav::{self, ReferencesPanel, RefRow, RenameBox};
 use crate::lsp_ui::{lsp_status, DiagnosticsOverlay};
 use crate::md_actions::{self, ListKind};
 use crate::menu_bar::{self, ListStyle, MenuAction, MenuContext};
@@ -116,6 +117,10 @@ struct Doc {
     /// The [`EditorView`] edit generation last pushed to `lsp` via `didChange` —
     /// the per-frame throttle so an unchanged buffer is not re-sent.
     lsp_synced_gen: u64,
+    /// The last [`LspClient::replies_epoch`](crate::lsp::LspClient::replies_epoch)
+    /// this doc drained (EDITOR-LSP-3) — the poll gate so quiet frames skip the
+    /// reply inbox.
+    lsp_reply_epoch: u64,
 }
 
 impl Doc {
@@ -132,6 +137,7 @@ impl Doc {
             lsp: None,
             diagnostics: DiagnosticsOverlay::default(),
             lsp_synced_gen: 0,
+            lsp_reply_epoch: 0,
         }
     }
 
@@ -381,6 +387,14 @@ pub struct EditorSurface {
     about_open: bool,
     /// The Insert Table grid-picker dialog (EDTB-3, Insert → Table…).
     table_picker: TablePicker,
+    /// The find-references results overlay (EDITOR-LSP-3, `Shift-F12`).
+    references: ReferencesPanel,
+    /// The rename new-name input (EDITOR-LSP-3, `F2`).
+    rename: RenameBox,
+    /// A short honest status line for the last LSP navigation action (§7) — e.g.
+    /// "No definition found" / "Renamed 3 files" / "No language server" — shown
+    /// in the status bar until the next action replaces it.
+    lsp_notice: Option<String>,
 }
 
 impl Default for EditorSurface {
@@ -405,6 +419,9 @@ impl Default for EditorSurface {
             save_as: SaveAsDialog::default(),
             about_open: false,
             table_picker: TablePicker::default(),
+            references: ReferencesPanel::default(),
+            rename: RenameBox::default(),
+            lsp_notice: None,
         }
     }
 }
@@ -719,6 +736,8 @@ impl EditorSurface {
             || self.save_as.open
             || self.about_open
             || self.table_picker.open
+            || self.references.is_open()
+            || self.rename.is_open()
     }
 
     /// Open the fuzzy file-finder (the `Cmd`/`Ctrl-P` seam), rooted at the open
@@ -869,6 +888,266 @@ impl EditorSurface {
                 .first()
                 .map_or(0, |r| r.start);
             doc.view.place_cursor(&doc.buffer, line_start + col);
+        }
+    }
+
+    // ── EDITOR-LSP-3: goto-definition / references / rename / format ──────────
+
+    /// The focused document's `(path, line, character)` at the caret — the LSP
+    /// wire position (zero-based line, UTF-16 column) a navigation request needs.
+    /// `None` for a pathless / empty document.
+    fn lsp_cursor_pos(&self) -> Option<(PathBuf, u32, u32)> {
+        let doc = self.doc()?;
+        let path = doc.buffer.path()?.to_path_buf();
+        let (line, character) = lsp_nav::char_to_lsp_pos(&doc.buffer, doc.view.cursor());
+        Some((path, line, character))
+    }
+
+    /// The honest gated-state notice for the focused document's server (§7) —
+    /// names the missing command where the [`LspState`](crate::lsp::LspState)
+    /// knows it (e.g. `rust-analyzer: not found`), else "No language server".
+    fn lsp_unavailable_notice(&self) -> String {
+        self.doc()
+            .and_then(|d| d.lsp.as_ref())
+            .and_then(lsp_status)
+            .map_or_else(|| "No language server".to_owned(), |s| s.text)
+    }
+
+    /// Whether the focused document's server accepts a request — the live gate the
+    /// action methods share: `f` is the client call (`goto_definition`, …),
+    /// returning whether it dispatched.
+    fn lsp_request(&self, f: impl FnOnce(&LspClient) -> bool) -> bool {
+        self.doc().and_then(|d| d.lsp.as_ref()).is_some_and(f)
+    }
+
+    /// Goto-definition (`F12`): request `textDocument/definition` for the caret.
+    /// The reply jumps to the target (see [`Self::route_reply`]); a gated server
+    /// is an honest no-op with a status (§7).
+    fn lsp_goto_definition(&mut self) {
+        let Some((path, line, character)) = self.lsp_cursor_pos() else {
+            return;
+        };
+        let sent = self.lsp_request(|c| c.goto_definition(&path, line, character));
+        self.lsp_notice = Some(if sent {
+            "Go to definition\u{2026}".to_owned()
+        } else {
+            self.lsp_unavailable_notice()
+        });
+    }
+
+    /// Find-references (`Shift-F12`): request `textDocument/references` for the
+    /// caret. The reply opens the results list (see [`Self::route_reply`]).
+    fn lsp_find_references(&mut self) {
+        let Some((path, line, character)) = self.lsp_cursor_pos() else {
+            return;
+        };
+        let sent = self.lsp_request(|c| c.find_references(&path, line, character));
+        self.lsp_notice = Some(if sent {
+            "Finding references\u{2026}".to_owned()
+        } else {
+            self.lsp_unavailable_notice()
+        });
+    }
+
+    /// Rename (`F2`): fire `prepareRename` and open the rename box prefilled with
+    /// the word under the cursor. A gated server is an honest no-op — no box, just
+    /// the status (§7), since a rename cannot happen without a server.
+    fn lsp_start_rename(&mut self) {
+        let Some((path, line, character)) = self.lsp_cursor_pos() else {
+            return;
+        };
+        if !self.lsp_request(|c| c.prepare_rename(&path, line, character)) {
+            self.lsp_notice = Some(self.lsp_unavailable_notice());
+            return;
+        }
+        let prefill = self
+            .doc()
+            .and_then(|d| lsp_nav::word_under_cursor(&d.buffer, d.view.cursor()))
+            .map(|(_, word)| word)
+            .unwrap_or_default();
+        self.close_search_overlays();
+        self.rename.open_for(path, line, character, &prefill);
+    }
+
+    /// Fire `textDocument/rename` with the submitted `new_name` for the box's
+    /// stored symbol position; the reply applies the workspace edit.
+    fn lsp_fire_rename(&mut self, new_name: &str) {
+        let (path, line, character) = self.rename.target();
+        let sent = self.lsp_request(|c| c.rename(&path, line, character, new_name));
+        self.lsp_notice = Some(if sent {
+            "Renaming\u{2026}".to_owned()
+        } else {
+            self.lsp_unavailable_notice()
+        });
+    }
+
+    /// Format (`Shift-Alt-F`): request `textDocument/formatting` for the whole
+    /// document; the reply applies the edits to the buffer.
+    fn lsp_format_document(&mut self) {
+        let Some(path) = self
+            .doc()
+            .and_then(|d| d.buffer.path())
+            .map(Path::to_path_buf)
+        else {
+            return;
+        };
+        let sent = self.lsp_request(|c| c.format(&path));
+        self.lsp_notice = Some(if sent {
+            "Formatting\u{2026}".to_owned()
+        } else {
+            self.lsp_unavailable_notice()
+        });
+    }
+
+    /// Poll the focused document's server for completed navigation replies
+    /// (EDITOR-LSP-3) and route each — gated on
+    /// [`LspClient::replies_epoch`](crate::lsp::LspClient::replies_epoch) so a
+    /// quiet frame does nothing. Called once per frame from [`editor_panel`].
+    fn pump_lsp_replies(&mut self) {
+        let drained = {
+            let Some(doc) = self.doc() else { return };
+            let Some(client) = doc.lsp.as_ref() else {
+                return;
+            };
+            let epoch = client.replies_epoch();
+            if epoch == doc.lsp_reply_epoch {
+                return;
+            }
+            (epoch, client.take_replies())
+        };
+        let (epoch, replies) = drained;
+        if let Some(doc) = self.doc_mut() {
+            doc.lsp_reply_epoch = epoch;
+        }
+        for reply in replies {
+            self.route_reply(reply);
+        }
+    }
+
+    /// Route one completed [`LspReply`] to its seam: definition → jump,
+    /// references → list, prepareRename → refine the box, rename → apply the
+    /// workspace edit, format → apply the edits.
+    fn route_reply(&mut self, reply: LspReply) {
+        match reply {
+            LspReply::Definition(locs) => self.route_definition(&locs),
+            LspReply::References(locs) => self.route_references(&locs),
+            LspReply::PrepareRename(prepare) => {
+                if let Some(placeholder) = prepare.and_then(|p| p.placeholder) {
+                    self.rename.set_placeholder(&placeholder);
+                }
+            }
+            LspReply::Rename(edit) => self.route_rename(&edit),
+            LspReply::Format(edits) => self.route_format(&edits),
+        }
+    }
+
+    /// A definition reply: jump to the first target through the shared open+jump
+    /// seam, or an honest "no definition found" notice.
+    fn route_definition(&mut self, locs: &[Location]) {
+        let Some(loc) = locs.first() else {
+            self.lsp_notice = Some("No definition found".to_owned());
+            return;
+        };
+        let path = loc.path.clone();
+        self.jump_to_location(&path, loc.range.start_line, loc.range.start_character);
+        self.lsp_notice = None;
+    }
+
+    /// A references reply: build the results list (each row's source-line preview
+    /// read from the open buffer or disk) and open the overlay, or an honest "no
+    /// references found" notice.
+    fn route_references(&mut self, locs: &[Location]) {
+        if locs.is_empty() {
+            self.lsp_notice = Some("No references found".to_owned());
+            return;
+        }
+        let rows: Vec<RefRow> = locs
+            .iter()
+            .map(|loc| {
+                let preview = self.reference_preview(&loc.path, loc.range.start_line);
+                RefRow::from_location(loc, &preview)
+            })
+            .collect();
+        self.close_search_overlays();
+        self.lsp_notice = Some(format!("{} references", rows.len()));
+        self.references.open_with(rows);
+    }
+
+    /// A rename reply: apply the cross-file [`WorkspaceEdit`] — each file to its
+    /// open buffer (undoable) or on disk (closed) — and report the file count.
+    fn route_rename(&mut self, edit: &WorkspaceEdit) {
+        if edit.is_empty() {
+            self.lsp_notice = Some("Nothing to rename".to_owned());
+            return;
+        }
+        let mut applied = 0usize;
+        for (path, edits) in &edit.changes {
+            if self.apply_edits_open_or_disk(path, edits) {
+                applied += 1;
+            }
+        }
+        self.lsp_notice = Some(if applied == 1 {
+            "Renamed 1 file".to_owned()
+        } else {
+            format!("Renamed {applied} files")
+        });
+    }
+
+    /// A format reply: apply the edits to the focused buffer (undoable), or an
+    /// honest "no formatting changes" notice.
+    fn route_format(&mut self, edits: &[TextEdit]) {
+        if edits.is_empty() {
+            self.lsp_notice = Some("No formatting changes".to_owned());
+            return;
+        }
+        if let Some(doc) = self.doc_mut() {
+            lsp_nav::apply_edits_to_open_buffer(&mut doc.view, &mut doc.buffer, edits);
+        }
+        self.lsp_notice = Some("Formatted".to_owned());
+    }
+
+    /// Apply one file's `edits` to its open buffer (undoable, preferred) when it
+    /// is open in any pane, else rewrite it on disk. Returns whether the file was
+    /// touched — the count that drives the rename notice.
+    fn apply_edits_open_or_disk(&mut self, path: &Path, edits: &[TextEdit]) -> bool {
+        for pane in self.panes.values_mut() {
+            for doc in &mut pane.tabs {
+                if doc.buffer.path() == Some(path) {
+                    lsp_nav::apply_edits_to_open_buffer(&mut doc.view, &mut doc.buffer, edits);
+                    return true;
+                }
+            }
+        }
+        lsp_nav::apply_edits_on_disk(path, edits).is_ok()
+    }
+
+    /// The trimmed source line for a reference preview: the live open buffer's
+    /// line when the file is open, else the on-disk line, else empty.
+    fn reference_preview(&self, path: &Path, line0: u32) -> String {
+        for pane in self.panes.values() {
+            for doc in &pane.tabs {
+                if doc.buffer.path() == Some(path) {
+                    let last = doc.buffer.len_lines().saturating_sub(1);
+                    return doc.buffer.line((line0 as usize).min(last));
+                }
+            }
+        }
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.lines().nth(line0 as usize).map(str::to_owned))
+            .unwrap_or_default()
+    }
+
+    /// Open `path` and place the caret at the LSP `(line, character)` — the shared
+    /// jump seam reused by goto-definition and a reference pick (the EDITOR-8
+    /// open+jump idiom). A read failure is a silent no-op (a vanished file).
+    fn jump_to_location(&mut self, path: &Path, line: u32, character: u32) {
+        if self.open_path(path).is_err() {
+            return;
+        }
+        if let Some(doc) = self.doc_mut() {
+            let idx = lsp_nav::char_of(&doc.buffer, line, character);
+            doc.view.place_cursor(&doc.buffer, idx);
         }
     }
 
@@ -1260,6 +1539,17 @@ impl EditorSurface {
         if let Some(hit) = search::show_project(ctx, &mut self.project_search) {
             self.open_hit(&hit);
         }
+        // EDITOR-LSP-3 — the find-references results list: a picked row opens the
+        // file + jumps through the same open+jump seam.
+        if let Some(row) = lsp_nav::show_references(ctx, &mut self.references) {
+            self.jump_to_location(&row.path, row.line0, row.char0);
+        }
+        // EDITOR-LSP-3 — the rename box: a submitted name fires the rename request
+        // (the reply applies the cross-file workspace edit).
+        if let Some(new_name) = lsp_nav::show_rename(ctx, &mut self.rename) {
+            self.rename.close();
+            self.lsp_fire_rename(&new_name);
+        }
     }
 
     // ── EDITOR-6: tabs + split chords, chrome, and the pane tree render ───────
@@ -1297,6 +1587,40 @@ impl EditorSurface {
             if ui.input_mut(|i| i.consume_key(Modifiers::ALT, key)) {
                 self.navigate_focus(dir);
             }
+        }
+    }
+
+    /// Intercept the EDITOR-LSP-3 navigation chords at the panel level (before the
+    /// text widget clones this frame's events), so the F-keys drive the language
+    /// server instead of falling through to the buffer: `F12` goto-definition,
+    /// `Shift-F12` find-references, `F2` rename, `Shift-Alt-F` format. Skipped
+    /// while an overlay/dialog holds the keyboard so a rename field can type an
+    /// `F` or the references list can arrow without re-triggering.
+    fn handle_lsp_chords(&mut self, ui: &Ui) {
+        if self.overlay_active() {
+            return;
+        }
+        let goto = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F12));
+        let references = ui.input_mut(|i| i.consume_key(Modifiers::SHIFT, Key::F12));
+        let rename = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F2));
+        let format =
+            ui.input_mut(|i| i.consume_key(Modifiers::SHIFT | Modifiers::ALT, Key::F));
+        let fired = goto || references || rename || format;
+        if references {
+            self.lsp_find_references();
+        } else if goto {
+            self.lsp_goto_definition();
+        }
+        if rename {
+            self.lsp_start_rename();
+        }
+        if format {
+            self.lsp_format_document();
+        }
+        // A live server replies asynchronously; nudge the next frame so the reply
+        // is drained promptly (the widget's 0.5 s heartbeat is the slow fallback).
+        if fired {
+            ui.ctx().request_repaint();
         }
     }
 
@@ -1360,6 +1684,8 @@ impl EditorSurface {
         }) else {
             return;
         };
+        // EDITOR-LSP-3 — the last navigation action's honest status (§7).
+        let notice = self.lsp_notice.clone();
         let mut toggle_wrap = false;
         ui.horizontal(|ui| {
             ui.add_space(Style::SP_S);
@@ -1368,6 +1694,14 @@ impl EditorSurface {
                     RichText::new("lossy decode")
                         .size(Style::SMALL)
                         .color(Style::WARN),
+                );
+            }
+            if let Some(notice) = &notice {
+                ui.add_space(Style::SP_M);
+                ui.label(
+                    RichText::new(notice)
+                        .size(Style::SMALL)
+                        .color(Style::ACCENT),
                 );
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1757,6 +2091,11 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
     // EDITOR-6 — the tab / split / pane-focus chords, consumed at the same panel
     // level (before the widget clones this frame's events) for the same reason.
     surface.handle_pane_chords(ui);
+    // EDITOR-LSP-3 — the navigation chords (F12 / Shift-F12 / F2 / Shift-Alt-F),
+    // consumed here for the same reason, then drain any completed async replies
+    // from the language server so this frame reflects a jump / list / edit.
+    surface.handle_lsp_chords(ui);
+    surface.pump_lsp_replies();
 
     // EDTB-4 — the compact decision, taken ONCE from the panel's available width
     // before the bars mount so all three read one consistent layout. Each bar's
@@ -3385,5 +3724,214 @@ mod tests {
         assert_eq!(surface.pane_count(), 1, "the surface opens with one pane");
         assert_eq!(focused_tabs(&surface), 0, "and no open tabs (empty state)");
         assert!(!surface.is_open());
+    }
+
+    // ── EDITOR-LSP-3: navigation routing over the surface (no live server) ────
+    //
+    // The test build spawns no real language server (see `build_lsp_client`), so
+    // the async request → reply round-trip is proven in `lsp`'s fake-server
+    // tests. Here the reply *routing* — the jump / list / cross-file edit / format
+    // application + the honest server-absent no-op — is driven through the real
+    // surface seams by handing `route_reply` a synthesized reply.
+
+    use crate::lsp::{Location, LspRange, LspReply, TextEdit, WorkspaceEdit};
+
+    /// A single-line LSP range at the given UTF-16 columns.
+    fn lsp_range(line: u32, c0: u32, c1: u32) -> LspRange {
+        LspRange {
+            start_line: line,
+            start_character: c0,
+            end_line: line,
+            end_character: c1,
+        }
+    }
+
+    #[test]
+    fn definition_reply_opens_the_target_and_jumps() {
+        let d = TempDir::new("lsp3-def");
+        let src = d.join("src.rs");
+        std::fs::write(&src, b"use dep;\n").expect("write src");
+        let target = d.join("dep.rs");
+        std::fs::write(&target, b"pub fn thing() {}\n").expect("write target");
+        let mut surface = real_editor();
+        surface.open_path(&src).expect("open src");
+        // A definition at dep.rs line 0, col 7 (the `thing` identifier).
+        let loc = Location {
+            path: target.clone(),
+            range: lsp_range(0, 7, 12),
+        };
+        surface.route_reply(LspReply::Definition(vec![loc]));
+        assert_eq!(
+            surface.current_path(),
+            Some(target.as_path()),
+            "the definition target opened"
+        );
+        assert_eq!(
+            surface.doc().expect("a doc").view.cursor(),
+            7,
+            "the caret jumped onto the definition"
+        );
+    }
+
+    #[test]
+    fn empty_definition_reply_is_an_honest_notice() {
+        let d = TempDir::new("lsp3-nodef");
+        let src = d.join("src.rs");
+        std::fs::write(&src, b"fn f() {}\n").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&src).expect("open");
+        surface.route_reply(LspReply::Definition(Vec::new()));
+        assert_eq!(surface.lsp_notice.as_deref(), Some("No definition found"));
+    }
+
+    #[test]
+    fn references_reply_populates_the_list_and_a_pick_jumps() {
+        let d = TempDir::new("lsp3-refs");
+        let a = d.join("a.rs");
+        std::fs::write(&a, b"let name = 1;\nuse name;\n").expect("write a");
+        let b = d.join("b.rs");
+        std::fs::write(&b, b"// unrelated\nname();\n").expect("write b");
+        let mut surface = real_editor();
+        surface.open_path(&a).expect("open a");
+        let locs = vec![
+            Location {
+                path: a.clone(),
+                range: lsp_range(0, 4, 8),
+            },
+            Location {
+                path: b.clone(),
+                range: lsp_range(1, 0, 4),
+            },
+        ];
+        surface.route_reply(LspReply::References(locs));
+        assert!(surface.references.is_open(), "the references list opened");
+        assert_eq!(
+            surface.references.rows().len(),
+            2,
+            "both references are listed"
+        );
+        // Picking the second row jumps to b.rs line 1 (the same seam the overlay
+        // pick drives).
+        let row = surface.references.rows()[1].clone();
+        surface.jump_to_location(&row.path, row.line0, row.char0);
+        assert_eq!(
+            surface.current_path(),
+            Some(b.as_path()),
+            "the pick opened b.rs"
+        );
+        let doc = surface.doc().expect("a doc");
+        assert_eq!(
+            doc.view.cursor(),
+            doc.buffer.line_to_char(1),
+            "the caret jumped to the reference's line"
+        );
+    }
+
+    #[test]
+    fn rename_reply_applies_across_an_open_and_a_closed_file() {
+        let d = TempDir::new("lsp3-rename");
+        let open = d.join("open.rs");
+        std::fs::write(&open, b"let foo = 1;\n").expect("write open");
+        let closed = d.join("closed.rs");
+        std::fs::write(&closed, b"use foo;\n").expect("write closed");
+        let mut surface = real_editor();
+        surface.open_path(&open).expect("open the open file");
+        // Rename `foo` → `bar` in both files (chars 4..7 on line 0 of each).
+        let edit = WorkspaceEdit {
+            changes: vec![
+                (
+                    open.clone(),
+                    vec![TextEdit {
+                        range: lsp_range(0, 4, 7),
+                        new_text: "bar".to_owned(),
+                    }],
+                ),
+                (
+                    closed.clone(),
+                    vec![TextEdit {
+                        range: lsp_range(0, 4, 7),
+                        new_text: "bar".to_owned(),
+                    }],
+                ),
+            ],
+        };
+        surface.route_reply(LspReply::Rename(edit));
+        // The open file changed in its live buffer (undoable) ...
+        assert_eq!(
+            surface.doc().expect("doc").buffer.rope().to_string(),
+            "let bar = 1;\n"
+        );
+        // ... and the closed file was rewritten on disk.
+        assert_eq!(
+            std::fs::read_to_string(&closed).expect("read closed"),
+            "use bar;\n"
+        );
+        assert_eq!(surface.lsp_notice.as_deref(), Some("Renamed 2 files"));
+    }
+
+    #[test]
+    fn format_reply_edits_the_focused_buffer() {
+        let d = TempDir::new("lsp3-fmt");
+        let src = d.join("src.rs");
+        std::fs::write(&src, b"fn  f(){}\n").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&src).expect("open");
+        // Collapse the double space (chars 2..4) to one.
+        let edits = vec![TextEdit {
+            range: lsp_range(0, 2, 4),
+            new_text: " ".to_owned(),
+        }];
+        surface.route_reply(LspReply::Format(edits));
+        assert_eq!(
+            surface.doc().expect("doc").buffer.rope().to_string(),
+            "fn f(){}\n"
+        );
+        assert_eq!(surface.lsp_notice.as_deref(), Some("Formatted"));
+    }
+
+    #[test]
+    fn navigation_without_a_server_is_an_honest_no_op() {
+        // §7: the test build spawns no server, so the doc's client is absent —
+        // every action honestly no-ops with a status, never a fake jump/edit.
+        let d = TempDir::new("lsp3-noserver");
+        let src = d.join("src.rs");
+        std::fs::write(&src, b"fn main() {}\n").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&src).expect("open");
+        surface.lsp_goto_definition();
+        assert_eq!(surface.lsp_notice.as_deref(), Some("No language server"));
+        surface.lsp_format_document();
+        assert_eq!(surface.lsp_notice.as_deref(), Some("No language server"));
+        // A rename never even opens its box without a server.
+        surface.lsp_start_rename();
+        assert!(
+            !surface.rename.is_open(),
+            "rename is a no-op without a server"
+        );
+        assert_eq!(surface.lsp_notice.as_deref(), Some("No language server"));
+    }
+
+    #[test]
+    fn the_references_overlay_and_rename_box_paint() {
+        let d = TempDir::new("lsp3-paint");
+        let a = d.join("a.rs");
+        std::fs::write(&a, b"let x = 1;\n").expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&a).expect("open");
+        surface.route_reply(LspReply::References(vec![Location {
+            path: a.clone(),
+            range: lsp_range(0, 4, 5),
+        }]));
+        assert!(surface.references.is_open());
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the references overlay paints"
+        );
+        surface.references.close();
+        surface.rename.open_for(a.clone(), 0, 4, "x");
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the rename box paints"
+        );
     }
 }

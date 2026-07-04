@@ -145,8 +145,9 @@ impl DiagnosticsOverlay {
 /// Walks the line's chars accumulating UTF-16 units until the target column,
 /// landing on the nearest char boundary — so an astral char (2 UTF-16 units)
 /// advances the column by two but the char offset by one, and a column past the
-/// line's content clamps to its end.
-fn resolve_pos(buffer: &Buffer, line: u32, utf16_col: u32) -> usize {
+/// line's content clamps to its end. Shared with `lsp_nav` (EDITOR-LSP-3), which
+/// resolves the definition / references / edit positions the same way.
+pub(crate) fn resolve_pos(buffer: &Buffer, line: u32, utf16_col: u32) -> usize {
     let line = (line as usize).min(buffer.len_lines().saturating_sub(1));
     let line_start = buffer.line_to_char(line);
     let target = utf16_col as usize;

@@ -948,6 +948,43 @@ impl EditorView {
         count
     }
 
+    /// Apply a set of `(char-range, new-text)` edits — each with its own
+    /// replacement — as ONE undo step, returning the count applied. The seam the
+    /// LSP formatting + rename workspace-edit paths drive (EDITOR-LSP-3): a
+    /// language server returns a batch of heterogeneous edits, and this lands
+    /// them atomically so one `Ctrl-Z` reverts the whole format / rename.
+    ///
+    /// Like [`replace_all`](Self::replace_all) it applies high-offset-first so
+    /// each splice leaves the earlier ranges' char indices valid (LSP guarantees
+    /// the edits are non-overlapping); it then leaves one caret at the topmost
+    /// edit. Empty input records nothing.
+    pub fn apply_text_edits(&mut self, buffer: &mut Buffer, edits: &[(Range<usize>, String)]) -> usize {
+        if edits.is_empty() {
+            return 0;
+        }
+        // Sort a view of the edits descending by start so the splices don't
+        // shift each other's offsets.
+        let mut ordered: Vec<&(Range<usize>, String)> = edits.iter().collect();
+        ordered.sort_by_key(|e| std::cmp::Reverse(e.0.start));
+        self.begin_edit();
+        let mut groups = 0usize;
+        let mut count = 0usize;
+        let mut top = buffer.len_chars();
+        for (range, text) in ordered {
+            let len = buffer.len_chars();
+            let start = range.start.min(len);
+            let end = range.end.clamp(start, len);
+            groups += Self::splice(buffer, start, end, text);
+            top = top.min(start);
+            count += 1;
+        }
+        self.carets = vec![Caret::at(top.min(buffer.len_chars()))];
+        self.primary = 0;
+        self.box_anchor = None;
+        self.finish_edit(groups, EditKind::Insert, true);
+        count
+    }
+
     /// Splice `text` in place of char span `start..end` of the buffer, returning
     /// the number of buffer undo groups it recorded (0/1/2) — the shared primitive
     /// under [`replace_range`](Self::replace_range) /
@@ -3117,6 +3154,32 @@ mod tests {
             "ab cab ab",
             "undo restored every replaced run"
         );
+    }
+
+    #[test]
+    fn apply_text_edits_lands_heterogeneous_edits_as_one_undo_step() {
+        // EDITOR-LSP-3: a batch of edits each with its OWN replacement (a format
+        // / rename response) lands atomically, applied high-offset-first so the
+        // earlier ranges stay valid, and undoes as one step.
+        let mut buf = Buffer::from_text("let foo = old;\n");
+        let mut view = EditorView::new();
+        // Given ascending but applied descending: replace "foo" (4..7) with "bar"
+        // and "old" (10..13) with "new".
+        let edits = vec![(4..7, "bar".to_owned()), (10..13, "new".to_owned())];
+        let n = view.apply_text_edits(&mut buf, &edits);
+        assert_eq!(n, 2, "both edits applied");
+        assert_eq!(buf.rope().to_string(), "let bar = new;\n");
+        assert!(
+            view.undo(&mut buf),
+            "the whole batch undoes as one operator step"
+        );
+        assert_eq!(
+            buf.rope().to_string(),
+            "let foo = old;\n",
+            "undo restored the pre-edit text"
+        );
+        // An empty batch records nothing.
+        assert_eq!(view.apply_text_edits(&mut buf, &[]), 0);
     }
 
     #[test]
