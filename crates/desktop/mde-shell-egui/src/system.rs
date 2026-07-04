@@ -1141,6 +1141,96 @@ fn section_card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R
     card_frame().show(ui, add).inner
 }
 
+// ──────────────────────────── wide-layout helpers (SETTINGS-3) ────────────────────────────
+
+/// The minimum comfortable width for one detail tile / column (Carbon expressive,
+/// design lock #4). The wide detail pane fits as many equal columns of at least this
+/// width as it can; below it a column is dropped so a tile never crushes on a small
+/// DRM seat (the small-seat concession). Derived from the spacing grid — no raw
+/// literal (§4), the `Style::SP_XL * n` idiom the rail width already uses.
+const TILE_MIN_W: f32 = Style::SP_XL * 8.0;
+
+/// The Settings **detail tile** frame (SETTINGS-3) — a nested card inside the
+/// section's layer-02 body card. It rests on Carbon **layer-01** (a tonal step in from
+/// the raised body card — the alternating-layer Carbon nesting model) ringed by the
+/// shared hairline [`Style::BORDER`] + corner radius, so a row / column of tiles reads
+/// as distinct cards. Every value a [`Style`] token, reusing the SETTINGS-2 elevation
+/// ladder (§4 — no raw literal).
+fn tile_frame() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(Style::LAYER_01)
+        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .corner_radius(Style::RADIUS)
+        .inner_margin(Style::SP_S)
+}
+
+/// Render `add` inside a [`tile_frame`], stretched to fill its column so a row of
+/// tiles reads as equal cards (the frame otherwise shrinks to its content). Generic
+/// over the body's return so a section's value threads straight through.
+fn tile<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    tile_frame()
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            add(ui)
+        })
+        .inner
+}
+
+/// A **titled detail column** — a [`tile`] card headed by a dim caption — for one side
+/// of a side-by-side wide layout (Bluetooth adapters | devices, Power controls |
+/// battery). Reuses the tile card + the SETTINGS-2 tokens (§4).
+fn column_card<R>(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    tile(ui, |ui| {
+        ui.label(
+            RichText::new(title)
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL)
+                .strong(),
+        );
+        ui.add_space(Style::SP_XS);
+        add(ui)
+    })
+}
+
+/// How many equal columns of at least [`TILE_MIN_W`] fit `avail` points — at least
+/// one, capped at `upper`. The wide detail pane lays its items across this many
+/// columns; a narrow seat collapses toward one (graceful, never clipped — design
+/// lock #4). A pure fold (no float→int cast), unit-tested headless.
+fn fit_columns(avail: f32, upper: usize) -> usize {
+    let mut cols = 1;
+    let mut needed = TILE_MIN_W * 2.0;
+    while cols < upper && avail >= needed {
+        cols += 1;
+        needed += TILE_MIN_W;
+    }
+    cols
+}
+
+/// Lay `items` **across** the wide detail pane in a responsive grid: as many equal
+/// columns of at least [`TILE_MIN_W`] as fit (capped at `max_cols`, never more than the
+/// item count), each cell rendered by `cell`. A narrow seat collapses toward one column
+/// so nothing clips (design lock #4). The single across-the-width primitive the
+/// reworked Displays / Audio / Hotkeys bodies share (§6). Empty `items` draw nothing —
+/// the caller shows its own honest-empty note.
+fn across_grid<T>(
+    ui: &mut egui::Ui,
+    items: &[T],
+    max_cols: usize,
+    mut cell: impl FnMut(&mut egui::Ui, &T),
+) {
+    if items.is_empty() {
+        return;
+    }
+    let cols = fit_columns(ui.available_width(), max_cols.min(items.len()));
+    for chunk in items.chunks(cols) {
+        ui.columns(cols, |columns| {
+            for (slot, item) in chunk.iter().enumerate() {
+                cell(&mut columns[slot], item);
+            }
+        });
+    }
+}
+
 /// An honest-empty Mesh & System placeholder (§7): a not-yet-wired note, never a
 /// fake control. SETTINGS-4 replaces this with the real identity/role/pairing/network
 /// bodies keyed off the node's own state.
@@ -1173,42 +1263,65 @@ fn probe_section<T>(
     }
 }
 
-/// The Mixer section — read-only status (fader/mute/solo interaction is E12-16).
+/// The Audio / Mixer section — read-only status (fader/mute/solo interaction is
+/// E12-16). The master output is the emphasized channel spanning the pane; the
+/// playback strips spread **across** the wide detail pane as channel tiles
+/// (SETTINGS-3), not a stacked column.
 fn mixer_section(ui: &mut egui::Ui, snap: Option<&SeatSnapshot>) {
     probe_section(
         ui,
         snap,
         |s| &s.mixer,
         |ui, m: &MixerStatus| {
-            strip_row(ui, &m.master, true);
-            for strip in &m.strips {
-                strip_row(ui, strip, false);
-            }
+            tile(ui, |ui| strip_channel(ui, &m.master, true));
             if m.strips.is_empty() {
+                ui.add_space(Style::SP_S);
                 muted_note(ui, "No channel strips.");
+                return;
             }
+            ui.add_space(Style::SP_S);
+            // The channel strips laid across the wide pane, up to four to a row.
+            across_grid(ui, &m.strips, 4, |ui, strip| {
+                tile(ui, |ui| strip_channel(ui, strip, false));
+            });
         },
     );
 }
 
-/// One mixer strip as a read-only status row.
-fn strip_row(ui: &mut egui::Ui, strip: &MixerStrip, master: bool) {
-    let value = if strip.muted {
-        format!("{}% \u{00B7} muted", strip.volume)
-    } else {
-        format!("{}%", strip.volume)
-    };
-    let tone = if strip.muted {
+/// One mixer channel as a read-only tile: a status dot + name, then the level (and an
+/// honest "muted" flag). The across-the-width channel the Audio section lays in a row
+/// (SETTINGS-3), replacing the old stacked [`field`] row.
+fn strip_channel(ui: &mut egui::Ui, strip: &MixerStrip, master: bool) {
+    let tone = if strip.muted { Style::WARN } else { Style::OK };
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(DOT).color(tone).size(Style::SMALL));
+        ui.add_space(Style::SP_XS);
+        let name = if master {
+            "Master"
+        } else {
+            strip.name.as_str()
+        };
+        ui.label(
+            RichText::new(name)
+                .color(Style::TEXT)
+                .size(Style::SMALL)
+                .strong(),
+        );
+    });
+    let level_tone = if strip.muted {
         Style::WARN
     } else {
         Style::TEXT
     };
-    let label = if master {
-        "Master".to_owned()
-    } else {
-        strip.name.clone()
-    };
-    field(ui, &label, &value, tone);
+    let size = if master { Style::BODY } else { Style::SMALL };
+    ui.label(
+        RichText::new(format!("{}%", strip.volume))
+            .color(level_tone)
+            .size(size),
+    );
+    if strip.muted {
+        muted_note(ui, "muted");
+    }
 }
 
 /// Whether the passed device state offers each action button (the pure
@@ -1266,18 +1379,38 @@ fn bluetooth_section(ui: &mut egui::Ui, snap: Option<&SeatSnapshot>, actions: &m
                 muted_note(ui, "No Bluetooth adapter.");
                 return;
             }
-            for adapter in &bt.adapters {
-                adapter_row(ui, adapter, actions);
-            }
             // Devices hang off the first adapter (the RemoveDevice owner). A scan
-            // annotates each row with live RSSI.
+            // annotates each device row with live RSSI.
             let adapter_path = bt.adapters.first().map(|a| a.path.as_str());
             let scanning = bt.adapters.iter().any(|a| a.discovering);
-            if bt.devices.is_empty() {
-                muted_note(ui, "No devices — scan to discover nearby devices.");
-            }
-            for device in &bt.devices {
-                device_row(ui, device, adapter_path, scanning, actions);
+            // Adapters and devices sit side by side in the wide pane (SETTINGS-3);
+            // a narrow seat drops to one stacked column so nothing clips.
+            let render_adapters = |ui: &mut egui::Ui, actions: &mut Vec<SysAction>| {
+                for adapter in &bt.adapters {
+                    adapter_row(ui, adapter, actions);
+                }
+            };
+            let render_devices = |ui: &mut egui::Ui, actions: &mut Vec<SysAction>| {
+                if bt.devices.is_empty() {
+                    muted_note(ui, "No devices — scan to discover nearby devices.");
+                }
+                for device in &bt.devices {
+                    device_row(ui, device, adapter_path, scanning, actions);
+                }
+            };
+            if fit_columns(ui.available_width(), 2) == 2 {
+                ui.columns(2, |columns| {
+                    column_card(&mut columns[0], "Adapters", |ui| {
+                        render_adapters(ui, actions);
+                    });
+                    column_card(&mut columns[1], "Devices", |ui| {
+                        render_devices(ui, actions);
+                    });
+                });
+            } else {
+                column_card(ui, "Adapters", |ui| render_adapters(ui, actions));
+                ui.add_space(Style::SP_S);
+                column_card(ui, "Devices", |ui| render_devices(ui, actions));
             }
         },
     );
@@ -1491,21 +1624,25 @@ fn displays_section(
             let backlights = snap.and_then(|s| s.backlights.present());
             let ddc = snap.and_then(|s| s.ddc.present());
             let multi = layout.active_count() > 1;
-            for out in &layout.outputs {
+            // The outputs laid across the wide pane as a ROW of cards (SETTINGS-3),
+            // up to three to a row, collapsing toward one on a narrow seat.
+            across_grid(ui, &layout.outputs, 3, |ui, out| {
                 let connector = connectors.iter().find(|c| c.name == out.connector);
-                output_row(
-                    ui,
-                    out,
-                    connector,
-                    multi,
-                    backlights,
-                    ddc,
-                    panel_brightness,
-                    ddc_brightness,
-                    actions,
-                );
-                ui.add_space(Style::SP_XS);
-            }
+                tile(ui, |ui| {
+                    output_row(
+                        ui,
+                        out,
+                        connector,
+                        multi,
+                        backlights,
+                        ddc,
+                        panel_brightness,
+                        ddc_brightness,
+                        actions,
+                    );
+                });
+            });
+            ui.add_space(Style::SP_S);
             // The arrangement is desired-state intent: the live modeset apply
             // (panel → the `run_drm` runner's multi-CRTC drive) + EDID-keyed
             // roaming are integration-gated (E12-19). Honest, never a fake "applied".
@@ -1743,143 +1880,162 @@ fn power_section(
     instances: &InstancesState,
     actions: &mut Vec<SysAction>,
 ) {
-    // Host power verbs — Lock is always offered; the host-down verbs (Suspend,
-    // Hibernate, Reboot, PowerOff) are gated by logind's CanX and a two-click
-    // confirm (lock 12). Hibernate (POWER-4) rides the same row + gate as Suspend.
-    probe_section(
-        ui,
-        snap,
-        |s| &s.power,
-        |ui, caps: &PowerCaps| {
-            power_verb_row(ui, PowerVerb::Lock, Avail::Yes, confirm, actions);
-            power_verb_row(ui, PowerVerb::Suspend, caps.suspend, confirm, actions);
-            power_verb_row(ui, PowerVerb::Hibernate, caps.hibernate, confirm, actions);
-            power_verb_row(ui, PowerVerb::Reboot, caps.reboot, confirm, actions);
-            power_verb_row(ui, PowerVerb::PowerOff, caps.poweroff, confirm, actions);
-        },
-    );
+    // Power controls and battery telemetry sit side by side in the wide pane
+    // (SETTINGS-3): the logind verbs + profile + idle/lid policy on the left, the
+    // battery / charge / source readings on the right. A narrow seat stacks them.
+    // Both panes read the real snapshot + drive the same SysAction seam — a
+    // presentation pass, the control logic unchanged (§6/§7).
+    let controls_pane = |ui: &mut egui::Ui,
+                         confirm: Option<PowerVerb>,
+                         cfg: &mut PowerHonorConfig,
+                         actions: &mut Vec<SysAction>| {
+        // Host power verbs — Lock is always offered; the host-down verbs (Suspend,
+        // Hibernate, Reboot, PowerOff) are gated by logind's CanX and a two-click
+        // confirm (lock 12). Hibernate (POWER-4) rides the same row + gate as Suspend.
+        probe_section(
+            ui,
+            snap,
+            |s| &s.power,
+            |ui, caps: &PowerCaps| {
+                power_verb_row(ui, PowerVerb::Lock, Avail::Yes, confirm, actions);
+                power_verb_row(ui, PowerVerb::Suspend, caps.suspend, confirm, actions);
+                power_verb_row(ui, PowerVerb::Hibernate, caps.hibernate, confirm, actions);
+                power_verb_row(ui, PowerVerb::Reboot, caps.reboot, confirm, actions);
+                power_verb_row(ui, PowerVerb::PowerOff, caps.poweroff, confirm, actions);
+            },
+        );
+        // Idle-suspend + lid-close policy (POWER-5) — the honorer reads this config
+        // every frame, so the pickers are §7-real (never inert). Safe defaults: idle
+        // Never, lid Suspend.
+        ui.add_space(Style::SP_XS);
+        power_settings::idle_timeout_body(ui, cfg, actions);
+        power_settings::lid_action_body(ui, cfg, actions);
+        // Power profile (POWER-4) — the daemon's available set + current active; the
+        // Absent case renders the probe's honest "unavailable", never a fake active.
+        ui.add_space(Style::SP_XS);
+        probe_section(
+            ui,
+            snap,
+            |s| &s.power_profile,
+            |ui, state| power_settings::profile_body(ui, state, actions),
+        );
+    };
 
-    // Idle-suspend + lid-close policy (POWER-5) — the honorer that enforces these
-    // lives in `crate::power_honor` and reads this config every frame, so the
-    // pickers are §7-real (never inert). Safe defaults: idle Never, lid Suspend.
-    ui.add_space(Style::SP_XS);
-    power_settings::idle_timeout_body(ui, power_honor_config, actions);
-    power_settings::lid_action_body(ui, power_honor_config, actions);
-
-    // Power profile (POWER-4) — the daemon's available set + current active. When
-    // power-profiles-daemon is Absent the probe renders the honest "unavailable"
-    // reason, never a fabricated active (§7).
-    ui.add_space(Style::SP_XS);
-    probe_section(
-        ui,
-        snap,
-        |s| &s.power_profile,
-        |ui, state| {
-            power_settings::profile_body(ui, state, actions);
-        },
-    );
-
-    // On-AC / on-battery source line (POWER-4) — the honest UPower LinePower
-    // reading, "unknown" when no adapter is tracked, "unavailable" when Absent.
-    ui.add_space(Style::SP_XS);
-    probe_section(
-        ui,
-        snap,
-        |s| &s.on_ac,
-        |ui, on_ac: &Option<bool>| {
-            power_settings::ac_source_body(ui, *on_ac);
-        },
-    );
-
-    // Charge limit (POWER-4) — the charge-stop cap slider when a battery
-    // advertises the attribute, an honest "not supported" when Present(None), and
-    // the probe's "unavailable" reason when Absent (no power-supply class).
-    ui.add_space(Style::SP_XS);
-    probe_section(
-        ui,
-        snap,
-        |s| &s.charge_limit,
-        |ui, cap: &Option<u8>| {
-            power_settings::charge_threshold_body(ui, *cap, charge_threshold, actions);
-        },
-    );
-
-    // Batteries (multi + peripherals, lock 6) + rich telemetry (POWER-4).
-    ui.add_space(Style::SP_XS);
-    probe_section(
-        ui,
-        snap,
-        |s| &s.batteries,
-        |ui, batteries| {
-            if batteries.is_empty() {
-                muted_note(ui, "No batteries.");
-            }
-            for battery in batteries {
-                let value = format!(
-                    "{:.0}% \u{00B7} {} \u{00B7} {}",
-                    battery.percentage,
-                    battery.kind.label(),
-                    battery.state.label()
-                );
-                field(ui, &battery.model, &value, Style::TEXT);
-                // Time-to-empty / time-to-full + draw rate when UPower reported
-                // them; an honest omission (no second line) otherwise (§7).
-                if let Some(tele) = power_settings::battery_telemetry(battery) {
-                    ui.indent((battery.model.as_str(), "battery-tele"), |ui| {
-                        muted_note(ui, tele);
-                    });
+    let battery_pane = |ui: &mut egui::Ui, live: &mut Option<u8>, actions: &mut Vec<SysAction>| {
+        // On-AC / on-battery source line (POWER-4) — the honest UPower LinePower
+        // reading, "unknown" when no adapter is tracked, "unavailable" when Absent.
+        probe_section(
+            ui,
+            snap,
+            |s| &s.on_ac,
+            |ui, on_ac: &Option<bool>| power_settings::ac_source_body(ui, *on_ac),
+        );
+        // Charge limit (POWER-4) — the charge-stop cap slider when a battery advertises
+        // the attribute, an honest "not supported" when Present(None), the probe's
+        // "unavailable" reason when Absent (no power-supply class).
+        ui.add_space(Style::SP_XS);
+        probe_section(
+            ui,
+            snap,
+            |s| &s.charge_limit,
+            |ui, cap: &Option<u8>| {
+                power_settings::charge_threshold_body(ui, *cap, live, actions);
+            },
+        );
+        // Batteries (multi + peripherals, lock 6) + rich telemetry (POWER-4).
+        ui.add_space(Style::SP_XS);
+        probe_section(
+            ui,
+            snap,
+            |s| &s.batteries,
+            |ui, batteries| {
+                if batteries.is_empty() {
+                    muted_note(ui, "No batteries.");
                 }
-            }
-        },
-    );
-
-    // Per-VM power rows — the Instances roster, a second view (§6). Empty roster →
-    // an honest note pointing at the Instances surface (never fabricated VMs).
-    ui.add_space(Style::SP_XS);
-    ui.label(
-        RichText::new("Local VMs")
-            .color(Style::TEXT_DIM)
-            .size(Style::SMALL),
-    );
-    let rows = instances.power_rows();
-    if rows.is_empty() {
-        muted_note(ui, "No local VMs — define one on the Instances surface.");
-    }
-    for (idx, row) in rows.iter().enumerate() {
-        ui.horizontal(|ui| {
-            let tone = if row.gated {
-                Style::WARN
-            } else if row.running {
-                Style::OK
-            } else {
-                Style::TEXT_DIM
-            };
-            ui.label(RichText::new(DOT).color(tone).size(Style::SMALL));
-            ui.add_space(Style::SP_XS);
-            ui.label(
-                RichText::new(&row.name)
-                    .color(Style::TEXT)
-                    .size(Style::SMALL),
-            );
-            ui.add_space(Style::SP_S);
-            ui.colored_label(tone, RichText::new(row.state).size(Style::SMALL));
-            ui.add_space(Style::SP_S);
-            // Reuse the broker verbs — Boot when down, Shutdown when running.
-            if row.running {
-                if ui
-                    .button(RichText::new("Shutdown").size(Style::SMALL))
-                    .clicked()
-                {
-                    actions.push(SysAction::VmPower { idx, boot: false });
+                for battery in batteries {
+                    let value = format!(
+                        "{:.0}% \u{00B7} {} \u{00B7} {}",
+                        battery.percentage,
+                        battery.kind.label(),
+                        battery.state.label()
+                    );
+                    field(ui, &battery.model, &value, Style::TEXT);
+                    // Time-to-empty / time-to-full + draw rate when UPower reported
+                    // them; an honest omission (no second line) otherwise (§7).
+                    if let Some(tele) = power_settings::battery_telemetry(battery) {
+                        ui.indent((battery.model.as_str(), "battery-tele"), |ui| {
+                            muted_note(ui, tele);
+                        });
+                    }
                 }
-            } else if ui
-                .button(RichText::new("Boot").size(Style::SMALL))
-                .clicked()
-            {
-                actions.push(SysAction::VmPower { idx, boot: true });
-            }
+            },
+        );
+    };
+
+    if fit_columns(ui.available_width(), 2) == 2 {
+        ui.columns(2, |columns| {
+            column_card(&mut columns[0], "Power", |ui| {
+                controls_pane(ui, confirm, power_honor_config, actions);
+            });
+            column_card(&mut columns[1], "Battery & source", |ui| {
+                battery_pane(ui, charge_threshold, actions);
+            });
+        });
+    } else {
+        column_card(ui, "Power", |ui| {
+            controls_pane(ui, confirm, power_honor_config, actions);
+        });
+        ui.add_space(Style::SP_S);
+        column_card(ui, "Battery & source", |ui| {
+            battery_pane(ui, charge_threshold, actions);
         });
     }
+
+    // Per-VM power rows — the Instances roster, a second view (§6) — span the full
+    // width below the two panes. Empty roster → an honest note pointing at the
+    // Instances surface (never fabricated VMs).
+    ui.add_space(Style::SP_S);
+    column_card(ui, "Local VMs", |ui| {
+        let rows = instances.power_rows();
+        if rows.is_empty() {
+            muted_note(ui, "No local VMs — define one on the Instances surface.");
+        }
+        for (idx, row) in rows.iter().enumerate() {
+            ui.horizontal(|ui| {
+                let tone = if row.gated {
+                    Style::WARN
+                } else if row.running {
+                    Style::OK
+                } else {
+                    Style::TEXT_DIM
+                };
+                ui.label(RichText::new(DOT).color(tone).size(Style::SMALL));
+                ui.add_space(Style::SP_XS);
+                ui.label(
+                    RichText::new(&row.name)
+                        .color(Style::TEXT)
+                        .size(Style::SMALL),
+                );
+                ui.add_space(Style::SP_S);
+                ui.colored_label(tone, RichText::new(row.state).size(Style::SMALL));
+                ui.add_space(Style::SP_S);
+                // Reuse the broker verbs — Boot when down, Shutdown when running.
+                if row.running {
+                    if ui
+                        .button(RichText::new("Shutdown").size(Style::SMALL))
+                        .clicked()
+                    {
+                        actions.push(SysAction::VmPower { idx, boot: false });
+                    }
+                } else if ui
+                    .button(RichText::new("Boot").size(Style::SMALL))
+                    .clicked()
+                {
+                    actions.push(SysAction::VmPower { idx, boot: true });
+                }
+            });
+        }
+    });
 }
 
 /// One power-verb row: the honest availability, then either a Lock/act button, an
@@ -1951,46 +2107,51 @@ fn power_verb_row(
 fn wallpaper_section(ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let current = crate::backdrop::selected_wallpaper(&ctx);
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("Desktop wallpaper")
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
-        );
-        ui.add_space(Style::SP_S);
-        ComboBox::from_id_salt("qbrand11-wallpaper")
-            .selected_text(RichText::new(current.label()).size(Style::SMALL))
-            .show_ui(ui, |ui| {
-                for wallpaper in crate::backdrop::Wallpaper::ALL {
-                    let selected = wallpaper == current;
-                    if ui
-                        .selectable_label(
-                            selected,
-                            RichText::new(wallpaper.label()).size(Style::SMALL),
-                        )
-                        .clicked()
-                        && !selected
-                    {
-                        crate::backdrop::select_wallpaper(&ctx, wallpaper);
-                    }
-                }
-            });
+    ui.label(
+        RichText::new("Desktop wallpaper")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL),
+    );
+    ui.add_space(Style::SP_S);
+    // The official wallpapers as a gallery laid across the wide pane (SETTINGS-3):
+    // each is a selectable tile driving the SAME backdrop seam the combo did — a
+    // presentation pass, the selection logic unchanged (§6/§7).
+    across_grid(ui, &crate::backdrop::Wallpaper::ALL, 3, |ui, &wallpaper| {
+        let selected = wallpaper == current;
+        tile(ui, |ui| {
+            if ui
+                .add_sized(
+                    [ui.available_width(), Style::SP_XL],
+                    egui::SelectableLabel::new(
+                        selected,
+                        RichText::new(wallpaper.label()).size(Style::BODY),
+                    ),
+                )
+                .clicked()
+                && !selected
+            {
+                crate::backdrop::select_wallpaper(&ctx, wallpaper);
+            }
+        });
     });
+    ui.add_space(Style::SP_S);
     muted_note(
         ui,
         "The five official Quazar wallpapers ship in the RPM; your choice follows your mesh identity when a workgroup volume is present.",
     );
 }
 
-/// The Hotkeys section — the fixed compiled-in table (lock 9) read-only.
+/// The Hotkeys section — the fixed compiled-in table (lock 9) read-only, laid
+/// **across** the wide pane in a responsive multi-column reference (SETTINGS-3)
+/// instead of one tall stacked list.
 fn hotkeys_section(ui: &mut egui::Ui) {
-    for hotkey in HOTKEYS {
+    across_grid(ui, HOTKEYS, 3, |ui, hotkey| {
         ui.horizontal(|ui| {
             ui.label(RichText::new(DOT).color(Style::TEXT_DIM).size(Style::SMALL));
             ui.add_space(Style::SP_XS);
             field(ui, hotkey.chord, hotkey.action.label(), Style::TEXT);
         });
-    }
+    });
 }
 
 #[cfg(test)]
@@ -2611,6 +2772,188 @@ mod tests {
         assert!(
             renders(&mut st, &mut inst),
             "the layered Settings page drew nothing"
+        );
+    }
+
+    // ── Expressive wide layouts (SETTINGS-3) ──────────────────────────────────
+
+    /// Render one headless frame at an explicit pane width, tessellating on the CPU
+    /// (the DRM runner's path minus the GPU) — the wide-pane variant of [`renders`].
+    fn renders_at(state: &mut SystemState, instances: &mut InstancesState, width: f32) -> bool {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 720.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| state.show(ui, instances));
+        });
+        !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
+    }
+
+    fn mixer_strip(name: &str, volume: u8, muted: bool) -> MixerStrip {
+        MixerStrip {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            origin: mde_seat::StripOrigin::HostSession,
+            volume,
+            muted,
+        }
+    }
+
+    fn connected_connector(name: &str) -> Connector {
+        Connector {
+            name: name.to_owned(),
+            status: ConnectorStatus::Connected,
+            size_mm: Some((600, 340)),
+            modes: vec![DisplayMode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+                preferred: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn fit_columns_widens_on_a_wide_pane_and_collapses_on_a_narrow_one() {
+        // The across-the-width reflow decision (design lock #4): a pane narrower than
+        // two tiles is a single column; a wider pane fits more, capped at the section
+        // max; and it never returns zero (so chunks() cannot panic on a small seat).
+        assert_eq!(fit_columns(TILE_MIN_W * 1.5, 4), 1);
+        assert_eq!(fit_columns(TILE_MIN_W * 2.0, 4), 2);
+        assert_eq!(fit_columns(TILE_MIN_W * 3.0, 4), 3);
+        assert_eq!(
+            fit_columns(TILE_MIN_W * 100.0, 3),
+            3,
+            "a very wide pane is capped at the section max"
+        );
+        assert_eq!(
+            fit_columns(TILE_MIN_W * 100.0, 1),
+            1,
+            "a one-item section stays a single column"
+        );
+        assert_eq!(
+            fit_columns(0.0, 4),
+            1,
+            "a zero-width pane is still one column"
+        );
+    }
+
+    #[test]
+    fn the_reworked_sections_paint_across_a_wide_detail_pane() {
+        // Inject Present Audio / Bluetooth / Power probes over an otherwise-real
+        // (Absent) snapshot and render each reworked section in a WIDE pane: the
+        // across / side-by-side layout must tessellate real geometry, never a blank —
+        // the wide-pane counterpart of selecting_each_section_routes_the_detail_pane.
+        let build = || {
+            let mut snap = Seat::new().snapshot();
+            snap.mixer = Probe::Present(MixerStatus {
+                master: mixer_strip("master", 64, false),
+                strips: vec![
+                    mixer_strip("Music", 80, false),
+                    mixer_strip("Voice", 40, true),
+                    mixer_strip("VM: build", 55, false),
+                ],
+            });
+            snap.bluetooth = Probe::Present(BtStatus {
+                adapters: vec![BtAdapter {
+                    path: "/org/bluez/hci0".to_owned(),
+                    name: "eagle".to_owned(),
+                    powered: true,
+                    discovering: false,
+                    discoverable: false,
+                    pairable: false,
+                }],
+                devices: vec![bt_device("/org/bluez/hci0/dev_AA", true, true, true)],
+            });
+            snap.power_profile = Probe::Present(ProfileState {
+                active: "balanced".to_owned(),
+                available: vec!["balanced".to_owned(), "performance".to_owned()],
+            });
+            snap.charge_limit = Probe::Present(Some(80));
+            snap.batteries = Probe::Present(vec![Battery {
+                model: "BAT0".to_owned(),
+                kind: BatteryKind::Internal,
+                percentage: 61.0,
+                state: BatteryState::Discharging,
+                power_supply: true,
+                time_to_empty: Some(Duration::from_secs(5400)),
+                time_to_full: None,
+                energy_rate: Some(11.7),
+            }]);
+            snap
+        };
+        for section in [
+            SettingsSection::Audio,
+            SettingsSection::Bluetooth,
+            SettingsSection::Power,
+            SettingsSection::Wallpaper,
+            SettingsSection::Hotkeys,
+        ] {
+            let snap = build();
+            let mut st = SystemState {
+                nav: SettingsNav::at(section),
+                ..SystemState::default()
+            };
+            st.reconcile(&snap);
+            st.snapshot = Some(snap);
+            let mut inst = InstancesState::default();
+            assert!(
+                renders_at(&mut st, &mut inst, 1440.0),
+                "the wide {} pane drew nothing",
+                section.label()
+            );
+        }
+    }
+
+    #[test]
+    fn the_displays_section_lays_outputs_across_and_still_drives_the_layout() {
+        // Two connected outputs reconciled into the layout render as a ROW of tiles in
+        // a wide pane (SETTINGS-3) — a full paint, never a stacked blank — and the
+        // ToggleOutput seam still drives the intent layout, proving the presentation
+        // pass didn't fork the control (§6/§7).
+        let mut st = SystemState {
+            nav: SettingsNav::at(SettingsSection::Displays),
+            ..SystemState::default()
+        };
+        let mut snap = Seat::new().snapshot();
+        snap.displays = Probe::Present(vec![
+            connected_connector("DP-1"),
+            connected_connector("DP-2"),
+        ]);
+        st.reconcile(&snap);
+        st.snapshot = Some(snap);
+        assert_eq!(
+            st.layout.outputs.len(),
+            2,
+            "both outputs entered the layout"
+        );
+
+        let mut inst = InstancesState::default();
+        assert!(
+            renders_at(&mut st, &mut inst, 1440.0),
+            "the wide Displays row of cards drew nothing"
+        );
+
+        // Toggling the FIRST output off drives the layout through apply() (the
+        // last-console interlock keeps the second lit) — the real SysAction still
+        // fires after the re-layout.
+        let first = st.layout.outputs[0].id.clone();
+        st.apply(
+            vec![SysAction::ToggleOutput(first.clone(), false)],
+            &mut inst,
+        );
+        let disabled = st
+            .layout
+            .outputs
+            .iter()
+            .find(|o| o.id == first)
+            .is_some_and(|o| !o.enabled);
+        assert!(
+            disabled,
+            "a ToggleOutput still drives the layout after the re-layout"
         );
     }
 }
