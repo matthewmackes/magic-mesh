@@ -127,6 +127,26 @@ impl Style {
     /// Categorical accent — **Media** (Carbon magenta).
     pub const ACCENT_MEDIA: Color32 = Color32::from_rgb(0xFF, 0x7E, 0xB6);
 
+    // ── Node capability grade ramp (A–F, green→red) ─────────────────────────
+    // NODE-GRADE-3 (design docs/design/node-grade.md #4): ONE shared A–F ramp that
+    // every grade UI reads — the dock's per-node capability list (NODE-GRADE-2)
+    // today, any future grade surface tomorrow. It is **not** a new palette: each
+    // rung resolves onto an existing status/accent token (§4 — one palette, no raw
+    // hex minted here), so the grades speak the same greens/ambers/reds the rest of
+    // the shell already does. The rungs redden monotonically A→F (green · lime ·
+    // gold · orange · red); [`GradeBand`] maps a 0–100 score → band → colour.
+    /// Grade **A** — healthy and with headroom. The success green ([`OK`](Self::OK)).
+    pub const GRADE_A: Color32 = Self::OK;
+    /// Grade **B** — the brighter/limier second green rung
+    /// ([`ACCENT_MESH`](Self::ACCENT_MESH), Carbon green).
+    pub const GRADE_B: Color32 = Self::ACCENT_MESH;
+    /// Grade **C** — the mid rung, gold/yellow ([`ACCENT_SYSTEM`](Self::ACCENT_SYSTEM)).
+    pub const GRADE_C: Color32 = Self::ACCENT_SYSTEM;
+    /// Grade **D** — degraded, the warning amber/orange ([`WARN`](Self::WARN)).
+    pub const GRADE_D: Color32 = Self::WARN;
+    /// Grade **F** — failing or maxed out, the danger red ([`DANGER`](Self::DANGER)).
+    pub const GRADE_F: Color32 = Self::DANGER;
+
     // ── Spacing (8px grid; XS is the half-step) ─────────────────────────────
     /// 4px — half-step (tight insets, icon gaps).
     pub const SP_XS: f32 = 4.0;
@@ -218,12 +238,131 @@ impl Style {
             s.spacing.interact_size.y = density.min_hit_target();
         });
     }
+
+    /// The **load-bar fill** colour for a 0–100 capability score: a smooth blend
+    /// along the same green→red ramp as the A–F letters (design #5 — the tiny
+    /// per-node load bar). `100` → [`GRADE_A`](Self::GRADE_A) green, `0` →
+    /// [`GRADE_F`](Self::GRADE_F) red, interpolated continuously between the rungs so
+    /// the bar reads as a gradient while the letter stays a discrete band. Scores
+    /// outside `0..=100` clamp to the ends rather than panic.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub fn grade_fill(score: f32) -> Color32 {
+        // Rungs worst→best: a full (100) bar is green, an empty (0) bar is red.
+        const RAMP: [Color32; 5] = [
+            Style::GRADE_F,
+            Style::GRADE_D,
+            Style::GRADE_C,
+            Style::GRADE_B,
+            Style::GRADE_A,
+        ];
+        let last = RAMP.len() - 1;
+        let pos = (score.clamp(0.0, 100.0) / 100.0) * last as f32;
+        let lo = pos.floor();
+        let idx = lo as usize;
+        if idx >= last {
+            return RAMP[last];
+        }
+        blend(RAMP[idx], RAMP[idx + 1], pos - lo)
+    }
+}
+
+/// Linear-interpolate two colours in gamma space at `t` ∈ `[0, 1]` — a small local
+/// mixer for [`Style::grade_fill`]'s load-bar gradient (`t = 0` → `a`, `t = 1` → `b`).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| {
+        (f32::from(y) - f32::from(x))
+            .mul_add(t, f32::from(x))
+            .round() as u8
+    };
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+}
+
+/// The five capability **bands** a 0–100 node score falls into — the A–F grade
+/// (there is no "E"; the classic school ramp skips it).
+///
+/// Each band owns one colour on the shared green→red ramp
+/// ([`Style::GRADE_A`]..[`Style::GRADE_F`]) and knows whether it is an alarm band, so
+/// "which score is which grade" and "which grades blink" are each defined **once**.
+/// The dock (NODE-GRADE-2) and any future grade UI map a score with
+/// [`from_score`](Self::from_score) then read the band's [`color`](Self::color) /
+/// [`letter`](Self::letter) / [`is_alert`](Self::is_alert).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GradeBand {
+    /// **A** — score ≥ 90: healthy and with spare headroom.
+    A,
+    /// **B** — score ≥ 80.
+    B,
+    /// **C** — score ≥ 70.
+    C,
+    /// **D** — score ≥ 60: degraded; an **alarm** band (blinks, design #6/#16).
+    D,
+    /// **F** — score < 60: failing or maxed out; an **alarm** band (blinks, #6/#16).
+    F,
+}
+
+impl GradeBand {
+    /// The band a 0–100 capability score falls into, on the classic **90/80/70/60**
+    /// thresholds (design #9). A `NaN` score reads as the worst band
+    /// ([`F`](Self::F)) — an unscored/absent node is treated as failing, not healthy.
+    #[must_use]
+    pub const fn from_score(score: f32) -> Self {
+        if score >= 90.0 {
+            Self::A
+        } else if score >= 80.0 {
+            Self::B
+        } else if score >= 70.0 {
+            Self::C
+        } else if score >= 60.0 {
+            Self::D
+        } else {
+            Self::F
+        }
+    }
+
+    /// The band's colour on the shared green→red ramp ([`Style::GRADE_A`]..`GRADE_F`).
+    #[must_use]
+    pub const fn color(self) -> Color32 {
+        match self {
+            Self::A => Style::GRADE_A,
+            Self::B => Style::GRADE_B,
+            Self::C => Style::GRADE_C,
+            Self::D => Style::GRADE_D,
+            Self::F => Style::GRADE_F,
+        }
+    }
+
+    /// The band's letter (`'A'`..`'F'`) for the dock row.
+    #[must_use]
+    pub const fn letter(self) -> char {
+        match self {
+            Self::A => 'A',
+            Self::B => 'B',
+            Self::C => 'C',
+            Self::D => 'D',
+            Self::F => 'F',
+        }
+    }
+
+    /// Whether this is an **alarm** band — `true` for [`D`](Self::D)/[`F`](Self::F),
+    /// the bands the dock hard-blinks (design #6/#16). The single predicate every
+    /// grade UI keys its blink/alert off, so "which bands alarm" lives in one place.
+    #[must_use]
+    pub const fn is_alert(self) -> bool {
+        matches!(self, Self::D | Self::F)
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants, clippy::float_cmp)]
 mod tests {
-    use super::{Density, Style};
+    use super::{Density, GradeBand, Style};
     use crate::formfactor::Formfactor;
 
     #[test]
@@ -349,5 +488,105 @@ mod tests {
             d.style().spacing.interact_size.y,
             mouse.style().spacing.interact_size.y
         );
+    }
+
+    // --- NODE-GRADE-3: the A–F grade ramp ------------------------------------
+
+    /// How red-vs-green a colour is: positive = redder, negative = greener. This is
+    /// the ramp's honest monotone axis — golds/oranges are too bright to rank by
+    /// luminance, so the grades "redden" A→F, they do not simply darken.
+    fn redness(c: egui::Color32) -> i32 {
+        i32::from(c.r()) - i32::from(c.g())
+    }
+
+    #[test]
+    fn grade_ramp_reddens_monotonically_a_to_f() {
+        let ramp = [
+            Style::GRADE_A,
+            Style::GRADE_B,
+            Style::GRADE_C,
+            Style::GRADE_D,
+            Style::GRADE_F,
+        ];
+        for pair in ramp.windows(2) {
+            assert!(
+                redness(pair[0]) < redness(pair[1]),
+                "the grade ramp must redden strictly from A→F: {:?} !< {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn grade_bands_map_to_distinct_tokens() {
+        let bands = [
+            GradeBand::A,
+            GradeBand::B,
+            GradeBand::C,
+            GradeBand::D,
+            GradeBand::F,
+        ];
+        for (i, a) in bands.iter().enumerate() {
+            for b in &bands[i + 1..] {
+                assert_ne!(
+                    a.color(),
+                    b.color(),
+                    "each grade band must map to a distinct token"
+                );
+            }
+        }
+        // The enum resolves to exactly the named ramp tokens.
+        assert_eq!(GradeBand::A.color(), Style::GRADE_A);
+        assert_eq!(GradeBand::F.color(), Style::GRADE_F);
+    }
+
+    #[test]
+    fn grade_a_c_f_are_distinct_and_from_the_shared_palette() {
+        // A/C/F are mutually distinct rungs...
+        assert_ne!(Style::GRADE_A, Style::GRADE_C);
+        assert_ne!(Style::GRADE_C, Style::GRADE_F);
+        assert_ne!(Style::GRADE_A, Style::GRADE_F);
+        // ...and every rung is an existing status/accent token, not a new hue (§4).
+        assert_eq!(Style::GRADE_A, Style::OK);
+        assert_eq!(Style::GRADE_B, Style::ACCENT_MESH);
+        assert_eq!(Style::GRADE_C, Style::ACCENT_SYSTEM);
+        assert_eq!(Style::GRADE_D, Style::WARN);
+        assert_eq!(Style::GRADE_F, Style::DANGER);
+    }
+
+    #[test]
+    fn grade_bands_follow_the_classic_thresholds() {
+        assert_eq!(GradeBand::from_score(100.0), GradeBand::A);
+        assert_eq!(GradeBand::from_score(90.0), GradeBand::A);
+        assert_eq!(GradeBand::from_score(89.9), GradeBand::B);
+        assert_eq!(GradeBand::from_score(80.0), GradeBand::B);
+        assert_eq!(GradeBand::from_score(70.0), GradeBand::C);
+        assert_eq!(GradeBand::from_score(60.0), GradeBand::D);
+        assert_eq!(GradeBand::from_score(59.9), GradeBand::F);
+        assert_eq!(GradeBand::from_score(0.0), GradeBand::F);
+        // An unscored (NaN) node reads as the worst band, never as healthy.
+        assert_eq!(GradeBand::from_score(f32::NAN), GradeBand::F);
+    }
+
+    #[test]
+    fn only_d_and_f_are_alarm_bands() {
+        assert!(!GradeBand::A.is_alert());
+        assert!(!GradeBand::B.is_alert());
+        assert!(!GradeBand::C.is_alert());
+        assert!(GradeBand::D.is_alert());
+        assert!(GradeBand::F.is_alert());
+    }
+
+    #[test]
+    fn grade_fill_spans_the_ramp_and_reddens_as_the_score_drops() {
+        // Endpoints pin to the band colours.
+        assert_eq!(Style::grade_fill(100.0), Style::GRADE_A);
+        assert_eq!(Style::grade_fill(0.0), Style::GRADE_F);
+        // Out-of-range scores clamp to the ends rather than panic.
+        assert_eq!(Style::grade_fill(250.0), Style::GRADE_A);
+        assert_eq!(Style::grade_fill(-10.0), Style::GRADE_F);
+        // A lower score yields a redder fill, along the same axis as the ramp.
+        assert!(redness(Style::grade_fill(20.0)) > redness(Style::grade_fill(95.0)));
     }
 }
