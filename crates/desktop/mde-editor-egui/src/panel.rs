@@ -44,6 +44,23 @@ use crate::widget::{editor_widget, EditorView};
 /// The project-tree side panel's default width — six shared spacing units (§4).
 const TREE_WIDTH: f32 = Style::SP_XL * 6.0;
 
+/// Below this panel width the Word toolbars lean out (EDTB-4, design lock #9):
+/// each strip's width-heavy dropdown folds into a `»` overflow so the Standard +
+/// Formatting bars stay usable on a narrow (compact-shell) editor panel. Derived
+/// from the shared spacing grid — a fourteen-column span (§4); the two strips
+/// each want roughly this to lay out their groups without crowding, so below it
+/// the wide dropdowns fold. The menu bar is already compact (dropdown buttons),
+/// so it is width-invariant.
+const COMPACT_WIDTH: f32 = Style::SP_XL * 14.0;
+
+/// Whether `available_width` puts the editor panel in the compact (narrow) layout
+/// — the EDTB-4 threshold decision, taken from the egui available width (the
+/// shell mounts the panel with no size signal, so width is the honest proxy).
+/// Pure, so it is unit-testable at both widths.
+fn is_compact(available_width: f32) -> bool {
+    available_width < COMPACT_WIDTH
+}
+
 /// The Save As / About dialog plate width — ten shared spacing units (§4).
 const DIALOG_W: f32 = Style::SP_XL * 10.0;
 
@@ -792,6 +809,14 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
     // and `Cmd`/`Ctrl-Shift-P` open the overlays instead of typing into the buffer.
     surface.handle_overlay_triggers(ui);
 
+    // EDTB-4 — the compact decision, taken ONCE from the panel's available width
+    // before the bars mount so all three read one consistent layout. Each bar's
+    // `TopBottomPanel::top` spans this same full width, so this is their width
+    // too. Below the threshold the Standard/Formatting strips fold their
+    // width-heavy dropdowns into a `»` overflow (still reachable, §7); the menu
+    // bar is already compact, so it renders the same at every width.
+    let compact = is_compact(ui.available_width());
+
     // EDTB-1 — the Word-97 menu bar + Standard toolbar across the top of the
     // panel (design: `editor-toolbar.md`), drawn before the tree/body so the
     // whole surface sits under them. Both render from one state snapshot and
@@ -815,7 +840,7 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
                 .inner_margin(Style::SP_XS),
         )
         .show_inside(ui, |ui| {
-            if let Some(picked) = toolbar::show(ui, &cx) {
+            if let Some(picked) = toolbar::show(ui, &cx, compact) {
                 action = Some(picked);
             }
         });
@@ -829,7 +854,7 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
                 .inner_margin(Style::SP_XS),
         )
         .show_inside(ui, |ui| {
-            if let Some(picked) = format_bar::show(ui, &cx) {
+            if let Some(picked) = format_bar::show(ui, &cx, compact) {
                 action = Some(picked);
             }
         });
@@ -1142,6 +1167,24 @@ mod tests {
         Style::install(&ctx);
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor_panel(ui, surface);
+            });
+        });
+        ctx.tessellate(out.shapes, out.pixels_per_point).len()
+    }
+
+    /// Like [`tessellate_panel`] but at a caller-chosen panel width, so a test can
+    /// drive the EDTB-4 wide (full) vs narrow (compact) bar layouts. Returns the
+    /// primitive count so callers can assert the surface actually paints.
+    fn tessellate_panel_at(surface: &mut EditorSurface, width: f32) -> usize {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, 640.0))),
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
@@ -2070,6 +2113,86 @@ mod tests {
         assert!(
             surface.doc.as_ref().expect("doc").lsp.is_some(),
             "the second document has its own client"
+        );
+    }
+
+    // ── EDTB-4: the compact-aware bars ───────────────────────────────────────
+
+    #[test]
+    fn the_compact_threshold_switches_at_the_token_width() {
+        // The layout decision is a pure fn of the panel's available width: at or
+        // above the token-derived threshold the full bars render; just below it
+        // the strips lean out (compact).
+        assert!(
+            !super::is_compact(super::COMPACT_WIDTH),
+            "at the threshold the full bars render"
+        );
+        assert!(!super::is_compact(super::COMPACT_WIDTH + 1.0));
+        assert!(
+            super::is_compact(super::COMPACT_WIDTH - 1.0),
+            "just under the threshold is compact"
+        );
+        assert!(super::is_compact(320.0), "a phone-narrow panel is compact");
+        assert!(!super::is_compact(1280.0), "a desktop-wide panel is full");
+    }
+
+    #[test]
+    fn the_full_bars_render_at_a_wide_panel() {
+        // §7 — at a wide panel the full three-bar chrome (menu + Standard +
+        // Formatting, the Style + Zoom dropdowns inline) paints real primitives.
+        let mut surface = real_editor();
+        surface.open_text("# title\n\nbody\n");
+        assert!(!super::is_compact(1200.0), "1200px is the full layout");
+        assert!(
+            tessellate_panel_at(&mut surface, 1200.0) > 0,
+            "the full bars produced no draw primitives"
+        );
+    }
+
+    #[test]
+    fn the_bars_lean_out_and_still_paint_at_a_narrow_panel() {
+        // §7 — at a narrow panel the strips go compact (the wide dropdowns fold
+        // into the `»` overflow) and still paint real primitives over an open
+        // document (Zoom + Style present, so both overflows render).
+        let mut surface = real_editor();
+        surface.open_text("# title\n\nbody\n");
+        assert!(super::is_compact(400.0), "400px is the compact layout");
+        assert!(
+            tessellate_panel_at(&mut surface, 400.0) > 0,
+            "the compact bars produced no draw primitives"
+        );
+    }
+
+    #[test]
+    fn compact_bars_keep_every_command_reachable_and_dispatching() {
+        // §7 — the folded controls are relocated into the `»` overflow, never
+        // lost: the SAME MenuAction they emit still dispatches. Render the whole
+        // panel narrow (compact), then drive the two overflowed controls' actions
+        // through the real seam — Zoom (Standard-strip overflow) and Heading
+        // (Format-strip overflow) both act on the live document at compact width.
+        let mut surface = real_editor();
+        surface.open_text("title\n");
+        assert!(
+            super::is_compact(400.0),
+            "the panel is in the compact layout at this width"
+        );
+        assert!(
+            tessellate_panel_at(&mut surface, 400.0) > 0,
+            "the compact bars paint"
+        );
+        // The overflowed Zoom still zooms…
+        run_action_in_frame(&mut surface, MenuAction::Zoom(150));
+        assert_eq!(
+            surface.menu_context().zoom_percent,
+            Some(150),
+            "the overflow Zoom still sets the view scale"
+        );
+        // …and the overflowed paragraph Style still sets the heading.
+        run_action_in_frame(&mut surface, MenuAction::Heading(2));
+        assert_eq!(
+            text_of(&surface),
+            "## title\n",
+            "the overflow Style still sets the caret-line heading"
         );
     }
 }

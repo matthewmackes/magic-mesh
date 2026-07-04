@@ -27,7 +27,7 @@
 use mde_egui::egui::{self, Button, RichText, Ui};
 use mde_egui::Style;
 
-use crate::menu_bar::{Gate, MenuAction, MenuContext};
+use crate::menu_bar::{Gate, MenuAction, MenuContext, OVERFLOW_GLYPH};
 
 /// The Word-97 zoom steps the dropdown offers.
 pub const ZOOM_STEPS: [u16; 6] = [50, 75, 100, 125, 150, 200];
@@ -66,6 +66,18 @@ pub enum StripEntry {
     Separator,
     /// The zoom dropdown (rendered only with an open document).
     Zoom,
+}
+
+impl StripEntry {
+    /// Whether this entry folds into the compact `»` overflow (EDTB-4) rather
+    /// than rendering inline when the panel is narrow. Only the width-heavy
+    /// **Zoom** dropdown folds — its `100%` text label is the one wide control on
+    /// this strip; the icon buttons and group separators are already narrow, so
+    /// they always stay in line (the compact form the strip needs). Pure so the
+    /// §7 "no command lost" fold split is unit-testable.
+    const fn folds_in_compact(&self) -> bool {
+        matches!(self, Self::Zoom)
+    }
 }
 
 /// The Standard strip in Word-97 order, as data — the render is one thin loop,
@@ -128,50 +140,112 @@ pub const STRIP: [StripEntry; 12] = [
 /// Render the Standard toolbar and return the action the operator picked this
 /// frame, if any. Buttons grey out by context exactly like their menu twins;
 /// each carries its command name as a small hover tooltip (Word-style).
-pub fn show(ui: &mut Ui, cx: &MenuContext) -> Option<MenuAction> {
+///
+/// When `compact` (EDTB-4 — the panel is narrow), the width-heavy Zoom dropdown
+/// folds into a trailing `»` overflow instead of rendering inline, so the strip
+/// leans out to its narrow icon buttons while keeping every command reachable
+/// (§7 — relocated, never lost). At full width every control renders in line.
+pub fn show(ui: &mut Ui, cx: &MenuContext, compact: bool) -> Option<MenuAction> {
     let mut action = None;
     ui.horizontal(|ui| {
         ui.add_space(Style::SP_S);
         for entry in &STRIP {
+            // Compact folds the width-heavy controls into the `»` overflow
+            // (rendered after the loop); the narrow icon buttons + separators
+            // always stay in line.
+            if compact && entry.folds_in_compact() {
+                continue;
+            }
             match entry {
                 StripEntry::Separator => {
                     ui.separator();
                 }
                 StripEntry::Button(button) => {
-                    let resp = ui
-                        .add_enabled(
-                            button.gate.enabled(cx),
-                            Button::new(RichText::new(button.glyph).size(Style::BODY)),
-                        )
-                        .on_hover_text(button.name)
-                        .on_disabled_hover_text(button.name);
-                    if resp.clicked() {
-                        action = Some(button.action);
+                    if let Some(picked) = tool_button(ui, cx, button) {
+                        action = Some(picked);
                     }
                 }
                 StripEntry::Zoom => {
-                    // No document → no zoom control (nothing to zoom); the
-                    // dropdown reappears with the next open document.
-                    if let Some(percent) = cx.zoom_percent {
-                        egui::ComboBox::from_id_salt("editor-zoom")
-                            .selected_text(format!("{percent}%"))
-                            .show_ui(ui, |ui| {
-                                for step in ZOOM_STEPS {
-                                    if ui
-                                        .selectable_label(step == percent, format!("{step}%"))
-                                        .clicked()
-                                    {
-                                        action = Some(MenuAction::Zoom(step));
-                                    }
-                                }
-                            })
-                            .response
-                            .on_hover_text("Zoom");
+                    if let Some(picked) = zoom_dropdown(ui, cx) {
+                        action = Some(picked);
                     }
                 }
             }
         }
+        // EDTB-4 — the compact `»` overflow: the folded width-heavy controls,
+        // still fully reachable (§7). Omitted with nothing to fold.
+        if compact {
+            if let Some(picked) = overflow(ui, cx) {
+                action = Some(picked);
+            }
+        }
     });
+    action
+}
+
+/// Render one Standard-toolbar command button (icon-only face + Word tooltip),
+/// greyed by its context gate exactly like its menu twin. Returns its action if
+/// the operator clicked it this frame.
+fn tool_button(ui: &mut Ui, cx: &MenuContext, button: &ToolButton) -> Option<MenuAction> {
+    let resp = ui
+        .add_enabled(
+            button.gate.enabled(cx),
+            Button::new(RichText::new(button.glyph).size(Style::BODY)),
+        )
+        .on_hover_text(button.name)
+        .on_disabled_hover_text(button.name);
+    resp.clicked().then_some(button.action)
+}
+
+/// Render the Zoom dropdown (Word's 50–200% steps) inline — but only with an open
+/// document: with none there is nothing to zoom, so it is omitted (the dropdown
+/// reappears with the next open document). Returns the picked `MenuAction::Zoom`.
+fn zoom_dropdown(ui: &mut Ui, cx: &MenuContext) -> Option<MenuAction> {
+    let percent = cx.zoom_percent?;
+    let mut action = None;
+    egui::ComboBox::from_id_salt("editor-zoom")
+        .selected_text(format!("{percent}%"))
+        .show_ui(ui, |ui| {
+            for step in ZOOM_STEPS {
+                if ui
+                    .selectable_label(step == percent, format!("{step}%"))
+                    .clicked()
+                {
+                    action = Some(MenuAction::Zoom(step));
+                }
+            }
+        })
+        .response
+        .on_hover_text("Zoom");
+    action
+}
+
+/// The compact `»` overflow menu: the width-heavy controls the narrow strip
+/// folded out of line, still fully reachable (§7 — relocated, never lost). On the
+/// Standard strip that is the Zoom dropdown; it renders here as the same zoom
+/// steps, emitting the same [`MenuAction::Zoom`] the inline dropdown does (§6).
+/// Omitted (no `»`) when nothing folds — i.e. with no open document to zoom.
+fn overflow(ui: &mut Ui, cx: &MenuContext) -> Option<MenuAction> {
+    let percent = cx.zoom_percent?;
+    let mut action = None;
+    ui.menu_button(OVERFLOW_GLYPH, |ui| {
+        ui.label(
+            RichText::new("Zoom")
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+        for step in ZOOM_STEPS {
+            if ui
+                .selectable_label(step == percent, format!("{step}%"))
+                .clicked()
+            {
+                action = Some(MenuAction::Zoom(step));
+                ui.close_menu();
+            }
+        }
+    })
+    .response
+    .on_hover_text("More controls");
     action
 }
 
@@ -239,6 +313,25 @@ mod tests {
             })
             .collect();
         assert_eq!(buttons, expect);
+    }
+
+    #[test]
+    fn only_the_zoom_dropdown_folds_into_the_compact_overflow() {
+        // EDTB-4 §7 — the narrow icon buttons + separators always stay inline;
+        // only the width-heavy Zoom dropdown folds into the `»` overflow. Nothing
+        // is dropped — every command button is reachable inline in both layouts.
+        let folded: Vec<&StripEntry> = STRIP.iter().filter(|e| e.folds_in_compact()).collect();
+        assert_eq!(folded.len(), 1, "exactly the Zoom dropdown folds");
+        assert!(matches!(folded[0], StripEntry::Zoom));
+        for entry in &STRIP {
+            if let StripEntry::Button(b) = entry {
+                assert!(
+                    !entry.folds_in_compact(),
+                    "the {} button must not fold — common commands stay inline",
+                    b.name
+                );
+            }
+        }
     }
 
     #[test]

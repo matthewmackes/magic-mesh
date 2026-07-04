@@ -50,6 +50,14 @@ use mde_egui::Style;
 /// shared spacing units (§4), the same derivation as the panel's tree width.
 const MENU_MIN_W: f32 = Style::SP_XL * 6.0;
 
+/// The compact **overflow** affordance's glyph — Word's `»` chevrons, the "more
+/// controls" menu the Standard/Formatting strips fold their width-heavy dropdown
+/// into when the editor panel goes narrow (EDTB-4). Shared by both toolbars so
+/// the fold reads identically on each strip. The menu bar itself never overflows
+/// (it is already compact — dropdown buttons), so this lives here only as the
+/// bars' shared vocabulary, alongside [`MenuAction`]/[`MenuContext`].
+pub const OVERFLOW_GLYPH: &str = "\u{00BB}";
+
 /// One action a menu item or Standard-toolbar button dispatches — the EDTB-1
 /// analogue of [`PaletteCommand`](crate::palette::PaletteCommand). Every variant
 /// routes to a real seam in `EditorSurface::run_action` (§7 — no dead entries);

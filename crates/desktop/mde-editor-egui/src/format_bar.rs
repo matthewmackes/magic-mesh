@@ -48,7 +48,7 @@
 use mde_egui::egui::{self, pos2, vec2, Rect, RichText, Sense, Stroke, Ui};
 use mde_egui::Style;
 
-use crate::menu_bar::{ListStyle, MenuAction, MenuContext, WrapMarker};
+use crate::menu_bar::{ListStyle, MenuAction, MenuContext, WrapMarker, OVERFLOW_GLYPH};
 
 /// The Style dropdown's labels, indexed by heading level (0 = Normal body text).
 pub const STYLE_LABELS: [&str; 7] = [
@@ -79,30 +79,27 @@ fn tool(ui: &mut Ui, face: RichText, tip: &'static str, enabled: bool) -> bool {
 /// Render the Formatting toolbar and return the action the operator picked this
 /// frame, if any. One horizontal strip in Word-97 order; every control greys out
 /// with no open document (`cx.has_doc`), exactly like its Format-menu twin.
-pub fn show(ui: &mut Ui, cx: &MenuContext) -> Option<MenuAction> {
+///
+/// When `compact` (EDTB-4 — the panel is narrow), the width-heavy paragraph
+/// **Style** dropdown folds into a trailing `»` overflow instead of leading the
+/// strip inline, so the narrow icon controls (B/I/U/S, lists, indents) keep the
+/// line while every command stays reachable (§7 — relocated, never lost). At
+/// full width the Style dropdown renders in line.
+pub fn show(ui: &mut Ui, cx: &MenuContext, compact: bool) -> Option<MenuAction> {
     let mut action = None;
     let enabled = cx.has_doc;
     ui.horizontal(|ui| {
         ui.add_space(Style::SP_S);
 
-        // Style dropdown → set_heading. Reads back the caret line's current
-        // level so it reflects the document (Word's Style box behavior).
-        let level = usize::from(cx.heading_level.unwrap_or(0)).min(STYLE_LABELS.len() - 1);
-        ui.add_enabled_ui(enabled, |ui| {
-            egui::ComboBox::from_id_salt("editor-style")
-                .selected_text(STYLE_LABELS[level])
-                .show_ui(ui, |ui| {
-                    for (i, label) in STYLE_LABELS.iter().enumerate() {
-                        if ui.selectable_label(i == level, *label).clicked() {
-                            action = Some(MenuAction::Heading(u8::try_from(i).unwrap_or(0)));
-                        }
-                    }
-                })
-                .response
-                .on_hover_text("Paragraph style");
-        });
-
-        ui.separator();
+        // The paragraph Style dropdown is the one width-heavy control (its text
+        // label). Inline at full width; folded into the trailing `»` overflow in
+        // compact so the narrow icon controls keep the line.
+        if !compact {
+            if let Some(picked) = style_dropdown(ui, cx, enabled) {
+                action = Some(picked);
+            }
+            ui.separator();
+        }
 
         // B / I / U / S — the character wraps, each in its own styled face.
         if tool(
@@ -178,6 +175,67 @@ pub fn show(ui: &mut Ui, cx: &MenuContext) -> Option<MenuAction> {
         ) {
             action = Some(MenuAction::Indent(1));
         }
+
+        // EDTB-4 — the compact `»` overflow carrying the folded Style dropdown,
+        // still fully reachable (§7). Greyed with no document, like the inline
+        // dropdown it replaces.
+        if compact {
+            ui.separator();
+            if let Some(picked) = overflow(ui, cx, enabled) {
+                action = Some(picked);
+            }
+        }
+    });
+    action
+}
+
+/// Render the paragraph **Style** dropdown (Normal + Heading 1-6) inline, greyed
+/// with no document; its selected text reads back the caret line's current level
+/// so it reflects the document (Word's Style box behavior). Returns the picked
+/// [`MenuAction::Heading`].
+fn style_dropdown(ui: &mut Ui, cx: &MenuContext, enabled: bool) -> Option<MenuAction> {
+    let level = usize::from(cx.heading_level.unwrap_or(0)).min(STYLE_LABELS.len() - 1);
+    let mut action = None;
+    ui.add_enabled_ui(enabled, |ui| {
+        egui::ComboBox::from_id_salt("editor-style")
+            .selected_text(STYLE_LABELS[level])
+            .show_ui(ui, |ui| {
+                for (i, label) in STYLE_LABELS.iter().enumerate() {
+                    if ui.selectable_label(i == level, *label).clicked() {
+                        action = Some(MenuAction::Heading(u8::try_from(i).unwrap_or(0)));
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Paragraph style");
+    });
+    action
+}
+
+/// The compact `»` overflow menu carrying the folded paragraph **Style** levels
+/// (Normal + Heading 1-6) — the same [`STYLE_LABELS`] set the inline dropdown
+/// offers, emitting the same [`MenuAction::Heading`] (§6), so leaning out the
+/// strip loses no style (§7). Greyed with no document, exactly like the inline
+/// dropdown. Reads back the caret line's level for the check-mark.
+fn overflow(ui: &mut Ui, cx: &MenuContext, enabled: bool) -> Option<MenuAction> {
+    let level = usize::from(cx.heading_level.unwrap_or(0)).min(STYLE_LABELS.len() - 1);
+    let mut action = None;
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.menu_button(OVERFLOW_GLYPH, |ui| {
+            ui.label(
+                RichText::new("Paragraph style")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            );
+            for (i, label) in STYLE_LABELS.iter().enumerate() {
+                if ui.selectable_label(i == level, *label).clicked() {
+                    action = Some(MenuAction::Heading(u8::try_from(i).unwrap_or(0)));
+                    ui.close_menu();
+                }
+            }
+        })
+        .response
+        .on_hover_text("More formatting");
     });
     action
 }
