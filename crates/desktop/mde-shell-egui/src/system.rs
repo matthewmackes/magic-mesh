@@ -30,11 +30,14 @@
 //! shared pump cadence; the same cached snapshot feeds the chrome icons.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
 use mde_egui::{field, muted_note, OsdKind, OsdLevel, Severity, Style, Toast};
+use serde::{Deserialize, Serialize};
 
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{
@@ -112,6 +115,12 @@ pub(crate) struct SystemState {
     /// frame. Loaded from disk on start; saved on change. Safe defaults (idle Never,
     /// lid Suspend) until the operator picks otherwise.
     power_honor_config: PowerHonorConfig,
+    /// The Settings master-detail rail selection (SETTINGS-1) — the domain group +
+    /// section the detail pane rests on. Loaded from disk on start and saved on
+    /// every move, so the surface reopens where the operator left it across a
+    /// surface switch AND a restart (the [`PowerHonorConfig`] client-data-dir JSON
+    /// idiom, reused verbatim).
+    nav: SettingsNav,
 }
 
 impl Default for SystemState {
@@ -134,6 +143,7 @@ impl Default for SystemState {
             pin_input: String::new(),
             pending_toasts: Vec::new(),
             power_honor_config: PowerHonorConfig::load(),
+            nav: SettingsNav::load(),
         }
     }
 }
@@ -272,10 +282,18 @@ impl SystemState {
         self.seat.power(verb)
     }
 
-    /// Render the surface's live content, driving Displays + Power against the seat
-    /// and the shared Instances broker (per-VM power rows, §6).
+    /// Render the surface's live content as a **master-detail** shell (SETTINGS-1):
+    /// a left rail of the three domain groups + a wide right detail pane that
+    /// renders ONLY the selected section's body via the existing per-section fns
+    /// (a layout/routing pass — the bodies + their `apply()`/`SysAction` seams are
+    /// reused verbatim, §6). Drives Displays + Power against the seat and the shared
+    /// Instances broker (per-VM power rows, §6).
     pub(crate) fn show(&mut self, ui: &mut egui::Ui, instances: &mut InstancesState) {
         let mut actions: Vec<SysAction> = Vec::new();
+        // Capture the rail selection before the render borrow so a rail click that
+        // moves it can be detected + persisted afterwards (the same collect-then-
+        // apply idiom the SysActions use — the render can't take `&mut self`).
+        let nav_before = self.nav;
         {
             let Self {
                 snapshot,
@@ -288,44 +306,55 @@ impl SystemState {
                 pairing,
                 pin_input,
                 power_honor_config,
+                nav,
                 ..
             } = self;
             let snap = snapshot.as_ref();
 
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if let Some(err) = error.as_deref() {
-                        ui.colored_label(Style::DANGER, RichText::new(err).size(Style::SMALL));
-                        ui.add_space(Style::SP_S);
-                    }
-                    section(ui, "Mixer", |ui| mixer_section(ui, snap));
-                    section(ui, "Bluetooth", |ui| {
-                        bluetooth_section(ui, snap, &mut actions);
-                    });
-                    section(ui, "Displays", |ui| {
-                        displays_section(
-                            ui,
-                            snap,
-                            layout,
-                            panel_brightness,
-                            ddc_brightness,
-                            &mut actions,
-                        );
-                    });
-                    section(ui, "Power & Battery", |ui| {
-                        power_section(
-                            ui,
-                            snap,
-                            *confirm,
-                            charge_threshold,
-                            power_honor_config,
-                            instances,
-                            &mut actions,
-                        );
-                    });
-                    section(ui, "Wallpaper", wallpaper_section);
-                    section(ui, "Hotkeys", hotkeys_section);
+            // The master rail: the three domain groups + their section rows. A row
+            // click moves `nav` (persisted after the borrow). The per-domain accent
+            // tint + Carbon elevation layers are SETTINGS-2's pass — this unit is a
+            // plain expressive master-detail; the accent seam is the group header
+            // (see [`settings_rail`]).
+            egui::SidePanel::left(ui.id().with("settings-rail"))
+                .resizable(false)
+                .exact_width(Style::SP_XL * 6.0)
+                .frame(egui::Frame::NONE.inner_margin(Style::SP_M))
+                .show_inside(ui, |ui| settings_rail(ui, nav));
+
+            // The (possibly just-clicked) selection, copied out so the detail pane's
+            // closure doesn't re-borrow `nav`.
+            let selected = nav.section;
+
+            // The detail pane fills the remaining width and renders only the selected
+            // section's body — expressive spacing, the whole right side.
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE.inner_margin(Style::SP_L))
+                .show_inside(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if let Some(err) = error.as_deref() {
+                                ui.colored_label(
+                                    Style::DANGER,
+                                    RichText::new(err).size(Style::SMALL),
+                                );
+                                ui.add_space(Style::SP_S);
+                            }
+                            settings_detail(
+                                ui,
+                                selected,
+                                snap,
+                                layout,
+                                panel_brightness,
+                                ddc_brightness,
+                                *confirm,
+                                charge_threshold,
+                                power_honor_config,
+                                instances,
+                                &mut actions,
+                            );
+                        });
                 });
 
             // The BlueZ pairing modal (E12-17): a ctx-level dialog that shows only
@@ -333,6 +362,12 @@ impl SystemState {
             // bridge the registered agent posts to. Rendered here so it lives only
             // while the System surface is shown, never blocking the render thread.
             pairing_dialog(ui.ctx(), pairing, pin_input);
+        }
+        // Persist a moved rail selection across surface switches + restart (the
+        // client-data-dir JSON idiom `PowerHonorConfig` uses). Only a real move
+        // writes — an unchanged render never re-saves (§7: no inert write).
+        if self.nav != nav_before {
+            self.nav.save();
         }
         self.apply(actions, instances);
     }
@@ -753,18 +788,320 @@ impl SystemState {
     }
 }
 
+// ──────────────────────────── master-detail nav (SETTINGS-1) ────────────────────────────
+
+/// One rail leaf of the Settings master-detail shell (SETTINGS-1): the six existing
+/// host-control sections plus the honest-empty Mesh & System placeholders SETTINGS-4
+/// fills. Each belongs to exactly one [`SettingsGroup`]; the pair the rail rests on
+/// is a [`SettingsNav`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SettingsSection {
+    /// Per-output enable / mode / arrangement + brightness (`displays_section`).
+    #[default]
+    Displays,
+    /// The mixer strips (`mixer_section`) — labelled "Audio" in the rail.
+    Audio,
+    /// Adapters + devices (`bluetooth_section`).
+    Bluetooth,
+    /// Logind verbs + profiles + batteries + per-VM rows (`power_section`).
+    Power,
+    /// The desktop backdrop picker (`wallpaper_section`).
+    Wallpaper,
+    /// The compiled-in hotkey table (`hotkeys_section`).
+    Hotkeys,
+    /// Mesh identity — honest-empty until SETTINGS-4.
+    Identity,
+    /// Node role pin — honest-empty until SETTINGS-4.
+    Role,
+    /// Mesh pairing — honest-empty until SETTINGS-4.
+    Pairing,
+    /// Overlay/underlay network facts — honest-empty until SETTINGS-4.
+    Network,
+}
+
+impl SettingsSection {
+    /// The rail + detail-header label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Displays => "Displays",
+            Self::Audio => "Audio",
+            Self::Bluetooth => "Bluetooth",
+            Self::Power => "Power & Battery",
+            Self::Wallpaper => "Wallpaper",
+            Self::Hotkeys => "Hotkeys",
+            Self::Identity => "Identity",
+            Self::Role => "Role",
+            Self::Pairing => "Pairing",
+            Self::Network => "Network",
+        }
+    }
+
+    /// The domain group this section lives under (the single source of truth the
+    /// rail + [`SettingsNav`] normalise against).
+    const fn group(self) -> SettingsGroup {
+        match self {
+            Self::Displays | Self::Audio | Self::Bluetooth | Self::Power => SettingsGroup::Devices,
+            Self::Wallpaper | Self::Hotkeys => SettingsGroup::Personalization,
+            Self::Identity | Self::Role | Self::Pairing | Self::Network => {
+                SettingsGroup::MeshSystem
+            }
+        }
+    }
+
+    /// Whether a section is wired to a real body (the six existing sections) rather
+    /// than an honest-empty Mesh & System placeholder. A taxonomy invariant the
+    /// tests assert; the live routing is the exhaustive match in [`settings_detail`],
+    /// so this stays test-only.
+    #[cfg(test)]
+    const fn is_wired(self) -> bool {
+        matches!(
+            self,
+            Self::Displays
+                | Self::Audio
+                | Self::Bluetooth
+                | Self::Power
+                | Self::Wallpaper
+                | Self::Hotkeys
+        )
+    }
+}
+
+/// A domain group — the top level of the master rail (lock 3). Scales as sections
+/// grow; the taxonomy places every section exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SettingsGroup {
+    /// Displays · Audio · Bluetooth · Power & Battery.
+    #[default]
+    Devices,
+    /// Wallpaper · Hotkeys.
+    Personalization,
+    /// Identity · Role · Pairing · Network (honest-empty until SETTINGS-4).
+    MeshSystem,
+}
+
+impl SettingsGroup {
+    /// The three domain groups, in rail order.
+    const ALL: [Self; 3] = [Self::Devices, Self::Personalization, Self::MeshSystem];
+
+    /// The rail header label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Devices => "Devices",
+            Self::Personalization => "Personalization",
+            Self::MeshSystem => "Mesh & System",
+        }
+    }
+
+    /// This group's sections, in rail order.
+    const fn sections(self) -> &'static [SettingsSection] {
+        match self {
+            Self::Devices => &[
+                SettingsSection::Displays,
+                SettingsSection::Audio,
+                SettingsSection::Bluetooth,
+                SettingsSection::Power,
+            ],
+            Self::Personalization => &[SettingsSection::Wallpaper, SettingsSection::Hotkeys],
+            Self::MeshSystem => &[
+                SettingsSection::Identity,
+                SettingsSection::Role,
+                SettingsSection::Pairing,
+                SettingsSection::Network,
+            ],
+        }
+    }
+}
+
+/// The client-data-dir file the rail selection persists to (the `PowerHonorConfig`
+/// idiom — one small JSON per shell preference).
+const NAV_CONFIG_FILE: &str = "settings-nav.json";
+
+/// The Settings rail selection (SETTINGS-1): the domain group + section the
+/// master-detail rail last rested on. Persisted so the surface reopens where the
+/// operator left it — across a surface switch AND a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct SettingsNav {
+    /// The active domain group (always re-derived from `section` so the pair can
+    /// never present an inconsistent state, §7).
+    #[serde(default)]
+    group: SettingsGroup,
+    /// The active section — the rail leaf the detail pane renders.
+    #[serde(default)]
+    section: SettingsSection,
+}
+
+impl Default for SettingsNav {
+    fn default() -> Self {
+        Self::at(SettingsSection::Displays)
+    }
+}
+
+impl SettingsNav {
+    /// The nav resting on `section`, its group derived so the pair is always
+    /// consistent (the only constructor a rail click uses).
+    const fn at(section: SettingsSection) -> Self {
+        Self {
+            group: section.group(),
+            section,
+        }
+    }
+
+    /// Re-derive the group from the section so a hand-edited / schema-drifted file
+    /// can never present an inconsistent pair (§7 — the section wins).
+    const fn normalized(self) -> Self {
+        Self::at(self.section)
+    }
+
+    /// The default nav path (`<client-data-dir>/settings-nav.json`), or `None` when
+    /// no data dir resolves (a headless context) — mirrors `PowerHonorConfig`.
+    fn default_path() -> Option<PathBuf> {
+        mde_bus::client_data_dir().map(|d| d.join(NAV_CONFIG_FILE))
+    }
+
+    /// Load from `path`, folding a missing / malformed file to the default (never a
+    /// fatal) and normalising the group against the section.
+    fn load_from(path: &Path) -> Self {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+            .map_or_else(Self::default, Self::normalized)
+    }
+
+    /// Load from the default path (default when absent / unresolvable).
+    #[must_use]
+    fn load() -> Self {
+        Self::default_path().map_or_else(Self::default, |p| Self::load_from(&p))
+    }
+
+    /// Write to `path` (atomic temp + rename, like `PowerHonorConfig`). Takes `self`
+    /// by value — the nav is a 2-byte `Copy`.
+    ///
+    /// # Errors
+    /// The [`std::io::Error`] if the dir cannot be created or the file cannot be
+    /// written / renamed.
+    fn save_to(self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Persist to the default path (a silent no-op when no data dir resolves).
+    fn save(self) {
+        if let Some(path) = Self::default_path() {
+            let _ = self.save_to(&path);
+        }
+    }
+}
+
 // ──────────────────────────── render ────────────────────────────
 
-/// A titled section: a dim caption over a grouped card. The shared surface idiom.
-fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+/// The master rail (SETTINGS-1): the three domain groups, each an expressive header
+/// over its selectable section rows. The active section is highlighted; a click
+/// moves `nav`. SEAM — SETTINGS-2 tints each group header + the active-row marker in
+/// the group's categorical accent (the shared `Style::ACCENT_*` set, §4); this unit
+/// stays plain.
+fn settings_rail(ui: &mut egui::Ui, nav: &mut SettingsNav) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (i, group) in SettingsGroup::ALL.iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(Style::SP_M);
+                }
+                ui.label(
+                    RichText::new(group.label())
+                        .color(Style::TEXT_DIM)
+                        .size(Style::SMALL)
+                        .strong(),
+                );
+                ui.add_space(Style::SP_XS);
+                for &section in group.sections() {
+                    let selected = nav.section == section;
+                    let row = ui.add_sized(
+                        [ui.available_width(), Style::SP_L],
+                        egui::SelectableLabel::new(
+                            selected,
+                            RichText::new(section.label()).size(Style::BODY),
+                        ),
+                    );
+                    if row.clicked() {
+                        *nav = SettingsNav::at(section);
+                    }
+                }
+            }
+        });
+}
+
+/// The detail pane (SETTINGS-1): an expressive header over the selected section's
+/// body, rendered by calling the EXISTING per-section fn verbatim (§6 — no forked
+/// logic; every `apply()`/`SysAction` seam is reused). The Mesh & System placeholders
+/// render an honest-empty note until SETTINGS-4 wires them.
+#[allow(clippy::too_many_arguments)] // one router legibly threading the live section refs
+fn settings_detail(
+    ui: &mut egui::Ui,
+    section: SettingsSection,
+    snap: Option<&SeatSnapshot>,
+    layout: &DisplayLayout,
+    panel_brightness: &mut BTreeMap<String, u8>,
+    ddc_brightness: &mut BTreeMap<String, u8>,
+    confirm: Option<PowerVerb>,
+    charge_threshold: &mut Option<u8>,
+    power_honor_config: &mut PowerHonorConfig,
+    instances: &InstancesState,
+    actions: &mut Vec<SysAction>,
+) {
+    // Expressive header — the active section's title in the large type scale. SEAM:
+    // SETTINGS-2 tints this in the group accent (`section.group()`).
     ui.label(
-        RichText::new(title)
-            .color(Style::TEXT_DIM)
-            .size(Style::SMALL)
+        RichText::new(section.label())
+            .color(Style::TEXT)
+            .size(Style::HEADING)
             .strong(),
     );
-    ui.group(body);
-    ui.add_space(Style::SP_S);
+    ui.add_space(Style::SP_M);
+    ui.group(|ui| match section {
+        SettingsSection::Displays => {
+            displays_section(ui, snap, layout, panel_brightness, ddc_brightness, actions)
+        }
+        SettingsSection::Audio => mixer_section(ui, snap),
+        SettingsSection::Bluetooth => bluetooth_section(ui, snap, actions),
+        SettingsSection::Power => power_section(
+            ui,
+            snap,
+            confirm,
+            charge_threshold,
+            power_honor_config,
+            instances,
+            actions,
+        ),
+        SettingsSection::Wallpaper => wallpaper_section(ui),
+        SettingsSection::Hotkeys => hotkeys_section(ui),
+        SettingsSection::Identity
+        | SettingsSection::Role
+        | SettingsSection::Pairing
+        | SettingsSection::Network => settings_placeholder(ui, section),
+    });
+}
+
+/// An honest-empty Mesh & System placeholder (§7): a not-yet-wired note, never a
+/// fake control. SETTINGS-4 replaces this with the real identity/role/pairing/network
+/// bodies keyed off the node's own state.
+fn settings_placeholder(ui: &mut egui::Ui, section: SettingsSection) {
+    muted_note(
+        ui,
+        format!(
+            "{} settings are not wired yet — Mesh & System lands in SETTINGS-4.",
+            section.label()
+        ),
+    );
 }
 
 /// Fold a snapshot [`Probe`] into its render: not-yet-polled → "reading…",
@@ -1383,24 +1720,39 @@ fn power_section(
     // power-profiles-daemon is Absent the probe renders the honest "unavailable"
     // reason, never a fabricated active (§7).
     ui.add_space(Style::SP_XS);
-    probe_section(ui, snap, |s| &s.power_profile, |ui, state| {
-        power_settings::profile_body(ui, state, actions);
-    });
+    probe_section(
+        ui,
+        snap,
+        |s| &s.power_profile,
+        |ui, state| {
+            power_settings::profile_body(ui, state, actions);
+        },
+    );
 
     // On-AC / on-battery source line (POWER-4) — the honest UPower LinePower
     // reading, "unknown" when no adapter is tracked, "unavailable" when Absent.
     ui.add_space(Style::SP_XS);
-    probe_section(ui, snap, |s| &s.on_ac, |ui, on_ac: &Option<bool>| {
-        power_settings::ac_source_body(ui, *on_ac);
-    });
+    probe_section(
+        ui,
+        snap,
+        |s| &s.on_ac,
+        |ui, on_ac: &Option<bool>| {
+            power_settings::ac_source_body(ui, *on_ac);
+        },
+    );
 
     // Charge limit (POWER-4) — the charge-stop cap slider when a battery
     // advertises the attribute, an honest "not supported" when Present(None), and
     // the probe's "unavailable" reason when Absent (no power-supply class).
     ui.add_space(Style::SP_XS);
-    probe_section(ui, snap, |s| &s.charge_limit, |ui, cap: &Option<u8>| {
-        power_settings::charge_threshold_body(ui, *cap, charge_threshold, actions);
-    });
+    probe_section(
+        ui,
+        snap,
+        |s| &s.charge_limit,
+        |ui, cap: &Option<u8>| {
+            power_settings::charge_threshold_body(ui, *cap, charge_threshold, actions);
+        },
+    );
 
     // Batteries (multi + peripherals, lock 6) + rich telemetry (POWER-4).
     ui.add_space(Style::SP_XS);
@@ -1978,5 +2330,151 @@ mod tests {
             !st.agent_attempted,
             "no adapter ⇒ no agent registration attempt"
         );
+    }
+
+    // ── Settings master-detail shell (SETTINGS-1) ─────────────────────────────
+
+    /// A unique per-test temp dir (the manual idiom `power_honor`'s tests use — no
+    /// tempfile dep on the airgapped farm).
+    fn nav_temp_dir(tag: &str) -> PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("mde-settings1-{tag}-{}-{n}", std::process::id()))
+    }
+
+    #[test]
+    fn the_rail_lists_the_three_domain_groups_covering_every_section() {
+        // The master rail is exactly the three domain groups (lock 3), each with at
+        // least one section, and every listed section names the group that lists it
+        // (no orphan / mis-grouped leaf).
+        assert_eq!(SettingsGroup::ALL.len(), 3);
+        for group in SettingsGroup::ALL {
+            assert!(
+                !group.sections().is_empty(),
+                "{} has no sections",
+                group.label()
+            );
+            for &section in group.sections() {
+                assert_eq!(
+                    section.group(),
+                    group,
+                    "{} is listed under the wrong group",
+                    section.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_existing_section_is_reachable_exactly_once_and_wired() {
+        // The six existing host-control sections each appear exactly once across the
+        // whole taxonomy and route to a real body; the Mesh & System leaves are the
+        // honest-empty placeholders (not wired until SETTINGS-4).
+        let all: Vec<SettingsSection> = SettingsGroup::ALL
+            .iter()
+            .flat_map(|g| g.sections().iter().copied())
+            .collect();
+        for existing in [
+            SettingsSection::Displays,
+            SettingsSection::Audio,
+            SettingsSection::Bluetooth,
+            SettingsSection::Power,
+            SettingsSection::Wallpaper,
+            SettingsSection::Hotkeys,
+        ] {
+            assert_eq!(
+                all.iter().filter(|&&s| s == existing).count(),
+                1,
+                "{} must be reachable exactly once",
+                existing.label()
+            );
+            assert!(existing.is_wired(), "{} must be wired", existing.label());
+        }
+        for placeholder in [
+            SettingsSection::Identity,
+            SettingsSection::Role,
+            SettingsSection::Pairing,
+            SettingsSection::Network,
+        ] {
+            assert!(
+                !placeholder.is_wired(),
+                "{} is an honest-empty placeholder until SETTINGS-4",
+                placeholder.label()
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_each_section_routes_the_detail_pane_and_paints() {
+        // Drive a headless frame per section with the rail resting on it: the detail
+        // pane must tessellate real geometry (route to that body / honest-empty note,
+        // never blank), and a click-free render leaves the selection put.
+        for group in SettingsGroup::ALL {
+            for &section in group.sections() {
+                let mut st = SystemState {
+                    nav: SettingsNav::at(section),
+                    ..SystemState::default()
+                };
+                let mut inst = InstancesState::default();
+                assert!(
+                    renders(&mut st, &mut inst),
+                    "the detail pane for {} drew nothing",
+                    section.label()
+                );
+                assert_eq!(
+                    st.nav.section, section,
+                    "a click-free render must not move the selection"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_nav_selection_round_trips_through_disk_persistence() {
+        // A moved rail selection survives a restart: write it through the real
+        // save_to/load_from seam (the PowerHonorConfig idiom) and read it back; a
+        // missing file folds to the default (Displays), never a fatal.
+        let dir = nav_temp_dir("rt");
+        std::fs::create_dir_all(&dir).expect("mkroot");
+        let path = dir.join(NAV_CONFIG_FILE);
+
+        assert_eq!(
+            SettingsNav::load_from(&path),
+            SettingsNav::default(),
+            "a missing file folds to the default"
+        );
+        assert_eq!(SettingsNav::default().section, SettingsSection::Displays);
+
+        let nav = SettingsNav::at(SettingsSection::Hotkeys);
+        nav.save_to(&path).expect("save");
+        let back = SettingsNav::load_from(&path);
+        assert_eq!(back, nav, "the pick round-trips through disk");
+        assert_eq!(back.section, SettingsSection::Hotkeys);
+        assert_eq!(back.group, SettingsGroup::Personalization);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_group_in_the_file_is_normalised_against_the_section() {
+        // A hand-edited / schema-drifted file whose group doesn't own its section is
+        // folded so the pair is always consistent (§7 — the section wins). Also
+        // exercises the snake_case serde wire form.
+        let dir = nav_temp_dir("norm");
+        std::fs::create_dir_all(&dir).expect("mkroot");
+        let path = dir.join(NAV_CONFIG_FILE);
+        std::fs::write(&path, r#"{"group":"devices","section":"hotkeys"}"#).expect("write");
+
+        let nav = SettingsNav::load_from(&path);
+        assert_eq!(nav.section, SettingsSection::Hotkeys);
+        assert_eq!(
+            nav.group,
+            SettingsGroup::Personalization,
+            "the group is re-derived from the section"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

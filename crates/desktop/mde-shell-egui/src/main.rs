@@ -630,13 +630,17 @@ impl Shell {
             }
             Surface::System => {
                 // This seat's host controls, folded from the one `mde-seat` Seat
-                // (E12-15). Scoped under its own `push_id` like every mounted
-                // surface so its egui ids can't collide in the shell's one
-                // `Context`. The snapshot is refreshed in `render` (it also feeds
-                // the taskbar tray's icons), so the panel only renders here.
-                // The System panel drives Displays + Power live (E12-18); its
-                // per-VM power rows reuse the Instances broker (§6), so it takes a
-                // `&mut` to that roster — two disjoint field borrows of the shell.
+                // (E12-15). Under SETTINGS-1 the surface is a master-detail shell —
+                // `system.show` draws the left domain-group rail + the wide detail
+                // pane, routing to each existing section body verbatim (§6) and
+                // persisting the rail selection itself. Scoped under its own
+                // `push_id` like every mounted surface so its egui ids can't collide
+                // in the shell's one `Context`. The snapshot is refreshed in
+                // `render` (it also feeds the taskbar tray's icons), so the panel
+                // only renders here. The System panel drives Displays + Power live
+                // (E12-18); its per-VM power rows reuse the Instances broker (§6),
+                // so it takes a `&mut` to that roster — two disjoint field borrows
+                // of the shell.
                 let system = &mut self.system;
                 let instances = &mut self.instances;
                 ui.push_id("shell-system", |ui| {
