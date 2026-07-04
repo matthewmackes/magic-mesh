@@ -336,9 +336,51 @@ struct Unit {
     last_seen_ms: u64,
 }
 
+/// The kind of a derived relationship between two units — a **local** mirror of
+/// the aggregator's `edges::EdgeKind` (EXPLORER-7, design E2). The variant names
+/// AND the `rename_all` MUST match the worker's enum so the wire tokens
+/// (`mesh_tunnel` / `cloud_attach` / `l2_l3_adjacency` / `host_placement` /
+/// `storage_usage`) decode byte-for-byte (§6 — mirror the contract, never link the
+/// daemon crate). An unknown future kind fails only that edge's parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EdgeKind {
+    /// A mesh tunnel between two peers — direct or relayed via a lighthouse.
+    MeshTunnel,
+    /// A cloud attachment: instance→network/volume/image, network→subnet/router.
+    CloudAttach,
+    /// L2/L3 adjacency: two LAN hosts sharing a subnet (one broadcast domain).
+    L2L3Adjacency,
+    /// Host placement: a cloud object runs on a mesh node (the DCIM relation).
+    HostPlacement,
+    /// Storage usage: a volume attached to an instance / backed by a pool.
+    StorageUsage,
+}
+
+/// One typed relationship between two units — a **local** mirror of the
+/// aggregator's `edges::Edge` (EXPLORER-7, design E8). `from`/`to` are the fold's
+/// stable unit ids (`peer:` / `lan:` / `cloud:<kind>:`) — except the not-modelled
+/// subnet/router/pool endpoints, which carry their own prefixed ids; a chip only
+/// jumps when the endpoint resolves to a unit on the shelf (§7 — every chip a real
+/// hero, never a dead link).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct Edge {
+    /// The relation kind (drives the chip section).
+    kind: EdgeKind,
+    /// The source unit id.
+    from: String,
+    /// The target unit id (or a non-unit subnet/router/pool endpoint id).
+    to: String,
+    /// A short human-readable qualifier (`direct` / `runs on node-a` …); absent
+    /// when the worker had nothing to add.
+    #[serde(default)]
+    detail: Option<String>,
+}
+
 /// The body published to `state/units/<node>` — a mirror of the aggregator's
-/// `UnitsState` (only the fields the shell reads; `edges`/`published_at_ms` are
-/// ignored by serde until EXPLORER-8 renders edge chips).
+/// `UnitsState` (the fields the shell reads; `published_at_ms` stays ignored). The
+/// typed `edges` set (EXPLORER-7) rides alongside the units and drives the
+/// hero-card edge chips (EXPLORER-8).
 #[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 #[serde(default)]
 struct UnitsState {
@@ -346,6 +388,8 @@ struct UnitsState {
     host: String,
     /// Every unit that node folded.
     units: Vec<Unit>,
+    /// The typed relationships derived from the same unioned sources (EXPLORER-7).
+    edges: Vec<Edge>,
 }
 
 // ─────────────────────────── category identity ───────────────────────────
@@ -743,6 +787,92 @@ fn proximity_rank(unit: &Unit, self_id: &str) -> u8 {
     }
 }
 
+/// Union every node's published edge set into one, deduped by the `(kind, from,
+/// to)` triple. Each node already derives + dedups its own set (EXPLORER-7), but a
+/// peer that mirrors another node's view republishes the same edges, so the union
+/// collapses those cross-node duplicates. Pure — the chip region's data model,
+/// unit-tested without a Bus.
+fn fold_edges(states: &[UnitsState]) -> Vec<Edge> {
+    let mut seen: HashSet<(EdgeKind, String, String)> = HashSet::new();
+    let mut edges = Vec::new();
+    for state in states {
+        for edge in &state.edges {
+            if seen.insert((edge.kind, edge.from.clone(), edge.to.clone())) {
+                edges.push(edge.clone());
+            }
+        }
+    }
+    edges
+}
+
+// ─────────────────── edge-chip grouping (EXPLORER-8, design E1/E6) ───────────────────
+
+/// One jump chip: a related unit reachable from the focused hero over an edge —
+/// its name + kind glyph, and the id the click jumps focus to. Only units actually
+/// on the shelf become chips (§7 — a chip always lands on a real hero, never a dead
+/// subnet/router/pool endpoint the aggregator left unmodelled).
+#[derive(Debug, Clone, PartialEq)]
+struct ChipItem {
+    /// The neighbour unit id the chip jumps to.
+    id: String,
+    /// Its display name.
+    name: String,
+    /// Its kind (drives the glyph + category accent).
+    kind: UnitKind,
+}
+
+/// One grouped chip section on the hero card: a header (the design's Tunnels /
+/// Networks / Volumes / Same subnet / Runs on `<node>` / Storage) + its row of
+/// jump chips. A section only exists when it has ≥1 chip (absent kinds omitted).
+#[derive(Debug, Clone, PartialEq)]
+struct EdgeSection {
+    /// The section header.
+    header: String,
+    /// Its jump chips, ordered by neighbour name.
+    chips: Vec<ChipItem>,
+}
+
+/// The other endpoint of `edge` relative to the focused unit `focus_id`, or `None`
+/// when the edge isn't incident to it. Handles both symmetric (peer↔peer,
+/// host↔host) and directed edges — the focus can sit on either end.
+fn neighbor_of<'a>(edge: &'a Edge, focus_id: &str) -> Option<&'a str> {
+    if edge.from == focus_id {
+        Some(edge.to.as_str())
+    } else if edge.to == focus_id {
+        Some(edge.from.as_str())
+    } else {
+        None
+    }
+}
+
+/// The host node name a `HostPlacement` edge names — its directed `to` endpoint is
+/// always the node's `peer:<node>` unit, so strip that prefix (falling back to the
+/// raw id if the shape ever drifts).
+fn placement_node(edge: &Edge) -> &str {
+    edge.to.strip_prefix("peer:").unwrap_or(&edge.to)
+}
+
+/// The chip section an incident `edge` falls under, from the focused unit's view:
+/// its display rank (the design's ordering — Tunnels, Networks, Volumes, …, Same
+/// subnet, Runs on `<node>`, Storage) + the section header. A cloud attachment is
+/// grouped by what the neighbour **is** (so it reads correctly whichever end is
+/// focused): a network → Networks, a volume → Volumes, an image → Images, and the
+/// reverse (an instance) → Instances.
+fn section_for(edge: &Edge, neighbor: &Unit) -> (u8, String) {
+    match edge.kind {
+        EdgeKind::MeshTunnel => (0, "Tunnels".to_string()),
+        EdgeKind::CloudAttach => match neighbor.kind {
+            UnitKind::Network => (1, "Networks".to_string()),
+            UnitKind::Volume => (2, "Volumes".to_string()),
+            UnitKind::Image => (3, "Images".to_string()),
+            _ => (4, "Instances".to_string()),
+        },
+        EdgeKind::L2L3Adjacency => (5, "Same subnet".to_string()),
+        EdgeKind::HostPlacement => (6, format!("Runs on {}", placement_node(edge))),
+        EdgeKind::StorageUsage => (7, "Storage".to_string()),
+    }
+}
+
 // ─────────────────────────── text helpers ───────────────────────────
 
 /// The reachability line (#10): "In mesh" / "On LAN" / "Cloud object · <node>",
@@ -1017,6 +1147,9 @@ pub struct ExplorerState {
     local_host: String,
     /// The folded shelf: deduped, self-first, proximity-ordered.
     units: Vec<Unit>,
+    /// The folded typed edge set (EXPLORER-7) — every node's mirror unioned +
+    /// deduped, the source of the hero-card edge chips (EXPLORER-8).
+    edges: Vec<Edge>,
     /// Rolling per-unit telemetry history keyed by unit id — the sparkline source
     /// (EXPLORER-4), sampled each refresh from real readings only (§7).
     history: HashMap<String, UnitHistory>,
@@ -1044,6 +1177,7 @@ impl Default for ExplorerState {
             }),
             local_host: local_hostname(),
             units: Vec::new(),
+            edges: Vec::new(),
             history: HashMap::new(),
             focus: 0,
             filter: None,
@@ -1077,6 +1211,7 @@ impl ExplorerState {
     /// never a panic.
     fn refresh(&mut self) {
         let states = self.client.read();
+        self.edges = fold_edges(&states);
         self.units = fold_units(&states, &self.local_host);
         self.sample_history();
     }
@@ -1149,6 +1284,78 @@ impl ExplorerState {
         if self.filter != filter {
             self.filter = filter;
             self.focus = 0;
+        }
+    }
+
+    // ─────────────────── edge chips + jump (EXPLORER-8) ───────────────────
+
+    /// The focused unit's incident edges (EXPLORER-7), grouped into the design's
+    /// chip sections (E6) in display order — one section per edge kind present,
+    /// each a row of jump chips to the related units. Only edges whose neighbour
+    /// resolves to a unit **on the shelf** yield a chip (a subnet/router/pool
+    /// endpoint isn't a hero, so it can't be jumped to — omitted, §7); a section
+    /// with no such chip is dropped, so no empty header ever shows. Pure over the
+    /// folded state — unit-tested without a render.
+    fn grouped_edges(&self, focus: &Unit) -> Vec<EdgeSection> {
+        let by_id: HashMap<&str, &Unit> = self.units.iter().map(|u| (u.id.as_str(), u)).collect();
+        // rank → (header, chips); the BTreeMap keeps the design's section order.
+        let mut groups: std::collections::BTreeMap<u8, (String, Vec<ChipItem>)> =
+            std::collections::BTreeMap::new();
+        // Dedup a neighbour within a section (two edges of one kind to the same
+        // unit collapse to one chip).
+        let mut seen: HashSet<(u8, String)> = HashSet::new();
+        for edge in &self.edges {
+            let Some(neighbor_id) = neighbor_of(edge, &focus.id) else {
+                continue;
+            };
+            let Some(neighbor) = by_id.get(neighbor_id).copied() else {
+                continue;
+            };
+            let (rank, header) = section_for(edge, neighbor);
+            if !seen.insert((rank, neighbor_id.to_string())) {
+                continue;
+            }
+            groups
+                .entry(rank)
+                .or_insert_with(|| (header, Vec::new()))
+                .1
+                .push(ChipItem {
+                    id: neighbor.id.clone(),
+                    name: neighbor.name.clone(),
+                    kind: neighbor.kind,
+                });
+        }
+        groups
+            .into_values()
+            .map(|(header, mut chips)| {
+                chips.sort_by(|a, b| {
+                    a.name
+                        .to_lowercase()
+                        .cmp(&b.name.to_lowercase())
+                        .then_with(|| a.id.cmp(&b.id))
+                });
+                EdgeSection { header, chips }
+            })
+            .collect()
+    }
+
+    /// Jump the hero focus to the unit `id` (a chip click). Reuses the surface's
+    /// one focus-set path — the `focus` index into the filtered view — resolving
+    /// the neighbour's position; when the active category filter would hide it, the
+    /// filter clears so the jump always lands. A stale arm/note from the old focus
+    /// is dropped. A no-op if the id has left the shelf.
+    fn jump_to_id(&mut self, id: &str) {
+        let Some(abs) = self.units.iter().position(|u| u.id == id) else {
+            return;
+        };
+        let cat = self.units[abs].kind.category();
+        if self.filter.is_some_and(|f| f != cat) {
+            self.filter = None;
+        }
+        if let Some(pos) = self.filtered_indices().iter().position(|&i| i == abs) {
+            self.focus = pos;
+            self.arm = None;
+            self.last_action_note = None;
         }
     }
 
@@ -1258,6 +1465,42 @@ impl ExplorerState {
             } else {
                 Style::TEXT_DIM
             }));
+        }
+    }
+
+    /// The grouped edge-chip region under the card (EXPLORER-8, design E1/E6): the
+    /// focused unit's related units, grouped by relationship (Tunnels / Networks /
+    /// Volumes / Same subnet / Runs on `<node>` / Storage), each a row of chips
+    /// that jump the hero focus to the neighbour. Absent sections are simply not
+    /// drawn (no empty header, §7). The whole region is skipped when the unit has
+    /// no jumpable edges.
+    fn edge_chips(&mut self, ui: &mut egui::Ui, unit: &Unit) {
+        let sections = self.grouped_edges(unit);
+        if sections.is_empty() {
+            return;
+        }
+        ui.add_space(Style::SP_M);
+        let mut jump: Option<String> = None;
+        for section in &sections {
+            ui.add_space(Style::SP_S);
+            ui.label(
+                RichText::new(&section.header)
+                    .size(Style::SMALL)
+                    .strong()
+                    .color(Style::TEXT_DIM),
+            );
+            ui.add_space(Style::SP_XS);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::splat(Style::SP_XS);
+                for chip in &section.chips {
+                    if edge_chip(ui, chip) {
+                        jump = Some(chip.id.clone());
+                    }
+                }
+            });
+        }
+        if let Some(id) = jump {
+            self.jump_to_id(&id);
         }
     }
 
@@ -1465,6 +1708,9 @@ impl ExplorerState {
                 }
                 // The EXPLORER-5 launchpad: real per-type verbs under the card.
                 self.action_bar(&mut child, &unit);
+                // The EXPLORER-8 connectivity region: grouped edge chips that jump
+                // the hero focus to the unit's related neighbours.
+                self.edge_chips(&mut child, &unit);
             }
             None if self.filter.is_none() => {
                 // #23 — no mirror yet: show THIS node, discovering.
@@ -1629,6 +1875,60 @@ fn chip(ui: &mut egui::Ui, label: &str, active: bool, accent: Color32) -> bool {
             if active { accent } else { Style::BORDER },
         ));
     ui.add(button).clicked()
+}
+
+/// One edge jump chip (EXPLORER-8): a mini kind glyph + the neighbour's name in a
+/// clickable pill, the border tinted with the neighbour's category accent (the
+/// EXPLORER-15 / PICKER category-accent language, §4 tokens — no raw hex). Returns
+/// whether it was clicked (the hero-focus jump). Hand-painted (a glyph beside text)
+/// rather than an `egui::Button` so the procedural kind glyph rides inside.
+fn edge_chip(ui: &mut egui::Ui, chip: &ChipItem) -> bool {
+    let accent = chip.kind.category().accent();
+    let galley = ui.painter().layout_no_wrap(
+        truncate(&chip.name, 18),
+        FontId::proportional(Style::SMALL),
+        Style::TEXT,
+    );
+    let glyph = Style::SP_M;
+    let pad = Style::SP_S;
+    let gap = Style::SP_XS;
+    let w = pad + glyph + gap + galley.size().x + pad;
+    let h = glyph.max(galley.size().y) + Style::SP_XS * 2.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
+    let hovered = resp.hovered();
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        Style::RADIUS,
+        if hovered {
+            Style::SURFACE_HI
+        } else {
+            Style::SURFACE
+        },
+    );
+    painter.rect_stroke(
+        rect,
+        Style::RADIUS,
+        Stroke::new(1.0, if hovered { accent } else { Style::BORDER }),
+        StrokeKind::Inside,
+    );
+    paint_kind_glyph(
+        painter,
+        egui::pos2(rect.min.x + pad + glyph * 0.5, rect.center().y),
+        glyph * 0.42,
+        chip.kind,
+        accent,
+    );
+    let text_h = galley.size().y;
+    painter.galley(
+        egui::pos2(
+            rect.min.x + pad + glyph + gap,
+            rect.center().y - text_h * 0.5,
+        ),
+        galley,
+        Style::TEXT,
+    );
+    resp.on_hover_text(&chip.name).clicked()
 }
 
 /// A thin vertical category divider + rotated-free label between filmstrip
@@ -2071,6 +2371,7 @@ mod tests {
                 client: Box::new(FakeUnits(states)),
                 local_host: host.to_string(),
                 units: Vec::new(),
+                edges: Vec::new(),
                 history: HashMap::new(),
                 focus: 0,
                 filter: None,
@@ -2147,7 +2448,8 @@ mod tests {
     #[test]
     fn wire_mirror_decodes_a_real_aggregator_body_ignoring_daemon_only_fields() {
         // Byte-for-byte the shape `unit_aggregator::UnitsState` serialises, incl.
-        // the `edges` / `published_at_ms` / cloud / extras fields the shell ignores.
+        // the `published_at_ms` / cloud / extras daemon-only fields the shell
+        // ignores, and the typed `edges` set (EXPLORER-7) the chips now decode.
         let body = r#"{
             "host":"node-a",
             "units":[{
@@ -2168,8 +2470,40 @@ mod tests {
         assert_eq!(u.reachability, Reachability::InMesh);
         assert_eq!(u.health, Some(Health::Healthy));
         assert!(u.mesh.as_ref().is_some_and(|m| m.leader));
+        // The edge set decodes off the same body (EXPLORER-8).
+        assert_eq!(state.edges.len(), 1);
+        assert_eq!(state.edges[0].kind, EdgeKind::MeshTunnel);
+        assert_eq!(state.edges[0].from, "peer:node-a");
+        assert_eq!(state.edges[0].to, "peer:node-b");
+        assert_eq!(state.edges[0].detail.as_deref(), Some("direct"));
         // The topic prefix matches the aggregator's `state/units/<node>` shape.
         assert!(super::STATE_PREFIX.starts_with("state/units/"));
+    }
+
+    #[test]
+    fn every_edge_kind_token_matches_the_worker_wire() {
+        // §6 — the shell's `EdgeKind` mirror MUST decode the worker's exact
+        // `rename_all = "snake_case"` tokens; a drift here silently drops chips.
+        let body = r#"[
+            {"kind":"mesh_tunnel","from":"a","to":"b"},
+            {"kind":"cloud_attach","from":"a","to":"b"},
+            {"kind":"l2_l3_adjacency","from":"a","to":"b"},
+            {"kind":"host_placement","from":"a","to":"b"},
+            {"kind":"storage_usage","from":"a","to":"b"}
+        ]"#;
+        let edges: Vec<Edge> = serde_json::from_str(body).expect("all five kinds decode");
+        assert_eq!(
+            edges.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![
+                EdgeKind::MeshTunnel,
+                EdgeKind::CloudAttach,
+                EdgeKind::L2L3Adjacency,
+                EdgeKind::HostPlacement,
+                EdgeKind::StorageUsage,
+            ]
+        );
+        // A `detail`-less edge decodes with `None` (the worker skips it when empty).
+        assert!(edges[0].detail.is_none());
     }
 
     #[test]
@@ -2178,10 +2512,12 @@ mod tests {
         let a = UnitsState {
             host: "node-a".into(),
             units: vec![unit("peer:x", UnitKind::Peer, "x-old", 100)],
+            edges: Vec::new(),
         };
         let b = UnitsState {
             host: "node-b".into(),
             units: vec![unit("peer:x", UnitKind::Peer, "x-new", 200)],
+            edges: Vec::new(),
         };
         let folded = fold_units(&[a, b], "me");
         assert_eq!(folded.len(), 1, "deduped by id");
@@ -2199,6 +2535,7 @@ mod tests {
                 unit("peer:me", UnitKind::Peer, "me", 10),
                 unit("peer:alpha", UnitKind::Peer, "alpha", 10),
             ],
+            edges: Vec::new(),
         };
         let folded = fold_units(&[state], "me");
         let ids: Vec<&str> = folded.iter().map(|u| u.id.as_str()).collect();
@@ -2228,6 +2565,7 @@ mod tests {
                     unit("cloud:instance:i", UnitKind::Instance, "i", 10),
                     unit("cloud:volume:v", UnitKind::Volume, "v", 10),
                 ],
+                edges: Vec::new(),
             }],
             "me",
         );
@@ -2255,6 +2593,7 @@ mod tests {
                     unit("lan:a", UnitKind::LanHost, "a", 10),
                     unit("cloud:instance:i", UnitKind::Instance, "i", 10),
                 ],
+                edges: Vec::new(),
             }],
             "me",
         );
@@ -2281,6 +2620,7 @@ mod tests {
                     unit("lan:a", UnitKind::LanHost, "a", 10),
                     unit("cloud:instance:i", UnitKind::Instance, "i", 10),
                 ],
+                edges: Vec::new(),
             }],
             "me",
         );
@@ -2362,6 +2702,7 @@ mod tests {
                 unit("lan:aa", UnitKind::LanHost, "printer", now_ms()),
                 unit("cloud:instance:i1", UnitKind::Instance, "web", now_ms()),
             ],
+            edges: Vec::new(),
         }];
 
         for filter in [
@@ -2422,6 +2763,7 @@ mod tests {
         let states = vec![UnitsState {
             host: "me".into(),
             units: vec![peer],
+            edges: Vec::new(),
         }];
         let mut s = ExplorerState::with_fake(states, "me"); // one refresh already
         for _ in 0..(HISTORY_LEN + 5) {
@@ -2449,6 +2791,7 @@ mod tests {
                     ..Default::default()
                 },
             )],
+            edges: Vec::new(),
         }];
         let mut s = ExplorerState::with_fake(present, "me");
         assert!(s.history.contains_key("peer:gone"));
@@ -2478,6 +2821,7 @@ mod tests {
             vec![UnitsState {
                 host: "me".into(),
                 units: vec![peer],
+                edges: Vec::new(),
             }],
             "me",
         );
@@ -2511,6 +2855,7 @@ mod tests {
         let states = vec![UnitsState {
             host: "me".into(),
             units: vec![peer, unit("lan:aa", UnitKind::LanHost, "printer", now_ms())],
+            edges: Vec::new(),
         }];
         let mut s = ExplorerState::with_fake(states, "me");
         for _ in 0..4 {
@@ -2586,6 +2931,7 @@ mod tests {
             vec![UnitsState {
                 host: "me".into(),
                 units: vec![instance_unit("cloud:instance:i-9", "web")],
+                edges: Vec::new(),
             }],
             "me",
         );
@@ -2628,6 +2974,7 @@ mod tests {
             vec![UnitsState {
                 host: "me".into(),
                 units: vec![instance_unit("cloud:instance:i-9", "web")],
+                edges: Vec::new(),
             }],
             "me",
         );
@@ -2664,6 +3011,7 @@ mod tests {
             vec![UnitsState {
                 host: "me".into(),
                 units: vec![unit("peer:zeta", UnitKind::Peer, "zeta", now_ms())],
+                edges: Vec::new(),
             }],
             "me",
         );
@@ -2697,6 +3045,7 @@ mod tests {
             vec![UnitsState {
                 host: "me".into(),
                 units: vec![unit("lan:printer", UnitKind::LanHost, "printer", now_ms())],
+                edges: Vec::new(),
             }],
             "me",
         );
@@ -2763,6 +3112,7 @@ mod tests {
             vec![UnitsState {
                 host: "me".into(),
                 units: vec![instance_unit("cloud:instance:i-9", "web")],
+                edges: Vec::new(),
             }],
             "me",
         );
@@ -2774,6 +3124,221 @@ mod tests {
             screen_rect: Some(Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
                 Vec2::new(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| s.show(ui));
+        });
+        assert!(!ctx.tessellate(out.shapes, out.pixels_per_point).is_empty());
+    }
+
+    // ─────────────────────── EXPLORER-8 edge chips ───────────────────────
+
+    /// A typed edge between two ids (test fixtures build them directly, no wire).
+    fn edge(kind: EdgeKind, from: &str, to: &str) -> Edge {
+        Edge {
+            kind,
+            from: from.to_string(),
+            to: to.to_string(),
+            detail: None,
+        }
+    }
+
+    /// A connectivity fixture: self + a peer, an instance wired to a network +
+    /// volume, running on the peer, the volume attached (+ backed by a non-unit
+    /// pool). One state so `fold_edges` + `grouped_edges` see the whole graph.
+    fn connected_state() -> Vec<UnitsState> {
+        vec![UnitsState {
+            host: "me".into(),
+            units: vec![
+                unit("peer:me", UnitKind::Peer, "me", 10),
+                unit("peer:anvil", UnitKind::Peer, "anvil", 10),
+                unit("cloud:instance:i1", UnitKind::Instance, "web", 10),
+                unit("cloud:network:n1", UnitKind::Network, "tenant", 10),
+                unit("cloud:volume:v1", UnitKind::Volume, "data", 10),
+            ],
+            edges: vec![
+                edge(EdgeKind::MeshTunnel, "peer:me", "peer:anvil"),
+                edge(
+                    EdgeKind::CloudAttach,
+                    "cloud:instance:i1",
+                    "cloud:network:n1",
+                ),
+                edge(
+                    EdgeKind::CloudAttach,
+                    "cloud:instance:i1",
+                    "cloud:volume:v1",
+                ),
+                edge(EdgeKind::HostPlacement, "cloud:instance:i1", "peer:anvil"),
+                edge(
+                    EdgeKind::StorageUsage,
+                    "cloud:volume:v1",
+                    "cloud:instance:i1",
+                ),
+                // Backing pool: a non-unit endpoint — never a jump chip (§7).
+                edge(EdgeKind::StorageUsage, "cloud:volume:v1", "pool:ceph"),
+            ],
+        }]
+    }
+
+    /// Focus the hero on the unit `id` (its position in the current filtered view).
+    fn focus_on(s: &mut ExplorerState, id: &str) {
+        let abs = s
+            .units
+            .iter()
+            .position(|u| u.id == id)
+            .expect("unit present");
+        s.focus = s
+            .filtered_indices()
+            .iter()
+            .position(|&i| i == abs)
+            .expect("unit is in the active view");
+    }
+
+    #[test]
+    fn edges_fold_and_dedup_across_node_mirrors() {
+        // Two nodes republish the same derived edge — the union keeps one.
+        let states = vec![
+            UnitsState {
+                host: "a".into(),
+                units: vec![],
+                edges: vec![edge(EdgeKind::MeshTunnel, "peer:a", "peer:b")],
+            },
+            UnitsState {
+                host: "b".into(),
+                units: vec![],
+                edges: vec![
+                    edge(EdgeKind::MeshTunnel, "peer:a", "peer:b"), // dup
+                    edge(EdgeKind::MeshTunnel, "peer:b", "peer:c"), // new
+                ],
+            },
+        ];
+        assert_eq!(
+            fold_edges(&states).len(),
+            2,
+            "cross-node duplicate collapses"
+        );
+    }
+
+    #[test]
+    fn edge_chips_group_by_kind_and_omit_absent_sections() {
+        let s = ExplorerState::with_fake(connected_state(), "me");
+        let instance = s
+            .units
+            .iter()
+            .find(|u| u.id == "cloud:instance:i1")
+            .cloned()
+            .expect("instance folded");
+
+        let sections = s.grouped_edges(&instance);
+        // Design order: Networks, Volumes, Runs on <node>, Storage. Tunnels + Same
+        // subnet are absent from an instance's view → no empty headers (§7).
+        let headers: Vec<&str> = sections.iter().map(|sec| sec.header.as_str()).collect();
+        assert_eq!(
+            headers,
+            vec!["Networks", "Volumes", "Runs on anvil", "Storage"]
+        );
+        // Each chip is the related unit (name + kind), jumpable.
+        let chip_of = |header: &str| -> Vec<&str> {
+            sections
+                .iter()
+                .find(|sec| sec.header == header)
+                .map(|sec| sec.chips.iter().map(|c| c.name.as_str()).collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(chip_of("Networks"), vec!["tenant"]);
+        assert_eq!(chip_of("Volumes"), vec!["data"]);
+        assert_eq!(chip_of("Runs on anvil"), vec!["anvil"]);
+        // Storage shows the attached volume; the non-unit backing pool is skipped.
+        assert_eq!(chip_of("Storage"), vec!["data"]);
+        assert!(
+            sections
+                .iter()
+                .all(|sec| sec.chips.iter().all(|c| c.id != "pool:ceph")),
+            "a non-unit pool endpoint never becomes a chip"
+        );
+
+        // A peer's view has only the mesh tunnel — every cloud section is absent.
+        let me = s.units.iter().find(|u| u.id == "peer:me").cloned().unwrap();
+        let peer_sections = s.grouped_edges(&me);
+        assert_eq!(
+            peer_sections
+                .iter()
+                .map(|x| x.header.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Tunnels"]
+        );
+        assert_eq!(peer_sections[0].chips[0].id, "peer:anvil");
+    }
+
+    #[test]
+    fn a_unit_with_only_a_non_unit_endpoint_shows_no_section() {
+        // A volume backed solely by a pool (no attachment, no unit neighbour) has
+        // nothing jumpable → the whole edge region is empty, not an empty header.
+        let s = ExplorerState::with_fake(
+            vec![UnitsState {
+                host: "me".into(),
+                units: vec![unit("cloud:volume:v9", UnitKind::Volume, "lonely", 10)],
+                edges: vec![edge(EdgeKind::StorageUsage, "cloud:volume:v9", "pool:ceph")],
+            }],
+            "me",
+        );
+        let vol = s
+            .units
+            .iter()
+            .find(|u| u.id == "cloud:volume:v9")
+            .cloned()
+            .unwrap();
+        assert!(s.grouped_edges(&vol).is_empty());
+    }
+
+    #[test]
+    fn a_chip_click_jumps_the_hero_focus_to_the_neighbour() {
+        let mut s = ExplorerState::with_fake(connected_state(), "me");
+        focus_on(&mut s, "cloud:instance:i1");
+        // The Networks chip points at the tenant network.
+        let sections = s.grouped_edges(&focused(&s));
+        let net_chip = sections
+            .iter()
+            .find(|sec| sec.header == "Networks")
+            .and_then(|sec| sec.chips.first())
+            .expect("a network chip")
+            .clone();
+        assert_eq!(net_chip.id, "cloud:network:n1");
+
+        // Clicking it (the jump path) moves the hero focus to that neighbour.
+        s.jump_to_id(&net_chip.id);
+        assert_eq!(focused(&s).id, "cloud:network:n1");
+    }
+
+    #[test]
+    fn a_jump_to_a_filtered_out_neighbour_clears_the_filter() {
+        // Focused on a cloud instance under the Cloud filter, jumping to its host
+        // peer (a Mesh unit hidden by the filter) clears the filter so the jump
+        // always lands — reusing the one focus-set path.
+        let mut s = ExplorerState::with_fake(connected_state(), "me");
+        s.set_filter(Some(Category::Cloud));
+        focus_on(&mut s, "cloud:instance:i1");
+        s.jump_to_id("peer:anvil");
+        assert_eq!(
+            s.filter, None,
+            "the hiding filter clears on a cross-filter jump"
+        );
+        assert_eq!(focused(&s).id, "peer:anvil");
+    }
+
+    #[test]
+    fn the_edge_chip_region_renders_headless() {
+        // The grouped chips tessellate cleanly under the hero card.
+        let mut s = ExplorerState::with_fake(connected_state(), "me");
+        focus_on(&mut s, "cloud:instance:i1");
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                Vec2::new(1200.0, 900.0),
             )),
             ..Default::default()
         };
