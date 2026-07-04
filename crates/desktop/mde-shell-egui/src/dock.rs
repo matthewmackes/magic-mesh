@@ -705,8 +705,9 @@ const DOCK_AREA: &str = "vdock-area";
 /// is deliberately **no hover-reveal** (lock #9). VDOCK-2 adds the picker's
 /// `active` surface (the shell body follows it, carried over from the horizontal
 /// bar's routing) and the `overflow_open` popup latch (#22). The shell-side getter
-/// that reads `active` back into the central view lands with the `main.rs` wire,
-/// out of this unit's dock.rs-only fence.
+/// [`Self::active`] reads `active` back into the central view (the VDOCK-6 `main.rs`
+/// wire); [`Self::set_active`] mirrors the shell's live surface back in first, so a
+/// hotkey / chyron nav that moved the surface still highlights in the picker.
 #[derive(Debug, Default)]
 pub struct DockState {
     /// Toggled by a clean Super tap (lock #13) — the hotkey reveal/hide latch.
@@ -803,15 +804,30 @@ impl DockState {
         }
     }
 
+    /// The **active surface** the app picker currently shows (VDOCK-2). The shell
+    /// reads this back into its central view each frame after [`dock`] (the VDOCK-6
+    /// wire) so a picker-cell click routes the shell body; [`Self::set_active`]
+    /// mirrors the shell's live surface in first, so the picker highlights whatever
+    /// surface is showing (design #25).
+    pub const fn active(&self) -> Surface {
+        self.active
+    }
+
+    /// Mirror the shell's live surface into the dock before [`dock`] (VDOCK-6) — a
+    /// hotkey / chyron / self-test nav can move the surface OUTSIDE the picker, so
+    /// the dock must track it (else the [`Self::active`] read-back would stomp that
+    /// nav with a stale selection). A picker click then moves it and the shell reads
+    /// it straight back.
+    pub const fn set_active(&mut self, surface: Surface) {
+        self.active = surface;
+    }
+
     /// Refresh the bottom **status quads'** live inputs (VDOCK-3) — the shell calls
     /// this each frame before [`dock`] with the SAME folds the horizontal tray
     /// reads (`chrome.summary()`, `system.snapshot()`, `chat.total_unread()`, the
     /// live-session flag). Owned so the dock's `(ctx, state)` signature stays put;
     /// the quads render the pre-poll dim state until the first call lands (§7).
-    // The one caller — `main.rs::mount_dock_chrome` — is a parallel VDOCK unit
-    // outside this dock.rs/tray.rs fence, so the seam lands here first (the dock
-    // tests exercise it); allow the transient dead_code until that wire arrives.
-    #[allow(dead_code)]
+    /// Wired by `main.rs::mount_dock_chrome` (VDOCK-6) — the SOLE dock chrome.
     pub fn set_status_inputs(
         &mut self,
         mesh: MeshSummary,
@@ -852,11 +868,7 @@ impl DockState {
     /// frame after [`dock`] and drives it: a [`DockRequest::Lock`] drops the
     /// in-process curtain (`curtain.lock()`, exactly like Super+L), a
     /// [`DockRequest::Power`] drives `system.honor_power(verb)` (§6). `None` (drained
-    /// once) otherwise.
-    // The one caller — `main.rs::mount_dock_chrome` — is the parallel VDOCK wire
-    // outside this dock.rs/tray.rs fence, so the seam lands here first (the dock
-    // tests exercise it); allow the transient dead_code until that wire arrives.
-    #[allow(dead_code)]
+    /// once) otherwise. Wired by `main.rs::mount_dock_chrome` (VDOCK-6).
     pub const fn take_request(&mut self) -> Option<DockRequest> {
         self.pending.take()
     }

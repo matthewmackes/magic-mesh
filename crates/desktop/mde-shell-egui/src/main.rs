@@ -146,9 +146,12 @@ struct Shell {
     /// tray itself is stateless folds over `chrome` + the seat snapshot + the
     /// Chat unread tally, rendered by `dock::taskbar` (NAVBAR-W10-2).
     tray: tray::TrayState,
-    /// VDOCK-1 — the left vertical dock's auto-hide state (the Super-tap reveal
-    /// latch + the pin). Read by `dock::dock` each frame; toggled by a clean Super
-    /// tap on the hotkey path (`hotkeys::HotkeyRouter::take_dock_toggle`).
+    /// VDOCK-1/2/3/4 — the left vertical dock's state: the auto-hide half (the
+    /// Super-tap reveal latch + the pin), the app picker's `active` surface, the
+    /// bottom status-quad inputs, and the system-quad power menu + pending request.
+    /// `dock::dock` reads + drives it each frame; the Super-tap reveal toggles it on
+    /// the hotkey path (`hotkeys::HotkeyRouter::take_dock_toggle`); and
+    /// `mount_dock_chrome` mirrors `nav.surface` in/out + drains its lock/power request.
     vdock: dock::DockState,
     /// VDOCK-1 — the cutover flag. When `true` (the default) the shell mounts the
     /// left vertical dock (`dock::dock`) INSTEAD of the horizontal bottom taskbar;
@@ -987,11 +990,35 @@ impl Shell {
     /// budget.
     fn mount_dock_chrome(&mut self, ctx: &egui::Context) {
         let bar_clicked = if self.vertical_dock {
-            // VDOCK-1 — the slide-in, auto-hide left dock. Its interior is empty
-            // seams here (VDOCK-2/3/4 fill the app picker + status/system quads), so
-            // no cell routes yet — the shell body is reached via the hotkeys + edge
-            // swipes until VDOCK-2 lands the app picker.
-            dock::dock(ctx, &mut self.vdock)
+            // VDOCK-1/2/3/4 — the slide-in, auto-hide left dock, now the live chrome.
+            // The dock owns its own picker `active`; the shell keeps `nav.surface` as
+            // the ONE source of truth every other nav path (hotkeys, chyron,
+            // self-test, chooser) writes. So MIRROR the live surface INTO the dock
+            // before `dock()` (the picker then highlights whatever is showing), feed
+            // the bottom status quads their live inputs (VDOCK-3 — the SAME folds the
+            // taskbar branch builds below), then read the picker's selection straight
+            // back OUT (the VDOCK-6 wire) so a picker-cell click routes the body.
+            self.vdock.set_active(self.nav.surface);
+            self.vdock.set_status_inputs(
+                self.chrome.summary().clone(),
+                self.system.snapshot().cloned(),
+                self.chat.total_unread(),
+                self.vdi.requested_target().is_some(),
+            );
+            let clicked = dock::dock(ctx, &mut self.vdock);
+            self.nav.surface = self.vdock.active();
+            // VDOCK-4 — drain the system-quad's pending request: Lock drops the
+            // in-process curtain (exactly like Super+L), a Power verb drives the seat
+            // honorer (its typed-armed consent is the operator's; a refusal is an
+            // honest no-op, §7).
+            match self.vdock.take_request() {
+                Some(dock::DockRequest::Lock) => self.curtain.lock(),
+                Some(dock::DockRequest::Power(verb)) => {
+                    let _ = self.system.honor_power(verb);
+                }
+                None => {}
+            }
+            clicked
         } else {
             // The legacy bottom taskbar (locks W1/W13) — the flat icon-only surface
             // row plus the right-justified status tray + clock. Retained behind the
