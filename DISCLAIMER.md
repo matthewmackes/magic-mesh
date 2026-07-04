@@ -46,6 +46,29 @@ membership on a per-node cert, (c) making revocation immediate and fleet-wide, a
 peer-to-peer network isolation *within* the group, MCNF is not the right
 tool — run it only among machines you would trust on the same LAN.
 
+### Cloud instances are inside the radius (QUASAR-CLOUD extension)
+
+With the mesh cloud (`docs/design/quasar-cloud.md`), self-served VM instances
+are **"inside" the trust envelope without their own mesh certs**: every instance
+lands on one flat Neutron/OVN provider network bridged into the overlay, with
+**default-open security groups**. An instance is peer-equivalent — it can reach
+every peer and every peer can reach it — so whatever guest OS a member boots is
+inside the radius, exactly like a node. Only two guardrails temper this:
+
+- **Hard per-user Keystone quotas** — capacity-derived, enforced per member; the
+  mesh's first hard authorization boundary, a documented departure from the
+  no-RBAC doctrine. Quotas bound how *much* a member can run, not what a running
+  instance can reach.
+- **The public boundary is unchanged** — instances are mesh-only (no web
+  exposure), the host firewalld keeps the public boundary, and floating IPs come
+  only from each site's LAN.
+
+The supported envelope is **raised for compute**: the control plane stays
+workgroup-small (the 12-node infrastructure cap above), while compute nodes may
+scale to dozens — a carve-out like the VDI one — so the count of machines inside
+the radius is no longer bounded by the node cap. Boot only images and workloads
+you would trust on the same LAN.
+
 ## Data, replication, and recovery
 
 MCNF replicates data across peers (Syncthing) and converges node
