@@ -696,12 +696,15 @@ const DOCK_SLIDE_KEY: &str = "vdock-slide";
 /// Id::new(DOCK_AREA))`.
 const DOCK_AREA: &str = "vdock-area";
 
-/// The left vertical dock's **auto-hide state** (VDOCK-1, locks #9/#13) — the two
-/// inputs that decide whether the dock is on screen: the Super-tap **reveal**
-/// latch and the **pin**. Kept tiny + pure (no egui, no GPU) so the shell's
-/// hotkey path toggles it and the render reads [`Self::shown`] headless-testably.
-/// There is deliberately **no hover-reveal** (lock #9): the dock shows only via
-/// the hotkey or the pin.
+/// The left vertical dock's **state** — VDOCK-1's auto-hide inputs (locks #9/#13)
+/// plus VDOCK-2's picker state. The auto-hide half (the Super-tap **reveal** latch
+/// and the **pin**) is kept tiny and pure (no egui, no GPU) so the shell's hotkey
+/// path toggles it and the render reads [`Self::shown`] headless-testably; there
+/// is deliberately **no hover-reveal** (lock #9). VDOCK-2 adds the picker's
+/// `active` surface (the shell body follows it, carried over from the horizontal
+/// bar's routing) and the `overflow_open` popup latch (#22). The shell-side getter
+/// that reads `active` back into the central view lands with the `main.rs` wire,
+/// out of this unit's dock.rs-only fence.
 #[derive(Debug, Default)]
 pub struct DockState {
     /// Toggled by a clean Super tap (lock #13) — the hotkey reveal/hide latch.
@@ -709,6 +712,13 @@ pub struct DockState {
     /// The pin (lock #9): while set, the dock stays on screen regardless of the
     /// reveal latch — the "hotkey + pin" hold-open.
     pinned: bool,
+    /// The **active surface** the app picker selects (VDOCK-2) — a picker cell
+    /// click writes it here; the shell body follows [`Self::active`]. Defaults to
+    /// [`Surface::Workbench`] (the shell opens on the Workbench).
+    active: Surface,
+    /// Whether the '…' **overflow** more-popup is open (VDOCK-2, lock #22) — set by
+    /// the '…' cell, cleared on a route or a click-away.
+    overflow_open: bool,
 }
 
 impl DockState {
@@ -755,11 +765,12 @@ impl DockState {
 /// dock can never steal focus/input while hidden (the design's "auto-hide + DRM
 /// seat" risk; proven by the passthrough test).
 ///
-/// VDOCK-1 builds the FRAME + the slide/toggle/pin only; the interior is three
-/// empty seams the follow-ups fill — a top **Workbench-lead** zone (VDOCK-2), a
-/// scrollable **app-groups** middle (VDOCK-2), and a bottom **status + system
-/// quad** zone (VDOCK-3/4). Returns `true` if a dock control routed this frame
-/// (today only the pin; VDOCK-2's picker will surface the shell body).
+/// VDOCK-1 built the FRAME + the slide/toggle/pin; **VDOCK-2** fills the top
+/// **Workbench-lead** zone + the single-column **app-groups** middle
+/// ([`paint_dock_frame`]). The bottom **status + system quad** zone stays a seam
+/// for VDOCK-3/4. Returns `true` if a dock control routed this frame — the pin, or
+/// a picker cell selecting its [`Surface`] (recorded in [`DockState`]'s active
+/// surface, which the shell reads back to surface the body).
 pub fn dock(ctx: &egui::Context, state: &mut DockState) -> bool {
     let shown = state.shown();
     // Slide-in-from-left over the shared Motion table (lock #14): `t` eases
@@ -807,11 +818,11 @@ pub fn dock(ctx: &egui::Context, state: &mut DockState) -> bool {
     clicked
 }
 
-/// Paint the vertical dock's frame into `rect` and lay out its (VDOCK-1 empty)
-/// interior zones: the solid Carbon-dark panel + the hairline right-edge divider
-/// (lock #24, §4 tokens), the pin toggle in the top zone, and the three commented
-/// seams the follow-ups fill. Returns `true` if the pin (the only control today)
-/// was clicked this frame.
+/// Paint the vertical dock's frame into `rect` and lay out its interior: the solid
+/// Carbon-dark panel + the hairline right-edge divider (lock #24, §4 tokens), the
+/// **VDOCK-2** top zone (the Workbench lead + the folded-in pin) and middle zone
+/// (the single-column app groups + '…' overflow), and the bottom seam VDOCK-3/4
+/// fills. Returns `true` if the pin or a picker cell routed this frame.
 fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
     let painter = ui.painter().clone();
     // Solid Carbon-dark panel fill (lock #24) — the SURFACE token (§4), the same
@@ -825,24 +836,69 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
         egui::Stroke::new(HAIRLINE_W, Style::BORDER),
     );
 
-    // ── The three interior zones — VDOCK-1 leaves them EMPTY with clean seams ──
-    //
-    // MIDDLE zone (SEAM → VDOCK-2): between the top cell's bottom and the bottom
-    // quad zone lives the scrollable, single-column **app groups** (Comms → … →
-    // Media) — horizontal accent labels + left-rail stripes + a '…' overflow, each
-    // cell in `Surface::ALL` order. VDOCK-1 leaves it intentionally empty.
-    //
-    // BOTTOM zone (SEAM → VDOCK-3/4): the last ~DOCK_W of the column anchors the
-    // stacked 2×2 **status quads** (Chat/BT/Vol/Batt · Status/Signal/Peers/
-    // Sessions) + the **system quad** (Settings · Show-Desktop · Lock · Power).
-    // VDOCK-1 leaves it empty too.
-    //
-    // TOP zone (SEAM → VDOCK-2 mounts the pinned **Workbench lead** glyph here):
-    // for VDOCK-1 the top DOCK_W-tall cell carries the dock's **pin** toggle
-    // (lock #9), the one control this foundation wires. Returned as the frame's
-    // click result.
-    let top = egui::Rect::from_min_size(rect.min, egui::vec2(DOCK_W, DOCK_W));
-    pin_toggle(ui, top, state)
+    let mut clicked = false;
+
+    // ── TOP zone (design #8) — the Workbench lead pinned top, the pin folded in ──
+    // The Workbench lead is the topmost cell (the mesh-control home, always one
+    // click away); VDOCK-1's pin toggle (lock #9 — the "pin" half of "hotkey +
+    // pin") folds into a slim strip just beneath it. A BORDER hairline sets the
+    // lead apart from the app groups below.
+    let wb = egui::Rect::from_min_size(rect.min, egui::vec2(DOCK_W, DOCK_W));
+    if pick_app_cell(ui, Surface::Workbench, &mut state.active, wb) {
+        clicked = true;
+    }
+    let pin = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), wb.bottom()),
+        egui::vec2(DOCK_W, PIN_STRIP_H),
+    );
+    if pin_toggle(ui, pin, state) {
+        clicked = true;
+    }
+    painter.hline(
+        (rect.left() + Style::SP_XS)..=(rect.right() - Style::SP_XS),
+        pin.bottom() + GROUP_DIVIDER_H / 2.0,
+        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+    );
+
+    // ── MIDDLE zone (design #2/#3/#4/#10/#11/#21/#22/#23) — the app picker ──
+    // The six labelled groups stacked single-column top→bottom (Comms → … →
+    // Media), each a horizontal accent label (#4) + a left-rail accent stripe +
+    // accent divider (#21) over its icon-only 24px cells (#11/#23) in Surface::ALL
+    // order (#3). The zone is bounded above the BOTTOM_ZONE_H band reserved for
+    // VDOCK-3/4's status + system quads; groups that overrun it fold into the '…'
+    // more-popup (#22).
+    let middle_top = pin.bottom() + GROUP_DIVIDER_H;
+    let middle_bottom = rect.bottom() - BOTTOM_ZONE_H;
+    let middle_h = (middle_bottom - middle_top).max(0.0);
+    let visible = visible_group_count(middle_h);
+    // Fit the labels to the column interior — the full width less an SP_XS side
+    // margin each side (SP_XS + SP_XS = SP_S total).
+    let font = group_label_font(ui, DOCK_W - Style::SP_S);
+    let mut y = middle_top;
+    for group in &GROUPS[..visible] {
+        let (h, routed) = pick_group(
+            ui,
+            group,
+            egui::pos2(rect.left(), y),
+            DOCK_W,
+            &font,
+            &mut state.active,
+        );
+        if routed {
+            clicked = true;
+        }
+        y += h;
+    }
+    if visible < GROUPS.len() && pick_overflow(ui, rect, middle_bottom, visible, &font, state) {
+        clicked = true;
+    }
+
+    // ── BOTTOM zone (SEAM → VDOCK-3/4) — the last BOTTOM_ZONE_H of the column is
+    // reserved for the stacked 2×2 status quads (Chat/BT/Vol/Batt · Status/Signal/
+    // Peers/Sessions) + the system quad (Settings · Show-Desktop · Lock · Power);
+    // VDOCK-2 bounds the app zone above it and leaves it empty (the frame fill
+    // shows through) — VDOCK-3/4 fill it.
+    clicked
 }
 
 /// The dock's **pin** toggle (VDOCK-1, lock #9) — the minimal affordance that
@@ -875,12 +931,323 @@ fn pin_toggle(ui: &egui::Ui, cell: egui::Rect, state: &mut DockState) -> bool {
     false
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// VDOCK-2 — the vertical **app picker** (fills the dock's TOP + MIDDLE zones;
+// design `docs/design/vertical-dock.md`, locks #2/#3/#4/#10/#11/#21/#22/#23).
+//
+// The Workbench lead (top) + the six labelled app groups stacked single-column in
+// the middle — each with a horizontal accent label (#4), a left-rail accent stripe
+// + accent divider (#21), icon-only 24px cells (#11/#23), a left-edge active bar
+// (#10), and a '…' more-popup when the groups overrun the zone (#22). The picker's
+// GROUPS + surface→glyph map + accent tokens all carry over from the horizontal
+// `taskbar` (this is a re-layout, not a rebuild). Settings (the System surface) +
+// Show-Desktop are NOT in the picker — they belong to VDOCK-4's bottom system
+// quad; every other surface appears here exactly once (the same union the
+// compile-time guard above pins). A click routes into `DockState::active`.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The single-column app-cell height (design #23) — a 24px glyph ([`ICON_LOGICAL`])
+/// centred in an [`Style::SP_XL`]-tall cell, on the 8px grid.
+const APP_CELL_H: f32 = Style::SP_XL;
+
+/// The slim **pin** strip beneath the Workbench lead (lock #9) — folds VDOCK-1's
+/// pin toggle in just under the lead glyph. `SP_M` tall.
+const PIN_STRIP_H: f32 = Style::SP_M;
+
+/// The horizontal accent-label row above each group (#4) — `SP_M` tall, its label
+/// sized to fit the narrow column by [`group_label_font`].
+const PICK_LABEL_H: f32 = Style::SP_M;
+
+/// The per-group accent **divider** band (#21) — an `SP_S` gap with the group's
+/// accent hairline centred in it, separating one group from the next.
+const GROUP_DIVIDER_H: f32 = Style::SP_S;
+
+/// The thin **left-rail accent stripe** beside each group's cells (#21) — a 2px
+/// group-accent spine (twice the [`HAIRLINE_W`] rule), inset [`Style::SP_XS`] from
+/// the column's left edge.
+const RAIL_W: f32 = HAIRLINE_W * 2.0;
+
+/// The active cell's **left-edge accent bar** (lock #10) — an `SP_XS`-wide
+/// [`Style::ACCENT`] bar down the active surface's left edge (the vertical analog
+/// of the horizontal bar's bottom underline), at the cell's outer edge.
+const ACTIVE_BAR_W: f32 = Style::SP_XS;
+
+/// The '…' overflow cell height (#22) — the more-popup trigger at the bottom of
+/// the app zone. `SP_L`.
+const OVERFLOW_H: f32 = Style::SP_L;
+
+/// The bottom band reserved for VDOCK-3/4's stacked status quads + system quad
+/// (design #8) — three quad rows (~`DOCK_W` each). VDOCK-2 bounds the middle app
+/// zone above it and leaves it empty; sizing the middle against this reserve makes
+/// the '…' overflow (#22) real on a short screen. VDOCK-3/4 fill the band.
+const BOTTOM_ZONE_H: f32 = 3.0 * DOCK_W;
+
+/// The stable per-surface id of a vertical-picker cell — the render + routing are
+/// unchanged, but tests read a cell's settled `Rect` back to click its exact
+/// centre (the taskbar [`cell_id`] idiom, kept distinct so the two docks' cells
+/// never share an id).
+fn pick_cell_id(surface: Surface) -> egui::Id {
+    egui::Id::new(("vdock-pick-cell", surface))
+}
+
+/// The stable id of a group's horizontal accent label, so the harness can read its
+/// settled `Rect` back. Display-only (hover sense).
+fn pick_label_id(label: &str) -> egui::Id {
+    egui::Id::new(("vdock-pick-label", label))
+}
+
+/// The stable id of the '…' overflow cell (#22).
+fn overflow_more_id() -> egui::Id {
+    egui::Id::new("vdock-pick-overflow")
+}
+
+/// The rendered height of one group in the app zone: its accent label row + its
+/// single-column cells + its accent divider band.
+#[allow(
+    clippy::cast_precision_loss, // surface counts are tiny (≤3)
+    clippy::suboptimal_flops     // layout arithmetic reads clearer than mul_add
+)]
+fn group_height(group: &Group) -> f32 {
+    PICK_LABEL_H + group.surfaces.len() as f32 * APP_CELL_H + GROUP_DIVIDER_H
+}
+
+/// How many of the six [`GROUPS`] fit, top→down, in a `middle_h`-tall app zone
+/// (#22). If they all fit, all six render inline; otherwise the zone reserves its
+/// bottom [`OVERFLOW_H`] for the '…' cell and fits as many *whole* groups above it
+/// as it can — the rest fold into the more-popup.
+fn visible_group_count(middle_h: f32) -> usize {
+    let total: f32 = GROUPS.iter().map(group_height).sum();
+    if total <= middle_h {
+        return GROUPS.len();
+    }
+    let avail = (middle_h - OVERFLOW_H).max(0.0);
+    let mut used = 0.0;
+    let mut n = 0;
+    for group in &GROUPS {
+        let h = group_height(group);
+        if used + h > avail {
+            break;
+        }
+        used += h;
+        n += 1;
+    }
+    n
+}
+
+/// One single-column **app cell** (#2/#11/#23) — a 24px brand glyph centred in a
+/// `width`-wide × [`APP_CELL_H`]-tall cell, icon-only (no tooltip, #11). The active
+/// surface wears the left-edge [`Style::ACCENT`] bar (#10) + the subtle selection
+/// wash; a hover is a fill only. A click routes to the surface (sets `active`,
+/// returns `true` so the shell can surface the body). Every colour is a Style
+/// token (§4); shared by the Workbench lead, the middle groups, and the '…' popup.
+fn pick_app_cell(ui: &egui::Ui, surface: Surface, active: &mut Surface, rect: egui::Rect) -> bool {
+    let selected = *active == surface;
+    let resp = ui.interact(rect, pick_cell_id(surface), egui::Sense::click());
+    let hovered = resp.hovered();
+    let painter = ui.painter().clone();
+
+    // Subtle fill: the selected cell wears the accent selection wash, a hovered one
+    // the raised SURFACE_HI (both Style tokens, §4).
+    if selected {
+        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
+    } else if hovered {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+
+    // Active mark (lock #10): the accent bar down the cell's LEFT edge.
+    if selected {
+        let bar =
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(ACTIVE_BAR_W, rect.height()));
+        painter.rect_filled(bar, egui::CornerRadius::ZERO, Style::ACCENT);
+    }
+
+    // Two-tone tint (the taskbar idiom): active reads solid ACCENT, a hovered one
+    // brightens to full TEXT, the rest sit dim at TEXT_DIM — the glyph is tinted at
+    // rasterization, so it's blitted with WHITE (no extra multiply). A load failure
+    // fails soft to the bare cell (§7).
+    let tint = if selected {
+        Style::ACCENT
+    } else if hovered {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    if let Some(tex) = icon_texture(ui.ctx(), surface.icon_id(), ICON_LOGICAL, tint) {
+        let icon =
+            egui::Rect::from_center_size(rect.center(), egui::vec2(ICON_LOGICAL, ICON_LOGICAL));
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
+    }
+
+    if resp.clicked() {
+        *active = surface;
+        return true;
+    }
+    false
+}
+
+/// Paint one **group** (#3/#4/#21) into the column at `origin`, `width` wide: the
+/// horizontal accent label (#4), the single-column icon cells ([`Surface::ALL`]
+/// order), the left-rail accent stripe beside them (#21), and the accent divider
+/// (#21). Returns `(height, routed)` — the consumed height + whether a cell routed
+/// this frame. Shared by the middle zone and the '…' overflow popup.
+#[allow(
+    clippy::cast_precision_loss, // per-group cell counts are tiny (≤3)
+    clippy::suboptimal_flops     // layout arithmetic reads clearer than mul_add
+)]
+fn pick_group(
+    ui: &egui::Ui,
+    group: &Group,
+    origin: egui::Pos2,
+    width: f32,
+    font: &egui::FontId,
+    active: &mut Surface,
+) -> (f32, bool) {
+    let painter = ui.painter().clone();
+
+    // The horizontal accent label above the group (#4) — display-only (hover sense)
+    // so the harness can read its rect; painted in the group accent, centred.
+    let label_rect = egui::Rect::from_min_size(origin, egui::vec2(width, PICK_LABEL_H));
+    ui.interact(label_rect, pick_label_id(group.label), egui::Sense::hover());
+    let galley =
+        ui.fonts(|f| f.layout_no_wrap(group.label.to_owned(), font.clone(), group.accent));
+    let lp = egui::pos2(
+        label_rect.center().x - galley.size().x / 2.0,
+        label_rect.center().y - galley.size().y / 2.0,
+    );
+    painter.galley(lp, galley, group.accent);
+
+    // The single-column icon cells (#2), stacked under the label in Surface::ALL
+    // order (#3/L7).
+    let cells_top = label_rect.bottom();
+    let mut routed = false;
+    for (i, &surface) in group.surfaces.iter().enumerate() {
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(origin.x, cells_top + i as f32 * APP_CELL_H),
+            egui::vec2(width, APP_CELL_H),
+        );
+        if pick_app_cell(ui, surface, active, cell) {
+            routed = true;
+        }
+    }
+    let cells_bottom = cells_top + group.surfaces.len() as f32 * APP_CELL_H;
+
+    // The thin left-rail accent stripe beside the cells (#21) — the group's spine,
+    // painted over the cell fills in the group accent, inset SP_XS from the edge.
+    let rail = egui::Rect::from_min_max(
+        egui::pos2(origin.x + Style::SP_XS, cells_top),
+        egui::pos2(origin.x + Style::SP_XS + RAIL_W, cells_bottom),
+    );
+    painter.rect_filled(rail, egui::CornerRadius::ZERO, group.accent);
+
+    // The accent divider below the group (#21).
+    painter.hline(
+        (origin.x + Style::SP_XS)..=(origin.x + width - Style::SP_XS),
+        cells_bottom + GROUP_DIVIDER_H / 2.0,
+        egui::Stroke::new(HAIRLINE_W, group.accent),
+    );
+
+    (group_height(group), routed)
+}
+
+/// The '…' **more-popup** overflow (lock #22) — when the groups overrun the app
+/// zone, a '…' cell at the zone's bottom toggles a floating popup of the hidden
+/// groups (label + cells), each routing on click. Returns `true` when a popup cell
+/// routed this frame. Chosen over a scrollbar because a scrollbar would eat the
+/// 48px column's width; the '…' popup keeps the picker icon-clean.
+fn pick_overflow(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    middle_bottom: f32,
+    visible: usize,
+    font: &egui::FontId,
+    state: &mut DockState,
+) -> bool {
+    let more = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), middle_bottom - OVERFLOW_H),
+        egui::vec2(DOCK_W, OVERFLOW_H),
+    );
+    let resp = ui.interact(more, overflow_more_id(), egui::Sense::click());
+    let opened = resp.clicked();
+    if opened {
+        state.overflow_open = !state.overflow_open;
+    }
+    // The '…' glyph — brightens on hover / while the popup is open (Style tokens).
+    let color = if state.overflow_open || resp.hovered() {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    let dots = ui.fonts(|f| {
+        f.layout_no_wrap("…".to_owned(), egui::FontId::proportional(Style::BODY), color)
+    });
+    ui.painter().galley(
+        egui::pos2(
+            more.center().x - dots.size().x / 2.0,
+            more.center().y - dots.size().y / 2.0,
+        ),
+        dots,
+        color,
+    );
+
+    if !state.overflow_open {
+        return false;
+    }
+
+    // The floating popup of the hidden groups — anchored to the right of the '…'
+    // cell and growing upward (the tray flyout idiom): a SURFACE panel + hairline
+    // border behind the same single-column groups.
+    let hidden = &GROUPS[visible..];
+    let popup_h: f32 = hidden.iter().map(group_height).sum();
+    let inner = egui::Area::new(egui::Id::new("vdock-overflow-popup"))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(egui::pos2(more.right() + Style::SP_XS, more.bottom()))
+        .show(ui.ctx(), |ui| {
+            let (area, _) =
+                ui.allocate_exact_size(egui::vec2(DOCK_W, popup_h), egui::Sense::hover());
+            // Reserve a slot so the panel background paints BEHIND the cells (the
+            // tray/keyboard overlay idiom).
+            let bg = ui.painter().add(egui::Shape::Noop);
+            let mut routed = false;
+            let mut y = area.top();
+            for group in hidden {
+                let (h, r) =
+                    pick_group(ui, group, egui::pos2(area.left(), y), DOCK_W, font, &mut state.active);
+                y += h;
+                routed |= r;
+            }
+            let panel = area.expand(Style::SP_S);
+            ui.painter()
+                .set(bg, egui::Shape::rect_filled(panel, Style::RADIUS, Style::SURFACE));
+            ui.painter().rect_stroke(
+                panel,
+                Style::RADIUS,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+            routed
+        });
+
+    let routed = inner.inner;
+    if routed {
+        // A route closes the popup (the tray idiom).
+        state.overflow_open = false;
+    } else if !opened && inner.response.clicked_elsewhere() {
+        // Click-away dismissal — but not on the very click that opened it (that
+        // click lands outside the popup and would dismiss it in the same frame).
+        state.overflow_open = false;
+    }
+    routed
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        cell_id, dock, group_hairline_id, group_label_id, icon_texture, taskbar, underline,
-        DockState, Surface, CELL_W, DOCK_AREA, DOCK_W, GROUPS, GROUP_GAP, HAIRLINE_W, ICON_GAP,
-        ICON_LOGICAL, LABEL_PAD, SHOW_DESKTOP_W, TASKBAR_H, TASKBAR_TOP_PAD,
+        cell_id, dock, group_hairline_id, group_height, group_label_id, icon_texture,
+        overflow_more_id, pick_cell_id, taskbar, underline, visible_group_count, DockState, Surface,
+        CELL_W, DOCK_AREA, DOCK_W, GROUPS, GROUP_GAP, HAIRLINE_W, ICON_GAP, ICON_LOGICAL, LABEL_PAD,
+        PIN_STRIP_H, SHOW_DESKTOP_W, TASKBAR_H, TASKBAR_TOP_PAD,
     };
     use crate::chrome::MeshSummary;
     use crate::tray::{TrayInputs, TrayState};
@@ -1740,25 +2107,34 @@ Desktop x=[{:.1},{:.1}]",
 
     // ── VDOCK-1: the left vertical dock frame + auto-hide ─────────────────────
 
-    /// Drive `frames` headless frames of the vertical dock over a surface — a
-    /// background `CentralPanel` (the surface the dock floats over) plus the dock —
-    /// on a 1280×800 screen. The same `Context::run` path the DRM runner drives.
+    /// Drive ONE headless frame of the vertical dock over a stand-in surface at a
+    /// given screen `size`, feeding `events` — the routing/overflow harness core
+    /// (the same `Context::run` path the DRM runner drives, minus the GPU).
+    fn drive_vdock(
+        ctx: &egui::Context,
+        state: &mut DockState,
+        events: Vec<egui::Event>,
+        size: egui::Vec2,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size)),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            // A stand-in surface beneath the dock (the background layer).
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ui.button("surface");
+            });
+            let _ = dock(ctx, state);
+        });
+    }
+
+    /// Drive `frames` quiet headless frames of the vertical dock on a 1280×800
+    /// screen (the VDOCK-1 passthrough/frame tests' size).
     fn run_vdock(ctx: &egui::Context, state: &mut DockState, frames: usize) {
         for _ in 0..frames {
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::pos2(0.0, 0.0),
-                    egui::vec2(1280.0, 800.0),
-                )),
-                ..Default::default()
-            };
-            let _ = ctx.run(input, |ctx| {
-                // A stand-in surface beneath the dock (the background layer).
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let _ = ui.button("surface");
-                });
-                let _ = dock(ctx, state);
-            });
+            drive_vdock(ctx, state, Vec::new(), egui::vec2(1280.0, 800.0));
         }
     }
 
@@ -1874,8 +2250,10 @@ Desktop x=[{:.1},{:.1}]",
         let mut s = DockState::default();
         s.toggle(); // reveal it so the Area (and its pin) is mounted
 
-        // The pin sits centred in the top DOCK_W×DOCK_W cell, flush to the top-left.
-        let click = egui::pos2(DOCK_W / 2.0, DOCK_W / 2.0);
+        // VDOCK-2 folded the pin into the slim strip just BENEATH the Workbench
+        // lead cell (the top DOCK_W-tall cell is now the Workbench); click the pin
+        // strip's centre.
+        let click = egui::pos2(DOCK_W / 2.0, DOCK_W + PIN_STRIP_H / 2.0);
         let press = egui::Event::PointerButton {
             pos: click,
             button: egui::PointerButton::Primary,
@@ -1912,5 +2290,298 @@ Desktop x=[{:.1},{:.1}]",
         frame(&ctx, &mut s, vec![egui::Event::PointerMoved(click), press]);
         frame(&ctx, &mut s, vec![release]);
         assert!(s.pinned(), "clicking the pin holds the dock open (lock #9)");
+    }
+
+    // ── VDOCK-2: the vertical app picker (top + middle zones) ─────────────────
+
+    /// The picker's surfaces in order — the Workbench lead, then each group's
+    /// members (`Surface::ALL` order). Excludes System (Settings) + Desktop, which
+    /// are VDOCK-4's system quad.
+    fn picker_surfaces() -> Vec<Surface> {
+        std::iter::once(Surface::Workbench)
+            .chain(GROUPS.iter().flat_map(|g| g.surfaces.iter().copied()))
+            .collect()
+    }
+
+    fn press_at(pos: egui::Pos2) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn release_at(pos: egui::Pos2) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    /// Click `center` — press one frame, release the next (the egui click model
+    /// the taskbar tests use). The caller primes the layout first.
+    fn click_vdock(ctx: &egui::Context, state: &mut DockState, center: egui::Pos2, size: egui::Vec2) {
+        drive_vdock(
+            ctx,
+            state,
+            vec![egui::Event::PointerMoved(center), press_at(center)],
+            size,
+        );
+        drive_vdock(ctx, state, vec![release_at(center)], size);
+    }
+
+    #[test]
+    fn the_app_zone_fits_all_groups_when_tall_and_overflows_when_short() {
+        // #22 — all six groups render inline when the app zone is tall enough; a
+        // short zone reserves the '…' cell and shows fewer WHOLE groups.
+        let total: f32 = GROUPS.iter().map(group_height).sum();
+        assert_eq!(
+            visible_group_count(total),
+            GROUPS.len(),
+            "all six fit when the zone == their total height"
+        );
+        assert_eq!(
+            visible_group_count(total + 100.0),
+            GROUPS.len(),
+            "all six fit with room to spare"
+        );
+        // Drop just under the total (by the last group's height) → at least one
+        // group folds into the overflow popup.
+        let short = total - group_height(&GROUPS[GROUPS.len() - 1]);
+        let n = visible_group_count(short);
+        assert!(
+            n < GROUPS.len(),
+            "a short zone overflows — showed {n} of {}",
+            GROUPS.len()
+        );
+        // A zone too small for even one group shows none (everything overflows).
+        assert_eq!(visible_group_count(0.0), 0, "no room → all overflow");
+    }
+
+    #[test]
+    fn the_picker_routes_every_app_surface_and_defers_the_system_quad() {
+        // §7 — the Workbench lead + the twelve group surfaces each route on a click
+        // into DockState::active (the carried-over routing). Settings (System) +
+        // Show-Desktop are NOT in the picker — they belong to VDOCK-4's system quad.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle(); // reveal the dock so its Area (and cells) mount
+        let sz = egui::vec2(1280.0, 800.0);
+        // Prime so every stable-id cell rect is registered + settled.
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let picker = picker_surfaces();
+        assert_eq!(
+            picker.len(),
+            Surface::ALL.len() - 2,
+            "the picker holds every surface but System + Desktop"
+        );
+
+        // Read every picker cell's settled centre up front (a click shifts no rect).
+        let mut centers: Vec<(Surface, egui::Pos2)> = Vec::new();
+        for &want in &picker {
+            let resp = ctx.read_response(pick_cell_id(want));
+            assert!(resp.is_some(), "{want:?} picker cell rect not registered");
+            centers.push((want, resp.expect("registered above").rect.center()));
+        }
+
+        for (want, center) in centers {
+            click_vdock(&ctx, &mut s, center, sz);
+            assert_eq!(s.active, want, "clicking {want:?}'s picker cell selects it");
+        }
+
+        // The system-quad surfaces are absent from the picker (VDOCK-4 owns them).
+        assert!(
+            ctx.read_response(pick_cell_id(Surface::System)).is_none(),
+            "System (Settings) is deferred to VDOCK-4's system quad"
+        );
+        assert!(
+            ctx.read_response(pick_cell_id(Surface::Desktop)).is_none(),
+            "Show-Desktop is deferred to VDOCK-4's system quad"
+        );
+    }
+
+    #[test]
+    fn the_picker_stacks_the_groups_in_a_single_column() {
+        // #2 — the app picker is ONE vertical column: every cell shares the
+        // column's x-centre + full width, and the cells march strictly downward.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let mut prev_bottom = f32::MIN;
+        for surface in picker_surfaces() {
+            let resp = ctx.read_response(pick_cell_id(surface));
+            assert!(resp.is_some(), "{surface:?} cell rect not registered");
+            let rect = resp.expect("registered above").rect;
+            assert!(
+                (rect.center().x - DOCK_W / 2.0).abs() < 1.0,
+                "{surface:?} cell off the column centre (cx {})",
+                rect.center().x
+            );
+            assert!(
+                (rect.width() - DOCK_W).abs() < 1.0,
+                "{surface:?} cell is not the full column width"
+            );
+            assert!(
+                rect.top() >= prev_bottom - 1.0,
+                "{surface:?} cell is not stacked below the previous one"
+            );
+            prev_bottom = rect.bottom();
+        }
+    }
+
+    #[test]
+    fn the_group_labels_paint_horizontally_in_their_group_accent() {
+        // #4 — each group carries ONE horizontal (angle 0) accent label above its
+        // cells, painted in that group's Style accent token; on a tall screen all
+        // six render inline with no '…' overflow.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let sz = egui::vec2(1280.0, 800.0);
+        // Prime a frame, then capture over an EMPTY surface so the only text is the
+        // dock's group labels (no stand-in button caption to filter out).
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), sz)),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |_ui| {});
+            let _ = dock(ctx, &mut s);
+        });
+        let mut texts = Vec::new();
+        for clipped in &out.shapes {
+            collect_text_shapes(&clipped.shape, &mut texts);
+        }
+        assert_eq!(
+            texts.len(),
+            GROUPS.len(),
+            "exactly one label per group, nothing else (no captions, no '…' at this height)"
+        );
+        let accents: Vec<egui::Color32> = GROUPS.iter().map(|g| g.accent).collect();
+        for (angle, color) in texts {
+            assert!(
+                angle.abs() < 1e-3,
+                "the vertical dock's labels read HORIZONTALLY (angle 0), got {angle}"
+            );
+            assert!(
+                accents.contains(&color),
+                "a group label is painted in its group accent, got {color:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_active_surface_wears_a_left_edge_accent_bar() {
+        // #10 — the active cell wears a left-edge Style::ACCENT bar. Capture the
+        // frame's rect_filled shapes and confirm an ACCENT-coloured rect hugs the
+        // column's left edge (x≈0) at the active cell — absent for the inactive.
+        fn left_edge_accent_bars(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(r) if r.fill == Style::ACCENT && r.rect.left() < 1.0 => {
+                    out.push(r.rect);
+                }
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        left_edge_accent_bars(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default(); // active = Workbench (the top lead cell)
+        s.toggle();
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), sz)),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |_ui| {});
+            let _ = dock(ctx, &mut s);
+        });
+
+        let mut bars = Vec::new();
+        for clipped in &out.shapes {
+            left_edge_accent_bars(&clipped.shape, &mut bars);
+        }
+        // Exactly the active (Workbench) lead cell shows a left-edge accent bar.
+        assert_eq!(
+            bars.len(),
+            1,
+            "one active left-edge accent bar (the Workbench lead), got {}",
+            bars.len()
+        );
+        let wb = ctx
+            .read_response(pick_cell_id(Surface::Workbench))
+            .expect("the Workbench lead cell is registered")
+            .rect;
+        let bar = bars[0];
+        assert!(bar.left() < 1.0, "the accent bar hugs the column's left edge");
+        assert!(
+            (bar.height() - wb.height()).abs() < 1.0,
+            "the bar spans the active cell's height"
+        );
+    }
+
+    #[test]
+    fn the_overflow_more_popup_routes_a_hidden_group_surface() {
+        // #22 — on a short screen the lower groups fold into the '…' more-popup:
+        // the '…' cell is present, clicking it opens the popup, and a popup cell
+        // still routes to its Surface (then closes the popup).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        // Short enough that the last groups (incl. Media) overflow the app zone.
+        let sz = egui::vec2(1280.0, 600.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let more = ctx
+            .read_response(overflow_more_id())
+            .expect("the '…' overflow cell is registered on a short screen")
+            .rect;
+        assert!(!s.overflow_open, "the popup starts closed");
+        assert!(
+            ctx.read_response(pick_cell_id(Surface::Media)).is_none(),
+            "Media is folded into the overflow, not an inline cell yet"
+        );
+
+        // Click '…' → the popup opens.
+        click_vdock(&ctx, &mut s, more.center(), sz);
+        assert!(s.overflow_open, "clicking '…' opens the more-popup");
+
+        // Settle the popup so its cells register, then click Media inside it.
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let media = ctx
+            .read_response(pick_cell_id(Surface::Media))
+            .expect("the overflowed Media cell renders in the popup")
+            .rect
+            .center();
+        click_vdock(&ctx, &mut s, media, sz);
+        assert_eq!(
+            s.active,
+            Surface::Media,
+            "a click in the more-popup routes to its Surface"
+        );
+        assert!(!s.overflow_open, "routing from the popup closes it");
     }
 }
