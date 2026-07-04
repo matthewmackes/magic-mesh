@@ -36,6 +36,7 @@ mod instances;
 mod keyboard;
 mod mesh_view;
 mod network;
+mod pam_auth;
 mod power_honor;
 mod power_settings;
 mod provisioning;
@@ -252,8 +253,9 @@ struct Shell {
     /// While engaged it consumes ALL input (lock 10): the pointer through its
     /// whole-screen Foreground layer, the keyboard through its per-frame focus
     /// steal plus the hotkey / edge-swipe / central-view gates in `render`.
-    /// Super+L drops it; unlocking is the CURTAIN-2 PAM seam — the default
-    /// verifier honestly denies every attempt (a lock without a key, §7).
+    /// Super+L drops it; unlocking runs the CURTAIN-2 PAM seam
+    /// ([`curtain::Curtain::pam`] / [`pam_auth::PamVerifier`]) — the seat user's
+    /// real system password, verified off the render thread (§7).
     curtain: curtain::Curtain,
 }
 
@@ -297,7 +299,7 @@ impl Shell {
             mesh_view: mesh_view::MeshViewState::default(),
             self_test: mesh_view::SelfTestWatch::default(),
             power_honor: power_honor::PowerHonor::default(),
-            curtain: curtain::Curtain::default(),
+            curtain: curtain::Curtain::pam(),
         }
     }
 

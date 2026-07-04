@@ -360,6 +360,15 @@ impl Curtain {
         }
     }
 
+    /// Build the curtain over the **real seat-user authenticator** — the
+    /// CURTAIN-2 PAM path ([`crate::pam_auth::PamVerifier`]), which verifies each
+    /// unlock against the seat user's system password off the render thread. The
+    /// constructor the shell mounts in `main.rs`; [`Default`] keeps the honest
+    /// deny-all [`NotWired`] seam for tests (and any not-yet-wired build).
+    pub(crate) fn pam() -> Self {
+        Self::with_verifier(Box::new(crate::pam_auth::PamVerifier::new()))
+    }
+
     /// Drop the curtain (Super+L, and later the CURTAIN-3 triggers). Starts
     /// the slide from the top edge; a no-op while already engaged.
     pub(crate) const fn lock(&mut self) {
@@ -844,6 +853,22 @@ mod tests {
         c.tick(0.016);
     }
 
+    /// One attempt through an OFF-THREAD verifier (the real [`PamVerifier`]):
+    /// submit, then tick in bounded sub-steps until the worker's verdict lands
+    /// and the machine leaves `Verifying` (unlike `Scripted`, whose verdict is
+    /// queued synchronously in `begin`).
+    fn attempt_async(c: &mut Curtain, password: &str) {
+        c.password.push_str(password);
+        c.submit();
+        assert!(matches!(c.phase, Phase::Verifying), "submit must enter Verifying");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(c.phase, Phase::Verifying) {
+            c.tick(0.01);
+            assert!(Instant::now() < deadline, "the verdict never landed off-thread");
+            std::thread::yield_now();
+        }
+    }
+
     fn key(k: egui::Key, pressed: bool) -> egui::Event {
         egui::Event::Key {
             key: k,
@@ -967,6 +992,38 @@ mod tests {
         assert!(matches!(c.phase, Phase::Revealing));
         assert_eq!(c.fails, 0, "the attempt window resets after the cooldown");
         assert!(c.stage_accepts_input());
+    }
+
+    #[test]
+    fn the_pam_verifier_seam_denies_off_thread_and_five_arm_the_backoff_wall() {
+        use crate::pam_auth::PamVerifier;
+        // The REAL CURTAIN-2 verifier — its genuine off-thread channel bridge —
+        // over a scripted deny-only backend (a unit test NEVER runs real PAM).
+        // Confirms 5 real denials drive the existing 30s cooldown (lock 10).
+        let deny = std::sync::Arc::new(|_user: &str, _password: &str| {
+            Verdict::Denied("incorrect password".to_owned())
+        });
+        let verifier = PamVerifier::with_backend(Some("seat".to_owned()), deny);
+        let mut c = locked(Box::new(verifier));
+        c.reveal();
+
+        for i in 1..=4 {
+            attempt_async(&mut c, "wrong");
+            assert!(
+                matches!(c.phase, Phase::Revealing),
+                "deny {i} must return to the password stage"
+            );
+            assert_eq!(c.fails, i);
+            assert!(c.password.is_empty(), "the buffer clears on submit");
+        }
+
+        attempt_async(&mut c, "wrong");
+        let remaining = c
+            .backoff_remaining()
+            .expect("the 5th real denial must arm the backoff wall");
+        assert!((remaining - BACKOFF_SECS).abs() < 1e-3);
+        assert!(!c.stage_accepts_input(), "the field disables behind the wall");
+        assert!(c.engaged() && c.covers_fully());
     }
 
     #[test]
