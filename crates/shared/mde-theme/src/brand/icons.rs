@@ -1,6 +1,7 @@
 //! `brand::icons` — the monochrome Quasar line-art icon set (QBRAND-2).
 //!
-//! The 20 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10) embedded as
+//! The 32 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10 + the
+//! NAVBAR-W10-1 tray set) embedded as
 //! inline SVG consts behind [`IconId`], plus the SVG→raster loader
 //! ([`icon_image`]) every surface draws them through. The glyphs are authored
 //! in `currentColor` (the text-lockup wordmark excepted — see below), so ONE
@@ -56,9 +57,10 @@ macro_rules! quasar_svg {
 
 /// Identifier for every glyph in the Quasar brand set.
 ///
-/// The product marks, the 14 dock/surface glyphs and the 3 node-role badges —
-/// one variant per SVG in `assets/brand/quasar/`; [`IconId::svg`] resolves the
-/// embedded source.
+/// The product marks, the 14 dock/surface glyphs, the 3 node-role badges and
+/// the 12 Win10-taskbar tray glyphs (NAVBAR-W10-1, tuned to stay legible
+/// rasterized at 16px) — one variant per SVG in `assets/brand/quasar/`;
+/// [`IconId::svg`] resolves the embedded source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IconId {
     /// The round mesh-node constellation product mark (`mark.svg`, the 64×64
@@ -105,11 +107,42 @@ pub enum IconId {
     Server,
     /// The Lighthouse role badge.
     Lighthouse,
+    /// Tray: mesh signal strength — four ascending bars.
+    Signal,
+    /// Tray: active VDI session — a monitor carrying a two-node link mark
+    /// (the Desktop monitor + a connection, per NAVBAR-W10 W2/W10).
+    Sessions,
+    /// Tray: the overflow-flyout `^` chevron (NAVBAR-W10 W10/W13).
+    ChevronUp,
+    /// Tray: speaker with sound-wave arcs (volume).
+    Volume,
+    /// Tray: speaker with an `×` mark — the muted state for the volume
+    /// micro-flyout (NAVBAR-W10 W7).
+    VolumeMuted,
+    /// Tray: the Bluetooth rune, drawn 12 units wide so the crossing strokes
+    /// stay separable at 16px (no prior BT glyph existed in the set).
+    BluetoothSmall,
+    /// Tray: battery outline, no charge fill (the empty step of the W8
+    /// fill-level ladder; the other steps share this exact outline).
+    BatteryEmpty,
+    /// Tray: battery at ~25% — the shared outline + a 4-unit fill bar.
+    BatteryQuarter,
+    /// Tray: battery at ~50% — the shared outline + an 8-unit fill bar.
+    BatteryHalf,
+    /// Tray: battery at ~75% — the shared outline + a 12-unit fill bar.
+    BatteryThreeQuarter,
+    /// Tray: battery at 100% — the shared outline + the full 16-unit fill bar.
+    BatteryFull,
+    /// Tray: a standalone solid charge bolt sized to overlay any
+    /// `Battery*` glyph at the same raster size (the Win10 idiom: the bolt
+    /// spans the icon, overflowing the outline) — draw the fill-level glyph,
+    /// then this on top while charging. Also reads alone as "charging".
+    BatteryBolt,
 }
 
 impl IconId {
     /// Every glyph in the set, for exhaustive iteration (dock catalogs, tests).
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 32] = [
         Self::Mark,
         Self::Wordmark,
         Self::Node,
@@ -130,11 +163,41 @@ impl IconId {
         Self::Workstation,
         Self::Server,
         Self::Lighthouse,
+        Self::Signal,
+        Self::Sessions,
+        Self::ChevronUp,
+        Self::Volume,
+        Self::VolumeMuted,
+        Self::BluetoothSmall,
+        Self::BatteryEmpty,
+        Self::BatteryQuarter,
+        Self::BatteryHalf,
+        Self::BatteryThreeQuarter,
+        Self::BatteryFull,
+        Self::BatteryBolt,
+    ];
+
+    /// The tray glyph subset (NAVBAR-W10-1) — every glyph the 40px taskbar's
+    /// tray renders at 16px, for targeted iteration in the tray and its tests.
+    pub const TRAY: [Self; 12] = [
+        Self::Signal,
+        Self::Sessions,
+        Self::ChevronUp,
+        Self::Volume,
+        Self::VolumeMuted,
+        Self::BluetoothSmall,
+        Self::BatteryEmpty,
+        Self::BatteryQuarter,
+        Self::BatteryHalf,
+        Self::BatteryThreeQuarter,
+        Self::BatteryFull,
+        Self::BatteryBolt,
     ];
 
     /// The embedded SVG source for this glyph — `currentColor` line-art in a
-    /// square viewBox (`0 0 32 32` for the surface/role/node glyphs, `0 0 64
-    /// 64` for the mark); the wordmark alone is a `0 0 320 184` text lockup.
+    /// square viewBox (`0 0 32 32` for the surface/role/node/tray glyphs, `0
+    /// 0 64 64` for the mark); the wordmark alone is a `0 0 320 184` text
+    /// lockup.
     #[must_use]
     pub const fn svg(self) -> &'static str {
         match self {
@@ -158,6 +221,18 @@ impl IconId {
             Self::Workstation => quasar_svg!("role-workstation.svg"),
             Self::Server => quasar_svg!("role-server.svg"),
             Self::Lighthouse => quasar_svg!("role-lighthouse.svg"),
+            Self::Signal => quasar_svg!("tray-signal.svg"),
+            Self::Sessions => quasar_svg!("tray-sessions.svg"),
+            Self::ChevronUp => quasar_svg!("tray-chevron-up.svg"),
+            Self::Volume => quasar_svg!("tray-volume.svg"),
+            Self::VolumeMuted => quasar_svg!("tray-volume-muted.svg"),
+            Self::BluetoothSmall => quasar_svg!("tray-bluetooth-small.svg"),
+            Self::BatteryEmpty => quasar_svg!("tray-battery-empty.svg"),
+            Self::BatteryQuarter => quasar_svg!("tray-battery-quarter.svg"),
+            Self::BatteryHalf => quasar_svg!("tray-battery-half.svg"),
+            Self::BatteryThreeQuarter => quasar_svg!("tray-battery-three-quarter.svg"),
+            Self::BatteryFull => quasar_svg!("tray-battery-full.svg"),
+            Self::BatteryBolt => quasar_svg!("tray-battery-bolt.svg"),
         }
     }
 
@@ -187,6 +262,18 @@ impl IconId {
             Self::Workstation => "role-workstation",
             Self::Server => "role-server",
             Self::Lighthouse => "role-lighthouse",
+            Self::Signal => "tray-signal",
+            Self::Sessions => "tray-sessions",
+            Self::ChevronUp => "tray-chevron-up",
+            Self::Volume => "tray-volume",
+            Self::VolumeMuted => "tray-volume-muted",
+            Self::BluetoothSmall => "tray-bluetooth-small",
+            Self::BatteryEmpty => "tray-battery-empty",
+            Self::BatteryQuarter => "tray-battery-quarter",
+            Self::BatteryHalf => "tray-battery-half",
+            Self::BatteryThreeQuarter => "tray-battery-three-quarter",
+            Self::BatteryFull => "tray-battery-full",
+            Self::BatteryBolt => "tray-battery-bolt",
         }
     }
 }
@@ -440,14 +527,64 @@ mod tests {
     }
 
     #[test]
+    fn tray_glyphs_rasterize_nonempty_at_16_and_24() {
+        // NAVBAR-W10-1 §7 gate: the Win10 tray draws these at exactly 16px
+        // (24px covers the flyout/hi-DPI step) — every glyph must come back
+        // square, correctly sized and with real ink through the same
+        // icon_image loader the shell uses.
+        assert_eq!(IconId::TRAY.len(), 12, "tray subset size");
+        for id in IconId::TRAY {
+            for size in [16_u32, 24] {
+                let img = icon_image(id, size, TINT)
+                    .unwrap_or_else(|err| panic!("tray {id:?} @ {size}px failed: {err}"));
+                assert_eq!(img.height, size, "tray {id:?} @ {size}px height");
+                assert_eq!(img.width, size, "tray glyphs are square, {id:?}");
+                assert!(
+                    opaque_pixels(&img.rgba) > 0,
+                    "tray {id:?} @ {size}px rasterized empty"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn battery_fill_ladder_is_strictly_monotonic_at_16px() {
+        // The W8 fill-level ladder shares one outline and varies only the
+        // fill bar, so at tray size (16px) each step must ink strictly more
+        // pixels than the one below — proving the five levels stay visually
+        // distinct where it matters.
+        let ladder = [
+            IconId::BatteryEmpty,
+            IconId::BatteryQuarter,
+            IconId::BatteryHalf,
+            IconId::BatteryThreeQuarter,
+            IconId::BatteryFull,
+        ];
+        let inked: Vec<usize> = ladder
+            .iter()
+            .map(|&id| {
+                let img =
+                    icon_image(id, 16, TINT).unwrap_or_else(|err| panic!("{id:?} failed: {err}"));
+                opaque_pixels(&img.rgba)
+            })
+            .collect();
+        for pair in inked.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "battery fill ladder not monotonic at 16px: {inked:?}"
+            );
+        }
+    }
+
+    #[test]
     fn zero_size_is_an_error_not_a_panic() {
         assert_eq!(icon_image(IconId::Mark, 0, TINT), Err(IconError::ZeroSize));
     }
 
     #[test]
     fn ids_names_and_sources_are_distinct_and_exhaustive() {
-        // Guards a copy-paste slip in the two match tables: 20 ids, 20 unique
-        // names, 20 unique embedded sources, all valid-looking SVG.
+        // Guards a copy-paste slip in the two match tables: 32 ids, 32 unique
+        // names, 32 unique embedded sources, all valid-looking SVG.
         let mut names: Vec<&str> = IconId::ALL.iter().map(|id| id.name()).collect();
         names.sort_unstable();
         names.dedup();
