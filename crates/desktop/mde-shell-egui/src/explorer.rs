@@ -34,11 +34,14 @@
 //! - **Mosaic + IPAM (EXPLORER-11 / EXPLORER-10).** This unit is the hero-card
 //!   mode only. The zoomable mosaic overview + summary strip and the IPAM table
 //!   are their own modes; the category chips here are the seed of the #8 filter.
-//! - **Rich telemetry sparklines + per-type action bars (EXPLORER-4 / EXPLORER-5).**
-//!   The card shows the telemetry it can honestly read today (health tier, mesh
-//!   role/leader/version, any reported load/mem/uptime) and marks the rest
-//!   unknown; the load/mem/net **sparklines** and the armed action verbs fill the
-//!   same card without re-wiring this mount.
+//! - **Rich telemetry sparklines (EXPLORER-4).** The card shows a live status
+//!   ring, the mesh facts (role/leader/version), and a **metric grid** of
+//!   load / mem / net / uptime. Load and mem draw a real **sparkline** built from
+//!   the samples this shell has actually polled over time (a rolling per-unit
+//!   history, never synthesised — §7); a metric with no live source (net) or a
+//!   scalar-only metric (uptime) stays honestly dimmed rather than faking a
+//!   trend. The per-type action bars (EXPLORER-5) fill the same card without
+//!   re-wiring this mount.
 
 // This module is canvas/painter code (the hero glyphs, status ring, filmstrip
 // thumbnails). Its geometry is a few pixel positions per frame, so — exactly as
@@ -52,7 +55,7 @@
     clippy::suboptimal_flops
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -117,6 +120,26 @@ const RING_FRACTION: f32 = 0.32;
 const RING_MIN: f32 = Style::SP_XL * 2.0;
 /// Maximum hero ring diameter (four XL steps).
 const RING_MAX: f32 = Style::SP_XL * 4.0;
+
+// ── Telemetry sparklines (EXPLORER-4) ──
+/// Rolling telemetry history depth — 60 points ≈ 5 minutes at the 5 s poll
+/// cadence. A ring-buffer behaviour cap, not a metric literal.
+const HISTORY_LEN: usize = 60;
+/// A metric cell's / sparkline's plot width (2.5 XL grid steps — wide enough for
+/// a legible trend under the big value). A §4-grid behaviour param.
+const SPARK_W: f32 = Style::SP_XL * 2.5;
+/// Sparkline plot height (one L step).
+const SPARK_H: f32 = Style::SP_L;
+/// A metric cell's full height: the value line + the plot + the caption.
+const METRIC_CELL_H: f32 = Style::SP_XL * 2.25;
+/// Sparkline polyline stroke width (a painter behaviour param, like the ring).
+const SPARK_STROKE_W: f32 = 1.5;
+/// Memory sparkline full-scale — a 0–100 % axis.
+const MEM_FULL_SCALE: f32 = 100.0;
+/// Load sparkline reference ceiling: scale to at least 1.0 (one core busy) so an
+/// idle line reads low, and let a real peak above it expand the axis (never
+/// clipped) rather than pinning to a fabricated maximum.
+const LOAD_REF_CEIL: f32 = 1.0;
 
 // ─────────────────────────── wire mirrors (§6) ───────────────────────────
 
@@ -567,7 +590,13 @@ fn paint_status_ring(
 /// of half-extent `r` (Carbon-inspired, font-independent painter primitives —
 /// like the mesh-map canvas). `color` is the category accent.
 #[allow(clippy::many_single_char_names)]
-fn paint_kind_glyph(painter: &egui::Painter, center: egui::Pos2, r: f32, kind: UnitKind, color: Color32) {
+fn paint_kind_glyph(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    r: f32,
+    kind: UnitKind,
+    color: Color32,
+) {
     let stroke = Stroke::new(GLYPH_STROKE_W, color);
     match kind {
         // Peer — a hub with three spokes to satellite rings (a mesh node).
@@ -589,11 +618,17 @@ fn paint_kind_glyph(painter: &egui::Painter, center: egui::Pos2, r: f32, kind: U
             painter.rect_stroke(screen, Style::RADIUS * 0.5, stroke, StrokeKind::Middle);
             let base_y = screen.max.y + r * 0.45;
             painter.line_segment(
-                [egui::pos2(center.x, screen.max.y), egui::pos2(center.x, base_y)],
+                [
+                    egui::pos2(center.x, screen.max.y),
+                    egui::pos2(center.x, base_y),
+                ],
                 stroke,
             );
             painter.line_segment(
-                [egui::pos2(center.x - r * 0.5, base_y), egui::pos2(center.x + r * 0.5, base_y)],
+                [
+                    egui::pos2(center.x - r * 0.5, base_y),
+                    egui::pos2(center.x + r * 0.5, base_y),
+                ],
                 stroke,
             );
         }
@@ -601,10 +636,8 @@ fn paint_kind_glyph(painter: &egui::Painter, center: egui::Pos2, r: f32, kind: U
         UnitKind::Instance => {
             for k in 0u8..3 {
                 let cy = center.y + (f32::from(k) - 1.0) * r * 0.7;
-                let bay = Rect::from_center_size(
-                    egui::pos2(center.x, cy),
-                    Vec2::new(r * 1.7, r * 0.5),
-                );
+                let bay =
+                    Rect::from_center_size(egui::pos2(center.x, cy), Vec2::new(r * 1.7, r * 0.5));
                 painter.rect_stroke(bay, Style::RADIUS * 0.4, stroke, StrokeKind::Middle);
                 painter.circle_filled(egui::pos2(bay.min.x + r * 0.28, cy), GLYPH_STROKE_W, color);
             }
@@ -615,7 +648,10 @@ fn paint_kind_glyph(painter: &egui::Painter, center: egui::Pos2, r: f32, kind: U
             painter.rect_stroke(body, Style::RADIUS * 0.6, stroke, StrokeKind::Middle);
             let bar_y = body.max.y - r * 0.4;
             painter.line_segment(
-                [egui::pos2(body.min.x + r * 0.25, bar_y), egui::pos2(body.max.x - r * 0.25, bar_y)],
+                [
+                    egui::pos2(body.min.x + r * 0.25, bar_y),
+                    egui::pos2(body.max.x - r * 0.25, bar_y),
+                ],
                 stroke,
             );
         }
@@ -628,8 +664,10 @@ fn paint_kind_glyph(painter: &egui::Painter, center: egui::Pos2, r: f32, kind: U
         UnitKind::Network => {
             let nodes: [egui::Pos2; 3] = [
                 center + Vec2::angled(-std::f32::consts::FRAC_PI_2) * r,
-                center + Vec2::angled(std::f32::consts::FRAC_PI_2 + std::f32::consts::FRAC_PI_3) * r,
-                center + Vec2::angled(std::f32::consts::FRAC_PI_2 - std::f32::consts::FRAC_PI_3) * r,
+                center
+                    + Vec2::angled(std::f32::consts::FRAC_PI_2 + std::f32::consts::FRAC_PI_3) * r,
+                center
+                    + Vec2::angled(std::f32::consts::FRAC_PI_2 - std::f32::consts::FRAC_PI_3) * r,
             ];
             for k in 0..3 {
                 painter.line_segment([nodes[k], nodes[(k + 1) % 3]], stroke);
@@ -639,6 +677,43 @@ fn paint_kind_glyph(painter: &egui::Painter, center: egui::Pos2, r: f32, kind: U
             }
         }
     }
+}
+
+// ─────────────────────────── telemetry history (EXPLORER-4) ───────────────────────────
+
+/// A rolling ring of the real telemetry samples this shell has actually observed
+/// for one unit — the honest sparkline source (§7). Every point is a value read
+/// from a live mirror on a past poll, never synthesised: an empty series ⇒ the
+/// metric is honestly dimmed, never a fabricated demo curve. The daemon publishes
+/// scalars (EXPLORER-1) and the shell folds each poll's reading into the trend,
+/// so a live peer grows a genuine load/mem history without a new probe.
+#[derive(Default)]
+struct UnitHistory {
+    /// Observed 1-minute load averages, oldest → newest.
+    load1: VecDeque<f32>,
+    /// Observed memory-used percentages, oldest → newest.
+    mem_used_pct: VecDeque<f32>,
+}
+
+impl UnitHistory {
+    /// Fold this poll's readable scalars into the trend — a metric absent this
+    /// tick simply isn't recorded (its series stays honest, §7).
+    fn record(&mut self, t: &Telemetry) {
+        if let Some(v) = t.load1 {
+            push_bounded(&mut self.load1, v);
+        }
+        if let Some(v) = t.mem_used_pct {
+            push_bounded(&mut self.mem_used_pct, v);
+        }
+    }
+}
+
+/// Push `v` onto a bounded ring, dropping the oldest sample past [`HISTORY_LEN`].
+fn push_bounded(ring: &mut VecDeque<f32>, v: f32) {
+    if ring.len() >= HISTORY_LEN {
+        ring.pop_front();
+    }
+    ring.push_back(v);
 }
 
 // ─────────────────────────── the surface state ───────────────────────────
@@ -652,6 +727,9 @@ pub struct ExplorerState {
     local_host: String,
     /// The folded shelf: deduped, self-first, proximity-ordered.
     units: Vec<Unit>,
+    /// Rolling per-unit telemetry history keyed by unit id — the sparkline source
+    /// (EXPLORER-4), sampled each refresh from real readings only (§7).
+    history: HashMap<String, UnitHistory>,
     /// The focused hero index, into the currently-**filtered** view.
     focus: usize,
     /// The active category filter (`None` ⇒ all, #8).
@@ -668,6 +746,7 @@ impl Default for ExplorerState {
             }),
             local_host: local_hostname(),
             units: Vec::new(),
+            history: HashMap::new(),
             focus: 0,
             filter: None,
             last_poll: None,
@@ -696,6 +775,26 @@ impl ExplorerState {
     fn refresh(&mut self) {
         let states = self.client.read();
         self.units = fold_units(&states, &self.local_host);
+        self.sample_history();
+    }
+
+    /// Fold this poll's readable telemetry into each unit's rolling sparkline
+    /// history (EXPLORER-4). Every recorded point is a value we actually read this
+    /// tick (§7 — the trend is observed, never synthesised); a unit that has left
+    /// the shelf has its history pruned so a departed unit can't leave a ghost
+    /// curve behind.
+    fn sample_history(&mut self) {
+        let live: HashSet<&str> = self.units.iter().map(|u| u.id.as_str()).collect();
+        self.history.retain(|id, _| live.contains(id.as_str()));
+        for unit in &self.units {
+            let Some(t) = &unit.telemetry else { continue };
+            // Only start/extend a trend for a unit that reports a series metric —
+            // an all-absent telemetry block leaves the history honestly empty.
+            if t.load1.is_none() && t.mem_used_pct.is_none() {
+                continue;
+            }
+            self.history.entry(unit.id.clone()).or_default().record(t);
+        }
     }
 
     /// The indices of `units` matching the active filter (all when `None`).
@@ -806,7 +905,12 @@ impl ExplorerState {
         let total = self.units.len();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = Style::SP_S;
-            if chip(ui, &format!("All · {total}"), self.filter.is_none(), Style::ACCENT) {
+            if chip(
+                ui,
+                &format!("All · {total}"),
+                self.filter.is_none(),
+                Style::ACCENT,
+            ) {
                 self.set_filter(None);
             }
             for cat in Category::ALL {
@@ -855,11 +959,12 @@ impl ExplorerState {
         match indices.get(self.focus).copied() {
             Some(idx) => {
                 let unit = self.units[idx].clone();
-                hero_card(&mut child, &unit, false);
+                let history = self.history.get(&unit.id);
+                hero_card(&mut child, &unit, false, history);
             }
             None if self.filter.is_none() => {
                 // #23 — no mirror yet: show THIS node, discovering.
-                hero_card(&mut child, &self_placeholder(&self.local_host), true);
+                hero_card(&mut child, &self_placeholder(&self.local_host), true, None);
             }
             None => {
                 // A filter with no matches — honest, not blank.
@@ -920,15 +1025,35 @@ impl ExplorerState {
         let h = w * 0.4;
         let stroke = Stroke::new(GLYPH_STROKE_W, color);
         if right {
-            ui.painter()
-                .line_segment([egui::pos2(c.x - h * 0.5, c.y - h), egui::pos2(c.x + h * 0.5, c.y)], stroke);
-            ui.painter()
-                .line_segment([egui::pos2(c.x + h * 0.5, c.y), egui::pos2(c.x - h * 0.5, c.y + h)], stroke);
+            ui.painter().line_segment(
+                [
+                    egui::pos2(c.x - h * 0.5, c.y - h),
+                    egui::pos2(c.x + h * 0.5, c.y),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(c.x + h * 0.5, c.y),
+                    egui::pos2(c.x - h * 0.5, c.y + h),
+                ],
+                stroke,
+            );
         } else {
-            ui.painter()
-                .line_segment([egui::pos2(c.x + h * 0.5, c.y - h), egui::pos2(c.x - h * 0.5, c.y)], stroke);
-            ui.painter()
-                .line_segment([egui::pos2(c.x - h * 0.5, c.y), egui::pos2(c.x + h * 0.5, c.y + h)], stroke);
+            ui.painter().line_segment(
+                [
+                    egui::pos2(c.x + h * 0.5, c.y - h),
+                    egui::pos2(c.x - h * 0.5, c.y),
+                ],
+                stroke,
+            );
+            ui.painter().line_segment(
+                [
+                    egui::pos2(c.x - h * 0.5, c.y),
+                    egui::pos2(c.x + h * 0.5, c.y + h),
+                ],
+                stroke,
+            );
         }
         enabled && resp.clicked()
     }
@@ -941,29 +1066,28 @@ impl ExplorerState {
             ui.allocate_space(Vec2::new(ui.available_width(), THUMB_H));
             return;
         }
-        egui::ScrollArea::horizontal()
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = Style::SP_S;
-                    let mut last_cat: Option<Category> = None;
-                    let mut jump: Option<usize> = None;
-                    for (pos, &idx) in indices.iter().enumerate() {
-                        let unit = &self.units[idx];
-                        let cat = unit.kind.category();
-                        // Category dividers (#8) — only meaningful in the unfiltered view.
-                        if self.filter.is_none() && last_cat != Some(cat) {
-                            filmstrip_divider(ui, cat);
-                            last_cat = Some(cat);
-                        }
-                        if thumbnail(ui, unit, pos == self.focus) {
-                            jump = Some(pos);
-                        }
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = Style::SP_S;
+                let mut last_cat: Option<Category> = None;
+                let mut jump: Option<usize> = None;
+                for (pos, &idx) in indices.iter().enumerate() {
+                    let unit = &self.units[idx];
+                    let cat = unit.kind.category();
+                    // Category dividers (#8) — only meaningful in the unfiltered view.
+                    if self.filter.is_none() && last_cat != Some(cat) {
+                        filmstrip_divider(ui, cat);
+                        last_cat = Some(cat);
                     }
-                    if let Some(pos) = jump {
-                        self.focus = pos;
+                    if thumbnail(ui, unit, pos == self.focus) {
+                        jump = Some(pos);
                     }
-                });
+                }
+                if let Some(pos) = jump {
+                    self.focus = pos;
+                }
             });
+        });
     }
 }
 
@@ -990,12 +1114,16 @@ fn self_placeholder(host: &str) -> Unit {
 /// A Carbon filter/nav pill; returns whether it was clicked. Active = accent
 /// fill; inactive = surface with a dim border (all §4 tokens).
 fn chip(ui: &mut egui::Ui, label: &str, active: bool, accent: Color32) -> bool {
-    let text = RichText::new(label)
-        .size(Style::SMALL)
-        .color(if active { Style::BG } else { Style::TEXT });
+    let text =
+        RichText::new(label)
+            .size(Style::SMALL)
+            .color(if active { Style::BG } else { Style::TEXT });
     let button = egui::Button::new(text)
         .fill(if active { accent } else { Style::SURFACE })
-        .stroke(Stroke::new(1.0, if active { accent } else { Style::BORDER }));
+        .stroke(Stroke::new(
+            1.0,
+            if active { accent } else { Style::BORDER },
+        ));
     ui.add(button).clicked()
 }
 
@@ -1004,7 +1132,11 @@ fn chip(ui: &mut egui::Ui, label: &str, active: bool, accent: Color32) -> bool {
 fn filmstrip_divider(ui: &mut egui::Ui, cat: Category) {
     ui.vertical(|ui| {
         ui.add_space(Style::SP_XS);
-        ui.label(RichText::new(cat.label()).size(Style::SMALL).color(cat.accent()));
+        ui.label(
+            RichText::new(cat.label())
+                .size(Style::SMALL)
+                .color(cat.accent()),
+        );
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(Style::SP_XS, THUMB_H * 0.6), Sense::hover());
         ui.painter().line_segment(
@@ -1030,16 +1162,30 @@ fn thumbnail(ui: &mut egui::Ui, unit: &Unit, focused: bool) -> bool {
             } else {
                 Style::BORDER
             };
-            ui.painter().rect_filled(rect, Style::RADIUS, Style::SURFACE);
             ui.painter()
-                .rect_stroke(rect, Style::RADIUS, Stroke::new(1.0, border), StrokeKind::Inside);
+                .rect_filled(rect, Style::RADIUS, Style::SURFACE);
+            ui.painter().rect_stroke(
+                rect,
+                Style::RADIUS,
+                Stroke::new(1.0, border),
+                StrokeKind::Inside,
+            );
             // Mini glyph.
             let glyph_c = egui::pos2(rect.center().x, rect.min.y + THUMB_H * 0.36);
-            paint_kind_glyph(ui.painter(), glyph_c, THUMB_H * 0.2, unit.kind, cat.accent());
+            paint_kind_glyph(
+                ui.painter(),
+                glyph_c,
+                THUMB_H * 0.2,
+                unit.kind,
+                cat.accent(),
+            );
             // Status dot.
             if let Some(h) = unit.health {
-                ui.painter()
-                    .circle_filled(rect.right_top() + Vec2::new(-Style::SP_S, Style::SP_S), Style::SP_XS * 0.7, h.ring_color());
+                ui.painter().circle_filled(
+                    rect.right_top() + Vec2::new(-Style::SP_S, Style::SP_S),
+                    Style::SP_XS * 0.7,
+                    h.ring_color(),
+                );
             }
             // Truncated name.
             let name = truncate(&unit.name, 12);
@@ -1069,20 +1215,28 @@ fn truncate(s: &str, max: usize) -> String {
 /// The hero card body (#9/#10/#11/#12): the status ring + type glyph, the
 /// name/type/reachability headline, and rich telemetry when reachable else a
 /// dimmed-minimal card with explicit unknowns. `discovering` renders the #23
-/// self card's "Discovering units…" line.
-fn hero_card(ui: &mut egui::Ui, unit: &Unit, discovering: bool) {
+/// self card's "Discovering units…" line; `history` carries the focused unit's
+/// rolling sparkline samples (EXPLORER-4, `None` for the placeholder/dimmed path).
+fn hero_card(ui: &mut egui::Ui, unit: &Unit, discovering: bool, history: Option<&UnitHistory>) {
     let cat = unit.kind.category();
     let rich = hero_is_rich(unit);
     ui.add_space(Style::SP_L);
 
     // The status ring + type glyph (#9).
-    let side = (ui.available_width().min(ui.available_height()) * RING_FRACTION)
-        .clamp(RING_MIN, RING_MAX);
+    let side =
+        (ui.available_width().min(ui.available_height()) * RING_FRACTION).clamp(RING_MIN, RING_MAX);
     let (ring_rect, _) = ui.allocate_exact_size(Vec2::splat(side), Sense::hover());
     let center = ring_rect.center();
     let radius = side * 0.5 - RING_STROKE_W;
     let time = ui.input(|i| i.time);
-    let spinning = paint_status_ring(ui.painter(), center, radius, unit.health, cat.accent(), time);
+    let spinning = paint_status_ring(
+        ui.painter(),
+        center,
+        radius,
+        unit.health,
+        cat.accent(),
+        time,
+    );
     paint_kind_glyph(ui.painter(), center, radius * 0.5, unit.kind, cat.accent());
     if spinning {
         ui.ctx().request_repaint();
@@ -1109,9 +1263,12 @@ fn hero_card(ui: &mut egui::Ui, unit: &Unit, discovering: bool) {
                 .background_color(Style::SURFACE_HI),
         );
         ui.label(
-            RichText::new(reachability_line(&unit.reachability, unit.address.as_deref()))
-                .size(Style::BODY)
-                .color(Style::TEXT_DIM),
+            RichText::new(reachability_line(
+                &unit.reachability,
+                unit.address.as_deref(),
+            ))
+            .size(Style::BODY)
+            .color(Style::TEXT_DIM),
         );
     });
 
@@ -1123,7 +1280,7 @@ fn hero_card(ui: &mut egui::Ui, unit: &Unit, discovering: bool) {
     }
 
     if rich {
-        hero_telemetry(ui, unit);
+        hero_telemetry(ui, unit, history);
     } else {
         // Dimmed-minimal card (#12) — only what's known, no faked fields (§7).
         ui.scope(|ui| {
@@ -1166,11 +1323,13 @@ const fn hero_is_rich(unit: &Unit) -> bool {
     }
 }
 
-/// The rich telemetry region (#11): the health pill, a peer's mesh facts
-/// (role/leader/version), and any reported load/mem/uptime — or an honest
-/// "Live telemetry not yet reported" line when a readable unit has none yet (§7;
-/// EXPLORER-4 fills the sparklines here).
-fn hero_telemetry(ui: &mut egui::Ui, unit: &Unit) {
+/// The rich telemetry region (#11, EXPLORER-4): the health pill, a peer's mesh
+/// facts (role/leader/version), and the **metric grid** — load / mem / net /
+/// uptime, load and mem drawing a real sparkline from `history` — or an honest
+/// "Live telemetry not yet reported" line when a readable unit has nothing to
+/// show yet (§7).
+fn hero_telemetry(ui: &mut egui::Ui, unit: &Unit, history: Option<&UnitHistory>) {
+    let accent = unit.kind.category().accent();
     if let Some(health) = unit.health {
         ui.label(
             RichText::new(health_label(health))
@@ -1197,35 +1356,185 @@ fn hero_telemetry(ui: &mut egui::Ui, unit: &Unit) {
             );
         }
     }
-    match &unit.telemetry {
-        Some(t) if t.any() => {
-            ui.add_space(Style::SP_S);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = Style::SP_L;
-                ui.add_space(ui.available_width() * 0.5 - Style::SP_XL * 2.0);
-                if let Some(load) = t.load1 {
-                    stat(ui, "load", format!("{load:.2}"));
-                }
-                if let Some(mem) = t.mem_used_pct {
-                    stat(ui, "mem", format!("{mem:.0}%"));
-                }
-                if let Some(up) = t.uptime_s {
-                    stat(ui, "uptime", fmt_duration(up));
-                }
-            });
-        }
-        _ => {
-            muted_note(ui, "Live telemetry not yet reported.");
-        }
+
+    // The load/mem sparklines draw only from real accumulated samples (§7).
+    let load_series = history.map(|h| &h.load1).filter(|s| !s.is_empty());
+    let mem_series = history.map(|h| &h.mem_used_pct).filter(|s| !s.is_empty());
+    let telemetry = unit.telemetry.clone().unwrap_or_default();
+    // Show the grid once there's *anything* real to show — a scalar this tick or
+    // an accumulated trend; otherwise the honest "nothing yet" line, not a wall
+    // of empty cells.
+    if telemetry.any() || load_series.is_some() || mem_series.is_some() {
+        ui.add_space(Style::SP_S);
+        metric_grid(ui, &telemetry, load_series, mem_series, accent);
+    } else {
+        muted_note(ui, "Live telemetry not yet reported.");
     }
 }
 
-/// A compact labelled stat cell (value over caption) for the telemetry row.
-fn stat(ui: &mut egui::Ui, caption: &str, value: String) {
-    ui.vertical(|ui| {
-        ui.label(RichText::new(value).size(Style::BODY).strong().color(Style::TEXT));
-        ui.label(RichText::new(caption).size(Style::SMALL).color(Style::TEXT_DIM));
-    });
+/// The centred load · mem · net · uptime metric grid (EXPLORER-4). A fixed-width
+/// row so the surrounding top-down-centre layout centres it cleanly. Each metric
+/// is honest field-by-field: a readable value + sparkline where a source exists,
+/// a dimmed "no source" cell where none does (net), never a fabricated trend.
+fn metric_grid(
+    ui: &mut egui::Ui,
+    t: &Telemetry,
+    load_series: Option<&VecDeque<f32>>,
+    mem_series: Option<&VecDeque<f32>>,
+    accent: Color32,
+) {
+    let row_w = SPARK_W * 4.0 + Style::SP_L * 3.0;
+    ui.allocate_ui_with_layout(
+        Vec2::new(row_w, METRIC_CELL_H),
+        Layout::left_to_right(Align::Min),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = Style::SP_L;
+            metric_cell(
+                ui,
+                "load",
+                t.load1.map(|v| format!("{v:.2}")),
+                load_series,
+                LOAD_REF_CEIL,
+                accent,
+            );
+            metric_cell(
+                ui,
+                "mem",
+                t.mem_used_pct.map(|v| format!("{v:.0}%")),
+                mem_series,
+                MEM_FULL_SCALE,
+                accent,
+            );
+            // Net has no live source on today's mirror — an honest dimmed cell,
+            // not a faked throughput curve (§7). It lights up when the aggregator
+            // begins reporting a rate.
+            metric_cell(ui, "net", None, None, 0.0, accent);
+            // Uptime is a scalar counter, not a trend — show the value with a
+            // neutral baseline rather than a meaningless ramp.
+            metric_cell(
+                ui,
+                "uptime",
+                t.uptime_s.map(fmt_duration),
+                None,
+                0.0,
+                accent,
+            );
+        },
+    );
+}
+
+/// One metric cell: the current value (or a dimmed "—" when unreadable), a
+/// sparkline of the real observed `series` when it has ≥2 points, and a caption.
+/// The placeholder is honest per case: "collecting…" for a readable metric still
+/// filling its trend, a neutral baseline for a scalar-only metric, "no source"
+/// where nothing is reported at all (§7).
+fn metric_cell(
+    ui: &mut egui::Ui,
+    caption: &str,
+    value: Option<String>,
+    series: Option<&VecDeque<f32>>,
+    full_scale: f32,
+    color: Color32,
+) {
+    ui.allocate_ui_with_layout(
+        Vec2::new(SPARK_W, METRIC_CELL_H),
+        Layout::top_down(Align::Center),
+        |ui| {
+            ui.set_min_width(SPARK_W);
+            let has_value = value.is_some();
+            match value {
+                Some(v) => ui.label(
+                    RichText::new(v)
+                        .size(Style::BODY)
+                        .strong()
+                        .color(Style::TEXT),
+                ),
+                None => ui.label(
+                    RichText::new("—")
+                        .size(Style::BODY)
+                        .strong()
+                        .color(Style::TEXT_DIM),
+                ),
+            };
+            match (series, has_value) {
+                (Some(s), _) if s.len() >= 2 => sparkline(ui, s, full_scale, color),
+                // A readable series metric that hasn't filled two points yet.
+                (Some(_), _) => spark_note(ui, "collecting…"),
+                // A scalar-only metric (uptime): a neutral baseline, no fake trend.
+                (None, true) => spark_baseline(ui),
+                // No live source at all (net): honestly dimmed unknown.
+                (None, false) => spark_note(ui, "no source"),
+            }
+            ui.label(
+                RichText::new(caption)
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            );
+        },
+    );
+}
+
+/// Draw a sparkline of `samples` (oldest → newest) scaled to `[0, full_scale]`,
+/// the axis expanding to fit any real peak above the reference so a spike is
+/// never clipped. Newest reading dotted. Real observed points only — the caller
+/// guarantees ≥2 (§7).
+fn sparkline(ui: &mut egui::Ui, samples: &VecDeque<f32>, full_scale: f32, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(SPARK_W, SPARK_H), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, Style::RADIUS * 0.5, Style::SURFACE);
+    let n = samples.len();
+    if n < 2 {
+        return;
+    }
+    // Scale to the metric's reference, but never below a real peak (no clipping).
+    let peak = samples
+        .iter()
+        .copied()
+        .fold(full_scale, f32::max)
+        .max(f32::EPSILON);
+    let pad = SPARK_STROKE_W;
+    let plot_h = rect.height() - pad * 2.0;
+    let x_at = |i: usize| rect.min.x + rect.width() * (i as f32 / (n - 1) as f32);
+    let y_at = |v: f32| rect.max.y - pad - plot_h * (v / peak).clamp(0.0, 1.0);
+    let stroke = Stroke::new(SPARK_STROKE_W, color);
+    let pts: Vec<egui::Pos2> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| egui::pos2(x_at(i), y_at(v)))
+        .collect();
+    for seg in pts.windows(2) {
+        painter.line_segment([seg[0], seg[1]], stroke);
+    }
+    // Emphasise the newest reading with a dot.
+    if let Some(&last) = pts.last() {
+        painter.circle_filled(last, SPARK_STROKE_W * 1.5, color);
+    }
+}
+
+/// A dimmed placeholder occupying the sparkline's footprint (keeps the grid rows
+/// aligned) with an honest short caption — "collecting…" / "no source" (§7).
+fn spark_note(ui: &mut egui::Ui, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(SPARK_W, SPARK_H), Sense::hover());
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::proportional(Style::SMALL),
+        Style::TEXT_DIM,
+    );
+}
+
+/// A neutral baseline in the sparkline footprint for a scalar-only metric (its
+/// value is real, but there is no series to trend — so no fabricated ramp, §7).
+fn spark_baseline(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(SPARK_W, SPARK_H), Sense::hover());
+    ui.painter().line_segment(
+        [
+            egui::pos2(rect.min.x, rect.center().y),
+            egui::pos2(rect.max.x, rect.center().y),
+        ],
+        Stroke::new(1.0, Style::BORDER),
+    );
 }
 
 /// The human label for a health tier.
@@ -1258,12 +1567,21 @@ mod tests {
                 client: Box::new(FakeUnits(states)),
                 local_host: host.to_string(),
                 units: Vec::new(),
+                history: HashMap::new(),
                 focus: 0,
                 filter: None,
                 last_poll: None,
             };
             s.refresh();
             s
+        }
+    }
+
+    /// A reachable peer carrying live telemetry — the sparkline-path fixture.
+    fn peer_with_telemetry(id: &str, name: &str, t: Telemetry) -> Unit {
+        Unit {
+            telemetry: Some(t),
+            ..unit(id, UnitKind::Peer, name, now_ms())
         }
     }
 
@@ -1349,11 +1667,11 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "peer:me",             // self first (#23)
-                "peer:alpha",          // then mesh by name
+                "peer:me",    // self first (#23)
+                "peer:alpha", // then mesh by name
                 "peer:zeta",
-                "lan:aa",              // then LAN
-                "cloud:instance:i1",   // then cloud
+                "lan:aa",            // then LAN
+                "cloud:instance:i1", // then cloud
             ]
         );
     }
@@ -1467,7 +1785,12 @@ mod tests {
             10
         )));
         // A volume/image/network is a summary card, not rich telemetry.
-        assert!(!hero_is_rich(&unit("cloud:volume:v", UnitKind::Volume, "v", 10)));
+        assert!(!hero_is_rich(&unit(
+            "cloud:volume:v",
+            UnitKind::Volume,
+            "v",
+            10
+        )));
     }
 
     #[test]
@@ -1503,13 +1826,21 @@ mod tests {
             ],
         }];
 
-        for filter in [None, Some(Category::Mesh), Some(Category::Lan), Some(Category::Cloud)] {
+        for filter in [
+            None,
+            Some(Category::Mesh),
+            Some(Category::Lan),
+            Some(Category::Cloud),
+        ] {
             let mut s = ExplorerState::with_fake(states.clone(), "me");
             s.set_filter(filter);
             let ctx = egui::Context::default();
             Style::install(&ctx);
             let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(1200.0, 800.0))),
+                screen_rect: Some(Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    Vec2::new(1200.0, 800.0),
+                )),
                 ..Default::default()
             };
             let out = ctx.run(input, |ctx| {
@@ -1524,12 +1855,162 @@ mod tests {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(1000.0, 700.0))),
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                Vec2::new(1000.0, 700.0),
+            )),
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| empty.show(ui));
         });
         assert!(!ctx.tessellate(out.shapes, out.pixels_per_point).is_empty());
+    }
+
+    #[test]
+    fn telemetry_history_accumulates_bounded_real_samples() {
+        // A reachable peer that reports load/mem: repeated polls build a REAL
+        // observed series (every point a value we read, never synthesised, §7),
+        // ring-bounded to the history cap.
+        let peer = peer_with_telemetry(
+            "peer:me",
+            "me",
+            Telemetry {
+                load1: Some(0.5),
+                mem_used_pct: Some(40.0),
+                uptime_s: Some(120),
+            },
+        );
+        let states = vec![UnitsState {
+            host: "me".into(),
+            units: vec![peer],
+        }];
+        let mut s = ExplorerState::with_fake(states, "me"); // one refresh already
+        for _ in 0..(HISTORY_LEN + 5) {
+            s.refresh();
+        }
+        let h = s.history.get("peer:me").expect("peer accrued history");
+        assert_eq!(h.load1.len(), HISTORY_LEN, "series ring-bounded to the cap");
+        assert_eq!(h.mem_used_pct.len(), HISTORY_LEN);
+        assert!(
+            h.load1.iter().all(|&v| (v - 0.5).abs() < f32::EPSILON),
+            "each point is the real observed value, not a faked curve"
+        );
+    }
+
+    #[test]
+    fn history_prunes_departed_units() {
+        // A unit that leaves the shelf drops its stale history — no ghost curve.
+        let present = vec![UnitsState {
+            host: "me".into(),
+            units: vec![peer_with_telemetry(
+                "peer:gone",
+                "gone",
+                Telemetry {
+                    load1: Some(1.0),
+                    ..Default::default()
+                },
+            )],
+        }];
+        let mut s = ExplorerState::with_fake(present, "me");
+        assert!(s.history.contains_key("peer:gone"));
+        // The next read returns an empty shelf → the unit departs.
+        s.client = Box::new(FakeUnits(vec![]));
+        s.refresh();
+        assert!(
+            !s.history.contains_key("peer:gone"),
+            "stale history pruned when the unit leaves"
+        );
+    }
+
+    #[test]
+    fn a_unit_without_a_series_metric_records_no_history() {
+        // Telemetry with only a scalar counter (uptime) and no load/mem must NOT
+        // start a trend — the sparkline source stays honestly empty (§7).
+        let peer = peer_with_telemetry(
+            "peer:me",
+            "me",
+            Telemetry {
+                load1: None,
+                mem_used_pct: None,
+                uptime_s: Some(999),
+            },
+        );
+        let s = ExplorerState::with_fake(
+            vec![UnitsState {
+                host: "me".into(),
+                units: vec![peer],
+            }],
+            "me",
+        );
+        assert!(
+            s.history.get("peer:me").is_none(),
+            "no load/mem → no sparkline history minted"
+        );
+    }
+
+    #[test]
+    fn hero_card_renders_sparklines_when_reachable_else_dimmed() {
+        // A reachable peer with telemetry, polled enough to fill a real sparkline,
+        // renders the rich metric grid; an off-mesh LAN host renders the
+        // dimmed-minimal card with no telemetry grid (#11/#12).
+        let peer = Unit {
+            mesh: Some(MeshFacts {
+                role: Some("workstation".into()),
+                leader: false,
+                mde_version: Some("12.0.0".into()),
+            }),
+            ..peer_with_telemetry(
+                "peer:me",
+                "me",
+                Telemetry {
+                    load1: Some(0.8),
+                    mem_used_pct: Some(55.0),
+                    uptime_s: Some(90_061),
+                },
+            )
+        };
+        let states = vec![UnitsState {
+            host: "me".into(),
+            units: vec![peer, unit("lan:aa", UnitKind::LanHost, "printer", now_ms())],
+        }];
+        let mut s = ExplorerState::with_fake(states, "me");
+        for _ in 0..4 {
+            s.refresh(); // ≥2 samples → a drawable sparkline
+        }
+        assert!(
+            s.history
+                .get("peer:me")
+                .is_some_and(|h| h.load1.len() >= 2 && h.mem_used_pct.len() >= 2),
+            "the sparkline has ≥2 real points to draw"
+        );
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                Vec2::new(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        // Reachable peer focused → the sparkline / metric-grid path.
+        s.focus = 0;
+        let out = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| s.show(ui));
+        });
+        assert!(
+            !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty(),
+            "the rich sparkline card drew primitives"
+        );
+        // Dimmed LAN host focused → the dimmed-minimal path (no metric grid).
+        s.focus = 1;
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| s.show(ui));
+        });
+        assert!(
+            !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty(),
+            "the dimmed-minimal card drew primitives"
+        );
     }
 }
