@@ -10,6 +10,7 @@ use crate::workers::container::{Container, ContainerState};
 
 use super::fleet::{CloudDesired, FleetStateError, FleetStateSource};
 use super::podman::{KollaServiceSpec, PodmanRunner, RunnerError};
+use super::verbs::{CloudInstance, InstanceOpError, InstanceOps, LifecycleAction};
 
 /// An in-memory [`FleetStateSource`]: a fixed doctrine view or a typed gate.
 pub struct FakeFleet {
@@ -231,6 +232,77 @@ impl PodmanRunner for FakeRunner {
         self.record(format!("remove:{name}"));
         self.gate()?;
         self.containers.lock().unwrap().remove(name);
+        Ok(())
+    }
+}
+
+/// QC-11 — an in-memory [`InstanceOps`] recording calls + a canned instance
+/// roster, so the typed cloud verbs run without the `openstack` CLI. `list`
+/// answers the seeded roster; each `perform` records `<verb>:<instance>`; a
+/// `failing` fake makes every op answer a typed [`InstanceOpError`] (the honest
+/// seam-failure path).
+pub struct FakeInstanceOps {
+    instances: Vec<CloudInstance>,
+    calls: Mutex<Vec<String>>,
+    /// When set, every op fails with this reason (a typed CLI error).
+    fail: Option<String>,
+}
+
+impl FakeInstanceOps {
+    /// A fake with no instances and no planned failure.
+    pub fn new() -> Self {
+        Self {
+            instances: Vec::new(),
+            calls: Mutex::new(Vec::new()),
+            fail: None,
+        }
+    }
+
+    /// Seed the roster `list` returns.
+    #[must_use]
+    pub fn with_instances(mut self, instances: Vec<CloudInstance>) -> Self {
+        self.instances = instances;
+        self
+    }
+
+    /// Make every op answer a typed CLI failure with `reason`.
+    #[must_use]
+    pub fn failing(mut self, reason: &str) -> Self {
+        self.fail = Some(reason.to_string());
+        self
+    }
+
+    /// The recorded op log (`list` / `start:<id>` / `delete:<id>` / …).
+    pub fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl InstanceOps for FakeInstanceOps {
+    fn list(&self) -> Result<Vec<CloudInstance>, InstanceOpError> {
+        self.calls.lock().unwrap().push("list".to_string());
+        if let Some(reason) = &self.fail {
+            return Err(InstanceOpError::Command {
+                cmd: "server list".into(),
+                code: 1,
+                stderr: reason.clone(),
+            });
+        }
+        Ok(self.instances.clone())
+    }
+
+    fn perform(&self, action: LifecycleAction, instance: &str) -> Result<(), InstanceOpError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("{}:{instance}", action.cli_verb()));
+        if let Some(reason) = &self.fail {
+            return Err(InstanceOpError::Command {
+                cmd: format!("server {}", action.cli_verb()),
+                code: 1,
+                stderr: reason.clone(),
+            });
+        }
         Ok(())
     }
 }

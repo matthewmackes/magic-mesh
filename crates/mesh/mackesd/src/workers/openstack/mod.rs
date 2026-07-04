@@ -62,6 +62,12 @@
 //! - [`podman`] — QC-5 grows per-service health probes.
 //! - [`reconcile`] — QC-5 extends the mirror with API health; QC-11's typed
 //!   verbs consume the same state model.
+//! - [`verbs`] — QC-11's typed `action/cloud/*` Bus verb surface (Q40/Q70): the
+//!   read verbs fold the [`reconcile::OpenStackState`] mirror; the
+//!   `list-instances` + `instance-{start,stop,reboot,delete}` verbs gate on the
+//!   real state and drive the Nova [`verbs::InstanceOps`] seam, so every mesh
+//!   client (the Cloud plane, the phone, `meshctl`) drives the cloud through
+//!   typed requests, never raw `openstack`.
 
 #![cfg(feature = "async-services")]
 
@@ -76,11 +82,15 @@ pub mod reconcile;
 pub mod secrets;
 #[cfg(test)]
 pub(crate) mod testkit;
+pub mod verbs;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use mde_bus::persist::Persist;
 
 use super::nebula_supervisor::DEFAULT_OVERLAY_IP_PATH;
 use super::{ShutdownToken, Worker};
@@ -90,6 +100,7 @@ use config_render::{render_cloud_bootstrap, OverlayBind};
 use fleet::{FleetStateSource, MeshFleetState};
 use podman::{PodmanCli, PodmanRunner, DEFAULT_KOLLA_CONFIG_ROOT};
 use reconcile::{converge_cycle, CycleOutcome, DoctrineStatus, OpenStackState};
+use verbs::{drain_cloud_verbs, InstanceOps, OpenstackCli, CLOUD_VERBS};
 
 /// Converge cadence.
 ///
@@ -109,6 +120,32 @@ pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(60);
 #[must_use]
 pub fn state_topic(node: &str) -> String {
     format!("state/openstack/{node}")
+}
+
+/// The default Bus root (the persisted message tree), matching every other
+/// mackesd worker's resolution (the QC-11 verb responder drains + replies here).
+fn default_bus_root() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("mde").join("bus"))
+}
+
+/// QC-11 — seed each cloud verb topic's request cursor at its tail so a worker
+/// restart doesn't replay stale requests (never re-performs a queued lifecycle
+/// op). A missing Bus store leaves every cursor `None`; the first drain then
+/// starts clean.
+fn seed_verb_cursors(bus_root: Option<&Path>) -> BTreeMap<String, Option<String>> {
+    let mut cursors = BTreeMap::new();
+    let Some(root) = bus_root else {
+        return cursors;
+    };
+    let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        return cursors;
+    };
+    for verb in CLOUD_VERBS {
+        let topic = verbs::cloud_action_topic(verb);
+        let latest = persist.latest_ulid(&topic).ok().flatten();
+        cursors.insert(topic, latest);
+    }
+    cursors
 }
 
 /// Publish a JSON body to `topic` via the `mde-bus` CLI — the same
@@ -189,6 +226,12 @@ pub struct OpenstackWorker {
     /// The podman seam (production: [`PodmanCli`]). `Arc` so each cycle runs
     /// on a `spawn_blocking` thread without borrowing `self`.
     runner: Arc<dyn PodmanRunner + Send + Sync>,
+    /// QC-11 — the Nova instance seam the typed `action/cloud/instance-*`
+    /// lifecycle + `list-instances` verbs drive (production: [`OpenstackCli`]).
+    /// `Arc` so each verb drain runs on a `spawn_blocking` thread (an
+    /// `openstack` shell-out never pins the async runtime) without borrowing
+    /// `self`.
+    instances: Arc<dyn InstanceOps + Send + Sync>,
     /// The Kolla config root ([`DEFAULT_KOLLA_CONFIG_ROOT`]; tests point it
     /// at a tempdir).
     config_root: PathBuf,
@@ -200,6 +243,10 @@ pub struct OpenstackWorker {
     /// from (production: [`DEFAULT_OVERLAY_IP_PATH`]; tests point it at a temp
     /// file or leave it absent to exercise the honest unresolved gate).
     overlay_ip_path: PathBuf,
+    /// The Bus root the QC-11 verb responder drains `action/cloud/*` requests
+    /// from + writes `reply/<ulid>` to (production: [`default_bus_root`]; tests
+    /// point it at a tempdir, or `None` to leave the responder idle).
+    bus_root: Option<PathBuf>,
     /// Converge cadence.
     poll: Duration,
     /// Mirror republish heartbeat.
@@ -220,9 +267,11 @@ impl OpenstackWorker {
             fleet: Arc::new(MeshFleetState::new(host.clone(), workgroup_root.clone())),
             host,
             runner: Arc::new(PodmanCli::new()),
+            instances: Arc::new(OpenstackCli::new()),
             config_root: PathBuf::from(DEFAULT_KOLLA_CONFIG_ROOT),
             share_root: workgroup_root,
             overlay_ip_path: PathBuf::from(DEFAULT_OVERLAY_IP_PATH),
+            bus_root: default_bus_root(),
             poll: DEFAULT_POLL_INTERVAL,
             heartbeat: PUBLISH_HEARTBEAT,
         }
@@ -239,6 +288,21 @@ impl OpenstackWorker {
     #[must_use]
     pub fn with_runner(mut self, runner: Arc<dyn PodmanRunner + Send + Sync>) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Inject the Nova instance seam (tests — the QC-11 verb responder).
+    #[must_use]
+    pub fn with_instances(mut self, instances: Arc<dyn InstanceOps + Send + Sync>) -> Self {
+        self.instances = instances;
+        self
+    }
+
+    /// Override the Bus root the QC-11 verb responder uses (tests point it at a
+    /// tempdir; `None` leaves the responder idle).
+    #[must_use]
+    pub fn with_bus_root(mut self, bus_root: Option<PathBuf>) -> Self {
+        self.bus_root = bus_root;
         self
     }
 
@@ -325,6 +389,46 @@ impl OpenstackWorker {
         }
         *last = Some(outcome.state);
     }
+
+    /// QC-11 — drain net-new `action/cloud/*` verb requests and answer each on
+    /// `reply/<ulid>` against the last-converged mirror `state` + the Nova seam.
+    ///
+    /// The whole drain (sqlite reads/writes + the possible `openstack`
+    /// shell-out) runs on a `spawn_blocking` thread so a slow CLI never pins the
+    /// async runtime — the same discipline the converge uses. `Persist` isn't
+    /// `Sync`, so the closure opens its own handle each tick (cheap: one sqlite
+    /// open + PRAGMA); the per-verb cursors ride in/out by value. Cursors are
+    /// only advanced on a clean return, so a `spawn_blocking` panic never
+    /// silently replays a queued lifecycle op (§7).
+    async fn drain_verbs(
+        &self,
+        cursors: &mut BTreeMap<String, Option<String>>,
+        state: &OpenStackState,
+    ) {
+        let Some(bus_root) = self.bus_root.clone() else {
+            return;
+        };
+        let instances = Arc::clone(&self.instances);
+        let state = state.clone();
+        let snapshot = cursors.clone();
+        match tokio::task::spawn_blocking(move || {
+            let mut cursors = snapshot;
+            match Persist::open(bus_root) {
+                Ok(persist) => drain_cloud_verbs(&persist, &mut cursors, &state, &*instances),
+                Err(e) => {
+                    tracing::debug!(target: "mackesd::openstack", error = %e, "cloud verbs: bus open failed");
+                }
+            }
+            cursors
+        })
+        .await
+        {
+            Ok(updated) => *cursors = updated,
+            Err(e) => {
+                tracing::warn!(target: "mackesd::openstack", error = %e, "cloud verb drain task join failed");
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -336,6 +440,9 @@ impl Worker for OpenstackWorker {
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         let mut last: Option<OpenStackState> = None;
         let mut last_pub_at: Option<Instant> = None;
+        // QC-11 — seed the verb-request cursors at the tail so a restart doesn't
+        // replay stale `action/cloud/*` requests (no re-performed lifecycle op).
+        let mut verb_cursors = seed_verb_cursors(self.bus_root.as_deref());
         // Converge + publish immediately on start so a panel doesn't wait a
         // full tick for the first mirror row.
         self.cycle_and_publish(&mut last, &mut last_pub_at).await;
@@ -345,6 +452,10 @@ impl Worker for OpenstackWorker {
             tokio::select! {
                 _ = tick.tick() => {
                     self.cycle_and_publish(&mut last, &mut last_pub_at).await;
+                    // Answer any queued cloud verbs against the fresh mirror.
+                    if let Some(state) = last.clone() {
+                        self.drain_verbs(&mut verb_cursors, &state).await;
+                    }
                 }
                 () = shutdown.wait() => break,
             }
@@ -474,11 +585,13 @@ mod tests {
     #[tokio::test]
     async fn tick_loop_exits_on_shutdown() {
         // Drives run() with the gated fake doctrine + an empty fake runner
-        // (no live podman, no etcd) and exits promptly on shutdown.
+        // (no live podman, no etcd) and exits promptly on shutdown. The verb
+        // responder is idle (`with_bus_root(None)`) so the test stays hermetic.
         let (tx, rx) = tokio::sync::watch::channel(false);
         let mut w = OpenstackWorker::new("node".to_string(), PathBuf::from("/tmp"))
             .with_fleet(Arc::new(FakeFleet::gated("QC-4 record missing")))
             .with_runner(Arc::new(FakeRunner::new()))
+            .with_bus_root(None)
             .with_poll(Duration::from_millis(10));
         let token = ShutdownToken::from_receiver(rx);
         let handle = tokio::spawn(async move { w.run(token).await });
@@ -487,5 +600,65 @@ mod tests {
         let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(joined.is_ok(), "worker must exit promptly on shutdown");
         assert!(joined.unwrap().expect("join").is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_verb_responder_answers_a_cloud_request_from_the_run_loop() {
+        // QC-11 — the wired responder: the running worker drains a queued
+        // `action/cloud/get-status` request and lands a typed reply on
+        // reply/<ulid> (a read answers even under a gated doctrine — it just
+        // returns the honest mirror). Proves the mod.rs run-loop wiring +
+        // bus_root injection, over a real Persist tempdir.
+        use super::testkit::FakeInstanceOps;
+        use mde_bus::hooks::config::Priority;
+        use mde_bus::persist::Persist;
+        use mde_bus::rpc::reply_topic;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bus_root = dir.path().to_path_buf();
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut w = OpenstackWorker::new("node-a".to_string(), PathBuf::from("/tmp"))
+            .with_fleet(Arc::new(FakeFleet::gated("QC-4 record missing")))
+            .with_runner(Arc::new(FakeRunner::new()))
+            .with_instances(Arc::new(FakeInstanceOps::new()))
+            .with_bus_root(Some(bus_root.clone()))
+            .with_poll(Duration::from_millis(10));
+        let token = ShutdownToken::from_receiver(rx);
+        let handle = tokio::spawn(async move { w.run(token).await });
+
+        // Let the worker seed its cursors (empty topic ⇒ None) + tick once,
+        // THEN publish the request so the next drain picks it up.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let persist = Persist::open(bus_root.clone()).expect("persist");
+        let req = persist
+            .write(
+                &verbs::cloud_action_topic("get-status"),
+                Priority::Default,
+                None,
+                Some("{}"),
+            )
+            .expect("write request");
+        drop(persist);
+
+        // Poll for the reply across a few ticks.
+        let reply_topic = reply_topic(&req.ulid);
+        let mut answered = false;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let persist = Persist::open(bus_root.clone()).expect("persist");
+            let replies = persist.list_since(&reply_topic, None).unwrap_or_default();
+            if let Some(reply) = replies.first() {
+                let decoded: verbs::CloudReply =
+                    serde_json::from_str(&reply.body.clone().expect("body")).expect("decode");
+                assert!(decoded.ok, "get-status answers even under a gated doctrine");
+                assert_eq!(decoded.status.expect("status").host, "node-a");
+                answered = true;
+                break;
+            }
+        }
+        tx.send(true).expect("signal shutdown");
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(answered, "the run-loop responder must answer the cloud request");
     }
 }
