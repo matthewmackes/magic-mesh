@@ -67,6 +67,7 @@ use mde_egui::Style;
 
 use crate::buffer::Buffer;
 use crate::highlight::{HighlightSpan, Highlighter};
+use crate::md_actions::MdOutcome;
 
 /// Soft-tab width: a Tab keypress inserts this many spaces (the editor is
 /// spaces-by-default, the common Rust convention). Not a metric — a text unit.
@@ -871,6 +872,74 @@ impl EditorView {
         }
         self.normalize();
         self.finish_edit(groups, EditKind::Delete, multi);
+    }
+
+    // ── EDTB-3: the markdown formatting seam (drives `md_actions`) ───────────
+
+    /// Every caret's char span (`lo..hi`, an *empty* span at a bare caret) — the
+    /// caret set the [`md_actions`](crate::md_actions) formatting engine (EDTB-2)
+    /// takes. Unlike [`selections`](Self::selections) (the Copy/Cut source, which
+    /// drops bare carets), this keeps the empty spans so a line-oriented op —
+    /// heading / list / indent — acts on a bare caret's line, matching the
+    /// engine's own multi-caret contract.
+    fn caret_spans(&self) -> Vec<Range<usize>> {
+        self.carets
+            .iter()
+            .map(|c| {
+                let (lo, hi) = c.span();
+                lo..hi
+            })
+            .collect()
+    }
+
+    /// Replace the caret set with `spans` (ascending, non-overlapping — an
+    /// [`MdOutcome::selections`]): an empty span becomes a bare caret, a
+    /// non-empty one a forward selection (`anchor` at the start). Primary resets
+    /// to the first caret. Empty input is ignored (never leaves zero carets).
+    fn set_carets_from_spans(&mut self, spans: &[Range<usize>]) {
+        if spans.is_empty() {
+            return;
+        }
+        self.carets = spans
+            .iter()
+            .map(|r| {
+                if r.start == r.end {
+                    Caret::at(r.start)
+                } else {
+                    Caret {
+                        cursor: r.end,
+                        anchor: Some(r.start),
+                        goal_col: None,
+                    }
+                }
+            })
+            .collect();
+        self.primary = 0;
+    }
+
+    /// Apply one [`md_actions`](crate::md_actions) formatting op as **one**
+    /// operator undo step — the seam the EDTB-3 Formatting strip / Format &
+    /// Insert menus drive (design: `editor-toolbar.md` locks #1/#8).
+    ///
+    /// `op` mutates the buffer over the current [`caret_spans`](Self::caret_spans)
+    /// and returns the post-edit spans plus the count of buffer undo groups it
+    /// committed. This records that count as a single widget-level undo entry —
+    /// the *exact* [`finish_edit`](Self::finish_edit) path a multi-caret fan-out
+    /// edit uses (`multi`, so it never coalesces into prior typing), and restores
+    /// every caret to the returned spans. A zero-group op (the engine's
+    /// idempotent no-op) records nothing, leaving the undo log untouched.
+    pub(crate) fn apply_md<F>(&mut self, buffer: &mut Buffer, op: F)
+    where
+        F: FnOnce(&mut Buffer, &[Range<usize>]) -> MdOutcome,
+    {
+        let spans = self.caret_spans();
+        self.begin_edit();
+        let outcome = op(buffer, &spans);
+        self.set_carets_from_spans(&outcome.selections);
+        // The engine already returns merged, ascending spans, so `normalize`'s
+        // touch-merge would only ever over-fuse distinct carets — record them
+        // as the engine gave them.
+        self.finish_edit(outcome.groups, EditKind::Insert, true);
     }
 
     /// Select the whole buffer (collapses to one caret) — the `Ctrl-A` arm and
@@ -2310,6 +2379,54 @@ mod tests {
         view.apply_event(&mut buf, &key(Key::Y, cmd()), 10);
         assert_eq!(buf.rope().to_string(), "Xa\nXb\nXc");
         assert_eq!(view.carets.len(), 3);
+    }
+
+    #[test]
+    fn apply_md_wraps_the_selection_as_one_undo_step_and_restores_carets() {
+        // EDTB-3 — the formatting seam: an `md_actions` op runs over the caret
+        // spans, records ONE widget undo step, and hands its returned spans back
+        // to the carets (so a follow-up toggle round-trips through the widget).
+        let mut buf = Buffer::from_text("make this bold");
+        let mut view = EditorView::new();
+        view.carets = vec![Caret {
+            cursor: 9,
+            anchor: Some(5),
+            goal_col: None,
+        }];
+        view.apply_md(&mut buf, |b, spans| {
+            crate::md_actions::toggle_wrap(b, spans, "**")
+        });
+        assert_eq!(buf.rope().to_string(), "make **this** bold");
+        assert_eq!(
+            view.selections(),
+            vec![7..11],
+            "the carets became the returned inner span"
+        );
+        assert!(view.can_undo(), "the format op armed one undo step");
+        // One widget undo reverts the whole op (both marker inserts).
+        assert!(view.undo(&mut buf));
+        assert_eq!(buf.rope().to_string(), "make this bold");
+        assert!(!view.can_undo(), "the op was exactly one step");
+        assert_eq!(view.selections(), vec![5..9], "undo restored the caret");
+        // Redo re-applies it.
+        assert!(view.redo(&mut buf));
+        assert_eq!(buf.rope().to_string(), "make **this** bold");
+    }
+
+    #[test]
+    fn apply_md_never_coalesces_into_prior_typing() {
+        // A format op must be its own undo step even right after a type run.
+        let mut buf = Buffer::from_text("");
+        let mut view = EditorView::new();
+        view.insert(&mut buf, "word"); // an open typing group
+        view.apply_md(&mut buf, |b, spans| {
+            crate::md_actions::toggle_wrap(b, spans, "**")
+        });
+        assert_eq!(buf.rope().to_string(), "**word**");
+        // Undo the format op only — the typing survives as its own step.
+        assert!(view.undo(&mut buf));
+        assert_eq!(buf.rope().to_string(), "word", "typing survives the undo");
+        assert!(view.can_undo(), "the typing group is still its own step");
     }
 
     #[test]

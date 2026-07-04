@@ -30,8 +30,10 @@ use mde_egui::Style;
 
 use crate::buffer::Buffer;
 use crate::finder::{self, FileFinder};
+use crate::format_bar;
 use crate::highlight::Highlighter;
-use crate::menu_bar::{self, MenuAction, MenuContext};
+use crate::md_actions::{self, ListKind};
+use crate::menu_bar::{self, ListStyle, MenuAction, MenuContext};
 use crate::palette::{self, CommandPalette, PaletteCommand};
 use crate::project_tree::{self, ProjectTree};
 use crate::toolbar;
@@ -116,6 +118,17 @@ pub struct EditorSurface {
     save_as: SaveAsDialog,
     /// Whether the About dialog is shown (EDTB-1, Help → About the Editor).
     about_open: bool,
+    /// The Insert Table grid-picker dialog (EDTB-3, Insert → Table…).
+    table_picker: TablePicker,
+}
+
+/// The Insert Table grid-picker's dialog state (EDTB-3): whether the Word
+/// drag-grid overlay is shown. The hover selection is transient per frame
+/// ([`format_bar::table_grid`]), so nothing else persists here.
+#[derive(Default)]
+struct TablePicker {
+    /// Whether the picker window is shown.
+    open: bool,
 }
 
 /// The small Save As… path-input dialog (EDTB-1): a path field prefilled with
@@ -212,7 +225,11 @@ impl EditorSurface {
     /// capturing the keyboard for an overlay.
     #[must_use]
     pub const fn overlay_active(&self) -> bool {
-        self.finder.is_open() || self.palette.is_open() || self.save_as.open || self.about_open
+        self.finder.is_open()
+            || self.palette.is_open()
+            || self.save_as.open
+            || self.about_open
+            || self.table_picker.open
     }
 
     /// Open the fuzzy file-finder (the `Cmd`/`Ctrl-P` seam), rooted at the open
@@ -282,6 +299,12 @@ impl EditorSurface {
             tree_shown: self.show_tree,
             wrap_on: doc.is_some_and(|d| d.view.wrap()),
             zoom_percent: doc.map(|d| d.view.zoom_percent()),
+            // The Format strip Style dropdown reads the primary caret line's
+            // heading level (EDTB-3).
+            heading_level: doc.map(|d| {
+                let (line, _) = d.view.line_col(&d.buffer);
+                heading_level_of(&d.buffer, line - 1)
+            }),
         }
     }
 
@@ -343,6 +366,60 @@ impl EditorSurface {
                     doc.view.set_zoom_percent(percent);
                 }
             }
+            // ── EDTB-3: the Formatting strip / Insert & Format menus ─────────
+            // Each drives the landed `md_actions` engine on the live buffer as
+            // ONE operator undo step (the widget's `apply_md` records the
+            // engine's undo-group count). A no-op with no document (§7).
+            MenuAction::Heading(level) => {
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.view.apply_md(&mut doc.buffer, |b, spans| {
+                        md_actions::set_heading(b, spans, level)
+                    });
+                }
+            }
+            MenuAction::Wrap(marker) => {
+                if let Some(doc) = self.doc.as_mut() {
+                    let m = marker.marker();
+                    doc.view.apply_md(&mut doc.buffer, |b, spans| {
+                        md_actions::toggle_wrap(b, spans, m)
+                    });
+                }
+            }
+            MenuAction::List(style) => {
+                if let Some(doc) = self.doc.as_mut() {
+                    let kind = match style {
+                        ListStyle::Bullet => ListKind::Bullet,
+                        ListStyle::Numbered => ListKind::Numbered,
+                    };
+                    doc.view.apply_md(&mut doc.buffer, |b, spans| {
+                        md_actions::toggle_line_prefix(b, spans, kind)
+                    });
+                }
+            }
+            MenuAction::Indent(delta) => {
+                if let Some(doc) = self.doc.as_mut() {
+                    let d = isize::from(delta);
+                    doc.view.apply_md(&mut doc.buffer, |b, spans| {
+                        md_actions::shift_indent(b, spans, d)
+                    });
+                }
+            }
+            MenuAction::InsertTablePicker => self.table_picker.open = true,
+            MenuAction::InsertTable { rows, cols } => self.insert_table_at_caret(rows, cols),
+        }
+    }
+
+    /// Insert a `rows`×`cols` markdown table skeleton at the primary caret —
+    /// what the grid-picker (EDTB-3) commits, and the seam
+    /// [`MenuAction::InsertTable`] dispatches (menu/test parity). One undo step;
+    /// a no-op with no open document.
+    fn insert_table_at_caret(&mut self, rows: u8, cols: u8) {
+        if let Some(doc) = self.doc.as_mut() {
+            let caret = doc.view.cursor();
+            let (rows, cols) = (usize::from(rows), usize::from(cols));
+            doc.view.apply_md(&mut doc.buffer, |b, _spans| {
+                md_actions::insert_table(b, caret, rows, cols)
+            });
         }
     }
 
@@ -464,6 +541,42 @@ impl EditorSurface {
                 self.about_open = false;
             }
         }
+
+        self.render_table_picker(ctx);
+    }
+
+    /// Render the EDTB-3 Insert Table grid-picker (Word's drag-grid): hover to
+    /// size, click to insert the markdown skeleton at the caret. Escape / Cancel
+    /// dismisses; a click routes through the same seam `MenuAction::InsertTable`
+    /// drives (§6 — one undo step). Token-styled (§4).
+    fn render_table_picker(&mut self, ctx: &egui::Context) {
+        if !self.table_picker.open {
+            return;
+        }
+        let esc = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+        let mut chosen: Option<(u8, u8)> = None;
+        let mut cancel = esc;
+        egui::Window::new("Insert Table")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new("Table size")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.add_space(Style::SP_XS);
+                chosen = format_bar::table_grid(ui);
+                ui.add_space(Style::SP_S);
+                cancel |= ui.button("Cancel").clicked();
+            });
+        if let Some((rows, cols)) = chosen {
+            self.table_picker.open = false;
+            self.run_action(ctx, MenuAction::InsertTable { rows, cols });
+        } else if cancel {
+            self.table_picker.open = false;
+        }
     }
 
     /// Intercept the overlay trigger chords at the panel level — consumed BEFORE
@@ -494,6 +607,23 @@ impl EditorSurface {
         if let Some(cmd) = palette::show(ctx, &mut self.palette) {
             self.run_command(cmd);
         }
+    }
+}
+
+/// The markdown ATX heading level of `line` (0-based) — the leading `#`-run
+/// (1-6) when it is a real heading (followed by a space or the line end), else 0
+/// (Normal body text). The Format strip's Style dropdown read-back (EDTB-3); a
+/// cheap, allocation-light mirror of the engine's own `#`-run detection.
+fn heading_level_of(buffer: &Buffer, line: usize) -> u8 {
+    if line >= buffer.len_lines() {
+        return 0;
+    }
+    let text = buffer.line(line);
+    let hashes = text.chars().take_while(|&c| c == '#').count();
+    if (1..=6).contains(&hashes) && matches!(text.chars().nth(hashes), Some(' ' | '\n') | None) {
+        u8::try_from(hashes).unwrap_or(0)
+    } else {
+        0
     }
 }
 
@@ -536,6 +666,20 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
         )
         .show_inside(ui, |ui| {
             if let Some(picked) = toolbar::show(ui, &cx) {
+                action = Some(picked);
+            }
+        });
+    // EDTB-3 — the Word Formatting strip (Style/B/I/U/S/lists/indent), the
+    // second toolbar row, mounted below the Standard strip. Drives `md_actions`
+    // through the same `run_action` dispatch (§6). Greyed with no document.
+    egui::TopBottomPanel::top("editor-format-bar")
+        .frame(
+            egui::Frame::default()
+                .fill(Style::SURFACE)
+                .inner_margin(Style::SP_XS),
+        )
+        .show_inside(ui, |ui| {
+            if let Some(picked) = format_bar::show(ui, &cx) {
                 action = Some(picked);
             }
         });
@@ -1442,5 +1586,176 @@ mod tests {
             run_action_in_frame(&mut surface, action);
         }
         assert!(!surface.is_open(), "the surface stayed in the empty state");
+    }
+
+    // ── EDTB-3: the Formatting strip + Insert/Table + Format menus ───────────
+
+    use crate::menu_bar::{ListStyle, WrapMarker};
+
+    /// The current buffer text of the open document (test helper).
+    fn text_of(surface: &EditorSurface) -> String {
+        surface.doc.as_ref().expect("doc").buffer.rope().to_string()
+    }
+
+    #[test]
+    fn format_bold_wraps_the_selection_as_one_undo_step() {
+        // The exact seam the strip's B button (and the Format → Bold menu twin)
+        // emit — dispatched through the real `run_action`, observed on the bytes.
+        let mut surface = real_editor();
+        surface.open_text("word");
+        run_action_in_frame(&mut surface, MenuAction::SelectAll);
+        run_action_in_frame(&mut surface, MenuAction::Wrap(WrapMarker::Bold));
+        assert_eq!(text_of(&surface), "**word**", "Bold wrapped the selection");
+        assert!(surface.menu_context().can_undo, "the format op armed Undo");
+
+        // ONE operator undo step reverts the whole wrap.
+        run_action_in_frame(&mut surface, MenuAction::Undo);
+        assert_eq!(text_of(&surface), "word", "one Undo reverts the wrap");
+        assert!(
+            !surface.menu_context().can_undo,
+            "the wrap was exactly one step"
+        );
+    }
+
+    #[test]
+    fn format_italic_underline_and_strike_wrap_with_their_markers() {
+        for (marker, wrapped) in [
+            (WrapMarker::Italic, "*word*"),
+            (WrapMarker::Underline, "<u>word</u>"),
+            (WrapMarker::Strike, "~~word~~"),
+        ] {
+            let mut surface = real_editor();
+            surface.open_text("word");
+            run_action_in_frame(&mut surface, MenuAction::SelectAll);
+            run_action_in_frame(&mut surface, MenuAction::Wrap(marker));
+            assert_eq!(text_of(&surface), wrapped, "{marker:?} wraps its markup");
+        }
+    }
+
+    #[test]
+    fn format_heading_sets_the_hash_prefix_at_the_caret_line() {
+        let mut surface = real_editor();
+        surface.open_text("title\nbody\n");
+        // Caret opens at line 0; the Style dropdown → Heading 2 hashes that line.
+        run_action_in_frame(&mut surface, MenuAction::Heading(2));
+        assert_eq!(text_of(&surface), "## title\nbody\n");
+        // Normal Text (level 0) strips it back.
+        run_action_in_frame(&mut surface, MenuAction::Heading(0));
+        assert_eq!(text_of(&surface), "title\nbody\n");
+    }
+
+    #[test]
+    fn format_bullet_and_numbered_lists_toggle_the_selected_lines() {
+        let mut surface = real_editor();
+        surface.open_text("a\nb\n");
+        run_action_in_frame(&mut surface, MenuAction::SelectAll);
+        run_action_in_frame(&mut surface, MenuAction::List(ListStyle::Bullet));
+        assert_eq!(text_of(&surface), "- a\n- b\n", "bullets on both lines");
+
+        run_action_in_frame(&mut surface, MenuAction::SelectAll);
+        run_action_in_frame(&mut surface, MenuAction::List(ListStyle::Numbered));
+        assert_eq!(text_of(&surface), "1. a\n2. b\n", "converted to numbers");
+    }
+
+    #[test]
+    fn format_indent_shifts_the_caret_line_and_round_trips() {
+        let mut surface = real_editor();
+        surface.open_text("x\n");
+        run_action_in_frame(&mut surface, MenuAction::Indent(1));
+        assert_eq!(
+            text_of(&surface),
+            "  x\n",
+            "increase indent adds two spaces"
+        );
+        run_action_in_frame(&mut surface, MenuAction::Indent(-1));
+        assert_eq!(text_of(&surface), "x\n", "decrease indent removes them");
+    }
+
+    #[test]
+    fn insert_table_action_drops_a_skeleton_as_one_undo_step() {
+        let mut surface = real_editor();
+        surface.open_text("");
+        run_action_in_frame(&mut surface, MenuAction::InsertTable { rows: 2, cols: 3 });
+        assert_eq!(
+            text_of(&surface),
+            "| Col 1 | Col 2 | Col 3 |\n\
+             | ----- | ----- | ----- |\n\
+             |       |       |       |\n\
+             |       |       |       |\n",
+            "the grid-picker inserts a markdown table skeleton"
+        );
+        assert!(surface.menu_context().can_undo, "the insert armed Undo");
+        run_action_in_frame(&mut surface, MenuAction::Undo);
+        assert_eq!(text_of(&surface), "", "one Undo removes the whole table");
+    }
+
+    #[test]
+    fn insert_table_picker_opens_and_paints() {
+        let mut surface = real_editor();
+        surface.open_text("x");
+        run_action_in_frame(&mut surface, MenuAction::InsertTablePicker);
+        assert!(
+            surface.table_picker.open,
+            "Insert → Table… opened the picker"
+        );
+        assert!(
+            surface.overlay_active(),
+            "the open picker reports as an active overlay"
+        );
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the grid-picker dialog produced no draw primitives"
+        );
+    }
+
+    #[test]
+    fn the_style_dropdown_reads_back_the_caret_heading_level() {
+        let mut surface = real_editor();
+        surface.open_text("## heading\nbody\n");
+        assert_eq!(
+            surface.menu_context().heading_level,
+            Some(2),
+            "the Style box reflects the caret line's `##`"
+        );
+        // A non-heading line reads back Normal (0).
+        surface.open_text("plain\n");
+        assert_eq!(surface.menu_context().heading_level, Some(0));
+        // No document → no read-back (the strip greys out).
+        surface.close();
+        assert_eq!(surface.menu_context().heading_level, None);
+    }
+
+    #[test]
+    fn format_actions_are_no_ops_on_the_empty_surface() {
+        // Every EDTB-3 dispatch arm survives the empty state as a genuine no-op
+        // (§7); the Formatting strip also greys these out (Gate::Doc).
+        let mut surface = real_editor();
+        for action in [
+            MenuAction::Heading(3),
+            MenuAction::Wrap(WrapMarker::Bold),
+            MenuAction::List(ListStyle::Numbered),
+            MenuAction::Indent(1),
+            MenuAction::InsertTable { rows: 2, cols: 2 },
+        ] {
+            run_action_in_frame(&mut surface, action);
+        }
+        assert!(!surface.is_open(), "the surface stayed in the empty state");
+        // The picker toggle is harmless with no document (grid-picker acts at
+        // the caret only once a document is open).
+        run_action_in_frame(&mut surface, MenuAction::InsertTablePicker);
+        run_action_in_frame(&mut surface, MenuAction::InsertTable { rows: 1, cols: 1 });
+        assert!(!surface.is_open());
+    }
+
+    #[test]
+    fn the_format_strip_paints_over_an_open_document() {
+        // The whole three-bar chrome (menu + Standard + Formatting) tessellates
+        // real primitives — the Formatting strip is mounted + reachable (§7).
+        let mut surface = real_editor();
+        surface.open_text("# title\n\n- item\n");
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the editor with the Formatting strip produced no draw primitives"
+        );
     }
 }

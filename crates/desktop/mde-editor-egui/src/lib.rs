@@ -35,8 +35,13 @@
 //!   `docs/design/editor-toolbar.md`): File/Edit/View/Tools/Help menus and the
 //!   New·Open·Save | Cut·Copy·Paste | Undo·Redo | Zoom strip, every control
 //!   routed through the same palette / `EditorView` seams (§6) — no dead
-//!   entries (lock #4: Insert/Format/Table menus and Print/Spell/Find await
-//!   their phases). Zoom is a real per-view font scale on [`EditorView`].
+//!   entries (lock #4). Zoom is a real per-view font scale on [`EditorView`].
+//! * EDTB-2/3 — the **markdown formatting engine + Formatting toolbar**
+//!   ([`md_actions`] / [`format_bar`]): the Style dropdown, B/I/U/S, list, and
+//!   indent controls (Word's second toolbar row) plus the **Insert** (Table
+//!   grid-picker) and **Format** menus, each driving `md_actions` on the live
+//!   buffer as one operator undo step. Only the standalone Table menu (cell ops)
+//!   and Print/Spell/Find await later phases.
 //!
 //! Tabs + splittable panes land in the following units; they grow
 //! [`EditorSurface`] / [`EditorView`] and render into [`editor_panel`] without
@@ -49,6 +54,7 @@
 pub mod buffer;
 pub mod crdt;
 mod finder;
+mod format_bar;
 mod fuzzy;
 pub mod highlight;
 pub mod lsp;

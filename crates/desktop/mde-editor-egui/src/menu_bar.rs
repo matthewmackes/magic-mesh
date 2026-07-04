@@ -3,7 +3,7 @@
 //!
 //! An `egui::menu::bar` of the classic Word menus, adapted honestly to what the
 //! editor can actually do today. Per lock #4 (**no dead entries** — an item
-//! appears only when its seam exists), this phase ships **five** of the eight
+//! appears only when its seam exists), this phase ships **seven** of the eight
 //! Word-97 menus:
 //!
 //! * **File** — New (scratch), Open… (the `Ctrl-P` finder), Open Folder (cwd →
@@ -14,16 +14,23 @@
 //!   lie about what it does).
 //! * **View** — Project Tree + Soft-Wrap toggles (checked = current state).
 //!   Preview / per-bar toggles arrive with EDTB-7 / later phases.
+//! * **Insert** (EDTB-3) — Table…, which opens the Word grid-picker and drops a
+//!   markdown table skeleton at the caret ([`crate::md_actions::insert_table`]).
+//! * **Format** (EDTB-3) — the menu twin of the Formatting strip: Bold / Italic
+//!   / Underline / Strikethrough ([`crate::md_actions::toggle_wrap`]), Bullet /
+//!   Numbered list ([`toggle_line_prefix`](crate::md_actions::toggle_line_prefix)),
+//!   Increase / Decrease Indent ([`shift_indent`](crate::md_actions::shift_indent)),
+//!   and Normal / Heading 1-6 ([`set_heading`](crate::md_actions::set_heading)) —
+//!   keyboard/menu parity with the strip, one dispatch seam (§6).
 //! * **Tools** — Command Palette… (`Ctrl-Shift-P`).
 //! * **Help** — About the Editor (crate name + the workspace version line;
 //!   `mde-egui` exposes no brand/build module, so the crate's own
 //!   `CARGO_PKG_VERSION` — the workspace-inherited platform version — is the
 //!   honest source).
 //!
-//! **Omitted whole menus** (they appear as their phases land, per lock #4):
-//! **Insert** (the table grid-picker is EDTB-3), **Format** (the Formatting
-//! toolbar + markdown actions are EDTB-2), **Table** (EDTB-3). Print/Spell items
-//! in File/Tools are P2/P3 (EDTB-5/6).
+//! **Omitted** (they appear as their phases land, per lock #4): the standalone
+//! **Table** menu (cell/row operations — not yet backed; Insert → Table… covers
+//! creation) and the Print/Spell items in File/Tools (P2/P3 — EDTB-5/6).
 //!
 //! The menu tree is **data** ([`MENUS`]) rendered by one thin loop, so the §7
 //! guarantees are unit-testable without egui: every item maps to a real
@@ -85,6 +92,72 @@ pub enum MenuAction {
     About,
     /// Set the editor-view zoom to this percent (the toolbar dropdown).
     Zoom(u16),
+    /// Set the selected lines' markdown heading level (0 = Normal body text,
+    /// 1-6 = `#`..`######`) — the Format strip Style dropdown + the Format menu
+    /// ([`crate::md_actions::set_heading`]).
+    Heading(u8),
+    /// Toggle a markdown inline wrap around every caret's selection — the Format
+    /// strip B/I/U/S buttons + the Format menu
+    /// ([`crate::md_actions::toggle_wrap`]).
+    Wrap(WrapMarker),
+    /// Toggle a list prefix on the selected lines — the Format strip list
+    /// buttons + the Format menu
+    /// ([`crate::md_actions::toggle_line_prefix`]).
+    List(ListStyle),
+    /// Shift the selected lines' indent by this many two-space levels (±1) — the
+    /// Format strip indent buttons + the Format menu
+    /// ([`crate::md_actions::shift_indent`]).
+    Indent(i8),
+    /// Open the Insert Table grid-picker (Insert → Table…).
+    InsertTablePicker,
+    /// Insert a `rows`×`cols` markdown table skeleton at the caret — what the
+    /// grid-picker commits, routed through the shared dispatch for menu/test
+    /// parity ([`crate::md_actions::insert_table`]).
+    InsertTable {
+        /// Body rows below the header row.
+        rows: u8,
+        /// Columns.
+        cols: u8,
+    },
+}
+
+/// A markdown inline wrap the Format controls toggle (design lock #1). Each maps
+/// to the marker string [`crate::md_actions::toggle_wrap`] wraps the selection
+/// with; underline has no markdown form, so it uses honest inline HTML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapMarker {
+    /// `**bold**`.
+    Bold,
+    /// `*italic*`.
+    Italic,
+    /// `<u>underline</u>` — honest HTML-in-md (markdown has no underline).
+    Underline,
+    /// `~~strikethrough~~`.
+    Strike,
+}
+
+impl WrapMarker {
+    /// The markdown marker string the engine wraps a selection with.
+    #[must_use]
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::Bold => "**",
+            Self::Italic => "*",
+            Self::Underline => "<u>",
+            Self::Strike => "~~",
+        }
+    }
+}
+
+/// A list style the Format controls toggle (design lock #8) — mapped to the
+/// engine's `ListKind` at the dispatch (keeping this action vocabulary free of
+/// the engine module).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListStyle {
+    /// `- ` bullets.
+    Bullet,
+    /// `1. ` numbers.
+    Numbered,
 }
 
 /// What must be true for an item to be **enabled** — the Word-97 grey-out
@@ -141,6 +214,10 @@ pub struct MenuContext {
     /// The open document's view zoom in percent, or `None` with no document
     /// (the toolbar then omits the zoom dropdown — nothing to zoom).
     pub zoom_percent: Option<u16>,
+    /// The primary caret line's markdown heading level (0 = Normal body text,
+    /// 1-6 = a `#`-heading), or `None` with no document — the Format strip Style
+    /// dropdown's current-selection read-back.
+    pub heading_level: Option<u8>,
 }
 
 /// One menu item: its label, its (existing, real) shortcut hint, the action it
@@ -240,6 +317,85 @@ const VIEW_ITEMS: [MenuItem; 2] = [
     MenuItem::new("Soft-Wrap", "", MenuAction::ToggleWrap, Gate::Doc, false),
 ];
 
+/// The Insert menu (EDTB-3) — Table… raises the Word grid-picker.
+const INSERT_ITEMS: [MenuItem; 1] = [MenuItem::new(
+    "Table\u{2026}",
+    "",
+    MenuAction::InsertTablePicker,
+    Gate::Doc,
+    false,
+)];
+
+/// The Format menu (EDTB-3) — the menu twin of the Formatting strip, in Word's
+/// grouping: character wraps, then lists, then indent, then the paragraph
+/// (heading) style. Every item needs an open document (`Gate::Doc`); they act on
+/// the caret's line/selection even with nothing selected, so no `Selection` gate.
+const FORMAT_ITEMS: [MenuItem; 15] = [
+    MenuItem::new(
+        "Bold",
+        "",
+        MenuAction::Wrap(WrapMarker::Bold),
+        Gate::Doc,
+        false,
+    ),
+    MenuItem::new(
+        "Italic",
+        "",
+        MenuAction::Wrap(WrapMarker::Italic),
+        Gate::Doc,
+        false,
+    ),
+    MenuItem::new(
+        "Underline",
+        "",
+        MenuAction::Wrap(WrapMarker::Underline),
+        Gate::Doc,
+        false,
+    ),
+    MenuItem::new(
+        "Strikethrough",
+        "",
+        MenuAction::Wrap(WrapMarker::Strike),
+        Gate::Doc,
+        false,
+    ),
+    MenuItem::new(
+        "Bullet List",
+        "",
+        MenuAction::List(ListStyle::Bullet),
+        Gate::Doc,
+        true,
+    ),
+    MenuItem::new(
+        "Numbered List",
+        "",
+        MenuAction::List(ListStyle::Numbered),
+        Gate::Doc,
+        false,
+    ),
+    MenuItem::new(
+        "Increase Indent",
+        "",
+        MenuAction::Indent(1),
+        Gate::Doc,
+        true,
+    ),
+    MenuItem::new(
+        "Decrease Indent",
+        "",
+        MenuAction::Indent(-1),
+        Gate::Doc,
+        false,
+    ),
+    MenuItem::new("Normal Text", "", MenuAction::Heading(0), Gate::Doc, true),
+    MenuItem::new("Heading 1", "", MenuAction::Heading(1), Gate::Doc, false),
+    MenuItem::new("Heading 2", "", MenuAction::Heading(2), Gate::Doc, false),
+    MenuItem::new("Heading 3", "", MenuAction::Heading(3), Gate::Doc, false),
+    MenuItem::new("Heading 4", "", MenuAction::Heading(4), Gate::Doc, false),
+    MenuItem::new("Heading 5", "", MenuAction::Heading(5), Gate::Doc, false),
+    MenuItem::new("Heading 6", "", MenuAction::Heading(6), Gate::Doc, false),
+];
+
 /// The Tools menu (spelling is EDTB-6).
 const TOOLS_ITEMS: [MenuItem; 1] = [MenuItem::new(
     "Command Palette\u{2026}",
@@ -258,13 +414,16 @@ const HELP_ITEMS: [MenuItem; 1] = [MenuItem::new(
     false,
 )];
 
-/// The whole menu bar as data: `(title, items)` in Word-97 order. Insert /
-/// Format / Table are absent — they would be empty this phase (lock #4), and
-/// [`tests`] assert both the omission and that no present menu is empty.
-pub const MENUS: [(&str, &[MenuItem]); 5] = [
+/// The whole menu bar as data: `(title, items)` in Word-97 order. Insert +
+/// Format land in EDTB-3; the standalone **Table** menu (cell/row ops) is still
+/// absent — it has no landed backend (lock #4), and [`tests`] assert both the
+/// omission and that no present menu is empty.
+pub const MENUS: [(&str, &[MenuItem]); 7] = [
     ("File", &FILE_ITEMS),
     ("Edit", &EDIT_ITEMS),
     ("View", &VIEW_ITEMS),
+    ("Insert", &INSERT_ITEMS),
+    ("Format", &FORMAT_ITEMS),
     ("Tools", &TOOLS_ITEMS),
     ("Help", &HELP_ITEMS),
 ];
@@ -320,6 +479,7 @@ mod tests {
             tree_shown: true,
             wrap_on: false,
             zoom_percent: Some(100),
+            heading_level: Some(0),
         }
     }
 
@@ -333,6 +493,7 @@ mod tests {
             tree_shown: false,
             wrap_on: false,
             zoom_percent: None,
+            heading_level: None,
         }
     }
 
@@ -349,17 +510,68 @@ mod tests {
     }
 
     #[test]
-    fn unlanded_menus_are_omitted_not_stubbed() {
-        // Insert (EDTB-3), Format (EDTB-2), and Table (EDTB-3) have no landed
-        // backend this phase — the whole menus must be absent (lock #4), not
-        // present-but-empty or present-but-disabled.
-        for (title, _) in MENUS {
+    fn the_standalone_table_menu_is_still_omitted() {
+        // Insert + Format land in EDTB-3 (asserted present below); the standalone
+        // Table menu (cell/row ops) has no landed backend, so it must be absent
+        // (lock #4), not present-but-empty.
+        let titles: Vec<&str> = MENUS.iter().map(|(t, _)| *t).collect();
+        assert!(
+            !titles.contains(&"Table"),
+            "the standalone Table menu shipped before its backend"
+        );
+        assert!(titles.contains(&"Insert"), "Insert lands in EDTB-3");
+        assert!(titles.contains(&"Format"), "Format lands in EDTB-3");
+        assert_eq!(MENUS.len(), 7, "the seven real menus ship through EDTB-3");
+    }
+
+    #[test]
+    fn insert_and_format_drive_the_md_actions_engine() {
+        // EDTB-3 §7 — every Insert/Format item routes to a real engine action
+        // (no dead entries), and each is doc-gated (grey with no document).
+        let insert: Vec<MenuAction> = MENUS
+            .iter()
+            .find(|(t, _)| *t == "Insert")
+            .expect("Insert menu")
+            .1
+            .iter()
+            .map(|i| i.action)
+            .collect();
+        assert_eq!(insert, vec![MenuAction::InsertTablePicker]);
+
+        let format = MENUS
+            .iter()
+            .find(|(t, _)| *t == "Format")
+            .expect("Format")
+            .1;
+        for item in format {
             assert!(
-                !matches!(title, "Insert" | "Format" | "Table"),
-                "menu {title} shipped before its backend phase"
+                matches!(
+                    item.action,
+                    MenuAction::Wrap(_)
+                        | MenuAction::List(_)
+                        | MenuAction::Indent(_)
+                        | MenuAction::Heading(_)
+                ),
+                "{} is not a formatting action",
+                item.label
+            );
+            assert!(
+                matches!(item.gate, super::Gate::Doc),
+                "{} should be document-gated",
+                item.label
             );
         }
-        assert_eq!(MENUS.len(), 5, "exactly the five real menus ship in EDTB-1");
+        // The strip's whole vocabulary is present: B/I/U/S, both lists, both
+        // indents, and Normal + all six heading levels.
+        assert!(format
+            .iter()
+            .any(|i| i.action == MenuAction::Wrap(super::WrapMarker::Bold)));
+        for lvl in 0..=6 {
+            assert!(
+                format.iter().any(|i| i.action == MenuAction::Heading(lvl)),
+                "Heading {lvl} missing from the Format menu"
+            );
+        }
     }
 
     #[test]
@@ -381,8 +593,8 @@ mod tests {
         let titles: Vec<&str> = MENUS.iter().map(|(t, _)| *t).collect();
         assert_eq!(
             titles,
-            vec!["File", "Edit", "View", "Tools", "Help"],
-            "the Word-97 menu order (minus the omitted phases)"
+            vec!["File", "Edit", "View", "Insert", "Format", "Tools", "Help"],
+            "the Word-97 menu order (minus the still-omitted Table menu)"
         );
         let file: Vec<&str> = MENUS[0].1.iter().map(|i| i.label).collect();
         assert_eq!(
