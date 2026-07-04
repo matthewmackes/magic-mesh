@@ -133,4 +133,42 @@ NAVBAR-8 compact↔expand machinery (§6: glue, not a second picker).
 `dock.rs` + `chooser.rs` + `main.rs` — serialise with the other NAVBAR tasks on those
 files.
 
-## Tasks → see `docs/WORKLIST.md` NAVBAR-1..8 + NAVBAR-U1..U4.
+## NAVBAR-W10 — pixel-perfect Windows-10 taskbar (operator 2026-07-04, 20-Q survey)
+
+**Supersedes** (newest wins): lock #5 (icon+tiny-label → **icons only, no text**), lock #6
+(48px → **40px**), lock #7 (top accent strip → **bottom-edge underline**), lock #3's
+dividers (→ **flat row**), NAVBAR-4's "fold chrome into a tray segment" (→ **remove the
+top chrome bar entirely**; the tray IS the status surface), and NAVBAR-8's bar-variant
+(→ one constant bar; compact only collapses the tray). The un-cramp v2 metrics are
+replaced by the Win10 metrics.
+
+| # | Decision | Lock |
+|---|----------|------|
+| W1 | Top status bar | **REMOVED** — the shell has one bar, the bottom taskbar. |
+| W2 | Tray set | **All** current chrome slots become tray icons: Peers, Status(health), Signal, Bluetooth, Volume, Battery, Sessions, Chat. Right-justified, **icons only**, Carbon glyphs. |
+| W3 | Metrics | **Pixel-per Win10 @100%**: 40px bar, 24px app glyphs, **16px tray glyphs**; flat SURFACE fill + hairline top divider stays. |
+| W4 | App row | **Flat icon row, no labels, no group dividers** — all 15 surfaces as 24px glyphs from the left in ALL order (System/Storage/About ordinary icons at the row's end, before the tray). |
+| W5 | Active mark | **Bottom-edge accent underline** + subtle fill wash (the Win10 running/active idiom). |
+| W6 | Hover | **Hover fill only — no tooltips, no labels anywhere.** |
+| W7 | Click | Tray icon click = **jump to the owning surface** (Batt/BT/Vol→System, Peers/Status/Signal→Mesh Map, Sessions→Desktop). Exceptions: **Chat** = unread badge + a recent-messages flyout; **Volume** = mute micro-flyout; **BT** = power micro-flyout. |
+| W8 | Battery icon | **Fill-level glyph** — battery outline whose fill tracks charge (~4-5 steps) + a bolt overlay when charging; amber/red at low/critical. |
+| W9 | State | **Tiny corner status dot** on tray icons (OK/warn/danger), glyph keeps one tint. |
+| W10 | Overflow | **^ chevron flyout**; **Signal + Peers hidden** by default. **Sessions appears only while a VDI session is active.** |
+| W11 | Clock | **Time over date, stacked** (Win10 corner); click → **System**. |
+| W12 | Brand | **Watermark** — Win10-activation-style ghost text, bottom-right above the bar, 3 lines: product ("MDE Quazar") · version line · node (hostname/role), from `brand::build`, painted on the backdrop layer. |
+| W13 | Compact mode | The bar is constant; **compact collapses the tray to ^ + clock** (all icons into the flyout). Expand/Collapse chrome button is dropped. |
+
+**Mechanism:** `dock.rs` relayouts to the 40px flat row (labels/dividers/top-strip out,
+underline in); a new `tray.rs` renders the right-justified icon strip (16px glyphs +
+dots + badge + chevron flyout + stacked clock) by folding the SAME sources today's
+`chrome.rs` slots read (mesh snapshot, `SeatSnapshot`, chat unread); `chrome.rs`'s top
+strip is retired (its pure fold helpers move to/are reused by `tray.rs`); `main.rs`
+drops the top panel + gains nothing (the bar mounts as today); the watermark paints in
+`backdrop.rs` from `brand::build`. New Carbon 16px-friendly glyphs (signal, sessions,
+chevron, volume, bluetooth-small, battery fill set + bolt) join `brand::icons`;
+peers/status reuse the node/health glyphs, chat reuses the surface glyph.
+
+**Risk:** no labels + no tooltips = discoverability rests entirely on glyph recognition
+(operator's explicit call, #20/W6); the flyouts + surfaces carry the names.
+
+## Tasks → see `docs/WORKLIST.md` NAVBAR-1..8 + NAVBAR-U1..U4 + NAVBAR-W10-1..5.
