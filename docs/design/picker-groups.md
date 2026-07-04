@@ -33,6 +33,19 @@ Desktop" button. Rendered as a thin sliver/button there; clicking it still route
 `Surface::Desktop`. The Mesh group is then just **MeshView**. This is the one element
 that lives to the right of the tray (Win10's Show-Desktop convention).
 
+### Settings → right side + new gear icon (operator 2026-07-04)
+
+`Surface::System` (Settings) moves OUT of the System group to the **right side, just
+BEFORE the tray status icons** (the last app-element before the tray hands off). Its
+icon changes to a **new gear/cog glyph** (`IconId::Settings` + a gear SVG in
+`mde-theme`) instead of the current `surface-system`. The System group becomes
+**Files, Storage, About**.
+
+### Taller bar (operator 2026-07-04)
+
+Increase `TASKBAR_H` so the icons carry **more empty space above them** — the icons sit
+lower with breathing room at the top of the bar (a taller, less-cramped Win10 bar).
+
 ## Styling locks
 
 | # | Decision | Lock |
