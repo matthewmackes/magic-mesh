@@ -21,10 +21,13 @@
 //!   `Gated` mirror row with a sharp reason — never a silent partial success.
 //!
 //! MVP scope (design Q24): the minimal config each foundation/identity/core
-//! service needs to *start*. Real service credentials are seeded by the QC-5
-//! identity work; until then the connection strings carry the
-//! [`SECRET_PLACEHOLDER`] token (an honest "not yet sealed", not a fake
-//! secret), so the config is structurally complete and the container comes up.
+//! service needs to *start*. Real service credentials are sealed by QC-5
+//! ([`super::secrets`]): the renderer reads the sealed [`SecretView`] off the
+//! [`RenderCtx`] and substitutes each service's genuine password into its
+//! connection strings. When the set isn't sealed yet (a non-leader before the
+//! leader's file has synced), the render returns [`RenderError::SecretsUnsealed`]
+//! and the reconcile gates that service — never a blank or fabricated secret
+//! (§7).
 
 use std::path::Path;
 
@@ -33,11 +36,7 @@ use thiserror::Error;
 
 use super::catalog::ServiceKind;
 use super::podman::kolla_config_dir;
-
-/// Placeholder for a service credential the QC-5 identity work seals + injects.
-/// Rendered into the connection strings so the config is structurally complete
-/// without fabricating a real secret (§7).
-pub const SECRET_PLACEHOLDER: &str = "__mcnf_qc5_secret__";
+use super::secrets::{SecretView, Secrets};
 
 /// Mesh-DNS name the leader-hosted `MariaDB` (Q15) answers on — resolves to the
 /// current leader over the overlay (Q46, Designate/peer-directory), so a
@@ -65,17 +64,26 @@ pub struct RenderCtx {
     /// This node's mesh name — the API bind host (Q22/23) and the local cache /
     /// DB target on the leader.
     pub host: String,
+    /// The QC-5 sealed per-service secrets this tick ([`SecretView`]). `Sealed`
+    /// → the renderer substitutes real passwords; `Unsealed` → the render gates
+    /// the service (never a blank credential, §7).
+    pub secrets: SecretView,
 }
 
 impl RenderCtx {
     /// A context with no live doctrine (a `Disabled`/`Gated` tick converges no
-    /// starts, so the release is unused — only `host` is meaningful).
+    /// starts, so the release + secrets are unused — only `host` is meaningful).
     #[must_use]
     pub fn empty(host: &str) -> Self {
         Self {
             release: String::new(),
             leader: false,
             host: host.to_string(),
+            secrets: SecretView::Unsealed(
+                "no cloud doctrine active — secrets are not resolved for a \
+                 Disabled/Gated tick"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -102,6 +110,15 @@ pub enum RenderError {
         /// The underlying serde error.
         #[source]
         source: serde_json::Error,
+    },
+    /// The QC-5 per-service secrets aren't sealed/complete this tick — the
+    /// renderer refuses to substitute a blank or fabricated credential and gates
+    /// the service instead (§7). The reason names the sub-state (awaiting the
+    /// leader / malformed / an incomplete set).
+    #[error("kolla config: secrets not sealed — {reason}")]
+    SecretsUnsealed {
+        /// Why the sealed set isn't usable this tick.
+        reason: String,
     },
 }
 
@@ -168,9 +185,30 @@ pub fn render_service_config(
     kind: ServiceKind,
     ctx: &RenderCtx,
 ) -> Result<(), RenderError> {
+    // QC-5 — the sealed secrets gate. An unsealed set (a non-leader before the
+    // leader's file synced, or a malformed/unreadable companion) gates the
+    // service with its sharp reason; a complete Sealed set is required before we
+    // ever substitute a password, so no blank credential reaches a live config.
+    let secrets = match &ctx.secrets {
+        SecretView::Sealed(secrets) => secrets,
+        SecretView::Unsealed(reason) => {
+            return Err(RenderError::SecretsUnsealed {
+                reason: reason.clone(),
+            })
+        }
+    };
+    if let Some(missing) = secrets.first_missing() {
+        return Err(RenderError::SecretsUnsealed {
+            reason: format!(
+                "the sealed secret set is missing `{missing}` — awaiting a complete \
+                 re-seal from the leader (never rendering a blank credential)"
+            ),
+        });
+    }
+
     let dir = kolla_config_dir(config_root, kind);
     let service = kind.container_name();
-    let plan = service_plan(kind, ctx);
+    let plan = service_plan(kind, ctx, secrets);
 
     // Provenance header — stamps the pinned Kolla release (Q69) the doctrine
     // rendered this config from, so a config on disk names its own release.
@@ -235,25 +273,29 @@ fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
 // ─────────────────────────── per-service configs ───────────────────────────
 
 /// The DB connection URL for `svc`: the leader reaches its own local `MariaDB`,
-/// every other node reaches it over mesh-DNS (Q15/Q46).
-fn db_url(svc: &str, ctx: &RenderCtx) -> String {
+/// every other node reaches it over mesh-DNS (Q15/Q46). Carries the sealed
+/// per-service DB password (QC-5).
+fn db_url(svc: &str, ctx: &RenderCtx, secrets: &Secrets) -> String {
     let host = if ctx.leader {
         ctx.host.as_str()
     } else {
         DB_MESH_NAME
     };
-    format!("mysql+pymysql://{svc}:{SECRET_PLACEHOLDER}@{host}/{svc}")
+    let pw = secrets.db_password(svc);
+    format!("mysql+pymysql://{svc}:{pw}@{host}/{svc}")
 }
 
 /// The oslo.messaging transport URL (Q16 — internal RPC on `RabbitMQ`, strictly
-/// separate from mde-bus per Q67).
-fn transport_url() -> String {
-    format!("rabbit://openstack:{SECRET_PLACEHOLDER}@{RABBIT_MESH_NAME}:{RABBIT_PORT}//")
+/// separate from mde-bus per Q67). Carries the sealed `RabbitMQ` password (QC-5).
+fn transport_url(secrets: &Secrets) -> String {
+    let pw = secrets.rabbitmq_password();
+    format!("rabbit://openstack:{pw}@{RABBIT_MESH_NAME}:{RABBIT_PORT}//")
 }
 
 /// The `[keystone_authtoken]` block every keystone-authenticated API shares
-/// (Q21 — the mesh account is the cloud account; QC-5 seals the real password).
-fn authtoken(svc: &str, ctx: &RenderCtx) -> String {
+/// (Q21 — the mesh account is the cloud account). Carries the sealed service-
+/// user password (QC-5).
+fn authtoken(svc: &str, ctx: &RenderCtx, secrets: &Secrets) -> String {
     format!(
         "[keystone_authtoken]\n\
          www_authenticate_uri = http://{KEYSTONE_MESH_NAME}:{KEYSTONE_PORT}\n\
@@ -264,13 +306,14 @@ fn authtoken(svc: &str, ctx: &RenderCtx) -> String {
          user_domain_name = Default\n\
          project_name = service\n\
          username = {svc}\n\
-         password = {SECRET_PLACEHOLDER}\n",
+         password = {pw}\n",
         host = ctx.host,
+        pw = secrets.service_user_password(svc),
     )
 }
 
 /// One `[DEFAULT]` binding an API to the overlay (Q22/23) + wiring RPC.
-fn api_default(ctx: &RenderCtx) -> String {
+fn api_default(ctx: &RenderCtx, secrets: &Secrets) -> String {
     format!(
         "[DEFAULT]\n\
          debug = False\n\
@@ -278,7 +321,7 @@ fn api_default(ctx: &RenderCtx) -> String {
          osapi_compute_listen = {host}\n\
          transport_url = {rpc}\n",
         host = ctx.host,
-        rpc = transport_url(),
+        rpc = transport_url(secrets),
     )
 }
 
@@ -286,19 +329,22 @@ fn api_default(ctx: &RenderCtx) -> String {
 /// MVP service set). Real but minimal — enough for the container to come up on
 /// the pinned release; QC-5 layers identity/bootstrap on top.
 #[allow(clippy::too_many_lines)] // one arm per service reads best kept together
-fn service_plan(kind: ServiceKind, ctx: &RenderCtx) -> ServicePlan {
-    let one =
-        |command: &str, name: &'static str, dest: &'static str, owner: &'static str, body: String| {
-            ServicePlan {
-                command: command.to_string(),
-                files: vec![ConfFile {
-                    name,
-                    dest,
-                    owner,
-                    body,
-                }],
-            }
-        };
+fn service_plan(kind: ServiceKind, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
+    let one = |command: &str,
+               name: &'static str,
+               dest: &'static str,
+               owner: &'static str,
+               body: String| {
+        ServicePlan {
+            command: command.to_string(),
+            files: vec![ConfFile {
+                name,
+                dest,
+                owner,
+                body,
+            }],
+        }
+    };
     match kind {
         // ── Foundation trio (Q15/16/17) ──
         ServiceKind::Mariadb => one(
@@ -326,8 +372,9 @@ fn service_plan(kind: ServiceKind, ctx: &RenderCtx) -> ServicePlan {
                 "listeners.tcp.default = {host}:{RABBIT_PORT}\n\
                  loopback_users = none\n\
                  default_user = openstack\n\
-                 default_pass = {SECRET_PLACEHOLDER}\n",
+                 default_pass = {pw}\n",
                 host = ctx.host,
+                pw = secrets.rabbitmq_password(),
             ),
         ),
         // memcached is command-only (no config file).
@@ -347,7 +394,7 @@ fn service_plan(kind: ServiceKind, ctx: &RenderCtx) -> ServicePlan {
                  [cache]\nbackend = oslo_cache.memcache_pool\nenabled = True\n\
                  memcache_servers = {host}:{MEMCACHE_PORT}\n\
                  [token]\nprovider = fernet\n",
-                db = db_url("keystone", ctx),
+                db = db_url("keystone", ctx, secrets),
                 host = ctx.host,
             ),
         ),
@@ -362,8 +409,8 @@ fn service_plan(kind: ServiceKind, ctx: &RenderCtx) -> ServicePlan {
                  [glance_store]\nstores = file\ndefault_store = file\n\
                  filesystem_store_datadir = /var/lib/glance/images/\n",
                 host = ctx.host,
-                db = db_url("glance", ctx),
-                authtoken = authtoken("glance", ctx),
+                db = db_url("glance", ctx, secrets),
+                authtoken = authtoken("glance", ctx, secrets),
             ),
         ),
         ServiceKind::PlacementApi => one(
@@ -374,14 +421,14 @@ fn service_plan(kind: ServiceKind, ctx: &RenderCtx) -> ServicePlan {
             format!(
                 "[DEFAULT]\ndebug = False\n\
                  [placement_database]\nconnection = {db}\n{authtoken}",
-                db = db_url("placement", ctx),
-                authtoken = authtoken("placement", ctx),
+                db = db_url("placement", ctx, secrets),
+                authtoken = authtoken("placement", ctx, secrets),
             ),
         ),
-        ServiceKind::NovaApi => nova("nova-api", ctx),
-        ServiceKind::NovaScheduler => nova("nova-scheduler", ctx),
-        ServiceKind::NovaConductor => nova("nova-conductor", ctx),
-        ServiceKind::NovaCompute => nova("nova-compute", ctx),
+        ServiceKind::NovaApi => nova("nova-api", ctx, secrets),
+        ServiceKind::NovaScheduler => nova("nova-scheduler", ctx, secrets),
+        ServiceKind::NovaConductor => nova("nova-conductor", ctx, secrets),
+        ServiceKind::NovaCompute => nova("nova-compute", ctx, secrets),
         ServiceKind::NeutronServer => ServicePlan {
             command: "neutron-server --config-file /etc/neutron/neutron.conf \
                       --config-file /etc/neutron/plugins/ml2/ml2_conf.ini"
@@ -397,9 +444,9 @@ fn service_plan(kind: ServiceKind, ctx: &RenderCtx) -> ServicePlan {
                          transport_url = {rpc}\n\
                          [database]\nconnection = {db}\n{authtoken}",
                         host = ctx.host,
-                        rpc = transport_url(),
-                        db = db_url("neutron", ctx),
-                        authtoken = authtoken("neutron", ctx),
+                        rpc = transport_url(secrets),
+                        db = db_url("neutron", ctx, secrets),
+                        authtoken = authtoken("neutron", ctx, secrets),
                     ),
                 },
                 ConfFile {
@@ -415,15 +462,15 @@ fn service_plan(kind: ServiceKind, ctx: &RenderCtx) -> ServicePlan {
                 },
             ],
         },
-        ServiceKind::CinderApi => cinder("cinder-api", ctx),
-        ServiceKind::CinderScheduler => cinder("cinder-scheduler", ctx),
-        ServiceKind::CinderVolume => cinder("cinder-volume", ctx),
+        ServiceKind::CinderApi => cinder("cinder-api", ctx, secrets),
+        ServiceKind::CinderScheduler => cinder("cinder-scheduler", ctx, secrets),
+        ServiceKind::CinderVolume => cinder("cinder-volume", ctx, secrets),
     }
 }
 
 /// The shared Nova plan (all four nova services read one `nova.conf`; only the
 /// command differs — Q31 Nova+Placement own VM lifecycle).
-fn nova(command: &str, ctx: &RenderCtx) -> ServicePlan {
+fn nova(command: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
     ServicePlan {
         command: command.to_string(),
         files: vec![ConfFile {
@@ -435,14 +482,15 @@ fn nova(command: &str, ctx: &RenderCtx) -> ServicePlan {
                  [api_database]\nconnection = {api_db}\n\
                  [database]\nconnection = {db}\n{authtoken}\
                  [placement]\nauth_type = password\nauth_url = http://{ks}:{ksp}\n\
-                 username = placement\npassword = {SECRET_PLACEHOLDER}\n\
+                 username = placement\npassword = {placement_pw}\n\
                  user_domain_name = Default\nproject_domain_name = Default\n\
                  project_name = service\n\
                  [libvirt]\nvirt_type = kvm\n",
-                default = api_default(ctx),
-                api_db = db_url("nova_api", ctx),
-                db = db_url("nova", ctx),
-                authtoken = authtoken("nova", ctx),
+                default = api_default(ctx, secrets),
+                api_db = db_url("nova_api", ctx, secrets),
+                db = db_url("nova", ctx, secrets),
+                authtoken = authtoken("nova", ctx, secrets),
+                placement_pw = secrets.service_user_password("placement"),
                 ks = KEYSTONE_MESH_NAME,
                 ksp = KEYSTONE_PORT,
             ),
@@ -451,7 +499,7 @@ fn nova(command: &str, ctx: &RenderCtx) -> ServicePlan {
 }
 
 /// The shared Cinder plan (LVM per node — Q51/59).
-fn cinder(command: &str, ctx: &RenderCtx) -> ServicePlan {
+fn cinder(command: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
     ServicePlan {
         command: command.to_string(),
         files: vec![ConfFile {
@@ -465,9 +513,9 @@ fn cinder(command: &str, ctx: &RenderCtx) -> ServicePlan {
                  [lvm]\nvolume_driver = cinder.volume.drivers.lvm.LVMVolumeDriver\n\
                  volume_group = cinder-volumes\ntarget_protocol = iscsi\n",
                 host = ctx.host,
-                rpc = transport_url(),
-                db = db_url("cinder", ctx),
-                authtoken = authtoken("cinder", ctx),
+                rpc = transport_url(secrets),
+                db = db_url("cinder", ctx, secrets),
+                authtoken = authtoken("cinder", ctx, secrets),
             ),
         }],
     }
@@ -483,6 +531,18 @@ mod tests {
             release: "2024.1".into(),
             leader,
             host: "node-a".into(),
+            secrets: SecretView::Sealed(Secrets::generate()),
+        }
+    }
+
+    /// A ctx carrying a specific sealed set (so a test can assert the exact
+    /// password the renderer substitutes).
+    fn ctx_with(leader: bool, secrets: Secrets) -> RenderCtx {
+        RenderCtx {
+            release: "2024.1".into(),
+            leader,
+            host: "node-a".into(),
+            secrets: SecretView::Sealed(secrets),
         }
     }
 
@@ -502,7 +562,10 @@ mod tests {
             cfg["config_files"][0]["source"],
             "/var/lib/kolla/config_files/keystone.conf"
         );
-        assert_eq!(cfg["config_files"][0]["dest"], "/etc/keystone/keystone.conf");
+        assert_eq!(
+            cfg["config_files"][0]["dest"],
+            "/etc/keystone/keystone.conf"
+        );
         // The referenced conf actually rendered.
         assert!(svc_dir.join("keystone.conf").is_file());
         // No tmp file left behind (atomic).
@@ -524,9 +587,8 @@ mod tests {
         // Leader: its own services reach the local MariaDB directly (Q15).
         let dir2 = tempfile::tempdir().unwrap();
         render_service_config(dir2.path(), ServiceKind::GlanceApi, &ctx(true)).unwrap();
-        let body2 =
-            std::fs::read_to_string(dir2.path().join("glance_api").join("glance-api.conf"))
-                .unwrap();
+        let body2 = std::fs::read_to_string(dir2.path().join("glance_api").join("glance-api.conf"))
+            .unwrap();
         assert!(body2.contains("@node-a/glance"), "{body2}");
     }
 
@@ -539,9 +601,10 @@ mod tests {
             render_service_config(dir.path(), kind, &ctx(true)).unwrap();
             assert!(config_rendered(dir.path(), kind), "{kind:?}");
             let svc_dir = dir.path().join(kind.container_name());
-            let cfg: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(svc_dir.join("config.json")).unwrap())
-                    .unwrap();
+            let cfg: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(svc_dir.join("config.json")).unwrap(),
+            )
+            .unwrap();
             assert!(cfg["command"].as_str().is_some_and(|c| !c.is_empty()));
             for entry in cfg["config_files"].as_array().unwrap() {
                 let src = entry["source"].as_str().unwrap();
@@ -578,5 +641,120 @@ mod tests {
         assert!(matches!(err, RenderError::Io { .. }), "{err:?}");
         assert!(err.to_string().contains("keystone"), "{err}");
         assert!(!config_rendered(dir.path(), ServiceKind::Keystone));
+    }
+
+    // ── QC-5: the sealed secrets are substituted, never the placeholder ──
+
+    /// Read a rendered service config body off the config root.
+    fn read_conf(root: &Path, kind: ServiceKind, name: &str) -> String {
+        std::fs::read_to_string(root.join(kind.container_name()).join(name)).unwrap()
+    }
+
+    #[test]
+    fn sealed_secrets_are_substituted_into_the_connection_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = Secrets::generate();
+        let nova_db_pw = secrets.db_password("nova").to_string();
+        let nova_svc_pw = secrets.service_user_password("nova").to_string();
+        let placement_pw = secrets.service_user_password("placement").to_string();
+        let rabbit_pw = secrets.rabbitmq_password().to_string();
+        let context = ctx_with(false, secrets);
+
+        render_service_config(dir.path(), ServiceKind::NovaApi, &context).unwrap();
+        let body = read_conf(dir.path(), ServiceKind::NovaApi, "nova.conf");
+
+        // The real sealed secrets land in the DB URL, the authtoken block, the
+        // placement auth, and the RPC transport — each in place of the QC-4
+        // placeholder.
+        assert!(
+            body.contains(&format!("nova:{nova_db_pw}@")),
+            "db password: {body}"
+        );
+        assert!(
+            body.contains(&format!("password = {nova_svc_pw}")),
+            "authtoken: {body}"
+        );
+        assert!(
+            body.contains(&format!("username = placement\npassword = {placement_pw}")),
+            "placement auth: {body}"
+        );
+        assert!(
+            body.contains(&format!("rabbit://openstack:{rabbit_pw}@")),
+            "rpc: {body}"
+        );
+        // The QC-4 placeholder token is gone from the rendered config entirely.
+        assert!(
+            !body.contains("__mcnf_qc5_secret__"),
+            "placeholder leaked: {body}"
+        );
+        assert!(!body.contains("SECRET_PLACEHOLDER"), "{body}");
+    }
+
+    #[test]
+    fn the_same_sealed_set_renders_the_same_password_on_every_node() {
+        // §7 — a non-leader reads the leader's set; the same input renders the
+        // same password (leader/non-leader differ only in the DB *host*).
+        let secrets = Secrets::generate();
+        let expected = secrets.db_password("glance").to_string();
+
+        let d1 = tempfile::tempdir().unwrap();
+        render_service_config(
+            d1.path(),
+            ServiceKind::GlanceApi,
+            &ctx_with(false, secrets.clone()),
+        )
+        .unwrap();
+        let leader_view = read_conf(d1.path(), ServiceKind::GlanceApi, "glance-api.conf");
+
+        let d2 = tempfile::tempdir().unwrap();
+        render_service_config(d2.path(), ServiceKind::GlanceApi, &ctx_with(true, secrets)).unwrap();
+        let non_leader_view = read_conf(d2.path(), ServiceKind::GlanceApi, "glance-api.conf");
+
+        assert!(
+            leader_view.contains(&format!("glance:{expected}@")),
+            "{leader_view}"
+        );
+        assert!(
+            non_leader_view.contains(&format!("glance:{expected}@")),
+            "{non_leader_view}"
+        );
+    }
+
+    #[test]
+    fn an_unsealed_ctx_gates_the_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = RenderCtx {
+            release: "2024.1".into(),
+            leader: false,
+            host: "node-a".into(),
+            secrets: SecretView::Unsealed("awaiting sealed secrets from leader".to_string()),
+        };
+        let err = render_service_config(dir.path(), ServiceKind::Keystone, &context)
+            .expect_err("an unsealed ctx must gate the render");
+        let RenderError::SecretsUnsealed { reason } = &err else {
+            unreachable!("wrong variant: {err:?}");
+        };
+        assert!(
+            reason.contains("awaiting sealed secrets from leader"),
+            "{reason}"
+        );
+        // Nothing was written — no blank-credential config left behind.
+        assert!(!config_rendered(dir.path(), ServiceKind::Keystone));
+    }
+
+    #[test]
+    fn an_incomplete_sealed_set_gates_rather_than_rendering_a_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        // A sealed set that dropped nova's DB password → the completeness gate
+        // fires; the renderer never substitutes a blank password.
+        let secrets = Secrets::generate().dropping_for_test("db_nova");
+        let err =
+            render_service_config(dir.path(), ServiceKind::NovaApi, &ctx_with(false, secrets))
+                .expect_err("an incomplete set must gate");
+        let RenderError::SecretsUnsealed { reason } = &err else {
+            unreachable!("wrong variant: {err:?}");
+        };
+        assert!(reason.contains("db_nova"), "{reason}");
+        assert!(!config_rendered(dir.path(), ServiceKind::NovaApi));
     }
 }

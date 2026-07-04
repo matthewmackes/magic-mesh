@@ -24,6 +24,7 @@ use super::config_render::{render_service_config, RenderCtx};
 use super::fleet::{desired_services, FleetStateSource};
 use super::images::{check_archive, ArchiveStatus};
 use super::podman::{config_rendered, KollaServiceSpec, PodmanRunner};
+use super::secrets::load_or_seal;
 
 // ─────────────────────────── converge plan ───────────────────────────
 
@@ -565,9 +566,12 @@ pub fn converge_cycle(
     host: &str,
 ) -> CycleOutcome {
     // 1 — doctrine. `ctx` carries the render inputs (release + leader + this
-    // node's mesh name) the QC-4 config renderer folds into each service's
-    // Kolla config; for a Disabled/Gated tick the desired set is empty so it's
-    // never consulted.
+    // node's mesh name + the QC-5 sealed secrets) the config renderer folds into
+    // each service's Kolla config; for a Disabled/Gated tick the desired set is
+    // empty so it's never consulted. The sealed secrets are resolved off the
+    // same workgroup root (`share_root`) the doctrine + archives ride: the
+    // leader mints them once, every other node reads them, and a not-yet-sealed
+    // set gates each start honestly (§7 — never a blank credential).
     let doctrine_read = fleet.read();
     let (doctrine, desired, ctx) = match &doctrine_read {
         Ok(view) if view.enabled => (
@@ -580,9 +584,14 @@ pub fn converge_cycle(
                 release: view.kolla_release.clone(),
                 leader: view.leader,
                 host: host.to_string(),
+                secrets: load_or_seal(share_root, view.leader),
             },
         ),
-        Ok(_) => (DoctrineStatus::Disabled, BTreeSet::new(), RenderCtx::empty(host)),
+        Ok(_) => (
+            DoctrineStatus::Disabled,
+            BTreeSet::new(),
+            RenderCtx::empty(host),
+        ),
         Err(e) => (
             DoctrineStatus::Gated {
                 reason: e.to_string(),
@@ -665,6 +674,20 @@ mod tests {
             leader,
             kolla_release: "2024.1".into(),
         }
+    }
+
+    /// Seal a complete QC-5 secret set on the fake share so the start path
+    /// reaches the render/run legs. Mirrors the live invariant: a non-leader
+    /// can't start a service until the leader's sealed secrets have synced in —
+    /// `load_or_seal(.., true)` acts as that leader having sealed the file.
+    fn seed_secrets(share: &Path) {
+        assert!(
+            matches!(
+                load_or_seal(share, true),
+                super::super::secrets::SecretView::Sealed(_)
+            ),
+            "the fake share must accept a sealed set",
+        );
     }
 
     /// Seed `kind`'s archive with a CORRECT `SHA256SUMS` entry on the fake
@@ -864,6 +887,7 @@ mod tests {
         let runner = FakeRunner::new();
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
+        seed_secrets(share.path());
         // Every desired service: a checksum-verified archive on the share
         // (which the fake's load deposits the pinned tag from) + rendered
         // config — the full bootstrap-from-the-share path.
@@ -1080,6 +1104,7 @@ mod tests {
         runner.seed_image(&ServiceKind::Keystone.image_ref("2024.1"));
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
+        seed_secrets(share.path());
         converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
         assert!(runner.calls().iter().any(|c| c == "run:keystone"));
         assert!(
@@ -1098,6 +1123,7 @@ mod tests {
         runner.seed_image(&ServiceKind::Keystone.image_ref("2024.1"));
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
+        seed_secrets(share.path());
         std::fs::write(dir.path().join("keystone"), b"blocker").unwrap();
         let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
         let keystone = out
@@ -1119,11 +1145,89 @@ mod tests {
     }
 
     #[test]
+    fn unsealed_secrets_gate_a_non_leader_start_honestly() {
+        // QC-5 §7 — a non-leader whose share has no sealed secrets yet (the
+        // leader hasn't sealed / it hasn't synced) gates each start with the
+        // sharp "awaiting sealed secrets from leader" reason — never a blank
+        // password, never a launch. The image is present so the flow reaches
+        // the secrets gate (past the QC-3 archive lane).
+        let fleet = FakeFleet::fixed(enabled_view(false));
+        let runner = FakeRunner::new();
+        runner.seed_image(&ServiceKind::Keystone.image_ref("2024.1"));
+        let dir = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        // NB: no seed_secrets — the leader's file has not reached this node.
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        assert!(
+            runner.calls().iter().all(|c| c != "run:keystone"),
+            "no launch"
+        );
+        assert!(!out.acted, "nothing was mutated");
+        let keystone = out
+            .state
+            .services
+            .iter()
+            .find(|r| r.service == "keystone")
+            .expect("keystone row");
+        let ServiceStatus::Gated { reason } = &keystone.status else {
+            unreachable!("wrong status: {:?}", keystone.status);
+        };
+        assert!(reason.contains("secrets not sealed"), "{reason}");
+        assert!(
+            reason.contains("awaiting sealed secrets from leader"),
+            "{reason}"
+        );
+        // An honest gate, not an [!]-grade failure.
+        assert!(out.alerts.is_empty(), "{:?}", out.alerts);
+        assert!(!super::super::podman::config_rendered(
+            dir.path(),
+            ServiceKind::Keystone
+        ));
+    }
+
+    #[test]
+    fn a_leader_seals_secrets_and_starts_the_service() {
+        // QC-5 §7 — the LEADER, with no secrets file yet, mints + seals one
+        // (once) and proceeds to render + start against the real password.
+        let fleet = FakeFleet::fixed(enabled_view(true));
+        let runner = FakeRunner::new();
+        for kind in desired_services(&enabled_view(true)) {
+            runner.seed_image(&kind.image_ref("2024.1"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        // No seed_secrets — the leader itself seals the file this tick.
+        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        assert!(
+            runner.calls().iter().any(|c| c == "run:keystone"),
+            "the leader starts"
+        );
+        // The sealed companion now exists on the share (sealed once, read after).
+        assert!(
+            super::super::secrets::secrets_toml_path(share.path()).exists(),
+            "the leader sealed the secrets companion"
+        );
+        // The rendered config carries a real password, not the placeholder.
+        let body = std::fs::read_to_string(dir.path().join("keystone").join("keystone.conf"))
+            .expect("keystone.conf rendered");
+        assert!(
+            !body.contains("__mcnf_qc5_secret__"),
+            "placeholder leaked: {body}"
+        );
+        assert!(out
+            .state
+            .services
+            .iter()
+            .all(|r| r.status == ServiceStatus::Running));
+    }
+
+    #[test]
     fn image_and_config_present_starts_the_service() {
         let fleet = FakeFleet::fixed(enabled_view(false));
         let runner = FakeRunner::new();
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
+        seed_secrets(share.path());
         // Render every desired service's config + mirror every image so the
         // whole set starts.
         for kind in desired_services(&enabled_view(false)) {
@@ -1186,6 +1290,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
+        seed_secrets(share.path());
         let d = dir.path().join("keystone");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("config.json"), "{}").unwrap();

@@ -39,7 +39,11 @@
 //!   lease; QC-10's capacity-derived quotas read the same doctrine.
 //! - [`config_render`] — QC-4's one-state → Kolla config renderer (landed):
 //!   materializes each desired service's `/etc/kolla/<svc>/config.json` (+ the
-//!   service config it points to) from the doctrine, atomically.
+//!   service config it points to) from the doctrine, atomically. QC-5 seals the
+//!   real per-service credentials it substitutes.
+//! - [`secrets`] — QC-5's sealed per-service secret set (the leader mints once
+//!   from the OS CSPRNG, seals `0600` on the Syncthing share, every other node
+//!   reads it; the renderer substitutes it for QC-4's placeholder).
 //! - [`images`] — QC-3's airgap archive lane (landed): the decided
 //!   `<share>/kolla/<release>/` layout + `SHA256SUMS` verification; QC-9's
 //!   DIB pipeline reuses the same share conventions for tenant images.
@@ -55,6 +59,7 @@ pub mod fleet;
 pub mod images;
 pub mod podman;
 pub mod reconcile;
+pub mod secrets;
 #[cfg(test)]
 pub(crate) mod testkit;
 
