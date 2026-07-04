@@ -25,6 +25,7 @@ mod chat;
 mod chooser;
 mod chrome;
 mod controller;
+mod curtain;
 mod datacenter;
 mod discovery;
 mod dock;
@@ -246,6 +247,14 @@ struct Shell {
     /// operator's idle-suspend timeout + lid-close action (read from the System
     /// state's persisted config) against the ONE seat. Safe by default (idle off).
     power_honor: power_honor::PowerHonor,
+    /// The CURTAIN-1 lock curtain — the full-screen lock layer (the pure
+    /// state machine + the slide/settle-bounce motion + the giant clock face).
+    /// While engaged it consumes ALL input (lock 10): the pointer through its
+    /// whole-screen Foreground layer, the keyboard through its per-frame focus
+    /// steal plus the hotkey / edge-swipe / central-view gates in `render`.
+    /// Super+L drops it; unlocking is the CURTAIN-2 PAM seam — the default
+    /// verifier honestly denies every attempt (a lock without a key, §7).
+    curtain: curtain::Curtain,
 }
 
 impl Shell {
@@ -288,6 +297,7 @@ impl Shell {
             mesh_view: mesh_view::MeshViewState::default(),
             self_test: mesh_view::SelfTestWatch::default(),
             power_honor: power_honor::PowerHonor::default(),
+            curtain: curtain::Curtain::default(),
         }
     }
 
@@ -315,6 +325,13 @@ impl Shell {
             HotkeyAction::OpenSystem => {
                 self.nav.expanded = true;
                 self.nav.surface = Surface::System;
+            }
+            HotkeyAction::Lock => {
+                // CURTAIN-1 — Super+L drops the lock curtain (design lock 2).
+                // The DM-less DRM shell IS this seat's locker, so Lock acts here
+                // in the shell rather than routing to logind through the System
+                // state (whose `PowerVerb::Lock` leg remains for external callers).
+                self.curtain.lock();
             }
             // Hardware — act on the seat; a volume/brightness change flashes the OSD.
             hardware => {
@@ -759,30 +776,9 @@ impl Shell {
             self.nav.expanded = true;
         }
 
-        // Expand transition: 0.0 = collapsed (session), 1.0 = expanded (the
-        // active surface). The constant taskbar rides outside the fade.
-        let t = Motion::animate(ctx, "shell-expand", self.nav.expanded, Motion::BASE);
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Cross-fade the two central views through the midpoint so they never
-            // fight for layout: the session fades out over the first half, the
-            // shell body fades in over the second.
-            if t < 0.5 {
-                ui.set_opacity((1.0 - t * 2.0).clamp(0.0, 1.0));
-                session::show(ui);
-            } else {
-                let a = (t * 2.0 - 1.0).clamp(0.0, 1.0);
-                ui.set_opacity(a);
-                // A small rise as the shell body settles in.
-                ui.add_space((1.0 - a) * Style::SP_S);
-                self.body(ui);
-            }
-        });
-
-        // Keep painting while the transition is in flight.
-        if t > 0.001 && t < 0.999 {
-            ctx.request_repaint();
-        }
+        // The central view: the session↔body cross-fade — or nothing at all
+        // while the settled curtain fully covers the seat (CURTAIN-1, lock 10).
+        self.central_view(ctx);
 
         // Route the System surface's own control-error alerts (a refused / absent
         // Bluetooth write, a pairing-agent registration failure — §7) into the ONE
@@ -814,7 +810,11 @@ impl Shell {
         // (the dock / tablet bar). Drained from the seat's gesture side channel; empty
         // on the windowed fallback, so the reveal self-gates to the real DRM seat.
         for edge in mde_egui::drain_edge_swipes() {
-            if matches!(edge, mde_egui::Edge::Left | mde_egui::Edge::Bottom) {
+            // CURTAIN-1 (lock 10): the drain always runs (the side channel must
+            // not back up), but a swipe acts on the nav only past the curtain.
+            if matches!(edge, mde_egui::Edge::Left | mde_egui::Edge::Bottom)
+                && !self.curtain.engaged()
+            {
                 self.nav.expanded = true;
             }
         }
@@ -822,7 +822,13 @@ impl Shell {
         let host_keys = mde_egui::hostkeys::drain_host_keys();
         let presses = ctx.input(|i| hotkeys::egui_key_presses(&i.events));
         for action in self.hotkeys.dispatch(&host_keys, &presses) {
-            self.apply_hotkey(action);
+            // CURTAIN-1 (lock 10): while the curtain is engaged NO chord acts on
+            // the seat or the nav. The dispatch itself still runs so the router's
+            // leader latch tracks Super press/release across the lock; every
+            // matched action is swallowed until the curtain lifts.
+            if !self.curtain.engaged() {
+                self.apply_hotkey(action);
+            }
         }
 
         // The KIRON chyron (KIRON-2) — driven last so its lower-third band + OSD
@@ -838,7 +844,11 @@ impl Shell {
         if let Some(nav) = self.toasts.drive(ctx) {
             // A clicked chyron action navigates — THIS is where the verb executes
             // (KIRON-1 deliberately only reported it). Any target expands the shell.
-            self.apply_nav(nav);
+            // CURTAIN-1 (lock 10): never past the lock — the curtain's layer already
+            // blocks the click; this gate is the belt to that suspender.
+            if !self.curtain.engaged() {
+                self.apply_nav(nav);
+            }
         }
 
         // SURFACE-10 (lock 14): the on-screen keyboard overlay — drawn last (Foreground)
@@ -846,6 +856,52 @@ impl Shell {
         // It reads the live focus + the cached formfactor and self-manages its raise /
         // dismiss; on a Laptop (or the windowed fallback) it stays inert.
         self.keyboard.show(ctx);
+
+        // CURTAIN-1 — the lock curtain, driven absolutely last: its whole-screen
+        // Foreground layer (re-raised with `move_to_top`) covers everything above,
+        // chyron and OSK floats included. While engaged it consumes ALL input
+        // (lock 10) — the pointer through the covering layer, the keyboard through
+        // its per-frame focus steal plus the hotkey / edge-swipe / central-view
+        // gates above. An early no-op while Unlocked.
+        self.curtain.show(ctx);
+    }
+
+    /// The central view: the session↔body cross-fade through the expand
+    /// transition. While the settled curtain fully covers the seat (CURTAIN-1,
+    /// lock 10) it mounts NOTHING — an opaque sheet hides it anyway, and
+    /// surfaces beneath must not run their raw input reads (the VDI guest
+    /// forward drains `ui.input` directly, past focus and layer hit-tests).
+    /// The curtain's drop/lift tweens still render the view beneath the
+    /// sliding sheet.
+    fn central_view(&mut self, ctx: &egui::Context) {
+        // Expand transition: 0.0 = collapsed (session), 1.0 = expanded (the
+        // active surface). The constant taskbar rides outside the fade.
+        let t = Motion::animate(ctx, "shell-expand", self.nav.expanded, Motion::BASE);
+
+        let covered = self.curtain.covers_fully();
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if covered {
+                return;
+            }
+            // Cross-fade the two central views through the midpoint so they never
+            // fight for layout: the session fades out over the first half, the
+            // shell body fades in over the second.
+            if t < 0.5 {
+                ui.set_opacity((1.0 - t * 2.0).clamp(0.0, 1.0));
+                session::show(ui);
+            } else {
+                let a = (t * 2.0 - 1.0).clamp(0.0, 1.0);
+                ui.set_opacity(a);
+                // A small rise as the shell body settles in.
+                ui.add_space((1.0 - a) * Style::SP_S);
+                self.body(ui);
+            }
+        });
+
+        // Keep painting while the transition is in flight.
+        if t > 0.001 && t < 0.999 {
+            ctx.request_repaint();
+        }
     }
 }
 
