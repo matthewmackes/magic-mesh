@@ -95,4 +95,30 @@ Two halves, split on the mesh/desktop boundary (§6):
 - Historical/time-travel views; alerting.
 - Cross-mesh (federated) unit discovery beyond the local mesh + local LAN.
 
-## Tasks → `docs/WORKLIST.md` EXPLORER-1..6.
+## Connectivity + NetBox-style extensions (operator 2026-07-04, +10-Q round)
+
+The explorer is not just a shelf of units — it surfaces how they **connect**, in the
+NetBox/IPAM/DCIM spirit, but as a **live-discovered mirror** (the network IS the source
+of truth; nothing hand-entered, no authoritative CMDB to keep in sync).
+
+| # | Area | Lock |
+|---|------|------|
+| E1 | Connectivity form | **Edges folded into the hero card** (not a separate graph canvas) — each unit's related units appear as clickable chips that jump the hero to the neighbor. No graph-mode to build. |
+| E2 | Edge kinds | **All five** — (a) mesh tunnels (peer↔peer, incl. via-lighthouse), (b) cloud attachments (instance→network/port, →volume, →image; network→subnet→router), (c) L2/L3 adjacency (same subnet / one ARP hop / same gateway), (d) host placement (which dom0/node runs each object — the DCIM 'rack' relation), (e) **storage usage** (volume→instance + backing pool/share consumption). |
+| E3 | NetBox role | **Live-discovered mirror** — NetBox-style *views* over live truth; no manual allocation/reservation, no drift-reconcile DB. |
+| E4 | Instance depth | **Full Nova/Neutron/Cinder detail** — flavor (vCPU/RAM/disk), power+task state, all fixed/floating IPs + ports/networks, attached volumes+sizes, boot image, host node, keypair, created/uptime, security groups. A real detail sheet. |
+| E5 | Enrichment sources | **All four** beyond the primary APIs — reverse DNS + mDNS names; MAC **OUI vendor** lookup (offline OUI table); light **service/port fingerprint** (SSH/HTTP/RDP/Spice/VNC → type guess + openable actions); mesh **cert/role** metadata (Nebula identity, groups, pinned role, uptime-in-mesh). |
+| E6 | Edge chips | **Grouped by edge kind** — card sections: Tunnels / Networks / Volumes / Same subnet / Runs on \<node\> / Storage — each a row of jump chips. |
+| E7 | IPAM view | **Yes — a discovered prefix/IP table mode** — a third surface mode: every discovered subnet/prefix (mesh 10.42/…, LAN 172.20/…, OpenStack tenant nets) with each address' occupant unit, free/used, gateway. Rendered live; no manual allocation. |
+| E8 | Edge compute | **Aggregator worker derives edges** — the mackesd unit_aggregator computes the edge set from the sources it already unions and publishes edges alongside units on the bus; the shell just renders chips (§6). |
+| E9 | Export | **Bus API only** — expose the typed unit + edge stream on the mesh bus for any mesh client; no file/NetBox-format export yet. |
+| E10 | History | **First-seen / last-seen only** — each unit carries first-seen + last-seen timestamps; no event log / time-series. |
+
+These fold back into the architecture: the `Unit` model gains the full detail fields
+(E4) + first/last-seen (E10) + enrichment (E5); the aggregator gains an **edge
+derivation** stage publishing a typed `Edge { kind, from_unit, to_unit, detail }` set
+(E8/E2) + a bus read API (E9); the hero card gains a grouped edge-chip region (E1/E6);
+and the surface gains an **IPAM table mode** beside Hero (E7). Adaptive density (#22)
+now spans three views (Hero / edge-rich card / IPAM table).
+
+## Tasks → `docs/WORKLIST.md` EXPLORER-1..10.
