@@ -1176,7 +1176,10 @@ fn fmt_date(ts_unix_ms: i64) -> String {
 /// Civil `(year, month, day)` from a day-count since the Unix epoch
 /// (1970-01-01), proleptic Gregorian. Howard Hinnant's `civil_from_days` — the
 /// one piece of calendar math the DRM seat needs with no time crate on the deps.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+/// Crate-visible: the taskbar tray's stacked clock (`tray::clock_lines`) folds
+/// its date line through this same fn, so the shell has ONE calendar (§6).
+/// (`pub`, not `pub(crate)`, is the `clippy::redundant_pub_crate` form here.)
+pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let shifted = days + 719_468;
     let era = (if shifted >= 0 { shifted } else { shifted - 146_096 }) / 146_097;
     let day_of_era = shifted - era * 146_097; // [0, 146096]

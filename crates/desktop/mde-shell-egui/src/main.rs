@@ -1,15 +1,18 @@
 //! `mde-shell-egui` — the single MCNF E12 "Quasar" egui shell (E12-3).
 //!
-//! One eframe app on the `mde-egui` harness. A thin persistent **chrome bar**
-//! (peers · sessions · status + an Expand toggle) sits over a central view that
-//! is either:
+//! One eframe app on the `mde-egui` harness. The shell has **ONE bar** — the
+//! constant pixel-per-Win10 bottom **taskbar** (NAVBAR-W10-2: the flat
+//! icon-only surface row, then the right-justified status tray + clock; the
+//! old top chrome strip is retired, lock W1). Above it, the central view is
+//! either:
 //!
-//! * the **session EmptyState** (collapsed) — a real session is a fullscreen VM
-//!   texture from `mde-vdi`, a later unit; or
-//! * the **Workbench** five-plane nav (expanded) — This Node / Controller /
-//!   Network / Fleet / Provisioning.
+//! * the **session `EmptyState`** (collapsed) — a real session is a fullscreen VM
+//!   texture from `mde-vdi`; or
+//! * the active **surface** (expanded) — Workbench / Mesh Map / the app
+//!   surfaces, selected on the taskbar (the dock IS the nav; any bar click
+//!   surfaces the body).
 //!
-//! The expand/collapse transition eases through the shared `Motion` table and the
+//! The session↔body transition eases through the shared `Motion` table and the
 //! whole surface renders through the shared `Style` (governance §4/§5/§7). This is
 //! the skeleton the panels (Workbench/Files/Music/Voice) and the VM session-view
 //! plug into.
@@ -44,6 +47,7 @@ mod surface_card;
 mod system;
 mod thisnode;
 mod toast_bridge;
+mod tray;
 mod vdi;
 mod web;
 mod workbench;
@@ -64,13 +68,16 @@ use mde_voice_egui::{voice_header, voice_panel, voice_pump, VoiceApp};
 use dock::Surface;
 use workbench::Plane;
 
-/// The shell's pure navigation state: whether the chrome bar is expanded into the
-/// shell body, and — once expanded — which plane the Workbench has selected. Kept
-/// separate from the surface apps (which need an eframe `CreationContext` to
-/// build) so the nav invariants stay unit-testable without a GPU.
+/// The shell's pure navigation state: whether the shell body (the active
+/// surface) is showing over the session view, and which plane the Workbench has
+/// selected. Kept separate from the surface apps (which need an eframe
+/// `CreationContext` to build) so the nav invariants stay unit-testable without
+/// a GPU. The old chrome Expand/Collapse toggle is retired (NAVBAR-W10-2 —
+/// the dock is the nav): any taskbar click, hotkey, chyron action, or edge
+/// swipe surfaces the body.
 #[derive(Default)]
 struct Nav {
-    /// `true` while the chrome bar is expanded into the shell body.
+    /// `true` while the shell body (the active surface) fills the central view.
     expanded: bool,
     /// Which surface fills the shell body (Workbench by default).
     surface: Surface,
@@ -78,17 +85,10 @@ struct Nav {
     plane: Plane,
 }
 
-impl Nav {
-    /// Flip between the collapsed session view and the expanded shell body.
-    fn toggle_expand(&mut self) {
-        self.expanded = !self.expanded;
-    }
-}
-
 /// The whole shell: the nav state, the live chrome/Fleet Bus state, and the three
 /// embedded mesh-control surfaces it owns and drives per frame (E12-3b EMBED).
 struct Shell {
-    /// Expand state + the selected Workbench plane.
+    /// Body-vs-session state + the active surface + the selected Workbench plane.
     nav: Nav,
     /// Fleet plane — live per-node KVM host health + VM roster, and the
     /// host-targeted VM lifecycle controls (MV-6). Subscribes to the Bus.
@@ -130,10 +130,15 @@ struct Shell {
     /// answer (plan summary / CA-migration steps / LAN-only retry hint / typed
     /// gated error).
     spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState,
-    /// The always-visible chrome bar's live state — peers + mesh status folded
-    /// from the world-readable mesh-status snapshot, polled on the shared cadence
-    /// (self-gating inside `chrome::show`).
+    /// The live mesh-status fold — peers + mesh health folded from the
+    /// world-readable snapshot, polled on the shared cadence (self-gating in
+    /// `render`). The taskbar tray renders its Peers / Status / Signal dots
+    /// from this ONE poll's product (NAVBAR-W10-2 — no second poll).
     chrome: chrome::ChromeState,
+    /// The taskbar tray's per-frame state (the `^` overflow flyout latch). The
+    /// tray itself is stateless folds over `chrome` + the seat snapshot + the
+    /// Chat unread tally, rendered by `dock::taskbar` (NAVBAR-W10-2).
+    tray: tray::TrayState,
     /// The Music surface, owned + built once (its worker thread wakes the shell's
     /// egui context on every update). Rendered via `mde_music_egui::music_panel`.
     music: MusicApp,
@@ -173,8 +178,9 @@ struct Shell {
     chat: chat::ChatState,
     /// The System surface — this seat's host controls, folded from the ONE
     /// `mde-seat` `Seat` (lock 1): mixer / Bluetooth / displays / power & battery /
-    /// backlight / hotkeys. Its cached snapshot also feeds the three read-only
-    /// chrome status icons (E12-15). Absent backends render honestly (§7).
+    /// backlight / hotkeys. Its cached snapshot also feeds the taskbar tray's
+    /// read-only BT / Volume / Battery icons (NAVBAR-W10-2). Absent backends
+    /// render honestly (§7).
     system: system::SystemState,
     /// The Storage surface — GParted-authentic disk/partition management (E12-21).
     /// Folds `state/storage/<node>` mirrors (UDisks2 topology + backend availability)
@@ -260,6 +266,7 @@ impl Shell {
             services: services_flow::ServicesFlowState::default(),
             spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState::default(),
             chrome: chrome::ChromeState::default(),
+            tray: tray::TrayState::default(),
             music: MusicApp::new_with_ctx(ctx),
             media: real_media(),
             files: mde_files_egui::real_browser(),
@@ -319,9 +326,9 @@ impl Shell {
     }
 
     /// Apply a resolved [`toast_bridge::Navigate`] to the shell nav — the ONE place
-    /// a `shell/goto/<surface>` / `shell/plane/<plane>` verb executes, shared by the
-    /// KIRON chyron action and the chrome unread indicator (NOTIFY-CHAT-6). Any
-    /// target expands the shell (a navigation is never a no-op behind the session).
+    /// a `shell/goto/<surface>` / `shell/plane/<plane>` verb executes (the KIRON
+    /// chyron action + the OW-10 self-test edge). Any target expands the shell
+    /// (a navigation is never a no-op behind the session).
     fn apply_nav(&mut self, nav: toast_bridge::Navigate) {
         self.nav.expanded = true;
         match nav {
@@ -333,8 +340,10 @@ impl Shell {
         }
     }
 
-    /// The expanded shell body: the full-width bottom taskbar plus the one active
-    /// surface (NAVBAR-1 — the taskbar replaces the retired left rail).
+    /// The expanded shell body: the one active surface. (The taskbar is NOT
+    /// mounted here any more — NAVBAR-W10-2 lock W13 makes the bar constant, so
+    /// `render` mounts the bottom panel before the central view, session and
+    /// body alike.)
     ///
     /// The shell owns the frame loop, so it drives the active surface itself —
     /// its per-frame **pump** (the worker-update drain the surface kept out of the
@@ -345,17 +354,6 @@ impl Shell {
     /// surface's in the shell's one `Context`. The Workbench keeps its live Fleet
     /// plane (MV-6).
     fn body(&mut self, ui: &mut egui::Ui) {
-        // NAVBAR-1 — the surface launcher is now a full-width taskbar pinned to the
-        // bottom edge. Reserving the bottom panel BEFORE the surface content means
-        // the active surface fills the whole central area ABOVE the bar. Flat Carbon:
-        // a solid SURFACE fill + a hairline top divider (drawn by `dock::taskbar`).
-        egui::TopBottomPanel::bottom("shell-taskbar")
-            .exact_height(dock::TASKBAR_H)
-            .frame(egui::Frame::default().fill(Style::SURFACE))
-            .show_inside(ui, |ui| {
-                dock::taskbar(ui, &mut self.nav.surface);
-            });
-
         match self.nav.surface {
             Surface::Workbench => {
                 workbench::show(
@@ -526,7 +524,7 @@ impl Shell {
                 // (E12-15). Scoped under its own `push_id` like every mounted
                 // surface so its egui ids can't collide in the shell's one
                 // `Context`. The snapshot is refreshed in `render` (it also feeds
-                // the chrome icons), so the panel only renders here.
+                // the taskbar tray's icons), so the panel only renders here.
                 // The System panel drives Displays + Power live (E12-18); its
                 // per-VM power rows reuse the Instances broker (§6), so it takes a
                 // `&mut` to that roster — two disjoint field borrows of the shell.
@@ -589,9 +587,9 @@ impl Boot {
                 self.splash.complete(splash::Milestone::Surfaces);
             } else if !self.splash.is_complete(splash::Milestone::MeshSnapshot) {
                 // The shell's FIRST mesh-status snapshot poll — the same
-                // world-readable fold the chrome bar runs on its cadence, so
-                // the first dock frame opens with a live chrome instead of a
-                // cold "Connecting…" whenever a snapshot exists.
+                // world-readable fold the taskbar tray renders on its cadence,
+                // so the first dock frame opens with live tray dots instead of
+                // cold dim ones whenever a snapshot exists.
                 if let Some(shell) = self.shell.as_mut() {
                     shell.chrome.poll(ctx);
                 }
@@ -648,9 +646,9 @@ impl Shell {
 
         // OW-10 — the onboard self-test watch: an all-green verdict landing on the
         // mesh Bus auto-opens the live Mesh Map, through the SAME
-        // `shell/goto/<surface>` nav grammar the chrome unread indicator + the KIRON
-        // chyron use (no second navigation path). The watch self-gates on the shared
-        // cadence; the Mesh Map is independently reachable from the taskbar besides.
+        // `shell/goto/<surface>` nav grammar the KIRON chyron uses (no second
+        // navigation path). The watch self-gates on the shared cadence; the Mesh
+        // Map is independently reachable from the taskbar besides.
         self.self_test.poll(ctx);
         if self.self_test.take_all_green() {
             if let Some(nav) = toast_bridge::resolve_action("shell/goto/mesh-map") {
@@ -683,7 +681,7 @@ impl Shell {
         // clipboard clips + human chat) — tails its `state/chat/*` read-model
         // whenever the shell is expanded: a cheap incremental read that keeps the
         // roster + conversations live so data is ready the instant the operator
-        // switches to it, and drives the chrome unread indicator (no cold-start
+        // switches to it, and drives the tray's Chat unread badge (no cold-start
         // wait). This subsumes the retired Notifications + Clipboard polls
         // (NOTIFY-CHAT-6).
         if self.nav.expanded {
@@ -707,10 +705,10 @@ impl Shell {
             self.storage.poll(ctx);
         }
 
-        // The seat snapshot feeds BOTH the System surface and the always-visible
-        // chrome status icons, so poll it every frame (self-gating on the shared
-        // cadence) — the chrome's Bluetooth/Volume icons stay live even while the
-        // System surface isn't the one in view.
+        // The seat snapshot feeds BOTH the System surface and the taskbar tray's
+        // always-visible status icons, so poll it every frame (self-gating on the
+        // shared cadence) — the tray's BT / Volume / Battery icons stay live even
+        // while the System surface isn't the one in view.
         self.system.poll(ctx);
 
         // POWER-5 — the DRM-native idle + lid honorer: one tick per frame folds this
@@ -727,33 +725,42 @@ impl Shell {
         self.system
             .sync_pairing_agent(self.nav.expanded && self.nav.surface == Surface::System);
 
-        // The thin persistent chrome bar (48px = SP_XL + SP_M).
-        let unread = self.chat.total_unread();
-        egui::TopBottomPanel::top("mcnf-chrome")
-            .exact_height(Style::SP_XL + Style::SP_M)
-            .show(ctx, |ui| {
-                let outcome = chrome::show(
-                    ui,
-                    &mut self.chrome,
-                    self.system.snapshot(),
-                    self.nav.expanded,
-                    unread,
-                );
-                if outcome.toggled {
-                    self.nav.toggle_expand();
-                }
-                // The unread indicator opens the unified Chat surface through the
-                // ONE `shell/goto/chat` nav grammar (the same resolver the KIRON
-                // chyron uses) — no second navigation path in the chrome.
-                if outcome.open_chat {
-                    if let Some(nav) = toast_bridge::resolve_action("shell/goto/chat") {
-                        self.apply_nav(nav);
-                    }
-                }
-            });
+        // NAVBAR-W10-2 (lock W1) — the top chrome strip is retired; its snapshot
+        // poll survives as the tray's mesh fold. ONE self-gating poll per frame
+        // (it also keeps the repaint heartbeat alive for the tray dots and the
+        // clock's minute flip) — the tray reads the product, no second poll.
+        self.chrome.poll(ctx);
 
-        // Expand transition: 0.0 = collapsed (session), 1.0 = expanded (shell body
-        // — the dock + the active surface).
+        // The shell's ONE constant bar (locks W1/W13): the pixel-per-Win10
+        // bottom taskbar — the flat icon-only surface row plus the right-
+        // justified status tray + clock — mounted BEFORE the central view so it
+        // frames the session and the shell body alike, and the surface body
+        // above it fills to the top edge.
+        let unread = self.chat.total_unread();
+        let session_active = self.vdi.requested_target().is_some();
+        let mut bar_clicked = false;
+        egui::TopBottomPanel::bottom("shell-taskbar")
+            .exact_height(dock::TASKBAR_H)
+            .frame(egui::Frame::default().fill(Style::SURFACE))
+            .show(ctx, |ui| {
+                let inputs = tray::TrayInputs {
+                    mesh: self.chrome.summary(),
+                    seat: self.system.snapshot(),
+                    unread,
+                    session_active,
+                };
+                bar_clicked = dock::taskbar(ui, &mut self.nav.surface, &mut self.tray, &inputs);
+            });
+        if bar_clicked {
+            // The dock is the nav (lock W1): any bar routing — a surface cell OR
+            // a tray icon — surfaces the shell body (a navigation is never a
+            // no-op behind the session). This replaces the retired chrome
+            // Expand/Collapse toggle.
+            self.nav.expanded = true;
+        }
+
+        // Expand transition: 0.0 = collapsed (session), 1.0 = expanded (the
+        // active surface). The constant taskbar rides outside the fade.
         let t = Motion::animate(ctx, "shell-expand", self.nav.expanded, Motion::BASE);
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -889,8 +896,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dock, editor_panel, files_panel, media_header, media_panel, real_editor, real_media,
-        real_terminal, splash, terminal_panel, Boot, Nav, Plane, Surface,
+        chrome, dock, editor_panel, files_panel, media_header, media_panel, real_editor,
+        real_media, real_terminal, splash, terminal_panel, tray, Boot, Nav, Plane, Surface,
     };
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
@@ -904,16 +911,6 @@ mod tests {
         );
         assert_eq!(n.surface, Surface::Workbench);
         assert_eq!(n.plane, Plane::ThisNode);
-    }
-
-    #[test]
-    fn toggle_expand_flips_the_shell_body() {
-        let mut s = Nav::default();
-        assert!(!s.expanded);
-        s.toggle_expand();
-        assert!(s.expanded);
-        s.toggle_expand();
-        assert!(!s.expanded);
     }
 
     /// One headless boot frame through the SAME `Boot::frame` both runners
@@ -947,11 +944,31 @@ mod tests {
         assert!(!boot.splash.dismissed(), "dismissed before init completed");
     }
 
-    /// Drive one headless frame that reproduces the shell's expanded **body mount**
-    /// — the bottom taskbar plus a surface scoped under `push_id`, inside the shell's
-    /// `CentralPanel` — then tessellate it on the CPU so any paint-path fault
-    /// surfaces as a failure. This is the same `Context::run` → `tessellate` path
-    /// the DRM runner drives, minus the GPU (no window, no wgpu).
+    /// Mount the shell's constant bottom taskbar (NAVBAR-W10-2, with a default
+    /// tray over an unseen mesh) exactly as `render` does — the bar-then-central
+    /// mount order every surface test below reproduces.
+    fn mount_taskbar(ctx: &egui::Context, active: &mut Surface) {
+        let mesh = chrome::MeshSummary::default();
+        let mut tray_state = tray::TrayState::default();
+        let inputs = tray::TrayInputs {
+            mesh: &mesh,
+            seat: None,
+            unread: 0,
+            session_active: false,
+        };
+        egui::TopBottomPanel::bottom("shell-taskbar")
+            .exact_height(dock::TASKBAR_H)
+            .frame(egui::Frame::default().fill(Style::SURFACE))
+            .show(ctx, |ui| {
+                let _ = dock::taskbar(ui, active, &mut tray_state, &inputs);
+            });
+    }
+
+    /// Drive one headless frame that reproduces the shell's **body mount** — the
+    /// constant bottom taskbar, then a surface scoped under `push_id` in the
+    /// shell's `CentralPanel` — then tessellate it on the CPU so any paint-path
+    /// fault surfaces as a failure. This is the same `Context::run` → `tessellate`
+    /// path the DRM runner drives, minus the GPU (no window, no wgpu).
     ///
     /// Files is the surface a unit test can build (`MusicApp`/`VoiceApp` need an
     /// eframe `CreationContext`, which only `eframe::run_native` supplies, and
@@ -974,11 +991,8 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
+            mount_taskbar(ctx, &mut active);
             egui::CentralPanel::default().show(ctx, |ui| {
-                egui::TopBottomPanel::bottom("shell-taskbar")
-                    .exact_height(dock::TASKBAR_H)
-                    .frame(egui::Frame::default().fill(Style::SURFACE))
-                    .show_inside(ui, |ui| dock::taskbar(ui, &mut active));
                 ui.push_id("shell-files", |ui| files_panel(ui, &mut files));
             });
         });
@@ -1008,11 +1022,8 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
+            mount_taskbar(ctx, &mut active);
             egui::CentralPanel::default().show(ctx, |ui| {
-                egui::TopBottomPanel::bottom("shell-taskbar")
-                    .exact_height(dock::TASKBAR_H)
-                    .frame(egui::Frame::default().fill(Style::SURFACE))
-                    .show_inside(ui, |ui| dock::taskbar(ui, &mut active));
                 ui.push_id("shell-media", |ui| {
                     media_header(ui, &mut media);
                     ui.separator();
@@ -1046,11 +1057,8 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
+            mount_taskbar(ctx, &mut active);
             egui::CentralPanel::default().show(ctx, |ui| {
-                egui::TopBottomPanel::bottom("shell-taskbar")
-                    .exact_height(dock::TASKBAR_H)
-                    .frame(egui::Frame::default().fill(Style::SURFACE))
-                    .show_inside(ui, |ui| dock::taskbar(ui, &mut active));
                 ui.push_id("shell-terminal", |ui| terminal_panel(ui, &mut terminal));
             });
         });
@@ -1079,11 +1087,8 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
+            mount_taskbar(ctx, &mut active);
             egui::CentralPanel::default().show(ctx, |ui| {
-                egui::TopBottomPanel::bottom("shell-taskbar")
-                    .exact_height(dock::TASKBAR_H)
-                    .frame(egui::Frame::default().fill(Style::SURFACE))
-                    .show_inside(ui, |ui| dock::taskbar(ui, &mut active));
                 ui.push_id("shell-editor", |ui| editor_panel(ui, &mut editor));
             });
         });

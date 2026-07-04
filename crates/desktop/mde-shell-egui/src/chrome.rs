@@ -1,111 +1,87 @@
-//! The persistent chrome bar — the thin top strip that frames every session and
-//! carries the Expand toggle into the Workbench.
+//! The shell's live **mesh-status fold** — the world-readable snapshot poll
+//! plus the pure [`MeshSummary`] projection the taskbar tray renders.
 //!
-//! The bar reads **live** mesh state on a self-gating poll cadence and renders
-//! honest empty / loading / degraded states through the shared `Style` (§4/§7):
+//! Until NAVBAR-W10-2 this module also rendered the top chrome strip
+//! (brand/version · Peers · Sessions · Status · Signal · BT · Vol · Batt ·
+//! Chat · Collapse); lock W1 removed that bar outright — the shell has ONE
+//! bar, the bottom taskbar, and the tray IS the status surface. What remains
+//! here is the strip's pure heart:
 //!
-//! * **Peers** and **Status** fold the world-readable mesh-status snapshot the
-//!   root timer writes (`/run/mde/mesh-status.json`) — the same source the panel
-//!   client reads (the desktop user can't read the root-only peer directory). The
-//!   worst-of lighthouse verdict behind Status is the reused LIGHTHOUSE-7 model
-//!   (`lighthouse_health_from_snapshot`), so the bar can't diverge from the rest
-//!   of the fleet's health verdict.
-//! * **Sessions** honestly reads "No session" until `mde-vdi` connects a live VM
-//!   desktop (a later unit) — the same truth the collapsed session empty state
-//!   shows. Nothing here fabricates a count.
+//! * **[`MeshSummary`]** folds the world-readable mesh-status snapshot the
+//!   root timer writes (`/run/mde/mesh-status.json`) — the same source the
+//!   panel client reads (the desktop user can't read the root-only peer
+//!   directory). The worst-of lighthouse verdict is the reused LIGHTHOUSE-7
+//!   model (`lighthouse_health_from_snapshot`), so the tray's Status dot
+//!   can't diverge from the rest of the fleet's health verdict.
+//! * **[`ChromeState::poll`]** is the ONE self-gating snapshot read + repaint
+//!   heartbeat — `main.rs` drives it each frame and the tray consumes the
+//!   product (`tray::TrayInputs.mesh`); no second poll, no second reader.
 //!
-//! The projection (`MeshSummary`) + the model→slot mapping are pure (no egui
-//! `Context`, no IO, no GPU), so they're unit-tested directly; the only IO is the
-//! snapshot read in [`ChromeState::poll`].
+//! The projection is pure (no egui `Context`, no IO, no GPU), so it's
+//! unit-tested directly; the only IO is the snapshot read in `poll`. The
+//! seat-side folds the strip carried (battery pack pick + tone) moved to
+//! `tray.rs` with the icons they feed.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use mde_egui::egui::{self, Align, Color32, Layout, RichText};
-use mde_egui::Style;
+use mde_egui::egui;
 
 use mde_cosmic_applet::{lighthouse_health_from_snapshot, LighthouseHealth};
 
-use mde_seat::{Battery, BatteryState, Probe, SeatSnapshot};
-
-use mde_theme::brand::build;
-use mde_theme::brand::icons::{icon_image, IconId};
-
-/// The world-readable mesh-status snapshot the root timer writes. The shell reads
-/// peers + lighthouse health from it exactly like the panel client — the desktop
-/// user can't read the root-only replicated peer directory, so this JSON is the
-/// read path.
+/// The world-readable mesh-status snapshot the root timer writes. The shell
+/// reads peers + lighthouse health from it exactly like the panel client — the
+/// desktop user can't read the root-only replicated peer directory, so this
+/// JSON is the read path.
 const SNAPSHOT_PATH: &str = "/run/mde/mesh-status.json";
 
 /// Poll cadence — a peer join/leave or a lighthouse health flip surfaces within
-/// this window. Matches the panel client + the Fleet datacenter poll; the read is
-/// a cheap local file scan, so the cadence can stay tight.
+/// this window (and the tray clock's minute flip rides the same heartbeat).
+/// Matches the panel client + the Fleet datacenter poll; the read is a cheap
+/// local file scan, so the cadence can stay tight.
 const REFRESH: Duration = Duration::from_secs(5);
-
-/// A filled-circle status dot, drawn as the shared glyph the rest of the platform
-/// uses (the datacenter rows, the panel pip) rather than a hand-rolled painter
-/// circle with literal metrics — so the dot reads one `Style` size + colour.
-const DOT: &str = "\u{25CF}";
-
-/// Charge (%) below which a **draining** system pack reads amber "low", and at or
-/// below which it reads red "critical" — the at-a-glance thresholds behind the
-/// battery slot's dot. A charging or full pack is never amber/red (it's improving);
-/// these bite only while the pack is actually discharging.
-const BATTERY_LOW: f64 = 20.0;
-const BATTERY_CRITICAL: f64 = 5.0;
 
 // ──────────────────────────── projected view ────────────────────────────
 
-/// The chrome bar's live mesh summary, folded from the mesh-status snapshot.
-/// Pure data — parsed without egui/IO/GPU, so it's unit-tested directly.
+/// The shell's live mesh summary, folded from the mesh-status snapshot — the
+/// source behind the tray's Peers / Status / Signal dots. Pure data — parsed
+/// without egui/IO/GPU, so it's unit-tested directly. (`pub`, not `pub(crate)`,
+/// is the `clippy::redundant_pub_crate` form for crate-visible items in a
+/// private module, like `dock::TASKBAR_H`.)
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MeshSummary {
+pub struct MeshSummary {
     /// Peers in the directory (every node the snapshot names).
-    peers_total: usize,
+    pub peers_total: usize,
     /// Peers currently `presence == "online"`.
-    peers_online: usize,
+    pub peers_online: usize,
     /// Worst-of lighthouse health (the mesh "Status" verdict) — reused from the
-    /// panel/applet model so the bar can't diverge from the fleet's verdict.
-    health: LighthouseHealth,
-    /// `healthy` lighthouses behind `health` (for the Status tooltip).
-    lh_healthy: usize,
-    /// `total` lighthouses behind `health` (for the Status tooltip).
-    lh_total: usize,
-    /// This node's pinned deployment role, folded from the snapshot's own `self`
-    /// directory row (`lighthouse`/`server`/`workstation`) — the same role source
-    /// the This-Node plane reads, off the SAME snapshot the bar already polls (no
-    /// new IO, no new dependency). `None` when the snapshot names no `self`, this
-    /// node isn't in the directory yet, or its row carries no role → the honest
-    /// neutral node badge, never a guessed role (§7).
-    role: Option<String>,
+    /// panel/applet model so the tray can't diverge from the fleet's verdict.
+    pub health: LighthouseHealth,
     /// `true` once a snapshot has been parsed — distinguishes "no snapshot yet"
-    /// (the connecting/loading state) from a parsed-but-empty mesh.
-    seen: bool,
+    /// (the honest dim pre-read state) from a parsed-but-empty mesh.
+    pub seen: bool,
 }
 
 impl Default for MeshSummary {
-    /// The pre-first-read state: nothing seen yet (drives the "Connecting…"
-    /// loading state). `LighthouseHealth` has no `Default`, so this is hand-rolled.
+    /// The pre-first-read state: nothing seen yet (the tray renders dim dots).
+    /// `LighthouseHealth` has no `Default`, so this is hand-rolled.
     fn default() -> Self {
         Self {
             peers_total: 0,
             peers_online: 0,
             health: LighthouseHealth::None,
-            lh_healthy: 0,
-            lh_total: 0,
-            role: None,
             seen: false,
         }
     }
 }
 
 impl MeshSummary {
-    /// Fold the mesh-status snapshot JSON into the bar's summary. A missing /
-    /// garbage snapshot yields the honest unseen summary (drives "Connecting…"),
-    /// never a panic — mirroring the panel client's tolerance.
-    fn from_snapshot(snapshot: &str) -> Self {
+    /// Fold the mesh-status snapshot JSON into the summary. A missing / garbage
+    /// snapshot yields the honest unseen summary (the tray's dim dots), never a
+    /// panic — mirroring the panel client's tolerance.
+    pub(crate) fn from_snapshot(snapshot: &str) -> Self {
         // The worst-of lighthouse verdict is the reused LIGHTHOUSE-7 parser.
-        let (health, lh_healthy, lh_total) = lighthouse_health_from_snapshot(snapshot);
+        let (health, _, _) = lighthouse_health_from_snapshot(snapshot);
         let Ok(v) = serde_json::from_str::<serde_json::Value>(snapshot) else {
             return Self::default();
         };
@@ -117,424 +93,27 @@ impl MeshSummary {
             .iter()
             .filter(|n| n.get("presence").and_then(serde_json::Value::as_str) == Some("online"))
             .count();
-        // This node's role: match the snapshot's own `self` marker to its directory
-        // row and read that row's `role` (the exact idiom This Node / Fleet fold).
-        // A missing `self`, an absent own row, or a blank role → `None` (no guess).
-        let self_host = nonempty(&v, "self");
-        let role = self_host.and_then(|host| {
-            nodes
-                .iter()
-                .find(|n| {
-                    n.get("hostname").and_then(serde_json::Value::as_str) == Some(host.as_str())
-                })
-                .and_then(|n| nonempty(n, "role"))
-        });
         Self {
             peers_total,
             peers_online,
             health,
-            lh_healthy,
-            lh_total,
-            role,
             seen: true,
         }
     }
 }
 
-/// Read a non-empty, trimmed string field off a JSON object, or `None` — the same
-/// tolerant field read the This Node plane uses (blank/whitespace reads as absent).
-fn nonempty(val: &serde_json::Value, key: &str) -> Option<String> {
-    val.get(key)
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-}
-
-// ──────────────────────────── slot view mapping ───────────────────────────
-
-/// One rendered slot: a tone dot, a value string, its colour, and a hover
-/// tooltip. The model→slot mapping is pure so it's unit-tested (a degraded mesh
-/// must map to a `DANGER` dot + "Degraded", etc.).
-struct SlotView {
-    dot: Color32,
-    value: String,
-    value_color: Color32,
-    tooltip: Option<String>,
-}
-
-impl SlotView {
-    /// The pre-first-snapshot loading state, shared by every live slot.
-    fn connecting() -> Self {
-        Self {
-            dot: Style::TEXT_DIM,
-            value: "Connecting…".to_string(),
-            value_color: Style::TEXT_DIM,
-            tooltip: Some("Reading mesh status…".to_string()),
-        }
-    }
-}
-
-/// The Peers slot: `online/total` with a tone (green all-online, amber some-away),
-/// an honest "No peers" when the directory is empty, and "Connecting…" before the
-/// first snapshot.
-fn peers_view(s: &MeshSummary) -> SlotView {
-    if !s.seen {
-        return SlotView::connecting();
-    }
-    if s.peers_total == 0 {
-        return SlotView {
-            dot: Style::TEXT_DIM,
-            value: "No peers".to_string(),
-            value_color: Style::TEXT_DIM,
-            tooltip: Some("No peers in the directory yet.".to_string()),
-        };
-    }
-    let all_online = s.peers_online == s.peers_total;
-    let away = s.peers_total.saturating_sub(s.peers_online);
-    SlotView {
-        dot: if all_online { Style::OK } else { Style::WARN },
-        value: format!("{}/{}", s.peers_online, s.peers_total),
-        value_color: if all_online { Style::TEXT } else { Style::WARN },
-        tooltip: Some(if all_online {
-            format!("Peers: all {} online.", s.peers_total)
-        } else {
-            format!(
-                "Peers: {}/{} online — {away} away.",
-                s.peers_online, s.peers_total
-            )
-        }),
-    }
-}
-
-/// The Status slot: the worst-of lighthouse verdict — green "Healthy", red
-/// "Degraded", a dim "No lighthouses" when none are in view, and "Connecting…"
-/// before the first snapshot.
-fn status_view(s: &MeshSummary) -> SlotView {
-    if !s.seen {
-        return SlotView::connecting();
-    }
-    match s.health {
-        LighthouseHealth::AllHealthy => SlotView {
-            dot: Style::OK,
-            value: "Healthy".to_string(),
-            value_color: Style::TEXT,
-            tooltip: s.health.tooltip(s.lh_healthy, s.lh_total),
-        },
-        LighthouseHealth::Degraded => SlotView {
-            dot: Style::DANGER,
-            value: "Degraded".to_string(),
-            value_color: Style::DANGER,
-            tooltip: s.health.tooltip(s.lh_healthy, s.lh_total),
-        },
-        LighthouseHealth::None => SlotView {
-            dot: Style::TEXT_DIM,
-            value: "No lighthouses".to_string(),
-            value_color: Style::TEXT_DIM,
-            tooltip: Some("No lighthouses in view.".to_string()),
-        },
-    }
-}
-
-// ───────────────────── read-only seat status icons (E12-15) ─────────────────
-//
-// Lock 3: the chrome bar carries read-only iconic status only — Signal · Bluetooth
-// · Volume · Battery — and no controls; ALL host-control interaction lives on
-// `Surface::System`. These fold the SAME `mde-seat` snapshot the System surface
-// renders (the shell polls one `Seat`), so the icon and the panel can't diverge.
-// Each is the familiar dot+name+value slot, so the read-only status reads exactly
-// like the mesh slots beside it.
-
-/// The Signal slot: mesh reachability, reused from the chrome's own mesh summary
-/// (the presence source lock 3 points the Signal icon at) — online when any peer
-/// is reachable, an honest "isolated" when the directory is populated but nobody
-/// answers, "no peers" when it's empty, and "Connecting…" before the first read.
-fn signal_view(s: &MeshSummary) -> SlotView {
-    if !s.seen {
-        return SlotView::connecting();
-    }
-    if s.peers_total == 0 {
-        return SlotView {
-            dot: Style::TEXT_DIM,
-            value: "no peers".to_string(),
-            value_color: Style::TEXT_DIM,
-            tooltip: Some("Signal — no peers in the mesh directory yet.".to_string()),
-        };
-    }
-    if s.peers_online == 0 {
-        return SlotView {
-            dot: Style::WARN,
-            value: "isolated".to_string(),
-            value_color: Style::WARN,
-            tooltip: Some("Signal — the directory is populated but no peer is online.".to_string()),
-        };
-    }
-    SlotView {
-        dot: Style::OK,
-        value: "online".to_string(),
-        value_color: Style::TEXT,
-        tooltip: Some(format!(
-            "Signal — {}/{} peers reachable on the mesh.",
-            s.peers_online, s.peers_total
-        )),
-    }
-}
-
-/// The Bluetooth slot: adapter power + connected-device count from the seat
-/// snapshot. `Absent` (no `BlueZ` / no bus — the build-host case) reads as a dim
-/// "off" carrying the honest reason; never a fabricated radio state (§7).
-fn bluetooth_view(seat: Option<&SeatSnapshot>) -> SlotView {
-    match seat.map(|s| &s.bluetooth) {
-        None => seat_reading("Bluetooth"),
-        Some(Probe::Absent { reason, .. }) => seat_unavailable(reason),
-        Some(Probe::Present(bt)) => {
-            if bt.any_adapter_powered() {
-                let connected = bt.connected_devices();
-                let value = if connected > 0 {
-                    format!("on \u{00B7} {connected}")
-                } else {
-                    "on".to_string()
-                };
-                SlotView {
-                    dot: Style::OK,
-                    value,
-                    value_color: Style::TEXT,
-                    tooltip: Some(format!(
-                        "Bluetooth on — {connected} device(s) connected of {} known.",
-                        bt.devices.len()
-                    )),
-                }
-            } else {
-                SlotView {
-                    dot: Style::TEXT_DIM,
-                    value: "off".to_string(),
-                    value_color: Style::TEXT_DIM,
-                    tooltip: Some("Bluetooth adapter powered off.".to_string()),
-                }
-            }
-        }
-    }
-}
-
-/// The Volume slot: master mute / level from the seat snapshot's mixer. `Absent`
-/// (the `PipeWire` binding lands in E12-16, so this is the build-host state today)
-/// reads as a dim "unavailable" carrying the honest reason; never a fake level.
-fn volume_view(seat: Option<&SeatSnapshot>) -> SlotView {
-    match seat.map(|s| &s.mixer) {
-        None => seat_reading("Volume"),
-        Some(Probe::Absent { reason, .. }) => seat_unavailable(reason),
-        Some(Probe::Present(m)) => {
-            if m.master.muted {
-                SlotView {
-                    dot: Style::WARN,
-                    value: "muted".to_string(),
-                    value_color: Style::WARN,
-                    tooltip: Some("Master output muted.".to_string()),
-                }
-            } else {
-                SlotView {
-                    dot: Style::OK,
-                    value: format!("{}%", m.master.volume),
-                    value_color: Style::TEXT,
-                    tooltip: Some(format!("Master output at {}%.", m.master.volume)),
-                }
-            }
-        }
-    }
-}
-
-/// The Battery slot: the system pack's charge + charging state, folded from the
-/// SAME `SeatSnapshot.batteries` telemetry the System surface's Power section
-/// renders (the shell polls one `Seat`, so the slot and the panel can't diverge).
-/// `Absent` (no `UPower` / no bus — the build-host case) reads a dim "unavailable"
-/// carrying the honest reason; a present-but-empty snapshot (a desktop with no
-/// pack) reads a dim "No battery"; never a fabricated level (§7).
-fn battery_view(seat: Option<&SeatSnapshot>) -> SlotView {
-    match seat.map(|s| &s.batteries) {
-        None => seat_reading("Battery"),
-        Some(Probe::Absent { reason, .. }) => seat_unavailable(reason),
-        Some(Probe::Present(cells)) => {
-            let Some(b) = system_pack(cells) else {
-                return SlotView {
-                    dot: Style::TEXT_DIM,
-                    value: "No battery".to_string(),
-                    value_color: Style::TEXT_DIM,
-                    tooltip: Some("No battery on this host.".to_string()),
-                };
-            };
-            let (dot, value_color) = battery_tone(b);
-            let mut value = format!("{:.0}%", b.percentage);
-            // A charging (or pending-charge) pack carries the bolt so the slot reads
-            // "on AC" at a glance, beside the tone dot.
-            if matches!(
-                b.state,
-                BatteryState::Charging | BatteryState::PendingCharge
-            ) {
-                value.push('\u{26A1}');
-            }
-            SlotView {
-                dot,
-                value,
-                value_color,
-                tooltip: Some(format!(
-                    "Battery — {} \u{00B7} {} \u{00B7} {:.0}%",
-                    b.kind.label(),
-                    b.state.label(),
-                    b.percentage
-                )),
-            }
-        }
-    }
-}
-
-/// Pick the system pack to summarise from a multi-battery snapshot (lock 6): the
-/// `PowerSupply` pack that actually powers the host, else — when none is flagged
-/// (an all-peripheral snapshot) — the fullest cell, so the slot never invents a
-/// reading. `None` only for an empty list (the caller renders "No battery").
-fn system_pack(cells: &[Battery]) -> Option<&Battery> {
-    cells.iter().find(|b| b.power_supply).or_else(|| {
-        cells.iter().max_by(|a, b| {
-            a.percentage
-                .partial_cmp(&b.percentage)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-    })
-}
-
-/// The battery slot's tone — `(dot, value_color)` for the chosen system pack. A
-/// charging or full pack reads OK; a draining pack reads red under ~5% (or when
-/// `UPower` reports it empty) and amber under ~20%; anything else (a healthily
-/// draining pack, a pending state) reads the neutral dim dot with a legible value.
-fn battery_tone(b: &Battery) -> (Color32, Color32) {
-    match b.state {
-        BatteryState::Charging | BatteryState::FullyCharged => (Style::OK, Style::TEXT),
-        BatteryState::Empty => (Style::DANGER, Style::DANGER),
-        BatteryState::Discharging | BatteryState::PendingDischarge => {
-            if b.percentage <= BATTERY_CRITICAL {
-                (Style::DANGER, Style::DANGER)
-            } else if b.percentage < BATTERY_LOW {
-                (Style::WARN, Style::WARN)
-            } else {
-                (Style::TEXT_DIM, Style::TEXT)
-            }
-        }
-        BatteryState::PendingCharge | BatteryState::Unknown => (Style::TEXT_DIM, Style::TEXT),
-    }
-}
-
-/// The pre-first-snapshot seat state, shared by the Bluetooth + Volume + Battery
-/// icons.
-fn seat_reading(what: &str) -> SlotView {
-    SlotView {
-        dot: Style::TEXT_DIM,
-        value: "\u{2014}".to_string(),
-        value_color: Style::TEXT_DIM,
-        tooltip: Some(format!("Reading {what} status from the seat…")),
-    }
-}
-
-/// A seat backend that is honestly absent on this host — a dim "unavailable"
-/// carrying the typed reason (§7 / interlock 4), never a fabricated state.
-fn seat_unavailable(reason: &str) -> SlotView {
-    SlotView {
-        dot: Style::TEXT_DIM,
-        value: "unavailable".to_string(),
-        value_color: Style::TEXT_DIM,
-        tooltip: Some(reason.to_string()),
-    }
-}
-
-/// The Sessions slot: honest "No session" until `mde-vdi` connects a live VM
-/// desktop (a later unit) and drives this slot. Never a fabricated count (§7) —
-/// the same truth the collapsed session empty state shows.
-fn session_view() -> SlotView {
-    SlotView {
-        dot: Style::TEXT_DIM,
-        value: "No session".to_string(),
-        value_color: Style::TEXT_DIM,
-        tooltip: Some(
-            "Connect a desktop — your VM session renders here (mde-vdi, a later unit).".to_string(),
-        ),
-    }
-}
-
-// ─────────────────────────── the node role badge ──────────────────────────
-//
-// The chrome carries this node's identity: the subtle build tag plus a small role
-// badge. The badge reuses QBRAND-2's role glyphs (`IconId::Workstation/Server/
-// Lighthouse`) — the brand crate owns the artwork, this bar only tints + places it
-// (§4/§6). The role itself is folded from the mesh snapshot the bar already reads
-// (`MeshSummary::role`), so there's no second role source to drift.
-
-/// The resolved role badge: which brand glyph to draw, the `Style` token to tint it
-/// with, and the hover text. A known role reads at full text tone; an unknown role
-/// falls back to the neutral mesh-node glyph, dimmed — honest, never a guessed role.
-struct Badge {
-    /// The brand glyph to raster (a role badge, or the neutral node glyph).
-    icon: IconId,
-    /// The `Style` token the glyph is tinted with (full tone known, dim unknown).
-    tint: Color32,
-    /// The hover text naming the role (or its honest absence).
-    tooltip: &'static str,
-}
-
-/// Map this node's pinned role string to its badge. The three deployment roles map
-/// to their QBRAND-2 glyphs at full text tone; anything else (including a genuinely
-/// unknown / not-yet-published role) is the dim neutral node glyph — the honest
-/// fallback the design calls for, never a fabricated role (§7).
-fn role_badge(role: Option<&str>) -> Badge {
-    match role {
-        Some("workstation") => Badge {
-            icon: IconId::Workstation,
-            tint: Style::TEXT,
-            tooltip: "This node's role: Workstation.",
-        },
-        Some("server") => Badge {
-            icon: IconId::Server,
-            tint: Style::TEXT,
-            tooltip: "This node's role: Server.",
-        },
-        Some("lighthouse") => Badge {
-            icon: IconId::Lighthouse,
-            tint: Style::TEXT,
-            tooltip: "This node's role: Lighthouse.",
-        },
-        _ => Badge {
-            icon: IconId::Node,
-            tint: Style::TEXT_DIM,
-            tooltip: "This node's role isn't published to the mesh snapshot yet.",
-        },
-    }
-}
-
-/// The badge's raster size in physical pixels: a `Style`-grid point size scaled by
-/// the context's device pixel ratio, so the glyph is DPI-crisp (never a raw metric,
-/// §4). Clamped ≥ 1px so `icon_image` never sees a zero size.
-#[allow(
-    clippy::cast_possible_truncation, // rounded, clamped-positive f32 → u32
-    clippy::cast_sign_loss            // ≥ 1.0 by the .max(1.0) clamp
-)]
-fn badge_px(points: f32, pixels_per_point: f32) -> u32 {
-    (points * pixels_per_point).round().max(1.0) as u32
-}
-
 // ──────────────────────────── the chrome state ────────────────────────────
 
-/// The chrome bar's live state: the projected mesh summary plus the small IO
-/// context to refresh it on the shared cadence.
-pub(crate) struct ChromeState {
+/// The live mesh-fold state: the projected summary plus the small IO context to
+/// refresh it on the shared cadence.
+pub struct ChromeState {
     /// The world-readable snapshot path (resolved once).
     snapshot_path: PathBuf,
-    /// The latest projection. Unseen until the first snapshot lands (drives the
-    /// "Connecting…" state).
+    /// The latest projection. Unseen until the first snapshot lands (the tray
+    /// renders dim dots).
     summary: MeshSummary,
     /// When the snapshot was last polled (drives the fixed cadence).
     last_poll: Option<Instant>,
-    /// The cached role-badge texture, keyed by `(glyph, tint)` so the SVG only
-    /// re-rasterizes when the resolved role (or its tint) changes — not every
-    /// frame. `None` until the first badge draws (or if rasterization ever fails —
-    /// the cluster then shows the build tag alone, never a panic).
-    badge: Option<(IconId, [u8; 4], egui::TextureHandle)>,
 }
 
 impl Default for ChromeState {
@@ -543,19 +122,19 @@ impl Default for ChromeState {
             snapshot_path: PathBuf::from(SNAPSHOT_PATH),
             summary: MeshSummary::default(),
             last_poll: None,
-            badge: None,
         }
     }
 }
 
 impl ChromeState {
     /// The poll seam: refresh the projection from the snapshot when the cadence
-    /// has elapsed, then keep the repaint heartbeat alive so a peer join/leave or a
-    /// lighthouse flip surfaces without input. Cheap enough to call every frame —
-    /// it self-gates. A missing / unreadable snapshot yields the unseen summary
-    /// (honest "Connecting…"), never a panic. `pub(crate)` so the QBRAND-4
-    /// boot-splash can bank its "first mesh snapshot poll" milestone by running
-    /// THIS real fold (the first dock frame then opens with a live chrome).
+    /// has elapsed, then keep the repaint heartbeat alive so a peer join/leave,
+    /// a lighthouse flip, or the tray clock's minute change surfaces without
+    /// input. Cheap enough to call every frame — it self-gates. A missing /
+    /// unreadable snapshot yields the unseen summary (honest dim dots), never a
+    /// panic. `pub(crate)` so the QBRAND-4 boot-splash can bank its "first mesh
+    /// snapshot poll" milestone by running THIS real fold (the first dock frame
+    /// then opens with a live tray).
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
         let due = self.last_poll.is_none_or(|t| t.elapsed() >= REFRESH);
         if due {
@@ -566,196 +145,10 @@ impl ChromeState {
         ctx.request_repaint_after(REFRESH);
     }
 
-    /// Resolve the role-badge texture for `badge`, rasterizing + uploading the brand
-    /// glyph on first use (and only re-rasterizing when the glyph or its tint
-    /// changes — the cache is keyed by both). Returns a cheap clone of the cached
-    /// [`egui::TextureHandle`], or `None` if the glyph can't rasterize (never a
-    /// panic — the caller then draws the build tag alone). The one-line SVG→texture
-    /// wrap is QBRAND-2's documented recipe; the tint comes straight from a `Style`
-    /// token, so this bar never re-derives the design system's colours (§4/§6).
-    fn badge_texture(&mut self, ctx: &egui::Context, badge: &Badge) -> Option<egui::TextureHandle> {
-        let tint = [
-            badge.tint.r(),
-            badge.tint.g(),
-            badge.tint.b(),
-            badge.tint.a(),
-        ];
-        let fresh = self
-            .badge
-            .as_ref()
-            .is_none_or(|(id, key, _)| *id != badge.icon || *key != tint);
-        if fresh {
-            let px = badge_px(Style::SP_M, ctx.pixels_per_point());
-            match icon_image(badge.icon, px, tint) {
-                Ok(img) => {
-                    let color =
-                        egui::ColorImage::from_rgba_unmultiplied(img.size_usize(), &img.rgba);
-                    let tex =
-                        ctx.load_texture(badge.icon.name(), color, egui::TextureOptions::LINEAR);
-                    self.badge = Some((badge.icon, tint, tex));
-                }
-                Err(_) => self.badge = None,
-            }
-        }
-        self.badge.as_ref().map(|(_, _, tex)| tex.clone())
-    }
-}
-
-/// What the chrome bar reported this frame — the Expand/Collapse toggle and/or a
-/// click on the unread indicator (NOTIFY-CHAT-6). The shell applies each; the
-/// unread click routes through the one `shell/goto/chat` nav grammar so the chrome
-/// has no second copy of the navigation.
-#[derive(Default, Clone, Copy)]
-pub(crate) struct ChromeOutcome {
-    /// The Expand/Collapse toggle was clicked this frame.
-    pub toggled: bool,
-    /// The unread indicator was clicked — open the unified Chat surface.
-    pub open_chat: bool,
-}
-
-/// Render the chrome bar's contents inside a top panel. Polls the live mesh
-/// summary (self-gating on the shared cadence), draws the brand mark + the live
-/// slots + the unread indicator, and reports the Expand toggle / unread click this
-/// frame. `unread` is the whole-mesh Chat tally (folded alerts + clipboard clips +
-/// human chat) — the ONE notification interface's badge.
-pub(crate) fn show(
-    ui: &mut egui::Ui,
-    chrome: &mut ChromeState,
-    seat: Option<&SeatSnapshot>,
-    expanded: bool,
-    unread: usize,
-) -> ChromeOutcome {
-    chrome.poll(ui.ctx());
-
-    // The mesh slots, then the read-only seat status icons (lock 3: Signal ·
-    // Bluetooth · Volume) folded from the same seat snapshot the System surface
-    // renders.
-    let slots = [
-        ("Peers", peers_view(&chrome.summary)),
-        ("Sessions", session_view()),
-        ("Status", status_view(&chrome.summary)),
-        ("Signal", signal_view(&chrome.summary)),
-        ("BT", bluetooth_view(seat)),
-        ("Vol", volume_view(seat)),
-        ("Batt", battery_view(seat)),
-    ];
-
-    let mut outcome = ChromeOutcome::default();
-    ui.horizontal_centered(|ui| {
-        // Brand mark — keeps the bar identifiable when a session is fullscreen.
-        ui.label(
-            RichText::new("MCNF")
-                .color(Style::ACCENT)
-                .size(Style::BODY)
-                .strong(),
-        );
-
-        // This node's role badge — the pinned deployment role rendered small, folded
-        // from the SAME snapshot the bar already reads (the node's own `self` row).
-        // An unknown role falls back to the neutral node glyph (honest, never a
-        // guessed role). The brand crate owns the glyph; this bar only tints + sizes
-        // it off `Style` tokens (§4).
-        let badge = role_badge(chrome.summary.role.as_deref());
-        if let Some(tex) = chrome.badge_texture(ui.ctx(), &badge) {
-            ui.add_space(Style::SP_S);
-            ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                tex.id(),
-                egui::vec2(Style::SP_M, Style::SP_M),
-            )))
-            .on_hover_text(badge.tooltip);
-        }
-
-        // The subtle build tag in the dim Carbon token — single-sourced from
-        // brand::build so it can't drift from the splash / About / --version line
-        // (§4/§6); hovering reveals the full stamp (hash · date · channel).
-        ui.add_space(Style::SP_S);
-        ui.label(
-            RichText::new(build::version_line())
-                .color(Style::TEXT_DIM)
-                .size(Style::SMALL),
-        )
-        .on_hover_text(build::full());
-
-        ui.add_space(Style::SP_M);
-
-        for (i, (name, view)) in slots.iter().enumerate() {
-            if i > 0 {
-                ui.add_space(Style::SP_S);
-                ui.label(RichText::new("·").color(Style::BORDER).size(Style::BODY));
-                ui.add_space(Style::SP_S);
-            }
-            draw_slot(ui, name, view);
-        }
-
-        // Expand / Collapse, pinned to the right edge, with the unread indicator
-        // just inside it (the ONE notification interface's badge — NOTIFY-CHAT-6).
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let label = if expanded { "Collapse" } else { "Expand" };
-            if ui.button(label).clicked() {
-                outcome.toggled = true;
-            }
-            ui.add_space(Style::SP_S);
-            if chat_indicator(ui, unread).clicked() {
-                outcome.open_chat = true;
-            }
-        });
-    });
-    outcome
-}
-
-/// The unread indicator — a filled dot plus the word "Chat" and, when the mesh has
-/// unread notifications (folded alerts + clipboard clips + human chat, all one
-/// Chat surface now), a count badge. Accent when something waits, dim when quiet;
-/// always clickable so the operator can open Chat regardless. Reads the same
-/// `Style` dot glyph as the status slots (no emoji-font tofu risk), returns the
-/// click response (the caller routes it through `shell/goto/chat`). The tooltip is
-/// honest about the count so a dim dot never reads as a fabricated "all clear".
-fn chat_indicator(ui: &mut egui::Ui, unread: usize) -> egui::Response {
-    let (color, tooltip) = if unread > 0 {
-        (
-            Style::ACCENT,
-            format!("{unread} unread — open Chat (alerts, clipboard, messages)."),
-        )
-    } else {
-        (
-            Style::TEXT_DIM,
-            "No unread — open Chat (alerts, clipboard, messages).".to_string(),
-        )
-    };
-    let label = if unread > 0 {
-        // Cap the badge so a firehose can't stretch the bar.
-        let shown = if unread > 99 {
-            "99+".to_string()
-        } else {
-            unread.to_string()
-        };
-        RichText::new(format!("{DOT} Chat {shown}"))
-            .color(color)
-            .size(Style::SMALL)
-            .strong()
-    } else {
-        RichText::new(format!("{DOT} Chat"))
-            .color(color)
-            .size(Style::SMALL)
-    };
-    ui.add(egui::Button::new(label).frame(unread > 0))
-        .on_hover_text(tooltip)
-}
-
-/// One status slot: a tone dot, the slot name, and its live value (with a hover
-/// tooltip). All colour/size read `Style`.
-fn draw_slot(ui: &mut egui::Ui, name: &str, view: &SlotView) {
-    ui.label(RichText::new(DOT).color(view.dot).size(Style::SMALL));
-    ui.add_space(Style::SP_XS);
-    ui.label(RichText::new(name).color(Style::TEXT).size(Style::SMALL));
-    ui.add_space(Style::SP_XS);
-    let resp = ui.label(
-        RichText::new(&view.value)
-            .color(view.value_color)
-            .size(Style::SMALL),
-    );
-    if let Some(tip) = &view.tooltip {
-        let _ = resp.on_hover_text(tip.clone());
+    /// The latest projection — what the taskbar tray folds its Peers / Status /
+    /// Signal dots from each frame.
+    pub(crate) const fn summary(&self) -> &MeshSummary {
+        &self.summary
     }
 }
 
@@ -780,11 +173,8 @@ mod tests {
     fn unseen_before_the_first_snapshot() {
         let s = MeshSummary::default();
         assert!(!s.seen);
-        // Every live slot loads honestly, never blank.
-        for v in [peers_view(&s), status_view(&s)] {
-            assert_eq!(v.value, "Connecting…");
-            assert_eq!(v.dot, Style::TEXT_DIM);
-        }
+        assert_eq!((s.peers_online, s.peers_total), (0, 0));
+        assert_eq!(s.health, LighthouseHealth::None);
     }
 
     #[test]
@@ -792,7 +182,6 @@ mod tests {
         for bad in ["", "not json", "{}", r#"{"network":{}}"#] {
             let s = MeshSummary::from_snapshot(bad);
             assert!(!s.seen, "{bad:?} must not read as a live mesh");
-            assert_eq!(peers_view(&s).value, "Connecting…");
         }
     }
 
@@ -802,462 +191,40 @@ mod tests {
         let s = MeshSummary::from_snapshot(&snapshot("online", "online", "offline"));
         assert!(s.seen);
         assert_eq!((s.peers_online, s.peers_total), (2, 3));
-        let v = peers_view(&s);
-        assert_eq!(v.value, "2/3");
-        // Some away → amber, not green and not red.
-        assert_eq!(v.dot, Style::WARN);
-        assert!(v.tooltip.is_some_and(|t| t.contains("away")));
-    }
-
-    #[test]
-    fn peers_all_online_is_green() {
+        // All three up → 3/3.
         let s = MeshSummary::from_snapshot(&snapshot("online", "online", "online"));
         assert_eq!((s.peers_online, s.peers_total), (3, 3));
-        let v = peers_view(&s);
-        assert_eq!(v.value, "3/3");
-        assert_eq!(v.dot, Style::OK);
-        assert_eq!(v.value_color, Style::TEXT);
     }
 
     #[test]
-    fn empty_directory_is_no_peers_not_connecting() {
-        // A parsed snapshot with an empty node list is "seen" → honest empty state,
-        // distinct from the pre-read "Connecting…".
+    fn empty_directory_is_seen_not_pre_read() {
+        // A parsed snapshot with an empty node list is "seen" → the tray's
+        // honest empty state, distinct from the pre-read dim state.
         let s = MeshSummary::from_snapshot(r#"{"nodes":[],"network":{"lighthouse_ips":[]}}"#);
         assert!(s.seen);
-        let v = peers_view(&s);
-        assert_eq!(v.value, "No peers");
-        assert_eq!(v.dot, Style::TEXT_DIM);
+        assert_eq!(s.peers_total, 0);
     }
 
     #[test]
-    fn status_maps_worst_of_lighthouse_health() {
-        // All lighthouses up → green "Healthy".
+    fn health_folds_the_worst_of_lighthouse_verdict() {
+        // All lighthouses up → AllHealthy.
         let up = MeshSummary::from_snapshot(&snapshot("online", "online", "offline"));
         assert_eq!(up.health, LighthouseHealth::AllHealthy);
-        let v = status_view(&up);
-        assert_eq!(v.value, "Healthy");
-        assert_eq!(v.dot, Style::OK);
-        assert!(v.tooltip.is_some_and(|t| t.contains("2/2")));
-
-        // Any lighthouse down → red "Degraded" (worst-of).
+        // Any lighthouse down → Degraded (worst-of).
         let deg = MeshSummary::from_snapshot(&snapshot("online", "idle", "online"));
         assert_eq!(deg.health, LighthouseHealth::Degraded);
-        let v = status_view(&deg);
-        assert_eq!(v.value, "Degraded");
-        assert_eq!(v.dot, Style::DANGER);
-        assert_eq!(v.value_color, Style::DANGER);
-    }
-
-    #[test]
-    fn status_with_no_lighthouses_is_dim() {
-        let s = MeshSummary::from_snapshot(
+        // No lighthouses in view → None.
+        let none = MeshSummary::from_snapshot(
             r#"{"nodes":[{"hostname":"ws","overlay_ip":"10.42.0.50","presence":"online","role":"workstation"}],"network":{"lighthouse_ips":[]}}"#,
         );
-        assert!(s.seen);
-        assert_eq!(s.health, LighthouseHealth::None);
-        let v = status_view(&s);
-        assert_eq!(v.value, "No lighthouses");
-        assert_eq!(v.dot, Style::TEXT_DIM);
-    }
-
-    #[test]
-    fn session_slot_is_an_honest_empty_state() {
-        // No live session signal yet — never a fabricated count (§7).
-        let v = session_view();
-        assert_eq!(v.value, "No session");
-        assert_eq!(v.dot, Style::TEXT_DIM);
-        assert!(v.tooltip.is_some_and(|t| t.contains("mde-vdi")));
-    }
-
-    #[test]
-    fn chrome_outcome_defaults_to_no_action() {
-        let o = ChromeOutcome::default();
-        assert!(!o.toggled);
-        assert!(!o.open_chat);
-    }
-
-    #[test]
-    fn chrome_bar_with_the_unread_indicator_tessellates() {
-        // The chrome bar (incl. the NOTIFY-CHAT-6 unread indicator) mounts + paints
-        // headless with a live unread count — proving the new indicator draws real
-        // geometry, the same CPU paint path the DRM runner drives.
-        use mde_egui::egui::{pos2, vec2, Rect};
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut chrome = ChromeState::default();
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 48.0))),
-            ..Default::default()
-        };
-        let out = ctx.run(input, |ctx| {
-            egui::TopBottomPanel::top("mcnf-chrome").show(ctx, |ui| {
-                let outcome = show(ui, &mut chrome, None, false, 7);
-                // No pointer events → neither affordance fires this frame.
-                assert!(!outcome.toggled && !outcome.open_chat);
-            });
-        });
-        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-        assert!(
-            !prims.is_empty(),
-            "the chrome bar produced no draw primitives"
-        );
+        assert_eq!(none.health, LighthouseHealth::None);
     }
 
     #[test]
     fn chrome_state_defaults_to_the_snapshot_path_unseen() {
         let c = ChromeState::default();
         assert_eq!(c.snapshot_path, PathBuf::from(SNAPSHOT_PATH));
-        assert!(!c.summary.seen);
+        assert!(!c.summary().seen);
         assert!(c.last_poll.is_none());
-    }
-
-    // ── the read-only seat status icons (E12-15, lock 3) ─────────────────────
-
-    use mde_seat::{Backend, BatteryKind, BtAdapter, BtDevice, BtStatus, MixerStatus};
-
-    /// A typed-absent probe of any section (the honest build-host state).
-    fn absent<T>() -> Probe<T> {
-        Probe::Absent {
-            backend: Backend::PipeWire,
-            reason: "PipeWire is not available: test".to_string(),
-        }
-    }
-
-    /// A snapshot with a chosen Bluetooth, every other section Absent. The mixer is
-    /// always Absent here: its `MixerStatus` can't be constructed off the shell
-    /// crate (the `StripOrigin` field type isn't re-exported), and Absent is the
-    /// real build-host mixer state until E12-16 anyway — mde-seat's own tests cover
-    /// a Present mixer fold.
-    fn seat_snapshot(bluetooth: Probe<BtStatus>) -> SeatSnapshot {
-        let mixer: Probe<MixerStatus> = absent();
-        SeatSnapshot {
-            bluetooth,
-            batteries: absent(),
-            on_ac: absent(),
-            power: absent(),
-            power_profile: absent(),
-            charge_limit: absent(),
-            lid: absent(),
-            displays: absent(),
-            backlights: absent(),
-            mixer,
-            ddc: absent(),
-        }
-    }
-
-    #[test]
-    fn seat_icons_read_unavailable_when_the_backend_is_absent() {
-        // The build-host reality: no PipeWire mixer, no BlueZ — the icons must read
-        // an honest dim "unavailable", never a fabricated on/level (§7).
-        let snap = seat_snapshot(absent());
-        let bt = bluetooth_view(Some(&snap));
-        assert_eq!(bt.value, "unavailable");
-        assert_eq!(bt.dot, Style::TEXT_DIM);
-        assert!(bt.tooltip.is_some_and(|t| t.contains("not available")));
-        let vol = volume_view(Some(&snap));
-        assert_eq!(vol.value, "unavailable");
-        assert_eq!(vol.dot, Style::TEXT_DIM);
-    }
-
-    #[test]
-    fn seat_icons_are_a_dim_dash_before_the_first_snapshot() {
-        // No snapshot yet (pre-poll) is distinct from Absent — a dim placeholder,
-        // never blank.
-        assert_eq!(bluetooth_view(None).value, "\u{2014}");
-        assert_eq!(volume_view(None).value, "\u{2014}");
-    }
-
-    #[test]
-    fn bluetooth_icon_folds_powered_adapter_and_connected_count() {
-        let bt = BtStatus {
-            adapters: vec![BtAdapter {
-                path: "/org/bluez/hci0".into(),
-                name: "hci0".into(),
-                powered: true,
-                discovering: false,
-                discoverable: false,
-                pairable: false,
-            }],
-            devices: vec![BtDevice {
-                path: "/org/bluez/hci0/dev_x".into(),
-                alias: "MX Keys".into(),
-                address: Some("AA:BB:CC:DD:EE:FF".into()),
-                rssi: None,
-                paired: true,
-                connected: true,
-                trusted: true,
-                battery_percent: Some(80),
-                icon: None,
-            }],
-        };
-        let v = bluetooth_view(Some(&seat_snapshot(Probe::Present(bt))));
-        assert_eq!(v.value, "on \u{00B7} 1");
-        assert_eq!(v.dot, Style::OK);
-
-        // A powered-off adapter with nothing connected reads a dim "off".
-        let bare = BtStatus {
-            adapters: vec![BtAdapter {
-                path: "/org/bluez/hci0".into(),
-                name: "hci0".into(),
-                powered: false,
-                discovering: false,
-                discoverable: false,
-                pairable: false,
-            }],
-            devices: Vec::new(),
-        };
-        let off = bluetooth_view(Some(&seat_snapshot(Probe::Present(bare))));
-        assert_eq!(off.value, "off");
-        assert_eq!(off.dot, Style::TEXT_DIM);
-    }
-
-    /// A snapshot carrying a chosen battery probe, every other section Absent — the
-    /// battery-slot analogue of `seat_snapshot`.
-    fn battery_snapshot(batteries: Probe<Vec<Battery>>) -> SeatSnapshot {
-        SeatSnapshot {
-            bluetooth: absent(),
-            batteries,
-            on_ac: absent(),
-            power: absent(),
-            power_profile: absent(),
-            charge_limit: absent(),
-            lid: absent(),
-            displays: absent(),
-            backlights: absent(),
-            mixer: absent(),
-            ddc: absent(),
-        }
-    }
-
-    /// One internal system pack at a chosen charge/state — the shape the slot folds.
-    fn pack(percentage: f64, state: BatteryState, power_supply: bool) -> Battery {
-        Battery {
-            model: "BAT0".to_string(),
-            kind: BatteryKind::Internal,
-            percentage,
-            state,
-            power_supply,
-            time_to_empty: None,
-            time_to_full: None,
-            energy_rate: None,
-        }
-    }
-
-    #[test]
-    fn battery_slot_folds_the_system_pack_charge_and_state() {
-        // A charging pack → OK dot, the bolt appended to the charge, an honest tip.
-        let v = battery_view(Some(&battery_snapshot(Probe::Present(vec![pack(
-            80.0,
-            BatteryState::Charging,
-            true,
-        )]))));
-        assert_eq!(v.value, "80%\u{26A1}");
-        assert_eq!(v.dot, Style::OK);
-        assert!(v
-            .tooltip
-            .is_some_and(|t| t.contains("internal battery") && t.contains("charging")));
-
-        // A low draining pack (< 20%) → amber WARN dot, no bolt.
-        let v = battery_view(Some(&battery_snapshot(Probe::Present(vec![pack(
-            12.0,
-            BatteryState::Discharging,
-            true,
-        )]))));
-        assert_eq!(v.value, "12%");
-        assert_eq!(v.dot, Style::WARN);
-        assert_eq!(v.value_color, Style::WARN);
-
-        // A full pack → OK dot, no bolt.
-        let v = battery_view(Some(&battery_snapshot(Probe::Present(vec![pack(
-            100.0,
-            BatteryState::FullyCharged,
-            true,
-        )]))));
-        assert_eq!(v.value, "100%");
-        assert_eq!(v.dot, Style::OK);
-
-        // A critically low draining pack → red DANGER dot.
-        assert_eq!(
-            battery_view(Some(&battery_snapshot(Probe::Present(vec![pack(
-                3.0,
-                BatteryState::Discharging,
-                true
-            )]))))
-            .dot,
-            Style::DANGER
-        );
-        // An empty pack → red DANGER dot too.
-        assert_eq!(
-            battery_view(Some(&battery_snapshot(Probe::Present(vec![pack(
-                0.0,
-                BatteryState::Empty,
-                true
-            )]))))
-            .dot,
-            Style::DANGER
-        );
-
-        // A healthily draining pack reads the neutral dim dot with a legible value.
-        let v = battery_view(Some(&battery_snapshot(Probe::Present(vec![pack(
-            72.0,
-            BatteryState::Discharging,
-            true,
-        )]))));
-        assert_eq!(v.value, "72%");
-        assert_eq!(v.dot, Style::TEXT_DIM);
-        assert_eq!(v.value_color, Style::TEXT);
-    }
-
-    #[test]
-    fn battery_slot_picks_the_system_pack_over_a_fuller_peripheral() {
-        // A fuller peripheral (a mouse) must not mask the low system pack: the
-        // `PowerSupply` cell is summarised even though it's the lower charge.
-        let v = battery_view(Some(&battery_snapshot(Probe::Present(vec![
-            pack(95.0, BatteryState::Discharging, false), // peripheral mouse
-            pack(15.0, BatteryState::Discharging, true),  // the system pack, low
-        ]))));
-        assert_eq!(v.value, "15%");
-        assert_eq!(v.dot, Style::WARN);
-    }
-
-    #[test]
-    fn battery_slot_is_honest_when_empty_or_absent() {
-        // Present-but-empty (a desktop with no pack) → a dim "No battery".
-        let v = battery_view(Some(&battery_snapshot(Probe::Present(Vec::new()))));
-        assert_eq!(v.value, "No battery");
-        assert_eq!(v.dot, Style::TEXT_DIM);
-
-        // Absent backend (no UPower / no bus) → the shared dim "unavailable".
-        let v = battery_view(Some(&battery_snapshot(absent())));
-        assert_eq!(v.value, "unavailable");
-        assert_eq!(v.dot, Style::TEXT_DIM);
-
-        // Before the first snapshot → the dim dash, never blank.
-        assert_eq!(battery_view(None).value, "\u{2014}");
-    }
-
-    #[test]
-    fn signal_icon_folds_mesh_reachability_from_the_summary() {
-        // Any peer online → green "online".
-        let up = MeshSummary::from_snapshot(&snapshot("online", "online", "offline"));
-        let v = signal_view(&up);
-        assert_eq!(v.value, "online");
-        assert_eq!(v.dot, Style::OK);
-
-        // A populated directory with nobody online → amber "isolated".
-        let down = MeshSummary::from_snapshot(&snapshot("offline", "offline", "offline"));
-        let v = signal_view(&down);
-        assert_eq!(v.value, "isolated");
-        assert_eq!(v.dot, Style::WARN);
-
-        // Before the first snapshot → the shared connecting state.
-        assert_eq!(signal_view(&MeshSummary::default()).value, "Connecting…");
-    }
-
-    // ── the node role badge (QBRAND-5) ───────────────────────────────────────
-
-    #[test]
-    fn role_folds_from_this_nodes_own_self_row() {
-        // The snapshot names this node via `self`; the badge reads THIS node's own
-        // directory row (a lighthouse), not a peer's role.
-        let snap = r#"{"self":"lh-01","nodes":[
-            {"hostname":"lh-01","overlay_ip":"10.42.0.1","presence":"online","role":"lighthouse"},
-            {"hostname":"ws-1","overlay_ip":"10.42.0.50","presence":"online","role":"workstation"}
-        ],"network":{"lighthouse_ips":["10.42.0.1"]}}"#;
-        let s = MeshSummary::from_snapshot(snap);
-        assert_eq!(s.role.as_deref(), Some("lighthouse"));
-        assert_eq!(role_badge(s.role.as_deref()).icon, IconId::Lighthouse);
-    }
-
-    #[test]
-    fn role_is_none_without_a_self_row_and_falls_back_to_the_node_glyph() {
-        // No `self` marker (the test snapshot helper omits it) → no honest role, so
-        // the badge is the dim neutral node glyph, never a guessed role (§7).
-        let s = MeshSummary::from_snapshot(&snapshot("online", "online", "online"));
-        assert!(
-            s.role.is_none(),
-            "a missing `self` marker must not guess a role"
-        );
-        let badge = role_badge(s.role.as_deref());
-        assert_eq!(badge.icon, IconId::Node);
-        assert_eq!(badge.tint, Style::TEXT_DIM);
-    }
-
-    #[test]
-    fn role_badge_maps_each_known_role_to_its_glyph_at_full_tone() {
-        for (role, icon) in [
-            ("workstation", IconId::Workstation),
-            ("server", IconId::Server),
-            ("lighthouse", IconId::Lighthouse),
-        ] {
-            let badge = role_badge(Some(role));
-            assert_eq!(badge.icon, icon, "{role} → wrong glyph");
-            // A known role reads at full text tone; the tag beside it stays dim.
-            assert_eq!(badge.tint, Style::TEXT, "{role} tint");
-        }
-        // An unrecognised token buckets to the honest neutral fallback.
-        assert_eq!(role_badge(Some("xcp-ng")).icon, IconId::Node);
-        assert_eq!(role_badge(None).icon, IconId::Node);
-    }
-
-    #[test]
-    fn badge_px_scales_with_dpi_and_never_zeros() {
-        assert_eq!(badge_px(Style::SP_M, 1.0), 16);
-        assert_eq!(badge_px(Style::SP_M, 2.0), 32);
-        // A degenerate ppp can't produce a zero raster (icon_image would reject it).
-        assert!(badge_px(Style::SP_M, 0.0) >= 1);
-    }
-
-    #[test]
-    fn chrome_bar_renders_the_version_tag_and_a_real_role_badge() {
-        // The bar mounts + paints headless with a known role folded in: the role
-        // badge SVG rasterizes + uploads a real texture (the known-role path), the
-        // dim build tag draws, and the whole bar tessellates to real geometry — the
-        // same CPU paint path the DRM runner drives.
-        use mde_egui::egui::{pos2, vec2, Rect};
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        // Fold a lighthouse role directly, and suppress the re-poll so `show`'s
-        // poll (the real snapshot path is absent under test) can't wipe it.
-        let mut chrome = ChromeState {
-            summary: MeshSummary {
-                role: Some("lighthouse".to_string()),
-                seen: true,
-                ..MeshSummary::default()
-            },
-            last_poll: Some(Instant::now()),
-            ..ChromeState::default()
-        };
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 48.0))),
-            ..Default::default()
-        };
-        let out = ctx.run(input, |ctx| {
-            egui::TopBottomPanel::top("mcnf-chrome").show(ctx, |ui| {
-                show(ui, &mut chrome, None, false, 0);
-            });
-        });
-        // The lighthouse role badge rasterized + cached its texture.
-        assert!(
-            matches!(chrome.badge, Some((IconId::Lighthouse, _, _))),
-            "the lighthouse role badge texture was not cached"
-        );
-        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-        assert!(
-            !prims.is_empty(),
-            "the chrome bar produced no draw primitives"
-        );
-    }
-
-    #[test]
-    fn the_build_tag_is_the_shared_brand_line() {
-        // The chrome tag is single-sourced from brand::build — the same line the
-        // splash / About / --version show, so they can never diverge (§4/§6).
-        assert_eq!(
-            build::version_line(),
-            mde_theme::brand::build::version_line()
-        );
-        assert!(!build::version_line().is_empty());
     }
 }

@@ -1,39 +1,42 @@
-//! The shell **dock** — the full-width surface launcher **taskbar** pinned to the
-//! bottom edge (NAVBAR-1, superseding the E12-3b left rail).
+//! The shell **dock** — the full-width surface launcher **taskbar** pinned to
+//! the bottom edge: the shell's ONE bar (NAVBAR-W10-2, superseding NAVBAR-1's
+//! labelled/grouped bar and the E12-3b left rail before it).
 //!
 //! Under E12 "Quasar" the mesh-control surfaces are **panels in the one shell**,
 //! not separate clients (§5, the EMBED model — there is no compositor). The dock
-//! is that shell nav: a flat Carbon taskbar that selects which surface fills the
-//! shell body — the mesh-control [`Workbench`](Surface::Workbench) (This Node →
-//! Fleet, MV-6), this node's local VM [`Instances`](Surface::Instances) (the
-//! cloud-hypervisor broker, E12-7), the brokered VM [`Desktop`](Surface::Desktop)
-//! (VDI, egui-native), the embedded app surfaces (Music / Media / Files / Voice /
-//! Browser / Terminal / Editor), plus the unified [`Chat`](Surface::Chat) surface
-//! — the ONE notification interface (ICQ roster + folded alerts + clipboard clips,
-//! NOTIFY-CHAT). One surface shows at a time; the Workbench is always one click away.
+//! is that shell nav: a pixel-per-Win10 taskbar (lock W3 — a 40px bar, 24px app
+//! glyphs) that selects which surface fills the shell body — the mesh-control
+//! [`Workbench`](Surface::Workbench), the live Mesh Map, the VM surfaces
+//! (Instances / Desktop), the embedded app surfaces (Music / Media / Files /
+//! Voice / Browser / Terminal / Editor), the unified [`Chat`](Surface::Chat)
+//! surface, and the System / Storage / About screens. One surface shows at a
+//! time; the Workbench is always one click away.
 //!
-//! The bar lays its entries out **horizontally**, partitioned into three
-//! declarative [`Group`]s — mesh-control ∣ apps ∣ system — with a thin Carbon
-//! divider and the system group pushed hard-right (tray-style order, NAVBAR-2).
-//! Each entry is an icon-first glyph cell: the brand glyph over a tiny always-on
-//! caption, an accent top-border + brighter tint when active, a hover highlight +
-//! `hint` tooltip (NAVBAR-3).
+//! The bar is **one flat icon-only row** (locks W4/W5/W6): every surface as a
+//! 24px brand glyph in [`Surface::ALL`] order from the left — no labels, no
+//! group dividers, no right-packed system group (the tray owns the right). The
+//! active cell wears a **bottom-edge accent underline** + the subtle selection
+//! wash; hover is a fill only — no tooltips anywhere. After a flexible gap the
+//! bar ends in the right-justified status **tray** + clock (`tray.rs`).
 //!
 //! The bar is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
 //! shell owns each surface's app and its per-frame pump.
 
-use mde_egui::egui::{self, Align2, FontId, TextureHandle, TextureOptions};
+use mde_egui::egui::{self, TextureHandle, TextureOptions};
 use mde_egui::Style;
 use mde_theme::brand::icons::{icon_image, IconId};
 
-/// Which surface fills the shell body when the chrome bar is expanded.
+use crate::tray::{self, TrayInputs, TrayState};
+
+/// Which surface fills the shell body.
 ///
-/// [`Workbench`](Self::Workbench) is the default: expanding opens the mesh-control
-/// Workbench exactly as it did before E12-3b — the three app surfaces are the
-/// panels this unit adds beside it.
+/// [`Workbench`](Self::Workbench) is the default: the shell opens on the
+/// mesh-control Workbench — the other surfaces are the panels beside it.
+/// (`pub`, not `pub(crate)`, is the `clippy::redundant_pub_crate` form for
+/// crate-visible items in a private module — like `TASKBAR_H` below.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub(crate) enum Surface {
+pub enum Surface {
     /// The five-plane mesh-control Workbench (This Node → Fleet).
     #[default]
     Workbench,
@@ -79,8 +82,8 @@ pub(crate) enum Surface {
     Chat,
     /// The System surface — this seat's host controls (audio mixer, Bluetooth,
     /// displays, power & battery, backlight, hotkeys), folded from `mde-seat`
-    /// (E12-15). Owns ALL host-control interaction (lock 3); the chrome bar keeps
-    /// only read-only status icons.
+    /// (E12-15). Owns ALL host-control interaction (lock 3); the taskbar tray
+    /// keeps only read-only status icons.
     System,
     /// The Storage surface — GParted-authentic disk/partition management (E12-21),
     /// folded from `state/storage/<node>` and driven back via `action/storage/<node>`.
@@ -95,33 +98,18 @@ pub(crate) enum Surface {
     About,
 }
 
-/// The three declarative sections a [`Surface`] belongs to on the bottom taskbar
-/// (NAVBAR-2). The partition drives the bar's layout: mesh-control and apps pack
-/// from the left (split by a Carbon divider), and the system group is pushed
-/// hard-right (tray-style order #13). A single [`Surface::group`] classifier keeps
-/// the partition declarative — it only *selects*; [`Surface::ALL`] stays the one
-/// ordering authority.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Group {
-    /// Mesh-control surfaces — Workbench, Mesh Map, Instances, Desktop.
-    MeshControl,
-    /// App surfaces — Music, Media, Files, Voice, Browser, Terminal, Editor, Chat.
-    Apps,
-    /// System surfaces — System, Storage, About (the tray-side group).
-    System,
-}
-
 // This nav enum spells its variants `Surface::Music` rather than `Self::Music` on
-// purpose: the explicit type keeps the `ALL` table, the labels, and the hints
-// scannable side by side (a launcher reads clearer than a wall of `Self::`). Opt the
-// block out of `clippy::use_self` rather than thread `Self::` through every arm.
+// purpose: the explicit type keeps the `ALL` table and the glyph map scannable
+// side by side (a launcher reads clearer than a wall of `Self::`). Opt the block
+// out of `clippy::use_self` rather than thread `Self::` through every arm.
 #[allow(clippy::use_self)]
 impl Surface {
-    /// The dock entries in nav order — the Workbench (mesh-control home) first,
-    /// then the live Mesh Map, then the local VM Instances broker + the brokered
-    /// Desktop, then the three app surfaces, then the unified Chat surface (the ONE
-    /// notification interface), then this seat's host-controls System + Storage
-    /// surfaces, and finally the About surface (the platform-identity screen).
+    /// The dock entries in nav order — the one ordering authority (lock W4: the
+    /// bar renders exactly this, flat, from the left): the Workbench
+    /// (mesh-control home) first, then the live Mesh Map, the local VM Instances
+    /// broker + the brokered Desktop, the app surfaces, the unified Chat surface
+    /// (the ONE notification interface), and the System / Storage / About
+    /// screens as ordinary row icons at the end (the tray owns the right edge).
     pub(crate) const ALL: [Surface; 15] = [
         Surface::Workbench,
         Surface::MeshView,
@@ -140,75 +128,8 @@ impl Surface {
         Surface::About,
     ];
 
-    /// The short dock label.
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Surface::Workbench => "Workbench",
-            Surface::MeshView => "Mesh Map",
-            Surface::Instances => "Instances",
-            Surface::Desktop => "Desktop",
-            Surface::Music => "Music",
-            Surface::Media => "Media",
-            Surface::Files => "Files",
-            Surface::Voice => "Voice",
-            Surface::Browser => "Browser",
-            Surface::Terminal => "Terminal",
-            Surface::Editor => "Editor",
-            Surface::Chat => "Chat",
-            Surface::System => "System",
-            Surface::Storage => "Storage",
-            Surface::About => "About",
-        }
-    }
-
-    /// A one-line hover hint — honest description of what the surface does, never a
-    /// stand-in for live data (§7).
-    pub(crate) const fn hint(self) -> &'static str {
-        match self {
-            Surface::Workbench => {
-                "Mesh control — This Node, Controller, Network, Fleet, Provisioning."
-            }
-            Surface::MeshView => {
-                "The live mesh map — nodes by role and health, the elected leader, and the links between them."
-            }
-            Surface::Instances => {
-                "Manage this node's local VMs (cloud-hypervisor) — create, boot, shut down."
-            }
-            Surface::Desktop => {
-                "Pick a discovered desktop (mesh peers, LAN, local VMs) and view it in-shell."
-            }
-            Surface::Music => "Play the mesh music library (Subsonic / Airsonic).",
-            Surface::Media => {
-                "Play local, Jellyfin & mesh media — Sources, Library, Player, Queue."
-            }
-            Surface::Files => "Browse local + peer folders and Send-To across the mesh.",
-            Surface::Voice => "Place and receive mesh voice calls (SIP).",
-            Surface::Browser => {
-                "Browse the web in a sandboxed Servo browser rendered here in the shell."
-            }
-            Surface::Terminal => {
-                "Open a shell — tabs, splits, broadcast input, and a shell on any mesh peer."
-            }
-            Surface::Editor => {
-                "A native, keyboard-driven code editor — open a file to start editing."
-            }
-            Surface::Chat => {
-                "Mesh chat (ICQ) — every host is a contact; its alerts + clipboard copies are its messages."
-            }
-            Surface::System => {
-                "This seat's host controls — audio mixer, Bluetooth, displays, power, hotkeys."
-            }
-            Surface::Storage => {
-                "Disks & partitions across the mesh — stage a queue, arm the target, apply."
-            }
-            Surface::About => {
-                "About MDE Quazar — the product lockup, the full build identity, and the shipped licenses."
-            }
-        }
-    }
-
     /// The [`brand::icons`](mde_theme::brand::icons) glyph this surface draws in
-    /// the rail (QBRAND-7). A 1:1 map by name onto the Quasar brand set — every
+    /// the bar (QBRAND-7). A 1:1 map by name onto the Quasar brand set — every
     /// dock surface has a dedicated line-art glyph and `MeshView` folds onto the
     /// topology-map glyph. The dock never re-draws a glyph; it tints this one
     /// through the shared loader (§6).
@@ -234,154 +155,118 @@ impl Surface {
             Surface::About => IconId::Mark,
         }
     }
-
-    /// Which taskbar [`Group`] this surface renders in (NAVBAR-2). The locked
-    /// partition: mesh-control (Workbench, Mesh Map, Instances, Desktop) ∣ apps
-    /// (Music, Media, Files, Voice, Browser, Terminal, Editor, Chat) ∣ system
-    /// (System, Storage, About). Exhaustive by construction — every variant maps,
-    /// so a new surface must pick a group.
-    const fn group(self) -> Group {
-        match self {
-            Surface::Workbench | Surface::MeshView | Surface::Instances | Surface::Desktop => {
-                Group::MeshControl
-            }
-            Surface::Music
-            | Surface::Media
-            | Surface::Files
-            | Surface::Voice
-            | Surface::Browser
-            | Surface::Terminal
-            | Surface::Editor
-            | Surface::Chat => Group::Apps,
-            Surface::System | Surface::Storage | Surface::About => Group::System,
-        }
-    }
 }
 
-/// The taskbar height in logical points (design lock #6) — a standard 48px bar,
-/// mirroring the chrome strip (`SP_XL + SP_M`). Every value stays on the 8px grid;
-/// `main.rs` mounts the bottom panel at exactly this height. (`pub`, not
-/// `pub(crate)`, is the `clippy::redundant_pub_crate` form for a crate-visible item
-/// in a private module — this is the one dock symbol `main.rs` reads.)
-pub const TASKBAR_H: f32 = Style::SP_XL * 2.0 + Style::SP_S;
+/// The taskbar height in logical points — the pixel-per-Win10 40px bar (lock
+/// W3), on the 8px grid (`SP_XL + SP_S`); `main.rs` mounts the bottom panel at
+/// exactly this height. (`pub`, not `pub(crate)`, is the
+/// `clippy::redundant_pub_crate` form for a crate-visible item in a private
+/// module.)
+pub const TASKBAR_H: f32 = Style::SP_XL + Style::SP_S;
 
-/// The fixed width of one glyph cell — room for the ~24px glyph plus its tiny
-/// always-on caption beneath (design lock #5/#6). Two base units (`SP_XL * 2`).
+/// The fixed width of one icon-only glyph cell (lock W4 — no caption, so the
+/// cell shrinks to suit the 24px glyph): `SP_XL + SP_M` on the 8px grid.
 /// Private: only the bar's own layout + tests read it.
-const CELL_W: f32 = Style::SP_XL * 2.5;
+const CELL_W: f32 = Style::SP_XL + Style::SP_M;
 
-/// The glyph edge in logical points — the ~24px brand icon that leads each cell
-/// (design lock #6). Rasterized crisp at the physical pixel size by `icon_texture`.
-const ICON_LOGICAL: f32 = Style::SP_L + Style::SP_XS;
+/// The app glyph edge in logical points — the Win10 24px taskbar icon (lock
+/// W3, `SP_L`). Rasterized crisp at the physical pixel size by `icon_texture`.
+const ICON_LOGICAL: f32 = Style::SP_L;
 
-/// Render the surface launcher as a full-width bottom **taskbar** into `ui`,
-/// selecting the active [`Surface`] (NAVBAR-1..3). A click on a cell makes that
-/// surface active; the active one reads as selected (accent top-border + solid
-/// glyph tint).
+/// The active cell's **bottom-edge accent underline** (lock W5 — the Win10
+/// running/active idiom, replacing the old top strip): a full-width strip,
+/// `SP_XS` tall, hugging the cell's bottom edge. Pure geometry, unit-tested.
+fn underline(cell: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(cell.left(), cell.bottom() - Style::SP_XS),
+        egui::vec2(cell.width(), Style::SP_XS),
+    )
+}
+
+/// Render the surface launcher as the full-width bottom **taskbar** into `ui`,
+/// selecting the active [`Surface`] and rendering the right-justified status
+/// tray (NAVBAR-W10-2). A click on a cell makes that surface active; the
+/// active one reads as selected (bottom accent underline + selection wash).
 ///
-/// The entries lay out horizontally, partitioned into three [`Group`]s: mesh-control
-/// and apps pack from the left (split by a thin Carbon divider), then a flexible
-/// gap, then the system group pushed hard-right (tray-style order #13). Each cell is
-/// icon-first — the [`brand::icons`](mde_theme::brand::icons) glyph over a tiny
-/// always-on caption — with a hover highlight + `hint` tooltip.
-pub(crate) fn taskbar(ui: &mut egui::Ui, active: &mut Surface) {
-    // NAVBAR-1 — a hairline top divider on the seam between the surface body above
-    // and the bar, drawn from the installed BORDER stroke (a Style token, not a raw
+/// The layout is the Win10 anatomy: one flat icon-only row in [`Surface::ALL`]
+/// order from the left (no labels, no dividers — locks W4/W6), a flexible gap,
+/// then the tray (chevron · status icons · clock) against the right edge.
+/// Returns `true` when any click routed this frame (a cell or a tray icon) so
+/// the shell can surface the body behind a session.
+pub fn taskbar(
+    ui: &mut egui::Ui,
+    active: &mut Surface,
+    tray: &mut TrayState,
+    inputs: &TrayInputs<'_>,
+) -> bool {
+    // A hairline top divider on the seam between the surface body above and the
+    // bar, drawn from the installed BORDER stroke (a Style token, not a raw
     // colour/width — §4). The flat SURFACE fill is the panel frame (`main.rs`).
     let hairline = ui.visuals().widgets.noninteractive.bg_stroke;
     ui.painter()
         .hline(ui.max_rect().x_range(), ui.max_rect().top(), hairline);
 
+    let mut clicked = false;
     ui.horizontal(|ui| {
-        // Cells breathe with a small horizontal gap (un-cramp, operator 2026-07-03) —
-        // each cell still carries its own internal padding around the centred glyph.
+        // Cells breathe with a small horizontal gap; each cell still carries its
+        // own internal padding around the centred glyph.
         ui.spacing_mut().item_spacing = egui::vec2(Style::SP_XS, 0.0);
 
-        // NAVBAR-2 — mesh-control, a thin divider, then apps (both left-packed).
-        render_group(ui, Group::MeshControl, active);
-        divider(ui);
-        render_group(ui, Group::Apps, active);
+        // Lock W4 — one flat icon row, ALL order, from the left. System /
+        // Storage / About are ordinary row icons (the tray owns the right).
+        for surface in Surface::ALL {
+            if cell(ui, surface, active) {
+                clicked = true;
+            }
+        }
 
-        // NAVBAR-2 — flexible space, then the system group hard-right (tray-style
-        // order #13): a right-to-left sub-layout consumes the remaining width and
-        // packs System · Storage · About against the right edge (About furthest
-        // right), leaving room on the right for the status-tray fold-in (NAVBAR-4).
+        // Lock W2 — flexible space, then the right-justified tray + clock: a
+        // right-to-left sub-layout consumes the remaining width.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(Style::SP_XS, 0.0);
-            for surface in Surface::ALL
-                .iter()
-                .rev()
-                .copied()
-                .filter(|s| s.group() == Group::System)
-            {
-                cell(ui, surface, active);
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            if tray::tray(ui, tray, active, inputs) {
+                clicked = true;
             }
         });
     });
+    clicked
 }
 
-/// Render one [`Group`]'s surfaces as cells, in the canonical [`Surface::ALL`] nav
-/// order (the single ordering authority — the partition only *selects*, never
-/// re-orders).
-fn render_group(ui: &mut egui::Ui, which: Group, active: &mut Surface) {
-    for surface in Surface::ALL.iter().copied().filter(|s| s.group() == which) {
-        cell(ui, surface, active);
-    }
-}
-
-/// A thin vertical Carbon divider between two groups — a short, vertically-inset
-/// hairline in the BORDER token (§4), the horizontal analogue of the old rail's
-/// separators.
-fn divider(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(Style::SP_S, ui.available_height()),
-        egui::Sense::hover(),
-    );
-    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
-    ui.painter().vline(
-        rect.center().x,
-        (rect.top() + Style::SP_S)..=(rect.bottom() - Style::SP_S),
-        stroke,
-    );
-}
-
-/// One taskbar entry — an icon-first glyph cell (NAVBAR-3): the brand glyph over a
-/// tiny always-on caption, an accent top-border + brighter tint when active, a
-/// hover highlight + `hint` tooltip, and a click that selects the surface.
-fn cell(ui: &mut egui::Ui, surface: Surface, active: &mut Surface) {
+/// One taskbar entry — an icon-only glyph cell (locks W4/W5/W6): the 24px brand
+/// glyph centred in the cell, the accent bottom underline + selection wash when
+/// active, a hover fill only (NO tooltip), and a click that selects the
+/// surface (returned so the shell can surface the body).
+fn cell(ui: &mut egui::Ui, surface: Surface, active: &mut Surface) -> bool {
     let selected = *active == surface;
-    // Fill the full bar height so the icon+label stack sits vertically centred with
-    // breathing room above and below (not jammed at the top), and the whole bar is
-    // clickable — not just a short content band.
-    let cell_h = TASKBAR_H;
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(CELL_W, cell_h), egui::Sense::click());
-    // Hover reveals the surface's one-line hint (design lock #10).
-    let response = response.on_hover_text(surface.hint());
+    // Fill the full bar height so the whole column is clickable.
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(CELL_W, ui.available_height()),
+        egui::Sense::click(),
+    );
     let hovered = response.hovered();
 
     // A painter clone so `egui::Image::paint_at` can still borrow `ui` (splash.rs).
     let painter = ui.painter().clone();
 
-    // Cell background: the selected cell wears the accent selection wash, a hovered
-    // one the raised SURFACE_HI — both Style tokens (§4, design lock #10).
+    // Cell background: the selected cell wears the accent selection wash, a
+    // hovered one the raised SURFACE_HI — both Style tokens (§4); hover is the
+    // fill alone (lock W6 — no tooltip).
     if selected {
         painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
     } else if hovered {
         painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
     }
 
-    // Active mark (design lock #7): an accent strip along the cell's top edge.
+    // Active mark (lock W5): the accent underline along the cell's bottom edge.
     if selected {
-        let strip =
-            egui::Rect::from_min_size(rect.left_top(), egui::vec2(rect.width(), Style::SP_XS));
-        painter.rect_filled(strip, egui::CornerRadius::ZERO, Style::ACCENT);
+        painter.rect_filled(underline(rect), egui::CornerRadius::ZERO, Style::ACCENT);
     }
 
-    // Two-tone tint (design lock #9): the active glyph reads solid in the brand
-    // ACCENT, a hovered one brightens to full TEXT, the rest sit dim at TEXT_DIM.
-    // The brand SVG set is a single `currentColor` variant (no separate outline
-    // artwork), so "filled vs outline" is approximated by tint intensity — every
-    // value a Style token, never a raw colour (§4).
+    // Two-tone tint: the active glyph reads solid in the brand ACCENT, a hovered
+    // one brightens to full TEXT, the rest sit dim at TEXT_DIM. The brand SVG
+    // set is a single `currentColor` variant (no separate outline artwork), so
+    // "filled vs outline" is approximated by tint intensity — every value a
+    // Style token, never a raw colour (§4).
     let tint = if selected {
         Style::ACCENT
     } else if hovered {
@@ -390,41 +275,28 @@ fn cell(ui: &mut egui::Ui, surface: Surface, active: &mut Surface) {
         Style::TEXT_DIM
     };
 
-    // The glyph + caption vertical stack, centred in the cell. A glyph load failure
-    // fails soft to the caption alone (§7).
-    let content_h = ICON_LOGICAL + Style::SP_S + Style::SMALL;
-    let glyph_top = rect.top() + (cell_h - content_h) / 2.0;
+    // The glyph, centred in the cell (lock W4 — no caption beneath it). A glyph
+    // load failure fails soft to the bare cell (§7).
     if let Some(tex) = icon_texture(ui.ctx(), surface.icon_id(), ICON_LOGICAL, tint) {
-        let icon_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.center().x - ICON_LOGICAL / 2.0, glyph_top),
-            egui::vec2(ICON_LOGICAL, ICON_LOGICAL),
-        );
+        let icon_rect =
+            egui::Rect::from_center_size(rect.center(), egui::vec2(ICON_LOGICAL, ICON_LOGICAL));
         egui::Image::new(egui::load::SizedTexture::new(tex.id(), icon_rect.size()))
             .paint_at(ui, icon_rect);
     }
-    // The tiny always-on caption (design lock #5), centred beneath the glyph.
-    painter.text(
-        egui::pos2(
-            rect.center().x,
-            glyph_top + ICON_LOGICAL + Style::SP_S + Style::SMALL / 2.0,
-        ),
-        Align2::CENTER_CENTER,
-        surface.label(),
-        FontId::proportional(Style::SMALL),
-        tint,
-    );
 
     if response.clicked() {
         *active = surface;
+        return true;
     }
+    false
 }
 
 /// Rasterize + upload a brand glyph, cached in egui memory so a given
 /// `(glyph, physical-size, tint)` triple is rasterized through `resvg` **once**
 /// and then shared as a cheap ref-counted [`TextureHandle`] — never re-rasterized
 /// per frame (the backdrop.rs lock-7 pattern). A failed rasterize caches `None`,
-/// so a broken asset fails soft to the bare text label (§7) without retrying
-/// every frame.
+/// so a broken asset fails soft (§7) without retrying every frame. Shared with
+/// the tray (`tray.rs`), which rasters the 16px tray set through the same cache.
 ///
 /// The glyph is rasterized at the physical pixel size (`logical × ppp`) and drawn
 /// back at the logical size, so it stays DPI-crisp at any `HiDPI` scale — the
@@ -433,7 +305,7 @@ fn cell(ui: &mut egui::Ui, surface: Surface, active: &mut Surface) {
     clippy::cast_possible_truncation, // rounded, clamped-positive f32 → u32
     clippy::cast_sign_loss            // size_px ≥ 1.0 by the .max(1.0) clamp
 )]
-fn icon_texture(
+pub fn icon_texture(
     ctx: &egui::Context,
     id: IconId,
     logical_px: f32,
@@ -462,7 +334,9 @@ fn icon_texture(
 
 #[cfg(test)]
 mod tests {
-    use super::{icon_texture, taskbar, Group, Surface, CELL_W, ICON_LOGICAL, TASKBAR_H};
+    use super::{icon_texture, taskbar, underline, Surface, CELL_W, ICON_LOGICAL, TASKBAR_H};
+    use crate::chrome::MeshSummary;
+    use crate::tray::{TrayInputs, TrayState};
     use mde_egui::egui;
     use mde_egui::Style;
     use mde_theme::brand::icons::{icon_image, IconId};
@@ -501,25 +375,51 @@ mod tests {
     }
 
     #[test]
-    fn labels_and_hints_are_present_and_distinct() {
-        for s in Surface::ALL {
-            assert!(!s.label().is_empty(), "{s:?} has an empty label");
-            // A hint is real descriptive copy, longer than its one-word label.
-            assert!(s.hint().len() > s.label().len(), "{s:?} hint too short");
-        }
-        let mut labels: Vec<&str> = Surface::ALL.iter().map(|s| s.label()).collect();
-        labels.sort_unstable();
-        labels.dedup();
-        assert_eq!(
-            labels.len(),
-            Surface::ALL.len(),
-            "dock labels must be distinct"
-        );
+    fn the_shell_opens_on_the_workbench_surface() {
+        assert_eq!(Surface::default(), Surface::Workbench);
+    }
+
+    // --- NAVBAR-W10-2: the pixel-per-Win10 metrics + active mark ------------------
+
+    #[test]
+    fn the_bar_wears_the_win10_metrics() {
+        // Lock W3 @100%: a 40px bar, 24px app glyphs, and the icon-only cell
+        // shrunk to 48px — all on the 8px grid, straight from Style tokens.
+        assert!((TASKBAR_H - 40.0).abs() < f32::EPSILON, "bar height");
+        assert!((ICON_LOGICAL - 24.0).abs() < f32::EPSILON, "app glyph edge");
+        assert!((CELL_W - 48.0).abs() < f32::EPSILON, "icon-only cell width");
     }
 
     #[test]
-    fn the_shell_opens_on_the_workbench_surface() {
-        assert_eq!(Surface::default(), Surface::Workbench);
+    fn the_active_underline_hugs_the_cells_bottom_edge() {
+        // Lock W5 — the accent mark moved from the cell's top strip to the
+        // Win10 bottom-edge underline: full cell width, SP_XS tall, flush with
+        // the bottom edge.
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(96.0, 600.0 - TASKBAR_H),
+            egui::vec2(CELL_W, TASKBAR_H),
+        );
+        let strip = underline(cell);
+        assert!(
+            (strip.bottom() - cell.bottom()).abs() < f32::EPSILON,
+            "flush bottom"
+        );
+        assert!(
+            (strip.height() - Style::SP_XS).abs() < f32::EPSILON,
+            "strip height"
+        );
+        assert!(
+            (strip.width() - cell.width()).abs() < f32::EPSILON,
+            "full width"
+        );
+        assert!(
+            (strip.left() - cell.left()).abs() < f32::EPSILON,
+            "flush left"
+        );
+        assert!(
+            strip.top() > cell.center().y,
+            "an underline, not a top strip"
+        );
     }
 
     // --- QBRAND-7: every dock surface renders a brand::icons glyph ----------------
@@ -564,7 +464,7 @@ mod tests {
     #[test]
     fn every_surface_glyph_rasterizes_nonempty() {
         // Each surface's glyph resolves to real ink through the shared loader,
-        // tinted by a Style token (no raw hex) — so the rail never draws an empty
+        // tinted by a Style token (no raw hex) — so the bar never draws an empty
         // square.
         let tint = Style::TEXT_DIM.to_array();
         for surface in Surface::ALL {
@@ -574,61 +474,40 @@ mod tests {
         }
     }
 
-    // --- NAVBAR-2: the three-group partition --------------------------------------
+    // --- the bar mounts, renders icon-only, and switches surface on a click -------
 
-    #[test]
-    fn the_three_groups_partition_all_fifteen_surfaces() {
-        // The locked partition (NAVBAR-2): mesh-control (4) ∣ apps (8) ∣ system (3).
-        let mesh = [
-            Surface::Workbench,
-            Surface::MeshView,
-            Surface::Instances,
-            Surface::Desktop,
-        ];
-        let apps = [
-            Surface::Music,
-            Surface::Media,
-            Surface::Files,
-            Surface::Voice,
-            Surface::Browser,
-            Surface::Terminal,
-            Surface::Editor,
-            Surface::Chat,
-        ];
-        let system = [Surface::System, Surface::Storage, Surface::About];
-        for s in mesh {
-            assert_eq!(s.group(), Group::MeshControl, "{s:?} not mesh-control");
-        }
-        for s in apps {
-            assert_eq!(s.group(), Group::Apps, "{s:?} not apps");
-        }
-        for s in system {
-            assert_eq!(s.group(), Group::System, "{s:?} not system");
-        }
-
-        // Every surface in ALL lands in exactly one group; the three filters cover
-        // all fifteen — a true partition, no surface dropped or double-counted.
-        let mesh_n = Surface::ALL
-            .iter()
-            .filter(|s| s.group() == Group::MeshControl)
-            .count();
-        let apps_n = Surface::ALL
-            .iter()
-            .filter(|s| s.group() == Group::Apps)
-            .count();
-        let sys_n = Surface::ALL
-            .iter()
-            .filter(|s| s.group() == Group::System)
-            .count();
-        assert_eq!((mesh_n, apps_n, sys_n), (4, 8, 3), "group cardinalities");
-        assert_eq!(
-            mesh_n + apps_n + sys_n,
-            Surface::ALL.len(),
-            "the three groups must partition ALL"
-        );
+    /// Mount the real bottom bar (with a default tray over an unseen mesh) for
+    /// one headless frame and return the frame output.
+    fn run_taskbar(
+        ctx: &egui::Context,
+        active: &mut Surface,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mesh = MeshSummary::default();
+        let inputs = TrayInputs {
+            mesh: &mesh,
+            seat: None,
+            unread: 0,
+            session_active: false,
+        };
+        let mut tray = TrayState::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::TopBottomPanel::bottom("shell-taskbar")
+                .exact_height(TASKBAR_H)
+                .frame(egui::Frame::default().fill(Style::SURFACE))
+                .show(ctx, |ui| {
+                    let _ = taskbar(ui, active, &mut tray, &inputs);
+                });
+        })
     }
-
-    // --- NAVBAR-1/3: the bar mounts, renders, and switches surface on a click -----
 
     #[test]
     fn the_taskbar_renders_and_caches_the_glyphs_headless() {
@@ -639,20 +518,9 @@ mod tests {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut active = Surface::default();
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(1280.0, 640.0),
-            )),
-            ..Default::default()
-        };
-        let out = ctx.run(input, |ctx| {
-            egui::TopBottomPanel::bottom("shell-taskbar")
-                .exact_height(TASKBAR_H)
-                .frame(egui::Frame::default().fill(Style::SURFACE))
-                .show(ctx, |ui| taskbar(ui, &mut active));
-        });
-        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        let out = run_taskbar(&ctx, &mut active, Vec::new());
+        let ppp = out.pixels_per_point;
+        let prims = ctx.tessellate(out.shapes, ppp);
         assert!(!prims.is_empty(), "the taskbar drew nothing");
 
         for surface in Surface::ALL {
@@ -663,37 +531,52 @@ mod tests {
         }
     }
 
+    /// Count the text shapes in a frame's output, recursing into shape groups.
+    fn count_text_shapes(shape: &egui::Shape, n: &mut usize) {
+        match shape {
+            egui::Shape::Text(_) => *n += 1,
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    count_text_shapes(s, n);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn the_bar_is_icon_only_no_captions_no_tooltips() {
+        // Locks W4/W6 — no labels under the app glyphs, no tooltips anywhere.
+        // The ONLY text on a quiet bar (no unread badge, flyout closed) is the
+        // tray clock's two stacked lines: HH:MM over the date.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut active = Surface::default();
+        let out = run_taskbar(&ctx, &mut active, Vec::new());
+        let mut texts = 0;
+        for clipped in &out.shapes {
+            count_text_shapes(&clipped.shape, &mut texts);
+        }
+        assert_eq!(
+            texts, 2,
+            "the quiet bar must carry exactly the clock's two lines, no captions"
+        );
+    }
+
     #[test]
     fn clicking_a_taskbar_cell_selects_that_surface() {
-        // NAVBAR-3 preserves the click→select behaviour. Mount the real bottom bar
-        // and click the leftmost cell (Workbench, the mesh-control head). egui hit-
-        // tests a press against the settled widget rects, so prime a couple of
-        // no-event frames first, then press one frame + release the next (the egui
-        // click model), and the active surface follows the click.
+        // The click→select behaviour survives the icon-only relayout. Mount the
+        // real bottom bar and click the leftmost cell (Workbench, the nav head).
+        // egui hit-tests a press against the settled widget rects, so prime a
+        // couple of no-event frames first, then press one frame + release the
+        // next (the egui click model), and the active surface follows the click.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut active = Surface::About;
-        let screen = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 600.0));
-        // The first cell is flush-left; its centre is one half-cell in from the left,
-        // and the clickable content sits in the upper band of the bar (icon+label,
-        // top-aligned), so target a point a short way down from the bar's top edge —
-        // derived from the layout constants, not a magic number.
-        let click = egui::pos2(CELL_W / 2.0, 600.0 - TASKBAR_H + Style::SP_M);
-        let run = |active: &mut Surface, events: Vec<egui::Event>| {
-            let input = egui::RawInput {
-                screen_rect: Some(screen),
-                events,
-                ..Default::default()
-            };
-            // The frame output is unused here — the test asserts on `active`, not
-            // the tessellation (that is the headless-render test's job).
-            let _ = ctx.run(input, |ctx| {
-                egui::TopBottomPanel::bottom("shell-taskbar")
-                    .exact_height(TASKBAR_H)
-                    .frame(egui::Frame::default().fill(Style::SURFACE))
-                    .show(ctx, |ui| taskbar(ui, active));
-            });
-        };
+        // The first cell is flush-left and fills the bar's height, so its centre
+        // — half a cell in, half the bar up from the bottom — is the retargeted
+        // click point (derived from the layout constants, not a magic number).
+        let click = egui::pos2(CELL_W / 2.0, 600.0 - TASKBAR_H / 2.0);
         let press = egui::Event::PointerButton {
             pos: click,
             button: egui::PointerButton::Primary,
@@ -707,11 +590,15 @@ mod tests {
             modifiers: egui::Modifiers::default(),
         };
         // Prime: settle the layout so egui has the cell rects registered.
-        run(&mut active, Vec::new());
-        run(&mut active, Vec::new());
+        let _ = run_taskbar(&ctx, &mut active, Vec::new());
+        let _ = run_taskbar(&ctx, &mut active, Vec::new());
         // Move onto the Workbench cell + press, then release the next frame.
-        run(&mut active, vec![egui::Event::PointerMoved(click), press]);
-        run(&mut active, vec![release]);
+        let _ = run_taskbar(
+            &ctx,
+            &mut active,
+            vec![egui::Event::PointerMoved(click), press],
+        );
+        let _ = run_taskbar(&ctx, &mut active, vec![release]);
         assert_eq!(
             active,
             Surface::Workbench,
