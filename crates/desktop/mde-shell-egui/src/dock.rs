@@ -12,12 +12,14 @@
 //! surface, and the System / Storage / About screens. One surface shows at a
 //! time; the Workbench is always one click away.
 //!
-//! The bar is **one flat icon-only row** (locks W4/W5/W6): every surface as a
-//! 24px brand glyph in [`Surface::ALL`] order from the left — no labels, no
-//! group dividers, no right-packed system group (the tray owns the right). The
-//! active cell wears a **bottom-edge accent underline** + the subtle selection
-//! wash; hover is a fill only — no tooltips anywhere. After a flexible gap the
-//! bar ends in the right-justified status **tray** + clock (`tray.rs`).
+//! The app row leads with the **Workbench** as a standalone anchor, then the
+//! surfaces gathered into six labelled **groups** (PICKER-1: Comms · Workloads ·
+//! Terminals · Mesh · System · Media) — each group preceded by a rotated
+//! bottom-to-top accent label + a Carbon-blue hairline to its left, its 24px
+//! brand glyph cells kept in [`Surface::ALL`] order. The active cell still wears
+//! a **bottom-edge accent underline** + the subtle selection wash; hover is a
+//! fill only — no per-icon captions, no tooltips anywhere. After a flexible gap
+//! the bar ends in the right-justified status **tray** + clock (`tray.rs`).
 //!
 //! The bar is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
@@ -35,7 +37,7 @@ use crate::tray::{self, TrayInputs, TrayState};
 /// mesh-control Workbench — the other surfaces are the panels beside it.
 /// (`pub`, not `pub(crate)`, is the `clippy::redundant_pub_crate` form for
 /// crate-visible items in a private module — like `TASKBAR_H` below.)
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub enum Surface {
     /// The five-plane mesh-control Workbench (This Node → Fleet).
     #[default]
@@ -104,12 +106,14 @@ pub enum Surface {
 // out of `clippy::use_self` rather than thread `Self::` through every arm.
 #[allow(clippy::use_self)]
 impl Surface {
-    /// The dock entries in nav order — the one ordering authority (lock W4: the
-    /// bar renders exactly this, flat, from the left): the Workbench
-    /// (mesh-control home) first, then the live Mesh Map, the local VM Instances
-    /// broker + the brokered Desktop, the app surfaces, the unified Chat surface
-    /// (the ONE notification interface), and the System / Storage / About
-    /// screens as ordinary row icons at the end (the tray owns the right edge).
+    /// Every surface in canonical order — the ordering authority the picker is
+    /// built + checked against: the Workbench (mesh-control home) first, then the
+    /// live Mesh Map, the local VM Instances broker + the brokered Desktop, the
+    /// app surfaces, the unified Chat surface (the ONE notification interface),
+    /// and the System / Storage / About screens. PICKER-1 gathers these into the
+    /// labelled [`GROUPS`] (the Workbench leads standalone), preserving this
+    /// relative order within each group (L7); a compile-time guard keeps the two
+    /// tables in sync.
     pub(crate) const ALL: [Surface; 15] = [
         Surface::Workbench,
         Surface::MeshView,
@@ -183,13 +187,198 @@ fn underline(cell: egui::Rect) -> egui::Rect {
     )
 }
 
+// ── PICKER-1: the app row grouped into named sections ───────────────────────
+
+/// A named section of the app row (PICKER-1): a rotated bottom-to-top accent
+/// label + a Carbon-blue hairline, drawn to the LEFT of the group's icon cells
+/// (the existing 24px cells, unchanged). The Workbench is NOT in any group — it
+/// leads the row as a standalone anchor.
+struct Group {
+    /// The section heading, painted rotated (bottom-to-top) in [`Self::accent`].
+    label: &'static str,
+    /// The group's identity colour — the label tint (design L4).
+    accent: egui::Color32,
+    /// The group's surfaces, kept in [`Surface::ALL`] relative order (lock L7).
+    surfaces: &'static [Surface],
+}
+
+// PICKER-2: these six per-group accent colours are LOCAL placeholders. PICKER-2
+// lifts them into `mde_egui::Style` (the shared design system), keyed to the
+// SAME accents EXPLORER-15 uses for its category identity — one colour language
+// across the picker + the explorer, defined once and consumed by both. Until
+// then they live here as Carbon categorical hues; do NOT add more raw colours
+// elsewhere (§4). The Carbon-blue hairline itself reuses the existing
+// interactive-blue token [`Style::ACCENT`] — no placeholder needed there.
+const GROUP_COMMS: egui::Color32 = egui::Color32::from_rgb(0x33, 0xB1, 0xFF); // cyan
+const GROUP_WORKLOADS: egui::Color32 = egui::Color32::from_rgb(0xA5, 0x6E, 0xFF); // purple
+const GROUP_TERMINALS: egui::Color32 = egui::Color32::from_rgb(0x08, 0xBD, 0xBA); // teal
+const GROUP_MESH: egui::Color32 = egui::Color32::from_rgb(0x42, 0xBE, 0x65); // green
+const GROUP_SYSTEM: egui::Color32 = egui::Color32::from_rgb(0xF1, 0xC2, 0x1B); // gold
+const GROUP_MEDIA: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x7E, 0xB6); // magenta
+
+/// The six labelled groups in their locked left-to-right order (L5), each
+/// listing its surfaces in [`Surface::ALL`] relative order (L7). Workbench is
+/// rendered first as the standalone lead and appears in no group; every other
+/// surface appears here exactly once (About lives in System) — the union with
+/// the Workbench lead reproduces all 15 of [`Surface::ALL`]. Drives the app-row
+/// render + the shell tests (the one grouping authority).
+const GROUPS: [Group; 6] = [
+    Group {
+        label: "Comms",
+        accent: GROUP_COMMS,
+        surfaces: &[Surface::Voice, Surface::Chat],
+    },
+    Group {
+        label: "Workloads",
+        accent: GROUP_WORKLOADS,
+        surfaces: &[Surface::Instances],
+    },
+    Group {
+        label: "Terminals",
+        accent: GROUP_TERMINALS,
+        surfaces: &[Surface::Browser, Surface::Terminal, Surface::Editor],
+    },
+    Group {
+        label: "Mesh",
+        accent: GROUP_MESH,
+        surfaces: &[Surface::MeshView, Surface::Desktop],
+    },
+    Group {
+        label: "System",
+        accent: GROUP_SYSTEM,
+        surfaces: &[
+            Surface::Files,
+            Surface::System,
+            Surface::Storage,
+            Surface::About,
+        ],
+    },
+    Group {
+        label: "Media",
+        accent: GROUP_MEDIA,
+        surfaces: &[Surface::Music, Surface::Media],
+    },
+];
+
+// Compile-time guard: the Workbench lead + the six `GROUPS` place every
+// `Surface::ALL` entry EXACTLY once — so the picker can never silently drop or
+// duplicate a surface when either table changes (add a surface to `ALL` but
+// forget to group it, or list it twice, and the crate fails to compile). Keeps
+// `Surface::ALL` the authority the render is checked against. Fieldless enums
+// cast to their discriminant in const, so this compares by identity.
+const _: () = {
+    let mut i = 0;
+    while i < Surface::ALL.len() {
+        let target = Surface::ALL[i] as usize;
+        let mut count = if Surface::Workbench as usize == target {
+            1
+        } else {
+            0
+        };
+        let mut g = 0;
+        while g < GROUPS.len() {
+            let surfaces = GROUPS[g].surfaces;
+            let mut s = 0;
+            while s < surfaces.len() {
+                if surfaces[s] as usize == target {
+                    count += 1;
+                }
+                s += 1;
+            }
+            g += 1;
+        }
+        assert!(
+            count == 1,
+            "every Surface::ALL entry must be placed exactly once across the Workbench lead + GROUPS",
+        );
+        i += 1;
+    }
+};
+
+/// The Carbon-blue group hairline width in logical points — a 1px rule (L3).
+const HAIRLINE_W: f32 = 1.0;
+
+/// The group-label point-size floor — the rotated micro-label never shrinks below
+/// this, so it stays legible even when a long label wants to overflow the bar.
+const LABEL_MIN_PT: f32 = 8.0;
+
+/// The stable per-surface id of a cell, so the app-row layout is addressable —
+/// the render + routing are unchanged, but tests can read a cell's rect back via
+/// [`egui::Context::read_response`] to click its exact centre (the W10-2 idiom,
+/// now that grouping shifts each cell off a hand-computable x).
+fn cell_id(surface: Surface) -> egui::Id {
+    egui::Id::new(("qbrand-dock-cell", surface))
+}
+
+/// The shared point size for every group label — starts at [`Style::SMALL`] and
+/// shrinks UNIFORMLY (all six labels together) just enough that the widest label,
+/// rotated upright, fits the bar's interior height (its horizontal text width
+/// becomes the vertical extent). Floored at [`LABEL_MIN_PT`] for legibility.
+fn group_label_font(ui: &egui::Ui, bar_h: f32) -> egui::FontId {
+    let base = egui::FontId::proportional(Style::SMALL);
+    let widest = ui.fonts(|f| {
+        GROUPS
+            .iter()
+            .map(|g| {
+                f.layout_no_wrap(g.label.to_owned(), base.clone(), Style::TEXT)
+                    .size()
+                    .x
+            })
+            .fold(0.0_f32, f32::max)
+    });
+    let pt = if widest <= bar_h {
+        Style::SMALL
+    } else {
+        (Style::SMALL * bar_h / widest).max(LABEL_MIN_PT)
+    };
+    egui::FontId::proportional(pt)
+}
+
+/// Paint one group's rotated **bottom-to-top** accent label (L1/L4) into a thin
+/// column allocated at the current cursor. Display-only (`Sense::hover` — not
+/// clickable): after a −90° rotation about its pivot the galley's line height
+/// becomes the column width and its text width the vertical extent, dropped so
+/// the text reads upward, vertically centred in the bar.
+fn group_label(ui: &mut egui::Ui, group: &Group, font: egui::FontId) {
+    let galley = ui.fonts(|f| f.layout_no_wrap(group.label.to_owned(), font, group.accent));
+    let col_w = galley.size().y;
+    let text_w = galley.size().x;
+    let (rect, _resp) = ui.allocate_exact_size(
+        egui::vec2(col_w, ui.available_height()),
+        egui::Sense::hover(),
+    );
+    // Pivot at the column's left edge; the rotated text spans [pos.y - text_w,
+    // pos.y] vertically, so drop the baseline half its width below centre.
+    let pos = egui::pos2(rect.left(), rect.center().y + text_w / 2.0);
+    ui.painter().add(
+        egui::epaint::TextShape::new(pos, galley, group.accent)
+            .with_angle(-std::f32::consts::FRAC_PI_2),
+    );
+}
+
+/// Paint the thin **Carbon-blue** vertical hairline that sits beside a group's
+/// label (L3) — the interactive-blue [`Style::ACCENT`] token (§4, not raw hex),
+/// inset a hair from the bar's top/bottom edges. Display-only.
+fn group_hairline(ui: &mut egui::Ui) {
+    let (rect, _resp) = ui.allocate_exact_size(
+        egui::vec2(HAIRLINE_W, ui.available_height()),
+        egui::Sense::hover(),
+    );
+    ui.painter().vline(
+        rect.center().x,
+        (rect.top() + Style::SP_XS)..=(rect.bottom() - Style::SP_XS),
+        egui::Stroke::new(HAIRLINE_W, Style::ACCENT),
+    );
+}
+
 /// Render the surface launcher as the full-width bottom **taskbar** into `ui`,
 /// selecting the active [`Surface`] and rendering the right-justified status
 /// tray (NAVBAR-W10-2). A click on a cell makes that surface active; the
 /// active one reads as selected (bottom accent underline + selection wash).
 ///
-/// The layout is the Win10 anatomy: one flat icon-only row in [`Surface::ALL`]
-/// order from the left (no labels, no dividers — locks W4/W6), a flexible gap,
+/// The layout: the Workbench as a standalone lead, then the six labelled groups
+/// (PICKER-1) — each a rotated bottom-to-top accent label + a Carbon-blue
+/// hairline before its [`Surface::ALL`]-ordered icon cells — a flexible gap,
 /// then the tray (chevron · status icons · clock) against the right edge.
 /// Returns `true` when any click routed this frame (a cell or a tray icon) so
 /// the shell can surface the body behind a session.
@@ -209,14 +398,32 @@ pub fn taskbar(
     let mut clicked = false;
     ui.horizontal(|ui| {
         // Cells breathe with a small horizontal gap; each cell still carries its
-        // own internal padding around the centred glyph.
+        // own internal padding around the centred glyph. The same gap spaces the
+        // per-group label + hairline from the icons they head.
         ui.spacing_mut().item_spacing = egui::vec2(Style::SP_XS, 0.0);
 
-        // Lock W4 — one flat icon row, ALL order, from the left. System /
-        // Storage / About are ordinary row icons (the tray owns the right).
-        for surface in Surface::ALL {
-            if cell(ui, surface, active) {
-                clicked = true;
+        // The label micro-type is sized once so all six labels shrink together
+        // to fit the bar height (the full row height, before any cell is placed).
+        let bar_h = ui.available_height();
+        let label_font = group_label_font(ui, bar_h);
+
+        // PICKER-1 — the Workbench leads as the standalone anchor (no group, no
+        // label), then the six labelled groups (L5), each in Surface::ALL order
+        // within itself (L7). System / Storage / About are ordinary cells inside
+        // the System group (the tray still owns the right).
+        if cell(ui, Surface::Workbench, active) {
+            clicked = true;
+        }
+        for group in &GROUPS {
+            // Generous padding before each group (L3), then the rotated accent
+            // label + the Carbon-blue hairline to the LEFT of the icon cells.
+            ui.add_space(Style::SP_S);
+            group_label(ui, group, label_font.clone());
+            group_hairline(ui);
+            for &surface in group.surfaces {
+                if cell(ui, surface, active) {
+                    clicked = true;
+                }
             }
         }
 
@@ -238,11 +445,15 @@ pub fn taskbar(
 /// surface (returned so the shell can surface the body).
 fn cell(ui: &mut egui::Ui, surface: Surface, active: &mut Surface) -> bool {
     let selected = *active == surface;
-    // Fill the full bar height so the whole column is clickable.
-    let (rect, response) = ui.allocate_exact_size(
+    // Fill the full bar height so the whole column is clickable. Interact under a
+    // stable per-surface id (`cell_id`) so the render + routing are unchanged but
+    // the cell's rect is addressable — tests read it back to click its centre now
+    // that grouping shifts each cell off a hand-computable x.
+    let (rect, _resp) = ui.allocate_exact_size(
         egui::vec2(CELL_W, ui.available_height()),
-        egui::Sense::click(),
+        egui::Sense::hover(),
     );
+    let response = ui.interact(rect, cell_id(surface), egui::Sense::click());
     let hovered = response.hovered();
 
     // A painter clone so `egui::Image::paint_at` can still borrow `ui` (splash.rs).
@@ -334,7 +545,9 @@ pub fn icon_texture(
 
 #[cfg(test)]
 mod tests {
-    use super::{icon_texture, taskbar, underline, Surface, CELL_W, ICON_LOGICAL, TASKBAR_H};
+    use super::{
+        cell_id, icon_texture, taskbar, underline, Surface, CELL_W, GROUPS, ICON_LOGICAL, TASKBAR_H,
+    };
     use crate::chrome::MeshSummary;
     use crate::tray::{TrayInputs, TrayState};
     use mde_egui::egui;
@@ -531,13 +744,15 @@ mod tests {
         }
     }
 
-    /// Count the text shapes in a frame's output, recursing into shape groups.
-    fn count_text_shapes(shape: &egui::Shape, n: &mut usize) {
+    /// Collect every text shape's `(angle, fallback_color)` in a frame's output,
+    /// recursing into shape groups. The group labels are rotated (angle ≠ 0),
+    /// tinted by their group accent; the clock lines are upright (angle 0).
+    fn collect_text_shapes(shape: &egui::Shape, out: &mut Vec<(f32, egui::Color32)>) {
         match shape {
-            egui::Shape::Text(_) => *n += 1,
+            egui::Shape::Text(t) => out.push((t.angle, t.fallback_color)),
             egui::Shape::Vec(v) => {
                 for s in v {
-                    count_text_shapes(s, n);
+                    collect_text_shapes(s, out);
                 }
             }
             _ => {}
@@ -545,22 +760,56 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_is_icon_only_no_captions_no_tooltips() {
-        // Locks W4/W6 — no labels under the app glyphs, no tooltips anywhere.
-        // The ONLY text on a quiet bar (no unread badge, flyout closed) is the
-        // tray clock's two stacked lines: HH:MM over the date.
+    fn the_bar_shows_group_labels_and_the_clock_no_captions_no_tooltips() {
+        // PICKER-1 relayout: the ONLY text on a quiet bar (no unread badge,
+        // flyout closed) is the six rotated group labels + the tray clock's two
+        // stacked lines — still no per-icon captions (W4) and no tooltips (W6).
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut active = Surface::default();
         let out = run_taskbar(&ctx, &mut active, Vec::new());
-        let mut texts = 0;
+        let mut texts = Vec::new();
         for clipped in &out.shapes {
-            count_text_shapes(&clipped.shape, &mut texts);
+            collect_text_shapes(&clipped.shape, &mut texts);
         }
         assert_eq!(
-            texts, 2,
-            "the quiet bar must carry exactly the clock's two lines, no captions"
+            texts.len(),
+            GROUPS.len() + 2,
+            "the quiet bar carries exactly the six group labels + the clock's two lines"
         );
+    }
+
+    #[test]
+    fn the_group_labels_render_rotated_bottom_to_top_in_their_accent() {
+        // L1/L4 — each group's heading is a label rotated 90° CCW (bottom-to-top,
+        // angle −π/2) painted in that group's accent colour; the two upright
+        // clock lines (angle 0) are the only other text.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut active = Surface::default();
+        let out = run_taskbar(&ctx, &mut active, Vec::new());
+        let mut texts = Vec::new();
+        for clipped in &out.shapes {
+            collect_text_shapes(&clipped.shape, &mut texts);
+        }
+        let rotated: Vec<(f32, egui::Color32)> =
+            texts.into_iter().filter(|(a, _)| *a != 0.0).collect();
+        assert_eq!(
+            rotated.len(),
+            GROUPS.len(),
+            "one rotated label per group, none for the icons or the clock"
+        );
+        let accents: Vec<egui::Color32> = GROUPS.iter().map(|g| g.accent).collect();
+        for (angle, color) in rotated {
+            assert!(
+                (angle - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-3,
+                "label reads bottom-to-top (−π/2), got {angle}"
+            );
+            assert!(
+                accents.contains(&color),
+                "label painted in a group accent, got {color:?}"
+            );
+        }
     }
 
     #[test]
@@ -604,5 +853,121 @@ mod tests {
             Surface::Workbench,
             "clicking the Workbench cell selected it"
         );
+    }
+
+    // --- PICKER-1: the group table + rotated labels + hairline dividers -----------
+
+    #[test]
+    fn the_locked_group_taxonomy_and_order() {
+        // L5/L7 — six groups in the locked left-to-right order, each listing its
+        // surfaces in Surface::ALL relative order; About lives in System, and the
+        // Workbench is in no group (it leads the row as the standalone anchor).
+        use Surface::{
+            About, Browser, Chat, Desktop, Editor, Files, Instances, Media, MeshView, Music,
+            Storage, System, Terminal, Voice, Workbench,
+        };
+        let expect: [(&str, &[Surface]); 6] = [
+            ("Comms", &[Voice, Chat]),
+            ("Workloads", &[Instances]),
+            ("Terminals", &[Browser, Terminal, Editor]),
+            ("Mesh", &[MeshView, Desktop]),
+            ("System", &[Files, System, Storage, About]),
+            ("Media", &[Music, Media]),
+        ];
+        assert_eq!(GROUPS.len(), expect.len(), "six groups");
+        for (g, (label, surfaces)) in GROUPS.iter().zip(expect) {
+            assert_eq!(g.label, label, "group order");
+            assert_eq!(
+                g.surfaces, surfaces,
+                "{label} membership + within-group order"
+            );
+        }
+        let system = GROUPS.iter().find(|g| g.label == "System").unwrap();
+        assert!(system.surfaces.contains(&About), "About lives in System");
+        assert!(
+            GROUPS.iter().all(|g| !g.surfaces.contains(&Workbench)),
+            "Workbench leads standalone, in no group"
+        );
+    }
+
+    #[test]
+    fn the_groups_cover_every_surface_once_in_surface_all_order() {
+        // The Workbench lead + the six groups reproduce all 15 of Surface::ALL,
+        // each surface placed exactly once...
+        let mut placed: Vec<Surface> = vec![Surface::Workbench];
+        for g in &GROUPS {
+            placed.extend_from_slice(g.surfaces);
+        }
+        assert_eq!(
+            placed.len(),
+            Surface::ALL.len(),
+            "every surface placed once"
+        );
+        for s in Surface::ALL {
+            assert_eq!(
+                placed.iter().filter(|&&x| x == s).count(),
+                1,
+                "{s:?} appears exactly once across the lead + groups"
+            );
+        }
+        // ...and L7: within each group the surfaces keep Surface::ALL relative
+        // order (their ALL indices ascend).
+        let idx = |s: Surface| Surface::ALL.iter().position(|&x| x == s).unwrap();
+        for g in &GROUPS {
+            let idxs: Vec<usize> = g.surfaces.iter().map(|&s| idx(s)).collect();
+            assert!(
+                idxs.is_sorted(),
+                "group {} keeps Surface::ALL order",
+                g.label
+            );
+        }
+    }
+
+    #[test]
+    fn clicking_any_group_cell_routes_to_its_surface() {
+        // §7 — every one of the 15 surfaces still routes on a click after the
+        // grouping relayout (Workbench lead + all cells in the six groups). Mount
+        // the real bar, read each cell's settled rect by its stable id, then click
+        // its exact centre (the W10-2 idiom) and assert the active surface follows.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut warm = Surface::Workbench;
+        // Prime two frames so every cell rect is registered under its id.
+        let _ = run_taskbar(&ctx, &mut warm, Vec::new());
+        let _ = run_taskbar(&ctx, &mut warm, Vec::new());
+        let mut centers: Vec<(Surface, egui::Pos2)> = Vec::new();
+        for s in Surface::ALL {
+            let response = ctx.read_response(cell_id(s));
+            assert!(response.is_some(), "{s:?} cell rect not registered");
+            let rect = response.expect("registered above").rect;
+            centers.push((s, rect.center()));
+        }
+        for (want, center) in centers {
+            // Start on a different surface so the click is observable.
+            let mut active = if want == Surface::Workbench {
+                Surface::About
+            } else {
+                Surface::Workbench
+            };
+            let press = egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            };
+            let release = egui::Event::PointerButton {
+                pos: center,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            };
+            let _ = run_taskbar(
+                &ctx,
+                &mut active,
+                vec![egui::Event::PointerMoved(center), press],
+            );
+            let _ = run_taskbar(&ctx, &mut active, vec![release]);
+            assert_eq!(active, want, "clicking {want:?}'s cell selects it");
+        }
     }
 }
