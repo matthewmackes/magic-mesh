@@ -22,14 +22,23 @@
 //! - **Rich telemetry** — time-to-empty / time-to-full + draw rate
 //!   ([`battery_telemetry`]), formatted compactly, omitted honestly when absent.
 //!
-//! POWER-5 adds two more, now non-inert: the **idle-suspend timeout** picker
-//! ([`idle_timeout_body`]) and the **lid-close action** dropdown
+//! POWER-5 adds two more, now non-inert: the **idle** picker — timeout + action
+//! ([`idle_timeout_body`]) — and the **lid-close action** dropdown
 //! ([`lid_action_body`]). These edit the persisted [`PowerHonorConfig`] the
 //! [`crate::power_honor`] honorer enforces every frame — so they are §7-real
-//! (the timer really suspends on idle, the lid handler really acts), never a dead
+//! (the timer really acts on idle, the lid handler really acts), never a dead
 //! control. The safe defaults live in the config: idle **Never**, lid **Suspend**.
+//! CURTAIN-3 makes the idle/lid **action** selectable — Suspend / **Lock** (drop the
+//! shell's curtain in-process) / Do nothing.
 //!
 //! Token-only styling (§4): every colour/size/space is a [`Style`] constant.
+
+#![allow(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) body-builders in a private shell module are this crate's \
+              idiom (curtain, dock, tray, …); the System surface's Power section \
+              consumes them"
+)]
 
 use std::time::Duration;
 
@@ -37,7 +46,7 @@ use mde_egui::egui::{self, ComboBox, RichText, Slider};
 use mde_egui::{field, muted_note, Style};
 use mde_seat::{Battery, ProfileState, SeatError};
 
-use crate::power_honor::{LidAction, PowerHonorConfig};
+use crate::power_honor::{IdleAction, LidAction, PowerHonorConfig};
 use crate::system::SysAction;
 
 /// The charge-stop cap slider's range. Below ~50% is rarely a useful pack-sparing
@@ -230,11 +239,13 @@ pub(crate) fn idle_option_label(mins: Option<u64>) -> String {
     mins.map_or_else(|| "Never".to_owned(), |m| format!("{m} min"))
 }
 
-/// The idle-suspend timeout picker (POWER-5) — Never / 1 / 5 / 10 / 30 min, editing
-/// the honorer's persisted [`PowerHonorConfig`]. A real change writes the new value
-/// into `config` and dispatches [`SysAction::SavePowerHonorConfig`] so it persists;
-/// an unchanged re-pick is not re-saved (§7: no inert write). The honorer reads this
-/// config every frame, so the choice is enforced — never a dead control.
+/// The idle picker (POWER-5 + CURTAIN-3) — the idle **timeout** (Never / 1 / 5 / 10 /
+/// 30 min) plus what firing it **does** (Suspend / **Lock** / Do nothing), both editing
+/// the honorer's persisted [`PowerHonorConfig`]. A real change writes the new value into
+/// `config` and dispatches [`SysAction::SavePowerHonorConfig`] so it persists; an
+/// unchanged re-pick is not re-saved (§7: no inert write). The honorer reads this config
+/// every frame, so both choices are enforced — never a dead control. CURTAIN-3's Lock
+/// action drops the shell's in-process curtain when the timeout fires.
 pub(crate) fn idle_timeout_body(
     ui: &mut egui::Ui,
     config: &mut PowerHonorConfig,
@@ -242,7 +253,7 @@ pub(crate) fn idle_timeout_body(
 ) {
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("Suspend when idle")
+            RichText::new("Idle timeout")
                 .color(Style::TEXT_DIM)
                 .size(Style::SMALL),
         );
@@ -268,9 +279,35 @@ pub(crate) fn idle_timeout_body(
                 }
             });
     });
+    // CURTAIN-3 — what firing the idle timeout does: Suspend (default) / Lock (drop
+    // the curtain in-process) / Do nothing. Mirrors the lid-action picker; the honorer
+    // routes a Lock to the curtain, never to logind.
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("When idle")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_S);
+        ComboBox::from_id_salt("curtain3-idle-action")
+            .selected_text(RichText::new(config.idle_action.label()).size(Style::SMALL))
+            .show_ui(ui, |ui| {
+                for action in IdleAction::ALL {
+                    let selected = config.idle_action == action;
+                    if ui
+                        .selectable_label(selected, RichText::new(action.label()).size(Style::SMALL))
+                        .clicked()
+                        && !selected
+                    {
+                        config.idle_action = action;
+                        actions.push(SysAction::SavePowerHonorConfig);
+                    }
+                }
+            });
+    });
     muted_note(
         ui,
-        "Suspends this seat after the chosen idle time; \u{201C}Never\u{201D} keeps it awake.",
+        "Runs the chosen action after the idle time; \u{201C}Never\u{201D} keeps the seat awake.",
     );
 }
 

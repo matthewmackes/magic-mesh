@@ -11,21 +11,37 @@
 //!
 //! - **Idle timer** — the last user-input instant is tracked from egui's per-frame
 //!   input (any key/text/pointer/scroll/touch/zoom resets it). When the seat has
-//!   been idle at least the configured timeout, the idle action fires **once**
-//!   ([`PowerVerb::Suspend`]) and does not re-fire until activity resumes. The
-//!   timeout defaults to **Never** — a fresh install never surprise-suspends; only
-//!   an operator-set timeout arms it (the safe default).
+//!   been idle at least the configured timeout, the configured [`IdleAction`] fires
+//!   **once** (Suspend default / **Lock** / Do nothing) and does not re-fire until
+//!   activity resumes. The timeout defaults to **Never** — a fresh install never
+//!   surprise-suspends; only an operator-set timeout arms it (the safe default).
 //! - **Lid handler** — the [`mde_seat::SeatSnapshot::lid`] reading each tick; on an
 //!   Open→Closed edge the configured [`LidAction`] fires once (Suspend default /
 //!   Lock / Do nothing). A held-closed lid, a repeated Closed read, or an Unknown
 //!   flap never re-fires (the debounce is the edge, not the level), and a lid that
 //!   is already closed at startup never fires (it was never seen open, so unarmed).
 //!
+//! **CURTAIN-3** folds the lock curtain into the honorer: an idle/lid action of
+//! **Lock** does NOT route to logind — the DM-less shell IS this seat's locker, so
+//! [`PowerHonor::tick`] reports the request and `main.rs` drops the in-process
+//! [`crate::curtain::Curtain`] (exactly as Super+L does). The same config carries the
+//! persisted boot-gate ([`PowerHonorConfig::require_login_at_boot`], default **on**):
+//! [`should_lock_at_boot`] is the pure decision the shell reads once at construction
+//! to start Locked before any surface renders.
+//!
 //! Everything here is decoupled from egui + the real seat behind a pure state fold
-//! ([`PowerHonor::step`]) and pure decisions ([`idle_should_fire`] / [`lid_step`]),
-//! so the idle-elapsed rule, the lid transition→action mapping, and the config
-//! round-trip are all unit-tested without ever calling suspend (§7 runtime-real,
-//! the real suspend/lid is HW-gated).
+//! ([`PowerHonor::step`]) and pure decisions ([`idle_should_fire`] / [`lid_step`] /
+//! [`should_lock_at_boot`]), so the idle-elapsed rule, the lid/idle action→verb
+//! mapping, the boot-gate decision, and the config round-trip are all unit-tested
+//! without ever calling suspend or a real curtain (§7 runtime-real, the real
+//! suspend/lid is HW-gated).
+
+#![allow(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) items in a private shell module are this crate's idiom \
+              (curtain, dock, tray, …); main.rs + the System surface's Power \
+              section consume the honorer's config + action types"
+)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -85,21 +101,89 @@ impl LidAction {
     }
 }
 
+/// What firing the **idle timeout** does (CURTAIN-3). The prior POWER-5 behavior was
+/// a hard-wired Suspend; that stays the default, and **Lock** (drop the curtain) joins
+/// it beside Do nothing. Mirrors [`LidAction`] — the same {Suspend, Lock, Nothing} set
+/// mapping to the same [`PowerVerb`]s — but kept a distinct type so the idle and lid
+/// choices persist and read independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IdleAction {
+    /// Suspend the host (suspend-to-RAM) — the default, the prior POWER-5 behavior.
+    #[default]
+    Suspend,
+    /// Lock the session — drop the in-process curtain (CURTAIN-3).
+    Lock,
+    /// Do nothing (the timeout arms nothing but still latches once).
+    Nothing,
+}
+
+impl IdleAction {
+    /// Every action, in picker order.
+    pub(crate) const ALL: [Self; 3] = [Self::Suspend, Self::Lock, Self::Nothing];
+
+    /// The operator-facing label.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Suspend => "Suspend",
+            Self::Lock => "Lock",
+            Self::Nothing => "Do nothing",
+        }
+    }
+
+    /// The power verb this action performs, or `None` for [`IdleAction::Nothing`].
+    const fn verb(self) -> Option<PowerVerb> {
+        match self {
+            Self::Suspend => Some(PowerVerb::Suspend),
+            Self::Lock => Some(PowerVerb::Lock),
+            Self::Nothing => None,
+        }
+    }
+}
+
+/// The default for [`PowerHonorConfig::require_login_at_boot`]: **on** — the shipped
+/// secure posture (the shell boots to the curtain). A serde default so a config file
+/// written before CURTAIN-3 (no field) still reads as require-login, never silently
+/// off.
+const fn require_login_default() -> bool {
+    true
+}
+
 /// The persisted honorer settings the Power section edits and the honorer enforces.
 ///
-/// The [`Default`] is the SAFE default: `idle_timeout_min: None` (idle-suspend off,
-/// so a fresh install never surprise-suspends until the operator arms it) and
-/// `lid_action: LidAction::Suspend` (the laptop-expected close behavior). Both fall
-/// out of the field defaults ([`Option::default`] = `None`, [`LidAction::default`] =
-/// `Suspend`), so the derive is exactly this policy.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// The [`Default`] is the SAFE / shipped default: `idle_timeout_min: None` (idle
+/// action off, so a fresh install never surprise-suspends until the operator arms a
+/// timeout), `idle_action: IdleAction::Suspend` and `lid_action: LidAction::Suspend`
+/// (the laptop-expected behaviors), and `require_login_at_boot: true` (CURTAIN-3 — the
+/// shell boots to the curtain). Only the boot-gate departs from a bare field-derive
+/// (a `bool` derives `false`), so [`Default`] is written by hand to make the on-by-
+/// default policy explicit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PowerHonorConfig {
-    /// Idle-suspend timeout in whole minutes; `None` = Never (off) — the safe default.
+    /// Idle timeout in whole minutes; `None` = Never (off) — the safe default.
     #[serde(default)]
     pub(crate) idle_timeout_min: Option<u64>,
+    /// What firing the idle timeout does (default Suspend; CURTAIN-3 adds Lock).
+    #[serde(default)]
+    pub(crate) idle_action: IdleAction,
     /// What closing the lid does (default Suspend).
     #[serde(default)]
     pub(crate) lid_action: LidAction,
+    /// CURTAIN-3 boot-gate: start the shell Locked (the curtain drops before any
+    /// surface renders) — default **on**, the shipped secure posture.
+    #[serde(default = "require_login_default")]
+    pub(crate) require_login_at_boot: bool,
+}
+
+impl Default for PowerHonorConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_min: None,
+            idle_action: IdleAction::Suspend,
+            lid_action: LidAction::Suspend,
+            require_login_at_boot: require_login_default(),
+        }
+    }
 }
 
 impl PowerHonorConfig {
@@ -181,6 +265,15 @@ const fn lid_step(armed: bool, reading: LidState) -> (bool, bool) {
     }
 }
 
+/// The CURTAIN-3 boot-gate decision: the shell starts **Locked** (the curtain drops
+/// before any surface renders) exactly when the persisted policy requires a login at
+/// boot. Pure, so the boot-lock rule is unit-tested without standing up the whole
+/// shell; `main.rs` reads it once at construction.
+#[must_use]
+pub(crate) const fn should_lock_at_boot(cfg: &PowerHonorConfig) -> bool {
+    cfg.require_login_at_boot
+}
+
 // ──────────────────────────── the honorer ────────────────────────────
 
 /// The idle + lid honorer — the per-frame runtime state (the config is the source
@@ -209,18 +302,35 @@ impl Default for PowerHonor {
 impl PowerHonor {
     /// The per-frame hook (the shell's one-line update-loop call): fold this frame's
     /// egui input + the seat's lid reading into the idle/lid decision, and drive any
-    /// resulting power verb through the ONE seat. A typed failure is kept as an
-    /// honest note, never a panic.
-    pub(crate) fn tick(&mut self, ctx: &egui::Context, system: &SystemState) {
+    /// resulting power verb through the ONE seat. Returns `true` when an idle/lid
+    /// action of **Lock** fired this frame — CURTAIN-3 routes that in-process (the
+    /// caller drops the shell's curtain), NOT to logind, since the DM-less shell IS
+    /// this seat's locker (exactly like Super+L). A typed failure on the host verbs
+    /// (Suspend) is kept as an honest note, never a panic.
+    #[must_use]
+    pub(crate) fn tick(&mut self, ctx: &egui::Context, system: &SystemState) -> bool {
         let active = ctx_has_activity(ctx);
         let lid = system.lid_state();
         let cfg = system.power_honor_config();
-        let verbs = self.step(cfg.idle_timeout(), cfg.lid_action, active, lid, Instant::now());
+        let verbs = self.step(
+            cfg.idle_timeout(),
+            cfg.idle_action,
+            cfg.lid_action,
+            active,
+            lid,
+            Instant::now(),
+        );
+        let mut lock_requested = false;
         for verb in verbs {
-            // A refused/absent logind is surfaced honestly to the journal, never a
-            // pretend-success and never a panic (§7). It fires at most once per idle
-            // stretch / lid edge, so this can't spam the log.
-            if let Err(e) = system.honor_power(verb) {
+            if matches!(verb, PowerVerb::Lock) {
+                // CURTAIN-3: Lock is the shell's own curtain, dropped in-process by
+                // the caller — never sent to logind's session Lock (that leg stays
+                // for the System surface's explicit control). At most one per idle
+                // stretch / lid edge, so a held lock never spams.
+                lock_requested = true;
+            } else if let Err(e) = system.honor_power(verb) {
+                // A refused/absent logind is surfaced honestly to the journal, never
+                // a pretend-success and never a panic (§7).
                 eprintln!("power-honor: {} failed: {e}", verb.label());
             }
         }
@@ -229,14 +339,17 @@ impl PowerHonor {
         if cfg.idle_timeout().is_some() && !self.idle_fired {
             ctx.request_repaint_after(IDLE_CHECK);
         }
+        lock_requested
     }
 
     /// The pure state fold (unit-tested without egui or a real seat): update the idle
     /// timer + lid arm from this tick's input, returning the verbs to execute (at
-    /// most one idle + one lid). No I/O, no suspend — the caller executes.
+    /// most one idle + one lid). No I/O, no suspend, no curtain — the caller executes
+    /// (routing a [`PowerVerb::Lock`] to the in-process curtain, the rest to the seat).
     fn step(
         &mut self,
         idle_timeout: Option<Duration>,
+        idle_action: IdleAction,
         lid_action: LidAction,
         active: bool,
         lid: Option<LidState>,
@@ -251,8 +364,12 @@ impl PowerHonor {
         if !self.idle_fired {
             let idle_for = now.saturating_duration_since(self.last_activity);
             if idle_should_fire(idle_for, idle_timeout) {
+                // Latch once per idle stretch regardless of the action (Nothing still
+                // arms only once); a Suspend/Lock verb rides out to the caller.
                 self.idle_fired = true;
-                verbs.push(PowerVerb::Suspend);
+                if let Some(verb) = idle_action.verb() {
+                    verbs.push(verb);
+                }
             }
         }
         // ── lid handler ──
@@ -309,8 +426,43 @@ mod tests {
         // A fresh install never surprise-suspends: idle is Never (off).
         assert_eq!(d.idle_timeout_min, None);
         assert_eq!(d.idle_timeout(), None);
+        // The idle action defaults to the prior POWER-5 behavior (Suspend).
+        assert_eq!(d.idle_action, IdleAction::Suspend);
         // The laptop-expected lid default is Suspend.
         assert_eq!(d.lid_action, LidAction::Suspend);
+        // CURTAIN-3: the shipped default boots to the curtain (require login on).
+        assert!(d.require_login_at_boot);
+        assert!(should_lock_at_boot(&d));
+    }
+
+    #[test]
+    fn the_boot_gate_decision_tracks_require_login_at_boot() {
+        // On (the shipped default) → the shell starts Locked before any surface.
+        assert!(should_lock_at_boot(&PowerHonorConfig::default()));
+        // Off → the shell boots straight to the desktop (the old DM-less behavior).
+        let off = PowerHonorConfig {
+            require_login_at_boot: false,
+            ..PowerHonorConfig::default()
+        };
+        assert!(!should_lock_at_boot(&off));
+    }
+
+    #[test]
+    fn a_config_written_before_curtain3_still_reads_as_require_login() {
+        // A power-honor.json from before the boot-gate field folds to require-login
+        // (the serde default), never silently off — the secure posture is the floor.
+        let legacy = r#"{ "idle_timeout_min": 5, "lid_action": "suspend" }"#;
+        let cfg: PowerHonorConfig = serde_json::from_str(legacy).expect("legacy config");
+        assert!(
+            cfg.require_login_at_boot,
+            "a pre-CURTAIN-3 file must default on"
+        );
+        assert_eq!(
+            cfg.idle_action,
+            IdleAction::Suspend,
+            "and idle_action folds to Suspend"
+        );
+        assert_eq!(cfg.idle_timeout_min, Some(5));
     }
 
     #[test]
@@ -349,7 +501,9 @@ mod tests {
 
         let cfg = PowerHonorConfig {
             idle_timeout_min: Some(10),
+            idle_action: IdleAction::Lock,
             lid_action: LidAction::Lock,
+            require_login_at_boot: false,
         };
         cfg.save_to(&path).expect("save");
         assert_eq!(PowerHonorConfig::load_from(&path), cfg, "round-trip");
@@ -413,34 +567,119 @@ mod tests {
 
         // An active tick seeds last-activity and never fires.
         assert!(h
-            .step(t, LidAction::Nothing, true, None, base)
+            .step(t, IdleAction::Suspend, LidAction::Nothing, true, None, base)
             .is_empty());
         // Before the timeout: nothing.
         assert!(h
-            .step(t, LidAction::Nothing, false, None, base + Duration::from_secs(299))
+            .step(
+                t,
+                IdleAction::Suspend,
+                LidAction::Nothing,
+                false,
+                None,
+                base + Duration::from_secs(299)
+            )
             .is_empty());
         // At the timeout: Suspend fires exactly once.
         assert_eq!(
-            h.step(t, LidAction::Nothing, false, None, base + Duration::from_secs(300)),
+            h.step(
+                t,
+                IdleAction::Suspend,
+                LidAction::Nothing,
+                false,
+                None,
+                base + Duration::from_secs(300)
+            ),
             vec![PowerVerb::Suspend]
         );
         // Still idle, well past: no re-fire.
         assert!(h
-            .step(t, LidAction::Nothing, false, None, base + Duration::from_secs(900))
+            .step(
+                t,
+                IdleAction::Suspend,
+                LidAction::Nothing,
+                false,
+                None,
+                base + Duration::from_secs(900)
+            )
             .is_empty());
 
         // Activity resumes → the latch clears; a full fresh timeout must elapse.
         let base2 = base + Duration::from_secs(1_000);
         assert!(h
-            .step(t, LidAction::Nothing, true, None, base2)
+            .step(
+                t,
+                IdleAction::Suspend,
+                LidAction::Nothing,
+                true,
+                None,
+                base2
+            )
             .is_empty());
         assert!(h
-            .step(t, LidAction::Nothing, false, None, base2 + Duration::from_secs(299))
+            .step(
+                t,
+                IdleAction::Suspend,
+                LidAction::Nothing,
+                false,
+                None,
+                base2 + Duration::from_secs(299)
+            )
             .is_empty());
         assert_eq!(
-            h.step(t, LidAction::Nothing, false, None, base2 + Duration::from_secs(300)),
+            h.step(
+                t,
+                IdleAction::Suspend,
+                LidAction::Nothing,
+                false,
+                None,
+                base2 + Duration::from_secs(300)
+            ),
             vec![PowerVerb::Suspend],
             "it arms again after activity"
+        );
+    }
+
+    #[test]
+    fn step_fires_the_configured_idle_action_lock_and_nothing() {
+        // CURTAIN-3: idle_action = Lock → a Lock verb rides out (the caller drops the
+        // in-process curtain); it never routes to logind here.
+        let t = Some(Duration::from_secs(300));
+        let base = Instant::now();
+        let mut lock = PowerHonor::default();
+        assert!(lock
+            .step(t, IdleAction::Lock, LidAction::Nothing, true, None, base)
+            .is_empty());
+        assert_eq!(
+            lock.step(
+                t,
+                IdleAction::Lock,
+                LidAction::Nothing,
+                false,
+                None,
+                base + Duration::from_secs(300)
+            ),
+            vec![PowerVerb::Lock],
+            "idle-action=Lock must fire a Lock verb at the timeout"
+        );
+
+        // idle_action = Nothing → the timeout latches but performs no verb at all.
+        let mut nothing = PowerHonor::default();
+        assert!(nothing
+            .step(t, IdleAction::Nothing, LidAction::Nothing, true, None, base)
+            .is_empty());
+        assert!(
+            nothing
+                .step(
+                    t,
+                    IdleAction::Nothing,
+                    LidAction::Nothing,
+                    false,
+                    None,
+                    base + Duration::from_secs(600)
+                )
+                .is_empty(),
+            "idle-action=Nothing fires no verb even past the timeout"
         );
     }
 
@@ -448,10 +687,24 @@ mod tests {
     fn step_never_suspends_on_idle_when_the_timeout_is_never() {
         let mut h = PowerHonor::default();
         let base = Instant::now();
-        h.step(None, LidAction::Nothing, true, None, base);
+        h.step(
+            None,
+            IdleAction::Suspend,
+            LidAction::Nothing,
+            true,
+            None,
+            base,
+        );
         // A day of idle with Never set: still nothing (the safe default).
         assert!(h
-            .step(None, LidAction::Nothing, false, None, base + Duration::from_secs(86_400))
+            .step(
+                None,
+                IdleAction::Suspend,
+                LidAction::Nothing,
+                false,
+                None,
+                base + Duration::from_secs(86_400)
+            )
             .is_empty());
     }
 
@@ -462,36 +715,100 @@ mod tests {
 
         // Closed at startup (never seen open) → no surprise action.
         assert!(h
-            .step(None, LidAction::Suspend, false, Some(LidState::Closed), now)
+            .step(
+                None,
+                IdleAction::Suspend,
+                LidAction::Suspend,
+                false,
+                Some(LidState::Closed),
+                now
+            )
             .is_empty());
         // Open, then Closed → the configured Suspend fires once.
         assert!(h
-            .step(None, LidAction::Suspend, false, Some(LidState::Open), now)
+            .step(
+                None,
+                IdleAction::Suspend,
+                LidAction::Suspend,
+                false,
+                Some(LidState::Open),
+                now
+            )
             .is_empty());
         assert_eq!(
-            h.step(None, LidAction::Suspend, false, Some(LidState::Closed), now),
+            h.step(
+                None,
+                IdleAction::Suspend,
+                LidAction::Suspend,
+                false,
+                Some(LidState::Closed),
+                now
+            ),
             vec![PowerVerb::Suspend]
         );
         // Held closed → no loop.
         assert!(h
-            .step(None, LidAction::Suspend, false, Some(LidState::Closed), now)
+            .step(
+                None,
+                IdleAction::Suspend,
+                LidAction::Suspend,
+                false,
+                Some(LidState::Closed),
+                now
+            )
             .is_empty());
         // An Unknown flap → no fire.
         assert!(h
-            .step(None, LidAction::Suspend, false, Some(LidState::Unknown), now)
+            .step(
+                None,
+                IdleAction::Suspend,
+                LidAction::Suspend,
+                false,
+                Some(LidState::Unknown),
+                now
+            )
             .is_empty());
 
-        // Reopen + reclose with Lock configured → the Lock verb fires.
-        h.step(None, LidAction::Lock, false, Some(LidState::Open), now);
+        // Reopen + reclose with Lock configured → the Lock verb fires (CURTAIN-3
+        // routes it to the in-process curtain, not logind — asserted at the tick).
+        h.step(
+            None,
+            IdleAction::Suspend,
+            LidAction::Lock,
+            false,
+            Some(LidState::Open),
+            now,
+        );
         assert_eq!(
-            h.step(None, LidAction::Lock, false, Some(LidState::Closed), now),
+            h.step(
+                None,
+                IdleAction::Suspend,
+                LidAction::Lock,
+                false,
+                Some(LidState::Closed),
+                now
+            ),
             vec![PowerVerb::Lock]
         );
 
         // With Nothing configured, a close performs no verb at all.
-        h.step(None, LidAction::Nothing, false, Some(LidState::Open), now);
+        h.step(
+            None,
+            IdleAction::Suspend,
+            LidAction::Nothing,
+            false,
+            Some(LidState::Open),
+            now,
+        );
         assert!(h
-            .step(None, LidAction::Nothing, false, Some(LidState::Closed), now)
+            .step(
+                None,
+                IdleAction::Suspend,
+                LidAction::Nothing,
+                false,
+                Some(LidState::Closed),
+                now
+            )
             .is_empty());
     }
 
@@ -501,17 +818,35 @@ mod tests {
         let mut h = PowerHonor::default();
         let now = Instant::now();
         for _ in 0..5 {
-            assert!(h.step(None, LidAction::Suspend, false, None, now).is_empty());
+            assert!(h
+                .step(
+                    None,
+                    IdleAction::Suspend,
+                    LidAction::Suspend,
+                    false,
+                    None,
+                    now
+                )
+                .is_empty());
         }
     }
 
     #[test]
-    fn lid_action_verbs_map_and_the_labels_read() {
+    fn lid_and_idle_action_verbs_map_and_the_labels_read() {
         assert_eq!(LidAction::Suspend.verb(), Some(PowerVerb::Suspend));
         assert_eq!(LidAction::Lock.verb(), Some(PowerVerb::Lock));
         assert_eq!(LidAction::Nothing.verb(), None);
         assert_eq!(LidAction::Suspend.label(), "Suspend");
         assert_eq!(LidAction::Nothing.label(), "Do nothing");
         assert_eq!(LidAction::ALL.len(), 3);
+
+        // The idle action mirrors the same {Suspend, Lock, Nothing} → verb map.
+        assert_eq!(IdleAction::Suspend.verb(), Some(PowerVerb::Suspend));
+        assert_eq!(IdleAction::Lock.verb(), Some(PowerVerb::Lock));
+        assert_eq!(IdleAction::Nothing.verb(), None);
+        assert_eq!(IdleAction::Lock.label(), "Lock");
+        assert_eq!(IdleAction::Nothing.label(), "Do nothing");
+        assert_eq!(IdleAction::ALL.len(), 3);
+        assert_eq!(IdleAction::default(), IdleAction::Suspend);
     }
 }

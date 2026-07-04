@@ -147,6 +147,16 @@ mde-chat = { path = "../../services/mde-chat" }
 # toolkit resolution.
 mde-seat = { path = "../mde-seat" }
 
+# CURTAIN-3 — the logind session Lock/Unlock listener (`lock_signal.rs`). The
+# DM-less shell has no screensaver daemon to catch `loginctl lock-session`, so it
+# subscribes to logind's session signals directly over the system bus and drops its
+# in-process curtain. mde-seat already builds this exact zbus (5, tokio + blocking
+# API), so cargo unifies to one artifact — no new toolchain surface. The match/
+# forward is the ONLY direct D-Bus the shell does; every other seat call routes
+# through mde-seat (lock 1). Standard `org.freedesktop.login1` interop (§2 FDO
+# exception), matching mde-seat's build.
+zbus = { version = "5", default-features = false, features = ["tokio", "blocking-api"] }
+
 # BOOKMARKS-6 — the Surface::Browser IPC + shm texture bridge. The shell's `web`
 # panel is this crate's first caller: it spawns the sandboxed `mde-web-preview`
 # helper per session, drives it over the typed session socket, and uploads each

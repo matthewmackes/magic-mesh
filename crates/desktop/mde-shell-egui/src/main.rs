@@ -34,6 +34,7 @@ mod host_mirror;
 mod hotkeys;
 mod instances;
 mod keyboard;
+mod lock_signal;
 mod mesh_view;
 mod network;
 mod pam_auth;
@@ -68,6 +69,9 @@ use mde_term_egui::{real_terminal, terminal_panel, terminal_pump, TerminalSurfac
 use mde_voice_egui::{voice_header, voice_panel, voice_pump, VoiceApp};
 
 use dock::Surface;
+// CURTAIN-3 — the logind lock-signal receive seam, so `render` can poll the
+// listener source for `loginctl lock-session` (the trait's `poll`).
+use lock_signal::LockSignals;
 use workbench::Plane;
 
 /// The shell's pure navigation state: whether the shell body (the active
@@ -257,6 +261,12 @@ struct Shell {
     /// ([`curtain::Curtain::pam`] / [`pam_auth::PamVerifier`]) — the seat user's
     /// real system password, verified off the render thread (§7).
     curtain: curtain::Curtain,
+    /// CURTAIN-3 — the logind session `Lock`/`Unlock` listener: a background thread
+    /// forwards `loginctl lock-session` (and any session-manager lock) so `render`
+    /// drops the same in-process [`curtain`](Self::curtain). Inert when there is no
+    /// system bus / logind (headless CI, the windowed fallback) — honest, never a
+    /// faked signal. The idle/lid Lock actions + the boot-gate feed the SAME curtain.
+    lock_signal: lock_signal::LogindLockSource,
 }
 
 impl Shell {
@@ -266,7 +276,7 @@ impl Shell {
     /// E12-3b. Called mid-boot by [`Boot::frame`] (the QBRAND-4 `Surfaces`
     /// milestone), on the DRM seat and the windowed fallback alike.
     fn new_for_ctx(ctx: &egui::Context) -> Self {
-        Self {
+        let mut shell = Self {
             nav: Nav::default(),
             datacenter: datacenter::DatacenterState::default(),
             thisnode: thisnode::ThisNodeState::default(),
@@ -300,7 +310,20 @@ impl Shell {
             self_test: mesh_view::SelfTestWatch::default(),
             power_honor: power_honor::PowerHonor::default(),
             curtain: curtain::Curtain::pam(),
+            lock_signal: lock_signal::LogindLockSource::new(ctx),
+        };
+
+        // CURTAIN-3 boot-gate (design lock 2): when the persisted policy requires a
+        // login at boot (the shipped default), start the shell **Locked** — drop the
+        // curtain now, before the first surface renders, so the desktop is never shown
+        // or interactable until the seat user's real password passes PAM. This does
+        // NOT change the `.13`-style autostart: the service still starts the shell; the
+        // shell just starts behind the curtain. `lock()` is idempotent, and the config
+        // read folds an absent file to require-login (fail-secure).
+        if power_honor::should_lock_at_boot(shell.system.power_honor_config()) {
+            shell.curtain.lock();
         }
+        shell
     }
 
     /// Apply one dispatched hotkey action (E12-19). Hardware actions act on the ONE
@@ -731,11 +754,22 @@ impl Shell {
         self.system.poll(ctx);
 
         // POWER-5 — the DRM-native idle + lid honorer: one tick per frame folds this
-        // frame's input + the seat's lid reading into the idle-suspend / lid-close
-        // decision and drives it through the ONE seat (a self-contained block so an
-        // EDITOR-9 merge stays trivial). Safe by default — idle-suspend is off until
-        // the operator arms it in the Power section.
-        self.power_honor.tick(ctx, &self.system);
+        // frame's input + the seat's lid reading into the idle / lid-close decision and
+        // drives it through the ONE seat (a self-contained block so an EDITOR-9 merge
+        // stays trivial). Safe by default — idle action is off until the operator arms
+        // a timeout in the Power section.
+        // CURTAIN-3: an idle/lid action of **Lock** is reported back (not routed to
+        // logind) so it drops the in-process curtain here, exactly like Super+L.
+        if self.power_honor.tick(ctx, &self.system) {
+            self.curtain.lock();
+        }
+
+        // CURTAIN-3 — logind session Lock/Unlock: drain the listener's forwarded
+        // signals and route them (`loginctl lock-session` drops the curtain; an
+        // Unlock is received but never bypasses PAM — design lock 1). Empty when no
+        // system bus / logind, so this self-gates to a real seat, honestly.
+        let lock_signals = self.lock_signal.poll();
+        lock_signal::apply_lock_signals(&lock_signals, &mut self.curtain);
 
         // E12-17 — the BlueZ pairing agent is live only while the System surface is
         // in view: register on entry (once an adapter is present), drop
