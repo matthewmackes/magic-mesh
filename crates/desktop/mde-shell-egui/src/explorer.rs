@@ -88,7 +88,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -117,6 +117,19 @@ const STATE_PREFIX: &str = "state/units/";
 /// event-paced, so the shared 5 s cadence surfaces a new/removed unit without
 /// spinning — the same cadence every other plane refreshes at.
 const REFRESH: Duration = Duration::from_secs(5);
+
+/// EXPLORER-12 — how long the surface must sit without ANY input before the
+/// ambient idle auto-cycle begins (a living-wall display only comes alive after a
+/// clear pause). A behaviour cadence in the same `Duration` register as
+/// [`REFRESH`] — deliberately NOT a `Motion` easing token (§4 governs the *visual*
+/// transition, which the hero's `Motion::BASE` page-slide still owns).
+const AMBIENT_IDLE: Duration = Duration::from_secs(30);
+
+/// EXPLORER-12 — the deliberately slow dwell between ambient auto-advances once
+/// the cycle is running (a calm wall-clock crawl, never a flicker). A behaviour
+/// cadence like [`AMBIENT_IDLE`]; each advance's motion still eases through the
+/// `Motion` table via the hero paging animation, so §4 stays honoured.
+const AMBIENT_DWELL: Duration = Duration::from_secs(10);
 
 /// Filmstrip thumbnail width — three XL grid steps, wide enough for a mini glyph
 /// plus a truncated name. A behaviour param on the §4 grid, not a scattered px.
@@ -1380,6 +1393,108 @@ enum SurfaceMode {
     Ipam,
 }
 
+/// The file the Explorer's persisted preferences round-trip through — one JSON
+/// record under the client data dir, the SETTINGS-nav / `PowerHonorConfig` idiom.
+const PREFS_FILE: &str = "explorer-prefs.json";
+
+/// The Explorer surface's persisted preferences. EXPLORER-12 seeds it with the
+/// ambient-idle toggle; the EXPLORER-13 view/selection persistence extends this
+/// SAME record. Persisted the SETTINGS-nav way: one JSON file, atomic temp +
+/// rename, a missing / malformed file folding to the default (never a fatal, §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+struct ExplorerPrefs {
+    /// The EXPLORER-12 ambient idle auto-cycle toggle — **OFF by default** (the
+    /// `bool` default): an unattended screen only comes alive when the operator
+    /// opts in, never on its own.
+    #[serde(default)]
+    ambient_idle: bool,
+}
+
+impl ExplorerPrefs {
+    /// The default prefs path (`<client-data-dir>/explorer-prefs.json`), or `None`
+    /// in a headless context — mirrors `SettingsNav::default_path`.
+    fn default_path() -> Option<PathBuf> {
+        mde_bus::client_data_dir().map(|d| d.join(PREFS_FILE))
+    }
+
+    /// Load from `path`, folding a missing / malformed file to the default.
+    fn load_from(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Load from the default path (default when absent / unresolvable).
+    fn load() -> Self {
+        Self::default_path().map_or_else(Self::default, |p| Self::load_from(&p))
+    }
+
+    /// Write to `path` (atomic temp + rename, like `SettingsNav::save_to`).
+    ///
+    /// # Errors
+    /// The [`std::io::Error`] if the dir cannot be created or the file cannot be
+    /// written / renamed.
+    fn save_to(self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Persist to the default path (a silent no-op when no data dir resolves).
+    fn save(self) {
+        if let Some(path) = Self::default_path() {
+            let _ = self.save_to(&path);
+        }
+    }
+}
+
+/// Whether ANY user interaction landed this frame — a key/D-pad press, typed
+/// text, a pointer button/move, or a scroll. A held key or pointer button also
+/// counts, so the ambient cycle stays paused for the whole press, not just its
+/// edge. This is the ONE signal the auto-cycle treats as "the operator is here".
+fn is_user_input(i: &egui::InputState) -> bool {
+    if i.pointer.any_down() || !i.keys_down.is_empty() {
+        return true;
+    }
+    i.events.iter().any(|e| {
+        matches!(
+            e,
+            egui::Event::Key { .. }
+                | egui::Event::Text(_)
+                | egui::Event::Paste(_)
+                | egui::Event::PointerButton { .. }
+                | egui::Event::PointerMoved(_)
+                | egui::Event::MouseWheel { .. }
+        )
+    })
+}
+
+/// Whether motion is suppressed — egui's `animation_time` collapsed to zero, which
+/// is the shell's reduce-motion posture in the egui epoch (the retired `mde-theme`
+/// reduce-motion engine is gone). An auto-moving wall display is exactly the
+/// motion a reduce-motion seat opts out of (WCAG 2.2.2 pause/stop/hide), so the
+/// ambient cycle stays parked under it.
+fn reduce_motion(ctx: &egui::Context) -> bool {
+    ctx.style().animation_time <= 0.0
+}
+
+/// Pure ambient-cycle timing gate: given the frame clock and the last-input /
+/// last-advance marks (all egui-clock seconds), is a step due? A step waits for a
+/// full [`AMBIENT_IDLE`] of quiet AND a full [`AMBIENT_DWELL`] since the previous
+/// step — the first drives entry, the second throttles the crawl. Pure over its
+/// inputs so the cadence is unit-tested without a render.
+fn ambient_due(now: f64, last_input: f64, last_advance: f64) -> bool {
+    now - last_input >= AMBIENT_IDLE.as_secs_f64()
+        && now - last_advance >= AMBIENT_DWELL.as_secs_f64()
+}
+
 /// The Discovery-surface hero-card state (EXPLORER-3): the folded unit shelf, the
 /// focused index, the active category filter, and the Bus read seam.
 pub struct ExplorerState {
@@ -1425,6 +1540,17 @@ pub struct ExplorerState {
     /// The focused mosaic tile's on-screen rect from the last frame — the origin a
     /// keyboard/D-pad Enter zooms from (a mouse pick carries its own rect).
     focus_rect: Option<Rect>,
+    /// EXPLORER-12: the persisted surface preferences — currently the ambient-idle
+    /// toggle, loaded on construction + re-saved when the operator flips it.
+    prefs: ExplorerPrefs,
+    /// EXPLORER-12: the egui-clock second of the last user input — the idle clock
+    /// the ambient cycle waits on. `None` until the first frame seeds it at mount,
+    /// so the idle window starts when the surface opens, not at session start.
+    last_input_at: Option<f64>,
+    /// EXPLORER-12: the egui-clock second the ambient cycle last stepped the focus
+    /// — the dwell throttle between auto-advances. Tracks the input clock while the
+    /// operator is present so the first step lands a clean [`AMBIENT_IDLE`] later.
+    last_advance_at: Option<f64>,
 }
 
 impl Default for ExplorerState {
@@ -1450,6 +1576,9 @@ impl Default for ExplorerState {
             zoom_start: None,
             mosaic_enter: None,
             focus_rect: None,
+            prefs: ExplorerPrefs::load(),
+            last_input_at: None,
+            last_advance_at: None,
         }
     }
 }
@@ -1467,6 +1596,61 @@ impl ExplorerState {
             self.refresh();
         }
         ctx.request_repaint_after(REFRESH);
+    }
+
+    /// EXPLORER-12 — the ambient idle auto-cycle tick, run once per frame from
+    /// [`Self::show`]. When the toggle is on and the surface has sat without ANY
+    /// input for [`AMBIENT_IDLE`], step the shared focus one unit every
+    /// [`AMBIENT_DWELL`] so an unattended screen keeps informing; ANY key / D-pad /
+    /// pointer / scroll interaction resets the idle clock and pauses it at once, so
+    /// it never fights the operator. Never runs under reduce-motion, and only in the
+    /// hero / mosaic modes (the IPAM table has no focus to advance). Self-gating and
+    /// cheap — safe to call every frame.
+    fn tick_ambient(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        // ANY interaction this frame (or the very first frame) re-arms the idle
+        // clock — the pause. Advancing the focus ourselves is NOT input, so the
+        // cycle never treats its own step as a reason to stop.
+        if self.last_input_at.is_none() || ctx.input(is_user_input) {
+            self.last_input_at = Some(now);
+            self.last_advance_at = Some(now);
+            return;
+        }
+        // Gate: opted in, an advanceable mode, real motion allowed, >1 unit to walk.
+        if !self.prefs.ambient_idle
+            || matches!(self.mode, SurfaceMode::Ipam)
+            || reduce_motion(ctx)
+            || self.hero_count() < 2
+        {
+            return;
+        }
+        // Keep frames coming with no input so the idle timer actually elapses.
+        ctx.request_repaint_after(AMBIENT_DWELL);
+        let last_input = self.last_input_at.unwrap_or(now);
+        let last_advance = self.last_advance_at.unwrap_or(now);
+        if ambient_due(now, last_input, last_advance) {
+            self.ambient_step();
+            self.last_advance_at = Some(now);
+        }
+    }
+
+    /// Advance the ambient cycle one unit, wrapping at the end so a wall display
+    /// loops the shelf forever (unlike the operator's [`Self::page_next`], which
+    /// clamps). A no-op below two units — nothing to cycle through.
+    fn ambient_step(&mut self) {
+        let count = self.hero_count();
+        if count > 1 {
+            self.focus = (self.focus + 1) % count;
+        }
+    }
+
+    /// Flip the ambient-idle toggle and persist the new value (the SETTINGS-nav
+    /// idiom — a durable choice that survives lock/unlock + restart). The flipping
+    /// click is itself input, so the idle clock re-arms on the same frame and the
+    /// cycle never fires the instant it's switched on.
+    fn toggle_ambient(&mut self) {
+        self.prefs.ambient_idle = !self.prefs.ambient_idle;
+        self.prefs.save();
     }
 
     /// Re-read + re-fold the shelf. Split from the cadence gate so the pure fold
@@ -1984,6 +2168,12 @@ impl ExplorerState {
             self.focus.min(count - 1)
         };
 
+        // EXPLORER-12: the ambient idle auto-cycle — crawl the shared focus forward
+        // while the surface sits untouched (a no-op when the toggle is off, input
+        // just landed, or reduce-motion is set). After the focus clamp so a step
+        // lands on a valid index; before the panels so it shows this same frame.
+        self.tick_ambient(ui.ctx());
+
         egui::TopBottomPanel::top(ui.id().with("explorer-chips"))
             .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
             .show_inside(ui, |ui| self.header(ui));
@@ -2029,8 +2219,16 @@ impl ExplorerState {
             if chip(ui, "IPAM", self.mode == SurfaceMode::Ipam, Style::ACCENT) {
                 self.set_mode(SurfaceMode::Ipam);
             }
-            // The O2 fleet rollup, pushed to the right edge of the strip.
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.rollup(ui));
+            // The O2 fleet rollup pushed to the right edge, with the EXPLORER-12
+            // ambient-idle toggle just inboard of it (right-to-left adds the rollup
+            // first, so the toggle sits to its left).
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                self.rollup(ui);
+                ui.add_space(Style::SP_M);
+                if chip(ui, "Ambient", self.prefs.ambient_idle, Style::ACCENT) {
+                    self.toggle_ambient();
+                }
+            });
         });
         ui.add_space(Style::SP_XS);
         self.chips(ui);
@@ -3355,6 +3553,9 @@ mod tests {
                 zoom_start: None,
                 mosaic_enter: None,
                 focus_rect: None,
+                prefs: ExplorerPrefs::default(),
+                last_input_at: None,
+                last_advance_at: None,
             };
             s.refresh();
             s
@@ -4540,6 +4741,163 @@ mod tests {
             s.mosaic_enter.is_none(),
             "re-selecting the same mode is a no-op"
         );
+    }
+
+    // ─────────────────── EXPLORER-12 ambient idle auto-cycle ───────────────────
+
+    /// A unique per-test temp dir (the manual `power_honor` idiom — no tempfile dep
+    /// on the airgapped farm).
+    fn ambient_temp_dir(tag: &str) -> PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "mde-explorer-prefs-{tag}-{}-{n}",
+            std::process::id()
+        ))
+    }
+
+    /// Run one headless Explorer frame at `time` seconds carrying `events`.
+    fn ambient_frame(
+        ctx: &egui::Context,
+        s: &mut ExplorerState,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                Vec2::new(1200.0, 800.0),
+            )),
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| s.show(ui));
+        });
+    }
+
+    #[test]
+    fn ambient_toggle_defaults_off_and_round_trips_through_disk() {
+        // OFF by default — an unattended screen never moves unless opted in (§7).
+        assert!(!ExplorerPrefs::default().ambient_idle);
+        assert!(
+            !ExplorerState::with_fake(addressed_state(), "me")
+                .prefs
+                .ambient_idle,
+            "a fresh surface loads the OFF default"
+        );
+
+        // The SETTINGS-nav persistence idiom: a missing file folds to the default,
+        // and a flipped toggle survives a restart (write → read back).
+        let dir = ambient_temp_dir("rt");
+        std::fs::create_dir_all(&dir).expect("mkroot");
+        let path = dir.join(PREFS_FILE);
+        assert_eq!(
+            ExplorerPrefs::load_from(&path),
+            ExplorerPrefs::default(),
+            "a missing prefs file folds to the OFF default"
+        );
+
+        let on = ExplorerPrefs { ambient_idle: true };
+        on.save_to(&path).expect("save");
+        assert!(
+            ExplorerPrefs::load_from(&path).ambient_idle,
+            "the enabled toggle round-trips through disk (survives restart)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambient_due_waits_out_idle_then_dwell() {
+        let idle = AMBIENT_IDLE.as_secs_f64();
+        let dwell = AMBIENT_DWELL.as_secs_f64();
+        // Still inside the idle window → never due.
+        assert!(!ambient_due(idle - 1.0, 0.0, 0.0));
+        // Idle window AND a full dwell elapsed → due (the entry step).
+        assert!(ambient_due(idle + dwell, 0.0, 0.0));
+        // Past idle, but the previous step was under a dwell ago → throttled crawl.
+        let now = idle + dwell + 5.0;
+        assert!(!ambient_due(now, 0.0, now - (dwell - 0.5)));
+    }
+
+    #[test]
+    fn ambient_idle_advances_focus_and_input_pauses_it() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.set_mode(SurfaceMode::Hero);
+        s.prefs.ambient_idle = true;
+        s.focus = 0;
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        // Frame 1 at t=0 only arms the idle clock — nothing advances.
+        ambient_frame(&ctx, &mut s, 0.0, vec![]);
+        assert_eq!(s.focus, 0, "the first frame just arms the idle clock");
+
+        // A quiet frame past idle+dwell → the ambient cycle steps one unit.
+        let past = AMBIENT_IDLE.as_secs_f64() + AMBIENT_DWELL.as_secs_f64() + 1.0;
+        ambient_frame(&ctx, &mut s, past, vec![]);
+        assert_eq!(s.focus, 1, "sitting idle past the interval auto-advances");
+
+        // ANY input pauses it — a key press even further along holds the focus
+        // (the idle clock re-arms this frame; the cycle never fights the operator).
+        let key = egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        ambient_frame(
+            &ctx,
+            &mut s,
+            past + AMBIENT_DWELL.as_secs_f64() + 1.0,
+            vec![key],
+        );
+        assert_eq!(s.focus, 1, "input pauses the cycle — the focus holds");
+    }
+
+    #[test]
+    fn ambient_stays_off_by_default_and_under_reduce_motion() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let past = AMBIENT_IDLE.as_secs_f64() + AMBIENT_DWELL.as_secs_f64() + 1.0;
+
+        // Toggle OFF (the default) → no advance no matter how long it sits idle.
+        let mut off = ExplorerState::with_fake(addressed_state(), "me");
+        off.set_mode(SurfaceMode::Hero);
+        off.focus = 0;
+        ambient_frame(&ctx, &mut off, 0.0, vec![]);
+        ambient_frame(&ctx, &mut off, past, vec![]);
+        assert_eq!(off.focus, 0, "the default-off toggle never auto-advances");
+
+        // Toggle ON but reduce-motion set → the cycle stays parked (WCAG 2.2.2).
+        ctx.style_mut(|st| st.animation_time = 0.0);
+        assert!(
+            reduce_motion(&ctx),
+            "zero animation_time reads as reduce-motion"
+        );
+        let mut rm = ExplorerState::with_fake(addressed_state(), "me");
+        rm.set_mode(SurfaceMode::Hero);
+        rm.prefs.ambient_idle = true;
+        rm.focus = 0;
+        ambient_frame(&ctx, &mut rm, 0.0, vec![]);
+        ambient_frame(&ctx, &mut rm, past, vec![]);
+        assert_eq!(rm.focus, 0, "reduce-motion parks the ambient cycle");
+    }
+
+    #[test]
+    fn ambient_step_wraps_around_the_shelf() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        let count = s.hero_count();
+        assert!(count > 1, "the fixture has a shelf to cycle");
+        s.focus = count - 1;
+        s.ambient_step();
+        assert_eq!(s.focus, 0, "the wall display loops back to the start");
     }
 
     #[test]
