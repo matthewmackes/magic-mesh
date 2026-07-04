@@ -185,10 +185,11 @@ fn fold_peers(mesh: &MeshSnapshot) -> Vec<Unit> {
     units
 }
 
-/// Fold the cloud union into deduped units (lock #20): one per object id
-/// (keeping the record whose node sorts first — deterministic), then ordered by
-/// kind then name for display.
-fn fold_cloud(cloud: &[CloudObjectRecord]) -> Vec<Unit> {
+/// Dedup the cloud union by unit id (lock #20): one record per object id, keeping
+/// the one whose node sorts first (deterministic). Shared by the unit fold and
+/// EXPLORER-7's edge derivation so both see the SAME deduped object set (a
+/// cross-node duplicate never double-lists a unit nor doubles its edges).
+pub(super) fn dedup_cloud_records(cloud: &[CloudObjectRecord]) -> Vec<&CloudObjectRecord> {
     let mut records: Vec<&CloudObjectRecord> = cloud.iter().collect();
     records.sort_by(|a, b| {
         a.kind
@@ -197,9 +198,18 @@ fn fold_cloud(cloud: &[CloudObjectRecord]) -> Vec<Unit> {
             .then_with(|| a.node.cmp(&b.node))
     });
     let mut ids = BTreeSet::new();
-    let mut units: Vec<Unit> = records
+    records
         .into_iter()
         .filter(|r| ids.insert(r.kind.unit_id(&r.id)))
+        .collect()
+}
+
+/// Fold the cloud union into deduped units (lock #20): one per object id
+/// (keeping the record whose node sorts first — deterministic), then ordered by
+/// kind then name for display.
+fn fold_cloud(cloud: &[CloudObjectRecord]) -> Vec<Unit> {
+    let mut units: Vec<Unit> = dedup_cloud_records(cloud)
+        .into_iter()
         .map(cloud_unit)
         .collect();
     units.sort_by(|a, b| a.kind.cmp(&b.kind).then_with(|| a.name.cmp(&b.name)));
@@ -250,6 +260,7 @@ mod tests {
             kind,
             name: name.to_string(),
             address: None,
+            links: super::super::sources::CloudLinks::default(),
         }
     }
 

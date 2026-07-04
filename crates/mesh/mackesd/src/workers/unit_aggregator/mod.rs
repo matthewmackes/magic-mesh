@@ -16,20 +16,21 @@
 //! - **A pure fold** ([`fold::aggregate`]): self-first (lock #23), then peers,
 //!   LAN, cloud; cloud deduped by object id across nodes (lock #20); first/last-
 //!   seen stamped across ticks (E10). Unprobed fields stay explicit `None` (§7).
-//! - **The `state/units/<node>` mirror** ([`unit::UnitsState`]) — published on
-//!   change + a heartbeat via the `mde-bus` fire-and-reap path (the same idiom
-//!   `state/openstack/<node>` uses).
+//! - **A pure edge derivation** ([`edges::derive_edges`], EXPLORER-7, E2/E8): the
+//!   five typed relationship kinds ([`edges::EdgeKind`]) computed from the SAME
+//!   three sources (no new probes, §7) — mesh tunnels, cloud attachments, L2/L3
+//!   adjacency, host placement, storage usage — deduped + sorted.
+//! - **The `state/units/<node>` mirror** ([`unit::UnitsState`]) — the folded units
+//!   AND the derived edges, published on change + a heartbeat via the `mde-bus`
+//!   fire-and-reap path (the same idiom `state/openstack/<node>` uses).
 //! - **The E9 read verb** ([`verb`]) — `action/units/get-stream` → a
-//!   `reply/<ulid>` carrying the current stream, for any Rust/CLI mesh client.
+//!   `reply/<ulid>` carrying the current stream (units + edges), for any Rust/CLI
+//!   mesh client.
 //!
 //! ## Seams the later EXPLORER slices fill
 //! - EXPLORER-2 replaces [`sources::NoScan`] with the real mDNS/ARP/ping-sweep
 //!   scan behind [`sources::LanScanSource`], honouring the [`scan_flag`] the
 //!   surface toggles (lock #24). The `LanHost` unit producer already lands here.
-//! - EXPLORER-7 derives a typed edge set from the SAME unioned sources and rides
-//!   it alongside units (extending [`verb::UnitsReply`]); the ids
-//!   ([`unit::peer_unit_id`] / [`unit::lan_unit_id`] / [`sources::CloudKind::unit_id`])
-//!   are the stable edge endpoints.
 //! - EXPLORER-9 fills [`unit::Extras`] (enrichment) + the instance detail (E4);
 //!   the model already carries the `Option` slots.
 //!
@@ -37,6 +38,7 @@
 
 #![cfg(feature = "async-services")]
 
+pub mod edges;
 pub mod fold;
 pub mod lan_scan;
 pub mod sources;
@@ -57,6 +59,7 @@ use mde_bus::rpc::reply_topic;
 
 use super::{ShutdownToken, Worker};
 
+use edges::derive_edges;
 use fold::{aggregate, SeenTracker};
 use lan_scan::LanScan;
 use sources::{
@@ -240,9 +243,13 @@ impl UnitAggregatorWorker {
         let lan = self.scan.scan(scan_active);
         let now = now_ms();
         let units = aggregate(&mesh, &cloud, &lan, &mut self.seen, now);
+        // Derive the typed edge set from the SAME three sources (EXPLORER-7,
+        // E2/E8) — no new probes; absent sources yield no edges (§7).
+        let edges = derive_edges(&mesh, &cloud, &lan);
         UnitsState {
             host: self.host.clone(),
             units,
+            edges,
             published_at_ms: now,
         }
     }
@@ -348,6 +355,7 @@ mod tests {
             kind: CloudKind::Instance,
             name: "web".into(),
             address: None,
+            links: super::sources::CloudLinks::default(),
         }];
         let scan = Arc::new(FakeLanScan::new(vec![LanHostRecord {
             key: "aa:bb".into(),
@@ -369,6 +377,15 @@ mod tests {
         assert_eq!(state.units[0].id, super::unit::peer_unit_id("me"));
         // The scan seam saw the active flag.
         assert_eq!(scan.last_active(), Some(true));
+        // EXPLORER-7: the fold derives edges from the SAME sources — the cloud
+        // instance on node-a yields a HostPlacement edge to that node's peer.
+        let placement = state
+            .edges
+            .iter()
+            .find(|e| e.kind == super::edges::EdgeKind::HostPlacement)
+            .expect("a host-placement edge for the cloud instance");
+        assert_eq!(placement.from, "cloud:instance:i1");
+        assert_eq!(placement.to, super::unit::peer_unit_id("node-a"));
     }
 
     #[test]
@@ -402,6 +419,7 @@ mod tests {
         let state = UnitsState {
             host: "node-a".into(),
             units: vec![],
+            edges: vec![],
             published_at_ms: 7,
         };
         let mut cursor = None;

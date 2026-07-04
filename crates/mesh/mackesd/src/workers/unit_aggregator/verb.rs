@@ -122,6 +122,7 @@ mod tests {
                 last_seen_ms: 2,
                 extras: super::super::unit::Extras::default(),
             }],
+            edges: vec![],
             published_at_ms: 3,
         }
     }
@@ -153,6 +154,29 @@ mod tests {
         assert!(!reply.ok);
         assert!(reply.state.is_none());
         assert!(reply.error.expect("error").contains("bad units request"));
+    }
+
+    #[test]
+    fn reply_carries_the_derived_edge_set_alongside_units() {
+        // E9: the read verb returns units + edges over the same request. A client
+        // that fires `action/units/get-stream` gets the typed connectivity too.
+        use super::super::edges::{Edge, EdgeKind};
+        let mut state = sample_state();
+        state.edges = vec![Edge {
+            kind: EdgeKind::HostPlacement,
+            from: "cloud:instance:i1".into(),
+            to: peer_unit_id("node-a"),
+            detail: Some("runs on node-a".into()),
+        }];
+        let reply = handle_units_request("{}", &state);
+        assert!(reply.ok);
+        let body = reply.to_body();
+        // The edge rides inside the reply's state, so a decode recovers it.
+        let back: UnitsReply = serde_json::from_str(&body).expect("decode");
+        let edges = back.state.expect("state").edges;
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].kind, EdgeKind::HostPlacement);
+        assert_eq!(edges[0].to, peer_unit_id("node-a"));
     }
 
     #[test]

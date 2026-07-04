@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::edges::Edge;
+
 /// The kind of a discovered unit (lock #1: three kinds, one stream, one badge).
 ///
 /// `Peer` comes from the mesh mirror; `LanHost` from the active LAN scan
@@ -239,6 +241,11 @@ pub struct UnitsState {
     /// Every unit this node folded, in proximity order: self first (lock #23),
     /// then mesh peers by name, then LAN hosts, then cloud objects (lock #7).
     pub units: Vec<Unit>,
+    /// The typed relationships derived from the SAME unioned sources (EXPLORER-7,
+    /// E2/E8) — published alongside the units so a client renders connectivity
+    /// chips without recomputing them. Empty when no source yields an edge (§7).
+    #[serde(default)]
+    pub edges: Vec<Edge>,
     /// Wall-clock publish time, ms since the Unix epoch.
     pub published_at_ms: u64,
 }
@@ -246,9 +253,15 @@ pub struct UnitsState {
 impl UnitsState {
     /// Equality ignoring publish time + per-unit timestamps — the worker's
     /// publish-on-change gate (mirrors `OpenStackState::same_ignoring_time`).
+    ///
+    /// The edge set is compared in full: edges are time-independent (derived from
+    /// content, not timestamps), so an unchanged fold yields identical edges — but
+    /// a foreign-key/adjacency change with a stable unit set IS an observable
+    /// change worth republishing.
     #[must_use]
     pub fn same_ignoring_time(&self, other: &Self) -> bool {
         self.host == other.host
+            && self.edges == other.edges
             && self.units.len() == other.units.len()
             && self
                 .units
@@ -316,6 +329,7 @@ mod tests {
         let s1 = UnitsState {
             host: "node-a".into(),
             units: vec![unit("peer:a", "a", 1, 2), unit("peer:b", "b", 1, 2)],
+            edges: vec![],
             published_at_ms: 10,
         };
         // Same units, fresh stamps → not a change.
@@ -355,11 +369,23 @@ mod tests {
                 last_seen_ms: 2,
                 extras: Extras::default(),
             }],
+            edges: vec![Edge {
+                kind: super::super::edges::EdgeKind::MeshTunnel,
+                from: peer_unit_id("node-a"),
+                to: peer_unit_id("node-b"),
+                detail: Some("direct".into()),
+            }],
             published_at_ms: 3,
         };
         let json = serde_json::to_string(&state).expect("serialize");
         let back: UnitsState = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, state);
+        // The edge set rides alongside units on the published body (E8/E9).
+        assert_eq!(back.edges.len(), 1);
+        assert_eq!(
+            back.edges[0].kind,
+            super::super::edges::EdgeKind::MeshTunnel
+        );
         // Cloud reachability round-trips the host-node tag.
         let cloud = Reachability::CloudObject {
             node: "node-b".into(),

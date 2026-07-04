@@ -133,6 +133,32 @@ impl CloudKind {
     }
 }
 
+/// The foreign-key references a cloud object carries (design E2/E8).
+///
+/// Feeds EXPLORER-7's edge derivation. Every field is default-absent (§7 honest):
+/// today's service-only mirror carries none, so no cloud edges are derived until a
+/// forward-compat mirror publishes them. Kept a discrete block so the base
+/// [`CloudObjectRecord`] identity fields stay stable.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CloudLinks {
+    /// Networks this instance is attached to (Nova → Neutron), by network id.
+    pub networks: Vec<String>,
+    /// Volumes attached to this instance (Nova → Cinder), by volume id.
+    pub volumes: Vec<String>,
+    /// The boot image of this instance (Nova → Glance), by image id.
+    pub image: Option<String>,
+    /// Subnets this network owns (Neutron), by subnet id.
+    pub subnets: Vec<String>,
+    /// The gateway router of this network (Neutron), by router id.
+    pub router: Option<String>,
+    /// The instance this volume is attached to (Cinder attachment), by id.
+    pub attached_to: Option<String>,
+    /// The backing pool/share this volume consumes (Cinder host/pool).
+    pub pool: Option<String>,
+    /// The volume's size in GiB — the consumed amount, for the storage edge detail.
+    pub size_gb: Option<u64>,
+}
+
 /// One cloud object folded from a node's `state/openstack/<node>` mirror, tagged
 /// with the host node that runs it (lock #20).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +174,8 @@ pub struct CloudObjectRecord {
     pub name: String,
     /// A fixed/floating address, when the mirror carries one.
     pub address: Option<String>,
+    /// The object's foreign keys, feeding EXPLORER-7's edge derivation (E2/E8).
+    pub links: CloudLinks,
 }
 
 /// The cloud half of the union (source (b), lock #20).
@@ -193,6 +221,30 @@ pub struct CloudObjectWire {
     /// publishing node as the host tag).
     #[serde(default)]
     pub host: Option<String>,
+    /// Instance → network ids (EXPLORER-7 edge FK). Absent on today's mirror.
+    #[serde(default)]
+    pub networks: Vec<String>,
+    /// Instance → volume ids (EXPLORER-7 edge FK).
+    #[serde(default)]
+    pub volumes: Vec<String>,
+    /// Instance → boot image id (EXPLORER-7 edge FK).
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Network → subnet ids (EXPLORER-7 edge FK).
+    #[serde(default)]
+    pub subnets: Vec<String>,
+    /// Network → gateway router id (EXPLORER-7 edge FK).
+    #[serde(default)]
+    pub router: Option<String>,
+    /// Volume → attached instance id (EXPLORER-7 edge FK).
+    #[serde(default)]
+    pub attached_to: Option<String>,
+    /// Volume → backing pool/share (EXPLORER-7 edge FK).
+    #[serde(default)]
+    pub pool: Option<String>,
+    /// Volume size in GiB — the storage edge's consumed-amount detail.
+    #[serde(default)]
+    pub size_gb: Option<u64>,
 }
 
 /// The `<node>` leaf of a `state/openstack/<node>` topic, or `None` if `topic`
@@ -219,6 +271,16 @@ pub fn records_from_body(topic_node: &str, body: &OpenstackMirrorBody) -> Vec<Cl
             kind: o.kind,
             name: o.name.clone(),
             address: o.address.clone(),
+            links: CloudLinks {
+                networks: o.networks.clone(),
+                volumes: o.volumes.clone(),
+                image: o.image.clone(),
+                subnets: o.subnets.clone(),
+                router: o.router.clone(),
+                attached_to: o.attached_to.clone(),
+                pool: o.pool.clone(),
+                size_gb: o.size_gb,
+            },
         })
         .collect()
 }
@@ -402,6 +464,34 @@ mod tests {
         // Object with its own host → tagged there (the host-node tag, lock #20).
         assert_eq!(recs[1].node, "node-b");
         assert_eq!(recs[1].kind, CloudKind::Network);
+    }
+
+    #[test]
+    fn object_foreign_keys_decode_into_links_for_edge_derivation() {
+        // A forward-compat mirror carrying EXPLORER-7 foreign keys folds them into
+        // the record's links block (feeding the edge derivation); a plain object
+        // leaves every link default-absent (§7).
+        let body_str = r#"{
+            "host":"node-a",
+            "objects":[
+                {"id":"i1","kind":"instance","name":"web",
+                 "networks":["n1"],"volumes":["v1"],"image":"img1"},
+                {"id":"v1","kind":"volume","name":"data",
+                 "attached_to":"i1","pool":"ceph","size_gb":40},
+                {"id":"img1","kind":"image","name":"cirros"}
+            ]
+        }"#;
+        let body: OpenstackMirrorBody = serde_json::from_str(body_str).expect("decode");
+        let recs = records_from_body("node-a", &body);
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].links.networks, vec!["n1".to_string()]);
+        assert_eq!(recs[0].links.volumes, vec!["v1".to_string()]);
+        assert_eq!(recs[0].links.image.as_deref(), Some("img1"));
+        assert_eq!(recs[1].links.attached_to.as_deref(), Some("i1"));
+        assert_eq!(recs[1].links.pool.as_deref(), Some("ceph"));
+        assert_eq!(recs[1].links.size_gb, Some(40));
+        // A plain object → default-absent links.
+        assert_eq!(recs[2].links, CloudLinks::default());
     }
 
     #[test]
