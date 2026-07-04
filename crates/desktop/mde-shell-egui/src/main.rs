@@ -1057,6 +1057,32 @@ impl Shell {
         // active surface). The constant taskbar rides outside the fade.
         let t = Motion::animate(ctx, "shell-expand", self.nav.expanded, Motion::BASE);
 
+        // DOCK-OVERLAP — when the vertical dock is shown and we are NOT in a
+        // full-screen remote desktop, reserve a left gutter equal to the dock's
+        // live eased slide width so the central content is NOT covered by the dock
+        // (it insets in lockstep with the slide, no overlap). In a full-screen
+        // remote desktop the dock instead floats as an overlay (it reveals OVER the
+        // edge-to-edge remote), so NO gutter is reserved; hidden → no gutter (full
+        // width). Mounted as an empty left `SidePanel` BEFORE the `CentralPanel`,
+        // which the floating dock `Area` paints over. Reuses the EXACT
+        // full-screen-remote condition the KIRON focus-mute uses (`render`).
+        let full_screen_remote_desktop =
+            self.nav.surface == Surface::Desktop && self.vdi.requested_target().is_some();
+        let gutter = reserved_dock_gutter(
+            self.vertical_dock,
+            full_screen_remote_desktop,
+            ctx,
+            &self.vdock,
+        );
+        if gutter > 0.0 {
+            egui::SidePanel::left("shell-dock-gutter")
+                .exact_width(gutter)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE)
+                .show(ctx, |_ui| {});
+        }
+
         let covered = self.curtain.covers_fully();
         egui::CentralPanel::default().show(ctx, |ui| {
             if covered {
@@ -1081,6 +1107,27 @@ impl Shell {
         if t > 0.001 && t < 0.999 {
             ctx.request_repaint();
         }
+    }
+}
+
+/// DOCK-OVERLAP — the width of the left gutter the shell reserves for the vertical
+/// dock this frame so the central content is never covered by it. It is the dock's
+/// live eased slide width ([`dock::gutter_width`], `0.0` when hidden + settled) —
+/// but reserved ONLY when the vertical dock is mounted AND we are NOT in a
+/// full-screen remote desktop. In a full-screen remote desktop the dock floats as
+/// an overlay (it reveals OVER the edge-to-edge remote), so nothing is reserved;
+/// the legacy bottom taskbar likewise reserves no side gutter. Split out (and pure
+/// but for the dock's slide read) so the gate is unit-testable.
+fn reserved_dock_gutter(
+    vertical_dock: bool,
+    full_screen_remote_desktop: bool,
+    ctx: &egui::Context,
+    vdock: &dock::DockState,
+) -> f32 {
+    if vertical_dock && !full_screen_remote_desktop {
+        dock::gutter_width(ctx, vdock)
+    } else {
+        0.0
     }
 }
 
@@ -1132,7 +1179,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         chrome, dock, editor_panel, files_panel, media_header, media_panel, real_editor,
-        real_media, real_terminal, splash, terminal_panel, tray, Boot, Nav, Plane, Surface,
+        real_media, real_terminal, reserved_dock_gutter, splash, terminal_panel, tray, Boot, Nav,
+        Plane, Surface,
     };
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
@@ -1146,6 +1194,100 @@ mod tests {
         );
         assert_eq!(n.surface, Surface::Workbench);
         assert_eq!(n.plane, Plane::ThisNode);
+    }
+
+    // ── DOCK-OVERLAP: the vertical dock reserves a gutter so it never overlaps ──
+
+    #[test]
+    fn the_dock_reserves_a_gutter_except_in_a_full_screen_remote_desktop() {
+        // A shown vertical dock, NOT in a full-screen remote desktop → the shell
+        // reserves the dock's slide width (DOCK_W once settled) as a left gutter so
+        // the dock never overlaps the surface. A fresh context reports the settled
+        // slide endpoint on first sight (egui's `animate_bool`), so the reserved
+        // width is DOCK_W. Each case uses its own context so the slide latch starts
+        // fresh at the right endpoint.
+        let ctx = egui::Context::default();
+        let mut shown = dock::DockState::default();
+        shown.toggle();
+        assert!(
+            (reserved_dock_gutter(true, false, &ctx, &shown) - dock::DOCK_W).abs() < f32::EPSILON,
+            "a shown dock off a full-screen remote reserves a DOCK_W gutter (no overlap)"
+        );
+
+        // A full-screen remote desktop → NO gutter: the dock overlays the
+        // edge-to-edge remote on reveal (the remote stays full-screen).
+        let ctx2 = egui::Context::default();
+        let mut shown2 = dock::DockState::default();
+        shown2.toggle();
+        assert_eq!(
+            reserved_dock_gutter(true, true, &ctx2, &shown2),
+            0.0,
+            "in a full-screen remote desktop the dock overlays — no gutter reserved"
+        );
+
+        // A hidden dock → NO gutter (content fills the full width).
+        let ctx3 = egui::Context::default();
+        let hidden = dock::DockState::default();
+        assert_eq!(
+            reserved_dock_gutter(true, false, &ctx3, &hidden),
+            0.0,
+            "a hidden dock reserves nothing — the content fills full width"
+        );
+
+        // The legacy bottom taskbar reserves no side gutter.
+        let ctx4 = egui::Context::default();
+        let mut shown4 = dock::DockState::default();
+        shown4.toggle();
+        assert_eq!(
+            reserved_dock_gutter(false, false, &ctx4, &shown4),
+            0.0,
+            "the bottom taskbar reserves no side gutter"
+        );
+    }
+
+    #[test]
+    fn a_reserved_gutter_insets_the_central_content_by_dock_w() {
+        // The reservation MECHANISM (mirrors `central_view`): an empty left
+        // SidePanel of the reserved width pushes the CentralPanel's content right by
+        // exactly that width, so the floating dock Area over x∈[0,DOCK_W] covers only
+        // the empty gutter — never the surface. The CentralPanel's own inner frame
+        // margin is constant, so the DOCK_W inset shows as the DELTA between the
+        // reserved and the unreserved content left.
+        let with = central_left_after_gutter(dock::DOCK_W);
+        let without = central_left_after_gutter(0.0);
+        assert!(
+            (with - without - dock::DOCK_W).abs() < 0.5,
+            "a DOCK_W gutter must inset the central content by DOCK_W (with={with}, without={without})"
+        );
+        assert!(
+            with > without,
+            "reserving a gutter must push the central content strictly rightward"
+        );
+    }
+
+    /// Mount an empty left gutter `SidePanel` of `gutter` (0 = none) exactly as
+    /// `central_view` does, then a `CentralPanel`, and return the CentralPanel
+    /// content rect's LEFT — the inset the reserved gutter produces.
+    fn central_left_after_gutter(gutter: f32) -> f32 {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let left = std::cell::Cell::new(f32::NAN);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            if gutter > 0.0 {
+                egui::SidePanel::left("shell-dock-gutter")
+                    .exact_width(gutter)
+                    .resizable(false)
+                    .show_separator_line(false)
+                    .frame(egui::Frame::NONE)
+                    .show(ctx, |_ui| {});
+            }
+            egui::CentralPanel::default().show(ctx, |ui| left.set(ui.max_rect().left()));
+        });
+        left.get()
     }
 
     /// One headless boot frame through the SAME `Boot::frame` both runners

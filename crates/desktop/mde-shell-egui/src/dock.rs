@@ -698,6 +698,18 @@ const DOCK_SLIDE_KEY: &str = "vdock-slide";
 /// Id::new(DOCK_AREA))`.
 const DOCK_AREA: &str = "vdock-area";
 
+/// The egui memory key for the DOCK-ACCENT right-edge **brighten** latch — the
+/// Motion factor that eases the Carbon-blue edge hairline dim↔full on reveal or a
+/// pointer over the dock. Private to the dock (distinct from [`DOCK_SLIDE_KEY`]).
+const ACCENT_LIT_KEY: &str = "vdock-accent-lit";
+
+/// The DOCK-ACCENT right-edge hairline's **rest** brightness (DOCK-ACCENT) — the
+/// Carbon interactive-blue edge sits this dim (a gamma-scaled [`Style::ACCENT`],
+/// so also part-transparent: the inboard [`Style::BORDER`] divider shows through,
+/// the "layered" look) when the dock is settled + unhovered, easing to full ACCENT
+/// on reveal/hover.
+const ACCENT_EDGE_DIM: f32 = 0.4;
+
 /// The left vertical dock's **state** — VDOCK-1's auto-hide inputs (locks #9/#13)
 /// plus VDOCK-2's picker state. The auto-hide half (the Super-tap **reveal** latch
 /// and the **pin**) is kept tiny and pure (no egui, no GPU) so the shell's hotkey
@@ -943,6 +955,25 @@ pub fn dock(ctx: &egui::Context, state: &mut DockState) -> bool {
     clicked
 }
 
+/// The width of the left **gutter** the shell reserves for the vertical dock this
+/// frame (DOCK-OVERLAP) — [`DOCK_W`] scaled by the dock's live slide progress, so
+/// the central content insets in lockstep with the sliding dock (no content jump
+/// on reveal). Reads the SAME slide latch [`dock`] drives (idempotent within a
+/// frame — egui's `animate_bool` returns the settled endpoint on first sight and
+/// the same value on repeat reads), so the reserved gutter and the dock can never
+/// drift apart. `0.0` when the dock is hidden **and settled** — the central
+/// content then fills the full width. The shell reserves this as an empty left
+/// gutter ONLY when NOT in a full-screen remote desktop; there the dock floats as
+/// an overlay instead (`main.rs::central_view`).
+pub fn gutter_width(ctx: &egui::Context, state: &DockState) -> f32 {
+    let t = Motion::animate(ctx, DOCK_SLIDE_KEY, state.shown(), Motion::BASE);
+    if t <= 0.001 {
+        0.0
+    } else {
+        DOCK_W * t
+    }
+}
+
 /// Paint the vertical dock's frame into `rect` and lay out its interior: the solid
 /// Carbon-dark panel + the hairline right-edge divider (lock #24, §4 tokens), the
 /// **VDOCK-2** top zone (the Workbench lead + the folded-in pin) and middle zone
@@ -961,6 +992,24 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
         rect.right(),
         rect.y_range(),
         egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+    );
+    // DOCK-ACCENT — a 1px Carbon **Interactive Blue 60** hairline at the dock's
+    // OUTERMOST right pixel (`rect.right()`), full height, layered just outside the
+    // inboard BORDER divider above (blue at the edge, the divider inboard). It sits
+    // dim at rest and BRIGHTENS on reveal OR a pointer over the dock: the brighten
+    // factor eases over the shared Motion table (no literal duration, §4), lerping
+    // the SAME [`Style::ACCENT`] token the group hairline strokes from
+    // [`ACCENT_EDGE_DIM`] to full (no raw hex, §4).
+    let lit = Motion::animate(
+        ui.ctx(),
+        ACCENT_LIT_KEY,
+        state.shown() || ui.rect_contains_pointer(rect),
+        Motion::FAST,
+    );
+    painter.vline(
+        rect.right(),
+        rect.top()..=rect.bottom(),
+        egui::Stroke::new(HAIRLINE_W, accent_edge_color(lit)),
     );
 
     let mut clicked = false;
@@ -1066,6 +1115,16 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
     }
 
     clicked
+}
+
+/// The DOCK-ACCENT right-edge hairline colour for a given brighten factor `lit`
+/// (0 = rest, 1 = fully revealed/hovered): the Carbon interactive-blue
+/// [`Style::ACCENT`] token (no raw hex, §4), gamma-scaled from [`ACCENT_EDGE_DIM`]
+/// at rest to full at `lit == 1`. The gamma scale also drops the alpha at rest, so
+/// the dim edge is part-transparent and the inboard divider shows through (the
+/// "layered" look). Pure, so the brighten curve is unit-testable.
+fn accent_edge_color(lit: f32) -> egui::Color32 {
+    Style::ACCENT.gamma_multiply(egui::lerp(ACCENT_EDGE_DIM..=1.0, lit))
 }
 
 /// The dock's **pin** toggle (VDOCK-1, lock #9) — the minimal affordance that
@@ -1937,12 +1996,12 @@ fn power_arming_stage(ui: &mut egui::Ui, power: &mut PowerMenu) -> Option<PowerI
 #[cfg(test)]
 mod tests {
     use super::{
-        cell_id, dock, group_hairline_id, group_height, group_label_id, icon_texture,
-        overflow_more_id, pick_cell_id, power_item_id, sys_cell_id, taskbar, underline,
-        visible_group_count, DockRequest, DockState, PowerItem, PowerMenu, Surface, SysCell,
-        CELL_W, DOCK_AREA, DOCK_W, GROUPS, GROUP_GAP, HAIRLINE_W, ICON_GAP, ICON_LOGICAL,
-        LABEL_PAD, PIN_STRIP_H, POWER_MENU, SHOW_DESKTOP_W, SYSTEM_QUAD, SYS_QUAD_ICON, TASKBAR_H,
-        TASKBAR_TOP_PAD,
+        accent_edge_color, cell_id, dock, group_hairline_id, group_height, group_label_id,
+        gutter_width, icon_texture, overflow_more_id, pick_cell_id, power_item_id, sys_cell_id,
+        taskbar, underline, visible_group_count, DockRequest, DockState, PowerItem, PowerMenu,
+        Surface, SysCell, ACCENT_EDGE_DIM, CELL_W, DOCK_AREA, DOCK_W, GROUPS, GROUP_GAP,
+        HAIRLINE_W, ICON_GAP, ICON_LOGICAL, LABEL_PAD, PIN_STRIP_H, POWER_MENU, SHOW_DESKTOP_W,
+        SYSTEM_QUAD, SYS_QUAD_ICON, TASKBAR_H, TASKBAR_TOP_PAD,
     };
     use crate::chrome::MeshSummary;
     use crate::tray::{TrayInputs, TrayState};
@@ -2986,6 +3045,107 @@ Desktop x=[{:.1},{:.1}]",
         frame(&ctx, &mut s, vec![egui::Event::PointerMoved(click), press]);
         frame(&ctx, &mut s, vec![release]);
         assert!(s.pinned(), "clicking the pin holds the dock open (lock #9)");
+    }
+
+    // ── DOCK-OVERLAP: the shell reserves a gutter so the dock never overlaps ──
+
+    #[test]
+    fn a_shown_dock_reserves_a_full_gutter_a_hidden_one_reserves_nothing() {
+        // DOCK-OVERLAP — the shell insets the central content by this width so the
+        // dock never sits over the surface (except a full-screen remote desktop,
+        // gated in main.rs). A fresh context reports the settled slide endpoint on
+        // first sight (egui's `animate_bool`), so a shown dock reserves the full
+        // DOCK_W and a hidden + settled dock reserves nothing (content fills width).
+        let ctx = egui::Context::default();
+        let mut shown = DockState::default();
+        shown.toggle();
+        assert!(
+            (gutter_width(&ctx, &shown) - DOCK_W).abs() < f32::EPSILON,
+            "a shown dock reserves a full DOCK_W gutter (no overlap)"
+        );
+        // A separate context so the slide latch starts fresh at the hidden endpoint.
+        let ctx2 = egui::Context::default();
+        let hidden = DockState::default();
+        assert_eq!(
+            gutter_width(&ctx2, &hidden),
+            0.0,
+            "a hidden + settled dock reserves nothing — the content fills full width"
+        );
+    }
+
+    // ── DOCK-ACCENT: a Carbon-blue hairline down the dock's right edge ────────
+
+    #[test]
+    fn the_right_edge_accent_brightens_from_dim_to_full_carbon_blue() {
+        // DOCK-ACCENT — the right-edge hairline reuses Style::ACCENT (the Carbon
+        // interactive-blue token, no raw hex) and brightens with the reveal/hover
+        // factor: dim at rest, full ACCENT when revealed, monotone between. It stays
+        // blue-dominant at rest (it IS the blue token, gamma-scaled).
+        let dim = accent_edge_color(0.0);
+        let full = accent_edge_color(1.0);
+        assert_eq!(
+            full,
+            Style::ACCENT,
+            "fully lit is the Carbon interactive-blue token (gamma ×1 is identity)"
+        );
+        assert!(
+            dim.r() <= full.r() && dim.g() <= full.g() && dim.b() <= full.b() && dim.a() < full.a(),
+            "the rest state is dimmer + more transparent than the revealed state"
+        );
+        assert!(
+            dim.b() >= dim.r() && dim.b() >= dim.g(),
+            "the edge stays Carbon-blue (blue-dominant) even at rest"
+        );
+        assert!(
+            (0.0..1.0).contains(&ACCENT_EDGE_DIM),
+            "the rest brightness is a genuine dim, not full-on"
+        );
+    }
+
+    #[test]
+    fn the_dock_paints_a_carbon_blue_hairline_down_its_right_edge() {
+        // DOCK-ACCENT — a 1px Carbon interactive-blue line at the dock's OUTERMOST
+        // right pixel (rect.right() == DOCK_W when fully in), full height, layered
+        // outside the inboard BORDER divider. Drive a shown dock and find the
+        // blue-dominant vertical LineSegment at x≈DOCK_W spanning the screen height.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut shown = DockState::default();
+        shown.toggle(); // reveal it (slide settles to t=1 on the first frame)
+
+        run_vdock(&ctx, &mut shown, 1);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ui.button("surface");
+            });
+            let _ = dock(ctx, &mut shown);
+        });
+
+        let found = out.shapes.iter().any(|cs| match &cs.shape {
+            egui::Shape::LineSegment { points, stroke } => {
+                let [a, b] = points;
+                let vertical = (a.x - b.x).abs() < 0.5;
+                let at_right_edge = (a.x - DOCK_W).abs() < 0.5;
+                let full_height = (b.y - a.y).abs() > 700.0;
+                let c = stroke.color;
+                // The Carbon interactive-blue token is blue-dominant + bright; the
+                // inboard BORDER divider (b == 61) is excluded by the b > 100 gate.
+                let blue = c.b() > c.r() && c.b() > c.g() && c.b() > 100;
+                vertical && at_right_edge && full_height && blue
+            }
+            _ => false,
+        });
+        assert!(
+            found,
+            "no Carbon-blue right-edge hairline at x≈DOCK_W spanning full height"
+        );
     }
 
     // ── VDOCK-2: the vertical app picker (top + middle zones) ─────────────────
