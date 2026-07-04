@@ -16,7 +16,7 @@ then **six labeled groups** in this left-to-right order:
 | 1 | **Comms** | Chat, Voice |
 | 2 | **Workloads** | Instances |
 | 3 | **Terminals** | Editor, Terminal, Browser |
-| 4 | **Mesh** | MeshView, Desktop |
+| 4 | **Mesh** | MeshView *(Desktop moved out — see below)* |
 | 5 | **System** | Files, System, Storage, About |
 | 6 | **Media** | Music, Media |
 
@@ -24,6 +24,14 @@ All 15 surfaces are placed (About kept, in System). Notes on the non-obvious cal
 (operator, this survey): Instances→Workloads but Desktop→Mesh (a VM is a workload, a
 remote desktop is a mesh connection); Editor/Terminal/Browser form the new **Terminals**
 group (interactive session windows); Files→System (with Storage); Workbench leads alone.
+
+### Desktop → the Windows "Show Desktop" position (operator 2026-07-04)
+
+`Surface::Desktop` moves OUT of the Mesh group to the **far-right end of the taskbar**,
+past the clock/tray — the exact bottom-right corner where Windows 10 places its "Show
+Desktop" button. Rendered as a thin sliver/button there; clicking it still routes to
+`Surface::Desktop`. The Mesh group is then just **MeshView**. This is the one element
+that lives to the right of the tray (Win10's Show-Desktop convention).
 
 ## Styling locks
 
