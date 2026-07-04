@@ -24,10 +24,16 @@
 //!   trigger chords are intercepted at the panel level (before the widget reads
 //!   this frame's events) and which drive the existing surface seams over a small
 //!   self-contained [`fuzzy`] matcher.
+//! * EDITOR-5 — **tree-sitter syntax highlighting** ([`highlight`]): per-open-
+//!   buffer grammars picked by file extension (rust / python / js / ts / json /
+//!   toml / markdown / bash), re-parsed **incrementally** on edit (the buffer's
+//!   edit deltas splice the old tree — no full-file reparse per keystroke) and
+//!   painted through the shared Carbon code-theme tokens ([`mde_egui::code`],
+//!   §4). Unknown extensions honestly render plain (§7).
 //!
-//! Tree-sitter highlighting (EDITOR-5) and tabs + splittable panes land in the
-//! following units; they grow [`EditorSurface`] / [`EditorView`] and render into
-//! [`editor_panel`] without re-wiring the shell.
+//! Tabs + splittable panes land in the following units; they grow
+//! [`EditorSurface`] / [`EditorView`] and render into [`editor_panel`] without
+//! re-wiring the shell.
 //!
 //! Layering (§6): the surface state + render seam live in [`panel`], the widget in
 //! [`widget`], the document model in [`buffer`]; the only in-workspace edge points
@@ -36,6 +42,7 @@
 pub mod buffer;
 mod finder;
 mod fuzzy;
+pub mod highlight;
 mod palette;
 pub mod panel;
 pub mod project_tree;
@@ -44,6 +51,7 @@ pub mod widget;
 use mde_egui::{eframe, egui};
 
 pub use buffer::Buffer;
+pub use highlight::{Highlighter, Language};
 pub use panel::{editor_panel, EditorSurface};
 pub use project_tree::ProjectTree;
 pub use widget::{editor_widget, EditorView};

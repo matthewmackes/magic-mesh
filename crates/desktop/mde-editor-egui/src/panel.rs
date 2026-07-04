@@ -30,6 +30,7 @@ use mde_egui::Style;
 
 use crate::buffer::Buffer;
 use crate::finder::{self, FileFinder};
+use crate::highlight::Highlighter;
 use crate::palette::{self, CommandPalette, PaletteCommand};
 use crate::project_tree::{self, ProjectTree};
 use crate::widget::{editor_widget, EditorView};
@@ -51,20 +52,27 @@ const SCRATCH_SEED: &str = "// Scratch buffer — type here.\n// The editor edit
 
 /// One open document in the editor surface: the editable rope [`Buffer`]
 /// (EDITOR-2) paired with the [`EditorView`] widget state (EDITOR-3, the caret /
-/// selection / scroll / wrap).
+/// selection / scroll / wrap) and — when the file's extension maps to a
+/// vendored grammar — its tree-sitter [`Highlighter`] (EDITOR-5).
 struct Doc {
     /// The editable document model.
     buffer: Buffer,
     /// The widget state rendering + editing it.
     view: EditorView,
+    /// The syntax highlighter, or `None` for plain text (unknown extension /
+    /// a pathless scratch buffer) — the honest no-highlight render (§7).
+    highlight: Option<Highlighter>,
 }
 
 impl Doc {
-    /// Wrap a freshly built buffer in a new view.
+    /// Wrap a freshly built buffer in a new view, picking the highlighter by
+    /// the buffer's file extension (none for scratch/unknown — plain text).
     fn new(buffer: Buffer) -> Self {
+        let highlight = buffer.path().and_then(Highlighter::for_path);
         Self {
             buffer,
             view: EditorView::new(),
+            highlight,
         }
     }
 }
@@ -301,8 +309,9 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
         };
         doc_chrome(ui, doc, &mut surface.show_tree);
         ui.separator();
-        // Disjoint field borrows: the widget edits `&mut view` + `&mut buffer`.
-        editor_widget(ui, &mut doc.view, &mut doc.buffer);
+        // Disjoint field borrows: the widget edits `&mut view` + `&mut buffer`
+        // and syncs `&mut highlight` with this frame's edits (EDITOR-5).
+        editor_widget(ui, &mut doc.view, &mut doc.buffer, doc.highlight.as_mut());
     });
 
     // EDITOR-7 — the finder + palette overlays float above the body (rendered last
@@ -360,6 +369,9 @@ fn doc_chrome(ui: &mut Ui, doc: &mut Doc, show_tree: &mut bool) {
     let lossy = doc.buffer.is_lossy();
     let (line, col) = doc.view.line_col(&doc.buffer);
     let wrap_on = doc.view.wrap();
+    // The detected language (EDITOR-5) — honest chrome: shown only when a real
+    // grammar is highlighting this document, absent for plain text.
+    let lang = doc.highlight.as_ref().map(|hl| hl.language().name());
     let mut toggle_wrap = false;
 
     ui.add_space(Style::SP_XS);
@@ -381,7 +393,7 @@ fn doc_chrome(ui: &mut Ui, doc: &mut Doc, show_tree: &mut bool) {
                     .color(Style::WARN),
             );
         }
-        // Right-aligned: the wrap toggle + the caret position.
+        // Right-aligned: the wrap toggle + the caret position + the language.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(Style::SP_S);
             ui.label(
@@ -389,6 +401,14 @@ fn doc_chrome(ui: &mut Ui, doc: &mut Doc, show_tree: &mut bool) {
                     .size(Style::SMALL)
                     .color(Style::TEXT_DIM),
             );
+            if let Some(lang) = lang {
+                ui.add_space(Style::SP_M);
+                ui.label(
+                    RichText::new(lang)
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+            }
             ui.add_space(Style::SP_M);
             if ui
                 .selectable_label(wrap_on, RichText::new("Wrap").size(Style::SMALL))
@@ -578,6 +598,32 @@ mod tests {
         assert!(
             hint.contains("open") && hint.contains("edit"),
             "the hint should tell the operator to open a file to edit"
+        );
+    }
+
+    #[test]
+    fn opening_a_source_file_attaches_its_highlighter() {
+        // EDITOR-5 — the open-path seam picks the grammar by extension; a
+        // pathless scratch buffer honestly stays plain.
+        let d = TempDir::new("hl");
+        let file = d.join("lib.rs");
+        std::fs::write(&file, b"fn f() {}\n").expect("write");
+
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+        assert!(
+            surface.doc.as_ref().expect("doc").highlight.is_some(),
+            "a .rs file gets the rust highlighter"
+        );
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the highlighted document renders"
+        );
+
+        surface.open_scratch();
+        assert!(
+            surface.doc.as_ref().expect("doc").highlight.is_none(),
+            "a pathless scratch buffer renders plain (no guessed grammar)"
         );
     }
 

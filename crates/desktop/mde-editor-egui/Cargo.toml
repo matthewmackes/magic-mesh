@@ -50,6 +50,23 @@ mde-egui = { path = "../../shared/mde-egui" }
 # the `1.x` line like the repo's other loose pins.
 ropey = "1"
 
+# EDITOR-5 tree-sitter highlighting: the incremental parser core + the grammar
+# set the design doc locks (rust, python, js/ts, json, toml, markdown, bash).
+# These are C-via-cc crates; the farm's gcc compiles each grammar's parser.c
+# once and the incremental API keeps per-keystroke work O(edit), never a
+# full-file reparse. `streaming-iterator` is the trait tree-sitter 0.25's
+# QueryCaptures iterates through (not re-exported by the core crate).
+tree-sitter = "0.25"
+streaming-iterator = "0.1"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-json = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-md = "0.3"
+tree-sitter-bash = "0.23"
+
 [dev-dependencies]
 # EDITOR-2 buffer tests write + read real files (the open round-trip and the
 # save-changes-the-on-disk-bytes checks) through a throwaway tempdir — the same

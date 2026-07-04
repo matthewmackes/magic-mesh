@@ -27,6 +27,12 @@
 //!   restore the text and return a cursor-position hint. History is bounded.
 //! * **Save** — [`Buffer::save`] / [`Buffer::save_as`] stream the rope to disk
 //!   (the on-disk bytes actually change) and clear the dirty flag.
+//! * **Edit deltas** (EDITOR-5) — every rope mutation (insert, remove, and each
+//!   op an undo/redo replays) records an [`EditDelta`] in tree-sitter's
+//!   `InputEdit` shape; [`Buffer::take_edits`] drains them so the highlighter
+//!   re-parses **incrementally** (`Tree::edit` + reparse), never a full-file
+//!   pass per keystroke. The queue is bounded: on overflow the drain reports
+//!   `None` and the consumer does one full reparse.
 
 // `module_name_repetitions`: `Buffer` is the domain name for this module's one
 // public type; renaming it to avoid echoing the `buffer` module would be worse.
@@ -49,6 +55,115 @@ use ropey::Rope;
 /// limit while still covering any realistic undo reach.
 const HISTORY_LIMIT: usize = 256;
 
+/// Upper bound on pending [`EditDelta`]s held for the highlighter. When nothing
+/// drains the ledger (a plain-text buffer with no highlighter attached, or a
+/// massive scripted edit run between frames), the ledger overflows instead of
+/// growing without limit — the consumer then does one full reparse.
+const EDIT_LEDGER_LIMIT: usize = 1024;
+
+/// One rope mutation in tree-sitter's `InputEdit` shape (EDITOR-5).
+///
+/// Byte offsets plus `(row, byte-column)` points for the edit's start, its old
+/// end, and its new end. Recorded by **every** rope mutation — insert, remove,
+/// and each op an undo/redo replays — so an incremental re-parser can splice
+/// its old tree instead of re-reading the whole document per keystroke.
+///
+/// Kept toolkit-free (plain `usize` tuples, no tree-sitter types) so the buffer
+/// stays a pure data structure; the highlight engine converts to `InputEdit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditDelta {
+    /// Byte offset where the edit begins.
+    pub start_byte: usize,
+    /// Byte offset one past the replaced span, in the **old** text.
+    pub old_end_byte: usize,
+    /// Byte offset one past the inserted span, in the **new** text.
+    pub new_end_byte: usize,
+    /// `(row, byte-column)` of the edit start.
+    pub start_point: (usize, usize),
+    /// `(row, byte-column)` one past the replaced span, in the old text.
+    pub old_end_point: (usize, usize),
+    /// `(row, byte-column)` one past the inserted span, in the new text.
+    pub new_end_point: (usize, usize),
+}
+
+/// The bounded pending-delta queue between the buffer and its highlighter.
+///
+/// Deltas accumulate here on every mutation and are drained by
+/// [`Buffer::take_edits`]. Past [`EDIT_LEDGER_LIMIT`] the ledger flips to
+/// `overflowed` and drops its backlog: the next drain reports the overflow so
+/// the consumer performs one full reparse instead of replaying a huge tail.
+#[derive(Default)]
+struct EditLedger {
+    deltas: Vec<EditDelta>,
+    overflowed: bool,
+}
+
+impl EditLedger {
+    /// Queue one delta, flipping to overflow at the cap.
+    fn push(&mut self, delta: EditDelta) {
+        if self.overflowed {
+            return;
+        }
+        if self.deltas.len() >= EDIT_LEDGER_LIMIT {
+            self.overflowed = true;
+            self.deltas.clear();
+            return;
+        }
+        self.deltas.push(delta);
+    }
+
+    /// Drain: `Some(deltas)` to replay incrementally, `None` when the ledger
+    /// overflowed (full reparse required). Either way the ledger resets.
+    fn take(&mut self) -> Option<Vec<EditDelta>> {
+        if std::mem::take(&mut self.overflowed) {
+            self.deltas.clear();
+            return None;
+        }
+        Some(std::mem::take(&mut self.deltas))
+    }
+}
+
+/// The `(byte offset, (row, byte-column))` of char index `char_idx` — the
+/// tree-sitter-shaped coordinates of one buffer position (O(log n)).
+fn byte_point(rope: &Rope, char_idx: usize) -> (usize, (usize, usize)) {
+    let byte = rope.char_to_byte(char_idx);
+    let row = rope.char_to_line(char_idx);
+    (byte, (row, byte - rope.line_to_byte(row)))
+}
+
+/// THE insert primitive: splice `text` into `rope` at char `at`, recording the
+/// [`EditDelta`] onto `ledger`. Every insertion — direct edits and undo/redo
+/// replays — funnels through here so no rope mutation escapes the ledger.
+fn splice_insert(rope: &mut Rope, ledger: &mut EditLedger, at: usize, text: &str) {
+    let (start_byte, start_point) = byte_point(rope, at);
+    rope.insert(at, text);
+    let (new_end_byte, new_end_point) = byte_point(rope, at + text.chars().count());
+    ledger.push(EditDelta {
+        start_byte,
+        old_end_byte: start_byte,
+        new_end_byte,
+        start_point,
+        old_end_point: start_point,
+        new_end_point,
+    });
+}
+
+/// THE remove primitive: cut the char `range` out of `rope`, recording the
+/// [`EditDelta`] onto `ledger` (the counterpart of [`splice_insert`]).
+fn splice_remove(rope: &mut Rope, ledger: &mut EditLedger, range: Range<usize>) {
+    let (start_byte, start_point) = byte_point(rope, range.start);
+    let (old_end_byte, old_end_point) = byte_point(rope, range.end);
+    rope.remove(range);
+    ledger.push(EditDelta {
+        start_byte,
+        old_end_byte,
+        new_end_byte: start_byte,
+        start_point,
+        old_end_point,
+        new_end_point: start_point,
+    });
+}
+
 /// One reversible edit against the rope, stored so it can be replayed (redo) or
 /// inverted (undo). `Remove` keeps the removed text so undo can re-insert it.
 enum EditOp {
@@ -59,20 +174,25 @@ enum EditOp {
 }
 
 impl EditOp {
-    /// Re-apply this edit forward (used by redo).
-    fn apply(&self, rope: &mut Rope) {
+    /// Re-apply this edit forward (used by redo), recording its delta.
+    fn apply(&self, rope: &mut Rope, ledger: &mut EditLedger) {
         match self {
-            Self::Insert { at, text } => rope.insert(*at, text),
-            Self::Remove { at, text } => rope.remove(*at..*at + text.chars().count()),
+            Self::Insert { at, text } => splice_insert(rope, ledger, *at, text),
+            Self::Remove { at, text } => {
+                splice_remove(rope, ledger, *at..*at + text.chars().count());
+            }
         }
     }
 
-    /// Apply this edit's inverse (used by undo): an insert becomes a remove of
-    /// the same span, a remove becomes an insert of the removed text.
-    fn invert(&self, rope: &mut Rope) {
+    /// Apply this edit's inverse (used by undo), recording its delta: an insert
+    /// becomes a remove of the same span, a remove becomes an insert of the
+    /// removed text.
+    fn invert(&self, rope: &mut Rope, ledger: &mut EditLedger) {
         match self {
-            Self::Insert { at, text } => rope.remove(*at..*at + text.chars().count()),
-            Self::Remove { at, text } => rope.insert(*at, text),
+            Self::Insert { at, text } => {
+                splice_remove(rope, ledger, *at..*at + text.chars().count());
+            }
+            Self::Remove { at, text } => splice_insert(rope, ledger, *at, text),
         }
     }
 }
@@ -84,12 +204,18 @@ impl EditOp {
 fn coalesces(prev: &EditOp, next: &EditOp) -> bool {
     match (prev, next) {
         (
-            EditOp::Insert { at: prev_start, text: prev_text },
+            EditOp::Insert {
+                at: prev_start,
+                text: prev_text,
+            },
             EditOp::Insert { at: next_start, .. },
         ) => *next_start == *prev_start + prev_text.chars().count(),
         (
             EditOp::Remove { at: prev_start, .. },
-            EditOp::Remove { at: next_start, text: next_text },
+            EditOp::Remove {
+                at: next_start,
+                text: next_text,
+            },
         ) => *next_start == *prev_start || *next_start + next_text.chars().count() == *prev_start,
         _ => false,
     }
@@ -148,24 +274,25 @@ impl History {
         self.open = false;
     }
 
-    /// Undo the newest group, mutating `rope`; returns its `cursor_before` hint.
-    fn undo(&mut self, rope: &mut Rope) -> Option<usize> {
+    /// Undo the newest group, mutating `rope` (deltas onto `ledger`); returns
+    /// its `cursor_before` hint.
+    fn undo(&mut self, rope: &mut Rope, ledger: &mut EditLedger) -> Option<usize> {
         self.open = false;
         let group = self.undo.pop()?;
         for op in group.ops.iter().rev() {
-            op.invert(rope);
+            op.invert(rope, ledger);
         }
         let cursor = group.cursor_before;
         self.redo.push(group);
         Some(cursor)
     }
 
-    /// Redo the most recently undone group, mutating `rope`; returns its
-    /// `cursor_after` hint.
-    fn redo(&mut self, rope: &mut Rope) -> Option<usize> {
+    /// Redo the most recently undone group, mutating `rope` (deltas onto
+    /// `ledger`); returns its `cursor_after` hint.
+    fn redo(&mut self, rope: &mut Rope, ledger: &mut EditLedger) -> Option<usize> {
         let group = self.redo.pop()?;
         for op in &group.ops {
-            op.apply(rope);
+            op.apply(rope, ledger);
         }
         let cursor = group.cursor_after;
         self.open = false;
@@ -186,6 +313,7 @@ pub struct Buffer {
     dirty: bool,
     lossy: bool,
     history: History,
+    edits: EditLedger,
 }
 
 impl Buffer {
@@ -198,6 +326,7 @@ impl Buffer {
             dirty: false,
             lossy: false,
             history: History::default(),
+            edits: EditLedger::default(),
         }
     }
 
@@ -211,6 +340,7 @@ impl Buffer {
             dirty: false,
             lossy: false,
             history: History::default(),
+            edits: EditLedger::default(),
         }
     }
 
@@ -236,6 +366,7 @@ impl Buffer {
             dirty: false,
             lossy,
             history: History::default(),
+            edits: EditLedger::default(),
         })
     }
 
@@ -316,7 +447,7 @@ impl Buffer {
         if text.is_empty() {
             return;
         }
-        self.rope.insert(char_idx, text);
+        splice_insert(&mut self.rope, &mut self.edits, char_idx, text);
         let after = char_idx + text.chars().count();
         self.history.record(
             EditOp::Insert {
@@ -342,9 +473,27 @@ impl Buffer {
             return;
         }
         let removed = self.rope.slice(start..end).to_string();
-        self.rope.remove(start..end);
-        self.history.record(EditOp::Remove { at: start, text: removed }, end, start);
+        splice_remove(&mut self.rope, &mut self.edits, start..end);
+        self.history.record(
+            EditOp::Remove {
+                at: start,
+                text: removed,
+            },
+            end,
+            start,
+        );
         self.dirty = true;
+    }
+
+    /// Drain the [`EditDelta`]s recorded since the last drain — the seam an
+    /// incremental highlighter syncs its tree through (EDITOR-5).
+    ///
+    /// `Some(deltas)` (possibly empty) replays incrementally in order; `None`
+    /// means the ledger overflowed (more than [`EDIT_LEDGER_LIMIT`] mutations
+    /// piled up undrained), so the consumer must re-parse from scratch. Either
+    /// way the ledger is reset.
+    pub fn take_edits(&mut self) -> Option<Vec<EditDelta>> {
+        self.edits.take()
     }
 
     /// Close the current undo group. The next edit starts a fresh group even if
@@ -358,7 +507,7 @@ impl Buffer {
     /// cursor-position hint (the char index the caret sat at before the group),
     /// or `None` if there is nothing to undo.
     pub fn undo(&mut self) -> Option<usize> {
-        let cursor = self.history.undo(&mut self.rope)?;
+        let cursor = self.history.undo(&mut self.rope, &mut self.edits)?;
         self.dirty = true;
         Some(cursor)
     }
@@ -367,7 +516,7 @@ impl Buffer {
     /// cursor-position hint (the char index the caret ended at), or `None` if
     /// there is nothing to redo.
     pub fn redo(&mut self) -> Option<usize> {
-        let cursor = self.history.redo(&mut self.rope)?;
+        let cursor = self.history.redo(&mut self.rope, &mut self.edits)?;
         self.dirty = true;
         Some(cursor)
     }
@@ -482,8 +631,8 @@ mod tests {
         let mut buf = Buffer::from_text("abc");
         buf.insert(0, "");
         buf.remove(2..2); // empty range
-        // A reversed range (start > end) is also a no-op; build it from values so
-        // it isn't a lint-visible literal reversed range.
+                          // A reversed range (start > end) is also a no-op; build it from values so
+                          // it isn't a lint-visible literal reversed range.
         let (hi, lo) = (3_usize, 1_usize);
         buf.remove(hi..lo);
         assert_eq!(buf.rope().to_string(), "abc");
@@ -533,7 +682,11 @@ mod tests {
         assert_eq!(buf.rope().to_string(), "abcd");
 
         buf.undo();
-        assert_eq!(buf.rope().to_string(), "ab", "first undo drops only the second group");
+        assert_eq!(
+            buf.rope().to_string(),
+            "ab",
+            "first undo drops only the second group"
+        );
         buf.undo();
         assert_eq!(buf.rope().to_string(), "");
         assert!(!buf.can_undo());
@@ -549,7 +702,11 @@ mod tests {
         assert!(buf.can_undo());
 
         buf.undo();
-        assert_eq!(buf.rope().to_string(), "abc", "three backspaces undo together");
+        assert_eq!(
+            buf.rope().to_string(),
+            "abc",
+            "three backspaces undo together"
+        );
         assert!(!buf.can_undo(), "the run was a single group");
     }
 
@@ -589,7 +746,11 @@ mod tests {
         assert!(buf.path().is_none());
 
         buf.save_as(&target).expect("save_as");
-        assert_eq!(buf.path(), Some(target.as_path()), "save_as adopts the path");
+        assert_eq!(
+            buf.path(),
+            Some(target.as_path()),
+            "save_as adopts the path"
+        );
         assert!(!buf.is_dirty());
         assert_eq!(std::fs::read(&target).expect("read back"), b"x\n");
     }
@@ -599,6 +760,90 @@ mod tests {
         let mut buf = Buffer::from_text("scratch");
         let err = buf.save().expect_err("scratch buffer has no path");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    // ── EDITOR-5: edit deltas for the incremental highlighter ────────────────
+
+    #[test]
+    fn insert_records_a_byte_and_point_delta_across_lines_and_multibyte() {
+        let mut buf = Buffer::from_text("ab\ncd");
+        buf.take_edits().expect("fresh ledger drains empty");
+
+        // Insert a multi-byte, multi-line snippet before the final 'd' (char 4 =
+        // byte 4, line 1 col 1). "xé\nz" is 4 chars / 5 bytes with one newline.
+        buf.insert(4, "xé\nz");
+
+        let deltas = buf.take_edits().expect("no overflow");
+        assert_eq!(deltas.len(), 1);
+        let d = deltas[0];
+        assert_eq!(d.start_byte, 4);
+        assert_eq!(d.old_end_byte, 4, "an insert replaces nothing");
+        assert_eq!(d.new_end_byte, 9, "5 inserted BYTES (é is 2)");
+        assert_eq!(d.start_point, (1, 1));
+        assert_eq!(d.old_end_point, (1, 1));
+        assert_eq!(
+            d.new_end_point,
+            (2, 1),
+            "the newline in the insert lands the new end on row 2 byte-col 1"
+        );
+    }
+
+    #[test]
+    fn remove_records_the_replaced_span_and_collapses_to_the_start() {
+        let mut buf = Buffer::from_text("ab\ncxé\nzd");
+        buf.take_edits().expect("drain the empty ledger");
+
+        // Cut chars 4..8 ("xé\nz") — the exact inverse of the insert above.
+        buf.remove(4..8);
+
+        let deltas = buf.take_edits().expect("no overflow");
+        assert_eq!(deltas.len(), 1);
+        let d = deltas[0];
+        assert_eq!(d.start_byte, 4);
+        assert_eq!(d.old_end_byte, 9, "the removed span was 5 bytes");
+        assert_eq!(d.new_end_byte, 4, "a remove inserts nothing");
+        assert_eq!(d.start_point, (1, 1));
+        assert_eq!(d.old_end_point, (2, 1));
+        assert_eq!(d.new_end_point, (1, 1));
+    }
+
+    #[test]
+    fn undo_and_redo_record_deltas_too() {
+        let mut buf = Buffer::from_text("abc");
+        buf.insert(3, "X");
+        buf.take_edits().expect("drain the insert");
+
+        buf.undo();
+        let undo_deltas = buf.take_edits().expect("no overflow");
+        assert_eq!(undo_deltas.len(), 1, "the undo's remove was recorded");
+        assert_eq!(undo_deltas[0].old_end_byte, 4);
+        assert_eq!(undo_deltas[0].new_end_byte, 3);
+
+        buf.redo();
+        let redo_deltas = buf.take_edits().expect("no overflow");
+        assert_eq!(redo_deltas.len(), 1, "the redo's insert was recorded");
+        assert_eq!(redo_deltas[0].old_end_byte, 3);
+        assert_eq!(redo_deltas[0].new_end_byte, 4);
+    }
+
+    #[test]
+    fn an_undrained_ledger_overflows_to_a_full_reparse_signal() {
+        let mut buf = Buffer::from_text("");
+        // Far past the cap without a drain (a highlighter-less buffer's life).
+        for i in 0..1_500 {
+            buf.insert(i, "a");
+        }
+        assert_eq!(
+            buf.take_edits(),
+            None,
+            "an overflowed ledger reports None (full reparse)"
+        );
+        // The overflow drained + reset the ledger: recording works again.
+        buf.insert(0, "b");
+        let deltas = buf
+            .take_edits()
+            .expect("post-overflow ledger records again");
+        assert_eq!(deltas.len(), 1);
     }
 
     #[test]

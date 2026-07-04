@@ -24,8 +24,14 @@
 //!
 //! Multi-cursor + column selection land here (EDITOR-4): the single `(caret,
 //! anchor)` generalizes to a `Vec` of carets, every edit fans out across all of
-//! them, and overlapping carets merge. Tree-sitter highlighting + the fuzzy
-//! finder follow in EDITOR-5+.
+//! them, and overlapping carets merge.
+//!
+//! Syntax highlighting lands here too (EDITOR-5): [`editor_widget`] takes the
+//! document's optional [`Highlighter`], syncs it with this frame's edits
+//! (incremental re-parse via the buffer's edit deltas), resolves the **visible**
+//! window's [`HighlightSpan`]s once, and the row paint draws each line span by
+//! span in its Carbon code-token color ([`mde_egui::code`], §4) — viewport
+//! culling intact, only on-screen glyphs get styled draws.
 
 // `EditorView` is the domain name for this module's widget-state type; renaming
 // it to dodge the `widget` echo would be worse (the same call `buffer.rs` makes).
@@ -54,12 +60,13 @@ use std::ops::Range;
 use std::time::Duration;
 
 use mde_egui::egui::{
-    self, pos2, vec2, Align2, Event, EventFilter, FontId, Key, Modifiers, Pos2, Rect, Response,
-    ScrollArea, Sense, Stroke, Ui,
+    self, pos2, vec2, Align2, Color32, Event, EventFilter, FontId, Key, Modifiers, Pos2, Rect,
+    Response, ScrollArea, Sense, Stroke, Ui,
 };
 use mde_egui::Style;
 
 use crate::buffer::Buffer;
+use crate::highlight::{HighlightSpan, Highlighter};
 
 /// Soft-tab width: a Tab keypress inserts this many spaces (the editor is
 /// spaces-by-default, the common Rust convention). Not a metric — a text unit.
@@ -1167,7 +1174,13 @@ impl EditorView {
 
     /// Horizontal motion for every caret: by word when `cmd`, extending on
     /// `shift`, in the `forward` direction. Always reports a change.
-    fn move_horizontal(&mut self, buffer: &mut Buffer, cmd: bool, shift: bool, forward: bool) -> bool {
+    fn move_horizontal(
+        &mut self,
+        buffer: &mut Buffer,
+        cmd: bool,
+        shift: bool,
+        forward: bool,
+    ) -> bool {
         buffer.commit_group();
         self.group_open = false;
         let len = buffer.len_chars();
@@ -1219,7 +1232,10 @@ impl EditorView {
     /// unwrapped (one row per line) and wrapped (many rows per line) paths.
     fn vis_row(&self, buffer: &Buffer, vr: usize, cols: usize) -> VisRow {
         if self.wrap {
-            let line = self.wrap_map.line_at(vr).min(buffer.len_lines().saturating_sub(1));
+            let line = self
+                .wrap_map
+                .line_at(vr)
+                .min(buffer.len_lines().saturating_sub(1));
             let base = self.wrap_map.row_of(line);
             let sub = vr.saturating_sub(base);
             let line_start = buffer.line_to_char(line);
@@ -1275,15 +1291,23 @@ impl EditorView {
 }
 
 /// Render + edit an open [`Buffer`](crate::buffer::Buffer) through its
-/// [`EditorView`] — the one egui entry point for the code editor (EDITOR-3/4).
+/// [`EditorView`] — the one egui entry point for the code editor (EDITOR-3/4/5).
 ///
 /// Fills the available space with a scroll area, paints only the visible rows
 /// (viewport culling), maps the pointer to a rope char index for click/drag/
 /// double-/triple-/Alt-click/Alt-drag selection, routes this frame's key events
 /// into the view, and draws the gutter + text + selections + carets through
-/// [`Style`] tokens (§4). Returns the content [`Response`] so the surface can
-/// observe focus/hover.
-pub fn editor_widget(ui: &mut Ui, view: &mut EditorView, buffer: &mut Buffer) -> Response {
+/// [`Style`] tokens (§4). `highlight` is the document's syntax highlighter
+/// (EDITOR-5) or `None` for plain text: when present it is synced with this
+/// frame's edits (incremental re-parse) and the visible rows paint span by span
+/// in their code-token colors. Returns the content [`Response`] so the surface
+/// can observe focus/hover.
+pub fn editor_widget(
+    ui: &mut Ui,
+    view: &mut EditorView,
+    buffer: &mut Buffer,
+    highlight: Option<&mut Highlighter>,
+) -> Response {
     view.clamp(buffer);
 
     let font = body_font();
@@ -1318,18 +1342,19 @@ pub fn editor_widget(ui: &mut Ui, view: &mut EditorView, buffer: &mut Buffer) ->
         .auto_shrink([false, false])
         .drag_to_scroll(false)
         .show(ui, |ui| {
-            editor_body(ui, view, buffer, metrics, wrap_cols, total_rows)
+            editor_body(ui, view, buffer, highlight, metrics, wrap_cols, total_rows)
         })
         .inner
 }
 
 /// The scroll-area body: allocate the virtual content, handle input, paint the
 /// visible rows. Split out of [`editor_widget`] so each half stays legible.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn editor_body(
     ui: &mut Ui,
     view: &mut EditorView,
     buffer: &mut Buffer,
+    highlight: Option<&mut Highlighter>,
     m: Metrics,
     wrap_cols: usize,
     total_rows: usize,
@@ -1381,9 +1406,29 @@ fn editor_body(
         let row = view.vis_row(buffer, vr, wrap_cols);
         view.max_line_chars = view.max_line_chars.max(line_len(buffer, row.line));
     }
-    view.max_line_chars = view.max_line_chars.max(line_len(buffer, view.cur_line(buffer)));
+    view.max_line_chars = view
+        .max_line_chars
+        .max(line_len(buffer, view.cur_line(buffer)));
 
-    paint(ui, view, buffer, m, origin, first, last, wrap_cols, &resp);
+    // EDITOR-5 — bring the syntax tree up to date with this frame's edits
+    // (incremental: the buffer's edit deltas splice the old tree, no full-file
+    // reparse per keystroke), then resolve the highlight spans for just the
+    // VISIBLE window once — the query cost scales with the viewport, matching
+    // the paint culling. Plain-text documents pass `None` and skip all of it.
+    let spans = highlight.map_or_else(Vec::new, |hl| {
+        hl.sync(buffer);
+        if first < last {
+            let w_start = view.vis_row(buffer, first, wrap_cols).start;
+            let w_end = view.vis_row(buffer, last - 1, wrap_cols).end;
+            hl.spans_in(buffer.rope(), w_start..w_end)
+        } else {
+            Vec::new()
+        }
+    });
+
+    paint(
+        ui, view, buffer, m, origin, first, last, wrap_cols, &resp, &spans,
+    );
 
     // Reveal the primary caret exactly once after a move/edit (don't fight scroll).
     if std::mem::take(&mut view.reveal_caret) {
@@ -1541,8 +1586,9 @@ fn handle_keys(resp: &Response, ui: &Ui, view: &mut EditorView, buffer: &mut Buf
 }
 
 /// Paint the visible rows: current-line highlight (per caret line), selection
-/// bands (per caret), gutter numbers, text glyphs, and the blinking carets — all
-/// through [`Style`] tokens (§4).
+/// bands (per caret), gutter numbers, text glyphs (span-sliced into their code-
+/// token colors when `spans` is non-empty, EDITOR-5), and the blinking carets —
+/// all through [`Style`]/[`mde_egui::code`] tokens (§4).
 #[allow(clippy::too_many_arguments)]
 fn paint(
     ui: &Ui,
@@ -1554,6 +1600,7 @@ fn paint(
     last: usize,
     wrap_cols: usize,
     resp: &Response,
+    spans: &[HighlightSpan],
 ) {
     let clip = ui.clip_rect();
     let painter = ui.painter_at(clip);
@@ -1569,6 +1616,11 @@ fn paint(
         .map(|c| buffer.char_to_line(c.cursor.min(len)))
         .collect();
     let selections = view.selections();
+
+    // Rows ascend through the document, so one monotonic index walks the sorted
+    // span list across the whole paint (a span crossing a row break — a block
+    // comment — is not passed until every row it covers has painted).
+    let mut span_idx = 0usize;
 
     for vr in first..last {
         let row = view.vis_row(buffer, vr, wrap_cols);
@@ -1590,21 +1642,124 @@ fn paint(
             paint_selection(&text_painter, &row, sel, text_x0, y, m);
         }
 
-        // Row text (materializes only this slice, never the whole document).
-        if row.end > row.start {
-            let text = buffer.rope().slice(row.start..row.end).to_string();
-            text_painter.text(
-                pos2(text_x0, y),
-                Align2::LEFT_TOP,
-                text,
-                body_font(),
+        // Row text, span-sliced into code-token colors (EDITOR-5; plain rows —
+        // no highlighter or no captures — paint as one foreground run). Only
+        // this row's slices materialize, never the whole document.
+        while span_idx < spans.len() && spans[span_idx].range.end <= row.start {
+            span_idx += 1;
+        }
+        paint_row_text(
+            &text_painter,
+            buffer,
+            &row,
+            &spans[span_idx..],
+            text_x0,
+            y,
+            m,
+        );
+    }
+
+    paint_gutter(
+        &painter,
+        view,
+        buffer,
+        m,
+        origin,
+        clip,
+        first,
+        last,
+        wrap_cols,
+        &caret_lines,
+    );
+    paint_carets(&text_painter, ui, view, buffer, m, origin, wrap_cols, resp);
+}
+
+/// Paint one visual row's glyphs, sliced by the highlight `spans` that overlap
+/// it (EDITOR-5): gaps between spans draw as plain foreground text, each span
+/// draws in its [`CodeToken`](mde_egui::code::CodeToken) color at its monospace
+/// column offset. `spans` starts at the first span that may still overlap this
+/// row (the caller's monotonic walk); iteration stops at the first span past
+/// the row's end, so per-row cost tracks the row's own span count.
+fn paint_row_text(
+    painter: &egui::Painter,
+    buffer: &Buffer,
+    row: &VisRow,
+    spans: &[HighlightSpan],
+    text_x0: f32,
+    y: f32,
+    m: Metrics,
+) {
+    if row.end <= row.start {
+        return;
+    }
+    let mut cursor = row.start;
+    for span in spans {
+        if span.range.start >= row.end {
+            break;
+        }
+        let start = span.range.start.max(cursor).min(row.end);
+        let end = span.range.end.min(row.end);
+        if end <= cursor {
+            continue;
+        }
+        if start > cursor {
+            draw_slice(
+                painter,
+                buffer,
+                row,
+                cursor..start,
+                text_x0,
+                y,
+                m,
                 Style::TEXT,
             );
         }
+        draw_slice(
+            painter,
+            buffer,
+            row,
+            start..end,
+            text_x0,
+            y,
+            m,
+            span.token.color(),
+        );
+        cursor = end;
     }
+    if cursor < row.end {
+        draw_slice(
+            painter,
+            buffer,
+            row,
+            cursor..row.end,
+            text_x0,
+            y,
+            m,
+            Style::TEXT,
+        );
+    }
+}
 
-    paint_gutter(&painter, view, buffer, m, origin, clip, first, last, wrap_cols, &caret_lines);
-    paint_carets(&text_painter, ui, view, buffer, m, origin, wrap_cols, resp);
+/// Paint one contiguous char slice of a visual row at its monospace column
+/// offset in `color` — the shared draw for plain gaps and highlight spans.
+#[allow(clippy::too_many_arguments)]
+fn draw_slice(
+    painter: &egui::Painter,
+    buffer: &Buffer,
+    row: &VisRow,
+    chars: Range<usize>,
+    text_x0: f32,
+    y: f32,
+    m: Metrics,
+    color: Color32,
+) {
+    if chars.start >= chars.end {
+        return;
+    }
+    let text = buffer.rope().slice(chars.clone()).to_string();
+    #[allow(clippy::cast_precision_loss)]
+    let x = text_x0 + (chars.start - row.start) as f32 * m.glyph_w;
+    painter.text(pos2(x, y), Align2::LEFT_TOP, text, body_font(), color);
 }
 
 /// Paint the selection band for one visual row, with a trailing hint when the
@@ -1833,7 +1988,11 @@ mod tests {
         view.apply_event(&mut buf, &key(Key::ArrowDown, Modifiers::NONE), 10);
         assert_eq!(view.line_col(&buf), (2, 3), "clamped to the short line end");
         view.apply_event(&mut buf, &key(Key::ArrowDown, Modifiers::NONE), 10);
-        assert_eq!(view.line_col(&buf), (3, 6), "goal column restored on line 2");
+        assert_eq!(
+            view.line_col(&buf),
+            (3, 6),
+            "goal column restored on line 2"
+        );
     }
 
     // ── selection (EDITOR-3) ─────────────────────────────────────────────────
@@ -1979,7 +2138,7 @@ mod tests {
         let mut buf = Buffer::from_text("aaa\nbbb\nccc");
         let mut view = EditorView::new();
         view.place_cursor(&buf, 1); // line 0, col 1
-        // Ctrl+Alt+Down adds a caret on line 1 at the same column, made primary.
+                                    // Ctrl+Alt+Down adds a caret on line 1 at the same column, made primary.
         view.apply_event(&mut buf, &key(Key::ArrowDown, cmd_alt()), 10);
         assert_eq!(view.carets.len(), 2);
         assert_eq!(view.cursor(), 5, "line 1 col 1");
@@ -1993,7 +2152,11 @@ mod tests {
         // Add-above from the bottom caret re-lands on line 1 → merges with the
         // existing caret there, so the count does not grow.
         view.apply_event(&mut buf, &key(Key::ArrowUp, cmd_alt()), 10);
-        assert_eq!(view.carets.len(), 3, "add-above onto an existing caret merges");
+        assert_eq!(
+            view.carets.len(),
+            3,
+            "add-above onto an existing caret merges"
+        );
     }
 
     #[test]
@@ -2001,10 +2164,14 @@ mod tests {
         let mut buf = Buffer::from_text("foo bar foo baz foo");
         let mut view = EditorView::new();
         view.place_cursor(&buf, 1); // inside the first "foo"
-        // First Ctrl+D selects the word.
+                                    // First Ctrl+D selects the word.
         view.apply_event(&mut buf, &key(Key::D, cmd()), 10);
         assert_eq!(view.carets.len(), 1);
-        assert_eq!(view.selection(), Some(0..3), "first Ctrl+D selects the word");
+        assert_eq!(
+            view.selection(),
+            Some(0..3),
+            "first Ctrl+D selects the word"
+        );
         // Second Ctrl+D adds a caret at the next "foo" (chars 8..11), now primary.
         view.apply_event(&mut buf, &key(Key::D, cmd()), 10);
         assert_eq!(view.carets.len(), 2);
@@ -2042,7 +2209,11 @@ mod tests {
         assert_eq!(buf.rope().to_string(), "Xa\nXb\nXc", "every caret inserted");
         // One undo reverts the whole fan-out and restores every caret.
         view.apply_event(&mut buf, &key(Key::Z, cmd()), 10);
-        assert_eq!(buf.rope().to_string(), "a\nb\nc", "one undo reverts the fan-out");
+        assert_eq!(
+            buf.rope().to_string(),
+            "a\nb\nc",
+            "one undo reverts the fan-out"
+        );
         assert_eq!(view.carets.len(), 3, "undo restored every caret");
         // Redo puts the text + carets back.
         view.apply_event(&mut buf, &key(Key::Y, cmd()), 10);
@@ -2083,7 +2254,11 @@ mod tests {
         view.primary = 1;
         // A no-op motion (Right without shift would move; use normalize directly).
         view.normalize();
-        assert_eq!(view.carets.len(), 1, "overlapping selections merged into one");
+        assert_eq!(
+            view.carets.len(),
+            1,
+            "overlapping selections merged into one"
+        );
         assert_eq!(view.selection(), Some(0..5));
         let _ = &mut buf;
     }
@@ -2121,11 +2296,14 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                editor_widget(ui, &mut view, &mut buf);
+                editor_widget(ui, &mut view, &mut buf, None);
             });
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-        assert!(!prims.is_empty(), "the editor widget produced no primitives");
+        assert!(
+            !prims.is_empty(),
+            "the editor widget produced no primitives"
+        );
     }
 
     #[test]
@@ -2145,11 +2323,52 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                editor_widget(ui, &mut view, &mut buf);
+                editor_widget(ui, &mut view, &mut buf, None);
             });
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-        assert!(!prims.is_empty(), "the multi-caret editor produced no primitives");
+        assert!(
+            !prims.is_empty(),
+            "the multi-caret editor produced no primitives"
+        );
+    }
+
+    #[test]
+    fn highlighted_widget_syncs_the_tree_and_paints() {
+        // EDITOR-5 end-to-end through the real widget frame: a rust buffer with a
+        // live highlighter paints, and the frame itself ran the highlighter's
+        // sync (the parse happened inside `editor_widget`, not in test setup).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut buf = Buffer::from_text("fn main() {\n    let s = \"hi\"; // c\n}\n");
+        let mut view = EditorView::new();
+        let mut hl = crate::highlight::Highlighter::new(crate::highlight::Language::Rust)
+            .expect("rust grammar loads");
+        assert_eq!(hl.full_parses(), 0, "no parse before the frame");
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor_widget(ui, &mut view, &mut buf, Some(&mut hl));
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the highlighted editor produced no primitives"
+        );
+        assert_eq!(
+            hl.full_parses(),
+            1,
+            "the widget frame ran the highlighter's initial sync"
+        );
+        // And the synced tree yields real spans over the visible text.
+        assert!(
+            !hl.spans_in(buf.rope(), 0..buf.len_chars()).is_empty(),
+            "the frame-synced highlighter captures the rust snippet"
+        );
     }
 
     #[test]
@@ -2168,11 +2387,14 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                editor_widget(ui, &mut view, &mut buf);
+                editor_widget(ui, &mut view, &mut buf, None);
             });
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-        assert!(!prims.is_empty(), "the wrapped editor produced no primitives");
+        assert!(
+            !prims.is_empty(),
+            "the wrapped editor produced no primitives"
+        );
         // The wrap map saw more visual rows than the single logical line.
         assert!(
             view.wrap_map.total() > 1,
