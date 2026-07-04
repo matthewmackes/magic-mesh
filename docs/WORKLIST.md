@@ -2819,6 +2819,18 @@ Design: `docs/design/editor.md` (operator-locked 2026-07-03, 2-round survey). Ro
 - [ ] **EDITOR-12: code folding + symbol outline.** **As** a developer, **I want** structure, **so that** I navigate big files. **Acceptance:** tree-sitter-driven fold regions (fold/unfold) + a symbol outline (functions/types) with jump; tested.
 
 #### Phase 2 — language intelligence (LSP) *(follow-on)*
+#### EDTB — the Word-97 toolbar (operator 2026-07-04; 10-Q survey; design: docs/design/editor-toolbar.md)
+
+Serialize behind EDITOR-5 (panel.rs/widget.rs contention); EDTB-1 establishes menu_bar.rs/toolbar.rs/md_actions.rs, then 2/3 extend.
+
+- [ ] **EDTB-1: menu bar + Standard toolbar core.** **As** a user, **I want** Word's chrome on the editor, **so that** it feels like a full app. **Acceptance:** `menu_bar.rs` (File/Edit/View/Insert/Format/Tools/Table/Help → real seams: file ops, clipboard, undo/redo, finder/palette, view toggles; no dead items — unbacked entries absent per lock #4) + `toolbar.rs` Standard strip (New/Open/Save/SaveAs/Cut/Copy/Paste/Undo/Redo/Find/Zoom, Word order, Carbon glyphs); zoom = editor-view scale; mounted above the editor in `panel.rs`; tested dispatch per control.
+- [ ] **EDTB-2: Formatting toolbar + markdown actions.** **As** a writer, **I want** B/I/U/styles/lists, **so that** formatting is one click. **Acceptance:** `md_actions.rs` pure edit engine (wrap-selection `**`/`*`/`<u>`, Style dropdown → `#` heading levels, `- `/`1. ` line-prefix toggles, indent shift) — multi-cursor aware, sane undo groups, unit-tested; the Formatting strip drives it (Word order).
+- [ ] **EDTB-3: Insert Table grid-picker + Font/Size global setting.** **As** a user, **I want** Word's table grid + font control, **so that** structure is easy. **Acceptance:** `table_picker.rs` hover rows×cols grid → md-table skeleton insert; Font+Size dropdowns write the persisted **platform** font/size (shell config + live apply via the mde-egui font install) — honest cross-crate wiring, not per-buffer.
+- [ ] **EDTB-4: compact-aware bars.** **As** a user, **I want** lean compact mode, **so that** space survives. **Acceptance:** expanded = menu + both toolbars; compact = menu bar only; follows the shell mode; tested.
+- [ ] **EDTB-5: Print via CUPS (P2).** **As** a user, **I want** to print, **so that** paper exists. **Acceptance:** Print pipes the buffer as formatted mono text to `lp` (honest error when no CUPS/printer); Print Preview paginates; the buttons appear only with this phase (lock #4).
+- [ ] **EDTB-6: Spelling via hunspell (P3).** **As** a writer, **I want** squiggles + F7, **so that** typos die. **Acceptance:** system hunspell (RPM `Requires`; shell-out `hunspell -a` acceptable) drives red squiggly underlines in the widget + an F7 walk dialog (suggest/replace/ignore); honest absent-state when hunspell is missing; md/text files first.
+- [ ] **EDTB-7: split markdown preview (P4).** **As** a writer, **I want** rendered output, **so that** markup reads as a document. **Acceptance:** View→Preview + toolbar toggle opens a side-by-side rendered pane (headings/bold/italic/lists/tables via Carbon text styles), live as you type; token-styled; tested render mapping.
+
 - [ ] **EDITOR-LSP-1: LSP client subsystem** — per-language server lifecycle, initialize/shutdown, document sync (glue over `lsp-types`/a tower-lsp client); reachable, honest gated state when no server.
 - [ ] **EDITOR-LSP-2: diagnostics + completion + hover** — gutter/inline diagnostics, completion popup, hover docs, signature help.
 - [ ] **EDITOR-LSP-3: goto-definition + find-references + rename + format** — cross-file navigation + workspace edits.
