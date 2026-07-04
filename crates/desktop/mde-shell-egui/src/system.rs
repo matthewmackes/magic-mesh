@@ -312,14 +312,13 @@ impl SystemState {
             let snap = snapshot.as_ref();
 
             // The master rail: the three domain groups + their section rows. A row
-            // click moves `nav` (persisted after the borrow). The per-domain accent
-            // tint + Carbon elevation layers are SETTINGS-2's pass — this unit is a
-            // plain expressive master-detail; the accent seam is the group header
-            // (see [`settings_rail`]).
+            // click moves `nav` (persisted after the borrow). Each group header wears
+            // its domain's categorical accent (SETTINGS-2 — see [`settings_rail`]); the
+            // rail rests on the Carbon layer-01 page (see [`page_frame`]).
             egui::SidePanel::left(ui.id().with("settings-rail"))
                 .resizable(false)
                 .exact_width(Style::SP_XL * 6.0)
-                .frame(egui::Frame::NONE.inner_margin(Style::SP_M))
+                .frame(page_frame(Style::SP_M))
                 .show_inside(ui, |ui| settings_rail(ui, nav));
 
             // The (possibly just-clicked) selection, copied out so the detail pane's
@@ -327,9 +326,11 @@ impl SystemState {
             let selected = nav.section;
 
             // The detail pane fills the remaining width and renders only the selected
-            // section's body — expressive spacing, the whole right side.
+            // section's body — expressive spacing, the whole right side. It rests on
+            // the same Carbon layer-01 page (SETTINGS-2); the section body raises to a
+            // layer-02 card inside (see [`settings_detail`]).
             egui::CentralPanel::default()
-                .frame(egui::Frame::NONE.inner_margin(Style::SP_L))
+                .frame(page_frame(Style::SP_L))
                 .show_inside(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
@@ -894,6 +895,24 @@ impl SettingsGroup {
         }
     }
 
+    /// This group's categorical **accent** (SETTINGS-2, design lock #2). REUSES the
+    /// shared `Style::ACCENT_*` categorical set — the ONE colour language the bottom
+    /// picker (PICKER-2) + the unit explorer (EXPLORER-15) already speak — so a
+    /// domain's tint here reads the same across the shell (§4; no second set minted).
+    /// Three mutually-distinct hues, each set apart from the interactive brand accent
+    /// so a group tint never reads as an affordance. The rail group header + the
+    /// active detail-section header both key off this.
+    const fn accent(self) -> egui::Color32 {
+        match self {
+            // Host devices / hardware — the picker's host-control gold.
+            Self::Devices => Style::ACCENT_SYSTEM,
+            // Appearance / personalization — the expressive magenta.
+            Self::Personalization => Style::ACCENT_MEDIA,
+            // Mesh identity / role / pairing / network — the mesh green.
+            Self::MeshSystem => Style::ACCENT_MESH,
+        }
+    }
+
     /// This group's sections, in rail order.
     const fn sections(self) -> &'static [SettingsSection] {
         match self {
@@ -1005,9 +1024,9 @@ impl SettingsNav {
 
 /// The master rail (SETTINGS-1): the three domain groups, each an expressive header
 /// over its selectable section rows. The active section is highlighted; a click
-/// moves `nav`. SEAM — SETTINGS-2 tints each group header + the active-row marker in
-/// the group's categorical accent (the shared `Style::ACCENT_*` set, §4); this unit
-/// stays plain.
+/// moves `nav`. SETTINGS-2 tints each group header in the group's categorical accent
+/// ([`SettingsGroup::accent`] — the shared `Style::ACCENT_*` set, §4), the one colour
+/// language PICKER-2 / EXPLORER-15 speak.
 fn settings_rail(ui: &mut egui::Ui, nav: &mut SettingsNav) {
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -1018,7 +1037,7 @@ fn settings_rail(ui: &mut egui::Ui, nav: &mut SettingsNav) {
                 }
                 ui.label(
                     RichText::new(group.label())
-                        .color(Style::TEXT_DIM)
+                        .color(group.accent())
                         .size(Style::SMALL)
                         .strong(),
                 );
@@ -1058,16 +1077,19 @@ fn settings_detail(
     instances: &InstancesState,
     actions: &mut Vec<SysAction>,
 ) {
-    // Expressive header — the active section's title in the large type scale. SEAM:
-    // SETTINGS-2 tints this in the group accent (`section.group()`).
+    // Expressive header — the active section's title in the large type scale, tinted
+    // in its domain group's categorical accent (SETTINGS-2) so the active domain reads
+    // at a glance in the same colour as its rail header.
     ui.label(
         RichText::new(section.label())
-            .color(Style::TEXT)
+            .color(section.group().accent())
             .size(Style::HEADING)
             .strong(),
     );
     ui.add_space(Style::SP_M);
-    ui.group(|ui| match section {
+    // The section body sits on a Carbon layer-02 card raised above the layer-01 page,
+    // ringed by a hairline border (SETTINGS-2 — [`section_card`]).
+    section_card(ui, |ui| match section {
         SettingsSection::Displays => {
             displays_section(ui, snap, layout, panel_brightness, ddc_brightness, actions)
         }
@@ -1089,6 +1111,34 @@ fn settings_detail(
         | SettingsSection::Pairing
         | SettingsSection::Network => settings_placeholder(ui, section),
     });
+}
+
+/// The Settings **page** frame (SETTINGS-2) — Carbon **layer-01**: the rail + the
+/// detail pane rest one elevation step above the window [`Style::BG`], the base the
+/// section cards raise from. `margin` is the pane's inner pad (its own expressive
+/// value per pane). All tokens — no raw literal (§4).
+fn page_frame(margin: f32) -> egui::Frame {
+    egui::Frame::NONE.fill(Style::LAYER_01).inner_margin(margin)
+}
+
+/// The Settings **section card** frame (SETTINGS-2) — Carbon **layer-02**: the
+/// selected section's body sits one elevation step above the layer-01 page, ringed by
+/// a hairline [`Style::BORDER`] with the shared corner radius. Every value is a
+/// [`Style`] token (fill / stroke / radius / pad — no raw literal, §4).
+fn card_frame() -> egui::Frame {
+    egui::Frame::NONE
+        .fill(Style::LAYER_02)
+        .stroke(egui::Stroke::new(1.0, Style::BORDER))
+        .corner_radius(Style::RADIUS)
+        .inner_margin(Style::SP_M)
+}
+
+/// Render `add` inside a [`card_frame`] — the layer-02 section card that replaces the
+/// plain `ui.group`, so the elevation ladder + hairline read as one Carbon surface.
+/// Generic over the body's return (the `ui.group` shape it supersedes), so a section
+/// fn's value threads straight through.
+fn section_card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    card_frame().show(ui, add).inner
 }
 
 /// An honest-empty Mesh & System placeholder (§7): a not-yet-wired note, never a
@@ -2476,5 +2526,91 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Categorical accent + Carbon layers (SETTINGS-2) ───────────────────────
+
+    #[test]
+    fn each_domain_group_wears_a_distinct_shared_categorical_accent() {
+        // The three domain accents REUSE the shared Style::ACCENT_* categorical set
+        // (the ONE colour language PICKER-2 / EXPLORER-15 speak, §4 — no second set
+        // minted here), are mutually distinct, and are each set apart from the
+        // interactive brand accent so a domain tint never reads as an affordance.
+        let categorical = [
+            Style::ACCENT_COMMS,
+            Style::ACCENT_WORKLOADS,
+            Style::ACCENT_TERMINALS,
+            Style::ACCENT_MESH,
+            Style::ACCENT_SYSTEM,
+            Style::ACCENT_MEDIA,
+        ];
+        let accents: Vec<egui::Color32> = SettingsGroup::ALL.iter().map(|g| g.accent()).collect();
+        for a in &accents {
+            assert!(
+                categorical.contains(a),
+                "a domain accent must be drawn from the shared categorical set, not minted"
+            );
+            assert_ne!(
+                *a,
+                Style::ACCENT,
+                "a domain accent must differ from the interactive brand accent"
+            );
+        }
+        for (i, a) in accents.iter().enumerate() {
+            for b in &accents[i + 1..] {
+                assert_ne!(a, b, "domain accents must be mutually distinct");
+            }
+        }
+        // Every section inherits exactly its group's accent — the rail header AND the
+        // active detail header both key off `section.group().accent()`, so a section's
+        // two tints can never disagree.
+        for group in SettingsGroup::ALL {
+            for &section in group.sections() {
+                assert_eq!(
+                    section.group().accent(),
+                    group.accent(),
+                    "{} must wear its group's accent",
+                    section.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_page_and_section_card_sit_on_ascending_carbon_layers() {
+        // The page frame fills Carbon layer-01 and the section card fills layer-02
+        // with a hairline border — every value a Style token (no raw literal, §4) —
+        // and the card reads one elevation step above the page (not a flat fill).
+        let page = page_frame(Style::SP_L);
+        assert_eq!(page.fill, Style::LAYER_01, "the page rests on layer-01");
+
+        let card = card_frame();
+        assert_eq!(
+            card.fill,
+            Style::LAYER_02,
+            "the section card rests on layer-02"
+        );
+        assert_eq!(
+            card.stroke.color,
+            Style::BORDER,
+            "the card wears a hairline border"
+        );
+        assert!(
+            (card.stroke.width - 1.0).abs() < f32::EPSILON,
+            "the card border is a 1px hairline"
+        );
+        assert_ne!(
+            card.fill, page.fill,
+            "the card must be a tonal step above the page (Carbon elevation)"
+        );
+
+        // And the layered detail path actually paints headless — the section body
+        // renders inside the layer-02 card without panicking, a full paint never blank.
+        let mut st = SystemState::default();
+        let mut inst = InstancesState::default();
+        assert!(
+            renders(&mut st, &mut inst),
+            "the layered Settings page drew nothing"
+        );
     }
 }

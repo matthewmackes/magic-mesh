@@ -77,6 +77,18 @@ impl Style {
     /// Hairline borders + separators.
     pub const BORDER: Color32 = Color32::from_rgb(0x33, 0x33, 0x3D);
 
+    // ── Carbon elevation layers ─────────────────────────────────────────────
+    // The Carbon "layer" model for nested regions: a page rests one tonal step
+    // above the window [`BG`](Self::BG), and a card rests one step above the page —
+    // regions separate by elevation, not a heavy border. Named aliases over the
+    // existing surface palette (one palette, no new hue §4): the two steps a
+    // two-level layout (a page + its section cards, SETTINGS-2) needs, reusable
+    // shell-wide.
+    /// Carbon elevation — **layer-01**: a page / panel one step above [`BG`](Self::BG).
+    pub const LAYER_01: Color32 = Self::SURFACE;
+    /// Carbon elevation — **layer-02**: a card resting on [`LAYER_01`](Self::LAYER_01).
+    pub const LAYER_02: Color32 = Self::SURFACE_HI;
+
     /// Primary text.
     pub const TEXT: Color32 = Color32::from_rgb(0xE6, 0xE6, 0xEC);
     /// Secondary / dimmed text.
@@ -256,6 +268,18 @@ mod tests {
                 assert_ne!(a, b, "categorical accents must be mutually distinct");
             }
         }
+    }
+
+    #[test]
+    fn carbon_elevation_layers_form_an_ascending_ladder() {
+        // The Carbon layer ladder for nested regions: the window BG, then a page
+        // (layer-01), then a card (layer-02) — each a distinct tonal step so a card
+        // reads as raised without a heavy fill, and both layers resolve onto the
+        // existing surface palette (one palette, §4 — no new hue minted).
+        assert_ne!(Style::BG, Style::LAYER_01);
+        assert_ne!(Style::LAYER_01, Style::LAYER_02);
+        assert_eq!(Style::LAYER_01, Style::SURFACE);
+        assert_eq!(Style::LAYER_02, Style::SURFACE_HI);
     }
 
     #[test]
