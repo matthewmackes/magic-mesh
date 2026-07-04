@@ -40,13 +40,21 @@
 //! - [`config_render`] — QC-4's one-state → Kolla config renderer (landed):
 //!   materializes each desired service's `/etc/kolla/<svc>/config.json` (+ the
 //!   service config it points to) from the doctrine, atomically. QC-5 seals the
-//!   real per-service credentials it substitutes.
+//!   real per-service credentials it substitutes; QC-9 renders Glance's
+//!   local file store + image cache + cross-node `copy-image` replication.
+//! - [`image_pipeline`] — QC-9's diskimage-builder → Glance pipeline (the
+//!   pinned, testable definition that retires `build-mde-vm-golden.sh`, Q36/53):
+//!   `disk-image-create` from a versioned element set → `glance image-create`
+//!   into a node's file store → `glance-replicator livecopy` fan-out to every
+//!   API node. QC-11/12 drive it from the typed `image` verb + Cloud plane.
 //! - [`secrets`] — QC-5's sealed per-service secret set (the leader mints once
 //!   from the OS CSPRNG, seals `0600` on the Syncthing share, every other node
 //!   reads it; the renderer substitutes it for QC-4's placeholder).
 //! - [`images`] — QC-3's airgap archive lane (landed): the decided
-//!   `<share>/kolla/<release>/` layout + `SHA256SUMS` verification; QC-9's
-//!   DIB pipeline reuses the same share conventions for tenant images.
+//!   `<share>/kolla/<release>/` layout + `SHA256SUMS` verification for the Kolla
+//!   *service* images (the containers). Tenant VM images take the separate
+//!   [`image_pipeline`] (DIB → Glance) lane — service images ride Podman, VM
+//!   images ride Glance.
 //! - [`podman`] — QC-5 grows per-service health probes.
 //! - [`reconcile`] — QC-5 extends the mirror with API health; QC-11's typed
 //!   verbs consume the same state model.
@@ -56,6 +64,7 @@
 pub mod catalog;
 pub mod config_render;
 pub mod fleet;
+pub mod image_pipeline;
 pub mod images;
 pub mod podman;
 pub mod reconcile;

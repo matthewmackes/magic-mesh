@@ -101,6 +101,29 @@ const SWIFT_PORT: u16 = 8080;
 /// The Swift container cinder-backup lands each volume's backup objects in.
 const CINDER_BACKUP_CONTAINER: &str = "volumebackups";
 
+// ── QC-9: the Glance local-file store + replication/caching (Q36/53) ──
+/// The on-disk **local file store** every API node's glance-api serves images
+/// from (Q53 — a node-local file store, carved beside the Cinder VG + Swift dir
+/// on the writable partition, Q59). An image lands here once and is replicated
+/// to every other API node's store by the QC-9 pipeline
+/// ([`super::image_pipeline`]).
+const GLANCE_STORE_DATADIR: &str = "/var/lib/glance/images/";
+/// The per-node **image cache** directory (Q53 — caching between API nodes): a
+/// hot image served off a peer's store is cached locally so the next serve is
+/// node-local. Distinct from the store — the store is authoritative, the cache
+/// is disposable.
+const GLANCE_IMAGE_CACHE_DIR: &str = "/var/lib/glance/image-cache/";
+/// The per-node image-cache ceiling in bytes (20 GiB) — the cache pruner trims
+/// to this, so the cache never fills the writable partition (§7 — a real bound,
+/// not an unbounded cache masquerading as one).
+const GLANCE_IMAGE_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// Glance's `image_cache_stall_time` (seconds) — how long a half-fetched cache
+/// entry may sit before the cleaner reaps it (a day).
+const GLANCE_IMAGE_CACHE_STALL_SECS: u32 = 86_400;
+/// The `[glance_store]` local file-store name (matches the `--store` the QC-9
+/// upload targets and the `stores`/`default_store` this renders).
+const GLANCE_FILE_STORE: &str = "file";
+
 /// This node's Nebula overlay bind (design Q22/23) — the resolved overlay IP
 /// every `OpenStack` API binds plaintext to (the overlay IS the transport
 /// security), or the honest reason it couldn't be resolved.
@@ -523,24 +546,7 @@ fn service_plan(
                 host = overlay,
             ),
         ),
-        ServiceKind::GlanceApi => one(
-            "glance-api",
-            "glance-api.conf",
-            "/etc/glance/glance-api.conf",
-            "glance:glance",
-            format!(
-                "[DEFAULT]\ndebug = False\nbind_host = {host}\nbind_port = {port}\n\
-                 public_endpoint = {endpoint}\n\
-                 [database]\nconnection = {db}\n{authtoken}\
-                 [glance_store]\nstores = file\ndefault_store = file\n\
-                 filesystem_store_datadir = /var/lib/glance/images/\n",
-                host = overlay,
-                port = ServiceKind::GlanceApi.api_port().unwrap_or_default(),
-                endpoint = mesh_endpoint(ServiceKind::GlanceApi),
-                db = db_url("glance", overlay, ctx, secrets),
-                authtoken = authtoken("glance", overlay, secrets),
-            ),
-        ),
+        ServiceKind::GlanceApi => glance(overlay, ctx, secrets),
         ServiceKind::PlacementApi => one(
             "/usr/sbin/httpd -DFOREGROUND",
             "placement.conf",
@@ -566,6 +572,62 @@ fn service_plan(
         ServiceKind::CinderScheduler => cinder("cinder-scheduler", overlay, ctx, secrets),
         ServiceKind::CinderVolume => cinder("cinder-volume", overlay, ctx, secrets),
         ServiceKind::CinderBackup => cinder("cinder-backup", overlay, ctx, secrets),
+    }
+}
+
+/// The Glance plan (Q36/53 — the image service on every API node, QC-6/Q22): a
+/// node-local **file store** with **replication + caching between API nodes**.
+///
+/// - `[DEFAULT]`: the overlay-bound API listener (QC-6, Q22/23), the mesh
+///   service-catalog `public_endpoint`, and this node's
+///   `worker_self_reference_url` (its own mesh endpoint) — the node identity
+///   Glance stamps on an image's store location so a peer's `copy-image` import
+///   knows which node's store a location lives in. The **image cache** (Q53 —
+///   caching): a cache dir on the writable partition, a real byte ceiling the
+///   pruner trims to, and the stall time the cleaner reaps a half-fetched entry
+///   after. `enabled_import_methods` carries **`copy-image`** — the
+///   interoperable-import verb that pulls an image into THIS node's local store
+///   from a peer (one half of the QC-9 replication; the other is
+///   `glance-replicator livecopy`, [`super::image_pipeline`]).
+/// - `[glance_store]`: the node-local **file** store (Q53/Q59) at
+///   [`GLANCE_STORE_DATADIR`], `0640` file perms.
+/// - `[paste_deploy]`: `flavor = keystone+cachemanagement` — wires the
+///   image-cache + cache-management middleware into the API pipeline so the
+///   cache directory above is actually consulted (without it the cache is inert).
+/// - `[database]` + `[keystone_authtoken]`: the sealed DB (QC-5/Q15) and the
+///   shared Keystone authtoken (QC-5/Q21) — the same seams every API shares.
+fn glance(overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
+    let endpoint = mesh_endpoint(ServiceKind::GlanceApi);
+    ServicePlan {
+        command: "glance-api".to_string(),
+        files: vec![ConfFile {
+            name: "glance-api.conf",
+            dest: "/etc/glance/glance-api.conf",
+            owner: "glance:glance",
+            body: format!(
+                "[DEFAULT]\ndebug = False\nbind_host = {host}\nbind_port = {port}\n\
+                 public_endpoint = {endpoint}\n\
+                 worker_self_reference_url = {endpoint}\n\
+                 enabled_import_methods = [glance-direct,web-download,copy-image]\n\
+                 image_cache_dir = {cache_dir}\n\
+                 image_cache_max_size = {cache_max}\n\
+                 image_cache_stall_time = {cache_stall}\n\
+                 [database]\nconnection = {db}\n{authtoken}\
+                 [glance_store]\nstores = {store}\ndefault_store = {store}\n\
+                 filesystem_store_datadir = {datadir}\n\
+                 filesystem_store_file_perm = 0640\n\
+                 [paste_deploy]\nflavor = keystone+cachemanagement\n",
+                host = overlay,
+                port = ServiceKind::GlanceApi.api_port().unwrap_or_default(),
+                cache_dir = GLANCE_IMAGE_CACHE_DIR,
+                cache_max = GLANCE_IMAGE_CACHE_MAX_BYTES,
+                cache_stall = GLANCE_IMAGE_CACHE_STALL_SECS,
+                db = db_url("glance", overlay, ctx, secrets),
+                authtoken = authtoken("glance", overlay, secrets),
+                store = GLANCE_FILE_STORE,
+                datadir = GLANCE_STORE_DATADIR,
+            ),
+        }],
     }
 }
 
@@ -1371,5 +1433,75 @@ mod tests {
             conf.contains("backup_driver = cinder.backup.drivers.swift.SwiftBackupDriver"),
             "{conf}"
         );
+    }
+
+    // ── QC-9: the Glance local-file store + replication/caching (Q36/53) ──
+
+    #[test]
+    fn glance_renders_the_node_local_file_store() {
+        // Q53/Q59 — the [glance_store] file store on THIS node's writable
+        // partition: `stores`/`default_store` are `file`, the datadir is the
+        // canonical images path, and rendered files are group-readable only.
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::GlanceApi, &ctx(false)).unwrap();
+        let conf = read_conf(dir.path(), ServiceKind::GlanceApi, "glance-api.conf");
+        assert!(conf.contains("[glance_store]"), "{conf}");
+        assert!(conf.contains("stores = file"), "{conf}");
+        assert!(conf.contains("default_store = file"), "{conf}");
+        assert!(
+            conf.contains("filesystem_store_datadir = /var/lib/glance/images/"),
+            "{conf}"
+        );
+        assert!(conf.contains("filesystem_store_file_perm = 0640"), "{conf}");
+    }
+
+    #[test]
+    fn glance_renders_the_image_cache_with_a_real_bound_and_cachemanagement() {
+        // Q53 — the "caching between API nodes" half: a cache dir on the writable
+        // partition, a REAL byte ceiling (20 GiB) the pruner trims to (never an
+        // unbounded cache, §7), the stall time, and the paste flavor that
+        // actually wires the cache middleware into the API pipeline (without it
+        // the cache dir is inert — a config that looks cached but isn't).
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::GlanceApi, &ctx(false)).unwrap();
+        let conf = read_conf(dir.path(), ServiceKind::GlanceApi, "glance-api.conf");
+        assert!(
+            conf.contains("image_cache_dir = /var/lib/glance/image-cache/"),
+            "{conf}"
+        );
+        // 20 GiB, spelled in bytes so the pruner has a concrete ceiling.
+        assert!(
+            conf.contains(&format!("image_cache_max_size = {}", 20u64 * 1024 * 1024 * 1024)),
+            "{conf}"
+        );
+        assert!(conf.contains("image_cache_stall_time = 86400"), "{conf}");
+        assert!(
+            conf.contains("flavor = keystone+cachemanagement"),
+            "the cache middleware must be wired into the paste pipeline: {conf}"
+        );
+    }
+
+    #[test]
+    fn glance_renders_the_cross_node_replication_wiring() {
+        // Q53 — the "replication between API nodes" half: the node advertises its
+        // own mesh endpoint as `worker_self_reference_url` (the identity a peer's
+        // copy-image import resolves a store location against), and `copy-image`
+        // is an enabled import method (the verb that pulls an image into THIS
+        // node's local store from a peer). Both reference the mesh endpoint, never
+        // a public-underlay address (QC-6/Q23).
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::GlanceApi, &ctx(false)).unwrap();
+        let conf = read_conf(dir.path(), ServiceKind::GlanceApi, "glance-api.conf");
+        assert!(
+            conf.contains("worker_self_reference_url = http://glance.mesh:9292"),
+            "{conf}"
+        );
+        assert!(
+            conf.contains("enabled_import_methods = [glance-direct,web-download,copy-image]"),
+            "copy-image is the replication verb: {conf}"
+        );
+        // Still overlay-only — no wildcard/loopback leaked by the QC-9 additions.
+        assert!(!conf.contains("0.0.0.0"), "{conf}");
+        assert!(!conf.contains("127.0.0.1"), "{conf}");
     }
 }
