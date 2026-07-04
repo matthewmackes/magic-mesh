@@ -322,12 +322,47 @@ const HAIRLINE_W: f32 = 1.0;
 /// this, so it stays legible even when a long label wants to overflow the bar.
 const LABEL_MIN_PT: f32 = 8.0;
 
+// ── PICKER-3: the group's spacing rhythm (8px grid; §4 — no raw px) ───────────
+// Every horizontal gap in the grouped run is added EXPLICITLY from these three
+// tokens (the automatic item-spacing is zeroed in `taskbar`), so the rhythm is
+// even + measurable: mixing an auto per-item gap with a manual `add_space` is
+// what left the labels cramped against their hairline/icons and the group
+// boundaries reading unevenly. The three gaps form a clear hierarchy —
+// `GROUP_GAP`(16) ≫ `LABEL_PAD`(8) > `ICON_GAP`(4) — so a group reads as one
+// cluster set clearly apart from the next.
+
+/// The generous inter-group separation — the clear gap BEFORE each rotated accent
+/// label (and before the first group, off the Workbench lead). `SP_M`.
+const GROUP_GAP: f32 = Style::SP_M;
+
+/// The small breathing pad on EACH side of a group's Carbon-blue hairline
+/// (label → pad → hairline → pad → icons), so the rotated label never crowds the
+/// rule and the rule never crowds the icons. `SP_S`.
+const LABEL_PAD: f32 = Style::SP_S;
+
+/// The tight gap between the icon cells WITHIN one group cluster. `SP_XS`.
+const ICON_GAP: f32 = Style::SP_XS;
+
 /// The stable per-surface id of a cell, so the app-row layout is addressable —
 /// the render + routing are unchanged, but tests can read a cell's rect back via
 /// [`egui::Context::read_response`] to click its exact centre (the W10-2 idiom,
 /// now that grouping shifts each cell off a hand-computable x).
 fn cell_id(surface: Surface) -> egui::Id {
     egui::Id::new(("qbrand-dock-cell", surface))
+}
+
+/// The stable id of a group's rotated label column, so the app-row layout is fully
+/// addressable — the render is unchanged (the label is display-only, `Sense::hover`),
+/// but the layout harness can read its settled `Rect` back to measure the group's
+/// spacing rhythm (PICKER-3).
+fn group_label_id(label: &str) -> egui::Id {
+    egui::Id::new(("qbrand-dock-group-label", label))
+}
+
+/// The stable id of a group's Carbon-blue hairline rule, so the harness can read
+/// its settled `Rect` (its x + vertical extent) back. Display-only.
+fn group_hairline_id(label: &str) -> egui::Id {
+    egui::Id::new(("qbrand-dock-group-hairline", label))
 }
 
 /// The shared point size for every group label — starts at [`Style::SMALL`] and
@@ -367,6 +402,9 @@ fn group_label(ui: &mut egui::Ui, group: &Group, font: egui::FontId) {
         egui::vec2(col_w, ui.available_height()),
         egui::Sense::hover(),
     );
+    // Register the settled column under a stable id so the harness can read its
+    // rect back (still display-only — hover sense, no click, nothing painted here).
+    ui.interact(rect, group_label_id(group.label), egui::Sense::hover());
     // Pivot at the column's left edge; the rotated text spans [pos.y - text_w,
     // pos.y] vertically, so drop the baseline half its width below centre.
     let pos = egui::pos2(rect.left(), rect.center().y + text_w / 2.0);
@@ -379,11 +417,14 @@ fn group_label(ui: &mut egui::Ui, group: &Group, font: egui::FontId) {
 /// Paint the thin **Carbon-blue** vertical hairline that sits beside a group's
 /// label (L3) — the interactive-blue [`Style::ACCENT`] token (§4, not raw hex),
 /// inset a hair from the bar's top/bottom edges. Display-only.
-fn group_hairline(ui: &mut egui::Ui) {
+fn group_hairline(ui: &mut egui::Ui, group: &Group) {
     let (rect, _resp) = ui.allocate_exact_size(
         egui::vec2(HAIRLINE_W, ui.available_height()),
         egui::Sense::hover(),
     );
+    // Register the settled rule under a stable id (display-only) so the harness can
+    // measure the label→hairline→icon rhythm and the cross-group alignment.
+    ui.interact(rect, group_hairline_id(group.label), egui::Sense::hover());
     ui.painter().vline(
         rect.center().x,
         (rect.top() + Style::SP_XS)..=(rect.bottom() - Style::SP_XS),
@@ -417,10 +458,11 @@ pub fn taskbar(
 
     let mut clicked = false;
     ui.horizontal(|ui| {
-        // Cells breathe with a small horizontal gap; each cell still carries its
-        // own internal padding around the centred glyph. The same gap spaces the
-        // per-group label + hairline from the icons they head.
-        ui.spacing_mut().item_spacing = egui::vec2(Style::SP_XS, 0.0);
+        // Every horizontal gap in the grouped run is added EXPLICITLY below (from
+        // the GROUP_GAP / LABEL_PAD / ICON_GAP tokens), so zero the automatic
+        // item-spacing: mixing an auto per-item gap with a manual `add_space` is
+        // what left the labels cramped and the group boundaries reading unevenly.
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
 
         // The label micro-type is sized once so all six labels shrink together
         // to fit the bar height (the full row height, before any cell is placed).
@@ -435,12 +477,19 @@ pub fn taskbar(
             clicked = true;
         }
         for group in &GROUPS {
-            // Generous padding before each group (L3), then the rotated accent
-            // label + the Carbon-blue hairline to the LEFT of the icon cells.
-            ui.add_space(Style::SP_S);
+            // PICKER-3 — one even, generous rhythm per group: a clear GROUP_GAP
+            // before the rotated accent label, a LABEL_PAD off the Carbon-blue
+            // hairline (L3), the hairline, another LABEL_PAD, then the icon cells
+            // clustered ICON_GAP apart. Every gap is a Style token (§4, no raw px).
+            ui.add_space(GROUP_GAP);
             group_label(ui, group, label_font.clone());
-            group_hairline(ui);
-            for &surface in group.surfaces {
+            ui.add_space(LABEL_PAD);
+            group_hairline(ui, group);
+            ui.add_space(LABEL_PAD);
+            for (i, &surface) in group.surfaces.iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(ICON_GAP);
+                }
                 if cell(ui, surface, active) {
                     clicked = true;
                 }
@@ -613,8 +662,9 @@ pub fn icon_texture(
 #[cfg(test)]
 mod tests {
     use super::{
-        cell_id, icon_texture, taskbar, underline, Surface, CELL_W, GROUPS, ICON_LOGICAL,
-        SHOW_DESKTOP_W, TASKBAR_H, TASKBAR_TOP_PAD,
+        cell_id, group_hairline_id, group_label_id, icon_texture, taskbar, underline, Surface,
+        CELL_W, GROUPS, GROUP_GAP, HAIRLINE_W, ICON_GAP, ICON_LOGICAL, LABEL_PAD, SHOW_DESKTOP_W,
+        TASKBAR_H, TASKBAR_TOP_PAD,
     };
     use crate::chrome::MeshSummary;
     use crate::tray::{TrayInputs, TrayState};
@@ -771,12 +821,16 @@ mod tests {
 
     // --- the bar mounts, renders icon-only, and switches surface on a click -------
 
-    /// Mount the real bottom bar (with a default tray over an unseen mesh) for
-    /// one headless frame and return the frame output.
-    fn run_taskbar(
+    /// Mount the real bottom bar (with a default tray over an unseen mesh) for one
+    /// headless frame at a given screen `width` and return the frame output — the
+    /// same `Context::run` → `TopBottomPanel::bottom` path `main.rs` mounts (matching
+    /// its exact-height + zero-margin `SURFACE` frame), so the layout the harness
+    /// measures is the live one.
+    fn run_taskbar_sized(
         ctx: &egui::Context,
         active: &mut Surface,
         events: Vec<egui::Event>,
+        width: f32,
     ) -> egui::FullOutput {
         let mesh = MeshSummary::default();
         let inputs = TrayInputs {
@@ -789,7 +843,7 @@ mod tests {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
-                egui::vec2(1280.0, 600.0),
+                egui::vec2(width, 600.0),
             )),
             events,
             ..Default::default()
@@ -802,6 +856,16 @@ mod tests {
                     let _ = taskbar(ui, active, &mut tray, &inputs);
                 });
         })
+    }
+
+    /// Mount the real bottom bar at the default 1280-wide screen (the click/glyph
+    /// tests' width) for one headless frame.
+    fn run_taskbar(
+        ctx: &egui::Context,
+        active: &mut Surface,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        run_taskbar_sized(ctx, active, events, 1280.0)
     }
 
     #[test]
@@ -1131,5 +1195,330 @@ mod tests {
             desktop.width() < CELL_W,
             "the Desktop sliver is narrower than a normal cell"
         );
+    }
+
+    // ── PICKER-3: the headless taskbar LAYOUT HARNESS ─────────────────────────
+    // A repeatable, headless measurement of the grouped taskbar's REAL on-screen
+    // geometry. It mounts the true `taskbar()` via `egui::Context::run` at a given
+    // screen width, reads every element's settled `Rect` back by the stable id the
+    // dock assigns (icon/Settings/Desktop cells → `cell_id`; rotated group labels →
+    // `group_label_id`; Carbon-blue hairlines → `group_hairline_id`), and reduces
+    // them to the group spacing rhythm. `report()` prints the measured geometry
+    // (visible under `--nocapture`); `assert_even_rhythm()` pins the intended
+    // rhythm as the regression guard + the spec.
+
+    /// The measured geometry of one group in the app row.
+    struct GroupGeom {
+        label: &'static str,
+        label_rect: egui::Rect,
+        hairline_rect: egui::Rect,
+        icons: Vec<egui::Rect>,
+    }
+
+    impl GroupGeom {
+        fn first_icon(&self) -> egui::Rect {
+            *self.icons.first().expect("a group has ≥1 icon")
+        }
+        fn last_icon(&self) -> egui::Rect {
+            *self.icons.last().expect("a group has ≥1 icon")
+        }
+        /// The group's full horizontal extent — its rotated label is the leftmost
+        /// element, its last icon the rightmost.
+        fn left(&self) -> f32 {
+            self.label_rect.left()
+        }
+        fn right(&self) -> f32 {
+            self.last_icon().right()
+        }
+        /// label → Carbon-blue hairline gap.
+        fn label_to_hairline(&self) -> f32 {
+            self.hairline_rect.left() - self.label_rect.right()
+        }
+        /// hairline → first icon gap.
+        fn hairline_to_first_icon(&self) -> f32 {
+            self.first_icon().left() - self.hairline_rect.right()
+        }
+        /// The gap between consecutive icon cells within the group (`None` for a
+        /// single-icon group).
+        fn icon_to_icon(&self) -> Option<f32> {
+            (self.icons.len() > 1).then(|| self.icons[1].left() - self.icons[0].right())
+        }
+    }
+
+    /// The measured geometry of the whole taskbar at one screen width.
+    struct BarGeom {
+        width: f32,
+        bar_top: f32,
+        bar_bottom: f32,
+        workbench: egui::Rect,
+        groups: Vec<GroupGeom>,
+        settings: egui::Rect,
+        desktop: egui::Rect,
+    }
+
+    impl BarGeom {
+        fn bar_center_y(&self) -> f32 {
+            f32::midpoint(self.bar_top, self.bar_bottom)
+        }
+        /// The element immediately to the LEFT of group `i` — the Workbench lead for
+        /// the first group, else the previous group's last icon.
+        fn left_neighbour_right(&self, i: usize) -> f32 {
+            if i == 0 {
+                self.workbench.right()
+            } else {
+                self.groups[i - 1].right()
+            }
+        }
+        /// The inter-group gap: the clear space BEFORE group `i`'s rotated label
+        /// (measured off its left neighbour's right edge).
+        fn pre_label_gap(&self, i: usize) -> f32 {
+            self.groups[i].label_rect.left() - self.left_neighbour_right(i)
+        }
+        /// The flexible gap between the grouped run and the right cluster — the
+        /// Settings button is the leftmost element of that cluster.
+        fn group_to_tray_gap(&self) -> f32 {
+            self.settings.left() - self.groups.last().expect("six groups").right()
+        }
+
+        /// Emit the full measured geometry as a table — every element's rect + the
+        /// per-group gaps (deliverable #3). Printed by the harness test under
+        /// `--nocapture`; also the human-readable form of what the assertions pin.
+        fn report(&self) -> String {
+            use std::fmt::Write as _;
+            let mut s = String::new();
+            let _ = writeln!(
+                s,
+                "=== taskbar layout @ {:.0}px  (bar y=[{:.1},{:.1}] center={:.1}) ===",
+                self.width,
+                self.bar_top,
+                self.bar_bottom,
+                self.bar_center_y()
+            );
+            let _ = writeln!(
+                s,
+                "lead  Workbench      x=[{:.1},{:.1}]",
+                self.workbench.left(),
+                self.workbench.right()
+            );
+            for (i, g) in self.groups.iter().enumerate() {
+                let i2i = g
+                    .icon_to_icon()
+                    .map_or_else(|| "n/a".to_owned(), |v| format!("{v:.1}"));
+                let _ = writeln!(
+                    s,
+                    "grp{i} {:<10} label x=[{:.1},{:.1}] cy={:.1} | hairline x={:.1} | \
+icons x=[{:.1}..{:.1}] | grp=[{:.1},{:.1}] || pre={:.1} lbl→hr={:.1} hr→ic={:.1} ic→ic={}",
+                    g.label,
+                    g.label_rect.left(),
+                    g.label_rect.right(),
+                    g.label_rect.center().y,
+                    g.hairline_rect.center().x,
+                    g.first_icon().left(),
+                    g.last_icon().right(),
+                    g.left(),
+                    g.right(),
+                    self.pre_label_gap(i),
+                    g.label_to_hairline(),
+                    g.hairline_to_first_icon(),
+                    i2i,
+                );
+            }
+            let _ = writeln!(
+                s,
+                "right  group→tray gap={:.1} | Settings x=[{:.1},{:.1}] | tray x=[{:.1},{:.1}] | \
+Desktop x=[{:.1},{:.1}]",
+                self.group_to_tray_gap(),
+                self.settings.left(),
+                self.settings.right(),
+                self.settings.right(),
+                self.desktop.left(),
+                self.desktop.left(),
+                self.desktop.right(),
+            );
+            s
+        }
+    }
+
+    /// Mount the real taskbar headlessly at `width`, settle the layout, and read
+    /// every element's settled `Rect` back by its stable id — the harness core.
+    fn measure_taskbar(width: f32) -> BarGeom {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut active = Surface::Workbench;
+        // Prime two frames so every stable-id widget rect is registered + settled
+        // (`read_response` reads the previous frame's rects — the W10-2 idiom).
+        let _ = run_taskbar_sized(&ctx, &mut active, Vec::new(), width);
+        let _ = run_taskbar_sized(&ctx, &mut active, Vec::new(), width);
+
+        let rect_of = |id: egui::Id| {
+            ctx.read_response(id)
+                .expect("every taskbar element rect is registered under its stable id")
+                .rect
+        };
+        let workbench = rect_of(cell_id(Surface::Workbench));
+        let settings = rect_of(cell_id(Surface::System));
+        let desktop = rect_of(cell_id(Surface::Desktop));
+        let groups = GROUPS
+            .iter()
+            .map(|g| GroupGeom {
+                label: g.label,
+                label_rect: rect_of(group_label_id(g.label)),
+                hairline_rect: rect_of(group_hairline_id(g.label)),
+                icons: g.surfaces.iter().map(|&s| rect_of(cell_id(s))).collect(),
+            })
+            .collect();
+        BarGeom {
+            width,
+            bar_top: workbench.top(),
+            bar_bottom: workbench.bottom(),
+            workbench,
+            groups,
+            settings,
+            desktop,
+        }
+    }
+
+    /// The realistic screen widths the harness pins the rhythm at — the T470s
+    /// panel + two common desktop sizes.
+    const HARNESS_WIDTHS: [f32; 3] = [1366.0, 1920.0, 2560.0];
+
+    /// Layout tolerance in logical px — the gaps are added from exact `Style`
+    /// tokens, so this only absorbs egui's sub-pixel rounding of the rects.
+    const LAYOUT_TOL: f32 = 1.0;
+
+    fn approx(a: f32, b: f32) -> bool {
+        (a - b).abs() <= LAYOUT_TOL
+    }
+
+    /// Assert the intended even rhythm on a measured bar (the spec + regression
+    /// guard). Every gap must equal its `Style` token and be equal across groups,
+    /// the labels vertically centred, the hairlines aligned, and nothing overlapping.
+    fn assert_even_rhythm(bar: &BarGeom) {
+        let w = bar.width;
+        assert_eq!(bar.groups.len(), 6, "@{w}: six measured groups");
+
+        // (1) Inter-group gaps equal (within 1px) — the clear space before every
+        // rotated label, incl. the Workbench-lead → first-group gap, is GROUP_GAP.
+        for i in 0..bar.groups.len() {
+            let gap = bar.pre_label_gap(i);
+            assert!(
+                approx(gap, GROUP_GAP),
+                "@{w}: group {} pre-label gap {gap:.2} ≠ GROUP_GAP {GROUP_GAP}",
+                bar.groups[i].label
+            );
+        }
+
+        // (2) label→hairline→icon spacing consistent across groups — both pads are
+        // LABEL_PAD and identical group to group (the rhythm the operator flagged).
+        for g in &bar.groups {
+            assert!(
+                approx(g.label_to_hairline(), LABEL_PAD),
+                "@{w}: {} label→hairline {:.2} ≠ LABEL_PAD {LABEL_PAD}",
+                g.label,
+                g.label_to_hairline()
+            );
+            assert!(
+                approx(g.hairline_to_first_icon(), LABEL_PAD),
+                "@{w}: {} hairline→icon {:.2} ≠ LABEL_PAD {LABEL_PAD}",
+                g.label,
+                g.hairline_to_first_icon()
+            );
+            // Icon-to-icon within a multi-icon cluster is the tight ICON_GAP.
+            if let Some(i2i) = g.icon_to_icon() {
+                assert!(
+                    approx(i2i, ICON_GAP),
+                    "@{w}: {} icon→icon {i2i:.2} ≠ ICON_GAP {ICON_GAP}",
+                    g.label
+                );
+            }
+        }
+
+        // (3) Labels vertically centred in the bar.
+        for g in &bar.groups {
+            assert!(
+                approx(g.label_rect.center().y, bar.bar_center_y()),
+                "@{w}: {} label cy {:.2} not centred in the bar (center {:.2})",
+                g.label,
+                g.label_rect.center().y,
+                bar.bar_center_y()
+            );
+        }
+
+        // (4) Hairlines aligned — same 1px width + the same inset vertical extent
+        // across every group (a clean shared rule, not a ragged set).
+        let h0 = bar.groups[0].hairline_rect;
+        for g in &bar.groups {
+            assert!(
+                approx(g.hairline_rect.width(), HAIRLINE_W),
+                "@{w}: {} hairline width {:.2} ≠ HAIRLINE_W {HAIRLINE_W}",
+                g.label,
+                g.hairline_rect.width()
+            );
+            assert!(
+                approx(g.hairline_rect.top(), h0.top())
+                    && approx(g.hairline_rect.bottom(), h0.bottom()),
+                "@{w}: {} hairline y-extent [{:.2},{:.2}] ≠ [{:.2},{:.2}]",
+                g.label,
+                g.hairline_rect.top(),
+                g.hairline_rect.bottom(),
+                h0.top(),
+                h0.bottom()
+            );
+        }
+
+        // (5) No overlap — each group's label starts strictly right of its left
+        // neighbour's icons (the GROUP_GAP always separates them).
+        for i in 0..bar.groups.len() {
+            assert!(
+                bar.groups[i].label_rect.left() > bar.left_neighbour_right(i),
+                "@{w}: {} label overlaps the element to its left",
+                bar.groups[i].label
+            );
+        }
+
+        // (6) The right cluster keeps its positions with an even, positive flexible
+        // gap: Settings sits left of the tray + the far-right Desktop sliver, and
+        // the Desktop sliver still hugs the bar's right edge.
+        assert!(
+            bar.group_to_tray_gap() > 0.0,
+            "@{w}: the grouped run collided with the right cluster (gap {:.2})",
+            bar.group_to_tray_gap()
+        );
+        assert!(
+            bar.settings.right() <= bar.desktop.left() + LAYOUT_TOL,
+            "@{w}: Settings is not left of the Desktop sliver",
+        );
+        assert!(
+            approx(bar.desktop.right(), w),
+            "@{w}: the Desktop sliver no longer hugs the right edge (right {:.2})",
+            bar.desktop.right()
+        );
+
+        // (7) The MEASURED gaps form a clear visual hierarchy — a group reads as
+        // one cluster set clearly apart from the next: pre-label ≫ label-pad >
+        // icon gap (checked on the rendered numbers, not just the token defs).
+        let pre = bar.pre_label_gap(0);
+        let pad = bar.groups[0].label_to_hairline();
+        let icon = bar.groups[0]
+            .icon_to_icon()
+            .expect("the Comms group has two icons");
+        assert!(
+            pre > pad && pad > icon,
+            "@{w}: gaps not tiered — pre-label {pre:.1} > label-pad {pad:.1} > icon {icon:.1}"
+        );
+    }
+
+    #[test]
+    fn the_grouped_taskbar_is_evenly_spaced_at_common_widths() {
+        // PICKER-3 — the layout harness: measure the real taskbar geometry at the
+        // T470s + two common desktop widths, print the report (seen under
+        // `--nocapture`), and assert the even rhythm. This is both the spec and the
+        // regression guard for the group spacing.
+        for width in HARNESS_WIDTHS {
+            let bar = measure_taskbar(width);
+            // Emitted geometry — visible when the suite runs with `--nocapture`.
+            eprint!("{}", bar.report());
+            assert_even_rhythm(&bar);
+        }
     }
 }
