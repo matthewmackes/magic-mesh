@@ -899,7 +899,8 @@ impl Shell {
         // (lock 10) — the pointer through the covering layer, the keyboard through
         // its per-frame focus steal plus the hotkey / edge-swipe / central-view
         // gates above. An early no-op while Unlocked.
-        self.curtain.show(ctx);
+        self.curtain
+            .show(ctx, &mut self.media, self.system.snapshot(), self.chrome.summary());
     }
 
     /// The central view: the session↔body cross-fade through the expand

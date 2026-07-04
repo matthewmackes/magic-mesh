@@ -24,8 +24,17 @@
 //! denies every attempt — it can never unlock (§7 forbids a pretend-success),
 //! so a locked CURTAIN-1 seat stays locked until the shell service restarts,
 //! and the deny line says exactly that. Tests unlock through the seam with a
-//! scripted verdict. The status row + unified now-playing strip are the
-//! CURTAIN-4 seam ([`Curtain::face_extras`]), deliberately empty here.
+//! scripted verdict.
+//!
+//! **CURTAIN-4** fills [`Curtain::face_extras`]: the unified now-playing strip
+//! (the active media player's title + play/pause/next/prev, driven through the
+//! [`LockMedia`] seam) and a master-volume slider (the [`LockMixer`] seam over
+//! the same `wpctl` backend the tray drives) work WHILE locked — design lock 3,
+//! playback needs no unlock — and are the ONLY input the engaged curtain exempts
+//! from its whole-screen grab (lock 10). Beside them the status row glances
+//! battery / mesh health / date (lock 4); no message content ever reaches the
+//! curtain (lock 4 — chat stays private until unlock). Music is honestly scoped
+//! out: `mde-music-egui` exposes no in-process transport seam to drive.
 
 #![allow(
     clippy::redundant_pub_crate,
@@ -37,6 +46,14 @@ use std::time::{Duration, Instant};
 
 use mde_egui::egui::{self, Align2, Color32, FontId, RichText};
 use mde_egui::{Motion, Style};
+
+use mde_cosmic_applet::LighthouseHealth;
+use mde_media_egui::{MediaSurface, TransportAction};
+use mde_seat::{Battery, BatteryState, MixerClient, PwGraph, SeatError, SeatSnapshot};
+use mde_theme::brand::icons::IconId;
+
+use crate::chrome::MeshSummary;
+use crate::dock::icon_texture;
 
 // ───────────────────────────── the verify seam ─────────────────────────────
 
@@ -99,6 +116,143 @@ impl Verifier for NotWired {
         Some(Verdict::Denied(NOT_WIRED_DENY.to_owned()))
     }
 }
+
+// ─────────────────────── the CURTAIN-4 transport seams ───────────────────────
+
+/// The now-playing view the curtain's locked strip renders — the active media
+/// player's title and whether it is playing. An owned snapshot (not a borrow of
+/// the player) so the seam stays render-agnostic and the tests can script it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NowPlaying {
+    /// The loaded track's display title (the media surface's own now-playing
+    /// title fold — a file stem or a stream title, never invented).
+    title: String,
+    /// Whether the engine is actively playing (paused/idle reads `false`).
+    playing: bool,
+}
+
+/// The **media transport seam** (design lock 3/7): the curtain drives whichever
+/// player the shell holds without reaching into it. Production wires it to the
+/// live [`MediaSurface`] (`self.media` in the shell — the ONE media player the
+/// shell owns); tests wire a recording fake to assert the locked strip drives
+/// the real transport. Music is deliberately absent — `mde-music-egui` exposes
+/// no in-process transport seam, so the curtain honestly drives media only.
+pub(crate) trait LockMedia {
+    /// The active track, or `None` when nothing is loaded (the honest "nothing
+    /// playing" state — the strip then shows no dead controls).
+    fn now_playing(&self) -> Option<NowPlaying>;
+    /// Toggle play/pause on the live player.
+    fn toggle_play(&mut self);
+    /// Advance to the next queued track.
+    fn next(&mut self);
+    /// Step back to the previous queued track.
+    fn prev(&mut self);
+}
+
+/// The live wiring: the shell's production media surface drives the strip
+/// directly (glue over its public transport — [`MediaController::dispatch`] +
+/// the now-playing fold — no reimplementation, §6).
+impl LockMedia for MediaSurface {
+    fn now_playing(&self) -> Option<NowPlaying> {
+        // `media()` is `Some` only while a track is loaded (a Stop unloads it),
+        // so this is the honest "something is playing/paused" gate.
+        self.player().media().map(|_| NowPlaying {
+            title: mde_media_egui::model::now_playing_title(self.player()),
+            playing: self.is_playing(),
+        })
+    }
+
+    fn toggle_play(&mut self) {
+        self.dispatch(TransportAction::TogglePlay);
+    }
+
+    fn next(&mut self) {
+        self.dispatch(TransportAction::Next);
+    }
+
+    fn prev(&mut self) {
+        self.dispatch(TransportAction::Prev);
+    }
+}
+
+/// The **master-volume seam** (design lock 3): the curtain's volume slider +
+/// mute toggle drive the SAME host mixer (`wpctl`/`PipeWire`) the tray's
+/// `TrayVerbs` do — the master output is a global host service, so the curtain
+/// owns its own lazy client rather than reaching the System state's `Seat`
+/// handle (lock 1). Tests inject a recording fake. The current level is read
+/// from the passed [`SeatSnapshot`], not this seam — a write-only verb pair.
+trait LockMixer {
+    /// Set the master strip's volume (0–100).
+    ///
+    /// # Errors
+    /// The mixer client's typed error (absent `PipeWire` → `Unavailable`).
+    fn set_volume(&self, strip_id: &str, volume: u8) -> Result<(), SeatError>;
+
+    /// Set the master strip's mute.
+    ///
+    /// # Errors
+    /// As [`Self::set_volume`].
+    fn set_muted(&self, strip_id: &str, muted: bool) -> Result<(), SeatError>;
+}
+
+/// The production mixer verbs: `PipeWire` via `wpctl`, the same backend the seat
+/// snapshot the curtain reads is folded from. Lazy — no I/O until the slider is
+/// actually moved, so a headless / never-locked curtain never touches the host.
+struct HostMixer {
+    /// The `PipeWire` graph client (volume/mute via `wpctl`).
+    mixer: PwGraph,
+}
+
+impl HostMixer {
+    /// Wire the live host client (no I/O here).
+    fn new() -> Self {
+        Self {
+            mixer: PwGraph::new(),
+        }
+    }
+}
+
+impl LockMixer for HostMixer {
+    fn set_volume(&self, strip_id: &str, volume: u8) -> Result<(), SeatError> {
+        self.mixer.set_volume(strip_id, volume)
+    }
+
+    fn set_muted(&self, strip_id: &str, muted: bool) -> Result<(), SeatError> {
+        self.mixer.set_muted(strip_id, muted)
+    }
+}
+
+/// A confirmed master-mixer write, echoed over the seat snapshot until the
+/// System state's ~5s poll catches up — the tray's echo pattern, one slot (the
+/// master strip). Set ONLY on a verb's `Ok` (§7 — a refused write never
+/// pretends), so the slider + mute glyph read the just-written value back
+/// instantly instead of snapping to the stale snapshot between polls.
+#[derive(Debug, Clone)]
+struct VolEcho {
+    /// The master strip id the write targeted.
+    id: String,
+    /// The confirmed volume (0–100).
+    volume: u8,
+    /// The confirmed mute.
+    muted: bool,
+    /// When the write landed (the TTL clock).
+    at: Instant,
+}
+
+/// The master strip the volume slider renders + drives: its id, the
+/// echo-folded volume, and the echo-folded mute.
+struct MasterView {
+    /// The strip id the verbs key on.
+    id: String,
+    /// The effective volume (echo over snapshot).
+    volume: u8,
+    /// The effective mute (echo over snapshot).
+    muted: bool,
+}
+
+/// How long a confirmed mixer echo may outlive the snapshot — one ~5s seat poll
+/// plus slack, matching the tray so the two never disagree on the master.
+const VOL_ECHO_TTL: Duration = Duration::from_secs(8);
 
 // ───────────────────────────── the state machine ─────────────────────────────
 
@@ -168,13 +322,25 @@ const ROW_H: f32 = Style::SP_XL * 3.0;
 /// The clock's centre line as a fraction of the sheet height (centred-high).
 const CLOCK_Y_FRAC: f32 = 0.28;
 /// The CURTAIN-4 extras region's centre line (between the date and the stage).
-const EXTRAS_Y_FRAC: f32 = 0.55;
+const EXTRAS_Y_FRAC: f32 = 0.52;
 /// The password stage's centre line (low-centre, lock 8).
-const FIELD_Y_FRAC: f32 = 0.75;
+const FIELD_Y_FRAC: f32 = 0.78;
 /// The extras region's width as a fraction of the sheet width.
 const EXTRAS_W_FRAC: f32 = 0.5;
-/// The extras region's height as a fraction of the sheet height.
-const EXTRAS_H_FRAC: f32 = 0.12;
+/// The extras region's height as a fraction of the sheet height — tall enough
+/// for the now-playing strip, the volume row, and the status glanceables.
+const EXTRAS_H_FRAC: f32 = 0.22;
+/// The locked volume slider's width, on the spacing grid.
+const VOL_SLIDER_W: f32 = Style::SP_XL * 5.0;
+/// The mute-toggle glyph edge (the tray's 16px raster idiom).
+const GLANCE_ICON: f32 = Style::SP_M;
+/// A status-row glanceable dot's radius (the tray's tiny state-dot idiom).
+const GLANCE_DOT_R: f32 = Style::SP_XS / 2.0;
+/// Charge (%) at/under which the battery glanceable reads red, and under which
+/// it reads amber (the tray's ladder, restated — `tray.rs` is a sibling worker's
+/// file and its folds are private, so the thresholds live here too).
+const GLANCE_BATTERY_CRITICAL: f64 = 5.0;
+const GLANCE_BATTERY_LOW: f64 = 20.0;
 /// How far the idle dim drops the face type toward black — the clock stays
 /// faint, never gone (design lock 10).
 const FAINT_DROP: f32 = 0.8;
@@ -209,10 +375,15 @@ struct Signals {
 }
 
 /// Fold one frame's egui events into the curtain's [`Signals`]. A pointer move
-/// (or wheel/zoom/touch drift) only wakes the dim; a key press, text, paste, or
-/// button press also reveals the stage; releases and non-user events (a focus
-/// flip, `PointerGone`) are nothing — never a phantom reveal.
-fn fold_events(events: &[egui::Event]) -> Signals {
+/// (or wheel/zoom/touch drift) only wakes the dim; a key press, text, or paste
+/// reveals the stage; releases and non-user events (a focus flip, `PointerGone`)
+/// are nothing — never a phantom reveal.
+///
+/// A pointer press reveals the stage **unless** it lands inside `exempt` — the
+/// now-playing / volume strip's hit area (CURTAIN-4, design lock 3): a click
+/// there drives the transport, not an unlock, so it only wakes. That strip is
+/// the ONLY interactive region the engaged curtain exempts besides the field.
+fn fold_events(events: &[egui::Event], exempt: Option<egui::Rect>) -> Signals {
     let mut s = Signals::default();
     for e in events {
         match e {
@@ -227,10 +398,17 @@ fn fold_events(events: &[egui::Event]) -> Signals {
             }
             egui::Event::Key { pressed: true, .. }
             | egui::Event::Text(_)
-            | egui::Event::Paste(_)
-            | egui::Event::PointerButton { pressed: true, .. } => {
+            | egui::Event::Paste(_) => {
                 s.reveal = true;
                 s.wake = true;
+            }
+            egui::Event::PointerButton {
+                pressed: true, pos, ..
+            } => {
+                s.wake = true;
+                if !exempt.is_some_and(|r| r.contains(*pos)) {
+                    s.reveal = true;
+                }
             }
             egui::Event::PointerMoved(_)
             | egui::Event::MouseMoved(_)
@@ -333,6 +511,16 @@ pub(crate) struct Curtain {
     password: String,
     /// The verify seam (CURTAIN-2 fills it with PAM; [`NotWired`] by default).
     verifier: Box<dyn Verifier>,
+    /// The CURTAIN-4 master-volume seam (real `wpctl` by default; a recording
+    /// fake in tests). Write-only — the live level is read from the seat
+    /// snapshot the shell hands [`Curtain::show`], never from here.
+    mixer: Box<dyn LockMixer>,
+    /// The in-flight master-mixer write echo (CURTAIN-4), bridging the ~5s
+    /// seat-poll gap so a just-driven volume/mute reads back instantly.
+    vol_echo: Option<VolEcho>,
+    /// The last refused mixer verb's honest message (§7), shown under the
+    /// locked volume slider; cleared by the next successful write.
+    mixer_error: Option<String>,
     /// The previous `show` frame's instant — the real-elapsed clock behind
     /// [`Curtain::tick`] (frames run at 1 Hz on the settled face, so egui's
     /// smoothed `stable_dt` would under-count the idle timer).
@@ -356,6 +544,9 @@ impl Curtain {
             error: None,
             password: String::new(),
             verifier,
+            mixer: Box::new(HostMixer::new()),
+            vol_echo: None,
+            mixer_error: None,
             last_frame: None,
         }
     }
@@ -552,14 +743,34 @@ impl Curtain {
     /// the covering layer. Called LAST in the shell render so `move_to_top`
     /// leaves the curtain above every other float; an early no-op while
     /// `Unlocked`.
-    pub(crate) fn show(&mut self, ctx: &egui::Context) {
+    ///
+    /// CURTAIN-4 hands in the live transport + status state the locked face
+    /// exposes: `media` is the active player the now-playing strip drives
+    /// (design lock 3/7), `seat` carries the master-mixer level + the battery
+    /// glanceable (lock 4), and `mesh` the network-health glanceable (lock 4).
+    /// The shell passes its own `self.media` / `system.snapshot()` /
+    /// `chrome.summary()` — the same reads the taskbar tray folds, no new poll.
+    pub(crate) fn show(
+        &mut self,
+        ctx: &egui::Context,
+        media: &mut dyn LockMedia,
+        seat: Option<&SeatSnapshot>,
+        mesh: &MeshSummary,
+    ) {
         if !self.engaged() {
             self.last_frame = None;
             return;
         }
 
         // 1 — this frame's raw input, folded to the curtain's typed signals.
-        let signals = ctx.input(|i| fold_events(&i.events));
+        // The now-playing / volume strip's hit area is exempt from the reveal
+        // trigger (design lock 3) — but only while it actually carries a live
+        // control: an idle, player-less, mixer-less strip has nothing to drive,
+        // so a press there reveals the stage like anywhere else on the face.
+        let exempt = (matches!(self.phase, Phase::Locked { .. })
+            && extras_interactive(&*media, seat))
+        .then(|| extras_rect(ctx.screen_rect()));
+        let signals = ctx.input(|i| fold_events(&i.events, exempt));
         self.fold_input(signals);
 
         // 2 — advance the per-state timers on real elapsed time (the settled
@@ -601,7 +812,7 @@ impl Curtain {
                 let (rect, _claim) =
                     ui.allocate_exact_size(screen.size(), egui::Sense::click_and_drag());
                 let sheet = rect.translate(egui::vec2(0.0, offset));
-                self.paint_sheet(ui, sheet, dim);
+                self.paint_sheet(ui, sheet, dim, media, seat, mesh);
             });
         ctx.move_to_top(layer.response.layer_id);
 
@@ -621,9 +832,18 @@ impl Curtain {
     }
 
     /// Paint the sheet into its (offset) rect: the opaque near-black fill with
-    /// the overshoot bleed, the giant clock face, the CURTAIN-4 extras seam,
-    /// and the two-stage password reveal.
-    fn paint_sheet(&mut self, ui: &mut egui::Ui, sheet: egui::Rect, dim: f32) {
+    /// the overshoot bleed, the giant clock face, the CURTAIN-4 extras seam
+    /// (now-playing strip + volume + status glanceables), and the two-stage
+    /// password reveal.
+    fn paint_sheet(
+        &mut self,
+        ui: &mut egui::Ui,
+        sheet: egui::Rect,
+        dim: f32,
+        media: &mut dyn LockMedia,
+        seat: Option<&SeatSnapshot>,
+        mesh: &MeshSummary,
+    ) {
         let painter = ui.painter().clone();
 
         // The sheet fill, bled above the top edge so the drop's settle
@@ -656,22 +876,15 @@ impl Curtain {
             faint(Style::TEXT_DIM, dim),
         );
 
-        // The CURTAIN-4 seam: the glanceable status row + the unified
-        // now-playing strip mount in this region (between the date line and
-        // the password stage). Deliberately empty in CURTAIN-1.
-        let extras = egui::Rect::from_center_size(
-            egui::pos2(cx, sheet.height().mul_add(EXTRAS_Y_FRAC, sheet.top())),
-            egui::vec2(
-                sheet.width() * EXTRAS_W_FRAC,
-                sheet.height() * EXTRAS_H_FRAC,
-            ),
-        );
+        // The CURTAIN-4 seam: the unified now-playing strip + the volume row +
+        // the glanceable status row mount in this region (between the date line
+        // and the password stage). The idle dim fades them with the face.
         let mut extras_ui = ui.new_child(
             egui::UiBuilder::new()
-                .max_rect(extras)
+                .max_rect(extras_rect(sheet))
                 .layout(egui::Layout::top_down(egui::Align::Center)),
         );
-        self.face_extras(&mut extras_ui);
+        self.face_extras(&mut extras_ui, dim, media, seat, mesh);
 
         // The two-stage reveal (lock 8): the password stage slides in
         // low-centre. It mounts the instant the stage phase arrives (so the
@@ -699,17 +912,127 @@ impl Curtain {
     }
 
     /// The **CURTAIN-4 seam** — the face's glanceable extras region: the
-    /// status row (battery / mesh health, design lock 4) and the unified
-    /// now-playing transport strip (lock 3/7) mount here. CURTAIN-1
-    /// deliberately leaves it empty; the region + call site are the extension
-    /// point so CURTAIN-4 fills content without re-plumbing the face.
-    #[allow(
-        clippy::unused_self,
-        clippy::missing_const_for_fn,
-        reason = "the CURTAIN-4 extension seam: kept as a plain method so the fill \
-                  reaches the curtain's state without re-plumbing the face"
-    )]
-    fn face_extras(&self, _ui: &mut egui::Ui) {}
+    /// unified now-playing transport strip (design lock 3/7), the master-volume
+    /// row (lock 3), and the status glanceables (battery / mesh / date, lock 4).
+    /// All three fade with the idle dim. No message content is ever shown — the
+    /// curtain is handed no chat state to leak (lock 4).
+    fn face_extras(
+        &mut self,
+        ui: &mut egui::Ui,
+        dim: f32,
+        media: &mut dyn LockMedia,
+        seat: Option<&SeatSnapshot>,
+        mesh: &MeshSummary,
+    ) {
+        // The extras fade with the face's idle dim — faint, never gone (lock 10).
+        ui.set_opacity(dim.mul_add(-FAINT_DROP, 1.0));
+        let now = Instant::now();
+
+        now_playing_strip(ui, media);
+        ui.add_space(Style::SP_S);
+        self.volume_row(ui, seat, now);
+        ui.add_space(Style::SP_S);
+        status_row(ui, seat, mesh);
+    }
+
+    /// The master-volume row (design lock 3): the mute-toggle speaker glyph + a
+    /// slider driving the REAL host mixer through the [`LockMixer`] seam, over
+    /// the echo-folded master level. An absent mixer renders the honest
+    /// not-available line instead of a dead slider (§7); a refused write
+    /// surfaces its typed error underneath.
+    fn volume_row(&mut self, ui: &mut egui::Ui, seat: Option<&SeatSnapshot>, now: Instant) {
+        self.reconcile_vol_echo(seat, now);
+        let Some(master) = self.master_view(seat, now) else {
+            mde_egui::muted_note(ui, "Volume unavailable");
+            return;
+        };
+        let mut level = master.volume;
+        ui.horizontal(|ui| {
+            if mute_button(ui, master.muted) {
+                self.drive_mute(&master.id, !master.muted, master.volume, now);
+            }
+            ui.spacing_mut().slider_width = VOL_SLIDER_W;
+            if ui
+                .add(egui::Slider::new(&mut level, 0..=100).show_value(false))
+                .changed()
+            {
+                self.drive_volume(&master.id, level, master.muted, now);
+            }
+        });
+        if let Some(e) = &self.mixer_error {
+            ui.label(RichText::new(e).size(Style::SMALL).color(Style::DANGER));
+        }
+    }
+
+    /// Drop the volume echo once the seat snapshot reflects it (the ~5s poll
+    /// caught up) or it outlived [`VOL_ECHO_TTL`] — past that, the real state
+    /// wins again (a change made from the System surface must not be overridden
+    /// forever by a stale echo).
+    fn reconcile_vol_echo(&mut self, seat: Option<&SeatSnapshot>, now: Instant) {
+        if let Some(e) = &self.vol_echo {
+            let caught_up = seat.and_then(|s| s.mixer.present()).is_some_and(|m| {
+                m.master.id == e.id && m.master.volume == e.volume && m.master.muted == e.muted
+            });
+            if caught_up || now.duration_since(e.at) >= VOL_ECHO_TTL {
+                self.vol_echo = None;
+            }
+        }
+    }
+
+    /// The master strip to render + drive: the snapshot's master with any live
+    /// echo folded over it. `None` when the seat carries no mixer.
+    fn master_view(&self, seat: Option<&SeatSnapshot>, now: Instant) -> Option<MasterView> {
+        let master = &seat?.mixer.present()?.master;
+        if let Some(e) = &self.vol_echo {
+            if e.id == master.id && now.duration_since(e.at) < VOL_ECHO_TTL {
+                return Some(MasterView {
+                    id: master.id.clone(),
+                    volume: e.volume,
+                    muted: e.muted,
+                });
+            }
+        }
+        Some(MasterView {
+            id: master.id.clone(),
+            volume: master.volume,
+            muted: master.muted,
+        })
+    }
+
+    /// Drive the master volume through the seam: on `Ok`, echo it so the slider
+    /// reads back instantly; on a refusal, surface the typed error and echo
+    /// NOTHING (§7 — the stale snapshot stays the truth).
+    fn drive_volume(&mut self, id: &str, volume: u8, muted: bool, now: Instant) {
+        match self.mixer.set_volume(id, volume) {
+            Ok(()) => {
+                self.mixer_error = None;
+                self.vol_echo = Some(VolEcho {
+                    id: id.to_owned(),
+                    volume,
+                    muted,
+                    at: now,
+                });
+            }
+            Err(e) => self.mixer_error = Some(format!("volume: {e}")),
+        }
+    }
+
+    /// Drive the master mute — the same confirm-then-echo contract; the echo is
+    /// what flips the speaker glyph live.
+    fn drive_mute(&mut self, id: &str, muted: bool, volume: u8, now: Instant) {
+        match self.mixer.set_muted(id, muted) {
+            Ok(()) => {
+                self.mixer_error = None;
+                self.vol_echo = Some(VolEcho {
+                    id: id.to_owned(),
+                    volume,
+                    muted,
+                    at: now,
+                });
+            }
+            Err(e) => self.mixer_error = Some(format!("mute: {e}")),
+        }
+    }
 
     /// The password stage (lock 8): the low-centre field (masked input), the
     /// verify spinner, the honest deny line, or the backoff wall's live
@@ -766,6 +1089,185 @@ impl Curtain {
     }
 }
 
+// ─────────────────────── the CURTAIN-4 face-extras folds ──────────────────────
+
+/// The CURTAIN-4 extras region's rect within a `sheet` — the now-playing strip,
+/// the volume row, and the status glanceables mount here (between the date line
+/// and the password stage). Shared by the painter AND the input-exemption fold
+/// so the hit area exempted from the reveal is exactly what's drawn (lock 3).
+fn extras_rect(sheet: egui::Rect) -> egui::Rect {
+    egui::Rect::from_center_size(
+        egui::pos2(
+            sheet.center().x,
+            sheet.height().mul_add(EXTRAS_Y_FRAC, sheet.top()),
+        ),
+        egui::vec2(
+            sheet.width() * EXTRAS_W_FRAC,
+            sheet.height() * EXTRAS_H_FRAC,
+        ),
+    )
+}
+
+/// Whether the extras strip carries a live control this frame — a loaded player
+/// (play/pause/next/prev) or a present mixer (the volume slider). Only then is
+/// its hit area worth exempting from the reveal trigger: an inert strip has
+/// nothing to drive, so a press there should reveal the stage (design lock 3).
+fn extras_interactive(media: &dyn LockMedia, seat: Option<&SeatSnapshot>) -> bool {
+    media.now_playing().is_some() || seat.is_some_and(|s| s.mixer.present().is_some())
+}
+
+/// The unified now-playing strip (design lock 3/7): the active player's title +
+/// a live state word over a prev · play/pause · next transport, driving the
+/// [`LockMedia`] seam. With nothing loaded it shows the honest "Nothing playing"
+/// line and NO controls — never a dead button (§7).
+fn now_playing_strip(ui: &mut egui::Ui, media: &mut dyn LockMedia) {
+    let Some(np) = media.now_playing() else {
+        mde_egui::muted_note(ui, "Nothing playing");
+        return;
+    };
+    let playing = np.playing;
+    ui.label(
+        RichText::new(np.title)
+            .size(Style::BODY)
+            .color(Style::ACCENT),
+    );
+    ui.label(
+        RichText::new(if playing { "Now playing" } else { "Paused" })
+            .size(Style::SMALL)
+            .color(Style::TEXT_DIM),
+    );
+    ui.add_space(Style::SP_XS);
+    ui.horizontal(|ui| {
+        if ui.button("Prev").clicked() {
+            media.prev();
+        }
+        if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
+            media.toggle_play();
+        }
+        if ui.button("Next").clicked() {
+            media.next();
+        }
+    });
+}
+
+/// The glanceable status row (design lock 4): battery · mesh health · date — the
+/// ONLY status the curtain shows. NO message content: chat previews stay private
+/// until unlock, and the curtain is handed no chat state to leak. The tray's
+/// fold logic, restated (its helpers are private to a sibling worker's tray.rs).
+fn status_row(ui: &mut egui::Ui, seat: Option<&SeatSnapshot>, mesh: &MeshSummary) {
+    ui.horizontal(|ui| {
+        if let Some((pct, tone)) = battery_glance(seat) {
+            glance_dot(ui, tone);
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a battery percentage is a clamped 0..=100 value"
+            )]
+            let label = format!("{}%", pct.round() as u32);
+            ui.label(
+                RichText::new(label)
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            );
+            ui.add_space(Style::SP_M);
+        }
+        let (tone, word) = mesh_glance(mesh);
+        glance_dot(ui, tone);
+        ui.label(
+            RichText::new(word)
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+        ui.add_space(Style::SP_M);
+        let (_, date) = face_lines(unix_now());
+        ui.label(
+            RichText::new(date)
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+    });
+}
+
+/// A tiny tone dot (the tray's at-a-glance state idiom) leading a glanceable.
+fn glance_dot(ui: &mut egui::Ui, tone: Color32) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(Style::SP_S, Style::SP_S), egui::Sense::hover());
+    ui.painter()
+        .circle_filled(rect.center(), GLANCE_DOT_R, tone);
+}
+
+/// The mute-toggle speaker glyph (the tray's volume-flyout affordance): the
+/// muted variant + a WARN tint while muted, hover fill, no tooltip. Returns
+/// `true` on a click.
+fn mute_button(ui: &mut egui::Ui, muted: bool) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(Style::SP_L, Style::SP_L), egui::Sense::click());
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let (glyph, tint) = if muted {
+        (IconId::VolumeMuted, Style::WARN)
+    } else {
+        (IconId::Volume, Style::TEXT)
+    };
+    if let Some(tex) = icon_texture(ui.ctx(), glyph, GLANCE_ICON, tint) {
+        let icon_rect =
+            egui::Rect::from_center_size(rect.center(), egui::vec2(GLANCE_ICON, GLANCE_ICON));
+        egui::Image::new(egui::load::SizedTexture::new(tex.id(), icon_rect.size()))
+            .paint_at(ui, icon_rect);
+    }
+    response.clicked()
+}
+
+/// The battery glanceable — `(percentage, tone)` for the system pack, or `None`
+/// when no battery is present (a desktop / pre-poll). The tray's system-pack
+/// pick + tone ladder, restated (lock 4).
+fn battery_glance(seat: Option<&SeatSnapshot>) -> Option<(f64, Color32)> {
+    let cells = seat?.batteries.present()?;
+    let b = cells.iter().find(|b| b.power_supply).or_else(|| {
+        cells.iter().max_by(|a, b| {
+            a.percentage
+                .partial_cmp(&b.percentage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    })?;
+    Some((b.percentage, battery_glance_tone(b)))
+}
+
+/// The battery dot's tone (the tray's `battery_tone` ladder, restated): a
+/// charging/full pack reads OK; a draining pack reads red at/under ~5% and amber
+/// under ~20%; anything else the neutral dim dot.
+fn battery_glance_tone(b: &Battery) -> Color32 {
+    match b.state {
+        BatteryState::Charging | BatteryState::FullyCharged => Style::OK,
+        BatteryState::Empty => Style::DANGER,
+        BatteryState::Discharging | BatteryState::PendingDischarge => {
+            if b.percentage <= GLANCE_BATTERY_CRITICAL {
+                Style::DANGER
+            } else if b.percentage < GLANCE_BATTERY_LOW {
+                Style::WARN
+            } else {
+                Style::TEXT_DIM
+            }
+        }
+        BatteryState::PendingCharge | BatteryState::Unknown => Style::TEXT_DIM,
+    }
+}
+
+/// The mesh-health glanceable `(tone, word)` — the worst-of lighthouse verdict,
+/// dim/"—" before the first snapshot (lock 4).
+const fn mesh_glance(mesh: &MeshSummary) -> (Color32, &'static str) {
+    if !mesh.seen {
+        return (Style::TEXT_DIM, "Mesh \u{2014}");
+    }
+    match mesh.health {
+        LighthouseHealth::AllHealthy => (Style::OK, "Mesh OK"),
+        LighthouseHealth::Degraded => (Style::DANGER, "Mesh degraded"),
+        LighthouseHealth::None => (Style::TEXT_DIM, "Mesh \u{2014}"),
+    }
+}
+
 // ──────────────────────────────────── tests ────────────────────────────────────
 
 #[cfg(test)]
@@ -774,6 +1276,7 @@ mod tests {
     use crate::chrome::MeshSummary;
     use crate::dock::{self, Surface};
     use crate::tray::{TrayInputs, TrayState};
+    use mde_seat::{Backend, BatteryKind, MixerStatus, MixerStrip, Probe, StripOrigin};
     use std::collections::VecDeque;
 
     // ── the scripted verify seam ──
@@ -860,11 +1363,17 @@ mod tests {
     fn attempt_async(c: &mut Curtain, password: &str) {
         c.password.push_str(password);
         c.submit();
-        assert!(matches!(c.phase, Phase::Verifying), "submit must enter Verifying");
+        assert!(
+            matches!(c.phase, Phase::Verifying),
+            "submit must enter Verifying"
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         while matches!(c.phase, Phase::Verifying) {
             c.tick(0.01);
-            assert!(Instant::now() < deadline, "the verdict never landed off-thread");
+            assert!(
+                Instant::now() < deadline,
+                "the verdict never landed off-thread"
+            );
             std::thread::yield_now();
         }
     }
@@ -888,6 +1397,157 @@ mod tests {
             events,
             ..Default::default()
         }
+    }
+
+    // ── the CURTAIN-4 transport fakes + seat fixtures ──
+
+    /// A recording [`LockMedia`]: scripts a now-playing view and counts the
+    /// transport drives — the seam CURTAIN-4's live `MediaSurface` fills, and
+    /// the recording fake §7 asks for (assert the locked strip drove the seam).
+    #[derive(Default)]
+    struct RecordingMedia {
+        np: Option<NowPlaying>,
+        toggles: usize,
+        nexts: usize,
+        prevs: usize,
+    }
+
+    impl RecordingMedia {
+        /// A fake whose player is loaded + playing `title`.
+        fn playing(title: &str) -> Self {
+            Self {
+                np: Some(NowPlaying {
+                    title: title.to_owned(),
+                    playing: true,
+                }),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl LockMedia for RecordingMedia {
+        fn now_playing(&self) -> Option<NowPlaying> {
+            self.np.clone()
+        }
+        fn toggle_play(&mut self) {
+            self.toggles += 1;
+        }
+        fn next(&mut self) {
+            self.nexts += 1;
+        }
+        fn prev(&mut self) {
+            self.prevs += 1;
+        }
+    }
+
+    /// The recorded master-mixer writes (shared so the test reads them back).
+    #[derive(Default)]
+    struct MixerLog {
+        volumes: Vec<(String, u8)>,
+        mutes: Vec<(String, bool)>,
+    }
+
+    /// A recording [`LockMixer`]: logs every confirmed master write, or refuses
+    /// them all to exercise the honest error path (§7).
+    #[derive(Clone, Default)]
+    struct RecordingMixer {
+        log: std::rc::Rc<std::cell::RefCell<MixerLog>>,
+        refuse: bool,
+    }
+
+    fn refused() -> SeatError {
+        SeatError::Unavailable {
+            backend: Backend::PipeWire,
+            reason: "test refusal".to_owned(),
+        }
+    }
+
+    impl LockMixer for RecordingMixer {
+        fn set_volume(&self, id: &str, v: u8) -> Result<(), SeatError> {
+            if self.refuse {
+                return Err(refused());
+            }
+            self.log.borrow_mut().volumes.push((id.to_owned(), v));
+            Ok(())
+        }
+        fn set_muted(&self, id: &str, m: bool) -> Result<(), SeatError> {
+            if self.refuse {
+                return Err(refused());
+            }
+            self.log.borrow_mut().mutes.push((id.to_owned(), m));
+            Ok(())
+        }
+    }
+
+    /// A typed-absent probe of any section (the honest build-host state).
+    fn absent<T>() -> Probe<T> {
+        Probe::Absent {
+            backend: Backend::PipeWire,
+            reason: "not available: test".to_owned(),
+        }
+    }
+
+    /// An all-absent seat snapshot the per-section fixtures override.
+    fn seat() -> SeatSnapshot {
+        SeatSnapshot {
+            bluetooth: absent(),
+            batteries: absent(),
+            on_ac: absent(),
+            power: absent(),
+            power_profile: absent(),
+            charge_limit: absent(),
+            lid: absent(),
+            displays: absent(),
+            backlights: absent(),
+            mixer: absent(),
+            ddc: absent(),
+        }
+    }
+
+    /// A master mixer strip at a chosen volume + mute.
+    fn mixer(volume: u8, muted: bool) -> MixerStatus {
+        MixerStatus {
+            master: MixerStrip {
+                id: "master".to_owned(),
+                name: "Master".to_owned(),
+                origin: StripOrigin::HostSession,
+                volume,
+                muted,
+            },
+            strips: Vec::new(),
+        }
+    }
+
+    /// One internal system pack at a chosen charge/state.
+    fn pack(percentage: f64, state: BatteryState) -> Battery {
+        Battery {
+            model: "BAT0".to_owned(),
+            kind: BatteryKind::Internal,
+            percentage,
+            state,
+            power_supply: true,
+            time_to_empty: None,
+            time_to_full: None,
+            energy_rate: None,
+        }
+    }
+
+    /// A seen mesh summary at a chosen health.
+    fn seen_mesh(health: LighthouseHealth) -> MeshSummary {
+        MeshSummary {
+            peers_total: 2,
+            peers_online: 2,
+            health,
+            seen: true,
+        }
+    }
+
+    /// Drive `show` with no live media / seat and a default mesh — the CURTAIN-1
+    /// tests only exercise the clock / motion / input-exclusivity, not the
+    /// CURTAIN-4 strip, so they mount an empty transport.
+    fn show_bare(c: &mut Curtain, ctx: &egui::Context) {
+        let mut media = RecordingMedia::default();
+        c.show(ctx, &mut media, None, &MeshSummary::default());
     }
 
     // ── the state machine ──
@@ -1022,7 +1682,10 @@ mod tests {
             .backoff_remaining()
             .expect("the 5th real denial must arm the backoff wall");
         assert!((remaining - BACKOFF_SECS).abs() < 1e-3);
-        assert!(!c.stage_accepts_input(), "the field disables behind the wall");
+        assert!(
+            !c.stage_accepts_input(),
+            "the field disables behind the wall"
+        );
         assert!(c.engaged() && c.covers_fully());
     }
 
@@ -1144,10 +1807,19 @@ mod tests {
 
     // ── input folding ──
 
+    fn click_at(pos: egui::Pos2) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
     #[test]
     fn raw_input_folds_to_wake_reveal_and_escape() {
         // A pointer drift only wakes (never a phantom reveal).
-        let s = fold_events(&[egui::Event::PointerMoved(egui::pos2(1.0, 1.0))]);
+        let s = fold_events(&[egui::Event::PointerMoved(egui::pos2(1.0, 1.0))], None);
         assert_eq!(
             s,
             Signals {
@@ -1157,7 +1829,7 @@ mod tests {
             }
         );
         // A key press wakes AND reveals; a release is nothing.
-        let s = fold_events(&[key(egui::Key::A, true)]);
+        let s = fold_events(&[key(egui::Key::A, true)], None);
         assert_eq!(
             s,
             Signals {
@@ -1166,20 +1838,48 @@ mod tests {
                 escape: false
             }
         );
-        assert_eq!(fold_events(&[key(egui::Key::A, false)]), Signals::default());
+        assert_eq!(
+            fold_events(&[key(egui::Key::A, false)], None),
+            Signals::default()
+        );
         // A click reveals.
-        let s = fold_events(&[egui::Event::PointerButton {
-            pos: egui::pos2(10.0, 10.0),
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::default(),
-        }]);
+        let s = fold_events(&[click_at(egui::pos2(10.0, 10.0))], None);
         assert!(s.reveal && s.wake && !s.escape);
         // Escape carries the escape signal.
-        let s = fold_events(&[key(egui::Key::Escape, true)]);
+        let s = fold_events(&[key(egui::Key::Escape, true)], None);
         assert!(s.escape && s.wake);
         // A non-user event is nothing — it must not wake the dim.
-        assert_eq!(fold_events(&[egui::Event::PointerGone]), Signals::default());
+        assert_eq!(
+            fold_events(&[egui::Event::PointerGone], None),
+            Signals::default()
+        );
+    }
+
+    #[test]
+    fn a_press_on_the_exempt_media_strip_wakes_but_never_reveals() {
+        // CURTAIN-4 (design lock 3): a press inside the now-playing / volume
+        // strip drives that control — it must NOT reveal the password stage —
+        // while a press anywhere else on the face reveals it (lock 8).
+        let strip = egui::Rect::from_min_max(egui::pos2(100.0, 300.0), egui::pos2(400.0, 380.0));
+        let inside = fold_events(&[click_at(egui::pos2(250.0, 340.0))], Some(strip));
+        assert_eq!(
+            inside,
+            Signals {
+                wake: true,
+                reveal: false,
+                escape: false
+            },
+            "a press on the exempt media strip wakes but must not reveal"
+        );
+        let outside = fold_events(&[click_at(egui::pos2(250.0, 500.0))], Some(strip));
+        assert!(
+            outside.reveal && outside.wake,
+            "a press off the strip still reveals the stage"
+        );
+        // A keystroke reveals regardless of the exempt strip (you can't type a
+        // password into a transport button).
+        let keyed = fold_events(&[key(egui::Key::A, true)], Some(strip));
+        assert!(keyed.reveal);
     }
 
     // ── input exclusivity (lock 10) ──
@@ -1218,7 +1918,7 @@ mod tests {
                 });
             // Reborrow per frame — `ctx.run`'s closure is `FnMut`.
             if let Some(c) = curtain.as_deref_mut() {
-                c.show(ctx);
+                show_bare(c, ctx);
             }
         });
     }
@@ -1299,7 +1999,7 @@ mod tests {
         // A surface field beneath holds keyboard focus as the curtain drops…
         let beneath = egui::Id::new("some-surface-field");
         ctx.memory_mut(|m| m.request_focus(beneath));
-        let _ = ctx.run(raw(Vec::new()), |ctx| c.show(ctx));
+        let _ = ctx.run(raw(Vec::new()), |ctx| show_bare(&mut c, ctx));
         assert_ne!(
             ctx.memory(egui::Memory::focused),
             Some(beneath),
@@ -1307,9 +2007,11 @@ mod tests {
         );
 
         // …any key reveals the stage, whose field takes the keyboard.
-        let _ = ctx.run(raw(vec![key(egui::Key::A, true)]), |ctx| c.show(ctx));
+        let _ = ctx.run(raw(vec![key(egui::Key::A, true)]), |ctx| {
+            show_bare(&mut c, ctx);
+        });
         assert!(matches!(c.phase, Phase::Revealing));
-        let _ = ctx.run(raw(Vec::new()), |ctx| c.show(ctx));
+        let _ = ctx.run(raw(Vec::new()), |ctx| show_bare(&mut c, ctx));
         assert_eq!(
             ctx.memory(egui::Memory::focused),
             Some(egui::Id::new(PASSWORD_FIELD)),
@@ -1338,15 +2040,18 @@ mod tests {
         Style::install(&ctx);
         let mut c = locked(Scripted::denies(0));
         // Prime one frame — egui sizes a fresh Area before its first real paint.
-        let _ = ctx.run(raw(Vec::new()), |ctx| c.show(ctx));
-        let out = ctx.run(raw(Vec::new()), |ctx| c.show(ctx));
+        let _ = ctx.run(raw(Vec::new()), |ctx| show_bare(&mut c, ctx));
+        let out = ctx.run(raw(Vec::new()), |ctx| show_bare(&mut c, ctx));
         let mut texts = 0;
         for clipped in &out.shapes {
             count_text_shapes(&clipped.shape, &mut texts);
         }
-        assert_eq!(
-            texts, 2,
-            "the resting face carries exactly the clock's two lines (HH:MM + date)"
+        // The face carries the clock's two lines (HH:MM + date) plus the
+        // always-present CURTAIN-4 glanceables (nothing-playing · volume ·
+        // mesh · date), so at least the clock's two must paint.
+        assert!(
+            texts >= 2,
+            "the resting face is missing the clock's two lines ({texts} texts)"
         );
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         assert!(!prims.is_empty(), "the curtain painted no draw primitives");
@@ -1357,11 +2062,261 @@ mod tests {
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut c = Curtain::default();
-        let out = ctx.run(raw(Vec::new()), |ctx| c.show(ctx));
+        let out = ctx.run(raw(Vec::new()), |ctx| show_bare(&mut c, ctx));
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
         assert!(
             prims.is_empty(),
             "an unlocked curtain must draw nothing at all"
         );
+    }
+
+    // ── CURTAIN-4: the now-playing transport + volume + status glanceables ──
+
+    #[test]
+    fn the_media_seam_drives_the_real_media_surface() {
+        // §7: the transport drives the LIVE player, not a mock — the production
+        // `MediaSurface` (airgap-safe `FakeMpv`) through the `LockMedia` seam.
+        let mut media = mde_media_egui::real_media();
+        assert!(
+            LockMedia::now_playing(&media).is_none(),
+            "an idle surface honestly has nothing playing"
+        );
+
+        // Load + play a path through the real transport (no disk I/O — FakeMpv).
+        media.dispatch(TransportAction::PlayPath("/media/song.mp3".to_owned()));
+        let np = LockMedia::now_playing(&media).expect("a loaded track is now-playing");
+        assert!(
+            np.title.contains("song"),
+            "the title is the real player's, not invented: {}",
+            np.title
+        );
+
+        // The transport verbs reach the real player; a Stop unloads it, so the
+        // strip honestly falls back to "nothing playing" (no dead controls).
+        LockMedia::toggle_play(&mut media);
+        media.dispatch(TransportAction::Stop);
+        assert!(
+            LockMedia::now_playing(&media).is_none(),
+            "Stop unloads the transport — the honest empty state (§7)"
+        );
+    }
+
+    #[test]
+    fn the_media_strip_is_exempt_from_the_lock_but_the_rest_reveals() {
+        // §7 / design lock 3: a press on the now-playing / volume strip drives
+        // that control while the curtain stays LOCKED (the media hit-areas are
+        // exempt from the whole-screen grab); a press anywhere else reveals the
+        // password stage (lock 8).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut c = locked(Scripted::denies(0));
+        let mut media = RecordingMedia::playing("Song \u{2014} Artist");
+        let snap = {
+            let mut s = seat();
+            s.mixer = Probe::Present(mixer(40, false));
+            s
+        };
+        let mesh = MeshSummary::default();
+
+        // Prime a frame so the covering Area is sized + settled on the face.
+        let _ = ctx.run(raw(Vec::new()), |ctx| {
+            c.show(ctx, &mut media, Some(&snap), &mesh);
+        });
+        assert!(matches!(c.phase, Phase::Locked { .. }));
+
+        // A press INSIDE the extras strip (its centre, 0.52·h) must NOT reveal.
+        let inside = egui::pos2(640.0, 720.0 * EXTRAS_Y_FRAC);
+        let _ = ctx.run(
+            raw(vec![egui::Event::PointerMoved(inside), click_at(inside)]),
+            |ctx| {
+                c.show(ctx, &mut media, Some(&snap), &mesh);
+            },
+        );
+        assert!(
+            matches!(c.phase, Phase::Locked { .. }),
+            "a press on the media strip must keep the curtain locked (lock 3)"
+        );
+
+        // A press near the top of the face (off the strip) reveals the stage.
+        let outside = egui::pos2(640.0, 40.0);
+        let _ = ctx.run(
+            raw(vec![egui::Event::PointerMoved(outside), click_at(outside)]),
+            |ctx| {
+                c.show(ctx, &mut media, Some(&snap), &mesh);
+            },
+        );
+        assert!(
+            matches!(c.phase, Phase::Revealing),
+            "a press off the strip reveals the password stage (lock 8)"
+        );
+    }
+
+    #[test]
+    fn a_player_less_strip_still_reveals_on_a_press_over_it() {
+        // With no player AND no mixer the strip carries no live control, so its
+        // area is NOT exempt — a press there must still reveal (never a dead
+        // zone that traps the user, §7).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut c = locked(Scripted::denies(0));
+        let mut media = RecordingMedia::default(); // nothing playing
+        let mesh = MeshSummary::default();
+        let _ = ctx.run(raw(Vec::new()), |ctx| {
+            c.show(ctx, &mut media, None, &mesh);
+        });
+        let over = egui::pos2(640.0, 720.0 * EXTRAS_Y_FRAC);
+        let _ = ctx.run(
+            raw(vec![egui::Event::PointerMoved(over), click_at(over)]),
+            |ctx| {
+                c.show(ctx, &mut media, None, &mesh);
+            },
+        );
+        assert!(
+            matches!(c.phase, Phase::Revealing),
+            "an inert strip must not swallow the reveal"
+        );
+    }
+
+    #[test]
+    fn the_playing_face_paints_more_than_the_idle_face() {
+        // The transport strip actually renders: a playing face (title + state +
+        // prev/play/next) carries strictly more text than an idle one.
+        fn face_texts(np: Option<&str>) -> usize {
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            let mut c = locked(Scripted::denies(0));
+            let mut media = np.map_or_else(RecordingMedia::default, RecordingMedia::playing);
+            let mesh = MeshSummary::default();
+            let _ = ctx.run(raw(Vec::new()), |ctx| {
+                c.show(ctx, &mut media, None, &mesh);
+            });
+            let out = ctx.run(raw(Vec::new()), |ctx| {
+                c.show(ctx, &mut media, None, &mesh);
+            });
+            let mut texts = 0;
+            for clipped in &out.shapes {
+                count_text_shapes(&clipped.shape, &mut texts);
+            }
+            texts
+        }
+        assert!(
+            face_texts(Some("Great Song")) > face_texts(None),
+            "the now-playing strip must add its title + transport to the face"
+        );
+    }
+
+    #[test]
+    fn the_volume_slider_drives_the_real_mixer_and_echoes_it_back() {
+        // §7 / design lock 3: the slider drives the REAL host mixer through the
+        // seam; the confirmed write echoes so the level reads back before the
+        // ~5s seat poll (the tray's echo, one slot).
+        let mut c = Curtain::with_verifier(Scripted::denies(0));
+        let rec = RecordingMixer::default();
+        c.mixer = Box::new(rec.clone());
+        let now = Instant::now();
+
+        c.drive_volume("master", 55, false, now);
+        assert_eq!(
+            rec.log.borrow().volumes,
+            vec![("master".to_owned(), 55)],
+            "the confirmed write reached the mixer seam"
+        );
+        // The echo folds over a stale snapshot so the slider reads 55 at once.
+        let snap = {
+            let mut s = seat();
+            s.mixer = Probe::Present(mixer(40, false)); // the poll still says 40
+            s
+        };
+        let view = c.master_view(Some(&snap), now).expect("a master strip");
+        assert_eq!(
+            view.volume, 55,
+            "the echo reads the just-written level back"
+        );
+
+        // Once the snapshot catches up (or the TTL passes), the echo clears.
+        let caught = {
+            let mut s = seat();
+            s.mixer = Probe::Present(mixer(55, false));
+            s
+        };
+        c.reconcile_vol_echo(Some(&caught), now);
+        assert!(
+            c.vol_echo.is_none(),
+            "the echo drops once the poll catches up"
+        );
+    }
+
+    #[test]
+    fn the_mute_toggle_drives_the_mixer_and_a_refusal_surfaces_honestly() {
+        // A confirmed mute echoes; a refused write surfaces its typed error and
+        // echoes NOTHING (§7 — the stale snapshot stays the truth).
+        let mut c = Curtain::with_verifier(Scripted::denies(0));
+        let rec = RecordingMixer::default();
+        c.mixer = Box::new(rec.clone());
+        let now = Instant::now();
+        c.drive_mute("master", true, 40, now);
+        assert_eq!(rec.log.borrow().mutes, vec![("master".to_owned(), true)]);
+        assert!(c.vol_echo.is_some(), "a confirmed mute echoes");
+
+        let mut refuse = Curtain::with_verifier(Scripted::denies(0));
+        refuse.mixer = Box::new(RecordingMixer {
+            refuse: true,
+            ..RecordingMixer::default()
+        });
+        refuse.drive_volume("master", 10, false, now);
+        assert!(
+            refuse.vol_echo.is_none(),
+            "a refused write never echoes (§7)"
+        );
+        assert!(
+            refuse
+                .mixer_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("volume"),
+            "a refused write surfaces its typed error"
+        );
+    }
+
+    #[test]
+    fn the_status_folds_battery_mesh_and_show_no_chat() {
+        // Design lock 4: the glanceables read real battery + mesh; the curtain
+        // is handed NO chat state (the `show` signature takes only media / seat /
+        // mesh), so message content can never reach the face.
+        let mut s = seat();
+        s.batteries = Probe::Present(vec![pack(12.0, BatteryState::Discharging)]);
+        let (pct, tone) = battery_glance(Some(&s)).expect("a system pack");
+        assert!((pct - 12.0).abs() < f64::EPSILON);
+        assert_eq!(tone, Style::WARN, "12% draining reads amber");
+        assert!(
+            battery_glance(None).is_none(),
+            "no seat → no battery glanceable"
+        );
+
+        assert_eq!(
+            mesh_glance(&seen_mesh(LighthouseHealth::AllHealthy)),
+            (Style::OK, "Mesh OK")
+        );
+        assert_eq!(
+            mesh_glance(&seen_mesh(LighthouseHealth::Degraded)).0,
+            Style::DANGER
+        );
+        assert_eq!(
+            mesh_glance(&MeshSummary::default()).0,
+            Style::TEXT_DIM,
+            "a pre-first-snapshot mesh reads dim, not a fabricated verdict"
+        );
+    }
+
+    #[test]
+    fn an_absent_mixer_shows_no_dead_slider() {
+        // §7: with no mixer the master view is None, so the volume row renders
+        // the honest not-available line instead of a slider over nothing.
+        let c = Curtain::with_verifier(Scripted::denies(0));
+        assert!(
+            c.master_view(Some(&seat()), Instant::now()).is_none(),
+            "an absent mixer yields no master view (honest, no dead slider)"
+        );
+        assert!(c.master_view(None, Instant::now()).is_none());
     }
 }
