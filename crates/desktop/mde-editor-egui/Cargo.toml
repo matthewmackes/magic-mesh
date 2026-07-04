@@ -83,6 +83,11 @@ tree-sitter-bash = "0.23"
 mde-bus = { path = "../../platform/mde-bus" }
 serde = { workspace = true }
 base64 = "0.22"
+# EDITOR-8 project + in-buffer search: the pure-Rust regex engine backing the
+# find/replace overlay's `.*` toggle + the project-wide search's regex mode.
+# Already a direct dep of `mde-term-egui` + `mde-files` (one workspace-locked
+# version), so no new lock line; vendors/builds offline; no C, no build script.
+regex = "1"
 
 [dev-dependencies]
 # EDITOR-2 buffer tests write + read real files (the open round-trip and the

@@ -890,6 +890,84 @@ impl EditorView {
         self.finish_edit(groups, EditKind::Delete, multi);
     }
 
+    // ── EDITOR-8: the find/replace edit seams ────────────────────────────────
+
+    /// Replace char `range` with `text` as ONE self-contained undo step, leaving
+    /// a single caret at the end of the inserted text — the Replace-current seam
+    /// (EDITOR-8). A real rope edit: it records widget + buffer undo and bumps the
+    /// LSP edit generation, exactly like a typed edit, so a replace is undoable and
+    /// syncs the language server. Out-of-range bounds clamp; an empty range with
+    /// empty `text` records nothing.
+    pub fn replace_range(&mut self, buffer: &mut Buffer, range: Range<usize>, text: &str) {
+        let len = buffer.len_chars();
+        let start = range.start.min(len);
+        let end = range.end.clamp(start, len);
+        self.begin_edit();
+        let groups = Self::splice(buffer, start, end, text);
+        let caret = (start + text.chars().count()).min(buffer.len_chars());
+        self.carets = vec![Caret::at(caret)];
+        self.primary = 0;
+        self.box_anchor = None;
+        // `multi = true`: a replace is always its own closed undo step (it never
+        // coalesces into a run of typing).
+        self.finish_edit(groups, EditKind::Insert, true);
+    }
+
+    /// Replace every range in `ranges` (ascending, non-overlapping — as
+    /// [`crate::search::find_matches`] yields) with `text` as ONE undo step,
+    /// returning the count replaced — the Replace-All seam (EDITOR-8). Applies
+    /// right-to-left so each edit leaves the earlier ranges' char indices valid,
+    /// then leaves one caret at the first (topmost) replacement.
+    pub fn replace_all(
+        &mut self,
+        buffer: &mut Buffer,
+        ranges: &[Range<usize>],
+        text: &str,
+    ) -> usize {
+        if ranges.is_empty() {
+            return 0;
+        }
+        self.begin_edit();
+        let mut groups = 0usize;
+        let mut count = 0usize;
+        for range in ranges.iter().rev() {
+            let len = buffer.len_chars();
+            let start = range.start.min(len);
+            let end = range.end.clamp(start, len);
+            groups += Self::splice(buffer, start, end, text);
+            count += 1;
+        }
+        let caret = ranges
+            .first()
+            .map_or(0, |r| r.start)
+            .min(buffer.len_chars());
+        self.carets = vec![Caret::at(caret)];
+        self.primary = 0;
+        self.box_anchor = None;
+        self.finish_edit(groups, EditKind::Insert, true);
+        count
+    }
+
+    /// Splice `text` in place of char span `start..end` of the buffer, returning
+    /// the number of buffer undo groups it recorded (0/1/2) — the shared primitive
+    /// under [`replace_range`](Self::replace_range) /
+    /// [`replace_all`](Self::replace_all). Mirrors the group bookkeeping of the
+    /// widget's own [`insert`](Self::insert) fan-out.
+    fn splice(buffer: &mut Buffer, start: usize, end: usize, text: &str) -> usize {
+        let mut groups = 0usize;
+        if end > start {
+            buffer.remove(start..end);
+            buffer.commit_group();
+            groups += 1;
+        }
+        if !text.is_empty() {
+            buffer.insert(start, text);
+            buffer.commit_group();
+            groups += 1;
+        }
+        groups
+    }
+
     // ── EDTB-3: the markdown formatting seam (drives `md_actions`) ───────────
 
     /// Every caret's char span (`lo..hi`, an *empty* span at a bare caret) — the
@@ -1461,6 +1539,23 @@ impl EditorView {
     }
 }
 
+/// The in-buffer find matches to live-highlight this frame (EDITOR-8).
+///
+/// The ascending char ranges the search bar resolved against the buffer, plus
+/// which one is the *current* match (painted with a stronger band + an outline).
+/// Empty ranges + `None` — the [`Default`] — when no find bar targets this widget,
+/// so a non-search frame paints exactly as before. The ranges are viewport-culled
+/// per row at paint time (clamped to each visual row, exactly like the selection
+/// bands), so a match off-screen costs nothing.
+#[derive(Clone, Copy, Default)]
+pub struct MatchHighlights<'a> {
+    /// The matches to highlight — ascending char ranges into the rope.
+    pub ranges: &'a [Range<usize>],
+    /// The index (into `ranges`) of the current match, or `None` when there is
+    /// no current match to emphasize.
+    pub current: Option<usize>,
+}
+
 /// Render + edit an open [`Buffer`](crate::buffer::Buffer) through its
 /// [`EditorView`] — the one egui entry point for the code editor (EDITOR-3/4/5).
 ///
@@ -1471,14 +1566,16 @@ impl EditorView {
 /// [`Style`] tokens (§4). `highlight` is the document's syntax highlighter
 /// (EDITOR-5) or `None` for plain text: when present it is synced with this
 /// frame's edits (incremental re-parse) and the visible rows paint span by span
-/// in their code-token colors. Returns the content [`Response`] so the surface
-/// can observe focus/hover.
+/// in their code-token colors. `matches` are the EDITOR-8 find highlights layered
+/// over the text (empty for a non-search frame). Returns the content [`Response`]
+/// so the surface can observe focus/hover.
 pub fn editor_widget(
     ui: &mut Ui,
     view: &mut EditorView,
     buffer: &mut Buffer,
     highlight: Option<&mut Highlighter>,
     diagnostics: &DiagnosticsOverlay,
+    matches: MatchHighlights,
 ) -> Response {
     view.clamp(buffer);
 
@@ -1527,6 +1624,7 @@ pub fn editor_widget(
                 wrap_cols,
                 total_rows,
                 diagnostics,
+                matches,
             )
         })
         .inner
@@ -1544,6 +1642,7 @@ fn editor_body(
     wrap_cols: usize,
     total_rows: usize,
     diagnostics: &DiagnosticsOverlay,
+    matches: MatchHighlights,
 ) -> Response {
     let clip = ui.clip_rect();
     // Content extent: full virtual height so the scrollbar is honest; width is the
@@ -1624,6 +1723,7 @@ fn editor_body(
         &resp,
         &spans,
         diagnostics,
+        matches,
     );
 
     // Reveal the primary caret exactly once after a move/edit (don't fight scroll).
@@ -1793,6 +1893,7 @@ fn paint(
     resp: &Response,
     spans: &[HighlightSpan],
     diagnostics: &DiagnosticsOverlay,
+    matches: MatchHighlights,
 ) {
     let clip = ui.clip_rect();
     let painter = ui.painter_at(clip);
@@ -1833,6 +1934,10 @@ fn paint(
         for sel in &selections {
             paint_selection(&text_painter, &row, sel, text_x0, y, m);
         }
+
+        // EDITOR-8 — the find-match bands for this row (under the text, over the
+        // selection), each clamped to the row (viewport-culled like selections).
+        paint_match_highlights(&text_painter, matches, &row, text_x0, y, m);
 
         // Row text, span-sliced into code-token colors (EDITOR-5; plain rows —
         // no highlighter or no captures — paint as one foreground run). Only
@@ -2060,6 +2165,46 @@ fn paint_selection(
     }
 }
 
+/// Paint the EDITOR-8 find-match bands overlapping one visual row: a translucent
+/// warning-token fill under every match (distinct from the accent selection),
+/// with the *current* match painted with a stronger fill + an outline so it reads
+/// as "you are here". Each match is clamped to the row, so a match off-screen or
+/// spanning a row break paints only its visible slice.
+fn paint_match_highlights(
+    painter: &egui::Painter,
+    matches: MatchHighlights,
+    row: &VisRow,
+    text_x0: f32,
+    y: f32,
+    m: Metrics,
+) {
+    for (i, mark) in matches.ranges.iter().enumerate() {
+        let lo = mark.start.clamp(row.start, row.end);
+        let hi = mark.end.clamp(row.start, row.end);
+        if hi <= lo {
+            continue;
+        }
+        let left = text_x0 + (lo - row.start) as f32 * m.glyph_w;
+        let right = text_x0 + (hi - row.start) as f32 * m.glyph_w;
+        let rect = Rect::from_min_max(pos2(left, y), pos2(right, y + m.row_h));
+        let is_current = matches.current == Some(i);
+        let fill = if is_current {
+            Style::WARN.gamma_multiply(0.45)
+        } else {
+            Style::WARN.gamma_multiply(0.22)
+        };
+        painter.rect_filled(rect, 0.0, fill);
+        if is_current {
+            painter.rect_stroke(
+                rect,
+                0.0,
+                Stroke::new(1.0, Style::WARN),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+}
+
 /// Paint the pinned line-number gutter for the visible rows.
 #[allow(clippy::too_many_arguments)]
 fn paint_gutter(
@@ -2182,7 +2327,10 @@ fn gutter_width(lines: usize, glyph_w: f32) -> f32 {
 #[cfg(test)]
 #[allow(clippy::float_cmp)]
 mod tests {
-    use super::{editor_widget, find_next, line_len, line_span, word_span, Caret, EditorView};
+    use super::{
+        editor_widget, find_next, line_len, line_span, word_span, Caret, EditorView,
+        MatchHighlights,
+    };
     use crate::buffer::Buffer;
     use crate::lsp_ui::DiagnosticsOverlay;
     use mde_egui::egui::{self, pos2, vec2, Event, Key, Modifiers, Rect};
@@ -2630,6 +2778,7 @@ mod tests {
                     &mut buf,
                     None,
                     &DiagnosticsOverlay::default(),
+                    MatchHighlights::default(),
                 );
             });
         });
@@ -2663,6 +2812,7 @@ mod tests {
                     &mut buf,
                     None,
                     &DiagnosticsOverlay::default(),
+                    MatchHighlights::default(),
                 );
             });
         });
@@ -2697,6 +2847,7 @@ mod tests {
                     &mut buf,
                     Some(&mut hl),
                     &DiagnosticsOverlay::default(),
+                    MatchHighlights::default(),
                 );
             });
         });
@@ -2739,6 +2890,7 @@ mod tests {
                     &mut buf,
                     None,
                     &DiagnosticsOverlay::default(),
+                    MatchHighlights::default(),
                 );
             });
         });
@@ -2823,6 +2975,7 @@ mod tests {
                     &mut buf,
                     None,
                     &DiagnosticsOverlay::default(),
+                    MatchHighlights::default(),
                 );
             });
         });
@@ -2893,6 +3046,7 @@ mod tests {
                     &mut buf,
                     None,
                     &DiagnosticsOverlay::default(),
+                    MatchHighlights::default(),
                 );
             });
         });
@@ -2900,7 +3054,14 @@ mod tests {
 
         let out = ctx.run(input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                editor_widget(ui, &mut view, &mut buf, None, &diags);
+                editor_widget(
+                    ui,
+                    &mut view,
+                    &mut buf,
+                    None,
+                    &diags,
+                    MatchHighlights::default(),
+                );
             });
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
@@ -2912,6 +3073,109 @@ mod tests {
             vertices(&prims) > plain_v,
             "the diagnostics added painted geometry (gutter marker + underline): {} vs {plain_v}",
             vertices(&prims)
+        );
+    }
+
+    // ── EDITOR-8: the find/replace edit seams + the match-highlight paint ─────
+
+    #[test]
+    fn replace_range_mutates_the_buffer_and_is_undoable() {
+        // Replace the "world" in "hello world" with "there" as one undo step; the
+        // rope actually changes, the caret lands after the insert, and undo
+        // restores the original text (a real, undoable edit — §7).
+        let mut buf = Buffer::from_text("hello world");
+        let mut view = EditorView::new();
+        view.replace_range(&mut buf, 6..11, "there");
+        assert_eq!(buf.rope().to_string(), "hello there");
+        assert_eq!(view.cursor(), 11, "caret sits after the replacement");
+        assert!(view.can_undo(), "the replace recorded an undo step");
+        assert!(view.undo(&mut buf), "undo the replace");
+        assert_eq!(
+            buf.rope().to_string(),
+            "hello world",
+            "undo restored the original text"
+        );
+    }
+
+    #[test]
+    fn replace_all_replaces_every_range_and_counts() {
+        // Replace all three "ab" runs with "X" in one undo step; the count is
+        // returned and the whole edit undoes together.
+        let mut buf = Buffer::from_text("ab cab ab");
+        let mut view = EditorView::new();
+        // "ab cab ab": matches at 0..2, 4..6, 7..9.
+        let ranges = [0..2, 4..6, 7..9];
+        let n = view.replace_all(&mut buf, &ranges, "X");
+        assert_eq!(n, 3, "three matches replaced");
+        assert_eq!(buf.rope().to_string(), "X cX X");
+        assert!(
+            view.undo(&mut buf),
+            "the whole replace-all undoes as one step"
+        );
+        assert_eq!(
+            buf.rope().to_string(),
+            "ab cab ab",
+            "undo restored every replaced run"
+        );
+    }
+
+    #[test]
+    fn match_highlights_add_painted_geometry() {
+        // A frame with find matches paints more geometry than one without: the
+        // match bands add vertices (the highlight render path is reachable, §7).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut buf = Buffer::from_text("find me and find me again\n");
+        let mut view = EditorView::new();
+        // Two "find" matches at chars 0..4 and 12..16, the second current.
+        let ranges = [0..4, 12..16];
+        let with = MatchHighlights {
+            ranges: &ranges,
+            current: Some(1),
+        };
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let vertices = |prims: &[egui::ClippedPrimitive]| -> usize {
+            prims
+                .iter()
+                .map(|p| match &p.primitive {
+                    egui::epaint::Primitive::Mesh(m) => m.vertices.len(),
+                    egui::epaint::Primitive::Callback(_) => 0,
+                })
+                .sum()
+        };
+        let plain = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor_widget(
+                    ui,
+                    &mut view,
+                    &mut buf,
+                    None,
+                    &DiagnosticsOverlay::default(),
+                    MatchHighlights::default(),
+                );
+            });
+        });
+        let plain_v = vertices(&ctx.tessellate(plain.shapes, plain.pixels_per_point));
+
+        let out = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor_widget(
+                    ui,
+                    &mut view,
+                    &mut buf,
+                    None,
+                    &DiagnosticsOverlay::default(),
+                    with,
+                );
+            });
+        });
+        let hi_v = vertices(&ctx.tessellate(out.shapes, out.pixels_per_point));
+        assert!(
+            hi_v > plain_v,
+            "the match bands add painted geometry: {hi_v} vs {plain_v}"
         );
     }
 }

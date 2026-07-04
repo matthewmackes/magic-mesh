@@ -24,17 +24,17 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use mde_egui::egui::{
-    self, pos2, vec2, Align, Align2, CursorIcon, FontId, Id, Key, Layout, Modifiers, Rect, Response,
-    RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder,
+    self, pos2, vec2, Align, Align2, CursorIcon, FontId, Id, Key, Layout, Modifiers, Rect,
+    Response, RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder,
 };
 use mde_egui::Style;
 
 use crate::buffer::Buffer;
 use crate::finder::{self, FileFinder};
-use crate::panes::{self, NavDir, Pane, PaneId, SplitDir};
 use crate::format_bar;
 use crate::highlight::{Highlighter, Language};
 use crate::lsp::LspClient;
@@ -42,9 +42,11 @@ use crate::lsp_ui::{lsp_status, DiagnosticsOverlay};
 use crate::md_actions::{self, ListKind};
 use crate::menu_bar::{self, ListStyle, MenuAction, MenuContext};
 use crate::palette::{self, CommandPalette, PaletteCommand};
+use crate::panes::{self, NavDir, Pane, PaneId, SplitDir};
 use crate::project_tree::{self, ProjectTree};
+use crate::search::{self, FindEvent, FindState, ProjectSearch};
 use crate::toolbar;
-use crate::widget::{editor_widget, EditorView};
+use crate::widget::{editor_widget, EditorView, MatchHighlights};
 
 /// The project-tree side panel's default width — six shared spacing units (§4).
 const TREE_WIDTH: f32 = Style::SP_XL * 6.0;
@@ -369,6 +371,10 @@ pub struct EditorSurface {
     finder: FileFinder,
     /// The command-palette overlay (EDITOR-7, `Cmd`/`Ctrl-Shift-P`).
     palette: CommandPalette,
+    /// The in-buffer find/replace bar (EDITOR-8, `Ctrl-F` / `Ctrl-H`).
+    find: FindState,
+    /// The project-wide search overlay (EDITOR-8, `Ctrl-Shift-F`).
+    project_search: ProjectSearch,
     /// The Save As… path dialog (EDTB-1, File → Save As).
     save_as: SaveAsDialog,
     /// Whether the About dialog is shown (EDTB-1, Help → About the Editor).
@@ -394,6 +400,8 @@ impl Default for EditorSurface {
             show_tree: false,
             finder: FileFinder::default(),
             palette: CommandPalette::default(),
+            find: FindState::default(),
+            project_search: ProjectSearch::default(),
             save_as: SaveAsDialog::default(),
             about_open: false,
             table_picker: TablePicker::default(),
@@ -706,6 +714,8 @@ impl EditorSurface {
     pub const fn overlay_active(&self) -> bool {
         self.finder.is_open()
             || self.palette.is_open()
+            || self.find.is_open()
+            || self.project_search.is_open()
             || self.save_as.open
             || self.about_open
             || self.table_picker.open
@@ -721,16 +731,145 @@ impl EditorSurface {
             .map(|tree| tree.root().to_path_buf())
             .or_else(|| std::env::current_dir().ok());
         if let Some(root) = root {
-            self.palette.close(); // only one overlay at a time
+            self.close_search_overlays(); // only one overlay at a time
             self.finder.open_at(&root);
         }
     }
 
     /// Toggle the command palette (the `Cmd`/`Ctrl-Shift-P` seam), closing the
-    /// finder so only one overlay is up at a time.
+    /// finder / search overlays so only one overlay is up at a time.
     pub(crate) fn toggle_palette(&mut self) {
         self.finder.close();
+        self.find.close();
+        self.project_search.close();
         self.palette.toggle();
+    }
+
+    // ── EDITOR-8: the in-buffer find/replace + project search seams ──────────
+
+    /// Close every non-palette overlay (finder / palette / find bar / project
+    /// search) so only the one being opened is up — the "one overlay at a time"
+    /// invariant every `open_*` seam re-asserts.
+    fn close_search_overlays(&mut self) {
+        self.finder.close();
+        self.palette.close();
+        self.find.close();
+        self.project_search.close();
+    }
+
+    /// Open the in-buffer find bar (`Ctrl-F`).
+    pub(crate) fn open_find(&mut self) {
+        self.close_search_overlays();
+        self.find.open_find();
+    }
+
+    /// Open the in-buffer find + replace bar (`Ctrl-H`).
+    pub(crate) fn open_replace(&mut self) {
+        self.close_search_overlays();
+        self.find.open_replace();
+    }
+
+    /// Open the project-wide search (`Ctrl-Shift-F`), rooted at the open project
+    /// root if there is one, else the current working directory — so it is always
+    /// reachable. A silent no-op if neither root resolves.
+    pub(crate) fn open_project_search(&mut self) {
+        let root = self
+            .project
+            .as_ref()
+            .map(|tree| tree.root().to_path_buf())
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(root) = root {
+            self.close_search_overlays();
+            self.project_search.open_at(root);
+        }
+    }
+
+    /// Recompute the in-buffer find matches against the active buffer while the
+    /// find bar is open — so the widget paints this frame's matches and the bar's
+    /// counter tracks edits + toggle flips. A no-op while the bar is closed; the
+    /// matches are dropped when no document is open.
+    fn refresh_find_matches(&mut self) {
+        if !self.find.is_open() {
+            return;
+        }
+        match self.doc().map(|doc| doc.buffer.rope().to_string()) {
+            Some(text) => self.find.recompute(&text),
+            None => self.find.clear_matches(),
+        }
+    }
+
+    /// The find-match bands to paint this frame: the resolved ranges + the current
+    /// index, or empty when the bar is closed. Owned so the caller can pass them
+    /// past the `&mut self` render borrow.
+    fn find_paint_bands(&self) -> (Vec<Range<usize>>, Option<usize>) {
+        if self.find.is_open() && !self.find.matches().is_empty() {
+            (
+                self.find.matches().to_vec(),
+                Some(self.find.current_index()),
+            )
+        } else {
+            (Vec::new(), None)
+        }
+    }
+
+    /// Reveal the current find match — place the caret at its start (which scrolls
+    /// it into view through the existing [`EditorView::place_cursor`] reveal).
+    fn reveal_current_match(&mut self) {
+        let Some(range) = self.find.current_range() else {
+            return;
+        };
+        if let Some(doc) = self.doc_mut() {
+            doc.view.place_cursor(&doc.buffer, range.start);
+        }
+    }
+
+    /// Replace the current find match with the replacement text — a real,
+    /// undoable rope edit through [`EditorView::replace_range`] (§7). The matches
+    /// recompute next frame; the current index then slides onto the following
+    /// match (the standard replace-then-advance behaviour).
+    fn replace_current_match(&mut self) {
+        let Some(range) = self.find.current_range() else {
+            return;
+        };
+        let replacement = self.find.replacement().to_owned();
+        if let Some(doc) = self.doc_mut() {
+            doc.view.replace_range(&mut doc.buffer, range, &replacement);
+        }
+    }
+
+    /// Replace every find match with the replacement text as ONE undo step
+    /// ([`EditorView::replace_all`]) and record the count for the bar to show.
+    fn replace_all_matches(&mut self) {
+        let ranges = self.find.matches().to_vec();
+        if ranges.is_empty() {
+            return;
+        }
+        let replacement = self.find.replacement().to_owned();
+        if let Some(doc) = self.doc_mut() {
+            let n = doc.view.replace_all(&mut doc.buffer, &ranges, &replacement);
+            self.find.set_last_replaced(n);
+        }
+    }
+
+    /// Open a project-search hit: open the file, then jump the caret onto the
+    /// match — re-finding the query on the opened line for an exact,
+    /// backend-independent char column (else the line start).
+    fn open_hit(&mut self, hit: &search::Hit) {
+        if self.open_path(&hit.path).is_err() {
+            return;
+        }
+        let query = self.project_search.query().to_owned();
+        let opts = self.project_search.options();
+        if let Some(doc) = self.doc_mut() {
+            let last_line = doc.buffer.len_lines().saturating_sub(1);
+            let line = hit.line.saturating_sub(1).min(last_line);
+            let line_start = doc.buffer.line_to_char(line);
+            let line_text = doc.buffer.line(line);
+            let col = search::find_matches(&line_text, &query, opts)
+                .first()
+                .map_or(0, |r| r.start);
+            doc.view.place_cursor(&doc.buffer, line_start + col);
+        }
     }
 
     /// Run one [`PaletteCommand`] against the live surface seams — the dispatch the
@@ -1067,11 +1206,27 @@ impl EditorSurface {
         let open_palette =
             ui.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::P));
         let open_finder = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P));
+        // EDITOR-8 — the search chords, consumed at the same panel level so they
+        // open the overlays instead of typing into the buffer. The more-specific
+        // Shift chord (project search) is consumed before the plain `Ctrl-F`.
+        let open_project =
+            ui.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::F));
+        let open_find = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F));
+        let open_replace = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::H));
         if open_palette {
             self.toggle_palette();
         }
         if open_finder {
             self.open_finder();
+        }
+        if open_project {
+            self.open_project_search();
+        }
+        if open_find {
+            self.open_find();
+        }
+        if open_replace {
+            self.open_replace();
         }
     }
 
@@ -1085,6 +1240,25 @@ impl EditorSurface {
         }
         if let Some(cmd) = palette::show(ctx, &mut self.palette) {
             self.run_command(cmd);
+        }
+        // EDITOR-8 — the in-buffer find/replace bar: route its frame event to the
+        // live buffer / view (next/prev jump the caret, replace mutates the rope).
+        match search::show_find(ctx, &mut self.find) {
+            FindEvent::Idle => {}
+            FindEvent::Next => {
+                self.find.cycle(true);
+                self.reveal_current_match();
+            }
+            FindEvent::Prev => {
+                self.find.cycle(false);
+                self.reveal_current_match();
+            }
+            FindEvent::ReplaceCurrent => self.replace_current_match(),
+            FindEvent::ReplaceAll => self.replace_all_matches(),
+        }
+        // EDITOR-8 — the project-wide search: a picked hit opens the file + jumps.
+        if let Some(hit) = search::show_project(ctx, &mut self.project_search) {
+            self.open_hit(&hit);
         }
     }
 
@@ -1262,14 +1436,29 @@ impl EditorSurface {
     /// Lay the split tree out into `rect` and render every leaf (its tab bar +
     /// active tab's widget), the draggable dividers, and the focus ring. Deferred
     /// tab/pane actions are applied after all borrows release.
-    fn render_panes(&mut self, ui: &mut Ui, rect: Rect) {
+    fn render_panes(
+        &mut self,
+        ui: &mut Ui,
+        rect: Rect,
+        match_ranges: &[Range<usize>],
+        match_current: Option<usize>,
+    ) {
         self.prefocus(ui);
         let lay = panes::layout(&self.tree, rect);
         let multi = lay.leaves.len() > 1;
         let mut outcomes: Vec<(PaneId, LeafAction)> = Vec::new();
         let mut ids: HashMap<PaneId, Id> = HashMap::new();
         for (pid, prect) in &lay.leaves {
-            self.render_leaf(ui, *pid, *prect, multi, &mut outcomes, &mut ids);
+            self.render_leaf(
+                ui,
+                *pid,
+                *prect,
+                multi,
+                &mut outcomes,
+                &mut ids,
+                match_ranges,
+                match_current,
+            );
         }
         self.pane_widget_ids = ids;
         self.render_dividers(ui, &lay);
@@ -1284,6 +1473,7 @@ impl EditorSurface {
     /// Render one leaf pane into `rect`: its tab bar, then the active tab's text
     /// widget (the live rope, §7) or the honest empty-pane face. Collects the
     /// tab-bar action + the widget's egui id for [`prefocus`](Self::prefocus).
+    #[allow(clippy::too_many_arguments)]
     fn render_leaf(
         &mut self,
         ui: &mut Ui,
@@ -1292,6 +1482,8 @@ impl EditorSurface {
         multi: bool,
         outcomes: &mut Vec<(PaneId, LeafAction)>,
         ids: &mut HashMap<PaneId, Id>,
+        match_ranges: &[Range<usize>],
+        match_current: Option<usize>,
     ) {
         let is_focused = pid == self.focus;
         let Some(pane) = self.panes.get_mut(&pid) else {
@@ -1314,12 +1506,23 @@ impl EditorSurface {
         if let Some(doc) = pane.active_doc_mut() {
             // EDITOR-LSP-2 — refresh, render the live widget, then sync edits.
             doc.refresh_diagnostics();
+            // EDITOR-8 — the find-match highlights only paint in the focused pane
+            // (the search targets its active document); other panes paint plain.
+            let matches = if is_focused {
+                MatchHighlights {
+                    ranges: match_ranges,
+                    current: match_current,
+                }
+            } else {
+                MatchHighlights::default()
+            };
             let resp = editor_widget(
                 &mut child,
                 &mut doc.view,
                 &mut doc.buffer,
                 doc.highlight.as_mut(),
                 &doc.diagnostics,
+                matches,
             );
             doc.sync_lsp();
             ids.insert(pid, resp.id);
@@ -1349,7 +1552,11 @@ impl EditorSurface {
                 ),
             };
             let resp = ui
-                .interact(hit, ui.id().with(("editor-splitter", div.path)), Sense::drag())
+                .interact(
+                    hit,
+                    ui.id().with(("editor-splitter", div.path)),
+                    Sense::drag(),
+                )
                 .on_hover_cursor(icon);
             if resp.dragged() {
                 if let Some(pos) = resp.interact_pointer_pos() {
@@ -1467,9 +1674,7 @@ fn tab_chip(
     };
     let text_color = if active { Style::TEXT } else { Style::TEXT_DIM };
     let font = FontId::proportional(Style::SMALL);
-    let galley = ui
-        .painter()
-        .layout_no_wrap(label, font, text_color);
+    let galley = ui.painter().layout_no_wrap(label, font, text_color);
     let close_w = Style::SP_M;
     let pad = Style::SP_S;
     let size = vec2(
@@ -1606,6 +1811,13 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
         surface.run_action(ui.ctx(), action);
     }
 
+    // EDITOR-8 — recompute the in-buffer find matches (while the find bar is open)
+    // against the now-settled buffer, then snapshot the bands to paint. Taken here
+    // — after the menu/toolbar action ran, before the body renders — so the widget
+    // paints this frame's matches and the counter reflects the live buffer (§7).
+    surface.refresh_find_matches();
+    let (find_bands, find_current) = surface.find_paint_bands();
+
     // EDITOR-9 — the toggleable project-tree side panel, drawn BEFORE the central
     // body so the editor fills the area to its right (the `files_panel` idiom). A
     // file click routes through the EDITOR-3 open seam; a "no folder" state offers
@@ -1650,7 +1862,7 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
                 .show_inside(ui, |ui| surface.status_bar(ui));
         }
         let body = ui.available_rect_before_wrap();
-        surface.render_panes(ui, body);
+        surface.render_panes(ui, body, &find_bands, find_current);
     });
 
     // EDITOR-7 — the finder + palette overlays float above the body (rendered last
@@ -2117,6 +2329,160 @@ mod tests {
             tessellate_panel(&mut surface) > 0,
             "the open palette overlay produced no draw primitives"
         );
+    }
+
+    // ── EDITOR-8: project + in-buffer search ─────────────────────────────────
+
+    #[test]
+    fn ctrl_f_and_ctrl_h_open_the_find_bar_at_the_panel_level() {
+        // The find chords are intercepted at the panel level (not the widget), so
+        // they open the bar instead of typing into the buffer.
+        let mut surface = real_editor();
+        surface.open_text("fn main() {}\n");
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        run_frame(
+            &ctx,
+            &mut surface,
+            vec![key_press(Key::F, Modifiers::COMMAND)],
+        );
+        assert!(surface.find.is_open(), "Ctrl+F opened the find bar");
+        // Esc closes it (consumed by the overlay).
+        run_frame(
+            &ctx,
+            &mut surface,
+            vec![key_press(Key::Escape, Modifiers::NONE)],
+        );
+        assert!(!surface.find.is_open(), "Esc closed the find bar");
+
+        run_frame(
+            &ctx,
+            &mut surface,
+            vec![key_press(Key::H, Modifiers::COMMAND)],
+        );
+        assert!(surface.find.is_open(), "Ctrl+H opened the replace bar");
+    }
+
+    #[test]
+    fn ctrl_shift_f_opens_the_project_search() {
+        let d = TempDir::new("ps-open");
+        std::fs::write(d.join("a.rs"), b"fn a() {}\n").expect("write");
+        let mut surface = real_editor();
+        surface.open_folder(d.0.clone());
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        run_frame(
+            &ctx,
+            &mut surface,
+            vec![key_press(
+                Key::F,
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::COMMAND
+                },
+            )],
+        );
+        assert!(
+            surface.project_search.is_open(),
+            "Ctrl+Shift+F opened the project search"
+        );
+    }
+
+    #[test]
+    fn find_recompute_highlights_the_right_ranges_and_cycles() {
+        // Open the bar over a real buffer, set a query, recompute against the live
+        // rope: the paint bands are the exact match ranges, and next/prev cycle the
+        // caret onto each match through the real reveal seam.
+        let mut surface = real_editor();
+        surface.open_text("find me and find me again\n");
+        surface.open_find();
+        surface.find.set_query("find");
+        surface.refresh_find_matches();
+
+        let (bands, current) = surface.find_paint_bands();
+        assert_eq!(bands, vec![0..4, 12..16], "both 'find' runs highlight");
+        assert_eq!(current, Some(0), "the first match is current");
+
+        surface.find.cycle(true);
+        surface.reveal_current_match();
+        assert_eq!(
+            surface.doc().expect("doc").view.cursor(),
+            12,
+            "Next moved the caret to the second match's start"
+        );
+        // The whole surface still paints with the bar open + matches highlighted.
+        assert!(tessellate_panel(&mut surface) > 0, "the find bar paints");
+    }
+
+    #[test]
+    fn find_replace_current_mutates_the_live_buffer() {
+        let mut surface = real_editor();
+        surface.open_text("aa bb aa\n");
+        surface.open_replace();
+        surface.find.set_query("aa");
+        surface.find.set_replacement("zz");
+        surface.refresh_find_matches();
+
+        surface.replace_current_match();
+        assert_eq!(
+            surface.doc().expect("doc").buffer.rope().to_string(),
+            "zz bb aa\n",
+            "Replace mutated the first match on the real rope"
+        );
+        // The edit is undoable (a real widget edit step).
+        assert!(surface.doc().expect("doc").view.can_undo());
+    }
+
+    #[test]
+    fn find_replace_all_replaces_every_match() {
+        let mut surface = real_editor();
+        surface.open_text("aa bb aa\n");
+        surface.open_replace();
+        surface.find.set_query("aa");
+        surface.find.set_replacement("z");
+        surface.refresh_find_matches();
+        assert_eq!(
+            surface.find_paint_bands().0.len(),
+            2,
+            "two matches to replace"
+        );
+
+        surface.replace_all_matches();
+        assert_eq!(
+            surface.doc().expect("doc").buffer.rope().to_string(),
+            "z bb z\n",
+            "Replace All replaced every match"
+        );
+    }
+
+    #[test]
+    fn project_search_opens_a_hit_and_jumps_to_the_line() {
+        let d = TempDir::new("ps-jump");
+        let file = d.join("code.rs");
+        std::fs::write(&file, b"fn a() {}\nfn target() {}\n").expect("write");
+        let mut surface = real_editor();
+        surface.open_folder(d.0.clone());
+        surface.open_project_search();
+        surface.project_search.set_query("target");
+        surface.project_search.run();
+
+        let hit = surface
+            .project_search
+            .results()
+            .first()
+            .expect("a hit for the seeded symbol")
+            .clone();
+        assert!(hit.path.ends_with("code.rs"), "the hit points at the file");
+
+        surface.open_hit(&hit);
+        assert!(surface.is_open(), "opening the hit opened the document");
+        assert_eq!(surface.current_path(), Some(file.as_path()));
+        let doc = surface.doc().expect("doc");
+        let (line, col) = doc.view.line_col(&doc.buffer);
+        assert_eq!(line, 2, "jumped to the hit's line (1-based)");
+        assert_eq!(col, 4, "landed on the 'target' match column");
     }
 
     // ── EDTB-1: the menu bar + Standard toolbar dispatch ────────────────────
@@ -2884,7 +3250,11 @@ mod tests {
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
-        run_frame(&ctx, &mut surface, vec![key_press(Key::T, Modifiers::COMMAND)]);
+        run_frame(
+            &ctx,
+            &mut surface,
+            vec![key_press(Key::T, Modifiers::COMMAND)],
+        );
         assert_eq!(
             focused_tabs(&surface),
             2,
@@ -2901,7 +3271,11 @@ mod tests {
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
-        run_frame(&ctx, &mut surface, vec![key_press(Key::W, Modifiers::COMMAND)]);
+        run_frame(
+            &ctx,
+            &mut surface,
+            vec![key_press(Key::W, Modifiers::COMMAND)],
+        );
         assert_eq!(focused_tabs(&surface), 1, "Ctrl-W closed the active tab");
         assert!(surface.is_open(), "the surviving tab is still open");
     }
@@ -2979,9 +3353,15 @@ mod tests {
         surface.split_focused(SplitDir::V); // focus is now the right pane
         let right = surface.focus;
         surface.navigate_focus(NavDir::Left);
-        assert_ne!(surface.focus, right, "Alt+Left moved focus to the left pane");
+        assert_ne!(
+            surface.focus, right,
+            "Alt+Left moved focus to the left pane"
+        );
         surface.navigate_focus(NavDir::Right);
-        assert_eq!(surface.focus, right, "Alt+Right moved focus back to the right");
+        assert_eq!(
+            surface.focus, right,
+            "Alt+Right moved focus back to the right"
+        );
     }
 
     #[test]

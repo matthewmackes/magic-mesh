@@ -66,6 +66,15 @@
 //!   `Ctrl-Shift-\` split the focused pane. Every tab is a real rope [`Buffer`]
 //!   (§7 — no mock panes).
 //!
+//! * EDITOR-8 — **project + in-buffer search** (`search`): a find/replace bar over
+//!   the active buffer (`Ctrl-F` / `Ctrl-H`) with case / whole-word / regex
+//!   toggles, next/prev cycling, replace + replace-all, and every match live-
+//!   highlighted in the widget (viewport-culled, layered over the tree-sitter
+//!   paint like the LSP diagnostics); plus a project-wide search (`Ctrl-Shift-F`)
+//!   whose honest backend is **ripgrep** when present, else a bounded in-Rust
+//!   walk — a picked hit opens the file + jumps to the line (§7 — real rope
+//!   edits + real files, no mockups).
+//!
 //! Layering (§6): the surface state + render seam live in [`panel`], the widget in
 //! [`widget`], the document model in [`buffer`]; the only in-workspace edge points
 //! inward to [`mde_egui`] (the harness + the shared Carbon `Style`).
@@ -85,6 +94,7 @@ mod palette;
 pub mod panel;
 pub mod panes;
 pub mod project_tree;
+mod search;
 mod toolbar;
 pub mod widget;
 
