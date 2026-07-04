@@ -83,6 +83,24 @@ const MESH_PROVIDER_BRIDGE: &str = "br-mesh";
 /// (≈ 1342). Rendered as Neutron's `global_physnet_mtu`.
 const MESH_NET_MTU: u16 = 1342;
 
+// ── QC-8: the Cinder LVM backend + cinder-backup to the object tier (Q51/56/57/59) ──
+/// The LVM volume group cinder carves on **each node's writable partition**
+/// (Q59) — the block backend is node-local (Q51), so every node runs its own VG
+/// of the same name, sliced from the writable partition beside the Swift dir and
+/// the Nova ephemeral pool.
+const CINDER_VOLUME_GROUP: &str = "cinder-volumes";
+/// Mesh-DNS name the Keystone-native **Swift** hot object tier (Q55) answers on
+/// — resolved over the overlay (QC-6 idiom, like `keystone.mesh`). cinder-backup
+/// streams volume backups here (Q57); Swift replicates the ring off-site to DO
+/// Spaces (Q54 — the two-tier store), so the single cinder `backup_driver`
+/// targets the hot tier and the off-site leg rides Swift's own replication, not
+/// a second cinder driver.
+const SWIFT_MESH_NAME: &str = "swift.mesh";
+/// The Swift proxy port the object API answers on (the cinder-backup target).
+const SWIFT_PORT: u16 = 8080;
+/// The Swift container cinder-backup lands each volume's backup objects in.
+const CINDER_BACKUP_CONTAINER: &str = "volumebackups";
+
 /// This node's Nebula overlay bind (design Q22/23) — the resolved overlay IP
 /// every `OpenStack` API binds plaintext to (the overlay IS the transport
 /// security), or the honest reason it couldn't be resolved.
@@ -547,6 +565,7 @@ fn service_plan(
         ServiceKind::CinderApi => cinder("cinder-api", overlay, ctx, secrets),
         ServiceKind::CinderScheduler => cinder("cinder-scheduler", overlay, ctx, secrets),
         ServiceKind::CinderVolume => cinder("cinder-volume", overlay, ctx, secrets),
+        ServiceKind::CinderBackup => cinder("cinder-backup", overlay, ctx, secrets),
     }
 }
 
@@ -585,8 +604,21 @@ fn nova(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> Ser
     }
 }
 
-/// The shared Cinder plan (LVM per node — Q51/59). The volume API listener
-/// binds to the overlay (QC-6, Q22/23).
+/// The shared Cinder plan (QC-8 — LVM per node + cinder-backup to the object
+/// tier; Q51/56/57/59). All four cinder services (api/scheduler/volume/backup)
+/// read this one `cinder.conf`; only the launch command differs.
+///
+/// - `[DEFAULT]`: the overlay-bound volume-API listener (QC-6, Q22/23), the RPC
+///   transport (Q16), `enabled_backends = lvm`, and the **cinder-backup** config
+///   (Q57) — the Keystone-native **Swift** hot object tier (Q55) as the
+///   `backup_driver`, reached over the mesh by its Nebula-DNS name (`swift.mesh`;
+///   Swift replicates the ring off-site to DO Spaces, Q54 — the two-tier store's
+///   off-site leg rides Swift's own replication, not a second cinder driver).
+/// - `[lvm]`: the node-local LVM backend (Q51) — the volume group carved on this
+///   node's writable partition (Q59), **thin**-provisioned for efficient
+///   snapshots (Q56), served over an iSCSI/LIO target whose portal binds to this
+///   node's overlay IP (QC-6, Q23 — a peer attaches the volume over the mesh,
+///   never the public underlay).
 fn cinder(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
     ServicePlan {
         command: command.to_string(),
@@ -598,12 +630,24 @@ fn cinder(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> S
                 "[DEFAULT]\ndebug = False\nmy_ip = {host}\n\
                  osapi_volume_listen = {host}\nosapi_volume_listen_port = {port}\n\
                  transport_url = {rpc}\nenabled_backends = lvm\n\
+                 backup_driver = cinder.backup.drivers.swift.SwiftBackupDriver\n\
+                 backup_swift_url = http://{swift}:{swift_port}/v1/AUTH_\n\
+                 backup_swift_auth = per_user\nbackup_swift_auth_version = 3\n\
+                 backup_swift_container = {backup_container}\n\
+                 backup_compression_algorithm = zstd\n\
                  [database]\nconnection = {db}\n{authtoken}\
-                 [lvm]\nvolume_driver = cinder.volume.drivers.lvm.LVMVolumeDriver\n\
-                 volume_group = cinder-volumes\ntarget_protocol = iscsi\n",
+                 [lvm]\nvolume_backend_name = lvm\n\
+                 volume_driver = cinder.volume.drivers.lvm.LVMVolumeDriver\n\
+                 volume_group = {vg}\nlvm_type = thin\n\
+                 target_protocol = iscsi\ntarget_helper = lioadm\n\
+                 target_ip_address = {host}\n",
                 host = overlay,
                 port = ServiceKind::CinderApi.api_port().unwrap_or_default(),
                 rpc = transport_url(secrets),
+                swift = SWIFT_MESH_NAME,
+                swift_port = SWIFT_PORT,
+                backup_container = CINDER_BACKUP_CONTAINER,
+                vg = CINDER_VOLUME_GROUP,
                 db = db_url("cinder", overlay, ctx, secrets),
                 authtoken = authtoken("cinder", overlay, secrets),
             ),
@@ -1247,6 +1291,85 @@ mod tests {
         assert!(
             chassis_leader.contains(&format!("external_ids:ovn-remote = tcp:{OVERLAY}:6642")),
             "{chassis_leader}"
+        );
+    }
+
+    // ── QC-8: the Cinder LVM backend + cinder-backup to the object tier ──
+
+    #[test]
+    fn cinder_renders_the_node_local_lvm_backend() {
+        // Q51/59 — the [lvm] backend: the volume group carved on the writable
+        // partition, thin-provisioned for snapshots (Q56), served over an
+        // iSCSI/LIO target whose portal binds to THIS node's overlay IP (QC-6,
+        // Q23 — a peer attaches the volume over the mesh, never the underlay).
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::CinderVolume, &ctx(false)).unwrap();
+        let conf = read_conf(dir.path(), ServiceKind::CinderVolume, "cinder.conf");
+        assert!(conf.contains("enabled_backends = lvm"), "{conf}");
+        assert!(
+            conf.contains("volume_driver = cinder.volume.drivers.lvm.LVMVolumeDriver"),
+            "{conf}"
+        );
+        assert!(conf.contains("volume_group = cinder-volumes"), "{conf}");
+        assert!(conf.contains("lvm_type = thin"), "{conf}");
+        assert!(conf.contains("target_protocol = iscsi"), "{conf}");
+        assert!(conf.contains("target_helper = lioadm"), "{conf}");
+        // The iSCSI portal is the overlay IP — a volume is attachable over the
+        // mesh only, never 0.0.0.0/the public underlay.
+        assert!(
+            conf.contains(&format!("target_ip_address = {OVERLAY}")),
+            "{conf}"
+        );
+        assert!(!conf.contains("0.0.0.0"), "{conf}");
+        assert!(!conf.contains("127.0.0.1"), "{conf}");
+    }
+
+    #[test]
+    fn cinder_renders_backup_to_the_swift_object_tier() {
+        // Q55/57 — cinder-backup streams volumes to the Keystone-native Swift hot
+        // object tier, reached over the mesh by its Nebula-DNS name (Swift
+        // replicates off-site to DO Spaces per Q54 — the off-site leg rides
+        // Swift's own replication, not a second cinder driver).
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::CinderVolume, &ctx(false)).unwrap();
+        let conf = read_conf(dir.path(), ServiceKind::CinderVolume, "cinder.conf");
+        assert!(
+            conf.contains("backup_driver = cinder.backup.drivers.swift.SwiftBackupDriver"),
+            "{conf}"
+        );
+        assert!(
+            conf.contains("backup_swift_url = http://swift.mesh:8080/v1/AUTH_"),
+            "{conf}"
+        );
+        assert!(conf.contains("backup_swift_container = volumebackups"), "{conf}");
+        // Keystone-native per-user auth (the mesh account IS the cloud account,
+        // Q21) — never a hardcoded service credential in the rendered config.
+        assert!(conf.contains("backup_swift_auth = per_user"), "{conf}");
+    }
+
+    #[test]
+    fn cinder_backup_service_renders_the_shared_cinder_conf() {
+        // QC-8 — the new cinder-backup agent reads the same one cinder.conf as
+        // the api/scheduler/volume services (LVM backend + backup config in one
+        // file); its config.json launches the backup command.
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::CinderBackup, &ctx(false)).unwrap();
+        assert!(config_rendered(dir.path(), ServiceKind::CinderBackup));
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("cinder_backup").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg["command"], "cinder-backup");
+        assert_eq!(
+            cfg["config_files"][0]["dest"],
+            "/etc/cinder/cinder.conf"
+        );
+        // The same complete backend + backup config lands for the backup agent.
+        let conf = read_conf(dir.path(), ServiceKind::CinderBackup, "cinder.conf");
+        assert!(conf.contains("volume_group = cinder-volumes"), "{conf}");
+        assert!(
+            conf.contains("backup_driver = cinder.backup.drivers.swift.SwiftBackupDriver"),
+            "{conf}"
         );
     }
 }

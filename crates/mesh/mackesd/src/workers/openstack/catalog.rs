@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 pub enum Placement {
     /// Runs on every OpenStack-carrying node (Q22 "APIs on every node" + the
     /// per-node data/compute plane — nova-compute, cinder-volume's node-local
-    /// LVM (Q51), memcached (Q17), a `RabbitMQ` cluster member (Q16)).
+    /// LVM (Q51) + its cinder-backup agent (Q57), memcached (Q17), a `RabbitMQ`
+    /// cluster member (Q16)).
     EveryNode,
     /// Rides the etcd leader and re-places on failover (Q15 — `MariaDB` is a
     /// workload on the leader, never a permanently-special node).
@@ -83,12 +84,17 @@ pub enum ServiceKind {
     CinderScheduler,
     /// Node-local LVM volume service (Q51/59).
     CinderVolume,
+    /// Node-local volume-backup service → the Swift object tier (QC-8/Q57).
+    /// Rides every node beside `cinder-volume`: the volumes it streams to the
+    /// object store are node-local LVM (Q51/59), so the backup agent runs where
+    /// they live — never a controller box (Q5/22).
+    CinderBackup,
 }
 
 impl ServiceKind {
     /// Every catalogued service, in the canonical (enum-order) sequence the
     /// mirror rows + reconcile folds iterate.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::Mariadb,
         Self::Rabbitmq,
         Self::Memcached,
@@ -107,6 +113,7 @@ impl ServiceKind {
         Self::CinderApi,
         Self::CinderScheduler,
         Self::CinderVolume,
+        Self::CinderBackup,
     ];
 
     /// The Kolla-convention container name (underscored) — the `--name` the
@@ -133,6 +140,7 @@ impl ServiceKind {
             Self::CinderApi => "cinder_api",
             Self::CinderScheduler => "cinder_scheduler",
             Self::CinderVolume => "cinder_volume",
+            Self::CinderBackup => "cinder_backup",
         }
     }
 
@@ -159,6 +167,7 @@ impl ServiceKind {
             Self::CinderApi => "cinder-api",
             Self::CinderScheduler => "cinder-scheduler",
             Self::CinderVolume => "cinder-volume",
+            Self::CinderBackup => "cinder-backup",
         }
     }
 
@@ -407,6 +416,7 @@ mod tests {
             ServiceKind::OvnController,
             ServiceKind::CinderScheduler,
             ServiceKind::CinderVolume,
+            ServiceKind::CinderBackup,
         ] {
             assert_eq!(kind.api_port(), None, "{kind:?}");
             assert_eq!(kind.mesh_dns_name(), None, "{kind:?}");
@@ -425,6 +435,23 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    #[test]
+    fn cinder_backup_is_an_every_node_agent_with_kolla_names() {
+        // QC-8/Q57 — cinder-backup rides every node beside cinder-volume (the
+        // node-local LVM volumes it streams to the object tier, Q51/59), never a
+        // controller box (Q5/22), and carries no tenant-facing API listener.
+        assert_eq!(ServiceKind::CinderBackup.container_name(), "cinder_backup");
+        assert_eq!(ServiceKind::CinderBackup.image_name(), "cinder-backup");
+        assert_eq!(ServiceKind::CinderBackup.placement(), Placement::EveryNode);
+        assert_eq!(ServiceKind::CinderBackup.api_port(), None);
+        assert_eq!(ServiceKind::CinderBackup.mesh_dns_name(), None);
+        // It reverse-maps from its podman container name like every catalog entry.
+        assert_eq!(
+            ServiceKind::from_container_name("cinder_backup"),
+            Some(ServiceKind::CinderBackup)
+        );
     }
 
     #[test]
