@@ -195,6 +195,28 @@ const IPAM_TYPE_COL: f32 = Style::SP_XL * 3.0;
 /// The prefix-capacity meter width (used/free bar in the prefix header).
 const IPAM_BAR_W: f32 = Style::SP_XL * 3.0;
 
+// ── Mosaic overview mode (EXPLORER-11, design O1/O3/O6) ──
+/// One mosaic hero-tile's width — wide enough for a mini glyph plus a truncated
+/// name (a §4-grid behaviour param, not a scattered px).
+const MOSAIC_TILE_W: f32 = Style::SP_XL * 4.5;
+/// One mosaic hero-tile's height (the mini status-ring well + the name + badge).
+const MOSAIC_TILE_H: f32 = Style::SP_XL * 3.75;
+/// The gap between mosaic tiles — rows AND columns share it, so `mosaic_columns`
+/// and the row layout agree on the grid step (D-pad nav stays true, O6).
+const MOSAIC_GAP: f32 = Style::SP_M;
+/// The mini status-ring diameter inside a mosaic tile — echoes the hero ring at
+/// tile scale (O1 "mini hero tiles").
+const MOSAIC_RING_D: f32 = Style::SP_XL * 1.5;
+/// The keyboard/D-pad focus-ring stroke width — a deliberately thick, high
+/// contrast ring so the selection is always legible for couch nav (O11).
+const FOCUS_RING_W: f32 = 2.5;
+/// The tile→hero zoom-in duration — the O3 shared-element reveal, pinned to the
+/// §4 Motion table's deliberate step (never a literal duration).
+const ZOOM_SECS: f32 = Motion::SLOW;
+/// The zoom/settle opacity floor: the hero starts this faint as it grows from the
+/// tile, and the mosaic settles back in from here on Back (O3).
+const ZOOM_FADE_FLOOR: f32 = 0.4;
+
 // ─────────────────────────── wire mirrors (§6) ───────────────────────────
 
 /// The kind of a discovered unit — a **local** mirror of the aggregator's
@@ -1341,13 +1363,18 @@ fn push_bounded(ring: &mut VecDeque<f32>, v: f32) {
 
 // ─────────────────────────── the surface state ───────────────────────────
 
-/// Which surface mode the Explorer renders (design O1's three modes; the mosaic
-/// overview is EXPLORER-11). EXPLORER-10 adds the **IPAM** address table beside the
-/// hero card, toggled from the header — the category filter chips scope both.
+/// Which surface mode the Explorer renders (design O1's three modes). The
+/// **mosaic** overview is the whole-fleet landing (EXPLORER-11); picking a tile
+/// zooms into the one-unit **hero** card (EXPLORER-3); the **IPAM** table is the
+/// NetBox-style discovered-address view (EXPLORER-10). The category filter chips
+/// scope all three; the header toggles between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SurfaceMode {
-    /// The one-unit-at-a-time hero card (EXPLORER-3) — the default landing.
+    /// The zoomable, category-clustered mosaic of mini hero tiles — the landing
+    /// (EXPLORER-11, O1).
     #[default]
+    Mosaic,
+    /// The one-unit-at-a-time hero card (EXPLORER-3) — the zoom-in focus mode.
     Hero,
     /// The NetBox-style discovered prefix/IP table (EXPLORER-10).
     Ipam,
@@ -1382,8 +1409,22 @@ pub struct ExplorerState {
     arm: Option<ArmedVerb>,
     /// The last verb's honest inline note (`true` ⇒ an error/gated reason).
     last_action_note: Option<(String, bool)>,
-    /// The active surface mode — the hero card or the IPAM table (EXPLORER-10).
+    /// The active surface mode — the mosaic overview, the hero card, or the IPAM
+    /// table (EXPLORER-11/10). The mosaic is the landing (O1).
     mode: SurfaceMode,
+    /// The origin tile rect a zoom-in animates out from (O3 shared-element zoom);
+    /// `None` ⇒ the hero was entered without a spatial origin (a direct toggle /
+    /// keyboard pick with no live tile rect) so it simply fades in.
+    zoom_from: Option<Rect>,
+    /// When the current tile→hero zoom-in began — the transition clock. `None` ⇒
+    /// no zoom is in flight.
+    zoom_start: Option<Instant>,
+    /// When the mosaic was last (re-)entered from the hero — the O3 zoom-out
+    /// settle; drives a brief fade-in so Back reads as a reverse zoom.
+    mosaic_enter: Option<Instant>,
+    /// The focused mosaic tile's on-screen rect from the last frame — the origin a
+    /// keyboard/D-pad Enter zooms from (a mouse pick carries its own rect).
+    focus_rect: Option<Rect>,
 }
 
 impl Default for ExplorerState {
@@ -1405,6 +1446,10 @@ impl Default for ExplorerState {
             arm: None,
             last_action_note: None,
             mode: SurfaceMode::default(),
+            zoom_from: None,
+            zoom_start: None,
+            mosaic_enter: None,
+            focus_rect: None,
         }
     }
 }
@@ -1475,13 +1520,40 @@ impl ExplorerState {
     }
 
     /// Per-category rollup counts over the whole shelf (drives the chip badges +
-    /// the seed of the O2 summary strip).
+    /// the O2 summary strip).
     fn category_counts(&self) -> [usize; 3] {
         let mut counts = [0usize; 3];
         for unit in &self.units {
             counts[unit.kind.category().index()] += 1;
         }
         counts
+    }
+
+    /// The fleet health rollup over the whole shelf — `[green, warn, down]`: green
+    /// = healthy, warn = degraded, down = critical **or** unreachable. An
+    /// unprobed/unknown unit is counted in none of them (honest, §7). Drives the O2
+    /// summary strip's health tallies.
+    fn health_rollup(&self) -> [usize; 3] {
+        let mut rollup = [0usize; 3];
+        for unit in &self.units {
+            match unit.health {
+                Some(Health::Healthy) => rollup[0] += 1,
+                Some(Health::Degraded) => rollup[1] += 1,
+                Some(Health::Critical | Health::Unreachable) => rollup[2] += 1,
+                _ => {}
+            }
+        }
+        rollup
+    }
+
+    /// The count of discovered units that reported a (non-empty) address — the O2
+    /// summary strip's "total addresses" tally. A unit with no address is never
+    /// counted (§7 — only real discovery).
+    fn total_addresses(&self) -> usize {
+        self.units
+            .iter()
+            .filter(|u| u.address.as_deref().is_some_and(|a| !a.trim().is_empty()))
+            .count()
     }
 
     /// Page one unit toward the end of the shelf (Right / ›, #6).
@@ -1596,6 +1668,67 @@ impl ExplorerState {
     fn jump_from_ipam(&mut self, id: &str) {
         self.mode = SurfaceMode::Hero;
         self.jump_to_id(id);
+    }
+
+    // ─────────────────── the mosaic overview (EXPLORER-11) ───────────────────
+
+    /// Switch surface mode from a direct header toggle — a clean cut, not a stale
+    /// shared-element zoom: any in-flight zoom is cleared, and landing on the
+    /// mosaic seeds the O3 settle fade. A no-op toggle to the current mode leaves
+    /// the animation state untouched.
+    fn set_mode(&mut self, mode: SurfaceMode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        self.zoom_from = None;
+        self.zoom_start = None;
+        self.mosaic_enter = (mode == SurfaceMode::Mosaic).then(Instant::now);
+    }
+
+    /// Zoom a picked mosaic tile into its full hero (O1/O3): focus the unit at
+    /// `pos` (its index in the current filtered view), switch to the hero mode, and
+    /// seed the shared-element zoom from the tile's `from` rect (a keyboard Enter
+    /// with no live rect passes `None` → the hero simply fades in). Reuses the ONE
+    /// focus-set path (a stale arm/note from the old focus is dropped).
+    fn zoom_into(&mut self, pos: usize, from: Option<Rect>) {
+        self.focus = pos;
+        self.mode = SurfaceMode::Hero;
+        self.zoom_from = from;
+        self.zoom_start = Some(Instant::now());
+        self.mosaic_enter = None;
+        self.arm = None;
+        self.last_action_note = None;
+    }
+
+    /// Zoom back out to the mosaic overview (O3 reverse — Back/Esc): return to the
+    /// mosaic with the just-focused tile still selected (spatially coherent) and a
+    /// brief settle fade. The hero's zoom-in state is cleared.
+    fn back_to_mosaic(&mut self) {
+        self.mode = SurfaceMode::Mosaic;
+        self.zoom_from = None;
+        self.zoom_start = None;
+        self.mosaic_enter = Some(Instant::now());
+    }
+
+    /// The current tile→hero zoom transform: `Some((rect, opacity))` while the O3
+    /// shared-element zoom is in flight, else `None` once it completes (or was
+    /// never seeded). Clears the zoom state on completion so the hero settles into
+    /// its normal full-frame paging.
+    fn zoom_progress(&mut self, full: Rect) -> Option<(Rect, f32)> {
+        let start = self.zoom_start?;
+        let p = (start.elapsed().as_secs_f32() / ZOOM_SECS).clamp(0.0, 1.0);
+        if p >= 1.0 {
+            self.zoom_from = None;
+            self.zoom_start = None;
+            return None;
+        }
+        let eased = ease_out(p);
+        let from = self.zoom_from.unwrap_or(full);
+        Some((
+            lerp_rect(from, full, eased),
+            flerp(ZOOM_FADE_FLOOR, 1.0, eased),
+        ))
     }
 
     // ─────────────────── the per-type action bar (EXPLORER-5) ───────────────────
@@ -1835,11 +1968,15 @@ impl ExplorerState {
     /// mode (hero card · filmstrip, or the IPAM table). The one public entry the
     /// mount drives per frame.
     pub fn show(&mut self, ui: &mut egui::Ui) {
-        // Hero paging keys only steer the hero mode.
-        if self.mode == SurfaceMode::Hero {
-            self.handle_keys(ui);
+        // Per-mode input (O6): the hero pages + zooms out, the mosaic grid-navs +
+        // zooms in; the IPAM table is scroll-only.
+        match self.mode {
+            SurfaceMode::Hero => self.handle_keys(ui),
+            SurfaceMode::Mosaic => self.handle_mosaic_keys(ui),
+            SurfaceMode::Ipam => {}
         }
-        // Keep focus valid against the freshest (possibly re-filtered) view.
+        // Keep focus valid against the freshest (possibly re-filtered) view — the
+        // one focus index the mosaic tiles + hero pages share.
         let count = self.hero_count();
         self.focus = if count == 0 {
             0
@@ -1851,6 +1988,11 @@ impl ExplorerState {
             .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
             .show_inside(ui, |ui| self.header(ui));
         match self.mode {
+            SurfaceMode::Mosaic => {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+                    .show_inside(ui, |ui| self.mosaic(ui));
+            }
             SurfaceMode::Hero => {
                 egui::TopBottomPanel::bottom(ui.id().with("explorer-strip"))
                     .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
@@ -1867,34 +2009,68 @@ impl ExplorerState {
         }
     }
 
-    /// The header: the Hero ⇄ IPAM mode toggle (EXPLORER-10), then the category
-    /// filter chips (#8) that scope whichever mode is active.
+    /// The summary/filter strip (O2): the Mosaic ⇄ Hero ⇄ IPAM mode toggle + the
+    /// right-aligned fleet rollup (health tallies + total addresses), then the
+    /// category filter chips (#8) that scope whichever mode is active.
     fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = Style::SP_S;
+            if chip(
+                ui,
+                "Mosaic",
+                self.mode == SurfaceMode::Mosaic,
+                Style::ACCENT,
+            ) {
+                self.set_mode(SurfaceMode::Mosaic);
+            }
             if chip(ui, "Hero", self.mode == SurfaceMode::Hero, Style::ACCENT) {
-                self.mode = SurfaceMode::Hero;
+                self.set_mode(SurfaceMode::Hero);
             }
             if chip(ui, "IPAM", self.mode == SurfaceMode::Ipam, Style::ACCENT) {
-                self.mode = SurfaceMode::Ipam;
+                self.set_mode(SurfaceMode::Ipam);
             }
+            // The O2 fleet rollup, pushed to the right edge of the strip.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| self.rollup(ui));
         });
         ui.add_space(Style::SP_XS);
         self.chips(ui);
     }
 
-    /// Left/Right (and Home/End) paging (#6, O6 D-pad-first). Consumed from this
-    /// frame's input; a fullscreen text surface never sees them because only the
-    /// active surface renders.
+    /// The O2 fleet rollup cluster on the right of the summary strip: the health
+    /// tallies (green / warn / down) + the total discovered addresses. A live
+    /// whole-fleet glance over the folded shelf (§7 — real tiers only).
+    fn rollup(&self, ui: &mut egui::Ui) {
+        let [green, warn, down] = self.health_rollup();
+        ui.spacing_mut().item_spacing.x = Style::SP_S;
+        // Right-to-left layout → add right-most first: addresses, then down/warn/up.
+        ui.label(
+            RichText::new(format!("{} addr", self.total_addresses()))
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+        health_dot(ui, Style::DANGER, down);
+        health_dot(ui, Style::WARN, warn);
+        health_dot(ui, Style::OK, green);
+    }
+
+    /// Hero-mode input (#6, O6 D-pad-first): Left/Right page, Home/End jump to the
+    /// ends, Esc/Backspace zoom back out to the mosaic overview (O3). Consumed from
+    /// this frame's input; a fullscreen text surface never sees them because only
+    /// the active surface renders.
     fn handle_keys(&mut self, ui: &egui::Ui) {
-        let (left, right, home, end) = ui.input(|i| {
+        let (left, right, home, end, back) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowLeft),
                 i.key_pressed(egui::Key::ArrowRight),
                 i.key_pressed(egui::Key::Home),
                 i.key_pressed(egui::Key::End),
+                i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Backspace),
             )
         });
+        if back {
+            self.back_to_mosaic();
+            return;
+        }
         if left {
             self.page_prev();
         }
@@ -1906,6 +2082,49 @@ impl ExplorerState {
         }
         if end {
             self.focus = self.hero_count().saturating_sub(1);
+        }
+    }
+
+    /// Mosaic-mode grid nav (O6/O11): Left/Right step one tile, Up/Down move a
+    /// whole row, Home/End jump to the ends, Enter/Space zoom the focused tile into
+    /// its hero (O3). Couch-or-desk — the same focus index the hero pages, so a
+    /// zoom lands on exactly the selected tile. The column step matches the render's
+    /// (`mosaic_columns` over the inner content width).
+    fn handle_mosaic_keys(&mut self, ui: &egui::Ui) {
+        let cols = mosaic_columns(ui.available_width() - Style::SP_S * 2.0);
+        let count = self.hero_count();
+        let (left, right, up, down, home, end, enter) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Home),
+                i.key_pressed(egui::Key::End),
+                i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space),
+            )
+        });
+        if left {
+            self.focus = grid_move(self.focus, count, cols, GridDir::Left);
+        }
+        if right {
+            self.focus = grid_move(self.focus, count, cols, GridDir::Right);
+        }
+        if up {
+            self.focus = grid_move(self.focus, count, cols, GridDir::Up);
+        }
+        if down {
+            self.focus = grid_move(self.focus, count, cols, GridDir::Down);
+        }
+        if home {
+            self.focus = 0;
+        }
+        if end {
+            self.focus = count.saturating_sub(1);
+        }
+        if enter && count > 0 {
+            let from = self.focus_rect;
+            self.zoom_into(self.focus, from);
         }
     }
 
@@ -1950,16 +2169,27 @@ impl ExplorerState {
             self.page_next();
         }
 
+        // The shared-element zoom-in (O3): while a tile→hero zoom is in flight the
+        // hero card grows from the picked tile's rect with a fade, snapping the
+        // page-slide out of the way so the two don't fight; otherwise the usual
         // Carbon slide + cross-fade on a page change (#21).
         let anim_id = ui.id().with("explorer-hero-anim");
-        let visual = ui
-            .ctx()
-            .animate_value_with_time(anim_id, self.focus as f32, Motion::BASE);
-        let delta = self.focus as f32 - visual;
-        let slide = (delta * full.width() * SLIDE_FRACTION).clamp(-full.width(), full.width());
-        let fade = (1.0 - delta.abs()).clamp(0.0, 1.0);
-
-        let child_rect = full.translate(Vec2::new(slide, 0.0));
+        let (child_rect, fade) = if let Some((rect, opacity)) = self.zoom_progress(full) {
+            ui.ctx()
+                .animate_value_with_time(anim_id, self.focus as f32, 0.0);
+            if opacity < 1.0 {
+                ui.ctx().request_repaint();
+            }
+            (rect, opacity)
+        } else {
+            let visual = ui
+                .ctx()
+                .animate_value_with_time(anim_id, self.focus as f32, Motion::BASE);
+            let delta = self.focus as f32 - visual;
+            let slide = (delta * full.width() * SLIDE_FRACTION).clamp(-full.width(), full.width());
+            let fade = (1.0 - delta.abs()).clamp(0.0, 1.0);
+            (full.translate(Vec2::new(slide, 0.0)), fade)
+        };
         let mut child = ui.new_child(
             UiBuilder::new()
                 .max_rect(child_rect)
@@ -2153,6 +2383,99 @@ impl ExplorerState {
             self.jump_from_ipam(&id);
         }
     }
+
+    /// The mosaic overview (EXPLORER-11, design O1): a category-clustered grid of
+    /// mini hero tiles — the whole-fleet landing. Picking a tile zooms it into its
+    /// full hero (O3); the keyboard/D-pad focus ring always shows the selection
+    /// (O6/O11). Honest-empty falls back to this node's own discovering tile (#23),
+    /// or a "no matches" note under a filter — never a blank pane (§7).
+    fn mosaic(&mut self, ui: &mut egui::Ui) {
+        let indices = self.filtered_indices();
+        if indices.is_empty() {
+            self.focus_rect = None;
+            ui.add_space(Style::SP_L);
+            if self.filter.is_none() {
+                // #23 — no mirror yet: show THIS node's own tile, discovering.
+                let me = self_placeholder(&self.local_host);
+                ui.vertical_centered(|ui| {
+                    mosaic_tile(ui, &me, true);
+                    ui.add_space(Style::SP_S);
+                    muted_note(ui, "Discovering units… others tile in as they're found.");
+                });
+            } else {
+                muted_note(
+                    ui,
+                    format!(
+                        "No {} units discovered yet.",
+                        self.filter.map_or("", Category::label)
+                    ),
+                );
+            }
+            return;
+        }
+
+        // The O3 zoom-out settle: a brief fade-in when the mosaic was just
+        // re-entered from a hero, so Back reads as a reverse zoom.
+        let settle = if let Some(t) = self.mosaic_enter {
+            let p = (t.elapsed().as_secs_f32() / Motion::BASE).clamp(0.0, 1.0);
+            if p >= 1.0 {
+                self.mosaic_enter = None;
+            }
+            ui.ctx().request_repaint();
+            flerp(ZOOM_FADE_FLOOR, 1.0, p)
+        } else {
+            1.0
+        };
+
+        // Cluster the (already proximity-sorted) filtered view into contiguous
+        // category runs — the category-clustered grid (O1/O8).
+        let mut clusters: Vec<(Category, Vec<usize>)> = Vec::new();
+        for &idx in &indices {
+            let cat = self.units[idx].kind.category();
+            match clusters.last_mut() {
+                Some((c, run)) if *c == cat => run.push(idx),
+                _ => clusters.push((cat, vec![idx])),
+            }
+        }
+
+        let focus = self.focus;
+        let mut pick: Option<(usize, Rect)> = None;
+        let mut focus_rect: Option<Rect> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.set_opacity(settle);
+                let cols = mosaic_columns(ui.available_width());
+                let mut pos = 0usize; // the running index into the filtered view
+                for (cat, run) in &clusters {
+                    mosaic_cluster_header(ui, *cat, run.len());
+                    let mut k = 0;
+                    while k < run.len() {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = MOSAIC_GAP;
+                            for _ in 0..cols {
+                                let Some(&idx) = run.get(k) else { break };
+                                let focused = pos == focus;
+                                let (rect, clicked) = mosaic_tile(ui, &self.units[idx], focused);
+                                if focused {
+                                    focus_rect = Some(rect);
+                                }
+                                if clicked {
+                                    pick = Some((pos, rect));
+                                }
+                                pos += 1;
+                                k += 1;
+                            }
+                        });
+                        ui.add_space(MOSAIC_GAP);
+                    }
+                }
+            });
+        self.focus_rect = focus_rect;
+        if let Some((pos, rect)) = pick {
+            self.zoom_into(pos, Some(rect));
+        }
+    }
 }
 
 /// Synthesise this node's own hero unit for the honest empty state (#23) — a real
@@ -2328,6 +2651,161 @@ fn truncate(s: &str, max: usize) -> String {
         let head: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{head}…")
     }
+}
+
+// ─────────────────── mosaic overview render (EXPLORER-11) ───────────────────
+
+/// A D-pad direction over the mosaic grid (O6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GridDir {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Move the focus index over a `count`-item, `cols`-wide grid one step in `dir`,
+/// clamping at every edge (a D-pad press past an edge stays put — never wraps, so
+/// couch nav is predictable, O6). Pure — the grid-nav model, unit-tested without a
+/// render.
+fn grid_move(focus: usize, count: usize, cols: usize, dir: GridDir) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let cols = cols.max(1);
+    let last = count - 1;
+    match dir {
+        GridDir::Left => focus.saturating_sub(1),
+        GridDir::Right => (focus + 1).min(last),
+        // Top row can't rise; else step up a whole row.
+        GridDir::Up => focus.checked_sub(cols).unwrap_or(focus),
+        GridDir::Down => (focus + cols).min(last),
+    }
+}
+
+/// The number of mosaic columns that fit in `avail` pixels (always ≥1, even at a
+/// nonsense/negative width), so the grid-nav row step and the rendered row width
+/// agree — a zero-column grid would render nothing.
+fn mosaic_columns(avail: f32) -> usize {
+    (((avail + MOSAIC_GAP) / (MOSAIC_TILE_W + MOSAIC_GAP)) as usize).max(1)
+}
+
+/// Linear interpolate `a`→`b` by `t`.
+fn flerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Interpolate a rect `from`→`to` by `t` — the shared-element zoom geometry (O3).
+fn lerp_rect(from: Rect, to: Rect, t: f32) -> Rect {
+    Rect::from_min_max(
+        egui::pos2(
+            flerp(from.min.x, to.min.x, t),
+            flerp(from.min.y, to.min.y, t),
+        ),
+        egui::pos2(
+            flerp(from.max.x, to.max.x, t),
+            flerp(from.max.y, to.max.y, t),
+        ),
+    )
+}
+
+/// An ease-out curve (fast-in, settling) for the zoom reveal — Carbon productive
+/// motion without pulling in a bespoke easing framework.
+fn ease_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t) * (1.0 - t)
+}
+
+/// One health-rollup stat (O2): a filled status dot in `color` + its count, so the
+/// green/warn/down palette reads at a glance in the summary strip.
+fn health_dot(ui: &mut egui::Ui, color: Color32, count: usize) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = Style::SP_XS;
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(Style::SP_S), Sense::hover());
+        ui.painter()
+            .circle_filled(rect.center(), Style::SP_XS * 0.9, color);
+        ui.label(
+            RichText::new(count.to_string())
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+    });
+}
+
+/// A mosaic cluster header (O1/O8): the category label + its count in the category
+/// accent — the category-clustered grid's divider between runs.
+fn mosaic_cluster_header(ui: &mut egui::Ui, cat: Category, count: usize) {
+    ui.add_space(Style::SP_S);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = Style::SP_S;
+        ui.label(
+            RichText::new(cat.label())
+                .size(Style::BODY)
+                .strong()
+                .color(cat.accent()),
+        );
+        ui.label(
+            RichText::new(count.to_string())
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
+    });
+    ui.add_space(Style::SP_XS);
+}
+
+/// One mosaic hero-tile (EXPLORER-11): a mini status ring + kind glyph, the
+/// truncated name, and a type badge, in a category-tinted frame; the keyboard/
+/// D-pad-focused tile wears a thick high-contrast focus ring (O11). Hand-painted so
+/// the procedural glyph family (O8) rides inside, echoing the hero at tile scale.
+/// Returns its rect (the zoom-in origin) and whether it was clicked (the O3 pick).
+fn mosaic_tile(ui: &mut egui::Ui, unit: &Unit, focused: bool) -> (Rect, bool) {
+    let cat = unit.kind.category();
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(MOSAIC_TILE_W, MOSAIC_TILE_H), Sense::click());
+    let hovered = resp.hovered();
+    let painter = ui.painter();
+    painter.rect_filled(rect, Style::RADIUS, Style::SURFACE);
+    // The frame: a thick accent focus ring for the selection, else a hover accent
+    // or a calm border (O11 — the selection is always legible for D-pad nav).
+    let (stroke_w, frame) = if focused {
+        (FOCUS_RING_W, Style::ACCENT_HI)
+    } else if hovered {
+        (1.0, cat.accent())
+    } else {
+        (1.0, Style::BORDER)
+    };
+    painter.rect_stroke(
+        rect,
+        Style::RADIUS,
+        Stroke::new(stroke_w, frame),
+        StrokeKind::Inside,
+    );
+    // The mini status ring + kind glyph (echoes the hero, O1/O8). A known health
+    // tier tints the ring; an unprobed unit reads as a calm border, never faked.
+    let ring_c = egui::pos2(
+        rect.center().x,
+        rect.min.y + MOSAIC_RING_D * 0.5 + Style::SP_S,
+    );
+    let ring_r = MOSAIC_RING_D * 0.5;
+    let ring_color = unit.health.map_or(Style::BORDER, Health::ring_color);
+    painter.circle_stroke(ring_c, ring_r, Stroke::new(RING_STROKE_W, ring_color));
+    paint_kind_glyph(painter, ring_c, ring_r * 0.55, unit.kind, cat.accent());
+    // The truncated name + the type badge under it.
+    painter.text(
+        egui::pos2(rect.center().x, rect.max.y - Style::SP_M),
+        Align2::CENTER_BOTTOM,
+        truncate(&unit.name, 14),
+        FontId::proportional(Style::BODY),
+        Style::TEXT,
+    );
+    painter.text(
+        egui::pos2(rect.center().x, rect.max.y - Style::SP_XS),
+        Align2::CENTER_BOTTOM,
+        unit.kind.label(),
+        FontId::proportional(Style::SMALL),
+        cat.accent(),
+    );
+    (rect, resp.clicked())
 }
 
 // ─────────────────── IPAM table render (EXPLORER-10) ───────────────────
@@ -2873,6 +3351,10 @@ mod tests {
                 arm: None,
                 last_action_note: None,
                 mode: SurfaceMode::default(),
+                zoom_from: None,
+                zoom_start: None,
+                mosaic_enter: None,
+                focus_rect: None,
             };
             s.refresh();
             s
@@ -3206,6 +3688,7 @@ mod tests {
             Some(Category::Cloud),
         ] {
             let mut s = ExplorerState::with_fake(states.clone(), "me");
+            s.mode = SurfaceMode::Hero; // exercise the hero-card path (mosaic lands)
             s.set_filter(filter);
             let ctx = egui::Context::default();
             Style::install(&ctx);
@@ -3225,6 +3708,7 @@ mod tests {
 
         // And the honest empty (#23) self card renders too.
         let mut empty = ExplorerState::with_fake(vec![], "solo");
+        empty.mode = SurfaceMode::Hero;
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let input = egui::RawInput {
@@ -3352,6 +3836,7 @@ mod tests {
             edges: Vec::new(),
         }];
         let mut s = ExplorerState::with_fake(states, "me");
+        s.mode = SurfaceMode::Hero; // the hero-card path (mosaic is the landing)
         for _ in 0..4 {
             s.refresh(); // ≥2 samples → a drawable sparkline
         }
@@ -3610,6 +4095,7 @@ mod tests {
             }],
             "me",
         );
+        s.mode = SurfaceMode::Hero; // the action bar lives on the hero card
         let u = focused(&s);
         s.arm_verb(Verb::Delete, &u.id); // show the challenge row
         let ctx = egui::Context::default();
@@ -3826,6 +4312,7 @@ mod tests {
     fn the_edge_chip_region_renders_headless() {
         // The grouped chips tessellate cleanly under the hero card.
         let mut s = ExplorerState::with_fake(connected_state(), "me");
+        s.mode = SurfaceMode::Hero; // the edge chips ride the hero card
         focus_on(&mut s, "cloud:instance:i1");
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -4022,5 +4509,226 @@ mod tests {
         let mut empty = ExplorerState::with_fake(vec![], "solo");
         empty.mode = SurfaceMode::Ipam;
         assert!(render(&mut empty));
+    }
+
+    // ─────────────────────── EXPLORER-11 mosaic overview ───────────────────────
+
+    #[test]
+    fn mosaic_is_the_landing_mode() {
+        // The surface lands on the whole-fleet mosaic (O1), not the hero card.
+        assert_eq!(SurfaceMode::default(), SurfaceMode::Mosaic);
+        let s = ExplorerState::with_fake(addressed_state(), "me");
+        assert_eq!(s.mode, SurfaceMode::Mosaic);
+    }
+
+    #[test]
+    fn mode_toggles_switch_between_all_three() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        assert_eq!(s.mode, SurfaceMode::Mosaic);
+        s.set_mode(SurfaceMode::Hero);
+        assert_eq!(s.mode, SurfaceMode::Hero);
+        s.set_mode(SurfaceMode::Ipam);
+        assert_eq!(s.mode, SurfaceMode::Ipam);
+        s.set_mode(SurfaceMode::Mosaic);
+        assert_eq!(s.mode, SurfaceMode::Mosaic);
+        // Landing back on the mosaic seeds the O3 settle fade.
+        assert!(s.mosaic_enter.is_some());
+        // A no-op toggle to the current mode is inert.
+        s.mosaic_enter = None;
+        s.set_mode(SurfaceMode::Mosaic);
+        assert!(
+            s.mosaic_enter.is_none(),
+            "re-selecting the same mode is a no-op"
+        );
+    }
+
+    #[test]
+    fn picking_a_tile_zooms_into_its_hero() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.last_action_note = Some(("stale".into(), false)); // a note from a prior view
+        let rect = Rect::from_min_size(egui::pos2(10.0, 10.0), Vec2::splat(100.0));
+        s.zoom_into(2, Some(rect));
+        assert_eq!(s.mode, SurfaceMode::Hero, "a pick zooms into the hero");
+        assert_eq!(s.focus, 2, "the picked tile becomes the focused hero");
+        assert_eq!(
+            s.zoom_from,
+            Some(rect),
+            "the zoom animates from the tile rect"
+        );
+        assert!(
+            s.zoom_start.is_some(),
+            "the shared-element zoom clock is running"
+        );
+        assert!(
+            s.last_action_note.is_none() && s.arm.is_none(),
+            "the zoom reuses the focus path and drops stale arm/note"
+        );
+    }
+
+    #[test]
+    fn back_zooms_out_to_the_mosaic() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.zoom_into(1, None);
+        assert_eq!(s.mode, SurfaceMode::Hero);
+        s.back_to_mosaic();
+        assert_eq!(s.mode, SurfaceMode::Mosaic, "Back returns to the overview");
+        assert_eq!(s.focus, 1, "the just-viewed tile stays selected (coherent)");
+        assert!(s.zoom_from.is_none() && s.zoom_start.is_none());
+        assert!(
+            s.mosaic_enter.is_some(),
+            "the reverse settle fade is seeded"
+        );
+    }
+
+    #[test]
+    fn grid_nav_walks_the_mosaic_and_clamps_at_the_edges() {
+        // A 5-item, 3-wide grid: rows [0 1 2] [3 4].
+        let (n, cols) = (5, 3);
+        assert_eq!(grid_move(0, n, cols, GridDir::Right), 1);
+        assert_eq!(
+            grid_move(2, n, cols, GridDir::Right),
+            3,
+            "steps into the next row"
+        );
+        assert_eq!(
+            grid_move(0, n, cols, GridDir::Left),
+            0,
+            "clamps at the start"
+        );
+        assert_eq!(
+            grid_move(4, n, cols, GridDir::Right),
+            4,
+            "clamps at the end"
+        );
+        assert_eq!(grid_move(0, n, cols, GridDir::Down), 3, "down a whole row");
+        assert_eq!(grid_move(3, n, cols, GridDir::Up), 0, "up a whole row");
+        assert_eq!(
+            grid_move(1, n, cols, GridDir::Up),
+            1,
+            "the top row can't rise"
+        );
+        assert_eq!(
+            grid_move(4, n, cols, GridDir::Down),
+            4,
+            "the last item can't fall"
+        );
+        // Degenerate inputs never panic.
+        assert_eq!(
+            grid_move(0, 0, cols, GridDir::Right),
+            0,
+            "an empty grid stays put"
+        );
+        assert_eq!(grid_move(2, n, 0, GridDir::Down), 3, "cols floors to 1");
+    }
+
+    #[test]
+    fn mosaic_columns_fit_and_floor_to_one() {
+        assert!(
+            mosaic_columns(2000.0) >= 3,
+            "a wide surface fits several tiles"
+        );
+        assert_eq!(
+            mosaic_columns(10.0),
+            1,
+            "a narrow surface still shows one column"
+        );
+        assert_eq!(
+            mosaic_columns(-50.0),
+            1,
+            "a nonsense width never underflows"
+        );
+    }
+
+    #[test]
+    fn zoom_geometry_interpolates_from_tile_to_full() {
+        let from = Rect::from_min_size(egui::pos2(20.0, 20.0), Vec2::splat(10.0));
+        let to = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::splat(100.0));
+        assert_eq!(lerp_rect(from, to, 0.0), from, "t=0 sits on the tile");
+        assert_eq!(lerp_rect(from, to, 1.0), to, "t=1 fills the hero frame");
+        assert!(ease_out(0.0).abs() < f32::EPSILON);
+        assert!((ease_out(1.0) - 1.0).abs() < f32::EPSILON);
+        assert!(ease_out(0.5) > 0.5, "ease-out leads linear at the midpoint");
+    }
+
+    #[test]
+    fn rollup_counts_are_honest_over_the_shelf() {
+        // Mixed health + addresses: green/warn/down tallies count only real tiers,
+        // unknown/unprobed count in none; total addresses counts only reporters.
+        let states = vec![UnitsState {
+            host: "me".into(),
+            units: vec![
+                Unit {
+                    health: Some(Health::Healthy),
+                    address: Some("10.42.0.1".into()),
+                    ..unit("peer:me", UnitKind::Peer, "me", 10)
+                },
+                Unit {
+                    health: Some(Health::Degraded),
+                    address: Some("10.42.0.2".into()),
+                    ..unit("peer:b", UnitKind::Peer, "b", 10)
+                },
+                Unit {
+                    health: Some(Health::Critical),
+                    address: None,
+                    ..unit("peer:c", UnitKind::Peer, "c", 10)
+                },
+                Unit {
+                    health: Some(Health::Unreachable),
+                    address: Some("172.20.0.9".into()),
+                    ..unit("lan:d", UnitKind::LanHost, "d", 10)
+                },
+                Unit {
+                    health: Some(Health::Unknown),
+                    address: None,
+                    ..unit("cloud:instance:i", UnitKind::Instance, "i", 10)
+                },
+            ],
+            edges: Vec::new(),
+        }];
+        let s = ExplorerState::with_fake(states, "me");
+        assert_eq!(
+            s.health_rollup(),
+            [1, 1, 2],
+            "1 green, 1 warn, 2 down (critical + unreachable); unknown counts in none"
+        );
+        assert_eq!(
+            s.total_addresses(),
+            3,
+            "only the three address-reporting units"
+        );
+        assert_eq!(s.category_counts(), [3, 1, 1], "3 mesh, 1 lan, 1 cloud");
+    }
+
+    #[test]
+    fn mosaic_renders_headless_across_filters_and_empty() {
+        let render = |s: &mut ExplorerState| {
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    Vec2::new(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| s.show(ui));
+            });
+            !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
+        };
+        // The mosaic is the default landing → show() drives the mosaic path.
+        for filter in [
+            None,
+            Some(Category::Mesh),
+            Some(Category::Lan),
+            Some(Category::Cloud),
+        ] {
+            let mut s = ExplorerState::with_fake(addressed_state(), "me");
+            s.set_filter(filter);
+            assert!(render(&mut s), "the mosaic drew primitives for {filter:?}");
+        }
+        // The honest empty (#23) self tile renders in the mosaic too, never blank.
+        let mut empty = ExplorerState::with_fake(vec![], "solo");
+        assert!(render(&mut empty), "the empty mosaic drew the self tile");
     }
 }
