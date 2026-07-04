@@ -29,6 +29,7 @@ mod curtain;
 mod datacenter;
 mod discovery;
 mod dock;
+mod explorer;
 mod formfactor;
 mod host_mirror;
 mod hotkeys;
@@ -242,6 +243,13 @@ struct Shell {
     /// Workbench planes read. Polled while in view; opens the honest "waiting for
     /// mesh" EmptyState until a snapshot lands.
     mesh_view: mesh_view::MeshViewState,
+    /// The Discovery hero-card surface (EXPLORER-3) — the cinematic one-unit-at-a-
+    /// time view over every discovered unit (mesh peers · LAN hosts · `OpenStack`
+    /// objects), folded from the aggregator's `state/units/*` mirrors (EXPLORER-1).
+    /// A thin renderer (§6): it reads the Bus, never scans. Mounted as the Mesh
+    /// Map surface's **Explorer** lens (the [`explorer::LENS_KEY`] toggle) pending
+    /// the dedicated dock entry; polled only while that lens is visible (#24).
+    explorer: explorer::ExplorerState,
     /// The onboard self-test watch (OW-10) — observes the `event/onboard/self-test`
     /// verdict lane and raises a one-shot edge the instant a node goes all-green, so
     /// the shell auto-opens the Mesh Map. The receive half of a flow whose publish
@@ -307,6 +315,7 @@ impl Shell {
             editor: real_editor(),
             editor_launch: EditorLaunchWatch::from_env(),
             mesh_view: mesh_view::MeshViewState::default(),
+            explorer: explorer::ExplorerState::default(),
             self_test: mesh_view::SelfTestWatch::default(),
             power_honor: power_honor::PowerHonor::default(),
             curtain: curtain::Curtain::pam(),
@@ -382,6 +391,54 @@ impl Shell {
         }
     }
 
+    /// Poll the Mesh Map surface and — when its EXPLORER-3 **Explorer** lens is the
+    /// one showing — the Discovery hero card, which tails `state/units/*` ONLY while
+    /// that lens is visible: the honest reachable half of the #24 scan-active gate
+    /// (the aggregator's in-process scan flag has no Bus seam yet, so nothing is
+    /// published here — §7). The mesh fold is the same cheap local scan the
+    /// Workbench planes poll (it self-gates).
+    fn poll_mesh_map(&mut self, ctx: &egui::Context) {
+        self.mesh_view.poll(ctx);
+        let explorer_lens =
+            ctx.data(|d| d.get_temp::<bool>(egui::Id::new(explorer::LENS_KEY)).unwrap_or(false));
+        if explorer_lens {
+            self.explorer.poll(ctx);
+        }
+    }
+
+    /// The Mesh Map surface (OW-10) with its EXPLORER-3 sibling **Explorer** lens
+    /// (the Discovery hero card). A slim segmented header toggles between the two
+    /// topology lenses — the map (nodes + links) and the one-unit-at-a-time hero
+    /// shelf over every discovered unit. The lens persists in egui memory under
+    /// [`explorer::LENS_KEY`] so [`Self::poll_mesh_map`] reads the same choice; it
+    /// defaults to the map, so OW-10's all-green auto-open still lands on the map.
+    /// (Mounted here pending the dedicated dock entry the taskbar owner adds — a
+    /// clean seam.)
+    fn show_mesh_map(&mut self, ui: &mut egui::Ui) {
+        let mesh_view = &mut self.mesh_view;
+        let explorer = &mut self.explorer;
+        ui.push_id("shell-mesh-view", |ui| {
+            let lens_id = egui::Id::new(explorer::LENS_KEY);
+            let mut show_explorer = ui.data(|d| d.get_temp::<bool>(lens_id).unwrap_or(false));
+            ui.horizontal(|ui| {
+                ui.add_space(Style::SP_S);
+                if ui.selectable_label(!show_explorer, "Mesh Map").clicked() {
+                    show_explorer = false;
+                }
+                if ui.selectable_label(show_explorer, "Explorer").clicked() {
+                    show_explorer = true;
+                }
+            });
+            ui.data_mut(|d| d.insert_temp(lens_id, show_explorer));
+            ui.separator();
+            if show_explorer {
+                explorer.show(ui);
+            } else {
+                mesh_view.show(ui);
+            }
+        });
+    }
+
     /// The expanded shell body: the one active surface. (The taskbar is NOT
     /// mounted here any more — NAVBAR-W10-2 lock W13 makes the bar constant, so
     /// `render` mounts the bottom panel before the central view, session and
@@ -411,14 +468,7 @@ impl Shell {
                     &mut self.spawn_lighthouse,
                 );
             }
-            Surface::MeshView => {
-                // The live Mesh Map (OW-10) — the `mde-mesh-view` painter fed the
-                // MeshState folded from the mesh-status snapshot. Scoped under its own
-                // `push_id` like every mounted surface; the poll refreshes the fold in
-                // `render` while this surface is in view.
-                let mesh_view = &mut self.mesh_view;
-                ui.push_id("shell-mesh-view", |ui| mesh_view.show(ui));
-            }
+            Surface::MeshView => self.show_mesh_map(ui),
             Surface::Desktop => {
                 // The Desktop surface's no-session face IS the Desktop Chooser
                 // (CHOOSER-2, superseding the E12-5b flat picker): with nothing
@@ -698,10 +748,9 @@ impl Shell {
             }
         }
 
-        // The Mesh Map surface refolds the mesh-status snapshot while it's in view —
-        // the same cheap local scan the Workbench planes poll (it self-gates).
+        // The Mesh Map surface (+ its EXPLORER-3 Explorer lens) refolds while in view.
         if self.nav.expanded && self.nav.surface == Surface::MeshView {
-            self.mesh_view.poll(ctx);
+            self.poll_mesh_map(ctx);
         }
 
         // The Desktop Chooser (CHOOSER-2) tails the CHOOSER-1 worker's
