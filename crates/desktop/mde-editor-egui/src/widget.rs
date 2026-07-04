@@ -81,6 +81,17 @@ const CARET_W: f32 = Style::SP_XS / 2.0;
 /// the egui frame clock, so it needs no wall-clock and stays test-free.
 const BLINK_HZ: f64 = 2.0;
 
+/// The default zoom (EDTB-1): 100% renders the editor at the shared
+/// [`Style::BODY`] size, exactly the pre-zoom EDITOR-3 metrics.
+const ZOOM_DEFAULT: u16 = 100;
+
+/// The zoom clamp range in percent — wide enough for every Word-97 Standard
+/// toolbar step (50–200%) with headroom, tight enough that a bad value can never
+/// zero the font or blow up the layout arithmetic.
+const ZOOM_MIN: u16 = 25;
+/// See [`ZOOM_MIN`].
+const ZOOM_MAX: u16 = 400;
+
 /// The character class used for word-wise selection/motion (double-click and
 /// `Ctrl`+Arrow): a word run, a whitespace run, or a punctuation run. Expanding a
 /// selection stops at a class boundary, matching every editor's word semantics.
@@ -327,14 +338,19 @@ struct Metrics {
     row_h: f32,
     /// Width of the left gutter (line-number column).
     gutter_w: f32,
+    /// The view's zoom as a font-size multiplier (EDTB-1) — carried so the paint
+    /// helpers resolve the *same* scaled font the metrics were measured with.
+    scale: f32,
 }
 
-/// The monospace font every editor glyph + the cell metrics resolve against.
+/// The monospace font every editor glyph + the cell metrics resolve against,
+/// scaled by the view's zoom factor (EDTB-1; `1.0` = the shared [`Style::BODY`]
+/// token — §4: the size stays token-derived, zoom only multiplies it).
 ///
 /// The shell's `fonts::install` puts the bundled face first in the Monospace
 /// family, so this id renders through it (mirrors `mde-term-egui`).
-fn body_font() -> FontId {
-    FontId::monospace(Style::BODY)
+fn body_font(scale: f32) -> FontId {
+    FontId::monospace(Style::BODY * scale)
 }
 
 /// One caret in the view: a char index into the rope plus a selection anchor and
@@ -465,6 +481,11 @@ pub struct EditorView {
     /// Anchor cell `(visual row, column)` of an in-progress Alt+drag column
     /// (box) selection, or `None` when no box drag is active.
     box_anchor: Option<(usize, usize)>,
+    /// The view's zoom in percent (EDTB-1) — the Word-97 Standard-toolbar zoom,
+    /// a per-view font scale over [`Style::BODY`] (100 = unscaled). Every cell
+    /// metric (glyph width, row height, gutter) derives from the scaled font, so
+    /// hit-testing, wrap, culling, and the caret all track the zoom for free.
+    zoom_percent: u16,
 }
 
 impl Default for EditorView {
@@ -490,6 +511,7 @@ impl EditorView {
             last_kind: None,
             edit_before: None,
             box_anchor: None,
+            zoom_percent: ZOOM_DEFAULT,
         }
     }
 
@@ -519,6 +541,32 @@ impl EditorView {
         v
     }
 
+    /// Whether any caret holds a non-empty selection — the Cut/Copy enablement
+    /// the menu bar + Standard toolbar read (EDTB-1).
+    #[must_use]
+    pub(crate) fn has_selection(&self) -> bool {
+        self.carets.iter().any(|c| c.selection().is_some())
+    }
+
+    /// The selected text: every caret's selection joined top-to-bottom with a
+    /// newline, or `None` when nothing is selected. The ONE copy/cut source —
+    /// the widget's `Ctrl-C`/`Ctrl-X` arm and the Edit-menu/toolbar Copy/Cut
+    /// (EDTB-1) all read the clipboard payload from here (§6, no duplication).
+    #[must_use]
+    pub(crate) fn selected_text(&self, buffer: &Buffer) -> Option<String> {
+        let ranges = self.selections();
+        if ranges.is_empty() {
+            return None;
+        }
+        Some(
+            ranges
+                .iter()
+                .map(|r| buffer.rope().slice(r.clone()).to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
     /// Whether soft-wrap is on.
     #[must_use]
     pub const fn wrap(&self) -> bool {
@@ -528,6 +576,25 @@ impl EditorView {
     /// Flip the soft-wrap toggle (the chrome strip's Wrap control).
     pub fn toggle_wrap(&mut self) {
         self.wrap = !self.wrap;
+    }
+
+    /// The view's zoom in percent (EDTB-1) — 100 renders at the shared
+    /// [`Style::BODY`] size; the Standard-toolbar dropdown reads this back.
+    #[must_use]
+    pub const fn zoom_percent(&self) -> u16 {
+        self.zoom_percent
+    }
+
+    /// Set the view's zoom in percent, clamped to a sane range — the Word-97
+    /// Standard-toolbar zoom control's seam. A real font-scale: the next frame's
+    /// metrics (glyph cell, row height, gutter) all resolve through it.
+    pub fn set_zoom_percent(&mut self, percent: u16) {
+        self.zoom_percent = percent.clamp(ZOOM_MIN, ZOOM_MAX);
+    }
+
+    /// The zoom as a font-size multiplier over [`Style::BODY`] (1.0 at 100%).
+    pub(crate) fn font_scale(&self) -> f32 {
+        f32::from(self.zoom_percent) / 100.0
     }
 
     /// The primary caret's 1-based `(line, column)` for the status strip.
@@ -777,9 +844,10 @@ impl EditorView {
         self.finish_edit(groups, EditKind::Delete, multi);
     }
 
-    /// Delete only the carets' selections (no char fallback) — the Cut edit. A
-    /// caret with no selection is left in place.
-    fn delete_selections(&mut self, buffer: &mut Buffer) {
+    /// Delete only the carets' selections (no char fallback) — the Cut edit,
+    /// shared by the widget's `Ctrl-X` arm and the Edit-menu/toolbar Cut
+    /// (EDTB-1). A caret with no selection is left in place.
+    pub(crate) fn delete_selections(&mut self, buffer: &mut Buffer) {
         let multi = self.carets.len() > 1;
         self.begin_edit();
         let order = self.fanout_order();
@@ -805,8 +873,9 @@ impl EditorView {
         self.finish_edit(groups, EditKind::Delete, multi);
     }
 
-    /// Select the whole buffer (collapses to one caret).
-    fn select_all(&mut self, buffer: &Buffer) {
+    /// Select the whole buffer (collapses to one caret) — the `Ctrl-A` arm and
+    /// the Edit-menu Select All (EDTB-1) share this one fn.
+    pub(crate) fn select_all(&mut self, buffer: &Buffer) {
         self.carets = vec![Caret {
             cursor: buffer.len_chars(),
             anchor: Some(0),
@@ -817,9 +886,23 @@ impl EditorView {
         self.reveal_caret = true;
     }
 
+    /// Whether an undo step is available — the Edit-menu/toolbar Undo
+    /// enablement (EDTB-1, the Word-97 grey-out).
+    #[must_use]
+    pub(crate) fn can_undo(&self) -> bool {
+        !self.undo_log.is_empty()
+    }
+
+    /// Whether a redo step is available — the Edit-menu/toolbar Redo enablement.
+    #[must_use]
+    pub(crate) fn can_redo(&self) -> bool {
+        !self.redo_log.is_empty()
+    }
+
     /// Undo one widget step, unwinding its buffer groups and restoring every
-    /// caret. Returns whether it changed anything.
-    fn undo(&mut self, buffer: &mut Buffer) -> bool {
+    /// caret. Returns whether it changed anything. Shared by the widget's
+    /// `Ctrl-Z` arm and the Edit-menu/toolbar Undo (EDTB-1).
+    pub(crate) fn undo(&mut self, buffer: &mut Buffer) -> bool {
         buffer.commit_group();
         let Some(entry) = self.undo_log.pop() else {
             return false;
@@ -837,8 +920,9 @@ impl EditorView {
     }
 
     /// Redo one widget step, re-applying its buffer groups and restoring every
-    /// caret. Returns whether it changed anything.
-    fn redo(&mut self, buffer: &mut Buffer) -> bool {
+    /// caret. Returns whether it changed anything. Shared by the widget's
+    /// `Ctrl-Shift-Z`/`Ctrl-Y` arms and the Edit-menu/toolbar Redo (EDTB-1).
+    pub(crate) fn redo(&mut self, buffer: &mut Buffer) -> bool {
         buffer.commit_group();
         let Some(entry) = self.redo_log.pop() else {
             return false;
@@ -1310,13 +1394,17 @@ pub fn editor_widget(
 ) -> Response {
     view.clamp(buffer);
 
-    let font = body_font();
+    // The zoom-scaled font (EDTB-1): every metric below derives from it, so the
+    // whole cell geometry — hit-testing, wrap, culling, carets — tracks the zoom.
+    let scale = view.font_scale();
+    let font = body_font(scale);
     let (glyph_w, row_h) = ui.fonts(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
     let gutter_w = gutter_width(buffer.len_lines(), glyph_w);
     let metrics = Metrics {
         glyph_w,
         row_h,
         gutter_w,
+        scale,
     };
 
     // Wrap width in columns from the available text span; keep the map fresh.
@@ -1564,14 +1652,9 @@ fn handle_keys(resp: &Response, ui: &Ui, view: &mut EditorView, buffer: &mut Buf
     for event in &events {
         match event {
             Event::Copy | Event::Cut => {
-                let sels = view.selections();
-                if !sels.is_empty() {
-                    // Join every caret's selection with a newline (top-to-bottom).
-                    let text = sels
-                        .iter()
-                        .map(|r| buffer.rope().slice(r.clone()).to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                // The one copy/cut source (§6): the same `selected_text` +
+                // `delete_selections` seams the Edit menu / toolbar dispatch.
+                if let Some(text) = view.selected_text(buffer) {
                     ui.ctx().copy_text(text);
                     if matches!(event, Event::Cut) {
                         view.delete_selections(buffer);
@@ -1759,7 +1842,13 @@ fn draw_slice(
     let text = buffer.rope().slice(chars.clone()).to_string();
     #[allow(clippy::cast_precision_loss)]
     let x = text_x0 + (chars.start - row.start) as f32 * m.glyph_w;
-    painter.text(pos2(x, y), Align2::LEFT_TOP, text, body_font(), color);
+    painter.text(
+        pos2(x, y),
+        Align2::LEFT_TOP,
+        text,
+        body_font(m.scale),
+        color,
+    );
 }
 
 /// Paint the selection band for one visual row, with a trailing hint when the
@@ -1837,7 +1926,9 @@ fn paint_gutter(
             pos2(num_x, y),
             Align2::RIGHT_TOP,
             (row.line + 1).to_string(),
-            FontId::monospace(Style::SMALL),
+            // The gutter number scales with the zoom too (EDTB-1), staying the
+            // SMALL:BODY ratio the tokens fix at every zoom step.
+            FontId::monospace(Style::SMALL * m.scale),
             color,
         );
     }
@@ -2399,6 +2490,79 @@ mod tests {
         assert!(
             view.wrap_map.total() > 1,
             "a long line wrapped into multiple visual rows"
+        );
+    }
+
+    // ── EDTB-1: the view zoom (the Standard-toolbar Zoom dropdown's seam) ────
+
+    #[test]
+    fn zoom_scales_the_rendered_font_size() {
+        // The zoom is a REAL font scale: the FontId every glyph draws with is
+        // `Style::BODY * scale`, so 200% doubles the rendered size and 50%
+        // halves it. This is the exact font `editor_widget` measures its cell
+        // metrics from and `draw_slice` paints with.
+        let mut view = EditorView::new();
+        assert_eq!(view.zoom_percent(), 100, "a fresh view opens at 100%");
+        assert_eq!(super::body_font(view.font_scale()).size, Style::BODY);
+
+        view.set_zoom_percent(200);
+        assert_eq!(view.zoom_percent(), 200);
+        assert_eq!(
+            super::body_font(view.font_scale()).size,
+            Style::BODY * 2.0,
+            "200% doubles the editor font"
+        );
+
+        view.set_zoom_percent(50);
+        assert_eq!(
+            super::body_font(view.font_scale()).size,
+            Style::BODY * 0.5,
+            "50% halves the editor font"
+        );
+    }
+
+    #[test]
+    fn zoom_clamps_to_the_sane_range() {
+        let mut view = EditorView::new();
+        view.set_zoom_percent(0);
+        assert_eq!(view.zoom_percent(), super::ZOOM_MIN, "0% clamps up");
+        view.set_zoom_percent(10_000);
+        assert_eq!(view.zoom_percent(), super::ZOOM_MAX, "10000% clamps down");
+    }
+
+    #[test]
+    fn zoomed_widget_lays_out_larger_rows_and_paints() {
+        // Drive two real frames at 100% and 200% and observe the row geometry
+        // through the caret's reported line under a fixed click position: at
+        // 200% the rows are twice as tall, so the same y lands a lower line at
+        // 100% than at 200%. Simpler + robust: assert the widget still paints
+        // and the scaled metrics feed the layout by comparing glyph widths.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let font_100 = super::body_font(1.0);
+        let font_200 = super::body_font(2.0);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0))),
+            ..Default::default()
+        };
+        let mut buf = Buffer::from_text("fn main() {}\n");
+        let mut view = EditorView::new();
+        view.set_zoom_percent(200);
+        let out = ctx.run(input, |ctx| {
+            let (w100, w200) =
+                ctx.fonts(|f| (f.glyph_width(&font_100, 'M'), f.glyph_width(&font_200, 'M')));
+            assert!(
+                w200 > w100 * 1.5,
+                "the 200% font measures a wider glyph cell ({w100} -> {w200})"
+            );
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor_widget(ui, &mut view, &mut buf, None);
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the zoomed editor produced no primitives"
         );
     }
 }

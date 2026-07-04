@@ -30,6 +30,13 @@
 //!   edit deltas splice the old tree — no full-file reparse per keystroke) and
 //!   painted through the shared Carbon code-theme tokens ([`mde_egui::code`],
 //!   §4). Unknown extensions honestly render plain (§7).
+//! * EDTB-1 — the **Word-97 menu bar + Standard toolbar**
+//!   ([`menu_bar`] / [`toolbar`]; design:
+//!   `docs/design/editor-toolbar.md`): File/Edit/View/Tools/Help menus and the
+//!   New·Open·Save | Cut·Copy·Paste | Undo·Redo | Zoom strip, every control
+//!   routed through the same palette / `EditorView` seams (§6) — no dead
+//!   entries (lock #4: Insert/Format/Table menus and Print/Spell/Find await
+//!   their phases). Zoom is a real per-view font scale on [`EditorView`].
 //!
 //! Tabs + splittable panes land in the following units; they grow
 //! [`EditorSurface`] / [`EditorView`] and render into [`editor_panel`] without
@@ -43,9 +50,11 @@ pub mod buffer;
 mod finder;
 mod fuzzy;
 pub mod highlight;
+mod menu_bar;
 mod palette;
 pub mod panel;
 pub mod project_tree;
+mod toolbar;
 pub mod widget;
 
 use mde_egui::{eframe, egui};

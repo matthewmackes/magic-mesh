@@ -25,18 +25,32 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use mde_egui::egui::{self, Key, Modifiers, RichText, Ui};
+use mde_egui::egui::{self, Align2, Key, Modifiers, RichText, Ui};
 use mde_egui::Style;
 
 use crate::buffer::Buffer;
 use crate::finder::{self, FileFinder};
 use crate::highlight::Highlighter;
+use crate::menu_bar::{self, MenuAction, MenuContext};
 use crate::palette::{self, CommandPalette, PaletteCommand};
 use crate::project_tree::{self, ProjectTree};
+use crate::toolbar;
 use crate::widget::{editor_widget, EditorView};
 
 /// The project-tree side panel's default width — six shared spacing units (§4).
 const TREE_WIDTH: f32 = Style::SP_XL * 6.0;
+
+/// The Save As / About dialog plate width — ten shared spacing units (§4).
+const DIALOG_W: f32 = Style::SP_XL * 10.0;
+
+/// The About dialog's title (Help → About the Editor, EDTB-1).
+const ABOUT_TITLE: &str = "About the Editor";
+
+/// The crate + version line the About dialog shows. `mde-egui` carries no
+/// brand/build module (and the iced-era `mde-theme` brand is deliberately not a
+/// dependency of this surface), so the workspace-inherited crate version — the
+/// platform version — is the honest source.
+const ABOUT_VERSION_LINE: &str = concat!("mde-editor-egui ", env!("CARGO_PKG_VERSION"));
 
 /// The honest empty-state headline the surface renders when no document is open
 /// (§7) — a real, reachable message, never a `todo!()`/stub.
@@ -98,6 +112,36 @@ pub struct EditorSurface {
     finder: FileFinder,
     /// The command-palette overlay (EDITOR-7, `Cmd`/`Ctrl-Shift-P`).
     palette: CommandPalette,
+    /// The Save As… path dialog (EDTB-1, File → Save As).
+    save_as: SaveAsDialog,
+    /// Whether the About dialog is shown (EDTB-1, Help → About the Editor).
+    about_open: bool,
+}
+
+/// The small Save As… path-input dialog (EDTB-1): a path field prefilled with
+/// the document's current path, Save/Cancel buttons, and an inline error line
+/// when the write fails (§7 — the failure is shown, never swallowed).
+#[derive(Default)]
+struct SaveAsDialog {
+    /// Whether the dialog is shown.
+    open: bool,
+    /// The live path field text.
+    path: String,
+    /// The last failed write's message, shown inline until the next attempt.
+    error: Option<String>,
+    /// Set on open so the path field grabs the keyboard for one frame.
+    focus_field: bool,
+}
+
+impl SaveAsDialog {
+    /// Open the dialog, prefilled with the document's current path (empty for a
+    /// scratch buffer) and cleared of any stale error.
+    fn open_for(&mut self, current: Option<&Path>) {
+        self.open = true;
+        self.path = current.map_or_else(String::new, |p| p.display().to_string());
+        self.error = None;
+        self.focus_field = true;
+    }
 }
 
 impl EditorSurface {
@@ -162,12 +206,13 @@ impl EditorSurface {
 
     // ── EDITOR-7: the fuzzy finder + command palette ─────────────────────────
 
-    /// Whether a modal overlay (the fuzzy file-finder or the command palette) is
-    /// currently up. The shell can key off this to suppress its own global chords
-    /// while the editor surface is capturing the keyboard for an overlay.
+    /// Whether a modal overlay (the fuzzy file-finder, the command palette, or
+    /// an EDTB-1 dialog — Save As / About) is currently up. The shell can key
+    /// off this to suppress its own global chords while the editor surface is
+    /// capturing the keyboard for an overlay.
     #[must_use]
     pub const fn overlay_active(&self) -> bool {
-        self.finder.is_open() || self.palette.is_open()
+        self.finder.is_open() || self.palette.is_open() || self.save_as.open || self.about_open
     }
 
     /// Open the fuzzy file-finder (the `Cmd`/`Ctrl-P` seam), rooted at the open
@@ -223,6 +268,204 @@ impl EditorSurface {
         }
     }
 
+    // ── EDTB-1: the Word-97 menu bar + Standard toolbar ─────────────────────
+
+    /// Snapshot the enablement + toggle/zoom state the menu bar and toolbar
+    /// render from this frame — the bars' one read seam into the surface.
+    pub(crate) fn menu_context(&self) -> MenuContext {
+        let doc = self.doc.as_ref();
+        MenuContext {
+            has_doc: doc.is_some(),
+            has_selection: doc.is_some_and(|d| d.view.has_selection()),
+            can_undo: doc.is_some_and(|d| d.view.can_undo()),
+            can_redo: doc.is_some_and(|d| d.view.can_redo()),
+            tree_shown: self.show_tree,
+            wrap_on: doc.is_some_and(|d| d.view.wrap()),
+            zoom_percent: doc.map(|d| d.view.zoom_percent()),
+        }
+    }
+
+    /// Dispatch one menu-bar / toolbar action (EDTB-1). The Word chrome drives
+    /// the SAME seams the palette and the widget's chords drive: where a
+    /// [`PaletteCommand`] already names the operation, the arm delegates to
+    /// [`run_command`](Self::run_command) (§6 — one implementation); the editing
+    /// arms call the same `EditorView` fns the keyboard runs. An action whose
+    /// precondition is absent (Undo with nothing to undo, Zoom with no document)
+    /// is a genuine no-op — the bars also grey those items out.
+    pub(crate) fn run_action(&mut self, ctx: &egui::Context, action: MenuAction) {
+        match action {
+            MenuAction::NewScratch => self.run_command(PaletteCommand::OpenScratch),
+            MenuAction::OpenFinder => self.open_finder(),
+            MenuAction::OpenFolderCwd => self.run_command(PaletteCommand::OpenFolderCwd),
+            MenuAction::Save => self.run_command(PaletteCommand::Save),
+            MenuAction::SaveAs => {
+                let current = self.current_path().map(Path::to_path_buf);
+                self.save_as.open_for(current.as_deref());
+            }
+            MenuAction::CloseDoc => self.run_command(PaletteCommand::CloseDoc),
+            MenuAction::Undo => {
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.view.undo(&mut doc.buffer);
+                }
+            }
+            MenuAction::Redo => {
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.view.redo(&mut doc.buffer);
+                }
+            }
+            MenuAction::Cut => {
+                // The widget's Ctrl-X arm exactly: copy the selection, then
+                // delete it — the same two seams, menu-driven.
+                self.copy_selection(ctx);
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.view.delete_selections(&mut doc.buffer);
+                }
+            }
+            MenuAction::Copy => self.copy_selection(ctx),
+            MenuAction::Paste => {
+                // Ask the platform for its clipboard: the backend answers with
+                // the same `Event::Paste` the widget's Ctrl-V path inserts —
+                // one insert seam. (The DRM backend has no clipboard yet; there
+                // this is the same honest no-op the Ctrl-V chord is today.)
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+            }
+            MenuAction::SelectAll => {
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.view.select_all(&doc.buffer);
+                }
+            }
+            MenuAction::ToggleTree => self.run_command(PaletteCommand::ToggleTree),
+            MenuAction::ToggleWrap => self.run_command(PaletteCommand::ToggleWrap),
+            MenuAction::CommandPalette => self.toggle_palette(),
+            MenuAction::About => self.about_open = true,
+            MenuAction::Zoom(percent) => {
+                if let Some(doc) = self.doc.as_mut() {
+                    doc.view.set_zoom_percent(percent);
+                }
+            }
+        }
+    }
+
+    /// Copy every caret's selection to the platform clipboard — the Edit-menu /
+    /// toolbar Copy, reading the exact same `EditorView::selected_text` the
+    /// widget's `Ctrl-C` arm reads (§6). A no-op with no selection.
+    fn copy_selection(&self, ctx: &egui::Context) {
+        if let Some(doc) = self.doc.as_ref() {
+            if let Some(text) = doc.view.selected_text(&doc.buffer) {
+                ctx.copy_text(text);
+            }
+        }
+    }
+
+    /// Commit the Save As dialog: write the buffer to the entered path
+    /// ([`Buffer::save_as`], which adopts the path), re-pick the syntax
+    /// highlighter for the new extension (exactly as `Doc::new` does on open),
+    /// and close the dialog. A failed write keeps the dialog open with the
+    /// error shown inline (§7).
+    fn save_as_commit(&mut self) {
+        let path = self.save_as.path.trim().to_owned();
+        if path.is_empty() {
+            self.save_as.error = Some("Enter a path to save to.".to_owned());
+            return;
+        }
+        let Some(doc) = self.doc.as_mut() else {
+            // The document vanished under the dialog — nothing left to save.
+            self.save_as.open = false;
+            return;
+        };
+        match doc.buffer.save_as(&path) {
+            Ok(()) => {
+                doc.highlight = doc.buffer.path().and_then(Highlighter::for_path);
+                self.save_as.open = false;
+            }
+            Err(err) => self.save_as.error = Some(err.to_string()),
+        }
+    }
+
+    /// Render the EDTB-1 dialogs (Save As…, About) above the editor body and
+    /// route their outcomes. Escape cancels an open dialog (consumed, mirroring
+    /// the finder/palette Esc handling). Token-styled (§4).
+    fn render_dialogs(&mut self, ctx: &egui::Context) {
+        if self.save_as.open {
+            let esc = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+            let mut save = false;
+            let mut cancel = esc;
+            egui::Window::new("Save As")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_min_width(DIALOG_W);
+                    ui.label(
+                        RichText::new("Save the document as")
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                    );
+                    ui.add_space(Style::SP_XS);
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.save_as.path)
+                            .hint_text("/path/to/file")
+                            .desired_width(f32::INFINITY),
+                    );
+                    if std::mem::take(&mut self.save_as.focus_field) {
+                        field.request_focus();
+                    }
+                    // Enter in the path field saves (the field drops focus on
+                    // Enter — the standard egui commit idiom).
+                    if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                        save = true;
+                    }
+                    if let Some(error) = &self.save_as.error {
+                        ui.add_space(Style::SP_XS);
+                        ui.label(RichText::new(error).size(Style::SMALL).color(Style::WARN));
+                    }
+                    ui.add_space(Style::SP_XS);
+                    ui.horizontal(|ui| {
+                        save |= ui.button("Save").clicked();
+                        cancel |= ui.button("Cancel").clicked();
+                    });
+                });
+            if save {
+                self.save_as_commit();
+            } else if cancel {
+                self.save_as.open = false;
+            }
+        }
+
+        if self.about_open {
+            let mut close = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+            egui::Window::new(ABOUT_TITLE)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.set_min_width(DIALOG_W);
+                    ui.label(
+                        RichText::new("Quasar Editor")
+                            .size(Style::HEADING)
+                            .color(Style::TEXT)
+                            .strong(),
+                    );
+                    ui.add_space(Style::SP_XS);
+                    ui.label(
+                        RichText::new(ABOUT_VERSION_LINE)
+                            .size(Style::BODY)
+                            .color(Style::TEXT_DIM),
+                    );
+                    ui.label(
+                        RichText::new("The MCNF native code-editor surface.")
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                    );
+                    ui.add_space(Style::SP_S);
+                    close |= ui.button("Close").clicked();
+                });
+            if close {
+                self.about_open = false;
+            }
+        }
+    }
+
     /// Intercept the overlay trigger chords at the panel level — consumed BEFORE
     /// the text widget reads this frame's events (it clones `ui.input` events
     /// during its own render), so `Cmd`/`Ctrl-P` opens the finder and
@@ -268,6 +511,37 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
     // frame's `ui.input` events during its own render below), so `Cmd`/`Ctrl-P`
     // and `Cmd`/`Ctrl-Shift-P` open the overlays instead of typing into the buffer.
     surface.handle_overlay_triggers(ui);
+
+    // EDTB-1 — the Word-97 menu bar + Standard toolbar across the top of the
+    // panel (design: `editor-toolbar.md`), drawn before the tree/body so the
+    // whole surface sits under them. Both render from one state snapshot and
+    // return at most one picked action, dispatched through the same seams the
+    // palette drives (`run_action` → `run_command`/`EditorView`).
+    let cx = surface.menu_context();
+    let mut action = None;
+    egui::TopBottomPanel::top("editor-menu-bar")
+        .frame(
+            egui::Frame::default()
+                .fill(Style::SURFACE)
+                .inner_margin(Style::SP_XS),
+        )
+        .show_inside(ui, |ui| {
+            action = menu_bar::show(ui, &cx);
+        });
+    egui::TopBottomPanel::top("editor-toolbar")
+        .frame(
+            egui::Frame::default()
+                .fill(Style::SURFACE)
+                .inner_margin(Style::SP_XS),
+        )
+        .show_inside(ui, |ui| {
+            if let Some(picked) = toolbar::show(ui, &cx) {
+                action = Some(picked);
+            }
+        });
+    if let Some(action) = action {
+        surface.run_action(ui.ctx(), action);
+    }
 
     // EDITOR-9 — the toggleable project-tree side panel, drawn BEFORE the central
     // body so the editor fills the area to its right (the `files_panel` idiom). A
@@ -317,6 +591,9 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
     // EDITOR-7 — the finder + palette overlays float above the body (rendered last
     // so they paint on top); each returns the operator's pick, routed to its seam.
     surface.render_overlays(ui);
+
+    // EDTB-1 — the Save As / About dialogs, rendered above everything.
+    surface.render_dialogs(ui.ctx());
 }
 
 /// The project tree's "no folder open" face (§7) — an honest note plus a reachable
@@ -474,6 +751,7 @@ fn empty_state(ui: &mut Ui) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{editor_panel, EditorSurface, NO_FILE_HINT, NO_FILE_TITLE, SCRATCH_SEED};
+    use crate::menu_bar::MenuAction;
     use crate::palette::PaletteCommand;
     use crate::real_editor;
     use mde_egui::egui::{self, pos2, vec2, Event, Key, Modifiers, Rect};
@@ -850,5 +1128,319 @@ mod tests {
             tessellate_panel(&mut surface) > 0,
             "the open palette overlay produced no draw primitives"
         );
+    }
+
+    // ── EDTB-1: the menu bar + Standard toolbar dispatch ────────────────────
+
+    /// Run `action` through the real dispatch inside a live frame, returning
+    /// the frame's [`egui::FullOutput`] so tests can observe the platform
+    /// effects (clipboard commands, viewport commands).
+    fn run_action_in_frame(surface: &mut EditorSurface, action: MenuAction) -> egui::FullOutput {
+        let ctx = egui::Context::default();
+        ctx.run(egui::RawInput::default(), |ctx| {
+            surface.run_action(ctx, action);
+        })
+    }
+
+    #[test]
+    fn menu_new_scratch_opens_a_document() {
+        let mut surface = real_editor();
+        run_action_in_frame(&mut surface, MenuAction::NewScratch);
+        assert!(surface.is_open(), "File > New opened a scratch document");
+    }
+
+    #[test]
+    fn menu_open_routes_to_the_finder() {
+        let mut surface = real_editor();
+        run_action_in_frame(&mut surface, MenuAction::OpenFinder);
+        assert!(
+            surface.finder.is_open(),
+            "File > Open… opened the Ctrl-P finder"
+        );
+    }
+
+    #[test]
+    fn menu_open_folder_roots_the_project_tree() {
+        let mut surface = real_editor();
+        assert!(!surface.has_project());
+        run_action_in_frame(&mut surface, MenuAction::OpenFolderCwd);
+        assert!(
+            surface.has_project(),
+            "File > Open Folder rooted the tree at the cwd"
+        );
+    }
+
+    #[test]
+    fn menu_save_writes_the_buffer_through_the_palette_seam() {
+        let d = TempDir::new("menu-save");
+        let file = d.join("menu.txt");
+        std::fs::write(&file, b"abc").expect("seed");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+        surface.doc.as_mut().expect("doc").buffer.insert(3, "!");
+        run_action_in_frame(&mut surface, MenuAction::Save);
+        assert_eq!(
+            std::fs::read(&file).expect("read back"),
+            b"abc!",
+            "File > Save wrote the bytes (the same run_command(Save) seam)"
+        );
+    }
+
+    #[test]
+    fn menu_save_as_commits_to_a_new_path_and_repicks_the_highlighter() {
+        let d = TempDir::new("menu-save-as");
+        let mut surface = real_editor();
+        surface.open_text("fn f() {}\n");
+        run_action_in_frame(&mut surface, MenuAction::SaveAs);
+        assert!(surface.save_as.open, "File > Save As… opened the dialog");
+        assert!(
+            surface.overlay_active(),
+            "the open dialog reports as an active overlay"
+        );
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the Save As dialog produced no draw primitives"
+        );
+
+        let target = d.join("adopted.rs");
+        surface.save_as.path = target.display().to_string();
+        surface.save_as_commit();
+
+        assert!(!surface.save_as.open, "a successful save closes the dialog");
+        assert_eq!(
+            std::fs::read(&target).expect("read back"),
+            b"fn f() {}\n",
+            "Save As wrote the buffer to the new path"
+        );
+        assert_eq!(
+            surface.current_path(),
+            Some(target.as_path()),
+            "the buffer adopted the new path"
+        );
+        assert!(
+            surface.doc.as_ref().expect("doc").highlight.is_some(),
+            "the .rs path re-picked a highlighter for the renamed document"
+        );
+    }
+
+    #[test]
+    fn save_as_failure_keeps_the_dialog_open_with_the_error() {
+        let mut surface = real_editor();
+        surface.open_text("x");
+        run_action_in_frame(&mut surface, MenuAction::SaveAs);
+        surface.save_as.path = "/nonexistent-dir-mde-editor/x.txt".to_owned();
+        surface.save_as_commit();
+        assert!(surface.save_as.open, "a failed write keeps the dialog open");
+        assert!(
+            surface.save_as.error.is_some(),
+            "the write error is shown, not swallowed"
+        );
+    }
+
+    #[test]
+    fn menu_close_returns_to_the_empty_state() {
+        let mut surface = real_editor();
+        surface.open_text("x");
+        run_action_in_frame(&mut surface, MenuAction::CloseDoc);
+        assert!(!surface.is_open(), "File > Close closed the document");
+    }
+
+    #[test]
+    fn menu_undo_and_redo_unwind_a_typed_edit() {
+        // Type through a REAL widget frame (the same path the keyboard takes),
+        // then unwind/redo through the menu seams.
+        let mut surface = real_editor();
+        surface.open_text("abc");
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        run_frame(&ctx, &mut surface, vec![Event::Text("X".to_owned())]);
+        assert_eq!(
+            surface.doc.as_ref().expect("doc").buffer.rope().to_string(),
+            "Xabc",
+            "the frame's Text event inserted at the caret"
+        );
+        assert!(surface.menu_context().can_undo, "the edit armed Undo");
+
+        surface.run_action(&ctx, MenuAction::Undo);
+        assert_eq!(
+            surface.doc.as_ref().expect("doc").buffer.rope().to_string(),
+            "abc",
+            "Edit > Undo unwound the typed edit"
+        );
+        assert!(surface.menu_context().can_redo, "undo armed Redo");
+
+        surface.run_action(&ctx, MenuAction::Redo);
+        assert_eq!(
+            surface.doc.as_ref().expect("doc").buffer.rope().to_string(),
+            "Xabc",
+            "Edit > Redo re-applied the edit"
+        );
+    }
+
+    #[test]
+    fn menu_select_all_selects_the_whole_buffer() {
+        let mut surface = real_editor();
+        surface.open_text("hello");
+        run_action_in_frame(&mut surface, MenuAction::SelectAll);
+        assert_eq!(
+            surface.doc.as_ref().expect("doc").view.selection(),
+            Some(0..5),
+            "Edit > Select All selected the whole document"
+        );
+        assert!(surface.menu_context().has_selection);
+    }
+
+    #[test]
+    fn menu_copy_emits_the_clipboard_command_with_the_selection() {
+        let mut surface = real_editor();
+        surface.open_text("hello");
+        run_action_in_frame(&mut surface, MenuAction::SelectAll);
+        let out = run_action_in_frame(&mut surface, MenuAction::Copy);
+        let copied = out
+            .platform_output
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::OutputCommand::CopyText(text) if text == "hello"));
+        assert!(copied, "Edit > Copy put the selection on the clipboard");
+        assert_eq!(
+            surface.doc.as_ref().expect("doc").buffer.rope().to_string(),
+            "hello",
+            "Copy leaves the buffer untouched"
+        );
+    }
+
+    #[test]
+    fn menu_cut_copies_then_deletes_the_selection() {
+        let mut surface = real_editor();
+        surface.open_text("hello");
+        run_action_in_frame(&mut surface, MenuAction::SelectAll);
+        let out = run_action_in_frame(&mut surface, MenuAction::Cut);
+        let copied = out
+            .platform_output
+            .commands
+            .iter()
+            .any(|c| matches!(c, egui::OutputCommand::CopyText(text) if text == "hello"));
+        assert!(copied, "Edit > Cut copied the selection first");
+        assert_eq!(
+            surface.doc.as_ref().expect("doc").buffer.rope().to_string(),
+            "",
+            "Edit > Cut deleted the selection"
+        );
+    }
+
+    #[test]
+    fn menu_paste_requests_the_platform_clipboard() {
+        // The dispatch asks the backend for its clipboard; the backend answers
+        // with the same `Event::Paste` the widget's Ctrl-V inserts (that insert
+        // path is covered by the widget's own paste tests).
+        let mut surface = real_editor();
+        surface.open_text("x");
+        let out = run_action_in_frame(&mut surface, MenuAction::Paste);
+        let requested = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .is_some_and(|v| {
+                v.commands
+                    .iter()
+                    .any(|c| matches!(c, egui::ViewportCommand::RequestPaste))
+            });
+        assert!(requested, "Edit > Paste sent ViewportCommand::RequestPaste");
+    }
+
+    #[test]
+    fn menu_toggles_and_palette_route_to_their_seams() {
+        let mut surface = real_editor();
+        surface.open_text("a long line\n");
+        let tree_before = surface.show_tree;
+        run_action_in_frame(&mut surface, MenuAction::ToggleTree);
+        assert_ne!(surface.show_tree, tree_before, "View > Project Tree flips");
+
+        let wrap_before = surface.doc.as_ref().expect("doc").view.wrap();
+        run_action_in_frame(&mut surface, MenuAction::ToggleWrap);
+        assert_ne!(
+            surface.doc.as_ref().expect("doc").view.wrap(),
+            wrap_before,
+            "View > Soft-Wrap flips"
+        );
+
+        run_action_in_frame(&mut surface, MenuAction::CommandPalette);
+        assert!(
+            surface.palette.is_open(),
+            "Tools > Command Palette… opened the overlay"
+        );
+    }
+
+    #[test]
+    fn menu_about_opens_the_dialog_and_it_paints() {
+        let mut surface = real_editor();
+        run_action_in_frame(&mut surface, MenuAction::About);
+        assert!(surface.about_open, "Help > About opened the dialog");
+        assert!(
+            surface.overlay_active(),
+            "the About dialog reports as an active overlay"
+        );
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the About dialog produced no draw primitives"
+        );
+        assert!(
+            !super::ABOUT_VERSION_LINE.is_empty()
+                && super::ABOUT_VERSION_LINE.contains("mde-editor-egui"),
+            "the About line names the crate + version"
+        );
+    }
+
+    #[test]
+    fn toolbar_zoom_sets_the_editor_view_scale() {
+        let mut surface = real_editor();
+        surface.open_text("x");
+        assert_eq!(
+            surface.menu_context().zoom_percent,
+            Some(100),
+            "a fresh document opens at 100%"
+        );
+        run_action_in_frame(&mut surface, MenuAction::Zoom(150));
+        assert_eq!(
+            surface.menu_context().zoom_percent,
+            Some(150),
+            "the Zoom dropdown set the view's font scale"
+        );
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the zoomed editor still paints"
+        );
+    }
+
+    #[test]
+    fn zoom_without_a_document_is_a_genuine_no_op() {
+        let mut surface = real_editor();
+        assert_eq!(
+            surface.menu_context().zoom_percent,
+            None,
+            "no document, no zoom value (the dropdown is omitted)"
+        );
+        run_action_in_frame(&mut surface, MenuAction::Zoom(150));
+        assert!(!surface.is_open(), "Zoom with no document changed nothing");
+    }
+
+    #[test]
+    fn doc_gated_actions_are_no_ops_on_the_empty_surface() {
+        // Every doc-gated dispatch arm survives the empty state as a genuine
+        // no-op (§7 — never a panic); the bars also grey these out.
+        let mut surface = real_editor();
+        for action in [
+            MenuAction::Save,
+            MenuAction::CloseDoc,
+            MenuAction::Undo,
+            MenuAction::Redo,
+            MenuAction::Cut,
+            MenuAction::Copy,
+            MenuAction::SelectAll,
+            MenuAction::ToggleWrap,
+            MenuAction::Zoom(200),
+        ] {
+            run_action_in_frame(&mut surface, action);
+        }
+        assert!(!surface.is_open(), "the surface stayed in the empty state");
     }
 }
