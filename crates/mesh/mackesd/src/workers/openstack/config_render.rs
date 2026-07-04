@@ -38,6 +38,7 @@ use std::path::Path;
 use serde::Serialize;
 use thiserror::Error;
 
+use super::capacity::{derive_flavors, derive_quotas, NodeCapacity};
 use super::catalog::ServiceKind;
 use super::podman::kolla_config_dir;
 use super::secrets::{SecretView, Secrets};
@@ -377,6 +378,125 @@ pub fn render_service_config(
     })
 }
 
+// ─────────────────────── QC-10: the cloud bootstrap seed ───────────────────────
+
+/// The service label the bootstrap-seed errors carry in the [`RenderError`].
+const BOOTSTRAP_SERVICE: &str = "cloud-bootstrap";
+
+/// The rendered bootstrap seed's filename under `<config_root>/bootstrap/`.
+const BOOTSTRAP_SEED_NAME: &str = "cloud-bootstrap.sh";
+
+/// Render the QC-10 **cloud bootstrap seed** from this node's real `capacity`.
+///
+/// The two open-cloud guardrails (design Q29/39/89) as an idempotent
+/// `openstack`-CLI script the leader's cloud bootstrap applies once (Q27 — the
+/// CLI rides the host image).
+///
+/// It carries both guardrails, each *derived from real capacity*, never fixed
+/// `OpenStack` defaults:
+/// - **Capacity-derived flavors** ([`super::capacity::derive_flavors`], Q39): a
+///   tiny/small/medium/large ladder scaled to the node's shape, created via
+///   `openstack flavor create` — the set regenerates as the fleet's capacity
+///   changes.
+/// - **Hard per-user quotas** ([`super::capacity::derive_quotas`], Q89): a
+///   per-member ceiling that is a *fraction* of the node (so several members
+///   coexist and none can claim the fleet — the ENT-12 blast-radius guardrail),
+///   registered as **Keystone unified limits** — the default every project/user
+///   inherits, the mesh's first hard authorization boundary. Nova enforces them
+///   via the `[quota] UnifiedLimitsDriver` the [`nova`] render sets; QC-11/12
+///   layer explicit per-member overrides at enrollment.
+///
+/// Written atomically to `<config_root>/bootstrap/cloud-bootstrap.sh`; each
+/// create/register is guarded (show/list first), so re-applying on a later
+/// converge is a no-op. Returns the seed path.
+///
+/// # Errors
+/// A [`RenderError::Io`] if the seed (or its parent dir) can't be written.
+pub fn render_cloud_bootstrap(
+    config_root: &Path,
+    release: &str,
+    capacity: &NodeCapacity,
+) -> Result<std::path::PathBuf, RenderError> {
+    use std::fmt::Write as _;
+
+    let flavors = derive_flavors(capacity);
+    let quota = derive_quotas(capacity);
+
+    let mut body = String::new();
+    body.push_str("#!/bin/sh\n");
+    // Writing to a String is infallible — the discarded fmt::Result never errors.
+    let _ = writeln!(
+        body,
+        "# rendered by mackesd openstack worker (QC-10) — kolla release {release}"
+    );
+    body.push_str(
+        "# Capacity-derived flavors + hard per-user quotas (design Q29/39/89).\n\
+         # Applied once by the leader's cloud bootstrap over the openstack CLI\n\
+         # (Q27, in the host image). Idempotent: every create/register is guarded,\n\
+         # so re-running on a later converge is a no-op.\n\
+         set -eu\n\n",
+    );
+
+    // ── Capacity-derived flavors (Q39) — sized from this node's real shape,
+    //    NOT fixed OpenStack defaults. ──
+    let _ = writeln!(
+        body,
+        "# Capacity-derived flavors (Q39) — this node: {} vCPU / {} MiB / {} GiB.",
+        capacity.vcpus, capacity.ram_mib, capacity.disk_gib
+    );
+    body.push_str(
+        "ensure_flavor() {  # <name> <vcpus> <ram-mib> <disk-gib>\n  \
+         openstack flavor show \"$1\" >/dev/null 2>&1 && return 0\n  \
+         openstack flavor create --vcpus \"$2\" --ram \"$3\" --disk \"$4\" --public \"$1\"\n}\n",
+    );
+    for f in &flavors {
+        let _ = writeln!(
+            body,
+            "ensure_flavor {} {} {} {}",
+            f.name, f.vcpus, f.ram_mib, f.disk_gib
+        );
+    }
+
+    // ── Hard per-user quotas (Q89) — a fraction of the node, registered as
+    //    Keystone unified limits (the default every project/user inherits; the
+    //    mesh's first hard authz boundary). ──
+    body.push_str(
+        "\n# Hard per-user quotas (Q89 — the ENT-12 blast-radius guardrail: one\n\
+         # member may claim at most a fraction of the fleet, HARD). Registered as\n\
+         # Keystone unified limits — the default every project/user inherits; Nova\n\
+         # enforces them via the UnifiedLimitsDriver in nova.conf. QC-11/12 layer\n\
+         # explicit per-member overrides at enrollment.\n",
+    );
+    body.push_str(
+        "ensure_limit() {  # <service> <resource-name> <default-limit>\n  \
+         [ -n \"$(openstack registered limit list --service \"$1\" \
+         --resource-name \"$2\" -f value -c ID 2>/dev/null)\" ] && return 0\n  \
+         openstack registered limit create --service \"$1\" --default-limit \"$3\" \"$2\"\n}\n",
+    );
+    // Nova compute caps, then Cinder block-storage caps, then the Neutron FIP cap
+    // — the five caps the design names (instances/vCPU/RAM/volumes/floating-IPs)
+    // plus the gigabytes ceiling volumes are bounded by.
+    for (service, resource, limit) in [
+        ("nova", "servers", u64::from(quota.instances)),
+        ("nova", "class:VCPU", u64::from(quota.vcpus)),
+        ("nova", "class:MEMORY_MB", quota.ram_mib),
+        ("cinder", "volumes", u64::from(quota.volumes)),
+        ("cinder", "gigabytes", quota.gigabytes),
+        ("neutron", "floatingip", u64::from(quota.floating_ips)),
+    ] {
+        let _ = writeln!(body, "ensure_limit {service} {resource} {limit}");
+    }
+
+    let dir = config_root.join("bootstrap");
+    let path = dir.join(BOOTSTRAP_SEED_NAME);
+    write_atomic(&path, &body).map_err(|source| RenderError::Io {
+        service: BOOTSTRAP_SERVICE.to_string(),
+        path: path.display().to_string(),
+        source,
+    })?;
+    Ok(path)
+}
+
 /// Atomic tmp-write + rename, creating the parent dir (the mesh convention —
 /// mirrors the `chat`/`app_sync` workers' `write_atomic`).
 fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
@@ -635,7 +755,10 @@ fn glance(overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
 /// command differs — Q31 Nova+Placement own VM lifecycle). The API listener
 /// binds to the overlay ([`api_default`]); the cross-service references
 /// (Glance images, Placement, Keystone) are mesh-DNS endpoints reached over the
-/// overlay (QC-6, Q22).
+/// overlay (QC-6, Q22). The `[quota]` block selects the **`UnifiedLimitsDriver`**
+/// (QC-10, Q89) so Nova enforces the Keystone unified limits the
+/// [`render_cloud_bootstrap`] seed registers — the hard per-user boundary is a
+/// real enforcement path, not just a declared number.
 fn nova(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
     ServicePlan {
         command: command.to_string(),
@@ -652,7 +775,8 @@ fn nova(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> Ser
                  username = placement\npassword = {placement_pw}\n\
                  user_domain_name = Default\nproject_domain_name = Default\n\
                  project_name = service\n\
-                 [libvirt]\nvirt_type = kvm\n",
+                 [libvirt]\nvirt_type = kvm\n\
+                 [quota]\ndriver = nova.quota.UnifiedLimitsDriver\n",
                 default = api_default(overlay, secrets),
                 api_db = db_url("nova_api", overlay, ctx, secrets),
                 db = db_url("nova", overlay, ctx, secrets),
@@ -1329,7 +1453,11 @@ mod tests {
         // provider bridge mapping that puts an instance on the mesh.
         let dir = tempfile::tempdir().unwrap();
         render_service_config(dir.path(), ServiceKind::OvnController, &ctx(false)).unwrap();
-        let chassis = read_conf(dir.path(), ServiceKind::OvnController, "ovn-controller.conf");
+        let chassis = read_conf(
+            dir.path(),
+            ServiceKind::OvnController,
+            "ovn-controller.conf",
+        );
         assert!(
             chassis.contains("external_ids:ovn-remote = tcp:ovn-sb.mesh:6642"),
             "{chassis}"
@@ -1349,7 +1477,11 @@ mod tests {
         // On the leader the SB DB is local (overlay IP).
         let dir2 = tempfile::tempdir().unwrap();
         render_service_config(dir2.path(), ServiceKind::OvnController, &ctx(true)).unwrap();
-        let chassis_leader = read_conf(dir2.path(), ServiceKind::OvnController, "ovn-controller.conf");
+        let chassis_leader = read_conf(
+            dir2.path(),
+            ServiceKind::OvnController,
+            "ovn-controller.conf",
+        );
         assert!(
             chassis_leader.contains(&format!("external_ids:ovn-remote = tcp:{OVERLAY}:6642")),
             "{chassis_leader}"
@@ -1403,7 +1535,10 @@ mod tests {
             conf.contains("backup_swift_url = http://swift.mesh:8080/v1/AUTH_"),
             "{conf}"
         );
-        assert!(conf.contains("backup_swift_container = volumebackups"), "{conf}");
+        assert!(
+            conf.contains("backup_swift_container = volumebackups"),
+            "{conf}"
+        );
         // Keystone-native per-user auth (the mesh account IS the cloud account,
         // Q21) — never a hardcoded service credential in the rendered config.
         assert!(conf.contains("backup_swift_auth = per_user"), "{conf}");
@@ -1422,10 +1557,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg["command"], "cinder-backup");
-        assert_eq!(
-            cfg["config_files"][0]["dest"],
-            "/etc/cinder/cinder.conf"
-        );
+        assert_eq!(cfg["config_files"][0]["dest"], "/etc/cinder/cinder.conf");
         // The same complete backend + backup config lands for the backup agent.
         let conf = read_conf(dir.path(), ServiceKind::CinderBackup, "cinder.conf");
         assert!(conf.contains("volume_group = cinder-volumes"), "{conf}");
@@ -1471,7 +1603,10 @@ mod tests {
         );
         // 20 GiB, spelled in bytes so the pruner has a concrete ceiling.
         assert!(
-            conf.contains(&format!("image_cache_max_size = {}", 20u64 * 1024 * 1024 * 1024)),
+            conf.contains(&format!(
+                "image_cache_max_size = {}",
+                20u64 * 1024 * 1024 * 1024
+            )),
             "{conf}"
         );
         assert!(conf.contains("image_cache_stall_time = 86400"), "{conf}");
@@ -1503,5 +1638,117 @@ mod tests {
         // Still overlay-only — no wildcard/loopback leaked by the QC-9 additions.
         assert!(!conf.contains("0.0.0.0"), "{conf}");
         assert!(!conf.contains("127.0.0.1"), "{conf}");
+    }
+
+    // ── QC-10: capacity-derived flavors + hard per-user quotas (Q29/39/89) ──
+
+    /// A big node and a small node — the seed's scaling is asserted across both.
+    const BIG_NODE: NodeCapacity = NodeCapacity::new(32, 131_072, 2_000);
+    const SMALL_NODE: NodeCapacity = NodeCapacity::new(4, 8_192, 100);
+
+    /// Read the rendered bootstrap seed body off the config root.
+    fn read_seed(root: &Path) -> String {
+        std::fs::read_to_string(root.join("bootstrap").join("cloud-bootstrap.sh")).unwrap()
+    }
+
+    #[test]
+    fn nova_selects_the_unified_limits_quota_driver() {
+        // QC-10/Q89 — nova.conf carries the [quota] UnifiedLimitsDriver so the
+        // Keystone unified limits the seed registers are actually ENFORCED (a
+        // hard boundary, not a declared-but-inert number).
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::NovaApi, &ctx(false)).unwrap();
+        let nova = read_conf(dir.path(), ServiceKind::NovaApi, "nova.conf");
+        assert!(nova.contains("[quota]"), "{nova}");
+        assert!(
+            nova.contains("driver = nova.quota.UnifiedLimitsDriver"),
+            "{nova}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_seed_renders_capacity_derived_flavors() {
+        // Q39 — the seed creates a tiny/small/medium/large ladder sized from the
+        // node's real shape (the largest flavor is half a 32-vCPU node), via
+        // idempotent `openstack flavor create` calls.
+        let dir = tempfile::tempdir().unwrap();
+        let path = render_cloud_bootstrap(dir.path(), "2024.1", &BIG_NODE).unwrap();
+        assert!(path.ends_with("bootstrap/cloud-bootstrap.sh"));
+        let seed = read_seed(dir.path());
+        // Provenance + the honest capacity comment.
+        assert!(seed.contains("QC-10"), "{seed}");
+        assert!(seed.contains("kolla release 2024.1"), "{seed}");
+        assert!(seed.contains("32 vCPU / 131072 MiB / 2000 GiB"), "{seed}");
+        // All four rungs, capacity-derived — on a 32-vCPU node the fractions
+        // dominate the floors: tiny = vcpus/16, ram/16, disk/32; large = vcpus/2,
+        // ram/2, disk/4.
+        assert!(seed.contains("ensure_flavor m1.tiny 2 8192 62"), "{seed}");
+        assert!(
+            seed.contains("ensure_flavor m1.large 16 65536 500"),
+            "{seed}"
+        );
+        // Idempotent create guard.
+        assert!(seed.contains("openstack flavor show"), "{seed}");
+        assert!(seed.contains("openstack flavor create --vcpus"), "{seed}");
+    }
+
+    #[test]
+    fn bootstrap_flavors_scale_with_capacity() {
+        // §7 — the flavor set regenerates larger for a bigger node.
+        let big_dir = tempfile::tempdir().unwrap();
+        render_cloud_bootstrap(big_dir.path(), "2024.1", &BIG_NODE).unwrap();
+        let small_dir = tempfile::tempdir().unwrap();
+        render_cloud_bootstrap(small_dir.path(), "2024.1", &SMALL_NODE).unwrap();
+        // The big node's large flavor (16 vCPU) is bigger than the small node's
+        // (2→floored 4 vCPU) — the same rung, a different size.
+        assert!(read_seed(big_dir.path()).contains("m1.large 16 65536 500"));
+        assert!(!read_seed(small_dir.path()).contains("m1.large 16 65536 500"));
+        assert!(read_seed(small_dir.path()).contains("ensure_flavor m1.large 4 4096 "));
+    }
+
+    #[test]
+    fn bootstrap_seed_renders_hard_per_user_quota_caps() {
+        // Q89 — the seed registers the five hard per-user caps the design names
+        // (instances/vCPU/RAM/volumes/floating-IPs, + the gigabytes ceiling) as
+        // Keystone unified limits, each a fraction of the node (a quarter here).
+        let dir = tempfile::tempdir().unwrap();
+        render_cloud_bootstrap(dir.path(), "2024.1", &BIG_NODE).unwrap();
+        let seed = read_seed(dir.path());
+        assert!(seed.contains("Hard per-user quotas (Q89"), "{seed}");
+        // The config literally contains the caps (design §7), each derived.
+        assert!(seed.contains("ensure_limit nova servers 8"), "{seed}");
+        assert!(seed.contains("ensure_limit nova class:VCPU 8"), "{seed}");
+        assert!(
+            seed.contains("ensure_limit nova class:MEMORY_MB 32768"),
+            "{seed}"
+        );
+        assert!(seed.contains("ensure_limit cinder volumes 16"), "{seed}");
+        assert!(seed.contains("ensure_limit cinder gigabytes 500"), "{seed}");
+        assert!(seed.contains("ensure_limit neutron floatingip 8"), "{seed}");
+        // Registered as Keystone unified limits (the hard default every user
+        // inherits), idempotently.
+        assert!(
+            seed.contains("openstack registered limit create --service"),
+            "{seed}"
+        );
+        assert!(
+            seed.contains("openstack registered limit list --service"),
+            "{seed}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_quota_caps_are_a_hard_fraction_that_scales() {
+        // §7 — the per-user cap is strictly a fraction of the node (never the
+        // whole node) and grows with capacity: the big node's vCPU cap (8) beats
+        // the small node's (1).
+        let big_dir = tempfile::tempdir().unwrap();
+        render_cloud_bootstrap(big_dir.path(), "2024.1", &BIG_NODE).unwrap();
+        let small_dir = tempfile::tempdir().unwrap();
+        render_cloud_bootstrap(small_dir.path(), "2024.1", &SMALL_NODE).unwrap();
+        // 8 vCPU per user on a 32-vCPU node → a quarter, so ≥4 members coexist;
+        // 1 vCPU on the 4-vCPU node — the cap tracks capacity, always a fraction.
+        assert!(read_seed(big_dir.path()).contains("ensure_limit nova class:VCPU 8"));
+        assert!(read_seed(small_dir.path()).contains("ensure_limit nova class:VCPU 1"));
     }
 }

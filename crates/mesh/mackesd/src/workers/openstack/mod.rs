@@ -36,7 +36,11 @@
 //!   the Nebula interface, wave-2 services (Q25) land as new variants.
 //! - [`fleet`] — QC-4 wired the live doctrine read (landed): the TOML
 //!   companion on the Syncthing share + the leader bit off the `/mesh/leader`
-//!   lease; QC-10's capacity-derived quotas read the same doctrine.
+//!   lease.
+//! - [`capacity`] — QC-10's node-capacity read + the two open-cloud guardrails
+//!   it derives: capacity-scaled Nova flavors (Q39) and hard per-user quotas
+//!   (Q89, the ENT-12 blast-radius boundary). The leader renders these into the
+//!   [`config_render::render_cloud_bootstrap`] seed the deploy applies.
 //! - [`config_render`] — QC-4's one-state → Kolla config renderer (landed):
 //!   materializes each desired service's `/etc/kolla/<svc>/config.json` (+ the
 //!   service config it points to) from the doctrine, atomically. QC-5 seals the
@@ -61,6 +65,7 @@
 
 #![cfg(feature = "async-services")]
 
+pub mod capacity;
 pub mod catalog;
 pub mod config_render;
 pub mod fleet;
@@ -80,10 +85,11 @@ use std::time::{Duration, Instant};
 use super::nebula_supervisor::DEFAULT_OVERLAY_IP_PATH;
 use super::{ShutdownToken, Worker};
 
-use config_render::OverlayBind;
+use capacity::NodeCapacity;
+use config_render::{render_cloud_bootstrap, OverlayBind};
 use fleet::{FleetStateSource, MeshFleetState};
 use podman::{PodmanCli, PodmanRunner, DEFAULT_KOLLA_CONFIG_ROOT};
-use reconcile::{converge_cycle, CycleOutcome, OpenStackState};
+use reconcile::{converge_cycle, CycleOutcome, DoctrineStatus, OpenStackState};
 
 /// Converge cadence.
 ///
@@ -134,6 +140,41 @@ fn resolve_overlay(path: &Path) -> OverlayBind {
             "overlay address unresolved — node not on the mesh (no overlay IP published at \
              {} yet; enroll the node so nebula_supervisor writes it)",
             path.display()
+        )),
+    }
+}
+
+/// QC-10 — on the leader, render the **cloud bootstrap seed** (capacity-derived
+/// flavors + hard per-user quotas, design Q29/39/89) so the deploy can apply the
+/// two open-cloud guardrails.
+///
+/// The seed is cloud-global bootstrap the leader owns (like the leader-hosted
+/// `MariaDB`, Q15), so it's rendered only when this node's doctrine came back
+/// `Enabled` with the leader lease held; every other node (and a Disabled/Gated
+/// tick) no-ops. It reads the node's real capacity ([`NodeCapacity::probe`]) —
+/// so the flavors/quotas track the fleet's actual shape — and a probe/render
+/// failure rides the alert lane (→ chat, lock 11), never a fabricated capacity
+/// or a silent swallow (§7). Idempotent: the seed's own guards make re-applying
+/// on a later tick a no-op.
+fn render_leader_bootstrap(config_root: &Path, outcome: &mut CycleOutcome) {
+    let DoctrineStatus::Enabled {
+        leader: true,
+        kolla_release,
+    } = &outcome.state.doctrine
+    else {
+        return;
+    };
+    let release = kolla_release.clone();
+    match NodeCapacity::probe() {
+        Ok(cap) => {
+            if let Err(e) = render_cloud_bootstrap(config_root, &release, &cap) {
+                outcome.alerts.push(format!(
+                    "openstack: cloud bootstrap seed render failed — {e}"
+                ));
+            }
+        }
+        Err(e) => outcome.alerts.push(format!(
+            "openstack: node-capacity probe for the cloud bootstrap seed failed — {e}"
         )),
     }
 }
@@ -248,14 +289,18 @@ impl OpenstackWorker {
         // gates every start honestly in the converge.
         let overlay = resolve_overlay(&self.overlay_ip_path);
         let outcome: CycleOutcome = match tokio::task::spawn_blocking(move || {
-            converge_cycle(
+            let mut outcome = converge_cycle(
                 &*fleet,
                 &*runner,
                 &config_root,
                 &share_root,
                 &host,
                 &overlay,
-            )
+            );
+            // QC-10 — the leader renders the cloud bootstrap seed (capacity-
+            // derived flavors + hard per-user quotas) alongside the converge.
+            render_leader_bootstrap(&config_root, &mut outcome);
+            outcome
         })
         .await
         {
@@ -361,6 +406,69 @@ mod tests {
     fn overlay_ip_path_defaults_to_the_canonical_publish_file() {
         let w = OpenstackWorker::new("node".to_string(), PathBuf::from("/tmp"));
         assert_eq!(w.overlay_ip_path, PathBuf::from(DEFAULT_OVERLAY_IP_PATH));
+    }
+
+    // ── QC-10: the leader-gated cloud bootstrap seed ──
+
+    fn outcome_with(doctrine: DoctrineStatus) -> CycleOutcome {
+        CycleOutcome {
+            state: OpenStackState {
+                host: "node-a".into(),
+                doctrine,
+                runtime: reconcile::RuntimeStatus::Available,
+                services: Vec::new(),
+                extras: Vec::new(),
+                published_at_ms: 0,
+            },
+            acted: false,
+            alerts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn bootstrap_seed_is_not_rendered_off_the_leader() {
+        // QC-10 — a non-leader (and a Disabled/Gated tick) renders no seed and
+        // raises no alert: the cloud-global bootstrap is the leader's to own.
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("bootstrap").join("cloud-bootstrap.sh");
+        for doctrine in [
+            DoctrineStatus::Enabled {
+                leader: false,
+                kolla_release: "2024.1".into(),
+            },
+            DoctrineStatus::Disabled,
+            DoctrineStatus::Gated {
+                reason: "no QC-4 record".into(),
+            },
+        ] {
+            let mut outcome = outcome_with(doctrine);
+            render_leader_bootstrap(dir.path(), &mut outcome);
+            assert!(!seed.exists(), "no seed off the leader");
+            assert!(outcome.alerts.is_empty(), "{:?}", outcome.alerts);
+        }
+    }
+
+    #[test]
+    fn the_leader_renders_the_capacity_derived_bootstrap_seed() {
+        // QC-10 — on the leader the seed is rendered from this host's real probed
+        // capacity (capacity-derived flavors + hard per-user quotas), so the
+        // deploy can apply the two guardrails.
+        let dir = tempfile::tempdir().unwrap();
+        let mut outcome = outcome_with(DoctrineStatus::Enabled {
+            leader: true,
+            kolla_release: "2024.1".into(),
+        });
+        render_leader_bootstrap(dir.path(), &mut outcome);
+        assert!(
+            outcome.alerts.is_empty(),
+            "the host probe/render must succeed: {:?}",
+            outcome.alerts
+        );
+        let seed = std::fs::read_to_string(dir.path().join("bootstrap").join("cloud-bootstrap.sh"))
+            .expect("the leader rendered the seed");
+        assert!(seed.contains("QC-10"), "{seed}");
+        assert!(seed.contains("ensure_flavor m1.large"), "{seed}");
+        assert!(seed.contains("ensure_limit nova class:VCPU"), "{seed}");
     }
 
     #[tokio::test]
