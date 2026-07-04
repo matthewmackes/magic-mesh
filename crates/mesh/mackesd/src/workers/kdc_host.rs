@@ -41,10 +41,23 @@
 //! of our identity to each phone's overlay IP over the overlay (design #2) —
 //! never a UDP broadcast (which Nebula doesn't carry). A phone whose overlay IP
 //! isn't in the roster is honestly `not_discovered` (no broadcast fallback, §7).
+//!
+//! **KDC-MESH-5 (2026-07-04) — bidirectional mesh notifications.** A phone
+//! notification (`kdeconnect.notification`) received on any node is fanned out to
+//! EVERY node's desktop feed (design #6): the receiving node republishes it onto
+//! its local `event/notify/phone` lane (the CHAT-FIX-2 producer lane the chat
+//! worker folds into `alert:<self>`) AND relays it to peers over the mesh-shunt
+//! substrate (`<root>/kdc-notify/<host>.json`), which each peer republishes onto
+//! its own feed. A bounded per-node seen-set de-dups so one phone notification
+//! isn't N toasts on a single desktop. The reverse direction (design #9) forwards
+//! the local `event/notify/*` feed to the paired phone as KDE Connect
+//! notifications over the overlay transport. Every forwarded action is audited in
+//! the hash-chained event log (#16); an unpaired / unreachable phone is an honest
+//! no-op (no fake delivery, §7).
 
 #![cfg(feature = "async-services")]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +72,7 @@ use mde_kdc_host::pairing::{DeviceRecord, PairingStore};
 use mde_kdc_host::{EventStream, HostEvent, MeshPairing, OverlayTransport, PeerId, Transport};
 use mde_kdc_proto::discovery::{Announce, DeviceType};
 use mde_kdc_proto::plugins::battery::BatteryBody;
+use mde_kdc_proto::plugins::notification::{notification_packet, NotificationBody};
 use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
@@ -102,6 +116,104 @@ const OUTBOUND_DRAIN: Duration = Duration::from_secs(1);
 /// Health-tick cadence. 30s is the same window
 /// `lan_discovery` uses for its idle scan.
 const TICK: Duration = Duration::from_secs(30);
+
+// ── KDC-MESH-5: bidirectional mesh notifications ─────────────────────────────
+//
+// Design #6/#9: phone notifications appear on EVERY node's desktop feed (a
+// de-duped fan-out over the mesh-shunt substrate), and the CHAT-FIX-2 local-event
+// feed (`event/notify/*`) is forwarded to the paired phone as KDE Connect
+// notifications over the overlay. Every forwarded action is audited (#16).
+
+/// The CHAT-FIX-2 producer lane a relayed phone notification republishes onto so
+/// the chat worker folds it into this node's `alert:<self>` desktop feed. Mirrors
+/// [`crate::workers::notify::NOTIFY_TOPIC_PREFIX`]`+ "phone"`.
+const NOTIFY_TOPIC_PHONE: &str = "event/notify/phone";
+
+/// The `event/notify/<source>` lanes the CHAT-FIX-2 producer emits that we forward
+/// to the paired phone. `phone` is deliberately excluded — it carries inbound
+/// phone notifications, and echoing them back would loop.
+const MESH_NOTIFY_SOURCES: [&str; 5] = ["peer", "updates", "service", "disk", "journal"];
+
+/// Cap on THIS host's own relay row (newest N phone notifications).
+const NOTIFY_RELAY_CAP: usize = 64;
+
+/// A relayed notification older than this (ms) is dropped by the collector so a
+/// rejoining node doesn't replay ancient notifications — 5 minutes.
+const NOTIFY_RELAY_STALE_MS: i64 = 300_000;
+
+/// Bound on the per-node de-dup seen-set of notification keys.
+const NOTIFY_SEEN_CAP: usize = 512;
+
+/// How often the mesh→phone forwarder drains the local `event/notify/*` lanes.
+const NOTIFY_FORWARD_TICK: Duration = Duration::from_secs(5);
+
+/// The bus root the CHAT-FIX-2 notify producer + the chat folder run on — the
+/// per-HOME `data_dir/mde/bus`, identical for every worker in THIS mackesd
+/// process (mirrors `notify::default_bus_root` + `chat::default_bus_root`). Using
+/// it directly guarantees a republished `event/notify/phone` is folded by chat and
+/// a forwarded notify is read from the same lanes the producer writes.
+fn notify_bus_root() -> Option<PathBuf> {
+    Some(dirs::data_dir()?.join("mde").join("bus"))
+}
+
+/// A bounded de-dup ring of notification keys (phone id + notif id + cancel). A
+/// key admitted once is suppressed thereafter so one phone notification isn't N
+/// toasts on a single desktop — whether it arrives directly from the phone AND via
+/// a peer relay, or twice from the phone. Bounded so it can't grow without limit.
+#[derive(Default)]
+struct NotifySeen {
+    recent: VecDeque<String>,
+    set: BTreeSet<String>,
+}
+
+impl NotifySeen {
+    /// Admit `key`: `true` (act on it) the first time, `false` once seen. Keeps the
+    /// ring ≤ [`NOTIFY_SEEN_CAP`], evicting the oldest key.
+    fn admit(&mut self, key: &str) -> bool {
+        if self.set.contains(key) {
+            return false;
+        }
+        self.set.insert(key.to_string());
+        self.recent.push_back(key.to_string());
+        while self.recent.len() > NOTIFY_SEEN_CAP {
+            if let Some(old) = self.recent.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        true
+    }
+
+    /// Mark `key` seen without acting (the startup prime, so a restart doesn't
+    /// re-toast notifications already on the substrate).
+    fn prime(&mut self, key: String) {
+        let _ = self.admit(&key);
+    }
+}
+
+/// A local mesh notification pulled off an `event/notify/<source>` lane, ready to
+/// forward to the phone. Parsed from the CHAT-FIX-2 producer's alert-shaped body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MeshNotify {
+    /// The bus ULID — the phone's dedup id for the outbound notification.
+    id: String,
+    /// The lane suffix (`service`/`disk`/…), shown as the notification title.
+    source: String,
+    /// The originating host (from the body), part of the ticker line.
+    host: String,
+    /// The one-line human summary.
+    summary: String,
+}
+
+/// One inbound phone notification, parsed + pre-rendered for the fan-out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundNotification {
+    key: String,
+    phone_id: String,
+    phone_name: String,
+    app_name: String,
+    summary: String,
+    severity: String,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Worker-local outbound queue
@@ -359,6 +471,369 @@ fn publish_kdc_alert(summary: &str, severity: &str) {
     let _ = persist.write("fdo/KDE Connect", prio, Some("KDE Connect"), Some(&body));
 }
 
+// ─────────────────────── KDC-MESH-5: notification I/O ctx ─────────────────────
+
+/// The I/O the KDC-MESH-5 notification paths touch, made injectable so the fan-out
+/// and forward logic is hermetically testable (tests point `bus_root`/`db_path` at
+/// tempdirs). Production reads the CHAT-FIX-2 bus + the hash-chained event store.
+struct NotifyCtx {
+    /// This node's hostname — the `host` field on republished feed items + the
+    /// audit `node_id`.
+    hostname: String,
+    /// The CHAT-FIX-2 bus root (`event/notify/*`); `None` disables bus I/O.
+    bus_root: Option<PathBuf>,
+    /// The hash-chained event store (`events::append_and_alert`).
+    db_path: PathBuf,
+}
+
+impl NotifyCtx {
+    /// Production ctx: the per-HOME notify bus + the default event store.
+    fn production(hostname: &str) -> Self {
+        Self {
+            hostname: hostname.to_string(),
+            bus_root: notify_bus_root(),
+            db_path: crate::default_db_path(),
+        }
+    }
+
+    /// Publish one notification onto THIS node's local `event/notify/phone` bus lane
+    /// — the CHAT-FIX-2 producer lane the chat worker folds into `alert:<self>` (the
+    /// desktop notify feed). Same alert-shaped body [`crate::workers::notify`] emits.
+    /// Best-effort (open+write+drop; `Persist` is `!Send`).
+    fn publish_phone_notify(&self, summary: &str, severity: &str, ts_ms: i64) {
+        let Some(root) = self.bus_root.clone() else {
+            return;
+        };
+        let Ok(persist) = Persist::open(root) else {
+            return;
+        };
+        let body = json!({
+            "severity": severity,
+            "source": "phone",
+            "summary": summary,
+            "host": self.hostname,
+            "ts_unix_ms": ts_ms,
+        })
+        .to_string();
+        if let Err(e) = persist.write(NOTIFY_TOPIC_PHONE, Priority::Default, None, Some(&body)) {
+            debug!(error = %e, "kdc-host: phone-notify publish failed");
+        }
+    }
+
+    /// Audit one forwarded notification action through the hash-chained event log
+    /// (#16). Best-effort — [`crate::events::append_and_alert`] logs + swallows a
+    /// store fault, so an audit hiccup never wedges the notify path.
+    fn audit(&self, detail: Value) {
+        crate::events::append_and_alert(
+            &self.db_path,
+            &self.hostname,
+            crate::events::EventKind::Lifecycle,
+            detail,
+        );
+    }
+
+    /// Handle one inbound phone `kdeconnect.notification` (design #6): de-dup, then
+    /// republish onto THIS node's desktop feed, relay it to peers over the
+    /// mesh-shunt substrate, and audit. A key already seen (a duplicate from the
+    /// phone, or one we already surfaced via a peer relay) is a silent no-op — the
+    /// de-dup that keeps one phone notification from becoming N toasts on a single
+    /// desktop.
+    fn fanout_inbound(
+        &self,
+        root: &std::path::Path,
+        seen: &mut NotifySeen,
+        n: &InboundNotification,
+        now: i64,
+    ) {
+        if !seen.admit(&n.key) {
+            return;
+        }
+        // 1) THIS node's desktop feed.
+        self.publish_phone_notify(&n.summary, &n.severity, now);
+        // 2) Relay to every other node over the replicated substrate (they
+        //    republish onto their own feeds on their next relay tick).
+        let entry = super::mesh_shunt::RelayedNotification {
+            key: n.key.clone(),
+            phone_id: n.phone_id.clone(),
+            phone_name: n.phone_name.clone(),
+            app_name: n.app_name.clone(),
+            summary: n.summary.clone(),
+            severity: n.severity.clone(),
+            origin_host: self.hostname.clone(),
+            ts_ms: now,
+        };
+        if let Err(e) =
+            super::mesh_shunt::append_notify_relay(root, &self.hostname, &entry, NOTIFY_RELAY_CAP)
+        {
+            warn!(error = %e, "kdc-host: phone-notify relay publish failed");
+        }
+        // 3) Audit the forwarded action (#16).
+        self.audit(json!({
+            "action": "kdc_notify_fanout",
+            "direction": "phone_to_desktops",
+            "phone": n.phone_id,
+            "app": n.app_name,
+        }));
+    }
+
+    /// Drain neighbors' relayed phone notifications off the substrate and republish
+    /// any not-yet-seen one onto THIS node's desktop feed (design #6 fan-out on the
+    /// receiving side). Own-row authority + the seen-set keep it loop-free and
+    /// de-duped: a node never re-relays what it read (it only writes its OWN row),
+    /// and a notification it already surfaced (direct or via another relay) is
+    /// skipped. Returns how many it surfaced (observability + tests).
+    fn drain_relayed(&self, root: &std::path::Path, seen: &mut NotifySeen, now: i64) -> usize {
+        let mut surfaced = 0;
+        for entry in super::mesh_shunt::collect_notify_relay(
+            root,
+            &self.hostname,
+            now,
+            NOTIFY_RELAY_STALE_MS,
+        ) {
+            if !seen.admit(&entry.key) {
+                continue;
+            }
+            self.publish_phone_notify(&entry.summary, &entry.severity, now);
+            self.audit(json!({
+                "action": "kdc_notify_fanout",
+                "direction": "relayed_to_desktop",
+                "phone": entry.phone_id,
+                "origin": entry.origin_host,
+            }));
+            surfaced += 1;
+        }
+        surfaced
+    }
+
+    /// Forward every newly-produced local mesh notification to each paired phone
+    /// over the overlay (design #9). Honest-gated: with no paired phone it's a no-op
+    /// (no draining, so a later pairing seeds forward-only — no backlog dump); a
+    /// paired but unreachable phone is an honest no-op (no fake delivery, no audit).
+    /// Each ACTUAL delivery is audited (#16).
+    async fn forward_to_phones(
+        &self,
+        transport: &OverlayTransport,
+        pairing: &Arc<PairingStore>,
+        cursors: &mut HashMap<String, String>,
+    ) {
+        let phones: Vec<PeerId> = pairing
+            .records()
+            .into_iter()
+            .map(|r| PeerId::from(r.device_id.as_str()))
+            .collect();
+        if phones.is_empty() {
+            return; // honest gate: no phone paired → nothing to forward
+        }
+        for n in self.drain_local_notifies(cursors) {
+            let packet = mesh_notify_packet(&n, now_ms());
+            for phone in &phones {
+                if forward_packet_to_phone(transport, phone, packet.clone()).await {
+                    self.audit(json!({
+                        "action": "kdc_notify_to_phone",
+                        "direction": "mesh_to_phone",
+                        "phone": phone.as_str(),
+                        "source": n.source,
+                        "summary": n.summary,
+                    }));
+                }
+            }
+        }
+    }
+
+    /// Drain the local `event/notify/<source>` lanes (the CHAT-FIX-2 producer,
+    /// excluding the inbound `phone` lane) for notifications newer than each lane's
+    /// cursor. First sight of a lane seeds its cursor forward-only (no backlog
+    /// replay), mirroring the chat/notify no-backlog contract. Sync (opens + drops
+    /// `Persist` without holding it across an await). The startup benign prime
+    /// (`"notify monitor online"`) is filtered so it isn't forwarded to the phone.
+    fn drain_local_notifies(&self, cursors: &mut HashMap<String, String>) -> Vec<MeshNotify> {
+        let Some(root) = self.bus_root.clone() else {
+            return Vec::new();
+        };
+        let Ok(persist) = Persist::open(root) else {
+            return Vec::new();
+        };
+        collect_local_notifies(&persist, cursors)
+    }
+}
+
+// ───────────────── KDC-MESH-5: phone → desktops (pure helpers) ────────────────
+
+/// Render a phone notification's one-line feed summary (`"App: text"`), collapsing
+/// an empty app or empty text. Pure + testable.
+fn phone_notify_summary(app: &str, text: &str) -> String {
+    let app = app.trim();
+    let text = text.trim();
+    let sep = if app.is_empty() || text.is_empty() {
+        ""
+    } else {
+        ": "
+    };
+    format!("{app}{sep}{text}")
+}
+
+/// Parse an inbound `kdeconnect.notification` packet into a fan-outable
+/// [`InboundNotification`], or `None` to skip it. Cancels (dismissals) are skipped
+/// — the desktop feed is an append-only log with no dismiss affordance — as is a
+/// content-less notification. The de-dup key falls back to the summary text when
+/// the phone omits a stable notification `id`, so distinct notifications don't
+/// collapse to one. Pure (no I/O) so the fan-out decision is unit-tested.
+fn parse_inbound_notification(
+    peer: &PeerId,
+    packet: &mde_kdc_proto::wire::Packet,
+    phone_name: &str,
+) -> Option<InboundNotification> {
+    if packet.kind != "kdeconnect.notification" {
+        return None;
+    }
+    let body = &packet.body;
+    // A cancel is a dismissal, not a new desktop toast — skip (matches the
+    // Alert-Center path's existing cancel handling).
+    if body.get("isCancel").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let app = body
+        .get("appName")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let text = body
+        .get("ticker")
+        .or_else(|| body.get("text"))
+        .or_else(|| body.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let summary = phone_notify_summary(&app, &text);
+    if summary.is_empty() {
+        return None;
+    }
+    let notif_id = body.get("id").and_then(Value::as_str).unwrap_or("");
+    // Fall back to the summary when the phone omits a stable id, so two different
+    // notifications with no id don't share a key.
+    let id_part = if notif_id.is_empty() {
+        summary.as_str()
+    } else {
+        notif_id
+    };
+    Some(InboundNotification {
+        key: super::mesh_shunt::notify_relay_key(peer.as_str(), id_part, false),
+        phone_id: peer.as_str().to_string(),
+        phone_name: phone_name.to_string(),
+        app_name: app,
+        summary,
+        // Phone notifications ride the feed at Info — present, but they don't
+        // hijack the screen with a Warning+ chyron.
+        severity: "info".to_string(),
+    })
+}
+
+// ───────────────── KDC-MESH-5: mesh → phone (forward) ─────────────────────────
+
+/// The persist-driven core of [`NotifyCtx::drain_local_notifies`] — factored out so
+/// it's hermetically testable against a tempdir `Persist`. Drains the local
+/// `event/notify/<source>` lanes (the CHAT-FIX-2 producer, excluding the inbound
+/// `phone` lane) for notifications newer than each lane's cursor. First sight of a
+/// lane seeds its cursor forward-only (no backlog replay), mirroring the chat/notify
+/// no-backlog contract. The startup benign prime (`"notify monitor online"`) is
+/// filtered so it isn't forwarded to the phone.
+fn collect_local_notifies(
+    persist: &Persist,
+    cursors: &mut HashMap<String, String>,
+) -> Vec<MeshNotify> {
+    let mut out = Vec::new();
+    for source in MESH_NOTIFY_SOURCES {
+        let topic = format!("{}{source}", crate::workers::notify::NOTIFY_TOPIC_PREFIX);
+        let first_sight = !cursors.contains_key(&topic);
+        let since = cursors.get(&topic).cloned();
+        let msgs = persist
+            .list_since(&topic, since.as_deref())
+            .unwrap_or_default();
+        if let Some(last) = msgs.last() {
+            cursors.insert(topic.clone(), last.ulid.clone());
+        }
+        if first_sight {
+            // Seed the cursor to the current head; don't replay the backlog.
+            continue;
+        }
+        for m in msgs {
+            let Some(body) = m.body.as_deref() else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(body) else {
+                continue;
+            };
+            let summary = v
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if summary.is_empty() || summary == "notify monitor online" {
+                continue; // skip the benign per-lane prime
+            }
+            out.push(MeshNotify {
+                id: m.ulid.clone(),
+                source: source.to_string(),
+                host: v
+                    .get("host")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                summary,
+            });
+        }
+    }
+    out
+}
+
+/// Build the outbound `kdeconnect.notification` packet for a forwarded mesh
+/// notification — appears on the phone as a "Quasar Mesh" notification. Pure.
+fn mesh_notify_packet(n: &MeshNotify, ts_ms: i64) -> mde_kdc_proto::wire::Packet {
+    let title = if n.host.is_empty() {
+        format!("Mesh · {}", n.source)
+    } else {
+        format!("{} · {}", n.host, n.source)
+    };
+    let ticker = format!("Quasar Mesh: {}", n.summary);
+    notification_packet(
+        ts_ms,
+        NotificationBody {
+            id: n.id.clone(),
+            app_name: "Quasar Mesh".to_string(),
+            title,
+            text: n.summary.clone(),
+            ticker,
+            is_clearable: true,
+            is_cancel: false,
+        },
+    )
+}
+
+/// Forward one already-built packet to a phone over the overlay: prefer the live
+/// inbound link (`send_to`), else dial out by the phone's overlay IP (`open`).
+/// Returns whether it was actually delivered — an unreachable phone is an honest
+/// `false` (no fake delivery), never a queued or faked send.
+async fn forward_packet_to_phone(
+    transport: &OverlayTransport,
+    peer: &PeerId,
+    packet: mde_kdc_proto::wire::Packet,
+) -> bool {
+    if transport.send_to(peer, packet.clone()).await.is_ok() {
+        return true;
+    }
+    match transport.open(peer).await {
+        Ok(conn) => {
+            let ok = conn.send(packet).await.is_ok();
+            conn.close().await;
+            ok
+        }
+        Err(e) => {
+            debug!(phone = %peer.as_str(), error = %e, "kdc-host: mesh→phone forward skipped (unreachable)");
+            false
+        }
+    }
+}
+
 /// Fold one host event into the roster: connections flip `online`, battery
 /// packets update the charge, discovery announces refresh the display name.
 /// Pure (no I/O) so the state machine is unit-tested without a bus or a phone.
@@ -581,6 +1056,17 @@ async fn run_host(
     // transport to its paired device. Failures (device offline / not yet
     // connected) are logged, not retried — operator actions are fire-and-forget.
     let mut drain_tick = tokio::time::interval(OUTBOUND_DRAIN);
+    // KDC-MESH-5 — bidirectional mesh notifications. `notify_seen` de-dups the
+    // phone→desktops fan-out (primed with what's already on the substrate so a
+    // restart doesn't re-toast); `notify_cursors` drives the mesh→phone forwarder
+    // (forward-only per lane); `notify_fwd_tick` paces it.
+    let notify_ctx = NotifyCtx::production(&shunt_host);
+    let mut notify_seen = NotifySeen::default();
+    for key in super::mesh_shunt::all_notify_relay_keys(&shunt_root) {
+        notify_seen.prime(key);
+    }
+    let mut notify_cursors: HashMap<String, String> = HashMap::new();
+    let mut notify_fwd_tick = tokio::time::interval(NOTIFY_FORWARD_TICK);
     loop {
         tokio::select! {
             ev = stream.recv() => {
@@ -603,9 +1089,18 @@ async fn run_host(
                     }
                     HostEvent::PeerLost(_) => {}
                 }
-                // NOTIFY-SRC-3 — surface notable device events to the Alert Center.
-                if let Some((summary, severity)) = kdc_event_alert(&ev) {
-                    publish_kdc_alert(&summary, severity);
+                // NOTIFY-SRC-3 — surface notable device events to the Alert Center,
+                // EXCEPT phone notifications: KDC-MESH-5 fans those out (de-duped)
+                // to EVERY node's desktop feed via `event/notify/phone` + the
+                // replicated relay below, so routing them here too would double them.
+                let is_phone_notification = matches!(
+                    &ev,
+                    HostEvent::Packet { packet, .. } if packet.kind == "kdeconnect.notification"
+                );
+                if !is_phone_notification {
+                    if let Some((summary, severity)) = kdc_event_alert(&ev) {
+                        publish_kdc_alert(&summary, severity);
+                    }
                 }
                 // A phone-initiated `kdeconnect.pair{pair:true}`: pin the cert seen
                 // at TLS time, persist the device, and accept.
@@ -645,6 +1140,22 @@ async fn run_host(
                             apply_clipboard(content);
                         }
                     }
+                    // KDC-MESH-5 — a phone notification (design #6): fan it out,
+                    // de-duped, to EVERY node's desktop feed. Republish onto THIS
+                    // node's `event/notify/phone` lane + relay it to peers over the
+                    // mesh-shunt substrate; audited (#16). The phone's friendly name
+                    // (for the feed line) comes off the live roster.
+                    if packet.kind == "kdeconnect.notification" {
+                        let phone_name = roster
+                            .lock()
+                            .ok()
+                            .and_then(|m| m.get(peer.as_str()).map(|d| d.name.clone()))
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| peer.as_str().to_string());
+                        if let Some(n) = parse_inbound_notification(peer, packet, &phone_name) {
+                            notify_ctx.fanout_inbound(&shunt_root, &mut notify_seen, &n, now_ms());
+                        }
+                    }
                 }
                 if let Ok(mut m) = roster.lock() {
                     apply_event(&mut m, ev);
@@ -668,6 +1179,16 @@ async fn run_host(
                     },
                 );
                 directed_announce(&transport, &phone_ids).await;
+                // KDC-MESH-5 — pick up neighbors' relayed phone notifications off
+                // the substrate and republish any not-yet-seen one onto THIS node's
+                // desktop feed (the phone→desktops fan-out, receiving side, #6).
+                notify_ctx.drain_relayed(&shunt_root, &mut notify_seen, now_ms());
+            }
+            _ = notify_fwd_tick.tick() => {
+                // KDC-MESH-5 — forward the local `event/notify/*` feed (CHAT-FIX-2)
+                // to the paired phone as KDE Connect notifications over the overlay
+                // (#9). Honest-gated on a paired + reachable phone; audited (#16).
+                notify_ctx.forward_to_phones(&transport, &pairing, &mut notify_cursors).await;
             }
             _ = drain_tick.tick() => {
                 for send in outbound.take_all() {
@@ -1867,6 +2388,294 @@ mod tests {
         }
     }
 
+    // ── KDC-MESH-5: bidirectional mesh notifications ─────────────────────────
+
+    fn notif_pkt(id: &str, app: &str, ticker: &str) -> mde_kdc_proto::wire::Packet {
+        build_packet(
+            "kdeconnect.notification",
+            json!({ "id": id, "appName": app, "ticker": ticker }),
+        )
+    }
+
+    fn test_ctx(host: &str, tmp: &std::path::Path) -> NotifyCtx {
+        NotifyCtx {
+            hostname: host.to_string(),
+            bus_root: Some(tmp.join(format!("bus-{host}"))),
+            db_path: tmp.join(format!("mded-{host}.db")),
+        }
+    }
+
+    fn phone_lane_len(bus_root: &std::path::Path) -> usize {
+        Persist::open(bus_root.to_path_buf())
+            .unwrap()
+            .list_since(NOTIFY_TOPIC_PHONE, None)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
+    fn audit_row_count(db_path: &std::path::Path) -> usize {
+        let conn = crate::store::open(db_path).unwrap();
+        crate::store::load_audit_rows(&conn).unwrap().len()
+    }
+
+    #[test]
+    fn phone_notify_summary_collapses_empty_parts() {
+        assert_eq!(phone_notify_summary("Signal", "hi"), "Signal: hi");
+        assert_eq!(phone_notify_summary("", "hi"), "hi");
+        assert_eq!(phone_notify_summary("Signal", ""), "Signal");
+        assert_eq!(phone_notify_summary("  ", "  "), "");
+    }
+
+    #[test]
+    fn parse_inbound_notification_parses_skips_cancel_and_keys_distinctly() {
+        let peer = PeerId::from("moto");
+        let n =
+            parse_inbound_notification(&peer, &notif_pkt("m1", "Signal", "new message"), "Moto")
+                .expect("a content notification parses");
+        assert_eq!(n.summary, "Signal: new message");
+        assert_eq!(n.phone_id, "moto");
+        assert_eq!(n.severity, "info");
+        assert!(n.key.contains("moto") && n.key.contains("m1"));
+        // A cancel (dismissal) is skipped — no desktop toast.
+        let cancel = build_packet(
+            "kdeconnect.notification",
+            json!({ "id": "m1", "isCancel": true }),
+        );
+        assert!(parse_inbound_notification(&peer, &cancel, "Moto").is_none());
+        // A content-less notification is skipped.
+        assert!(parse_inbound_notification(&peer, &notif_pkt("m2", "", ""), "Moto").is_none());
+        // Distinct notification ids ⇒ distinct de-dup keys.
+        let a = parse_inbound_notification(&peer, &notif_pkt("m1", "S", "x"), "Moto").unwrap();
+        let b = parse_inbound_notification(&peer, &notif_pkt("m2", "S", "x"), "Moto").unwrap();
+        assert_ne!(a.key, b.key);
+        // A wrong packet kind isn't a notification.
+        assert!(parse_inbound_notification(
+            &peer,
+            &build_packet("kdeconnect.ping", json!({})),
+            "Moto"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn notify_seen_dedups_and_is_bounded() {
+        let mut seen = NotifySeen::default();
+        assert!(seen.admit("k1"), "first sight acts");
+        assert!(!seen.admit("k1"), "second sight suppressed");
+        // Flood past the cap; the ring stays bounded and old keys are evicted.
+        for i in 0..(NOTIFY_SEEN_CAP * 2) {
+            seen.admit(&format!("f{i}"));
+        }
+        assert!(seen.recent.len() <= NOTIFY_SEEN_CAP, "seen ring is bounded");
+    }
+
+    #[test]
+    fn mesh_notify_packet_builds_a_kdeconnect_notification() {
+        let n = MeshNotify {
+            id: "01ULID".into(),
+            source: "service".into(),
+            host: "nyc3".into(),
+            summary: "service sshd.service failed".into(),
+        };
+        let pkt = mesh_notify_packet(&n, 42);
+        assert_eq!(pkt.kind, "kdeconnect.notification");
+        let body: NotificationBody =
+            mde_kdc_proto::plugins::from_packet_body(&pkt).expect("decodes");
+        assert_eq!(body.app_name, "Quasar Mesh");
+        assert_eq!(body.id, "01ULID");
+        assert_eq!(body.text, "service sshd.service failed");
+        assert!(body.title.contains("nyc3") && body.title.contains("service"));
+        assert!(!body.is_cancel);
+    }
+
+    #[test]
+    fn phone_notification_fans_out_and_dedups_across_nodes() {
+        // Two nodes (A + B) share ONE replicated relay root (the substrate) but each
+        // has its own local bus + audit store. A phone notification received on A
+        // must appear on B's desktop feed exactly once — and never twice even if B
+        // also receives it directly or drains the relay again.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path().join("shared");
+        let ctx_a = test_ctx("nodeA", tmp.path());
+        let ctx_b = test_ctx("nodeB", tmp.path());
+        let mut seen_a = NotifySeen::default();
+        let mut seen_b = NotifySeen::default();
+
+        let peer = PeerId::from("moto");
+        let n = parse_inbound_notification(&peer, &notif_pkt("m1", "Signal", "ping!"), "Moto")
+            .expect("parses");
+
+        // Node A receives it: republishes to A's feed + relays it + audits.
+        ctx_a.fanout_inbound(&root, &mut seen_a, &n, 1_000);
+        assert_eq!(
+            phone_lane_len(ctx_a.bus_root.as_deref().unwrap()),
+            1,
+            "the notification is on node A's desktop feed"
+        );
+        assert!(
+            audit_row_count(&ctx_a.db_path) >= 1,
+            "the fan-out is audited (#16)"
+        );
+        // It's on the replicated substrate for peers to pick up.
+        assert_eq!(
+            crate::workers::mesh_shunt::collect_notify_relay(
+                &root,
+                "nodeB",
+                1_200,
+                NOTIFY_RELAY_STALE_MS
+            )
+            .len(),
+            1,
+            "node B sees A's relayed notification on the substrate"
+        );
+
+        // Node B drains the relay: the notification appears on B's feed (fan-out).
+        assert_eq!(ctx_b.drain_relayed(&root, &mut seen_b, 1_200), 1);
+        assert_eq!(
+            phone_lane_len(ctx_b.bus_root.as_deref().unwrap()),
+            1,
+            "the phone notification fanned out to node B's desktop feed"
+        );
+
+        // De-dup: draining again surfaces nothing (already seen).
+        assert_eq!(ctx_b.drain_relayed(&root, &mut seen_b, 1_300), 0);
+        // De-dup across paths: if B ALSO receives it directly from the phone, it's a
+        // no-op — one phone notification is never N toasts on a single desktop.
+        ctx_b.fanout_inbound(&root, &mut seen_b, &n, 1_400);
+        assert_eq!(
+            phone_lane_len(ctx_b.bus_root.as_deref().unwrap()),
+            1,
+            "still exactly one toast on node B after a duplicate direct receipt"
+        );
+    }
+
+    #[test]
+    fn mesh_notify_forward_is_forward_only_and_skips_the_prime() {
+        // The mesh→phone drainer forwards only notifications produced AFTER it first
+        // saw a lane (no backlog replay), and never forwards the benign prime.
+        let tmp = tempdir().unwrap();
+        let bus = tmp.path().join("bus");
+        let persist = Persist::open(bus.clone()).unwrap();
+        let service = format!("{}service", crate::workers::notify::NOTIFY_TOPIC_PREFIX);
+        let body = |summary: &str| {
+            json!({ "severity": "warning", "source": "service", "summary": summary, "host": "nyc3" })
+                .to_string()
+        };
+        // A backlog message exists before the first drain.
+        persist
+            .write(
+                &service,
+                Priority::Default,
+                None,
+                Some(&body("old failure")),
+            )
+            .unwrap();
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        // First drain: forward-only — seeds the cursor, replays nothing.
+        assert!(collect_local_notifies(&persist, &mut cursors).is_empty());
+        // Now a prime + a real notification land.
+        persist
+            .write(
+                &service,
+                Priority::Default,
+                None,
+                Some(&body("notify monitor online")),
+            )
+            .unwrap();
+        persist
+            .write(
+                &service,
+                Priority::Default,
+                None,
+                Some(&body("nginx.service failed")),
+            )
+            .unwrap();
+        let got = collect_local_notifies(&persist, &mut cursors);
+        assert_eq!(
+            got.len(),
+            1,
+            "only the real, post-cursor notification is forwarded"
+        );
+        assert_eq!(got[0].summary, "nginx.service failed");
+        assert_eq!(got[0].source, "service");
+    }
+
+    #[tokio::test]
+    async fn mesh_forward_is_honest_noop_when_unpaired() {
+        // No paired phone: the forwarder drains nothing (a later pairing seeds
+        // forward-only — no backlog dump) and never fakes a delivery or an audit.
+        let tmp = tempdir().unwrap();
+        let ctx = test_ctx("nodeA", tmp.path());
+        let store = Arc::new(PairingStore::open(tmp.path().join("pair-unpaired")).unwrap());
+        let transport = OverlayTransport::new(announce("nodeA", "Node A"), Arc::clone(&store));
+        // A notification exists on the bus, but with no phone paired nothing forwards.
+        let bus = ctx.bus_root.clone().unwrap();
+        let persist = Persist::open(bus.clone()).unwrap();
+        let service = format!("{}service", crate::workers::notify::NOTIFY_TOPIC_PREFIX);
+        persist
+            .write(&service, Priority::Default, None, Some(
+                &json!({"severity":"warning","source":"service","summary":"x failed","host":"nodeA"}).to_string(),
+            ))
+            .unwrap();
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        ctx.forward_to_phones(&transport, &store, &mut cursors)
+            .await;
+        assert!(
+            cursors.is_empty(),
+            "no draining occurs with no paired phone"
+        );
+        assert_eq!(audit_row_count(&ctx.db_path), 0, "no fake-delivery audit");
+    }
+
+    #[tokio::test]
+    async fn mesh_forward_to_a_paired_but_unreachable_phone_is_an_honest_noop() {
+        // A paired phone with no live link and no known overlay IP: the forwarder
+        // tries the overlay, fails honestly, and audits NOTHING (no fake delivery).
+        let tmp = tempdir().unwrap();
+        let ctx = test_ctx("nodeA", tmp.path());
+        let store = Arc::new(PairingStore::open(tmp.path().join("pair-unreach")).unwrap());
+        store
+            .pair(DeviceRecord {
+                device_id: "moto".into(),
+                device_name: "Moto".into(),
+                paired_at_ms: 1,
+                fingerprint: String::new(),
+            })
+            .unwrap();
+        let transport = OverlayTransport::new(announce("nodeA", "Node A"), Arc::clone(&store));
+        let bus = ctx.bus_root.clone().unwrap();
+        let persist = Persist::open(bus.clone()).unwrap();
+        let service = format!("{}service", crate::workers::notify::NOTIFY_TOPIC_PREFIX);
+        let write_notify = |summary: &str| {
+            persist
+                .write(
+                    &service,
+                    Priority::Default,
+                    None,
+                    Some(
+                        &json!({"severity":"warning","source":"service","summary":summary,"host":"nodeA"})
+                            .to_string(),
+                    ),
+                )
+                .unwrap();
+        };
+        let mut cursors: HashMap<String, String> = HashMap::new();
+        // A first notification seeds the cursor forward-only (the first drain skips
+        // it); a second, post-cursor notification IS drained + delivery attempted —
+        // but the phone is unreachable, so nothing is delivered and nothing audited.
+        write_notify("old failure");
+        ctx.forward_to_phones(&transport, &store, &mut cursors)
+            .await;
+        write_notify("nginx failed");
+        ctx.forward_to_phones(&transport, &store, &mut cursors)
+            .await;
+        assert_eq!(
+            audit_row_count(&ctx.db_path),
+            0,
+            "an unreachable phone is delivered nothing → nothing audited"
+        );
+    }
+
     #[test]
     fn kdc_event_alert_classifies_notable_events() {
         use mde_kdc_proto::wire::Packet;
@@ -2105,7 +2914,10 @@ mod tests {
         std::fs::create_dir_all(&cfg).unwrap();
         // THIS node has paired NOTHING locally (an honest, unsynced start).
         let pairing = Arc::new(PairingStore::open(&cfg).unwrap());
-        assert!(!pairing.is_paired("phone-1"), "unsynced: honest gate, no trust");
+        assert!(
+            !pairing.is_paired("phone-1"),
+            "unsynced: honest gate, no trust"
+        );
 
         let transport = OverlayTransport::new(local_announce(), Arc::clone(&pairing))
             .with_overlay_ip(IpAddr::V4(Ipv4Addr::LOCALHOST))
@@ -2153,19 +2965,34 @@ mod tests {
         // phone-1 is now recognized mesh-wide WITHOUT a local pairing, carrying
         // hostA's pin (so the transport enforces the same cert). phone-ghost (no
         // pin) is NOT trusted — the honest gate.
-        assert!(pairing.is_paired("phone-1"), "the neighbor's pairing replicated in");
+        assert!(
+            pairing.is_paired("phone-1"),
+            "the neighbor's pairing replicated in"
+        );
         assert!(pairing.is_synced("phone-1"));
-        assert!(!pairing.is_locally_paired("phone-1"), "recognized via mesh, not own-row");
+        assert!(
+            !pairing.is_locally_paired("phone-1"),
+            "recognized via mesh, not own-row"
+        );
         assert_eq!(pairing.get("phone-1").unwrap().fingerprint, "AA:BB:CC");
-        assert_eq!(pairing.synced_pairing("phone-1").unwrap().origin_host, "hostA");
-        assert!(!pairing.is_paired("phone-ghost"), "a pin-less relay stays untrusted");
+        assert_eq!(
+            pairing.synced_pairing("phone-1").unwrap().origin_host,
+            "hostA"
+        );
+        assert!(
+            !pairing.is_paired("phone-ghost"),
+            "a pin-less relay stays untrusted"
+        );
         // Own-row authority: we never republished the synced pairing as our own.
         let raw = std::fs::read_to_string(
             super::super::mesh_shunt::phones_dir(&shared).join("hostB.json"),
         )
         .unwrap();
         let back = super::super::mesh_shunt::parse_roster(&raw).expect("our roster parses");
-        assert!(back.devices.is_empty(), "synced pairings are not republished");
+        assert!(
+            back.devices.is_empty(),
+            "synced pairings are not republished"
+        );
     }
 
     #[test]

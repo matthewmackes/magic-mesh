@@ -276,7 +276,11 @@ pub fn collect_overlay_directory(workgroup_root: &Path, self_hostname: &str) -> 
         };
         // The neighbor host itself, resolvable by overlay IP (host↔host reach).
         if !roster.host_device_id.is_empty() {
-            if let Some(ip) = roster.host_overlay_ip.as_deref().and_then(parse_dialable_ip) {
+            if let Some(ip) = roster
+                .host_overlay_ip
+                .as_deref()
+                .and_then(parse_dialable_ip)
+            {
                 out.hosts.push((roster.host_device_id, ip));
             }
         }
@@ -358,6 +362,169 @@ pub fn collect_pairings(workgroup_root: &Path, self_hostname: &str) -> Vec<Colle
                 paired_at_ms: d.paired_at_ms,
                 origin_host: stem.to_string(),
             });
+        }
+    }
+    out
+}
+
+// ── KDC-MESH-5: the replicated phone-notification relay ──────────────────────
+//
+// Design #6/#9: a phone notification must appear on EVERY node's desktop notify
+// feed, not just the node the phone happens to be connected to. The receiving
+// node writes the notification into its own row of a replicated relay dir
+// (`<root>/kdc-notify/<hostname>.json`, own-row authority — same substrate the
+// phone roster rides); every peer reads its neighbors' rows each shunt tick and
+// republishes any it hasn't seen onto its LOCAL `event/notify/phone` bus lane (the
+// CHAT-FIX-2 producer lane the chat worker folds into the desktop feed). The
+// per-node de-dup (a bounded seen-set in `kdc_host`) keeps one phone notification
+// from becoming N toasts on a single desktop even when the phone is connected to
+// several nodes at once. Overlay-carried: the relay dir replicates over the Nebula
+// overlay via Syncthing (SUBSTRATE-V2), never a public port.
+
+/// The replicated directory holding every peer's relayed phone notifications.
+#[must_use]
+pub fn notify_relay_dir(workgroup_root: &Path) -> PathBuf {
+    workgroup_root.join("kdc-notify")
+}
+
+/// One relayed phone notification (the JSON shape on the volume).
+///
+/// Carries the de-dup `key`, the phone identity, the pre-rendered feed fields, and
+/// the `origin_host` (the node that received it from the phone) + `ts_ms`
+/// (freshness).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RelayedNotification {
+    /// The mesh-wide de-dup key — [`notify_relay_key`] of the phone id + the
+    /// KDE-Connect notification id + the cancel flag.
+    pub key: String,
+    /// The phone's KDE-Connect device id (the paired-once mesh identity).
+    pub phone_id: String,
+    /// The phone's friendly name (for the feed line).
+    pub phone_name: String,
+    /// The emitting Android app (`appName`).
+    pub app_name: String,
+    /// The pre-rendered one-line feed summary (`"App: text"`).
+    pub summary: String,
+    /// The chat severity tag (`"info"`/`"warning"`) so the fold classifies it.
+    pub severity: String,
+    /// The mesh host that received the notification from the phone.
+    pub origin_host: String,
+    /// Unix-ms when the origin host received it (the freshness stamp).
+    pub ts_ms: i64,
+}
+
+/// The mesh-wide de-dup key for a phone notification.
+///
+/// The phone id + the KDE-Connect notification id + whether it's a cancel. Two
+/// nodes that both receive the same phone notification compute the same key, so
+/// each republishes it onto its own feed exactly once.
+#[must_use]
+pub fn notify_relay_key(phone_id: &str, notif_id: &str, is_cancel: bool) -> String {
+    format!(
+        "{phone_id}:{notif_id}:{}",
+        if is_cancel { "c" } else { "n" }
+    )
+}
+
+/// Append one relayed notification to THIS host's own relay row.
+///
+/// Own-row authority — only this box writes `<hostname>.json`. Idempotent per `key`
+/// (a re-received notification refreshes its stamp rather than duplicating), and
+/// bounded to the newest `cap` entries so the row can't grow without limit. Atomic
+/// temp + rename, like [`publish_roster`].
+///
+/// # Errors
+/// IO / serialization failures.
+pub fn append_notify_relay(
+    workgroup_root: &Path,
+    hostname: &str,
+    entry: &RelayedNotification,
+    cap: usize,
+) -> std::io::Result<PathBuf> {
+    let dir = notify_relay_dir(workgroup_root);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{hostname}.json"));
+    let mut entries: Vec<RelayedNotification> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    // Idempotent per key: drop a prior copy, then push the fresh one.
+    entries.retain(|e| e.key != entry.key);
+    entries.push(entry.clone());
+    // Bound to the newest `cap` by timestamp.
+    if entries.len() > cap.max(1) {
+        entries.sort_by_key(|e| e.ts_ms);
+        let start = entries.len() - cap.max(1);
+        entries.drain(0..start);
+    }
+    let body = serde_json::to_string_pretty(&entries)?;
+    let tmp = dir.join(format!(".{hostname}.json.tmp"));
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// Read every neighbor's relayed notifications (skipping our own row).
+///
+/// Own-row authority; keeps only entries fresher than `stale_ms` so a rejoining
+/// node doesn't replay ancient notifications. Junk / half-replicated files are
+/// skipped, like every other replicated reader. The caller de-dups by `key`
+/// against its seen-set before republishing each onto its local feed.
+#[must_use]
+pub fn collect_notify_relay(
+    workgroup_root: &Path,
+    self_hostname: &str,
+    now_ms: i64,
+    stale_ms: i64,
+) -> Vec<RelayedNotification> {
+    let Ok(entries) = std::fs::read_dir(notify_relay_dir(workgroup_root)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        if stem == self_hostname || path.extension().is_none_or(|x| x != "json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(list) = serde_json::from_str::<Vec<RelayedNotification>>(&raw) else {
+            continue;
+        };
+        for n in list {
+            if now_ms.saturating_sub(n.ts_ms) <= stale_ms {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
+/// Every de-dup key currently present in the relay dir (own row + neighbors').
+///
+/// The `kdc_host` worker primes its seen-set with these at startup so a restart
+/// doesn't re-toast notifications already on the substrate.
+#[must_use]
+pub fn all_notify_relay_keys(workgroup_root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(notify_relay_dir(workgroup_root)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().is_none_or(|x| x != "json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(list) = serde_json::from_str::<Vec<RelayedNotification>>(&raw) {
+            out.extend(list.into_iter().map(|n| n.key));
         }
     }
     out
@@ -466,7 +633,10 @@ mod tests {
         std::fs::write(phones_dir(root).join("oak.json"), "{{not json").unwrap();
         std::fs::write(phones_dir(root).join("README.txt"), "hi").unwrap();
         assert!(collect_synthetic(root, "pine", 1).is_empty());
-        assert_eq!(collect_overlay_directory(root, "pine"), RosterOverlay::default());
+        assert_eq!(
+            collect_overlay_directory(root, "pine"),
+            RosterOverlay::default()
+        );
     }
 
     // ── KDC-MESH-2: overlay IPs flow through the roster ──────────────────────
@@ -476,10 +646,15 @@ mod tests {
         // `None` overlay IP is skipped (compact, back-compat); `Some` is carried.
         let bare = dev("d", "n");
         let s = serde_json::to_string(&bare).unwrap();
-        assert!(!s.contains("overlay_ip"), "None overlay_ip must not serialize");
+        assert!(
+            !s.contains("overlay_ip"),
+            "None overlay_ip must not serialize"
+        );
         assert_eq!(serde_json::from_str::<PublishedDevice>(&s).unwrap(), bare);
         let withip = dev_ip("d", "n", "10.42.0.7");
-        assert!(serde_json::to_string(&withip).unwrap().contains("10.42.0.7"));
+        assert!(serde_json::to_string(&withip)
+            .unwrap()
+            .contains("10.42.0.7"));
     }
 
     #[test]
@@ -554,13 +729,19 @@ mod tests {
         let bare = dev("d", "n");
         let s = serde_json::to_string(&bare).unwrap();
         assert!(!s.contains("fingerprint"), "empty pin must not serialize");
-        assert!(!s.contains("paired_at_ms"), "zero paired_at must not serialize");
+        assert!(
+            !s.contains("paired_at_ms"),
+            "zero paired_at must not serialize"
+        );
         assert_eq!(serde_json::from_str::<PublishedDevice>(&s).unwrap(), bare);
 
         let paired = dev_paired("d", "n", "AA:BB:CC");
         let sp = serde_json::to_string(&paired).unwrap();
         assert!(sp.contains("AA:BB:CC") && sp.contains("paired_at_ms"));
-        assert_eq!(serde_json::from_str::<PublishedDevice>(&sp).unwrap(), paired);
+        assert_eq!(
+            serde_json::from_str::<PublishedDevice>(&sp).unwrap(),
+            paired
+        );
     }
 
     #[test]
@@ -582,7 +763,11 @@ mod tests {
         publish_phones(root, "pine", &[dev_paired("p1", "Pine", "DD:EE:FF")]).unwrap();
 
         let pairings = collect_pairings(root, "pine");
-        assert_eq!(pairings.len(), 1, "only oak's pinned phone is a trusted pairing");
+        assert_eq!(
+            pairings.len(),
+            1,
+            "only oak's pinned phone is a trusted pairing"
+        );
         let p = &pairings[0];
         assert_eq!(p.device_id, "o1");
         assert_eq!(p.fingerprint, "AA:BB:CC");
@@ -601,5 +786,82 @@ mod tests {
         // synced).
         let tmp = tempfile::tempdir().unwrap();
         assert!(collect_pairings(tmp.path(), "pine").is_empty());
+    }
+
+    // ── KDC-MESH-5: the replicated phone-notification relay ──────────────────
+
+    fn relayed(key: &str, origin: &str, ts: i64) -> RelayedNotification {
+        RelayedNotification {
+            key: key.into(),
+            phone_id: "moto".into(),
+            phone_name: "Moto".into(),
+            app_name: "Signal".into(),
+            summary: "Signal: new message".into(),
+            severity: "info".into(),
+            origin_host: origin.into(),
+            ts_ms: ts,
+        }
+    }
+
+    #[test]
+    fn notify_relay_key_distinguishes_cancel_from_show() {
+        assert_eq!(notify_relay_key("moto", "n1", false), "moto:n1:n");
+        assert_ne!(
+            notify_relay_key("moto", "n1", false),
+            notify_relay_key("moto", "n1", true),
+            "a cancel and a show of the same notification are distinct keys"
+        );
+    }
+
+    #[test]
+    fn append_notify_relay_is_idempotent_per_key_and_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Re-appending the same key refreshes rather than duplicates.
+        append_notify_relay(root, "oak", &relayed("k1", "oak", 10), 4).unwrap();
+        append_notify_relay(root, "oak", &relayed("k1", "oak", 20), 4).unwrap();
+        let raw = std::fs::read_to_string(notify_relay_dir(root).join("oak.json")).unwrap();
+        let list: Vec<RelayedNotification> = serde_json::from_str(&raw).unwrap();
+        assert_eq!(list.len(), 1, "same key is idempotent");
+        assert_eq!(list[0].ts_ms, 20, "the newer stamp wins");
+        // A flood past the cap keeps only the newest `cap` entries.
+        for i in 0..10 {
+            append_notify_relay(root, "oak", &relayed(&format!("f{i}"), "oak", 100 + i), 4)
+                .unwrap();
+        }
+        let raw = std::fs::read_to_string(notify_relay_dir(root).join("oak.json")).unwrap();
+        let list: Vec<RelayedNotification> = serde_json::from_str(&raw).unwrap();
+        assert!(list.len() <= 4, "relay row is bounded to the cap");
+    }
+
+    #[test]
+    fn collect_notify_relay_reads_neighbors_skips_self_and_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A neighbor (oak) relays a fresh + a stale notification.
+        append_notify_relay(root, "oak", &relayed("fresh", "oak", 9_000), 16).unwrap();
+        append_notify_relay(root, "oak", &relayed("stale", "oak", 1_000), 16).unwrap();
+        // Our own row must never be relayed back to us.
+        append_notify_relay(root, "pine", &relayed("mine", "pine", 9_500), 16).unwrap();
+
+        // now=10_000, stale window=5_000 → only oak's fresh entry survives.
+        let got = collect_notify_relay(root, "pine", 10_000, 5_000);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].key, "fresh");
+        assert_eq!(got[0].origin_host, "oak");
+    }
+
+    #[test]
+    fn all_notify_relay_keys_covers_every_row_for_the_startup_prime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        append_notify_relay(root, "oak", &relayed("a", "oak", 1), 8).unwrap();
+        append_notify_relay(root, "pine", &relayed("b", "pine", 2), 8).unwrap();
+        let mut keys = all_notify_relay_keys(root);
+        keys.sort();
+        assert_eq!(keys, vec!["a".to_string(), "b".to_string()]);
+        // Empty dir → no keys (no panic).
+        let empty = tempfile::tempdir().unwrap();
+        assert!(all_notify_relay_keys(empty.path()).is_empty());
     }
 }
