@@ -2833,7 +2833,7 @@ Serialize behind EDITOR-5 (panel.rs/widget.rs contention); EDTB-1 establishes me
 
 - [✓] **EDITOR-LSP-1: LSP client subsystem** — per-language server lifecycle, initialize/shutdown, document sync (glue over `lsp-types`/a tower-lsp client); reachable, honest gated state when no server. *(done: 4a55c75 — lsp.rs, stdio JSON-RPC framing hand-rolled, initialize/shutdown/exit, didOpen/Change/Close, publishDiagnostics→typed Vec<Diagnostic>; honest LspUnavailable when the server binary is absent; fake-sh-server tests (real framing) 13/13; lsp-types 0.97 vendored. UI consumption = EDITOR-LSP-2.)*
 - [✓] **EDITOR-LSP-2: diagnostics + completion + hover** — gutter/inline diagnostics, completion popup, hover docs, signature help.
-- [ ] **EDITOR-LSP-3: goto-definition + find-references + rename + format** — cross-file navigation + workspace edits.
+- [✓] **EDITOR-LSP-3: goto-definition + find-references + rename + format** — cross-file navigation + workspace edits.
 
 #### Phase 3 — mesh-native collaborative editing *(follow-on, the Zed differentiator)*
 - [✓] **EDITOR-COLLAB-1: CRDT buffer** — a conflict-free replicated buffer model (glue over an existing Rust CRDT, e.g. `yrs`/`diamond-types`), local-first, deterministic merge; tested convergence. *(done: 84a8d04 — crdt.rs, yrs 0.23 CollabDoc: insert/remove→binary updates, apply_remote order-tolerant merge, encode_state_vector/diff sync seam, EditSink Buffer-bridge contract; convergence tests (both orders, 3-way, offline-reconnect) 12/12. Bus session = EDITOR-COLLAB-2.)*
