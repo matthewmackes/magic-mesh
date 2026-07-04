@@ -363,6 +363,7 @@ mod tests {
             name: name.to_string(),
             address: None,
             links,
+            detail: crate::workers::unit_aggregator::unit::CloudDetail::default(),
         }
     }
 

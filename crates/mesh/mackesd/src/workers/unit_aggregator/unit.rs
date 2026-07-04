@@ -140,6 +140,75 @@ pub struct MeshFacts {
     pub mde_version: Option<String>,
 }
 
+/// The deep Nova/Neutron/Cinder detail a cloud unit carries beyond identity (E4).
+///
+/// The "detail sheet" fields (EXPLORER-9) folded from the `OpenStack` mirror
+/// objects' bodies (the same mirror `sources` already unions — no new probe, §7).
+///
+/// Every field is optional/empty: today's service-only mirror carries none, so a
+/// cloud unit folds `None` here (honest unknown, §7); a forward-compat mirror that
+/// publishes tenant-object detail populates what it knows, field-by-field. The
+/// counterpart to [`MeshFacts`] for the cloud kinds. `None` on the [`Unit`] for a
+/// non-cloud unit or a bare cloud object with no detail on the mirror.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CloudDetail {
+    /// Nova flavor name (e.g. `m1.small`).
+    pub flavor: Option<String>,
+    /// vCPU count (Nova flavor).
+    pub vcpus: Option<u32>,
+    /// RAM in MiB (Nova flavor).
+    pub ram_mb: Option<u64>,
+    /// Root disk in GiB (Nova flavor).
+    pub disk_gb: Option<u64>,
+    /// Cinder volume size in GiB (the volume's own capacity).
+    pub size_gb: Option<u64>,
+    /// Nova power state (`running`/`shutdown`/…).
+    pub power_state: Option<String>,
+    /// Nova task state while transitioning (`spawning`/`deleting`/…).
+    pub task_state: Option<String>,
+    /// Cinder/Glance/Neutron object status (`available`/`in-use`/`active`/…).
+    pub status: Option<String>,
+    /// All fixed IPs (Nova/Neutron).
+    pub fixed_ips: Vec<String>,
+    /// All floating IPs (Nova/Neutron).
+    pub floating_ips: Vec<String>,
+    /// Neutron port ids attached to this instance.
+    pub ports: Vec<String>,
+    /// Nova keypair name.
+    pub keypair: Option<String>,
+    /// Security-group names (Nova/Neutron).
+    pub security_groups: Vec<String>,
+    /// Creation timestamp as the mirror carries it (ISO-8601 string).
+    pub created: Option<String>,
+    /// Uptime in seconds, when the mirror reports it (a renderer may otherwise
+    /// derive it from `created` — never synthesized here, §7).
+    pub uptime_s: Option<u64>,
+}
+
+impl CloudDetail {
+    /// Whether nothing is known — every field `None`/empty. A bare cloud object
+    /// folds `None` on the [`Unit`] rather than an empty detail block (§7).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.flavor.is_none()
+            && self.vcpus.is_none()
+            && self.ram_mb.is_none()
+            && self.disk_gb.is_none()
+            && self.size_gb.is_none()
+            && self.power_state.is_none()
+            && self.task_state.is_none()
+            && self.status.is_none()
+            && self.fixed_ips.is_empty()
+            && self.floating_ips.is_empty()
+            && self.ports.is_empty()
+            && self.keypair.is_none()
+            && self.security_groups.is_empty()
+            && self.created.is_none()
+            && self.uptime_s.is_none()
+    }
+}
+
 /// The open enrichment block EXPLORER-9 fills (E5).
 ///
 /// Reverse-DNS/mDNS names, offline MAC-OUI vendor, a service/port fingerprint →
@@ -155,7 +224,9 @@ pub struct Extras {
     pub oui_vendor: Option<String>,
     /// Service/port fingerprint → type guess (E5). EXPLORER-9.
     pub fingerprint: Option<String>,
-    /// Mesh cert identity / groups metadata (E5). EXPLORER-9.
+    /// A `Peer`'s mesh identity from the directory row (E5): the pinned Nebula
+    /// role (`lighthouse`/`workstation`). EXPLORER-9. Full Nebula cert *groups*
+    /// aren't on today's mirror ⇒ absent until one carries them (honest §7).
     pub cert_role: Option<String>,
     /// Free-form discovered key/values — the open tail (§7 honest: absent keys
     /// simply aren't present).
@@ -187,6 +258,10 @@ pub struct Unit {
     /// Mesh-mirror facts for a `Peer` (role/leader/version); `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<MeshFacts>,
+    /// Deep E4 detail for a cloud unit (Instance/Volume/…); `None` on a non-cloud
+    /// unit or a bare cloud object with no detail on the mirror (§7). EXPLORER-9.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<CloudDetail>,
     /// First observation, ms since the Unix epoch — preserved across a
     /// vanish→return (E10, lock).
     pub first_seen_ms: u64,
@@ -203,7 +278,7 @@ impl Unit {
     /// unit, so comparing it would defeat publish-on-change; `first_seen_ms` is
     /// stable but excluded for symmetry. Everything that constitutes an
     /// observable *change* (identity, reachability, address, health, telemetry,
-    /// mesh facts, enrichment) is compared.
+    /// mesh facts, cloud detail, enrichment) is compared.
     #[must_use]
     pub fn same_ignoring_time(&self, other: &Self) -> bool {
         self.id == other.id
@@ -214,6 +289,7 @@ impl Unit {
             && self.health == other.health
             && self.telemetry == other.telemetry
             && self.mesh == other.mesh
+            && self.cloud == other.cloud
             && self.extras == other.extras
     }
 }
@@ -285,6 +361,7 @@ mod tests {
             health: Some(Health::Healthy),
             telemetry: None,
             mesh: None,
+            cloud: None,
             first_seen_ms: first,
             last_seen_ms: last,
             extras: Extras::default(),
@@ -365,6 +442,7 @@ mod tests {
                     leader: true,
                     mde_version: Some("12.0.0".into()),
                 }),
+                cloud: None,
                 first_seen_ms: 1,
                 last_seen_ms: 2,
                 extras: Extras::default(),

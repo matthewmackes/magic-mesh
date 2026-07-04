@@ -118,6 +118,7 @@ mod tests {
                 health: None,
                 telemetry: None,
                 mesh: None,
+                cloud: None,
                 first_seen_ms: 1,
                 last_seen_ms: 2,
                 extras: super::super::unit::Extras::default(),

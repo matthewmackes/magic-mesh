@@ -15,6 +15,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use mackes_mesh_types::peers::PeerRecord;
 
+use super::enrich;
 use super::sources::{CloudObjectRecord, LanHostRecord, MeshSnapshot};
 use super::unit::{
     lan_unit_id, peer_unit_id, Extras, Health, MeshFacts, Reachability, Unit, UnitKind,
@@ -58,6 +59,57 @@ impl SeenTracker {
     }
 }
 
+/// The E5 enrichment folded onto a `Peer` from its replicated directory row (no
+/// new probe, §7): the pinned mesh role (`cert_role`), the peer's own reported MAC
+/// → offline OUI vendor, its remote-access listeners → the fingerprint + openable
+/// actions + a coarse type hint, and the media-lighthouse / external-address tags.
+/// Honestly empty where the row is silent (a pre-PD-2 writer with no descriptors).
+fn peer_extras(rec: &PeerRecord) -> Extras {
+    let mut extras = Extras {
+        cert_role: rec.role.clone(),
+        ..Extras::default()
+    };
+    if let Some(d) = &rec.descriptors {
+        // The peer's own-reported remote-access listeners are its service
+        // fingerprint (the mesh-mirror counterpart to the LAN port scan, E5).
+        let mut services: Vec<String> = Vec::new();
+        if d.remote_access.ssh {
+            services.push("ssh".to_string());
+        }
+        if d.remote_access.rdp {
+            services.push("rdp".to_string());
+        }
+        if d.remote_access.vnc {
+            services.push("vnc".to_string());
+        }
+        if !services.is_empty() {
+            extras.fingerprint = Some(services.join(", "));
+            let actions = enrich::openable_actions(&services);
+            if !actions.is_empty() {
+                extras
+                    .extra
+                    .insert("actions".to_string(), actions.join(","));
+            }
+            if let Some(t) = enrich::service_type_hint(&services) {
+                extras.extra.insert("type_guess".to_string(), t.to_string());
+            }
+        }
+        // The peer's own LAN MAC (own-row authority) → offline OUI vendor.
+        if let Some(mac) = d.lan_macs.first() {
+            extras.oui_vendor = enrich::oui_vendor(mac).map(str::to_string);
+        }
+    }
+    if rec.media {
+        extras.extra.insert("media".to_string(), "true".to_string());
+    }
+    if let Some(addr) = &rec.external_addr {
+        extras
+            .extra
+            .insert("external_addr".to_string(), addr.clone());
+    }
+    extras
+}
+
 /// Build a `Peer` unit from a directory row + the current leader hostname.
 fn peer_unit(rec: &PeerRecord, leader: Option<&str>) -> Unit {
     Unit {
@@ -73,9 +125,10 @@ fn peer_unit(rec: &PeerRecord, leader: Option<&str>) -> Unit {
             leader: leader == Some(rec.hostname.as_str()),
             mde_version: rec.mde_version.clone(),
         }),
+        cloud: None,
         first_seen_ms: 0,
         last_seen_ms: 0,
-        extras: Extras::default(),
+        extras: peer_extras(rec),
     }
 }
 
@@ -96,6 +149,7 @@ fn self_unit_synthetic(self_host: &str, leader: Option<&str>) -> Unit {
             leader: leader == Some(self_host),
             mde_version: None,
         }),
+        cloud: None,
         first_seen_ms: 0,
         last_seen_ms: 0,
         extras: Extras::default(),
@@ -106,16 +160,26 @@ fn self_unit_synthetic(self_host: &str, leader: Option<&str>) -> Unit {
 ///
 /// The scan's port fingerprint folds into the open [`Extras`] block (E5): the
 /// service-label list (`extras.fingerprint`), the coarse type guess + raw open
-/// ports (`extras.extra`), and the rDNS/mDNS name (`extras.rdns`). Every field
-/// stays honestly absent when the scan couldn't answer it (§7); the richer OUI /
-/// cert enrichment is EXPLORER-9.
+/// ports (`extras.extra`), and the rDNS/mDNS name (`extras.rdns`). EXPLORER-9 adds
+/// the offline OUI vendor from the MAC key (`extras.oui_vendor`) and the openable
+/// actions the discovered services imply (`extras.extra["actions"]`). Every field
+/// stays honestly absent when nothing answered it (§7).
 fn lan_unit(rec: &LanHostRecord) -> Unit {
     let mut extras = Extras {
         rdns: rec.rdns.clone(),
+        // The stable key is the host's MAC (or an IP fallback); the OUI lookup
+        // vendors a real MAC and honestly ignores an IP key (§7).
+        oui_vendor: enrich::oui_vendor(&rec.key).map(str::to_string),
         ..Extras::default()
     };
     if !rec.services.is_empty() {
         extras.fingerprint = Some(rec.services.join(", "));
+        let actions = enrich::openable_actions(&rec.services);
+        if !actions.is_empty() {
+            extras
+                .extra
+                .insert("actions".to_string(), actions.join(","));
+        }
     }
     if let Some(guess) = &rec.type_guess {
         extras.extra.insert("type_guess".to_string(), guess.clone());
@@ -139,6 +203,7 @@ fn lan_unit(rec: &LanHostRecord) -> Unit {
         health: None,
         telemetry: None,
         mesh: None,
+        cloud: None,
         first_seen_ms: 0,
         last_seen_ms: 0,
         extras,
@@ -146,6 +211,10 @@ fn lan_unit(rec: &LanHostRecord) -> Unit {
 }
 
 /// Build a cloud-object unit, tagged with its host node (lock #20).
+///
+/// The E4 detail sheet (flavor/state/IPs/keypair/secgroups/…) folds from the
+/// mirror object's [`CloudObjectRecord::detail`] onto the unit's `cloud` block —
+/// `None` for a bare object with no detail (today's service-only mirror, §7).
 fn cloud_unit(rec: &CloudObjectRecord) -> Unit {
     Unit {
         id: rec.kind.unit_id(&rec.id),
@@ -158,6 +227,11 @@ fn cloud_unit(rec: &CloudObjectRecord) -> Unit {
         health: None,
         telemetry: None,
         mesh: None,
+        cloud: if rec.detail.is_empty() {
+            None
+        } else {
+            Some(rec.detail.clone())
+        },
         first_seen_ms: 0,
         last_seen_ms: 0,
         extras: Extras::default(),
@@ -261,6 +335,7 @@ mod tests {
             name: name.to_string(),
             address: None,
             links: super::super::sources::CloudLinks::default(),
+            detail: super::super::unit::CloudDetail::default(),
         }
     }
 
@@ -430,6 +505,153 @@ mod tests {
         assert!(bare_unit.extras.rdns.is_none());
         assert!(bare_unit.extras.extra.is_empty());
         assert!(bare_unit.health.is_none());
+    }
+
+    #[test]
+    fn instance_detail_folds_onto_the_cloud_unit_and_bare_objects_stay_none() {
+        // EXPLORER-9 (E4): a cloud instance carrying the deep detail sheet folds it
+        // onto the unit's `cloud` block; a bare object (no detail) stays None (§7).
+        use super::super::unit::CloudDetail;
+        let mut inst = cloud_rec("node-a", "i1", CloudKind::Instance, "web");
+        inst.detail = CloudDetail {
+            flavor: Some("m1.small".into()),
+            vcpus: Some(2),
+            ram_mb: Some(2048),
+            disk_gb: Some(20),
+            power_state: Some("running".into()),
+            status: Some("ACTIVE".into()),
+            fixed_ips: vec!["10.0.0.5".into()],
+            floating_ips: vec!["172.24.4.7".into()],
+            ports: vec!["p1".into()],
+            keypair: Some("mesh-key".into()),
+            security_groups: vec!["default".into()],
+            created: Some("2026-07-04T12:00:00Z".into()),
+            uptime_s: Some(3600),
+            ..CloudDetail::default()
+        };
+        let bare = cloud_rec("node-a", "img1", CloudKind::Image, "cirros");
+        let mesh = MeshSnapshot {
+            self_host: "me".into(),
+            leader: None,
+            peers: vec![],
+        };
+        let mut seen = SeenTracker::new();
+        let units = aggregate(&mesh, &[inst, bare], &[], &mut seen, 1);
+        let web = units
+            .iter()
+            .find(|u| u.kind == UnitKind::Instance)
+            .expect("instance unit");
+        let detail = web.cloud.as_ref().expect("instance carries E4 detail");
+        assert_eq!(detail.flavor.as_deref(), Some("m1.small"));
+        assert_eq!(detail.vcpus, Some(2));
+        assert_eq!(detail.power_state.as_deref(), Some("running"));
+        assert_eq!(detail.floating_ips, vec!["172.24.4.7".to_string()]);
+        assert_eq!(detail.keypair.as_deref(), Some("mesh-key"));
+        assert_eq!(detail.security_groups, vec!["default".to_string()]);
+        // The bare image carries no fabricated detail — honest unknown (§7).
+        let img = units
+            .iter()
+            .find(|u| u.kind == UnitKind::Image)
+            .expect("image unit");
+        assert!(img.cloud.is_none());
+    }
+
+    #[test]
+    fn lan_host_enriches_oui_vendor_and_openable_actions() {
+        // EXPLORER-9 (E5): a MAC-keyed LAN host gets an offline OUI vendor + the
+        // openable actions its fingerprint implies; an IP-keyed host honestly can't
+        // be vendored (§7).
+        let qemu = LanHostRecord {
+            key: "52:54:00:ab:cd:ef".into(), // a QEMU/KVM guest NIC
+            name: "guest.local".into(),
+            address: Some("172.20.0.60".into()),
+            services: vec!["ssh".into(), "vnc".into()],
+            open_ports: vec![22, 5900],
+            type_guess: Some("computer".into()),
+            rdns: Some("guest.local".into()),
+        };
+        let ip_keyed = LanHostRecord {
+            key: "172.20.0.61".into(), // no MAC → not vendorable
+            name: "172.20.0.61".into(),
+            address: Some("172.20.0.61".into()),
+            ..Default::default()
+        };
+        let mesh = MeshSnapshot {
+            self_host: "me".into(),
+            leader: None,
+            peers: vec![],
+        };
+        let mut seen = SeenTracker::new();
+        let units = aggregate(&mesh, &[], &[qemu, ip_keyed], &mut seen, 1);
+        let guest = units
+            .iter()
+            .find(|u| u.id == lan_unit_id("52:54:00:ab:cd:ef"))
+            .expect("qemu lan unit");
+        assert_eq!(guest.extras.oui_vendor.as_deref(), Some("QEMU/KVM"));
+        assert_eq!(
+            guest.extras.extra.get("actions").map(String::as_str),
+            Some("open-ssh,open-vnc")
+        );
+        // The IP-keyed host is honestly un-vendored + carries no actions (§7).
+        let bare = units
+            .iter()
+            .find(|u| u.id == lan_unit_id("172.20.0.61"))
+            .expect("ip-keyed lan unit");
+        assert!(bare.extras.oui_vendor.is_none());
+        assert!(!bare.extras.extra.contains_key("actions"));
+    }
+
+    #[test]
+    fn peer_enriches_role_mac_vendor_and_remote_access_from_the_mirror() {
+        // EXPLORER-9 (E5): a peer's directory row enriches cert_role (pinned role),
+        // its own-reported MAC → OUI vendor, and its remote-access listeners → the
+        // fingerprint + openable actions + a type hint — no new probe (§7).
+        use mackes_mesh_types::peers::{RemoteAccess, ServiceDescriptors};
+        let mut rec = PeerRecord::now("anvil", Some("12.0.0".into()), "healthy");
+        rec.role = Some("workstation".into());
+        rec.media = true;
+        rec.descriptors = Some(ServiceDescriptors {
+            remote_access: RemoteAccess {
+                ssh: true,
+                rdp: true,
+                vnc: false,
+            },
+            lan_macs: vec!["b8:27:eb:00:11:22".into()], // a Raspberry Pi
+            ..Default::default()
+        });
+        let mesh = MeshSnapshot {
+            self_host: "me".into(),
+            leader: None,
+            peers: vec![PeerRecord::now("me", None, "healthy"), rec],
+        };
+        let mut seen = SeenTracker::new();
+        let units = aggregate(&mesh, &[], &[], &mut seen, 1);
+        let anvil = units
+            .iter()
+            .find(|u| u.id == peer_unit_id("anvil"))
+            .expect("peer unit");
+        assert_eq!(anvil.extras.cert_role.as_deref(), Some("workstation"));
+        assert_eq!(anvil.extras.oui_vendor.as_deref(), Some("Raspberry Pi"));
+        assert_eq!(anvil.extras.fingerprint.as_deref(), Some("ssh, rdp"));
+        assert_eq!(
+            anvil.extras.extra.get("actions").map(String::as_str),
+            Some("open-ssh,open-rdp")
+        );
+        // RDP present → the fingerprint types it a desktop computer.
+        assert_eq!(
+            anvil.extras.extra.get("type_guess").map(String::as_str),
+            Some("computer")
+        );
+        assert_eq!(
+            anvil.extras.extra.get("media").map(String::as_str),
+            Some("true")
+        );
+        // Self (no directory descriptors) carries honest-empty enrichment (§7).
+        let me = &units[0];
+        assert_eq!(me.id, peer_unit_id("me"));
+        assert!(me.extras.oui_vendor.is_none());
+        assert!(me.extras.fingerprint.is_none());
+        assert!(me.extras.cert_role.is_none());
     }
 
     #[test]

@@ -31,14 +31,17 @@
 //! - EXPLORER-2 replaces [`sources::NoScan`] with the real mDNS/ARP/ping-sweep
 //!   scan behind [`sources::LanScanSource`], honouring the [`scan_flag`] the
 //!   surface toggles (lock #24). The `LanHost` unit producer already lands here.
-//! - EXPLORER-9 fills [`unit::Extras`] (enrichment) + the instance detail (E4);
-//!   the model already carries the `Option` slots.
+//! - EXPLORER-9 ([`enrich`]) fills [`unit::Extras`] (offline MAC-OUI vendor,
+//!   service→openable-action, fingerprint→type) + the [`unit::CloudDetail`] E4
+//!   instance/volume detail folded from the `OpenStack` mirror objects. Every field
+//!   an unprobed source can't answer stays an explicit `None`/empty (§7).
 //!
 //! [`scan_flag`]: UnitAggregatorWorker::scan_flag
 
 #![cfg(feature = "async-services")]
 
 pub mod edges;
+pub mod enrich;
 pub mod fold;
 pub mod lan_scan;
 pub mod sources;
@@ -356,6 +359,7 @@ mod tests {
             name: "web".into(),
             address: None,
             links: super::sources::CloudLinks::default(),
+            detail: super::unit::CloudDetail::default(),
         }];
         let scan = Arc::new(FakeLanScan::new(vec![LanHostRecord {
             key: "aa:bb".into(),

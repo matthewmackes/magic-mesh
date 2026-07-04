@@ -30,7 +30,7 @@ use serde::Deserialize;
 
 use mackes_mesh_types::peers::PeerRecord;
 
-use super::unit::UnitKind;
+use super::unit::{CloudDetail, UnitKind};
 
 // ─────────────────────────── mesh seam ───────────────────────────
 
@@ -176,6 +176,10 @@ pub struct CloudObjectRecord {
     pub address: Option<String>,
     /// The object's foreign keys, feeding EXPLORER-7's edge derivation (E2/E8).
     pub links: CloudLinks,
+    /// The deep E4 detail (flavor/state/IPs/keypair/secgroups/…), folded onto the
+    /// unit's [`CloudDetail`] block (EXPLORER-9). Empty on today's service-only
+    /// mirror (honest §7); populated by a forward-compat object mirror.
+    pub detail: CloudDetail,
 }
 
 /// The cloud half of the union (source (b), lock #20).
@@ -242,9 +246,53 @@ pub struct CloudObjectWire {
     /// Volume → backing pool/share (EXPLORER-7 edge FK).
     #[serde(default)]
     pub pool: Option<String>,
-    /// Volume size in GiB — the storage edge's consumed-amount detail.
+    /// Volume size in GiB — the storage edge's consumed-amount detail (also the
+    /// [`CloudDetail::size_gb`] of a Volume unit).
     #[serde(default)]
     pub size_gb: Option<u64>,
+    // ── E4 detail (EXPLORER-9) — absent on today's service-only mirror (§7). ──
+    /// Nova flavor name.
+    #[serde(default)]
+    pub flavor: Option<String>,
+    /// vCPU count (Nova flavor).
+    #[serde(default)]
+    pub vcpus: Option<u32>,
+    /// RAM in MiB (Nova flavor).
+    #[serde(default)]
+    pub ram_mb: Option<u64>,
+    /// Root disk in GiB (Nova flavor).
+    #[serde(default)]
+    pub disk_gb: Option<u64>,
+    /// Nova power state (`running`/`shutdown`/…).
+    #[serde(default)]
+    pub power_state: Option<String>,
+    /// Nova task state while transitioning (`spawning`/`deleting`/…).
+    #[serde(default)]
+    pub task_state: Option<String>,
+    /// Cinder/Glance/Neutron object status (`available`/`in-use`/`active`/…).
+    #[serde(default)]
+    pub status: Option<String>,
+    /// All fixed IPs (Nova/Neutron).
+    #[serde(default)]
+    pub fixed_ips: Vec<String>,
+    /// All floating IPs (Nova/Neutron).
+    #[serde(default)]
+    pub floating_ips: Vec<String>,
+    /// Neutron port ids attached to this instance.
+    #[serde(default)]
+    pub ports: Vec<String>,
+    /// Nova keypair name.
+    #[serde(default)]
+    pub keypair: Option<String>,
+    /// Security-group names (Nova/Neutron).
+    #[serde(default)]
+    pub security_groups: Vec<String>,
+    /// Creation timestamp as the mirror carries it (ISO-8601 string).
+    #[serde(default)]
+    pub created: Option<String>,
+    /// Uptime in seconds, when the mirror reports it.
+    #[serde(default)]
+    pub uptime_s: Option<u64>,
 }
 
 /// The `<node>` leaf of a `state/openstack/<node>` topic, or `None` if `topic`
@@ -280,6 +328,23 @@ pub fn records_from_body(topic_node: &str, body: &OpenstackMirrorBody) -> Vec<Cl
                 attached_to: o.attached_to.clone(),
                 pool: o.pool.clone(),
                 size_gb: o.size_gb,
+            },
+            detail: CloudDetail {
+                flavor: o.flavor.clone(),
+                vcpus: o.vcpus,
+                ram_mb: o.ram_mb,
+                disk_gb: o.disk_gb,
+                size_gb: o.size_gb,
+                power_state: o.power_state.clone(),
+                task_state: o.task_state.clone(),
+                status: o.status.clone(),
+                fixed_ips: o.fixed_ips.clone(),
+                floating_ips: o.floating_ips.clone(),
+                ports: o.ports.clone(),
+                keypair: o.keypair.clone(),
+                security_groups: o.security_groups.clone(),
+                created: o.created.clone(),
+                uptime_s: o.uptime_s,
             },
         })
         .collect()
@@ -492,6 +557,52 @@ mod tests {
         assert_eq!(recs[1].links.size_gb, Some(40));
         // A plain object → default-absent links.
         assert_eq!(recs[2].links, CloudLinks::default());
+    }
+
+    #[test]
+    fn instance_object_body_decodes_full_e4_detail() {
+        // A forward-compat mirror carrying the E4 instance detail sheet folds every
+        // field into the record's CloudDetail; a plain object leaves it empty (§7).
+        let body_str = r#"{
+            "host":"node-a",
+            "objects":[
+                {"id":"i1","kind":"instance","name":"web","address":"10.0.0.5",
+                 "flavor":"m1.small","vcpus":2,"ram_mb":2048,"disk_gb":20,
+                 "power_state":"running","task_state":null,"status":"ACTIVE",
+                 "fixed_ips":["10.0.0.5"],"floating_ips":["172.24.4.7"],
+                 "ports":["p1","p2"],"keypair":"mesh-key",
+                 "security_groups":["default","web"],
+                 "created":"2026-07-04T12:00:00Z","uptime_s":3600},
+                {"id":"v1","kind":"volume","name":"data","size_gb":40,"status":"in-use"},
+                {"id":"img1","kind":"image","name":"cirros"}
+            ]
+        }"#;
+        let body: OpenstackMirrorBody = serde_json::from_str(body_str).expect("decode");
+        let recs = records_from_body("node-a", &body);
+        assert_eq!(recs.len(), 3);
+        let inst = &recs[0].detail;
+        assert_eq!(inst.flavor.as_deref(), Some("m1.small"));
+        assert_eq!(inst.vcpus, Some(2));
+        assert_eq!(inst.ram_mb, Some(2048));
+        assert_eq!(inst.disk_gb, Some(20));
+        assert_eq!(inst.power_state.as_deref(), Some("running"));
+        assert_eq!(inst.task_state, None);
+        assert_eq!(inst.status.as_deref(), Some("ACTIVE"));
+        assert_eq!(inst.fixed_ips, vec!["10.0.0.5".to_string()]);
+        assert_eq!(inst.floating_ips, vec!["172.24.4.7".to_string()]);
+        assert_eq!(inst.ports, vec!["p1".to_string(), "p2".to_string()]);
+        assert_eq!(inst.keypair.as_deref(), Some("mesh-key"));
+        assert_eq!(
+            inst.security_groups,
+            vec!["default".to_string(), "web".to_string()]
+        );
+        assert_eq!(inst.created.as_deref(), Some("2026-07-04T12:00:00Z"));
+        assert_eq!(inst.uptime_s, Some(3600));
+        // The volume's own capacity + status ride the detail too.
+        assert_eq!(recs[1].detail.size_gb, Some(40));
+        assert_eq!(recs[1].detail.status.as_deref(), Some("in-use"));
+        // A plain object → empty detail (honest unknown, §7).
+        assert!(recs[2].detail.is_empty());
     }
 
     #[test]
