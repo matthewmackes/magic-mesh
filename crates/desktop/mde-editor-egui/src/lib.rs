@@ -48,6 +48,14 @@
 //!   paints the published diagnostics (`lsp_ui`) as gutter severity markers +
 //!   inline underlines with a hover message. An absent server binary surfaces
 //!   the honest [`LspState::Unavailable`] status, never a faked session (§7).
+//! * EDITOR-COLLAB-1/2 — **mesh co-editing**: the conflict-free replicated
+//!   document ([`crdt`], yrs) and the **share-session** ([`collab_session`]) that
+//!   carries it over the Mackes Bus as a P2P editing session — local edits
+//!   broadcast, remote merges applied, the y-sync state-vector handshake on join,
+//!   remote cursors/presence, and a host/guest permission model. No cloud: every
+//!   frame rides the local Bus spool the broker federates over Nebula. Real
+//!   convergence is proven over a transport seam ([`collab_session::CollabTransport`])
+//!   with an in-process fake bus; the panel wiring + live smoke land in COLLAB-3.
 //!
 //! * EDITOR-6 — **tabs + splittable panes** ([`panes`]): the surface grows from
 //!   one open document into a pane registry (each pane a strip of open-buffer
@@ -63,6 +71,7 @@
 //! inward to [`mde_egui`] (the harness + the shared Carbon `Style`).
 
 pub mod buffer;
+pub mod collab_session;
 pub mod crdt;
 mod finder;
 mod format_bar;
@@ -82,6 +91,10 @@ pub mod widget;
 use mde_egui::{eframe, egui};
 
 pub use buffer::Buffer;
+pub use collab_session::{
+    Access, BusTransport, CollabError, CollabMessage, CollabSession, CollabTransport, CursorPos,
+    FakeBus, FrameKind, PollOutcome, Presence, RemotePeer, Role, SessionId,
+};
 pub use crdt::{CollabDoc, CrdtError, EditSink, TextEdit};
 pub use highlight::{Highlighter, Language};
 pub use lsp::{Diagnostic, LspClient, LspState, Severity};

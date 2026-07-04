@@ -74,6 +74,16 @@ serde_json = { workspace = true }
 yrs = "0.23"
 tree-sitter-bash = "0.23"
 
+# EDITOR-COLLAB-2: the mesh share-session (collab_session.rs) rides the Mackes Bus
+# — the SAME desktop-tier `mde-bus` edge `mde-files-egui`/`mde-term-egui` lean on
+# (never `mackesd`, §6). The session opens a local `Persist` to publish/poll the
+# per-session `collab/session/<id>` topic; the Bus broker federates it to peers
+# over Nebula (P2P, no cloud). `serde` frames the wire verbs and `base64` (already
+# in the workspace lock) keeps the binary CRDT payloads compact JSON text.
+mde-bus = { path = "../../platform/mde-bus" }
+serde = { workspace = true }
+base64 = "0.22"
+
 [dev-dependencies]
 # EDITOR-2 buffer tests write + read real files (the open round-trip and the
 # save-changes-the-on-disk-bytes checks) through a throwaway tempdir — the same

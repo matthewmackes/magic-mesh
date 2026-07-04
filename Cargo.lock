@@ -4130,9 +4130,12 @@ version = "12.0.0"
 name = "mde-editor-egui"
 version = "12.0.0"
 dependencies = [
+ "base64",
  "lsp-types",
+ "mde-bus",
  "mde-egui",
  "ropey",
+ "serde",
  "serde_json",
  "streaming-iterator",
  "tempfile",
