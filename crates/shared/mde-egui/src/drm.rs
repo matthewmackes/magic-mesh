@@ -797,6 +797,11 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
     // flip completes (GBM hands out a small ring of buffers).
     let mut prev: Option<(gbm::BufferObject<()>, drm::control::framebuffer::Handle)> = None;
     let mut quit = false;
+    // Esc is a normal key on a shipped desktop — it must NEVER tear the seat down
+    // (any dialog/field owns it). Quitting the DRM session on Esc is a dev-only
+    // escape hatch, opt-in via `MDE_DRM_ESC_QUIT`; production leaves it unset so the
+    // desktop survives Esc and forwards it to egui like any other key.
+    let esc_quits = std::env::var_os("MDE_DRM_ESC_QUIT").is_some();
     // Modifier state: updated on each KeyDown/KeyUp before feeding egui Key events.
     let mut shift = false;
     let mut ctrl = false;
@@ -942,8 +947,8 @@ pub fn run_drm(app_id: &str, mut ui: impl FnMut(&egui::Context)) -> Result<(), D
                         56 | 100 => alt = pressed,  // LEFTALT | RIGHTALT
                         _ => {}
                     }
-                    if code == 1 && pressed {
-                        quit = true; // ESC exits the DRM shell
+                    if code == 1 && pressed && esc_quits {
+                        quit = true; // ESC exits the DRM shell — dev-only (MDE_DRM_ESC_QUIT)
                     }
                     // E12-19 (lock 8): the XF86 media/system keys + the Super leader
                     // have no egui::Key, so forward the host-relevant scancodes on
