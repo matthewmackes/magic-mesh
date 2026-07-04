@@ -2837,7 +2837,7 @@ Serialize behind EDITOR-5 (panel.rs/widget.rs contention); EDTB-1 establishes me
 
 #### Phase 3 — mesh-native collaborative editing *(follow-on, the Zed differentiator)*
 - [✓] **EDITOR-COLLAB-1: CRDT buffer** — a conflict-free replicated buffer model (glue over an existing Rust CRDT, e.g. `yrs`/`diamond-types`), local-first, deterministic merge; tested convergence. *(done: 84a8d04 — crdt.rs, yrs 0.23 CollabDoc: insert/remove→binary updates, apply_remote order-tolerant merge, encode_state_vector/diff sync seam, EditSink Buffer-bridge contract; convergence tests (both orders, 3-way, offline-reconnect) 12/12. Bus session = EDITOR-COLLAB-2.)*
-- [ ] **EDITOR-COLLAB-2: mesh share-session** — publish/subscribe an editing session over mde-bus/Nebula (P2P, no cloud), scoped to a mesh SessionId; remote cursors/selections + presence; permissions (host/guest RW/RO).
+- [✓] **EDITOR-COLLAB-2: mesh share-session** — publish/subscribe an editing session over mde-bus/Nebula (P2P, no cloud), scoped to a mesh SessionId; remote cursors/selections + presence; permissions (host/guest RW/RO).
 - [ ] **EDITOR-COLLAB-3: follow mode + Mesh-Map presence** — follow a collaborator's viewport; show active co-editing sessions on the Mesh Map (reuse the QBRAND-8 per-node presence).
 
 ---
