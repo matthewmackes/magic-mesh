@@ -579,20 +579,33 @@ impl Shell {
                 // The sandboxed Servo browser (BOOKMARKS-6) — the `mde-web-preview`
                 // helper driven over IPC and displayed by uploading its shm frames
                 // to an egui texture. Scoped under its own `push_id` like every
-                // mounted surface. The panel polls + drives its own tabs; a live
-                // session attaches only via the gated `live-helper` spawn (else the
-                // honest gated EmptyState), so nothing is faked here (§7).
+                // mounted surface. The panel polls + drives its own tabs.
+                //
+                // `live-helper`: on first open, spawn the sandboxed helper as a live
+                // tab, honest-gated to a usable seat (a real seat has been probed) +
+                // an installed helper binary — else a NAMED honest notice, never a
+                // fake page (§7). The default build keeps no live tab and shows the
+                // gated EmptyState.
+                #[cfg(feature = "live-helper")]
+                {
+                    let seat_present = self.system.snapshot().is_some();
+                    self.web.ensure_live_tab(seat_present);
+                }
                 let web = &mut self.web;
                 ui.push_id("shell-web", |ui| {
                     web::web_panel(ui, web);
                 });
-                // Respawn-on-reload: a crashed tab's Reload asked to restart. The
-                // live helper spawn is the client crate's gated `live-helper` path
-                // (honest-gated to a GPU seat), so the shell drains + acknowledges
-                // the request here; a live build swaps in a fresh session. No live
-                // tabs exist in the default build, so this is inert (never a faked
-                // page, §7).
-                let _restart_requested = self.web.take_respawn_request();
+                // Respawn-on-reload: a crashed tab's Reload asked to restart. Under
+                // `live-helper` the shell swaps in a fresh live session; the default
+                // build drains the flag honestly (no live tab exists, so it is inert
+                // — never a faked page, §7).
+                let restart_requested = self.web.take_respawn_request();
+                #[cfg(feature = "live-helper")]
+                if restart_requested {
+                    self.web.respawn_live();
+                }
+                #[cfg(not(feature = "live-helper"))]
+                let _ = restart_requested;
             }
             Surface::Terminal => {
                 // The Terminator-class terminal (TERM-16) over a real local PTY —

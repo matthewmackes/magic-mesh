@@ -30,6 +30,45 @@ use mde_egui::{muted_note, Style};
 
 use mde_web_preview_client::{SessionState, WebSession};
 
+// ── live-helper: spawning the real sandboxed `mde-web-preview` helper ──────────
+//
+// Gated behind `mde-shell-egui`'s `live-helper` feature, which turns on the client
+// crate's `live-helper` spawn API ([`WebSession::spawn`] + [`SpawnSpec`]). OFF by
+// default so the shell stays portable and the Browser surface shows its honest
+// gated EmptyState (§7); ON, the surface spawns the sandboxed helper on first open.
+#[cfg(feature = "live-helper")]
+use mde_web_preview_client::session::SpawnSpec;
+
+/// The sandboxed-helper binary the RPM installs; overridable via [`HELPER_BIN_ENV`]
+/// for the test bed / dev builds.
+#[cfg(feature = "live-helper")]
+const DEFAULT_HELPER_BIN: &str = "/usr/bin/mde-web-preview";
+
+/// The env var overriding [`DEFAULT_HELPER_BIN`] (test bed / dev builds).
+#[cfg(feature = "live-helper")]
+const HELPER_BIN_ENV: &str = "MDE_WEB_PREVIEW_BIN";
+
+/// The first page a freshly spawned live tab loads.
+#[cfg(feature = "live-helper")]
+const START_URL: &str = "about:blank";
+
+/// The initial helper view geometry (device px); the scaled body fills the panel,
+/// and the helper repaints on the address bar's first navigation.
+#[cfg(feature = "live-helper")]
+const INIT_W: u32 = 1280;
+#[cfg(feature = "live-helper")]
+const INIT_H: u32 = 800;
+
+/// Resolve the sandboxed-helper binary path — the [`HELPER_BIN_ENV`] override, else
+/// [`DEFAULT_HELPER_BIN`].
+#[cfg(feature = "live-helper")]
+fn helper_bin_path() -> std::path::PathBuf {
+    std::env::var_os(HELPER_BIN_ENV).map_or_else(
+        || std::path::PathBuf::from(DEFAULT_HELPER_BIN),
+        std::path::PathBuf::from,
+    )
+}
+
 /// The browser body is scaled to fill the surface, so sample it linearly.
 const BROWSER_TEX: TextureOptions = TextureOptions::LINEAR;
 
@@ -57,6 +96,16 @@ pub(crate) struct WebState {
     /// Set when Reload is pressed on a *crashed* active tab — the shell (or a test)
     /// drains it and swaps in a fresh session (respawn-on-reload).
     respawn_requested: bool,
+    /// An honest gated notice shown in place of the `EmptyState` when a `live-helper`
+    /// open couldn't proceed (no seat · helper binary absent · spawn failed). `None`
+    /// = the default gated caption. Only ever set on the live path — a named reason,
+    /// never a fake page (§7).
+    #[cfg(feature = "live-helper")]
+    gate_notice: Option<String>,
+    /// One-shot latch so the real `Command::spawn` is attempted at most once per
+    /// surface lifetime — a spawn *failure* must not respawn a process every frame.
+    #[cfg(feature = "live-helper")]
+    spawn_attempted: bool,
 }
 
 impl WebState {
@@ -69,7 +118,7 @@ impl WebState {
     /// path (gated) and the tests both funnel through here; the default gated build
     /// opens no tabs and shows the honest `EmptyState`, so this is unused there.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "live-helper")),
         allow(
             dead_code,
             reason = "tabs are opened by the gated live-helper spawn (client crate) \
@@ -94,7 +143,7 @@ impl WebState {
     /// Replace the active tab's crashed session with a fresh one (respawn-on-reload),
     /// discarding its stale texture so the new page uploads cleanly.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "live-helper")),
         allow(
             dead_code,
             reason = "the respawn target is created by the gated live-helper path (and tests)"
@@ -104,6 +153,91 @@ impl WebState {
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.session = session;
             tab.texture = None;
+        }
+    }
+}
+
+/// The `live-helper` spawn glue: creating live [`WebSession`]s by launching the
+/// sandboxed `mde-web-preview` helper (the client crate's `live-helper` API) and
+/// attaching them as tabs, behind the honest deployment gates (§7). All of this is
+/// compiled out of the default portable build.
+#[cfg(feature = "live-helper")]
+impl WebState {
+    /// Ensure a live browser tab exists — spawn the sandboxed helper on first open.
+    /// The shell's Browser arm calls this each frame with the live seat verdict. A
+    /// no-op once a tab is open, and the real `Command::spawn` is attempted at most
+    /// once (a failure surfaces an honest notice, never a per-frame spawn-storm).
+    pub(crate) fn ensure_live_tab(&mut self, seat_present: bool) {
+        if !self.tabs.is_empty() || self.spawn_attempted {
+            return;
+        }
+        self.spawn_attempted = true;
+        self.open_with(seat_present, helper_bin_path(), WebSession::spawn);
+    }
+
+    /// Respawn the active crashed tab with a fresh live session (respawn-on-reload),
+    /// drained by the Browser arm when [`Self::take_respawn_request`] fires. Driven
+    /// by an explicit user Reload, so it is not rate-limited by the one-shot latch.
+    pub(crate) fn respawn_live(&mut self) {
+        // A tab was already open, so the seat gate is already proven live.
+        if let Some(session) = self.make_session(true, helper_bin_path(), WebSession::spawn) {
+            self.respawn_active_with(session);
+        }
+    }
+
+    /// Testable core of [`Self::ensure_live_tab`]: attach a session from `spawn` as
+    /// the first tab, applying the honest gates. Production passes
+    /// [`WebSession::spawn`]; the tests inject a `testkit` factory so no real process
+    /// is spawned (hermetic CI).
+    fn open_with(
+        &mut self,
+        seat_present: bool,
+        helper_bin: std::path::PathBuf,
+        spawn: impl FnOnce(&SpawnSpec) -> std::io::Result<WebSession>,
+    ) {
+        if let Some(session) = self.make_session(seat_present, helper_bin, spawn) {
+            self.push_session(session);
+        }
+    }
+
+    /// Build one live session behind the honest gates (a usable seat · the helper
+    /// binary installed · the spawn succeeding), or record a NAMED notice and return
+    /// `None`. Never fakes a page, never panics, never hangs — a spawn failure
+    /// surfaces its reason (§7).
+    fn make_session(
+        &mut self,
+        seat_present: bool,
+        helper_bin: std::path::PathBuf,
+        spawn: impl FnOnce(&SpawnSpec) -> std::io::Result<WebSession>,
+    ) -> Option<WebSession> {
+        if !seat_present {
+            self.gate_notice =
+                Some("The sandboxed browser needs a GPU seat — none is available here.".to_owned());
+            return None;
+        }
+        if !helper_bin.exists() {
+            self.gate_notice = Some(format!(
+                "The sandboxed browser helper is not installed ({}).",
+                helper_bin.display()
+            ));
+            return None;
+        }
+        let spec = SpawnSpec {
+            helper_bin,
+            url: START_URL.to_owned(),
+            width: INIT_W,
+            height: INIT_H,
+        };
+        match spawn(&spec) {
+            Ok(session) => {
+                self.gate_notice = None;
+                Some(session)
+            }
+            Err(e) => {
+                self.gate_notice =
+                    Some(format!("The sandboxed browser helper failed to start: {e}"));
+                None
+            }
         }
     }
 }
@@ -157,7 +291,16 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
                 muted_note(ui, "Loading the page\u{2026}");
             });
         }
-        None => empty_body(ui),
+        None => {
+            // The honest gated body — a `live-helper` build shows the NAMED gate
+            // notice (no seat · helper absent · spawn failed) when one is set; the
+            // default build always shows the standard gated caption (§7).
+            #[cfg(feature = "live-helper")]
+            let notice = state.gate_notice.as_deref();
+            #[cfg(not(feature = "live-helper"))]
+            let notice: Option<&str> = None;
+            empty_body(ui, notice);
+        }
     }
 }
 
@@ -496,8 +639,9 @@ fn crashed_body(ui: &mut egui::Ui, reason: String, respawn_requested: &mut bool)
     });
 }
 
-/// The no-session `EmptyState` — an honest gated caption, never a placeholder page.
-fn empty_body(ui: &mut egui::Ui) {
+/// The no-session `EmptyState` — an honest gated caption (or the NAMED live-path
+/// notice when one is passed), never a placeholder page.
+fn empty_body(ui: &mut egui::Ui, notice: Option<&str>) {
     centered(ui, |ui| {
         ui.label(
             RichText::new("Sandboxed browser")
@@ -507,8 +651,10 @@ fn empty_body(ui: &mut egui::Ui) {
         ui.add_space(Style::SP_S);
         muted_note(
             ui,
-            "The sandboxed Servo browser renders here in the shell. A live session \
-             attaches on a GPU seat (BOOKMARKS-5/6 live path is gated).",
+            notice.unwrap_or(
+                "The sandboxed Servo browser renders here in the shell. A live session \
+                 attaches on a GPU seat (BOOKMARKS-5/6 live path is gated).",
+            ),
         );
     });
 }
@@ -732,5 +878,116 @@ mod tests {
             run_panel(&mut state),
             "the page-actions chrome produced no draw"
         );
+    }
+
+    // ── live-helper: the real spawn/attach/pump glue ────────────────────────────
+    //
+    // Exercised through the SAME `open_with` seam the shell's Browser arm drives,
+    // but with a `testkit` factory injected in place of the real `Command::spawn`,
+    // so the spawn→attach→pump path runs hermetically — no Servo, no real process.
+
+    #[cfg(feature = "live-helper")]
+    #[test]
+    fn live_open_spawns_attaches_and_pumps_a_frame() {
+        use std::cell::RefCell;
+        // Hold the fake helpers so the attached session stays live through the pump.
+        let helpers: RefCell<Vec<testkit::FakeHelper>> = RefCell::new(Vec::new());
+        let mut state = WebState::default();
+        // A real, existing path passes the "helper installed" gate; the injected
+        // factory returns a testkit session instead of exec'ing Servo.
+        let bin = std::env::current_exe().expect("test exe path");
+        state.open_with(true, bin, |_spec| {
+            let (session, helper) = testkit::connect()?;
+            helpers.borrow_mut().push(helper);
+            Ok(session)
+        });
+        assert_eq!(
+            state.tabs.len(),
+            1,
+            "the live open attached exactly one tab"
+        );
+        assert!(
+            state.gate_notice.is_none(),
+            "a successful open clears the gate notice"
+        );
+        assert!(
+            run_until_texture(&mut state),
+            "the live tab pumped no frame into the texture path"
+        );
+        assert!(state.tabs[0].texture.is_some());
+    }
+
+    #[cfg(feature = "live-helper")]
+    #[test]
+    fn live_open_with_no_seat_stays_the_honest_empty_state() {
+        use std::cell::Cell;
+        let spawned = Cell::new(false);
+        let mut state = WebState::default();
+        let bin = std::env::current_exe().expect("test exe path");
+        state.open_with(false, bin, |_spec| {
+            spawned.set(true);
+            Err(std::io::Error::other(
+                "factory must not be called without a seat",
+            ))
+        });
+        assert!(!spawned.get(), "no seat must not spawn a helper");
+        assert!(state.tabs.is_empty(), "no tab attaches without a seat");
+        assert!(
+            state.gate_notice.is_some(),
+            "the no-seat gate is named honestly"
+        );
+        // The panel draws the honest gated EmptyState, never a fake page.
+        assert!(run_panel(&mut state));
+    }
+
+    #[cfg(feature = "live-helper")]
+    #[test]
+    fn live_open_with_an_absent_helper_stays_the_honest_empty_state() {
+        use std::cell::Cell;
+        let spawned = Cell::new(false);
+        let mut state = WebState::default();
+        let missing = std::path::PathBuf::from("/nonexistent/mde-web-preview-xyz");
+        state.open_with(true, missing, |_spec| {
+            spawned.set(true);
+            Err(std::io::Error::other(
+                "factory must not run with an absent helper",
+            ))
+        });
+        assert!(!spawned.get(), "an absent helper binary must not spawn");
+        assert!(state.tabs.is_empty());
+        let notice = state.gate_notice.as_deref().unwrap_or_default();
+        assert!(
+            notice.contains("not installed"),
+            "the absent-helper gate names it honestly: {notice}"
+        );
+        assert!(run_panel(&mut state));
+    }
+
+    #[cfg(feature = "live-helper")]
+    #[test]
+    fn a_spawn_failure_surfaces_an_honest_reason_not_a_hang() {
+        let mut state = WebState::default();
+        let bin = std::env::current_exe().expect("test exe path");
+        state.open_with(true, bin, |_spec| {
+            Err(std::io::Error::other("exec denied by sandbox"))
+        });
+        assert!(state.tabs.is_empty(), "a failed spawn attaches no tab");
+        let notice = state.gate_notice.as_deref().unwrap_or_default();
+        assert!(
+            notice.contains("failed to start") && notice.contains("exec denied"),
+            "a spawn failure surfaces its reason: {notice}"
+        );
+        assert!(run_panel(&mut state), "the honest failure notice draws");
+    }
+
+    #[cfg(feature = "live-helper")]
+    #[test]
+    fn helper_bin_path_defaults_and_honors_the_env_override() {
+        use std::path::PathBuf;
+        std::env::remove_var(HELPER_BIN_ENV);
+        assert_eq!(helper_bin_path(), PathBuf::from(DEFAULT_HELPER_BIN));
+        std::env::set_var(HELPER_BIN_ENV, "/opt/mde/mde-web-preview");
+        assert_eq!(helper_bin_path(), PathBuf::from("/opt/mde/mde-web-preview"));
+        std::env::remove_var(HELPER_BIN_ENV);
     }
 }

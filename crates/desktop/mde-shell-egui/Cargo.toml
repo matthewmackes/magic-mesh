@@ -21,6 +21,14 @@ path = "src/main.rs"
 # DRM master is present.
 drm = ["mde-egui/drm"]
 
+# BOOKMARKS-6 live path — turn on the client crate's `live-helper` spawn API so the
+# Browser surface really `Command::spawn`s the sandboxed `mde-web-preview` helper on
+# first open (honest-gated to a usable seat + an installed helper binary). OFF by
+# default so the default build stays portable and the surface shows its honest gated
+# EmptyState; ON, the surface renders a live sandboxed Servo page (§7). Mirrors the
+# client crate's own `live-helper` gate, exactly as the VDI crates gate live-connect.
+live-helper = ["mde-web-preview-client/live-helper"]
+
 [dependencies]
 # The §4/§5 harness is the shell's primary inward dependency (§6 layered tiers):
 # it provides run_client (the eframe Wayland-client runner), the shared Style, the
