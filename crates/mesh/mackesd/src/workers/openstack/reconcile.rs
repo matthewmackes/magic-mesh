@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::workers::container::{Container, ContainerState};
 
 use super::catalog::ServiceKind;
+use super::config_render::{render_service_config, RenderCtx};
 use super::fleet::{desired_services, FleetStateSource};
 use super::images::{check_archive, ArchiveStatus};
 use super::podman::{config_rendered, KollaServiceSpec, PodmanRunner};
@@ -424,16 +425,16 @@ fn converge_start(
     runner: &dyn PodmanRunner,
     config_root: &Path,
     share_root: &Path,
-    release: &str,
+    ctx: &RenderCtx,
     kind: ServiceKind,
     out: &mut CycleNotes,
 ) {
-    let spec = KollaServiceSpec::for_service(kind, release, config_root);
+    let spec = KollaServiceSpec::for_service(kind, &ctx.release, config_root);
     match runner.image_present(&spec.image) {
         Ok(true) => {}
         // Absent locally → the airgap lane (never a pull, Q18).
         Ok(false) => {
-            if !load_from_archive(runner, share_root, release, kind, &spec.image, out) {
+            if !load_from_archive(runner, share_root, &ctx.release, kind, &spec.image, out) {
                 return; // gated/failed — the note is already written
             }
         }
@@ -442,24 +443,27 @@ fn converge_start(
             return;
         }
     }
-    if config_rendered(config_root, kind) {
-        match runner.run_service(&spec) {
-            Ok(()) => out.acted = true,
-            Err(e) => out.fail(kind, "start", &e.to_string()),
+    // QC-4 — render this service's Kolla config from the one-state doctrine
+    // (atomic, idempotent). Success materializes `config.json` (the Kolla
+    // COPY_ALWAYS entrypoint), so the container has a config to start from; a
+    // render failure gates the service with the typed reason — never a
+    // half-written config, never a doomed launch on an empty config dir (§7).
+    match render_service_config(config_root, kind, ctx) {
+        Ok(()) => {
+            debug_assert!(config_rendered(config_root, kind));
+            match runner.run_service(&spec) {
+                Ok(()) => out.acted = true,
+                Err(e) => out.fail(kind, "start", &e.to_string()),
+            }
         }
-    } else {
-        out.notes.insert(
-            kind,
-            ServiceStatus::Gated {
-                reason: format!(
-                    "kolla config not rendered at {} — the one-state → Kolla \
-                     config renderer lands with QC-4 (foundation services)",
-                    super::podman::kolla_config_dir(config_root, kind)
-                        .join("config.json")
-                        .display()
-                ),
-            },
-        );
+        Err(e) => {
+            out.notes.insert(
+                kind,
+                ServiceStatus::Gated {
+                    reason: format!("kolla config render gated the start — {e}"),
+                },
+            );
+        }
     }
 }
 
@@ -469,12 +473,12 @@ fn apply_plan(
     runner: &dyn PodmanRunner,
     config_root: &Path,
     share_root: &Path,
-    release: &str,
+    ctx: &RenderCtx,
     plan: ConvergePlan,
     out: &mut CycleNotes,
 ) {
     for kind in plan.start {
-        converge_start(runner, config_root, share_root, release, kind, out);
+        converge_start(runner, config_root, share_root, ctx, kind, out);
     }
     for kind in plan.restart {
         match runner.start_existing(kind.container_name()) {
@@ -560,24 +564,31 @@ pub fn converge_cycle(
     share_root: &Path,
     host: &str,
 ) -> CycleOutcome {
-    // 1 — doctrine.
+    // 1 — doctrine. `ctx` carries the render inputs (release + leader + this
+    // node's mesh name) the QC-4 config renderer folds into each service's
+    // Kolla config; for a Disabled/Gated tick the desired set is empty so it's
+    // never consulted.
     let doctrine_read = fleet.read();
-    let (doctrine, desired, release) = match &doctrine_read {
+    let (doctrine, desired, ctx) = match &doctrine_read {
         Ok(view) if view.enabled => (
             DoctrineStatus::Enabled {
                 leader: view.leader,
                 kolla_release: view.kolla_release.clone(),
             },
             desired_services(view),
-            view.kolla_release.clone(),
+            RenderCtx {
+                release: view.kolla_release.clone(),
+                leader: view.leader,
+                host: host.to_string(),
+            },
         ),
-        Ok(_) => (DoctrineStatus::Disabled, BTreeSet::new(), String::new()),
+        Ok(_) => (DoctrineStatus::Disabled, BTreeSet::new(), RenderCtx::empty(host)),
         Err(e) => (
             DoctrineStatus::Gated {
                 reason: e.to_string(),
             },
             BTreeSet::new(),
-            String::new(),
+            RenderCtx::empty(host),
         ),
     };
     let doctrine_known = doctrine_read.is_ok();
@@ -599,7 +610,7 @@ pub fn converge_cycle(
             runner,
             config_root,
             share_root,
-            &release,
+            &ctx,
             plan_converge(&desired, &observed),
             &mut out,
         );
@@ -1060,12 +1071,34 @@ mod tests {
     }
 
     #[test]
-    fn unrendered_config_gates_the_start_with_the_qc4_reason() {
+    fn config_renders_on_start_so_the_gate_flips_and_the_service_runs() {
+        // QC-4 — the renderer is wired: an image-present service has its Kolla
+        // config rendered in the start path (the gate flips true) and starts,
+        // with real config.json on disk.
         let fleet = FakeFleet::fixed(enabled_view(false));
         let runner = FakeRunner::new();
         runner.seed_image(&ServiceKind::Keystone.image_ref("2024.1"));
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
+        converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        assert!(runner.calls().iter().any(|c| c == "run:keystone"));
+        assert!(
+            super::super::podman::config_rendered(dir.path(), ServiceKind::Keystone),
+            "the renderer materialized the Kolla config.json"
+        );
+    }
+
+    #[test]
+    fn render_failure_gates_the_start_with_a_sharp_reason() {
+        // §7 — a config-render failure (a file blocking the service's config
+        // dir) gates the service with the typed reason, launches nothing, and
+        // leaves no partial config.
+        let fleet = FakeFleet::fixed(enabled_view(false));
+        let runner = FakeRunner::new();
+        runner.seed_image(&ServiceKind::Keystone.image_ref("2024.1"));
+        let dir = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keystone"), b"blocker").unwrap();
         let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
         let keystone = out
             .state
@@ -1076,9 +1109,13 @@ mod tests {
         let ServiceStatus::Gated { reason } = &keystone.status else {
             unreachable!("wrong status: {:?}", keystone.status);
         };
-        assert!(reason.contains("QC-4"), "{reason}");
+        assert!(reason.contains("render"), "{reason}");
         assert!(reason.contains("keystone"), "{reason}");
-        assert!(runner.calls().iter().all(|c| !c.starts_with("run:")));
+        assert!(runner.calls().iter().all(|c| c != "run:keystone"));
+        assert!(!super::super::podman::config_rendered(
+            dir.path(),
+            ServiceKind::Keystone
+        ));
     }
 
     #[test]

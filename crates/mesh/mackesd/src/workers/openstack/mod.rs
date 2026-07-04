@@ -12,9 +12,9 @@
 //!
 //! - **Two injectable seams**, both headless-testable with fakes:
 //!   [`fleet::FleetStateSource`] (WHICH services — the one-state doctrine
-//!   read; the live etcd/Syncthing leg is typed
-//!   [`fleet::FleetStateError::IntegrationGated`] until QC-4 authors the
-//!   record) and [`podman::PodmanRunner`] (HOW they run — production shells
+//!   read; QC-4 wired the live leg: the TOML companion on the Syncthing share
+//!   plus the leader bit off the `/mesh/leader` lease) and
+//!   [`podman::PodmanRunner`] (HOW they run — production shells
 //!   `podman` through the bounded proc path; a podman-less host answers a
 //!   typed [`podman::RunnerError::PodmanAbsent`]).
 //! - **A pure reconcile core** ([`reconcile::plan_converge`] +
@@ -34,19 +34,23 @@
 //!
 //! - [`catalog`] — the service vocabulary: QC-6 binds the API entries to
 //!   the Nebula interface, wave-2 services (Q25) land as new variants.
-//! - [`fleet`] — QC-4 wires the live doctrine read (the `/mesh/cloud/` etcd
-//!   record + TOML companion) and richer placement (`RabbitMQ` cluster
-//!   topology); QC-10's capacity-derived quotas read the same doctrine.
+//! - [`fleet`] — QC-4 wired the live doctrine read (landed): the TOML
+//!   companion on the Syncthing share + the leader bit off the `/mesh/leader`
+//!   lease; QC-10's capacity-derived quotas read the same doctrine.
+//! - [`config_render`] — QC-4's one-state → Kolla config renderer (landed):
+//!   materializes each desired service's `/etc/kolla/<svc>/config.json` (+ the
+//!   service config it points to) from the doctrine, atomically.
 //! - [`images`] — QC-3's airgap archive lane (landed): the decided
 //!   `<share>/kolla/<release>/` layout + `SHA256SUMS` verification; QC-9's
 //!   DIB pipeline reuses the same share conventions for tenant images.
-//! - [`podman`] — QC-4 grows per-service health probes.
-//! - [`reconcile`] — QC-4 extends the mirror with API health; QC-11's typed
+//! - [`podman`] — QC-5 grows per-service health probes.
+//! - [`reconcile`] — QC-5 extends the mirror with API health; QC-11's typed
 //!   verbs consume the same state model.
 
 #![cfg(feature = "async-services")]
 
 pub mod catalog;
+pub mod config_render;
 pub mod fleet;
 pub mod images;
 pub mod podman;
@@ -102,8 +106,8 @@ fn publish_json<T: serde::Serialize>(topic: &str, body: &T) {
 pub struct OpenstackWorker {
     /// This node's id — the mirror topic namespace + `host` stamp.
     host: String,
-    /// The doctrine seam (production: [`MeshFleetState`], integration-gated
-    /// until QC-4).
+    /// The doctrine seam (production: [`MeshFleetState`] — QC-4's live read
+    /// off the Syncthing share + `/mesh/leader` lease).
     fleet: Arc<dyn FleetStateSource + Send + Sync>,
     /// The podman seam (production: [`PodmanCli`]). `Arc` so each cycle runs
     /// on a `spawn_blocking` thread without borrowing `self`.
@@ -122,8 +126,9 @@ pub struct OpenstackWorker {
 }
 
 impl OpenstackWorker {
-    /// Construct with production defaults: the gated [`MeshFleetState`]
-    /// doctrine seam over `workgroup_root`, the live [`PodmanCli`] runner,
+    /// Construct with production defaults: the live [`MeshFleetState`]
+    /// doctrine seam over `host` + `workgroup_root`, the live [`PodmanCli`]
+    /// runner,
     /// the `/etc/kolla` config root, `workgroup_root` doubling as the QC-3
     /// archive share (it IS the Syncthing-replicated `/mnt/mesh-storage`),
     /// and the default cadences. `host` is this node's id (the mirror
@@ -131,8 +136,8 @@ impl OpenstackWorker {
     #[must_use]
     pub fn new(host: String, workgroup_root: PathBuf) -> Self {
         Self {
+            fleet: Arc::new(MeshFleetState::new(host.clone(), workgroup_root.clone())),
             host,
-            fleet: Arc::new(MeshFleetState::new(workgroup_root.clone())),
             runner: Arc::new(PodmanCli::new()),
             config_root: PathBuf::from(DEFAULT_KOLLA_CONFIG_ROOT),
             share_root: workgroup_root,
