@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::workers::container::{Container, ContainerState};
 
 use super::catalog::ServiceKind;
-use super::config_render::{render_service_config, RenderCtx};
+use super::config_render::{render_service_config, OverlayBind, RenderCtx};
 use super::fleet::{desired_services, FleetStateSource};
 use super::images::{check_archive, ArchiveStatus};
 use super::podman::{config_rendered, KollaServiceSpec, PodmanRunner};
@@ -557,21 +557,28 @@ fn runtime_unavailable_outcome(
 ///   start gates naming the exact archive path it awaits; never a registry
 ///   pull (Q18);
 /// - an unrendered config gates that service's start with a named reason
-///   instead of launching a doomed container.
+///   instead of launching a doomed container;
+/// - a service whose overlay bind address is unresolved (this node isn't on the
+///   mesh yet — the `overlay` seam answered [`OverlayBind::Unresolved`]) gates
+///   rather than bind a control-plane API to 0.0.0.0/localhost (QC-6, Q23).
 pub fn converge_cycle(
     fleet: &dyn FleetStateSource,
     runner: &dyn PodmanRunner,
     config_root: &Path,
     share_root: &Path,
     host: &str,
+    overlay: &OverlayBind,
 ) -> CycleOutcome {
     // 1 — doctrine. `ctx` carries the render inputs (release + leader + this
-    // node's mesh name + the QC-5 sealed secrets) the config renderer folds into
-    // each service's Kolla config; for a Disabled/Gated tick the desired set is
-    // empty so it's never consulted. The sealed secrets are resolved off the
-    // same workgroup root (`share_root`) the doctrine + archives ride: the
-    // leader mints them once, every other node reads them, and a not-yet-sealed
-    // set gates each start honestly (§7 — never a blank credential).
+    // node's resolved Nebula overlay bind + the QC-5 sealed secrets) the config
+    // renderer folds into each service's Kolla config; for a Disabled/Gated tick
+    // the desired set is empty so it's never consulted. The sealed secrets are
+    // resolved off the same workgroup root (`share_root`) the doctrine + archives
+    // ride: the leader mints them once, every other node reads them, and a
+    // not-yet-sealed set gates each start honestly (§7 — never a blank
+    // credential). The `overlay` bind is resolved by the caller (the worker,
+    // off the canonical publish file) so this stays seam-pure; an unresolved
+    // overlay gates each start (QC-6, never a 0.0.0.0 fallback).
     let doctrine_read = fleet.read();
     let (doctrine, desired, ctx) = match &doctrine_read {
         Ok(view) if view.enabled => (
@@ -583,21 +590,21 @@ pub fn converge_cycle(
             RenderCtx {
                 release: view.kolla_release.clone(),
                 leader: view.leader,
-                host: host.to_string(),
+                overlay: overlay.clone(),
                 secrets: load_or_seal(share_root, view.leader),
             },
         ),
         Ok(_) => (
             DoctrineStatus::Disabled,
             BTreeSet::new(),
-            RenderCtx::empty(host),
+            RenderCtx::empty(),
         ),
         Err(e) => (
             DoctrineStatus::Gated {
                 reason: e.to_string(),
             },
             BTreeSet::new(),
-            RenderCtx::empty(host),
+            RenderCtx::empty(),
         ),
     };
     let doctrine_known = doctrine_read.is_ok();
@@ -674,6 +681,12 @@ mod tests {
             leader,
             kolla_release: "2024.1".into(),
         }
+    }
+
+    /// A resolved overlay bind (this node is "on the mesh") — the render binds
+    /// every API to this IP (QC-6). The default the converge tests pass.
+    fn overlay() -> OverlayBind {
+        OverlayBind::Resolved("10.42.0.9".into())
     }
 
     /// Seal a complete QC-5 secret set on the fake share so the start path
@@ -799,7 +812,14 @@ mod tests {
         runner.seed_container("keystone", ContainerState::Running);
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         // No mutations against an unknown desired state.
         assert!(runner.calls().iter().all(|c| c.starts_with("list")));
         assert!(!out.acted);
@@ -819,7 +839,14 @@ mod tests {
         let runner = FakeRunner::absent();
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         assert!(!out.acted);
         let RuntimeStatus::Unavailable { reason } = &out.state.runtime else {
             unreachable!("wrong runtime: {:?}", out.state.runtime);
@@ -847,7 +874,14 @@ mod tests {
         let runner = FakeRunner::new(); // no images seeded
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         assert!(!out.acted, "no start may run without the image");
         assert!(runner
             .calls()
@@ -898,7 +932,14 @@ mod tests {
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join("config.json"), "{}").unwrap();
         }
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         assert!(out.acted);
         assert!(out.alerts.is_empty(), "{:?}", out.alerts);
         let calls = runner.calls();
@@ -929,7 +970,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
         seed_mismatched_archive(share.path(), ServiceKind::Keystone);
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         // The trust boundary: an unverified archive NEVER reaches the image
         // store, and nothing was mutated.
         assert!(
@@ -971,7 +1019,7 @@ mod tests {
         // A share path that does not exist — /mnt/mesh-storage before the
         // first Syncthing provision.
         let missing = share.path().join("not-mounted");
-        let out = converge_cycle(&fleet, &runner, dir.path(), &missing, "node-a");
+        let out = converge_cycle(&fleet, &runner, dir.path(), &missing, "node-a", &overlay());
         assert!(!out.acted);
         assert!(runner.calls().iter().all(|c| !c.starts_with("load:")));
         assert!(
@@ -1011,7 +1059,14 @@ mod tests {
             b"bytes",
         )
         .unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         assert!(runner.calls().iter().all(|c| !c.starts_with("load:")));
         let keystone = out
             .state
@@ -1034,7 +1089,14 @@ mod tests {
         let share = tempfile::tempdir().unwrap();
         let path = seed_verified_archive(share.path(), ServiceKind::Keystone);
         runner.fail_next_load(&path, "blob: no space left on device");
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         let keystone = out
             .state
             .services
@@ -1067,7 +1129,14 @@ mod tests {
         // "succeeds" yet the wanted image ref stays absent (an archive
         // mirrored for the wrong release) — never a silent success.
         let path = seed_verified_archive(share.path(), ServiceKind::Keystone);
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         let calls = runner.calls();
         assert!(
             calls
@@ -1105,7 +1174,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
         seed_secrets(share.path());
-        converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         assert!(runner.calls().iter().any(|c| c == "run:keystone"));
         assert!(
             super::super::podman::config_rendered(dir.path(), ServiceKind::Keystone),
@@ -1125,7 +1201,14 @@ mod tests {
         let share = tempfile::tempdir().unwrap();
         seed_secrets(share.path());
         std::fs::write(dir.path().join("keystone"), b"blocker").unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         let keystone = out
             .state
             .services
@@ -1157,7 +1240,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
         // NB: no seed_secrets — the leader's file has not reached this node.
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         assert!(
             runner.calls().iter().all(|c| c != "run:keystone"),
             "no launch"
@@ -1197,7 +1287,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
         // No seed_secrets — the leader itself seals the file this tick.
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         assert!(
             runner.calls().iter().any(|c| c == "run:keystone"),
             "the leader starts"
@@ -1236,7 +1333,14 @@ mod tests {
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join("config.json"), "{}").unwrap();
         }
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         assert!(out.acted);
         assert!(out.alerts.is_empty(), "{:?}", out.alerts);
         assert!(runner.calls().iter().any(|c| c == "run:keystone"));
@@ -1265,7 +1369,14 @@ mod tests {
         runner.seed_container("mariadb", ContainerState::Running);
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         assert!(out.acted);
         let calls = runner.calls();
         assert!(calls.iter().any(|c| c == "start:nova_api"), "{calls:?}");
@@ -1294,7 +1405,14 @@ mod tests {
         let d = dir.path().join("keystone");
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("config.json"), "{}").unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         let keystone = out
             .state
             .services
@@ -1316,6 +1434,55 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_overlay_gates_every_start_honestly() {
+        // QC-6 §7 — this node isn't on the mesh yet (the overlay seam answered
+        // Unresolved). Images + secrets are present so the flow reaches the
+        // render, where the overlay gate fires: every service is Gated with the
+        // "overlay address unresolved" reason, nothing launches, and no
+        // 0.0.0.0-bound config lands (never a public-underlay bind).
+        let fleet = FakeFleet::fixed(enabled_view(false));
+        let runner = FakeRunner::new();
+        for kind in desired_services(&enabled_view(false)) {
+            runner.seed_image(&kind.image_ref("2024.1"));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        seed_secrets(share.path());
+        let unresolved = OverlayBind::Unresolved(
+            "overlay address unresolved — node not on the mesh".to_string(),
+        );
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &unresolved,
+        );
+        assert!(!out.acted, "nothing may launch off an unresolved overlay");
+        assert!(
+            runner.calls().iter().all(|c| !c.starts_with("run:")),
+            "{:?}",
+            runner.calls()
+        );
+        assert!(
+            out.state
+                .services
+                .iter()
+                .all(|r| matches!(&r.status, ServiceStatus::Gated { reason }
+                    if reason.contains("overlay address unresolved"))),
+            "{:?}",
+            out.state.services
+        );
+        // No config.json was ever written (the gate precedes any file write).
+        for kind in desired_services(&enabled_view(false)) {
+            assert!(!config_rendered(dir.path(), kind), "{kind:?}");
+        }
+        // An honest gate, not an [!]-grade failure.
+        assert!(out.alerts.is_empty(), "{:?}", out.alerts);
+    }
+
+    #[test]
     fn disabled_doctrine_stops_the_managed_world() {
         let fleet = FakeFleet::fixed(CloudDesired {
             enabled: false,
@@ -1327,7 +1494,14 @@ mod tests {
         runner.seed_container("mcnf-navidrome", ContainerState::Running); // unmanaged
         let dir = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
-        let out = converge_cycle(&fleet, &runner, dir.path(), share.path(), "node-a");
+        let out = converge_cycle(
+            &fleet,
+            &runner,
+            dir.path(),
+            share.path(),
+            "node-a",
+            &overlay(),
+        );
         assert!(out.acted);
         assert_eq!(out.state.doctrine, DoctrineStatus::Disabled);
         let calls = runner.calls();

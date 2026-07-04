@@ -9,8 +9,12 @@
 //! this module materializes the Kolla config from it — parameterized by the
 //! pinned release, the leader bit (Q15 — the DB is leader-hosted, so the
 //! leader's services reach it locally while every other node reaches it over
-//! mesh-DNS), and the node's mesh name (Q22/23 — APIs bind plaintext to the
-//! overlay only; the mesh name resolves to the Nebula address).
+//! mesh-DNS), and — QC-6 — the node's **resolved Nebula overlay address**
+//! (Q22/23 — every API binds plaintext to the overlay IP only; the overlay IS
+//! the transport security). A node not on the mesh yet has no overlay IP to
+//! bind to, so the render gates the service ([`RenderError::OverlayUnresolved`])
+//! rather than fall back to `0.0.0.0`/localhost — a control-plane API is never
+//! exposed on the public underlay (§7).
 //!
 //! Honesty (§7):
 //! - the render is **atomic** — every file lands via a tmp-write + rename, and
@@ -53,6 +57,25 @@ const MEMCACHE_PORT: u16 = 11211;
 /// Keystone public API port.
 const KEYSTONE_PORT: u16 = 5000;
 
+/// This node's Nebula overlay bind (design Q22/23) — the resolved overlay IP
+/// every `OpenStack` API binds plaintext to (the overlay IS the transport
+/// security), or the honest reason it couldn't be resolved.
+///
+/// A socket binds to an address, not a name: QC-6 resolves this node's live
+/// overlay IP from the canonical publish file `nebula_supervisor` writes (the
+/// same source `sshd_overlay_bind`/`cups_sync`/`boot_readiness` bind to) and
+/// threads it here. When the node isn't on the mesh yet, the render **gates**
+/// every service with the reason — never a `0.0.0.0`/`127.0.0.1` fallback that
+/// would expose a control-plane API on the public underlay (§7 / Q23).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverlayBind {
+    /// The resolved Nebula overlay IPv4 the APIs bind + advertise on.
+    Resolved(String),
+    /// The overlay address couldn't be resolved — the sharp reason (the node
+    /// isn't enrolled / no overlay IP published yet). Gates the render.
+    Unresolved(String),
+}
+
 /// The node-local render inputs folded from the doctrine (design Q30).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderCtx {
@@ -61,9 +84,10 @@ pub struct RenderCtx {
     /// This node holds the etcd leader lease → it hosts `MariaDB` (Q15) and its
     /// own services reach the DB locally; a non-leader reaches it via mesh-DNS.
     pub leader: bool,
-    /// This node's mesh name — the API bind host (Q22/23) and the local cache /
-    /// DB target on the leader.
-    pub host: String,
+    /// This node's Nebula overlay bind (QC-6, Q22/23) — the resolved overlay IP
+    /// every API binds/advertises on + the leader's local DB/cache target, or
+    /// the honest unresolved reason that gates the render.
+    pub overlay: OverlayBind,
     /// The QC-5 sealed per-service secrets this tick ([`SecretView`]). `Sealed`
     /// → the renderer substitutes real passwords; `Unsealed` → the render gates
     /// the service (never a blank credential, §7).
@@ -72,13 +96,18 @@ pub struct RenderCtx {
 
 impl RenderCtx {
     /// A context with no live doctrine (a `Disabled`/`Gated` tick converges no
-    /// starts, so the release + secrets are unused — only `host` is meaningful).
+    /// starts, so nothing is rendered — the overlay + secrets are both left
+    /// unresolved).
     #[must_use]
-    pub fn empty(host: &str) -> Self {
+    pub fn empty() -> Self {
         Self {
             release: String::new(),
             leader: false,
-            host: host.to_string(),
+            overlay: OverlayBind::Unresolved(
+                "no cloud doctrine active — the overlay bind is not resolved for a \
+                 Disabled/Gated tick"
+                    .to_string(),
+            ),
             secrets: SecretView::Unsealed(
                 "no cloud doctrine active — secrets are not resolved for a \
                  Disabled/Gated tick"
@@ -118,6 +147,15 @@ pub enum RenderError {
     #[error("kolla config: secrets not sealed — {reason}")]
     SecretsUnsealed {
         /// Why the sealed set isn't usable this tick.
+        reason: String,
+    },
+    /// This node's Nebula overlay address couldn't be resolved (it isn't on the
+    /// mesh yet) — QC-6 refuses to bind a control-plane API to `0.0.0.0`/
+    /// localhost and gates the service instead (§7 / design Q23). The reason
+    /// already reads as an "overlay address unresolved …" sentence.
+    #[error("kolla config: {reason}")]
+    OverlayUnresolved {
+        /// Why the overlay bind address isn't resolvable this tick.
         reason: String,
     },
 }
@@ -185,6 +223,21 @@ pub fn render_service_config(
     kind: ServiceKind,
     ctx: &RenderCtx,
 ) -> Result<(), RenderError> {
+    // QC-6 — the overlay bind gate (checked first: a node off the mesh can't
+    // serve at all). Every API binds plaintext to this node's Nebula overlay
+    // address (Q22/23; the overlay IS the transport security). An unresolved
+    // overlay gates the service with the sharp reason rather than fall back to
+    // 0.0.0.0/localhost, which would expose a control-plane API on the public
+    // underlay (§7).
+    let overlay = match &ctx.overlay {
+        OverlayBind::Resolved(ip) => ip.as_str(),
+        OverlayBind::Unresolved(reason) => {
+            return Err(RenderError::OverlayUnresolved {
+                reason: reason.clone(),
+            })
+        }
+    };
+
     // QC-5 — the sealed secrets gate. An unsealed set (a non-leader before the
     // leader's file synced, or a malformed/unreadable companion) gates the
     // service with its sharp reason; a complete Sealed set is required before we
@@ -208,7 +261,7 @@ pub fn render_service_config(
 
     let dir = kolla_config_dir(config_root, kind);
     let service = kind.container_name();
-    let plan = service_plan(kind, ctx, secrets);
+    let plan = service_plan(kind, overlay, ctx, secrets);
 
     // Provenance header — stamps the pinned Kolla release (Q69) the doctrine
     // rendered this config from, so a config on disk names its own release.
@@ -272,15 +325,19 @@ fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
 
 // ─────────────────────────── per-service configs ───────────────────────────
 
-/// The DB connection URL for `svc`: the leader reaches its own local `MariaDB`,
-/// every other node reaches it over mesh-DNS (Q15/Q46). Carries the sealed
-/// per-service DB password (QC-5).
-fn db_url(svc: &str, ctx: &RenderCtx, secrets: &Secrets) -> String {
-    let host = if ctx.leader {
-        ctx.host.as_str()
-    } else {
-        DB_MESH_NAME
-    };
+/// The mesh-DNS service-catalog endpoint URL an API `kind` advertises (QC-6,
+/// Q22/23) — plaintext HTTP over the overlay to the service's Nebula-DNS name.
+/// Only the API kinds carry one; the renderer only asks for API kinds, so the
+/// empty fallback is unreachable.
+fn mesh_endpoint(kind: ServiceKind) -> String {
+    kind.endpoint_url().unwrap_or_default()
+}
+
+/// The DB connection URL for `svc`: the leader reaches its own local `MariaDB`
+/// on its overlay IP, every other node reaches it over mesh-DNS (Q15/Q46).
+/// Carries the sealed per-service DB password (QC-5).
+fn db_url(svc: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> String {
+    let host = if ctx.leader { overlay } else { DB_MESH_NAME };
     let pw = secrets.db_password(svc);
     format!("mysql+pymysql://{svc}:{pw}@{host}/{svc}")
 }
@@ -293,9 +350,11 @@ fn transport_url(secrets: &Secrets) -> String {
 }
 
 /// The `[keystone_authtoken]` block every keystone-authenticated API shares
-/// (Q21 — the mesh account is the cloud account). Carries the sealed service-
-/// user password (QC-5).
-fn authtoken(svc: &str, ctx: &RenderCtx, secrets: &Secrets) -> String {
+/// (Q21 — the mesh account is the cloud account). The Keystone endpoint it
+/// authenticates against is a mesh-DNS URL (reached over the overlay); the
+/// per-node memcache it caches tokens in is this node's overlay IP. Carries the
+/// sealed service-user password (QC-5).
+fn authtoken(svc: &str, overlay: &str, secrets: &Secrets) -> String {
     format!(
         "[keystone_authtoken]\n\
          www_authenticate_uri = http://{KEYSTONE_MESH_NAME}:{KEYSTONE_PORT}\n\
@@ -307,20 +366,24 @@ fn authtoken(svc: &str, ctx: &RenderCtx, secrets: &Secrets) -> String {
          project_name = service\n\
          username = {svc}\n\
          password = {pw}\n",
-        host = ctx.host,
+        host = overlay,
         pw = secrets.service_user_password(svc),
     )
 }
 
-/// One `[DEFAULT]` binding an API to the overlay (Q22/23) + wiring RPC.
-fn api_default(ctx: &RenderCtx, secrets: &Secrets) -> String {
+/// One `[DEFAULT]` binding the Nova API listener to the overlay (QC-6, Q22/23)
+/// and wiring RPC. The listen host is the resolved overlay IP and the port is
+/// the catalogued Nova API port, so the compute API answers on the mesh only.
+fn api_default(overlay: &str, secrets: &Secrets) -> String {
     format!(
         "[DEFAULT]\n\
          debug = False\n\
          my_ip = {host}\n\
          osapi_compute_listen = {host}\n\
+         osapi_compute_listen_port = {port}\n\
          transport_url = {rpc}\n",
-        host = ctx.host,
+        host = overlay,
+        port = ServiceKind::NovaApi.api_port().unwrap_or_default(),
         rpc = transport_url(secrets),
     )
 }
@@ -329,7 +392,12 @@ fn api_default(ctx: &RenderCtx, secrets: &Secrets) -> String {
 /// MVP service set). Real but minimal — enough for the container to come up on
 /// the pinned release; QC-5 layers identity/bootstrap on top.
 #[allow(clippy::too_many_lines)] // one arm per service reads best kept together
-fn service_plan(kind: ServiceKind, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
+fn service_plan(
+    kind: ServiceKind,
+    overlay: &str,
+    ctx: &RenderCtx,
+    secrets: &Secrets,
+) -> ServicePlan {
     let one = |command: &str,
                name: &'static str,
                dest: &'static str,
@@ -354,13 +422,12 @@ fn service_plan(kind: ServiceKind, ctx: &RenderCtx, secrets: &Secrets) -> Servic
             "mysql:mysql",
             format!(
                 "[mysqld]\n\
-                 bind_address = {host}\n\
+                 bind_address = {overlay}\n\
                  wsrep_on = OFF\n\
                  default_storage_engine = InnoDB\n\
                  max_connections = 4096\n\
                  [client]\n\
-                 default_character_set = utf8\n",
-                host = ctx.host,
+                 default_character_set = utf8\n"
             ),
         ),
         ServiceKind::Rabbitmq => one(
@@ -373,13 +440,13 @@ fn service_plan(kind: ServiceKind, ctx: &RenderCtx, secrets: &Secrets) -> Servic
                  loopback_users = none\n\
                  default_user = openstack\n\
                  default_pass = {pw}\n",
-                host = ctx.host,
+                host = overlay,
                 pw = secrets.rabbitmq_password(),
             ),
         ),
-        // memcached is command-only (no config file).
+        // memcached is command-only (no config file) — bound to the overlay IP.
         ServiceKind::Memcached => ServicePlan {
-            command: format!("/usr/bin/memcached -vv -l {host}", host = ctx.host),
+            command: format!("/usr/bin/memcached -vv -l {overlay}"),
             files: Vec::new(),
         },
         // ── Identity + core APIs (Q21/24), on every node (Q22) ──
@@ -390,12 +457,14 @@ fn service_plan(kind: ServiceKind, ctx: &RenderCtx, secrets: &Secrets) -> Servic
             "keystone:keystone",
             format!(
                 "[DEFAULT]\ndebug = False\n\
+                 public_endpoint = {endpoint}\nadmin_endpoint = {endpoint}\n\
                  [database]\nconnection = {db}\n\
                  [cache]\nbackend = oslo_cache.memcache_pool\nenabled = True\n\
                  memcache_servers = {host}:{MEMCACHE_PORT}\n\
                  [token]\nprovider = fernet\n",
-                db = db_url("keystone", ctx, secrets),
-                host = ctx.host,
+                endpoint = mesh_endpoint(ServiceKind::Keystone),
+                db = db_url("keystone", overlay, ctx, secrets),
+                host = overlay,
             ),
         ),
         ServiceKind::GlanceApi => one(
@@ -404,13 +473,16 @@ fn service_plan(kind: ServiceKind, ctx: &RenderCtx, secrets: &Secrets) -> Servic
             "/etc/glance/glance-api.conf",
             "glance:glance",
             format!(
-                "[DEFAULT]\ndebug = False\nbind_host = {host}\n\
+                "[DEFAULT]\ndebug = False\nbind_host = {host}\nbind_port = {port}\n\
+                 public_endpoint = {endpoint}\n\
                  [database]\nconnection = {db}\n{authtoken}\
                  [glance_store]\nstores = file\ndefault_store = file\n\
                  filesystem_store_datadir = /var/lib/glance/images/\n",
-                host = ctx.host,
-                db = db_url("glance", ctx, secrets),
-                authtoken = authtoken("glance", ctx, secrets),
+                host = overlay,
+                port = ServiceKind::GlanceApi.api_port().unwrap_or_default(),
+                endpoint = mesh_endpoint(ServiceKind::GlanceApi),
+                db = db_url("glance", overlay, ctx, secrets),
+                authtoken = authtoken("glance", overlay, secrets),
             ),
         ),
         ServiceKind::PlacementApi => one(
@@ -421,14 +493,14 @@ fn service_plan(kind: ServiceKind, ctx: &RenderCtx, secrets: &Secrets) -> Servic
             format!(
                 "[DEFAULT]\ndebug = False\n\
                  [placement_database]\nconnection = {db}\n{authtoken}",
-                db = db_url("placement", ctx, secrets),
-                authtoken = authtoken("placement", ctx, secrets),
+                db = db_url("placement", overlay, ctx, secrets),
+                authtoken = authtoken("placement", overlay, secrets),
             ),
         ),
-        ServiceKind::NovaApi => nova("nova-api", ctx, secrets),
-        ServiceKind::NovaScheduler => nova("nova-scheduler", ctx, secrets),
-        ServiceKind::NovaConductor => nova("nova-conductor", ctx, secrets),
-        ServiceKind::NovaCompute => nova("nova-compute", ctx, secrets),
+        ServiceKind::NovaApi => nova("nova-api", overlay, ctx, secrets),
+        ServiceKind::NovaScheduler => nova("nova-scheduler", overlay, ctx, secrets),
+        ServiceKind::NovaConductor => nova("nova-conductor", overlay, ctx, secrets),
+        ServiceKind::NovaCompute => nova("nova-compute", overlay, ctx, secrets),
         ServiceKind::NeutronServer => ServicePlan {
             command: "neutron-server --config-file /etc/neutron/neutron.conf \
                       --config-file /etc/neutron/plugins/ml2/ml2_conf.ini"
@@ -439,14 +511,15 @@ fn service_plan(kind: ServiceKind, ctx: &RenderCtx, secrets: &Secrets) -> Servic
                     dest: "/etc/neutron/neutron.conf",
                     owner: "neutron:neutron",
                     body: format!(
-                        "[DEFAULT]\ndebug = False\nbind_host = {host}\n\
+                        "[DEFAULT]\ndebug = False\nbind_host = {host}\nbind_port = {port}\n\
                          core_plugin = ml2\nservice_plugins = router\n\
                          transport_url = {rpc}\n\
                          [database]\nconnection = {db}\n{authtoken}",
-                        host = ctx.host,
+                        host = overlay,
+                        port = ServiceKind::NeutronServer.api_port().unwrap_or_default(),
                         rpc = transport_url(secrets),
-                        db = db_url("neutron", ctx, secrets),
-                        authtoken = authtoken("neutron", ctx, secrets),
+                        db = db_url("neutron", overlay, ctx, secrets),
+                        authtoken = authtoken("neutron", overlay, secrets),
                     ),
                 },
                 ConfFile {
@@ -462,15 +535,18 @@ fn service_plan(kind: ServiceKind, ctx: &RenderCtx, secrets: &Secrets) -> Servic
                 },
             ],
         },
-        ServiceKind::CinderApi => cinder("cinder-api", ctx, secrets),
-        ServiceKind::CinderScheduler => cinder("cinder-scheduler", ctx, secrets),
-        ServiceKind::CinderVolume => cinder("cinder-volume", ctx, secrets),
+        ServiceKind::CinderApi => cinder("cinder-api", overlay, ctx, secrets),
+        ServiceKind::CinderScheduler => cinder("cinder-scheduler", overlay, ctx, secrets),
+        ServiceKind::CinderVolume => cinder("cinder-volume", overlay, ctx, secrets),
     }
 }
 
 /// The shared Nova plan (all four nova services read one `nova.conf`; only the
-/// command differs — Q31 Nova+Placement own VM lifecycle).
-fn nova(command: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
+/// command differs — Q31 Nova+Placement own VM lifecycle). The API listener
+/// binds to the overlay ([`api_default`]); the cross-service references
+/// (Glance images, Placement, Keystone) are mesh-DNS endpoints reached over the
+/// overlay (QC-6, Q22).
+fn nova(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
     ServicePlan {
         command: command.to_string(),
         files: vec![ConfFile {
@@ -481,15 +557,17 @@ fn nova(command: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
                 "{default}\
                  [api_database]\nconnection = {api_db}\n\
                  [database]\nconnection = {db}\n{authtoken}\
+                 [glance]\napi_servers = {glance_ep}\n\
                  [placement]\nauth_type = password\nauth_url = http://{ks}:{ksp}\n\
                  username = placement\npassword = {placement_pw}\n\
                  user_domain_name = Default\nproject_domain_name = Default\n\
                  project_name = service\n\
                  [libvirt]\nvirt_type = kvm\n",
-                default = api_default(ctx, secrets),
-                api_db = db_url("nova_api", ctx, secrets),
-                db = db_url("nova", ctx, secrets),
-                authtoken = authtoken("nova", ctx, secrets),
+                default = api_default(overlay, secrets),
+                api_db = db_url("nova_api", overlay, ctx, secrets),
+                db = db_url("nova", overlay, ctx, secrets),
+                authtoken = authtoken("nova", overlay, secrets),
+                glance_ep = mesh_endpoint(ServiceKind::GlanceApi),
                 placement_pw = secrets.service_user_password("placement"),
                 ks = KEYSTONE_MESH_NAME,
                 ksp = KEYSTONE_PORT,
@@ -498,8 +576,9 @@ fn nova(command: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
     }
 }
 
-/// The shared Cinder plan (LVM per node — Q51/59).
-fn cinder(command: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
+/// The shared Cinder plan (LVM per node — Q51/59). The volume API listener
+/// binds to the overlay (QC-6, Q22/23).
+fn cinder(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
     ServicePlan {
         command: command.to_string(),
         files: vec![ConfFile {
@@ -508,14 +587,16 @@ fn cinder(command: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
             owner: "cinder:cinder",
             body: format!(
                 "[DEFAULT]\ndebug = False\nmy_ip = {host}\n\
+                 osapi_volume_listen = {host}\nosapi_volume_listen_port = {port}\n\
                  transport_url = {rpc}\nenabled_backends = lvm\n\
                  [database]\nconnection = {db}\n{authtoken}\
                  [lvm]\nvolume_driver = cinder.volume.drivers.lvm.LVMVolumeDriver\n\
                  volume_group = cinder-volumes\ntarget_protocol = iscsi\n",
-                host = ctx.host,
+                host = overlay,
+                port = ServiceKind::CinderApi.api_port().unwrap_or_default(),
                 rpc = transport_url(secrets),
-                db = db_url("cinder", ctx, secrets),
-                authtoken = authtoken("cinder", ctx, secrets),
+                db = db_url("cinder", overlay, ctx, secrets),
+                authtoken = authtoken("cinder", overlay, secrets),
             ),
         }],
     }
@@ -526,11 +607,14 @@ mod tests {
     use super::*;
     use crate::workers::openstack::podman::config_rendered;
 
+    /// A fixture overlay IP the render binds to (QC-6) — a node "on the mesh".
+    const OVERLAY: &str = "10.42.0.9";
+
     fn ctx(leader: bool) -> RenderCtx {
         RenderCtx {
             release: "2024.1".into(),
             leader,
-            host: "node-a".into(),
+            overlay: OverlayBind::Resolved(OVERLAY.into()),
             secrets: SecretView::Sealed(Secrets::generate()),
         }
     }
@@ -541,7 +625,7 @@ mod tests {
         RenderCtx {
             release: "2024.1".into(),
             leader,
-            host: "node-a".into(),
+            overlay: OverlayBind::Resolved(OVERLAY.into()),
             secrets: SecretView::Sealed(secrets),
         }
     }
@@ -575,21 +659,22 @@ mod tests {
     #[test]
     fn render_is_parameterized_by_the_doctrine() {
         let dir = tempfile::tempdir().unwrap();
-        // Non-leader: the DB target is the mesh-DNS name.
+        // Non-leader: the API binds to the resolved overlay IP; the DB target
+        // is the mesh-DNS name.
         render_service_config(dir.path(), ServiceKind::GlanceApi, &ctx(false)).unwrap();
         let body =
             std::fs::read_to_string(dir.path().join("glance_api").join("glance-api.conf")).unwrap();
-        assert!(body.contains("bind_host = node-a"), "{body}");
+        assert!(body.contains(&format!("bind_host = {OVERLAY}")), "{body}");
         assert!(body.contains("@mariadb.mesh/glance"), "{body}");
         // The pinned release is stamped in (release-parameterized render).
         assert!(body.contains("kolla release 2024.1"), "{body}");
 
-        // Leader: its own services reach the local MariaDB directly (Q15).
+        // Leader: its own services reach the local MariaDB on the overlay IP (Q15).
         let dir2 = tempfile::tempdir().unwrap();
         render_service_config(dir2.path(), ServiceKind::GlanceApi, &ctx(true)).unwrap();
         let body2 = std::fs::read_to_string(dir2.path().join("glance_api").join("glance-api.conf"))
             .unwrap();
-        assert!(body2.contains("@node-a/glance"), "{body2}");
+        assert!(body2.contains(&format!("@{OVERLAY}/glance")), "{body2}");
     }
 
     #[test]
@@ -726,7 +811,8 @@ mod tests {
         let context = RenderCtx {
             release: "2024.1".into(),
             leader: false,
-            host: "node-a".into(),
+            // Overlay resolved so the render reaches (and gates on) the secrets.
+            overlay: OverlayBind::Resolved(OVERLAY.into()),
             secrets: SecretView::Unsealed("awaiting sealed secrets from leader".to_string()),
         };
         let err = render_service_config(dir.path(), ServiceKind::Keystone, &context)
@@ -756,5 +842,113 @@ mod tests {
         };
         assert!(reason.contains("db_nova"), "{reason}");
         assert!(!config_rendered(dir.path(), ServiceKind::NovaApi));
+    }
+
+    // ── QC-6: the Nebula-overlay bind + mesh endpoint URLs ──
+
+    #[test]
+    fn every_bind_directive_is_the_resolved_overlay_never_zero_or_localhost() {
+        // §7 — each service that controls its own listener binds to the
+        // resolved overlay IP; never 0.0.0.0/localhost (which would expose a
+        // control-plane API on the public underlay, design Q23).
+        let dir = tempfile::tempdir().unwrap();
+        let cases: &[(ServiceKind, &str, &str)] = &[
+            (ServiceKind::Mariadb, "galera.cnf", "bind_address"),
+            (
+                ServiceKind::Rabbitmq,
+                "rabbitmq.conf",
+                "listeners.tcp.default",
+            ),
+            (ServiceKind::GlanceApi, "glance-api.conf", "bind_host"),
+            (ServiceKind::NovaApi, "nova.conf", "osapi_compute_listen"),
+            (ServiceKind::NeutronServer, "neutron.conf", "bind_host"),
+            (ServiceKind::CinderApi, "cinder.conf", "osapi_volume_listen"),
+        ];
+        for (kind, file, directive) in cases {
+            render_service_config(dir.path(), *kind, &ctx(false)).unwrap();
+            let body = read_conf(dir.path(), *kind, file);
+            // The bind directive names the overlay IP.
+            assert!(
+                body.contains(&format!("{directive} = {OVERLAY}")),
+                "{kind:?} {directive} must bind the overlay: {body}"
+            );
+            // And nothing binds to a wildcard/loopback address.
+            assert!(!body.contains("0.0.0.0"), "{kind:?} binds 0.0.0.0: {body}");
+            assert!(
+                !body.contains("127.0.0.1"),
+                "{kind:?} binds loopback: {body}"
+            );
+        }
+        // memcached is command-only — its listener flag is the overlay too.
+        render_service_config(dir.path(), ServiceKind::Memcached, &ctx(false)).unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("memcached").join("config.json")).unwrap(),
+        )
+        .unwrap();
+        let cmd = cfg["command"].as_str().unwrap();
+        assert!(cmd.contains(&format!("-l {OVERLAY}")), "{cmd}");
+        assert!(!cmd.contains("0.0.0.0"), "{cmd}");
+    }
+
+    #[test]
+    fn api_endpoint_urls_advertise_the_mesh_address() {
+        // The service-catalog endpoint URLs carry the Nebula-DNS mesh address
+        // (Q22), so tenants reach every API over the overlay.
+        let dir = tempfile::tempdir().unwrap();
+        render_service_config(dir.path(), ServiceKind::Keystone, &ctx(false)).unwrap();
+        let keystone = read_conf(dir.path(), ServiceKind::Keystone, "keystone.conf");
+        assert!(
+            keystone.contains("public_endpoint = http://keystone.mesh:5000"),
+            "{keystone}"
+        );
+        assert!(
+            keystone.contains("admin_endpoint = http://keystone.mesh:5000"),
+            "{keystone}"
+        );
+
+        render_service_config(dir.path(), ServiceKind::GlanceApi, &ctx(false)).unwrap();
+        let glance = read_conf(dir.path(), ServiceKind::GlanceApi, "glance-api.conf");
+        assert!(
+            glance.contains("public_endpoint = http://glance.mesh:9292"),
+            "{glance}"
+        );
+
+        // Nova reaches Glance's image API over the mesh endpoint too.
+        render_service_config(dir.path(), ServiceKind::NovaApi, &ctx(false)).unwrap();
+        let nova = read_conf(dir.path(), ServiceKind::NovaApi, "nova.conf");
+        assert!(
+            nova.contains("api_servers = http://glance.mesh:9292"),
+            "{nova}"
+        );
+        // Keystone auth is a mesh endpoint on every authenticated API.
+        assert!(
+            nova.contains("auth_url = http://keystone.mesh:5000"),
+            "{nova}"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_overlay_gates_the_render() {
+        // §7 / Q23 — a node not on the mesh has no overlay IP; the render gates
+        // the service with the sharp reason rather than bind 0.0.0.0. Sealed
+        // secrets prove the overlay gate fires FIRST (independent of secrets).
+        let dir = tempfile::tempdir().unwrap();
+        let context = RenderCtx {
+            release: "2024.1".into(),
+            leader: false,
+            overlay: OverlayBind::Unresolved(
+                "overlay address unresolved — node not on the mesh".to_string(),
+            ),
+            secrets: SecretView::Sealed(Secrets::generate()),
+        };
+        let err = render_service_config(dir.path(), ServiceKind::Keystone, &context)
+            .expect_err("an unresolved overlay must gate the render");
+        let RenderError::OverlayUnresolved { reason } = &err else {
+            unreachable!("wrong variant: {err:?}");
+        };
+        assert!(reason.contains("overlay address unresolved"), "{reason}");
+        assert!(reason.contains("not on the mesh"), "{reason}");
+        // Nothing was written — no 0.0.0.0-bound config left behind.
+        assert!(!config_rendered(dir.path(), ServiceKind::Keystone));
     }
 }

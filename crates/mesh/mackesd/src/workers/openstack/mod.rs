@@ -63,13 +63,15 @@ pub mod secrets;
 #[cfg(test)]
 pub(crate) mod testkit;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::nebula_supervisor::DEFAULT_OVERLAY_IP_PATH;
 use super::{ShutdownToken, Worker};
 
+use config_render::OverlayBind;
 use fleet::{FleetStateSource, MeshFleetState};
 use podman::{PodmanCli, PodmanRunner, DEFAULT_KOLLA_CONFIG_ROOT};
 use reconcile::{converge_cycle, CycleOutcome, OpenStackState};
@@ -107,6 +109,26 @@ fn publish_json<T: serde::Serialize>(topic: &str, body: &T) {
     crate::proc_reap::fire_and_reap(cmd, crate::proc_reap::DEFAULT_REAP_TIMEOUT);
 }
 
+/// Resolve this node's Nebula overlay bind address (QC-6, Q22/23) from the
+/// canonical publish file `nebula_supervisor` writes on every signed-bundle
+/// refresh (`DEFAULT_OVERLAY_IP_PATH`) — the same source of truth
+/// `sshd_overlay_bind`/`cups_sync`/`boot_readiness` bind their listeners to.
+///
+/// A missing or empty file means the node isn't on the mesh yet (pre-enrollment
+/// / fresh dev box): an honest [`OverlayBind::Unresolved`] that gates every
+/// service's render, never a `0.0.0.0`/localhost fallback that would put a
+/// control-plane API on the public underlay (§7).
+fn resolve_overlay(path: &Path) -> OverlayBind {
+    match std::fs::read_to_string(path) {
+        Ok(s) if !s.trim().is_empty() => OverlayBind::Resolved(s.trim().to_string()),
+        _ => OverlayBind::Unresolved(format!(
+            "overlay address unresolved — node not on the mesh (no overlay IP published at \
+             {} yet; enroll the node so nebula_supervisor writes it)",
+            path.display()
+        )),
+    }
+}
+
 /// The QC-2 `openstack` worker.
 pub struct OpenstackWorker {
     /// This node's id — the mirror topic namespace + `host` stamp.
@@ -124,6 +146,10 @@ pub struct OpenstackWorker {
     /// (production: the same replicated workgroup root the doctrine seam
     /// rides — `/mnt/mesh-storage`; tests point it at a tempdir).
     share_root: PathBuf,
+    /// The canonical overlay-IP publish file QC-6 resolves the API bind address
+    /// from (production: [`DEFAULT_OVERLAY_IP_PATH`]; tests point it at a temp
+    /// file or leave it absent to exercise the honest unresolved gate).
+    overlay_ip_path: PathBuf,
     /// Converge cadence.
     poll: Duration,
     /// Mirror republish heartbeat.
@@ -146,6 +172,7 @@ impl OpenstackWorker {
             runner: Arc::new(PodmanCli::new()),
             config_root: PathBuf::from(DEFAULT_KOLLA_CONFIG_ROOT),
             share_root: workgroup_root,
+            overlay_ip_path: PathBuf::from(DEFAULT_OVERLAY_IP_PATH),
             poll: DEFAULT_POLL_INTERVAL,
             heartbeat: PUBLISH_HEARTBEAT,
         }
@@ -179,6 +206,14 @@ impl OpenstackWorker {
         self
     }
 
+    /// Override the overlay-IP publish file QC-6 resolves the bind address from
+    /// (tests).
+    #[must_use]
+    pub fn with_overlay_ip_path(mut self, path: PathBuf) -> Self {
+        self.overlay_ip_path = path;
+        self
+    }
+
     /// Override the converge cadence (tests, to avoid multi-second waits).
     #[must_use]
     pub const fn with_poll(mut self, poll: Duration) -> Self {
@@ -199,8 +234,19 @@ impl OpenstackWorker {
         let config_root = self.config_root.clone();
         let share_root = self.share_root.clone();
         let host = self.host.clone();
+        // QC-6 — resolve this node's overlay bind each tick (it may come up
+        // after the worker starts, once the node enrolls); an unresolved overlay
+        // gates every start honestly in the converge.
+        let overlay = resolve_overlay(&self.overlay_ip_path);
         let outcome: CycleOutcome = match tokio::task::spawn_blocking(move || {
-            converge_cycle(&*fleet, &*runner, &config_root, &share_root, &host)
+            converge_cycle(
+                &*fleet,
+                &*runner,
+                &config_root,
+                &share_root,
+                &host,
+                &overlay,
+            )
         })
         .await
         {
@@ -268,6 +314,44 @@ mod tests {
     fn worker_name_matches_module_and_census() {
         let w = OpenstackWorker::new("node".to_string(), PathBuf::from("/tmp"));
         assert_eq!(w.name(), "openstack");
+    }
+
+    #[test]
+    fn resolve_overlay_reads_the_publish_file_and_trims() {
+        // QC-6 — a published overlay IP resolves to a bind address.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay-ip");
+        std::fs::write(&path, "10.42.0.9\n").unwrap();
+        assert_eq!(
+            resolve_overlay(&path),
+            OverlayBind::Resolved("10.42.0.9".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_overlay_gates_when_absent_or_empty() {
+        // §7 — a node not on the mesh (no file, or a blank one mid-provision)
+        // resolves to the honest unresolved gate, never a fabricated bind.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        let OverlayBind::Unresolved(reason) = resolve_overlay(&missing) else {
+            unreachable!("absent file must be unresolved");
+        };
+        assert!(reason.contains("overlay address unresolved"), "{reason}");
+        assert!(reason.contains("not on the mesh"), "{reason}");
+
+        let blank = dir.path().join("overlay-ip");
+        std::fs::write(&blank, "   \n").unwrap();
+        assert!(matches!(
+            resolve_overlay(&blank),
+            OverlayBind::Unresolved(_)
+        ));
+    }
+
+    #[test]
+    fn overlay_ip_path_defaults_to_the_canonical_publish_file() {
+        let w = OpenstackWorker::new("node".to_string(), PathBuf::from("/tmp"));
+        assert_eq!(w.overlay_ip_path, PathBuf::from(DEFAULT_OVERLAY_IP_PATH));
     }
 
     #[tokio::test]

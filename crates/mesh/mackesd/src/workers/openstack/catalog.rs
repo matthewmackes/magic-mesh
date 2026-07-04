@@ -169,6 +169,54 @@ impl ServiceKind {
         }
     }
 
+    /// The public API listen port for an API-serving service (Q22/24) — the
+    /// port its overlay-bound listener answers on and its service-catalog
+    /// endpoint advertises. `None` for the foundation trio (whose ports are
+    /// internal wiring, not tenant-facing APIs) and for the Nova/Cinder agents
+    /// that carry no listener (scheduler/conductor/compute/volume).
+    #[must_use]
+    pub const fn api_port(self) -> Option<u16> {
+        match self {
+            Self::Keystone => Some(5000),
+            Self::GlanceApi => Some(9292),
+            Self::PlacementApi => Some(8778),
+            Self::NovaApi => Some(8774),
+            Self::NeutronServer => Some(9696),
+            Self::CinderApi => Some(8776),
+            _ => None,
+        }
+    }
+
+    /// The Nebula-DNS name this API answers on (Q22/46 — Designate/peer-
+    /// directory resolution). `Some` exactly when [`Self::api_port`] is: the
+    /// service-catalog endpoint resolves over the mesh to whichever node serves
+    /// the API, so tenants reach it without pinning a per-node URL.
+    #[must_use]
+    pub const fn mesh_dns_name(self) -> Option<&'static str> {
+        match self {
+            Self::Keystone => Some("keystone.mesh"),
+            Self::GlanceApi => Some("glance.mesh"),
+            Self::PlacementApi => Some("placement.mesh"),
+            Self::NovaApi => Some("nova.mesh"),
+            Self::NeutronServer => Some("neutron.mesh"),
+            Self::CinderApi => Some("cinder.mesh"),
+            _ => None,
+        }
+    }
+
+    /// The service-catalog endpoint URL an API advertises over the mesh
+    /// (QC-6, Q22/23): plaintext HTTP to the Nebula-DNS name — the overlay IS
+    /// the transport security, so tenants reach every API over the mesh with no
+    /// TLS. `None` for a non-API service (no tenant-facing endpoint).
+    #[must_use]
+    pub fn endpoint_url(self) -> Option<String> {
+        Some(format!(
+            "http://{}:{}",
+            self.mesh_dns_name()?,
+            self.api_port()?
+        ))
+    }
+
     /// Reverse-map a `podman ps` container name to its catalogued service —
     /// `None` for a container the worker does not manage (an operator's
     /// unrelated container is never touched by the reconcile).
@@ -265,6 +313,65 @@ mod tests {
             .filter(|k| k.placement() == Placement::LeaderOnly)
             .collect();
         assert_eq!(leader_only, vec![ServiceKind::Mariadb]);
+    }
+
+    #[test]
+    fn api_services_carry_a_port_and_mesh_endpoint() {
+        // QC-6 — every API service advertises a Nebula-DNS service-catalog
+        // endpoint over the mesh (plaintext HTTP; the overlay is the TLS).
+        assert_eq!(ServiceKind::Keystone.api_port(), Some(5000));
+        assert_eq!(
+            ServiceKind::Keystone.endpoint_url().as_deref(),
+            Some("http://keystone.mesh:5000")
+        );
+        assert_eq!(
+            ServiceKind::GlanceApi.endpoint_url().as_deref(),
+            Some("http://glance.mesh:9292")
+        );
+        assert_eq!(
+            ServiceKind::PlacementApi.endpoint_url().as_deref(),
+            Some("http://placement.mesh:8778")
+        );
+        assert_eq!(
+            ServiceKind::NovaApi.endpoint_url().as_deref(),
+            Some("http://nova.mesh:8774")
+        );
+        assert_eq!(
+            ServiceKind::NeutronServer.endpoint_url().as_deref(),
+            Some("http://neutron.mesh:9696")
+        );
+        assert_eq!(
+            ServiceKind::CinderApi.endpoint_url().as_deref(),
+            Some("http://cinder.mesh:8776")
+        );
+        // The foundation trio + the agent services carry no tenant-facing API.
+        for kind in [
+            ServiceKind::Mariadb,
+            ServiceKind::Rabbitmq,
+            ServiceKind::Memcached,
+            ServiceKind::NovaScheduler,
+            ServiceKind::NovaConductor,
+            ServiceKind::NovaCompute,
+            ServiceKind::CinderScheduler,
+            ServiceKind::CinderVolume,
+        ] {
+            assert_eq!(kind.api_port(), None, "{kind:?}");
+            assert_eq!(kind.mesh_dns_name(), None, "{kind:?}");
+            assert_eq!(kind.endpoint_url(), None, "{kind:?}");
+        }
+        // The port + mesh name + endpoint stay in lockstep across the catalog.
+        for kind in ServiceKind::ALL {
+            assert_eq!(
+                kind.endpoint_url().is_some(),
+                kind.api_port().is_some(),
+                "{kind:?}"
+            );
+            assert_eq!(
+                kind.mesh_dns_name().is_some(),
+                kind.api_port().is_some(),
+                "{kind:?}"
+            );
+        }
     }
 
     #[test]
