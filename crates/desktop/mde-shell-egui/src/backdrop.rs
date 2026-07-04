@@ -19,6 +19,14 @@
 //! ~6 MB to the binary, so the rest load from disk (disk-honest, §4). All colour the
 //! shell *adds* — the Carbon field beneath, the cover scrim, the status backing — is
 //! a `mde-theme`/`Style` token, never a raw hex (§4).
+//!
+//! NAVBAR-W10-3 (`docs/design/workbench-navbar.md` lock W12) rides this same layer:
+//! a Windows-10-activation-style **ghost watermark** — the product mark, the brand
+//! version line, and the node identity — right-aligned in the field's bottom-right
+//! corner, a margin above where the taskbar mounts. Faded [`Style::TEXT_DIM`] ink
+//! with no backing, so it reads like the Win10 "Activate Windows" text: visible,
+//! never competing. It paints wherever the backdrop paints; the role is honestly
+//! omitted when no `role.toml` is pinned (§7).
 
 #![allow(
     clippy::redundant_pub_crate,
@@ -29,11 +37,13 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use mde_egui::egui::{self, FontId, Rect, TextureHandle, TextureOptions, Vec2};
 use mde_egui::{Motion, Style};
 
+use mde_theme::brand;
 use serde::{Deserialize, Serialize};
 
 use mackes_mesh_types::peers::default_workgroup_root;
@@ -73,6 +83,21 @@ const STATUS_Y_FRAC: f32 = 0.74;
 /// The Carbon backing opacity behind the honest status block, so it reads over any
 /// wallpaper region (§4 token, never a raw hex).
 const STATUS_BACKING_ALPHA: f32 = 0.5;
+
+/// The watermark's product mark — the first, slightly larger ghost line
+/// (NAVBAR-W10 lock W12 names the product "MDE Quazar").
+const WATERMARK_PRODUCT: &str = "MDE Quazar";
+
+/// The ghost emphasis of the watermark ink: [`Style::TEXT_DIM`] faded further to
+/// the Win10 "Activate Windows" register — visible over the artwork, never
+/// competing with content (§4: a faded token, never a raw hex).
+const WATERMARK_GHOST: f32 = 0.6;
+
+/// The pinned deployment role file — `mde-role`'s canonical path. The watermark
+/// reads it directly (only the pinned token is wanted for the node line, not the
+/// fail-closed role gate), honoring the same `MDE_ROLE_PATH` override
+/// `mde_role::default_role_path` honors.
+const ROLE_PATH: &str = "/var/lib/mde/role.toml";
 
 /// The shared cover-scrim animation key. Exactly one backdrop paints per frame (the
 /// shell shows one central view at a time), so a single key yields a continuous eased
@@ -207,6 +232,11 @@ pub(crate) fn show(ui: &egui::Ui, coverage: Coverage, status: Option<(&str, &str
         }
     }
 
+    // NAVBAR-W10-3 (lock W12) — the brand watermark: three ghost lines in the
+    // bottom-right, clear of the taskbar. Painted over the scrim so its ghost
+    // weight holds on empty and covered displays alike.
+    paint_watermark(&painter, free, ui.ctx().screen_rect());
+
     // Any honest status (the empty-desktop copy, a gated-transport note) — a small
     // block low on the field, over a subtle backing so it reads over the artwork.
     if let Some((title, detail)) = status {
@@ -284,6 +314,40 @@ fn paint_status(painter: &egui::Painter, free: Rect, title: &str, detail: &str) 
     );
     painter.galley(title_pos, title_galley, Style::TEXT);
     painter.galley(detail_pos, detail_galley, Style::TEXT_DIM);
+}
+
+/// NAVBAR-W10-3 (lock W12) — paint the brand watermark: the Win10-activation-style
+/// ghost block, three right-aligned lines stacked in the field's bottom-right
+/// corner, a margin above where the taskbar mounts. The product mark sits slightly
+/// larger over the version + node lines; all three in faded [`Style::TEXT_DIM`]
+/// ink with no backing, so the mark reads over the artwork without competing.
+fn paint_watermark(painter: &egui::Painter, free: Rect, screen: Rect) {
+    let [product, version, node] = watermark();
+    let ink = Style::TEXT_DIM.gamma_multiply(WATERMARK_GHOST);
+    let galleys = [
+        painter.layout_no_wrap(product.clone(), FontId::proportional(Style::BODY), ink),
+        painter.layout_no_wrap(version.clone(), FontId::proportional(Style::SMALL), ink),
+        painter.layout_no_wrap(node.clone(), FontId::proportional(Style::SMALL), ink),
+    ];
+
+    // The taskbar mounts at the screen's bottom edge, so in the mounted shell the
+    // backdrop's own rect already ends at the bar's top (the bottom panel is
+    // reserved first); on a bar-less display (a headless frame) the screen-based
+    // bound still keeps the watermark clear of where the bar sits. `min` takes
+    // whichever bound is higher on screen — the mark is always above the bar.
+    let right = free.right() - Style::SP_L;
+    let mut bottom = free.bottom().min(screen.bottom() - crate::dock::TASKBAR_H) - Style::SP_L;
+
+    // Stack bottom-up: node at the anchor, version above it, product on top.
+    for galley in galleys.iter().rev() {
+        bottom -= galley.size().y;
+        painter.galley(
+            egui::pos2(right - galley.size().x, bottom),
+            galley.clone(),
+            ink,
+        );
+        bottom -= Style::SP_XS;
+    }
 }
 
 // ─────────────────────────── the resolved-texture cache ───────────────────────────
@@ -566,6 +630,54 @@ fn resolve_seat() -> String {
     "seat".to_owned()
 }
 
+/// The three watermark lines, resolved once per process ([`OnceLock`]): the
+/// hostname is boot-stable and the role pin is install-time (upgrade-only in
+/// `mde-role`), so a per-frame re-read would be pure disk churn — a re-pin
+/// surfaces on the next shell start.
+fn watermark() -> &'static [String; 3] {
+    static LINES: OnceLock<[String; 3]> = OnceLock::new();
+    LINES
+        .get_or_init(|| watermark_lines(&crate::discovery::local_peer(), resolve_role().as_deref()))
+}
+
+/// Fold the watermark's three ghost lines (lock W12): the product mark, the brand
+/// version line ([`brand::build::version_line`]), and the node identity —
+/// `<host> · <role>`, or the bare hostname when no role is pinned (honest
+/// omission, §7).
+fn watermark_lines(host: &str, role: Option<&str>) -> [String; 3] {
+    let node = role.map_or_else(|| host.to_owned(), |role| format!("{host} · {role}"));
+    [
+        WATERMARK_PRODUCT.to_owned(),
+        brand::build::version_line(),
+        node,
+    ]
+}
+
+/// The pinned deployment role for the watermark's node line, or `None` — the role
+/// honestly omitted — when [`ROLE_PATH`] is absent/unreadable or names nothing
+/// (§7; the watermark never guesses a tier the way `mde-role` callers never
+/// default one).
+fn resolve_role() -> Option<String> {
+    let path =
+        std::env::var_os("MDE_ROLE_PATH").map_or_else(|| PathBuf::from(ROLE_PATH), PathBuf::from);
+    role_from_toml(&fs::read_to_string(path).ok()?)
+}
+
+/// Extract the pinned role token from a `role.toml` body: the unquoted value of
+/// the first `role = <value>` line, `#` comments and blank lines skipped —
+/// mirrors `mde-role`'s tolerant line parse, minus the enum gate (the watermark
+/// shows the pinned token verbatim; validity is the role gate's business).
+fn role_from_toml(text: &str) -> Option<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .find_map(|line| {
+            let value = line.strip_prefix("role")?.trim_start().strip_prefix('=')?;
+            let value = value.trim().trim_matches('"').trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        })
+}
+
 /// Wall-clock epoch millis — the record timestamp the save stamps writes with.
 fn unix_millis() -> u64 {
     std::time::SystemTime::now()
@@ -786,5 +898,111 @@ mod tests {
         assert_eq!(selected_wallpaper(&ctx), Wallpaper::Two);
         select_wallpaper(&ctx, Wallpaper::Five);
         assert_eq!(selected_wallpaper(&ctx), Wallpaper::Five);
+    }
+
+    // ──────────────────── NAVBAR-W10-3 — the brand watermark ────────────────────
+
+    /// Every glyph run in a frame's shape list, with its paint position — the
+    /// headless proof the watermark text actually reaches the paint list
+    /// (`Shape::Vec` recursed; the same shapes [`run`] tessellates).
+    fn frame_text(shapes: &[egui::epaint::ClippedShape]) -> Vec<(egui::Pos2, String)> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(egui::Pos2, String)>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => out.push((t.pos, t.galley.text().to_owned())),
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn the_watermark_folds_product_version_and_node() {
+        let [product, version, node] = watermark_lines("eagle", Some("workstation"));
+        assert_eq!(product, WATERMARK_PRODUCT);
+        assert_eq!(
+            version,
+            brand::build::version_line(),
+            "the version line is brand::build's, never a re-derived string"
+        );
+        assert_eq!(node, "eagle · workstation");
+    }
+
+    #[test]
+    fn the_watermark_omits_an_absent_role() {
+        // No pinned role → the bare hostname, never a guessed tier (§7).
+        let [_, _, node] = watermark_lines("eagle", None);
+        assert_eq!(node, "eagle");
+    }
+
+    #[test]
+    fn the_role_token_parses_from_a_role_toml_body() {
+        assert_eq!(
+            role_from_toml("# pinned at install\nrole = \"workstation\"\nmedia = true\n"),
+            Some("workstation".to_owned())
+        );
+        assert_eq!(
+            role_from_toml("role=lighthouse"),
+            Some("lighthouse".to_owned()),
+            "unquoted / unspaced values parse"
+        );
+        assert_eq!(
+            role_from_toml("# role = \"workstation\""),
+            None,
+            "a commented-out line never pins a role"
+        );
+        assert_eq!(
+            role_from_toml("role = \"\""),
+            None,
+            "an empty value is no role"
+        );
+        assert_eq!(role_from_toml(""), None, "an empty body is no role");
+    }
+
+    #[test]
+    fn the_backdrop_paints_the_watermark_bottom_right_above_the_bar() {
+        // A headless 960×640 frame with no status block: the only text on the
+        // backdrop is the watermark itself. All three live lines must reach the
+        // paint list, anchored in the bottom-right quadrant and wholly above where
+        // the taskbar mounts — and the frame must still tessellate non-empty.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, Coverage::Empty, None));
+        });
+
+        let texts = frame_text(&out.shapes);
+        for line in watermark() {
+            let hits: Vec<_> = texts.iter().filter(|(_, t)| t == line).collect();
+            assert!(!hits.is_empty(), "watermark line {line:?} was not painted");
+            for (pos, _) in hits {
+                assert!(
+                    pos.x > 480.0 && pos.y > 320.0,
+                    "line {line:?} must anchor bottom-right, painted at {pos:?}"
+                );
+                assert!(
+                    pos.y < 640.0 - crate::dock::TASKBAR_H,
+                    "line {line:?} must sit above the taskbar, painted at {pos:?}"
+                );
+            }
+        }
+
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the watermark backdrop produced no draw primitives"
+        );
     }
 }
