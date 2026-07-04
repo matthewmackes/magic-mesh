@@ -586,6 +586,19 @@ pub mod vm_lifecycle;
 // `event/podman/containers`. Universal like vm_lifecycle — every node can host
 // datacenter containers.
 pub mod container;
+// QC-2 (QUASAR-CLOUD) — the mackesd `openstack` worker: the supervision root of
+// the mesh-becomes-an-OpenStack-cloud epic (docs/design/quasar-cloud.md). Reads
+// the fleet/one-state cloud doctrine for WHICH Kolla service containers this
+// node hosts (APIs on every node, leader-hosted MariaDB, no controller box —
+// Q5/Q15/Q22; the live etcd/Syncthing doctrine read is a typed IntegrationGated
+// until QC-4 authors the record), converges desired vs running under Podman via
+// the injectable PodmanRunner seam (start missing / restart killed / stop
+// extra; starts honestly gated on the operator-mirrored image (QC-3 airgap
+// lane, Q18) + the rendered Kolla config (QC-4)), and publishes the
+// `state/openstack/<node>` mirror. `[!]`-grade failures ride the mackesd::alert
+// lane (→ chat, NOTIFY-CHAT lock 11). Universal (rank 0) — the doctrine, not
+// the role, decides which services a node hosts.
+pub mod openstack;
 // E12-20 — the storage worker: the privileged owner of the Workbench Storage plane
 // (GParted for the mesh, docs/design/workbench-storage-plane.md). Owns a typed
 // StorageOp pending-queue executor over a live UDisks2 zbus topology — stage-time

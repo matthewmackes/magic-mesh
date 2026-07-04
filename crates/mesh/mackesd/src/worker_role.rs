@@ -91,6 +91,16 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // reported the Workstation as NOT running storage. Only the READ/publish path
     // is enabled here; the live UDisks2Executor stays IntegrationGated as-is.
     ("storage", 0),
+    // QC-2 — the OpenStack supervision worker: UNIVERSAL (rank 0). The
+    // QUASAR-CLOUD design's universal-node premise (quasar-cloud.md Q1/Q5/Q22:
+    // any-role node, APIs on every node, no controller box) means every node —
+    // lighthouse included — can carry cloud duties; the fleet/one-state
+    // doctrine (not the role) decides WHICH Kolla services a node hosts, and a
+    // node assigned none (or a pre-doctrine mesh, where the read is honestly
+    // IntegrationGated) still publishes its `state/openstack/<node>` mirror.
+    // A deliberate census entry like storage's (BUG-STORAGE-1), never the
+    // silent unknown-worker default.
+    ("openstack", 0),
     // ── Workstation (rank 1) — everything beyond the relay control plane: the
     //    fleet + mesh storage workers AND voice / clipboard / kdc / remmina /
     //    music. A headless box is a Workstation too (the desktop workers idle
@@ -392,7 +402,11 @@ mod tests {
         // +1 storage (BUG-STORAGE-1 — the E12-20 universal per-node topology mirror,
         // pinned at rank 0 so it is a deliberate census entry on every role instead
         // of riding the silent unknown-worker default that hid it from role-workers).
-        assert_eq!(WORKER_TIERS.len(), 39);
+        // +1 openstack (QC-2 — the QUASAR-CLOUD Kolla-service supervision worker,
+        // pinned at rank 0: the universal-node premise (quasar-cloud.md Q1/Q5/Q22)
+        // puts cloud duties on any role; the fleet doctrine, not the rank, decides
+        // which services a node hosts).
+        assert_eq!(WORKER_TIERS.len(), 40);
     }
 
     #[test]
@@ -415,8 +429,8 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            23,
-            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror)"
+            24,
+            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision)"
         );
         assert_eq!(
             count(1),
@@ -503,6 +517,36 @@ mod tests {
     }
 
     #[test]
+    fn openstack_worker_runs_on_every_role() {
+        // QC-2 — the QUASAR-CLOUD universal-node premise (Q1/Q5/Q22: any-role
+        // node, APIs on every node, no controller box). The worker MUST spawn on
+        // every role — the fleet doctrine, not the rank, decides which Kolla
+        // services a node hosts — and a node assigned none (or a pre-doctrine
+        // mesh) still publishes an honest `state/openstack/<node>` mirror.
+        assert_eq!(
+            min_rank("openstack"),
+            0,
+            "openstack is a universal (rank-0) worker"
+        );
+        assert!(
+            runs("openstack", Role::Workstation.rank()),
+            "a Workstation carries cloud duties (universal node)"
+        );
+        assert!(
+            runs("openstack", Role::Lighthouse.rank()),
+            "a Lighthouse carries cloud duties too — no controller box, no exempt role"
+        );
+        // A DELIBERATE census entry (like storage's BUG-STORAGE-1 lesson), so
+        // `mackesd role-workers` lists it on both roles rather than riding the
+        // silent unknown-worker default.
+        assert!(workers_for_rank(Role::Workstation.rank()).contains(&"openstack"));
+        assert!(workers_for_rank(Role::Lighthouse.rank()).contains(&"openstack"));
+        // No capability tag — the doctrine gate lives inside the worker's fleet
+        // seam, not in the role census.
+        assert_eq!(required_capability("openstack"), None);
+    }
+
+    #[test]
     fn role_name_maps_each_rank_to_its_canonical_name() {
         // BOOKMARKS-8 — the browser-policy worker folds its per-role policy by
         // this name, so it MUST match the role.toml canonical names.
@@ -522,12 +566,12 @@ mod tests {
     fn workers_for_rank_is_a_growing_superset() {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        // 23 lighthouse-tier workers (22 control-plane + the BUG-STORAGE-1 universal
-        // storage mirror at rank 0); Workstation adds the 16 fleet + desktop workers
-        // for the full 39 (the retired Server tier folded into Workstation in the
-        // 2-role model).
-        assert_eq!(lh.len(), 23);
-        assert_eq!(ws.len(), 39);
+        // 24 lighthouse-tier workers (22 control-plane + the BUG-STORAGE-1 universal
+        // storage mirror + the QC-2 universal openstack worker at rank 0);
+        // Workstation adds the 16 fleet + desktop workers for the full 40 (the
+        // retired Server tier folded into Workstation in the 2-role model).
+        assert_eq!(lh.len(), 24);
+        assert_eq!(ws.len(), 40);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
@@ -588,16 +632,17 @@ mod tests {
             "media ≠ workstation tier"
         );
         let set = workers_for_class(media_lh);
-        // = the 23 lighthouse-tier workers (incl. link-traffic MESHMAP-6 + the
-        // BUG-STORAGE-1 universal storage mirror) + navidrome.
-        assert_eq!(set.len(), 24);
+        // = the 24 lighthouse-tier workers (incl. link-traffic MESHMAP-6, the
+        // BUG-STORAGE-1 universal storage mirror + the QC-2 universal openstack
+        // worker) + navidrome.
+        assert_eq!(set.len(), 25);
         assert!(set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 23);
+        assert_eq!(workers_for_class(plain_lh).len(), 24);
     }
 
     #[test]

@@ -6549,6 +6549,32 @@ fn run_serve(
                 .expect("worker_names mutex")
                 .push("storage".into());
         }
+        // QC-2 — the openstack worker: the QUASAR-CLOUD supervision root
+        // (docs/design/quasar-cloud.md). Reads the fleet/one-state cloud
+        // doctrine for WHICH Kolla service containers this node hosts (the
+        // live etcd/Syncthing doctrine read is a typed IntegrationGated until
+        // QC-4 authors the record), converges desired vs running under Podman
+        // via the injectable PodmanRunner seam (start missing / restart
+        // killed / stop extra; starts honestly gated on the operator-mirrored
+        // image (QC-3 airgap lane) + the rendered Kolla config (QC-4)), and
+        // publishes the `state/openstack/<node>` mirror. Universal — the
+        // design's any-role-node premise (Q1/Q5/Q22) — so it is a deliberate
+        // rank-0 census entry like storage's; the doctrine, not the role,
+        // decides which services land here. node_id is the mirror `host`
+        // stamp; the workgroup root seeds the doctrine seam's Syncthing leg.
+        if mackesd_core::worker_role::runs("openstack", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::openstack::OpenstackWorker::new(
+                    node_id.clone(),
+                    workgroup_root.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("openstack".into());
+        }
         // MV-5a — the scheduler worker: the placement slice of the no-center
         // scheduler. Drains `action/schedule/place`, folds each node's latest
         // `event/kvm/services` capacity, chooses the target node (healthy pin →
