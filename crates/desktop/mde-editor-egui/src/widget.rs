@@ -66,6 +66,7 @@ use mde_egui::egui::{
 use mde_egui::Style;
 
 use crate::buffer::Buffer;
+use crate::fold::Folds;
 use crate::highlight::{HighlightSpan, Highlighter};
 use crate::lsp_ui::{severity_color, DiagnosticsOverlay};
 use crate::md_actions::MdOutcome;
@@ -263,20 +264,28 @@ struct WrapMap {
     len_chars: usize,
     /// Buffer line count when built — the other half.
     len_lines: usize,
+    /// The [`Folds`] cache generation this map was built at (EDITOR-12) — a fold
+    /// toggle bumps it, so a stale map rebuilds and hidden lines drop out.
+    folds_generation: u64,
     /// `rows_before[i]` = visual rows above logical line `i`; `len == len_lines + 1`.
+    /// A folded (hidden) line contributes **zero** rows, so `line_at` naturally
+    /// skips it and the total excludes it.
     rows_before: Vec<usize>,
 }
 
 impl WrapMap {
-    /// Whether this map is still valid for `buffer` wrapped at `cols` columns.
-    fn is_valid(&self, buffer: &Buffer, cols: usize) -> bool {
+    /// Whether this map is still valid for `buffer` wrapped at `cols` columns with
+    /// the fold state at cache generation `folds_generation`.
+    fn is_valid(&self, buffer: &Buffer, cols: usize, folds_generation: u64) -> bool {
         self.cols == cols
             && self.len_chars == buffer.len_chars()
             && self.len_lines == buffer.len_lines()
+            && self.folds_generation == folds_generation
     }
 
-    /// Rebuild the prefix sums for `buffer` wrapped at `cols` columns (O(lines)).
-    fn rebuild(&mut self, buffer: &Buffer, cols: usize) {
+    /// Rebuild the prefix sums for `buffer` wrapped at `cols` columns (O(lines)),
+    /// giving a folded (hidden) line zero rows so the wrapped render skips it.
+    fn rebuild(&mut self, buffer: &Buffer, cols: usize, folds: &Folds) {
         let cols = cols.max(1);
         let lines = buffer.len_lines();
         self.rows_before.clear();
@@ -284,6 +293,9 @@ impl WrapMap {
         let mut acc = 0;
         for line in 0..lines {
             self.rows_before.push(acc);
+            if folds.is_line_hidden(line) {
+                continue; // a collapsed line occupies no visual row
+            }
             let llen = line_len(buffer, line);
             acc += llen.div_ceil(cols).max(1);
         }
@@ -291,6 +303,7 @@ impl WrapMap {
         self.cols = cols;
         self.len_chars = buffer.len_chars();
         self.len_lines = buffer.len_lines();
+        self.folds_generation = folds.generation();
     }
 
     /// Total visual rows (≥ 1).
@@ -492,6 +505,10 @@ pub struct EditorView {
     /// LSP-2) — the panel compares it across frames to push a `didChange` to the
     /// language server only when the text actually moved (not on caret motion).
     edits: u64,
+    /// The per-buffer code-folding state (EDITOR-12): the tree-sitter fold regions
+    /// (cached by buffer revision) and which are collapsed. The render skips the
+    /// hidden lines this describes.
+    folds: Folds,
 }
 
 impl Default for EditorView {
@@ -519,6 +536,7 @@ impl EditorView {
             box_anchor: None,
             zoom_percent: ZOOM_DEFAULT,
             edits: 0,
+            folds: Folds::default(),
         }
     }
 
@@ -629,6 +647,108 @@ impl EditorView {
         self.group_open = false;
         self.box_anchor = None;
         self.reveal_caret = true;
+    }
+
+    // ── EDITOR-12: code folding ──────────────────────────────────────────────
+
+    /// The read-only fold state — the panel reads it (e.g. to enable a "fold all"
+    /// affordance) and the paint/geometry helpers below consult it.
+    #[must_use]
+    pub(crate) fn folds(&self) -> &Folds {
+        &self.folds
+    }
+
+    /// Re-derive the fold regions from the document's highlighter tree when the
+    /// buffer has changed since the last derivation (EDITOR-12) — the once-per-
+    /// frame refresh the widget drives before it reads keys/geometry. A plain-text
+    /// buffer (`hl == None`) clears folding honestly. Reuses the SAME tree the
+    /// highlighter parses; no second parser.
+    pub fn refresh_folds(&mut self, buffer: &Buffer, hl: Option<&Highlighter>) {
+        let revision = buffer.revision();
+        if !self.folds.needs_refresh(revision) {
+            return;
+        }
+        let regions = hl
+            .map(|h| h.fold_regions(buffer.rope()))
+            .unwrap_or_default();
+        self.folds.update_regions(regions, revision);
+    }
+
+    /// Fold the region at the primary caret (EDITOR-12 keybinding / affordance):
+    /// the region opening on the caret line, else the innermost region enclosing
+    /// it. Pulls any caret swallowed by the collapse back onto the header line so
+    /// it stays visible. Returns whether anything folded.
+    pub(crate) fn fold_at_caret(&mut self, buffer: &Buffer) -> bool {
+        let line = self.cur_line(buffer);
+        let Some(region) = self.folds.foldable_at(line) else {
+            return false;
+        };
+        if self.folds.fold(region.header_line) {
+            self.pull_carets_out_of_folds(buffer);
+            self.reveal_caret = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Unfold the collapsed region at the primary caret (EDITOR-12). Returns
+    /// whether anything unfolded.
+    pub(crate) fn unfold_at_caret(&mut self, buffer: &Buffer) -> bool {
+        let line = self.cur_line(buffer);
+        let Some(header) = self.folds.unfoldable_at(line) else {
+            return false;
+        };
+        if self.folds.unfold(header) {
+            self.reveal_caret = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Toggle the region headed by logical `line` (the gutter chevron seam), pulling
+    /// carets out of a fresh collapse. Returns whether the fold state changed.
+    pub(crate) fn toggle_fold_header(&mut self, buffer: &Buffer, line: usize) -> bool {
+        let changed = self.folds.toggle(line);
+        if changed {
+            self.pull_carets_out_of_folds(buffer);
+            self.reveal_caret = true;
+        }
+        changed
+    }
+
+    /// Move any caret sitting inside a newly collapsed region up to its header
+    /// line's start (dropping the selection), so the caret never hides.
+    fn pull_carets_out_of_folds(&mut self, buffer: &Buffer) {
+        let len = buffer.len_chars();
+        for c in &mut self.carets {
+            let line = buffer.char_to_line(c.cursor.min(len));
+            if let Some(header) = self.folds.header_of_hidden_line(line) {
+                c.cursor = buffer.line_to_char(header);
+                c.anchor = None;
+                c.goal_col = None;
+            }
+        }
+        self.normalize();
+    }
+
+    /// Refresh the soft-wrap prefix sums when stale (EDITOR-3), now also rebuilt
+    /// when the fold state moved so wrapped rows exclude hidden lines. Wraps the
+    /// two-field borrow (`wrap_map` + `folds`) so callers stay a single call.
+    fn ensure_wrap_map(&mut self, buffer: &Buffer, wrap_cols: usize) {
+        if self.wrap
+            && !self
+                .wrap_map
+                .is_valid(buffer, wrap_cols, self.folds.generation())
+        {
+            self.wrap_map.rebuild(buffer, wrap_cols, &self.folds);
+        }
+    }
+
+    /// The unwrapped display-row count — logical lines minus the folded ones.
+    fn unwrapped_rows(&self, buffer: &Buffer) -> usize {
+        self.folds.visible_line_count(buffer.len_lines()).max(1)
     }
 
     /// Clamp every caret back inside the buffer (called each frame in case the
@@ -958,7 +1078,11 @@ impl EditorView {
     /// each splice leaves the earlier ranges' char indices valid (LSP guarantees
     /// the edits are non-overlapping); it then leaves one caret at the topmost
     /// edit. Empty input records nothing.
-    pub fn apply_text_edits(&mut self, buffer: &mut Buffer, edits: &[(Range<usize>, String)]) -> usize {
+    pub fn apply_text_edits(
+        &mut self,
+        buffer: &mut Buffer,
+        edits: &[(Range<usize>, String)],
+    ) -> usize {
         if edits.is_empty() {
             return 0;
         }
@@ -1453,6 +1577,9 @@ impl EditorView {
             Key::Z if cmd && shift => self.redo(buffer),
             Key::Z if cmd => self.undo(buffer),
             Key::Y if cmd => self.redo(buffer),
+            // ── EDITOR-12: fold / unfold the region at the caret ──
+            Key::OpenBracket if cmd && shift => self.fold_at_caret(buffer),
+            Key::CloseBracket if cmd && shift => self.unfold_at_caret(buffer),
             Key::Escape => self.collapse(),
             _ => false,
         }
@@ -1536,7 +1663,11 @@ impl EditorView {
                 line_end: line_start + llen,
             }
         } else {
-            let line = vr.min(buffer.len_lines().saturating_sub(1));
+            // EDITOR-12 — display row → logical line, skipping any folded lines.
+            let line = self
+                .folds
+                .line_of_display_row(vr)
+                .min(buffer.len_lines().saturating_sub(1));
             let start = buffer.line_to_char(line);
             let end = start + line_len(buffer, line);
             VisRow {
@@ -1566,7 +1697,8 @@ impl EditorView {
             };
             (self.wrap_map.row_of(line) + sub, xcol)
         } else {
-            (line, col)
+            // EDITOR-12 — logical line → display row (folded lines above collapse).
+            (self.folds.display_row_of_line(line), col)
         }
     }
 
@@ -1633,13 +1765,14 @@ pub fn editor_widget(
     let avail = ui.available_size();
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let wrap_cols = (((avail.x - gutter_w) / glyph_w).floor().max(1.0)) as usize;
-    if view.wrap && !view.wrap_map.is_valid(buffer, wrap_cols) {
-        view.wrap_map.rebuild(buffer, wrap_cols);
-    }
+    // Hit-testing this frame's pointer runs against the geometry that was
+    // DISPLAYED last frame, so keep last frame's fold state here (the fresh fold
+    // refresh happens in `editor_body`, after this frame's edits settle).
+    view.ensure_wrap_map(buffer, wrap_cols);
     let total_rows = if view.wrap {
         view.wrap_map.total()
     } else {
-        buffer.len_lines()
+        view.unwrapped_rows(buffer)
     };
 
     let scroll = if view.wrap {
@@ -1674,7 +1807,7 @@ fn editor_body(
     ui: &mut Ui,
     view: &mut EditorView,
     buffer: &mut Buffer,
-    highlight: Option<&mut Highlighter>,
+    mut highlight: Option<&mut Highlighter>,
     m: Metrics,
     wrap_cols: usize,
     total_rows: usize,
@@ -1706,16 +1839,26 @@ fn editor_body(
     handle_pointer(&resp, ui, view, buffer, m, origin, total_rows, wrap_cols);
     handle_keys(&resp, ui, view, buffer, rows_visible);
 
-    // Re-validate geometry after any edit so the paint pass never indexes a line
-    // that a delete removed (the wrap map + row count must match the live buffer).
-    view.clamp(buffer);
-    if view.wrap && !view.wrap_map.is_valid(buffer, wrap_cols) {
-        view.wrap_map.rebuild(buffer, wrap_cols);
+    // EDITOR-5/12 — bring the syntax tree up to date with this frame's edits
+    // FIRST (incremental: the buffer's edit deltas splice the old tree, no full-
+    // file reparse per keystroke), then refresh the fold regions off that SAME
+    // tree, so the geometry below (row count, wrap map, cull window) already
+    // reflects any fold hidden this frame. Plain-text documents (`None`) sync
+    // nothing and clear folding honestly.
+    if let Some(hl) = highlight.as_deref_mut() {
+        hl.sync(buffer);
     }
+    view.refresh_folds(buffer, highlight.as_deref());
+
+    // Re-validate geometry after any edit / fold so the paint pass never indexes a
+    // line that a delete removed or a fold hid (the wrap map + row count must match
+    // the live buffer + fold state).
+    view.clamp(buffer);
+    view.ensure_wrap_map(buffer, wrap_cols);
     let total = if view.wrap {
         view.wrap_map.total()
     } else {
-        buffer.len_lines()
+        view.unwrapped_rows(buffer)
     };
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let first = (((clip.top() - origin.y) / m.row_h).floor().max(0.0)) as usize;
@@ -1732,13 +1875,10 @@ fn editor_body(
         .max_line_chars
         .max(line_len(buffer, view.cur_line(buffer)));
 
-    // EDITOR-5 — bring the syntax tree up to date with this frame's edits
-    // (incremental: the buffer's edit deltas splice the old tree, no full-file
-    // reparse per keystroke), then resolve the highlight spans for just the
-    // VISIBLE window once — the query cost scales with the viewport, matching
-    // the paint culling. Plain-text documents pass `None` and skip all of it.
-    let spans = highlight.map_or_else(Vec::new, |hl| {
-        hl.sync(buffer);
+    // EDITOR-5 — resolve the highlight spans for just the VISIBLE window once (the
+    // tree is already synced above) — the query cost scales with the viewport,
+    // matching the paint culling.
+    let spans = highlight.as_deref().map_or_else(Vec::new, |hl| {
         if first < last {
             let w_start = view.vis_row(buffer, first, wrap_cols).start;
             let w_end = view.vis_row(buffer, last - 1, wrap_cols).end;
@@ -1806,6 +1946,21 @@ fn handle_pointer(
     let Some(pos) = resp.interact_pointer_pos() else {
         return;
     };
+
+    // EDITOR-12 — a click in the pinned gutter of a fold-header row toggles that
+    // fold (the chevron affordance). The gutter is a big, forgiving hit target;
+    // caught here (not the text area) so it never moves the caret.
+    let gutter_left = ui.clip_rect().left();
+    if resp.clicked() && pos.x >= gutter_left && pos.x <= gutter_left + m.gutter_w {
+        let (vr, _) = hit_cell(m, origin, total_rows, pos);
+        let row = view.vis_row(buffer, vr, wrap_cols);
+        if row.first && view.folds().region_at_header(row.line).is_some() {
+            resp.request_focus();
+            view.toggle_fold_header(buffer, row.line);
+        }
+        return;
+    }
+
     let idx = hit_char(view, buffer, m, origin, total_rows, wrap_cols, pos);
     let cell = hit_cell(m, origin, total_rows, pos);
 
@@ -2301,6 +2456,25 @@ fn paint_gutter(
                 severity_color(severity),
             );
         }
+
+        // EDITOR-12 — a fold chevron in the gutter's right pad on a foldable header
+        // line: ▾ when the region is open, ▸ (accent) when it is collapsed. The
+        // click is handled in `handle_pointer` (the whole gutter row is the target).
+        if view.folds().region_at_header(row.line).is_some() {
+            let folded = view.folds().is_folded(row.line);
+            let (glyph, color) = if folded {
+                ("\u{25B8}", Style::ACCENT)
+            } else {
+                ("\u{25BE}", Style::TEXT_DIM)
+            };
+            painter.text(
+                pos2(gx + m.gutter_w - Style::SP_XS, y + m.row_h * 0.5),
+                Align2::CENTER_CENTER,
+                glyph,
+                FontId::monospace(Style::SMALL * m.scale),
+                color,
+            );
+        }
     }
 }
 
@@ -2369,6 +2543,7 @@ mod tests {
         MatchHighlights,
     };
     use crate::buffer::Buffer;
+    use crate::highlight::{Highlighter, Language};
     use crate::lsp_ui::DiagnosticsOverlay;
     use mde_egui::egui::{self, pos2, vec2, Event, Key, Modifiers, Rect};
     use mde_egui::Style;
@@ -3240,5 +3415,102 @@ mod tests {
             hi_v > plain_v,
             "the match bands add painted geometry: {hi_v} vs {plain_v}"
         );
+    }
+
+    // ── EDITOR-12: code folding through the view ─────────────────────────────
+
+    /// A Rust source with a foldable function body, parsed through the real
+    /// highlighter so the view's fold regions come off the SAME tree.
+    fn folded_view() -> (Buffer, Highlighter, EditorView) {
+        let src = "fn main() {\n    let x = 1;\n    let y = 2;\n    println!(\"{x}{y}\");\n}\n";
+        let mut buf = Buffer::from_text(src);
+        let mut hl = Highlighter::new(Language::Rust).expect("rust grammar");
+        hl.sync(&mut buf);
+        let mut view = EditorView::new();
+        view.refresh_folds(&buf, Some(&hl));
+        (buf, hl, view)
+    }
+
+    #[test]
+    fn folding_hides_the_body_rows_and_unfolding_restores_them() {
+        let (buf, _hl, mut view) = folded_view();
+        let full = view.unwrapped_rows(&buf);
+        // Caret on the header line; fold the function.
+        view.place_cursor(&buf, 0);
+        assert!(view.fold_at_caret(&buf), "the fn body is foldable");
+        assert!(
+            view.unwrapped_rows(&buf) < full,
+            "folding removed display rows: {} !< {full}",
+            view.unwrapped_rows(&buf)
+        );
+        // The body lines no longer resolve to any display row.
+        let shown: Vec<usize> = (0..view.unwrapped_rows(&buf))
+            .map(|vr| view.vis_row(&buf, vr, 80).line)
+            .collect();
+        assert!(
+            shown.contains(&0),
+            "the header line stays visible: {shown:?}"
+        );
+        assert!(!shown.contains(&1), "body line 1 is hidden: {shown:?}");
+        assert!(!shown.contains(&2), "body line 2 is hidden: {shown:?}");
+        // Unfold restores every row.
+        assert!(view.unfold_at_caret(&buf), "unfolds at the header");
+        assert_eq!(view.unwrapped_rows(&buf), full, "unfold restored the rows");
+        let restored: Vec<usize> = (0..view.unwrapped_rows(&buf))
+            .map(|vr| view.vis_row(&buf, vr, 80).line)
+            .collect();
+        assert!(
+            restored.contains(&1) && restored.contains(&2),
+            "body back: {restored:?}"
+        );
+    }
+
+    #[test]
+    fn the_fold_chord_folds_at_the_caret() {
+        let (mut buf, _hl, mut view) = folded_view();
+        let full = view.unwrapped_rows(&buf);
+        view.place_cursor(&buf, 0);
+        // Ctrl+Shift+[ folds the region under the caret (the widget keybinding).
+        let mods = Modifiers {
+            shift: true,
+            ..Modifiers::COMMAND
+        };
+        let changed = view.apply_event(&mut buf, &key(Key::OpenBracket, mods), 20);
+        assert!(changed, "the fold chord reports a change");
+        assert!(
+            view.unwrapped_rows(&buf) < full,
+            "the chord folded the body"
+        );
+        // Ctrl+Shift+] unfolds it again.
+        let unfolded = view.apply_event(&mut buf, &key(Key::CloseBracket, mods), 20);
+        assert!(unfolded, "the unfold chord reports a change");
+        assert_eq!(view.unwrapped_rows(&buf), full);
+    }
+
+    #[test]
+    fn a_caret_inside_a_folding_region_is_pulled_to_the_header() {
+        let (buf, _hl, mut view) = folded_view();
+        // Put the caret deep in the body (line 2), then fold the enclosing fn.
+        view.place_cursor(&buf, buf.line_to_char(2));
+        assert!(view.fold_at_caret(&buf), "folds the enclosing region");
+        // The caret must not be stranded on a hidden line.
+        let line = buf.char_to_line(view.cursor());
+        assert!(
+            !view.folds().is_line_hidden(line),
+            "the caret was pulled out of the collapsed region to line {line}"
+        );
+        assert_eq!(line, 0, "it lands on the header line");
+    }
+
+    #[test]
+    fn plain_text_view_never_folds() {
+        // No highlighter (plain text) → no regions → the chord is an honest no-op.
+        let buf = Buffer::from_text("just\nsome\nplain\ntext\n");
+        let mut view = EditorView::new();
+        view.refresh_folds(&buf, None);
+        let full = view.unwrapped_rows(&buf);
+        view.place_cursor(&buf, 0);
+        assert!(!view.fold_at_caret(&buf), "nothing to fold in plain text");
+        assert_eq!(view.unwrapped_rows(&buf), full);
     }
 }

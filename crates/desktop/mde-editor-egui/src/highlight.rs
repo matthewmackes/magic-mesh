@@ -377,6 +377,28 @@ impl Highlighter {
         }
     }
 
+    /// The foldable regions of the current syntax tree (EDITOR-12) — reuses the
+    /// SAME parsed tree as highlighting, never a second parse. Empty until the
+    /// first [`sync`](Self::sync) (or for a language whose tree failed to build).
+    #[must_use]
+    pub fn fold_regions(&self, _rope: &Rope) -> Vec<crate::fold::FoldRegion> {
+        self.tree
+            .as_ref()
+            .map(crate::fold::regions_from_tree)
+            .unwrap_or_default()
+    }
+
+    /// The document's outline symbols (functions / types / impls) from the current
+    /// tree (EDITOR-12) — again over the SAME parsed tree. Names are read straight
+    /// off `rope` by byte span. Empty until the first [`sync`](Self::sync).
+    #[must_use]
+    pub fn symbols(&self, rope: &Rope) -> Vec<crate::outline::Symbol> {
+        self.tree
+            .as_ref()
+            .map(|tree| crate::outline::symbols_from_tree(tree, rope))
+            .unwrap_or_default()
+    }
+
     /// The highlight spans intersecting the char window `chars` — the widget
     /// calls this once per frame with the visible viewport (so the query cost
     /// scales with what's on screen, matching the paint culling), then slices

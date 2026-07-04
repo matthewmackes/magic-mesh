@@ -41,6 +41,8 @@ pub enum PaletteCommand {
     OpenScratch,
     /// Show/hide the project-tree side panel.
     ToggleTree,
+    /// Show/hide the symbol-outline side panel (EDITOR-12).
+    ToggleOutline,
     /// Flip the editor's soft-wrap.
     ToggleWrap,
     /// Close the open document, returning to the empty state.
@@ -51,10 +53,11 @@ pub enum PaletteCommand {
 
 impl PaletteCommand {
     /// Every command the palette offers, in display order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Save,
         Self::OpenScratch,
         Self::ToggleTree,
+        Self::ToggleOutline,
         Self::ToggleWrap,
         Self::CloseDoc,
         Self::OpenFolderCwd,
@@ -67,6 +70,7 @@ impl PaletteCommand {
             Self::Save => "Save",
             Self::OpenScratch => "Open Scratch Buffer",
             Self::ToggleTree => "Toggle Project Tree",
+            Self::ToggleOutline => "Toggle Symbol Outline",
             Self::ToggleWrap => "Toggle Soft-Wrap",
             Self::CloseDoc => "Close Document",
             Self::OpenFolderCwd => "Open Folder (current directory)",
@@ -81,6 +85,7 @@ impl PaletteCommand {
             Self::Save => "buffer.save",
             Self::OpenScratch => "new scratch document",
             Self::ToggleTree => "project tree panel",
+            Self::ToggleOutline => "symbol outline panel",
             Self::ToggleWrap => "editor soft-wrap",
             Self::CloseDoc => "back to empty state",
             Self::OpenFolderCwd => "root tree at cwd",
@@ -283,10 +288,10 @@ mod tests {
 
     #[test]
     fn every_command_has_a_nonempty_title_and_hint() {
-        // §7 — no dead / blank entries: each of the six commands is named + hinted.
+        // §7 — no dead / blank entries: each command is named + hinted.
         assert_eq!(
             PaletteCommand::ALL.len(),
-            6,
+            7,
             "the full command set is listed"
         );
         for cmd in PaletteCommand::ALL {
@@ -302,7 +307,7 @@ mod tests {
         let results = palette.results();
         assert_eq!(
             results,
-            vec![0, 1, 2, 3, 4, 5],
+            vec![0, 1, 2, 3, 4, 5, 6],
             "empty query lists every command"
         );
     }

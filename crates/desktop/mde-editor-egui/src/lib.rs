@@ -81,6 +81,15 @@
 //!   walk — a picked hit opens the file + jumps to the line (§7 — real rope
 //!   edits + real files, no mockups).
 //!
+//! * EDITOR-12 — **code folding + symbol outline** ([`fold`] / [`outline`]): both
+//!   reuse the SAME EDITOR-5 tree-sitter tree (no second parser). Folding derives
+//!   fold regions (functions / blocks / impls) from the tree, collapses them from
+//!   a gutter chevron or the `Ctrl-Shift-[` / `Ctrl-Shift-]` chords (per-buffer
+//!   state), and genuinely hides the folded lines in the widget render. The
+//!   outline is a toggleable panel (`Ctrl-Shift-O`) listing the file's symbols;
+//!   clicking one jumps the caret through the shared EDITOR-8/LSP jump seam. A
+//!   language with no grammar shows an honest empty state (§7).
+//!
 //! Layering (§6): the surface state + render seam live in [`panel`], the widget in
 //! [`widget`], the document model in [`buffer`]; the only in-workspace edge points
 //! inward to [`mde_egui`] (the harness + the shared Carbon `Style`).
@@ -89,6 +98,7 @@ pub mod buffer;
 pub mod collab_session;
 pub mod crdt;
 mod finder;
+pub mod fold;
 mod format_bar;
 mod fuzzy;
 pub mod highlight;
@@ -97,6 +107,7 @@ pub mod lsp_nav;
 pub mod lsp_ui;
 pub mod md_actions;
 mod menu_bar;
+pub mod outline;
 mod palette;
 pub mod panel;
 pub mod panes;
@@ -113,9 +124,11 @@ pub use collab_session::{
     FakeBus, FrameKind, PollOutcome, Presence, RemotePeer, Role, SessionId,
 };
 pub use crdt::{CollabDoc, CrdtError, EditSink, TextEdit};
+pub use fold::{FoldRegion, Folds};
 pub use highlight::{Highlighter, Language};
 pub use lsp::{Diagnostic, LspClient, LspState, Severity};
 pub use lsp_ui::DiagnosticsOverlay;
+pub use outline::{Symbol, SymbolKind};
 pub use panel::{editor_panel, EditorSurface};
 pub use project_tree::ProjectTree;
 pub use widget::{editor_widget, EditorView};

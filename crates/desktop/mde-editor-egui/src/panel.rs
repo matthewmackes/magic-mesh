@@ -43,6 +43,7 @@ use crate::lsp_nav::{self, RefRow, ReferencesPanel, RenameBox};
 use crate::lsp_ui::{lsp_status, DiagnosticsOverlay};
 use crate::md_actions::{self, ListKind};
 use crate::menu_bar::{self, ListStyle, MenuAction, MenuContext};
+use crate::outline;
 use crate::palette::{self, CommandPalette, PaletteCommand};
 use crate::panes::{self, NavDir, Pane, PaneId, SplitDir};
 use crate::project_tree::{self, ProjectTree};
@@ -52,6 +53,10 @@ use crate::widget::{editor_widget, EditorView, MatchHighlights};
 
 /// The project-tree side panel's default width — six shared spacing units (§4).
 const TREE_WIDTH: f32 = Style::SP_XL * 6.0;
+
+/// The symbol-outline side panel's default width (EDITOR-12) — six shared
+/// spacing units (§4), the tree's twin on the opposite edge.
+const OUTLINE_WIDTH: f32 = Style::SP_XL * 6.0;
 
 /// Below this panel width the Word toolbars lean out (EDTB-4, design lock #9):
 /// each strip's width-heavy dropdown folds into a `»` overflow so the Standard +
@@ -403,6 +408,8 @@ pub struct EditorSurface {
     project: Option<ProjectTree>,
     /// Whether the project-tree side panel is shown beside the editor body.
     show_tree: bool,
+    /// Whether the symbol-outline side panel is shown (EDITOR-12).
+    show_outline: bool,
     /// The fuzzy file-finder overlay (EDITOR-7, `Cmd`/`Ctrl-P`).
     finder: FileFinder,
     /// The command-palette overlay (EDITOR-7, `Cmd`/`Ctrl-Shift-P`).
@@ -453,6 +460,7 @@ impl Default for EditorSurface {
             pane_widget_ids: HashMap::new(),
             project: None,
             show_tree: false,
+            show_outline: false,
             finder: FileFinder::default(),
             palette: CommandPalette::default(),
             find: FindState::default(),
@@ -1316,6 +1324,37 @@ impl EditorSurface {
             .unwrap_or_default()
     }
 
+    // ── EDITOR-12: the symbol outline ────────────────────────────────────────
+
+    /// The focused document's outline symbols (functions / types / impls), derived
+    /// from its tree-sitter tree — empty for a plain-text / pathless buffer (the
+    /// honest empty state the panel then shows). Owned so the caller can render past
+    /// the `&mut self` render borrow.
+    fn active_symbols(&self) -> Vec<outline::Symbol> {
+        self.doc()
+            .and_then(|doc| {
+                doc.highlight
+                    .as_ref()
+                    .map(|hl| hl.symbols(doc.buffer.rope()))
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether the focused document has a syntax grammar (a highlighter) — the
+    /// outline uses it to tell "no outline for this file type" from "no symbols".
+    fn active_has_grammar(&self) -> bool {
+        self.doc().is_some_and(|doc| doc.highlight.is_some())
+    }
+
+    /// Jump the focused document's caret to rope char offset `idx` — the outline
+    /// row click seam, reusing the SAME [`EditorView::place_cursor`] reveal the
+    /// EDITOR-8 / LSP jumps use (§6). A no-op when no document is open.
+    fn jump_caret(&mut self, idx: usize) {
+        if let Some(doc) = self.doc_mut() {
+            doc.view.place_cursor(&doc.buffer, idx);
+        }
+    }
+
     /// Open `path` and place the caret at the LSP `(line, character)` — the shared
     /// jump seam reused by goto-definition and a reference pick (the EDITOR-8
     /// open+jump idiom). A read failure is a silent no-op (a vanished file).
@@ -1346,6 +1385,7 @@ impl EditorSurface {
             }
             PaletteCommand::OpenScratch => self.open_scratch(),
             PaletteCommand::ToggleTree => self.show_tree = !self.show_tree,
+            PaletteCommand::ToggleOutline => self.show_outline = !self.show_outline,
             PaletteCommand::ToggleWrap => {
                 if let Some(doc) = self.doc_mut() {
                     doc.view.toggle_wrap();
@@ -1877,6 +1917,10 @@ impl EditorSurface {
             ui.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::F));
         let open_find = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F));
         let open_replace = ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::H));
+        // EDITOR-12 — the symbol-outline side-panel toggle, consumed here so it
+        // never types an `o` into the buffer.
+        let toggle_outline =
+            ui.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::O));
         if open_palette {
             self.toggle_palette();
         }
@@ -1891,6 +1935,9 @@ impl EditorSurface {
         }
         if open_replace {
             self.open_replace();
+        }
+        if toggle_outline {
+            self.show_outline = !self.show_outline;
         }
     }
 
@@ -2017,6 +2064,17 @@ impl EditorSurface {
         ui.horizontal(|ui| {
             ui.add_space(Style::SP_S);
             tree_toggle(ui, &mut self.show_tree);
+            // EDITOR-12 — the symbol-outline toggle (mouse twin of Ctrl+Shift+O).
+            if ui
+                .selectable_label(
+                    self.show_outline,
+                    RichText::new("\u{2263}").size(Style::BODY),
+                )
+                .on_hover_text("Toggle the symbol outline (Ctrl+Shift+O)")
+                .clicked()
+            {
+                self.show_outline = !self.show_outline;
+            }
             ui.add_space(Style::SP_M);
             if ui
                 .selectable_label(false, RichText::new("\u{2503}").size(Style::BODY))
@@ -2489,6 +2547,7 @@ fn heading_level_of(buffer: &Buffer, line: usize) -> u8 {
 /// state plus a temporary "open a scratch buffer" affordance so the surface is
 /// exercisable before fuzzy-open lands. `surface` is the mount seam the shell
 /// wires (the analogue of `files_panel`'s `&mut FileBrowser`).
+#[allow(clippy::too_many_lines)] // one linear mount sequence; splitting it hides the order
 pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
     // EDITOR-7 — panel-level keybind intercept. Consume the overlay trigger chords
     // FIRST, before the tree/central body render (the text widget clones this
@@ -2597,6 +2656,25 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
         }
         if let Some(path) = picked {
             surface.open_selected(&path);
+        }
+    }
+
+    // EDITOR-12 — the toggleable symbol-outline side panel, drawn on the RIGHT edge
+    // (the project tree's twin) so the editor fills the space between them. A row
+    // click jumps the focused caret through the shared `place_cursor` seam; a
+    // language with no grammar / no symbols shows an honest empty state.
+    if surface.show_outline {
+        let symbols = surface.active_symbols();
+        let has_grammar = surface.active_has_grammar();
+        let has_doc = surface.doc().is_some();
+        let jump = egui::SidePanel::right("editor-outline")
+            .resizable(true)
+            .default_width(OUTLINE_WIDTH)
+            .frame(egui::Frame::default().fill(Style::SURFACE))
+            .show_inside(ui, |ui| outline::show(ui, &symbols, has_grammar, has_doc))
+            .inner;
+        if let Some(idx) = jump {
+            surface.jump_caret(idx);
         }
     }
 
@@ -2861,6 +2939,65 @@ mod tests {
             surface.doc().expect("doc").highlight.is_none(),
             "a pathless scratch buffer renders plain (no guessed grammar)"
         );
+    }
+
+    #[test]
+    fn the_outline_lists_and_jumps_to_symbols() {
+        // EDITOR-12 — the outline is derived from the SAME tree-sitter tree the
+        // highlighter parses; a symbol click jumps the caret via `place_cursor`.
+        let d = TempDir::new("outline");
+        let file = d.join("shapes.rs");
+        std::fs::write(
+            &file,
+            b"struct Point {\n    x: i32,\n}\n\nfn area() -> i32 {\n    0\n}\n",
+        )
+        .expect("write");
+        let mut surface = real_editor();
+        surface.open_path(&file).expect("open");
+        surface.show_outline = true;
+        // The first frame syncs the highlighter tree, so the outline populates.
+        assert!(tessellate_panel(&mut surface) > 0, "panel + outline render");
+
+        assert!(surface.active_has_grammar(), "the .rs doc has a grammar");
+        let symbols = surface.active_symbols();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Point"), "struct listed: {names:?}");
+        assert!(names.contains(&"area"), "fn listed: {names:?}");
+
+        // Clicking the fn jumps the caret onto it (the outline row seam).
+        let area = symbols.iter().find(|s| s.name == "area").expect("fn area");
+        surface.jump_caret(area.char_start);
+        let cursor = surface.doc().expect("doc").view.cursor();
+        assert_eq!(cursor, area.char_start, "the caret jumped to the symbol");
+    }
+
+    #[test]
+    fn the_outline_shows_an_honest_empty_state_without_a_grammar() {
+        // A pathless scratch buffer has no grammar → the panel shows the honest
+        // empty state (no fabricated symbols, §7) and still renders.
+        let mut surface = real_editor();
+        surface.open_scratch();
+        surface.show_outline = true;
+        assert!(!surface.active_has_grammar(), "scratch has no grammar");
+        assert!(surface.active_symbols().is_empty(), "no symbols to list");
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the empty-state outline still paints"
+        );
+    }
+
+    #[test]
+    fn toggle_outline_command_flips_the_panel() {
+        // §7 — the palette command drives the real panel flag (no dead entry).
+        let mut surface = real_editor();
+        let before = surface.show_outline;
+        surface.run_command(PaletteCommand::ToggleOutline);
+        assert_ne!(
+            surface.show_outline, before,
+            "the command toggled the outline"
+        );
+        surface.run_command(PaletteCommand::ToggleOutline);
+        assert_eq!(surface.show_outline, before, "toggling again restores it");
     }
 
     #[test]
