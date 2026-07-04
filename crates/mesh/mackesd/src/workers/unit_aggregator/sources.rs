@@ -292,7 +292,7 @@ impl OpenstackMirrorSource for NoCloud {
 // ─────────────────────────── LAN scan seam ───────────────────────────
 
 /// One LAN host the active scan discovered (EXPLORER-2 fills these).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LanHostRecord {
     /// The stable id key — the host's MAC (preferred) or IP (fallback).
     pub key: String,
@@ -300,6 +300,17 @@ pub struct LanHostRecord {
     pub name: String,
     /// The host's LAN address, when known.
     pub address: Option<String>,
+    /// Open service labels from the light port fingerprint (E5, EXPLORER-2):
+    /// e.g. `["ssh", "rdp", "vnc"]`. Empty when nothing answered / unprobed (§7).
+    pub services: Vec<String>,
+    /// The raw open fingerprint ports behind [`Self::services`] — the seam the
+    /// openable per-service actions (E5) ride. Empty when none.
+    pub open_ports: Vec<u16>,
+    /// Coarse device-type guess from the fingerprint + mDNS (E5). `None` when
+    /// nothing is confident enough — honest unknown, never guessed (§7).
+    pub type_guess: Option<String>,
+    /// Reverse-DNS / mDNS name (E5), when resolved. `None` ⇒ unresolved.
+    pub rdns: Option<String>,
 }
 
 /// The off-mesh half (EXPLORER-2 producer seam). The active scan runs ONLY while

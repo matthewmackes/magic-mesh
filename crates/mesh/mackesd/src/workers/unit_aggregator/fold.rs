@@ -103,7 +103,33 @@ fn self_unit_synthetic(self_host: &str, leader: Option<&str>) -> Unit {
 }
 
 /// Build a `LanHost` unit (EXPLORER-2 producer feeds these).
+///
+/// The scan's port fingerprint folds into the open [`Extras`] block (E5): the
+/// service-label list (`extras.fingerprint`), the coarse type guess + raw open
+/// ports (`extras.extra`), and the rDNS/mDNS name (`extras.rdns`). Every field
+/// stays honestly absent when the scan couldn't answer it (§7); the richer OUI /
+/// cert enrichment is EXPLORER-9.
 fn lan_unit(rec: &LanHostRecord) -> Unit {
+    let mut extras = Extras {
+        rdns: rec.rdns.clone(),
+        ..Extras::default()
+    };
+    if !rec.services.is_empty() {
+        extras.fingerprint = Some(rec.services.join(", "));
+    }
+    if let Some(guess) = &rec.type_guess {
+        extras.extra.insert("type_guess".to_string(), guess.clone());
+    }
+    if !rec.open_ports.is_empty() {
+        extras.extra.insert(
+            "open_ports".to_string(),
+            rec.open_ports
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
     Unit {
         id: lan_unit_id(&rec.key),
         kind: UnitKind::LanHost,
@@ -115,7 +141,7 @@ fn lan_unit(rec: &LanHostRecord) -> Unit {
         mesh: None,
         first_seen_ms: 0,
         last_seen_ms: 0,
-        extras: Extras::default(),
+        extras,
     }
 }
 
@@ -331,6 +357,7 @@ mod tests {
             key: "aa:bb".into(),
             name: "printer".into(),
             address: Some("172.20.0.50".into()),
+            ..Default::default()
         }];
         let cloud = vec![cloud_rec("node-a", "i1", CloudKind::Instance, "web")];
         let mut seen = SeenTracker::new();
@@ -338,6 +365,60 @@ mod tests {
         assert_eq!(units[0].kind, UnitKind::Peer);
         assert_eq!(units[1].kind, UnitKind::LanHost);
         assert_eq!(units[2].kind, UnitKind::Instance);
+    }
+
+    #[test]
+    fn lan_host_folds_the_scan_fingerprint_into_extras() {
+        // A fingerprinted LAN host (EXPLORER-2): its service labels + type guess
+        // + rDNS name fold into the open Extras block (E5).
+        let fingerprinted = LanHostRecord {
+            key: "aa:bb:cc:dd:ee:ff".into(),
+            name: "desk.local".into(),
+            address: Some("192.168.1.40".into()),
+            services: vec!["rdp".into(), "vnc".into()],
+            open_ports: vec![3389, 5900],
+            type_guess: Some("computer".into()),
+            rdns: Some("desk.local".into()),
+        };
+        // An un-fingerprinted silent host (only ARP-known): honest-empty extras (§7).
+        let bare = LanHostRecord {
+            key: "192.168.1.41".into(),
+            name: "192.168.1.41".into(),
+            address: Some("192.168.1.41".into()),
+            ..Default::default()
+        };
+        let mesh = MeshSnapshot {
+            self_host: "me".into(),
+            leader: None,
+            peers: vec![],
+        };
+        let mut seen = SeenTracker::new();
+        let units = aggregate(&mesh, &[], &[fingerprinted, bare], &mut seen, 1);
+        let desk = units
+            .iter()
+            .find(|u| u.id == lan_unit_id("aa:bb:cc:dd:ee:ff"))
+            .expect("fingerprinted lan unit");
+        assert_eq!(desk.kind, UnitKind::LanHost);
+        assert_eq!(desk.reachability, Reachability::OnLan);
+        assert_eq!(desk.extras.fingerprint.as_deref(), Some("rdp, vnc"));
+        assert_eq!(desk.extras.rdns.as_deref(), Some("desk.local"));
+        assert_eq!(
+            desk.extras.extra.get("type_guess").map(String::as_str),
+            Some("computer")
+        );
+        assert_eq!(
+            desk.extras.extra.get("open_ports").map(String::as_str),
+            Some("3389,5900")
+        );
+        // The bare host carries no fabricated fingerprint/type — honest unknown.
+        let bare_unit = units
+            .iter()
+            .find(|u| u.id == lan_unit_id("192.168.1.41"))
+            .expect("bare lan unit");
+        assert!(bare_unit.extras.fingerprint.is_none());
+        assert!(bare_unit.extras.rdns.is_none());
+        assert!(bare_unit.extras.extra.is_empty());
+        assert!(bare_unit.health.is_none());
     }
 
     #[test]

@@ -38,6 +38,7 @@
 #![cfg(feature = "async-services")]
 
 pub mod fold;
+pub mod lan_scan;
 pub mod sources;
 #[cfg(test)]
 pub(crate) mod testkit;
@@ -57,8 +58,9 @@ use mde_bus::rpc::reply_topic;
 use super::{ShutdownToken, Worker};
 
 use fold::{aggregate, SeenTracker};
+use lan_scan::LanScan;
 use sources::{
-    BusOpenstackMirror, LanScanSource, MeshDirectoryMirror, MeshMirrorSource, NoCloud, NoScan,
+    BusOpenstackMirror, LanScanSource, MeshDirectoryMirror, MeshMirrorSource, NoCloud,
     OpenstackMirrorSource,
 };
 use unit::UnitsState;
@@ -159,8 +161,9 @@ pub struct UnitAggregatorWorker {
 impl UnitAggregatorWorker {
     /// Construct with production defaults: the replicated peer directory + etcd
     /// leader as the mesh seam, the persisted Bus tree as the openstack-union
-    /// seam, no LAN scan yet (EXPLORER-2), and the default cadences. `host` is
-    /// this node's id; `workgroup_root` seeds the peer-directory reader.
+    /// seam, the surface-gated active LAN scan ([`LanScan`], EXPLORER-2) as the
+    /// off-mesh seam, and the default cadences. `host` is this node's id;
+    /// `workgroup_root` seeds the peer-directory reader.
     #[must_use]
     pub fn new(host: String, workgroup_root: PathBuf) -> Self {
         let bus_root = default_bus_root();
@@ -172,7 +175,7 @@ impl UnitAggregatorWorker {
             mesh: Arc::new(MeshDirectoryMirror::new(workgroup_root, host.clone())),
             host,
             cloud,
-            scan: Arc::new(NoScan),
+            scan: Arc::new(LanScan::live()),
             scan_active: Arc::new(AtomicBool::new(false)),
             bus_root,
             poll: DEFAULT_POLL_INTERVAL,
@@ -306,7 +309,7 @@ impl Worker for UnitAggregatorWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::sources::{CloudKind, CloudObjectRecord, LanHostRecord, MeshSnapshot};
+    use super::sources::{CloudKind, CloudObjectRecord, LanHostRecord, MeshSnapshot, NoScan};
     use super::testkit::{FakeLanScan, FakeMeshMirror, FakeOpenstack};
     use super::unit::UnitKind;
     use super::*;
@@ -350,6 +353,7 @@ mod tests {
             key: "aa:bb".into(),
             name: "printer".into(),
             address: Some("172.20.0.50".into()),
+            ..Default::default()
         }]));
         let mut w = worker_with(mesh, cloud, Arc::clone(&scan));
         // Surface visible → the scan runs (lock #24).
@@ -378,6 +382,7 @@ mod tests {
             key: "aa:bb".into(),
             name: "printer".into(),
             address: None,
+            ..Default::default()
         }]));
         let mut w = worker_with(mesh, vec![], Arc::clone(&scan));
         // Default: scan flag false (surface closed) → no probing, no LAN units.
