@@ -48,6 +48,7 @@ use crate::palette::{self, CommandPalette, PaletteCommand};
 use crate::panes::{self, NavDir, Pane, PaneId, SplitDir};
 use crate::project_tree::{self, ProjectTree};
 use crate::search::{self, FindEvent, FindState, ProjectSearch};
+use crate::terminal::TerminalDock;
 use crate::toolbar;
 use crate::widget::{editor_widget, EditorView, MatchHighlights};
 
@@ -77,6 +78,14 @@ fn is_compact(available_width: f32) -> bool {
 
 /// The Save As / About dialog plate width — ten shared spacing units (§4).
 const DIALOG_W: f32 = Style::SP_XL * 10.0;
+
+/// The integrated terminal dock's default height (EDITOR-10) — eight shared
+/// spacing units (§4); resizable, so this is only the opening size.
+const TERMINAL_HEIGHT: f32 = Style::SP_XL * 8.0;
+
+/// The terminal dock's minimum drag height — three spacing units (§4), so a
+/// dragged-down dock still shows a usable row or two of the shell.
+const TERMINAL_MIN_HEIGHT: f32 = Style::SP_XL * 3.0;
 
 /// The About dialog's title (Help → About the Editor, EDTB-1).
 const ABOUT_TITLE: &str = "About the Editor";
@@ -443,6 +452,9 @@ pub struct EditorSurface {
     /// (§7) — e.g. "Saved" / "Autosaved" / "Reloaded from disk" / a write error —
     /// shown in the status bar until the next action replaces it.
     notice: Option<String>,
+    /// The EDITOR-10 integrated terminal dock — `mde-term-egui`'s `TabbedTerminal`
+    /// embedded as a toggleable bottom panel over a real PTY in the project root.
+    terminal: TerminalDock,
 }
 
 impl Default for EditorSurface {
@@ -474,6 +486,7 @@ impl Default for EditorSurface {
             autosave: load_autosave_prefs(),
             reload: ReloadWatch::default(),
             notice: None,
+            terminal: TerminalDock::default(),
         }
     }
 }
@@ -1386,6 +1399,7 @@ impl EditorSurface {
             PaletteCommand::OpenScratch => self.open_scratch(),
             PaletteCommand::ToggleTree => self.show_tree = !self.show_tree,
             PaletteCommand::ToggleOutline => self.show_outline = !self.show_outline,
+            PaletteCommand::ToggleTerminal => self.toggle_terminal(),
             PaletteCommand::ToggleWrap => {
                 if let Some(doc) = self.doc_mut() {
                     doc.view.toggle_wrap();
@@ -1397,6 +1411,39 @@ impl EditorSurface {
                     self.open_folder(cwd);
                 }
             }
+        }
+    }
+
+    // ── EDITOR-10: the integrated terminal dock ─────────────────────────────
+
+    /// The working directory a freshly opened terminal spawns its shell in: the
+    /// open project root, else the current working directory — the same root
+    /// resolution [`open_finder`](Self::open_finder) /
+    /// [`open_project_search`](Self::open_project_search) use, so the dock is
+    /// always reachable.
+    fn terminal_cwd(&self) -> Option<PathBuf> {
+        self.project
+            .as_ref()
+            .map(|tree| tree.root().to_path_buf())
+            .or_else(|| std::env::current_dir().ok())
+    }
+
+    /// Toggle the integrated terminal dock (Ctrl+Backtick / View → Terminal / the
+    /// surface-strip button / the palette). Opening it lazily spawns a real login
+    /// shell in the project cwd on the first open; toggling only shows/hides
+    /// thereafter, so the session is never lost (EDITOR-10).
+    pub(crate) fn toggle_terminal(&mut self) {
+        let cwd = self.terminal_cwd();
+        self.terminal.toggle(cwd.as_deref());
+    }
+
+    /// Intercept the terminal-toggle chord (Ctrl+Backtick) at the panel level —
+    /// consumed BEFORE the text widget clones this frame's events (mirroring the
+    /// other panel-level chord intercepts) so it flips the dock instead of typing
+    /// a backtick into the buffer.
+    fn handle_terminal_chord(&mut self, ui: &Ui) {
+        if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Backtick)) {
+            self.toggle_terminal();
         }
     }
 
@@ -1412,6 +1459,7 @@ impl EditorSurface {
             can_undo: doc.is_some_and(|d| d.view.can_undo()),
             can_redo: doc.is_some_and(|d| d.view.can_redo()),
             tree_shown: self.show_tree,
+            terminal_shown: self.terminal.is_shown(),
             wrap_on: doc.is_some_and(|d| d.view.wrap()),
             zoom_percent: doc.map(|d| d.view.zoom_percent()),
             // The Format strip Style dropdown reads the primary caret line's
@@ -1473,6 +1521,7 @@ impl EditorSurface {
                 }
             }
             MenuAction::ToggleTree => self.run_command(PaletteCommand::ToggleTree),
+            MenuAction::ToggleTerminal => self.run_command(PaletteCommand::ToggleTerminal),
             MenuAction::ToggleWrap => self.run_command(PaletteCommand::ToggleWrap),
             MenuAction::CommandPalette => self.toggle_palette(),
             MenuAction::About => self.about_open = true,
@@ -2075,6 +2124,17 @@ impl EditorSurface {
             {
                 self.show_outline = !self.show_outline;
             }
+            // EDITOR-10 — the integrated-terminal toggle (mouse twin of Ctrl+`).
+            if ui
+                .selectable_label(
+                    self.terminal.is_shown(),
+                    RichText::new("\u{2328}").size(Style::BODY),
+                )
+                .on_hover_text("Toggle the integrated terminal (Ctrl+`)")
+                .clicked()
+            {
+                self.toggle_terminal();
+            }
             ui.add_space(Style::SP_M);
             if ui
                 .selectable_label(false, RichText::new("\u{2503}").size(Style::BODY))
@@ -2566,6 +2626,10 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
     // external-change poll. `now` is egui's app-time in seconds; both the tick and
     // the poll are debounced so neither fights a live edit gesture.
     surface.handle_save_chord(ui);
+    // EDITOR-10 — the integrated-terminal toggle chord (`Ctrl+``), consumed at the
+    // panel level for the same reason (before the widget clones this frame's
+    // events) so it flips the dock instead of typing a backtick into the buffer.
+    surface.handle_terminal_chord(ui);
     let now = ui.input(|i| i.time);
     surface.tick_autosave(now);
     surface.poll_external_change(now);
@@ -2692,6 +2756,21 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
                         .inner_margin(Style::SP_XS),
                 )
                 .show_inside(ui, |ui| surface.status_bar(ui));
+        }
+        // EDITOR-10 — the integrated terminal dock, a toggleable, resizable bottom
+        // panel above the status strip (its bottom panel was added first, so this
+        // one sits over it). Pump its chords + live font first, then paint the
+        // reused `TabbedTerminal`; the session persists across toggles.
+        if surface.terminal.is_shown() {
+            egui::TopBottomPanel::bottom("editor-terminal")
+                .resizable(true)
+                .default_height(TERMINAL_HEIGHT)
+                .min_height(TERMINAL_MIN_HEIGHT)
+                .frame(egui::Frame::default().fill(Style::BG))
+                .show_inside(ui, |ui| {
+                    surface.terminal.pump(ui.ctx());
+                    surface.terminal.show(ui);
+                });
         }
         let body = ui.available_rect_before_wrap();
         surface.render_panes(ui, body, &find_bands, find_current);
@@ -2889,6 +2968,86 @@ mod tests {
         );
         surface.close();
         assert!(!surface.is_open(), "close returns to the empty state");
+    }
+
+    /// EDITOR-10 — the integrated terminal dock is reachable through the real
+    /// `editor_panel` path: the Ctrl+Backtick chord toggles it on, it spawns a real PTY
+    /// in the open project root, the panel mounts + paints with it shown, and the
+    /// chord toggles it back off — all without losing the session (the acceptance).
+    #[test]
+    fn the_terminal_dock_toggles_and_spawns_in_the_project_cwd() {
+        let tmp = TempDir::new("term-dock");
+        let want = tmp.0.canonicalize().expect("canonical project root");
+        let mut surface = real_editor();
+        surface.open_folder(want.clone());
+        assert!(!surface.terminal.is_shown(), "the dock starts hidden");
+
+        // Frame 1: Ctrl+` opens the dock (the panel-level chord intercept), and
+        // the same frame mounts + paints the dock's real terminal (the chord fires
+        // at the top of `editor_panel`, before the bottom panel renders). One ctx
+        // for the whole interaction so the lazily-installed terminal font persists.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            events: vec![key_press(Key::Backtick, Modifiers::COMMAND)],
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor_panel(ui, &mut surface);
+            });
+        });
+        assert!(
+            surface.terminal.is_shown(),
+            "Ctrl+` shows the terminal dock"
+        );
+        assert!(
+            !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty(),
+            "the editor with the terminal dock produced no draw primitives"
+        );
+        let got = surface
+            .terminal
+            .active_cwd()
+            .expect("the dock spawned a live local shell")
+            .canonicalize()
+            .expect("canonical shell cwd");
+        assert_eq!(got, want, "the shell spawned in the open project root");
+
+        // Frame 2: Ctrl+` again hides it — the session survives (still spawned).
+        run_frame(
+            &ctx,
+            &mut surface,
+            vec![key_press(Key::Backtick, Modifiers::COMMAND)],
+        );
+        assert!(
+            !surface.terminal.is_shown(),
+            "Ctrl+` hides the terminal dock"
+        );
+        assert!(
+            surface.terminal.active_cwd().is_some(),
+            "hiding the dock kept its live session"
+        );
+    }
+
+    /// EDITOR-10 — the View → Terminal menu action drives the SAME toggle seam as
+    /// the chord (§6, one implementation), and the menu context reports the state
+    /// for its checkmark.
+    #[test]
+    fn the_view_menu_terminal_action_toggles_the_dock() {
+        let ctx = egui::Context::default();
+        let mut surface = real_editor();
+        assert!(!surface.menu_context().terminal_shown, "starts hidden");
+        surface.run_action(&ctx, MenuAction::ToggleTerminal);
+        assert!(
+            surface.menu_context().terminal_shown,
+            "the View → Terminal action shows the dock"
+        );
+        surface.run_action(&ctx, MenuAction::ToggleTerminal);
+        assert!(
+            !surface.menu_context().terminal_shown,
+            "toggling again hides it"
+        );
     }
 
     #[test]

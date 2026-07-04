@@ -4,7 +4,7 @@
 //! `Cmd`/`Ctrl-Shift-P` toggles it (the intercept lives at the panel level in
 //! [`crate::panel`], never in the text widget). Each entry is a real command over
 //! the existing [`EditorSurface`](crate::EditorSurface) seams — Save, Open Scratch,
-//! Toggle Project Tree, Toggle Soft-Wrap, Close Document, Open Folder — dispatched
+//! Toggle Project Tree, Toggle Terminal, Toggle Soft-Wrap, Close Document, Open Folder — dispatched
 //! by [`EditorSurface::run_command`](crate::EditorSurface::run_command). There are
 //! **no dead entries** (§7): picking one actually invokes its seam.
 //!
@@ -43,6 +43,8 @@ pub enum PaletteCommand {
     ToggleTree,
     /// Show/hide the symbol-outline side panel (EDITOR-12).
     ToggleOutline,
+    /// Show/hide the integrated terminal dock (EDITOR-10).
+    ToggleTerminal,
     /// Flip the editor's soft-wrap.
     ToggleWrap,
     /// Close the open document, returning to the empty state.
@@ -53,11 +55,12 @@ pub enum PaletteCommand {
 
 impl PaletteCommand {
     /// Every command the palette offers, in display order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Save,
         Self::OpenScratch,
         Self::ToggleTree,
         Self::ToggleOutline,
+        Self::ToggleTerminal,
         Self::ToggleWrap,
         Self::CloseDoc,
         Self::OpenFolderCwd,
@@ -71,6 +74,7 @@ impl PaletteCommand {
             Self::OpenScratch => "Open Scratch Buffer",
             Self::ToggleTree => "Toggle Project Tree",
             Self::ToggleOutline => "Toggle Symbol Outline",
+            Self::ToggleTerminal => "Toggle Terminal",
             Self::ToggleWrap => "Toggle Soft-Wrap",
             Self::CloseDoc => "Close Document",
             Self::OpenFolderCwd => "Open Folder (current directory)",
@@ -86,6 +90,7 @@ impl PaletteCommand {
             Self::OpenScratch => "new scratch document",
             Self::ToggleTree => "project tree panel",
             Self::ToggleOutline => "symbol outline panel",
+            Self::ToggleTerminal => "integrated terminal dock",
             Self::ToggleWrap => "editor soft-wrap",
             Self::CloseDoc => "back to empty state",
             Self::OpenFolderCwd => "root tree at cwd",
@@ -291,7 +296,7 @@ mod tests {
         // §7 — no dead / blank entries: each command is named + hinted.
         assert_eq!(
             PaletteCommand::ALL.len(),
-            7,
+            8,
             "the full command set is listed"
         );
         for cmd in PaletteCommand::ALL {
@@ -303,11 +308,11 @@ mod tests {
     #[test]
     fn an_empty_query_lists_every_command_in_order() {
         let palette = CommandPalette::default();
-        // `default` is closed; results only reads query/ALL, so it lists all six.
+        // `default` is closed; results only reads query/ALL, so it lists them all.
         let results = palette.results();
         assert_eq!(
             results,
-            vec![0, 1, 2, 3, 4, 5, 6],
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
             "empty query lists every command"
         );
     }

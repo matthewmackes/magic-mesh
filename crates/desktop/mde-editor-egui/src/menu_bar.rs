@@ -12,7 +12,7 @@
 //!   in-buffer find is EDITOR-8 and has not landed, so there is no honest
 //!   target yet (the finder finds *files*, not text — routing Find there would
 //!   lie about what it does).
-//! * **View** — Project Tree + Soft-Wrap toggles (checked = current state).
+//! * **View** — Project Tree + Terminal + Soft-Wrap toggles (checked = current state).
 //!   Preview / per-bar toggles arrive with EDTB-7 / later phases.
 //! * **Insert** (EDTB-3) — Table…, which opens the Word grid-picker and drops a
 //!   markdown table skeleton at the caret ([`crate::md_actions::insert_table`]).
@@ -92,6 +92,8 @@ pub enum MenuAction {
     SelectAll,
     /// Show/hide the project-tree side panel (the palette's toggle).
     ToggleTree,
+    /// Show/hide the integrated terminal dock (EDITOR-10; the palette's toggle).
+    ToggleTerminal,
     /// Flip the editor's soft-wrap (the palette's toggle).
     ToggleWrap,
     /// Toggle the command palette — the same overlay `Ctrl-Shift-P` raises.
@@ -217,6 +219,8 @@ pub struct MenuContext {
     pub can_redo: bool,
     /// The project-tree side panel is shown (View → Project Tree checkmark).
     pub tree_shown: bool,
+    /// The integrated terminal dock is shown (View → Terminal checkmark, EDITOR-10).
+    pub terminal_shown: bool,
     /// Soft-wrap is on for the open document (View → Soft-Wrap checkmark).
     pub wrap_on: bool,
     /// The open document's view zoom in percent, or `None` with no document
@@ -268,6 +272,7 @@ impl MenuItem {
     pub const fn checked(&self, cx: &MenuContext) -> Option<bool> {
         match self.action {
             MenuAction::ToggleTree => Some(cx.tree_shown),
+            MenuAction::ToggleTerminal => Some(cx.terminal_shown),
             MenuAction::ToggleWrap => Some(cx.wrap_on),
             _ => None,
         }
@@ -313,12 +318,19 @@ const EDIT_ITEMS: [MenuItem; 6] = [
     ),
 ];
 
-/// The View menu — the two real toggles (Preview/bars arrive in later phases).
-const VIEW_ITEMS: [MenuItem; 2] = [
+/// The View menu — the real toggles (Preview/bars arrive in later phases).
+const VIEW_ITEMS: [MenuItem; 3] = [
     MenuItem::new(
         "Project Tree",
         "",
         MenuAction::ToggleTree,
+        Gate::Always,
+        false,
+    ),
+    MenuItem::new(
+        "Terminal",
+        "Ctrl+`",
+        MenuAction::ToggleTerminal,
         Gate::Always,
         false,
     ),
@@ -485,6 +497,7 @@ mod tests {
             can_undo: true,
             can_redo: true,
             tree_shown: true,
+            terminal_shown: true,
             wrap_on: false,
             zoom_percent: Some(100),
             heading_level: Some(0),
@@ -499,6 +512,7 @@ mod tests {
             can_undo: false,
             can_redo: false,
             tree_shown: false,
+            terminal_shown: false,
             wrap_on: false,
             zoom_percent: None,
             heading_level: None,
@@ -658,7 +672,8 @@ mod tests {
         for (_, items) in MENUS {
             for item in items {
                 match item.action {
-                    MenuAction::ToggleTree => {
+                    // Project Tree + Terminal both read back `true` in `full_context`.
+                    MenuAction::ToggleTree | MenuAction::ToggleTerminal => {
                         assert_eq!(item.checked(&cx), Some(true));
                         toggles += 1;
                     }
@@ -670,6 +685,6 @@ mod tests {
                 }
             }
         }
-        assert_eq!(toggles, 2, "the two View toggles are check-style");
+        assert_eq!(toggles, 3, "the three View toggles are check-style");
     }
 }

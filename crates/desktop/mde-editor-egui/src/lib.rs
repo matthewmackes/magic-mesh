@@ -81,6 +81,12 @@
 //!   walk — a picked hit opens the file + jumps to the line (§7 — real rope
 //!   edits + real files, no mockups).
 //!
+//! * EDITOR-10 — the **integrated terminal dock** ([`terminal`]): `mde-term-egui`'s
+//!   `TabbedTerminal` embedded as a toggleable bottom panel (Ctrl+Backtick / View →
+//!   Terminal / a surface-strip button / the palette), a real login shell on a
+//!   real PTY spawned in the open project root, kept across toggles (§6 glue over
+//!   the TERM-16 mount seam — no re-implemented terminal).
+//!
 //! * EDITOR-12 — **code folding + symbol outline** ([`fold`] / [`outline`]): both
 //!   reuse the SAME EDITOR-5 tree-sitter tree (no second parser). Folding derives
 //!   fold regions (functions / blocks / impls) from the tree, collapses them from
@@ -113,6 +119,7 @@ pub mod panel;
 pub mod panes;
 pub mod project_tree;
 mod search;
+mod terminal;
 mod toolbar;
 pub mod widget;
 

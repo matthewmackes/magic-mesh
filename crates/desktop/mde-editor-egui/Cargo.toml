@@ -83,6 +83,15 @@ tree-sitter-bash = "0.23"
 mde-bus = { path = "../../platform/mde-bus" }
 serde = { workspace = true }
 base64 = "0.22"
+
+# EDITOR-10 — the integrated terminal dock embeds `mde-term-egui`'s
+# `TabbedTerminal` (the whole TERM-4/5/8 terminal over a real local PTY) as a
+# toggleable bottom panel, reusing the TERM-16 mount seam (the `dispatch_keys` /
+# `show` / `fonts::install` public API + `SpawnOptions` for the project-root cwd).
+# §6 glue only — no re-implemented VT/PTY/split machinery. A desktop-shell-tier
+# sibling edge, exactly like the shell's own mount of this crate; it pulls no new
+# heavy graph (the VT engine + `mde-egui` harness are already resolved once).
+mde-term-egui = { path = "../mde-term-egui" }
 # EDITOR-8 project + in-buffer search: the pure-Rust regex engine backing the
 # find/replace overlay's `.*` toggle + the project-wide search's regex mode.
 # Already a direct dep of `mde-term-egui` + `mde-files` (one workspace-locked
