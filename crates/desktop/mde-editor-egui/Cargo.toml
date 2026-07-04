@@ -65,6 +65,13 @@ tree-sitter-typescript = "0.23"
 tree-sitter-json = "0.24"
 tree-sitter-toml-ng = "0.7"
 tree-sitter-md = "0.3"
+
+# EDITOR-LSP-1: the pure-Rust LSP protocol types (de/serialized via serde_json).
+lsp-types = "0.97"
+serde_json = { workspace = true }
+
+# EDITOR-COLLAB-1: yrs, the pure-Rust Yjs port — the CRDT text model for shared editing.
+yrs = "0.23"
 tree-sitter-bash = "0.23"
 
 [dev-dependencies]

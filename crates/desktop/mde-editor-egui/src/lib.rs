@@ -47,9 +47,12 @@
 //! inward to [`mde_egui`] (the harness + the shared Carbon `Style`).
 
 pub mod buffer;
+pub mod crdt;
 mod finder;
 mod fuzzy;
 pub mod highlight;
+pub mod lsp;
+pub mod md_actions;
 mod menu_bar;
 mod palette;
 pub mod panel;
@@ -60,7 +63,9 @@ pub mod widget;
 use mde_egui::{eframe, egui};
 
 pub use buffer::Buffer;
+pub use crdt::{CollabDoc, CrdtError, EditSink, TextEdit};
 pub use highlight::{Highlighter, Language};
+pub use lsp::{Diagnostic, LspClient, LspState, Severity};
 pub use panel::{editor_panel, EditorSurface};
 pub use project_tree::ProjectTree;
 pub use widget::{editor_widget, EditorView};
