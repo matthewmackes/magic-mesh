@@ -274,6 +274,22 @@ impl UnitKind {
             Self::Instance | Self::Volume | Self::Image | Self::Network => Category::Cloud,
         }
     }
+
+    /// The type words the `/` universal search matches for this kind (EXPLORER-14,
+    /// O7 — typing "nova" lands on instances): the badge label plus the design's
+    /// own taxonomy names (lock #4 — Nova instances / Cinder volumes / Glance
+    /// images / Neutron networks), so the operator's `OpenStack` vocabulary finds
+    /// the right units without a synonym table to maintain.
+    const fn search_terms(self) -> &'static str {
+        match self {
+            Self::Peer => "peer mesh",
+            Self::LanHost => "lan host",
+            Self::Instance => "instance nova server",
+            Self::Volume => "volume cinder",
+            Self::Image => "image glance",
+            Self::Network => "network neutron",
+        }
+    }
 }
 
 /// Where a unit sits relative to the mesh — a mirror of the aggregator's
@@ -357,10 +373,29 @@ struct MeshFacts {
     mde_version: Option<String>,
 }
 
+/// The E5 enrichment block folded onto a unit — a **local** mirror of the
+/// aggregator's `Extras`, decoding exactly the fields the `/` universal search
+/// matches (EXPLORER-14, O7): the rDNS/mDNS name, the offline OUI vendor, the
+/// service fingerprint labels, and the open key/value tail (`open_ports` /
+/// `type_guess` / …). Every field honestly absent when unprobed (§7).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(default)]
+struct UnitExtras {
+    /// Reverse-DNS / mDNS name (E5).
+    rdns: Option<String>,
+    /// MAC OUI vendor from the offline table (E5).
+    oui_vendor: Option<String>,
+    /// Service/port fingerprint labels (`"ssh, vnc"`).
+    fingerprint: Option<String>,
+    /// The open discovered key/values (the worker's `open_ports`, `type_guess`,
+    /// `actions`, … tail).
+    extra: BTreeMap<String, String>,
+}
+
 /// One discovered unit — a **local** mirror of the aggregator's `Unit`, carrying
-/// exactly the fields the hero card renders. Serde ignores the daemon-only fields
-/// (cloud detail, enrichment) EXPLORER-4/9 render, so this decodes the same body
-/// without linking the daemon crate (§6).
+/// exactly the fields the hero card renders + the `/` search matches. Serde
+/// ignores the remaining daemon-only fields (the E4 cloud detail sheet), so this
+/// decodes the same body without linking the daemon crate (§6).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct Unit {
     /// Stable, source-namespaced id (the dedup + self key).
@@ -389,6 +424,9 @@ struct Unit {
     /// Most-recent observation, ms since the Unix epoch (E10).
     #[serde(default)]
     last_seen_ms: u64,
+    /// The E5 enrichment block (the search's service/MAC-vendor/rDNS fields).
+    #[serde(default)]
+    extras: UnitExtras,
 }
 
 /// The kind of a derived relationship between two units — a **local** mirror of
@@ -1188,6 +1226,154 @@ pub fn local_hostname() -> String {
     "localhost".to_string()
 }
 
+// ─────────────── universal search (EXPLORER-14, design O7) ───────────────
+//
+// A self-contained fuzzy matcher — the editor's `fuzzy` idiom (EDITOR-7)
+// mirrored locally: that scorer is private to `mde-editor-egui`, and sharing it
+// would mean a new cross-cutting module this unit's scope forbids, so the small
+// subsequence scorer (boundary + contiguity bonuses, gap + leading penalties)
+// lives here. Pure data-in / data-out — unit-tested without a render.
+
+/// Max rows the ranked hit list shows — enough to disambiguate without burying
+/// the best match (typing more narrows the head).
+const SEARCH_MAX_HITS: usize = 8;
+
+/// Score awarded when a matched char sits on a word boundary (a separator or a
+/// camel-case hump) — the humps a human aims at.
+const BOUNDARY_BONUS: i32 = 16;
+/// Score awarded when a matched char immediately follows the previous match — a
+/// contiguous run of the query (e.g. `5900` inside `22,5900`).
+const CONTIGUOUS_BONUS: i32 = 8;
+/// Bonus when the matched char has the same case as the query char, so an
+/// exact-case hit edges out a case-folded one.
+const CASE_BONUS: i32 = 2;
+/// Penalty per skipped char in a gap between two matches (capped), so a tightly
+/// packed match outranks a scattered one.
+const GAP_PENALTY: i32 = -1;
+/// Penalty per leading unmatched char before the first match (capped), so a
+/// match near the start outranks one buried deep in the string.
+const LEADING_PENALTY: i32 = -1;
+/// Cap on the per-match gap / leading penalty so one very long field can't
+/// dominate the score with penalties alone.
+const PENALTY_CAP: usize = 12;
+
+/// Whether `cur` begins a new "word" given the char `prev` before it — a
+/// separator break (incl. the `:`/`,` the MAC / port-list fields carry) or a
+/// camel-case hump.
+const fn is_word_boundary(prev: char, cur: char) -> bool {
+    let separator = matches!(prev, '/' | '\\' | '_' | '-' | '.' | ' ' | ':' | ',');
+    let camel_hump = !prev.is_uppercase() && cur.is_uppercase();
+    separator || camel_hump
+}
+
+/// The penalty count for a `gap` of skipped chars, capped so a single long span
+/// can't swamp the score.
+fn capped_gap(gap: usize) -> i32 {
+    i32::try_from(gap.min(PENALTY_CAP)).unwrap_or(0)
+}
+
+/// Score `needle` against `haystack`, or `None` when `needle` is not an
+/// in-order, case-insensitive subsequence of `haystack`. Higher is better; an
+/// empty needle scores a neutral `0` (the caller decides what an empty query
+/// means). Greedy left-to-right — the standard lightweight fuzzy heuristic —
+/// with boundary/contiguity/case bonuses and gap/leading penalties folded in.
+fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let hay: Vec<char> = haystack.chars().collect();
+    let ndl: Vec<char> = needle.chars().collect();
+
+    let mut total: i32 = 0;
+    let mut ni = 0usize;
+    let mut prev: Option<usize> = None;
+
+    for (hi, &hc) in hay.iter().enumerate() {
+        let Some(&nc) = ndl.get(ni) else { break };
+        if !hc.eq_ignore_ascii_case(&nc) {
+            continue;
+        }
+        // Exactly one of the three position scores applies per matched char.
+        total += match prev {
+            Some(p) if p + 1 == hi => CONTIGUOUS_BONUS,
+            Some(p) => GAP_PENALTY * capped_gap(hi - p - 1),
+            None => LEADING_PENALTY * capped_gap(hi),
+        };
+        if hi == 0 || is_word_boundary(hay[hi - 1], hc) {
+            total += BOUNDARY_BONUS;
+        }
+        if hc == nc {
+            total += CASE_BONUS;
+        }
+        prev = Some(hi);
+        ni += 1;
+    }
+
+    (ni == ndl.len()).then_some(total)
+}
+
+/// The searchable text fields of one unit (O7 "Everything"): name · address
+/// (IP) · the LAN id key (the host's MAC, or its IP fallback) · the kind's type
+/// words · the hosting node · the discovered service labels / open ports /
+/// enrichment names. Only real discovered values — an absent field contributes
+/// nothing (§7, never a fabricated haystack). Fields score independently so a
+/// match can never straddle two unrelated fields.
+fn search_fields(unit: &Unit) -> Vec<&str> {
+    let mut fields = vec![unit.name.as_str(), unit.kind.search_terms()];
+    if let Some(addr) = unit.address.as_deref() {
+        fields.push(addr);
+    }
+    // The LAN unit id's key IS the host's MAC when ARP knows it (the aggregator's
+    // `lan:<mac-or-ip>` contract) — the MAC-prefix search field.
+    if let Some(key) = unit.id.strip_prefix("lan:") {
+        fields.push(key);
+    }
+    if let Reachability::CloudObject { node } = &unit.reachability {
+        fields.push(node);
+    }
+    let extras = &unit.extras;
+    fields.extend(extras.rdns.as_deref());
+    fields.extend(extras.oui_vendor.as_deref());
+    fields.extend(extras.fingerprint.as_deref());
+    for key in ["open_ports", "type_guess"] {
+        if let Some(v) = extras.extra.get(key) {
+            fields.push(v);
+        }
+    }
+    fields
+}
+
+/// The unit's best single-field score for `query`, or `None` when no field
+/// matches.
+fn unit_search_score(query: &str, unit: &Unit) -> Option<i32> {
+    search_fields(unit)
+        .into_iter()
+        .filter_map(|f| fuzzy_score(query, f))
+        .max()
+}
+
+/// The `/` search overlay's live state (EXPLORER-14): the query, the selected
+/// row in the ranked hit list, and the one-shot focus request for the box.
+struct SearchState {
+    /// The live query text (persisted while active — the O5 "active search").
+    query: String,
+    /// The selected hit row (Enter jumps it; Up/Down move it).
+    sel: usize,
+    /// Focus the query box on the next rendered frame (set on open/restore).
+    focus_pending: bool,
+}
+
+impl SearchState {
+    /// A freshly opened (or restored) search with `query` pre-filled.
+    const fn open(query: String) -> Self {
+        Self {
+            query,
+            sel: 0,
+            focus_pending: true,
+        }
+    }
+}
+
 // ─────────────────────────── procedural glyphs (#9) ───────────────────────────
 
 /// Paint an arc of `sweep` radians starting at `start` around `center`, as a
@@ -1429,6 +1615,10 @@ struct ExplorerPrefs {
     selected: Option<String>,
     /// EXPLORER-13 — the active category filter (`None` ⇒ All), restored on open.
     filter: Option<Category>,
+    /// EXPLORER-14 — the active `/` search query (empty ⇒ the search is closed);
+    /// a non-empty query restores the overlay open with it (the O5 "active
+    /// search" half of the view record).
+    search: String,
 }
 
 impl ExplorerPrefs {
@@ -1487,6 +1677,20 @@ fn is_user_input(i: &egui::InputState) -> bool {
                 | egui::Event::PointerMoved(_)
                 | egui::Event::MouseWheel { .. }
         )
+    })
+}
+
+/// Whether `/` was pressed this frame — consumed (the key's paired text event is
+/// dropped) so the slash that OPENS the search never leaks into the query box
+/// the same frame (EXPLORER-14).
+fn slash_pressed(ui: &egui::Ui) -> bool {
+    ui.ctx().input_mut(|i| {
+        let hit = i.key_pressed(egui::Key::Slash);
+        if hit {
+            i.events
+                .retain(|e| !matches!(e, egui::Event::Text(t) if t == "/"));
+        }
+        hit
     })
 }
 
@@ -1574,6 +1778,9 @@ pub struct ExplorerState {
     /// streamed in. Applied on each [`Self::refresh`] until the peer appears, so the
     /// jump lands even when the Explorer hadn't polled that peer when it was tapped.
     pending_focus: Option<String>,
+    /// EXPLORER-14: the `/` universal-search overlay while open (`None` ⇒
+    /// closed) — the query box + ranked hit list over every discovered unit.
+    search: Option<SearchState>,
 }
 
 impl Default for ExplorerState {
@@ -1604,6 +1811,7 @@ impl Default for ExplorerState {
             last_input_at: None,
             last_advance_at: None,
             pending_focus: None,
+            search: None,
         };
         // EXPLORER-13 — restore the persisted view record (O5). The mirrors
         // haven't been read yet, so the remembered selection is held and lands
@@ -1646,9 +1854,12 @@ impl ExplorerState {
             self.last_advance_at = Some(now);
             return;
         }
-        // Gate: opted in, an advanceable mode, real motion allowed, >1 unit to walk.
+        // Gate: opted in, an advanceable mode, no search session in flight (the
+        // operator is mid-thought — never crawl the focus out from under them),
+        // real motion allowed, >1 unit to walk.
         if !self.prefs.ambient_idle
             || matches!(self.mode, SurfaceMode::Ipam)
+            || self.search.is_some()
             || reduce_motion(ctx)
             || self.hero_count() < 2
         {
@@ -1686,15 +1897,16 @@ impl ExplorerState {
     // ─────────────── view persistence (EXPLORER-13, design O5) ───────────────
 
     /// Restore a persisted view record (O5): the last mode, the active category
-    /// filter, and the last-selected unit — the selection is held via
+    /// filter, the last-selected unit — the selection is held via
     /// [`Self::pending_focus`] until its unit streams in, so a remembered unit
     /// that has left the fleet gracefully falls back to the front of the shelf
-    /// (§7 — never a phantom focus). The ONE restore path [`Default`] and the
-    /// tests share.
+    /// (§7 — never a phantom focus) — and an active `/` search reopens with its
+    /// query (EXPLORER-14). The ONE restore path [`Default`] and the tests share.
     fn apply_restore(&mut self, prefs: ExplorerPrefs) {
         self.mode = prefs.mode;
         self.filter = prefs.filter;
         self.pending_focus.clone_from(&prefs.selected);
+        self.search = (!prefs.search.is_empty()).then(|| SearchState::open(prefs.search.clone()));
         self.prefs = prefs;
     }
 
@@ -1727,6 +1939,11 @@ impl ExplorerState {
                 .clone()
                 .or_else(|| self.focused_unit_id()),
             filter: self.filter,
+            search: self
+                .search
+                .as_ref()
+                .map(|s| s.query.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -1739,6 +1956,143 @@ impl ExplorerState {
         if snapshot != self.prefs {
             self.prefs = snapshot;
             self.save_prefs();
+        }
+    }
+
+    // ─────────────── universal search (EXPLORER-14, design O7) ───────────────
+
+    /// Open the `/` search overlay with an empty query (the box takes focus on
+    /// the next frame).
+    fn open_search(&mut self) {
+        self.search = Some(SearchState::open(String::new()));
+    }
+
+    /// The ranked hits for `query` over the WHOLE shelf (O7 "Everything" — the
+    /// search ignores the active category filter; the jump clears a hiding one):
+    /// each unit's best field score, best first, ties keeping shelf order (a
+    /// stable sort), capped at [`SEARCH_MAX_HITS`]. Returns absolute indices
+    /// into [`Self::units`]. An empty/blank query yields nothing (the box just
+    /// opened — no fake "everything matches" wall).
+    fn search_hits(&self, query: &str) -> Vec<usize> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let mut scored: Vec<(usize, i32)> = self
+            .units
+            .iter()
+            .enumerate()
+            .filter_map(|(i, u)| unit_search_score(query, u).map(|s| (i, s)))
+            .collect();
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.truncate(SEARCH_MAX_HITS);
+        scored.into_iter().map(|(i, _)| i).collect()
+    }
+
+    /// Land a search pick: jump the shared hero/mosaic focus to the hit (the ONE
+    /// focus path — [`Self::jump_to_id`], which clears a hiding filter so the
+    /// jump always lands) and close the overlay. A pick made from the IPAM table
+    /// returns to the hero card first (the table has no per-unit focus to jump).
+    fn jump_to_search_hit(&mut self, id: &str) {
+        if self.mode == SurfaceMode::Ipam {
+            self.mode = SurfaceMode::Hero;
+        }
+        self.jump_to_id(id);
+        self.search = None;
+    }
+
+    /// Search-overlay input: Esc closes (clearing the query — the persisted
+    /// "active search" only lives while the overlay does), Enter jumps the
+    /// selected hit, Up/Down move the selection. Read raw so they work while the
+    /// query box holds keyboard focus; every printable key stays the box's.
+    fn handle_search_keys(&mut self, ui: &egui::Ui) {
+        let (esc, enter, up, down) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+            )
+        });
+        if esc {
+            self.search = None;
+            return;
+        }
+        let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else {
+            return;
+        };
+        let hits = self.search_hits(&query);
+        if hits.is_empty() {
+            return;
+        }
+        let last = hits.len() - 1;
+        if down {
+            if let Some(s) = self.search.as_mut() {
+                s.sel = (s.sel + 1).min(last);
+            }
+        }
+        if up {
+            if let Some(s) = self.search.as_mut() {
+                s.sel = s.sel.saturating_sub(1);
+            }
+        }
+        if enter {
+            let sel = self.search.as_ref().map_or(0, |s| s.sel).min(last);
+            let id = self.units[hits[sel]].id.clone();
+            self.jump_to_search_hit(&id);
+        }
+    }
+
+    /// The `/` search overlay (EXPLORER-14): the query box + the ranked hit list
+    /// over every discovered unit — name/IP/MAC/type/node/service (O7). A row
+    /// click (or Enter) jumps the hero/mosaic focus to the hit; the honest
+    /// no-match note names the fields it searched (§7 — never a silent blank).
+    fn search_overlay(&mut self, ui: &mut egui::Ui) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = Style::SP_S;
+            ui.label(
+                RichText::new("/")
+                    .size(Style::BODY)
+                    .strong()
+                    .color(Style::ACCENT_HI),
+            );
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut search.query)
+                    .hint_text("Search name · IP · MAC · type · node · service")
+                    .desired_width(Style::SP_XL * 8.0),
+            );
+            if search.focus_pending {
+                resp.request_focus();
+                search.focus_pending = false;
+            }
+            if resp.changed() {
+                search.sel = 0;
+            }
+        });
+        let (query, sel) = (search.query.clone(), search.sel);
+        let hits = self.search_hits(&query);
+        if hits.is_empty() {
+            if !query.trim().is_empty() {
+                muted_note(
+                    ui,
+                    "No unit matches — searched name, IP, MAC, type, node, and service.",
+                );
+            }
+            return;
+        }
+        ui.add_space(Style::SP_XS);
+        let mut jump: Option<String> = None;
+        for (row, &abs) in hits.iter().enumerate() {
+            let unit = &self.units[abs];
+            if search_hit_row(ui, unit, row == sel.min(hits.len() - 1)) {
+                jump = Some(unit.id.clone());
+            }
+        }
+        if let Some(id) = jump {
+            self.jump_to_search_hit(&id);
         }
     }
 
@@ -2268,12 +2622,24 @@ impl ExplorerState {
     /// mode (hero card · filmstrip, or the IPAM table). The one public entry the
     /// mount drives per frame.
     pub fn show(&mut self, ui: &mut egui::Ui) {
-        // Per-mode input (O6): the hero pages + zooms out, the mosaic grid-navs +
-        // zooms in; the IPAM table is scroll-only.
-        match self.mode {
-            SurfaceMode::Hero => self.handle_keys(ui),
-            SurfaceMode::Mosaic => self.handle_mosaic_keys(ui),
-            SurfaceMode::Ipam => {}
+        // Input routing: the open `/` search owns the keyboard (EXPLORER-14);
+        // otherwise the per-mode nav runs (O6 — the hero pages + zooms out, the
+        // mosaic grid-navs + zooms in; the IPAM table is scroll-only), gated off
+        // whenever ANY text box holds focus (the search box, the arming echo) so
+        // typing a name never pages the shelf or zooms out from under the
+        // operator.
+        if self.search.is_some() {
+            self.handle_search_keys(ui);
+        } else if !ui.ctx().wants_keyboard_input() {
+            if slash_pressed(ui) {
+                self.open_search();
+            } else {
+                match self.mode {
+                    SurfaceMode::Hero => self.handle_keys(ui),
+                    SurfaceMode::Mosaic => self.handle_mosaic_keys(ui),
+                    SurfaceMode::Ipam => {}
+                }
+            }
         }
         // Keep focus valid against the freshest (possibly re-filtered) view — the
         // one focus index the mosaic tiles + hero pages share.
@@ -2293,6 +2659,13 @@ impl ExplorerState {
         egui::TopBottomPanel::top(ui.id().with("explorer-chips"))
             .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
             .show_inside(ui, |ui| self.header(ui));
+        // The `/` universal-search overlay rides between the summary strip and
+        // the active mode, so the hit list never covers the filter chips.
+        if self.search.is_some() {
+            egui::TopBottomPanel::top(ui.id().with("explorer-search"))
+                .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+                .show_inside(ui, |ui| self.search_overlay(ui));
+        }
         match self.mode {
             SurfaceMode::Mosaic => {
                 egui::CentralPanel::default()
@@ -2810,6 +3183,7 @@ fn self_placeholder(host: &str) -> Unit {
         mesh: None,
         first_seen_ms: 0,
         last_seen_ms: 0,
+        extras: UnitExtras::default(),
     }
 }
 
@@ -2829,6 +3203,69 @@ fn chip(ui: &mut egui::Ui, label: &str, active: bool, accent: Color32) -> bool {
             if active { accent } else { Style::BORDER },
         ));
     ui.add(button).clicked()
+}
+
+/// One ranked search hit row (EXPLORER-14): a mini kind glyph + the unit's name,
+/// type badge, and reachability/address line; the keyboard-selected row wears the
+/// accent frame (Enter jumps it). Returns whether it was clicked (the jump).
+fn search_hit_row(ui: &mut egui::Ui, unit: &Unit, selected: bool) -> bool {
+    let cat = unit.kind.category();
+    // Reserve the band slot so it paints BEHIND the row content (the IPAM idiom).
+    let band = ui.painter().add(egui::Shape::Noop);
+    let resp = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = Style::SP_S;
+            ui.set_min_width(ui.available_width());
+            ui.add_space(Style::SP_S);
+            let (glyph_rect, _) = ui.allocate_exact_size(Vec2::splat(Style::SP_M), Sense::hover());
+            paint_kind_glyph(
+                ui.painter(),
+                glyph_rect.center(),
+                Style::SP_M * 0.42,
+                unit.kind,
+                cat.accent(),
+            );
+            ui.label(
+                RichText::new(&unit.name)
+                    .size(Style::BODY)
+                    .color(Style::TEXT),
+            );
+            ui.label(
+                RichText::new(unit.kind.label())
+                    .size(Style::SMALL)
+                    .color(cat.accent()),
+            );
+            ui.label(
+                RichText::new(reachability_line(
+                    &unit.reachability,
+                    unit.address.as_deref(),
+                ))
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+            );
+        })
+        .response
+        .interact(Sense::click());
+    let fill = if resp.hovered() {
+        Style::SURFACE_HI
+    } else if selected {
+        Style::SURFACE
+    } else {
+        Style::BG
+    };
+    ui.painter().set(
+        band,
+        egui::Shape::rect_filled(resp.rect, Style::RADIUS * 0.5, fill),
+    );
+    if selected {
+        ui.painter().rect_stroke(
+            resp.rect,
+            Style::RADIUS * 0.5,
+            Stroke::new(1.0, Style::ACCENT_HI),
+            StrokeKind::Inside,
+        );
+    }
+    resp.clicked()
 }
 
 /// One edge jump chip (EXPLORER-8): a mini kind glyph + the neighbour's name in a
@@ -3677,6 +4114,7 @@ mod tests {
                 last_input_at: None,
                 last_advance_at: None,
                 pending_focus: None,
+                search: None,
             };
             s.refresh();
             s
@@ -3750,6 +4188,7 @@ mod tests {
             mesh: None,
             first_seen_ms: 100,
             last_seen_ms: last,
+            extras: UnitExtras::default(),
         }
     }
 
@@ -3765,7 +4204,10 @@ mod tests {
                 "reachability":{"where":"in_mesh"},
                 "address":"10.42.0.1","health":"healthy",
                 "mesh":{"role":"lighthouse","leader":true,"mde_version":"12.0.0"},
-                "cloud":null,"first_seen_ms":1,"last_seen_ms":2,"extras":{}
+                "cloud":null,"first_seen_ms":1,"last_seen_ms":2,
+                "extras":{"rdns":"node-a.local","oui_vendor":null,
+                          "fingerprint":"ssh, vnc",
+                          "extra":{"open_ports":"22,5900"}}
             }],
             "edges":[{"kind":"mesh_tunnel","from":"peer:node-a","to":"peer:node-b","detail":"direct"}],
             "published_at_ms":3
@@ -3778,6 +4220,13 @@ mod tests {
         assert_eq!(u.reachability, Reachability::InMesh);
         assert_eq!(u.health, Some(Health::Healthy));
         assert!(u.mesh.as_ref().is_some_and(|m| m.leader));
+        // The E5 enrichment mirror decodes off the same body (EXPLORER-14).
+        assert_eq!(u.extras.rdns.as_deref(), Some("node-a.local"));
+        assert_eq!(u.extras.fingerprint.as_deref(), Some("ssh, vnc"));
+        assert_eq!(
+            u.extras.extra.get("open_ports").map(String::as_str),
+            Some("22,5900")
+        );
         // The edge set decodes off the same body (EXPLORER-8).
         assert_eq!(state.edges.len(), 1);
         assert_eq!(state.edges[0].kind, EdgeKind::MeshTunnel);
@@ -5238,6 +5687,7 @@ mod tests {
             mode: SurfaceMode::Ipam,
             selected: Some("lan:printer".to_string()),
             filter: Some(Category::Lan),
+            search: "vnc".to_string(),
         };
         prefs.save_to(&path).expect("save");
         assert_eq!(
@@ -5380,6 +5830,242 @@ mod tests {
             s.view_snapshot().selected.as_deref(),
             Some("peer:later"),
             "the held restore target stays the remembered selection"
+        );
+    }
+
+    // ─────────────── EXPLORER-14 universal search + jump ───────────────
+
+    /// A shelf spanning every searchable field (O7): a MAC-keyed LAN host
+    /// fingerprinted with VNC on 5900, an IP-keyed LAN host, a Nova instance on
+    /// node `bigboy`, peers, and a volume.
+    fn searchable_state() -> Vec<UnitsState> {
+        let mut vnc_box = addr_unit(
+            "lan:aa:bb:cc:dd:ee:ff",
+            UnitKind::LanHost,
+            "media-box",
+            "172.20.0.60",
+        );
+        vnc_box.extras.fingerprint = Some("vnc".to_string());
+        vnc_box
+            .extras
+            .extra
+            .insert("open_ports".to_string(), "5900".to_string());
+        let mut printer = addr_unit(
+            "lan:172.20.0.50",
+            UnitKind::LanHost,
+            "printer",
+            "172.20.0.50",
+        );
+        printer
+            .extras
+            .extra
+            .insert("open_ports".to_string(), "80,443".to_string());
+        let web = Unit {
+            reachability: Reachability::CloudObject {
+                node: "bigboy".to_string(),
+            },
+            ..unit("cloud:instance:i1", UnitKind::Instance, "web", 10)
+        };
+        vec![UnitsState {
+            host: "me".into(),
+            units: vec![
+                unit("peer:me", UnitKind::Peer, "me", 10),
+                unit("peer:anvil", UnitKind::Peer, "anvil", 10),
+                vnc_box,
+                printer,
+                web,
+                unit("cloud:volume:v1", UnitKind::Volume, "data", 10),
+            ],
+            edges: Vec::new(),
+        }]
+    }
+
+    #[test]
+    fn fuzzy_scoring_is_a_case_insensitive_subsequence_ranked_by_shape() {
+        // Not a subsequence → no match; out-of-order → no match.
+        assert_eq!(fuzzy_score("xz", "abc"), None);
+        assert_eq!(fuzzy_score("cba", "abc"), None);
+        // Case-folds both ways.
+        assert!(fuzzy_score("WEB", "web").is_some());
+        assert!(fuzzy_score("web", "WEB").is_some());
+        // The leading contiguous hit outranks the buried subsequence (the
+        // editor idiom's bread-and-butter ranking).
+        let tight = fuzzy_score("main", "main.rs").expect("tight");
+        let buried = fuzzy_score("main", "domain_view.rs").expect("buried");
+        assert!(tight > buried, "leading contiguous > buried");
+    }
+
+    #[test]
+    fn search_spans_every_field() {
+        let s = ExplorerState::with_fake(searchable_state(), "me");
+        let names = |q: &str| -> Vec<String> {
+            s.search_hits(q)
+                .iter()
+                .map(|&i| s.units[i].name.clone())
+                .collect()
+        };
+        // "5900" → the VNC host, via the discovered open-ports field (O7).
+        assert_eq!(names("5900"), vec!["media-box"]);
+        // "nova" → the instance, via the design's own type taxonomy (lock #4).
+        assert_eq!(names("nova"), vec!["web"]);
+        // A MAC prefix → the MAC-keyed LAN host (the aggregator's lan:<mac> id).
+        assert_eq!(names("aa:bb:cc"), vec!["media-box"]);
+        // A node name → the cloud object it hosts (lock #20's host-node tag).
+        assert_eq!(names("bigboy"), vec!["web"]);
+        // A service label → the fingerprinted host.
+        assert_eq!(names("vnc"), vec!["media-box"]);
+        // An IP → the addressed unit.
+        assert_eq!(names("172.20.0.50"), vec!["printer"]);
+        // Junk matches nothing; an empty/blank query lists nothing (§7 — the
+        // just-opened box never fakes an "everything matches" wall).
+        assert!(names("zzzz").is_empty());
+        assert!(names("").is_empty());
+        assert!(names("   ").is_empty());
+    }
+
+    #[test]
+    fn search_ranks_the_name_hit_first_and_caps_the_list() {
+        let s = ExplorerState::with_fake(searchable_state(), "me");
+        let hits = s.search_hits("an");
+        assert_eq!(
+            s.units[hits[0]].id, "peer:anvil",
+            "the boundary name hit outranks buried subsequences"
+        );
+        assert!(hits.len() <= SEARCH_MAX_HITS, "the hit list is capped");
+    }
+
+    #[test]
+    fn a_search_pick_jumps_the_focus_and_closes_the_overlay() {
+        let mut s = ExplorerState::with_fake(searchable_state(), "me");
+        s.set_filter(Some(Category::Mesh)); // a filter that hides the hit
+        s.open_search();
+        let hits = s.search_hits("5900");
+        let id = s.units[hits[0]].id.clone();
+        s.jump_to_search_hit(&id);
+        assert_eq!(focused(&s).id, "lan:aa:bb:cc:dd:ee:ff");
+        assert_eq!(s.filter, None, "a hiding filter clears so the jump lands");
+        assert!(s.search.is_none(), "the overlay closes on a pick");
+
+        // From the IPAM table a pick returns to the hero card (no table focus).
+        s.mode = SurfaceMode::Ipam;
+        s.open_search();
+        s.jump_to_search_hit("peer:anvil");
+        assert_eq!(s.mode, SurfaceMode::Hero);
+        assert_eq!(focused(&s).id, "peer:anvil");
+    }
+
+    #[test]
+    fn an_active_search_persists_and_restores_open() {
+        // The active query rides the O5 view record and reopens on restore …
+        let prefs = ExplorerPrefs {
+            search: "nova".to_string(),
+            ..Default::default()
+        };
+        let s = ExplorerState::with_prefs(searchable_state(), "me", prefs);
+        assert!(
+            s.search.as_ref().is_some_and(|x| x.query == "nova"),
+            "a restored search reopens with its query"
+        );
+        // … the live query rides the snapshot …
+        let mut live = ExplorerState::with_fake(searchable_state(), "me");
+        live.open_search();
+        if let Some(x) = live.search.as_mut() {
+            x.query = "web".to_string();
+        }
+        assert_eq!(live.view_snapshot().search, "web");
+        // … and closing the overlay clears the persisted half.
+        live.search = None;
+        assert_eq!(live.view_snapshot().search, "");
+    }
+
+    #[test]
+    fn slash_opens_the_search_and_esc_closes_it() {
+        let mut s = ExplorerState::with_fake(searchable_state(), "me");
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let slash = egui::Event::Key {
+            key: egui::Key::Slash,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        ambient_frame(
+            &ctx,
+            &mut s,
+            0.0,
+            vec![slash, egui::Event::Text("/".to_string())],
+        );
+        assert!(s.search.is_some(), "`/` opens the universal search");
+        assert_eq!(
+            s.search.as_ref().map(|x| x.query.as_str()),
+            Some(""),
+            "the opening slash is consumed, never typed into the box"
+        );
+        // Esc closes it again.
+        let esc = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        ambient_frame(&ctx, &mut s, 0.5, vec![esc]);
+        assert!(s.search.is_none(), "Esc closes the search");
+    }
+
+    #[test]
+    fn search_selection_keys_walk_the_hits_and_enter_jumps() {
+        let mut s = ExplorerState::with_fake(searchable_state(), "me");
+        s.open_search();
+        if let Some(x) = s.search.as_mut() {
+            x.query = "17".to_string(); // two LAN addresses match
+        }
+        let hits = s.search_hits("17");
+        assert!(hits.len() >= 2, "the fixture yields a walkable list");
+        let second = s.units[hits[1]].id.clone();
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let key = |k: egui::Key| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        ambient_frame(&ctx, &mut s, 0.0, vec![key(egui::Key::ArrowDown)]);
+        assert_eq!(
+            s.search.as_ref().map(|x| x.sel),
+            Some(1),
+            "Down moves the selection"
+        );
+        ambient_frame(&ctx, &mut s, 0.5, vec![key(egui::Key::Enter)]);
+        assert!(s.search.is_none(), "Enter closes the search");
+        assert_eq!(focused(&s).id, second, "Enter jumped the selected hit");
+    }
+
+    #[test]
+    fn the_search_overlay_renders_headless() {
+        let mut s = ExplorerState::with_fake(searchable_state(), "me");
+        s.open_search();
+        if let Some(x) = s.search.as_mut() {
+            x.query = "a".to_string();
+        }
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                Vec2::new(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| s.show(ui));
+        });
+        assert!(
+            !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty(),
+            "the search overlay drew primitives"
         );
     }
 }
