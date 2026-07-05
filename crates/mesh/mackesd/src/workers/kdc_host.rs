@@ -66,7 +66,7 @@ use std::time::Duration;
 
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
-use mde_bus::rpc::reply_topic;
+use mde_bus::rpc::{publish_request, reply_topic};
 use mde_kdc_host::error::HostError;
 use mde_kdc_host::file_browse::SharedRoot;
 use mde_kdc_host::pairing::{DeviceRecord, PairingStore};
@@ -80,6 +80,13 @@ use serde_json::{json, Value};
 use tracing::{debug, error, info, warn};
 
 use super::{ShutdownToken, Worker};
+// KDC-MESH-8 — consume the QUASAR-CLOUD openstack worker's PUBLIC Bus verb
+// interface (design #12) to drive fleet instance lifecycle from the phone. This
+// is a read-only consumer of the public `verbs` surface — the openstack worker
+// itself (its state, its responder) is never touched.
+use crate::workers::openstack::verbs::{
+    cloud_action_topic, CloudInstance, CloudReply, LifecycleAction,
+};
 
 /// The Connect verbs served over `action/connect/<verb>` (E2.2 — replacing
 /// the retired `dev.mackes.MDE.Connect` D-Bus surface). `version`/`list`/
@@ -440,6 +447,11 @@ fn kdc_event_alert(ev: &HostEvent) -> Option<(String, &'static str)> {
                     (threshold || (0..=15).contains(&charge))
                         .then(|| (format!("{who} battery low ({charge}%)"), "warn"))
                 }
+                // KDC-MESH-8 — telephony alert (#12): a phone call/SMS state event
+                // reaches the Alert Center as a call notification. A cancel (the call
+                // ended) isn't a new alert; disconnected/talking are presence churn we
+                // don't toast — ringing + missed are the notable events.
+                "kdeconnect.telephony" => telephony_alert(&packet.body),
                 _ => None,
             }
         }
@@ -933,12 +945,19 @@ fn local_announce() -> Announce {
         "kdeconnect.share.request",
         // Ring this host (ring_local_device).
         "kdeconnect.findmyphone.request",
-        // Curated command list + execution (handle_runcommand).
+        // Curated command list + execution (handle_runcommand), incl. the
+        // KDC-MESH-8 OpenStack lifecycle commands.
         "kdeconnect.runcommand.request",
         // KDC-MESH-7 — the phone's SFTP mount-info reply (browse the phone's FS
         // from this desktop; the request goes out below). Handled by mounting the
         // phone's SFTP server via the injectable seam.
         "kdeconnect.sftp",
+        // KDC-MESH-8 — the phone's call/SMS state (telephony alert, #12), surfaced
+        // to THIS host's desktop feed + audited.
+        "kdeconnect.telephony",
+        // KDC-MESH-8 — a connectivity-report request; answered with THIS host's
+        // connectivity summary (#12).
+        "kdeconnect.connectivity_report.request",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -1130,33 +1149,82 @@ async fn run_host(
                     {
                         accept_pair(&pairing, &transport, &roster, peer).await;
                     }
-                    // KDC-PLUGINS — Run Command: the phone asks for the command list
-                    // (`requestCommandList`) or triggers a curated key. Results come
-                    // back as a `kdeconnect.ping` notification on the phone.
+                    // KDC-PLUGINS / KDC-MESH-8 — Run Command: the phone asks for the
+                    // command list (`requestCommandList`) or triggers a curated key.
+                    // Results come back as a `kdeconnect.ping` notification. Cloud
+                    // (OpenStack lifecycle) keys drive the QC `action/cloud/*` verbs;
+                    // every executed command audits (#16). The cloud path is gated on
+                    // a paired device (the auth, #16).
                     if packet.kind == "kdeconnect.runcommand.request" {
-                        handle_runcommand(&transport, &config_dir, peer, &packet.body).await;
+                        let paired = pairing.is_paired(peer.as_str());
+                        handle_runcommand(&transport, &config_dir, peer, &packet.body, paired).await;
                     }
-                    // KDC-PLUGINS — Battery request: the peer polls THIS host's
-                    // battery. Answer with a `kdeconnect.battery` snapshot read
-                    // from `/sys/class/power_supply` (a desktop replies cleanly
-                    // with the "-1 / not a battery" sentinel).
+                    // KDC-PLUGINS / KDC-MESH-8 — Battery request: the peer polls THIS
+                    // host's battery. Answer with a `kdeconnect.battery` snapshot read
+                    // from `/sys/class/power_supply` (a desktop replies cleanly with
+                    // the "-1 / not a battery" sentinel); audited (#16).
                     if packet.kind == "kdeconnect.battery.request" {
                         handle_battery_request(&transport, peer).await;
+                        audit_kdc_action(json!({
+                            "action": "kdc_battery_report",
+                            "phone": peer.as_str(),
+                        }));
                     }
-                    // KDC-PLUGINS — Find My Phone: the peer rings THIS host. Play
-                    // an audible alert through the desktop sound path (the same
-                    // canberra/paplay path the notify-toast uses).
+                    // KDC-MESH-8 — Connectivity report request: reply with THIS host's
+                    // connectivity summary (mesh/overlay up, default route, up links)
+                    // as a ping notification; audited (#12/#16). Symmetric with the
+                    // battery report — the desktop reports its own connectivity.
+                    if packet.kind == "kdeconnect.connectivity_report.request" {
+                        handle_connectivity_request(&transport, peer).await;
+                        audit_kdc_action(json!({
+                            "action": "kdc_connectivity_report",
+                            "phone": peer.as_str(),
+                        }));
+                    }
+                    // KDC-PLUGINS / KDC-MESH-8 — Find My Phone (both ways, #12): the
+                    // peer rings THIS host through the desktop sound path; audited.
+                    // The reverse (this host rings the phone) is the `ring` verb.
                     if packet.kind == "kdeconnect.findmyphone.request" {
                         ring_local_device();
+                        audit_kdc_action(json!({
+                            "action": "kdc_find_my_device",
+                            "direction": "phone_rings_desktop",
+                            "phone": peer.as_str(),
+                        }));
                     }
-                    // KDC-PLUGINS — Clipboard: a peer's copy (live or the
+                    // KDC-MESH-8 — Telephony alert (#12): a phone call/SMS state event
+                    // (ringing / missed / talking) surfaces on THIS host's desktop
+                    // feed via `kdc_event_alert` above; audit it here.
+                    if packet.kind == "kdeconnect.telephony" {
+                        if let Ok(body) = mde_kdc_proto::plugins::from_packet_body::<
+                            mde_kdc_proto::plugins::telephony::TelephonyBody,
+                        >(packet)
+                        {
+                            audit_kdc_action(json!({
+                                "action": "kdc_telephony_alert",
+                                "phone": peer.as_str(),
+                                "event": format!("{:?}", body.event),
+                                "caller": if body.contact_name.is_empty() {
+                                    body.phone_number.clone()
+                                } else {
+                                    body.contact_name.clone()
+                                },
+                            }));
+                        }
+                    }
+                    // KDC-PLUGINS / KDC-MESH-8 — Clipboard: a peer's copy (live or the
                     // connection-time `.connect` push) is applied to THIS host's
-                    // Wayland clipboard via `wl-copy` when present.
+                    // Wayland clipboard via `wl-copy` when present; audited (#16).
                     if packet.kind == "kdeconnect.clipboard"
                         || packet.kind == "kdeconnect.clipboard.connect"
                     {
                         if let Some(content) = packet.body.get("content").and_then(Value::as_str) {
                             apply_clipboard(content);
+                            audit_kdc_action(json!({
+                                "action": "kdc_clipboard_apply",
+                                "phone": peer.as_str(),
+                                "bytes": content.len(),
+                            }));
                         }
                     }
                     // KDC-MESH-5 — a phone notification (design #6): fan it out,
@@ -1435,15 +1503,25 @@ fn execute_runcommand(cmds: &[RunCmd], key: &str) -> String {
 /// (`requestCommandList`) or execute a `key` and ping the result back. Execution
 /// runs off the reactor thread (`spawn_blocking`) so a slow command can't stall
 /// the host event loop.
+///
+/// KDC-MESH-8: the published list carries the shell commands PLUS the fleet
+/// OpenStack lifecycle commands ([`cloud_command_entries`]). A `cloud-*` key is
+/// routed through the QC `action/cloud/*` Bus verbs ([`handle_cloud_command`]) —
+/// gated on a `paired` device (the auth, #16) — instead of the shell. Every
+/// executed command audits (#16).
 async fn handle_runcommand(
     transport: &OverlayTransport,
     config_dir: &std::path::Path,
     peer: &PeerId,
     body: &Value,
+    paired: bool,
 ) {
-    let cmds = load_runcommands(config_dir);
+    let shell_cmds = load_runcommands(config_dir);
     if body.get("requestCommandList").and_then(Value::as_bool) == Some(true) {
-        let list = command_list_json(&cmds);
+        // The phone-visible list = the shell commands + the cloud lifecycle set.
+        let mut all = shell_cmds.clone();
+        all.extend(cloud_command_entries());
+        let list = command_list_json(&all);
         let pkt = build_packet("kdeconnect.runcommand", json!({ "commandList": list }));
         if let Err(e) = transport.send_to(peer, pkt).await {
             warn!(error = %e, "kdc-host: runcommand list send failed");
@@ -1451,11 +1529,31 @@ async fn handle_runcommand(
         return;
     }
     if let Some(key) = body.get("key").and_then(Value::as_str) {
+        // KDC-MESH-8 — a cloud lifecycle key drives the fleet OpenStack verbs over
+        // the Bus (paired-gated), not the shell.
+        if let Some(cmd) = CloudCommand::from_key(key) {
+            if !paired {
+                let pkt = build_packet(
+                    "kdeconnect.ping",
+                    json!({ "message": "Cloud commands require a paired device" }),
+                );
+                let _ = transport.send_to(peer, pkt).await;
+                return;
+            }
+            handle_cloud_command(transport, peer, cmd).await;
+            return;
+        }
         let key = key.to_string();
-        let result = tokio::task::spawn_blocking(move || execute_runcommand(&cmds, &key))
+        let audit_key = key.clone();
+        let result = tokio::task::spawn_blocking(move || execute_runcommand(&shell_cmds, &key))
             .await
             .unwrap_or_else(|_| "command execution failed".to_string());
         info!(device = %peer.as_str(), "kdc-host: ran phone command");
+        audit_kdc_action(json!({
+            "action": "kdc_runcommand",
+            "phone": peer.as_str(),
+            "key": audit_key,
+        }));
         let pkt = build_packet("kdeconnect.ping", json!({ "message": result }));
         if let Err(e) = transport.send_to(peer, pkt).await {
             warn!(error = %e, "kdc-host: runcommand result ping failed");
@@ -1663,6 +1761,10 @@ fn advertised_services() -> Vec<String> {
         // honest-gates when `sshfs` is absent (it's a capability, not a promise
         // the tool is installed).
         service_directory::service::SFTP.to_string(),
+        // KDC-MESH-8 — fleet OpenStack lifecycle (drives the QC `action/cloud/*`
+        // verbs) + telephony (call/SMS) alerts.
+        service_directory::service::OPENSTACK.to_string(),
+        service_directory::service::TELEPHONY.to_string(),
     ]
 }
 
@@ -1772,6 +1874,388 @@ fn serve_browse(config_dir: &std::path::Path, body: &Value) -> String {
     match mde_kdc_host::file_browse::browse(&roots, path) {
         Ok(entries) => json!({ "ok": true, "path": path, "entries": entries }).to_string(),
         Err(e) => json!({ "ok": false, "error": e.to_string() }).to_string(),
+    }
+}
+
+// ── KDC-MESH-8: run-commands (OpenStack lifecycle) + telephony + connectivity ──
+//
+// The phone triggers fleet OpenStack lifecycle commands (design #12) that drive
+// the QC `action/cloud/*` typed verbs over the Bus — consuming the openstack
+// worker's PUBLIC interface, never touching the worker. Battery + connectivity
+// report on desktops, telephony alerts surface, find-my-device works both ways;
+// pairing is the auth but EVERY action audits (#16, `audit_kdc_action`).
+
+/// How long a phone-triggered cloud Bus round-trip waits for the openstack
+/// worker's reply before honest-gating "cloud unavailable" (no fabricated result).
+const CLOUD_BUS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The fleet OpenStack lifecycle commands the phone can trigger (design #12).
+///
+/// Bulk-scoped because stock KDE Connect's run-command sends only a curated
+/// `key` (no instance argument): `List`/`Status` read the roster; `StartAll`/
+/// `StopAll`/`RebootAll` act on every matching instance. **Delete is deliberately
+/// NOT phone-exposed** — a fleet-wide delete with no per-command confirm is past
+/// the safety line the audit log alone shouldn't backstop (a targeted delete
+/// needs an instance the stock run-command can't carry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloudCommand {
+    /// List every Nova instance (name + status).
+    List,
+    /// Summarize the roster (counts by status).
+    Status,
+    /// Start every `SHUTOFF` instance.
+    StartAll,
+    /// Stop every `ACTIVE` instance.
+    StopAll,
+    /// Reboot every `ACTIVE` instance.
+    RebootAll,
+}
+
+impl CloudCommand {
+    /// The curated run-command `key` for each command.
+    const fn key(self) -> &'static str {
+        match self {
+            Self::List => "cloud-list",
+            Self::Status => "cloud-status",
+            Self::StartAll => "cloud-start-all",
+            Self::StopAll => "cloud-stop-all",
+            Self::RebootAll => "cloud-reboot-all",
+        }
+    }
+
+    /// The phone-visible name shown in the run-command list.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::List => "Cloud: list instances",
+            Self::Status => "Cloud: status",
+            Self::StartAll => "Cloud: start all instances",
+            Self::StopAll => "Cloud: stop all instances",
+            Self::RebootAll => "Cloud: reboot all instances",
+        }
+    }
+
+    /// Map a run-command key to its command, or `None` for a non-cloud key.
+    fn from_key(key: &str) -> Option<Self> {
+        [
+            Self::List,
+            Self::Status,
+            Self::StartAll,
+            Self::StopAll,
+            Self::RebootAll,
+        ]
+        .into_iter()
+        .find(|c| c.key() == key)
+    }
+
+    /// The lifecycle action a bulk command drives (`None` for the reads).
+    const fn lifecycle(self) -> Option<LifecycleAction> {
+        match self {
+            Self::StartAll => Some(LifecycleAction::Start),
+            Self::StopAll => Some(LifecycleAction::Stop),
+            Self::RebootAll => Some(LifecycleAction::Reboot),
+            Self::List | Self::Status => None,
+        }
+    }
+}
+
+/// Every cloud command as a [`RunCmd`] so it appears in the phone's run-command
+/// list. The `command` field is a static label (cloud keys never shell out — they
+/// route through the Bus in [`handle_cloud_command`]).
+fn cloud_command_entries() -> Vec<RunCmd> {
+    [
+        CloudCommand::List,
+        CloudCommand::Status,
+        CloudCommand::StartAll,
+        CloudCommand::StopAll,
+        CloudCommand::RebootAll,
+    ]
+    .into_iter()
+    .map(|c| RunCmd {
+        key: c.key().to_string(),
+        name: c.name().to_string(),
+        command: "(mesh OpenStack lifecycle over the Bus)".to_string(),
+    })
+    .collect()
+}
+
+/// The `openstack server <verb>` Bus verb for a lifecycle action
+/// (`instance-start` / `instance-stop` / `instance-reboot`).
+fn lifecycle_bus_verb(action: LifecycleAction) -> String {
+    format!("instance-{}", action.cli_verb())
+}
+
+/// Pick the instances a bulk lifecycle command acts on, filtered by Nova status:
+/// `Start` targets `SHUTOFF` instances, `Stop`/`Reboot` target `ACTIVE` ones,
+/// `Delete` (never phone-exposed) targets none. Pure + testable — the decision
+/// that keeps a start-all from redundantly starting already-running instances.
+fn plan_cloud_lifecycle(action: LifecycleAction, instances: &[CloudInstance]) -> Vec<String> {
+    instances
+        .iter()
+        .filter(|i| match action {
+            LifecycleAction::Start => i.status.eq_ignore_ascii_case("SHUTOFF"),
+            LifecycleAction::Stop | LifecycleAction::Reboot => {
+                i.status.eq_ignore_ascii_case("ACTIVE")
+            }
+            LifecycleAction::Delete => false,
+        })
+        .map(|i| i.name.clone())
+        .collect()
+}
+
+/// A phone-friendly one-line roster listing (`cloud-list`). Pure + testable.
+fn summarize_instances(instances: &[CloudInstance]) -> String {
+    if instances.is_empty() {
+        return "No cloud instances".to_string();
+    }
+    let rows: Vec<String> = instances
+        .iter()
+        .map(|i| format!("{} [{}]", i.name, i.status))
+        .collect();
+    format!("{} instance(s): {}", instances.len(), rows.join(", "))
+}
+
+/// A phone-friendly status summary — counts by state (`cloud-status`). Pure.
+fn summarize_status(instances: &[CloudInstance]) -> String {
+    let active = instances
+        .iter()
+        .filter(|i| i.status.eq_ignore_ascii_case("ACTIVE"))
+        .count();
+    let shutoff = instances
+        .iter()
+        .filter(|i| i.status.eq_ignore_ascii_case("SHUTOFF"))
+        .count();
+    let other = instances.len() - active - shutoff;
+    format!(
+        "Cloud: {} instance(s) — {active} active, {shutoff} shutoff, {other} other",
+        instances.len()
+    )
+}
+
+/// One synchronous cloud Bus round-trip: publish `action/cloud/<verb>` with
+/// `body` and poll `reply/<ulid>` until the openstack worker answers or
+/// [`CLOUD_BUS_TIMEOUT`] elapses. Sync (the `Persist` never crosses an await —
+/// it runs inside `spawn_blocking`), consuming the PUBLIC rpc + verb interface.
+/// `None` is an honest gate (no responder / timeout), never a fabricated reply.
+fn cloud_bus_call(persist: &Persist, verb: &str, body: &str) -> Option<CloudReply> {
+    let topic = cloud_action_topic(verb);
+    let ulid = publish_request(persist, &topic, Priority::Default, None, Some(body)).ok()?;
+    let rtopic = reply_topic(&ulid);
+    let deadline = std::time::Instant::now() + CLOUD_BUS_TIMEOUT;
+    loop {
+        if let Ok(msgs) = persist.list_since(&rtopic, None) {
+            if let Some(m) = msgs.first() {
+                return m
+                    .body
+                    .as_deref()
+                    .and_then(|b| serde_json::from_str::<CloudReply>(b).ok());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Run a cloud command against the fleet over the Bus (design #12) and return the
+/// phone-friendly result line. Sync (the `Persist` Bus round-trips can't cross an
+/// await); the async caller runs it via `spawn_blocking`. Every performed op
+/// audits (#16); an unavailable cloud / no-responder is an honest gate.
+fn run_cloud_command_blocking(cmd: CloudCommand) -> String {
+    let Some(bus) = mde_bus::default_data_dir() else {
+        return "Cloud unavailable (no Bus)".to_string();
+    };
+    let Ok(persist) = Persist::open(bus) else {
+        return "Cloud unavailable (Bus not open)".to_string();
+    };
+    // Every cloud command starts from the live instance roster.
+    let instances = match cloud_bus_call(&persist, "list-instances", "{}") {
+        Some(reply) if reply.ok => reply.instances.unwrap_or_default(),
+        Some(reply) => {
+            return format!(
+                "Cloud gated: {}",
+                reply.gated.or(reply.error).unwrap_or_default()
+            );
+        }
+        None => {
+            return "Cloud unavailable (no response — is the openstack worker running?)"
+                .to_string();
+        }
+    };
+    audit_kdc_action(json!({
+        "action": "kdc_openstack",
+        "verb": "list-instances",
+        "count": instances.len(),
+    }));
+    let Some(action) = cmd.lifecycle() else {
+        // A read command — summarize the roster.
+        return match cmd {
+            CloudCommand::Status => summarize_status(&instances),
+            _ => summarize_instances(&instances),
+        };
+    };
+    let targets = plan_cloud_lifecycle(action, &instances);
+    if targets.is_empty() {
+        return format!("{}: no matching instances", cmd.name());
+    }
+    let verb = lifecycle_bus_verb(action);
+    let (mut done, mut failed) = (0_usize, 0_usize);
+    for name in &targets {
+        let body = json!({ "instance": name }).to_string();
+        match cloud_bus_call(&persist, &verb, &body) {
+            Some(r) if r.ok => {
+                done += 1;
+                audit_kdc_action(json!({
+                    "action": "kdc_openstack",
+                    "verb": verb,
+                    "instance": name,
+                    "audited": r.audited,
+                }));
+            }
+            Some(r) => {
+                failed += 1;
+                audit_kdc_action(json!({
+                    "action": "kdc_openstack",
+                    "verb": verb,
+                    "instance": name,
+                    "result": "failed",
+                    "reason": r.error.or(r.gated).unwrap_or_default(),
+                }));
+            }
+            None => {
+                failed += 1;
+                audit_kdc_action(json!({
+                    "action": "kdc_openstack",
+                    "verb": verb,
+                    "instance": name,
+                    "result": "timeout",
+                }));
+            }
+        }
+    }
+    format!(
+        "{}: {done} ok, {failed} failed (of {})",
+        cmd.name(),
+        targets.len()
+    )
+}
+
+/// Handle a phone-triggered cloud command: run the fleet Bus round-trips off the
+/// reactor (`spawn_blocking`, since `Persist` is `!Send`) + ping the result back
+/// to the phone.
+async fn handle_cloud_command(transport: &OverlayTransport, peer: &PeerId, cmd: CloudCommand) {
+    let result = tokio::task::spawn_blocking(move || run_cloud_command_blocking(cmd))
+        .await
+        .unwrap_or_else(|_| "cloud command failed".to_string());
+    info!(device = %peer.as_str(), command = cmd.key(), "kdc-host: ran phone cloud command");
+    let pkt = build_packet("kdeconnect.ping", json!({ "message": result }));
+    if let Err(e) = transport.send_to(peer, pkt).await {
+        warn!(error = %e, "kdc-host: cloud command result ping failed");
+    }
+}
+
+// ── KDC-MESH-8: telephony alerts + connectivity report ───────────────────────
+
+/// Classify an inbound `kdeconnect.telephony` body into an Alert-Center
+/// `(summary, severity)`, or `None` to skip. Ringing + missed are the notable
+/// call events (surfaced to the desktop feed); talking/disconnected are presence
+/// churn, and a cancel (call ended) isn't a new alert. Pure + testable.
+fn telephony_alert(body: &Value) -> Option<(String, &'static str)> {
+    use mde_kdc_proto::plugins::telephony::{TelephonyBody, TelephonyEvent};
+    let parsed: TelephonyBody = serde_json::from_value(body.clone()).ok()?;
+    if parsed.is_cancel {
+        return None;
+    }
+    let who = if !parsed.contact_name.is_empty() {
+        parsed.contact_name
+    } else if !parsed.phone_number.is_empty() {
+        parsed.phone_number
+    } else {
+        "unknown".to_string()
+    };
+    match parsed.event {
+        TelephonyEvent::Ringing => Some((format!("Incoming call from {who}"), "warn")),
+        TelephonyEvent::Missed => Some((format!("Missed call from {who}"), "warn")),
+        TelephonyEvent::Talking | TelephonyEvent::Disconnected => None,
+    }
+}
+
+/// Read a `/sys/class/net/<iface>/operstate` file, returning whether the link is
+/// `up`. Best-effort — a missing/unreadable node is not up.
+fn iface_is_up(iface: &str) -> bool {
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/operstate"))
+        .map(|s| s.trim() == "up")
+        .unwrap_or(false)
+}
+
+/// Count the non-loopback network interfaces reporting `operstate == up`.
+fn up_interface_count() -> usize {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| name != "lo" && iface_is_up(name))
+        .count()
+}
+
+/// Whether the host has a default route (IPv4 or IPv6) — parsed from
+/// `/proc/net/route` (a `00000000` destination) / `/proc/net/ipv6_route`.
+fn has_default_route() -> bool {
+    let v4 = std::fs::read_to_string("/proc/net/route")
+        .map(|t| {
+            t.lines().skip(1).any(|l| {
+                let mut cols = l.split_whitespace();
+                cols.next(); // iface
+                cols.next().map(|dest| dest == "00000000") == Some(true)
+            })
+        })
+        .unwrap_or(false);
+    let zeros = "0".repeat(32);
+    let v6 = std::fs::read_to_string("/proc/net/ipv6_route")
+        .map(|t| {
+            t.lines()
+                .any(|l| l.split_whitespace().next() == Some(zeros.as_str()))
+        })
+        .unwrap_or(false);
+    v4 || v6
+}
+
+/// Render THIS host's connectivity summary (design #12) from its inputs. Pure +
+/// testable — the live reader ([`local_connectivity_summary`]) supplies the
+/// system state.
+fn format_connectivity(overlay_up: bool, default_route: bool, up_ifaces: usize) -> String {
+    let mesh = if overlay_up {
+        "on the mesh"
+    } else {
+        "OFF the mesh"
+    };
+    let route = if default_route {
+        "internet routable"
+    } else {
+        "no default route"
+    };
+    format!("Connectivity: {mesh}, {route}, {up_ifaces} link(s) up")
+}
+
+/// This host's live connectivity summary: overlay/mesh reachability (the QC-6
+/// overlay-ip publish file resolves), a default route, and the count of up links.
+fn local_connectivity_summary() -> String {
+    let overlay_up = mde_kdc_host::resolve_overlay_ip(std::path::Path::new(
+        mde_kdc_host::DEFAULT_OVERLAY_IP_PATH,
+    ))
+    .is_resolved();
+    format_connectivity(overlay_up, has_default_route(), up_interface_count())
+}
+
+/// Answer a `kdeconnect.connectivity_report.request` with THIS host's
+/// connectivity summary as a ping notification (design #12).
+async fn handle_connectivity_request(transport: &OverlayTransport, peer: &PeerId) {
+    let summary = local_connectivity_summary();
+    let pkt = build_packet("kdeconnect.ping", json!({ "message": summary }));
+    if let Err(e) = transport.send_to(peer, pkt).await {
+        warn!(error = %e, "kdc-host: connectivity report send failed");
     }
 }
 
@@ -3425,5 +3909,147 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].device_id, "d1");
         assert_eq!(queued[0].packet.kind, "kdeconnect.sftp.request");
+    }
+
+    // ── KDC-MESH-8: run-commands (OpenStack lifecycle) + telephony + connectivity ─
+
+    fn instance(name: &str, status: &str) -> CloudInstance {
+        CloudInstance {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            status: status.to_string(),
+            flavor: None,
+            image: None,
+            networks: None,
+        }
+    }
+
+    #[test]
+    fn cloud_command_keys_map_and_the_list_includes_them() {
+        assert_eq!(
+            CloudCommand::from_key("cloud-list"),
+            Some(CloudCommand::List)
+        );
+        assert_eq!(
+            CloudCommand::from_key("cloud-reboot-all"),
+            Some(CloudCommand::RebootAll)
+        );
+        // A shell key isn't a cloud command (so it takes the shell path).
+        assert_eq!(CloudCommand::from_key("mesh-health"), None);
+        // The phone-visible command list carries the cloud entries.
+        let list = command_list_json(&cloud_command_entries());
+        for c in [
+            "cloud-list",
+            "cloud-start-all",
+            "cloud-stop-all",
+            "cloud-reboot-all",
+        ] {
+            assert!(list.contains(c), "command list missing {c}");
+        }
+        // Delete is deliberately NOT phone-exposed (safety).
+        assert!(!list.contains("cloud-delete"));
+    }
+
+    #[test]
+    fn plan_cloud_lifecycle_filters_by_nova_status() {
+        let fleet = [
+            instance("web", "ACTIVE"),
+            instance("db", "SHUTOFF"),
+            instance("cache", "ACTIVE"),
+            instance("broken", "ERROR"),
+        ];
+        // start-all acts on the SHUTOFF instance only.
+        assert_eq!(
+            plan_cloud_lifecycle(LifecycleAction::Start, &fleet),
+            vec!["db".to_string()]
+        );
+        // stop-all / reboot-all act on the ACTIVE instances only.
+        assert_eq!(
+            plan_cloud_lifecycle(LifecycleAction::Stop, &fleet),
+            vec!["web".to_string(), "cache".to_string()]
+        );
+        assert_eq!(
+            plan_cloud_lifecycle(LifecycleAction::Reboot, &fleet),
+            vec!["web".to_string(), "cache".to_string()]
+        );
+        // Delete targets nothing (never phone-exposed).
+        assert!(plan_cloud_lifecycle(LifecycleAction::Delete, &fleet).is_empty());
+    }
+
+    #[test]
+    fn lifecycle_bus_verb_maps_to_the_openstack_action_verb() {
+        assert_eq!(lifecycle_bus_verb(LifecycleAction::Start), "instance-start");
+        assert_eq!(
+            lifecycle_bus_verb(LifecycleAction::Reboot),
+            "instance-reboot"
+        );
+    }
+
+    #[test]
+    fn cloud_summaries_are_phone_friendly() {
+        let fleet = [instance("web", "ACTIVE"), instance("db", "SHUTOFF")];
+        let list = summarize_instances(&fleet);
+        assert!(list.contains("web [ACTIVE]") && list.contains("db [SHUTOFF]"));
+        let status = summarize_status(&fleet);
+        assert!(status.contains("1 active") && status.contains("1 shutoff"));
+        assert_eq!(summarize_instances(&[]), "No cloud instances");
+    }
+
+    #[test]
+    fn telephony_alert_flags_ringing_and_missed_only() {
+        // Ringing + missed are notable call events (warn); talking/disconnected
+        // and a cancel are not surfaced.
+        let ringing = json!({ "event": "ringing", "contactName": "Alice" });
+        assert_eq!(
+            telephony_alert(&ringing),
+            Some(("Incoming call from Alice".to_string(), "warn"))
+        );
+        let missed = json!({ "event": "missed", "phoneNumber": "+15551234" });
+        assert_eq!(
+            telephony_alert(&missed),
+            Some(("Missed call from +15551234".to_string(), "warn"))
+        );
+        assert!(telephony_alert(&json!({ "event": "talking" })).is_none());
+        assert!(telephony_alert(&json!({ "event": "disconnected" })).is_none());
+        assert!(
+            telephony_alert(&json!({ "event": "ringing", "isCancel": true })).is_none(),
+            "a cancel is not a new alert"
+        );
+        // It also feeds the Alert-Center classifier.
+        let pkt = build_packet("kdeconnect.telephony", ringing);
+        let ev = HostEvent::Packet {
+            peer: PeerId::from("moto"),
+            packet: pkt,
+        };
+        assert!(matches!(kdc_event_alert(&ev), Some((_, "warn"))));
+    }
+
+    #[test]
+    fn format_connectivity_reads_the_mesh_route_and_links() {
+        let up = format_connectivity(true, true, 2);
+        assert!(
+            up.contains("on the mesh") && up.contains("internet routable") && up.contains("2 link")
+        );
+        let down = format_connectivity(false, false, 0);
+        assert!(down.contains("OFF the mesh") && down.contains("no default route"));
+    }
+
+    #[test]
+    fn kdc_mesh8_a_phone_action_appends_a_hash_chained_audit_row() {
+        // design #16 — pairing is the auth, but EVERY action is recorded. Serial
+        // tests (`--test-threads=1`) make MDE_HOME a safe hermetic redirect.
+        let tmp = tempdir().unwrap();
+        std::env::set_var("MDE_HOME", tmp.path());
+        let before = audit_row_count(&crate::default_db_path());
+        audit_kdc_action(
+            json!({ "action": "kdc_openstack", "verb": "instance-reboot", "instance": "web" }),
+        );
+        let after = audit_row_count(&crate::default_db_path());
+        assert_eq!(
+            after,
+            before + 1,
+            "the phone-triggered action appended one audit row"
+        );
+        std::env::remove_var("MDE_HOME");
     }
 }
