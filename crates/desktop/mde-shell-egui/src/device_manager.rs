@@ -19,7 +19,7 @@
 //! honest "no inventory yet", never a faked tree; absent summary fields render as
 //! an em-dash, never invented totals.
 //!
-//! **Scope now covers DEVMGR-2 + DEVMGR-3** — the by-type tree + header card +
+//! **Scope now covers DEVMGR-2 + DEVMGR-3 + DEVMGR-4** — the by-type tree + header card +
 //! local read (DEVMGR-2), plus the bottom **detail drawer** (General / Driver /
 //! Details / Events / Resources, #9/#10), the **MDM problem-code parity** (#11 —
 //! `DeviceStatus` → Windows Code 28/22/10 with the honest Linux reason beside it),
@@ -31,7 +31,16 @@
 //! twin of a real seam (Scan / view-mode / Expand-Collapse-all / the ⓘ dialog),
 //! honestly disabled/omitted per §7.
 //!
-//! The host rail across peers (DEVMGR-4), the by-connection topology (DEVMGR-5) and
+//! **DEVMGR-4 adds the host rail + mesh-node switching** — a persistent left rail
+//! lists every peer that has published a `device-inventory/<host>.json` (via
+//! [`device_inventory::read_all`]) with a health/freshness status dot + the local
+//! "you are here" marker; selecting one loads THAT host's snapshot instantly and a
+//! live-refresh button re-reads it (#5/#7). The tree, header card, drawer + status
+//! cluster all reflect the **selected** host; local is the default on open. A host
+//! that has published nothing, or whose snapshot is old, reads an honest
+//! **absent / stale** state — never fabricated data (§7).
+//!
+//! The by-connection topology (DEVMGR-5), the cross-fleet By-node flatten and
 //! export (DEVMGR-6) are still later units; their seams here (the disabled view
 //! modes) are left clean, not stubbed to a fake render.
 
@@ -63,6 +72,14 @@ use crate::explorer::local_hostname;
 /// immediate re-read regardless of this gate.
 const REFRESH: Duration = Duration::from_secs(30);
 
+/// How long a published snapshot may age before the rail marks a host **stale**
+/// (design §7 — honest dim/stale/offline). The producer republishes on its own
+/// smoothed cadence (well under a minute); a host whose newest snapshot is older
+/// than this has likely stopped publishing (offline / stalled), so the rail dims
+/// it to amber rather than paint it as live. A snapshot with an unknown publish
+/// time (`published_at_ms == 0`) is treated as stale for the same honesty reason.
+const STALE_AFTER: Duration = Duration::from_secs(180);
+
 /// How the device tree is organised (#3). DEVMGR-2 ships **By type**; By
 /// connection (the PCI/USB topology, DEVMGR-5) and By node (the cross-fleet
 /// flatten, DEVMGR-4) are later units. The faithful MDM View menu offers all
@@ -80,7 +97,8 @@ enum ViewMode {
     ByType,
     /// The PCI/USB topology tree (DEVMGR-5) — not yet wired.
     ByConnection,
-    /// The cross-fleet flatten of every host's devices (DEVMGR-4) — not yet wired.
+    /// The cross-fleet flatten of every host's devices (a later P2 unit) — not
+    /// yet wired (DEVMGR-4 adds the host rail, not this flattened view).
     ByNode,
 }
 
@@ -220,18 +238,129 @@ const fn problem_code(status: DeviceStatus) -> Option<u32> {
     }
 }
 
-/// The About → Device-Manager surface state (DEVMGR-2). Holds the last-read local
-/// inventory, the fixed-cadence read clock, the per-category expand set, the tree
-/// organisation, and the ⓘ dialog latch. Drives no worker — a thin renderer over
-/// the replicated snapshot.
+/// How fresh a host's published inventory is (the rail's honest dim/stale/offline,
+/// design §7) — derived purely from the snapshot's publish time vs now, so the
+/// classification is unit-tested without a clock or a render.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostFreshness {
+    /// Published within [`STALE_AFTER`] — a live host, dot coloured by its health.
+    Fresh,
+    /// Published, but the newest snapshot is older than [`STALE_AFTER`] (or its
+    /// publish time is unknown) — likely offline / no longer republishing. The
+    /// rail dims it amber rather than paint a stale tree as live.
+    Stale,
+    /// Nothing published for this host at all — an honest offline "?", never a
+    /// fabricated tree.
+    Absent,
+}
+
+/// Classify a host's freshness from its snapshot publish time (`None` when the
+/// host has published nothing) against `now_ms`. Pure, so the rail's dim/stale/
+/// offline states are tested deterministically.
+fn host_freshness(published_at_ms: Option<u64>, now_ms: u64) -> HostFreshness {
+    match published_at_ms {
+        None => HostFreshness::Absent,
+        // An honest "unknown publish time" (the schema's `0`) can't be confirmed
+        // fresh, so it reads stale rather than live.
+        Some(0) => HostFreshness::Stale,
+        Some(ts) => {
+            let age_ms = now_ms.saturating_sub(ts);
+            if u128::from(age_ms) <= STALE_AFTER.as_millis() {
+                HostFreshness::Fresh
+            } else {
+                HostFreshness::Stale
+            }
+        }
+    }
+}
+
+/// One row in the host rail (#5) — a peer that may or may not have published an
+/// inventory. Carries just what the rail renders (name · freshness · the health
+/// badge counts), decoupled from the full [`DeviceInventory`] so an absent host
+/// (no published file) is still a first-class, selectable row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostEntry {
+    /// The peer's short hostname (the rail key + the `read_inventory` stem).
+    host: String,
+    /// When this host last published (`None` = nothing published — an absent row).
+    published_at_ms: Option<u64>,
+    /// Device count in the newest snapshot (0 for an absent host).
+    device_count: usize,
+    /// Problem-status device count in the newest snapshot (0 for an absent host).
+    problem_count: usize,
+}
+
+impl HostEntry {
+    /// A rail row from a published inventory.
+    fn from_inventory(inv: &DeviceInventory) -> Self {
+        Self {
+            host: inv.host.clone(),
+            published_at_ms: Some(inv.published_at_ms),
+            device_count: inv.device_count(),
+            problem_count: inv.problem_count(),
+        }
+    }
+
+    /// An absent rail row — a known host (e.g. the local "you are here" node) that
+    /// has published nothing yet. Rendered as an honest offline "?" (§7).
+    fn absent(host: &str) -> Self {
+        Self {
+            host: host.to_string(),
+            published_at_ms: None,
+            device_count: 0,
+            problem_count: 0,
+        }
+    }
+
+    /// This row's freshness against `now_ms`.
+    fn freshness(&self, now_ms: u64) -> HostFreshness {
+        host_freshness(self.published_at_ms, now_ms)
+    }
+}
+
+/// Build the host rail from every published inventory (#5): a [`HostEntry`] per
+/// host, with the local "you are here" node always present (even if it has
+/// published nothing yet — an honest absent row you can still select) and **pinned
+/// first**, the rest alphabetical. `all` arrives already sorted by host
+/// ([`device_inventory::read_all`]), so the local-first key keeps a stable order.
+/// Pure over its inputs, so the rail model is tested without a substrate.
+fn build_rail(all: &[DeviceInventory], local: &str) -> Vec<HostEntry> {
+    let mut entries: Vec<HostEntry> = all.iter().map(HostEntry::from_inventory).collect();
+    if !entries.iter().any(|e| e.host == local) {
+        entries.push(HostEntry::absent(local));
+    }
+    // Local pinned first (you-are-here), then the rest alphabetically.
+    entries.sort_by(|a, b| {
+        let a_local = a.host == local;
+        let b_local = b.host == local;
+        b_local.cmp(&a_local).then_with(|| a.host.cmp(&b.host))
+    });
+    entries
+}
+
+/// The About → Device-Manager surface state (DEVMGR-2..4). Holds the host rail
+/// across every peer (DEVMGR-4), the selected host + its last-read inventory, the
+/// fixed-cadence read clock, the per-category expand set, the tree organisation,
+/// the open device drawer, and the ⓘ dialog latch. Drives no worker — a thin
+/// renderer over the replicated snapshots.
 pub(crate) struct DeviceManagerState {
     /// The replicated workgroup root the `device-inventory/` dir lives under
     /// (resolved once — the same substrate mount the chrome/grade fold reads).
     workgroup_root: PathBuf,
-    /// This node's short hostname — the LOCAL inventory this surface reads
-    /// (DEVMGR-2; the host rail across peers is DEVMGR-4).
+    /// This node's short hostname — the "you are here" rail anchor + the default
+    /// selection on open (DEVMGR-4). Always present in the rail even if it has
+    /// published nothing.
     local_host: String,
-    /// The last-read LOCAL inventory, or `None` when nothing is published yet.
+    /// The host currently being inspected (DEVMGR-4) — `local_host` on open, then
+    /// whichever rail row the operator selects. The tree / header card / drawer /
+    /// status cluster all reflect THIS host.
+    selected_host: String,
+    /// The host rail (#5) — one [`HostEntry`] per published peer + the local node,
+    /// rebuilt from [`device_inventory::read_all`] on every read. Local is pinned
+    /// first.
+    hosts: Vec<HostEntry>,
+    /// The last-read inventory for [`Self::selected_host`], or `None` when that
+    /// host has published nothing (an honest absent read, never a fabricated tree).
     inventory: Option<DeviceInventory>,
     /// Whether the inventory has been read at least once — the honest pre-poll
     /// gate (§7): a dim "reading…" before the first read, distinct from a
@@ -256,9 +385,12 @@ pub(crate) struct DeviceManagerState {
 
 impl Default for DeviceManagerState {
     fn default() -> Self {
+        let local_host = local_hostname();
         Self {
             workgroup_root: default_workgroup_root(),
-            local_host: local_hostname(),
+            selected_host: local_host.clone(),
+            local_host,
+            hosts: Vec::new(),
             inventory: None,
             seen: false,
             last_poll: None,
@@ -272,14 +404,31 @@ impl Default for DeviceManagerState {
 }
 
 impl DeviceManagerState {
-    /// Re-read THIS node's published inventory from the substrate now. An absent /
-    /// half-replicated / unreadable file reads as an honest `None` (never a
-    /// panic, via [`device_inventory::read_inventory`]); `seen` flips true so the
-    /// surface leaves the pre-poll state. Both the Scan action and the cadence
-    /// [`poll`](Self::poll) land here.
+    /// Re-read the substrate now — the host rail (every peer's freshness + health)
+    /// and the **selected** host's inventory in one [`device_inventory::read_all`]
+    /// (#5/#7). An absent / half-replicated / unreadable file reads as an honest
+    /// `None` (never a panic); `seen` flips true so the surface leaves the pre-poll
+    /// state. The Scan action, the rail's live-refresh, host switching, and the
+    /// cadence [`poll`](Self::poll) all land here.
     fn refresh(&mut self) {
-        self.inventory = device_inventory::read_inventory(&self.workgroup_root, &self.local_host);
+        // One dir read serves both the rail (every peer's freshness/health) and the
+        // selected host's tree (found in the same set — no second file read).
+        let all = device_inventory::read_all(&self.workgroup_root);
+        self.hosts = build_rail(&all, &self.local_host);
+        self.inventory = all.into_iter().find(|inv| inv.host == self.selected_host);
         self.seen = true;
+    }
+
+    /// Switch the inspected host to `host` (a rail click, #5): the device drawer +
+    /// active tab reset (a selection is per-host), then an immediate re-read loads
+    /// the new host's snapshot instantly (the #7 hybrid — the published file, no
+    /// wait). The category expand-set is stable across the switch (keyed on the
+    /// shared taxonomy keys), so the operator's open categories persist.
+    fn select_host(&mut self, host: String) {
+        self.selected_host = host;
+        self.selected = None;
+        self.active_tab = DrawerTab::default();
+        self.refresh();
     }
 
     /// The poll seam (self-gating): re-read on the fixed cadence while the About
@@ -313,11 +462,76 @@ impl DeviceManagerState {
         }
     }
 
+    /// The persistent left **host rail** (#5): every peer that has published an
+    /// inventory (plus the local "you are here" node) as a selectable row with a
+    /// freshness/health status dot; local pinned first, marked with a ⌂ home glyph.
+    /// A header carries a live-refresh button (#7 — re-read the selected host from
+    /// the mesh). Selecting a row switches the inspected host ([`Self::select_host`]).
+    fn rail(&mut self, ui: &mut egui::Ui) {
+        let now = now_ms();
+        let selected = self.selected_host.clone();
+        let local = self.local_host.clone();
+        let mut clicked: Option<String> = None;
+        let mut refresh_clicked = false;
+        egui::SidePanel::left(ui.id().with("devmgr-host-rail"))
+            .resizable(true)
+            .default_width(Style::SP_XL * 5.0)
+            .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Mesh nodes")
+                            .color(Style::TEXT_DIM)
+                            .size(Style::SMALL)
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button(
+                                RichText::new("\u{21BB}") // ↻ — live-refresh this host
+                                    .size(Style::SMALL)
+                                    .color(Style::TEXT),
+                            )
+                            .on_hover_text("Refresh this host's inventory from the mesh")
+                            .clicked()
+                        {
+                            refresh_clicked = true;
+                        }
+                    });
+                });
+                ui.separator();
+                ui.add_space(Style::SP_XS);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.hosts.is_empty() {
+                            muted_note(ui, "No nodes have published an inventory yet.");
+                        }
+                        for entry in &self.hosts {
+                            let is_sel = entry.host == selected;
+                            let is_local = entry.host == local;
+                            if host_row(ui, entry, is_sel, is_local, now) {
+                                clicked = Some(entry.host.clone());
+                            }
+                        }
+                    });
+            });
+        if refresh_clicked {
+            self.refresh();
+        }
+        if let Some(host) = clicked {
+            if host != self.selected_host {
+                self.select_host(host);
+            }
+        }
+    }
+
     /// Render the whole surface into `ui` (the body of `Surface::About`).
     ///
-    /// Layout (#2/#9): the compact brand strip (#24), the shared MENUBAR-ALL bar,
-    /// then the device tree filling the body — with the bottom **detail drawer**
-    /// (DEVMGR-3) reserved *before* the body so the tree stays full-width above it.
+    /// Layout (#2/#5/#9): the compact brand strip (#24), the shared MENUBAR-ALL
+    /// bar, then **rail │ tree │ (bottom drawer)** — the persistent left host rail
+    /// (DEVMGR-4) reserved first so it spans full height, then the bottom **detail
+    /// drawer** (DEVMGR-3), then the tree + header card fill the remainder.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
         // The brand identity strip (#24) — kept beside the shared MenuBar so the
         // `◈ Magic-Mesh Quasar v<ver>` mark + the ⓘ button stay always-visible.
@@ -330,7 +544,11 @@ impl DeviceManagerState {
         ui.separator();
         ui.add_space(Style::SP_XS);
 
-        // The bottom detail drawer (#9): reserved first so the tree/header body
+        // The persistent left host rail (#5): reserved first so it spans the full
+        // body height (rail │ tree │ drawer). Switching hosts here re-reads below.
+        self.rail(ui);
+
+        // The bottom detail drawer (#9): reserved next so the tree/header body
         // below fills only the space it leaves (the tree stays full-width above).
         self.detail_drawer(ui);
 
@@ -339,10 +557,10 @@ impl DeviceManagerState {
             .show_inside(ui, |ui| {
                 if !self.seen {
                     // Honest pre-poll (§7) — no fabricated tree before the first read.
-                    pre_poll(ui, &self.local_host);
+                    pre_poll(ui, &self.selected_host);
                 } else if self.inventory.is_none() {
-                    // Read, but this host has published nothing yet.
-                    empty_host(ui, &self.local_host);
+                    // Read, but the selected host has published nothing yet.
+                    empty_host(ui, &self.selected_host);
                 } else {
                     // The header reads the inventory immutably, then the tree takes
                     // `&mut self` to mutate the expand/selection sets — so the header
@@ -484,7 +702,7 @@ impl DeviceManagerState {
         let host = self
             .inventory
             .as_ref()
-            .map_or(self.local_host.as_str(), |inv| inv.host.as_str());
+            .map_or(self.selected_host.as_str(), |inv| inv.host.as_str());
         let host_tone = if self.inventory.is_some() {
             ChipTone::Info
         } else if self.seen {
@@ -1085,20 +1303,164 @@ fn empty_host(ui: &mut egui::Ui, host: &str) {
     });
 }
 
+// ─────────────────────────────── the host rail (#5) ─────────────────────────
+
+/// One host row in the rail — a freshness/health status dot, the hostname
+/// (accent-tinted + strong when it is the selected host), and the ⌂ "you are
+/// here" marker on the local node. An absent host dims its name (an honest offline
+/// row). The whole strip is one click target (switch to this host) with a hover
+/// summary. Returns `true` when the row was clicked this frame.
+fn host_row(
+    ui: &mut egui::Ui,
+    entry: &HostEntry,
+    selected: bool,
+    is_local: bool,
+    now_ms: u64,
+) -> bool {
+    let fresh = entry.freshness(now_ms);
+    let resp = ui
+        .horizontal(|ui| {
+            status_dot(ui, host_dot_tone(entry, now_ms));
+            ui.add_space(Style::SP_XS);
+            let name_tone = if selected {
+                Style::ACCENT
+            } else if fresh == HostFreshness::Absent {
+                Style::TEXT_DIM
+            } else {
+                Style::TEXT
+            };
+            let mut name = RichText::new(&entry.host)
+                .color(name_tone)
+                .size(Style::SMALL);
+            if selected {
+                name = name.strong();
+            }
+            ui.label(name);
+            if is_local {
+                ui.add_space(Style::SP_XS);
+                ui.label(
+                    RichText::new("\u{2302}") // ⌂ — you are here
+                        .color(Style::TEXT_DIM)
+                        .size(Style::SMALL),
+                );
+            }
+        })
+        .response;
+    // The row's labels don't sense clicks, so re-interact the whole strip as one
+    // selection target (click a host to inspect it), with a hover summary.
+    resp.interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(host_hover(entry, now_ms))
+        .clicked()
+}
+
+/// The status-dot tone for a rail host (design §7): an **absent** host is dim
+/// (offline / nothing published), a **stale** snapshot is amber (published but old
+/// — likely offline, so its health can't be trusted), and a **fresh** host is
+/// green when clean or danger when any device is faulted. Pure, so the honest
+/// dim/stale/offline mapping is tested without a render.
+fn host_dot_tone(entry: &HostEntry, now_ms: u64) -> egui::Color32 {
+    match entry.freshness(now_ms) {
+        HostFreshness::Absent => Style::TEXT_DIM,
+        HostFreshness::Stale => Style::WARN,
+        HostFreshness::Fresh => {
+            if entry.problem_count > 0 {
+                Style::DANGER
+            } else {
+                Style::OK
+            }
+        }
+    }
+}
+
+/// The rail row's hover summary — device / problem counts + a freshness read-out,
+/// or an honest "nothing published" for an absent host (§7). Pure over `now_ms` so
+/// it is tested deterministically.
+fn host_hover(entry: &HostEntry, now_ms: u64) -> String {
+    use std::fmt::Write as _;
+    let fresh = entry.freshness(now_ms);
+    if fresh == HostFreshness::Absent {
+        return "No device inventory published \u{2014} offline or not yet scanned.".to_string();
+    }
+    let mut s = format!(
+        "{} {}",
+        entry.device_count,
+        plural(entry.device_count, "device", "devices")
+    );
+    if entry.problem_count > 0 {
+        let _ = write!(
+            s,
+            " \u{00B7} {} {}", // ·
+            entry.problem_count,
+            plural(entry.problem_count, "problem", "problems")
+        );
+    }
+    s.push('\n');
+    if fresh == HostFreshness::Stale {
+        s.push_str("Stale \u{2014} "); // —
+    }
+    s.push_str(&scanned_label(now_ms, entry.published_at_ms.unwrap_or(0)));
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        cpu_line, device_status_display, format_mem_kb, header_lines, humanize_ago,
-        humanize_uptime, problem_code, scanned_label, status_tone, DeviceManagerState,
-        DeviceSelection, DrawerTab, MenuAction, ViewMode,
+        build_rail, cpu_line, device_status_display, format_mem_kb, header_lines, host_dot_tone,
+        host_hover, humanize_ago, humanize_uptime, problem_code, scanned_label, status_tone,
+        DeviceManagerState, DeviceSelection, DrawerTab, HostEntry, HostFreshness, MenuAction,
+        ViewMode, STALE_AFTER,
     };
     use mackes_mesh_types::device_inventory::{
-        category, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
+        self, category, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
     };
     use mde_egui::menubar::{Entry, Menu};
     use mde_egui::{egui, ChipTone, Style};
     use std::collections::BTreeSet;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    /// A throwaway substrate root under the system temp dir (this crate does not
+    /// vendor `tempfile`), removed on drop. Holds a `device-inventory/` dir the
+    /// rail-read tests publish host fixtures into, so `refresh` exercises the real
+    /// [`device_inventory::read_all`] path (DEVMGR-4's actual read).
+    struct ScratchRoot(PathBuf);
+
+    impl ScratchRoot {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let root = std::env::temp_dir().join(format!("devmgr-{tag}-{nanos}"));
+            std::fs::create_dir_all(device_inventory::inventory_dir(&root)).unwrap();
+            Self(root)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        /// Publish a host's inventory (a re-hosted fixture at `published_at_ms`).
+        fn publish(&self, host: &str, published_at_ms: u64) {
+            let mut inv = DeviceInventory::fixture();
+            inv.host = host.to_string();
+            inv.published_at_ms = published_at_ms;
+            let path = device_inventory::inventory_path(&self.0, host);
+            std::fs::write(&path, serde_json::to_string(&inv).unwrap()).unwrap();
+        }
+    }
+
+    impl Drop for ScratchRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A published fixture inventory re-hosted under `host` (a distinct rail peer).
+    fn host_inventory(host: &str) -> DeviceInventory {
+        let mut inv = DeviceInventory::fixture();
+        inv.host = host.to_string();
+        inv
+    }
 
     /// A state carrying a chosen inventory + seen flag, rooted at a non-existent
     /// path so `refresh` reads an honest `None` (no real substrate touched).
@@ -1106,6 +1468,8 @@ mod tests {
         DeviceManagerState {
             workgroup_root: PathBuf::from("/nonexistent-devmgr-test-root"),
             local_host: "laptop-mm".to_string(),
+            selected_host: "laptop-mm".to_string(),
+            hosts: Vec::new(),
             inventory: inv,
             seen,
             last_poll: None,
@@ -1553,5 +1917,183 @@ mod tests {
         // A publish time of 0 (the schema's honest "unknown") fabricates no age.
         assert_eq!(scanned_label(1_000_000, 0), "Scanned \u{2014}");
         assert_eq!(scanned_label(1_000_000, 940_000), "Scanned 1m ago");
+    }
+
+    // ── DEVMGR-4: the host rail + mesh-node switching ────────────────────────
+
+    #[test]
+    fn the_rail_lists_every_published_host_with_local_pinned_first() {
+        // read_all delivers the published peers sorted; build_rail injects the
+        // absent local "you are here" row and pins it first, the rest alphabetical.
+        let all = vec![
+            host_inventory("alpha"),
+            host_inventory("mid-node"),
+            host_inventory("zulu"),
+        ];
+        let rail = build_rail(&all, "laptop-mm");
+        let names: Vec<&str> = rail.iter().map(|e| e.host.as_str()).collect();
+        assert_eq!(names, vec!["laptop-mm", "alpha", "mid-node", "zulu"]);
+        // The local node was not among the published set, so it is an honest absent
+        // row (§7) — a selectable "you are here" that has published nothing yet.
+        assert_eq!(rail[0].published_at_ms, None);
+        assert_eq!(rail[0].freshness(0), HostFreshness::Absent);
+        // A published peer carries its real counts (the fixture: 2 devices, 1 fault).
+        let alpha = rail.iter().find(|e| e.host == "alpha").unwrap();
+        assert_eq!(alpha.device_count, 2);
+        assert_eq!(alpha.problem_count, 1);
+    }
+
+    #[test]
+    fn the_local_host_is_pinned_first_even_when_it_published_and_sorts_late() {
+        // "zeta" is the local node AND published; alphabetically last, but the rail
+        // pins it first (you-are-here) with no duplicate row.
+        let all = vec![
+            host_inventory("alpha"),
+            host_inventory("beta"),
+            host_inventory("zeta"),
+        ];
+        let rail = build_rail(&all, "zeta");
+        let names: Vec<&str> = rail.iter().map(|e| e.host.as_str()).collect();
+        assert_eq!(names, vec!["zeta", "alpha", "beta"]);
+        assert_eq!(
+            rail.iter().filter(|e| e.host == "zeta").count(),
+            1,
+            "the published local host is not duplicated by the injected row"
+        );
+        assert!(
+            rail[0].published_at_ms.is_some(),
+            "local published, not absent"
+        );
+    }
+
+    #[test]
+    fn refresh_reads_the_rail_and_switching_loads_the_selected_hosts_tree() {
+        // A real multi-host substrate — the DEVMGR-4 read path end to end.
+        let scratch = ScratchRoot::new("switch");
+        scratch.publish("laptop-mm", 1_000); // the local node
+        scratch.publish("edge-1", 2_000);
+        scratch.publish("edge-2", 3_000);
+        let mut s = state_with(None, false);
+        s.workgroup_root = scratch.path().to_path_buf();
+        s.refresh();
+        // The rail lists every published host from the peer directory, local first.
+        let names: Vec<String> = s.hosts.iter().map(|e| e.host.clone()).collect();
+        assert_eq!(names, vec!["laptop-mm", "edge-1", "edge-2"]);
+        // The default selection loaded the LOCAL host's tree.
+        assert_eq!(s.inventory.as_ref().unwrap().host, "laptop-mm");
+        // Switching selects the right host's published tree, instantly (#7 hybrid).
+        s.select_host("edge-2".to_string());
+        assert_eq!(s.selected_host, "edge-2");
+        assert_eq!(s.inventory.as_ref().unwrap().host, "edge-2");
+        assert_eq!(s.inventory.as_ref().unwrap().device_count(), 2);
+        // Switching resets any open device drawer (a selection is per-host).
+        assert!(s.selected.is_none());
+        // And it still renders headless (a live render of the switched host).
+        assert!(drive(&mut s) > 0, "the switched-host surface drew nothing");
+    }
+
+    #[test]
+    fn an_unpublished_selected_host_reads_an_honest_empty_tree() {
+        // Only the local node has published; selecting a never-seen peer reads an
+        // honest None (the empty-host state), never a fabricated tree (§7).
+        let scratch = ScratchRoot::new("absent");
+        scratch.publish("laptop-mm", 5_000);
+        let mut s = state_with(None, false);
+        s.workgroup_root = scratch.path().to_path_buf();
+        s.refresh();
+        s.select_host("ghost-node".to_string());
+        assert_eq!(s.selected_host, "ghost-node");
+        assert!(
+            s.inventory.is_none(),
+            "an unpublished host reads as None, not a fake tree"
+        );
+        assert!(s.seen);
+        assert!(drive(&mut s) > 0, "the empty-host state drew nothing");
+        // The local "you are here" row stays present in the rail regardless.
+        assert!(s.hosts.iter().any(|e| e.host == "laptop-mm"));
+    }
+
+    #[test]
+    fn freshness_maps_to_honest_dim_stale_and_offline_dots() {
+        let now = 10_000_000_u64;
+        let stale_ms = u64::try_from(STALE_AFTER.as_millis()).unwrap();
+        // Absent — nothing published: dim (offline), never green.
+        let absent = HostEntry::absent("ghost");
+        assert_eq!(absent.freshness(now), HostFreshness::Absent);
+        assert_eq!(host_dot_tone(&absent, now), Style::TEXT_DIM);
+        // Fresh + clean → OK green; fresh + a fault → danger red.
+        let fresh_ok = HostEntry {
+            host: "a".into(),
+            published_at_ms: Some(now - 1_000),
+            device_count: 3,
+            problem_count: 0,
+        };
+        assert_eq!(fresh_ok.freshness(now), HostFreshness::Fresh);
+        assert_eq!(host_dot_tone(&fresh_ok, now), Style::OK);
+        let fresh_bad = HostEntry {
+            problem_count: 2,
+            ..fresh_ok
+        };
+        assert_eq!(host_dot_tone(&fresh_bad, now), Style::DANGER);
+        // Stale — published, but older than STALE_AFTER: amber, not green (its
+        // health can't be trusted), even with no problems in the stale snapshot.
+        let stale = HostEntry {
+            host: "b".into(),
+            published_at_ms: Some(now - stale_ms - 1),
+            device_count: 5,
+            problem_count: 0,
+        };
+        assert_eq!(stale.freshness(now), HostFreshness::Stale);
+        assert_eq!(host_dot_tone(&stale, now), Style::WARN);
+        // A published-but-unknown-time snapshot (the schema's honest 0) reads stale.
+        let unknown = HostEntry {
+            host: "c".into(),
+            published_at_ms: Some(0),
+            device_count: 1,
+            problem_count: 0,
+        };
+        assert_eq!(unknown.freshness(now), HostFreshness::Stale);
+    }
+
+    #[test]
+    fn the_rail_renders_headless_and_its_hover_stays_honest() {
+        let now = 10_000_000_u64;
+        // An absent host's hover is the honest offline line — it invents no counts
+        // and no freshness read-out (a single line, no "N devices" / "Scanned …").
+        let absent = HostEntry::absent("ghost");
+        let h = host_hover(&absent, now);
+        assert!(
+            h.contains("No device inventory published"),
+            "absent hover: {h}"
+        );
+        assert!(
+            !h.contains("Scanned"),
+            "an absent hover invents no freshness: {h}"
+        );
+        assert!(
+            !h.contains('\n'),
+            "an absent hover is a single honest line: {h}"
+        );
+        // A stale host's hover is flagged honestly, with its real counts.
+        let stale = HostEntry {
+            host: "b".into(),
+            published_at_ms: Some(now - 600_000),
+            device_count: 5,
+            problem_count: 1,
+        };
+        let h = host_hover(&stale, now);
+        assert!(h.contains("Stale"), "a stale hover flags staleness: {h}");
+        assert!(
+            h.contains("5 devices") && h.contains("1 problem"),
+            "the real counts: {h}"
+        );
+        // The rail itself renders headless from a populated hosts list (a live
+        // render — a fresh local peer + an offline one — proving it isn't dead).
+        let mut s = state_with(Some(DeviceInventory::fixture()), true);
+        s.hosts = vec![
+            HostEntry::from_inventory(&DeviceInventory::fixture()),
+            HostEntry::absent("edge-offline"),
+        ];
+        assert!(drive(&mut s) > 0, "the host rail drew nothing");
     }
 }
