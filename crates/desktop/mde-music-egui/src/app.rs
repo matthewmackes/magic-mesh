@@ -17,6 +17,7 @@ use mde_egui::Style;
 use mde_musicd::airsonic::{Album, Client, Song};
 use mde_musicd::creds;
 
+use crate::menubar::{self, MenuAction, MenuContext, NowPlaying};
 use crate::model::{album_subtitle, format_duration, Command, Fetch, MusicState, Update};
 use crate::worker;
 
@@ -85,71 +86,58 @@ impl MusicApp {
         }
     }
 
-    /// The header strip: the surface title, the server host, and the transport
-    /// controls for the now-playing track.
-    fn render_header(&self, ui: &mut egui::Ui) {
-        let mut cmd: Option<Command> = None;
-        ui.add_space(Style::SP_XS);
-        ui.horizontal(|ui| {
-            ui.add_space(Style::SP_S);
-            ui.heading(
-                RichText::new("Music")
-                    .size(Style::HEADING)
-                    .color(Style::TEXT),
-            );
-            if !self.server.is_empty() {
-                ui.add_space(Style::SP_M);
-                mde_egui::muted_note(ui, &self.server);
-            }
-            // Transport, pinned to the right edge.
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_space(Style::SP_S);
-                if let Some(song) = &self.state.now_playing {
-                    if ui.button("Stop").clicked() {
-                        cmd = Some(Command::Stop);
-                    }
-                    let (label, intent) = if self.state.playing {
-                        ("Pause", Command::Pause)
-                    } else {
-                        ("Resume", Command::Resume)
-                    };
-                    if ui.button(label).clicked() {
-                        cmd = Some(intent);
-                    }
-                    ui.add_space(Style::SP_M);
-                    ui.label(
-                        RichText::new(format!("{} — {}", song.title, song.artist))
-                            .size(Style::BODY)
-                            .color(Style::ACCENT),
-                    );
-                    let state_word = if self.state.playing {
-                        "Now playing"
-                    } else {
-                        "Paused"
-                    };
-                    // Live elapsed / total from the worker's playhead poll. Clamp
-                    // the elapsed value to the tagged length so a slightly-ahead
-                    // playhead never reads past the end; when the server gave no
-                    // length (e.g. a stream), show the elapsed time on its own.
-                    let elapsed = self.state.position_ms / 1000;
-                    let status = if song.duration > 0 {
-                        format!(
-                            "{state_word} · {} / {}",
-                            format_duration(elapsed.min(u64::from(song.duration))),
-                            format_duration(u64::from(song.duration)),
-                        )
-                    } else {
-                        format!("{state_word} · {}", format_duration(elapsed))
-                    };
-                    mde_egui::muted_note(ui, status);
+    /// Snapshot the surface into the [`MenuContext`] the shared menu bar renders
+    /// from (the read half of a frame) — its connection health, the transport
+    /// state, whether an album is open, and the now-playing readout. The elapsed
+    /// playhead is clamped to the tagged length so a slightly-ahead poll never
+    /// reads past the end; a `0` duration (a stream the server gave no length for)
+    /// leaves the total off. The bar never reaches into the surface mid-render, so
+    /// its gating + status cluster stay unit-testable without egui.
+    fn menu_context(&self) -> MenuContext {
+        let now_playing = self.state.now_playing.as_ref().map(|song| {
+            let duration_secs = u64::from(song.duration);
+            let elapsed_secs = self.state.position_ms / 1000;
+            NowPlaying {
+                title: song.title.clone(),
+                artist: song.artist.clone(),
+                elapsed_secs: if duration_secs > 0 {
+                    elapsed_secs.min(duration_secs)
                 } else {
-                    mde_egui::muted_note(ui, "Nothing playing");
-                }
-            });
+                    elapsed_secs
+                },
+                duration_secs,
+            }
         });
-        ui.add_space(Style::SP_XS);
-        if let Some(c) = cmd {
-            self.send(c);
+        MenuContext {
+            connected: self.commands.is_some(),
+            library_failed: matches!(self.state.albums, Fetch::Failed(_)),
+            has_track: self.state.now_playing.is_some(),
+            playing: self.state.playing,
+            album_open: self.state.open_album.is_some(),
+            server: self.server.clone(),
+            now_playing,
+        }
+    }
+
+    /// Dispatch a menu-bar [`MenuAction`] to its real seam (§6, one dispatch path).
+    /// The transport + library-reload actions become the worker [`Command`] they
+    /// map to; Reload Album resolves the open album's id from live state; Back to
+    /// Library is a local navigation seam ([`MusicState::close`]) with no worker
+    /// round-trip. No new behaviour — every arm drives an existing seam.
+    fn run_menu_action(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::ReloadAlbum => {
+                if let Some(open) = &self.state.open_album {
+                    let id = open.album.id.clone();
+                    self.send(Command::LoadAlbum(id));
+                }
+            }
+            MenuAction::BackToLibrary => self.state.close(),
+            other => {
+                if let Some(cmd) = other.command() {
+                    self.send(cmd);
+                }
+            }
         }
     }
 
@@ -291,25 +279,35 @@ pub fn music_panel(ui: &mut egui::Ui, app: &mut MusicApp) {
 }
 
 /// Drain the worker's updates into the surface state — the per-frame **state
-/// pump**. The standalone [`MusicApp`]'s `update` calls this at the top of every
-/// frame; the E12 shell (E12-3b) calls it for the mounted surface each frame too,
-/// because the shell owns the one frame loop and never calls the surface's
-/// `App::update`. Non-blocking (`try_recv`) and a no-op when the worker has sent
-/// nothing — or when no worker is running (the unconfigured, no-creds surface).
+/// pump**.
+///
+/// The standalone [`MusicApp`]'s `update` calls this at the top of every frame;
+/// the E12 shell (E12-3b) calls it for the mounted surface each frame too, because
+/// the shell owns the one frame loop and never calls the surface's `App::update`.
+/// Non-blocking (`try_recv`) and a no-op when the worker has sent nothing — or when
+/// no worker is running (the unconfigured, no-creds surface).
 pub fn music_pump(app: &mut MusicApp) {
     while let Ok(update) = app.updates.try_recv() {
         app.state.apply(update);
     }
 }
 
-/// Render the surface **header** strip — title · server host · transport controls
-/// for the now-playing track — into `ui`. The standalone app frames it in the
-/// window's top panel; the E12 shell renders it above the mounted [`music_panel`]
-/// so the embedded surface keeps its transport + server identity, the same chrome
-/// the standalone binary shows. The header stays out of [`music_panel`] because
-/// the shell supplies its own surrounding chrome.
-pub fn music_header(ui: &mut egui::Ui, app: &MusicApp) {
-    app.render_header(ui);
+/// Render the surface's **shared top menu bar** (MENUBAR-ALL) into `ui`, then
+/// dispatch the action the operator picked to its real seam.
+///
+/// The bar carries the UPPERCASE `MUSIC` title, the Playback / Library / View
+/// menus, and the live status cluster (server health + now-playing). The standalone
+/// app frames it in the window's top panel; the E12 shell renders it above the
+/// mounted [`music_panel`] so the embedded surface keeps the same discoverable
+/// chrome + transport the standalone binary shows. The bar stays out of
+/// [`music_panel`] because the shell supplies its own surrounding chrome. Takes
+/// `&mut` because Back to Library mutates the surface's own view state (§6 glue: the
+/// menu is the mouse twin of an existing seam).
+pub fn music_header(ui: &mut egui::Ui, app: &mut MusicApp) {
+    let cx = app.menu_context();
+    if let Some(action) = menubar::show(ui, &cx) {
+        app.run_menu_action(action);
+    }
 }
 
 impl App for MusicApp {
@@ -411,6 +409,7 @@ fn track_row(ui: &mut egui::Ui, index: usize, song: &Song) -> Response {
 #[cfg(test)]
 mod tests {
     use super::{music_panel, MusicApp};
+    use crate::menubar::MenuAction;
     use crate::model::{Fetch, MusicState, Update};
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
@@ -519,5 +518,41 @@ mod tests {
         state.open_album.as_mut().expect("an album is open").tracks =
             Fetch::Ready(vec![song("a"), song("b")]);
         render(&mut app_with(state, None));
+    }
+
+    #[test]
+    fn menu_back_to_library_closes_the_open_album() {
+        // The View → Back to Library menu action drives the same `close` seam the
+        // album view's button does — a real navigation seam, not a no-op.
+        let mut state = MusicState::new();
+        state.open(album("7"));
+        let mut app = app_with(state, None);
+        assert!(app.state.open_album.is_some());
+        app.run_menu_action(MenuAction::BackToLibrary);
+        assert!(
+            app.state.open_album.is_none(),
+            "Back to Library returned to the listing"
+        );
+    }
+
+    #[test]
+    fn menu_context_snapshots_transport_and_connection() {
+        // A worker-less fixture (no creds) with a track playing + an album open:
+        // the context mirrors the live state the bar gates + renders from.
+        let mut state = MusicState::new();
+        state.now_playing = Some(song("42"));
+        state.playing = true;
+        state.position_ms = 5_000;
+        state.open(album("7"));
+        let app = app_with(state, None);
+        let cx = app.menu_context();
+        assert!(!cx.connected, "app_with spawns no worker");
+        assert!(cx.has_track && cx.playing);
+        assert!(cx.album_open);
+        let np = cx.now_playing.expect("a track is playing");
+        assert_eq!(np.title, "Track 42");
+        // 5000ms → 5s, clamped to the 180s tagged length.
+        assert_eq!(np.elapsed_secs, 5);
+        assert_eq!(np.duration_secs, 180);
     }
 }

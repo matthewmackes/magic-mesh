@@ -27,6 +27,7 @@
 pub mod model;
 
 mod app;
+mod menubar;
 mod worker;
 
 use mde_egui::{eframe, run_client};
