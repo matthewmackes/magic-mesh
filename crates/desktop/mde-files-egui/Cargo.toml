@@ -75,5 +75,12 @@ symphonia  = { version = "0.5", default-features = false, features = ["flac", "m
 # airgapped farm — no new crate, no `libc`.
 rustix     = { version = "1", features = ["process"] }
 
+[dev-dependencies]
+# TRANSFERS-8 — the transfers file-store round-trip test writes an inbox verb +
+# reads a ledger under a throwaway store root. `tempfile` is already in the
+# workspace lock (mde-shell-egui + the services tier use it), so this is
+# fetch-free on the airgapped farm.
+tempfile = "3"
+
 [lints]
 workspace = true

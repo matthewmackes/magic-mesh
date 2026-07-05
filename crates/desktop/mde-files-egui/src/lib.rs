@@ -31,6 +31,7 @@ pub mod mesh_mount;
 pub mod model;
 pub mod ops;
 pub mod preview;
+pub mod transfers;
 pub mod view;
 
 use mde_egui::{eframe, egui};

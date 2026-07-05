@@ -59,7 +59,8 @@ use mde_egui::egui::{self, Context, RichText};
 use mde_egui::menubar::{Entry, Item as BarItem, Menu, StatusChip};
 use mde_egui::{ChipTone, Style};
 
-use crate::model::{mount_host_of, FileBrowser, SortKey, ViewMode, LOCAL_SPOTS};
+use crate::model::{mount_host_of, FileBrowser, SortKey, SurfaceTab, ViewMode, LOCAL_SPOTS};
+use crate::transfers::{LedgerCounts, Method, StateFilter};
 use crate::view::Action;
 
 /// The bar's menu titles, left to right — the shared File/Edit/View/Help spine
@@ -68,12 +69,17 @@ use crate::view::Action;
 /// menu-order test checks [`build_menus`] against (test-only — the render builds
 /// each [`Menu`] with its own title, so nothing outside the test reads this).
 #[cfg(test)]
-const MENU_TITLES: [&str; 6] = ["File", "Edit", "View", "Go", "Share", "Help"];
+const MENU_TITLES: [&str; 7] = ["File", "Edit", "View", "Go", "Share", "Transfers", "Help"];
 
 /// The egui-memory id the Help → Keyboard-Shortcuts reference window's open flag
 /// lives under, so [`files_panel`](crate::view::files_panel) stays stateless (it
 /// owns only the `FileBrowser`; the bar keeps its one bit of chrome state here).
 const SHORTCUTS_OPEN: &str = "files-menubar-shortcuts-open";
+
+/// The egui-memory id the TRANSFERS-8 Destinations manager window's open flag
+/// lives under (the bar owns this chrome bit; the render lives in
+/// [`crate::view`], which has the `FileBrowser` to list the live targets).
+const DESTINATIONS_OPEN: &str = "files-menubar-destinations-open";
 
 // ─────────────────────────────── the activation id ──────────────────────────
 
@@ -144,8 +150,24 @@ pub(crate) enum Picked {
     SendInChat(String),
     /// Open the focused local file in the Editor surface ([`send_to_editor`]).
     OpenInEditor,
+    /// TRANSFERS-8 — switch the top-level surface (Files ↔ Transfers, Q1).
+    ShowSurface(SurfaceTab),
+    /// TRANSFERS-8 — open the New Transfer dialog ([`open_new_transfer`], Q13).
+    NewTransfer,
+    /// TRANSFERS-8 — pause every pausable job ([`transfer_pause_all`]).
+    TransferPauseAll,
+    /// TRANSFERS-8 — resume every Paused job ([`transfer_resume_all`]).
+    TransferResumeAll,
+    /// TRANSFERS-8 — cancel every terminal job ([`transfer_clear_completed`]).
+    TransferClearCompleted,
+    /// TRANSFERS-8 — filter the Transfers view by state ([`set_transfers_filter`]).
+    TransferStateFilter(StateFilter),
+    /// TRANSFERS-8 — filter the Transfers view by method (`None` = all lanes).
+    TransferMethodFilter(Option<Method>),
     /// Toggle the keyboard-shortcuts reference (owned by the bar, not the model).
     ShowShortcuts,
+    /// TRANSFERS-8 — toggle the Destinations manager window (bar-owned chrome, Q16).
+    ShowDestinations,
 }
 
 /// Map a [`Picked`] to its real [`Action`] seam, or `None` for
@@ -186,8 +208,15 @@ pub(crate) fn to_action(picked: Picked, cx: &FilesCtx) -> Option<Action> {
         Picked::SendToPeer(id) => Action::SendToPeer(p, id),
         Picked::SendInChat(id) => Action::SendInChat(p, id),
         Picked::OpenInEditor => Action::SendToEditor(p),
-        // Owned by the bar (opens the reference window), not a model seam.
-        Picked::ShowShortcuts => return None,
+        Picked::ShowSurface(tab) => Action::SwitchSurface(tab),
+        Picked::NewTransfer => Action::OpenNewTransfer,
+        Picked::TransferPauseAll => Action::TransferPauseAll,
+        Picked::TransferResumeAll => Action::TransferResumeAll,
+        Picked::TransferClearCompleted => Action::TransferClearCompleted,
+        Picked::TransferStateFilter(s) => Action::SetTransferStateFilter(s),
+        Picked::TransferMethodFilter(m) => Action::SetTransferMethodFilter(m),
+        // Bar-owned windows (toggle chrome), not a model seam.
+        Picked::ShowShortcuts | Picked::ShowDestinations => return None,
     })
 }
 
@@ -266,10 +295,18 @@ pub(crate) struct FilesCtx {
     pub dest: Option<String>,
     /// The active tab's backend path (the path chip).
     pub path: String,
-    /// In-flight (not-yet-finished) transfers (the transfer chip).
+    /// In-flight (not-yet-finished) op-queue transfers (the local-copy chip).
     pub running: usize,
     /// The reachable mesh peers (the Go + Share menus).
     pub peers: Vec<PeerLite>,
+    /// TRANSFERS-8 — the Transfers tab is showing (the tab-switch checkmark).
+    pub on_transfers_tab: bool,
+    /// TRANSFERS-8 — the worker ledger tallies (the control-item gating + badge).
+    pub transfer_counts: LedgerCounts,
+    /// TRANSFERS-8 — the current Transfers view state-filter (the radio checkmark).
+    pub transfer_state_filter: StateFilter,
+    /// TRANSFERS-8 — the current Transfers view method-filter (`None` = all lanes).
+    pub transfer_method_filter: Option<Method>,
 }
 
 /// Snapshot `browser` into a [`FilesCtx`] — the read half of a render frame.
@@ -319,6 +356,10 @@ pub(crate) fn snapshot(b: &FileBrowser) -> FilesCtx {
         path: tab.location().backend_path(),
         running: b.ops().active().iter().filter(|o| !o.is_done()).count(),
         peers,
+        on_transfers_tab: b.surface_tab() == SurfaceTab::Transfers,
+        transfer_counts: b.transfers_counts(),
+        transfer_state_filter: b.transfers_filter().state,
+        transfer_method_filter: b.transfers_filter().method,
     }
 }
 
@@ -549,6 +590,67 @@ fn share_menu(cx: &FilesCtx) -> Menu<Picked> {
     Menu::new("Share", entries)
 }
 
+/// The Transfers drop-down (Files-specific) — the TRANSFERS-8 tab's control
+/// surface reused on the shared bar (Q16): the tab switch, the New Transfer entry
+/// point, the batch lifecycle verbs (each gated on a real ledger tally, §7), the
+/// View-by-state / -by-method filters, and the Destinations manager. The batch
+/// items disable — never vanish — when the ledger has nothing to act on.
+fn transfers_menu(cx: &FilesCtx) -> Menu<Picked> {
+    let c = cx.transfer_counts;
+    // View → state radios + method radios (Q16 — filter the live ledger).
+    let mut view_entries: Vec<Entry<Picked>> = StateFilter::ALL
+        .iter()
+        .map(|&s| {
+            Entry::Item(
+                BarItem::new(Picked::TransferStateFilter(s), s.label())
+                    .checked(cx.transfer_state_filter == s),
+            )
+        })
+        .collect();
+    view_entries.push(Entry::Separator);
+    view_entries.push(Entry::Caption("Method".to_owned()));
+    view_entries.push(Entry::Item(
+        BarItem::new(Picked::TransferMethodFilter(None), "All Methods")
+            .checked(cx.transfer_method_filter.is_none()),
+    ));
+    for m in Method::ALL {
+        view_entries.push(Entry::Item(
+            BarItem::new(Picked::TransferMethodFilter(Some(m)), m.label())
+                .checked(cx.transfer_method_filter == Some(m)),
+        ));
+    }
+    Menu::new(
+        "Transfers",
+        vec![
+            Entry::Item(
+                BarItem::new(Picked::ShowSurface(SurfaceTab::Transfers), "Transfers Tab")
+                    .checked(cx.on_transfers_tab),
+            ),
+            Entry::Separator,
+            item(Picked::NewTransfer, "New Transfer\u{2026}"),
+            Entry::Separator,
+            Entry::Item(
+                BarItem::new(Picked::TransferPauseAll, "Pause All").enabled(c.pausable > 0),
+            ),
+            Entry::Item(
+                BarItem::new(Picked::TransferResumeAll, "Resume All").enabled(c.resumable > 0),
+            ),
+            Entry::Item(
+                BarItem::new(Picked::TransferClearCompleted, "Clear Completed")
+                    .enabled(c.terminal > 0),
+            ),
+            Entry::Separator,
+            Entry::Submenu {
+                label: "View".to_owned(),
+                mnemonic: None,
+                entries: view_entries,
+            },
+            Entry::Separator,
+            item(Picked::ShowDestinations, "Destinations\u{2026}"),
+        ],
+    )
+}
+
 /// The Help drop-down — the keyboard-shortcuts reference.
 fn help_menu() -> Menu<Picked> {
     Menu::new(
@@ -567,6 +669,7 @@ pub(crate) fn build_menus(cx: &FilesCtx) -> Vec<Menu<Picked>> {
         view_menu(cx),
         go_menu(cx),
         share_menu(cx),
+        transfers_menu(cx),
         help_menu(),
     ]
 }
@@ -615,6 +718,14 @@ pub(crate) fn build_status(cx: &FilesCtx) -> Vec<StatusChip> {
             ChipTone::Info,
         ));
     }
+    // TRANSFERS-8 — the worker ledger's in-flight count (distinct from the local
+    // op-queue "transferring" chip above; the dock Files cell badges this, Q1).
+    if cx.transfer_counts.active > 0 {
+        chips.push(StatusChip::new(
+            format!("{} in transfers", cx.transfer_counts.active),
+            ChipTone::Info,
+        ));
+    }
     if cx.on_mesh {
         chips.push(StatusChip::with_icon("\u{25CF}", "on mesh", ChipTone::Ok));
     } else {
@@ -650,6 +761,27 @@ pub(crate) fn toggle_shortcuts(ctx: &Context) {
     let id = egui::Id::new(SHORTCUTS_OPEN);
     let open = ctx.data(|d| d.get_temp::<bool>(id).unwrap_or(false));
     ctx.data_mut(|d| d.insert_temp(id, !open));
+}
+
+/// Flip the TRANSFERS-8 Destinations manager window's open flag (egui memory).
+pub(crate) fn toggle_destinations(ctx: &Context) {
+    let id = egui::Id::new(DESTINATIONS_OPEN);
+    let open = ctx.data(|d| d.get_temp::<bool>(id).unwrap_or(false));
+    ctx.data_mut(|d| d.insert_temp(id, !open));
+}
+
+/// Read the Destinations manager window's open flag (the [`crate::view`] render).
+#[must_use]
+pub(crate) fn destinations_open(ctx: &Context) -> bool {
+    ctx.data(|d| {
+        d.get_temp::<bool>(egui::Id::new(DESTINATIONS_OPEN))
+            .unwrap_or(false)
+    })
+}
+
+/// Write the Destinations manager window's open flag (its own close button).
+pub(crate) fn set_destinations_open(ctx: &Context, open: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(DESTINATIONS_OPEN), open));
 }
 
 /// Render the keyboard-shortcuts reference window when open (the Help seam).
@@ -728,6 +860,16 @@ mod tests {
                 mounted: true,
                 is_full: false,
             }],
+            on_transfers_tab: false,
+            transfer_counts: crate::transfers::LedgerCounts {
+                pausable: 1,
+                resumable: 1,
+                terminal: 1,
+                active: 2,
+                total: 3,
+            },
+            transfer_state_filter: crate::transfers::StateFilter::All,
+            transfer_method_filter: None,
         }
     }
 
@@ -766,10 +908,10 @@ mod tests {
         let menus = build_menus(&cx);
         for (label, id, _) in all_items(&menus) {
             assert!(!label.is_empty(), "an item shipped unlabeled");
-            // Every id resolves to a real Action, or is the bar-owned Help toggle.
+            // Every id resolves to a real Action, or is a bar-owned window toggle.
             let resolved = to_action(id.clone(), &cx);
             assert!(
-                resolved.is_some() || id == Picked::ShowShortcuts,
+                resolved.is_some() || id == Picked::ShowShortcuts || id == Picked::ShowDestinations,
                 "{label} maps to no seam"
             );
         }
@@ -969,6 +1111,48 @@ mod tests {
         );
         // A plain command carries no checkmark.
         assert_eq!(checked(&Picked::NewTab), None);
+    }
+
+    #[test]
+    fn transfers_menu_gates_batch_verbs_on_the_ledger_tally() {
+        use crate::transfers::{LedgerCounts, StateFilter};
+        let enabled = |menus: &[Menu<Picked>], want: &Picked| {
+            all_items(menus)
+                .into_iter()
+                .find(|(_, id, _)| id == want)
+                .map(|(_, _, en)| en)
+        };
+        // A rich ledger (1 pausable / 1 resumable / 1 terminal) opens all three.
+        let rich = build_menus(&fixture());
+        assert_eq!(enabled(&rich, &Picked::TransferPauseAll), Some(true));
+        assert_eq!(enabled(&rich, &Picked::TransferResumeAll), Some(true));
+        assert_eq!(enabled(&rich, &Picked::TransferClearCompleted), Some(true));
+        // New Transfer is always available (no precondition).
+        assert_eq!(enabled(&rich, &Picked::NewTransfer), Some(true));
+        // An empty ledger greys the batch verbs — but never omits them (§7).
+        let empty = FilesCtx {
+            transfer_counts: LedgerCounts::default(),
+            ..fixture()
+        };
+        let menus = build_menus(&empty);
+        assert_eq!(enabled(&menus, &Picked::TransferPauseAll), Some(false));
+        assert_eq!(enabled(&menus, &Picked::TransferResumeAll), Some(false));
+        assert_eq!(
+            enabled(&menus, &Picked::TransferClearCompleted),
+            Some(false)
+        );
+        // The state/method filter radios read back the live filter.
+        let filtered = FilesCtx {
+            transfer_state_filter: StateFilter::Failed,
+            transfer_method_filter: Some(crate::transfers::Method::Rsync),
+            ..fixture()
+        };
+        assert!(matches!(
+            to_action(Picked::TransferStateFilter(StateFilter::Failed), &filtered),
+            Some(Action::SetTransferStateFilter(StateFilter::Failed))
+        ));
+        // Destinations is the bar's own window, not a model seam.
+        assert!(to_action(Picked::ShowDestinations, &filtered).is_none());
     }
 
     #[test]

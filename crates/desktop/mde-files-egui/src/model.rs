@@ -36,6 +36,10 @@ use crate::dialogs::{Arming, ConfirmDelete, Perm, PermClass, PropertiesDialog};
 use crate::mesh_mount::{BusMeshMount, MeshMountClient, MeshMountVerb, MountView};
 use crate::ops::Ops;
 use crate::preview::{PreviewState, Previews, ThumbState};
+use crate::transfers::{
+    build_targets, display_order, FileTransfers, LedgerCounts, Method, NewTransferForm,
+    TransferFilter, TransferJob, TransferTarget, TransferVerb, TransfersClient,
+};
 use mde_files::opqueue::{ConflictChoice, Resolution};
 
 /// How often the Mesh sidebar re-reads `state/mesh-mount/*` from the Bus. The read
@@ -929,6 +933,43 @@ struct SearchState {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Surface tab (Files ↔ Transfers) — TRANSFERS-8.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// How often the Transfers tab re-reads the worker's ledger from the node-local
+/// store. A cheap local directory scan (never a peer probe), so a worker
+/// transition surfaces within this window — matches the mesh-mount cadence.
+const TRANSFERS_POLL: Duration = Duration::from_secs(2);
+
+/// Which top-level surface the File Browser is showing (Q1).
+///
+/// The Transfers **tab inside** the File Browser: the `MenuBar` + sidebar are
+/// shared across both (Q16); only the central content switches (the file panes
+/// vs. the transfers ledger).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SurfaceTab {
+    /// The file panes (the classic File Browser).
+    #[default]
+    Files,
+    /// The transfers ledger (the TRANSFERS-8 renderer).
+    Transfers,
+}
+
+impl SurfaceTab {
+    /// The two surface tabs, in strip order.
+    pub const ALL: [Self; 2] = [Self::Files, Self::Transfers];
+
+    /// The tab-strip label.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Files => "Files",
+            Self::Transfers => "Transfers",
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // The whole surface model.
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -992,6 +1033,21 @@ pub struct FileBrowser {
     /// hits accumulate into the tab it was launched from, so a result set is an
     /// ordinary file view and every op applies.
     search: Option<SearchState>,
+    /// TRANSFERS-8 — which top-level surface is showing (Files ↔ Transfers, Q1).
+    surface_tab: SurfaceTab,
+    /// TRANSFERS-8 — the transfers worker client (reads the ledger, submits typed
+    /// verbs over the node-local inbox). Injectable so the model is unit-tested
+    /// headless; production is [`FileTransfers::from_env`].
+    transfers: Box<dyn TransfersClient>,
+    /// TRANSFERS-8 — the latest ledger snapshot, refreshed on the [`TRANSFERS_POLL`]
+    /// cadence (a job appearing / a state change surfaces within the window).
+    transfers_jobs: Vec<TransferJob>,
+    /// When the ledger was last polled (drives the fixed cadence).
+    last_transfers_poll: Option<Instant>,
+    /// TRANSFERS-8 — the Transfers tab's live view filter (state + method, Q16).
+    transfers_filter: TransferFilter,
+    /// TRANSFERS-8 — the open New Transfer dialog's entry state, if any (Q13).
+    new_transfer: Option<NewTransferForm>,
 }
 
 impl FileBrowser {
@@ -1049,11 +1105,29 @@ impl FileBrowser {
             previews: Previews::spawn(),
             search_form: SearchForm::default(),
             search: None,
+            surface_tab: SurfaceTab::default(),
+            transfers: Box::new(FileTransfers::from_env()),
+            transfers_jobs: Vec::new(),
+            last_transfers_poll: None,
+            transfers_filter: TransferFilter::default(),
+            new_transfer: None,
         };
         me.refresh_roster();
         me.reload(0);
         me.reload(1);
         me
+    }
+
+    /// Swap in an explicit [`TransfersClient`] (TRANSFERS-8). Tests inject a
+    /// [`FakeTransfers`](crate::transfers::test_support::FakeTransfers) to assert
+    /// the exact verb the surface emitted; production keeps the [`FileTransfers`]
+    /// from [`Self::with_file_ops`]. Re-reads the ledger through the new client so
+    /// the tab reflects it immediately.
+    #[must_use]
+    pub fn with_transfers(mut self, transfers: Box<dyn TransfersClient>) -> Self {
+        self.transfers = transfers;
+        self.read_transfers();
+        self
     }
 
     /// Swap in an explicit [`MeshMountClient`] (tests inject a fake; production
@@ -1247,6 +1321,274 @@ impl FileBrowser {
             Err(e) => self.last_note = Some(e),
         }
         self.read_mounts();
+    }
+
+    // ── transfers (TRANSFERS-8 — the Transfers tab + the three entry points) ──
+
+    /// Which top-level surface is showing (Files ↔ Transfers, Q1).
+    #[must_use]
+    pub fn surface_tab(&self) -> SurfaceTab {
+        self.surface_tab
+    }
+
+    /// Switch the top-level surface (the tab strip). Switching to Transfers reads
+    /// the ledger immediately so the tab is live on the first frame.
+    pub fn set_surface_tab(&mut self, tab: SurfaceTab) {
+        self.surface_tab = tab;
+        if tab == SurfaceTab::Transfers {
+            self.read_transfers();
+        }
+    }
+
+    /// Re-read the worker's ledger into the cache. A local directory scan — never a
+    /// peer probe — so it can't hang the UI (mirrors [`read_mounts`](Self::read_mounts)).
+    fn read_transfers(&mut self) {
+        self.transfers_jobs = self.transfers.jobs();
+        self.last_transfers_poll = Some(Instant::now());
+    }
+
+    /// Refresh the ledger on the [`TRANSFERS_POLL`] cadence (call once per frame; it
+    /// self-gates, so it's cheap to call every frame). A submitted job / a state
+    /// change surfaces within the window.
+    pub fn pump_transfers(&mut self) {
+        let due = self
+            .last_transfers_poll
+            .is_none_or(|t| t.elapsed() >= TRANSFERS_POLL);
+        if due {
+            self.read_transfers();
+        }
+    }
+
+    /// `true` while the ledger holds an in-flight job — the view keeps a repaint
+    /// heartbeat alive so live progress updates without input.
+    #[must_use]
+    pub fn transfers_active(&self) -> bool {
+        self.transfers_jobs.iter().any(|j| j.state.is_active())
+    }
+
+    /// Whether a transfers worker has ever run on this node (drives the `EmptyState`'s
+    /// "no worker" vs. "no jobs yet" honesty, §7).
+    #[must_use]
+    pub fn transfers_worker_present(&self) -> bool {
+        self.transfers.worker_present()
+    }
+
+    /// The Transfers tab's live view filter (state + method, Q16).
+    #[must_use]
+    pub fn transfers_filter(&self) -> TransferFilter {
+        self.transfers_filter
+    }
+
+    /// Replace the Transfers view filter (the `MenuBar`'s View-by-state / -by-method).
+    pub fn set_transfers_filter(&mut self, filter: TransferFilter) {
+        self.transfers_filter = filter;
+    }
+
+    /// The ledger jobs in **newest-relevant** display order under the current
+    /// filter — the list the Transfers tab renders (Q1: "live progress list").
+    #[must_use]
+    pub fn transfers_view(&self) -> Vec<TransferJob> {
+        display_order(&self.transfers_jobs, &self.transfers_filter)
+    }
+
+    /// The unfiltered ledger tallies (drive the `MenuBar`'s control gating + the
+    /// active-count badge).
+    #[must_use]
+    pub fn transfers_counts(&self) -> LedgerCounts {
+        LedgerCounts::of(&self.transfers_jobs)
+    }
+
+    /// The auto-only destination registry (Q10): the two standing node-state
+    /// targets (Music Library / Mesh Share) plus one per **reachable** peer. The
+    /// drop / "Send to →" / dialog entry points target these.
+    #[must_use]
+    pub fn transfer_targets(&self) -> Vec<TransferTarget> {
+        let peers: Vec<(String, String)> = self
+            .reachable_destinations()
+            .into_iter()
+            .map(|p| (p.id.clone(), p.host.clone()))
+            .collect();
+        build_targets(&peers)
+    }
+
+    /// Submit a client-minted job to the worker (the one path every entry point
+    /// funnels through). Records an honest status note either way (§7).
+    fn submit_transfer_job(&mut self, job: TransferJob) {
+        let route = job.route();
+        match self.transfers.dispatch(&TransferVerb::Submit(job)) {
+            Ok(()) => self.last_note = Some(format!("Queued transfer {route}")),
+            Err(e) => self.last_note = Some(e),
+        }
+    }
+
+    /// **Entry point 1 (Q13) — the New Transfer dialog.** Open a blank dialog.
+    pub fn open_new_transfer(&mut self) {
+        self.new_transfer = Some(NewTransferForm::default());
+    }
+
+    /// Open the New Transfer dialog pre-pointed at a chosen destination + method
+    /// (the drop / "Send to →" entry points route here when there's no selection to
+    /// submit outright — the user fills only the source).
+    pub fn open_new_transfer_to(&mut self, dest: impl Into<String>, method: Method) {
+        self.new_transfer = Some(NewTransferForm::to(dest, method));
+    }
+
+    /// The open New Transfer dialog's entry state, if any.
+    #[must_use]
+    pub fn new_transfer(&self) -> Option<&NewTransferForm> {
+        self.new_transfer.as_ref()
+    }
+
+    /// Commit an edit to the New Transfer form (render → intents → apply, like the
+    /// search form).
+    pub fn set_new_transfer_form(&mut self, form: NewTransferForm) {
+        if self.new_transfer.is_some() {
+            self.new_transfer = Some(form);
+        }
+    }
+
+    /// Close the New Transfer dialog without submitting.
+    pub fn cancel_new_transfer(&mut self) {
+        self.new_transfer = None;
+    }
+
+    /// Submit the New Transfer dialog's job (if complete) and close it. A blank /
+    /// incomplete form is an honest no-op (the Submit button is disabled behind
+    /// [`NewTransferForm::runnable`], this is the belt-and-braces guard).
+    pub fn submit_new_transfer(&mut self) {
+        let Some(job) = self.new_transfer.as_ref().and_then(NewTransferForm::to_job) else {
+            return;
+        };
+        self.submit_transfer_job(job);
+        self.new_transfer = None;
+        self.read_transfers();
+    }
+
+    /// **Entry point 2 (Q13) — right-click "Send to → `<target>`".** Submit
+    /// `pane`'s selected local files to `target` (one job per file). `None` (with an
+    /// honest note) when nothing local is selected — a peer/virtual row carries no
+    /// path.
+    pub fn send_to_target(&mut self, pane: usize, target: &TransferTarget) {
+        let sources = self.pane(pane).active_tab().selected_paths();
+        if sources.is_empty() {
+            self.last_note = Some(
+                "Nothing to send — select a local file first (mesh files need a mount).".into(),
+            );
+            return;
+        }
+        self.submit_sources_to(&sources, target);
+    }
+
+    /// **Entry point 3 (Q13) — drag-drop onto a destination.** Submit
+    /// `source_pane`'s selection to `target` (one job per file). `None` (with a
+    /// note) when the selection carries no filesystem path.
+    pub fn drop_on_target(&mut self, source_pane: usize, target: &TransferTarget) {
+        let sources = self.pane(source_pane).active_tab().selected_paths();
+        if sources.is_empty() {
+            self.last_note =
+                Some("Nothing to transfer — mesh/peer files need a mount (FILEMGR-9).".into());
+            return;
+        }
+        self.submit_sources_to(&sources, target);
+    }
+
+    /// Submit one job per source path to `target` (the shared body of the "Send
+    /// to →" + drag-drop entry points). Each job rides the target's method + dest.
+    fn submit_sources_to(&mut self, sources: &[PathBuf], target: &TransferTarget) {
+        let mut queued = 0usize;
+        let mut last_err = None;
+        for src in sources {
+            let job = TransferJob::new(
+                src.to_string_lossy().into_owned(),
+                target.dest.clone(),
+                target.method,
+                crate::transfers::TransferPolicy::default(),
+            );
+            match self.transfers.dispatch(&TransferVerb::Submit(job)) {
+                Ok(()) => queued += 1,
+                Err(e) => last_err = Some(e),
+            }
+        }
+        self.last_note = Some(last_err.unwrap_or_else(|| {
+            let noun = if queued == 1 { "transfer" } else { "transfers" };
+            format!("Queued {queued} {noun} \u{2192} {}", target.label)
+        }));
+        self.read_transfers();
+    }
+
+    /// Lifecycle: pause one job (its ledger row's control). An illegal/absent verb
+    /// is honestly refused by the daemon (never a silent GUI no-op).
+    pub fn transfer_pause(&mut self, id: &str) {
+        self.dispatch_transfer_lifecycle(&TransferVerb::Pause(id.to_string()));
+    }
+
+    /// Lifecycle: resume one Paused job.
+    pub fn transfer_resume(&mut self, id: &str) {
+        self.dispatch_transfer_lifecycle(&TransferVerb::Resume(id.to_string()));
+    }
+
+    /// Lifecycle: cancel one job (removes it from the ledger + frees any slot).
+    pub fn transfer_cancel(&mut self, id: &str) {
+        self.dispatch_transfer_lifecycle(&TransferVerb::Cancel(id.to_string()));
+    }
+
+    /// **Pause-all** (Q16 menu): pause every pausable job (Queued/Running).
+    pub fn transfer_pause_all(&mut self) {
+        let ids: Vec<String> = self
+            .transfers_jobs
+            .iter()
+            .filter(|j| j.state.can_pause())
+            .map(|j| j.id.clone())
+            .collect();
+        self.dispatch_transfer_batch(&ids, TransferVerb::Pause);
+    }
+
+    /// **Resume-all** (Q16 menu): resume every Paused job.
+    pub fn transfer_resume_all(&mut self) {
+        let ids: Vec<String> = self
+            .transfers_jobs
+            .iter()
+            .filter(|j| j.state.can_resume())
+            .map(|j| j.id.clone())
+            .collect();
+        self.dispatch_transfer_batch(&ids, TransferVerb::Resume);
+    }
+
+    /// **Clear-completed** (Q16 menu): cancel every terminal job (Done/Failed) — a
+    /// cancel removes the row, which is how the worker clears history (there is no
+    /// distinct clear verb; cancel is legal from any state).
+    pub fn transfer_clear_completed(&mut self) {
+        let ids: Vec<String> = self
+            .transfers_jobs
+            .iter()
+            .filter(|j| j.state.is_terminal())
+            .map(|j| j.id.clone())
+            .collect();
+        self.dispatch_transfer_batch(&ids, TransferVerb::Cancel);
+    }
+
+    /// Dispatch one lifecycle verb + refresh the ledger, recording an honest note
+    /// on a store error.
+    fn dispatch_transfer_lifecycle(&mut self, verb: &TransferVerb) {
+        if let Err(e) = self.transfers.dispatch(verb) {
+            self.last_note = Some(e);
+        }
+        self.read_transfers();
+    }
+
+    /// Dispatch a batch of the same lifecycle verb (Pause-all / Resume-all /
+    /// Clear-completed), then refresh. An empty batch is a no-op.
+    fn dispatch_transfer_batch(&mut self, ids: &[String], verb: impl Fn(String) -> TransferVerb) {
+        let mut last_err = None;
+        for id in ids {
+            if let Err(e) = self.transfers.dispatch(&verb(id.clone())) {
+                last_err = Some(e);
+            }
+        }
+        if let Some(e) = last_err {
+            self.last_note = Some(e);
+        }
+        self.read_transfers();
     }
 
     // ── pane / tab structure ────────────────────────────────────────────────
@@ -3560,5 +3902,154 @@ mod tests {
             "no dialog opens for a pathless row"
         );
         assert!(b.last_note().is_some());
+    }
+
+    // ── TRANSFERS-8: the tab + the three Submit entry points (Q13) ────────────
+
+    use crate::transfers::test_support::FakeTransfers;
+    use crate::transfers::{
+        Method as XMethod, TransferJob as XJob, TransferPolicy as XPolicy, TransferState as XState,
+        TransferVerb,
+    };
+
+    /// A one-file local browser wired to a recording [`FakeTransfers`] — the fixture
+    /// the entry-point tests submit from. Returns the browser + the fake handle
+    /// (a clone shares the recorded dispatch log).
+    fn transfers_browser(rows: Vec<FileRow>, fake: FakeTransfers) -> FileBrowser {
+        FileBrowser::with_file_ops(
+            Box::new(FixtureBackend::new(Vec::new(), rows)),
+            FakeFileOps::new(),
+        )
+        .with_transfers(Box::new(fake))
+    }
+
+    fn one_local_file() -> Vec<FileRow> {
+        vec![FileRow::local("clip.mp3", Mime::Doc, "3 MB", "now").with_path("/home/me/clip.mp3")]
+    }
+
+    #[test]
+    fn surface_tab_defaults_to_files_and_switches() {
+        let mut b = browser_over(roster_backend());
+        assert_eq!(b.surface_tab(), SurfaceTab::Files);
+        b.set_surface_tab(SurfaceTab::Transfers);
+        assert_eq!(b.surface_tab(), SurfaceTab::Transfers);
+    }
+
+    #[test]
+    fn entry_point_right_click_send_to_target_emits_a_submit() {
+        let fake = FakeTransfers::new();
+        let mut b = transfers_browser(one_local_file(), fake.clone());
+        b.click(0, 0);
+        let target = b
+            .transfer_targets()
+            .into_iter()
+            .find(|t| t.label == "Music Library")
+            .expect("Music Library is a standing target");
+        b.send_to_target(0, &target);
+        let verbs = fake.verbs();
+        assert_eq!(verbs.len(), 1, "one Submit per selected file");
+        assert!(
+            matches!(&verbs[0], TransferVerb::Submit(job)
+                if job.source == "/home/me/clip.mp3"
+                    && job.dest == "music:library"
+                    && job.method == XMethod::Music),
+            "the right-click entry point emits a Music Submit: {:?}",
+            verbs[0]
+        );
+    }
+
+    #[test]
+    fn entry_point_drag_drop_onto_a_target_emits_a_submit() {
+        let fake = FakeTransfers::new();
+        let mut b = transfers_browser(one_local_file(), fake.clone());
+        b.click(0, 0);
+        let target = b
+            .transfer_targets()
+            .into_iter()
+            .find(|t| t.kind == crate::transfers::TargetKind::MeshShare)
+            .expect("Mesh Share is a standing target");
+        b.drop_on_target(0, &target);
+        let verbs = fake.verbs();
+        assert_eq!(verbs.len(), 1);
+        assert!(matches!(&verbs[0], TransferVerb::Submit(j) if j.dest == "mesh-share:"));
+    }
+
+    #[test]
+    fn entry_point_new_transfer_dialog_submits_and_closes() {
+        let fake = FakeTransfers::new();
+        let mut b = transfers_browser(Vec::new(), fake.clone());
+        b.open_new_transfer();
+        let mut form = b.new_transfer().expect("dialog open").clone();
+        form.source = "https://example.com/f.iso".into();
+        form.dest = "/downloads".into();
+        form.method = XMethod::Http;
+        b.set_new_transfer_form(form);
+        b.submit_new_transfer();
+        assert!(b.new_transfer().is_none(), "submit closes the dialog");
+        let verbs = fake.verbs();
+        assert_eq!(verbs.len(), 1);
+        assert!(
+            matches!(&verbs[0], TransferVerb::Submit(job)
+                if job.source == "https://example.com/f.iso"
+                    && job.dest == "/downloads"
+                    && job.method == XMethod::Http),
+            "the dialog entry point emits an HTTP Submit: {:?}",
+            verbs[0]
+        );
+    }
+
+    #[test]
+    fn send_to_target_with_no_local_selection_is_an_honest_note() {
+        let fake = FakeTransfers::new();
+        let mut b = transfers_browser(one_local_file(), fake.clone());
+        // No selection → nothing submitted, an honest note instead of a silent no-op.
+        let target = b.transfer_targets().into_iter().next().unwrap();
+        b.send_to_target(0, &target);
+        assert_eq!(fake.dispatch_count(), 0, "nothing selected → no Submit");
+        assert!(b.last_note().is_some());
+    }
+
+    #[test]
+    fn batch_verbs_dispatch_per_eligible_ledger_job() {
+        let mut running = XJob::new("/a", "/b", XMethod::Rsync, XPolicy::default());
+        running.state = XState::Running;
+        let mut paused = XJob::new("/c", "/d", XMethod::Http, XPolicy::default());
+        paused.state = XState::Paused;
+        let mut done = XJob::new("/e", "/f", XMethod::Node, XPolicy::default());
+        done.state = XState::Done;
+        let fake =
+            FakeTransfers::new().with_jobs(vec![running.clone(), paused.clone(), done.clone()]);
+        let mut b = transfers_browser(Vec::new(), fake.clone());
+        // Pause-all → one Pause (the running); Resume-all → one Resume (the paused);
+        // Clear-completed → one Cancel (the done).
+        b.transfer_pause_all();
+        b.transfer_resume_all();
+        b.transfer_clear_completed();
+        let verbs = fake.verbs();
+        assert_eq!(verbs.len(), 3, "one verb per eligible job");
+        assert!(verbs
+            .iter()
+            .any(|v| matches!(v, TransferVerb::Pause(id) if *id == running.id)));
+        assert!(verbs
+            .iter()
+            .any(|v| matches!(v, TransferVerb::Resume(id) if *id == paused.id)));
+        assert!(verbs
+            .iter()
+            .any(|v| matches!(v, TransferVerb::Cancel(id) if *id == done.id)));
+    }
+
+    #[test]
+    fn transfers_view_and_counts_read_the_injected_ledger() {
+        let mut running = XJob::new("/a", "/b", XMethod::Rsync, XPolicy::default());
+        running.state = XState::Running;
+        let mut done = XJob::new("/e", "/f", XMethod::Node, XPolicy::default());
+        done.state = XState::Done;
+        let fake = FakeTransfers::new().with_jobs(vec![running, done]);
+        let b = transfers_browser(Vec::new(), fake);
+        assert_eq!(b.transfers_view().len(), 2);
+        let c = b.transfers_counts();
+        assert_eq!(c.active, 1, "the running job is active");
+        assert_eq!(c.terminal, 1, "the done job is terminal");
+        assert!(b.transfers_active());
     }
 }

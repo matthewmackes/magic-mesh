@@ -45,11 +45,14 @@ use mde_files::search::TypeFilter;
 use crate::dialogs::{Perm, PermClass};
 use crate::mesh_mount::{MountPhase, MountView};
 use crate::model::{
-    mount_host_of, FileBrowser, Location, SearchForm, SendOutcome, SortKey, SortSpec, ViewMode,
-    LOCAL_SPOTS,
+    mount_host_of, FileBrowser, Location, SearchForm, SendOutcome, SortKey, SortSpec, SurfaceTab,
+    ViewMode, LOCAL_SPOTS,
 };
 use crate::preview::{
     Pixels, PreviewData, PreviewKind, PreviewState, ThumbState, TokenKind, TokenSpan,
+};
+use crate::transfers::{
+    Method, NewTransferForm, StateFilter, TargetKind, TransferJob, TransferState, TransferTarget,
 };
 
 // Details-view column widths (right-hand columns; name takes the rest).
@@ -200,6 +203,38 @@ pub(crate) enum Action {
     CancelSearch,
     /// FILEMGR-4 — leave search mode and restore `pane`'s folder listing.
     ClearSearch(usize),
+    /// TRANSFERS-8 — switch the top-level surface (Files ↔ Transfers, Q1).
+    SwitchSurface(SurfaceTab),
+    /// TRANSFERS-8 — open a blank New Transfer dialog (Q13 entry 1).
+    OpenNewTransfer,
+    /// TRANSFERS-8 — open the New Transfer dialog pre-pointed at a destination.
+    OpenNewTransferTo(String, Method),
+    /// TRANSFERS-8 — commit an edit to the New Transfer form.
+    NewTransferEdit(NewTransferForm),
+    /// TRANSFERS-8 — submit the New Transfer dialog's job + close it.
+    SubmitNewTransfer,
+    /// TRANSFERS-8 — dismiss the New Transfer dialog.
+    CancelNewTransfer,
+    /// TRANSFERS-8 — right-click "Send to → `<target>`" (Q13 entry 2).
+    SendToTarget(usize, TransferTarget),
+    /// TRANSFERS-8 — drag-drop onto a destination (Q13 entry 3).
+    DropOnTarget(usize, TransferTarget),
+    /// TRANSFERS-8 — pause one ledger job.
+    TransferPause(String),
+    /// TRANSFERS-8 — resume one Paused job.
+    TransferResume(String),
+    /// TRANSFERS-8 — cancel one job (removes it from the ledger).
+    TransferCancel(String),
+    /// TRANSFERS-8 — pause every pausable job (Q16 menu).
+    TransferPauseAll,
+    /// TRANSFERS-8 — resume every Paused job (Q16 menu).
+    TransferResumeAll,
+    /// TRANSFERS-8 — cancel every terminal job (Clear-completed, Q16 menu).
+    TransferClearCompleted,
+    /// TRANSFERS-8 — set the Transfers view state-filter (Q16 menu).
+    SetTransferStateFilter(StateFilter),
+    /// TRANSFERS-8 — set the Transfers view method-filter (`None` = all lanes).
+    SetTransferMethodFilter(Option<Method>),
 }
 
 /// Render the whole Files surface into `ui`. The one reusable entry point: the
@@ -234,6 +269,13 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     if browser.search_running() {
         ui.ctx().request_repaint_after(Duration::from_millis(80));
     }
+    // TRANSFERS-8 — refresh the worker's ledger (a cheap, cadence-gated local
+    // directory scan; never a peer probe). Keep a repaint heartbeat while any job
+    // is in flight so live progress updates without input.
+    browser.pump_transfers();
+    if browser.transfers_active() {
+        ui.ctx().request_repaint_after(Duration::from_secs(1));
+    }
 
     let mut actions: Vec<Action> = Vec::new();
     // FILEMGR-12 — Ctrl+C / Ctrl+X / Ctrl+V over the active pane, sharing the shell
@@ -245,7 +287,14 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     // so it reads as the surface's chrome header (lock 11), above the quick-access
     // strip below it.
     menu_bar(ui, browser, &mut actions);
-    top_bar(ui, browser, &mut actions);
+    // TRANSFERS-8 — the top-level surface tab strip (Files ↔ Transfers, Q1). The
+    // MenuBar above + the sidebar/bottom strip below are shared across both (Q16);
+    // only the central content + the file-specific toolbar switch.
+    surface_tabs(ui, browser, &mut actions);
+    let on_files = browser.surface_tab() == SurfaceTab::Files;
+    if on_files {
+        top_bar(ui, browser, &mut actions);
+    }
     egui::TopBottomPanel::bottom("files-bottom").show_inside(ui, |ui| {
         op_strip(ui, browser, &mut actions);
         status_line(ui, browser);
@@ -253,24 +302,35 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     sidebar(ui, browser, &mut actions);
     // FILEMGR-10 — the toggleable preview pane sits between the listing and the
     // window edge, previewing the focused selection with built-in viewers only.
-    if browser.preview_pane_open() {
+    if on_files && browser.preview_pane_open() {
         preview_pane(ui, browser, &mut actions);
     }
     egui::CentralPanel::default().show_inside(ui, |ui| {
-        if browser.is_dual() {
-            ui.columns(2, |cols| {
-                pane_view(&mut cols[0], browser, 0, &mut actions);
-                pane_view(&mut cols[1], browser, 1, &mut actions);
-            });
+        if on_files {
+            if browser.is_dual() {
+                ui.columns(2, |cols| {
+                    pane_view(&mut cols[0], browser, 0, &mut actions);
+                    pane_view(&mut cols[1], browser, 1, &mut actions);
+                });
+            } else {
+                pane_view(ui, browser, 0, &mut actions);
+            }
         } else {
-            pane_view(ui, browser, 0, &mut actions);
+            // TRANSFERS-8 — the Transfers tab: the worker's live ledger.
+            transfers_panel(ui, browser, &mut actions);
         }
     });
-    // FILEMGR-10 — the Space quick-look modal, over everything.
-    quick_look_overlay(ui, browser, &mut actions);
+    // FILEMGR-10 — the Space quick-look modal, over everything (Files tab only).
+    if on_files {
+        quick_look_overlay(ui, browser, &mut actions);
+    }
     // FILEMGR-11 — the operation dialogs, topmost. At most one shows at a time
     // (a worker parked on a collision is the most urgent, so it wins).
     operation_dialogs(ui, browser, &mut actions);
+    // TRANSFERS-8 — the New Transfer dialog (Q13 entry 1) + the Destinations
+    // manager window (Q16), both modal over either tab.
+    new_transfer_dialog(ui, browser, &mut actions);
+    destinations_window(ui, browser, &mut actions);
 
     let ctx = ui.ctx().clone();
     for action in actions {
@@ -442,6 +502,31 @@ fn apply(ctx: &egui::Context, browser: &mut FileBrowser, action: Action) {
         Action::RunSearch(p) => browser.start_search(p),
         Action::CancelSearch => browser.cancel_search(),
         Action::ClearSearch(p) => browser.clear_search(p),
+        // ── TRANSFERS-8 ──────────────────────────────────────────────────────
+        Action::SwitchSurface(tab) => browser.set_surface_tab(tab),
+        Action::OpenNewTransfer => browser.open_new_transfer(),
+        Action::OpenNewTransferTo(dest, method) => browser.open_new_transfer_to(dest, method),
+        Action::NewTransferEdit(form) => browser.set_new_transfer_form(form),
+        Action::SubmitNewTransfer => browser.submit_new_transfer(),
+        Action::CancelNewTransfer => browser.cancel_new_transfer(),
+        Action::SendToTarget(p, target) => browser.send_to_target(p, &target),
+        Action::DropOnTarget(p, target) => browser.drop_on_target(p, &target),
+        Action::TransferPause(id) => browser.transfer_pause(&id),
+        Action::TransferResume(id) => browser.transfer_resume(&id),
+        Action::TransferCancel(id) => browser.transfer_cancel(&id),
+        Action::TransferPauseAll => browser.transfer_pause_all(),
+        Action::TransferResumeAll => browser.transfer_resume_all(),
+        Action::TransferClearCompleted => browser.transfer_clear_completed(),
+        Action::SetTransferStateFilter(state) => {
+            let mut f = browser.transfers_filter();
+            f.state = state;
+            browser.set_transfers_filter(f);
+        }
+        Action::SetTransferMethodFilter(method) => {
+            let mut f = browser.transfers_filter();
+            f.method = method;
+            browser.set_transfers_filter(f);
+        }
     }
 }
 
@@ -472,13 +557,362 @@ fn menu_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
         ui.add_space(Style::SP_XS);
     });
     if let Some(p) = picked {
-        match crate::menubar::to_action(p, &cx) {
+        match crate::menubar::to_action(p.clone(), &cx) {
             Some(action) => actions.push(action),
-            // The only non-seam pick: toggle the Help shortcuts reference.
-            None => crate::menubar::toggle_shortcuts(ui.ctx()),
+            // The two non-seam picks toggle a bar-owned window (Help / Destinations).
+            None => {
+                if p == crate::menubar::Picked::ShowDestinations {
+                    crate::menubar::toggle_destinations(ui.ctx());
+                } else {
+                    crate::menubar::toggle_shortcuts(ui.ctx());
+                }
+            }
         }
     }
     crate::menubar::shortcuts_window(ui.ctx());
+}
+
+// ── TRANSFERS-8: the surface tab strip + the Transfers tab ─────────────────────
+
+/// The top-level surface tab strip (Files ↔ Transfers, Q1) — a slim row of
+/// segmented tabs just under the shared `MenuBar`. The Transfers tab carries a live
+/// active-count badge (the same count the dock Files cell badges, Q1). Switching is
+/// one [`Action::SwitchSurface`]; the `MenuBar` + sidebar + bottom strip stay put
+/// (Q16 — the Transfers tab reuses the File Browser's chrome, not a new spine).
+fn surface_tabs(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    let current = b.surface_tab();
+    let active = b.transfers_counts().active;
+    egui::TopBottomPanel::top("files-surface-tabs").show_inside(ui, |ui| {
+        ui.add_space(Style::SP_XS);
+        ui.horizontal(|ui| {
+            for tab in SurfaceTab::ALL {
+                let label = if tab == SurfaceTab::Transfers && active > 0 {
+                    format!("{}  ({active})", tab.label())
+                } else {
+                    tab.label().to_string()
+                };
+                if ui.selectable_label(current == tab, label).clicked() {
+                    actions.push(Action::SwitchSurface(tab));
+                }
+            }
+        });
+        ui.add_space(Style::SP_XS);
+    });
+}
+
+/// The Carbon [`Style`] token for a transfer state (§4 — no raw hex).
+const fn transfer_state_color(state: TransferState) -> Color32 {
+    match state {
+        TransferState::Queued => Style::TEXT_DIM,
+        TransferState::Running => Style::ACCENT,
+        TransferState::Paused => Style::WARN,
+        TransferState::Done => Style::OK,
+        TransferState::Failed => Style::DANGER,
+    }
+}
+
+/// The Transfers tab (Q1) — the worker's live ledger in newest-relevant order,
+/// with an inline state filter, a New Transfer button, and honest empty states.
+/// This is a pure renderer (§9): every control emits a typed verb the daemon owns;
+/// the list reflects the ledger the worker publishes, never a fabricated row.
+fn transfers_panel(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    ui.add_space(Style::SP_S);
+    let counts = b.transfers_counts();
+    let filter = b.transfers_filter();
+
+    // Header: title + the New Transfer entry point (Q13).
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Transfers").color(Style::TEXT).strong());
+        if counts.total > 0 {
+            muted_note(ui, format!("\u{b7} {} total", counts.total));
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let btn = egui::Button::new(RichText::new("New Transfer").color(Style::BG).strong())
+                .fill(Style::ACCENT);
+            if ui
+                .add(btn)
+                .on_hover_text("Queue a transfer (source \u{2192} destination)")
+                .clicked()
+            {
+                actions.push(Action::OpenNewTransfer);
+            }
+        });
+    });
+
+    // Inline state filter (the MenuBar's View-by-state twin, for quick reach).
+    ui.add_space(Style::SP_XS);
+    ui.horizontal_wrapped(|ui| {
+        for s in StateFilter::ALL {
+            if ui.selectable_label(filter.state == s, s.label()).clicked() {
+                actions.push(Action::SetTransferStateFilter(s));
+            }
+        }
+    });
+    if let Some(m) = filter.method {
+        ui.horizontal(|ui| {
+            muted_note(ui, format!("method: {}", m.label()));
+            if ui.small_button("clear").clicked() {
+                actions.push(Action::SetTransferMethodFilter(None));
+            }
+        });
+    }
+    ui.separator();
+
+    let jobs = b.transfers_view();
+    if jobs.is_empty() {
+        transfers_empty_state(ui, b, counts.total);
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for job in &jobs {
+                transfer_row(ui, job, actions);
+                ui.add_space(Style::SP_XS);
+            }
+        });
+}
+
+/// The honest empty state (§7) — distinguishes "no worker on this node", "no
+/// transfers yet", and "nothing matches this filter"; never a fake row.
+fn transfers_empty_state(ui: &mut egui::Ui, b: &FileBrowser, total: usize) {
+    ui.add_space(Style::SP_L);
+    ui.vertical_centered(|ui| {
+        if !b.transfers_worker_present() {
+            ui.label(RichText::new("No transfers worker on this node yet.").color(Style::TEXT_DIM));
+            muted_note(
+                ui,
+                "The daemon's transfers worker runs on Workstation-tier nodes; \
+                 it publishes the ledger this tab reads.",
+            );
+        } else if total == 0 {
+            ui.label(RichText::new("No transfers yet.").color(Style::TEXT_DIM));
+            muted_note(
+                ui,
+                "Start one with New Transfer, drop a file onto a destination, \
+                 or right-click a file and Send to \u{2192}.",
+            );
+        } else {
+            ui.label(RichText::new("No transfers match this filter.").color(Style::TEXT_DIM));
+            muted_note(ui, "Pick a different state above, or All.");
+        }
+    });
+}
+
+/// One ledger row: the method, the source → dest route, the live state chip, a
+/// determinate progress bar ONLY when the lane reported a real percent (§7 — never
+/// a fabricated bar), the honest failure reason, and the per-job lifecycle controls
+/// gated by the worker's state machine.
+fn transfer_row(ui: &mut egui::Ui, job: &TransferJob, actions: &mut Vec<Action>) {
+    egui::Frame::NONE
+        .fill(Style::LAYER_01)
+        .corner_radius(Style::RADIUS)
+        .inner_margin(Style::SP_S)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // Method chip.
+                ui.colored_label(
+                    Style::TEXT_DIM,
+                    RichText::new(job.method.label()).size(Style::SMALL),
+                );
+                ui.add_space(Style::SP_S);
+                // Route (truncated by the row width; the full route is on hover).
+                ui.label(RichText::new(job.route()).color(Style::TEXT))
+                    .on_hover_text(job.route());
+                // State chip + controls on the right.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    transfer_row_controls(ui, job, actions);
+                    ui.colored_label(
+                        transfer_state_color(job.state),
+                        RichText::new(job.state.label()).size(Style::SMALL).strong(),
+                    );
+                });
+            });
+            // Progress: a determinate bar only when a real percent exists.
+            if let Some(pct) = job.progress {
+                ui.add(
+                    egui::ProgressBar::new(f32::from(pct) / 100.0)
+                        .desired_height(Style::SP_XS)
+                        .fill(transfer_state_color(job.state)),
+                );
+            } else if job.state == TransferState::Running {
+                // Running with no parsed percent yet — honest, not a fake 0%.
+                muted_note(ui, "working\u{2026}");
+            }
+            // The honest failure reason (§7).
+            if let Some(err) = &job.error {
+                ui.colored_label(
+                    Style::DANGER,
+                    RichText::new(format!("! {err}")).size(Style::SMALL),
+                );
+            }
+        });
+}
+
+/// The per-row lifecycle buttons (right-aligned): Pause / Resume gated by the
+/// worker's state machine, Cancel always available (a cancel removes the row).
+fn transfer_row_controls(ui: &mut egui::Ui, job: &TransferJob, actions: &mut Vec<Action>) {
+    if ui
+        .small_button("Cancel")
+        .on_hover_text("Remove this transfer from the ledger")
+        .clicked()
+    {
+        actions.push(Action::TransferCancel(job.id.clone()));
+    }
+    if job.state.can_resume() && ui.small_button("Resume").clicked() {
+        actions.push(Action::TransferResume(job.id.clone()));
+    }
+    if job.state.can_pause() && ui.small_button("Pause").clicked() {
+        actions.push(Action::TransferPause(job.id.clone()));
+    }
+}
+
+/// The New Transfer dialog (Q13 entry 1) — source / dest / method + the Q12/Q15
+/// policy knobs. Edits a clone of the model's [`NewTransferForm`] and hands it back
+/// through one [`Action::NewTransferEdit`] (the surface's render → intents → apply
+/// flow); Submit is disabled until both endpoints are non-blank (an honest guard,
+/// §7). A modal over a dimmed shell.
+fn new_transfer_dialog(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    let Some(form) = b.new_transfer() else {
+        return;
+    };
+    if modal_backdrop(ui.ctx(), "files-new-transfer-dim") {
+        actions.push(Action::CancelNewTransfer);
+    }
+    let mut edited = form.clone();
+    let before = edited.clone();
+    egui::Window::new("New Transfer")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ui.ctx(), |ui| {
+            ui.set_max_width(Style::SP_XL * 14.0);
+            egui::Grid::new("new-transfer-grid")
+                .num_columns(2)
+                .spacing([Style::SP_M, Style::SP_S])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Source").color(Style::TEXT_DIM));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut edited.source)
+                            .desired_width(Style::SP_XL * 9.0)
+                            .hint_text("/path, https://…, host:/path, peer:<id>"),
+                    );
+                    ui.end_row();
+
+                    ui.label(RichText::new("Destination").color(Style::TEXT_DIM));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut edited.dest)
+                            .desired_width(Style::SP_XL * 9.0)
+                            .hint_text("/path, host:/path, peer:<id>, music:library"),
+                    );
+                    ui.end_row();
+
+                    ui.label(RichText::new("Method").color(Style::TEXT_DIM));
+                    egui::ComboBox::from_id_salt("new-transfer-method")
+                        .selected_text(edited.method.label())
+                        .show_ui(ui, |ui| {
+                            for m in Method::MANUAL {
+                                ui.selectable_value(&mut edited.method, m, m.label());
+                            }
+                        });
+                    ui.end_row();
+
+                    ui.label(RichText::new("Bandwidth cap").color(Style::TEXT_DIM));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut edited.bwlimit)
+                            .desired_width(Style::SP_XL * 4.0)
+                            .hint_text("e.g. 2m (optional)"),
+                    );
+                    ui.end_row();
+
+                    ui.label(RichText::new("Verify").color(Style::TEXT_DIM));
+                    ui.checkbox(&mut edited.verify, "Checksum on completion");
+                    ui.end_row();
+                });
+
+            ui.add_space(Style::SP_S);
+            ui.horizontal(|ui| {
+                let runnable = edited.runnable();
+                let submit =
+                    egui::Button::new(RichText::new("Queue transfer").color(Style::BG).strong())
+                        .fill(Style::ACCENT);
+                if ui
+                    .add_enabled(runnable, submit)
+                    .on_disabled_hover_text("Enter a source and a destination")
+                    .clicked()
+                {
+                    actions.push(Action::SubmitNewTransfer);
+                }
+                if ui.button("Cancel").clicked() {
+                    actions.push(Action::CancelNewTransfer);
+                }
+            });
+        });
+    // Hand the edited form back once (only when it actually changed).
+    if edited != before {
+        actions.push(Action::NewTransferEdit(edited));
+    }
+}
+
+/// The Carbon token for a destination kind (§4).
+const fn target_tone(kind: TargetKind) -> Color32 {
+    match kind {
+        TargetKind::Peer => Style::ACCENT_MESH,
+        TargetKind::Music => Style::ACCENT_MEDIA,
+        TargetKind::MeshShare => Style::ACCENT,
+    }
+}
+
+/// The Destinations manager window (Q16) — the auto-only registry (Q10): the two
+/// standing node-state targets plus one per reachable peer, each a one-click New
+/// Transfer entry point. Honest about the model: arbitrary hosts/URLs aren't pins,
+/// they're typed per-job. Bar-owned open flag (egui memory), rendered here because
+/// it needs the live roster.
+fn destinations_window(ui: &egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    let ctx = ui.ctx();
+    if !crate::menubar::destinations_open(ctx) {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("Destinations")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.set_max_width(Style::SP_XL * 12.0);
+            muted_note(
+                ui,
+                "Auto-registered from mesh state. Arbitrary hosts / URLs are typed \
+                 per-job in New Transfer.",
+            );
+            ui.add_space(Style::SP_S);
+            for target in b.transfer_targets() {
+                ui.horizontal(|ui| {
+                    status_dot(ui, target_tone(target.kind));
+                    ui.label(RichText::new(&target.label).color(Style::TEXT));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("New transfer\u{2026}")
+                            .on_hover_text("Open the New Transfer dialog pointed here")
+                            .clicked()
+                        {
+                            actions.push(Action::OpenNewTransferTo(
+                                target.dest.clone(),
+                                target.method,
+                            ));
+                        }
+                    });
+                });
+                muted_note(
+                    ui,
+                    format!("{} \u{b7} {}", target.method.label(), target.dest),
+                );
+                ui.add_space(Style::SP_XS);
+            }
+        });
+    if !open {
+        crate::menubar::set_destinations_open(ctx, false);
+    }
 }
 
 // ── Top toolbar ───────────────────────────────────────────────────────────────
@@ -792,7 +1226,46 @@ fn sidebar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
                     peer_row(ui, b, peer, active, actions);
                 }
             }
+            ui.add_space(Style::SP_M);
+
+            // TRANSFERS-8 — the destination drop dock (Q13 entry 3). Drag a file
+            // selection onto a target to queue a transfer; a click opens the New
+            // Transfer dialog pointed here. Visible on both surface tabs (the sidebar
+            // is shared), so a drag from the Files tab reaches a target either way.
+            destinations_section(ui, b, actions);
         });
+}
+
+/// The sidebar's "SEND TO" section — the auto destination registry (Q10) as live
+/// **drop targets** (Q13 entry 3) plus a click-to-open-dialog convenience. A file
+/// drag released on a row queues a transfer of the source pane's selection; a plain
+/// click opens the New Transfer dialog pre-pointed at the target.
+fn destinations_section(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    section_header(ui, "SEND TO");
+    muted_note(ui, "Drop files here, or click to set up a transfer.");
+    for target in b.transfer_targets() {
+        let resp = ui
+            .selectable_label(false, format!("\u{2192} {}", target.label))
+            .on_hover_text(format!("{} \u{b7} {}", target.method.label(), target.dest));
+        if resp.clicked() {
+            actions.push(Action::OpenNewTransferTo(
+                target.dest.clone(),
+                target.method,
+            ));
+        }
+        // A live drop target: highlight on hover, queue on release.
+        if resp.dnd_hover_payload::<FilesDrag>().is_some() {
+            ui.painter().rect_stroke(
+                resp.rect,
+                Style::RADIUS,
+                Stroke::new(1.0, target_tone(target.kind)),
+                StrokeKind::Inside,
+            );
+        }
+        if let Some(payload) = resp.dnd_release_payload::<FilesDrag>() {
+            actions.push(Action::DropOnTarget(payload.source_pane, target.clone()));
+        }
+    }
 }
 
 /// One Mesh sidebar tree row: a peer with a live presence pip, its worker-
@@ -1400,6 +1873,11 @@ fn entry_interactions(
         ui.menu_button("Send in Chat", |ui| {
             peer_send_submenu(ui, b, pane_ix, true, actions);
         });
+        // TRANSFERS-8 — right-click "Transfer to →" (Q13 entry 2): queue a real
+        // transfer of the selection to an auto destination (peer / Music / mesh-
+        // share). Distinct from FILEMGR-7 "Send to" — this rides the daemon-owned
+        // transfers queue (survives a shell restart, tracked in the ledger).
+        target_transfer_submenu(ui, b, pane_ix, actions);
         // EDITOR-9 — open a file in the Editor surface (files only; a directory has
         // no document to open). Posts `action/editor/open`, drained by the shell.
         if !e.is_dir && ui.button("Open in Editor").clicked() {
@@ -1496,6 +1974,31 @@ fn peer_send_submenu(
             .on_hover_text("Peer is offline \u{2014} can't receive a file");
         }
     }
+}
+
+/// TRANSFERS-8 — the "Transfer to →" submenu (Q13 entry 2): one row per auto
+/// destination (Q10 — the two standing node-state targets + one per reachable
+/// peer). Clicking queues a real transfer of the pane's selection to that target
+/// through the daemon-owned queue. Reads the cached roster only — never a blocking
+/// probe.
+fn target_transfer_submenu(
+    ui: &mut egui::Ui,
+    b: &FileBrowser,
+    pane_ix: usize,
+    actions: &mut Vec<Action>,
+) {
+    ui.menu_button("Transfer to", |ui| {
+        for target in b.transfer_targets() {
+            if ui
+                .button(target.label.as_str())
+                .on_hover_text(format!("{} \u{b7} {}", target.method.label(), target.dest))
+                .clicked()
+            {
+                actions.push(Action::SendToTarget(pane_ix, target.clone()));
+                ui.close_menu();
+            }
+        }
+    });
 }
 
 /// Paint the rubber-band and select the rows it covers (view geometry; the model
@@ -2534,7 +3037,9 @@ const fn peer_color(status: PeerStatus) -> egui::Color32 {
 #[cfg(test)]
 mod tests {
     use super::files_panel;
-    use crate::model::{FileBrowser, Location, ViewMode};
+    use crate::model::{FileBrowser, Location, SurfaceTab, ViewMode};
+    use crate::transfers::test_support::FakeTransfers;
+    use crate::transfers::{Method, TransferJob, TransferPolicy, TransferState};
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
     use mde_files::backend::{
@@ -2700,6 +3205,57 @@ mod tests {
         b.navigate(0, Location::Peer("ghost".into()));
         assert!(b.active_tab().rows().is_empty());
         assert!(b.mesh_overlay().is_none());
+        mount(&mut b);
+    }
+
+    #[test]
+    fn mounts_and_renders_the_transfers_tab_with_ledger_fixtures() {
+        // A running (with progress) + a failed (with a reason) job — the tab must
+        // render both, the state chips, and the progress bar, headless without panic.
+        let mut running = TransferJob::new(
+            "/src/a",
+            "peer:oak",
+            Method::Rsync,
+            TransferPolicy::default(),
+        );
+        running.state = TransferState::Running;
+        running.progress = Some(42);
+        let mut failed = TransferJob::new(
+            "https://x/y.iso",
+            "/downloads",
+            Method::Http,
+            TransferPolicy::default(),
+        );
+        failed.state = TransferState::Failed;
+        failed.error = Some("host unreachable".into());
+        let fake = FakeTransfers::new().with_jobs(vec![running, failed]);
+        let mut b =
+            FileBrowser::with_file_ops(Box::new(RenderFixture::populated()), FakeFileOps::new())
+                .with_transfers(Box::new(fake));
+        b.set_surface_tab(SurfaceTab::Transfers);
+        assert_eq!(b.surface_tab(), SurfaceTab::Transfers);
+        assert_eq!(b.transfers_view().len(), 2, "both ledger fixtures show");
+        mount(&mut b);
+    }
+
+    #[test]
+    fn mounts_and_renders_the_transfers_empty_state_when_worker_absent() {
+        // An absent worker is an honest EmptyState (§7), not a fabricated row.
+        let fake = FakeTransfers::new().present(false);
+        let mut b =
+            FileBrowser::with_file_ops(Box::new(RenderFixture::populated()), FakeFileOps::new())
+                .with_transfers(Box::new(fake));
+        b.set_surface_tab(SurfaceTab::Transfers);
+        assert!(!b.transfers_worker_present());
+        assert!(b.transfers_view().is_empty());
+        mount(&mut b);
+    }
+
+    #[test]
+    fn mounts_and_renders_the_new_transfer_dialog() {
+        let mut b = browser();
+        b.open_new_transfer();
+        assert!(b.new_transfer().is_some());
         mount(&mut b);
     }
 
