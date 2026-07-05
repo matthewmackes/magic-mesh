@@ -68,7 +68,10 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 use mde_kdc_host::error::HostError;
+use mde_kdc_host::file_browse::SharedRoot;
 use mde_kdc_host::pairing::{DeviceRecord, PairingStore};
+use mde_kdc_host::service_directory::{self, NodeServices, PublishedRoot};
+use mde_kdc_host::sftp::{SftpMount, SshfsMount};
 use mde_kdc_host::{EventStream, HostEvent, MeshPairing, OverlayTransport, PeerId, Transport};
 use mde_kdc_proto::discovery::{Announce, DeviceType};
 use mde_kdc_proto::plugins::battery::BatteryBody;
@@ -82,7 +85,7 @@ use super::{ShutdownToken, Worker};
 /// the retired `dev.mackes.MDE.Connect` D-Bus surface). `version`/`list`/
 /// `get` read the store; `pair`/`unpair` mutate it; `ring`/`sms`/
 /// `clipboard` enqueue a `Packet` onto the outbound queue.
-const CONNECT_VERBS: [&str; 10] = [
+const CONNECT_VERBS: [&str; 11] = [
     "version",
     "list",
     "get",
@@ -96,12 +99,21 @@ const CONNECT_VERBS: [&str; 10] = [
     // `kdeconnect.share.request` (file or URL/text) onto the outbound queue,
     // same delivery path as ring/sms/clipboard.
     "share",
+    // KDC-MESH-7 — ask the phone to start SFTP browsing; the phone replies with a
+    // `kdeconnect.sftp` mount-info packet this host mounts (design #11a).
+    "sftp",
 ];
 
 /// Bus topic the worker answers with the live device roster (E2.3 — the same
 /// topic the Connect clients (the Workbench panel) already query via
 /// `connect::devices()`). Distinct from the `<verb>` action topics.
 const DEVICES_TOPIC: &str = "action/connect/devices";
+
+/// KDC-MESH-7 — Bus topic the worker answers with a listing of THIS node's shared
+/// files (the node-targeted file browse, design #7/#11b). Served separately from
+/// the pure `<verb>` responder because the listing needs the node's shared-roots
+/// config. Request body `{"path": "<path>"}` (empty ⇒ list the roots themselves).
+const BROWSE_TOPIC: &str = "action/connect/browse";
 
 /// KDE Connect's stock UDP/TCP port (identity broadcast + TLS link).
 const KDC_PORT: u16 = 1716;
@@ -923,6 +935,10 @@ fn local_announce() -> Announce {
         "kdeconnect.findmyphone.request",
         // Curated command list + execution (handle_runcommand).
         "kdeconnect.runcommand.request",
+        // KDC-MESH-7 — the phone's SFTP mount-info reply (browse the phone's FS
+        // from this desktop; the request goes out below). Handled by mounting the
+        // phone's SFTP server via the injectable seam.
+        "kdeconnect.sftp",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -939,6 +955,9 @@ fn local_announce() -> Announce {
         "kdeconnect.sms.request",
         "kdeconnect.telephony.request",
         "kdeconnect.runcommand",
+        // KDC-MESH-7 — ask the phone to start browsing (it replies with the SFTP
+        // mount info above).
+        "kdeconnect.sftp.request",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -1156,6 +1175,23 @@ async fn run_host(
                             notify_ctx.fanout_inbound(&shunt_root, &mut notify_seen, &n, now_ms());
                         }
                     }
+                    // KDC-MESH-7 — the phone's SFTP mount-info reply to our
+                    // `kdeconnect.sftp.request` (design #11a): mount the phone's
+                    // filesystem via the injectable seam so its files appear as a
+                    // local directory. The mount shells out (`sshfs`) + honest-
+                    // gates when absent, so it runs off the reactor; the outcome
+                    // is audited (#16).
+                    if packet.kind == "kdeconnect.sftp" {
+                        if let Ok(info) = mde_kdc_proto::plugins::from_packet_body::<
+                            mde_kdc_proto::plugins::sftp::SftpMountInfo,
+                        >(packet)
+                        {
+                            let device = peer.as_str().to_string();
+                            tokio::task::spawn_blocking(move || {
+                                mount_phone_sftp(&SshfsMount, &device, &info);
+                            });
+                        }
+                    }
                 }
                 if let Ok(mut m) = roster.lock() {
                     apply_event(&mut m, ev);
@@ -1183,6 +1219,18 @@ async fn run_host(
                 // the substrate and republish any not-yet-seen one onto THIS node's
                 // desktop feed (the phone→desktops fan-out, receiving side, #6).
                 notify_ctx.drain_relayed(&shunt_root, &mut notify_seen, now_ms());
+                // KDC-MESH-7 — publish THIS node's service set + a shallow snapshot
+                // of its shared roots to the mesh service directory so the phone/hub
+                // can target any node (design #7). Own-row authority (own file).
+                let snapshot = node_services_snapshot(
+                    &config_dir,
+                    &shunt_host,
+                    &host_device_id,
+                    host_overlay_ip,
+                );
+                if let Err(e) = service_directory::publish_services(&shunt_root, &snapshot) {
+                    warn!(error = %e, "kdc-host: service-directory publish failed");
+                }
             }
             _ = notify_fwd_tick.tick() => {
                 // KDC-MESH-5 — forward the local `event/notify/*` feed (CHAT-FIX-2)
@@ -1542,6 +1590,191 @@ fn now_ms() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
+// ───────────────── KDC-MESH-7: two-way files + service directory ──────────────
+//
+// Each node publishes its KDC service set + a shallow snapshot of its shared
+// roots to the replicated service directory (`<root>/kdc-services/<host>.json`);
+// the phone/hub browse it to target any node (design #7). Files ride both ways:
+// browse the phone's FS via the injectable SFTP seam (#11a), and browse a node's
+// shared files via the directory snapshot + the live `browse` verb (#11b).
+
+/// The `[[root]] label=… path=…` shared-roots document (`<config>/shared-roots.toml`).
+#[derive(Debug, Default, serde::Deserialize)]
+struct SharedRootsFile {
+    #[serde(default)]
+    root: Vec<SharedRootEntry>,
+}
+
+/// One operator-configured shared root row in `shared-roots.toml`.
+#[derive(Debug, serde::Deserialize)]
+struct SharedRootEntry {
+    label: String,
+    path: String,
+}
+
+/// The node's browseable shared roots: `<config_dir>/shared-roots.toml` when
+/// present + parseable, else the default `~/Public` (only when it exists, so an
+/// empty list honestly means "nothing shared" rather than a phantom root). Only
+/// roots whose path actually exists are returned (§7 — never a phantom share).
+fn default_shared_roots(config_dir: &std::path::Path) -> Vec<SharedRoot> {
+    let configured: Vec<SharedRoot> =
+        match std::fs::read_to_string(config_dir.join("shared-roots.toml")) {
+            Ok(text) => toml::from_str::<SharedRootsFile>(&text)
+                .map(|f| {
+                    f.root
+                        .into_iter()
+                        .map(|r| SharedRoot::new(r.label, r.path))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+    let roots = if configured.is_empty() {
+        dirs::home_dir()
+            .map(|h| {
+                vec![SharedRoot::new(
+                    "Public",
+                    h.join("Public").to_string_lossy().to_string(),
+                )]
+            })
+            .unwrap_or_default()
+    } else {
+        configured
+    };
+    // Only expose roots that actually exist (an honest, non-phantom share).
+    roots
+        .into_iter()
+        .filter(|r| std::path::Path::new(&r.path).is_dir())
+        .collect()
+}
+
+/// The KDC service tokens THIS node advertises in the mesh service directory.
+///
+/// KDC-MESH-7 tokens: `files` (+ `sftp` for the phone-FS mount) plus the
+/// already-live `run-commands` / `battery` / `find-my-device`. KDC-MESH-8 extends
+/// this with `openstack` + `telephony`.
+fn advertised_services() -> Vec<String> {
+    vec![
+        service_directory::service::FILES.to_string(),
+        service_directory::service::RUN_COMMANDS.to_string(),
+        service_directory::service::BATTERY.to_string(),
+        service_directory::service::FIND_MY_DEVICE.to_string(),
+        // The phone-FS SFTP mount seam is always advertised; the live leg
+        // honest-gates when `sshfs` is absent (it's a capability, not a promise
+        // the tool is installed).
+        service_directory::service::SFTP.to_string(),
+    ]
+}
+
+/// Build THIS node's service-directory entry: its identity + overlay IP, the
+/// advertised services, and a shallow snapshot of each shared root's top level
+/// (so a phone/hub browses the first level straight off the substrate).
+fn node_services_snapshot(
+    config_dir: &std::path::Path,
+    host: &str,
+    device_id: &str,
+    overlay_ip: Option<IpAddr>,
+) -> NodeServices {
+    let shared_roots = default_shared_roots(config_dir)
+        .into_iter()
+        .map(|root| {
+            let entries = mde_kdc_host::file_browse::list_dir(std::path::Path::new(&root.path))
+                .unwrap_or_default();
+            PublishedRoot { root, entries }
+        })
+        .collect();
+    NodeServices {
+        node_host: host.to_string(),
+        node_device_id: device_id.to_string(),
+        overlay_ip: overlay_ip.map(|ip| ip.to_string()),
+        services: advertised_services(),
+        shared_roots,
+        updated_ms: now_ms(),
+    }
+}
+
+/// The local mountpoint the phone's SFTP filesystem is mounted at:
+/// `<runtime|cache|tmp>/mde/kdc-sftp/<device>`. The device id is sanitized to a
+/// single path segment so a hostile id can't escape the mount dir.
+fn kdc_sftp_mountpoint(device_id: &str) -> PathBuf {
+    let base = dirs::runtime_dir()
+        .or_else(dirs::cache_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    let safe: String = device_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    base.join("mde").join("kdc-sftp").join(safe)
+}
+
+/// Append one phone-triggered action to the KDC hash-chained audit log (design
+/// #16 — pairing is the auth, but EVERY action is recorded). Best-effort:
+/// [`crate::events::append_and_alert`] logs + swallows a store fault so an audit
+/// hiccup never wedges the action path.
+fn audit_kdc_action(detail: Value) {
+    crate::events::append_and_alert(
+        &crate::default_db_path(),
+        &hostname_for_shunt(),
+        crate::events::EventKind::Lifecycle,
+        detail,
+    );
+}
+
+/// Mount a phone's SFTP server (design #11a) via the injectable `seam`, auditing
+/// the outcome. A not-mountable reply / absent `sshfs` is an honest gate — logged
+/// + audited as `gated`, never a faked mount. Sync (the seam shells out); the
+/// caller runs it off the reactor via `spawn_blocking`.
+fn mount_phone_sftp<M: SftpMount>(
+    seam: &M,
+    device_id: &str,
+    info: &mde_kdc_proto::plugins::sftp::SftpMountInfo,
+) {
+    let mountpoint = kdc_sftp_mountpoint(device_id);
+    match seam.mount(info, &mountpoint) {
+        Ok(m) => {
+            info!(device = %device_id, mountpoint = %m.mountpoint.display(), "kdc-host: mounted phone SFTP");
+            audit_kdc_action(json!({
+                "action": "kdc_sftp_mount",
+                "phone": device_id,
+                "mountpoint": m.mountpoint.to_string_lossy(),
+                "remote": m.remote_path,
+            }));
+        }
+        Err(e) => {
+            debug!(device = %device_id, error = %e, "kdc-host: SFTP mount honest-gated");
+            audit_kdc_action(json!({
+                "action": "kdc_sftp_mount",
+                "phone": device_id,
+                "result": "gated",
+                "reason": e.to_string(),
+            }));
+        }
+    }
+}
+
+/// Serve one `action/connect/browse` request: list THIS node's shared files at
+/// the requested `path` (the node-targeted file browse, design #7/#11b), auditing
+/// the browse (#16). A path outside the shared roots is refused (the security
+/// gate). Returns the reply JSON.
+fn serve_browse(config_dir: &std::path::Path, body: &Value) -> String {
+    let path = body.get("path").and_then(Value::as_str).unwrap_or_default();
+    let roots = default_shared_roots(config_dir);
+    audit_kdc_action(json!({
+        "action": "kdc_file_browse",
+        "path": path,
+    }));
+    match mde_kdc_host::file_browse::browse(&roots, path) {
+        Ok(entries) => json!({ "ok": true, "path": path, "entries": entries }).to_string(),
+        Err(e) => json!({ "ok": false, "error": e.to_string() }).to_string(),
+    }
+}
+
 /// THIS host's overlay identity as it publishes it in the mesh-shunt roster:
 /// its KDC device id (`/etc/machine-id`) + the overlay IP `start` resolved.
 #[derive(Clone, Copy)]
@@ -1878,6 +2111,24 @@ fn handle_connect_verb(
             });
             json!({ "ok": true })
         }
+        // KDC-MESH-7 — ask a paired phone to start SFTP browsing. Enqueues a
+        // `kdeconnect.sftp.request{startBrowsing:true}`; the phone replies with a
+        // `kdeconnect.sftp` mount-info packet the host mounts (design #11a). Same
+        // outbound-queue delivery path as ring/share.
+        "sftp" => {
+            let Some(id) = dev_id() else {
+                return json!({ "ok": false, "error": "NoSuchDevice" }).to_string();
+            };
+            if !store.is_paired(&id) {
+                return json!({ "ok": false, "error": "NoSuchDevice" }).to_string();
+            }
+            let packet = mde_kdc_proto::plugins::sftp::sftp_request_packet(now_ms(), true);
+            outbound.push(OutboundSend {
+                device_id: id,
+                packet,
+            });
+            json!({ "ok": true })
+        }
         other => json!({ "ok": false, "error": format!("unknown verb: {other}") }),
     };
     reply.to_string()
@@ -1891,6 +2142,7 @@ fn serve_connect_bus(
     store: &PairingStore,
     roster: &Roster,
     outbound: &PendingSends,
+    config_dir: &std::path::Path,
     stop: &AtomicBool,
 ) {
     let mut cursors: HashMap<String, String> = HashMap::new();
@@ -1944,6 +2196,29 @@ fn serve_connect_bus(
                 );
             }
         }
+        // KDC-MESH-7 — the node-targeted file browse (`action/connect/browse`):
+        // list THIS node's shared files at the requested path (security-gated to
+        // the shared roots), audited. Served here (not via the pure verb handler)
+        // because it needs the node's shared-roots config.
+        if let Ok(msgs) =
+            persist.list_since(BROWSE_TOPIC, cursors.get(BROWSE_TOPIC).map(String::as_str))
+        {
+            for msg in msgs {
+                cursors.insert(BROWSE_TOPIC.to_string(), msg.ulid.clone());
+                let body: Value = msg
+                    .body
+                    .as_deref()
+                    .and_then(|b| serde_json::from_str(b).ok())
+                    .unwrap_or(Value::Null);
+                let reply = serve_browse(config_dir, &body);
+                let _ = persist.write(
+                    &reply_topic(&msg.ulid),
+                    Priority::Default,
+                    None,
+                    Some(&reply),
+                );
+            }
+        }
         std::thread::sleep(CONNECT_POLL);
     }
 }
@@ -1986,6 +2261,7 @@ impl Worker for KdcHostWorker {
         let store = Arc::clone(&pairing_arc);
         let resp_roster = Arc::clone(&roster);
         let outbound = self.outbound.clone();
+        let responder_config_dir = self.config_dir.clone();
         let responder = std::thread::Builder::new()
             .name("kdc-connect-bus".into())
             .spawn(move || {
@@ -1994,7 +2270,14 @@ impl Worker for KdcHostWorker {
                     return;
                 };
                 match Persist::open(bus_root) {
-                    Ok(p) => serve_connect_bus(&p, &store, &resp_roster, &outbound, &stop),
+                    Ok(p) => serve_connect_bus(
+                        &p,
+                        &store,
+                        &resp_roster,
+                        &outbound,
+                        &responder_config_dir,
+                        &stop,
+                    ),
                     Err(e) => {
                         warn!(error = %e, "kdc-host: opening Bus store for Connect responder")
                     }
@@ -3013,5 +3296,134 @@ mod tests {
         assert_eq!(d.name, "Pixel");
         assert!(!d.online);
         assert_eq!(d.battery, None);
+    }
+
+    // ── KDC-MESH-7: two-way any-node files + the mesh service directory ───────
+
+    #[test]
+    fn default_shared_roots_reads_toml_and_drops_phantom_paths() {
+        let tmp = tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let cfg = tmp.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("shared-roots.toml"),
+            format!(
+                "[[root]]\nlabel = \"Real\"\npath = {real:?}\n\
+                 [[root]]\nlabel = \"Ghost\"\npath = \"/no/such/dir\"\n",
+            ),
+        )
+        .unwrap();
+        let roots = default_shared_roots(&cfg);
+        // The phantom (non-existent) root is dropped — an honest, non-phantom share.
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].label, "Real");
+    }
+
+    #[test]
+    fn kdc_sftp_mountpoint_sanitizes_the_device_id_to_one_segment() {
+        let mp = kdc_sftp_mountpoint("../../etc/moto id");
+        // No path traversal survives: the id collapses to a single sanitized seg.
+        assert!(mp.ends_with("kdc-sftp/______etc_moto_id"));
+        assert!(mp.to_string_lossy().contains("kdc-sftp"));
+    }
+
+    #[test]
+    fn kdc_mesh7_service_directory_and_node_targeted_browse() {
+        // Serial-only (mackesd tests run `--test-threads=1`), so pointing MDE_HOME
+        // at a tempdir makes the browse audit write hermetically.
+        let tmp = tempdir().unwrap();
+        std::env::set_var("MDE_HOME", tmp.path());
+
+        // A shared root with a file + a subdir, and a SECRET dir outside it.
+        let shared = tmp.path().join("share");
+        std::fs::create_dir_all(shared.join("sub")).unwrap();
+        std::fs::write(shared.join("a.txt"), b"hi").unwrap();
+        let secret = tmp.path().join("secret");
+        std::fs::create_dir_all(&secret).unwrap();
+
+        let cfg = tmp.path().join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("shared-roots.toml"),
+            format!("[[root]]\nlabel = \"Share\"\npath = {shared:?}\n"),
+        )
+        .unwrap();
+
+        // (c) The service directory: this node's snapshot advertises files + sftp
+        // and carries a shallow snapshot of its shared root.
+        let snap = node_services_snapshot(&cfg, "nodeA", "id-a", None);
+        assert!(snap.offers(service_directory::service::FILES));
+        assert!(snap.offers(service_directory::service::SFTP));
+        assert_eq!(snap.shared_roots.len(), 1);
+        assert!(snap.shared_roots[0]
+            .entries
+            .iter()
+            .any(|e| e.name == "a.txt"));
+
+        // Publish → collect → select any node (the directory round-trip, #7).
+        let root = tmp.path().join("workgroup");
+        service_directory::publish_services(&root, &snap).unwrap();
+        service_directory::publish_services(
+            &root,
+            &NodeServices {
+                node_host: "nodeB".into(),
+                services: advertised_services(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let all = service_directory::collect_all_services(&root);
+        assert_eq!(all.len(), 2);
+        let picked = service_directory::select_node(&all, "nodeA").expect("node targetable");
+        assert_eq!(picked.node_host, "nodeA");
+
+        // (b) A node-targeted file browse: serve the shared files, refuse an escape.
+        let ok = serve_browse(&cfg, &json!({ "path": shared.to_string_lossy() }));
+        let v: Value = serde_json::from_str(&ok).unwrap();
+        assert_eq!(v["ok"], true);
+        let names: Vec<String> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"a.txt".to_string()));
+        assert!(names.contains(&"sub".to_string()));
+
+        let refused = serve_browse(&cfg, &json!({ "path": secret.to_string_lossy() }));
+        let rv: Value = serde_json::from_str(&refused).unwrap();
+        assert_eq!(
+            rv["ok"], false,
+            "a path outside the shared roots is refused"
+        );
+
+        // The browse audited (design #16) into the hermetic MDE_HOME db.
+        assert!(
+            audit_row_count(&crate::default_db_path()) >= 1,
+            "the node-targeted browse appended a KDC audit row",
+        );
+
+        std::env::remove_var("MDE_HOME");
+    }
+
+    #[test]
+    fn connect_verb_sftp_requires_paired_and_enqueues_a_browse_request() {
+        let tmp = tempdir().unwrap();
+        let store = test_store(tmp.path());
+        let outbound = PendingSends::new();
+        // Unpaired → refused, nothing enqueued.
+        let miss = handle_connect_verb(&store, &outbound, "sftp", &json!({ "device_id": "d1" }));
+        assert!(miss.contains("NoSuchDevice"));
+        assert_eq!(outbound.len(), 0);
+        // Pair then request SFTP browse → a `kdeconnect.sftp.request` is queued.
+        handle_connect_verb(&store, &outbound, "pair", &pair_body("d1", "Pixel"));
+        let ok = handle_connect_verb(&store, &outbound, "sftp", &json!({ "device_id": "d1" }));
+        assert!(ok.contains(r#""ok":true"#));
+        let queued = outbound.take_all();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].device_id, "d1");
+        assert_eq!(queued[0].packet.kind, "kdeconnect.sftp.request");
     }
 }

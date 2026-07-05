@@ -20,6 +20,7 @@ pub mod mpris;
 pub mod notification;
 pub mod ping;
 pub mod run_command;
+pub mod sftp;
 pub mod share;
 pub mod sms;
 pub mod telephony;
@@ -31,6 +32,7 @@ pub use mpris::{mpris_command_packet, MprisBody, MprisKind, MprisPlugin};
 pub use notification::{notification_packet, NotificationBody, NotificationPlugin};
 pub use ping::{ping_packet, PingBody, PingPlugin};
 pub use run_command::{run_command_packet, RunCommandBody};
+pub use sftp::{sftp_mount_packet, sftp_request_packet, SftpMountInfo, SftpRequestBody};
 pub use share::{file_share_packet, url_share_packet, ShareBody, ShareKind, SharePlugin};
 pub use sms::{sms_messages_packet, SmsMessage, SmsMessagesBody, SmsPlugin};
 pub use telephony::{telephony_packet, TelephonyBody, TelephonyEvent, TelephonyPlugin};
@@ -77,6 +79,13 @@ pub enum PluginKind {
     /// per-device via the KDC2-3.11.a per-device allow list
     /// (deferred).
     RunCommand,
+    /// KDC-MESH-7 — SFTP browse. A desktop sends `kdeconnect.sftp.request`
+    /// (`startBrowsing`) and the phone replies with a `kdeconnect.sftp` mount
+    /// info packet; the desktop mounts the phone's filesystem (production:
+    /// `sshfs`, via the injectable `mde_kdc_host::sftp` seam). Upstream ships it
+    /// as an optional plugin; MDE wires it host-side for the "browse the phone's
+    /// files from a desktop" leg (design #11a).
+    Sftp,
 }
 
 impl PluginKind {
@@ -87,7 +96,7 @@ impl PluginKind {
     /// in a deterministic shape (some KDC clients are sensitive to
     /// list order during pairing).
     #[must_use]
-    pub const fn all() -> [Self; 10] {
+    pub const fn all() -> [Self; 11] {
         [
             Self::Ping,
             Self::Clipboard,
@@ -99,6 +108,7 @@ impl PluginKind {
             Self::Sms,
             Self::Telephony,
             Self::RunCommand,
+            Self::Sftp,
         ]
     }
 
@@ -116,6 +126,7 @@ impl PluginKind {
             Self::Sms => "sms.messages",
             Self::Telephony => "telephony",
             Self::RunCommand => "runcommand",
+            Self::Sftp => "sftp.request",
         }
     }
 
@@ -301,8 +312,9 @@ mod tests {
     fn plugin_kind_count_matches_upstream_kdc() {
         // v2.1 KDC2: parity with upstream KDE Connect's 9
         // canonical plugins + RunCommand (KDC2-2.19, deny-by-
-        // default in policy.toml).
-        assert_eq!(PluginKind::all().len(), 10);
+        // default in policy.toml) + Sftp (KDC-MESH-7, host-side
+        // browse-the-phone mount).
+        assert_eq!(PluginKind::all().len(), 11);
     }
 
     #[test]
@@ -344,12 +356,12 @@ mod tests {
     #[test]
     fn plugin_kind_tokens_are_unique() {
         // Two plugins sharing the same token would silently merge
-        // in the registry. Hard-lock uniqueness across all 10
-        // variants (9 canonical + RunCommand).
+        // in the registry. Hard-lock uniqueness across all 11
+        // variants (9 canonical + RunCommand + Sftp).
         let mut tokens: Vec<&'static str> = PluginKind::all().iter().map(|k| k.token()).collect();
         tokens.sort_unstable();
         tokens.dedup();
-        assert_eq!(tokens.len(), 10);
+        assert_eq!(tokens.len(), 11);
     }
 
     // ─────────────────────────────────────────────────────────
@@ -387,6 +399,7 @@ mod tests {
                 PluginKind::Sms => vec!["kdeconnect.sms.messages"],
                 PluginKind::Telephony => vec!["kdeconnect.telephony"],
                 PluginKind::RunCommand => vec!["kdeconnect.runcommand"],
+                PluginKind::Sftp => vec!["kdeconnect.sftp.request"],
             };
             Self {
                 kind,
