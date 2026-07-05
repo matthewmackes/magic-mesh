@@ -25,6 +25,9 @@
 //! - [`mod@layout`] — the **pure** layout math (radial auto-placement, screen
 //!   mapping, pulse interpolation), unit-tested without a GPU.
 //! - [`MeshView`] — the painter over those results.
+//! - [`mod@menubar`] — the shared **top menu bar** for the surface (MENUBAR-ALL):
+//!   the [`MeshMenuBar`] over [`MeshViewOptions`] (the viewer's real View/Filter
+//!   controls) + a live health-count status cluster.
 //!
 //! Tier (§6): desktop-shell. Depends only on the shared `mde-egui` harness — the
 //! edge points inward, so the mesh substrate stays headless-capable.
@@ -45,8 +48,10 @@
 )]
 
 pub mod layout;
+pub mod menubar;
 pub mod state;
 mod view;
 
+pub use menubar::{MeshMenuBar, MeshOutcome, MeshViewOptions};
 pub use state::{Health, MeshLink, MeshNode, MeshState, Role};
 pub use view::MeshView;

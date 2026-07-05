@@ -1,7 +1,13 @@
 //! Surface · Mesh Map (OW-10) — the live mesh canvas, the egui reincarnation of
 //! MESHMAP.
 //!
-//! Two small pieces of glue live here; neither reimplements anything (§6):
+//! A few small pieces of glue live here; none reimplements anything (§6):
+//!
+//! * The surface embeds the shared **top menu bar** (MENUBAR-ALL): [`MeshMenuBar`]
+//!   renders `mde-mesh-view`'s [`MeshViewOptions`] (Reduce Motion + the role /
+//!   health filters) with a live health-count status cluster, and hands back the
+//!   one host-owned command — a manual Refresh, which forces the next re-poll. The
+//!   filtered projection is what the widget paints and the badge overlay pins to.
 //!
 //! * [`MeshViewState`] folds the SAME world-readable mesh-status snapshot the
 //!   Workbench planes read (`/run/mde/mesh-status.json`, written every ~30s by the
@@ -39,7 +45,10 @@ use mde_egui::Style;
 use mde_theme::brand::icons::{icon_image, IconId};
 use serde_json::Value;
 
-use mde_mesh_view::{layout, Health, MeshLink, MeshNode, MeshState, MeshView, Role};
+use mde_mesh_view::{
+    layout, Health, MeshLink, MeshMenuBar, MeshNode, MeshOutcome, MeshState, MeshView,
+    MeshViewOptions, Role,
+};
 
 /// The world-readable mesh-status snapshot — the same source This Node / Network /
 /// the chrome bar read (the desktop user can't read the root-only replicated peer
@@ -225,6 +234,10 @@ pub(crate) struct MeshViewState {
     /// The health-tinted brand role badges overlaid on the map, rasterized once
     /// per (glyph, tint) and cached.
     badges: BadgeCache,
+    /// The shared top menu bar (MENUBAR-ALL) — its live legend-window flag.
+    menubar: MeshMenuBar,
+    /// The bar-driven view controls (Reduce Motion + the role/health filters).
+    options: MeshViewOptions,
 }
 
 impl Default for MeshViewState {
@@ -234,6 +247,8 @@ impl Default for MeshViewState {
             state: MeshState::default(),
             last_poll: None,
             badges: BadgeCache::default(),
+            menubar: MeshMenuBar::new(),
+            options: MeshViewOptions::default(),
         }
     }
 }
@@ -262,25 +277,38 @@ impl MeshViewState {
     /// [`brand::icons`](mde_theme::brand::icons) role badge over each node so its
     /// Workstation / Server / Lighthouse role reads at a glance (QBRAND-8).
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
-        let response = MeshView::new(&self.state).show(ui);
-        self.overlay_role_badges(ui, response.rect);
+        // MENUBAR-ALL: the shared top bar drives the view options (Reduce Motion,
+        // the role / health filters) and a manual Refresh — the one out-of-band
+        // command the surface owns, which forces the next snapshot re-poll.
+        if self.menubar.ui(ui, &self.state, &mut self.options) == Some(MeshOutcome::Refresh) {
+            self.last_poll = None;
+        }
+        // Paint (and badge) exactly the filtered projection, so the canvas, its
+        // layout, and the badge overlay all stay consistent under a filter.
+        let view = self.options.filter(&self.state);
+        let response = MeshView::new(&view)
+            .reduce_motion(self.options.reduce_motion)
+            .show(ui);
+        self.overlay_role_badges(ui, response.rect, &view);
     }
 
-    /// Overlay the health-tinted brand role badge on every node, pinned to the same
-    /// disc the widget painted (re-resolving the shared `layout::place` over the
-    /// widget's own [`MeshView::DEFAULT_MARGIN`], so the badge lands exactly on its
-    /// node). No nodes ⇒ nothing to badge (the widget already painted its honest
-    /// `EmptyState`). The badge sits as a pip at the disc's NE edge, sized to the
-    /// node's role radius. Reuses the QBRAND-2 icon raster + texture wrap (§6).
-    fn overlay_role_badges(&mut self, ui: &egui::Ui, area: Rect) {
-        if self.state.nodes.is_empty() {
+    /// Overlay the health-tinted brand role badge on every node of the painted
+    /// (post-filter) `state`, pinned to the same disc the widget painted
+    /// (re-resolving the shared `layout::place` over the widget's own
+    /// [`MeshView::DEFAULT_MARGIN`] against the SAME state the widget drew, so the
+    /// badge lands exactly on its node even under an active filter). No nodes ⇒
+    /// nothing to badge (the widget already painted its honest `EmptyState`). The
+    /// badge sits as a pip at the disc's NE edge, sized to the node's role radius.
+    /// Reuses the QBRAND-2 icon raster + texture wrap (§6).
+    fn overlay_role_badges(&mut self, ui: &egui::Ui, area: Rect, state: &MeshState) {
+        if state.nodes.is_empty() {
             return;
         }
-        let centres = layout::place(&self.state, area, MeshView::DEFAULT_MARGIN);
+        let centres = layout::place(state, area, MeshView::DEFAULT_MARGIN);
         let ctx = ui.ctx().clone();
         let painter = ui.painter_at(area);
         let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
-        for (node, centre) in self.state.nodes.iter().zip(&centres) {
+        for (node, centre) in state.nodes.iter().zip(&centres) {
             let icon = role_icon(node.role);
             let tint = health_tint(node.health);
             let Some(texture) = self.badges.texture(&ctx, icon, tint) else {
@@ -612,11 +640,22 @@ mod tests {
             {"hostname":"ws","overlay_ip":"10.42.0.21","presence":"idle","role":"workstation"}
           ],"network":{"leader":"srv"}}"#;
         let state = project(snap);
-        let srv = state.nodes.iter().find(|n| n.id == "srv").expect("server node");
+        let srv = state
+            .nodes
+            .iter()
+            .find(|n| n.id == "srv")
+            .expect("server node");
         assert_eq!(srv.role, Role::Server);
         assert_eq!(srv.version.as_deref(), Some("12.0.0"));
-        let ws = state.nodes.iter().find(|n| n.id == "ws").expect("workstation");
-        assert_eq!(ws.version, None, "absent version stays None (honest placeholder)");
+        let ws = state
+            .nodes
+            .iter()
+            .find(|n| n.id == "ws")
+            .expect("workstation");
+        assert_eq!(
+            ws.version, None,
+            "absent version stays None (honest placeholder)"
+        );
         assert!(!ws.stale);
     }
 
