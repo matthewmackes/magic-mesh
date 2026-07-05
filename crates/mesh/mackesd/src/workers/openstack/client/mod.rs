@@ -43,7 +43,7 @@ pub(crate) mod testkit;
 
 use std::sync::Arc;
 
-use mackes_mesh_types::openstack::{ServiceCatalog, ServiceHealth};
+use mackes_mesh_types::openstack::{ResourceTable, ServiceCatalog, ServiceHealth};
 
 use config::CloudConfig;
 use health::{probe_service_health, EndpointProbe, HttpProbe};
@@ -108,6 +108,40 @@ pub trait CatalogSource {
     /// gate); a typed [`ClientError`] on a config/auth/transport failure.
     fn catalog_and_health(&self) -> Result<CatalogHealth, ClientError>;
 }
+
+/// The seam the IAC-3 `action/cloud/list-resources` verb drives to list one
+/// cataloged service's resources as the §6 [`ResourceTable`] the Resources tab
+/// renders.
+///
+/// Lists `servers`/`networks`/`stacks`/… . Production: [`LiveOpenStack`]
+/// (authenticate → the REST `list` seam → parse); tests inject
+/// [`testkit::FakeCatalogSource`].
+pub trait ResourceSource {
+    /// List the `collection` of `service_type`, applying `query` filters, into a
+    /// typed [`ResourceTable`].
+    ///
+    /// # Errors
+    /// [`ClientError::Unconfigured`] when no `clouds.yaml` exists (an honest
+    /// gate); a typed [`ClientError`] on a config/auth/transport failure or an
+    /// unparseable (non-list) response — never a fabricated table (§7).
+    fn list_resources(
+        &self,
+        service_type: &str,
+        collection: &str,
+        query: &[(String, String)],
+    ) -> Result<ResourceTable, ClientError>;
+}
+
+/// The unified `OpenStack` client seam the cloud-verb responder ([`super::verbs`])
+/// drives — the catalog+health read **and** the per-service resource list as one
+/// injected object.
+///
+/// A single seam threads the drain (IAC-1's §6 glue). Blanket-implemented for
+/// anything that is both a [`CatalogSource`] and a [`ResourceSource`]: production
+/// [`LiveOpenStack`], tests [`testkit::FakeCatalogSource`].
+pub trait CloudClient: CatalogSource + ResourceSource + Send + Sync {}
+
+impl<T: CatalogSource + ResourceSource + Send + Sync> CloudClient for T {}
 
 /// The composed client: a resolved [`CloudConfig`] + the auth & probe seams.
 ///
@@ -179,6 +213,38 @@ impl CatalogSource for OpenStackClient {
     }
 }
 
+impl ResourceSource for OpenStackClient {
+    fn list_resources(
+        &self,
+        service_type: &str,
+        collection: &str,
+        query: &[(String, String)],
+    ) -> Result<ResourceTable, ClientError> {
+        let session = self.authenticate()?;
+        let req = ResourceRequest {
+            verb: Verb::List,
+            target: ResourceRef {
+                service_type: service_type.to_string(),
+                collection: collection.to_string(),
+                id: None,
+            },
+            body: None,
+            query: query.to_vec(),
+        };
+        let resp = self.resource_api().call(&session, &req)?;
+        if !resp.is_success() {
+            // A non-2xx (a wrong endpoint / an API error) is honest transport
+            // failure — never parsed into a fake-empty table (§7).
+            return Err(ClientError::Transport(format!(
+                "HTTP {} listing {service_type}/{collection}",
+                resp.status
+            )));
+        }
+        ResourceTable::from_collection_json(service_type, collection, &resp.body)
+            .map_err(|e| ClientError::Catalog(e.to_string()))
+    }
+}
+
 /// The production [`CatalogSource`].
 ///
 /// Loads the standard `clouds.yaml` **on each call** (so a node that gets its
@@ -195,9 +261,10 @@ impl LiveOpenStack {
         Self
     }
 
-    /// Wrap it in an [`Arc`] for the worker seam.
+    /// Wrap it in an [`Arc`] for the worker seam — the unified [`CloudClient`]
+    /// (catalog + resource list).
     #[must_use]
-    pub fn shared() -> Arc<dyn CatalogSource + Send + Sync> {
+    pub fn shared() -> Arc<dyn CloudClient> {
         Arc::new(Self)
     }
 }
@@ -206,6 +273,18 @@ impl CatalogSource for LiveOpenStack {
     fn catalog_and_health(&self) -> Result<CatalogHealth, ClientError> {
         let config = config::load_default()?;
         OpenStackClient::live(config).catalog_and_health()
+    }
+}
+
+impl ResourceSource for LiveOpenStack {
+    fn list_resources(
+        &self,
+        service_type: &str,
+        collection: &str,
+        query: &[(String, String)],
+    ) -> Result<ResourceTable, ClientError> {
+        let config = config::load_default()?;
+        OpenStackClient::live(config).list_resources(service_type, collection, query)
     }
 }
 

@@ -54,12 +54,14 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 
-use mackes_mesh_types::openstack::{ServiceCatalog, ServiceHealth};
+use mackes_mesh_types::openstack::{
+    default_collection, ResourceTable, ServiceCatalog, ServiceHealth,
+};
 
 use crate::workers::proc::output_with_timeout;
 
 use super::catalog::ServiceKind;
-use super::client::{CatalogHealth, CatalogSource};
+use super::client::{CatalogHealth, CloudClient};
 use super::reconcile::{DoctrineStatus, OpenStackState, RuntimeStatus, ServiceRow, ServiceStatus};
 
 // ─────────────────────────── the verb vocabulary ───────────────────────────
@@ -74,11 +76,14 @@ pub const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
 /// `instance-*` lifecycle verbs are control-plane mutations and audit.
 ///
 /// IAC-1 added `get-catalog` — the Keystone service directory + per-service API
-/// health the `IaC` surface (IAC-2) consumes; a read, so audit-exempt.
-pub const CLOUD_VERBS: [&str; 8] = [
+/// health the `IaC` surface (IAC-2) consumes; a read, so audit-exempt. IAC-3
+/// added `list-resources` — one cataloged service's resource rows the Resources
+/// tab renders; also a read (`list-` stem), so audit-exempt.
+pub const CLOUD_VERBS: [&str; 9] = [
     "get-status",
     "get-catalog",
     "list-services",
+    "list-resources",
     "list-instances",
     "instance-start",
     "instance-stop",
@@ -374,6 +379,37 @@ pub fn parse_instance_request(body: &str) -> Result<InstanceRequest, String> {
     serde_json::from_str(trimmed).map_err(|e| format!("bad cloud request body: {e}"))
 }
 
+/// The typed request body for `list-resources` (IAC-3) — which service's
+/// resources to list.
+///
+/// `service` is the Keystone service **type** (`compute`/`network`/…, required);
+/// `collection` is the REST collection path (defaulted from the service type via
+/// [`default_collection`] when absent); `query` are list filters applied verbatim
+/// (the linked cross-service view passes e.g. `device_id=<instance>`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResourceListRequest {
+    /// The Keystone service type to list resources for.
+    pub service: String,
+    /// The collection path (`servers/detail`, `stacks`, …); defaulted from the
+    /// service type when empty/absent.
+    pub collection: Option<String>,
+    /// List filters (`[["status","ACTIVE"]]`), applied verbatim.
+    pub query: Vec<(String, String)>,
+}
+
+/// Parse a `list-resources` request body into a typed [`ResourceListRequest`].
+///
+/// # Errors
+/// A human-readable message when the body isn't valid request JSON.
+pub fn parse_resource_request(body: &str) -> Result<ResourceListRequest, String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Ok(ResourceListRequest::default());
+    }
+    serde_json::from_str(trimmed).map_err(|e| format!("bad resource request body: {e}"))
+}
+
 /// The unified typed reply published to `reply/<request-ulid>` for every
 /// `action/cloud/*` verb.
 ///
@@ -401,6 +437,9 @@ pub struct CloudReply {
     /// (IAC-1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<Vec<ServiceHealth>>,
+    /// `list-resources` — one cataloged service's resource table (IAC-3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<ResourceTable>,
     /// `list-instances` — the Nova instance roster.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instances: Option<Vec<CloudInstance>>,
@@ -428,6 +467,7 @@ impl CloudReply {
             services: None,
             catalog: None,
             health: None,
+            resources: None,
             instances: None,
             instance: None,
             gated: None,
@@ -461,6 +501,15 @@ impl CloudReply {
     pub fn services(verb: &str, services: Vec<ServiceRow>) -> Self {
         Self {
             services: Some(services),
+            ..Self::base(verb, true)
+        }
+    }
+
+    /// `list-resources` — one cataloged service's resource table (IAC-3).
+    #[must_use]
+    pub fn resources(verb: &str, table: ResourceTable) -> Self {
+        Self {
+            resources: Some(table),
             ..Self::base(verb, true)
         }
     }
@@ -596,7 +645,7 @@ pub fn handle_cloud_request(
     body: &str,
     state: &OpenStackState,
     ops: &dyn InstanceOps,
-    catalog_src: &dyn CatalogSource,
+    client: &dyn CloudClient,
 ) -> CloudReply {
     match verb {
         "get-status" => CloudReply::status(verb, state.clone()),
@@ -604,11 +653,16 @@ pub fn handle_cloud_request(
         // IAC-1 — the Keystone service directory + per-service API health. An
         // unconfigured node (no clouds.yaml) is an honest gate; an auth/transport
         // failure is a real failure — never a fabricated catalog (§7).
-        "get-catalog" => match catalog_src.catalog_and_health() {
+        "get-catalog" => match client.catalog_and_health() {
             Ok(ch) => CloudReply::catalog(verb, ch),
             Err(e) if e.is_unconfigured() => CloudReply::gated(verb, e.to_string()),
             Err(e) => CloudReply::failed(verb, e.to_string()),
         },
+        // IAC-3 — one cataloged service's resource rows (the Resources tab).
+        // Same client seam as get-catalog: an unconfigured node gates honestly, an
+        // auth/transport/parse failure is a real failure — never fabricated rows
+        // (§7). An empty table is a real "no resources", carried as an ok reply.
+        "list-resources" => handle_list_resources(verb, body, client),
         "list-instances" => match cloud_gate(state) {
             Err(reason) => CloudReply::gated(verb, reason),
             Ok(()) => match ops.list() {
@@ -665,12 +719,52 @@ fn handle_lifecycle(
     }
 }
 
+/// The `list-resources` leg of [`handle_cloud_request`]: parse the target
+/// service, default its collection from the service type, drive the client's
+/// resource-list seam, and answer honestly.
+///
+/// An unconfigured node gates (retry once the cloud is configured); an
+/// auth/transport/parse failure is a real failure; a service with no known
+/// collection is a typed rejection. An empty table is a real ok reply ("no
+/// resources"), never a fabricated row (§7).
+fn handle_list_resources(verb: &str, body: &str, client: &dyn CloudClient) -> CloudReply {
+    let req = match parse_resource_request(body) {
+        Ok(r) => r,
+        Err(e) => return CloudReply::rejected(verb, e),
+    };
+    let service = req.service.trim();
+    if service.is_empty() {
+        return CloudReply::rejected(
+            verb,
+            "a list-resources request requires a non-empty `service` (the Keystone service type)",
+        );
+    }
+    let collection = req
+        .collection
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string)
+        .or_else(|| default_collection(service).map(str::to_string));
+    let Some(collection) = collection else {
+        return CloudReply::rejected(
+            verb,
+            format!("no default resource collection for service `{service}` — pass an explicit `collection`"),
+        );
+    };
+    match client.list_resources(service, &collection, &req.query) {
+        Ok(table) => CloudReply::resources(verb, table),
+        Err(e) if e.is_unconfigured() => CloudReply::gated(verb, e.to_string()),
+        Err(e) => CloudReply::failed(verb, e.to_string()),
+    }
+}
+
 /// Drain net-new `action/cloud/*` requests and answer each on `reply/<ulid>`.
 ///
 /// Answers each net-new request since the per-verb cursors with a typed
-/// [`CloudReply`] over `state` + the `ops` seam. Best-effort — a read/write
-/// failure is logged and the cursor still advances (a stale request never
-/// re-answers, and a lifecycle op never re-performs).
+/// [`CloudReply`] over `state` + the `ops` seam + the `client` seam. Best-effort
+/// — a read/write failure is logged and the cursor still advances (a stale
+/// request never re-answers, and a lifecycle op never re-performs).
 ///
 /// Synchronous + seam-pure: the worker drives it on a blocking task (an
 /// `openstack` shell-out never pins the async runtime); tests drive it directly
@@ -680,7 +774,7 @@ pub fn drain_cloud_verbs(
     cursors: &mut BTreeMap<String, Option<String>>,
     state: &OpenStackState,
     ops: &dyn InstanceOps,
-    catalog_src: &dyn CatalogSource,
+    client: &dyn CloudClient,
 ) {
     for verb in CLOUD_VERBS {
         let topic = cloud_action_topic(verb);
@@ -695,7 +789,7 @@ pub fn drain_cloud_verbs(
         for msg in msgs {
             *cursor = Some(msg.ulid.clone());
             let body = msg.body.unwrap_or_default();
-            let reply = handle_cloud_request(verb, &body, state, ops, catalog_src);
+            let reply = handle_cloud_request(verb, &body, state, ops, client);
             if let Err(e) = persist.write(
                 &reply_topic(&msg.ulid),
                 Priority::Default,
@@ -759,7 +853,13 @@ mod tests {
     fn topics_are_namespaced_and_reads_are_audit_exempt() {
         assert_eq!(cloud_action_topic("get-status"), "action/cloud/get-status");
         // The read verbs carry the audit-exempt stem; the mutations audit.
-        for read in ["get-status", "list-services", "list-instances"] {
+        for read in [
+            "get-status",
+            "get-catalog",
+            "list-services",
+            "list-resources",
+            "list-instances",
+        ] {
             let t = cloud_action_topic(read);
             assert!(
                 !mde_bus::persist::is_auditable(&t),
@@ -888,6 +988,95 @@ mod tests {
         assert!(!reply.ok);
         assert!(reply.gated.is_none(), "a real auth failure is not a gate");
         assert!(reply.error.expect("error").contains("401"));
+    }
+
+    // ── IAC-3: list-resources drives the client seam / honest-degrades ──
+
+    fn sample_resource_table() -> ResourceTable {
+        ResourceTable::from_collection_json(
+            "compute",
+            "servers/detail",
+            r#"{"servers":[
+                {"id":"i-1","name":"web","status":"ACTIVE"},
+                {"id":"i-2","name":"db","status":"SHUTOFF"}
+            ]}"#,
+        )
+        .expect("fixture table")
+    }
+
+    #[test]
+    fn list_resources_returns_a_table_from_the_client() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        let cat = FakeCatalogSource::ok(ServiceCatalog::default(), vec![])
+            .with_resources(sample_resource_table());
+        // The service alone is enough — the collection defaults from the type.
+        let reply = handle_cloud_request(
+            "list-resources",
+            r#"{"service":"compute"}"#,
+            &state,
+            &ops,
+            &cat,
+        );
+        assert!(reply.ok);
+        let table = reply.resources.expect("resources");
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0].id, "i-1");
+        assert!(
+            ops.calls().is_empty(),
+            "list-resources never touches the instance CLI seam"
+        );
+    }
+
+    #[test]
+    fn list_resources_gates_honestly_when_unconfigured_and_fails_on_a_real_error() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        // No clouds.yaml → a gate (retry once configured), never fabricated rows.
+        let gated = handle_cloud_request(
+            "list-resources",
+            r#"{"service":"network"}"#,
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
+        assert!(!gated.ok && gated.resources.is_none());
+        assert!(gated.gated.expect("gated").contains("clouds.yaml"));
+        // A real transport failure is failed, not gated.
+        let failing = FakeCatalogSource::failing(
+            crate::workers::openstack::client::ClientError::Transport("HTTP 500".into()),
+        );
+        let reply = handle_cloud_request(
+            "list-resources",
+            r#"{"service":"network"}"#,
+            &state,
+            &ops,
+            &failing,
+        );
+        assert!(!reply.ok && reply.gated.is_none());
+        assert!(reply.error.expect("error").contains("500"));
+    }
+
+    #[test]
+    fn list_resources_rejects_a_missing_service_or_an_uncollectable_one() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        let cat = FakeCatalogSource::ok(ServiceCatalog::default(), vec![]);
+        // No service → rejected.
+        let bad = handle_cloud_request("list-resources", "{}", &state, &ops, &cat);
+        assert!(!bad.ok);
+        assert!(bad.error.expect("error").contains("service"));
+        // A service with no default collection + no explicit one → rejected
+        // (never a fabricated table).
+        let no_coll = handle_cloud_request(
+            "list-resources",
+            r#"{"service":"identity"}"#,
+            &state,
+            &ops,
+            &cat,
+        );
+        assert!(!no_coll.ok);
+        assert!(no_coll.error.expect("error").contains("collection"));
     }
 
     // ── list-instances drives the real seam / honest-gates ──

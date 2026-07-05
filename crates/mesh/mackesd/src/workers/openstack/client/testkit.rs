@@ -6,13 +6,13 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use mackes_mesh_types::openstack::{ProbeOutcome, ServiceCatalog, ServiceHealth};
+use mackes_mesh_types::openstack::{ProbeOutcome, ResourceTable, ServiceCatalog, ServiceHealth};
 
 use super::config::CloudConfig;
 use super::health::EndpointProbe;
 use super::keystone::{KeystoneAuth, Session};
 use super::resource::{ResourceApi, ResourceRequest, ResourceResponse};
-use super::{CatalogHealth, CatalogSource, ClientError};
+use super::{CatalogHealth, CatalogSource, ClientError, ResourceSource};
 
 /// An in-memory [`KeystoneAuth`]: answers a canned [`Session`] or a typed error.
 pub struct FakeKeystone {
@@ -168,40 +168,70 @@ impl ResourceApi for FakeResourceApi {
     }
 }
 
-/// An in-memory [`CatalogSource`] for the QC-11 `get-catalog` verb tests: a
-/// canned catalog+health, an honest unconfigured gate, or a typed failure.
+/// An in-memory [`CloudClient`](super::CloudClient) for the cloud-verb tests: a
+/// canned catalog+health (`get-catalog`) **and** a canned resource table
+/// (`list-resources`), an honest unconfigured gate, or a typed failure — one fake
+/// drives both seams the responder threads.
 pub struct FakeCatalogSource {
     result: Result<CatalogHealth, ClientError>,
+    resources: Result<ResourceTable, ClientError>,
 }
 
 impl FakeCatalogSource {
-    /// Answer `catalog` + `health` on every call.
+    /// Answer `catalog` + `health` on every `get-catalog`; an empty table on
+    /// every `list-resources` (override with [`Self::with_resources`]).
     #[must_use]
     pub fn ok(catalog: ServiceCatalog, health: Vec<ServiceHealth>) -> Self {
         Self {
             result: Ok(CatalogHealth { catalog, health }),
+            resources: Ok(ResourceTable::default()),
         }
     }
 
-    /// Answer the honest "no clouds.yaml on this node" gate.
+    /// Answer the honest "no clouds.yaml on this node" gate on both seams.
     #[must_use]
     pub fn unconfigured() -> Self {
         Self {
             result: Err(ClientError::Unconfigured(
                 "test fake: no clouds.yaml".to_string(),
             )),
+            resources: Err(ClientError::Unconfigured(
+                "test fake: no clouds.yaml".to_string(),
+            )),
         }
     }
 
-    /// Answer a typed failure (auth/transport) — a real error, not a gate.
+    /// Answer a typed failure (auth/transport) on both seams — a real error, not
+    /// a gate.
     #[must_use]
     pub fn failing(err: ClientError) -> Self {
-        Self { result: Err(err) }
+        Self {
+            result: Err(err.clone()),
+            resources: Err(err),
+        }
+    }
+
+    /// Override the canned `list-resources` answer (a fixture resource table).
+    #[must_use]
+    pub fn with_resources(mut self, table: ResourceTable) -> Self {
+        self.resources = Ok(table);
+        self
     }
 }
 
 impl CatalogSource for FakeCatalogSource {
     fn catalog_and_health(&self) -> Result<CatalogHealth, ClientError> {
         self.result.clone()
+    }
+}
+
+impl ResourceSource for FakeCatalogSource {
+    fn list_resources(
+        &self,
+        _service_type: &str,
+        _collection: &str,
+        _query: &[(String, String)],
+    ) -> Result<ResourceTable, ClientError> {
+        self.resources.clone()
     }
 }

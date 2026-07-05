@@ -451,6 +451,270 @@ fn parse_version_document(body: &str) -> (Option<String>, Option<String>) {
     (version_id, microversion)
 }
 
+// ─────────────────────────── resource tables (IAC-3) ───────────────────────────
+
+/// The maximum number of value columns a resource table renders.
+///
+/// Enough to carry a resource's identifying + status fields without an unreadably
+/// wide table (the `id` rides [`ResourceRow::id`], not a column).
+pub const MAX_RESOURCE_COLUMNS: usize = 7;
+
+/// The default REST **collection path** the IAC Resources tab lists for a
+/// Keystone service **type**.
+///
+/// Appended to the service's catalog endpoint base (IAC-3 / design #10/#14).
+/// `None` for a service the tab doesn't drill in v1 (identity / placement /
+/// object-store / dns have no first-class row table yet) — honest, never a
+/// fabricated collection.
+///
+/// The version-segment choices track a standard **Kolla** catalog (Nova/Cinder/
+/// Heat advertise versioned endpoint bases, so the collection is bare; Neutron/
+/// Glance advertise unversioned bases, so the version rides the collection). A
+/// deployment whose catalog differs surfaces an honest HTTP error, never faked
+/// rows (§7) — the live path is tuned by the IAC-6 smoke.
+#[must_use]
+pub fn default_collection(service_type: &str) -> Option<&'static str> {
+    match service_type {
+        "compute" | "compute_legacy" => Some("servers/detail"),
+        "network" => Some("v2.0/networks"),
+        "image" => Some("v2/images"),
+        "volume" | "volumev2" | "volumev3" | "block-storage" | "block-store" => {
+            Some("volumes/detail")
+        }
+        "orchestration" | "cloudformation" => Some("stacks"),
+        _ => None,
+    }
+}
+
+/// A resource-list body couldn't be parsed into a table — the typed, honest
+/// failure (never a fabricated empty table when the shape is unrecognized, §7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceParseError(pub String);
+
+impl std::fmt::Display for ResourceParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "parsing the resource list failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for ResourceParseError {}
+
+/// One row in a per-service resource table (IAC-3).
+///
+/// `id` is the resource's `OpenStack` id — the stable selection + cross-link +
+/// arming key — and `cells` are the column values aligned to the table's
+/// [`ResourceTable::columns`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceRow {
+    /// The resource id (the row's stable key). Empty only when the API row
+    /// carried no scalar `id` (honest — never invented).
+    pub id: String,
+    /// The value cells, one per column in [`ResourceTable::columns`] order.
+    pub cells: Vec<String>,
+}
+
+/// A per-service resource table the IAC **Resources** tab renders (IAC-3).
+///
+/// The service type it lists, the collection queried, ordered column headers, and
+/// the rows. Honest: an empty `rows` means the service genuinely has no resources
+/// of this type — never a fabricated row (§7).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceTable {
+    /// The Keystone service type this table lists (`compute`, `network`, …).
+    pub service_type: String,
+    /// The REST collection path queried (`servers/detail`, `stacks`, …).
+    pub collection: String,
+    /// The value column headers, in render order (the raw API field keys).
+    pub columns: Vec<String>,
+    /// The resource rows.
+    pub rows: Vec<ResourceRow>,
+}
+
+impl ResourceTable {
+    /// Whether the table carries no rows (the service has no resources of this
+    /// type) — the honest "no resources" read.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The index of the column named `header`, if present.
+    #[must_use]
+    pub fn column_index(&self, header: &str) -> Option<usize> {
+        self.columns.iter().position(|c| c == header)
+    }
+
+    /// The index of the table's "name" column — the first of the common name
+    /// keys (`name` / `stack_name` / `display_name`) it carries, if any. Drives
+    /// the row's display label + typed-arming echo.
+    #[must_use]
+    pub fn name_column(&self) -> Option<usize> {
+        ["name", "stack_name", "display_name"]
+            .iter()
+            .find_map(|h| self.column_index(h))
+    }
+
+    /// The human label for `row` — its name-column cell when non-empty, else its
+    /// id (never blank when the row has an id). Used for the table label, the
+    /// linked view, and the typed-arming target.
+    #[must_use]
+    pub fn row_label<'a>(&self, row: &'a ResourceRow) -> &'a str {
+        self.name_column()
+            .and_then(|i| row.cells.get(i))
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&row.id)
+    }
+
+    /// Parse a standard `OpenStack` list-response `body` into a table for
+    /// `service_type` / `collection`.
+    ///
+    /// Locates the resource array (`OpenStack` wraps it under the collection's
+    /// key — `{"servers":[…]}` / `{"stacks":[…]}` / `{"networks":[…]}`), derives
+    /// ordered value columns from the rows' displayable scalar/reference fields
+    /// (name/status first, `id` + `links` excluded, capped at
+    /// [`MAX_RESOURCE_COLUMNS`]), and builds one [`ResourceRow`] each. An empty
+    /// array is a real empty table (honest "no resources"); a body with **no**
+    /// recognizable array is a [`ResourceParseError`] — so a wrong endpoint /
+    /// error body surfaces honestly rather than as fake-empty (§7).
+    ///
+    /// # Errors
+    /// [`ResourceParseError`] when the body isn't valid JSON or carries no
+    /// resource array.
+    pub fn from_collection_json(
+        service_type: &str,
+        collection: &str,
+        body: &str,
+    ) -> Result<Self, ResourceParseError> {
+        let value: serde_json::Value =
+            serde_json::from_str(body.trim()).map_err(|e| ResourceParseError(e.to_string()))?;
+        let rows_val = locate_resource_array(&value, collection).ok_or_else(|| {
+            ResourceParseError(format!(
+                "no resource array found for collection `{collection}`"
+            ))
+        })?;
+
+        // Ordered value columns: every displayable field seen across the rows,
+        // first-seen order, `id`/`links` excluded, name/status hoisted first,
+        // capped so the table stays readable.
+        let mut columns: Vec<String> = Vec::new();
+        for item in rows_val {
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
+            for (k, v) in obj {
+                if k == "id" || k == "ID" || k == "links" {
+                    continue;
+                }
+                if is_displayable(v) && !columns.iter().any(|c| c == k) {
+                    columns.push(k.clone());
+                }
+            }
+        }
+        order_resource_columns(&mut columns);
+        columns.truncate(MAX_RESOURCE_COLUMNS);
+
+        let rows = rows_val
+            .iter()
+            .filter_map(|item| {
+                let obj = item.as_object()?;
+                let id = obj
+                    .get("id")
+                    .or_else(|| obj.get("ID"))
+                    .and_then(display_scalar)
+                    .unwrap_or_default();
+                let cells = columns
+                    .iter()
+                    .map(|col| obj.get(col).map(display_value).unwrap_or_default())
+                    .collect();
+                Some(ResourceRow { id, cells })
+            })
+            .collect();
+
+        Ok(Self {
+            service_type: service_type.to_string(),
+            collection: collection.to_string(),
+            columns,
+            rows,
+        })
+    }
+}
+
+/// Locate the resource array inside a standard list response: the collection's
+/// first/last path segment key (`servers/detail` → `servers`; `v2.0/networks` →
+/// `networks`), else a top-level array, else the first array-valued field. `None`
+/// when the body carries no array (an error/HTML body → an honest parse failure).
+fn locate_resource_array<'a>(
+    value: &'a serde_json::Value,
+    collection: &str,
+) -> Option<&'a Vec<serde_json::Value>> {
+    let first = collection.split('/').next().unwrap_or(collection);
+    let last = collection.rsplit('/').next().unwrap_or(collection);
+    for key in [first, last] {
+        if let Some(arr) = value.get(key).and_then(|v| v.as_array()) {
+            return Some(arr);
+        }
+    }
+    if let Some(arr) = value.as_array() {
+        return Some(arr);
+    }
+    value.as_object()?.values().find_map(|v| v.as_array())
+}
+
+/// Whether a JSON value renders as a single table cell: a scalar, or a nested
+/// object that carries an `id`/`name` reference (a flavor/image ref). Arrays +
+/// bare nested objects are skipped (kept out of the columns, honest — not
+/// crammed into a cell).
+fn is_displayable(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::String(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::Bool(_) => true,
+        serde_json::Value::Object(o) => o.contains_key("id") || o.contains_key("name"),
+        _ => false,
+    }
+}
+
+/// Render a JSON value to a table cell: a scalar to its text, a reference object
+/// to its `name` (else `id`), anything else to empty (never a raw JSON blob).
+fn display_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Object(o) => o
+            .get("name")
+            .and_then(|x| x.as_str())
+            .or_else(|| o.get("id").and_then(|x| x.as_str()))
+            .unwrap_or_default()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Render a scalar JSON value to its text (for the row `id`); `None` for a
+/// non-scalar (an id is never a fabricated object).
+fn display_scalar(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Hoist the name column first and the status column second, preserving the
+/// first-seen order of the rest — so a table reads name · status · … regardless
+/// of the API's field order. Stable, so equal-priority columns keep insertion
+/// order.
+fn order_resource_columns(columns: &mut [String]) {
+    columns.sort_by_key(|c| match c.as_str() {
+        "name" | "stack_name" | "display_name" => 0u8,
+        "status" | "stack_status" | "state" | "power_state" => 1,
+        _ => 2,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,5 +955,122 @@ mod tests {
         // The `interface` serializes as the lowercase catalog token.
         assert!(hs.contains(r#""interface":"public""#));
         assert!(hs.contains(r#""state":"up""#));
+    }
+
+    // ─────────────────────────── resource tables (IAC-3) ───────────────────────────
+
+    #[test]
+    fn default_collection_covers_the_drillable_services_and_omits_the_rest() {
+        assert_eq!(default_collection("compute"), Some("servers/detail"));
+        assert_eq!(default_collection("network"), Some("v2.0/networks"));
+        assert_eq!(default_collection("image"), Some("v2/images"));
+        assert_eq!(default_collection("volumev3"), Some("volumes/detail"));
+        assert_eq!(default_collection("orchestration"), Some("stacks"));
+        // A service with no first-class row table degrades honestly (no collection).
+        assert_eq!(default_collection("identity"), None);
+        assert_eq!(default_collection("placement"), None);
+    }
+
+    #[test]
+    fn parses_a_nova_server_detail_list_into_a_table() {
+        // The real `GET /servers/detail` shape: id + name + status + reference
+        // objects (flavor/image) + a nested addresses object (skipped, honest).
+        let body = r#"{"servers":[
+            {"id":"i-1","name":"web","status":"ACTIVE",
+             "flavor":{"id":"m1.small","links":[]},
+             "image":{"id":"ubuntu-22"},
+             "addresses":{"flat":[{"addr":"10.0.0.5"}]},
+             "links":[{"rel":"self","href":"http://x"}]},
+            {"id":"i-2","name":"db","status":"SHUTOFF",
+             "flavor":{"id":"m1.large"}}
+        ]}"#;
+        let t =
+            ResourceTable::from_collection_json("compute", "servers/detail", body).expect("parse");
+        assert_eq!(t.service_type, "compute");
+        assert_eq!(t.rows.len(), 2);
+        // `id`/`links`/`addresses` are excluded; name + status lead the columns.
+        assert_eq!(t.columns.first().map(String::as_str), Some("name"));
+        assert_eq!(t.columns.get(1).map(String::as_str), Some("status"));
+        assert!(t.columns.iter().any(|c| c == "flavor"));
+        assert!(!t
+            .columns
+            .iter()
+            .any(|c| c == "id" || c == "links" || c == "addresses"));
+        // The row id rides ResourceRow::id (not a cell); a reference object renders
+        // its id.
+        assert_eq!(t.rows[0].id, "i-1");
+        let flavor_col = t.column_index("flavor").expect("flavor column");
+        assert_eq!(t.rows[0].cells[flavor_col], "m1.small");
+        // A missing cell (row 2 has no image) is empty, never guessed.
+        let image_col = t.column_index("image").expect("image column");
+        assert_eq!(t.rows[1].cells[image_col], "");
+        // The label prefers the name column.
+        assert_eq!(t.row_label(&t.rows[0]), "web");
+    }
+
+    #[test]
+    fn parses_a_heat_stack_list_with_stack_name_and_status() {
+        let body = r#"{"stacks":[
+            {"id":"s-1","stack_name":"mesh-net","stack_status":"CREATE_COMPLETE","creation_time":"2026-07-05T00:00:00Z"}
+        ]}"#;
+        let t =
+            ResourceTable::from_collection_json("orchestration", "stacks", body).expect("parse");
+        assert_eq!(t.rows.len(), 1);
+        // stack_name is the name column and leads; the label falls to it.
+        assert_eq!(t.name_column(), t.column_index("stack_name"));
+        assert_eq!(t.columns.first().map(String::as_str), Some("stack_name"));
+        assert_eq!(t.row_label(&t.rows[0]), "mesh-net");
+        assert_eq!(t.rows[0].id, "s-1");
+    }
+
+    #[test]
+    fn an_empty_array_is_an_honest_empty_table_and_a_bad_body_is_an_error() {
+        // An empty collection is a real empty table (honest "no resources").
+        let empty =
+            ResourceTable::from_collection_json("network", "v2.0/networks", r#"{"networks":[]}"#)
+                .expect("empty parses");
+        assert!(empty.is_empty());
+        assert!(empty.columns.is_empty());
+        // A body with no recognizable array (an error/HTML response) is a typed
+        // failure — never a fabricated empty table (§7).
+        assert!(ResourceTable::from_collection_json(
+            "network",
+            "v2.0/networks",
+            "<html>404</html>"
+        )
+        .is_err());
+        assert!(
+            ResourceTable::from_collection_json(
+                "compute",
+                "servers",
+                r#"{"itemNotFound":{"code":404}}"#
+            )
+            .is_err(),
+            "a 404 error object carries no array"
+        );
+    }
+
+    #[test]
+    fn a_row_label_falls_back_to_the_id_when_unnamed() {
+        // A collection whose rows carry no name column labels by id.
+        let body =
+            r#"{"floatingips":[{"id":"fip-1","status":"ACTIVE","floating_ip_address":"1.2.3.4"}]}"#;
+        let t = ResourceTable::from_collection_json("network", "v2.0/floatingips", body)
+            .expect("parse");
+        assert!(t.name_column().is_none());
+        assert_eq!(t.row_label(&t.rows[0]), "fip-1");
+    }
+
+    #[test]
+    fn a_resource_table_round_trips_json() {
+        let t = ResourceTable::from_collection_json(
+            "compute",
+            "servers/detail",
+            r#"{"servers":[{"id":"i-1","name":"web","status":"ACTIVE"}]}"#,
+        )
+        .unwrap();
+        let s = serde_json::to_string(&t).unwrap();
+        let back: ResourceTable = serde_json::from_str(&s).unwrap();
+        assert_eq!(t, back);
     }
 }

@@ -101,7 +101,7 @@ use super::nebula_supervisor::DEFAULT_OVERLAY_IP_PATH;
 use super::{ShutdownToken, Worker};
 
 use capacity::NodeCapacity;
-use client::{CatalogSource, LiveOpenStack};
+use client::{CloudClient, LiveOpenStack};
 use config_render::{render_cloud_bootstrap, render_fleet_heat_stack, OverlayBind};
 use fleet::{FleetStateSource, MeshFleetState};
 use podman::{PodmanCli, PodmanRunner, DEFAULT_KOLLA_CONFIG_ROOT};
@@ -262,8 +262,9 @@ pub struct OpenstackWorker {
     /// production: [`LiveOpenStack`], which loads `clouds.yaml` per call and
     /// gates honestly on an unconfigured node). `Arc` so the verb drain runs on
     /// a `spawn_blocking` thread (the auth + probe HTTP never pins the async
-    /// runtime) without borrowing `self`.
-    catalog: Arc<dyn CatalogSource + Send + Sync>,
+    /// runtime) without borrowing `self`. The unified [`CloudClient`] seam also
+    /// serves IAC-3's `list-resources` (one injected client, both verbs).
+    catalog: Arc<dyn CloudClient>,
     /// The Kolla config root ([`DEFAULT_KOLLA_CONFIG_ROOT`]; tests point it
     /// at a tempdir).
     config_root: PathBuf,
@@ -331,10 +332,10 @@ impl OpenstackWorker {
         self
     }
 
-    /// Inject the IAC-1 `OpenStack` client seam (tests — the `get-catalog`
-    /// responder; production defaults to [`LiveOpenStack`]).
+    /// Inject the IAC-1/IAC-3 `OpenStack` client seam (tests — the `get-catalog`
+    /// + `list-resources` responder; production defaults to [`LiveOpenStack`]).
     #[must_use]
-    pub fn with_catalog(mut self, catalog: Arc<dyn CatalogSource + Send + Sync>) -> Self {
+    pub fn with_catalog(mut self, catalog: Arc<dyn CloudClient>) -> Self {
         self.catalog = catalog;
         self
     }
