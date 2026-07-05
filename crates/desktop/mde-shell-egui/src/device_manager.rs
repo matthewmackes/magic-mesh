@@ -86,6 +86,23 @@
 //! may lose reach to this host" warning (#13). The §6 boundary holds — the wire is
 //! the shared [`mackes_mesh_types::device_control`] contract, not a `mackesd` dep.
 //!
+//! **DEVMGR-11 adds the non-PC host types (#6/#22)** — the rail lists more than
+//! mesh nodes: **Cloud/Nova instances** + **LAN-discovered hosts** (both read
+//! from the EXPLORER `state/units/<node>` Bus mirrors — Nova rides the QC
+//! `state/openstack` union the unit aggregator folds, LAN rides the EXPLORER-2
+//! scan — via a local wire mirror, never a daemon-crate link, §6), **paired
+//! phones** (the SEC-5/KDC `kdc-phones/<host>.json` replicated pairing rosters),
+//! and **`VyOS` / router appliances** (the `<host>/router-registry.json` mirror
+//! the router-registry worker writes). Each host type maps to a synthesized
+//! [`DeviceInventory`] carrying ONLY the categories its source can honestly
+//! answer (#22 — router → Network/System/Firmware, phone → Radios (Power +
+//! Sensors are explicitly unreported), Nova → virtio devices, LAN → the
+//! remotely-detectable NIC), never an empty category and never a fabricated
+//! device (§7): a shallow source renders an honest partial tree plus an explicit
+//! source note saying what is unreported and why. Privileged device ops
+//! (DEVMGR-8) stay mesh-node-only — a non-PC host's context menu honestly omits
+//! them (no mackesd on a phone/router/instance to drain the request).
+//!
 //! **DEVMGR-10 lands the By-node cross-fleet flatten (#3)** — the third
 //! [`ViewMode`] is now wired. Where By-type / By-connection re-group ONE host's
 //! devices, By-node re-roots the WHOLE fleet: every published host (via
@@ -127,6 +144,7 @@ use mde_egui::egui::{self, Id, RichText};
 use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
 use mde_egui::{field, muted_note, status_dot, ChipTone, StatusChip, Style};
 use mde_theme::brand;
+use serde::Deserialize;
 
 use crate::about;
 use crate::explorer::local_hostname;
@@ -390,14 +408,62 @@ fn host_freshness(published_at_ms: Option<u64>, now_ms: u64) -> HostFreshness {
     }
 }
 
+/// What kind of host a rail row represents (DEVMGR-11, #6): a mesh node with a
+/// published mackesd inventory, or one of the four non-PC sources — each mapping
+/// to its own inventory source (#22) and rendering only the categories that
+/// source can honestly answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostKind {
+    /// A mesh peer node (the DEVMGR-1 published `device-inventory/<host>.json`).
+    Node,
+    /// A Cloud / Nova compute instance (the EXPLORER `state/units` mirror — the
+    /// unit aggregator's fold of every node's QC `state/openstack` mirror).
+    Nova,
+    /// A paired phone (the SEC-5/KDC `kdc-phones/<host>.json` pairing rosters).
+    Phone,
+    /// A LAN-discovered off-mesh host (the EXPLORER-2 scan via `state/units`).
+    Lan,
+    /// A discovered `VyOS` / `EdgeOS` router appliance (`<host>/router-registry.json`).
+    Router,
+}
+
+impl HostKind {
+    /// Rail render order: mesh nodes first, then the non-PC sections (#6).
+    const ORDER: [Self; 5] = [Self::Node, Self::Nova, Self::Phone, Self::Lan, Self::Router];
+
+    /// The rail section header for this kind.
+    const fn section(self) -> &'static str {
+        match self {
+            Self::Node => "Mesh nodes",
+            Self::Nova => "Cloud instances",
+            Self::Phone => "Phones",
+            Self::Lan => "LAN hosts",
+            Self::Router => "Routers",
+        }
+    }
+
+    /// Whether privileged DEVMGR-8 device ops can route to this host — only a
+    /// mesh node runs the mackesd `device_control` worker that drains them (§7:
+    /// offering the verbs on a phone / router / instance would be a placebo).
+    const fn controllable(self) -> bool {
+        matches!(self, Self::Node)
+    }
+}
+
 /// One row in the host rail (#5) — a peer that may or may not have published an
 /// inventory. Carries just what the rail renders (name · freshness · the health
 /// badge counts), decoupled from the full [`DeviceInventory`] so an absent host
 /// (no published file) is still a first-class, selectable row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HostEntry {
-    /// The peer's short hostname (the rail key + the `read_inventory` stem).
+    /// The unique rail key. A mesh node's short hostname (the `read_inventory`
+    /// stem); a non-PC host's source-namespaced id (`cloud:…` / `phone:…` /
+    /// `lan:…` / `router:…`, DEVMGR-11) so kinds can never collide.
     host: String,
+    /// The human display name the rail renders (== `host` for a mesh node).
+    label: String,
+    /// Which host type this row is (DEVMGR-11, #6).
+    kind: HostKind,
     /// When this host last published (`None` = nothing published — an absent row).
     published_at_ms: Option<u64>,
     /// Device count in the newest snapshot (0 for an absent host).
@@ -411,6 +477,8 @@ impl HostEntry {
     fn from_inventory(inv: &DeviceInventory) -> Self {
         Self {
             host: inv.host.clone(),
+            label: inv.host.clone(),
+            kind: HostKind::Node,
             published_at_ms: Some(inv.published_at_ms),
             device_count: inv.device_count(),
             problem_count: inv.problem_count(),
@@ -422,9 +490,23 @@ impl HostEntry {
     fn absent(host: &str) -> Self {
         Self {
             host: host.to_string(),
+            label: host.to_string(),
+            kind: HostKind::Node,
             published_at_ms: None,
             device_count: 0,
             problem_count: 0,
+        }
+    }
+
+    /// A rail row for a non-PC host (DEVMGR-11) over its synthesized inventory.
+    fn non_pc(host: &NonPcHost) -> Self {
+        Self {
+            host: host.key.clone(),
+            label: host.inventory.host.clone(),
+            kind: host.kind,
+            published_at_ms: Some(host.inventory.published_at_ms),
+            device_count: host.inventory.device_count(),
+            problem_count: host.inventory.problem_count(),
         }
     }
 
@@ -452,6 +534,603 @@ fn build_rail(all: &[DeviceInventory], local: &str) -> Vec<HostEntry> {
         b_local.cmp(&a_local).then_with(|| a.host.cmp(&b.host))
     });
     entries
+}
+
+/// Append the DEVMGR-11 non-PC hosts to the mesh-node rail (#6): the node rows
+/// keep their local-first order, then each non-PC kind in [`HostKind::ORDER`]
+/// (Cloud → Phones → LAN → Routers), label-sorted within a kind. Pure, so the
+/// grouped rail model is tested without a substrate.
+fn merge_rail(mut nodes: Vec<HostEntry>, non_pc: &[NonPcHost]) -> Vec<HostEntry> {
+    for kind in HostKind::ORDER {
+        if kind == HostKind::Node {
+            continue;
+        }
+        let mut rows: Vec<HostEntry> = non_pc
+            .iter()
+            .filter(|h| h.kind == kind)
+            .map(HostEntry::non_pc)
+            .collect();
+        rows.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.host.cmp(&b.host)));
+        nodes.extend(rows);
+    }
+    nodes
+}
+
+// ──────────────── the DEVMGR-11 non-PC host sources (#6/#22) ─────────────────
+
+/// A non-PC rail host (DEVMGR-11): its unique rail key, kind, the synthesized
+/// honest-partial [`DeviceInventory`] (only the categories its source can
+/// answer, #22), and an explicit source note saying what is unreported (§7).
+#[derive(Debug, Clone, PartialEq)]
+struct NonPcHost {
+    /// The source-namespaced rail key (`cloud:…` / `phone:…` / `lan:…` /
+    /// `router:…`) — collision-proof against node hostnames.
+    key: String,
+    /// The host type.
+    kind: HostKind,
+    /// The honest partial tree (`inventory.host` carries the display name).
+    inventory: DeviceInventory,
+    /// The explicit unknowns note rendered under the header card (§7) — what
+    /// this source cannot report, never silently absent.
+    note: Option<String>,
+}
+
+/// The `state/units/<node>` Bus mirror prefix (the EXPLORER unit stream this
+/// surface reads Nova instances + LAN hosts from) — a local mirror of
+/// `mackesd::workers::unit_aggregator::state_topic` (§6: mirror the wire, never
+/// link the daemon crate; the explorer surface pins the same prefix).
+const UNITS_STATE_PREFIX: &str = "state/units/";
+
+/// The unit kinds this surface folds — a local mirror of the aggregator's
+/// `UnitKind` wire tokens. Unknown future kinds fail only that unit's parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UnitKindMirror {
+    /// An in-mesh peer — already on the rail via its published inventory.
+    Peer,
+    /// An off-mesh LAN host (EXPLORER-2 scan) → a [`HostKind::Lan`] row.
+    LanHost,
+    /// A Nova compute instance → a [`HostKind::Nova`] row.
+    Instance,
+    /// Cloud objects that are not hosts — not rail material.
+    Volume,
+    /// (see [`Self::Volume`])
+    Image,
+    /// (see [`Self::Volume`])
+    Network,
+}
+
+/// The Nova/Cinder detail block on an instance unit — a local mirror of the
+/// aggregator's `CloudDetail` (only the fields this surface renders). Every
+/// field optional: an unprobed fact stays `None` (§7).
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(default)]
+struct CloudDetailMirror {
+    /// Flavor name (`m1.small`).
+    flavor: Option<String>,
+    /// vCPU count from the flavor.
+    vcpus: Option<u32>,
+    /// RAM in MiB from the flavor.
+    ram_mb: Option<u64>,
+    /// Root-disk size in GiB from the flavor.
+    disk_gb: Option<u64>,
+    /// Nova status (`ACTIVE` / `SHUTOFF` / `ERROR`).
+    status: Option<String>,
+    /// Fixed IPs on the instance's ports.
+    fixed_ips: Vec<String>,
+    /// Floating IPs mapped onto it.
+    floating_ips: Vec<String>,
+    /// Neutron port ids.
+    ports: Vec<String>,
+    /// Creation timestamp (ISO), when reported.
+    created: Option<String>,
+}
+
+/// The enrichment block (EXPLORER-9 E5) — a local mirror of the aggregator's
+/// `Extras`; the LAN tree's honestly-detectable facts.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(default)]
+struct ExtrasMirror {
+    /// Reverse-DNS / mDNS name.
+    rdns: Option<String>,
+    /// Offline MAC-OUI vendor lookup.
+    oui_vendor: Option<String>,
+    /// Service/port fingerprint → type guess.
+    fingerprint: Option<String>,
+}
+
+/// One unit off the `state/units/<node>` mirror — the fields this surface folds
+/// (serde ignores the rest of the wire body).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct UnitMirror {
+    /// Stable source-namespaced id (`cloud:instance:<uuid>` / `lan:<ip>` …) —
+    /// reused as the rail key.
+    id: String,
+    /// The unit kind.
+    kind: UnitKindMirror,
+    /// Display name.
+    name: String,
+    /// Best-known address, when a source reported one.
+    #[serde(default)]
+    address: Option<String>,
+    /// Coarse health tier token (`healthy` / `degraded` / `critical` /
+    /// `unreachable` / `unknown`), when a real source reports one.
+    #[serde(default)]
+    health: Option<String>,
+    /// The Nova detail block on an instance.
+    #[serde(default)]
+    cloud: Option<CloudDetailMirror>,
+    /// The E5 enrichment block.
+    #[serde(default)]
+    extras: ExtrasMirror,
+    /// Most-recent observation, ms since the Unix epoch (the freshness source).
+    #[serde(default)]
+    last_seen_ms: u64,
+}
+
+/// The `state/units/<node>` body — the fields this surface reads.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(default)]
+struct UnitsStateMirror {
+    /// Every unit that node folded.
+    units: Vec<UnitMirror>,
+}
+
+/// Read every node's `state/units/<node>` mirror off the Bus spool and dedupe
+/// by unit id (latest `last_seen_ms` wins — every node folds the same fleet, so
+/// mirrors overlap). `None` / no spool reads empty — the honest solo-host state.
+/// The same `list_topics` + latest-body idiom the explorer surface uses.
+fn read_units(bus_root: Option<&Path>) -> Vec<UnitMirror> {
+    let Some(root) = bus_root else {
+        return Vec::new();
+    };
+    let Ok(persist) = Persist::open(root.to_path_buf()) else {
+        return Vec::new();
+    };
+    let topics = persist.list_topics().unwrap_or_default();
+    let mut by_id: std::collections::BTreeMap<String, UnitMirror> =
+        std::collections::BTreeMap::new();
+    for topic in topics.iter().filter(|t| t.starts_with(UNITS_STATE_PREFIX)) {
+        let latest = persist
+            .list_since(topic, None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|m| m.body)
+            .next_back();
+        let Some(body) = latest else { continue };
+        let Ok(state) = serde_json::from_str::<UnitsStateMirror>(&body) else {
+            continue;
+        };
+        for unit in state.units {
+            match by_id.get(&unit.id) {
+                Some(prev) if prev.last_seen_ms >= unit.last_seen_ms => {}
+                _ => {
+                    by_id.insert(unit.id.clone(), unit);
+                }
+            }
+        }
+    }
+    by_id.into_values().collect()
+}
+
+/// One paired phone off a `kdc-phones/<host>.json` roster — a local mirror of
+/// the mesh-shunt's `PublishedDevice` (§6: the wire is the replicated JSON).
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(default)]
+struct PhoneMirror {
+    /// KDE-Connect device id (stable across renames) — the rail key stem.
+    device_id: String,
+    /// The phone's human name.
+    device_name: String,
+    /// The phone's Nebula overlay IP, when the pairing host knows it.
+    overlay_ip: Option<String>,
+    /// The pinned cert fingerprint (empty ⇒ name-relay only).
+    fingerprint: String,
+    /// Unix-ms when the phone was paired (0 ⇒ unknown).
+    paired_at_ms: i64,
+}
+
+/// A `kdc-phones/<host>.json` roster body — the KDC-MESH-2 shape; the legacy
+/// pre-roster shape (a bare device array) is handled by [`read_phones`].
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(default)]
+struct PhoneRosterMirror {
+    /// The phones the publishing host paired (own-row authority).
+    devices: Vec<PhoneMirror>,
+}
+
+/// Read every host's replicated KDC pairing roster (`<root>/kdc-phones/*.json`),
+/// returning each phone with the hostname that paired it. Both file shapes
+/// parse (roster + the legacy bare array); junk files are skipped; phones seen
+/// from several hosts dedupe by device id (a pin-carrying row wins).
+fn read_phones(workgroup_root: &Path) -> Vec<(PhoneMirror, String)> {
+    let mut by_id: std::collections::BTreeMap<String, (PhoneMirror, String)> =
+        std::collections::BTreeMap::new();
+    let dir = workgroup_root.join("kdc-phones");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(host) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let Ok(data) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let devices = serde_json::from_str::<PhoneRosterMirror>(&data)
+            .map(|r| r.devices)
+            .or_else(|_| serde_json::from_str::<Vec<PhoneMirror>>(&data))
+            .unwrap_or_default();
+        for dev in devices {
+            if dev.device_id.is_empty() {
+                continue;
+            }
+            match by_id.get(&dev.device_id) {
+                // Keep the richer row: a pinned fingerprint beats a name-relay.
+                Some((prev, _)) if !prev.fingerprint.is_empty() || dev.fingerprint.is_empty() => {}
+                _ => {
+                    by_id.insert(dev.device_id.clone(), (dev, host.clone()));
+                }
+            }
+        }
+    }
+    by_id.into_values().collect()
+}
+
+/// One discovered router appliance off a `<host>/router-registry.json` mirror —
+/// a local mirror of the router-registry worker's `RouterEntry` (§6).
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[serde(default)]
+struct RouterMirror {
+    /// Gateway MAC — the stable id.
+    id: String,
+    /// Management IP.
+    ip: String,
+    /// The mesh node this appliance sits behind (`peer:<host>`).
+    node_id: String,
+    /// Fingerprinted vendor token (`edgeos` / `vyos` / `vyatta-unknown` /
+    /// `unknown`).
+    vendor: String,
+    /// First line of `show version` when managed + reachable; else empty.
+    version: String,
+    /// A sealed credential exists for this appliance.
+    managed: bool,
+    /// Discovered but no credential sealed yet (read-only surfacing).
+    needs_creds: bool,
+    /// This is a node's primary default-route appliance.
+    is_default: bool,
+}
+
+/// Read every node's router-registry mirror (`<root>/<host>/router-registry.json`),
+/// deduped by appliance id (several nodes behind one gateway publish the same
+/// MAC — the managed / versioned row wins, it carries strictly more facts).
+fn read_routers(workgroup_root: &Path) -> Vec<RouterMirror> {
+    let mut by_id: std::collections::BTreeMap<String, RouterMirror> =
+        std::collections::BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(workgroup_root) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path().join("router-registry.json");
+        let Ok(data) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(router) = serde_json::from_str::<RouterMirror>(&data) else {
+            continue;
+        };
+        if router.id.is_empty() {
+            continue;
+        }
+        let richer = |r: &RouterMirror| (r.managed, !r.version.is_empty());
+        match by_id.get(&router.id) {
+            Some(prev) if richer(prev) >= richer(&router) => {}
+            _ => {
+                by_id.insert(router.id.clone(), router);
+            }
+        }
+    }
+    by_id.into_values().collect()
+}
+
+/// Map a unit's health token onto an honest device status: a reported
+/// degraded/critical tier is a real problem (Code 10 with the real tier as the
+/// reason); `unreachable` is an honest [`Unknown`](DeviceStatus::Unknown); a
+/// healthy / absent / unrecognized tier stays plain-present (never a fabricated
+/// fault, §7).
+fn unit_status(health: Option<&str>) -> (DeviceStatus, Option<String>) {
+    match health {
+        Some(h @ ("degraded" | "critical")) => (
+            DeviceStatus::Degraded,
+            Some(format!("unit aggregator reports {h} health")),
+        ),
+        Some("unreachable") => (
+            DeviceStatus::Unknown,
+            Some("unreachable per the unit aggregator".to_string()),
+        ),
+        _ => (DeviceStatus::Ok, None),
+    }
+}
+
+/// An empty non-PC host summary — every field an honest `None` (§7); the
+/// builders fill only what their source actually reports.
+fn blank_summary() -> HostSummary {
+    HostSummary::default()
+}
+
+/// Synthesize the honest virtio tree for a Nova instance (#22 — "Nova →
+/// virtio devices"): one virtio network interface per reported fixed/floating
+/// IP (a Neutron port IS a virtio-net attachment on the QUASAR-CLOUD
+/// libvirt/QEMU plane) — falling back to bare port ids when no IP is mapped —
+/// plus the flavor's root disk as a virtio block device. vCPU / RAM flavor
+/// facts land in the header summary, not as fabricated devices. No reported
+/// detail ⇒ zero categories + an explicit note, never an invented tree (§7).
+fn nova_host(u: &UnitMirror) -> NonPcHost {
+    let cloud = u.cloud.clone().unwrap_or_default();
+    let (status, problem) = unit_status(u.health.as_deref());
+    let state_note = cloud
+        .status
+        .clone()
+        .map(|s| format!("instance status: {s}"));
+    let mut devices: Vec<DeviceRecord> = Vec::new();
+    let mut nic = |detail: String| {
+        let mut rec = DeviceRecord::new("virtio network interface", status);
+        rec.problem.clone_from(&problem);
+        rec.events.push(detail);
+        rec.events.extend(state_note.clone());
+        devices.push(rec);
+    };
+    for ip in &cloud.fixed_ips {
+        nic(format!("fixed IP {ip}"));
+    }
+    for ip in &cloud.floating_ips {
+        nic(format!("floating IP {ip}"));
+    }
+    if cloud.fixed_ips.is_empty() && cloud.floating_ips.is_empty() {
+        for port in &cloud.ports {
+            nic(format!("Neutron port {port}"));
+        }
+    }
+    if let Some(gb) = cloud.disk_gb {
+        let mut rec =
+            DeviceRecord::new(format!("virtio block device ({gb} GiB root disk)"), status);
+        rec.problem.clone_from(&problem);
+        if let Some(flavor) = &cloud.flavor {
+            rec.events.push(format!("flavor {flavor}"));
+        }
+        rec.events.extend(state_note.clone());
+        devices.push(rec);
+    }
+    let categories = if devices.is_empty() {
+        Vec::new()
+    } else {
+        vec![DeviceCategory {
+            key: "virtio".to_string(),
+            label: "Virtio devices".to_string(),
+            devices,
+        }]
+    };
+    let note = if categories.is_empty() {
+        Some(
+            "Nova has reported no attached-device detail for this instance yet \u{2014} \
+             no virtio tree is shown rather than an invented one."
+                .to_string(),
+        )
+    } else {
+        Some(
+            "A Nova instance shows its virtio devices (ports \u{2192} virtio-net, root disk \
+             \u{2192} virtio-blk); guest-internal hardware is unreported."
+                .to_string(),
+        )
+    };
+    NonPcHost {
+        key: u.id.clone(),
+        kind: HostKind::Nova,
+        inventory: DeviceInventory {
+            host: u.name.clone(),
+            published_at_ms: u.last_seen_ms,
+            summary: HostSummary {
+                cpu_count: cloud.vcpus,
+                mem_total_kb: cloud.ram_mb.map(|mb| mb.saturating_mul(1024)),
+                ..blank_summary()
+            },
+            tools: mackes_mesh_types::device_inventory::ToolAvailability::default(),
+            categories,
+        },
+        note,
+    }
+}
+
+/// Synthesize the honest tree for a paired phone (#22 — "phone → Power /
+/// Sensors / Radios"): the KDC pairing roster proves a network radio path only
+/// when the phone carries an overlay IP (it is dialable there), so **Radios**
+/// is the one category pairing state can honestly populate; Power + Sensors are
+/// explicitly unreported (the note says so), never fabricated or empty (§7).
+fn phone_host(p: &PhoneMirror, paired_on: &str) -> NonPcHost {
+    let mut categories = Vec::new();
+    if let Some(ip) = &p.overlay_ip {
+        let mut rec = DeviceRecord::new("Network radio (mesh overlay link)", DeviceStatus::Ok);
+        rec.events.push(format!("overlay IP {ip}"));
+        rec.events.push(format!("paired via {paired_on}"));
+        if !p.fingerprint.is_empty() {
+            rec.events
+                .push("certificate fingerprint pinned".to_string());
+        }
+        rec.events
+            .push("transport radio (Wi-Fi / cellular) unreported".to_string());
+        categories.push(DeviceCategory {
+            key: "radios".to_string(),
+            label: "Radios".to_string(),
+            devices: vec![rec],
+        });
+    }
+    let dialable = if p.overlay_ip.is_some() {
+        ""
+    } else {
+        " It has no overlay IP yet, so not even its radio link can be shown."
+    };
+    let note = format!(
+        "Paired via {paired_on} (KDC). Pairing state carries no battery or sensor telemetry \
+         \u{2014} Power and Sensors are unreported, not empty.{dialable}"
+    );
+    NonPcHost {
+        key: format!("phone:{}", p.device_id),
+        kind: HostKind::Phone,
+        inventory: DeviceInventory {
+            host: p.device_name.clone(),
+            published_at_ms: u64::try_from(p.paired_at_ms).unwrap_or(0),
+            summary: blank_summary(),
+            tools: mackes_mesh_types::device_inventory::ToolAvailability::default(),
+            categories,
+        },
+        note: Some(note),
+    }
+}
+
+/// Synthesize the honest tree for a LAN-discovered host (#22 — "LAN → what's
+/// remotely detectable"): the EXPLORER-2 scan observed exactly one thing — a
+/// network interface answering on the LAN — so **Network adapters** carries the
+/// observed NIC with its real facts (address, OUI vendor, reverse-DNS name,
+/// service fingerprint). Nothing else is detectable remotely, and the note says
+/// so (§7).
+fn lan_host(u: &UnitMirror) -> NonPcHost {
+    let (status, problem) = unit_status(u.health.as_deref());
+    let name = u.address.as_ref().map_or_else(
+        || "Observed network interface".to_string(),
+        |addr| format!("Observed network interface ({addr})"),
+    );
+    let mut rec = DeviceRecord::new(name, status);
+    rec.vendor.clone_from(&u.extras.oui_vendor);
+    rec.problem = problem;
+    if let Some(rdns) = &u.extras.rdns {
+        rec.events.push(format!("reverse-DNS name {rdns}"));
+    }
+    if let Some(fp) = &u.extras.fingerprint {
+        rec.events.push(format!("service fingerprint: {fp}"));
+    }
+    NonPcHost {
+        key: u.id.clone(),
+        kind: HostKind::Lan,
+        inventory: DeviceInventory {
+            host: u.name.clone(),
+            published_at_ms: u.last_seen_ms,
+            summary: blank_summary(),
+            tools: mackes_mesh_types::device_inventory::ToolAvailability::default(),
+            categories: vec![DeviceCategory::new(category::NETWORK_ADAPTERS, vec![rec])],
+        },
+        note: Some(
+            "An off-mesh LAN host \u{2014} only what the LAN scan can detect remotely is \
+             shown; its internal hardware is unreported."
+                .to_string(),
+        ),
+    }
+}
+
+/// The human platform label for a router vendor token.
+fn router_platform(vendor: &str) -> Option<&'static str> {
+    match vendor {
+        "edgeos" => Some("EdgeOS (Ubiquiti EdgeRouter)"),
+        "vyos" => Some("VyOS"),
+        "vyatta-unknown" => Some("Vyatta-family (unrecognized version)"),
+        _ => None,
+    }
+}
+
+/// Synthesize the honest tree for a discovered router appliance (#22 —
+/// "router → Network / System / Firmware"): **Network** carries the real
+/// management interface (IP + MAC + default-route fact); **System** the
+/// fingerprinted platform when one was recognized; **Firmware** the real
+/// `show version` line when the appliance is managed + reachable. An
+/// unfingerprinted platform / unreadable firmware is an absent category plus an
+/// explicit note (needs-creds), never a guess (§7).
+fn router_host(r: &RouterMirror) -> NonPcHost {
+    let mut categories = Vec::new();
+
+    let mut nic = DeviceRecord::new(format!("Gateway interface ({})", r.ip), DeviceStatus::Ok);
+    nic.events.push(format!("management IP {}", r.ip));
+    nic.events.push(format!("MAC {}", r.id));
+    if r.is_default {
+        nic.events
+            .push(format!("primary default route for {}", r.node_id));
+    }
+    categories.push(DeviceCategory::new(category::NETWORK_ADAPTERS, vec![nic]));
+
+    if let Some(platform) = router_platform(&r.vendor) {
+        let mut sys = DeviceRecord::new(format!("Router platform: {platform}"), DeviceStatus::Ok);
+        sys.events.push(format!("fingerprinted as {}", r.vendor));
+        categories.push(DeviceCategory {
+            key: "system".to_string(),
+            label: "System".to_string(),
+            devices: vec![sys],
+        });
+    }
+
+    if !r.version.is_empty() {
+        let fw = DeviceRecord::new(format!("Firmware: {}", r.version), DeviceStatus::Ok);
+        categories.push(DeviceCategory {
+            key: "firmware".to_string(),
+            label: "Firmware".to_string(),
+            devices: vec![fw],
+        });
+    }
+
+    let note = if r.needs_creds {
+        "Discovered, but no router credential is sealed \u{2014} firmware and configuration \
+         are unreadable until one is added (read-only surfacing)."
+            .to_string()
+    } else if r.version.is_empty() {
+        "The appliance has not answered `show version` yet \u{2014} Firmware is unreported, \
+         not empty."
+            .to_string()
+    } else {
+        "A router shows only what its management plane reports: Network, System and Firmware."
+            .to_string()
+    };
+    NonPcHost {
+        key: format!("router:{}", r.id),
+        kind: HostKind::Router,
+        inventory: DeviceInventory {
+            host: r.ip.clone(),
+            // RouterEntry carries no publish timestamp — an honest 0 reads as
+            // "stale / unknown age" in the rail, never a fabricated freshness.
+            published_at_ms: 0,
+            summary: blank_summary(),
+            tools: mackes_mesh_types::device_inventory::ToolAvailability::default(),
+            categories,
+        },
+        note: Some(note),
+    }
+}
+
+/// Gather every DEVMGR-11 non-PC host from its real source (#6).
+///
+/// Nova instances + LAN hosts come off the `state/units` Bus mirrors, phones
+/// off the replicated KDC pairing rosters, routers off the router-registry
+/// mirrors. Each maps through its pure builder to an honest partial tree
+/// (#22/§7).
+fn read_non_pc(workgroup_root: &Path, bus_root: Option<&Path>) -> Vec<NonPcHost> {
+    let mut out = Vec::new();
+    for unit in read_units(bus_root) {
+        match unit.kind {
+            UnitKindMirror::Instance => out.push(nova_host(&unit)),
+            UnitKindMirror::LanHost => out.push(lan_host(&unit)),
+            _ => {}
+        }
+    }
+    for (phone, paired_on) in read_phones(workgroup_root) {
+        out.push(phone_host(&phone, &paired_on));
+    }
+    for router in read_routers(workgroup_root) {
+        out.push(router_host(&router));
+    }
+    out
 }
 
 /// The About → Device-Manager surface state (DEVMGR-2..4). Holds the host rail
@@ -483,6 +1162,14 @@ pub(crate) struct DeviceManagerState {
     /// ([`build_node_tree`]) flattens. Refreshed on every read; the By-type /
     /// By-connection views read only [`Self::inventory`] and ignore it.
     all_inventories: Vec<DeviceInventory>,
+    /// The DEVMGR-11 non-PC hosts (#6) — Nova instances, paired phones, LAN
+    /// hosts, routers — each with its synthesized honest-partial tree (#22),
+    /// gathered from their real sources on every [`Self::refresh`].
+    non_pc: Vec<NonPcHost>,
+    /// The Bus spool the `state/units/<node>` mirrors are read from (DEVMGR-11)
+    /// — [`mde_bus::client_data_dir`] in production; tests point at a tempdir.
+    /// `None` reads no units (the honest no-Bus seat).
+    bus_root: Option<PathBuf>,
     /// Whether the inventory has been read at least once — the honest pre-poll
     /// gate (§7): a dim "reading…" before the first read, distinct from a
     /// read-but-empty host.
@@ -518,6 +1205,8 @@ impl Default for DeviceManagerState {
             hosts: Vec::new(),
             inventory: None,
             all_inventories: Vec::new(),
+            non_pc: Vec::new(),
+            bus_root: mde_bus::client_data_dir(),
             seen: false,
             last_poll: None,
             expanded: BTreeSet::new(),
@@ -542,13 +1231,46 @@ impl DeviceManagerState {
         // selected host's tree (found in the same set — no second file read), AND
         // the By-node cross-fleet flatten (which keeps the whole set, DEVMGR-10).
         let all = device_inventory::read_all(&self.workgroup_root);
-        self.hosts = build_rail(&all, &self.local_host);
+        // DEVMGR-11 — the non-PC hosts from their real sources (#6): the
+        // `state/units` mirrors (Nova + LAN), the KDC pairing rosters (phones),
+        // and the router-registry mirrors.
+        let non_pc = read_non_pc(&self.workgroup_root, self.bus_root.as_deref());
+        self.hosts = merge_rail(build_rail(&all, &self.local_host), &non_pc);
         self.inventory = all
             .iter()
             .find(|inv| inv.host == self.selected_host)
-            .cloned();
+            .cloned()
+            .or_else(|| {
+                // A non-PC selection resolves to its synthesized honest-partial
+                // tree (DEVMGR-11) — keyed on the namespaced rail key, so a node
+                // hostname can never shadow it.
+                non_pc
+                    .iter()
+                    .find(|h| h.key == self.selected_host)
+                    .map(|h| h.inventory.clone())
+            });
         self.all_inventories = all;
+        self.non_pc = non_pc;
         self.seen = true;
+    }
+
+    /// The kind of the currently selected host — [`HostKind::Node`] when the
+    /// selection is not on the rail (the pre-poll default is the local node).
+    fn selected_kind(&self) -> HostKind {
+        self.hosts
+            .iter()
+            .find(|h| h.host == self.selected_host)
+            .map_or(HostKind::Node, |h| h.kind)
+    }
+
+    /// The selected non-PC host's explicit-unknowns source note (DEVMGR-11, §7),
+    /// when one applies — rendered under the header card so a shallow tree says
+    /// what its source cannot report rather than looking silently sparse.
+    fn selected_note(&self) -> Option<&str> {
+        self.non_pc
+            .iter()
+            .find(|h| h.key == self.selected_host)
+            .and_then(|h| h.note.as_deref())
     }
 
     /// Switch the inspected host to `host` (a rail click, #5): the device drawer +
@@ -623,7 +1345,7 @@ impl DeviceManagerState {
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new("Mesh nodes")
+                        RichText::new("Hosts")
                             .color(Style::TEXT_DIM)
                             .size(Style::SMALL)
                             .strong(),
@@ -650,9 +1372,25 @@ impl DeviceManagerState {
                         if self.hosts.is_empty() {
                             muted_note(ui, "No nodes have published an inventory yet.");
                         }
+                        // DEVMGR-11 (#6): grouped by host kind — a section header
+                        // precedes each kind's rows (mesh nodes first, then the
+                        // non-PC sources), rendered only when the kind has rows.
+                        let mut last_kind: Option<HostKind> = None;
                         for entry in &self.hosts {
+                            if last_kind != Some(entry.kind) {
+                                if last_kind.is_some() {
+                                    ui.add_space(Style::SP_S);
+                                }
+                                ui.label(
+                                    RichText::new(entry.kind.section())
+                                        .color(Style::TEXT_DIM)
+                                        .size(Style::SMALL)
+                                        .strong(),
+                                );
+                                last_kind = Some(entry.kind);
+                            }
                             let is_sel = entry.host == selected;
-                            let is_local = entry.host == local;
+                            let is_local = entry.kind == HostKind::Node && entry.host == local;
                             if host_row(ui, entry, is_sel, is_local, now) {
                                 clicked = Some(entry.host.clone());
                             }
@@ -721,6 +1459,12 @@ impl DeviceManagerState {
                     // borrow is scoped closed (a plain `if let`) before `tree` runs.
                     if let Some(inv) = self.inventory.as_ref() {
                         header_card(ui, inv);
+                    }
+                    // DEVMGR-11 (§7): a non-PC host's explicit-unknowns note — what
+                    // its source cannot report — so a shallow tree never reads as
+                    // silently sparse.
+                    if let Some(note) = self.selected_note().map(str::to_string) {
+                        muted_note(ui, note);
                     }
                     ui.add_space(Style::SP_S);
                     // Only the tree grouping/nesting changes between view modes
@@ -988,15 +1732,24 @@ impl DeviceManagerState {
         let mut clicked: Option<DeviceSelection> = None;
         let mut action: Option<RowActionRequest> = None;
         let selected = self.selected.clone();
+        // DEVMGR-11 — privileged DEVMGR-8 verbs only reach a mesh node's mackesd;
+        // a non-PC host's rows honestly omit them (§7).
+        let allow_control = self.selected_kind().controllable();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let Some(inv) = self.inventory.as_ref() else {
                     return;
                 };
+                if inv.categories.is_empty() {
+                    // A source that could answer nothing yet (§7) — the note above
+                    // says why; never a fabricated tree.
+                    muted_note(ui, "No device detail is reported for this host.");
+                    return;
+                }
                 for cat in &inv.categories {
                     let open = self.expanded.contains(cat.key.as_str());
-                    let out = category_header(ui, cat, open, selected.as_ref());
+                    let out = category_header(ui, cat, open, selected.as_ref(), allow_control);
                     if out.header_clicked {
                         toggled = Some(cat.key.clone());
                     }
@@ -1163,6 +1916,22 @@ impl DeviceManagerState {
             target_host,
             typed: _,
         } = arming;
+        // DEVMGR-11 kind gate (§7): only a mesh node runs the device_control
+        // worker that drains these requests — a non-PC target (instance / phone /
+        // LAN host / router) is refused honestly, never a request that would sit
+        // in a dir nothing reads. (The context menu already omits the verbs for
+        // these hosts; this is the seam-level backstop.)
+        if !self.selected_kind().controllable() {
+            raise_toast(
+                "warning",
+                &format!(
+                    "{target_host} is not a mesh node \u{2014} device ops need the node-side \
+                     mesh worker, so {} was not dispatched",
+                    op.as_str()
+                ),
+            );
+            return;
+        }
         // Reachability gate (§7): a host that has published no inventory is offline /
         // never-seen — we can't route to it, so refuse honestly rather than write a
         // request that will never be drained.
@@ -1221,6 +1990,8 @@ impl DeviceManagerState {
         // Build an owned tree (clones the records) so the immutable inventory
         // borrow ends before the mutate-after-frame toggle/selection below.
         let tree = self.inventory.as_ref().map(build_connection_tree);
+        // DEVMGR-11 — same mesh-node-only gate as the by-type tree.
+        let allow_control = self.selected_kind().controllable();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1245,7 +2016,7 @@ impl DeviceManagerState {
                         let is_sel = selected
                             .as_ref()
                             .is_some_and(|s| s.matches(&node.category, dev));
-                        let out = device_row(ui, dev, &node.category, is_sel);
+                        let out = device_row(ui, dev, &node.category, is_sel, allow_control);
                         if out.clicked {
                             clicked = Some(DeviceSelection::of(&node.category, dev));
                         }
@@ -1256,7 +2027,7 @@ impl DeviceManagerState {
                         // A synthetic bus / controller branch — its devices nest
                         // beneath it (host \u{2192} bus \u{2192} device).
                         let open = self.expanded.contains(node.key.as_str());
-                        let out = conn_bus_header(ui, node, open, selected.as_ref());
+                        let out = conn_bus_header(ui, node, open, selected.as_ref(), allow_control);
                         if out.header_clicked {
                             toggled = Some(node.key.clone());
                         }
@@ -1805,6 +2576,7 @@ fn category_header(
     cat: &DeviceCategory,
     open: bool,
     selected: Option<&DeviceSelection>,
+    allow_control: bool,
 ) -> CategoryOutcome {
     let problems = cat.problem_count();
     let tone = if problems > 0 {
@@ -1825,7 +2597,7 @@ fn category_header(
         .show(ui, |ui| {
             for dev in &cat.devices {
                 let is_sel = selected.is_some_and(|s| s.matches(&cat.key, dev));
-                let out = device_row(ui, dev, &cat.key, is_sel);
+                let out = device_row(ui, dev, &cat.key, is_sel, allow_control);
                 if out.clicked {
                     clicked = Some(DeviceSelection::of(&cat.key, dev));
                 }
@@ -2066,6 +2838,7 @@ fn conn_bus_header(
     node: &ConnNode,
     open: bool,
     selected: Option<&DeviceSelection>,
+    allow_control: bool,
 ) -> CategoryOutcome {
     let problems = node.problem_count();
     let tone = if problems > 0 {
@@ -2087,7 +2860,7 @@ fn conn_bus_header(
             for child in &node.children {
                 if let Some(dev) = &child.device {
                     let is_sel = selected.is_some_and(|s| s.matches(&child.category, dev));
-                    let out = device_row(ui, dev, &child.category, is_sel);
+                    let out = device_row(ui, dev, &child.category, is_sel, allow_control);
                     if out.clicked {
                         clicked = Some(DeviceSelection::of(&child.category, dev));
                     }
@@ -2330,7 +3103,9 @@ fn node_host_header(
                     // the same key on a different host must not read as selected).
                     let is_sel =
                         is_selected_host && selected.is_some_and(|s| s.matches(&cat.key, dev));
-                    let out = device_row(ui, dev, &cat.key, is_sel);
+                    // By-node flattens published MESH-NODE inventories only
+                    // (DEVMGR-10), so the DEVMGR-8 verbs are always live here.
+                    let out = device_row(ui, dev, &cat.key, is_sel, true);
                     if out.clicked {
                         clicked = Some(DeviceSelection::of(&cat.key, dev));
                     }
@@ -2499,6 +3274,7 @@ fn device_context_menu(
     ui: &mut egui::Ui,
     category: &str,
     dev: &DeviceRecord,
+    allow_control: bool,
 ) -> Option<RowActionRequest> {
     let mut chosen: Option<RowActionRequest> = None;
     for action in DeviceAction::ALL {
@@ -2517,26 +3293,37 @@ fn device_context_menu(
         }
     }
     ui.separator();
-    // DEVMGR-8 — the privileged, node-side verbs (#12/#13/#14). Each arms first
-    // (type the device name) and dispatches to the RAIL-selected host's mackesd.
-    for op in DeviceControlOp::ALL {
-        if ui
-            .button(RichText::new(control_label(op)).color(Style::DANGER))
-            .clicked()
-        {
-            chosen = Some(RowActionRequest::Control {
-                op,
-                target: Box::new(device_target(category, dev)),
-            });
-            ui.close_menu();
+    if allow_control {
+        // DEVMGR-8 — the privileged, node-side verbs (#12/#13/#14). Each arms first
+        // (type the device name) and dispatches to the RAIL-selected host's mackesd.
+        for op in DeviceControlOp::ALL {
+            if ui
+                .button(RichText::new(control_label(op)).color(Style::DANGER))
+                .clicked()
+            {
+                chosen = Some(RowActionRequest::Control {
+                    op,
+                    target: Box::new(device_target(category, dev)),
+                });
+                ui.close_menu();
+            }
         }
+        ui.separator();
+        // Honest disclosure (§13): these run on the node itself, over the overlay.
+        muted_note(
+            ui,
+            "Enable/Disable, reload + rescan run on the node \u{2014} armed, audited.",
+        );
+    } else {
+        // DEVMGR-11 (§7) — a non-PC host (instance / phone / LAN / router) runs no
+        // mackesd device_control worker, so the privileged verbs are honestly
+        // ABSENT, not greyed placebos, with the reason disclosed.
+        muted_note(
+            ui,
+            "Enable/Disable + driver ops apply to mesh nodes only \u{2014} this host \
+             runs no mesh device-control worker.",
+        );
     }
-    ui.separator();
-    // Honest disclosure (§13): these run on the node itself, over the overlay.
-    muted_note(
-        ui,
-        "Enable/Disable, reload + rescan run on the node \u{2014} armed, audited.",
-    );
     chosen
 }
 
@@ -2568,7 +3355,13 @@ fn device_target(category: &str, dev: &DeviceRecord) -> DeviceTarget {
 /// device (#11), and the honest Linux reason from the schema, dimmed. Returns a
 /// [`RowOutcome`] — a left-click selection (open/toggle the drawer) and any
 /// context-menu action the operator chose for this device.
-fn device_row(ui: &mut egui::Ui, dev: &DeviceRecord, category: &str, selected: bool) -> RowOutcome {
+fn device_row(
+    ui: &mut egui::Ui,
+    dev: &DeviceRecord,
+    category: &str,
+    selected: bool,
+    allow_control: bool,
+) -> RowOutcome {
     let inner = ui
         .horizontal(|ui| {
             status_dot(ui, status_tone(dev.status));
@@ -2597,7 +3390,7 @@ fn device_row(ui: &mut egui::Ui, dev: &DeviceRecord, category: &str, selected: b
         .interact(egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     let mut action: Option<RowActionRequest> = None;
-    resp.context_menu(|ui| action = device_context_menu(ui, category, dev));
+    resp.context_menu(|ui| action = device_context_menu(ui, category, dev, allow_control));
     RowOutcome {
         clicked: resp.clicked(),
         action,
@@ -2956,7 +3749,7 @@ fn host_row(
             } else {
                 Style::TEXT
             };
-            let mut name = RichText::new(&entry.host)
+            let mut name = RichText::new(&entry.label)
                 .color(name_tone)
                 .size(Style::SMALL);
             if selected {
@@ -3104,6 +3897,8 @@ mod tests {
             // bare state (no refresh) is coherent; a `refresh` repopulates it.
             all_inventories: inv.iter().cloned().collect(),
             inventory: inv,
+            non_pc: Vec::new(),
+            bus_root: None,
             seen,
             last_poll: None,
             expanded: BTreeSet::new(),
@@ -3668,6 +4463,8 @@ mod tests {
         // Fresh + clean → OK green; fresh + a fault → danger red.
         let fresh_ok = HostEntry {
             host: "a".into(),
+            label: "a".into(),
+            kind: HostKind::Node,
             published_at_ms: Some(now - 1_000),
             device_count: 3,
             problem_count: 0,
@@ -3683,6 +4480,8 @@ mod tests {
         // health can't be trusted), even with no problems in the stale snapshot.
         let stale = HostEntry {
             host: "b".into(),
+            label: "b".into(),
+            kind: HostKind::Node,
             published_at_ms: Some(now - stale_ms - 1),
             device_count: 5,
             problem_count: 0,
@@ -3692,6 +4491,8 @@ mod tests {
         // A published-but-unknown-time snapshot (the schema's honest 0) reads stale.
         let unknown = HostEntry {
             host: "c".into(),
+            label: "c".into(),
+            kind: HostKind::Node,
             published_at_ms: Some(0),
             device_count: 1,
             problem_count: 0,
@@ -3721,6 +4522,8 @@ mod tests {
         // A stale host's hover is flagged honestly, with its real counts.
         let stale = HostEntry {
             host: "b".into(),
+            label: "b".into(),
+            kind: HostKind::Node,
             published_at_ms: Some(now - 600_000),
             device_count: 5,
             problem_count: 1,
@@ -4565,6 +5368,448 @@ mod tests {
         assert!(
             drive(&mut s) > 0,
             "by-node still renders the fleet despite an absent selection"
+        );
+    }
+
+    // ── DEVMGR-11: the non-PC host types (#6/#22) ─────────────────────────────
+
+    use super::{
+        lan_host, merge_rail, nova_host, phone_host, router_host, CloudDetailMirror, ExtrasMirror,
+        HostKind, PhoneMirror, RouterMirror, UnitKindMirror, UnitMirror,
+    };
+
+    /// A Nova instance unit as the `state/units` mirror reports it (EXPLORER-9
+    /// detail present).
+    fn nova_unit() -> UnitMirror {
+        UnitMirror {
+            id: "cloud:instance:0f3a".into(),
+            kind: UnitKindMirror::Instance,
+            name: "web-1".into(),
+            address: Some("10.0.0.5".into()),
+            health: None,
+            cloud: Some(CloudDetailMirror {
+                flavor: Some("m1.small".into()),
+                vcpus: Some(2),
+                ram_mb: Some(2048),
+                disk_gb: Some(20),
+                status: Some("ACTIVE".into()),
+                fixed_ips: vec!["10.0.0.5".into()],
+                floating_ips: vec!["203.0.113.9".into()],
+                ports: vec!["p-1".into()],
+                created: None,
+            }),
+            extras: ExtrasMirror::default(),
+            last_seen_ms: now_ms(),
+        }
+    }
+
+    /// A LAN-scan unit with the EXPLORER-9 enrichment facts.
+    fn lan_unit() -> UnitMirror {
+        UnitMirror {
+            id: "lan:192.168.1.50".into(),
+            kind: UnitKindMirror::LanHost,
+            name: "printer.local".into(),
+            address: Some("192.168.1.50".into()),
+            health: Some("degraded".into()),
+            cloud: None,
+            extras: ExtrasMirror {
+                rdns: Some("printer.local".into()),
+                oui_vendor: Some("Brother Industries".into()),
+                fingerprint: Some("ipp \u{2014} looks like a printer".into()),
+            },
+            last_seen_ms: now_ms(),
+        }
+    }
+
+    fn paired_phone() -> PhoneMirror {
+        PhoneMirror {
+            device_id: "abc123".into(),
+            device_name: "Pixel 8".into(),
+            overlay_ip: Some("10.42.0.7".into()),
+            fingerprint: "AA:BB:CC".into(),
+            paired_at_ms: 1_720_000_000_000,
+        }
+    }
+
+    fn edge_router() -> RouterMirror {
+        RouterMirror {
+            id: "aa:bb:cc:dd:ee:ff".into(),
+            ip: "172.20.0.1".into(),
+            node_id: "peer:eagle".into(),
+            vendor: "edgeos".into(),
+            version: "EdgeOS v2.0.9".into(),
+            managed: true,
+            needs_creds: false,
+            is_default: true,
+        }
+    }
+
+    #[test]
+    fn a_nova_instance_maps_to_a_virtio_only_tree_off_the_units_mirror() {
+        // #22 — "a Nova instance shows virtio devices": ports → virtio-net, the
+        // flavor's root disk → virtio-blk; vCPU/RAM land in the header summary,
+        // never as fabricated device rows; no other category is invented.
+        let h = nova_host(&nova_unit());
+        assert_eq!(h.kind, HostKind::Nova);
+        assert_eq!(h.key, "cloud:instance:0f3a");
+        assert_eq!(h.inventory.host, "web-1");
+        let keys: Vec<&str> = h
+            .inventory
+            .categories
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["virtio"], "exactly the virtio category");
+        let virtio = &h.inventory.categories[0];
+        assert_eq!(virtio.label, "Virtio devices");
+        assert!(!virtio.devices.is_empty(), "never an empty category (#22)");
+        // One NIC per reported IP (fixed + floating) + the root disk.
+        assert_eq!(virtio.devices.len(), 3);
+        assert!(virtio.devices[0]
+            .events
+            .iter()
+            .any(|e| e == "fixed IP 10.0.0.5"));
+        assert!(virtio.devices[1]
+            .events
+            .iter()
+            .any(|e| e == "floating IP 203.0.113.9"));
+        assert!(virtio.devices[2].name.contains("20 GiB root disk"));
+        assert!(virtio
+            .devices
+            .iter()
+            .all(|d| d.events.iter().any(|e| e == "instance status: ACTIVE")));
+        // Flavor facts ride the summary (real), the rest stays an honest None.
+        assert_eq!(h.inventory.summary.cpu_count, Some(2));
+        assert_eq!(h.inventory.summary.mem_total_kb, Some(2048 * 1024));
+        assert_eq!(h.inventory.summary.os, None, "guest OS is unreported");
+    }
+
+    #[test]
+    fn a_detailless_nova_instance_shows_no_fabricated_tree() {
+        // §7 — no reported Nova detail ⇒ zero categories + an explicit note,
+        // never an invented virtio tree.
+        let mut u = nova_unit();
+        u.cloud = None;
+        let h = nova_host(&u);
+        assert!(h.inventory.categories.is_empty());
+        assert!(h
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("no attached-device detail"));
+    }
+
+    #[test]
+    fn a_paired_phone_maps_to_radios_only_and_never_fabricates_power_or_sensors() {
+        // #22 — "phone → Power/Sensors/Radios": the KDC pairing roster can honestly
+        // answer only the network-radio path (the overlay IP proves it); Power +
+        // Sensors are explicitly unreported in the note, never invented or empty.
+        let h = phone_host(&paired_phone(), "eagle");
+        assert_eq!(h.kind, HostKind::Phone);
+        assert_eq!(h.key, "phone:abc123");
+        assert_eq!(h.inventory.host, "Pixel 8");
+        let keys: Vec<&str> = h
+            .inventory
+            .categories
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["radios"], "exactly the radios category");
+        let radio = &h.inventory.categories[0].devices[0];
+        assert!(radio.events.iter().any(|e| e == "overlay IP 10.42.0.7"));
+        assert!(radio.events.iter().any(|e| e == "paired via eagle"));
+        assert!(radio
+            .events
+            .iter()
+            .any(|e| e.contains("fingerprint pinned")));
+        assert!(radio.events.iter().any(|e| e.contains("unreported")));
+        let note = h.note.as_deref().unwrap();
+        assert!(note.contains("Power and Sensors are unreported"));
+
+        // No overlay IP ⇒ not even the radio link can be shown — zero categories,
+        // the note says why (§7), never a fabricated row.
+        let mut p = paired_phone();
+        p.overlay_ip = None;
+        let bare = phone_host(&p, "eagle");
+        assert!(bare.inventory.categories.is_empty());
+        assert!(bare.note.as_deref().unwrap().contains("no overlay IP"));
+    }
+
+    #[test]
+    fn a_lan_host_maps_to_the_observed_nic_with_only_detectable_facts() {
+        // #22 — "LAN → what's remotely detectable": one observed NIC carrying the
+        // scan's real facts (address, OUI vendor, rDNS, service fingerprint); a
+        // reported degraded health is an honest problem, not a guess.
+        let h = lan_host(&lan_unit());
+        assert_eq!(h.kind, HostKind::Lan);
+        assert_eq!(h.key, "lan:192.168.1.50");
+        let keys: Vec<&str> = h
+            .inventory
+            .categories
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert_eq!(keys, vec![category::NETWORK_ADAPTERS]);
+        let nic = &h.inventory.categories[0].devices[0];
+        assert!(nic.name.contains("192.168.1.50"));
+        assert_eq!(nic.vendor.as_deref(), Some("Brother Industries"));
+        assert!(nic.events.iter().any(|e| e.contains("printer.local")));
+        assert!(nic.events.iter().any(|e| e.contains("service fingerprint")));
+        assert_eq!(nic.status, DeviceStatus::Degraded);
+        assert!(nic.problem.as_deref().unwrap().contains("degraded"));
+    }
+
+    #[test]
+    fn a_router_maps_to_network_system_firmware_and_gates_what_it_cannot_read() {
+        // #22 — "router → Network/System/Firmware": a managed, fingerprinted
+        // appliance fills all three off real registry facts.
+        let h = router_host(&edge_router());
+        assert_eq!(h.kind, HostKind::Router);
+        assert_eq!(h.key, "router:aa:bb:cc:dd:ee:ff");
+        let keys: Vec<&str> = h
+            .inventory
+            .categories
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert_eq!(keys, vec![category::NETWORK_ADAPTERS, "system", "firmware"]);
+        let nic = &h.inventory.categories[0].devices[0];
+        assert!(nic.events.iter().any(|e| e == "MAC aa:bb:cc:dd:ee:ff"));
+        assert!(nic
+            .events
+            .iter()
+            .any(|e| e.contains("primary default route")));
+        assert!(h.inventory.categories[1].devices[0].name.contains("EdgeOS"));
+        assert!(h.inventory.categories[2].devices[0].name.contains("v2.0.9"));
+        for c in &h.inventory.categories {
+            assert!(!c.devices.is_empty(), "never an empty category (#22)");
+        }
+
+        // Unfingerprinted + credential-less ⇒ only the Network facts exist; System
+        // and Firmware are ABSENT (not fabricated), and the note names the gate.
+        let r = RouterMirror {
+            vendor: "unknown".into(),
+            version: String::new(),
+            managed: false,
+            needs_creds: true,
+            ..edge_router()
+        };
+        let bare = router_host(&r);
+        let keys: Vec<&str> = bare
+            .inventory
+            .categories
+            .iter()
+            .map(|c| c.key.as_str())
+            .collect();
+        assert_eq!(keys, vec![category::NETWORK_ADAPTERS]);
+        assert!(bare
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("no router credential"));
+    }
+
+    #[test]
+    fn the_rail_groups_host_kinds_in_order_with_collision_proof_keys() {
+        // #6 — the rail = mesh nodes first (local pinned), then Cloud → Phones →
+        // LAN → Routers; every non-PC key is source-namespaced so a node hostname
+        // can never shadow it.
+        let nodes = build_rail(&[host_inventory("laptop-mm")], "laptop-mm");
+        let non_pc = vec![
+            router_host(&edge_router()),
+            lan_host(&lan_unit()),
+            phone_host(&paired_phone(), "eagle"),
+            nova_host(&nova_unit()),
+        ];
+        let rail = merge_rail(nodes, &non_pc);
+        let kinds: Vec<HostKind> = rail.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                HostKind::Node,
+                HostKind::Nova,
+                HostKind::Phone,
+                HostKind::Lan,
+                HostKind::Router
+            ]
+        );
+        // Labels are the display names, keys the namespaced ids.
+        let phone = rail.iter().find(|e| e.kind == HostKind::Phone).unwrap();
+        assert_eq!(phone.label, "Pixel 8");
+        assert_eq!(phone.host, "phone:abc123");
+        // A router registry row carries no publish time — its freshness reads an
+        // honest Stale (unknown age), never a fabricated "fresh".
+        let router = rail.iter().find(|e| e.kind == HostKind::Router).unwrap();
+        assert_eq!(router.freshness(now_ms()), HostFreshness::Stale);
+        // The keys never collide.
+        let mut keys: Vec<&str> = rail.iter().map(|e| e.host.as_str()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), rail.len());
+    }
+
+    #[test]
+    fn refresh_folds_every_non_pc_source_and_selecting_one_loads_its_tree() {
+        // Each host type flows from its REAL source (#6): the `state/units/<node>`
+        // Bus mirror (Nova + LAN), the replicated `kdc-phones/<host>.json` roster
+        // (phones), and `<host>/router-registry.json` (routers) — end to end
+        // through `refresh`, selection, and a headless render.
+        use mde_bus::hooks::config::Priority;
+        use mde_bus::persist::Persist;
+
+        let scratch = ScratchRoot::new("nonpc");
+        scratch.publish("laptop-mm", now_ms());
+        // The KDC pairing roster eagle published.
+        let phones = scratch.path().join("kdc-phones");
+        std::fs::create_dir_all(&phones).unwrap();
+        std::fs::write(
+            phones.join("eagle.json"),
+            serde_json::json!({
+                "host_device_id": "h-eagle",
+                "host_overlay_ip": "10.42.0.2",
+                "devices": [{
+                    "device_id": "abc123",
+                    "device_name": "Pixel 8",
+                    "overlay_ip": "10.42.0.7",
+                    "fingerprint": "AA:BB:CC",
+                    "paired_at_ms": 1_720_000_000_000_i64,
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // The router-registry mirror eagle wrote.
+        let eagle_dir = scratch.path().join("eagle");
+        std::fs::create_dir_all(&eagle_dir).unwrap();
+        std::fs::write(
+            eagle_dir.join("router-registry.json"),
+            serde_json::json!({
+                "id": "aa:bb:cc:dd:ee:ff",
+                "ip": "172.20.0.1",
+                "node_id": "peer:eagle",
+                "vendor": "edgeos",
+                "version": "EdgeOS v2.0.9",
+                "managed": true,
+                "needs_creds": false,
+                "is_default": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // The units mirror on the Bus spool: an instance + a LAN host (+ a peer
+        // and a volume, which are NOT rail material and must be ignored).
+        let bus = scratch.path().join("bus");
+        let persist = Persist::open(bus.clone()).unwrap();
+        let body = serde_json::json!({
+            "host": "laptop-mm",
+            "units": [
+                {
+                    "id": "cloud:instance:0f3a", "kind": "instance", "name": "web-1",
+                    "reachability": {"where": "cloud_object", "node": "laptop-mm"},
+                    "cloud": {"vcpus": 2, "ram_mb": 2048, "disk_gb": 20,
+                               "status": "ACTIVE", "fixed_ips": ["10.0.0.5"]},
+                    "last_seen_ms": 5,
+                },
+                {
+                    "id": "lan:192.168.1.50", "kind": "lan_host", "name": "printer.local",
+                    "reachability": {"where": "on_lan"},
+                    "address": "192.168.1.50",
+                    "extras": {"oui_vendor": "Brother Industries"},
+                    "last_seen_ms": 5,
+                },
+                {"id": "peer:eagle", "kind": "peer", "name": "eagle",
+                 "reachability": {"where": "in_mesh"}},
+                {"id": "cloud:volume:v1", "kind": "volume", "name": "data",
+                 "reachability": {"where": "cloud_object", "node": "laptop-mm"}},
+            ],
+        })
+        .to_string();
+        persist
+            .write(
+                "state/units/laptop-mm",
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .unwrap();
+
+        let mut s = state_with(None, false);
+        s.workgroup_root = scratch.path().to_path_buf();
+        s.bus_root = Some(bus);
+        s.refresh();
+
+        let kind_of = |key: &str| s.hosts.iter().find(|e| e.host == key).map(|e| e.kind);
+        assert_eq!(kind_of("laptop-mm"), Some(HostKind::Node));
+        assert_eq!(kind_of("cloud:instance:0f3a"), Some(HostKind::Nova));
+        assert_eq!(kind_of("phone:abc123"), Some(HostKind::Phone));
+        assert_eq!(kind_of("lan:192.168.1.50"), Some(HostKind::Lan));
+        assert_eq!(kind_of("router:aa:bb:cc:dd:ee:ff"), Some(HostKind::Router));
+        assert_eq!(
+            kind_of("peer:eagle"),
+            None,
+            "a mesh peer unit is not rail material (it rails via its inventory)"
+        );
+
+        // Selecting the instance loads its synthesized virtio tree + source note.
+        s.select_host("cloud:instance:0f3a".to_string());
+        let inv = s.inventory.as_ref().expect("the non-PC tree loads");
+        assert_eq!(inv.host, "web-1");
+        assert_eq!(inv.categories.len(), 1);
+        assert_eq!(inv.categories[0].key, "virtio");
+        assert!(s.selected_note().unwrap().contains("virtio"));
+        assert!(drive(&mut s) > 0, "the non-PC tree renders headless");
+
+        // Selecting the phone renders its radios-only tree.
+        s.select_host("phone:abc123".to_string());
+        let inv = s.inventory.as_ref().unwrap();
+        assert_eq!(inv.host, "Pixel 8");
+        assert_eq!(inv.categories[0].key, "radios");
+        assert!(drive(&mut s) > 0, "the phone tree renders headless");
+    }
+
+    #[test]
+    fn non_pc_hosts_never_take_a_privileged_device_op() {
+        // §7 — only a mesh node runs the device_control worker; the kind gate is
+        // both a menu omission (controllable()) and a dispatch-seam backstop: an
+        // armed op against a phone writes NO request anywhere.
+        assert!(HostKind::Node.controllable());
+        for kind in [
+            HostKind::Nova,
+            HostKind::Phone,
+            HostKind::Lan,
+            HostKind::Router,
+        ] {
+            assert!(!kind.controllable(), "{kind:?} must not take device ops");
+        }
+
+        let scratch = ScratchRoot::new("nonpc-refuse");
+        let phones = scratch.path().join("kdc-phones");
+        std::fs::create_dir_all(&phones).unwrap();
+        std::fs::write(
+            phones.join("eagle.json"),
+            serde_json::json!({"devices": [{
+                "device_id": "abc123", "device_name": "Pixel 8",
+                "overlay_ip": "10.42.0.7", "paired_at_ms": 1_i64,
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        let mut s = state_with(None, true);
+        s.workgroup_root = scratch.path().to_path_buf();
+        s.refresh();
+        s.select_host("phone:abc123".to_string());
+        assert_eq!(s.selected_kind(), HostKind::Phone);
+
+        s.dispatch_control(DeviceArming {
+            op: DeviceControlOp::Disable,
+            target: DeviceTarget::new("Network radio (mesh overlay link)", "radios"),
+            target_host: "phone:abc123".into(),
+            typed: "Network radio (mesh overlay link)".into(),
+        });
+        assert!(
+            mackes_mesh_types::device_control::take_requests(scratch.path(), "phone:abc123")
+                .is_empty(),
+            "a non-node target must get no dispatched request"
         );
     }
 }
