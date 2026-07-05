@@ -3047,7 +3047,7 @@ Throwaway XCP-ng VMs on a dom0 (LAN-bridged, `172.20.x`) giving the shell's Desk
   **As** a member, **I want** a one-click SPICE console (mde-vdi-spice viewer) and automatic SSH key injection, **so that** getting into my instance is trivial (Q34/88).
   **Acceptance**:
     - [ ] console opens from the Cloud plane row; a launched instance accepts the member's mesh-derived SSH key
-- [>] **QC-14: VDI broker overlay on Nova.**
+- [✓] **QC-14: VDI broker overlay on Nova.** *(done: adf754f — session_broker learns action/vdi/place: DesktopSpec→select_flavor (capacity m1.* ladder) + vdi_metadata + build_vdi_template (OS::Nova::Server HOT) → NovaPlacementRequest carrying the QC-11 heat-create/update HeatRequest (consumes the PUBLIC verb only, openstack worker untouched); placed desktop folds into the SAME SessionRequest::Open the chooser renders (mde-vdi-rdp/vnc, no new render code); roaming=rebuild via heat-update (Q38, session_roaming untouched); LiveNovaPlacement IntegrationGated until a live Nova+Heat cloud. 34 session_broker + 3382 mackesd lib tests, clippy 0, no bin/mackesd.rs change (leader-gated topic drain).)*
   **As** a desktop user, **I want** the session-broker to place VDI desktops as Nova instances (flavor+metadata) while owning the display path/roaming/seat binding, **so that** one VM plane serves both worlds (Q33).
   **Acceptance**:
     - [ ] a VDI session boots via Nova and renders through the existing viewer path; roaming = rebuild per Q38
