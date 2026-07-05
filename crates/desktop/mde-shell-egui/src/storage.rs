@@ -1,4 +1,6 @@
-//! The **Storage** surface — `GParted`-authentic disk/partition management (E12-21).
+//! The **Storage** surface — `GParted`-authentic disk/partition management
+//! (E12-21), fronted as **"Local Cylinders"** (MENU-4: the operator's name for
+//! the platform's `GParted`, carried by the shared menu bar's `GParted` spine).
 //!
 //! The desktop half of the Workbench Storage plane
 //! (`docs/design/workbench-storage-plane.md`). Where the `mackesd` `storage`
@@ -54,6 +56,7 @@
 //! unit-tested directly; the only IO is `poll` (a `Persist` read) and `publish` (a
 //! `Persist` write — the same persist-first path `mde-bus publish` takes).
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -159,6 +162,16 @@ impl BlockDevice {
     fn free_mib(&self) -> u64 {
         let used: u64 = self.partitions.iter().map(|p| p.size_mib).sum();
         self.size_mib.saturating_sub(used)
+    }
+
+    /// The named partition's live row on this disk, or a typed reason — the
+    /// resize/move anchor (current size / start), mirroring the worker's own
+    /// resolution.
+    fn partition_named(&self, partition: &str) -> Result<&Partition, String> {
+        self.partitions
+            .iter()
+            .find(|p| p.name == partition)
+            .ok_or_else(|| format!("{partition} is not on {}.", self.name))
     }
 
     /// The advisory protection reason for this disk, derived from what the topology
@@ -346,8 +359,10 @@ impl Filesystem {
 
 /// One typed storage operation — the queue element (mirrors `storage::StorageOp`,
 /// internally tagged on `op` so the worker's `parse_request` accepts it verbatim).
-/// This surface stages the `GParted`-core set; grow/shrink/move stay worker-side ops
-/// for a follow-on (E12-22/23) rather than half-wiring a resize dialog here.
+/// This surface stages the `GParted`-core set plus resize (grow/shrink) + move
+/// (MENU-4 — the composer resolves the direction off the live partition size, the
+/// worker re-validates authoritatively); the remaining worker verbs (flags, LUKS,
+/// btrfs subvolumes) stay worker-side until their compose legs land (E12-22/23).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum StorageOp {
@@ -407,6 +422,29 @@ enum StorageOp {
         /// The partition device.
         partition: String,
     },
+    /// Grow a partition (+ its filesystem) to `new_size_mib` — mirrors the
+    /// worker's `Grow` (lock 5 `GParted` parity: resize is a first-class queue op).
+    Grow {
+        /// The partition device.
+        partition: String,
+        /// The target size (MiB), larger than current.
+        new_size_mib: u64,
+    },
+    /// Shrink a partition (+ its filesystem) to `new_size_mib` — mirrors `Shrink`.
+    Shrink {
+        /// The partition device.
+        partition: String,
+        /// The target size (MiB), smaller than current.
+        new_size_mib: u64,
+    },
+    /// Move a partition to a new start offset (rewrites data — slow) — mirrors
+    /// the worker's `Move`.
+    Move {
+        /// The partition device.
+        partition: String,
+        /// The new start offset (MiB from the disk head).
+        new_start_mib: u64,
+    },
 }
 
 impl StorageOp {
@@ -427,7 +465,10 @@ impl StorageOp {
             | Self::Format { partition, .. }
             | Self::SetLabel { partition, .. }
             | Self::Mount { partition, .. }
-            | Self::Unmount { partition } => Some(partition.as_str()),
+            | Self::Unmount { partition }
+            | Self::Grow { partition, .. }
+            | Self::Shrink { partition, .. }
+            | Self::Move { partition, .. } => Some(partition.as_str()),
             Self::CreateTable { .. } | Self::CreatePartition { .. } => None,
         }
     }
@@ -473,6 +514,18 @@ impl StorageOp {
                 mountpoint,
             } => format!("Mount {partition} at {mountpoint}"),
             Self::Unmount { partition } => format!("Unmount {partition}"),
+            Self::Grow {
+                partition,
+                new_size_mib,
+            } => format!("Grow {partition} to {new_size_mib} MiB"),
+            Self::Shrink {
+                partition,
+                new_size_mib,
+            } => format!("Shrink {partition} to {new_size_mib} MiB"),
+            Self::Move {
+                partition,
+                new_start_mib,
+            } => format!("Move {partition} to start {new_start_mib} MiB"),
         }
     }
 }
@@ -601,6 +654,29 @@ fn queue_target(ops: &[StorageOp], topo: &Topology) -> Result<String, String> {
     }
 }
 
+/// The `Apply` request a queue + typed arming echo authorize against `node`, or
+/// `None` while the gate is shut (empty queue, no single target disk, or an echo
+/// that doesn't match — lock 8). The ONE armed-apply decision both the inline
+/// Apply button and the Edit → Apply All Operations menu item share (§6), so the
+/// typed-confirm gate cannot fork. Pure — unit-tested directly.
+fn armed_apply_request(
+    node: &NodeStorage,
+    queue: &[StorageOp],
+    arming: &str,
+) -> Option<StorageRequest> {
+    if queue.is_empty() {
+        return None;
+    }
+    let target = queue_target(queue, &node.topology).ok()?;
+    (arming.trim() == target).then(|| StorageRequest::Apply {
+        armed_device: target,
+        staged: node.topology.clone(),
+        queue: StorageQueue {
+            ops: queue.to_vec(),
+        },
+    })
+}
+
 // ──────────────────────────── the compose form ────────────────────────────
 
 /// Which op the compose form builds.
@@ -613,6 +689,11 @@ enum OpKind {
     NewTable,
     /// Delete a partition.
     Delete,
+    /// Resize a partition (grow or shrink — the direction falls out of the new
+    /// size vs the current one, mirroring the worker's `Grow`/`Shrink` split).
+    Resize,
+    /// Move a partition to a new start offset.
+    Move,
     /// Format a partition.
     Format,
     /// Set a partition label.
@@ -625,10 +706,12 @@ enum OpKind {
 
 impl OpKind {
     /// Every op kind, in the composer's dropdown order.
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 9] = [
         Self::NewPartition,
         Self::NewTable,
         Self::Delete,
+        Self::Resize,
+        Self::Move,
         Self::Format,
         Self::SetLabel,
         Self::Mount,
@@ -641,6 +724,8 @@ impl OpKind {
             Self::NewPartition => "New partition",
             Self::NewTable => "New partition table",
             Self::Delete => "Delete partition",
+            Self::Resize => "Resize (grow / shrink)",
+            Self::Move => "Move",
             Self::Format => "Format",
             Self::SetLabel => "Set label",
             Self::Mount => "Mount",
@@ -652,7 +737,13 @@ impl OpKind {
     const fn is_partition_scoped(self) -> bool {
         matches!(
             self,
-            Self::Delete | Self::Format | Self::SetLabel | Self::Mount | Self::Unmount
+            Self::Delete
+                | Self::Resize
+                | Self::Move
+                | Self::Format
+                | Self::SetLabel
+                | Self::Mount
+                | Self::Unmount
         )
     }
 }
@@ -673,6 +764,8 @@ struct Compose {
     label: String,
     /// The mount point for Mount, raw text.
     mountpoint: String,
+    /// The new start offset (MiB) for Move, raw text.
+    new_start_mib: String,
     /// The table scheme for New partition table.
     table: PartTable,
 }
@@ -686,9 +779,12 @@ impl Compose {
         };
     }
 
-    /// Build the staged [`StorageOp`] against whole disk `device` (+ its free space
-    /// for a size default), or a human-readable validation message. Pure.
-    fn build(&self, device: &str, free_mib: u64) -> Result<StorageOp, String> {
+    /// Build the staged [`StorageOp`] against whole disk `dev` (its name, free
+    /// space, and — for resize/move — the target partition's current geometry),
+    /// or a human-readable validation message. Pure.
+    fn build(&self, dev: &BlockDevice) -> Result<StorageOp, String> {
+        let device = dev.name.as_str();
+        let free_mib = dev.free_mib();
         let need_partition = |p: &str| -> Result<String, String> {
             let p = p.trim();
             if p.is_empty() {
@@ -728,6 +824,8 @@ impl Compose {
             OpKind::Delete => Ok(StorageOp::DeletePartition {
                 partition: need_partition(&self.partition)?,
             }),
+            OpKind::Resize => self.build_resize(dev, need_partition(&self.partition)?),
+            OpKind::Move => self.build_move(dev, need_partition(&self.partition)?),
             OpKind::Format => Ok(StorageOp::Format {
                 partition: need_partition(&self.partition)?,
                 filesystem: self.fs.ok_or_else(|| "Pick a filesystem.".to_string())?,
@@ -757,6 +855,61 @@ impl Compose {
                 partition: need_partition(&self.partition)?,
             }),
         }
+    }
+
+    /// The Resize leg of [`Compose::build`]: the direction falls out of the new
+    /// size vs the target's current size (the worker's Grow/Shrink split), with
+    /// an advisory free-space check mirroring the worker's `InvalidResize` wall
+    /// (it re-checks authoritatively). Pure.
+    fn build_resize(&self, dev: &BlockDevice, partition: String) -> Result<StorageOp, String> {
+        let current = dev.partition_named(&partition)?.size_mib;
+        let new_size = self
+            .size_mib
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "New size (MiB) must be a whole number.".to_string())?;
+        if new_size == 0 {
+            return Err("New size (MiB) must be greater than 0.".to_string());
+        }
+        match new_size.cmp(&current) {
+            Ordering::Equal => Err(format!("{partition} is already {current} MiB.")),
+            Ordering::Greater => {
+                let growth = new_size - current;
+                let free_mib = dev.free_mib();
+                if growth > free_mib {
+                    return Err(format!(
+                        "Growing by {growth} MiB needs more than the {free_mib} MiB free on {}.",
+                        dev.name
+                    ));
+                }
+                Ok(StorageOp::Grow {
+                    partition,
+                    new_size_mib: new_size,
+                })
+            }
+            Ordering::Less => Ok(StorageOp::Shrink {
+                partition,
+                new_size_mib: new_size,
+            }),
+        }
+    }
+
+    /// The Move leg of [`Compose::build`]: a new start offset for the target
+    /// partition, refusing the no-op move. Pure.
+    fn build_move(&self, dev: &BlockDevice, partition: String) -> Result<StorageOp, String> {
+        let current = dev.partition_named(&partition)?.start_mib;
+        let new_start = self
+            .new_start_mib
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "New start (MiB) must be a whole number.".to_string())?;
+        if new_start == current {
+            return Err(format!("{partition} already starts at {current} MiB."));
+        }
+        Ok(StorageOp::Move {
+            partition,
+            new_start_mib: new_start,
+        })
     }
 
     /// The trimmed non-empty label, or `None`.
@@ -794,6 +947,10 @@ pub(crate) struct StorageState {
     last_error: Option<String>,
     /// The latest per-op progress for the selected node, folded from the lane.
     progress: Vec<StorageProgress>,
+    /// View → Device Rail: a left rail listing the selected peer's disks (MENU-4).
+    view_rail: bool,
+    /// View → Geometry / Cylinder Detail: the per-disk derived-geometry block.
+    view_geometry: bool,
     /// When the Bus was last polled (drives the fixed cadence).
     last_poll: Option<Instant>,
 }
@@ -812,6 +969,8 @@ impl Default for StorageState {
             arming: String::new(),
             last_error: None,
             progress: Vec::new(),
+            view_rail: false,
+            view_geometry: false,
             last_poll: None,
         }
     }
@@ -877,7 +1036,15 @@ impl StorageState {
             .as_ref()
             .is_none_or(|d| !devices.iter().any(|dev| &dev.name == d))
         {
-            self.selected_device = devices.first().map(|d| d.name.clone());
+            // Default to the first *unlocked* disk — staging against a protected
+            // one is advisory-walled everywhere, so a protected default would
+            // grey the whole Partition spine for no reason. Fall back to the
+            // first disk (still rendered honestly locked) when all are protected.
+            self.selected_device = devices
+                .iter()
+                .find(|d| d.protected_reason().is_none())
+                .or_else(|| devices.first())
+                .map(|d| d.name.clone());
             self.compose.reset();
         }
     }
@@ -910,15 +1077,38 @@ impl StorageState {
         self.ensure_selection();
     }
 
+    /// Switch the compose target disk — the ONE device-selection seam the inline
+    /// "Target … for staging" tap, the View rail, and the menu bar all drive (§6).
+    fn select_device(&mut self, name: &str) {
+        if self.selected_device.as_deref() == Some(name) {
+            return;
+        }
+        self.selected_device = Some(name.to_string());
+        self.compose.reset();
+        self.compose_error = None;
+    }
+
+    /// The Apply request the current queue + typed arming echo authorize, if any —
+    /// the Edit → Apply All Operations gate delegates to the same pure decision
+    /// the inline Apply button uses ([`armed_apply_request`], §6 one path).
+    fn armed_apply(&self) -> Option<StorageRequest> {
+        let node = self.selected()?;
+        armed_apply_request(node, &self.queue, &self.arming)
+    }
+
     /// Render the Storage surface's live content.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
-        // MENUBAR-ALL — the shared top bar (STORAGE). Its menus are mouse twins of the
-        // surface's own seams (§6, one path): **Peer** switches the active node (the
-        // picker), **Disk** refreshes its topology / clears the staged queue, and
-        // **Operation** jumps the compose form to any op — surfacing every advanced
-        // action (New table · Format · Delete · Mount · Unmount …) discoverably (the
-        // governing principle), each honestly gated to a selected target (§7). The
-        // bar's UPPERCASE display title replaces the old proportional heading.
+        // MENU-4 — the shared top bar, titled **Local Cylinders** (the operator's
+        // name for the platform's GParted). The spine mirrors GParted's own
+        // (Peer · Edit · View · Device · Partition · Help), every item the mouse
+        // twin of a real storage-plane seam (§6, one path): **Edit** owns the
+        // pending queue (undo / clear / the typed-armed Apply), **View** toggles
+        // the device rail + geometry detail, **Device** rescans + stages a new
+        // partition table, **Partition** stages every partition verb (new /
+        // delete / resize-move / format-to / mount-unmount / label) through the
+        // composer, whose queue only ever reaches a disk via the typed-arming
+        // Apply (lock 8). Each entry is honestly gated (§7): context-gated greys,
+        // absent omits — never a dead item.
         if let Some(action) = menubar::show(self, ui) {
             menubar::apply(self, action);
         }
@@ -956,11 +1146,59 @@ impl StorageState {
         ui.separator();
         ui.add_space(Style::SP_M);
 
+        // View → Device Rail: a GParted-style left rail of the selected peer's
+        // disks (each a tap on the ONE select_device seam), beside the main body.
+        if self.view_rail {
+            egui::SidePanel::left("storage-device-rail")
+                .resizable(false)
+                .default_width(Style::SP_XL * 5.0)
+                .show_inside(ui, |ui| self.show_device_rail(ui));
+        }
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 self.show_selected(ui);
             });
+    }
+
+    /// The View → Device Rail body: every disk on the selected peer, the staging
+    /// target highlighted, protected disks listed-but-locked (advisory, lock 7).
+    fn show_device_rail(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            RichText::new("Devices")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add_space(Style::SP_XS);
+        let devices = self.selected_devices();
+        if devices.is_empty() {
+            mde_egui::muted_note(ui, "No disks on this peer.");
+            return;
+        }
+        let mut pick: Option<String> = None;
+        for dev in &devices {
+            let locked = dev.protected_reason().is_some();
+            let is_sel = self.selected_device.as_deref() == Some(dev.name.as_str());
+            let text = RichText::new(format!(
+                "{} \u{00B7} {} GiB{}",
+                dev.name,
+                dev.size_mib / 1024,
+                if locked { " \u{1F512}" } else { "" }
+            ))
+            .size(Style::SMALL);
+            // A locked disk stays visible for orientation but can't become the
+            // staging target here — the same advisory wall the inline tap keeps.
+            if ui
+                .add_enabled(!locked, egui::SelectableLabel::new(is_sel, text))
+                .clicked()
+            {
+                pick = Some(dev.name.clone());
+            }
+        }
+        if let Some(name) = pick {
+            self.select_device(&name);
+        }
     }
 
     /// The honest empty state before any peer has published a storage mirror.
@@ -1086,16 +1324,19 @@ impl StorageState {
         let mut goto_instances = false;
 
         // Disks — segment bar + partition table + advisory locked rows.
+        let mut pick: Option<String> = None;
         for dev in devices {
             ui.group(|ui| {
                 show_disk(
                     ui,
                     dev,
                     self.selected_device.as_deref() == Some(dev.name.as_str()),
+                    self.view_geometry,
                     &mut goto_instances,
                 );
             });
-            // A tap on the disk header selects it as the compose target.
+            // A tap on the disk header selects it as the compose target (the same
+            // select_device seam the View rail + menu drive).
             ui.add_space(Style::SP_XS);
             let is_sel = self.selected_device.as_deref() == Some(dev.name.as_str());
             if dev.protected_reason().is_none()
@@ -1106,13 +1347,13 @@ impl StorageState {
                             .size(Style::SMALL),
                     )
                     .clicked()
-                && self.selected_device.as_deref() != Some(dev.name.as_str())
             {
-                self.selected_device = Some(dev.name.clone());
-                self.compose.reset();
-                self.compose_error = None;
+                pick = Some(dev.name.clone());
             }
             ui.add_space(Style::SP_S);
+        }
+        if let Some(name) = pick {
+            self.select_device(&name);
         }
 
         ui.separator();
@@ -1215,6 +1456,26 @@ impl StorageState {
         let _ = Persist::open(root.clone())
             .and_then(|p| p.write(TOAST_TOPIC, Priority::Default, None, Some(&body)));
     }
+
+    /// Help → Safety & arming posture: publish the surface's one-line safety
+    /// contract as an info toast on the shell's real notification lane — the same
+    /// persist-first [`TOAST_TOPIC`] path the deep-link rides, so even Help drives
+    /// a live seam (§7, the `IaC` Help idiom). Menu-gated on a Bus dir existing.
+    fn emit_safety_note(&self) {
+        let Some(root) = self.bus_root.as_ref() else {
+            return;
+        };
+        let body = serde_json::json!({
+            "severity": "info",
+            "source_host": self.local_host,
+            "flag": "STORAGE",
+            "headline": "Hard walls refuse root/boot/EFI, mesh-storage and in-use disks; \
+                         every apply is typed-armed to exactly one disk.",
+        })
+        .to_string();
+        let _ = Persist::open(root.clone())
+            .and_then(|p| p.write(TOAST_TOPIC, Priority::Default, None, Some(&body)));
+    }
 }
 
 /// The dock surface a running-VM/container wall routes to (free the guest there).
@@ -1282,8 +1543,15 @@ fn fs_tone(filesystem: Option<&str>) -> Color32 {
 }
 
 /// Render one disk: header (name / size / removable / table / lock), the segment
-/// bar, and the partition table. `is_target` marks the compose target.
-fn show_disk(ui: &mut egui::Ui, dev: &BlockDevice, is_target: bool, goto_instances: &mut bool) {
+/// bar, the optional derived-geometry detail (View → Geometry / Cylinder Detail),
+/// and the partition table. `is_target` marks the compose target.
+fn show_disk(
+    ui: &mut egui::Ui,
+    dev: &BlockDevice,
+    is_target: bool,
+    geometry: bool,
+    goto_instances: &mut bool,
+) {
     let protected = dev.protected_reason();
     ui.horizontal(|ui| {
         ui.label(
@@ -1328,6 +1596,16 @@ fn show_disk(ui: &mut egui::Ui, dev: &BlockDevice, is_target: bool, goto_instanc
     show_segment_bar(ui, dev);
     ui.add_space(Style::SP_XS);
 
+    // View → Geometry / Cylinder Detail — the derived legacy-geometry readout
+    // (the "Local Cylinders" identity), every figure computed from the published
+    // topology and labelled derived (§7 — no invented probe data).
+    if geometry {
+        for line in geometry_lines(dev) {
+            mde_egui::muted_note(ui, line);
+        }
+        ui.add_space(Style::SP_XS);
+    }
+
     // Partition table rows.
     if dev.partitions.is_empty() {
         mde_egui::muted_note(ui, "No partitions (unpartitioned free space).");
@@ -1353,6 +1631,38 @@ fn show_disk(ui: &mut egui::Ui, dev: &BlockDevice, is_target: bool, goto_instanc
             *goto_instances = true;
         }
     });
+}
+
+/// The logical sector size every derived-geometry figure assumes (the udev
+/// convention `fdisk` reports against).
+const SECTOR_BYTES: u64 = 512;
+/// Legacy CHS heads — the fdisk/DOS 255×63 translation every tool derives with.
+const CHS_HEADS: u64 = 255;
+/// Legacy CHS sectors-per-track (the other half of the 255×63 translation).
+const CHS_SECTORS: u64 = 63;
+
+/// The two derived-geometry readout lines for a disk (View → Geometry / Cylinder
+/// Detail): sectors + legacy CHS cylinders derived from the published size, and
+/// the table / partition / free-space rollup. Pure — unit-tested directly. Every
+/// figure is deterministic arithmetic over the worker's real topology, labelled
+/// derived (§7): the mirror carries no probed sector size, so the fdisk 512 B /
+/// 255×63 convention is stated, never passed off as hardware truth.
+fn geometry_lines(dev: &BlockDevice) -> [String; 2] {
+    let sectors = dev.size_mib * (1024 * 1024 / SECTOR_BYTES);
+    let cylinders = (dev.size_mib * 1024 * 1024) / (CHS_HEADS * CHS_SECTORS * SECTOR_BYTES);
+    [
+        format!(
+            "Geometry (derived @ {SECTOR_BYTES} B sectors): {sectors} sectors \u{00B7} \
+             {cylinders} cylinders (legacy CHS {CHS_HEADS}\u{00D7}{CHS_SECTORS})"
+        ),
+        format!(
+            "{} \u{00B7} {} partition(s) \u{00B7} {} MiB free of {} MiB",
+            dev.table.map_or("no table", PartTable::label),
+            dev.partitions.len(),
+            dev.free_mib(),
+            dev.size_mib
+        ),
+    ]
 }
 
 /// The `GParted`-style horizontal segment bar: one coloured segment per partition
@@ -1512,6 +1822,8 @@ fn show_compose(
         }
         OpKind::SetLabel => compose_text_field(ui, "Label", &mut compose.label),
         OpKind::Mount => compose_text_field(ui, "Mount point", &mut compose.mountpoint),
+        OpKind::Resize => compose_resize_fields(ui, compose, dev),
+        OpKind::Move => compose_move_fields(ui, compose, dev),
         OpKind::Delete | OpKind::Unmount => {}
     }
 
@@ -1525,10 +1837,43 @@ fn show_compose(
         .button(RichText::new("\u{FF0B} Stage").size(Style::SMALL))
         .clicked()
     {
-        match compose.build(&dev.name, dev.free_mib()) {
+        match compose.build(dev) {
             Ok(op) => *staged = Some(op),
             Err(e) => *error = Some(e),
         }
+    }
+}
+
+/// The Resize context fields: the new-size entry plus the live current-size /
+/// free-space anchor for the chosen partition (new-vs-current decides the
+/// grow-vs-shrink direction, so the anchor keeps it legible).
+fn compose_resize_fields(ui: &mut egui::Ui, compose: &mut Compose, dev: &BlockDevice) {
+    compose_text_field(ui, "New size (MiB)", &mut compose.size_mib);
+    if let Some(p) = dev.partitions.iter().find(|p| p.name == compose.partition) {
+        mde_egui::muted_note(
+            ui,
+            format!(
+                "(currently {} MiB; {} MiB free on {} to grow into)",
+                p.size_mib,
+                dev.free_mib(),
+                dev.name
+            ),
+        );
+    }
+}
+
+/// The Move context fields: the new-start entry plus the live current-start
+/// anchor for the chosen partition.
+fn compose_move_fields(ui: &mut egui::Ui, compose: &mut Compose, dev: &BlockDevice) {
+    compose_text_field(ui, "New start (MiB)", &mut compose.new_start_mib);
+    if let Some(p) = dev.partitions.iter().find(|p| p.name == compose.partition) {
+        mde_egui::muted_note(
+            ui,
+            format!(
+                "(currently starts at {} MiB; data is rewritten \u{2014} slow)",
+                p.start_mib
+            ),
+        );
     }
 }
 
@@ -1700,10 +2045,12 @@ fn show_queue_and_apply(
                         .desired_width(Style::SP_XL * 5.0),
                 );
                 ui.add_space(Style::SP_S);
-                let armed = arming.trim() == target;
+                // The same pure decision the Edit → Apply All menu item gates on
+                // (§6 one path): a request exists only when the echo matches.
+                let request = armed_apply_request(node, queue, arming);
                 if ui
                     .add_enabled(
-                        armed,
+                        request.is_some(),
                         egui::Button::new(RichText::new("Apply").size(Style::SMALL)),
                     )
                     .on_hover_text(
@@ -1712,11 +2059,7 @@ fn show_queue_and_apply(
                     )
                     .clicked()
                 {
-                    *apply = Some(StorageRequest::Apply {
-                        armed_device: target,
-                        staged: node.topology.clone(),
-                        queue: StorageQueue { ops: queue.clone() },
-                    });
+                    *apply = request;
                 }
             });
             ui.add_space(Style::SP_XS);
@@ -1779,20 +2122,29 @@ fn show_progress(ui: &mut egui::Ui, progress: &[StorageProgress], goto_instances
     }
 }
 
-/// MENUBAR-ALL (Storage) — the shared top bar over the GParted-style surface.
+/// MENU-4 — the **Local Cylinders** bar: the platform's `GParted` spine over the
+/// storage plane.
 ///
-/// Every item is the mouse twin of a seam the surface already drives (§6, one path):
-/// **Peer** switches the active node ([`StorageState::select_node`], the picker's
-/// seam); **Disk → Refresh Topology** re-publishes the `Refresh` request the inline
-/// button sends, and **Clear Queue** drops the staged ops; **Operation** jumps the
-/// compose form's `kind` to any op — the governing principle's point, surfacing the
-/// advanced New-table / Format / Delete / Mount / Unmount ops discoverably. Each
-/// item is honestly gated (§7): Peer is present only when a peer has published,
-/// Refresh needs a selected node, Clear needs a non-empty queue, and Operation needs
-/// a selected disk — a context-gated item disables, an absent one is omitted, never
-/// a dead entry. The status cluster reads the live fleet rollup + queue depth.
+/// The spine mirrors `GParted`'s own menu order (app · Edit · View · Device ·
+/// Partition · Help), with **Peer** in the app slot (the mesh dimension `GParted`
+/// never had). Every item is the mouse twin of a seam the surface already drives
+/// (§6, one path): **Peer** switches the active node (`select_node`); **Edit**
+/// owns the pending queue — Undo Last / Clear All, and **Apply All Operations**,
+/// which shares the inline button's exact typed-arming decision
+/// ([`super::armed_apply_request`], lock 8) so the menu can never bypass the
+/// typed confirm; **View** toggles the device rail + derived-geometry detail;
+/// **Device** rescans the topology (`Refresh`) and stages a new partition table;
+/// **Partition** stages every partition verb (new / delete / resize-move /
+/// format-to‹fs› / mount-unmount / label) by jumping the composer — each staged
+/// op only ever reaches a disk through the typed-armed Apply; **Help** carries
+/// the surface identity and publishes the safety posture on the live toast lane.
+/// Each entry is honestly gated (§7): Peer omits itself until a peer publishes,
+/// destructive verbs grey without an unlocked target disk, Mount/Unmount grey
+/// without a partition in the matching state, Apply All greys until the echo is
+/// typed — never a dead entry. Chips: fleet rollup · peer health · the selected
+/// device · the pending-op count.
 mod menubar {
-    use super::{OpKind, StorageRequest, StorageState, DOT};
+    use super::{BlockDevice, Filesystem, OpKind, StorageRequest, StorageState, DOT};
     use mde_egui::egui::Ui;
     use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
     use mde_egui::{ChipTone, StatusChip, Style};
@@ -1804,21 +2156,35 @@ mod menubar {
         /// Switch the active peer (the picker's `select_node` seam).
         SelectPeer(String),
         /// Re-publish the selected peer's live topology (`StorageRequest::Refresh`).
-        RefreshTopology,
+        RescanDevices,
+        /// Pop the most recently staged op (`GParted`'s Undo Last Operation).
+        UndoLast,
         /// Drop the staged op queue + its arming echo.
         ClearQueue,
+        /// Publish the typed-armed Apply (enabled only while the echo matches).
+        ApplyAll,
+        /// Toggle the View → Device Rail.
+        ToggleRail,
+        /// Toggle the View → Geometry / Cylinder Detail.
+        ToggleGeometry,
         /// Jump the compose form to this op kind (its own dropdown seam).
         StageKind(OpKind),
+        /// Jump the compose form to Format with this filesystem preset
+        /// (`GParted`'s "Format to ›" submenu).
+        StageFormat(Filesystem),
+        /// Publish the safety-posture note on the toast lane (Help).
+        HelpSafety,
     }
 
-    /// Render the STORAGE bar and return the action picked this frame, if any.
+    /// Render the LOCAL CYLINDERS bar and return the action picked this frame.
     pub(super) fn show(state: &StorageState, ui: &mut Ui) -> Option<MenuAction> {
         let menus = build_menus(state);
         let status = build_status(state);
         let model = MenuBarModel {
-            // Storage sits in the dock's "System" group (gold), so the title wears
-            // that categorical accent (lock 2).
-            title: "Storage",
+            // The operator's name for the platform's GParted (MENU-4). Storage
+            // sits in the dock's "System" group (gold), so the title wears that
+            // categorical accent (lock 2).
+            title: "Local Cylinders",
             accent: Style::ACCENT_SYSTEM,
             menus: &menus,
             status: &status,
@@ -1826,10 +2192,18 @@ mod menubar {
         MenuBar::show(ui, &model)
     }
 
-    /// Build the menus from live state, each honestly gated (§7).
+    /// The selected disk's live row, if any.
+    fn selected_disk(state: &StorageState) -> Option<BlockDevice> {
+        let name = state.selected_device.as_deref()?;
+        state
+            .selected_devices()
+            .into_iter()
+            .find(|d| d.name == name)
+    }
+
+    /// Build the `GParted` spine from live state, each entry honestly gated (§7).
     fn build_menus(state: &StorageState) -> Vec<Menu<MenuAction>> {
         let mut menus = Vec::new();
-        let selected_node = state.selected_node.clone();
 
         // Peer — one radio per published node (omitted entirely until a peer lands).
         if !state.nodes.is_empty() {
@@ -1837,7 +2211,7 @@ mod menubar {
                 .nodes
                 .iter()
                 .map(|n| {
-                    let checked = selected_node.as_deref() == Some(n.host.as_str());
+                    let checked = state.selected_node.as_deref() == Some(n.host.as_str());
                     let label = if n.host == state.local_host {
                         format!("{} (this node)", n.host)
                     } else {
@@ -1851,39 +2225,161 @@ mod menubar {
             menus.push(Menu::new("Peer", peers));
         }
 
-        // Disk — refresh the selected peer's topology / clear the staged queue.
-        menus.push(Menu::new(
-            "Disk",
-            vec![
-                Entry::Item(
-                    Item::new(MenuAction::RefreshTopology, "Refresh Topology")
-                        .enabled(selected_node.is_some()),
-                ),
-                Entry::Separator,
-                Entry::Item(
-                    Item::new(MenuAction::ClearQueue, "Clear Staged Queue")
-                        .enabled(!state.queue.is_empty()),
-                ),
-            ],
-        ));
-
-        // Operation — jump the compose form to any op (present only when a disk is
-        // selected to stage against; the active op radio-checked).
-        if state.selected_device.is_some() {
-            let active = state.compose.kind;
-            let ops: Vec<Entry<MenuAction>> = OpKind::ALL
-                .iter()
-                .map(|&k| {
-                    Entry::Item(Item::new(MenuAction::StageKind(k), k.label()).checked(k == active))
-                })
-                .collect();
-            menus.push(Menu::new("Operation", ops));
-        }
+        menus.push(build_edit_menu(state));
+        menus.push(build_view_menu(state));
+        menus.push(build_device_menu(state));
+        menus.push(build_partition_menu(state));
+        menus.push(build_help_menu(state));
         menus
     }
 
-    /// The live status cluster: the fleet rollup (disks · peers), the selected peer's
-    /// backend health, and the staged-queue depth.
+    /// **Edit** — the pending-queue verbs (`GParted`'s Edit menu, lock 8 intact):
+    /// Undo Last / Clear All need a queue; Apply All shares the inline button's
+    /// typed-arming decision and greys until the echo matches.
+    fn build_edit_menu(state: &StorageState) -> Menu<MenuAction> {
+        let staged = !state.queue.is_empty();
+        let armed = state.armed_apply().is_some();
+        let mut entries = vec![
+            Entry::Item(Item::new(MenuAction::UndoLast, "Undo Last Operation").enabled(staged)),
+            Entry::Item(Item::new(MenuAction::ClearQueue, "Clear All Operations").enabled(staged)),
+            Entry::Separator,
+            Entry::Item(Item::new(MenuAction::ApplyAll, "Apply All Operations").enabled(armed)),
+        ];
+        if staged && !armed {
+            // An honest caption, not a dead item: why Apply is grey right now.
+            entries.push(Entry::Caption(
+                "Type the target device below to arm Apply.".to_string(),
+            ));
+        }
+        Menu::new("Edit", entries)
+    }
+
+    /// **View** — the device rail + derived-geometry toggles; greyed until the
+    /// selected peer has published a disk to show.
+    fn build_view_menu(state: &StorageState) -> Menu<MenuAction> {
+        let has_disks = !state.selected_devices().is_empty();
+        Menu::new(
+            "View",
+            vec![
+                Entry::Item(
+                    Item::new(MenuAction::ToggleRail, "Device Rail")
+                        .checked(state.view_rail)
+                        .enabled(has_disks),
+                ),
+                Entry::Item(
+                    Item::new(MenuAction::ToggleGeometry, "Geometry / Cylinder Detail")
+                        .checked(state.view_geometry)
+                        .enabled(has_disks),
+                ),
+            ],
+        )
+    }
+
+    /// **Device** — whole-disk verbs: rescan (the worker's `Refresh`), and a new
+    /// partition table staged through the composer (typed-armed at Apply).
+    fn build_device_menu(state: &StorageState) -> Menu<MenuAction> {
+        let disk = selected_disk(state);
+        let stageable = disk
+            .as_ref()
+            .is_some_and(|d| d.protected_reason().is_none());
+        Menu::new(
+            "Device",
+            vec![
+                Entry::Caption(disk.as_ref().map_or_else(
+                    || "No disk selected.".to_string(),
+                    |d| format!("Selected: {}", d.name),
+                )),
+                Entry::Item(
+                    Item::new(MenuAction::RescanDevices, "Rescan Devices")
+                        .enabled(state.selected_node.is_some()),
+                ),
+                Entry::Separator,
+                Entry::Item(
+                    Item::new(
+                        MenuAction::StageKind(OpKind::NewTable),
+                        "New Partition Table\u{2026}",
+                    )
+                    .enabled(stageable),
+                ),
+            ],
+        )
+    }
+
+    /// **Partition** — the full `GParted` verb set, staged through the composer.
+    /// Each verb greys honestly: no unlocked target disk shuts them all;
+    /// partition-scoped verbs need a partition; Mount/Unmount need one in the
+    /// matching state; New needs free space to carve.
+    fn build_partition_menu(state: &StorageState) -> Menu<MenuAction> {
+        let disk = selected_disk(state);
+        let stageable = disk
+            .as_ref()
+            .is_some_and(|d| d.protected_reason().is_none());
+        let has_parts = stageable && disk.as_ref().is_some_and(|d| !d.partitions.is_empty());
+        let has_free = stageable && disk.as_ref().is_some_and(|d| d.free_mib() > 0);
+        let any_mounted = has_parts
+            && disk
+                .as_ref()
+                .is_some_and(|d| d.partitions.iter().any(|p| p.mountpoint.is_some()));
+        let any_unmounted = has_parts
+            && disk
+                .as_ref()
+                .is_some_and(|d| d.partitions.iter().any(|p| p.mountpoint.is_none()));
+
+        let item_for = |kind: OpKind, label: &str, enabled: bool| {
+            Entry::Item(Item::new(MenuAction::StageKind(kind), label).enabled(enabled))
+        };
+        let format_to: Vec<Entry<MenuAction>> = Filesystem::ALL
+            .iter()
+            .map(|&fs| {
+                Entry::Item(Item::new(MenuAction::StageFormat(fs), fs.label()).enabled(has_parts))
+            })
+            .collect();
+
+        Menu::new(
+            "Partition",
+            vec![
+                item_for(OpKind::NewPartition, "New\u{2026}", has_free),
+                Entry::Separator,
+                item_for(OpKind::Delete, "Delete", has_parts),
+                item_for(OpKind::Resize, "Resize (Grow / Shrink)\u{2026}", has_parts),
+                item_for(OpKind::Move, "Move\u{2026}", has_parts),
+                Entry::Separator,
+                Entry::Submenu {
+                    label: "Format to".to_string(),
+                    mnemonic: None,
+                    entries: format_to,
+                },
+                Entry::Separator,
+                item_for(OpKind::Mount, "Mount\u{2026}", any_unmounted),
+                item_for(OpKind::Unmount, "Unmount", any_mounted),
+                Entry::Separator,
+                item_for(OpKind::SetLabel, "Label\u{2026}", has_parts),
+            ],
+        )
+    }
+
+    /// **Help** — the honest surface identity plus one real seam: the safety
+    /// posture published on the live toast lane (greyed with no Bus dir, so the
+    /// item is never a silent no-op).
+    fn build_help_menu(state: &StorageState) -> Menu<MenuAction> {
+        Menu::new(
+            "Help",
+            vec![
+                Entry::Caption(
+                    "Local Cylinders \u{2014} GParted-class disk surgery over the mesh \
+                     storage plane."
+                        .to_string(),
+                ),
+                Entry::Item(
+                    Item::new(MenuAction::HelpSafety, "Safety & arming posture\u{2026}")
+                        .enabled(state.bus_root.is_some()),
+                ),
+            ],
+        )
+    }
+
+    /// The live status cluster: the fleet rollup (disks · peers), the selected
+    /// peer's backend health, the selected device, and the pending-op count.
     fn build_status(state: &StorageState) -> Vec<StatusChip> {
         let peers = state.nodes.len();
         let disks: usize = state.nodes.iter().map(|n| n.topology.devices.len()).sum();
@@ -1905,10 +2401,19 @@ mod menubar {
             chips.push(StatusChip::with_icon(DOT, node.host.clone(), tone));
         }
 
-        let staged = state.queue.len();
-        if staged > 0 {
-            chips.push(StatusChip::new(format!("{staged} staged"), ChipTone::Info));
+        // The selected device + the pending-op count — the MENU-4 pair.
+        if let Some(device) = &state.selected_device {
+            chips.push(StatusChip::new(device.clone(), ChipTone::Info));
         }
+        let staged = state.queue.len();
+        chips.push(StatusChip::new(
+            format!("{staged} pending"),
+            if staged > 0 {
+                ChipTone::Info
+            } else {
+                ChipTone::Neutral
+            },
+        ));
         chips
     }
 
@@ -1916,9 +2421,15 @@ mod menubar {
     pub(super) fn apply(state: &mut StorageState, action: MenuAction) {
         match action {
             MenuAction::SelectPeer(host) => state.select_node(&host),
-            MenuAction::RefreshTopology => {
+            MenuAction::RescanDevices => {
                 if let Some(node) = state.selected_node.clone() {
                     state.publish(&node, &StorageRequest::Refresh);
+                }
+            }
+            MenuAction::UndoLast => {
+                state.queue.pop();
+                if state.queue.is_empty() {
+                    state.arming.clear();
                 }
             }
             MenuAction::ClearQueue => {
@@ -1926,18 +2437,38 @@ mod menubar {
                 state.arming.clear();
                 state.compose_error = None;
             }
+            MenuAction::ApplyAll => {
+                // The gate re-decides here (never trusts the render frame's
+                // enable): no matching echo ⇒ no request ⇒ nothing publishes.
+                if let (Some(node), Some(req)) = (state.selected_node.clone(), state.armed_apply())
+                {
+                    state.publish(&node, &req);
+                }
+            }
+            MenuAction::ToggleRail => state.view_rail = !state.view_rail,
+            MenuAction::ToggleGeometry => state.view_geometry = !state.view_geometry,
             MenuAction::StageKind(kind) => {
                 state.compose.kind = kind;
                 state.compose_error = None;
             }
+            MenuAction::StageFormat(fs) => {
+                state.compose.kind = OpKind::Format;
+                state.compose.fs = Some(fs);
+                state.compose_error = None;
+            }
+            MenuAction::HelpSafety => state.emit_safety_note(),
         }
     }
 
     #[cfg(test)]
+    #[allow(clippy::panic)]
     mod tests {
-        use super::super::{BackendStatus, NodeStorage, StorageState, Topology};
+        use super::super::{
+            project, state_body, BackendStatus, Filesystem, NodeStorage, OpKind, StorageOp,
+            StorageState, Topology,
+        };
         use super::{apply, build_menus, build_status, MenuAction};
-        use mde_egui::menubar::Entry;
+        use mde_egui::menubar::{Entry, Menu};
         use mde_egui::ChipTone;
 
         /// One node view with the given backend health (an empty topology is enough
@@ -1957,63 +2488,195 @@ mod menubar {
             }
         }
 
-        /// A state carrying two nodes — enough to exercise the peer + rollup seams.
+        /// A state carrying two (disk-less) nodes — the peer + rollup seams.
+        /// `bus_root: None` keeps the Help gate deterministic off the build host's
+        /// environment.
         fn two_node_state() -> StorageState {
             StorageState {
                 nodes: vec![node("nodeA", true), node("nodeB", false)],
                 local_host: "nodeA".to_string(),
                 selected_node: Some("nodeA".to_string()),
+                bus_root: None,
                 ..StorageState::default()
             }
         }
 
+        /// A state with the two-disk fixture topology (sda protected, sdb free),
+        /// sdb selected — the full Partition-spine gating context.
+        fn disk_state() -> StorageState {
+            let mut state = StorageState {
+                nodes: project(&[state_body("nodeA", 1, true)]),
+                local_host: "nodeA".to_string(),
+                bus_root: None,
+                ..StorageState::default()
+            };
+            state.ensure_selection();
+            state
+        }
+
+        /// Every activatable item of `menu`, flattened through submenus.
+        fn items(menu: &Menu<MenuAction>) -> Vec<&super::Item<MenuAction>> {
+            fn walk<'a>(
+                entries: &'a [Entry<MenuAction>],
+                out: &mut Vec<&'a super::Item<MenuAction>>,
+            ) {
+                for e in entries {
+                    match e {
+                        Entry::Item(i) => out.push(i),
+                        Entry::Submenu { entries, .. } => walk(entries, out),
+                        Entry::Separator | Entry::Caption(_) => {}
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(&menu.entries, &mut out);
+            out
+        }
+
+        fn menu<'a>(menus: &'a [Menu<MenuAction>], title: &str) -> &'a Menu<MenuAction> {
+            menus
+                .iter()
+                .find(|m| m.title == title)
+                .unwrap_or_else(|| panic!("{title} menu present"))
+        }
+
         #[test]
-        fn peer_menu_is_omitted_until_a_peer_publishes() {
-            let empty = StorageState::default();
+        fn the_spine_is_the_gparted_order_and_greys_shut_when_empty() {
+            let empty = StorageState {
+                bus_root: None,
+                ..StorageState::default()
+            };
             let menus = build_menus(&empty);
             assert!(
                 !menus.iter().any(|m| m.title == "Peer"),
                 "no peer ⇒ the Peer menu is omitted, not present-but-empty (§7)"
             );
-            // Disk is always present; its items are gated (no node ⇒ Refresh greys,
-            // empty queue ⇒ Clear greys) — disabled, never omitted.
-            let disk = menus.iter().find(|m| m.title == "Disk").expect("Disk menu");
-            for entry in &disk.entries {
-                if let Entry::Item(item) = entry {
+            // The GParted spine stays constant (a stable chrome), items greyed.
+            let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
+            assert_eq!(titles, ["Edit", "View", "Device", "Partition", "Help"]);
+            for m in &menus {
+                for item in items(m) {
                     assert!(
                         !item.enabled,
-                        "{} greys with no node / empty queue",
-                        item.label
+                        "{} › {} greys with no peer / disk / queue / Bus",
+                        m.title, item.label
                     );
                 }
             }
-            assert!(
-                !menus.iter().any(|m| m.title == "Operation"),
-                "no selected disk ⇒ the Operation menu is omitted"
-            );
         }
 
         #[test]
         fn peer_menu_lists_every_node_with_the_active_one_checked() {
             let state = two_node_state();
             let menus = build_menus(&state);
-            let peer = menus.iter().find(|m| m.title == "Peer").expect("Peer menu");
-            let ids: Vec<&MenuAction> = peer
-                .entries
-                .iter()
-                .filter_map(|e| match e {
-                    Entry::Item(i) => Some(&i.id),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(ids.len(), 2, "both peers reachable");
-            // The active peer (nodeA) is the checked one.
-            for entry in &peer.entries {
-                if let Entry::Item(item) = entry {
-                    let is_a = item.id == MenuAction::SelectPeer("nodeA".to_string());
-                    assert_eq!(item.checked, Some(is_a), "only the active peer is checked");
-                }
+            let peer = menu(&menus, "Peer");
+            let entries = items(peer);
+            assert_eq!(entries.len(), 2, "both peers reachable");
+            for item in entries {
+                let is_a = item.id == MenuAction::SelectPeer("nodeA".to_string());
+                assert_eq!(item.checked, Some(is_a), "only the active peer is checked");
             }
+        }
+
+        #[test]
+        fn the_partition_spine_arms_over_the_unlocked_disk() {
+            let state = disk_state();
+            assert_eq!(
+                state.selected_device.as_deref(),
+                Some("/dev/sdb"),
+                "the default target skips the protected root disk"
+            );
+            let menus = build_menus(&state);
+            let partition = menu(&menus, "Partition");
+            let by_label = |label: &str| {
+                items(partition)
+                    .into_iter()
+                    .find(|i| i.label == label)
+                    .unwrap_or_else(|| panic!("{label} present"))
+                    .enabled
+            };
+            assert!(by_label("New\u{2026}"), "free space ⇒ New enabled");
+            assert!(by_label("Delete"), "a partition exists ⇒ Delete enabled");
+            assert!(by_label("Resize (Grow / Shrink)\u{2026}"));
+            assert!(by_label("Move\u{2026}"));
+            assert!(
+                by_label("Mount\u{2026}"),
+                "sdb1 is unmounted ⇒ Mount enabled"
+            );
+            assert!(
+                !by_label("Unmount"),
+                "nothing mounted on sdb ⇒ Unmount greys (§7)"
+            );
+            // Format to › carries every filesystem, enabled over the live target.
+            let fs_items: Vec<_> = items(partition)
+                .into_iter()
+                .filter(|i| matches!(i.id, MenuAction::StageFormat(_)))
+                .collect();
+            assert_eq!(fs_items.len(), Filesystem::ALL.len());
+            assert!(fs_items.iter().all(|i| i.enabled));
+            // Device › New Partition Table is stageable over the unlocked disk.
+            let device = menu(&menus, "Device");
+            assert!(items(device)
+                .into_iter()
+                .any(|i| i.id == MenuAction::StageKind(OpKind::NewTable) && i.enabled));
+        }
+
+        #[test]
+        fn apply_all_arms_only_on_the_typed_echo() {
+            let mut state = disk_state();
+            state.queue.push(StorageOp::DeletePartition {
+                partition: "/dev/sdb1".to_string(),
+            });
+            let enabled_apply = |state: &StorageState| {
+                items(menu(&build_menus(state), "Edit"))
+                    .into_iter()
+                    .find(|i| i.label == "Apply All Operations")
+                    .expect("Apply All present")
+                    .enabled
+            };
+            assert!(
+                !enabled_apply(&state),
+                "no echo ⇒ Apply All greys (lock 8 — the menu can't bypass arming)"
+            );
+            state.arming = "/dev/wrong".to_string();
+            assert!(!enabled_apply(&state), "a wrong echo keeps it grey");
+            state.arming = "/dev/sdb".to_string();
+            assert!(enabled_apply(&state), "the exact echo arms it");
+            // The apply path re-decides the gate itself; with no Bus dir the
+            // publish records the honest error rather than silently dropping.
+            apply(&mut state, MenuAction::ApplyAll);
+            assert!(state.last_error.is_some(), "no Bus dir ⇒ the honest error");
+        }
+
+        #[test]
+        fn undo_last_pops_one_op_and_clearing_empties_the_queue() {
+            let mut state = disk_state();
+            state.queue = vec![
+                StorageOp::Unmount {
+                    partition: "/dev/sdb1".to_string(),
+                },
+                StorageOp::DeletePartition {
+                    partition: "/dev/sdb1".to_string(),
+                },
+            ];
+            state.arming = "/dev/sdb".to_string();
+            apply(&mut state, MenuAction::UndoLast);
+            assert_eq!(state.queue.len(), 1, "undo pops the most recent op");
+            assert_eq!(state.arming, "/dev/sdb", "a live queue keeps the echo");
+            apply(&mut state, MenuAction::UndoLast);
+            assert!(state.queue.is_empty());
+            assert!(
+                state.arming.is_empty(),
+                "an emptied queue drops the stale echo"
+            );
+
+            state.queue = vec![StorageOp::Unmount {
+                partition: "/dev/sdb1".to_string(),
+            }];
+            state.arming = "/dev/sdb".to_string();
+            apply(&mut state, MenuAction::ClearQueue);
+            assert!(state.queue.is_empty(), "the queue is cleared");
+            assert!(state.arming.is_empty(), "the arming echo is cleared");
         }
 
         #[test]
@@ -2024,71 +2687,86 @@ mod menubar {
         }
 
         #[test]
-        fn clear_queue_drops_the_staged_ops_and_arming() {
+        fn stage_verbs_jump_the_compose_form() {
             let mut state = two_node_state();
-            state.queue = vec![super::super::StorageOp::Unmount {
-                partition: "/dev/sdb1".to_string(),
-            }];
-            state.arming = "nodeA".to_string();
-            apply(&mut state, MenuAction::ClearQueue);
-            assert!(state.queue.is_empty(), "the queue is cleared");
-            assert!(state.arming.is_empty(), "the arming echo is cleared");
+            apply(&mut state, MenuAction::StageKind(OpKind::Resize));
+            assert_eq!(state.compose.kind, OpKind::Resize);
+            // Format to › presets the filesystem too.
+            apply(&mut state, MenuAction::StageFormat(Filesystem::Xfs));
+            assert_eq!(state.compose.kind, OpKind::Format);
+            assert_eq!(state.compose.fs, Some(Filesystem::Xfs));
         }
 
         #[test]
-        fn stage_kind_jumps_the_compose_form() {
-            let mut state = two_node_state();
-            apply(
-                &mut state,
-                MenuAction::StageKind(super::super::OpKind::Format),
-            );
-            assert_eq!(state.compose.kind, super::super::OpKind::Format);
+        fn view_toggles_flip_and_read_back_checked() {
+            let mut state = disk_state();
+            apply(&mut state, MenuAction::ToggleRail);
+            apply(&mut state, MenuAction::ToggleGeometry);
+            assert!(state.view_rail && state.view_geometry);
+            let menus = build_menus(&state);
+            for item in items(menu(&menus, "View")) {
+                assert_eq!(item.checked, Some(true), "{} reads back on", item.label);
+            }
         }
 
         #[test]
-        fn status_shows_the_rollup_peer_health_and_queue_depth() {
-            let mut state = two_node_state();
-            state.queue = vec![super::super::StorageOp::Unmount {
+        fn status_shows_rollup_health_device_and_pending_count() {
+            let mut state = disk_state();
+            state.queue = vec![StorageOp::Unmount {
                 partition: "/dev/sdb1".to_string(),
             }];
             let chips = build_status(&state);
-            // The fleet rollup (2 peers) + the active peer's health dot + the queue.
-            assert!(chips.iter().any(|c| c.text.contains("2 peers")));
+            assert!(chips.iter().any(|c| c.text.contains("2 disks")));
             assert!(chips
                 .iter()
                 .any(|c| c.text == "nodeA" && c.tone == ChipTone::Ok));
+            assert!(
+                chips
+                    .iter()
+                    .any(|c| c.text == "/dev/sdb" && c.tone == ChipTone::Info),
+                "the selected device chip (MENU-4)"
+            );
             assert!(chips
                 .iter()
-                .any(|c| c.text == "1 staged" && c.tone == ChipTone::Info));
+                .any(|c| c.text == "1 pending" && c.tone == ChipTone::Info));
+            // An empty queue still reads an honest zero, never a vanished chip.
+            state.queue.clear();
+            let chips = build_status(&state);
+            assert!(chips
+                .iter()
+                .any(|c| c.text == "0 pending" && c.tone == ChipTone::Neutral));
         }
     }
 }
 
+/// A faithful `state/storage/<node>` mirror body — the exact shape the E12-20
+/// worker's `StorageState` serializes. Module-scoped so the menubar + coverage
+/// test modules share the ONE fixture topology (sda protected, sdb free).
 #[cfg(test)]
+fn state_body(host: &str, at: u64, available: bool) -> String {
+    if !available {
+        return format!(
+            r#"{{"host":"{host}","backend":{{"status":"unavailable","reason":"no system bus"}},"topology":{{"devices":[]}},"published_at_ms":{at}}}"#
+        );
+    }
+    format!(
+        r#"{{"host":"{host}","backend":{{"status":"available"}},"topology":{{"devices":[
+          {{"name":"/dev/sda","size_mib":51200,"table":"gpt","removable":false,"partitions":[
+            {{"name":"/dev/sda1","number":1,"start_mib":1,"size_mib":512,"filesystem":"vfat","mountpoint":"/boot/efi"}},
+            {{"name":"/dev/sda2","number":2,"start_mib":513,"size_mib":50000,"filesystem":"ext4","mountpoint":"/"}}
+          ]}},
+          {{"name":"/dev/sdb","size_mib":16384,"table":"gpt","removable":true,"partitions":[
+            {{"name":"/dev/sdb1","number":1,"start_mib":1,"size_mib":8192,"filesystem":"ext4","label":"data"}}
+          ]}}
+        ]}},"published_at_ms":{at}}}"#
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
 mod tests {
     use super::*;
     use mde_egui::egui::{pos2, vec2, Rect};
-
-    /// A faithful `state/storage/<node>` mirror body — the exact shape the E12-20
-    /// worker's `StorageState` serializes.
-    fn state_body(host: &str, at: u64, available: bool) -> String {
-        if !available {
-            return format!(
-                r#"{{"host":"{host}","backend":{{"status":"unavailable","reason":"no system bus"}},"topology":{{"devices":[]}},"published_at_ms":{at}}}"#
-            );
-        }
-        format!(
-            r#"{{"host":"{host}","backend":{{"status":"available"}},"topology":{{"devices":[
-              {{"name":"/dev/sda","size_mib":51200,"table":"gpt","removable":false,"partitions":[
-                {{"name":"/dev/sda1","number":1,"start_mib":1,"size_mib":512,"filesystem":"vfat","mountpoint":"/boot/efi"}},
-                {{"name":"/dev/sda2","number":2,"start_mib":513,"size_mib":50000,"filesystem":"ext4","mountpoint":"/"}}
-              ]}},
-              {{"name":"/dev/sdb","size_mib":16384,"table":"gpt","removable":true,"partitions":[
-                {{"name":"/dev/sdb1","number":1,"start_mib":1,"size_mib":8192,"filesystem":"ext4","label":"data"}}
-              ]}}
-            ]}},"published_at_ms":{at}}}"#
-        )
-    }
 
     /// A `state/storage/<node>` progress body.
     fn progress_body(
@@ -2188,8 +2866,15 @@ mod tests {
         assert_eq!(sdb.free_mib(), 16384 - 8192);
     }
 
+    /// The fixture's free data disk: /dev/sdb, 16384 MiB, one 8192 MiB ext4
+    /// partition starting at 1 MiB → 8192 MiB free.
+    fn sdb() -> BlockDevice {
+        project(&[state_body("n", 1, true)])[0].topology.devices[1].clone()
+    }
+
     #[test]
     fn compose_builds_each_op_kind_to_the_worker_shape() {
+        let dev = sdb();
         let as_json = |op: &StorageOp| -> serde_json::Value {
             serde_json::from_str(&serde_json::to_string(op).unwrap_or_default()).unwrap_or_default()
         };
@@ -2201,23 +2886,16 @@ mod tests {
             label: "scratch".to_string(),
             ..Compose::default()
         };
-        let json = as_json(
-            &new_part
-                .build("/dev/sdb", 4096)
-                .expect("new partition builds"),
-        );
+        let json = as_json(&new_part.build(&dev).expect("new partition builds"));
         assert_eq!(json["op"], "create_partition");
         assert_eq!(json["device"], "/dev/sdb");
-        assert_eq!(json["size_mib"], 4096, "blank size fills the free space");
+        assert_eq!(json["size_mib"], 8192, "blank size fills the free space");
         assert_eq!(json["filesystem"], "ext4");
         assert_eq!(json["label"], "scratch");
 
         // Explicit oversize is refused.
         new_part.size_mib = "9999".to_string();
-        assert!(
-            new_part.build("/dev/sdb", 4096).is_err(),
-            "oversize is refused"
-        );
+        assert!(new_part.build(&dev).is_err(), "oversize is refused");
 
         // New table.
         let new_table = Compose {
@@ -2225,7 +2903,7 @@ mod tests {
             table: PartTable::Gpt,
             ..Compose::default()
         };
-        let json = as_json(&new_table.build("/dev/sdb", 0).expect("table builds"));
+        let json = as_json(&new_table.build(&dev).expect("table builds"));
         assert_eq!(json["op"], "create_table");
         assert_eq!(json["table"], "gpt");
 
@@ -2235,11 +2913,11 @@ mod tests {
             ..Compose::default()
         };
         assert!(
-            del.build("/dev/sdb", 0).is_err(),
+            del.build(&dev).is_err(),
             "delete without a partition is refused"
         );
         del.partition = "/dev/sdb1".to_string();
-        let del_op = del.build("/dev/sdb", 0).expect("delete builds");
+        let del_op = del.build(&dev).expect("delete builds");
         assert_eq!(
             del_op,
             StorageOp::DeletePartition {
@@ -2254,14 +2932,113 @@ mod tests {
             fs: None,
             ..Compose::default()
         };
-        assert!(
-            fmt.build("/dev/sdb", 0).is_err(),
-            "format without a fs is refused"
-        );
+        assert!(fmt.build(&dev).is_err(), "format without a fs is refused");
         fmt.fs = Some(Filesystem::Xfs);
-        let json = as_json(&fmt.build("/dev/sdb", 0).expect("format builds"));
+        let json = as_json(&fmt.build(&dev).expect("format builds"));
         assert_eq!(json["op"], "format");
         assert_eq!(json["filesystem"], "xfs");
+    }
+
+    #[test]
+    fn compose_resize_picks_the_worker_direction_from_the_live_size() {
+        let dev = sdb(); // sdb1 is 8192 MiB; 8192 MiB free.
+        let as_json = |op: &StorageOp| -> serde_json::Value {
+            serde_json::from_str(&serde_json::to_string(op).unwrap_or_default()).unwrap_or_default()
+        };
+        let mut rz = Compose {
+            kind: OpKind::Resize,
+            partition: "/dev/sdb1".to_string(),
+            size_mib: "12288".to_string(),
+            ..Compose::default()
+        };
+        // Larger than current → the worker's `grow` shape, verbatim.
+        let json = as_json(&rz.build(&dev).expect("grow builds"));
+        assert_eq!(json["op"], "grow");
+        assert_eq!(json["partition"], "/dev/sdb1");
+        assert_eq!(json["new_size_mib"], 12288);
+        // Smaller than current → `shrink`.
+        rz.size_mib = "4096".to_string();
+        let json = as_json(&rz.build(&dev).expect("shrink builds"));
+        assert_eq!(json["op"], "shrink");
+        assert_eq!(json["new_size_mib"], 4096);
+        // The same size, an over-growth past free space, and an off-disk
+        // partition are refused with typed reasons (the worker re-checks).
+        rz.size_mib = "8192".to_string();
+        assert!(rz.build(&dev).is_err(), "no-op resize is refused");
+        rz.size_mib = "17000".to_string();
+        assert!(rz.build(&dev).is_err(), "growth past free space is refused");
+        rz.size_mib = "12288".to_string();
+        rz.partition = "/dev/sdb9".to_string();
+        assert!(rz.build(&dev).is_err(), "an unknown partition is refused");
+    }
+
+    #[test]
+    fn compose_move_builds_the_worker_shape_and_refuses_a_no_op() {
+        let dev = sdb(); // sdb1 starts at 1 MiB.
+        let mut mv = Compose {
+            kind: OpKind::Move,
+            partition: "/dev/sdb1".to_string(),
+            new_start_mib: "4096".to_string(),
+            ..Compose::default()
+        };
+        let json: serde_json::Value = serde_json::from_str(
+            &serde_json::to_string(&mv.build(&dev).expect("move builds")).unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        assert_eq!(json["op"], "move");
+        assert_eq!(json["partition"], "/dev/sdb1");
+        assert_eq!(json["new_start_mib"], 4096);
+        mv.new_start_mib = "1".to_string();
+        assert!(
+            mv.build(&dev).is_err(),
+            "moving to the current start is a no-op"
+        );
+    }
+
+    #[test]
+    fn geometry_lines_derive_sectors_and_cylinders_from_the_real_size() {
+        let dev = sdb(); // 16384 MiB = 33_554_432 × 512 B sectors.
+        let [geometry, rollup] = geometry_lines(&dev);
+        assert!(geometry.contains("33554432 sectors"), "{geometry}");
+        // 17_179_869_184 B / (255 × 63 × 512 B per cylinder) = 2088 full cylinders.
+        assert!(geometry.contains("2088 cylinders"), "{geometry}");
+        assert!(geometry.contains("derived"), "derived figures say so (§7)");
+        assert!(rollup.contains("GPT"), "{rollup}");
+        assert!(rollup.contains("1 partition(s)"), "{rollup}");
+        assert!(rollup.contains("8192 MiB free of 16384 MiB"), "{rollup}");
+    }
+
+    #[test]
+    fn armed_apply_request_demands_the_exact_typed_echo() {
+        let nodes = project(&[state_body("n", 1, true)]);
+        let node = &nodes[0];
+        let queue = vec![StorageOp::DeletePartition {
+            partition: "/dev/sdb1".to_string(),
+        }];
+        assert!(
+            armed_apply_request(node, &[], "/dev/sdb").is_none(),
+            "an empty queue never arms"
+        );
+        assert!(
+            armed_apply_request(node, &queue, "").is_none(),
+            "no echo, no request"
+        );
+        assert!(
+            armed_apply_request(node, &queue, "/dev/sda").is_none(),
+            "the wrong disk never arms"
+        );
+        let req = armed_apply_request(node, &queue, "  /dev/sdb  ")
+            .expect("the exact echo (whitespace-trimmed) arms");
+        let StorageRequest::Apply {
+            armed_device,
+            queue: q,
+            ..
+        } = req
+        else {
+            panic!("an armed request is an Apply");
+        };
+        assert_eq!(armed_device, "/dev/sdb");
+        assert_eq!(q.ops.len(), 1);
     }
 
     #[test]
@@ -2360,10 +3137,13 @@ mod tests {
     fn live_surface_mounts_and_tessellates() {
         // Feed the projection directly (bypassing the Bus IO) and select the
         // removable data disk so the compose form + queue paths are all reachable,
-        // then prove the whole surface tessellates headless.
+        // then prove the whole surface tessellates headless — with both View
+        // toggles on, so the device rail + geometry detail paint too (MENU-4).
         let mut s = StorageState {
             nodes: project(&[state_body("this-node", 1, true)]),
             local_host: "this-node".to_string(),
+            view_rail: true,
+            view_geometry: true,
             ..StorageState::default()
         };
         s.ensure_selection();
