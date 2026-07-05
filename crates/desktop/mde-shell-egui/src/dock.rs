@@ -1,41 +1,34 @@
-//! The shell **dock** — the full-width surface launcher **taskbar** pinned to
-//! the bottom edge: the shell's ONE bar (NAVBAR-W10-2, superseding NAVBAR-1's
-//! labelled/grouped bar and the E12-3b left rail before it).
+//! The shell **dock** — the left **vertical dock** ([`dock`], design
+//! `docs/design/vertical-dock.md`): the shell's ONE chrome (VDOCK, the sole
+//! surface launcher after VDOCK-6b ripped out the old horizontal taskbar).
 //!
 //! Under E12 "Quasar" the mesh-control surfaces are **panels in the one shell**,
 //! not separate clients (§5, the EMBED model — there is no compositor). The dock
-//! is that shell nav: a Win10-style taskbar (lock W3 — 24px app glyphs on a bar
-//! given top breathing room) that selects which surface fills the shell body — the mesh-control
+//! is that shell nav: a left-edge, full-height, ~48px slide-in auto-hide column
+//! that selects which surface fills the shell body — the mesh-control
 //! [`Workbench`](Surface::Workbench), the live Mesh Map, the VM surfaces
 //! (Instances / Desktop), the embedded app surfaces (Music / Media / Files /
 //! Voice / Browser / Terminal / Editor), the unified [`Chat`](Surface::Chat)
 //! surface, and the System / Storage / About screens. One surface shows at a
 //! time; the Workbench is always one click away.
 //!
-//! The app row leads with the **Workbench** as a standalone anchor, then the
+//! The picker leads with the **Workbench** as the top standalone anchor, then the
 //! surfaces gathered into six labelled **groups** (PICKER-1: Comms · Workloads ·
-//! Terminals · Mesh · System · Media) — each group preceded by a rotated
-//! bottom-to-top accent label + a Carbon-blue hairline to its left, its 24px
-//! brand glyph cells kept in [`Surface::ALL`] order. The active cell still wears
-//! a **bottom-edge accent underline** + the subtle selection wash; hover is a
-//! fill only — no per-icon captions, no tooltips anywhere. After a flexible gap
-//! the right corner cluster: the **Settings** (host-controls) gear button just
-//! left of the right-justified status **tray** + clock (`tray.rs`), and — pinned
-//! to the very bottom-right corner PAST the tray — the Win10 **Show Desktop**
-//! sliver: a thin icon-only button that routes to
-//! [`Surface::Desktop`](Surface::Desktop).
+//! Terminals · Mesh · System · Media) stacked single-column, each with a
+//! horizontal accent label + a left-rail accent stripe over its 24px brand glyph
+//! cells (in [`Surface::ALL`] order). The active cell wears a **left-edge accent
+//! bar** + the subtle selection wash; hover is a fill only — no per-icon captions,
+//! no tooltips anywhere. Beneath the picker sit VDOCK-3's bottom **status quads**
+//! and VDOCK-4's **system quad** (Settings · Show-Desktop · Lock · Power).
 //!
-//! The bar is pure chrome: it reads + writes the active [`Surface`] and draws
+//! The dock is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
 //! shell owns each surface's app and its per-frame pump.
 //!
-//! **VDOCK-1** adds the left **vertical dock** ([`dock`], design
-//! `docs/design/vertical-dock.md`) in parallel: a left-edge, full-height, ~48px
-//! slide-in auto-hide column that will REPLACE this bottom [`taskbar`]. VDOCK-1
-//! builds only its frame + auto-hide (Super-tap toggle + pin + slide); the app
-//! picker / status quads / system quad land in VDOCK-2/3/4. The shell mounts one
-//! or the other via a flag (default the vertical dock); this `taskbar` stays
-//! intact until VDOCK-6 rips it out at the cutover.
+//! The dock slides in from the left over the shared [`Motion`] table and
+//! auto-hides (Super-tap toggle + pin, no hover). When fully hidden + settled it
+//! mounts **no layer at all**, so a hidden dock steals no input from the surface
+//! beneath (the "auto-hide + DRM seat" guarantee).
 
 use mde_egui::egui::{self, TextureHandle, TextureOptions};
 use mde_egui::{Motion, Style};
@@ -43,7 +36,7 @@ use mde_seat::{PowerVerb, SeatSnapshot};
 use mde_theme::brand::icons::{icon_image, IconId};
 
 use crate::chrome::MeshSummary;
-use crate::tray::{self, TrayInputs, TrayState};
+use crate::tray::{self, TrayInputs};
 
 /// Which surface fills the shell body.
 ///
@@ -178,53 +171,32 @@ impl Surface {
     }
 }
 
-/// The taskbar height in logical points — a Win10-style bar given extra breathing
-/// room above the icon row (`SP_XL + SP_M + SP_S` on the 8px grid = the former
-/// 40px bar plus an `SP_M` [`TASKBAR_TOP_PAD`] top strip). `main.rs` mounts the
-/// bottom panel at exactly this height. (`pub`, not `pub(crate)`, is the
-/// `clippy::redundant_pub_crate` form for a crate-visible item in a private
+/// A shared bar-height token in logical points (`SP_XL + SP_M + SP_S` on the 8px
+/// grid = 56px). The old horizontal taskbar mounted its bottom panel at exactly
+/// this height; after VDOCK-6b removed that bar the token survives as the height
+/// the boot backdrop reserves at the screen bottom (`backdrop.rs`) and the curtain
+/// input-exclusivity test mounts its chrome strip at. (`pub`, not `pub(crate)`, is
+/// the `clippy::redundant_pub_crate` form for a crate-visible item in a private
 /// module.)
 pub const TASKBAR_H: f32 = Style::SP_XL + Style::SP_M + Style::SP_S;
 
-/// The empty breathing room ABOVE the icon row (`SP_M`) — the taller bar is
-/// bottom-biased, so the 24px glyphs sit low (Win10-taskbar feel) with this much
-/// clear space over them. The icon band is the bottom `TASKBAR_H − TASKBAR_TOP_PAD`
-/// of each cell; the active underline still hugs the very bottom edge.
-const TASKBAR_TOP_PAD: f32 = Style::SP_M;
-
 /// The fixed width of one icon-only glyph cell (lock W4 — no caption, so the
-/// cell shrinks to suit the 24px glyph): `SP_XL + SP_M` on the 8px grid.
-/// Private: only the bar's own layout + tests read it.
+/// cell shrinks to suit the 24px glyph): `SP_XL + SP_M` on the 8px grid. The
+/// vertical dock's [`DOCK_W`] column is this same module. Private: only the
+/// dock's own layout + tests read it.
 const CELL_W: f32 = Style::SP_XL + Style::SP_M;
 
-/// The app glyph edge in logical points — the Win10 24px taskbar icon (lock
-/// W3, `SP_L`). Rasterized crisp at the physical pixel size by `icon_texture`.
+/// The app glyph edge in logical points — the 24px dock icon (lock W3, `SP_L`).
+/// Rasterized crisp at the physical pixel size by `icon_texture`.
 const ICON_LOGICAL: f32 = Style::SP_L;
 
-/// The width of the Win10 **"Show Desktop"** sliver pinned to the bar's far-right
-/// corner (past the tray) — a thin button, deliberately narrower than a normal
-/// [`CELL_W`] cell (`SP_L + SP_S` on the 8px grid), yet wide enough to centre the
-/// 24px Desktop glyph with a hair of breathing room.
-const SHOW_DESKTOP_W: f32 = Style::SP_L + Style::SP_S;
+// ── PICKER-1: the app picker grouped into named sections ────────────────────
 
-/// The active cell's **bottom-edge accent underline** (lock W5 — the Win10
-/// running/active idiom, replacing the old top strip): a full-width strip,
-/// `SP_XS` tall, hugging the cell's bottom edge. Pure geometry, unit-tested.
-fn underline(cell: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_size(
-        egui::pos2(cell.left(), cell.bottom() - Style::SP_XS),
-        egui::vec2(cell.width(), Style::SP_XS),
-    )
-}
-
-// ── PICKER-1: the app row grouped into named sections ───────────────────────
-
-/// A named section of the app row (PICKER-1): a rotated bottom-to-top accent
-/// label + a Carbon-blue hairline, drawn to the LEFT of the group's icon cells
-/// (the existing 24px cells, unchanged). The Workbench is NOT in any group — it
-/// leads the row as a standalone anchor.
+/// A named section of the app picker (PICKER-1): an accent label + the group's
+/// 24px icon cells, keyed by the group's identity colour. The Workbench is NOT in
+/// any group — it leads the picker as the top standalone anchor.
 struct Group {
-    /// The section heading, painted rotated (bottom-to-top) in [`Self::accent`].
+    /// The section heading, painted in [`Self::accent`].
     label: &'static str,
     /// The group's identity colour — the label tint (design L4).
     accent: egui::Color32,
@@ -240,14 +212,14 @@ struct Group {
 // raw colours here). The Carbon-blue hairline reuses the interactive-blue token
 // [`Style::ACCENT`].
 
-/// The six labelled groups in their locked left-to-right order (L5), each
+/// The six labelled groups in their locked top-to-bottom order (L5), each
 /// listing its surfaces in [`Surface::ALL`] relative order (L7). THREE surfaces
-/// sit outside every group: the **Workbench** leads the row as the standalone
-/// anchor, **System** is the right-side Settings button (rendered just left of the
-/// tray), and **Desktop** is the far-right Win10 [`show_desktop_sliver`] past the
-/// tray; every other surface appears here exactly once (About lives in System's
-/// group) — the union with those three reproduces all 15 of [`Surface::ALL`].
-/// Drives the app-row render + the shell tests (the one grouping authority).
+/// sit outside every group: the **Workbench** leads the picker as the top
+/// standalone anchor, and **System** (Settings) + **Desktop** (Show-Desktop) are
+/// VDOCK-4's bottom system-quad cells; every other surface appears here exactly
+/// once (About lives in System's group) — the union with those three reproduces
+/// all 15 of [`Surface::ALL`]. Drives the picker render + the shell tests (the one
+/// grouping authority).
 const GROUPS: [Group; 6] = [
     Group {
         label: "Comms",
@@ -283,20 +255,19 @@ const GROUPS: [Group; 6] = [
     },
 ];
 
-// Compile-time guard: the Workbench lead + the right-side System Settings button +
-// the far-right Desktop sliver + the six `GROUPS` place every `Surface::ALL` entry
-// EXACTLY once — so the picker can never silently drop or duplicate a surface when
-// either table changes (add a surface to `ALL` but forget to group it, or list it
-// twice, and the crate fails to compile). Keeps `Surface::ALL` the authority the
-// render is checked against. Fieldless enums cast to their discriminant in const,
-// so this compares by identity.
+// Compile-time guard: the Workbench lead + VDOCK-4's two system-quad cells
+// (System/Settings + Desktop/Show-Desktop) + the six `GROUPS` place every
+// `Surface::ALL` entry EXACTLY once — so the picker can never silently drop or
+// duplicate a surface when either table changes (add a surface to `ALL` but forget
+// to group it, or list it twice, and the crate fails to compile). Keeps
+// `Surface::ALL` the authority the render is checked against. Fieldless enums cast
+// to their discriminant in const, so this compares by identity.
 const _: () = {
     let mut i = 0;
     while i < Surface::ALL.len() {
         let target = Surface::ALL[i] as usize;
-        // Three surfaces are placed outside every group: Workbench (standalone
-        // lead), System (right-side Settings button), Desktop (far-right
-        // Show-Desktop sliver).
+        // Three surfaces are placed outside every group: Workbench (the top
+        // standalone lead), System + Desktop (VDOCK-4's system-quad cells).
         let mut count = if Surface::Workbench as usize == target
             || Surface::System as usize == target
             || Surface::Desktop as usize == target
@@ -319,7 +290,7 @@ const _: () = {
         }
         assert!(
             count == 1,
-            "every Surface::ALL entry must be placed exactly once across the Workbench lead + the System Settings button + the Desktop sliver + GROUPS",
+            "every Surface::ALL entry must be placed exactly once across the Workbench lead + the System + Desktop system-quad cells + GROUPS",
         );
         i += 1;
     }
@@ -328,58 +299,15 @@ const _: () = {
 /// The Carbon-blue group hairline width in logical points — a 1px rule (L3).
 const HAIRLINE_W: f32 = 1.0;
 
-/// The group-label point-size floor — the rotated micro-label never shrinks below
-/// this, so it stays legible even when a long label wants to overflow the bar.
+/// The group-label point-size floor — the micro-label never shrinks below this,
+/// so it stays legible even when a long label wants to overflow the narrow column.
 const LABEL_MIN_PT: f32 = 8.0;
 
-// ── PICKER-3: the group's spacing rhythm (8px grid; §4 — no raw px) ───────────
-// Every horizontal gap in the grouped run is added EXPLICITLY from these three
-// tokens (the automatic item-spacing is zeroed in `taskbar`), so the rhythm is
-// even + measurable: mixing an auto per-item gap with a manual `add_space` is
-// what left the labels cramped against their hairline/icons and the group
-// boundaries reading unevenly. The three gaps form a clear hierarchy —
-// `GROUP_GAP`(16) ≫ `LABEL_PAD`(8) > `ICON_GAP`(4) — so a group reads as one
-// cluster set clearly apart from the next.
-
-/// The generous inter-group separation — the clear gap BEFORE each rotated accent
-/// label (and before the first group, off the Workbench lead). `SP_M`.
-const GROUP_GAP: f32 = Style::SP_M;
-
-/// The small breathing pad on EACH side of a group's Carbon-blue hairline
-/// (label → pad → hairline → pad → icons), so the rotated label never crowds the
-/// rule and the rule never crowds the icons. `SP_S`.
-const LABEL_PAD: f32 = Style::SP_S;
-
-/// The tight gap between the icon cells WITHIN one group cluster. `SP_XS`.
-const ICON_GAP: f32 = Style::SP_XS;
-
-/// The stable per-surface id of a cell, so the app-row layout is addressable —
-/// the render + routing are unchanged, but tests can read a cell's rect back via
-/// [`egui::Context::read_response`] to click its exact centre (the W10-2 idiom,
-/// now that grouping shifts each cell off a hand-computable x).
-fn cell_id(surface: Surface) -> egui::Id {
-    egui::Id::new(("qbrand-dock-cell", surface))
-}
-
-/// The stable id of a group's rotated label column, so the app-row layout is fully
-/// addressable — the render is unchanged (the label is display-only, `Sense::hover`),
-/// but the layout harness can read its settled `Rect` back to measure the group's
-/// spacing rhythm (PICKER-3).
-fn group_label_id(label: &str) -> egui::Id {
-    egui::Id::new(("qbrand-dock-group-label", label))
-}
-
-/// The stable id of a group's Carbon-blue hairline rule, so the harness can read
-/// its settled `Rect` (its x + vertical extent) back. Display-only.
-fn group_hairline_id(label: &str) -> egui::Id {
-    egui::Id::new(("qbrand-dock-group-hairline", label))
-}
-
 /// The shared point size for every group label — starts at [`Style::SMALL`] and
-/// shrinks UNIFORMLY (all six labels together) just enough that the widest label,
-/// rotated upright, fits the bar's interior height (its horizontal text width
-/// becomes the vertical extent). Floored at [`LABEL_MIN_PT`] for legibility.
-fn group_label_font(ui: &egui::Ui, bar_h: f32) -> egui::FontId {
+/// shrinks UNIFORMLY (all six labels together) just enough that the widest label
+/// fits within `avail` logical points (the narrow dock column's interior width).
+/// Floored at [`LABEL_MIN_PT`] for legibility.
+fn group_label_font(ui: &egui::Ui, avail: f32) -> egui::FontId {
     let base = egui::FontId::proportional(Style::SMALL);
     let widest = ui.fonts(|f| {
         GROUPS
@@ -391,241 +319,12 @@ fn group_label_font(ui: &egui::Ui, bar_h: f32) -> egui::FontId {
             })
             .fold(0.0_f32, f32::max)
     });
-    let pt = if widest <= bar_h {
+    let pt = if widest <= avail {
         Style::SMALL
     } else {
-        (Style::SMALL * bar_h / widest).max(LABEL_MIN_PT)
+        (Style::SMALL * avail / widest).max(LABEL_MIN_PT)
     };
     egui::FontId::proportional(pt)
-}
-
-/// Paint one group's rotated **bottom-to-top** accent label (L1/L4) into a thin
-/// column allocated at the current cursor. Display-only (`Sense::hover` — not
-/// clickable): after a −90° rotation about its pivot the galley's line height
-/// becomes the column width and its text width the vertical extent, dropped so
-/// the text reads upward, vertically centred in the bar.
-fn group_label(ui: &mut egui::Ui, group: &Group, font: egui::FontId) {
-    let galley = ui.fonts(|f| f.layout_no_wrap(group.label.to_owned(), font, group.accent));
-    let col_w = galley.size().y;
-    let text_w = galley.size().x;
-    let (rect, _resp) = ui.allocate_exact_size(
-        egui::vec2(col_w, ui.available_height()),
-        egui::Sense::hover(),
-    );
-    // Register the settled column under a stable id so the harness can read its
-    // rect back (still display-only — hover sense, no click, nothing painted here).
-    ui.interact(rect, group_label_id(group.label), egui::Sense::hover());
-    // Pivot at the column's left edge; the rotated text spans [pos.y - text_w,
-    // pos.y] vertically, so drop the baseline half its width below centre.
-    let pos = egui::pos2(rect.left(), rect.center().y + text_w / 2.0);
-    ui.painter().add(
-        egui::epaint::TextShape::new(pos, galley, group.accent)
-            .with_angle(-std::f32::consts::FRAC_PI_2),
-    );
-}
-
-/// Paint the thin **Carbon-blue** vertical hairline that sits beside a group's
-/// label (L3) — the interactive-blue [`Style::ACCENT`] token (§4, not raw hex),
-/// inset a hair from the bar's top/bottom edges. Display-only.
-fn group_hairline(ui: &mut egui::Ui, group: &Group) {
-    let (rect, _resp) = ui.allocate_exact_size(
-        egui::vec2(HAIRLINE_W, ui.available_height()),
-        egui::Sense::hover(),
-    );
-    // Register the settled rule under a stable id (display-only) so the harness can
-    // measure the label→hairline→icon rhythm and the cross-group alignment.
-    ui.interact(rect, group_hairline_id(group.label), egui::Sense::hover());
-    ui.painter().vline(
-        rect.center().x,
-        (rect.top() + Style::SP_XS)..=(rect.bottom() - Style::SP_XS),
-        egui::Stroke::new(HAIRLINE_W, Style::ACCENT),
-    );
-}
-
-/// Render the surface launcher as the full-width bottom **taskbar** into `ui`,
-/// selecting the active [`Surface`] and rendering the right-justified status
-/// tray (NAVBAR-W10-2). A click on a cell makes that surface active; the
-/// active one reads as selected (bottom accent underline + selection wash).
-///
-/// The layout: the Workbench as a standalone lead, then the six labelled groups
-/// (PICKER-1) — each a rotated bottom-to-top accent label + a Carbon-blue
-/// hairline before its [`Surface::ALL`]-ordered icon cells — a flexible gap,
-/// then the tray (chevron · status icons · clock) against the right edge.
-/// Returns `true` when any click routed this frame (a cell or a tray icon) so
-/// the shell can surface the body behind a session.
-pub fn taskbar(
-    ui: &mut egui::Ui,
-    active: &mut Surface,
-    tray: &mut TrayState,
-    inputs: &TrayInputs<'_>,
-) -> bool {
-    // A hairline top divider on the seam between the surface body above and the
-    // bar, drawn from the installed BORDER stroke (a Style token, not a raw
-    // colour/width — §4). The flat SURFACE fill is the panel frame (`main.rs`).
-    let hairline = ui.visuals().widgets.noninteractive.bg_stroke;
-    ui.painter()
-        .hline(ui.max_rect().x_range(), ui.max_rect().top(), hairline);
-
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        // Every horizontal gap in the grouped run is added EXPLICITLY below (from
-        // the GROUP_GAP / LABEL_PAD / ICON_GAP tokens), so zero the automatic
-        // item-spacing: mixing an auto per-item gap with a manual `add_space` is
-        // what left the labels cramped and the group boundaries reading unevenly.
-        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-
-        // The label micro-type is sized once so all six labels shrink together
-        // to fit the bar height (the full row height, before any cell is placed).
-        let bar_h = ui.available_height();
-        let label_font = group_label_font(ui, bar_h);
-
-        // PICKER-1 — the Workbench leads as the standalone anchor (no group, no
-        // label), then the six labelled groups (L5), each in Surface::ALL order
-        // within itself (L7). System / Storage / About are ordinary cells inside
-        // the System group (the tray still owns the right).
-        if cell(ui, Surface::Workbench, active) {
-            clicked = true;
-        }
-        for group in &GROUPS {
-            // PICKER-3 — one even, generous rhythm per group: a clear GROUP_GAP
-            // before the rotated accent label, a LABEL_PAD off the Carbon-blue
-            // hairline (L3), the hairline, another LABEL_PAD, then the icon cells
-            // clustered ICON_GAP apart. Every gap is a Style token (§4, no raw px).
-            ui.add_space(GROUP_GAP);
-            group_label(ui, group, label_font.clone());
-            ui.add_space(LABEL_PAD);
-            group_hairline(ui, group);
-            ui.add_space(LABEL_PAD);
-            for (i, &surface) in group.surfaces.iter().enumerate() {
-                if i > 0 {
-                    ui.add_space(ICON_GAP);
-                }
-                if cell(ui, surface, active) {
-                    clicked = true;
-                }
-            }
-        }
-
-        // Lock W2 — flexible space, then the right-justified corner cluster: a
-        // right-to-left sub-layout consumes the remaining width, laying out from the
-        // RIGHT edge inward in add order. The Win10 "Show Desktop" sliver is added
-        // FIRST so it lands right-most (the bottom-right corner, PAST the tray);
-        // then the status tray + clock; then the System **Settings** button, which
-        // lands just LEFT of the tray — the last app-element before the tray, at the
-        // right end of the flexible space (PICKER-2).
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-            if show_desktop_sliver(ui, active) {
-                clicked = true;
-            }
-            if tray::tray(ui, tray, active, inputs) {
-                clicked = true;
-            }
-            if cell(ui, Surface::System, active) {
-                clicked = true;
-            }
-        });
-    });
-    clicked
-}
-
-/// One ordinary taskbar entry — a full-[`CELL_W`] icon-only glyph cell.
-fn cell(ui: &mut egui::Ui, surface: Surface, active: &mut Surface) -> bool {
-    launch_cell(ui, surface, active, CELL_W, false)
-}
-
-/// The Win10 **"Show Desktop"** sliver — a thin [`SHOW_DESKTOP_W`] button pinned
-/// to the bar's far-right corner (rendered right-most in the tray sub-layout, past
-/// the tray). A left-edge divider sets it off from the tray (the Win10 corner
-/// idiom); it routes to [`Surface::Desktop`] and wears the same active/hover
-/// affordances as a cell, just narrower.
-fn show_desktop_sliver(ui: &mut egui::Ui, active: &mut Surface) -> bool {
-    launch_cell(ui, Surface::Desktop, active, SHOW_DESKTOP_W, true)
-}
-
-/// The shared render for a taskbar launch entry (locks W4/W5/W6) — used by both an
-/// ordinary [`cell`] and the far-right [`show_desktop_sliver`]: the 24px brand
-/// glyph centred in a `width`-wide, full-bar-height column, the accent bottom
-/// underline + selection wash when active, a hover fill only (NO tooltip), an
-/// optional Win10 left-edge divider (the Show-Desktop sliver), and a click that
-/// selects the surface (returned so the shell can surface the body).
-fn launch_cell(
-    ui: &mut egui::Ui,
-    surface: Surface,
-    active: &mut Surface,
-    width: f32,
-    left_divider: bool,
-) -> bool {
-    let selected = *active == surface;
-    // Fill the full bar height so the whole column is clickable. Interact under a
-    // stable per-surface id (`cell_id`) so the render + routing are unchanged but
-    // the cell's rect is addressable — tests read it back to click its centre now
-    // that grouping shifts each cell off a hand-computable x.
-    let (rect, _resp) = ui.allocate_exact_size(
-        egui::vec2(width, ui.available_height()),
-        egui::Sense::hover(),
-    );
-    let response = ui.interact(rect, cell_id(surface), egui::Sense::click());
-    let hovered = response.hovered();
-
-    // A painter clone so `egui::Image::paint_at` can still borrow `ui` (splash.rs).
-    let painter = ui.painter().clone();
-
-    // Cell background: the selected cell wears the accent selection wash, a
-    // hovered one the raised SURFACE_HI — both Style tokens (§4); hover is the
-    // fill alone (lock W6 — no tooltip).
-    if selected {
-        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
-    } else if hovered {
-        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
-    }
-
-    // Active mark (lock W5): the accent underline along the cell's bottom edge.
-    if selected {
-        painter.rect_filled(underline(rect), egui::CornerRadius::ZERO, Style::ACCENT);
-    }
-
-    // The Win10 vertical divider marking the far-right Show-Desktop corner — a
-    // BORDER hairline down the sliver's LEFT edge, inset from the bar edges (§4).
-    if left_divider {
-        painter.vline(
-            rect.left(),
-            (rect.top() + Style::SP_XS)..=(rect.bottom() - Style::SP_XS),
-            egui::Stroke::new(HAIRLINE_W, Style::BORDER),
-        );
-    }
-
-    // Two-tone tint: the active glyph reads solid in the brand ACCENT, a hovered
-    // one brightens to full TEXT, the rest sit dim at TEXT_DIM. The brand SVG
-    // set is a single `currentColor` variant (no separate outline artwork), so
-    // "filled vs outline" is approximated by tint intensity — every value a
-    // Style token, never a raw colour (§4).
-    let tint = if selected {
-        Style::ACCENT
-    } else if hovered {
-        Style::TEXT
-    } else {
-        Style::TEXT_DIM
-    };
-
-    // The glyph, centred in the cell's BOTTOM icon band (lock W4 — no caption
-    // beneath it). The band is the cell minus the TASKBAR_TOP_PAD breathing room,
-    // so the glyph sits low (bottom-biased) with clear space above it. A glyph load
-    // failure fails soft to the bare cell (§7).
-    if let Some(tex) = icon_texture(ui.ctx(), surface.icon_id(), ICON_LOGICAL, tint) {
-        let icon_cy = (rect.top() + TASKBAR_TOP_PAD + rect.bottom()) / 2.0;
-        let icon_center = egui::pos2(rect.center().x, icon_cy);
-        let icon_rect =
-            egui::Rect::from_center_size(icon_center, egui::vec2(ICON_LOGICAL, ICON_LOGICAL));
-        egui::Image::new(egui::load::SizedTexture::new(tex.id(), icon_rect.size()))
-            .paint_at(ui, icon_rect);
-    }
-
-    if response.clicked() {
-        *active = surface;
-        return true;
-    }
-    false
 }
 
 /// Rasterize + upload a brand glyph, cached in egui memory so a given
@@ -673,20 +372,18 @@ pub fn icon_texture(
 // VDOCK-1 — the left **vertical dock** frame + auto-hide (design
 // `docs/design/vertical-dock.md`, locks #1/#9/#13/#14/#23/#24).
 //
-// The eventual replacement for the horizontal [`taskbar`] above: a left-edge,
-// full-height, ~48px, solid Carbon-dark column that slides in from the left and
-// auto-hides (hotkey + pin, no hover). VDOCK-1 builds ONLY the FRAME + the
-// slide/toggle/pin mechanism; the interior stays three empty seams for the
-// follow-ups (app picker VDOCK-2, status quads VDOCK-3, system quad VDOCK-4). It
-// mounts in parallel with the still-intact `taskbar` — the shell picks one via a
-// flag (default the vertical dock); VDOCK-6 rips the bottom bar out at the cutover.
+// The shell's sole chrome (VDOCK-6b removed the old horizontal taskbar): a
+// left-edge, full-height, ~48px, solid Carbon-dark column that slides in from the
+// left and auto-hides (hotkey + pin, no hover). VDOCK-1 builds the FRAME + the
+// slide/toggle/pin mechanism; the interior is filled by the app picker (VDOCK-2),
+// the status quads (VDOCK-3), and the system quad (VDOCK-4).
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// The vertical dock's width in logical points (~48px, design #2/#23) — one
-/// column, the SAME 48px module as the horizontal taskbar's icon cell
-/// ([`CELL_W`]), so VDOCK-2's app glyphs + VDOCK-3/4's quads inherit the grid.
-/// (`pub`, not `pub(crate)` — the `clippy::redundant_pub_crate` form for a
-/// crate-visible item in a private module, like [`TASKBAR_H`].)
+/// column, the SAME 48px [`CELL_W`] module, so VDOCK-2's app glyphs + VDOCK-3/4's
+/// quads inherit the grid. (`pub`, not `pub(crate)` — the
+/// `clippy::redundant_pub_crate` form for a crate-visible item in a private
+/// module, like [`TASKBAR_H`].)
 pub const DOCK_W: f32 = CELL_W;
 
 /// The egui memory key for the dock's slide animation (the Motion latch that
@@ -697,18 +394,6 @@ const DOCK_SLIDE_KEY: &str = "vdock-slide";
 /// the passthrough test) can name its `LayerId` — `LayerId::new(Foreground,
 /// Id::new(DOCK_AREA))`.
 const DOCK_AREA: &str = "vdock-area";
-
-/// The egui memory key for the DOCK-ACCENT right-edge **brighten** latch — the
-/// Motion factor that eases the Carbon-blue edge hairline dim↔full on reveal or a
-/// pointer over the dock. Private to the dock (distinct from [`DOCK_SLIDE_KEY`]).
-const ACCENT_LIT_KEY: &str = "vdock-accent-lit";
-
-/// The DOCK-ACCENT right-edge hairline's **rest** brightness (DOCK-ACCENT) — the
-/// Carbon interactive-blue edge sits this dim (a gamma-scaled [`Style::ACCENT`],
-/// so also part-transparent: the inboard [`Style::BORDER`] divider shows through,
-/// the "layered" look) when the dock is settled + unhovered, easing to full ACCENT
-/// on reveal/hover.
-const ACCENT_EDGE_DIM: f32 = 0.4;
 
 /// The left vertical dock's **state** — VDOCK-1's auto-hide inputs (locks #9/#13)
 /// plus VDOCK-2's picker state. The auto-hide half (the Super-tap **reveal** latch
@@ -886,8 +571,8 @@ impl DockState {
     }
 }
 
-/// Render the **left vertical dock** (VDOCK-1) — the slide-in, auto-hide chrome
-/// that will replace the bottom [`taskbar`]. A left-edge, full-height [`DOCK_W`]
+/// Render the **left vertical dock** (VDOCK-1) — the slide-in, auto-hide chrome,
+/// the shell's sole surface launcher. A left-edge, full-height [`DOCK_W`]
 /// column: a solid Carbon-dark panel with a hairline right-edge divider (locks
 /// #1/#24, §4 tokens). Hidden off the left by default; the shell's Super-tap
 /// toggles it and the pin holds it open (`state`), sliding in/out from the left
@@ -983,33 +668,16 @@ pub fn gutter_width(ctx: &egui::Context, state: &DockState) -> f32 {
 /// this frame.
 fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
     let painter = ui.painter().clone();
-    // Solid Carbon-dark panel fill (lock #24) — the SURFACE token (§4), the same
-    // flat fill the horizontal bar wears, so the two docks read as one chrome.
+    // Solid Carbon-dark panel fill (lock #24) — the SURFACE token (§4), a flat
+    // opaque fill so the dock reads as one solid chrome column.
     painter.rect_filled(rect, egui::CornerRadius::ZERO, Style::SURFACE);
     // The hairline right-edge divider (lock #24) — a 1px BORDER rule down the
     // dock's right edge, the seam between the dock and the surface it floats over.
+    // (The old DOCK-ACCENT blue edge seam was removed by operator directive.)
     painter.vline(
         rect.right(),
         rect.y_range(),
         egui::Stroke::new(HAIRLINE_W, Style::BORDER),
-    );
-    // DOCK-ACCENT — a 1px Carbon **Interactive Blue 60** hairline at the dock's
-    // OUTERMOST right pixel (`rect.right()`), full height, layered just outside the
-    // inboard BORDER divider above (blue at the edge, the divider inboard). It sits
-    // dim at rest and BRIGHTENS on reveal OR a pointer over the dock: the brighten
-    // factor eases over the shared Motion table (no literal duration, §4), lerping
-    // the SAME [`Style::ACCENT`] token the group hairline strokes from
-    // [`ACCENT_EDGE_DIM`] to full (no raw hex, §4).
-    let lit = Motion::animate(
-        ui.ctx(),
-        ACCENT_LIT_KEY,
-        state.shown() || ui.rect_contains_pointer(rect),
-        Motion::FAST,
-    );
-    painter.vline(
-        rect.right(),
-        rect.top()..=rect.bottom(),
-        egui::Stroke::new(HAIRLINE_W, accent_edge_color(lit)),
     );
 
     let mut clicked = false;
@@ -1117,16 +785,6 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
     clicked
 }
 
-/// The DOCK-ACCENT right-edge hairline colour for a given brighten factor `lit`
-/// (0 = rest, 1 = fully revealed/hovered): the Carbon interactive-blue
-/// [`Style::ACCENT`] token (no raw hex, §4), gamma-scaled from [`ACCENT_EDGE_DIM`]
-/// at rest to full at `lit == 1`. The gamma scale also drops the alpha at rest, so
-/// the dim edge is part-transparent and the inboard divider shows through (the
-/// "layered" look). Pure, so the brighten curve is unit-testable.
-fn accent_edge_color(lit: f32) -> egui::Color32 {
-    Style::ACCENT.gamma_multiply(egui::lerp(ACCENT_EDGE_DIM..=1.0, lit))
-}
-
 /// The dock's **pin** toggle (VDOCK-1, lock #9) — the minimal affordance that
 /// holds the dock open when set (the "pin" half of "hotkey + pin, no hover").
 /// The brand set has no pin glyph yet (VDOCK-4 gives the dock its real glyphs), so
@@ -1184,14 +842,10 @@ const PIN_STRIP_H: f32 = Style::SP_M;
 /// sized to fit the narrow column by [`group_label_font`].
 const PICK_LABEL_H: f32 = Style::SP_M;
 
-/// The per-group accent **divider** band (#21) — an `SP_S` gap with the group's
-/// accent hairline centred in it, separating one group from the next.
+/// The per-group **separation** band (#21) — an `SP_S` gap between one group's
+/// full accent outline box and the next, so each colored box reads as its own
+/// enclosed cluster.
 const GROUP_DIVIDER_H: f32 = Style::SP_S;
-
-/// The thin **left-rail accent stripe** beside each group's cells (#21) — a 2px
-/// group-accent spine (twice the [`HAIRLINE_W`] rule), inset [`Style::SP_XS`] from
-/// the column's left edge.
-const RAIL_W: f32 = HAIRLINE_W * 2.0;
 
 /// The active cell's **left-edge accent bar** (lock #10) — an `SP_XS`-wide
 /// [`Style::ACCENT`] bar down the active surface's left edge (the vertical analog
@@ -1210,8 +864,8 @@ const BOTTOM_ZONE_H: f32 = 3.0 * DOCK_W;
 
 /// The stable per-surface id of a vertical-picker cell — the render + routing are
 /// unchanged, but tests read a cell's settled `Rect` back to click its exact
-/// centre (the taskbar [`cell_id`] idiom, kept distinct so the two docks' cells
-/// never share an id).
+/// centre (the addressable-cell idiom, so a picker cell never shares an id with a
+/// status/system-quad cell).
 fn pick_cell_id(surface: Surface) -> egui::Id {
     egui::Id::new(("vdock-pick-cell", surface))
 }
@@ -1357,19 +1011,20 @@ fn pick_group(
     }
     let cells_bottom = cells_top + group.surfaces.len() as f32 * APP_CELL_H;
 
-    // The thin left-rail accent stripe beside the cells (#21) — the group's spine,
-    // painted over the cell fills in the group accent, inset SP_XS from the edge.
-    let rail = egui::Rect::from_min_max(
+    // A FULL 1px outline in the group's accent around the whole cell cluster
+    // (operator directive: each colored box gets a complete outside outline, all
+    // four sides — replacing the old half-enclosure left-rail stripe + bottom
+    // divider). Inset SP_XS from the column edges so the box reads as its own
+    // fully-enclosed group. Every colour is a Style token (§4).
+    let box_rect = egui::Rect::from_min_max(
         egui::pos2(origin.x + Style::SP_XS, cells_top),
-        egui::pos2(origin.x + Style::SP_XS + RAIL_W, cells_bottom),
+        egui::pos2(origin.x + width - Style::SP_XS, cells_bottom),
     );
-    painter.rect_filled(rail, egui::CornerRadius::ZERO, group.accent);
-
-    // The accent divider below the group (#21).
-    painter.hline(
-        (origin.x + Style::SP_XS)..=(origin.x + width - Style::SP_XS),
-        cells_bottom + GROUP_DIVIDER_H / 2.0,
+    painter.rect_stroke(
+        box_rect,
+        Style::RADIUS,
         egui::Stroke::new(HAIRLINE_W, group.accent),
+        egui::StrokeKind::Inside,
     );
 
     (group_height(group), routed)
@@ -1501,9 +1156,8 @@ fn pick_overflow(
 const SYS_QUAD_ICON: f32 = Style::SP_M + Style::SP_XS / 2.0;
 
 /// The stroke width of the procedurally-drawn system-quad glyphs (Lock + Power —
-/// the brand set has no glyph for either yet, like the VDOCK-1 pin): a 2px rule,
-/// the same `HAIRLINE_W · 2` weight the group left-rail ([`RAIL_W`]) uses, so the
-/// line-art reads at the ~18px quad-icon size.
+/// the brand set has no glyph for either yet, like the VDOCK-1 pin): a 2px rule
+/// (`HAIRLINE_W · 2`), so the line-art reads at the ~18px quad-icon size.
 const SYS_GLYPH_STROKE: f32 = HAIRLINE_W * 2.0;
 
 /// The Power menu's row + popup width — token math (`SP_XL · 5` = 160pt), wide
@@ -1996,15 +1650,12 @@ fn power_arming_stage(ui: &mut egui::Ui, power: &mut PowerMenu) -> Option<PowerI
 #[cfg(test)]
 mod tests {
     use super::{
-        accent_edge_color, cell_id, dock, group_hairline_id, group_height, group_label_id,
-        gutter_width, icon_texture, overflow_more_id, pick_cell_id, power_item_id, sys_cell_id,
-        taskbar, underline, visible_group_count, DockRequest, DockState, PowerItem, PowerMenu,
-        Surface, SysCell, ACCENT_EDGE_DIM, CELL_W, DOCK_AREA, DOCK_W, GROUPS, GROUP_GAP,
-        HAIRLINE_W, ICON_GAP, ICON_LOGICAL, LABEL_PAD, PIN_STRIP_H, POWER_MENU, SHOW_DESKTOP_W,
-        SYSTEM_QUAD, SYS_QUAD_ICON, TASKBAR_H, TASKBAR_TOP_PAD,
+        dock, group_height, gutter_width, overflow_more_id, pick_cell_id, power_item_id,
+        sys_cell_id, visible_group_count, DockRequest, DockState, PowerItem, PowerMenu, Surface,
+        SysCell, CELL_W, DOCK_AREA, DOCK_W, GROUPS, ICON_LOGICAL, PIN_STRIP_H, POWER_MENU,
+        SYSTEM_QUAD, SYS_QUAD_ICON,
     };
     use crate::chrome::MeshSummary;
-    use crate::tray::{TrayInputs, TrayState};
     use mde_egui::egui;
     use mde_egui::Style;
     use mde_seat::PowerVerb;
@@ -2046,62 +1697,6 @@ mod tests {
     #[test]
     fn the_shell_opens_on_the_workbench_surface() {
         assert_eq!(Surface::default(), Surface::Workbench);
-    }
-
-    // --- NAVBAR-W10-2: the pixel-per-Win10 metrics + active mark ------------------
-
-    #[test]
-    fn the_bar_wears_the_win10_metrics() {
-        // Lock W3 @100%: 24px app glyphs and the icon-only cell shrunk to 48px —
-        // all on the 8px grid, straight from Style tokens. The bar is the former
-        // 40px Win10 height plus an SP_M (16px) top breathing strip = 56px, so the
-        // glyphs sit low with clear space above them.
-        // 56px = the former 40px Win10 bar + the SP_M (16px) top strip, so the bar
-        // is taller than the old 40px for air above the icons.
-        assert!((TASKBAR_H - 56.0).abs() < f32::EPSILON, "bar height");
-        assert!(
-            (TASKBAR_TOP_PAD - 16.0).abs() < f32::EPSILON,
-            "top breathing room"
-        );
-        assert!((ICON_LOGICAL - 24.0).abs() < f32::EPSILON, "app glyph edge");
-        assert!((CELL_W - 48.0).abs() < f32::EPSILON, "icon-only cell width");
-        // The bar stays on the 8px grid.
-        assert!(
-            (TASKBAR_H % 8.0).abs() < f32::EPSILON,
-            "bar height on the 8px grid"
-        );
-    }
-
-    #[test]
-    fn the_active_underline_hugs_the_cells_bottom_edge() {
-        // Lock W5 — the accent mark moved from the cell's top strip to the
-        // Win10 bottom-edge underline: full cell width, SP_XS tall, flush with
-        // the bottom edge.
-        let cell = egui::Rect::from_min_size(
-            egui::pos2(96.0, 600.0 - TASKBAR_H),
-            egui::vec2(CELL_W, TASKBAR_H),
-        );
-        let strip = underline(cell);
-        assert!(
-            (strip.bottom() - cell.bottom()).abs() < f32::EPSILON,
-            "flush bottom"
-        );
-        assert!(
-            (strip.height() - Style::SP_XS).abs() < f32::EPSILON,
-            "strip height"
-        );
-        assert!(
-            (strip.width() - cell.width()).abs() < f32::EPSILON,
-            "full width"
-        );
-        assert!(
-            (strip.left() - cell.left()).abs() < f32::EPSILON,
-            "flush left"
-        );
-        assert!(
-            strip.top() > cell.center().y,
-            "an underline, not a top strip"
-        );
     }
 
     // --- QBRAND-7: every dock surface renders a brand::icons glyph ----------------
@@ -2157,77 +1752,6 @@ mod tests {
         }
     }
 
-    // --- the bar mounts, renders icon-only, and switches surface on a click -------
-
-    /// Mount the real bottom bar (with a default tray over an unseen mesh) for one
-    /// headless frame at a given screen `width` and return the frame output — the
-    /// same `Context::run` → `TopBottomPanel::bottom` path `main.rs` mounts (matching
-    /// its exact-height + zero-margin `SURFACE` frame), so the layout the harness
-    /// measures is the live one.
-    fn run_taskbar_sized(
-        ctx: &egui::Context,
-        active: &mut Surface,
-        events: Vec<egui::Event>,
-        width: f32,
-    ) -> egui::FullOutput {
-        let mesh = MeshSummary::default();
-        let inputs = TrayInputs {
-            mesh: &mesh,
-            seat: None,
-            unread: 0,
-            session_active: false,
-        };
-        let mut tray = TrayState::default();
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(width, 600.0),
-            )),
-            events,
-            ..Default::default()
-        };
-        ctx.run(input, |ctx| {
-            egui::TopBottomPanel::bottom("shell-taskbar")
-                .exact_height(TASKBAR_H)
-                .frame(egui::Frame::default().fill(Style::SURFACE))
-                .show(ctx, |ui| {
-                    let _ = taskbar(ui, active, &mut tray, &inputs);
-                });
-        })
-    }
-
-    /// Mount the real bottom bar at the default 1280-wide screen (the click/glyph
-    /// tests' width) for one headless frame.
-    fn run_taskbar(
-        ctx: &egui::Context,
-        active: &mut Surface,
-        events: Vec<egui::Event>,
-    ) -> egui::FullOutput {
-        run_taskbar_sized(ctx, active, events, 1280.0)
-    }
-
-    #[test]
-    fn the_taskbar_renders_and_caches_the_glyphs_headless() {
-        // Drive one headless frame of the full-width bottom taskbar (the same
-        // Context::run → tessellate path the DRM runner uses, minus the GPU): it
-        // must draw primitives without panicking, and every surface glyph must
-        // resolve to a real texture through the memory-cached loader.
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut active = Surface::default();
-        let out = run_taskbar(&ctx, &mut active, Vec::new());
-        let ppp = out.pixels_per_point;
-        let prims = ctx.tessellate(out.shapes, ppp);
-        assert!(!prims.is_empty(), "the taskbar drew nothing");
-
-        for surface in Surface::ALL {
-            assert!(
-                icon_texture(&ctx, surface.icon_id(), ICON_LOGICAL, Style::TEXT_DIM).is_some(),
-                "{surface:?} glyph failed to rasterize + upload"
-            );
-        }
-    }
-
     /// Collect every text shape's `(angle, fallback_color)` in a frame's output,
     /// recursing into shape groups. The group labels are rotated (angle ≠ 0),
     /// tinted by their group accent; the clock lines are upright (angle 0).
@@ -2241,102 +1765,6 @@ mod tests {
             }
             _ => {}
         }
-    }
-
-    #[test]
-    fn the_bar_shows_group_labels_and_the_clock_no_captions_no_tooltips() {
-        // PICKER-1 relayout: the ONLY text on a quiet bar (no unread badge,
-        // flyout closed) is the six rotated group labels + the tray clock's two
-        // stacked lines — still no per-icon captions (W4) and no tooltips (W6).
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut active = Surface::default();
-        let out = run_taskbar(&ctx, &mut active, Vec::new());
-        let mut texts = Vec::new();
-        for clipped in &out.shapes {
-            collect_text_shapes(&clipped.shape, &mut texts);
-        }
-        assert_eq!(
-            texts.len(),
-            GROUPS.len() + 2,
-            "the quiet bar carries exactly the six group labels + the clock's two lines"
-        );
-    }
-
-    #[test]
-    fn the_group_labels_render_rotated_bottom_to_top_in_their_accent() {
-        // L1/L4 — each group's heading is a label rotated 90° CCW (bottom-to-top,
-        // angle −π/2) painted in that group's accent colour; the two upright
-        // clock lines (angle 0) are the only other text.
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut active = Surface::default();
-        let out = run_taskbar(&ctx, &mut active, Vec::new());
-        let mut texts = Vec::new();
-        for clipped in &out.shapes {
-            collect_text_shapes(&clipped.shape, &mut texts);
-        }
-        let rotated: Vec<(f32, egui::Color32)> =
-            texts.into_iter().filter(|(a, _)| *a != 0.0).collect();
-        assert_eq!(
-            rotated.len(),
-            GROUPS.len(),
-            "one rotated label per group, none for the icons or the clock"
-        );
-        let accents: Vec<egui::Color32> = GROUPS.iter().map(|g| g.accent).collect();
-        for (angle, color) in rotated {
-            assert!(
-                (angle - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-3,
-                "label reads bottom-to-top (−π/2), got {angle}"
-            );
-            assert!(
-                accents.contains(&color),
-                "label painted in a group accent, got {color:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn clicking_a_taskbar_cell_selects_that_surface() {
-        // The click→select behaviour survives the icon-only relayout. Mount the
-        // real bottom bar and click the leftmost cell (Workbench, the nav head).
-        // egui hit-tests a press against the settled widget rects, so prime a
-        // couple of no-event frames first, then press one frame + release the
-        // next (the egui click model), and the active surface follows the click.
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut active = Surface::About;
-        // The first cell is flush-left and fills the bar's height, so its centre
-        // — half a cell in, half the bar up from the bottom — is the retargeted
-        // click point (derived from the layout constants, not a magic number).
-        let click = egui::pos2(CELL_W / 2.0, 600.0 - TASKBAR_H / 2.0);
-        let press = egui::Event::PointerButton {
-            pos: click,
-            button: egui::PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::default(),
-        };
-        let release = egui::Event::PointerButton {
-            pos: click,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: egui::Modifiers::default(),
-        };
-        // Prime: settle the layout so egui has the cell rects registered.
-        let _ = run_taskbar(&ctx, &mut active, Vec::new());
-        let _ = run_taskbar(&ctx, &mut active, Vec::new());
-        // Move onto the Workbench cell + press, then release the next frame.
-        let _ = run_taskbar(
-            &ctx,
-            &mut active,
-            vec![egui::Event::PointerMoved(click), press],
-        );
-        let _ = run_taskbar(&ctx, &mut active, vec![release]);
-        assert_eq!(
-            active,
-            Surface::Workbench,
-            "clicking the Workbench cell selected it"
-        );
     }
 
     // --- PICKER-1: the group table + rotated labels + hairline dividers -----------
@@ -2436,427 +1864,6 @@ mod tests {
                 "group {} keeps Surface::ALL order",
                 g.label
             );
-        }
-    }
-
-    #[test]
-    fn clicking_any_group_cell_routes_to_its_surface() {
-        // §7 — every one of the 15 surfaces still routes on a click after the
-        // grouping relayout (Workbench lead + all cells in the six groups). Mount
-        // the real bar, read each cell's settled rect by its stable id, then click
-        // its exact centre (the W10-2 idiom) and assert the active surface follows.
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut warm = Surface::Workbench;
-        // Prime two frames so every cell rect is registered under its id.
-        let _ = run_taskbar(&ctx, &mut warm, Vec::new());
-        let _ = run_taskbar(&ctx, &mut warm, Vec::new());
-        let mut centers: Vec<(Surface, egui::Pos2)> = Vec::new();
-        for s in Surface::ALL {
-            let response = ctx.read_response(cell_id(s));
-            assert!(response.is_some(), "{s:?} cell rect not registered");
-            let rect = response.expect("registered above").rect;
-            centers.push((s, rect.center()));
-        }
-        for (want, center) in centers {
-            // Start on a different surface so the click is observable.
-            let mut active = if want == Surface::Workbench {
-                Surface::About
-            } else {
-                Surface::Workbench
-            };
-            let press = egui::Event::PointerButton {
-                pos: center,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::default(),
-            };
-            let release = egui::Event::PointerButton {
-                pos: center,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::default(),
-            };
-            let _ = run_taskbar(
-                &ctx,
-                &mut active,
-                vec![egui::Event::PointerMoved(center), press],
-            );
-            let _ = run_taskbar(&ctx, &mut active, vec![release]);
-            assert_eq!(active, want, "clicking {want:?}'s cell selects it");
-        }
-    }
-
-    #[test]
-    fn the_desktop_sliver_pins_to_the_far_right_corner_past_the_tray() {
-        // The Win10 "Show Desktop" move: Desktop is NOT a group cell — it renders as
-        // a thin sliver held in the bottom-right corner, right-most on the whole bar
-        // (past the tray). Mount the real bar, settle the layout, and read the
-        // Desktop cell rect back: its right edge hugs the bar's right edge (nothing
-        // sits further right — i.e. past the tray) and it is narrower than a normal
-        // cell (a sliver, SHOW_DESKTOP_W).
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut active = Surface::Workbench;
-        let _ = run_taskbar(&ctx, &mut active, Vec::new());
-        let _ = run_taskbar(&ctx, &mut active, Vec::new());
-
-        let desktop = ctx
-            .read_response(cell_id(Surface::Desktop))
-            .expect("the Desktop sliver rect is registered")
-            .rect;
-        // The bar spans the 1280-wide screen (run_taskbar's screen_rect); the sliver
-        // hugs its right edge — the far-right corner, past the tray.
-        assert!(
-            (desktop.right() - 1280.0).abs() < 1.0,
-            "the Desktop sliver hugs the bar's right edge, got right={}",
-            desktop.right()
-        );
-        // Every group cell sits to its LEFT — nothing renders further right.
-        for s in Surface::ALL {
-            if s == Surface::Desktop {
-                continue;
-            }
-            if let Some(resp) = ctx.read_response(cell_id(s)) {
-                assert!(
-                    resp.rect.right() <= desktop.right() + f32::EPSILON,
-                    "{s:?} renders to the right of the Desktop sliver"
-                );
-            }
-        }
-        // It is a thin sliver — narrower than a normal cell.
-        assert!(
-            (desktop.width() - SHOW_DESKTOP_W).abs() < f32::EPSILON,
-            "the Desktop sliver is SHOW_DESKTOP_W wide"
-        );
-        assert!(
-            desktop.width() < CELL_W,
-            "the Desktop sliver is narrower than a normal cell"
-        );
-    }
-
-    // ── PICKER-3: the headless taskbar LAYOUT HARNESS ─────────────────────────
-    // A repeatable, headless measurement of the grouped taskbar's REAL on-screen
-    // geometry. It mounts the true `taskbar()` via `egui::Context::run` at a given
-    // screen width, reads every element's settled `Rect` back by the stable id the
-    // dock assigns (icon/Settings/Desktop cells → `cell_id`; rotated group labels →
-    // `group_label_id`; Carbon-blue hairlines → `group_hairline_id`), and reduces
-    // them to the group spacing rhythm. `report()` prints the measured geometry
-    // (visible under `--nocapture`); `assert_even_rhythm()` pins the intended
-    // rhythm as the regression guard + the spec.
-
-    /// The measured geometry of one group in the app row.
-    struct GroupGeom {
-        label: &'static str,
-        label_rect: egui::Rect,
-        hairline_rect: egui::Rect,
-        icons: Vec<egui::Rect>,
-    }
-
-    impl GroupGeom {
-        fn first_icon(&self) -> egui::Rect {
-            *self.icons.first().expect("a group has ≥1 icon")
-        }
-        fn last_icon(&self) -> egui::Rect {
-            *self.icons.last().expect("a group has ≥1 icon")
-        }
-        /// The group's full horizontal extent — its rotated label is the leftmost
-        /// element, its last icon the rightmost.
-        fn left(&self) -> f32 {
-            self.label_rect.left()
-        }
-        fn right(&self) -> f32 {
-            self.last_icon().right()
-        }
-        /// label → Carbon-blue hairline gap.
-        fn label_to_hairline(&self) -> f32 {
-            self.hairline_rect.left() - self.label_rect.right()
-        }
-        /// hairline → first icon gap.
-        fn hairline_to_first_icon(&self) -> f32 {
-            self.first_icon().left() - self.hairline_rect.right()
-        }
-        /// The gap between consecutive icon cells within the group (`None` for a
-        /// single-icon group).
-        fn icon_to_icon(&self) -> Option<f32> {
-            (self.icons.len() > 1).then(|| self.icons[1].left() - self.icons[0].right())
-        }
-    }
-
-    /// The measured geometry of the whole taskbar at one screen width.
-    struct BarGeom {
-        width: f32,
-        bar_top: f32,
-        bar_bottom: f32,
-        workbench: egui::Rect,
-        groups: Vec<GroupGeom>,
-        settings: egui::Rect,
-        desktop: egui::Rect,
-    }
-
-    impl BarGeom {
-        fn bar_center_y(&self) -> f32 {
-            f32::midpoint(self.bar_top, self.bar_bottom)
-        }
-        /// The element immediately to the LEFT of group `i` — the Workbench lead for
-        /// the first group, else the previous group's last icon.
-        fn left_neighbour_right(&self, i: usize) -> f32 {
-            if i == 0 {
-                self.workbench.right()
-            } else {
-                self.groups[i - 1].right()
-            }
-        }
-        /// The inter-group gap: the clear space BEFORE group `i`'s rotated label
-        /// (measured off its left neighbour's right edge).
-        fn pre_label_gap(&self, i: usize) -> f32 {
-            self.groups[i].label_rect.left() - self.left_neighbour_right(i)
-        }
-        /// The flexible gap between the grouped run and the right cluster — the
-        /// Settings button is the leftmost element of that cluster.
-        fn group_to_tray_gap(&self) -> f32 {
-            self.settings.left() - self.groups.last().expect("six groups").right()
-        }
-
-        /// Emit the full measured geometry as a table — every element's rect + the
-        /// per-group gaps (deliverable #3). Printed by the harness test under
-        /// `--nocapture`; also the human-readable form of what the assertions pin.
-        fn report(&self) -> String {
-            use std::fmt::Write as _;
-            let mut s = String::new();
-            let _ = writeln!(
-                s,
-                "=== taskbar layout @ {:.0}px  (bar y=[{:.1},{:.1}] center={:.1}) ===",
-                self.width,
-                self.bar_top,
-                self.bar_bottom,
-                self.bar_center_y()
-            );
-            let _ = writeln!(
-                s,
-                "lead  Workbench      x=[{:.1},{:.1}]",
-                self.workbench.left(),
-                self.workbench.right()
-            );
-            for (i, g) in self.groups.iter().enumerate() {
-                let i2i = g
-                    .icon_to_icon()
-                    .map_or_else(|| "n/a".to_owned(), |v| format!("{v:.1}"));
-                let _ = writeln!(
-                    s,
-                    "grp{i} {:<10} label x=[{:.1},{:.1}] cy={:.1} | hairline x={:.1} | \
-icons x=[{:.1}..{:.1}] | grp=[{:.1},{:.1}] || pre={:.1} lbl→hr={:.1} hr→ic={:.1} ic→ic={}",
-                    g.label,
-                    g.label_rect.left(),
-                    g.label_rect.right(),
-                    g.label_rect.center().y,
-                    g.hairline_rect.center().x,
-                    g.first_icon().left(),
-                    g.last_icon().right(),
-                    g.left(),
-                    g.right(),
-                    self.pre_label_gap(i),
-                    g.label_to_hairline(),
-                    g.hairline_to_first_icon(),
-                    i2i,
-                );
-            }
-            let _ = writeln!(
-                s,
-                "right  group→tray gap={:.1} | Settings x=[{:.1},{:.1}] | tray x=[{:.1},{:.1}] | \
-Desktop x=[{:.1},{:.1}]",
-                self.group_to_tray_gap(),
-                self.settings.left(),
-                self.settings.right(),
-                self.settings.right(),
-                self.desktop.left(),
-                self.desktop.left(),
-                self.desktop.right(),
-            );
-            s
-        }
-    }
-
-    /// Mount the real taskbar headlessly at `width`, settle the layout, and read
-    /// every element's settled `Rect` back by its stable id — the harness core.
-    fn measure_taskbar(width: f32) -> BarGeom {
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut active = Surface::Workbench;
-        // Prime two frames so every stable-id widget rect is registered + settled
-        // (`read_response` reads the previous frame's rects — the W10-2 idiom).
-        let _ = run_taskbar_sized(&ctx, &mut active, Vec::new(), width);
-        let _ = run_taskbar_sized(&ctx, &mut active, Vec::new(), width);
-
-        let rect_of = |id: egui::Id| {
-            ctx.read_response(id)
-                .expect("every taskbar element rect is registered under its stable id")
-                .rect
-        };
-        let workbench = rect_of(cell_id(Surface::Workbench));
-        let settings = rect_of(cell_id(Surface::System));
-        let desktop = rect_of(cell_id(Surface::Desktop));
-        let groups = GROUPS
-            .iter()
-            .map(|g| GroupGeom {
-                label: g.label,
-                label_rect: rect_of(group_label_id(g.label)),
-                hairline_rect: rect_of(group_hairline_id(g.label)),
-                icons: g.surfaces.iter().map(|&s| rect_of(cell_id(s))).collect(),
-            })
-            .collect();
-        BarGeom {
-            width,
-            bar_top: workbench.top(),
-            bar_bottom: workbench.bottom(),
-            workbench,
-            groups,
-            settings,
-            desktop,
-        }
-    }
-
-    /// The realistic screen widths the harness pins the rhythm at — the T470s
-    /// panel + two common desktop sizes.
-    const HARNESS_WIDTHS: [f32; 3] = [1366.0, 1920.0, 2560.0];
-
-    /// Layout tolerance in logical px — the gaps are added from exact `Style`
-    /// tokens, so this only absorbs egui's sub-pixel rounding of the rects.
-    const LAYOUT_TOL: f32 = 1.0;
-
-    fn approx(a: f32, b: f32) -> bool {
-        (a - b).abs() <= LAYOUT_TOL
-    }
-
-    /// Assert the intended even rhythm on a measured bar (the spec + regression
-    /// guard). Every gap must equal its `Style` token and be equal across groups,
-    /// the labels vertically centred, the hairlines aligned, and nothing overlapping.
-    fn assert_even_rhythm(bar: &BarGeom) {
-        let w = bar.width;
-        assert_eq!(bar.groups.len(), 6, "@{w}: six measured groups");
-
-        // (1) Inter-group gaps equal (within 1px) — the clear space before every
-        // rotated label, incl. the Workbench-lead → first-group gap, is GROUP_GAP.
-        for i in 0..bar.groups.len() {
-            let gap = bar.pre_label_gap(i);
-            assert!(
-                approx(gap, GROUP_GAP),
-                "@{w}: group {} pre-label gap {gap:.2} ≠ GROUP_GAP {GROUP_GAP}",
-                bar.groups[i].label
-            );
-        }
-
-        // (2) label→hairline→icon spacing consistent across groups — both pads are
-        // LABEL_PAD and identical group to group (the rhythm the operator flagged).
-        for g in &bar.groups {
-            assert!(
-                approx(g.label_to_hairline(), LABEL_PAD),
-                "@{w}: {} label→hairline {:.2} ≠ LABEL_PAD {LABEL_PAD}",
-                g.label,
-                g.label_to_hairline()
-            );
-            assert!(
-                approx(g.hairline_to_first_icon(), LABEL_PAD),
-                "@{w}: {} hairline→icon {:.2} ≠ LABEL_PAD {LABEL_PAD}",
-                g.label,
-                g.hairline_to_first_icon()
-            );
-            // Icon-to-icon within a multi-icon cluster is the tight ICON_GAP.
-            if let Some(i2i) = g.icon_to_icon() {
-                assert!(
-                    approx(i2i, ICON_GAP),
-                    "@{w}: {} icon→icon {i2i:.2} ≠ ICON_GAP {ICON_GAP}",
-                    g.label
-                );
-            }
-        }
-
-        // (3) Labels vertically centred in the bar.
-        for g in &bar.groups {
-            assert!(
-                approx(g.label_rect.center().y, bar.bar_center_y()),
-                "@{w}: {} label cy {:.2} not centred in the bar (center {:.2})",
-                g.label,
-                g.label_rect.center().y,
-                bar.bar_center_y()
-            );
-        }
-
-        // (4) Hairlines aligned — same 1px width + the same inset vertical extent
-        // across every group (a clean shared rule, not a ragged set).
-        let h0 = bar.groups[0].hairline_rect;
-        for g in &bar.groups {
-            assert!(
-                approx(g.hairline_rect.width(), HAIRLINE_W),
-                "@{w}: {} hairline width {:.2} ≠ HAIRLINE_W {HAIRLINE_W}",
-                g.label,
-                g.hairline_rect.width()
-            );
-            assert!(
-                approx(g.hairline_rect.top(), h0.top())
-                    && approx(g.hairline_rect.bottom(), h0.bottom()),
-                "@{w}: {} hairline y-extent [{:.2},{:.2}] ≠ [{:.2},{:.2}]",
-                g.label,
-                g.hairline_rect.top(),
-                g.hairline_rect.bottom(),
-                h0.top(),
-                h0.bottom()
-            );
-        }
-
-        // (5) No overlap — each group's label starts strictly right of its left
-        // neighbour's icons (the GROUP_GAP always separates them).
-        for i in 0..bar.groups.len() {
-            assert!(
-                bar.groups[i].label_rect.left() > bar.left_neighbour_right(i),
-                "@{w}: {} label overlaps the element to its left",
-                bar.groups[i].label
-            );
-        }
-
-        // (6) The right cluster keeps its positions with an even, positive flexible
-        // gap: Settings sits left of the tray + the far-right Desktop sliver, and
-        // the Desktop sliver still hugs the bar's right edge.
-        assert!(
-            bar.group_to_tray_gap() > 0.0,
-            "@{w}: the grouped run collided with the right cluster (gap {:.2})",
-            bar.group_to_tray_gap()
-        );
-        assert!(
-            bar.settings.right() <= bar.desktop.left() + LAYOUT_TOL,
-            "@{w}: Settings is not left of the Desktop sliver",
-        );
-        assert!(
-            approx(bar.desktop.right(), w),
-            "@{w}: the Desktop sliver no longer hugs the right edge (right {:.2})",
-            bar.desktop.right()
-        );
-
-        // (7) The MEASURED gaps form a clear visual hierarchy — a group reads as
-        // one cluster set clearly apart from the next: pre-label ≫ label-pad >
-        // icon gap (checked on the rendered numbers, not just the token defs).
-        let pre = bar.pre_label_gap(0);
-        let pad = bar.groups[0].label_to_hairline();
-        let icon = bar.groups[0]
-            .icon_to_icon()
-            .expect("the Comms group has two icons");
-        assert!(
-            pre > pad && pad > icon,
-            "@{w}: gaps not tiered — pre-label {pre:.1} > label-pad {pad:.1} > icon {icon:.1}"
-        );
-    }
-
-    #[test]
-    fn the_grouped_taskbar_is_evenly_spaced_at_common_widths() {
-        // PICKER-3 — the layout harness: measure the real taskbar geometry at the
-        // T470s + two common desktop widths, print the report (seen under
-        // `--nocapture`), and assert the even rhythm. This is both the spec and the
-        // regression guard for the group spacing.
-        for width in HARNESS_WIDTHS {
-            let bar = measure_taskbar(width);
-            // Emitted geometry — visible when the suite runs with `--nocapture`.
-            eprint!("{}", bar.report());
-            assert_even_rhythm(&bar);
         }
     }
 
@@ -3070,81 +2077,6 @@ Desktop x=[{:.1},{:.1}]",
             gutter_width(&ctx2, &hidden),
             0.0,
             "a hidden + settled dock reserves nothing — the content fills full width"
-        );
-    }
-
-    // ── DOCK-ACCENT: a Carbon-blue hairline down the dock's right edge ────────
-
-    #[test]
-    fn the_right_edge_accent_brightens_from_dim_to_full_carbon_blue() {
-        // DOCK-ACCENT — the right-edge hairline reuses Style::ACCENT (the Carbon
-        // interactive-blue token, no raw hex) and brightens with the reveal/hover
-        // factor: dim at rest, full ACCENT when revealed, monotone between. It stays
-        // blue-dominant at rest (it IS the blue token, gamma-scaled).
-        let dim = accent_edge_color(0.0);
-        let full = accent_edge_color(1.0);
-        assert_eq!(
-            full,
-            Style::ACCENT,
-            "fully lit is the Carbon interactive-blue token (gamma ×1 is identity)"
-        );
-        assert!(
-            dim.r() <= full.r() && dim.g() <= full.g() && dim.b() <= full.b() && dim.a() < full.a(),
-            "the rest state is dimmer + more transparent than the revealed state"
-        );
-        assert!(
-            dim.b() >= dim.r() && dim.b() >= dim.g(),
-            "the edge stays Carbon-blue (blue-dominant) even at rest"
-        );
-        assert!(
-            (0.0..1.0).contains(&ACCENT_EDGE_DIM),
-            "the rest brightness is a genuine dim, not full-on"
-        );
-    }
-
-    #[test]
-    fn the_dock_paints_a_carbon_blue_hairline_down_its_right_edge() {
-        // DOCK-ACCENT — a 1px Carbon interactive-blue line at the dock's OUTERMOST
-        // right pixel (rect.right() == DOCK_W when fully in), full height, layered
-        // outside the inboard BORDER divider. Drive a shown dock and find the
-        // blue-dominant vertical LineSegment at x≈DOCK_W spanning the screen height.
-        let ctx = egui::Context::default();
-        Style::install(&ctx);
-        let mut shown = DockState::default();
-        shown.toggle(); // reveal it (slide settles to t=1 on the first frame)
-
-        run_vdock(&ctx, &mut shown, 1);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(1280.0, 800.0),
-            )),
-            ..Default::default()
-        };
-        let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let _ = ui.button("surface");
-            });
-            let _ = dock(ctx, &mut shown);
-        });
-
-        let found = out.shapes.iter().any(|cs| match &cs.shape {
-            egui::Shape::LineSegment { points, stroke } => {
-                let [a, b] = points;
-                let vertical = (a.x - b.x).abs() < 0.5;
-                let at_right_edge = (a.x - DOCK_W).abs() < 0.5;
-                let full_height = (b.y - a.y).abs() > 700.0;
-                let c = stroke.color;
-                // The Carbon interactive-blue token is blue-dominant + bright; the
-                // inboard BORDER divider (b == 61) is excluded by the b > 100 gate.
-                let blue = c.b() > c.r() && c.b() > c.g() && c.b() > 100;
-                vertical && at_right_edge && full_height && blue
-            }
-            _ => false,
-        });
-        assert!(
-            found,
-            "no Carbon-blue right-edge hairline at x≈DOCK_W spanning full height"
         );
     }
 

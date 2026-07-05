@@ -1,15 +1,14 @@
 //! `mde-shell-egui` — the single MCNF E12 "Quasar" egui shell (E12-3).
 //!
-//! One eframe app on the `mde-egui` harness. The shell has **ONE bar** — the
-//! constant pixel-per-Win10 bottom **taskbar** (NAVBAR-W10-2: the flat
-//! icon-only surface row, then the right-justified status tray + clock; the
-//! old top chrome strip is retired, lock W1). Above it, the central view is
-//! either:
+//! One eframe app on the `mde-egui` harness. The shell has **ONE chrome** — the
+//! left **vertical dock** (VDOCK, `dock::dock`: the slide-in, auto-hide app picker
+//! + bottom status/system quads; the old horizontal taskbar and the top chrome
+//! strip are both retired). Beside it, the central view is either:
 //!
 //! * the **session `EmptyState`** (collapsed) — a real session is a fullscreen VM
 //!   texture from `mde-vdi`; or
 //! * the active **surface** (expanded) — Workbench / Mesh Map / the app
-//!   surfaces, selected on the taskbar (the dock IS the nav; any bar click
+//!   surfaces, selected on the dock (the dock IS the nav; any dock click
 //!   surfaces the body).
 //!
 //! The session↔body transition eases through the shared `Motion` table and the
@@ -79,9 +78,8 @@ use workbench::Plane;
 /// surface) is showing over the session view, and which plane the Workbench has
 /// selected. Kept separate from the surface apps (which need an eframe
 /// `CreationContext` to build) so the nav invariants stay unit-testable without
-/// a GPU. The old chrome Expand/Collapse toggle is retired (NAVBAR-W10-2 —
-/// the dock is the nav): any taskbar click, hotkey, chyron action, or edge
-/// swipe surfaces the body.
+/// a GPU. The old chrome Expand/Collapse toggle is retired (the dock is the nav):
+/// any dock click, hotkey, chyron action, or edge swipe surfaces the body.
 #[derive(Default)]
 struct Nav {
     /// `true` while the shell body (the active surface) fills the central view.
@@ -139,13 +137,9 @@ struct Shell {
     spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState,
     /// The live mesh-status fold — peers + mesh health folded from the
     /// world-readable snapshot, polled on the shared cadence (self-gating in
-    /// `render`). The taskbar tray renders its Peers / Status / Signal dots
-    /// from this ONE poll's product (NAVBAR-W10-2 — no second poll).
+    /// `render`). The dock's status quads render their Peers / Status / Signal
+    /// dots from this ONE poll's product (VDOCK-3 — no second poll).
     chrome: chrome::ChromeState,
-    /// The taskbar tray's per-frame state (the `^` overflow flyout latch). The
-    /// tray itself is stateless folds over `chrome` + the seat snapshot + the
-    /// Chat unread tally, rendered by `dock::taskbar` (NAVBAR-W10-2).
-    tray: tray::TrayState,
     /// VDOCK-1/2/3/4 — the left vertical dock's state: the auto-hide half (the
     /// Super-tap reveal latch + the pin), the app picker's `active` surface, the
     /// bottom status-quad inputs, and the system-quad power menu + pending request.
@@ -153,12 +147,6 @@ struct Shell {
     /// the hotkey path (`hotkeys::HotkeyRouter::take_dock_toggle`); and
     /// `mount_dock_chrome` mirrors `nav.surface` in/out + drains its lock/power request.
     vdock: dock::DockState,
-    /// VDOCK-1 — the cutover flag. When `true` (the default) the shell mounts the
-    /// left vertical dock (`dock::dock`) INSTEAD of the horizontal bottom taskbar;
-    /// when `false` it mounts the legacy `dock::taskbar`. Both code paths stay
-    /// until VDOCK-6 rips the bottom bar out at the cutover; a field (not a const)
-    /// keeps both branches live so neither reads as dead code.
-    vertical_dock: bool,
     /// The Music surface, owned + built once (its worker thread wakes the shell's
     /// egui context on every update). Rendered via `mde_music_egui::music_panel`.
     music: MusicApp,
@@ -198,8 +186,8 @@ struct Shell {
     chat: chat::ChatState,
     /// The System surface — this seat's host controls, folded from the ONE
     /// `mde-seat` `Seat` (lock 1): mixer / Bluetooth / displays / power & battery /
-    /// backlight / hotkeys. Its cached snapshot also feeds the taskbar tray's
-    /// read-only BT / Volume / Battery icons (NAVBAR-W10-2). Absent backends
+    /// backlight / hotkeys. Its cached snapshot also feeds the dock's status quads'
+    /// read-only BT / Volume / Battery cells (VDOCK-3). Absent backends
     /// render honestly (§7).
     system: system::SystemState,
     /// The Storage surface — GParted-authentic disk/partition management (E12-21).
@@ -308,12 +296,7 @@ impl Shell {
             services: services_flow::ServicesFlowState::default(),
             spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState::default(),
             chrome: chrome::ChromeState::default(),
-            tray: tray::TrayState::default(),
             vdock: dock::DockState::default(),
-            // VDOCK-1 cutover — the vertical dock is the live chrome (default ON);
-            // the bottom bar stays mounted only when this is flipped off (until
-            // VDOCK-6 removes it entirely).
-            vertical_dock: true,
             music: MusicApp::new_with_ctx(ctx),
             media: real_media(),
             files: mde_files_egui::real_browser(),
@@ -432,8 +415,7 @@ impl Shell {
     /// shelf over every discovered unit. The lens persists in egui memory under
     /// [`explorer::LENS_KEY`] so [`Self::poll_mesh_map`] reads the same choice; it
     /// defaults to the map, so OW-10's all-green auto-open still lands on the map.
-    /// (Mounted here pending the dedicated dock entry the taskbar owner adds — a
-    /// clean seam.)
+    /// (Mounted here pending the dedicated dock picker entry — a clean seam.)
     fn show_mesh_map(&mut self, ui: &mut egui::Ui) {
         let mesh_view = &mut self.mesh_view;
         let explorer = &mut self.explorer;
@@ -459,10 +441,9 @@ impl Shell {
         });
     }
 
-    /// The expanded shell body: the one active surface. (The taskbar is NOT
-    /// mounted here any more — NAVBAR-W10-2 lock W13 makes the bar constant, so
-    /// `render` mounts the bottom panel before the central view, session and
-    /// body alike.)
+    /// The expanded shell body: the one active surface. (The dock chrome is NOT
+    /// mounted here — `render` mounts the floating dock before the central view,
+    /// session and body alike.)
     ///
     /// The shell owns the frame loop, so it drives the active surface itself —
     /// its per-frame **pump** (the worker-update drain the surface kept out of the
@@ -652,7 +633,7 @@ impl Shell {
                 // persisting the rail selection itself. Scoped under its own
                 // `push_id` like every mounted surface so its egui ids can't collide
                 // in the shell's one `Context`. The snapshot is refreshed in
-                // `render` (it also feeds the taskbar tray's icons), so the panel
+                // `render` (it also feeds the dock's status quads), so the panel
                 // only renders here. The System panel drives Displays + Power live
                 // (E12-18); its per-VM power rows reuse the Instances broker (§6),
                 // so it takes a `&mut` to that roster — two disjoint field borrows
@@ -716,9 +697,9 @@ impl Boot {
                 self.splash.complete(splash::Milestone::Surfaces);
             } else if !self.splash.is_complete(splash::Milestone::MeshSnapshot) {
                 // The shell's FIRST mesh-status snapshot poll — the same
-                // world-readable fold the taskbar tray renders on its cadence,
-                // so the first dock frame opens with live tray dots instead of
-                // cold dim ones whenever a snapshot exists.
+                // world-readable fold the dock's status quads render on their
+                // cadence, so the first dock frame opens with live status dots
+                // instead of cold dim ones whenever a snapshot exists.
                 if let Some(shell) = self.shell.as_mut() {
                     shell.chrome.poll(ctx);
                 }
@@ -777,7 +758,7 @@ impl Shell {
         // mesh Bus auto-opens the live Mesh Map, through the SAME
         // `shell/goto/<surface>` nav grammar the KIRON chyron uses (no second
         // navigation path). The watch self-gates on the shared cadence; the Mesh
-        // Map is independently reachable from the taskbar besides.
+        // Map is independently reachable from the dock besides.
         self.self_test.poll(ctx);
         if self.self_test.take_all_green() {
             if let Some(nav) = toast_bridge::resolve_action("shell/goto/mesh-map") {
@@ -809,9 +790,9 @@ impl Shell {
         // clipboard clips + human chat) — tails its `state/chat/*` read-model
         // whenever the shell is expanded: a cheap incremental read that keeps the
         // roster + conversations live so data is ready the instant the operator
-        // switches to it, and drives the tray's Chat unread badge (no cold-start
-        // wait). This subsumes the retired Notifications + Clipboard polls
-        // (NOTIFY-CHAT-6).
+        // switches to it, and drives the dock Chat quad's unread badge (no
+        // cold-start wait). This subsumes the retired Notifications + Clipboard
+        // polls (NOTIFY-CHAT-6).
         if self.nav.expanded {
             self.chat.poll(ctx);
             // EDITOR-9 — pick up a Files "Send-to-Editor" (or any node's
@@ -833,9 +814,9 @@ impl Shell {
             self.storage.poll(ctx);
         }
 
-        // The seat snapshot feeds BOTH the System surface and the taskbar tray's
-        // always-visible status icons, so poll it every frame (self-gating on the
-        // shared cadence) — the tray's BT / Volume / Battery icons stay live even
+        // The seat snapshot feeds BOTH the System surface and the dock's status
+        // quads' always-visible status cells, so poll it every frame (self-gating on
+        // the shared cadence) — the quads' BT / Volume / Battery cells stay live even
         // while the System surface isn't the one in view.
         self.system.poll(ctx);
 
@@ -864,16 +845,15 @@ impl Shell {
         self.system
             .sync_pairing_agent(self.nav.expanded && self.nav.surface == Surface::System);
 
-        // NAVBAR-W10-2 (lock W1) — the top chrome strip is retired; its snapshot
-        // poll survives as the tray's mesh fold. ONE self-gating poll per frame
-        // (it also keeps the repaint heartbeat alive for the tray dots and the
-        // clock's minute flip) — the tray reads the product, no second poll.
+        // The top chrome strip is retired; its snapshot poll survives as the dock
+        // status quads' mesh fold. ONE self-gating poll per frame (it also keeps the
+        // repaint heartbeat alive for the quad status dots) — the quads read the
+        // product, no second poll.
         self.chrome.poll(ctx);
 
-        // The shell's dock chrome (VDOCK-1), mounted BEFORE the central view so it
-        // frames the session + shell body: the left vertical dock (default) or the
-        // legacy bottom taskbar behind the flag. Extracted to a helper so `render`
-        // stays within the line budget.
+        // The shell's dock chrome (VDOCK), mounted BEFORE the central view so it
+        // frames the session + shell body: the left vertical dock, the sole chrome.
+        // Extracted to a helper so `render` stays within the line budget.
         self.mount_dock_chrome(ctx);
 
         // The central view: the session↔body cross-fade — or nothing at all
@@ -978,68 +958,41 @@ impl Shell {
         );
     }
 
-    /// Mount the shell's **dock chrome** for this frame (VDOCK-1). When
-    /// `vertical_dock` is on (the default) this is the left **vertical dock**
-    /// (`dock::dock`) — a floating, slide-in, auto-hide `Area` that reserves NO
-    /// gutter, so the central view fills the full width AND height (no bottom
-    /// panel). Otherwise it's the legacy pixel-per-Win10 bottom **taskbar**
-    /// (`dock::taskbar`) in a bottom panel. Either way, a routed click surfaces the
-    /// shell body (the dock IS the nav, lock W1 — a navigation is never a no-op
-    /// behind the session). Both paths stay live until VDOCK-6 rips the bottom bar
-    /// out at the cutover. Split out of `render` so each stays within the line
-    /// budget.
+    /// Mount the shell's **dock chrome** for this frame (VDOCK) — the left
+    /// **vertical dock** (`dock::dock`), the shell's sole chrome: a floating,
+    /// slide-in, auto-hide `Area` that reserves NO gutter of its own (the central
+    /// view fills the full width AND height; `central_view` insets an empty gutter
+    /// in lockstep with the slide so the dock never overlaps the surface). A routed
+    /// click surfaces the shell body (the dock IS the nav — a navigation is never a
+    /// no-op behind the session). Split out of `render` so each stays within the
+    /// line budget.
     fn mount_dock_chrome(&mut self, ctx: &egui::Context) {
-        let bar_clicked = if self.vertical_dock {
-            // VDOCK-1/2/3/4 — the slide-in, auto-hide left dock, now the live chrome.
-            // The dock owns its own picker `active`; the shell keeps `nav.surface` as
-            // the ONE source of truth every other nav path (hotkeys, chyron,
-            // self-test, chooser) writes. So MIRROR the live surface INTO the dock
-            // before `dock()` (the picker then highlights whatever is showing), feed
-            // the bottom status quads their live inputs (VDOCK-3 — the SAME folds the
-            // taskbar branch builds below), then read the picker's selection straight
-            // back OUT (the VDOCK-6 wire) so a picker-cell click routes the body.
-            self.vdock.set_active(self.nav.surface);
-            self.vdock.set_status_inputs(
-                self.chrome.summary().clone(),
-                self.system.snapshot().cloned(),
-                self.chat.total_unread(),
-                self.vdi.requested_target().is_some(),
-            );
-            let clicked = dock::dock(ctx, &mut self.vdock);
-            self.nav.surface = self.vdock.active();
-            // VDOCK-4 — drain the system-quad's pending request: Lock drops the
-            // in-process curtain (exactly like Super+L), a Power verb drives the seat
-            // honorer (its typed-armed consent is the operator's; a refusal is an
-            // honest no-op, §7).
-            match self.vdock.take_request() {
-                Some(dock::DockRequest::Lock) => self.curtain.lock(),
-                Some(dock::DockRequest::Power(verb)) => {
-                    let _ = self.system.honor_power(verb);
-                }
-                None => {}
+        // The dock owns its own picker `active`; the shell keeps `nav.surface` as
+        // the ONE source of truth every other nav path (hotkeys, chyron, self-test,
+        // chooser) writes. So MIRROR the live surface INTO the dock before `dock()`
+        // (the picker then highlights whatever is showing), feed the bottom status
+        // quads their live inputs (VDOCK-3), then read the picker's selection
+        // straight back OUT so a picker-cell click routes the body.
+        self.vdock.set_active(self.nav.surface);
+        self.vdock.set_status_inputs(
+            self.chrome.summary().clone(),
+            self.system.snapshot().cloned(),
+            self.chat.total_unread(),
+            self.vdi.requested_target().is_some(),
+        );
+        let bar_clicked = dock::dock(ctx, &mut self.vdock);
+        self.nav.surface = self.vdock.active();
+        // VDOCK-4 — drain the system-quad's pending request: Lock drops the
+        // in-process curtain (exactly like Super+L), a Power verb drives the seat
+        // honorer (its typed-armed consent is the operator's; a refusal is an
+        // honest no-op, §7).
+        match self.vdock.take_request() {
+            Some(dock::DockRequest::Lock) => self.curtain.lock(),
+            Some(dock::DockRequest::Power(verb)) => {
+                let _ = self.system.honor_power(verb);
             }
-            clicked
-        } else {
-            // The legacy bottom taskbar (locks W1/W13) — the flat icon-only surface
-            // row plus the right-justified status tray + clock. Retained behind the
-            // flag until VDOCK-6's cutover.
-            let unread = self.chat.total_unread();
-            let session_active = self.vdi.requested_target().is_some();
-            let mut clicked = false;
-            egui::TopBottomPanel::bottom("shell-taskbar")
-                .exact_height(dock::TASKBAR_H)
-                .frame(egui::Frame::default().fill(Style::SURFACE))
-                .show(ctx, |ui| {
-                    let inputs = tray::TrayInputs {
-                        mesh: self.chrome.summary(),
-                        seat: self.system.snapshot(),
-                        unread,
-                        session_active,
-                    };
-                    clicked = dock::taskbar(ui, &mut self.nav.surface, &mut self.tray, &inputs);
-                });
-            clicked
-        };
+            None => {}
+        }
         if bar_clicked {
             self.nav.expanded = true;
         }
@@ -1054,10 +1007,10 @@ impl Shell {
     /// sliding sheet.
     fn central_view(&mut self, ctx: &egui::Context) {
         // Expand transition: 0.0 = collapsed (session), 1.0 = expanded (the
-        // active surface). The constant taskbar rides outside the fade.
+        // active surface). The floating dock rides outside the fade.
         let t = Motion::animate(ctx, "shell-expand", self.nav.expanded, Motion::BASE);
 
-        // DOCK-OVERLAP — when the vertical dock is shown and we are NOT in a
+        // DOCK-OVERLAP — when the dock is shown and we are NOT in a
         // full-screen remote desktop, reserve a left gutter equal to the dock's
         // live eased slide width so the central content is NOT covered by the dock
         // (it insets in lockstep with the slide, no overlap). In a full-screen
@@ -1068,12 +1021,7 @@ impl Shell {
         // full-screen-remote condition the KIRON focus-mute uses (`render`).
         let full_screen_remote_desktop =
             self.nav.surface == Surface::Desktop && self.vdi.requested_target().is_some();
-        let gutter = reserved_dock_gutter(
-            self.vertical_dock,
-            full_screen_remote_desktop,
-            ctx,
-            &self.vdock,
-        );
+        let gutter = reserved_dock_gutter(full_screen_remote_desktop, ctx, &self.vdock);
         if gutter > 0.0 {
             egui::SidePanel::left("shell-dock-gutter")
                 .exact_width(gutter)
@@ -1113,21 +1061,19 @@ impl Shell {
 /// DOCK-OVERLAP — the width of the left gutter the shell reserves for the vertical
 /// dock this frame so the central content is never covered by it. It is the dock's
 /// live eased slide width ([`dock::gutter_width`], `0.0` when hidden + settled) —
-/// but reserved ONLY when the vertical dock is mounted AND we are NOT in a
-/// full-screen remote desktop. In a full-screen remote desktop the dock floats as
-/// an overlay (it reveals OVER the edge-to-edge remote), so nothing is reserved;
-/// the legacy bottom taskbar likewise reserves no side gutter. Split out (and pure
-/// but for the dock's slide read) so the gate is unit-testable.
+/// but reserved ONLY when we are NOT in a full-screen remote desktop. In a
+/// full-screen remote desktop the dock floats as an overlay (it reveals OVER the
+/// edge-to-edge remote), so nothing is reserved. Split out (and pure but for the
+/// dock's slide read) so the gate is unit-testable.
 fn reserved_dock_gutter(
-    vertical_dock: bool,
     full_screen_remote_desktop: bool,
     ctx: &egui::Context,
     vdock: &dock::DockState,
 ) -> f32 {
-    if vertical_dock && !full_screen_remote_desktop {
-        dock::gutter_width(ctx, vdock)
-    } else {
+    if full_screen_remote_desktop {
         0.0
+    } else {
+        dock::gutter_width(ctx, vdock)
     }
 }
 
@@ -1178,9 +1124,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        chrome, dock, editor_panel, files_panel, media_header, media_panel, real_editor,
-        real_media, real_terminal, reserved_dock_gutter, splash, terminal_panel, tray, Boot, Nav,
-        Plane, Surface,
+        dock, editor_panel, files_panel, media_header, media_panel, real_editor, real_media,
+        real_terminal, reserved_dock_gutter, splash, terminal_panel, Boot, Nav, Plane, Surface,
     };
     use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::Style;
@@ -1210,7 +1155,7 @@ mod tests {
         let mut shown = dock::DockState::default();
         shown.toggle();
         assert!(
-            (reserved_dock_gutter(true, false, &ctx, &shown) - dock::DOCK_W).abs() < f32::EPSILON,
+            (reserved_dock_gutter(false, &ctx, &shown) - dock::DOCK_W).abs() < f32::EPSILON,
             "a shown dock off a full-screen remote reserves a DOCK_W gutter (no overlap)"
         );
 
@@ -1219,29 +1164,17 @@ mod tests {
         let ctx2 = egui::Context::default();
         let mut shown2 = dock::DockState::default();
         shown2.toggle();
-        assert_eq!(
-            reserved_dock_gutter(true, true, &ctx2, &shown2),
-            0.0,
+        assert!(
+            reserved_dock_gutter(true, &ctx2, &shown2).abs() < f32::EPSILON,
             "in a full-screen remote desktop the dock overlays — no gutter reserved"
         );
 
         // A hidden dock → NO gutter (content fills the full width).
         let ctx3 = egui::Context::default();
         let hidden = dock::DockState::default();
-        assert_eq!(
-            reserved_dock_gutter(true, false, &ctx3, &hidden),
-            0.0,
+        assert!(
+            reserved_dock_gutter(false, &ctx3, &hidden).abs() < f32::EPSILON,
             "a hidden dock reserves nothing — the content fills full width"
-        );
-
-        // The legacy bottom taskbar reserves no side gutter.
-        let ctx4 = egui::Context::default();
-        let mut shown4 = dock::DockState::default();
-        shown4.toggle();
-        assert_eq!(
-            reserved_dock_gutter(false, false, &ctx4, &shown4),
-            0.0,
-            "the bottom taskbar reserves no side gutter"
         );
     }
 
@@ -1266,7 +1199,7 @@ mod tests {
     }
 
     /// Mount an empty left gutter `SidePanel` of `gutter` (0 = none) exactly as
-    /// `central_view` does, then a `CentralPanel`, and return the CentralPanel
+    /// `central_view` does, then a `CentralPanel`, and return the `CentralPanel`
     /// content rect's LEFT — the inset the reserved gutter produces.
     fn central_left_after_gutter(gutter: f32) -> f32 {
         let ctx = egui::Context::default();
@@ -1321,28 +1254,21 @@ mod tests {
         assert!(!boot.splash.dismissed(), "dismissed before init completed");
     }
 
-    /// Mount the shell's constant bottom taskbar (NAVBAR-W10-2, with a default
-    /// tray over an unseen mesh) exactly as `render` does — the bar-then-central
-    /// mount order every surface test below reproduces.
-    fn mount_taskbar(ctx: &egui::Context, active: &mut Surface) {
-        let mesh = chrome::MeshSummary::default();
-        let mut tray_state = tray::TrayState::default();
-        let inputs = tray::TrayInputs {
-            mesh: &mesh,
-            seat: None,
-            unread: 0,
-            session_active: false,
-        };
-        egui::TopBottomPanel::bottom("shell-taskbar")
-            .exact_height(dock::TASKBAR_H)
-            .frame(egui::Frame::default().fill(Style::SURFACE))
-            .show(ctx, |ui| {
-                let _ = dock::taskbar(ui, active, &mut tray_state, &inputs);
-            });
+    /// Mount the shell's **vertical dock** chrome (VDOCK, the sole chrome) exactly
+    /// as `render`'s `mount_dock_chrome` does — the floating dock `Area` mounted
+    /// before the central view — so the surface-mount tests below reproduce the live
+    /// chrome-then-central order. The dock is revealed so its frame actually paints;
+    /// it mirrors `active` in and reads the picker selection back out.
+    fn mount_dock(ctx: &egui::Context, active: &mut Surface) {
+        let mut vdock = dock::DockState::default();
+        vdock.toggle(); // reveal it so the dock frame paints
+        vdock.set_active(*active);
+        let _ = dock::dock(ctx, &mut vdock);
+        *active = vdock.active();
     }
 
     /// Drive one headless frame that reproduces the shell's **body mount** — the
-    /// constant bottom taskbar, then a surface scoped under `push_id` in the
+    /// vertical dock chrome, then a surface scoped under `push_id` in the
     /// shell's `CentralPanel` — then tessellate it on the CPU so any paint-path
     /// fault surfaces as a failure. This is the same `Context::run` → `tessellate`
     /// path the DRM runner drives, minus the GPU (no window, no wgpu).
@@ -1368,7 +1294,7 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            mount_taskbar(ctx, &mut active);
+            mount_dock(ctx, &mut active);
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.push_id("shell-files", |ui| files_panel(ui, &mut files));
             });
@@ -1380,8 +1306,8 @@ mod tests {
         );
     }
 
-    /// The Media surface (MEDIA-18) mounts through the same `body` path — the bottom
-    /// taskbar plus the media header + `media_panel` scoped under `push_id` — over the
+    /// The Media surface (MEDIA-18) mounts through the same `body` path — the dock
+    /// chrome plus the media header + `media_panel` scoped under `push_id` — over the
     /// **real** `mde_media_core` backend (`real_media()`, no demo data; with no media
     /// indexed it shows the honest first-run Sources view, still a full paint path).
     /// Tessellating it on the CPU proves the whole media player is runtime-reachable
@@ -1399,7 +1325,7 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            mount_taskbar(ctx, &mut active);
+            mount_dock(ctx, &mut active);
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.push_id("shell-media", |ui| {
                     media_header(ui, &mut media);
@@ -1416,7 +1342,7 @@ mod tests {
     }
 
     /// The Terminal surface (TERM-16) mounts through the same `body` path — the
-    /// bottom taskbar plus `terminal_panel` scoped under `push_id` — over a **real**
+    /// dock chrome plus `terminal_panel` scoped under `push_id` — over a **real**
     /// local PTY (`real_terminal()`, no demo data; a refused first PTY renders the
     /// honest spawn error, still a full paint path). Tessellating it on the CPU
     /// proves the whole Terminator-class terminal is runtime-reachable as an
@@ -1434,7 +1360,7 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            mount_taskbar(ctx, &mut active);
+            mount_dock(ctx, &mut active);
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.push_id("shell-terminal", |ui| terminal_panel(ui, &mut terminal));
             });
@@ -1446,8 +1372,8 @@ mod tests {
         );
     }
 
-    /// The Editor surface (EDITOR-1) mounts through the same `body` path — the bottom
-    /// taskbar plus `editor_panel` scoped under `push_id` — over a fresh
+    /// The Editor surface (EDITOR-1) mounts through the same `body` path — the dock
+    /// chrome plus `editor_panel` scoped under `push_id` — over a fresh
     /// `EditorSurface` (`real_editor()`). EDITOR-1 is the scaffold, so the panel
     /// paints the editor chrome + the honest "No file open" empty state (§7, a real
     /// reachable state, not a `todo!()`). Tessellating it on the CPU proves the
@@ -1464,7 +1390,7 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            mount_taskbar(ctx, &mut active);
+            mount_dock(ctx, &mut active);
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.push_id("shell-editor", |ui| editor_panel(ui, &mut editor));
             });

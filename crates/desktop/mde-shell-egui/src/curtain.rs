@@ -176,8 +176,8 @@ impl LockMedia for MediaSurface {
 }
 
 /// The **master-volume seam** (design lock 3): the curtain's volume slider +
-/// mute toggle drive the SAME host mixer (`wpctl`/`PipeWire`) the tray's
-/// `TrayVerbs` do — the master output is a global host service, so the curtain
+/// mute toggle drive the SAME host mixer (`wpctl`/`PipeWire`) the System surface's
+/// mixer controls do — the master output is a global host service, so the curtain
 /// owns its own lazy client rather than reaching the System state's `Seat`
 /// handle (lock 1). Tests inject a recording fake. The current level is read
 /// from the passed [`SeatSnapshot`], not this seam — a write-only verb pair.
@@ -450,9 +450,8 @@ fn lift_offset(p: f32) -> f32 {
 
 /// The face's two lines (lock 6): wall-clock `HH:MM` over the civil
 /// `YYYY-MM-DD`, UTC — the same no-time-crate calendar fold the Chat timeline
-/// and the tray's stacked clock run ([`crate::chat::civil_from_days`] is the
-/// crate's ONE calendar, §6; the tray's own `clock_lines` is module-private,
-/// so the fold is restated here rather than reaching into `tray.rs`).
+/// runs ([`crate::chat::civil_from_days`] is the crate's ONE calendar, §6),
+/// restated here rather than reaching across surface modules.
 fn face_lines(unix_secs: i64) -> (String, String) {
     let tod = unix_secs.rem_euclid(86_400);
     let (year, month, day) = crate::chat::civil_from_days(unix_secs.div_euclid(86_400));
@@ -1275,7 +1274,6 @@ mod tests {
     use super::*;
     use crate::chrome::MeshSummary;
     use crate::dock::{self, Surface};
-    use crate::tray::{TrayInputs, TrayState};
     use mde_seat::{Backend, BatteryKind, MixerStatus, MixerStrip, Probe, StripOrigin};
     use std::collections::VecDeque;
 
@@ -1884,23 +1882,19 @@ mod tests {
 
     // ── input exclusivity (lock 10) ──
 
-    /// Mount the shell's real bottom taskbar exactly as `render` does, plus —
-    /// optionally — the engaged curtain drawn after it (the render order in
-    /// `main.rs`), for one headless frame.
+    /// Mount a generic bottom **chrome strip** standing in for the shell's dock —
+    /// one full-width clickable band that routes to the Workbench on a click — plus
+    /// (optionally) the engaged curtain drawn after it (the render order in
+    /// `main.rs`), for one headless frame. The real chrome is the left vertical dock
+    /// (VDOCK); this input-exclusivity test only needs an interactive region under
+    /// the curtain to prove the whole-screen grab (lock 10) swallows a click meant
+    /// for the chrome beneath.
     fn shell_frame(
         ctx: &egui::Context,
         active: &mut Surface,
         mut curtain: Option<&mut Curtain>,
         events: Vec<egui::Event>,
     ) {
-        let mesh = MeshSummary::default();
-        let inputs = TrayInputs {
-            mesh: &mesh,
-            seat: None,
-            unread: 0,
-            session_active: false,
-        };
-        let mut tray = TrayState::default();
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
@@ -1910,11 +1904,15 @@ mod tests {
             ..Default::default()
         };
         let _ = ctx.run(input, |ctx| {
-            egui::TopBottomPanel::bottom("shell-taskbar")
+            egui::TopBottomPanel::bottom("shell-chrome")
                 .exact_height(dock::TASKBAR_H)
                 .frame(egui::Frame::default().fill(Style::SURFACE))
                 .show(ctx, |ui| {
-                    let _ = dock::taskbar(ui, active, &mut tray, &inputs);
+                    let (_rect, resp) =
+                        ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
+                    if resp.clicked() {
+                        *active = Surface::Workbench;
+                    }
                 });
             // Reborrow per frame — `ctx.run`'s closure is `FnMut`.
             if let Some(c) = curtain.as_deref_mut() {
@@ -1925,11 +1923,10 @@ mod tests {
 
     #[test]
     fn the_engaged_curtain_swallows_clicks_before_the_dock() {
-        // The dock's leftmost (Workbench) cell centre — derived from the same
-        // layout tokens as dock's private CELL_W (`SP_XL + SP_M`; dock.rs is
-        // read-only for CURTAIN-1, so the constant is restated here).
-        let cell_w = Style::SP_XL + Style::SP_M;
-        let click = egui::pos2(cell_w / 2.0, 600.0 - dock::TASKBAR_H / 2.0);
+        // A point inside the bottom chrome band (any x in the band works; the y is
+        // the band's vertical centre). With no curtain the click routes to Workbench;
+        // under the engaged curtain the whole-screen grab swallows it.
+        let click = egui::pos2(32.0, 600.0 - dock::TASKBAR_H / 2.0);
         let press = egui::Event::PointerButton {
             pos: click,
             button: egui::PointerButton::Primary,
