@@ -475,6 +475,14 @@ pub struct DockState {
     /// [`Self::take_node_focus`] (the deferred-wire idiom, like [`Self::pending`]).
     /// A `String` (not `Copy`), so it rides its own field rather than [`DockRequest`].
     pending_node_focus: Option<String>,
+    /// CONSOLE-1 — whether the Console front-door panel is up, mirrored in by
+    /// the shell each frame ([`Self::set_console_open`]) so the Start cell wears
+    /// its active tint (the `set_active` mirror idiom).
+    console_open: bool,
+    /// CONSOLE-1 — latched `true` by a Start-cell click ([`start_cell`]); the
+    /// shell drains it ([`Self::take_console_toggle`]) and toggles the Console
+    /// panel. The dock can't reach the panel itself (§6, the deferred wire).
+    console_toggle: bool,
 }
 
 /// A shell-level **request** the VDOCK-4 system quad records for the shell to drain
@@ -631,6 +639,24 @@ impl DockState {
     pub const fn take_node_focus(&mut self) -> Option<String> {
         self.pending_node_focus.take()
     }
+
+    /// Mirror the Console front-door panel's open state into the dock before
+    /// [`dock`] (CONSOLE-1) — the Start cell's active tint then follows the real
+    /// panel (the [`Self::set_active`] mirror idiom). Wired by
+    /// `main.rs::mount_dock_chrome`.
+    pub const fn set_console_open(&mut self, open: bool) {
+        self.console_open = open;
+    }
+
+    /// Drain the Start cell's **Console toggle** (CONSOLE-1) — `true` exactly
+    /// once per Start-cell click; the shell flips the Console panel on it (the
+    /// [`Self::take_request`] deferred-wire idiom). Pressing Start with the
+    /// panel already up drains through the same latch and closes it (lock #4).
+    pub const fn take_console_toggle(&mut self) -> bool {
+        let toggled = self.console_toggle;
+        self.console_toggle = false;
+        toggled
+    }
 }
 
 /// Render the **left vertical dock** (VDOCK-1) — the slide-in, auto-hide chrome,
@@ -744,12 +770,28 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
 
     let mut clicked = false;
 
-    // ── TOP zone (design #8) — the Workbench lead pinned top, the pin folded in ──
-    // The Workbench lead is the topmost cell (the mesh-control home, always one
-    // click away); VDOCK-1's pin toggle (lock #9 — the "pin" half of "hotkey +
-    // pin") folds into a slim strip just beneath it. A BORDER hairline sets the
-    // lead apart from the app groups below.
-    let wb = egui::Rect::from_min_size(rect.min, egui::vec2(DOCK_W, DOCK_W));
+    // ── TOP zone (design #8 + CONSOLE-1) — the Start front door, the Workbench
+    // lead, the pin folded in. CONSOLE-1's Start cell (the Terminal glyph — the
+    // terminal's front door) is the TOPMOST cell: the console design locked
+    // "far-left, before Workbench" on the old horizontal bar, and on the
+    // vertical dock far-left maps to the top, still before the Workbench lead.
+    // A BORDER hairline seats it apart; the Workbench lead (the mesh-control
+    // home, always one click away) sits beneath, with VDOCK-1's pin toggle
+    // (lock #9 — the "pin" half of "hotkey + pin") in a slim strip under it and
+    // a hairline before the app groups below.
+    let start = egui::Rect::from_min_size(rect.min, egui::vec2(DOCK_W, DOCK_W));
+    if start_cell(ui, start, state) {
+        clicked = true;
+    }
+    painter.hline(
+        (rect.left() + Style::SP_XS)..=(rect.right() - Style::SP_XS),
+        start.bottom(),
+        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+    );
+    let wb = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), start.bottom()),
+        egui::vec2(DOCK_W, DOCK_W),
+    );
     if pick_app_cell(ui, Surface::Workbench, &mut state.active, wb) {
         clicked = true;
     }
@@ -865,6 +907,49 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
     }
 
     clicked
+}
+
+/// The stable id of CONSOLE-1's Start cell, so tests read its settled `Rect`.
+fn start_cell_id() -> egui::Id {
+    egui::Id::new("vdock-start-cell")
+}
+
+/// CONSOLE-1's **Start cell** — the Console front door's trigger (console
+/// design locks #1/#2): the topmost dock cell (the vertical mapping of the
+/// design's "far-left, before Workbench"), wearing the **Terminal brand glyph**
+/// because the Console IS the terminal's front door. A click latches the
+/// Console toggle for the shell to drain ([`DockState::take_console_toggle`] —
+/// the deferred wire; pressing it again closes, lock #4). While the panel is up
+/// (mirrored in via [`DockState::set_console_open`]) the cell wears the
+/// selection wash + ACCENT tint, the sys-cell "menu open" idiom. Every colour
+/// is a Style token (§4). Returns `true` on a click.
+fn start_cell(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> bool {
+    let resp = ui.interact(rect, start_cell_id(), egui::Sense::click());
+    let hovered = resp.hovered();
+    let painter = ui.painter().clone();
+    if state.console_open {
+        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
+    } else if hovered {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let tint = if state.console_open {
+        Style::ACCENT
+    } else if hovered {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::Terminal, ICON_LOGICAL, tint) {
+        let icon =
+            egui::Rect::from_center_size(rect.center(), egui::vec2(ICON_LOGICAL, ICON_LOGICAL));
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
+    }
+    if resp.clicked() {
+        state.console_toggle = true;
+        return true;
+    }
+    false
 }
 
 /// The dock's **pin** toggle (VDOCK-1, lock #9) — the minimal affordance that
@@ -2117,7 +2202,7 @@ fn power_arming_stage(ui: &mut egui::Ui, power: &mut PowerMenu) -> Option<PowerI
 mod tests {
     use super::{
         clock_cell_id, dock, grade_band_height, grade_overflow_id, grade_row_id, group_height,
-        gutter_width, overflow_more_id, pick_cell_id, power_item_id, sys_cell_id,
+        gutter_width, overflow_more_id, pick_cell_id, power_item_id, start_cell_id, sys_cell_id,
         visible_group_count, DockRequest, DockState, PowerItem, PowerMenu, Surface, SysCell,
         BOTTOM_ZONE_H, CELL_W, DOCK_AREA, DOCK_W, GRADE_MAX_ROWS, GROUPS, ICON_LOGICAL,
         PIN_STRIP_H, POWER_MENU, STATUS_SYS_H, SYSTEM_QUAD, SYS_QUAD_ICON,
@@ -2500,9 +2585,9 @@ mod tests {
         s.toggle(); // reveal it so the Area (and its pin) is mounted
 
         // VDOCK-2 folded the pin into the slim strip just BENEATH the Workbench
-        // lead cell (the top DOCK_W-tall cell is now the Workbench); click the pin
-        // strip's centre.
-        let click = egui::pos2(DOCK_W / 2.0, DOCK_W + PIN_STRIP_H / 2.0);
+        // lead cell — which CONSOLE-1's Start cell pushed down one DOCK_W (the
+        // top cell is now the Start front door); click the pin strip's centre.
+        let click = egui::pos2(DOCK_W / 2.0, DOCK_W + DOCK_W + PIN_STRIP_H / 2.0);
         let press = egui::Event::PointerButton {
             pos: click,
             button: egui::PointerButton::Primary,
@@ -2539,6 +2624,56 @@ mod tests {
         frame(&ctx, &mut s, vec![egui::Event::PointerMoved(click), press]);
         frame(&ctx, &mut s, vec![release]);
         assert!(s.pinned(), "clicking the pin holds the dock open (lock #9)");
+    }
+
+    // ── CONSOLE-1: the Start front door's dock cell ────────────────────────────
+
+    #[test]
+    fn the_start_cell_tops_the_dock_and_latches_the_console_toggle() {
+        // Console locks #1/#2 mapped to the vertical dock: the Start cell is the
+        // TOPMOST cell (far-left → top), before the Workbench lead, and a click
+        // latches the console toggle the shell drains — exactly once.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle(); // reveal the dock so its cells mount
+        let sz = egui::vec2(1280.0, 900.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let start = ctx
+            .read_response(start_cell_id())
+            .expect("the Start cell is registered")
+            .rect;
+        assert!(start.top() < 1.0, "the Start cell anchors the dock's top");
+        assert!(
+            (start.height() - DOCK_W).abs() < 1.0 && (start.width() - DOCK_W).abs() < 1.0,
+            "the Start cell is one DOCK_W module"
+        );
+        let wb = ctx
+            .read_response(pick_cell_id(Surface::Workbench))
+            .expect("the Workbench lead is registered")
+            .rect;
+        assert!(
+            (wb.top() - start.bottom()).abs() < 1.0,
+            "Start sits BEFORE (above) the Workbench lead (console lock #2)"
+        );
+
+        assert!(!s.take_console_toggle(), "no toggle before a click");
+        click_vdock(&ctx, &mut s, start.center(), sz);
+        assert!(
+            s.take_console_toggle(),
+            "a Start-cell click latches the console toggle"
+        );
+        assert!(
+            !s.take_console_toggle(),
+            "the toggle latch drains exactly once"
+        );
+        assert_eq!(
+            s.active,
+            Surface::default(),
+            "the Start cell routes NO surface — it only toggles the Console"
+        );
     }
 
     // ── DOCK-OVERLAP: the shell reserves a gutter so the dock never overlaps ──

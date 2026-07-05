@@ -23,6 +23,7 @@ mod bt_pairing;
 mod chat;
 mod chooser;
 mod chrome;
+mod console;
 mod controller;
 mod curtain;
 mod datacenter;
@@ -150,6 +151,14 @@ struct Shell {
     /// the hotkey path (`hotkeys::HotkeyRouter::take_dock_toggle`); and
     /// `mount_dock_chrome` mirrors `nav.surface` in/out + drains its lock/power request.
     vdock: dock::DockState,
+    /// CONSOLE-1 — the Console front-door panel (the Terminal's Start Menu,
+    /// `docs/design/console-frontdoor.md`): the Win10 two-pane of operational
+    /// entries the dock's Start cell toggles. The dock latches the toggle and
+    /// the shell drains it here (the deferred wire), mounts the panel each
+    /// frame, and drives its typed [`console::ConsoleRequest`]s (a live
+    /// surface-link routes the nav; command launches stay honest-gated on the
+    /// CONSOLE-2 spawn-tab seam, §7).
+    console: console::ConsoleState,
     /// The Music surface, owned + built once (its worker thread wakes the shell's
     /// egui context on every update). Rendered via `mde_music_egui::music_panel`.
     music: MusicApp,
@@ -319,6 +328,7 @@ impl Shell {
             spawn_lighthouse: spawn_lighthouse_flow::SpawnLighthouseFlowState::default(),
             chrome: chrome::ChromeState::default(),
             vdock: dock::DockState::default(),
+            console: console::ConsoleState::default(),
             music: MusicApp::new_with_ctx(ctx),
             media: real_media(),
             files: mde_files_egui::real_browser(),
@@ -948,6 +958,11 @@ impl Shell {
         // Extracted to a helper so `render` stays within the line budget.
         self.mount_dock_chrome(ctx);
 
+        // CONSOLE-1 — the Terminal's Start-Menu front door: the panel + its
+        // toggle/request drains, split to a helper (the mount_dock_chrome idiom)
+        // so `render` stays within the line budget.
+        self.mount_console(ctx);
+
         // The central view: the session↔body cross-fade — or nothing at all
         // while the settled curtain fully covers the seat (CURTAIN-1, lock 10).
         self.central_view(ctx);
@@ -1066,6 +1081,9 @@ impl Shell {
         // quads their live inputs (VDOCK-3), then read the picker's selection
         // straight back OUT so a picker-cell click routes the body.
         self.vdock.set_active(self.nav.surface);
+        // CONSOLE-1 — mirror the Console panel's open state in first, so the
+        // Start cell's active tint follows the real panel (the set_active idiom).
+        self.vdock.set_console_open(self.console.is_open());
         self.vdock.set_status_inputs(
             self.chrome.summary().clone(),
             self.system.snapshot().cloned(),
@@ -1097,6 +1115,33 @@ impl Shell {
         }
         if bar_clicked {
             self.nav.expanded = true;
+        }
+    }
+
+    /// CONSOLE-1 — mount the Terminal's Start-Menu **front door** for this
+    /// frame: drain the dock Start cell's toggle latch (ALWAYS drained so it
+    /// never backs up — the Super-tap idiom), mount the Console panel (the
+    /// floating slide-up beside the dock, `console::console_panel`), and drive
+    /// its typed requests. Everything but the drain sits behind the curtain
+    /// gate (CURTAIN-1 lock 10): the panel reads raw Esc/arrow/Enter presses,
+    /// which must never act past the lock — the hotkey-gate posture. Split out
+    /// of `render` (the `mount_dock_chrome` idiom) so each stays within the
+    /// line budget.
+    fn mount_console(&mut self, ctx: &egui::Context) {
+        let toggled = self.vdock.take_console_toggle();
+        if self.curtain.engaged() {
+            return;
+        }
+        if toggled {
+            self.console.toggle();
+        }
+        console::console_panel(ctx, &mut self.console);
+        if let Some(console::ConsoleRequest::Goto(surface)) = self.console.take_request() {
+            // A live surface-link entry (the pinned Terminal, the Cloud-plane
+            // link) routes the shell body — a navigation is never a no-op
+            // behind the session.
+            self.nav.expanded = true;
+            self.nav.surface = surface;
         }
     }
 
