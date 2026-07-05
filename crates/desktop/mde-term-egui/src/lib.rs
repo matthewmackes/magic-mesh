@@ -203,9 +203,11 @@ pub use splits::{
 pub use tabs::{consume_tab_commands, RemoteHub, TabCommand, TabbedTerminal};
 pub use title::PaneTitle;
 pub use tmux::{
-    commands as tmux_commands, parse_layout, parse_session_list, ControlChannel, Layout, LayoutDir,
-    LayoutError, LayoutKind, Notification, Parser as TmuxParser, ResizeDir, SessionInfo,
-    Status as TmuxStatus, TmuxController, TmuxLaunch, TmuxModel, TmuxPane, TmuxSession, TmuxWindow,
+    commands as tmux_commands, parse_layout, parse_pane_titles, parse_session_list,
+    parse_window_order, resize_for_divider, CommandSink, ControlChannel, Layout, LayoutDir,
+    LayoutError, LayoutKind, Notification, PaneResize, Parser as TmuxParser, ResizeDir,
+    SessionInfo, Status as TmuxStatus, TmuxController, TmuxLaunch, TmuxModel, TmuxPane, TmuxPaneIo,
+    TmuxSession, TmuxWindow,
 };
 pub use tmux_ui::{command_for, TmuxChrome, TmuxIntent, TmuxMenuChoice};
 pub use watch::{ActivityWatch, WatchEvent, WatchMode};

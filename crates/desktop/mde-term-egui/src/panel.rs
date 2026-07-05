@@ -121,9 +121,15 @@ pub fn terminal_panel(ui: &mut Ui, surface: &mut TerminalSurface) {
             // The tmux session/window/pane tree mounts as a left panel (only when
             // opened), reserving its width before the terminal fills the rest.
             tmux.sidebar(ui);
-            term.show(ui);
-            if term.is_empty() {
-                empty_state(ui, term);
+            // TMUX-FC-3: while a control client is live, the body is the mounted
+            // tmux window view (tab strip + the window's panes as live TERM-3
+            // widgets); otherwise the native tabbed terminal owns it (lock #3
+            // coexistence — tmux stays opt-in, detach returns the native shell).
+            if !tmux.window_body(ui) {
+                term.show(ui);
+                if term.is_empty() {
+                    empty_state(ui, term);
+                }
             }
         }
         Err(err) => {

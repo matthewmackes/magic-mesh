@@ -38,15 +38,21 @@
 //!   [`TmuxModel`], with an honest [`Status`] (Connecting / Attached / Error /
 //!   Exited — no fake attach if `tmux` is absent or `-CC` fails).
 //!
-//! ## Seams left for TMUX-FC-2..8
-//! The core is render-agnostic. What it deliberately leaves for the chrome units:
-//! - Mounting the per-window [`TmuxModel::window_tree`] + per-pane
-//!   [`TmuxModel::pane_terminal`] into a live [`crate::splits::SplitTerminal`] /
-//!   [`crate::tabs::TabbedTerminal`] (a `Session::Tmux` widget backing that reads
-//!   the shared engine and routes typed input to [`commands::send_keys`]).
-//! - The sidebar tree, native Quasar status bar, toolbar + command palette,
-//!   context menus (TMUX-FC-2), session create/attach/detach + persistence
-//!   (TMUX-FC-3..6), mesh attach (TMUX-FC-7), and the layout presets (TMUX-FC-8).
+//! ## Landed on top (TMUX-FC-2/3) and seams left for TMUX-FC-4..8
+//! - TMUX-FC-2: the sidebar tree + session ops + the all-sessions picker
+//!   (`crate::tmux_ui`), fed by [`commands`]' session builders +
+//!   [`parse_session_list`].
+//! - TMUX-FC-3 (here): the **window & pane op** builders (split / close / zoom ·
+//!   break / join / swap / move · resize · rename), the zoom + window-order +
+//!   pane-title model truth ([`parse_pane_titles`] / [`parse_window_order`] over
+//!   tagged `list-*` replies — reconciliation stays server-driven), the
+//!   divider-drag → `resize-pane` mapping ([`resize_for_divider`]), and the
+//!   **pane-content mount seam**: [`CommandSink`] + [`TmuxPaneIo`] back a
+//!   [`crate::session::Session::Tmux`] widget that reads the shared engine and
+//!   routes typed input to [`commands::send_keys`].
+//! - Still open: native status bar + toolbar + palette + context menus
+//!   (TMUX-FC-4), persistence/templates (FC-5), mesh attach (FC-6), presets
+//!   (FC-7), config/keys/copy (FC-8).
 
 #![allow(clippy::module_name_repetitions)]
 
@@ -63,7 +69,7 @@ use alacritty_terminal::event::{OnResize, WindowSize};
 use alacritty_terminal::tty;
 
 use crate::engine::Terminal;
-use crate::splits::{clamp_ratio, Pane as SplitPane, SessionId, SplitDir};
+use crate::splits::{clamp_ratio, NodePath, Pane as SplitPane, SessionId, SplitDir};
 
 /// Read chunk for the control-channel pump (one kernel PTY buffer, ~8 KiB).
 const CTRL_READ_CHUNK: usize = 8192;
@@ -288,6 +294,57 @@ impl ControlChannel {
     pub const fn child_pid(&self) -> u32 {
         self.child_pid
     }
+
+    /// A cloneable command-line handle onto this channel — what a mounted pane
+    /// widget holds to route its typed input through [`commands::send_keys`]
+    /// without owning the channel (TMUX-FC-3's pane-content mount seam).
+    #[must_use]
+    pub fn sink(&self) -> CommandSink {
+        CommandSink {
+            input_tx: Arc::clone(&self.input_tx),
+        }
+    }
+}
+
+/// A cloneable write-side handle onto a [`ControlChannel`].
+///
+/// One command line per call, honestly [`CommandSink::is_closed`] once the
+/// channel dies. Held by each mounted pane's [`TmuxPaneIo`] so many widgets
+/// share the one control channel.
+#[derive(Clone)]
+pub struct CommandSink {
+    input_tx: Arc<Mutex<Option<Sender<Vec<u8>>>>>,
+}
+
+impl CommandSink {
+    /// Write one control-mode command line (a trailing `\n` is added).
+    ///
+    /// # Errors
+    /// [`ErrorKind::BrokenPipe`] once the channel's write side is gone.
+    pub fn send_line(&self, command: &str) -> std::io::Result<()> {
+        let mut bytes = command.as_bytes().to_vec();
+        bytes.push(b'\n');
+        lock_unpoisoned(&self.input_tx)
+            .as_ref()
+            .and_then(|tx| tx.send(bytes).ok())
+            .ok_or_else(|| ErrorKind::BrokenPipe.into())
+    }
+
+    /// `true` once the channel's write side is gone (the tmux client exited).
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        lock_unpoisoned(&self.input_tx).is_none()
+    }
+
+    /// A sink wired to a raw queue instead of a live channel — the test seam
+    /// (asserts the exact command lines a mounted pane emits).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_tests(tx: Sender<Vec<u8>>) -> Self {
+        Self {
+            input_tx: Arc::new(Mutex::new(Some(tx))),
+        }
+    }
 }
 
 impl Drop for ControlChannel {
@@ -387,8 +444,13 @@ pub enum Notification {
         window: u32,
         /// The full layout string (checksum-prefixed).
         layout: String,
-        /// The visible-layout string (newer tmux), if present.
+        /// The visible-layout string (newer tmux), if present. When the window
+        /// is zoomed this is the zoomed arrangement (the one on screen), while
+        /// `layout` stays the full pane set.
         visible: Option<String>,
+        /// The window-flags token (newer tmux), if present — `Z` inside it means
+        /// the window is zoomed.
+        flags: Option<String>,
     },
     /// `%session-changed $<session> <name>` — the attached session changed.
     SessionChanged {
@@ -422,6 +484,14 @@ pub enum Notification {
         window: u32,
         /// The new window name.
         name: String,
+    },
+    /// `%session-window-changed $<session> @<window>` — the session's current
+    /// window changed (the round-trip echo of a `select-window`).
+    SessionWindowChanged {
+        /// The session id.
+        session: u32,
+        /// The now-current window id.
+        window: u32,
     },
     /// `%window-pane-changed @<window> %<pane>` — the window's active pane.
     WindowPaneChanged {
@@ -602,6 +672,15 @@ impl Parser {
             "%unlinked-window-renamed" => renamed(args, '@', |window, name| {
                 Notification::UnlinkedWindowRenamed { window, name }
             }),
+            "%session-window-changed" => {
+                let (sess_tok, win_tok) = split_head(args);
+                match (parse_id(sess_tok, '$'), parse_id(win_tok.trim(), '@')) {
+                    (Some(session), Some(window)) => {
+                        Notification::SessionWindowChanged { session, window }
+                    }
+                    _ => Notification::Other(line.to_owned()),
+                }
+            }
             "%window-pane-changed" => {
                 let (win_tok, pane_tok) = split_head(args);
                 match (parse_id(win_tok, '@'), parse_id(pane_tok.trim(), '%')) {
@@ -662,11 +741,13 @@ fn parse_layout_change(args: &str) -> Notification {
     let win = it.next();
     let layout = it.next();
     let visible = it.next().map(str::to_owned);
+    let flags = it.next().map(str::to_owned);
     match (win.and_then(|w| parse_id(w, '@')), layout) {
         (Some(window), Some(layout)) => Notification::LayoutChange {
             window,
             layout: layout.to_owned(),
             visible,
+            flags,
         },
         _ => Notification::Other(format!("%layout-change {args}")),
     }
@@ -963,8 +1044,16 @@ pub struct TmuxWindow {
     name: String,
     session: Option<u32>,
     layout: Option<Layout>,
+    /// The parsed visible layout, when it differs from the full one (a zoomed
+    /// window shows only the zoomed pane while `layout` keeps the full set).
+    visible: Option<Layout>,
     active_pane: Option<u32>,
     linked: bool,
+    /// Whether the window is zoomed (`Z` in the `%layout-change` flags).
+    zoomed: bool,
+    /// The window's position in its session (`#{window_index}`), learned from a
+    /// [`parse_window_order`] reply — tab-strip order, distinct from the id.
+    index: Option<u32>,
 }
 
 impl TmuxWindow {
@@ -997,6 +1086,19 @@ impl TmuxWindow {
     #[must_use]
     pub const fn is_linked(&self) -> bool {
         self.linked
+    }
+
+    /// Whether the window is zoomed (one pane temporarily fills it).
+    #[must_use]
+    pub const fn is_zoomed(&self) -> bool {
+        self.zoomed
+    }
+
+    /// The window's position in its session, when a window-order reply has
+    /// reported one.
+    #[must_use]
+    pub const fn index(&self) -> Option<u32> {
+        self.index
     }
 }
 
@@ -1073,6 +1175,8 @@ pub struct TmuxModel {
     windows: BTreeMap<u32, TmuxWindow>,
     panes: BTreeMap<u32, TmuxPane>,
     current_session: Option<u32>,
+    /// The session's current window (`%session-window-changed`).
+    current_window: Option<u32>,
     exited: Option<String>,
 }
 
@@ -1096,10 +1200,20 @@ impl TmuxModel {
             | Notification::UnlinkedWindowRenamed { window, name } => {
                 self.windows.entry(window).or_default().name = name;
             }
-            Notification::LayoutChange { window, layout, .. } => self.relayout(window, &layout),
+            Notification::LayoutChange {
+                window,
+                layout,
+                visible,
+                flags,
+            } => self.relayout(window, &layout, visible.as_deref(), flags.as_deref()),
             Notification::SessionChanged { session, name } => {
                 self.current_session = Some(session);
                 self.sessions.entry(session).or_default().name = name;
+            }
+            Notification::SessionWindowChanged { session, window } => {
+                if self.current_session.is_none_or(|s| s == session) {
+                    self.current_window = Some(window);
+                }
             }
             Notification::SessionRenamed { session, name } => {
                 let id = session.or(self.current_session);
@@ -1146,16 +1260,24 @@ impl TmuxModel {
     fn close_window(&mut self, window: u32) {
         self.windows.remove(&window);
         self.panes.retain(|_, p| p.window != Some(window));
+        if self.current_window == Some(window) {
+            self.current_window = None;
+        }
     }
 
     /// Reconcile a window's pane-set + arrangement from a new layout string:
     /// create panes new to the window (sized to their cells), resize existing
-    /// ones, and drop panes no longer present.
-    fn relayout(&mut self, window: u32, layout: &str) {
+    /// ones, and drop panes no longer present. The optional visible layout +
+    /// flags carry the zoom truth: `Z` in the flags means the window is zoomed
+    /// and the visible layout (the zoomed pane filling the window) is what's on
+    /// screen, while the full `layout` keeps the whole pane set alive.
+    fn relayout(&mut self, window: u32, layout: &str, visible: Option<&str>, flags: Option<&str>) {
         let Ok(parsed) = parse_layout(layout) else {
             return;
         };
         let ids = parsed.pane_ids();
+        let zoomed = flags.is_some_and(|f| f.contains('Z'));
+        let visible_parsed = visible.and_then(|v| parse_layout(v).ok());
 
         // Place + size each pane the layout mentions.
         collect_leaf_cells(&parsed, &mut |pane, w, h| {
@@ -1169,12 +1291,29 @@ impl TmuxModel {
             lock_unpoisoned(&entry.terminal).resize(usize::from(w.max(1)), usize::from(h.max(1)));
         });
 
+        // A zoomed window paints its visible arrangement — size those panes (in
+        // practice the one zoomed pane) to their on-screen cells instead.
+        if zoomed {
+            if let Some(vis) = visible_parsed.as_ref() {
+                collect_leaf_cells(vis, &mut |pane, w, h| {
+                    if let Some(entry) = self.panes.get_mut(&pane) {
+                        entry.width = w;
+                        entry.height = h;
+                        lock_unpoisoned(&entry.terminal)
+                            .resize(usize::from(w.max(1)), usize::from(h.max(1)));
+                    }
+                });
+            }
+        }
+
         // Drop panes that used to be in this window but the layout no longer has.
         self.panes
             .retain(|id, p| p.window != Some(window) || ids.contains(id));
 
         let entry = self.windows.entry(window).or_default();
         entry.layout = Some(parsed);
+        entry.zoomed = zoomed;
+        entry.visible = zoomed.then_some(visible_parsed).flatten();
         if entry.session.is_none() {
             entry.session = self.current_session;
         }
@@ -1184,6 +1323,13 @@ impl TmuxModel {
     #[must_use]
     pub const fn current_session(&self) -> Option<u32> {
         self.current_session
+    }
+
+    /// The session's current window, when a `%session-window-changed` has
+    /// arrived (the window the view mounts; falls back to the first linked one).
+    #[must_use]
+    pub const fn current_window(&self) -> Option<u32> {
+        self.current_window
     }
 
     /// Whether the control client has exited (with its reason, when given).
@@ -1210,14 +1356,20 @@ impl TmuxModel {
         self.windows.get(&id)
     }
 
-    /// The linked windows (those forming the current session's tab strip), by id.
+    /// The linked windows (those forming the current session's tab strip), in
+    /// session order — by `#{window_index}` once a window-order reply has
+    /// landed ([`Self::apply_window_order`]), falling back to id order until
+    /// then. This is what makes a `move-window` reorder visibly reconcile.
     #[must_use]
     pub fn windows_in_order(&self) -> Vec<u32> {
-        self.windows
+        let mut out: Vec<(u32, u32)> = self
+            .windows
             .iter()
             .filter(|(_, w)| w.linked)
-            .map(|(id, _)| *id)
-            .collect()
+            .map(|(id, w)| (w.index.unwrap_or(*id), *id))
+            .collect();
+        out.sort_unstable();
+        out.into_iter().map(|(_, id)| id).collect()
     }
 
     /// A pane by id.
@@ -1238,13 +1390,59 @@ impl TmuxModel {
     }
 
     /// The native split tree for a window — the mapping a renderer mounts as a
-    /// [`crate::splits::SplitTerminal`] tab (leaves keyed by tmux pane id).
+    /// [`crate::splits::SplitTerminal`] tab (leaves keyed by tmux pane id). A
+    /// zoomed window yields its **visible** arrangement (the zoomed pane filling
+    /// the window), exactly what tmux has on screen.
     #[must_use]
     pub fn window_tree(&self, window: u32) -> Option<SplitPane> {
-        self.windows
-            .get(&window)
-            .and_then(|w| w.layout.as_ref())
-            .map(Layout::to_pane_tree)
+        let win = self.windows.get(&window)?;
+        if win.zoomed {
+            if let Some(vis) = win.visible.as_ref() {
+                return Some(vis.to_pane_tree());
+            }
+        }
+        win.layout.as_ref().map(Layout::to_pane_tree)
+    }
+
+    /// Reconcile pane titles from a [`commands::list_pane_titles`] reply — the
+    /// server truth after a `select-pane -T` rename (tmux emits no `%`-event
+    /// for titles, so the reply is the round-trip's second half).
+    pub fn apply_pane_titles(&mut self, titles: &[(u32, String)]) {
+        for (pane, title) in titles {
+            if let Some(p) = self.panes.get_mut(pane) {
+                p.title.clone_from(title);
+            }
+        }
+    }
+
+    /// Reconcile the session's window order + membership from a
+    /// [`commands::list_window_order`] reply: reported windows are the current
+    /// session's tab strip (in `#{window_index}` order); linked windows the
+    /// reply no longer mentions have left the session. Server truth — the
+    /// reconcile after `move-window`/`break-pane`/`switch-client`.
+    pub fn apply_window_order(&mut self, order: &[(u32, u32)]) {
+        for (id, win) in &mut self.windows {
+            match order.iter().find(|(w, _)| w == id) {
+                Some((_, index)) => {
+                    win.linked = true;
+                    win.index = Some(*index);
+                    if win.session.is_none() {
+                        win.session = self.current_session;
+                    }
+                }
+                None => win.linked = false,
+            }
+        }
+        // Windows the model has not met yet (an attach to a pre-existing
+        // session streams no `%window-add` for them).
+        for (window, index) in order {
+            let entry = self.windows.entry(*window).or_default();
+            entry.linked = true;
+            entry.index = Some(*index);
+            if entry.session.is_none() {
+                entry.session = self.current_session;
+            }
+        }
     }
 
     /// The shared engine of a pane — the grid `%output` feeds and a renderer
@@ -1338,6 +1536,110 @@ pub mod commands {
     #[must_use]
     pub fn rename_window(window: u32, name: &str) -> String {
         format!("rename-window -t @{window} {}", quote(name))
+    }
+
+    /// Rename a pane's title: `select-pane -t %<pane> -T <title>` (tmux-quoted).
+    ///
+    /// tmux emits no `%`-event for titles — [`super::TmuxController`] follows up
+    /// with [`list_pane_titles`] so the reply reconciles the model.
+    #[must_use]
+    pub fn rename_pane(pane: u32, title: &str) -> String {
+        format!("select-pane -t %{pane} -T {}", quote(title))
+    }
+
+    /// Toggle a pane's zoom: `resize-pane -t %<pane> -Z` (the `%layout-change`
+    /// flags carry the `Z` truth back).
+    #[must_use]
+    pub fn zoom_pane(pane: u32) -> String {
+        format!("resize-pane -t %{pane} -Z")
+    }
+
+    /// Break a pane out into its own window: `break-pane -s %<pane>`
+    /// (`%window-add` + `%layout-change` reconcile).
+    #[must_use]
+    pub fn break_pane(pane: u32) -> String {
+        format!("break-pane -s %{pane}")
+    }
+
+    /// Join (move) a pane into another window: `join-pane -h -s %<src> -t @<dst>`
+    /// — a native [`SplitDir::V`] (side by side) is tmux's `-h`, [`SplitDir::H`]
+    /// (stacked) its `-v`, matching [`split_window`].
+    #[must_use]
+    pub fn join_pane(src: u32, dst_window: u32, dir: SplitDir) -> String {
+        let flag = match dir {
+            SplitDir::V => "-h",
+            SplitDir::H => "-v",
+        };
+        format!("join-pane {flag} -s %{src} -t @{dst_window}")
+    }
+
+    /// Swap two panes in place: `swap-pane -d -s %<a> -t %<b>` (`-d` keeps the
+    /// active pane where the user is looking).
+    #[must_use]
+    pub fn swap_panes(a: u32, b: u32) -> String {
+        format!("swap-pane -d -s %{a} -t %{b}")
+    }
+
+    /// Reorder: move a window immediately **before** another
+    /// (`move-window -b -s @<src> -t @<dst>`) — the drag-reorder drop's command.
+    #[must_use]
+    pub fn move_window_before(src: u32, dst: u32) -> String {
+        format!("move-window -b -s @{src} -t @{dst}")
+    }
+
+    /// Reorder: move a window immediately **after** another
+    /// (`move-window -a -s @<src> -t @<dst>`) — the drop past the last tab.
+    #[must_use]
+    pub fn move_window_after(src: u32, dst: u32) -> String {
+        format!("move-window -a -s @{src} -t @{dst}")
+    }
+
+    /// Set a pane's exact width in cells: `resize-pane -t %<pane> -x <cols>` —
+    /// the vertical-divider drag's command (tmux moves the shared boundary).
+    #[must_use]
+    pub fn resize_pane_width(pane: u32, cols: u16) -> String {
+        format!("resize-pane -t %{pane} -x {cols}")
+    }
+
+    /// Set a pane's exact height in cells: `resize-pane -t %<pane> -y <rows>` —
+    /// the horizontal-divider drag's command.
+    #[must_use]
+    pub fn resize_pane_height(pane: u32, rows: u16) -> String {
+        format!("resize-pane -t %{pane} -y {rows}")
+    }
+
+    /// Report the control client's grid size: `refresh-client -C <cols>x<rows>`.
+    ///
+    /// tmux lays windows out to the attached client's size, so the mounted view
+    /// sends this when its rect's cell grid changes — the `%layout-change` that
+    /// follows resizes every pane engine to what actually fits on screen.
+    #[must_use]
+    pub fn refresh_client_size(cols: u16, rows: u16) -> String {
+        format!("refresh-client -C {cols}x{rows}")
+    }
+
+    /// Enumerate the current session's panes with their titles.
+    ///
+    /// Each line is tagged [`super::PANE_TITLE_TAG`] so the reply is
+    /// self-identifying (never mistaken for a session list). Parsed by
+    /// [`super::parse_pane_titles`].
+    #[must_use]
+    pub fn list_pane_titles() -> String {
+        format!(
+            "list-panes -s -F '{}\t#{{pane_id}}\t#{{pane_title}}'",
+            super::PANE_TITLE_TAG
+        )
+    }
+
+    /// Enumerate the current session's windows in index order, each line tagged
+    /// [`super::WINDOW_ORDER_TAG`]. Parsed by [`super::parse_window_order`] —
+    /// the tab-strip order truth after a reorder/break/switch.
+    #[must_use]
+    pub fn list_window_order() -> String {
+        format!(
+            "list-windows -F '{}\t#{{window_id}}\t#{{window_index}}'",
+            super::WINDOW_ORDER_TAG
+        )
     }
 
     /// Resize a pane to an exact cell size: `resize-pane -t %<pane> -x <c> -y <r>`.
@@ -1488,6 +1790,212 @@ pub fn parse_session_list(lines: &[String]) -> Vec<SessionInfo> {
         .collect()
 }
 
+/// The self-identifying first field of a [`commands::list_pane_titles`] reply
+/// line.
+///
+/// The tag is what routes a reply to its parser: replies carry no command
+/// echo in control mode, and shape-sniffing alone could mistake one list for
+/// another (a numeric pane title parses like a session row).
+pub const PANE_TITLE_TAG: &str = "pane_title";
+
+/// The self-identifying first field of a [`commands::list_window_order`] reply
+/// line (see [`PANE_TITLE_TAG`]).
+pub const WINDOW_ORDER_TAG: &str = "window_order";
+
+/// Parse a [`commands::list_pane_titles`] reply body: tagged
+/// `pane_title<TAB>%<pane><TAB><title>` lines → `(pane, title)` pairs.
+///
+/// A line without the tag or a `%`-id is skipped (it belongs to some other
+/// reply). A title keeps any internal tabs.
+#[must_use]
+pub fn parse_pane_titles(lines: &[String]) -> Vec<(u32, String)> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            if fields.next()? != PANE_TITLE_TAG {
+                return None;
+            }
+            let pane = parse_id(fields.next()?.trim(), '%')?;
+            Some((pane, fields.next().unwrap_or("").to_owned()))
+        })
+        .collect()
+}
+
+/// Parse a [`commands::list_window_order`] reply body: tagged
+/// `window_order<TAB>@<window><TAB><index>` lines → `(window, index)` pairs in
+/// reply (= session) order. Untagged/malformed lines are skipped.
+#[must_use]
+pub fn parse_window_order(lines: &[String]) -> Vec<(u32, u32)> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            if fields.next()? != WINDOW_ORDER_TAG {
+                return None;
+            }
+            let window = parse_id(fields.next()?.trim(), '@')?;
+            let index = fields.next()?.trim().parse().ok()?;
+            Some((window, index))
+        })
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Divider drag → `resize-pane`: the native-tree path mapped back to tmux cells.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `resize-pane` a divider drag resolves to.
+///
+/// Set `pane`'s size along the container's axis to `cells`
+/// ([`commands::resize_pane_width`] for a [`LayoutDir::LeftRight`] container,
+/// `_height` for [`LayoutDir::TopBottom`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PaneResize {
+    /// The pane whose cell size carries the boundary (a leaf of the divider's
+    /// first side spanning that side's full extent along the axis).
+    pub pane: u32,
+    /// Which axis the container splits on (→ `-x` vs `-y`).
+    pub dir: LayoutDir,
+    /// The new size in cells along that axis.
+    pub cells: u16,
+}
+
+/// Resolve a dragged native divider back to the tmux `resize-pane` that moves
+/// the same boundary.
+///
+/// The native tree ([`Layout::to_pane_tree`]) folds each n-ary tmux container
+/// into a right-leaning binary chain, so the divider at [`NodePath`] `path`
+/// separates one container child from its remaining siblings. This walks the
+/// **tmux** layout in the same fold order, converts the dragged `ratio` into
+/// cells along the container's axis, and picks the first-side leaf whose extent
+/// spans that side (resizing it moves exactly this boundary). `None` when the
+/// path doesn't address a divider or the span is too small to move.
+#[must_use]
+pub fn resize_for_divider(layout: &Layout, path: NodePath, ratio: f32) -> Option<PaneResize> {
+    resize_in_cell(layout, NodePath::ROOT, path, ratio)
+}
+
+/// Descend into a layout cell looking for the divider at `target`.
+fn resize_in_cell(
+    cell: &Layout,
+    cur: NodePath,
+    target: NodePath,
+    ratio: f32,
+) -> Option<PaneResize> {
+    match &cell.kind {
+        LayoutKind::Pane(_) => None,
+        LayoutKind::Split(dir, cells) => resize_in_chain(cells, *dir, cur, target, ratio),
+    }
+}
+
+/// Descend a sibling chain exactly as [`fold_children`] built it: the node at
+/// `cur` separates `cells[0]` (child a) from the rest (child b).
+fn resize_in_chain(
+    cells: &[Layout],
+    dir: LayoutDir,
+    cur: NodePath,
+    target: NodePath,
+    ratio: f32,
+) -> Option<PaneResize> {
+    match cells {
+        [] => None,
+        [only] => resize_in_cell(only, cur, target, ratio),
+        [first, rest @ ..] => {
+            if cur == target {
+                let total =
+                    axis_size(first, dir) + rest.iter().map(|c| axis_size(c, dir)).sum::<f32>();
+                if total < 2.0 {
+                    return None;
+                }
+                let cells_f = (ratio * total).round().clamp(1.0, total - 1.0);
+                // Bounded to 1..=total-1 with total ≤ u16::MAX sums, so exact.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let cells_new = cells_f as u16;
+                Some(PaneResize {
+                    pane: boundary_leaf(first, dir)?,
+                    dir,
+                    cells: cells_new,
+                })
+            } else {
+                resize_in_cell(first, cur.child_a(), target, ratio)
+                    .or_else(|| resize_in_chain(rest, dir, cur.child_b(), target, ratio))
+            }
+        }
+    }
+}
+
+/// A leaf of `cell` whose extent along `dir`'s axis spans the whole cell, so
+/// `resize-pane`-ing it to N cells moves the cell's own boundary. A cross-axis
+/// child always spans its parent, so descend the first; a same-axis child (a
+/// denormalised nesting) only partially spans, so descend the one nearest the
+/// boundary (the last).
+fn boundary_leaf(cell: &Layout, dir: LayoutDir) -> Option<u32> {
+    match &cell.kind {
+        LayoutKind::Pane(id) => Some(*id),
+        LayoutKind::Split(inner, cells) => {
+            if *inner == dir {
+                boundary_leaf(cells.last()?, dir)
+            } else {
+                boundary_leaf(cells.first()?, dir)
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The pane-content mount backing: a tmux pane behind the TERM-3 widget.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The [`crate::session::Session::Tmux`] backing: one mounted tmux pane.
+///
+/// The shared engine `%output` feeds (rendered by the one TERM-3 grid, §6) plus
+/// a [`CommandSink`] its typed input rides through [`commands::send_keys`]. The
+/// round-trip discipline in widget form: input goes to tmux, never straight to
+/// the grid; the grid changes only when `%output` arrives.
+pub struct TmuxPaneIo {
+    pane: u32,
+    terminal: Arc<Mutex<Terminal>>,
+    sink: CommandSink,
+}
+
+impl TmuxPaneIo {
+    /// Bind pane `pane`'s shared engine to the control channel behind `sink`.
+    #[must_use]
+    pub const fn new(pane: u32, terminal: Arc<Mutex<Terminal>>, sink: CommandSink) -> Self {
+        Self {
+            pane,
+            terminal,
+            sink,
+        }
+    }
+
+    /// The tmux pane id this mount drives.
+    #[must_use]
+    pub const fn pane(&self) -> u32 {
+        self.pane
+    }
+
+    /// Route typed bytes to the pane as a `send-keys` command line.
+    ///
+    /// # Errors
+    /// [`std::io::ErrorKind::BrokenPipe`] once the control channel is gone.
+    pub fn send_input(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.sink.send_line(&commands::send_keys(self.pane, bytes))
+    }
+
+    /// Run `f` against the pane's engine (the render-agnostic snapshot source).
+    pub fn with_terminal<R>(&self, f: impl FnOnce(&Terminal) -> R) -> R {
+        f(&lock_unpoisoned(&self.terminal))
+    }
+
+    /// `true` once the control channel has died — the pane can't move again.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.sink.is_closed()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The controller: live channel + parser + model, with an honest status.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1555,25 +2063,10 @@ impl TmuxController {
         );
 
         let got = !chunks.is_empty();
+        let mut refresh = false;
         for chunk in chunks {
             for note in self.parser.feed(&chunk) {
-                match &note {
-                    Notification::Exit { reason } => {
-                        self.status = Status::Exited(reason.clone().unwrap_or_default());
-                    }
-                    // The only command reply carrying `name<TAB>attached<TAB>windows`
-                    // lines is `list-sessions` (other ops reply empty), so a
-                    // non-empty parse is the session enumeration — cache it for the
-                    // picker. An empty/other reply leaves the last list intact.
-                    Notification::Reply(reply) if !reply.error => {
-                        let sessions = parse_session_list(&reply.lines);
-                        if !sessions.is_empty() {
-                            self.all_sessions = sessions;
-                        }
-                    }
-                    _ => {}
-                }
-                self.model.apply(note);
+                refresh |= self.absorb(note);
             }
         }
 
@@ -1583,6 +2076,55 @@ impl TmuxController {
         if closed && self.status == Status::Connecting {
             self.status = Status::Error("tmux -CC exited before attaching".to_owned());
         }
+        // The window set / session just changed: converge the tab-strip order +
+        // membership + pane titles from server truth (once per pump, not per
+        // notification, so an attach burst asks once).
+        if refresh {
+            let _ = self.request_window_order();
+            let _ = self.request_pane_titles();
+        }
+    }
+
+    /// Fold one notification into the controller + model. Returns `true` when
+    /// the window set changed (the caller then re-asks for the order truth).
+    fn absorb(&mut self, note: Notification) -> bool {
+        let mut refresh = false;
+        match &note {
+            Notification::Exit { reason } => {
+                self.status = Status::Exited(reason.clone().unwrap_or_default());
+            }
+            // Route a reply body to its parser. The tagged lists
+            // (`list-pane-titles` / `list-window-order`) identify themselves;
+            // the remaining non-empty list shape is `list-sessions`
+            // (`name<TAB>attached<TAB>windows` — other ops reply empty), cached
+            // for the picker. An empty/other reply leaves prior state intact.
+            Notification::Reply(reply) if !reply.error => {
+                let titles = parse_pane_titles(&reply.lines);
+                if !titles.is_empty() {
+                    self.model.apply_pane_titles(&titles);
+                }
+                let order = parse_window_order(&reply.lines);
+                if !order.is_empty() {
+                    self.model.apply_window_order(&order);
+                }
+                if titles.is_empty() && order.is_empty() {
+                    let sessions = parse_session_list(&reply.lines);
+                    if !sessions.is_empty() {
+                        self.all_sessions = sessions;
+                    }
+                }
+            }
+            // The window set or session changed — the order/membership truth
+            // (`#{window_index}` etc.) is not in the notification itself.
+            Notification::WindowAdd { .. }
+            | Notification::WindowClose { .. }
+            | Notification::UnlinkedWindowAdd { .. }
+            | Notification::UnlinkedWindowClose { .. }
+            | Notification::SessionChanged { .. } => refresh = true,
+            _ => {}
+        }
+        self.model.apply(note);
+        refresh
     }
 
     /// Write a raw tmux command line (see [`commands`]).
@@ -1603,6 +2145,32 @@ impl TmuxController {
     /// [`ErrorKind::BrokenPipe`] once the channel is gone (or never connected).
     pub fn request_sessions(&self) -> std::io::Result<()> {
         self.send(&commands::list_sessions())
+    }
+
+    /// Ask for the session's window order + membership
+    /// ([`commands::list_window_order`]); the tagged reply reconciles the model
+    /// on a later [`Self::pump`].
+    ///
+    /// # Errors
+    /// [`ErrorKind::BrokenPipe`] once the channel is gone (or never connected).
+    pub fn request_window_order(&self) -> std::io::Result<()> {
+        self.send(&commands::list_window_order())
+    }
+
+    /// Ask for the session's pane titles ([`commands::list_pane_titles`]); the
+    /// tagged reply reconciles the model on a later [`Self::pump`].
+    ///
+    /// # Errors
+    /// [`ErrorKind::BrokenPipe`] once the channel is gone (or never connected).
+    pub fn request_pane_titles(&self) -> std::io::Result<()> {
+        self.send(&commands::list_pane_titles())
+    }
+
+    /// A cloneable command handle onto the live channel — what each mounted
+    /// pane's [`TmuxPaneIo`] holds. `None` when no channel ever connected.
+    #[must_use]
+    pub fn sink(&self) -> Option<CommandSink> {
+        self.channel.as_ref().map(ControlChannel::sink)
     }
 
     /// Every session on the server (attached + detached) from the last
@@ -1681,6 +2249,7 @@ boom\n\
                     window: 0,
                     layout: "bd41,80x24,0,0,0".to_owned(),
                     visible: Some("bd41,80x24,0,0,0".to_owned()),
+                    flags: Some("*".to_owned()),
                 },
                 Notification::Output {
                     pane: 0,
@@ -1922,6 +2491,92 @@ boom\n\
         assert_eq!(m.exit_reason(), Some("bye"));
     }
 
+    #[test]
+    fn session_window_changed_tracks_the_current_window() {
+        let mut m = TmuxModel::new();
+        drive(
+            &mut m,
+            b"%session-changed $0 main\n\
+              %window-add @0\n\
+              %window-add @1\n\
+              %session-window-changed $0 @1\n",
+        );
+        assert_eq!(m.current_window(), Some(1));
+        // A foreign session's change is not this client's current window.
+        drive(&mut m, b"%session-window-changed $9 @7\n");
+        assert_eq!(m.current_window(), Some(1));
+        // Closing the current window clears it (the view falls back).
+        drive(&mut m, b"%window-close @1\n");
+        assert_eq!(m.current_window(), None);
+    }
+
+    #[test]
+    fn zoom_flags_swap_the_window_tree_to_the_visible_layout() {
+        let mut m = TmuxModel::new();
+        drive(
+            &mut m,
+            b"%window-add @0\n\
+              %layout-change @0 f9d3,80x24,0,0{40x24,0,0,1,39x24,41,0,2} f9d3,80x24,0,0{40x24,0,0,1,39x24,41,0,2} *\n",
+        );
+        assert!(!m.window(0).expect("window").is_zoomed());
+        // Zoom pane 2: the full layout keeps both panes, the visible one is the
+        // zoomed pane filling the window, the flags carry `Z`.
+        drive(
+            &mut m,
+            b"%layout-change @0 f9d3,80x24,0,0{40x24,0,0,1,39x24,41,0,2} bd41,80x24,0,0,2 *Z\n",
+        );
+        assert!(m.window(0).expect("window").is_zoomed());
+        assert_eq!(
+            m.window_tree(0),
+            Some(SplitPane::Leaf(SessionId(2))),
+            "a zoomed window renders its visible (single-pane) arrangement"
+        );
+        // The hidden pane survives (the full set is the retention truth) and the
+        // zoomed pane is sized to the whole window.
+        assert!(m.pane(1).is_some(), "the hidden pane must not be dropped");
+        assert_eq!(m.pane(2).map(TmuxPane::size), Some((80, 24)));
+        // Unzoom: back to the split arrangement + the layout-cell sizes.
+        drive(
+            &mut m,
+            b"%layout-change @0 f9d3,80x24,0,0{40x24,0,0,1,39x24,41,0,2} f9d3,80x24,0,0{40x24,0,0,1,39x24,41,0,2} *\n",
+        );
+        assert!(!m.window(0).expect("window").is_zoomed());
+        assert!(matches!(m.window_tree(0), Some(SplitPane::Split { .. })));
+        assert_eq!(m.pane(2).map(TmuxPane::size), Some((39, 24)));
+    }
+
+    #[test]
+    fn window_order_reply_reorders_and_relinks() {
+        let mut m = TmuxModel::new();
+        drive(
+            &mut m,
+            b"%session-changed $0 main\n\
+              %window-add @0\n\
+              %window-add @1\n\
+              %window-add @2\n",
+        );
+        assert_eq!(m.windows_in_order(), vec![0, 1, 2], "id order until told");
+        // The order truth: @2 moved to the front, @1 gone from the session,
+        // @5 exists but was never streamed (an attach to an existing session).
+        m.apply_window_order(&[(2, 0), (0, 1), (5, 2)]);
+        assert_eq!(m.windows_in_order(), vec![2, 0, 5]);
+        assert!(!m.window(1).expect("window 1").is_linked());
+        assert_eq!(m.window(5).and_then(TmuxWindow::session), Some(0));
+    }
+
+    #[test]
+    fn pane_title_reply_sets_titles() {
+        let mut m = TmuxModel::new();
+        drive(
+            &mut m,
+            b"%window-add @0\n\
+              %layout-change @0 f9d3,80x24,0,0{40x24,0,0,1,39x24,41,0,2}\n",
+        );
+        m.apply_pane_titles(&[(1, "build".to_owned()), (2, "logs".to_owned())]);
+        assert_eq!(m.pane(1).map(TmuxPane::title), Some("build"));
+        assert_eq!(m.pane(2).map(TmuxPane::title), Some("logs"));
+    }
+
     // ── %output → the widget grid (the pane engine) ──────────────────────────
 
     #[test]
@@ -1981,6 +2636,34 @@ boom\n\
         );
         // A quote in the name is safely escaped.
         assert_eq!(c::rename_window(0, "a'b"), "rename-window -t @0 'a'\\''b'",);
+    }
+
+    #[test]
+    fn window_and_pane_op_builders_emit_the_exact_tmux_lines() {
+        use commands as c;
+        assert_eq!(c::zoom_pane(3), "resize-pane -t %3 -Z");
+        assert_eq!(c::break_pane(4), "break-pane -s %4");
+        assert_eq!(c::join_pane(4, 2, SplitDir::V), "join-pane -h -s %4 -t @2");
+        assert_eq!(c::join_pane(4, 2, SplitDir::H), "join-pane -v -s %4 -t @2");
+        assert_eq!(c::swap_panes(1, 5), "swap-pane -d -s %1 -t %5");
+        assert_eq!(c::move_window_before(3, 1), "move-window -b -s @3 -t @1");
+        assert_eq!(c::move_window_after(1, 3), "move-window -a -s @1 -t @3");
+        assert_eq!(c::resize_pane_width(2, 55), "resize-pane -t %2 -x 55");
+        assert_eq!(c::resize_pane_height(2, 14), "resize-pane -t %2 -y 14");
+        assert_eq!(c::refresh_client_size(120, 40), "refresh-client -C 120x40");
+        assert_eq!(
+            c::rename_pane(7, "build log"),
+            "select-pane -t %7 -T 'build log'"
+        );
+        // The tagged enumerations stay in step with their parsers.
+        assert_eq!(
+            c::list_pane_titles(),
+            "list-panes -s -F 'pane_title\t#{pane_id}\t#{pane_title}'"
+        );
+        assert_eq!(
+            c::list_window_order(),
+            "list-windows -F 'window_order\t#{window_id}\t#{window_index}'"
+        );
     }
 
     #[test]
@@ -2057,6 +2740,172 @@ boom\n\
         );
     }
 
+    // ── the tagged reply parsers (titles + window order) ─────────────────────
+
+    #[test]
+    fn parse_pane_titles_reads_tagged_lines_only() {
+        let lines = [
+            "pane_title\t%1\tvim".to_owned(),
+            "pane_title\t%2\ta\ttabbed title".to_owned(), // internal tab kept
+            "pane_title\t%3".to_owned(),                  // empty title
+            "main\t1\t3".to_owned(),                      // a session-list line
+            "pane_title\tnope\tx".to_owned(),             // bad id
+        ];
+        assert_eq!(
+            parse_pane_titles(&lines),
+            vec![
+                (1, "vim".to_owned()),
+                (2, "a\ttabbed title".to_owned()),
+                (3, String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_window_order_reads_tagged_lines_only() {
+        let lines = [
+            "window_order\t@3\t0".to_owned(),
+            "window_order\t@0\t1".to_owned(),
+            "main\t1\t3".to_owned(), // a session-list line
+            "window_order\t@9".to_owned(),
+        ];
+        assert_eq!(parse_window_order(&lines), vec![(3, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn tagged_replies_and_session_lists_never_cross_parse() {
+        // The tag column is what routes a reply: each list parses as itself and
+        // as nothing else, even for pathological names/titles.
+        let titles = ["pane_title\t%5\t42".to_owned()]; // a numeric title
+        let order = ["window_order\t@1\t0".to_owned()];
+        let sessions = ["pane_title\t1\t2".to_owned()]; // a session named like the tag
+        assert!(parse_session_list(&titles).is_empty());
+        assert!(parse_session_list(&order).is_empty());
+        assert!(parse_pane_titles(&sessions).is_empty());
+        assert!(parse_window_order(&sessions).is_empty());
+        assert_eq!(parse_session_list(&sessions).len(), 1);
+    }
+
+    // ── reply routing through the controller (no live tmux needed) ────────────
+
+    fn offline_controller() -> TmuxController {
+        TmuxController {
+            channel: None,
+            parser: Parser::new(),
+            model: TmuxModel::new(),
+            status: Status::Connecting,
+            all_sessions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn absorb_routes_each_tagged_reply_to_its_truth() {
+        let mut ctrl = offline_controller();
+        // Seed a window + two panes.
+        let mut p = Parser::new();
+        for note in p.feed(
+            b"%session-changed $0 main\n\
+              %window-add @0\n\
+              %layout-change @0 f9d3,80x24,0,0{40x24,0,0,1,39x24,41,0,2}\n",
+        ) {
+            let _ = ctrl.absorb(note);
+        }
+        let reply = |lines: &[&str]| {
+            Notification::Reply(CommandReply {
+                number: 1,
+                flags: 0,
+                lines: lines.iter().map(|s| (*s).to_owned()).collect(),
+                error: false,
+            })
+        };
+        // A pane-title reply lands on the panes.
+        let _ = ctrl.absorb(reply(&["pane_title\t%1\tbuild", "pane_title\t%2\tlogs"]));
+        assert_eq!(ctrl.model().pane(1).map(TmuxPane::title), Some("build"));
+        // A window-order reply lands on the strip order.
+        let _ = ctrl.absorb(reply(&["window_order\t@0\t0"]));
+        assert_eq!(ctrl.model().window(0).and_then(TmuxWindow::index), Some(0));
+        // A session-list reply lands on the picker cache — not on the model.
+        let _ = ctrl.absorb(reply(&["main\t1\t3", "build\t0\t1"]));
+        assert_eq!(ctrl.all_sessions().len(), 2);
+        // A window-set change asks the caller to re-request the order truth.
+        assert!(ctrl.absorb(Notification::WindowAdd { window: 4 }));
+        assert!(!ctrl.absorb(Notification::PaneModeChanged { pane: 1 }));
+    }
+
+    // ── divider drag → resize-pane (the native path mapped back to cells) ────
+
+    #[test]
+    fn resize_for_divider_maps_the_root_boundary() {
+        let l = parse_layout("f9d3,80x24,0,0{40x24,0,0,1,39x24,41,0,2}").expect("layout");
+        // Drag the vertical divider to a quarter: 79 usable cells → pane 1 gets 20.
+        assert_eq!(
+            resize_for_divider(&l, NodePath::ROOT, 0.25),
+            Some(PaneResize {
+                pane: 1,
+                dir: LayoutDir::LeftRight,
+                cells: 20,
+            })
+        );
+        // The clamp keeps at least one cell each side.
+        assert_eq!(
+            resize_for_divider(&l, NodePath::ROOT, 0.0).map(|r| r.cells),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn resize_for_divider_descends_the_fold_chain() {
+        // A left pane and a right column split top/bottom: the nested divider
+        // lives at ROOT.child_b() (the fold's rest-chain), axis TopBottom.
+        let l = parse_layout("bbbb,80x24,0,0{40x24,0,0,1,39x24,41,0[39x12,41,0,2,39x11,41,13,3]}")
+            .expect("layout");
+        assert_eq!(
+            resize_for_divider(&l, NodePath::ROOT.child_b(), 0.75),
+            Some(PaneResize {
+                pane: 2,
+                dir: LayoutDir::TopBottom,
+                cells: 17, // 0.75 × (12 + 11) ≈ 17
+            })
+        );
+        // A path addressing no divider is honestly nothing.
+        assert_eq!(resize_for_divider(&l, NodePath::ROOT.child_a(), 0.5), None);
+    }
+
+    #[test]
+    fn resize_for_divider_picks_a_full_span_boundary_leaf() {
+        // The first side is itself a top/bottom column: either of its panes
+        // spans the column's width, and the walk picks the first (pane 1) so a
+        // `-x` resize on it moves the outer vertical boundary.
+        let l = parse_layout("cccc,80x24,0,0{40x24,0,0[40x12,0,0,1,40x11,0,13,2],39x24,41,0,3}")
+            .expect("layout");
+        assert_eq!(
+            resize_for_divider(&l, NodePath::ROOT, 0.5).map(|r| (r.pane, r.dir)),
+            Some((1, LayoutDir::LeftRight))
+        );
+    }
+
+    // ── the pane-content mount backing (typed input → send-keys) ─────────────
+
+    #[test]
+    fn pane_io_routes_input_as_send_keys_and_reads_the_shared_engine() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let sink = CommandSink::for_tests(tx);
+        let engine = Arc::new(Mutex::new(Terminal::with_default_scrollback(20, 4)));
+        lock_unpoisoned(&engine).feed(b"ready");
+
+        let io = TmuxPaneIo::new(5, Arc::clone(&engine), sink);
+        assert_eq!(io.pane(), 5);
+        assert!(!io.is_closed());
+        // Typed bytes leave as the exact hex-safe send-keys command line.
+        io.send_input(b"hi").expect("send");
+        assert_eq!(rx.recv().expect("line"), b"send-keys -t %5 -H 68 69\n");
+        // The widget reads the same grid %output feeds.
+        assert!(io.with_terminal(|t| t.viewport().line_text(0).contains("ready")));
+        // A dead channel refuses input honestly.
+        drop(rx);
+        assert!(io.send_input(b"x").is_err());
+    }
+
     // ── the controller's honest error state (no live tmux needed) ─────────────
 
     #[test]
@@ -2095,6 +2944,97 @@ boom\n\
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    /// Pump the live controller until `done` holds (10s deadline).
+    fn wait_live(
+        ctrl: &mut TmuxController,
+        what: &str,
+        mut done: impl FnMut(&TmuxController) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(ctrl) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            ctrl.pump();
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// The FC-3 **pane** round-trips against a live server: split · zoom on/off ·
+    /// rename window · rename pane title · exact-cell resize — each op's command
+    /// lands and the `%`-event stream (or tagged reply) reconciles the model,
+    /// never a direct mutation.
+    fn live_pane_op_round_trips(ctrl: &mut TmuxController, window: u32) -> u32 {
+        // Split: one pane becomes two.
+        let pane0 = ctrl.model().panes_of_window(window)[0];
+        ctrl.send(&commands::split_window(pane0, SplitDir::V))
+            .expect("split");
+        wait_live(ctrl, "the split's layout-change", |c| {
+            c.model().panes_of_window(window).len() == 2
+        });
+
+        // Zoom on, then off: the layout-change flags carry the truth.
+        ctrl.send(&commands::zoom_pane(pane0)).expect("zoom");
+        wait_live(ctrl, "the zoomed layout-change", |c| {
+            c.model().window(window).is_some_and(TmuxWindow::is_zoomed)
+        });
+        ctrl.send(&commands::zoom_pane(pane0)).expect("unzoom");
+        wait_live(ctrl, "the unzoomed layout-change", |c| {
+            c.model().window(window).is_some_and(|w| !w.is_zoomed())
+        });
+
+        // Rename the window: %window-renamed reconciles.
+        ctrl.send(&commands::rename_window(window, "fc3"))
+            .expect("rename window");
+        wait_live(ctrl, "%window-renamed", |c| {
+            c.model().window(window).map(TmuxWindow::name) == Some("fc3")
+        });
+
+        // Rename a pane title: the tagged list-panes reply reconciles (tmux
+        // emits no %-event for titles).
+        ctrl.send(&commands::rename_pane(pane0, "alpha"))
+            .expect("rename pane");
+        ctrl.request_pane_titles().expect("request titles");
+        wait_live(ctrl, "the pane-title reply", |c| {
+            c.model().pane(pane0).map(TmuxPane::title) == Some("alpha")
+        });
+
+        // Resize: the exact-cell command round-trips through layout-change.
+        ctrl.send(&commands::resize_pane_width(pane0, 20))
+            .expect("resize");
+        wait_live(ctrl, "the resize's layout-change", |c| {
+            c.model().pane(pane0).map(TmuxPane::size).map(|s| s.0) == Some(20)
+        });
+        pane0
+    }
+
+    /// The FC-3 **window** round-trips: break a pane out (a second window
+    /// appears) and reorder it first (the tagged window-order reply reconciles
+    /// the strip).
+    fn live_window_op_round_trips(ctrl: &mut TmuxController, window: u32, keep: u32) {
+        let pane1 = ctrl
+            .model()
+            .panes_of_window(window)
+            .into_iter()
+            .find(|p| *p != keep)
+            .expect("the split pane");
+        ctrl.send(&commands::break_pane(pane1)).expect("break");
+        wait_live(ctrl, "the broken-out window", |c| {
+            c.model().windows_in_order().len() == 2
+        });
+
+        let new_window = ctrl
+            .model()
+            .windows_in_order()
+            .into_iter()
+            .find(|w| *w != window)
+            .expect("the new window");
+        ctrl.send(&commands::move_window_before(new_window, window))
+            .expect("move");
+        ctrl.request_window_order().expect("request order");
+        wait_live(ctrl, "the reordered strip", |c| {
+            c.model().windows_in_order().first() == Some(&new_window)
+        });
     }
 
     #[test]
@@ -2143,6 +3083,11 @@ boom\n\
         // A live window mapped to a real native split tree.
         let window = ctrl.model().windows_in_order()[0];
         assert!(ctrl.model().window_tree(window).is_some());
+
+        // The TMUX-FC-3 round-trips (pane ops, then window ops) — each a GUI
+        // command reconciled by the %-event stream / tagged replies.
+        let pane0 = live_pane_op_round_trips(&mut ctrl, window);
+        live_window_op_round_trips(&mut ctrl, window, pane0);
 
         // Tear down the private server.
         let _ = ctrl.send("kill-server");

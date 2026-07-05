@@ -296,6 +296,16 @@ impl TerminalWidget {
         Self::over(Session::Remote(Box::new(remote)))
     }
 
+    /// Wrap a mounted tmux pane (TMUX-FC-3): the same TERM-3 grid + input path
+    /// over the pane's shared engine, typed bytes riding the control channel as
+    /// `send-keys` — the round-trip in widget form. The pane's grid is sized by
+    /// `%layout-change`, never by this widget's rect.
+    #[must_use]
+    pub fn new_tmux(io: crate::tmux::TmuxPaneIo) -> Self {
+        let fallback = format!("tmux %{}", io.pane());
+        Self::over(Session::Tmux(io)).with_title_fallback(fallback)
+    }
+
     /// Wrap either backing behind the shared render/input path.
     #[must_use]
     fn over(session: Session) -> Self {
@@ -1529,7 +1539,7 @@ const fn watch_badge(mode: WatchMode) -> Option<(&'static str, egui::Color32)> {
 /// Grid dimensions for an available rect: floor division by the cell metrics,
 /// at least 1×1. A milli-cell epsilon absorbs f32 ratio noise so a rect sized
 /// for exactly N cells yields N (960.0/9.6 is 99.999992…, not 100).
-fn grid_size(avail: Vec2, cell: Vec2) -> (u16, u16) {
+pub(crate) fn grid_size(avail: Vec2, cell: Vec2) -> (u16, u16) {
     // Floored non-negative ratios bounded far below u16::MAX by real window
     // sizes; the saturating cast is the clamp.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

@@ -655,12 +655,16 @@ fn terminal_entries(cx: &MenuContext, keymap: &Keymap) -> Vec<Entry<Picked>> {
     out
 }
 
-/// The Tmux drop-down (TMUX-FC-2): the session-management entry points. Each item
-/// routes OUT as a [`TmuxMenuChoice`] the surface applies to its
-/// [`crate::tmux_ui::TmuxChrome`]; Detach / Hide-tree honestly grey out without a
-/// live control client (§7). The full session/window/pane tree lives in the sidebar
-/// the "New tmux session" item reveals.
+/// The Tmux drop-down (TMUX-FC-2/3): the session-management entry points plus
+/// the window & pane ops. Each item routes OUT as a [`TmuxMenuChoice`] the
+/// surface applies to its [`crate::tmux_ui::TmuxChrome`]; every item needing a
+/// live control client honestly greys out without one (§7). The full
+/// session/window/pane tree lives in the sidebar the "New tmux session" item
+/// reveals; the ops resolve against the current window's active pane.
 fn tmux_entries(active: bool) -> Vec<Entry<Picked>> {
+    let op = |choice: TmuxMenuChoice, label: &str| {
+        Entry::Item(BarItem::new(Picked::Tmux(choice), label).enabled(active))
+    };
     vec![
         Entry::Item(BarItem::new(
             Picked::Tmux(TmuxMenuChoice::NewSession),
@@ -671,11 +675,17 @@ fn tmux_entries(active: bool) -> Vec<Entry<Picked>> {
             "Attach Session\u{2026}",
         )),
         Entry::Separator,
-        Entry::Item(BarItem::new(Picked::Tmux(TmuxMenuChoice::Detach), "Detach").enabled(active)),
-        Entry::Item(
-            BarItem::new(Picked::Tmux(TmuxMenuChoice::ToggleTree), "Hide/Show Tree")
-                .enabled(active),
-        ),
+        op(TmuxMenuChoice::SplitRight, "Split Pane Right"),
+        op(TmuxMenuChoice::SplitDown, "Split Pane Down"),
+        op(TmuxMenuChoice::ZoomPane, "Zoom Pane"),
+        op(TmuxMenuChoice::BreakPane, "Break Pane to Window"),
+        op(TmuxMenuChoice::ClosePane, "Close Pane"),
+        Entry::Separator,
+        op(TmuxMenuChoice::NewWindow, "New Window"),
+        op(TmuxMenuChoice::KillWindow, "Kill Window"),
+        Entry::Separator,
+        op(TmuxMenuChoice::Detach, "Detach"),
+        op(TmuxMenuChoice::ToggleTree, "Hide/Show Tree"),
     ]
 }
 

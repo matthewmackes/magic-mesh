@@ -1,11 +1,17 @@
-//! The backing a [`crate::widget::TerminalWidget`] renders — a **local** PTY
-//! shell (TERM-1..6) or a **remote** mesh shell driven over the broker (TERM-8).
+//! The backing a [`crate::widget::TerminalWidget`] renders.
 //!
-//! Both variants expose the same tiny surface the widget needs (read the engine,
+//! Three variants: a **local** PTY shell (TERM-1..6), a **remote** mesh shell
+//! driven over the broker (TERM-8), or a mounted **tmux pane** on a control
+//! channel (TMUX-FC-3).
+//!
+//! All variants expose the same tiny surface the widget needs (read the engine,
 //! send input, resize, liveness), so the one TERM-3 grid renderer + input handler
-//! paints either pane — no second terminal emulator (§6). A remote pane adds a
+//! paints any pane — no second terminal emulator (§6). A remote pane adds a
 //! per-frame [`Session::poll`] (draining the Bus) and the honest node marker +
-//! status chip; a local pane pumps on its own threads and has neither.
+//! status chip; a local pane pumps on its own threads and has neither. A tmux
+//! pane reads the shared engine `%output` feeds and routes typed input through
+//! `send-keys` on the control channel — the FC round-trip in widget form (its
+//! grid is resized by `%layout-change`, never by the widget's rect).
 
 use std::io;
 
@@ -15,6 +21,7 @@ use mde_egui::Style;
 use crate::engine::Terminal;
 use crate::pty::LocalPty;
 use crate::remote::{RemotePty, StatusTone};
+use crate::tmux::TmuxPaneIo;
 
 /// What the widget needs to paint a frame's chrome around the grid.
 ///
@@ -40,12 +47,15 @@ pub enum Session {
     Local(LocalPty),
     /// A remote mesh shell driven over the TERM-7 broker (TERM-8).
     Remote(Box<RemotePty>),
+    /// A mounted tmux pane on a control channel (TMUX-FC-3): the shared engine
+    /// `%output` feeds, input routed as `send-keys`.
+    Tmux(TmuxPaneIo),
 }
 
 impl Session {
     /// Drain any pending backing work for this frame. A remote session reads its
-    /// Bus state log; a local session pumps on its own threads, so this is a
-    /// no-op for it.
+    /// Bus state log; a local session pumps on its own threads and a tmux pane
+    /// is fed by the surface-level controller pump, so both are no-ops here.
     pub fn poll(&mut self) {
         if let Self::Remote(remote) = self {
             remote.poll();
@@ -53,11 +63,14 @@ impl Session {
     }
 
     /// Resize the grid to `cols × rows` (and, for a remote session, publish the
-    /// resize verb).
+    /// resize verb). A tmux pane's grid belongs to tmux — `%layout-change`
+    /// resizes it, so the widget-rect resize is deliberately a no-op there (the
+    /// mounted view reports the *client* size via `refresh-client` instead).
     pub fn resize(&mut self, cols: u16, rows: u16) {
         match self {
             Self::Local(pty) => pty.resize(cols, rows),
             Self::Remote(remote) => remote.resize(cols, rows),
+            Self::Tmux(_) => {}
         }
     }
 
@@ -69,26 +82,31 @@ impl Session {
         match self {
             Self::Local(pty) => pty.send_input(bytes),
             Self::Remote(remote) => remote.send_input(bytes),
+            Self::Tmux(io) => io.send_input(bytes),
         }
     }
 
     /// Run `f` against the current engine state (the render-agnostic snapshot
-    /// source both variants share).
+    /// source every variant shares).
     pub fn with_terminal<R>(&self, f: impl FnOnce(&Terminal) -> R) -> R {
         match self {
             Self::Local(pty) => pty.with_terminal(f),
             Self::Remote(remote) => remote.with_terminal(f),
+            Self::Tmux(io) => io.with_terminal(f),
         }
     }
 
     /// Whether the pane should reap (close). A local session reaps on child exit;
     /// a remote session reaps only on a **clean** shell exit (a failure lingers so
-    /// its reason stays on screen).
+    /// its reason stays on screen). A tmux pane's life belongs to tmux — the
+    /// mounted view unmounts it when the layout drops it — so it only reaps once
+    /// the whole control channel is gone.
     #[must_use]
     pub fn is_output_closed(&self) -> bool {
         match self {
             Self::Local(pty) => pty.is_output_closed(),
             Self::Remote(remote) => remote.is_output_closed(),
+            Self::Tmux(io) => io.is_closed(),
         }
     }
 
@@ -98,7 +116,7 @@ impl Session {
     pub const fn local(&self) -> Option<&LocalPty> {
         match self {
             Self::Local(pty) => Some(pty),
-            Self::Remote(_) => None,
+            Self::Remote(_) | Self::Tmux(_) => None,
         }
     }
 
@@ -108,7 +126,7 @@ impl Session {
     pub fn remote(&self) -> Option<&RemotePty> {
         match self {
             Self::Remote(remote) => Some(remote.as_ref()),
-            Self::Local(_) => None,
+            Self::Local(_) | Self::Tmux(_) => None,
         }
     }
 
@@ -130,6 +148,14 @@ impl Session {
                     live: status.is_live(),
                     node: Some(remote.node_label().to_string()),
                     note: status.note().map(|(text, tone)| (text, tone_color(tone))),
+                }
+            }
+            Self::Tmux(io) => {
+                let ended = io.is_closed();
+                RenderState {
+                    live: !ended,
+                    node: None,
+                    note: ended.then(|| ("tmux detached".to_string(), Style::TEXT_DIM)),
                 }
             }
         }
