@@ -28,16 +28,35 @@
 //! The whole engine takes an injectable [`SysfsRoots`] (production points at
 //! `/sys` + `/proc`; tests point at a fixture tree), so the taxonomy build, the
 //! status derivation, and the publish path are all headless-testable.
+//!
+//! ## DEVMGR-9 — fleet-wide device-fault notify (#21)
+//!
+//! On each publish the engine also diffs the NEW snapshot against the host's
+//! PREVIOUS published snapshot ([`fault_transitions`]): a device transitioning
+//! **into** a problem state (a driver drop → `no-driver`, disk I/O errors →
+//! `degraded`, a NIC set down → `disabled`) is an edge event. The
+//! `hardware_probe` worker runs each edge through the per-device
+//! [`DeviceFaultGate`] (the flapping guard — mirror of `node_grade`'s
+//! `AlertGate` cooldown, #20) and publishes one debounced alert on
+//! [`NOTIFY_TOPIC`] (`event/notify/device-fault`) — a lane the `chat` worker
+//! folds into this node's `alert:<self>` conversation (CHAT-FIX-2), so the
+//! fault reaches Chat + the phone. Honest by construction: a fault that merely
+//! *persists* appears in both snapshots and never re-fires; an
+//! [`Unknown`](DeviceStatus::Unknown) state is an honest unknown, not a fault,
+//! and never alerts (§7 — no fabricated failures).
 
 #![cfg(feature = "async-services")]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use mackes_mesh_types::device_inventory::{
     category, DeviceCategory, DeviceInventory, DeviceRecord, DeviceResources, DeviceStatus,
     HostSummary, ToolAvailability,
 };
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::Persist;
 
 // ── injectable roots ─────────────────────────────────────────────────────────
 
@@ -931,12 +950,46 @@ pub fn capture_dmesg() -> Vec<String> {
 /// # Errors
 /// Directory-create / write / rename / serialization failures.
 pub fn publish_system(workgroup_root: &Path, hostname: &str) -> std::io::Result<PathBuf> {
+    publish_system_observing(workgroup_root, hostname).map(|(path, _)| path)
+}
+
+/// [`publish_system`], additionally returning the DEVMGR-9 fault edges.
+///
+/// The edges are the devices that entered a problem state SINCE the previous
+/// published snapshot ([`fault_transitions`]). The `hardware_probe` worker
+/// debounces + publishes them on the notify lane; the CLI-parity
+/// [`publish_system`] wrapper drops them.
+///
+/// # Errors
+/// Directory-create / write / rename / serialization failures.
+pub fn publish_system_observing(
+    workgroup_root: &Path,
+    hostname: &str,
+) -> std::io::Result<(PathBuf, Vec<FaultTransition>)> {
     let roots = SysfsRoots::system();
     let ids = IdsDb::load();
     let tools = tool_availability(&ids);
     let dmesg = capture_dmesg();
     let inv = enumerate(&roots, &ids, tools, hostname, &dmesg);
-    write_inventory(workgroup_root, &inv)
+    write_inventory_observing(workgroup_root, &inv)
+}
+
+/// [`write_inventory`] with the DEVMGR-9 observation.
+///
+/// Reads the host's PREVIOUS published snapshot first, writes the new one, and
+/// returns the fault-transition edges between them. Split out so the
+/// fault-notify path is exercised end to end with fixture-built trees (no real
+/// `/sys` needed).
+///
+/// # Errors
+/// Directory-create / write / rename / serialization failures.
+pub fn write_inventory_observing(
+    workgroup_root: &Path,
+    inv: &DeviceInventory,
+) -> std::io::Result<(PathBuf, Vec<FaultTransition>)> {
+    let prev = mackes_mesh_types::device_inventory::read_inventory(workgroup_root, &inv.host);
+    let path = write_inventory(workgroup_root, inv)?;
+    Ok((path, fault_transitions(prev.as_ref(), inv)))
 }
 
 /// Write a prebuilt inventory to the substrate (atomic temp+rename). Split out so
@@ -953,6 +1006,186 @@ pub fn write_inventory(workgroup_root: &Path, inv: &DeviceInventory) -> std::io:
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, &path)?;
     Ok(path)
+}
+
+// ── DEVMGR-9: the fleet-wide device-fault notify (#21) ──────────────────────
+
+/// The Bus lane a device-fault alert rides.
+///
+/// The `chat` worker's `ALERT_LANE_PREFIXES` carries `event/notify/`, so each
+/// alert folds into this node's `alert:<self>` conversation (CHAT-FIX-2) and
+/// reaches Chat + the phone.
+pub const NOTIFY_TOPIC: &str = "event/notify/device-fault";
+
+/// The stable `source` token on the published alert body (the Chat card badge).
+pub const NOTIFY_SOURCE: &str = "device-fault";
+
+/// Per-device debounce window — the flapping guard (#21).
+///
+/// A mirror of `node_grade::ALERT_COOLDOWN` scaled to the `hardware_probe`
+/// 5-minute tick: a device that bounces ok↔faulted across ticks alerts once per
+/// window, not on every re-entry.
+pub const FAULT_COOLDOWN: Duration = Duration::from_secs(1800);
+
+/// Whether a state is a **fault** worth notifying.
+///
+/// A fault is a real problem the producer derived from Linux facts.
+/// [`DeviceStatus::Unknown`] is an honest could-not-determine, NOT a fault —
+/// alerting on it would fabricate a failure out of a missing read (§7).
+#[must_use]
+pub const fn is_fault(status: DeviceStatus) -> bool {
+    matches!(
+        status,
+        DeviceStatus::NoDriver | DeviceStatus::Disabled | DeviceStatus::Degraded
+    )
+}
+
+/// The alert `severity` for a fault state (the Chat card colour).
+///
+/// A device actively reporting errors (`degraded` — I/O faults, dmesg errors)
+/// is critical; a dropped driver / an administratively-downed device is a
+/// warning.
+#[must_use]
+pub const fn fault_severity(status: DeviceStatus) -> &'static str {
+    match status {
+        DeviceStatus::Degraded => "critical",
+        _ => "warning",
+    }
+}
+
+/// One device-fault edge: a device observed transitioning **into** a problem
+/// state between two published snapshots (DEVMGR-9). Carries what the alert
+/// body + the debounce key need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaultTransition {
+    /// The stable per-device debounce key (`sysfs_path`, or `<category>/<name>`
+    /// for a record without one).
+    pub key: String,
+    /// The category the device sits under (context for the alert card).
+    pub category: String,
+    /// The device's display name.
+    pub name: String,
+    /// The problem state it entered.
+    pub status: DeviceStatus,
+    /// The honest Linux reason ([`DeviceRecord::problem`]), when the producer
+    /// derived one.
+    pub reason: Option<String>,
+}
+
+/// The stable identity key for a device (the debounce + diff key): its sysfs
+/// path when it has one, else `<category>/<name>` (CPU/memory records carry no
+/// sysfs node).
+#[must_use]
+pub fn device_key(category_key: &str, dev: &DeviceRecord) -> String {
+    dev.sysfs_path
+        .clone()
+        .unwrap_or_else(|| format!("{category_key}/{}", dev.name))
+}
+
+/// Diff two snapshots for devices transitioning **into** a fault state (#21).
+///
+/// A device faulted in `next` fires only when the previous snapshot shows it
+/// non-faulted — or doesn't show it at all (a device arriving already broken,
+/// or the host's very first publish, mirroring `AlertGate`'s prev-`None`
+/// entering semantics). A fault that persists across snapshots never re-fires
+/// (edge-triggered); a recovery fires nothing.
+#[must_use]
+pub fn fault_transitions(
+    prev: Option<&DeviceInventory>,
+    next: &DeviceInventory,
+) -> Vec<FaultTransition> {
+    let prev_status: BTreeMap<String, DeviceStatus> = prev
+        .map(|inv| {
+            inv.categories
+                .iter()
+                .flat_map(|c| c.devices.iter().map(|d| (device_key(&c.key, d), d.status)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for cat in &next.categories {
+        for dev in &cat.devices {
+            if !is_fault(dev.status) {
+                continue;
+            }
+            let key = device_key(&cat.key, dev);
+            let entering = prev_status.get(&key).is_none_or(|s| !is_fault(*s));
+            if entering {
+                out.push(FaultTransition {
+                    key,
+                    category: cat.key.clone(),
+                    name: dev.name.clone(),
+                    status: dev.status,
+                    reason: dev.problem.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The per-device debounce gate (#21) — the flapping guard.
+///
+/// Sits over the edge-triggered [`fault_transitions`], mirroring
+/// `node_grade::AlertGate`'s cooldown. [`fault_transitions`] already
+/// edge-triggers (a persisting fault never re-fires); this gate additionally
+/// suppresses a device that *re-enters* a fault state inside
+/// [`FAULT_COOLDOWN`] (ok↔faulted flapping).
+#[derive(Debug, Default)]
+pub struct DeviceFaultGate {
+    /// Last admitted alert per device key.
+    last_alert: BTreeMap<String, Instant>,
+}
+
+impl DeviceFaultGate {
+    /// Whether an alert for `key` may fire at `now`. Admitting records the
+    /// timestamp; a repeat inside the cooldown is suppressed.
+    pub fn admit(&mut self, key: &str, now: Instant) -> bool {
+        let cooled = self
+            .last_alert
+            .get(key)
+            .is_none_or(|t| now.duration_since(*t) >= FAULT_COOLDOWN);
+        if cooled {
+            self.last_alert.insert(key.to_string(), now);
+        }
+        cooled
+    }
+}
+
+/// Serialize + publish one device-fault alert on [`NOTIFY_TOPIC`].
+///
+/// Mirrors `node_grade::emit_alert`. Every field is a string so
+/// `mde_chat::fold_alert` keeps it (it preserves string fields only).
+/// Best-effort — a write failure is logged, never fatal.
+pub fn emit_fault_alert(persist: &Persist, host: &str, t: &FaultTransition) {
+    let summary = format!(
+        "device `{}` on {host} entered state {}{}",
+        t.name,
+        t.status.as_str(),
+        t.reason
+            .as_deref()
+            .map(|r| format!(" \u{2014} {r}"))
+            .unwrap_or_default()
+    );
+    let body = serde_json::json!({
+        "severity": fault_severity(t.status),
+        "source": NOTIFY_SOURCE,
+        "summary": summary,
+        "host": host,
+        "device": t.name,
+        "category": t.category,
+        "status": t.status.as_str(),
+        "reason": t.reason.as_deref().unwrap_or(""),
+    })
+    .to_string();
+    if let Err(e) = persist.write(NOTIFY_TOPIC, Priority::Default, None, Some(&body)) {
+        tracing::debug!(
+            target: "mackesd::device_inventory",
+            topic = NOTIFY_TOPIC,
+            error = %e,
+            "device-fault notify publish failed",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1291,6 +1524,127 @@ mod tests {
         assert_eq!(inv.host, "bare");
         assert!(inv.categories.is_empty());
         assert_eq!(inv.device_count(), 0);
+    }
+
+    /// A one-device inventory for `host`, the device in `status` (DEVMGR-9
+    /// transition fixtures).
+    fn nic_inventory(host: &str, status: DeviceStatus, problem: Option<&str>) -> DeviceInventory {
+        let dev = DeviceRecord {
+            sysfs_path: Some("/sys/bus/pci/devices/0000:03:00.0".into()),
+            problem: problem.map(str::to_string),
+            ..DeviceRecord::new("Intel I219-LM Ethernet", status)
+        };
+        DeviceInventory {
+            host: host.to_string(),
+            published_at_ms: 1,
+            summary: HostSummary::default(),
+            tools: ToolAvailability::default(),
+            categories: vec![DeviceCategory::new(category::NETWORK_ADAPTERS, vec![dev])],
+        }
+    }
+
+    #[test]
+    fn fault_transitions_fire_only_on_entry_into_a_problem_state() {
+        let clean = nic_inventory("edge-1", DeviceStatus::Ok, None);
+        let faulted = nic_inventory("edge-1", DeviceStatus::Degraded, Some("nic: I/O error"));
+        // ok → degraded is an edge.
+        let t = fault_transitions(Some(&clean), &faulted);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].name, "Intel I219-LM Ethernet");
+        assert_eq!(t[0].status, DeviceStatus::Degraded);
+        assert_eq!(t[0].reason.as_deref(), Some("nic: I/O error"));
+        assert_eq!(t[0].key, "/sys/bus/pci/devices/0000:03:00.0");
+        // A persisting fault is NOT a new edge (edge-triggered, never a re-fire).
+        assert!(fault_transitions(Some(&faulted), &faulted).is_empty());
+        // A recovery fires nothing.
+        assert!(fault_transitions(Some(&faulted), &clean).is_empty());
+        // A device arriving already broken (absent from prev) is an entry; so is
+        // the host's very first publish (prev None — AlertGate semantics).
+        let empty = DeviceInventory {
+            categories: vec![],
+            ..clean.clone()
+        };
+        assert_eq!(fault_transitions(Some(&empty), &faulted).len(), 1);
+        assert_eq!(fault_transitions(None, &faulted).len(), 1);
+        // An honest Unknown is NOT a fault — never an alert (§7).
+        let unknown = nic_inventory("edge-1", DeviceStatus::Unknown, None);
+        assert!(fault_transitions(Some(&clean), &unknown).is_empty());
+        // …and ok→unknown→degraded still reads as an entry when it lands.
+        assert_eq!(fault_transitions(Some(&unknown), &faulted).len(), 1);
+    }
+
+    #[test]
+    fn fault_gate_debounces_flapping_per_device() {
+        let mut gate = DeviceFaultGate::default();
+        let t0 = std::time::Instant::now();
+        assert!(gate.admit("dev-a", t0), "first entry fires");
+        assert!(
+            !gate.admit("dev-a", t0 + Duration::from_secs(60)),
+            "a re-entry inside the cooldown is suppressed (flapping)"
+        );
+        assert!(
+            gate.admit("dev-b", t0 + Duration::from_secs(60)),
+            "an unrelated device is independent"
+        );
+        assert!(
+            gate.admit("dev-a", t0 + FAULT_COOLDOWN),
+            "after the cooldown the device may alert again"
+        );
+    }
+
+    #[test]
+    fn severity_and_fault_classification_are_honest() {
+        assert!(is_fault(DeviceStatus::NoDriver));
+        assert!(is_fault(DeviceStatus::Disabled));
+        assert!(is_fault(DeviceStatus::Degraded));
+        assert!(!is_fault(DeviceStatus::Ok));
+        assert!(!is_fault(DeviceStatus::Unknown), "unknown is not a fault");
+        assert_eq!(fault_severity(DeviceStatus::Degraded), "critical");
+        assert_eq!(fault_severity(DeviceStatus::NoDriver), "warning");
+        assert_eq!(fault_severity(DeviceStatus::Disabled), "warning");
+    }
+
+    #[test]
+    fn a_simulated_fault_fires_one_debounced_notify_and_flapping_does_not_spam() {
+        // The DEVMGR-9 acceptance, end to end over the real publish + Bus paths:
+        // clean → faulted fires exactly one alert on the folded lane; the device
+        // then flapping ok↔faulted inside the cooldown adds nothing.
+        let store = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let mut gate = DeviceFaultGate::default();
+        let host = "edge-1";
+        let clean = nic_inventory(host, DeviceStatus::Ok, None);
+        let faulted = nic_inventory(host, DeviceStatus::Degraded, Some("nic: I/O error"));
+
+        let mut drive = |inv: &DeviceInventory, at: Instant| {
+            let (_, transitions) = write_inventory_observing(store.path(), inv).unwrap();
+            for t in &transitions {
+                if gate.admit(&t.key, at) {
+                    emit_fault_alert(&persist, host, t);
+                }
+            }
+        };
+
+        let t0 = Instant::now();
+        drive(&clean, t0); // baseline publish — nothing to alert
+        drive(&faulted, t0 + Duration::from_secs(300)); // the fault edge → ONE notify
+        drive(&clean, t0 + Duration::from_secs(600)); // recovery — nothing
+        drive(&faulted, t0 + Duration::from_secs(900)); // flap re-entry — debounced
+
+        let alerts = persist.list_since(NOTIFY_TOPIC, None).unwrap();
+        assert_eq!(alerts.len(), 1, "exactly one debounced fault notify");
+        let body: serde_json::Value =
+            serde_json::from_str(alerts[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["severity"], "critical");
+        assert_eq!(body["source"], NOTIFY_SOURCE);
+        assert_eq!(body["host"], host);
+        assert_eq!(body["device"], "Intel I219-LM Ethernet");
+        assert_eq!(body["reason"], "nic: I/O error");
+        assert!(body["summary"]
+            .as_str()
+            .unwrap()
+            .contains("entered state degraded"));
     }
 
     #[test]
