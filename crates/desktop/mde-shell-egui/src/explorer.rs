@@ -847,10 +847,10 @@ fn peer_self_id(host: &str) -> String {
 }
 
 /// Union every node's mirror into one shelf: dedup by id keeping the freshest
-/// observation (lock #20 dedup), then order **this node first** (#23), then by
-/// proximity category, then by name (locks #7). Pure — the render's data model,
-/// unit-tested without a Bus.
-fn fold_units(states: &[UnitsState], local_host: &str) -> Vec<Unit> {
+/// observation (lock #20 dedup), then order **pinned first** (O9), then **this
+/// node** (#23), then by proximity category, then by name (locks #7). Pure —
+/// the render's data model, unit-tested without a Bus.
+fn fold_units(states: &[UnitsState], local_host: &str, pinned: &[String]) -> Vec<Unit> {
     let self_id = peer_self_id(local_host);
     let mut by_id: HashMap<String, Unit> = HashMap::new();
     for state in states {
@@ -864,22 +864,31 @@ fn fold_units(states: &[UnitsState], local_host: &str) -> Vec<Unit> {
         }
     }
     let mut units: Vec<Unit> = by_id.into_values().collect();
-    units.sort_by(|a, b| {
-        proximity_rank(a, &self_id)
-            .cmp(&proximity_rank(b, &self_id))
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            .then_with(|| a.id.cmp(&b.id))
-    });
+    sort_units(&mut units, &self_id, pinned);
     units
 }
 
-/// The sort key: this node first (0), then the unit's category slot + 1.
-fn proximity_rank(unit: &Unit, self_id: &str) -> u8 {
-    if unit.id == self_id {
+/// The ONE shelf ordering (shared by the fold and a live pin re-sort): pinned →
+/// self → proximity category, then case-folded name, then id (deterministic).
+fn sort_units(units: &mut [Unit], self_id: &str, pinned: &[String]) {
+    units.sort_by(|a, b| {
+        proximity_rank(a, self_id, pinned)
+            .cmp(&proximity_rank(b, self_id, pinned))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+}
+
+/// The sort key: pinned to the very front (O9), then this node, then the unit's
+/// category slot.
+fn proximity_rank(unit: &Unit, self_id: &str, pinned: &[String]) -> u8 {
+    if pinned.iter().any(|p| p == &unit.id) {
         0
+    } else if unit.id == self_id {
+        1
     } else {
-        // category().index() is 0..=2 → 1..=3, never overflowing a u8.
-        u8::try_from(unit.kind.category().index()).unwrap_or(2) + 1
+        // category().index() is 0..=2 → 2..=4, never overflowing a u8.
+        u8::try_from(unit.kind.category().index()).unwrap_or(2) + 2
     }
 }
 
@@ -1619,6 +1628,12 @@ struct ExplorerPrefs {
     /// a non-empty query restores the overlay open with it (the O5 "active
     /// search" half of the view record).
     search: String,
+    /// EXPLORER-16 — the pinned unit ids (O9), in the order they were pinned;
+    /// pinned units sort to the front of the mosaic + filmstrip.
+    pinned: Vec<String>,
+    /// EXPLORER-16 — the Pinned filter chip: scope the view to pinned units.
+    /// Composes with the category filter (Pinned ∩ Cloud is a real scope).
+    pinned_only: bool,
 }
 
 impl ExplorerPrefs {
@@ -1944,6 +1959,8 @@ impl ExplorerState {
                 .as_ref()
                 .map(|s| s.query.clone())
                 .unwrap_or_default(),
+            pinned: self.prefs.pinned.clone(),
+            pinned_only: self.prefs.pinned_only,
         }
     }
 
@@ -2096,13 +2113,73 @@ impl ExplorerState {
         }
     }
 
+    // ─────────────── pinning + the Pinned cluster (EXPLORER-16, O9) ───────────────
+
+    /// Whether `id` is pinned. The shelf is dozens of units, so the linear scan
+    /// over the small persisted list beats maintaining a second mirror set.
+    fn is_pinned(&self, id: &str) -> bool {
+        self.prefs.pinned.iter().any(|p| p == id)
+    }
+
+    /// Pin/unpin a unit (O9): flip its id in the persisted pin set, re-sort the
+    /// shelf so pinned units surface to the front at once, and keep the
+    /// operator's focus on the unit it was on — a pin re-orders the shelf, it
+    /// never teleports the view.
+    fn toggle_pin(&mut self, id: &str) {
+        let keep = self.focused_unit_id();
+        if let Some(pos) = self.prefs.pinned.iter().position(|p| p == id) {
+            self.prefs.pinned.remove(pos);
+        } else {
+            self.prefs.pinned.push(id.to_string());
+        }
+        self.save_prefs();
+        let self_id = peer_self_id(&self.local_host);
+        sort_units(&mut self.units, &self_id, &self.prefs.pinned);
+        if let Some(keep) = keep {
+            self.refocus(&keep);
+        }
+    }
+
+    /// Re-anchor focus onto `id` in the current view WITHOUT touching any filter
+    /// (unlike [`Self::jump_to_id`]): after a pin re-sort the unit may have left
+    /// the view entirely (unpinned under the Pinned chip) — focus then folds to
+    /// the front of what remains.
+    fn refocus(&mut self, id: &str) {
+        let target = self.units.iter().position(|u| u.id == id);
+        let pos = target.and_then(|abs| self.filtered_indices().iter().position(|&i| i == abs));
+        self.focus = pos.unwrap_or(0);
+    }
+
+    /// Toggle the Pinned filter chip (O9): scope every mode to pinned units,
+    /// re-anchoring focus to the front of the new view (the `set_filter` idiom).
+    fn set_pinned_only(&mut self, on: bool) {
+        if self.prefs.pinned_only != on {
+            self.prefs.pinned_only = on;
+            self.focus = 0;
+            self.save_prefs();
+        }
+    }
+
+    /// The honest empty-view note: the Pinned scope explains how to pin; a
+    /// category filter names its category (§7 — the note says why it's empty).
+    fn empty_note_text(&self) -> String {
+        if self.prefs.pinned_only {
+            "No pinned units yet — press P (or right-click a tile) to pin one.".to_string()
+        } else {
+            format!(
+                "No {} units discovered yet.",
+                self.filter.map_or("", Category::label)
+            )
+        }
+    }
+
     /// Re-read + re-fold the shelf. Split from the cadence gate so the pure fold
     /// stays testable; a dark Bus yields an empty shelf (→ the #23 self card),
     /// never a panic.
     fn refresh(&mut self) {
         let states = self.client.read();
         self.edges = fold_edges(&states);
-        self.units = fold_units(&states, &self.local_host);
+        self.units = fold_units(&states, &self.local_host, &self.prefs.pinned);
         self.sample_history();
         self.apply_pending_focus();
     }
@@ -2152,21 +2229,27 @@ impl ExplorerState {
         }
     }
 
-    /// The indices of `units` matching the active filter (all when `None`).
+    /// The indices of `units` matching the active category filter (all when
+    /// `None`) and — under the EXPLORER-16 Pinned chip — the pin set.
     fn filtered_indices(&self) -> Vec<usize> {
         self.units
             .iter()
             .enumerate()
-            .filter(|(_, u)| self.filter.is_none_or(|c| u.kind.category() == c))
+            .filter(|(_, u)| {
+                self.filter.is_none_or(|c| u.kind.category() == c)
+                    && (!self.prefs.pinned_only || self.is_pinned(&u.id))
+            })
             .map(|(i, _)| i)
             .collect()
     }
 
     /// How many hero pages the current view has — the filtered count, or **1** for
-    /// the honest self placeholder when nothing has streamed in yet (#23).
+    /// the honest self placeholder when nothing has streamed in yet (#23). An
+    /// active filter (category or Pinned) with no matches is an honest **0**,
+    /// never a fake self card.
     fn hero_count(&self) -> usize {
         let n = self.filtered_indices().len();
-        if n == 0 && self.filter.is_none() {
+        if n == 0 && self.filter.is_none() && !self.prefs.pinned_only {
             1
         } else {
             n
@@ -2307,12 +2390,18 @@ impl ExplorerState {
 
     /// The discovered prefix/IP table for the current view: every /24 an addressed
     /// unit occupies, scoped by the active category filter (the same chips that
-    /// scope the hero shelf). Pure over the folded state — the render's data model,
-    /// unit-tested without a Bus.
+    /// scope the hero shelf); under the EXPLORER-16 Pinned chip the table keeps
+    /// the prefixes where a pinned unit lives (whole-prefix context — the
+    /// neighbours around your pinned units are the point of an address table).
+    /// Pure over the folded state — the render's data model, unit-tested without
+    /// a Bus.
     fn ipam_prefixes(&self) -> Vec<IpamPrefix> {
         derive_prefixes(&self.units, &self.edges)
             .into_iter()
             .filter(|p| self.filter.is_none_or(|c| p.category == c))
+            .filter(|p| {
+                !self.prefs.pinned_only || p.occupants.iter().any(|o| self.is_pinned(&o.unit_id))
+            })
             .collect()
     }
 
@@ -2475,6 +2564,33 @@ impl ExplorerState {
         ui.add_space(Style::SP_M);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = Style::SP_S;
+            // The EXPLORER-16 pin toggle leads the bar: a purely local shelf
+            // re-order (no bus seam to gate), so it is never armed.
+            let pinned = self.is_pinned(&unit.id);
+            let pin_text = RichText::new(if pinned { "Unpin" } else { "Pin" })
+                .size(Style::SMALL)
+                .color(if pinned {
+                    Style::ACCENT_HI
+                } else {
+                    Style::TEXT
+                });
+            let pin_button = egui::Button::new(pin_text)
+                .fill(Style::SURFACE)
+                .stroke(Stroke::new(
+                    1.0,
+                    if pinned {
+                        Style::ACCENT_HI
+                    } else {
+                        Style::BORDER
+                    },
+                ));
+            if ui
+                .add(pin_button)
+                .on_hover_text("Pinned units sort to the front (P)")
+                .clicked()
+            {
+                self.toggle_pin(&unit.id);
+            }
             for &verb in verbs_for(unit.kind) {
                 self.verb_button(ui, verb, unit);
             }
@@ -2634,6 +2750,15 @@ impl ExplorerState {
             if slash_pressed(ui) {
                 self.open_search();
             } else {
+                // P pins/unpins the focused unit (EXPLORER-16, O9) in the two
+                // modes that HAVE a visible focused unit.
+                if !matches!(self.mode, SurfaceMode::Ipam)
+                    && ui.input(|i| i.key_pressed(egui::Key::P))
+                {
+                    if let Some(id) = self.focused_unit_id() {
+                        self.toggle_pin(&id);
+                    }
+                }
                 match self.mode {
                     SurfaceMode::Hero => self.handle_keys(ui),
                     SurfaceMode::Mosaic => self.handle_mosaic_keys(ui),
@@ -2819,19 +2944,25 @@ impl ExplorerState {
     }
 
     /// The top category filter chips (#8): All + Mesh/LAN/Cloud with rollup
-    /// counts, each accent-tinted (O8). Selecting one scopes the shelf.
+    /// counts, each accent-tinted (O8), plus the EXPLORER-16 **Pinned** chip (O9)
+    /// scoping to the pin set (composable with a category). Selecting one scopes
+    /// the shelf; All clears both axes.
     fn chips(&mut self, ui: &mut egui::Ui) {
         let counts = self.category_counts();
         let total = self.units.len();
+        // The honest pin tally: pinned ids whose unit is actually on the shelf
+        // (a pinned unit that left the fleet isn't counted as present, §7).
+        let pinned_here = self.units.iter().filter(|u| self.is_pinned(&u.id)).count();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = Style::SP_S;
             if chip(
                 ui,
                 &format!("All · {total}"),
-                self.filter.is_none(),
+                self.filter.is_none() && !self.prefs.pinned_only,
                 Style::ACCENT,
             ) {
                 self.set_filter(None);
+                self.set_pinned_only(false);
             }
             for cat in Category::ALL {
                 let label = format!("{} · {}", cat.label(), counts[cat.index()]);
@@ -2839,6 +2970,15 @@ impl ExplorerState {
                 if chip(ui, &label, active, cat.accent()) {
                     self.set_filter(if active { None } else { Some(cat) });
                 }
+            }
+            let pin_active = self.prefs.pinned_only;
+            if chip(
+                ui,
+                &format!("Pinned · {pinned_here}"),
+                pin_active,
+                Style::ACCENT_HI,
+            ) {
+                self.set_pinned_only(!pin_active);
             }
         });
     }
@@ -2900,20 +3040,14 @@ impl ExplorerState {
                 // the hero focus to the unit's related neighbours.
                 self.edge_chips(&mut child, &unit);
             }
-            None if self.filter.is_none() => {
+            None if self.filter.is_none() && !self.prefs.pinned_only => {
                 // #23 — no mirror yet: show THIS node, discovering.
                 hero_card(&mut child, &self_placeholder(&self.local_host), true, None);
             }
             None => {
-                // A filter with no matches — honest, not blank.
+                // A filter/Pinned scope with no matches — honest, not blank.
                 child.add_space(full.height() * 0.35);
-                muted_note(
-                    &mut child,
-                    format!(
-                        "No {} units discovered yet.",
-                        self.filter.map_or("", Category::label)
-                    ),
-                );
+                muted_note(&mut child, self.empty_note_text());
             }
         }
         // Page position ("3 / 12"), so the shelf's extent is always legible.
@@ -2997,7 +3131,9 @@ impl ExplorerState {
     }
 
     /// The bottom filmstrip (#5): a horizontal strip of neighbour thumbnails with
-    /// category dividers, the focused thumb accented; a click jumps the hero (#6).
+    /// cluster dividers (the O9 Pinned run first, then the #8 categories), the
+    /// focused thumb accented; a click jumps the hero (#6), a right-click toggles
+    /// the thumb's pin (O9).
     fn filmstrip(&mut self, ui: &mut egui::Ui) {
         let indices = self.filtered_indices();
         if indices.is_empty() {
@@ -3007,22 +3143,35 @@ impl ExplorerState {
         egui::ScrollArea::horizontal().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = Style::SP_S;
-                let mut last_cat: Option<Category> = None;
+                let mut last_cluster: Option<Cluster> = None;
                 let mut jump: Option<usize> = None;
+                let mut pin_toggle: Option<String> = None;
                 for (pos, &idx) in indices.iter().enumerate() {
                     let unit = &self.units[idx];
-                    let cat = unit.kind.category();
-                    // Category dividers (#8) — only meaningful in the unfiltered view.
-                    if self.filter.is_none() && last_cat != Some(cat) {
-                        filmstrip_divider(ui, cat);
-                        last_cat = Some(cat);
+                    let pinned = self.is_pinned(&unit.id);
+                    let cluster = if pinned {
+                        Cluster::Pinned
+                    } else {
+                        Cluster::Cat(unit.kind.category())
+                    };
+                    // Cluster dividers — only meaningful in the unfiltered view.
+                    if self.filter.is_none() && last_cluster != Some(cluster) {
+                        filmstrip_divider(ui, cluster);
+                        last_cluster = Some(cluster);
                     }
-                    if thumbnail(ui, unit, pos == self.focus) {
+                    let (clicked, pin) = thumbnail(ui, unit, pos == self.focus, pinned);
+                    if clicked {
                         jump = Some(pos);
+                    }
+                    if pin {
+                        pin_toggle = Some(unit.id.clone());
                     }
                 }
                 if let Some(pos) = jump {
                     self.focus = pos;
+                }
+                if let Some(id) = pin_toggle {
+                    self.toggle_pin(&id);
                 }
             });
         });
@@ -3084,22 +3233,16 @@ impl ExplorerState {
         if indices.is_empty() {
             self.focus_rect = None;
             ui.add_space(Style::SP_L);
-            if self.filter.is_none() {
+            if self.filter.is_none() && !self.prefs.pinned_only {
                 // #23 — no mirror yet: show THIS node's own tile, discovering.
                 let me = self_placeholder(&self.local_host);
                 ui.vertical_centered(|ui| {
-                    mosaic_tile(ui, &me, true);
+                    mosaic_tile(ui, &me, true, false);
                     ui.add_space(Style::SP_S);
                     muted_note(ui, "Discovering units… others tile in as they're found.");
                 });
             } else {
-                muted_note(
-                    ui,
-                    format!(
-                        "No {} units discovered yet.",
-                        self.filter.map_or("", Category::label)
-                    ),
-                );
+                muted_note(ui, self.empty_note_text());
             }
             return;
         }
@@ -3117,19 +3260,14 @@ impl ExplorerState {
             1.0
         };
 
-        // Cluster the (already proximity-sorted) filtered view into contiguous
-        // category runs — the category-clustered grid (O1/O8).
-        let mut clusters: Vec<(Category, Vec<usize>)> = Vec::new();
-        for &idx in &indices {
-            let cat = self.units[idx].kind.category();
-            match clusters.last_mut() {
-                Some((c, run)) if *c == cat => run.push(idx),
-                _ => clusters.push((cat, vec![idx])),
-            }
-        }
+        // Cluster the (already pinned-then-proximity-sorted) filtered view into
+        // contiguous runs — the Pinned front cluster (O9) then the category
+        // clusters (O1/O8).
+        let clusters = self.cluster_runs(&indices);
 
         let focus = self.focus;
         let mut pick: Option<(usize, Rect)> = None;
+        let mut pin_toggle: Option<String> = None;
         let mut focus_rect: Option<Rect> = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -3137,8 +3275,8 @@ impl ExplorerState {
                 ui.set_opacity(settle);
                 let cols = mosaic_columns(ui.available_width());
                 let mut pos = 0usize; // the running index into the filtered view
-                for (cat, run) in &clusters {
-                    mosaic_cluster_header(ui, *cat, run.len());
+                for (cluster, run) in &clusters {
+                    mosaic_cluster_header(ui, *cluster, run.len());
                     let mut k = 0;
                     while k < run.len() {
                         ui.horizontal(|ui| {
@@ -3146,12 +3284,17 @@ impl ExplorerState {
                             for _ in 0..cols {
                                 let Some(&idx) = run.get(k) else { break };
                                 let focused = pos == focus;
-                                let (rect, clicked) = mosaic_tile(ui, &self.units[idx], focused);
+                                let unit = &self.units[idx];
+                                let pinned = self.is_pinned(&unit.id);
+                                let (rect, clicked, pin) = mosaic_tile(ui, unit, focused, pinned);
                                 if focused {
                                     focus_rect = Some(rect);
                                 }
                                 if clicked {
                                     pick = Some((pos, rect));
+                                }
+                                if pin {
+                                    pin_toggle = Some(unit.id.clone());
                                 }
                                 pos += 1;
                                 k += 1;
@@ -3162,9 +3305,33 @@ impl ExplorerState {
                 }
             });
         self.focus_rect = focus_rect;
+        if let Some(id) = pin_toggle {
+            self.toggle_pin(&id);
+        }
         if let Some((pos, rect)) = pick {
             self.zoom_into(pos, Some(rect));
         }
+    }
+
+    /// Fold the (already sorted) filtered view into contiguous cluster runs —
+    /// the Pinned front cluster (O9) then the category runs (O1/O8). Pure over
+    /// the folded state — the mosaic's grouping model, unit-tested without a
+    /// render.
+    fn cluster_runs(&self, indices: &[usize]) -> Vec<(Cluster, Vec<usize>)> {
+        let mut clusters: Vec<(Cluster, Vec<usize>)> = Vec::new();
+        for &idx in indices {
+            let unit = &self.units[idx];
+            let cluster = if self.is_pinned(&unit.id) {
+                Cluster::Pinned
+            } else {
+                Cluster::Cat(unit.kind.category())
+            };
+            match clusters.last_mut() {
+                Some((c, run)) if *c == cluster => run.push(idx),
+                _ => clusters.push((cluster, vec![idx])),
+            }
+        }
+        clusters
     }
 }
 
@@ -3322,15 +3489,15 @@ fn edge_chip(ui: &mut egui::Ui, chip: &ChipItem) -> bool {
     resp.on_hover_text(&chip.name).clicked()
 }
 
-/// A thin vertical category divider + rotated-free label between filmstrip
-/// sections (#8).
-fn filmstrip_divider(ui: &mut egui::Ui, cat: Category) {
+/// A thin vertical cluster divider + label between filmstrip sections (#8, plus
+/// the O9 Pinned run).
+fn filmstrip_divider(ui: &mut egui::Ui, cluster: Cluster) {
     ui.vertical(|ui| {
         ui.add_space(Style::SP_XS);
         ui.label(
-            RichText::new(cat.label())
+            RichText::new(cluster.label())
                 .size(Style::SMALL)
-                .color(cat.accent()),
+                .color(cluster.accent()),
         );
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(Style::SP_XS, THUMB_H * 0.6), Sense::hover());
@@ -3341,9 +3508,10 @@ fn filmstrip_divider(ui: &mut egui::Ui, cat: Category) {
     });
 }
 
-/// One filmstrip thumbnail — a mini glyph + status dot + truncated name; the
-/// focused thumb wears an accent border. Returns whether it was clicked (#6 jump).
-fn thumbnail(ui: &mut egui::Ui, unit: &Unit, focused: bool) -> bool {
+/// One filmstrip thumbnail — a mini glyph + status dot + truncated name (+ the
+/// O9 pin marker); the focused thumb wears an accent border. Returns whether it
+/// was clicked (#6 jump) and whether it was right-clicked (the O9 pin toggle).
+fn thumbnail(ui: &mut egui::Ui, unit: &Unit, focused: bool, pinned: bool) -> (bool, bool) {
     let cat = unit.kind.category();
     let resp = ui
         .scope_builder(UiBuilder::new().sense(Sense::click()), |ui| {
@@ -3382,6 +3550,14 @@ fn thumbnail(ui: &mut egui::Ui, unit: &Unit, focused: bool) -> bool {
                     h.ring_color(),
                 );
             }
+            // The pin marker (O9).
+            if pinned {
+                paint_pin(
+                    ui.painter(),
+                    rect.min + Vec2::splat(Style::SP_S),
+                    Style::ACCENT_HI,
+                );
+            }
             // Truncated name.
             let name = truncate(&unit.name, 12);
             ui.painter().text(
@@ -3393,7 +3569,8 @@ fn thumbnail(ui: &mut egui::Ui, unit: &Unit, focused: bool) -> bool {
             );
         })
         .response;
-    resp.on_hover_text(&unit.name).clicked()
+    let resp = resp.on_hover_text(&unit.name);
+    (resp.clicked(), resp.secondary_clicked())
 }
 
 /// Truncate a name to `max` chars with an ellipsis, so a long id never blows the
@@ -3408,6 +3585,36 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 // ─────────────────── mosaic overview render (EXPLORER-11) ───────────────────
+
+/// The mosaic/filmstrip cluster a unit files under (EXPLORER-16, O9): the
+/// **Pinned** front cluster, else its proximity category — the grouping key the
+/// cluster headers and filmstrip dividers speak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cluster {
+    /// The operator's pinned units — always the front cluster (O9).
+    Pinned,
+    /// A proximity-category run (O1/O8).
+    Cat(Category),
+}
+
+impl Cluster {
+    /// The header / divider label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Pinned => "Pinned",
+            Self::Cat(c) => c.label(),
+        }
+    }
+
+    /// The header / divider accent — the pin cluster wears the highlight accent
+    /// (§4 token, like the focus ring), categories keep their O8 identity.
+    const fn accent(self) -> Color32 {
+        match self {
+            Self::Pinned => Style::ACCENT_HI,
+            Self::Cat(c) => c.accent(),
+        }
+    }
+}
 
 /// A D-pad direction over the mosaic grid (O6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3486,17 +3693,17 @@ fn health_dot(ui: &mut egui::Ui, color: Color32, count: usize) {
     });
 }
 
-/// A mosaic cluster header (O1/O8): the category label + its count in the category
-/// accent — the category-clustered grid's divider between runs.
-fn mosaic_cluster_header(ui: &mut egui::Ui, cat: Category, count: usize) {
+/// A mosaic cluster header (O1/O8/O9): the cluster label (Pinned or a category)
+/// + its count in the cluster accent — the clustered grid's divider between runs.
+fn mosaic_cluster_header(ui: &mut egui::Ui, cluster: Cluster, count: usize) {
     ui.add_space(Style::SP_S);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = Style::SP_S;
         ui.label(
-            RichText::new(cat.label())
+            RichText::new(cluster.label())
                 .size(Style::BODY)
                 .strong()
-                .color(cat.accent()),
+                .color(cluster.accent()),
         );
         ui.label(
             RichText::new(count.to_string())
@@ -3509,10 +3716,12 @@ fn mosaic_cluster_header(ui: &mut egui::Ui, cat: Category, count: usize) {
 
 /// One mosaic hero-tile (EXPLORER-11): a mini status ring + kind glyph, the
 /// truncated name, and a type badge, in a category-tinted frame; the keyboard/
-/// D-pad-focused tile wears a thick high-contrast focus ring (O11). Hand-painted so
-/// the procedural glyph family (O8) rides inside, echoing the hero at tile scale.
-/// Returns its rect (the zoom-in origin) and whether it was clicked (the O3 pick).
-fn mosaic_tile(ui: &mut egui::Ui, unit: &Unit, focused: bool) -> (Rect, bool) {
+/// D-pad-focused tile wears a thick high-contrast focus ring (O11); a pinned
+/// tile wears the pin marker (O9). Hand-painted so the procedural glyph family
+/// (O8) rides inside, echoing the hero at tile scale. Returns its rect (the
+/// zoom-in origin), whether it was clicked (the O3 pick), and whether it was
+/// right-clicked (the O9 pin toggle).
+fn mosaic_tile(ui: &mut egui::Ui, unit: &Unit, focused: bool, pinned: bool) -> (Rect, bool, bool) {
     let cat = unit.kind.category();
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(MOSAIC_TILE_W, MOSAIC_TILE_H), Sense::click());
@@ -3559,7 +3768,38 @@ fn mosaic_tile(ui: &mut egui::Ui, unit: &Unit, focused: bool) -> (Rect, bool) {
         FontId::proportional(Style::SMALL),
         cat.accent(),
     );
-    (rect, resp.clicked())
+    // The pin marker (O9) in the tile's top-left corner.
+    if pinned {
+        paint_pin(
+            painter,
+            rect.min + Vec2::splat(Style::SP_S),
+            Style::ACCENT_HI,
+        );
+    }
+    let resp = resp.on_hover_text(if pinned {
+        "Right-click to unpin"
+    } else {
+        "Right-click to pin"
+    });
+    (rect, resp.clicked(), resp.secondary_clicked())
+}
+
+/// A tiny procedural pushpin marker (O9): a filled head + a 45° stem — painter
+/// primitives in the given §4 accent, like the kind glyphs.
+fn paint_pin(painter: &egui::Painter, center: egui::Pos2, color: Color32) {
+    let r = Style::SP_XS;
+    painter.circle_filled(
+        egui::pos2(center.x + r * 0.35, center.y - r * 0.35),
+        r * 0.6,
+        color,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(center.x + r * 0.1, center.y - r * 0.1),
+            egui::pos2(center.x - r * 0.8, center.y + r * 0.8),
+        ],
+        Stroke::new(GLYPH_STROKE_W * 0.75, color),
+    );
 }
 
 // ─────────────────── IPAM table render (EXPLORER-10) ───────────────────
@@ -4276,7 +4516,7 @@ mod tests {
             units: vec![unit("peer:x", UnitKind::Peer, "x-new", 200)],
             edges: Vec::new(),
         };
-        let folded = fold_units(&[a, b], "me");
+        let folded = fold_units(&[a, b], "me", &[]);
         assert_eq!(folded.len(), 1, "deduped by id");
         assert_eq!(folded[0].name, "x-new", "freshest observation kept");
     }
@@ -4294,7 +4534,7 @@ mod tests {
             ],
             edges: Vec::new(),
         };
-        let folded = fold_units(&[state], "me");
+        let folded = fold_units(&[state], "me", &[]);
         let ids: Vec<&str> = folded.iter().map(|u| u.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -5688,6 +5928,8 @@ mod tests {
             selected: Some("lan:printer".to_string()),
             filter: Some(Category::Lan),
             search: "vnc".to_string(),
+            pinned: vec!["peer:me".to_string()],
+            pinned_only: true,
         };
         prefs.save_to(&path).expect("save");
         assert_eq!(
@@ -6067,5 +6309,222 @@ mod tests {
             !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty(),
             "the search overlay drew primitives"
         );
+    }
+
+    // ─────────────── EXPLORER-16 pinning + the Pinned cluster ───────────────
+
+    #[test]
+    fn pinned_units_sort_to_the_front_of_the_fold() {
+        let state = UnitsState {
+            host: "me".into(),
+            units: vec![
+                unit("cloud:instance:i1", UnitKind::Instance, "web", 10),
+                unit("lan:aa", UnitKind::LanHost, "printer", 10),
+                unit("peer:me", UnitKind::Peer, "me", 10),
+                unit("peer:alpha", UnitKind::Peer, "alpha", 10),
+            ],
+            edges: Vec::new(),
+        };
+        // Unpinned: self first, then proximity (the #23/#7 order).
+        let plain = fold_units(std::slice::from_ref(&state), "me", &[]);
+        assert_eq!(plain[0].id, "peer:me");
+        // Pin the cloud instance: it jumps to the very front (O9), the rest keep
+        // their order.
+        let pinned = vec!["cloud:instance:i1".to_string()];
+        let folded = fold_units(&[state], "me", &pinned);
+        let ids: Vec<&str> = folded.iter().map(|u| u.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["cloud:instance:i1", "peer:me", "peer:alpha", "lan:aa"],
+            "pinned first, then self, then proximity+name"
+        );
+    }
+
+    #[test]
+    fn toggle_pin_reorders_live_keeps_focus_and_round_trips_through_disk() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.set_mode(SurfaceMode::Hero);
+        focus_on(&mut s, "peer:anvil");
+
+        // Pin the printer: it moves to the front; the operator's focus stays on
+        // anvil (a pin re-orders, never teleports).
+        s.toggle_pin("lan:printer");
+        assert!(s.is_pinned("lan:printer"));
+        assert_eq!(
+            s.units[0].id, "lan:printer",
+            "the pin surfaced to the front"
+        );
+        assert_eq!(
+            focused(&s).id,
+            "peer:anvil",
+            "focus held through the re-sort"
+        );
+
+        // The pin set persists (rides the ONE prefs record).
+        let dir = ambient_temp_dir("pin-rt");
+        std::fs::create_dir_all(&dir).expect("mkroot");
+        let path = dir.join(PREFS_FILE);
+        s.prefs_path = Some(path.clone());
+        s.persist_view();
+        assert_eq!(
+            ExplorerPrefs::load_from(&path).pinned,
+            vec!["lan:printer".to_string()],
+            "the pin set survives a restart"
+        );
+
+        // Unpin: the shelf returns to the plain order.
+        s.toggle_pin("lan:printer");
+        assert!(!s.is_pinned("lan:printer"));
+        assert_eq!(s.units[0].id, "peer:me", "unpinning restores self-first");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restored_pin_set_orders_the_first_fold() {
+        let prefs = ExplorerPrefs {
+            pinned: vec!["cloud:instance:i1".to_string()],
+            ..Default::default()
+        };
+        let s = ExplorerState::with_prefs(addressed_state(), "me", prefs);
+        assert!(s.is_pinned("cloud:instance:i1"));
+        assert_eq!(
+            s.units[0].id, "cloud:instance:i1",
+            "the restored pin set fronts the very first fold"
+        );
+    }
+
+    #[test]
+    fn the_pinned_chip_scopes_the_view_and_composes_with_a_category() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.toggle_pin("lan:printer");
+        s.toggle_pin("cloud:instance:i1");
+
+        // Pinned alone: exactly the two pinned units.
+        s.set_pinned_only(true);
+        let ids: Vec<String> = s
+            .filtered_indices()
+            .iter()
+            .map(|&i| s.units[i].id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"lan:printer".to_string()));
+        assert!(ids.contains(&"cloud:instance:i1".to_string()));
+
+        // Pinned ∩ Cloud: the pinned instance only.
+        s.set_filter(Some(Category::Cloud));
+        let ids: Vec<String> = s
+            .filtered_indices()
+            .iter()
+            .map(|&i| s.units[i].id.clone())
+            .collect();
+        assert_eq!(ids, vec!["cloud:instance:i1".to_string()]);
+
+        // Clearing both restores the whole shelf.
+        s.set_filter(None);
+        s.set_pinned_only(false);
+        assert_eq!(s.filtered_indices().len(), s.units.len());
+    }
+
+    #[test]
+    fn the_pinned_scope_with_no_pins_is_honestly_empty() {
+        // No self-placeholder fake under the Pinned chip (§7): zero pages + the
+        // honest how-to note.
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.set_pinned_only(true);
+        assert_eq!(s.hero_count(), 0, "no pins → an honest empty view");
+        assert!(
+            s.empty_note_text().contains("No pinned units"),
+            "the note says why it's empty"
+        );
+    }
+
+    #[test]
+    fn cluster_runs_front_the_pinned_units_under_their_own_header() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.toggle_pin("cloud:instance:i1");
+        let indices = s.filtered_indices();
+        let runs = s.cluster_runs(&indices);
+        assert_eq!(
+            runs[0].0,
+            Cluster::Pinned,
+            "the Pinned cluster leads the mosaic"
+        );
+        assert_eq!(runs[0].1.len(), 1);
+        assert_eq!(s.units[runs[0].1[0]].id, "cloud:instance:i1");
+        // The remaining runs are the plain category clusters in proximity order.
+        assert_eq!(runs[1].0, Cluster::Cat(Category::Mesh));
+        assert!(
+            runs.iter().skip(1).all(|(c, _)| *c != Cluster::Pinned),
+            "exactly one Pinned run"
+        );
+        // The cluster identity tokens: Pinned wears the highlight accent.
+        assert_eq!(Cluster::Pinned.label(), "Pinned");
+        assert_eq!(Cluster::Pinned.accent(), Style::ACCENT_HI);
+        assert_eq!(Cluster::Cat(Category::Lan).label(), "LAN");
+    }
+
+    #[test]
+    fn the_pinned_ipam_scope_keeps_prefixes_hosting_a_pinned_unit() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.toggle_pin("lan:printer");
+        s.set_pinned_only(true);
+        let prefixes = s.ipam_prefixes();
+        assert_eq!(prefixes.len(), 1, "only the pinned unit's /24 remains");
+        assert_eq!(prefixes[0].cidr(), "172.20.0.0/24");
+    }
+
+    #[test]
+    fn the_p_key_pins_the_focused_unit() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.set_mode(SurfaceMode::Hero);
+        focus_on(&mut s, "peer:anvil");
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let p = egui::Event::Key {
+            key: egui::Key::P,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        ambient_frame(&ctx, &mut s, 0.0, vec![p.clone()]);
+        assert!(s.is_pinned("peer:anvil"), "P pins the focused unit");
+        assert_eq!(
+            focused(&s).id,
+            "peer:anvil",
+            "the focus stays on the unit through its pin"
+        );
+        ambient_frame(&ctx, &mut s, 0.5, vec![p]);
+        assert!(!s.is_pinned("peer:anvil"), "P again unpins it");
+    }
+
+    #[test]
+    fn the_pinned_mosaic_and_filmstrip_render_headless() {
+        let render = |s: &mut ExplorerState| {
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    Vec2::new(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| s.show(ui));
+            });
+            !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty()
+        };
+        // The mosaic with a Pinned cluster + pin markers.
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.toggle_pin("lan:printer");
+        assert!(render(&mut s), "the pinned mosaic drew primitives");
+        // The hero + filmstrip with a pinned thumb + the Pin button.
+        s.set_mode(SurfaceMode::Hero);
+        assert!(render(&mut s), "the pinned hero/filmstrip drew primitives");
+        // The honest empty Pinned scope.
+        let mut none = ExplorerState::with_fake(addressed_state(), "me");
+        none.set_pinned_only(true);
+        assert!(render(&mut none), "the empty Pinned scope drew its note");
     }
 }
