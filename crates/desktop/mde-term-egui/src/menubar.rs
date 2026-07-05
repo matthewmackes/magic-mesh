@@ -2,9 +2,10 @@
 //! directive; design lineage: `mde-editor-egui`'s Word-97 menu bar).
 //!
 //! The terminal already carries every Terminator-class feature behind chords +
-//! the TERM-15 right-click menu; this is the *discoverable* face over them — an
-//! `egui::menu::bar` of drop-downs, each item the **mouse twin of an existing
-//! seam** (§6, one dispatch path), never a new behaviour and never a stub. Per
+//! the TERM-15 right-click menu; this is the *discoverable* face over them — hosted
+//! on the shared [`mde_egui::menubar::MenuBar`] (MENUBAR-ALL-1) under one UPPERCASE
+//! accent title, each item the **mouse twin of an existing seam** (§6, one dispatch
+//! path), never a new behaviour and never a stub. Per
 //! the editor menu's governing lock (**no dead entries** — an item ships only
 //! when its seam exists, §7), an item whose feature is genuinely missing is
 //! *omitted*, and an item whose feature needs context (Copy with no selection)
@@ -47,13 +48,14 @@
 //! applies to its [`crate::tmux_ui::TmuxChrome`] (create · attach-picker ·
 //! detach · toggle-tree), context-gated on a live control client.
 //!
-//! §4: the bar renders through the shared Carbon [`Style`] install — no forced
-//! colours, so egui's disabled dimming reads correctly.
+//! §4: the shared [`MenuBar`] renders through the Carbon [`Style`] install — no
+//! forced colours, so egui's disabled dimming reads correctly; the surface builds
+//! the menu **model** each frame ([`build_menus`]) and dispatches the activated
+//! [`Picked`] id, so every seam + gate + shortcut is preserved through the move.
 
-use std::cell::RefCell;
-
-use mde_egui::egui::{self, Button, Context, RichText, Ui};
-use mde_egui::Style;
+use mde_egui::egui::{self, Context, RichText, Ui};
+use mde_egui::menubar::{Entry, Item as BarItem, Menu, MenuBar as SharedMenuBar, MenuBarModel};
+use mde_egui::{ChipTone, StatusChip, Style};
 
 use crate::bell::BellConfig;
 use crate::keymap::{Action, Keymap};
@@ -63,10 +65,6 @@ use crate::splits::{Broadcast, Command, NavDir, SplitDir, SplitTerminal};
 use crate::tabs::TabCommand;
 use crate::tmux_ui::TmuxMenuChoice;
 use crate::TabbedTerminal;
-
-/// Minimum drop-down width so short menus don't collapse into slivers — six
-/// shared spacing units (§4), the editor menu bar's derivation.
-const MENU_MIN_W: f32 = Style::SP_XL * 6.0;
 
 /// The bar's menu titles, left to right.
 ///
@@ -585,70 +583,169 @@ fn shortcut_text(shortcut: Shortcut, keymap: &Keymap) -> String {
     }
 }
 
-/// Render one item as a button (checkable items carry a `✓` glyph + keep their
-/// shortcut). Records the chosen action into `out`.
-fn render_item(
-    ui: &mut Ui,
-    item: &Item,
-    cx: &MenuContext,
-    keymap: &Keymap,
-    out: &RefCell<Option<Outcome>>,
-) {
-    if item.sep_before {
-        ui.separator();
-    }
-    let enabled = item.gate.enabled(cx);
-    let label = match checked(item.action, cx) {
-        Some(true) => format!("\u{2713} {}", item.label),
-        Some(false) => format!("    {}", item.label),
-        None => item.label.to_owned(),
-    };
-    let clicked = ui
-        .add_enabled(
-            enabled,
-            Button::new(label).shortcut_text(shortcut_text(item.shortcut, keymap)),
-        )
-        .clicked();
-    if clicked {
-        *out.borrow_mut() = Some(Outcome::Action(item.action));
-        ui.close_menu();
-    }
-}
-
-/// Render a flat list of items into a drop-down.
-fn render_items(
-    ui: &mut Ui,
-    items: &[Item],
-    cx: &MenuContext,
-    keymap: &Keymap,
-    out: &RefCell<Option<Outcome>>,
-) {
-    for item in items {
-        render_item(ui, item, cx, keymap, out);
-    }
-}
-
-/// A nested submenu of check/command items (Colour Scheme, Broadcast, Bell).
-fn submenu(
-    ui: &mut Ui,
-    title: &str,
-    items: &[Item],
-    cx: &MenuContext,
-    keymap: &Keymap,
-    out: &RefCell<Option<Outcome>>,
-) {
-    ui.menu_button(title, |ui| {
-        ui.set_min_width(MENU_MIN_W);
-        render_items(ui, items, cx, keymap, out);
-    });
-}
-
-/// What a rendered frame chose — a plain action or a Session peer to attach.
-enum Outcome {
-    /// A menu item's action.
+/// What a rendered frame chose — the shared [`SharedMenuBar`] returns one of these
+/// as the activated item's id, and [`MenuBar::ui`] routes it to the right seam
+/// (three distinct destinations that the flat action vocabulary can't hold).
+#[derive(Clone)]
+enum Picked {
+    /// A menu action dispatched through [`apply`] (or the [`MenuBar`]-owned
+    /// shortcuts toggle).
     Action(MenuAction),
-    /// Attach a session on this mesh peer (Session menu).
+    /// Attach a session on this reachable mesh peer host (Session menu).
     AttachPeer(String),
+    /// A tmux session-management choice routed OUT to the surface's `TmuxChrome`
+    /// (TMUX-FC-2), not through [`apply`].
+    Tmux(TmuxMenuChoice),
+}
+
+/// Convert a static [`Item`] into a shared-model entry (a leading [`Entry::Separator`]
+/// when it starts a Word-style group), preserving its live-resolved shortcut hint,
+/// its [`Gate`], and its checkmark (§6 — the render host changed, the seam did not).
+fn push_item(out: &mut Vec<Entry<Picked>>, item: &Item, cx: &MenuContext, keymap: &Keymap) {
+    if item.sep_before {
+        out.push(Entry::Separator);
+    }
+    let mut bar_item =
+        BarItem::new(Picked::Action(item.action), item.label).enabled(item.gate.enabled(cx));
+    let shortcut = shortcut_text(item.shortcut, keymap);
+    if !shortcut.is_empty() {
+        bar_item = bar_item.shortcut(shortcut);
+    }
+    if let Some(on) = checked(item.action, cx) {
+        bar_item = bar_item.checked(on);
+    }
+    out.push(Entry::Item(bar_item));
+}
+
+/// A flat list of static [`Item`]s as shared-model entries (File/Edit/Splits/…).
+fn flat(items: &[Item], cx: &MenuContext, keymap: &Keymap) -> Vec<Entry<Picked>> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        push_item(&mut out, item, cx, keymap);
+    }
+    out
+}
+
+/// The View drop-down: the Colour Scheme submenu ([`SCHEME_ITEMS`]) then the
+/// Appearance/Zoom items ([`VIEW_ITEMS`]).
+fn view_entries(cx: &MenuContext, keymap: &Keymap) -> Vec<Entry<Picked>> {
+    let mut out = vec![Entry::Submenu {
+        label: "Colour Scheme".to_owned(),
+        mnemonic: None,
+        entries: flat(&SCHEME_ITEMS, cx, keymap),
+    }];
+    out.extend(flat(&VIEW_ITEMS, cx, keymap));
+    out
+}
+
+/// The Terminal drop-down: New Session, then the Broadcast-Input + Bell submenus.
+fn terminal_entries(cx: &MenuContext, keymap: &Keymap) -> Vec<Entry<Picked>> {
+    let mut out = flat(&TERMINAL_ITEMS, cx, keymap);
+    out.push(Entry::Separator);
+    out.push(Entry::Submenu {
+        label: "Broadcast Input".to_owned(),
+        mnemonic: None,
+        entries: flat(&BROADCAST_ITEMS, cx, keymap),
+    });
+    out.push(Entry::Submenu {
+        label: "Bell".to_owned(),
+        mnemonic: None,
+        entries: flat(&BELL_ITEMS, cx, keymap),
+    });
+    out
+}
+
+/// The Tmux drop-down (TMUX-FC-2): the session-management entry points. Each item
+/// routes OUT as a [`TmuxMenuChoice`] the surface applies to its
+/// [`crate::tmux_ui::TmuxChrome`]; Detach / Hide-tree honestly grey out without a
+/// live control client (§7). The full session/window/pane tree lives in the sidebar
+/// the "New tmux session" item reveals.
+fn tmux_entries(active: bool) -> Vec<Entry<Picked>> {
+    vec![
+        Entry::Item(BarItem::new(
+            Picked::Tmux(TmuxMenuChoice::NewSession),
+            "New tmux session",
+        )),
+        Entry::Item(BarItem::new(
+            Picked::Tmux(TmuxMenuChoice::ShowPicker),
+            "Attach Session\u{2026}",
+        )),
+        Entry::Separator,
+        Entry::Item(BarItem::new(Picked::Tmux(TmuxMenuChoice::Detach), "Detach").enabled(active)),
+        Entry::Item(
+            BarItem::new(Picked::Tmux(TmuxMenuChoice::ToggleTree), "Hide/Show Tree")
+                .enabled(active),
+        ),
+    ]
+}
+
+/// The Session drop-down: the reachable mesh peers (attach opens a remote tab), an
+/// honest empty caption, and the picker.
+fn session_entries(
+    keymap: &Keymap,
+    roster: Option<&crate::roster::RosterSnapshot>,
+) -> Vec<Entry<Picked>> {
+    let reachable: Vec<&crate::roster::PeerEntry> = roster
+        .map(|snap| snap.peers.iter().filter(|p| p.is_reachable()).collect())
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    if reachable.is_empty() {
+        out.push(Entry::Caption("No mesh peers online".to_owned()));
+    } else {
+        out.push(Entry::Caption("Attach a session on\u{2026}".to_owned()));
+        for peer in reachable {
+            out.push(Entry::Item(BarItem::new(
+                Picked::AttachPeer(peer.host.clone()),
+                peer.display.clone(),
+            )));
+        }
+    }
+    out.push(Entry::Separator);
+    let mut picker = BarItem::new(
+        Picked::Action(MenuAction::OpenRemotePicker),
+        "Open Session Picker\u{2026}",
+    );
+    let shortcut = shortcut_text(Shortcut::Bound(Action::ToggleRemote), keymap);
+    if !shortcut.is_empty() {
+        picker = picker.shortcut(shortcut);
+    }
+    out.push(Entry::Item(picker));
+    out
+}
+
+/// Build the full ordered menu tree ([`MENU_TITLES`] order) as the shared model.
+fn build_menus(
+    cx: &MenuContext,
+    keymap: &Keymap,
+    roster: Option<&crate::roster::RosterSnapshot>,
+    tmux_active: bool,
+) -> Vec<Menu<Picked>> {
+    vec![
+        Menu::new("File", flat(&FILE_ITEMS, cx, keymap)),
+        Menu::new("Edit", flat(&EDIT_ITEMS, cx, keymap)),
+        Menu::new("View", view_entries(cx, keymap)),
+        Menu::new("Terminal", terminal_entries(cx, keymap)),
+        Menu::new("Splits", flat(&SPLITS_ITEMS, cx, keymap)),
+        Menu::new("Tabs", flat(&TABS_ITEMS, cx, keymap)),
+        Menu::new("Tmux", tmux_entries(tmux_active)),
+        Menu::new("Session", session_entries(keymap, roster)),
+        Menu::new("Help", flat(&HELP_ITEMS, cx, keymap)),
+    ]
+}
+
+/// The terminal's live status cluster (lock 6): the open tab + pane counts, plus a
+/// broadcast-input warning chip while grouped input is armed — all real state read
+/// from the frame's [`MenuContext`] (§7).
+fn build_status(cx: &MenuContext) -> Vec<StatusChip> {
+    let mut chips = vec![
+        StatusChip::new(format!("{} tabs", cx.tab_count), ChipTone::Neutral),
+        StatusChip::new(format!("{} panes", cx.pane_count), ChipTone::Neutral),
+    ];
+    if cx.broadcast != Broadcast::Off {
+        chips.push(StatusChip::new("BROADCAST", ChipTone::Warn));
+    }
+    chips
 }
 
 /// The stateful top menu bar: it owns only the shortcuts-reference toggle; every
@@ -682,72 +779,36 @@ impl MenuBar {
         ctx: &Context,
         tmux_active: bool,
     ) -> Option<TmuxMenuChoice> {
+        // Snapshot the terminal up front (context + keymap clone + roster), build
+        // the shared model, render, then apply the one chosen item mutably — so no
+        // borrow of `term` is held across the render (TMUX-FC-2 / TERM-8 preserved).
         let cx = context(term);
         let keymap = term.keymap().clone();
         let roster = term.roster_snapshot();
-        let out: RefCell<Option<Outcome>> = RefCell::new(None);
-        let tmux_out: RefCell<Option<TmuxMenuChoice>> = RefCell::new(None);
+        let menus = build_menus(&cx, &keymap, roster.as_ref(), tmux_active);
+        let status = build_status(&cx);
+        let model = MenuBarModel {
+            title: "Terminal",
+            accent: Style::ACCENT_TERMINALS,
+            menus: &menus,
+            status: &status,
+        };
+        let picked = SharedMenuBar::show(ui, &model);
 
-        egui::menu::bar(ui, |ui| {
-            ui.add_space(Style::SP_XS);
-            ui.menu_button("File", |ui| {
-                ui.set_min_width(MENU_MIN_W);
-                render_items(ui, &FILE_ITEMS, &cx, &keymap, &out);
-            });
-            ui.menu_button("Edit", |ui| {
-                ui.set_min_width(MENU_MIN_W);
-                render_items(ui, &EDIT_ITEMS, &cx, &keymap, &out);
-            });
-            ui.menu_button("View", |ui| {
-                ui.set_min_width(MENU_MIN_W);
-                submenu(ui, "Colour Scheme", &SCHEME_ITEMS, &cx, &keymap, &out);
-                render_items(ui, &VIEW_ITEMS, &cx, &keymap, &out);
-            });
-            ui.menu_button("Terminal", |ui| {
-                ui.set_min_width(MENU_MIN_W);
-                render_items(ui, &TERMINAL_ITEMS, &cx, &keymap, &out);
-                ui.separator();
-                submenu(ui, "Broadcast Input", &BROADCAST_ITEMS, &cx, &keymap, &out);
-                submenu(ui, "Bell", &BELL_ITEMS, &cx, &keymap, &out);
-            });
-            ui.menu_button("Splits", |ui| {
-                ui.set_min_width(MENU_MIN_W);
-                render_items(ui, &SPLITS_ITEMS, &cx, &keymap, &out);
-            });
-            ui.menu_button("Tabs", |ui| {
-                ui.set_min_width(MENU_MIN_W);
-                render_items(ui, &TABS_ITEMS, &cx, &keymap, &out);
-            });
-            // ── TMUX-FC-2 seam ──────────────────────────────────────────────
-            // The tmux session menu — its choices route OUT (to the surface's
-            // TmuxChrome), not through `apply`; the session/window/pane tree +
-            // ops live in the sidebar the "New tmux session" item reveals.
-            ui.menu_button("Tmux", |ui| {
-                ui.set_min_width(MENU_MIN_W);
-                tmux_menu(ui, tmux_active, &tmux_out);
-            });
-            ui.menu_button("Session", |ui| {
-                ui.set_min_width(MENU_MIN_W);
-                session_menu(ui, roster.as_ref(), &cx, &keymap, &out);
-            });
-            ui.menu_button("Help", |ui| {
-                ui.set_min_width(MENU_MIN_W);
-                render_items(ui, &HELP_ITEMS, &cx, &keymap, &out);
-            });
-        });
-
-        match out.into_inner() {
-            Some(Outcome::Action(MenuAction::ShowShortcuts)) => self.shortcuts_open = true,
-            Some(Outcome::Action(action)) => apply(action, term, ctx),
-            Some(Outcome::AttachPeer(peer)) => term.open_remote_tab(&RemoteTarget {
+        let mut tmux_out = None;
+        match picked {
+            Some(Picked::Action(MenuAction::ShowShortcuts)) => self.shortcuts_open = true,
+            Some(Picked::Action(action)) => apply(action, term, ctx),
+            Some(Picked::AttachPeer(peer)) => term.open_remote_tab(&RemoteTarget {
                 label: peer.clone(),
                 peer,
             }),
+            Some(Picked::Tmux(choice)) => tmux_out = Some(choice),
             None => {}
         }
 
         self.shortcuts_window(ctx, term.keymap());
-        tmux_out.into_inner()
+        tmux_out
     }
 
     /// The keyboard-shortcuts reference (Help → Keyboard Shortcuts), read live
@@ -796,77 +857,6 @@ impl MenuBar {
                         }
                     });
             });
-    }
-}
-
-/// The Session drop-down: the reachable mesh peers (attach opens a remote tab),
-/// an honest empty state, and the picker.
-fn session_menu(
-    ui: &mut Ui,
-    roster: Option<&crate::roster::RosterSnapshot>,
-    cx: &MenuContext,
-    keymap: &Keymap,
-    out: &RefCell<Option<Outcome>>,
-) {
-    let reachable: Vec<&crate::roster::PeerEntry> = roster
-        .map(|snap| snap.peers.iter().filter(|p| p.is_reachable()).collect())
-        .unwrap_or_default();
-
-    if reachable.is_empty() {
-        ui.add_enabled(false, Button::new("No mesh peers online"));
-    } else {
-        ui.label(
-            RichText::new("Attach a session on\u{2026}")
-                .size(Style::SMALL)
-                .color(Style::TEXT_DIM),
-        );
-        for peer in reachable {
-            if ui.button(peer.display.as_str()).clicked() {
-                *out.borrow_mut() = Some(Outcome::AttachPeer(peer.host.clone()));
-                ui.close_menu();
-            }
-        }
-    }
-    ui.separator();
-    render_items(
-        ui,
-        std::slice::from_ref(&Item::new(
-            "Open Session Picker\u{2026}",
-            MenuAction::OpenRemotePicker,
-            Shortcut::Bound(Action::ToggleRemote),
-            Gate::Always,
-        )),
-        cx,
-        keymap,
-        out,
-    );
-}
-
-/// The Tmux drop-down (TMUX-FC-2): the session-management entry points. Each
-/// item routes OUT as a [`TmuxMenuChoice`] the surface applies to its
-/// [`crate::tmux_ui::TmuxChrome`]; the context-sensitive ones honestly grey out
-/// without a live control client (§7). The full session/window/pane tree + the
-/// per-session ops live in the sidebar "New tmux session" reveals.
-fn tmux_menu(ui: &mut Ui, active: bool, out: &RefCell<Option<TmuxMenuChoice>>) {
-    let choose = |ui: &mut Ui, choice: TmuxMenuChoice| {
-        *out.borrow_mut() = Some(choice);
-        ui.close_menu();
-    };
-    if ui.button("New tmux session").clicked() {
-        choose(ui, TmuxMenuChoice::NewSession);
-    }
-    if ui.button("Attach Session\u{2026}").clicked() {
-        choose(ui, TmuxMenuChoice::ShowPicker);
-    }
-    ui.separator();
-    if ui.add_enabled(active, Button::new("Detach")).clicked() {
-        choose(ui, TmuxMenuChoice::Detach);
-    }
-    if ui
-        .add_enabled(active, Button::new("Hide/Show Tree"))
-        .clicked()
-    {
-        choose(ui, TmuxMenuChoice::ToggleTree);
     }
 }
 

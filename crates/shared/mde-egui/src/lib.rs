@@ -30,6 +30,7 @@ pub mod fonts;
 pub mod formfactor;
 pub mod gestures;
 pub mod hostkeys;
+pub mod menubar;
 pub mod motion;
 pub mod runner;
 pub mod style;
@@ -56,6 +57,9 @@ pub use formfactor::{
 };
 pub use gestures::{
     drain_edge_swipes, push_edge_swipe, Edge, Gesture, GestureConfig, GestureRecognizer,
+};
+pub use menubar::{
+    resolve_mnemonics, ChipTone, Entry, Item, Menu, MenuBar, MenuBarModel, StatusChip,
 };
 pub use motion::Motion;
 pub use runner::run_client;

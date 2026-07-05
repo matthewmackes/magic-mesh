@@ -1,8 +1,9 @@
 //! EDTB-1 (part A) — the **Word-97 menu bar** across the top of the editor
 //! panel (design: `docs/design/editor-toolbar.md`).
 //!
-//! An `egui::menu::bar` of the classic Word menus, adapted honestly to what the
-//! editor can actually do today. Per lock #4 (**no dead entries** — an item
+//! The classic Word menus, adapted honestly to what the editor can actually do
+//! today, now hosted on the shared [`mde_egui::menubar::MenuBar`] (MENUBAR-ALL-1)
+//! under one UPPERCASE accent title. Per lock #4 (**no dead entries** — an item
 //! appears only when its seam exists), this phase ships **seven** of the eight
 //! Word-97 menus:
 //!
@@ -43,15 +44,13 @@
 //! no selection, Undo with an empty log) render **disabled** — the authentic
 //! Word-97 grey-out; the backends all exist, only the context gates them.
 //!
-//! Labels render theme-styled (no forced `RichText` color) so egui's disabled
-//! dimming works; the theme itself is the shared Carbon [`Style`] install (§4).
+//! The shared [`MenuBar`] renders the tree — disabled items grey through the
+//! Carbon [`Style`] install, toggles carry a check-mark, each item shows its live
+//! shortcut hint, and the whole bar reads as one platform surface (§4).
 
-use mde_egui::egui::{self, Button, Ui};
-use mde_egui::Style;
-
-/// Minimum dropdown width so short menus don't collapse into slivers — six
-/// shared spacing units (§4), the same derivation as the panel's tree width.
-const MENU_MIN_W: f32 = Style::SP_XL * 6.0;
+use mde_egui::egui::Ui;
+use mde_egui::menubar::{Entry, Item as BarItem, Menu, MenuBar, MenuBarModel};
+use mde_egui::{ChipTone, StatusChip, Style};
 
 /// The compact **overflow** affordance's glyph — Word's `»` chevrons, the "more
 /// controls" menu the Standard/Formatting strips fold their width-heavy dropdown
@@ -510,40 +509,72 @@ pub const MENUS: [(&str, &[MenuItem]); 7] = [
 ];
 
 /// Render the menu bar and return the action the operator picked this frame, if
-/// any. One generic loop over [`MENUS`]: plain items render as buttons with
-/// their shortcut hint, toggle items as checked labels; gated items render
-/// disabled (egui dims them through the shared theme).
+/// any. EDTB-1's own `egui::menu::bar` loop is retired onto the shared
+/// [`mde_egui::menubar::MenuBar`] (MENUBAR-ALL-1): the surface still owns its
+/// [`MENUS`] tables + [`MenuAction`] vocabulary + [`Gate`] context (§6, one
+/// dispatch path), and only builds the shared model each frame — the host widget +
+/// the "EDITOR" title header + the live status cluster are all that changed. Every
+/// item, shortcut, gate, toggle, and omission is preserved; the tests below still
+/// assert them on the unchanged tables.
 pub fn show(ui: &mut Ui, cx: &MenuContext) -> Option<MenuAction> {
-    let mut action = None;
-    egui::menu::bar(ui, |ui| {
-        ui.add_space(Style::SP_XS);
-        for (title, items) in MENUS {
-            ui.menu_button(title, |ui| {
-                ui.set_min_width(MENU_MIN_W);
-                for item in items {
-                    if item.sep_before {
-                        ui.separator();
-                    }
-                    let enabled = item.gate.enabled(cx);
-                    let clicked = if let Some(on) = item.checked(cx) {
-                        ui.add_enabled(enabled, egui::SelectableLabel::new(on, item.label))
-                            .clicked()
-                    } else {
-                        ui.add_enabled(
-                            enabled,
-                            Button::new(item.label).shortcut_text(item.shortcut),
-                        )
-                        .clicked()
-                    };
-                    if clicked {
-                        action = Some(item.action);
-                        ui.close_menu();
-                    }
+    let menus = build_menus(cx);
+    let status = build_status(cx);
+    let model = MenuBarModel {
+        // The Word-97 set now flies under one UPPERCASE accent title (lock 2/14).
+        title: "Editor",
+        accent: Style::ACCENT_TERMINALS,
+        menus: &menus,
+        status: &status,
+    };
+    MenuBar::show(ui, &model)
+}
+
+/// Convert the static [`MENUS`] tables + the live [`MenuContext`] into the shared
+/// menu model, preserving every item, its live shortcut hint, its Word-97 grey-out
+/// [`Gate`], its group separators, and the View toggles' check state — the render
+/// host is the only thing that changed (§6/§7).
+fn build_menus(cx: &MenuContext) -> Vec<Menu<MenuAction>> {
+    MENUS
+        .iter()
+        .map(|(title, items)| {
+            let mut entries = Vec::with_capacity(items.len());
+            for item in *items {
+                if item.sep_before {
+                    entries.push(Entry::Separator);
                 }
-            });
-        }
-    });
-    action
+                let mut bar_item =
+                    BarItem::new(item.action, item.label).enabled(item.gate.enabled(cx));
+                if !item.shortcut.is_empty() {
+                    bar_item = bar_item.shortcut(item.shortcut);
+                }
+                if let Some(on) = item.checked(cx) {
+                    bar_item = bar_item.checked(on);
+                }
+                entries.push(Entry::Item(bar_item));
+            }
+            Menu::new(*title, entries)
+        })
+        .collect()
+}
+
+/// The editor's live status cluster — the real view state from [`MenuContext`]:
+/// the view zoom + soft-wrap when a document is open, or an honest "No document"
+/// otherwise (§7 — every chip reflects live state, never a placeholder).
+fn build_status(cx: &MenuContext) -> Vec<StatusChip> {
+    cx.zoom_percent.map_or_else(
+        || vec![StatusChip::new("No document", ChipTone::Neutral)],
+        |zoom| {
+            let (wrap_label, wrap_tone) = if cx.wrap_on {
+                ("WRAP", ChipTone::Info)
+            } else {
+                ("NO WRAP", ChipTone::Neutral)
+            };
+            vec![
+                StatusChip::new(format!("{zoom}%"), ChipTone::Neutral),
+                StatusChip::new(wrap_label, wrap_tone),
+            ]
+        },
+    )
 }
 
 #[cfg(test)]

@@ -3267,16 +3267,16 @@ Turn `Surface::About` into a Windows-Device-Manager-style hardware inspector: a 
 
 Every primary nav-bar surface gets a slim top bar: a large UPPERCASE mono accent title (left) + the File/Edit/View/Help spine + surface menus (inline) + a live per-surface status cluster (right), all via one shared `mde-egui` MenuBar. **Governing principle (operator): the menu bar surfaces EVERY control incl. advanced/complex — comprehensive, honestly-wired, no dead entries (§7); critical for the OpenStack/IaC interfaces.** One big wave; Terminal + Editor refactor onto the shared component.
 
-- [ ] **MENUBAR-ALL-1: the shared `mde-egui` MenuBar component + Terminal/Editor refactor.**
+- [✓] **MENUBAR-ALL-1: the shared `mde-egui` MenuBar component + Terminal/Editor refactor.**
   **As** a mesh operator,
   **I want** one shared title+menu bar widget,
   **so that** every surface reads as one platform.
   **Acceptance** (each runtime-observable):
-    - [ ] a new `mde_egui::menubar` module: a slim `MenuBar` rendering an UPPERCASE mono DISPLAY-tier title (accent-tinted) + an inline menu strip + a right-aligned status-chip cluster, at one consistent height, from `Style`/`Motion`/`fonts` only
-    - [ ] a caller-supplied menu model (`Menu{title,mnemonic,items}`, `MenuItem{label,shortcut_hint,enabled,on_activate}`); dropdowns open with the shared motion spring; **Alt-mnemonics** + full keyboard nav + focus ring; each item shows its live shortcut hint; honest disable/omit (§7)
-    - [ ] backing tests (model, mnemonic resolution, disabled-item, status cluster) in mde-egui; style-leak grep clean
-    - [ ] **Terminal** (`mde-term-egui/menubar.rs`, incl. the TERM-MENUBAR-1 + TMUX-FC-2 Tmux menu) + **Editor** (Word-97 bar) refactored onto it — every existing menu item + seam preserved, their menu tests green
-    - [ ] renders correctly at 1.0 + a fractional scale
+    - [✓] a new `mde_egui::menubar` module: a slim `MenuBar` rendering an UPPERCASE mono DISPLAY-tier title (accent-tinted) + an inline menu strip + a right-aligned status-chip cluster, at one consistent height, from `Style`/`Motion`/`fonts` only
+    - [✓] a caller-supplied menu model (`Menu{title,mnemonic,entries}`, `Item{id,label,shortcut,enabled,checked}` + `Entry::{Item,Submenu,Separator,Caption}`); dropdowns fade in on the shared motion spring; **Alt-mnemonics** (underlined, `resolve_mnemonics`) + egui keyboard nav + 2px accent focus ring; each item shows its live shortcut hint; honest disable/omit (§7)
+    - [✓] backing tests (model, mnemonic resolution, disabled-item non-activatable, status cluster, title casing, reduce-motion, headless render) in mde-egui; style-leak grep clean
+    - [✓] **Terminal** (`mde-term-egui/menubar.rs`, incl. the TERM-MENUBAR-1 + TMUX-FC-2 Tmux menu) + **Editor** (Word-97 bar) refactored onto it — every existing menu item + seam preserved, their menu tests green (term 290, editor 388)
+    - [✓] renders correctly at 1.0 + a fractional scale (built on egui layout + `Style` tokens only, no hardcoded pixel positions)
 
 - [ ] **MENUBAR-ALL-2..N: per-surface title+menu bars (one big wave).**
   **As** a mesh operator,
