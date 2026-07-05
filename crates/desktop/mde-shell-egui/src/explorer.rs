@@ -453,7 +453,10 @@ struct UnitsState {
 /// carries a distinct §4 accent + a coherent label used on chips, badges, and the
 /// status ring. (EXPLORER-15 promotes these to dedicated Mesh/LAN/Cloud tokens;
 /// EXPLORER-3 maps onto the existing accent set — token-based, no raw hex.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Serialisable (`snake_case` tokens) because the active filter rides the
+/// EXPLORER-13 view record (O5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum Category {
     /// In-mesh peers.
     Mesh,
@@ -1383,8 +1386,10 @@ fn push_bounded(ring: &mut VecDeque<f32>, v: f32) {
 /// **mosaic** overview is the whole-fleet landing (EXPLORER-11); picking a tile
 /// zooms into the one-unit **hero** card (EXPLORER-3); the **IPAM** table is the
 /// NetBox-style discovered-address view (EXPLORER-10). The category filter chips
-/// scope all three; the header toggles between them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// scope all three; the header toggles between them. Serialisable (`snake_case`
+/// tokens) because the last mode rides the EXPLORER-13 view record (O5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum SurfaceMode {
     /// The zoomable, category-clustered mosaic of mini hero tiles — the landing
     /// (EXPLORER-11, O1).
@@ -1400,17 +1405,30 @@ enum SurfaceMode {
 /// record under the client data dir, the SETTINGS-nav / `PowerHonorConfig` idiom.
 const PREFS_FILE: &str = "explorer-prefs.json";
 
-/// The Explorer surface's persisted preferences. EXPLORER-12 seeds it with the
-/// ambient-idle toggle; the EXPLORER-13 view/selection persistence extends this
-/// SAME record. Persisted the SETTINGS-nav way: one JSON file, atomic temp +
-/// rename, a missing / malformed file folding to the default (never a fatal, §7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// The Explorer surface's persisted preferences: the EXPLORER-12 ambient-idle
+/// toggle plus the EXPLORER-13 **view-continuity record** (O5) — the last mode,
+/// last-selected unit id, and active category filter, restored on open so the
+/// surface is continuous across lock/unlock and restarts. Persisted the
+/// SETTINGS-nav way: one JSON file, atomic temp + rename, a missing / malformed /
+/// legacy (ambient-only) file folding each absent field to its default (never a
+/// fatal, §7).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 struct ExplorerPrefs {
     /// The EXPLORER-12 ambient idle auto-cycle toggle — **OFF by default** (the
     /// `bool` default): an unattended screen only comes alive when the operator
     /// opts in, never on its own.
-    #[serde(default)]
     ambient_idle: bool,
+    /// EXPLORER-13 — the last active surface mode (Mosaic/Hero/IPAM), restored
+    /// on open (O5). Defaults to the mosaic landing.
+    mode: SurfaceMode,
+    /// EXPLORER-13 — the last-selected unit id, re-focused once its unit streams
+    /// back in (`None` when nothing real was focused). A remembered unit that has
+    /// left the fleet simply never lands — the view falls back to the front of
+    /// the shelf (graceful, §7 — never a phantom selection).
+    selected: Option<String>,
+    /// EXPLORER-13 — the active category filter (`None` ⇒ All), restored on open.
+    filter: Option<Category>,
 }
 
 impl ExplorerPrefs {
@@ -1438,23 +1456,16 @@ impl ExplorerPrefs {
     /// # Errors
     /// The [`std::io::Error`] if the dir cannot be created or the file cannot be
     /// written / renamed.
-    fn save_to(self, path: &Path) -> std::io::Result<()> {
+    fn save_to(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(&self)
+        let json = serde_json::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
-    }
-
-    /// Persist to the default path (a silent no-op when no data dir resolves).
-    fn save(self) {
-        if let Some(path) = Self::default_path() {
-            let _ = self.save_to(&path);
-        }
     }
 }
 
@@ -1543,9 +1554,13 @@ pub struct ExplorerState {
     /// The focused mosaic tile's on-screen rect from the last frame — the origin a
     /// keyboard/D-pad Enter zooms from (a mouse pick carries its own rect).
     focus_rect: Option<Rect>,
-    /// EXPLORER-12: the persisted surface preferences — currently the ambient-idle
-    /// toggle, loaded on construction + re-saved when the operator flips it.
+    /// The persisted surface preferences: the EXPLORER-12 ambient-idle toggle +
+    /// the EXPLORER-13 view record (O5). Loaded + restored on construction;
+    /// re-saved whenever the live view drifts from it ([`Self::persist_view`]).
     prefs: ExplorerPrefs,
+    /// Where the prefs record persists — the client-data-dir file in production,
+    /// `None` in tests / a headless context (no writes, the honest no-op).
+    prefs_path: Option<PathBuf>,
     /// EXPLORER-12: the egui-clock second of the last user input — the idle clock
     /// the ambient cycle waits on. `None` until the first frame seeds it at mount,
     /// so the idle window starts when the surface opens, not at session start.
@@ -1563,7 +1578,7 @@ pub struct ExplorerState {
 
 impl Default for ExplorerState {
     fn default() -> Self {
-        Self {
+        let mut state = Self {
             client: Box::new(BusUnits {
                 bus_root: mde_bus::client_data_dir(),
             }),
@@ -1584,11 +1599,17 @@ impl Default for ExplorerState {
             zoom_start: None,
             mosaic_enter: None,
             focus_rect: None,
-            prefs: ExplorerPrefs::load(),
+            prefs: ExplorerPrefs::default(),
+            prefs_path: ExplorerPrefs::default_path(),
             last_input_at: None,
             last_advance_at: None,
             pending_focus: None,
-        }
+        };
+        // EXPLORER-13 — restore the persisted view record (O5). The mirrors
+        // haven't been read yet, so the remembered selection is held and lands
+        // on the first refresh that carries its unit.
+        state.apply_restore(ExplorerPrefs::load());
+        state
     }
 }
 
@@ -1659,7 +1680,66 @@ impl ExplorerState {
     /// cycle never fires the instant it's switched on.
     fn toggle_ambient(&mut self) {
         self.prefs.ambient_idle = !self.prefs.ambient_idle;
-        self.prefs.save();
+        self.save_prefs();
+    }
+
+    // ─────────────── view persistence (EXPLORER-13, design O5) ───────────────
+
+    /// Restore a persisted view record (O5): the last mode, the active category
+    /// filter, and the last-selected unit — the selection is held via
+    /// [`Self::pending_focus`] until its unit streams in, so a remembered unit
+    /// that has left the fleet gracefully falls back to the front of the shelf
+    /// (§7 — never a phantom focus). The ONE restore path [`Default`] and the
+    /// tests share.
+    fn apply_restore(&mut self, prefs: ExplorerPrefs) {
+        self.mode = prefs.mode;
+        self.filter = prefs.filter;
+        self.pending_focus.clone_from(&prefs.selected);
+        self.prefs = prefs;
+    }
+
+    /// Persist the current prefs record to [`Self::prefs_path`] — a silent no-op
+    /// in a headless/test context with no path (§7 — honest, never a fake write).
+    fn save_prefs(&self) {
+        if let Some(path) = &self.prefs_path {
+            let _ = self.prefs.save_to(path);
+        }
+    }
+
+    /// The focused unit's id in the current view (`None` on the #23 placeholder /
+    /// an empty filtered view) — what the view record remembers as "selected".
+    fn focused_unit_id(&self) -> Option<String> {
+        self.filtered_indices()
+            .get(self.focus)
+            .map(|&i| self.units[i].id.clone())
+    }
+
+    /// The view-continuity record the live surface currently amounts to (O5).
+    /// A still-held restore target ([`Self::pending_focus`]) stays the remembered
+    /// selection until it lands, so an early frame before its unit streams in
+    /// can't clobber the memory with `None`.
+    fn view_snapshot(&self) -> ExplorerPrefs {
+        ExplorerPrefs {
+            ambient_idle: self.prefs.ambient_idle,
+            mode: self.mode,
+            selected: self
+                .pending_focus
+                .clone()
+                .or_else(|| self.focused_unit_id()),
+            filter: self.filter,
+        }
+    }
+
+    /// Persist the view when (and only when) it drifted from the stored record —
+    /// one atomic write per real change (a mode/filter/selection move), nothing
+    /// per idle frame. Driven from the end of [`Self::show`], so every input path
+    /// (keys, chips, clicks, jumps) funnels through the one save.
+    fn persist_view(&mut self) {
+        let snapshot = self.view_snapshot();
+        if snapshot != self.prefs {
+            self.prefs = snapshot;
+            self.save_prefs();
+        }
     }
 
     /// Re-read + re-fold the shelf. Split from the cadence gate so the pure fold
@@ -2233,6 +2313,9 @@ impl ExplorerState {
                     .show_inside(ui, |ui| self.ipam_table(ui));
             }
         }
+        // EXPLORER-13 — persist the view record when this frame changed it (O5):
+        // after the panels, so every input path above funnels into the one save.
+        self.persist_view();
     }
 
     /// The summary/filter strip (O2): the Mosaic ⇄ Hero ⇄ IPAM mode toggle + the
@@ -3590,10 +3673,21 @@ mod tests {
                 mosaic_enter: None,
                 focus_rect: None,
                 prefs: ExplorerPrefs::default(),
+                prefs_path: None,
                 last_input_at: None,
                 last_advance_at: None,
                 pending_focus: None,
             };
+            s.refresh();
+            s
+        }
+
+        /// Build headless with a restored view record — the EXPLORER-13 restore
+        /// path ([`Self::apply_restore`], the same one `Default` drives), then a
+        /// first refresh so a remembered selection can land.
+        fn with_prefs(states: Vec<UnitsState>, host: &str, prefs: ExplorerPrefs) -> Self {
+            let mut s = Self::with_fake(states, host);
+            s.apply_restore(prefs);
             s.refresh();
             s
         }
@@ -4042,7 +4136,7 @@ mod tests {
             "me",
         );
         assert!(
-            s.history.get("peer:me").is_none(),
+            !s.history.contains_key("peer:me"),
             "no load/mem → no sparkline history minted"
         );
     }
@@ -4724,7 +4818,7 @@ mod tests {
 
     #[test]
     fn ipam_table_renders_headless_and_when_empty() {
-        let mut render = |s: &mut ExplorerState| {
+        let render = |s: &mut ExplorerState| {
             let ctx = egui::Context::default();
             Style::install(&ctx);
             let input = egui::RawInput {
@@ -4838,7 +4932,10 @@ mod tests {
             "a missing prefs file folds to the OFF default"
         );
 
-        let on = ExplorerPrefs { ambient_idle: true };
+        let on = ExplorerPrefs {
+            ambient_idle: true,
+            ..Default::default()
+        };
         on.save_to(&path).expect("save");
         assert!(
             ExplorerPrefs::load_from(&path).ambient_idle,
@@ -5125,5 +5222,164 @@ mod tests {
         // The honest empty (#23) self tile renders in the mosaic too, never blank.
         let mut empty = ExplorerState::with_fake(vec![], "solo");
         assert!(render(&mut empty), "the empty mosaic drew the self tile");
+    }
+
+    // ─────────────── EXPLORER-13 view/selection/filter persistence ───────────────
+
+    #[test]
+    fn the_view_record_round_trips_through_disk() {
+        // The full O5 record (mode + selection + filter, with the EXPLORER-12
+        // toggle riding along) survives a write → read-back — the restart path.
+        let dir = ambient_temp_dir("view-rt");
+        std::fs::create_dir_all(&dir).expect("mkroot");
+        let path = dir.join(PREFS_FILE);
+        let prefs = ExplorerPrefs {
+            ambient_idle: true,
+            mode: SurfaceMode::Ipam,
+            selected: Some("lan:printer".to_string()),
+            filter: Some(Category::Lan),
+        };
+        prefs.save_to(&path).expect("save");
+        assert_eq!(
+            ExplorerPrefs::load_from(&path),
+            prefs,
+            "the whole view record survives a restart"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_ambient_only_record_folds_the_view_fields_to_default() {
+        // A pre-EXPLORER-13 prefs file carries only the ambient toggle — the new
+        // fields fold to their defaults instead of failing the whole load (§7).
+        let dir = ambient_temp_dir("legacy");
+        std::fs::create_dir_all(&dir).expect("mkroot");
+        let path = dir.join(PREFS_FILE);
+        std::fs::write(&path, r#"{"ambient_idle":true}"#).expect("write legacy");
+        let prefs = ExplorerPrefs::load_from(&path);
+        assert!(prefs.ambient_idle, "the legacy toggle still reads");
+        assert_eq!(prefs.mode, SurfaceMode::Mosaic);
+        assert_eq!(prefs.selected, None);
+        assert_eq!(prefs.filter, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_returns_to_the_remembered_mode_filter_and_unit() {
+        let prefs = ExplorerPrefs {
+            mode: SurfaceMode::Hero,
+            selected: Some("lan:printer".to_string()),
+            filter: Some(Category::Lan),
+            ..Default::default()
+        };
+        let s = ExplorerState::with_prefs(addressed_state(), "me", prefs);
+        assert_eq!(s.mode, SurfaceMode::Hero, "the last mode restores");
+        assert_eq!(s.filter, Some(Category::Lan), "the active filter restores");
+        assert_eq!(
+            focused(&s).id,
+            "lan:printer",
+            "the remembered unit is focused again"
+        );
+        assert!(
+            s.pending_focus.is_none(),
+            "the landed selection releases the hold"
+        );
+    }
+
+    #[test]
+    fn restore_falls_back_gracefully_when_the_remembered_unit_is_gone() {
+        let prefs = ExplorerPrefs {
+            mode: SurfaceMode::Hero,
+            selected: Some("peer:departed".to_string()),
+            ..Default::default()
+        };
+        let mut s = ExplorerState::with_prefs(addressed_state(), "me", prefs);
+        // The vanished unit can't land — focus stays at the front of the shelf.
+        assert_eq!(s.focus, 0, "a gone selection folds to the front");
+        assert_eq!(
+            s.pending_focus.as_deref(),
+            Some("peer:departed"),
+            "the hold stays armed in case the unit streams back in"
+        );
+        // … and when it DOES stream back in, the remembered selection lands.
+        s.client = Box::new(FakeUnits(vec![UnitsState {
+            host: "me".into(),
+            units: vec![unit("peer:departed", UnitKind::Peer, "departed", now_ms())],
+            edges: Vec::new(),
+        }]));
+        s.refresh();
+        assert_eq!(
+            focused(&s).id,
+            "peer:departed",
+            "a late-arriving remembered unit still lands"
+        );
+    }
+
+    #[test]
+    fn the_view_snapshot_persists_on_change_and_only_on_change() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        let dir = ambient_temp_dir("persist");
+        std::fs::create_dir_all(&dir).expect("mkroot");
+        let path = dir.join(PREFS_FILE);
+        s.prefs_path = Some(path.clone());
+
+        // A view change → the snapshot lands on disk.
+        s.set_mode(SurfaceMode::Ipam);
+        s.set_filter(Some(Category::Mesh));
+        s.persist_view();
+        let on_disk = ExplorerPrefs::load_from(&path);
+        assert_eq!(on_disk.mode, SurfaceMode::Ipam);
+        assert_eq!(on_disk.filter, Some(Category::Mesh));
+        assert_eq!(
+            on_disk.selected.as_deref(),
+            Some("peer:me"),
+            "the focused unit rides the snapshot"
+        );
+
+        // No change → no rewrite: delete the file; persist_view must not re-mint it.
+        std::fs::remove_file(&path).expect("rm");
+        s.persist_view();
+        assert!(
+            !path.exists(),
+            "an unchanged view never rewrites the record"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rendered_frame_persists_the_view_through_show() {
+        // show() drives persist_view — one headless frame lands the record.
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        let dir = ambient_temp_dir("frame");
+        std::fs::create_dir_all(&dir).expect("mkroot");
+        let path = dir.join(PREFS_FILE);
+        s.prefs_path = Some(path.clone());
+        s.set_mode(SurfaceMode::Hero);
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ambient_frame(&ctx, &mut s, 0.0, vec![]);
+        assert_eq!(
+            ExplorerPrefs::load_from(&path).mode,
+            SurfaceMode::Hero,
+            "the frame's view change reached the disk record"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_early_empty_frame_never_clobbers_a_held_selection() {
+        // Restored with a remembered unit that hasn't streamed in yet: the first
+        // snapshot must keep remembering it, not overwrite `selected` with the
+        // placeholder's `None`.
+        let prefs = ExplorerPrefs {
+            selected: Some("peer:later".to_string()),
+            ..Default::default()
+        };
+        let s = ExplorerState::with_prefs(vec![], "me", prefs);
+        assert_eq!(
+            s.view_snapshot().selected.as_deref(),
+            Some("peer:later"),
+            "the held restore target stays the remembered selection"
+        );
     }
 }
