@@ -255,6 +255,8 @@ pub enum TmuxMenuChoice {
     ShowTemplates,
     /// Open the TMUX-FC-6 mesh peer picker (attach tmux on a node).
     ShowMesh,
+    /// Open one of the TMUX-FC-7 mesh-styled layout presets.
+    OpenPreset(crate::MeshPreset),
     /// Detach the control client.
     Detach,
     /// Show/hide the sidebar tree.
@@ -550,6 +552,20 @@ impl TmuxChrome {
         }
     }
 
+    /// TMUX-FC-7 — open one of the 5 mesh-styled layout presets: ensure a control
+    /// client, then write its built-in blueprint — a fresh session built from the
+    /// preset's window/pane layout + seeded commands the client switches onto (the
+    /// same FC-5 blueprint path a template uses).
+    fn open_preset(&mut self, preset: crate::MeshPreset) {
+        self.ensure_client();
+        self.ui.tree_open = true;
+        if let Some(ctrl) = self.controller.as_ref() {
+            for line in preset.blueprint().commands(preset.session_name()) {
+                let _ = ctrl.send(&line);
+            }
+        }
+    }
+
     /// TMUX-FC-6 — dial `tmux -CC` on a mesh peer over the Bus PTY broker and
     /// drive it with this same chrome. The controller/model/tree are
     /// transport-agnostic ([`crate::tmux::ControlLink`]), so the sidebar, tabs,
@@ -654,6 +670,7 @@ impl TmuxChrome {
             }
             Some(TmuxMenuChoice::ShowTemplates) => self.ui.templates_open = true,
             Some(TmuxMenuChoice::ShowMesh) => self.ui.mesh_open = true,
+            Some(TmuxMenuChoice::OpenPreset(preset)) => self.open_preset(preset),
             Some(TmuxMenuChoice::Detach) => {
                 if let Some(ctrl) = self.controller.as_ref() {
                     let _ = ctrl.send(&commands::detach_client());
@@ -3585,5 +3602,45 @@ mod tests {
         chrome.attach_peer("   ");
         assert!(chrome.is_active());
         drop(chrome); // joins the mesh worker
+    }
+
+    // ── TMUX-FC-7: a preset builds its layout (guarded live) ─────────────────
+
+    #[test]
+    fn live_open_preset_builds_its_mesh_styled_layout() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        // Mesh Ops is a one-window, four-pane layout. The seeded commands
+        // (meshctl/…) needn't exist on the build node — the *layout* still builds.
+        let store = TmuxStateStore::with_path(None);
+        let mut chrome = TmuxChrome::with_store(store, TmuxState::default());
+        chrome.open_preset(crate::MeshPreset::MeshOps);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            chrome.pump();
+            let ok = chrome.controller.as_ref().is_some_and(|c| {
+                let m = c.model();
+                m.current_session()
+                    .and_then(|s| m.session(s))
+                    .map(TmuxSession::name)
+                    == Some("mesh-ops")
+                    && m.windows_in_order()
+                        .first()
+                        .is_some_and(|w| m.panes_of_window(*w).len() == 4)
+            });
+            if ok {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the Mesh Ops preset layout never built"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", "mesh-ops"])
+            .output();
     }
 }

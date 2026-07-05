@@ -687,6 +687,19 @@ fn tmux_entries(active: bool) -> Vec<Entry<Picked>> {
             Picked::Tmux(TmuxMenuChoice::ShowMesh),
             "Attach on Mesh Node\u{2026}",
         )),
+        Entry::Submenu {
+            label: "Layout Presets".to_owned(),
+            mnemonic: None,
+            entries: crate::MeshPreset::ALL
+                .iter()
+                .map(|preset| {
+                    Entry::Item(BarItem::new(
+                        Picked::Tmux(TmuxMenuChoice::OpenPreset(*preset)),
+                        preset.label(),
+                    ))
+                })
+                .collect(),
+        },
         Entry::Separator,
         op(TmuxMenuChoice::SplitRight, "Split Pane Right"),
         op(TmuxMenuChoice::SplitDown, "Split Pane Down"),
