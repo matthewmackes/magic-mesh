@@ -125,6 +125,12 @@
 //!   command line); [`tmux::TmuxController`] ties it together with an honest
 //!   [`tmux::Status`] (no fake attach). The chrome/session/mesh/preset mount is
 //!   TMUX-FC-2..8.
+//! - [`menubar`] (TERM-MENUBAR-1) — the **top menu bar**: an `egui::menu::bar`
+//!   of File / Edit / View / Terminal / Splits / Tabs / Session / Help
+//!   drop-downs, each item the mouse twin of an existing seam (tabs / splits /
+//!   search / appearance / presets / remote roster / bell / keymap), with its
+//!   live shortcut beside it and context-gated items honestly greyed (§7). The
+//!   embed mounts it above the tab bar; a future tmux menu (TMUX-FC) slots in.
 
 pub mod appearance;
 pub mod bell;
@@ -134,6 +140,7 @@ pub mod keymap;
 pub mod layout;
 pub mod layout_ui;
 pub mod menu;
+pub mod menubar;
 pub mod mouse;
 pub mod notify;
 pub mod palette;
@@ -164,6 +171,7 @@ pub use menu::{
     BusChatClient, ChatBus, CommandRunner, ContextMenu, CustomCommand, OsCommandRunner,
     ACTION_CHAT_SEND,
 };
+pub use menubar::{BellMode, Gate, MenuAction, MenuBar, MenuContext};
 pub use mouse::{encode_sgr, MouseButton, MouseEvent};
 pub use notify::{BusNotifyClient, NoticeLevel, NotifyBus, TermNotice, TOAST_TOPIC};
 pub use palette::Palette;
@@ -172,7 +180,7 @@ pub use picker::{RemotePicker, RemoteTarget};
 pub use presets::Preset;
 pub use pty::{LocalPty, SpawnOptions};
 pub use remote::{BusPtyClient, PtyBus, RemotePty, RemoteStatus};
-pub use roster::{BusRoster, Presence, RosterClient, RosterSnapshot};
+pub use roster::{BusRoster, PeerEntry, Presence, RosterClient, RosterSnapshot};
 pub use screen::{Cell, CellAttrs, CellColor, CursorPos, Screen};
 pub use search::{CaseMode, Match, Search};
 pub use session::Session;

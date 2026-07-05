@@ -55,6 +55,7 @@ use mde_egui::egui::{
 use mde_egui::Style;
 
 use crate::appearance::Appearance;
+use crate::bell::BellConfig;
 use crate::layout::{cwd_of_pid, LayoutPane, LayoutTab, PaneSpec};
 use crate::picker::RemoteTarget;
 use crate::pty::{LocalPty, SpawnOptions};
@@ -1033,6 +1034,69 @@ impl SplitTerminal {
     pub fn toggle_silence_watch_focused(&mut self) {
         if let Some(w) = self.focused_widget_mut() {
             w.toggle_silence_watch();
+        }
+    }
+
+    // ── TERM-MENUBAR-1 seams ────────────────────────────────────────────────
+    // The top menu bar drives the focused pane's existing features (§6): Copy /
+    // Find / Clear are the mouse twins of `Ctrl+Shift+C` / `Ctrl+Shift+F` /
+    // `Ctrl+L`, and Bell is the appearance-style surface-wide push. Each mirrors
+    // the `*_focused` idiom the TERM-12 pane actions above already established.
+
+    /// The focused pane's widget, read-only — the menu bar reads the selection /
+    /// search / bell state through it to gate + check its items.
+    fn focused_widget(&self) -> Option<&TerminalWidget> {
+        self.sessions.get(&self.focused)
+    }
+
+    /// Copy the focused pane's selection to the clipboard (Edit → Copy).
+    pub fn copy_focused(&self, ctx: &Context) {
+        if let Some(w) = self.focused_widget() {
+            w.copy_selection_to_clipboard(ctx);
+        }
+    }
+
+    /// Whether the focused pane has a non-empty selection — gates Edit → Copy so
+    /// it greys out with nothing to copy (§7), never a silent no-op.
+    #[must_use]
+    pub fn focused_has_selection(&self) -> bool {
+        self.focused_widget()
+            .is_some_and(TerminalWidget::has_selection)
+    }
+
+    /// Toggle the focused pane's scrollback-search overlay (Edit → Find).
+    pub fn toggle_search_focused(&mut self) {
+        if let Some(w) = self.focused_widget_mut() {
+            w.toggle_search();
+        }
+    }
+
+    /// Whether the focused pane's search overlay is open (Edit → Find checkmark).
+    #[must_use]
+    pub fn focused_is_searching(&self) -> bool {
+        self.focused_widget()
+            .is_some_and(TerminalWidget::is_searching)
+    }
+
+    /// Clear the focused pane (Edit → Clear).
+    pub fn clear_focused(&mut self) {
+        if let Some(w) = self.focused_widget_mut() {
+            w.clear_screen();
+        }
+    }
+
+    /// The focused pane's bell config (Terminal → Bell checkmarks), or `None`
+    /// when the tab is empty.
+    #[must_use]
+    pub fn focused_bell_config(&self) -> Option<BellConfig> {
+        self.focused_widget().map(TerminalWidget::bell_config)
+    }
+
+    /// Set every pane's bell style at once (Terminal → Bell), so the choice
+    /// reaches the whole tab like the surface appearance does (TERM-11).
+    pub fn set_bell_config_all(&mut self, config: BellConfig) {
+        for w in self.sessions.values_mut() {
+            w.set_bell_config(config);
         }
     }
 

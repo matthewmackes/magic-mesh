@@ -45,9 +45,10 @@ use crate::keymap::{Action, Keymap};
 use crate::layout::SavedLayout;
 use crate::layout_ui::{LayoutIntent, LayoutManager};
 use crate::picker::{PickOutcome, ReattachTarget, RemotePicker, RemoteTarget};
+use crate::presets::Preset;
 use crate::pty::SpawnOptions;
 use crate::remote::{BusPtyClient, PtyBus, RemotePty};
-use crate::roster::{BusRoster, RosterClient};
+use crate::roster::{BusRoster, RosterClient, RosterSnapshot};
 use crate::splits::SplitTerminal;
 use crate::widget::chip;
 
@@ -65,6 +66,15 @@ const TAB_MAX_W: f32 = Style::SP_XL * 5.0;
 const UNDERLINE_PX: f32 = 2.0;
 /// How long the new-tab spawn-failure chip stays up.
 const ERROR_TTL: Duration = Duration::from_secs(6);
+
+/// The View → Zoom font-size range + step (points), mirroring the appearance
+/// picker's own knob so the menu and the picker agree — this is the shared size
+/// knob, not a second profile system.
+const FONT_ZOOM_MIN: f32 = 8.0;
+/// See [`FONT_ZOOM_MIN`].
+const FONT_ZOOM_MAX: f32 = 40.0;
+/// See [`FONT_ZOOM_MIN`].
+const FONT_ZOOM_STEP: f32 = 1.0;
 
 /// A tab-strip command decoded from the keyboard by [`consume_tab_commands`]
 /// and applied through [`TabbedTerminal::apply_tab`].
@@ -201,6 +211,12 @@ impl RemoteHub {
     /// TERM-14 — the broker's reattachable-session index (drives the picker list).
     fn reattachable(&self) -> Vec<crate::remote::SessionSummary> {
         self.bus.list_sessions()
+    }
+
+    /// The latest presence roster (TERM-MENUBAR-1: the Session menu lists the
+    /// reachable peers straight from it, alongside the picker).
+    fn roster_snapshot(&self) -> Option<RosterSnapshot> {
+        self.roster.snapshot()
     }
 }
 
@@ -361,6 +377,58 @@ impl TabbedTerminal {
     /// Mutable access to the keymap, for rebinding / applying a config override.
     pub const fn keymap_mut(&mut self) -> &mut Keymap {
         &mut self.keymap
+    }
+
+    // ── TERM-MENUBAR-1 seams ────────────────────────────────────────────────
+    // Surface-wide knobs the top menu bar drives: font-size zoom and the colour
+    // scheme both edit the shared [`Appearance`] the surface already pushes into
+    // every pane each frame ([`Self::show`]), and the roster feeds the Session
+    // menu. No new state — the menu is a discoverable face over TERM-11 + TERM-8.
+
+    /// The surface content font size in points (the View → Zoom read-back).
+    #[must_use]
+    pub const fn font_size(&self) -> f32 {
+        self.appearance.font_size
+    }
+
+    /// Set the surface font size, clamped to the appearance picker's own range
+    /// (the shared knob, not a second profile system).
+    const fn set_font_size(&mut self, size: f32) {
+        self.appearance.font_size = size.clamp(FONT_ZOOM_MIN, FONT_ZOOM_MAX);
+    }
+
+    /// Grow the surface font one step (View → Zoom In).
+    pub const fn zoom_in(&mut self) {
+        self.set_font_size(self.appearance.font_size + FONT_ZOOM_STEP);
+    }
+
+    /// Shrink the surface font one step (View → Zoom Out).
+    pub const fn zoom_out(&mut self) {
+        self.set_font_size(self.appearance.font_size - FONT_ZOOM_STEP);
+    }
+
+    /// Reset the surface font to the platform default (View → Reset Zoom).
+    pub const fn zoom_reset(&mut self) {
+        self.set_font_size(Style::BODY);
+    }
+
+    /// Select a bundled colour scheme (View → Colour Scheme), driving the same
+    /// [`Preset`] palettes the appearance picker offers (TERM-11).
+    pub const fn set_preset(&mut self, preset: Preset) {
+        self.appearance.palette = preset.palette();
+    }
+
+    /// The bundled preset the surface scheme currently matches, if any (the
+    /// View → Colour Scheme checkmark).
+    #[must_use]
+    pub fn current_preset(&self) -> Option<Preset> {
+        Preset::matching(&self.appearance.palette)
+    }
+
+    /// The latest mesh presence roster (the Session menu's peer list, TERM-8).
+    #[must_use]
+    pub fn roster_snapshot(&self) -> Option<RosterSnapshot> {
+        self.remote.roster_snapshot()
     }
 
     /// Decode this frame's chords through the rebindable [`Keymap`] and apply

@@ -496,6 +496,48 @@ impl TerminalWidget {
         self.bell.set_config(config);
     }
 
+    // ── TERM-MENUBAR-1 seams ────────────────────────────────────────────────
+    // Thin exposers the top menu bar drives — each is the mouse twin of an
+    // existing keystroke (§6, one dispatch path), so the menu adds no new
+    // behaviour, only a discoverable surface over what the pane already does.
+
+    /// Whether the pane holds a non-empty selection — the honest gate for the
+    /// Edit → Copy menu item (a bare click leaves a zero-length selection, which
+    /// [`Self::selection_text`] already reports as nothing, so Copy greys out
+    /// with nothing to copy rather than being a no-op, §7).
+    #[must_use]
+    pub fn has_selection(&self) -> bool {
+        self.selection_text().is_some()
+    }
+
+    /// Copy the current selection to the clipboard — the menu twin of the
+    /// `Ctrl+Shift+C` chord (a no-op with no selection, which the caller gates).
+    pub fn copy_selection_to_clipboard(&self, ctx: &Context) {
+        self.copy_selection(ctx);
+    }
+
+    /// Toggle the scrollback-search overlay — the menu twin of `Ctrl+Shift+F`
+    /// (mirrors the widget's own toggle: opening steals the keyboard, closing
+    /// hands it back to the shell).
+    pub const fn toggle_search(&mut self) {
+        self.search.toggle();
+        self.search_follow = self.search.active();
+    }
+
+    /// Whether the search overlay is open (the Edit → Find checkmark).
+    #[must_use]
+    pub const fn is_searching(&self) -> bool {
+        self.search.active()
+    }
+
+    /// Clear the pane — the menu twin of `Ctrl+L`: a Form-Feed on the shell's
+    /// input, which readline (or a full-screen app) redraws a clean screen from.
+    /// Written through the same [`Self::write_input`] path typing uses (§6), so
+    /// it targets only this pane and never fans out to a broadcast group.
+    pub fn clear_screen(&mut self) {
+        self.write_input(&[0x0c]);
+    }
+
     /// Whether the pane should reap (close) — a local child exit, or a remote
     /// clean shell exit (a remote failure lingers). The split multiplexer's
     /// close-on-exit (TERM-4) reads this.
@@ -1415,7 +1457,7 @@ impl TerminalWidget {
     }
 
     /// Copy the current selection to the clipboard (no-op without one).
-    fn copy_selection(&self, ctx: &Context) {
+    pub(crate) fn copy_selection(&self, ctx: &Context) {
         if let Some(sel) = self.selection {
             // One-shot full snapshot: the selection may live in history.
             let text = self

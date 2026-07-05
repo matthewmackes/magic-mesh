@@ -25,7 +25,7 @@
 use mde_egui::egui::{Context, RichText, Ui};
 use mde_egui::Style;
 
-use crate::{SpawnOptions, TabbedTerminal};
+use crate::{MenuBar, SpawnOptions, TabbedTerminal};
 
 /// The production terminal surface the E12 shell embeds (TERM-16).
 ///
@@ -44,6 +44,9 @@ pub struct TerminalSurface {
     /// — the standalone binary installs it at creation from its `CreationContext`,
     /// but the embed has no egui `Context` until its first frame.
     fonts_installed: bool,
+    /// The TERM-MENUBAR-1 top menu bar (its only state is the shortcuts-window
+    /// toggle; every feature it drives lives in the [`TabbedTerminal`]).
+    menubar: MenuBar,
 }
 
 /// Build the production [`TerminalSurface`] over a real local login shell.
@@ -60,6 +63,7 @@ pub fn real_terminal() -> TerminalSurface {
         term: TabbedTerminal::new(SpawnOptions::default())
             .map_err(|err| format!("could not start the shell: {err}")),
         fonts_installed: false,
+        menubar: MenuBar::new(),
     }
 }
 
@@ -88,8 +92,16 @@ pub fn terminal_pump(surface: &mut TerminalSurface, ctx: &Context) {
 /// session rather than dead-ending — the embedded surface has no window to close,
 /// unlike the standalone binary.
 pub fn terminal_panel(ui: &mut Ui, surface: &mut TerminalSurface) {
-    match &mut surface.term {
+    // Split the surface's fields so the menu bar (its own state) and the terminal
+    // can be driven together this frame without aliasing.
+    let TerminalSurface { term, menubar, .. } = surface;
+    match term {
         Ok(term) => {
+            // TERM-MENUBAR-1: the top menu-bar strip caps the surface, above the
+            // TERM-5 tab bar + the active split tree. It reads a snapshot of the
+            // terminal, renders the drop-downs, and applies the chosen action.
+            let ctx = ui.ctx().clone();
+            menubar.ui(ui, term, &ctx);
             term.show(ui);
             if term.is_empty() {
                 empty_state(ui, term);
