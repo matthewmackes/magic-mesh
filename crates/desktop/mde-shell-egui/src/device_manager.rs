@@ -19,11 +19,21 @@
 //! honest "no inventory yet", never a faked tree; absent summary fields render as
 //! an em-dash, never invented totals.
 //!
-//! **Scope is DEVMGR-2** — the by-type tree + header card + chrome + local read.
-//! The detail drawer + MDM problem codes (DEVMGR-3), the host rail across peers
-//! (DEVMGR-4), the by-connection topology (DEVMGR-5) and export (DEVMGR-6) are
-//! later units; their seams here (the disabled view modes, the non-interactive
-//! device rows) are left clean, not stubbed to a fake render.
+//! **Scope now covers DEVMGR-2 + DEVMGR-3** — the by-type tree + header card +
+//! local read (DEVMGR-2), plus the bottom **detail drawer** (General / Driver /
+//! Details / Events / Resources, #9/#10), the **MDM problem-code parity** (#11 —
+//! `DeviceStatus` → Windows Code 28/22/10 with the honest Linux reason beside it),
+//! and the About chrome refactored onto the shared
+//! [`mde_egui::menubar::MenuBar`] — About is the **14th / last MENUBAR-ALL
+//! surface**, so its bespoke Action/View/Help bar is replaced by the shared
+//! component (title · menus · a live status cluster), tinted with the dock's
+//! **System** group accent ([`Style::ACCENT_SYSTEM`]). Each menu item is the mouse
+//! twin of a real seam (Scan / view-mode / Expand-Collapse-all / the ⓘ dialog),
+//! honestly disabled/omitted per §7.
+//!
+//! The host rail across peers (DEVMGR-4), the by-connection topology (DEVMGR-5) and
+//! export (DEVMGR-6) are still later units; their seams here (the disabled view
+//! modes) are left clean, not stubbed to a fake render.
 
 #![allow(
     clippy::redundant_pub_crate,
@@ -34,14 +44,15 @@
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::device_inventory::{
     self, DeviceCategory, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
 };
 use mackes_mesh_types::peers::default_workgroup_root;
 use mde_egui::egui::{self, Id, RichText};
-use mde_egui::{field, muted_note, status_dot, Style};
+use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
+use mde_egui::{field, muted_note, status_dot, ChipTone, StatusChip, Style};
 use mde_theme::brand;
 
 use crate::about;
@@ -58,6 +69,11 @@ const REFRESH: Duration = Duration::from_secs(30);
 /// three, with the unbuilt modes **honestly disabled** (§7 — never stubbed to a
 /// fake render).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "the By-prefix mirrors MDM's own 'By type / By connection / By node' \
+              view-mode names — the shared prefix is the domain vocabulary, not noise"
+)]
 enum ViewMode {
     /// The classic by-category tree (Processors, Network adapters, …). Wired.
     #[default]
@@ -88,6 +104,122 @@ impl ViewMode {
     }
 }
 
+/// The bottom detail-drawer tab (#9/#10) — the full MDM property-tab set mapped to
+/// Linux facts (`General` / `Driver` / `Details` sysfs+IDs / `Events` dmesg+udev /
+/// `Resources` IRQ/IO/mem/DMA). Each tab renders only what the selected
+/// [`DeviceRecord`] actually carries; an absent field reads as an honest empty tab
+/// (§7), never a fabricated value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DrawerTab {
+    /// Identity + the MDM device-status box (name/vendor/model + problem code).
+    #[default]
+    General,
+    /// The bound kernel driver / module + its version.
+    Driver,
+    /// The sysfs path + `vendor:product` hardware IDs.
+    Details,
+    /// Recent dmesg / udev lines mentioning the device.
+    Events,
+    /// The IRQ / I/O-port / memory / DMA resources the device holds.
+    Resources,
+}
+
+impl DrawerTab {
+    /// The five tabs in MDM order.
+    const ALL: [Self; 5] = [
+        Self::General,
+        Self::Driver,
+        Self::Details,
+        Self::Events,
+        Self::Resources,
+    ];
+
+    /// The tab label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Driver => "Driver",
+            Self::Details => "Details",
+            Self::Events => "Events",
+            Self::Resources => "Resources",
+        }
+    }
+}
+
+/// One activation from the shared [`MenuBar`] (MENUBAR-ALL) — each is the mouse
+/// twin of a real DEVMGR seam, dispatched through [`DeviceManagerState::apply`]
+/// (§6/§7, one seam per entry). `Copy` so the static menu tables can hold it and
+/// the shared bar returns it by value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    /// Re-read the published inventory ([`DeviceManagerState::refresh`]).
+    Scan,
+    /// Switch the tree organisation ([`DeviceManagerState::view`]) — only the
+    /// wired [`ViewMode::ByType`] is ever enabled (§7).
+    View(ViewMode),
+    /// Expand every published category ([`DeviceManagerState::expand_all`]).
+    ExpandAll,
+    /// Collapse every category ([`DeviceManagerState::collapse_all`]).
+    CollapseAll,
+    /// Open the ⓘ license / credits / mesh-identity dialog.
+    About,
+}
+
+/// A stable handle to the selected device across inventory re-reads (#9). A
+/// [`DeviceRecord`] carries no id, so the selection keys on its category + name +
+/// sysfs path — the tuple a re-publish preserves for the same device. Resolved
+/// against the live inventory each frame ([`find_device`]); a device that vanishes
+/// closes the drawer rather than freezing a stale clone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeviceSelection {
+    /// The owning category key.
+    category: String,
+    /// The device display name.
+    name: String,
+    /// The sysfs path, when the record carried one (the strong half of the key).
+    sysfs_path: Option<String>,
+}
+
+impl DeviceSelection {
+    /// The selection key for a device within a category.
+    fn of(category: &str, dev: &DeviceRecord) -> Self {
+        Self {
+            category: category.to_string(),
+            name: dev.name.clone(),
+            sysfs_path: dev.sysfs_path.clone(),
+        }
+    }
+
+    /// Whether this selection names `dev` within `category`.
+    fn matches(&self, category: &str, dev: &DeviceRecord) -> bool {
+        self.category == category && self.name == dev.name && self.sysfs_path == dev.sysfs_path
+    }
+}
+
+/// Resolve a [`DeviceSelection`] against the live inventory, or `None` when the
+/// device is no longer published (the drawer then closes — never a stale render).
+fn find_device<'a>(inv: &'a DeviceInventory, sel: &DeviceSelection) -> Option<&'a DeviceRecord> {
+    inv.categories
+        .iter()
+        .find(|c| c.key == sel.category)
+        .and_then(|c| c.devices.iter().find(|d| sel.matches(&c.key, d)))
+}
+
+/// The Windows-MDM problem code a Linux [`DeviceStatus`] maps to (#11) — the
+/// faithful *emulation* the design locks: no-driver → **Code 28**, disabled →
+/// **Code 22**, degraded/error → **Code 10**. [`Ok`](DeviceStatus::Ok) and
+/// [`Unknown`](DeviceStatus::Unknown) carry no code (an honest unknown is never
+/// dressed as a fabricated Windows code — design "Risks"). Pure, so the mapping is
+/// unit-tested without a render.
+const fn problem_code(status: DeviceStatus) -> Option<u32> {
+    match status {
+        DeviceStatus::NoDriver => Some(28),
+        DeviceStatus::Disabled => Some(22),
+        DeviceStatus::Degraded => Some(10),
+        DeviceStatus::Ok | DeviceStatus::Unknown => None,
+    }
+}
+
 /// The About → Device-Manager surface state (DEVMGR-2). Holds the last-read local
 /// inventory, the fixed-cadence read clock, the per-category expand set, the tree
 /// organisation, and the ⓘ dialog latch. Drives no worker — a thin renderer over
@@ -112,6 +244,12 @@ pub(crate) struct DeviceManagerState {
     expanded: BTreeSet<String>,
     /// The active tree organisation (#3) — By type in DEVMGR-2.
     view: ViewMode,
+    /// The device whose detail drawer is open (#9), or `None` when the drawer is
+    /// closed. A stable [`DeviceSelection`] resolved against the live inventory
+    /// each frame so a re-read never freezes a stale device.
+    selected: Option<DeviceSelection>,
+    /// Which detail-drawer tab is active (#10) — General on a fresh selection.
+    active_tab: DrawerTab,
     /// The ⓘ dialog latch — license / credits / mesh-identity (#24).
     show_about: bool,
 }
@@ -126,6 +264,8 @@ impl Default for DeviceManagerState {
             last_poll: None,
             expanded: BTreeSet::new(),
             view: ViewMode::default(),
+            selected: None,
+            active_tab: DrawerTab::default(),
             show_about: false,
         }
     }
@@ -174,32 +314,60 @@ impl DeviceManagerState {
     }
 
     /// Render the whole surface into `ui` (the body of `Surface::About`).
+    ///
+    /// Layout (#2/#9): the compact brand strip (#24), the shared MENUBAR-ALL bar,
+    /// then the device tree filling the body — with the bottom **detail drawer**
+    /// (DEVMGR-3) reserved *before* the body so the tree stays full-width above it.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
+        // The brand identity strip (#24) — kept beside the shared MenuBar so the
+        // `◈ Magic-Mesh Quasar v<ver>` mark + the ⓘ button stay always-visible.
         self.title_strip(ui);
-        ui.separator();
-        self.menu_bar(ui);
-        self.toolbar(ui);
+        // MENUBAR-ALL: the shared top bar replaces DEVMGR-2's bespoke Action/View/
+        // Help chrome (About is the 14th / last surface onto the shared component).
+        if let Some(action) = self.chrome_bar(ui) {
+            self.apply(action);
+        }
         ui.separator();
         ui.add_space(Style::SP_XS);
 
-        if !self.seen {
-            // Honest pre-poll (§7) — no fabricated tree before the first read.
-            pre_poll(ui, &self.local_host);
-        } else if self.inventory.is_none() {
-            // Read, but this host has published nothing yet.
-            empty_host(ui, &self.local_host);
-        } else {
-            // The header reads the inventory immutably, then the tree takes `&mut
-            // self` to mutate the expand set — so the header borrow is scoped
-            // closed (a plain `if let`) before `tree` is called.
-            if let Some(inv) = self.inventory.as_ref() {
-                header_card(ui, inv);
-            }
-            ui.add_space(Style::SP_S);
-            self.tree(ui);
-        }
+        // The bottom detail drawer (#9): reserved first so the tree/header body
+        // below fills only the space it leaves (the tree stays full-width above).
+        self.detail_drawer(ui);
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show_inside(ui, |ui| {
+                if !self.seen {
+                    // Honest pre-poll (§7) — no fabricated tree before the first read.
+                    pre_poll(ui, &self.local_host);
+                } else if self.inventory.is_none() {
+                    // Read, but this host has published nothing yet.
+                    empty_host(ui, &self.local_host);
+                } else {
+                    // The header reads the inventory immutably, then the tree takes
+                    // `&mut self` to mutate the expand/selection sets — so the header
+                    // borrow is scoped closed (a plain `if let`) before `tree` runs.
+                    if let Some(inv) = self.inventory.as_ref() {
+                        header_card(ui, inv);
+                    }
+                    ui.add_space(Style::SP_S);
+                    self.tree(ui);
+                }
+            });
 
         self.about_dialog(ui);
+    }
+
+    /// Dispatch a shared-[`MenuBar`] activation to its real seam (§6/§7 — every
+    /// menu item is the mouse twin of an existing DEVMGR seam, never new behaviour).
+    fn apply(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::Scan => self.refresh(),
+            MenuAction::View(mode) => self.view = mode,
+            MenuAction::ExpandAll => self.expand_all(),
+            MenuAction::CollapseAll => self.collapse_all(),
+            MenuAction::About => self.show_about = true,
+        }
     }
 
     /// The compact brand title strip (#2/#24): the `◈` mark + product name +
@@ -240,99 +408,129 @@ impl DeviceManagerState {
         });
     }
 
-    /// The faithful MDM menu bar (#19): Action (Scan) · View (the three modes +
-    /// Expand/Collapse-all) · Help (the ⓘ dialog).
-    fn menu_bar(&mut self, ui: &mut egui::Ui) {
-        egui::menu::bar(ui, |ui| {
-            ui.menu_button("Action", |ui| {
-                if ui.button("Scan for hardware changes").clicked() {
-                    self.refresh();
-                    ui.close_menu();
-                }
-            });
-            ui.menu_button("View", |ui| {
-                for mode in ViewMode::ALL {
-                    let resp = ui.add_enabled(
-                        mode.is_available(),
-                        egui::SelectableLabel::new(self.view == mode, mode.label()),
-                    );
-                    if resp.clicked() {
-                        self.view = mode;
-                        ui.close_menu();
-                    }
-                    if !mode.is_available() {
-                        resp.on_hover_text("Arrives in a later DEVMGR unit");
-                    }
-                }
-                ui.separator();
-                if ui.button("Expand all").clicked() {
-                    self.expand_all();
-                    ui.close_menu();
-                }
-                if ui.button("Collapse all").clicked() {
-                    self.collapse_all();
-                    ui.close_menu();
-                }
-            });
-            ui.menu_button("Help", |ui| {
-                if ui.button("About Magic-Mesh").clicked() {
-                    self.show_about = true;
-                    ui.close_menu();
-                }
-            });
-        });
+    /// MENUBAR-ALL (About) — the **shared top bar** that replaces DEVMGR-2's bespoke
+    /// Action/View/Help chrome. Renders the three menus (each item the mouse twin of
+    /// a real seam) + a live status cluster over
+    /// [`mde_egui::menubar::MenuBar`], tinted with the dock's **System** group accent
+    /// ([`Style::ACCENT_SYSTEM`]), and returns the activated [`MenuAction`] (applied
+    /// via [`Self::apply`]). About is the 14th / last surface onto the component.
+    fn chrome_bar(&self, ui: &mut egui::Ui) -> Option<MenuAction> {
+        let menus = self.build_menus();
+        let status = self.status_chips(now_ms());
+        let model = MenuBarModel {
+            // The dock groups About/System under the categorical gold, so the bar
+            // wears that accent (MENUBAR-ALL lock 2). The brand identity itself
+            // stays in the strip above (design #24).
+            title: "About",
+            accent: Style::ACCENT_SYSTEM,
+            menus: &menus,
+            status: &status,
+        };
+        MenuBar::show(ui, &model)
     }
 
-    /// The faithful MDM toolbar (#19): Scan (re-read the published inventory),
-    /// Expand/Collapse-all, and the view-mode segmented control — By type live,
-    /// the others disabled seams (§7).
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(Style::SP_XS);
-        ui.horizontal(|ui| {
-            ui.add_space(Style::SP_XS);
-            if ui
-                .button(RichText::new("\u{21BB}  Scan").size(Style::SMALL)) // ↻
-                .on_hover_text("Re-read the published hardware inventory")
-                .clicked()
-            {
-                self.refresh();
+    /// Build the three menus from live state (#19 → MENUBAR-ALL): **Action** (Scan),
+    /// **View** (the three modes as radio items — only [`ViewMode::ByType`] enabled,
+    /// the others honestly disabled §7 — plus Expand/Collapse-all, gated on a loaded
+    /// inventory), and **Help** (the ⓘ dialog). No invented File/Edit spine — About
+    /// has no file/clipboard seam (§7).
+    fn build_menus(&self) -> Vec<Menu<MenuAction>> {
+        let action = Menu::new(
+            "Action",
+            vec![Entry::Item(Item::new(
+                MenuAction::Scan,
+                "Scan for hardware changes",
+            ))],
+        );
+
+        let has_tree = self.inventory.is_some();
+        let mut view_entries: Vec<Entry<MenuAction>> = ViewMode::ALL
+            .iter()
+            .map(|&mode| {
+                Entry::Item(
+                    Item::new(MenuAction::View(mode), mode.label())
+                        .enabled(mode.is_available())
+                        .checked(self.view == mode),
+                )
+            })
+            .collect();
+        view_entries.push(Entry::Separator);
+        view_entries.push(Entry::Item(
+            Item::new(MenuAction::ExpandAll, "Expand all").enabled(has_tree),
+        ));
+        view_entries.push(Entry::Item(
+            Item::new(MenuAction::CollapseAll, "Collapse all").enabled(has_tree),
+        ));
+        let view = Menu::new("View", view_entries);
+
+        let help = Menu::new(
+            "Help",
+            vec![Entry::Item(Item::new(
+                MenuAction::About,
+                "About Magic-Mesh",
+            ))],
+        );
+
+        vec![action, view, help]
+    }
+
+    /// The live status cluster (MENUBAR-ALL lock 6): **host · N devices · M problems
+    /// · scanned-time**, all off real state (§7). The host chip tints Info when an
+    /// inventory has loaded, Warn once a read found nothing, Neutral before the first
+    /// read; problems read Danger when any device is faulted, else an Ok "No
+    /// problems"; the scanned chip humanizes the snapshot's freshness. Takes `now_ms`
+    /// so the freshness read-out is unit-tested deterministically.
+    fn status_chips(&self, now_ms: u64) -> Vec<StatusChip> {
+        let host = self
+            .inventory
+            .as_ref()
+            .map_or(self.local_host.as_str(), |inv| inv.host.as_str());
+        let host_tone = if self.inventory.is_some() {
+            ChipTone::Info
+        } else if self.seen {
+            ChipTone::Warn
+        } else {
+            ChipTone::Neutral
+        };
+        let mut chips = vec![StatusChip::with_icon(DOT, host.to_string(), host_tone)];
+
+        if let Some(inv) = self.inventory.as_ref() {
+            let devices = inv.device_count();
+            chips.push(StatusChip::new(
+                format!("{devices} {}", plural(devices, "device", "devices")),
+                ChipTone::Neutral,
+            ));
+            let problems = inv.problem_count();
+            if problems > 0 {
+                chips.push(StatusChip::with_icon(
+                    "\u{26A0}", // ⚠
+                    format!("{problems} {}", plural(problems, "problem", "problems")),
+                    ChipTone::Danger,
+                ));
+            } else {
+                chips.push(StatusChip::new("No problems", ChipTone::Ok));
             }
-            ui.separator();
-            if ui
-                .button(RichText::new("Expand all").size(Style::SMALL))
-                .clicked()
-            {
-                self.expand_all();
-            }
-            if ui
-                .button(RichText::new("Collapse all").size(Style::SMALL))
-                .clicked()
-            {
-                self.collapse_all();
-            }
-            ui.separator();
-            for mode in ViewMode::ALL {
-                let resp = ui.add_enabled(
-                    mode.is_available(),
-                    egui::SelectableLabel::new(self.view == mode, mode.label()),
-                );
-                if resp.clicked() {
-                    self.view = mode;
-                }
-            }
-        });
-        ui.add_space(Style::SP_XS);
+            chips.push(StatusChip::new(
+                scanned_label(now_ms, inv.published_at_ms),
+                ChipTone::Neutral,
+            ));
+        }
+        chips
     }
 
     /// The by-type device tree (#1/#18) in a vertical scroll: each category is a
     /// forced-state [`egui::CollapsingHeader`] whose open/closed is driven from
     /// [`Self::expanded`] (so Expand-/Collapse-all and per-header clicks all route
-    /// through the one set), amber-tinted when it holds a problem device.
+    /// through the one set), amber-tinted when it holds a problem device. A device
+    /// row click opens/toggles the bottom detail drawer (DEVMGR-3).
     fn tree(&mut self, ui: &mut egui::Ui) {
-        // The category a header click toggled this frame — applied AFTER the read
-        // borrow ends so the immutable inventory read + the mutable toggle never
-        // alias.
+        // The category a header click toggled + the device a row click selected this
+        // frame — applied AFTER the read borrow ends so the immutable inventory read
+        // and the mutable toggle/selection never alias. `selected` is cloned in so
+        // the highlight reads current selection without borrowing `self.selected`.
         let mut toggled: Option<String> = None;
+        let mut clicked: Option<DeviceSelection> = None;
+        let selected = self.selected.clone();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -341,20 +539,74 @@ impl DeviceManagerState {
                 };
                 for cat in &inv.categories {
                     let open = self.expanded.contains(cat.key.as_str());
-                    if category_header(ui, cat, open) {
+                    let out = category_header(ui, cat, open, selected.as_ref());
+                    if out.header_clicked {
                         toggled = Some(cat.key.clone());
+                    }
+                    if let Some(sel) = out.selected {
+                        clicked = Some(sel);
                     }
                 }
             });
         if let Some(key) = toggled {
             self.toggle(&key);
         }
+        if let Some(sel) = clicked {
+            // A click on the open device closes the drawer; a new device selects it
+            // and resets to the General tab.
+            if self.selected.as_ref() == Some(&sel) {
+                self.selected = None;
+            } else {
+                self.selected = Some(sel);
+                self.active_tab = DrawerTab::General;
+            }
+        }
+    }
+
+    /// The bottom detail drawer (#9/#10): when a device is selected, a resizable
+    /// bottom panel with the five MDM tabs, populated from the live record. The
+    /// selection is resolved against the current inventory each frame — a device
+    /// that vanished on a re-read closes the drawer (never a stale clone, §7).
+    fn detail_drawer(&mut self, ui: &mut egui::Ui) {
+        let Some(sel) = self.selected.clone() else {
+            return;
+        };
+        // Clone the resolved record out so the panel body borrows neither `self` nor
+        // the inventory — freeing the local tab/close state below to take `&mut`.
+        let Some(dev) = self
+            .inventory
+            .as_ref()
+            .and_then(|inv| find_device(inv, &sel))
+            .cloned()
+        else {
+            self.selected = None;
+            return;
+        };
+
+        let mut tab = self.active_tab;
+        let mut close = false;
+        egui::TopBottomPanel::bottom(ui.id().with("devmgr-detail-drawer"))
+            .resizable(true)
+            .min_height(Style::SP_XL * 4.0)
+            .default_height(Style::SP_XL * 7.0)
+            .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+            .show_inside(ui, |ui| {
+                drawer_header(ui, &dev, &mut close);
+                drawer_tabs(ui, &mut tab);
+                ui.separator();
+                ui.add_space(Style::SP_XS);
+                drawer_body(ui, &dev, tab);
+            });
+        self.active_tab = tab;
+        if close {
+            self.selected = None;
+        }
     }
 
     /// The ⓘ dialog (#24): the canonical identity screen (QBRAND-6 —
     /// [`about::about_panel`]) reused verbatim as the modal body (§6, one About
     /// renderer), with a top-bar close. Closes on the `×`, the backdrop, or Esc.
-    fn about_dialog(&mut self, ui: &mut egui::Ui) {
+    fn about_dialog(&mut self, ui: &egui::Ui) {
         if !self.show_about {
             return;
         }
@@ -487,12 +739,26 @@ fn format_mem_kb(kb: u64) -> String {
     format!("{gib:.1} GiB")
 }
 
+/// What a rendered [`category_header`] reports back for one frame: whether the
+/// header was clicked (the caller toggles the expand set) and any device row the
+/// operator selected (the caller opens the drawer).
+struct CategoryOutcome {
+    /// The collapsing header was clicked (toggle this category's expansion).
+    header_clicked: bool,
+    /// A device row was clicked (open/toggle its detail drawer).
+    selected: Option<DeviceSelection>,
+}
+
 /// One category branch — a forced-state collapsing header (its open/closed driven
-/// by the caller's expand set, #18). Returns `true` when the header was clicked
-/// (the caller toggles the set). The header tints amber when the category holds a
-/// problem device — a faithful MDM "attention on this branch" cue; the rich
-/// per-device MDM problem codes are DEVMGR-3.
-fn category_header(ui: &mut egui::Ui, cat: &DeviceCategory, open: bool) -> bool {
+/// by the caller's expand set, #18). The header tints amber and carries a `⚠ N`
+/// count when the category holds a problem device — a faithful MDM "attention on
+/// this branch" cue.
+fn category_header(
+    ui: &mut egui::Ui,
+    cat: &DeviceCategory,
+    open: bool,
+    selected: Option<&DeviceSelection>,
+) -> CategoryOutcome {
     let problems = cat.problem_count();
     let tone = if problems > 0 {
         Style::WARN
@@ -504,35 +770,276 @@ fn category_header(ui: &mut egui::Ui, cat: &DeviceCategory, open: bool) -> bool 
         use std::fmt::Write as _;
         let _ = write!(title, "   \u{26A0} {problems}"); // ⚠ N
     }
+    let mut clicked: Option<DeviceSelection> = None;
     let resp = egui::CollapsingHeader::new(RichText::new(title).color(tone).size(Style::BODY))
         .id_salt(("dm-cat", cat.key.as_str()))
         .open(Some(open))
         .show(ui, |ui| {
             for dev in &cat.devices {
-                device_row(ui, dev);
+                let is_sel = selected.is_some_and(|s| s.matches(&cat.key, dev));
+                if device_row(ui, dev, is_sel) {
+                    clicked = Some(DeviceSelection::of(&cat.key, dev));
+                }
             }
         });
-    resp.header_response.clicked()
+    CategoryOutcome {
+        header_clicked: resp.header_response.clicked(),
+        selected: clicked,
+    }
 }
 
-/// One device row — a status dot in the device's [`status_tone`], the name, and
-/// (for a problem device) the honest Linux reason from the schema, dimmed. The
-/// row is non-interactive in DEVMGR-2: the bottom detail drawer is DEVMGR-3, a
-/// clean seam left here rather than a dead click handler.
-fn device_row(ui: &mut egui::Ui, dev: &DeviceRecord) {
+/// One device row — a clickable selection row (DEVMGR-3): a status dot in the
+/// device's [`status_tone`], the name (accent-tinted when selected), the MDM
+/// **problem-code badge** for a faulted device (#11), and the honest Linux reason
+/// from the schema, dimmed. Returns `true` when the row was clicked this frame (the
+/// caller opens/toggles the bottom detail drawer).
+fn device_row(ui: &mut egui::Ui, dev: &DeviceRecord, selected: bool) -> bool {
+    let inner = ui
+        .horizontal(|ui| {
+            status_dot(ui, status_tone(dev.status));
+            ui.add_space(Style::SP_XS);
+            let name_tone = if selected { Style::ACCENT } else { Style::TEXT };
+            ui.label(RichText::new(&dev.name).color(name_tone).size(Style::SMALL));
+            if let Some(code) = problem_code(dev.status) {
+                ui.add_space(Style::SP_XS);
+                ui.label(
+                    RichText::new(format!("Code {code}"))
+                        .color(status_tone(dev.status))
+                        .size(Style::SMALL)
+                        .strong(),
+                );
+            }
+            if let Some(reason) = &dev.problem {
+                ui.add_space(Style::SP_XS);
+                muted_note(ui, format!("\u{2014} {reason}")); // — reason
+            }
+        })
+        .response;
+    // The row's labels don't sense clicks, so re-interact the whole strip as one
+    // selection target (the MDM "click a device to inspect it" affordance).
+    inner
+        .interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+}
+
+// ─────────────────────────── the detail drawer (#9/#10) ─────────────────────
+
+/// The filled status-dot glyph the status cluster reuses.
+const DOT: &str = "\u{25CF}";
+
+/// The drawer's title row (#9): the selected device's status dot + name, with a
+/// `×` close button on the right.
+fn drawer_header(ui: &mut egui::Ui, dev: &DeviceRecord, close: &mut bool) {
     ui.horizontal(|ui| {
         status_dot(ui, status_tone(dev.status));
         ui.add_space(Style::SP_XS);
         ui.label(
             RichText::new(&dev.name)
+                .color(Style::TEXT_STRONG)
+                .size(Style::BODY)
+                .strong(),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button(RichText::new("\u{00D7}").size(Style::BODY)) // ×
+                .on_hover_text("Close the device details")
+                .clicked()
+            {
+                *close = true;
+            }
+        });
+    });
+}
+
+/// The drawer's tab strip (#10): the five MDM tabs as selectable labels, updating
+/// the caller's active-tab.
+fn drawer_tabs(ui: &mut egui::Ui, tab: &mut DrawerTab) {
+    ui.horizontal(|ui| {
+        for t in DrawerTab::ALL {
+            if ui.selectable_label(*tab == t, t.label()).clicked() {
+                *tab = t;
+            }
+        }
+    });
+}
+
+/// The drawer's body (#10): the active tab's fields, in a scroll so a long Events /
+/// Resources list never blows the panel. Every tab renders only real record data,
+/// with an honest empty state when a field is absent (§7).
+fn drawer_body(ui: &mut egui::Ui, dev: &DeviceRecord, tab: DrawerTab) {
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| match tab {
+            DrawerTab::General => general_tab(ui, dev),
+            DrawerTab::Driver => driver_tab(ui, dev),
+            DrawerTab::Details => details_tab(ui, dev),
+            DrawerTab::Events => events_tab(ui, dev),
+            DrawerTab::Resources => resources_tab(ui, dev),
+        });
+}
+
+/// The **General** tab (#10): identity (name / manufacturer / model) plus the MDM
+/// **device-status box** (#11) — "This device is working properly." for a healthy
+/// device, or the mapped problem code with the honest Linux reason beside it.
+fn general_tab(ui: &mut egui::Ui, dev: &DeviceRecord) {
+    field(ui, "Device name", &dev.name, Style::TEXT);
+    optional_field(ui, "Manufacturer", dev.vendor.as_deref());
+    optional_field(ui, "Model", dev.model.as_deref());
+    ui.add_space(Style::SP_S);
+    ui.label(
+        RichText::new("Device status")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL),
+    );
+    let (text, tone) = device_status_display(dev);
+    ui.colored_label(tone, RichText::new(text).size(Style::SMALL));
+}
+
+/// The **Driver** tab (#10): the bound kernel driver / module + its version. An
+/// honestly-empty tab when no driver is bound (which is exactly the no-driver
+/// problem state, §7).
+fn driver_tab(ui: &mut egui::Ui, dev: &DeviceRecord) {
+    if dev.driver.is_none() && dev.driver_version.is_none() {
+        muted_note(ui, "No kernel driver is bound to this device.");
+        return;
+    }
+    optional_field(ui, "Driver", dev.driver.as_deref());
+    optional_field(ui, "Driver version", dev.driver_version.as_deref());
+}
+
+/// The **Details** tab (#10): the sysfs path + the `vendor:product` hardware IDs —
+/// the Linux mapping of MDM's property IDs. Honestly empty when neither was read.
+fn details_tab(ui: &mut egui::Ui, dev: &DeviceRecord) {
+    if dev.sysfs_path.is_none() && dev.ids.is_none() {
+        muted_note(ui, "No sysfs path or hardware IDs were reported.");
+        return;
+    }
+    optional_field(ui, "Hardware IDs", dev.ids.as_deref());
+    optional_field(ui, "sysfs path", dev.sysfs_path.as_deref());
+}
+
+/// The **Events** tab (#10): the recent dmesg / udev lines mentioning this device,
+/// in mono. Honestly empty when none were captured.
+fn events_tab(ui: &mut egui::Ui, dev: &DeviceRecord) {
+    if dev.events.is_empty() {
+        muted_note(ui, "No recent kernel or udev events for this device.");
+        return;
+    }
+    for line in &dev.events {
+        ui.label(
+            RichText::new(line)
+                .family(egui::FontFamily::Monospace)
                 .color(Style::TEXT)
                 .size(Style::SMALL),
         );
-        if let Some(reason) = &dev.problem {
-            ui.add_space(Style::SP_XS);
-            muted_note(ui, format!("\u{2014} {reason}")); // — reason
+    }
+}
+
+/// The **Resources** tab (#10): the IRQ / I/O-port / memory-window / DMA resources
+/// the device holds. Honestly empty when the enumerator resolved none.
+fn resources_tab(ui: &mut egui::Ui, dev: &DeviceRecord) {
+    let r = &dev.resources;
+    if r.is_empty() {
+        muted_note(ui, "No IRQ, I/O, memory, or DMA resources were reported.");
+        return;
+    }
+    if let Some(irq) = r.irq {
+        field(ui, "IRQ", &irq.to_string(), Style::TEXT);
+    }
+    for (label, list) in [
+        ("I/O ports", &r.io_ports),
+        ("Memory range", &r.memory),
+        ("DMA", &r.dma),
+    ] {
+        for value in list {
+            field(ui, label, value, Style::TEXT);
         }
-    });
+    }
+}
+
+/// A labelled field that renders an honest em-dash when the value is absent (§7),
+/// so a drawer tab never leaves a blank or fabricates a value.
+fn optional_field(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+    match value {
+        Some(v) => field(ui, label, v, Style::TEXT),
+        None => field(ui, label, &dash(), Style::TEXT_DIM),
+    }
+}
+
+/// The MDM device-status line for the General tab (#11): the problem code + the
+/// honest Linux reason for a faulted device, "working properly" for a healthy one,
+/// or an honest "could not be determined" for an unknown state — never a fabricated
+/// Windows code. Returns the text + its [`Style`] tone. Pure, so the mapping is
+/// unit-tested without a render.
+fn device_status_display(dev: &DeviceRecord) -> (String, egui::Color32) {
+    if let Some(code) = problem_code(dev.status) {
+        let reason = dev
+            .problem
+            .as_deref()
+            .unwrap_or("no additional detail reported");
+        return (
+            format!("Code {code} \u{2014} {reason}"),
+            status_tone(dev.status),
+        );
+    }
+    if dev.status == DeviceStatus::Ok {
+        return ("This device is working properly.".to_string(), Style::OK);
+    }
+    // Unknown — an honest "could not be determined", never a fabricated code.
+    let text = dev.problem.as_deref().map_or_else(
+        || "Device status could not be determined.".to_string(),
+        |r| format!("Device status could not be determined \u{2014} {r}"),
+    );
+    (text, Style::TEXT_DIM)
+}
+
+/// Singular / plural pick on a count (no faked pluralization elsewhere).
+const fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 {
+        one
+    } else {
+        many
+    }
+}
+
+/// The "scanned N ago" freshness chip text (#8) from the snapshot's publish time.
+/// A `0` publish time (the schema's honest "unknown") reads as an em-dash rather
+/// than a fabricated age. Pure over `now_ms` so it is deterministically tested.
+fn scanned_label(now_ms: u64, published_ms: u64) -> String {
+    if published_ms == 0 {
+        return "Scanned \u{2014}".to_string();
+    }
+    format!(
+        "Scanned {}",
+        humanize_ago(now_ms.saturating_sub(published_ms) / 1000)
+    )
+}
+
+/// Humanize an elapsed span (in whole seconds) to a compact "N ago" — "just now"
+/// under 5 s, then s / m / h / d rounded down.
+fn humanize_ago(secs: u64) -> String {
+    if secs < 5 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3_600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3_600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// Wall-clock now in ms since the epoch (the status cluster's freshness read), or
+/// `0` if the clock is before the epoch (an honest miss the chip renders as "—").
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 /// The status-dot tone for a device state — the honest Linux state coloured, not
@@ -581,13 +1088,15 @@ fn empty_host(ui: &mut egui::Ui, host: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        cpu_line, format_mem_kb, header_lines, humanize_uptime, status_tone, DeviceManagerState,
-        ViewMode,
+        cpu_line, device_status_display, format_mem_kb, header_lines, humanize_ago,
+        humanize_uptime, problem_code, scanned_label, status_tone, DeviceManagerState,
+        DeviceSelection, DrawerTab, MenuAction, ViewMode,
     };
     use mackes_mesh_types::device_inventory::{
-        category, DeviceInventory, DeviceStatus, HostSummary,
+        category, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
     };
-    use mde_egui::{egui, Style};
+    use mde_egui::menubar::{Entry, Menu};
+    use mde_egui::{egui, ChipTone, Style};
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
@@ -602,6 +1111,8 @@ mod tests {
             last_poll: None,
             expanded: BTreeSet::new(),
             view: ViewMode::ByType,
+            selected: None,
+            active_tab: DrawerTab::General,
             show_about: false,
         }
     }
@@ -775,5 +1286,272 @@ mod tests {
         assert!(cpu_line(&s).contains('4'));
         s.cpu_count = None;
         assert_eq!(cpu_line(&s), "\u{2014}");
+    }
+
+    // ── DEVMGR-3 helpers ─────────────────────────────────────────────────────
+
+    /// The fixture's driverless PCI device (`NoDriver` + the honest Linux reason,
+    /// with no driver / events / resources — the empty-tab cases).
+    fn orphan() -> DeviceRecord {
+        DeviceInventory::fixture()
+            .categories
+            .into_iter()
+            .find(|c| c.key == category::PCI_DEVICES)
+            .and_then(|c| c.devices.into_iter().next())
+            .expect("the fixture publishes a PCI device")
+    }
+
+    /// The activation ids of a menu's items, in order.
+    fn item_ids(menu: &Menu<MenuAction>) -> Vec<MenuAction> {
+        menu.entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Item(item) => Some(item.id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // ── (b) MDM problem-code parity (#11) ────────────────────────────────────
+
+    #[test]
+    fn linux_state_maps_to_the_mdm_problem_code() {
+        // The faithful emulation the design locks: no-driver→28, disabled→22,
+        // degraded→10; Ok + Unknown carry no fabricated Windows code.
+        assert_eq!(problem_code(DeviceStatus::NoDriver), Some(28));
+        assert_eq!(problem_code(DeviceStatus::Disabled), Some(22));
+        assert_eq!(problem_code(DeviceStatus::Degraded), Some(10));
+        assert_eq!(problem_code(DeviceStatus::Ok), None);
+        assert_eq!(problem_code(DeviceStatus::Unknown), None);
+    }
+
+    #[test]
+    fn device_status_display_keeps_the_real_linux_reason_beside_the_code() {
+        // A driverless device → Code 28 WITH the honest Linux reason, in the warn
+        // tone — the code never stands alone (design "keep the emulation honest").
+        let (text, tone) = device_status_display(&orphan());
+        assert!(text.contains("Code 28"), "the MDM code: {text}");
+        assert!(
+            text.contains("no kernel driver bound"),
+            "the honest Linux reason rides beside the code: {text}"
+        );
+        assert_eq!(tone, Style::WARN);
+        // A healthy device reads the MDM "working properly", in the Ok tone.
+        let gpu = DeviceRecord::new("Intel UHD Graphics", DeviceStatus::Ok);
+        let (text, tone) = device_status_display(&gpu);
+        assert_eq!(text, "This device is working properly.");
+        assert_eq!(tone, Style::OK);
+        // An unknown state stays honest — never dressed as a fabricated code.
+        let mut unk = DeviceRecord::new("Unclaimed bus device", DeviceStatus::Unknown);
+        let (text, _) = device_status_display(&unk);
+        assert!(!text.contains("Code"), "unknown fabricates no code: {text}");
+        unk.problem = Some("state could not be read".to_string());
+        let (text, _) = device_status_display(&unk);
+        assert!(
+            text.contains("state could not be read"),
+            "reason kept: {text}"
+        );
+    }
+
+    // ── (a) the bottom detail drawer (#9/#10) ────────────────────────────────
+
+    #[test]
+    fn the_drawer_has_the_full_mdm_tab_set() {
+        assert_eq!(DrawerTab::ALL.len(), 5);
+        let labels: Vec<&str> = DrawerTab::ALL.iter().map(|t| t.label()).collect();
+        assert_eq!(
+            labels,
+            vec!["General", "Driver", "Details", "Events", "Resources"]
+        );
+        assert_eq!(DrawerTab::default(), DrawerTab::General);
+    }
+
+    #[test]
+    fn the_five_tab_drawer_renders_for_a_selected_device() {
+        // Selecting a device opens the drawer; each of the five MDM tabs renders
+        // from the record without panicking (a live render, not dead code) — and
+        // the orphan exercises the honest empty Driver / Events / Resources tabs.
+        let inv = DeviceInventory::fixture();
+        let orphan = orphan();
+        for tab in DrawerTab::ALL {
+            let mut s = state_with(Some(inv.clone()), true);
+            s.selected = Some(DeviceSelection::of(category::PCI_DEVICES, &orphan));
+            s.active_tab = tab;
+            assert!(drive(&mut s) > 0, "the {} tab drew nothing", tab.label());
+            assert!(
+                s.selected.is_some(),
+                "a live selection stays open on the {} tab",
+                tab.label()
+            );
+        }
+    }
+
+    #[test]
+    fn the_drawer_prunes_a_selection_that_vanished() {
+        // A device no longer published closes the drawer rather than freezing a
+        // stale clone (§7 — honest, never a fabricated render).
+        let mut s = state_with(Some(DeviceInventory::fixture()), true);
+        s.selected = Some(DeviceSelection {
+            category: category::PCI_DEVICES.to_string(),
+            name: "A device that was unplugged".to_string(),
+            sysfs_path: None,
+        });
+        let _ = drive(&mut s);
+        assert!(s.selected.is_none(), "an unresolvable selection is dropped");
+    }
+
+    #[test]
+    fn a_device_selection_keys_on_category_name_and_sysfs() {
+        let orphan = orphan();
+        let sel = DeviceSelection::of(category::PCI_DEVICES, &orphan);
+        // The same device in the same category matches (a re-publish preserves it).
+        assert!(sel.matches(category::PCI_DEVICES, &orphan));
+        // A different category, or a different device, does not.
+        assert!(!sel.matches(category::DISPLAY, &orphan));
+        let other = DeviceRecord::new("Something else entirely", DeviceStatus::Ok);
+        assert!(!sel.matches(category::PCI_DEVICES, &other));
+    }
+
+    // ── (c) the shared MenuBar drives the real seams ─────────────────────────
+
+    #[test]
+    fn the_menu_bar_menus_drive_the_real_seams() {
+        let s = state_with(Some(DeviceInventory::fixture()), true);
+        let menus = s.build_menus();
+        let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
+        assert_eq!(titles, vec!["Action", "View", "Help"]);
+        // No invented File/Edit spine — About has no file/clipboard seam (§7).
+        for banned in ["File", "Edit"] {
+            assert!(!titles.contains(&banned), "{banned} shipped without a seam");
+        }
+        // Action → Scan.
+        assert_eq!(item_ids(&menus[0]), vec![MenuAction::Scan]);
+        // View → the three modes (By type live + checked, the others disabled
+        // seams §7) + Expand/Collapse-all (enabled with a loaded inventory).
+        let view = &menus[1];
+        for entry in &view.entries {
+            if let Entry::Item(item) = entry {
+                if let MenuAction::View(mode) = item.id {
+                    assert_eq!(
+                        item.enabled,
+                        mode.is_available(),
+                        "{mode:?} enablement tracks whether it is wired"
+                    );
+                    assert_eq!(
+                        item.checked,
+                        Some(mode == ViewMode::ByType),
+                        "the active mode is the checked one"
+                    );
+                }
+            }
+        }
+        let enabled = |id| {
+            view.entries
+                .iter()
+                .any(|e| matches!(e, Entry::Item(it) if it.id == id && it.enabled))
+        };
+        assert!(enabled(MenuAction::ExpandAll));
+        assert!(enabled(MenuAction::CollapseAll));
+        // Help → the ⓘ dialog.
+        assert_eq!(item_ids(&menus[2]), vec![MenuAction::About]);
+    }
+
+    #[test]
+    fn expand_collapse_disable_without_a_loaded_inventory() {
+        // §7 — with nothing published there is nothing to expand, so the two are
+        // honestly disabled (never a silent no-op).
+        let s = state_with(None, true);
+        let view = &s.build_menus()[1];
+        for id in [MenuAction::ExpandAll, MenuAction::CollapseAll] {
+            assert!(
+                view.entries
+                    .iter()
+                    .any(|e| matches!(e, Entry::Item(it) if it.id == id && !it.enabled)),
+                "{id:?} greys with no tree"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_dispatches_each_action_to_its_seam() {
+        // Scan re-reads (seen flips true even off a fresh, empty state).
+        let mut s = state_with(None, false);
+        s.apply(MenuAction::Scan);
+        assert!(s.seen, "Scan drove a read");
+        // Expand / Collapse over the fixture.
+        let mut s = state_with(Some(DeviceInventory::fixture()), true);
+        s.apply(MenuAction::ExpandAll);
+        assert_eq!(s.expanded.len(), 2, "Expand all filled the set");
+        s.apply(MenuAction::CollapseAll);
+        assert!(s.expanded.is_empty(), "Collapse all cleared it");
+        // A view switch + the ⓘ dialog.
+        s.apply(MenuAction::View(ViewMode::ByConnection));
+        assert_eq!(s.view, ViewMode::ByConnection);
+        assert!(!s.show_about);
+        s.apply(MenuAction::About);
+        assert!(s.show_about, "About opened the ⓘ dialog");
+    }
+
+    #[test]
+    fn the_status_cluster_reflects_host_devices_and_problems() {
+        let inv = DeviceInventory::fixture();
+        let published = inv.published_at_ms;
+        let s = state_with(Some(inv), true);
+        let chips = s.status_chips(published + 90_000); // 90 s after publish
+        assert!(
+            chips
+                .iter()
+                .any(|c| c.text == "laptop-mm" && c.tone == ChipTone::Info),
+            "the host chip reads Info once an inventory loads"
+        );
+        assert!(chips.iter().any(|c| c.text == "2 devices"), "device count");
+        assert!(
+            chips
+                .iter()
+                .any(|c| c.text.contains("1 problem") && c.tone == ChipTone::Danger),
+            "the one faulted device reads a danger problem chip"
+        );
+        assert!(
+            chips.iter().any(|c| c.text == "Scanned 1m ago"),
+            "the freshness chip: {:?}",
+            chips.iter().map(|c| c.text.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_status_cluster_is_honest_before_a_read_and_when_clean() {
+        // Pre-read: only the host chip, neutral, no fabricated counts.
+        let pre = state_with(None, false);
+        let chips = pre.status_chips(0);
+        assert_eq!(chips.len(), 1, "no counts before the first read");
+        assert_eq!(chips[0].tone, ChipTone::Neutral);
+        // A clean host reads an Ok "No problems".
+        let mut inv = DeviceInventory::fixture();
+        for cat in &mut inv.categories {
+            for dev in &mut cat.devices {
+                dev.status = DeviceStatus::Ok;
+                dev.problem = None;
+            }
+        }
+        let clean = state_with(Some(inv), true);
+        let chips = clean.status_chips(0);
+        assert!(
+            chips
+                .iter()
+                .any(|c| c.text == "No problems" && c.tone == ChipTone::Ok),
+            "a clean host reads an Ok 'No problems'"
+        );
+    }
+
+    #[test]
+    fn scanned_freshness_humanizes_and_stays_honest() {
+        assert_eq!(humanize_ago(3), "just now");
+        assert_eq!(humanize_ago(42), "42s ago");
+        assert_eq!(humanize_ago(600), "10m ago");
+        assert_eq!(humanize_ago(7_200), "2h ago");
+        assert_eq!(humanize_ago(180_000), "2d ago");
+        // A publish time of 0 (the schema's honest "unknown") fabricates no age.
+        assert_eq!(scanned_label(1_000_000, 0), "Scanned \u{2014}");
+        assert_eq!(scanned_label(1_000_000, 940_000), "Scanned 1m ago");
     }
 }
