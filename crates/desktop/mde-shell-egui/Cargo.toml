@@ -182,5 +182,10 @@ mde-web-preview-client = { path = "../mde-web-preview-client" }
 # out of the release build.
 mde-web-preview-client = { path = "../mde-web-preview-client", features = ["testkit"] }
 
+# The Mesh-Map co-editing watch test (EDITOR-COLLAB-3) drains a REAL `Persist`
+# spool on a throwaway dir — the same tempdir seam the editor's BusTransport
+# round-trip test uses. Already in the workspace lock, no new lock line.
+tempfile = "3"
+
 [lints]
 workspace = true

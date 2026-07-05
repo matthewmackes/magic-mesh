@@ -78,14 +78,18 @@
 //!   returned edits. An absent server binary surfaces the honest
 //!   [`LspState::Unavailable`] status, and every navigation action on a gated
 //!   server is an honest no-op with a status — never a faked session (§7).
-//! * EDITOR-COLLAB-1/2 — **mesh co-editing**: the conflict-free replicated
-//!   document ([`crdt`], yrs) and the **share-session** ([`collab_session`]) that
+//! * EDITOR-COLLAB-1/2/3 — **mesh co-editing**: the conflict-free replicated
+//!   document ([`crdt`], yrs), the **share-session** ([`collab_session`]) that
 //!   carries it over the Mackes Bus as a P2P editing session — local edits
 //!   broadcast, remote merges applied, the y-sync state-vector handshake on join,
-//!   remote cursors/presence, and a host/guest permission model. No cloud: every
-//!   frame rides the local Bus spool the broker federates over Nebula. Real
-//!   convergence is proven over a transport seam ([`collab_session::CollabTransport`])
-//!   with an in-process fake bus; the panel wiring + live smoke land in COLLAB-3.
+//!   remote cursors/selections/viewports as presence, and a host/guest permission
+//!   model — and **follow mode** ([`follow`]): pin a collaborator and the local
+//!   view tracks their cursor + scroll, any local input breaking the follow. No
+//!   cloud: every frame rides the local Bus spool the broker federates over
+//!   Nebula (which is also what the shell's Mesh Map watches to badge nodes in
+//!   active co-editing sessions). Real convergence is proven over a transport
+//!   seam ([`collab_session::CollabTransport`]) with an in-process fake bus; the
+//!   panel wiring + live smoke are the remaining share-session UI unit.
 //!
 //! * EDITOR-6 — **tabs + splittable panes** ([`panes`]): the surface grows from
 //!   one open document into a pane registry (each pane a strip of open-buffer
@@ -129,6 +133,7 @@ pub mod collab_session;
 pub mod crdt;
 mod finder;
 pub mod fold;
+pub mod follow;
 mod format_bar;
 mod fuzzy;
 pub mod highlight;
@@ -155,10 +160,12 @@ use mde_egui::{eframe, egui};
 pub use buffer::Buffer;
 pub use collab_session::{
     Access, BusTransport, CollabError, CollabMessage, CollabSession, CollabTransport, CursorPos,
-    FakeBus, FrameKind, PollOutcome, Presence, RemotePeer, Role, SessionId,
+    FakeBus, FollowUpdate, FrameKind, PollOutcome, Presence, RemotePeer, Role, SessionId, Viewport,
+    COLLAB_TOPIC_PREFIX,
 };
 pub use crdt::{CollabDoc, CrdtError, EditSink, TextEdit};
 pub use fold::{FoldRegion, Folds};
+pub use follow::{apply_follow, follow_banner};
 pub use highlight::{Highlighter, Language};
 pub use lsp::{Diagnostic, LspClient, LspState, Severity};
 pub use lsp_ui::DiagnosticsOverlay;

@@ -650,6 +650,25 @@ impl EditorView {
         self.reveal_caret = true;
     }
 
+    /// Place a single caret carrying a selection `anchor → head` (both clamped),
+    /// dropping any other carets — the seam follow mode (EDITOR-COLLAB-3) uses to
+    /// mirror the followed collaborator's selection into this view, scroll-
+    /// revealed exactly like [`Self::place_cursor`]. `anchor == head` collapses
+    /// to a bare caret.
+    pub fn place_selection(&mut self, buffer: &Buffer, anchor: usize, head: usize) {
+        let len = buffer.len_chars();
+        let (anchor, head) = (anchor.min(len), head.min(len));
+        let mut caret = Caret::at(head);
+        if anchor != head {
+            caret.anchor = Some(anchor);
+        }
+        self.carets = vec![caret];
+        self.primary = 0;
+        self.group_open = false;
+        self.box_anchor = None;
+        self.reveal_caret = true;
+    }
+
     // ── EDITOR-12: code folding ──────────────────────────────────────────────
 
     /// The read-only fold state — the panel reads it (e.g. to enable a "fold all"

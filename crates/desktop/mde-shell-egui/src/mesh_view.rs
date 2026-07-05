@@ -18,6 +18,20 @@
 //!   unreadable snapshot yields an empty `MeshState`, which the widget paints as its
 //!   honest "waiting for mesh" `EmptyState`, never a fabricated peer.
 //!
+//! * [`CoEditWatch`] (EDITOR-COLLAB-3) watches the editor share-session lanes on
+//!   the mesh Bus (`collab/session/<id>` — the SAME frames `mde-editor-egui`'s
+//!   `CollabSession` publishes, decoded through the editor crate's own exported
+//!   wire types, §6 — no drifting second decoder) and folds them into per-session
+//!   participant rosters stamped with each frame's Bus write time. A session with
+//!   **two or more participants** and traffic inside the activity window is an
+//!   *active co-editing session*; every participant whose identity matches a map
+//!   node's hostname gets an accent-tinted Editor badge pinned to its disc — the
+//!   QBRAND-8 per-node adornment idiom, on the NW edge where the role badge holds
+//!   NE. Honest boundaries (§7): a solo session (a host sharing to nobody) is not
+//!   "co-editing" and badges nothing, a peer identity that isn't a hostname on
+//!   this map badges nothing, and a silent session ages out of the badge rather
+//!   than pinning a stale "editing" marker forever.
+//!
 //! * [`SelfTestWatch`] observes the onboard self-test verdict on the mesh Bus
 //!   (`event/onboard/self-test`) and reports the moment a node's self-test goes
 //!   **all-green**, so the shell can auto-open this Mesh Map (OW-10's acceptance).
@@ -37,9 +51,10 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use mde_bus::persist::Persist;
+use mde_editor_egui::collab_session::{CollabMessage, FrameKind, COLLAB_TOPIC_PREFIX};
 use mde_egui::egui::{self, Color32, Pos2, Rect, TextureHandle};
 use mde_egui::Style;
 use mde_theme::brand::icons::{icon_image, IconId};
@@ -238,6 +253,9 @@ pub(crate) struct MeshViewState {
     menubar: MeshMenuBar,
     /// The bar-driven view controls (Reduce Motion + the role/health filters).
     options: MeshViewOptions,
+    /// The editor share-session watch — which nodes are in an active co-editing
+    /// session right now (EDITOR-COLLAB-3), for the co-edit badge overlay.
+    coedit: CoEditWatch,
 }
 
 impl Default for MeshViewState {
@@ -249,6 +267,7 @@ impl Default for MeshViewState {
             badges: BadgeCache::default(),
             menubar: MeshMenuBar::new(),
             options: MeshViewOptions::default(),
+            coedit: CoEditWatch::default(),
         }
     }
 }
@@ -266,6 +285,9 @@ impl MeshViewState {
             self.last_poll = Some(Instant::now());
             let snapshot = std::fs::read_to_string(&self.snapshot_path).unwrap_or_default();
             self.state = project(&snapshot);
+            // Same cadence: drain the editor share-session lanes so the co-edit
+            // badges track session join/leave/idle within the window.
+            self.coedit.drain(now_unix_ms());
         }
         ctx.request_repaint_after(REFRESH);
     }
@@ -290,6 +312,7 @@ impl MeshViewState {
             .reduce_motion(self.options.reduce_motion)
             .show(ui);
         self.overlay_role_badges(ui, response.rect, &view);
+        self.overlay_coedit_badges(ui, response.rect, &view);
     }
 
     /// Overlay the health-tinted brand role badge on every node of the painted
@@ -317,6 +340,40 @@ impl MeshViewState {
             let r = node.role.radius();
             let diameter = (r * BADGE_SCALE).max(BADGE_MIN_PX);
             let pip = *centre + egui::vec2(r, -r); // NE edge of the node disc
+            let rect = Rect::from_center_size(pip, egui::Vec2::splat(diameter));
+            painter.image(texture.id(), rect, uv, Color32::WHITE);
+        }
+    }
+
+    /// Overlay the **co-editing badge** (EDITOR-COLLAB-3) on every painted node
+    /// participating in an active share-session: the accent-tinted Editor glyph
+    /// pinned to the disc's NW edge (the role badge holds NE), placed against
+    /// the SAME filtered state + `layout::place` geometry the widget drew —
+    /// the QBRAND-8 per-node adornment idiom, through the same [`BadgeCache`]
+    /// raster + texture path (§6). A peer identity that isn't a hostname on
+    /// this map simply badges nothing (§7 — never a fabricated node).
+    fn overlay_coedit_badges(&mut self, ui: &egui::Ui, area: Rect, state: &MeshState) {
+        if state.nodes.is_empty() {
+            return;
+        }
+        let active = self.coedit.active_peers(now_unix_ms());
+        if active.is_empty() {
+            return;
+        }
+        let centres = layout::place(state, area, MeshView::DEFAULT_MARGIN);
+        let ctx = ui.ctx().clone();
+        let painter = ui.painter_at(area);
+        let uv = Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0));
+        for (node, centre) in state.nodes.iter().zip(&centres) {
+            if !active.contains(node.id.as_str()) {
+                continue;
+            }
+            let Some(texture) = self.badges.texture(&ctx, IconId::Editor, COEDIT_TINT) else {
+                continue; // unreachable zero-size / asset-parse path — skip, never panic
+            };
+            let r = node.role.radius();
+            let diameter = (r * BADGE_SCALE).max(BADGE_MIN_PX);
+            let pip = *centre + egui::vec2(-r, -r); // NW edge — NE holds the role badge
             let rect = Rect::from_center_size(pip, egui::Vec2::splat(diameter));
             painter.image(texture.id(), rect, uv, Color32::WHITE);
         }
@@ -351,6 +408,16 @@ const fn health_tint(health: Health) -> [u8; 4] {
     [color.r(), color.g(), color.b(), color.a()]
 }
 
+/// The co-editing badge tint — the shared accent (an *activity* accent, kept
+/// distinct from the health tints the role badges carry), from the shared
+/// palette (no raw hex, §4).
+const COEDIT_TINT: [u8; 4] = [
+    Style::ACCENT.r(),
+    Style::ACCENT.g(),
+    Style::ACCENT.b(),
+    Style::ACCENT.a(),
+];
+
 /// Rasterizes the brand role badges once per (glyph, health-tint) and caches the
 /// egui textures for the map overlay — 3 roles × 3 health tints at most, loaded
 /// lazily on first use. Reuses the QBRAND-2 `brand::icons` raster + the one-line
@@ -381,6 +448,159 @@ impl BadgeCache {
                 Some(slot.insert(handle))
             }
         }
+    }
+}
+
+// ─────────────────────────── the co-editing presence watch ───────────────────────────
+
+/// How recently an active co-editing session must have Bus traffic for its
+/// participants to badge on the map. A live session emits frames on every
+/// keystroke / caret move (`Update` / `Presence`), so a genuinely active pair
+/// re-arms this continuously; a session everyone walked away from ages out
+/// instead of pinning a stale "editing" marker (§7).
+const COEDIT_ACTIVE_MS: i64 = 5 * 60 * 1000;
+
+/// Roster retention: a session silent this long is dropped from memory
+/// entirely (its per-peer cursors have already advanced past its frames, so a
+/// dropped roster only rebuilds from *new* traffic). Deliberately wider than
+/// the activity window so a briefly-idle session keeps its roster and lights
+/// back up from a single fresh frame.
+const COEDIT_RETAIN_MS: i64 = 6 * COEDIT_ACTIVE_MS;
+
+/// Wall-clock Unix milliseconds — the same scale `StoredMessage::ts_unix_ms`
+/// (the Bus write stamp) carries, so frame freshness compares directly.
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+/// Decode one share-session frame body to `(participant, is_leave)`, or `None`
+/// for an undecodable body. Every decodable frame — `Hello`, `Sync`, `Update`,
+/// `Presence`, `Grant` — is participation *activity* from its sender; a `Leave`
+/// prunes the sender from the session's roster. Decoded through the editor
+/// crate's own exported [`CollabMessage`] wire type (§6 — the one frame shape,
+/// no drifting shell-side mirror).
+fn coedit_frame(body: &str) -> Option<(String, bool)> {
+    let msg = serde_json::from_str::<CollabMessage>(body).ok()?;
+    if msg.from.is_empty() {
+        return None;
+    }
+    let leaving = matches!(msg.kind, FrameKind::Leave);
+    Some((msg.from, leaving))
+}
+
+/// Watches the editor share-session lanes (`collab/session/<id>`) on the mesh
+/// Bus and answers "which nodes are co-editing right now?" for the map's badge
+/// overlay (EDITOR-COLLAB-3).
+///
+/// Per session topic it keeps a roster of participants stamped with their last
+/// frame's Bus write time (`ts_unix_ms` — honest wall-clock freshness even for
+/// history drained at shell launch, no cold-start false positives and no missed
+/// already-live sessions). A session is **active** when its roster holds two or
+/// more participants and any frame landed inside [`COEDIT_ACTIVE_MS`]; every
+/// participant of an active session badges. Peer identities are the stable mesh
+/// identities the sessions publish (hostnames — the same string
+/// `collab_session::client_id_for` hashes), matched against map node ids.
+pub(crate) struct CoEditWatch {
+    /// The client Bus root (the same `mde_bus::client_data_dir()` the toast
+    /// lane reads); `None` off a mesh (no Bus) — the watch then never badges.
+    bus_root: Option<PathBuf>,
+    /// Per-topic Bus ULID cursors — each drain reads only new frames.
+    cursors: HashMap<String, Option<String>>,
+    /// Per-session participant rosters: topic → (peer → last frame ts, Unix ms).
+    sessions: HashMap<String, HashMap<String, i64>>,
+}
+
+impl Default for CoEditWatch {
+    fn default() -> Self {
+        Self {
+            bus_root: mde_bus::client_data_dir(),
+            cursors: HashMap::new(),
+            sessions: HashMap::new(),
+        }
+    }
+}
+
+impl CoEditWatch {
+    /// Drain every share-session lane past its cursor, folding new frames into
+    /// the rosters, then age out long-silent sessions. Cheap: an incremental
+    /// indexed spool read per topic; a missing Bus is a silent no-op (never a
+    /// panic — the honest off-mesh state).
+    fn drain(&mut self, now_ms: i64) {
+        if let Some(root) = self.bus_root.clone() {
+            if let Ok(persist) = Persist::open(root) {
+                let topics = persist.list_topics().unwrap_or_default();
+                for topic in topics
+                    .into_iter()
+                    .filter(|t| t.starts_with(COLLAB_TOPIC_PREFIX))
+                {
+                    let cursor = self.cursors.entry(topic.clone()).or_default();
+                    let Ok(msgs) = persist.list_since(&topic, cursor.as_deref()) else {
+                        continue;
+                    };
+                    let mut fresh = Vec::with_capacity(msgs.len());
+                    for msg in msgs {
+                        *cursor = Some(msg.ulid);
+                        if let Some(body) = msg.body {
+                            fresh.push((body, msg.ts_unix_ms));
+                        }
+                    }
+                    for (body, ts_ms) in fresh {
+                        self.admit(&topic, &body, ts_ms);
+                    }
+                }
+            }
+        }
+        self.prune(now_ms);
+    }
+
+    /// Fold one frame body into its session's roster: activity stamps the
+    /// sender's last-seen time, a `Leave` prunes it (an emptied session is
+    /// dropped). Split from the Bus read so the whole policy is unit-tested
+    /// without a spool (the same drain/admit split [`SelfTestWatch`] uses).
+    fn admit(&mut self, topic: &str, body: &str, ts_ms: i64) {
+        let Some((peer, leaving)) = coedit_frame(body) else {
+            return;
+        };
+        if leaving {
+            if let Some(roster) = self.sessions.get_mut(topic) {
+                roster.remove(&peer);
+                if roster.is_empty() {
+                    self.sessions.remove(topic);
+                }
+            }
+        } else {
+            self.sessions
+                .entry(topic.to_string())
+                .or_default()
+                .entry(peer)
+                .and_modify(|last| *last = ts_ms.max(*last))
+                .or_insert(ts_ms);
+        }
+    }
+
+    /// Drop sessions whose newest frame is older than the retention window —
+    /// the memory bound (rosters never grow past the live session set).
+    fn prune(&mut self, now_ms: i64) {
+        self.sessions
+            .retain(|_, roster| roster.values().any(|&ts| now_ms - ts <= COEDIT_RETAIN_MS));
+    }
+
+    /// The peers currently in an **active co-editing session**: a roster of two
+    /// or more with any frame inside the activity window badges ALL its
+    /// participants (both sides of a live pair light up, even when only one of
+    /// them typed last). A solo session is honestly not *co*-editing (§7).
+    fn active_peers(&self, now_ms: i64) -> HashSet<String> {
+        let mut active = HashSet::new();
+        for roster in self.sessions.values() {
+            if roster.len() >= 2 && roster.values().any(|&ts| now_ms - ts <= COEDIT_ACTIVE_MS) {
+                active.extend(roster.keys().cloned());
+            }
+        }
+        active
     }
 }
 
@@ -768,5 +988,268 @@ mod tests {
             resolve_action("shell/goto/mesh-map"),
             Some(Navigate::Surface(Surface::MeshView))
         ));
+    }
+
+    // ── the co-editing presence watch (EDITOR-COLLAB-3) ──
+
+    use mde_editor_egui::collab_session::Presence as CollabPresence;
+
+    /// Encode one share-session frame exactly as the editor's `CollabSession`
+    /// publishes it — the same [`CollabMessage`] type both ends use (§6).
+    fn coedit_body(peer: &str, kind: FrameKind) -> String {
+        serde_json::to_string(&CollabMessage {
+            session: "docs-1".into(),
+            from: peer.into(),
+            kind,
+        })
+        .expect("encode")
+    }
+
+    /// A presence frame from `peer` (no cursor/viewport — join-time shape).
+    fn presence_frame(peer: &str) -> String {
+        coedit_body(
+            peer,
+            FrameKind::Presence {
+                presence: CollabPresence {
+                    peer: peer.into(),
+                    name: peer.into(),
+                    cursor: None,
+                    viewport: None,
+                },
+            },
+        )
+    }
+
+    /// An incremental CRDT update frame from `peer` (a keystroke on the wire).
+    fn update_frame(peer: &str) -> String {
+        coedit_body(
+            peer,
+            FrameKind::Update {
+                update: vec![1, 2, 3],
+            },
+        )
+    }
+
+    /// A leave frame from `peer`.
+    fn leave_frame(peer: &str) -> String {
+        coedit_body(peer, FrameKind::Leave)
+    }
+
+    /// A watch with no Bus — the seam for feeding frames straight into `admit`,
+    /// mirroring the live `drain` → `admit` path (the `SelfTestWatch` idiom).
+    fn detached_watch() -> CoEditWatch {
+        CoEditWatch {
+            bus_root: None,
+            cursors: HashMap::new(),
+            sessions: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_session_frame_decodes_to_participation_or_leave() {
+        // Any decodable frame is participation activity from its sender; a
+        // Leave prunes; garbage decodes to nothing (never a fabricated peer).
+        assert_eq!(
+            coedit_frame(&presence_frame("ws-1")),
+            Some(("ws-1".into(), false))
+        );
+        assert_eq!(
+            coedit_frame(&update_frame("eagle")),
+            Some(("eagle".into(), false))
+        );
+        assert_eq!(
+            coedit_frame(&leave_frame("ws-1")),
+            Some(("ws-1".into(), true))
+        );
+        for bad in ["", "not json", "{}"] {
+            assert_eq!(coedit_frame(bad), None, "{bad:?} must not decode");
+        }
+        assert_eq!(
+            coedit_frame(&coedit_body("", FrameKind::Leave)),
+            None,
+            "an anonymous frame is dropped"
+        );
+    }
+
+    #[test]
+    fn a_pair_with_fresh_traffic_is_active_and_a_solo_or_silent_one_is_not() {
+        let now = 1_750_000_000_000_i64;
+        let mut watch = detached_watch();
+
+        // A solo session (a host sharing to nobody) is not CO-editing.
+        watch.admit("collab/session/a", &presence_frame("ws-1"), now - 1_000);
+        assert!(watch.active_peers(now).is_empty(), "solo ≠ co-editing");
+
+        // A second participant with fresh traffic lights BOTH sides up.
+        watch.admit("collab/session/a", &update_frame("lh-01"), now);
+        let active = watch.active_peers(now);
+        assert!(active.contains("ws-1"), "the quiet side badges too");
+        assert!(active.contains("lh-01"));
+
+        // No frame inside the activity window → the badge honestly ages out.
+        assert!(
+            watch.active_peers(now + COEDIT_ACTIVE_MS + 1).is_empty(),
+            "a silent session must not pin a stale badge"
+        );
+    }
+
+    #[test]
+    fn a_leave_dissolves_the_pair_and_an_emptied_session_is_dropped() {
+        let now = 1_750_000_000_000_i64;
+        let mut watch = detached_watch();
+        watch.admit("collab/session/b", &presence_frame("ws-1"), now);
+        watch.admit("collab/session/b", &presence_frame("ws-2"), now);
+        assert_eq!(watch.active_peers(now).len(), 2);
+
+        watch.admit("collab/session/b", &leave_frame("ws-2"), now);
+        assert!(
+            watch.active_peers(now).is_empty(),
+            "one peer left → the session is no longer co-editing"
+        );
+        watch.admit("collab/session/b", &leave_frame("ws-1"), now);
+        assert!(watch.sessions.is_empty(), "an emptied session is dropped");
+    }
+
+    #[test]
+    fn retention_drops_long_silent_sessions_from_memory() {
+        let now = 1_750_000_000_000_i64;
+        let mut watch = detached_watch();
+        watch.admit(
+            "collab/session/old",
+            &presence_frame("a"),
+            now - COEDIT_RETAIN_MS - 1,
+        );
+        watch.admit("collab/session/live", &presence_frame("b"), now);
+        watch.prune(now);
+        assert!(
+            !watch.sessions.contains_key("collab/session/old"),
+            "the memory bound: dead sessions don't accumulate"
+        );
+        assert!(watch.sessions.contains_key("collab/session/live"));
+    }
+
+    #[test]
+    fn the_watch_drains_a_real_persist_spool() {
+        // The live path over a REAL local Persist (a throwaway dir, not the
+        // mesh bus): frames written by one side surface as active co-editing,
+        // the per-topic cursor advances, and a Leave dissolves the pair.
+        use mde_bus::hooks::config::Priority;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("open persist");
+        let topic = format!("{COLLAB_TOPIC_PREFIX}live-doc");
+        for body in [presence_frame("ws-1"), update_frame("lh-01")] {
+            persist
+                .write(&topic, Priority::Default, None, Some(&body))
+                .expect("write frame");
+        }
+        // An unrelated lane on the same spool is never a co-edit signal.
+        persist
+            .write(
+                SELF_TEST_TOPIC,
+                Priority::Default,
+                None,
+                Some(&green_report()),
+            )
+            .expect("write unrelated");
+
+        let mut watch = CoEditWatch {
+            bus_root: Some(tmp.path().to_path_buf()),
+            cursors: HashMap::new(),
+            sessions: HashMap::new(),
+        };
+        let now = now_unix_ms();
+        watch.drain(now);
+        let active = watch.active_peers(now);
+        assert!(active.contains("ws-1") && active.contains("lh-01"));
+        assert_eq!(active.len(), 2, "the unrelated lane added nobody");
+
+        // Only NEW frames replay next drain (the cursor advanced): the Leave.
+        persist
+            .write(&topic, Priority::Default, None, Some(&leave_frame("lh-01")))
+            .expect("write leave");
+        let now = now_unix_ms();
+        watch.drain(now);
+        assert!(watch.active_peers(now).is_empty(), "the pair dissolved");
+    }
+
+    #[test]
+    fn the_map_overlays_coedit_badges_for_active_session_peers() {
+        // Driving a real headless frame through `show` exercises the co-edit
+        // overlay end-to-end over the same snapshot the role badges paint: the
+        // two on-map participants of an active session rasterize + paint the
+        // accent Editor badge; an off-map participant identity badges nothing.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let now = now_unix_ms();
+        let mut coedit = detached_watch();
+        coedit.admit("collab/session/pair", &presence_frame("ws-1"), now);
+        coedit.admit("collab/session/pair", &update_frame("lh-01"), now);
+        coedit.admit(
+            "collab/session/pair",
+            &presence_frame("laptop-elsewhere"),
+            now,
+        );
+        let mut mv = MeshViewState {
+            state: project(&snapshot()),
+            coedit,
+            ..Default::default()
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(480.0, 360.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                mv.show(ui);
+            });
+        });
+        assert!(
+            !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty(),
+            "the map + co-edit overlay produced no draw primitives"
+        );
+        assert!(
+            mv.badges
+                .textures
+                .contains_key(&(IconId::Editor, COEDIT_TINT)),
+            "the Editor glyph rasterized at the accent tint"
+        );
+        // 3 role badges (QBRAND-8) + exactly 1 co-edit badge texture — the
+        // off-map identity fabricated no node and no extra texture.
+        assert_eq!(mv.badges.textures.len(), 4);
+    }
+
+    #[test]
+    fn a_solo_session_paints_no_coedit_badge() {
+        // One participant on the map, nobody else in the session → the map
+        // stays honest: role badges only, no "co-editing" marker.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut coedit = detached_watch();
+        coedit.admit(
+            "collab/session/solo",
+            &presence_frame("ws-1"),
+            now_unix_ms(),
+        );
+        let mut mv = MeshViewState {
+            state: project(&snapshot()),
+            coedit,
+            ..Default::default()
+        };
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(480.0, 360.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                mv.show(ui);
+            });
+        });
+        assert!(
+            !mv.badges
+                .textures
+                .contains_key(&(IconId::Editor, COEDIT_TINT)),
+            "no co-edit badge for a solo session"
+        );
+        assert_eq!(mv.badges.textures.len(), 3, "role badges only");
     }
 }

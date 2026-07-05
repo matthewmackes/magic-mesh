@@ -24,9 +24,10 @@
 //!   sequence numbers).
 //! * **`Update`** — an incremental [`CollabDoc::take_updates`] payload: one
 //!   local edit fanned out to peers, merged with [`CollabDoc::apply_remote`].
-//! * **`Presence`** — a peer's display name + cursor/selection, so every editor
-//!   paints the others' carets (COLLAB-3 grows this into follow-mode + the
-//!   Mesh-Map presence).
+//! * **`Presence`** — a peer's display name + cursor/selection + visible
+//!   [`Viewport`], so every editor paints the others' carets and a follower can
+//!   track the leader's scroll (COLLAB-3; the `viewport` field is
+//!   `#[serde(default)]`, so COLLAB-2-era frames without it still decode).
 //! * **`Grant`** — the host granting/revoking a guest's [`Access`] (the
 //!   permission model below).
 //! * **`Leave`** — a peer dropping out (its presence is pruned).
@@ -45,6 +46,21 @@
 //! ops) would need the host to sit between peers rather than the shared-spool
 //! broadcast this unit uses; that relay is out of scope here and honestly noted
 //! rather than faked (§7).
+//!
+//! # Follow mode (COLLAB-3)
+//!
+//! [`CollabSession::follow`] pins a known peer as the **followed** collaborator:
+//! every later `Presence` frame from that peer surfaces on the poll as
+//! [`PollOutcome::follow`] — its cursor/selection + viewport — which the editor
+//! surface replays onto its local view ([`crate::follow::apply_follow`] drives
+//! the scroll/selection). The standard break idioms are enforced *here*, not
+//! left to the UI: any **local edit** ([`CollabSession::local_insert`] /
+//! [`CollabSession::local_remove`] — even one refused for read-only access)
+//! breaks follow, the surface reports scroll/click/key gestures through
+//! [`CollabSession::note_local_input`], and the followed peer **leaving** ends
+//! follow with an explicit [`PollOutcome::follow_ended`] edge so the UI clears
+//! its "Following …" affordance. The affordance itself is
+//! [`crate::follow::follow_banner`].
 //!
 //! # Why no daemon-side relay
 //!
@@ -240,7 +256,20 @@ impl CursorPos {
     }
 }
 
-/// A peer's presence: who they are and where their cursor is.
+/// A peer's **visible line span** (COLLAB-3 follow mode).
+///
+/// The 0-based buffer lines its editor viewport currently shows
+/// (`first_line..=last_line`, inclusive). Broadcast inside [`Presence`] so a
+/// follower can track the leader's *scroll*, not just its caret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Viewport {
+    /// The first (topmost) visible buffer line, 0-based.
+    pub first_line: usize,
+    /// The last (bottommost) visible buffer line, 0-based, inclusive.
+    pub last_line: usize,
+}
+
+/// A peer's presence: who they are, where their cursor is, and what they see.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Presence {
     /// The peer's stable identity (the same string fed to [`client_id_for`]).
@@ -250,6 +279,27 @@ pub struct Presence {
     /// The peer's caret/selection, or `None` when it hasn't reported one yet.
     #[serde(default)]
     pub cursor: Option<CursorPos>,
+    /// The peer's visible line span, or `None` when it hasn't reported one yet.
+    /// `#[serde(default)]` keeps COLLAB-2-era frames (no field on the wire)
+    /// decoding — wire-compatible both ways, no migration.
+    #[serde(default)]
+    pub viewport: Option<Viewport>,
+}
+
+/// What a follower learns about its followed peer from one poll (COLLAB-3).
+///
+/// The freshest cursor/selection + viewport that peer reported. The editor
+/// surface replays it onto the local view ([`crate::follow::apply_follow`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowUpdate {
+    /// The followed peer's identity.
+    pub peer: String,
+    /// The followed peer's display name (drives the "Following …" affordance).
+    pub name: String,
+    /// The followed peer's caret/selection, when reported.
+    pub cursor: Option<CursorPos>,
+    /// The followed peer's visible line span, when reported.
+    pub viewport: Option<Viewport>,
 }
 
 /// What the session knows about one remote peer: its latest [`Presence`] and the
@@ -531,6 +581,15 @@ pub struct PollOutcome {
     pub peers_changed: bool,
     /// The host changed **our** [`Access`] → refresh the edit guards / UI.
     pub access_changed: bool,
+    /// The followed peer reported fresh presence → drive the local view to track
+    /// it (COLLAB-3 follow mode). `None` when not following, or when the
+    /// followed peer was silent this poll.
+    pub follow: Option<FollowUpdate>,
+    /// Follow mode ended **remotely** this poll — the followed peer left the
+    /// session. The UI clears its "Following …" affordance on this edge.
+    /// (A *locally* broken follow — an edit or [`CollabSession::note_local_input`]
+    /// — is known synchronously and never raises this.)
+    pub follow_ended: bool,
 }
 
 /// A live mesh editing session over a [`CollabDoc`] and a [`CollabTransport`].
@@ -558,6 +617,10 @@ pub struct CollabSession {
     cursor: Option<String>,
     /// Our last-set caret/selection, broadcast by [`Self::publish_presence`].
     self_cursor: Option<CursorPos>,
+    /// Our last-set visible line span, broadcast by [`Self::publish_presence`].
+    self_viewport: Option<Viewport>,
+    /// The peer we are following (COLLAB-3), or `None` when not following.
+    following: Option<String>,
     /// Remote peers: presence + granted access, keyed by peer identity.
     peers: BTreeMap<String, RemotePeer>,
     /// Count of frames skipped (undecodable / wrong-session / failed merge) — an
@@ -597,6 +660,8 @@ impl CollabSession {
             doc,
             cursor: None,
             self_cursor: None,
+            self_viewport: None,
+            following: None,
             peers: BTreeMap::new(),
             dropped: 0,
         }
@@ -675,8 +740,11 @@ impl CollabSession {
     /// Mirror a local buffer **insert** into the shared doc (bridge contract rule
     /// 2 — same args as `Buffer::insert`). Returns `false` and does nothing for a
     /// read-only participant (the cooperative permission gate). The queued update
-    /// is broadcast on the next [`Self::flush`].
+    /// is broadcast on the next [`Self::flush`]. A local edit is local input, so
+    /// it breaks follow mode (even a refused read-only edit — the *gesture* is
+    /// what breaks follow, the standard idiom).
     pub fn local_insert(&mut self, char_idx: usize, text: &str) -> bool {
+        self.note_local_input();
         if !self.access.can_edit() {
             return false;
         }
@@ -686,8 +754,9 @@ impl CollabSession {
 
     /// Mirror a local buffer **remove** into the shared doc (bridge contract rule
     /// 2 — same args as `Buffer::remove`). Returns `false` and does nothing for a
-    /// read-only participant.
+    /// read-only participant. Breaks follow mode like [`Self::local_insert`].
     pub fn local_remove(&mut self, range: Range<usize>) -> bool {
+        self.note_local_input();
         if !self.access.can_edit() {
             return false;
         }
@@ -713,14 +782,57 @@ impl CollabSession {
         self.self_cursor = cursor;
     }
 
-    /// Broadcast this peer's current presence (name + cursor) to the session.
+    /// Set this peer's visible line span (broadcast by
+    /// [`Self::publish_presence`]) — what a follower of *this* peer tracks.
+    pub const fn set_viewport(&mut self, viewport: Option<Viewport>) {
+        self.self_viewport = viewport;
+    }
+
+    /// Broadcast this peer's current presence (name + cursor + viewport) to the
+    /// session.
     pub fn publish_presence(&self, transport: &dyn CollabTransport) {
         let presence = Presence {
             peer: self.me.clone(),
             name: self.name.clone(),
             cursor: self.self_cursor,
+            viewport: self.self_viewport,
         };
         self.publish(transport, &FrameKind::Presence { presence });
+    }
+
+    // ── follow mode (COLLAB-3) ──
+
+    /// Start **following** `peer`: its later `Presence` frames surface as
+    /// [`PollOutcome::follow`] for the local view to track. Returns `false`
+    /// (and follows nobody) when `peer` isn't in the roster — you can only
+    /// follow a collaborator you can see.
+    pub fn follow(&mut self, peer: &str) -> bool {
+        if self.peers.contains_key(peer) {
+            self.following = Some(peer.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Stop following (the explicit affordance click). Idempotent.
+    pub fn unfollow(&mut self) {
+        self.following = None;
+    }
+
+    /// The peer currently being followed, or `None`.
+    #[must_use]
+    pub fn following(&self) -> Option<&str> {
+        self.following.as_deref()
+    }
+
+    /// Report a **local input gesture** (scroll, click, caret key) — any local
+    /// input breaks follow mode, the standard idiom. Returns whether a follow
+    /// was actually broken (so the surface repaints its affordance exactly
+    /// once). Local *edits* break follow on their own via
+    /// [`Self::local_insert`] / [`Self::local_remove`].
+    pub fn note_local_input(&mut self) -> bool {
+        self.following.take().is_some()
     }
 
     /// **Grant** (or revoke) a peer's edit permission — host only. Records the
@@ -824,6 +936,17 @@ impl CollabSession {
                 Err(_) => self.dropped += 1,
             },
             FrameKind::Presence { presence } => {
+                // Follow mode: the followed peer's fresh presence drives the
+                // local view. Later frames in the same poll overwrite earlier
+                // ones — the follower lands on the freshest report.
+                if self.following.as_deref() == Some(msg.from.as_str()) {
+                    out.follow = Some(FollowUpdate {
+                        peer: presence.peer.clone(),
+                        name: presence.name.clone(),
+                        cursor: presence.cursor,
+                        viewport: presence.viewport,
+                    });
+                }
                 self.upsert_presence(presence.clone());
                 out.peers_changed = true;
             }
@@ -841,6 +964,12 @@ impl CollabSession {
             FrameKind::Leave => {
                 if self.peers.remove(&msg.from).is_some() {
                     out.peers_changed = true;
+                }
+                // The followed peer left → follow ends remotely; the UI clears
+                // its "Following …" affordance on this edge.
+                if self.following.as_deref() == Some(msg.from.as_str()) {
+                    self.following = None;
+                    out.follow_ended = true;
                 }
             }
         }
@@ -868,6 +997,7 @@ impl CollabSession {
                     peer: peer.to_string(),
                     name: peer.to_string(),
                     cursor: None,
+                    viewport: None,
                 },
                 access: Access::ReadWrite,
             });
@@ -894,6 +1024,7 @@ impl CollabSession {
                     peer: peer.to_string(),
                     name: peer.to_string(),
                     cursor: None,
+                    viewport: None,
                 },
                 access,
             });
@@ -904,7 +1035,7 @@ impl CollabSession {
 mod tests {
     use super::{
         Access, CollabError, CollabMessage, CollabSession, CollabTransport, CursorPos, FakeBus,
-        FrameKind, Presence, Role, SessionId, COLLAB_TOPIC_PREFIX,
+        FrameKind, Presence, Role, SessionId, Viewport, COLLAB_TOPIC_PREFIX,
     };
 
     fn sid(id: &str) -> SessionId {
@@ -1184,6 +1315,152 @@ mod tests {
         assert!(!host.peers().contains_key("guest"), "left peer pruned");
     }
 
+    // ── follow mode (COLLAB-3) ──
+
+    #[test]
+    fn presence_carries_the_viewport_and_collab2_frames_still_decode() {
+        let bus = FakeBus::new();
+        let mut host = CollabSession::host(sid("vp"), "host", "a\nb\nc\nd\n");
+        let mut guest = CollabSession::guest(sid("vp"), "guest");
+        guest.join(&bus);
+        host.poll(&bus);
+
+        // The guest reports what it sees; the host's roster reflects it.
+        guest.set_viewport(Some(Viewport {
+            first_line: 1,
+            last_line: 3,
+        }));
+        guest.publish_presence(&bus);
+        host.poll(&bus);
+        let seen = host.peers()["guest"]
+            .presence
+            .viewport
+            .expect("a reported viewport");
+        assert_eq!(seen.first_line, 1);
+        assert_eq!(seen.last_line, 3);
+
+        // Wire-compat lock: a COLLAB-2-era presence frame (no `viewport` field
+        // on the wire) still decodes — the field defaults to None, no
+        // migration, mixed-build sessions keep working.
+        let old_frame = r#"{"session":"vp","from":"legacy","kind":{"t":"presence","presence":{"peer":"legacy","name":"Old Build","cursor":{"anchor":2,"head":2}}}}"#;
+        let msg: CollabMessage = serde_json::from_str(old_frame).expect("COLLAB-2 frame decodes");
+        let FrameKind::Presence { presence } = msg.kind else {
+            unreachable!("a presence frame decodes to FrameKind::Presence")
+        };
+        assert_eq!(presence.cursor, Some(CursorPos::caret(2)));
+        assert_eq!(presence.viewport, None, "absent field defaults");
+    }
+
+    #[test]
+    fn follow_requires_a_known_peer() {
+        let bus = FakeBus::new();
+        let mut host = CollabSession::host(sid("f0"), "host", "x\n");
+        assert!(
+            !host.follow("stranger"),
+            "you can only follow a collaborator you can see"
+        );
+        assert_eq!(host.following(), None);
+
+        let mut guest = CollabSession::guest(sid("f0"), "guest");
+        guest.join(&bus);
+        host.poll(&bus);
+        assert!(host.follow("guest"), "a rostered peer is followable");
+        assert_eq!(host.following(), Some("guest"));
+        host.unfollow();
+        assert_eq!(host.following(), None);
+    }
+
+    #[test]
+    fn follow_surfaces_only_the_followed_peers_presence() {
+        let bus = FakeBus::new();
+        let mut host = CollabSession::host(sid("f1"), "host", "one\ntwo\nthree\n");
+        let mut g1 = CollabSession::guest(sid("f1"), "g1").with_name("Ada");
+        let mut g2 = CollabSession::guest(sid("f1"), "g2");
+        g1.join(&bus);
+        g2.join(&bus);
+        host.poll(&bus);
+
+        assert!(host.follow("g1"));
+
+        // Both guests report presence; only the followed one drives the view.
+        g1.set_cursor(Some(CursorPos { anchor: 1, head: 5 }));
+        g1.set_viewport(Some(Viewport {
+            first_line: 0,
+            last_line: 2,
+        }));
+        g1.publish_presence(&bus);
+        g2.set_cursor(Some(CursorPos::caret(9)));
+        g2.publish_presence(&bus);
+
+        let out = host.poll(&bus);
+        let follow = out.follow.expect("the followed peer's presence surfaced");
+        assert_eq!(follow.peer, "g1");
+        assert_eq!(follow.name, "Ada", "the display name drives the affordance");
+        assert_eq!(follow.cursor, Some(CursorPos { anchor: 1, head: 5 }));
+        assert_eq!(
+            follow.viewport,
+            Some(Viewport {
+                first_line: 0,
+                last_line: 2
+            })
+        );
+        assert!(!out.follow_ended);
+
+        // A quiet followed peer surfaces nothing next poll (no fabricated pos).
+        let out = host.poll(&bus);
+        assert_eq!(out.follow, None);
+    }
+
+    #[test]
+    fn any_local_input_breaks_follow() {
+        let bus = FakeBus::new();
+        let mut host = CollabSession::host(sid("f2"), "host", "text\n");
+        let mut guest = CollabSession::guest(sid("f2"), "guest");
+        guest.join(&bus);
+        host.poll(&bus);
+
+        // A scroll/click/key gesture breaks follow exactly once.
+        assert!(host.follow("guest"));
+        assert!(host.note_local_input(), "the gesture broke the follow");
+        assert_eq!(host.following(), None);
+        assert!(!host.note_local_input(), "already broken — no double edge");
+
+        // A local edit breaks follow on its own.
+        assert!(host.follow("guest"));
+        assert!(host.local_insert(0, "typed "));
+        assert_eq!(host.following(), None, "an edit is local input");
+
+        // Even a REFUSED read-only edit is a local gesture that breaks follow.
+        // (The host publishes presence so the guest can roster — and follow — it.)
+        host.publish_presence(&bus);
+        guest.poll(&bus);
+        assert!(guest.follow("host"));
+        assert!(host.grant("guest", Access::ReadOnly, &bus));
+        guest.poll(&bus);
+        assert!(guest.follow("host"), "still followable while read-only");
+        assert!(!guest.local_insert(0, "nope"), "RO edit refused");
+        assert_eq!(guest.following(), None, "the gesture still broke follow");
+    }
+
+    #[test]
+    fn the_followed_peer_leaving_ends_follow_with_an_edge() {
+        let bus = FakeBus::new();
+        let mut host = CollabSession::host(sid("f3"), "host", "x\n");
+        let mut guest = CollabSession::guest(sid("f3"), "guest");
+        guest.join(&bus);
+        host.poll(&bus);
+        assert!(host.follow("guest"));
+
+        guest.leave(&bus);
+        let out = host.poll(&bus);
+        assert!(out.follow_ended, "the remote end raises the edge");
+        assert_eq!(host.following(), None);
+
+        // The edge is one-shot: the next poll is quiet.
+        let out = host.poll(&bus);
+        assert!(!out.follow_ended);
+    }
+
     // ── permissions ──
 
     #[test]
@@ -1249,6 +1526,7 @@ mod tests {
                     peer: "guest".into(),
                     name: "g".into(),
                     cursor: None,
+                    viewport: None,
                 },
             },
         };
