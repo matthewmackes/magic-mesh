@@ -50,8 +50,23 @@
 //! root with a note (§7), never a fabricated hierarchy. A richer bridge/port tree
 //! would need a real `parent` field in the DEVMGR-1 inventory.
 //!
-//! The cross-fleet By-node flatten and export (DEVMGR-6) are still later units;
-//! their seams here (the disabled By-node mode) are left clean, not stubbed.
+//! **DEVMGR-6 adds export / print** — the MDM `Action → generate a report`
+//! equivalent: the Action menu grows **Export inventory (JSON)**, **Export report
+//! (Markdown)**, and **Copy report to clipboard**, each rendering the **currently
+//! selected host + active view mode** ([`render_json`] / [`render_report`]). JSON
+//! serde-serializes the live [`DeviceInventory`] (round-trips the §6 contract); the
+//! Markdown report mirrors the on-screen tree — the rich host header, then per
+//! category (By type) or per bus / controller (By connection) device rows carrying
+//! the same DEVMGR-3 problem-code + status text the drawer shows
+//! ([`device_status_display`]). No native file-save dialog seam exists on this DRM
+//! seat, so a write lands at a deterministic `$XDG_DATA_HOME`/`~/.local/share/mde/
+//! device-inventory/<host>-<view>.<ext>` path ([`export_dir`]) and confirms on the
+//! shared KIRON toast lane; a failed write raises an error toast, never a silent
+//! no-op (§7). A host with nothing published exports an honest "no inventory yet"
+//! report, never a fabricated tree.
+//!
+//! The cross-fleet By-node flatten is still a later unit; its seam here (the
+//! disabled By-node mode) is left clean, not stubbed.
 
 #![allow(
     clippy::redundant_pub_crate,
@@ -61,13 +76,15 @@
 )]
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mackes_mesh_types::device_inventory::{
     self, DeviceCategory, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
 };
 use mackes_mesh_types::peers::default_workgroup_root;
+use mde_bus::hooks::config::Priority;
+use mde_bus::persist::Persist;
 use mde_egui::egui::{self, Id, RichText};
 use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
 use mde_egui::{field, muted_note, status_dot, ChipTone, StatusChip, Style};
@@ -75,6 +92,7 @@ use mde_theme::brand;
 
 use crate::about;
 use crate::explorer::local_hostname;
+use crate::toast_bridge::TOAST_TOPIC;
 
 /// Re-read THIS node's published inventory this often (design #8 — the ~30 s
 /// auto-refresh; the producer republishes on its own cadence). A Scan forces an
@@ -131,6 +149,46 @@ impl ViewMode {
     /// renders as a disabled control until its unit lands (§7).
     const fn is_available(self) -> bool {
         matches!(self, Self::ByType | Self::ByConnection)
+    }
+
+    /// A filesystem-safe slug for the export filename (DEVMGR-6) — the view mode an
+    /// export was taken under, so a By-type and a By-connection report of the same
+    /// host never overwrite each other.
+    const fn slug(self) -> &'static str {
+        match self {
+            Self::ByType => "by-type",
+            Self::ByConnection => "by-connection",
+            Self::ByNode => "by-node",
+        }
+    }
+}
+
+/// The machine / human export formats (DEVMGR-6, design #23) — **JSON** (serde of
+/// the [`DeviceInventory`] §6 contract, round-tripping) and a human-readable
+/// **Markdown** report mirroring the on-screen tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    /// Machine JSON — the serialized [`DeviceInventory`].
+    Json,
+    /// A human-readable Markdown report ([`render_report`]).
+    Markdown,
+}
+
+impl ExportFormat {
+    /// The file extension for this format.
+    const fn ext(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Markdown => "md",
+        }
+    }
+
+    /// The human noun for the confirmation toast ("inventory JSON" / "report").
+    const fn noun(self) -> &'static str {
+        match self {
+            Self::Json => "inventory JSON",
+            Self::Markdown => "Markdown report",
+        }
     }
 }
 
@@ -191,6 +249,12 @@ enum MenuAction {
     ExpandAll,
     /// Collapse every category ([`DeviceManagerState::collapse_all`]).
     CollapseAll,
+    /// Export the selected host's inventory to a JSON file (DEVMGR-6).
+    ExportJson,
+    /// Export the selected host's inventory to a Markdown report file (DEVMGR-6).
+    ExportMarkdown,
+    /// Copy the Markdown report to the clipboard (DEVMGR-6).
+    CopyReport,
     /// Open the ⓘ license / credits / mesh-identity dialog.
     About,
 }
@@ -556,7 +620,7 @@ impl DeviceManagerState {
         // MENUBAR-ALL: the shared top bar replaces DEVMGR-2's bespoke Action/View/
         // Help chrome (About is the 14th / last surface onto the shared component).
         if let Some(action) = self.chrome_bar(ui) {
-            self.apply(action);
+            self.dispatch(action, ui.ctx());
         }
         ui.separator();
         ui.add_space(Style::SP_XS);
@@ -600,6 +664,20 @@ impl DeviceManagerState {
 
     /// Dispatch a shared-[`MenuBar`] activation to its real seam (§6/§7 — every
     /// menu item is the mouse twin of an existing DEVMGR seam, never new behaviour).
+    /// The clipboard export needs the [`egui::Context`] (the seat's copy channel);
+    /// the pure-state seams route through [`Self::apply`].
+    fn dispatch(&mut self, action: MenuAction, ctx: &egui::Context) {
+        match action {
+            MenuAction::ExportJson => self.export(ExportFormat::Json),
+            MenuAction::ExportMarkdown => self.export(ExportFormat::Markdown),
+            MenuAction::CopyReport => self.copy_report(ctx),
+            other => self.apply(other),
+        }
+    }
+
+    /// Dispatch a pure-state [`MenuBar`] activation to its real seam (§6/§7). The
+    /// file/clipboard export actions are handled in [`Self::dispatch`] (they need
+    /// the render context); everything else mutates state only.
     fn apply(&mut self, action: MenuAction) {
         match action {
             MenuAction::Scan => self.refresh(),
@@ -607,7 +685,53 @@ impl DeviceManagerState {
             MenuAction::ExpandAll => self.expand_all(),
             MenuAction::CollapseAll => self.collapse_all(),
             MenuAction::About => self.show_about = true,
+            // Handled in `dispatch` (they need the render context) — never reached.
+            MenuAction::ExportJson | MenuAction::ExportMarkdown | MenuAction::CopyReport => {}
         }
+    }
+
+    /// Export the **selected host + active view mode** to a real file (DEVMGR-6,
+    /// design #23 / §7): build the JSON or Markdown contents ([`render_json`] /
+    /// [`render_report`]) and write them under [`export_dir`] (no native save
+    /// dialog exists on this seat). A success confirms on the shared KIRON toast
+    /// lane with the written path; a failed write raises an error toast, never a
+    /// silent no-op. A host with nothing published writes an honest "no inventory"
+    /// report, not a fabricated one.
+    fn export(&self, format: ExportFormat) {
+        let host = self.export_host();
+        let inv = self.inventory.as_ref();
+        let contents = match format {
+            ExportFormat::Json => render_json(inv, host),
+            ExportFormat::Markdown => render_report(inv, host, self.view),
+        };
+        let filename = format!("{host}-{}.{}", self.view.slug(), format.ext());
+        match write_export(&export_dir(), &sanitize(&filename), &contents) {
+            Ok(path) => raise_toast(
+                "info",
+                &format!("Exported {} to {}", format.noun(), path.display()),
+            ),
+            Err(err) => raise_toast("warning", &format!("Export failed: {err}")),
+        }
+    }
+
+    /// Copy the selected host's Markdown report to the seat clipboard (DEVMGR-6,
+    /// design #23) — the no-filesystem path — and confirm on the toast lane. The
+    /// report reflects the active view mode, like the file export.
+    fn copy_report(&self, ctx: &egui::Context) {
+        ctx.copy_text(render_report(
+            self.inventory.as_ref(),
+            self.export_host(),
+            self.view,
+        ));
+        raise_toast("info", "Copied the device report to the clipboard");
+    }
+
+    /// The host an export is labelled for — the loaded inventory's own host when
+    /// one is present, else the selected rail host (an honest absent export).
+    fn export_host(&self) -> &str {
+        self.inventory
+            .as_ref()
+            .map_or(self.selected_host.as_str(), |inv| inv.host.as_str())
     }
 
     /// The compact brand title strip (#2/#24): the `◈` mark + product name +
@@ -669,18 +793,31 @@ impl DeviceManagerState {
         MenuBar::show(ui, &model)
     }
 
-    /// Build the three menus from live state (#19 → MENUBAR-ALL): **Action** (Scan),
+    /// Build the three menus from live state (#19 → MENUBAR-ALL): **Action** (Scan +
+    /// the DEVMGR-6 Export/Copy report seams — MDM's `Action → generate a report`),
     /// **View** (the three modes as radio items — only [`ViewMode::ByType`] enabled,
     /// the others honestly disabled §7 — plus Expand/Collapse-all, gated on a loaded
-    /// inventory), and **Help** (the ⓘ dialog). No invented File/Edit spine — About
-    /// has no file/clipboard seam (§7).
+    /// inventory), and **Help** (the ⓘ dialog). No invented File/Edit spine — the
+    /// export lives under Action, exactly as Device Manager's does (§7).
     fn build_menus(&self) -> Vec<Menu<MenuAction>> {
         let action = Menu::new(
             "Action",
-            vec![Entry::Item(Item::new(
-                MenuAction::Scan,
-                "Scan for hardware changes",
-            ))],
+            vec![
+                Entry::Item(Item::new(MenuAction::Scan, "Scan for hardware changes")),
+                Entry::Separator,
+                Entry::Item(Item::new(
+                    MenuAction::ExportJson,
+                    "Export inventory (JSON)\u{2026}",
+                )),
+                Entry::Item(Item::new(
+                    MenuAction::ExportMarkdown,
+                    "Export report (Markdown)\u{2026}",
+                )),
+                Entry::Item(Item::new(
+                    MenuAction::CopyReport,
+                    "Copy report to clipboard",
+                )),
+            ],
         );
 
         let has_tree = self.inventory.is_some();
@@ -1052,6 +1189,240 @@ fn humanize_uptime(secs: u64) -> String {
 fn format_mem_kb(kb: u64) -> String {
     let gib = kb as f64 / (1024.0 * 1024.0);
     format!("{gib:.1} GiB")
+}
+
+// ─────────────────── export / print the inventory (DEVMGR-6, #23) ───────────
+
+/// The directory a device export lands in (DEVMGR-6, §7). No native file-save
+/// dialog seam exists on this DRM seat, so the write is deterministic:
+/// `$XDG_DATA_HOME/mde/device-inventory/`, else `~/.local/share/mde/
+/// device-inventory/`, else a temp-dir fallback (an honest last resort so an
+/// export never silently no-ops on a seat with no HOME). Pure over the
+/// environment, so the resolution is unit-tested without touching disk.
+fn export_dir() -> PathBuf {
+    // A non-empty env dir joined with the `mde/device-inventory` tail, or `None`
+    // when the var is unset / empty (an empty XDG var reads as unset, per spec).
+    let from_env = |var: &str, tail: &[&str]| -> Option<PathBuf> {
+        let val = std::env::var_os(var)?;
+        if val.is_empty() {
+            return None;
+        }
+        let mut path = PathBuf::from(val);
+        path.extend(tail);
+        Some(path)
+    };
+    from_env("XDG_DATA_HOME", &["mde", "device-inventory"])
+        .or_else(|| from_env("HOME", &[".local", "share", "mde", "device-inventory"]))
+        .unwrap_or_else(|| std::env::temp_dir().join("mde-device-inventory"))
+}
+
+/// Neutralize any character that is not filename-safe (a path separator, a shell
+/// glyph) to `_`, keeping DNS-safe hostnames + the view slug intact — so a
+/// hostile / odd hostname can never escape [`export_dir`].
+fn sanitize(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Write an export atomically into `dir` (DEVMGR-6, §7 — a real write, not a
+/// stub): create the dir, write a temp sibling, then rename it over the target
+/// (the tmp-then-rename pattern the shell's other JSON writers use), so a reader
+/// never sees a half-written report. Returns the written path (for the
+/// confirmation toast) or the honest [`std::io::Error`] (for the error toast).
+fn write_export(dir: &Path, filename: &str, contents: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(filename);
+    let tmp = dir.join(format!(".{filename}.tmp"));
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(path)
+}
+
+/// Raise a confirmation / error chyron on the shell's ONE KIRON toast lane
+/// (`event/toast/show`) — the same lane the Chat / Explorer nav toasts use — so
+/// an export honestly reports its outcome (§7: a failed write is never a silent
+/// no-op). `severity` is the wire token (`info` on success, `warning` on a failed
+/// write). A seat with no reachable Bus simply prints nothing (the same graceful
+/// degrade the other toast raises take), the file having already been written.
+fn raise_toast(severity: &str, headline: &str) {
+    let Some(root) = mde_bus::client_data_dir() else {
+        return;
+    };
+    let Ok(persist) = Persist::open(root) else {
+        return;
+    };
+    let body = serde_json::json!({
+        "severity": severity,
+        "flag": "DEVICE",
+        "headline": headline,
+    })
+    .to_string();
+    let _ = persist.write(TOAST_TOPIC, Priority::Default, None, Some(body.as_str()));
+}
+
+/// Serialize the selected host's inventory to pretty JSON (DEVMGR-6, #23) — the
+/// machine export of the §6 [`DeviceInventory`] contract, which round-trips. A
+/// host with nothing published serializes an **honest** small object (`published:
+/// false` + a note), never a fabricated inventory tree (§7). Pure, so the export
+/// is unit-tested without a render.
+fn render_json(inv: Option<&DeviceInventory>, host: &str) -> String {
+    inv.map_or_else(
+        || {
+            serde_json::to_string_pretty(&serde_json::json!({
+                "host": host,
+                "published": false,
+                "note": "no device inventory has been published for this host yet",
+            }))
+        },
+        serde_json::to_string_pretty,
+    )
+    .unwrap_or_else(|_| format!("{{\"host\":\"{host}\",\"published\":false}}"))
+}
+
+/// Render the human-readable Markdown report (DEVMGR-6, #23), mirroring the
+/// on-screen tree: a host header + summary (the #20 header-card fields), then the
+/// device section grouped to reflect the **active view mode** — per category (By
+/// type) or per bus / controller (By connection). Every device row carries the
+/// same DEVMGR-3 problem-code + status text the drawer shows
+/// ([`device_status_display`]). A host with nothing published renders an honest
+/// "no inventory yet" report (§7). Pure, so the report is unit-tested.
+fn render_report(inv: Option<&DeviceInventory>, host: &str, view: ViewMode) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "# Device inventory \u{2014} {host}");
+    let _ = writeln!(out);
+    let Some(inv) = inv else {
+        let _ = writeln!(
+            out,
+            "No device inventory has been published for {host} yet."
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "The hardware probe republishes periodically \u{2014} or press Scan, \
+             then export again."
+        );
+        return out;
+    };
+    // Provenance — the view the report was taken under (a By-connection report
+    // groups differently from a By-type one, so the reader knows which).
+    let mode = if view == ViewMode::ByConnection {
+        "By connection"
+    } else {
+        "By type"
+    };
+    let _ = writeln!(
+        out,
+        "_Magic-Mesh Quasar device report \u{00B7} view: {mode}_"
+    );
+    let _ = writeln!(out);
+    // The rich host header (mirrors the on-screen header card, #20).
+    for (label, value) in header_lines(inv) {
+        let _ = writeln!(out, "- **{label}:** {value}");
+    }
+    let devices = inv.device_count();
+    let problems = inv.problem_count();
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "**{devices} {}**, {problems} with problems.",
+        plural(devices, "device", "devices")
+    );
+    let _ = writeln!(out);
+    // The device section, grouped to mirror the active view mode.
+    if view == ViewMode::ByConnection {
+        report_by_connection(&mut out, inv);
+    } else {
+        report_by_type(&mut out, inv);
+    }
+    out
+}
+
+/// The By-type device section of the report — one `##` heading per category (the
+/// on-screen tree order) with its device rows beneath, an amber `⚠ N` suffix on a
+/// category holding a problem device.
+fn report_by_type(out: &mut String, inv: &DeviceInventory) {
+    use std::fmt::Write as _;
+    if inv.categories.is_empty() {
+        let _ = writeln!(out, "_No devices were enumerated for this host._");
+        return;
+    }
+    for cat in &inv.categories {
+        let _ = writeln!(
+            out,
+            "## {}{}",
+            cat.label,
+            problem_suffix(cat.problem_count())
+        );
+        let _ = writeln!(out);
+        for dev in &cat.devices {
+            let _ = writeln!(out, "{}", report_device_line(dev));
+        }
+        let _ = writeln!(out);
+    }
+}
+
+/// The By-connection device section of the report — one `##` heading per bus /
+/// controller branch (reconstructed by [`build_connection_tree`]) with its
+/// devices beneath, plus any parentless device leaf directly under the host. When
+/// the host published no bus topology at all, an honest flat note precedes a flat
+/// device list (§7 — never a fabricated hierarchy), mirroring the on-screen view.
+fn report_by_connection(out: &mut String, inv: &DeviceInventory) {
+    use std::fmt::Write as _;
+    let tree = build_connection_tree(inv);
+    if tree.flat_no_bus {
+        let _ = writeln!(
+            out,
+            "_No bus / parent topology was published for this host \u{2014} devices \
+             are listed flat under the host._"
+        );
+        let _ = writeln!(out);
+    }
+    for node in &tree.roots {
+        if let Some(dev) = &node.device {
+            // A parentless device leaf directly under the host root (never dropped).
+            let _ = writeln!(out, "{}", report_device_line(dev));
+        } else {
+            let _ = writeln!(
+                out,
+                "## {}{}",
+                node.label,
+                problem_suffix(node.problem_count())
+            );
+            let _ = writeln!(out);
+            for child in &node.children {
+                if let Some(dev) = &child.device {
+                    let _ = writeln!(out, "{}", report_device_line(dev));
+                }
+            }
+            let _ = writeln!(out);
+        }
+    }
+}
+
+/// One device row in the report — the device name + the same DEVMGR-3 status text
+/// the General drawer tab shows ([`device_status_display`]), so a `Code 28`
+/// device reads identically in the report and the UI.
+fn report_device_line(dev: &DeviceRecord) -> String {
+    let (status, _) = device_status_display(dev);
+    format!("- {} \u{2014} {status}", dev.name)
+}
+
+/// The amber `(⚠ N)` heading suffix for a branch holding problem devices (empty
+/// for a clean branch) — the report twin of the tree's category badge.
+fn problem_suffix(problems: usize) -> String {
+    if problems > 0 {
+        format!(" (\u{26A0} {problems})")
+    } else {
+        String::new()
+    }
 }
 
 /// What a rendered [`category_header`] reports back for one frame: whether the
@@ -1760,10 +2131,11 @@ fn host_hover(entry: &HostEntry, now_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_connection_tree, build_rail, cpu_line, derive_bus, device_status_display,
+        build_connection_tree, build_rail, cpu_line, derive_bus, device_status_display, export_dir,
         format_mem_kb, header_lines, host_dot_tone, host_hover, humanize_ago, humanize_uptime,
-        problem_code, scanned_label, status_tone, DeviceManagerState, DeviceSelection, DrawerTab,
-        HostEntry, HostFreshness, MenuAction, ViewMode, STALE_AFTER,
+        problem_code, render_json, render_report, sanitize, scanned_label, status_tone,
+        write_export, DeviceManagerState, DeviceSelection, DrawerTab, HostEntry, HostFreshness,
+        MenuAction, ViewMode, STALE_AFTER,
     };
     use mackes_mesh_types::device_inventory::{
         self, category, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
@@ -2143,8 +2515,17 @@ mod tests {
         for banned in ["File", "Edit"] {
             assert!(!titles.contains(&banned), "{banned} shipped without a seam");
         }
-        // Action → Scan.
-        assert_eq!(item_ids(&menus[0]), vec![MenuAction::Scan]);
+        // Action → Scan + the DEVMGR-6 export/copy report seams (MDM's Action →
+        // generate a report). Separators drop out of `item_ids`.
+        assert_eq!(
+            item_ids(&menus[0]),
+            vec![
+                MenuAction::Scan,
+                MenuAction::ExportJson,
+                MenuAction::ExportMarkdown,
+                MenuAction::CopyReport,
+            ]
+        );
         // View → the three modes (By type live + checked, the others disabled
         // seams §7) + Expand/Collapse-all (enabled with a loaded inventory).
         let view = &menus[1];
@@ -2599,5 +2980,155 @@ mod tests {
         // No path, or an unrecognized one, resolves no bus (→ the host root).
         assert_eq!(derive_bus(None).map(|b| b.key), None);
         assert_eq!(derive_bus(Some("/proc/cpuinfo")).map(|b| b.key), None);
+    }
+
+    // ── DEVMGR-6: export / print the inventory (#23) ─────────────────────────
+
+    #[test]
+    fn export_json_round_trips_the_fixture_inventory() {
+        // The machine export serde-serializes the §6 contract and round-trips it
+        // byte-for-value — the JSON is the same DeviceInventory back.
+        let inv = DeviceInventory::fixture();
+        let json = render_json(Some(&inv), &inv.host);
+        let back: DeviceInventory = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, inv, "the JSON export round-trips the §6 contract");
+    }
+
+    #[test]
+    fn the_markdown_report_lists_the_host_every_device_and_the_problem_code() {
+        let inv = DeviceInventory::fixture();
+        let report = render_report(Some(&inv), &inv.host, ViewMode::ByType);
+        // The host header + the mirrored header-card summary fields (#20).
+        assert!(report.contains("laptop-mm"), "the host header: {report}");
+        assert!(report.contains("Fedora"), "the OS summary line: {report}");
+        // Every published device is named (the on-screen tree membership).
+        assert!(report.contains("Intel UHD Graphics 620"), "the GPU row");
+        assert!(report.contains("SD Host Controller"), "the PCI device row");
+        // The driverless device carries its MDM problem code + the honest Linux
+        // reason, identical to the drawer's General tab (DEVMGR-3 reuse).
+        assert!(report.contains("Code 28"), "the MDM problem code: {report}");
+        assert!(
+            report.contains("no kernel driver bound"),
+            "the honest reason"
+        );
+        // A healthy device reads the working-properly line, never a fake code.
+        assert!(report.contains("This device is working properly."));
+    }
+
+    #[test]
+    fn an_absent_host_exports_an_honest_empty_report_not_a_fabricated_one() {
+        // Markdown names the host + an honest "no inventory" note, no device rows.
+        let report = render_report(None, "ghost-node", ViewMode::ByType);
+        assert!(report.contains("ghost-node"), "the host is named: {report}");
+        assert!(
+            report.contains("No device inventory has been published"),
+            "the honest empty note: {report}"
+        );
+        assert!(
+            !report.contains("Code"),
+            "no fabricated device rows: {report}"
+        );
+        // JSON is an honest published:false object, never a faked inventory tree.
+        let json = render_json(None, "ghost-node");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["host"], serde_json::json!("ghost-node"));
+        assert_eq!(v["published"], serde_json::json!(false));
+        assert!(
+            v.get("categories").is_none(),
+            "an absent export fabricates no category tree: {json}"
+        );
+    }
+
+    #[test]
+    fn the_report_groups_to_reflect_the_active_view_mode() {
+        let inv = DeviceInventory::fixture();
+        // By type groups under the category labels (the default tree).
+        let by_type = render_report(Some(&inv), &inv.host, ViewMode::ByType);
+        assert!(by_type.contains("view: By type"), "the provenance line");
+        assert!(
+            by_type.contains("## Display adapters"),
+            "by-type groups under category headings: {by_type}"
+        );
+        assert!(
+            !by_type.contains("PCI bus 0000:00"),
+            "by-type does not bus-group: {by_type}"
+        );
+        // By connection re-groups the SAME devices under the bus / controller
+        // topology instead (DEVMGR-5 parity, reflected in the export).
+        let by_conn = render_report(Some(&inv), &inv.host, ViewMode::ByConnection);
+        assert!(
+            by_conn.contains("view: By connection"),
+            "the provenance line"
+        );
+        assert!(
+            by_conn.contains("## PCI bus 0000:00"),
+            "by-connection groups under bus headings: {by_conn}"
+        );
+        assert!(
+            !by_conn.contains("## Display adapters"),
+            "by-connection regroups off the function category: {by_conn}"
+        );
+        // The grouping changes, not the membership — every device is still listed.
+        for report in [&by_type, &by_conn] {
+            assert!(report.contains("Intel UHD Graphics 620"));
+            assert!(report.contains("SD Host Controller"));
+        }
+    }
+
+    #[test]
+    fn write_export_writes_a_real_file_that_round_trips() {
+        // §7 — a real write, not a stub: the bytes land on disk and read back to
+        // the same inventory, and the tmp-then-rename leaves no stray sibling.
+        let scratch = ScratchRoot::new("export-write");
+        let dir = scratch.path().join("exports");
+        let inv = DeviceInventory::fixture();
+        let json = render_json(Some(&inv), &inv.host);
+        let path = write_export(&dir, "laptop-mm-by-type.json", &json).expect("the export writes");
+        assert!(path.exists(), "the export file is on disk");
+        let read = std::fs::read_to_string(&path).unwrap();
+        let back: DeviceInventory = serde_json::from_str(&read).unwrap();
+        assert_eq!(back, inv, "the written file round-trips the inventory");
+        assert!(
+            !dir.join(".laptop-mm-by-type.json.tmp").exists(),
+            "the rename consumed the temp sibling"
+        );
+    }
+
+    #[test]
+    fn a_failed_export_write_is_an_honest_error_not_a_silent_no_op() {
+        // A target whose parent component is a regular file cannot be created —
+        // even as root — so write_export returns the honest io::Error rather than
+        // pretending success (§7 — the shell then raises an error toast).
+        let scratch = ScratchRoot::new("export-fail");
+        let blocker = scratch.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let result = write_export(&blocker.join("under-a-file"), "x.json", "{}");
+        assert!(
+            result.is_err(),
+            "writing under a file surfaces an error, never a silent no-op"
+        );
+    }
+
+    #[test]
+    fn the_export_dir_is_a_deterministic_user_data_location() {
+        // No native save dialog exists on this seat, so the path is deterministic:
+        // an absolute mde/device-inventory location under the user data home (or
+        // the temp-dir fallback), never the cwd or a fabricated path.
+        let dir = export_dir();
+        assert!(dir.is_absolute(), "an absolute path: {dir:?}");
+        assert!(
+            dir.ends_with("mde/device-inventory") || dir.ends_with("mde-device-inventory"),
+            "a stable data-home location: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_keeps_hostnames_and_neutralizes_path_separators() {
+        // A DNS-safe hostname + view slug + extension survives intact.
+        assert_eq!(sanitize("laptop-mm-by-type.json"), "laptop-mm-by-type.json");
+        // A path separator can never survive to escape the export dir.
+        let hostile = sanitize("../../etc/passwd");
+        assert!(!hostile.contains('/'), "no separator survives: {hostile}");
+        assert_eq!(sanitize("a b/c"), "a_b_c");
     }
 }
