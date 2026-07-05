@@ -54,6 +54,24 @@ pub struct TerminalSurface {
     tmux: TmuxChrome,
 }
 
+impl TerminalSurface {
+    /// CONSOLE-2 — the Console front door's entrypoint on the embedded surface:
+    /// open a **named tab running `argv`** (a typed program+args array, §9) and
+    /// focus it ([`TabbedTerminal::spawn_tab`]). The tab stays open when the
+    /// command exits, showing the exit status with a key/click-to-close prompt.
+    /// Root ops pass a [`crate::tabs::sudo_argv`]-wrapped argv — sudo prompts
+    /// for the password interactively in the tab's PTY (no caching tricks).
+    ///
+    /// Returns whether the tab opened: `false` when the surface has no live
+    /// terminal (the first PTY was refused — the panel already shows why) or
+    /// the spawn failed (the surface's error chip carries the OS refusal, §7).
+    pub fn spawn_tab(&mut self, name: impl Into<String>, argv: &[String]) -> bool {
+        self.term
+            .as_mut()
+            .is_ok_and(|term| term.spawn_tab(name, argv))
+    }
+}
+
 /// Build the production [`TerminalSurface`] over a real local login shell.
 ///
 /// The one construction path for a live terminal surface the shell owns, mirroring
@@ -188,6 +206,23 @@ mod tests {
         assert!(
             !prims.is_empty(),
             "the mounted terminal surface produced no draw primitives"
+        );
+    }
+
+    /// CONSOLE-2 — the shell-facing spawn-tab seam opens a named command tab on
+    /// the embedded surface (the entrypoint `mde-shell-egui`'s Console panel
+    /// will call), and a refused spawn reports `false` without a fake tab (§7).
+    #[test]
+    fn surface_spawn_tab_opens_a_named_command_tab() {
+        let mut surface = real_terminal();
+        let argv = vec!["/bin/echo".to_owned(), "console-seam".to_owned()];
+        assert!(
+            surface.spawn_tab("Ops", &argv),
+            "the live surface opens a command tab"
+        );
+        assert!(
+            !surface.spawn_tab("Ghost", &["/no/such/console-binary".to_owned()]),
+            "a missing binary reports false"
         );
     }
 }

@@ -605,6 +605,37 @@ impl TabbedTerminal {
         }
     }
 
+    /// CONSOLE-2 — the Console front door's terminal seam: open a **named tab
+    /// running a real command** and focus it. `argv` is a typed program+args
+    /// array (§9 — never a shell string) spawned on a fresh PTY; the tab's
+    /// single pane runs it interactively and **stays open when it exits**,
+    /// showing the exit status with a press-a-key/click-to-close prompt, so
+    /// one-shot output (a `dnf check-update`, a `df`) can actually be read.
+    ///
+    /// Root ops wrap their argv in [`sudo_argv`] first — sudo then prompts for
+    /// the password **interactively in this tab's PTY** (design lock #29): no
+    /// `-n`, no askpass helper, no credential caching tricks.
+    ///
+    /// Returns whether the tab opened; a refused spawn (missing binary, empty
+    /// argv) raises the honest error chip and adds no tab (§7 — never a fake
+    /// tab). Exported for the shell's Console panel to call (`mde-shell-egui`
+    /// drives it through [`crate::panel::TerminalSurface::spawn_tab`]).
+    pub fn spawn_tab(&mut self, name: impl Into<String>, argv: &[String]) -> bool {
+        let name = name.into();
+        match SplitTerminal::from_command(&name, argv, self.spawn_opts.clone()) {
+            Ok(term) => {
+                self.tabs.push(Tab { term, title: name });
+                self.active = self.tabs.len() - 1;
+                true
+            }
+            Err(err) => {
+                let what = argv.first().map_or("a command", String::as_str);
+                self.error = Some((format!("could not run {what}: {err}"), Instant::now()));
+                false
+            }
+        }
+    }
+
     /// Close tab `i`: its split terminal drops (every pane SIGHUP'd + reaped),
     /// and the active index falls to a neighbouring tab.
     pub fn close_tab(&mut self, i: usize) {
@@ -1014,6 +1045,24 @@ impl TabbedTerminal {
             }
         }
     }
+}
+
+/// CONSOLE-2 — the documented **sudo path** for a root op (design lock #29):
+/// wrap a command's argv as `sudo -- <argv>`, a typed array end to end (§9).
+///
+/// sudo prompts for the password **interactively in the tab's PTY** — the pane
+/// is a real terminal, so the prompt renders and the typed password flows to
+/// sudo with echo off, exactly as on a console. Deliberately absent: `-n`
+/// (non-interactive would just fail), an askpass helper, stdin piping, or any
+/// credential caching trick — sudo's own timestamp policy is the only cache.
+/// The `--` terminator keeps the wrapped program from parsing as sudo options.
+#[must_use]
+pub fn sudo_argv(argv: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(argv.len() + 2);
+    out.push("sudo".to_owned());
+    out.push("--".to_owned());
+    out.extend(argv.iter().cloned());
+    out
 }
 
 /// Where an index lands after the tab at `from` is removed and re-inserted at
@@ -1590,5 +1639,88 @@ mod tests {
         // oak's topic slot — the reconnect request, really constructed (§7).
         assert_eq!(bus.verb_count("open"), 1);
         assert_eq!(bus.published()[0].peer, "oak");
+    }
+
+    // ── CONSOLE-2: the spawn-tab seam (named command tabs + the sudo path) ──
+
+    fn owned(argv: &[&str]) -> Vec<String> {
+        argv.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn sudo_argv_wraps_the_command_for_an_interactive_pty_prompt() {
+        let argv = owned(&["systemctl", "restart", "nebula"]);
+        assert_eq!(
+            sudo_argv(&argv),
+            owned(&["sudo", "--", "systemctl", "restart", "nebula"]),
+            "sudo + the option terminator + the argv, verbatim"
+        );
+        // No caching tricks anywhere on the path: no non-interactive flag, no
+        // askpass — the password prompt happens in the tab's PTY (lock #29).
+        assert!(!sudo_argv(&argv)
+            .iter()
+            .any(|a| a == "-n" || a.to_lowercase().contains("askpass")));
+        // Composes with spawn_tab: the wrapped argv is what a root entry runs.
+        assert_eq!(sudo_argv(&owned(&["dnf", "upgrade"]))[0], "sudo");
+    }
+
+    #[test]
+    fn spawn_tab_opens_a_named_focused_tab_running_the_command() {
+        let ctx = Context::default();
+        Style::install(&ctx);
+        let mut term = tabs();
+        assert!(
+            term.spawn_tab("Disk Usage", &owned(&["/bin/echo", "console-mark"])),
+            "a real command spawns"
+        );
+        // A second tab opened, focused, NAMED — not an ordinal.
+        assert_eq!(term.tab_count(), 2);
+        assert_eq!(term.active_index(), 1);
+        assert_eq!(term.tab_title(1), Some("Disk Usage"));
+        assert_eq!(term.tab(1).expect("command tab").session_count(), 1);
+
+        // The command exits → the tab is HELD open with the exit prompt…
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !term.tab(1).expect("command tab").focused_stream_ended() {
+            assert!(Instant::now() < deadline, "echo never exited");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        settle(&ctx, &mut term, 3);
+        assert_eq!(
+            term.tab_count(),
+            2,
+            "the exited command tab stays open (the prompt is up)"
+        );
+
+        // …until a key acknowledges it — then the tab closes (frame 1 lands
+        // focus on the prompt, frame 2's key acks, frame 3 reaps the tab).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while term.tab_count() > 1 {
+            assert!(Instant::now() < deadline, "the ack never closed the tab");
+            frame(
+                &ctx,
+                &mut term,
+                vec![key_event(Key::Enter, Modifiers::NONE)],
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert_eq!(term.tab_title(0), Some("1"), "the plain shell tab remains");
+    }
+
+    #[test]
+    fn spawn_tab_failure_raises_the_chip_and_adds_no_tab() {
+        let mut term = tabs();
+        assert!(
+            !term.spawn_tab("Ghost", &owned(&["/no/such/console-binary"])),
+            "a missing binary must not open a tab"
+        );
+        assert_eq!(term.tab_count(), 1, "no fake tab (§7)");
+        assert!(
+            term.error.is_some(),
+            "the honest error chip carries the OS refusal"
+        );
+        // An empty argv is refused the same way.
+        assert!(!term.spawn_tab("Empty", &[]));
+        assert_eq!(term.tab_count(), 1);
     }
 }

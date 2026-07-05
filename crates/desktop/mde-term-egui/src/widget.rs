@@ -46,7 +46,7 @@ use crate::menu::{BusChatClient, ChatBus, CommandRunner, ContextMenu, OsCommandR
 use crate::mouse::{encode_sgr, MouseButton, MouseEvent};
 use crate::notify::{BusNotifyClient, NoticeLevel, NotifyBus, TermNotice};
 use crate::palette::{self, Palette};
-use crate::pty::LocalPty;
+use crate::pty::{ChildExit, LocalPty};
 use crate::remote::RemotePty;
 use crate::screen::{Cell, Screen};
 use crate::search::Search;
@@ -262,6 +262,13 @@ pub struct TerminalWidget {
     /// split multiplexer drains it ([`Self::take_new_terminal_here`]) and splits
     /// the pane inheriting its cwd (TERM-15 reuses the TERM-4/5 spawn).
     new_terminal_here: bool,
+    /// CONSOLE-2 — the pane **stays open when its child exits** (a command tab),
+    /// showing the exit-status prompt until a key/click acknowledges it. Off
+    /// for plain shells, whose exit closes the pane as ever (TERM-4).
+    hold_on_exit: bool,
+    /// CONSOLE-2 — the user acknowledged the exit prompt (a key press or a
+    /// click); the pane now reaps like any ended shell.
+    exit_ack: bool,
 }
 
 /// The item a TERM-15 context-menu click selected, recorded inside the menu
@@ -306,6 +313,18 @@ impl TerminalWidget {
         Self::over(Session::Tmux(io)).with_title_fallback(fallback)
     }
 
+    /// CONSOLE-2 — wrap a spawned **command** ([`LocalPty::spawn_argv`]) as a
+    /// held pane: it runs interactively like any shell pane (sudo's password
+    /// prompt lands right here in the PTY), and on exit it **stays open**,
+    /// showing the exit status with a press-a-key/click-to-close prompt so
+    /// one-shot output can actually be read. `name` seeds the pane title.
+    #[must_use]
+    pub fn new_command(pty: LocalPty, name: impl Into<String>) -> Self {
+        let mut widget = Self::over(Session::Local(pty)).with_title_fallback(name);
+        widget.hold_on_exit = true;
+        widget
+    }
+
     /// Wrap either backing behind the shared render/input path.
     #[must_use]
     fn over(session: Session) -> Self {
@@ -335,6 +354,8 @@ impl TerminalWidget {
             chat_bus: Arc::new(BusChatClient::from_env()),
             runner: Arc::new(OsCommandRunner),
             new_terminal_here: false,
+            hold_on_exit: false,
+            exit_ack: false,
         }
     }
 
@@ -550,9 +571,27 @@ impl TerminalWidget {
 
     /// Whether the pane should reap (close) — a local child exit, or a remote
     /// clean shell exit (a remote failure lingers). The split multiplexer's
-    /// close-on-exit (TERM-4) reads this.
+    /// close-on-exit (TERM-4) reads this. A CONSOLE-2 **held** command pane
+    /// deliberately reads `false` while its exit prompt is up — it reaps only
+    /// once the prompt is acknowledged (a key press or a click).
     #[must_use]
     pub fn is_output_closed(&self) -> bool {
+        self.session.is_output_closed() && !self.exit_prompt_active()
+    }
+
+    /// CONSOLE-2 — whether the stays-open-on-exit prompt is up: a held command
+    /// pane whose child has exited and whose prompt is not yet acknowledged.
+    #[must_use]
+    pub fn exit_prompt_active(&self) -> bool {
+        self.hold_on_exit && !self.exit_ack && self.session.is_output_closed()
+    }
+
+    /// Test-only: the RAW backing stream truth (ignoring the CONSOLE-2 hold
+    /// gate) — lets the tab/split tests wait for a command's exit before
+    /// asserting the held prompt.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn stream_ended(&self) -> bool {
         self.session.is_output_closed()
     }
 
@@ -687,7 +726,17 @@ impl TerminalWidget {
 
         // The backing's render chrome: liveness (cursor + repaint), the node
         // marker (remote), and the honest status note (§7).
-        let render = self.session.render_state();
+        let mut render = self.session.render_state();
+        if self.exit_prompt_active() {
+            // CONSOLE-2: the held pane's exit prompt replaces the plain
+            // "session ended" note — the real exit status + how to close. Keep
+            // frames coming briefly so the status (harvested on the reader
+            // thread a beat after EOF) lands on screen.
+            render.note = Some(exit_note(
+                self.session.local().and_then(LocalPty::exit_status),
+            ));
+            ui.ctx().request_repaint_after(LIVE_REPAINT);
+        }
         let live = render.live;
         let cursor = self.cursor_paint(&response, ui.input(|i| i.time), live);
         let search_hits = self.search_hits(first_abs, screen.rows());
@@ -900,6 +949,38 @@ impl TerminalWidget {
         history: usize,
         mouse_report: bool,
     ) {
+        // CONSOLE-2: while the held pane's exit prompt is up, the input path
+        // becomes the close acknowledgement — a click or any key press closes
+        // it. The wheel still pages the scrollback, so the command's output can
+        // be reviewed before closing; nothing is written to the dead PTY.
+        if self.exit_prompt_active() {
+            if response.clicked() {
+                self.exit_ack = true;
+            }
+            // Keep the keyboard here (the ended session no longer grabs it
+            // below), so "press any key" actually lands on this pane.
+            if ui.memory(|m| m.focused().is_none()) {
+                response.request_focus();
+            }
+            let events = ui.input(|i| i.events.clone());
+            for event in events {
+                match event {
+                    Event::MouseWheel { unit, delta, .. } => {
+                        if response.hovered() {
+                            self.wheel(unit, delta.y, cell.y, rows, history);
+                        }
+                    }
+                    Event::Text(_) | Event::Key { pressed: true, .. } => {
+                        if response.has_focus() {
+                            self.exit_ack = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+
         if response.clicked() || response.drag_started() {
             response.request_focus();
         }
@@ -1953,6 +2034,27 @@ fn paint_cursor(painter: &egui::Painter, origin: Pos2, screen: &Screen, spec: &P
     }
 }
 
+/// CONSOLE-2 — the held pane's exit prompt: the harvested status + how to
+/// close, toned honestly (OK for a clean 0, DANGER for a failure, dim while
+/// the status is unknown/still landing). Pure, so the wording + tone are
+/// unit-tested headlessly.
+fn exit_note(status: Option<ChildExit>) -> (String, egui::Color32) {
+    match status {
+        Some(ChildExit::Code(0)) => (
+            "exited (status 0) \u{2014} press a key or click to close".to_owned(),
+            Style::OK,
+        ),
+        Some(ChildExit::Code(code)) => (
+            format!("exited (status {code}) \u{2014} press a key or click to close"),
+            Style::DANGER,
+        ),
+        Some(ChildExit::Unknown) | None => (
+            "exited \u{2014} press a key or click to close".to_owned(),
+            Style::TEXT_DIM,
+        ),
+    }
+}
+
 /// A small status chip: SURFACE plate, hairline border, dimmed label.
 /// Crate-shared: the split surface (TERM-4) paints its zoom/error chips
 /// through the same primitive, so all terminal chrome chips match.
@@ -2721,5 +2823,82 @@ mod tests {
         w.new_terminal_here = true;
         assert!(w.take_new_terminal_here());
         assert!(!w.take_new_terminal_here());
+    }
+
+    // ── CONSOLE-2: the held command pane + its exit prompt ──────────────────
+
+    #[test]
+    fn exit_note_words_and_tones_the_status_honestly() {
+        let (ok, tone) = exit_note(Some(ChildExit::Code(0)));
+        assert!(ok.contains("status 0"), "clean exit shows its code: {ok}");
+        assert_eq!(tone, Style::OK);
+        let (bad, tone) = exit_note(Some(ChildExit::Code(7)));
+        assert!(bad.contains("status 7"), "failure shows its code: {bad}");
+        assert_eq!(tone, Style::DANGER);
+        let (pending, tone) = exit_note(None);
+        assert!(pending.contains("press a key"), "{pending}");
+        assert_eq!(tone, Style::TEXT_DIM);
+        assert_eq!(exit_note(Some(ChildExit::Unknown)).1, Style::TEXT_DIM);
+    }
+
+    #[test]
+    fn a_held_command_pane_stays_open_until_a_key_acknowledges_the_prompt() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let pty = LocalPty::spawn_argv(
+            &["/bin/echo".to_owned(), "held-mark".to_owned()],
+            SpawnOptions::default(),
+        )
+        .expect("spawn /bin/echo");
+        let mut w = TerminalWidget::new_command(pty, "Echo");
+
+        let frame = |w: &mut TerminalWidget, events: Vec<Event>| {
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_max(pos2(0.0, 0.0), pos2(800.0, 480.0))),
+                events,
+                ..RawInput::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = w.show(ui);
+                });
+            });
+        };
+
+        // Wait for the command to finish (real PTY timing, --test-threads=1).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !w.stream_ended() {
+            assert!(std::time::Instant::now() < deadline, "echo never exited");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        // The stream ended, but the held pane must NOT reap — the prompt is up
+        // (the first frame also hands it the keyboard).
+        frame(&mut w, Vec::new());
+        assert!(w.exit_prompt_active(), "the exit prompt is up");
+        assert!(!w.is_output_closed(), "held: the reap gate stays closed");
+        // The command's output is still on the grid, readable under the prompt.
+        let text = w.with_terminal(|t| {
+            let full = t.full();
+            (0..full.rows())
+                .map(|r| full.line_text(r))
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+        assert!(text.contains("held-mark"), "output kept on screen: {text}");
+
+        // Any key acknowledges the prompt → the pane now reaps.
+        frame(
+            &mut w,
+            vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        assert!(!w.exit_prompt_active(), "the key acknowledged the prompt");
+        assert!(w.is_output_closed(), "acknowledged: the pane reaps");
     }
 }

@@ -139,6 +139,16 @@
 //!   search / appearance / presets / remote roster / bell / keymap), with its
 //!   live shortcut beside it and context-gated items honestly greyed (§7). The
 //!   embed mounts it above the tab bar; a future tmux menu (TMUX-FC) slots in.
+//!
+//! - **CONSOLE-2** — the Console front door's terminal seam: the shell's Start
+//!   Menu launches operational entries as **named command tabs** here.
+//!   [`TabbedTerminal::spawn_tab`] (surfaced on the embed as
+//!   [`panel::TerminalSurface::spawn_tab`]) opens a named tab running a typed
+//!   argv on a fresh PTY ([`pty::LocalPty::spawn_argv`], §9 — never a shell
+//!   string); the pane **stays open on exit** with the harvested exit status
+//!   ([`pty::ChildExit`]) and a press-a-key/click-to-close prompt. Root ops
+//!   wrap their argv in [`tabs::sudo_argv`] — sudo prompts interactively in
+//!   the tab's PTY (design lock #29, no caching tricks).
 
 pub mod appearance;
 pub mod bell;
@@ -187,7 +197,7 @@ pub use palette::Palette;
 pub use panel::{real_terminal, terminal_panel, terminal_pump, TerminalSurface};
 pub use picker::{RemotePicker, RemoteTarget};
 pub use presets::Preset;
-pub use pty::{LocalPty, SpawnOptions};
+pub use pty::{ChildExit, LocalPty, SpawnOptions};
 pub use remote::{BusPtyClient, PtyBus, RemotePty, RemoteStatus};
 pub use roster::{BusRoster, PeerEntry, Presence, RosterClient, RosterSnapshot};
 pub use screen::{Cell, CellAttrs, CellColor, CursorPos, Screen};
@@ -200,7 +210,7 @@ pub use smart::{
 pub use splits::{
     consume_commands, Broadcast, Command, NavDir, Pane, SessionId, SplitDir, SplitTerminal,
 };
-pub use tabs::{consume_tab_commands, RemoteHub, TabCommand, TabbedTerminal};
+pub use tabs::{consume_tab_commands, sudo_argv, RemoteHub, TabCommand, TabbedTerminal};
 pub use title::PaneTitle;
 pub use tmux::{
     commands as tmux_commands, parse_layout, parse_pane_titles, parse_session_list,

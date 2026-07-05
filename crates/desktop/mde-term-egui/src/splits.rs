@@ -827,6 +827,41 @@ impl SplitTerminal {
         this
     }
 
+    /// CONSOLE-2 — open the multiplexer with a **command** pane as its single
+    /// leaf: `argv` spawned as a typed program+args array on a fresh PTY
+    /// ([`LocalPty::spawn_argv`], §9 — never a shell string), the pane titled
+    /// `name` and **held open on exit** with the exit-status prompt
+    /// ([`TerminalWidget::new_command`]) so one-shot output can be read before
+    /// a key/click closes it. Root ops arrive already `sudo`-wrapped
+    /// ([`crate::tabs::sudo_argv`]) — sudo prompts interactively in this pane's
+    /// PTY. Splits within the tab reuse `spawn_opts` for plain shells.
+    ///
+    /// # Errors
+    /// The spawn failure — whatever the OS refused (a missing binary is
+    /// `NotFound`); the caller surfaces it honestly (§7, never a fake pane).
+    pub fn from_command(name: &str, argv: &[String], spawn_opts: SpawnOptions) -> io::Result<Self> {
+        let mut this = Self::bare(spawn_opts);
+        let pty = LocalPty::spawn_argv(argv, this.spawn_opts.clone())?;
+        let id = SessionId(this.next_id);
+        this.next_id += 1;
+        this.sessions
+            .insert(id, TerminalWidget::new_command(pty, name));
+        this.tree = Some(Pane::leaf(id));
+        this.focused = id;
+        Ok(this)
+    }
+
+    /// Test-only: whether the focused pane's backing stream has ended — the RAW
+    /// truth, ignoring the CONSOLE-2 hold gate — so the tab tests can wait for
+    /// a command's exit before asserting the held prompt.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn focused_stream_ended(&self) -> bool {
+        self.sessions
+            .get(&self.focused)
+            .is_some_and(TerminalWidget::stream_ended)
+    }
+
     /// A registry/tree-less shell sharing the common field defaults.
     fn bare(spawn_opts: SpawnOptions) -> Self {
         Self {

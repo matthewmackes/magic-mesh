@@ -27,10 +27,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use std::{env, io, thread};
 
 use alacritty_terminal::event::{OnResize, WindowSize};
 use alacritty_terminal::tty;
+use alacritty_terminal::tty::{ChildEvent, EventedPty};
 
 use crate::engine::{Terminal, DEFAULT_SCROLLBACK};
 
@@ -40,6 +42,25 @@ const FALLBACK_SHELL: &str = "/bin/sh";
 /// Read chunk size for the PTY→engine pump. One kernel PTY buffer is ~8 KiB,
 /// so this drains a full buffer per `read` under heavy output.
 const READ_CHUNK: usize = 8192;
+
+/// How long the command-path reader waits for the child's exit status after
+/// the output stream ends before degrading to [`ChildExit::Unknown`] — a child
+/// that lingers past master EOF (a daemonizing grandchild holding nothing)
+/// must never wedge the reader thread (§7 honest degrade, never a hang).
+const EXIT_STATUS_WAIT: Duration = Duration::from_secs(5);
+
+/// Poll step for [`collect_child_exit`]'s bounded SIGCHLD wait.
+const EXIT_STATUS_POLL: Duration = Duration::from_millis(10);
+
+/// How a command child ended — the CONSOLE-2 stays-open-on-exit prompt's datum.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChildExit {
+    /// The process exited with this status code.
+    Code(i32),
+    /// The status could not be read: the child was signal-terminated (no code),
+    /// or the bounded reap wait expired.
+    Unknown,
+}
 
 /// How a [`LocalPty`] session is spawned.
 ///
@@ -124,6 +145,25 @@ pub struct LocalPty {
     writer: Option<JoinHandle<()>>,
     output_closed: Arc<AtomicBool>,
     child_pid: u32,
+    /// The child's exit status, harvested by the reader pump after stream end
+    /// on the [`Self::spawn_argv`] path (`None` until then, and always `None`
+    /// on the login-shell path, which never collects one).
+    exit: Arc<Mutex<Option<ChildExit>>>,
+}
+
+/// The resolved program + argv a [`LocalPty`] session runs — the private shape
+/// both public spawn paths reduce to before the shared PTY setup.
+struct SpawnPlan {
+    /// The program to execute.
+    program: String,
+    /// Its arguments (a typed array, §9 — never a shell string).
+    args: Vec<String>,
+    /// Set `$SHELL` to this in the child (the login-shell path mirrors the
+    /// resolved shell, as a login(1) would); `None` inherits the caller's.
+    shell_var: Option<String>,
+    /// Harvest the child's exit status after the output stream ends (the
+    /// CONSOLE-2 command path; the login path leaves it uncollected).
+    collect_exit: bool,
 }
 
 impl LocalPty {
@@ -134,25 +174,61 @@ impl LocalPty {
     /// Anything the OS refuses: `openpty` failure, an unresolvable user, a
     /// missing shell binary, or fd duplication for the pump threads.
     pub fn spawn(opts: SpawnOptions) -> io::Result<Self> {
+        let (program, args) =
+            login_shell_argv(resolve_shell(opts.shell.clone(), env::var("SHELL").ok()));
+        let plan = SpawnPlan {
+            shell_var: Some(program.clone()),
+            program,
+            args,
+            collect_exit: false,
+        };
+        Self::spawn_with(&plan, opts)
+    }
+
+    /// CONSOLE-2 — spawn a **command** (not a login shell) on a fresh PTY: the
+    /// typed `argv` array is `program + args` verbatim (§9 — no login flag, no
+    /// shell interpolation, sudo prompts interactively right in this PTY). The
+    /// reader pump harvests the child's exit status at stream end
+    /// ([`Self::exit_status`]) so the stays-open-on-exit prompt can show it.
+    /// `opts` contributes the grid, scrollback, cwd and extra env; its `shell`
+    /// field is ignored (the program comes from `argv`).
+    ///
+    /// # Errors
+    /// An empty `argv` (`InvalidInput`), or whatever the OS refuses — a missing
+    /// binary is `NotFound`, surfaced honestly to the caller (§7).
+    pub fn spawn_argv(argv: &[String], opts: SpawnOptions) -> io::Result<Self> {
+        let (program, rest) = argv
+            .split_first()
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "spawn_argv needs a program"))?;
+        let plan = SpawnPlan {
+            program: program.clone(),
+            args: rest.to_vec(),
+            shell_var: None,
+            collect_exit: true,
+        };
+        Self::spawn_with(&plan, opts)
+    }
+
+    /// The shared spawn body behind [`Self::spawn`] / [`Self::spawn_argv`].
+    fn spawn_with(plan: &SpawnPlan, opts: SpawnOptions) -> io::Result<Self> {
         let cols = opts.cols.max(1);
         let rows = opts.rows.max(1);
-
-        let (program, args) = login_shell_argv(resolve_shell(opts.shell, env::var("SHELL").ok()));
 
         // The child's terminal identity, set per-session (never via the
         // process-global `tty::setup_env`, which would mutate the whole
         // surface's env): the engine is alacritty's, whose escape support is
         // xterm-256color-compatible, and truecolor is a design lock (Q20).
-        // `SHELL` mirrors the resolved program, as a login(1) would set it.
         let mut child_env = vec![
             ("TERM".to_owned(), "xterm-256color".to_owned()),
             ("COLORTERM".to_owned(), "truecolor".to_owned()),
-            ("SHELL".to_owned(), program.clone()),
         ];
+        if let Some(shell) = &plan.shell_var {
+            child_env.push(("SHELL".to_owned(), shell.clone()));
+        }
         child_env.extend(opts.env);
 
         let config = tty::Options {
-            shell: Some(tty::Shell::new(program, args)),
+            shell: Some(tty::Shell::new(plan.program.clone(), plan.args.clone())),
             working_directory: opts.cwd,
             hold: false,
             env: child_env.into_iter().collect(),
@@ -192,6 +268,8 @@ impl LocalPty {
         let output_closed = Arc::new(AtomicBool::new(false));
         let (tx, input_rx) = mpsc::channel::<Vec<u8>>();
         let input_tx = Arc::new(Mutex::new(Some(tx)));
+        let exit = Arc::new(Mutex::new(None));
+        let collect_exit = plan.collect_exit;
 
         let reader = thread::Builder::new()
             .name("mde-term-pty-read".into())
@@ -200,6 +278,7 @@ impl LocalPty {
                 let pty = Arc::clone(&pty);
                 let input_tx = Arc::clone(&input_tx);
                 let output_closed = Arc::clone(&output_closed);
+                let exit = Arc::clone(&exit);
                 move || {
                     pump_output(reader_file, &terminal, &output_closed);
                     // The master hit EOF/EIO — the child is gone (its slave fds
@@ -207,7 +286,17 @@ impl LocalPty {
                     // promptly, not only at session close (`Drop` finding `None`
                     // simply skips), and close the input queue so the writer
                     // pump exits and `send_input` reports the death honestly.
-                    drop(lock_unpoisoned(&pty).take());
+                    // The command path first harvests the exit status through
+                    // the PTY's own SIGCHLD reap seam (CONSOLE-2's prompt).
+                    // The pty guard is released before the harvest touches the
+                    // exit lock — no two locks are ever held together.
+                    let taken = lock_unpoisoned(&pty).take();
+                    if let Some(mut taken) = taken {
+                        if collect_exit {
+                            *lock_unpoisoned(&exit) = Some(collect_child_exit(&mut taken));
+                        }
+                        drop(taken);
+                    }
                     drop(lock_unpoisoned(&input_tx).take());
                 }
             })?;
@@ -224,7 +313,17 @@ impl LocalPty {
             writer: Some(writer),
             output_closed,
             child_pid,
+            exit,
         })
+    }
+
+    /// The child's exit status, once the output stream has ended and the reader
+    /// pump harvested it — `None` while the command runs (and always `None` for
+    /// the login-shell path, which never collects one). CONSOLE-2's
+    /// stays-open-on-exit prompt reads this.
+    #[must_use]
+    pub fn exit_status(&self) -> Option<ChildExit> {
+        *lock_unpoisoned(&self.exit)
     }
 
     /// The shared engine state. The reader pump feeds it; the surface (and
@@ -329,6 +428,30 @@ fn pump_input(mut file: std::fs::File, input_rx: &Receiver<Vec<u8>>) {
     while let Ok(chunk) = input_rx.recv() {
         if file.write_all(&chunk).is_err() {
             break;
+        }
+    }
+}
+
+/// Harvest the child's exit status after the output stream ended, through the
+/// PTY's **own** reap seam — [`EventedPty::next_child_event`] reads the SIGCHLD
+/// pipe and `try_wait`s the child (§6: alacritty's plumbing, no hand-rolled
+/// `waitpid`). Bounded by [`EXIT_STATUS_WAIT`]: at master EOF the child is
+/// normally already reapable, but a straggler degrades to
+/// [`ChildExit::Unknown`] rather than wedging the reader thread. A code-less
+/// exit (signal-terminated) is `Unknown` too — never a fabricated code (§7).
+fn collect_child_exit(pty: &mut tty::Pty) -> ChildExit {
+    let deadline = Instant::now() + EXIT_STATUS_WAIT;
+    loop {
+        match pty.next_child_event() {
+            Some(ChildEvent::Exited(code)) => {
+                return code.map_or(ChildExit::Unknown, ChildExit::Code);
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    return ChildExit::Unknown;
+                }
+                thread::sleep(EXIT_STATUS_POLL);
+            }
         }
     }
 }
@@ -532,5 +655,76 @@ mod tests {
         // Drop is synchronous: SIGHUP + wait() completed (directly or via the
         // joined reader pump), so the pid is gone — not a zombie — already.
         assert!(!pid_exists(pid), "child reaped by session drop");
+    }
+
+    // --- CONSOLE-2: the typed-argv command path + the exit-status harvest ---
+
+    fn owned(argv: &[&str]) -> Vec<String> {
+        argv.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn spawn_argv_runs_the_command_and_harvests_status_zero() {
+        let session = LocalPty::spawn_argv(
+            &owned(&["/bin/echo", "console-mark"]),
+            SpawnOptions::default(),
+        )
+        .expect("spawn /bin/echo");
+        // The command's real output reached the engine (a real run, §7)…
+        wait_for_text(&session, "console-mark");
+        // …the stream closed on exit, and the reader harvested status 0.
+        wait_for("output stream to close", || {
+            session.is_output_closed().then_some(())
+        });
+        let status = wait_for("exit status harvest", || session.exit_status());
+        assert_eq!(status, ChildExit::Code(0));
+    }
+
+    #[test]
+    fn spawn_argv_reports_a_nonzero_exit_code() {
+        // `sh -c "exit 7"` is a typed argv here — the program is /bin/sh and
+        // the script is one of its arguments; the seam itself interpolates
+        // nothing (§9 — the caller chose to run a shell).
+        let session = LocalPty::spawn_argv(
+            &owned(&["/bin/sh", "-c", "exit 7"]),
+            SpawnOptions::default(),
+        )
+        .expect("spawn sh -c");
+        wait_for("output stream to close", || {
+            session.is_output_closed().then_some(())
+        });
+        let status = wait_for("exit status harvest", || session.exit_status());
+        assert_eq!(status, ChildExit::Code(7));
+    }
+
+    #[test]
+    fn spawn_argv_refuses_an_empty_argv_and_a_missing_binary_honestly() {
+        assert!(
+            matches!(
+                LocalPty::spawn_argv(&[], SpawnOptions::default()),
+                Err(ref err) if err.kind() == ErrorKind::InvalidInput
+            ),
+            "empty argv must refuse with InvalidInput"
+        );
+        // A missing binary surfaces the OS refusal, never a fake session (§7).
+        assert!(LocalPty::spawn_argv(
+            &owned(&["/no/such/console-binary"]),
+            SpawnOptions::default()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_login_shell_path_never_collects_an_exit_status() {
+        let session = spawn_sh();
+        session.send_input(b"exit\n").expect("queue input");
+        wait_for("output stream to close", || {
+            session.is_output_closed().then_some(())
+        });
+        assert_eq!(
+            session.exit_status(),
+            None,
+            "the shell path leaves the status uncollected (only spawn_argv harvests)"
+        );
     }
 }
