@@ -55,7 +55,8 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 
 use mackes_mesh_types::openstack::{
-    default_collection, HeatPreview, HeatStackDetail, ResourceTable, ServiceCatalog, ServiceHealth,
+    default_collection, EndpointInterface, HealthState, HeatPreview, HeatStackDetail,
+    ResourceTable, ServiceCatalog, ServiceHealth,
 };
 
 use crate::workers::proc::output_with_timeout;
@@ -124,6 +125,23 @@ pub fn heat_verb_audits(verb: &str) -> bool {
         verb,
         "heat-check" | "heat-create" | "heat-update" | "heat-delete"
     )
+}
+
+/// Whether a cloud verb is an **audited mutation** (vs an audit-exempt read) —
+/// IAC-5 (#23): every mutating op audits.
+///
+/// The four `instance-*` lifecycle verbs (a start/stop/reboot/delete all change
+/// the cloud) and the four Heat mutations ([`heat_verb_audits`]) audit; the
+/// `get-`/`list-` reads do not. This is the single authority the drain uses to
+/// (a) set the reply's `audited` flag + emit the tracing audit line, and (b)
+/// decide a notify-on-failure — and it agrees, verb-for-verb, with the Bus
+/// topic's own hash-chain guard ([`mde_bus::persist::is_auditable`]): every verb
+/// for which this is `true` rides an auditable `action/cloud/<verb>` topic, and
+/// every read for which it is `false` carries the exempt stem (asserted in the
+/// tests).
+#[must_use]
+pub fn verb_audits(verb: &str) -> bool {
+    LifecycleAction::from_verb(verb).is_some() || heat_verb_audits(verb)
 }
 
 /// The Bus topic for cloud verb `verb`: `action/cloud/<verb>`.
@@ -645,8 +663,8 @@ impl CloudReply {
         }
     }
 
-    /// A lifecycle op succeeded on `instance` (`audited` when it was
-    /// destructive).
+    /// A lifecycle op succeeded on `instance` (`audited` — every performed
+    /// lifecycle verb is a control-plane mutation and audits, #23).
     #[must_use]
     pub fn performed(verb: &str, instance: impl Into<String>, audited: bool) -> Self {
         Self {
@@ -832,16 +850,19 @@ fn handle_lifecycle(
     }
     match ops.perform(action, instance) {
         Ok(()) => {
-            let audited = action.is_destructive();
-            if audited {
-                tracing::info!(
-                    target: "mackesd::openstack",
-                    verb,
-                    instance,
-                    "performed destructive cloud lifecycle op (audited)"
-                );
-            }
-            CloudReply::performed(verb, instance, audited)
+            // #23 — every performed lifecycle verb is a control-plane mutation and
+            // audits (start/stop change instance state just as reboot/delete do):
+            // the request topic hash-chained via `is_auditable`, and we log the
+            // performed op on `mackesd::openstack`. `destructive` is a separate
+            // axis (it drives the surface's typed-arming, not the audit).
+            tracing::info!(
+                target: "mackesd::openstack",
+                verb,
+                instance,
+                destructive = action.is_destructive(),
+                "performed cloud lifecycle mutation (audited)"
+            );
+            CloudReply::performed(verb, instance, true)
         }
         Err(e) => CloudReply::failed(verb, e.to_string()),
     }
@@ -1031,6 +1052,190 @@ fn heat_audit_ok(verb: &str, stack_ref: &str, reply_stack: String) -> CloudReply
     CloudReply::heat_performed(verb, reply_stack, audited)
 }
 
+// ─────────────────────────── the mesh notify feed (IAC-5) ───────────────────────────
+
+/// CHAT-FIX-2 — the mesh notify lane the `openstack` worker fires on. The `chat`
+/// worker folds every `event/notify/*` lane
+/// ([`crate::workers::chat::ALERT_LANE_PREFIXES`]) into the node's `alert:<self>`
+/// conversation (and, Warning+, the tray badge / a chyron), so a body published
+/// here reaches the operator's Chat feed with **no** emitter-side render path —
+/// the same glue [`crate::workers::notify`] + [`crate::workers::node_grade`] use
+/// (§6, reuse-not-duplicate).
+const CLOUD_NOTIFY_TOPIC: &str = "event/notify/cloud";
+
+/// The stable `source` token on the published alert body (the Chat card badge).
+const CLOUD_NOTIFY_SOURCE: &str = "cloud";
+
+/// Severity tag ([`mde_chat::Severity`] shape, folded by `fold_alert`) for a
+/// mutating-op **failure** — worth noticing (amber).
+const SEV_WARNING: &str = "warning";
+
+/// Severity tag for a **service going down** — needs attention now (red).
+const SEV_CRITICAL: &str = "critical";
+
+/// The alert-shaped JSON body a cloud notification serializes to — the shape the
+/// chat [`mde_chat::fold_alert`] understands (`severity` drives the colour;
+/// `host` routes it to `alert:<host>`; every other string field becomes a card
+/// row). Mirrors [`crate::workers::node_grade`]'s `GradeAlertBody`.
+#[derive(Debug, Serialize)]
+struct CloudAlertBody<'a> {
+    /// `warning` (op failure) / `critical` (service down).
+    severity: &'a str,
+    /// The `cloud` source badge.
+    source: &'a str,
+    /// The one-line human message the Chat card shows.
+    summary: String,
+    /// The originating host — routes the alert to `alert:<host>`.
+    host: &'a str,
+    /// The cloud verb that failed, for an op-failure alert.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verb: Option<&'a str>,
+    /// The service that went down, for a service-down alert.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service: Option<&'a str>,
+    /// The alert's mint time (ms since epoch).
+    ts_unix_ms: i64,
+}
+
+/// The `openstack` worker's mesh-notify producer (IAC-5 / #23).
+///
+/// It fires the notify feed **only** on a mutating-op failure or a health-probe
+/// service-down transition — never a routine success (that would be feed noise).
+/// It carries the small cross-tick state the second trigger needs: this node's
+/// host stamp (the alert's origin) and the last-seen per-service health (to catch
+/// an `Up → Down` edge, seeded silently on first sight so a boot doesn't flood).
+/// It rides in/out of [`drain_cloud_verbs`] by value alongside the verb cursors.
+#[derive(Debug, Default, Clone)]
+pub struct CloudNotifier {
+    /// This node's id — the alert's `host` (routes it to `alert:<host>`).
+    host: String,
+    /// Last-seen per-service health state (public interface preferred), keyed by
+    /// service type — the baseline the `Up → Down` edge is measured against.
+    seen_health: BTreeMap<String, HealthState>,
+}
+
+impl CloudNotifier {
+    /// A notifier stamping alerts with this node's `host`.
+    #[must_use]
+    pub fn new(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            seen_health: BTreeMap::new(),
+        }
+    }
+
+    /// Publish an op-failure alert for a mutating verb whose reply carried an
+    /// error (a seam failure or a rejection) — a gate (`retry later`) or a routine
+    /// success never reaches here (see [`mutation_failed`]).
+    fn emit_op_failure(&self, persist: &Persist, verb: &str, reply: &CloudReply, now_ms: i64) {
+        let detail = reply.error.as_deref().unwrap_or("unknown error");
+        let summary = format!("OpenStack {verb} failed on {}: {detail}", self.host);
+        Self::publish(
+            persist,
+            &CloudAlertBody {
+                severity: SEV_WARNING,
+                source: CLOUD_NOTIFY_SOURCE,
+                summary,
+                host: &self.host,
+                verb: Some(verb),
+                service: None,
+                ts_unix_ms: now_ms,
+            },
+        );
+    }
+
+    /// Fold a fresh `get-catalog` health snapshot: fire a service-down alert for
+    /// every service that transitioned `Up → Down` since the last snapshot, then
+    /// re-baseline. First sight (no prior state) seeds silently — a service that
+    /// is simply down on the first poll is not a *transition* (§7 — no boot flood).
+    fn note_catalog_health(&mut self, persist: &Persist, health: &[ServiceHealth], now_ms: i64) {
+        let now = service_states(health);
+        for ty in down_transitions(&self.seen_health, &now) {
+            let summary = format!("OpenStack {ty} service went down on {}", self.host);
+            Self::publish(
+                persist,
+                &CloudAlertBody {
+                    severity: SEV_CRITICAL,
+                    source: CLOUD_NOTIFY_SOURCE,
+                    summary,
+                    host: &self.host,
+                    verb: None,
+                    service: Some(&ty),
+                    ts_unix_ms: now_ms,
+                },
+            );
+        }
+        self.seen_health = now;
+    }
+
+    /// Serialize + publish one alert body on [`CLOUD_NOTIFY_TOPIC`]. Best-effort —
+    /// a write failure is logged, never fatal (§7).
+    fn publish(persist: &Persist, body: &CloudAlertBody) {
+        let Ok(json) = serde_json::to_string(body) else {
+            return;
+        };
+        if let Err(e) = persist.write(CLOUD_NOTIFY_TOPIC, Priority::Default, None, Some(&json)) {
+            tracing::debug!(
+                target: "mackesd::openstack",
+                topic = CLOUD_NOTIFY_TOPIC,
+                error = %e,
+                "cloud notify publish failed"
+            );
+        }
+    }
+}
+
+/// Whether a reply warrants an op-failure notify: a **mutating** verb
+/// ([`verb_audits`]) whose reply carried an `error` (a seam failure or a
+/// rejection). A read never notifies; a routine success (`error` unset) and an
+/// honest gate (`gated` set, `error` unset — retry later, nothing performed) do
+/// not either (#23 — only on failure).
+#[must_use]
+fn mutation_failed(verb: &str, reply: &CloudReply) -> bool {
+    verb_audits(verb) && reply.error.is_some()
+}
+
+/// Reduce per-endpoint health rows to one state per service type — the **public**
+/// interface's state when the service advertises one (what a mesh client
+/// reaches), else the first probed interface's. The single representative the
+/// `Up → Down` edge is measured on.
+fn service_states(health: &[ServiceHealth]) -> BTreeMap<String, HealthState> {
+    let mut out: BTreeMap<String, HealthState> = BTreeMap::new();
+    for h in health {
+        let is_public = h.interface == EndpointInterface::Public;
+        // Public wins; otherwise keep the first interface seen for this type.
+        if is_public || !out.contains_key(&h.service_type) {
+            out.insert(h.service_type.clone(), h.state);
+        }
+    }
+    out
+}
+
+/// The service types that transitioned `Up → Down` between two health snapshots —
+/// the services worth a "went down" alert. Only a prior **Up** counts as a
+/// transition: a first sight (absent from `prev`), a still-down service, and an
+/// `Absent → Down` (an endpoint that was never up) are all silent (§7).
+fn down_transitions(
+    prev: &BTreeMap<String, HealthState>,
+    now: &BTreeMap<String, HealthState>,
+) -> Vec<String> {
+    now.iter()
+        .filter(|(ty, &state)| {
+            state == HealthState::Down && prev.get(*ty) == Some(&HealthState::Up)
+        })
+        .map(|(ty, _)| ty.clone())
+        .collect()
+}
+
+/// Milliseconds since the Unix epoch — the alert body's `ts_unix_ms` stamp.
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 /// Drain net-new `action/cloud/*` requests and answer each on `reply/<ulid>`.
 ///
 /// Answers each net-new request since the per-verb cursors with a typed
@@ -1041,13 +1246,20 @@ fn heat_audit_ok(verb: &str, stack_ref: &str, reply_stack: String) -> CloudReply
 /// Synchronous + seam-pure: the worker drives it on a blocking task (an
 /// `openstack` shell-out never pins the async runtime); tests drive it directly
 /// with a real [`Persist`] tempdir + [`super::testkit::FakeInstanceOps`].
+///
+/// IAC-5 (#23) — after each request settles, `notifier` fires the mesh notify
+/// feed **only** on a mutating-op failure ([`mutation_failed`]) or a
+/// `get-catalog` health-probe `Up → Down` transition; a routine success or an
+/// honest gate never publishes a notification.
 pub fn drain_cloud_verbs(
     persist: &Persist,
     cursors: &mut BTreeMap<String, Option<String>>,
     state: &OpenStackState,
     ops: &dyn InstanceOps,
     client: &dyn CloudClient,
+    notifier: &mut CloudNotifier,
 ) {
+    let now_ms = now_unix_ms();
     for verb in CLOUD_VERBS {
         let topic = cloud_action_topic(verb);
         let cursor = cursors.entry(topic.clone()).or_default();
@@ -1069,6 +1281,15 @@ pub fn drain_cloud_verbs(
                 Some(&reply.to_body()),
             ) {
                 tracing::warn!(target: "mackesd::openstack", ulid = %msg.ulid, error = %e, "cloud verb: reply write failed");
+            }
+            // IAC-5 — fire the mesh notify feed only on a mutating-op failure or a
+            // service-down transition (#23), never a routine success.
+            if mutation_failed(verb, &reply) {
+                notifier.emit_op_failure(persist, verb, &reply, now_ms);
+            } else if verb == "get-catalog" && reply.ok {
+                if let Some(health) = reply.health.as_deref() {
+                    notifier.note_catalog_health(persist, health, now_ms);
+                }
             }
         }
     }
@@ -1643,10 +1864,17 @@ mod tests {
     }
 
     #[test]
-    fn destructive_ops_are_flagged_audited_and_reads_are_not() {
+    fn every_lifecycle_mutation_is_flagged_audited() {
+        // #23 — every performed lifecycle verb is a control-plane mutation and
+        // audits (start/stop change instance state as much as reboot/delete do);
+        // a read is never audited.
         let state = enabled_state();
-        // delete + reboot are destructive → audited.
-        for verb in ["instance-delete", "instance-reboot"] {
+        for verb in [
+            "instance-start",
+            "instance-stop",
+            "instance-reboot",
+            "instance-delete",
+        ] {
             let ops = FakeInstanceOps::new();
             let reply = handle_cloud_request(
                 verb,
@@ -1655,20 +1883,38 @@ mod tests {
                 &ops,
                 &FakeCatalogSource::unconfigured(),
             );
-            assert!(reply.ok && reply.audited, "{verb} must be audited");
-        }
-        // start + stop are not destructive.
-        for verb in ["instance-start", "instance-stop"] {
-            let ops = FakeInstanceOps::new();
-            let reply = handle_cloud_request(
-                verb,
-                r#"{"instance":"i-9"}"#,
-                &state,
-                &ops,
-                &FakeCatalogSource::unconfigured(),
+            assert!(
+                reply.ok && reply.audited,
+                "{verb} is a mutation and must be audited (#23)"
             );
-            assert!(reply.ok && !reply.audited, "{verb} is not destructive");
         }
+        let read = handle_cloud_request(
+            "list-instances",
+            "",
+            &state,
+            &FakeInstanceOps::new(),
+            &FakeCatalogSource::unconfigured(),
+        );
+        assert!(!read.audited, "a read is never audited");
+    }
+
+    #[test]
+    fn verb_audits_agrees_with_the_bus_hash_chain_for_every_verb() {
+        // #23 — the two audit layers must never disagree: every verb this flags an
+        // audited mutation rides an auditable `action/cloud/<verb>` topic (its
+        // request hash-chains into the KDC audit log), and every read carries the
+        // exempt `get-`/`list-` stem. Proven verb-for-verb over the whole surface.
+        for verb in CLOUD_VERBS {
+            let topic = cloud_action_topic(verb);
+            assert_eq!(
+                verb_audits(verb),
+                mde_bus::persist::is_auditable(&topic),
+                "{verb}: verb_audits must match the Bus hash-chain guard"
+            );
+        }
+        // Sanity: the mutations are the 4 lifecycle + 4 Heat verbs, nothing else.
+        let audited = CLOUD_VERBS.into_iter().filter(|v| verb_audits(v)).count();
+        assert_eq!(audited, 8, "exactly 8 mutating verbs audit");
     }
 
     #[test]
@@ -1853,12 +2099,14 @@ mod tests {
         let state = enabled_state();
         let ops = FakeInstanceOps::new();
         let mut cursors = BTreeMap::new();
+        let mut notifier = CloudNotifier::new("node-a");
         drain_cloud_verbs(
             &persist,
             &mut cursors,
             &state,
             &ops,
             &FakeCatalogSource::unconfigured(),
+            &mut notifier,
         );
 
         // The op reached the seam...
@@ -1872,6 +2120,11 @@ mod tests {
             serde_json::from_str(&replies[0].body.clone().expect("reply body")).expect("decode");
         assert!(reply.ok);
         assert_eq!(reply.instance.as_deref(), Some("i-42"));
+        // A routine success fires NO notify (#23 — only on failure/service-down).
+        assert!(
+            notify_bodies(&persist).is_empty(),
+            "a successful lifecycle op must not notify"
+        );
 
         // A second drain with the advanced cursor re-answers nothing (no
         // re-performed lifecycle op — the §7 idempotence of the cursor).
@@ -1881,7 +2134,225 @@ mod tests {
             &state,
             &ops,
             &FakeCatalogSource::unconfigured(),
+            &mut notifier,
         );
         assert_eq!(ops.calls(), vec!["stop:i-42".to_string()], "no replay");
+    }
+
+    // ── IAC-5: the mesh notify feed (failure / service-down only) ──
+
+    /// The bodies published to the cloud notify lane, oldest-first.
+    fn notify_bodies(persist: &Persist) -> Vec<String> {
+        persist
+            .list_since(CLOUD_NOTIFY_TOPIC, None)
+            .expect("list notify")
+            .into_iter()
+            .filter_map(|m| m.body)
+            .collect()
+    }
+
+    /// Publish a request on `verb`'s topic + drain it once (a test helper — it
+    /// simply forwards the drain's own seams, so the arg count mirrors it).
+    #[allow(clippy::too_many_arguments)]
+    fn publish_and_drain(
+        persist: &Persist,
+        cursors: &mut BTreeMap<String, Option<String>>,
+        notifier: &mut CloudNotifier,
+        state: &OpenStackState,
+        ops: &dyn InstanceOps,
+        client: &dyn CloudClient,
+        verb: &str,
+        body: &str,
+    ) {
+        persist
+            .write(
+                &cloud_action_topic(verb),
+                Priority::Default,
+                None,
+                Some(body),
+            )
+            .expect("write request");
+        drain_cloud_verbs(persist, cursors, state, ops, client, notifier);
+    }
+
+    #[test]
+    fn a_failed_mutation_notifies_but_a_success_and_a_gate_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let state = enabled_state();
+        let mut cursors = BTreeMap::new();
+        let mut notifier = CloudNotifier::new("node-a");
+
+        // A failing Heat mutation → one op-failure notify (warning).
+        let failing = FakeCatalogSource::failing(super::super::client::ClientError::Transport(
+            "heat 500".to_string(),
+        ));
+        publish_and_drain(
+            &persist,
+            &mut cursors,
+            &mut notifier,
+            &state,
+            &FakeInstanceOps::new(),
+            &failing,
+            "heat-create",
+            r#"{"stack_name":"web","template":"{}"}"#,
+        );
+        let after_fail = notify_bodies(&persist);
+        assert_eq!(after_fail.len(), 1, "a failed mutation fires one notify");
+        assert!(after_fail[0].contains("heat-create") && after_fail[0].contains("\"warning\""));
+        assert!(
+            after_fail[0].contains("\"source\":\"cloud\""),
+            "the alert carries the cloud source badge"
+        );
+
+        // A successful Heat mutation → NO new notify.
+        let ok = FakeCatalogSource::ok(ServiceCatalog::default(), vec![]);
+        publish_and_drain(
+            &persist,
+            &mut cursors,
+            &mut notifier,
+            &state,
+            &FakeInstanceOps::new(),
+            &ok,
+            "heat-create",
+            r#"{"stack_name":"web2","template":"{}"}"#,
+        );
+        assert_eq!(
+            notify_bodies(&persist).len(),
+            1,
+            "a routine success must not notify"
+        );
+
+        // A gated mutation (doctrine still enabled, but the seam gates via the
+        // client's Unconfigured) → NO notify (retry-later, not a failure).
+        let gated = FakeCatalogSource::unconfigured();
+        publish_and_drain(
+            &persist,
+            &mut cursors,
+            &mut notifier,
+            &state,
+            &FakeInstanceOps::new(),
+            &gated,
+            "heat-check",
+            r#"{"stack_name":"web","stack_id":"s-1"}"#,
+        );
+        assert_eq!(
+            notify_bodies(&persist).len(),
+            1,
+            "an honest gate must not notify"
+        );
+
+        // A failing lifecycle mutation → another op-failure notify.
+        let bad_ops = FakeInstanceOps::new().failing("nova refused");
+        publish_and_drain(
+            &persist,
+            &mut cursors,
+            &mut notifier,
+            &state,
+            &bad_ops,
+            &FakeCatalogSource::unconfigured(),
+            "instance-delete",
+            r#"{"instance":"i-9"}"#,
+        );
+        let bodies = notify_bodies(&persist);
+        assert_eq!(bodies.len(), 2, "a failed lifecycle op fires a notify");
+        assert!(bodies[1].contains("instance-delete"));
+    }
+
+    #[test]
+    fn a_service_down_transition_notifies_but_first_sight_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let persist = Persist::open(dir.path().to_path_buf()).expect("persist");
+        let state = enabled_state();
+        let mut cursors = BTreeMap::new();
+        let mut notifier = CloudNotifier::new("node-a");
+        let ops = FakeInstanceOps::new();
+
+        let catalog = sample_catalog_health().catalog;
+        let up = vec![shape_health(
+            "compute",
+            EndpointInterface::Public,
+            "http://nova.mesh:8774/v2.1",
+            &ProbeOutcome::Reachable {
+                http_status: 200,
+                body: String::new(),
+                elapsed_ms: 5,
+            },
+        )];
+        let down = vec![shape_health(
+            "compute",
+            EndpointInterface::Public,
+            "http://nova.mesh:8774/v2.1",
+            &ProbeOutcome::Unreachable {
+                elapsed_ms: 2000,
+                reason: "connection refused".to_string(),
+            },
+        )];
+
+        // First sight is UP → seeds the baseline silently (no notify).
+        publish_and_drain(
+            &persist,
+            &mut cursors,
+            &mut notifier,
+            &state,
+            &ops,
+            &FakeCatalogSource::ok(catalog.clone(), up),
+            "get-catalog",
+            "",
+        );
+        assert!(
+            notify_bodies(&persist).is_empty(),
+            "first sight seeds silently"
+        );
+
+        // Now compute goes DOWN → one critical service-down notify.
+        publish_and_drain(
+            &persist,
+            &mut cursors,
+            &mut notifier,
+            &state,
+            &ops,
+            &FakeCatalogSource::ok(catalog.clone(), down.clone()),
+            "get-catalog",
+            "",
+        );
+        let bodies = notify_bodies(&persist);
+        assert_eq!(bodies.len(), 1, "an Up→Down transition fires one notify");
+        assert!(bodies[0].contains("compute") && bodies[0].contains("\"critical\""));
+
+        // Staying down does NOT re-notify (only the transition edge fires).
+        publish_and_drain(
+            &persist,
+            &mut cursors,
+            &mut notifier,
+            &state,
+            &ops,
+            &FakeCatalogSource::ok(catalog, down),
+            "get-catalog",
+            "",
+        );
+        assert_eq!(
+            notify_bodies(&persist).len(),
+            1,
+            "a still-down service does not re-notify"
+        );
+    }
+
+    #[test]
+    fn down_transitions_only_fires_on_a_prior_up() {
+        use std::collections::BTreeMap as Map;
+        let up = |ty: &str| (ty.to_string(), HealthState::Up);
+        let down = |ty: &str| (ty.to_string(), HealthState::Down);
+        let absent = |ty: &str| (ty.to_string(), HealthState::Absent);
+
+        let prev: Map<String, HealthState> = [up("compute"), down("network"), absent("dns")].into();
+        let now: Map<String, HealthState> = [
+            down("compute"), // up → down: fires
+            down("network"), // down → down: silent
+            down("dns"),     // absent → down: silent
+            down("image"),   // first sight down: silent
+        ]
+        .into();
+        assert_eq!(down_transitions(&prev, &now), vec!["compute".to_string()]);
     }
 }

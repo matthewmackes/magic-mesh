@@ -2354,19 +2354,22 @@ fn authority(url: &str) -> &str {
 // ─────────────────────────── the MENUBAR-ALL bar ────────────────────────────
 
 /// MENUBAR-ALL (Infra as Code) — the shared bar over the `OpenStack` control
-/// plane. Every item is a real seam (§6): **Catalog → Refresh now** forces an
-/// immediate re-poll, **Catalog → Auto-refresh** toggles the ~15 s live poll,
-/// **View → Show endpoint URLs** expands the tiles' full URLs. The File/Edit/Help
-/// spine is omitted (no file/clipboard/about seam here — the Instances precedent,
-/// §7). IAC-3 adds the **catalog-driven per-service menus** (one per drillable
-/// bucket — Drill / Refresh resources, + Compute's armed lifecycle verbs), the
-/// governing-principle headline: comprehensive, yet every item maps to a landed
-/// Bus seam and an absent verb is omitted, never greyed (§8). The status cluster
-/// reads the live catalog.
+/// plane. Every item is a real seam (§6): the **Catalog** spine (Refresh now /
+/// Auto-refresh) + **View** (Show endpoint URLs), then the **catalog-driven
+/// per-service menus**, then **Help**. IAC-5 makes the per-service menus **one
+/// per advertised Keystone service**, so the bar grows + shrinks with the live
+/// catalog (design #17): each carries that service's full landed verb set (Drill
+/// / Refresh, Compute's armed lifecycle, the Orchestration menu's folded-in Heat
+/// set), the governing-principle headline — comprehensive, yet every item maps to
+/// a landed Bus seam; an absent verb is omitted, a context-gated one disabled, a
+/// verb-less service an honest caption, never a dead entry (§8). The status
+/// cluster reads the live catalog.
 mod menubar {
+    use std::collections::BTreeSet;
+
     use super::{
-        service_bucket, Arming, CatalogOutcome, HeatOp, IacTab, InfraCodeState, BUCKETS, DOT,
-        HEAT_SERVICE,
+        service_bucket, service_display_name, Arming, CatalogOutcome, HeatOp, IacTab,
+        InfraCodeState, BUCKETS, DOT, HEAT_SERVICE,
     };
     use mackes_mesh_types::openstack::default_collection;
     use mde_egui::egui::Ui;
@@ -2423,20 +2426,26 @@ mod menubar {
         /// Heat: open the typed-arming confirm for a create / update / delete
         /// (#22).
         HeatArm(HeatOp),
+        /// Help → surface the audit + notify posture in the action note (a real
+        /// seam — the `note` renders; IAC-5's honest one-liner).
+        HelpAbout,
     }
 
-    /// Render the INFRA AS CODE bar and return the action picked this frame. The
-    /// bar is the Catalog / View spine **plus** the catalog-driven per-service
-    /// menus (the governing principle — every real control, incl. the armed
-    /// lifecycle verbs, is here; a verb with no landed seam is omitted, §8).
+    /// Render the INFRA AS CODE bar and return the action picked this frame
+    /// (IAC-5).
+    ///
+    /// The bar is the **Catalog / View** spine, then the **catalog-driven
+    /// per-service menus** (one menu per advertised Keystone service, growing +
+    /// shrinking with the live catalog, design #17), then the **Help** menu. The
+    /// governing principle (MENUBAR-ALL): every real control — incl. the armed
+    /// Nova lifecycle + the full Heat verb set (folded into the Orchestration
+    /// service's menu, lock 9 — no separate ad-hoc menu) — is here; a verb with no
+    /// landed seam is omitted and a context-gated one disabled, never a dead entry
+    /// (§8).
     pub(super) fn show(ui: &mut Ui, state: &InfraCodeState) -> Option<MenuAction> {
         let mut menus = build_menus(state.auto_refresh, state.show_urls);
         menus.extend(build_service_menus(state));
-        // The dedicated Heat menu (IAC-4) — the full native-IaC verb set. Omitted
-        // when the catalog advertises no orchestration service (§8).
-        if let Some(heat) = build_heat_menu(state) {
-            menus.push(heat);
-        }
+        menus.push(build_help_menu());
         let status = build_status(state);
         let model = MenuBarModel {
             // The dock groups Infra as Code under **Workloads** (purple), so the
@@ -2449,103 +2458,180 @@ mod menubar {
         MenuBar::show(ui, &model)
     }
 
-    /// Build the catalog-driven per-service menus (design #17): one menu per
-    /// service bucket that carries a drillable resource collection, each with
-    /// **Drill into resources** + **Refresh resources** (real `list-resources`
-    /// seams), and — for **Compute** — the armed Nova lifecycle verbs on the
-    /// selected instance (Start / Stop direct; Reboot / Delete typed-armed).
-    /// Every item maps to a landed Bus seam; verbs without one are omitted, never
-    /// greyed (§8). Empty until the catalog is [`CatalogOutcome::Ready`].
+    /// Build the catalog-driven per-service menus (design #17) — **one menu per
+    /// advertised Keystone service**, so the bar auto-grows + shrinks as the live
+    /// catalog changes (a newly-advertised service automatically gets its menu).
+    ///
+    /// The known families (Compute / Network / Image / Volume / Orchestration /
+    /// Identity / DNS / Object Storage / Placement) render in canonical order,
+    /// collapsing their type variants (`volume`/`volumev3` → one **Volume** menu);
+    /// the `Other` catch-all fans out **one menu per distinct unknown type**, so a
+    /// brand-new service still surfaces its own menu. Each menu carries that
+    /// service's full landed verb set ([`service_menu`]) — the governing principle
+    /// (surface ALL controls), with honest omit/disable (§8). Empty until the
+    /// catalog is [`CatalogOutcome::Ready`].
     fn build_service_menus(state: &InfraCodeState) -> Vec<Menu<MenuAction>> {
         let CatalogOutcome::Ready(view) = &state.outcome else {
             return Vec::new();
         };
         let selected = state.single_selected_instance();
+        let has_stack = state.heat.selected.is_some();
         let mut menus = Vec::new();
         for bucket in BUCKETS {
-            // The first cataloged service in this bucket that has a resource table.
-            let Some(svc) = view.catalog.services.iter().find(|s| {
-                service_bucket(&s.service_type) == bucket
-                    && default_collection(&s.service_type).is_some()
-            }) else {
-                continue;
-            };
-            let ty = svc.service_type.clone();
-            let mut entries = vec![
-                Entry::Item(Item::new(
-                    MenuAction::Drill(ty.clone()),
-                    "Drill into resources",
-                )),
-                Entry::Item(Item::new(
-                    MenuAction::RefreshResources(ty.clone()),
-                    "Refresh resources",
-                )),
-            ];
-            if bucket == "Compute" {
-                entries.push(Entry::Separator);
-                // The lifecycle verbs act on the single selected instance — a
-                // context-gated control, so disabled (not omitted) when the
-                // selection isn't exactly one (§7/#22 single-target arming).
-                let (enabled, id, name) = selected.clone().map_or_else(
-                    || (false, String::new(), String::new()),
-                    |(id, name)| (true, id, name),
-                );
-                for (verb, label) in [
-                    ("instance-start", "Start instance"),
-                    ("instance-stop", "Stop instance"),
-                ] {
-                    entries.push(Entry::Item(
-                        Item::new(
-                            MenuAction::Lifecycle {
-                                verb,
-                                instance_id: id.clone(),
-                                name: name.clone(),
-                            },
-                            label,
-                        )
-                        .enabled(enabled),
-                    ));
+            if bucket == "Other" {
+                // Fan out one menu per distinct unknown service type (deduped) — the
+                // auto-grow showcase: a service Keystone advertises that isn't a
+                // known family still gets its own menu, titled by its identity.
+                let mut seen: BTreeSet<&str> = BTreeSet::new();
+                for svc in &view.catalog.services {
+                    if service_bucket(&svc.service_type) == "Other"
+                        && seen.insert(svc.service_type.as_str())
+                    {
+                        menus.push(service_menu(
+                            &svc.service_type,
+                            service_display_name(svc),
+                            selected.as_ref(),
+                            has_stack,
+                        ));
+                    }
                 }
-                for (verb, label) in [
-                    ("instance-reboot", "Reboot instance\u{2026}"),
-                    ("instance-delete", "Delete instance\u{2026}"),
-                ] {
-                    entries.push(Entry::Item(
-                        Item::new(
-                            MenuAction::ArmLifecycle {
-                                verb,
-                                instance_id: id.clone(),
-                                name: name.clone(),
-                            },
-                            label,
-                        )
-                        .enabled(enabled),
-                    ));
-                }
+            } else if let Some(svc) = view
+                .catalog
+                .services
+                .iter()
+                .find(|s| service_bucket(&s.service_type) == bucket)
+            {
+                // One menu per known family present in the catalog, titled by the
+                // family, targeting the first advertised type in it (they share a
+                // resource collection, so any is a valid drill target).
+                menus.push(service_menu(
+                    &svc.service_type,
+                    bucket.to_string(),
+                    selected.as_ref(),
+                    has_stack,
+                ));
             }
-            menus.push(Menu::new(bucket, entries));
         }
         menus
     }
 
-    /// Build the dedicated **Heat** menu (IAC-4) — the full native-IaC verb set
-    /// (the MENUBAR-ALL governing principle): Refresh stacks / Reverse-generate /
+    /// Build one advertised service's menu (design #17) — its **full landed verb
+    /// set**, honestly gated (§8):
+    ///
+    /// - the read seam **Drill into resources** + **Refresh resources** when the
+    ///   service has a resource collection (a landed `list-resources` seam);
+    /// - for **Compute**, the armed Nova lifecycle verbs on the selected instance
+    ///   (Start / Stop direct; Reboot / Delete typed-armed, #22), disabled until
+    ///   exactly one instance is selected (context-gated, §7);
+    /// - for **Orchestration**, the folded-in full **Heat** verb set (Refresh /
+    ///   Reverse-generate / New stack / Show / Preview / Stack-check / Update /
+    ///   Delete — lock 9, no separate ad-hoc menu);
+    /// - and, for a service with **no** landed management verb (Identity / DNS /
+    ///   Placement / Object Storage / an unknown type), a single honest
+    ///   [`Entry::Caption`] — the service is advertised, but nothing is wired to
+    ///   fake (§8, never a dead/greyed actionable entry).
+    fn service_menu(
+        ty: &str,
+        title: impl Into<String>,
+        selected: Option<&(String, String)>,
+        has_stack: bool,
+    ) -> Menu<MenuAction> {
+        let bucket = service_bucket(ty);
+        let mut entries = Vec::new();
+        // The read seam — omitted (§8) when the service has no resource collection.
+        if default_collection(ty).is_some() {
+            entries.push(Entry::Item(Item::new(
+                MenuAction::Drill(ty.to_string()),
+                "Drill into resources",
+            )));
+            // Orchestration's own Heat set carries "Refresh stacks", so we don't
+            // duplicate a generic Refresh there (lock 9).
+            if bucket != "Orchestration" {
+                entries.push(Entry::Item(Item::new(
+                    MenuAction::RefreshResources(ty.to_string()),
+                    "Refresh resources",
+                )));
+            }
+        }
+        match bucket {
+            "Compute" => {
+                if !entries.is_empty() {
+                    entries.push(Entry::Separator);
+                }
+                push_lifecycle_verbs(&mut entries, selected);
+            }
+            "Orchestration" => {
+                if !entries.is_empty() {
+                    entries.push(Entry::Separator);
+                }
+                entries.extend(heat_entries(has_stack));
+            }
+            _ => {}
+        }
+        if entries.is_empty() {
+            // Honest §8 — advertised, but no management verb is wired for its type.
+            entries.push(Entry::Caption(
+                "No management verbs are wired for this service yet.".to_string(),
+            ));
+        }
+        Menu::new(title, entries)
+    }
+
+    /// Push the armed Nova lifecycle verbs (Start / Stop direct; Reboot / Delete
+    /// typed-armed, #22) onto a Compute menu. They act on the single selected
+    /// instance, so they are disabled (context-gated, §7 — not omitted) when the
+    /// selection isn't exactly one.
+    fn push_lifecycle_verbs(
+        entries: &mut Vec<Entry<MenuAction>>,
+        selected: Option<&(String, String)>,
+    ) {
+        let (enabled, id, name) = selected.map_or_else(
+            || (false, String::new(), String::new()),
+            |(id, name)| (true, id.clone(), name.clone()),
+        );
+        for (verb, label) in [
+            ("instance-start", "Start instance"),
+            ("instance-stop", "Stop instance"),
+        ] {
+            entries.push(Entry::Item(
+                Item::new(
+                    MenuAction::Lifecycle {
+                        verb,
+                        instance_id: id.clone(),
+                        name: name.clone(),
+                    },
+                    label,
+                )
+                .enabled(enabled),
+            ));
+        }
+        for (verb, label) in [
+            ("instance-reboot", "Reboot instance\u{2026}"),
+            ("instance-delete", "Delete instance\u{2026}"),
+        ] {
+            entries.push(Entry::Item(
+                Item::new(
+                    MenuAction::ArmLifecycle {
+                        verb,
+                        instance_id: id.clone(),
+                        name: name.clone(),
+                    },
+                    label,
+                )
+                .enabled(enabled),
+            ));
+        }
+    }
+
+    /// The full native-IaC **Heat** verb set (IAC-4), folded into the
+    /// Orchestration service's menu (lock 9): Refresh stacks / Reverse-generate /
     /// New stack, plus the selection-gated Show / Preview / Stack-check / Update /
-    /// Delete. Returns `None` (omitting the menu, §8) when the catalog advertises
-    /// no orchestration service — honestly omitted, never a dead menu. The
-    /// mutating Update / Delete are typed-armed (#22); the reads +
-    /// non-destructive stack-check act directly. Create rides the New-stack form
-    /// (armed there).
-    fn build_heat_menu(state: &InfraCodeState) -> Option<Menu<MenuAction>> {
-        let CatalogOutcome::Ready(view) = &state.outcome else {
-            return None;
-        };
-        // Omit the whole menu when the catalog advertises no Heat service (§8).
-        view.catalog.service(HEAT_SERVICE)?;
-        // The selection-gated verbs are disabled (context-gated, §7) — not
-        // omitted — until a stack is selected.
-        let has_sel = state.heat.selected.is_some();
-        let entries = vec![
+    /// Delete. The mutating Update / Delete are typed-armed (#22); the reads + the
+    /// non-destructive stack-check act directly; Create rides the New-stack form
+    /// (armed there). `has_sel` disables the selection-gated verbs (§7 — not
+    /// omitted) until a stack is selected.
+    fn heat_entries(has_sel: bool) -> Vec<Entry<MenuAction>> {
+        vec![
             Entry::Item(Item::new(MenuAction::HeatRefresh, "Refresh stacks")),
             Entry::Item(Item::new(
                 MenuAction::HeatReverse,
@@ -2567,8 +2653,26 @@ mod menubar {
                 Item::new(MenuAction::HeatArm(HeatOp::Delete), "Delete stack\u{2026}")
                     .enabled(has_sel),
             ),
-        ];
-        Some(Menu::new("Heat", entries))
+        ]
+    }
+
+    /// The **Help** menu (the MENUBAR-ALL spine) — an honest surface identity
+    /// caption + a real seam: **Audit + notify posture** writes IAC-5's one-line
+    /// note (every mutating op audits; notify fires only on failure/service-down),
+    /// so even Help carries no dead entry (§8).
+    fn build_help_menu() -> Menu<MenuAction> {
+        Menu::new(
+            "Help",
+            vec![
+                Entry::Caption(
+                    "Infra as Code \u{2014} the OpenStack IaaS control plane.".to_string(),
+                ),
+                Entry::Item(Item::new(
+                    MenuAction::HelpAbout,
+                    "Audit + notify posture\u{2026}",
+                )),
+            ],
+        )
     }
 
     /// Build the Catalog + View menus, reflecting the two live toggles.
@@ -2708,6 +2812,14 @@ mod menubar {
             MenuAction::HeatArm(HeatOp::Update) => state.arm_heat_update(),
             MenuAction::HeatArm(HeatOp::Delete) => state.arm_heat_delete(),
             MenuAction::HeatArm(HeatOp::Create) => state.arm_heat_create(),
+            // Help → the honest IAC-5 audit + notify posture, surfaced in the note.
+            MenuAction::HelpAbout => {
+                state.note = Some(
+                    "Every mutating op is audited to the KDC hash-chained log; the mesh notify \
+                     feed fires only on a failure or a service going down."
+                        .to_string(),
+                );
+            }
         }
     }
 
@@ -2715,12 +2827,17 @@ mod menubar {
     #[allow(clippy::panic)]
     mod tests {
         use super::super::tests::{fixture_view, heat_view};
-        use super::super::{CatalogOutcome, HeatOp, InfraCodeState};
+        use super::super::{CatalogOutcome, HeatOp, InfraCodeState, HEAT_SERVICE};
         use super::{
-            apply, build_heat_menu, build_menus, build_service_menus, build_status, MenuAction,
+            apply, build_help_menu, build_menus, build_service_menus, build_status, MenuAction,
         };
-        use mde_egui::menubar::{Entry, Item};
+        use mde_egui::menubar::{Entry, Item, Menu};
         use mde_egui::ChipTone;
+
+        /// The service menu titled `title`, if the generator built one.
+        fn menu<'a>(menus: &'a [Menu<MenuAction>], title: &str) -> Option<&'a Menu<MenuAction>> {
+            menus.iter().find(|m| m.title == title)
+        }
 
         /// The item ids of a menu, in order.
         fn menu_action_ids(menu: &super::Menu<MenuAction>) -> Vec<MenuAction> {
@@ -2734,23 +2851,31 @@ mod menubar {
         }
 
         #[test]
-        fn the_heat_menu_lists_the_live_verb_set_and_omits_when_no_orchestration() {
-            // §8 — no orchestration service ⇒ no Heat menu (omitted, not dead).
+        fn orchestration_menu_folds_in_the_full_heat_verb_set_and_is_absent_without_it() {
+            // §8 / lock 9 — the Heat verb set lives in the Orchestration service
+            // menu, not a separate ad-hoc menu. No orchestration service ⇒ no
+            // Orchestration menu at all (omitted, not dead).
             let no_heat = InfraCodeState {
                 outcome: CatalogOutcome::Ready(fixture_view()),
                 ..InfraCodeState::default()
             };
-            assert!(build_heat_menu(&no_heat).is_none());
+            assert!(
+                menu(&build_service_menus(&no_heat), "Orchestration").is_none(),
+                "no orchestration service ⇒ no Orchestration menu"
+            );
 
-            // Orchestration cataloged ⇒ the Heat menu carries the full verb set.
+            // Orchestration cataloged ⇒ its menu carries Drill + the full Heat set.
             let mut state = InfraCodeState {
                 outcome: CatalogOutcome::Ready(heat_view()),
                 ..InfraCodeState::default()
             };
-            let menu = build_heat_menu(&state).expect("Heat menu");
-            assert_eq!(menu.title, "Heat");
-            let ids = menu_action_ids(&menu);
+            let menus = build_service_menus(&state);
+            let orch = menu(&menus, "Orchestration")
+                .expect("Orchestration menu")
+                .clone();
+            let ids = menu_action_ids(&orch);
             for want in [
+                MenuAction::Drill(HEAT_SERVICE.to_string()),
                 MenuAction::HeatRefresh,
                 MenuAction::HeatReverse,
                 MenuAction::HeatNewStack,
@@ -2760,12 +2885,15 @@ mod menubar {
                 MenuAction::HeatArm(HeatOp::Update),
                 MenuAction::HeatArm(HeatOp::Delete),
             ] {
-                assert!(ids.contains(&want), "the Heat menu is missing {want:?}");
+                assert!(
+                    ids.contains(&want),
+                    "the Orchestration menu is missing {want:?}"
+                );
             }
 
             // The selection-gated verbs are disabled (context-gated, §7) — not
             // omitted — until a stack is selected.
-            let show = menu
+            let show = orch
                 .entries
                 .iter()
                 .find_map(|e| match e {
@@ -2777,8 +2905,9 @@ mod menubar {
 
             // With a selection they enable, and the armed verbs open the confirm.
             state.heat.selected = Some(("s-1".to_string(), "mesh-net".to_string()));
-            let menu2 = build_heat_menu(&state).expect("Heat menu");
-            let show2 = menu2
+            let menus2 = build_service_menus(&state);
+            let orch2 = menu(&menus2, "Orchestration").expect("Orchestration menu");
+            let show2 = orch2
                 .entries
                 .iter()
                 .find_map(|e| match e {
@@ -2797,25 +2926,32 @@ mod menubar {
         #[test]
         fn service_menus_are_catalog_driven_and_carry_the_verb_set() {
             // The fixture catalog = compute + identity + image; compute & image are
-            // drillable, identity is not (it has no resource table).
+            // drillable, identity is not (no resource collection).
             let state = InfraCodeState {
                 outcome: CatalogOutcome::Ready(fixture_view()),
                 ..InfraCodeState::default()
             };
             let menus = build_service_menus(&state);
             let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
-            assert!(titles.contains(&"Compute") && titles.contains(&"Image"));
+            // #17 — one menu per advertised service, incl. the verb-less Identity.
             assert!(
-                !titles.contains(&"Identity"),
-                "an undrillable service gets no menu (§8, omitted not greyed)"
+                titles.contains(&"Compute")
+                    && titles.contains(&"Image")
+                    && titles.contains(&"Identity"),
+                "every advertised service gets a menu (auto-grow); got {titles:?}"
             );
 
-            // A non-compute service carries just the two read verbs.
-            let image = menus
-                .iter()
-                .find(|m| m.title == "Image")
-                .expect("Image menu");
+            // A non-compute drillable service carries just the two read verbs.
+            let image = menu(&menus, "Image").expect("Image menu");
             assert_eq!(image.entries.len(), 2, "Drill + Refresh only");
+
+            // A verb-less service (identity) gets an honest caption, not a dead
+            // actionable entry (§8) — no activatable items at all.
+            let identity = menu(&menus, "Identity").expect("Identity menu");
+            assert!(
+                matches!(identity.entries.as_slice(), [Entry::Caption(_)]),
+                "a verb-less service shows one honest caption, no items"
+            );
 
             // Compute carries the read verbs + the four armed lifecycle verbs,
             // disabled while nothing is selected (context-gated, §7 — not omitted).
@@ -2853,6 +2989,93 @@ mod menubar {
                     instance_id: String::new(),
                     name: String::new(),
                 }));
+        }
+
+        /// A `CatalogView` over a Keystone token, no health rows.
+        fn view_from(token: &str) -> super::super::CatalogView {
+            super::super::CatalogView {
+                catalog: mackes_mesh_types::openstack::ServiceCatalog::from_keystone_token_json(
+                    token,
+                )
+                .expect("fixture catalog"),
+                health: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn the_bar_auto_grows_one_menu_per_advertised_service() {
+            // #17 — the bar carries exactly one menu per advertised service and
+            // grows as the catalog advertises more.
+            let two = view_from(
+                r#"{"token":{"catalog":[
+                    {"type":"compute","name":"nova","endpoints":[{"interface":"public","url":"http://n:8774/v2.1","region":"R"}]},
+                    {"type":"network","name":"neutron","endpoints":[{"interface":"public","url":"http://n:9696","region":"R"}]}
+                ]}}"#,
+            );
+            let pair = InfraCodeState {
+                outcome: CatalogOutcome::Ready(two),
+                ..InfraCodeState::default()
+            };
+            let pair_menus = build_service_menus(&pair);
+            let titles: Vec<&str> = pair_menus.iter().map(|m| m.title.as_str()).collect();
+            assert_eq!(titles, vec!["Compute", "Network"], "one menu per service");
+
+            // Advertise a third service → the bar grows a menu for it automatically.
+            let three = view_from(
+                r#"{"token":{"catalog":[
+                    {"type":"compute","name":"nova","endpoints":[{"interface":"public","url":"http://n:8774/v2.1","region":"R"}]},
+                    {"type":"network","name":"neutron","endpoints":[{"interface":"public","url":"http://n:9696","region":"R"}]},
+                    {"type":"image","name":"glance","endpoints":[{"interface":"public","url":"http://g:9292","region":"R"}]}
+                ]}}"#,
+            );
+            let grown = InfraCodeState {
+                outcome: CatalogOutcome::Ready(three),
+                ..InfraCodeState::default()
+            };
+            let grown_menus = build_service_menus(&grown);
+            assert_eq!(
+                grown_menus.len(),
+                3,
+                "the bar grew a menu for the new service"
+            );
+            assert!(
+                menu(&grown_menus, "Image").is_some(),
+                "the newly-advertised Image service got its own menu"
+            );
+
+            // An unknown service type still fans out its own menu (the Other bucket
+            // is per-type, not a single collapsed catch-all).
+            let unknown = view_from(
+                r#"{"token":{"catalog":[
+                    {"type":"metering","name":"ceilometer","endpoints":[{"interface":"public","url":"http://m:8777","region":"R"}]},
+                    {"type":"sharev2","name":"manila","endpoints":[{"interface":"public","url":"http://s:8786","region":"R"}]}
+                ]}}"#,
+            );
+            let exotic = InfraCodeState {
+                outcome: CatalogOutcome::Ready(unknown),
+                ..InfraCodeState::default()
+            };
+            assert_eq!(
+                build_service_menus(&exotic).len(),
+                2,
+                "two unknown types ⇒ two distinct menus"
+            );
+        }
+
+        #[test]
+        fn help_menu_carries_a_real_seam_not_a_dead_entry() {
+            // The Help spine (§8) — a caption + one real action; no dead entry.
+            let help = build_help_menu();
+            assert_eq!(help.title, "Help");
+            assert_eq!(menu_action_ids(&help), vec![MenuAction::HelpAbout]);
+            // The action drives a real seam — the audit/notify posture note.
+            let mut state = InfraCodeState::default();
+            assert!(state.note.is_none());
+            apply(&mut state, MenuAction::HelpAbout);
+            assert!(
+                state.note.as_deref().is_some_and(|n| n.contains("audited")),
+                "Help surfaces the audit + notify posture (a real seam)"
+            );
         }
 
         #[test]

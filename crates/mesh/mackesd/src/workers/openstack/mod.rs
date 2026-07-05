@@ -106,7 +106,7 @@ use config_render::{render_cloud_bootstrap, render_fleet_heat_stack, OverlayBind
 use fleet::{FleetStateSource, MeshFleetState};
 use podman::{PodmanCli, PodmanRunner, DEFAULT_KOLLA_CONFIG_ROOT};
 use reconcile::{converge_cycle, CycleOutcome, DoctrineStatus, OpenStackState};
-use verbs::{drain_cloud_verbs, InstanceOps, OpenstackCli, CLOUD_VERBS};
+use verbs::{drain_cloud_verbs, CloudNotifier, InstanceOps, OpenstackCli, CLOUD_VERBS};
 
 /// Converge cadence.
 ///
@@ -445,6 +445,7 @@ impl OpenstackWorker {
     async fn drain_verbs(
         &self,
         cursors: &mut BTreeMap<String, Option<String>>,
+        notifier: &mut CloudNotifier,
         state: &OpenStackState,
     ) {
         let Some(bus_root) = self.bus_root.clone() else {
@@ -454,21 +455,35 @@ impl OpenstackWorker {
         let catalog = Arc::clone(&self.catalog);
         let state = state.clone();
         let snapshot = cursors.clone();
+        // The notify producer's cross-tick state (host stamp + last-seen health)
+        // rides in/out of the blocking task by value, like the verb cursors.
+        let notif_in = notifier.clone();
         match tokio::task::spawn_blocking(move || {
             let mut cursors = snapshot;
+            let mut notif = notif_in;
             match Persist::open(bus_root) {
                 Ok(persist) => {
-                    drain_cloud_verbs(&persist, &mut cursors, &state, &*instances, &*catalog);
+                    drain_cloud_verbs(
+                        &persist,
+                        &mut cursors,
+                        &state,
+                        &*instances,
+                        &*catalog,
+                        &mut notif,
+                    );
                 }
                 Err(e) => {
                     tracing::debug!(target: "mackesd::openstack", error = %e, "cloud verbs: bus open failed");
                 }
             }
-            cursors
+            (cursors, notif)
         })
         .await
         {
-            Ok(updated) => *cursors = updated,
+            Ok((updated_cursors, updated_notif)) => {
+                *cursors = updated_cursors;
+                *notifier = updated_notif;
+            }
             Err(e) => {
                 tracing::warn!(target: "mackesd::openstack", error = %e, "cloud verb drain task join failed");
             }
@@ -488,6 +503,9 @@ impl Worker for OpenstackWorker {
         // QC-11 — seed the verb-request cursors at the tail so a restart doesn't
         // replay stale `action/cloud/*` requests (no re-performed lifecycle op).
         let mut verb_cursors = seed_verb_cursors(self.bus_root.as_deref());
+        // IAC-5 — the mesh-notify producer's cross-tick state (host stamp +
+        // last-seen per-service health for the Up→Down edge).
+        let mut notifier = CloudNotifier::new(self.host.clone());
         // Converge + publish immediately on start so a panel doesn't wait a
         // full tick for the first mirror row.
         self.cycle_and_publish(&mut last, &mut last_pub_at).await;
@@ -499,7 +517,7 @@ impl Worker for OpenstackWorker {
                     self.cycle_and_publish(&mut last, &mut last_pub_at).await;
                     // Answer any queued cloud verbs against the fresh mirror.
                     if let Some(state) = last.clone() {
-                        self.drain_verbs(&mut verb_cursors, &state).await;
+                        self.drain_verbs(&mut verb_cursors, &mut notifier, &state).await;
                     }
                 }
                 () = shutdown.wait() => break,
