@@ -41,6 +41,15 @@
 //! temp + rename, the timers idiom). A custom entry's launch rides the same
 //! spawn-tab seam, opening its own named tab (CONSOLE-5).
 //!
+//! **CONSOLE-3** is the front door's CONTENT: the const [`ConsoleEntry`] table
+//! across every operational group (System / Network / Packages / Storage / Mesh
+//! / Containers & VMs / Shells), each row a real tool honest-gated on `$PATH`
+//! (§7) and carrying its own **domain glyph** (lock #33) — System / Storage /
+//! Mesh / Instances / Signal / … — so the menu scans by domain rather than a
+//! wall of identical terminal icons. The Containers & VMs group's Cloud-plane
+//! row is the surface link to [`Surface::Instances`] (the combined-group
+//! decision, Q41/Q50).
+//!
 //! Like the dock, this module is pure chrome + state: it records a typed
 //! [`ConsoleRequest`] the shell drains after the frame (`main.rs`), and never
 //! reaches the nav / curtain / seat itself (§6, the VDOCK deferred-wire idiom).
@@ -177,6 +186,13 @@ struct ConsoleEntry {
     tool: &'static str,
     /// The Fedora/Quasar provenance tag (lock #38).
     provenance: Provenance,
+    /// The row's **domain glyph** (lock #33's "icon"): a distinct brand glyph
+    /// per operational domain (System / Network / Storage / Mesh / …), so the
+    /// front door reads as a real Start Menu rather than a wall of identical
+    /// terminal glyphs. A surface-link entry carries its surface's OWN glyph, so
+    /// the iconography stays 1:1 with the surface identity (the entry-table
+    /// test pins that invariant).
+    icon: IconId,
     /// What activation does.
     kind: EntryKind,
 }
@@ -198,6 +214,7 @@ const PINNED: [ConsoleEntry; 2] = [
         desc: "Open the Terminal surface — tabs, splits, mesh peers",
         tool: "",
         provenance: Provenance::Quasar,
+        icon: IconId::Terminal,
         kind: EntryKind::Link(Surface::Terminal),
     },
     ConsoleEntry {
@@ -205,6 +222,7 @@ const PINNED: [ConsoleEntry; 2] = [
         desc: "Live per-process CPU / memory / IO (btop)",
         tool: "btop",
         provenance: Provenance::Fedora,
+        icon: IconId::System,
         kind: EntryKind::Tab("btop"),
     },
 ];
@@ -223,6 +241,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Live per-process CPU / memory / IO (btop)",
                 tool: "btop",
                 provenance: Provenance::Fedora,
+                icon: IconId::System,
                 kind: EntryKind::Tab("btop"),
             },
             ConsoleEntry {
@@ -230,6 +249,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Unit list — start / stop / restart from it (systemctl)",
                 tool: "systemctl",
                 provenance: Provenance::Fedora,
+                icon: IconId::Settings,
                 kind: EntryKind::Tab("systemctl list-units"),
             },
             ConsoleEntry {
@@ -237,6 +257,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Follow the system journal live (journalctl -f)",
                 tool: "journalctl",
                 provenance: Provenance::Fedora,
+                icon: IconId::Editor,
                 kind: EntryKind::Tab("journalctl -f"),
             },
             ConsoleEntry {
@@ -244,6 +265,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Live control-group CPU / memory / IO (systemd-cgtop)",
                 tool: "systemd-cgtop",
                 provenance: Provenance::Fedora,
+                icon: IconId::System,
                 kind: EntryKind::Tab("systemd-cgtop"),
             },
         ],
@@ -256,6 +278,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Mesh-aware summary: links, routes, overlay + peers",
                 tool: "ip",
                 provenance: Provenance::Quasar,
+                icon: IconId::Signal,
                 kind: EntryKind::Tab("bash -lc 'ip -br addr; echo; ip route; echo; meshctl status'"),
             },
             ConsoleEntry {
@@ -263,6 +286,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Listening + established sockets (ss -tulpn)",
                 tool: "ss",
                 provenance: Provenance::Fedora,
+                icon: IconId::Signal,
                 kind: EntryKind::Tab("ss -tulpn"),
             },
             ConsoleEntry {
@@ -270,6 +294,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "ICMP path quality to the lighthouse overlay (mtr)",
                 tool: "mtr",
                 provenance: Provenance::Fedora,
+                icon: IconId::Signal,
                 kind: EntryKind::Tab("mtr 10.42.0.1"),
             },
             ConsoleEntry {
@@ -277,6 +302,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "NetworkManager device + connection overview (nmcli)",
                 tool: "nmcli",
                 provenance: Provenance::Fedora,
+                icon: IconId::Settings,
                 kind: EntryKind::Tab("nmcli"),
             },
             ConsoleEntry {
@@ -284,6 +310,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Active zone: services, ports, rules (firewall-cmd)",
                 tool: "firewall-cmd",
                 provenance: Provenance::Fedora,
+                icon: IconId::Settings,
                 kind: EntryKind::Tab("sudo firewall-cmd --list-all"),
             },
         ],
@@ -296,6 +323,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "What would update, without changing anything (dnf)",
                 tool: "dnf",
                 provenance: Provenance::Fedora,
+                icon: IconId::Files,
                 kind: EntryKind::Tab("dnf check-update"),
             },
             ConsoleEntry {
@@ -303,6 +331,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Upgrade the whole system (sudo dnf upgrade)",
                 tool: "dnf",
                 provenance: Provenance::Fedora,
+                icon: IconId::Files,
                 kind: EntryKind::Tab("sudo dnf upgrade"),
             },
             ConsoleEntry {
@@ -310,6 +339,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Everything installed, searchable (dnf list)",
                 tool: "dnf",
                 provenance: Provenance::Fedora,
+                icon: IconId::Files,
                 kind: EntryKind::Tab("dnf list --installed"),
             },
             ConsoleEntry {
@@ -317,6 +347,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Update the mesh platform from the signed channel",
                 tool: "dnf",
                 provenance: Provenance::Quasar,
+                icon: IconId::MeshView,
                 kind: EntryKind::Tab("sudo dnf upgrade magic-mesh"),
             },
             ConsoleEntry {
@@ -324,6 +355,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "List + update the installed Flatpaks",
                 tool: "flatpak",
                 provenance: Provenance::Fedora,
+                icon: IconId::Files,
                 kind: EntryKind::Tab("bash -lc 'flatpak list; flatpak update'"),
             },
         ],
@@ -336,6 +368,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Filesystem fill + block-device tree (df, lsblk)",
                 tool: "df",
                 provenance: Provenance::Fedora,
+                icon: IconId::Storage,
                 kind: EntryKind::Tab("bash -lc 'df -h; echo; lsblk'"),
             },
             ConsoleEntry {
@@ -343,6 +376,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Interactive disk-usage explorer (ncdu)",
                 tool: "ncdu",
                 provenance: Provenance::Fedora,
+                icon: IconId::Storage,
                 kind: EntryKind::Tab("ncdu /"),
             },
             ConsoleEntry {
@@ -350,6 +384,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "SMART health verdict for each disk (smartctl -H)",
                 tool: "smartctl",
                 provenance: Provenance::Fedora,
+                icon: IconId::Storage,
                 kind: EntryKind::Tab(
                     "bash -lc 'for d in /dev/sd? /dev/nvme?n1; do [ -e \"$d\" ] && sudo smartctl -H \"$d\"; done'",
                 ),
@@ -359,6 +394,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "The mesh share mount + Syncthing sync status",
                 tool: "findmnt",
                 provenance: Provenance::Quasar,
+                icon: IconId::Storage,
                 kind: EntryKind::Tab(
                     "bash -lc 'findmnt /mnt/mesh-storage; echo; systemctl --no-pager status \"syncthing*\"'",
                 ),
@@ -373,6 +409,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "This node + fleet status roll-up (meshctl status)",
                 tool: "meshctl",
                 provenance: Provenance::Quasar,
+                icon: IconId::MeshView,
                 kind: EntryKind::Tab("meshctl status"),
             },
             ConsoleEntry {
@@ -380,6 +417,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Fleet-wide peer directory (meshctl fleet status)",
                 tool: "meshctl",
                 provenance: Provenance::Quasar,
+                icon: IconId::Node,
                 kind: EntryKind::Tab("meshctl fleet status"),
             },
             ConsoleEntry {
@@ -387,6 +425,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "The state/openstack mirror on the Bus spool",
                 tool: "",
                 provenance: Provenance::Quasar,
+                icon: IconId::MeshView,
                 kind: EntryKind::Tab(
                     "bash -lc 'ls -l \"${MDE_BUS_ROOT:-/run/mde-bus}/state/openstack\" 2>/dev/null || echo \"no cloud mirror published on this node\"'",
                 ),
@@ -396,6 +435,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Endpoint health + members (etcdctl)",
                 tool: "etcdctl",
                 provenance: Provenance::Quasar,
+                icon: IconId::Server,
                 kind: EntryKind::Tab("bash -lc 'etcdctl endpoint health; etcdctl member list'"),
             },
         ],
@@ -408,6 +448,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Every podman container, running or not",
                 tool: "podman",
                 provenance: Provenance::Fedora,
+                icon: IconId::Instances,
                 kind: EntryKind::Tab("podman ps --all"),
             },
             ConsoleEntry {
@@ -415,6 +456,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Every libvirt domain, running or not (virsh)",
                 tool: "virsh",
                 provenance: Provenance::Fedora,
+                icon: IconId::Instances,
                 kind: EntryKind::Tab("virsh list --all"),
             },
             ConsoleEntry {
@@ -422,6 +464,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "The cloud's server roster (openstack server list)",
                 tool: "openstack",
                 provenance: Provenance::Quasar,
+                icon: IconId::Server,
                 kind: EntryKind::Tab("openstack server list"),
             },
             ConsoleEntry {
@@ -429,6 +472,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Open the Instances surface — the VM lifecycle GUI",
                 tool: "",
                 provenance: Provenance::Quasar,
+                icon: IconId::Instances,
                 kind: EntryKind::Link(Surface::Instances),
             },
         ],
@@ -441,6 +485,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "A login shell as the seat user",
                 tool: "bash",
                 provenance: Provenance::Fedora,
+                icon: IconId::Terminal,
                 kind: EntryKind::Tab("bash -l"),
             },
             ConsoleEntry {
@@ -448,6 +493,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "A root login shell (sudo -i)",
                 tool: "sudo",
                 provenance: Provenance::Fedora,
+                icon: IconId::Terminal,
                 kind: EntryKind::Tab("sudo -i"),
             },
             ConsoleEntry {
@@ -455,6 +501,7 @@ const GROUPS: [ConsoleGroup; 7] = [
                 desc: "Attach or create the console tmux session",
                 tool: "tmux",
                 provenance: Provenance::Fedora,
+                icon: IconId::Terminal,
                 kind: EntryKind::Tab("tmux new-session -A -s console"),
             },
         ],
@@ -924,11 +971,18 @@ impl ConsoleState {
 /// Whether `tool` resolves to an executable on `$PATH` (`""` = no tool needed,
 /// always present). A real filesystem check — the honest greying's ground truth.
 fn tool_present(tool: &str) -> bool {
+    tool_present_in(tool, std::env::var_os("PATH"))
+}
+
+/// The [`tool_present`] core against an explicit `PATH` (`""` = always present).
+/// Split out so a fixture `PATH` can prove every declared tool resolves without
+/// mutating the process-global environment (which would race the test suite).
+fn tool_present_in(tool: &str, path: Option<std::ffi::OsString>) -> bool {
     use std::os::unix::fs::PermissionsExt;
     if tool.is_empty() {
         return true;
     }
-    let Some(path) = std::env::var_os("PATH") else {
+    let Some(path) = path else {
         return false;
     };
     std::env::split_paths(&path).any(|dir| {
@@ -1490,9 +1544,10 @@ fn heading(ui: &mut egui::Ui, label: &str) -> egui::Rect {
     rect
 }
 
-/// One entry row (lock #33): the row glyph (a surface link wears its surface's
-/// brand glyph; a command entry wears the Terminal front-door glyph), the label
-/// over the one-line description, and the subtle provenance tag (lock #38). An
+/// One entry row (lock #33): the row's declared domain glyph (System / Storage
+/// / Mesh / Instances / Signal / … — a surface link wears its surface's own
+/// glyph), the label over the one-line description, and the subtle provenance
+/// tag (lock #38). An
 /// absent tool greys the row + names the absence in-line (§7). The focused row
 /// wears the EXPLORER-18 focus ring (lock #48) and scrolls itself into view
 /// when the ring just moved. Returns `true` on a click (the caller activates).
@@ -1522,11 +1577,10 @@ fn entry_row(ui: &mut egui::Ui, flat: usize, entry: &ConsoleEntry, state: &Conso
         }
     }
 
-    // The row glyph, through the dock's shared cached loader (§6).
-    let icon_id = match entry.kind {
-        EntryKind::Link(surface) => surface.icon_id(),
-        EntryKind::Tab(_) => IconId::Terminal,
-    };
+    // The row's domain glyph (lock #33), through the dock's shared cached
+    // loader (§6) — each entry declares its own (a surface link wears its
+    // surface's glyph), so the list scans by domain, not one blanket icon.
+    let icon_id = entry.icon;
     let tint = if !present {
         Style::TEXT_DIM
     } else if hovered || focused {
@@ -1730,8 +1784,8 @@ mod tests {
     use super::{
         console_confirm_id, console_entry_id, console_heading_id, console_panel, console_power_id,
         console_rail_id, entry_at, identity_line, launch_argv, static_rows, tool_present,
-        total_rows, ConsoleRequest, ConsoleState, CustomEntry, EntryKind, GateReason, PowerAction,
-        CONSOLE_AREA, GROUPS, PINNED,
+        tool_present_in, total_rows, ConsoleRequest, ConsoleState, CustomEntry, EntryKind,
+        GateReason, PowerAction, CONSOLE_AREA, GROUPS, PINNED,
     };
     use crate::dock::Surface;
     use mde_egui::egui;
@@ -1875,6 +1929,87 @@ mod tests {
         assert!(tool_present("sh"), "sh must resolve on $PATH");
         assert!(!tool_present("definitely-not-a-real-tool-xyzzy"));
         assert!(tool_present(""));
+    }
+
+    #[test]
+    fn every_entry_wears_its_own_domain_glyph_and_links_match_their_surface() {
+        // Lock #33 — every row declares its OWN domain glyph (not one blanket
+        // terminal icon), and a surface-link entry wears its surface's own
+        // glyph so the iconography stays 1:1 with the surface identity.
+        let mut glyphs = std::collections::BTreeSet::new();
+        for entry in static_rows() {
+            if let EntryKind::Link(surface) = entry.kind {
+                assert_eq!(
+                    entry.icon,
+                    surface.icon_id(),
+                    "{} links to {surface:?} but wears a different glyph",
+                    entry.label,
+                );
+            }
+            glyphs.insert(entry.icon.name());
+        }
+        // The table spans several distinct domain glyphs — proof it is NOT the
+        // old wall of identical terminal icons.
+        assert!(
+            glyphs.len() >= 6,
+            "the entry table should span several domain glyphs, saw {glyphs:?}"
+        );
+    }
+
+    #[test]
+    fn every_declared_tool_resolves_against_a_fixture_path() {
+        // The §7 honest gate's positive proof: stage a stub executable for
+        // every tool the table declares, then assert every entry resolves
+        // present on that fixture $PATH — every entry maps to a REAL,
+        // correctly-named command (a typo'd tool would fail here), while an
+        // unstaged name stays absent (the greying's ground truth). No global
+        // env mutation — the fixture PATH is passed straight to the core.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path();
+        let tools: std::collections::BTreeSet<&str> = static_rows()
+            .map(|e| e.tool)
+            .filter(|t| !t.is_empty())
+            .collect();
+        for tool in &tools {
+            let path = bin.join(tool);
+            std::fs::write(&path, "#!/bin/sh\n").expect("write stub");
+            let mut perms = std::fs::metadata(&path).expect("stat stub").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).expect("chmod stub");
+        }
+        let fixture = bin.as_os_str().to_os_string();
+        for entry in static_rows() {
+            assert!(
+                tool_present_in(entry.tool, Some(fixture.clone())),
+                "{} tool {:?} did not resolve on the fixture PATH",
+                entry.label,
+                entry.tool,
+            );
+        }
+        assert!(
+            !tool_present_in("mcnf-definitely-absent-xyzzy", Some(fixture)),
+            "an unstaged tool must stay absent (the honest gate's ground truth)"
+        );
+    }
+
+    #[test]
+    fn the_containers_and_vms_plane_link_routes_to_the_instances_surface() {
+        // Q41/Q50 — the combined Containers & VMs group carries the surface
+        // link that routes to the Cloud/Instances PLANE (a GUI surface), NOT a
+        // terminal tab; activating it records Goto(Instances) and closes.
+        let flat = static_rows()
+            .position(|e| e.kind == EntryKind::Link(Surface::Instances))
+            .expect("the Cloud-plane surface link exists");
+        let mut s = ConsoleState::with_store(None);
+        s.toggle();
+        s.activate(flat);
+        assert_eq!(
+            s.take_request(),
+            Some(ConsoleRequest::Goto(Surface::Instances)),
+            "the Containers & VMs plane link routes to the Instances surface"
+        );
+        assert!(!s.is_open(), "a routed surface link closes the panel");
     }
 
     #[test]
