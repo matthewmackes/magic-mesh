@@ -27,6 +27,15 @@
 //! with no backing, so it reads like the Win10 "Activate Windows" text: visible,
 //! never competing. It paints wherever the backdrop paints; the role is honestly
 //! omitted when no `role.toml` is pinned (§7).
+//!
+//! NAVBAR-W10-6 (lock W12b) makes that watermark a **live link to the About surface**:
+//! the union of the three ghost lines is one hover/click target — hover brightens the
+//! ink one token step (the affordance; still no tooltip, W6) and a click latches an
+//! [`Surface::About`] nav-request into egui memory, which the shell drains through its
+//! one nav ([`take_nav_request`]). The backdrop layer owns no surface state, so the
+//! request rides the same egui-memory seam the wallpaper cache does — the `take_*`
+//! drain idiom the picker/desktop faces (`chooser::take_connect` /
+//! `vdi::take_return_to_chrome`) already use.
 
 #![allow(
     clippy::redundant_pub_crate,
@@ -49,6 +58,7 @@ use serde::{Deserialize, Serialize};
 use mackes_mesh_types::peers::default_workgroup_root;
 
 use crate::chooser::decode_png_rgba;
+use crate::dock::Surface;
 
 /// The installed wallpaper directory — QBRAND-9 drops all five official wallpapers
 /// here in the RPM. The selected one is loaded from disk at runtime.
@@ -92,6 +102,17 @@ const WATERMARK_PRODUCT: &str = "MDE Quazar";
 /// the Win10 "Activate Windows" register — visible over the artwork, never
 /// competing with content (§4: a faded token, never a raw hex).
 const WATERMARK_GHOST: f32 = 0.6;
+
+/// The stable egui id of the watermark's one hover/click target (lock W12b) — the
+/// union of the three ghost lines, so the whole mark is a single About affordance
+/// with no dead zone between the lines.
+const WATERMARK_LINK_ID: &str = "shell-watermark-about-link";
+
+/// The egui-memory key the watermark's [`Surface::About`] nav-request latches under
+/// (lock W12b). The backdrop layer owns no surface state, so a click stows the target
+/// here for the shell to drain next frame ([`take_nav_request`]) — the same memory
+/// seam the wallpaper cache rides.
+const NAV_REQUEST_KEY: &str = "shell-backdrop-nav-request";
 
 /// The pinned deployment role file — `mde-role`'s canonical path. The watermark
 /// reads it directly (only the pinned token is wanted for the node line, not the
@@ -234,8 +255,9 @@ pub(crate) fn show(ui: &egui::Ui, coverage: Coverage, status: Option<(&str, &str
 
     // NAVBAR-W10-3 (lock W12) — the brand watermark: three ghost lines in the
     // bottom-right, clear of the taskbar. Painted over the scrim so its ghost
-    // weight holds on empty and covered displays alike.
-    paint_watermark(&painter, free, ui.ctx().screen_rect());
+    // weight holds on empty and covered displays alike. NAVBAR-W10-6 (lock W12b):
+    // it's a live About link — `ui` carries the hover/click interaction.
+    paint_watermark(ui, &painter, free, ui.ctx().screen_rect());
 
     // Any honest status (the empty-desktop copy, a gated-transport note) — a small
     // block low on the field, over a subtle backing so it reads over the artwork.
@@ -321,13 +343,32 @@ fn paint_status(painter: &egui::Painter, free: Rect, title: &str, detail: &str) 
 /// corner, a margin above where the taskbar mounts. The product mark sits slightly
 /// larger over the version + node lines; all three in faded [`Style::TEXT_DIM`]
 /// ink with no backing, so the mark reads over the artwork without competing.
-fn paint_watermark(painter: &egui::Painter, free: Rect, screen: Rect) {
+///
+/// NAVBAR-W10-6 (lock W12b) makes the block a **live About link**: the union of the
+/// three text rects is one hover/click target — hover brightens the ink one token
+/// step ([`watermark_ink`]; no tooltip, W6) and a click latches an
+/// [`Surface::About`] nav-request the shell drains ([`take_nav_request`]).
+fn paint_watermark(ui: &egui::Ui, painter: &egui::Painter, free: Rect, screen: Rect) {
     let [product, version, node] = watermark();
-    let ink = Style::TEXT_DIM.gamma_multiply(WATERMARK_GHOST);
+    // Lay the three lines out once at a placeholder colour (a galley's size is
+    // ink-independent), so a single layout serves both the resting ghost and the
+    // hover-brightened link — the ink is applied as a paint-time override below.
     let galleys = [
-        painter.layout_no_wrap(product.clone(), FontId::proportional(Style::BODY), ink),
-        painter.layout_no_wrap(version.clone(), FontId::proportional(Style::SMALL), ink),
-        painter.layout_no_wrap(node.clone(), FontId::proportional(Style::SMALL), ink),
+        painter.layout_no_wrap(
+            product.clone(),
+            FontId::proportional(Style::BODY),
+            egui::Color32::PLACEHOLDER,
+        ),
+        painter.layout_no_wrap(
+            version.clone(),
+            FontId::proportional(Style::SMALL),
+            egui::Color32::PLACEHOLDER,
+        ),
+        painter.layout_no_wrap(
+            node.clone(),
+            FontId::proportional(Style::SMALL),
+            egui::Color32::PLACEHOLDER,
+        ),
     ];
 
     // The taskbar mounts at the screen's bottom edge, so in the mounted shell the
@@ -338,16 +379,81 @@ fn paint_watermark(painter: &egui::Painter, free: Rect, screen: Rect) {
     let right = free.right() - Style::SP_L;
     let mut bottom = free.bottom().min(screen.bottom() - crate::dock::TASKBAR_H) - Style::SP_L;
 
-    // Stack bottom-up: node at the anchor, version above it, product on top.
-    for galley in galleys.iter().rev() {
-        bottom -= galley.size().y;
-        painter.galley(
-            egui::pos2(right - galley.size().x, bottom),
-            galley.clone(),
-            ink,
-        );
+    // Place each line bottom-up (node at the anchor, version above it, product on
+    // top), recording its paint position — the layout is byte-for-byte the W10-3
+    // stack, split out only so the union of the line rects can be one click target.
+    let mut positions = [egui::Pos2::ZERO; 3];
+    for (galley, pos) in galleys.iter().zip(positions.iter_mut()).rev() {
+        let size = galley.size();
+        bottom -= size.y;
+        *pos = egui::pos2(right - size.x, bottom);
         bottom -= Style::SP_XS;
     }
+
+    // The union of the three text rects is the single hover/click region (W12b — the
+    // click region IS the text, never a dead zone around or between the lines).
+    let mut region = Rect::NOTHING;
+    for (galley, &pos) in galleys.iter().zip(positions.iter()) {
+        region = region.union(Rect::from_min_size(pos, galley.size()));
+    }
+
+    // The watermark is a live link to About (W12b): sense a click over the text
+    // region, brighten the ink one token step on hover (the affordance, no tooltip),
+    // and latch the About nav-request the shell drains on click.
+    let response = ui.interact(
+        region,
+        egui::Id::new(WATERMARK_LINK_ID),
+        egui::Sense::click(),
+    );
+    if response.clicked() {
+        request_nav(ui.ctx(), Surface::About);
+    }
+    let ink = watermark_ink(response.hovered());
+    for (galley, &pos) in galleys.iter().zip(positions.iter()) {
+        painter.galley_with_override_text_color(pos, galley.clone(), ink);
+    }
+}
+
+/// The watermark ink for the current hover state (lock W12b): the resting Win10-
+/// activation ghost ([`Style::TEXT_DIM`] faded by [`WATERMARK_GHOST`]), brightened
+/// one token step to the full [`Style::TEXT_DIM`] on hover — the affordance that the
+/// mark is a live About link, with no tooltip (W6). Pure — unit-tested without egui.
+fn watermark_ink(hovered: bool) -> egui::Color32 {
+    if hovered {
+        Style::TEXT_DIM
+    } else {
+        Style::TEXT_DIM.gamma_multiply(WATERMARK_GHOST)
+    }
+}
+
+/// Latch a nav-request into egui memory for the shell to drain (lock W12b). The
+/// backdrop layer owns no surface state, so the watermark link stows its target
+/// here — the same memory seam the wallpaper cache rides — rather than reaching the
+/// shell nav directly.
+fn request_nav(ctx: &egui::Context, surface: Surface) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(NAV_REQUEST_KEY), surface));
+}
+
+/// Take the backdrop's pending nav-request (the W12b watermark→About link), if any —
+/// a one-shot drain mirroring `chooser::ChooserState::take_connect`: the shell calls
+/// this each frame and routes the returned [`Surface`] through its own nav, and a
+/// second call in the same frame yields `None`. Returns `None` when nothing was
+/// clicked.
+#[allow(
+    dead_code,
+    reason = "the shell drains this each frame to route the W12b watermark→About \
+              click; wiring it is the one-line main.rs nav hookup, held out of this \
+              unit to avoid the concurrent Surface edit main.rs is carrying"
+)]
+pub(crate) fn take_nav_request(ctx: &egui::Context) -> Option<Surface> {
+    let id = egui::Id::new(NAV_REQUEST_KEY);
+    ctx.data_mut(|d| {
+        let taken = d.get_temp::<Surface>(id);
+        if taken.is_some() {
+            d.remove::<Surface>(id);
+        }
+        taken
+    })
 }
 
 // ─────────────────────────── the resolved-texture cache ───────────────────────────
@@ -1003,6 +1109,150 @@ mod tests {
         assert!(
             !prims.is_empty(),
             "the watermark backdrop produced no draw primitives"
+        );
+    }
+
+    // ─────────────── NAVBAR-W10-6 — the watermark→About link (W12b) ───────────────
+
+    /// A primary-button press/release event at `pos` (the egui click model: press one
+    /// frame, release the next), mirroring the tray/dock click tests.
+    fn press(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    /// Every watermark line's painted **override** colour this frame — the ink the
+    /// hover state resolved to (`galley_with_override_text_color` stamps it onto the
+    /// `TextShape`). Keyed by the line text so a test can assert per line.
+    fn watermark_inks(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, egui::Color32)> {
+        fn walk(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Color32)>) {
+            match shape {
+                egui::epaint::Shape::Text(t) => {
+                    if let Some(c) = t.override_text_color {
+                        out.push((t.galley.text().to_owned(), c));
+                    }
+                }
+                egui::epaint::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// Run one headless 960×640 backdrop frame (empty desktop, no status) feeding
+    /// `events`, returning the frame output for shape inspection.
+    fn watermark_frame(ctx: &egui::Context, events: Vec<egui::Event>) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            events,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| show(ui, Coverage::Empty, None));
+        })
+    }
+
+    #[test]
+    fn watermark_ink_brightens_one_token_step_on_hover() {
+        // Lock W12b — the resting ink is the ghosted TEXT_DIM (the Win10-activation
+        // register); hover firms it up one token step to the full TEXT_DIM, the
+        // affordance that the mark is a live link (still no tooltip, W6).
+        let rest = watermark_ink(false);
+        let hot = watermark_ink(true);
+        assert_eq!(rest, Style::TEXT_DIM.gamma_multiply(WATERMARK_GHOST));
+        assert_eq!(hot, Style::TEXT_DIM);
+        assert_ne!(rest, hot, "hover must change the ink");
+        // "Brighter" = no channel drops and at least one rises (a ghost is a gamma
+        // fade toward black, so un-ghosting only raises the channels).
+        assert!(
+            hot.r() >= rest.r()
+                && hot.g() >= rest.g()
+                && hot.b() >= rest.b()
+                && (hot.r() > rest.r() || hot.g() > rest.g() || hot.b() > rest.b()),
+            "hover ink {hot:?} must be brighter than the ghost {rest:?}"
+        );
+    }
+
+    #[test]
+    fn hovering_the_watermark_brightens_the_painted_ink() {
+        // The painted proof: pointer off the mark → every line paints the ghost ink;
+        // pointer over the mark's rect → every line paints the brightened link ink,
+        // so the W12b hover affordance actually reaches the paint list.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        // Settle the interact region, then read its centre back by the stable id.
+        let _ = watermark_frame(&ctx, Vec::new());
+        let region = ctx
+            .read_response(egui::Id::new(WATERMARK_LINK_ID))
+            .expect("the watermark link region is registered")
+            .rect;
+        let center = region.center();
+
+        // Off the mark (pointer parked top-left): the resting ghost ink on all three.
+        let cold = watermark_frame(&ctx, vec![egui::Event::PointerMoved(pos2(4.0, 4.0))]);
+        let ghost = Style::TEXT_DIM.gamma_multiply(WATERMARK_GHOST);
+        let cold_inks = watermark_inks(&cold.shapes);
+        assert_eq!(cold_inks.len(), 3, "three watermark lines paint");
+        assert!(
+            cold_inks.iter().all(|(_, c)| *c == ghost),
+            "un-hovered lines paint the ghost ink: {cold_inks:?}"
+        );
+
+        // Over the mark: every line brightens one token step to full TEXT_DIM.
+        let hot = watermark_frame(&ctx, vec![egui::Event::PointerMoved(center)]);
+        let hot_inks = watermark_inks(&hot.shapes);
+        assert_eq!(hot_inks.len(), 3, "three watermark lines paint");
+        assert!(
+            hot_inks.iter().all(|(_, c)| *c == Style::TEXT_DIM),
+            "hovered lines brighten to TEXT_DIM: {hot_inks:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_the_watermark_requests_the_about_surface() {
+        // Lock W12b — a click anywhere on the three-line block latches a
+        // Surface::About nav-request the shell drains; the drain is one-shot (a second
+        // take yields None), and nothing is pending before a click.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        assert_eq!(take_nav_request(&ctx), None, "no request before a click");
+
+        // Settle the region, read its centre, then click it (press one frame, release
+        // the next — the egui click model the tray/dock tests use).
+        let _ = watermark_frame(&ctx, Vec::new());
+        let center = ctx
+            .read_response(egui::Id::new(WATERMARK_LINK_ID))
+            .expect("the watermark link region is registered")
+            .rect
+            .center();
+        let _ = watermark_frame(
+            &ctx,
+            vec![egui::Event::PointerMoved(center), press(center, true)],
+        );
+        let _ = watermark_frame(&ctx, vec![press(center, false)]);
+
+        assert_eq!(
+            take_nav_request(&ctx),
+            Some(Surface::About),
+            "clicking the watermark routes to About"
+        );
+        assert_eq!(
+            take_nav_request(&ctx),
+            None,
+            "the nav-request drain is one-shot"
         );
     }
 }
