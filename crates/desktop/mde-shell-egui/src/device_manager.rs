@@ -19,7 +19,7 @@
 //! honest "no inventory yet", never a faked tree; absent summary fields render as
 //! an em-dash, never invented totals.
 //!
-//! **Scope now covers DEVMGR-2 + DEVMGR-3 + DEVMGR-4 + DEVMGR-5** — the by-type tree + header card +
+//! **Scope now covers DEVMGR-2 through DEVMGR-7** — the by-type tree + header card +
 //! local read (DEVMGR-2), plus the bottom **detail drawer** (General / Driver /
 //! Details / Events / Resources, #9/#10), the **MDM problem-code parity** (#11 —
 //! `DeviceStatus` → Windows Code 28/22/10 with the honest Linux reason beside it),
@@ -64,6 +64,20 @@
 //! shared KIRON toast lane; a failed write raises an error toast, never a silent
 //! no-op (§7). A host with nothing published exports an honest "no inventory yet"
 //! report, never a fabricated tree.
+//!
+//! **DEVMGR-7 adds the honest device actions (#12)** — the MDM per-device action
+//! set, offered as a right-click **context menu** on any device row plus a Copy
+//! button in the detail drawer: **Properties** (open the device's property sheet —
+//! the DEVMGR-3 drawer), **Scan for hardware changes** (re-read the inventory — the
+//! honest rescan, the same seam as the Action-menu Scan), and **Copy device
+//! details** (the full field dump to the seat clipboard, [`render_device_details`]).
+//! Because this surface is a **read-only** §6 consumer of the published inventory
+//! JSON — it holds no privileged-exec / worker-request seam — MDM's
+//! hardware-mutating verbs (Enable/Disable, Reload kernel module) cannot be
+//! performed honestly from here and are **omitted, not greyed** (§7/§8): they belong
+//! to the mesh-side producer on the node itself (a later request-channel unit), and
+//! a muted caption in the context menu says so rather than shipping a placebo
+//! control. No destructive action ships, so no typed-arming gate is needed here.
 //!
 //! The cross-fleet By-node flatten is still a later unit; its seam here (the
 //! disabled By-node mode) is left clean, not stubbed.
@@ -907,6 +921,7 @@ impl DeviceManagerState {
         // the highlight reads current selection without borrowing `self.selected`.
         let mut toggled: Option<String> = None;
         let mut clicked: Option<DeviceSelection> = None;
+        let mut action: Option<RowActionRequest> = None;
         let selected = self.selected.clone();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -923,6 +938,9 @@ impl DeviceManagerState {
                     if let Some(sel) = out.selected {
                         clicked = Some(sel);
                     }
+                    if let Some(req) = out.action {
+                        action = Some(req);
+                    }
                 }
             });
         if let Some(key) = toggled {
@@ -930,6 +948,9 @@ impl DeviceManagerState {
         }
         if let Some(sel) = clicked {
             self.toggle_device_selection(sel);
+        }
+        if let Some(req) = action {
+            self.apply_row_action(req, ui.ctx());
         }
     }
 
@@ -944,6 +965,32 @@ impl DeviceManagerState {
         } else {
             self.selected = Some(sel);
             self.active_tab = DrawerTab::General;
+        }
+    }
+
+    /// Dispatch a DEVMGR-7 device-row context-menu action to its real seam (§7 —
+    /// the honest, read-only subset of MDM's device verbs): **Properties** opens the
+    /// device's property sheet (the DEVMGR-3 drawer, always opening — never toggling
+    /// closed like a row click), **Scan** re-reads the inventory (the honest rescan,
+    /// the same seam as the Action-menu Scan), and **Copy device details** dumps the
+    /// full record to the seat clipboard ([`render_device_details`]) + confirms on
+    /// the toast lane. The mutating verbs (Enable/Disable, Reload module) are
+    /// honestly omitted upstream (this surface has no privileged-exec seam), so
+    /// there is nothing destructive to typed-arm here.
+    fn apply_row_action(&mut self, req: RowActionRequest, ctx: &egui::Context) {
+        match req {
+            RowActionRequest::Properties(sel) => {
+                self.selected = Some(sel);
+                self.active_tab = DrawerTab::General;
+            }
+            RowActionRequest::Scan => self.refresh(),
+            RowActionRequest::CopyDetails(dev) => {
+                ctx.copy_text(render_device_details(&dev));
+                raise_toast(
+                    "info",
+                    &format!("Copied {} details to the clipboard", dev.name),
+                );
+            }
         }
     }
 
@@ -962,6 +1009,7 @@ impl DeviceManagerState {
         // this frame — applied AFTER the read borrow ends (as in [`Self::tree`]).
         let mut toggled: Option<String> = None;
         let mut clicked: Option<DeviceSelection> = None;
+        let mut action: Option<RowActionRequest> = None;
         let selected = self.selected.clone();
         // Build an owned tree (clones the records) so the immutable inventory
         // borrow ends before the mutate-after-frame toggle/selection below.
@@ -990,8 +1038,12 @@ impl DeviceManagerState {
                         let is_sel = selected
                             .as_ref()
                             .is_some_and(|s| s.matches(&node.category, dev));
-                        if device_row(ui, dev, is_sel) {
+                        let out = device_row(ui, dev, &node.category, is_sel);
+                        if out.clicked {
                             clicked = Some(DeviceSelection::of(&node.category, dev));
+                        }
+                        if let Some(req) = out.action {
+                            action = Some(req);
                         }
                     } else {
                         // A synthetic bus / controller branch — its devices nest
@@ -1004,6 +1056,9 @@ impl DeviceManagerState {
                         if let Some(sel) = out.selected {
                             clicked = Some(sel);
                         }
+                        if let Some(req) = out.action {
+                            action = Some(req);
+                        }
                     }
                 }
             });
@@ -1012,6 +1067,9 @@ impl DeviceManagerState {
         }
         if let Some(sel) = clicked {
             self.toggle_device_selection(sel);
+        }
+        if let Some(req) = action {
+            self.apply_row_action(req, ui.ctx());
         }
     }
 
@@ -1037,19 +1095,29 @@ impl DeviceManagerState {
 
         let mut tab = self.active_tab;
         let mut close = false;
+        let mut copy = false;
         egui::TopBottomPanel::bottom(ui.id().with("devmgr-detail-drawer"))
             .resizable(true)
             .min_height(Style::SP_XL * 4.0)
             .default_height(Style::SP_XL * 7.0)
             .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
             .show_inside(ui, |ui| {
-                drawer_header(ui, &dev, &mut close);
+                drawer_header(ui, &dev, &mut close, &mut copy);
                 drawer_tabs(ui, &mut tab);
                 ui.separator();
                 ui.add_space(Style::SP_XS);
                 drawer_body(ui, &dev, tab);
             });
         self.active_tab = tab;
+        if copy {
+            // The DEVMGR-7 Copy-info action, reached from the drawer (the
+            // non-right-click path) — the same seam the row context menu drives.
+            ui.ctx().copy_text(render_device_details(&dev));
+            raise_toast(
+                "info",
+                &format!("Copied {} details to the clipboard", dev.name),
+            );
+        }
         if close {
             self.selected = None;
         }
@@ -1426,13 +1494,16 @@ fn problem_suffix(problems: usize) -> String {
 }
 
 /// What a rendered [`category_header`] reports back for one frame: whether the
-/// header was clicked (the caller toggles the expand set) and any device row the
-/// operator selected (the caller opens the drawer).
+/// header was clicked (the caller toggles the expand set), any device row the
+/// operator selected (the caller opens the drawer), and any DEVMGR-7 context-menu
+/// action the operator chose on a device row (the caller dispatches it).
 struct CategoryOutcome {
     /// The collapsing header was clicked (toggle this category's expansion).
     header_clicked: bool,
     /// A device row was clicked (open/toggle its detail drawer).
     selected: Option<DeviceSelection>,
+    /// A device-row context-menu action the operator chose (DEVMGR-7).
+    action: Option<RowActionRequest>,
 }
 
 /// One category branch — a forced-state collapsing header (its open/closed driven
@@ -1457,20 +1528,26 @@ fn category_header(
         let _ = write!(title, "   \u{26A0} {problems}"); // ⚠ N
     }
     let mut clicked: Option<DeviceSelection> = None;
+    let mut action: Option<RowActionRequest> = None;
     let resp = egui::CollapsingHeader::new(RichText::new(title).color(tone).size(Style::BODY))
         .id_salt(("dm-cat", cat.key.as_str()))
         .open(Some(open))
         .show(ui, |ui| {
             for dev in &cat.devices {
                 let is_sel = selected.is_some_and(|s| s.matches(&cat.key, dev));
-                if device_row(ui, dev, is_sel) {
+                let out = device_row(ui, dev, &cat.key, is_sel);
+                if out.clicked {
                     clicked = Some(DeviceSelection::of(&cat.key, dev));
+                }
+                if let Some(req) = out.action {
+                    action = Some(req);
                 }
             }
         });
     CategoryOutcome {
         header_clicked: resp.header_response.clicked(),
         selected: clicked,
+        action,
     }
 }
 
@@ -1712,6 +1789,7 @@ fn conn_bus_header(
         let _ = write!(title, "   \u{26A0} {problems}"); // ⚠ N
     }
     let mut clicked: Option<DeviceSelection> = None;
+    let mut action: Option<RowActionRequest> = None;
     let resp = egui::CollapsingHeader::new(RichText::new(title).color(tone).size(Style::BODY))
         .id_salt(("dm-conn", node.key.as_str()))
         .open(Some(open))
@@ -1719,8 +1797,12 @@ fn conn_bus_header(
             for child in &node.children {
                 if let Some(dev) = &child.device {
                     let is_sel = selected.is_some_and(|s| s.matches(&child.category, dev));
-                    if device_row(ui, dev, is_sel) {
+                    let out = device_row(ui, dev, &child.category, is_sel);
+                    if out.clicked {
                         clicked = Some(DeviceSelection::of(&child.category, dev));
+                    }
+                    if let Some(req) = out.action {
+                        action = Some(req);
                     }
                 }
             }
@@ -1728,15 +1810,116 @@ fn conn_bus_header(
     CategoryOutcome {
         header_clicked: resp.header_response.clicked(),
         selected: clicked,
+        action,
     }
 }
 
-/// One device row — a clickable selection row (DEVMGR-3): a status dot in the
-/// device's [`status_tone`], the name (accent-tinted when selected), the MDM
-/// **problem-code badge** for a faulted device (#11), and the honest Linux reason
-/// from the schema, dimmed. Returns `true` when the row was clicked this frame (the
-/// caller opens/toggles the bottom detail drawer).
-fn device_row(ui: &mut egui::Ui, dev: &DeviceRecord, selected: bool) -> bool {
+// ───────────────────── device actions (DEVMGR-7, #12) ───────────────────────
+
+/// The **honest, read-only** subset of MDM's per-device action verbs this
+/// inventory panel can perform (DEVMGR-7, #12) — offered as a right-click context
+/// menu on a device row. This surface is a §6 consumer of the published inventory
+/// JSON and holds no privileged-exec / worker-request seam, so MDM's
+/// hardware-mutating verbs (Enable/Disable, Reload kernel module) are **omitted,
+/// not greyed** (§7/§8) — they belong to the mesh-side producer on the node. `Copy`
+/// so the static action table can hold it by value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceAction {
+    /// Open the device's property sheet (the DEVMGR-3 detail drawer).
+    Properties,
+    /// Re-read the inventory (the honest rescan — the same seam as Action → Scan).
+    Scan,
+    /// Copy the full device detail dump to the seat clipboard.
+    CopyDetails,
+}
+
+impl DeviceAction {
+    /// The honest action set the context menu offers, in MDM order. Deliberately
+    /// omits Enable/Disable + Reload module (no honest seam from a read-only
+    /// consumer, §7/§8) — asserted by the DEVMGR-7 action-set test.
+    const ALL: [Self; 3] = [Self::Properties, Self::Scan, Self::CopyDetails];
+
+    /// The menu-item label (glyph + verb), in the shell's context-menu idiom.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Properties => "\u{2699}  Properties",           // ⚙
+            Self::Scan => "\u{21BB}  Scan for hardware changes",  // ↻
+            Self::CopyDetails => "\u{29C9}  Copy device details", // ⧉
+        }
+    }
+}
+
+/// A resolved DEVMGR-7 action request bubbled up from a device-row context menu to
+/// [`DeviceManagerState::apply_row_action`], already carrying the payload the seam
+/// needs (the selection to open, or the record to copy) so the state applies it
+/// after the immutable inventory borrow ends (as with row selection / header
+/// toggles).
+#[derive(Debug, Clone)]
+enum RowActionRequest {
+    /// Open the property sheet for this device (its stable selection key).
+    Properties(DeviceSelection),
+    /// Re-read the inventory (no per-device payload — the honest rescan).
+    Scan,
+    /// Copy this device's full detail dump to the clipboard. The record is boxed so
+    /// this large payload never bloats the small [`Properties`](Self::Properties) /
+    /// [`Scan`](Self::Scan) variants (`clippy::large_enum_variant`).
+    CopyDetails(Box<DeviceRecord>),
+}
+
+/// What a device row reports back for one frame (DEVMGR-7): a left-click selection
+/// (open/toggle its detail drawer) and/or a context-menu action the operator chose,
+/// both applied after the read borrow ends.
+struct RowOutcome {
+    /// The row was left-clicked (open/toggle the detail drawer).
+    clicked: bool,
+    /// A context-menu action the operator chose on this device (DEVMGR-7).
+    action: Option<RowActionRequest>,
+}
+
+/// The device-row right-click context menu (DEVMGR-7, #12) — the honest MDM action
+/// set for one device: **Properties** (open the drawer), **Scan for hardware
+/// changes** (re-read), **Copy device details** (clipboard). A muted caption below
+/// them honestly states the read-only posture (§7) — why MDM's Enable/Disable +
+/// driver-reload verbs are absent — rather than shipping a greyed placebo (§8).
+/// Returns the chosen [`RowActionRequest`] (the caller dispatches it).
+fn device_context_menu(
+    ui: &mut egui::Ui,
+    category: &str,
+    dev: &DeviceRecord,
+) -> Option<RowActionRequest> {
+    let mut chosen: Option<RowActionRequest> = None;
+    for action in DeviceAction::ALL {
+        if ui
+            .button(RichText::new(action.label()).color(Style::TEXT))
+            .clicked()
+        {
+            chosen = Some(match action {
+                DeviceAction::Properties => {
+                    RowActionRequest::Properties(DeviceSelection::of(category, dev))
+                }
+                DeviceAction::Scan => RowActionRequest::Scan,
+                DeviceAction::CopyDetails => RowActionRequest::CopyDetails(Box::new(dev.clone())),
+            });
+            ui.close_menu();
+        }
+    }
+    ui.separator();
+    // Honest disclosure (§7), not a placebo control (§8): the mutating verbs run on
+    // the node, not from this read-only inventory viewer.
+    muted_note(
+        ui,
+        "Read-only inventory \u{2014} enable/disable + driver reload run on the node.",
+    );
+    chosen
+}
+
+/// One device row — a clickable selection row (DEVMGR-3) carrying the DEVMGR-7
+/// right-click action menu: a status dot in the device's [`status_tone`], the name
+/// (accent-tinted when selected), the MDM **problem-code badge** for a faulted
+/// device (#11), and the honest Linux reason from the schema, dimmed. Returns a
+/// [`RowOutcome`] — a left-click selection (open/toggle the drawer) and any
+/// context-menu action the operator chose for this device.
+fn device_row(ui: &mut egui::Ui, dev: &DeviceRecord, category: &str, selected: bool) -> RowOutcome {
     let inner = ui
         .horizontal(|ui| {
             status_dot(ui, status_tone(dev.status));
@@ -1759,11 +1942,73 @@ fn device_row(ui: &mut egui::Ui, dev: &DeviceRecord, selected: bool) -> bool {
         })
         .response;
     // The row's labels don't sense clicks, so re-interact the whole strip as one
-    // selection target (the MDM "click a device to inspect it" affordance).
-    inner
+    // selection target (the MDM "click a device to inspect it" affordance) that also
+    // carries the DEVMGR-7 right-click action menu.
+    let resp = inner
         .interact(egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .clicked()
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let mut action: Option<RowActionRequest> = None;
+    resp.context_menu(|ui| action = device_context_menu(ui, category, dev));
+    RowOutcome {
+        clicked: resp.clicked(),
+        action,
+    }
+}
+
+/// The full device detail dump copied to the clipboard by DEVMGR-7's **Copy device
+/// details** action — every field the five drawer tabs render (#10), as a plain-text
+/// block: identity (name / manufacturer / model / hardware IDs), the MDM device
+/// status line ([`device_status_display`], carrying the problem code + honest Linux
+/// reason), the bound driver, the sysfs details, and the resources + recent events.
+/// Absent scalar fields read as an honest em-dash and empty lists as a "none
+/// reported" line (§7 — never a fabricated value), mirroring the tabs. Pure, so the
+/// dump is unit-tested without a render.
+fn render_device_details(dev: &DeviceRecord) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let opt = |v: Option<&str>| v.map_or_else(dash, str::to_string);
+    let _ = writeln!(out, "Device: {}", dev.name);
+    let _ = writeln!(out, "Manufacturer: {}", opt(dev.vendor.as_deref()));
+    let _ = writeln!(out, "Model: {}", opt(dev.model.as_deref()));
+    let _ = writeln!(out, "Hardware IDs: {}", opt(dev.ids.as_deref()));
+    let (status, _) = device_status_display(dev);
+    let _ = writeln!(out, "Status: {status}");
+    let _ = writeln!(out, "Driver: {}", opt(dev.driver.as_deref()));
+    let _ = writeln!(
+        out,
+        "Driver version: {}",
+        opt(dev.driver_version.as_deref())
+    );
+    let _ = writeln!(out, "sysfs path: {}", opt(dev.sysfs_path.as_deref()));
+    // Resources (the Resources tab, #10) — each present line, else an honest none.
+    let r = &dev.resources;
+    let _ = writeln!(out, "Resources:");
+    if r.is_empty() {
+        let _ = writeln!(out, "  none reported");
+    } else {
+        if let Some(irq) = r.irq {
+            let _ = writeln!(out, "  IRQ: {irq}");
+        }
+        for (label, list) in [
+            ("I/O ports", &r.io_ports),
+            ("Memory range", &r.memory),
+            ("DMA", &r.dma),
+        ] {
+            for value in list {
+                let _ = writeln!(out, "  {label}: {value}");
+            }
+        }
+    }
+    // Events (the Events tab, #10) — recent dmesg / udev lines, else an honest none.
+    let _ = writeln!(out, "Events:");
+    if dev.events.is_empty() {
+        let _ = writeln!(out, "  none reported");
+    } else {
+        for line in &dev.events {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
+    out
 }
 
 // ─────────────────────────── the detail drawer (#9/#10) ─────────────────────
@@ -1772,8 +2017,9 @@ fn device_row(ui: &mut egui::Ui, dev: &DeviceRecord, selected: bool) -> bool {
 const DOT: &str = "\u{25CF}";
 
 /// The drawer's title row (#9): the selected device's status dot + name, with a
-/// `×` close button on the right.
-fn drawer_header(ui: &mut egui::Ui, dev: &DeviceRecord, close: &mut bool) {
+/// DEVMGR-7 **Copy details** button + a `×` close button on the right — the
+/// non-right-click path to the honest Copy-info action (#12).
+fn drawer_header(ui: &mut egui::Ui, dev: &DeviceRecord, close: &mut bool, copy: &mut bool) {
     ui.horizontal(|ui| {
         status_dot(ui, status_tone(dev.status));
         ui.add_space(Style::SP_XS);
@@ -1790,6 +2036,13 @@ fn drawer_header(ui: &mut egui::Ui, dev: &DeviceRecord, close: &mut bool) {
                 .clicked()
             {
                 *close = true;
+            }
+            if ui
+                .button(RichText::new("\u{29C9}").size(Style::BODY)) // ⧉ — copy details
+                .on_hover_text("Copy this device's details to the clipboard")
+                .clicked()
+            {
+                *copy = true;
             }
         });
     });
@@ -2133,9 +2386,9 @@ mod tests {
     use super::{
         build_connection_tree, build_rail, cpu_line, derive_bus, device_status_display, export_dir,
         format_mem_kb, header_lines, host_dot_tone, host_hover, humanize_ago, humanize_uptime,
-        problem_code, render_json, render_report, sanitize, scanned_label, status_tone,
-        write_export, DeviceManagerState, DeviceSelection, DrawerTab, HostEntry, HostFreshness,
-        MenuAction, ViewMode, STALE_AFTER,
+        problem_code, render_device_details, render_json, render_report, sanitize, scanned_label,
+        status_tone, write_export, DeviceAction, DeviceManagerState, DeviceSelection, DrawerTab,
+        HostEntry, HostFreshness, MenuAction, RowActionRequest, ViewMode, STALE_AFTER,
     };
     use mackes_mesh_types::device_inventory::{
         self, category, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
@@ -3130,5 +3383,172 @@ mod tests {
         let hostile = sanitize("../../etc/passwd");
         assert!(!hostile.contains('/'), "no separator survives: {hostile}");
         assert_eq!(sanitize("a b/c"), "a_b_c");
+    }
+
+    // ── DEVMGR-7: the honest device actions (#12) ────────────────────────────
+
+    #[test]
+    fn the_device_action_set_is_the_honest_read_only_subset() {
+        // §7/§8 — the context menu offers ONLY the actions a read-only inventory
+        // consumer can perform honestly: Properties (open the drawer), Scan (re-read),
+        // Copy device details. MDM's hardware-mutating verbs (Enable/Disable, Reload
+        // module) are OMITTED, never greyed — there is no honest seam for them here.
+        assert_eq!(DeviceAction::ALL.len(), 3);
+        assert_eq!(
+            DeviceAction::ALL,
+            [
+                DeviceAction::Properties,
+                DeviceAction::Scan,
+                DeviceAction::CopyDetails,
+            ]
+        );
+        // The labels name only the honest verbs — no Disable / Enable / Reload /
+        // Uninstall / Update anywhere in the offered set.
+        for action in DeviceAction::ALL {
+            let l = action.label().to_lowercase();
+            for banned in [
+                "disable",
+                "enable",
+                "reload",
+                "uninstall",
+                "update",
+                "unbind",
+            ] {
+                assert!(
+                    !l.contains(banned),
+                    "{action:?} must not offer the mutating verb '{banned}': {l}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn device_details_dump_carries_every_field_and_the_problem_code() {
+        // Copy-info (#12) dumps every drawer-tab field. The rich fixture GPU carries
+        // ids / driver / sysfs / resources; the dump names each, plus the honest MDM
+        // status line — identical to what the drawer's General tab shows.
+        let gpu = DeviceInventory::fixture()
+            .categories
+            .into_iter()
+            .find(|c| c.key == category::DISPLAY)
+            .and_then(|c| c.devices.into_iter().next())
+            .expect("the fixture publishes a display device");
+        let dump = render_device_details(&gpu);
+        assert!(dump.contains(&gpu.name), "the device name: {dump}");
+        assert!(dump.contains("Status:"), "the MDM status line: {dump}");
+        assert!(dump.contains("Manufacturer:") && dump.contains("Model:"));
+        assert!(
+            dump.contains("Driver:") && dump.contains("sysfs path:"),
+            "the driver + details lines: {dump}"
+        );
+        assert!(
+            dump.contains("Resources:") && dump.contains("Events:"),
+            "the resources + events sections: {dump}"
+        );
+        // The driverless PCI device dumps its Code 28 + the honest Linux reason,
+        // byte-for-byte the drawer's General tab (device_status_display reuse).
+        let (status, _) = device_status_display(&orphan());
+        let dump = render_device_details(&orphan());
+        assert!(dump.contains("Code 28"), "the problem code: {dump}");
+        assert!(
+            dump.contains(&status),
+            "the same status line the drawer shows"
+        );
+        assert!(dump.contains("no kernel driver bound"), "the honest reason");
+    }
+
+    #[test]
+    fn a_sparse_device_dump_is_honest_never_fabricated() {
+        // A minimal record (name + status, nothing else) dumps an honest em-dash for
+        // each absent scalar + a "none reported" for the empty lists (§7) — never a
+        // fabricated vendor / driver / resource.
+        let bare = DeviceRecord::new("Unclaimed bus device", DeviceStatus::Unknown);
+        let dump = render_device_details(&bare);
+        assert!(dump.contains("Device: Unclaimed bus device"));
+        assert!(
+            dump.contains("Manufacturer: \u{2014}") && dump.contains("Driver: \u{2014}"),
+            "absent scalars dash, never fabricate: {dump}"
+        );
+        assert_eq!(
+            dump.matches("none reported").count(),
+            2,
+            "both the empty Resources + Events read an honest 'none reported': {dump}"
+        );
+        assert!(
+            !dump.contains("Code"),
+            "an unknown state fabricates no code: {dump}"
+        );
+    }
+
+    /// A headless [`egui::Context`] for driving the action seams that copy to the
+    /// clipboard (no GPU, no real seat — the copy queues an output command).
+    fn headless_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx
+    }
+
+    #[test]
+    fn apply_row_action_dispatches_each_action_to_its_real_seam() {
+        let ctx = headless_ctx();
+        let inv = DeviceInventory::fixture();
+
+        // Properties OPENS the drawer for the device (never toggles it closed like a
+        // row click), on the General tab.
+        let mut s = state_with(Some(inv.clone()), true);
+        s.active_tab = DrawerTab::Driver;
+        let sel = DeviceSelection::of(category::PCI_DEVICES, &orphan());
+        s.apply_row_action(RowActionRequest::Properties(sel.clone()), &ctx);
+        assert_eq!(
+            s.selected,
+            Some(sel.clone()),
+            "Properties opened the drawer"
+        );
+        assert_eq!(
+            s.active_tab,
+            DrawerTab::General,
+            "Properties resets to General"
+        );
+        // Re-issuing Properties keeps it open (it opens, it does not toggle closed).
+        s.apply_row_action(RowActionRequest::Properties(sel.clone()), &ctx);
+        assert_eq!(
+            s.selected,
+            Some(sel),
+            "Properties stays open, never toggles shut"
+        );
+
+        // Scan re-reads the inventory (the honest rescan) — seen flips even off a
+        // fresh, empty state, exactly like the Action-menu Scan.
+        let mut s = state_with(None, false);
+        s.apply_row_action(RowActionRequest::Scan, &ctx);
+        assert!(s.seen, "the Scan action drove a real re-read");
+
+        // Copy device details drives the clipboard seam without panicking (a live
+        // seam, not dead code); it mutates no state.
+        let mut s = state_with(Some(inv), true);
+        let before = s.selected.clone();
+        s.apply_row_action(RowActionRequest::CopyDetails(Box::new(orphan())), &ctx);
+        assert_eq!(s.selected, before, "Copy touches no selection state");
+    }
+
+    #[test]
+    fn a_device_row_context_menu_renders_and_the_drawer_copy_path_is_live() {
+        // The row (now carrying the DEVMGR-7 context menu) + the drawer (now carrying
+        // the Copy button) both render headless — a live render, not dead code. The
+        // context menu itself only opens on right-click, but attaching it is exercised
+        // by the row render, and its seams (apply_row_action / render_device_details)
+        // are covered above.
+        let inv = DeviceInventory::fixture();
+        let mut s = state_with(Some(inv), true);
+        s.expand_all();
+        s.selected = Some(DeviceSelection::of(category::PCI_DEVICES, &orphan()));
+        assert!(
+            drive(&mut s) > 0,
+            "the action-carrying rows + drawer drew nothing"
+        );
+        assert!(
+            s.selected.is_some(),
+            "the drawer stayed open across the frame"
+        );
     }
 }
