@@ -111,6 +111,20 @@
 //!   new-terminal-here over the TERM-4/5 [`splits`] spawn inheriting the pane's
 //!   cwd. The widget renders it on the grid's right-click; the split multiplexer
 //!   drains the new-terminal-here flag.
+//!
+//! - [`tmux`] (TMUX-FC-1) — the **control-mode core**: make tmux first-class via
+//!   `iTerm2`-style control mode (`tmux -CC`). [`tmux::ControlChannel`] spawns the
+//!   control client on the same `alacritty_terminal::tty` PTY seam [`pty`] uses
+//!   (§6), pumping its raw control protocol into [`tmux::Parser`] — an
+//!   incremental, partial-read-robust parser of the `%`-notifications
+//!   ([`tmux::Notification`]). [`tmux::parse_layout`] turns tmux's layout string
+//!   into a pane tree that folds onto the native [`splits::Pane`] verbatim, and
+//!   [`tmux::TmuxModel`] keeps a live sessions→windows→panes model — each pane an
+//!   [`engine::Terminal`] fed by `%output` (the grid a [`widget::TerminalWidget`]
+//!   renders). [`tmux::commands`] is the command sink (GUI intent → a `tmux`
+//!   command line); [`tmux::TmuxController`] ties it together with an honest
+//!   [`tmux::Status`] (no fake attach). The chrome/session/mesh/preset mount is
+//!   TMUX-FC-2..8.
 
 pub mod appearance;
 pub mod bell;
@@ -136,6 +150,7 @@ pub mod smart;
 pub mod splits;
 pub mod tabs;
 pub mod title;
+pub mod tmux;
 pub mod watch;
 pub mod widget;
 
@@ -170,5 +185,10 @@ pub use splits::{
 };
 pub use tabs::{consume_tab_commands, RemoteHub, TabCommand, TabbedTerminal};
 pub use title::PaneTitle;
+pub use tmux::{
+    commands as tmux_commands, parse_layout, ControlChannel, Layout, LayoutDir, LayoutError,
+    LayoutKind, Notification, Parser as TmuxParser, ResizeDir, Status as TmuxStatus,
+    TmuxController, TmuxLaunch, TmuxModel, TmuxPane, TmuxSession, TmuxWindow,
+};
 pub use watch::{ActivityWatch, WatchEvent, WatchMode};
 pub use widget::{ClipboardOptions, TerminalWidget};
