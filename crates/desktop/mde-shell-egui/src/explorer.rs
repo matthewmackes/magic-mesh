@@ -1163,8 +1163,11 @@ fn now_ms() -> u64 {
 
 /// The local hostname — `$HOSTNAME` → `/proc/sys/kernel/hostname` → `/etc/hostname`
 /// → `"localhost"` (the shell-tier idiom, shared with [`crate::storage`]). Names
-/// this node's own hero unit (#23) + orders it first.
-fn local_hostname() -> String {
+/// this node's own hero unit (#23) + orders it first. Crate-visible (`pub`, the
+/// `clippy::redundant_pub_crate` form in a private module) so the NODE-GRADE-2 grade
+/// fold ([`crate::chrome`]) pins the local grade row off the SAME resolution (no
+/// third copy of the idiom).
+pub fn local_hostname() -> String {
     if let Ok(h) = std::env::var("HOSTNAME") {
         let h = h.trim();
         if !h.is_empty() {
@@ -1551,6 +1554,11 @@ pub struct ExplorerState {
     /// — the dwell throttle between auto-advances. Tracks the input clock while the
     /// operator is present so the first step lands a clean [`AMBIENT_IDLE`] later.
     last_advance_at: Option<f64>,
+    /// A tap-to-focus target from OUTSIDE the surface (the NODE-GRADE-2 dock grade
+    /// row → this node's hero, #7) that hasn't landed yet because its unit hasn't
+    /// streamed in. Applied on each [`Self::refresh`] until the peer appears, so the
+    /// jump lands even when the Explorer hadn't polled that peer when it was tapped.
+    pending_focus: Option<String>,
 }
 
 impl Default for ExplorerState {
@@ -1579,6 +1587,7 @@ impl Default for ExplorerState {
             prefs: ExplorerPrefs::load(),
             last_input_at: None,
             last_advance_at: None,
+            pending_focus: None,
         }
     }
 }
@@ -1661,6 +1670,33 @@ impl ExplorerState {
         self.edges = fold_edges(&states);
         self.units = fold_units(&states, &self.local_host);
         self.sample_history();
+        self.apply_pending_focus();
+    }
+
+    /// Focus the hero card on a mesh node by hostname — the NODE-GRADE-2 dock grade
+    /// row's tap target (#7). Reuses the surface's ONE focus-set path
+    /// ([`Self::jump_to_id`], keyed by the aggregator's `peer:<host>` id) and lands
+    /// in the hero mode. If that peer's unit hasn't streamed in yet the target is
+    /// held ([`Self::pending_focus`]) and applied on the next refresh, so a tap that
+    /// arrives before the Explorer has polled the peer still lands.
+    pub fn focus_node(&mut self, host: &str) {
+        let id = peer_self_id(host);
+        self.mode = SurfaceMode::Hero;
+        self.jump_to_id(&id);
+        self.pending_focus = (!self.units.iter().any(|u| u.id == id)).then_some(id);
+    }
+
+    /// Re-apply a held cross-surface focus target once its unit has streamed in (a
+    /// NODE-GRADE-2 tap that arrived before the peer's unit did). A no-op when
+    /// nothing is pending or the target is still absent.
+    fn apply_pending_focus(&mut self) {
+        let Some(id) = self.pending_focus.clone() else {
+            return;
+        };
+        if self.units.iter().any(|u| u.id == id) {
+            self.jump_to_id(&id);
+            self.pending_focus = None;
+        }
     }
 
     /// Fold this poll's readable telemetry into each unit's rolling sparkline
@@ -3556,6 +3592,7 @@ mod tests {
                 prefs: ExplorerPrefs::default(),
                 last_input_at: None,
                 last_advance_at: None,
+                pending_focus: None,
             };
             s.refresh();
             s

@@ -979,6 +979,7 @@ impl Shell {
             self.system.snapshot().cloned(),
             self.chat.total_unread(),
             self.vdi.requested_target().is_some(),
+            self.chrome.grades().clone(),
         );
         let bar_clicked = dock::dock(ctx, &mut self.vdock);
         self.nav.surface = self.vdock.active();
@@ -992,6 +993,15 @@ impl Shell {
                 let _ = self.system.honor_power(verb);
             }
             None => {}
+        }
+        // NODE-GRADE-2 (#7) — a tapped grade row asks to open that node's Explorer
+        // hero. The dock can't reach the Explorer/nav (§6), so drain its request
+        // here: route to the Mesh Map, flip on its Explorer lens, and focus the peer
+        // (the reused EXPLORER jump path). The tap itself expanded the shell below.
+        if let Some(host) = self.vdock.take_node_focus() {
+            self.nav.surface = Surface::MeshView;
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new(explorer::LENS_KEY), true));
+            self.explorer.focus_node(&host);
         }
         if bar_clicked {
             self.nav.expanded = true;

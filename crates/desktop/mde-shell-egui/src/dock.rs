@@ -31,11 +31,11 @@
 //! beneath (the "auto-hide + DRM seat" guarantee).
 
 use mde_egui::egui::{self, TextureHandle, TextureOptions};
-use mde_egui::{Motion, Style};
+use mde_egui::{GradeBand, Motion, Style};
 use mde_seat::{PowerVerb, SeatSnapshot};
 use mde_theme::brand::icons::{icon_image, IconId};
 
-use crate::chrome::MeshSummary;
+use crate::chrome::{GradeRow, MeshSummary, NodeGrades};
 use crate::tray::{self, TrayInputs};
 
 /// Which surface fills the shell body.
@@ -405,7 +405,12 @@ const DOCK_AREA: &str = "vdock-area";
 /// [`Self::active`] reads `active` back into the central view (the VDOCK-6 `main.rs`
 /// wire); [`Self::set_active`] mirrors the shell's live surface back in first, so a
 /// hotkey / chyron nav that moved the surface still highlights in the picker.
+// The dock carries several INDEPENDENT boolean latches (the reveal/pin auto-hide
+// pair + the two overflow-popup latches for the app groups and the grade list) —
+// not a state machine folding into one enum, so opt this one struct past the
+// `struct_excessive_bools` bar rather than contrive a two-variant enum.
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct DockState {
     /// Toggled by a clean Super tap (lock #13) — the hotkey reveal/hide latch.
     revealed: bool,
@@ -419,6 +424,10 @@ pub struct DockState {
     /// Whether the '…' **overflow** more-popup is open (VDOCK-2, lock #22) — set by
     /// the '…' cell, cleared on a route or a click-away.
     overflow_open: bool,
+    /// Whether the NODE-GRADE-2 grade list's '…' expander is open (design #8) — set
+    /// by its '…' cell, cleared on a tap-route or a click-away. Distinct latch from
+    /// the app picker's [`Self::overflow_open`].
+    grades_overflow_open: bool,
     /// The live inputs VDOCK-3's bottom **status quads** fold each frame (the mesh
     /// summary, the seat snapshot, the Chat unread tally, the live-session flag) —
     /// owned so `dock()` keeps its `(ctx, state)` signature; the shell refreshes it
@@ -436,6 +445,13 @@ pub struct DockState {
     /// (VDOCK-3's `set_status_inputs` pattern), out of this dock.rs-only fence.
     /// `None` until a cell/menu fires (one request outlives one frame).
     pending: Option<DockRequest>,
+    /// A pending **node-focus** request the NODE-GRADE-2 grade list records when a
+    /// grade row is tapped (design #7): the hostname whose Explorer hero the shell
+    /// should open. The dock can't reach the shell's Explorer / nav (§6), so it
+    /// records the host here and `main.rs` drives the jump via
+    /// [`Self::take_node_focus`] (the deferred-wire idiom, like [`Self::pending`]).
+    /// A `String` (not `Copy`), so it rides its own field rather than [`DockRequest`].
+    pending_node_focus: Option<String>,
 }
 
 /// A shell-level **request** the VDOCK-4 system quad records for the shell to drain
@@ -470,6 +486,10 @@ struct StatusInputs {
     unread: usize,
     /// `true` while a VDI session is live — the Sessions cell's honest tone.
     session_active: bool,
+    /// NODE-GRADE-2 — the folded per-node capability grades the grade mini-list
+    /// renders above the status quads (local pinned first, peers worst-first). The
+    /// honest empty set pre-poll, so the band simply vanishes until grades arrive.
+    grades: NodeGrades,
 }
 
 impl DockState {
@@ -531,12 +551,14 @@ impl DockState {
         seat: Option<SeatSnapshot>,
         unread: usize,
         session_active: bool,
+        grades: NodeGrades,
     ) {
         self.status = StatusInputs {
             mesh,
             seat,
             unread,
             session_active,
+            grades,
         };
     }
 
@@ -568,6 +590,23 @@ impl DockState {
     /// once) otherwise. Wired by `main.rs::mount_dock_chrome` (VDOCK-6).
     pub const fn take_request(&mut self) -> Option<DockRequest> {
         self.pending.take()
+    }
+
+    /// Record a **node-focus** request (NODE-GRADE-2, design #7) — a grade row tap
+    /// asking the shell to open that host's Explorer hero. The dock can't reach the
+    /// Explorer / nav (§6); the shell drains this each frame ([`Self::take_node_focus`]).
+    /// A fresh tap overwrites any un-drained one (the latest wins).
+    fn request_node_focus(&mut self, host: &str) {
+        self.pending_node_focus = Some(host.to_owned());
+    }
+
+    /// Drain the pending **node-focus** request (NODE-GRADE-2) — the shell calls this
+    /// each frame after [`dock`] and, on `Some(host)`, routes to the Mesh Map's
+    /// Explorer lens focused on that node (`ExplorerState::focus_node`, the reused
+    /// EXPLORER jump path). `None` (drained once) otherwise. Wired by
+    /// `main.rs::mount_dock_chrome`.
+    pub const fn take_node_focus(&mut self) -> Option<String> {
+        self.pending_node_focus.take()
     }
 }
 
@@ -711,8 +750,15 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
     // order (#3). The zone is bounded above the BOTTOM_ZONE_H band reserved for
     // VDOCK-3/4's status + system quads; groups that overrun it fold into the '…'
     // more-popup (#22).
+    // NODE-GRADE-2 — the per-node grade mini-list claims a band directly ABOVE the
+    // status quads (a new zone between the app groups and VDOCK-3), so the app zone
+    // now ends at the grade band's top. An empty grade set claims 0 (the band
+    // vanishes and the groups reclaim the space, so pre-poll the layout is unchanged).
+    let quads_top_zone = rect.bottom() - BOTTOM_ZONE_H;
+    let grade_band_h = grade_band_height(&state.status.grades);
+    let grade_top = quads_top_zone - grade_band_h;
     let middle_top = pin.bottom() + GROUP_DIVIDER_H;
-    let middle_bottom = rect.bottom() - BOTTOM_ZONE_H;
+    let middle_bottom = grade_top;
     let middle_h = (middle_bottom - middle_top).max(0.0);
     let visible = visible_group_count(middle_h);
     // Fit the labels to the column interior — the full width less an SP_XS side
@@ -734,6 +780,13 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
         y += h;
     }
     if visible < GROUPS.len() && pick_overflow(ui, rect, middle_bottom, visible, &font, state) {
+        clicked = true;
+    }
+
+    // ── GRADE band (NODE-GRADE-2 → design #4/#5/#6/#7/#8/#14/#15/#18/#19) — the
+    // per-node capability grade mini-list, painted between the app groups and the
+    // status quads. Empty grades painted nothing (grade_band_h == 0).
+    if grade_band_h > 0.0 && paint_grade_band(ui, rect, grade_top, state) {
         clicked = true;
     }
 
@@ -1131,6 +1184,322 @@ fn pick_overflow(
         state.overflow_open = false;
     }
     routed
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NODE-GRADE-2 — the **grade mini-list** (design `docs/design/node-grade.md`,
+// locks #4/#5/#6/#7/#8/#14/#15/#18/#19). A stacked A–F capability grade per mesh
+// node, painted in the dock's bottom zone ABOVE the VDOCK-3 status quads (a new
+// band between the app groups and the quads). The local node is pinned first with a
+// "you are here" marker (#18); peers sort worst-grade-first (#19). Each row is the
+// A–F letter in the shared green→red `mde_egui` ramp (#4) — hard-blinking for a D/F
+// alarm (#6/#16) — a tiny load bar for the 0–100 score (#5), and a ↑/→/↓ trend
+// arrow (#14). A tap opens that node's Explorer hero (#7); the worst-N show inline
+// with a '…' expander for the rest (#8). No header (#15); a stale/absent grade reads
+// a greyed "?" (§7). The fold + sort live in `chrome::NodeGrades`; this is the render.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One grade mini-list row's height (design #5) — compact, on the 8px grid, tall
+/// enough to seat the ~18px grade-letter cell in the quad idiom. `SP_L` (24px).
+const GRADE_ROW_H: f32 = Style::SP_L;
+
+/// The worst-N grade rows shown inline before the rest fold into the '…' expander
+/// (#8) — the local node's pin plus the worst peers, bounded so the band never eats
+/// the narrow column on a busy mesh.
+const GRADE_MAX_ROWS: usize = 5;
+
+/// The grade letter's cell edge — the ~18px quad idiom (#5), matching the status
+/// quads' glyph edge so the three bottom clusters read on one grid.
+const GRADE_LETTER_W: f32 = SYS_QUAD_ICON;
+
+/// The trend-arrow cell width (#14) — a slim `SP_M` column at the row's right edge.
+const GRADE_ARROW_W: f32 = Style::SP_M;
+
+/// The grade load bar's height (#5) — a thin `SP_XS` rule, vertically centred.
+const GRADE_BAR_H: f32 = Style::SP_XS;
+
+/// The stable per-host id of a grade row, so the render + routing are addressable —
+/// tests read a row's settled `Rect` back to click it (the [`pick_cell_id`] idiom,
+/// kept distinct so a grade row never shares an id with a picker / quad cell).
+fn grade_row_id(host: &str) -> egui::Id {
+    egui::Id::new(("vdock-grade-row", host))
+}
+
+/// The stable id of the grade list's '…' expander cell (#8).
+fn grade_overflow_id() -> egui::Id {
+    egui::Id::new("vdock-grade-overflow")
+}
+
+/// The vertical space the grade mini-list claims above the status quads: the visible
+/// rows (capped at [`GRADE_MAX_ROWS`], #8) each [`GRADE_ROW_H`] tall, plus the '…'
+/// expander cell + a top separator gap when peers spill past the cap. `0` when there
+/// are no grades (pre-poll / empty), so the band vanishes and the app zone reclaims
+/// the space (the layout is then byte-identical to the pre-NODE-GRADE dock).
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)] // tiny row count; the band arithmetic reads clearer than mul_add
+fn grade_band_height(grades: &NodeGrades) -> f32 {
+    let total = grades.rows.len();
+    if total == 0 {
+        return 0.0;
+    }
+    let visible = total.min(GRADE_MAX_ROWS);
+    let overflow = if total > GRADE_MAX_ROWS {
+        OVERFLOW_H
+    } else {
+        0.0
+    };
+    GROUP_DIVIDER_H + visible as f32 * GRADE_ROW_H + overflow
+}
+
+/// Paint the grade mini-list band into the column between `grade_top` and the status
+/// quads. A BORDER hairline sets it apart from the app groups above (the pin-strip
+/// separator idiom) — no header (#15). Renders the worst-N rows inline, then the '…'
+/// expander when peers overflow (#8). Returns `true` if a row (or a popup row) tapped
+/// this frame (the caller records the tap-to-hero route, #7).
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)] // tiny row indices; layout math reads clearer than mul_add
+fn paint_grade_band(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    grade_top: f32,
+    state: &mut DockState,
+) -> bool {
+    let total = state.status.grades.rows.len();
+    let visible = total.min(GRADE_MAX_ROWS);
+    let has_overflow = total > GRADE_MAX_ROWS;
+
+    // The separating hairline (the pin-strip / system-quad rule idiom, §4 token).
+    ui.painter().hline(
+        (rect.left() + Style::SP_XS)..=(rect.right() - Style::SP_XS),
+        grade_top + GROUP_DIVIDER_H / 2.0,
+        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+    );
+
+    // The visible rows. The tap target is collected as an owned host so the immutable
+    // borrow of `state.status.grades` releases before `request_node_focus` writes.
+    let rows_top = grade_top + GROUP_DIVIDER_H;
+    let mut tapped: Option<String> = None;
+    for (i, row) in state.status.grades.rows.iter().take(visible).enumerate() {
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rows_top + i as f32 * GRADE_ROW_H),
+            egui::vec2(DOCK_W, GRADE_ROW_H),
+        );
+        if grade_row(ui, row, cell) {
+            tapped = Some(row.host.clone());
+        }
+    }
+    let mut clicked = tapped.is_some_and(|host| {
+        state.request_node_focus(&host);
+        true
+    });
+
+    if has_overflow {
+        let more_top = rows_top + visible as f32 * GRADE_ROW_H;
+        if grade_overflow(ui, rect, more_top, visible, state) {
+            clicked = true;
+        }
+    }
+    clicked
+}
+
+/// One grade mini-list row (design #4/#5/#14/#18): the local "you are here" marker
+/// (#18), the A–F letter in its green→red band colour (#4) — hard-blinking on/off for
+/// a D/F alarm (#6/#16) — a tiny load bar for the 0–100 score (#5), and the trend
+/// arrow (#14). A stale/unobservable node reads a greyed "?" (#17/§7), never a fake
+/// letter. A hover fills only (no tooltip). A click returns `true` (the caller records
+/// the tap-to-hero route, #7). Every colour is an `mde_egui` token (§4).
+#[allow(clippy::suboptimal_flops)] // the glyph-centring math reads clearer than mul_add
+fn grade_row(ui: &egui::Ui, row: &GradeRow, cell: egui::Rect) -> bool {
+    let resp = ui.interact(cell, grade_row_id(&row.host), egui::Sense::click());
+    let painter = ui.painter().clone();
+    if resp.hovered() {
+        painter.rect_filled(cell, Style::RADIUS, Style::SURFACE_HI);
+    }
+    // The local node's subtle "you are here" left-edge accent tick (#18) — the
+    // picker's active-bar idiom at the row's outer edge.
+    if row.is_local {
+        let bar =
+            egui::Rect::from_min_size(cell.left_top(), egui::vec2(ACTIVE_BAR_W, cell.height()));
+        painter.rect_filled(bar, egui::CornerRadius::ZERO, Style::ACCENT);
+    }
+
+    // The band the score falls into — the ONE authority for the letter, its ramp
+    // colour, and whether it alarms (`mde_egui::GradeBand`, §4). A stale row never
+    // alarms (we can't observe it; it reads "?").
+    let band = GradeBand::from_score(f32::from(row.score));
+    let alarm = !row.stale && band.is_alert();
+    // A D/F alarm hard-blinks; when dark (or stale) the mark reads dim (#6/#16
+    // always-blink, reduce-motion ignored).
+    let lit = !alarm || Motion::blink(ui.ctx());
+
+    // ── the A–F letter (or a greyed "?" when stale) in the ~18px quad cell ──
+    let letter_rect = egui::Rect::from_min_size(
+        egui::pos2(cell.left() + Style::SP_XS, cell.top()),
+        egui::vec2(GRADE_LETTER_W, cell.height()),
+    );
+    let (glyph, letter_color) = if row.stale {
+        ("?".to_owned(), Style::TEXT_DIM)
+    } else if lit {
+        (band.letter().to_string(), band.color())
+    } else {
+        (band.letter().to_string(), Style::TEXT_DIM)
+    };
+    let galley = ui
+        .fonts(|f| f.layout_no_wrap(glyph, egui::FontId::proportional(Style::BODY), letter_color));
+    painter.galley(
+        egui::pos2(
+            letter_rect.center().x - galley.size().x / 2.0,
+            letter_rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        letter_color,
+    );
+
+    // ── the tiny load bar (the 0–100 score) ──
+    let bar_left = letter_rect.right() + Style::SP_XS;
+    let bar_right = cell.right() - GRADE_ARROW_W - Style::SP_XS;
+    let bar_track = egui::Rect::from_min_max(
+        egui::pos2(bar_left, cell.center().y - GRADE_BAR_H / 2.0),
+        egui::pos2(bar_right, cell.center().y + GRADE_BAR_H / 2.0),
+    );
+    painter.rect_filled(bar_track, Style::RADIUS, Style::SURFACE_HI);
+    if !row.stale && bar_track.width() > 0.0 {
+        let fill_w = bar_track.width() * (f32::from(row.score) / 100.0).clamp(0.0, 1.0);
+        let fill = egui::Rect::from_min_size(bar_track.min, egui::vec2(fill_w, bar_track.height()));
+        // The load bar rides the SAME green→red ramp as the letter, dimming in
+        // lock-step with the alarm blink so the whole row flashes as one (#5/#6).
+        let fill_color = if lit {
+            Style::grade_fill(f32::from(row.score))
+        } else {
+            Style::TEXT_DIM
+        };
+        painter.rect_filled(fill, Style::RADIUS, fill_color);
+    }
+
+    // ── the trend arrow (#14) ──
+    let arrow_rect = egui::Rect::from_min_size(
+        egui::pos2(cell.right() - GRADE_ARROW_W, cell.top()),
+        egui::vec2(GRADE_ARROW_W, cell.height()),
+    );
+    let arrow = ui.fonts(|f| {
+        f.layout_no_wrap(
+            row.trend.arrow().to_owned(),
+            egui::FontId::proportional(Style::SMALL),
+            Style::TEXT_DIM,
+        )
+    });
+    painter.galley(
+        egui::pos2(
+            arrow_rect.center().x - arrow.size().x / 2.0,
+            arrow_rect.center().y - arrow.size().y / 2.0,
+        ),
+        arrow,
+        Style::TEXT_DIM,
+    );
+
+    resp.clicked()
+}
+
+/// The grade list's '…' **expander** (design #8) — when peers spill past
+/// [`GRADE_MAX_ROWS`], a '…' cell beneath the visible rows toggles a floating popup
+/// of the hidden (better-graded) peers, each still tapping through to its hero.
+/// Reuses the app picker's overflow idiom ([`pick_overflow`]): a SURFACE panel +
+/// hairline behind the same rows, anchored to the right and growing upward. Returns
+/// `true` when a popup row tapped this frame.
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)] // tiny row count; layout math reads clearer than mul_add
+fn grade_overflow(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    more_top: f32,
+    visible: usize,
+    state: &mut DockState,
+) -> bool {
+    let more = egui::Rect::from_min_size(
+        egui::pos2(rect.left(), more_top),
+        egui::vec2(DOCK_W, OVERFLOW_H),
+    );
+    let resp = ui.interact(more, grade_overflow_id(), egui::Sense::click());
+    let opened = resp.clicked();
+    if opened {
+        state.grades_overflow_open = !state.grades_overflow_open;
+    }
+    let color = if state.grades_overflow_open || resp.hovered() {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    let dots = ui.fonts(|f| {
+        f.layout_no_wrap(
+            "…".to_owned(),
+            egui::FontId::proportional(Style::BODY),
+            color,
+        )
+    });
+    ui.painter().galley(
+        egui::pos2(
+            more.center().x - dots.size().x / 2.0,
+            more.center().y - dots.size().y / 2.0,
+        ),
+        dots,
+        color,
+    );
+
+    if !state.grades_overflow_open {
+        return false;
+    }
+
+    // The hidden peer rows (past the worst-N cut) — cloned so the immutable grades
+    // borrow releases before `request_node_focus` writes state.
+    let hidden: Vec<GradeRow> = state
+        .status
+        .grades
+        .rows
+        .iter()
+        .skip(visible)
+        .cloned()
+        .collect();
+    let popup_h = hidden.len() as f32 * GRADE_ROW_H;
+    let mut tapped: Option<String> = None;
+    let inner = egui::Area::new(egui::Id::new("vdock-grade-overflow-popup"))
+        .order(egui::Order::Foreground)
+        .pivot(egui::Align2::LEFT_BOTTOM)
+        .fixed_pos(egui::pos2(more.right() + Style::SP_XS, more.bottom()))
+        .show(ui.ctx(), |ui| {
+            let (area, _) =
+                ui.allocate_exact_size(egui::vec2(DOCK_W, popup_h), egui::Sense::hover());
+            // Reserve a slot so the panel background paints BEHIND the rows.
+            let bg = ui.painter().add(egui::Shape::Noop);
+            for (i, row) in hidden.iter().enumerate() {
+                let cell = egui::Rect::from_min_size(
+                    egui::pos2(area.left(), area.top() + i as f32 * GRADE_ROW_H),
+                    egui::vec2(DOCK_W, GRADE_ROW_H),
+                );
+                if grade_row(ui, row, cell) {
+                    tapped = Some(row.host.clone());
+                }
+            }
+            let panel = area.expand(Style::SP_S);
+            ui.painter().set(
+                bg,
+                egui::Shape::rect_filled(panel, Style::RADIUS, Style::SURFACE),
+            );
+            ui.painter().rect_stroke(
+                panel,
+                Style::RADIUS,
+                ui.visuals().widgets.noninteractive.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+        });
+
+    if let Some(host) = tapped {
+        // A tap routes to the hero + closes the popup (the tray idiom).
+        state.request_node_focus(&host);
+        state.grades_overflow_open = false;
+        return true;
+    }
+    if !opened && inner.response.clicked_elsewhere() {
+        // Click-away dismissal — but not on the very click that opened it.
+        state.grades_overflow_open = false;
+    }
+    false
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1650,16 +2019,33 @@ fn power_arming_stage(ui: &mut egui::Ui, power: &mut PowerMenu) -> Option<PowerI
 #[cfg(test)]
 mod tests {
     use super::{
-        dock, group_height, gutter_width, overflow_more_id, pick_cell_id, power_item_id,
-        sys_cell_id, visible_group_count, DockRequest, DockState, PowerItem, PowerMenu, Surface,
-        SysCell, CELL_W, DOCK_AREA, DOCK_W, GROUPS, ICON_LOGICAL, PIN_STRIP_H, POWER_MENU,
-        SYSTEM_QUAD, SYS_QUAD_ICON,
+        dock, grade_band_height, grade_overflow_id, grade_row_id, group_height, gutter_width,
+        overflow_more_id, pick_cell_id, power_item_id, sys_cell_id, visible_group_count,
+        DockRequest, DockState, PowerItem, PowerMenu, Surface, SysCell, CELL_W, DOCK_AREA, DOCK_W,
+        GRADE_MAX_ROWS, GROUPS, ICON_LOGICAL, PIN_STRIP_H, POWER_MENU, SYSTEM_QUAD, SYS_QUAD_ICON,
     };
-    use crate::chrome::MeshSummary;
+    use crate::chrome::{GradeRow, GradeTrend, MeshSummary, NodeGrades};
     use mde_egui::egui;
     use mde_egui::Style;
     use mde_seat::PowerVerb;
     use mde_theme::brand::icons::{icon_image, IconId};
+
+    /// One grade row at a chosen host / score / pin / staleness (steady trend).
+    fn grade(host: &str, score: u8, is_local: bool, stale: bool) -> GradeRow {
+        GradeRow {
+            host: host.to_owned(),
+            score,
+            trend: GradeTrend::Steady,
+            is_local,
+            stale,
+        }
+    }
+
+    /// A seen grade set in the given (already-sorted) render order — the render
+    /// preserves the order `chrome::NodeGrades::fold` produced.
+    fn grades(rows: Vec<GradeRow>) -> NodeGrades {
+        NodeGrades { rows, seen: true }
+    }
 
     #[test]
     fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
@@ -2396,7 +2782,13 @@ mod tests {
         Style::install(&ctx);
         let mut s = DockState::default();
         s.toggle(); // reveal the dock so its Area (and the quads) mount
-        s.set_status_inputs(MeshSummary::default(), None, 3, false);
+        s.set_status_inputs(
+            MeshSummary::default(),
+            None,
+            3,
+            false,
+            NodeGrades::default(),
+        );
         let sz = egui::vec2(1280.0, 800.0);
         // Prime so the quad cell rects register + settle under their stable ids.
         drive_vdock(&ctx, &mut s, Vec::new(), sz);
@@ -2651,6 +3043,183 @@ mod tests {
                 PowerItem::Shutdown
             ],
             "the Power menu is Lock / Suspend / Reboot / Shutdown (#18)"
+        );
+    }
+
+    // ── NODE-GRADE-2: the grade mini-list band (design #5/#7/#8/#18/#19) ───────
+
+    #[test]
+    fn the_grade_band_has_no_height_without_grades() {
+        // Pre-poll / empty grades → the band claims 0, so the dock's layout is
+        // byte-identical to the pre-NODE-GRADE dock (§7 honest: no fake rows).
+        assert!(
+            grade_band_height(&NodeGrades::default()).abs() < f32::EPSILON,
+            "an empty grade set paints no band"
+        );
+        assert!(
+            grade_band_height(&grades(vec![grade("me", 90, true, false)])) > 0.0,
+            "one grade claims a band"
+        );
+    }
+
+    #[test]
+    fn the_grade_rows_sit_above_the_status_quads_local_first() {
+        // Design #18/#19 — the grade mini-list paints in the bottom zone ABOVE the
+        // VDOCK-3 status quads, in the given render order (local pinned first). The
+        // rows register addressable rects and every one clears the first status quad.
+        use crate::tray::{quad_cell_id, TrayItem};
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        // Local "me" pinned first, then a worst-first peer.
+        s.set_status_inputs(
+            MeshSummary::default(),
+            None,
+            0,
+            false,
+            grades(vec![
+                grade("me", 95, true, false),
+                grade("oak", 40, false, false),
+            ]),
+        );
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let me = ctx
+            .read_response(grade_row_id("me"))
+            .expect("the local grade row is registered")
+            .rect;
+        let oak = ctx
+            .read_response(grade_row_id("oak"))
+            .expect("the peer grade row is registered")
+            .rect;
+        // Local pinned first (renders above the peer), matching the fold order.
+        assert!(
+            me.top() < oak.top(),
+            "the local node's row is pinned first (#18)"
+        );
+        // Both rows sit ABOVE the first status quad (the Chat cell of quad 1).
+        let quad = ctx
+            .read_response(quad_cell_id(TrayItem::Chat))
+            .expect("the status quad is registered below the grade band")
+            .rect;
+        assert!(
+            me.bottom() <= quad.top() + 1.0 && oak.bottom() <= quad.top() + 1.0,
+            "the grade band renders above the status quads (design #8)"
+        );
+        // Each row spans the full column width (the dock idiom).
+        assert!(
+            (me.width() - DOCK_W).abs() < 1.0,
+            "a grade row is the full column"
+        );
+    }
+
+    #[test]
+    fn tapping_a_grade_row_records_a_node_focus_request() {
+        // Design #7 — a grade row tap records the host's Explorer-hero focus request
+        // the shell drains (routing to the Mesh Map's Explorer lens). The request
+        // drains exactly once (the shell reads it a single frame).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        s.set_status_inputs(
+            MeshSummary::default(),
+            None,
+            0,
+            false,
+            grades(vec![grade("oak", 40, false, false)]),
+        );
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let oak = ctx
+            .read_response(grade_row_id("oak"))
+            .expect("the grade row is registered")
+            .rect
+            .center();
+        assert!(
+            s.take_node_focus().is_none(),
+            "no focus request before the tap"
+        );
+        click_vdock(&ctx, &mut s, oak, sz);
+        assert_eq!(
+            s.take_node_focus().as_deref(),
+            Some("oak"),
+            "tapping a grade row records that node's hero-focus request (#7)"
+        );
+        assert!(
+            s.take_node_focus().is_none(),
+            "the focus request drains once"
+        );
+    }
+
+    #[test]
+    fn the_grade_overflow_expander_reveals_the_hidden_peers() {
+        // Design #8 — past the worst-N cap the extra peers fold into a '…' expander:
+        // the '…' cell is present, the capped peer is hidden until it opens, and a
+        // popup row still routes to its hero (then closes the popup).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        // One local + (GRADE_MAX_ROWS) peers → one peer spills past the cap.
+        let mut rows = vec![grade("me", 99, true, false)];
+        let peers = ["p1", "p2", "p3", "p4", "p5"];
+        assert_eq!(peers.len(), GRADE_MAX_ROWS, "seed exactly one over the cap");
+        for (i, name) in peers.iter().enumerate() {
+            // Ascending scores so the render order is stable; the last is hidden.
+            rows.push(grade(
+                name,
+                10 + u8::try_from(i).unwrap_or(0) * 10,
+                false,
+                false,
+            ));
+        }
+        let hidden_host = peers[peers.len() - 1];
+        s.set_status_inputs(MeshSummary::default(), None, 0, false, grades(rows));
+        let sz = egui::vec2(1280.0, 800.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        assert!(
+            ctx.read_response(grade_overflow_id()).is_some(),
+            "the '…' expander is present when peers spill past the cap"
+        );
+        assert!(
+            ctx.read_response(grade_row_id(hidden_host)).is_none(),
+            "the capped peer is hidden until the expander opens"
+        );
+
+        // Open the expander.
+        let more = ctx
+            .read_response(grade_overflow_id())
+            .expect("the '…' cell is registered")
+            .rect
+            .center();
+        click_vdock(&ctx, &mut s, more, sz);
+        assert!(s.grades_overflow_open, "clicking '…' opens the expander");
+
+        // Settle the popup, then tap the hidden peer inside it.
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        let hidden = ctx
+            .read_response(grade_row_id(hidden_host))
+            .expect("the hidden peer renders in the expander popup")
+            .rect
+            .center();
+        click_vdock(&ctx, &mut s, hidden, sz);
+        assert_eq!(
+            s.take_node_focus().as_deref(),
+            Some(hidden_host),
+            "a tap in the expander routes to that node's hero"
+        );
+        assert!(
+            !s.grades_overflow_open,
+            "routing from the expander closes it"
         );
     }
 }

@@ -59,7 +59,7 @@ pub use gestures::{
 };
 pub use motion::Motion;
 pub use runner::run_client;
-pub use style::{Density, Style};
+pub use style::{Density, GradeBand, Style};
 pub use toast::{
     ChyronInteraction, Dwell, OsdKind, OsdLevel, Severity, Tier, Toast, ToastAction, ToastHost,
 };
