@@ -1144,6 +1144,17 @@ impl Shell {
                 self.nav.expanded = true;
                 self.nav.surface = surface;
             }
+            // CONSOLE-5 — the front door opens a real tab: a command / Custom
+            // entry switches the body to the Terminal surface (lock #7) and
+            // drives the now-landed spawn-tab seam over the shell's live
+            // `TerminalSurface`. Root ops arrive already `sudo`-wrapped (the
+            // console's `launch_argv`); a refused spawn is the surface's own
+            // honest error chip (§7) — never a fabricated tab.
+            Some(console::ConsoleRequest::SpawnTab { name, argv }) => {
+                self.nav.expanded = true;
+                self.nav.surface = Surface::Terminal;
+                let _ = self.terminal.spawn_tab(name, &argv);
+            }
             // CONSOLE-4 — the rail Power section: Lock drops the in-process
             // curtain (exactly like Super+L); a Power verb drives the seat
             // honorer (the typed-armed consent is the operator's; a refusal is

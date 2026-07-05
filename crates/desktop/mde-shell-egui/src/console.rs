@@ -19,15 +19,18 @@
 //! **bottom-left footprint** — anchored beside the dock column at the screen
 //! bottom, rising with the locked slide-up Motion (lock #3/#44).
 //!
-//! **Honest gates (§7):** an entry's real launch — "open a named terminal tab
-//! running this command" — needs the CONSOLE-2 `spawn_tab` seam on
-//! `mde-term-egui`, which has not landed (`TabbedTerminal::new_tab()` takes no
-//! command today). Activating a command entry therefore raises a **typed
-//! `NotWired` notice** in the panel, never a faked launch. Surface-link entries
-//! (the pinned Terminal, the Containers&VMs "Cloud plane" link, lock #41) route
-//! for real through the shell nav. A command whose underlying tool is absent
-//! from `$PATH` renders greyed and reports the missing tool by name (the design's
-//! "no dead entries" rule).
+//! **The launch (CONSOLE-5, §6/§7):** activating a command entry opens a
+//! **named terminal tab running it** through the CONSOLE-2 `spawn_tab` seam on
+//! `mde-term-egui` — the panel records a typed [`ConsoleRequest::SpawnTab`] the
+//! shell drains (`main.rs`), switching to `Surface::Terminal` and driving
+//! `TerminalSurface::spawn_tab`. The line rides a login shell (`bash -lc …`) so
+//! its shell syntax is honored, and a **root op** (a leading `sudo`, lock #29)
+//! runs that shell under [`sudo_argv`] so sudo prompts interactively in the
+//! tab's PTY. Surface-link entries (the pinned Terminal, the Containers&VMs
+//! "Cloud plane" link, lock #41) route for real through the shell nav. A command
+//! whose underlying tool is absent from `$PATH` renders greyed and reports the
+//! missing tool by name — the one honest gate that remains (the design's "no
+//! dead entries" rule, §7).
 //!
 //! **CONSOLE-4** adds the rail's **Power section** (lock #28: Lock → the shell
 //! curtain, Suspend at once, Reboot / Shut Down behind the VDOCK-4 typed-arming
@@ -35,8 +38,8 @@
 //! `system.honor_power`, never a raw `systemctl`) and the **Custom group**
 //! (lock #35): operator-registered named command entries, added in-UI and
 //! persisted to `console-custom.json` under the client data dir (atomic
-//! temp + rename, the timers idiom). A custom entry's launch leg rides the same
-//! CONSOLE-2 spawn-tab seam, so its activation is honest-gated too (§7).
+//! temp + rename, the timers idiom). A custom entry's launch rides the same
+//! spawn-tab seam, opening its own named tab (CONSOLE-5).
 //!
 //! Like the dock, this module is pure chrome + state: it records a typed
 //! [`ConsoleRequest`] the shell drains after the frame (`main.rs`), and never
@@ -48,6 +51,7 @@ use std::path::{Path, PathBuf};
 use mde_egui::egui;
 use mde_egui::{Motion, Style};
 use mde_seat::PowerVerb;
+use mde_term_egui::sudo_argv;
 use mde_theme::brand::icons::IconId;
 use serde::{Deserialize, Serialize};
 
@@ -150,9 +154,10 @@ impl Provenance {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
     /// Open a **named terminal tab** running this command line (the launch
-    /// model, design lock "Launch model"). Root ops embed `sudo` (lock #29).
-    /// GATED until the CONSOLE-2 `spawn_tab` seam lands — activation raises the
-    /// typed [`GateReason::SpawnTabNotWired`] notice, never a faked launch (§7).
+    /// model, design lock "Launch model") through the CONSOLE-2 `spawn_tab`
+    /// seam. Root ops embed a leading `sudo` (lock #29), which [`launch_argv`]
+    /// routes through [`sudo_argv`] for an interactive PTY prompt. An absent
+    /// tool stays honestly greyed — the [`GateReason::ToolMissing`] gate (§7).
     Tab(&'static str),
     /// Route to a shell surface (lock #41's "open the correct GUI surface") —
     /// live NOW through [`ConsoleRequest::Goto`].
@@ -479,14 +484,12 @@ fn entry_at(flat: usize) -> &'static ConsoleEntry {
 
 // ── the honest gate (§7 — typed, never a fake) ──────────────────────────────
 
-/// Why an activated entry could not run — the typed honest gate (§7).
+/// Why an activated command entry could not run — the one honest gate that
+/// remains once the launch seam is wired (§7): its tool is absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateReason {
-    /// The launch leg is **`NotWired`**: opening a named terminal tab running a
-    /// command needs the CONSOLE-2 `spawn_tab` seam on `mde-term-egui`
-    /// (`TabbedTerminal::new_tab()` takes no command today).
-    SpawnTabNotWired,
-    /// The entry's underlying tool is not on this node's `$PATH`.
+    /// The entry's underlying tool is not on this node's `$PATH` — the row greys
+    /// and names it, never a dead or a faked entry.
     ToolMissing(&'static str),
 }
 
@@ -504,11 +507,6 @@ impl GateNotice {
     /// The operator-facing line (painted in the notice strip).
     fn text(&self) -> String {
         match self.reason {
-            GateReason::SpawnTabNotWired => format!(
-                "{}: NotWired — the terminal spawn-tab seam (CONSOLE-2) has not landed; \
-                 this entry opens a named terminal tab once it does.",
-                self.entry
-            ),
             GateReason::ToolMissing(tool) => {
                 format!(
                     "{}: \u{201c}{tool}\u{201d} is not installed on this node.",
@@ -523,10 +521,21 @@ impl GateNotice {
 /// frame — the panel never reaches the nav itself (§6, the `DockRequest` idiom).
 /// (`pub`, not `pub(crate)`, is the `clippy::redundant_pub_crate` form for
 /// crate-visible items in a private module — the dock's convention.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsoleRequest {
     /// Route the shell body to a surface (a live surface-link entry).
     Goto(Surface),
+    /// CONSOLE-5 — open a **named terminal tab** running `argv`: the shell
+    /// switches to `Surface::Terminal` (lock #7) and drives
+    /// `TerminalSurface::spawn_tab` (§6, the deferred-wire idiom — the panel
+    /// records this, never reaching the surface itself). `argv` is the typed
+    /// program+args [`launch_argv`] built (§9), root ops already `sudo`-wrapped.
+    SpawnTab {
+        /// The tab's name — the activated entry's label.
+        name: String,
+        /// The typed program+args to run on the tab's fresh PTY.
+        argv: Vec<String>,
+    },
     /// CONSOLE-4 — drop the shell curtain (the Power section's Lock; the
     /// in-process lock, exactly like Super+L — NOT logind's session Lock).
     Lock,
@@ -782,17 +791,16 @@ impl ConsoleState {
     }
 
     /// Activate the flat row `flat` (a click or Enter): a surface link routes +
-    /// closes; a command entry raises its typed honest gate — the missing tool
-    /// by name, else the CONSOLE-2 `NotWired` seam (§7 — never a faked launch).
-    /// A Custom row (the flat tail, CONSOLE-4) is a command entry whose launch
-    /// rides the same seam, so it gates the same way.
+    /// closes; a command entry opens its **named terminal tab** (CONSOLE-5 — the
+    /// front door launches), unless its tool is absent, when it stays honestly
+    /// greyed and names the gap (the [`GateReason::ToolMissing`] gate, §7). A
+    /// Custom row (the flat tail, CONSOLE-4) launches its operator-owned command
+    /// line the same way — the operator owns it, so no `$PATH` check.
     fn activate(&mut self, flat: usize) {
         if flat >= total_rows() {
             if let Some(entry) = self.custom.entries.get(flat - total_rows()) {
-                self.gate = Some(GateNotice {
-                    entry: entry.name.clone(),
-                    reason: GateReason::SpawnTabNotWired,
-                });
+                let (name, command) = (entry.name.clone(), entry.command.clone());
+                self.launch(name, &command);
             }
             return;
         }
@@ -802,18 +810,30 @@ impl ConsoleState {
                 self.pending = Some(ConsoleRequest::Goto(surface));
                 self.close();
             }
-            EntryKind::Tab(_) => {
-                let reason = if self.present.get(flat).copied().unwrap_or(false) {
-                    GateReason::SpawnTabNotWired
+            EntryKind::Tab(cmd) => {
+                if self.present.get(flat).copied().unwrap_or(false) {
+                    self.launch(entry.label.to_owned(), cmd);
                 } else {
-                    GateReason::ToolMissing(entry.tool)
-                };
-                self.gate = Some(GateNotice {
-                    entry: entry.label.to_owned(),
-                    reason,
-                });
+                    self.gate = Some(GateNotice {
+                        entry: entry.label.to_owned(),
+                        reason: GateReason::ToolMissing(entry.tool),
+                    });
+                }
             }
         }
+    }
+
+    /// Record the spawn-tab request that opens `cmd` in a `name`d Terminal tab,
+    /// then close: the shell (`main.rs`) drains it, focuses `Surface::Terminal`
+    /// and drives `TerminalSurface::spawn_tab` (§6, the deferred-wire idiom —
+    /// the panel never reaches the surface). Root ops ride [`sudo_argv`] inside
+    /// [`launch_argv`]; a refused spawn is the surface's own honest chip (§7).
+    fn launch(&mut self, name: String, cmd: &str) {
+        self.pending = Some(ConsoleRequest::SpawnTab {
+            name,
+            argv: launch_argv(cmd),
+        });
+        self.close();
     }
 
     /// CONSOLE-4 — press a rail Power row (lock #28): Lock / Suspend fire their
@@ -917,6 +937,31 @@ fn tool_present(tool: &str) -> bool {
             .metadata()
             .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     })
+}
+
+/// Turn a Console entry's command **line** into the typed program+args
+/// [`ConsoleRequest::SpawnTab`] runs (§9). The line is handed to a login shell
+/// (`bash -lc <cmd>`) so its shell syntax — the `;`, quotes, globs and `$…` the
+/// entries lean on — is honored exactly as written and the `sbin` admin tools
+/// resolve on the login `$PATH`.
+///
+/// A **root op** carries a leading `sudo ` (design lock #29): its shell runs
+/// under [`sudo_argv`] (`sudo -- bash -lc …`) so the whole pipeline is elevated
+/// and sudo prompts **interactively in the tab's PTY**. A `sudo` that owns its
+/// own flag rather than a command — the Root Shell's `sudo -i` — is left
+/// verbatim (wrapping it would feed sudo a bogus program name after `--`).
+fn launch_argv(cmd: &str) -> Vec<String> {
+    if let Some(rest) = cmd.strip_prefix("sudo ") {
+        if !rest.trim_start().starts_with('-') {
+            return sudo_argv(&shell_lc(rest));
+        }
+    }
+    shell_lc(cmd)
+}
+
+/// The `bash -lc <cmd>` login-shell recipe both launch legs share.
+fn shell_lc(cmd: &str) -> Vec<String> {
+    vec!["bash".to_owned(), "-lc".to_owned(), cmd.to_owned()]
 }
 
 /// The footer's `user@host` (lock #43): `$USER` / `$LOGNAME` → `operator` (the
@@ -1684,8 +1729,8 @@ fn custom_add_form(ui: &mut egui::Ui, state: &mut ConsoleState) -> bool {
 mod tests {
     use super::{
         console_confirm_id, console_entry_id, console_heading_id, console_panel, console_power_id,
-        console_rail_id, entry_at, identity_line, static_rows, tool_present, total_rows,
-        ConsoleRequest, ConsoleState, CustomEntry, EntryKind, GateReason, PowerAction,
+        console_rail_id, entry_at, identity_line, launch_argv, static_rows, tool_present,
+        total_rows, ConsoleRequest, ConsoleState, CustomEntry, EntryKind, GateReason, PowerAction,
         CONSOLE_AREA, GROUPS, PINNED,
     };
     use crate::dock::Surface;
@@ -1953,10 +1998,12 @@ mod tests {
     }
 
     #[test]
-    fn a_command_entry_raises_the_typed_notwired_gate_never_a_fake_launch() {
-        // §7 — the launch leg needs the CONSOLE-2 spawn-tab seam; until it
-        // lands, Enter on a command entry raises the TYPED NotWired notice and
-        // routes nothing. Presence is pinned so the verdict is host-independent.
+    fn a_present_command_entry_opens_its_named_tab_and_a_missing_one_greys() {
+        // CONSOLE-5 — the front door opens: Enter on a present command entry
+        // records the SpawnTab request that opens its NAMED tab and closes the
+        // panel; a still-missing tool stays honestly greyed (§7, ToolMissing)
+        // and launches nothing. Presence is pinned so the verdict is
+        // host-independent.
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut s = ConsoleState::default();
@@ -1965,19 +2012,50 @@ mod tests {
         s.force_presence(1, true); // the pinned Monitor (btop), "installed"
         drive(&ctx, &mut s, vec![key(egui::Key::ArrowDown)], SZ);
         drive(&ctx, &mut s, vec![key(egui::Key::Enter)], SZ);
-        let gate = s.gate.clone().expect("a gated activation raises a notice");
-        assert_eq!(gate.reason, GateReason::SpawnTabNotWired);
-        assert_eq!(gate.entry, "Monitor");
-        assert_eq!(s.take_request(), None, "a gated entry routes NOTHING");
-        assert!(s.is_open(), "the panel stays up so the notice is read");
+        assert_eq!(
+            s.take_request(),
+            Some(ConsoleRequest::SpawnTab {
+                name: "Monitor".to_owned(),
+                argv: launch_argv("btop"),
+            }),
+            "the front door opens the entry's named tab running its command",
+        );
+        assert!(s.gate.is_none(), "a launched entry raises no gate");
+        assert!(!s.is_open(), "launching closes the panel and shows the tab");
 
-        // The same entry with its tool absent names the missing tool instead.
+        // A fresh state with the tool ABSENT: the row greys + names the missing
+        // tool, and routes NOTHING (§7 — never a faked launch).
+        let mut s = ConsoleState::default();
+        s.toggle();
+        drive(&ctx, &mut s, Vec::new(), SZ);
         s.force_presence(1, false);
+        drive(&ctx, &mut s, vec![key(egui::Key::ArrowDown)], SZ);
         drive(&ctx, &mut s, vec![key(egui::Key::Enter)], SZ);
         assert_eq!(
-            s.gate.clone().expect("still gated").reason,
+            s.gate.clone().expect("a missing tool gates").reason,
             GateReason::ToolMissing("btop")
         );
+        assert_eq!(s.take_request(), None, "a missing tool launches nothing");
+        assert!(s.is_open(), "the panel stays up so the notice is read");
+    }
+
+    #[test]
+    fn a_root_op_launches_through_the_documented_sudo_argv_path() {
+        // Lock #29 — a leading `sudo ` op runs its login shell UNDER sudo
+        // (`sudo -- bash -lc …`, the sudo prompts in the tab's PTY); a plain op
+        // is just its login shell; a `sudo` owning its own flag (the Root
+        // Shell's `sudo -i`) is left verbatim, never fed to sudo as a program.
+        let words = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            launch_argv("sudo dnf upgrade"),
+            words(&["sudo", "--", "bash", "-lc", "dnf upgrade"]),
+        );
+        assert_eq!(
+            launch_argv("sudo firewall-cmd --list-all"),
+            words(&["sudo", "--", "bash", "-lc", "firewall-cmd --list-all"]),
+        );
+        assert_eq!(launch_argv("btop"), words(&["bash", "-lc", "btop"]));
+        assert_eq!(launch_argv("sudo -i"), words(&["bash", "-lc", "sudo -i"]));
     }
 
     #[test]
@@ -2234,10 +2312,10 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_entry_activation_is_honest_gated_on_the_spawn_tab_seam() {
-        // §7 — a Custom entry's launch rides the SAME CONSOLE-2 seam, so its
-        // activation raises the typed NotWired notice and routes NOTHING; the
-        // keyboard ring includes the custom tail.
+    fn a_custom_entry_opens_its_own_named_tab() {
+        // CONSOLE-5 — a Custom entry's launch rides the SAME spawn-tab seam,
+        // opening its own named tab running the operator's command line and
+        // closing the panel; the keyboard ring includes the custom tail.
         let dir = tempfile::tempdir().expect("tempdir");
         let store = dir.path().join("console-custom.json");
         let mut s = ConsoleState::with_store(Some(store));
@@ -2251,13 +2329,15 @@ mod tests {
             "the activation ring includes the custom tail"
         );
         s.activate(total_rows());
-        let gate = s.gate.clone().expect("a gated activation raises a notice");
-        assert_eq!(gate.reason, GateReason::SpawnTabNotWired);
-        assert_eq!(gate.entry, "Farm top");
         assert_eq!(
             s.take_request(),
-            None,
-            "a gated custom entry routes NOTHING"
+            Some(ConsoleRequest::SpawnTab {
+                name: "Farm top".to_owned(),
+                argv: launch_argv("ssh mm@bigboy btop"),
+            }),
+            "a custom entry opens its own named tab running the operator's line",
         );
+        assert!(s.gate.is_none(), "a launched custom entry raises no gate");
+        assert!(!s.is_open(), "launching a custom entry closes the panel");
     }
 }
