@@ -1226,6 +1226,60 @@ impl CloudPlaneState {
     }
 }
 
+/// One Cloud verb the MENU-1 "State of the Mesh" bar offers while the Cloud
+/// plane is active — each the mouse twin of an affordance the plane body
+/// already renders (§6, one seam; applied via
+/// [`CloudPlaneState::apply_menu_verb`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudMenuVerb {
+    /// Queue an immediate re-poll of every lane (status/catalog/roster/kinds)
+    /// plus a preset re-read.
+    Refresh,
+    /// Jump to Instances and open the full launch picker (Q83).
+    LaunchInstance,
+    /// Jump to Volumes and open the New-volume form.
+    NewVolume,
+    /// Jump to Images and open the Register-image form.
+    RegisterImage,
+    /// Jump to Networks and open the New-network form.
+    NewNetwork,
+}
+
+impl CloudPlaneState {
+    /// Apply a MENU-1 Cloud verb — the same fields the in-plane toggles flip
+    /// (a menu pick opens the exact affordance the body's own button opens).
+    pub fn apply_menu_verb(&mut self, verb: CloudMenuVerb) {
+        match verb {
+            CloudMenuVerb::Refresh => {
+                self.status.forced = true;
+                self.catalog.forced = true;
+                self.instances.forced = true;
+                for lane in self.resources.values_mut() {
+                    lane.forced = true;
+                }
+                self.presets_loaded_at = None;
+            }
+            CloudMenuVerb::LaunchInstance => {
+                self.tab = CloudTab::Instances;
+                self.picker.open = true;
+                self.picker.error = None;
+            }
+            CloudMenuVerb::NewVolume => {
+                self.tab = CloudTab::Volumes;
+                self.volume_form.0 = true;
+            }
+            CloudMenuVerb::RegisterImage => {
+                self.tab = CloudTab::Images;
+                self.image_form.0 = true;
+            }
+            CloudMenuVerb::NewNetwork => {
+                self.tab = CloudTab::Networks;
+                self.network_form.0 = true;
+            }
+        }
+    }
+}
+
 /// The lifecycle word for the mutation note.
 fn action_word(verb: &str) -> &'static str {
     match verb {
@@ -2651,6 +2705,34 @@ mod tests {
         assert!(usage.per_user.is_empty());
         assert_eq!(usage.instances, None);
         assert_eq!(usage.kinds, vec![("networks", 1, None)]);
+    }
+
+    // ── MENU-1 verbs ──
+
+    #[test]
+    fn menu_verbs_drive_the_same_seams_the_body_toggles() {
+        let mut state = test_state();
+        state.apply_menu_verb(CloudMenuVerb::LaunchInstance);
+        assert_eq!(state.tab, CloudTab::Instances);
+        assert!(state.picker.open);
+        state.apply_menu_verb(CloudMenuVerb::NewVolume);
+        assert_eq!(state.tab, CloudTab::Volumes);
+        assert!(state.volume_form.0);
+        state.apply_menu_verb(CloudMenuVerb::RegisterImage);
+        assert_eq!(state.tab, CloudTab::Images);
+        assert!(state.image_form.0);
+        state.apply_menu_verb(CloudMenuVerb::NewNetwork);
+        assert_eq!(state.tab, CloudTab::Networks);
+        assert!(state.network_form.0);
+        // Refresh queues every lane + a preset re-read.
+        state.resources.entry(ResKind::Stacks).or_default();
+        state.presets_loaded_at = Some(Instant::now());
+        state.apply_menu_verb(CloudMenuVerb::Refresh);
+        assert!(state.status.forced);
+        assert!(state.catalog.forced);
+        assert!(state.instances.forced);
+        assert!(state.resources[&ResKind::Stacks].forced);
+        assert!(state.presets_loaded_at.is_none());
     }
 
     // ── lanes ──

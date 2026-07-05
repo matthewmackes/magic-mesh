@@ -571,6 +571,13 @@ impl DatacenterState {
         ctx.request_repaint_after(REFRESH);
     }
 
+    /// Queue an immediate re-read: the next `poll` refreshes regardless of the
+    /// cadence. The MENU-1 "State of the Mesh" bar's Fleet → Refresh verb — the
+    /// mouse twin of waiting out the poll cadence (§6, no second read path).
+    pub(crate) const fn refresh_now(&mut self) {
+        self.last_poll = None;
+    }
+
     /// Read both topics and re-project. Split from the cadence gate so the pure
     /// projection stays testable; a missing dir / unreadable topic yields an empty
     /// or last-known projection, never a panic.

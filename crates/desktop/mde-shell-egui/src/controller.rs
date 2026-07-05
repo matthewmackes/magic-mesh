@@ -285,6 +285,25 @@ impl ControllerState {
         ctx.request_repaint_after(REFRESH);
     }
 
+    /// The elected controller's hostname, when a leader lease is held — the
+    /// same live projection the body renders, surfaced read-only for the
+    /// MENU-1 "State of the Mesh" bar's leader chip (§6 — one fold, two views).
+    pub(crate) fn leader(&self) -> Option<&str> {
+        self.status.leader.as_deref()
+    }
+
+    /// How many nodes the peer directory names (`0` before the first parsed
+    /// snapshot — the chip is honestly omitted then, keyed on [`Self::seen`]).
+    pub(crate) fn peer_count(&self) -> usize {
+        self.status.nodes.len()
+    }
+
+    /// Whether a snapshot has been parsed yet — gates the MENU-1 chips so a
+    /// pre-poll frame never shows a fabricated zero (§7).
+    pub(crate) const fn seen(&self) -> bool {
+        self.status.seen
+    }
+
     /// Render the plane's live content into `ui`.
     pub(crate) fn show(&self, ui: &mut egui::Ui) {
         show_status(ui, &self.status);

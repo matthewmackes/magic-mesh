@@ -127,12 +127,34 @@ pub fn show(
     // spawn-lighthouse requests onto the Bus and holds the daemon's typed answer.
     spawn_lighthouse: &mut crate::spawn_lighthouse_flow::SpawnLighthouseFlowState,
 ) {
-    // MENUBAR-ALL — the shared top bar (WORKBENCH). Its one honest menu is the
-    // **Plane** switch — the same `selected` seam the rail below drives (§6, no new
-    // behaviour); a pick radio-jumps the active plane. The bar's UPPERCASE display
-    // title replaces the old proportional heading (design lock 2).
-    if let Some(plane) = menubar::show(ui, *selected) {
-        *selected = plane;
+    // MENU-1 — the shared top bar, retitled **State of the Mesh** (operator
+    // retitle; the `Surface` enum name stays Workbench). The full MenuBarModel:
+    // **View** (plane navigation — the same `selected` seam the rail below
+    // drives), the **active plane's verb menu** (Cloud verbs into the
+    // egui-memory Cloud state; Fleet → Refresh onto the datacenter poll seam),
+    // and **Help** (the bar-owned plane guide). The status cluster carries live
+    // mesh state — active plane · elected leader · peer count · fleet update
+    // target — each chip only when the fact is live (§7).
+    if let Some(action) = menubar::show(ui, *selected, controller, provisioning) {
+        match action {
+            menubar::MenuAction::Plane(plane) => *selected = plane,
+            menubar::MenuAction::Cloud(verb) => {
+                // The same egui-memory state the Cloud plane body drives — a
+                // menu pick opens the exact affordance the body's button opens
+                // (§6, one seam), and View lands on the plane it acted on.
+                let handle = cloud_plane::state_handle(ui);
+                handle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .apply_menu_verb(verb);
+                *selected = Plane::Cloud;
+            }
+            menubar::MenuAction::FleetRefresh => datacenter.refresh_now(),
+            // Handled inside the bar (it owns the guide window's open flag);
+            // unreachable here, kept explicit so a new action can't fall
+            // through silently.
+            menubar::MenuAction::HelpGuide => {}
+        }
     }
     ui.colored_label(
         Style::TEXT_DIM,
@@ -233,85 +255,264 @@ pub fn show(
     });
 }
 
-/// MENUBAR-ALL (Workbench) — the shared top bar over the five-plane nav.
+/// MENU-1 — the **State of the Mesh** bar over the five-plane nav (the operator
+/// retitle of the old one-menu WORKBENCH bar, which is retired).
 ///
-/// The Workbench is a pure *navigation* surface: its content is whichever of the
-/// five [`Plane`]s the operator selects, and its every real control is that plane
-/// switch (the sub-flows the Provisioning plane hosts live inside the plane body,
-/// not the bar). So the bar carries exactly one honest menu — **Plane** — whose
-/// items are the mouse twin of the rail's `selectable_label`s (§6, one seam), each
-/// radio-checked to the live selection. There is no File/Edit/Help spine to invent
-/// (the surface has no file, clipboard, or about seam), so it is honestly omitted
-/// (§7 — no dead entries). The status cluster names the active plane (live state).
+/// The full shared-`MenuBar` treatment, at plane depth (the `IaC` IAC-5 bar is
+/// the reference idiom):
+///
+/// - **View** — plane navigation: one radio item per [`Plane`] in blast-radius
+///   order, the mouse twin of the rail's `selectable_label`s (§6, one seam).
+/// - **The active plane's verb menu** — only for a plane with a real mutable
+///   seam behind this bar: **Cloud** (the QC-12 verbs, applied to the plane's
+///   egui-memory state — refresh + the launch picker + the per-kind New forms)
+///   and **Fleet** (Refresh now, onto the datacenter poll seam). The This Node /
+///   Network / Provisioning planes render read-only snapshot views behind
+///   `&self` here — no mutable verb seam exists, so no verb menu is invented
+///   (§7 — honest omission, never a dead entry; the Provisioning flows carry
+///   their own in-body controls).
+/// - **Help** — the bar-owned **Plane Guide** window (the five planes + their
+///   real blurbs; the voice bar's bar-owned-overlay idiom).
+///
+/// The status cluster is live mesh state: the active plane, the elected
+/// leader + peer count (the controller's parsed snapshot — chips gated on
+/// `ControllerState::seen`, §7), and the fleet update target (provisioning).
 mod menubar {
+    use super::cloud_plane::CloudMenuVerb;
     use super::Plane;
-    use mde_egui::egui::Ui;
+    use crate::controller::ControllerState;
+    use crate::provisioning::ProvisioningState;
+    use mde_egui::egui::{self, Ui};
     use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
     use mde_egui::{ChipTone, StatusChip, Style};
 
-    /// Render the WORKBENCH bar and return the plane the operator picked this frame,
-    /// if any — the same seam the plane rail drives (`*selected = plane`).
-    pub(super) fn show(ui: &mut Ui, active: Plane) -> Option<Plane> {
+    /// The shared filled-circle chip icon (the datacenter / Instances glyph).
+    const DOT: &str = "\u{25CF}";
+
+    /// One bar action. `HelpGuide` is intercepted by [`show`] (the bar owns the
+    /// guide window); the rest dispatch in `workbench::show`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum MenuAction {
+        /// View → jump to this plane (the rail's `selected` seam).
+        Plane(Plane),
+        /// Cloud → a QC-12 verb into the Cloud plane's egui-memory state.
+        Cloud(CloudMenuVerb),
+        /// Fleet → queue an immediate datacenter re-read.
+        FleetRefresh,
+        /// Help → toggle the bar-owned Plane Guide window.
+        HelpGuide,
+    }
+
+    /// Render the STATE OF THE MESH bar and return the action picked this
+    /// frame, if any (Help is handled here — the bar owns the guide window).
+    pub(super) fn show(
+        ui: &mut Ui,
+        active: Plane,
+        controller: &ControllerState,
+        provisioning: &ProvisioningState,
+    ) -> Option<MenuAction> {
         let menus = build_menus(active);
-        let status = build_status(active);
+        let status = build_status(active, controller, provisioning);
         let model = MenuBarModel {
             // The dock tints the Workbench lead cell with the brand accent (its
-            // standalone-lead cell has no group hue), so the title matches (lock 2).
-            title: "Workbench",
+            // standalone-lead cell has no group hue), so the title matches.
+            title: "State of the Mesh",
             accent: Style::ACCENT,
             menus: &menus,
             status: &status,
         };
-        MenuBar::show(ui, &model)
+        let picked = MenuBar::show(ui, &model);
+
+        // The Plane Guide is bar-owned UI: a Help pick flips the persisted
+        // flag; the window renders while it is set (the egui-memory idiom the
+        // Explorer lens uses).
+        let guide_id = egui::Id::new("workbench-plane-guide");
+        let mut open = ui
+            .ctx()
+            .data(|d| d.get_temp::<bool>(guide_id).unwrap_or(false));
+        let picked = match picked {
+            Some(MenuAction::HelpGuide) => {
+                open = !open;
+                None
+            }
+            other => other,
+        };
+        if open {
+            render_plane_guide(ui, &mut open);
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(guide_id, open));
+        picked
     }
 
-    /// The **Plane** menu: one radio item per [`Plane`] in blast-radius order, the
-    /// active one checked — every item drives the real `selected` seam.
-    fn build_menus(active: Plane) -> Vec<Menu<Plane>> {
-        let items: Vec<Entry<Plane>> = Plane::ALL
+    /// The Help → Plane Guide window: every plane's label + its real blurb —
+    /// the same honest copy the content pane renders (§6, one source).
+    fn render_plane_guide(ui: &Ui, open: &mut bool) {
+        egui::Window::new("Plane guide")
+            .open(open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ui.ctx(), |ui| {
+                mde_egui::muted_note(
+                    ui,
+                    "The Workbench's five control planes, ordered by blast radius.",
+                );
+                ui.add_space(Style::SP_S);
+                for plane in Plane::ALL {
+                    ui.label(
+                        egui::RichText::new(plane.label())
+                            .color(Style::TEXT)
+                            .size(Style::BODY)
+                            .strong(),
+                    );
+                    mde_egui::muted_note(ui, plane.blurb());
+                    ui.add_space(Style::SP_XS);
+                }
+            });
+    }
+
+    /// Build the bar's menus for the active plane: View (plane radios), the
+    /// active plane's verb menu when one exists, and Help.
+    fn build_menus(active: Plane) -> Vec<Menu<MenuAction>> {
+        let view: Vec<Entry<MenuAction>> = Plane::ALL
             .iter()
-            .map(|&p| Entry::Item(Item::new(p, p.label()).checked(active == p)))
+            .map(|&p| Entry::Item(Item::new(MenuAction::Plane(p), p.label()).checked(active == p)))
             .collect();
-        vec![Menu::new("Plane", items)]
+        let mut menus = vec![Menu::new("View", view)];
+
+        match active {
+            // The Cloud plane's verbs (QC-12) — each the mouse twin of an
+            // affordance the plane body renders (§6, one seam).
+            Plane::Cloud => menus.push(Menu::new(
+                "Cloud",
+                vec![
+                    Entry::Item(Item::new(
+                        MenuAction::Cloud(CloudMenuVerb::Refresh),
+                        "Refresh now",
+                    )),
+                    Entry::Item(Item::new(
+                        MenuAction::Cloud(CloudMenuVerb::LaunchInstance),
+                        "Launch instance\u{2026}",
+                    )),
+                    Entry::Item(Item::new(
+                        MenuAction::Cloud(CloudMenuVerb::NewVolume),
+                        "New volume\u{2026}",
+                    )),
+                    Entry::Item(Item::new(
+                        MenuAction::Cloud(CloudMenuVerb::RegisterImage),
+                        "Register image\u{2026}",
+                    )),
+                    Entry::Item(Item::new(
+                        MenuAction::Cloud(CloudMenuVerb::NewNetwork),
+                        "New network\u{2026}",
+                    )),
+                ],
+            )),
+            // The Fleet plane's one honest verb: queue an immediate re-read of
+            // the Bus projection (the datacenter poll seam).
+            Plane::Fleet => menus.push(Menu::new(
+                "Fleet",
+                vec![Entry::Item(Item::new(
+                    MenuAction::FleetRefresh,
+                    "Refresh now",
+                ))],
+            )),
+            // This Node / Network / Provisioning are read-only (`&self`) behind
+            // this bar — no mutable verb seam exists, so no verb menu is
+            // invented (§7 — honest omission, never a dead entry).
+            Plane::ThisNode | Plane::Network | Plane::Provisioning => {}
+        }
+
+        menus.push(Menu::new(
+            "Help",
+            vec![Entry::Item(Item::new(
+                MenuAction::HelpGuide,
+                "Plane Guide\u{2026}",
+            ))],
+        ));
+        menus
     }
 
-    /// The live status cluster: the active plane's name (which plane is showing).
-    fn build_status(active: Plane) -> Vec<StatusChip> {
-        vec![StatusChip::new(active.label(), ChipTone::Info)]
+    /// The live status cluster: the active plane, then — once the controller's
+    /// snapshot has been parsed — the elected leader (or an honest "no leader")
+    /// and the peer-directory count, and the fleet update target when the
+    /// provisioning snapshot named one. Nothing pre-poll is fabricated (§7).
+    fn build_status(
+        active: Plane,
+        controller: &ControllerState,
+        provisioning: &ProvisioningState,
+    ) -> Vec<StatusChip> {
+        let mut chips = vec![StatusChip::new(active.label(), ChipTone::Info)];
+        if controller.seen() {
+            match controller.leader() {
+                Some(leader) => chips.push(StatusChip::with_icon(
+                    DOT,
+                    format!("leader {leader}"),
+                    ChipTone::Ok,
+                )),
+                None => chips.push(StatusChip::with_icon(DOT, "no leader", ChipTone::Warn)),
+            }
+            let peers = controller.peer_count();
+            chips.push(StatusChip::new(
+                format!("{peers} peer{}", if peers == 1 { "" } else { "s" }),
+                ChipTone::Neutral,
+            ));
+        }
+        if let Some(target) = provisioning.fleet_target() {
+            chips.push(StatusChip::new(
+                format!("target {target}"),
+                ChipTone::Neutral,
+            ));
+        }
+        chips
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{build_menus, build_status, Plane};
+        use super::{build_menus, build_status, CloudMenuVerb, MenuAction, Plane};
+        use crate::controller::ControllerState;
+        use crate::provisioning::ProvisioningState;
         use mde_egui::menubar::Entry;
         use mde_egui::ChipTone;
 
-        #[test]
-        fn plane_menu_lists_every_plane_with_the_active_one_checked() {
-            let menus = build_menus(Plane::Network);
-            assert_eq!(menus.len(), 1, "the Workbench carries one honest menu");
-            let plane_menu = &menus[0];
-            assert_eq!(plane_menu.title, "Plane");
-            let ids: Vec<Plane> = plane_menu
-                .entries
+        /// Flatten a menu's item ids.
+        fn ids(menu: &mde_egui::menubar::Menu<MenuAction>) -> Vec<MenuAction> {
+            menu.entries
                 .iter()
                 .filter_map(|e| match e {
                     Entry::Item(i) => Some(i.id),
                     _ => None,
                 })
+                .collect()
+        }
+
+        #[test]
+        fn view_menu_lists_every_plane_with_the_active_one_checked() {
+            let menus = build_menus(Plane::Network);
+            let view = &menus[0];
+            assert_eq!(view.title, "View");
+            let planes: Vec<Plane> = view
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Item(i) => match i.id {
+                        MenuAction::Plane(p) => Some(p),
+                        _ => None,
+                    },
+                    _ => None,
+                })
                 .collect();
             assert_eq!(
-                ids,
+                planes,
                 Plane::ALL.to_vec(),
                 "every plane is reachable, in order"
             );
-            // Exactly the active plane is checked (radio) — the rest are unchecked,
-            // never omitted (§7).
-            for entry in &plane_menu.entries {
+            // Exactly the active plane is checked (radio) — the rest are
+            // unchecked, never omitted (§7).
+            for entry in &view.entries {
                 if let Entry::Item(item) = entry {
                     assert_eq!(
                         item.checked,
-                        Some(item.id == Plane::Network),
+                        Some(item.id == MenuAction::Plane(Plane::Network)),
                         "{:?} check-state must track the active plane",
                         item.id
                     );
@@ -320,11 +521,63 @@ mod menubar {
         }
 
         #[test]
-        fn status_names_the_active_plane() {
-            let chips = build_status(Plane::Provisioning);
+        fn verb_menus_appear_only_at_plane_depth() {
+            // Cloud active → View · Cloud · Help, with every QC-12 verb.
+            let menus = build_menus(Plane::Cloud);
+            assert_eq!(menus.len(), 3);
+            assert_eq!(menus[1].title, "Cloud");
+            let cloud = ids(&menus[1]);
+            for verb in [
+                CloudMenuVerb::Refresh,
+                CloudMenuVerb::LaunchInstance,
+                CloudMenuVerb::NewVolume,
+                CloudMenuVerb::RegisterImage,
+                CloudMenuVerb::NewNetwork,
+            ] {
+                assert!(
+                    cloud.contains(&MenuAction::Cloud(verb)),
+                    "{verb:?} missing from the Cloud menu"
+                );
+            }
+
+            // Fleet active → View · Fleet · Help, with the refresh verb.
+            let menus = build_menus(Plane::Fleet);
+            assert_eq!(menus.len(), 3);
+            assert_eq!(menus[1].title, "Fleet");
+            assert_eq!(ids(&menus[1]), vec![MenuAction::FleetRefresh]);
+
+            // A read-only plane → View · Help only (honest omission, §7).
+            for plane in [Plane::ThisNode, Plane::Network, Plane::Provisioning] {
+                let menus = build_menus(plane);
+                assert_eq!(menus.len(), 2, "{plane:?} must carry no verb menu");
+                assert_eq!(menus[0].title, "View");
+                assert_eq!(menus[1].title, "Help");
+            }
+        }
+
+        #[test]
+        fn help_carries_the_plane_guide() {
+            let menus = build_menus(Plane::ThisNode);
+            let help = menus.last().expect("a Help menu");
+            assert_eq!(help.title, "Help");
+            assert_eq!(ids(help), vec![MenuAction::HelpGuide]);
+        }
+
+        #[test]
+        fn status_names_the_active_plane_and_omits_unpolled_facts() {
+            // Pre-poll defaults: no snapshot parsed, no fleet target — only the
+            // active-plane chip shows (nothing fabricated, §7).
+            let controller = ControllerState::default();
+            let provisioning = ProvisioningState::default();
+            let chips = build_status(Plane::Provisioning, &controller, &provisioning);
             assert!(chips
                 .iter()
                 .any(|c| c.text == "Provisioning" && c.tone == ChipTone::Info));
+            assert_eq!(
+                chips.len(),
+                1,
+                "unpolled leader/peers/target chips must be omitted, not zeroed"
+            );
         }
 
         #[test]
@@ -333,19 +586,21 @@ mod menubar {
             use mde_egui::Style;
             let ctx = egui::Context::default();
             Style::install(&ctx);
+            let controller = ControllerState::default();
+            let provisioning = ProvisioningState::default();
             let input = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 640.0))),
                 ..Default::default()
             };
             let out = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    let _ = super::show(ui, Plane::ThisNode);
+                    let _ = super::show(ui, Plane::Cloud, &controller, &provisioning);
                 });
             });
             let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
             assert!(
                 !prims.is_empty(),
-                "the Workbench bar produced no primitives"
+                "the State of the Mesh bar produced no primitives"
             );
         }
     }

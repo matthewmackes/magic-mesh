@@ -293,6 +293,13 @@ impl ProvisioningState {
         ctx.request_repaint_after(REFRESH);
     }
 
+    /// The fleet-wide update target (`latest_version`), when the snapshot has
+    /// named one — the same live projection the version card renders, surfaced
+    /// read-only for the MENU-1 "State of the Mesh" bar's revision chip (§6).
+    pub(crate) fn fleet_target(&self) -> Option<&str> {
+        self.status.latest_version.as_deref()
+    }
+
     /// Render the plane's live content into `ui`.
     pub(crate) fn show(&self, ui: &mut egui::Ui) {
         show_status(ui, &self.status);
