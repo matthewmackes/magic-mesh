@@ -3047,7 +3047,7 @@ Throwaway XCP-ng VMs on a dom0 (LAN-bridged, `172.20.x`) giving the shell's Desk
   **As** a member, **I want** a one-click SPICE console (mde-vdi-spice viewer) and automatic SSH key injection, **so that** getting into my instance is trivial (Q34/88).
   **Acceptance**:
     - [ ] console opens from the Cloud plane row; a launched instance accepts the member's mesh-derived SSH key
-- [>] **QC-14: VDI broker overlay on Nova.**
+- [ ] **QC-14: VDI broker overlay on Nova.**
   **As** a desktop user, **I want** the session-broker to place VDI desktops as Nova instances (flavor+metadata) while owning the display path/roaming/seat binding, **so that** one VM plane serves both worlds (Q33).
   **Acceptance**:
     - [ ] a VDI session boots via Nova and renders through the existing viewer path; roaming = rebuild per Q38
@@ -3059,7 +3059,7 @@ Throwaway XCP-ng VMs on a dom0 (LAN-bridged, `172.20.x`) giving the shell's Desk
   **As** the platform, **I want** Rust integration tests driving boot/net/volume round-trips through the verbs against a farm-VM dev cloud, **so that** the cloud is continuously proven (Q74/75).
   **Acceptance**:
     - [ ] IaC brings up disposable virtual mesh nodes on the farm; the test suite runs in the GitOps lane and gates regressions
-- [>] **QC-17: Designate replaces naming.**
+- [✓] **QC-17: Designate replaces naming.** *(done: 5571eb6 — Designate wave-2 plane (api/central/producer/worker/mdns + per-node bind9, overlay-only); designate.rs peer-directory→zone fold (.cloud.mesh. records, API multi-A, leader-pinned names) + re-seed script + injectable PeerDirectorySource; live getaddrinfo resolve honest-gated.)*
   **As** the platform, **I want** Designate serving mesh zones fed by the peer directory, **so that** nodes, instances, and services resolve by DNS everywhere (Q46).
   **Acceptance**:
     - [ ] node + instance records resolve mesh-wide; the peer directory can re-seed Designate from scratch
@@ -3071,7 +3071,7 @@ Throwaway XCP-ng VMs on a dom0 (LAN-bridged, `172.20.x`) giving the shell's Desk
   **As** an operator, **I want** Heat stacks rendered from fleet state, Octavia for instance load-balancing, and optional Horizon, **so that** wave 2 lands per the locks (Q25/47/61).
   **Acceptance**:
     - [ ] a fleet-state record renders + applies as a Heat stack; an Octavia LB fronts an instance service; Horizon (if deployed) is reachable mesh-only
-- [>] **QC-20: cloud events into chat + idle nudges.**
+- [✓] **QC-20: cloud events into chat + idle nudges.** *(done: a9aa9c0 — events.rs emits on event/notify/cloud-instance (chat folds it, no emitter change); service_contact routes a failure as a msg from nova.mesh; ACTIVE→ERROR edge=1 dedup alert, idle SHUTOFF>24h=1 debounced owner nudge (≤3/tick). Oslo AMQP feed NotWired-gated (roster watch signal works today). mackesd 3366 lib tests.)*
   **As** an operator, **I want** OpenStack notifications folded into the mesh chat (services as roster contacts) and idle instances nudging their owners, **so that** the one notification surface covers the cloud (Q65/90).
   **Acceptance**:
     - [ ] an instance failure arrives as a signed chat message from the service contact; an idle instance triggers an owner nudge
