@@ -13,6 +13,16 @@
 # never fleet infra. Root + `alpine` passwords are `testvm`; the farm key
 # (~/.ssh/mackes_mesh_ed25519) is authorized for root SSH debug.
 #
+# `--rdp` instead creates `testvm-win` (TESTVM-3): the DOCUMENTED DEGRADATION
+# path for the RDP endpoint — there is NO local Windows ISO on either dom0
+# (TESTVM-1 recon, re-checked by probe_images at every bringup), so instead of
+# native Windows RDP this is an Alpine guest running `xrdp` on :3389 with its
+# libvnc session backend riding the same Xvfb :1 + x11vnc pieces (x11vnc bound
+# to 127.0.0.1:5900, password `testvm`, purely as xrdp's backend). It still
+# exercises the shell's ironrdp path at protocol level (X.224 + RDP security
+# negotiation; a self-signed TLS cert is generated for the negotiate layer).
+# Same throwaway/no-auth posture as testvm-lin.
+#
 # Pipeline (runs from the build host; needs qemu-img + genisoimage locally):
 #   1. probe both farm dom0s' free memory, pick the one with headroom
 #   2. mirror the Alpine "generic cloudinit" cloud image into /root/mcnf-images
@@ -30,6 +40,7 @@
 #
 # Usage:
 #   install-helpers/testvm-up.sh              # auto-pick dom0, bring up testvm-lin
+#   install-helpers/testvm-up.sh --rdp        # bring up testvm-win (Alpine+xrdp :3389)
 #   install-helpers/testvm-up.sh --host 172.20.0.9
 #   install-helpers/testvm-up.sh --probe      # capacity + image/ISO recon only
 #
@@ -50,14 +61,21 @@ ALPINE_BRANCH="${TESTVM_ALPINE_BRANCH:-latest-stable}"
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 VNC_PORT=5900
 SPICE_PORT=5930
+RDP_PORT=3389
 
-HOST=""; PROBE_ONLY=0
+HOST=""; PROBE_ONLY=0; MODE=lin
 while [ $# -gt 0 ]; do case "$1" in
   --host)  HOST="$2"; shift 2;;
   --probe) PROBE_ONLY=1; shift;;
-  -h|--help) sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+  --rdp)   MODE=rdp; shift;;
+  -h|--help) sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
   *) echo "unknown arg: $1" >&2; exit 1;;
 esac; done
+
+if [ "$MODE" = rdp ]; then   # TESTVM-3: the Alpine+xrdp degradation profile
+  VM_NAME="testvm-win"
+  VM_MAC="5a:54:00:e5:70:02"   # distinct fixed MAC -> its own findable lease
+fi
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -i "$SSH_KEY")
 d0() { ssh "${SSH_OPTS[@]}" "root@$1" "${@:2}"; }   # run on a dom0
@@ -129,6 +147,83 @@ instance-id: ${VM_NAME}-001
 local-hostname: ${VM_NAME}
 EOF
 
+if [ "$MODE" = rdp ]; then
+cat > "$WORK/user-data" <<EOF
+#cloud-config
+hostname: ${VM_NAME}
+disable_root: false
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  users:
+    - {name: root, password: testvm, type: text}
+    - {name: alpine, password: testvm, type: text}
+write_files:
+  - path: /root/xrdp-testvm.ini
+    permissions: '0644'
+    content: |
+      ; testvm-win xrdp config — :${RDP_PORT}, autorun into the libvnc session
+      ; mirroring the local Xvfb :1 via x11vnc on 127.0.0.1:${VNC_PORT}.
+      ; (staged here, copied over /etc/xrdp/xrdp.ini after apk installs xrdp,
+      ; so the package's own default config never wins)
+      [Globals]
+      ini_version=1
+      fork=true
+      port=${RDP_PORT}
+      address=0.0.0.0
+      security_layer=negotiate
+      crypt_level=high
+      certificate=
+      key_file=
+      autorun=testvm
+      max_bpp=24
+
+      [testvm]
+      name=testvm
+      lib=libvnc.so
+      ip=127.0.0.1
+      port=${VNC_PORT}
+      username=na
+      password=testvm
+  - path: /etc/local.d/testvm-endpoints.start
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      # testvm-win throwaway endpoint: RDP :${RDP_PORT} (xrdp, libvnc backend
+      # riding Xvfb :1 + x11vnc on 127.0.0.1:${VNC_PORT}). Restart-safe via local.d.
+      exec >>/var/log/testvm-endpoints.log 2>&1
+      echo "=== \$(date) endpoints start"
+      pgrep -f x11vnc >/dev/null 2>&1 && { echo already-running; exit 0; }
+      port_up() { netstat -tln 2>/dev/null | grep -q ":\$1 "; }
+      Xvfb :1 -screen 0 1024x768x16 >/var/log/xvfb.log 2>&1 &
+      sleep 3
+      DISPLAY=:1 xsetroot -solid "#224466" 2>/dev/null || true
+      DISPLAY=:1 xterm -geometry 110x32+40+40 \\
+        -e /bin/sh -lc "hostname; ip addr; exec /bin/sh" 2>/dev/null &
+      x11vnc -display :1 -rfbport ${VNC_PORT} -localhost -passwd testvm -forever -shared -bg
+      # xrdp key material must exist before the daemon takes connects
+      [ -f /etc/xrdp/rsakeys.ini ] || xrdp-keygen xrdp auto 2>/dev/null || true
+      [ -f /etc/xrdp/cert.pem ] || openssl req -x509 -newkey rsa:2048 -nodes \\
+        -days 3650 -subj /CN=${VM_NAME} \\
+        -keyout /etc/xrdp/key.pem -out /etc/xrdp/cert.pem 2>/dev/null || true
+      pgrep -f xrdp-sesman >/dev/null 2>&1 || xrdp-sesman 2>/dev/null || true
+      pgrep -x xrdp >/dev/null 2>&1 || xrdp
+      sleep 2
+      echo "rdp-port=\$(port_up ${RDP_PORT} && echo up || echo DOWN) vnc-backend=\$(port_up ${VNC_PORT} && echo up || echo DOWN)"
+runcmd:
+  - mkdir -p /root/.ssh && chmod 700 /root/.ssh
+  - echo "${PUBKEY}" >> /root/.ssh/authorized_keys
+  - ping -c 3 ${HOST} || true
+  - grep -q '/community\$' /etc/apk/repositories || sed -n 's|/main\$|/community|p' /etc/apk/repositories >> /etc/apk/repositories
+  - apk update
+  - apk add --no-progress xvfb x11vnc xterm xsetroot font-misc-misc xe-guest-utilities xrdp openssl || true
+  - cp /root/xrdp-testvm.ini /etc/xrdp/xrdp.ini || true
+  - rc-update add local default || true
+  - rc-service xe-guest-utilities start 2>/dev/null || rc-update add xe-guest-utilities default || true
+  - /etc/local.d/testvm-endpoints.start
+  - ping -c 3 ${HOST} || true
+EOF
+else
 cat > "$WORK/user-data" <<EOF
 #cloud-config
 hostname: ${VM_NAME}
@@ -183,6 +278,7 @@ runcmd:
   - /etc/local.d/testvm-endpoints.start
   - ping -c 3 ${HOST} || true
 EOF
+fi
 
 genisoimage -quiet -output "$WORK/seed.iso" -volid cidata -joliet -rock \
   "$WORK/user-data" "$WORK/meta-data"
@@ -210,7 +306,12 @@ d0 "$HOST" "rm -f /var/tmp/${VM_NAME}-root.raw /var/tmp/${VM_NAME}-seed.iso"
 # ------------------------------------------------- 5. assemble the VM -------
 VM=$(d0 "$HOST" "xe vm-install template='Other install media' new-name-label=$VM_NAME")
 log "VM: $VM"
-d0 "$HOST" "xe vm-param-set uuid=$VM name-description='THROWAWAY VDI test endpoint (VNC :$VNC_PORT / Spice :$SPICE_PORT) — tear down with install-helpers/testvm-down.sh'"
+if [ "$MODE" = rdp ]; then
+  DESC="THROWAWAY VDI test endpoint (RDP :$RDP_PORT via Alpine+xrdp — degradation path, no Windows ISO on the airgap) — tear down with install-helpers/testvm-down.sh"
+else
+  DESC="THROWAWAY VDI test endpoint (VNC :$VNC_PORT / Spice :$SPICE_PORT) — tear down with install-helpers/testvm-down.sh"
+fi
+d0 "$HOST" "xe vm-param-set uuid=$VM name-description='$DESC'"
 d0 "$HOST" "xe vm-memory-limits-set uuid=$VM static-min=$((512*1024*1024)) dynamic-min=$((MEM_MIB*1024*1024)) dynamic-max=$((MEM_MIB*1024*1024)) static-max=$((MEM_MIB*1024*1024))"
 d0 "$HOST" "xe vm-param-set uuid=$VM VCPUs-max=1 VCPUs-at-startup=1 HVM-boot-params:order=c other-config:testvm=throwaway"
 d0 "$HOST" "xe vbd-create vm-uuid=$VM vdi-uuid=$ROOT_VDI device=0 bootable=true mode=RW type=Disk" >/dev/null
@@ -236,6 +337,38 @@ done
 log "$VM_NAME is at $IP"
 
 port_open() { timeout 4 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; }
+
+if [ "$MODE" = rdp ]; then
+  log "waiting for the RDP endpoint (apk installs run over the LAN — allow ~5-10 min)…"
+  RDP_OK=0
+  for _ in $(seq 1 120); do
+    port_open "$IP" "$RDP_PORT" && RDP_OK=1 && log "RDP :$RDP_PORT open" && break
+    sleep 5
+  done
+  # Protocol-level check (mirrors an RDP client's first packet): an X.224
+  # Connection Request carrying an RDP negotiation request (TLS|HYBRID) must
+  # be answered with an X.224 Connection Confirm — TPKT 0x03, TPDU code 0xd0.
+  X224=$(timeout 8 bash -c "exec 3<>/dev/tcp/$IP/$RDP_PORT
+    printf '\x03\x00\x00\x13\x0e\xe0\x00\x00\x00\x00\x00\x01\x00\x08\x00\x03\x00\x00\x00' >&3
+    head -c 11 <&3 | od -An -tx1 | tr -d ' \n'" 2>/dev/null || true)
+  CC=FAIL
+  case "$X224" in 0300??????d0*) CC=PASS;; esac
+  echo
+  log "================ RESULT ================"
+  log "dom0:   $HOST"
+  log "vm:     $VM_NAME ($VM)"
+  log "ip:     $IP"
+  log "rdp:    $IP:$RDP_PORT  open=$RDP_OK  x224-conn-confirm=$CC  reply-hex=${X224:-none}"
+  log "ssh:    root@$IP (farm key or password 'testvm')"
+  log "NOTE:   Alpine+xrdp DEGRADATION path — no Windows ISO on either dom0"
+  log "teardown: install-helpers/testvm-down.sh"
+  [ "$RDP_OK" = 1 ] && [ "$CC" = PASS ] || {
+    log "WARNING: RDP endpoint not verified — ssh in and check /var/log/testvm-endpoints.log"
+    exit 2
+  }
+  exit 0
+fi
+
 log "waiting for the endpoints (apk installs run over the LAN — allow ~5-10 min)…"
 VNC_OK=0; SPICE_OK=0
 for _ in $(seq 1 120); do
