@@ -36,6 +36,12 @@
 //!   New·Open·Save | Cut·Copy·Paste | Undo·Redo | Zoom strip, every control
 //!   routed through the same palette / `EditorView` seams (§6) — no dead
 //!   entries (lock #4). Zoom is a real per-view font scale on [`EditorView`].
+//! * EDTB-5 — **Print via CUPS** ([`print`]): the File → Print / Print Preview
+//!   items + the Standard-toolbar Print group paginate the buffer as formatted
+//!   monospace text (filename header + `Page N of M` footer) and pipe it to `lp`;
+//!   the Print Preview overlay renders the same pages before printing. A missing
+//!   `lp` / no configured printer surfaces an honest named notice, never a silent
+//!   no-op or a faked success (§7).
 //! * EDTB-2/3 — the **markdown formatting engine + Formatting toolbar**
 //!   ([`md_actions`] / [`format_bar`]): the Style dropdown, B/I/U/S, list, and
 //!   indent controls (Word's second toolbar row) plus the **Insert** (Table
@@ -117,6 +123,7 @@ pub mod outline;
 mod palette;
 pub mod panel;
 pub mod panes;
+mod print;
 pub mod project_tree;
 mod search;
 mod terminal;

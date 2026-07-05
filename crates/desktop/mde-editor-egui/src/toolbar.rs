@@ -2,12 +2,12 @@
 //! the menu bar (design: `docs/design/editor-toolbar.md`).
 //!
 //! Word's Standard-toolbar order, cut to the controls whose backends exist
-//! today (lock #4 — no dead buttons): `New · Open · Save · | · Cut · Copy ·
-//! Paste · | · Undo · Redo · | · Zoom`. The omitted Word buttons await their
-//! phases: Print / Print Preview (EDTB-5), Spelling (EDTB-6), Insert Table +
-//! `AutoFormat` (EDTB-3/2), Format Painter (no rich-text analogue — out of
-//! scope). Every button dispatches the **same** [`MenuAction`] its menu twin
-//! does — one dispatch seam, zero duplication (§6).
+//! today (lock #4 — no dead buttons): `New · Open · Save · | · Print · Print
+//! Preview · | · Cut · Copy · Paste · | · Undo · Redo · | · Zoom`. The remaining
+//! omitted Word buttons await their phases: Spelling (EDTB-6), Format Painter (no
+//! rich-text analogue — out of scope). The Print group landed in EDTB-5. Every
+//! button dispatches the **same** [`MenuAction`] its menu twin does — one dispatch
+//! seam, zero duplication (§6).
 //!
 //! Glyphs are text glyphs from the workspace's established vocabulary (egui's
 //! built-in faces stay installed as fallback behind Droid Sans Mono, so the
@@ -82,7 +82,7 @@ impl StripEntry {
 
 /// The Standard strip in Word-97 order, as data — the render is one thin loop,
 /// and [`tests`] assert the order + that every button drives a real action.
-pub const STRIP: [StripEntry; 12] = [
+pub const STRIP: [StripEntry; 15] = [
     StripEntry::Button(ToolButton::new(
         "\u{FF0B}",
         "New",
@@ -99,6 +99,21 @@ pub const STRIP: [StripEntry; 12] = [
         "\u{1F4BE}",
         "Save",
         MenuAction::Save,
+        Gate::Doc,
+    )),
+    StripEntry::Separator,
+    // The EDTB-5 Print group (Word's Standard-toolbar Print · Print Preview),
+    // between Save and the clipboard group; both need an open document to print.
+    StripEntry::Button(ToolButton::new(
+        "\u{1F5A8}",
+        "Print",
+        MenuAction::Print,
+        Gate::Doc,
+    )),
+    StripEntry::Button(ToolButton::new(
+        "\u{1F50D}",
+        "Print Preview",
+        MenuAction::PrintPreview,
         Gate::Doc,
     )),
     StripEntry::Separator,
@@ -255,8 +270,9 @@ mod tests {
 
     #[test]
     fn the_strip_is_the_word_97_standard_order() {
-        // New · Open · Save · | · Cut · Copy · Paste · | · Undo · Redo · | ·
-        // Zoom — the exact EDTB-1 strip (Print/Spell/Table await their phases).
+        // New · Open · Save · | · Print · Print Preview · | · Cut · Copy · Paste ·
+        // | · Undo · Redo · | · Zoom — the EDTB-1 strip with the EDTB-5 Print
+        // group (Spell awaits EDTB-6).
         let shape: Vec<String> = STRIP
             .iter()
             .map(|e| match e {
@@ -268,7 +284,20 @@ mod tests {
         assert_eq!(
             shape,
             vec![
-                "New", "Open", "Save", "|", "Cut", "Copy", "Paste", "|", "Undo", "Redo", "|",
+                "New",
+                "Open",
+                "Save",
+                "|",
+                "Print",
+                "Print Preview",
+                "|",
+                "Cut",
+                "Copy",
+                "Paste",
+                "|",
+                "Undo",
+                "Redo",
+                "|",
                 "Zoom"
             ]
         );
@@ -299,6 +328,8 @@ mod tests {
             ("New", MenuAction::NewScratch),
             ("Open", MenuAction::OpenFinder),
             ("Save", MenuAction::Save),
+            ("Print", MenuAction::Print),
+            ("Print Preview", MenuAction::PrintPreview),
             ("Cut", MenuAction::Cut),
             ("Copy", MenuAction::Copy),
             ("Paste", MenuAction::Paste),

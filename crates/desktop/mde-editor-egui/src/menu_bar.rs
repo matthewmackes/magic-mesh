@@ -7,7 +7,8 @@
 //! Word-97 menus:
 //!
 //! * **File** — New (scratch), Open… (the `Ctrl-P` finder), Open Folder (cwd →
-//!   project tree), Save, Save As… (a small path dialog), Close.
+//!   project tree), Save, Save As… (a small path dialog), Close, and the EDTB-5
+//!   Print group: Print Preview + Print… (paginate → CUPS `lp`).
 //! * **Edit** — Undo, Redo, Cut, Copy, Paste, Select All. **Find… is omitted**:
 //!   in-buffer find is EDITOR-8 and has not landed, so there is no honest
 //!   target yet (the finder finds *files*, not text — routing Find there would
@@ -30,7 +31,8 @@
 //!
 //! **Omitted** (they appear as their phases land, per lock #4): the standalone
 //! **Table** menu (cell/row operations — not yet backed; Insert → Table… covers
-//! creation) and the Print/Spell items in File/Tools (P2/P3 — EDTB-5/6).
+//! creation) and the Tools → Spelling item (EDTB-6). The File Print group landed
+//! in EDTB-5.
 //!
 //! The menu tree is **data** ([`MENUS`]) rendered by one thin loop, so the §7
 //! guarantees are unit-testable without egui: every item maps to a real
@@ -77,6 +79,10 @@ pub enum MenuAction {
     SaveAs,
     /// Close the open document (the palette's Close seam).
     CloseDoc,
+    /// Paginate the buffer and print it via CUPS `lp` (EDTB-5).
+    Print,
+    /// Open the Print Preview overlay — the paginated pages before printing (EDTB-5).
+    PrintPreview,
     /// Undo one widget step (`EditorView::undo`).
     Undo,
     /// Redo one widget step (`EditorView::redo`).
@@ -279,8 +285,11 @@ impl MenuItem {
     }
 }
 
-/// The File menu (Word-97 order, minus the unlanded Print group — EDTB-5).
-const FILE_ITEMS: [MenuItem; 6] = [
+/// The File menu (Word-97 order). The Print group (Print Preview + Print…) lands
+/// in EDTB-5; both are document-gated (nothing to print with no open document).
+/// Neither carries a shortcut hint: Word's `Ctrl+P` is already the fuzzy Open
+/// finder here, so a `Ctrl+P` hint on Print would lie about the binding.
+const FILE_ITEMS: [MenuItem; 8] = [
     MenuItem::new("New", "", MenuAction::NewScratch, Gate::Always, false),
     MenuItem::new(
         "Open\u{2026}",
@@ -299,6 +308,14 @@ const FILE_ITEMS: [MenuItem; 6] = [
     MenuItem::new("Save", "", MenuAction::Save, Gate::Doc, true),
     MenuItem::new("Save As\u{2026}", "", MenuAction::SaveAs, Gate::Doc, false),
     MenuItem::new("Close", "", MenuAction::CloseDoc, Gate::Doc, true),
+    MenuItem::new(
+        "Print Preview",
+        "",
+        MenuAction::PrintPreview,
+        Gate::Doc,
+        true,
+    ),
+    MenuItem::new("Print\u{2026}", "", MenuAction::Print, Gate::Doc, false),
 ];
 
 /// The Edit menu (Word-97 order; Find… omitted until EDITOR-8 lands in-buffer
@@ -597,6 +614,32 @@ mod tests {
     }
 
     #[test]
+    fn the_file_print_group_landed_doc_gated() {
+        // EDTB-5 §7 — File carries both Print Preview and Print…, each routing to
+        // a real print action and greyed with no document (nothing to print).
+        let file = MENUS
+            .iter()
+            .find(|(t, _)| *t == "File")
+            .expect("File menu")
+            .1;
+        let preview = file
+            .iter()
+            .find(|i| i.action == MenuAction::PrintPreview)
+            .expect("Print Preview is present");
+        let print = file
+            .iter()
+            .find(|i| i.action == MenuAction::Print)
+            .expect("Print… is present");
+        assert!(
+            matches!(preview.gate, Gate::Doc),
+            "Print Preview is doc-gated"
+        );
+        assert!(matches!(print.gate, Gate::Doc), "Print is doc-gated");
+        // Neither carries a shortcut hint — Ctrl+P is the finder, not print.
+        assert_eq!(print.shortcut, "", "no misleading Ctrl+P hint on Print");
+    }
+
+    #[test]
     fn find_is_omitted_until_editor_8_lands() {
         // In-buffer find (EDITOR-8) has not landed; an Edit → Find… entry would
         // be a dead item (the file finder is not text find).
@@ -627,7 +670,9 @@ mod tests {
                 "Open Folder",
                 "Save",
                 "Save As\u{2026}",
-                "Close"
+                "Close",
+                "Print Preview",
+                "Print\u{2026}"
             ]
         );
         let edit: Vec<&str> = MENUS[1].1.iter().map(|i| i.label).collect();

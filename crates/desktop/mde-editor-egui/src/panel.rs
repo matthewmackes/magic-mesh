@@ -46,6 +46,7 @@ use crate::menu_bar::{self, ListStyle, MenuAction, MenuContext};
 use crate::outline;
 use crate::palette::{self, CommandPalette, PaletteCommand};
 use crate::panes::{self, NavDir, Pane, PaneId, SplitDir};
+use crate::print::{self, PageLayout, PrintOptions};
 use crate::project_tree::{self, ProjectTree};
 use crate::search::{self, FindEvent, FindState, ProjectSearch};
 use crate::terminal::TerminalDock;
@@ -78,6 +79,15 @@ fn is_compact(available_width: f32) -> bool {
 
 /// The Save As / About dialog plate width — ten shared spacing units (§4).
 const DIALOG_W: f32 = Style::SP_XL * 10.0;
+
+/// The Print Preview overlay's default plate width (EDTB-5) — twenty shared
+/// spacing units (§4), wide enough for the 80-column monospace page at the
+/// preview's `SMALL` face; the window is resizable + scrollable beyond it.
+const PREVIEW_W: f32 = Style::SP_XL * 20.0;
+
+/// The Print Preview scroll viewport's max height (EDTB-5) — fourteen shared
+/// spacing units (§4), so a long document scrolls inside a bounded dialog.
+const PREVIEW_MAX_H: f32 = Style::SP_XL * 14.0;
 
 /// The integrated terminal dock's default height (EDITOR-10) — eight shared
 /// spacing units (§4); resizable, so this is only the opening size.
@@ -433,6 +443,8 @@ pub struct EditorSurface {
     about_open: bool,
     /// The Insert Table grid-picker dialog (EDTB-3, Insert → Table…).
     table_picker: TablePicker,
+    /// The EDTB-5 print state (Print Preview overlay + last print outcome).
+    print: PrintUi,
     /// The find-references results overlay (EDITOR-LSP-3, `Shift-F12`).
     references: ReferencesPanel,
     /// The rename new-name input (EDITOR-LSP-3, `F2`).
@@ -480,6 +492,7 @@ impl Default for EditorSurface {
             save_as: SaveAsDialog::default(),
             about_open: false,
             table_picker: TablePicker::default(),
+            print: PrintUi::default(),
             references: ReferencesPanel::default(),
             rename: RenameBox::default(),
             lsp_notice: None,
@@ -498,6 +511,26 @@ impl Default for EditorSurface {
 struct TablePicker {
     /// Whether the picker window is shown.
     open: bool,
+}
+
+/// The EDTB-5 print state: the Print Preview overlay's open flag and the last
+/// print attempt's honest outcome (surfaced in the preview + the status bar).
+#[derive(Default)]
+struct PrintUi {
+    /// Whether the Print Preview overlay is shown.
+    preview_open: bool,
+    /// The last print attempt's outcome, or `None` before any attempt (§7 — a
+    /// named success/failure, shown until the next attempt).
+    outcome: Option<PrintOutcome>,
+}
+
+/// One print attempt's human-readable result (§7 — a success message or an honest
+/// failure notice), with the flag that colors it (OK vs. DANGER).
+struct PrintOutcome {
+    /// The message text shown to the operator.
+    text: String,
+    /// True for a job sent to the queue; false for an honest failure.
+    ok: bool,
 }
 
 /// The small Save As… path-input dialog (EDTB-1): a path field prefilled with
@@ -921,8 +954,9 @@ impl EditorSurface {
 
     // ── EDITOR-7: the fuzzy finder + command palette ─────────────────────────
 
-    /// Whether a modal overlay (the fuzzy file-finder, the command palette, or
-    /// an EDTB-1 dialog — Save As / About) is currently up. The shell can key
+    /// Whether a modal overlay (the fuzzy file-finder, the command palette, or a
+    /// dialog — Save As / About / Insert Table / Print Preview) is currently up.
+    /// The shell can key
     /// off this to suppress its own global chords while the editor surface is
     /// capturing the keyboard for an overlay.
     #[must_use]
@@ -934,6 +968,7 @@ impl EditorSurface {
             || self.save_as.open
             || self.about_open
             || self.table_picker.open
+            || self.print.preview_open
             || self.references.is_open()
             || self.rename.is_open()
             || self.reload.prompt.is_some()
@@ -1489,6 +1524,13 @@ impl EditorSurface {
                 self.save_as.open_for(current.as_deref());
             }
             MenuAction::CloseDoc => self.run_command(PaletteCommand::CloseDoc),
+            // ── EDTB-5: Print via CUPS ───────────────────────────────────────
+            MenuAction::Print => self.do_print(),
+            MenuAction::PrintPreview => {
+                // A fresh preview drops the stale outcome from the last attempt.
+                self.print.outcome = None;
+                self.print.preview_open = true;
+            }
             MenuAction::Undo => {
                 if let Some(doc) = self.doc_mut() {
                     doc.view.undo(&mut doc.buffer);
@@ -1914,6 +1956,115 @@ impl EditorSurface {
         }
 
         self.render_table_picker(ctx);
+        self.render_print_preview(ctx);
+    }
+
+    /// The filename shown in the print header / job title (EDTB-5) — the open
+    /// document's file name, or `Untitled` for a pathless scratch buffer.
+    fn print_filename(&self) -> String {
+        self.current_path().and_then(Path::file_name).map_or_else(
+            || "Untitled".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// Paginate the open buffer and submit it to CUPS `lp` (EDTB-5). Stores an
+    /// honest outcome — a sent-N-pages message or a named [`print::PrintError`]
+    /// notice — surfaced in the Print Preview overlay and mirrored to the status
+    /// bar so a direct toolbar/menu Print (no preview open) is never a silent
+    /// no-op or a faked success (§7). A no-op with no open document.
+    fn do_print(&mut self) {
+        let filename = self.print_filename();
+        let Some(text) = self.doc().map(|d| d.buffer.rope().to_string()) else {
+            return;
+        };
+        let layout = PageLayout::default();
+        let pages = print::paginate(&text, &layout);
+        let count = pages.len();
+        let job = print::render_print_job(&pages, &filename, &layout);
+        let opts = PrintOptions {
+            printer: None,
+            title: filename,
+        };
+        let message = match print::submit(print::LP, &job, &opts) {
+            Ok(()) => (format!("Sent {count} page(s) to the print queue"), true),
+            Err(err) => (err.notice(), false),
+        };
+        self.print.outcome = Some(PrintOutcome {
+            text: message.0.clone(),
+            ok: message.1,
+        });
+        self.notice = Some(message.0);
+    }
+
+    /// Render the EDTB-5 Print Preview overlay: the paginated pages (the same
+    /// [`print::paginate`] the print job renders, so the preview is honest) in the
+    /// Quasar style, with a Print button that submits to CUPS and the last
+    /// attempt's outcome shown inline. Escape / Close dismisses. Token-styled (§4).
+    fn render_print_preview(&mut self, ctx: &egui::Context) {
+        if !self.print.preview_open {
+            return;
+        }
+        let filename = self.print_filename();
+        let Some(text) = self.doc().map(|d| d.buffer.rope().to_string()) else {
+            // The document vanished under the overlay — nothing left to preview.
+            self.print.preview_open = false;
+            return;
+        };
+        let layout = PageLayout::default();
+        let pages = print::paginate(&text, &layout);
+        let total = pages.len();
+        let mut want_print = false;
+        let mut close = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+        egui::Window::new("Print Preview")
+            .collapsible(false)
+            .resizable(true)
+            .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(PREVIEW_W);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(&filename)
+                            .size(Style::BODY)
+                            .color(Style::TEXT)
+                            .strong(),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(format!("{total} page(s)"))
+                                .size(Style::SMALL)
+                                .color(Style::TEXT_DIM),
+                        );
+                    });
+                });
+                ui.add_space(Style::SP_XS);
+                egui::ScrollArea::both()
+                    .max_height(PREVIEW_MAX_H)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for page in &pages {
+                            print::draw_page(ui, page, &filename, total);
+                            ui.add_space(Style::SP_S);
+                        }
+                    });
+                if let Some(outcome) = &self.print.outcome {
+                    ui.add_space(Style::SP_XS);
+                    let color = if outcome.ok { Style::OK } else { Style::DANGER };
+                    ui.label(RichText::new(&outcome.text).size(Style::SMALL).color(color));
+                }
+                ui.add_space(Style::SP_S);
+                ui.horizontal(|ui| {
+                    want_print = ui.button("Print").clicked();
+                    close |= ui.button("Close").clicked();
+                });
+            });
+        if want_print {
+            self.do_print();
+        }
+        if close {
+            self.print.preview_open = false;
+            self.print.outcome = None;
+        }
     }
 
     /// Render the EDTB-3 Insert Table grid-picker (Word's drag-grid): hover to
