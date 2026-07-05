@@ -1186,6 +1186,67 @@ enum Cmd {
         #[command(subcommand)]
         cmd: MeshSshKeyCmd,
     },
+
+    /// TRANSFERS-1 — drive the daemon's `transfers` queue (§9 CLI parity for the
+    /// `transfer.submit/cancel/pause/resume/list` verbs). Submit/cancel/pause/resume
+    /// hand a typed verb to the running daemon through the node-local inbox; list
+    /// reads the persistent ledger directly. The same store the daemon uses, so the
+    /// CLI and the GUI share one queue.
+    Transfer {
+        #[command(subcommand)]
+        cmd: TransferCmd,
+    },
+}
+
+/// TRANSFERS-1 — `mackesd transfer <sub>`: the CLI half of the typed verb set.
+#[derive(Subcommand)]
+enum TransferCmd {
+    /// Enqueue a new transfer (`transfer.submit`). Mints a Queued job + hands it to
+    /// the daemon; prints the new job id.
+    Submit {
+        /// Where the bytes come from (a path, a URL, a `host:path`, or a peer —
+        /// the lane parses it per method).
+        #[arg(long, value_name = "SRC")]
+        source: String,
+        /// Where the bytes land.
+        #[arg(long, value_name = "DEST")]
+        dest: String,
+        /// The protocol lane: sftp | rsync | http | browser-download | node | music.
+        #[arg(long, value_name = "METHOD")]
+        method: String,
+        /// Optional per-job bandwidth cap (Q12 — passed to the tool: `rsync
+        /// --bwlimit` / `wget --limit-rate`, e.g. `2m`).
+        #[arg(long, value_name = "RATE")]
+        bwlimit: Option<String>,
+        /// Verify integrity on completion (Q15 — size + checksum; a mismatch is a
+        /// failure, not a silent pass).
+        #[arg(long)]
+        verify: bool,
+    },
+    /// List every job in the ledger (`transfer.list`). `--json` for the raw records.
+    List {
+        /// Emit the ledger as a JSON array instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel a job (`transfer.cancel`) — removes it + frees any slot it held.
+    Cancel {
+        /// The job id (from `submit` / `list`).
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Pause a Queued/Running job (`transfer.pause`).
+    Pause {
+        /// The job id.
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Resume a Paused job (`transfer.resume`).
+    Resume {
+        /// The job id.
+        #[arg(value_name = "ID")]
+        id: String,
+    },
 }
 
 /// FILEMGR-6 — `mackesd mesh-ssh-key <sub>`: the shared-key lifecycle
@@ -4653,6 +4714,9 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::MeshSshKey { cmd } => {
             return cmd_mesh_ssh_key(cmd);
+        }
+        Cmd::Transfer { cmd } => {
+            return cmd_transfer(cmd);
         }
         Cmd::Secret { cmd } => {
             return cmd_secret(cmd);
@@ -9735,6 +9799,31 @@ fn run_serve(
                 .push("node_grade".into());
         }
 
+        // TRANSFERS-1 — the `transfers` worker: the daemon-owned queue/ledger/verb/
+        // state-machine spine of the Transfers surface (docs/design/transfers-
+        // surface.md). Owns a typed TransferJob envelope, a persistent node-local
+        // ledger (survives restart, Q11), the submit/cancel/pause/resume/list verbs
+        // (Q14, driven by the `mackesd transfer …` CLI for §9 parity), and the
+        // parallel cap (Q12). Execution is delegated to an injectable LaneRunner seam
+        // the per-protocol lanes (TRANSFERS-2..6) implement — honestly gated for now
+        // (§7: a submitted job fails naming the un-wired lane, never a fake success).
+        // Workstation-tier (rank 1) — a desktop feature fronted by the File Browser,
+        // sibling of pty_broker/mesh_mount; it idles gracefully on a headless box /
+        // Lighthouse (an empty inbox + empty ledger). Store is node-local, so it
+        // needs neither the workgroup root nor the node id.
+        if mackesd_core::worker_role::runs("transfers", role_rank) {
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::transfers::TransfersWorker::new(
+                    mackesd_core::workers::transfers::default_store_root(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("transfers".into());
+        }
+
         // TUNE-3.b (2026-05-26) — wire the v1.3.0 Fleet ansible-pull
         // worker. `crates/mackesd/src/workers/ansible_pull.rs::build`
         // has shipped since v2.0.0 Phase B.6 but stayed dead;
@@ -10404,6 +10493,114 @@ fn cmd_secret(cmd: SecretCmd) -> anyhow::Result<()> {
 /// shared mesh SSH keypair is sealed under `mesh-ssh-key` (the ref the FILEMGR-5
 /// mesh-mount worker reads); the public half installs for the mesh user behind an
 /// overlay-only sshd Match block. `rotate` is the documented re-key path.
+/// TRANSFERS-1 — `mackesd transfer <sub>`: the CLI half of the typed verb set (§9
+/// parity). Mutating verbs (submit/cancel/pause/resume) are handed to the running
+/// daemon through the node-local inbox (the daemon is the single ledger writer);
+/// `list` reads the persistent ledger directly. Both resolve the same node-local
+/// store the daemon uses, so the CLI and the daemon share one queue.
+fn cmd_transfer(cmd: TransferCmd) -> anyhow::Result<()> {
+    use mackesd_core::workers::transfers::{
+        default_store_root, write_verb, Ledger, Method, TransferJob, TransferPolicy, TransferVerb,
+    };
+
+    let store_root = default_store_root();
+
+    match cmd {
+        TransferCmd::Submit {
+            source,
+            dest,
+            method,
+            bwlimit,
+            verify,
+        } => {
+            let method: Method = method.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            let policy = TransferPolicy { bwlimit, verify };
+            let job = TransferJob::new(source, dest, method, policy);
+            let id = job.id.clone();
+            write_verb(&store_root, &TransferVerb::Submit(job))
+                .with_context(|| format!("writing submit verb under {}", store_root.display()))?;
+            println!("transfer submit: queued {id} ({method})");
+            println!(
+                "  the daemon's transfers worker picks it up; track with `mackesd transfer list`"
+            );
+        }
+        TransferCmd::List { json } => {
+            // A pure read: open the ledger directly (never `TransferQueue::open`,
+            // which runs the daemon-only Running→Queued crash recovery).
+            let ledger = Ledger::open(&store_root).with_context(|| {
+                format!("opening the transfers ledger at {}", store_root.display())
+            })?;
+            let jobs = ledger.load_all();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&jobs)?);
+            } else if jobs.is_empty() {
+                println!("no transfers in the ledger");
+            } else {
+                println!(
+                    "{:<26} {:<8} {:<16} SOURCE -> DEST",
+                    "ID", "STATE", "METHOD"
+                );
+                for j in &jobs {
+                    let pct = j.progress.map_or_else(String::new, |p| format!(" {p}%"));
+                    println!(
+                        "{:<26} {:<8} {:<16} {} -> {}{pct}",
+                        j.id, j.state, j.method, j.source, j.dest
+                    );
+                    if let Some(err) = &j.error {
+                        println!("    ! {err}");
+                    }
+                }
+            }
+        }
+        TransferCmd::Cancel { id } => {
+            dispatch_transfer_lifecycle(
+                &store_root,
+                &id,
+                TransferVerb::Cancel(id.clone()),
+                "cancel",
+            )?;
+        }
+        TransferCmd::Pause { id } => {
+            dispatch_transfer_lifecycle(
+                &store_root,
+                &id,
+                TransferVerb::Pause(id.clone()),
+                "pause",
+            )?;
+        }
+        TransferCmd::Resume { id } => {
+            dispatch_transfer_lifecycle(
+                &store_root,
+                &id,
+                TransferVerb::Resume(id.clone()),
+                "resume",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Hand a lifecycle verb (cancel/pause/resume) to the daemon after an honest early
+/// existence check against the ledger (a typo'd id fails fast rather than silently
+/// dropping a verb the daemon would refuse).
+fn dispatch_transfer_lifecycle(
+    store_root: &std::path::Path,
+    id: &str,
+    verb: mackesd_core::workers::transfers::TransferVerb,
+    name: &str,
+) -> anyhow::Result<()> {
+    use mackesd_core::workers::transfers::{write_verb, Ledger};
+    let ledger = Ledger::open(store_root)
+        .with_context(|| format!("opening the transfers ledger at {}", store_root.display()))?;
+    if ledger.get(id).is_none() {
+        anyhow::bail!("no transfer `{id}` in the ledger (see `mackesd transfer list`)");
+    }
+    write_verb(store_root, &verb)
+        .with_context(|| format!("writing {name} verb under {}", store_root.display()))?;
+    println!("transfer {name}: requested for {id} (the daemon applies it on its next tick)");
+    Ok(())
+}
+
 fn cmd_mesh_ssh_key(cmd: MeshSshKeyCmd) -> anyhow::Result<()> {
     use mackesd_core::ipc::mesh_ssh_key::{MeshKeyProvisioner, ProvisionOutcome, SshdReload};
     use mackesd_core::ipc::secret_store::{repo_root, SecretStore};

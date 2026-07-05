@@ -235,6 +235,12 @@ pub mod mesh_mount;
 // reap folds are pure + unit-tested.
 pub mod mesh_router;
 pub mod pty_broker;
+// TRANSFERS-1 — the `transfers` worker: the daemon-owned queue/ledger/verb/state-
+// machine spine of the Transfers surface (docs/design/transfers-surface.md). Owns a
+// typed TransferJob envelope, a persistent node-local ledger, the submit/cancel/
+// pause/resume/list verbs, and the parallel cap — with an injectable LaneRunner seam
+// the per-protocol lanes (TRANSFERS-2..6) implement (honestly gated until then).
+pub mod transfers;
 // NF-3.4 (v2.5) — Nebula supervisor worker (CA mint +
 // role-marker management + bundle-watch + systemctl
 // reload).

@@ -209,6 +209,14 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     // seated user opens a terminal on a mesh node), so Workstation-tier; it
     // idles gracefully on a headless box (no action/pty/* requests arrive).
     ("pty_broker", 1),
+    // TRANSFERS-1 — the transfers worker: the daemon-owned queue/ledger/verb spine
+    // of the Transfers surface (docs/design/transfers-surface.md). A desktop feature
+    // fronted by the File Browser (Q1), the sibling of pty_broker/mesh_mount, so
+    // Workstation-tier; it idles gracefully on a headless box or a Lighthouse relay
+    // (an empty inbox + empty ledger, no transfer.submit verbs arrive). A deliberate
+    // census entry (the BUG-STORAGE-1 lesson — a worker absent from the census
+    // silently never runs).
+    ("transfers", 1),
 ];
 
 /// MEDIA-1 — workers that ALSO require a capability tag beyond their rank tier.
@@ -477,7 +485,10 @@ mod tests {
         // executor, pinned at rank 0: every node can be a device-action target and
         // drains its own fleet/device-control/<self> dir. Split 29/15 → 30/15, len
         // 44 → 45).
-        assert_eq!(WORKER_TIERS.len(), 45);
+        // +1 transfers (TRANSFERS-1 — the Workstation-tier transfers queue/ledger/
+        // verb spine, sibling of pty_broker/mesh_mount. Split 30/15 → 30/16, len
+        // 45 → 46).
+        assert_eq!(WORKER_TIERS.len(), 46);
     }
 
     #[test]
@@ -505,8 +516,8 @@ mod tests {
         );
         assert_eq!(
             count(1),
-            15,
-            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7) — kdc moved to rank 0 (KDC-MESH-3)"
+            16,
+            "Workstation = fleet (ansible-pull/app-sync/job_exec) + voice/clipboard_sync/remmina + music_autoconfig (MEDIA-8) + mesh_mount (FILEMGR-5) + bookmarks (BOOKMARKS-2) + adfilter (BOOKMARKS-7) + browser_policy (BOOKMARKS-8) + desktop_sources (CHOOSER-1) + media_sources (MEDIA-14) + media_server (MEDIA-15) + pty_broker (TERM-7) + transfers (TRANSFERS-1) — kdc moved to rank 0 (KDC-MESH-3)"
         );
         // No middle tier in the 2-role model — Workstation is the top rank.
         assert_eq!(
@@ -759,11 +770,11 @@ mod tests {
         // universal unit_aggregator + the CHAT-FIX-2 universal notify producer + the
         // NODE-GRADE-1 universal node_grade self-grade + the KDC-MESH-3 universal
         // kdc_host + the CHAT-FIX-1 universal chat worker + the DEVMGR-8 universal
-        // device_control executor at rank 0); Workstation adds the 15 fleet + desktop
-        // workers for the full 45 (the retired Server tier folded into Workstation in
-        // the 2-role model).
+        // device_control executor at rank 0); Workstation adds the 16 fleet + desktop
+        // workers (incl. the TRANSFERS-1 transfers worker) for the full 46 (the
+        // retired Server tier folded into Workstation in the 2-role model).
         assert_eq!(lh.len(), 30);
-        assert_eq!(ws.len(), 45);
+        assert_eq!(ws.len(), 46);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
