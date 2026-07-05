@@ -267,7 +267,9 @@ impl PeerDirectorySource for FakePeerDirectory {
 /// `failing` fake makes every op answer a typed [`InstanceOpError`] (the honest
 /// seam-failure path).
 pub struct FakeInstanceOps {
-    instances: Vec<CloudInstance>,
+    /// Interior-mutable so a QC-20 watch test can flip an instance's status
+    /// mid-run (an `ACTIVE → ERROR` edge) through a shared `Arc`.
+    instances: Mutex<Vec<CloudInstance>>,
     calls: Mutex<Vec<String>>,
     /// When set, every op fails with this reason (a typed CLI error).
     fail: Option<String>,
@@ -277,7 +279,7 @@ impl FakeInstanceOps {
     /// A fake with no instances and no planned failure.
     pub fn new() -> Self {
         Self {
-            instances: Vec::new(),
+            instances: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
             fail: None,
         }
@@ -285,9 +287,14 @@ impl FakeInstanceOps {
 
     /// Seed the roster `list` returns.
     #[must_use]
-    pub fn with_instances(mut self, instances: Vec<CloudInstance>) -> Self {
-        self.instances = instances;
+    pub fn with_instances(self, instances: Vec<CloudInstance>) -> Self {
+        *self.instances.lock().unwrap() = instances;
         self
+    }
+
+    /// Replace the roster mid-test (QC-20 — drive a status edge live).
+    pub fn set_instances(&self, instances: Vec<CloudInstance>) {
+        *self.instances.lock().unwrap() = instances;
     }
 
     /// Make every op answer a typed CLI failure with `reason`.
@@ -313,7 +320,7 @@ impl InstanceOps for FakeInstanceOps {
                 stderr: reason.clone(),
             });
         }
-        Ok(self.instances.clone())
+        Ok(self.instances.lock().unwrap().clone())
     }
 
     fn perform(&self, action: LifecycleAction, instance: &str) -> Result<(), InstanceOpError> {

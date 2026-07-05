@@ -51,6 +51,12 @@
 //!   feed script the QC-10 seed runs (the peer directory rebuilds the zones
 //!   from scratch), the peer-fed pool topology (every node's bind9 — no
 //!   fixed center), and the honest live-resolve gate.
+//! - [`events`] — QC-20's cloud-events-into-chat producer (Q65/Q90,
+//!   NOTIFY-CHAT §6): failure events + Nova `ERROR` edges emit alert bodies
+//!   from the owning **service contact** (`nova.mesh`, …) on the
+//!   `event/notify/cloud-instance` lane the chat worker already folds (no
+//!   emitter-side chat change), plus the bounded, debounced idle-instance
+//!   owner nudge off the roster watch.
 //! - [`image_pipeline`] — QC-9's diskimage-builder → Glance pipeline (the
 //!   pinned, testable definition that retires `build-mde-vm-golden.sh`, Q36/53):
 //!   `disk-image-create` from a versioned element set → `glance image-create`
@@ -85,6 +91,7 @@ pub mod catalog;
 pub mod client;
 pub mod config_render;
 pub mod designate;
+pub mod events;
 pub mod fleet;
 pub mod image_pipeline;
 pub mod images;
@@ -110,6 +117,7 @@ use capacity::NodeCapacity;
 use client::{CloudClient, LiveOpenStack};
 use config_render::{render_cloud_bootstrap, render_fleet_heat_stack, OverlayBind};
 use designate::{MeshPeerDirectory, PeerDirectorySource};
+use events::{watch_cycle, EventSource, NotificationFeed, WatchState};
 use fleet::{FleetStateSource, MeshFleetState};
 use podman::{PodmanCli, PodmanRunner, DEFAULT_KOLLA_CONFIG_ROOT};
 use reconcile::{converge_cycle, CycleOutcome, DoctrineStatus, OpenStackState};
@@ -128,6 +136,14 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// so a freshly-pruned topic / late subscriber still finds a recent row
 /// without the Bus filling with identical bodies.
 pub const PUBLISH_HEARTBEAT: Duration = Duration::from_secs(60);
+
+/// QC-20 — the instance-watch cadence (the Nova roster read behind the
+/// `ERROR`-edge alerts, the idle nudges, and the QC-17 instance-record feed).
+///
+/// Deliberately slower than the converge tick: each read is a real
+/// `openstack server list` (a minted Keystone token + a Nova round-trip over
+/// the overlay), and minutes-fresh is plenty for failure/idle signals.
+pub const INSTANCE_WATCH_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The per-node mirror topic: `state/openstack/<node>`.
 #[must_use]
@@ -306,6 +322,11 @@ pub struct OpenstackWorker {
     /// runtime) without borrowing `self`. The unified [`CloudClient`] seam also
     /// serves IAC-3's `list-resources` (one injected client, both verbs).
     catalog: Arc<dyn CloudClient>,
+    /// QC-20 — the `OpenStack` notification seam the watch drains
+    /// (production: [`NotificationFeed`], honestly gated until the AMQP
+    /// consumer leg lands; the live failure signal rides the roster watch
+    /// meanwhile).
+    events: Arc<dyn EventSource + Send + Sync>,
     /// The Kolla config root ([`DEFAULT_KOLLA_CONFIG_ROOT`]; tests point it
     /// at a tempdir).
     config_root: PathBuf,
@@ -325,6 +346,8 @@ pub struct OpenstackWorker {
     poll: Duration,
     /// Mirror republish heartbeat.
     heartbeat: Duration,
+    /// QC-20 — the instance-watch cadence ([`INSTANCE_WATCH_INTERVAL`]).
+    instance_watch: Duration,
 }
 
 impl OpenstackWorker {
@@ -344,12 +367,14 @@ impl OpenstackWorker {
             runner: Arc::new(PodmanCli::new()),
             instances: Arc::new(OpenstackCli::new()),
             catalog: LiveOpenStack::shared(),
+            events: Arc::new(NotificationFeed),
             config_root: PathBuf::from(DEFAULT_KOLLA_CONFIG_ROOT),
             share_root: workgroup_root,
             overlay_ip_path: PathBuf::from(DEFAULT_OVERLAY_IP_PATH),
             bus_root: default_bus_root(),
             poll: DEFAULT_POLL_INTERVAL,
             heartbeat: PUBLISH_HEARTBEAT,
+            instance_watch: INSTANCE_WATCH_INTERVAL,
         }
     }
 
@@ -427,6 +452,20 @@ impl OpenstackWorker {
         self
     }
 
+    /// Inject the QC-20 notification seam (tests — a fixture event feed).
+    #[must_use]
+    pub fn with_event_source(mut self, events: Arc<dyn EventSource + Send + Sync>) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// Override the QC-20 instance-watch cadence (tests).
+    #[must_use]
+    pub const fn with_instance_watch(mut self, watch: Duration) -> Self {
+        self.instance_watch = watch;
+        self
+    }
+
     /// Run one converge cycle on a blocking thread (podman + doctrine I/O
     /// never pins the async runtime), surface its alerts, and publish the
     /// mirror when the content changed or the heartbeat elapsed.
@@ -484,6 +523,52 @@ impl OpenstackWorker {
             *last_pub_at = Some(now);
         }
         *last = Some(outcome.state);
+    }
+
+    /// QC-20 — one instance-watch tick on a blocking thread: drain the
+    /// notification seam + observe the Nova roster (ERROR edges, idle
+    /// nudges), publish the resulting chat alerts, and refresh the QC-17
+    /// instance-record `snapshot` when the roster read succeeded (a gated
+    /// read keeps the previous snapshot — never an emptied zone feed).
+    async fn watch_instances(&self, state: &mut WatchState, snapshot: &mut Vec<(String, String)>) {
+        let Some(bus_root) = self.bus_root.clone() else {
+            return;
+        };
+        let instances = Arc::clone(&self.instances);
+        let events = Arc::clone(&self.events);
+        let watch_in = state.clone();
+        match tokio::task::spawn_blocking(move || {
+            let mut watch = watch_in;
+            let pairs = match Persist::open(bus_root) {
+                Ok(persist) => {
+                    let now_ms = i64::try_from(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or_default(),
+                    )
+                    .unwrap_or(0);
+                    watch_cycle(&persist, &*instances, &*events, &mut watch, now_ms)
+                }
+                Err(e) => {
+                    tracing::debug!(target: "mackesd::openstack", error = %e, "instance watch: bus open failed");
+                    None
+                }
+            };
+            (watch, pairs)
+        })
+        .await
+        {
+            Ok((watch, pairs)) => {
+                *state = watch;
+                if let Some(pairs) = pairs {
+                    *snapshot = pairs;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "mackesd::openstack", error = %e, "instance watch task join failed");
+            }
+        }
     }
 
     /// QC-11 — drain net-new `action/cloud/*` verb requests and answer each on
@@ -564,13 +649,18 @@ impl Worker for OpenstackWorker {
         // Designate zone feed derives instance records from. Empty until a
         // roster read lands (honest absence — instance records simply aren't
         // fed yet), refreshed by the QC-20 instance watch.
-        let instance_snapshot: Vec<(String, String)> = Vec::new();
+        let mut instance_snapshot: Vec<(String, String)> = Vec::new();
+        // QC-20 — the watch's cross-tick state (ERROR-edge baseline, idle
+        // tracking, event dedup), riding the loop by value like the notifier.
+        let mut watch_state = WatchState::default();
         // Converge + publish immediately on start so a panel doesn't wait a
         // full tick for the first mirror row.
         self.cycle_and_publish(&mut last, &mut last_pub_at, &instance_snapshot)
             .await;
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
+        let mut watch_tick = tokio::time::interval(self.instance_watch);
+        watch_tick.tick().await; // consume the immediate first tick
         loop {
             tokio::select! {
                 _ = tick.tick() => {
@@ -578,6 +668,17 @@ impl Worker for OpenstackWorker {
                     // Answer any queued cloud verbs against the fresh mirror.
                     if let Some(state) = last.clone() {
                         self.drain_verbs(&mut verb_cursors, &mut notifier, &state).await;
+                    }
+                }
+                _ = watch_tick.tick() => {
+                    // QC-20 — the roster watch runs only under an Enabled
+                    // doctrine (no cloud declared ⇒ no roster to poll; the
+                    // openstack CLI isn't hammered on every non-cloud node).
+                    let enabled = last
+                        .as_ref()
+                        .is_some_and(|s| matches!(s.doctrine, DoctrineStatus::Enabled { .. }));
+                    if enabled {
+                        self.watch_instances(&mut watch_state, &mut instance_snapshot).await;
                     }
                 }
                 () = shutdown.wait() => break,
@@ -852,5 +953,77 @@ mod tests {
             answered,
             "the run-loop responder must answer the cloud request"
         );
+    }
+
+    #[tokio::test]
+    async fn the_instance_watch_emits_an_error_edge_alert_from_the_run_loop() {
+        // QC-20 — the wired watch: under an Enabled doctrine the run loop
+        // polls the Nova roster on its own cadence; an ACTIVE → ERROR edge
+        // lands ONE critical alert on the chat-folded
+        // `event/notify/cloud-instance` lane, authored by the `nova.mesh`
+        // service contact (services as roster contacts — no chat change).
+        use super::testkit::FakeInstanceOps;
+        use fleet::CloudDesired;
+        use verbs::CloudInstance;
+
+        let bus = tempfile::tempdir().unwrap();
+        let bus_root = bus.path().to_path_buf();
+        let share = tempfile::tempdir().unwrap();
+
+        let mk = |status: &str| CloudInstance {
+            id: "uuid-1".to_string(),
+            name: "web-1".to_string(),
+            status: status.to_string(),
+            flavor: None,
+            image: None,
+            networks: Some("mesh=10.42.100.7".to_string()),
+        };
+        let ops = Arc::new(FakeInstanceOps::new().with_instances(vec![mk("ACTIVE")]));
+        // Method-call clone (not `Arc::clone`) so the concrete Arc is cloned
+        // first, then unsize-coerced to the seam's trait object.
+        let dyn_ops: Arc<dyn InstanceOps + Send + Sync> = ops.clone();
+
+        let view = CloudDesired {
+            enabled: true,
+            leader: false,
+            kolla_release: "2024.1".to_string(),
+            horizon: false,
+        };
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut w = OpenstackWorker::new("node-a".to_string(), share.path().to_path_buf())
+            .with_fleet(Arc::new(FakeFleet::fixed(view)))
+            .with_runner(Arc::new(FakeRunner::new()))
+            .with_instances(dyn_ops)
+            .with_config_root(share.path().join("kolla"))
+            .with_share_root(share.path().to_path_buf())
+            .with_overlay_ip_path(share.path().join("no-overlay-yet"))
+            .with_bus_root(Some(bus_root.clone()))
+            .with_poll(Duration::from_millis(10))
+            .with_instance_watch(Duration::from_millis(25));
+        let token = ShutdownToken::from_receiver(rx);
+        let handle = tokio::spawn(async move { w.run(token).await });
+
+        // Let a first watch tick seed the ACTIVE baseline, then flip the
+        // roster to ERROR and poll for the folded-lane emission.
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        ops.set_instances(vec![mk("ERROR")]);
+        let mut body: Option<String> = None;
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let persist = Persist::open(bus_root.clone()).expect("persist");
+            let rows = persist
+                .list_since(events::INSTANCE_NOTIFY_TOPIC, None)
+                .unwrap_or_default();
+            if let Some(row) = rows.first() {
+                body = row.body.clone();
+                break;
+            }
+        }
+        tx.send(true).expect("signal shutdown");
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        let body = body.expect("the watch must publish the ERROR-edge alert");
+        assert!(body.contains("\"severity\":\"critical\""), "{body}");
+        assert!(body.contains("\"host\":\"nova.mesh\""), "{body}");
+        assert!(body.contains("web-1"), "{body}");
     }
 }
