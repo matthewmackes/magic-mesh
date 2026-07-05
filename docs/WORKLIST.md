@@ -3144,3 +3144,118 @@ Make tmux first-class in mde-term-egui via iTerm2-style control mode (`tmux -CC`
 ## TERM-MENUBAR — a top menu bar exposing all terminal features (operator 2026-07-04)
 
 - [ ] **TERM-MENUBAR-1: the terminal menu bar.** **As** a user, **I want** a menu bar at the top of the terminal exposing all features, **so that** everything is discoverable without memorizing shortcuts. **Acceptance** (each runtime-observable): a top menu bar on the terminal surface (mde-term-egui) with menus covering EVERY feature — File (new tab/window, close), Edit (copy/paste/find/select-all/clear), View (appearance/theme presets, fonts, zoom, toggle status bar), Terminal (new session, reset, broadcast-input, bell settings), Splits (split H/V, navigate, close, zoom, layouts), Tabs (new/close/rename/reorder/detach), Session (mesh/remote roster, attach a peer node), tmux (the TMUX-FC session/window/pane actions — wired as those land), Help (shortcuts). Each item drives the REAL existing feature seam (menu.rs/tabs/splits/search/remote/appearance/presets — §6 glue, no dead items §7); shortcuts shown beside items; Carbon Style tokens (§4). Tested: the menu bar renders all menus, each item dispatches its real action, honest-disabled where a feature needs context. *(mde-term-egui; keep the panel.rs mount minimal — coordinate with TMUX-FC-1)*
+
+
+### DEVMGR — Device-Manager hardware inspector in the About surface (25-Q survey 2026-07-04; design: docs/design/about-device-manager.md)
+
+Turn `Surface::About` into a Windows-Device-Manager-style hardware inspector: a faithful categorized device tree in Quasar dark, host-switching across the whole mesh (nodes/Cloud/phones/LAN/VyOS), rich per-device properties, MDM problem-code parity, fleet-wide fault notify, and (P2) real device actions over the overlay. **Serialize the shell units (DEVMGR-2..6/10/11 all touch the new `device_manager.rs` + the About mount — land on the settled base, like the VDOCK churn).**
+
+#### Phase 1 — read-only inspector (local + mesh nodes)
+
+- [ ] **DEVMGR-1: the device-inventory worker + publish.**
+  **As** an operator,
+  **I want** every node to enumerate + publish its own hardware,
+  **so that** any host's device tree is readable across the mesh.
+  **Acceptance** (each runtime-observable):
+    - [ ] extend an existing inventory worker (`legacy_inventory`/`compute_registry`, NOT a new worker — #16) to enumerate the local host's **full Linux taxonomy** (CPU/memory/disk+storage-ctrl/network/GPU/USB/PCI/audio/input/sensors/bluetooth/power) via **sysfs/udev first** (+ `pci.ids`/`usb.ids` names) with `lshw -json`/`dmidecode` shelled out for deep DMI/firmware on demand (#4/#15)
+    - [ ] each device carries `{name, vendor, model, ids, sysfs_path, driver/module+version, status+problem_code, resources(irq/io/mem), recent_events}`
+    - [ ] publish the tree to `<workgroup_root>/device-inventory/<hostname>.json` via the SEC-5 mesh-shunt replication (like node_grade); periodic republish + an on-demand live-re-query seam (#7/#8); rank-0 (every node)
+    - [ ] the shared serde schema lives in a mesh-neutral shared crate (or duplicated with a round-trip test) — no §6 boundary crossing
+    - [ ] tested: enumeration builds the taxonomy from a fixture sysfs tree, the JSON round-trips, the publish path writes the file
+
+- [ ] **DEVMGR-2: About → Device Manager shell (local host, by-type).**
+  **As** a user,
+  **I want** the About surface to become a Device Manager,
+  **so that** I can inspect this machine's hardware like Windows.
+  **Acceptance** (each runtime-observable):
+    - [ ] a new `device_manager.rs` renders as the body of `Surface::About`; brand → a compact `◈ Magic-Mesh Quasar v<ver>` title strip + an ⓘ button opening license/credits/mesh-identity in a dialog (#2/#24)
+    - [ ] the faithful MDM **by-type** device tree in `mde_egui::Style` dark tokens, **all-collapsed** default (#1/#18), reading the LOCAL published inventory (DEVMGR-1)
+    - [ ] a full **menu bar (Action/View/Help) + toolbar** (Scan, View-mode toggle, Expand/Collapse-all) (#19)
+    - [ ] a **rich header card** (host · OS/kernel · uptime · CPU/RAM/disk totals · device count + problem badge) (#20)
+    - [ ] style-leak grep clean; tested: tree builds from a fixture inventory, categories group correctly, collapse state, header card fields
+
+- [ ] **DEVMGR-3: the device detail drawer + problem codes.**
+  **As** a user,
+  **I want** full per-device properties,
+  **so that** I can diagnose a device.
+  **Acceptance** (each runtime-observable):
+    - [ ] selecting a device slides up a **bottom detail drawer** (tree stays full-width above, #9) with **General / Driver / Details(sysfs IDs) / Events / Resources** tabs (#10)
+    - [ ] **full MDM problem-code parity** (#11): Linux state → problem code (no-driver→Code 28, disabled→Code 22, error/degraded→Code 10) shown in the drawer + as tree badges, WITH the real Linux reason beside it (honest emulation)
+    - [ ] tested: the state→code mapping, each tab renders its device fields, badge appears on a problem device
+
+- [ ] **DEVMGR-4: the host rail + mesh-node switching.**
+  **As** an operator,
+  **I want** to switch which host I'm inspecting,
+  **so that** I can check any node's hardware from one panel.
+  **Acceptance** (each runtime-observable):
+    - [ ] a persistent **left host rail** (rail │ tree │ drawer) listing mesh peer nodes with a status dot + the local "you are here" marker (#5)
+    - [ ] selecting a host loads its published inventory instantly (**hybrid snapshot**) + a **live-refresh** button re-queries it (#7); a **Scan** action + ~30s auto-refresh (#8); honest dim/stale/offline states
+    - [ ] tested: rail lists nodes from the peer directory, switching loads the right tree, stale/offline render honestly
+
+- [ ] **DEVMGR-5: the By-connection view mode.**
+  **As** a user,
+  **I want** the bus-topology view,
+  **so that** I can see what hangs off what.
+  **Acceptance** (each runtime-observable):
+    - [ ] a **By-connection** view mode (the View toggle) renders the PCI/USB topology tree (host bridge → bus → device → child) from the same inventory (#3)
+    - [ ] tested: the topology tree nests devices under their parent bus from a fixture
+
+- [ ] **DEVMGR-6: export the device list.**
+  **As** an operator,
+  **I want** to export a host's inventory,
+  **so that** I can attach it to a ticket or diff it.
+  **Acceptance** (each runtime-observable):
+    - [ ] an Export action produces the current host's inventory as machine **JSON** and a human-readable **Markdown report**, plus copy-to-clipboard (#23)
+    - [ ] tested: the JSON round-trips, the Markdown report contains every category + problem summary
+
+#### Phase 2 — actions, notify, By-node, non-PC hosts, reach
+
+- [ ] **DEVMGR-7: local device actions (armed).**
+  **As** an operator,
+  **I want** to act on this machine's devices,
+  **so that** I can recover a wedged device.
+  **Acceptance** (each runtime-observable):
+    - [ ] **Rescan bus** (sysfs `.../rescan`), **Enable/Disable** (driver bind/unbind, `ip link up/down`, USB `authorized`), **Reload kernel module** (rmmod+modprobe), **Properties/Copy-info** (#12) fire on the LOCAL host
+    - [ ] destructive actions behind **typed-arming** (type the device/host name — reuse EXPLORER-5 arming, #14); the safe ones fire directly
+    - [ ] tested: each action maps to its real seam, the arming gate blocks until typed, a rescan/disable dispatches
+
+- [ ] **DEVMGR-8: remote device actions over the overlay.**
+  **As** an operator,
+  **I want** to act on a remote node's devices,
+  **so that** I can drive any host's hardware from one panel.
+  **Acceptance** (each runtime-observable):
+    - [ ] the DEVMGR-7 actions dispatch on a selected **remote** host over the Nebula overlay (reuse the mackesd run-command / QC-verb / TERM remote seam, #13), typed-armed
+    - [ ] a "you may lose reach to this host" warning for network-device actions; every action appends to the KDC hash-chained audit log
+    - [ ] tested: a remote action round-trips to the target's action seam + the audit append
+
+- [ ] **DEVMGR-9: fleet-wide device-fault notify.**
+  **As** an operator,
+  **I want** to hear when a device fails on any node,
+  **so that** I catch hardware problems without watching the panel.
+  **Acceptance** (each runtime-observable):
+    - [ ] a device transitioning INTO a problem state (driver drop, disk I/O errors, NIC down) emits `event/notify/<source>` → Chat + phone (CHAT-FIX-2 producer, #21), debounced against flapping (mirror node_grade)
+    - [ ] tested: a simulated fault transition fires one debounced notify; a flapping device does not spam
+
+- [ ] **DEVMGR-10: the By-node cross-fleet view.**
+  **As** an operator,
+  **I want** every host's devices in one tree,
+  **so that** I can scan the whole fleet's hardware at once.
+  **Acceptance** (each runtime-observable):
+    - [ ] a **By-node** view mode flattens all hosts' published inventories into one cross-fleet tree (host → its devices), problem hosts near the top (#3)
+    - [ ] tested: the By-node tree aggregates multiple fixture hosts + surfaces problem counts per host
+
+- [ ] **DEVMGR-11: non-PC host types.**
+  **As** a user,
+  **I want** phones, routers, cloud instances + LAN hosts in the inspector,
+  **so that** the whole mesh's hardware is visible.
+  **Acceptance** (each runtime-observable):
+    - [ ] the host rail also lists **Cloud/Nova instances**, **paired phones**, **LAN-discovered hosts**, and **VyOS/router devices** (#6); each renders **only the categories that apply** (router→Network/System/Firmware, phone→Power/Sensors/Radios, Nova→virtio, LAN→remotely-detectable), never an empty category (#22)
+    - [ ] each source contributes what it can (Nova via the QC/compute registry, phones via KDC, LAN via probe_nmap, VyOS via SSH/API); honest partial trees
+    - [ ] tested: each host type maps to its inventory source + renders only applicable categories
+
+- [ ] **DEVMGR-12: live smoke on the seat.**
+  **As** the operator,
+  **I want** the Device Manager verified on a real seat,
+  **so that** it's truly done.
+  **Acceptance** (each runtime-observable):
+    - [ ] on Eagle / the test bed, the About Device Manager renders on the DRM seat — the tree, header card, menu bar/toolbar, host rail; switching to another mesh node loads its real hardware; a real device shows its real driver/IDs; (P2) an action fires armed; captured/confirmed (§7 live-verify)
