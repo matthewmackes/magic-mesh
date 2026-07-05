@@ -122,6 +122,14 @@ else
     echo "  graphics/text -devel headers installed above; point at a LAN mirror on"
     echo "  an airgapped builder. (A headless RPM has no browser: use --server.)"
     exit 1; }
+  # E12-3 DRM + BOOKMARKS-6 live path — re-link the ONE shell binary with the
+  # features the shipped seat needs: `drm` so it owns the bare KMS/DRM seat, and
+  # `live-helper` so the Browser surface really spawns the sandboxed
+  # `mde-web-preview` shipped right above (without it the surface is permanently
+  # the gated EmptyState — the RPM would ship a browser helper no shell can ever
+  # start). The workspace build compiled all deps; this only re-links one bin.
+  echo "[f43] re-linking mde-shell-egui --features drm,live-helper"
+  cargo build --release --locked -p mde-shell-egui --features drm,live-helper
   echo "[f43] generating RPM"
   cargo generate-rpm -p crates/mesh/mackesd
 fi

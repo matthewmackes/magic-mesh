@@ -445,7 +445,10 @@ case "${1:-}" in
     # E12-3 DRM: after the workspace build, re-link mde-shell-egui with --features drm
     # so it owns the bare KMS/DRM seat (no Wayland compositor). The workspace build
     # compiles all dependencies; this one-crate rebuild only re-links the final binary.
-    remote "cargo build --workspace --release && cargo build --release -p mde-shell-egui --features drm && cargo generate-rpm -p crates/mesh/mackesd"
+    # + BOOKMARKS-6 `live-helper`: the RPM ships /usr/bin/mde-web-preview, so the
+    # shipped shell must be able to spawn it — without this feature the Browser
+    # surface is permanently the gated EmptyState (the live 2026-07-05 finding).
+    remote "cargo build --workspace --release && cargo build --release -p mde-shell-egui --features drm,live-helper && cargo generate-rpm -p crates/mesh/mackesd"
     mkdir -p "$ARTIFACTS"
     log "pulling RPM(s) → $ARTIFACTS"
     rsync -az -e "${SSH[*]}" "$DEST:$REMOTE_DIR/target/generate-rpm/*.rpm" "$ARTIFACTS/"
