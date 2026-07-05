@@ -1070,6 +1070,15 @@ impl Shell {
             }
         }
 
+        // NAVBAR-W10-6: a click on the backdrop's brand watermark routes to About,
+        // guarded by the curtain like every other nav (the backdrop paint latched the
+        // request; this drains it — the one-shot `take_*` idiom).
+        if let Some(surface) = backdrop::take_nav_request(ctx) {
+            if !self.curtain.engaged() {
+                self.apply_nav(toast_bridge::Navigate::Surface(surface));
+            }
+        }
+
         // SURFACE-10 (lock 14): the on-screen keyboard overlay — drawn last (Foreground)
         // so it floats above the chrome, the active surface, and any fullscreen guest.
         // It reads the live focus + the cached formfactor and self-manages its raise /
