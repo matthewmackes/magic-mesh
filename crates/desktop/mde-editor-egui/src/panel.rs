@@ -49,6 +49,7 @@ use crate::panes::{self, NavDir, Pane, PaneId, SplitDir};
 use crate::print::{self, PageLayout, PrintOptions};
 use crate::project_tree::{self, ProjectTree};
 use crate::search::{self, FindEvent, FindState, ProjectSearch};
+use crate::spell::{self, SpellChecker, SpellMiss, SpellState};
 use crate::terminal::TerminalDock;
 use crate::toolbar;
 use crate::widget::{editor_widget, EditorView, MatchHighlights};
@@ -153,6 +154,10 @@ struct Doc {
     /// App-time (seconds) the buffer last changed — autosave writes a dirty
     /// buffer only once it has been idle past the configured window (EDITOR-11).
     idle_since: f64,
+    /// The per-document spell-check state (EDTB-6): the resolved misses the widget
+    /// underlines + the `F7` walk steps, and the background-check debounce. Empty
+    /// for a code / non-spell-checkable buffer.
+    spell: SpellChecker,
 }
 
 impl Doc {
@@ -173,7 +178,35 @@ impl Doc {
             lsp_reply_epoch: 0,
             autosave_rev,
             idle_since: 0.0,
+            spell: SpellChecker::default(),
         }
+    }
+
+    /// Whether this document is spell-checked (EDTB-6, md/text first).
+    fn spellcheckable(&self) -> bool {
+        spell::is_spellcheckable(self.buffer.path())
+    }
+
+    /// Drive the per-document spell pass (EDTB-6) — the spell analogue of
+    /// [`refresh_diagnostics`](Self::refresh_diagnostics) + [`sync_lsp`](Self::sync_lsp):
+    /// drain a finished background check into the overlay, then launch a fresh one
+    /// when the buffer changed (debounced on the revision, at most one in flight).
+    /// A non-spell-checkable buffer or an unavailable `hunspell` disables the
+    /// checker cleanly (no stale squiggles, §7). Stringifies the rope only when it
+    /// actually spawns, so a quiet frame is free. Returns whether a check is
+    /// pending, so the panel can nudge a repaint to pick up the result.
+    fn pump_spell(&mut self, program: &str, state: SpellState) -> bool {
+        self.spell.poll();
+        if !self.spellcheckable() || !state.is_ready() {
+            self.spell.disable();
+            return false;
+        }
+        let rev = self.buffer.revision();
+        if self.spell.wants_check(rev) {
+            let text = self.buffer.rope().to_string();
+            self.spell.spawn(program, text, rev);
+        }
+        self.spell.is_pending()
     }
 
     /// Attach a language-server session for this document's file, rooted at
@@ -408,6 +441,10 @@ enum LeafAction {
 /// existing seam ([`open_path`](Self::open_path), the menu bar, the palette)
 /// reads through [`doc`](Self::doc) / [`doc_mut`](Self::doc_mut). A pane with no
 /// tabs renders the honest empty state (§7); each tab is a real rope [`Buffer`].
+// `struct_excessive_bools`: the panel toggles (tree / outline / About / the
+// spell probe-latch) are independent per-surface flags, not a disguised state
+// machine — an enum would misrepresent flags that vary independently.
+#[allow(clippy::struct_excessive_bools)]
 pub struct EditorSurface {
     /// The pane registry: every split-tree leaf's open tabs.
     panes: HashMap<PaneId, PaneTabs>,
@@ -467,6 +504,20 @@ pub struct EditorSurface {
     /// The EDITOR-10 integrated terminal dock — `mde-term-egui`'s `TabbedTerminal`
     /// embedded as a toggleable bottom panel over a real PTY in the project root.
     terminal: TerminalDock,
+    /// The spell-check program (EDTB-6) — `hunspell` — probed once on the first
+    /// frame; the resolved availability is [`spell_state`](Self::spell_state).
+    spell_program: String,
+    /// Whether `hunspell` is installed (EDTB-6), probed lazily once. Drives the
+    /// honest greyed control + "hunspell not installed" note (§7).
+    spell_state: SpellState,
+    /// Whether the one-time [`spell_program`](Self::spell_program) probe has run.
+    spell_probed: bool,
+    /// The `F7` spelling-walk dialog state (open flag + the current miss index).
+    spell_walk: SpellWalk,
+    /// A short honest status line for the last spelling action (§7) — e.g.
+    /// "hunspell not installed" / "Spell-check is for text or markdown files" —
+    /// shown in the status bar until the next action replaces it.
+    spell_notice: Option<String>,
 }
 
 impl Default for EditorSurface {
@@ -500,8 +551,26 @@ impl Default for EditorSurface {
             reload: ReloadWatch::default(),
             notice: None,
             terminal: TerminalDock::default(),
+            spell_program: spell::HUNSPELL.to_owned(),
+            // Unavailable until the first-frame probe proves otherwise — an honest
+            // pessimistic default (no fake underlines before the probe).
+            spell_state: SpellState::Unavailable,
+            spell_probed: false,
+            spell_walk: SpellWalk::default(),
+            spell_notice: None,
         }
     }
+}
+
+/// The `F7` spelling-walk dialog state (EDTB-6): whether it is shown and which
+/// visible miss it is parked on. The misses themselves live on the focused
+/// [`Doc`]'s [`SpellChecker`]; this holds only the modal's own cursor.
+#[derive(Default)]
+struct SpellWalk {
+    /// Whether the walk dialog is shown.
+    open: bool,
+    /// The index into the focused document's visible misses — clamped each frame.
+    index: usize,
 }
 
 /// The Insert Table grid-picker's dialog state (EDTB-3): whether the Word
@@ -972,6 +1041,7 @@ impl EditorSurface {
             || self.references.is_open()
             || self.rename.is_open()
             || self.reload.prompt.is_some()
+            || self.spell_walk.open
     }
 
     /// Open the fuzzy file-finder (the `Cmd`/`Ctrl-P` seam), rooted at the open
@@ -1416,6 +1486,97 @@ impl EditorSurface {
         }
     }
 
+    // ── EDTB-6: spell-check (hunspell) ───────────────────────────────────────
+
+    /// Probe `hunspell` once, on the first frame (EDTB-6). Deferred out of the
+    /// constructor so building an [`EditorSurface`] never spawns a subprocess; the
+    /// result gates the squiggles + the honest "not installed" chrome. Under the
+    /// crate's own tests the probe is skipped and the checker stays
+    /// [`SpellState::Unavailable`], so the suite never launches `hunspell` (the LSP
+    /// `build_lsp_client` idiom — deterministic + subprocess-free).
+    // Not `const`: the production body calls `spell::probe` (spawns a subprocess);
+    // only the `cfg(test)` body (which elides that) looks const to clippy.
+    #[allow(clippy::missing_const_for_fn)]
+    fn ensure_spell_probe(&mut self) {
+        if self.spell_probed {
+            return;
+        }
+        self.spell_probed = true;
+        #[cfg(not(test))]
+        {
+            self.spell_state = spell::probe(&self.spell_program);
+        }
+    }
+
+    /// Open the `F7` spelling-walk dialog (EDTB-6) — or, when it can't run, set the
+    /// honest reason as the status note instead of a dead dialog (§7): no document,
+    /// a code buffer, or a missing `hunspell` each name themselves.
+    fn open_spell_walk(&mut self) {
+        let Some(doc) = self.doc() else {
+            self.spell_notice = Some("Open a document to spell-check".to_owned());
+            return;
+        };
+        if !doc.spellcheckable() {
+            self.spell_notice = Some("Spell-check is for text or markdown files".to_owned());
+            return;
+        }
+        if !self.spell_state.is_ready() {
+            self.spell_notice = Some(SpellState::Unavailable.notice().to_owned());
+            return;
+        }
+        self.close_search_overlays();
+        self.spell_walk.open = true;
+        self.spell_walk.index = 0;
+        self.spell_notice = None;
+    }
+
+    /// The focused document's current visible miss for the walk (clamped to the
+    /// walk index), or `None` when the list is empty / there is no document.
+    fn spell_current_miss(&self) -> Option<SpellMiss> {
+        let doc = self.doc()?;
+        let misses = doc.spell.misses();
+        misses
+            .get(self.spell_walk.index.min(misses.len().saturating_sub(1)))
+            .cloned()
+    }
+
+    /// Replace the walk's current miss with `replacement` as a real, undoable rope
+    /// edit (EDTB-6) — the same [`EditorView::replace_range`] seam the find/replace
+    /// bar uses (§6). Guarded: if the stored span no longer holds the missed word
+    /// (an edit shifted it since the last check), the replace is skipped rather
+    /// than corrupting unrelated text (§7). The next background pass re-resolves
+    /// the misses against the edited buffer.
+    fn spell_replace_current(&mut self, miss: &SpellMiss, replacement: &str) {
+        if let Some(doc) = self.doc_mut() {
+            let end = miss.chars.end.min(doc.buffer.len_chars());
+            if end <= miss.chars.start {
+                return;
+            }
+            let here = doc.buffer.rope().slice(miss.chars.start..end).to_string();
+            if here != miss.word {
+                return; // stale span — an edit moved the word; skip, don't corrupt
+            }
+            doc.view
+                .replace_range(&mut doc.buffer, miss.chars.start..end, replacement);
+        }
+    }
+
+    /// Ignore every occurrence of the walk's current word this session
+    /// (Ignore-All) — filtered out of the squiggles at once (EDTB-6).
+    fn spell_ignore_all(&mut self, word: &str) {
+        if let Some(doc) = self.doc_mut() {
+            doc.spell.ignore_all(word);
+        }
+    }
+
+    /// Add the walk's current word to the session personal dictionary
+    /// (Add-to-dictionary) — un-squiggled at once (EDTB-6).
+    fn spell_add_word(&mut self, word: &str) {
+        if let Some(doc) = self.doc_mut() {
+            doc.spell.add_to_dictionary(word);
+        }
+    }
+
     /// Run one [`PaletteCommand`] against the live surface seams — the dispatch the
     /// palette's Enter/click routes to. Each arm invokes a real seam (§7 — no dead
     /// entries): Save writes the buffer, the toggles flip real view/panel state,
@@ -1503,6 +1664,10 @@ impl EditorSurface {
                 let (line, _) = d.view.line_col(&d.buffer);
                 heading_level_of(&d.buffer, line - 1)
             }),
+            // EDTB-6 — the Tools/toolbar Spelling control greys out unless
+            // `hunspell` is installed and the buffer is a spell-checkable type.
+            spell_available: self.spell_state.is_ready(),
+            spellcheckable: doc.is_some_and(Doc::spellcheckable),
         }
     }
 
@@ -1531,6 +1696,8 @@ impl EditorSurface {
                 self.print.outcome = None;
                 self.print.preview_open = true;
             }
+            // ── EDTB-6: Spelling (hunspell) ──────────────────────────────────
+            MenuAction::SpellCheck => self.open_spell_walk(),
             MenuAction::Undo => {
                 if let Some(doc) = self.doc_mut() {
                     doc.view.undo(&mut doc.buffer);
@@ -2067,6 +2234,214 @@ impl EditorSurface {
         }
     }
 
+    /// The in-line context around a miss (EDTB-6) — the text before + after the
+    /// word on its own line, each clamped to a readable window so a very long line
+    /// never blows the dialog. The word itself is [`SpellMiss::word`].
+    fn spell_context(&self, miss: &SpellMiss) -> (String, String) {
+        // A bounded window on each side of the word (with a leading/trailing
+        // ellipsis) so a very long line never blows the dialog.
+        const CTX: usize = 32;
+        let Some(doc) = self.doc() else {
+            return (String::new(), String::new());
+        };
+        let buffer = &doc.buffer;
+        let line_idx = buffer.char_to_line(miss.chars.start);
+        let line_start = buffer.line_to_char(line_idx);
+        let line: Vec<char> = buffer
+            .line(line_idx)
+            .trim_end_matches('\n')
+            .chars()
+            .collect();
+        let ws = miss.chars.start.saturating_sub(line_start).min(line.len());
+        let we = miss
+            .chars
+            .end
+            .saturating_sub(line_start)
+            .min(line.len())
+            .max(ws);
+        let before: String = if ws > CTX {
+            format!("\u{2026}{}", line[ws - CTX..ws].iter().collect::<String>())
+        } else {
+            line[..ws].iter().collect()
+        };
+        let after: String = if line.len().saturating_sub(we) > CTX {
+            format!("{}\u{2026}", line[we..we + CTX].iter().collect::<String>())
+        } else {
+            line[we..].iter().collect()
+        };
+        (before, after)
+    }
+
+    /// Render the EDTB-6 `F7` spelling-walk dialog: step the buffer's misspellings,
+    /// each shown in its line context with the [`hunspell`](crate::spell)
+    /// suggestions, and the Suggest / Replace / Ignore / Ignore-All /
+    /// Add-to-dictionary actions. Replace is a real undoable rope edit through the
+    /// shared seam (§6/§7); Ignore-All / Add filter the squiggles at once. An empty
+    /// list shows the honest "no misspellings" state, never a fake walk. Escape /
+    /// Done dismisses. Token-styled (§4).
+    #[allow(clippy::too_many_lines)]
+    fn render_spell_walk(&mut self, ctx: &egui::Context) {
+        if !self.spell_walk.open {
+            return;
+        }
+        // The document vanished under the dialog — nothing left to walk.
+        let Some(total) = self.doc().map(|d| d.spell.misses().len()) else {
+            self.spell_walk.open = false;
+            return;
+        };
+        // Keep the cursor in range as the visible list shrinks under it.
+        if total > 0 {
+            self.spell_walk.index = self.spell_walk.index.min(total - 1);
+        }
+        let miss = self.spell_current_miss();
+        let checking = self.doc().is_some_and(|d| d.spell.is_pending());
+        let (before, after) = miss
+            .as_ref()
+            .map_or_else(|| (String::new(), String::new()), |m| self.spell_context(m));
+
+        let mut esc = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
+        let mut replace_with: Option<String> = None;
+        let mut ignore = false;
+        let mut ignore_all = false;
+        let mut add = false;
+        let mut prev = false;
+        let mut next = false;
+
+        egui::Window::new("Spelling")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.set_min_width(DIALOG_W);
+                match &miss {
+                    None => {
+                        // The honest clean / working state (§7) — never a fake walk.
+                        ui.label(
+                            RichText::new(if checking {
+                                "Checking spelling\u{2026}"
+                            } else {
+                                "No misspellings found"
+                            })
+                            .size(Style::BODY)
+                            .color(Style::TEXT_DIM),
+                        );
+                        ui.add_space(Style::SP_S);
+                        esc |= ui.button("Done").clicked();
+                    }
+                    Some(m) => {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Misspelling {} of {total}",
+                                    self.spell_walk.index + 1
+                                ))
+                                .size(Style::SMALL)
+                                .color(Style::TEXT_DIM),
+                            );
+                        });
+                        ui.add_space(Style::SP_XS);
+                        // The word in its line context — the miss painted in the
+                        // shared spell token, the surrounds dimmed.
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.label(RichText::new(&before).monospace().color(Style::TEXT_DIM));
+                            ui.label(
+                                RichText::new(&m.word)
+                                    .monospace()
+                                    .strong()
+                                    .color(Style::SPELL),
+                            );
+                            ui.label(RichText::new(&after).monospace().color(Style::TEXT_DIM));
+                        });
+                        ui.add_space(Style::SP_S);
+                        // Suggest — the clickable suggestion list; a click Replaces.
+                        if m.suggestions.is_empty() {
+                            ui.label(
+                                RichText::new("No suggestions")
+                                    .size(Style::SMALL)
+                                    .color(Style::TEXT_DIM),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new("Suggestions")
+                                    .size(Style::SMALL)
+                                    .color(Style::TEXT_DIM),
+                            );
+                            ui.add_space(Style::SP_XS);
+                            ui.horizontal_wrapped(|ui| {
+                                for sug in &m.suggestions {
+                                    if ui.button(sug).clicked() {
+                                        replace_with = Some(sug.clone());
+                                    }
+                                }
+                            });
+                        }
+                        ui.add_space(Style::SP_S);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            // Replace with the top suggestion (greyed with none).
+                            let top = m.suggestions.first().cloned();
+                            if ui
+                                .add_enabled(top.is_some(), egui::Button::new("Replace"))
+                                .on_hover_text("Replace with the top suggestion")
+                                .clicked()
+                            {
+                                replace_with = top;
+                            }
+                            ignore |= ui.button("Ignore").clicked();
+                            ignore_all |= ui.button("Ignore All").clicked();
+                            add |= ui
+                                .button("Add to Dictionary")
+                                .on_hover_text("Add to the session dictionary")
+                                .clicked();
+                        });
+                        ui.add_space(Style::SP_XS);
+                        ui.horizontal(|ui| {
+                            prev |= ui.button("\u{2039} Prev").clicked();
+                            next |= ui.button("Next \u{203A}").clicked();
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                esc |= ui.button("Done").clicked();
+                            });
+                        });
+                    }
+                }
+            });
+
+        // Apply the picked action after the window's borrow releases (the print /
+        // save-as idiom). Replace edits the buffer; the next background check
+        // re-resolves the misses, so the walk naturally advances off the fixed
+        // word. Ignore-All / Add shrink the visible list immediately.
+        if let (Some(replacement), Some(m)) = (replace_with, miss.as_ref()) {
+            self.spell_replace_current(m, &replacement);
+        } else if ignore {
+            self.spell_walk.index += 1;
+        } else if ignore_all {
+            if let Some(m) = miss.as_ref() {
+                self.spell_ignore_all(&m.word);
+            }
+        } else if add {
+            if let Some(m) = miss.as_ref() {
+                self.spell_add_word(&m.word);
+            }
+        }
+        if prev {
+            self.spell_walk.index = self.spell_walk.index.saturating_sub(1);
+        }
+        if next {
+            self.spell_walk.index += 1;
+        }
+        // Re-clamp against the (possibly shrunk) list so the next frame is valid.
+        let now = self.doc().map_or(0, |d| d.spell.misses().len());
+        self.spell_walk.index = self.spell_walk.index.min(now.saturating_sub(1));
+        if esc {
+            self.spell_walk.open = false;
+        }
+        // A pending check should repaint so the walk fills in when it lands.
+        if checking {
+            ctx.request_repaint();
+        }
+    }
+
     /// Render the EDTB-3 Insert Table grid-picker (Word's drag-grid): hover to
     /// size, click to insert the markdown skeleton at the caret. Escape / Cancel
     /// dismisses; a click routes through the same seam `MenuAction::InsertTable`
@@ -2255,6 +2630,19 @@ impl EditorSurface {
         }
     }
 
+    /// Intercept the EDTB-6 spelling chord (`F7`) at the panel level (before the
+    /// widget clones this frame's events, so it never types into the buffer),
+    /// opening the walk dialog. Skipped while an overlay/dialog holds the
+    /// keyboard (the walk owns its own keys once up).
+    fn handle_spell_chord(&mut self, ui: &Ui) {
+        if self.overlay_active() {
+            return;
+        }
+        if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F7)) {
+            self.open_spell_walk();
+        }
+    }
+
     /// The surface chrome strip above the pane tree: the project-tree toggle and
     /// the split controls (the mouse-reachable twins of the split chords, §7).
     /// Token-styled (§4). Per-buffer identity lives in each pane's tab bar, so
@@ -2317,10 +2705,11 @@ impl EditorSurface {
         ui.separator();
     }
 
-    /// The focused document's status line (caret position, language, LSP status,
-    /// soft-wrap toggle, lossy-decode note) — a single surface-global strip since
-    /// the tab bars already carry each buffer's name + dirty marker. Honest
+    /// The focused document's status line (caret position, language, LSP + spell
+    /// status, soft-wrap toggle, lossy-decode note) — a single surface-global strip
+    /// since the tab bars already carry each buffer's name + dirty marker. Honest
     /// chrome: every value reflects the real buffer/view (§7); token-styled (§4).
+    #[allow(clippy::too_many_lines)]
     fn status_bar(&mut self, ui: &mut Ui) {
         // Snapshot every displayed value, ending the `&Doc` borrow before the
         // deferred wrap toggle needs `&mut Doc`.
@@ -2339,6 +2728,20 @@ impl EditorSurface {
         };
         // EDITOR-LSP-3 — the last navigation action's honest status (§7).
         let notice = self.lsp_notice.clone();
+        // EDTB-6 — the last spelling-action notice (§7) + the ambient spell status
+        // (an honest "hunspell not installed" for a text buffer, else a quiet miss
+        // count). Snapshotted here so the `&Doc` borrow ends before the toggles.
+        let spell_notice = self.spell_notice.clone();
+        let spell_status: Option<(String, egui::Color32)> = self.doc().and_then(|doc| {
+            if !doc.spellcheckable() {
+                return None;
+            }
+            if !self.spell_state.is_ready() {
+                return Some((SpellState::Unavailable.notice().to_owned(), Style::WARN));
+            }
+            let n = doc.spell.misses().len();
+            (n > 0).then(|| (format!("{n} spelling"), Style::TEXT_DIM))
+        });
         // EDITOR-11 — the last save/autosave/reload status + the autosave toggle.
         let save_notice = self.notice.clone();
         let autosave_on = self.autosave.enabled;
@@ -2369,6 +2772,14 @@ impl EditorSurface {
                         .color(Style::TEXT_DIM),
                 );
             }
+            if let Some(spell_notice) = &spell_notice {
+                ui.add_space(Style::SP_M);
+                ui.label(
+                    RichText::new(spell_notice)
+                        .size(Style::SMALL)
+                        .color(Style::ACCENT),
+                );
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(Style::SP_S);
                 ui.label(
@@ -2383,6 +2794,10 @@ impl EditorSurface {
                             .size(Style::SMALL)
                             .color(status.color),
                     );
+                }
+                if let Some((text, color)) = &spell_status {
+                    ui.add_space(Style::SP_M);
+                    ui.label(RichText::new(text).size(Style::SMALL).color(*color));
                 }
                 if let Some(lang) = lang {
                     ui.add_space(Style::SP_M);
@@ -2458,6 +2873,10 @@ impl EditorSurface {
         let multi = lay.leaves.len() > 1;
         let mut outcomes: Vec<(PaneId, LeafAction)> = Vec::new();
         let mut ids: HashMap<PaneId, Id> = HashMap::new();
+        // Snapshot the surface-global spell env once (a String clone + a Copy
+        // state) so each leaf's per-doc pump reads it without re-borrowing self.
+        let spell_program = self.spell_program.clone();
+        let spell_state = self.spell_state;
         for (pid, prect) in &lay.leaves {
             self.render_leaf(
                 ui,
@@ -2468,6 +2887,8 @@ impl EditorSurface {
                 &mut ids,
                 match_ranges,
                 match_current,
+                &spell_program,
+                spell_state,
             );
         }
         self.pane_widget_ids = ids;
@@ -2494,6 +2915,8 @@ impl EditorSurface {
         ids: &mut HashMap<PaneId, Id>,
         match_ranges: &[Range<usize>],
         match_current: Option<usize>,
+        spell_program: &str,
+        spell_state: SpellState,
     ) {
         let is_focused = pid == self.focus;
         let Some(pane) = self.panes.get_mut(&pid) else {
@@ -2516,6 +2939,13 @@ impl EditorSurface {
         if let Some(doc) = pane.active_doc_mut() {
             // EDITOR-LSP-2 — refresh, render the live widget, then sync edits.
             doc.refresh_diagnostics();
+            // EDTB-6 — drive the background spell pass (drain a finished check +
+            // launch one for a fresh edit); a pending check nudges a repaint so
+            // its squiggles land promptly.
+            if doc.pump_spell(spell_program, spell_state) {
+                child.ctx().request_repaint();
+            }
+            let spell = doc.spell.marks();
             // EDITOR-8 — the find-match highlights only paint in the focused pane
             // (the search targets its active document); other panes paint plain.
             let matches = if is_focused {
@@ -2533,6 +2963,7 @@ impl EditorSurface {
                 doc.highlight.as_mut(),
                 &doc.diagnostics,
                 matches,
+                spell,
             );
             doc.sync_lsp();
             ids.insert(pid, resp.id);
@@ -2772,6 +3203,10 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
     // consumed here for the same reason, then drain any completed async replies
     // from the language server so this frame reflects a jump / list / edit.
     surface.handle_lsp_chords(ui);
+    // EDTB-6 — probe hunspell once, then the F7 spelling chord (consumed at the
+    // panel level for the same reason) opens the walk dialog.
+    surface.ensure_spell_probe();
+    surface.handle_spell_chord(ui);
     // EDITOR-11 — Ctrl-S save (consumed at the panel level, before the widget
     // clones this frame's events), then the autosave debounce tick + the
     // external-change poll. `now` is egui's app-time in seconds; both the tick and
@@ -2933,6 +3368,9 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
 
     // EDTB-1 — the Save As / About dialogs, rendered above everything.
     surface.render_dialogs(ui.ctx());
+    // EDTB-6 — the F7 spelling-walk dialog, above the body (the same overlay
+    // layer as Print Preview / Save As).
+    surface.render_spell_walk(ui.ctx());
     // EDITOR-11 — the external-change reload prompt, above everything (never a
     // silent clobber; the operator chooses keep-mine vs. reload-theirs).
     surface.render_reload_prompt(ui.ctx());
@@ -4001,6 +4439,145 @@ mod tests {
             run_action_in_frame(&mut surface, action);
         }
         assert!(!surface.is_open(), "the surface stayed in the empty state");
+    }
+
+    // ── EDTB-6: the spelling walk (hunspell) ─────────────────────────────────
+
+    use crate::spell::{SpellMiss, SpellState};
+
+    #[test]
+    fn spell_walk_replace_edits_the_buffer_through_the_shared_seam() {
+        // Injecting a completed check (no live hunspell needed on the farm), the
+        // walk's Replace applies a real undoable rope edit — the same
+        // EditorView::replace_range the find bar uses (§6/§7).
+        let mut surface = real_editor();
+        surface.open_text("wrold ok\n"); // a pathless scratch = spell-checkable prose
+        let miss = SpellMiss {
+            chars: 0..5,
+            word: "wrold".to_owned(),
+            suggestions: vec!["world".to_owned()],
+        };
+        surface
+            .doc_mut()
+            .expect("doc")
+            .spell
+            .set_misses_for_test(vec![miss.clone()], 1);
+        assert_eq!(surface.doc().unwrap().spell.misses().len(), 1);
+
+        surface.spell_replace_current(&miss, "world");
+        assert_eq!(
+            surface.doc().unwrap().buffer.rope().to_string(),
+            "world ok\n",
+            "Replace fixed the misspelling in the live buffer"
+        );
+        assert!(
+            surface.menu_context().can_undo,
+            "the replace armed a real undo step"
+        );
+    }
+
+    #[test]
+    fn spell_replace_skips_a_stale_span_rather_than_corrupting_text() {
+        // §7: if the stored span no longer holds the missed word (an edit shifted
+        // it), Replace is a guarded no-op, never a corruption of unrelated text.
+        let mut surface = real_editor();
+        surface.open_text("hello world\n");
+        let stale = SpellMiss {
+            chars: 0..5, // "hello", not the word the miss claims
+            word: "wrold".to_owned(),
+            suggestions: vec!["world".to_owned()],
+        };
+        surface.spell_replace_current(&stale, "world");
+        assert_eq!(
+            surface.doc().unwrap().buffer.rope().to_string(),
+            "hello world\n",
+            "a stale span left the buffer untouched"
+        );
+    }
+
+    #[test]
+    fn spell_walk_is_honest_when_hunspell_is_unavailable() {
+        // §7: with hunspell absent (the cfg(test) default — the probe never runs a
+        // subprocess), F7 / Tools → Spelling does not open a dead dialog; it sets
+        // the truthful "hunspell not installed" note instead.
+        let mut surface = real_editor();
+        surface.open_text("some prose here\n");
+        surface.ensure_spell_probe(); // stays Unavailable under cfg(test)
+        assert_eq!(surface.spell_state, SpellState::Unavailable);
+
+        surface.open_spell_walk();
+        assert!(
+            !surface.spell_walk.open,
+            "the walk does not open with no checker"
+        );
+        assert_eq!(
+            surface.spell_notice.as_deref(),
+            Some("hunspell not installed"),
+            "the honest absent-state note is surfaced (§7)"
+        );
+    }
+
+    #[test]
+    fn spell_gate_is_md_text_first_over_real_files() {
+        // md/text first: the Spelling control's gate reflects the open file type —
+        // greyed for a code buffer, live for markdown (both real on-disk files).
+        let tmp = TempDir::new("spell-gate");
+        let code = tmp.join("main.rs");
+        let prose = tmp.join("notes.md");
+        std::fs::write(&code, "fn main() {}\n").expect("write code");
+        std::fs::write(&prose, "helo world\n").expect("write prose");
+
+        let mut surface = real_editor();
+        surface.spell_state = SpellState::Ready; // pretend hunspell is installed
+        surface.spell_probed = true;
+
+        surface.open_path(&code).expect("open code");
+        assert!(
+            !surface.menu_context().spellcheckable,
+            "a .rs buffer is not spell-checked (md/text first)"
+        );
+
+        surface.open_path(&prose).expect("open prose");
+        assert!(
+            surface.menu_context().spellcheckable,
+            "a .md buffer is spell-checked"
+        );
+        assert!(surface.menu_context().spell_available, "hunspell available");
+    }
+
+    #[test]
+    fn spell_walk_opens_and_renders_when_ready() {
+        // With hunspell "ready" and injected misses, the walk opens and renders in
+        // a real frame (§7 — the dialog is reachable, not a mockup). Rendered
+        // directly (not via editor_panel) so no background subprocess is spawned.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut surface = real_editor();
+        surface.spell_state = SpellState::Ready;
+        surface.spell_probed = true;
+        surface.open_text("teh quick fox\n");
+        surface.doc_mut().unwrap().spell.set_misses_for_test(
+            vec![SpellMiss {
+                chars: 0..3,
+                word: "teh".to_owned(),
+                suggestions: vec!["the".to_owned()],
+            }],
+            1,
+        );
+        surface.open_spell_walk();
+        assert!(surface.spell_walk.open, "the walk opened");
+
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+            ..Default::default()
+        };
+        // Two frames: an egui Window/Area sizes itself on the first pass and paints
+        // on the settled second — tessellate that one.
+        let _ = ctx.run(input(), |ctx| surface.render_spell_walk(ctx));
+        let out = ctx.run(input(), |ctx| surface.render_spell_walk(ctx));
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(!prims.is_empty(), "the walk dialog painted");
+        assert!(surface.spell_walk.open, "still open after a passive render");
     }
 
     // ── EDTB-3: the Formatting strip + Insert/Table + Format menus ───────────

@@ -42,6 +42,15 @@
 //!   the Print Preview overlay renders the same pages before printing. A missing
 //!   `lp` / no configured printer surfaces an honest named notice, never a silent
 //!   no-op or a faked success (§7).
+//! * EDTB-6 — **spell-check via hunspell** ([`spell`]): a background `hunspell -a`
+//!   pass underlines misspelled words with a red squiggle ([`mde_egui::Style::SPELL`],
+//!   §4) in markdown / plain-text buffers, and `F7` opens a walk dialog stepping
+//!   each miss with Suggest / Replace / Ignore / Ignore-All / Add-to-dictionary
+//!   (Replace is a real undoable rope edit). The check runs off the paint thread
+//!   ([`spell::SpellWorker`]), debounced on the buffer revision. A missing
+//!   `hunspell` greys the control with an honest "hunspell not installed" note —
+//!   no crash, no fake underlines (§7). The RPM should `Requires: hunspell` + a
+//!   default dictionary.
 //! * EDTB-2/3 — the **markdown formatting engine + Formatting toolbar**
 //!   ([`md_actions`] / [`format_bar`]): the Style dropdown, B/I/U/S, list, and
 //!   indent controls (Word's second toolbar row) plus the **Insert** (Table
@@ -126,6 +135,7 @@ pub mod panes;
 mod print;
 pub mod project_tree;
 mod search;
+pub mod spell;
 mod terminal;
 mod toolbar;
 pub mod widget;
@@ -145,6 +155,7 @@ pub use lsp_ui::DiagnosticsOverlay;
 pub use outline::{Symbol, SymbolKind};
 pub use panel::{editor_panel, EditorSurface};
 pub use project_tree::ProjectTree;
+pub use spell::{SpellChecker, SpellMarks, SpellMiss, SpellState};
 pub use widget::{editor_widget, EditorView};
 
 /// Build the production [`EditorSurface`] the E12 shell owns and mounts with

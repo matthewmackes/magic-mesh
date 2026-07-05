@@ -105,6 +105,12 @@ impl Style {
     pub const WARN: Color32 = Color32::from_rgb(0xFF, 0xB4, 0x54);
     /// Status — success / ok.
     pub const OK: Color32 = Color32::from_rgb(0x4F, 0xD0, 0x8A);
+    /// Editorial — a **spelling** miss: the red wavy underline the editor draws
+    /// under a misspelled word (EDTB-6, `mde-editor-egui`). Its own token — a
+    /// deeper, more saturated Carbon red-60 — so a spell squiggle reads distinct
+    /// from a [`DANGER`](Self::DANGER) *error* underline (the LSP diagnostics
+    /// squiggle), never the same red for two different meanings.
+    pub const SPELL: Color32 = Color32::from_rgb(0xDA, 0x1E, 0x28);
 
     // ── Categorical accents (picker groups · explorer categories) ───────────
     // Six distinct Carbon **categorical** hues that key a group's / category's
@@ -381,6 +387,27 @@ mod tests {
         assert_ne!(Style::TEXT, Style::TEXT_DIM);
         assert_ne!(Style::ACCENT, Style::BG);
         assert_ne!(Style::ACCENT, Style::ACCENT_HI);
+    }
+
+    #[test]
+    fn spell_underline_is_a_distinct_red() {
+        // EDTB-6: the spelling squiggle is its own token, a red that reads as
+        // "misspelling" yet is visibly distinct from the DANGER error squiggle,
+        // so the editor never paints one red for two meanings.
+        assert_ne!(
+            Style::SPELL,
+            Style::DANGER,
+            "the spell squiggle must differ from the error squiggle"
+        );
+        let (r, g, b) = (
+            Style::SPELL.r() as u16,
+            Style::SPELL.g() as u16,
+            Style::SPELL.b() as u16,
+        );
+        assert!(
+            r > g && r > b,
+            "the spell underline reads as red (r dominates): {r},{g},{b}"
+        );
     }
 
     #[test]

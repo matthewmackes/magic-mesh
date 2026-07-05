@@ -70,6 +70,7 @@ use crate::fold::Folds;
 use crate::highlight::{HighlightSpan, Highlighter};
 use crate::lsp_ui::{severity_color, DiagnosticsOverlay};
 use crate::md_actions::MdOutcome;
+use crate::spell::SpellMarks;
 
 /// Soft-tab width: a Tab keypress inserts this many spaces (the editor is
 /// spaces-by-default, the common Rust convention). Not a metric — a text unit.
@@ -1745,6 +1746,7 @@ pub fn editor_widget(
     highlight: Option<&mut Highlighter>,
     diagnostics: &DiagnosticsOverlay,
     matches: MatchHighlights,
+    spell: SpellMarks,
 ) -> Response {
     view.clamp(buffer);
 
@@ -1795,6 +1797,7 @@ pub fn editor_widget(
                 total_rows,
                 diagnostics,
                 matches,
+                spell,
             )
         })
         .inner
@@ -1813,6 +1816,7 @@ fn editor_body(
     total_rows: usize,
     diagnostics: &DiagnosticsOverlay,
     matches: MatchHighlights,
+    spell: SpellMarks,
 ) -> Response {
     let clip = ui.clip_rect();
     // Content extent: full virtual height so the scrollbar is honest; width is the
@@ -1901,6 +1905,7 @@ fn editor_body(
         &spans,
         diagnostics,
         matches,
+        spell,
     );
 
     // Reveal the primary caret exactly once after a move/edit (don't fight scroll).
@@ -2086,6 +2091,7 @@ fn paint(
     spans: &[HighlightSpan],
     diagnostics: &DiagnosticsOverlay,
     matches: MatchHighlights,
+    spell: SpellMarks,
 ) {
     let clip = ui.clip_rect();
     let painter = ui.painter_at(clip);
@@ -2150,6 +2156,11 @@ fn paint(
         // EDITOR-LSP-2 — diagnostic underlines (squiggles) + hover message for
         // any diagnostic range overlapping this row, layered over the text.
         paint_diagnostic_underlines(&text_painter, ui, diagnostics, vr, &row, text_x0, y, m);
+
+        // EDTB-6 — spelling underlines: the red squiggle + suggestion hover under
+        // any misspelled-word span overlapping this row, layered over the text
+        // (viewport-culled per row, exactly like the diagnostics).
+        paint_spell_underlines(&text_painter, ui, spell, vr, &row, text_x0, y, m);
     }
 
     paint_gutter(
@@ -2207,6 +2218,57 @@ fn paint_diagnostic_underlines(
         let id = ui.id().with(("mde-editor-diag", vr, i));
         ui.interact(rect, id, Sense::hover())
             .on_hover_text(mark.message.as_str());
+    }
+}
+
+/// Paint the spelling underlines for one visual row (EDTB-6): a
+/// [`Style::SPELL`] red squiggle under each misspelled-word span overlapping this
+/// row, plus a hover region naming the word + its suggestions. Ranges clamp to
+/// the row (viewport-culled), exactly like [`paint_diagnostic_underlines`]. A
+/// stale span (an edit landed since the last background check) that no longer
+/// overlaps any row simply does not paint — no fake underline (§7).
+#[allow(clippy::too_many_arguments)]
+fn paint_spell_underlines(
+    painter: &egui::Painter,
+    ui: &Ui,
+    spell: SpellMarks,
+    vr: usize,
+    row: &VisRow,
+    text_x0: f32,
+    y: f32,
+    m: Metrics,
+) {
+    for (i, miss) in spell.misses.iter().enumerate() {
+        let lo = miss.chars.start.clamp(row.start, row.end);
+        let hi = miss.chars.end.clamp(row.start, row.end);
+        if hi <= lo {
+            continue;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let left = text_x0 + (lo - row.start) as f32 * m.glyph_w;
+        #[allow(clippy::cast_precision_loss)]
+        let right = text_x0 + (hi - row.start) as f32 * m.glyph_w;
+        squiggle(
+            painter,
+            left,
+            right,
+            y + m.row_h - Style::SP_XS * 0.75,
+            Style::SPELL,
+        );
+        // A hover naming the word + suggestions (unique id per row + mark so egui
+        // never sees a duplicate interaction this frame).
+        let rect = Rect::from_min_max(pos2(left, y), pos2(right, y + m.row_h));
+        let id = ui.id().with(("mde-editor-spell", vr, i));
+        let hover = if miss.suggestions.is_empty() {
+            format!("Spelling: {} (no suggestions)", miss.word)
+        } else {
+            format!(
+                "Spelling: {} \u{2192} {}",
+                miss.word,
+                miss.suggestions.join(", ")
+            )
+        };
+        ui.interact(rect, id, Sense::hover()).on_hover_text(hover);
     }
 }
 
@@ -2540,11 +2602,12 @@ fn gutter_width(lines: usize, glyph_w: f32) -> f32 {
 mod tests {
     use super::{
         editor_widget, find_next, line_len, line_span, word_span, Caret, EditorView,
-        MatchHighlights,
+        MatchHighlights, SpellMarks,
     };
     use crate::buffer::Buffer;
     use crate::highlight::{Highlighter, Language};
     use crate::lsp_ui::DiagnosticsOverlay;
+    use crate::spell::SpellMiss;
     use mde_egui::egui::{self, pos2, vec2, Event, Key, Modifiers, Rect};
     use mde_egui::Style;
 
@@ -2991,6 +3054,7 @@ mod tests {
                     None,
                     &DiagnosticsOverlay::default(),
                     MatchHighlights::default(),
+                    SpellMarks::default(),
                 );
             });
         });
@@ -3025,6 +3089,7 @@ mod tests {
                     None,
                     &DiagnosticsOverlay::default(),
                     MatchHighlights::default(),
+                    SpellMarks::default(),
                 );
             });
         });
@@ -3060,6 +3125,7 @@ mod tests {
                     Some(&mut hl),
                     &DiagnosticsOverlay::default(),
                     MatchHighlights::default(),
+                    SpellMarks::default(),
                 );
             });
         });
@@ -3103,6 +3169,7 @@ mod tests {
                     None,
                     &DiagnosticsOverlay::default(),
                     MatchHighlights::default(),
+                    SpellMarks::default(),
                 );
             });
         });
@@ -3188,6 +3255,7 @@ mod tests {
                     None,
                     &DiagnosticsOverlay::default(),
                     MatchHighlights::default(),
+                    SpellMarks::default(),
                 );
             });
         });
@@ -3259,6 +3327,7 @@ mod tests {
                     None,
                     &DiagnosticsOverlay::default(),
                     MatchHighlights::default(),
+                    SpellMarks::default(),
                 );
             });
         });
@@ -3273,6 +3342,7 @@ mod tests {
                     None,
                     &diags,
                     MatchHighlights::default(),
+                    SpellMarks::default(),
                 );
             });
         });
@@ -3285,6 +3355,72 @@ mod tests {
             vertices(&prims) > plain_v,
             "the diagnostics added painted geometry (gutter marker + underline): {} vs {plain_v}",
             vertices(&prims)
+        );
+    }
+
+    // ── EDTB-6: spelling squiggle paint ──────────────────────────────────────
+
+    #[test]
+    fn spell_misses_paint_a_red_squiggle() {
+        // A resolved spelling miss underlines its span through a real frame (§7 —
+        // the spell render path is reachable, not a mockup): the squiggle adds
+        // painted geometry over a plain, mark-free frame.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut buf = Buffer::from_text("teh quick fox\n");
+        let mut view = EditorView::new();
+        // "teh" occupies chars 0..3.
+        let misses = [SpellMiss {
+            chars: 0..3,
+            word: "teh".to_owned(),
+            suggestions: vec!["the".to_owned()],
+        }];
+
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 600.0))),
+            ..Default::default()
+        };
+        let vertices = |prims: &[egui::ClippedPrimitive]| -> usize {
+            prims
+                .iter()
+                .map(|p| match &p.primitive {
+                    egui::epaint::Primitive::Mesh(m) => m.vertices.len(),
+                    egui::epaint::Primitive::Callback(_) => 0,
+                })
+                .sum()
+        };
+        let plain = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor_widget(
+                    ui,
+                    &mut view,
+                    &mut buf,
+                    None,
+                    &DiagnosticsOverlay::default(),
+                    MatchHighlights::default(),
+                    SpellMarks::default(),
+                );
+            });
+        });
+        let plain_v = vertices(&ctx.tessellate(plain.shapes, plain.pixels_per_point));
+
+        let out = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                editor_widget(
+                    ui,
+                    &mut view,
+                    &mut buf,
+                    None,
+                    &DiagnosticsOverlay::default(),
+                    MatchHighlights::default(),
+                    SpellMarks { misses: &misses },
+                );
+            });
+        });
+        let hi_v = vertices(&ctx.tessellate(out.shapes, out.pixels_per_point));
+        assert!(
+            hi_v > plain_v,
+            "the spelling squiggle added painted geometry: {hi_v} vs {plain_v}"
         );
     }
 
@@ -3393,6 +3529,7 @@ mod tests {
                     None,
                     &DiagnosticsOverlay::default(),
                     MatchHighlights::default(),
+                    SpellMarks::default(),
                 );
             });
         });
@@ -3407,6 +3544,7 @@ mod tests {
                     None,
                     &DiagnosticsOverlay::default(),
                     with,
+                    SpellMarks::default(),
                 );
             });
         });

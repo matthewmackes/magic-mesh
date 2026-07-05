@@ -82,7 +82,7 @@ impl StripEntry {
 
 /// The Standard strip in Word-97 order, as data — the render is one thin loop,
 /// and [`tests`] assert the order + that every button drives a real action.
-pub const STRIP: [StripEntry; 15] = [
+pub const STRIP: [StripEntry; 17] = [
     StripEntry::Button(ToolButton::new(
         "\u{FF0B}",
         "New",
@@ -115,6 +115,16 @@ pub const STRIP: [StripEntry; 15] = [
         "Print Preview",
         MenuAction::PrintPreview,
         Gate::Doc,
+    )),
+    StripEntry::Separator,
+    // The EDTB-6 Spelling button (Word's Standard-toolbar Spelling & Grammar),
+    // between the Print and clipboard groups. Greyed unless hunspell is installed
+    // and the buffer is a spell-checkable (md/text) type (Gate::Spell).
+    StripEntry::Button(ToolButton::new(
+        "\u{2713}",
+        "Spelling (F7)",
+        MenuAction::SpellCheck,
+        Gate::Spell,
     )),
     StripEntry::Separator,
     StripEntry::Button(ToolButton::new(
@@ -270,9 +280,9 @@ mod tests {
 
     #[test]
     fn the_strip_is_the_word_97_standard_order() {
-        // New · Open · Save · | · Print · Print Preview · | · Cut · Copy · Paste ·
-        // | · Undo · Redo · | · Zoom — the EDTB-1 strip with the EDTB-5 Print
-        // group (Spell awaits EDTB-6).
+        // New · Open · Save · | · Print · Print Preview · | · Spelling · | · Cut ·
+        // Copy · Paste · | · Undo · Redo · | · Zoom — the EDTB-1 strip with the
+        // EDTB-5 Print group + the EDTB-6 Spelling button.
         let shape: Vec<String> = STRIP
             .iter()
             .map(|e| match e {
@@ -290,6 +300,8 @@ mod tests {
                 "|",
                 "Print",
                 "Print Preview",
+                "|",
+                "Spelling (F7)",
                 "|",
                 "Cut",
                 "Copy",
@@ -330,6 +342,7 @@ mod tests {
             ("Save", MenuAction::Save),
             ("Print", MenuAction::Print),
             ("Print Preview", MenuAction::PrintPreview),
+            ("Spelling (F7)", MenuAction::SpellCheck),
             ("Cut", MenuAction::Cut),
             ("Copy", MenuAction::Copy),
             ("Paste", MenuAction::Paste),

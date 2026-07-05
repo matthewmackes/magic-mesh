@@ -83,6 +83,9 @@ pub enum MenuAction {
     Print,
     /// Open the Print Preview overlay — the paginated pages before printing (EDTB-5).
     PrintPreview,
+    /// Open the `F7` spelling-walk dialog — a `hunspell` spell-check of the
+    /// markdown / plain-text buffer (EDTB-6).
+    SpellCheck,
     /// Undo one widget step (`EditorView::undo`).
     Undo,
     /// Redo one widget step (`EditorView::redo`).
@@ -191,6 +194,9 @@ pub enum Gate {
     UndoStack,
     /// Needs an available redo step.
     RedoStack,
+    /// Needs a spell-checkable (md/text) document AND an installed `hunspell`
+    /// (EDTB-6) — the honest grey when the feature can't run (§7).
+    Spell,
 }
 
 impl Gate {
@@ -202,6 +208,7 @@ impl Gate {
             Self::Selection => cx.has_selection,
             Self::UndoStack => cx.can_undo,
             Self::RedoStack => cx.can_redo,
+            Self::Spell => cx.spell_available && cx.spellcheckable,
         }
     }
 }
@@ -236,6 +243,11 @@ pub struct MenuContext {
     /// 1-6 = a `#`-heading), or `None` with no document — the Format strip Style
     /// dropdown's current-selection read-back.
     pub heading_level: Option<u8>,
+    /// `hunspell` is installed (EDTB-6) — the Spelling control's live half of its
+    /// gate; paired with [`spellcheckable`](Self::spellcheckable).
+    pub spell_available: bool,
+    /// The open document is a spell-checkable (md/text) type (EDTB-6).
+    pub spellcheckable: bool,
 }
 
 /// One menu item: its label, its (existing, real) shortcut hint, the action it
@@ -433,14 +445,23 @@ const FORMAT_ITEMS: [MenuItem; 15] = [
     MenuItem::new("Heading 6", "", MenuAction::Heading(6), Gate::Doc, false),
 ];
 
-/// The Tools menu (spelling is EDTB-6).
-const TOOLS_ITEMS: [MenuItem; 1] = [MenuItem::new(
-    "Command Palette\u{2026}",
-    "Ctrl+Shift+P",
-    MenuAction::CommandPalette,
-    Gate::Always,
-    false,
-)];
+/// The Tools menu — Spelling (EDTB-6, `hunspell`) + the Command Palette.
+const TOOLS_ITEMS: [MenuItem; 2] = [
+    MenuItem::new(
+        "Spelling\u{2026}",
+        "F7",
+        MenuAction::SpellCheck,
+        Gate::Spell,
+        false,
+    ),
+    MenuItem::new(
+        "Command Palette\u{2026}",
+        "Ctrl+Shift+P",
+        MenuAction::CommandPalette,
+        Gate::Always,
+        true,
+    ),
+];
 
 /// The Help menu.
 const HELP_ITEMS: [MenuItem; 1] = [MenuItem::new(
@@ -518,6 +539,8 @@ mod tests {
             wrap_on: false,
             zoom_percent: Some(100),
             heading_level: Some(0),
+            spell_available: true,
+            spellcheckable: true,
         }
     }
 
@@ -533,6 +556,8 @@ mod tests {
             wrap_on: false,
             zoom_percent: None,
             heading_level: None,
+            spell_available: false,
+            spellcheckable: false,
         }
     }
 
