@@ -10,7 +10,7 @@
 //! seam, zero duplication (§6).
 //!
 //! Glyphs are text glyphs from the workspace's established vocabulary (egui's
-//! built-in faces stay installed as fallback behind Droid Sans Mono, so the
+//! built-in faces stay installed as fallback behind Intel One Mono, so the
 //! symbol/emoji points render); no new SVG assets this task — the iced-era
 //! `IconId` set lives in the retiring `mde-theme` crate, which this egui
 //! surface deliberately does not depend on. Unlike the shell bar (whose rule is

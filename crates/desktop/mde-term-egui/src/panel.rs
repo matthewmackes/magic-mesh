@@ -11,7 +11,7 @@
 //!   `mde_media_egui::real_media`), owning the live [`TabbedTerminal`] over a real
 //!   local PTY — no demo data (§7). The shell holds one directly.
 //! * [`terminal_pump`] is the per-frame state pump (the analogue of `media_pump`):
-//!   it lazily lands the bundled Droid Sans Mono face and drains the chord keymap
+//!   it lazily lands the bundled Intel One Mono face and drains the chord keymap
 //!   *before* the panes read input, exactly as the standalone binary's update loop
 //!   does — so a chord never doubles as shell input.
 //! * [`terminal_panel`] renders the surface into the shell body (the analogue of
@@ -39,7 +39,7 @@ pub struct TerminalSurface {
     /// The tabbed split-pane terminal, or the honest first-PTY spawn error the
     /// panel renders instead (§7).
     term: Result<TabbedTerminal, String>,
-    /// Whether the bundled Droid Sans Mono face has been layered onto the
+    /// Whether the bundled Intel One Mono face has been layered onto the
     /// shell's shared font set yet. Installed lazily on the first [`terminal_pump`]
     /// — the standalone binary installs it at creation from its `CreationContext`,
     /// but the embed has no egui `Context` until its first frame.
@@ -75,7 +75,7 @@ pub fn real_terminal() -> TerminalSurface {
 
 /// The per-frame state pump — mirrors the sibling surfaces' `*_pump`.
 ///
-/// Lands the bundled Droid Sans Mono face once (idempotent), then drains this
+/// Lands the bundled Intel One Mono face once (idempotent), then drains this
 /// frame's chords through the rebindable keymap and applies each — tab commands to
 /// the surface, split commands + pane actions to the active tab — **before** the
 /// panes read input in [`terminal_panel`], so a chord never doubles as shell input

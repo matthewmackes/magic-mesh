@@ -19,7 +19,8 @@
 //!   colour is a [`Style`] / [`mde_egui::code`] token and every point size is a
 //!   [`Style`] type-scale rung ([`Style::heading_size`], `BODY`, …), so the
 //!   preview carries no raw hex and no literal size (§4). The one embedded face
-//!   (Droid Sans Mono) has no bold cut, so *weight* is the brighter
+//!   (Intel One Mono Regular — only the regular cut is embedded, so no bold
+//!   cut) means *weight* is the brighter
 //!   [`Style::TEXT_STRONG`] tone and *italic* is egui's real synthetic slant —
 //!   the honest cues a mono face can give (§7).
 //!

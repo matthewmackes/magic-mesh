@@ -80,7 +80,7 @@ impl eframe::App for TermApp {
 
 fn main() -> eframe::Result<()> {
     run_client("org.magicmesh.Terminal", "MCNF Terminal", |cc| {
-        // Layer the bundled Droid Sans Mono face onto the shared font set
+        // Layer the bundled Intel One Mono face onto the shared font set
         // (additive over `Style::install`), so the grid renders the platform
         // default: a crisp, clean monospace (no programming ligatures).
         mde_term_egui::fonts::install(&cc.egui_ctx);

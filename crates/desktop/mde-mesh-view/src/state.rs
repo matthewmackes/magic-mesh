@@ -42,7 +42,7 @@ pub enum Health {
 pub struct MeshNode {
     /// Stable identifier — what [`MeshLink`] endpoints reference.
     pub id: String,
-    /// Human label drawn beneath the node (rendered in Droid Sans Mono).
+    /// Human label drawn beneath the node (rendered in Intel One Mono).
     pub label: String,
     /// Hierarchy role (size + auto-placement).
     pub role: Role,

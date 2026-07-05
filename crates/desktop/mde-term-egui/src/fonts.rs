@@ -1,12 +1,13 @@
 //! The terminal grid's bundled monospace font.
 //!
-//! **Droid Sans Mono** (Apache License 2.0 — `assets/fonts/DroidSansMono-NOTICE.txt`)
+//! **Intel One Mono** (SIL OFL-1.1 — `assets/fonts/IntelOneMono-NOTICE.txt`)
 //! is embedded in the crate so the terminal grid renders a crisp, clean monospace
 //! face on the immutable bootc image, with no dependency on a system-installed
 //! font. This is the platform default (the shared `Style` installs the same face);
-//! it renders a plain monospace with **no programming ligatures** — the terminal
-//! traded the earlier Fira Code ligature face (TERM-13) for the platform-default
-//! Droid Sans Mono. The grid paints through `FontId::monospace` (see
+//! it renders a plain monospace with **no programming ligatures** — the family's
+//! 1.4 ligatures live behind the opt-in `ss01` stylistic set, which egui never
+//! activates, so the terminal still trades away the earlier Fira Code ligature
+//! face (TERM-13). The grid paints through `FontId::monospace` (see
 //! [`crate::widget`]); [`install`] registers the embedded face at the **highest
 //! priority** of egui's `Monospace` family, so the grid — and the terminal's own
 //! monospace chrome — draw with the bundled font.
@@ -19,9 +20,11 @@
 use mde_egui::egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
 use mde_egui::egui::{Context, FontData, FontFamily};
 
-/// The embedded Droid Sans Mono face (Apache License 2.0) — a clean monospace
-/// font (no programming ligatures).
-const DROID_SANS_MONO: &[u8] = include_bytes!("../assets/fonts/DroidSansMono.ttf");
+/// The embedded Intel One Mono face (SIL OFL-1.1) — a clean monospace font
+/// (no programming ligatures without the `ss01` stylistic set, which egui
+/// never activates). An OpenType/CFF `.otf`; egui's `ttf-parser` backend
+/// reads CFF outlines natively.
+const INTEL_ONE_MONO: &[u8] = include_bytes!("../assets/fonts/IntelOneMono-Regular.otf");
 
 /// Key for the bundled terminal face in egui's font map.
 const TERM_FONT_KEY: &str = "mde-term-mono";
@@ -34,7 +37,7 @@ const TERM_FONT_KEY: &str = "mde-term-mono";
 pub fn install(ctx: &Context) {
     ctx.add_font(FontInsert::new(
         TERM_FONT_KEY,
-        FontData::from_static(DROID_SANS_MONO),
+        FontData::from_static(INTEL_ONE_MONO),
         // Highest in Monospace: the grid's `FontId::monospace` glyphs resolve to
         // the bundled face first, egui's built-ins staying as fallback.
         vec![InsertFontFamily {
@@ -46,24 +49,31 @@ pub fn install(ctx: &Context) {
 
 #[cfg(test)]
 mod tests {
-    use super::{install, DROID_SANS_MONO};
+    use super::{install, INTEL_ONE_MONO};
 
     #[test]
-    fn droid_sans_mono_face_is_embedded_and_valid() {
-        // include_bytes! resolved a real, non-empty TrueType face (magic
-        // 0x00010000) — not a stray/missing asset.
+    fn intel_one_mono_face_is_embedded_and_valid() {
+        // include_bytes! resolved a real, non-empty OpenType/CFF face (magic
+        // `OTTO`) — not a stray/missing asset.
         assert!(
-            DROID_SANS_MONO.len() > 50_000,
-            "the bundled monospace TTF looks too small ({} bytes)",
-            DROID_SANS_MONO.len()
+            INTEL_ONE_MONO.len() > 50_000,
+            "the bundled monospace OTF looks too small ({} bytes)",
+            INTEL_ONE_MONO.len()
         );
-        assert_eq!(&DROID_SANS_MONO[0..4], &[0x00, 0x01, 0x00, 0x00]);
+        assert_eq!(&INTEL_ONE_MONO[0..4], b"OTTO");
     }
 
     #[test]
     fn install_registers_the_grid_font_headless() {
         // Registering the terminal face must work without a GPU (CPU-only
-        // Context) and never panic.
-        install(&mde_egui::egui::Context::default());
+        // Context), and a frame that lays out monospace text must succeed —
+        // this forces egui to actually parse the embedded CFF face.
+        let ctx = mde_egui::egui::Context::default();
+        install(&ctx);
+        let _ = ctx.run(mde_egui::egui::RawInput::default(), |ctx| {
+            mde_egui::egui::CentralPanel::default().show(ctx, |ui| {
+                ui.monospace("grid glyphs");
+            });
+        });
     }
 }
