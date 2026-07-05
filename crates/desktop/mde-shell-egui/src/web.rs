@@ -263,12 +263,22 @@ pub(crate) fn web_panel(ui: &mut egui::Ui, state: &mut WebState) {
         }
     }
 
-    // 3. The navigation chrome (back / forward / reload / address bar), wired to
+    // 3. The shared MENUBAR-ALL top bar — the UPPERCASE BROWSER title, the real
+    //    WebSession menus (Edit / View / History / Bookmarks), and the live status
+    //    cluster. It COMPLEMENTS the navigation chrome below (never replaces it —
+    //    the address bar + back/forward/reload buttons stay), the same model→seam
+    //    pattern every other surface uses (design: `docs/design/menubar-all.md`).
+    if let Some(action) = menubar::show(state, ui) {
+        menubar::apply(ui.ctx(), state, action);
+    }
+    ui.add_space(Style::SP_XS);
+
+    // 4. The navigation chrome (back / forward / reload / address bar), wired to
     //    the active session's control socket.
     nav_chrome(ui, state);
     ui.add_space(Style::SP_XS);
 
-    // 4. The body. Read the active tab's status first so the crashed arm can set
+    // 5. The body. Read the active tab's status first so the crashed arm can set
     //    the respawn flag without holding a `&mut Tab` borrow of `state`.
     let active = state.active;
     let status = state.tabs.get(active).map(|t| {
@@ -667,6 +677,536 @@ fn centered(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
+/// The Browser surface's shared **MENUBAR-ALL** top bar (design: `menubar-all.md`).
+///
+/// The UPPERCASE `BROWSER` title in the Terminals-group accent, the real
+/// [`WebSession`] menus, and a live status cluster — the one shared
+/// [`mde_egui::menubar::MenuBar`] every surface embeds. Every visible item binds to
+/// a seam that already exists on the active session or page (§6 glue, no new
+/// behaviour — the SAME seams the toolbar chrome + [`page_actions_menu`] drive); a
+/// context-gated item renders **disabled** and an absent capability is **omitted**
+/// (§7). The surface honestly has no File (no new-tab/quit seam in the portable
+/// build), no page-text Copy/Find, no Zoom, and no keyboard chord table, so those
+/// menus are absent — never a dead entry. The status cluster shows the committed
+/// URL, the session lifecycle, the http/https security state, and the ad-filter
+/// shield (BOOKMARKS-7).
+mod menubar {
+    use super::{
+        bookmark_add_body, chat_share_body, local_hostname, publish, WebState,
+        ACTION_BOOKMARKS_ADD, ACTION_CHAT_SEND,
+    };
+    use mde_egui::egui;
+    use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
+    use mde_egui::{ChipTone, StatusChip, Style};
+    use mde_web_preview_client::SessionState;
+
+    /// The lock glyph a secure (https) page wears in the security chip.
+    const LOCK: &str = "\u{1F512}";
+    /// The open-lock glyph a plain (http) page wears in the security chip.
+    const UNLOCK: &str = "\u{1F513}";
+    /// The ad-filter shield glyph (matches the toolbar "N blocked" readout).
+    const SHIELD: &str = "\u{2298}";
+    /// The committed-URL chip truncates to this many characters so a long address
+    /// never crowds the status cluster.
+    const URL_MAX: usize = 42;
+
+    /// One Browser menu action — each maps to a real [`WebSession`]/page seam in
+    /// [`apply`]. `Copy`, so the menu model stays a plain value tree.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum MenuAction {
+        /// Navigate back (`WebSession::go_back`).
+        Back,
+        /// Navigate forward (`WebSession::go_forward`).
+        Forward,
+        /// Reload the page, or respawn a crashed tab (`WebSession::reload` /
+        /// `respawn_requested` — the exact toolbar Reload behaviour).
+        Reload,
+        /// Copy the committed URL to the shell clipboard (the page-actions seam).
+        CopyUrl,
+        /// Bookmark the live page (`action/bookmarks/add`, BOOKMARKS-10).
+        AddBookmark,
+        /// Share the live page into Chat (`action/chat/send`, BOOKMARKS-10).
+        SendInChat,
+    }
+
+    /// A per-frame read-out of the active tab's live state — the single immutable
+    /// borrow the menu model + status cluster are both built from, so the render is
+    /// a pure function of it (unit-testable without a driven session).
+    #[derive(Default)]
+    #[allow(
+        clippy::struct_excessive_bools,
+        reason = "a flat read-out of the active tab's nav flags (can_back/can_forward/\
+                  loading, mirroring NavState) plus has_tab/crashed — not a state machine"
+    )]
+    struct Snapshot {
+        /// A tab is attached.
+        has_tab: bool,
+        /// The active tab has crashed.
+        crashed: bool,
+        /// A back-history entry exists.
+        can_back: bool,
+        /// A forward-history entry exists.
+        can_forward: bool,
+        /// A load is in progress.
+        loading: bool,
+        /// The ad-filter blocked-request count for this page (BOOKMARKS-7).
+        blocked: u32,
+        /// The committed URL.
+        url: String,
+        /// The session lifecycle, or `None` with no tab.
+        state: Option<SessionState>,
+    }
+
+    impl Snapshot {
+        /// Whether there is a live page (a non-crashed tab with a URL) to act on —
+        /// the gate the page-family items (Copy URL / bookmark / share) share.
+        fn has_page(&self) -> bool {
+            self.has_tab && !self.crashed && !self.url.trim().is_empty()
+        }
+    }
+
+    /// Read the active tab's live state into a [`Snapshot`] (one immutable borrow).
+    fn snapshot(state: &WebState) -> Snapshot {
+        state
+            .tabs
+            .get(state.active)
+            .map_or_else(Snapshot::default, |tab| {
+                let nav = tab.session.nav();
+                Snapshot {
+                    has_tab: true,
+                    crashed: tab.session.is_crashed(),
+                    can_back: nav.can_back,
+                    can_forward: nav.can_forward,
+                    loading: nav.loading,
+                    blocked: tab.session.blocked_count(),
+                    url: nav.url.clone(),
+                    state: Some(tab.session.state().clone()),
+                }
+            })
+    }
+
+    /// The Reload item's label — "Restart Page" on a crashed tab (it respawns),
+    /// "Reload" otherwise (mirrors the toolbar tooltip).
+    const fn reload_label(crashed: bool) -> &'static str {
+        if crashed {
+            "Restart Page"
+        } else {
+            "Reload"
+        }
+    }
+
+    /// Build the Browser menus from live state (§6/§7): Edit (Copy URL), View
+    /// (Reload), History (Back/Forward, gated on the live history), and Bookmarks
+    /// (add plus share). File is omitted (no new-tab/quit seam in this surface), and
+    /// so are page-text Copy/Find, Zoom, and Help (no chord table) — honest absence,
+    /// never a dead entry.
+    fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
+        let has_page = s.has_page();
+        vec![
+            Menu::new(
+                "Edit",
+                vec![Entry::Item(
+                    Item::new(MenuAction::CopyUrl, "Copy URL").enabled(has_page),
+                )],
+            ),
+            Menu::new(
+                "View",
+                vec![Entry::Item(
+                    Item::new(MenuAction::Reload, reload_label(s.crashed)).enabled(s.has_tab),
+                )],
+            ),
+            Menu::new(
+                "History",
+                vec![
+                    Entry::Item(
+                        Item::new(MenuAction::Back, "Back")
+                            .enabled(s.has_tab && !s.crashed && s.can_back),
+                    ),
+                    Entry::Item(
+                        Item::new(MenuAction::Forward, "Forward")
+                            .enabled(s.has_tab && !s.crashed && s.can_forward),
+                    ),
+                ],
+            ),
+            Menu::new(
+                "Bookmarks",
+                vec![
+                    Entry::Item(
+                        Item::new(MenuAction::AddBookmark, "Add Bookmark").enabled(has_page),
+                    ),
+                    Entry::Separator,
+                    Entry::Item(
+                        Item::new(MenuAction::SendInChat, "Send in Chat").enabled(has_page),
+                    ),
+                ],
+            ),
+        ]
+    }
+
+    /// The lifecycle status chip: Loading (a load in flight or the pre-first-frame
+    /// state), Live (a painted, settled page), Crashed, or an idle "No session"
+    /// with no tab.
+    fn state_chip(s: &Snapshot) -> StatusChip {
+        match &s.state {
+            None => StatusChip::new("No session", ChipTone::Neutral),
+            Some(SessionState::Crashed { .. }) => StatusChip::new("Crashed", ChipTone::Danger),
+            Some(SessionState::Loading) => StatusChip::new("Loading", ChipTone::Info),
+            Some(SessionState::Live) => {
+                if s.loading {
+                    StatusChip::new("Loading", ChipTone::Info)
+                } else {
+                    StatusChip::new("Live", ChipTone::Ok)
+                }
+            }
+        }
+    }
+
+    /// The http/https security chip for the committed URL — a lock (Ok) for https,
+    /// an open lock (Warn) for http, or `None` for a schemeless address
+    /// (`about:blank`, empty) with no security state to report.
+    fn security_chip(s: &Snapshot) -> Option<StatusChip> {
+        if !s.has_tab {
+            return None;
+        }
+        let url = s.url.trim();
+        if url.starts_with("https://") {
+            Some(StatusChip::with_icon(LOCK, "https", ChipTone::Ok))
+        } else if url.starts_with("http://") {
+            Some(StatusChip::with_icon(UNLOCK, "http", ChipTone::Warn))
+        } else {
+            None
+        }
+    }
+
+    /// Truncate a URL to [`URL_MAX`] characters (an ellipsis tail) so the chip
+    /// stays compact; a short URL is verbatim.
+    fn truncate_url(url: &str) -> String {
+        let url = url.trim();
+        if url.chars().count() <= URL_MAX {
+            return url.to_owned();
+        }
+        let head: String = url.chars().take(URL_MAX - 1).collect();
+        format!("{head}\u{2026}")
+    }
+
+    /// Build the live status cluster: the committed URL, the lifecycle state, the
+    /// http/https security state, and the ad-filter shield (a `0` count stays
+    /// hidden, §7).
+    fn build_status(s: &Snapshot) -> Vec<StatusChip> {
+        let mut chips = Vec::new();
+        if s.has_tab && !s.url.trim().is_empty() {
+            chips.push(StatusChip::new(truncate_url(&s.url), ChipTone::Neutral));
+        }
+        chips.push(state_chip(s));
+        if let Some(chip) = security_chip(s) {
+            chips.push(chip);
+        }
+        if s.blocked > 0 {
+            chips.push(StatusChip::with_icon(
+                SHIELD,
+                s.blocked.to_string(),
+                ChipTone::Warn,
+            ));
+        }
+        chips
+    }
+
+    /// Render the BROWSER bar and return the action the operator picked this frame.
+    pub(super) fn show(state: &WebState, ui: &mut egui::Ui) -> Option<MenuAction> {
+        let snap = snapshot(state);
+        let menus = build_menus(&snap);
+        let status = build_status(&snap);
+        let model = MenuBarModel {
+            // The dock groups Browser under **Terminals** (teal), so the title
+            // wears that categorical accent (lock 2).
+            title: "Browser",
+            accent: Style::ACCENT_TERMINALS,
+            menus: &menus,
+            status: &status,
+        };
+        MenuBar::show(ui, &model)
+    }
+
+    /// The active tab's committed URL, or empty with no tab.
+    fn page_url(state: &WebState) -> String {
+        state
+            .tabs
+            .get(state.active)
+            .map(|t| t.session.nav().url.clone())
+            .unwrap_or_default()
+    }
+
+    /// The active tab's committed URL + title, or empties with no tab.
+    fn page_url_title(state: &WebState) -> (String, String) {
+        state.tabs.get(state.active).map_or_else(
+            || (String::new(), String::new()),
+            |t| (t.session.nav().url.clone(), t.session.title().to_owned()),
+        )
+    }
+
+    /// Dispatch a picked action to its real seam (§6, no new behaviour) — the SAME
+    /// seams the toolbar chrome + page-actions menu already drive.
+    pub(super) fn apply(ctx: &egui::Context, state: &mut WebState, action: MenuAction) {
+        match action {
+            MenuAction::Back => {
+                if let Some(tab) = state.active_tab() {
+                    tab.session.go_back();
+                }
+            }
+            MenuAction::Forward => {
+                if let Some(tab) = state.active_tab() {
+                    tab.session.go_forward();
+                }
+            }
+            MenuAction::Reload => {
+                let crashed = state
+                    .tabs
+                    .get(state.active)
+                    .is_some_and(|t| t.session.is_crashed());
+                if crashed {
+                    state.respawn_requested = true;
+                } else if let Some(tab) = state.active_tab() {
+                    tab.session.reload();
+                }
+            }
+            MenuAction::CopyUrl => {
+                let url = page_url(state);
+                if !url.trim().is_empty() {
+                    ctx.copy_text(url);
+                }
+            }
+            MenuAction::AddBookmark => {
+                let (url, title) = page_url_title(state);
+                if !url.trim().is_empty() {
+                    publish(ACTION_BOOKMARKS_ADD, &bookmark_add_body(&url, &title));
+                }
+            }
+            MenuAction::SendInChat => {
+                let (url, title) = page_url_title(state);
+                if !url.trim().is_empty() {
+                    publish(
+                        ACTION_CHAT_SEND,
+                        &chat_share_body(&local_hostname(), &url, &title),
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(
+        clippy::panic,
+        reason = "a let-else in a model test names the expected menu shape (house style, \
+                  mirroring the shared menubar.rs tests)"
+    )]
+    mod tests {
+        use super::{
+            apply, build_menus, build_status, reload_label, security_chip, show, state_chip,
+            truncate_url, MenuAction, Snapshot, WebState, URL_MAX,
+        };
+        use mde_egui::egui;
+        use mde_egui::menubar::Entry;
+        use mde_egui::{ChipTone, Style};
+        use mde_web_preview_client::SessionState;
+
+        /// A live, navigable https page (a non-crashed tab, one back entry, three
+        /// blocked requests) — the model tests read their gating off it.
+        fn https_page() -> Snapshot {
+            Snapshot {
+                has_tab: true,
+                crashed: false,
+                can_back: true,
+                can_forward: false,
+                loading: false,
+                blocked: 3,
+                url: "https://example.com/path".to_owned(),
+                state: Some(SessionState::Live),
+            }
+        }
+
+        #[test]
+        fn the_menus_cover_the_real_browser_seams() {
+            let menus = build_menus(&https_page());
+            let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
+            assert_eq!(titles, ["Edit", "View", "History", "Bookmarks"]);
+            // File (no new-tab/quit seam) and Help (no chord table) are honestly
+            // omitted, not shipped as present-but-dead menus (§7).
+            assert!(!titles.contains(&"File"));
+            assert!(!titles.contains(&"Help"));
+        }
+
+        #[test]
+        fn back_and_forward_gate_on_the_live_history() {
+            // can_back = true, can_forward = false → Back enabled, Forward greyed —
+            // the §7 disable, never an omission.
+            let history = build_menus(&https_page())
+                .into_iter()
+                .find(|m| m.title == "History")
+                .expect("History menu present");
+            let items: Vec<(String, bool)> = history
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Item(i) => Some((i.label.clone(), i.enabled)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                items,
+                [("Back".to_owned(), true), ("Forward".to_owned(), false)]
+            );
+        }
+
+        #[test]
+        fn the_page_family_items_disable_without_a_live_page() {
+            // No tab → every item greys (Copy URL / Reload / Back / Forward / Add
+            // Bookmark / Send in Chat), all present-but-disabled, none omitted.
+            let menus = build_menus(&Snapshot::default());
+            for menu in &menus {
+                for entry in &menu.entries {
+                    if let Entry::Item(item) = entry {
+                        assert!(!item.enabled, "{} greys with no live page", item.label);
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn reload_relabels_to_restart_and_stays_enabled_on_a_crashed_tab() {
+            assert_eq!(reload_label(false), "Reload");
+            assert_eq!(reload_label(true), "Restart Page");
+            let crashed = Snapshot {
+                has_tab: true,
+                crashed: true,
+                ..Snapshot::default()
+            };
+            let view = build_menus(&crashed)
+                .into_iter()
+                .find(|m| m.title == "View")
+                .expect("View menu present");
+            let Entry::Item(reload) = &view.entries[0] else {
+                panic!("View[0] is Reload");
+            };
+            assert_eq!(reload.label, "Restart Page");
+            assert!(
+                reload.enabled,
+                "Reload stays enabled on a crashed tab (it respawns)"
+            );
+        }
+
+        #[test]
+        fn the_status_cluster_reflects_the_live_page() {
+            let chips = build_status(&https_page());
+            let texts: Vec<&str> = chips.iter().map(|c| c.text.as_str()).collect();
+            // URL · Live · https · 3 blocked, left→right.
+            assert_eq!(texts[0], "https://example.com/path");
+            assert!(texts.contains(&"Live"), "the lifecycle chip is present");
+            assert!(texts.contains(&"https"), "the security chip is present");
+            assert!(texts.contains(&"3"), "the ad-filter shield shows the count");
+        }
+
+        #[test]
+        fn the_state_chip_tracks_the_session_lifecycle() {
+            let live = state_chip(&https_page());
+            assert_eq!(live.text, "Live");
+            assert_eq!(live.tone, ChipTone::Ok);
+            let loading = Snapshot {
+                has_tab: true,
+                loading: true,
+                state: Some(SessionState::Live),
+                ..Snapshot::default()
+            };
+            assert_eq!(state_chip(&loading).text, "Loading");
+            let crashed = Snapshot {
+                has_tab: true,
+                state: Some(SessionState::Crashed {
+                    reason: "boom".to_owned(),
+                }),
+                ..Snapshot::default()
+            };
+            assert_eq!(state_chip(&crashed).tone, ChipTone::Danger);
+            // No tab → an honest neutral idle chip, never a fake "Live".
+            assert_eq!(state_chip(&Snapshot::default()).tone, ChipTone::Neutral);
+        }
+
+        #[test]
+        fn the_security_chip_reads_the_url_scheme() {
+            assert_eq!(
+                security_chip(&https_page()).expect("https chip").tone,
+                ChipTone::Ok
+            );
+            let http = Snapshot {
+                has_tab: true,
+                url: "http://plain.example/".to_owned(),
+                state: Some(SessionState::Live),
+                ..Snapshot::default()
+            };
+            assert_eq!(
+                security_chip(&http).expect("http chip").tone,
+                ChipTone::Warn
+            );
+            // A schemeless address (about:blank) and no-tab both omit the chip.
+            let blank = Snapshot {
+                has_tab: true,
+                url: "about:blank".to_owned(),
+                state: Some(SessionState::Live),
+                ..Snapshot::default()
+            };
+            assert!(security_chip(&blank).is_none());
+            assert!(security_chip(&Snapshot::default()).is_none());
+        }
+
+        #[test]
+        fn a_long_url_truncates_but_a_short_one_is_verbatim() {
+            assert_eq!(truncate_url("https://a.co/"), "https://a.co/");
+            let long = "https://example.com/a/very/long/path/that/keeps/going/and/going/on";
+            let out = truncate_url(long);
+            assert!(out.chars().count() <= URL_MAX, "truncated within the cap");
+            assert!(
+                out.ends_with('\u{2026}'),
+                "a truncated URL wears an ellipsis"
+            );
+        }
+
+        #[test]
+        fn apply_on_an_empty_state_is_a_safe_noop() {
+            let ctx = egui::Context::default();
+            let mut state = WebState::default();
+            for action in [
+                MenuAction::Back,
+                MenuAction::Forward,
+                MenuAction::Reload,
+                MenuAction::CopyUrl,
+                MenuAction::AddBookmark,
+                MenuAction::SendInChat,
+            ] {
+                apply(&ctx, &mut state, action);
+            }
+            assert!(!state.respawn_requested, "no tab → Reload is a no-op");
+            assert!(state.tabs.is_empty(), "no action attaches or drops a tab");
+        }
+
+        #[test]
+        fn the_browser_bar_renders_headless() {
+            use egui::{pos2, vec2, Rect};
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            let state = WebState::default();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 640.0))),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = show(&state, ui);
+                });
+            });
+            let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+            assert!(!prims.is_empty(), "the Browser bar produced no primitives");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -826,6 +1366,41 @@ mod tests {
         assert!(
             run_until_texture(&mut state),
             "the respawned tab never uploaded a frame"
+        );
+    }
+
+    // ── MENUBAR-ALL: the Browser bar dispatches its actions to real seams ───────
+
+    #[test]
+    fn the_menu_reload_on_a_live_tab_reloads_without_a_respawn() {
+        // The View→Reload item on a live tab drives `WebSession::reload` (the same
+        // seam the toolbar Reload button uses) and is NOT a respawn.
+        let (session, _helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default();
+        state.push_session(session);
+        run_until_texture(&mut state);
+        let ctx = egui::Context::default();
+        super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::Reload);
+        assert!(!state.respawn_requested, "a live reload is not a respawn");
+        assert!(!state.tabs[0].session.is_crashed());
+    }
+
+    #[test]
+    fn the_menu_reload_on_a_crashed_tab_requests_a_respawn() {
+        // On a crashed tab the SAME View→Reload item becomes a respawn request —
+        // byte-identical to the toolbar Reload's crashed-tab behaviour.
+        let (session, helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default();
+        state.push_session(session);
+        run_until_texture(&mut state);
+        helper.crash();
+        run_panel(&mut state); // the poll observes the crash
+        assert!(state.tabs[0].session.is_crashed());
+        let ctx = egui::Context::default();
+        super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::Reload);
+        assert!(
+            state.respawn_requested,
+            "menu Reload on a crashed tab requests a respawn (like the toolbar)"
         );
     }
 
