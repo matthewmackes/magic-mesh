@@ -125,6 +125,14 @@
 //!   command line); [`tmux::TmuxController`] ties it together with an honest
 //!   [`tmux::Status`] (no fake attach). The chrome/session/mesh/preset mount is
 //!   TMUX-FC-2..8.
+//! - [`tmux_ui`] (TMUX-FC-2) — the **session management chrome**: the
+//!   sessions→windows→panes sidebar tree ([`tmux_ui::TmuxChrome`]) over the live
+//!   [`tmux::TmuxModel`], the full session ops (create · attach · detach · kill ·
+//!   rename) each a [`tmux_ui::TmuxIntent`] mapped by [`tmux_ui::command_for`] to
+//!   the real [`tmux::commands`] line (round-trip: the `%`-event reconciles the
+//!   tree, never a direct mutation), and the all-sessions picker (attached AND
+//!   detached, from the control-channel `list-sessions` reply). The [`menubar`]
+//!   tmux menu ([`tmux_ui::TmuxMenuChoice`]) is its entry point.
 //! - [`menubar`] (TERM-MENUBAR-1) — the **top menu bar**: an `egui::menu::bar`
 //!   of File / Edit / View / Terminal / Splits / Tabs / Session / Help
 //!   drop-downs, each item the mouse twin of an existing seam (tabs / splits /
@@ -158,6 +166,7 @@ pub mod splits;
 pub mod tabs;
 pub mod title;
 pub mod tmux;
+pub mod tmux_ui;
 pub mod watch;
 pub mod widget;
 
@@ -194,9 +203,10 @@ pub use splits::{
 pub use tabs::{consume_tab_commands, RemoteHub, TabCommand, TabbedTerminal};
 pub use title::PaneTitle;
 pub use tmux::{
-    commands as tmux_commands, parse_layout, ControlChannel, Layout, LayoutDir, LayoutError,
-    LayoutKind, Notification, Parser as TmuxParser, ResizeDir, Status as TmuxStatus,
-    TmuxController, TmuxLaunch, TmuxModel, TmuxPane, TmuxSession, TmuxWindow,
+    commands as tmux_commands, parse_layout, parse_session_list, ControlChannel, Layout, LayoutDir,
+    LayoutError, LayoutKind, Notification, Parser as TmuxParser, ResizeDir, SessionInfo,
+    Status as TmuxStatus, TmuxController, TmuxLaunch, TmuxModel, TmuxPane, TmuxSession, TmuxWindow,
 };
+pub use tmux_ui::{command_for, TmuxChrome, TmuxIntent, TmuxMenuChoice};
 pub use watch::{ActivityWatch, WatchEvent, WatchMode};
 pub use widget::{ClipboardOptions, TerminalWidget};

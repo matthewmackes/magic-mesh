@@ -1371,6 +1371,58 @@ pub mod commands {
         out
     }
 
+    // ── session-level ops (TMUX-FC-2) ────────────────────────────────────────
+    // Create / attach / detach / kill / rename + enumerate, each a `%`-event
+    // round-trip: the command lands, tmux emits `%session-changed` /
+    // `%sessions-changed` / `%exit`, and [`super::TmuxModel`] reconciles from it.
+
+    /// Create a new session and switch this control client onto it:
+    /// `new-session -s <name>` (control mode switches the client, emitting
+    /// `%session-changed`; the name is tmux-quoted).
+    #[must_use]
+    pub fn new_session(name: &str) -> String {
+        format!("new-session -s {}", quote(name))
+    }
+
+    /// Re-attach a detached (or other) session onto this control client.
+    ///
+    /// `switch-client -t <target>` — the control-mode way to move the one client
+    /// between sessions without a second attach (emits `%session-changed`).
+    #[must_use]
+    pub fn attach_session(target: &str) -> String {
+        format!("switch-client -t {}", quote(target))
+    }
+
+    /// Detach this control client: `detach-client`. The session keeps running on
+    /// the node (design lock #6); the channel then sees `%exit`.
+    #[must_use]
+    pub fn detach_client() -> String {
+        "detach-client".to_owned()
+    }
+
+    /// Kill a session outright: `kill-session -t <target>` (name tmux-quoted).
+    #[must_use]
+    pub fn kill_session(target: &str) -> String {
+        format!("kill-session -t {}", quote(target))
+    }
+
+    /// Rename a session: `rename-session -t <target> <name>` (both tmux-quoted).
+    #[must_use]
+    pub fn rename_session(target: &str, name: &str) -> String {
+        format!("rename-session -t {} {}", quote(target), quote(name))
+    }
+
+    /// Enumerate **all** sessions (attached AND detached) — the picker's source.
+    ///
+    /// Emits tab-separated `name<TAB>attached<TAB>windows` lines in the command
+    /// reply. The `\t` separator survives session names with spaces
+    /// (space-splitting would not). Parsed by [`super::parse_session_list`], which
+    /// must stay in step with this format string.
+    #[must_use]
+    pub fn list_sessions() -> String {
+        "list-sessions -F '#{session_name}\t#{session_attached}\t#{session_windows}'".to_owned()
+    }
+
     /// tmux-quote a string: single-quote wrap, escaping any internal quote.
     fn quote(s: &str) -> String {
         let mut out = String::with_capacity(s.len() + 2);
@@ -1385,6 +1437,55 @@ pub mod commands {
         out.push('\'');
         out
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The session enumeration: `list-sessions` → all sessions (attached + detached).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One session as `list-sessions` reports it — the picker's row (TMUX-FC-2).
+///
+/// Unlike the [`TmuxModel`], which only fully knows the *attached* session's
+/// windows/panes (control mode streams that one), this carries every session on
+/// the server including the **detached** ones, so a detached session can be
+/// picked and re-attached ([`commands::attach_session`]).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct SessionInfo {
+    /// The session name (the `switch-client`/`kill-session` target).
+    pub name: String,
+    /// Whether a client is currently attached (`#{session_attached}` > 0).
+    pub attached: bool,
+    /// How many windows the session holds (`#{session_windows}`).
+    pub windows: u32,
+}
+
+/// Parse the reply body of [`commands::list_sessions`] into [`SessionInfo`]s.
+///
+/// Each line is `name<TAB>attached<TAB>windows`; a line without at least the
+/// name+attached fields, or an empty name, is skipped rather than faked. Kept in
+/// step with the `-F` format string [`commands::list_sessions`] emits.
+#[must_use]
+pub fn parse_session_list(lines: &[String]) -> Vec<SessionInfo> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let name = fields.next()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let attached = fields.next()?.trim().parse::<u32>().ok()? > 0;
+            let windows = fields
+                .next()
+                .and_then(|f| f.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            Some(SessionInfo {
+                name: name.to_owned(),
+                attached,
+                windows,
+            })
+        })
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1411,6 +1512,10 @@ pub struct TmuxController {
     parser: Parser,
     model: TmuxModel,
     status: Status,
+    /// Every session on the server (attached + detached), from the most recent
+    /// [`Self::request_sessions`] reply — the TMUX-FC-2 picker's source. The
+    /// model itself only fully knows the attached session's windows/panes.
+    all_sessions: Vec<SessionInfo>,
 }
 
 impl TmuxController {
@@ -1424,12 +1529,14 @@ impl TmuxController {
                 parser: Parser::new(),
                 model: TmuxModel::new(),
                 status: Status::Connecting,
+                all_sessions: Vec::new(),
             },
             Err(err) => Self {
                 channel: None,
                 parser: Parser::new(),
                 model: TmuxModel::new(),
                 status: Status::Error(format!("could not start tmux -CC: {err}")),
+                all_sessions: Vec::new(),
             },
         }
     }
@@ -1450,8 +1557,21 @@ impl TmuxController {
         let got = !chunks.is_empty();
         for chunk in chunks {
             for note in self.parser.feed(&chunk) {
-                if let Notification::Exit { reason } = &note {
-                    self.status = Status::Exited(reason.clone().unwrap_or_default());
+                match &note {
+                    Notification::Exit { reason } => {
+                        self.status = Status::Exited(reason.clone().unwrap_or_default());
+                    }
+                    // The only command reply carrying `name<TAB>attached<TAB>windows`
+                    // lines is `list-sessions` (other ops reply empty), so a
+                    // non-empty parse is the session enumeration — cache it for the
+                    // picker. An empty/other reply leaves the last list intact.
+                    Notification::Reply(reply) if !reply.error => {
+                        let sessions = parse_session_list(&reply.lines);
+                        if !sessions.is_empty() {
+                            self.all_sessions = sessions;
+                        }
+                    }
+                    _ => {}
                 }
                 self.model.apply(note);
             }
@@ -1474,6 +1594,22 @@ impl TmuxController {
             || Err(ErrorKind::BrokenPipe.into()),
             |channel| channel.send_line(command),
         )
+    }
+
+    /// Ask the server to enumerate every session ([`commands::list_sessions`]);
+    /// the reply lands in [`Self::all_sessions`] on a later [`Self::pump`].
+    ///
+    /// # Errors
+    /// [`ErrorKind::BrokenPipe`] once the channel is gone (or never connected).
+    pub fn request_sessions(&self) -> std::io::Result<()> {
+        self.send(&commands::list_sessions())
+    }
+
+    /// Every session on the server (attached + detached) from the last
+    /// [`Self::request_sessions`] reply — the picker's rows (empty until asked).
+    #[must_use]
+    pub fn all_sessions(&self) -> &[SessionInfo] {
+        &self.all_sessions
     }
 
     /// The honest connection status.
@@ -1847,6 +1983,80 @@ boom\n\
         assert_eq!(c::rename_window(0, "a'b"), "rename-window -t @0 'a'\\''b'",);
     }
 
+    #[test]
+    fn session_command_builders_emit_the_exact_tmux_lines() {
+        use commands as c;
+        assert_eq!(c::new_session("dev"), "new-session -s 'dev'");
+        assert_eq!(c::attach_session("dev"), "switch-client -t 'dev'");
+        assert_eq!(c::detach_client(), "detach-client");
+        assert_eq!(c::kill_session("dev"), "kill-session -t 'dev'");
+        assert_eq!(
+            c::rename_session("dev", "prod"),
+            "rename-session -t 'dev' 'prod'"
+        );
+        // A name with a space stays one tmux argument (single-quote wrapped).
+        assert_eq!(c::new_session("my work"), "new-session -s 'my work'");
+        // The enumeration format is tab-separated so a spaced name never splits.
+        assert_eq!(
+            c::list_sessions(),
+            "list-sessions -F '#{session_name}\t#{session_attached}\t#{session_windows}'"
+        );
+    }
+
+    // ── the session enumeration (the picker's source) ────────────────────────
+
+    #[test]
+    fn parse_session_list_reads_attached_and_detached() {
+        let lines = [
+            "main\t1\t3".to_owned(),
+            "build\t0\t1".to_owned(),
+            "my work\t2\t5".to_owned(), // a spaced name + multi-client attach count
+        ];
+        let sessions = parse_session_list(&lines);
+        assert_eq!(
+            sessions,
+            vec![
+                SessionInfo {
+                    name: "main".to_owned(),
+                    attached: true,
+                    windows: 3,
+                },
+                SessionInfo {
+                    name: "build".to_owned(),
+                    attached: false,
+                    windows: 1,
+                },
+                SessionInfo {
+                    name: "my work".to_owned(),
+                    attached: true,
+                    windows: 5,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_session_list_skips_malformed_and_empty_lines() {
+        // An empty reply (any non-list command) yields no sessions, so the picker
+        // keeps its last good list rather than blanking.
+        assert!(parse_session_list(&[]).is_empty());
+        // A line with no name, or no attached field, is dropped — never faked.
+        let lines = [
+            String::new(),
+            "\t1\t2".to_owned(),   // empty name
+            "orphan".to_owned(),   // no attached field
+            "ok\t1\t4".to_owned(), // a good row survives the bad company
+        ];
+        assert_eq!(
+            parse_session_list(&lines),
+            vec![SessionInfo {
+                name: "ok".to_owned(),
+                attached: true,
+                windows: 4,
+            }]
+        );
+    }
+
     // ── the controller's honest error state (no live tmux needed) ─────────────
 
     #[test]
@@ -1935,6 +2145,76 @@ boom\n\
         assert!(ctrl.model().window_tree(window).is_some());
 
         // Tear down the private server.
+        let _ = ctrl.send("kill-server");
+        drop(ctrl);
+        let _ = Command::new("tmux")
+            .args(["-L", &sock, "kill-server"])
+            .output();
+    }
+
+    #[test]
+    fn live_picker_lists_attached_and_detached_sessions() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let sock = format!("mde-tmuxfc2-{}", std::process::id());
+        let launch = TmuxLaunch {
+            args: vec![
+                "-L".to_owned(),
+                sock.clone(),
+                "-CC".to_owned(),
+                "new-session".to_owned(),
+                "-A".to_owned(),
+                "-s".to_owned(),
+                "attached".to_owned(),
+            ],
+            ..TmuxLaunch::default()
+        };
+        let mut ctrl = TmuxController::connect(&launch);
+
+        // Attach first.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while *ctrl.status() != Status::Attached {
+            assert!(
+                Instant::now() < deadline,
+                "tmux -CC never attached (status {:?})",
+                ctrl.status()
+            );
+            ctrl.pump();
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // Create a second session WITHOUT switching to it — so the picker must
+        // list a genuinely detached session, not just the attached one.
+        ctrl.send("new-session -d -s detached")
+            .expect("create a detached session");
+        // Ask for the full enumeration and pump until both show up.
+        ctrl.request_sessions().expect("request the session list");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            ctrl.pump();
+            let sessions = ctrl.all_sessions();
+            let attached = sessions.iter().find(|s| s.name == "attached");
+            let detached = sessions.iter().find(|s| s.name == "detached");
+            if attached.is_some_and(|s| s.attached) && detached.is_some_and(|s| !s.attached) {
+                break;
+            }
+            // The list-sessions reply can race the detached create; re-ask.
+            let _ = ctrl.request_sessions();
+            assert!(
+                Instant::now() < deadline,
+                "the picker never listed both sessions (got {:?})",
+                ctrl.all_sessions()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        // Re-attaching the detached session round-trips a `%session-changed`.
+        ctrl.send(&commands::attach_session("detached"))
+            .expect("switch to the detached session");
+
         let _ = ctrl.send("kill-server");
         drop(ctrl);
         let _ = Command::new("tmux")

@@ -42,8 +42,10 @@
 //! **Select All** (there is no whole-buffer selection seam), **Reset** (the VT
 //! engine is fed only by the PTY reader thread — no external reset seam; a
 //! shell-stdin reset would be a fake), and the **status-bar toggle** (the
-//! surface has no status bar). A future **tmux** menu (TMUX-FC) slots in at the
-//! marked seam below; it is intentionally left unwired here.
+//! surface has no status bar). The **Tmux** menu (TMUX-FC-2) is wired at the
+//! marked seam below; its items route OUT as a [`TmuxMenuChoice`] the surface
+//! applies to its [`crate::tmux_ui::TmuxChrome`] (create · attach-picker ·
+//! detach · toggle-tree), context-gated on a live control client.
 //!
 //! §4: the bar renders through the shared Carbon [`Style`] install — no forced
 //! colours, so egui's disabled dimming reads correctly.
@@ -59,17 +61,21 @@ use crate::picker::RemoteTarget;
 use crate::presets::Preset;
 use crate::splits::{Broadcast, Command, NavDir, SplitDir, SplitTerminal};
 use crate::tabs::TabCommand;
+use crate::tmux_ui::TmuxMenuChoice;
 use crate::TabbedTerminal;
 
 /// Minimum drop-down width so short menus don't collapse into slivers — six
 /// shared spacing units (§4), the editor menu bar's derivation.
 const MENU_MIN_W: f32 = Style::SP_XL * 6.0;
 
-/// The bar's menu titles, left to right. A future **tmux** menu (TMUX-FC) slots
-/// in before Session; it is deliberately absent until that unit wires it (an
-/// empty menu would be a dead entry, §7).
-pub const MENU_TITLES: [&str; 8] = [
-    "File", "Edit", "View", "Terminal", "Splits", "Tabs", "Session", "Help",
+/// The bar's menu titles, left to right.
+///
+/// The **Tmux** menu (TMUX-FC-2) slots in before Session — its items route OUT to
+/// the surface's [`crate::tmux_ui::TmuxChrome`] (which owns the optional live
+/// control client the menu toggles), not into [`apply`] (which only touches the
+/// [`TabbedTerminal`]).
+pub const MENU_TITLES: [&str; 9] = [
+    "File", "Edit", "View", "Terminal", "Splits", "Tabs", "Tmux", "Session", "Help",
 ];
 
 // ─────────────────────────────── actions ────────────────────────────────────
@@ -664,11 +670,23 @@ impl MenuBar {
     /// of `term` up front (context + a keymap clone + the roster), renders every
     /// drop-down against it, then applies the one chosen action mutably — so no
     /// borrow of `term` is held across the render.
-    pub fn ui(&mut self, ui: &mut Ui, term: &mut TabbedTerminal, ctx: &Context) {
+    ///
+    /// `tmux_active` gates the Tmux menu's context-sensitive items (Detach / Hide
+    /// tree need a live control client); a [`TmuxMenuChoice`] is returned rather
+    /// than applied, since the surface — not the [`TabbedTerminal`] — owns the
+    /// optional control client the menu drives.
+    pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        term: &mut TabbedTerminal,
+        ctx: &Context,
+        tmux_active: bool,
+    ) -> Option<TmuxMenuChoice> {
         let cx = context(term);
         let keymap = term.keymap().clone();
         let roster = term.roster_snapshot();
         let out: RefCell<Option<Outcome>> = RefCell::new(None);
+        let tmux_out: RefCell<Option<TmuxMenuChoice>> = RefCell::new(None);
 
         egui::menu::bar(ui, |ui| {
             ui.add_space(Style::SP_XS);
@@ -692,10 +710,6 @@ impl MenuBar {
                 submenu(ui, "Broadcast Input", &BROADCAST_ITEMS, &cx, &keymap, &out);
                 submenu(ui, "Bell", &BELL_ITEMS, &cx, &keymap, &out);
             });
-            // ── TMUX-FC seam ────────────────────────────────────────────────
-            // A future "tmux" menu (control-mode attach / windows / panes) slots
-            // in here. Left unwired by TERM-MENUBAR-1 (an empty menu would be a
-            // dead entry, §7); TMUX-FC adds it once tmux.rs lands its seams.
             ui.menu_button("Splits", |ui| {
                 ui.set_min_width(MENU_MIN_W);
                 render_items(ui, &SPLITS_ITEMS, &cx, &keymap, &out);
@@ -703,6 +717,14 @@ impl MenuBar {
             ui.menu_button("Tabs", |ui| {
                 ui.set_min_width(MENU_MIN_W);
                 render_items(ui, &TABS_ITEMS, &cx, &keymap, &out);
+            });
+            // ── TMUX-FC-2 seam ──────────────────────────────────────────────
+            // The tmux session menu — its choices route OUT (to the surface's
+            // TmuxChrome), not through `apply`; the session/window/pane tree +
+            // ops live in the sidebar the "New tmux session" item reveals.
+            ui.menu_button("Tmux", |ui| {
+                ui.set_min_width(MENU_MIN_W);
+                tmux_menu(ui, tmux_active, &tmux_out);
             });
             ui.menu_button("Session", |ui| {
                 ui.set_min_width(MENU_MIN_W);
@@ -725,6 +747,7 @@ impl MenuBar {
         }
 
         self.shortcuts_window(ctx, term.keymap());
+        tmux_out.into_inner()
     }
 
     /// The keyboard-shortcuts reference (Help → Keyboard Shortcuts), read live
@@ -819,6 +842,34 @@ fn session_menu(
     );
 }
 
+/// The Tmux drop-down (TMUX-FC-2): the session-management entry points. Each
+/// item routes OUT as a [`TmuxMenuChoice`] the surface applies to its
+/// [`crate::tmux_ui::TmuxChrome`]; the context-sensitive ones honestly grey out
+/// without a live control client (§7). The full session/window/pane tree + the
+/// per-session ops live in the sidebar "New tmux session" reveals.
+fn tmux_menu(ui: &mut Ui, active: bool, out: &RefCell<Option<TmuxMenuChoice>>) {
+    let choose = |ui: &mut Ui, choice: TmuxMenuChoice| {
+        *out.borrow_mut() = Some(choice);
+        ui.close_menu();
+    };
+    if ui.button("New tmux session").clicked() {
+        choose(ui, TmuxMenuChoice::NewSession);
+    }
+    if ui.button("Attach Session\u{2026}").clicked() {
+        choose(ui, TmuxMenuChoice::ShowPicker);
+    }
+    ui.separator();
+    if ui.add_enabled(active, Button::new("Detach")).clicked() {
+        choose(ui, TmuxMenuChoice::Detach);
+    }
+    if ui
+        .add_enabled(active, Button::new("Hide/Show Tree"))
+        .clicked()
+    {
+        choose(ui, TmuxMenuChoice::ToggleTree);
+    }
+}
+
 /// The fixed (non-rebindable) chords the terminal widget handles directly — the
 /// reference window's second section, so every real chord is documented.
 const FIXED_SHORTCUTS: [(&str, &str); 6] = [
@@ -904,8 +955,7 @@ mod tests {
     #[test]
     fn omitted_features_have_no_dead_entry() {
         // No landed seam → no item (the editor's Find precedent): Paste, Select
-        // All, Reset, and a status-bar toggle are all honestly absent, and the
-        // tmux menu stays out until TMUX-FC wires it.
+        // All, Reset, and a status-bar toggle are all honestly absent.
         let all_labels: Vec<&str> = MENUS
             .iter()
             .flat_map(|(_, items)| items.iter())
@@ -923,14 +973,19 @@ mod tests {
                 "{banned} shipped without a landed seam"
             );
         }
-        assert!(!MENU_TITLES.contains(&"tmux"), "tmux menu is TMUX-FC's job");
+        // The tmux menu is now wired (TMUX-FC-2) — its items route out to the
+        // surface's TmuxChrome, not through this crate's `apply`.
+        assert!(
+            MENU_TITLES.contains(&"Tmux"),
+            "TMUX-FC-2 wires the tmux menu"
+        );
     }
 
     #[test]
     fn menu_order_is_stable() {
         assert_eq!(
             MENU_TITLES,
-            ["File", "Edit", "View", "Terminal", "Splits", "Tabs", "Session", "Help"]
+            ["File", "Edit", "View", "Terminal", "Splits", "Tabs", "Tmux", "Session", "Help"]
         );
     }
 
@@ -1119,7 +1174,8 @@ mod tests {
         };
         let out = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                bar.ui(ui, &mut term, ctx);
+                // `tmux_active = false` — no live control client in the test.
+                let _ = bar.ui(ui, &mut term, ctx, false);
             });
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);

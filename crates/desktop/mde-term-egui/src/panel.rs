@@ -25,7 +25,7 @@
 use mde_egui::egui::{Context, RichText, Ui};
 use mde_egui::Style;
 
-use crate::{MenuBar, SpawnOptions, TabbedTerminal};
+use crate::{MenuBar, SpawnOptions, TabbedTerminal, TmuxChrome};
 
 /// The production terminal surface the E12 shell embeds (TERM-16).
 ///
@@ -47,6 +47,11 @@ pub struct TerminalSurface {
     /// The TERM-MENUBAR-1 top menu bar (its only state is the shortcuts-window
     /// toggle; every feature it drives lives in the [`TabbedTerminal`]).
     menubar: MenuBar,
+    /// The TMUX-FC-2 session management chrome — the optional live `tmux -CC`
+    /// control client + the sidebar tree. Opt-in (lock #16): nothing attaches
+    /// until the Tmux menu's "New tmux session", so a terminal that never touches
+    /// tmux pays nothing.
+    tmux: TmuxChrome,
 }
 
 /// Build the production [`TerminalSurface`] over a real local login shell.
@@ -64,6 +69,7 @@ pub fn real_terminal() -> TerminalSurface {
             .map_err(|err| format!("could not start the shell: {err}")),
         fonts_installed: false,
         menubar: MenuBar::new(),
+        tmux: TmuxChrome::new(),
     }
 }
 
@@ -79,6 +85,9 @@ pub fn terminal_pump(surface: &mut TerminalSurface, ctx: &Context) {
         crate::fonts::install(ctx);
         surface.fonts_installed = true;
     }
+    // Drain any `tmux -CC` control traffic into the model before the tree renders
+    // (a no-op until the user opts into a tmux session).
+    surface.tmux.pump();
     if let Ok(term) = &mut surface.term {
         term.dispatch_keys(ctx);
     }
@@ -92,16 +101,26 @@ pub fn terminal_pump(surface: &mut TerminalSurface, ctx: &Context) {
 /// session rather than dead-ending — the embedded surface has no window to close,
 /// unlike the standalone binary.
 pub fn terminal_panel(ui: &mut Ui, surface: &mut TerminalSurface) {
-    // Split the surface's fields so the menu bar (its own state) and the terminal
-    // can be driven together this frame without aliasing.
-    let TerminalSurface { term, menubar, .. } = surface;
+    // Split the surface's fields so the menu bar (its own state), the tmux chrome,
+    // and the terminal can be driven together this frame without aliasing.
+    let TerminalSurface {
+        term,
+        menubar,
+        tmux,
+        ..
+    } = surface;
     match term {
         Ok(term) => {
             // TERM-MENUBAR-1: the top menu-bar strip caps the surface, above the
             // TERM-5 tab bar + the active split tree. It reads a snapshot of the
-            // terminal, renders the drop-downs, and applies the chosen action.
+            // terminal, renders the drop-downs, and applies the chosen action. The
+            // Tmux menu's choice (TMUX-FC-2) routes to the surface-held chrome.
             let ctx = ui.ctx().clone();
-            menubar.ui(ui, term, &ctx);
+            let tmux_choice = menubar.ui(ui, term, &ctx, tmux.is_active());
+            tmux.apply_menu(tmux_choice);
+            // The tmux session/window/pane tree mounts as a left panel (only when
+            // opened), reserving its width before the terminal fills the rest.
+            tmux.sidebar(ui);
             term.show(ui);
             if term.is_empty() {
                 empty_state(ui, term);
