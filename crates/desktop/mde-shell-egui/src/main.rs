@@ -26,6 +26,7 @@ mod chrome;
 mod controller;
 mod curtain;
 mod datacenter;
+mod device_manager;
 mod discovery;
 mod dock;
 mod explorer;
@@ -196,6 +197,13 @@ struct Shell {
     /// queue, and drives `action/storage/<node>` back onto the Bus. The `mackesd`
     /// storage worker owns the hard walls + the executor (live apply is E12-23).
     storage: storage::StorageState,
+    /// The About surface — the Device-Manager hardware inspector (DEVMGR-2). Reads
+    /// THIS node's published `device-inventory/<host>.json` (the §6 JSON contract
+    /// the `hardware_probe` worker publishes, DEVMGR-1) on a cadence + on Scan, and
+    /// renders the faithful Windows-Device-Manager by-type tree + rich header card
+    /// + menu/toolbar chrome in `mde_egui` dark tokens, with the brand shrunk to a
+    /// title strip + an ⓘ dialog. A pure consumer — it drives no worker.
+    device_manager: device_manager::DeviceManagerState,
     /// The KIRON chyron bridge (KIRON-2) — the shell's one `ToastHost` plus its
     /// `event/toast/show` Bus subscription, suppression posture, and the single
     /// notification-sound seam. Driven every frame; its lower-third band + OSD
@@ -307,6 +315,7 @@ impl Shell {
             chat: chat::ChatState::default(),
             system: system::SystemState::default(),
             storage: storage::StorageState::default(),
+            device_manager: device_manager::DeviceManagerState::default(),
             toasts: toast_bridge::ToastBridge::default(),
             hotkeys: hotkeys::HotkeyRouter::default(),
             formfactor: formfactor::FormfactorPublisher::default(),
@@ -651,12 +660,15 @@ impl Shell {
                 ui.push_id("shell-storage", |ui| storage.show(ui));
             }
             Surface::About => {
-                // The platform-identity screen (QBRAND-6): the brand lockup, the
-                // product name + tagline, the full build stamp, and the shipped
-                // legal docs. A pure renderer of the `mde_theme::brand` constants —
-                // it holds no shell state and drives no worker — scoped under its
-                // own `push_id` like every mounted surface.
-                ui.push_id("shell-about", about::about_panel);
+                // The About surface body is the Device-Manager hardware inspector
+                // (DEVMGR-2, design docs/design/about-device-manager.md): a compact
+                // brand title strip + an ⓘ dialog (the platform-identity screen,
+                // QBRAND-6) over the faithful by-type device tree + rich header card
+                // + menu/toolbar chrome, read from THIS node's published inventory.
+                // Scoped under its own `push_id` like every mounted surface so its
+                // egui ids can't collide in the shell's one `Context`.
+                let dm = &mut self.device_manager;
+                ui.push_id("shell-about", |ui| dm.show(ui));
             }
         }
     }
@@ -812,6 +824,14 @@ impl Shell {
         // change on any peer surfaces without operator input (E12-21).
         if self.nav.expanded && self.nav.surface == Surface::Storage {
             self.storage.poll(ctx);
+        }
+
+        // The About → Device-Manager surface re-reads THIS node's published
+        // hardware inventory on its cadence while in view (DEVMGR-2) — a cheap
+        // local read of the replicated `device-inventory/<host>.json`, honest
+        // pre-poll dim until the `hardware_probe` worker's file lands (§7).
+        if self.nav.expanded && self.nav.surface == Surface::About {
+            self.device_manager.poll(ctx);
         }
 
         // The seat snapshot feeds BOTH the System surface and the dock's status
