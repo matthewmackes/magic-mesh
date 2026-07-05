@@ -489,8 +489,17 @@ struct UnitsState {
 
 /// The three proximity categories a unit falls into (locks #7/#8, O8). Each
 /// carries a distinct §4 accent + a coherent label used on chips, badges, and the
-/// status ring. (EXPLORER-15 promotes these to dedicated Mesh/LAN/Cloud tokens;
-/// EXPLORER-3 maps onto the existing accent set — token-based, no raw hex.)
+/// status ring.
+///
+/// **Category identity (EXPLORER-15, design O8).** The accents ARE the shared
+/// categorical palette `mde_egui::Style` defines ONCE for the picker groups and
+/// the explorer categories (PICKER-2 — Mesh keeps its own `ACCENT_MESH` green,
+/// LAN speaks the terminal teal, Cloud the workloads purple): one colour
+/// language, no duplicate tokens minted here, no raw hex (§4). The mapping in
+/// [`accent`](Self::accent) is the ONE authority every site reads — tiles,
+/// chips, filmstrip dividers, IPAM bands, and the hero status ring's
+/// discovering arc — alongside the per-kind procedural glyph family
+/// ([`paint_kind_glyph`]) that rides the same accent at every scale.
 /// Serialisable (`snake_case` tokens) because the active filter rides the
 /// EXPLORER-13 view record (O5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2827,13 +2836,26 @@ impl ExplorerState {
                 "Mosaic",
                 self.mode == SurfaceMode::Mosaic,
                 Style::ACCENT,
+                Style::TEXT,
             ) {
                 self.set_mode(SurfaceMode::Mosaic);
             }
-            if chip(ui, "Hero", self.mode == SurfaceMode::Hero, Style::ACCENT) {
+            if chip(
+                ui,
+                "Hero",
+                self.mode == SurfaceMode::Hero,
+                Style::ACCENT,
+                Style::TEXT,
+            ) {
                 self.set_mode(SurfaceMode::Hero);
             }
-            if chip(ui, "IPAM", self.mode == SurfaceMode::Ipam, Style::ACCENT) {
+            if chip(
+                ui,
+                "IPAM",
+                self.mode == SurfaceMode::Ipam,
+                Style::ACCENT,
+                Style::TEXT,
+            ) {
                 self.set_mode(SurfaceMode::Ipam);
             }
             // The O2 fleet rollup pushed to the right edge, with the EXPLORER-12
@@ -2842,7 +2864,13 @@ impl ExplorerState {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 self.rollup(ui);
                 ui.add_space(Style::SP_M);
-                if chip(ui, "Ambient", self.prefs.ambient_idle, Style::ACCENT) {
+                if chip(
+                    ui,
+                    "Ambient",
+                    self.prefs.ambient_idle,
+                    Style::ACCENT,
+                    Style::TEXT,
+                ) {
                     self.toggle_ambient();
                 }
             });
@@ -2960,6 +2988,7 @@ impl ExplorerState {
                 &format!("All · {total}"),
                 self.filter.is_none() && !self.prefs.pinned_only,
                 Style::ACCENT,
+                Style::TEXT,
             ) {
                 self.set_filter(None);
                 self.set_pinned_only(false);
@@ -2967,7 +2996,9 @@ impl ExplorerState {
             for cat in Category::ALL {
                 let label = format!("{} · {}", cat.label(), counts[cat.index()]);
                 let active = self.filter == Some(cat);
-                if chip(ui, &label, active, cat.accent()) {
+                // The chip wears its category accent at rest too (EXPLORER-15,
+                // O8) — the filter row IS the category legend.
+                if chip(ui, &label, active, cat.accent(), cat.accent()) {
                     self.set_filter(if active { None } else { Some(cat) });
                 }
             }
@@ -2977,6 +3008,7 @@ impl ExplorerState {
                 &format!("Pinned · {pinned_here}"),
                 pin_active,
                 Style::ACCENT_HI,
+                Style::TEXT,
             ) {
                 self.set_pinned_only(!pin_active);
             }
@@ -3357,12 +3389,14 @@ fn self_placeholder(host: &str) -> Unit {
 // ─────────────────────────── render helpers ───────────────────────────
 
 /// A Carbon filter/nav pill; returns whether it was clicked. Active = accent
-/// fill; inactive = surface with a dim border (all §4 tokens).
-fn chip(ui: &mut egui::Ui, label: &str, active: bool, accent: Color32) -> bool {
-    let text =
-        RichText::new(label)
-            .size(Style::SMALL)
-            .color(if active { Style::BG } else { Style::TEXT });
+/// fill; inactive = surface with a dim border and the `rest` label tone (all §4
+/// tokens). The category chips pass their O8 accent as `rest` (EXPLORER-15) so
+/// a chip speaks its category identity even when not selected; every other
+/// chip passes the plain `TEXT` tone.
+fn chip(ui: &mut egui::Ui, label: &str, active: bool, accent: Color32, rest: Color32) -> bool {
+    let text = RichText::new(label)
+        .size(Style::SMALL)
+        .color(if active { Style::BG } else { rest });
     let button = egui::Button::new(text)
         .fill(if active { accent } else { Style::SURFACE })
         .stroke(Stroke::new(
@@ -4402,6 +4436,39 @@ mod tests {
         s.units[idx].clone()
     }
 
+    /// Render one headless frame of `s` and return every vertex colour the
+    /// tessellator actually emitted — the token-application probe (EXPLORER-15/
+    /// EXPLORER-18): a §4 token is *applied* iff its exact colour reaches the
+    /// draw list, not merely referenced in code.
+    fn painted_colors(s: &mut ExplorerState) -> std::collections::HashSet<[u8; 4]> {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                Vec2::new(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| s.show(ui));
+        });
+        let mut colors = std::collections::HashSet::new();
+        for clipped in ctx.tessellate(out.shapes, out.pixels_per_point) {
+            if let egui::epaint::Primitive::Mesh(mesh) = clipped.primitive {
+                for v in &mesh.vertices {
+                    colors.insert([v.color.r(), v.color.g(), v.color.b(), v.color.a()]);
+                }
+            }
+        }
+        colors
+    }
+
+    /// Whether the painted-colour set contains exactly the §4 token `c`.
+    fn painted(colors: &std::collections::HashSet<[u8; 4]>, c: Color32) -> bool {
+        colors.contains(&[c.r(), c.g(), c.b(), c.a()])
+    }
+
     /// A reachable peer carrying live telemetry — the sparkline-path fixture.
     fn peer_with_telemetry(id: &str, name: &str, t: Telemetry) -> Unit {
         Unit {
@@ -4567,6 +4634,68 @@ mod tests {
             "me",
         );
         assert_eq!(s.category_counts(), [1, 1, 2]); // 1 mesh, 1 lan, 2 cloud
+    }
+
+    // ─────────────── EXPLORER-15 per-category visual identity ───────────────
+
+    #[test]
+    fn category_identity_maps_onto_the_shared_style_tokens() {
+        // O8 — each category's accent IS a shared `Style` categorical token
+        // (defined ONCE for picker + explorer, PICKER-2): no duplicate minted,
+        // no raw hex in this crate.
+        assert_eq!(Category::Mesh.accent(), Style::ACCENT_MESH);
+        assert_eq!(Category::Lan.accent(), Style::ACCENT_TERMINALS);
+        assert_eq!(Category::Cloud.accent(), Style::ACCENT_WORKLOADS);
+        // The three identities are mutually distinct AND distinct from the one
+        // interactive brand accent, so a category tint never reads as an
+        // interaction affordance.
+        let cats: Vec<Color32> = Category::ALL.iter().map(|c| c.accent()).collect();
+        for (i, a) in cats.iter().enumerate() {
+            assert_ne!(*a, Style::ACCENT, "category ≠ brand accent");
+            for b in &cats[i + 1..] {
+                assert_ne!(a, b, "category accents must be mutually distinct");
+            }
+        }
+        // Every unit kind resolves into exactly one of the three identities —
+        // the glyph family ([`paint_kind_glyph`]) rides the same mapping, so no
+        // kind can render outside the category colour language.
+        for kind in [
+            UnitKind::Peer,
+            UnitKind::LanHost,
+            UnitKind::Instance,
+            UnitKind::Volume,
+            UnitKind::Image,
+            UnitKind::Network,
+        ] {
+            assert!(Category::ALL.contains(&kind.category()));
+        }
+    }
+
+    #[test]
+    fn category_accents_actually_paint_the_tiles_chips_and_rings() {
+        // Token *application*, not just mapping (the EXPLORER-15 acceptance):
+        // with one unit per category on the shelf, all three category accents
+        // must reach the draw list — the mosaic tiles' glyphs + badges + the
+        // rest-tinted filter chips on the landing, and the hero mode's status
+        // ring arc/glyph + filmstrip dividers.
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        let mosaic = painted_colors(&mut s);
+        for cat in Category::ALL {
+            assert!(
+                painted(&mosaic, cat.accent()),
+                "{} accent must be painted on the mosaic landing",
+                cat.label()
+            );
+        }
+        s.set_mode(SurfaceMode::Hero);
+        let hero = painted_colors(&mut s);
+        for cat in Category::ALL {
+            assert!(
+                painted(&hero, cat.accent()),
+                "{} accent must be painted in the hero mode",
+                cat.label()
+            );
+        }
     }
 
     #[test]

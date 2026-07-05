@@ -461,9 +461,9 @@ mod tests {
             "the spell squiggle must differ from the error squiggle"
         );
         let (r, g, b) = (
-            Style::SPELL.r() as u16,
-            Style::SPELL.g() as u16,
-            Style::SPELL.b() as u16,
+            u16::from(Style::SPELL.r()),
+            u16::from(Style::SPELL.g()),
+            u16::from(Style::SPELL.b()),
         );
         assert!(
             r > g && r > b,
