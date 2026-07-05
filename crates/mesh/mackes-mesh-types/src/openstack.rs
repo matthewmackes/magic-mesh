@@ -715,6 +715,457 @@ fn order_resource_columns(columns: &mut [String]) {
     });
 }
 
+// ─────────────────────────── Heat orchestration (IAC-4) ───────────────────────────
+//
+// The §6 wire shapes the IAC **Heat** tab renders — the native IaC control loop
+// (design #5/#6/#21). The producer is `mackesd`'s `openstack` worker driving the
+// real Heat REST API through IAC-1's `ResourceApi`; these pure types + parsers
+// are what both sides share, so the shell renders a stack detail / a
+// preview-update diff / a reverse-generated template without ever depending on
+// `mackesd`. Every parse degrades honestly (an absent field → an empty section,
+// never a fabricated resource/event/output, §7).
+
+/// One resource of a Heat stack — the stack-detail **resources** drill (design
+/// #6 "events + resources drill").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeatResource {
+    /// The logical resource name in the template (`resource_name`).
+    pub name: String,
+    /// The resource type (`OS::Nova::Server`, `OS::Neutron::Net`, …).
+    pub resource_type: String,
+    /// The resource's current status (`CREATE_COMPLETE`, `UPDATE_FAILED`, …).
+    pub status: String,
+    /// The physical (real cloud) id Heat provisioned, when the row carried one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub physical_id: String,
+}
+
+/// One event in a Heat stack's **events** timeline (design #6).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeatEvent {
+    /// The event timestamp (`event_time`, RFC3339).
+    pub time: String,
+    /// The resource the event is about (`resource_name`).
+    pub resource: String,
+    /// The status the resource moved to (`resource_status`).
+    pub status: String,
+    /// The human reason (`resource_status_reason`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+/// One **output** of a Heat stack (design #6 "outputs").
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeatOutput {
+    /// The output key (`output_key`).
+    pub key: String,
+    /// The output value rendered to a string (`output_value`).
+    pub value: String,
+    /// The output's description, when the template documented one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A Heat stack's full detail — the `heat-show` read (design #6): its status,
+/// **resources**, **events**, **outputs**, and the **template** (HOT, read view).
+///
+/// `resources`/`events`/`outputs`/`template` are folded from their own Heat
+/// sub-endpoint bodies; each is honestly empty when its sub-request returned
+/// nothing (never a fabricated row, §7).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeatStackDetail {
+    /// The stack's name.
+    pub stack_name: String,
+    /// The stack's id.
+    pub stack_id: String,
+    /// The stack status (`CREATE_COMPLETE`, `UPDATE_IN_PROGRESS`, …).
+    pub status: String,
+    /// The status reason, when Heat reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+    /// The last-updated time (`updated_time`), when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
+    /// The stack description from the template, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The stack's resources.
+    pub resources: Vec<HeatResource>,
+    /// The stack's event timeline (newest first, as Heat returns it).
+    pub events: Vec<HeatEvent>,
+    /// The stack's outputs.
+    pub outputs: Vec<HeatOutput>,
+    /// The stack's HOT template, pretty-printed for the read view + the editable
+    /// buffer. Empty when the template sub-request returned nothing.
+    pub template: String,
+}
+
+impl HeatStackDetail {
+    /// Parse a Heat `GET /stacks/{id}` response body (`{"stack": {…}}`) into the
+    /// detail skeleton (name / id / status / reason / updated / description /
+    /// outputs). The resources / events / template sections are folded in from
+    /// their own sub-endpoint bodies via [`Self::with_resources_json`] /
+    /// [`Self::with_events_json`] / [`Self::with_template_json`].
+    ///
+    /// # Errors
+    /// [`ResourceParseError`] when the body isn't valid JSON or carries no
+    /// `stack` object — so an error/HTML body surfaces honestly, never as a
+    /// fabricated empty stack (§7).
+    pub fn from_stack_json(body: &str) -> Result<Self, ResourceParseError> {
+        let value: serde_json::Value =
+            serde_json::from_str(body.trim()).map_err(|e| ResourceParseError(e.to_string()))?;
+        let stack = value
+            .get("stack")
+            .and_then(|s| s.as_object())
+            .ok_or_else(|| ResourceParseError("no `stack` object in the response".to_string()))?;
+        let s = |k: &str| -> String { stack.get(k).and_then(display_scalar).unwrap_or_default() };
+        let opt = |k: &str| -> Option<String> {
+            stack
+                .get(k)
+                .and_then(display_scalar)
+                .filter(|v| !v.trim().is_empty())
+        };
+        let outputs = stack
+            .get("outputs")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|o| {
+                        let obj = o.as_object()?;
+                        Some(HeatOutput {
+                            key: obj
+                                .get("output_key")
+                                .and_then(display_scalar)
+                                .unwrap_or_default(),
+                            value: obj
+                                .get("output_value")
+                                .map(display_value)
+                                .unwrap_or_default(),
+                            description: obj
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .map(str::to_string)
+                                .filter(|d| !d.trim().is_empty()),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            stack_name: s("stack_name"),
+            stack_id: s("id"),
+            status: s("stack_status"),
+            status_reason: opt("stack_status_reason"),
+            updated: opt("updated_time"),
+            description: opt("description"),
+            resources: Vec::new(),
+            events: Vec::new(),
+            outputs,
+            template: String::new(),
+        })
+    }
+
+    /// Fold a Heat `GET …/resources` body (`{"resources": [...]}`) into the
+    /// detail — best-effort (an unparseable body leaves the resources empty, an
+    /// honest "none returned" rather than an error that would hide the rest of
+    /// the stack).
+    #[must_use]
+    pub fn with_resources_json(mut self, body: &str) -> Self {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) {
+            if let Some(arr) = value.get("resources").and_then(|v| v.as_array()) {
+                self.resources = arr
+                    .iter()
+                    .filter_map(|r| {
+                        let o = r.as_object()?;
+                        Some(HeatResource {
+                            name: o
+                                .get("resource_name")
+                                .and_then(display_scalar)
+                                .unwrap_or_default(),
+                            resource_type: o
+                                .get("resource_type")
+                                .and_then(display_scalar)
+                                .unwrap_or_default(),
+                            status: o
+                                .get("resource_status")
+                                .and_then(display_scalar)
+                                .unwrap_or_default(),
+                            physical_id: o
+                                .get("physical_resource_id")
+                                .and_then(display_scalar)
+                                .unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+            }
+        }
+        self
+    }
+
+    /// Fold a Heat `GET …/events` body (`{"events": [...]}`) into the detail —
+    /// best-effort.
+    #[must_use]
+    pub fn with_events_json(mut self, body: &str) -> Self {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) {
+            if let Some(arr) = value.get("events").and_then(|v| v.as_array()) {
+                self.events = arr
+                    .iter()
+                    .filter_map(|e| {
+                        let o = e.as_object()?;
+                        Some(HeatEvent {
+                            time: o
+                                .get("event_time")
+                                .and_then(display_scalar)
+                                .unwrap_or_default(),
+                            resource: o
+                                .get("resource_name")
+                                .and_then(display_scalar)
+                                .unwrap_or_default(),
+                            status: o
+                                .get("resource_status")
+                                .and_then(display_scalar)
+                                .unwrap_or_default(),
+                            reason: o
+                                .get("resource_status_reason")
+                                .and_then(display_scalar)
+                                .unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+            }
+        }
+        self
+    }
+
+    /// Fold a Heat `GET …/template` body (the raw HOT template object) into the
+    /// detail, pretty-printed for the read view + the editable buffer. A
+    /// non-object body is kept verbatim; an empty body leaves the template empty.
+    #[must_use]
+    pub fn with_template_json(mut self, body: &str) -> Self {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            return self;
+        }
+        self.template = serde_json::from_str::<serde_json::Value>(trimmed).map_or_else(
+            |_| trimmed.to_string(),
+            |v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| trimmed.to_string()),
+        );
+        self
+    }
+}
+
+/// A Heat **preview-update** resource-change diff — the dry-run of what a
+/// template edit *would* change before it is applied (design #6 preview-update).
+///
+/// Each field lists the logical resource names in that change class; `unchanged`
+/// is carried so the diff can show the full picture, but [`Self::change_count`]
+/// counts only the real changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeatPreview {
+    /// Resources the update would add.
+    pub added: Vec<String>,
+    /// Resources the update would delete.
+    pub deleted: Vec<String>,
+    /// Resources the update would replace (delete + recreate).
+    pub replaced: Vec<String>,
+    /// Resources the update would update in place.
+    pub updated: Vec<String>,
+    /// Resources the update would leave unchanged.
+    pub unchanged: Vec<String>,
+}
+
+impl HeatPreview {
+    /// Parse a Heat preview-update response (`{"resource_changes": {…}}`) into
+    /// the diff. Each class's entries are the resources' logical names
+    /// (`resource_name`, falling back to `resource_identity.stack_name` or a
+    /// bare string). A body with no `resource_changes` is an honest no-change
+    /// diff (never an error — Heat omits the key when nothing changes).
+    ///
+    /// # Errors
+    /// [`ResourceParseError`] when the body isn't valid JSON.
+    pub fn from_json(body: &str) -> Result<Self, ResourceParseError> {
+        let value: serde_json::Value =
+            serde_json::from_str(body.trim()).map_err(|e| ResourceParseError(e.to_string()))?;
+        let changes = value.get("resource_changes");
+        let names = |key: &str| -> Vec<String> {
+            changes
+                .and_then(|c| c.get(key))
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(preview_change_name).collect())
+                .unwrap_or_default()
+        };
+        Ok(Self {
+            added: names("added"),
+            deleted: names("deleted"),
+            replaced: names("replaced"),
+            updated: names("updated"),
+            unchanged: names("unchanged"),
+        })
+    }
+
+    /// How many resources the update would actually change (added + deleted +
+    /// replaced + updated — `unchanged` excluded).
+    #[must_use]
+    pub fn change_count(&self) -> usize {
+        self.added.len() + self.deleted.len() + self.replaced.len() + self.updated.len()
+    }
+
+    /// Whether the preview shows no real change (an honest "nothing to do").
+    #[must_use]
+    pub fn is_no_change(&self) -> bool {
+        self.change_count() == 0
+    }
+}
+
+/// The logical name of one preview resource-change entry — its `resource_name`,
+/// else its nested `resource_identity.stack_name`, else a bare string entry.
+fn preview_change_name(entry: &serde_json::Value) -> Option<String> {
+    if let Some(s) = entry.as_str() {
+        return Some(s.to_string());
+    }
+    let o = entry.as_object()?;
+    o.get("resource_name")
+        .and_then(display_scalar)
+        .or_else(|| {
+            o.get("resource_identity")
+                .and_then(|ri| ri.get("stack_name"))
+                .and_then(display_scalar)
+        })
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// The HOT resource `type:` a Keystone service **type** reverse-generates to
+/// (design #5 reverse-generate).
+///
+/// `None` for a service with no faithful HOT mapping (Glance images / identity /
+/// … are not first-class HOT resources) — those are honestly noted, never
+/// emitted as a fabricated resource (§7).
+#[must_use]
+pub fn hot_resource_type(service_type: &str) -> Option<&'static str> {
+    match service_type {
+        "compute" | "compute_legacy" => Some("OS::Nova::Server"),
+        "network" => Some("OS::Neutron::Net"),
+        "volume" | "volumev2" | "volumev3" | "block-storage" | "block-store" => {
+            Some("OS::Cinder::Volume")
+        }
+        "orchestration" | "cloudformation" => Some("OS::Heat::Stack"),
+        _ => None,
+    }
+}
+
+/// The `heat_template_version` the reverse-generator stamps (a recent stable HOT
+/// version).
+pub const HOT_TEMPLATE_VERSION: &str = "2021-04-16";
+
+/// Reverse-generate a **HOT template** from live discovered resources (design #5
+/// — "capture reality as code").
+///
+/// Emits a valid HOT skeleton: the version stamp, a description that names its
+/// provenance + honesty caveat, and a `resources:` map with one entry per
+/// discovered resource — keyed by a YAML-safe form of its name, `type:` mapped
+/// from the service via [`hot_resource_type`], and its observed identifying value
+/// as a `name` property (other observed cells ride as `#` comments, since a
+/// status/address is not a settable property). A service with no HOT mapping is
+/// listed honestly in a trailing comment rather than emitted as a fabricated
+/// resource (§7) — the output is a review-before-apply starting point.
+#[must_use]
+pub fn reverse_generate_hot(tables: &[ResourceTable]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "heat_template_version: {HOT_TEMPLATE_VERSION}");
+    out.push('\n');
+    out.push_str(
+        "description: >-\n  Reverse-generated from live infrastructure by MCNF Infra-as-Code \
+         (capture\n  reality as code). Property fidelity is best-effort \u{2014} review before \
+         applying.\n\n",
+    );
+    out.push_str("resources:\n");
+
+    let mut emitted = 0usize;
+    let mut used_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut skipped: Vec<&str> = Vec::new();
+    for table in tables {
+        let Some(hot_type) = hot_resource_type(&table.service_type) else {
+            if !table.rows.is_empty() {
+                skipped.push(table.service_type.as_str());
+            }
+            continue;
+        };
+        for row in &table.rows {
+            let label = table.row_label(row);
+            let key = unique_yaml_key(label, row, &mut used_keys);
+            let _ = writeln!(out, "  {key}:");
+            let _ = writeln!(out, "    type: {hot_type}");
+            out.push_str("    properties:\n");
+            let _ = writeln!(out, "      name: {}", yaml_scalar(label));
+            // Other observed cells ride as reference comments (not settable props).
+            for (col, cell) in table.columns.iter().zip(row.cells.iter()) {
+                if col == "name" || col == "stack_name" || col == "display_name" || cell.is_empty()
+                {
+                    continue;
+                }
+                let _ = writeln!(out, "      # observed {col}: {cell}");
+            }
+            emitted += 1;
+        }
+    }
+    if emitted == 0 {
+        out.push_str("  {}  # no reverse-generable resources were discovered\n");
+    }
+    if !skipped.is_empty() {
+        skipped.sort_unstable();
+        skipped.dedup();
+        out.push('\n');
+        let _ = writeln!(
+            out,
+            "# discovered but not HOT-mappable (omitted, not fabricated): {}",
+            skipped.join(", ")
+        );
+    }
+    out
+}
+
+/// A YAML-safe, unique resource key derived from a resource label: non-alnum
+/// runs collapse to `_`, and a numeric suffix disambiguates a collision.
+fn unique_yaml_key(
+    label: &str,
+    row: &ResourceRow,
+    used: &mut std::collections::BTreeSet<String>,
+) -> String {
+    let mut base: String = label
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    base = base.trim_matches('_').to_string();
+    if base.is_empty() {
+        base = if row.id.is_empty() {
+            "resource".to_string()
+        } else {
+            format!(
+                "res_{}",
+                row.id.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+            )
+        };
+    }
+    let mut key = base.clone();
+    let mut n = 1;
+    while !used.insert(key.clone()) {
+        n += 1;
+        key = format!("{base}_{n}");
+    }
+    key
+}
+
+/// Quote a scalar for a YAML value when it needs it (contains a `:` or leading/
+/// trailing space); a plain token is emitted bare.
+fn yaml_scalar(value: &str) -> String {
+    if value.is_empty() || value.contains(':') || value.contains('#') || value != value.trim() {
+        format!("{value:?}")
+    } else {
+        value.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1072,5 +1523,175 @@ mod tests {
         let s = serde_json::to_string(&t).unwrap();
         let back: ResourceTable = serde_json::from_str(&s).unwrap();
         assert_eq!(t, back);
+    }
+
+    // ─────────────────────────── Heat orchestration (IAC-4) ───────────────────────────
+
+    #[test]
+    fn parses_a_heat_stack_detail_with_outputs() {
+        let body = r#"{"stack": {
+            "id": "s-1", "stack_name": "mesh-net", "stack_status": "CREATE_COMPLETE",
+            "stack_status_reason": "Stack CREATE completed successfully",
+            "updated_time": null, "description": "the mesh overlay network",
+            "outputs": [
+                {"output_key": "net_id", "output_value": "n-9", "description": "the network id"},
+                {"output_key": "subnet", "output_value": "10.0.0.0/24"}
+            ]
+        }}"#;
+        let d = HeatStackDetail::from_stack_json(body).expect("parse");
+        assert_eq!(d.stack_name, "mesh-net");
+        assert_eq!(d.stack_id, "s-1");
+        assert_eq!(d.status, "CREATE_COMPLETE");
+        assert_eq!(
+            d.status_reason.as_deref(),
+            Some("Stack CREATE completed successfully")
+        );
+        // A JSON null updated_time is honestly absent, never a fabricated time.
+        assert!(d.updated.is_none());
+        assert_eq!(d.outputs.len(), 2);
+        assert_eq!(d.outputs[0].key, "net_id");
+        assert_eq!(d.outputs[0].description.as_deref(), Some("the network id"));
+        assert!(d.outputs[1].description.is_none());
+        // resources/events/template are empty until folded.
+        assert!(d.resources.is_empty() && d.events.is_empty() && d.template.is_empty());
+    }
+
+    #[test]
+    fn folds_resources_events_and_template_into_the_detail() {
+        let base = HeatStackDetail::from_stack_json(
+            r#"{"stack":{"id":"s-1","stack_name":"web","stack_status":"CREATE_COMPLETE"}}"#,
+        )
+        .unwrap();
+        let d = base
+            .with_resources_json(
+                r#"{"resources":[
+                    {"resource_name":"server","resource_type":"OS::Nova::Server",
+                     "resource_status":"CREATE_COMPLETE","physical_resource_id":"i-7"}
+                ]}"#,
+            )
+            .with_events_json(
+                r#"{"events":[
+                    {"event_time":"2026-07-05T00:00:00Z","resource_name":"server",
+                     "resource_status":"CREATE_IN_PROGRESS","resource_status_reason":"state changed"}
+                ]}"#,
+            )
+            .with_template_json(r#"{"heat_template_version":"2021-04-16","resources":{}}"#);
+        assert_eq!(d.resources.len(), 1);
+        assert_eq!(d.resources[0].resource_type, "OS::Nova::Server");
+        assert_eq!(d.resources[0].physical_id, "i-7");
+        assert_eq!(d.events.len(), 1);
+        assert_eq!(d.events[0].reason, "state changed");
+        // The template is pretty-printed from the JSON body for the read view.
+        assert!(d.template.contains("heat_template_version"));
+        assert!(d.template.contains('\n'), "pretty-printed");
+    }
+
+    #[test]
+    fn a_stack_body_without_a_stack_object_is_a_typed_error() {
+        // §7 — an error/HTML body surfaces honestly, never a fabricated stack.
+        assert!(HeatStackDetail::from_stack_json("<html>404</html>").is_err());
+        assert!(HeatStackDetail::from_stack_json(r#"{"itemNotFound":{"code":404}}"#).is_err());
+        // A best-effort sub-fold of garbage leaves the section empty, not a panic.
+        let d = HeatStackDetail::from_stack_json(r#"{"stack":{"id":"s","stack_name":"n"}}"#)
+            .unwrap()
+            .with_resources_json("<html>")
+            .with_events_json("nope");
+        assert!(d.resources.is_empty() && d.events.is_empty());
+    }
+
+    #[test]
+    fn parses_a_preview_update_diff_and_counts_changes() {
+        let body = r#"{"resource_changes": {
+            "added":     [{"resource_name":"new_net"}],
+            "deleted":   [{"resource_name":"old_vol"}],
+            "replaced":  [{"resource_name":"server"}],
+            "updated":   [],
+            "unchanged": [{"resource_name":"router"}, {"resource_name":"subnet"}]
+        }}"#;
+        let p = HeatPreview::from_json(body).expect("parse");
+        assert_eq!(p.added, vec!["new_net"]);
+        assert_eq!(p.deleted, vec!["old_vol"]);
+        assert_eq!(p.replaced, vec!["server"]);
+        assert_eq!(p.unchanged.len(), 2);
+        // change_count excludes unchanged.
+        assert_eq!(p.change_count(), 3);
+        assert!(!p.is_no_change());
+        // Heat omits resource_changes when nothing changes → an honest no-change diff.
+        let none = HeatPreview::from_json("{}").expect("empty parses");
+        assert!(none.is_no_change() && none.change_count() == 0);
+        // A non-JSON body is a typed error, never a fabricated diff.
+        assert!(HeatPreview::from_json("<html>500</html>").is_err());
+    }
+
+    #[test]
+    fn reverse_generate_emits_a_hot_from_a_fixture_resource_set() {
+        // #5 capture-reality-as-code: two Nova servers + a network → a real HOT.
+        let compute = ResourceTable::from_collection_json(
+            "compute",
+            "servers/detail",
+            r#"{"servers":[
+                {"id":"i-1","name":"web","status":"ACTIVE"},
+                {"id":"i-2","name":"db","status":"SHUTOFF"}
+            ]}"#,
+        )
+        .unwrap();
+        let network = ResourceTable::from_collection_json(
+            "network",
+            "v2.0/networks",
+            r#"{"networks":[{"id":"n-1","name":"mesh-net","status":"ACTIVE"}]}"#,
+        )
+        .unwrap();
+        // An image table has no HOT mapping → honestly omitted, not fabricated.
+        let image = ResourceTable::from_collection_json(
+            "image",
+            "v2/images",
+            r#"{"images":[{"id":"img-1","name":"ubuntu","status":"active"}]}"#,
+        )
+        .unwrap();
+        let hot = reverse_generate_hot(&[compute, network, image]);
+        assert!(hot.starts_with("heat_template_version: 2021-04-16"));
+        assert!(hot.contains("resources:"));
+        assert!(hot.contains("OS::Nova::Server"));
+        assert!(hot.contains("OS::Neutron::Net"));
+        // The server + network names appear as resource keys / name props.
+        assert!(hot.contains("web") && hot.contains("db") && hot.contains("mesh_net"));
+        // The unmappable image service is honestly noted, never emitted as a resource.
+        assert!(!hot.contains("OS::Glance"));
+        assert!(hot.contains("not HOT-mappable"));
+        assert!(hot.contains("image"));
+    }
+
+    #[test]
+    fn reverse_generate_sanitizes_and_de_dupes_resource_keys() {
+        // Two rows whose names collide after sanitizing get disambiguated keys.
+        let t = ResourceTable::from_collection_json(
+            "compute",
+            "servers/detail",
+            r#"{"servers":[
+                {"id":"i-1","name":"my server","status":"ACTIVE"},
+                {"id":"i-2","name":"my:server","status":"ACTIVE"}
+            ]}"#,
+        )
+        .unwrap();
+        let hot = reverse_generate_hot(&[t]);
+        assert!(hot.contains("  my_server:"));
+        assert!(
+            hot.contains("  my_server_2:"),
+            "a colliding key is disambiguated"
+        );
+    }
+
+    #[test]
+    fn heat_detail_round_trips_json() {
+        let d = HeatStackDetail::from_stack_json(
+            r#"{"stack":{"id":"s","stack_name":"n","stack_status":"CREATE_COMPLETE"}}"#,
+        )
+        .unwrap()
+        .with_resources_json(
+            r#"{"resources":[{"resource_name":"r","resource_type":"OS::Nova::Server","resource_status":"OK"}]}"#,
+        );
+        let s = serde_json::to_string(&d).unwrap();
+        let back: HeatStackDetail = serde_json::from_str(&s).unwrap();
+        assert_eq!(d, back);
     }
 }

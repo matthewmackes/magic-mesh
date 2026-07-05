@@ -6,13 +6,15 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use mackes_mesh_types::openstack::{ProbeOutcome, ResourceTable, ServiceCatalog, ServiceHealth};
+use mackes_mesh_types::openstack::{
+    HeatPreview, HeatStackDetail, ProbeOutcome, ResourceTable, ServiceCatalog, ServiceHealth,
+};
 
 use super::config::CloudConfig;
 use super::health::EndpointProbe;
 use super::keystone::{KeystoneAuth, Session};
 use super::resource::{ResourceApi, ResourceRequest, ResourceResponse};
-use super::{CatalogHealth, CatalogSource, ClientError, ResourceSource};
+use super::{CatalogHealth, CatalogSource, ClientError, HeatSource, ResourceSource};
 
 /// An in-memory [`KeystoneAuth`]: answers a canned [`Session`] or a typed error.
 pub struct FakeKeystone {
@@ -169,45 +171,64 @@ impl ResourceApi for FakeResourceApi {
 }
 
 /// An in-memory [`CloudClient`](super::CloudClient) for the cloud-verb tests: a
-/// canned catalog+health (`get-catalog`) **and** a canned resource table
-/// (`list-resources`), an honest unconfigured gate, or a typed failure — one fake
-/// drives both seams the responder threads.
+/// canned catalog+health (`get-catalog`), a canned resource table
+/// (`list-resources`), **and** canned Heat answers (`heat-*`, IAC-4) — an honest
+/// unconfigured gate or a typed failure on every seam. One fake drives every seam
+/// the responder threads, and records the Heat calls it received.
 pub struct FakeCatalogSource {
     result: Result<CatalogHealth, ClientError>,
     resources: Result<ResourceTable, ClientError>,
+    heat_detail: Result<HeatStackDetail, ClientError>,
+    heat_preview: Result<HeatPreview, ClientError>,
+    heat_reverse: Result<String, ClientError>,
+    heat_mutation: Result<String, ClientError>,
+    heat_calls: Mutex<Vec<String>>,
 }
 
 impl FakeCatalogSource {
     /// Answer `catalog` + `health` on every `get-catalog`; an empty table on
-    /// every `list-resources` (override with [`Self::with_resources`]).
+    /// every `list-resources`; and honest empty Heat answers (override the Heat
+    /// ones with the `with_heat_*` builders).
     #[must_use]
     pub fn ok(catalog: ServiceCatalog, health: Vec<ServiceHealth>) -> Self {
         Self {
             result: Ok(CatalogHealth { catalog, health }),
             resources: Ok(ResourceTable::default()),
+            heat_detail: Ok(HeatStackDetail::default()),
+            heat_preview: Ok(HeatPreview::default()),
+            heat_reverse: Ok(String::new()),
+            heat_mutation: Ok(String::new()),
+            heat_calls: Mutex::new(Vec::new()),
         }
     }
 
-    /// Answer the honest "no clouds.yaml on this node" gate on both seams.
+    /// Answer the honest "no clouds.yaml on this node" gate on every seam.
     #[must_use]
     pub fn unconfigured() -> Self {
+        let gate = || ClientError::Unconfigured("test fake: no clouds.yaml".to_string());
         Self {
-            result: Err(ClientError::Unconfigured(
-                "test fake: no clouds.yaml".to_string(),
-            )),
-            resources: Err(ClientError::Unconfigured(
-                "test fake: no clouds.yaml".to_string(),
-            )),
+            result: Err(gate()),
+            resources: Err(gate()),
+            heat_detail: Err(gate()),
+            heat_preview: Err(gate()),
+            heat_reverse: Err(gate()),
+            heat_mutation: Err(gate()),
+            heat_calls: Mutex::new(Vec::new()),
         }
     }
 
-    /// Answer a typed failure (auth/transport) on both seams — a real error, not
+    /// Answer a typed failure (auth/transport) on every seam — a real error, not
     /// a gate.
     #[must_use]
     pub fn failing(err: ClientError) -> Self {
         Self {
             result: Err(err.clone()),
-            resources: Err(err),
+            resources: Err(err.clone()),
+            heat_detail: Err(err.clone()),
+            heat_preview: Err(err.clone()),
+            heat_reverse: Err(err.clone()),
+            heat_mutation: Err(err),
+            heat_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -216,6 +237,37 @@ impl FakeCatalogSource {
     pub fn with_resources(mut self, table: ResourceTable) -> Self {
         self.resources = Ok(table);
         self
+    }
+
+    /// Override the canned `heat-show` detail.
+    #[must_use]
+    pub fn with_heat_detail(mut self, detail: HeatStackDetail) -> Self {
+        self.heat_detail = Ok(detail);
+        self
+    }
+
+    /// Override the canned `heat-preview` diff.
+    #[must_use]
+    pub fn with_heat_preview(mut self, preview: HeatPreview) -> Self {
+        self.heat_preview = Ok(preview);
+        self
+    }
+
+    /// Override the canned `heat-reverse` HOT template.
+    #[must_use]
+    pub fn with_heat_reverse(mut self, hot: impl Into<String>) -> Self {
+        self.heat_reverse = Ok(hot.into());
+        self
+    }
+
+    /// The recorded Heat call log (`<verb> <args>`).
+    #[must_use]
+    pub fn heat_calls(&self) -> Vec<String> {
+        self.heat_calls.lock().unwrap().clone()
+    }
+
+    fn record(&self, call: impl Into<String>) {
+        self.heat_calls.lock().unwrap().push(call.into());
     }
 }
 
@@ -233,5 +285,52 @@ impl ResourceSource for FakeCatalogSource {
         _query: &[(String, String)],
     ) -> Result<ResourceTable, ClientError> {
         self.resources.clone()
+    }
+}
+
+impl HeatSource for FakeCatalogSource {
+    fn heat_show(&self, stack: &str) -> Result<HeatStackDetail, ClientError> {
+        self.record(format!("show:{stack}"));
+        self.heat_detail.clone()
+    }
+
+    fn heat_preview(
+        &self,
+        stack_name: &str,
+        stack_id: &str,
+        _template: &str,
+    ) -> Result<HeatPreview, ClientError> {
+        self.record(format!("preview:{stack_name}/{stack_id}"));
+        self.heat_preview.clone()
+    }
+
+    fn heat_check(&self, stack_name: &str, stack_id: &str) -> Result<(), ClientError> {
+        self.record(format!("check:{stack_name}/{stack_id}"));
+        self.heat_mutation.clone().map(|_| ())
+    }
+
+    fn heat_create(&self, stack_name: &str, _template: &str) -> Result<String, ClientError> {
+        self.record(format!("create:{stack_name}"));
+        self.heat_mutation.clone()
+    }
+
+    fn heat_update(
+        &self,
+        stack_name: &str,
+        stack_id: &str,
+        _template: &str,
+    ) -> Result<(), ClientError> {
+        self.record(format!("update:{stack_name}/{stack_id}"));
+        self.heat_mutation.clone().map(|_| ())
+    }
+
+    fn heat_delete(&self, stack_name: &str, stack_id: &str) -> Result<(), ClientError> {
+        self.record(format!("delete:{stack_name}/{stack_id}"));
+        self.heat_mutation.clone().map(|_| ())
+    }
+
+    fn heat_reverse(&self, services: &[(String, String)]) -> Result<String, ClientError> {
+        self.record(format!("reverse:{}", services.len()));
+        self.heat_reverse.clone()
     }
 }

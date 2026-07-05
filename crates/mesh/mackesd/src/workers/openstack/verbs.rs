@@ -55,7 +55,7 @@ use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 
 use mackes_mesh_types::openstack::{
-    default_collection, ResourceTable, ServiceCatalog, ServiceHealth,
+    default_collection, HeatPreview, HeatStackDetail, ResourceTable, ServiceCatalog, ServiceHealth,
 };
 
 use crate::workers::proc::output_with_timeout;
@@ -79,7 +79,20 @@ pub const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
 /// health the `IaC` surface (IAC-2) consumes; a read, so audit-exempt. IAC-3
 /// added `list-resources` — one cataloged service's resource rows the Resources
 /// tab renders; also a read (`list-` stem), so audit-exempt.
-pub const CLOUD_VERBS: [&str; 9] = [
+///
+/// IAC-4 added the native **Heat** control loop. The three **reads** carry the
+/// `get-` prefix (like `get-catalog`) so they are audit-exempt under
+/// [`mde_bus::persist::is_auditable`] (the BUS-AUDIT-FLOOD guard), matching the
+/// task's "read verbs audit-exempt":
+///
+/// - `get-heat-detail` — a stack's resources/events/outputs/template (show),
+/// - `get-heat-preview` — a dry-run preview-update diff (no state change),
+/// - `get-heat-reverse` — a reverse-generated HOT from live infra.
+///
+/// The four **mutations** change the cloud and audit (both the auditable Bus
+/// topic + a tracing audit line): `heat-check` (drift stack-check), `heat-create`,
+/// `heat-update`, `heat-delete` (the last three typed-armed at the surface, #22).
+pub const CLOUD_VERBS: [&str; 16] = [
     "get-status",
     "get-catalog",
     "list-services",
@@ -89,7 +102,29 @@ pub const CLOUD_VERBS: [&str; 9] = [
     "instance-stop",
     "instance-reboot",
     "instance-delete",
+    "get-heat-detail",
+    "get-heat-preview",
+    "get-heat-reverse",
+    "heat-check",
+    "heat-create",
+    "heat-update",
+    "heat-delete",
 ];
+
+/// Whether a Heat verb is an audited mutation vs an audit-exempt read.
+///
+/// The mutations `heat-check`/`heat-create`/`heat-update`/`heat-delete` change
+/// the cloud; the reads `get-heat-detail`/`get-heat-preview`/`get-heat-reverse`
+/// do not. Drives the `audited` reply flag + the tracing audit line; the Bus
+/// topic's own hash-chain audit follows [`mde_bus::persist::is_auditable`] (the
+/// read verbs carry the `get-` exempt stem).
+#[must_use]
+pub fn heat_verb_audits(verb: &str) -> bool {
+    matches!(
+        verb,
+        "heat-check" | "heat-create" | "heat-update" | "heat-delete"
+    )
+}
 
 /// The Bus topic for cloud verb `verb`: `action/cloud/<verb>`.
 #[must_use]
@@ -410,6 +445,39 @@ pub fn parse_resource_request(body: &str) -> Result<ResourceListRequest, String>
     serde_json::from_str(trimmed).map_err(|e| format!("bad resource request body: {e}"))
 }
 
+/// The typed request body for the `heat-*` verbs (IAC-4).
+///
+/// Which fields are read depends on the verb: `get-heat-detail` needs `stack`
+/// (id or name); preview/check/update/delete need `stack_name` + `stack_id`;
+/// create needs `stack_name`; preview/create/update carry the `template` buffer;
+/// reverse carries the `services` `(type, collection)` list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HeatRequest {
+    /// The stack id-or-name for a `get-heat-detail` show.
+    pub stack: String,
+    /// The stack name (preview / check / update / delete / create).
+    pub stack_name: String,
+    /// The stack id (preview / check / update / delete).
+    pub stack_id: String,
+    /// The HOT template buffer (preview / create / update).
+    pub template: String,
+    /// The `(service_type, collection)` list to reverse-generate from.
+    pub services: Vec<(String, String)>,
+}
+
+/// Parse a `heat-*` request body into a typed [`HeatRequest`].
+///
+/// # Errors
+/// A human-readable message when the body isn't valid request JSON.
+pub fn parse_heat_request(body: &str) -> Result<HeatRequest, String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Ok(HeatRequest::default());
+    }
+    serde_json::from_str(trimmed).map_err(|e| format!("bad heat request body: {e}"))
+}
+
 /// The unified typed reply published to `reply/<request-ulid>` for every
 /// `action/cloud/*` verb.
 ///
@@ -446,6 +514,18 @@ pub struct CloudReply {
     /// The instance a lifecycle verb acted on, on success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
+    /// `get-heat-detail` — a stack's full detail (IAC-4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heat_detail: Option<HeatStackDetail>,
+    /// `get-heat-preview` — a preview-update dry-run diff (IAC-4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heat_preview: Option<HeatPreview>,
+    /// `get-heat-reverse` — a reverse-generated HOT template (IAC-4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// The stack a Heat mutation acted on / created, on success (IAC-4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stack: Option<String>,
     /// An honest gate reason (the cloud isn't in a state to serve this verb —
     /// doctrine disabled/gated, runtime down, nova not running). Retry later;
     /// nothing was performed.
@@ -470,6 +550,10 @@ impl CloudReply {
             resources: None,
             instances: None,
             instance: None,
+            heat_detail: None,
+            heat_preview: None,
+            template: None,
+            stack: None,
             gated: None,
             error: None,
             audited: false,
@@ -510,6 +594,44 @@ impl CloudReply {
     pub fn resources(verb: &str, table: ResourceTable) -> Self {
         Self {
             resources: Some(table),
+            ..Self::base(verb, true)
+        }
+    }
+
+    /// `get-heat-detail` — one stack's full detail (IAC-4).
+    #[must_use]
+    pub fn heat_detail(verb: &str, detail: HeatStackDetail) -> Self {
+        Self {
+            heat_detail: Some(detail),
+            ..Self::base(verb, true)
+        }
+    }
+
+    /// `get-heat-preview` — a preview-update dry-run diff (IAC-4).
+    #[must_use]
+    pub fn heat_preview(verb: &str, preview: HeatPreview) -> Self {
+        Self {
+            heat_preview: Some(preview),
+            ..Self::base(verb, true)
+        }
+    }
+
+    /// `get-heat-reverse` — a reverse-generated HOT template (IAC-4).
+    #[must_use]
+    pub fn heat_template(verb: &str, template: impl Into<String>) -> Self {
+        Self {
+            template: Some(template.into()),
+            ..Self::base(verb, true)
+        }
+    }
+
+    /// A Heat mutation succeeded on `stack` (`audited` for the change verbs —
+    /// check/create/update/delete, IAC-4/#23).
+    #[must_use]
+    pub fn heat_performed(verb: &str, stack: impl Into<String>, audited: bool) -> Self {
+        Self {
+            stack: Some(stack.into()),
+            audited,
             ..Self::base(verb, true)
         }
     }
@@ -663,6 +785,12 @@ pub fn handle_cloud_request(
         // auth/transport/parse failure is a real failure — never fabricated rows
         // (§7). An empty table is a real "no resources", carried as an ok reply.
         "list-resources" => handle_list_resources(verb, body, client),
+        // IAC-4 — the native Heat control loop (reads + mutations). Same client
+        // seam: an unconfigured node gates, a transport/parse failure is a real
+        // failure, never a fabricated stack/diff/template (§7). The mutations
+        // (check/create/update/delete) audit; the reads do not.
+        "get-heat-detail" | "get-heat-preview" | "get-heat-reverse" | "heat-check"
+        | "heat-create" | "heat-update" | "heat-delete" => handle_heat(verb, body, client),
         "list-instances" => match cloud_gate(state) {
             Err(reason) => CloudReply::gated(verb, reason),
             Ok(()) => match ops.list() {
@@ -757,6 +885,150 @@ fn handle_list_resources(verb: &str, body: &str, client: &dyn CloudClient) -> Cl
         Err(e) if e.is_unconfigured() => CloudReply::gated(verb, e.to_string()),
         Err(e) => CloudReply::failed(verb, e.to_string()),
     }
+}
+
+/// The Heat leg of [`handle_cloud_request`] (IAC-4): parse the typed request,
+/// drive the client's Heat seam for the verb, and answer honestly.
+///
+/// Every verb maps an [`ClientError::Unconfigured`] to a gate (retry once the
+/// cloud is configured) and any other error to a real failure — never a
+/// fabricated stack/diff/template (§7). A performed mutation
+/// (check/create/update/delete) is logged on `mackesd::openstack` and its reply
+/// carries `audited: true` (#23); the request topic itself hash-chains via
+/// [`mde_bus::persist::is_auditable`]. A malformed body / a mutation missing its
+/// stack ref is a typed rejection.
+fn handle_heat(verb: &str, body: &str, client: &dyn CloudClient) -> CloudReply {
+    let req = match parse_heat_request(body) {
+        Ok(r) => r,
+        Err(e) => return CloudReply::rejected(verb, e),
+    };
+    match verb {
+        "get-heat-detail" => {
+            let stack = req.stack.trim();
+            if stack.is_empty() {
+                return CloudReply::rejected(
+                    verb,
+                    "a get-heat-detail request requires a non-empty `stack` (id or name)",
+                );
+            }
+            heat_result(verb, client.heat_show(stack), |detail| {
+                CloudReply::heat_detail(verb, detail)
+            })
+        }
+        "get-heat-preview" => {
+            let Some((name, id)) = require_stack_ref(&req) else {
+                return reject_missing_stack_ref(verb);
+            };
+            heat_result(
+                verb,
+                client.heat_preview(name, id, &req.template),
+                |preview| CloudReply::heat_preview(verb, preview),
+            )
+        }
+        "get-heat-reverse" => heat_result(verb, client.heat_reverse(&req.services), |hot| {
+            CloudReply::heat_template(verb, hot)
+        }),
+        "heat-check" => {
+            let Some((name, id)) = require_stack_ref(&req) else {
+                return reject_missing_stack_ref(verb);
+            };
+            heat_mutation(verb, &format!("{name}/{id}"), client.heat_check(name, id))
+        }
+        "heat-create" => {
+            let name = req.stack_name.trim();
+            if name.is_empty() {
+                return CloudReply::rejected(
+                    verb,
+                    "a heat-create request requires a non-empty `stack_name`",
+                );
+            }
+            match client.heat_create(name, &req.template) {
+                Ok(new_id) => {
+                    let stack = if new_id.is_empty() { name } else { &new_id };
+                    heat_audit_ok(verb, stack, stack.to_string())
+                }
+                Err(e) if e.is_unconfigured() => CloudReply::gated(verb, e.to_string()),
+                Err(e) => CloudReply::failed(verb, e.to_string()),
+            }
+        }
+        "heat-update" => {
+            let Some((name, id)) = require_stack_ref(&req) else {
+                return reject_missing_stack_ref(verb);
+            };
+            heat_mutation(
+                verb,
+                &format!("{name}/{id}"),
+                client.heat_update(name, id, &req.template),
+            )
+        }
+        "heat-delete" => {
+            let Some((name, id)) = require_stack_ref(&req) else {
+                return reject_missing_stack_ref(verb);
+            };
+            heat_mutation(verb, &format!("{name}/{id}"), client.heat_delete(name, id))
+        }
+        other => CloudReply::rejected(verb, format!("unknown heat verb: {other}")),
+    }
+}
+
+/// The `(stack_name, stack_id)` a Heat verb targets, or `None` when either is
+/// empty (the canonical Heat URL needs both).
+fn require_stack_ref(req: &HeatRequest) -> Option<(&str, &str)> {
+    let name = req.stack_name.trim();
+    let id = req.stack_id.trim();
+    (!name.is_empty() && !id.is_empty()).then_some((name, id))
+}
+
+/// The typed rejection for a Heat verb whose `stack_name` + `stack_id` isn't
+/// fully specified.
+fn reject_missing_stack_ref(verb: &str) -> CloudReply {
+    CloudReply::rejected(
+        verb,
+        "this heat verb requires a non-empty `stack_name` + `stack_id`",
+    )
+}
+
+/// Fold a Heat read result into a reply: `ok` → the payload reply, an
+/// unconfigured error → a gate, any other error → a failure.
+fn heat_result<T>(
+    verb: &str,
+    result: Result<T, super::client::ClientError>,
+    ok: impl FnOnce(T) -> CloudReply,
+) -> CloudReply {
+    match result {
+        Ok(v) => ok(v),
+        Err(e) if e.is_unconfigured() => CloudReply::gated(verb, e.to_string()),
+        Err(e) => CloudReply::failed(verb, e.to_string()),
+    }
+}
+
+/// Fold a Heat mutation result (check/update/delete) into a reply, auditing a
+/// performed op (#23).
+fn heat_mutation(
+    verb: &str,
+    stack: &str,
+    result: Result<(), super::client::ClientError>,
+) -> CloudReply {
+    match result {
+        Ok(()) => heat_audit_ok(verb, stack, stack.to_string()),
+        Err(e) if e.is_unconfigured() => CloudReply::gated(verb, e.to_string()),
+        Err(e) => CloudReply::failed(verb, e.to_string()),
+    }
+}
+
+/// Log a performed Heat mutation on `mackesd::openstack` (audited, #23) and build
+/// the ok reply. `audited` follows [`heat_verb_audits`] (every mutation audits).
+fn heat_audit_ok(verb: &str, stack_ref: &str, reply_stack: String) -> CloudReply {
+    let audited = heat_verb_audits(verb);
+    if audited {
+        tracing::info!(
+            target: "mackesd::openstack",
+            verb,
+            stack = stack_ref,
+            "performed Heat mutation (audited)"
+        );
+    }
+    CloudReply::heat_performed(verb, reply_stack, audited)
 }
 
 /// Drain net-new `action/cloud/*` requests and answer each on `reply/<ulid>`.
@@ -877,6 +1149,21 @@ mod tests {
                 mde_bus::persist::is_auditable(&t),
                 "lifecycle verb {mutation} must audit"
             );
+        }
+        // IAC-4 — the Heat reads carry the `get-` exempt stem; the mutations audit.
+        for read in ["get-heat-detail", "get-heat-preview", "get-heat-reverse"] {
+            assert!(
+                !mde_bus::persist::is_auditable(&cloud_action_topic(read)),
+                "heat read {read} must be audit-exempt (BUS-AUDIT-FLOOD)"
+            );
+            assert!(!heat_verb_audits(read), "{read} is a read");
+        }
+        for mutation in ["heat-check", "heat-create", "heat-update", "heat-delete"] {
+            assert!(
+                mde_bus::persist::is_auditable(&cloud_action_topic(mutation)),
+                "heat mutation {mutation} must audit"
+            );
+            assert!(heat_verb_audits(mutation), "{mutation} is a mutation");
         }
     }
 
@@ -1077,6 +1364,198 @@ mod tests {
         );
         assert!(!no_coll.ok);
         assert!(no_coll.error.expect("error").contains("collection"));
+    }
+
+    // ── IAC-4: the Heat control loop drives the client seam / honest-degrades ──
+
+    fn sample_heat_detail() -> HeatStackDetail {
+        HeatStackDetail::from_stack_json(
+            r#"{"stack":{"id":"s-1","stack_name":"mesh-net","stack_status":"CREATE_COMPLETE"}}"#,
+        )
+        .unwrap()
+        .with_resources_json(
+            r#"{"resources":[{"resource_name":"net","resource_type":"OS::Neutron::Net","resource_status":"CREATE_COMPLETE"}]}"#,
+        )
+    }
+
+    #[test]
+    fn heat_get_detail_returns_the_detail_from_the_client() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        let cat = FakeCatalogSource::ok(ServiceCatalog::default(), vec![])
+            .with_heat_detail(sample_heat_detail());
+        let reply = handle_cloud_request(
+            "get-heat-detail",
+            r#"{"stack":"mesh-net"}"#,
+            &state,
+            &ops,
+            &cat,
+        );
+        assert!(reply.ok);
+        let detail = reply.heat_detail.expect("detail");
+        assert_eq!(detail.stack_name, "mesh-net");
+        assert_eq!(detail.resources.len(), 1);
+        assert!(!reply.audited, "a read is never audited");
+        assert_eq!(cat.heat_calls(), vec!["show:mesh-net".to_string()]);
+    }
+
+    #[test]
+    fn heat_get_detail_rejects_an_empty_stack_and_gates_when_unconfigured() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        // No stack ref → typed rejection (never a fabricated stack).
+        let bad = handle_cloud_request(
+            "get-heat-detail",
+            "{}",
+            &state,
+            &ops,
+            &FakeCatalogSource::ok(ServiceCatalog::default(), vec![]),
+        );
+        assert!(!bad.ok && bad.error.expect("error").contains("stack"));
+        // Unconfigured node → a gate, not a failure.
+        let gated = handle_cloud_request(
+            "get-heat-detail",
+            r#"{"stack":"x"}"#,
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
+        assert!(!gated.ok && gated.gated.expect("gated").contains("clouds.yaml"));
+    }
+
+    #[test]
+    fn heat_get_preview_returns_a_diff_and_needs_a_stack_ref() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        let preview = HeatPreview {
+            added: vec!["new".into()],
+            ..HeatPreview::default()
+        };
+        let cat =
+            FakeCatalogSource::ok(ServiceCatalog::default(), vec![]).with_heat_preview(preview);
+        let reply = handle_cloud_request(
+            "get-heat-preview",
+            r#"{"stack_name":"mesh-net","stack_id":"s-1","template":"heat_template_version: 2021-04-16"}"#,
+            &state,
+            &ops,
+            &cat,
+        );
+        assert!(reply.ok);
+        assert_eq!(reply.heat_preview.expect("preview").change_count(), 1);
+        assert!(!reply.audited, "a dry-run preview is not audited");
+        assert_eq!(cat.heat_calls(), vec!["preview:mesh-net/s-1".to_string()]);
+        // Missing stack ref → rejection.
+        let bad = handle_cloud_request(
+            "get-heat-preview",
+            r#"{"stack_name":"mesh-net"}"#,
+            &state,
+            &ops,
+            &FakeCatalogSource::ok(ServiceCatalog::default(), vec![]),
+        );
+        assert!(!bad.ok && bad.error.expect("error").contains("stack_id"));
+    }
+
+    #[test]
+    fn heat_get_reverse_returns_a_generated_hot() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        let cat = FakeCatalogSource::ok(ServiceCatalog::default(), vec![])
+            .with_heat_reverse("heat_template_version: 2021-04-16\nresources: {}\n");
+        let reply = handle_cloud_request(
+            "get-heat-reverse",
+            r#"{"services":[["compute","servers/detail"]]}"#,
+            &state,
+            &ops,
+            &cat,
+        );
+        assert!(reply.ok);
+        assert!(reply
+            .template
+            .expect("template")
+            .contains("heat_template_version"));
+        assert!(!reply.audited);
+        assert_eq!(cat.heat_calls(), vec!["reverse:1".to_string()]);
+    }
+
+    #[test]
+    fn heat_mutations_perform_and_audit_and_are_rejected_without_a_ref() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        for (verb, want) in [
+            ("heat-check", "check:mesh-net/s-1"),
+            ("heat-update", "update:mesh-net/s-1"),
+            ("heat-delete", "delete:mesh-net/s-1"),
+        ] {
+            let cat = FakeCatalogSource::ok(ServiceCatalog::default(), vec![]);
+            let reply = handle_cloud_request(
+                verb,
+                r#"{"stack_name":"mesh-net","stack_id":"s-1","template":"x"}"#,
+                &state,
+                &ops,
+                &cat,
+            );
+            assert!(reply.ok, "{verb}");
+            assert!(reply.audited, "{verb} is an audited mutation (#23)");
+            assert_eq!(reply.stack.as_deref(), Some("mesh-net/s-1"), "{verb}");
+            assert_eq!(cat.heat_calls(), vec![want.to_string()], "{verb}");
+        }
+        // A mutation missing its stack ref is a typed rejection (never a blind op).
+        let bad = handle_cloud_request(
+            "heat-delete",
+            "{}",
+            &state,
+            &ops,
+            &FakeCatalogSource::ok(ServiceCatalog::default(), vec![]),
+        );
+        assert!(!bad.ok && bad.error.expect("error").contains("stack"));
+    }
+
+    #[test]
+    fn heat_create_needs_a_name_audits_and_returns_the_new_id() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        let cat = FakeCatalogSource::ok(ServiceCatalog::default(), vec![])
+            .with_resources(ResourceTable::default());
+        // The fake's heat mutation answers an empty id → the reply falls back to
+        // the name; drive create with a name + template.
+        let reply = handle_cloud_request(
+            "heat-create",
+            r#"{"stack_name":"fresh","template":"heat_template_version: 2021-04-16"}"#,
+            &state,
+            &ops,
+            &cat,
+        );
+        assert!(reply.ok && reply.audited);
+        assert_eq!(reply.stack.as_deref(), Some("fresh"));
+        assert_eq!(cat.heat_calls(), vec!["create:fresh".to_string()]);
+        // No name → rejection.
+        let bad = handle_cloud_request(
+            "heat-create",
+            r#"{"template":"x"}"#,
+            &state,
+            &ops,
+            &FakeCatalogSource::ok(ServiceCatalog::default(), vec![]),
+        );
+        assert!(!bad.ok && bad.error.expect("error").contains("stack_name"));
+    }
+
+    #[test]
+    fn a_heat_mutation_is_failed_not_gated_on_a_real_error() {
+        // §7 — a real transport failure is a failure, not a gate; nothing faked.
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        let cat = FakeCatalogSource::failing(
+            crate::workers::openstack::client::ClientError::Transport("HTTP 409".into()),
+        );
+        let reply = handle_cloud_request(
+            "heat-delete",
+            r#"{"stack_name":"n","stack_id":"i"}"#,
+            &state,
+            &ops,
+            &cat,
+        );
+        assert!(!reply.ok && reply.gated.is_none());
+        assert!(reply.error.expect("error").contains("409"));
     }
 
     // ── list-instances drives the real seam / honest-gates ──

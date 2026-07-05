@@ -36,6 +36,7 @@
 
 pub mod config;
 pub mod health;
+pub mod heat;
 pub mod keystone;
 pub mod resource;
 #[cfg(test)]
@@ -43,7 +44,9 @@ pub(crate) mod testkit;
 
 use std::sync::Arc;
 
-use mackes_mesh_types::openstack::{ResourceTable, ServiceCatalog, ServiceHealth};
+use mackes_mesh_types::openstack::{
+    HeatPreview, HeatStackDetail, ResourceTable, ServiceCatalog, ServiceHealth,
+};
 
 use config::CloudConfig;
 use health::{probe_service_health, EndpointProbe, HttpProbe};
@@ -132,16 +135,85 @@ pub trait ResourceSource {
     ) -> Result<ResourceTable, ClientError>;
 }
 
-/// The unified `OpenStack` client seam the cloud-verb responder ([`super::verbs`])
-/// drives — the catalog+health read **and** the per-service resource list as one
-/// injected object.
+/// The seam the IAC-4 `action/cloud/heat-*` verbs drive — the native Heat
+/// (`OpenStack` orchestration) control loop (design #5/#6).
 ///
-/// A single seam threads the drain (IAC-1's §6 glue). Blanket-implemented for
-/// anything that is both a [`CatalogSource`] and a [`ResourceSource`]: production
-/// [`LiveOpenStack`], tests [`testkit::FakeCatalogSource`].
-pub trait CloudClient: CatalogSource + ResourceSource + Send + Sync {}
+/// Shows a stack's detail, preview-updates (dry-run diff), stack-checks (drift),
+/// creates / updates / deletes a stack, and reverse-generates a HOT template from
+/// live infra. Every op reuses IAC-1's [`ResourceApi`]/[`keystone::Session`] seam over the
+/// standard Heat REST API. Production: [`LiveOpenStack`]; tests inject
+/// [`testkit::FakeCatalogSource`]. Each degrades honestly — an unconfigured node
+/// gates ([`ClientError::Unconfigured`]), an auth/transport/parse failure is a
+/// typed error, never a fabricated stack/diff/template (§7).
+pub trait HeatSource {
+    /// Show a stack's full detail (status / resources / events / outputs /
+    /// template) for the stack referenced by id or name.
+    ///
+    /// # Errors
+    /// [`ClientError::Unconfigured`] (gate) or a typed [`ClientError`].
+    fn heat_show(&self, stack: &str) -> Result<HeatStackDetail, ClientError>;
 
-impl<T: CatalogSource + ResourceSource + Send + Sync> CloudClient for T {}
+    /// Preview a template update as a Heat `preview_update` — the dry-run diff of
+    /// what applying `template` to the named stack *would* change.
+    ///
+    /// # Errors
+    /// [`ClientError::Unconfigured`] (gate) or a typed [`ClientError`].
+    fn heat_preview(
+        &self,
+        stack_name: &str,
+        stack_id: &str,
+        template: &str,
+    ) -> Result<HeatPreview, ClientError>;
+
+    /// Trigger a Heat `stack-check` on the stack (surfaces drift).
+    ///
+    /// # Errors
+    /// [`ClientError::Unconfigured`] (gate) or a typed [`ClientError`].
+    fn heat_check(&self, stack_name: &str, stack_id: &str) -> Result<(), ClientError>;
+
+    /// Create a stack from a HOT `template`; returns the new stack's id.
+    ///
+    /// # Errors
+    /// [`ClientError::Unconfigured`] (gate) or a typed [`ClientError`].
+    fn heat_create(&self, stack_name: &str, template: &str) -> Result<String, ClientError>;
+
+    /// Update a stack in place with a new HOT `template`.
+    ///
+    /// # Errors
+    /// [`ClientError::Unconfigured`] (gate) or a typed [`ClientError`].
+    fn heat_update(
+        &self,
+        stack_name: &str,
+        stack_id: &str,
+        template: &str,
+    ) -> Result<(), ClientError>;
+
+    /// Delete a stack.
+    ///
+    /// # Errors
+    /// [`ClientError::Unconfigured`] (gate) or a typed [`ClientError`].
+    fn heat_delete(&self, stack_name: &str, stack_id: &str) -> Result<(), ClientError>;
+
+    /// Reverse-generate a HOT template from the live discovered resources of
+    /// `services` (a `(service_type, collection)` list) — capture reality as code.
+    ///
+    /// # Errors
+    /// [`ClientError::Unconfigured`] (gate) or a typed [`ClientError`].
+    fn heat_reverse(&self, services: &[(String, String)]) -> Result<String, ClientError>;
+}
+
+/// The unified `OpenStack` client seam the cloud-verb responder
+/// ([`super::verbs`]) drives, as one injected object.
+///
+/// It threads the catalog+health read, the per-service resource list, **and**
+/// the Heat control loop (IAC-4) through one drain (IAC-1's §6 glue).
+/// Blanket-implemented for
+/// anything that is a [`CatalogSource`], a [`ResourceSource`], and a
+/// [`HeatSource`]: production [`LiveOpenStack`], tests
+/// [`testkit::FakeCatalogSource`].
+pub trait CloudClient: CatalogSource + ResourceSource + HeatSource + Send + Sync {}
+
+impl<T: CatalogSource + ResourceSource + HeatSource + Send + Sync> CloudClient for T {}
 
 /// The composed client: a resolved [`CloudConfig`] + the auth & probe seams.
 ///
