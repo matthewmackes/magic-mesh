@@ -151,22 +151,24 @@ fn accumulate_osd_idle<E: MediaEngine>(ctx: &Context, controller: &mut MediaCont
 
 // ── header ───────────────────────────────────────────────────────────────────────
 
-/// The header strip: the app title, the tab bar, the now-playing summary, and the
-/// fullscreen / mini-player toggles.
+/// The header strip: the shared MENUBAR-ALL top bar over the sub-view tab bar.
+///
+/// The bar (MENUBAR-ALL-media) renders the UPPERCASE `MEDIA` title, the
+/// File/View/Playback/Audio/Subtitles/Cast menus, and the live now-playing / time /
+/// output status cluster; it surfaces **all** of the surface's controls incl. the
+/// advanced transport (the governing principle), every item a real seam (§7). The
+/// fullscreen / mini-player toggles now live in its View menu (checkmarked) and the
+/// now-playing read-out in its status cluster, so the header carries only the primary
+/// Sources/Library/Player/Queue nav below the bar.
 pub fn media_header<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaController<E>) {
+    // The shared top bar (MENUBAR-ALL-1): title · menus · status cluster.
+    crate::menubar::menu_bar(ui, controller);
     ui.add_space(Style::SP_XS);
-    let mut chosen_tab = controller.ui().tab;
-    let mut toggle_pip = false;
-    let mut toggle_fullscreen = false;
 
+    // The primary in-surface nav — also reachable from the bar's View menu.
+    let mut chosen_tab = controller.ui().tab;
     ui.horizontal(|ui| {
         ui.add_space(Style::SP_S);
-        ui.heading(
-            RichText::new("Media")
-                .size(Style::HEADING)
-                .color(Style::TEXT),
-        );
-        ui.add_space(Style::SP_M);
         for tab in MediaTab::all() {
             if ui
                 .selectable_label(controller.ui().tab == tab, tab.label())
@@ -175,51 +177,9 @@ pub fn media_header<E: MediaEngine>(ui: &mut egui::Ui, controller: &mut MediaCon
                 chosen_tab = tab;
             }
         }
-
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add_space(Style::SP_S);
-            let pip_label = if controller.ui().pip {
-                "Mini-player ✓"
-            } else {
-                "Mini-player"
-            };
-            if ui.button(pip_label).clicked() {
-                toggle_pip = true;
-            }
-            let fs_label = if controller.ui().fullscreen {
-                "Exit fullscreen"
-            } else {
-                "Fullscreen"
-            };
-            if ui.button(fs_label).clicked() {
-                toggle_fullscreen = true;
-            }
-            ui.add_space(Style::SP_M);
-            // A live state dot + the now-playing title.
-            let dot = match controller.player().state() {
-                PlayerState::Playing => Style::OK,
-                PlayerState::Paused | PlayerState::Loading => Style::WARN,
-                PlayerState::Idle | PlayerState::Stopped | PlayerState::Ended => Style::TEXT_DIM,
-            };
-            status_dot(ui, dot);
-            ui.label(
-                RichText::new(now_playing_title(controller.player()))
-                    .size(Style::BODY)
-                    .color(Style::ACCENT),
-            );
-        });
     });
     ui.add_space(Style::SP_XS);
-
     controller.ui_mut().tab = chosen_tab;
-    if toggle_pip {
-        let now = controller.ui().pip;
-        controller.ui_mut().pip = !now;
-    }
-    if toggle_fullscreen {
-        let now = controller.ui().fullscreen;
-        controller.ui_mut().fullscreen = !now;
-    }
 }
 
 // ── central panel router ───────────────────────────────────────────────────────────
