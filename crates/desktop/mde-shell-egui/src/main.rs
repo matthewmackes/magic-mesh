@@ -51,6 +51,7 @@ mod storage;
 mod surface_card;
 mod system;
 mod thisnode;
+mod timers;
 mod toast_bridge;
 mod tray;
 mod vdi;
@@ -271,6 +272,12 @@ struct Shell {
     /// the shell auto-opens the Mesh Map. The receive half of a flow whose publish
     /// half is integration-gated, exactly like the VDI / Browser transports.
     self_test: mesh_view::SelfTestWatch,
+    /// The Timers & Alarms store (VDOCK-5) — countdown timers + daily alarms,
+    /// owned by the SHELL (not the panel) and ticked once per frame, so a due
+    /// timer/alarm fires its `event/notify/timer` notification even while the
+    /// surface is closed (the clock's replacement, design lock #16/#20). The
+    /// dock's clock-glyph strip opens `Surface::Timers` to edit it.
+    timers: timers::TimersState,
     /// The POWER-5 idle + lid honorer — the compositorless DRM shell's own
     /// swayidle/logind-lid replacement. Ticked once per frame; enforces the
     /// operator's idle-suspend timeout + lid-close action (read from the System
@@ -335,6 +342,7 @@ impl Shell {
             mesh_view: mesh_view::MeshViewState::default(),
             explorer: explorer::ExplorerState::default(),
             self_test: mesh_view::SelfTestWatch::default(),
+            timers: timers::TimersState::default(),
             power_honor: power_honor::PowerHonor::default(),
             curtain: curtain::Curtain::pam(),
             lock_signal: lock_signal::LogindLockSource::new(ctx),
@@ -707,6 +715,18 @@ impl Shell {
                 let dm = &mut self.device_manager;
                 ui.push_id("shell-about", |ui| dm.show(ui));
             }
+            Surface::Timers => {
+                // Timers & Alarms (VDOCK-5) — a pure renderer over the
+                // shell-owned store `render` ticks every frame, so a countdown
+                // never depends on this panel being open (the design's "Timers
+                // reliability" lock). Opened by the dock's clock-glyph strip
+                // (lock #20); scoped under its own `push_id` like every mounted
+                // surface.
+                let timers = &mut self.timers;
+                ui.push_id("shell-timers", |ui| {
+                    timers::timers_panel(ui, timers);
+                });
+            }
         }
     }
 }
@@ -895,6 +915,13 @@ impl Shell {
         if self.power_honor.tick(ctx, &self.system) {
             self.curtain.lock();
         }
+
+        // VDOCK-5 — the Timers & Alarms tick (the power_honor idiom): one call
+        // per frame evaluates the shell-owned countdown timers + daily alarms
+        // and fires each due one onto the CHAT-FIX-2 `event/notify/timer` lane —
+        // surface open or closed. It self-schedules the next wakeup, so a due
+        // alarm rings without input even on the idle DRM seat.
+        self.timers.tick(ctx);
 
         // CURTAIN-3 — logind session Lock/Unlock: drain the listener's forwarded
         // signals and route them (`loginctl lock-session` drops the curtain; an

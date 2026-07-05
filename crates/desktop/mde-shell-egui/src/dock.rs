@@ -18,8 +18,10 @@
 //! horizontal accent label + a left-rail accent stripe over its 24px brand glyph
 //! cells (in [`Surface::ALL`] order). The active cell wears a **left-edge accent
 //! bar** + the subtle selection wash; hover is a fill only — no per-icon captions,
-//! no tooltips anywhere. Beneath the picker sit VDOCK-3's bottom **status quads**
-//! and VDOCK-4's **system quad** (Settings · Show-Desktop · Lock · Power).
+//! no tooltips anywhere. Beneath the picker sit VDOCK-5's **clock strip** (the
+//! live HH:MM glyph that opens Timers & Alarms, lock #20), VDOCK-3's bottom
+//! **status quads**, and VDOCK-4's **system quad** (Settings · Show-Desktop ·
+//! Lock · Power).
 //!
 //! The dock is pure chrome: it reads + writes the active [`Surface`] and draws
 //! through the shared [`Style`] (§4). It never builds or drives a surface — the
@@ -111,6 +113,12 @@ pub enum Surface {
     /// and the shipped legal docs + source URL. A pure renderer of the
     /// [`mde_theme::brand`] constants (`crate::about`).
     About,
+    /// The **Timers & Alarms** surface (VDOCK-5, locks #5/#16/#20) — the clock's
+    /// replacement: countdown timers + daily alarms whose firings ride the
+    /// CHAT-FIX-2 `event/notify/timer` lane (`crate::timers`). Deliberately NOT
+    /// in [`Surface::ALL`]/the picker: its one home is the dock's clock-glyph
+    /// cell ([`clock_cell`] — the live time IS the glyph, lock #20).
+    Timers,
 }
 
 // This nav enum spells its variants `Surface::Music` rather than `Self::Music` on
@@ -177,7 +185,11 @@ impl Surface {
             // The About surface wears the product **mark** — the mesh-node
             // constellation glyph that IS the platform identity — fitting the
             // "about this platform" screen and distinct from every surface glyph.
-            Surface::About => IconId::Mark,
+            // Timers shares the arm for exhaustiveness ONLY (lock #20): its dock
+            // affordance is the LIVE TIME painted as text by [`clock_cell`]
+            // ("shows the time as its glyph"), never a brand SVG, and it sits
+            // outside `ALL`/the picker — no picker cell ever asks for this glyph.
+            Surface::About | Surface::Timers => IconId::Mark,
         }
     }
 }
@@ -759,10 +771,10 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
     // Media), each a horizontal accent label (#4) + a left-rail accent stripe +
     // accent divider (#21) over its icon-only 24px cells (#11/#23) in Surface::ALL
     // order (#3). The zone is bounded above the BOTTOM_ZONE_H band reserved for
-    // VDOCK-3/4's status + system quads; groups that overrun it fold into the '…'
-    // more-popup (#22).
+    // VDOCK-5's clock strip + VDOCK-3/4's status + system quads; groups that
+    // overrun it fold into the '…' more-popup (#22).
     // NODE-GRADE-2 — the per-node grade mini-list claims a band directly ABOVE the
-    // status quads (a new zone between the app groups and VDOCK-3), so the app zone
+    // bottom zone (between the app groups and the clock strip), so the app zone
     // now ends at the grade band's top. An empty grade set claims 0 (the band
     // vanishes and the groups reclaim the space, so pre-poll the layout is unchanged).
     let quads_top_zone = rect.bottom() - BOTTOM_ZONE_H;
@@ -801,17 +813,23 @@ fn paint_dock_frame(ui: &egui::Ui, rect: egui::Rect, state: &mut DockState) -> b
         clicked = true;
     }
 
-    // ── BOTTOM zone (VDOCK-3/4 → design #6/#7/#8/#15/#17/#18/#19) — the last
-    // BOTTOM_ZONE_H of the column holds three stacked DOCK_W quads: quad 1
-    // Chat[badge]·BT·Vol·Batt over quad 2 Status·Signal·Peers·Sessions (VDOCK-3),
-    // then the VDOCK-4 **system quad** Settings·Show-Desktop·Lock·Power in the final
-    // DOCK_W row. The status cells route to their owning surface (no flyouts, #15)
-    // with the Chat unread badge (#19); the system cells route/act (Settings→System,
-    // Show-Desktop→Desktop, Lock→curtain, Power→the armed menu, #18). The status
-    // quads fold the shell-fed StatusInputs — the honest pre-poll dim state until
-    // `set_status_inputs` lands (§7). `active` is copied out so the immutable borrow
-    // of `state.status` (the TrayInputs view) releases before it's written back.
-    let quads_top = rect.bottom() - BOTTOM_ZONE_H;
+    // ── BOTTOM zone (VDOCK-3/4/5 → design #6/#7/#8/#15/#16/#17/#18/#19/#20) —
+    // the last BOTTOM_ZONE_H of the column: VDOCK-5's **clock strip** (the live
+    // HH:MM glyph that routes to Timers & Alarms, lock #20), then three stacked
+    // DOCK_W quads: quad 1 Chat[badge]·BT·Vol·Batt over quad 2
+    // Status·Signal·Peers·Sessions (VDOCK-3), then the VDOCK-4 **system quad**
+    // Settings·Show-Desktop·Lock·Power in the final DOCK_W row. The status cells
+    // route to their owning surface (no flyouts, #15) with the Chat unread badge
+    // (#19); the system cells route/act (Settings→System, Show-Desktop→Desktop,
+    // Lock→curtain, Power→the armed menu, #18). The status quads fold the
+    // shell-fed StatusInputs — the honest pre-poll dim state until
+    // `set_status_inputs` lands (§7). `active` is copied out so the immutable
+    // borrow of `state.status` (the TrayInputs view) releases before it's
+    // written back.
+    let quads_top = rect.bottom() - STATUS_SYS_H;
+    if clock_cell(ui, egui::pos2(rect.left(), quads_top - CLOCK_CELL_H), state) {
+        clicked = true;
+    }
     let mut active = state.active;
     let quads_routed = {
         let inputs = TrayInputs {
@@ -879,6 +897,65 @@ fn pin_toggle(ui: &egui::Ui, cell: egui::Rect, state: &mut DockState) -> bool {
     false
 }
 
+/// The stable id of the clock strip (VDOCK-5), so tests read its settled `Rect`.
+fn clock_cell_id() -> egui::Id {
+    egui::Id::new("vdock-clock")
+}
+
+/// The **clock strip** (VDOCK-5, locks #16/#20) — the status cell whose glyph IS
+/// the live wall-clock `HH:MM` (painted text through the crate's one clock fold,
+/// `crate::timers::hhmm` — the brand set has no clock glyph and the design wants
+/// the *time* read as the icon). It reads as a clock and routes to the **Timers
+/// & Alarms** surface on click (`Surface::Timers`), wearing the same selection
+/// wash + left-edge accent bar as an app cell (#10). Every colour is a Style
+/// token (§4). Self-schedules a repaint at the next minute rollover so the
+/// painted minute is never stale. Returns `true` on a route.
+fn clock_cell(ui: &egui::Ui, origin: egui::Pos2, state: &mut DockState) -> bool {
+    let rect = egui::Rect::from_min_size(origin, egui::vec2(DOCK_W, CLOCK_CELL_H));
+    let resp = ui.interact(rect, clock_cell_id(), egui::Sense::click());
+    let selected = state.active == Surface::Timers;
+    let hovered = resp.hovered();
+    let painter = ui.painter().clone();
+    if selected {
+        painter.rect_filled(rect, Style::RADIUS, ui.visuals().selection.bg_fill);
+    } else if hovered {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    if selected {
+        let bar =
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(ACTIVE_BAR_W, rect.height()));
+        painter.rect_filled(bar, egui::CornerRadius::ZERO, Style::ACCENT);
+    }
+    // The pick_app_cell two-tone: active reads ACCENT, hover brightens to TEXT,
+    // rest sits dim — the time digits ARE the glyph (lock #20).
+    let tint = if selected {
+        Style::ACCENT
+    } else if hovered {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    let now = crate::timers::now_unix();
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        crate::timers::hhmm(now),
+        egui::FontId::proportional(Style::SMALL),
+        tint,
+    );
+    // Wake at the next minute rollover so the glyph never shows a stale minute
+    // (cheap: egui keeps only the earliest scheduled repaint).
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_secs(
+            crate::timers::secs_to_next_minute(now).max(1),
+        ));
+    if resp.clicked() {
+        state.active = Surface::Timers;
+        return true;
+    }
+    false
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // VDOCK-2 — the vertical **app picker** (fills the dock's TOP + MIDDLE zones;
 // design `docs/design/vertical-dock.md`, locks #2/#3/#4/#10/#11/#21/#22/#23).
@@ -920,11 +997,20 @@ const ACTIVE_BAR_W: f32 = Style::SP_XS;
 /// the app zone. `SP_L`.
 const OVERFLOW_H: f32 = Style::SP_L;
 
-/// The bottom band reserved for VDOCK-3/4's stacked status quads + system quad
-/// (design #8) — three quad rows (~`DOCK_W` each). VDOCK-2 bounds the middle app
-/// zone above it and leaves it empty; sizing the middle against this reserve makes
-/// the '…' overflow (#22) real on a short screen. VDOCK-3/4 fill the band.
-const BOTTOM_ZONE_H: f32 = 3.0 * DOCK_W;
+/// The **clock strip** height (VDOCK-5, lock #20) — one `SP_XL` row atop the
+/// bottom zone whose glyph IS the live `HH:MM` ([`clock_cell`]); clicking it
+/// opens the Timers & Alarms surface. The same `APP_CELL_H` module.
+const CLOCK_CELL_H: f32 = Style::SP_XL;
+
+/// The status/system rows of the bottom zone — VDOCK-3's two stacked status
+/// quads + VDOCK-4's system quad (~`DOCK_W` each).
+const STATUS_SYS_H: f32 = 3.0 * DOCK_W;
+
+/// The bottom band reserved beneath the app zone (design #8): VDOCK-5's clock
+/// strip over VDOCK-3/4's three quad rows ([`STATUS_SYS_H`]). VDOCK-2 bounds the
+/// middle app zone above it and leaves it empty; sizing the middle against this
+/// reserve makes the '…' overflow (#22) real on a short screen.
+const BOTTOM_ZONE_H: f32 = CLOCK_CELL_H + STATUS_SYS_H;
 
 /// The stable per-surface id of a vertical-picker cell — the render + routing are
 /// unchanged, but tests read a cell's settled `Rect` back to click its exact
@@ -2030,10 +2116,11 @@ fn power_arming_stage(ui: &mut egui::Ui, power: &mut PowerMenu) -> Option<PowerI
 #[cfg(test)]
 mod tests {
     use super::{
-        dock, grade_band_height, grade_overflow_id, grade_row_id, group_height, gutter_width,
-        overflow_more_id, pick_cell_id, power_item_id, sys_cell_id, visible_group_count,
-        DockRequest, DockState, PowerItem, PowerMenu, Surface, SysCell, CELL_W, DOCK_AREA, DOCK_W,
-        GRADE_MAX_ROWS, GROUPS, ICON_LOGICAL, PIN_STRIP_H, POWER_MENU, SYSTEM_QUAD, SYS_QUAD_ICON,
+        clock_cell_id, dock, grade_band_height, grade_overflow_id, grade_row_id, group_height,
+        gutter_width, overflow_more_id, pick_cell_id, power_item_id, sys_cell_id,
+        visible_group_count, DockRequest, DockState, PowerItem, PowerMenu, Surface, SysCell,
+        BOTTOM_ZONE_H, CELL_W, DOCK_AREA, DOCK_W, GRADE_MAX_ROWS, GROUPS, ICON_LOGICAL,
+        PIN_STRIP_H, POWER_MENU, STATUS_SYS_H, SYSTEM_QUAD, SYS_QUAD_ICON,
     };
     use crate::chrome::{GradeRow, GradeTrend, MeshSummary, NodeGrades};
     use mde_egui::egui;
@@ -2563,7 +2650,9 @@ mod tests {
         Style::install(&ctx);
         let mut s = DockState::default();
         s.toggle(); // reveal the dock so its Area (and cells) mount
-        let sz = egui::vec2(1280.0, 800.0);
+                    // Tall enough that all six groups render inline above the bottom zone
+                    // (which VDOCK-5's clock strip grew by CLOCK_CELL_H).
+        let sz = egui::vec2(1280.0, 900.0);
         // Prime so every stable-id cell rect is registered + settled.
         drive_vdock(&ctx, &mut s, Vec::new(), sz);
         drive_vdock(&ctx, &mut s, Vec::new(), sz);
@@ -2607,7 +2696,8 @@ mod tests {
         Style::install(&ctx);
         let mut s = DockState::default();
         s.toggle();
-        let sz = egui::vec2(1280.0, 800.0);
+        // Tall enough for all six groups inline over the clock-grown bottom zone.
+        let sz = egui::vec2(1280.0, 900.0);
         drive_vdock(&ctx, &mut s, Vec::new(), sz);
         drive_vdock(&ctx, &mut s, Vec::new(), sz);
 
@@ -2637,12 +2727,13 @@ mod tests {
     fn the_group_labels_paint_horizontally_in_their_group_accent() {
         // #4 — each group carries ONE horizontal (angle 0) accent label above its
         // cells, painted in that group's Style accent token; on a tall screen all
-        // six render inline with no '…' overflow.
+        // six render inline with no '…' overflow. The only other text in the
+        // column is VDOCK-5's clock glyph (the live HH:MM, dim — lock #20).
         let ctx = egui::Context::default();
         Style::install(&ctx);
         let mut s = DockState::default();
         s.toggle();
-        let sz = egui::vec2(1280.0, 800.0);
+        let sz = egui::vec2(1280.0, 900.0);
         // Prime a frame, then capture over an EMPTY surface so the only text is the
         // dock's group labels (no stand-in button caption to filter out).
         drive_vdock(&ctx, &mut s, Vec::new(), sz);
@@ -2658,22 +2749,34 @@ mod tests {
         for clipped in &out.shapes {
             collect_text_shapes(&clipped.shape, &mut texts);
         }
-        assert_eq!(
-            texts.len(),
-            GROUPS.len(),
-            "exactly one label per group, nothing else (no captions, no '…' at this height)"
-        );
         let accents: Vec<egui::Color32> = GROUPS.iter().map(|g| g.accent).collect();
-        for (angle, color) in texts {
+        let (labels, rest): (Vec<_>, Vec<_>) = texts
+            .into_iter()
+            .partition(|(_, color)| accents.contains(color));
+        assert_eq!(
+            labels.len(),
+            GROUPS.len(),
+            "exactly one accent label per group (no captions, no '…' at this height)"
+        );
+        for (angle, _) in labels {
             assert!(
                 angle.abs() < 1e-3,
                 "the vertical dock's labels read HORIZONTALLY (angle 0), got {angle}"
             );
-            assert!(
-                accents.contains(&color),
-                "a group label is painted in its group accent, got {color:?}"
-            );
         }
+        // The one non-accent text is the clock strip's HH:MM glyph — upright,
+        // dim (idle two-tone), never a caption.
+        assert_eq!(
+            rest.len(),
+            1,
+            "besides the labels only the clock glyph paints text"
+        );
+        assert!(rest[0].0.abs() < 1e-3, "the clock glyph reads upright");
+        assert_eq!(
+            rest[0].1,
+            Style::TEXT_DIM,
+            "the idle clock glyph sits dim like an idle app glyph"
+        );
     }
 
     #[test]
@@ -2779,6 +2882,103 @@ mod tests {
             "a click in the more-popup routes to its Surface"
         );
         assert!(!s.overflow_open, "routing from the popup closes it");
+    }
+
+    // ── VDOCK-5: the clock strip (Timers & Alarms home, locks #16/#20) ─────────
+
+    /// Collect every text shape's `(top-left, string)` — the clock test reads
+    /// the painted glyph's CONTENT back (the labels test only needs angle/color).
+    fn collect_text_strings(shape: &egui::Shape, out: &mut Vec<(egui::Pos2, String)>) {
+        match shape {
+            egui::Shape::Text(t) => out.push((t.pos, t.galley.text().to_string())),
+            egui::Shape::Vec(v) => {
+                for s in v {
+                    collect_text_strings(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn the_clock_strip_shows_the_live_time_and_routes_to_timers() {
+        // Lock #20 — the clock-glyph cell: it paints the LIVE wall-clock HH:MM
+        // as its glyph (the time IS the icon), sits atop the bottom zone above
+        // the status quads, and a click opens the Timers & Alarms surface.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = DockState::default();
+        s.toggle();
+        let sz = egui::vec2(1280.0, 900.0);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+        drive_vdock(&ctx, &mut s, Vec::new(), sz);
+
+        let cell = ctx
+            .read_response(clock_cell_id())
+            .expect("the clock strip is registered")
+            .rect;
+        assert!(
+            (cell.width() - DOCK_W).abs() < 1.0,
+            "the clock strip spans the full column"
+        );
+        assert!(
+            (cell.top() - (sz.y - BOTTOM_ZONE_H)).abs() < 1.0,
+            "the clock strip leads the bottom zone"
+        );
+        assert!(
+            (cell.bottom() - (sz.y - STATUS_SYS_H)).abs() < 1.0,
+            "the clock strip sits directly above the status quads"
+        );
+
+        // The glyph is the CURRENT time — capture one frame and find the HH:MM
+        // string inside the cell (sampling now on both sides tolerates a minute
+        // rollover mid-frame).
+        let before = crate::timers::hhmm(crate::timers::now_unix());
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), sz)),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |_ui| {});
+            let _ = dock(ctx, &mut s);
+        });
+        let after = crate::timers::hhmm(crate::timers::now_unix());
+        let mut texts = Vec::new();
+        for clipped in &out.shapes {
+            collect_text_strings(&clipped.shape, &mut texts);
+        }
+        assert!(
+            texts
+                .iter()
+                .any(|(pos, text)| cell.contains(*pos) && (*text == before || *text == after)),
+            "the clock strip paints the live HH:MM as its glyph (lock #20)"
+        );
+
+        // A click routes to Timers & Alarms (the surface's ONE home).
+        assert_ne!(s.active, Surface::Timers, "start off the Timers surface");
+        click_vdock(&ctx, &mut s, cell.center(), sz);
+        assert_eq!(
+            s.active,
+            Surface::Timers,
+            "clicking the clock opens Timers & Alarms (lock #20)"
+        );
+    }
+
+    #[test]
+    fn timers_home_is_the_clock_cell_not_the_picker() {
+        // Lock #20 — Timers deliberately sits OUTSIDE `Surface::ALL` (the picker
+        // ordering authority) and every group: its one launcher is the clock
+        // strip, so the picker/glyph tables stay exactly the 16 picker surfaces.
+        assert!(
+            !Surface::ALL.contains(&Surface::Timers),
+            "Timers is not a picker surface — the clock strip is its home"
+        );
+        assert!(
+            GROUPS
+                .iter()
+                .all(|g| !g.surfaces.contains(&Surface::Timers)),
+            "no group lists Timers"
+        );
     }
 
     // ── VDOCK-3: the status quads wired into the dock's bottom zone ────────────

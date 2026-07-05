@@ -229,6 +229,10 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         "chat" | "notifications" | "clipboard" => Some(Surface::Chat),
         "system" => Some(Surface::System),
         "storage" => Some(Surface::Storage),
+        // The Timers & Alarms surface (VDOCK-5) — the clock's replacement; the
+        // `clock` alias keeps a "where did the clock go?" verb landing somewhere
+        // honest (lock #5: the clock is now Timers & Alarms).
+        "timers" | "alarms" | "clock" => Some(Surface::Timers),
         _ => None,
     }
 }
