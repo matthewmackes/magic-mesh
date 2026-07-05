@@ -1483,9 +1483,12 @@ pub enum ResizeDir {
     Down,
 }
 
-/// The stock tmux layouts the FC-4 palette re-applies (`select-layout`) — the
-/// quick "even out this window" ops, distinct from the FC-7 mesh presets.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// The stock tmux layouts the FC-4 palette re-applies (`select-layout`).
+///
+/// The quick "even out this window" ops, distinct from the FC-7 mesh presets.
+/// Serde so a saved template blueprint (TMUX-FC-5) carries its window tidy-layout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum StockLayout {
     /// Panes side by side in one row (`even-horizontal`).
     EvenHorizontal,
@@ -1804,6 +1807,76 @@ pub mod commands {
     #[must_use]
     pub fn list_sessions() -> String {
         "list-sessions -F '#{session_name}\t#{session_attached}\t#{session_windows}'".to_owned()
+    }
+
+    // ── blueprint builders (TMUX-FC-5 templates / TMUX-FC-7 presets) ─────────
+    // A blueprint (a template or a preset) builds a whole session from a recipe:
+    // a detached session, extra windows, per-window pane splits, and the seeded
+    // command lines — then the control client switches onto it. Every string is
+    // built here (the one command home); [`crate::blueprint`] only orchestrates
+    // the ORDER. Targets are `session:window` **names** (not indices, so a
+    // non-default `base-index` never mis-addresses), tmux-quoted for spaces.
+
+    /// Create a **detached** session with its first window named.
+    ///
+    /// `new-session -d -s <session> -n <window>` — built detached so the blueprint
+    /// can seed panes before the client switches onto it (`%session-changed` never
+    /// fires mid-build).
+    #[must_use]
+    pub fn new_session_detached(session: &str, window: &str) -> String {
+        format!("new-session -d -s {} -n {}", quote(session), quote(window))
+    }
+
+    /// Add a named window to a session: `new-window -t <session> -n <window>`.
+    #[must_use]
+    pub fn new_window_named(session: &str, window: &str) -> String {
+        format!("new-window -t {} -n {}", quote(session), quote(window))
+    }
+
+    /// Split a window's active pane: `split-window -t <target> -h/-v`.
+    ///
+    /// A native [`SplitDir::V`] (side by side) is tmux's `-h`, [`SplitDir::H`]
+    /// (stacked) its `-v`, matching [`split_window`]. `target` is a
+    /// `session:window` name.
+    #[must_use]
+    pub fn split_window_in(target: &str, dir: SplitDir) -> String {
+        let flag = match dir {
+            SplitDir::V => "-h",
+            SplitDir::H => "-v",
+        };
+        format!("split-window -t {} {flag}", quote(target))
+    }
+
+    /// Type a literal command line into a target's active pane (no newline).
+    ///
+    /// `send-keys -t <target> -l <text>` (`-l` = literal, so a command that looks
+    /// like a tmux key name is still typed verbatim). Paired with [`send_enter`].
+    #[must_use]
+    pub fn send_text(target: &str, text: &str) -> String {
+        format!("send-keys -t {} -l {}", quote(target), quote(text))
+    }
+
+    /// Press Enter in a target's active pane: `send-keys -t <target> Enter` (runs
+    /// the line [`send_text`] typed).
+    #[must_use]
+    pub fn send_enter(target: &str) -> String {
+        format!("send-keys -t {} Enter", quote(target))
+    }
+
+    /// Tidy a window's arrangement: `select-layout -t <target> <name>`.
+    ///
+    /// The blueprint's final even-out after its splits (see [`select_layout`],
+    /// which targets a window id; this targets a `session:window` name).
+    #[must_use]
+    pub fn select_layout_in(target: &str, layout: super::StockLayout) -> String {
+        format!("select-layout -t {} {}", quote(target), layout.name())
+    }
+
+    /// Make a `session:window` name the current one: `select-window -t <target>`
+    /// (the blueprint focuses its first window after building the rest).
+    #[must_use]
+    pub fn select_window_target(target: &str) -> String {
+        format!("select-window -t {}", quote(target))
     }
 
     /// tmux-quote a string: single-quote wrap, escaping any internal quote.

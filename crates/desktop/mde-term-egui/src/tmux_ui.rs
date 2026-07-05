@@ -241,6 +241,8 @@ pub enum TmuxMenuChoice {
     ShowPicker,
     /// Open the FC-4 fuzzy command palette (starting a client first if needed).
     ShowPalette,
+    /// Open the TMUX-FC-5 templates ("projects") window.
+    ShowTemplates,
     /// Detach the control client.
     Detach,
     /// Show/hide the sidebar tree.
@@ -270,6 +272,79 @@ struct SessionRename {
     buffer: String,
 }
 
+/// One pane's edit row in the template editor — just its seeded command line
+/// (empty = a bare shell).
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct PaneEdit {
+    /// The command line to seed (blank leaves a plain shell).
+    command: String,
+}
+
+/// One window's edit block in the template editor (TMUX-FC-5): a name + its
+/// panes, plus how the panes split.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct WindowEdit {
+    /// The window name.
+    name: String,
+    /// The panes (at least one), in order.
+    panes: Vec<PaneEdit>,
+    /// How each extra pane splits off (beside / stacked).
+    split: SplitDir,
+}
+
+impl Default for WindowEdit {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            panes: vec![PaneEdit::default()],
+            split: SplitDir::V,
+        }
+    }
+}
+
+/// The in-progress template editor (TMUX-FC-5): a name + windows, authored fresh
+/// ("New template") or captured from the live session ("Save current as
+/// template"). Saving converts it to a [`crate::SessionTemplate`] blueprint.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct TemplateEdit {
+    /// The template name (and, sanitised, the session it opens).
+    name: String,
+    /// The windows to build.
+    windows: Vec<WindowEdit>,
+}
+
+impl TemplateEdit {
+    /// Convert the editor into a persistable template blueprint: each window's
+    /// non-blank panes become [`crate::BlueprintPane`]s, evened out `tiled`.
+    fn to_template(&self) -> crate::SessionTemplate {
+        let windows = self
+            .windows
+            .iter()
+            .map(|w| {
+                let panes: Vec<crate::BlueprintPane> = w
+                    .panes
+                    .iter()
+                    .map(|p| {
+                        let cmd = p.command.trim();
+                        if cmd.is_empty() {
+                            crate::BlueprintPane::shell()
+                        } else {
+                            crate::BlueprintPane::cmd(cmd)
+                        }
+                    })
+                    .collect();
+                let panes = if panes.is_empty() {
+                    vec![crate::BlueprintPane::shell()]
+                } else {
+                    panes
+                };
+                crate::BlueprintWindow::new(w.name.trim(), panes, w.split, Some(StockLayout::Tiled))
+            })
+            .collect();
+        crate::SessionTemplate::new(self.name.trim(), crate::Blueprint::new(windows))
+    }
+}
+
 /// What a sidebar row is — the pane-drag drop resolution's target set.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RowTarget {
@@ -280,6 +355,9 @@ enum RowTarget {
 }
 
 /// The UI-only state of the chrome (everything that is NOT the live controller).
+// Several independent open/reveal toggles — idiomatic egui panel state, not a
+// state machine worth encoding as flags.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct ChromeUi {
     /// Whether the sidebar tree is mounted.
@@ -308,6 +386,10 @@ struct ChromeUi {
     client_grid: Option<(u16, u16)>,
     /// The FC-4 command palette's own state (open/query/selection).
     palette: PaletteUi,
+    /// Whether the TMUX-FC-5 templates ("projects") window is open.
+    templates_open: bool,
+    /// The in-progress template editor, if any (TMUX-FC-5).
+    tpl_edit: Option<TemplateEdit>,
 }
 
 impl ChromeUi {
@@ -346,20 +428,145 @@ pub struct TmuxChrome {
     /// The mounted pane widgets, by tmux pane id — each a real TERM-3
     /// [`TerminalWidget`] over the pane's shared engine (§6, no second grid).
     mounts: HashMap<u32, TerminalWidget>,
+    /// TMUX-FC-5 — the platform-managed persisted state (remembered session +
+    /// templates) + its atomic store.
+    store: crate::TmuxStateStore,
+    /// The loaded persisted state.
+    state: crate::TmuxState,
+    /// Whether the first-frame auto-reattach (TMUX-FC-5) has run yet.
+    booted: bool,
 }
 
 impl TmuxChrome {
-    /// A fresh chrome with no tmux session (the sidebar hidden).
+    /// A fresh chrome with no live tmux session (the sidebar hidden), loading the
+    /// TMUX-FC-5 persisted state (remembered session + saved templates) from the
+    /// platform config dir. The remembered session is not re-entered until the
+    /// first [`Self::pump`] (so construction stays cheap + side-effect-free).
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let store = crate::TmuxStateStore::from_env();
+        let state = store.load();
+        Self {
+            store,
+            state,
+            ..Self::default()
+        }
+    }
+
+    /// A chrome over an explicit persisted store + state (the TMUX-FC-5 test
+    /// seam — points the store at a tempdir instead of the live config dir).
+    #[cfg(test)]
+    pub(crate) fn with_store(store: crate::TmuxStateStore, state: crate::TmuxState) -> Self {
+        Self {
+            store,
+            state,
+            ..Self::default()
+        }
+    }
+
+    /// The saved templates (the test/read view).
+    #[cfg(test)]
+    pub(crate) fn templates(&self) -> &[crate::SessionTemplate] {
+        &self.state.templates
     }
 
     /// Drain the control channel into the model — call once per frame, before the
-    /// tree renders (the [`crate::panel::terminal_pump`] slot).
+    /// tree renders (the [`crate::panel::terminal_pump`] slot). On the very first
+    /// call it performs the TMUX-FC-5 **auto-reattach**: if a session was
+    /// remembered, a control client re-enters it (`new-session -A` — a still-live
+    /// detached session is resumed, a killed one recreated) and the tree opens.
     pub fn pump(&mut self) {
+        if !self.booted {
+            self.booted = true;
+            if let Some(name) = self.state.last_session.clone() {
+                if !self.is_active() {
+                    self.controller = Some(TmuxController::connect(&TmuxLaunch::session(&name)));
+                    self.ui.tree_open = true;
+                }
+            }
+        }
         if let Some(ctrl) = self.controller.as_mut() {
             ctrl.pump();
+        }
+        // Remember whatever session the client is actually attached to (the
+        // round-trip truth), so the next relaunch reattaches it.
+        self.remember_current();
+    }
+
+    /// Persist the currently-attached session name as the one to reattach on the
+    /// next launch — only when it actually changed (no per-frame write churn).
+    fn remember_current(&mut self) {
+        let current = self.controller.as_ref().and_then(|c| {
+            let model = c.model();
+            model
+                .current_session()
+                .and_then(|s| model.session(s))
+                .map(|s| s.name().to_owned())
+        });
+        if let Some(name) = current {
+            if self.state.last_session.as_deref() != Some(name.as_str()) {
+                self.state.last_session = Some(name);
+                let _ = self.store.save(&self.state);
+            }
+        }
+    }
+
+    /// Open a saved template ("project"): ensure a control client, then write
+    /// its blueprint — a fresh session built from the recipe the client switches
+    /// onto. The `%`-events reconcile the tree (the round-trip, as ever).
+    fn open_template(&mut self, index: usize) {
+        let Some(tpl) = self.state.templates.get(index).cloned() else {
+            return;
+        };
+        self.ensure_client();
+        self.ui.tree_open = true;
+        let session = crate::session_safe(&tpl.name);
+        if let Some(ctrl) = self.controller.as_ref() {
+            for line in tpl.blueprint.commands(&session) {
+                let _ = ctrl.send(&line);
+            }
+        }
+    }
+
+    /// Persist the edited template (append or replace by name) — the editor's
+    /// Save. A blank name is ignored (§7 — no nameless template).
+    fn save_template(&mut self, edit: &TemplateEdit) {
+        if edit.name.trim().is_empty() {
+            return;
+        }
+        let tpl = edit.to_template();
+        if let Some(slot) = self.state.templates.iter_mut().find(|t| t.name == tpl.name) {
+            *slot = tpl;
+        } else {
+            self.state.templates.push(tpl);
+        }
+        let _ = self.store.save(&self.state);
+    }
+
+    /// Delete a saved template by index + persist.
+    fn delete_template(&mut self, index: usize) {
+        if index < self.state.templates.len() {
+            self.state.templates.remove(index);
+            let _ = self.store.save(&self.state);
+        }
+    }
+
+    /// Capture the live session's window/pane structure into a fresh template
+    /// editor (its commands left blank for the user to fill) — "Save current as
+    /// template". Falls back to a one-window skeleton when nothing is live.
+    fn capture_template_edit(&self) -> TemplateEdit {
+        let windows = self
+            .controller
+            .as_ref()
+            .map(|ctrl| capture_windows(ctrl.model()))
+            .unwrap_or_default();
+        TemplateEdit {
+            name: String::new(),
+            windows: if windows.is_empty() {
+                vec![WindowEdit::default()]
+            } else {
+                windows
+            },
         }
     }
 
@@ -395,6 +602,7 @@ impl TmuxChrome {
                 self.ensure_client();
                 self.ui.open_palette();
             }
+            Some(TmuxMenuChoice::ShowTemplates) => self.ui.templates_open = true,
             Some(TmuxMenuChoice::Detach) => {
                 if let Some(ctrl) = self.controller.as_ref() {
                     let _ = ctrl.send(&commands::detach_client());
@@ -462,6 +670,7 @@ impl TmuxChrome {
                 controller,
                 ui: state,
                 mounts,
+                ..
             } = self;
             let Some(ctrl) = controller.as_ref() else {
                 return false;
@@ -509,6 +718,46 @@ impl TmuxChrome {
         };
         self.dispatch(intents);
         mounted
+    }
+
+    /// Render the TMUX-FC-5 **templates** overlays (the projects window + its
+    /// editor) — floating egui windows, so they mount regardless of whether a
+    /// control client is live (a template can *start* a session from cold). The
+    /// [`crate::panel`] drives this each frame after the body.
+    pub fn overlays(&mut self, ui: &mut Ui) {
+        if self.ui.templates_open {
+            match render_templates(ui, &self.state.templates) {
+                Some(TemplateAction::Open(i)) => self.open_template(i),
+                Some(TemplateAction::Delete(i)) => self.delete_template(i),
+                Some(TemplateAction::NewEditor) => {
+                    self.ui.tpl_edit = Some(TemplateEdit {
+                        name: String::new(),
+                        windows: vec![WindowEdit::default()],
+                    });
+                }
+                Some(TemplateAction::CaptureEditor) => {
+                    self.ui.tpl_edit = Some(self.capture_template_edit());
+                }
+                Some(TemplateAction::Close) => self.ui.templates_open = false,
+                None => {}
+            }
+        }
+        if let Some(mut edit) = self.ui.tpl_edit.take() {
+            match render_template_editor(ui, &mut edit) {
+                Some(EditorAction::Save) => {
+                    self.save_template(&edit);
+                    // Keep the editor closed; the templates list now shows it.
+                }
+                Some(EditorAction::Cancel) => {}
+                None => self.ui.tpl_edit = Some(edit),
+            }
+        }
+    }
+
+    /// Whether the templates window is open (the menu's toggle-state twin).
+    #[must_use]
+    pub const fn templates_open(&self) -> bool {
+        self.ui.templates_open
     }
 
     /// Start a control client if none is live (idempotent) — the opt-in attach.
@@ -1450,6 +1699,17 @@ fn toolbar(ui: &mut Ui, model: &TmuxModel, state: &mut ChromeUi, intents: &mut V
         }
         if ui
             .add(Button::new(
+                RichText::new("Projects\u{2026}")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            ))
+            .on_hover_text("Saved session templates (TMUX-FC-5)")
+            .clicked()
+        {
+            state.templates_open = true;
+        }
+        if ui
+            .add(Button::new(
                 RichText::new(if state.tree_open {
                     "Tree \u{25C0}"
                 } else {
@@ -1963,6 +2223,236 @@ fn session_row(ui: &mut Ui, info: &SessionInfo, intents: &mut Vec<TmuxIntent>) {
             intents.push(TmuxIntent::KillSession(info.name.clone()));
         }
     });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TMUX-FC-5 — the templates ("projects") window + editor.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One action the templates window raises this frame (at most one).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TemplateAction {
+    /// Open (build + attach) the template at this index.
+    Open(usize),
+    /// Delete the template at this index.
+    Delete(usize),
+    /// Open a fresh, empty editor.
+    NewEditor,
+    /// Open an editor pre-filled from the live session's structure.
+    CaptureEditor,
+    /// Close the window.
+    Close,
+}
+
+/// The template editor's outcome this frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditorAction {
+    /// Save the edited template.
+    Save,
+    /// Discard the edit.
+    Cancel,
+}
+
+/// Capture the live model's windows into editor rows — one [`WindowEdit`] per
+/// linked window (its name, one blank pane per live pane, beside-split default).
+/// Pure over the model, so the "Save current as template" capture is unit-tested
+/// headlessly.
+fn capture_windows(model: &TmuxModel) -> Vec<WindowEdit> {
+    model
+        .windows_in_order()
+        .into_iter()
+        .filter_map(|w| {
+            let win = model.window(w)?;
+            let name = if win.name().is_empty() {
+                format!("win{w}")
+            } else {
+                win.name().to_owned()
+            };
+            let count = model.panes_of_window(w).len().max(1);
+            Some(WindowEdit {
+                name,
+                panes: vec![PaneEdit::default(); count],
+                split: SplitDir::V,
+            })
+        })
+        .collect()
+}
+
+/// The templates ("projects") window: the saved list (each Open/Delete) plus the
+/// "New" + "Save current" authoring entry points. Returns the one action raised.
+fn render_templates(ui: &Ui, templates: &[crate::SessionTemplate]) -> Option<TemplateAction> {
+    let mut action = None;
+    egui::Window::new("tmux templates")
+        .collapsible(false)
+        .resizable(true)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Projects")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM)
+                        .strong(),
+                );
+                if ui.button("New\u{2026}").clicked() {
+                    action = Some(TemplateAction::NewEditor);
+                }
+                if ui
+                    .button("Save current\u{2026}")
+                    .on_hover_text("Capture the live session's layout as a new template")
+                    .clicked()
+                {
+                    action = Some(TemplateAction::CaptureEditor);
+                }
+            });
+            ui.add_space(Style::SP_XS);
+            ui.separator();
+
+            if templates.is_empty() {
+                ui.add_space(Style::SP_XS);
+                ui.label(
+                    RichText::new("No saved templates yet")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+            }
+            ScrollArea::vertical()
+                .max_height(Style::SP_XL * 8.0)
+                .show(ui, |ui| {
+                    for (i, tpl) in templates.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(tpl.name.as_str())
+                                    .size(Style::BODY)
+                                    .color(Style::TEXT),
+                            );
+                            let wins = tpl.blueprint.windows.len();
+                            let panes = tpl.blueprint.pane_count();
+                            ui.label(
+                                RichText::new(format!("{wins}w \u{00b7} {panes}p"))
+                                    .size(Style::SMALL)
+                                    .color(Style::TEXT_DIM),
+                            );
+                            if ui.button("Open").clicked() {
+                                action = Some(TemplateAction::Open(i));
+                            }
+                            if ui.button("Delete").clicked() {
+                                action = Some(TemplateAction::Delete(i));
+                            }
+                        });
+                    }
+                });
+
+            ui.add_space(Style::SP_S);
+            ui.separator();
+            if ui.button("Close").clicked() {
+                action = Some(TemplateAction::Close);
+            }
+        });
+    action
+}
+
+/// The template editor window (TMUX-FC-5): the name, its windows (each a name, a
+/// beside/stacked split toggle, and its pane command lines), and Save/Cancel.
+/// Mutates `edit` in place; returns Save/Cancel when pressed.
+fn render_template_editor(ui: &Ui, edit: &mut TemplateEdit) -> Option<EditorAction> {
+    let mut action = None;
+    let mut remove_window: Option<usize> = None;
+    egui::Window::new("edit template")
+        .collapsible(false)
+        .resizable(true)
+        .anchor(Align2::CENTER_CENTER, Vec2::new(Style::SP_XL * 4.0, 0.0))
+        .show(ui.ctx(), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Name")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                ui.text_edit_singleline(&mut edit.name);
+            });
+            ui.add_space(Style::SP_XS);
+            ui.separator();
+
+            let win_count = edit.windows.len();
+            ScrollArea::vertical()
+                .max_height(Style::SP_XL * 9.0)
+                .show(ui, |ui| {
+                    for (wi, window) in edit.windows.iter_mut().enumerate() {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("Window {}", wi + 1))
+                                        .size(Style::SMALL)
+                                        .color(Style::ACCENT_TERMINALS),
+                                );
+                                ui.text_edit_singleline(&mut window.name);
+                                if ui
+                                    .selectable_label(window.split == SplitDir::V, "beside")
+                                    .clicked()
+                                {
+                                    window.split = SplitDir::V;
+                                }
+                                if ui
+                                    .selectable_label(window.split == SplitDir::H, "stacked")
+                                    .clicked()
+                                {
+                                    window.split = SplitDir::H;
+                                }
+                                // Never leave a template with zero windows.
+                                if win_count > 1 && ui.button("\u{00d7} win").clicked() {
+                                    remove_window = Some(wi);
+                                }
+                            });
+                            let mut remove_pane: Option<usize> = None;
+                            let pane_count = window.panes.len();
+                            for (pi, pane) in window.panes.iter_mut().enumerate() {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(Style::SP_M);
+                                    ui.label(
+                                        RichText::new(format!("%{pi}"))
+                                            .size(Style::SMALL)
+                                            .color(Style::TEXT_DIM),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut pane.command)
+                                            .hint_text("command (blank = shell)")
+                                            .desired_width(Style::SP_XL * 6.0),
+                                    );
+                                    if pane_count > 1 && ui.button("\u{00d7}").clicked() {
+                                        remove_pane = Some(pi);
+                                    }
+                                });
+                            }
+                            if let Some(pi) = remove_pane {
+                                window.panes.remove(pi);
+                            }
+                            if ui.button("+ pane").clicked() {
+                                window.panes.push(PaneEdit::default());
+                            }
+                        });
+                    }
+                });
+            if let Some(wi) = remove_window {
+                edit.windows.remove(wi);
+            }
+            if ui.button("+ window").clicked() {
+                edit.windows.push(WindowEdit::default());
+            }
+
+            ui.add_space(Style::SP_S);
+            ui.separator();
+            ui.horizontal(|ui| {
+                let can_save = !edit.name.trim().is_empty();
+                if ui.add_enabled(can_save, Button::new("Save")).clicked() {
+                    action = Some(EditorAction::Save);
+                }
+                if ui.button("Cancel").clicked() {
+                    action = Some(EditorAction::Cancel);
+                }
+            });
+        });
+    action
 }
 
 /// A small frameless text button for the row-inline ops (rename/kill), so the
@@ -2611,5 +3101,250 @@ mod tests {
         assert_eq!(secs_to_next_minute(0), 60);
         assert_eq!(secs_to_next_minute(59), 1);
         assert_eq!(secs_to_next_minute(61), 59);
+    }
+
+    // ── TMUX-FC-5: templates + persistence ───────────────────────────────────
+
+    use crate::blueprint::{Blueprint, BlueprintPane, BlueprintWindow};
+    use crate::tmux_store::{SessionTemplate, TmuxState, TmuxStateStore};
+
+    fn temp_store() -> (tempfile::TempDir, TmuxStateStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tmux").join("state.json");
+        let store = TmuxStateStore::with_path(Some(path));
+        (dir, store)
+    }
+
+    #[test]
+    fn saving_and_deleting_a_template_persists_through_the_store() {
+        let (_dir, store) = temp_store();
+        let mut chrome = TmuxChrome::with_store(store.clone(), TmuxState::default());
+        let edit = TemplateEdit {
+            name: "Dev".to_owned(),
+            windows: vec![WindowEdit {
+                name: "edit".to_owned(),
+                panes: vec![
+                    PaneEdit {
+                        command: "vim".to_owned(),
+                    },
+                    PaneEdit::default(), // blank → a bare shell
+                ],
+                split: SplitDir::V,
+            }],
+        };
+        chrome.save_template(&edit);
+        assert_eq!(chrome.templates().len(), 1);
+        // It persisted: a fresh store over the same path reads it back.
+        assert_eq!(store.load().templates.len(), 1);
+        let saved = &chrome.templates()[0];
+        assert_eq!(saved.name, "Dev");
+        assert_eq!(saved.blueprint.pane_count(), 2);
+
+        // A same-name save replaces rather than duplicates.
+        chrome.save_template(&edit);
+        assert_eq!(chrome.templates().len(), 1);
+
+        // A blank name is ignored (§7 — no nameless template).
+        chrome.save_template(&TemplateEdit {
+            name: "  ".to_owned(),
+            windows: vec![WindowEdit::default()],
+        });
+        assert_eq!(chrome.templates().len(), 1);
+
+        chrome.delete_template(0);
+        assert!(chrome.templates().is_empty());
+        assert!(store.load().templates.is_empty());
+    }
+
+    #[test]
+    fn template_edit_converts_blank_commands_to_shells() {
+        let edit = TemplateEdit {
+            name: "  Mesh Ops  ".to_owned(),
+            windows: vec![WindowEdit {
+                name: "ops".to_owned(),
+                panes: vec![
+                    PaneEdit {
+                        command: "meshctl status".to_owned(),
+                    },
+                    PaneEdit {
+                        command: "   ".to_owned(),
+                    },
+                ],
+                split: SplitDir::H,
+            }],
+        };
+        let tpl = edit.to_template();
+        assert_eq!(tpl.name, "Mesh Ops", "the name is trimmed");
+        let win = &tpl.blueprint.windows[0];
+        assert_eq!(win.panes[0], BlueprintPane::cmd("meshctl status"));
+        assert_eq!(win.panes[1], BlueprintPane::shell(), "blank → shell");
+        assert_eq!(win.split, SplitDir::H);
+    }
+
+    #[test]
+    fn capture_windows_mirrors_the_live_session_windows() {
+        // @0 "editor" has two panes; @1 "logs" has none yet (no layout streamed).
+        let model = two_window_model();
+        let caught = capture_windows(&model);
+        assert_eq!(caught.len(), 2, "one WindowEdit per linked window");
+        assert_eq!(caught[0].name, "editor");
+        assert_eq!(caught[0].panes.len(), 2, "the two-pane window's pane count");
+        assert_eq!(caught[1].name, "logs");
+        assert_eq!(
+            caught[1].panes.len(),
+            1,
+            "a paneless window still seeds one"
+        );
+        // Every captured pane starts blank (the user fills the commands).
+        assert!(caught[0].panes.iter().all(|p| p.command.is_empty()));
+
+        // Cold (no controller) → the editor falls back to a one-window skeleton.
+        let store = TmuxStateStore::with_path(None);
+        let chrome = TmuxChrome::with_store(store, TmuxState::default());
+        assert_eq!(chrome.capture_template_edit().windows.len(), 1);
+    }
+
+    #[test]
+    fn the_templates_window_and_editor_render_headless() {
+        let templates = vec![SessionTemplate::new(
+            "Dev",
+            Blueprint::new(vec![BlueprintWindow::new(
+                "edit",
+                vec![BlueprintPane::shell()],
+                SplitDir::V,
+                None,
+            )]),
+        )];
+        let prims = headless(|ui| {
+            let _ = render_templates(ui, &templates);
+        });
+        assert!(prims > 0, "the templates window did not tessellate");
+
+        let mut edit = TemplateEdit {
+            name: "New".to_owned(),
+            windows: vec![WindowEdit::default()],
+        };
+        let prims = headless(|ui| {
+            let _ = render_template_editor(ui, &mut edit);
+        });
+        assert!(prims > 0, "the template editor did not tessellate");
+    }
+
+    #[test]
+    fn a_chrome_with_no_remembered_session_stays_quiet_on_pump() {
+        // No remembered session → pump attaches nothing (opt-in honesty holds).
+        let store = TmuxStateStore::with_path(None);
+        let mut chrome = TmuxChrome::with_store(store, TmuxState::default());
+        chrome.pump();
+        assert!(!chrome.is_active(), "nothing to reattach → no client");
+        assert!(!chrome.tree_open(), "and the tree stays hidden");
+    }
+
+    #[test]
+    fn opening_the_templates_window_via_the_menu_reveals_it() {
+        let store = TmuxStateStore::with_path(None);
+        let mut chrome = TmuxChrome::with_store(store, TmuxState::default());
+        assert!(!chrome.templates_open());
+        chrome.apply_menu(Some(TmuxMenuChoice::ShowTemplates));
+        assert!(
+            chrome.templates_open(),
+            "the menu opens the templates window"
+        );
+    }
+
+    // ── TMUX-FC-5: a guarded live reattach + template open (needs tmux) ───────
+
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn live_auto_reattach_re_enters_a_remembered_session() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        // A remembered session name → the first pump re-enters it (opening the
+        // tree). Unique per-process so it never collides with the user's tmux.
+        let name = format!("mde-fc5-reattach-{}", std::process::id());
+        let store = TmuxStateStore::with_path(None);
+        let mut chrome = TmuxChrome::with_store(
+            store,
+            TmuxState {
+                last_session: Some(name.clone()),
+                templates: Vec::new(),
+            },
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !chrome.is_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "auto-reattach never attached the remembered session"
+            );
+            chrome.pump();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(chrome.tree_open(), "reattach reveals the tree");
+        // Tear the recreated session down (reattach uses new-session -A).
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &name])
+            .output();
+    }
+
+    #[test]
+    fn live_open_template_builds_its_layout() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux is not installed");
+            return;
+        }
+        let name = format!("mde-fc5-tpl-{}", std::process::id());
+        let store = TmuxStateStore::with_path(None);
+        let tpl = SessionTemplate::new(
+            name.clone(),
+            Blueprint::new(vec![
+                BlueprintWindow::new(
+                    "ops",
+                    vec![BlueprintPane::cmd("true"), BlueprintPane::cmd("true")],
+                    SplitDir::V,
+                    Some(StockLayout::EvenHorizontal),
+                ),
+                BlueprintWindow::new("shell", vec![BlueprintPane::shell()], SplitDir::H, None),
+            ]),
+        );
+        let mut chrome = TmuxChrome::with_store(
+            store,
+            TmuxState {
+                last_session: None,
+                templates: vec![tpl],
+            },
+        );
+        chrome.open_template(0);
+        // The blueprint built two windows, the first (ops) split into two panes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            chrome.pump();
+            let ok = chrome.controller.as_ref().is_some_and(|c| {
+                let m = c.model();
+                m.windows_in_order().len() == 2
+                    && m.windows_in_order()
+                        .first()
+                        .is_some_and(|w| m.panes_of_window(*w).len() == 2)
+            });
+            if ok {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the template's layout never built"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &crate::session_safe(&name)])
+            .output();
     }
 }

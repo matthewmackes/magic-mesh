@@ -679,6 +679,10 @@ fn tmux_entries(active: bool) -> Vec<Entry<Picked>> {
             Picked::Tmux(TmuxMenuChoice::ShowPalette),
             "Command Palette\u{2026}",
         )),
+        Entry::Item(BarItem::new(
+            Picked::Tmux(TmuxMenuChoice::ShowTemplates),
+            "Templates\u{2026}",
+        )),
         Entry::Separator,
         op(TmuxMenuChoice::SplitRight, "Split Pane Right"),
         op(TmuxMenuChoice::SplitDown, "Split Pane Down"),

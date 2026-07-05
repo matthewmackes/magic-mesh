@@ -149,6 +149,10 @@ pub fn terminal_panel(ui: &mut Ui, surface: &mut TerminalSurface) {
                     empty_state(ui, term);
                 }
             }
+            // TMUX-FC-5: the templates ("projects") window + its editor mount as
+            // floating overlays here, so a template can start a session from cold
+            // (they render whether or not a control client is live).
+            tmux.overlays(ui);
         }
         Err(err) => {
             ui.add_space(Style::SP_M);

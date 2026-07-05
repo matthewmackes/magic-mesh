@@ -157,6 +157,7 @@
 
 pub mod appearance;
 pub mod bell;
+pub mod blueprint;
 pub mod engine;
 pub mod fonts;
 pub mod keymap;
@@ -181,12 +182,14 @@ pub mod splits;
 pub mod tabs;
 pub mod title;
 pub mod tmux;
+pub mod tmux_store;
 pub mod tmux_ui;
 pub mod watch;
 pub mod widget;
 
 pub use appearance::{Appearance, AppearancePicker, CursorShape};
 pub use bell::{Bell, BellConfig, BellEffect};
+pub use blueprint::{Blueprint, BlueprintPane, BlueprintWindow};
 pub use engine::{TermEvent, Terminal, DEFAULT_SCROLLBACK};
 pub use keymap::{Action, Chord, Keymap, KeymapConfig};
 pub use layout::{LayoutPane, LayoutStore, LayoutTab, PaneSpec, SavedLayout};
@@ -224,6 +227,7 @@ pub use tmux::{
     SessionInfo, Status as TmuxStatus, StockLayout, TmuxController, TmuxLaunch, TmuxModel,
     TmuxPane, TmuxPaneIo, TmuxSession, TmuxWindow,
 };
+pub use tmux_store::{session_safe, SessionTemplate, TmuxState, TmuxStateStore};
 pub use tmux_ui::{command_for, TmuxChrome, TmuxIntent, TmuxMenuChoice};
 pub use watch::{ActivityWatch, WatchEvent, WatchMode};
 pub use widget::{ClipboardOptions, TerminalWidget};
