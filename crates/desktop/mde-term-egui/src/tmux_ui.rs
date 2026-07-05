@@ -257,6 +257,8 @@ pub enum TmuxMenuChoice {
     ShowMesh,
     /// Open one of the TMUX-FC-7 mesh-styled layout presets.
     OpenPreset(crate::MeshPreset),
+    /// Open the TMUX-FC-8 config settings pane (prefix / mouse / history).
+    ShowConfig,
     /// Detach the control client.
     Detach,
     /// Show/hide the sidebar tree.
@@ -408,6 +410,8 @@ struct ChromeUi {
     mesh_open: bool,
     /// The manual-host buffer in the mesh picker (a node not on the roster).
     mesh_host: String,
+    /// Whether the TMUX-FC-8 config settings pane is open.
+    settings_open: bool,
 }
 
 impl ChromeUi {
@@ -457,6 +461,10 @@ pub struct TmuxChrome {
     roster: Option<Arc<dyn RosterClient>>,
     /// TMUX-FC-6 — the Bus PTY-broker seam a mesh attach dials `tmux -CC` over.
     bus: Option<Arc<dyn PtyBus>>,
+    /// TMUX-FC-8 — the mesh-synced Quasar tmux config + its store.
+    config: crate::TmuxConfig,
+    /// The mesh-synced config store (`None` = no store resolved, e.g. tests).
+    config_store: Option<crate::TmuxConfigStore>,
 }
 
 impl TmuxChrome {
@@ -468,11 +476,15 @@ impl TmuxChrome {
     pub fn new() -> Self {
         let store = crate::TmuxStateStore::from_env();
         let state = store.load();
+        let config_store = crate::TmuxConfigStore::local();
+        let config = config_store.load();
         Self {
             store,
             state,
             roster: Some(Arc::new(crate::roster::BusRoster::from_env())),
             bus: Some(Arc::new(crate::remote::BusPtyClient::from_env())),
+            config,
+            config_store: Some(config_store),
             ..Self::default()
         }
     }
@@ -505,6 +517,7 @@ impl TmuxChrome {
             if let Some(name) = self.state.last_session.clone() {
                 if !self.is_active() {
                     self.controller = Some(TmuxController::connect(&TmuxLaunch::session(&name)));
+                    self.apply_config();
                     self.ui.tree_open = true;
                 }
             }
@@ -584,6 +597,7 @@ impl TmuxChrome {
         }
         let channel = MeshControlChannel::dial(bus, host, "main", MESH_DIAL_COLS, MESH_DIAL_ROWS);
         self.controller = Some(TmuxController::over(Box::new(channel)));
+        self.apply_config();
         self.ui.tree_open = true;
         self.ui.mesh_open = false;
     }
@@ -671,6 +685,7 @@ impl TmuxChrome {
             Some(TmuxMenuChoice::ShowTemplates) => self.ui.templates_open = true,
             Some(TmuxMenuChoice::ShowMesh) => self.ui.mesh_open = true,
             Some(TmuxMenuChoice::OpenPreset(preset)) => self.open_preset(preset),
+            Some(TmuxMenuChoice::ShowConfig) => self.ui.settings_open = true,
             Some(TmuxMenuChoice::Detach) => {
                 if let Some(ctrl) = self.controller.as_ref() {
                     let _ = ctrl.send(&commands::detach_client());
@@ -829,6 +844,14 @@ impl TmuxChrome {
                 None => {}
             }
         }
+        // TMUX-FC-8 — the Quasar config settings pane (prefix / mouse / history).
+        if self.ui.settings_open {
+            match render_settings(ui, &mut self.config) {
+                Some(SettingsAction::Save) => self.save_config(),
+                Some(SettingsAction::Close) => self.ui.settings_open = false,
+                None => {}
+            }
+        }
     }
 
     /// Whether the templates window is open (the menu's toggle-state twin).
@@ -841,7 +864,30 @@ impl TmuxChrome {
     fn ensure_client(&mut self) {
         if !self.is_active() {
             self.controller = Some(TmuxController::connect(&TmuxLaunch::default()));
+            self.apply_config();
         }
+    }
+
+    /// TMUX-FC-8 — push the mesh-synced Quasar config to the live control client
+    /// as `set-option -g` commands (the prefix, mouse, history). Applied the
+    /// moment a client is created, so the live server reflects the platform config
+    /// regardless of what `.tmux.conf` (if any) it started from. A no-op when no
+    /// client is live.
+    fn apply_config(&self) {
+        if let Some(ctrl) = self.controller.as_ref() {
+            for line in self.config.option_commands() {
+                let _ = ctrl.send(&line);
+            }
+        }
+    }
+
+    /// Persist the edited config (already mutated in place by the settings pane)
+    /// to the mesh-synced store + apply it live.
+    fn save_config(&self) {
+        if let Some(store) = self.config_store.as_ref() {
+            let _ = store.save(&self.config);
+        }
+        self.apply_config();
     }
 
     /// Ask the server for the full session list (feeds the picker).
@@ -1798,6 +1844,17 @@ fn toolbar(ui: &mut Ui, model: &TmuxModel, state: &mut ChromeUi, intents: &mut V
         }
         if ui
             .add(Button::new(
+                RichText::new("Config\u{2026}")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            ))
+            .on_hover_text("Quasar tmux config: prefix, mouse, history (TMUX-FC-8)")
+            .clicked()
+        {
+            state.settings_open = true;
+        }
+        if ui
+            .add(Button::new(
                 RichText::new(if state.tree_open {
                     "Tree \u{25C0}"
                 } else {
@@ -2640,6 +2697,88 @@ fn render_mesh_picker(
             if ui.button("Close").clicked() {
                 action = Some(MeshAction::Close);
             }
+        });
+    action
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TMUX-FC-8 — the Quasar config settings pane.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One action the config settings pane raises.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SettingsAction {
+    /// Persist the edited config to the mesh store + apply it live.
+    Save,
+    /// Close the pane.
+    Close,
+}
+
+/// The common prefix presets the settings pane offers as one-click chips.
+const PREFIX_PRESETS: [&str; 3] = ["C-b", "C-a", "C-Space"];
+
+/// The Quasar config settings pane (TMUX-FC-8): edit the prefix, the mouse
+/// toggle, and the scrollback history limit; Save persists to the mesh-synced
+/// store + applies live over the control channel. Mutates `config` in place.
+fn render_settings(ui: &Ui, config: &mut crate::TmuxConfig) -> Option<SettingsAction> {
+    let mut action = None;
+    egui::Window::new("tmux config")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.label(
+                RichText::new("Quasar tmux config (mesh-synced)")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM)
+                    .strong(),
+            );
+            ui.add_space(Style::SP_XS);
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Prefix")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut config.prefix)
+                        .desired_width(Style::SP_XL * 3.0),
+                );
+                for preset in PREFIX_PRESETS {
+                    if ui
+                        .selectable_label(config.prefix == preset, preset)
+                        .clicked()
+                    {
+                        preset.clone_into(&mut config.prefix);
+                    }
+                }
+            });
+            ui.checkbox(&mut config.mouse, "Mouse support");
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("History (lines)")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut config.history_limit)
+                        .speed(500)
+                        .range(1_000..=1_000_000),
+                );
+            });
+
+            ui.add_space(Style::SP_S);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    action = Some(SettingsAction::Save);
+                }
+                if ui.button("Close").clicked() {
+                    action = Some(SettingsAction::Close);
+                }
+            });
         });
     action
 }
@@ -3642,5 +3781,43 @@ mod tests {
         let _ = std::process::Command::new("tmux")
             .args(["kill-session", "-t", "mesh-ops"])
             .output();
+    }
+
+    // ── TMUX-FC-8: config settings pane + persistence ────────────────────────
+
+    use crate::tmux_config::{TmuxConfig, TmuxConfigStore};
+
+    #[test]
+    fn the_settings_pane_renders_and_the_menu_opens_it() {
+        let store = TmuxStateStore::with_path(None);
+        let mut chrome = TmuxChrome::with_store(store, TmuxState::default());
+        assert!(!chrome.ui.settings_open);
+        chrome.apply_menu(Some(TmuxMenuChoice::ShowConfig));
+        assert!(chrome.ui.settings_open, "the menu opens the config pane");
+
+        let mut cfg = TmuxConfig::default();
+        let prims = headless(|ui| {
+            let _ = render_settings(ui, &mut cfg);
+        });
+        assert!(prims > 0, "the config settings pane did not tessellate");
+    }
+
+    #[test]
+    fn save_config_persists_to_the_mesh_synced_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = TmuxStateStore::with_path(None);
+        let mut chrome = TmuxChrome::with_store(store, TmuxState::default());
+        chrome.config_store = Some(TmuxConfigStore::new(dir.path()));
+        chrome.config = TmuxConfig {
+            prefix: "C-a".to_owned(),
+            mouse: false,
+            history_limit: 12_345,
+        };
+        chrome.save_config(); // no live controller → apply is a no-op, persist runs
+        assert_eq!(
+            TmuxConfigStore::new(dir.path()).load(),
+            chrome.config,
+            "the edited config reads back from the mesh store"
+        );
     }
 }

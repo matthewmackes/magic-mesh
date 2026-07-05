@@ -709,6 +709,10 @@ fn tmux_entries(active: bool) -> Vec<Entry<Picked>> {
         Entry::Separator,
         op(TmuxMenuChoice::NewWindow, "New Window"),
         op(TmuxMenuChoice::KillWindow, "Kill Window"),
+        Entry::Item(BarItem::new(
+            Picked::Tmux(TmuxMenuChoice::ShowConfig),
+            "Config\u{2026}",
+        )),
         Entry::Separator,
         op(TmuxMenuChoice::Detach, "Detach"),
         op(TmuxMenuChoice::ToggleTree, "Hide/Show Tree"),

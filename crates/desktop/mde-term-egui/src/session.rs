@@ -86,6 +86,19 @@ impl Session {
         }
     }
 
+    /// TMUX-FC-8 — for a tmux pane, also yank a native GUI copy into tmux's paste
+    /// buffer (`set-buffer`), so `prefix ]` pastes it inside a pane; a no-op for a
+    /// local/remote pane (whose copy lives only in the OS + mesh clipboard). Only
+    /// a **single-line** selection is yanked — the control channel is line-based,
+    /// so a multi-line one rides the clipboard alone (which has no such limit).
+    pub fn yank_tmux_buffer(&self, text: &str) {
+        if let Self::Tmux(io) = self {
+            if !text.contains('\n') {
+                let _ = io.yank_buffer(text);
+            }
+        }
+    }
+
     /// Run `f` against the current engine state (the render-agnostic snapshot
     /// source every variant shares).
     pub fn with_terminal<R>(&self, f: impl FnOnce(&Terminal) -> R) -> R {
@@ -170,5 +183,33 @@ const fn tone_color(tone: StatusTone) -> Color32 {
         StatusTone::Warn => Style::WARN,
         StatusTone::Danger => Style::DANGER,
         StatusTone::Dim => Style::TEXT_DIM,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Session;
+    use crate::engine::Terminal;
+    use crate::tmux::{CommandSink, TmuxPaneIo};
+    use std::sync::{mpsc, Arc, Mutex};
+
+    #[test]
+    fn tmux_pane_yanks_a_single_line_selection_into_the_buffer_and_skips_multiline() {
+        // TMUX-FC-8 — a tmux pane's copy also yanks into tmux's buffer, but only a
+        // single-line selection (the control channel is line-based); a multi-line
+        // one rides the clipboard alone.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let engine = Arc::new(Mutex::new(Terminal::with_default_scrollback(20, 4)));
+        let session = Session::Tmux(TmuxPaneIo::new(3, engine, CommandSink::for_tests(tx)));
+
+        session.yank_tmux_buffer("one line");
+        assert_eq!(rx.recv().expect("yank"), b"set-buffer -- 'one line'\n");
+
+        // A multi-line selection yanks nothing to tmux (no set-buffer emitted).
+        session.yank_tmux_buffer("line one\nline two");
+        assert!(
+            rx.try_recv().is_err(),
+            "a multi-line selection must not reach the line-based control channel"
+        );
     }
 }

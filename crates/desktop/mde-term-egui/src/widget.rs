@@ -1259,6 +1259,8 @@ impl TerminalWidget {
             return;
         }
         if self.clip.copy_on_select {
+            // TMUX-FC-8 — a tmux pane's copy also yanks into tmux's paste buffer.
+            self.session.yank_tmux_buffer(&text);
             ctx.copy_text(text.clone());
         }
         self.primary = Some(text);
@@ -1547,7 +1549,8 @@ impl TerminalWidget {
         }
     }
 
-    /// Copy the current selection to the clipboard (no-op without one).
+    /// Copy the current selection to the clipboard (no-op without one), and — for
+    /// a tmux pane — also yank it into tmux's paste buffer (TMUX-FC-8).
     pub(crate) fn copy_selection(&self, ctx: &Context) {
         if let Some(sel) = self.selection {
             // One-shot full snapshot: the selection may live in history.
@@ -1555,6 +1558,7 @@ impl TerminalWidget {
                 .session
                 .with_terminal(|t| selected_text(&t.full(), &sel));
             if !text.is_empty() {
+                self.session.yank_tmux_buffer(&text);
                 ctx.copy_text(text);
             }
         }

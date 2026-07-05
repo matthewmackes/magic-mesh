@@ -1925,6 +1925,18 @@ pub mod commands {
         format!("select-window -t {}", quote(target))
     }
 
+    /// Yank text into tmux's paste buffer (TMUX-FC-8): `set-buffer -- <text>`.
+    ///
+    /// The native GUI copy (which already reaches the OS + mesh clipboard) also
+    /// lands in the tmux buffer, so a `prefix ]` paste inside a pane works. The
+    /// `--` guards a selection that starts with `-`. The control channel is
+    /// line-oriented, so the caller only yanks a single-line selection here (a
+    /// multi-line one rides the clipboard, which has no such limit).
+    #[must_use]
+    pub fn set_buffer(text: &str) -> String {
+        format!("set-buffer -- {}", quote(text))
+    }
+
     /// tmux-quote a string: single-quote wrap, escaping any internal quote.
     fn quote(s: &str) -> String {
         let mut out = String::with_capacity(s.len() + 2);
@@ -2182,6 +2194,15 @@ impl TmuxPaneIo {
     /// [`std::io::ErrorKind::BrokenPipe`] once the control channel is gone.
     pub fn send_input(&self, bytes: &[u8]) -> std::io::Result<()> {
         self.sink.send_line(&commands::send_keys(self.pane, bytes))
+    }
+
+    /// TMUX-FC-8 — yank `text` into tmux's paste buffer (`set-buffer`), so a
+    /// native GUI copy is also pasteable inside tmux with `prefix ]`.
+    ///
+    /// # Errors
+    /// [`std::io::ErrorKind::BrokenPipe`] once the control channel is gone.
+    pub fn yank_buffer(&self, text: &str) -> std::io::Result<()> {
+        self.sink.send_line(&commands::set_buffer(text))
     }
 
     /// Run `f` against the pane's engine (the render-agnostic snapshot source).
@@ -3135,6 +3156,23 @@ boom\n\
         // A dead channel refuses input honestly.
         drop(rx);
         assert!(io.send_input(b"x").is_err());
+    }
+
+    #[test]
+    fn set_buffer_yanks_a_selection_into_the_tmux_buffer() {
+        // TMUX-FC-8 — the command builder quotes the selection + guards a leading
+        // dash with `--`.
+        assert_eq!(commands::set_buffer("hello"), "set-buffer -- 'hello'");
+        assert_eq!(commands::set_buffer("-rf"), "set-buffer -- '-rf'");
+        // A quote in the selection is safely escaped (no command injection).
+        assert_eq!(commands::set_buffer("a'b"), "set-buffer -- 'a'\\''b'");
+
+        // The pane-io yank rides the same control-channel sink as send-keys.
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let engine = Arc::new(Mutex::new(Terminal::with_default_scrollback(20, 4)));
+        let io = TmuxPaneIo::new(7, engine, CommandSink::for_tests(tx));
+        io.yank_buffer("clip me").expect("yank");
+        assert_eq!(rx.recv().expect("line"), b"set-buffer -- 'clip me'\n");
     }
 
     // ── the controller's honest error state (no live tmux needed) ─────────────
