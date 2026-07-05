@@ -9687,6 +9687,37 @@ fn run_serve(
             worker_names.lock().expect("worker_names mutex").push("notify".into());
         }
 
+        // NODE-GRADE-1 — the `node_grade` worker: every node computes + publishes
+        // its OWN A–F capability grade (docs/design/node-grade.md). It scores five
+        // factors from telemetry the platform already gathers (§6, no new probes):
+        // CPU headroom (/proc/loadavg vs cores), RAM + disk free (/proc/meminfo,
+        // df /), role/worker health (the supervisor's live worker-status map +
+        // systemctl --failed), and mesh reachability (the replicated peer
+        // directory) — resource-heaviest weighted average → a smoothed 0–100 score
+        // + trend → an A–F band, published to
+        // `<workgroup_root>/node-grade/<hostname>.json` (the SEC-5 mesh-shunt
+        // own-row idiom) so every peer reads every node's grade. A debounced drop
+        // into D/F fires an `event/notify/node-grade` alert the chat worker folds
+        // into the Chat feed (CHAT-FIX-2). Universal (rank 0) like notify — every
+        // node grades itself; role_rank marks a lighthouse for the mesh factor and
+        // worker_status feeds the role factor.
+        if mackesd_core::worker_role::runs("node_grade", role_rank) {
+            let self_host = node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string();
+            sup.spawn(Spawn::new(
+                mackesd_core::workers::node_grade::NodeGradeWorker::new(
+                    self_host,
+                    workgroup_root.clone(),
+                    role_rank,
+                    Some(Arc::clone(&worker_status)),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names
+                .lock()
+                .expect("worker_names mutex")
+                .push("node_grade".into());
+        }
+
         // TUNE-3.b (2026-05-26) — wire the v1.3.0 Fleet ansible-pull
         // worker. `crates/mackesd/src/workers/ansible_pull.rs::build`
         // has shipped since v2.0.0 Phase B.6 but stayed dead;

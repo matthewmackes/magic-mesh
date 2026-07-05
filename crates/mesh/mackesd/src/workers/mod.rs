@@ -761,6 +761,18 @@ pub mod chat;
 // an injectable probe (absent binary ⇒ skipped honestly), so the whole worker is
 // headless-testable with fixtures; runs on EVERY node (rank 0).
 pub mod notify;
+// NODE-GRADE-1 — the per-node self-grade worker (design docs/design/node-grade.md).
+// Every node computes + publishes its OWN A–F capability grade from telemetry the
+// platform already gathers (§6, no new probes): CPU headroom, RAM + disk free,
+// role/worker health (the supervisor's live status + systemctl --failed), and mesh
+// reachability (the replicated peer directory). Five factor sub-scores → a
+// resource-heaviest weighted average → a smoothed 0–100 score + trend → an A–F
+// band, published to `<workgroup_root>/node-grade/<hostname>.json` (the SEC-5
+// mesh-shunt own-row idiom) so every peer reads every node's grade. A debounced
+// drop into D/F fires an `event/notify/node-grade` alert the chat worker folds into
+// the Chat feed (CHAT-FIX-2). Pure scoring/smoothing/debounce cores fold headless
+// behind an injectable sampler; runs on EVERY node (rank 0).
+pub mod node_grade;
 // CLIP-SYNC-1 — mesh clipboard sync. Watches the local Wayland clipboard
 // (`wl-paste --watch`, the Cosmic clipboard-manager hook), broadcasts every
 // text clip on the bus + appends to ONE mesh-global `clipboard/history.json`
