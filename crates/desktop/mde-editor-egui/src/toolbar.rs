@@ -57,11 +57,14 @@ impl ToolButton {
     }
 }
 
-/// One slot in the strip: a button, a Word group separator, or the zoom
-/// dropdown.
+/// One slot in the strip: a command button, a **toggle** (a pressed-state
+/// button), a Word group separator, or the zoom dropdown.
 pub enum StripEntry {
     /// A command button.
     Button(ToolButton),
+    /// A toggle button — renders pressed when its state reads back on (EDTB-7's
+    /// Preview toggle); dispatches its action to flip the state.
+    Toggle(ToolButton),
     /// A vertical group separator.
     Separator,
     /// The zoom dropdown (rendered only with an open document).
@@ -80,9 +83,16 @@ impl StripEntry {
     }
 }
 
+/// The EDTB-7 Preview toggle's checked state under `cx` — the split markdown
+/// preview pane is shown. Its own read-back so the toggle renders pressed; a
+/// plain command button has none.
+const fn toggle_checked(cx: &MenuContext, action: MenuAction) -> bool {
+    matches!(action, MenuAction::TogglePreview) && cx.preview_shown
+}
+
 /// The Standard strip in Word-97 order, as data — the render is one thin loop,
 /// and [`tests`] assert the order + that every button drives a real action.
-pub const STRIP: [StripEntry; 17] = [
+pub const STRIP: [StripEntry; 19] = [
     StripEntry::Button(ToolButton::new(
         "\u{FF0B}",
         "New",
@@ -159,6 +169,16 @@ pub const STRIP: [StripEntry; 17] = [
         Gate::RedoStack,
     )),
     StripEntry::Separator,
+    // EDTB-7 — the split markdown-preview toggle (a side-by-side rendered pane).
+    // A toggle, not a command: it renders pressed while the pane is shown, and
+    // greys out on a code buffer (Gate::Preview), which has no markdown to render.
+    StripEntry::Toggle(ToolButton::new(
+        "\u{25EB}",
+        "Preview",
+        MenuAction::TogglePreview,
+        Gate::Preview,
+    )),
+    StripEntry::Separator,
     StripEntry::Zoom,
 ];
 
@@ -190,6 +210,11 @@ pub fn show(ui: &mut Ui, cx: &MenuContext, compact: bool) -> Option<MenuAction> 
                         action = Some(picked);
                     }
                 }
+                StripEntry::Toggle(button) => {
+                    if let Some(picked) = toggle_button(ui, cx, button) {
+                        action = Some(picked);
+                    }
+                }
                 StripEntry::Zoom => {
                     if let Some(picked) = zoom_dropdown(ui, cx) {
                         action = Some(picked);
@@ -216,6 +241,21 @@ fn tool_button(ui: &mut Ui, cx: &MenuContext, button: &ToolButton) -> Option<Men
         .add_enabled(
             button.gate.enabled(cx),
             Button::new(RichText::new(button.glyph).size(Style::BODY)),
+        )
+        .on_hover_text(button.name)
+        .on_disabled_hover_text(button.name);
+    resp.clicked().then_some(button.action)
+}
+
+/// Render one Standard-toolbar **toggle** (EDTB-7's Preview) — a `SelectableLabel`
+/// that reads pressed while its state is on, greyed by its context gate exactly
+/// like a command button. Returns its action if the operator clicked it this frame.
+fn toggle_button(ui: &mut Ui, cx: &MenuContext, button: &ToolButton) -> Option<MenuAction> {
+    let on = toggle_checked(cx, button.action);
+    let resp = ui
+        .add_enabled(
+            button.gate.enabled(cx),
+            egui::SelectableLabel::new(on, RichText::new(button.glyph).size(Style::BODY)),
         )
         .on_hover_text(button.name)
         .on_disabled_hover_text(button.name);
@@ -276,7 +316,7 @@ fn overflow(ui: &mut Ui, cx: &MenuContext) -> Option<MenuAction> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MenuAction, StripEntry, STRIP, ZOOM_STEPS};
+    use super::{Gate, MenuAction, StripEntry, STRIP, ZOOM_STEPS};
 
     #[test]
     fn the_strip_is_the_word_97_standard_order() {
@@ -286,7 +326,7 @@ mod tests {
         let shape: Vec<String> = STRIP
             .iter()
             .map(|e| match e {
-                StripEntry::Button(b) => b.name.to_owned(),
+                StripEntry::Button(b) | StripEntry::Toggle(b) => b.name.to_owned(),
                 StripEntry::Separator => "|".to_owned(),
                 StripEntry::Zoom => "Zoom".to_owned(),
             })
@@ -310,6 +350,8 @@ mod tests {
                 "Undo",
                 "Redo",
                 "|",
+                "Preview",
+                "|",
                 "Zoom"
             ]
         );
@@ -318,7 +360,7 @@ mod tests {
     #[test]
     fn every_button_has_a_glyph_a_name_and_a_real_action() {
         for entry in &STRIP {
-            if let StripEntry::Button(b) = entry {
+            if let StripEntry::Button(b) | StripEntry::Toggle(b) = entry {
                 assert!(!b.glyph.is_empty(), "{} has no glyph", b.name);
                 assert!(!b.name.is_empty(), "a button has no tooltip name");
                 // No Zoom(_) hides among the buttons (zoom is the dropdown),
@@ -330,6 +372,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_preview_toggle_is_present_and_routes_to_its_menu_twin() {
+        // EDTB-7 — the split-preview toggle lives on the strip as a Toggle (not a
+        // command button) and dispatches the SAME action its View → Preview menu
+        // twin sends (§6, one dispatch seam).
+        let toggle = STRIP
+            .iter()
+            .find_map(|e| match e {
+                StripEntry::Toggle(b) => Some(b),
+                _ => None,
+            })
+            .expect("the Preview toggle is on the strip");
+        assert_eq!(toggle.name, "Preview");
+        assert_eq!(toggle.action, MenuAction::TogglePreview);
+        assert!(
+            matches!(toggle.gate, Gate::Preview),
+            "the Preview toggle greys out on a code buffer",
+        );
     }
 
     #[test]

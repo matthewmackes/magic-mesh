@@ -51,6 +51,15 @@
 //!   `hunspell` greys the control with an honest "hunspell not installed" note —
 //!   no crash, no fake underlines (§7). The RPM should `Requires: hunspell` + a
 //!   default dictionary.
+//! * EDTB-7 — the **split markdown preview** ([`markdown`]): a View → Preview
+//!   menu item + a Standard-toolbar toggle open a side-by-side rendered pane for
+//!   markdown / plain-text buffers (honest-disabled for code, §7). A small
+//!   self-contained subset parser maps headings / bold / italic / strike / lists
+//!   / quotes / fenced code / tables to the shared `mde_egui` text tiers
+//!   ([`Style::heading_size`](mde_egui::Style::heading_size) + the emphasis
+//!   [`TEXT_STRONG`](mde_egui::Style::TEXT_STRONG) tone, §4) — a real
+//!   markdown→egui render, re-parsed off the paint path (debounced on the buffer
+//!   revision like the spell pass) so it tracks live typing.
 //! * EDTB-2/3 — the **markdown formatting engine + Formatting toolbar**
 //!   ([`md_actions`] / [`format_bar`]): the Style dropdown, B/I/U/S, list, and
 //!   indent controls (Word's second toolbar row) plus the **Insert** (Table
@@ -126,6 +135,7 @@ pub mod highlight;
 pub mod lsp;
 pub mod lsp_nav;
 pub mod lsp_ui;
+pub mod markdown;
 pub mod md_actions;
 mod menu_bar;
 pub mod outline;

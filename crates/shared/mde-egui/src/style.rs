@@ -93,6 +93,13 @@ impl Style {
     pub const TEXT: Color32 = Color32::from_rgb(0xE6, 0xE6, 0xEC);
     /// Secondary / dimmed text.
     pub const TEXT_DIM: Color32 = Color32::from_rgb(0x9A, 0x9A, 0xA6);
+    /// **Emphasis** text — one rung brighter than [`TEXT`](Self::TEXT) (Carbon
+    /// white). The single embedded face (Droid Sans Mono, [`crate::fonts`]) has
+    /// no bold cut, so a *bold* / heading run cannot render heavier glyphs; the
+    /// honest token cue for weight on the dark ground is this brighter tone, the
+    /// mirror of [`TEXT_DIM`](Self::TEXT_DIM)'s dimmer one. Markdown preview
+    /// (EDTB-7) paints bold spans + heading titles with it.
+    pub const TEXT_STRONG: Color32 = Color32::from_rgb(0xF4, 0xF4, 0xF4);
 
     /// Interactive / brand accent (Quasar azure).
     pub const ACCENT: Color32 = Color32::from_rgb(0x5B, 0x8C, 0xFF);
@@ -174,8 +181,32 @@ impl Style {
     pub const SMALL: f32 = 12.0;
     /// Body text.
     pub const BODY: f32 = 14.0;
+    /// Sub-heading (Carbon productive-heading-04) — between [`BODY`](Self::BODY)
+    /// and [`HEADING`](Self::HEADING); the markdown-preview H3 rung (EDTB-7).
+    pub const TITLE: f32 = 18.0;
     /// Section heading.
     pub const HEADING: f32 = 22.0;
+    /// Display heading (Carbon productive-heading-06) — the largest type rung,
+    /// the markdown-preview H1 title size (EDTB-7).
+    pub const DISPLAY: f32 = 28.0;
+
+    /// The point size for a markdown/rich-text heading `level` on the shared
+    /// type ramp: H1 → [`DISPLAY`](Self::DISPLAY), H2 → [`HEADING`](Self::HEADING),
+    /// H3 → [`TITLE`](Self::TITLE), H4–H6 → [`BODY`](Self::BODY) (distinguished
+    /// by the emphasis tone, not a fourth size). Monotonic non-increasing, so a
+    /// deeper heading never renders larger than a shallower one; `0` and levels
+    /// past 6 clamp onto the ends. The markdown preview (`mde-editor-egui`,
+    /// EDTB-7) sizes every heading through this one ramp so no literal point size
+    /// leaks into the surface crate (§4).
+    #[must_use]
+    pub const fn heading_size(level: u8) -> f32 {
+        match level {
+            0 | 1 => Self::DISPLAY,
+            2 => Self::HEADING,
+            3 => Self::TITLE,
+            _ => Self::BODY,
+        }
+    }
 
     /// Install the shared look on an egui [`Context`] at the default (pointer)
     /// density. Call once per surface, from the harness runner's creation hook (see
@@ -451,7 +482,47 @@ mod tests {
     #[test]
     fn type_scale_is_ascending() {
         assert!(Style::SMALL < Style::BODY);
-        assert!(Style::BODY < Style::HEADING);
+        assert!(Style::BODY < Style::TITLE);
+        assert!(Style::TITLE < Style::HEADING);
+        assert!(Style::HEADING < Style::DISPLAY);
+    }
+
+    #[test]
+    fn heading_ramp_never_grows_with_depth() {
+        // EDTB-7 — the markdown-preview heading ramp: H1 is the largest rung and
+        // each deeper level is no larger than the one above it (a monotonic
+        // non-increasing ramp), so a deeper heading never out-sizes a shallower.
+        let sizes: Vec<f32> = (1..=6).map(Style::heading_size).collect();
+        assert_eq!(sizes[0], Style::DISPLAY, "H1 is the display rung");
+        assert_eq!(sizes[1], Style::HEADING, "H2 is the section-heading rung");
+        assert_eq!(sizes[2], Style::TITLE, "H3 is the sub-heading rung");
+        for w in sizes.windows(2) {
+            assert!(w[0] >= w[1], "heading ramp must not grow with depth");
+        }
+        // Every rung is a shared type-scale token — no orphan literal size.
+        for size in sizes {
+            assert!(
+                [Style::DISPLAY, Style::HEADING, Style::TITLE, Style::BODY].contains(&size),
+                "heading size {size} is off the shared type ramp"
+            );
+        }
+    }
+
+    #[test]
+    fn emphasis_text_is_brighter_than_body_and_opaque() {
+        // EDTB-7 — the bold/heading tone reads one rung brighter than body text
+        // (the honest weight cue for a font with no bold cut) and stays opaque so
+        // a bold glyph never ghosts on the dark ground.
+        let sum = |c: egui::Color32| u32::from(c.r()) + u32::from(c.g()) + u32::from(c.b());
+        assert!(
+            sum(Style::TEXT_STRONG) > sum(Style::TEXT),
+            "TEXT_STRONG must sit brighter than TEXT"
+        );
+        assert!(
+            sum(Style::TEXT) > sum(Style::TEXT_DIM),
+            "TEXT must sit brighter than TEXT_DIM"
+        );
+        assert_eq!(Style::TEXT_STRONG.a(), 0xFF, "emphasis text must be opaque");
     }
 
     #[test]

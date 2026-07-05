@@ -13,8 +13,9 @@
 //!   in-buffer find is EDITOR-8 and has not landed, so there is no honest
 //!   target yet (the finder finds *files*, not text — routing Find there would
 //!   lie about what it does).
-//! * **View** — Project Tree + Terminal + Soft-Wrap toggles (checked = current state).
-//!   Preview / per-bar toggles arrive with EDTB-7 / later phases.
+//! * **View** — Project Tree + Terminal + Preview (EDTB-7, the split markdown
+//!   pane; greyed on a code buffer) + Soft-Wrap toggles (checked = current state).
+//!   The per-bar toggles arrive with later phases.
 //! * **Insert** (EDTB-3) — Table…, which opens the Word grid-picker and drops a
 //!   markdown table skeleton at the caret ([`crate::md_actions::insert_table`]).
 //! * **Format** (EDTB-3) — the menu twin of the Formatting strip: Bold / Italic
@@ -103,6 +104,9 @@ pub enum MenuAction {
     ToggleTree,
     /// Show/hide the integrated terminal dock (EDITOR-10; the palette's toggle).
     ToggleTerminal,
+    /// Show/hide the split markdown preview pane (EDTB-7) — a side-by-side
+    /// rendered view of a markdown / text buffer.
+    TogglePreview,
     /// Flip the editor's soft-wrap (the palette's toggle).
     ToggleWrap,
     /// Toggle the command palette — the same overlay `Ctrl-Shift-P` raises.
@@ -197,6 +201,9 @@ pub enum Gate {
     /// Needs a spell-checkable (md/text) document AND an installed `hunspell`
     /// (EDTB-6) — the honest grey when the feature can't run (§7).
     Spell,
+    /// Needs a previewable (md/text) document (EDTB-7) — the honest grey on a
+    /// code buffer, which has no markdown to render.
+    Preview,
 }
 
 impl Gate {
@@ -209,6 +216,7 @@ impl Gate {
             Self::UndoStack => cx.can_undo,
             Self::RedoStack => cx.can_redo,
             Self::Spell => cx.spell_available && cx.spellcheckable,
+            Self::Preview => cx.preview_available,
         }
     }
 }
@@ -248,6 +256,12 @@ pub struct MenuContext {
     pub spell_available: bool,
     /// The open document is a spell-checkable (md/text) type (EDTB-6).
     pub spellcheckable: bool,
+    /// The open document is a previewable (md/text) type (EDTB-7) — the View →
+    /// Preview / toolbar toggle's gate; a code buffer greys it out.
+    pub preview_available: bool,
+    /// The split markdown preview pane is shown (EDTB-7) — the View → Preview
+    /// checkmark + the toolbar toggle's pressed state.
+    pub preview_shown: bool,
 }
 
 /// One menu item: its label, its (existing, real) shortcut hint, the action it
@@ -291,6 +305,7 @@ impl MenuItem {
         match self.action {
             MenuAction::ToggleTree => Some(cx.tree_shown),
             MenuAction::ToggleTerminal => Some(cx.terminal_shown),
+            MenuAction::TogglePreview => Some(cx.preview_shown),
             MenuAction::ToggleWrap => Some(cx.wrap_on),
             _ => None,
         }
@@ -347,8 +362,9 @@ const EDIT_ITEMS: [MenuItem; 6] = [
     ),
 ];
 
-/// The View menu — the real toggles (Preview/bars arrive in later phases).
-const VIEW_ITEMS: [MenuItem; 3] = [
+/// The View menu — the real toggles. Preview (EDTB-7) greys on a code buffer
+/// (`Gate::Preview`); the remaining per-bar toggles arrive in later phases.
+const VIEW_ITEMS: [MenuItem; 4] = [
     MenuItem::new(
         "Project Tree",
         "",
@@ -361,6 +377,13 @@ const VIEW_ITEMS: [MenuItem; 3] = [
         "Ctrl+`",
         MenuAction::ToggleTerminal,
         Gate::Always,
+        false,
+    ),
+    MenuItem::new(
+        "Preview",
+        "",
+        MenuAction::TogglePreview,
+        Gate::Preview,
         false,
     ),
     MenuItem::new("Soft-Wrap", "", MenuAction::ToggleWrap, Gate::Doc, false),
@@ -541,6 +564,8 @@ mod tests {
             heading_level: Some(0),
             spell_available: true,
             spellcheckable: true,
+            preview_available: true,
+            preview_shown: true,
         }
     }
 
@@ -558,6 +583,8 @@ mod tests {
             heading_level: None,
             spell_available: false,
             spellcheckable: false,
+            preview_available: false,
+            preview_shown: false,
         }
     }
 
@@ -742,8 +769,11 @@ mod tests {
         for (_, items) in MENUS {
             for item in items {
                 match item.action {
-                    // Project Tree + Terminal both read back `true` in `full_context`.
-                    MenuAction::ToggleTree | MenuAction::ToggleTerminal => {
+                    // Project Tree + Terminal + Preview all read back `true` in
+                    // `full_context`.
+                    MenuAction::ToggleTree
+                    | MenuAction::ToggleTerminal
+                    | MenuAction::TogglePreview => {
                         assert_eq!(item.checked(&cx), Some(true));
                         toggles += 1;
                     }
@@ -755,6 +785,6 @@ mod tests {
                 }
             }
         }
-        assert_eq!(toggles, 3, "the three View toggles are check-style");
+        assert_eq!(toggles, 4, "the four View toggles are check-style");
     }
 }

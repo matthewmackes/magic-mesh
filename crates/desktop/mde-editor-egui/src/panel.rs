@@ -41,6 +41,7 @@ use crate::highlight::{Highlighter, Language};
 use crate::lsp::{Location, LspClient, LspReply, TextEdit, WorkspaceEdit};
 use crate::lsp_nav::{self, RefRow, ReferencesPanel, RenameBox};
 use crate::lsp_ui::{lsp_status, DiagnosticsOverlay};
+use crate::markdown;
 use crate::md_actions::{self, ListKind};
 use crate::menu_bar::{self, ListStyle, MenuAction, MenuContext};
 use crate::outline;
@@ -60,6 +61,11 @@ const TREE_WIDTH: f32 = Style::SP_XL * 6.0;
 /// The symbol-outline side panel's default width (EDITOR-12) — six shared
 /// spacing units (§4), the tree's twin on the opposite edge.
 const OUTLINE_WIDTH: f32 = Style::SP_XL * 6.0;
+
+/// The split markdown-preview pane's default width (EDTB-7) — eleven shared
+/// spacing units (§4), roughly the editor's own half so the two read side by
+/// side; resizable, so this is only the opening size.
+const PREVIEW_WIDTH: f32 = Style::SP_XL * 11.0;
 
 /// Below this panel width the Word toolbars lean out (EDTB-4, design lock #9):
 /// each strip's width-heavy dropdown folds into a `»` overflow so the Standard +
@@ -158,6 +164,23 @@ struct Doc {
     /// underlines + the `F7` walk steps, and the background-check debounce. Empty
     /// for a code / non-spell-checkable buffer.
     spell: SpellChecker,
+    /// The EDTB-7 split-preview parse cache: the parsed markdown [`Block`](markdown::Block)s
+    /// and the buffer revision they were parsed at, so the preview re-parses only
+    /// when the buffer changed (the debounce, mirroring the spell pass) — never a
+    /// per-frame full-document parse. `None` revision = not yet parsed.
+    preview: PreviewCache,
+}
+
+/// One document's markdown-preview parse cache (EDTB-7): the parsed blocks + the
+/// buffer revision they reflect, so [`Doc::preview_blocks`] re-parses only on a
+/// real edit.
+#[derive(Default)]
+struct PreviewCache {
+    /// The buffer revision the cached blocks were parsed from, or `None` before
+    /// the first parse.
+    rev: Option<u64>,
+    /// The parsed markdown blocks the preview pane renders.
+    blocks: Vec<markdown::Block>,
 }
 
 impl Doc {
@@ -179,12 +202,32 @@ impl Doc {
             autosave_rev,
             idle_since: 0.0,
             spell: SpellChecker::default(),
+            preview: PreviewCache::default(),
         }
     }
 
     /// Whether this document is spell-checked (EDTB-6, md/text first).
     fn spellcheckable(&self) -> bool {
         spell::is_spellcheckable(self.buffer.path())
+    }
+
+    /// Whether this document gets the split markdown preview (EDTB-7, md/text
+    /// first) — a code buffer greys the toggle out (§7).
+    fn previewable(&self) -> bool {
+        markdown::is_previewable(self.buffer.path())
+    }
+
+    /// The parsed markdown blocks for the split preview (EDTB-7), re-parsed only
+    /// when the buffer revision moved since the last parse (the debounce, so live
+    /// typing reflects without a per-frame full parse). Stringifies the rope only
+    /// on a real edit; a quiet frame returns the cached blocks untouched.
+    fn preview_blocks(&mut self) -> &[markdown::Block] {
+        let rev = self.buffer.revision();
+        if self.preview.rev != Some(rev) {
+            self.preview.blocks = markdown::parse(&self.buffer.rope().to_string());
+            self.preview.rev = Some(rev);
+        }
+        &self.preview.blocks
     }
 
     /// Drive the per-document spell pass (EDTB-6) — the spell analogue of
@@ -466,6 +509,10 @@ pub struct EditorSurface {
     show_tree: bool,
     /// Whether the symbol-outline side panel is shown (EDITOR-12).
     show_outline: bool,
+    /// Whether the split markdown-preview pane is shown (EDTB-7). Only rendered
+    /// while the focused document is previewable (md/text); the View → Preview /
+    /// toolbar toggle greys out on a code buffer.
+    show_preview: bool,
     /// The fuzzy file-finder overlay (EDITOR-7, `Cmd`/`Ctrl-P`).
     finder: FileFinder,
     /// The command-palette overlay (EDITOR-7, `Cmd`/`Ctrl-Shift-P`).
@@ -536,6 +583,7 @@ impl Default for EditorSurface {
             project: None,
             show_tree: false,
             show_outline: false,
+            show_preview: false,
             finder: FileFinder::default(),
             palette: CommandPalette::default(),
             find: FindState::default(),
@@ -1643,6 +1691,20 @@ impl EditorSurface {
         }
     }
 
+    // ── EDTB-7: the split markdown preview ──────────────────────────────────
+
+    /// Toggle the split markdown-preview pane (View → Preview / the toolbar
+    /// toggle). Opening it is honest-gated on a previewable (md/text) focused
+    /// document: on a code buffer this is a genuine no-op (and the menu/toolbar
+    /// grey the control out), never a pane of nonsense (§7). Closing always works.
+    pub(crate) fn toggle_preview(&mut self) {
+        if self.show_preview {
+            self.show_preview = false;
+        } else if self.doc().is_some_and(Doc::previewable) {
+            self.show_preview = true;
+        }
+    }
+
     // ── EDTB-1: the Word-97 menu bar + Standard toolbar ─────────────────────
 
     /// Snapshot the enablement + toggle/zoom state the menu bar and toolbar
@@ -1668,6 +1730,10 @@ impl EditorSurface {
             // `hunspell` is installed and the buffer is a spell-checkable type.
             spell_available: self.spell_state.is_ready(),
             spellcheckable: doc.is_some_and(Doc::spellcheckable),
+            // EDTB-7 — the View → Preview / toolbar toggle greys out on a code
+            // buffer and reads back the pane's shown state.
+            preview_available: doc.is_some_and(Doc::previewable),
+            preview_shown: self.show_preview,
         }
     }
 
@@ -1731,6 +1797,8 @@ impl EditorSurface {
             }
             MenuAction::ToggleTree => self.run_command(PaletteCommand::ToggleTree),
             MenuAction::ToggleTerminal => self.run_command(PaletteCommand::ToggleTerminal),
+            // ── EDTB-7: the split markdown preview ───────────────────────────
+            MenuAction::TogglePreview => self.toggle_preview(),
             MenuAction::ToggleWrap => self.run_command(PaletteCommand::ToggleWrap),
             MenuAction::CommandPalette => self.toggle_palette(),
             MenuAction::About => self.about_open = true,
@@ -2861,6 +2929,38 @@ impl EditorSurface {
     /// Lay the split tree out into `rect` and render every leaf (its tab bar +
     /// active tab's widget), the draggable dividers, and the focus ring. Deferred
     /// tab/pane actions are applied after all borrows release.
+    /// Render the EDTB-7 split markdown-preview pane on the right edge (the
+    /// editor's side-by-side rendered half). Re-parses the focused document only
+    /// on a real edit ([`Doc::preview_blocks`]'s debounce) so live typing tracks;
+    /// an empty document shows an honest hint (§7). Only called while the focused
+    /// document is previewable, so the pane never renders nonsense for code.
+    fn render_preview(&mut self, ui: &mut Ui) {
+        egui::SidePanel::right("editor-preview")
+            .resizable(true)
+            .default_width(PREVIEW_WIDTH)
+            .frame(egui::Frame::default().fill(Style::BG))
+            .show_inside(ui, |ui| {
+                ui.add_space(Style::SP_XS);
+                ui.horizontal(|ui| {
+                    ui.add_space(Style::SP_S);
+                    ui.label(
+                        RichText::new("Preview")
+                            .size(Style::SMALL)
+                            .color(Style::TEXT_DIM),
+                    );
+                });
+                ui.separator();
+                if let Some(doc) = self.doc_mut() {
+                    let blocks = doc.preview_blocks();
+                    if blocks.is_empty() {
+                        preview_empty(ui);
+                    } else {
+                        markdown::show(ui, blocks);
+                    }
+                }
+            });
+    }
+
     fn render_panes(
         &mut self,
         ui: &mut Ui,
@@ -3328,6 +3428,14 @@ pub fn editor_panel(ui: &mut Ui, surface: &mut EditorSurface) {
         }
     }
 
+    // EDTB-7 — the split markdown-preview pane, a right-edge rendered view of the
+    // focused markdown/text buffer (the outline's neighbour). Only mounted while
+    // the focused document is previewable, so switching to a code tab honestly
+    // hides it (its toggle greys out) instead of rendering nonsense (§7).
+    if surface.show_preview && surface.doc().is_some_and(Doc::previewable) {
+        surface.render_preview(ui);
+    }
+
     egui::CentralPanel::default().show_inside(ui, |ui| {
         // EDITOR-6 — the surface chrome strip (tree toggle + split controls),
         // then the focused document's status line pinned to the bottom, then the
@@ -3391,6 +3499,25 @@ fn no_folder_face(ui: &mut Ui, open_cwd: &mut bool) {
         *open_cwd = ui
             .button(RichText::new("Open current folder").size(Style::SMALL))
             .clicked();
+    });
+}
+
+/// The split-preview pane's honest empty face (§7): shown when the previewable
+/// buffer has no content yet, so the pane is never a blank void. Token-styled (§4).
+fn preview_empty(ui: &mut Ui) {
+    ui.add_space(Style::SP_M);
+    ui.vertical_centered(|ui| {
+        ui.label(
+            RichText::new("Nothing to preview yet")
+                .size(Style::BODY)
+                .color(Style::TEXT_DIM),
+        );
+        ui.add_space(Style::SP_XS);
+        ui.label(
+            RichText::new("Type markdown to see it rendered here.")
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+        );
     });
 }
 
@@ -4153,6 +4280,80 @@ mod tests {
         assert!(
             surface.finder.is_open(),
             "File > Open… opened the Ctrl-P finder"
+        );
+    }
+
+    /// EDTB-7 — the View → Preview / toolbar toggle is honest-gated on the buffer
+    /// type: a markdown / text buffer opens the split preview; a code buffer does
+    /// not offer it (the control greys out) and toggling it is a no-op (§7).
+    #[test]
+    fn preview_toggle_gates_on_the_buffer_type() {
+        // A markdown buffer offers + opens the preview…
+        let mut surface = real_editor();
+        surface.open_text("# Title\n");
+        assert!(
+            surface.menu_context().preview_available,
+            "a markdown buffer offers the Preview toggle"
+        );
+        run_action_in_frame(&mut surface, MenuAction::TogglePreview);
+        assert!(surface.show_preview, "View > Preview opened the split pane");
+        assert!(
+            surface.menu_context().preview_shown,
+            "the context reads the pane back as shown (the checkmark / pressed state)"
+        );
+        run_action_in_frame(&mut surface, MenuAction::TogglePreview);
+        assert!(!surface.show_preview, "toggling again closed the pane");
+
+        // …a code buffer greys the toggle out and toggling is an honest no-op.
+        let d = TempDir::new("preview-gate");
+        let code = d.join("main.rs");
+        std::fs::write(&code, b"fn main() {}\n").expect("seed");
+        let mut surface = real_editor();
+        surface.open_path(&code).expect("open");
+        assert!(
+            !surface.menu_context().preview_available,
+            "a code buffer does not offer the Preview toggle"
+        );
+        run_action_in_frame(&mut surface, MenuAction::TogglePreview);
+        assert!(
+            !surface.show_preview,
+            "the preview stays closed for a code buffer (honest no-op)"
+        );
+    }
+
+    /// EDTB-7 — the preview tracks the buffer live: opening the pane parses the
+    /// document, and an edit re-parses (debounced on the revision) so the rendered
+    /// blocks reflect what was typed — proven through the real `editor_panel`
+    /// paint path, not a mocked seam.
+    #[test]
+    fn the_preview_renders_live_as_the_buffer_changes() {
+        let mut surface = real_editor();
+        surface.open_text("# One\n");
+        run_action_in_frame(&mut surface, MenuAction::TogglePreview);
+        assert!(surface.show_preview, "the preview pane is open");
+
+        // The first paint parses the initial buffer (one heading block).
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the split preview pane paints"
+        );
+        let before = surface.doc_mut().expect("doc").preview_blocks().to_vec();
+        assert_eq!(before.len(), 1, "one heading block to start: {before:?}");
+
+        // Type a fresh markdown paragraph, then re-paint.
+        {
+            let doc = surface.doc_mut().expect("doc");
+            let end = doc.buffer.len_chars();
+            doc.buffer.insert(end, "\nfresh **para** text\n");
+        }
+        assert!(
+            tessellate_panel(&mut surface) > 0,
+            "the preview re-paints after the edit"
+        );
+        let after = surface.doc_mut().expect("doc").preview_blocks().to_vec();
+        assert!(
+            after.len() > before.len(),
+            "the edit reflects live in the preview blocks: {before:?} -> {after:?}"
         );
     }
 
