@@ -790,6 +790,23 @@ mod tests {
     }
 
     #[test]
+    fn attach_and_paint_ready_encode_to_the_pinned_golden() {
+        // The exact bytes the sandboxed helper (`mde-web-preview`) must reproduce —
+        // it shares THIS file, but pinning the golden on both ends turns an
+        // accidental un-share-and-drift into a red test rather than a silent
+        // "stuck on Loading the page…" regression. Mirrored in the helper's
+        // `tests/protocol_golden.rs`.
+        assert_eq!(EventMsg::AttachFrame.encode(), vec![0u8]);
+        assert_eq!(
+            EventMsg::PaintReady {
+                seq: 0x0102_0304_0506_0708
+            }
+            .encode(),
+            vec![1, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01],
+        );
+    }
+
+    #[test]
     fn every_keycode_round_trips_its_discriminant() {
         for raw in 0u16..=62 {
             let key = KeyCode::from_u16(raw).expect("dense 0..=62 range");
