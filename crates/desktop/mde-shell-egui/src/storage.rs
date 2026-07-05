@@ -912,12 +912,17 @@ impl StorageState {
 
     /// Render the Storage surface's live content.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(Style::SP_S);
-        ui.heading(
-            RichText::new("Storage")
-                .color(Style::TEXT)
-                .size(Style::HEADING),
-        );
+        // MENUBAR-ALL — the shared top bar (STORAGE). Its menus are mouse twins of the
+        // surface's own seams (§6, one path): **Peer** switches the active node (the
+        // picker), **Disk** refreshes its topology / clears the staged queue, and
+        // **Operation** jumps the compose form to any op — surfacing every advanced
+        // action (New table · Format · Delete · Mount · Unmount …) discoverably (the
+        // governing principle), each honestly gated to a selected target (§7). The
+        // bar's UPPERCASE display title replaces the old proportional heading.
+        if let Some(action) = menubar::show(self, ui) {
+            menubar::apply(self, action);
+        }
+        ui.separator();
         ui.colored_label(
             Style::TEXT_DIM,
             "Disks & partitions across the mesh — stage a queue, arm the target, apply over the Bus.",
@@ -1770,6 +1775,291 @@ fn show_progress(ui: &mut egui::Ui, progress: &[StorageProgress], goto_instances
                     });
                 }
             });
+        }
+    }
+}
+
+/// MENUBAR-ALL (Storage) — the shared top bar over the GParted-style surface.
+///
+/// Every item is the mouse twin of a seam the surface already drives (§6, one path):
+/// **Peer** switches the active node ([`StorageState::select_node`], the picker's
+/// seam); **Disk → Refresh Topology** re-publishes the `Refresh` request the inline
+/// button sends, and **Clear Queue** drops the staged ops; **Operation** jumps the
+/// compose form's `kind` to any op — the governing principle's point, surfacing the
+/// advanced New-table / Format / Delete / Mount / Unmount ops discoverably. Each
+/// item is honestly gated (§7): Peer is present only when a peer has published,
+/// Refresh needs a selected node, Clear needs a non-empty queue, and Operation needs
+/// a selected disk — a context-gated item disables, an absent one is omitted, never
+/// a dead entry. The status cluster reads the live fleet rollup + queue depth.
+mod menubar {
+    use super::{OpKind, StorageRequest, StorageState, DOT};
+    use mde_egui::egui::Ui;
+    use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
+    use mde_egui::{ChipTone, StatusChip, Style};
+
+    /// One menu action — each routes to a real Storage seam in [`apply`]. Owned (a
+    /// peer id is a `String`), so `Clone` (not `Copy`) satisfies the shared bar.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) enum MenuAction {
+        /// Switch the active peer (the picker's `select_node` seam).
+        SelectPeer(String),
+        /// Re-publish the selected peer's live topology (`StorageRequest::Refresh`).
+        RefreshTopology,
+        /// Drop the staged op queue + its arming echo.
+        ClearQueue,
+        /// Jump the compose form to this op kind (its own dropdown seam).
+        StageKind(OpKind),
+    }
+
+    /// Render the STORAGE bar and return the action picked this frame, if any.
+    pub(super) fn show(state: &StorageState, ui: &mut Ui) -> Option<MenuAction> {
+        let menus = build_menus(state);
+        let status = build_status(state);
+        let model = MenuBarModel {
+            // Storage sits in the dock's "System" group (gold), so the title wears
+            // that categorical accent (lock 2).
+            title: "Storage",
+            accent: Style::ACCENT_SYSTEM,
+            menus: &menus,
+            status: &status,
+        };
+        MenuBar::show(ui, &model)
+    }
+
+    /// Build the menus from live state, each honestly gated (§7).
+    fn build_menus(state: &StorageState) -> Vec<Menu<MenuAction>> {
+        let mut menus = Vec::new();
+        let selected_node = state.selected_node.clone();
+
+        // Peer — one radio per published node (omitted entirely until a peer lands).
+        if !state.nodes.is_empty() {
+            let peers: Vec<Entry<MenuAction>> = state
+                .nodes
+                .iter()
+                .map(|n| {
+                    let checked = selected_node.as_deref() == Some(n.host.as_str());
+                    let label = if n.host == state.local_host {
+                        format!("{} (this node)", n.host)
+                    } else {
+                        n.host.clone()
+                    };
+                    Entry::Item(
+                        Item::new(MenuAction::SelectPeer(n.host.clone()), label).checked(checked),
+                    )
+                })
+                .collect();
+            menus.push(Menu::new("Peer", peers));
+        }
+
+        // Disk — refresh the selected peer's topology / clear the staged queue.
+        menus.push(Menu::new(
+            "Disk",
+            vec![
+                Entry::Item(
+                    Item::new(MenuAction::RefreshTopology, "Refresh Topology")
+                        .enabled(selected_node.is_some()),
+                ),
+                Entry::Separator,
+                Entry::Item(
+                    Item::new(MenuAction::ClearQueue, "Clear Staged Queue")
+                        .enabled(!state.queue.is_empty()),
+                ),
+            ],
+        ));
+
+        // Operation — jump the compose form to any op (present only when a disk is
+        // selected to stage against; the active op radio-checked).
+        if state.selected_device.is_some() {
+            let active = state.compose.kind;
+            let ops: Vec<Entry<MenuAction>> = OpKind::ALL
+                .iter()
+                .map(|&k| {
+                    Entry::Item(Item::new(MenuAction::StageKind(k), k.label()).checked(k == active))
+                })
+                .collect();
+            menus.push(Menu::new("Operation", ops));
+        }
+        menus
+    }
+
+    /// The live status cluster: the fleet rollup (disks · peers), the selected peer's
+    /// backend health, and the staged-queue depth.
+    fn build_status(state: &StorageState) -> Vec<StatusChip> {
+        let peers = state.nodes.len();
+        let disks: usize = state.nodes.iter().map(|n| n.topology.devices.len()).sum();
+        let mut chips = vec![StatusChip::new(
+            format!(
+                "{disks} disk{} \u{00B7} {peers} peer{}",
+                if disks == 1 { "" } else { "s" },
+                if peers == 1 { "" } else { "s" }
+            ),
+            ChipTone::Neutral,
+        )];
+
+        if let Some(node) = state.selected() {
+            let tone = if node.available() {
+                ChipTone::Ok
+            } else {
+                ChipTone::Warn
+            };
+            chips.push(StatusChip::with_icon(DOT, node.host.clone(), tone));
+        }
+
+        let staged = state.queue.len();
+        if staged > 0 {
+            chips.push(StatusChip::new(format!("{staged} staged"), ChipTone::Info));
+        }
+        chips
+    }
+
+    /// Apply a picked action to its real seam (§6, no new behaviour).
+    pub(super) fn apply(state: &mut StorageState, action: MenuAction) {
+        match action {
+            MenuAction::SelectPeer(host) => state.select_node(&host),
+            MenuAction::RefreshTopology => {
+                if let Some(node) = state.selected_node.clone() {
+                    state.publish(&node, &StorageRequest::Refresh);
+                }
+            }
+            MenuAction::ClearQueue => {
+                state.queue.clear();
+                state.arming.clear();
+                state.compose_error = None;
+            }
+            MenuAction::StageKind(kind) => {
+                state.compose.kind = kind;
+                state.compose_error = None;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::{BackendStatus, NodeStorage, StorageState, Topology};
+        use super::{apply, build_menus, build_status, MenuAction};
+        use mde_egui::menubar::Entry;
+        use mde_egui::ChipTone;
+
+        /// One node view with the given backend health (an empty topology is enough
+        /// for the bar's peer + rollup seams).
+        fn node(host: &str, available: bool) -> NodeStorage {
+            NodeStorage {
+                host: host.to_string(),
+                backend: if available {
+                    BackendStatus::Available
+                } else {
+                    BackendStatus::Unavailable {
+                        reason: "UDisks2 unreachable".to_string(),
+                    }
+                },
+                topology: Topology::default(),
+                published_at_ms: 0,
+            }
+        }
+
+        /// A state carrying two nodes — enough to exercise the peer + rollup seams.
+        fn two_node_state() -> StorageState {
+            StorageState {
+                nodes: vec![node("nodeA", true), node("nodeB", false)],
+                local_host: "nodeA".to_string(),
+                selected_node: Some("nodeA".to_string()),
+                ..StorageState::default()
+            }
+        }
+
+        #[test]
+        fn peer_menu_is_omitted_until_a_peer_publishes() {
+            let empty = StorageState::default();
+            let menus = build_menus(&empty);
+            assert!(
+                !menus.iter().any(|m| m.title == "Peer"),
+                "no peer ⇒ the Peer menu is omitted, not present-but-empty (§7)"
+            );
+            // Disk is always present; its items are gated (no node ⇒ Refresh greys,
+            // empty queue ⇒ Clear greys) — disabled, never omitted.
+            let disk = menus.iter().find(|m| m.title == "Disk").expect("Disk menu");
+            for entry in &disk.entries {
+                if let Entry::Item(item) = entry {
+                    assert!(
+                        !item.enabled,
+                        "{} greys with no node / empty queue",
+                        item.label
+                    );
+                }
+            }
+            assert!(
+                !menus.iter().any(|m| m.title == "Operation"),
+                "no selected disk ⇒ the Operation menu is omitted"
+            );
+        }
+
+        #[test]
+        fn peer_menu_lists_every_node_with_the_active_one_checked() {
+            let state = two_node_state();
+            let menus = build_menus(&state);
+            let peer = menus.iter().find(|m| m.title == "Peer").expect("Peer menu");
+            let ids: Vec<&MenuAction> = peer
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Item(i) => Some(&i.id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ids.len(), 2, "both peers reachable");
+            // The active peer (nodeA) is the checked one.
+            for entry in &peer.entries {
+                if let Entry::Item(item) = entry {
+                    let is_a = item.id == MenuAction::SelectPeer("nodeA".to_string());
+                    assert_eq!(item.checked, Some(is_a), "only the active peer is checked");
+                }
+            }
+        }
+
+        #[test]
+        fn selecting_a_peer_switches_the_active_node() {
+            let mut state = two_node_state();
+            apply(&mut state, MenuAction::SelectPeer("nodeB".to_string()));
+            assert_eq!(state.selected_node.as_deref(), Some("nodeB"));
+        }
+
+        #[test]
+        fn clear_queue_drops_the_staged_ops_and_arming() {
+            let mut state = two_node_state();
+            state.queue = vec![super::super::StorageOp::Unmount {
+                partition: "/dev/sdb1".to_string(),
+            }];
+            state.arming = "nodeA".to_string();
+            apply(&mut state, MenuAction::ClearQueue);
+            assert!(state.queue.is_empty(), "the queue is cleared");
+            assert!(state.arming.is_empty(), "the arming echo is cleared");
+        }
+
+        #[test]
+        fn stage_kind_jumps_the_compose_form() {
+            let mut state = two_node_state();
+            apply(
+                &mut state,
+                MenuAction::StageKind(super::super::OpKind::Format),
+            );
+            assert_eq!(state.compose.kind, super::super::OpKind::Format);
+        }
+
+        #[test]
+        fn status_shows_the_rollup_peer_health_and_queue_depth() {
+            let mut state = two_node_state();
+            state.queue = vec![super::super::StorageOp::Unmount {
+                partition: "/dev/sdb1".to_string(),
+            }];
+            let chips = build_status(&state);
+            // The fleet rollup (2 peers) + the active peer's health dot + the queue.
+            assert!(chips.iter().any(|c| c.text.contains("2 peers")));
+            assert!(chips
+                .iter()
+                .any(|c| c.text == "nodeA" && c.tone == ChipTone::Ok));
+            assert!(chips
+                .iter()
+                .any(|c| c.text == "1 staged" && c.tone == ChipTone::Info));
         }
     }
 }

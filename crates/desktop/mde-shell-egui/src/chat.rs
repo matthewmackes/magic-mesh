@@ -424,6 +424,17 @@ impl ChatState {
     /// Render the ICQ surface: the roster rail on the left, the selected
     /// contact's conversation pane filling the rest.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
+        // MENUBAR-ALL — the shared top bar (CHAT), above the roster + pane. Its menus
+        // are mouse twins of the surface's own seams (§6): **Conversation** mutes /
+        // closes the open thread, **Presence** sets this seat's presence + opens the
+        // status editor — the SAME `action/chat/*` publishes + local toggles the panel
+        // drives. Rendered before the no-roster early-return so the bar is always
+        // present (its Presence menu honestly omits itself until a roster lands, §7).
+        if let Some(action) = menubar::show(self, ui) {
+            menubar::apply(self, action);
+        }
+        ui.separator();
+
         let Some(roster) = self.roster.clone() else {
             let (title, subtitle) = empty_copy(self.bus_root.is_some());
             crate::session::empty_state(ui, title, subtitle);
@@ -762,7 +773,13 @@ impl ChatState {
             .stick_to_bottom(true)
             .show(ui, |ui| match self.convos.get(host) {
                 Some(conv) if !conv.is_empty() => {
-                    render_timeline(ui, conv.messages(), self_host, recipient, bus_root.as_deref());
+                    render_timeline(
+                        ui,
+                        conv.messages(),
+                        self_host,
+                        recipient,
+                        bus_root.as_deref(),
+                    );
                 }
                 _ => {
                     let subtitle = if is_self {
@@ -1048,6 +1065,245 @@ impl ChatState {
     }
 }
 
+/// MENUBAR-ALL (Chat) — the shared top bar over the ICQ surface.
+///
+/// Every item is the mouse twin of a seam the surface already drives (§6, one
+/// publish/toggle path): **Conversation → Mute** flips the open thread's
+/// `action/chat/mute` policy (the row context-menu's seam), **Close** deselects it;
+/// **Presence** posts this seat's `action/chat/presence` (the self-line picker's
+/// seam) and **Edit Status…** opens the same inline editor the self-line ✎ does.
+/// A context-gated item (Mute/Close with nothing selected) renders **disabled**, and
+/// the whole Presence menu is **omitted** until a roster (a self contact) exists —
+/// never a dead entry (§7). The File/Edit/Help spine has no chat seam, so it is
+/// honestly absent. The status cluster shows this seat's live presence + the
+/// whole-mesh unread tally.
+mod menubar {
+    use super::{ChatState, PresenceChoice, Selection};
+    use mde_egui::egui::Ui;
+    use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
+    use mde_egui::{ChipTone, StatusChip, Style};
+
+    /// A filled status dot — the same glyph the roster rows use.
+    const DOT: &str = "\u{25CF}";
+
+    /// One menu action — each routes to a real Chat seam in [`apply`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum MenuAction {
+        /// Toggle the selected conversation's mute policy (`action/chat/mute`).
+        MuteConversation,
+        /// Deselect the open conversation (local nav).
+        CloseConversation,
+        /// Set this seat's presence (`action/chat/presence`).
+        SetPresence(PresenceChoice),
+        /// Open the inline self-status editor (the self-line ✎ seam).
+        EditStatus,
+    }
+
+    /// Render the CHAT bar and return the action picked this frame, if any.
+    pub(super) fn show(state: &ChatState, ui: &mut Ui) -> Option<MenuAction> {
+        let menus = build_menus(state);
+        let status = build_status(state);
+        let model = MenuBarModel {
+            // The dock groups Chat under **Comms** (cyan), so the title wears that
+            // categorical accent (lock 2).
+            title: "Chat",
+            accent: Style::ACCENT_COMMS,
+            menus: &menus,
+            status: &status,
+        };
+        MenuBar::show(ui, &model)
+    }
+
+    /// This seat's current presence choice, or `None` before a roster lands.
+    fn current_presence(state: &ChatState) -> Option<PresenceChoice> {
+        state
+            .roster
+            .as_ref()
+            .map(|r| PresenceChoice::from_presence(r.self_contact().presence))
+    }
+
+    /// The selected conversation's mute state, or `None` when nothing is open.
+    fn selected_muted(state: &ChatState) -> Option<bool> {
+        match state.selected.as_ref()? {
+            Selection::Contact(host) => Some(state.is_contact_muted(host)),
+            Selection::Room(id) => Some(state.is_room_muted(id)),
+        }
+    }
+
+    /// Build the menus from live state: Conversation (always present, its items
+    /// gated on a selection), and Presence (present only once a roster exists).
+    fn build_menus(state: &ChatState) -> Vec<Menu<MenuAction>> {
+        let mut menus = Vec::new();
+
+        let muted = selected_muted(state);
+        let has_sel = muted.is_some();
+        menus.push(Menu::new(
+            "Conversation",
+            vec![
+                Entry::Item(
+                    Item::new(MenuAction::MuteConversation, "Mute Conversation")
+                        .checked(muted.unwrap_or(false))
+                        .enabled(has_sel),
+                ),
+                Entry::Item(
+                    Item::new(MenuAction::CloseConversation, "Close Conversation").enabled(has_sel),
+                ),
+            ],
+        ));
+
+        if let Some(current) = current_presence(state) {
+            let mut entries: Vec<Entry<MenuAction>> = PresenceChoice::ALL
+                .iter()
+                .map(|&c| {
+                    Entry::Item(
+                        Item::new(MenuAction::SetPresence(c), c.label()).checked(c == current),
+                    )
+                })
+                .collect();
+            entries.push(Entry::Separator);
+            entries.push(Entry::Item(
+                Item::new(MenuAction::EditStatus, "Edit Status\u{2026}")
+                    .enabled(!state.editing_status),
+            ));
+            menus.push(Menu::new("Presence", entries));
+        }
+        menus
+    }
+
+    /// The status-chip tone for a presence choice (Ok = reachable, Warn = away,
+    /// Danger = DND, Neutral = invisible) — mirrors [`super::presence_color`].
+    const fn presence_tone(c: PresenceChoice) -> ChipTone {
+        match c {
+            PresenceChoice::FreeForChat | PresenceChoice::Available => ChipTone::Ok,
+            PresenceChoice::Away => ChipTone::Warn,
+            PresenceChoice::Dnd => ChipTone::Danger,
+            PresenceChoice::Invisible => ChipTone::Neutral,
+        }
+    }
+
+    /// The live status cluster: this seat's presence + the whole-mesh unread tally.
+    fn build_status(state: &ChatState) -> Vec<StatusChip> {
+        let mut chips = Vec::new();
+        if let Some(current) = current_presence(state) {
+            chips.push(StatusChip::with_icon(
+                DOT,
+                current.label(),
+                presence_tone(current),
+            ));
+        }
+        let unread = state.total_unread();
+        if unread > 0 {
+            chips.push(StatusChip::new(format!("{unread} unread"), ChipTone::Info));
+        }
+        chips
+    }
+
+    /// Apply a picked action to its real seam (§6, no new behaviour).
+    pub(super) fn apply(state: &mut ChatState, action: MenuAction) {
+        match action {
+            MenuAction::MuteConversation => {
+                let Some(sel) = state.selected.clone() else {
+                    return;
+                };
+                let (target, id, muted) = match &sel {
+                    Selection::Contact(host) => {
+                        ("contact", host.clone(), state.is_contact_muted(host))
+                    }
+                    Selection::Room(id) => ("room", id.clone(), state.is_room_muted(id)),
+                };
+                // The SAME publish the row mute button uses — flip the persisted policy.
+                super::publish_mute(state.bus_root.as_deref(), target, &id, !muted);
+            }
+            MenuAction::CloseConversation => state.selected = None,
+            MenuAction::SetPresence(choice) => state.set_presence(choice),
+            MenuAction::EditStatus => {
+                if let Some(roster) = state.roster.as_ref() {
+                    state.status_draft = roster
+                        .self_contact()
+                        .status_message
+                        .clone()
+                        .unwrap_or_default();
+                }
+                state.editing_status = true;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::ChatState;
+        use super::{build_menus, presence_tone, MenuAction, PresenceChoice};
+        use mde_egui::menubar::Entry;
+        use mde_egui::ChipTone;
+
+        #[test]
+        fn conversation_items_disable_without_a_selection() {
+            // No roster, nothing selected: Mute/Close grey, and Presence is omitted
+            // (not a present-but-dead menu) until a roster lands (§7).
+            let state = ChatState::default();
+            let menus = build_menus(&state);
+            let convo = menus
+                .iter()
+                .find(|m| m.title == "Conversation")
+                .expect("Conversation menu is always present");
+            for entry in &convo.entries {
+                if let Entry::Item(item) = entry {
+                    assert!(!item.enabled, "{} greys with no selection", item.label);
+                }
+            }
+            assert!(
+                !menus.iter().any(|m| m.title == "Presence"),
+                "Presence is omitted until a roster (a self contact) exists"
+            );
+        }
+
+        #[test]
+        fn close_deselects_and_set_presence_maps_to_a_choice() {
+            let mut state = ChatState {
+                selected: Some(super::Selection::Contact("nyc3".into())),
+                ..ChatState::default()
+            };
+            super::apply(&mut state, MenuAction::CloseConversation);
+            assert!(state.selected.is_none(), "Close deselects the conversation");
+            // Edit Status opens the inline editor (a local toggle seam).
+            assert!(!state.editing_status);
+            super::apply(&mut state, MenuAction::EditStatus);
+            assert!(state.editing_status, "Edit Status opens the editor");
+            // set_presence publishes best-effort (no Bus dir in the test) — never a
+            // panic, and the action carries the chosen presence.
+            super::apply(&mut state, MenuAction::SetPresence(PresenceChoice::Dnd));
+        }
+
+        #[test]
+        fn presence_tones_are_distinct_across_the_reachability_bands() {
+            assert_eq!(presence_tone(PresenceChoice::Available), ChipTone::Ok);
+            assert_eq!(presence_tone(PresenceChoice::Away), ChipTone::Warn);
+            assert_eq!(presence_tone(PresenceChoice::Dnd), ChipTone::Danger);
+            assert_eq!(presence_tone(PresenceChoice::Invisible), ChipTone::Neutral);
+        }
+
+        #[test]
+        fn menu_bar_renders_headless() {
+            use mde_egui::egui::{self, pos2, vec2, Rect};
+            use mde_egui::Style;
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            let state = ChatState::default();
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 640.0))),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = super::show(&state, ui);
+                });
+            });
+            let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+            assert!(!prims.is_empty(), "the Chat bar produced no primitives");
+        }
+    }
+}
+
 /// Derive a stable, canonical room id from an operator-typed name: lowercase, ASCII
 /// alphanumerics kept, every other run collapsed to a single `-`, trimmed. So
 /// "Build Farm!" → "build-farm" — the same id on every node that types that name.
@@ -1181,7 +1437,11 @@ fn fmt_date(ts_unix_ms: i64) -> String {
 /// (`pub`, not `pub(crate)`, is the `clippy::redundant_pub_crate` form here.)
 pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let shifted = days + 719_468;
-    let era = (if shifted >= 0 { shifted } else { shifted - 146_096 }) / 146_097;
+    let era = (if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    }) / 146_097;
     let day_of_era = shifted - era * 146_097; // [0, 146096]
     let year_of_era =
         (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
@@ -1230,8 +1490,12 @@ fn message_row(
                 // row is no longer time-blind (the biggest "looks incomplete" tell).
                 let hhmm = fmt_hh_mm(msg.ts_unix_ms);
                 if !hhmm.is_empty() {
-                    ui.label(RichText::new(hhmm).color(Style::TEXT_DIM).size(Style::SMALL))
-                        .on_hover_text(fmt_full_datetime(msg.ts_unix_ms));
+                    ui.label(
+                        RichText::new(hhmm)
+                            .color(Style::TEXT_DIM)
+                            .size(Style::SMALL),
+                    )
+                    .on_hover_text(fmt_full_datetime(msg.ts_unix_ms));
                 }
             });
         });
@@ -1382,7 +1646,10 @@ fn contact_actions(ui: &mut egui::Ui, bus_root: Option<&Path>, host: &str, muted
 /// makes the toggle real, not a local-only switch — §7).
 fn mute_button(ui: &mut egui::Ui, bus_root: Option<&Path>, target: &str, id: &str, muted: bool) {
     let (glyph, hint) = if muted {
-        ("\u{1F514} Unmute", format!("Unmute {id} — let it ring again"))
+        (
+            "\u{1F514} Unmute",
+            format!("Unmute {id} — let it ring again"),
+        )
     } else {
         (
             "\u{1F515} Mute",

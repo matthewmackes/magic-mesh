@@ -361,6 +361,17 @@ impl SystemState {
         // moves it can be detected + persisted afterwards (the same collect-then-
         // apply idiom the SysActions use — the render can't take `&mut self`).
         let nav_before = self.nav;
+        // MENUBAR-ALL — the shared top bar (SYSTEM), above the master rail. Its three
+        // menus mirror the rail's domain groups (Devices · Personalization · Mesh &
+        // System), each listing every settings category as a radio item that jumps
+        // `nav` — the SAME seam a rail-row click drives (§6), so the operator can
+        // reach every section (incl. the advanced Pairing / Network / Power ones)
+        // from the bar (the governing principle). A picked section is applied here so
+        // the persist check below saves it exactly like a rail move.
+        if let Some(section) = menubar::show(ui, self.nav.section, self.snapshot()) {
+            self.nav = SettingsNav::at(section);
+        }
+        ui.separator();
         // Capture the appearance before the borrow so a Theme-section pick that moves
         // it can be detected + persisted afterwards (SETTINGS-5 — the same collect-
         // then-apply idiom `nav` uses; the live re-tint/zoom happens in the poll).
@@ -2872,6 +2883,217 @@ fn network_section(ui: &mut egui::Ui, mesh: &MeshFacts) {
         column_card(ui, "Overlay", |ui| overlay(ui));
         ui.add_space(Style::SP_S);
         column_card(ui, "Mesh links", |ui| links(ui));
+    }
+}
+
+/// MENUBAR-ALL (System) — the shared top bar over the master-detail Settings shell.
+///
+/// The bar's three menus ARE the master rail's three domain groups (Devices ·
+/// Personalization · Mesh & System), each listing every [`SettingsSection`] under it
+/// as a radio item that jumps the detail pane — the SAME `nav` seam a rail-row click
+/// drives (§6, one source of truth). This makes every settings category — including
+/// the advanced Pairing / Network / Power ones — reachable from the menus, the
+/// governing principle's point. There is no invented File/Edit/Help spine (Settings
+/// has none); the taxonomy places every section exactly once (a compile-time-style
+/// invariant the tests assert). The status cluster reads this seat's live hardware:
+/// the system battery (level + charge state) and the connected-display count, or an
+/// honest "No seat" when no snapshot has landed (§7).
+mod menubar {
+    use super::{SettingsGroup, SettingsSection};
+    use mde_egui::egui::Ui;
+    use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
+    use mde_egui::{ChipTone, StatusChip, Style};
+    use mde_seat::{BatteryState, ConnectorStatus, SeatSnapshot};
+
+    /// A filled status dot — the shared glyph the sections + dock quads use.
+    const DOT: &str = "\u{25CF}";
+
+    /// Render the SYSTEM bar and return the section the operator picked this frame,
+    /// if any — the same seam the rail drives (`nav = SettingsNav::at(section)`).
+    pub(super) fn show(
+        ui: &mut Ui,
+        active: SettingsSection,
+        snap: Option<&SeatSnapshot>,
+    ) -> Option<SettingsSection> {
+        let menus = build_menus(active);
+        let status = build_status(snap);
+        let model = MenuBarModel {
+            // The dock's "System" group + the Devices settings domain both wear the
+            // categorical gold, so the surface title matches (lock 2).
+            title: "System",
+            accent: Style::ACCENT_SYSTEM,
+            menus: &menus,
+            status: &status,
+        };
+        MenuBar::show(ui, &model)
+    }
+
+    /// One menu per domain group, each listing its sections as radio items (the
+    /// active one checked) — the rail's taxonomy, verbatim.
+    fn build_menus(active: SettingsSection) -> Vec<Menu<SettingsSection>> {
+        SettingsGroup::ALL
+            .iter()
+            .map(|&group| {
+                let items = group
+                    .sections()
+                    .iter()
+                    .map(|&s| Entry::Item(Item::new(s, s.label()).checked(s == active)))
+                    .collect();
+                Menu::new(group.label(), items)
+            })
+            .collect()
+    }
+
+    /// The status-chip tone for a battery level + charge state: charging / on-AC
+    /// reads Ok, a low battery escalates Warn → Danger, else a neutral read-out.
+    const fn battery_tone(pct: i64, charging: bool, on_ac: bool) -> ChipTone {
+        if charging || on_ac {
+            ChipTone::Ok
+        } else if pct <= 15 {
+            ChipTone::Danger
+        } else if pct <= 30 {
+            ChipTone::Warn
+        } else {
+            ChipTone::Neutral
+        }
+    }
+
+    /// The live status cluster: the system battery + the connected-display count from
+    /// the seat snapshot, or an honest "No seat" when none has landed (§7).
+    fn build_status(snap: Option<&SeatSnapshot>) -> Vec<StatusChip> {
+        let Some(snap) = snap else {
+            return vec![StatusChip::with_icon(DOT, "No seat", ChipTone::Warn)];
+        };
+        let mut chips = Vec::new();
+
+        // The whole-system battery (a peripheral battery is not the seat's charge).
+        if let Some(bat) = snap
+            .batteries
+            .present()
+            .and_then(|bs| bs.iter().find(|b| b.power_supply))
+        {
+            #[allow(clippy::cast_possible_truncation)]
+            let pct = bat.percentage.round().clamp(0.0, 100.0) as i64;
+            let on_ac = snap.on_ac.present().copied().flatten().unwrap_or(false);
+            let charging = matches!(
+                bat.state,
+                BatteryState::Charging | BatteryState::FullyCharged | BatteryState::PendingCharge
+            );
+            let suffix = if charging {
+                " charging"
+            } else if on_ac {
+                " (AC)"
+            } else {
+                ""
+            };
+            chips.push(StatusChip::with_icon(
+                DOT,
+                format!("{pct}%{suffix}"),
+                battery_tone(pct, charging, on_ac),
+            ));
+        }
+
+        // Connected displays (a real monitor count, not every enumerated connector).
+        if let Some(conns) = snap.displays.present() {
+            let n = conns
+                .iter()
+                .filter(|c| c.status == ConnectorStatus::Connected)
+                .count();
+            chips.push(StatusChip::new(
+                format!("{n} display{}", if n == 1 { "" } else { "s" }),
+                ChipTone::Neutral,
+            ));
+        }
+        chips
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::{SettingsGroup, SettingsSection};
+        use super::{battery_tone, build_menus, build_status};
+        use mde_egui::menubar::Entry;
+        use mde_egui::ChipTone;
+
+        #[test]
+        fn the_menus_are_the_three_domain_groups_covering_every_section_once() {
+            let menus = build_menus(SettingsSection::Pairing);
+            let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
+            assert_eq!(titles, vec!["Devices", "Personalization", "Mesh & System"]);
+            // Every section appears exactly once across the three menus (the rail
+            // taxonomy) — no dead/duplicated entry (§7).
+            let mut seen: Vec<SettingsSection> = menus
+                .iter()
+                .flat_map(|m| m.entries.iter())
+                .filter_map(|e| match e {
+                    Entry::Item(i) => Some(i.id),
+                    _ => None,
+                })
+                .collect();
+            let count = seen.len();
+            seen.sort_by_key(|s| s.label());
+            seen.dedup();
+            assert_eq!(count, seen.len(), "a section is listed twice");
+            for group in SettingsGroup::ALL {
+                for section in group.sections() {
+                    assert!(
+                        seen.contains(section),
+                        "{section:?} is unreachable from the bar"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn exactly_the_active_section_is_checked() {
+            let menus = build_menus(SettingsSection::Network);
+            for entry in menus.iter().flat_map(|m| m.entries.iter()) {
+                if let Entry::Item(item) = entry {
+                    assert_eq!(
+                        item.checked,
+                        Some(item.id == SettingsSection::Network),
+                        "{:?} check-state must track the active section",
+                        item.id
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn no_seat_is_an_honest_warn_chip() {
+            let chips = build_status(None);
+            assert!(chips
+                .iter()
+                .any(|c| c.text == "No seat" && c.tone == ChipTone::Warn));
+        }
+
+        #[test]
+        fn battery_tone_escalates_by_level_and_charge_state() {
+            assert_eq!(battery_tone(80, false, false), ChipTone::Neutral);
+            assert_eq!(battery_tone(25, false, false), ChipTone::Warn);
+            assert_eq!(battery_tone(10, false, false), ChipTone::Danger);
+            // Charging / on-AC always reads Ok regardless of level.
+            assert_eq!(battery_tone(10, true, false), ChipTone::Ok);
+            assert_eq!(battery_tone(10, false, true), ChipTone::Ok);
+        }
+
+        #[test]
+        fn menu_bar_renders_headless() {
+            use mde_egui::egui::{self, pos2, vec2, Rect};
+            use mde_egui::Style;
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 640.0))),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = super::show(ui, SettingsSection::Displays, None);
+                });
+            });
+            let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+            assert!(!prims.is_empty(), "the System bar produced no primitives");
+        }
     }
 }
 

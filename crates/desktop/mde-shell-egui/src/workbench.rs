@@ -110,12 +110,13 @@ pub(crate) fn show(
     // spawn-lighthouse requests onto the Bus and holds the daemon's typed answer.
     spawn_lighthouse: &mut crate::spawn_lighthouse_flow::SpawnLighthouseFlowState,
 ) {
-    ui.add_space(Style::SP_L);
-    ui.heading(
-        RichText::new("Workbench")
-            .color(Style::TEXT)
-            .size(Style::HEADING),
-    );
+    // MENUBAR-ALL — the shared top bar (WORKBENCH). Its one honest menu is the
+    // **Plane** switch — the same `selected` seam the rail below drives (§6, no new
+    // behaviour); a pick radio-jumps the active plane. The bar's UPPERCASE display
+    // title replaces the old proportional heading (design lock 2).
+    if let Some(plane) = menubar::show(ui, *selected) {
+        *selected = plane;
+    }
     ui.colored_label(
         Style::TEXT_DIM,
         "Mesh control — expanded from the chrome bar.",
@@ -203,6 +204,124 @@ pub(crate) fn show(
             }
         });
     });
+}
+
+/// MENUBAR-ALL (Workbench) — the shared top bar over the five-plane nav.
+///
+/// The Workbench is a pure *navigation* surface: its content is whichever of the
+/// five [`Plane`]s the operator selects, and its every real control is that plane
+/// switch (the sub-flows the Provisioning plane hosts live inside the plane body,
+/// not the bar). So the bar carries exactly one honest menu — **Plane** — whose
+/// items are the mouse twin of the rail's `selectable_label`s (§6, one seam), each
+/// radio-checked to the live selection. There is no File/Edit/Help spine to invent
+/// (the surface has no file, clipboard, or about seam), so it is honestly omitted
+/// (§7 — no dead entries). The status cluster names the active plane (live state).
+mod menubar {
+    use super::Plane;
+    use mde_egui::egui::Ui;
+    use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
+    use mde_egui::{ChipTone, StatusChip, Style};
+
+    /// Render the WORKBENCH bar and return the plane the operator picked this frame,
+    /// if any — the same seam the plane rail drives (`*selected = plane`).
+    pub(super) fn show(ui: &mut Ui, active: Plane) -> Option<Plane> {
+        let menus = build_menus(active);
+        let status = build_status(active);
+        let model = MenuBarModel {
+            // The dock tints the Workbench lead cell with the brand accent (its
+            // standalone-lead cell has no group hue), so the title matches (lock 2).
+            title: "Workbench",
+            accent: Style::ACCENT,
+            menus: &menus,
+            status: &status,
+        };
+        MenuBar::show(ui, &model)
+    }
+
+    /// The **Plane** menu: one radio item per [`Plane`] in blast-radius order, the
+    /// active one checked — every item drives the real `selected` seam.
+    fn build_menus(active: Plane) -> Vec<Menu<Plane>> {
+        let items: Vec<Entry<Plane>> = Plane::ALL
+            .iter()
+            .map(|&p| Entry::Item(Item::new(p, p.label()).checked(active == p)))
+            .collect();
+        vec![Menu::new("Plane", items)]
+    }
+
+    /// The live status cluster: the active plane's name (which plane is showing).
+    fn build_status(active: Plane) -> Vec<StatusChip> {
+        vec![StatusChip::new(active.label(), ChipTone::Info)]
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{build_menus, build_status, Plane};
+        use mde_egui::menubar::Entry;
+        use mde_egui::ChipTone;
+
+        #[test]
+        fn plane_menu_lists_every_plane_with_the_active_one_checked() {
+            let menus = build_menus(Plane::Network);
+            assert_eq!(menus.len(), 1, "the Workbench carries one honest menu");
+            let plane_menu = &menus[0];
+            assert_eq!(plane_menu.title, "Plane");
+            let ids: Vec<Plane> = plane_menu
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Item(i) => Some(i.id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                ids,
+                Plane::ALL.to_vec(),
+                "every plane is reachable, in order"
+            );
+            // Exactly the active plane is checked (radio) — the rest are unchecked,
+            // never omitted (§7).
+            for entry in &plane_menu.entries {
+                if let Entry::Item(item) = entry {
+                    assert_eq!(
+                        item.checked,
+                        Some(item.id == Plane::Network),
+                        "{:?} check-state must track the active plane",
+                        item.id
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn status_names_the_active_plane() {
+            let chips = build_status(Plane::Provisioning);
+            assert!(chips
+                .iter()
+                .any(|c| c.text == "Provisioning" && c.tone == ChipTone::Info));
+        }
+
+        #[test]
+        fn menu_bar_renders_headless() {
+            use mde_egui::egui::{self, pos2, vec2, Rect};
+            use mde_egui::Style;
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 640.0))),
+                ..Default::default()
+            };
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = super::show(ui, Plane::ThisNode);
+                });
+            });
+            let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+            assert!(
+                !prims.is_empty(),
+                "the Workbench bar produced no primitives"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

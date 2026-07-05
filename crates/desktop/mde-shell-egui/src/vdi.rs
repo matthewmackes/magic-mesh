@@ -251,6 +251,23 @@ impl VdiState {
         std::mem::take(&mut self.return_to_chrome)
     }
 
+    /// Raise the "return to chrome" request from a control other than the Esc chord
+    /// (MENUBAR-ALL — the Desktop bar's **Session → Return to Mesh Control**). It is
+    /// the SAME seam [`forward_input`] sets, drained by [`Self::take_return_to_chrome`]
+    /// after the panel mounts, so the menu path adds no new behaviour (§6).
+    pub(crate) const fn request_return_to_chrome(&mut self) {
+        self.return_to_chrome = true;
+    }
+
+    /// A log-safe summary of the pending connect for the Desktop bar's status
+    /// cluster: the VM/host name plus the chosen protocol's label, or `None` when no
+    /// connect is pending (the surface is on the Chooser). Carries no secret.
+    pub(crate) fn requested_summary(&self) -> Option<(&str, &'static str)> {
+        self.requested
+            .as_ref()
+            .map(|r| (r.target.name.as_str(), r.protocol.label()))
+    }
+
     /// Record the connect the Chooser's picker chose (CHOOSER-4). The surface then
     /// shows a "connecting" state naming the target + chosen protocol until the
     /// gated wire transport attaches the live decoder session.
@@ -391,6 +408,105 @@ fn forward_input(ui: &egui::Ui, state: &mut VdiState) {
             continue;
         }
         session.send_input(&event);
+    }
+}
+
+// ─────────────────────────── MENUBAR-ALL (Desktop) ──────────────────────────
+
+/// One action the Desktop menu bar dispatches — each routes to a real seam the
+/// shell already owns (§6, no new behaviour).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DesktopMenuAction {
+    /// Release the desktop back to the mesh-control chrome — the SAME seam the Esc
+    /// chord raises ([`VdiState::request_return_to_chrome`]).
+    ReturnToChrome,
+    /// Force the Chooser to re-read its published desktop-source roster now
+    /// ([`crate::chooser::ChooserState::refresh_now`]).
+    RefreshSources,
+}
+
+/// Render the Desktop surface's shared top bar (DESKTOP) and return the action the
+/// operator picked this frame, if any (MENUBAR-ALL). The Desktop surface has two
+/// honest faces — the **Chooser** (no session) and the brokered **desktop** (a
+/// pending / live connect) — so its two menus are gated to the face that owns the
+/// seam (§7 — a context-gated item disables, never a silent no-op):
+///
+/// * **Session → Return to Mesh Control** — the Esc-chord twin, live only while a
+///   desktop connect is pending / attached.
+/// * **View → Refresh Sources** — re-enumerate the Chooser's roster now, live only
+///   while the Chooser (no session) is showing.
+///
+/// The status cluster names the pending desktop + protocol, or the Chooser's live
+/// source count. The bar is decoupled from both states (it takes plain readouts) so
+/// the shell can mount it above whichever face renders below.
+pub(crate) fn desktop_menubar(
+    ui: &mut egui::Ui,
+    pending: Option<(&str, &str)>,
+    source_count: usize,
+) -> Option<DesktopMenuAction> {
+    use mde_egui::menubar::{MenuBar, MenuBarModel};
+    use mde_egui::Style;
+
+    let menus = build_desktop_menus(pending.is_some());
+    let status = build_desktop_status(pending, source_count);
+    let model = MenuBarModel {
+        // The dock tints the Show-Desktop cell with the brand accent (its
+        // system-quad cell carries no group hue), so the title matches (lock 2).
+        title: "Desktop",
+        accent: Style::ACCENT,
+        menus: &menus,
+        status: &status,
+    };
+    MenuBar::show(ui, &model)
+}
+
+/// The two Desktop menus, each gated to the face that owns its seam (§7): Session →
+/// Return to Mesh Control is live only while a connect is pending; View → Refresh
+/// Sources only on the Chooser. Every item is present, one is disabled — never a
+/// dead/omitted entry.
+fn build_desktop_menus(connected: bool) -> Vec<mde_egui::menubar::Menu<DesktopMenuAction>> {
+    use mde_egui::menubar::{Entry, Item, Menu};
+    vec![
+        Menu::new(
+            "Session",
+            vec![Entry::Item(
+                Item::new(DesktopMenuAction::ReturnToChrome, "Return to Mesh Control")
+                    .shortcut("Esc")
+                    .enabled(connected),
+            )],
+        ),
+        Menu::new(
+            "View",
+            vec![Entry::Item(
+                Item::new(DesktopMenuAction::RefreshSources, "Refresh Sources").enabled(!connected),
+            )],
+        ),
+    ]
+}
+
+/// The Desktop status cluster: the pending desktop + protocol, or the Chooser's
+/// live source count — real state either way (§7).
+fn build_desktop_status(
+    pending: Option<(&str, &str)>,
+    source_count: usize,
+) -> Vec<mde_egui::StatusChip> {
+    use mde_egui::{ChipTone, StatusChip};
+    match pending {
+        Some((name, protocol)) => vec![StatusChip::with_icon(
+            "\u{25B6}",
+            format!("{name} \u{00B7} {protocol}"),
+            ChipTone::Info,
+        )],
+        None => vec![
+            StatusChip::new("No desktop", ChipTone::Neutral),
+            StatusChip::new(
+                format!(
+                    "{source_count} source{}",
+                    if source_count == 1 { "" } else { "s" }
+                ),
+                ChipTone::Neutral,
+            ),
+        ],
     }
 }
 
@@ -572,6 +688,105 @@ mod tests {
             state.texture.is_some(),
             "the RDP session's first frame was not pulled and uploaded"
         );
+    }
+
+    #[test]
+    fn the_menu_return_seam_matches_the_esc_chord() {
+        // MENUBAR-ALL: the Session → Return to Mesh Control menu path raises the SAME
+        // `return_to_chrome` the Esc chord does, drained by `take_return_to_chrome`.
+        let mut state = VdiState::default();
+        assert!(!state.take_return_to_chrome());
+        state.request_return_to_chrome();
+        assert!(
+            state.take_return_to_chrome(),
+            "the menu return seam raises the chrome-return request"
+        );
+        assert!(
+            !state.take_return_to_chrome(),
+            "and it is one-shot, like Esc"
+        );
+    }
+
+    #[test]
+    fn requested_summary_names_the_pending_desktop_and_protocol() {
+        let mut state = VdiState::default();
+        assert!(
+            state.requested_summary().is_none(),
+            "no connect ⇒ no summary"
+        );
+        state.request_connect(ConnectRequest::new(
+            RequestedTarget::new("node-a", "win11"),
+            VdiProtocol::Rdp,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity("node-a"),
+        ));
+        assert_eq!(state.requested_summary(), Some(("win11", "RDP")));
+    }
+
+    #[test]
+    fn the_desktop_menus_gate_each_face_to_its_own_seam() {
+        use super::{build_desktop_menus, build_desktop_status};
+        use mde_egui::menubar::Entry;
+        use mde_egui::ChipTone;
+
+        // The enable state of each menu item is a pure function of `connected`:
+        // Return-to-Chrome is live only while connected, Refresh only on the Chooser.
+        // Every item is present in both faces — one is disabled, never omitted (§7).
+        for connected in [false, true] {
+            let menus = build_desktop_menus(connected);
+            let item_enabled = |title: &str| -> bool {
+                menus
+                    .iter()
+                    .find(|m| m.title == title)
+                    .and_then(|m| {
+                        m.entries.iter().find_map(|e| match e {
+                            Entry::Item(i) => Some(i.enabled),
+                            _ => None,
+                        })
+                    })
+                    .expect("the menu's item is present")
+            };
+            assert_eq!(
+                item_enabled("Session"),
+                connected,
+                "Return is live iff connected"
+            );
+            assert_eq!(
+                item_enabled("View"),
+                !connected,
+                "Refresh is live iff on the Chooser"
+            );
+        }
+
+        // The status cluster reflects the live face.
+        let chooser = build_desktop_status(None, 3);
+        assert!(chooser.iter().any(|c| c.text == "3 sources"));
+        assert!(chooser.iter().any(|c| c.text == "No desktop"));
+        let connected = build_desktop_status(Some(("win11", "RDP")), 3);
+        assert!(connected.iter().any(|c| c.text.contains("win11")
+            && c.text.contains("RDP")
+            && c.tone == ChipTone::Info));
+    }
+
+    #[test]
+    fn the_desktop_bar_renders_headless_in_both_faces() {
+        use mde_egui::egui::{pos2, vec2, Rect};
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 640.0))),
+            ..Default::default()
+        };
+        for pending in [None, Some(("win11", "RDP"))] {
+            let out = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = desktop_menubar(ui, pending, 3);
+                });
+            });
+            let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+            assert!(!prims.is_empty(), "a Desktop bar face drew nothing");
+        }
     }
 
     #[test]

@@ -1216,6 +1216,22 @@ impl ChooserState {
         ctx.request_repaint_after(REFRESH);
     }
 
+    /// The number of desktop sources in the latest published roster (`0` before the
+    /// first fold) — the Desktop menu bar's live source-count status readout
+    /// (MENUBAR-ALL). A pure read of the last projection, never a probe (§7).
+    pub(crate) fn source_count(&self) -> usize {
+        self.state.as_ref().map_or(0, |s| s.sources.len())
+    }
+
+    /// Force an immediate roster re-read now (MENUBAR-ALL — the Desktop bar's
+    /// **View → Refresh Sources**), bypassing the poll cadence. Reuses the SAME
+    /// [`Self::refresh`] the cadence drives (§6, no second read path) and re-arms the
+    /// cadence clock so the next `poll` doesn't immediately re-read.
+    pub(crate) fn refresh_now(&mut self) {
+        self.last_poll = Some(Instant::now());
+        self.refresh();
+    }
+
     /// Re-read the newest published roster and fold it (split from the
     /// cadence gate). A missing record keeps the last-known state — the read
     /// path never blanks a live grid on a transient read miss. Either way the

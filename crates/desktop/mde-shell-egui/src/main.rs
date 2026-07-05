@@ -480,6 +480,24 @@ impl Shell {
             }
             Surface::MeshView => self.show_mesh_map(ui),
             Surface::Desktop => {
+                // MENUBAR-ALL — the shared top bar (DESKTOP), mounted above whichever
+                // face renders below (the Chooser or the brokered desktop). Its two
+                // menus are gated to the face that owns the seam: Session → Return to
+                // Mesh Control (the Esc-chord twin, live while a connect is pending)
+                // and View → Refresh Sources (live on the Chooser). Rendered first so
+                // a picked action applies this frame; the `take_return_to_chrome`
+                // drain below still catches a menu-raised return like an Esc.
+                let pending = self.vdi.requested_summary();
+                let sources = self.chooser.source_count();
+                if let Some(action) = vdi::desktop_menubar(ui, pending, sources) {
+                    match action {
+                        vdi::DesktopMenuAction::ReturnToChrome => {
+                            self.vdi.request_return_to_chrome();
+                        }
+                        vdi::DesktopMenuAction::RefreshSources => self.chooser.refresh_now(),
+                    }
+                }
+                ui.separator();
                 // The Desktop surface's no-session face IS the Desktop Chooser
                 // (CHOOSER-2, superseding the E12-5b flat picker): with nothing
                 // requested it shows the discovered-desktop card grid over the

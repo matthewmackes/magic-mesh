@@ -262,6 +262,17 @@ impl Default for InstancesState {
 /// roster (name · state · resources · dual-homed NICs) with Create / Boot /
 /// Shutdown wired to `mde-kvm`, and an honest "No local VMs" `EmptyState` when empty.
 pub(crate) fn instances_panel(ui: &mut egui::Ui, state: &mut InstancesState) {
+    // MENUBAR-ALL — the shared top bar (INSTANCES). Its menus are the mouse twins of
+    // the panel's own affordances (§6, one dispatch path): **Instance** toggles the
+    // New-VM form, **Power** boots / shuts the selected VM through the SAME broker
+    // verbs the roster rows drive. Handled before the field destructure so the apply
+    // path can take `&mut state` freely; the separator sits it above the body.
+    if let Some(action) = menubar::show(ui, state) {
+        menubar::apply(state, action);
+    }
+    ui.separator();
+    ui.add_space(Style::SP_S);
+
     // Disjoint field borrows so the render closures can hold several at once (the
     // egui idiom datacenter::show uses).
     let InstancesState {
@@ -571,6 +582,260 @@ fn fold(
         Err(e) => {
             *last_error = Some(format!("VM {} failed for '{}': {e}", op.verb(), spec.name));
             None
+        }
+    }
+}
+
+/// MENUBAR-ALL (Instances) — the shared top bar over the local VM broker.
+///
+/// Every item is the mouse twin of an affordance the panel already renders (§6, one
+/// dispatch path through [`super::apply_action`] / the `show_create` toggle), never
+/// a new behaviour and never a stub. **Instance → New VM…** flips the same inline
+/// create form the header button toggles; **Power → Boot / Shutdown** drives the
+/// selected roster VM through the SAME `mde-kvm` lifecycle verbs its own Boot /
+/// Shutdown buttons use, honestly greyed when no row is selected (§7 — a
+/// context-gated item disables, never a silent no-op). The File/Edit/Help spine is
+/// omitted (the surface has no file / clipboard / about seam). The status cluster
+/// counts the roster (total · running · a gated-VMM warning) from live state.
+mod menubar {
+    use super::{apply_action, Action, CreateForm, InstancesState, Op, VmRunState, DOT};
+    use mde_egui::egui::Ui;
+    use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
+    use mde_egui::{ChipTone, StatusChip, Style};
+
+    /// One menu action — each routes to a real Instances seam in [`apply`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum MenuAction {
+        /// Toggle the inline "New VM" create form (the `show_create` seam).
+        ToggleCreate,
+        /// Boot the selected VM (`Op::Boot` via the broker).
+        Boot,
+        /// Shut down the selected VM (`Op::Shutdown` via the broker).
+        Shutdown,
+    }
+
+    /// Render the INSTANCES bar and return the action picked this frame, if any.
+    pub(super) fn show(ui: &mut Ui, state: &InstancesState) -> Option<MenuAction> {
+        let has_selection = state.selected.is_some();
+        let menus = build_menus(state.show_create, has_selection);
+        let status = build_status(state);
+        let model = MenuBarModel {
+            // The dock groups Instances under **Workloads** (purple), so the title
+            // wears that categorical accent (lock 2).
+            title: "Instances",
+            accent: Style::ACCENT_WORKLOADS,
+            menus: &menus,
+            status: &status,
+        };
+        MenuBar::show(ui, &model)
+    }
+
+    /// Build the two menus from live gating: the New-VM toggle's check state, and
+    /// whether a roster row is selected (Power's gate).
+    fn build_menus(show_create: bool, has_selection: bool) -> Vec<Menu<MenuAction>> {
+        vec![
+            Menu::new(
+                "Instance",
+                vec![Entry::Item(
+                    Item::new(MenuAction::ToggleCreate, "New VM\u{2026}").checked(show_create),
+                )],
+            ),
+            Menu::new(
+                "Power",
+                vec![
+                    Entry::Item(
+                        Item::new(MenuAction::Boot, "Boot selected").enabled(has_selection),
+                    ),
+                    Entry::Item(
+                        Item::new(MenuAction::Shutdown, "Shut down selected")
+                            .enabled(has_selection),
+                    ),
+                ],
+            ),
+        ]
+    }
+
+    /// The live status cluster: the roster size, the running count, and an honest
+    /// gated-VMM warning when a last op couldn't reach cloud-hypervisor.
+    fn build_status(state: &InstancesState) -> Vec<StatusChip> {
+        let total = state.vms.len();
+        let running = state
+            .vms
+            .iter()
+            .filter(|v| v.state == VmRunState::Running)
+            .count();
+        let gated = state.vms.iter().any(|v| v.state == VmRunState::Gated);
+        let mut chips = vec![StatusChip::new(
+            format!("{total} VM{}", if total == 1 { "" } else { "s" }),
+            ChipTone::Neutral,
+        )];
+        if running > 0 {
+            chips.push(StatusChip::with_icon(
+                DOT,
+                format!("{running} running"),
+                ChipTone::Ok,
+            ));
+        }
+        if gated {
+            chips.push(StatusChip::with_icon(DOT, "no VMM", ChipTone::Warn));
+        }
+        chips
+    }
+
+    /// Apply a picked action to its real seam (§6). Boot / Shutdown route through the
+    /// SAME [`apply_action`] the roster buttons use, so gating + the honest inline
+    /// error are preserved; the toggle mirrors the header's New-VM button.
+    pub(super) fn apply(state: &mut InstancesState, action: MenuAction) {
+        match action {
+            MenuAction::ToggleCreate => {
+                state.show_create = !state.show_create;
+                if state.show_create {
+                    state.form = CreateForm::default();
+                }
+            }
+            MenuAction::Boot | MenuAction::Shutdown => {
+                let Some(idx) = state.selected else {
+                    return;
+                };
+                let op = if matches!(action, MenuAction::Boot) {
+                    Op::Boot
+                } else {
+                    Op::Shutdown
+                };
+                apply_action(
+                    &mut state.vms,
+                    &mut state.selected,
+                    &mut state.last_error,
+                    &*state.broker,
+                    Action::Lifecycle { idx, op },
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::{InstancesState, LocalVm, VmRunState};
+        use super::{apply, build_menus, build_status, MenuAction};
+        use mde_egui::menubar::Entry;
+        use mde_egui::ChipTone;
+        use mde_kvm::VmSpec;
+
+        fn vm(name: &str, state: VmRunState) -> LocalVm {
+            LocalVm {
+                spec: VmSpec::new(name, 2, 2048, format!("/x/{name}.img")),
+                state,
+            }
+        }
+
+        #[test]
+        fn power_items_disable_without_a_selection() {
+            // No row selected → Boot/Shutdown grey (a disabled item, never omitted).
+            let menus = build_menus(false, false);
+            let power = menus
+                .iter()
+                .find(|m| m.title == "Power")
+                .expect("Power menu");
+            for entry in &power.entries {
+                if let Entry::Item(item) = entry {
+                    assert!(!item.enabled, "{} greys with no selection", item.label);
+                }
+            }
+            // With a selection they enable.
+            let menus = build_menus(false, true);
+            let power = menus
+                .iter()
+                .find(|m| m.title == "Power")
+                .expect("Power menu");
+            for entry in &power.entries {
+                if let Entry::Item(item) = entry {
+                    assert!(item.enabled, "{} enables with a selection", item.label);
+                }
+            }
+        }
+
+        #[test]
+        fn new_vm_item_tracks_the_form_toggle() {
+            // The Instance menu's New-VM item is a checkable toggle whose mark tracks
+            // the `show_create` state.
+            let new_vm_checked = |show_create: bool| -> Option<bool> {
+                let menus = build_menus(show_create, false);
+                assert_eq!(menus[0].title, "Instance");
+                menus[0]
+                    .entries
+                    .iter()
+                    .find_map(|e| match e {
+                        Entry::Item(i) => Some(i.checked),
+                        _ => None,
+                    })
+                    .flatten()
+            };
+            assert_eq!(
+                new_vm_checked(false),
+                Some(false),
+                "form closed ⇒ unchecked"
+            );
+            assert_eq!(new_vm_checked(true), Some(true), "form open ⇒ checked");
+        }
+
+        #[test]
+        fn toggle_create_flips_the_form() {
+            let mut state = InstancesState::default();
+            assert!(!state.show_create);
+            apply(&mut state, MenuAction::ToggleCreate);
+            assert!(state.show_create, "the toggle opens the form");
+            apply(&mut state, MenuAction::ToggleCreate);
+            assert!(!state.show_create, "the toggle closes it again");
+        }
+
+        #[test]
+        fn boot_drives_the_selected_vm_through_the_broker() {
+            // The REAL ChBroker against a VM with no live VMM: the menu Boot folds the
+            // honest gated state exactly like the row button (§7 — no fake success).
+            let mut state = InstancesState {
+                vms: vec![vm("ghost", VmRunState::Defined)],
+                selected: Some(0),
+                ..InstancesState::default()
+            };
+            apply(&mut state, MenuAction::Boot);
+            assert_eq!(state.vms[0].state, VmRunState::Gated);
+            assert!(
+                state.last_error.is_some(),
+                "a gated boot records the honest error"
+            );
+        }
+
+        #[test]
+        fn boot_without_a_selection_is_an_honest_no_op() {
+            let mut state = InstancesState {
+                vms: vec![vm("web1", VmRunState::Defined)],
+                selected: None,
+                ..InstancesState::default()
+            };
+            apply(&mut state, MenuAction::Boot);
+            // Nothing was driven — the VM keeps its state, no error minted.
+            assert_eq!(state.vms[0].state, VmRunState::Defined);
+            assert!(state.last_error.is_none());
+        }
+
+        #[test]
+        fn status_counts_the_roster_and_flags_a_gated_vmm() {
+            let state = InstancesState {
+                vms: vec![
+                    vm("a", VmRunState::Running),
+                    vm("b", VmRunState::Gated),
+                    vm("c", VmRunState::Stopped),
+                ],
+                ..InstancesState::default()
+            };
+            let chips = build_status(&state);
+            assert!(chips.iter().any(|c| c.text == "3 VMs"));
+            assert!(chips
+                .iter()
+                .any(|c| c.text == "1 running" && c.tone == ChipTone::Ok));
+            assert!(chips
+                .iter()
+                .any(|c| c.text == "no VMM" && c.tone == ChipTone::Warn));
         }
     }
 }
