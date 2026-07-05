@@ -19,7 +19,7 @@
 //! honest "no inventory yet", never a faked tree; absent summary fields render as
 //! an em-dash, never invented totals.
 //!
-//! **Scope now covers DEVMGR-2 + DEVMGR-3 + DEVMGR-4** — the by-type tree + header card +
+//! **Scope now covers DEVMGR-2 + DEVMGR-3 + DEVMGR-4 + DEVMGR-5** — the by-type tree + header card +
 //! local read (DEVMGR-2), plus the bottom **detail drawer** (General / Driver /
 //! Details / Events / Resources, #9/#10), the **MDM problem-code parity** (#11 —
 //! `DeviceStatus` → Windows Code 28/22/10 with the honest Linux reason beside it),
@@ -40,9 +40,18 @@
 //! that has published nothing, or whose snapshot is old, reads an honest
 //! **absent / stale** state — never fabricated data (§7).
 //!
-//! The by-connection topology (DEVMGR-5), the cross-fleet By-node flatten and
-//! export (DEVMGR-6) are still later units; their seams here (the disabled view
-//! modes) are left clean, not stubbed to a fake render.
+//! **DEVMGR-5 adds the By-connection view** — a second [`ViewMode`] that re-roots
+//! the same devices under their **parent bus / controller** (host → PCI/USB bus
+//! segment → device) instead of their function category, reconstructed from each
+//! record's [`DeviceRecord::sysfs_path`] (the only topology signal the DEVMGR-1
+//! schema carries — the PCI `DDDD:BB` bus segment / the USB bus number). A device
+//! with no resolvable bus falls under the host root (never dropped); a host that
+//! published no bus/parent data at all degrades to an honest flat list under the
+//! root with a note (§7), never a fabricated hierarchy. A richer bridge/port tree
+//! would need a real `parent` field in the DEVMGR-1 inventory.
+//!
+//! The cross-fleet By-node flatten and export (DEVMGR-6) are still later units;
+//! their seams here (the disabled By-node mode) are left clean, not stubbed.
 
 #![allow(
     clippy::redundant_pub_crate,
@@ -80,10 +89,10 @@ const REFRESH: Duration = Duration::from_secs(30);
 /// time (`published_at_ms == 0`) is treated as stale for the same honesty reason.
 const STALE_AFTER: Duration = Duration::from_secs(180);
 
-/// How the device tree is organised (#3). DEVMGR-2 ships **By type**; By
-/// connection (the PCI/USB topology, DEVMGR-5) and By node (the cross-fleet
-/// flatten, DEVMGR-4) are later units. The faithful MDM View menu offers all
-/// three, with the unbuilt modes **honestly disabled** (§7 — never stubbed to a
+/// How the device tree is organised (#3). DEVMGR-2 ships **By type** and
+/// DEVMGR-5 ships **By connection** (the bus/controller topology); By node (the
+/// cross-fleet flatten) is a later unit. The faithful MDM View menu offers all
+/// three, with the unbuilt mode **honestly disabled** (§7 — never stubbed to a
 /// fake render).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[allow(
@@ -95,7 +104,9 @@ enum ViewMode {
     /// The classic by-category tree (Processors, Network adapters, …). Wired.
     #[default]
     ByType,
-    /// The PCI/USB topology tree (DEVMGR-5) — not yet wired.
+    /// The bus/controller topology tree (DEVMGR-5) — devices re-rooted under
+    /// their parent PCI/USB bus segment (host → bus → device), reconstructed from
+    /// each record's sysfs path. Wired.
     ByConnection,
     /// The cross-fleet flatten of every host's devices (a later P2 unit) — not
     /// yet wired (DEVMGR-4 adds the host rail, not this flattened view).
@@ -115,10 +126,11 @@ impl ViewMode {
         }
     }
 
-    /// Whether this mode is wired in DEVMGR-2 (only [`ByType`](Self::ByType)). The
-    /// others render as disabled controls until their unit lands (§7).
+    /// Whether this mode is wired: [`ByType`](Self::ByType) (DEVMGR-2) and
+    /// [`ByConnection`](Self::ByConnection) (DEVMGR-5). [`ByNode`](Self::ByNode)
+    /// renders as a disabled control until its unit lands (§7).
     const fn is_available(self) -> bool {
-        matches!(self, Self::ByType)
+        matches!(self, Self::ByType | Self::ByConnection)
     }
 }
 
@@ -443,10 +455,15 @@ impl DeviceManagerState {
         ctx.request_repaint_after(REFRESH);
     }
 
-    /// Expand every published category (Expand-all, #19).
+    /// Expand every collapsible branch (Expand-all, #19) — every published
+    /// category in By-type, or every bus / controller branch in By-connection
+    /// (DEVMGR-5), so the one control fills whichever tree is showing.
     fn expand_all(&mut self) {
         if let Some(inv) = &self.inventory {
-            self.expanded = inv.categories.iter().map(|c| c.key.clone()).collect();
+            self.expanded = match self.view {
+                ViewMode::ByConnection => build_connection_tree(inv).bus_keys(),
+                _ => inv.categories.iter().map(|c| c.key.clone()).collect(),
+            };
         }
     }
 
@@ -569,7 +586,12 @@ impl DeviceManagerState {
                         header_card(ui, inv);
                     }
                     ui.add_space(Style::SP_S);
-                    self.tree(ui);
+                    // Only the tree grouping/nesting changes between view modes
+                    // (#3) — the header card, drawer + rows are shared.
+                    match self.view {
+                        ViewMode::ByConnection => self.connection_tree(ui),
+                        _ => self.tree(ui),
+                    }
                 }
             });
 
@@ -770,14 +792,89 @@ impl DeviceManagerState {
             self.toggle(&key);
         }
         if let Some(sel) = clicked {
-            // A click on the open device closes the drawer; a new device selects it
-            // and resets to the General tab.
-            if self.selected.as_ref() == Some(&sel) {
-                self.selected = None;
-            } else {
-                self.selected = Some(sel);
-                self.active_tab = DrawerTab::General;
-            }
+            self.toggle_device_selection(sel);
+        }
+    }
+
+    /// Open, or toggle-closed, the detail drawer for a clicked device row —
+    /// shared by the By-type [`Self::tree`] and the By-connection
+    /// [`Self::connection_tree`] so a row behaves identically in both. A click on
+    /// the already-open device closes the drawer; a new device selects it and
+    /// resets to the General tab.
+    fn toggle_device_selection(&mut self, sel: DeviceSelection) {
+        if self.selected.as_ref() == Some(&sel) {
+            self.selected = None;
+        } else {
+            self.selected = Some(sel);
+            self.active_tab = DrawerTab::General;
+        }
+    }
+
+    /// The **By-connection** device tree (DEVMGR-5, #3): the same devices
+    /// re-rooted under their parent bus / controller instead of their function
+    /// category — host → PCI/USB bus segment → device — reconstructed from each
+    /// record's [`DeviceRecord::sysfs_path`] ([`build_connection_tree`]). A device
+    /// with no resolvable bus renders directly under the host root (never dropped,
+    /// §7); a host that published no bus/parent data at all degrades to an honest
+    /// flat list under the root with a note, never a fabricated hierarchy. The
+    /// per-bus branches share [`Self::expanded`] (keyed on the bus-branch id) and
+    /// the device rows + selection reuse the By-type render, so only the nesting
+    /// differs between modes.
+    fn connection_tree(&mut self, ui: &mut egui::Ui) {
+        // The bus branch a header click toggled + the device a row click selected
+        // this frame — applied AFTER the read borrow ends (as in [`Self::tree`]).
+        let mut toggled: Option<String> = None;
+        let mut clicked: Option<DeviceSelection> = None;
+        let selected = self.selected.clone();
+        // Build an owned tree (clones the records) so the immutable inventory
+        // borrow ends before the mutate-after-frame toggle/selection below.
+        let tree = self.inventory.as_ref().map(build_connection_tree);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let Some(tree) = tree.as_ref() else {
+                    return;
+                };
+                if tree.flat_no_bus {
+                    // The honest degrade (§7): no derivable topology, so the tree
+                    // is flat under the root rather than a fabricated hierarchy.
+                    muted_note(
+                        ui,
+                        "No bus / parent topology was published for this host \u{2014} \
+                         devices are listed flat under the host. A deeper by-connection \
+                         tree needs a parent/bus field in the device inventory.",
+                    );
+                    ui.add_space(Style::SP_XS);
+                }
+                for node in &tree.roots {
+                    if let Some(dev) = &node.device {
+                        // A parentless device leaf directly under the host root
+                        // (§7 — never dropped).
+                        let is_sel = selected
+                            .as_ref()
+                            .is_some_and(|s| s.matches(&node.category, dev));
+                        if device_row(ui, dev, is_sel) {
+                            clicked = Some(DeviceSelection::of(&node.category, dev));
+                        }
+                    } else {
+                        // A synthetic bus / controller branch — its devices nest
+                        // beneath it (host \u{2192} bus \u{2192} device).
+                        let open = self.expanded.contains(node.key.as_str());
+                        let out = conn_bus_header(ui, node, open, selected.as_ref());
+                        if out.header_clicked {
+                            toggled = Some(node.key.clone());
+                        }
+                        if let Some(sel) = out.selected {
+                            clicked = Some(sel);
+                        }
+                    }
+                }
+            });
+        if let Some(key) = toggled {
+            self.toggle(&key);
+        }
+        if let Some(sel) = clicked {
+            self.toggle_device_selection(sel);
         }
     }
 
@@ -997,6 +1094,263 @@ fn category_header(
                 let is_sel = selected.is_some_and(|s| s.matches(&cat.key, dev));
                 if device_row(ui, dev, is_sel) {
                     clicked = Some(DeviceSelection::of(&cat.key, dev));
+                }
+            }
+        });
+    CategoryOutcome {
+        header_clicked: resp.header_response.clicked(),
+        selected: clicked,
+    }
+}
+
+// ───────────────────── the by-connection tree (DEVMGR-5, #3) ────────────────
+
+/// A synthetic bus / controller grouping node the By-connection view derives from
+/// a device's sysfs path — the parent a device attaches under (a PCI bus segment
+/// `0000:00`, a USB bus, or another `/sys/bus/<type>`). The `key` is namespaced so
+/// it never collides with a category key in the shared expand set; `label` is what
+/// the branch renders.
+struct BusSpec {
+    /// The expand-set / id-salt key (e.g. `pci:0000:00`).
+    key: String,
+    /// The rendered branch label (e.g. `PCI bus 0000:00`).
+    label: String,
+}
+
+/// One node in the by-connection tree ([`build_connection_tree`]): either a
+/// synthetic bus / controller branch (`device == None`, its `children` the devices
+/// on that bus) or a device leaf (`device == Some`, no children). A parentless
+/// device is a leaf directly among the roots (§7 — never dropped).
+struct ConnNode {
+    /// The bus branch's expand / id key (empty for a device leaf).
+    key: String,
+    /// The rendered label — the bus label, or the device name for a leaf.
+    label: String,
+    /// The device when this node is a leaf; `None` for a bus branch.
+    device: Option<DeviceRecord>,
+    /// The leaf device's owning category key (selection keying); empty on a bus.
+    category: String,
+    /// The devices nested under a bus branch (empty for a leaf).
+    children: Vec<Self>,
+}
+
+impl ConnNode {
+    /// A synthetic bus / controller branch.
+    fn bus(spec: BusSpec) -> Self {
+        Self {
+            key: spec.key,
+            label: spec.label,
+            device: None,
+            category: String::new(),
+            children: Vec::new(),
+        }
+    }
+
+    /// A device leaf carrying its owning category (for selection keying).
+    fn leaf(category: &str, dev: &DeviceRecord) -> Self {
+        Self {
+            key: String::new(),
+            label: dev.name.clone(),
+            device: Some(dev.clone()),
+            category: category.to_string(),
+            children: Vec::new(),
+        }
+    }
+
+    /// Problem-status devices this node covers — a leaf's own state, or the count
+    /// among a bus branch's children (its `⚠ N` badge).
+    fn problem_count(&self) -> usize {
+        let own = usize::from(self.device.as_ref().is_some_and(|d| d.status.is_problem()));
+        let kids = self
+            .children
+            .iter()
+            .filter(|c| c.device.as_ref().is_some_and(|d| d.status.is_problem()))
+            .count();
+        own + kids
+    }
+}
+
+/// The whole by-connection tree for one host: the host-root children (bus branches
+/// first, then any parentless device leaves) plus a flag marking the honest flat
+/// degrade when the host published no bus/parent topology at all (§7).
+struct ConnTree {
+    /// The host-root children — bus branches (sorted) then parentless leaves.
+    roots: Vec<ConnNode>,
+    /// True when no device carried any derivable bus — the tree is flat under the
+    /// root and the view shows an honest "no topology" note (never fabricated).
+    flat_no_bus: bool,
+}
+
+impl ConnTree {
+    /// The bus-branch keys (Expand-all fills these in By-connection mode).
+    fn bus_keys(&self) -> BTreeSet<String> {
+        self.roots
+            .iter()
+            .filter(|n| n.device.is_none())
+            .map(|n| n.key.clone())
+            .collect()
+    }
+}
+
+/// Reconstruct the by-connection tree from a host's inventory (DEVMGR-5): every
+/// device is re-rooted under the parent bus / controller its
+/// [`DeviceRecord::sysfs_path`] resolves to ([`derive_bus`]), keeping its owning
+/// category for selection keying. Devices with no resolvable bus become parentless
+/// leaves under the root (never dropped); when NO device resolves a bus the tree
+/// is flat and `flat_no_bus` is set (the honest degrade, §7). Pure over the
+/// inventory, so the nesting is unit-tested without a render.
+fn build_connection_tree(inv: &DeviceInventory) -> ConnTree {
+    use std::collections::BTreeMap;
+    // Bus branches keyed for a stable (sorted) order; parentless devices kept
+    // aside to append under the root after the buses.
+    let mut buses: BTreeMap<String, ConnNode> = BTreeMap::new();
+    let mut rootless: Vec<ConnNode> = Vec::new();
+    let mut device_total = 0usize;
+    for cat in &inv.categories {
+        for dev in &cat.devices {
+            device_total += 1;
+            let leaf = ConnNode::leaf(&cat.key, dev);
+            if let Some(spec) = derive_bus(dev.sysfs_path.as_deref()) {
+                buses
+                    .entry(spec.key.clone())
+                    .or_insert_with(|| ConnNode::bus(spec))
+                    .children
+                    .push(leaf);
+            } else {
+                rootless.push(leaf);
+            }
+        }
+    }
+    let flat_no_bus = device_total > 0 && buses.is_empty();
+    // Bus branches first (BTreeMap already orders them by key), each with its
+    // devices name-sorted; then the parentless leaves, also name-sorted.
+    let mut roots: Vec<ConnNode> = buses
+        .into_values()
+        .map(|mut bus| {
+            bus.children.sort_by(|a, b| a.label.cmp(&b.label));
+            bus
+        })
+        .collect();
+    rootless.sort_by(|a, b| a.label.cmp(&b.label));
+    roots.extend(rootless);
+    ConnTree { roots, flat_no_bus }
+}
+
+/// The parent bus / controller a device attaches under, derived from its sysfs
+/// path — the only topology signal the DEVMGR-1 schema carries. A PCI address
+/// yields its `DDDD:BB` bus segment, a USB path its bus number, any other
+/// `/sys/bus/<type>` its bus kind; a `None` / unrecognized path yields `None` (the
+/// device falls under the host root). A richer bridge/port hierarchy would need a
+/// real `parent` field in the inventory.
+fn derive_bus(sysfs: Option<&str>) -> Option<BusSpec> {
+    let path = sysfs?;
+    if let Some(bus) = parse_pci_bus(path) {
+        return Some(BusSpec {
+            key: format!("pci:{bus}"),
+            label: format!("PCI bus {bus}"),
+        });
+    }
+    if let Some(busnum) = parse_usb_bus(path) {
+        return Some(BusSpec {
+            key: format!("usb:{busnum}"),
+            label: format!("USB bus {busnum}"),
+        });
+    }
+    if let Some(kind) = parse_bus_kind(path) {
+        return Some(BusSpec {
+            key: format!("bus:{kind}"),
+            label: format!("{} bus", title_case(&kind)),
+        });
+    }
+    None
+}
+
+/// The PCI `DDDD:BB` bus segment of the last PCI address in a sysfs path (the
+/// device's own address, so a `/sys/devices/...` path resolves to the device's own
+/// bus, not the bridge's), or `None` when the path carries no PCI address —
+/// `/sys/bus/pci/devices/0000:02:00.0` → `0000:02`.
+fn parse_pci_bus(path: &str) -> Option<String> {
+    path.rsplit('/').find_map(pci_bdf_bus)
+}
+
+/// The `DDDD:BB` (domain:bus) of a `DDDD:BB:DD.F` PCI address component, or `None`
+/// when the component is not a PCI address.
+fn pci_bdf_bus(component: &str) -> Option<String> {
+    let (domain, rest) = component.split_once(':')?;
+    let (bus, devfn) = rest.split_once(':')?;
+    let (dev, func) = devfn.split_once('.')?;
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    (hex(domain, 4) && hex(bus, 2) && hex(dev, 2) && hex(func, 1))
+        .then(|| format!("{domain}:{bus}"))
+}
+
+/// The USB bus number of a USB sysfs path — the leading number of a `N-…` port
+/// path or a `usbN` root hub — or `None` when the path is not USB.
+fn parse_usb_bus(path: &str) -> Option<String> {
+    if !path.contains("/usb") {
+        return None;
+    }
+    let last = path.rsplit('/').next()?;
+    if let Some(num) = last.strip_prefix("usb") {
+        if !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(num.to_string());
+        }
+    }
+    let head = last.split('-').next()?;
+    (!head.is_empty() && head.bytes().all(|b| b.is_ascii_digit())).then(|| head.to_string())
+}
+
+/// The bus **kind** of a generic `/sys/bus/<kind>/…` path (virtio, scsi, i2c, …)
+/// for a device on a bus other than PCI/USB, or `None` when the path has no
+/// `/bus/<kind>/` segment.
+fn parse_bus_kind(path: &str) -> Option<String> {
+    let after = path.split("/bus/").nth(1)?;
+    let kind = after.split('/').next()?;
+    (!kind.is_empty()).then(|| kind.to_string())
+}
+
+/// Capitalize the first character of a bus-kind label (`virtio` → `Virtio`).
+fn title_case(s: &str) -> String {
+    let mut chars = s.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().collect::<String>() + chars.as_str()
+    })
+}
+
+/// One bus / controller branch of the by-connection tree — a forced-state
+/// collapsing header (its open/closed driven by the caller's expand set) whose
+/// device rows nest beneath it, mirroring [`category_header`]. The header tints
+/// amber with a `⚠ N` count when the bus holds a problem device. Reuses
+/// [`device_row`] + [`DeviceSelection`] so a row behaves identically in both views
+/// (only the nesting differs, #3).
+fn conn_bus_header(
+    ui: &mut egui::Ui,
+    node: &ConnNode,
+    open: bool,
+    selected: Option<&DeviceSelection>,
+) -> CategoryOutcome {
+    let problems = node.problem_count();
+    let tone = if problems > 0 {
+        Style::WARN
+    } else {
+        Style::TEXT
+    };
+    let mut title = node.label.clone();
+    if problems > 0 {
+        use std::fmt::Write as _;
+        let _ = write!(title, "   \u{26A0} {problems}"); // ⚠ N
+    }
+    let mut clicked: Option<DeviceSelection> = None;
+    let resp = egui::CollapsingHeader::new(RichText::new(title).color(tone).size(Style::BODY))
+        .id_salt(("dm-conn", node.key.as_str()))
+        .open(Some(open))
+        .show(ui, |ui| {
+            for child in &node.children {
+                if let Some(dev) = &child.device {
+                    let is_sel = selected.is_some_and(|s| s.matches(&child.category, dev));
+                    if device_row(ui, dev, is_sel) {
+                        clicked = Some(DeviceSelection::of(&child.category, dev));
+                    }
                 }
             }
         });
@@ -1406,10 +1760,10 @@ fn host_hover(entry: &HostEntry, now_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_rail, cpu_line, device_status_display, format_mem_kb, header_lines, host_dot_tone,
-        host_hover, humanize_ago, humanize_uptime, problem_code, scanned_label, status_tone,
-        DeviceManagerState, DeviceSelection, DrawerTab, HostEntry, HostFreshness, MenuAction,
-        ViewMode, STALE_AFTER,
+        build_connection_tree, build_rail, cpu_line, derive_bus, device_status_display,
+        format_mem_kb, header_lines, host_dot_tone, host_hover, humanize_ago, humanize_uptime,
+        problem_code, scanned_label, status_tone, DeviceManagerState, DeviceSelection, DrawerTab,
+        HostEntry, HostFreshness, MenuAction, ViewMode, STALE_AFTER,
     };
     use mackes_mesh_types::device_inventory::{
         self, category, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
@@ -1588,12 +1942,13 @@ mod tests {
     }
 
     #[test]
-    fn only_by_type_is_wired_the_other_modes_are_disabled_seams() {
-        // #3 — the View menu offers all three modes, but DEVMGR-2 wires only By
-        // type; the others are honest disabled seams (§7), not stubbed renders.
+    fn by_type_and_by_connection_are_wired_by_node_stays_a_disabled_seam() {
+        // #3 — the View menu offers all three modes; DEVMGR-2 wired By type and
+        // DEVMGR-5 wires By connection, while By node (the cross-fleet flatten)
+        // stays an honest disabled seam (§7), not a stubbed render.
         assert_eq!(ViewMode::ALL.len(), 3);
         assert!(ViewMode::ByType.is_available());
-        assert!(!ViewMode::ByConnection.is_available());
+        assert!(ViewMode::ByConnection.is_available());
         assert!(!ViewMode::ByNode.is_available());
         assert_eq!(ViewMode::default(), ViewMode::ByType);
     }
@@ -2095,5 +2450,154 @@ mod tests {
             HostEntry::absent("edge-offline"),
         ];
         assert!(drive(&mut s) > 0, "the host rail drew nothing");
+    }
+
+    // ── DEVMGR-5: the By-connection (bus / controller) view ──────────────────
+
+    #[test]
+    fn by_connection_nests_each_device_under_its_parent_bus() {
+        // The fixture's two PCI devices sit on distinct bus segments (0000:00 and
+        // 0000:02); the by-connection tree re-roots them under those bus branches
+        // (host → bus → device) — correct parent→child nesting, no flat degrade.
+        let tree = build_connection_tree(&DeviceInventory::fixture());
+        assert!(!tree.flat_no_bus, "the fixture carries real bus topology");
+        let labels: Vec<&str> = tree.roots.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(labels, vec!["PCI bus 0000:00", "PCI bus 0000:02"]);
+        // Every root is a bus branch (no parentless leaves), each holding its one
+        // device as a child leaf under the correct parent bus.
+        for bus in &tree.roots {
+            assert!(
+                bus.device.is_none(),
+                "a root bus branch is not a device leaf"
+            );
+            assert_eq!(bus.children.len(), 1, "one device on each fixture bus");
+        }
+        assert_eq!(
+            tree.roots[0].children[0].label, "Intel UHD Graphics 620",
+            "the GPU nests under its own bus segment 0000:00"
+        );
+        // The bus keys (Expand-all fodder) are exactly the two segment branches.
+        assert_eq!(tree.bus_keys().len(), 2);
+    }
+
+    #[test]
+    fn by_connection_puts_a_parentless_device_under_the_host_root() {
+        // A device with no sysfs path (nothing to resolve a bus from) is never
+        // dropped — it renders as a leaf directly among the roots (§7).
+        let mut inv = DeviceInventory::fixture();
+        inv.categories.push(device_inventory::DeviceCategory::new(
+            category::SENSORS,
+            vec![DeviceRecord::new("ACPI thermal zone", DeviceStatus::Ok)],
+        ));
+        let tree = build_connection_tree(&inv);
+        assert!(!tree.flat_no_bus, "some devices still carry a bus");
+        // The parentless sensor is a root-level leaf (device Some, no bus branch).
+        let leaf = tree
+            .roots
+            .iter()
+            .find(|n| {
+                n.device
+                    .as_ref()
+                    .is_some_and(|d| d.name == "ACPI thermal zone")
+            })
+            .expect("the parentless device stays under the root, never dropped");
+        assert!(leaf.children.is_empty(), "a leaf has no children");
+        assert!(leaf.key.is_empty(), "a leaf is not a bus branch");
+        // The two PCI bus branches are still present alongside it.
+        assert_eq!(
+            tree.roots.iter().filter(|n| n.device.is_none()).count(),
+            2,
+            "the PCI bus branches remain"
+        );
+    }
+
+    #[test]
+    fn by_connection_degrades_honestly_with_no_bus_data() {
+        // A host that published no sysfs paths at all (a shallow / non-PC host,
+        // #22) has no derivable topology — the tree renders flat under the root
+        // with the honest note flag set, never a fabricated hierarchy (§7).
+        let inv = DeviceInventory {
+            host: "vyos-edge".to_string(),
+            published_at_ms: 1,
+            summary: HostSummary::default(),
+            tools: device_inventory::ToolAvailability::default(),
+            categories: vec![device_inventory::DeviceCategory::new(
+                category::NETWORK_ADAPTERS,
+                vec![
+                    DeviceRecord::new("eth0", DeviceStatus::Ok),
+                    DeviceRecord::new("eth1", DeviceStatus::Ok),
+                ],
+            )],
+        };
+        let tree = build_connection_tree(&inv);
+        assert!(tree.flat_no_bus, "no bus data → the honest flat degrade");
+        // Both devices are flat leaves under the root (no bus branch invented).
+        assert_eq!(tree.roots.len(), 2);
+        assert!(
+            tree.roots
+                .iter()
+                .all(|n| n.device.is_some() && n.children.is_empty()),
+            "every node is a flat device leaf, no fabricated bus branch"
+        );
+        assert!(tree.bus_keys().is_empty(), "no bus branches to expand");
+    }
+
+    #[test]
+    fn switching_to_by_connection_preserves_the_selected_host_and_renders() {
+        // The rail selection (DEVMGR-4) governs the host; flipping the view mode
+        // (DEVMGR-5) re-groups the SAME host's devices without changing which host
+        // is inspected or its loaded inventory.
+        let scratch = ScratchRoot::new("view-switch");
+        scratch.publish("laptop-mm", 1_000);
+        scratch.publish("edge-2", 2_000);
+        let mut s = state_with(None, false);
+        s.workgroup_root = scratch.path().to_path_buf();
+        s.refresh();
+        s.select_host("edge-2".to_string());
+        assert_eq!(s.selected_host, "edge-2");
+        // Flip to By-connection — the seam the View menu drives.
+        s.apply(MenuAction::View(ViewMode::ByConnection));
+        assert_eq!(s.view, ViewMode::ByConnection);
+        // The selected host + its inventory are unchanged by the view switch.
+        assert_eq!(s.selected_host, "edge-2", "the host survives a view flip");
+        assert_eq!(s.inventory.as_ref().unwrap().host, "edge-2");
+        // Expand-all now fills the BUS branches (not the category keys) for this
+        // view — the one control tracks whichever tree is showing.
+        s.expand_all();
+        assert_eq!(
+            s.expanded,
+            build_connection_tree(s.inventory.as_ref().unwrap()).bus_keys(),
+            "Expand-all fills the by-connection bus branches"
+        );
+        // And the by-connection tree renders headless (a live render, not dead).
+        assert!(drive(&mut s) > 0, "the by-connection surface drew nothing");
+    }
+
+    #[test]
+    fn derive_bus_reads_pci_usb_and_generic_paths_and_honest_none() {
+        // PCI: the device's own DDDD:BB bus segment (the flat symlink form).
+        assert_eq!(
+            derive_bus(Some("/sys/bus/pci/devices/0000:02:00.0")).map(|b| b.label),
+            Some("PCI bus 0000:02".to_string())
+        );
+        // PCI: a real /sys/devices/… path resolves to the device's own bus, not
+        // the bridge's (the last address in the path).
+        assert_eq!(
+            derive_bus(Some("/sys/devices/pci0000:00/0000:00:1c.5/0000:03:00.0")).map(|b| b.label),
+            Some("PCI bus 0000:03".to_string())
+        );
+        // USB: the bus number of a port path (topology from the sysfs name).
+        assert_eq!(
+            derive_bus(Some("/sys/bus/usb/devices/1-1.2")).map(|b| b.label),
+            Some("USB bus 1".to_string())
+        );
+        // A generic bus kind is title-cased.
+        assert_eq!(
+            derive_bus(Some("/sys/bus/virtio/devices/virtio0")).map(|b| b.label),
+            Some("Virtio bus".to_string())
+        );
+        // No path, or an unrecognized one, resolves no bus (→ the host root).
+        assert_eq!(derive_bus(None).map(|b| b.key), None);
+        assert_eq!(derive_bus(Some("/proc/cpuinfo")).map(|b| b.key), None);
     }
 }
