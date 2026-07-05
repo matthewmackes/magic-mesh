@@ -677,19 +677,25 @@ fn centered(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
-/// The Browser surface's shared **MENUBAR-ALL** top bar (design: `menubar-all.md`).
+/// The Browser surface's shared **MENUBAR-ALL** top bar (design: `menubar-all.md`),
+/// grown into the MENU-3 **two-engine bar** (`docs/design/browser-daily-driver.md`).
 ///
 /// The UPPERCASE `BROWSER` title in the Terminals-group accent, the real
 /// [`WebSession`] menus, and a live status cluster — the one shared
-/// [`mde_egui::menubar::MenuBar`] every surface embeds. Every visible item binds to
-/// a seam that already exists on the active session or page (§6 glue, no new
-/// behaviour — the SAME seams the toolbar chrome + [`page_actions_menu`] drive); a
-/// context-gated item renders **disabled** and an absent capability is **omitted**
-/// (§7). The surface honestly has no File (no new-tab/quit seam in the portable
-/// build), no page-text Copy/Find, no Zoom, and no keyboard chord table, so those
-/// menus are absent — never a dead entry. The status cluster shows the committed
-/// URL, the session lifecycle, the http/https security state, and the ad-filter
-/// shield (BOOKMARKS-7).
+/// [`mde_egui::menubar::MenuBar`] every surface embeds. The **Engine** menu makes
+/// the BROWSER-DD-1 dual-engine architecture legible from the chrome: Servo is the
+/// active built-in engine, CEF is honestly gated "not yet vendored" — both as
+/// captions, because no engine-*selection* seam exists yet (§8: an absent seam is
+/// named, never a dead entry). **Page** carries the address-bar's open seam;
+/// Edit / View / History / Bookmarks bind to the session + page-actions seams the
+/// toolbar chrome already drives (§6 glue, no new behaviour). A context-gated item
+/// renders **disabled** and an absent capability is **omitted** (§7): no File (no
+/// new-tab/quit seam in the portable build), no page-text Copy/Find, no Zoom (no
+/// zoom control on the helper protocol), no keyboard chord table — and the
+/// BROWSER-DD-8 **Power mode** is a named honest gate in View until its toggle
+/// lands. The status cluster shows the active engine (MENU-3), the committed URL,
+/// the session lifecycle, the http/https security state, and the ad-filter shield
+/// (BOOKMARKS-7).
 mod menubar {
     use super::{
         bookmark_add_body, chat_share_body, local_hostname, publish, WebState,
@@ -721,6 +727,9 @@ mod menubar {
         /// Reload the page, or respawn a crashed tab (`WebSession::reload` /
         /// `respawn_requested` — the exact toolbar Reload behaviour).
         Reload,
+        /// Load the address-bar draft on the active tab (`WebSession::load` —
+        /// the toolbar Go button's exact seam, MENU-3).
+        OpenAddress,
         /// Copy the committed URL to the shell clipboard (the page-actions seam).
         CopyUrl,
         /// Bookmark the live page (`action/bookmarks/add`, BOOKMARKS-10).
@@ -736,7 +745,8 @@ mod menubar {
     #[allow(
         clippy::struct_excessive_bools,
         reason = "a flat read-out of the active tab's nav flags (can_back/can_forward/\
-                  loading, mirroring NavState) plus has_tab/crashed — not a state machine"
+                  loading, mirroring NavState) plus has_tab/crashed and the address-bar \
+                  draft flag — not a state machine"
     )]
     struct Snapshot {
         /// A tab is attached.
@@ -749,6 +759,8 @@ mod menubar {
         can_forward: bool,
         /// A load is in progress.
         loading: bool,
+        /// The address bar holds a non-empty draft (gates Page → Open, MENU-3).
+        typed_address: bool,
         /// The ad-filter blocked-request count for this page (BOOKMARKS-7).
         blocked: u32,
         /// The committed URL.
@@ -767,7 +779,7 @@ mod menubar {
 
     /// Read the active tab's live state into a [`Snapshot`] (one immutable borrow).
     fn snapshot(state: &WebState) -> Snapshot {
-        state
+        let mut snap = state
             .tabs
             .get(state.active)
             .map_or_else(Snapshot::default, |tab| {
@@ -778,11 +790,14 @@ mod menubar {
                     can_back: nav.can_back,
                     can_forward: nav.can_forward,
                     loading: nav.loading,
+                    typed_address: false,
                     blocked: tab.session.blocked_count(),
                     url: nav.url.clone(),
                     state: Some(tab.session.state().clone()),
                 }
-            })
+            });
+        snap.typed_address = !state.address.trim().is_empty();
+        snap
     }
 
     /// The Reload item's label — "Restart Page" on a crashed tab (it respawns),
@@ -795,14 +810,56 @@ mod menubar {
         }
     }
 
-    /// Build the Browser menus from live state (§6/§7): Edit (Copy URL), View
-    /// (Reload), History (Back/Forward, gated on the live history), and Bookmarks
-    /// (add plus share). File is omitted (no new-tab/quit seam in this surface), and
-    /// so are page-text Copy/Find, Zoom, and Help (no chord table) — honest absence,
-    /// never a dead entry.
+    /// The **Engine** menu (MENU-3) — the BROWSER-DD dual-engine design made
+    /// legible from the chrome. There is **no engine-selection seam yet**: every
+    /// live session IS the sandboxed Servo helper, and CEF is not vendored until
+    /// BROWSER-DD-1 lands — so both engine rows and the unlock note are honest
+    /// captions (§8: an absent seam is named, never a dead or greyed activatable
+    /// entry). When BROWSER-DD-1 lands the per-session engine choice, these rows
+    /// become the real Servo ⇄ CEF radio.
+    fn build_engine_menu(s: &Snapshot) -> Menu<MenuAction> {
+        let servo = if s.has_tab {
+            "\u{25C9} Servo \u{2014} active (light / private)"
+        } else {
+            "\u{25C9} Servo \u{2014} the built-in engine (light / private)"
+        };
+        Menu::new(
+            "Engine",
+            vec![
+                Entry::Caption(servo.to_owned()),
+                Entry::Caption(
+                    "\u{25CB} CEF \u{2014} not yet vendored (BROWSER-DD-1, the compat engine)."
+                        .to_owned(),
+                ),
+                Entry::Separator,
+                Entry::Caption(
+                    "Engine selection (Servo \u{21C4} CEF) unlocks when BROWSER-DD-1 lands the \
+                     CEF helper."
+                        .to_owned(),
+                ),
+            ],
+        )
+    }
+
+    /// Build the Browser menus from live state (§6/§7): Engine (the MENU-3
+    /// two-engine readout), Page (the address-bar open seam), Edit (Copy URL),
+    /// View (Reload + the named BROWSER-DD-8 Power-mode gate), History
+    /// (Back/Forward, gated on the live history), and Bookmarks (add plus share).
+    /// File is omitted (no new-tab/quit seam in this surface), and so are
+    /// page-text Copy/Find, Zoom (no zoom control on the helper protocol), and
+    /// Help (no chord table) — honest absence, never a dead entry.
     fn build_menus(s: &Snapshot) -> Vec<Menu<MenuAction>> {
         let has_page = s.has_page();
         vec![
+            build_engine_menu(s),
+            Menu::new(
+                "Page",
+                vec![Entry::Item(
+                    Item::new(MenuAction::OpenAddress, "Open Typed Address")
+                        .shortcut("Enter")
+                        .enabled(s.typed_address && s.has_tab && !s.crashed),
+                )],
+            ),
             Menu::new(
                 "Edit",
                 vec![Entry::Item(
@@ -811,9 +868,17 @@ mod menubar {
             ),
             Menu::new(
                 "View",
-                vec![Entry::Item(
-                    Item::new(MenuAction::Reload, reload_label(s.crashed)).enabled(s.has_tab),
-                )],
+                vec![
+                    Entry::Item(
+                        Item::new(MenuAction::Reload, reload_label(s.crashed)).enabled(s.has_tab),
+                    ),
+                    Entry::Separator,
+                    Entry::Caption(
+                        "Power mode \u{2014} not yet available (BROWSER-DD-8: the dev/power \
+                         toolset lands behind one toggle)."
+                            .to_owned(),
+                    ),
+                ],
             ),
             Menu::new(
                 "History",
@@ -889,11 +954,16 @@ mod menubar {
         format!("{head}\u{2026}")
     }
 
-    /// Build the live status cluster: the committed URL, the lifecycle state, the
+    /// Build the live status cluster: the active engine (MENU-3 — every live
+    /// session is the sandboxed Servo helper today, so the chip appears only when
+    /// a tab actually runs one, §7), the committed URL, the lifecycle state, the
     /// http/https security state, and the ad-filter shield (a `0` count stays
     /// hidden, §7).
     fn build_status(s: &Snapshot) -> Vec<StatusChip> {
         let mut chips = Vec::new();
+        if s.has_tab {
+            chips.push(StatusChip::new("Servo", ChipTone::Info));
+        }
         if s.has_tab && !s.url.trim().is_empty() {
             chips.push(StatusChip::new(truncate_url(&s.url), ChipTone::Neutral));
         }
@@ -969,6 +1039,20 @@ mod menubar {
                     tab.session.reload();
                 }
             }
+            MenuAction::OpenAddress => {
+                // The toolbar Go button's exact seam (MENU-3): load the address
+                // draft on a live (non-crashed) active tab.
+                let crashed = state
+                    .tabs
+                    .get(state.active)
+                    .is_some_and(|t| t.session.is_crashed());
+                let url = state.address.trim().to_owned();
+                if !crashed && !url.is_empty() {
+                    if let Some(tab) = state.active_tab() {
+                        tab.session.load(url);
+                    }
+                }
+            }
             MenuAction::CopyUrl => {
                 let url = page_url(state);
                 if !url.trim().is_empty() {
@@ -1018,6 +1102,7 @@ mod menubar {
                 can_back: true,
                 can_forward: false,
                 loading: false,
+                typed_address: false,
                 blocked: 3,
                 url: "https://example.com/path".to_owned(),
                 state: Some(SessionState::Live),
@@ -1028,11 +1113,118 @@ mod menubar {
         fn the_menus_cover_the_real_browser_seams() {
             let menus = build_menus(&https_page());
             let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
-            assert_eq!(titles, ["Edit", "View", "History", "Bookmarks"]);
+            assert_eq!(
+                titles,
+                ["Engine", "Page", "Edit", "View", "History", "Bookmarks"]
+            );
             // File (no new-tab/quit seam) and Help (no chord table) are honestly
             // omitted, not shipped as present-but-dead menus (§7).
             assert!(!titles.contains(&"File"));
             assert!(!titles.contains(&"Help"));
+        }
+
+        // ── MENU-3: the two-engine bar ──────────────────────────────────────────
+
+        #[test]
+        fn the_engine_menu_is_honest_captions_until_cef_lands() {
+            // No engine-selection seam exists (CEF isn't vendored, BROWSER-DD-1),
+            // so the Engine menu carries ONLY captions — no activatable (or even
+            // greyed) entry pretends a selection seam exists (§8).
+            let menus = build_menus(&https_page());
+            let engine = menus
+                .into_iter()
+                .find(|m| m.title == "Engine")
+                .expect("Engine menu present");
+            assert!(
+                !engine
+                    .entries
+                    .iter()
+                    .any(|e| matches!(e, Entry::Item(_) | Entry::Submenu { .. })),
+                "Engine holds no activatable entries until a selection seam lands"
+            );
+            let captions: Vec<&str> = engine
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Caption(c) => Some(c.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                captions.iter().any(|c| c.contains("Servo")),
+                "Servo is named as the active engine"
+            );
+            assert!(
+                captions
+                    .iter()
+                    .any(|c| c.contains("CEF") && c.contains("not yet vendored")),
+                "the CEF gate is named honestly"
+            );
+        }
+
+        #[test]
+        fn open_typed_address_gates_on_a_draft_and_a_live_tab() {
+            // A typed draft + a live tab → enabled; no draft, or a crashed tab,
+            // or no tab → the honest disable (§7).
+            let ready = Snapshot {
+                typed_address: true,
+                ..https_page()
+            };
+            let open = |menus: Vec<mde_egui::menubar::Menu<MenuAction>>| {
+                menus
+                    .into_iter()
+                    .find(|m| m.title == "Page")
+                    .and_then(|m| {
+                        m.entries.into_iter().find_map(|e| match e {
+                            Entry::Item(i) if i.id == MenuAction::OpenAddress => Some(i.enabled),
+                            _ => None,
+                        })
+                    })
+                    .expect("Page → Open Typed Address is present")
+            };
+            assert!(open(build_menus(&ready)), "draft + live tab enables");
+            assert!(!open(build_menus(&https_page())), "no draft disables");
+            let crashed = Snapshot {
+                typed_address: true,
+                crashed: true,
+                ..https_page()
+            };
+            assert!(!open(build_menus(&crashed)), "a crashed tab disables");
+            let no_tab = Snapshot {
+                typed_address: true,
+                ..Snapshot::default()
+            };
+            assert!(!open(build_menus(&no_tab)), "no tab disables");
+        }
+
+        #[test]
+        fn the_view_menu_names_the_power_mode_gate() {
+            let view = build_menus(&https_page())
+                .into_iter()
+                .find(|m| m.title == "View")
+                .expect("View menu present");
+            assert!(
+                view.entries.iter().any(|e| matches!(
+                    e,
+                    Entry::Caption(c) if c.contains("Power mode") && c.contains("BROWSER-DD-8")
+                )),
+                "the BROWSER-DD-8 Power-mode gate is a named honest caption"
+            );
+        }
+
+        #[test]
+        fn the_engine_chip_reads_the_live_helper() {
+            // A tab runs the sandboxed Servo helper → the engine chip shows; with
+            // no session there is no engine to claim (§7).
+            let chips = build_status(&https_page());
+            assert_eq!(chips[0].text, "Servo", "the engine chip leads the cluster");
+            assert_eq!(chips[0].tone, ChipTone::Info);
+            assert!(
+                !build_status(&Snapshot::default())
+                    .iter()
+                    .any(|c| c.text == "Servo"),
+                "no tab ⇒ no engine chip"
+            );
         }
 
         #[test]
@@ -1098,8 +1290,10 @@ mod menubar {
         fn the_status_cluster_reflects_the_live_page() {
             let chips = build_status(&https_page());
             let texts: Vec<&str> = chips.iter().map(|c| c.text.as_str()).collect();
-            // URL · Live · https · 3 blocked, left→right.
-            assert_eq!(texts[0], "https://example.com/path");
+            // Engine · URL · Live · https · 3 blocked, left→right (MENU-3 leads
+            // with the active engine).
+            assert_eq!(texts[0], "Servo");
+            assert_eq!(texts[1], "https://example.com/path");
             assert!(texts.contains(&"Live"), "the lifecycle chip is present");
             assert!(texts.contains(&"https"), "the security chip is present");
             assert!(texts.contains(&"3"), "the ad-filter shield shows the count");
@@ -1171,11 +1365,15 @@ mod menubar {
         #[test]
         fn apply_on_an_empty_state_is_a_safe_noop() {
             let ctx = egui::Context::default();
-            let mut state = WebState::default();
+            let mut state = WebState {
+                address: "https://example.com/".to_owned(),
+                ..WebState::default()
+            };
             for action in [
                 MenuAction::Back,
                 MenuAction::Forward,
                 MenuAction::Reload,
+                MenuAction::OpenAddress,
                 MenuAction::CopyUrl,
                 MenuAction::AddBookmark,
                 MenuAction::SendInChat,
@@ -1383,6 +1581,35 @@ mod tests {
         super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::Reload);
         assert!(!state.respawn_requested, "a live reload is not a respawn");
         assert!(!state.tabs[0].session.is_crashed());
+    }
+
+    #[test]
+    fn the_menu_open_address_loads_the_typed_draft_on_the_live_tab() {
+        // Page → Open Typed Address drives `WebSession::load` (the toolbar Go
+        // button's exact seam). The fake helper answers a Load with a fresh
+        // frame + PaintReady, so observing a new frame proves the menu action
+        // reached the live session — not a parallel path (§6).
+        let (session, _helper) = testkit::connect().expect("connect");
+        let mut state = WebState::default();
+        state.push_session(session);
+        run_until_texture(&mut state); // drain the initial frame
+        state.address = "https://example.com/".to_owned();
+        let ctx = egui::Context::default();
+        super::menubar::apply(&ctx, &mut state, super::menubar::MenuAction::OpenAddress);
+        let mut fresh_frame = false;
+        for _ in 0..100 {
+            let tab = &mut state.tabs[0];
+            tab.session.poll();
+            if tab.session.take_frame().is_some() {
+                fresh_frame = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            fresh_frame,
+            "OpenAddress reached the helper (a fresh frame arrived for the load)"
+        );
     }
 
     #[test]
