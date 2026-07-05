@@ -29,6 +29,7 @@
 pub mod discovery;
 pub mod error;
 pub mod event;
+pub mod fanout;
 pub mod file_browse;
 pub mod first_pair;
 pub mod keygen;
@@ -44,6 +45,11 @@ pub mod transport;
 pub use discovery::UdpDiscovery;
 pub use error::HostError;
 pub use event::{EventSink, EventStream, HostEvent};
+pub use fanout::{
+    aggregate_responses, collect_pending_requests, designated_endpoint, endpoint_device_name,
+    is_designated_endpoint, publish_request, publish_response, request_id, FanoutAction,
+    FanoutAggregate, FanoutRequest, FanoutResponse, MESH_ENDPOINT_NAME,
+};
 pub use file_browse::{browse, BrowseError, FileEntry, SharedRoot};
 pub use keygen::{generate_pkcs8, issue_identity_cert, KeygenError};
 pub use lan::{host_identity, LanConnection, LanTransport, KDC_TLS_PORT};

@@ -41,6 +41,7 @@ mod lock_signal;
 mod mesh_view;
 mod network;
 mod pam_auth;
+mod phones_hub;
 mod power_honor;
 mod power_settings;
 mod provisioning;
@@ -202,6 +203,12 @@ struct Shell {
     /// the chat worker's `state/chat/roster` + `state/chat/conversation/<key>`
     /// read-model. A pure renderer; sends via `action/chat/send`.
     chat: chat::ChatState,
+    /// The Phones hub surface (KDC-MESH-9) — the desktop-side management surface for
+    /// the mesh's paired phone(s). A thin client of the `kdc_host` worker: it renders
+    /// the live device roster (`action/connect/devices`) + the mesh service directory
+    /// (the replicated `kdc-services/*.json`, KDC-MESH-7) and drives the operator
+    /// verbs (unpair / ring / clipboard / sftp / browse). Polled while in view.
+    phones_hub: phones_hub::PhonesHubState,
     /// The System surface — this seat's host controls, folded from the ONE
     /// `mde-seat` `Seat` (lock 1): mixer / Bluetooth / displays / power & battery /
     /// backlight / hotkeys. Its cached snapshot also feeds the dock's status quads'
@@ -338,6 +345,7 @@ impl Shell {
             instances: instances::InstancesState::default(),
             infra_code: iac::InfraCodeState::default(),
             chat: chat::ChatState::default(),
+            phones_hub: phones_hub::PhonesHubState::default(),
             system: system::SystemState::default(),
             storage: storage::StorageState::default(),
             device_manager: device_manager::DeviceManagerState::default(),
@@ -689,6 +697,15 @@ impl Shell {
                     chat.show(ui);
                 });
             }
+            Surface::Phones => {
+                // The Phones hub (KDC-MESH-9) — the desktop-side management surface
+                // for the mesh's paired phone(s). A thin client of the `kdc_host`
+                // worker (renders its published state + drives its Bus verbs, §6); its
+                // poll is driven in `render` while in view. Scoped under its own
+                // `push_id` like every mounted surface.
+                let phones = &mut self.phones_hub;
+                ui.push_id("shell-phones", |ui| phones.show(ui));
+            }
             Surface::System => {
                 // This seat's host controls, folded from the one `mde-seat` Seat
                 // (E12-15). Under SETTINGS-1 the surface is a master-detail shell —
@@ -907,6 +924,14 @@ impl Shell {
         // pre-poll dim until the `hardware_probe` worker's file lands (§7).
         if self.nav.expanded && self.nav.surface == Surface::About {
             self.device_manager.poll(ctx);
+        }
+
+        // The Phones hub tails the live KDE Connect roster (`action/connect/devices`)
+        // + the mesh service directory (the replicated `kdc-services/*.json`) while
+        // in view (KDC-MESH-9) — a non-blocking Bus RPC + a cheap local scan on the
+        // shared cadence; the verb replies land on a later tick (§7).
+        if self.nav.expanded && self.nav.surface == Surface::Phones {
+            self.phones_hub.poll(ctx);
         }
 
         // The seat snapshot feeds BOTH the System surface and the dock's status

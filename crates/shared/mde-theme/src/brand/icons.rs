@@ -1,6 +1,6 @@
 //! `brand::icons` — the monochrome Quasar line-art icon set (QBRAND-2).
 //!
-//! The 33 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10 + the
+//! The 34 brand glyphs (`assets/brand/quasar/*.svg`, QBRAND-10 + the
 //! NAVBAR-W10-1 tray set) embedded as
 //! inline SVG consts behind [`IconId`], plus the SVG→raster loader
 //! ([`icon_image`]) every surface draws them through. The glyphs are authored
@@ -57,7 +57,7 @@ macro_rules! quasar_svg {
 
 /// Identifier for every glyph in the Quasar brand set.
 ///
-/// The product marks, the 15 dock/surface glyphs, the 3 node-role badges and
+/// The product marks, the 16 dock/surface glyphs, the 3 node-role badges and
 /// the 12 Win10-taskbar tray glyphs (NAVBAR-W10-1, tuned to stay legible
 /// rasterized at 16px) — one variant per SVG in `assets/brand/quasar/`;
 /// [`IconId::svg`] resolves the embedded source.
@@ -95,6 +95,8 @@ pub enum IconId {
     Editor,
     /// The Chat surface glyph.
     Chat,
+    /// The Phones hub surface glyph — a smartphone outline (KDC-MESH-9).
+    Phones,
     /// The System surface glyph.
     System,
     /// The Storage surface glyph.
@@ -146,7 +148,7 @@ pub enum IconId {
 
 impl IconId {
     /// Every glyph in the set, for exhaustive iteration (dock catalogs, tests).
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::Mark,
         Self::Wordmark,
         Self::Node,
@@ -161,6 +163,7 @@ impl IconId {
         Self::Terminal,
         Self::Editor,
         Self::Chat,
+        Self::Phones,
         Self::System,
         Self::Storage,
         Self::MeshView,
@@ -220,6 +223,7 @@ impl IconId {
             Self::Terminal => quasar_svg!("surface-terminal.svg"),
             Self::Editor => quasar_svg!("surface-editor.svg"),
             Self::Chat => quasar_svg!("surface-chat.svg"),
+            Self::Phones => quasar_svg!("surface-phones.svg"),
             Self::System => quasar_svg!("surface-system.svg"),
             Self::Storage => quasar_svg!("surface-storage.svg"),
             Self::MeshView => quasar_svg!("surface-mesh-view.svg"),
@@ -262,6 +266,7 @@ impl IconId {
             Self::Terminal => "surface-terminal",
             Self::Editor => "surface-editor",
             Self::Chat => "surface-chat",
+            Self::Phones => "surface-phones",
             Self::System => "surface-system",
             Self::Storage => "surface-storage",
             Self::MeshView => "surface-mesh-view",
@@ -590,8 +595,8 @@ mod tests {
 
     #[test]
     fn ids_names_and_sources_are_distinct_and_exhaustive() {
-        // Guards a copy-paste slip in the two match tables: 33 ids, 33 unique
-        // names, 33 unique embedded sources, all valid-looking SVG.
+        // Guards a copy-paste slip in the two match tables: 34 ids, 34 unique
+        // names, 34 unique embedded sources, all valid-looking SVG.
         let mut names: Vec<&str> = IconId::ALL.iter().map(|id| id.name()).collect();
         names.sort_unstable();
         names.dedup();

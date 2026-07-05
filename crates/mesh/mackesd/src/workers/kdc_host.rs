@@ -68,6 +68,7 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::{publish_request, reply_topic};
 use mde_kdc_host::error::HostError;
+use mde_kdc_host::fanout::{self, FanoutAction, FanoutRequest, FanoutResponse};
 use mde_kdc_host::file_browse::SharedRoot;
 use mde_kdc_host::pairing::{DeviceRecord, PairingStore};
 use mde_kdc_host::service_directory::{self, NodeServices, PublishedRoot};
@@ -165,6 +166,29 @@ const NOTIFY_SEEN_CAP: usize = 512;
 
 /// How often the mesh→phone forwarder drains the local `event/notify/*` lanes.
 const NOTIFY_FORWARD_TICK: Duration = Duration::from_secs(5);
+
+// ── KDC-MESH-9: the mesh-fanout endpoint (design #8) ─────────────────────────
+//
+// The designated endpoint advertises as "Quasar Mesh" (one device to stock KDE
+// Connect) and relays each follow-everywhere action (a phone clipboard copy / a
+// find-my-device ring) to EVERY node, aggregating their responses. The relay rides
+// the same own-row replicated substrate as the phone roster + notification relay
+// (`mde_kdc_host::fanout`); this worker is the glue that classifies the inbound
+// packet, publishes the request when it's the endpoint, and — on every node —
+// drains + applies + responds, then aggregates on the endpoint. Every fanned-out
+// action audits (#16).
+
+/// Cap on a node's own fanout request/response row (newest N).
+const FANOUT_ROW_CAP: usize = 64;
+
+/// A fanout request/response older than this (ms) is ignored — 5 minutes, the same
+/// window the notification relay ages out at (a rejoining node doesn't replay
+/// ancient actions).
+const FANOUT_STALE_MS: i64 = 300_000;
+
+/// Bound on the per-node apply-once seen-set of fanout request ids + the endpoint's
+/// recent-request ring it aggregates over.
+const FANOUT_SEEN_CAP: usize = 256;
 
 /// The bus root the CHAT-FIX-2 notify producer + the chat folder run on — the
 /// per-HOME `data_dir/mde/bus`, identical for every worker in THIS mackesd
@@ -752,6 +776,129 @@ fn parse_inbound_notification(
     })
 }
 
+// ───────────────── KDC-MESH-9: the mesh-fanout endpoint ───────────────────────
+
+/// Classify an inbound phone packet as a **follow-everywhere** [`FanoutAction`] the
+/// endpoint relays to every node (design #6/#10), or `None` for a packet that isn't
+/// fanned out. Pure (no I/O) so the endpoint's relay decision is unit-tested. Only
+/// the two v1 follow-everywhere actions are fanned out — a clipboard copy and a
+/// find-my-device ring — so a copy / ring on the single "Quasar Mesh" device
+/// reaches EVERY desktop, not just the endpoint one.
+fn fanout_action_for_packet(kind: &str, body: &Value) -> Option<FanoutAction> {
+    match kind {
+        "kdeconnect.clipboard" | "kdeconnect.clipboard.connect" => {
+            let content = body.get("content").and_then(Value::as_str)?;
+            // An empty clipboard push isn't worth fanning out.
+            (!content.is_empty()).then(|| FanoutAction::Clipboard {
+                content: content.to_string(),
+            })
+        }
+        "kdeconnect.findmyphone.request" => Some(FanoutAction::Ring),
+        _ => None,
+    }
+}
+
+/// Apply one fanned-out action on THIS node (design #6/#10) and return a short
+/// human detail for the response row. Reuses the same local seams the direct
+/// receive path drives (`apply_clipboard` / `ring_local_device`), so a fanned-out
+/// clipboard/ring is byte-identical to a directly-received one.
+fn apply_fanout_action(action: &FanoutAction) -> String {
+    match action {
+        FanoutAction::Clipboard { content } => {
+            apply_clipboard(content);
+            format!("clipboard set ({} bytes)", content.len())
+        }
+        FanoutAction::Ring => {
+            ring_local_device();
+            "rang".to_string()
+        }
+    }
+}
+
+/// The endpoint relays one follow-everywhere action to every node: append a
+/// [`FanoutRequest`] to this node's own request row (design #8) + audit (#16).
+/// Returns the request id so the endpoint can aggregate the responses later. A
+/// substrate write failure is an honest log + `None` (no fake fanout).
+fn relay_fanout_action(
+    shunt_root: &std::path::Path,
+    host: &str,
+    action: &FanoutAction,
+) -> Option<String> {
+    let ts = now_ms();
+    let id = fanout::request_id(host, ts, action);
+    let req = FanoutRequest {
+        id: id.clone(),
+        action: action.clone(),
+        origin_host: host.to_string(),
+        ts_ms: ts,
+    };
+    match fanout::publish_request(shunt_root, host, &req, FANOUT_ROW_CAP) {
+        Ok(_) => {
+            audit_kdc_action(json!({
+                "action": "kdc_fanout_relay",
+                "fanout_action": action.tag(),
+                "request_id": id,
+            }));
+            Some(id)
+        }
+        Err(e) => {
+            warn!(error = %e, "kdc-host: fanout relay publish failed");
+            None
+        }
+    }
+}
+
+/// Every node drains peers' pending fanout requests (design #8), applies each
+/// not-yet-seen action locally, and writes a response row; each application audits
+/// (#16). `seen` de-dups so a request is applied exactly once per node even though
+/// its row lingers on the substrate across ticks.
+fn drain_fanout_requests(shunt_root: &std::path::Path, host: &str, seen: &mut NotifySeen) {
+    let now = now_ms();
+    for req in fanout::collect_pending_requests(shunt_root, host, now, FANOUT_STALE_MS) {
+        if !seen.admit(&req.id) {
+            continue;
+        }
+        let detail = apply_fanout_action(&req.action);
+        let resp = FanoutResponse {
+            request_id: req.id.clone(),
+            node_host: host.to_string(),
+            applied: true,
+            detail: detail.clone(),
+            ts_ms: now_ms(),
+        };
+        if let Err(e) = fanout::publish_response(shunt_root, host, &resp, FANOUT_ROW_CAP) {
+            warn!(error = %e, "kdc-host: fanout response publish failed");
+        }
+        audit_kdc_action(json!({
+            "action": "kdc_fanout_apply",
+            "fanout_action": req.action.tag(),
+            "request_id": req.id,
+            "origin": req.origin_host,
+            "detail": detail,
+        }));
+    }
+}
+
+/// The endpoint aggregates the responses to each of its recent fanout requests
+/// (design #8 "aggregating responses") and audits the reach (how many nodes
+/// applied). Best-effort + observable — the aggregate lands in the hash-chained
+/// audit log (#16), so a follow-everywhere action's fleet reach is recorded.
+fn aggregate_fanout(shunt_root: &std::path::Path, recent: &VecDeque<String>) {
+    let now = now_ms();
+    for id in recent {
+        let agg = fanout::aggregate_responses(shunt_root, id, now, FANOUT_STALE_MS);
+        if agg.responders.is_empty() {
+            continue;
+        }
+        audit_kdc_action(json!({
+            "action": "kdc_fanout_aggregate",
+            "request_id": id,
+            "applied_nodes": agg.applied,
+            "responders": agg.responders,
+        }));
+    }
+}
+
 // ───────────────── KDC-MESH-5: mesh → phone (forward) ─────────────────────────
 
 /// The persist-driven core of [`NotifyCtx::drain_local_notifies`] — factored out so
@@ -1056,7 +1203,31 @@ async fn run_host(
     outbound: PendingSends,
     config_dir: PathBuf,
 ) {
-    let announce = local_announce();
+    let mut announce = local_announce();
+    // SEC-5 — the mesh-shunt root + this host's shunt name. Resolved up front (they
+    // were previously computed after transport start) so the KDC-MESH-9 endpoint
+    // election can run BEFORE the announce moves into the transport.
+    let shunt_root = crate::default_qnm_shared_root();
+    let shunt_host = hostname_for_shunt();
+    // KDC-MESH-9 — elect the mesh-fanout endpoint (design #8): the stable primary
+    // (lexicographically-lowest hostname) among the nodes that have published a KDC
+    // service-directory row, plus THIS node. The designated endpoint advertises its
+    // KDE Connect identity as "Quasar Mesh" — the single device stock KDE Connect
+    // shows for the follow-everywhere features — so its inbound clipboard/ring lands
+    // here and fans out to the whole mesh. Elected once at start (the advertised KDC
+    // name is the TLS-handshake identity, fixed for the link's life); a roster change
+    // settles on the next restart. A first-ever boot (empty directory) elects self,
+    // so a lone node is honestly its own "Quasar Mesh".
+    let mut mesh_hosts: Vec<String> = service_directory::collect_all_services(&shunt_root)
+        .into_iter()
+        .map(|n| n.node_host)
+        .collect();
+    mesh_hosts.push(shunt_host.clone());
+    let is_endpoint = fanout::is_designated_endpoint(&shunt_host, &mesh_hosts);
+    if is_endpoint {
+        announce.device_name = fanout::endpoint_device_name(true, &announce.device_name);
+        info!(name = %announce.device_name, "kdc-host: this node is the mesh-fanout endpoint");
+    }
     // KDC-MESH-2 — this node's KDC device id (its `/etc/machine-id`): published
     // in the mesh-shunt roster as `host_device_id` so neighbors can resolve +
     // dial THIS host by overlay IP (design #2). Captured before the announce
@@ -1081,12 +1252,11 @@ async fn run_host(
     // the roster (above) so the mesh can dial us; `None` only if the transport
     // somehow reported unresolved after a successful start (defensive).
     let host_overlay_ip = transport.overlay_status().await.overlay_ip();
-    // SEC-5 — the mesh-shunt: publish this peer's paired phones to the
-    // replicated volume + relay neighbors' phones into the roster, so a
-    // phone paired on another peer shows up here (and is outbound-
-    // pairable) without a direct LAN broadcast.
-    let shunt_root = crate::default_qnm_shared_root();
-    let shunt_host = hostname_for_shunt();
+    // SEC-5 — the mesh-shunt: publish this peer's paired phones to the replicated
+    // volume + relay neighbors' phones into the roster, so a phone paired on another
+    // peer shows up here (and is outbound-pairable) without a direct LAN broadcast.
+    // (`shunt_root` + `shunt_host` were resolved up front for the KDC-MESH-9 endpoint
+    // election above.)
     let shunt_registry = std::sync::Mutex::new(mde_kdc_proto::discovery::DiscoveryRegistry::new());
     let mut shunt_tick = tokio::time::interval(super::mesh_shunt::TICK);
     // AUD-2 — the kdc_outbound drainer: every second, take the operator-queued
@@ -1105,6 +1275,17 @@ async fn run_host(
     }
     let mut notify_cursors: HashMap<String, String> = HashMap::new();
     let mut notify_fwd_tick = tokio::time::interval(NOTIFY_FORWARD_TICK);
+    // KDC-MESH-9 — the mesh-fanout state. `fanout_seen` de-dups the apply-once drain
+    // (every node applies each request exactly once, even as the row lingers across
+    // ticks); `fanout_recent` is the endpoint's ring of request ids it aggregates
+    // over each shunt tick. Primed with what's already on the substrate so a restart
+    // doesn't re-apply a request it already handled.
+    let mut fanout_seen = NotifySeen::default();
+    for req in fanout::collect_pending_requests(&shunt_root, &shunt_host, now_ms(), FANOUT_STALE_MS)
+    {
+        fanout_seen.prime(req.id);
+    }
+    let mut fanout_recent: VecDeque<String> = VecDeque::new();
     loop {
         tokio::select! {
             ev = stream.recv() => {
@@ -1227,6 +1408,23 @@ async fn run_host(
                             }));
                         }
                     }
+                    // KDC-MESH-9 — the mesh-fanout endpoint (design #8): when THIS
+                    // node is the designated "Quasar Mesh" endpoint, a follow-
+                    // everywhere action it just applied locally (a clipboard copy or a
+                    // find-my-device ring, classified from the packet) is ALSO relayed
+                    // to every other node, so a copy/ring on the single "Quasar Mesh"
+                    // device reaches the whole mesh (#6/#10). The endpoint remembers
+                    // the request id to aggregate the responses on the shunt tick.
+                    if is_endpoint {
+                        if let Some(action) = fanout_action_for_packet(&packet.kind, &packet.body) {
+                            if let Some(id) = relay_fanout_action(&shunt_root, &shunt_host, &action) {
+                                fanout_recent.push_back(id);
+                                while fanout_recent.len() > FANOUT_SEEN_CAP {
+                                    fanout_recent.pop_front();
+                                }
+                            }
+                        }
+                    }
                     // KDC-MESH-5 — a phone notification (design #6): fan it out,
                     // de-duped, to EVERY node's desktop feed. Republish onto THIS
                     // node's `event/notify/phone` lane + relay it to peers over the
@@ -1298,6 +1496,15 @@ async fn run_host(
                 );
                 if let Err(e) = service_directory::publish_services(&shunt_root, &snapshot) {
                     warn!(error = %e, "kdc-host: service-directory publish failed");
+                }
+                // KDC-MESH-9 — the mesh-fanout, receiving + aggregating side (#8).
+                // Every node drains peers' pending follow-everywhere requests, applies
+                // each not-yet-seen one locally (clipboard/ring), and responds; the
+                // endpoint then aggregates its recent requests' responses so a
+                // follow-everywhere action's fleet reach lands in the audit log (#16).
+                drain_fanout_requests(&shunt_root, &shunt_host, &mut fanout_seen);
+                if is_endpoint {
+                    aggregate_fanout(&shunt_root, &fanout_recent);
                 }
             }
             _ = notify_fwd_tick.tick() => {
@@ -2812,6 +3019,77 @@ mod tests {
     fn worker_name_matches_module() {
         let w = KdcHostWorker::new(PathBuf::from("/tmp"));
         assert_eq!(w.name(), "kdc-host");
+    }
+
+    #[test]
+    fn fanout_classify_maps_only_follow_everywhere_packets() {
+        // A clipboard copy → a Clipboard fanout action.
+        assert_eq!(
+            fanout_action_for_packet("kdeconnect.clipboard", &json!({ "content": "hi" })),
+            Some(FanoutAction::Clipboard {
+                content: "hi".into()
+            })
+        );
+        // The connection-time clipboard push is fanned out too.
+        assert_eq!(
+            fanout_action_for_packet("kdeconnect.clipboard.connect", &json!({ "content": "x" })),
+            Some(FanoutAction::Clipboard {
+                content: "x".into()
+            })
+        );
+        // An empty clipboard push isn't worth fanning out.
+        assert_eq!(
+            fanout_action_for_packet("kdeconnect.clipboard", &json!({ "content": "" })),
+            None
+        );
+        // A find-my-device ring → a Ring fanout action.
+        assert_eq!(
+            fanout_action_for_packet("kdeconnect.findmyphone.request", &json!({})),
+            Some(FanoutAction::Ring)
+        );
+        // Everything else is NOT a follow-everywhere action (node-specific / not
+        // fanned out) — e.g. a run-command or a notification.
+        assert_eq!(
+            fanout_action_for_packet("kdeconnect.runcommand.request", &json!({})),
+            None
+        );
+        assert_eq!(
+            fanout_action_for_packet("kdeconnect.notification", &json!({ "ticker": "x" })),
+            None
+        );
+    }
+
+    #[test]
+    fn fanout_drain_applies_a_peer_request_once_and_responds() {
+        // The relay/aggregate substrate is exercised end-to-end via the worker glue:
+        // a peer's request is drained (applied once, then de-duped) and a response
+        // row is written the endpoint can aggregate. `apply_fanout_action` shells out
+        // to wl-copy/canberra which are absent in CI — it must still no-op cleanly.
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        // An endpoint (eagle) relayed a ring; a peer (oak) drains it.
+        fanout::publish_request(
+            root,
+            "eagle",
+            &FanoutRequest {
+                id: "eagle:1000:ring".into(),
+                action: FanoutAction::Ring,
+                origin_host: "eagle".into(),
+                ts_ms: now_ms(),
+            },
+            FANOUT_ROW_CAP,
+        )
+        .unwrap();
+        let mut seen = NotifySeen::default();
+        drain_fanout_requests(root, "oak", &mut seen);
+        // oak wrote a response the endpoint can aggregate.
+        let agg = fanout::aggregate_responses(root, "eagle:1000:ring", now_ms(), FANOUT_STALE_MS);
+        assert_eq!(agg.responders, vec!["oak".to_string()]);
+        assert_eq!(agg.applied, 1);
+        // A second drain is a no-op (apply-once seen-set) — still one responder.
+        drain_fanout_requests(root, "oak", &mut seen);
+        let agg2 = fanout::aggregate_responses(root, "eagle:1000:ring", now_ms(), FANOUT_STALE_MS);
+        assert_eq!(agg2.applied, 1, "de-duped: applied exactly once per node");
     }
 
     #[test]

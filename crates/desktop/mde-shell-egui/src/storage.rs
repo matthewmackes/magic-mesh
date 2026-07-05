@@ -3294,6 +3294,11 @@ mod menubar_coverage {
                 reason: "bare — mde-voice-egui mounts with its own header; folding \
                          it onto the shared bar is a MENUBAR-SWEEP follow-on",
             },
+            Surface::Phones => Coverage::Exempt {
+                reason: "bare — the KDC-MESH-9 Phones hub carries its own tab header \
+                         (Phones · Files · Commands · Pair); folding it onto the \
+                         shared bar is a MENUBAR-SWEEP follow-on",
+            },
             Surface::Terminal => Coverage::Exempt {
                 reason: "bare — mde-term-egui carries its own tmux/session menu \
                          strip; migrating it onto the shared bar is a MENUBAR-SWEEP \
@@ -3384,6 +3389,7 @@ mod menubar_coverage {
                 Surface::Voice,
                 Surface::Terminal,
                 Surface::Editor,
+                Surface::Phones,
                 Surface::Timers,
             ],
             "a surface leaving (or joining) the bare set updates this inventory \

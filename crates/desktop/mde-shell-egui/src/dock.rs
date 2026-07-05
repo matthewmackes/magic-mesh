@@ -97,6 +97,14 @@ pub enum Surface {
     /// worker read-model. Subsumes the retired standalone Notifications +
     /// Clipboard surfaces (NOTIFY-CHAT-6 cutover).
     Chat,
+    /// The **Phones** hub surface (KDC-MESH-9) — the desktop-side management surface
+    /// for the mesh's paired phone(s): mesh identity + battery/signal, per-feature
+    /// toggles, the node-targeted file browser, the run-command catalog (incl. the
+    /// OpenStack lifecycle set), fast mesh-wide unpair, and the pair-a-phone flow. A
+    /// thin client of the `kdc_host` worker (the `action/connect/*` verbs + the mesh
+    /// service directory) — it renders published state + drives Bus verbs, never
+    /// reimplementing the host (§6).
+    Phones,
     /// The System surface — this seat's host controls (audio mixer, Bluetooth,
     /// displays, power & battery, backlight, hotkeys), folded from `mde-seat`
     /// (E12-15). Owns ALL host-control interaction (lock 3); the taskbar tray
@@ -135,7 +143,7 @@ impl Surface {
     /// labelled [`GROUPS`] (the Workbench leads standalone), preserving this
     /// relative order within each group (L7); a compile-time guard keeps the two
     /// tables in sync.
-    pub(crate) const ALL: [Surface; 16] = [
+    pub(crate) const ALL: [Surface; 17] = [
         Surface::Workbench,
         Surface::MeshView,
         Surface::Instances,
@@ -149,6 +157,7 @@ impl Surface {
         Surface::Terminal,
         Surface::Editor,
         Surface::Chat,
+        Surface::Phones,
         Surface::System,
         Surface::Storage,
         Surface::About,
@@ -177,6 +186,8 @@ impl Surface {
             Surface::Terminal => IconId::Terminal,
             Surface::Editor => IconId::Editor,
             Surface::Chat => IconId::Chat,
+            // The Phones hub wears the dedicated smartphone glyph (KDC-MESH-9).
+            Surface::Phones => IconId::Phones,
             // The System (host-controls) surface is the dock's right-side Settings
             // button (PICKER-2) — it wears the toothed **cog** glyph, the Win10
             // settings-gear idiom, distinct from the spoked legacy System glyph.
@@ -241,13 +252,13 @@ struct Group {
 /// standalone anchor, and **System** (Settings) + **Desktop** (Show-Desktop) are
 /// VDOCK-4's bottom system-quad cells; every other surface appears here exactly
 /// once (About lives in System's group) — the union with those three reproduces
-/// all 15 of [`Surface::ALL`]. Drives the picker render + the shell tests (the one
+/// all 17 of [`Surface::ALL`]. Drives the picker render + the shell tests (the one
 /// grouping authority).
 const GROUPS: [Group; 6] = [
     Group {
         label: "Comms",
         accent: Style::ACCENT_COMMS,
-        surfaces: &[Surface::Voice, Surface::Chat],
+        surfaces: &[Surface::Voice, Surface::Chat, Surface::Phones],
     },
     Group {
         label: "Workloads",
@@ -2232,16 +2243,17 @@ mod tests {
 
     #[test]
     fn the_dock_lists_the_workbench_vm_surfaces_app_surfaces_and_info_surfaces() {
-        // Fifteen entries: Workbench first, the live Mesh Map (OW-10, `mde-mesh-view`),
+        // Seventeen entries: Workbench first, the live Mesh Map (OW-10, `mde-mesh-view`),
         // two VM surfaces (Instances / Desktop), the app surfaces (Music / Media — the
         // full media player, MEDIA-18 / Files / Voice / Browser — the sandboxed Servo
         // browser, BOOKMARKS-6 / Terminal — the Terminator-class terminal over a real
         // PTY, TERM-16 / Editor — the native Zed-style code editor, EDITOR-1), the
         // unified Chat surface (the ONE notification interface — the standalone
-        // Notifications + Clipboard surfaces are retired, NOTIFY-CHAT-6), the
-        // host-controls System surface, the Storage surface (GParted-authentic disk
-        // mgmt, E12-21), and the About surface (the platform-identity screen, QBRAND-6).
-        assert_eq!(Surface::ALL.len(), 16);
+        // Notifications + Clipboard surfaces are retired, NOTIFY-CHAT-6), the Phones
+        // hub (KDC-MESH-9 — the desktop-side paired-phone manager), the host-controls
+        // System surface, the Storage surface (GParted-authentic disk mgmt, E12-21),
+        // and the About surface (the platform-identity screen, QBRAND-6).
+        assert_eq!(Surface::ALL.len(), 17);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
             Surface::MeshView,
@@ -2256,6 +2268,8 @@ mod tests {
             Surface::Terminal,
             Surface::Editor,
             Surface::Chat,
+            // The Phones hub (KDC-MESH-9) — the desktop-side paired-phone manager.
+            Surface::Phones,
             Surface::System,
             Surface::Storage,
             Surface::About,
@@ -2289,6 +2303,8 @@ mod tests {
             (Surface::Terminal, IconId::Terminal),
             (Surface::Editor, IconId::Editor),
             (Surface::Chat, IconId::Chat),
+            // The Phones hub wears its own smartphone glyph (KDC-MESH-9).
+            (Surface::Phones, IconId::Phones),
             // The System surface is the right-side Settings button — the cog glyph.
             (Surface::System, IconId::Settings),
             (Surface::Storage, IconId::Storage),
@@ -2303,7 +2319,7 @@ mod tests {
                 "{surface:?} maps to the blank wordmark"
             );
         }
-        // The map is injective — 16 surfaces, 16 distinct glyph names (IaC wears
+        // The map is injective — 17 surfaces, 17 distinct glyph names (IaC wears
         // the Server badge, unshared by any other surface).
         let mut names: Vec<&str> = Surface::ALL.iter().map(|s| s.icon_id().name()).collect();
         names.sort_unstable();
@@ -2350,10 +2366,10 @@ mod tests {
         // Show-Desktop sliver).
         use Surface::{
             About, Browser, Chat, Editor, Files, InfraCode, Instances, Media, MeshView, Music,
-            Storage, Terminal, Voice, Workbench,
+            Phones, Storage, Terminal, Voice, Workbench,
         };
         let expect: [(&str, &[Surface]); 6] = [
-            ("Comms", &[Voice, Chat]),
+            ("Comms", &[Voice, Chat, Phones]),
             ("Workloads", &[Instances, InfraCode]),
             ("Terminals", &[Browser, Terminal, Editor]),
             ("Mesh", &[MeshView]),
@@ -2408,7 +2424,7 @@ mod tests {
     #[test]
     fn the_groups_cover_every_surface_once_in_surface_all_order() {
         // The Workbench lead + the System Settings button + the far-right Desktop
-        // sliver + the six groups reproduce all 15 of Surface::ALL, each surface
+        // sliver + the six groups reproduce all 17 of Surface::ALL, each surface
         // placed exactly once...
         let mut placed: Vec<Surface> = vec![Surface::Workbench, Surface::System, Surface::Desktop];
         for g in &GROUPS {
@@ -2778,7 +2794,7 @@ mod tests {
 
     #[test]
     fn the_picker_routes_every_app_surface_and_defers_the_system_quad() {
-        // §7 — the Workbench lead + the twelve group surfaces each route on a click
+        // §7 — the Workbench lead + the thirteen group surfaces each route on a click
         // into DockState::active (the carried-over routing). Settings (System) +
         // Show-Desktop are NOT in the picker — they belong to VDOCK-4's system quad.
         let ctx = egui::Context::default();
