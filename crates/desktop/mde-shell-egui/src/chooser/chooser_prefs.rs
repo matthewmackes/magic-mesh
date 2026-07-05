@@ -76,7 +76,7 @@ pub struct RecentEntry {
 
 /// A manual (operator-added) desktop endpoint as a last-writer-wins register:
 /// `present` false is the remove tombstone, so a remove on any seat converges.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManualEntry {
     /// The `manual:<host>:<port>:<proto>` id.
     pub id: String,
@@ -91,8 +91,38 @@ pub struct ManualEntry {
     /// The operator's display name, or `None` (defaults to `host:port` worker-side).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// TESTVM-4 — optional login user for the endpoint (RDP wants one; classic
+    /// VNC / a Spice ticket usually not), stored with the entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// TESTVM-4 — optional connect password/ticket stored WITH the entry: the
+    /// operator's explicit choice for a pinned lab/test endpoint, so Connect goes
+    /// straight through with no prompt. Redacted from `Debug` (the
+    /// `crate::auth::Secret` discipline); a credential that must live encrypted
+    /// at rest belongs in the CHOOSER-6 sealed store instead — leave this empty
+    /// to be prompted once and sealed there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
     /// Wall-clock epoch millis of the last add/edit/remove (the LWW ordering key).
     pub updated_ms: u64,
+}
+
+impl std::fmt::Debug for ManualEntry {
+    /// Redact the stored password — a debug-logged prefs record must never leak
+    /// a credential into a log/trace line (the `crate::auth::Secret` invariant).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManualEntry")
+            .field("id", &self.id)
+            .field("present", &self.present)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("protocol", &self.protocol)
+            .field("name", &self.name)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("updated_ms", &self.updated_ms)
+            .finish()
+    }
 }
 
 /// One seat's contribution to the operator's prefs — the single record it writes
@@ -461,44 +491,31 @@ impl ChooserPrefs {
         self.persist(now_ms);
     }
 
-    /// Set `id`'s manual register present with its endpoint fields, stamped
-    /// `now_ms`, and persist.
-    pub fn set_manual(
-        &mut self,
-        id: &str,
-        host: &str,
-        port: u16,
-        protocol: &str,
-        name: Option<String>,
-        now_ms: u64,
-    ) {
-        match self.local.manual.iter_mut().find(|e| e.id == id) {
-            Some(entry) => {
-                entry.present = true;
-                host.clone_into(&mut entry.host);
-                entry.port = port;
-                protocol.clone_into(&mut entry.protocol);
-                entry.name = name;
-                entry.updated_ms = now_ms;
-            }
-            None => self.local.manual.push(ManualEntry {
-                id: id.to_owned(),
-                present: true,
-                host: host.to_owned(),
-                port,
-                protocol: protocol.to_owned(),
-                name,
-                updated_ms: now_ms,
-            }),
+    /// Set `entry.id`'s manual register to `entry`'s endpoint fields (forced
+    /// present — this is the add/edit mutator; a remove goes through
+    /// [`remove_manual`](Self::remove_manual)) and persist, stamped with
+    /// `entry.updated_ms`.
+    pub fn set_manual(&mut self, entry: ManualEntry) {
+        let now_ms = entry.updated_ms;
+        let entry = ManualEntry {
+            present: true,
+            ..entry
+        };
+        match self.local.manual.iter_mut().find(|e| e.id == entry.id) {
+            Some(slot) => *slot = entry,
+            None => self.local.manual.push(entry),
         }
         self.persist(now_ms);
     }
 
     /// Tombstone `id`'s manual register (`present: false`), stamped `now_ms`, and
-    /// persist — so the remove converges across seats.
+    /// persist — so the remove converges across seats. Any stored credential is
+    /// dropped with it (a tombstone must not keep a secret alive on disk).
     pub fn remove_manual(&mut self, id: &str, now_ms: u64) {
         if let Some(entry) = self.local.manual.iter_mut().find(|e| e.id == id) {
             entry.present = false;
+            entry.username = None;
+            entry.password = None;
             entry.updated_ms = now_ms;
         } else {
             self.local.manual.push(ManualEntry {
@@ -508,6 +525,8 @@ impl ChooserPrefs {
                 port: 0,
                 protocol: String::new(),
                 name: None,
+                username: None,
+                password: None,
                 updated_ms: now_ms,
             });
         }
@@ -654,6 +673,8 @@ mod tests {
             port: 1,
             protocol: "rdp".to_owned(),
             name: None,
+            username: None,
+            password: None,
             updated_ms: 10,
         });
         // Present alone → one source.
@@ -667,9 +688,80 @@ mod tests {
             port: 1,
             protocol: "rdp".to_owned(),
             name: None,
+            username: None,
+            password: None,
             updated_ms: 20,
         });
         assert!(merge_manual(&[a, b]).is_empty(), "the newer remove wins");
+    }
+
+    // ── TESTVM-4: the optional stored credential on a manual register ──
+
+    #[test]
+    fn a_manual_entry_redacts_its_password_in_debug_but_round_trips_it() {
+        let entry = ManualEntry {
+            id: "manual:172.20.146.144:5900:vnc".to_owned(),
+            present: true,
+            host: "172.20.146.144".to_owned(),
+            port: 5900,
+            protocol: "vnc".to_owned(),
+            name: Some("testvm-lin".to_owned()),
+            username: None,
+            password: Some("testvm-secret".to_owned()),
+            updated_ms: 1,
+        };
+        // Debug never carries the secret (the crate::auth::Secret invariant)…
+        let shown = format!("{entry:?}");
+        assert!(
+            !shown.contains("testvm-secret"),
+            "the stored password leaked through Debug: {shown}"
+        );
+        assert!(shown.contains("<redacted>"));
+        // …but the persisted register itself round-trips the credential (this IS
+        // the shell-config store the pinned endpoint connects with).
+        let json = serde_json::to_string(&entry).expect("serializes");
+        let back: ManualEntry = serde_json::from_str(&json).expect("parses back");
+        assert_eq!(back.password.as_deref(), Some("testvm-secret"));
+        assert_eq!(back, entry);
+        // A pre-TESTVM-4 record (no credential fields) still parses — the fields
+        // are additive defaults, never a migration break.
+        let old: ManualEntry = serde_json::from_str(
+            r#"{"id":"manual:h:1:rdp","present":true,"host":"h","port":1,
+                "protocol":"rdp","updated_ms":5}"#,
+        )
+        .expect("an old record parses");
+        assert_eq!(old.username, None);
+        assert_eq!(old.password, None);
+    }
+
+    #[test]
+    fn removing_a_manual_entry_drops_its_stored_credential() {
+        let mut prefs = ChooserPrefs::new(
+            ChooserPrefsStore::new(PathBuf::from("/no/such/mesh/root")),
+            "matthew",
+            "seat-a",
+        );
+        prefs.set_manual(ManualEntry {
+            id: "manual:h:1:rdp".to_owned(),
+            present: true,
+            host: "h".to_owned(),
+            port: 1,
+            protocol: "rdp".to_owned(),
+            name: None,
+            username: Some("root".to_owned()),
+            password: Some("pw".to_owned()),
+            updated_ms: 10,
+        });
+        prefs.remove_manual("manual:h:1:rdp", 20);
+        let tomb = prefs
+            .local
+            .manual
+            .iter()
+            .find(|m| m.id == "manual:h:1:rdp")
+            .expect("the tombstone register remains");
+        assert!(!tomb.present);
+        assert_eq!(tomb.username, None, "a tombstone keeps no login user");
+        assert_eq!(tomb.password, None, "a tombstone keeps no secret alive");
     }
 
     #[test]
@@ -782,14 +874,17 @@ mod tests {
         assert!(a.is_ready());
         assert!(a.toggle_favorite("peer:oak", 1_000));
         a.record_recent("peer:oak", "oak", 1_100);
-        a.set_manual(
-            "manual:10.0.0.5:3389:rdp",
-            "10.0.0.5",
-            3389,
-            "rdp",
-            Some("OfficePC".to_owned()),
-            1_200,
-        );
+        a.set_manual(ManualEntry {
+            id: "manual:10.0.0.5:3389:rdp".to_owned(),
+            present: true,
+            host: "10.0.0.5".to_owned(),
+            port: 3389,
+            protocol: "rdp".to_owned(),
+            name: Some("OfficePC".to_owned()),
+            username: Some("office-admin".to_owned()),
+            password: Some("office-pw".to_owned()),
+            updated_ms: 1_200,
+        });
 
         // ── Seat B opens fresh over the SAME root and folds A's record. ──
         let b = ChooserPrefs::new(ChooserPrefsStore::new(dir.clone()), "matthew", "seat-b");
@@ -812,6 +907,11 @@ mod tests {
             vec!["manual:10.0.0.5:3389:rdp"],
             "seat A's manual source roamed to seat B"
         );
+        // TESTVM-4 — the stored credential roams WITH the entry (the whole
+        // register is the LWW value), so seat B connects with no re-entry.
+        let roamed = &merged.manual[0];
+        assert_eq!(roamed.username.as_deref(), Some("office-admin"));
+        assert_eq!(roamed.password.as_deref(), Some("office-pw"));
 
         // ── Seat B un-pins; seat A folds the un-pin back (LWW converges). ──
         let mut b = b;

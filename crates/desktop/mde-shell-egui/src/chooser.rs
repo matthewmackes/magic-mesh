@@ -60,7 +60,7 @@ use crate::auth::{
     SealOutcome,
 };
 use crate::vdi::{ConnectRequest, DisplayMode, MonitorSpan, RequestedTarget, VdiProtocol};
-use chooser_prefs::{unix_millis, ChooserPrefs};
+use chooser_prefs::{unix_millis, ChooserPrefs, ManualEntry};
 
 /// The retained-latest state topic the CHOOSER-1 worker publishes the merged
 /// roster to. MUST equal `mackesd::workers::desktop_sources::SOURCES_TOPIC`
@@ -798,12 +798,16 @@ fn distinct_os(sources: &[DesktopSource]) -> Vec<String> {
         .collect()
 }
 
-/// The in-progress manual-source edit (CHOOSER-8, context-menu → Edit). Seeded
-/// from the source's current fields; Save republishes it through the worker's
-/// typed verbs — remove the old id, add the edited endpoint (§6, never a command
-/// string). Only manual sources are editable (their fields are the operator's).
+/// The in-progress manual-source form (CHOOSER-8 context-menu → Edit, or the
+/// TESTVM-4 "Pin a desktop endpoint" ADD mode — an empty `original_id`). Seeded
+/// from the source's current fields (edit) or blank (add); Save records the
+/// CHOOSER-9 prefs register first, then mirrors through the worker's typed
+/// verbs when a Bus exists (§6, never a command string). Only manual sources
+/// are editable (their fields are the operator's). No `Debug` derive — the
+/// `password` buffer must never reach a log (the `crate::auth` discipline).
 struct ManualEdit {
     /// The manual source id being edited — the remove key + vanish guard.
+    /// Empty = ADD mode (TESTVM-4): nothing to remove, no roster row required.
     original_id: String,
     /// Editable display name (empty → the worker defaults it to `host:port`).
     name: String,
@@ -813,6 +817,11 @@ struct ManualEdit {
     port: String,
     /// Editable protocol.
     protocol: Protocol,
+    /// TESTVM-4 — optional login user stored with the entry (RDP wants one).
+    username: String,
+    /// TESTVM-4 — optional stored connect password (masked in the form; empty =
+    /// none stored → the CHOOSER-6 one-time prompt + seal path applies instead).
+    password: String,
     /// An inline validation error (empty host / bad port) — never a silent drop.
     error: Option<String>,
 }
@@ -1139,6 +1148,13 @@ pub(crate) struct ChooserState {
     /// the roamed prefs (once per session), so a manual source added on another seat
     /// materializes here without re-publishing every poll.
     hydrated_manual: HashSet<String>,
+    /// TESTVM-4 — the merged manual registers (the [`prefs`](Self::prefs) view,
+    /// refreshed each fold). The pinned-endpoint truth: any register the roster
+    /// doesn't carry is folded into [`Self::sources_snapshot`] as a synthetic
+    /// manual card, so a pinned endpoint is selectable with NO mesh discovery at
+    /// all (no Bus, no worker roster) — and a register's stored credential
+    /// connects it straight through the picker without a prompt.
+    manual_cache: Vec<ManualEntry>,
     /// CHOOSER-8 — the in-progress manual-source edit (context-menu → Edit), or
     /// `None`. Mutually exclusive with the connect picker.
     manual_edit: Option<ManualEdit>,
@@ -1188,19 +1204,29 @@ impl ChooserState {
             favorites: HashSet::new(),
             recents: HashSet::new(),
             hydrated_manual: HashSet::new(),
+            manual_cache: Vec::new(),
             manual_edit: None,
         };
         state.refresh_prefs_cache();
         state
     }
 
-    /// CHOOSER-9 — refresh the favorites + recents caches from the merged prefs (the
-    /// synced view across every seat). Called on every fold so a pin/recent/manual
-    /// change made at another seat surfaces here on the next poll.
+    /// CHOOSER-9 — refresh the favorites + recents + manual caches from the merged
+    /// prefs (the synced view across every seat). Called on every fold so a
+    /// pin/recent/manual change made at another seat surfaces here on the next poll.
     fn refresh_prefs_cache(&mut self) {
         let merged = self.prefs.merged();
         self.recents = merged.recents.iter().map(|r| r.id.clone()).collect();
         self.favorites = merged.favorites;
+        self.manual_cache = merged.manual;
+    }
+
+    /// Whether the last published roster already carries source `id` — the
+    /// synthetic-fold guard (a roster-backed card always wins over its register).
+    fn roster_has(&self, id: &str) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|s| s.sources.iter().any(|x| x.id == id))
     }
 
     /// The bus-poll seam: refresh the roster when the cadence has elapsed,
@@ -1216,11 +1242,18 @@ impl ChooserState {
         ctx.request_repaint_after(REFRESH);
     }
 
-    /// The number of desktop sources in the latest published roster (`0` before the
-    /// first fold) — the Desktop menu bar's live source-count status readout
-    /// (MENUBAR-ALL). A pure read of the last projection, never a probe (§7).
+    /// The number of desktop sources the grid renders (`0` before the first fold)
+    /// — the Desktop menu bar's live source-count status readout (MENUBAR-ALL).
+    /// A pure read of the last projection plus the pinned registers the roster
+    /// doesn't carry (TESTVM-4 — the count matches the cards), never a probe (§7).
     pub(crate) fn source_count(&self) -> usize {
-        self.state.as_ref().map_or(0, |s| s.sources.len())
+        let roster = self.state.as_ref().map_or(0, |s| s.sources.len());
+        let pinned = self
+            .manual_cache
+            .iter()
+            .filter(|m| !self.roster_has(&m.id))
+            .count();
+        roster + pinned
     }
 
     /// Force an immediate roster re-read now (MENUBAR-ALL — the Desktop bar's
@@ -1262,18 +1295,22 @@ impl ChooserState {
         }
         self.seen.extend(fresh);
         self.seeded = true;
-        if let Some(draft) = self.pending.as_ref() {
-            if !state.sources.iter().any(|s| s.id == draft.source_id) {
-                self.pending = None;
-            }
-        }
         self.state = Some(state);
         // CHOOSER-9 — capture the roster's manual sources into the synced prefs so
         // they roam, re-materialize any roamed manual source this seat's worker
-        // hasn't heard of yet, then re-merge the favorites/recents cache.
+        // hasn't heard of yet, then re-merge the favorites/recents/manual cache.
         self.capture_manual_sources();
         self.rematerialize_manual();
         self.refresh_prefs_cache();
+        // A pending protocol ask whose source vanished is dropped — checked
+        // against the roster AND the pinned registers (TESTVM-4: a synthetic
+        // card's open picker must survive a roster fold that never carried it).
+        if let Some(draft) = self.pending.as_ref() {
+            let id = draft.source_id.clone();
+            if !self.roster_has(&id) && !self.manual_cache.iter().any(|m| m.id == id) {
+                self.pending = None;
+            }
+        }
     }
 
     /// CHOOSER-9 — record every manual-origin source in the roster into the synced
@@ -1285,7 +1322,8 @@ impl ChooserState {
         let Some(state) = self.state.as_ref() else {
             return;
         };
-        let captures: Vec<(String, String, u16, String, Option<String>)> = state
+        let now = unix_millis();
+        let captures: Vec<ManualEntry> = state
             .sources
             .iter()
             .filter(|s| s.origin == SourceOrigin::Manual)
@@ -1294,16 +1332,30 @@ impl ChooserState {
                 let port = offer.port?;
                 let tag = offer.protocol.wire_tag()?;
                 let name = (s.name != format!("{}:{port}", s.host)).then(|| s.name.clone());
-                Some((s.id.clone(), s.host.clone(), port, tag.to_owned(), name))
+                Some(ManualEntry {
+                    id: s.id.clone(),
+                    present: true,
+                    host: s.host.clone(),
+                    port,
+                    protocol: tag.to_owned(),
+                    name,
+                    // A roster capture carries no credential — the worker never
+                    // publishes one; a stored credential only ever comes from the
+                    // operator's own form entry (TESTVM-4).
+                    username: None,
+                    password: None,
+                    updated_ms: now,
+                })
             })
             .collect();
-        let now = unix_millis();
-        for (id, host, port, tag, name) in captures {
+        for entry in captures {
             // Only capture an endpoint the prefs have NEVER recorded — never one
             // that was removed (a tombstone), so a lingering roster row can't
             // resurrect a manual source the operator deleted on another seat.
-            if !self.prefs.knows_manual(&id) {
-                self.prefs.set_manual(&id, &host, port, &tag, name, now);
+            // (A known-present register is also skipped, so this can never
+            // blank out a credential the operator stored on it.)
+            if !self.prefs.knows_manual(&entry.id) {
+                self.prefs.set_manual(entry);
             }
         }
     }
@@ -1363,12 +1415,48 @@ impl ChooserState {
     }
 
     /// A cloned snapshot of the current roster (the render + act-on-click
-    /// paths borrow it while mutating `self`).
+    /// paths borrow it while mutating `self`), with the TESTVM-4 pinned
+    /// endpoints folded in: any manual register the roster doesn't carry becomes
+    /// a synthetic manual card — the exact row the worker's `source_from_manual`
+    /// would publish (node = host, `host:port` name default, honest `Unknown`
+    /// reachability, never probed) — so a pinned target is selectable with no
+    /// mesh discovery at all.
     fn sources_snapshot(&self) -> Vec<DesktopSource> {
-        self.state
+        let mut out = self
+            .state
             .as_ref()
             .map(|s| s.sources.clone())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for entry in &self.manual_cache {
+            if self.roster_has(&entry.id) {
+                continue;
+            }
+            // A register whose stored tag this build can't route stays off the
+            // grid (it could never connect — §7), exactly like rematerialize.
+            let Some(protocol) = Protocol::from_wire_tag(&entry.protocol) else {
+                continue;
+            };
+            out.push(DesktopSource {
+                id: entry.id.clone(),
+                name: entry
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}:{}", entry.host, entry.port)),
+                node: entry.host.clone(),
+                host: entry.host.clone(),
+                protocols: vec![ProtocolOffer {
+                    protocol,
+                    port: Some(entry.port),
+                }],
+                origin: SourceOrigin::Manual,
+                reachability: Reachability::Unknown,
+                reason: None,
+                os_hint: None,
+                power_state: None,
+                thumbnail_ref: None,
+            });
+        }
+        out
     }
 
     /// A connectable card was activated: raise the CHOOSER-4 always-ask picker,
@@ -1456,6 +1544,30 @@ impl ChooserState {
             (draft.protocol, draft.display, draft.monitors)
         };
         let is_brokered = source.origin.is_mesh_brokered();
+        // TESTVM-4 — a pinned endpoint whose register stores its own credential
+        // connects straight through with it: no prompt, no store read — the same
+        // `Sealed` shape `auth::resolve` yields, so everything downstream (the
+        // honest note, the request, the gated E12-4 transport feed) is unchanged.
+        if !is_brokered {
+            let stored = self
+                .manual_cache
+                .iter()
+                .find(|m| m.id == source.id)
+                .and_then(|m| {
+                    m.password
+                        .clone()
+                        .map(|pw| (m.username.clone().unwrap_or_default(), pw))
+                });
+            if let Some((username, password)) = stored {
+                let auth = DesktopAuth::Sealed {
+                    store_ref: auth::derive_store_ref(&source.host, protocol),
+                    credential: auth::Credential::new(username, password),
+                };
+                self.pending = None;
+                self.connect_source(&source, protocol, display, monitors, auth, None);
+                return;
+            }
+        }
         match auth::resolve(
             is_brokered,
             &self.client_peer,
@@ -1558,14 +1670,19 @@ impl ChooserState {
         if source.origin != SourceOrigin::Manual {
             return;
         }
-        let body = RemoveSourceRequest { id: id.to_string() }.to_body();
-        publish_source_action(
-            self.bus_root.as_deref(),
-            &mut self.last_error,
-            REMOVE_SOURCE_TOPIC,
-            Some(&body),
-            "manual-source removal",
-        );
+        // Mirror the remove to the discovery worker when a Bus exists; a
+        // mesh-less seat skips it silently — the prefs tombstone below is the
+        // remove for a pinned-register card (TESTVM-4), so no error is faked.
+        if self.bus_root.is_some() {
+            let body = RemoveSourceRequest { id: id.to_string() }.to_body();
+            publish_source_action(
+                self.bus_root.as_deref(),
+                &mut self.last_error,
+                REMOVE_SOURCE_TOPIC,
+                Some(&body),
+                "manual-source removal",
+            );
+        }
         // CHOOSER-9 — tombstone the synced manual register + any pin so the remove
         // roams to every seat (never a source that reappears elsewhere), then
         // refresh the merged cache.
@@ -1611,6 +1728,9 @@ impl ChooserState {
         } else {
             source.name.clone()
         };
+        // TESTVM-4 — seed any stored credential from the register so an edit
+        // round-trips it (an untouched Save keeps the pinned endpoint's login).
+        let stored = self.manual_cache.iter().find(|m| m.id == source.id);
         self.pending = None;
         self.manual_edit = Some(ManualEdit {
             original_id: source.id.clone(),
@@ -1621,6 +1741,26 @@ impl ChooserState {
                 .map(|p| p.to_string())
                 .unwrap_or_default(),
             protocol: offer.map_or(Protocol::Rdp, |o| o.protocol),
+            username: stored.and_then(|m| m.username.clone()).unwrap_or_default(),
+            password: stored.and_then(|m| m.password.clone()).unwrap_or_default(),
+            error: None,
+        });
+    }
+
+    /// TESTVM-4 — open the manual form in ADD mode (an empty `original_id`): pin
+    /// a desktop endpoint by hand (host:port + protocol + an optional stored
+    /// credential), with or without mesh discovery. Mutually exclusive with the
+    /// connect picker, exactly like [`Self::begin_edit`].
+    fn begin_add(&mut self) {
+        self.pending = None;
+        self.manual_edit = Some(ManualEdit {
+            original_id: String::new(),
+            name: String::new(),
+            host: String::new(),
+            port: String::new(),
+            protocol: Protocol::Rdp,
+            username: String::new(),
+            password: String::new(),
             error: None,
         });
     }
@@ -1630,19 +1770,25 @@ impl ChooserState {
         self.manual_edit = None;
     }
 
-    /// CHOOSER-8 — Save the edited manual source: validate host + port, then
-    /// republish through the worker's typed verbs — remove the old id, add the
-    /// edited endpoint (§6; add is idempotent on the new id). A bad host/port sets
-    /// the form's inline error and does NOT publish; a publish failure surfaces on
-    /// `last_error`. The roster reflects the change on the next poll.
+    /// CHOOSER-8 / TESTVM-4 — Save the manual-source form (edit OR add mode):
+    /// validate host + port, write the CHOOSER-9 prefs register FIRST (the
+    /// shell-config truth — the pinned endpoint is selectable at once, mesh or
+    /// no mesh), then mirror through the worker's typed verbs when a Bus exists
+    /// — remove the old id, add the edited endpoint (§6; add is idempotent on
+    /// the new id). A bad host/port sets the form's inline error and saves
+    /// NOTHING; a publish failure surfaces on `last_error`. A roster-backed
+    /// card reflects the change on the next poll.
     fn save_manual_edit(&mut self, sources: &[DesktopSource]) {
         // Read the draft's fields into owned locals FIRST, so the `self.manual_edit`
         // borrow is dropped before any publish / error re-borrow (borrow clean).
         let Some(edit) = self.manual_edit.as_ref() else {
             return;
         };
-        // The source can move under the form; if it vanished, drop the edit.
-        if !sources.iter().any(|s| s.id == edit.original_id) {
+        // ADD mode carries no original id (TESTVM-4) — there is nothing to
+        // vanish, nothing to remove, and no roster row to require.
+        let adding = edit.original_id.is_empty();
+        // An edited source can move under the form; if it vanished, drop the edit.
+        if !adding && !sources.iter().any(|s| s.id == edit.original_id) {
             self.manual_edit = None;
             return;
         }
@@ -1652,6 +1798,11 @@ impl ChooserState {
             let n = edit.name.trim();
             (!n.is_empty()).then(|| n.to_string())
         };
+        let username = {
+            let u = edit.username.trim();
+            (!u.is_empty()).then(|| u.to_string())
+        };
+        let password = (!edit.password.is_empty()).then(|| edit.password.clone());
         let protocol = edit.protocol;
         let original_id = edit.original_id.clone();
 
@@ -1681,25 +1832,93 @@ impl ChooserState {
             }
             return;
         };
-        // Remove the old id, then add the edited endpoint (the worker keys manual
-        // sources on `host:port:proto`, so an edit is a remove + add).
-        let remove_body = RemoveSourceRequest {
-            id: original_id.clone(),
+        // TESTVM-4 — the CHOOSER-9 prefs register is the shell-config truth and
+        // is written FIRST: the pinned endpoint renders + connects from it (the
+        // synthetic fold) whether or not any mesh worker ever hears the Bus
+        // mirror below, and the record (credential included) roams per seat.
+        let new_id = format!("manual:{host}:{port}:{protocol_tag}");
+        let now = unix_millis();
+        if !adding && original_id != new_id {
+            // The endpoint key moved: tombstone the old register (+ its pin).
+            self.prefs.remove_manual(&original_id, now);
+            self.prefs.set_favorite(&original_id, false, now);
+            self.hydrated_manual.remove(&original_id);
         }
-        .to_body();
-        publish_source_action(
-            self.bus_root.as_deref(),
-            &mut self.last_error,
-            REMOVE_SOURCE_TOPIC,
-            Some(&remove_body),
-            "manual-source edit",
-        );
-        if self.last_error.is_some() {
-            return;
+        self.prefs.set_manual(ManualEntry {
+            id: new_id.clone(),
+            present: true,
+            host: host.clone(),
+            port,
+            protocol: protocol_tag.to_owned(),
+            name: name.clone(),
+            username,
+            password,
+            updated_ms: now,
+        });
+        // This seat is publishing the add itself below (when a Bus exists) —
+        // never let rematerialize double-publish the same id this session.
+        self.hydrated_manual.insert(new_id);
+        self.refresh_prefs_cache();
+
+        // Mirror through the discovery worker's typed verbs when a Bus exists.
+        // A mesh-less seat skips this silently — the register above already made
+        // the endpoint selectable, so no error is faked (§7).
+        if self.bus_root.is_some() {
+            self.mirror_manual_save(
+                (!adding).then_some(original_id.as_str()),
+                name.as_deref(),
+                &host,
+                port,
+                protocol_tag,
+            );
+        }
+
+        let shown = name.unwrap_or_else(|| format!("{host}:{port}"));
+        let verb = if adding { "Pinned" } else { "Updated" };
+        let tail = if self.bus_root.is_some() {
+            "the roster reflects it on the next refresh"
+        } else {
+            "no mesh Bus on this seat, so the card renders from the pin alone"
+        };
+        self.note = Some(format!(
+            "{verb} {shown} ({} \u{00B7} {host}:{port}) — stored in the chooser prefs; {tail}.",
+            protocol_tag.to_ascii_uppercase(),
+        ));
+        self.manual_edit = None;
+    }
+
+    /// The Bus leg of a manual-source save: remove the old id when the edit
+    /// moved the endpoint key (`original_id` is `Some` only for an edit), then
+    /// add the saved endpoint over the worker's typed verbs (§6 — the CHOOSER-8
+    /// seam; add is idempotent on the new id). A publish failure surfaces on
+    /// `last_error`, never a panic.
+    fn mirror_manual_save(
+        &mut self,
+        original_id: Option<&str>,
+        name: Option<&str>,
+        host: &str,
+        port: u16,
+        protocol_tag: &'static str,
+    ) {
+        if let Some(original_id) = original_id {
+            let remove_body = RemoveSourceRequest {
+                id: original_id.to_owned(),
+            }
+            .to_body();
+            publish_source_action(
+                self.bus_root.as_deref(),
+                &mut self.last_error,
+                REMOVE_SOURCE_TOPIC,
+                Some(&remove_body),
+                "manual-source edit",
+            );
+            if self.last_error.is_some() {
+                return;
+            }
         }
         let add_body = AddSourceRequest {
-            name: name.clone(),
-            host: host.clone(),
+            name: name.map(str::to_owned),
+            host: host.to_owned(),
             port,
             protocol: protocol_tag,
         }
@@ -1711,26 +1930,6 @@ impl ChooserState {
             Some(&add_body),
             "manual-source edit",
         );
-        if self.last_error.is_none() {
-            // CHOOSER-9 — roam the edit: tombstone the old manual register (+ its
-            // pin) and record the edited endpoint under its new id, so the change
-            // follows the identity to every seat.
-            let new_id = format!("manual:{host}:{port}:{protocol_tag}");
-            let now = unix_millis();
-            self.prefs.remove_manual(&original_id, now);
-            self.prefs.set_favorite(&original_id, false, now);
-            self.prefs
-                .set_manual(&new_id, &host, port, protocol_tag, name.clone(), now);
-            self.hydrated_manual.remove(&original_id);
-            self.refresh_prefs_cache();
-            let shown = name.unwrap_or_else(|| format!("{host}:{port}"));
-            self.note = Some(format!(
-                "Updated {shown} ({} \u{00B7} {host}:{port}) — the roster reflects the edit on \
-                 the next refresh.",
-                protocol_tag.to_ascii_uppercase(),
-            ));
-            self.manual_edit = None;
-        }
     }
 
     /// Connect one source with the picked options: build the [`ConnectRequest`]
@@ -1917,7 +2116,38 @@ pub(crate) fn chooser_panel(ui: &mut egui::Ui, state: &mut ChooserState) {
         ui.colored_label(Style::DANGER, err);
         ui.add_space(Style::SP_S);
     }
+
+    // TESTVM-4 — pin a desktop endpoint by hand (host:port + protocol + an
+    // optional stored credential). Offered with OR without a discovered roster,
+    // so a mesh-less seat can still pin its first target — the register renders
+    // as a card from the prefs alone.
+    ui.add_space(Style::SP_S);
+    if state.manual_edit.is_none()
+        && ui
+            .button(RichText::new("Pin a desktop endpoint\u{2026}").size(Style::SMALL))
+            .clicked()
+    {
+        state.begin_add();
+    }
+
     if empty {
+        // The ADD form must still render over the empty backdrop (there is no
+        // grid to host it), or the first pin could never be entered.
+        let action = state
+            .manual_edit
+            .as_mut()
+            .and_then(|edit| manual_edit_form(ui, edit));
+        match action {
+            Some(CardAction::SaveEdit) => state.save_manual_edit(&sources),
+            Some(CardAction::CancelEdit) => state.cancel_manual_edit(),
+            _ => {}
+        }
+        // The honest connect/save note still shows under the form (the §7 truth
+        // line — e.g. "Pinned … no mesh Bus on this seat").
+        if let Some(note) = state.note.as_deref() {
+            ui.add_space(Style::SP_S);
+            muted_note(ui, note);
+        }
         return;
     }
 
@@ -2080,11 +2310,12 @@ fn chooser_grid(
         }
     }
 
-    // CHOOSER-8 — the manual-source edit form (mutually exclusive with the connect
-    // picker). Its fields mutate the live edit draft; Save republishes through the
-    // worker's typed verbs.
+    // CHOOSER-8 — the manual-source form (mutually exclusive with the connect
+    // picker). Its fields mutate the live draft; Save records the prefs register
+    // then mirrors through the worker's typed verbs. TESTVM-4's ADD mode (empty
+    // `original_id`) has no roster row to require, so it always renders.
     if let Some(edit) = edit_draft.as_mut() {
-        if sources.iter().any(|s| s.id == edit.original_id) {
+        if edit.original_id.is_empty() || sources.iter().any(|s| s.id == edit.original_id) {
             if let Some(a) = manual_edit_form(ui, edit) {
                 action = Some(a);
             }
@@ -2747,8 +2978,13 @@ fn manual_edit_form(ui: &mut egui::Ui, edit: &mut ManualEdit) -> Option<CardActi
     ui.add_space(Style::SP_M);
     ui.separator();
     ui.add_space(Style::SP_S);
+    let title = if edit.original_id.is_empty() {
+        "Pin a desktop endpoint" // TESTVM-4 ADD mode
+    } else {
+        "Edit manual desktop"
+    };
     ui.label(
-        RichText::new("Edit manual desktop")
+        RichText::new(title)
             .color(Style::TEXT)
             .size(Style::BODY)
             .strong(),
@@ -2775,6 +3011,37 @@ fn manual_edit_form(ui: &mut egui::Ui, edit: &mut ManualEdit) -> Option<CardActi
             ui.radio_value(&mut edit.protocol, proto, proto.badge());
         }
     });
+    ui.add_space(Style::SP_XS);
+
+    // TESTVM-4 — the optional stored credential. Filled → Connect goes straight
+    // through with it (a pinned lab/test endpoint); left empty → the CHOOSER-6
+    // one-time prompt + sealed store applies, exactly as before.
+    edit_field(
+        ui,
+        "Username",
+        &mut edit.username,
+        "optional \u{2014} login user (RDP)",
+    );
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Password")
+                .color(Style::TEXT_DIM)
+                .size(Style::SMALL),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut edit.password)
+                .desired_width(Style::SP_XL * 6.0)
+                .password(true)
+                .hint_text("optional \u{2014} stored with this endpoint"),
+        );
+    });
+    ui.add_space(Style::SP_XS);
+    muted_note(
+        ui,
+        "A stored password rides the roaming chooser prefs and connects with no prompt — \
+         meant for lab/test endpoints. Leave it empty to be asked once and sealed in the \
+         secret store instead.",
+    );
 
     // The inline validation error (empty host / bad port) — never a silent drop.
     if let Some(err) = edit.error.as_deref() {
@@ -4687,6 +4954,235 @@ mod tests {
         let _ = std::fs::remove_dir_all(&prefs_root);
         let _ = std::fs::remove_dir_all(&bus_a);
         let _ = std::fs::remove_dir_all(&bus_b);
+    }
+
+    // ── TESTVM-4: pinned endpoints — selectable with NO mesh discovery ──
+
+    #[test]
+    fn a_pinned_endpoint_is_added_rendered_and_counted_with_no_roster_and_no_bus() {
+        let root = temp_prefs_root("pin-endpoint");
+        // No roster ever published, no Bus root — the mesh-less seat.
+        let mut state = state_with_prefs(None, None, root.clone(), "seat-a");
+        assert!(state.sources_snapshot().is_empty(), "nothing pinned yet");
+
+        // The operator pins the live VNC test endpoint through the ADD form.
+        state.begin_add();
+        {
+            let e = state.manual_edit.as_mut().expect("the add form opened");
+            assert!(e.original_id.is_empty(), "ADD mode has no original id");
+            e.name = "testvm-lin".to_string();
+            e.host = "172.20.146.144".to_string();
+            e.port = "5900".to_string();
+            e.protocol = Protocol::Vnc;
+            e.password = "testvm".to_string();
+        }
+        state.save_manual_edit(&[]);
+        assert!(state.manual_edit.is_none(), "the form closes on save");
+        assert!(
+            state.last_error.is_none(),
+            "a mesh-less pin is not an error: {:?}",
+            state.last_error
+        );
+
+        // The pin renders as a card from the prefs register alone (§7 honest
+        // fields: manual origin, never-probed Unknown, still connectable).
+        let sources = state.sources_snapshot();
+        assert_eq!(
+            sources.len(),
+            1,
+            "the pinned endpoint renders with no roster"
+        );
+        let card = &sources[0];
+        assert_eq!(card.id, "manual:172.20.146.144:5900:vnc");
+        assert_eq!(card.name, "testvm-lin");
+        assert_eq!(
+            (card.node.as_str(), card.host.as_str()),
+            ("172.20.146.144", "172.20.146.144")
+        );
+        assert_eq!(card.origin, SourceOrigin::Manual);
+        assert_eq!(card.reachability, Reachability::Unknown);
+        assert_eq!(
+            card.protocols,
+            vec![ProtocolOffer {
+                protocol: Protocol::Vnc,
+                port: Some(5900)
+            }]
+        );
+        assert!(card.connectable());
+        assert_eq!(
+            state.source_count(),
+            1,
+            "the menubar count matches the cards"
+        );
+        assert!(
+            run_panel(&mut state),
+            "the pinned card produced no draw primitives"
+        );
+
+        // …and the pin roams: a fresh seat over the same root shows it too.
+        let seat_b = state_with_prefs(None, None, root.clone(), "seat-b");
+        assert_eq!(
+            seat_b.sources_snapshot().len(),
+            1,
+            "the pinned endpoint roamed to a second mesh-less seat"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pinned_endpoint_with_a_stored_credential_connects_without_a_prompt() {
+        // THE TESTVM-4 connect acceptance: the stored register credential drives
+        // Connect straight through — no prompt, and the credential store is
+        // NEVER touched (ForbiddenStore panics on any access).
+        let root = temp_prefs_root("pin-connect");
+        let mut state = ChooserState::with_client(
+            Box::new(FakeSources(None)),
+            None,
+            "client-node".to_string(),
+            Box::new(ForbiddenStore),
+            prefs_at(root.clone(), "seat-a"),
+        );
+        state.prefs.set_manual(ManualEntry {
+            id: "manual:172.20.146.54:3389:rdp".to_string(),
+            present: true,
+            host: "172.20.146.54".to_string(),
+            port: 3389,
+            protocol: "rdp".to_string(),
+            name: Some("testvm-win".to_string()),
+            username: Some("root".to_string()),
+            password: Some("testvm".to_string()),
+            updated_ms: 1,
+        });
+        state.refresh();
+
+        let sources = state.sources_snapshot();
+        state.activate(&sources, "manual:172.20.146.54:3389:rdp");
+        assert!(
+            state.pending.is_some(),
+            "the always-ask picker still opens (lock 6)"
+        );
+        state.confirm_connect(&sources);
+
+        let request = state
+            .take_connect()
+            .expect("the stored credential connects straight through");
+        assert_eq!(request.protocol, VdiProtocol::Rdp);
+        assert_eq!(request.target.name, "testvm-win");
+        let DesktopAuth::Sealed {
+            credential,
+            store_ref,
+        } = &request.auth
+        else {
+            unreachable!("expected the stored register credential")
+        };
+        assert_eq!(store_ref, "desktop/172.20.146.54/rdp");
+        assert_eq!(credential.username, "root");
+        assert_eq!(credential.secret.expose(), "testvm");
+        assert!(state.pending.is_none(), "the picker closed on connect");
+        assert!(
+            state.recents.contains("manual:172.20.146.54:3389:rdp"),
+            "a genuine connect records the recent"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_pinned_endpoint_without_a_stored_password_still_prompts_once() {
+        // No stored password → the CHOOSER-6 fold is untouched: the one-time
+        // credential prompt raises and nothing connects until it's filled.
+        let root = temp_prefs_root("pin-prompt");
+        let mut state = state_with_prefs(None, None, root.clone(), "seat-a");
+        state.prefs.set_manual(ManualEntry {
+            id: "manual:172.20.146.144:5900:vnc".to_string(),
+            present: true,
+            host: "172.20.146.144".to_string(),
+            port: 5900,
+            protocol: "vnc".to_string(),
+            name: None,
+            username: None,
+            password: None,
+            updated_ms: 1,
+        });
+        state.refresh();
+        let sources = state.sources_snapshot();
+        state.activate(&sources, "manual:172.20.146.144:5900:vnc");
+        state.confirm_connect(&sources);
+        assert!(
+            state.take_connect().is_none(),
+            "nothing connects before the prompt is filled"
+        );
+        assert!(
+            state
+                .pending
+                .as_ref()
+                .is_some_and(|d| d.cred_prompt.is_some()),
+            "the one-time credential prompt raised"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_add_endpoint_form_renders_over_an_empty_grid() {
+        // The ADD form must paint even with no roster at all (the empty branch),
+        // or a mesh-less seat could never enter its first pin.
+        let mut state = state_with(None);
+        state.begin_add();
+        assert!(
+            run_panel(&mut state),
+            "the add-endpoint form produced no draw primitives over the empty grid"
+        );
+    }
+
+    #[test]
+    fn an_edit_round_trips_the_stored_credential_and_a_remove_tombstones_the_pin() {
+        let root = temp_prefs_root("pin-edit");
+        let mut state = state_with_prefs(None, None, root.clone(), "seat-a");
+        state.prefs.set_manual(ManualEntry {
+            id: "manual:172.20.146.144:5900:vnc".to_string(),
+            present: true,
+            host: "172.20.146.144".to_string(),
+            port: 5900,
+            protocol: "vnc".to_string(),
+            name: Some("testvm-lin".to_string()),
+            username: None,
+            password: Some("testvm".to_string()),
+            updated_ms: 1,
+        });
+        state.refresh();
+        let sources = state.sources_snapshot();
+
+        // Edit seeds the stored credential; an untouched Save keeps it.
+        state.begin_edit(&sources, "manual:172.20.146.144:5900:vnc");
+        assert_eq!(
+            state.manual_edit.as_ref().map(|e| e.password.as_str()),
+            Some("testvm"),
+            "the edit form seeds the stored password"
+        );
+        state.save_manual_edit(&sources);
+        assert!(state.manual_edit.is_none());
+        assert_eq!(
+            state
+                .manual_cache
+                .iter()
+                .find(|m| m.id == "manual:172.20.146.144:5900:vnc")
+                .and_then(|m| m.password.as_deref()),
+            Some("testvm"),
+            "an untouched Save keeps the stored credential"
+        );
+
+        // Remove tombstones the register — the card is gone with no Bus error.
+        let sources = state.sources_snapshot();
+        state.remove_source(&sources, "manual:172.20.146.144:5900:vnc");
+        assert!(
+            state.last_error.is_none(),
+            "a mesh-less remove is not an error: {:?}",
+            state.last_error
+        );
+        assert!(
+            state.sources_snapshot().is_empty(),
+            "the removed pin no longer renders"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
