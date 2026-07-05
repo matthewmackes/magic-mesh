@@ -221,7 +221,9 @@ const MOSAIC_GAP: f32 = Style::SP_M;
 /// tile scale (O1 "mini hero tiles").
 const MOSAIC_RING_D: f32 = Style::SP_XL * 1.5;
 /// The keyboard/D-pad focus-ring stroke width — a deliberately thick, high
-/// contrast ring so the selection is always legible for couch nav (O11).
+/// contrast ring so the selection is always legible for couch nav
+/// (EXPLORER-18, O11). Painted only through the ONE shared [`focus_ring`]
+/// helper so every navigable element wears the identical ring.
 const FOCUS_RING_W: f32 = 2.5;
 /// The tile→hero zoom-in duration — the O3 shared-element reveal, pinned to the
 /// §4 Motion table's deliberate step (never a literal duration).
@@ -3782,6 +3784,21 @@ fn self_placeholder(host: &str) -> Unit {
 
 // ─────────────────────────── render helpers ───────────────────────────
 
+/// The ONE high-contrast keyboard/D-pad **focus ring** (EXPLORER-18, O11):
+/// every navigable element — a mosaic tile, a filmstrip thumb, a search hit
+/// row — paints its selection through this single stroke, so "where am I"
+/// reads identically (thick [`FOCUS_RING_W`], `ACCENT_HI`) across the whole
+/// surface and can never fork per call site (§4). Painted last, over the
+/// element's own frame, so the ring is never buried under a category tint.
+fn focus_ring(painter: &egui::Painter, rect: Rect) {
+    painter.rect_stroke(
+        rect,
+        Style::RADIUS,
+        Stroke::new(FOCUS_RING_W, Style::ACCENT_HI),
+        StrokeKind::Inside,
+    );
+}
+
 /// A Carbon filter/nav pill; returns whether it was clicked. Active = accent
 /// fill; inactive = surface with a dim border and the `rest` label tone (all §4
 /// tokens). The category chips pass their O8 accent as `rest` (EXPLORER-15) so
@@ -3853,12 +3870,9 @@ fn search_hit_row(ui: &mut egui::Ui, unit: &Unit, selected: bool) -> bool {
         egui::Shape::rect_filled(resp.rect, Style::RADIUS * 0.5, fill),
     );
     if selected {
-        ui.painter().rect_stroke(
-            resp.rect,
-            Style::RADIUS * 0.5,
-            Stroke::new(1.0, Style::ACCENT_HI),
-            StrokeKind::Inside,
-        );
+        // The keyboard selection wears the shared high-contrast ring
+        // (EXPLORER-18, O11) — the same ring as a mosaic tile / filmstrip thumb.
+        focus_ring(ui.painter(), resp.rect);
     }
     resp.clicked()
 }
@@ -3937,8 +3951,9 @@ fn filmstrip_divider(ui: &mut egui::Ui, cluster: Cluster) {
 }
 
 /// One filmstrip thumbnail — a mini glyph + status dot + truncated name (+ the
-/// O9 pin marker); the focused thumb wears an accent border. Returns whether it
-/// was clicked (#6 jump) and whether it was right-clicked (the O9 pin toggle).
+/// O9 pin marker); the focused thumb wears the shared high-contrast
+/// [`focus_ring`] (EXPLORER-18, O11). Returns whether it was clicked (#6 jump)
+/// and whether it was right-clicked (the O9 pin toggle).
 fn thumbnail(ui: &mut egui::Ui, unit: &Unit, focused: bool, pinned: bool) -> (bool, bool) {
     let cat = unit.kind.category();
     let resp = ui
@@ -3946,9 +3961,7 @@ fn thumbnail(ui: &mut egui::Ui, unit: &Unit, focused: bool, pinned: bool) -> (bo
             ui.set_min_size(Vec2::new(THUMB_W, THUMB_H));
             let rect = Rect::from_min_size(ui.min_rect().min, Vec2::new(THUMB_W, THUMB_H));
             let hovered = ui.rect_contains_pointer(rect);
-            let border = if focused {
-                cat.accent()
-            } else if hovered {
+            let border = if hovered {
                 Style::ACCENT
             } else {
                 Style::BORDER
@@ -3961,6 +3974,12 @@ fn thumbnail(ui: &mut egui::Ui, unit: &Unit, focused: bool, pinned: bool) -> (bo
                 Stroke::new(1.0, border),
                 StrokeKind::Inside,
             );
+            // The focused thumb wears the shared high-contrast focus ring
+            // (EXPLORER-18, O11) — in hero mode the filmstrip IS where the
+            // selection reads, so it gets the same ring as a mosaic tile.
+            if focused {
+                focus_ring(ui.painter(), rect);
+            }
             // Mini glyph.
             let glyph_c = egui::pos2(rect.center().x, rect.min.y + THUMB_H * 0.36);
             paint_kind_glyph(
@@ -4163,24 +4182,25 @@ fn mosaic_tile(
     let hovered = resp.hovered();
     let painter = ui.painter();
     painter.rect_filled(rect, Style::RADIUS, Style::SURFACE);
-    // The frame: a thick accent focus ring for the selection, else the mark
-    // accent, a hover accent, or a calm border (O11 — the selection is always
-    // legible for D-pad nav; a marked tile stays visibly in the set).
-    let (stroke_w, frame) = if focused {
-        (FOCUS_RING_W, Style::ACCENT_HI)
-    } else if marked {
-        (1.0, Style::ACCENT)
+    // The frame: the mark accent, a hover accent, or a calm border — then the
+    // shared thick focus ring OVER it for the selection (EXPLORER-18, O11 —
+    // always legible for D-pad nav; a marked tile stays visibly in the set).
+    let frame = if marked {
+        Style::ACCENT
     } else if hovered {
-        (1.0, cat.accent())
+        cat.accent()
     } else {
-        (1.0, Style::BORDER)
+        Style::BORDER
     };
     painter.rect_stroke(
         rect,
         Style::RADIUS,
-        Stroke::new(stroke_w, frame),
+        Stroke::new(1.0, frame),
         StrokeKind::Inside,
     );
+    if focused {
+        focus_ring(painter, rect);
+    }
     // The EXPLORER-17 mark: a small filled accent square at top-right (the O9
     // pin keeps top-left), so a marked tile reads at a glance in the grid.
     if marked {
@@ -7379,6 +7399,111 @@ mod tests {
         assert!(
             shared_bulk_verbs(&mixed.marked_units()).is_empty(),
             "the mixed bar offers no padded verb (§7)"
+        );
+    }
+
+    // ─────── EXPLORER-18 accessibility: type · focus ring · text-scale ───────
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)] // the token contract IS constant (the mde-egui style-test idiom)
+    fn the_focus_ring_is_thick_high_contrast_and_never_camouflaged() {
+        // O11 — a hairline can't carry couch-distance selection; the ring is a
+        // deliberately thick stroke…
+        assert!(
+            FOCUS_RING_W >= 2.0,
+            "the focus ring must be thicker than a hairline"
+        );
+        // …in a tone distinct from every frame it can sit over: the category
+        // tints (hover), the mark accent, and the calm border — so the
+        // selection can never camouflage against its own element.
+        for (name, c) in [
+            ("mesh accent", Style::ACCENT_MESH),
+            ("lan accent", Style::ACCENT_TERMINALS),
+            ("cloud accent", Style::ACCENT_WORKLOADS),
+            ("mark accent", Style::ACCENT),
+            ("border", Style::BORDER),
+            ("surface", Style::SURFACE),
+        ] {
+            assert_ne!(
+                Style::ACCENT_HI,
+                c,
+                "the focus ring must stand apart from the {name}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)] // the token contract IS constant (the mde-egui style-test idiom)
+    fn generous_display_type_leads_the_type_ramp() {
+        // O11 "generous display type": the hero display name sits ABOVE the
+        // largest shared type rung — across-the-room legibility — while still
+        // deriving from the §4 ramp (a HEADING multiple, no raw px).
+        assert!(
+            HERO_TITLE_FS > Style::DISPLAY,
+            "the hero title must out-size the display rung"
+        );
+        assert!(
+            (HERO_TITLE_FS - Style::HEADING * 1.5).abs() < f32::EPSILON,
+            "the hero title derives from the shared HEADING rung, not a raw px"
+        );
+    }
+
+    #[test]
+    fn the_focus_ring_paints_the_selection_in_mosaic_and_hero() {
+        // Presence, not just definition: with NO pins and NO marks on the
+        // shelf, the ONLY author of ACCENT_HI vertices is the shared
+        // `focus_ring` — so finding the token in the draw list proves the
+        // selection ring is actually painted.
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        assert_eq!(s.mode, SurfaceMode::Mosaic);
+        assert!(
+            painted(&painted_colors(&mut s), Style::ACCENT_HI),
+            "the mosaic landing paints the focused tile's ring"
+        );
+        // The hero mode: the selection reads on the filmstrip's focused thumb.
+        s.set_mode(SurfaceMode::Hero);
+        assert!(
+            painted(&painted_colors(&mut s), Style::ACCENT_HI),
+            "the hero mode paints the focused filmstrip thumb's ring"
+        );
+    }
+
+    #[test]
+    fn explorer_composes_with_the_platform_text_scale_zoom() {
+        // SETTINGS-5 landed the whole-UI text-scale as an egui zoom_factor the
+        // shell applies globally. The explorer must COMPOSE with it: render
+        // under a scaled context without fighting the factor (no local
+        // set_zoom/ppp write) and without double-scaling (the factor lands on
+        // the context exactly once).
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        ctx.set_zoom_factor(1.5);
+        // Two full frames through every panel path (mosaic, then hero).
+        ambient_frame(&ctx, &mut s, 0.0, vec![]);
+        s.set_mode(SurfaceMode::Hero);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                Vec2::new(1200.0, 800.0),
+            )),
+            time: Some(0.5),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| s.show(ui));
+        });
+        assert!(
+            (ctx.zoom_factor() - 1.5).abs() < f32::EPSILON,
+            "the explorer never fights the platform text-scale factor"
+        );
+        assert!(
+            (ctx.pixels_per_point() - 1.5).abs() < 0.01,
+            "the zoom lands exactly once atop the 1.0 seat base — no double-scale"
+        );
+        assert!(
+            !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty(),
+            "the scaled explorer still draws"
         );
     }
 }
