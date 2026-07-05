@@ -3047,7 +3047,7 @@ Throwaway XCP-ng VMs on a dom0 (LAN-bridged, `172.20.x`) giving the shell's Desk
   **As** a member, **I want** a one-click SPICE console (mde-vdi-spice viewer) and automatic SSH key injection, **so that** getting into my instance is trivial (Q34/88).
   **Acceptance**:
     - [ ] console opens from the Cloud plane row; a launched instance accepts the member's mesh-derived SSH key
-- [ ] **QC-14: VDI broker overlay on Nova.**
+- [>] **QC-14: VDI broker overlay on Nova.**
   **As** a desktop user, **I want** the session-broker to place VDI desktops as Nova instances (flavor+metadata) while owning the display path/roaming/seat binding, **so that** one VM plane serves both worlds (Q33).
   **Acceptance**:
     - [ ] a VDI session boots via Nova and renders through the existing viewer path; roaming = rebuild per Q38
