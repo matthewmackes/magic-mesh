@@ -3291,13 +3291,14 @@ Every primary nav-bar surface gets a slim top bar: a large UPPERCASE mono accent
 
 A new Workloads-group surface "Infra as Code (IaC)": an OpenStack IaaS control plane on the standard APIs — Keystone catalog = the service directory, Heat = the native IaC engine, per-service APIs = status + comprehensive control. Lists all published services (OpenStack catalog + mesh/LAN scan, grouped by kind) under a live OpenStack-API status band. Tabbed Overview/Resources/Heat; typed-arming on all mutations; audit-all + notify-on-failure; comprehensive catalog-driven menu bar (the MENUBAR-ALL governing principle). Everything in one cut. Instances (QC-12) stays the quick VM view; IaC is the full admin.
 
-- [ ] **IAC-1: the OpenStack client foundation.**
+- [✓] **IAC-1: the OpenStack client foundation.**
   **As** an operator,
   **I want** a standard-API OpenStack client,
   **so that** the workspace speaks OpenStack natively.
   **Acceptance** (each runtime-observable):
-    - [ ] auth via `clouds.yaml` (openstacksdk standard, single default context); the **Keystone service catalog** (services + public/internal/admin endpoints + region); per-service **API health** (real ping/version probe → up/down + latency + microversion); the standard resource + verb calls (Nova/Neutron/Glance/Cinder/Heat/…) — reuse/extend the QUASAR-CLOUD / mackesd OpenStack integration (§6), not a parallel client
-    - [ ] honest absent/unreachable when a service isn't deployed; tested against fixtures + (IAC-7) a live cloud
+    - [✓] auth via `clouds.yaml` (openstacksdk standard, single default context); the **Keystone service catalog** (services + public/internal/admin endpoints + region); per-service **API health** (real ping/version probe → up/down + latency + microversion); the standard resource + verb calls (Nova/Neutron/Glance/Cinder/Heat/…) — reuse/extend the QUASAR-CLOUD / mackesd OpenStack integration (§6), not a parallel client
+    - [✓] honest absent/unreachable when a service isn't deployed; tested against fixtures + (IAC-7) a live cloud
+    - **Landed (IAC-1, 2026-07-04):** the client foundation extends the QUASAR-CLOUD `mackesd::workers::openstack` worker with a new `client/` sub-tree — `config` (clouds.yaml load + single-context select, password redacted, never on argv), `keystone` (v3 auth → token + catalog seam), `health` (per-endpoint version/ping probe seam), `resource` (the list/show/create/update/delete REST seam — the IAC-3 boundary) — plus a testkit of fakes; all pure logic fixture-tested (37 new unit tests). The §6 catalog+health wire contract (`ServiceCatalog`/`ServiceHealth`) lives in `mackes-mesh-types::openstack` so IAC-2's `mde-shell-egui` consumes it off the Bus without depending on `mackesd`; runtime-reachable now via the new `action/cloud/get-catalog` read verb on the existing QC-11 Bus seam (honest `Unconfigured` gate on a node with no clouds.yaml). The live-cloud smoke is IAC-6.
 
 - [ ] **IAC-2: the surface + Overview tab (status band + merged directory).**
   **As** an operator,

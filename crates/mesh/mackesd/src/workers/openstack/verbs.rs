@@ -54,9 +54,12 @@ use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;
 
+use mackes_mesh_types::openstack::{ServiceCatalog, ServiceHealth};
+
 use crate::workers::proc::output_with_timeout;
 
 use super::catalog::ServiceKind;
+use super::client::{CatalogHealth, CatalogSource};
 use super::reconcile::{DoctrineStatus, OpenStackState, RuntimeStatus, ServiceRow, ServiceStatus};
 
 // ─────────────────────────── the verb vocabulary ───────────────────────────
@@ -69,8 +72,12 @@ pub const CLOUD_ACTION_PREFIX: &str = "action/cloud/";
 /// The read verbs carry a `get-`/`list-` stem so they are audit-exempt
 /// ([`mde_bus::persist::is_auditable`], the BUS-AUDIT-FLOOD guard); the four
 /// `instance-*` lifecycle verbs are control-plane mutations and audit.
-pub const CLOUD_VERBS: [&str; 7] = [
+///
+/// IAC-1 added `get-catalog` — the Keystone service directory + per-service API
+/// health the `IaC` surface (IAC-2) consumes; a read, so audit-exempt.
+pub const CLOUD_VERBS: [&str; 8] = [
     "get-status",
+    "get-catalog",
     "list-services",
     "list-instances",
     "instance-start",
@@ -221,11 +228,7 @@ pub fn build_server_list_argv() -> Vec<String> {
 /// hostile id can't inject a command; an empty id is caller-rejected upstream.
 #[must_use]
 pub fn build_lifecycle_argv(action: LifecycleAction, instance: &str) -> Vec<String> {
-    vec![
-        "server".into(),
-        action.cli_verb().into(),
-        instance.into(),
-    ]
+    vec!["server".into(), action.cli_verb().into(), instance.into()]
 }
 
 /// Parse `openstack server list -f json` output into the typed roster.
@@ -391,6 +394,13 @@ pub struct CloudReply {
     /// `list-services` — the per-service rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub services: Option<Vec<ServiceRow>>,
+    /// `get-catalog` — the Keystone service directory (IAC-1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<ServiceCatalog>,
+    /// `get-catalog` — the per-service API health rows, paired with the catalog
+    /// (IAC-1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<Vec<ServiceHealth>>,
     /// `list-instances` — the Nova instance roster.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instances: Option<Vec<CloudInstance>>,
@@ -416,6 +426,8 @@ impl CloudReply {
             verb: verb.to_string(),
             status: None,
             services: None,
+            catalog: None,
+            health: None,
             instances: None,
             instance: None,
             gated: None,
@@ -429,6 +441,17 @@ impl CloudReply {
     pub fn status(verb: &str, state: OpenStackState) -> Self {
         Self {
             status: Some(state),
+            ..Self::base(verb, true)
+        }
+    }
+
+    /// `get-catalog` — the Keystone service directory + per-service API health
+    /// (IAC-1; both come from one authenticate + probe pass).
+    #[must_use]
+    pub fn catalog(verb: &str, ch: CatalogHealth) -> Self {
+        Self {
+            catalog: Some(ch.catalog),
+            health: Some(ch.health),
             ..Self::base(verb, true)
         }
     }
@@ -531,11 +554,17 @@ pub fn cloud_gate(state: &OpenStackState) -> Result<(), String> {
             ))
         }
         DoctrineStatus::Gated { reason } => {
-            return Err(format!("the cloud doctrine is unread on {} — {reason}", state.host))
+            return Err(format!(
+                "the cloud doctrine is unread on {} — {reason}",
+                state.host
+            ))
         }
     }
     if let RuntimeStatus::Unavailable { reason } = &state.runtime {
-        return Err(format!("the container runtime is unavailable on {} — {reason}", state.host));
+        return Err(format!(
+            "the container runtime is unavailable on {} — {reason}",
+            state.host
+        ));
     }
     let nova = ServiceKind::NovaApi.container_name();
     match state.services.iter().find(|r| r.service == nova) {
@@ -567,10 +596,19 @@ pub fn handle_cloud_request(
     body: &str,
     state: &OpenStackState,
     ops: &dyn InstanceOps,
+    catalog_src: &dyn CatalogSource,
 ) -> CloudReply {
     match verb {
         "get-status" => CloudReply::status(verb, state.clone()),
         "list-services" => CloudReply::services(verb, state.services.clone()),
+        // IAC-1 — the Keystone service directory + per-service API health. An
+        // unconfigured node (no clouds.yaml) is an honest gate; an auth/transport
+        // failure is a real failure — never a fabricated catalog (§7).
+        "get-catalog" => match catalog_src.catalog_and_health() {
+            Ok(ch) => CloudReply::catalog(verb, ch),
+            Err(e) if e.is_unconfigured() => CloudReply::gated(verb, e.to_string()),
+            Err(e) => CloudReply::failed(verb, e.to_string()),
+        },
         "list-instances" => match cloud_gate(state) {
             Err(reason) => CloudReply::gated(verb, reason),
             Ok(()) => match ops.list() {
@@ -642,6 +680,7 @@ pub fn drain_cloud_verbs(
     cursors: &mut BTreeMap<String, Option<String>>,
     state: &OpenStackState,
     ops: &dyn InstanceOps,
+    catalog_src: &dyn CatalogSource,
 ) {
     for verb in CLOUD_VERBS {
         let topic = cloud_action_topic(verb);
@@ -656,7 +695,7 @@ pub fn drain_cloud_verbs(
         for msg in msgs {
             *cursor = Some(msg.ulid.clone());
             let body = msg.body.unwrap_or_default();
-            let reply = handle_cloud_request(verb, &body, state, ops);
+            let reply = handle_cloud_request(verb, &body, state, ops, catalog_src);
             if let Err(e) = persist.write(
                 &reply_topic(&msg.ulid),
                 Priority::Default,
@@ -671,8 +710,12 @@ pub fn drain_cloud_verbs(
 
 #[cfg(test)]
 mod tests {
+    use super::super::client::testkit::FakeCatalogSource;
     use super::super::testkit::FakeInstanceOps;
     use super::*;
+    use mackes_mesh_types::openstack::{
+        shape_health, EndpointInterface, HealthState, ProbeOutcome,
+    };
 
     /// A mirror state with the doctrine `Enabled` and `nova_api` `Running` — the
     /// happy path the seam-touching verbs need.
@@ -743,7 +786,13 @@ mod tests {
     fn get_status_returns_the_whole_mirror() {
         let state = enabled_state();
         let ops = FakeInstanceOps::new();
-        let reply = handle_cloud_request("get-status", "", &state, &ops);
+        let reply = handle_cloud_request(
+            "get-status",
+            "",
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
         assert!(reply.ok);
         assert_eq!(reply.status.expect("status").host, "node-a");
         assert!(ops.calls().is_empty(), "a read never touches the seam");
@@ -753,11 +802,92 @@ mod tests {
     fn list_services_returns_the_service_rows() {
         let state = enabled_state();
         let ops = FakeInstanceOps::new();
-        let reply = handle_cloud_request("list-services", "{}", &state, &ops);
+        let reply = handle_cloud_request(
+            "list-services",
+            "{}",
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
         assert!(reply.ok);
         let rows = reply.services.expect("services");
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().any(|r| r.service == "nova_api"));
+    }
+
+    // ── IAC-1: get-catalog drives the client seam / honest-degrades ──
+
+    fn sample_catalog_health() -> CatalogHealth {
+        let catalog = ServiceCatalog::from_keystone_token_json(
+            r#"{"token":{"catalog":[
+                {"type":"compute","name":"nova","endpoints":[
+                    {"interface":"public","url":"http://nova.mesh:8774/v2.1","region":"RegionOne"}
+                ]}
+            ]}}"#,
+        )
+        .unwrap();
+        let health = vec![shape_health(
+            "compute",
+            EndpointInterface::Public,
+            "http://nova.mesh:8774/v2.1",
+            &ProbeOutcome::Reachable {
+                http_status: 200,
+                body: r#"{"version":{"id":"v2.1","max_version":"2.90"}}"#.into(),
+                elapsed_ms: 5,
+            },
+        )];
+        CatalogHealth { catalog, health }
+    }
+
+    #[test]
+    fn get_catalog_returns_the_catalog_and_health_from_the_client() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        let ch = sample_catalog_health();
+        let cat = FakeCatalogSource::ok(ch.catalog, ch.health);
+        let reply = handle_cloud_request("get-catalog", "", &state, &ops, &cat);
+        assert!(reply.ok);
+        let catalog = reply.catalog.expect("catalog");
+        assert_eq!(catalog.services.len(), 1);
+        assert_eq!(catalog.services[0].service_type, "compute");
+        let health = reply.health.expect("health");
+        assert_eq!(health[0].state, HealthState::Up);
+        assert_eq!(health[0].microversion.as_deref(), Some("2.90"));
+        assert!(
+            ops.calls().is_empty(),
+            "get-catalog never touches the instance seam"
+        );
+    }
+
+    #[test]
+    fn get_catalog_gates_honestly_when_no_cloud_is_configured() {
+        // §7 — a node with no clouds.yaml gates (retry once configured), never a
+        // fabricated empty catalog.
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        let reply = handle_cloud_request(
+            "get-catalog",
+            "",
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
+        assert!(!reply.ok);
+        assert!(reply.catalog.is_none() && reply.health.is_none());
+        assert!(reply.gated.expect("gated").contains("no clouds.yaml"));
+    }
+
+    #[test]
+    fn get_catalog_reports_a_real_auth_failure_as_failed_not_gated() {
+        let state = enabled_state();
+        let ops = FakeInstanceOps::new();
+        let cat = FakeCatalogSource::failing(crate::workers::openstack::client::ClientError::Auth(
+            "401 Unauthorized".into(),
+        ));
+        let reply = handle_cloud_request("get-catalog", "", &state, &ops, &cat);
+        assert!(!reply.ok);
+        assert!(reply.gated.is_none(), "a real auth failure is not a gate");
+        assert!(reply.error.expect("error").contains("401"));
     }
 
     // ── list-instances drives the real seam / honest-gates ──
@@ -766,7 +896,13 @@ mod tests {
     fn list_instances_drives_the_seam_when_the_cloud_is_up() {
         let state = enabled_state();
         let ops = FakeInstanceOps::new().with_instances(sample_instances());
-        let reply = handle_cloud_request("list-instances", "", &state, &ops);
+        let reply = handle_cloud_request(
+            "list-instances",
+            "",
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
         assert!(reply.ok);
         assert_eq!(reply.instances.expect("instances")[0].id, "i-1");
         assert_eq!(ops.calls(), vec!["list".to_string()]);
@@ -777,11 +913,20 @@ mod tests {
         let mut state = enabled_state();
         state.doctrine = DoctrineStatus::Disabled;
         let ops = FakeInstanceOps::new().with_instances(sample_instances());
-        let reply = handle_cloud_request("list-instances", "", &state, &ops);
+        let reply = handle_cloud_request(
+            "list-instances",
+            "",
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
         assert!(!reply.ok);
         assert!(reply.instances.is_none());
         assert!(reply.gated.expect("gated").contains("disabled"));
-        assert!(ops.calls().is_empty(), "a gated verb never touches the seam");
+        assert!(
+            ops.calls().is_empty(),
+            "a gated verb never touches the seam"
+        );
     }
 
     #[test]
@@ -792,7 +937,13 @@ mod tests {
             podman_state: "exited".into(),
         };
         let ops = FakeInstanceOps::new().with_instances(sample_instances());
-        let reply = handle_cloud_request("list-instances", "", &state, &ops);
+        let reply = handle_cloud_request(
+            "list-instances",
+            "",
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
         assert!(!reply.ok);
         assert!(reply.gated.expect("gated").contains("nova_api"));
         assert!(ops.calls().is_empty());
@@ -810,7 +961,13 @@ mod tests {
             ("instance-delete", "delete:i-9"),
         ] {
             let ops = FakeInstanceOps::new();
-            let reply = handle_cloud_request(verb, r#"{"instance":"i-9"}"#, &state, &ops);
+            let reply = handle_cloud_request(
+                verb,
+                r#"{"instance":"i-9"}"#,
+                &state,
+                &ops,
+                &FakeCatalogSource::unconfigured(),
+            );
             assert!(reply.ok, "{verb}");
             assert_eq!(reply.instance.as_deref(), Some("i-9"), "{verb}");
             assert_eq!(ops.calls(), vec![want.to_string()], "{verb}");
@@ -823,13 +980,25 @@ mod tests {
         // delete + reboot are destructive → audited.
         for verb in ["instance-delete", "instance-reboot"] {
             let ops = FakeInstanceOps::new();
-            let reply = handle_cloud_request(verb, r#"{"instance":"i-9"}"#, &state, &ops);
+            let reply = handle_cloud_request(
+                verb,
+                r#"{"instance":"i-9"}"#,
+                &state,
+                &ops,
+                &FakeCatalogSource::unconfigured(),
+            );
             assert!(reply.ok && reply.audited, "{verb} must be audited");
         }
         // start + stop are not destructive.
         for verb in ["instance-start", "instance-stop"] {
             let ops = FakeInstanceOps::new();
-            let reply = handle_cloud_request(verb, r#"{"instance":"i-9"}"#, &state, &ops);
+            let reply = handle_cloud_request(
+                verb,
+                r#"{"instance":"i-9"}"#,
+                &state,
+                &ops,
+                &FakeCatalogSource::unconfigured(),
+            );
             assert!(reply.ok && !reply.audited, "{verb} is not destructive");
         }
     }
@@ -841,11 +1010,20 @@ mod tests {
         let mut state = enabled_state();
         state.doctrine = DoctrineStatus::Disabled;
         let ops = FakeInstanceOps::new();
-        let reply = handle_cloud_request("instance-delete", r#"{"instance":"i-9"}"#, &state, &ops);
+        let reply = handle_cloud_request(
+            "instance-delete",
+            r#"{"instance":"i-9"}"#,
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
         assert!(!reply.ok);
         assert!(reply.gated.is_some());
         assert!(!reply.audited);
-        assert!(ops.calls().is_empty(), "a gated delete never reaches the seam");
+        assert!(
+            ops.calls().is_empty(),
+            "a gated delete never reaches the seam"
+        );
     }
 
     #[test]
@@ -853,7 +1031,13 @@ mod tests {
         let state = enabled_state();
         let ops = FakeInstanceOps::new();
         for body in ["", "{}", r#"{"instance":"  "}"#] {
-            let reply = handle_cloud_request("instance-stop", body, &state, &ops);
+            let reply = handle_cloud_request(
+                "instance-stop",
+                body,
+                &state,
+                &ops,
+                &FakeCatalogSource::unconfigured(),
+            );
             assert!(!reply.ok, "body {body:?}");
             assert!(reply.error.expect("error").contains("instance"));
             assert!(ops.calls().is_empty(), "no id ⇒ no seam call");
@@ -864,7 +1048,13 @@ mod tests {
     fn a_malformed_lifecycle_body_is_a_typed_rejection_not_a_panic() {
         let state = enabled_state();
         let ops = FakeInstanceOps::new();
-        let reply = handle_cloud_request("instance-start", "[1,2,3]", &state, &ops);
+        let reply = handle_cloud_request(
+            "instance-start",
+            "[1,2,3]",
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
         assert!(!reply.ok);
         assert!(reply.error.expect("error").contains("bad cloud request"));
         assert!(ops.calls().is_empty());
@@ -876,18 +1066,34 @@ mod tests {
         // failure, never a fabricated ok.
         let state = enabled_state();
         let ops = FakeInstanceOps::new().failing("exit 1: No server with a name or ID of 'i-9'");
-        let reply = handle_cloud_request("instance-start", r#"{"instance":"i-9"}"#, &state, &ops);
+        let reply = handle_cloud_request(
+            "instance-start",
+            r#"{"instance":"i-9"}"#,
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
         assert!(!reply.ok);
         assert!(reply.gated.is_none(), "a real failure is not a gate");
         assert!(reply.error.expect("error").contains("No server"));
-        assert_eq!(ops.calls(), vec!["start:i-9".to_string()], "it did reach the seam");
+        assert_eq!(
+            ops.calls(),
+            vec!["start:i-9".to_string()],
+            "it did reach the seam"
+        );
     }
 
     #[test]
     fn an_unknown_verb_is_rejected() {
         let state = enabled_state();
         let ops = FakeInstanceOps::new();
-        let reply = handle_cloud_request("instance-teleport", "{}", &state, &ops);
+        let reply = handle_cloud_request(
+            "instance-teleport",
+            "{}",
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
         assert!(!reply.ok);
         assert!(reply.error.expect("error").contains("unknown cloud verb"));
     }
@@ -943,7 +1149,11 @@ mod tests {
         assert_eq!(list[0].networks.as_deref(), Some("flat=10.0.0.5"));
         assert_eq!(list[1].status, "SHUTOFF");
         assert!(
-            list[1].networks.as_deref().expect("networks").contains("10.0.0.6"),
+            list[1]
+                .networks
+                .as_deref()
+                .expect("networks")
+                .contains("10.0.0.6"),
             "an object Networks column renders to a string"
         );
     }
@@ -975,7 +1185,13 @@ mod tests {
         let state = enabled_state();
         let ops = FakeInstanceOps::new();
         let mut cursors = BTreeMap::new();
-        drain_cloud_verbs(&persist, &mut cursors, &state, &ops);
+        drain_cloud_verbs(
+            &persist,
+            &mut cursors,
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
 
         // The op reached the seam...
         assert_eq!(ops.calls(), vec!["stop:i-42".to_string()]);
@@ -991,7 +1207,13 @@ mod tests {
 
         // A second drain with the advanced cursor re-answers nothing (no
         // re-performed lifecycle op — the §7 idempotence of the cursor).
-        drain_cloud_verbs(&persist, &mut cursors, &state, &ops);
+        drain_cloud_verbs(
+            &persist,
+            &mut cursors,
+            &state,
+            &ops,
+            &FakeCatalogSource::unconfigured(),
+        );
         assert_eq!(ops.calls(), vec!["stop:i-42".to_string()], "no replay");
     }
 }

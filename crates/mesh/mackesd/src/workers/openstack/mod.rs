@@ -73,6 +73,11 @@
 
 pub mod capacity;
 pub mod catalog;
+/// IAC-1 — the OpenStack **client foundation** (clouds.yaml auth → Keystone
+/// catalog → per-service API health → the standard resource/verb call seam). The
+/// client half of the integration (this worker is the server half); the seam the
+/// IAC surface (IAC-2..N) builds on.
+pub mod client;
 pub mod config_render;
 pub mod fleet;
 pub mod image_pipeline;
@@ -96,6 +101,7 @@ use super::nebula_supervisor::DEFAULT_OVERLAY_IP_PATH;
 use super::{ShutdownToken, Worker};
 
 use capacity::NodeCapacity;
+use client::{CatalogSource, LiveOpenStack};
 use config_render::{render_cloud_bootstrap, render_fleet_heat_stack, OverlayBind};
 use fleet::{FleetStateSource, MeshFleetState};
 use podman::{PodmanCli, PodmanRunner, DEFAULT_KOLLA_CONFIG_ROOT};
@@ -250,6 +256,14 @@ pub struct OpenstackWorker {
     /// `openstack` shell-out never pins the async runtime) without borrowing
     /// `self`.
     instances: Arc<dyn InstanceOps + Send + Sync>,
+    /// IAC-1 — the `OpenStack` client seam the typed `action/cloud/get-catalog`
+    /// verb drives to produce the Keystone service directory + per-service API
+    /// health (the §6 catalog+health contract the `IaC` surface consumes;
+    /// production: [`LiveOpenStack`], which loads `clouds.yaml` per call and
+    /// gates honestly on an unconfigured node). `Arc` so the verb drain runs on
+    /// a `spawn_blocking` thread (the auth + probe HTTP never pins the async
+    /// runtime) without borrowing `self`.
+    catalog: Arc<dyn CatalogSource + Send + Sync>,
     /// The Kolla config root ([`DEFAULT_KOLLA_CONFIG_ROOT`]; tests point it
     /// at a tempdir).
     config_root: PathBuf,
@@ -286,6 +300,7 @@ impl OpenstackWorker {
             host,
             runner: Arc::new(PodmanCli::new()),
             instances: Arc::new(OpenstackCli::new()),
+            catalog: LiveOpenStack::shared(),
             config_root: PathBuf::from(DEFAULT_KOLLA_CONFIG_ROOT),
             share_root: workgroup_root,
             overlay_ip_path: PathBuf::from(DEFAULT_OVERLAY_IP_PATH),
@@ -313,6 +328,14 @@ impl OpenstackWorker {
     #[must_use]
     pub fn with_instances(mut self, instances: Arc<dyn InstanceOps + Send + Sync>) -> Self {
         self.instances = instances;
+        self
+    }
+
+    /// Inject the IAC-1 `OpenStack` client seam (tests — the `get-catalog`
+    /// responder; production defaults to [`LiveOpenStack`]).
+    #[must_use]
+    pub fn with_catalog(mut self, catalog: Arc<dyn CatalogSource + Send + Sync>) -> Self {
+        self.catalog = catalog;
         self
     }
 
@@ -427,12 +450,15 @@ impl OpenstackWorker {
             return;
         };
         let instances = Arc::clone(&self.instances);
+        let catalog = Arc::clone(&self.catalog);
         let state = state.clone();
         let snapshot = cursors.clone();
         match tokio::task::spawn_blocking(move || {
             let mut cursors = snapshot;
             match Persist::open(bus_root) {
-                Ok(persist) => drain_cloud_verbs(&persist, &mut cursors, &state, &*instances),
+                Ok(persist) => {
+                    drain_cloud_verbs(&persist, &mut cursors, &state, &*instances, &*catalog);
+                }
                 Err(e) => {
                     tracing::debug!(target: "mackesd::openstack", error = %e, "cloud verbs: bus open failed");
                 }

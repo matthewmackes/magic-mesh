@@ -39,6 +39,13 @@ pub mod lighthouse;
 pub mod lighthouse_probe;
 // NF-11.1 (v2.5) — Nebula facts surface for the peer card.
 pub mod nebula;
+// IAC-1 (2026-07-04) — the OpenStack service-directory + API-health schema: the
+// §6 JSON contract between the mesh-side producer (mackesd's `openstack` worker
+// + its clouds.yaml→Keystone→catalog→health client foundation) and the
+// desktop-side consumer (the IAC-2 "Infra as Code (IaC)" surface's API status
+// band + merged directory). Lands here (like `device_inventory`) so neither side
+// depends on the other.
+pub mod openstack;
 pub mod peer_probe;
 // PEERVER-1 (v2.7, 2026-05-29) — peer-data convergence records.
 // Shared home so mackesd (writer, heartbeat tick) + mde-installer
