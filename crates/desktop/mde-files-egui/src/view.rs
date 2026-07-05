@@ -35,6 +35,7 @@ use mde_egui::egui::{
     self, Align2, Color32, FontId, Key, Modifiers, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
     TextureHandle, TextureOptions,
 };
+use mde_egui::menubar::{MenuBar as SharedMenuBar, MenuBarModel};
 use mde_egui::{field, muted_note, status_dot, Style};
 
 use mde_files::model::{Mime, PeerStatus};
@@ -87,7 +88,11 @@ struct EntryView {
 
 /// A user intent captured during a render, applied after the frame releases its
 /// shared borrow of the model.
-enum Action {
+///
+/// `pub(crate)` so the MENUBAR-ALL top bar ([`crate::menubar`]) can produce the
+/// same intents its toolbar/keyboard/right-click twins already do — the menu bar
+/// is a discoverable face over these seams, never a new dispatch path (§6).
+pub(crate) enum Action {
     Focus(usize),
     Navigate(usize, Location),
     Back(usize),
@@ -235,6 +240,11 @@ pub fn files_panel(ui: &mut egui::Ui, browser: &mut FileBrowser) {
     // clipboard. Kept off the text-edit path (path-edit / rename) so a paste there
     // lands in the field, never as a file transfer.
     clipboard_keys(ui, browser, &mut actions);
+    // MENUBAR-ALL — the shared top bar (FILES title · File/Edit/View/Go/Share/Help
+    // spine over real seams · live status cluster), registered before the toolbar
+    // so it reads as the surface's chrome header (lock 11), above the quick-access
+    // strip below it.
+    menu_bar(ui, browser, &mut actions);
     top_bar(ui, browser, &mut actions);
     egui::TopBottomPanel::bottom("files-bottom").show_inside(ui, |ui| {
         op_strip(ui, browser, &mut actions);
@@ -435,6 +445,42 @@ fn apply(ctx: &egui::Context, browser: &mut FileBrowser, action: Action) {
     }
 }
 
+// ── MENUBAR-ALL shared top bar ─────────────────────────────────────────────────
+
+/// Render the shared [`SharedMenuBar`] at the very top of the Files panel
+/// (MENUBAR-ALL): the UPPERCASE `FILES` title in the dock's System-group gold
+/// accent, the File/Edit/View/Go/Share/Help menu spine, and the live status
+/// cluster. The whole tree is built from a borrow-free [`crate::menubar`]
+/// snapshot; an activated item dispatches through the existing [`Action`]
+/// pipeline (§6 — the menu bar is a discoverable face over the surface's seams,
+/// never a new behaviour path). The Help window's open flag lives in egui memory,
+/// so the [`files_panel`] entry point stays stateless.
+fn menu_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
+    let cx = crate::menubar::snapshot(b);
+    let menus = crate::menubar::build_menus(&cx);
+    let status = crate::menubar::build_status(&cx);
+    let mut picked = None;
+    egui::TopBottomPanel::top("files-menubar").show_inside(ui, |ui| {
+        ui.add_space(Style::SP_XS);
+        let model = MenuBarModel {
+            title: "Files",
+            accent: Style::ACCENT_SYSTEM,
+            menus: &menus,
+            status: &status,
+        };
+        picked = SharedMenuBar::show(ui, &model);
+        ui.add_space(Style::SP_XS);
+    });
+    if let Some(p) = picked {
+        match crate::menubar::to_action(p, &cx) {
+            Some(action) => actions.push(action),
+            // The only non-seam pick: toggle the Help shortcuts reference.
+            None => crate::menubar::toggle_shortcuts(ui.ctx()),
+        }
+    }
+    crate::menubar::shortcuts_window(ui.ctx());
+}
+
 // ── Top toolbar ───────────────────────────────────────────────────────────────
 
 fn top_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
@@ -442,14 +488,8 @@ fn top_bar(ui: &mut egui::Ui, b: &FileBrowser, actions: &mut Vec<Action>) {
     egui::TopBottomPanel::top("files-top").show_inside(ui, |ui| {
         ui.add_space(Style::SP_XS);
         ui.horizontal(|ui| {
-            ui.heading(
-                RichText::new("Files")
-                    .color(Style::TEXT)
-                    .size(Style::HEADING),
-            );
-            ui.add_space(Style::SP_M);
-
-            // View-mode segmented control.
+            // View-mode segmented control (the FILES title now lives in the shared
+            // MENUBAR-ALL bar above — no duplicate heading here).
             let cur_view = b.active_tab().view();
             for mode in ViewMode::ALL {
                 if ui

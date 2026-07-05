@@ -26,6 +26,7 @@
 
 pub mod chat_bridge;
 pub mod dialogs;
+pub mod menubar;
 pub mod mesh_mount;
 pub mod model;
 pub mod ops;
