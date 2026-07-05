@@ -13,6 +13,13 @@
 //! connection-specific bus fields (rtt/nat/ice/mesh_path) describe a
 //! *link to a peer*; for a node's self-probe they carry honest local
 //! defaults (rtt 0, `Lan`, self path).
+//!
+//! DEVMGR-1 folds a SECOND artifact into this same rank-0 worker (lock #16 —
+//! "extend an existing inventory worker, not a new one"): on each tick it also
+//! calls [`super::device_inventory::publish_system`], which walks the full Linux
+//! hardware taxonomy sysfs-first and publishes
+//! `<workgroup_root>/device-inventory/<hostname>.json` for the About →
+//! Device-Manager surface. The worker's census entry is unchanged.
 
 #![cfg(feature = "async-services")]
 
@@ -212,10 +219,26 @@ impl Worker for HardwareProbeWorker {
         loop {
             let root = self.workgroup_root.clone();
             let node = self.node_id.clone();
-            // Gather shells read-only tools — keep it off the scheduler.
-            let _ = tokio::task::spawn_blocking(move || publish(&root, &node)).await;
+            // DEVMGR-1 — the rail/By-node views key on the SAME stem node_grade
+            // publishes under (node_id with the `peer:` prefix stripped), so a
+            // host's grade + device tree line up in the shell.
+            let host = node.strip_prefix("peer:").unwrap_or(&node).to_string();
+            // Gather shells read-only tools + walks sysfs — keep it off the
+            // scheduler. One blocking task publishes BOTH the PeerProbe
+            // (SUBAUDIT-D2) and the full device-inventory tree (DEVMGR-1).
+            let _ = tokio::task::spawn_blocking(move || {
+                publish(&root, &node);
+                if let Err(e) = super::device_inventory::publish_system(&root, &host) {
+                    tracing::warn!(
+                        target: "mackesd::hardware_probe",
+                        error = %e,
+                        "device-inventory publish failed",
+                    );
+                }
+            })
+            .await;
             tokio::select! {
-                _ = shutdown.wait() => return Ok(()),
+                () = shutdown.wait() => return Ok(()),
                 () = tokio::time::sleep(self.tick) => {}
             }
         }

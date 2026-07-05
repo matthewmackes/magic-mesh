@@ -3152,16 +3152,17 @@ Turn `Surface::About` into a Windows-Device-Manager-style hardware inspector: a 
 
 #### Phase 1 — read-only inspector (local + mesh nodes)
 
-- [ ] **DEVMGR-1: the device-inventory worker + publish.**
+- [✓] **DEVMGR-1: the device-inventory worker + publish.**
   **As** an operator,
   **I want** every node to enumerate + publish its own hardware,
   **so that** any host's device tree is readable across the mesh.
   **Acceptance** (each runtime-observable):
-    - [ ] extend an existing inventory worker (`legacy_inventory`/`compute_registry`, NOT a new worker — #16) to enumerate the local host's **full Linux taxonomy** (CPU/memory/disk+storage-ctrl/network/GPU/USB/PCI/audio/input/sensors/bluetooth/power) via **sysfs/udev first** (+ `pci.ids`/`usb.ids` names) with `lshw -json`/`dmidecode` shelled out for deep DMI/firmware on demand (#4/#15)
-    - [ ] each device carries `{name, vendor, model, ids, sysfs_path, driver/module+version, status+problem_code, resources(irq/io/mem), recent_events}`
-    - [ ] publish the tree to `<workgroup_root>/device-inventory/<hostname>.json` via the SEC-5 mesh-shunt replication (like node_grade); periodic republish + an on-demand live-re-query seam (#7/#8); rank-0 (every node)
-    - [ ] the shared serde schema lives in a mesh-neutral shared crate (or duplicated with a round-trip test) — no §6 boundary crossing
-    - [ ] tested: enumeration builds the taxonomy from a fixture sysfs tree, the JSON round-trips, the publish path writes the file
+    - [✓] extend an existing inventory worker (`legacy_inventory`/`compute_registry`, NOT a new worker — #16) to enumerate the local host's **full Linux taxonomy** (CPU/memory/disk+storage-ctrl/network/GPU/USB/PCI/audio/input/sensors/bluetooth/power) via **sysfs/udev first** (+ `pci.ids`/`usb.ids` names) with `lshw -json`/`dmidecode` shelled out for deep DMI/firmware on demand (#4/#15)
+    - [✓] each device carries `{name, vendor, model, ids, sysfs_path, driver/module+version, status+problem_code, resources(irq/io/mem), recent_events}`
+    - [✓] publish the tree to `<workgroup_root>/device-inventory/<hostname>.json` via the SEC-5 mesh-shunt replication (like node_grade); periodic republish + an on-demand live-re-query seam (#7/#8); rank-0 (every node)
+    - [✓] the shared serde schema lives in a mesh-neutral shared crate (or duplicated with a round-trip test) — no §6 boundary crossing
+    - [✓] tested: enumeration builds the taxonomy from a fixture sysfs tree, the JSON round-trips, the publish path writes the file
+    — DONE (2026-07-04, session 4e2f8f4c): folded into the existing rank-0 **`hardware_probe`** worker (the best "whichever fits best" home — `legacy_inventory` is a file-catalog core module, `compute_registry` publishes VM/container workloads to the Bus; `hardware_probe` is the existing hardware producer already publishing to `<workgroup_root>` via the SEC-5 idiom, so lock #16 is honored with no new worker/census entry). New engine `mackesd::workers::device_inventory` walks the full taxonomy sysfs-first (`/sys/bus/{pci,usb}`, `/sys/block`, `/sys/class/*`, `/proc/{cpuinfo,meminfo,uptime}`) with `pci.ids`/`usb.ids` names + honest status/problem derivation (PCI no-driver → `no-driver`, `enable=0`/de-authorized USB → `disabled`, dmesg error → `degraded`) + IRQ/io/mem resources + dmesg events; `lshw`/`dmidecode` are best-effort tool-availability flags (#15 honest-degrade). Publishes `<workgroup_root>/device-inventory/<hostname>.json` (atomic temp+rename, keyed on the same stem node_grade uses). **Shared schema in `mackes-mesh-types::device_inventory`** (the mesh-neutral crate that already carries `peer_probe` — both `mackesd` + `mde-shell-egui` depend on it, no §6 crossing; DEVMGR-2 reads this). Farm-green (slot devmgr1, host .90): mackes-mesh-types + mackesd build/clippy clean on the new files; `mackes-mesh-types` 5/5 + `mackesd::workers::device_inventory` 11/11 device tests pass; layered-tiers lint clean; rustfmt clean.
 
 - [ ] **DEVMGR-2: About → Device Manager shell (local host, by-type).**
   **As** a user,

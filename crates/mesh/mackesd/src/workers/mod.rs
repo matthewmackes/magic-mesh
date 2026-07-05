@@ -421,6 +421,11 @@ pub mod probe;
 // hardware probe + writes it to the replicated directory so the
 // Workbench Hardware panel renders the fleet. Spawned in run_serve.
 pub mod hardware_probe;
+// DEVMGR-1 — the device-inventory enumeration engine the `hardware_probe`
+// worker calls on its tick (NOT a new worker — lock #16). Walks the full Linux
+// hardware taxonomy sysfs-first + publishes `device-inventory/<host>.json` for
+// the About → Device-Manager surface (docs/design/about-device-manager.md).
+pub mod device_inventory;
 // E12-19 (Quasar host controls) — mirrors this node's seat snapshot to
 // state/host/<node>/seat and executes remote typed verbs (volume/BT/
 // display/power) behind the allowlist + safety interlocks. Runs on every
