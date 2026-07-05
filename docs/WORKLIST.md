@@ -3238,13 +3238,14 @@ Turn `Surface::About` into a Windows-Device-Manager-style hardware inspector: a 
     - [ ] a device transitioning INTO a problem state (driver drop, disk I/O errors, NIC down) emits `event/notify/<source>` → Chat + phone (CHAT-FIX-2 producer, #21), debounced against flapping (mirror node_grade)
     - [ ] tested: a simulated fault transition fires one debounced notify; a flapping device does not spam
 
-- [ ] **DEVMGR-10: the By-node cross-fleet view.**
+- [✓] **DEVMGR-10: the By-node cross-fleet view.**
   **As** an operator,
   **I want** every host's devices in one tree,
   **so that** I can scan the whole fleet's hardware at once.
   **Acceptance** (each runtime-observable):
-    - [ ] a **By-node** view mode flattens all hosts' published inventories into one cross-fleet tree (host → its devices), problem hosts near the top (#3)
-    - [ ] tested: the By-node tree aggregates multiple fixture hosts + surfaces problem counts per host
+    - [✓] a **By-node** view mode flattens all hosts' published inventories into one cross-fleet tree (host → its devices), problem hosts near the top (#3)
+    - [✓] tested: the By-node tree aggregates multiple fixture hosts + surfaces problem counts per host
+    - **Landed (DEVMGR-10, 2026-07-05):** `ViewMode::ByNode` is now wired (`is_available`, the third View-menu radio — no disabled seam left). A new `build_node_tree(read_all, local)` flattens the whole fleet: each published host a top-level `NodeHost` branch carrying its own device tree (categories cloned in), the absent local "you are here" node injected as an honest dim leaf mirroring the rail. `node_order` ranks **problem hosts first** (present-before-absent, any-fault-before-clean, more-problems-higher, then alphabetical), each host branch showing a per-host `⚠ N` badge + device count + a stale flag; a `fleet_header` sums the cross-fleet totals. Device rows/status-dots/problem-codes/context-menu/detail-drawer are the DEVMGR-2..8 seams verbatim (only the outer host→category→device nesting is new); Expand-all is mode-aware (host keys via `NodeTree::host_keys`). The DEVMGR-4 rail selection is cross-fleet-wide: the rail-selected host is accented and a device click on another host is an honest **jump** (`select_node_device` switches the inspected host so the drawer + any armed op resolve against the right node), never a mismatched host or fabricated tree (§7). Farm-green: `mde-shell-egui` builds; **625 tests pass** (7 new/updated By-node tests: fleet aggregation, problem-host ranking + exact per-host counts, honest absent leaf, view-flip preserves the fleet set, cross-fleet jump, renders-despite-absent-selection); clippy clean on `device_manager.rs`; style-leak grep + `lint-layered-tiers.sh` clean. STRICTLY within `device_manager.rs` (IAC-5 owns iac.rs + mackesd).
 
 - [ ] **DEVMGR-11: non-PC host types.**
   **As** a user,

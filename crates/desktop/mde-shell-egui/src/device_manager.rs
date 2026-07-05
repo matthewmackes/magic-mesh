@@ -86,8 +86,22 @@
 //! may lose reach to this host" warning (#13). The §6 boundary holds — the wire is
 //! the shared [`mackes_mesh_types::device_control`] contract, not a `mackesd` dep.
 //!
-//! The cross-fleet By-node flatten is still a later unit; its seam here (the
-//! disabled By-node mode) is left clean, not stubbed.
+//! **DEVMGR-10 lands the By-node cross-fleet flatten (#3)** — the third
+//! [`ViewMode`] is now wired. Where By-type / By-connection re-group ONE host's
+//! devices, By-node re-roots the WHOLE fleet: every published host (via
+//! [`device_inventory::read_all`], the same read the rail uses) becomes a
+//! top-level branch with its devices nested beneath it (sub-grouped by category),
+//! so an operator scans every node's hardware in one tree. Hosts with a device in
+//! a problem state sort to the top ([`build_node_tree`]) and each carries a
+//! per-host `⚠ N` badge. A host that has published nothing renders an honest dim
+//! "no inventory" leaf, never a fabricated tree (§7). The device rows, status
+//! dots, problem codes, detail drawer + context menu are the DEVMGR-2..8 seams
+//! verbatim; only the outer nesting changes. In By-node the DEVMGR-4 rail
+//! selection is cross-fleet-wide: the tree shows all hosts with the rail-selected
+//! one accented, and clicking a device on another host is an honest cross-fleet
+//! **jump** ([`DeviceManagerState::select_node_device`]) — the inspected host
+//! follows the click so the drawer + any armed op always resolve against the
+//! right node, never a mismatched host.
 
 #![allow(
     clippy::redundant_pub_crate,
@@ -131,11 +145,10 @@ const REFRESH: Duration = Duration::from_secs(30);
 /// time (`published_at_ms == 0`) is treated as stale for the same honesty reason.
 const STALE_AFTER: Duration = Duration::from_secs(180);
 
-/// How the device tree is organised (#3). DEVMGR-2 ships **By type** and
-/// DEVMGR-5 ships **By connection** (the bus/controller topology); By node (the
-/// cross-fleet flatten) is a later unit. The faithful MDM View menu offers all
-/// three, with the unbuilt mode **honestly disabled** (§7 — never stubbed to a
-/// fake render).
+/// How the device tree is organised (#3). DEVMGR-2 ships **By type**, DEVMGR-5
+/// ships **By connection** (the bus/controller topology), and DEVMGR-10 ships
+/// **By node** (the cross-fleet flatten). The faithful MDM View menu offers all
+/// three — every mode is now wired (§7 — no honestly-disabled seam remains).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[allow(
     clippy::enum_variant_names,
@@ -150,8 +163,9 @@ enum ViewMode {
     /// their parent PCI/USB bus segment (host → bus → device), reconstructed from
     /// each record's sysfs path. Wired.
     ByConnection,
-    /// The cross-fleet flatten of every host's devices (a later P2 unit) — not
-    /// yet wired (DEVMGR-4 adds the host rail, not this flattened view).
+    /// The cross-fleet flatten of every host's devices (DEVMGR-10) — every
+    /// published host a top-level branch, its devices nested beneath, problem
+    /// hosts first ([`build_node_tree`]). Wired.
     ByNode,
 }
 
@@ -168,11 +182,13 @@ impl ViewMode {
         }
     }
 
-    /// Whether this mode is wired: [`ByType`](Self::ByType) (DEVMGR-2) and
-    /// [`ByConnection`](Self::ByConnection) (DEVMGR-5). [`ByNode`](Self::ByNode)
-    /// renders as a disabled control until its unit lands (§7).
+    /// Whether this mode is wired: [`ByType`](Self::ByType) (DEVMGR-2),
+    /// [`ByConnection`](Self::ByConnection) (DEVMGR-5) and [`ByNode`](Self::ByNode)
+    /// (DEVMGR-10) — all three now render, so the View-menu radio never greys.
+    /// Kept as a seam (not folded to a constant) so a future unbuilt mode can
+    /// re-introduce an honest disabled control (§7) without touching the menu.
     const fn is_available(self) -> bool {
-        matches!(self, Self::ByType | Self::ByConnection)
+        matches!(self, Self::ByType | Self::ByConnection | Self::ByNode)
     }
 
     /// A filesystem-safe slug for the export filename (DEVMGR-6) — the view mode an
@@ -266,8 +282,8 @@ impl DrawerTab {
 enum MenuAction {
     /// Re-read the published inventory ([`DeviceManagerState::refresh`]).
     Scan,
-    /// Switch the tree organisation ([`DeviceManagerState::view`]) — only the
-    /// wired [`ViewMode::ByType`] is ever enabled (§7).
+    /// Switch the tree organisation ([`DeviceManagerState::view`]) — every mode
+    /// is now wired (By type / By connection / By node), so all three enable (§7).
     View(ViewMode),
     /// Expand every published category ([`DeviceManagerState::expand_all`]).
     ExpandAll,
@@ -462,6 +478,11 @@ pub(crate) struct DeviceManagerState {
     /// The last-read inventory for [`Self::selected_host`], or `None` when that
     /// host has published nothing (an honest absent read, never a fabricated tree).
     inventory: Option<DeviceInventory>,
+    /// The whole fleet's published inventories from the same [`device_inventory::read_all`]
+    /// as the rail (DEVMGR-10) — the source the **By-node** cross-fleet tree
+    /// ([`build_node_tree`]) flattens. Refreshed on every read; the By-type /
+    /// By-connection views read only [`Self::inventory`] and ignore it.
+    all_inventories: Vec<DeviceInventory>,
     /// Whether the inventory has been read at least once — the honest pre-poll
     /// gate (§7): a dim "reading…" before the first read, distinct from a
     /// read-but-empty host.
@@ -496,6 +517,7 @@ impl Default for DeviceManagerState {
             local_host,
             hosts: Vec::new(),
             inventory: None,
+            all_inventories: Vec::new(),
             seen: false,
             last_poll: None,
             expanded: BTreeSet::new(),
@@ -516,11 +538,16 @@ impl DeviceManagerState {
     /// state. The Scan action, the rail's live-refresh, host switching, and the
     /// cadence [`poll`](Self::poll) all land here.
     fn refresh(&mut self) {
-        // One dir read serves both the rail (every peer's freshness/health) and the
-        // selected host's tree (found in the same set — no second file read).
+        // One dir read serves the rail (every peer's freshness/health), the
+        // selected host's tree (found in the same set — no second file read), AND
+        // the By-node cross-fleet flatten (which keeps the whole set, DEVMGR-10).
         let all = device_inventory::read_all(&self.workgroup_root);
         self.hosts = build_rail(&all, &self.local_host);
-        self.inventory = all.into_iter().find(|inv| inv.host == self.selected_host);
+        self.inventory = all
+            .iter()
+            .find(|inv| inv.host == self.selected_host)
+            .cloned();
+        self.all_inventories = all;
         self.seen = true;
     }
 
@@ -549,9 +576,15 @@ impl DeviceManagerState {
     }
 
     /// Expand every collapsible branch (Expand-all, #19) — every published
-    /// category in By-type, or every bus / controller branch in By-connection
-    /// (DEVMGR-5), so the one control fills whichever tree is showing.
+    /// category in By-type, every bus / controller branch in By-connection
+    /// (DEVMGR-5), or every **host** branch in By-node (DEVMGR-10, the cross-fleet
+    /// keys), so the one control fills whichever tree is showing. By-node reads the
+    /// whole fleet, so it fills even when the rail-selected host itself is absent.
     fn expand_all(&mut self) {
+        if self.view == ViewMode::ByNode {
+            self.expanded = build_node_tree(&self.all_inventories, &self.local_host).host_keys();
+            return;
+        }
         if let Some(inv) = &self.inventory {
             self.expanded = match self.view {
                 ViewMode::ByConnection => build_connection_tree(inv).bus_keys(),
@@ -673,6 +706,12 @@ impl DeviceManagerState {
                 if !self.seen {
                     // Honest pre-poll (§7) — no fabricated tree before the first read.
                     pre_poll(ui, &self.selected_host);
+                } else if self.view == ViewMode::ByNode {
+                    // By-node reads the WHOLE fleet (DEVMGR-10), so it renders even
+                    // when the rail-selected host itself has published nothing — its
+                    // absent leaf still appears among the fleet, never the single-host
+                    // empty state.
+                    self.node_tree(ui);
                 } else if self.inventory.is_none() {
                     // Read, but the selected host has published nothing yet.
                     empty_host(ui, &self.selected_host);
@@ -854,7 +893,13 @@ impl DeviceManagerState {
             ],
         );
 
-        let has_tree = self.inventory.is_some();
+        // Expand/Collapse gate on there being a tree to fill: the selected host's
+        // inventory in By-type/By-connection, or ANY published host in By-node (the
+        // cross-fleet flatten renders even when the rail-selected host is absent).
+        let has_tree = match self.view {
+            ViewMode::ByNode => !self.all_inventories.is_empty(),
+            _ => self.inventory.is_some(),
+        };
         let mut view_entries: Vec<Entry<MenuAction>> = ViewMode::ALL
             .iter()
             .map(|&mode| {
@@ -1232,6 +1277,89 @@ impl DeviceManagerState {
         }
         if let Some(req) = action {
             self.apply_row_action(req, ui.ctx());
+        }
+    }
+
+    /// The **By-node** cross-fleet tree (DEVMGR-10, #3): the whole fleet's
+    /// published inventories ([`Self::all_inventories`], the same read the rail
+    /// uses) flattened into one tree — each host a top-level collapsing branch, its
+    /// devices nested beneath (sub-grouped by category), problem hosts sorted first
+    /// with a per-host `⚠ N` badge ([`build_node_tree`]). A host that has published
+    /// nothing renders an honest dim "no inventory" leaf, never a fabricated tree
+    /// (§7). The host branches share [`Self::expanded`] (keyed on the namespaced
+    /// host key) and the device rows + selection reuse the By-type render, so only
+    /// the outer nesting differs. In this mode the rail selection is
+    /// cross-fleet-wide: the rail-selected host is accented and a device click is an
+    /// honest jump ([`Self::select_node_device`]).
+    fn node_tree(&mut self, ui: &mut egui::Ui) {
+        // The host branch a header click toggled + the device a row click selected
+        // (carrying its owning HOST so a click can jump the inspected host) + any
+        // context-menu action — all applied AFTER the read borrow ends (as in
+        // [`Self::tree`] / [`Self::connection_tree`]).
+        let mut toggled: Option<String> = None;
+        let mut clicked: Option<(String, DeviceSelection)> = None;
+        let mut action: Option<(String, RowActionRequest)> = None;
+        let selected = self.selected.clone();
+        let selected_host = self.selected_host.clone();
+        let now = now_ms();
+        // Build an owned tree (clones the records) so the immutable fleet borrow
+        // ends before the mutate-after-frame toggle/selection below.
+        let tree = build_node_tree(&self.all_inventories, &self.local_host);
+        fleet_header(ui, &tree);
+        ui.add_space(Style::SP_S);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if tree.hosts.is_empty() {
+                    muted_note(ui, "No nodes have published a device inventory yet.");
+                    return;
+                }
+                for host in &tree.hosts {
+                    let open = self.expanded.contains(node_key(&host.host).as_str());
+                    let is_selected_host = host.host == selected_host;
+                    let out =
+                        node_host_header(ui, host, open, selected.as_ref(), is_selected_host, now);
+                    if out.header_clicked {
+                        toggled = Some(node_key(&host.host));
+                    }
+                    if let Some(sel) = out.selected {
+                        clicked = Some((host.host.clone(), sel));
+                    }
+                    if let Some(req) = out.action {
+                        action = Some((host.host.clone(), req));
+                    }
+                }
+            });
+        if let Some(key) = toggled {
+            self.toggle(&key);
+        }
+        if let Some((host, sel)) = clicked {
+            self.select_node_device(host, sel);
+        }
+        if let Some((host, req)) = action {
+            // A context-menu verb on another host's device routes to THAT host: jump
+            // the inspection there first so Properties / Scan / an armed Control all
+            // resolve + dispatch against the right node (§7 — never a mismatched host).
+            if host != self.selected_host {
+                self.select_host(host);
+            }
+            self.apply_row_action(req, ui.ctx());
+        }
+    }
+
+    /// Handle a device-row click in the By-node cross-fleet view (DEVMGR-10): a
+    /// click on a device owned by another host is an honest **jump** — the
+    /// inspected host switches to that device's host (the rail follows, DEVMGR-4)
+    /// and its detail drawer opens, so the drawer never resolves against the wrong
+    /// host. A click on a device already on the selected host toggles the drawer as
+    /// usual ([`Self::toggle_device_selection`]).
+    fn select_node_device(&mut self, host: String, sel: DeviceSelection) {
+        if host == self.selected_host {
+            self.toggle_device_selection(sel);
+        } else {
+            self.select_host(host);
+            self.selected = Some(sel);
+            self.active_tab = DrawerTab::General;
         }
     }
 
@@ -1976,6 +2104,286 @@ fn conn_bus_header(
     }
 }
 
+// ───────────────────── the by-node cross-fleet tree (DEVMGR-10, #3) ──────────
+
+/// The expand-set / id-salt key for a By-node host branch — namespaced so it
+/// never collides with a category key (By-type) or a bus key (By-connection) in
+/// the shared [`DeviceManagerState::expanded`] set.
+fn node_key(host: &str) -> String {
+    format!("node:{host}")
+}
+
+/// One host branch in the By-node cross-fleet tree ([`build_node_tree`]): a
+/// top-level host carrying its own device tree (its categories, cloned so the
+/// render borrow ends before the mutate-after-frame toggle), or an honest absent
+/// leaf (`published_at_ms == None`, no categories) for a host that has published
+/// nothing (§7 — never a fabricated tree).
+struct NodeHost {
+    /// The host's short name (the expand key + the selection/jump anchor).
+    host: String,
+    /// When it last published (`None` = absent — an honest dim leaf).
+    published_at_ms: Option<u64>,
+    /// Total device count in its snapshot (0 for an absent host).
+    device_count: usize,
+    /// Problem-status device count (its `⚠ N` badge; drives the fleet ranking).
+    problem_count: usize,
+    /// Its categorized device tree (empty for an absent host).
+    categories: Vec<DeviceCategory>,
+}
+
+impl NodeHost {
+    /// A host branch from a published inventory (its whole device tree cloned in).
+    fn from_inventory(inv: &DeviceInventory) -> Self {
+        Self {
+            host: inv.host.clone(),
+            published_at_ms: Some(inv.published_at_ms),
+            device_count: inv.device_count(),
+            problem_count: inv.problem_count(),
+            categories: inv.categories.clone(),
+        }
+    }
+
+    /// An absent host branch — a known host (e.g. the local "you are here" node)
+    /// that has published nothing yet. Rendered as an honest dim leaf (§7).
+    fn absent(host: &str) -> Self {
+        Self {
+            host: host.to_string(),
+            published_at_ms: None,
+            device_count: 0,
+            problem_count: 0,
+            categories: Vec::new(),
+        }
+    }
+
+    /// Whether this host has published an inventory (an expandable branch) — an
+    /// absent host is a non-expandable leaf.
+    const fn is_published(&self) -> bool {
+        self.published_at_ms.is_some()
+    }
+}
+
+/// The whole By-node cross-fleet tree: every host as a top-level branch, ranked
+/// problem-hosts-first (DEVMGR-10, #3).
+struct NodeTree {
+    /// The host branches — problem hosts first, then clean, then absent, each
+    /// tier stable-sorted (see [`node_order`]).
+    hosts: Vec<NodeHost>,
+}
+
+impl NodeTree {
+    /// The published host keys (Expand-all fills these in By-node mode) — an
+    /// absent host is a leaf with nothing to expand, so it is skipped.
+    fn host_keys(&self) -> BTreeSet<String> {
+        self.hosts
+            .iter()
+            .filter(|h| h.is_published())
+            .map(|h| node_key(&h.host))
+            .collect()
+    }
+}
+
+/// The By-node ranking (DEVMGR-10, #3): **problem hosts near the top** so a fleet
+/// scan surfaces faults first. Present hosts rank above absent ones (an absent
+/// host has no hardware to scan); among present hosts a host with any problem
+/// device ranks above a clean one, and more problems rank higher; ties (and the
+/// absent tier) break alphabetically for a stable order. Pure, so the ranking is
+/// unit-tested without a render.
+fn node_order(a: &NodeHost, b: &NodeHost) -> std::cmp::Ordering {
+    // Present (false) sorts before absent (true) — nothing to scan on an absent host.
+    (!a.is_published())
+        .cmp(&!b.is_published())
+        // A host with problems (false for problem==0) sorts before a clean one.
+        .then_with(|| (a.problem_count == 0).cmp(&(b.problem_count == 0)))
+        // Among problem hosts, more problems rank higher.
+        .then_with(|| b.problem_count.cmp(&a.problem_count))
+        // Stable alphabetical within a tier.
+        .then_with(|| a.host.cmp(&b.host))
+}
+
+/// Build the By-node cross-fleet tree from every published inventory (DEVMGR-10):
+/// each host becomes a top-level [`NodeHost`] carrying its own device tree, with
+/// the local "you are here" node always present (even if it has published nothing
+/// — an honest absent leaf, mirroring the rail), and the whole set ranked
+/// problem-hosts-first ([`node_order`]). `all` arrives already sorted by host
+/// ([`device_inventory::read_all`]), so the rank is a stable re-order. Pure over
+/// its inputs, so the aggregation + ranking is unit-tested without a substrate.
+fn build_node_tree(all: &[DeviceInventory], local: &str) -> NodeTree {
+    let mut hosts: Vec<NodeHost> = all.iter().map(NodeHost::from_inventory).collect();
+    if !hosts.iter().any(|h| h.host == local) {
+        hosts.push(NodeHost::absent(local));
+    }
+    hosts.sort_by(node_order);
+    NodeTree { hosts }
+}
+
+/// A compact cross-fleet summary above the By-node tree (DEVMGR-10) — the fleet
+/// twin of the By-type/By-connection header card (#20): the host count, how many
+/// are faulted, and the aggregate device + problem totals, all off real state
+/// (§7 — never a fabricated figure).
+fn fleet_header(ui: &mut egui::Ui, tree: &NodeTree) {
+    let hosts = tree.hosts.len();
+    let published = tree.hosts.iter().filter(|h| h.is_published()).count();
+    let problem_hosts = tree.hosts.iter().filter(|h| h.problem_count > 0).count();
+    let devices: usize = tree.hosts.iter().map(|h| h.device_count).sum();
+    let problems: usize = tree.hosts.iter().map(|h| h.problem_count).sum();
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Cross-fleet")
+                    .color(Style::TEXT_STRONG)
+                    .size(Style::TITLE)
+                    .strong(),
+            );
+            ui.add_space(Style::SP_S);
+            muted_note(
+                ui,
+                format!(
+                    "{published} of {hosts} {} \u{00B7} {devices} {}",
+                    plural(hosts, "host", "hosts"),
+                    plural(devices, "device", "devices"),
+                ),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if problems > 0 {
+                    ui.colored_label(
+                        Style::DANGER,
+                        RichText::new(format!(
+                            "\u{26A0} {problems} on {problem_hosts} {}", // ⚠
+                            plural(problem_hosts, "host", "hosts"),
+                        ))
+                        .size(Style::SMALL),
+                    );
+                } else {
+                    ui.colored_label(
+                        Style::OK,
+                        RichText::new("All devices OK across the fleet").size(Style::SMALL),
+                    );
+                }
+            });
+        });
+    });
+}
+
+/// One host branch of the By-node tree — a forced-state collapsing header (its
+/// open/closed driven by the caller's expand set) whose device rows nest beneath
+/// it, sub-grouped by category. The header names the host, folds in its device
+/// count + a `⚠ N` problem badge, tints amber when faulted / accent when it is the
+/// rail-selected host, and flags a stale snapshot. An absent host is an honest dim
+/// leaf ([`node_absent_row`]) — no header, no device tree (§7). Reuses
+/// [`device_row`] + [`DeviceSelection`] verbatim so a device behaves identically
+/// across all three views.
+fn node_host_header(
+    ui: &mut egui::Ui,
+    host: &NodeHost,
+    open: bool,
+    selected: Option<&DeviceSelection>,
+    is_selected_host: bool,
+    now_ms: u64,
+) -> CategoryOutcome {
+    // An absent host is a leaf — nothing published, nothing to expand (§7).
+    if !host.is_published() {
+        node_absent_row(ui, host, is_selected_host);
+        return CategoryOutcome {
+            header_clicked: false,
+            selected: None,
+            action: None,
+        };
+    }
+    let problems = host.problem_count;
+    let tone = if is_selected_host {
+        Style::ACCENT
+    } else if problems > 0 {
+        Style::WARN
+    } else {
+        Style::TEXT
+    };
+    let mut title = host.host.clone();
+    {
+        use std::fmt::Write as _;
+        let _ = write!(
+            title,
+            "   {} {}",
+            host.device_count,
+            plural(host.device_count, "device", "devices")
+        );
+        if problems > 0 {
+            let _ = write!(title, "   \u{26A0} {problems}"); // ⚠ N
+        }
+        if host_freshness(host.published_at_ms, now_ms) == HostFreshness::Stale {
+            let _ = write!(title, "   \u{00B7} stale"); // ·
+        }
+    }
+    let mut header = RichText::new(title).color(tone).size(Style::BODY);
+    if is_selected_host {
+        header = header.strong();
+    }
+    let mut clicked: Option<DeviceSelection> = None;
+    let mut action: Option<RowActionRequest> = None;
+    let resp = egui::CollapsingHeader::new(header)
+        .id_salt(("dm-node", host.host.as_str()))
+        .open(Some(open))
+        .show(ui, |ui| {
+            for cat in &host.categories {
+                node_category_caption(ui, cat);
+                for dev in &cat.devices {
+                    // Only the rail-selected host's devices highlight (a device with
+                    // the same key on a different host must not read as selected).
+                    let is_sel =
+                        is_selected_host && selected.is_some_and(|s| s.matches(&cat.key, dev));
+                    let out = device_row(ui, dev, &cat.key, is_sel);
+                    if out.clicked {
+                        clicked = Some(DeviceSelection::of(&cat.key, dev));
+                    }
+                    if let Some(req) = out.action {
+                        action = Some(req);
+                    }
+                }
+            }
+        });
+    CategoryOutcome {
+        header_clicked: resp.header_response.clicked(),
+        selected: clicked,
+        action,
+    }
+}
+
+/// A non-collapsible category sub-heading within a By-node host branch — the
+/// lightweight grouping caption (host → category → device) that keeps the single
+/// collapsible tier at the HOST level (so Expand-all is host-keyed). Dim by
+/// default, amber with a `⚠ N` count when the category holds a problem device.
+fn node_category_caption(ui: &mut egui::Ui, cat: &DeviceCategory) {
+    let problems = cat.problem_count();
+    let mut label = cat.label.clone();
+    if problems > 0 {
+        use std::fmt::Write as _;
+        let _ = write!(label, "  \u{26A0} {problems}"); // ⚠ N
+    }
+    let tone = if problems > 0 {
+        Style::WARN
+    } else {
+        Style::TEXT_DIM
+    };
+    ui.label(RichText::new(label).color(tone).size(Style::SMALL).strong());
+}
+
+/// An absent host leaf in the By-node tree — a dim status dot, the hostname, and
+/// an honest "no inventory published" note (§7 — never a fabricated device tree).
+/// Accent-tinted when it is the rail-selected host, mirroring the header branch.
+fn node_absent_row(ui: &mut egui::Ui, host: &NodeHost, is_selected_host: bool) {
+    ui.horizontal(|ui| {
+        status_dot(ui, Style::TEXT_DIM);
+        ui.add_space(Style::SP_XS);
+        let tone = if is_selected_host {
+            Style::ACCENT
+        } else {
+            Style::TEXT_DIM
+        };
+        ui.label(RichText::new(&host.host).color(tone).size(Style::BODY));
+        ui.add_space(Style::SP_XS);
+        muted_note(ui, "\u{2014} no inventory published"); // — no inventory published
+    });
+}
+
 // ───────────────────── device actions (DEVMGR-7, #12) ───────────────────────
 
 /// The **honest, read-only** subset of MDM's per-device action verbs this
@@ -2625,7 +3033,7 @@ fn host_hover(entry: &HostEntry, now_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_connection_tree, build_rail, cpu_line, derive_bus, device_armed,
+        build_connection_tree, build_node_tree, build_rail, cpu_line, derive_bus, device_armed,
         device_status_display, device_target, export_dir, format_mem_kb, header_lines,
         host_dot_tone, host_hover, humanize_ago, humanize_uptime, now_ms, problem_code,
         render_device_details, render_json, render_report, sanitize, scanned_label, status_tone,
@@ -2692,6 +3100,9 @@ mod tests {
             local_host: "laptop-mm".to_string(),
             selected_host: "laptop-mm".to_string(),
             hosts: Vec::new(),
+            // Seed the fleet set with the given inventory so a By-node render off a
+            // bare state (no refresh) is coherent; a `refresh` repopulates it.
+            all_inventories: inv.iter().cloned().collect(),
             inventory: inv,
             seen,
             last_poll: None,
@@ -2811,14 +3222,14 @@ mod tests {
     }
 
     #[test]
-    fn by_type_and_by_connection_are_wired_by_node_stays_a_disabled_seam() {
-        // #3 — the View menu offers all three modes; DEVMGR-2 wired By type and
-        // DEVMGR-5 wires By connection, while By node (the cross-fleet flatten)
-        // stays an honest disabled seam (§7), not a stubbed render.
+    fn all_three_view_modes_are_wired() {
+        // #3 — the View menu offers all three modes: DEVMGR-2 wired By type,
+        // DEVMGR-5 By connection, and DEVMGR-10 By node (the cross-fleet flatten).
+        // All three now render, so no honestly-disabled seam remains (§7).
         assert_eq!(ViewMode::ALL.len(), 3);
         assert!(ViewMode::ByType.is_available());
         assert!(ViewMode::ByConnection.is_available());
-        assert!(!ViewMode::ByNode.is_available());
+        assert!(ViewMode::ByNode.is_available());
         assert_eq!(ViewMode::default(), ViewMode::ByType);
     }
 
@@ -3943,6 +4354,217 @@ mod tests {
         assert!(
             s.arming.is_some(),
             "an unconfirmed arming persists across the frame"
+        );
+    }
+
+    // ── DEVMGR-10: the By-node cross-fleet view ──────────────────────────────
+
+    /// A fixture inventory re-hosted under `host` with every device forced healthy
+    /// — a clean node (0 problems) for the By-node ranking tests.
+    fn clean_host(host: &str) -> DeviceInventory {
+        let mut inv = host_inventory(host);
+        for cat in &mut inv.categories {
+            for dev in &mut cat.devices {
+                dev.status = DeviceStatus::Ok;
+                dev.problem = None;
+            }
+        }
+        inv
+    }
+
+    /// A clean host with `problems` extra faulted devices bolted on — a node whose
+    /// `problem_count` is exactly `problems`, for the By-node ranking + badge tests.
+    fn faulted_host(host: &str, problems: usize) -> DeviceInventory {
+        let mut inv = clean_host(host);
+        let devs: Vec<DeviceRecord> = (0..problems)
+            .map(|i| {
+                let mut d =
+                    DeviceRecord::new(format!("Faulted device {i}"), DeviceStatus::Degraded);
+                d.problem = Some("simulated I/O fault".into());
+                d
+            })
+            .collect();
+        inv.categories.push(device_inventory::DeviceCategory::new(
+            category::SENSORS,
+            devs,
+        ));
+        inv
+    }
+
+    #[test]
+    fn by_node_aggregates_every_host_into_one_cross_fleet_tree() {
+        // #3 — read_all delivers every published host; build_node_tree flattens
+        // them all into ONE tree, each host a top-level branch carrying its own
+        // device tree (host → its devices), so a fleet scan sees every node at once.
+        let all = vec![
+            host_inventory("alpha"),
+            host_inventory("beta"),
+            host_inventory("gamma"),
+        ];
+        let tree = build_node_tree(&all, "alpha"); // alpha published → no absent inject
+        assert_eq!(
+            tree.hosts.len(),
+            3,
+            "every published host is a top-level node"
+        );
+        for h in &tree.hosts {
+            assert_eq!(h.device_count, 2, "{} carries its own device tree", h.host);
+            assert!(
+                !h.categories.is_empty(),
+                "{}'s categories nest under it",
+                h.host
+            );
+        }
+        // The aggregate spans the whole fleet — three fixture hosts × 2 devices.
+        let total: usize = tree.hosts.iter().map(|h| h.device_count).sum();
+        assert_eq!(total, 6, "the tree aggregates the whole fleet's devices");
+    }
+
+    #[test]
+    fn by_node_ranks_problem_hosts_above_clean_ones_with_exact_counts() {
+        // #3 — problem hosts sort near the top (most problems highest) so a fleet
+        // scan surfaces faults first; clean hosts follow alphabetically. And the
+        // per-host problem count is exact (the ⚠ N badge is truthful).
+        let all = vec![
+            clean_host("aaa-clean"),    // 0 problems, alphabetically first
+            faulted_host("mmm-two", 2), // 2 problems
+            clean_host("zzz-clean"),    // 0 problems
+            faulted_host("bbb-one", 1), // 1 problem
+        ];
+        let tree = build_node_tree(&all, "aaa-clean");
+        let order: Vec<&str> = tree.hosts.iter().map(|h| h.host.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["mmm-two", "bbb-one", "aaa-clean", "zzz-clean"],
+            "problem hosts (most first) rank above clean hosts"
+        );
+        let count = |h: &str| {
+            tree.hosts
+                .iter()
+                .find(|n| n.host == h)
+                .unwrap()
+                .problem_count
+        };
+        assert_eq!(count("mmm-two"), 2, "the per-host problem count is exact");
+        assert_eq!(count("bbb-one"), 1);
+        assert_eq!(count("aaa-clean"), 0);
+        assert_eq!(count("zzz-clean"), 0);
+    }
+
+    #[test]
+    fn by_node_renders_an_absent_host_honestly_and_sinks_it() {
+        // §7 — the local "you are here" node that has published nothing is still
+        // present in the cross-fleet tree as an honest absent leaf (no device tree),
+        // sunk below the published hosts, and NOT expandable.
+        let all = vec![host_inventory("edge-1")]; // one published, faulted peer
+        let tree = build_node_tree(&all, "laptop-mm"); // local never published
+        let names: Vec<&str> = tree.hosts.iter().map(|h| h.host.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["edge-1", "laptop-mm"],
+            "the absent local sinks below the published peer"
+        );
+        let local = tree.hosts.iter().find(|h| h.host == "laptop-mm").unwrap();
+        assert_eq!(local.published_at_ms, None, "absent — nothing published");
+        assert_eq!(local.device_count, 0, "no fabricated devices");
+        assert!(local.categories.is_empty(), "no fabricated category tree");
+        // Expand-all only fills PUBLISHED host keys — an absent host is a leaf.
+        assert_eq!(
+            tree.host_keys(),
+            BTreeSet::from(["node:edge-1".to_string()])
+        );
+    }
+
+    #[test]
+    fn switching_to_by_node_preserves_the_fleet_inventory_set_and_renders() {
+        // Flipping to By-node re-groups the SAME cross-fleet data (read_all) into
+        // the host-flattened tree without changing which hosts are loaded; expand-all
+        // is then host-keyed (mode-aware), and the tree renders headless (a live
+        // render across the fleet, not dead code).
+        let scratch = ScratchRoot::new("by-node");
+        scratch.publish("laptop-mm", 1_000);
+        scratch.publish("edge-1", 2_000);
+        scratch.publish("edge-2", 3_000);
+        let mut s = state_with(None, false);
+        s.workgroup_root = scratch.path().to_path_buf();
+        s.refresh();
+        assert_eq!(s.all_inventories.len(), 3, "read_all kept the whole fleet");
+        // Flip to By-node — the seam the View menu drives.
+        s.apply(MenuAction::View(ViewMode::ByNode));
+        assert_eq!(s.view, ViewMode::ByNode);
+        // The inventory set is unchanged by the view flip (same three hosts).
+        let hosts: BTreeSet<&str> = s.all_inventories.iter().map(|i| i.host.as_str()).collect();
+        assert_eq!(
+            hosts,
+            BTreeSet::from(["laptop-mm", "edge-1", "edge-2"]),
+            "the fleet set survives the view flip"
+        );
+        // Expand-all fills the HOST keys (mode-aware), one per published host.
+        s.expand_all();
+        assert_eq!(
+            s.expanded,
+            build_node_tree(&s.all_inventories, &s.local_host).host_keys()
+        );
+        assert_eq!(s.expanded.len(), 3, "one expand key per published host");
+        assert!(
+            drive(&mut s) > 0,
+            "the by-node cross-fleet tree drew nothing"
+        );
+    }
+
+    #[test]
+    fn a_by_node_device_click_jumps_the_inspected_host() {
+        // In By-node the tree spans the fleet; clicking a device on another host is
+        // an honest cross-fleet jump — the rail-selected host follows so the drawer
+        // resolves against the right host (DEVMGR-4 selection stays truthful).
+        let scratch = ScratchRoot::new("by-node-jump");
+        scratch.publish("laptop-mm", 1_000);
+        scratch.publish("edge-2", 2_000);
+        let mut s = state_with(None, false);
+        s.workgroup_root = scratch.path().to_path_buf();
+        s.refresh();
+        s.view = ViewMode::ByNode;
+        assert_eq!(s.selected_host, "laptop-mm", "local is the default host");
+        // Click a device that lives on edge-2 (not the current host).
+        let sel = DeviceSelection::of(category::PCI_DEVICES, &orphan());
+        s.select_node_device("edge-2".to_string(), sel.clone());
+        assert_eq!(s.selected_host, "edge-2", "the rail follows the click");
+        assert_eq!(s.inventory.as_ref().unwrap().host, "edge-2");
+        assert_eq!(
+            s.selected,
+            Some(sel.clone()),
+            "the clicked device's drawer opened"
+        );
+        assert_eq!(s.active_tab, DrawerTab::General, "opens on General");
+        // Clicking a device already on the selected host toggles the drawer (no jump).
+        s.select_node_device("edge-2".to_string(), sel);
+        assert_eq!(
+            s.selected, None,
+            "a same-host re-click toggles the drawer closed"
+        );
+        assert_eq!(s.selected_host, "edge-2", "no jump within the same host");
+    }
+
+    #[test]
+    fn by_node_renders_the_fleet_even_when_the_selected_host_is_absent() {
+        // §7 — By-node reads the WHOLE fleet, so it renders the other hosts even
+        // when the rail-selected host itself has published nothing; it never falls
+        // into the single-host empty state.
+        let scratch = ScratchRoot::new("by-node-absent-sel");
+        scratch.publish("laptop-mm", now_ms());
+        scratch.publish("edge-1", now_ms());
+        let mut s = state_with(None, false);
+        s.workgroup_root = scratch.path().to_path_buf();
+        s.refresh();
+        s.view = ViewMode::ByNode;
+        s.expand_all(); // expand every host so the device rows render too
+        assert!(drive(&mut s) > 0, "the by-node tree drew nothing");
+        // Select a host that published nothing — the selected inventory goes None.
+        s.select_host("ghost-node".to_string());
+        assert!(s.inventory.is_none(), "the selected host is absent");
+        assert!(
+            drive(&mut s) > 0,
+            "by-node still renders the fleet despite an absent selection"
         );
     }
 }
