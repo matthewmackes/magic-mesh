@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 use mde_egui::egui::{self, ComboBox, RichText, Slider};
 use mde_egui::{field, muted_note, OsdKind, OsdLevel, Severity, Style, Toast};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{
@@ -54,6 +55,14 @@ use crate::power_settings;
 /// Poll cadence — a device plug, a battery drain, or a BT connect surfaces within
 /// this window.
 const REFRESH: Duration = Duration::from_secs(5);
+
+/// The world-readable mesh-status snapshot the SETTINGS-4 Mesh & System sections
+/// fold — the SAME source the chrome bar + the This Node / Network planes already
+/// read (`/run/mde/mesh-status.json`, written every ~30s by the root
+/// `mesh-status.timer`). The desktop user can't read the root-only replicated peer
+/// directory, so this JSON is the desktop tier's read path — the shell leans on no
+/// `mackesd` IPC and no root-only cert (§6).
+const MESH_STATUS_PATH: &str = "/run/mde/mesh-status.json";
 
 /// A filled-circle status dot — the shared glyph the rest of the platform uses.
 const DOT: &str = "\u{25CF}";
@@ -121,6 +130,12 @@ pub(crate) struct SystemState {
     /// surface switch AND a restart (the [`PowerHonorConfig`] client-data-dir JSON
     /// idiom, reused verbatim).
     nav: SettingsNav,
+    /// This node's mesh identity / role / network facts (SETTINGS-4), folded from
+    /// the SAME world-readable mesh-status snapshot the chrome bar + the This Node /
+    /// Network planes read ([`MESH_STATUS_PATH`]). Refreshed on the shared poll
+    /// cadence; the Mesh & System sections render it honest-`unknown` where the
+    /// snapshot doesn't carry a fact (§6/§7 — no new probe, no root-only cert read).
+    mesh: MeshFacts,
 }
 
 impl Default for SystemState {
@@ -144,6 +159,7 @@ impl Default for SystemState {
             pending_toasts: Vec::new(),
             power_honor_config: PowerHonorConfig::load(),
             nav: SettingsNav::load(),
+            mesh: MeshFacts::default(),
         }
     }
 }
@@ -200,6 +216,12 @@ pub(crate) enum SysAction {
     BtForget { adapter: String, device: String },
     /// Trust / untrust a device for auto-reconnect (`device path`, `trusted`).
     BtTrust(String, bool),
+    // ── Mesh & System (SETTINGS-4) ───────────────────────────────────────────
+    /// Re-arm the pairing responder from the Mesh & System → Pairing section:
+    /// clear the once-per-visit latch and re-attempt registration on the SAME
+    /// [`SystemState::sync_pairing_agent`] seam main.rs drives on surface
+    /// visibility (§6 — one responder, never a second agent).
+    PairingRetry,
 }
 
 impl SystemState {
@@ -216,6 +238,12 @@ impl SystemState {
             // Workbench. Published on the shared cadence, not per-frame.
             self.mirror.publish(&snap);
             self.snapshot = Some(snap);
+            // Fold this node's mesh identity / role / network facts from the same
+            // world-readable snapshot the chrome bar reads (SETTINGS-4, §6). A
+            // missing / unreadable file folds to the honest unseen facts, never a
+            // panic — mirroring the This Node / Network planes' tolerance.
+            let mesh_snapshot = fs::read_to_string(MESH_STATUS_PATH).unwrap_or_default();
+            self.mesh = MeshFacts::project(&mesh_snapshot);
         }
         ctx.request_repaint_after(REFRESH);
     }
@@ -294,6 +322,10 @@ impl SystemState {
         // moves it can be detected + persisted afterwards (the same collect-then-
         // apply idiom the SysActions use — the render can't take `&mut self`).
         let nav_before = self.nav;
+        // Whether the BlueZ pairing responder is currently registered — read before
+        // the mutable destructure (a Copy bool) so the Pairing section can surface
+        // the responder's honest live state (SETTINGS-4).
+        let agent_active = self.agent.is_some();
         {
             let Self {
                 snapshot,
@@ -307,9 +339,13 @@ impl SystemState {
                 pin_input,
                 power_honor_config,
                 nav,
+                mesh,
                 ..
             } = self;
             let snap = snapshot.as_ref();
+            // Whether a pairing PIN / passkey prompt is waiting for the shared modal
+            // (SETTINGS-4 Pairing surfaces it; the modal below answers it).
+            let prompt_in_flight = pairing.current().is_some();
 
             // The master rail: the three domain groups + their section rows. A row
             // click moves `nav` (persisted after the borrow). Each group header wears
@@ -353,6 +389,9 @@ impl SystemState {
                                 charge_threshold,
                                 power_honor_config,
                                 instances,
+                                mesh,
+                                agent_active,
+                                prompt_in_flight,
                                 &mut actions,
                             );
                         });
@@ -485,8 +524,20 @@ impl SystemState {
                         }
                     }
                 }
+                // SETTINGS-4: re-arm the pairing responder on the shared seam.
+                SysAction::PairingRetry => self.retry_pairing_agent(),
             }
         }
+    }
+
+    /// Re-arm the pairing responder (SETTINGS-4 Pairing section): clear the
+    /// once-per-visit latch, then re-attempt registration on the SAME
+    /// [`Self::sync_pairing_agent`] seam main.rs drives on visibility. With no
+    /// adapter this is an honest no-op (nothing to pair); a real failure re-toasts
+    /// once (§7), never a fabricated agent, never a second responder (§6).
+    fn retry_pairing_agent(&mut self) {
+        self.agent_attempted = false;
+        self.sync_pairing_agent(true);
     }
 
     /// Drive a POWER-4 profile switch through the real seat: on success
@@ -792,9 +843,9 @@ impl SystemState {
 // ──────────────────────────── master-detail nav (SETTINGS-1) ────────────────────────────
 
 /// One rail leaf of the Settings master-detail shell (SETTINGS-1): the six existing
-/// host-control sections plus the honest-empty Mesh & System placeholders SETTINGS-4
-/// fills. Each belongs to exactly one [`SettingsGroup`]; the pair the rail rests on
-/// is a [`SettingsNav`].
+/// host-control sections plus the four Mesh & System sections SETTINGS-4 wired to
+/// this node's real identity / role / pairing / network state. Each belongs to
+/// exactly one [`SettingsGroup`]; the pair the rail rests on is a [`SettingsNav`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum SettingsSection {
@@ -811,13 +862,13 @@ enum SettingsSection {
     Wallpaper,
     /// The compiled-in hotkey table (`hotkeys_section`).
     Hotkeys,
-    /// Mesh identity — honest-empty until SETTINGS-4.
+    /// Mesh identity name + overlay/cipher (`identity_section`, SETTINGS-4).
     Identity,
-    /// Node role pin — honest-empty until SETTINGS-4.
+    /// The pinned deployment role (`role_section`, SETTINGS-4).
     Role,
-    /// Mesh pairing — honest-empty until SETTINGS-4.
+    /// The pairing responder (`pairing_section`, SETTINGS-4).
     Pairing,
-    /// Overlay/underlay network facts — honest-empty until SETTINGS-4.
+    /// Overlay/underlay network facts (`network_section`, SETTINGS-4).
     Network,
 }
 
@@ -849,23 +900,6 @@ impl SettingsSection {
             }
         }
     }
-
-    /// Whether a section is wired to a real body (the six existing sections) rather
-    /// than an honest-empty Mesh & System placeholder. A taxonomy invariant the
-    /// tests assert; the live routing is the exhaustive match in [`settings_detail`],
-    /// so this stays test-only.
-    #[cfg(test)]
-    const fn is_wired(self) -> bool {
-        matches!(
-            self,
-            Self::Displays
-                | Self::Audio
-                | Self::Bluetooth
-                | Self::Power
-                | Self::Wallpaper
-                | Self::Hotkeys
-        )
-    }
 }
 
 /// A domain group — the top level of the master rail (lock 3). Scales as sections
@@ -878,7 +912,7 @@ enum SettingsGroup {
     Devices,
     /// Wallpaper · Hotkeys.
     Personalization,
-    /// Identity · Role · Pairing · Network (honest-empty until SETTINGS-4).
+    /// Identity · Role · Pairing · Network (SETTINGS-4 — this node's mesh facts).
     MeshSystem,
 }
 
@@ -1061,8 +1095,9 @@ fn settings_rail(ui: &mut egui::Ui, nav: &mut SettingsNav) {
 
 /// The detail pane (SETTINGS-1): an expressive header over the selected section's
 /// body, rendered by calling the EXISTING per-section fn verbatim (§6 — no forked
-/// logic; every `apply()`/`SysAction` seam is reused). The Mesh & System placeholders
-/// render an honest-empty note until SETTINGS-4 wires them.
+/// logic; every `apply()`/`SysAction` seam is reused). The Mesh & System sections
+/// (SETTINGS-4) render this node's real identity / role / pairing / network state,
+/// honest-`unknown` where the snapshot doesn't carry a fact (§7).
 #[allow(clippy::too_many_arguments)] // one router legibly threading the live section refs
 fn settings_detail(
     ui: &mut egui::Ui,
@@ -1075,6 +1110,9 @@ fn settings_detail(
     charge_threshold: &mut Option<u8>,
     power_honor_config: &mut PowerHonorConfig,
     instances: &InstancesState,
+    mesh: &MeshFacts,
+    agent_active: bool,
+    prompt_in_flight: bool,
     actions: &mut Vec<SysAction>,
 ) {
     // Expressive header — the active section's title in the large type scale, tinted
@@ -1106,10 +1144,12 @@ fn settings_detail(
         ),
         SettingsSection::Wallpaper => wallpaper_section(ui),
         SettingsSection::Hotkeys => hotkeys_section(ui),
-        SettingsSection::Identity
-        | SettingsSection::Role
-        | SettingsSection::Pairing
-        | SettingsSection::Network => settings_placeholder(ui, section),
+        SettingsSection::Identity => identity_section(ui, mesh),
+        SettingsSection::Role => role_section(ui, mesh),
+        SettingsSection::Pairing => {
+            pairing_section(ui, snap, agent_active, prompt_in_flight, actions);
+        }
+        SettingsSection::Network => network_section(ui, mesh),
     });
 }
 
@@ -1229,19 +1269,6 @@ fn across_grid<T>(
             }
         });
     }
-}
-
-/// An honest-empty Mesh & System placeholder (§7): a not-yet-wired note, never a
-/// fake control. SETTINGS-4 replaces this with the real identity/role/pairing/network
-/// bodies keyed off the node's own state.
-fn settings_placeholder(ui: &mut egui::Ui, section: SettingsSection) {
-    muted_note(
-        ui,
-        format!(
-            "{} settings are not wired yet — Mesh & System lands in SETTINGS-4.",
-            section.label()
-        ),
-    );
 }
 
 /// Fold a snapshot [`Probe`] into its render: not-yet-polled → "reading…",
@@ -2154,6 +2181,373 @@ fn hotkeys_section(ui: &mut egui::Ui) {
     });
 }
 
+// ──────────────────────────── Mesh & System (SETTINGS-4) ────────────────────────────
+
+/// This node's mesh facts (SETTINGS-4), folded from the world-readable mesh-status
+/// snapshot the chrome bar + the This Node / Network planes already read
+/// ([`MESH_STATUS_PATH`]). The shell leans on no `mackesd` IPC and no root-only cert
+/// path (§6); every field is real node reality, honest-`None` (rendered "unknown")
+/// where the snapshot doesn't carry it (§7). Pure (no IO / egui / GPU), so
+/// [`Self::project`] is unit-tested directly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MeshFacts {
+    /// `true` once a snapshot has parsed — distinguishes "no snapshot yet" (the
+    /// reading state) from a parsed one.
+    seen: bool,
+    /// This node's mesh identity name — the snapshot's `self` marker (the Nebula
+    /// certificate CN this fleet stamps as the hostname), when known.
+    identity: Option<String>,
+    /// Pinned deployment role (`lighthouse` / `server` / `workstation`), when this
+    /// node's own directory row carries it.
+    role: Option<String>,
+    /// This node's Nebula overlay IP, when known.
+    overlay_ip: Option<String>,
+    /// The overlay tunnel interface (e.g. `nebula1`), when known.
+    overlay_if: Option<String>,
+    /// The overlay subnet (CIDR), when known.
+    overlay_cidr: Option<String>,
+    /// The tunnel cipher label, when known.
+    cipher: Option<String>,
+    /// The elected mesh leader's hostname, when one holds the lease.
+    leader: Option<String>,
+    /// The lighthouse overlay IPs anchoring the fabric.
+    lighthouses: Vec<String>,
+    /// The lighthouse public (underlay) endpoints, when the snapshot carries them.
+    gateways: Vec<String>,
+    /// The node's underlay default gateway, when known.
+    default_gw: Option<String>,
+    /// Peers currently `online` in the directory.
+    peers_online: u64,
+    /// Peers in the directory (every node the snapshot names).
+    peers_total: u64,
+}
+
+impl MeshFacts {
+    /// Fold the mesh-status snapshot into this node's mesh facts. A missing /
+    /// garbage / non-mesh snapshot yields the honest unseen facts (drives the
+    /// "reading…" state), never a panic — mirroring the chrome bar's tolerance.
+    fn project(snapshot: &str) -> Self {
+        let Ok(v) = serde_json::from_str::<Value>(snapshot) else {
+            return Self::default();
+        };
+        let identity = nonempty(&v, "self");
+        let nodes = v.get("nodes").and_then(Value::as_array);
+        // A real snapshot names at least `self` or a `nodes` array; anything else
+        // (an empty object, an array, a fragment) reads as unseen.
+        if identity.is_none() && nodes.is_none() {
+            return Self::default();
+        }
+        let network = v.get("network");
+        // This node's own directory row (the role / overlay source), matched by the
+        // `self` identity — honestly absent when the node hasn't published a row yet.
+        let own = identity.as_deref().and_then(|host| {
+            nodes.and_then(|arr| {
+                arr.iter()
+                    .find(|n| n.get("hostname").and_then(Value::as_str) == Some(host))
+            })
+        });
+        Self {
+            seen: true,
+            role: own.and_then(|n| nonempty(n, "role")),
+            // Prefer this node's own directory-row overlay IP; fall back to the
+            // network overview's locally-probed overlay address.
+            overlay_ip: own
+                .and_then(|n| nonempty(n, "overlay_ip"))
+                .or_else(|| network.and_then(|n| nonempty(n, "overlay_ip"))),
+            overlay_if: network.and_then(|n| nonempty(n, "overlay_if")),
+            overlay_cidr: network.and_then(|n| nonempty(n, "overlay_cidr")),
+            cipher: network.and_then(|n| nonempty(n, "cipher")),
+            leader: network.and_then(|n| nonempty(n, "leader")),
+            lighthouses: str_array(network, "lighthouse_ips"),
+            gateways: str_array(network, "gateway_endpoints"),
+            default_gw: network.and_then(|n| nonempty(n, "default_gw")),
+            peers_online: v.get("online").and_then(Value::as_u64).unwrap_or(0),
+            peers_total: v.get("total").and_then(Value::as_u64).unwrap_or(0),
+            identity,
+        }
+    }
+
+    /// `true` when this node holds the mesh leader lease (its identity names the
+    /// elected leader).
+    fn is_leader(&self) -> bool {
+        matches!((&self.leader, &self.identity), (Some(l), Some(i)) if l == i)
+    }
+}
+
+/// Read a non-empty trimmed string field off a JSON object, or `None` — the same
+/// honest "empty ⇒ absent" fold the This Node / Network planes use (§7).
+fn nonempty(val: &Value, key: &str) -> Option<String> {
+    val.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// Read a JSON string array (dropping empties) off `network[key]`, or an empty vec
+/// when the key is absent / not an array.
+fn str_array(network: Option<&Value>, key: &str) -> Vec<String> {
+    network
+        .and_then(|n| n.get(key))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One mesh fact as a [`field`] row — the toned value when the snapshot carried it,
+/// a dim honest "unknown" when it didn't (§7 — never a fabricated value).
+fn mesh_field(ui: &mut egui::Ui, label: &str, value: Option<&str>) {
+    match value {
+        Some(v) => field(ui, label, v, Style::TEXT),
+        None => field(ui, label, "unknown", Style::TEXT_DIM),
+    }
+}
+
+/// The shared "reading the snapshot" note a Mesh & System section shows before the
+/// first mesh-status poll lands.
+fn mesh_reading(ui: &mut egui::Ui) {
+    muted_note(ui, "Reading this node's mesh status…");
+}
+
+/// The Identity section (SETTINGS-4) — this node's mesh identity name + overlay
+/// address + tunnel cipher, folded from the world-readable snapshot. The Nebula
+/// certificate fingerprint is honestly `unknown`: the shell reads the world-readable
+/// mesh-status surface, not the root-only cert (§6/§7 — the same honest boundary the
+/// This Node plane draws for node-local telemetry).
+fn identity_section(ui: &mut egui::Ui, mesh: &MeshFacts) {
+    if !mesh.seen {
+        mesh_reading(ui);
+        return;
+    }
+    tile(ui, |ui| {
+        mesh_field(ui, "Mesh name", mesh.identity.as_deref());
+        // Not on the world-readable surface — honest-unknown, never a fake digest.
+        field(ui, "Certificate fingerprint", "unknown", Style::TEXT_DIM);
+        mesh_field(ui, "Overlay address", mesh.overlay_ip.as_deref());
+        mesh_field(ui, "Tunnel cipher", mesh.cipher.as_deref());
+    });
+    ui.add_space(Style::SP_S);
+    muted_note(
+        ui,
+        "Identity folds from the world-readable mesh-status snapshot; the Nebula \
+         certificate fingerprint isn't published to this surface (the shell reads no \
+         root-only cert).",
+    );
+}
+
+/// The Role section (SETTINGS-4) — this node's pinned deployment role, a one-line
+/// description of what the tier means, and a leader-lease marker. Honest-`unknown`
+/// when the node hasn't published a directory row yet (§7).
+fn role_section(ui: &mut egui::Ui, mesh: &MeshFacts) {
+    if !mesh.seen {
+        mesh_reading(ui);
+        return;
+    }
+    let accent = SettingsGroup::MeshSystem.accent();
+    tile(ui, |ui| {
+        match mesh.role.as_deref() {
+            Some(role) => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(DOT).color(accent).size(Style::SMALL));
+                    ui.add_space(Style::SP_XS);
+                    ui.label(RichText::new(role).color(accent).size(Style::BODY).strong());
+                });
+                ui.add_space(Style::SP_XS);
+                muted_note(ui, role_description(role));
+            }
+            None => field(
+                ui,
+                "Role",
+                "unknown — not yet pinned in the peer directory",
+                Style::TEXT_DIM,
+            ),
+        }
+        if mesh.is_leader() {
+            ui.add_space(Style::SP_XS);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(DOT).color(Style::OK).size(Style::SMALL));
+                ui.add_space(Style::SP_XS);
+                ui.colored_label(
+                    Style::OK,
+                    RichText::new("holds the mesh leader lease").size(Style::SMALL),
+                );
+            });
+        }
+    });
+}
+
+/// A one-line description of a pinned role for the Role section — honest for the
+/// three deployment tiers the fleet pins, a neutral line for any other value.
+fn role_description(role: &str) -> &'static str {
+    match role {
+        "lighthouse" => {
+            "Anchors the overlay — a stable public endpoint peers discover the mesh through."
+        }
+        "server" => "A headless mesh member running shared workloads and services.",
+        "workstation" => "An interactive seat — this desktop rides the mesh as a workstation.",
+        _ => "A pinned mesh member.",
+    }
+}
+
+/// The Pairing section (SETTINGS-4) — folds in the pairing responder the surface
+/// already drives while Settings is open ([`SystemState::sync_pairing_agent`], §6).
+/// It surfaces the responder's honest live state — whether an adapter is present for
+/// it to bind, whether it's registered, and whether a pairing prompt is in flight
+/// (answered in the shared modal) — and offers a Retry that re-arms the SAME seam
+/// after a transient failure (never a second agent, §6 one-owner).
+fn pairing_section(
+    ui: &mut egui::Ui,
+    snap: Option<&SeatSnapshot>,
+    agent_active: bool,
+    prompt_in_flight: bool,
+    actions: &mut Vec<SysAction>,
+) {
+    // The responder binds the host Bluetooth adapter — no adapter, nothing to pair.
+    let adapter_present = matches!(
+        snap.map(|s| &s.bluetooth),
+        Some(Probe::Present(bt)) if !bt.adapters.is_empty()
+    );
+    tile(ui, |ui| {
+        let (dot, word, tone) = if !adapter_present {
+            (
+                Style::TEXT_DIM,
+                "no adapter — nothing to pair",
+                Style::TEXT_DIM,
+            )
+        } else if agent_active {
+            (Style::OK, "registered", Style::OK)
+        } else {
+            (
+                Style::WARN,
+                "adapter present — not yet registered",
+                Style::WARN,
+            )
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(DOT).color(dot).size(Style::SMALL));
+            ui.add_space(Style::SP_XS);
+            ui.label(
+                RichText::new("Pairing responder")
+                    .color(Style::TEXT)
+                    .size(Style::SMALL)
+                    .strong(),
+            );
+            ui.add_space(Style::SP_S);
+            ui.colored_label(tone, RichText::new(word).size(Style::SMALL));
+        });
+        // A prompt in flight — the operator answers it in the shared modal.
+        if prompt_in_flight {
+            ui.add_space(Style::SP_XS);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.add_space(Style::SP_XS);
+                ui.colored_label(
+                    Style::ACCENT,
+                    RichText::new("A pairing prompt is waiting — respond in the dialog.")
+                        .size(Style::SMALL),
+                );
+            });
+        }
+        // Retry re-arms the responder main.rs drives on visibility — disabled
+        // honestly when there is no adapter to bind.
+        ui.add_space(Style::SP_XS);
+        if ui
+            .add_enabled(
+                adapter_present,
+                egui::Button::new(RichText::new("Retry pairing").size(Style::SMALL)),
+            )
+            .clicked()
+        {
+            actions.push(SysAction::PairingRetry);
+        }
+    });
+    ui.add_space(Style::SP_S);
+    muted_note(
+        ui,
+        "The pairing responder answers incoming device PIN / passkey prompts while \
+         Settings is open; it binds the host Bluetooth adapter (§6 — one responder, \
+         driven by this surface's visibility).",
+    );
+}
+
+/// The Network section (SETTINGS-4) — the overlay (Nebula) facts and the mesh links /
+/// underlay reachability, laid side by side across the wide pane (SETTINGS-3). Every
+/// field is the node's real snapshot reality, honest-`unknown` where absent (§7).
+/// Live per-link throughput / handshake state isn't on the world-readable surface
+/// (§6) — the same honest boundary the Network plane draws.
+fn network_section(ui: &mut egui::Ui, mesh: &MeshFacts) {
+    // The middle-dot joiner the device-meta / Network rows use for a list value.
+    const SEP: &str = "  \u{00B7}  ";
+    if !mesh.seen {
+        mesh_reading(ui);
+        return;
+    }
+    let overlay = |ui: &mut egui::Ui| {
+        mesh_field(ui, "Overlay IP", mesh.overlay_ip.as_deref());
+        mesh_field(ui, "Interface", mesh.overlay_if.as_deref());
+        mesh_field(ui, "Subnet", mesh.overlay_cidr.as_deref());
+        mesh_field(ui, "Cipher", mesh.cipher.as_deref());
+    };
+    let links = |ui: &mut egui::Ui| {
+        // Live peer count — green when all live, warn when some are down.
+        let tone = if mesh.peers_total == 0 {
+            Style::TEXT_DIM
+        } else if mesh.peers_online == mesh.peers_total {
+            Style::OK
+        } else {
+            Style::WARN
+        };
+        field(
+            ui,
+            "Peers",
+            &format!("{}/{} live", mesh.peers_online, mesh.peers_total),
+            tone,
+        );
+        // The elected leader (with a this-node marker when we hold the lease).
+        match mesh.leader.as_deref() {
+            Some(leader) if mesh.is_leader() => {
+                field(ui, "Leader", &format!("{leader} (this node)"), Style::OK);
+            }
+            Some(leader) => field(ui, "Leader", leader, Style::TEXT),
+            None => field(ui, "Leader", "no leader elected", Style::TEXT_DIM),
+        }
+        // Lighthouses anchoring the overlay.
+        if mesh.lighthouses.is_empty() {
+            field(ui, "Lighthouses", "unknown", Style::TEXT_DIM);
+        } else {
+            field(ui, "Lighthouses", &mesh.lighthouses.join(SEP), Style::TEXT);
+        }
+        // Underlay reachability: the public endpoints + the default gateway (both
+        // honestly omitted / dim when the snapshot doesn't carry them).
+        if !mesh.gateways.is_empty() {
+            field(
+                ui,
+                "Public endpoints",
+                &mesh.gateways.join(SEP),
+                Style::TEXT,
+            );
+        }
+        mesh_field(ui, "Default gateway", mesh.default_gw.as_deref());
+    };
+    if fit_columns(ui.available_width(), 2) == 2 {
+        ui.columns(2, |columns| {
+            column_card(&mut columns[0], "Overlay", |ui| overlay(ui));
+            column_card(&mut columns[1], "Mesh links", |ui| links(ui));
+        });
+    } else {
+        column_card(ui, "Overlay", |ui| overlay(ui));
+        ui.add_space(Style::SP_S);
+        column_card(ui, "Mesh links", |ui| links(ui));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2579,42 +2973,36 @@ mod tests {
     }
 
     #[test]
-    fn every_existing_section_is_reachable_exactly_once_and_wired() {
-        // The six existing host-control sections each appear exactly once across the
-        // whole taxonomy and route to a real body; the Mesh & System leaves are the
-        // honest-empty placeholders (not wired until SETTINGS-4).
+    fn every_section_is_reachable_exactly_once() {
+        // Every section — the six host-control sections AND the four Mesh & System
+        // sections SETTINGS-4 wired — appears exactly once across the whole taxonomy
+        // and routes to a real body (the live routing is the exhaustive match in
+        // settings_detail; the render test proves each paints).
         let all: Vec<SettingsSection> = SettingsGroup::ALL
             .iter()
             .flat_map(|g| g.sections().iter().copied())
             .collect();
-        for existing in [
+        for section in [
             SettingsSection::Displays,
             SettingsSection::Audio,
             SettingsSection::Bluetooth,
             SettingsSection::Power,
             SettingsSection::Wallpaper,
             SettingsSection::Hotkeys,
-        ] {
-            assert_eq!(
-                all.iter().filter(|&&s| s == existing).count(),
-                1,
-                "{} must be reachable exactly once",
-                existing.label()
-            );
-            assert!(existing.is_wired(), "{} must be wired", existing.label());
-        }
-        for placeholder in [
             SettingsSection::Identity,
             SettingsSection::Role,
             SettingsSection::Pairing,
             SettingsSection::Network,
         ] {
-            assert!(
-                !placeholder.is_wired(),
-                "{} is an honest-empty placeholder until SETTINGS-4",
-                placeholder.label()
+            assert_eq!(
+                all.iter().filter(|&&s| s == section).count(),
+                1,
+                "{} must be reachable exactly once",
+                section.label()
             );
         }
+        // The whole taxonomy is exactly those ten sections (no orphan leaf).
+        assert_eq!(all.len(), 10, "the taxonomy lists exactly ten sections");
     }
 
     #[test]
@@ -2954,6 +3342,116 @@ mod tests {
         assert!(
             disabled,
             "a ToggleOutput still drives the layout after the re-layout"
+        );
+    }
+
+    // ── Mesh & System (SETTINGS-4) ────────────────────────────────────────────
+
+    /// A faithful mesh-status snapshot — the exact shape `mesh-status-snapshot.sh`
+    /// writes: `self` + a `nodes` directory (this node plus a lighthouse peer), the
+    /// fleet counts, and the network overview. `leader` names the mesh leader so both
+    /// the is-leader and not-leader paths are reachable from one fixture.
+    fn mesh_snapshot(self_host: &str, leader: &str) -> String {
+        format!(
+            r#"{{
+              "generated_ms": 1000000,
+              "self": "{self_host}",
+              "online": 2,
+              "total": 3,
+              "nodes": [
+                {{"hostname":"this-node","overlay_ip":"10.42.0.7","presence":"online",
+                  "role":"workstation"}},
+                {{"hostname":"lh-01","overlay_ip":"10.42.0.1","presence":"online",
+                  "role":"lighthouse"}}
+              ],
+              "network": {{"overlay_if":"nebula1","leader":"{leader}","overlay_ip":"10.42.0.7",
+                "overlay_cidr":"10.42.0.0/16","routes":[],"default_gw":"172.20.0.1",
+                "gateway_endpoints":["203.0.113.9:4242"],"lighthouse_ips":["10.42.0.1"],
+                "cipher":"AES-256-GCM"}}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn mesh_facts_fold_this_nodes_real_identity_role_and_network() {
+        // The leader is a peer (lh-01) here, so this node is NOT the leader; every
+        // field is the node's real snapshot reality (§7).
+        let mesh = MeshFacts::project(&mesh_snapshot("this-node", "lh-01"));
+        assert!(mesh.seen);
+        assert_eq!(mesh.identity.as_deref(), Some("this-node"));
+        assert_eq!(mesh.role.as_deref(), Some("workstation"));
+        assert_eq!(mesh.overlay_ip.as_deref(), Some("10.42.0.7"));
+        assert_eq!(mesh.overlay_if.as_deref(), Some("nebula1"));
+        assert_eq!(mesh.overlay_cidr.as_deref(), Some("10.42.0.0/16"));
+        assert_eq!(mesh.cipher.as_deref(), Some("AES-256-GCM"));
+        assert_eq!(mesh.leader.as_deref(), Some("lh-01"));
+        assert_eq!(mesh.lighthouses, vec!["10.42.0.1".to_owned()]);
+        assert_eq!(mesh.gateways, vec!["203.0.113.9:4242".to_owned()]);
+        assert_eq!(mesh.default_gw.as_deref(), Some("172.20.0.1"));
+        assert_eq!((mesh.peers_online, mesh.peers_total), (2, 3));
+        assert!(!mesh.is_leader(), "the leader is a peer, not this node");
+
+        // When this node holds the lease, is_leader flips.
+        let leading = MeshFacts::project(&mesh_snapshot("this-node", "this-node"));
+        assert!(leading.is_leader());
+    }
+
+    #[test]
+    fn mesh_facts_stay_unseen_on_a_garbage_or_fragment_snapshot() {
+        for bad in ["", "not json", "{}", "[]", r#"{"network":{}}"#] {
+            let mesh = MeshFacts::project(bad);
+            assert!(!mesh.seen, "{bad:?} must not read as a live snapshot");
+            assert!(mesh.identity.is_none());
+            assert!(mesh.lighthouses.is_empty());
+        }
+    }
+
+    #[test]
+    fn each_mesh_system_section_renders_live_data_and_honest_unknown() {
+        // Drive each Mesh & System section twice: once over live MeshFacts and once
+        // over the unseen default (every fact absent). Both must tessellate real
+        // geometry — the live data OR the honest "unknown" / "reading…" note, never a
+        // blank (§7). The wide side-by-side Network layout is exercised at 1440px.
+        let live = MeshFacts::project(&mesh_snapshot("this-node", "this-node"));
+        for section in [
+            SettingsSection::Identity,
+            SettingsSection::Role,
+            SettingsSection::Pairing,
+            SettingsSection::Network,
+        ] {
+            for mesh in [live.clone(), MeshFacts::default()] {
+                let mut st = SystemState {
+                    nav: SettingsNav::at(section),
+                    mesh,
+                    ..SystemState::default()
+                };
+                let mut inst = InstancesState::default();
+                assert!(
+                    renders_at(&mut st, &mut inst, 1440.0),
+                    "the Mesh & System {} pane drew nothing",
+                    section.label()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pairing_section_retry_rearms_the_agent_seam() {
+        // The Pairing section's Retry drives the SAME sync_pairing_agent seam: it
+        // clears the once-per-visit latch and re-attempts. On the headless farm host
+        // there's no adapter, so the re-attempt is an honest no-op (nothing to pair) —
+        // never a bus error, never a fabricated agent (§7). Asserting the latch was
+        // re-armed proves the section's action reached the seam.
+        let mut st = SystemState {
+            agent_attempted: true,
+            ..SystemState::default()
+        };
+        let mut inst = InstancesState::default();
+        st.apply(vec![SysAction::PairingRetry], &mut inst);
+        assert!(st.agent.is_none(), "no adapter ⇒ no agent registered");
+        assert!(
+            !st.agent_attempted,
+            "Retry re-armed the once-per-visit latch on the pairing seam"
         );
     }
 }
