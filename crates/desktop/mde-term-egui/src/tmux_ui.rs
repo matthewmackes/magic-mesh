@@ -49,6 +49,7 @@
 //! (and the tagged replies) reconcile the model — never a direct tree edit.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mde_egui::egui::{
@@ -57,6 +58,9 @@ use mde_egui::egui::{
 };
 use mde_egui::Style;
 
+use crate::mesh_tmux::MeshControlChannel;
+use crate::remote::PtyBus;
+use crate::roster::{RosterClient, RosterSnapshot};
 use crate::splits::{self, NodePath, SplitDir};
 use crate::tmux::{
     commands, resize_for_divider, CommandSink, LayoutDir, ResizeDir, SessionInfo, Status,
@@ -64,6 +68,12 @@ use crate::tmux::{
     TmuxWindow,
 };
 use crate::widget::TerminalWidget;
+
+/// The default grid a mesh control channel dials at, before the mounted view's
+/// `refresh-client -C` sizes it to the real on-screen rect (TMUX-FC-6).
+const MESH_DIAL_COLS: u16 = 80;
+/// See [`MESH_DIAL_COLS`].
+const MESH_DIAL_ROWS: u16 = 24;
 
 /// The pointer slop either side of a divider strip that still grabs it.
 const DIVIDER_HIT_SLOP: f32 = 3.0;
@@ -243,6 +253,8 @@ pub enum TmuxMenuChoice {
     ShowPalette,
     /// Open the TMUX-FC-5 templates ("projects") window.
     ShowTemplates,
+    /// Open the TMUX-FC-6 mesh peer picker (attach tmux on a node).
+    ShowMesh,
     /// Detach the control client.
     Detach,
     /// Show/hide the sidebar tree.
@@ -390,6 +402,10 @@ struct ChromeUi {
     templates_open: bool,
     /// The in-progress template editor, if any (TMUX-FC-5).
     tpl_edit: Option<TemplateEdit>,
+    /// Whether the TMUX-FC-6 mesh peer picker is open.
+    mesh_open: bool,
+    /// The manual-host buffer in the mesh picker (a node not on the roster).
+    mesh_host: String,
 }
 
 impl ChromeUi {
@@ -435,6 +451,10 @@ pub struct TmuxChrome {
     state: crate::TmuxState,
     /// Whether the first-frame auto-reattach (TMUX-FC-5) has run yet.
     booted: bool,
+    /// TMUX-FC-6 — the mesh peer roster source (reachable nodes to attach on).
+    roster: Option<Arc<dyn RosterClient>>,
+    /// TMUX-FC-6 — the Bus PTY-broker seam a mesh attach dials `tmux -CC` over.
+    bus: Option<Arc<dyn PtyBus>>,
 }
 
 impl TmuxChrome {
@@ -449,6 +469,8 @@ impl TmuxChrome {
         Self {
             store,
             state,
+            roster: Some(Arc::new(crate::roster::BusRoster::from_env())),
+            bus: Some(Arc::new(crate::remote::BusPtyClient::from_env())),
             ..Self::default()
         }
     }
@@ -528,6 +550,34 @@ impl TmuxChrome {
         }
     }
 
+    /// TMUX-FC-6 — dial `tmux -CC` on a mesh peer over the Bus PTY broker and
+    /// drive it with this same chrome. The controller/model/tree are
+    /// transport-agnostic ([`crate::tmux::ControlLink`]), so the sidebar, tabs,
+    /// panes, status bar, toolbar, and palette all control the remote session
+    /// exactly as a local one; the FC-2 all-sessions picker then enumerates the
+    /// peer's sessions (`list-sessions` round-trips over the broker). Replaces any
+    /// current controller — one active session at a time. A blank host, or no Bus
+    /// resolved, is honestly a no-op (§7 — never a fabricated remote attach).
+    fn attach_peer(&mut self, host: &str) {
+        let host = host.trim();
+        let Some(bus) = self.bus.clone() else {
+            return;
+        };
+        if host.is_empty() {
+            return;
+        }
+        let channel = MeshControlChannel::dial(bus, host, "main", MESH_DIAL_COLS, MESH_DIAL_ROWS);
+        self.controller = Some(TmuxController::over(Box::new(channel)));
+        self.ui.tree_open = true;
+        self.ui.mesh_open = false;
+    }
+
+    /// The reachable-peer roster for the FC-6 picker (empty when no roster is
+    /// published — the picker then leans on manual host entry).
+    fn mesh_roster(&self) -> Option<RosterSnapshot> {
+        self.roster.as_ref().and_then(|r| r.snapshot())
+    }
+
     /// Persist the edited template (append or replace by name) — the editor's
     /// Save. A blank name is ignored (§7 — no nameless template).
     fn save_template(&mut self, edit: &TemplateEdit) {
@@ -603,6 +653,7 @@ impl TmuxChrome {
                 self.ui.open_palette();
             }
             Some(TmuxMenuChoice::ShowTemplates) => self.ui.templates_open = true,
+            Some(TmuxMenuChoice::ShowMesh) => self.ui.mesh_open = true,
             Some(TmuxMenuChoice::Detach) => {
                 if let Some(ctrl) = self.controller.as_ref() {
                     let _ = ctrl.send(&commands::detach_client());
@@ -750,6 +801,15 @@ impl TmuxChrome {
                 }
                 Some(EditorAction::Cancel) => {}
                 None => self.ui.tpl_edit = Some(edit),
+            }
+        }
+        // TMUX-FC-6 — the mesh peer picker (attach tmux on any node).
+        if self.ui.mesh_open {
+            let roster = self.mesh_roster();
+            match render_mesh_picker(ui, roster.as_ref(), &mut self.ui.mesh_host) {
+                Some(MeshAction::Attach(host)) => self.attach_peer(&host),
+                Some(MeshAction::Close) => self.ui.mesh_open = false,
+                None => {}
             }
         }
     }
@@ -1710,6 +1770,17 @@ fn toolbar(ui: &mut Ui, model: &TmuxModel, state: &mut ChromeUi, intents: &mut V
         }
         if ui
             .add(Button::new(
+                RichText::new("Mesh\u{2026}")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            ))
+            .on_hover_text("Attach tmux on a mesh node (TMUX-FC-6)")
+            .clicked()
+        {
+            state.mesh_open = true;
+        }
+        if ui
+            .add(Button::new(
                 RichText::new(if state.tree_open {
                     "Tree \u{25C0}"
                 } else {
@@ -2451,6 +2522,107 @@ fn render_template_editor(ui: &Ui, edit: &mut TemplateEdit) -> Option<EditorActi
                     action = Some(EditorAction::Cancel);
                 }
             });
+        });
+    action
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TMUX-FC-6 — the mesh peer picker.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One action the mesh peer picker raises this frame.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum MeshAction {
+    /// Attach `tmux -CC` on this host (a roster peer or a typed one).
+    Attach(String),
+    /// Close the picker.
+    Close,
+}
+
+/// The mesh peer picker (TMUX-FC-6): the reachable roster peers (a pick dials
+/// `tmux -CC` on that node over the Bus broker) + a manual host field for a node
+/// not on the roster + an honest empty/solo caption. The picked session is the
+/// same chrome, driven over the mesh transport.
+fn render_mesh_picker(
+    ui: &Ui,
+    roster: Option<&RosterSnapshot>,
+    manual: &mut String,
+) -> Option<MeshAction> {
+    let mut action = None;
+    egui::Window::new("tmux on a mesh node")
+        .collapsible(false)
+        .resizable(true)
+        .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.label(
+                RichText::new("Attach tmux on\u{2026}")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM)
+                    .strong(),
+            );
+            ui.add_space(Style::SP_XS);
+
+            let reachable: Vec<_> = roster
+                .map(|snap| {
+                    snap.peers
+                        .iter()
+                        .filter(|p| p.is_reachable())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if reachable.is_empty() {
+                ui.label(
+                    RichText::new("No mesh peers online")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+            }
+            ScrollArea::vertical()
+                .max_height(Style::SP_XL * 7.0)
+                .show(ui, |ui| {
+                    for peer in reachable {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(peer.display.as_str())
+                                    .size(Style::BODY)
+                                    .color(Style::TEXT),
+                            );
+                            ui.label(
+                                RichText::new(peer.presence.label())
+                                    .size(Style::SMALL)
+                                    .color(Style::OK),
+                            );
+                            if ui.button("Attach").clicked() {
+                                action = Some(MeshAction::Attach(peer.host.clone()));
+                            }
+                        });
+                    }
+                });
+
+            ui.add_space(Style::SP_S);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Host")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                let resp = ui.add(
+                    egui::TextEdit::singleline(manual)
+                        .hint_text("node name")
+                        .desired_width(Style::SP_XL * 5.0),
+                );
+                let submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.button("Attach\u{2026}").clicked() || submit) && !manual.trim().is_empty() {
+                    action = Some(MeshAction::Attach(manual.trim().to_owned()));
+                    manual.clear();
+                }
+            });
+
+            ui.add_space(Style::SP_XS);
+            if ui.button("Close").clicked() {
+                action = Some(MeshAction::Close);
+            }
         });
     action
 }
@@ -3346,5 +3518,72 @@ mod tests {
         let _ = std::process::Command::new("tmux")
             .args(["kill-session", "-t", &crate::session_safe(&name)])
             .output();
+    }
+
+    // ── TMUX-FC-6: the mesh peer picker + attach wiring ──────────────────────
+
+    use crate::remote::test_support::FakeBus;
+    use crate::roster::{PeerEntry, Presence};
+
+    fn peer(host: &str, presence: Presence) -> PeerEntry {
+        PeerEntry {
+            host: host.to_owned(),
+            display: host.to_owned(),
+            presence,
+        }
+    }
+
+    #[test]
+    fn the_mesh_picker_renders_reachable_peers_and_the_empty_state() {
+        let snap = RosterSnapshot {
+            self_host: "here".to_owned(),
+            peers: vec![
+                peer("oak", Presence::Online),
+                peer("cedar", Presence::Offline),
+            ],
+        };
+        let mut manual = String::new();
+        let prims = headless(|ui| {
+            let _ = render_mesh_picker(ui, Some(&snap), &mut manual);
+        });
+        assert!(prims > 0, "the mesh picker did not tessellate");
+        // With no roster it still renders (the manual-host + empty caption path).
+        let prims = headless(|ui| {
+            let _ = render_mesh_picker(ui, None, &mut manual);
+        });
+        assert!(prims > 0, "the empty mesh picker did not tessellate");
+    }
+
+    #[test]
+    fn the_menu_opens_the_mesh_picker() {
+        let store = TmuxStateStore::with_path(None);
+        let mut chrome = TmuxChrome::with_store(store, TmuxState::default());
+        assert!(!chrome.ui.mesh_open);
+        chrome.apply_menu(Some(TmuxMenuChoice::ShowMesh));
+        assert!(chrome.ui.mesh_open, "the menu opens the mesh peer picker");
+    }
+
+    #[test]
+    fn attach_peer_dials_the_broker_and_drives_the_same_chrome() {
+        // A mesh attach dials `tmux -CC` on the peer over the (fake) Bus broker and
+        // makes the chrome active — the same controller/model a local session uses.
+        let bus = FakeBus::new();
+        let store = TmuxStateStore::with_path(None);
+        let mut chrome = TmuxChrome::with_store(store, TmuxState::default());
+        chrome.bus = Some(Arc::new(bus.clone()));
+        chrome.attach_peer("oak");
+        assert!(chrome.is_active(), "a mesh attach makes the chrome active");
+        assert!(chrome.tree_open(), "and reveals the tree");
+        // The worker opened the peer shell + exec'd control mode over the broker.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while bus.verb_count("open") == 0 {
+            assert!(std::time::Instant::now() < deadline, "no open verb");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(bus.published().iter().all(|p| p.peer == "oak"));
+        // A blank host is honestly a no-op (no second controller churn).
+        chrome.attach_peer("   ");
+        assert!(chrome.is_active());
+        drop(chrome); // joins the mesh worker
     }
 }

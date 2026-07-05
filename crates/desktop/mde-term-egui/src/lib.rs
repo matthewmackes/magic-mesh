@@ -165,6 +165,7 @@ pub mod layout;
 pub mod layout_ui;
 pub mod menu;
 pub mod menubar;
+pub mod mesh_tmux;
 pub mod mouse;
 pub mod notify;
 pub mod palette;
@@ -199,6 +200,7 @@ pub use menu::{
     ACTION_CHAT_SEND,
 };
 pub use menubar::{BellMode, Gate, MenuAction, MenuBar, MenuContext};
+pub use mesh_tmux::{attach_command, MeshControlChannel};
 pub use mouse::{encode_sgr, MouseButton, MouseEvent};
 pub use notify::{BusNotifyClient, NoticeLevel, NotifyBus, TermNotice, TOAST_TOPIC};
 pub use palette::Palette;
@@ -222,8 +224,8 @@ pub use tabs::{consume_tab_commands, sudo_argv, RemoteHub, TabCommand, TabbedTer
 pub use title::PaneTitle;
 pub use tmux::{
     commands as tmux_commands, parse_layout, parse_pane_titles, parse_session_list,
-    parse_window_order, resize_for_divider, CommandSink, ControlChannel, Layout, LayoutDir,
-    LayoutError, LayoutKind, Notification, PaneResize, Parser as TmuxParser, ResizeDir,
+    parse_window_order, resize_for_divider, CommandSink, ControlChannel, ControlLink, Layout,
+    LayoutDir, LayoutError, LayoutKind, Notification, PaneResize, Parser as TmuxParser, ResizeDir,
     SessionInfo, Status as TmuxStatus, StockLayout, TmuxController, TmuxLaunch, TmuxModel,
     TmuxPane, TmuxPaneIo, TmuxSession, TmuxWindow,
 };

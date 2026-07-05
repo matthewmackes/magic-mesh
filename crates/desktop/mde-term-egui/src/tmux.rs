@@ -306,6 +306,44 @@ impl ControlChannel {
     }
 }
 
+/// The transport a [`TmuxController`] drives control mode over.
+///
+/// A **local** `tmux -CC` PTY ([`ControlChannel`]) or a **mesh** peer's tmux over
+/// the Bus PTY broker ([`crate::mesh_tmux::MeshControlChannel`], TMUX-FC-6).
+/// Both present the same byte-in/byte-out surface (raw control-protocol chunks
+/// out, command lines in, an honest closed flag), so the controller, the model
+/// reconcile, and the whole FC-2/3/4/5 chrome drive a remote session with the
+/// exact code that drives a local one (§6 — one control-mode core, two
+/// transports). Object-safe (all `&self`) so the controller holds a boxed one.
+pub trait ControlLink: Send {
+    /// The next raw output chunk, or `None` when none is queued yet.
+    fn try_recv(&self) -> Option<Vec<u8>>;
+    /// `true` once the control stream has ended (client exit / transport drop).
+    fn is_closed(&self) -> bool;
+    /// Write one control-mode command line (a trailing `\n` is added).
+    ///
+    /// # Errors
+    /// [`ErrorKind::BrokenPipe`] once the write side is gone.
+    fn send_line(&self, command: &str) -> std::io::Result<()>;
+    /// A cloneable write handle (a mounted pane's `send-keys` route).
+    fn sink(&self) -> CommandSink;
+}
+
+impl ControlLink for ControlChannel {
+    fn try_recv(&self) -> Option<Vec<u8>> {
+        Self::try_recv(self)
+    }
+    fn is_closed(&self) -> bool {
+        Self::is_closed(self)
+    }
+    fn send_line(&self, command: &str) -> std::io::Result<()> {
+        Self::send_line(self, command)
+    }
+    fn sink(&self) -> CommandSink {
+        Self::sink(self)
+    }
+}
+
 /// A cloneable write-side handle onto a [`ControlChannel`].
 ///
 /// One command line per call, honestly [`CommandSink::is_closed`] once the
@@ -334,6 +372,14 @@ impl CommandSink {
     #[must_use]
     pub fn is_closed(&self) -> bool {
         lock_unpoisoned(&self.input_tx).is_none()
+    }
+
+    /// Build a sink over a shared input queue — the seam
+    /// [`crate::mesh_tmux::MeshControlChannel`] hands out so a remote pane's
+    /// `send-keys` rides the same queue its poll thread drains to Bus write verbs.
+    #[must_use]
+    pub(crate) const fn from_input(input_tx: Arc<Mutex<Option<Sender<Vec<u8>>>>>) -> Self {
+        Self { input_tx }
     }
 
     /// A sink wired to a raw queue instead of a live channel — the test seam
@@ -2170,7 +2216,7 @@ pub enum Status {
 /// A live tmux control-mode connection: the [`ControlChannel`] + the [`Parser`]
 /// + the [`TmuxModel`] it reconciles, plus an honest [`Status`].
 pub struct TmuxController {
-    channel: Option<ControlChannel>,
+    channel: Option<Box<dyn ControlLink>>,
     parser: Parser,
     model: TmuxModel,
     status: Status,
@@ -2186,13 +2232,7 @@ impl TmuxController {
     #[must_use]
     pub fn connect(launch: &TmuxLaunch) -> Self {
         match ControlChannel::spawn(launch) {
-            Ok(channel) => Self {
-                channel: Some(channel),
-                parser: Parser::new(),
-                model: TmuxModel::new(),
-                status: Status::Connecting,
-                all_sessions: Vec::new(),
-            },
+            Ok(channel) => Self::over(Box::new(channel)),
             Err(err) => Self {
                 channel: None,
                 parser: Parser::new(),
@@ -2200,6 +2240,19 @@ impl TmuxController {
                 status: Status::Error(format!("could not start tmux -CC: {err}")),
                 all_sessions: Vec::new(),
             },
+        }
+    }
+
+    /// Drive control mode over an already-built transport (a local
+    /// [`ControlChannel`] or the TMUX-FC-6 [`crate::mesh_tmux::MeshControlChannel`]).
+    #[must_use]
+    pub fn over(channel: Box<dyn ControlLink>) -> Self {
+        Self {
+            channel: Some(channel),
+            parser: Parser::new(),
+            model: TmuxModel::new(),
+            status: Status::Connecting,
+            all_sessions: Vec::new(),
         }
     }
 
@@ -2324,7 +2377,7 @@ impl TmuxController {
     /// pane's [`TmuxPaneIo`] holds. `None` when no channel ever connected.
     #[must_use]
     pub fn sink(&self) -> Option<CommandSink> {
-        self.channel.as_ref().map(ControlChannel::sink)
+        self.channel.as_ref().map(|c| c.sink())
     }
 
     /// Every session on the server (attached + detached) from the last

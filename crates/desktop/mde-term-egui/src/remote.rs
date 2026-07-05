@@ -143,6 +143,40 @@ impl ClientVerb {
     }
 }
 
+// ── verb builders for the TMUX-FC-6 control-mode-over-broker transport ────────
+// The mesh tmux channel ([`crate::mesh_tmux`]) opens a peer shell, `exec`s
+// `tmux -CC`, and feeds its control stream through the broker. It builds the
+// same `action/pty/<peer>` verbs a remote pane does — sourced here so the wire
+// shape stays single-homed (cross-checked against the worker in tests).
+
+/// The `open` request body for a brokered session `id` at an initial grid.
+#[must_use]
+pub fn verb_open(id: &str, cols: u16, rows: u16) -> String {
+    ClientVerb::Open {
+        id: id.to_owned(),
+        cols,
+        rows,
+    }
+    .body()
+}
+
+/// The `write` request body feeding base64-encoded `bytes` to session `id`.
+#[must_use]
+pub fn verb_write(id: &str, bytes: &[u8]) -> String {
+    ClientVerb::Write {
+        id: id.to_owned(),
+        data: B64.encode(bytes),
+    }
+    .body()
+}
+
+/// The `close` request body tearing session `id` down (the control client dies;
+/// the peer's tmux sessions outlive it — design lock #6).
+#[must_use]
+pub fn verb_close(id: &str) -> String {
+    ClientVerb::Close { id: id.to_owned() }.body()
+}
+
 // ── the published state record (mirror of the worker's `PtyState`) ───────────
 
 /// One record on the `state/pty/<id>` append log — a local mirror of the worker's
