@@ -30,6 +30,7 @@
 //! service (both inward edges), pulling in no mesh-substrate crate.
 
 pub mod fleet;
+pub mod menubar;
 pub mod model;
 
 mod view;
@@ -43,9 +44,11 @@ use mde_egui::egui::{self, Context};
 use mde_voice_hud::sip::SipAccount;
 
 use crate::fleet::FleetState;
+use crate::menubar::MenuBarState;
 use crate::model::{Command, Tab, Update, VoiceState};
 
-pub use view::{header as voice_header, voice_panel};
+pub use menubar::voice_menubar;
+pub use view::voice_panel;
 
 /// The voice surface: the view-model, the dial buffer, and the channel to its
 /// worker threads.
@@ -70,6 +73,9 @@ pub struct VoiceApp {
     /// Bus + the shared-account config, with the provision/inbound/nickname
     /// verbs. Its own Bus handle (read `state/voice/*`, publish `action/voice/*`).
     fleet: FleetState,
+    /// The MENUBAR-ALL top-bar state (only the shortcuts-reference toggle; every
+    /// other menu item reads/drives the fields above).
+    menu: MenuBarState,
 }
 
 impl VoiceApp {
@@ -109,6 +115,7 @@ impl VoiceApp {
             registrar_backed,
             tab: Tab::default(),
             fleet: FleetState::new(),
+            menu: MenuBarState::default(),
         }
     }
 
@@ -118,8 +125,9 @@ impl VoiceApp {
     }
 }
 
-/// Drain the worker's updates into the surface state — the per-frame **state
-/// pump**. The standalone [`VoiceApp`]'s `update` calls this at the top of every
+/// Drain the worker's updates into the surface state — the per-frame **state pump**.
+///
+/// The standalone [`VoiceApp`]'s `update` calls this at the top of every
 /// frame; the E12 shell (E12-3b) calls it for the mounted surface each frame too,
 /// because the shell owns the one frame loop and never calls the surface's
 /// `App::update`. Non-blocking (`try_recv`) and a no-op when the SIP agent has
@@ -135,7 +143,11 @@ impl App for VoiceApp {
         // Drain everything the worker has sent since the last frame.
         voice_pump(self);
 
-        egui::TopBottomPanel::top("voice-header").show(ctx, |ui| view::header(ui, self));
+        // The MENUBAR-ALL shared top bar (VOICE title · menus · live status
+        // cluster) — the surface's discoverable control surface, replacing the
+        // old registration header (its identity + reg status now ride the bar's
+        // status chips, its Retry the honest File → Re-register item).
+        egui::TopBottomPanel::top("voice-menubar").show(ctx, |ui| menubar::voice_menubar(ui, self));
 
         // The central content is the shared `voice_panel` body, so the standalone
         // window and the embedded shell panel (E12-3b) render identically.

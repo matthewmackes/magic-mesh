@@ -7,60 +7,13 @@
 //! done. Status text reuses the SIP state machine's own `RegistrationState`/
 //! `CallState` labels (§6 — no re-worded copy).
 
-use mde_egui::egui::{self, Align, Color32, Layout, RichText};
+use mde_egui::egui::{self, Color32, RichText};
 use mde_egui::Style;
 
 use mde_voice_hud::sip::CallState;
 
-use crate::model::{call_tone, dial_ready, registration_tone, Command, Tab, Tone, VoiceState};
+use crate::model::{call_tone, dial_ready, Command, Tab, Tone, VoiceState};
 use crate::VoiceApp;
-
-/// The header strip rendered into `ui`: the surface title, the account identity,
-/// and the live registration status (dot + the shipped `RegistrationState` label)
-/// with a Retry affordance shown only for a **registrar-backed** failure — a
-/// registrar-less P2P node has no registrar to re-register against, so Retry there
-/// would be a dead-end.
-///
-/// This is the standalone binary's chrome, framed by [`VoiceApp`] in the window's
-/// top panel. The embedded shell (E12-3b) supplies its own chrome and renders only
-/// [`voice_panel`], so the header stays here with the standalone app rather than in
-/// the shared panel body.
-pub fn header(ui: &mut egui::Ui, app: &VoiceApp) {
-    let mut reregister = false;
-    ui.add_space(Style::SP_XS);
-    ui.horizontal(|ui| {
-        ui.add_space(Style::SP_S);
-        ui.heading(
-            RichText::new("Voice")
-                .size(Style::HEADING)
-                .color(Style::TEXT),
-        );
-        ui.add_space(Style::SP_M);
-        mde_egui::muted_note(ui, &app.identity);
-
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add_space(Style::SP_S);
-            // Re-register is meaningless for a registrar-less P2P node (no
-            // registrar to retry, and after an overlay-bind failure the agent
-            // has already exited), so Retry appears only for a registrar-backed
-            // failure — never as a dead-end button.
-            if app.registrar_backed
-                && matches!(registration_tone(&app.state.registration), Tone::Bad)
-                && ui.button("Retry").clicked()
-            {
-                reregister = true;
-            }
-            ui.add_space(Style::SP_S);
-            mde_egui::muted_note(ui, app.state.registration.label());
-            ui.add_space(Style::SP_XS);
-            mde_egui::status_dot(ui, tone_color(registration_tone(&app.state.registration)));
-        });
-    });
-    ui.add_space(Style::SP_XS);
-    if reregister {
-        app.send(Command::Reregister);
-    }
-}
 
 /// Render the Voice surface's central content into the given `ui`.
 ///
@@ -75,8 +28,9 @@ pub fn header(ui: &mut egui::Ui, app: &VoiceApp) {
 /// owns a window or is a panel inside the one shell — the EMBED model of E12
 /// "Quasar" §5 (surfaces are panels in the shell, not separate clients). It draws
 /// only through the shared [`Style`] and reuses `app`'s state (no parallel state).
-/// The registration header and the per-frame worker-update drain stay with the
-/// standalone app's chrome ([`VoiceApp`]) — the shell owns those.
+/// The MENUBAR-ALL top bar ([`crate::voice_menubar`], carrying the account
+/// identity + live registration in its status cluster) and the per-frame
+/// worker-update drain frame this body — both host paths render the bar above it.
 pub fn voice_panel(ui: &mut egui::Ui, app: &mut VoiceApp) {
     // A ringing inbound call takes precedence over tab browsing — Answer/Decline
     // is urgent and must surface whichever tab is open, so the dialer stays
@@ -240,7 +194,8 @@ const fn tone_color(tone: Tone) -> Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{header, voice_panel};
+    use super::voice_panel;
+    use crate::menubar::{voice_menubar, MenuBarState};
     use crate::model::{Command, Update, VoiceState};
     use crate::VoiceApp;
     use mde_egui::egui::{self, pos2, vec2, Rect};
@@ -250,8 +205,8 @@ mod tests {
 
     /// Build a `VoiceApp` around a given `state` with a dead command channel and no
     /// worker — the embedded case a shell would drive, minus the SIP agent. Neither
-    /// `voice_panel` nor `header` needs a live worker: `send` on a hung-up channel is
-    /// a silent no-op, and the update channel is never read here.
+    /// `voice_panel` nor the menu bar needs a live worker: `send` on a hung-up
+    /// channel is a silent no-op, and the update channel is never read here.
     fn app_with(state: VoiceState, identity: &str, registrar_backed: bool) -> VoiceApp {
         let (commands, _cmd_rx) = mpsc::channel::<Command>();
         let (_upd_tx, updates) = mpsc::channel::<Update>();
@@ -264,12 +219,13 @@ mod tests {
             registrar_backed,
             tab: crate::model::Tab::default(),
             fleet: crate::fleet::FleetState::new(),
+            menu: MenuBarState::default(),
         }
     }
 
-    /// Drive one headless egui frame that shows the header + `voice_panel`, then
-    /// tessellate the result on the CPU so any paint-path fault (bad shape/text/
-    /// geometry) surfaces as a test failure. This is the same `Context::run` →
+    /// Drive one headless egui frame that shows the shared menu bar + `voice_panel`,
+    /// then tessellate the result on the CPU so any paint-path fault (bad shape/
+    /// text/geometry) surfaces as a test failure. This is the same `Context::run` →
     /// `tessellate` path the DRM runner drives, minus the GPU — no window, no wgpu,
     /// no socket, no sound device — so the embeddable panel is proven runtime-
     /// reachable in `cargo test`.
@@ -281,7 +237,7 @@ mod tests {
             ..Default::default()
         };
         let out = ctx.run(input, |ctx| {
-            egui::TopBottomPanel::top("voice-header").show(ctx, |ui| header(ui, app));
+            egui::TopBottomPanel::top("voice-menubar").show(ctx, |ui| voice_menubar(ui, app));
             egui::CentralPanel::default().show(ctx, |ui| voice_panel(ui, app));
         });
         let prims = ctx.tessellate(out.shapes, out.pixels_per_point);

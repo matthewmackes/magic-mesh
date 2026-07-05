@@ -67,7 +67,7 @@ use mde_files_egui::{files_panel, FileBrowser};
 use mde_media_egui::{media_header, media_panel, media_pump, real_media, MediaSurface};
 use mde_music_egui::{music_header, music_panel, music_pump, MusicApp};
 use mde_term_egui::{real_terminal, terminal_panel, terminal_pump, TerminalSurface};
-use mde_voice_egui::{voice_header, voice_panel, voice_pump, VoiceApp};
+use mde_voice_egui::{voice_menubar, voice_panel, voice_pump, VoiceApp};
 
 use dock::Surface;
 // CURTAIN-3 — the logind lock-signal receive seam, so `render` can poll the
@@ -563,7 +563,7 @@ impl Shell {
                 voice_pump(&mut self.voice);
                 let voice = &mut self.voice;
                 ui.push_id("shell-voice", |ui| {
-                    voice_header(ui, voice);
+                    voice_menubar(ui, voice);
                     ui.separator();
                     voice_panel(ui, voice);
                 });
