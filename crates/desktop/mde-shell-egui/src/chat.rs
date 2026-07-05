@@ -27,7 +27,7 @@
 //! [`Delivery`]).
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -265,6 +265,11 @@ impl PresenceChoice {
 /// The Chat surface state: the last roster + each contact's merged conversation
 /// (rebuilt from the latest-wins Bus mirrors each poll), the selected contact,
 /// the composer draft, and the per-contact read watermark for unread counts.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the three MENU-2 feed-filter bands + Unread Only + the status-editor \
+              toggle are independent view flags, not a state machine"
+)]
 pub(crate) struct ChatState {
     bus_root: Option<PathBuf>,
     /// The latest roster the worker published, if any.
@@ -297,6 +302,16 @@ pub(crate) struct ChatState {
     /// host first seen is watermarked at its current length so pre-existing
     /// backfilled history isn't flagged unread (unread = new since you looked).
     seen: BTreeMap<String, usize>,
+    /// View → feed filter (MENU-2): show folded system alerts in the timeline.
+    show_alerts: bool,
+    /// View → feed filter: show clipboard clips in the timeline.
+    show_clips: bool,
+    /// View → feed filter: show human messages (text / files / call + remote
+    /// records) in the timeline.
+    show_messages: bool,
+    /// View → Unread Only (MENU-2): the roster rail lists only conversations
+    /// carrying unread (self + the open one stay visible).
+    unread_only: bool,
     last_poll: Option<Instant>,
 }
 
@@ -316,6 +331,10 @@ impl Default for ChatState {
             new_room: String::new(),
             attach_path: String::new(),
             seen: BTreeMap::new(),
+            show_alerts: true,
+            show_clips: true,
+            show_messages: true,
+            unread_only: false,
             last_poll: None,
         }
     }
@@ -424,12 +443,14 @@ impl ChatState {
     /// Render the ICQ surface: the roster rail on the left, the selected
     /// contact's conversation pane filling the rest.
     pub(crate) fn show(&mut self, ui: &mut egui::Ui) {
-        // MENUBAR-ALL — the shared top bar (CHAT), above the roster + pane. Its menus
-        // are mouse twins of the surface's own seams (§6): **Conversation** mutes /
-        // closes the open thread, **Presence** sets this seat's presence + opens the
-        // status editor — the SAME `action/chat/*` publishes + local toggles the panel
-        // drives. Rendered before the no-roster early-return so the bar is always
-        // present (its Presence menu honestly omits itself until a roster lands, §7).
+        // MENU-2 — the shared top bar, titled **Contacts** (the operator's name
+        // for the roster workspace), above the roster + pane. Its menus drive the
+        // surface's own seams (§6): **Contacts** opens a 1:1 / marks read / mutes
+        // (real roster ops only), **View** holds the feed filters, **Chat** sends
+        // the draft + clears unread, **Presence** posts this seat's presence, and
+        // **Help** carries the honest surface identity. Rendered before the
+        // no-roster early-return so the bar is always present (its Presence menu
+        // honestly omits itself until a roster lands, §7).
         if let Some(action) = menubar::show(self, ui) {
             menubar::apply(self, action);
         }
@@ -556,9 +577,21 @@ impl ChatState {
         ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                self.roster_group(ui, roster, "Online", &roster.online());
+                // View → Unread Only (MENU-2) prunes the groups to the
+                // conversations that need attention (self + the open one stay).
+                let online: Vec<&Contact> = roster
+                    .online()
+                    .into_iter()
+                    .filter(|c| self.roster_shows(roster, c))
+                    .collect();
+                let offline: Vec<&Contact> = roster
+                    .offline()
+                    .into_iter()
+                    .filter(|c| self.roster_shows(roster, c))
+                    .collect();
+                self.roster_group(ui, roster, "Online", &online);
                 ui.add_space(Style::SP_S);
-                self.roster_group(ui, roster, "Offline", &roster.offline());
+                self.roster_group(ui, roster, "Offline", &offline);
                 ui.add_space(Style::SP_S);
                 self.rooms_group(ui);
             });
@@ -573,19 +606,21 @@ impl ChatState {
         if self.rooms.is_empty() {
             return;
         }
+        // System rooms first (the always-present fleet bands), then ad-hoc —
+        // pruned to the unread ones under View → Unread Only (MENU-2).
+        let ids: Vec<(String, String, RoomKind)> = self
+            .rooms
+            .iter()
+            .filter(|d| self.room_shows(&d.id))
+            .map(|d| (d.id.clone(), d.name.clone(), d.kind))
+            .collect();
         ui.label(
-            RichText::new(format!("ROOMS ({})", self.rooms.len()))
+            RichText::new(format!("ROOMS ({})", ids.len()))
                 .color(Style::TEXT_DIM)
                 .size(Style::SMALL)
                 .strong(),
         );
         ui.add_space(Style::SP_XS);
-        // System rooms first (the always-present fleet bands), then ad-hoc.
-        let ids: Vec<(String, String, RoomKind)> = self
-            .rooms
-            .iter()
-            .map(|d| (d.id.clone(), d.name.clone(), d.kind))
-            .collect();
         for (id, name, kind) in ids {
             self.room_row(ui, &id, &name, kind);
         }
@@ -773,13 +808,22 @@ impl ChatState {
             .stick_to_bottom(true)
             .show(ui, |ui| match self.convos.get(host) {
                 Some(conv) if !conv.is_empty() => {
-                    render_timeline(
-                        ui,
-                        conv.messages(),
-                        self_host,
-                        recipient,
-                        bus_root.as_deref(),
-                    );
+                    // View → feed filters (MENU-2): prune by kind before render.
+                    let shown: Vec<&Message> = conv
+                        .messages()
+                        .iter()
+                        .filter(|m| self.feed_shows(&m.kind))
+                        .collect();
+                    if shown.is_empty() {
+                        crate::session::empty_state(
+                            ui,
+                            "All messages filtered",
+                            "Everything in this timeline is hidden by the View feed filters — \
+                             re-enable Alerts / Clipboard Clips / Messages to see it.",
+                        );
+                    } else {
+                        render_timeline(ui, &shown, self_host, recipient, bus_root.as_deref());
+                    }
                 }
                 _ => {
                     let subtitle = if is_self {
@@ -967,10 +1011,25 @@ impl ChatState {
             .stick_to_bottom(true)
             .show(ui, |ui| match self.room_convos.get(id) {
                 Some(conv) if !conv.is_empty() => {
-                    // A room has no single recipient presence — pass None so my
+                    // View → feed filters (MENU-2) prune the shared log too. A
+                    // room has no single recipient presence — pass None so my
                     // outgoing line reads a neutral "Sent" (the honest room state;
                     // per-member delivery is the worker's fan-out, lock 22).
-                    render_timeline(ui, conv.messages(), &self_host, None, bus_root.as_deref());
+                    let shown: Vec<&Message> = conv
+                        .messages()
+                        .iter()
+                        .filter(|m| self.feed_shows(&m.kind))
+                        .collect();
+                    if shown.is_empty() {
+                        crate::session::empty_state(
+                            ui,
+                            "All messages filtered",
+                            "Everything in this room's log is hidden by the View feed filters — \
+                             re-enable Alerts / Clipboard Clips / Messages to see it.",
+                        );
+                    } else {
+                        render_timeline(ui, &shown, &self_host, None, bus_root.as_deref());
+                    }
                 }
                 _ => {
                     crate::session::empty_state(
@@ -1051,6 +1110,41 @@ impl ChatState {
         publish(self.bus_root.as_deref(), ACTION_CHAT_PRESENCE, &body);
     }
 
+    /// Whether the View feed filters admit a message of `kind` (MENU-2). The
+    /// three bands mirror the notification model: folded **alerts**, clipboard
+    /// **clips**, and everything human-authored (**messages** — text, file
+    /// offers, call/remote records). A pure view choice — never a data mutation.
+    const fn feed_shows(&self, kind: &MessageKind) -> bool {
+        match kind {
+            MessageKind::Alert { .. } => self.show_alerts,
+            MessageKind::Clipboard { .. } => self.show_clips,
+            _ => self.show_messages,
+        }
+    }
+
+    /// Whether the roster rail lists `contact` under View → Unread Only: self
+    /// stays pinned, the open conversation stays visible (opening a pane
+    /// watermarks it read, so it would otherwise vanish mid-read), everything
+    /// else needs unread.
+    fn roster_shows(&self, roster: &Roster, contact: &Contact) -> bool {
+        if !self.unread_only || roster.is_self(&contact.host) {
+            return true;
+        }
+        if self.selected == Some(Selection::Contact(contact.host.clone())) {
+            return true;
+        }
+        self.unread(&contact.host) > 0
+    }
+
+    /// Whether the roster rail lists room `id` under View → Unread Only (same
+    /// rule as [`Self::roster_shows`]: the open room stays visible).
+    fn room_shows(&self, id: &str) -> bool {
+        if !self.unread_only || self.selected == Some(Selection::Room(id.to_string())) {
+            return true;
+        }
+        self.room_unread(id) > 0
+    }
+
     /// Whether contact `host` is muted per the worker's published policy (a
     /// missing mirror — a fresh solo host — reads as not-muted).
     fn is_contact_muted(&self, host: &str) -> bool {
@@ -1065,20 +1159,32 @@ impl ChatState {
     }
 }
 
-/// MENUBAR-ALL (Chat) — the shared top bar over the ICQ surface.
+/// MENU-2 (Contacts) — the shared top bar over the ICQ roster workspace.
 ///
-/// Every item is the mouse twin of a seam the surface already drives (§6, one
-/// publish/toggle path): **Conversation → Mute** flips the open thread's
-/// `action/chat/mute` policy (the row context-menu's seam), **Close** deselects it;
-/// **Presence** posts this seat's `action/chat/presence` (the self-line picker's
-/// seam) and **Edit Status…** opens the same inline editor the self-line ✎ does.
-/// A context-gated item (Mute/Close with nothing selected) renders **disabled**, and
-/// the whole Presence menu is **omitted** until a roster (a self contact) exists —
-/// never a dead entry (§7). The File/Edit/Help spine has no chat seam, so it is
-/// honestly absent. The status cluster shows this seat's live presence + the
-/// whole-mesh unread tally.
+/// Titled **Contacts** (the operator's name for the surface — the roster IS the
+/// workspace). Every item drives a seam the surface already owns (§6, one
+/// publish/toggle path):
+///
+/// * **Contacts** — the real roster ops only: *Open 1:1* (one entry per peer
+///   contact, the pane-open seam), *Mark Read* (one entry per unread
+///   conversation — the same watermark the pane writes on open), and
+///   *Mute Contact / Room* (`action/chat/mute`, the row toggle's publish).
+/// * **View** — the feed filters (Alerts / Clipboard Clips / Messages) pruning
+///   the open timeline by kind, and *Unread Only* pruning the roster rail.
+/// * **Chat** — *Send Message* (the composer's `action/chat/send` on the open
+///   conversation), *Clear Unread* (watermark everything read), *Close
+///   Conversation* (deselect).
+/// * **Presence** — this seat's `action/chat/presence` (the self-line picker's
+///   seam) + *Edit Status…* (the ✎ editor). Omitted until a roster exists.
+/// * **Help** — the honest surface identity + the delivery-semantics truth
+///   (captions, never a dead activatable entry — §7/§8).
+///
+/// A context-gated item (Mute / Send / Close with nothing applicable) renders
+/// **disabled**; an absent seam is omitted or captioned — never a dead entry
+/// (§7). The status cluster shows this seat's live presence, the contacts
+/// online, and the whole-mesh unread tally (MENU-2 chips).
 mod menubar {
-    use super::{ChatState, PresenceChoice, Selection};
+    use super::{ChatState, Contact, Conversation, PresenceChoice, Selection};
     use mde_egui::egui::Ui;
     use mde_egui::menubar::{Entry, Item, Menu, MenuBar, MenuBarModel};
     use mde_egui::{ChipTone, StatusChip, Style};
@@ -1086,27 +1192,45 @@ mod menubar {
     /// A filled status dot — the same glyph the roster rows use.
     const DOT: &str = "\u{25CF}";
 
-    /// One menu action — each routes to a real Chat seam in [`apply`].
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    /// One menu action — each routes to a real Chat/roster seam in [`apply`].
+    /// Carries owned targets (a host / room id), so `Clone`, not `Copy`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub(super) enum MenuAction {
+        /// Open a peer contact's 1:1 conversation pane (the roster row's seam).
+        OpenContact(String),
+        /// Watermark one conversation read (the same seam opening its pane uses).
+        MarkRead(Selection),
         /// Toggle the selected conversation's mute policy (`action/chat/mute`).
         MuteConversation,
         /// Deselect the open conversation (local nav).
         CloseConversation,
+        /// Toggle the Alerts feed filter (View).
+        ToggleAlerts,
+        /// Toggle the Clipboard-Clips feed filter (View).
+        ToggleClips,
+        /// Toggle the Messages feed filter (View).
+        ToggleMessages,
+        /// Toggle the Unread-Only roster filter (View).
+        ToggleUnreadOnly,
+        /// Send the composer draft to the open conversation (`action/chat/send`).
+        SendDraft,
+        /// Watermark every contact + room read (the whole-mesh clear).
+        ClearUnread,
         /// Set this seat's presence (`action/chat/presence`).
         SetPresence(PresenceChoice),
         /// Open the inline self-status editor (the self-line ✎ seam).
         EditStatus,
     }
 
-    /// Render the CHAT bar and return the action picked this frame, if any.
+    /// Render the CONTACTS bar and return the action picked this frame, if any.
     pub(super) fn show(state: &ChatState, ui: &mut Ui) -> Option<MenuAction> {
         let menus = build_menus(state);
         let status = build_status(state);
         let model = MenuBarModel {
-            // The dock groups Chat under **Comms** (cyan), so the title wears that
-            // categorical accent (lock 2).
-            title: "Chat",
+            // The dock groups this surface under **Comms** (cyan), so the title
+            // wears that categorical accent (lock 2). "Contacts" is the operator
+            // retitle (MENU-2) — the roster is the workspace.
+            title: "Contacts",
             accent: Style::ACCENT_COMMS,
             menus: &menus,
             status: &status,
@@ -1130,44 +1254,209 @@ mod menubar {
         }
     }
 
-    /// Build the menus from live state: Conversation (always present, its items
-    /// gated on a selection), and Presence (present only once a roster exists).
-    fn build_menus(state: &ChatState) -> Vec<Menu<MenuAction>> {
-        let mut menus = Vec::new();
+    /// Whether Chat → Send Message can fire: a non-empty draft addressed at an
+    /// open peer conversation or room. The self-contact's alert timeline has no
+    /// composer (lock 17), so it never sends.
+    fn can_send(state: &ChatState) -> bool {
+        if state.draft.trim().is_empty() {
+            return false;
+        }
+        match (&state.selected, state.roster.as_ref()) {
+            (Some(Selection::Contact(host)), Some(roster)) => !roster.is_self(host),
+            (Some(Selection::Room(id)), _) => state.room_descriptor(id).is_some(),
+            _ => false,
+        }
+    }
 
+    /// Build the bar from live state: Contacts / View / Chat always present
+    /// (items context-gated, §7), Presence only once a roster exists, Help last.
+    fn build_menus(state: &ChatState) -> Vec<Menu<MenuAction>> {
+        let mut menus = vec![
+            build_contacts_menu(state),
+            build_view_menu(state),
+            build_chat_menu(state),
+        ];
+        if let Some(current) = current_presence(state) {
+            menus.push(build_presence_menu(state, current));
+        }
+        menus.push(build_help_menu());
+        menus
+    }
+
+    /// The **Contacts** menu — real roster ops only (MENU-2): Open 1:1 /
+    /// Mark Read submenus over the live roster, and the selected conversation's
+    /// mute toggle.
+    fn build_contacts_menu(state: &ChatState) -> Menu<MenuAction> {
         let muted = selected_muted(state);
-        let has_sel = muted.is_some();
-        menus.push(Menu::new(
-            "Conversation",
+        let mute_label = match state.selected {
+            Some(Selection::Room(_)) => "Mute Room",
+            _ => "Mute Contact",
+        };
+        Menu::new(
+            "Contacts",
             vec![
+                Entry::Submenu {
+                    label: "Open 1:1".to_owned(),
+                    mnemonic: None,
+                    entries: open_entries(state),
+                },
+                Entry::Submenu {
+                    label: "Mark Read".to_owned(),
+                    mnemonic: None,
+                    entries: mark_read_entries(state),
+                },
+                Entry::Separator,
                 Entry::Item(
-                    Item::new(MenuAction::MuteConversation, "Mute Conversation")
+                    Item::new(MenuAction::MuteConversation, mute_label)
                         .checked(muted.unwrap_or(false))
-                        .enabled(has_sel),
-                ),
-                Entry::Item(
-                    Item::new(MenuAction::CloseConversation, "Close Conversation").enabled(has_sel),
+                        .enabled(muted.is_some()),
                 ),
             ],
-        ));
+        )
+    }
 
-        if let Some(current) = current_presence(state) {
-            let mut entries: Vec<Entry<MenuAction>> = PresenceChoice::ALL
-                .iter()
-                .map(|&c| {
-                    Entry::Item(
-                        Item::new(MenuAction::SetPresence(c), c.label()).checked(c == current),
-                    )
-                })
-                .collect();
-            entries.push(Entry::Separator);
+    /// The Open-1:1 submenu body: one entry per peer contact (its host is its
+    /// username, lock 2), the open one checked; an honest caption before a
+    /// roster / with no peers (§7 — never a fabricated contact).
+    fn open_entries(state: &ChatState) -> Vec<Entry<MenuAction>> {
+        let Some(roster) = state.roster.as_ref() else {
+            return vec![Entry::Caption(
+                "No roster yet — the chat worker publishes it once this node is on the mesh Bus."
+                    .to_owned(),
+            )];
+        };
+        let mut entries = Vec::new();
+        for contact in roster.contacts() {
+            if roster.is_self(&contact.host) {
+                continue; // self has no 1:1 (lock 17 — no notes-to-self)
+            }
+            let open = state.selected == Some(Selection::Contact(contact.host.clone()));
             entries.push(Entry::Item(
-                Item::new(MenuAction::EditStatus, "Edit Status\u{2026}")
-                    .enabled(!state.editing_status),
+                Item::new(
+                    MenuAction::OpenContact(contact.host.clone()),
+                    contact.display_name(),
+                )
+                .checked(open),
             ));
-            menus.push(Menu::new("Presence", entries));
         }
-        menus
+        if entries.is_empty() {
+            entries.push(Entry::Caption(
+                "No peer contacts yet — every enrolled mesh host appears here.".to_owned(),
+            ));
+        }
+        entries
+    }
+
+    /// The Mark-Read submenu body: one entry per conversation carrying unread
+    /// (contacts, then rooms), labelled with its live count; an honest caption
+    /// when nothing is unread.
+    fn mark_read_entries(state: &ChatState) -> Vec<Entry<MenuAction>> {
+        let mut entries = Vec::new();
+        for host in state.convos.keys() {
+            let unread = state.unread(host);
+            if unread > 0 {
+                entries.push(Entry::Item(Item::new(
+                    MenuAction::MarkRead(Selection::Contact(host.clone())),
+                    format!("{host} ({unread})"),
+                )));
+            }
+        }
+        for room in &state.rooms {
+            let unread = state.room_unread(&room.id);
+            if unread > 0 {
+                entries.push(Entry::Item(Item::new(
+                    MenuAction::MarkRead(Selection::Room(room.id.clone())),
+                    format!("{} ({unread})", room.name),
+                )));
+            }
+        }
+        if entries.is_empty() {
+            entries.push(Entry::Caption("Nothing unread.".to_owned()));
+        }
+        entries
+    }
+
+    /// The **View** menu — the feed filters (timeline kinds) + Unread Only
+    /// (roster pruning), each a live checked toggle over real view state.
+    fn build_view_menu(state: &ChatState) -> Menu<MenuAction> {
+        Menu::new(
+            "View",
+            vec![
+                Entry::Caption("Feed filters".to_owned()),
+                Entry::Item(
+                    Item::new(MenuAction::ToggleAlerts, "Alerts").checked(state.show_alerts),
+                ),
+                Entry::Item(
+                    Item::new(MenuAction::ToggleClips, "Clipboard Clips").checked(state.show_clips),
+                ),
+                Entry::Item(
+                    Item::new(MenuAction::ToggleMessages, "Messages").checked(state.show_messages),
+                ),
+                Entry::Separator,
+                Entry::Item(
+                    Item::new(MenuAction::ToggleUnreadOnly, "Unread Only")
+                        .checked(state.unread_only),
+                ),
+            ],
+        )
+    }
+
+    /// The **Chat** menu — send the draft, clear all unread, close the pane.
+    fn build_chat_menu(state: &ChatState) -> Menu<MenuAction> {
+        Menu::new(
+            "Chat",
+            vec![
+                Entry::Item(
+                    Item::new(MenuAction::SendDraft, "Send Message")
+                        .shortcut("Enter")
+                        .enabled(can_send(state)),
+                ),
+                Entry::Item(
+                    Item::new(MenuAction::ClearUnread, "Clear Unread")
+                        .enabled(state.total_unread() > 0),
+                ),
+                Entry::Separator,
+                Entry::Item(
+                    Item::new(MenuAction::CloseConversation, "Close Conversation")
+                        .enabled(state.selected.is_some()),
+                ),
+            ],
+        )
+    }
+
+    /// The **Presence** menu (present only once a roster / self contact exists).
+    fn build_presence_menu(state: &ChatState, current: PresenceChoice) -> Menu<MenuAction> {
+        let mut entries: Vec<Entry<MenuAction>> = PresenceChoice::ALL
+            .iter()
+            .map(|&c| {
+                Entry::Item(Item::new(MenuAction::SetPresence(c), c.label()).checked(c == current))
+            })
+            .collect();
+        entries.push(Entry::Separator);
+        entries.push(Entry::Item(
+            Item::new(MenuAction::EditStatus, "Edit Status\u{2026}").enabled(!state.editing_status),
+        ));
+        Menu::new("Presence", entries)
+    }
+
+    /// The **Help** menu — honest identity captions (this surface has no manual
+    /// or note lane, so nothing pretends to be activatable — §8).
+    fn build_help_menu() -> Menu<MenuAction> {
+        Menu::new(
+            "Help",
+            vec![
+                Entry::Caption(
+                    "Contacts \u{2014} every mesh host is a contact; its alerts and clipboard \
+                     clips arrive as its messages."
+                        .to_owned(),
+                ),
+                Entry::Caption(
+                    "Delivery marks are presence-derived (\u{2713} sent \u{00B7} \u{2713}\u{2713} \
+                     delivered \u{00B7} \u{29D7} queued) \u{2014} never a fabricated read receipt."
+                        .to_owned(),
+                ),
+            ],
+        )
     }
 
     /// The status-chip tone for a presence choice (Ok = reachable, Warn = away,
@@ -1181,26 +1470,65 @@ mod menubar {
         }
     }
 
-    /// The live status cluster: this seat's presence + the whole-mesh unread tally.
+    /// The live status cluster (MENU-2 chips): this seat's presence, the peers
+    /// online, and the whole-mesh unread tally — all gated on a roster existing
+    /// (no roster ⇒ nothing to honestly count, §7).
     fn build_status(state: &ChatState) -> Vec<StatusChip> {
-        let mut chips = Vec::new();
-        if let Some(current) = current_presence(state) {
-            chips.push(StatusChip::with_icon(
-                DOT,
-                current.label(),
-                presence_tone(current),
-            ));
-        }
+        let Some(roster) = state.roster.as_ref() else {
+            return Vec::new();
+        };
+        let current = PresenceChoice::from_presence(roster.self_contact().presence);
+        let online = roster
+            .online()
+            .into_iter()
+            .filter(|c: &&Contact| !roster.is_self(&c.host))
+            .count();
         let unread = state.total_unread();
-        if unread > 0 {
-            chips.push(StatusChip::new(format!("{unread} unread"), ChipTone::Info));
+        vec![
+            StatusChip::with_icon(DOT, current.label(), presence_tone(current)),
+            StatusChip::new(
+                format!("{online} online"),
+                if online > 0 {
+                    ChipTone::Ok
+                } else {
+                    ChipTone::Neutral
+                },
+            ),
+            StatusChip::new(
+                format!("{unread} unread"),
+                if unread > 0 {
+                    ChipTone::Info
+                } else {
+                    ChipTone::Neutral
+                },
+            ),
+        ]
+    }
+
+    /// Watermark one conversation read — the same `seen` write opening its pane
+    /// performs, so the menu and the pane can't diverge.
+    fn mark_read(state: &mut ChatState, sel: &Selection) {
+        match sel {
+            Selection::Contact(host) => {
+                let now = state.convos.get(host).map_or(0, Conversation::len);
+                state.seen.insert(host.clone(), now);
+            }
+            Selection::Room(id) => {
+                let now = state.room_convos.get(id).map_or(0, Conversation::len);
+                state.seen.insert(super::room_key(id), now);
+            }
         }
-        chips
     }
 
     /// Apply a picked action to its real seam (§6, no new behaviour).
     pub(super) fn apply(state: &mut ChatState, action: MenuAction) {
         match action {
+            MenuAction::OpenContact(host) => {
+                // The roster row's exact open seam: select + fresh draft.
+                state.selected = Some(Selection::Contact(host));
+                state.draft.clear();
+            }
+            MenuAction::MarkRead(sel) => mark_read(state, &sel),
             MenuAction::MuteConversation => {
                 let Some(sel) = state.selected.clone() else {
                     return;
@@ -1215,6 +1543,52 @@ mod menubar {
                 super::publish_mute(state.bus_root.as_deref(), target, &id, !muted);
             }
             MenuAction::CloseConversation => state.selected = None,
+            MenuAction::ToggleAlerts => state.show_alerts = !state.show_alerts,
+            MenuAction::ToggleClips => state.show_clips = !state.show_clips,
+            MenuAction::ToggleMessages => state.show_messages = !state.show_messages,
+            MenuAction::ToggleUnreadOnly => state.unread_only = !state.unread_only,
+            MenuAction::SendDraft => {
+                // The composer's exact send seam, gated exactly like `can_send`.
+                let text = state.draft.trim().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                match state.selected.clone() {
+                    Some(Selection::Contact(host)) => {
+                        if state.roster.as_ref().is_some_and(|r| !r.is_self(&host)) {
+                            state.send(&host, &text);
+                            state.draft.clear();
+                        }
+                    }
+                    Some(Selection::Room(id)) => {
+                        if state.room_descriptor(&id).is_some() {
+                            state.send_room(&id, &text);
+                            state.draft.clear();
+                        }
+                    }
+                    None => {}
+                }
+            }
+            MenuAction::ClearUnread => {
+                // Watermark everything at its current length — the same `seen`
+                // mechanism the pane + Mark Read use, applied mesh-wide.
+                let contacts: Vec<(String, usize)> = state
+                    .convos
+                    .iter()
+                    .map(|(h, c)| (h.clone(), c.len()))
+                    .collect();
+                for (host, len) in contacts {
+                    state.seen.insert(host, len);
+                }
+                let rooms: Vec<(String, usize)> = state
+                    .room_convos
+                    .iter()
+                    .map(|(id, c)| (super::room_key(id), c.len()))
+                    .collect();
+                for (key, len) in rooms {
+                    state.seen.insert(key, len);
+                }
+            }
             MenuAction::SetPresence(choice) => state.set_presence(choice),
             MenuAction::EditStatus => {
                 if let Some(roster) = state.roster.as_ref() {
@@ -1230,37 +1604,169 @@ mod menubar {
     }
 
     #[cfg(test)]
+    #[allow(clippy::panic)]
     mod tests {
-        use super::super::ChatState;
-        use super::{build_menus, presence_tone, MenuAction, PresenceChoice};
+        use super::super::{alert_key, dm_key, ChatState, Selection};
+        use super::{
+            build_menus, build_status, can_send, presence_tone, MenuAction, PresenceChoice,
+        };
+        use mde_chat::{Contact, Conversation, Message, NodeRole, Presence, Roster};
         use mde_egui::menubar::Entry;
         use mde_egui::ChipTone;
 
+        /// A roster with self ("eagle") + an online peer ("nyc3") and one unread
+        /// message from that peer — the smallest live-looking state.
+        fn peered_state() -> ChatState {
+            let mut state = ChatState::default();
+            let mut roster = Roster::new("eagle");
+            roster.upsert(Contact::new("nyc3", NodeRole::Headless).with_presence(Presence::Online));
+            state.roster = Some(roster);
+            let mut conv = Conversation::new("nyc3");
+            conv.insert(Message::text("nyc3", 10, "hi"));
+            state.convos.insert("nyc3".into(), conv);
+            state.seen.insert("nyc3".into(), 0); // one unread
+            state
+        }
+
         #[test]
-        fn conversation_items_disable_without_a_selection() {
-            // No roster, nothing selected: Mute/Close grey, and Presence is omitted
-            // (not a present-but-dead menu) until a roster lands (§7).
+        fn bare_state_gates_honestly() {
+            // No roster, nothing selected: Mute + the Chat verbs grey, the Open-1:1
+            // submenu carries an honest caption, Presence is omitted (not a
+            // present-but-dead menu) until a roster lands (§7).
             let state = ChatState::default();
             let menus = build_menus(&state);
-            let convo = menus
-                .iter()
-                .find(|m| m.title == "Conversation")
-                .expect("Conversation menu is always present");
-            for entry in &convo.entries {
+            let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
+            assert_eq!(titles, ["Contacts", "View", "Chat", "Help"]);
+            let contacts = &menus[0];
+            let Entry::Submenu { entries, .. } = &contacts.entries[0] else {
+                panic!("Contacts[0] is the Open 1:1 submenu");
+            };
+            assert!(
+                matches!(entries.as_slice(), [Entry::Caption(_)]),
+                "no roster ⇒ Open 1:1 holds one honest caption"
+            );
+            for entry in &contacts.entries {
                 if let Entry::Item(item) = entry {
                     assert!(!item.enabled, "{} greys with no selection", item.label);
                 }
             }
-            assert!(
-                !menus.iter().any(|m| m.title == "Presence"),
-                "Presence is omitted until a roster (a self contact) exists"
+            let chat = menus.iter().find(|m| m.title == "Chat").expect("Chat menu");
+            for entry in &chat.entries {
+                if let Entry::Item(item) = entry {
+                    assert!(!item.enabled, "{} greys on a bare state", item.label);
+                }
+            }
+            assert!(build_status(&state).is_empty(), "no roster ⇒ no chips (§7)");
+        }
+
+        #[test]
+        fn open_1to1_lists_peers_and_opens_the_pane() {
+            let mut state = peered_state();
+            let menus = build_menus(&state);
+            let Entry::Submenu { entries, .. } = &menus[0].entries[0] else {
+                panic!("Contacts[0] is the Open 1:1 submenu");
+            };
+            let ids: Vec<&MenuAction> = entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Item(i) => Some(&i.id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                ids,
+                [&MenuAction::OpenContact("nyc3".into())],
+                "one entry per peer; self is excluded (lock 17)"
             );
+            super::apply(&mut state, MenuAction::OpenContact("nyc3".into()));
+            assert_eq!(
+                state.selected,
+                Some(Selection::Contact("nyc3".into())),
+                "Open 1:1 selects the pane"
+            );
+        }
+
+        #[test]
+        fn mark_read_and_clear_unread_watermark_via_the_seen_map() {
+            let mut state = peered_state();
+            assert_eq!(state.total_unread(), 1);
+            // The Mark-Read submenu lists exactly the unread conversation.
+            let menus = build_menus(&state);
+            let Entry::Submenu { entries, .. } = &menus[0].entries[1] else {
+                panic!("Contacts[1] is the Mark Read submenu");
+            };
+            assert!(
+                entries.iter().any(|e| matches!(
+                    e,
+                    Entry::Item(i) if i.id == MenuAction::MarkRead(Selection::Contact("nyc3".into()))
+                )),
+                "the unread contact is listed"
+            );
+            super::apply(
+                &mut state,
+                MenuAction::MarkRead(Selection::Contact("nyc3".into())),
+            );
+            assert_eq!(state.total_unread(), 0, "Mark Read watermarks it");
+
+            // Regrow an unread, then Clear Unread wipes the whole tally.
+            state.seen.insert("nyc3".into(), 0);
+            assert_eq!(state.total_unread(), 1);
+            super::apply(&mut state, MenuAction::ClearUnread);
+            assert_eq!(
+                state.total_unread(),
+                0,
+                "Clear Unread watermarks everything"
+            );
+        }
+
+        #[test]
+        fn view_toggles_flip_the_live_filter_state() {
+            let mut state = ChatState::default();
+            assert!(state.show_alerts && state.show_clips && state.show_messages);
+            assert!(!state.unread_only);
+            super::apply(&mut state, MenuAction::ToggleAlerts);
+            super::apply(&mut state, MenuAction::ToggleUnreadOnly);
+            assert!(!state.show_alerts, "Alerts toggled off");
+            assert!(state.unread_only, "Unread Only toggled on");
+            // The menu reflects the flipped state as its check-marks.
+            let menus = build_menus(&state);
+            let view = menus.iter().find(|m| m.title == "View").expect("View menu");
+            let checks: Vec<Option<bool>> = view
+                .entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Item(i) => Some(i.checked),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                checks,
+                [Some(false), Some(true), Some(true), Some(true)],
+                "Alerts off · Clips on · Messages on · Unread Only on"
+            );
+        }
+
+        #[test]
+        fn send_draft_gates_like_the_composer_and_clears_on_send() {
+            let mut state = peered_state();
+            assert!(!can_send(&state), "empty draft can't send");
+            state.draft = "hello".into();
+            assert!(!can_send(&state), "no open conversation can't send");
+            state.selected = Some(Selection::Contact("eagle".into()));
+            assert!(!can_send(&state), "the self alert timeline has no composer");
+            state.selected = Some(Selection::Contact("nyc3".into()));
+            assert!(can_send(&state));
+            // The publish is best-effort (no Bus dir in a test) — the draft still
+            // clears, proving the send seam ran.
+            state.bus_root = None;
+            super::apply(&mut state, MenuAction::SendDraft);
+            assert!(state.draft.is_empty(), "a sent draft clears");
         }
 
         #[test]
         fn close_deselects_and_set_presence_maps_to_a_choice() {
             let mut state = ChatState {
-                selected: Some(super::Selection::Contact("nyc3".into())),
+                selected: Some(Selection::Contact("nyc3".into())),
                 ..ChatState::default()
             };
             super::apply(&mut state, MenuAction::CloseConversation);
@@ -1272,6 +1778,29 @@ mod menubar {
             // set_presence publishes best-effort (no Bus dir in the test) — never a
             // panic, and the action carries the chosen presence.
             super::apply(&mut state, MenuAction::SetPresence(PresenceChoice::Dnd));
+        }
+
+        #[test]
+        fn chips_read_presence_online_count_and_unread_total() {
+            let state = peered_state();
+            let chips = build_status(&state);
+            assert!(
+                chips
+                    .iter()
+                    .any(|c| c.text == "1 online" && c.tone == ChipTone::Ok),
+                "one peer online (self excluded)"
+            );
+            assert!(
+                chips
+                    .iter()
+                    .any(|c| c.text == "1 unread" && c.tone == ChipTone::Info),
+                "the whole-mesh unread tally"
+            );
+            // The presence chip mirrors the self contact.
+            assert!(chips.iter().any(|c| c.text == "Available"));
+            // The DM ∪ alert key helpers stay order-stable (the fold contract).
+            assert_eq!(dm_key("eagle", "nyc3"), dm_key("nyc3", "eagle"));
+            assert_eq!(alert_key("nyc3"), "alert:nyc3");
         }
 
         #[test]
@@ -1299,7 +1828,7 @@ mod menubar {
                 });
             });
             let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
-            assert!(!prims.is_empty(), "the Chat bar produced no primitives");
+            assert!(!prims.is_empty(), "the Contacts bar produced no primitives");
         }
     }
 }
@@ -1365,16 +1894,17 @@ fn latest_json<T: serde::de::DeserializeOwned>(persist: &Persist, topic: &str) -
 /// Render a conversation's messages with a muted **day separator** whenever the
 /// civil (UTC) date changes — the authentic chat idiom — each row carrying its own
 /// HH:MM timestamp ([`message_row`]). Shared by the contact + room panes so both
-/// read the same way.
+/// read the same way. Takes the panes' already-feed-filtered slice (MENU-2), so
+/// the day separators track only what actually renders.
 fn render_timeline(
     ui: &mut egui::Ui,
-    messages: &VecDeque<Message>,
+    messages: &[&Message],
     self_host: &str,
     recipient: Option<&Contact>,
     bus_root: Option<&Path>,
 ) {
     let mut last_date: Option<String> = None;
-    for msg in messages {
+    for &msg in messages {
         let date = fmt_date(msg.ts_unix_ms);
         if last_date.as_deref() != Some(date.as_str()) {
             day_separator(ui, &date);
@@ -2164,6 +2694,77 @@ mod tests {
             !state.is_contact_muted("fra1"),
             "an unmuted contact still rings"
         );
+    }
+
+    // ── MENU-2: the View feed filters + Unread Only ────────────────────────────
+
+    /// The three feed-filter bands classify every message kind: alerts, clips,
+    /// and everything human-authored (text / file / call / remote) as messages.
+    #[test]
+    fn feed_filters_classify_every_message_kind() {
+        let mut state = ChatState::default();
+        let alert = MessageKind::Alert {
+            severity: Severity::Info,
+            flag: "x".into(),
+            fields: BTreeMap::new(),
+            action_verb: None,
+        };
+        let clip = MessageKind::Clipboard {
+            preview: "p".into(),
+            full: "f".into(),
+        };
+        let text = MessageKind::Text("hi".into());
+        let file = MessageKind::File {
+            name: "a.txt".into(),
+            size_bytes: 1,
+            mime: None,
+        };
+        // Defaults: everything shows.
+        for kind in [&alert, &clip, &text, &file] {
+            assert!(state.feed_shows(kind), "all bands default on");
+        }
+        state.show_alerts = false;
+        assert!(!state.feed_shows(&alert), "Alerts off hides an alert");
+        assert!(state.feed_shows(&clip), "…but not a clip");
+        state.show_clips = false;
+        assert!(!state.feed_shows(&clip));
+        state.show_messages = false;
+        assert!(!state.feed_shows(&text), "Messages off hides text");
+        assert!(!state.feed_shows(&file), "…and file offers");
+    }
+
+    /// Unread Only prunes the roster to conversations with unread — but self
+    /// stays pinned and the OPEN conversation stays visible (opening a pane
+    /// watermarks it read, so it must not vanish mid-read).
+    #[test]
+    fn unread_only_prunes_but_keeps_self_and_the_open_pane() {
+        let mut state = ChatState::default();
+        let mut roster = Roster::new("eagle");
+        roster.upsert(Contact::new("nyc3", NodeRole::Headless).with_presence(Presence::Online));
+        roster.upsert(Contact::new("fra1", NodeRole::Headless).with_presence(Presence::Online));
+        let me = Contact::new("eagle", NodeRole::Workstation);
+        let nyc3 = Contact::new("nyc3", NodeRole::Headless);
+        let fra1 = Contact::new("fra1", NodeRole::Headless);
+
+        // Filters off: everything shows.
+        assert!(state.roster_shows(&roster, &nyc3));
+
+        state.unread_only = true;
+        // nyc3 carries one unread → visible; fra1 is read → pruned.
+        let mut conv = Conversation::new("nyc3");
+        conv.insert(Message::text("nyc3", 10, "hi"));
+        state.convos.insert("nyc3".into(), conv);
+        state.seen.insert("nyc3".into(), 0);
+        assert!(state.roster_shows(&roster, &nyc3), "unread stays");
+        assert!(!state.roster_shows(&roster, &fra1), "read prunes");
+        assert!(state.roster_shows(&roster, &me), "self stays pinned");
+        // The open (therefore read) conversation stays visible.
+        state.selected = Some(Selection::Contact("fra1".into()));
+        assert!(state.roster_shows(&roster, &fra1), "the open pane stays");
+        // Rooms follow the same rule.
+        assert!(!state.room_shows("ops"), "a read room prunes");
+        state.selected = Some(Selection::Room("ops".into()));
+        assert!(state.room_shows("ops"), "the open room stays");
     }
 
     /// The presence / status / mute action helpers are best-effort: with no Bus
