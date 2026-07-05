@@ -24,6 +24,10 @@ pub mod ddns;
 // About → Device-Manager surface. Lands here (like `peer_probe`, the other
 // hardware schema) so neither side depends on the other.
 pub mod device_inventory;
+// DEVMGR-8 — the device-control request/result §6 contract: the desktop shell
+// dispatches a typed privileged-op request, mackesd's `device_control` worker
+// executes it on the target node. Lands here so neither side depends on the other.
+pub mod device_control;
 pub mod exposure;
 // LIGHTHOUSE-2 (2026-06-18) — shared lighthouse discovery + binary health
 // (beacon) derivation from the replicated peer directory. One pure source for

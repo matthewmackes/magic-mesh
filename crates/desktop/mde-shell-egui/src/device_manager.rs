@@ -71,13 +71,20 @@
 //! the DEVMGR-3 drawer), **Scan for hardware changes** (re-read the inventory — the
 //! honest rescan, the same seam as the Action-menu Scan), and **Copy device
 //! details** (the full field dump to the seat clipboard, [`render_device_details`]).
-//! Because this surface is a **read-only** §6 consumer of the published inventory
-//! JSON — it holds no privileged-exec / worker-request seam — MDM's
-//! hardware-mutating verbs (Enable/Disable, Reload kernel module) cannot be
-//! performed honestly from here and are **omitted, not greyed** (§7/§8): they belong
-//! to the mesh-side producer on the node itself (a later request-channel unit), and
-//! a muted caption in the context menu says so rather than shipping a placebo
-//! control. No destructive action ships, so no typed-arming gate is needed here.
+//! **DEVMGR-8 makes the omitted verbs live (#12/#13/#14)** — the node-side
+//! privileged-exec seam now exists: a `device_control` mackesd worker executes the
+//! real hardware mutation on the target node. So the context menu's previously
+//! omitted verbs — **Enable / Disable / Reload driver module / Rescan bus** — are
+//! now PRESENT, each behind **typed-arming** ([`DeviceArming`] — echo the device
+//! name, #14). Activating an armed op publishes a typed
+//! [`DeviceControlRequest`](mackes_mesh_types::device_control::DeviceControlRequest)
+//! into the **RAIL-selected** host's replicated `fleet/device-control/<host>/` dir
+//! ([`device_control::write_request`], DEVMGR-4 host selection governs → a mesh
+//! remote-exec routed to the target node), and a dispatch toast confirms. Honest
+//! degrade (§7): a target host that is Absent / never-published raises an error
+//! toast and writes nothing (no silent no-op); a network-device op carries a "you
+//! may lose reach to this host" warning (#13). The §6 boundary holds — the wire is
+//! the shared [`mackes_mesh_types::device_control`] contract, not a `mackesd` dep.
 //!
 //! The cross-fleet By-node flatten is still a later unit; its seam here (the
 //! disabled By-node mode) is left clean, not stubbed.
@@ -93,8 +100,11 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use mackes_mesh_types::device_control::{
+    self, DeviceControlOp, DeviceControlRequest, DeviceTarget,
+};
 use mackes_mesh_types::device_inventory::{
-    self, DeviceCategory, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
+    self, category, DeviceCategory, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
 };
 use mackes_mesh_types::peers::default_workgroup_root;
 use mde_bus::hooks::config::Priority;
@@ -471,6 +481,10 @@ pub(crate) struct DeviceManagerState {
     active_tab: DrawerTab,
     /// The ⓘ dialog latch — license / credits / mesh-identity (#24).
     show_about: bool,
+    /// A pending typed-arming confirm for a privileged device op (DEVMGR-8, #14),
+    /// if any — the destructive Enable/Disable/Reload/Rescan verbs stage here and
+    /// dispatch only once the operator echoes the device name.
+    arming: Option<DeviceArming>,
 }
 
 impl Default for DeviceManagerState {
@@ -489,6 +503,7 @@ impl Default for DeviceManagerState {
             selected: None,
             active_tab: DrawerTab::default(),
             show_about: false,
+            arming: None,
         }
     }
 }
@@ -638,6 +653,11 @@ impl DeviceManagerState {
         }
         ui.separator();
         ui.add_space(Style::SP_XS);
+
+        // DEVMGR-8 — a pending typed-arming confirm for a privileged device op
+        // renders as a prominent full-width banner above the rail/tree (#14),
+        // honest feedback before any node-side mutation.
+        self.render_arming(ui);
 
         // The persistent left host rail (#5): reserved first so it spans the full
         // body height (rail │ tree │ drawer). Switching hosts here re-reads below.
@@ -991,6 +1011,148 @@ impl DeviceManagerState {
                     &format!("Copied {} details to the clipboard", dev.name),
                 );
             }
+            // DEVMGR-8 — a privileged verb never fires from the menu: it stages the
+            // typed-arming confirm (#14). The echoed confirm (render_arming) then
+            // dispatches it to the selected host's mackesd.
+            RowActionRequest::Control { op, target } => {
+                self.arming = Some(DeviceArming {
+                    op,
+                    target: *target,
+                    target_host: self.selected_host.clone(),
+                    typed: String::new(),
+                });
+            }
+        }
+    }
+
+    /// The freshness of the currently selected host (DEVMGR-4) — the honest
+    /// reachability read used to block a device op against an offline / never-seen
+    /// host (§7). A host absent from the rail (nothing published) reads `Absent`.
+    fn selected_host_freshness(&self) -> HostFreshness {
+        let now = now_ms();
+        self.hosts
+            .iter()
+            .find(|h| h.host == self.selected_host)
+            .map_or(HostFreshness::Absent, |h| h.freshness(now))
+    }
+
+    /// Render the DEVMGR-8 typed-arming confirm (#14, mirroring the IAC / Console
+    /// power-op idiom): a warn-framed group naming the op + device, a
+    /// **reach-loss** caption for a network device (#13 — disabling a NIC can strand
+    /// the host), and the "type the device name to arm" echo. The DANGER confirm is
+    /// enabled ONLY once the echo matches (an unconfirmed op can never dispatch), and
+    /// a confirm drives [`Self::dispatch_control`]. Renders above the tree, like the
+    /// export toast — honest, never a silent op.
+    fn render_arming(&mut self, ui: &mut egui::Ui) {
+        // (confirmed) captured so the arming borrow drops before the seam is driven.
+        let mut act: Option<bool> = None;
+        if let Some(arming) = self.arming.as_mut() {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.colored_label(
+                    Style::WARN,
+                    RichText::new(format!("Confirm: {}", arming.op.label()))
+                        .size(Style::BODY)
+                        .strong(),
+                );
+                muted_note(
+                    ui,
+                    format!(
+                        "Type the device name \u{201C}{}\u{201D} to arm this op on {} \u{2014} it \
+                         runs on the node's real hardware and is audited.",
+                        arming.target.name, arming.target_host,
+                    ),
+                );
+                // #13 — a network device op can drop the operator's own reach.
+                if arming.target.category == category::NETWORK_ADAPTERS {
+                    ui.colored_label(
+                        Style::DANGER,
+                        RichText::new(
+                            "\u{26A0} You may lose reach to this host if you down its network device.",
+                        )
+                        .size(Style::SMALL),
+                    );
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut arming.typed)
+                        .hint_text(arming.target.name.as_str()),
+                );
+                let is_armed = device_armed(&arming.typed, &arming.target.name);
+                ui.horizontal(|ui| {
+                    let confirm = ui.add_enabled(
+                        is_armed,
+                        egui::Button::new(
+                            RichText::new(arming.op.label()).color(Style::DANGER),
+                        ),
+                    );
+                    if confirm.clicked() && is_armed {
+                        act = Some(true);
+                    } else if ui.button("Cancel").clicked() {
+                        act = Some(false);
+                    }
+                });
+            });
+            ui.add_space(Style::SP_S);
+        }
+        if let Some(confirmed) = act {
+            let arming = self.arming.take();
+            if confirmed {
+                if let Some(a) = arming {
+                    self.dispatch_control(a);
+                }
+            }
+        }
+    }
+
+    /// Dispatch an armed device op to the RAIL-selected host's mackesd (DEVMGR-8,
+    /// #13) — a mesh remote-exec routed to the target node. Honest degrade (§7): an
+    /// **absent / never-published** target host raises an error toast and writes
+    /// nothing (no silent no-op); otherwise the typed [`DeviceControlRequest`] is
+    /// written into the target's replicated `fleet/device-control/<host>/` dir (the
+    /// node's `device_control` worker drains + executes + audits it), and a dispatch
+    /// toast confirms. A failed write is an honest error toast, never swallowed.
+    fn dispatch_control(&self, arming: DeviceArming) {
+        // Consume the arming into its typed parts (the echo is spent).
+        let DeviceArming {
+            op,
+            target,
+            target_host,
+            typed: _,
+        } = arming;
+        // Reachability gate (§7): a host that has published no inventory is offline /
+        // never-seen — we can't route to it, so refuse honestly rather than write a
+        // request that will never be drained.
+        if self.selected_host_freshness() == HostFreshness::Absent {
+            raise_toast(
+                "warning",
+                &format!(
+                    "{target_host} is offline (no published inventory) \u{2014} cannot {} {}",
+                    op.as_str(),
+                    target.name
+                ),
+            );
+            return;
+        }
+        // Keep the display fields before `target`/`target_host` move into the request.
+        let device_name = target.name.clone();
+        let req = DeviceControlRequest {
+            id: next_request_id(),
+            op,
+            target,
+            target_host: target_host.clone(),
+            from: format!("peer:{}", self.local_host),
+        };
+        match device_control::write_request(&self.workgroup_root, &req) {
+            Ok(_) => raise_toast(
+                "info",
+                &format!(
+                    "Dispatched \u{201C}{}\u{201D} for {device_name} to {target_host}",
+                    op.label(),
+                ),
+            ),
+            Err(err) => raise_toast(
+                "warning",
+                &format!("Could not dispatch {} to {target_host}: {err}", op.as_str()),
+            ),
         }
     }
 
@@ -1864,6 +2026,17 @@ enum RowActionRequest {
     /// this large payload never bloats the small [`Properties`](Self::Properties) /
     /// [`Scan`](Self::Scan) variants (`clippy::large_enum_variant`).
     CopyDetails(Box<DeviceRecord>),
+    /// DEVMGR-8 — a **privileged** device op (Enable/Disable/Reload-module/Rescan-bus)
+    /// the operator chose. It does NOT fire directly: it opens the typed-arming stage
+    /// (#14), and only the echoed confirm dispatches the request to the target node's
+    /// mackesd. Boxed for the same [`large_enum_variant`](clippy::large_enum_variant)
+    /// reason as `CopyDetails`.
+    Control {
+        /// The op to arm.
+        op: DeviceControlOp,
+        /// The typed device target (name/category/sysfs/driver) resolved at menu time.
+        target: Box<DeviceTarget>,
+    },
 }
 
 /// What a device row reports back for one frame (DEVMGR-7): a left-click selection
@@ -1876,12 +2049,44 @@ struct RowOutcome {
     action: Option<RowActionRequest>,
 }
 
-/// The device-row right-click context menu (DEVMGR-7, #12) — the honest MDM action
-/// set for one device: **Properties** (open the drawer), **Scan for hardware
-/// changes** (re-read), **Copy device details** (clipboard). A muted caption below
-/// them honestly states the read-only posture (§7) — why MDM's Enable/Disable +
-/// driver-reload verbs are absent — rather than shipping a greyed placebo (§8).
-/// Returns the chosen [`RowActionRequest`] (the caller dispatches it).
+/// A pending DEVMGR-8 typed-arming confirm (#14): a privileged device op staged
+/// on a device + a target host, awaiting the operator's echo of the device name.
+/// Held in [`DeviceManagerState::arming`] and rendered by [`DeviceManagerState::render_arming`].
+struct DeviceArming {
+    /// The privileged op to run once armed.
+    op: DeviceControlOp,
+    /// The device the op targets (name/category/sysfs/driver).
+    target: DeviceTarget,
+    /// The RAIL-selected host the request routes to (DEVMGR-4 governs).
+    target_host: String,
+    /// The operator's live echo — must equal `target.name` to arm.
+    typed: String,
+}
+
+/// The typed-arming gate (#14): the trimmed echo must exactly equal the device
+/// name before a privileged op may dispatch. The single decision the confirm
+/// button + the tests share, so "unconfirmed ⇒ blocked" is proven without a render.
+fn device_armed(typed: &str, device_name: &str) -> bool {
+    typed.trim() == device_name
+}
+
+/// A process-unique request id for a dispatched device op (the correlation key the
+/// node writes its result back under). Millis + a monotonic per-process counter, so
+/// two rapid dispatches never collide — no ULID dependency needed for a file id.
+fn next_request_id() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{seq}", now_ms())
+}
+
+/// The device-row right-click context menu (DEVMGR-7 + DEVMGR-8, #12) — the full
+/// MDM action set for one device. The **read-only** verbs fire directly: **Properties**
+/// (open the drawer), **Scan for hardware changes** (re-read), **Copy device details**
+/// (clipboard). Below a separator, the **privileged** verbs (DEVMGR-8) — **Enable**,
+/// **Disable**, **Reload driver module**, **Rescan bus** — are now PRESENT (the
+/// node-side exec seam exists): each opens the typed-arming stage (#14) and dispatches
+/// to the selected host's mackesd only on the echoed confirm, tinted [`Style::DANGER`]
+/// as destructive. Returns the chosen [`RowActionRequest`] (the caller dispatches it).
 fn device_context_menu(
     ui: &mut egui::Ui,
     category: &str,
@@ -1904,13 +2109,49 @@ fn device_context_menu(
         }
     }
     ui.separator();
-    // Honest disclosure (§7), not a placebo control (§8): the mutating verbs run on
-    // the node, not from this read-only inventory viewer.
+    // DEVMGR-8 — the privileged, node-side verbs (#12/#13/#14). Each arms first
+    // (type the device name) and dispatches to the RAIL-selected host's mackesd.
+    for op in DeviceControlOp::ALL {
+        if ui
+            .button(RichText::new(control_label(op)).color(Style::DANGER))
+            .clicked()
+        {
+            chosen = Some(RowActionRequest::Control {
+                op,
+                target: Box::new(device_target(category, dev)),
+            });
+            ui.close_menu();
+        }
+    }
+    ui.separator();
+    // Honest disclosure (§13): these run on the node itself, over the overlay.
     muted_note(
         ui,
-        "Read-only inventory \u{2014} enable/disable + driver reload run on the node.",
+        "Enable/Disable, reload + rescan run on the node \u{2014} armed, audited.",
     );
     chosen
+}
+
+/// The context-menu glyph + verb for a privileged [`DeviceControlOp`] (DEVMGR-8),
+/// in the shell's context-menu idiom (a glyph, two spaces, the verb).
+const fn control_label(op: DeviceControlOp) -> &'static str {
+    match op {
+        DeviceControlOp::Enable => "\u{25B6}  Enable device", // ▶
+        DeviceControlOp::Disable => "\u{25A0}  Disable device", // ■
+        DeviceControlOp::ReloadModule => "\u{21BB}  Reload driver module", // ↻
+        DeviceControlOp::RescanBus => "\u{2921}  Rescan bus", // ⤡
+    }
+}
+
+/// The typed [`DeviceTarget`] for a device row — the subset of the record the
+/// node-side executor needs to resolve the real seam (§9 — typed params, no command).
+fn device_target(category: &str, dev: &DeviceRecord) -> DeviceTarget {
+    DeviceTarget {
+        name: dev.name.clone(),
+        category: category.to_string(),
+        sysfs_path: dev.sysfs_path.clone(),
+        driver: dev.driver.clone(),
+    }
 }
 
 /// One device row — a clickable selection row (DEVMGR-3) carrying the DEVMGR-7
@@ -2384,12 +2625,14 @@ fn host_hover(entry: &HostEntry, now_ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_connection_tree, build_rail, cpu_line, derive_bus, device_status_display, export_dir,
-        format_mem_kb, header_lines, host_dot_tone, host_hover, humanize_ago, humanize_uptime,
-        problem_code, render_device_details, render_json, render_report, sanitize, scanned_label,
-        status_tone, write_export, DeviceAction, DeviceManagerState, DeviceSelection, DrawerTab,
+        build_connection_tree, build_rail, cpu_line, derive_bus, device_armed,
+        device_status_display, device_target, export_dir, format_mem_kb, header_lines,
+        host_dot_tone, host_hover, humanize_ago, humanize_uptime, now_ms, problem_code,
+        render_device_details, render_json, render_report, sanitize, scanned_label, status_tone,
+        write_export, DeviceAction, DeviceArming, DeviceManagerState, DeviceSelection, DrawerTab,
         HostEntry, HostFreshness, MenuAction, RowActionRequest, ViewMode, STALE_AFTER,
     };
+    use mackes_mesh_types::device_control::{DeviceControlOp, DeviceTarget};
     use mackes_mesh_types::device_inventory::{
         self, category, DeviceInventory, DeviceRecord, DeviceStatus, HostSummary,
     };
@@ -2457,6 +2700,7 @@ mod tests {
             selected: None,
             active_tab: DrawerTab::General,
             show_about: false,
+            arming: None,
         }
     }
 
@@ -3549,6 +3793,156 @@ mod tests {
         assert!(
             s.selected.is_some(),
             "the drawer stayed open across the frame"
+        );
+    }
+
+    // ── DEVMGR-8: the privileged, armed, node-side device actions ─────────────
+
+    /// A device record carrying a real sysfs anchor + a bound driver (the fields
+    /// the node-side executor needs), for the arming/dispatch tests.
+    fn nic() -> DeviceRecord {
+        DeviceRecord {
+            sysfs_path: Some("/sys/bus/pci/devices/0000:00:1f.6".into()),
+            driver: Some("e1000e".into()),
+            ..DeviceRecord::new("Intel I219-V", DeviceStatus::Ok)
+        }
+    }
+
+    #[test]
+    fn the_context_menu_now_offers_every_privileged_op() {
+        // The armed action set IS exactly MDM's four hardware-mutating verbs (#12) —
+        // now PRESENT (DEVMGR-8's node-side seam exists), no longer omitted.
+        assert_eq!(DeviceControlOp::ALL.len(), 4);
+        // device_target carries the exact exec fields the node's executor resolves
+        // the seam from (§9 — typed params, not a command).
+        let t = device_target(category::NETWORK_ADAPTERS, &nic());
+        assert_eq!(t.name, "Intel I219-V");
+        assert_eq!(t.category, category::NETWORK_ADAPTERS);
+        assert_eq!(
+            t.sysfs_path.as_deref(),
+            Some("/sys/bus/pci/devices/0000:00:1f.6")
+        );
+        assert_eq!(t.driver.as_deref(), Some("e1000e"));
+    }
+
+    #[test]
+    fn a_privileged_op_arms_first_and_never_fires_directly() {
+        // Choosing Disable from the context menu stages the typed-arming confirm —
+        // it does NOT dispatch (#14). Nothing routes to a node until the echo arms.
+        let mut s = state_with(Some(host_inventory("laptop-mm")), true);
+        let ctx = egui::Context::default();
+        s.apply_row_action(
+            RowActionRequest::Control {
+                op: DeviceControlOp::Disable,
+                target: Box::new(device_target(category::NETWORK_ADAPTERS, &nic())),
+            },
+            &ctx,
+        );
+        let arming = s
+            .arming
+            .as_ref()
+            .expect("Disable opens the typed-arming stage, never fires directly");
+        assert_eq!(arming.op, DeviceControlOp::Disable);
+        assert_eq!(arming.target.name, "Intel I219-V");
+        assert_eq!(arming.target_host, "laptop-mm");
+        assert!(
+            arming.typed.is_empty(),
+            "arms empty — nothing dispatched yet"
+        );
+    }
+
+    #[test]
+    fn typed_arming_blocks_an_unconfirmed_disable() {
+        // The single gate the confirm button + the test share (#14).
+        assert!(
+            !device_armed("", "Intel I219-V"),
+            "an empty echo never arms"
+        );
+        assert!(
+            !device_armed("intel i219-v", "Intel I219-V"),
+            "a mistyped echo never arms"
+        );
+        assert!(
+            device_armed("  Intel I219-V  ", "Intel I219-V"),
+            "the exact device name (trimmed) arms"
+        );
+    }
+
+    #[test]
+    fn dispatch_to_a_fresh_host_writes_the_request_to_the_targets_replicated_dir() {
+        // A confirmed op routes to the RAIL-selected host's replicated dir (#13) —
+        // the node's device_control worker drains it. A real write, not a stub.
+        let scratch = ScratchRoot::new("dispatch");
+        scratch.publish("edge-2", now_ms()); // a fresh (reachable) target host
+        let mut s = state_with(None, true);
+        s.workgroup_root = scratch.path().to_path_buf();
+        s.local_host = "laptop-mm".into();
+        s.selected_host = "edge-2".into();
+        s.refresh(); // builds the rail → edge-2 is a Fresh, reachable host
+
+        s.dispatch_control(DeviceArming {
+            op: DeviceControlOp::Disable,
+            target: device_target(category::NETWORK_ADAPTERS, &nic()),
+            target_host: "edge-2".into(),
+            typed: "Intel I219-V".into(),
+        });
+
+        let reqs = mackes_mesh_types::device_control::take_requests(scratch.path(), "edge-2");
+        assert_eq!(
+            reqs.len(),
+            1,
+            "the armed op wrote one request to edge-2's dir"
+        );
+        assert_eq!(reqs[0].op, DeviceControlOp::Disable);
+        assert_eq!(reqs[0].target_host, "edge-2");
+        assert_eq!(reqs[0].target.name, "Intel I219-V");
+        assert_eq!(
+            reqs[0].from, "peer:laptop-mm",
+            "the requesting seat is recorded"
+        );
+    }
+
+    #[test]
+    fn dispatch_to_an_absent_host_writes_nothing_honest_error() {
+        // §7 — a target host that has published no inventory is offline/never-seen:
+        // the dispatch refuses (an honest error toast) and writes NO request, never
+        // a silent no-op that would leave a request no node ever drains.
+        let scratch = ScratchRoot::new("absent");
+        let mut s = state_with(None, true);
+        s.workgroup_root = scratch.path().to_path_buf();
+        s.local_host = "laptop-mm".into();
+        s.selected_host = "ghost-node".into();
+        s.refresh(); // ghost-node published nothing → not in the rail → Absent
+        assert_eq!(s.selected_host_freshness(), HostFreshness::Absent);
+
+        s.dispatch_control(DeviceArming {
+            op: DeviceControlOp::Disable,
+            target: DeviceTarget::new("Ghost NIC", category::NETWORK_ADAPTERS),
+            target_host: "ghost-node".into(),
+            typed: "Ghost NIC".into(),
+        });
+        assert!(
+            mackes_mesh_types::device_control::take_requests(scratch.path(), "ghost-node")
+                .is_empty(),
+            "an absent host must get no dispatched request"
+        );
+    }
+
+    #[test]
+    fn the_arming_banner_renders_headless_with_a_pending_confirm() {
+        // A staged arming draws its warn banner (the reach-loss caption for a NIC)
+        // — a live render, not dead code.
+        let mut s = state_with(Some(host_inventory("laptop-mm")), true);
+        s.arming = Some(DeviceArming {
+            op: DeviceControlOp::Disable,
+            target: device_target(category::NETWORK_ADAPTERS, &nic()),
+            target_host: "laptop-mm".into(),
+            typed: String::new(),
+        });
+        assert!(drive(&mut s) > 0, "the arming banner drew nothing");
+        assert!(
+            s.arming.is_some(),
+            "an unconfirmed arming persists across the frame"
         );
     }
 }

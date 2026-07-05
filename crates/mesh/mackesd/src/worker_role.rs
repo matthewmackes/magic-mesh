@@ -77,6 +77,12 @@ const WORKER_TIERS: &[(&str, u8)] = &[
     ("presence_watch", 0),
     ("etcd_watch", 0),
     ("lifecycle_exec", 0),
+    // DEVMGR-8 — the device-control executor: privileged hardware ops
+    // (enable/disable, reload module, rescan bus) the Device-Manager surface
+    // dispatches to a target node. UNIVERSAL (rank 0) like hardware_probe /
+    // lifecycle_exec — every node can be an action target and drains only its
+    // own replicated fleet/device-control/<self> request dir.
+    ("device_control", 0),
     ("reconcile", 0),
     ("netstate_apply", 0),
     ("validation_suite", 0),
@@ -467,7 +473,11 @@ mod tests {
         // +1 node_grade (NODE-GRADE-1 — the universal per-node self-grade worker,
         // pinned at rank 0: every node computes + publishes its own A–F capability
         // grade. The rank split shifts 28/15 → 29/15, len 43 → 44).
-        assert_eq!(WORKER_TIERS.len(), 44);
+        // +1 device_control (DEVMGR-8 — the universal per-node device-control
+        // executor, pinned at rank 0: every node can be a device-action target and
+        // drains its own fleet/device-control/<self> dir. Split 29/15 → 30/15, len
+        // 44 → 45).
+        assert_eq!(WORKER_TIERS.len(), 45);
     }
 
     #[test]
@@ -490,8 +500,8 @@ mod tests {
         let count = |rank: u8| WORKER_TIERS.iter().filter(|(_, r)| *r == rank).count();
         assert_eq!(
             count(0),
-            29,
-            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + notify (CHAT-FIX-2, universal local-notification producer) + node_grade (NODE-GRADE-1, universal per-node self-grade) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry)"
+            30,
+            "Lighthouse control plane (+gossip/reconcile/presence/etcd_watch/lifecycle/mesh_dns/netstate_apply/validation_suite/metrics_exporter/hardware_probe/link-traffic) + storage (BUG-STORAGE-1, universal per-node mirror) + openstack (QC-2, universal Kolla-service supervision) + unit_aggregator (EXPLORER-1, universal per-node unit view) + notify (CHAT-FIX-2, universal local-notification producer) + node_grade (NODE-GRADE-1, universal per-node self-grade) + kdc_host (KDC-MESH-3 #15, universal KDE Connect host — overlay-only, opens no public port) + chat (CHAT-FIX-1, universal mesh chat worker — was on the silent unknown-worker default, now an explicit census entry) + device_control (DEVMGR-8, universal per-node device-control executor)"
         );
         assert_eq!(
             count(1),
@@ -744,15 +754,16 @@ mod tests {
     fn workers_for_rank_is_a_growing_superset() {
         let lh = workers_for_rank(Role::Lighthouse.rank());
         let ws = workers_for_rank(Role::Workstation.rank());
-        // 29 lighthouse-tier workers (22 control-plane + the BUG-STORAGE-1 universal
+        // 30 lighthouse-tier workers (22 control-plane + the BUG-STORAGE-1 universal
         // storage mirror + the QC-2 universal openstack worker + the EXPLORER-1
         // universal unit_aggregator + the CHAT-FIX-2 universal notify producer + the
         // NODE-GRADE-1 universal node_grade self-grade + the KDC-MESH-3 universal
-        // kdc_host + the CHAT-FIX-1 universal chat worker at rank 0); Workstation
-        // adds the 15 fleet + desktop workers for the full 44 (the retired Server
-        // tier folded into Workstation in the 2-role model).
-        assert_eq!(lh.len(), 29);
-        assert_eq!(ws.len(), 44);
+        // kdc_host + the CHAT-FIX-1 universal chat worker + the DEVMGR-8 universal
+        // device_control executor at rank 0); Workstation adds the 15 fleet + desktop
+        // workers for the full 45 (the retired Server tier folded into Workstation in
+        // the 2-role model).
+        assert_eq!(lh.len(), 30);
+        assert_eq!(ws.len(), 45);
         // The universal storage mirror is now a listed census entry on BOTH roles
         // (it previously ran but was omitted from this diagnostic listing).
         assert!(
@@ -813,20 +824,20 @@ mod tests {
             "media ≠ workstation tier"
         );
         let set = workers_for_class(media_lh);
-        // = the 29 lighthouse-tier workers (incl. link-traffic MESHMAP-6, the
+        // = the 30 lighthouse-tier workers (incl. link-traffic MESHMAP-6, the
         // BUG-STORAGE-1 universal storage mirror, the QC-2 universal openstack
         // worker, the EXPLORER-1 universal unit_aggregator, the CHAT-FIX-2
         // universal notify producer, the NODE-GRADE-1 universal node_grade
-        // self-grade, the KDC-MESH-3 universal kdc_host + the CHAT-FIX-1 universal
-        // chat worker) + navidrome.
-        assert_eq!(set.len(), 30);
+        // self-grade, the KDC-MESH-3 universal kdc_host, the CHAT-FIX-1 universal
+        // chat worker + the DEVMGR-8 universal device_control executor) + navidrome.
+        assert_eq!(set.len(), 31);
         assert!(set.contains(&"navidrome"));
         assert!(set.contains(&"nebula_supervisor"));
         assert!(!set.contains(&"ansible-pull"));
         // A plain lighthouse class never includes the media worker.
         let plain_lh = DeployClass::plain(Role::Lighthouse.rank());
         assert!(!workers_for_class(plain_lh).contains(&"navidrome"));
-        assert_eq!(workers_for_class(plain_lh).len(), 29);
+        assert_eq!(workers_for_class(plain_lh).len(), 30);
     }
 
     #[test]

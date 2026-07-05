@@ -6205,9 +6205,9 @@ fn run_serve(
     db_path: PathBuf,
 ) -> anyhow::Result<()> {
     use mackesd_core::workers::{
-        firewall_preset::FirewallPresetWorker, fleet_reconcile, heartbeat::HeartbeatWorker,
-        job_exec, lifecycle_exec, mdns_relay::MdnsRelayWorker, mesh_dns,
-        mesh_router::MeshRouterWorker, netstate_apply, presence_watch, ssh_pubkey_gossip,
+        device_control, firewall_preset::FirewallPresetWorker, fleet_reconcile,
+        heartbeat::HeartbeatWorker, job_exec, lifecycle_exec, mdns_relay::MdnsRelayWorker,
+        mesh_dns, mesh_router::MeshRouterWorker, netstate_apply, presence_watch, ssh_pubkey_gossip,
         sshd_overlay_bind::SshdOverlayBindWorker, validation_suite,
         voice_config::VoiceConfigWorker, RestartPolicy, Spawn, Supervisor,
     };
@@ -6887,6 +6887,23 @@ fn run_serve(
                 RestartPolicy::OnFailure,
             ));
             worker_names.lock().expect("worker_names mutex").push("lifecycle_exec".into());
+        }
+        // DEVMGR-8 — the device-control executor: drains this box's replicated
+        // fleet/device-control/<self>/ for typed privileged-op requests the
+        // Device-Manager surface dispatches (enable/disable, reload module,
+        // rescan bus), gates each against this node's own published inventory
+        // (L9 rail), executes the FIXED sysfs/ip/modprobe seam, hash-chain audits
+        // it, and notifies on failure. Universal (rank 0) like lifecycle_exec.
+        if mackesd_core::worker_role::runs("device_control", role_rank) {
+            sup.spawn(Spawn::new(
+                device_control::DeviceControlExecWorker::new(
+                    workgroup_root.clone(),
+                    node_id.strip_prefix("peer:").unwrap_or(&node_id).to_string(),
+                    node_id.clone(),
+                ),
+                RestartPolicy::OnFailure,
+            ));
+            worker_names.lock().expect("worker_names mutex").push("device_control".into());
         }
         // PD-13 — presence-transition alerts: offline/online crossings
         // become desktop notifications via the alert_relay pipeline.

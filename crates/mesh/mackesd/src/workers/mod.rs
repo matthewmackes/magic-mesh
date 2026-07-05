@@ -475,6 +475,10 @@ pub mod netstate_apply;
 pub mod validation_suite;
 // PD-11 — executes descriptor-gated container/VM lifecycle requests.
 pub mod lifecycle_exec;
+// DEVMGR-8 — executes privileged device-control ops (enable/disable, reload
+// module, rescan bus) on this node for the Device-Manager surface, over the
+// replicated fleet/device-control/<self> request dir.
+pub mod device_control;
 // NF-21.3 — owns the firewalld preset that opens Nebula's
 // UDP/4242 (all peers) + TCP/443 (lighthouses) inbound. Replaces
 // mesh_nebula.py::apply_nebula_firewall_preset so the Python
