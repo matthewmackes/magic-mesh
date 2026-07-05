@@ -61,6 +61,12 @@ pub enum Surface {
     /// The **Instances** surface — this workstation's local cloud-hypervisor VMs
     /// (`mde-kvm`): the create / boot / shutdown lifecycle broker (E12-7).
     Instances,
+    /// The **Infra as Code (`IaC`)** surface — the `OpenStack` `IaaS` control
+    /// plane (`docs/design/iac-workspace.md`, IAC-2): the Keystone service
+    /// catalog + per-service API health + the merged service directory, consumed
+    /// off the Bus (`action/cloud/get-catalog`). The comprehensive `OpenStack`
+    /// admin beside the focused Instances VM view (#24).
+    InfraCode,
     /// The embedded Music surface (`mde-music-egui`).
     Music,
     /// The embedded Media surface (`mde-media-egui`) — the full media player
@@ -121,10 +127,11 @@ impl Surface {
     /// labelled [`GROUPS`] (the Workbench leads standalone), preserving this
     /// relative order within each group (L7); a compile-time guard keeps the two
     /// tables in sync.
-    pub(crate) const ALL: [Surface; 15] = [
+    pub(crate) const ALL: [Surface; 16] = [
         Surface::Workbench,
         Surface::MeshView,
         Surface::Instances,
+        Surface::InfraCode,
         Surface::Desktop,
         Surface::Music,
         Surface::Media,
@@ -149,6 +156,10 @@ impl Surface {
             Surface::Workbench => IconId::Workbench,
             Surface::MeshView => IconId::MeshView,
             Surface::Instances => IconId::Instances,
+            // The IaC surface wears the **Server** (infrastructure/rack) badge —
+            // the OpenStack IaaS control plane reads as "infrastructure", and it
+            // stays distinct from the Instances cloud glyph (the map is 1:1).
+            Surface::InfraCode => IconId::Server,
             Surface::Desktop => IconId::Desktop,
             Surface::Music => IconId::Music,
             Surface::Media => IconId::Media,
@@ -229,7 +240,7 @@ const GROUPS: [Group; 6] = [
     Group {
         label: "Workloads",
         accent: Style::ACCENT_WORKLOADS,
-        surfaces: &[Surface::Instances],
+        surfaces: &[Surface::Instances, Surface::InfraCode],
     },
     Group {
         label: "Terminals",
@@ -2058,11 +2069,12 @@ mod tests {
         // Notifications + Clipboard surfaces are retired, NOTIFY-CHAT-6), the
         // host-controls System surface, the Storage surface (GParted-authentic disk
         // mgmt, E12-21), and the About surface (the platform-identity screen, QBRAND-6).
-        assert_eq!(Surface::ALL.len(), 15);
+        assert_eq!(Surface::ALL.len(), 16);
         assert_eq!(Surface::ALL[0], Surface::Workbench);
         for s in [
             Surface::MeshView,
             Surface::Instances,
+            Surface::InfraCode,
             Surface::Desktop,
             Surface::Music,
             Surface::Media,
@@ -2095,6 +2107,7 @@ mod tests {
             (Surface::Workbench, IconId::Workbench),
             (Surface::MeshView, IconId::MeshView),
             (Surface::Instances, IconId::Instances),
+            (Surface::InfraCode, IconId::Server),
             (Surface::Desktop, IconId::Desktop),
             (Surface::Music, IconId::Music),
             (Surface::Media, IconId::Media),
@@ -2118,7 +2131,8 @@ mod tests {
                 "{surface:?} maps to the blank wordmark"
             );
         }
-        // The map is injective — 15 surfaces, 15 distinct glyph names.
+        // The map is injective — 16 surfaces, 16 distinct glyph names (IaC wears
+        // the Server badge, unshared by any other surface).
         let mut names: Vec<&str> = Surface::ALL.iter().map(|s| s.icon_id().name()).collect();
         names.sort_unstable();
         names.dedup();
@@ -2163,12 +2177,12 @@ mod tests {
         // System surface (right-side Settings button), and Desktop (far-right
         // Show-Desktop sliver).
         use Surface::{
-            About, Browser, Chat, Editor, Files, Instances, Media, MeshView, Music, Storage,
-            Terminal, Voice, Workbench,
+            About, Browser, Chat, Editor, Files, InfraCode, Instances, Media, MeshView, Music,
+            Storage, Terminal, Voice, Workbench,
         };
         let expect: [(&str, &[Surface]); 6] = [
             ("Comms", &[Voice, Chat]),
-            ("Workloads", &[Instances]),
+            ("Workloads", &[Instances, InfraCode]),
             ("Terminals", &[Browser, Terminal, Editor]),
             ("Mesh", &[MeshView]),
             ("System", &[Files, Storage, About]),

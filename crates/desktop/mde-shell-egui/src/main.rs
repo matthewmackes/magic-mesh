@@ -33,6 +33,7 @@ mod explorer;
 mod formfactor;
 mod host_mirror;
 mod hotkeys;
+mod iac;
 mod instances;
 mod keyboard;
 mod lock_signal;
@@ -181,6 +182,12 @@ struct Shell {
     /// lifecycle; with no live VMM the ops surface mde-kvm's typed gated error, and
     /// an empty roster shows the honest "No local VMs" EmptyState.
     instances: instances::InstancesState,
+    /// The Infra as Code (`IaC`) surface — the `OpenStack` `IaaS` control plane
+    /// (IAC-2). Consumes the Keystone service catalog + per-service API health off
+    /// the Bus read verb `action/cloud/get-catalog` (no shell→mackesd dep, §6) and renders
+    /// the Overview: the API status band + the merged service directory. Honest
+    /// "not configured / unreachable" when the cloud/verb is absent (§7).
+    infra_code: iac::InfraCodeState,
     /// The Chat surface (NOTIFY-CHAT-3) — the ICQ roster + conversation panes over
     /// the chat worker's `state/chat/roster` + `state/chat/conversation/<key>`
     /// read-model. A pure renderer; sends via `action/chat/send`.
@@ -312,6 +319,7 @@ impl Shell {
             vdi: vdi::VdiState::default(),
             chooser: chooser::ChooserState::default(),
             instances: instances::InstancesState::default(),
+            infra_code: iac::InfraCodeState::default(),
             chat: chat::ChatState::default(),
             system: system::SystemState::default(),
             storage: storage::StorageState::default(),
@@ -541,6 +549,17 @@ impl Shell {
                 let instances = &mut self.instances;
                 ui.push_id("shell-instances", |ui| {
                     instances::instances_panel(ui, instances);
+                });
+            }
+            Surface::InfraCode => {
+                // The OpenStack IaaS control plane (IAC-2) — the Overview tab: the
+                // API status band + the merged service directory, consumed off the
+                // Bus (`action/cloud/get-catalog`). Scoped under its own `push_id`
+                // like every mounted surface so its egui ids can't collide in the
+                // shell's one `Context`.
+                let infra_code = &mut self.infra_code;
+                ui.push_id("shell-infra-code", |ui| {
+                    iac::infra_code_panel(ui, infra_code);
                 });
             }
             Surface::Music => {
@@ -842,6 +861,14 @@ impl Shell {
         // change on any peer surfaces without operator input (E12-21).
         if self.nav.expanded && self.nav.surface == Surface::Storage {
             self.storage.poll(ctx);
+        }
+
+        // The Infra as Code surface polls the OpenStack catalog off the Bus
+        // (`action/cloud/get-catalog`) while it's in view — a non-blocking
+        // request/reply on its ~15 s cadence; the request is published sync and its
+        // reply read on a later tick, so the frame never stalls (IAC-2).
+        if self.nav.expanded && self.nav.surface == Surface::InfraCode {
+            self.infra_code.poll(ctx);
         }
 
         // The About → Device-Manager surface re-reads THIS node's published

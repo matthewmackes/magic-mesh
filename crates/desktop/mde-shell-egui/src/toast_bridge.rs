@@ -218,6 +218,8 @@ fn surface_by_name(name: &str) -> Option<Surface> {
         "mesh-map" | "meshview" | "mesh" => Some(Surface::MeshView),
         "desktop" => Some(Surface::Desktop),
         "instances" => Some(Surface::Instances),
+        // The Infra as Code (IaC) OpenStack control plane (IAC-2).
+        "iac" | "infra-code" | "infracode" | "infra" => Some(Surface::InfraCode),
         "music" => Some(Surface::Music),
         "files" => Some(Surface::Files),
         "voice" => Some(Surface::Voice),

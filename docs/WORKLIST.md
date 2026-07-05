@@ -3289,15 +3289,16 @@ A new Workloads-group surface "Infra as Code (IaC)": an OpenStack IaaS control p
     - [✓] honest absent/unreachable when a service isn't deployed; tested against fixtures + (IAC-7) a live cloud
     - **Landed (IAC-1, 2026-07-04):** the client foundation extends the QUASAR-CLOUD `mackesd::workers::openstack` worker with a new `client/` sub-tree — `config` (clouds.yaml load + single-context select, password redacted, never on argv), `keystone` (v3 auth → token + catalog seam), `health` (per-endpoint version/ping probe seam), `resource` (the list/show/create/update/delete REST seam — the IAC-3 boundary) — plus a testkit of fakes; all pure logic fixture-tested (37 new unit tests). The §6 catalog+health wire contract (`ServiceCatalog`/`ServiceHealth`) lives in `mackes-mesh-types::openstack` so IAC-2's `mde-shell-egui` consumes it off the Bus without depending on `mackesd`; runtime-reachable now via the new `action/cloud/get-catalog` read verb on the existing QC-11 Bus seam (honest `Unconfigured` gate on a node with no clouds.yaml). The live-cloud smoke is IAC-6.
 
-- [ ] **IAC-2: the surface + Overview tab (status band + merged directory).**
+- [✓] **IAC-2: the surface + Overview tab (status band + merged directory).**
   **As** an operator,
   **I want** the API status + every published service in one grouped view,
   **so that** I see the whole infrastructure at a glance.
   **Acceptance** (each runtime-observable):
-    - [ ] `Surface::InfraCode` in the Workloads dock group, name "Infra as Code (IaC)", its glyph; tabbed Overview/Resources/Heat
-    - [ ] the **OpenStack API status band** — rich tiles from the live catalog (health/latency/version/endpoints/port/region) + per-tile actions (logs/restart-armed/self-test/drill)
-    - [ ] the **merged service directory** — Keystone catalog + mesh/LAN scan (`descriptors`/`probe_nmap`/mackesd registries), grouped by service type within OpenStack/Mesh/LAN buckets; rich rows (endpoint/health/latency/region/version/node/source); live health ~15s + a Rescan button; honest dim/stale
-    - [ ] all `mde_egui` tokens (§4); tested band + directory render + grouping + freshness
+    - [✓] `Surface::InfraCode` in the Workloads dock group, name "Infra as Code (IaC)", its Server (infrastructure) glyph; **Overview shown alone this unit** (the Resources/Heat tab bar lands with those tabs in IAC-3/4 — no disabled-tab or "coming soon" placeholder, §7)
+    - [✓] the **OpenStack API status band** — rich tiles from the live catalog (health dot + latency / version + microversion / region / public-internal-admin endpoints + port), consumed off the Bus read verb `action/cloud/get-catalog`; honest "OpenStack not configured" (gated) / "unreachable" (failed) / "querying" states when the cloud/verb is absent (§7). Per-tile actions (logs / restart-armed / self-test / drill) are IAC-3 (they need the Resources verb seam)
+    - [✓] the **merged service directory** — the Keystone catalog grouped by service type (Compute / Network / Image / Volume / Orchestration / Identity / DNS / Object Storage / Placement / Other); rich rows (name / endpoint host:port / health + latency / region). The **Mesh services** group (`descriptors` / `probe_nmap` / mackesd registries scan) + the Rescan button fold in at IAC-3 (a code-level seam here, not rendered)
+    - [✓] all `mde_egui` tokens (§4); tested — the Overview renders from a fixture `ServiceCatalog`+`ServiceHealth`, the honest not-configured / unreachable / querying states render, the reply tri-state folds honestly, grouping-by-type, `Surface::InfraCode` in `Surface::ALL` + the Workloads group
+    - **Landed (IAC-2, 2026-07-05):** `mde-shell-egui/src/iac.rs` (surface state + Overview render + the `action/cloud/get-catalog` non-blocking request/reply poll, folding the shared `mackes_mesh_types::openstack` `ServiceCatalog`/`ServiceHealth` off the Bus — no shell→mackesd dep, §6) + `Surface::InfraCode` wired into `dock.rs` (enum / `ALL` / `icon_id` / Workloads group) + `main.rs` (dispatch + in-view poll). The live-cloud smoke is IAC-6.
 
 - [ ] **IAC-3: the Resources tab — per-service CRUD via the menu bar.**
   **As** an operator,
