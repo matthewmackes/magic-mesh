@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use crate::workers::container::{Container, ContainerState};
 
+use super::designate::PeerDirectorySource;
 use super::fleet::{CloudDesired, FleetStateError, FleetStateSource};
 use super::podman::{KollaServiceSpec, PodmanRunner, RunnerError};
 use super::verbs::{CloudInstance, InstanceOpError, InstanceOps, LifecycleAction};
@@ -233,6 +234,30 @@ impl PodmanRunner for FakeRunner {
         self.gate()?;
         self.containers.lock().unwrap().remove(name);
         Ok(())
+    }
+}
+
+/// QC-17 — an in-memory [`PeerDirectorySource`]: a fixture peer directory so
+/// the Designate zone-feed derivation runs without etcd.
+pub struct FakePeerDirectory {
+    pairs: Vec<(String, String)>,
+}
+
+impl FakePeerDirectory {
+    /// A fixture directory of `(hostname, overlay_ip)` pairs.
+    pub fn new(pairs: &[(&str, &str)]) -> Self {
+        Self {
+            pairs: pairs
+                .iter()
+                .map(|(h, ip)| ((*h).to_string(), (*ip).to_string()))
+                .collect(),
+        }
+    }
+}
+
+impl PeerDirectorySource for FakePeerDirectory {
+    fn pairs(&self) -> Vec<(String, String)> {
+        self.pairs.clone()
     }
 }
 

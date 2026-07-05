@@ -46,6 +46,11 @@
 //!   service config it points to) from the doctrine, atomically. QC-5 seals the
 //!   real per-service credentials it substitutes; QC-9 renders Glance's
 //!   local file store + image cache + cross-node `copy-image` replication.
+//! - [`designate`] — QC-17's naming plane (Q46 — Designate replaces DNS/
+//!   naming): the pure peer-directory → zone-record fold, the re-seed plan +
+//!   feed script the QC-10 seed runs (the peer directory rebuilds the zones
+//!   from scratch), the peer-fed pool topology (every node's bind9 — no
+//!   fixed center), and the honest live-resolve gate.
 //! - [`image_pipeline`] — QC-9's diskimage-builder → Glance pipeline (the
 //!   pinned, testable definition that retires `build-mde-vm-golden.sh`, Q36/53):
 //!   `disk-image-create` from a versioned element set → `glance image-create`
@@ -79,6 +84,7 @@ pub mod catalog;
 /// IAC surface (IAC-2..N) builds on.
 pub mod client;
 pub mod config_render;
+pub mod designate;
 pub mod fleet;
 pub mod image_pipeline;
 pub mod images;
@@ -103,6 +109,7 @@ use super::{ShutdownToken, Worker};
 use capacity::NodeCapacity;
 use client::{CloudClient, LiveOpenStack};
 use config_render::{render_cloud_bootstrap, render_fleet_heat_stack, OverlayBind};
+use designate::{MeshPeerDirectory, PeerDirectorySource};
 use fleet::{FleetStateSource, MeshFleetState};
 use podman::{PodmanCli, PodmanRunner, DEFAULT_KOLLA_CONFIG_ROOT};
 use reconcile::{converge_cycle, CycleOutcome, DoctrineStatus, OpenStackState};
@@ -199,7 +206,13 @@ fn resolve_overlay(path: &Path) -> OverlayBind {
 /// failure rides the alert lane (→ chat, lock 11), never a fabricated capacity
 /// or a silent swallow (§7). Idempotent: the seed's own guards make re-applying
 /// on a later tick a no-op.
-fn render_leader_bootstrap(config_root: &Path, outcome: &mut CycleOutcome) {
+fn render_leader_bootstrap(
+    config_root: &Path,
+    peers: &dyn PeerDirectorySource,
+    host: &str,
+    instances: &[(String, String)],
+    outcome: &mut CycleOutcome,
+) {
     let DoctrineStatus::Enabled {
         leader: true,
         kolla_release,
@@ -238,6 +251,30 @@ fn render_leader_bootstrap(config_root: &Path, outcome: &mut CycleOutcome) {
             .alerts
             .push(format!("openstack: fleet Heat stack render failed — {e}"));
     }
+
+    // QC-17 — the leader renders the Designate naming plane's peer-fed inputs
+    // (Q46: the peer directory feeds — and can re-seed — the mesh zone):
+    // the pool topology (every node's bind9, no fixed center) and the zone
+    // feed/re-seed script the QC-10 seed runs. Cloud-global like the seed, so
+    // leader-only; this tick runs ON the leader, so `host` IS the leader the
+    // leader-hosted names (mariadb/ovn-nb/ovn-sb.mesh) pin to. The live DNS
+    // resolve check gates honestly into the feed's provenance header (§7 —
+    // never a claimed-working naming plane). Render failures ride the alert
+    // lane (→ chat), never a silent swallow.
+    let peer_pairs = peers.pairs();
+    if let Err(e) = designate::render_designate_pools(config_root, &release, &peer_pairs) {
+        outcome
+            .alerts
+            .push(format!("openstack: designate pool render failed — {e}"));
+    }
+    let records = designate::derive_zone_records(&peer_pairs, Some(host), instances);
+    let gate = designate::live_resolve(&format!("{host}.mesh"));
+    let note = designate::resolve_note(&gate);
+    if let Err(e) = designate::render_designate_feed(config_root, &release, &records, &note) {
+        outcome.alerts.push(format!(
+            "openstack: designate zone feed render failed — {e}"
+        ));
+    }
 }
 
 /// The QC-2 `openstack` worker.
@@ -247,6 +284,10 @@ pub struct OpenstackWorker {
     /// The doctrine seam (production: [`MeshFleetState`] — QC-4's live read
     /// off the Syncthing share + `/mesh/leader` lease).
     fleet: Arc<dyn FleetStateSource + Send + Sync>,
+    /// QC-17 — the peer-directory seam the leader's Designate zone feed +
+    /// pool topology derive from (production: [`MeshPeerDirectory`] — the
+    /// etcd-first directory with the fs-union fallback).
+    peers: Arc<dyn PeerDirectorySource + Send + Sync>,
     /// The podman seam (production: [`PodmanCli`]). `Arc` so each cycle runs
     /// on a `spawn_blocking` thread without borrowing `self`.
     runner: Arc<dyn PodmanRunner + Send + Sync>,
@@ -298,6 +339,7 @@ impl OpenstackWorker {
     pub fn new(host: String, workgroup_root: PathBuf) -> Self {
         Self {
             fleet: Arc::new(MeshFleetState::new(host.clone(), workgroup_root.clone())),
+            peers: Arc::new(MeshPeerDirectory::new(workgroup_root.clone())),
             host,
             runner: Arc::new(PodmanCli::new()),
             instances: Arc::new(OpenstackCli::new()),
@@ -322,6 +364,14 @@ impl OpenstackWorker {
     #[must_use]
     pub fn with_runner(mut self, runner: Arc<dyn PodmanRunner + Send + Sync>) -> Self {
         self.runner = runner;
+        self
+    }
+
+    /// Inject the QC-17 peer-directory seam (tests — the Designate zone feed
+    /// derives from a fixture directory instead of etcd).
+    #[must_use]
+    pub fn with_peers(mut self, peers: Arc<dyn PeerDirectorySource + Send + Sync>) -> Self {
+        self.peers = peers;
         self
     }
 
@@ -384,12 +434,15 @@ impl OpenstackWorker {
         &self,
         last: &mut Option<OpenStackState>,
         last_pub_at: &mut Option<Instant>,
+        instance_snapshot: &[(String, String)],
     ) {
         let fleet = Arc::clone(&self.fleet);
         let runner = Arc::clone(&self.runner);
+        let peers = Arc::clone(&self.peers);
         let config_root = self.config_root.clone();
         let share_root = self.share_root.clone();
         let host = self.host.clone();
+        let instances = instance_snapshot.to_vec();
         // QC-6 — resolve this node's overlay bind each tick (it may come up
         // after the worker starts, once the node enrolls); an unresolved overlay
         // gates every start honestly in the converge.
@@ -405,7 +458,8 @@ impl OpenstackWorker {
             );
             // QC-10 — the leader renders the cloud bootstrap seed (capacity-
             // derived flavors + hard per-user quotas) alongside the converge.
-            render_leader_bootstrap(&config_root, &mut outcome);
+            // QC-17 — plus the Designate pool + zone feed (peer-directory-fed).
+            render_leader_bootstrap(&config_root, &*peers, &host, &instances, &mut outcome);
             outcome
         })
         .await
@@ -506,15 +560,21 @@ impl Worker for OpenstackWorker {
         // IAC-5 — the mesh-notify producer's cross-tick state (host stamp +
         // last-seen per-service health for the Up→Down edge).
         let mut notifier = CloudNotifier::new(self.host.clone());
+        // QC-17 — the latest `(name, ip)` Nova roster snapshot the leader's
+        // Designate zone feed derives instance records from. Empty until a
+        // roster read lands (honest absence — instance records simply aren't
+        // fed yet), refreshed by the QC-20 instance watch.
+        let instance_snapshot: Vec<(String, String)> = Vec::new();
         // Converge + publish immediately on start so a panel doesn't wait a
         // full tick for the first mirror row.
-        self.cycle_and_publish(&mut last, &mut last_pub_at).await;
+        self.cycle_and_publish(&mut last, &mut last_pub_at, &instance_snapshot)
+            .await;
         let mut tick = tokio::time::interval(self.poll);
         tick.tick().await; // consume the immediate first tick
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    self.cycle_and_publish(&mut last, &mut last_pub_at).await;
+                    self.cycle_and_publish(&mut last, &mut last_pub_at, &instance_snapshot).await;
                     // Answer any queued cloud verbs against the fresh mirror.
                     if let Some(state) = last.clone() {
                         self.drain_verbs(&mut verb_cursors, &mut notifier, &state).await;
@@ -529,8 +589,14 @@ impl Worker for OpenstackWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::testkit::{FakeFleet, FakeRunner};
+    use super::testkit::{FakeFleet, FakePeerDirectory, FakeRunner};
     use super::*;
+
+    /// A two-node fixture directory for the leader-render tests (`node-a` is
+    /// the host under test / the leader).
+    fn fake_peers() -> FakePeerDirectory {
+        FakePeerDirectory::new(&[("node-a", "10.42.0.9"), ("node-b", "10.42.0.4")])
+    }
 
     #[test]
     fn mirror_topic_is_namespaced_per_node() {
@@ -616,8 +682,14 @@ mod tests {
             },
         ] {
             let mut outcome = outcome_with(doctrine);
-            render_leader_bootstrap(dir.path(), &mut outcome);
+            render_leader_bootstrap(dir.path(), &fake_peers(), "node-a", &[], &mut outcome);
             assert!(!seed.exists(), "no seed off the leader");
+            // QC-17 — nor the Designate pool/feed (cloud-global = leader's).
+            assert!(!dir
+                .path()
+                .join("bootstrap")
+                .join("designate-feed.sh")
+                .exists());
             assert!(outcome.alerts.is_empty(), "{:?}", outcome.alerts);
         }
     }
@@ -632,7 +704,7 @@ mod tests {
             leader: true,
             kolla_release: "2024.1".into(),
         });
-        render_leader_bootstrap(dir.path(), &mut outcome);
+        render_leader_bootstrap(dir.path(), &fake_peers(), "node-a", &[], &mut outcome);
         assert!(
             outcome.alerts.is_empty(),
             "the host probe/render must succeed: {:?}",
@@ -643,6 +715,60 @@ mod tests {
         assert!(seed.contains("QC-10"), "{seed}");
         assert!(seed.contains("ensure_flavor m1.large"), "{seed}");
         assert!(seed.contains("ensure_limit nova class:VCPU"), "{seed}");
+    }
+
+    #[test]
+    fn the_leader_renders_the_peer_fed_designate_pool_and_zone_feed() {
+        // QC-17/Q46 — alongside the QC-10 seed, the leader renders the
+        // Designate naming plane's peer-directory-fed inputs: the pool
+        // topology (every node's bind9) and the zone feed/re-seed script,
+        // with the leader-hosted names pinned to THIS host (the tick runs on
+        // the leader) and the instance snapshot folded in.
+        let dir = tempfile::tempdir().unwrap();
+        let mut outcome = outcome_with(DoctrineStatus::Enabled {
+            leader: true,
+            kolla_release: "2024.1".into(),
+        });
+        let instances = vec![("web-1".to_string(), "10.42.100.7".to_string())];
+        render_leader_bootstrap(
+            dir.path(),
+            &fake_peers(),
+            "node-a",
+            &instances,
+            &mut outcome,
+        );
+        assert!(
+            outcome.alerts.is_empty(),
+            "renders must succeed: {:?}",
+            outcome.alerts
+        );
+        let feed = std::fs::read_to_string(dir.path().join("bootstrap").join("designate-feed.sh"))
+            .expect("the leader rendered the zone feed");
+        // Node + service + leader-pinned + instance records, all derived.
+        assert!(
+            feed.contains("ensure_rrset node-a.mesh. 10.42.0.9"),
+            "{feed}"
+        );
+        assert!(
+            feed.contains("ensure_rrset keystone.mesh. 10.42.0.4 10.42.0.9"),
+            "{feed}"
+        );
+        assert!(
+            feed.contains("ensure_rrset mariadb.mesh. 10.42.0.9"),
+            "the leader-hosted name pins this host: {feed}"
+        );
+        assert!(
+            feed.contains("ensure_rrset web-1.cloud.mesh. 10.42.100.7"),
+            "{feed}"
+        );
+        // The honest live-resolve gate is stamped (§7): on a box where
+        // node-a.mesh doesn't resolve it reads GATED, never claimed-working.
+        assert!(feed.contains("# live-resolve gate: "), "{feed}");
+        let pools =
+            std::fs::read_to_string(dir.path().join("bootstrap").join("designate-pools.yaml"))
+                .expect("the leader rendered the pool topology");
+        assert!(pools.contains("bind9 on node-a"), "{pools}");
+        assert!(pools.contains("bind9 on node-b"), "{pools}");
     }
 
     #[tokio::test]

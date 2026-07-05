@@ -8,8 +8,9 @@
 //! mapped each entry to its Syncthing-mirrored image archive
 //! ([`ServiceKind::archive_file_name`] — the [`super::images`] lane). Later
 //! QC tasks keep extending it in place: QC-4 renders each entry's Kolla
-//! config, QC-6 binds each API entry to the Nebula interface, and the wave-2
-//! services (Q25 — Designate, Octavia, Heat, Horizon) land as new variants.
+//! config, QC-6 binds each API entry to the Nebula interface, QC-19 landed
+//! the wave-2 Heat/Octavia/Horizon variants (Q25/47/61), and QC-17 lands the
+//! wave-2 Designate naming plane (Q46 — Designate replaces DNS/naming).
 
 use serde::{Deserialize, Serialize};
 
@@ -35,9 +36,9 @@ pub enum Placement {
 /// The variant set is the QC-2 skeleton catalog: the QC-4 foundation trio +
 /// the QC-5/6 identity + core-API set + the QC-7/8 OVN/Cinder plane, extended
 /// by QC-19 with the wave-2 services (Heat, Octavia, and the optional Horizon —
-/// Q25/47/61). Names follow the Kolla conventions the mirrored archives carry:
-/// container names use underscores (`nova_api`), image basenames use dashes
-/// (`nova-api`).
+/// Q25/47/61) and by QC-17 with the Designate naming plane (Q46). Names follow
+/// the Kolla conventions the mirrored archives carry: container names use
+/// underscores (`nova_api`), image basenames use dashes (`nova-api`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceKind {
@@ -115,12 +116,32 @@ pub enum ServiceKind {
     /// only when the doctrine opts in (`horizon = true`); Workbench is the
     /// primary Cloud UI (Q26), so absent-by-default is honest, not a gap.
     Horizon,
+    // ── Wave-2 naming (QC-17, Q25/46 — Designate replaces DNS/naming) ──
+    /// Designate REST API (Q46) — serves `openstack zone`/`recordset`; the
+    /// peer directory feeds (and can re-seed) the zones it fronts.
+    DesignateApi,
+    /// Designate central — the brains: owns the zone/recordset state machine
+    /// the API and workers coordinate through.
+    DesignateCentral,
+    /// Designate producer — the periodic-task emitter (zone refresh, delayed
+    /// NOTIFY, …).
+    DesignateProducer,
+    /// Designate worker — pushes zone changes to the DNS backends (this
+    /// fleet's per-node bind9 targets) over rndc.
+    DesignateWorker,
+    /// Designate mini-DNS — the AXFR/NOTIFY master the backend bind9s
+    /// transfer zones from.
+    DesignateMdns,
+    /// The bind9 backend that actually answers DNS on this node's overlay
+    /// (Q46 — nodes, instances, services resolve mesh-wide). Every node runs
+    /// one (no fixed center); the peer-directory-fed pool lists them all.
+    DesignateBackendBind9,
 }
 
 impl ServiceKind {
     /// Every catalogued service, in the canonical (enum-order) sequence the
     /// mirror rows + reconcile folds iterate.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 33] = [
         Self::Mariadb,
         Self::Rabbitmq,
         Self::Memcached,
@@ -148,6 +169,12 @@ impl ServiceKind {
         Self::OctaviaHealthManager,
         Self::OctaviaHousekeeping,
         Self::Horizon,
+        Self::DesignateApi,
+        Self::DesignateCentral,
+        Self::DesignateProducer,
+        Self::DesignateWorker,
+        Self::DesignateMdns,
+        Self::DesignateBackendBind9,
     ];
 
     /// The Kolla-convention container name (underscored) — the `--name` the
@@ -183,6 +210,12 @@ impl ServiceKind {
             Self::OctaviaHealthManager => "octavia_health_manager",
             Self::OctaviaHousekeeping => "octavia_housekeeping",
             Self::Horizon => "horizon",
+            Self::DesignateApi => "designate_api",
+            Self::DesignateCentral => "designate_central",
+            Self::DesignateProducer => "designate_producer",
+            Self::DesignateWorker => "designate_worker",
+            Self::DesignateMdns => "designate_mdns",
+            Self::DesignateBackendBind9 => "designate_backend_bind9",
         }
     }
 
@@ -218,6 +251,12 @@ impl ServiceKind {
             Self::OctaviaHealthManager => "octavia-health-manager",
             Self::OctaviaHousekeeping => "octavia-housekeeping",
             Self::Horizon => "horizon",
+            Self::DesignateApi => "designate-api",
+            Self::DesignateCentral => "designate-central",
+            Self::DesignateProducer => "designate-producer",
+            Self::DesignateWorker => "designate-worker",
+            Self::DesignateMdns => "designate-mdns",
+            Self::DesignateBackendBind9 => "designate-backend-bind9",
         }
     }
 
@@ -280,6 +319,11 @@ impl ServiceKind {
             Self::HeatApi => Some(8004),
             Self::HeatApiCfn => Some(8000),
             Self::OctaviaApi => Some(9876),
+            // Wave-2 naming (QC-17): the Designate REST API (Q46). The
+            // central/producer/worker/mdns agents and the bind9 backend carry
+            // no Keystone-catalog endpoint (bind9 answers DNS on 53, not a
+            // tenant-facing HTTP API).
+            Self::DesignateApi => Some(9001),
             _ => None,
         }
     }
@@ -300,6 +344,7 @@ impl ServiceKind {
             Self::HeatApi => Some("heat.mesh"),
             Self::HeatApiCfn => Some("heat-cfn.mesh"),
             Self::OctaviaApi => Some("octavia.mesh"),
+            Self::DesignateApi => Some("designate.mesh"),
             _ => None,
         }
     }
@@ -494,6 +539,13 @@ mod tests {
             ServiceKind::OctaviaHealthManager,
             ServiceKind::OctaviaHousekeeping,
             ServiceKind::Horizon,
+            // Wave-2 naming (QC-17): the Designate agents + the bind9 backend
+            // carry no tenant-facing HTTP endpoint (bind9 serves DNS on 53).
+            ServiceKind::DesignateCentral,
+            ServiceKind::DesignateProducer,
+            ServiceKind::DesignateWorker,
+            ServiceKind::DesignateMdns,
+            ServiceKind::DesignateBackendBind9,
         ] {
             assert_eq!(kind.api_port(), None, "{kind:?}");
             assert_eq!(kind.mesh_dns_name(), None, "{kind:?}");
@@ -528,6 +580,42 @@ mod tests {
         assert_eq!(
             ServiceKind::from_container_name("cinder_backup"),
             Some(ServiceKind::CinderBackup)
+        );
+    }
+
+    #[test]
+    fn designate_is_a_full_every_node_naming_plane() {
+        // QC-17/Q46 — Designate replaces DNS/naming: the API advertises the
+        // mesh endpoint like every other API; the agents + the per-node bind9
+        // backend ride every node (no fixed center — the peer-directory-fed
+        // pool lists every node's backend).
+        assert_eq!(ServiceKind::DesignateApi.api_port(), Some(9001));
+        assert_eq!(
+            ServiceKind::DesignateApi.endpoint_url().as_deref(),
+            Some("http://designate.mesh:9001")
+        );
+        for kind in [
+            ServiceKind::DesignateApi,
+            ServiceKind::DesignateCentral,
+            ServiceKind::DesignateProducer,
+            ServiceKind::DesignateWorker,
+            ServiceKind::DesignateMdns,
+            ServiceKind::DesignateBackendBind9,
+        ] {
+            assert_eq!(kind.placement(), Placement::EveryNode, "{kind:?}");
+        }
+        // Kolla naming conventions hold (underscored container, dashed image).
+        assert_eq!(
+            ServiceKind::DesignateBackendBind9.container_name(),
+            "designate_backend_bind9"
+        );
+        assert_eq!(
+            ServiceKind::DesignateBackendBind9.image_name(),
+            "designate-backend-bind9"
+        );
+        assert_eq!(
+            ServiceKind::from_container_name("designate_mdns"),
+            Some(ServiceKind::DesignateMdns)
         );
     }
 

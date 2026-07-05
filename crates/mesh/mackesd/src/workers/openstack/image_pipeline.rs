@@ -193,7 +193,10 @@ mod tests {
         assert!(!STANDARD_IMAGES.is_empty(), "at least one standard image");
         let base = &STANDARD_IMAGES[0];
         assert_eq!(base.name, "mcnf-base");
-        assert!(!base.elements.is_empty(), "an image needs an element manifest");
+        assert!(
+            !base.elements.is_empty(),
+            "an image needs an element manifest"
+        );
         // The base-distro element leads the manifest.
         assert_eq!(base.elements[0], "fedora");
     }

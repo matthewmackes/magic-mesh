@@ -45,10 +45,11 @@ use super::secrets::{SecretView, Secrets};
 
 /// Mesh-DNS name the leader-hosted `MariaDB` (Q15) answers on — resolves to the
 /// current leader over the overlay (Q46, Designate/peer-directory), so a
-/// failover moves the name, not the config.
-const DB_MESH_NAME: &str = "mariadb.mesh";
+/// failover moves the name, not the config. `pub(super)` since QC-17: the
+/// Designate zone feed serves this name from the peer directory.
+pub(super) const DB_MESH_NAME: &str = "mariadb.mesh";
 /// Mesh-DNS name the clustered `RabbitMQ` (Q16) answers on.
-const RABBIT_MESH_NAME: &str = "rabbitmq.mesh";
+pub(super) const RABBIT_MESH_NAME: &str = "rabbitmq.mesh";
 /// Mesh-DNS name Keystone answers on (Q21/22).
 const KEYSTONE_MESH_NAME: &str = "keystone.mesh";
 /// AMQP port.
@@ -67,9 +68,10 @@ const OVN_NB_PORT: u16 = 6641;
 const OVN_SB_PORT: u16 = 6642;
 /// Mesh-DNS name the leader-hosted OVN northbound DB (Q15) answers on — resolves
 /// to the current leader over the overlay (Q46, like `mariadb.mesh`).
-const OVN_NB_MESH_NAME: &str = "ovn-nb.mesh";
+/// `pub(super)` since QC-17: served by the Designate zone feed.
+pub(super) const OVN_NB_MESH_NAME: &str = "ovn-nb.mesh";
 /// Mesh-DNS name the leader-hosted OVN southbound DB answers on.
-const OVN_SB_MESH_NAME: &str = "ovn-sb.mesh";
+pub(super) const OVN_SB_MESH_NAME: &str = "ovn-sb.mesh";
 /// The single flat provider network's physnet label (Q43 — one flat provider
 /// network bridged into the mesh; every instance a peer-equivalent). Matches the
 /// `flat_networks` list, the `bridge_mappings`, and the chassis
@@ -136,6 +138,27 @@ const HORIZON_PORT: u16 = 80;
 /// bootstrap seed under `<config_root>/bootstrap/` (design Q61 — the worker
 /// renders stacks, Heat executes).
 const FLEET_HEAT_STACK_FILE: &str = "fleet-stack.yaml";
+
+// ── QC-17: the wave-2 Designate naming plane (Q25/46) ──
+/// The port every node's bind9 backend answers DNS on — bound to the overlay
+/// only (Q23), so mesh names resolve mesh-wide and never on the public underlay.
+pub(super) const DNS_PORT: u16 = 53;
+/// The Designate mini-DNS (AXFR/NOTIFY master) listen port — the per-node
+/// bind9 backends transfer zones from here.
+pub(super) const DESIGNATE_MDNS_PORT: u16 = 5354;
+/// The bind9 rndc control port the Designate worker drives each backend on.
+pub(super) const RNDC_PORT: u16 = 953;
+/// Where the shared sealed rndc key lands inside the Designate containers —
+/// the pool's `rndc_key_file` option points here.
+pub(super) const DESIGNATE_RNDC_KEY_PATH: &str = "/etc/designate/rndc.key";
+/// The rendered Designate zone feed's filename under `<config_root>/bootstrap/`
+/// ([`super::designate::render_designate_feed`] writes it; the QC-10 seed runs
+/// it when present).
+pub(super) const DESIGNATE_FEED_FILE: &str = "designate-feed.sh";
+/// The rendered peer-directory-fed Designate pool topology's filename
+/// ([`super::designate::render_designate_pools`] writes it; the feed applies
+/// it via `designate-manage pool update`).
+pub(super) const DESIGNATE_POOLS_FILE: &str = "designate-pools.yaml";
 /// The stack name the leader creates the fleet-inventory stack under, so
 /// `openstack stack list` shows one authoritative, fleet-derived stack.
 const FLEET_HEAT_STACK_NAME: &str = "mcnf-fleet";
@@ -522,6 +545,24 @@ pub fn render_cloud_bootstrap(
          fi"
     );
 
+    // ── QC-17: the Designate zone feed (Q46 — Designate replaces naming) ──
+    // The worker renders the peer-directory-derived pool + record feed beside
+    // this seed ([`super::designate`]); running it here seeds/re-seeds the mesh
+    // zone. Idempotent + drift-correcting; skipped if the wave-2 Designate
+    // plane (and so its rendered feed) isn't present on this fleet.
+    body.push_str(
+        "\n# QC-17 — the Designate zone feed (Q46): the peer directory feeds the\n\
+         # mesh zone and can re-seed it from scratch. Idempotent; skipped if the\n\
+         # wave-2 Designate plane (and so its rendered feed) isn't present.\n",
+    );
+    let _ = writeln!(
+        body,
+        "DESIGNATE_FEED=\"$(dirname \"$0\")/{DESIGNATE_FEED_FILE}\"\n\
+         if [ -f \"$DESIGNATE_FEED\" ]; then\n  \
+         sh \"$DESIGNATE_FEED\"\n\
+         fi"
+    );
+
     let dir = config_root.join("bootstrap");
     let path = dir.join(BOOTSTRAP_SEED_NAME);
     write_atomic(&path, &body).map_err(|source| RenderError::Io {
@@ -533,8 +574,9 @@ pub fn render_cloud_bootstrap(
 }
 
 /// Atomic tmp-write + rename, creating the parent dir (the mesh convention —
-/// mirrors the `chat`/`app_sync` workers' `write_atomic`).
-fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
+/// mirrors the `chat`/`app_sync` workers' `write_atomic`). `pub(super)` since
+/// QC-17: the Designate feed/pool renders reuse it.
+pub(super) fn write_atomic(path: &Path, body: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -738,6 +780,13 @@ fn service_plan(
         }
         ServiceKind::OctaviaHousekeeping => octavia("octavia-housekeeping", overlay, ctx, secrets),
         ServiceKind::Horizon => horizon(overlay, secrets),
+        // ── Wave-2 naming: Designate (QC-17, Q46) ──
+        ServiceKind::DesignateApi => designate("designate-api", overlay, ctx, secrets),
+        ServiceKind::DesignateCentral => designate("designate-central", overlay, ctx, secrets),
+        ServiceKind::DesignateProducer => designate("designate-producer", overlay, ctx, secrets),
+        ServiceKind::DesignateWorker => designate("designate-worker", overlay, ctx, secrets),
+        ServiceKind::DesignateMdns => designate("designate-mdns", overlay, ctx, secrets),
+        ServiceKind::DesignateBackendBind9 => designate_bind9(overlay, secrets),
     }
 }
 
@@ -1164,6 +1213,94 @@ fn horizon(overlay: &str, secrets: &Secrets) -> ServicePlan {
                 port = HORIZON_PORT,
             ),
         }],
+    }
+}
+
+/// The shared rndc key file (QC-17) — bind's `key` clause carrying the sealed
+/// fleet-wide HMAC secret. The Designate worker reads it at
+/// [`DESIGNATE_RNDC_KEY_PATH`] to drive the backends; each bind9 includes the
+/// same clause so the `controls` channel authenticates.
+fn rndc_key_file(dest: &'static str, owner: &'static str, secrets: &Secrets) -> ConfFile {
+    ConfFile {
+        name: "rndc.key",
+        dest,
+        owner,
+        body: format!(
+            "key \"rndc-key\" {{\n    algorithm hmac-sha256;\n    secret \"{key}\";\n}};\n",
+            key = secrets.designate_rndc_key(),
+        ),
+    }
+}
+
+/// The shared Designate plan (QC-17, Q46 — Designate replaces DNS/naming). All
+/// five Designate services (api / central / producer / worker / mdns) read one
+/// `designate.conf`; only the launch command differs.
+///
+/// The API listener and the mini-DNS AXFR master bind to the overlay (QC-6,
+/// Q22/23); the DB (Q15), RPC (Q16), and Keystone authtoken (Q21) are the same
+/// sealed seams every API shares. The worker's bind9 targets ride the
+/// peer-directory-fed pool ([`super::designate`] renders it — the topology is
+/// fleet state, not static config), authenticated by the sealed rndc key.
+fn designate(command: &str, overlay: &str, ctx: &RenderCtx, secrets: &Secrets) -> ServicePlan {
+    ServicePlan {
+        command: command.to_string(),
+        files: vec![
+            ConfFile {
+                name: "designate.conf",
+                dest: "/etc/designate/designate.conf",
+                owner: "designate:designate",
+                body: format!(
+                    "[DEFAULT]\ndebug = False\ntransport_url = {rpc}\n\
+                     [service:api]\nlisten = {host}:{api_port}\n\
+                     api_base_uri = {endpoint}\n\
+                     enable_api_v2 = True\nenable_api_admin = False\n\
+                     [service:mdns]\nlisten = {host}:{mdns_port}\n\
+                     [service:worker]\nenabled = True\nnotify = True\n\
+                     [storage:sqlalchemy]\nconnection = {db}\n{authtoken}",
+                    rpc = transport_url(secrets),
+                    host = overlay,
+                    api_port = ServiceKind::DesignateApi.api_port().unwrap_or_default(),
+                    endpoint = mesh_endpoint(ServiceKind::DesignateApi),
+                    mdns_port = DESIGNATE_MDNS_PORT,
+                    db = db_url("designate", overlay, ctx, secrets),
+                    authtoken = authtoken("designate", overlay, secrets),
+                ),
+            },
+            rndc_key_file(DESIGNATE_RNDC_KEY_PATH, "designate:designate", secrets),
+        ],
+    }
+}
+
+/// The per-node bind9 backend plan (QC-17, Q46) — the nameserver that actually
+/// answers mesh DNS, bound to this node's overlay only (Q23: the overlay IS the
+/// boundary — a mesh name never resolves on the public underlay). Authoritative
+/// only (`recursion no`), zone-managed by Designate over rndc
+/// (`allow-new-zones yes` + the sealed-key `controls` channel), zone data
+/// transferred from the mini-DNS masters the peer-directory-fed pool lists.
+fn designate_bind9(overlay: &str, secrets: &Secrets) -> ServicePlan {
+    ServicePlan {
+        command: "/usr/sbin/named -u named -g -c /etc/named.conf".to_string(),
+        files: vec![
+            ConfFile {
+                name: "named.conf",
+                dest: "/etc/named.conf",
+                owner: "named:named",
+                body: format!(
+                    "options {{\n    \
+                     listen-on port {DNS_PORT} {{ {overlay}; }};\n    \
+                     listen-on-v6 {{ none; }};\n    \
+                     directory \"/var/lib/named\";\n    \
+                     allow-query {{ any; }};\n    \
+                     recursion no;\n    \
+                     allow-new-zones yes;\n    \
+                     minimal-responses yes;\n}};\n\
+                     include \"/etc/rndc.key\";\n\
+                     controls {{\n    \
+                     inet {overlay} port {RNDC_PORT} allow {{ any; }} keys {{ \"rndc-key\"; }};\n}};\n",
+                ),
+            },
+            rndc_key_file("/etc/rndc.key", "named:named", secrets),
+        ],
     }
 }
 
@@ -2158,5 +2295,85 @@ mod tests {
             seed.contains("if [ -f \"$FLEET_STACK_TEMPLATE\" ]"),
             "{seed}"
         );
+    }
+
+    // ─────────────────── QC-17: the Designate naming plane (Q46) ───────────────────
+
+    #[test]
+    fn designate_shares_one_conf_and_binds_api_and_mdns_to_the_overlay() {
+        // Q46 — the five Designate services read one designate.conf; only the
+        // command differs. The API + mini-DNS bind to the overlay (QC-6/Q23);
+        // the DB/RPC/authtoken are the shared sealed seams, and the rndc key is
+        // the real sealed fleet-wide credential (never blank).
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = Secrets::generate();
+        let rndc_key = secrets.designate_rndc_key().to_string();
+        for (kind, command) in [
+            (ServiceKind::DesignateApi, "designate-api"),
+            (ServiceKind::DesignateCentral, "designate-central"),
+            (ServiceKind::DesignateProducer, "designate-producer"),
+            (ServiceKind::DesignateWorker, "designate-worker"),
+            (ServiceKind::DesignateMdns, "designate-mdns"),
+        ] {
+            render_service_config(dir.path(), kind, &ctx_with(false, secrets.clone())).unwrap();
+            assert_eq!(read_command(dir.path(), kind), command);
+            let conf = read_conf(dir.path(), kind, "designate.conf");
+            assert!(conf.contains(&format!("listen = {OVERLAY}:9001")), "{conf}");
+            assert!(conf.contains(&format!("listen = {OVERLAY}:5354")), "{conf}");
+            assert!(
+                conf.contains("api_base_uri = http://designate.mesh:9001"),
+                "{conf}"
+            );
+            assert!(conf.contains("@mariadb.mesh/designate"), "{conf}");
+            assert!(conf.contains("[keystone_authtoken]"), "{conf}");
+            // Never falls back off the overlay (Q23).
+            assert!(!conf.contains("0.0.0.0"), "{conf}");
+            // The sealed rndc key rides beside the conf for the worker's
+            // backend channel.
+            let key = read_conf(dir.path(), kind, "rndc.key");
+            assert!(key.contains("hmac-sha256"), "{key}");
+            assert!(key.contains(&rndc_key), "the real sealed key: {key}");
+        }
+    }
+
+    #[test]
+    fn bind9_backend_serves_the_overlay_only_under_designate_control() {
+        // Q46/Q23 — the per-node bind9 answers DNS on the overlay only (never
+        // the public underlay), authoritative-only, zone-managed by Designate
+        // (allow-new-zones + the sealed-key rndc controls channel).
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = Secrets::generate();
+        let rndc_key = secrets.designate_rndc_key().to_string();
+        render_service_config(
+            dir.path(),
+            ServiceKind::DesignateBackendBind9,
+            &ctx_with(false, secrets),
+        )
+        .unwrap();
+        assert!(read_command(dir.path(), ServiceKind::DesignateBackendBind9).contains("named"));
+        let conf = read_conf(dir.path(), ServiceKind::DesignateBackendBind9, "named.conf");
+        assert!(
+            conf.contains(&format!("listen-on port 53 {{ {OVERLAY}; }}")),
+            "{conf}"
+        );
+        assert!(conf.contains("recursion no"), "{conf}");
+        assert!(conf.contains("allow-new-zones yes"), "{conf}");
+        assert!(conf.contains(&format!("inet {OVERLAY} port 953")), "{conf}");
+        assert!(!conf.contains("0.0.0.0"), "never off the overlay: {conf}");
+        // The same sealed key both sides of the rndc channel agree on.
+        let key = read_conf(dir.path(), ServiceKind::DesignateBackendBind9, "rndc.key");
+        assert!(key.contains(&rndc_key), "{key}");
+    }
+
+    #[test]
+    fn bootstrap_seed_runs_the_designate_feed_when_rendered() {
+        // QC-17 — the leader's bootstrap seed runs the peer-directory zone feed
+        // when the worker rendered it, and skips honestly otherwise.
+        let dir = tempfile::tempdir().unwrap();
+        render_cloud_bootstrap(dir.path(), "2024.1", &BIG_NODE).unwrap();
+        let seed = read_seed(dir.path());
+        assert!(seed.contains("designate-feed.sh"), "{seed}");
+        assert!(seed.contains("if [ -f \"$DESIGNATE_FEED\" ]"), "{seed}");
+        assert!(seed.contains("sh \"$DESIGNATE_FEED\""), "{seed}");
     }
 }

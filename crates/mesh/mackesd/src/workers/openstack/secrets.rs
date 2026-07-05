@@ -56,6 +56,8 @@ const DB_USERS: &[&str] = &[
     // Wave-2 (QC-19): Heat + Octavia each own one control-plane DB.
     "heat",
     "octavia",
+    // Wave-2 naming (QC-17): Designate owns one control-plane DB (Q46).
+    "designate",
 ];
 
 /// Every Keystone service-user an API authenticates as (the
@@ -72,6 +74,8 @@ const SERVICE_USERS: &[&str] = &[
     // (Heat also reuses its own as the `stack_domain_admin` credential).
     "heat",
     "octavia",
+    // Wave-2 naming (QC-17): the Designate API authenticates to Keystone.
+    "designate",
 ];
 
 /// The single `RabbitMQ` `openstack` user password (Q16 — internal RPC, strictly
@@ -82,6 +86,13 @@ const RABBITMQ_KEY: &str = "rabbitmq_openstack";
 /// (QC-19/Q25). A real sealed secret (never blank), so a Horizon opt-in gets a
 /// genuine session key from the leader's one-time seal like every other service.
 const HORIZON_KEY: &str = "horizon_secret_key";
+
+/// The rndc HMAC key the Designate worker drives each node's bind9 backend
+/// with (QC-17/Q46). One shared sealed key across the fleet (the pool's
+/// `rndc_key_file` and every backend's `controls` block must agree). The
+/// alphanumeric [`SECRET_LEN`] value is valid base64 (40 chars ≡ 0 mod 4, all
+/// in the base64 alphabet), so bind accepts it verbatim as an hmac-sha256 key.
+const DESIGNATE_RNDC_KEY: &str = "designate_rndc_key";
 
 /// The deterministic key for `user`'s DB password.
 fn db_key(user: &str) -> String {
@@ -130,6 +141,7 @@ impl Secrets {
         }
         secrets.insert(RABBITMQ_KEY.to_string(), random_secret());
         secrets.insert(HORIZON_KEY.to_string(), random_secret());
+        secrets.insert(DESIGNATE_RNDC_KEY.to_string(), random_secret());
         Self { secrets }
     }
 
@@ -174,6 +186,13 @@ impl Secrets {
         if self.secrets.get(HORIZON_KEY).is_none_or(String::is_empty) {
             return Some(HORIZON_KEY.to_string());
         }
+        if self
+            .secrets
+            .get(DESIGNATE_RNDC_KEY)
+            .is_none_or(String::is_empty)
+        {
+            return Some(DESIGNATE_RNDC_KEY.to_string());
+        }
         None
     }
 
@@ -204,6 +223,14 @@ impl Secrets {
     #[must_use]
     pub fn horizon_secret_key(&self) -> &str {
         self.get(HORIZON_KEY)
+    }
+
+    /// The sealed rndc HMAC key (QC-17) — shared by the Designate worker's
+    /// `rndc.key` and every node's bind9 `controls` block, so the naming plane
+    /// drives its backends with a genuine fleet-wide credential.
+    #[must_use]
+    pub fn designate_rndc_key(&self) -> &str {
+        self.get(DESIGNATE_RNDC_KEY)
     }
 
     /// Look a key up. Guarded by [`Self::first_missing`] at the render entry, so
@@ -367,6 +394,10 @@ mod tests {
         assert_eq!(s.rabbitmq_password().len(), SECRET_LEN);
         // Wave-2 (QC-19): the Horizon session key is sealed like the rest.
         assert_eq!(s.horizon_secret_key().len(), SECRET_LEN);
+        // Wave-2 naming (QC-17): the Designate rndc key is sealed too, and is
+        // valid base64 for bind (length ≡ 0 mod 4, base64-alphabet chars).
+        assert_eq!(s.designate_rndc_key().len(), SECRET_LEN);
+        assert_eq!(SECRET_LEN % 4, 0, "bind base64 length constraint");
     }
 
     #[test]
