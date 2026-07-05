@@ -3260,3 +3260,82 @@ Turn `Surface::About` into a Windows-Device-Manager-style hardware inspector: a 
   **so that** it's truly done.
   **Acceptance** (each runtime-observable):
     - [ ] on Eagle / the test bed, the About Device Manager renders on the DRM seat — the tree, header card, menu bar/toolbar, host rail; switching to another mesh node loads its real hardware; a real device shows its real driver/IDs; (P2) an action fires armed; captured/confirmed (§7 live-verify)
+
+
+### MENUBAR-ALL — unified title + menu bar on every surface (15-Q survey 2026-07-04; design: docs/design/menubar-all.md)
+
+Every primary nav-bar surface gets a slim top bar: a large UPPERCASE mono accent title (left) + the File/Edit/View/Help spine + surface menus (inline) + a live per-surface status cluster (right), all via one shared `mde-egui` MenuBar. **Governing principle (operator): the menu bar surfaces EVERY control incl. advanced/complex — comprehensive, honestly-wired, no dead entries (§7); critical for the OpenStack/IaC interfaces.** One big wave; Terminal + Editor refactor onto the shared component.
+
+- [ ] **MENUBAR-ALL-1: the shared `mde-egui` MenuBar component + Terminal/Editor refactor.**
+  **As** a mesh operator,
+  **I want** one shared title+menu bar widget,
+  **so that** every surface reads as one platform.
+  **Acceptance** (each runtime-observable):
+    - [ ] a new `mde_egui::menubar` module: a slim `MenuBar` rendering an UPPERCASE mono DISPLAY-tier title (accent-tinted) + an inline menu strip + a right-aligned status-chip cluster, at one consistent height, from `Style`/`Motion`/`fonts` only
+    - [ ] a caller-supplied menu model (`Menu{title,mnemonic,items}`, `MenuItem{label,shortcut_hint,enabled,on_activate}`); dropdowns open with the shared motion spring; **Alt-mnemonics** + full keyboard nav + focus ring; each item shows its live shortcut hint; honest disable/omit (§7)
+    - [ ] backing tests (model, mnemonic resolution, disabled-item, status cluster) in mde-egui; style-leak grep clean
+    - [ ] **Terminal** (`mde-term-egui/menubar.rs`, incl. the TERM-MENUBAR-1 + TMUX-FC-2 Tmux menu) + **Editor** (Word-97 bar) refactored onto it — every existing menu item + seam preserved, their menu tests green
+    - [ ] renders correctly at 1.0 + a fractional scale
+
+- [ ] **MENUBAR-ALL-2..N: per-surface title+menu bars (one big wave).**
+  **As** a mesh operator,
+  **I want** every surface to carry the shared bar with its real menus,
+  **so that** all controls (incl. advanced) are discoverable per workspace.
+  **Acceptance** (each runtime-observable, one file-disjoint unit per surface — Music/Media/Files/Voice/Browser/Chat/Mesh-View/Instances/Desktop/System/Storage/About/Workbench):
+    - [ ] the surface embeds `mde_egui::MenuBar` with its UPPERCASE title + category accent + a live status cluster (real per-surface indicators, §7)
+    - [ ] the File/Edit/View/Help spine (only real items) + the surface's own menus, **every visible item bound to a real existing seam** (§6 glue) surfacing all its controls incl. advanced ops; context-gated items disabled, absent ones omitted (no dead entries)
+    - [ ] non-app surfaces (viewers/settings/Workbench) carry menus for their real seams; style-leak grep clean; tested each menu item dispatches its real action, honest-disabled where context-needed
+
+### IAC — the "Infra as Code (IaC)" workspace / OpenStack IaaS control plane (25-Q survey 2026-07-04; design: docs/design/iac-workspace.md)
+
+A new Workloads-group surface "Infra as Code (IaC)": an OpenStack IaaS control plane on the standard APIs — Keystone catalog = the service directory, Heat = the native IaC engine, per-service APIs = status + comprehensive control. Lists all published services (OpenStack catalog + mesh/LAN scan, grouped by kind) under a live OpenStack-API status band. Tabbed Overview/Resources/Heat; typed-arming on all mutations; audit-all + notify-on-failure; comprehensive catalog-driven menu bar (the MENUBAR-ALL governing principle). Everything in one cut. Instances (QC-12) stays the quick VM view; IaC is the full admin.
+
+- [ ] **IAC-1: the OpenStack client foundation.**
+  **As** an operator,
+  **I want** a standard-API OpenStack client,
+  **so that** the workspace speaks OpenStack natively.
+  **Acceptance** (each runtime-observable):
+    - [ ] auth via `clouds.yaml` (openstacksdk standard, single default context); the **Keystone service catalog** (services + public/internal/admin endpoints + region); per-service **API health** (real ping/version probe → up/down + latency + microversion); the standard resource + verb calls (Nova/Neutron/Glance/Cinder/Heat/…) — reuse/extend the QUASAR-CLOUD / mackesd OpenStack integration (§6), not a parallel client
+    - [ ] honest absent/unreachable when a service isn't deployed; tested against fixtures + (IAC-7) a live cloud
+
+- [ ] **IAC-2: the surface + Overview tab (status band + merged directory).**
+  **As** an operator,
+  **I want** the API status + every published service in one grouped view,
+  **so that** I see the whole infrastructure at a glance.
+  **Acceptance** (each runtime-observable):
+    - [ ] `Surface::InfraCode` in the Workloads dock group, name "Infra as Code (IaC)", its glyph; tabbed Overview/Resources/Heat
+    - [ ] the **OpenStack API status band** — rich tiles from the live catalog (health/latency/version/endpoints/port/region) + per-tile actions (logs/restart-armed/self-test/drill)
+    - [ ] the **merged service directory** — Keystone catalog + mesh/LAN scan (`descriptors`/`probe_nmap`/mackesd registries), grouped by service type within OpenStack/Mesh/LAN buckets; rich rows (endpoint/health/latency/region/version/node/source); live health ~15s + a Rescan button; honest dim/stale
+    - [ ] all `mde_egui` tokens (§4); tested band + directory render + grouping + freshness
+
+- [ ] **IAC-3: the Resources tab — per-service CRUD via the menu bar.**
+  **As** an operator,
+  **I want** to manage every service's resources,
+  **so that** the workspace is the full OpenStack admin.
+  **Acceptance** (each runtime-observable):
+    - [ ] drilling a service shows its **read-only resource tables** (sortable, row + bulk select); **every cataloged service** gets full CRUD (catalog-driven, auto-covers new services)
+    - [ ] all **mutating verbs live in the catalog-driven menu bar** (Compute/Network/Image/Volume/…) + **forms** for create/update (flavor/image/network pickers); **typed-arming** on every mutation; real OpenStack API calls (no mockups)
+    - [ ] the **linked cross-service view** — an instance ↔ its ports/networks/volumes/floating-IPs/security-groups/Heat-stack, jumpable; tested a real create/list/delete round-trips + the arming gate
+
+- [ ] **IAC-4: the Heat tab — the native IaC loop.**
+  **As** an operator,
+  **I want** Heat stacks/templates/drift + reverse-generate,
+  **so that** infrastructure-as-code is first-class.
+  **Acceptance** (each runtime-observable):
+    - [ ] list/show stacks; view + edit **HOT templates**; **preview-update** (dry-run diff of what would change); create/update/delete (typed-armed); **stack-check** (drift); events + resources drill
+    - [ ] **reverse-generate** a HOT template from the live discovered infra (capture reality as code); tested a stack lifecycle + a drift detect + a reverse-generate against fixtures/a live cloud
+
+- [ ] **IAC-5: audit + notify + comprehensive menu bar.**
+  **As** an operator,
+  **I want** every op audited + failures surfaced, via one comprehensive bar,
+  **so that** ops are traceable + all controls are reachable.
+  **Acceptance** (each runtime-observable):
+    - [ ] the **dynamic per-service menu bar** (one menu per advertised service carrying its full standard verb set + Catalog/View/Help, auto-growing) via the MENUBAR-ALL-1 shared component — surfaces ALL controls incl. advanced (the governing principle), honest omit/disable
+    - [ ] every mutating op → the KDC hash-chained audit log; the mesh notify feed fires **only on failure/service-down** (CHAT-FIX-2 producer); tested the audit append + a failure notify
+
+- [ ] **IAC-6: live smoke on the test bed.**
+  **As** the operator,
+  **I want** the IaC workspace verified against a real cloud,
+  **so that** it's truly done.
+  **Acceptance** (each runtime-observable):
+    - [ ] on the farm dev cloud / test bed: the status band shows the real catalog health; the directory lists real services; a real Resources op (e.g. list + an armed create/delete) round-trips; a Heat stack shows/drifts; captured/confirmed (§7 live-verify). *(coordinate with QUASAR-CLOUD live cloud availability)*
