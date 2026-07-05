@@ -230,10 +230,7 @@ impl Style {
         v.extreme_bg_color = Self::BG;
         v.faint_bg_color = Self::SURFACE;
         v.override_text_color = Some(Self::TEXT);
-        v.hyperlink_color = Self::ACCENT;
         v.window_stroke = Stroke::new(1.0, Self::BORDER);
-        v.selection.bg_fill = Self::ACCENT.gamma_multiply(0.35);
-        v.selection.stroke = Stroke::new(1.0, Self::ACCENT);
 
         let border = Stroke::new(1.0, Self::BORDER);
         let text = Stroke::new(1.0, Self::TEXT);
@@ -254,14 +251,18 @@ impl Style {
         // Hover.
         v.widgets.hovered.bg_fill = Self::SURFACE_HI;
         v.widgets.hovered.weak_bg_fill = Self::SURFACE_HI;
-        v.widgets.hovered.bg_stroke = Stroke::new(1.0, Self::ACCENT);
         v.widgets.hovered.fg_stroke = text;
 
         // Pressed / active.
-        v.widgets.active.bg_fill = Self::ACCENT;
-        v.widgets.active.weak_bg_fill = Self::ACCENT;
-        v.widgets.active.bg_stroke = Stroke::new(1.0, Self::ACCENT_HI);
         v.widgets.active.fg_stroke = Stroke::new(1.0, Self::BG);
+
+        // The interactive **accent** — the ONE re-tintable field group: the
+        // hyperlink, the text-selection wash + ring, the hover ring, and the
+        // pressed fill + ring. Applied here from the brand [`ACCENT`](Self::ACCENT);
+        // a Personalization → Theme pick (SETTINGS-5) re-applies the SAME derivation
+        // over the live context with a chosen accent (see [`set_accent`]), so the
+        // default look + a runtime override share one source of truth (§4/§6).
+        Self::accent_visuals(&mut v, Self::ACCENT, Self::ACCENT_HI);
 
         // SURFACE-11: the density scales the interaction metrics — targets and spacing
         // grow under touch, the palette does not.
@@ -274,6 +275,35 @@ impl Style {
             // The minimum interactive size is the finger/pointer hit target.
             s.spacing.interact_size.y = density.min_hit_target();
         });
+    }
+
+    /// Apply the interactive-accent derivation to `v` — the field group a runtime
+    /// accent choice re-tints (SETTINGS-5): the hyperlink colour, the text-selection
+    /// wash + ring, the hover ring, and the pressed/active fill + ring. Factored so
+    /// [`install_with_density`](Self::install_with_density) (the default brand accent)
+    /// and [`set_accent`](Self::set_accent) (a chosen accent) share ONE derivation and
+    /// can never fork the look (§4/§6). `accent_hi` is the slightly-lifted variant for
+    /// the pressed ring (the brand pair passes [`ACCENT`](Self::ACCENT)/[`ACCENT_HI`](Self::ACCENT_HI)).
+    fn accent_visuals(v: &mut egui::Visuals, accent: Color32, accent_hi: Color32) {
+        v.hyperlink_color = accent;
+        v.selection.bg_fill = accent.gamma_multiply(0.35);
+        v.selection.stroke = Stroke::new(1.0, accent);
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, accent);
+        v.widgets.active.bg_fill = accent;
+        v.widgets.active.weak_bg_fill = accent;
+        v.widgets.active.bg_stroke = Stroke::new(1.0, accent_hi);
+    }
+
+    /// Re-tint the live interactive **accent** on `ctx` to `accent` (SETTINGS-5 — the
+    /// Personalization → Theme accent choice). Re-applies ONLY the accent-derived
+    /// visual fields (via [`accent_visuals`](Self::accent_visuals)) over the
+    /// already-installed look, so the palette / density / type scale are untouched.
+    /// The shell re-applies this each frame from its Settings poll, so a chosen accent
+    /// survives a formfactor [`install_with_density`](Self::install_with_density)
+    /// re-install. A user pick has no separate "hi" token, so the chosen accent doubles
+    /// as the pressed-ring highlight.
+    pub fn set_accent(ctx: &Context, accent: Color32) {
+        ctx.style_mut(|s| Self::accent_visuals(&mut s.visuals, accent, accent));
     }
 
     /// The **load-bar fill** colour for a 0–100 capability score: a smooth blend
@@ -534,6 +564,32 @@ mod tests {
         assert_eq!(ctx.style().visuals.panel_fill, Style::BG);
         assert_eq!(ctx.style().visuals.hyperlink_color, Style::ACCENT);
         assert_eq!(ctx.style().spacing.indent, Style::SP_M);
+        // The refactored install routes the accent through the shared derivation, so
+        // the whole interactive-accent field group lands on the brand accent.
+        assert_eq!(ctx.style().visuals.widgets.active.bg_fill, Style::ACCENT);
+        assert_eq!(ctx.style().visuals.selection.stroke.color, Style::ACCENT);
+    }
+
+    #[test]
+    fn set_accent_retints_the_live_interactive_accent_only() {
+        // SETTINGS-5: a runtime accent choice re-tints the whole interactive-accent
+        // field group over an installed look, and leaves the rest of the palette /
+        // spacing untouched (a targeted re-tint, not a re-install).
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        Style::set_accent(&ctx, Style::ACCENT_MESH);
+        let s = ctx.style();
+        assert_eq!(s.visuals.hyperlink_color, Style::ACCENT_MESH);
+        assert_eq!(s.visuals.widgets.active.bg_fill, Style::ACCENT_MESH);
+        assert_eq!(
+            s.visuals.widgets.hovered.bg_stroke.color,
+            Style::ACCENT_MESH
+        );
+        assert_eq!(s.visuals.selection.stroke.color, Style::ACCENT_MESH);
+        // Untouched: the base palette + the spacing grid stay as installed.
+        assert_eq!(s.visuals.panel_fill, Style::BG);
+        assert_eq!(s.visuals.override_text_color, Some(Style::TEXT));
+        assert_eq!(s.spacing.indent, Style::SP_M);
     }
 
     // --- SURFACE-11: touch density -------------------------------------------------

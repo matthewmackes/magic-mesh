@@ -136,6 +136,16 @@ pub(crate) struct SystemState {
     /// cadence; the Mesh & System sections render it honest-`unknown` where the
     /// snapshot doesn't carry a fact (§6/§7 — no new probe, no root-only cert read).
     mesh: MeshFacts,
+    /// The Personalization → Theme appearance (SETTINGS-5): the interactive accent +
+    /// the platform text-scale. Loaded from disk on start (restored on open), saved on
+    /// a pick, and applied live to the context every frame by
+    /// [`Self::apply_appearance`] (the [`SettingsNav`] client-data-dir JSON idiom).
+    appearance: AppearanceConfig,
+    /// The seat's DPI zoom base — the egui `zoom_factor` the runner set from the panel
+    /// (or 1.0 windowed), captured ONCE on the first appearance apply so the text-scale
+    /// step composes with the panel DPI instead of clobbering it (SETTINGS-5). `None`
+    /// until the first poll observes the base.
+    zoom_base: Option<f32>,
 }
 
 impl Default for SystemState {
@@ -160,6 +170,8 @@ impl Default for SystemState {
             power_honor_config: PowerHonorConfig::load(),
             nav: SettingsNav::load(),
             mesh: MeshFacts::default(),
+            appearance: AppearanceConfig::load(),
+            zoom_base: None,
         }
     }
 }
@@ -245,7 +257,34 @@ impl SystemState {
             let mesh_snapshot = fs::read_to_string(MESH_STATUS_PATH).unwrap_or_default();
             self.mesh = MeshFacts::project(&mesh_snapshot);
         }
+        // SETTINGS-5: apply the persisted Personalization → Theme appearance to the
+        // live context every frame (poll runs unconditionally in both runners, so this
+        // is honored globally + restored on start — not just while Settings is open).
+        self.apply_appearance(ctx);
         ctx.request_repaint_after(REFRESH);
+    }
+
+    /// Apply the persisted Personalization → Theme appearance (SETTINGS-5) to the live
+    /// context: re-tint the interactive accent and hold the whole-UI text-scale zoom.
+    /// Cheap-guarded — a no-op frame costs one field read and never re-mutates — and
+    /// self-correcting: if a formfactor [`Style::install_with_density`] re-install reset
+    /// the accent to the brand blue, the next poll re-applies the pick. Both effects are
+    /// real runtime state (the egui visuals + zoom), never a dead toggle (§7).
+    fn apply_appearance(&mut self, ctx: &egui::Context) {
+        // Accent — re-tint only when the live accent drifts from the pick (a settings
+        // change, a fresh context, OR a formfactor re-install reset it to the brand).
+        let want_accent = self.appearance.accent.color();
+        if ctx.style().visuals.hyperlink_color != want_accent {
+            Style::set_accent(ctx, want_accent);
+        }
+        // Text-scale — capture the seat's DPI zoom base once (what the DRM runner set
+        // from the panel, or 1.0 windowed), then hold the zoom at base × the chosen
+        // step so the accessibility scale COMPOSES with HiDPI instead of clobbering it.
+        let base = *self.zoom_base.get_or_insert_with(|| ctx.zoom_factor());
+        let want_zoom = base * self.appearance.text_scale.factor();
+        if (ctx.zoom_factor() - want_zoom).abs() > f32::EPSILON {
+            ctx.set_zoom_factor(want_zoom);
+        }
     }
 
     /// Rebuild the layout on a connector-set change (a replug) and seed any newly
@@ -322,6 +361,10 @@ impl SystemState {
         // moves it can be detected + persisted afterwards (the same collect-then-
         // apply idiom the SysActions use — the render can't take `&mut self`).
         let nav_before = self.nav;
+        // Capture the appearance before the borrow so a Theme-section pick that moves
+        // it can be detected + persisted afterwards (SETTINGS-5 — the same collect-
+        // then-apply idiom `nav` uses; the live re-tint/zoom happens in the poll).
+        let appearance_before = self.appearance;
         // Whether the BlueZ pairing responder is currently registered — read before
         // the mutable destructure (a Copy bool) so the Pairing section can surface
         // the responder's honest live state (SETTINGS-4).
@@ -340,6 +383,7 @@ impl SystemState {
                 power_honor_config,
                 nav,
                 mesh,
+                appearance,
                 ..
             } = self;
             let snap = snapshot.as_ref();
@@ -390,6 +434,7 @@ impl SystemState {
                                 power_honor_config,
                                 instances,
                                 mesh,
+                                appearance,
                                 agent_active,
                                 prompt_in_flight,
                                 &mut actions,
@@ -408,6 +453,11 @@ impl SystemState {
         // writes — an unchanged render never re-saves (§7: no inert write).
         if self.nav != nav_before {
             self.nav.save();
+        }
+        // Persist a Theme-section appearance pick the same way (SETTINGS-5). Only a
+        // real change writes; the live re-tint/zoom lands on the next poll.
+        if self.appearance != appearance_before {
+            self.appearance.save();
         }
         self.apply(actions, instances);
     }
@@ -862,6 +912,8 @@ enum SettingsSection {
     Wallpaper,
     /// The compiled-in hotkey table (`hotkeys_section`).
     Hotkeys,
+    /// Appearance — accent + text-scale (`theme_section`, SETTINGS-5).
+    Theme,
     /// Mesh identity name + overlay/cipher (`identity_section`, SETTINGS-4).
     Identity,
     /// The pinned deployment role (`role_section`, SETTINGS-4).
@@ -882,6 +934,7 @@ impl SettingsSection {
             Self::Power => "Power & Battery",
             Self::Wallpaper => "Wallpaper",
             Self::Hotkeys => "Hotkeys",
+            Self::Theme => "Theme",
             Self::Identity => "Identity",
             Self::Role => "Role",
             Self::Pairing => "Pairing",
@@ -894,7 +947,7 @@ impl SettingsSection {
     const fn group(self) -> SettingsGroup {
         match self {
             Self::Displays | Self::Audio | Self::Bluetooth | Self::Power => SettingsGroup::Devices,
-            Self::Wallpaper | Self::Hotkeys => SettingsGroup::Personalization,
+            Self::Wallpaper | Self::Hotkeys | Self::Theme => SettingsGroup::Personalization,
             Self::Identity | Self::Role | Self::Pairing | Self::Network => {
                 SettingsGroup::MeshSystem
             }
@@ -910,7 +963,7 @@ enum SettingsGroup {
     /// Displays · Audio · Bluetooth · Power & Battery.
     #[default]
     Devices,
-    /// Wallpaper · Hotkeys.
+    /// Wallpaper · Hotkeys · Theme.
     Personalization,
     /// Identity · Role · Pairing · Network (SETTINGS-4 — this node's mesh facts).
     MeshSystem,
@@ -956,7 +1009,11 @@ impl SettingsGroup {
                 SettingsSection::Bluetooth,
                 SettingsSection::Power,
             ],
-            Self::Personalization => &[SettingsSection::Wallpaper, SettingsSection::Hotkeys],
+            Self::Personalization => &[
+                SettingsSection::Wallpaper,
+                SettingsSection::Hotkeys,
+                SettingsSection::Theme,
+            ],
             Self::MeshSystem => &[
                 SettingsSection::Identity,
                 SettingsSection::Role,
@@ -1054,6 +1111,195 @@ impl SettingsNav {
     }
 }
 
+// ──────────────────────────── Personalization → Theme (SETTINGS-5) ────────────────────────────
+
+/// A curated interactive-**accent** choice (SETTINGS-5). Each variant maps to ONE
+/// existing shared `Style::ACCENT*` token, so the picker offers the shell's own colour
+/// language — never an arbitrary raw colour (§4 — no new hex minted). `Brand` is the
+/// default interactive blue the shell installs; the rest reuse the categorical accent
+/// hues as the interactive tint. Applied live via [`Style::set_accent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AccentChoice {
+    /// The default interactive brand accent (`Style::ACCENT`, blue).
+    #[default]
+    Brand,
+    /// `Style::ACCENT_COMMS` (cyan).
+    Cyan,
+    /// `Style::ACCENT_WORKLOADS` (purple).
+    Purple,
+    /// `Style::ACCENT_TERMINALS` (teal).
+    Teal,
+    /// `Style::ACCENT_MESH` (green).
+    Green,
+    /// `Style::ACCENT_SYSTEM` (gold).
+    Gold,
+    /// `Style::ACCENT_MEDIA` (magenta).
+    Magenta,
+}
+
+impl AccentChoice {
+    /// The choices in picker order (Brand first).
+    const ALL: [Self; 7] = [
+        Self::Brand,
+        Self::Cyan,
+        Self::Purple,
+        Self::Teal,
+        Self::Green,
+        Self::Gold,
+        Self::Magenta,
+    ];
+
+    /// The picker label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Brand => "Brand",
+            Self::Cyan => "Cyan",
+            Self::Purple => "Purple",
+            Self::Teal => "Teal",
+            Self::Green => "Green",
+            Self::Gold => "Gold",
+            Self::Magenta => "Magenta",
+        }
+    }
+
+    /// The shared `Style` token this choice paints — the SAME colour language the
+    /// picker (PICKER-2) + explorer (EXPLORER-15) + Settings groups (SETTINGS-2) speak
+    /// (§4 — no new hue).
+    const fn color(self) -> egui::Color32 {
+        match self {
+            Self::Brand => Style::ACCENT,
+            Self::Cyan => Style::ACCENT_COMMS,
+            Self::Purple => Style::ACCENT_WORKLOADS,
+            Self::Teal => Style::ACCENT_TERMINALS,
+            Self::Green => Style::ACCENT_MESH,
+            Self::Gold => Style::ACCENT_SYSTEM,
+            Self::Magenta => Style::ACCENT_MEDIA,
+        }
+    }
+}
+
+/// A platform **text-scale** step (SETTINGS-5) — the EXPLORER-18 accessibility posture:
+/// the whole-UI zoom the shell honors so type + hit-targets scale together. Discrete
+/// legible steps (not a free slider) so the choice reads clearly and round-trips
+/// exactly. Applied live as the egui zoom multiplier atop the seat's DPI base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TextScale {
+    /// 90% — a denser layout.
+    Small,
+    /// 100% — the design baseline.
+    #[default]
+    Default,
+    /// 115%.
+    Large,
+    /// 130%.
+    Larger,
+    /// 150% — the accessibility maximum.
+    Largest,
+}
+
+impl TextScale {
+    /// The steps in slider order (smallest first).
+    const ALL: [Self; 5] = [
+        Self::Small,
+        Self::Default,
+        Self::Large,
+        Self::Larger,
+        Self::Largest,
+    ];
+
+    /// The picker label.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Small => "Small",
+            Self::Default => "Default",
+            Self::Large => "Large",
+            Self::Larger => "Larger",
+            Self::Largest => "Largest",
+        }
+    }
+
+    /// The whole-UI zoom multiplier applied atop the seat's DPI base — the egui
+    /// `zoom_factor` the shell honors. `Default` is the identity (1.0), a no-op.
+    const fn factor(self) -> f32 {
+        match self {
+            Self::Small => 0.9,
+            Self::Default => 1.0,
+            Self::Large => 1.15,
+            Self::Larger => 1.3,
+            Self::Largest => 1.5,
+        }
+    }
+}
+
+/// The client-data-dir file the Personalization → Theme appearance persists to (the
+/// [`SettingsNav`] / `PowerHonorConfig` one-JSON-per-preference idiom).
+const APPEARANCE_CONFIG_FILE: &str = "settings-appearance.json";
+
+/// The persisted Personalization → Theme appearance (SETTINGS-5): the interactive
+/// accent + the platform text-scale the shell actually applies at runtime. Loaded on
+/// start and restored on open, saved on a pick — the [`SettingsNav`] client-data-dir
+/// JSON idiom, reused. Both fields drive a real live effect through
+/// [`SystemState::apply_appearance`] (§7 — no dead toggle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+struct AppearanceConfig {
+    /// The interactive accent tint (re-applied over the installed look each frame).
+    #[serde(default)]
+    accent: AccentChoice,
+    /// The whole-UI text-scale step (the EXPLORER-18 accessibility zoom).
+    #[serde(default)]
+    text_scale: TextScale,
+}
+
+impl AppearanceConfig {
+    /// The default appearance path (`<client-data-dir>/settings-appearance.json`), or
+    /// `None` when no data dir resolves (a headless context) — mirrors [`SettingsNav`].
+    fn default_path() -> Option<PathBuf> {
+        mde_bus::client_data_dir().map(|d| d.join(APPEARANCE_CONFIG_FILE))
+    }
+
+    /// Load from `path`, folding a missing / malformed file to the default (never a
+    /// fatal) — the `#[serde(default)]` fields also tolerate a partial / drifted file.
+    fn load_from(path: &Path) -> Self {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Load from the default path (default when absent / unresolvable).
+    #[must_use]
+    fn load() -> Self {
+        Self::default_path().map_or_else(Self::default, |p| Self::load_from(&p))
+    }
+
+    /// Write to `path` (atomic temp + rename, like [`SettingsNav`]). Takes `self` by
+    /// value — the appearance is a small `Copy`.
+    ///
+    /// # Errors
+    /// The [`std::io::Error`] if the dir cannot be created or the file cannot be
+    /// written / renamed.
+    fn save_to(self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Persist to the default path (a silent no-op when no data dir resolves).
+    fn save(self) {
+        if let Some(path) = Self::default_path() {
+            let _ = self.save_to(&path);
+        }
+    }
+}
+
 // ──────────────────────────── render ────────────────────────────
 
 /// The master rail (SETTINGS-1): the three domain groups, each an expressive header
@@ -1111,6 +1357,7 @@ fn settings_detail(
     power_honor_config: &mut PowerHonorConfig,
     instances: &InstancesState,
     mesh: &MeshFacts,
+    appearance: &mut AppearanceConfig,
     agent_active: bool,
     prompt_in_flight: bool,
     actions: &mut Vec<SysAction>,
@@ -1144,6 +1391,7 @@ fn settings_detail(
         ),
         SettingsSection::Wallpaper => wallpaper_section(ui),
         SettingsSection::Hotkeys => hotkeys_section(ui),
+        SettingsSection::Theme => theme_section(ui, appearance),
         SettingsSection::Identity => identity_section(ui, mesh),
         SettingsSection::Role => role_section(ui, mesh),
         SettingsSection::Pairing => {
@@ -2181,6 +2429,85 @@ fn hotkeys_section(ui: &mut egui::Ui) {
     });
 }
 
+/// The Theme section (SETTINGS-5) under Personalization — the two appearance controls
+/// the shell **genuinely applies at runtime**: the interactive **accent** (re-tinting
+/// the live `Style` accent across every surface via [`Style::set_accent`]) and the
+/// **text-scale** (the EXPLORER-18 accessibility whole-UI zoom the shell honors). Each
+/// pick mutates the persisted [`AppearanceConfig`] in place; the change is saved after
+/// the render borrow and applied live by [`SystemState::apply_appearance`] on the poll.
+/// The platform is dark-only (the Quasar lock) — there is NO light/dark switch here,
+/// only what the runtime truly drives (§7 — no dead toggle). Laid **across** the wide
+/// pane (SETTINGS-3) — a swatch row + a step row, each a selectable tile.
+fn theme_section(ui: &mut egui::Ui, appearance: &mut AppearanceConfig) {
+    // Accent — a swatch row; the pick re-tints the whole shell's highlights live.
+    ui.label(
+        RichText::new("Accent colour")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL)
+            .strong(),
+    );
+    ui.add_space(Style::SP_XS);
+    across_grid(ui, &AccentChoice::ALL, 4, |ui, &choice| {
+        let selected = appearance.accent == choice;
+        tile(ui, |ui| {
+            ui.horizontal(|ui| {
+                // A filled swatch in the choice's real token colour — an honest live
+                // preview of the tint the pick applies (not a decorative dot).
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(Style::SP_M, Style::SP_M),
+                    egui::Sense::hover(),
+                );
+                ui.painter()
+                    .rect_filled(rect, Style::RADIUS, choice.color());
+                ui.add_space(Style::SP_XS);
+                if ui
+                    .add(egui::SelectableLabel::new(
+                        selected,
+                        RichText::new(choice.label()).size(Style::BODY),
+                    ))
+                    .clicked()
+                    && !selected
+                {
+                    appearance.accent = choice;
+                }
+            });
+        });
+    });
+    ui.add_space(Style::SP_M);
+    // Text-scale — the EXPLORER-18 accessibility whole-UI zoom, as legible steps.
+    ui.label(
+        RichText::new("Text size")
+            .color(Style::TEXT_DIM)
+            .size(Style::SMALL)
+            .strong(),
+    );
+    ui.add_space(Style::SP_XS);
+    across_grid(ui, &TextScale::ALL, 5, |ui, &scale| {
+        let selected = appearance.text_scale == scale;
+        tile(ui, |ui| {
+            if ui
+                .add_sized(
+                    [ui.available_width(), Style::SP_XL],
+                    egui::SelectableLabel::new(
+                        selected,
+                        RichText::new(scale.label()).size(Style::BODY),
+                    ),
+                )
+                .clicked()
+                && !selected
+            {
+                appearance.text_scale = scale;
+            }
+        });
+    });
+    ui.add_space(Style::SP_S);
+    muted_note(
+        ui,
+        "Accent re-tints every surface's highlights; text size scales the whole \
+         interface. The platform is dark-only — there is no light theme.",
+    );
+}
+
 // ──────────────────────────── Mesh & System (SETTINGS-4) ────────────────────────────
 
 /// This node's mesh facts (SETTINGS-4), folded from the world-readable mesh-status
@@ -2989,6 +3316,7 @@ mod tests {
             SettingsSection::Power,
             SettingsSection::Wallpaper,
             SettingsSection::Hotkeys,
+            SettingsSection::Theme,
             SettingsSection::Identity,
             SettingsSection::Role,
             SettingsSection::Pairing,
@@ -3001,8 +3329,8 @@ mod tests {
                 section.label()
             );
         }
-        // The whole taxonomy is exactly those ten sections (no orphan leaf).
-        assert_eq!(all.len(), 10, "the taxonomy lists exactly ten sections");
+        // The whole taxonomy is exactly those eleven sections (no orphan leaf).
+        assert_eq!(all.len(), 11, "the taxonomy lists exactly eleven sections");
     }
 
     #[test]
@@ -3075,6 +3403,193 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Personalization → Theme appearance (SETTINGS-5) ───────────────────────
+
+    #[test]
+    fn theme_is_a_personalization_section_reachable_once() {
+        // The new Theme section lives under Personalization (the design taxonomy) and
+        // is exactly one rail leaf.
+        assert_eq!(
+            SettingsSection::Theme.group(),
+            SettingsGroup::Personalization
+        );
+        assert!(SettingsGroup::Personalization
+            .sections()
+            .contains(&SettingsSection::Theme));
+        let count = SettingsGroup::ALL
+            .iter()
+            .flat_map(|g| g.sections().iter())
+            .filter(|&&s| s == SettingsSection::Theme)
+            .count();
+        assert_eq!(count, 1, "Theme must be reachable exactly once");
+    }
+
+    #[test]
+    fn every_accent_choice_maps_to_a_shared_style_token() {
+        // Each accent choice paints an EXISTING shared Style::ACCENT* token (§4 — no
+        // new hex), Brand is the interactive brand accent, and the non-Brand choices
+        // are mutually distinct so the picker offers real variation.
+        assert_eq!(AccentChoice::default(), AccentChoice::Brand);
+        assert_eq!(AccentChoice::Brand.color(), Style::ACCENT);
+        let variants: Vec<_> = AccentChoice::ALL
+            .iter()
+            .filter(|c| **c != AccentChoice::Brand)
+            .map(|c| c.color())
+            .collect();
+        for (i, a) in variants.iter().enumerate() {
+            assert_ne!(*a, Style::ACCENT, "a variant must differ from the brand");
+            for b in &variants[i + 1..] {
+                assert_ne!(a, b, "accent choices must be mutually distinct");
+            }
+        }
+    }
+
+    #[test]
+    fn text_scale_steps_ascend_around_a_default_identity() {
+        // The steps are strictly ascending and Default is the 1.0 identity (a no-op),
+        // so a Default pick never perturbs the seat's DPI zoom.
+        assert_eq!(TextScale::default(), TextScale::Default);
+        assert!((TextScale::Default.factor() - 1.0).abs() < f32::EPSILON);
+        let mut prev = f32::MIN;
+        for step in TextScale::ALL {
+            assert!(
+                step.factor() > prev,
+                "{} breaks the ascending order",
+                step.label()
+            );
+            prev = step.factor();
+        }
+    }
+
+    #[test]
+    fn the_theme_appearance_round_trips_through_disk_persistence() {
+        // A Theme pick survives a restart: write it through the real save_to/load_from
+        // seam (the SettingsNav idiom) and read it back; a missing file folds to the
+        // default (Brand / Default), never a fatal.
+        let dir = nav_temp_dir("theme-rt");
+        std::fs::create_dir_all(&dir).expect("mkroot");
+        let path = dir.join(APPEARANCE_CONFIG_FILE);
+
+        assert_eq!(
+            AppearanceConfig::load_from(&path),
+            AppearanceConfig::default(),
+            "a missing file folds to the default"
+        );
+        assert_eq!(AppearanceConfig::default().accent, AccentChoice::Brand);
+        assert_eq!(AppearanceConfig::default().text_scale, TextScale::Default);
+
+        let cfg = AppearanceConfig {
+            accent: AccentChoice::Green,
+            text_scale: TextScale::Larger,
+        };
+        cfg.save_to(&path).expect("save");
+        let back = AppearanceConfig::load_from(&path);
+        assert_eq!(back, cfg, "the appearance round-trips through disk");
+        assert_eq!(back.accent, AccentChoice::Green);
+        assert_eq!(back.text_scale, TextScale::Larger);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_partial_appearance_file_folds_missing_fields_to_their_defaults() {
+        // A drifted / partial file (only one field) reads back with the other field at
+        // its serde default — never a fatal, honest to what was written.
+        let dir = nav_temp_dir("theme-partial");
+        std::fs::create_dir_all(&dir).expect("mkroot");
+        let path = dir.join(APPEARANCE_CONFIG_FILE);
+        std::fs::write(&path, r#"{"accent":"gold"}"#).expect("write");
+
+        let cfg = AppearanceConfig::load_from(&path);
+        assert_eq!(
+            cfg.accent,
+            AccentChoice::Gold,
+            "the written field is honoured"
+        );
+        assert_eq!(
+            cfg.text_scale,
+            TextScale::Default,
+            "the absent field folds to its default"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_theme_accent_choice_retints_the_live_context_on_poll() {
+        // The apply seam is real: with a persisted accent pick, one poll re-tints the
+        // live egui interactive accent (observable in the context's visuals) — not a
+        // dead toggle (§7). Poll runs every frame in both runners, so this is global.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        assert_eq!(ctx.style().visuals.hyperlink_color, Style::ACCENT);
+        let mut st = SystemState {
+            appearance: AppearanceConfig {
+                accent: AccentChoice::Green,
+                text_scale: TextScale::Default,
+            },
+            ..SystemState::default()
+        };
+        st.poll(&ctx);
+        assert_eq!(
+            ctx.style().visuals.hyperlink_color,
+            Style::ACCENT_MESH,
+            "the accent pick re-tinted the live interactive accent"
+        );
+        assert_eq!(
+            ctx.style().visuals.widgets.active.bg_fill,
+            Style::ACCENT_MESH
+        );
+    }
+
+    #[test]
+    fn the_theme_text_scale_zooms_the_live_context_atop_the_dpi_base() {
+        // The text-scale pick sets the whole-UI zoom to the DPI base × the step; a
+        // Default pick is the identity (the base is untouched). egui STAGES a
+        // set_zoom_factor to the next begin_pass, so drive the poll through real
+        // passes (as both runners do) and read the applied zoom back after.
+        fn poll_pass(ctx: &egui::Context, st: &mut SystemState) {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(960.0, 640.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| st.poll(ctx));
+        }
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let base = ctx.zoom_factor();
+        let mut st = SystemState {
+            appearance: AppearanceConfig {
+                accent: AccentChoice::default(),
+                text_scale: TextScale::Larger,
+            },
+            ..SystemState::default()
+        };
+        poll_pass(&ctx, &mut st); // stages the zoom
+        poll_pass(&ctx, &mut st); // the next begin_pass applies it
+        let want = base * TextScale::Larger.factor();
+        assert!(
+            (ctx.zoom_factor() - want).abs() < f32::EPSILON,
+            "the whole-UI zoom follows the text-scale step atop the DPI base"
+        );
+
+        // A Default pick leaves the base zoom untouched (a genuine no-op).
+        let ctx2 = egui::Context::default();
+        Style::install(&ctx2);
+        let base2 = ctx2.zoom_factor();
+        let mut st2 = SystemState {
+            appearance: AppearanceConfig::default(),
+            ..SystemState::default()
+        };
+        poll_pass(&ctx2, &mut st2);
+        poll_pass(&ctx2, &mut st2);
+        assert!(
+            (ctx2.zoom_factor() - base2).abs() < f32::EPSILON,
+            "a Default text-scale must not perturb the DPI base zoom"
+        );
     }
 
     // ── Categorical accent + Carbon layers (SETTINGS-2) ───────────────────────
@@ -3279,6 +3794,7 @@ mod tests {
             SettingsSection::Power,
             SettingsSection::Wallpaper,
             SettingsSection::Hotkeys,
+            SettingsSection::Theme,
         ] {
             let snap = build();
             let mut st = SystemState {
