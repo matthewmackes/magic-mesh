@@ -1483,6 +1483,30 @@ pub enum ResizeDir {
     Down,
 }
 
+/// The stock tmux layouts the FC-4 palette re-applies (`select-layout`) — the
+/// quick "even out this window" ops, distinct from the FC-7 mesh presets.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StockLayout {
+    /// Panes side by side in one row (`even-horizontal`).
+    EvenHorizontal,
+    /// Panes stacked in one column (`even-vertical`).
+    EvenVertical,
+    /// Panes tiled as evenly as possible (`tiled`).
+    Tiled,
+}
+
+impl StockLayout {
+    /// tmux's name for the layout (the `select-layout` argument).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::EvenHorizontal => "even-horizontal",
+            Self::EvenVertical => "even-vertical",
+            Self::Tiled => "tiled",
+        }
+    }
+}
+
 /// Pure builders for the tmux commands the GUI writes to the control channel.
 ///
 /// Each returns the exact command line; the resulting `%`-event is what
@@ -1671,6 +1695,63 @@ pub mod commands {
             let _ = write!(out, " {b:02x}");
         }
         out
+    }
+
+    // ── navigation + arrangement ops (TMUX-FC-4) ─────────────────────────────
+    // The status-bar / toolbar / palette verbs. Each round-trips like every
+    // other builder: `next-window` comes back as `%session-window-changed`,
+    // the pane steps as `%window-pane-changed`, `select-layout` and the pane
+    // swaps as `%layout-change`.
+
+    /// Step the session's current window forward: `next-window`.
+    #[must_use]
+    pub fn next_window() -> String {
+        "next-window".to_owned()
+    }
+
+    /// Step the session's current window back: `previous-window`.
+    #[must_use]
+    pub fn previous_window() -> String {
+        "previous-window".to_owned()
+    }
+
+    /// Jump to the most recently used window: `last-window`.
+    #[must_use]
+    pub fn last_window() -> String {
+        "last-window".to_owned()
+    }
+
+    /// Cycle the active pane forward within the current window:
+    /// `select-pane -t :.+`.
+    #[must_use]
+    pub fn select_pane_next() -> String {
+        "select-pane -t :.+".to_owned()
+    }
+
+    /// Cycle the active pane back within the current window:
+    /// `select-pane -t :.-`.
+    #[must_use]
+    pub fn select_pane_prev() -> String {
+        "select-pane -t :.-".to_owned()
+    }
+
+    /// Swap a pane with the next one in the window: `swap-pane -D -t %<pane>`.
+    #[must_use]
+    pub fn swap_pane_next(pane: u32) -> String {
+        format!("swap-pane -D -t %{pane}")
+    }
+
+    /// Swap a pane with the previous one: `swap-pane -U -t %<pane>`.
+    #[must_use]
+    pub fn swap_pane_prev(pane: u32) -> String {
+        format!("swap-pane -U -t %{pane}")
+    }
+
+    /// Re-apply a stock layout to a window:
+    /// `select-layout -t @<window> <name>`.
+    #[must_use]
+    pub fn select_layout(window: u32, layout: super::StockLayout) -> String {
+        format!("select-layout -t @{window} {}", layout.name())
     }
 
     // ── session-level ops (TMUX-FC-2) ────────────────────────────────────────
@@ -2663,6 +2744,30 @@ boom\n\
         assert_eq!(
             c::list_window_order(),
             "list-windows -F 'window_order\t#{window_id}\t#{window_index}'"
+        );
+    }
+
+    #[test]
+    fn fc4_navigation_and_arrangement_builders_emit_the_exact_tmux_lines() {
+        use commands as c;
+        assert_eq!(c::next_window(), "next-window");
+        assert_eq!(c::previous_window(), "previous-window");
+        assert_eq!(c::last_window(), "last-window");
+        assert_eq!(c::select_pane_next(), "select-pane -t :.+");
+        assert_eq!(c::select_pane_prev(), "select-pane -t :.-");
+        assert_eq!(c::swap_pane_next(3), "swap-pane -D -t %3");
+        assert_eq!(c::swap_pane_prev(3), "swap-pane -U -t %3");
+        assert_eq!(
+            c::select_layout(1, StockLayout::EvenHorizontal),
+            "select-layout -t @1 even-horizontal"
+        );
+        assert_eq!(
+            c::select_layout(1, StockLayout::EvenVertical),
+            "select-layout -t @1 even-vertical"
+        );
+        assert_eq!(
+            c::select_layout(2, StockLayout::Tiled),
+            "select-layout -t @2 tiled"
         );
     }
 

@@ -35,24 +35,47 @@
 //!   mounts, wiring pump → render → dispatch. [`crate::panel`] holds one.
 //! * [`TmuxMenuChoice`] — the top-menu-bar (`crate::menubar`) tmux entries route
 //!   OUT to the surface, which owns the controller the menu drives.
+//!
+//! **TMUX-FC-4 — the native chrome** (design locks #4/#8/#15): the **native
+//! Quasar status bar** ([`status_bar`] — session name · the window list · a
+//! clock, all `Style` tokens, deliberately ignoring the user's tmux `status-*`
+//! config), the **toolbar** ([`toolbar`] — one-click pane/window ops resolved
+//! through the same [`op_intents`] targets the menu uses), the **curated
+//! ~30-command fuzzy palette** ([`PALETTE_COMMANDS`] + [`fuzzy_score`] — every
+//! row an intent against the live model), and the **enriched context menus**
+//! on window tabs + pane rows — including the `join-pane -h` trigger FC-3 left
+//! open (the pane row's "Join Into Window ▸ beside" items). Every affordance
+//! still issues a tmux command through the FC-1/2/3 round-trip; `%`-events
+//! (and the tagged replies) reconcile the model — never a direct tree edit.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use mde_egui::egui::{
-    self, Button, CursorIcon, FontId, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, StrokeKind,
-    Ui, UiBuilder, Vec2,
+    self, pos2, Align2, Button, CursorIcon, FontId, Key, Modifiers, Pos2, Rect, RichText,
+    ScrollArea, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2,
 };
 use mde_egui::Style;
 
 use crate::splits::{self, NodePath, SplitDir};
 use crate::tmux::{
-    commands, resize_for_divider, CommandSink, LayoutDir, SessionInfo, Status, TmuxController,
-    TmuxLaunch, TmuxModel, TmuxPaneIo, TmuxWindow,
+    commands, resize_for_divider, CommandSink, LayoutDir, ResizeDir, SessionInfo, Status,
+    StockLayout, TmuxController, TmuxLaunch, TmuxModel, TmuxPane, TmuxPaneIo, TmuxSession,
+    TmuxWindow,
 };
 use crate::widget::TerminalWidget;
 
 /// The pointer slop either side of a divider strip that still grabs it.
 const DIVIDER_HIT_SLOP: f32 = 3.0;
+
+/// The status bar's height (design lock #8) — one `SP_XL` band, like the strip.
+const STATUS_BAR_H: f32 = Style::SP_XL;
+
+/// How many cells a toolbar/palette resize nudge moves a pane.
+const RESIZE_STEP: u16 = 5;
+
+/// Seconds in a civil day — the clock fold's modulus.
+const DAY_SECS: i64 = 86_400;
 
 /// One GUI intent from the chrome — every session/window/pane op the tree, the
 /// tab strip, the mounted view, or the picker can raise. Owns its strings so it
@@ -99,13 +122,18 @@ pub enum TmuxIntent {
     ZoomPane(u32),
     /// Break a pane out into its own window (`break-pane -s %`).
     BreakPane(u32),
-    /// Join (move) a pane into another window (`join-pane -v -s % -t @`) — the
-    /// pane-row drag onto a window row.
+    /// Join (move) a pane into another window (`join-pane -h/-v -s % -t @`) —
+    /// the pane-row drag onto a window row (stacked), or the pane context
+    /// menu's "Join Into Window" items (beside = `-h`, the FC-4 trigger).
     JoinPane {
         /// The pane being moved.
         src: u32,
         /// The window it joins.
         window: u32,
+        /// How it lands: a native [`SplitDir::V`] (side by side) is tmux's
+        /// `-h`, [`SplitDir::H`] (stacked) its `-v` — the same mapping as
+        /// [`TmuxIntent::SplitPane`].
+        dir: SplitDir,
     },
     /// Swap two panes in place (`swap-pane -d`) — the pane-row drag onto
     /// another pane row.
@@ -137,6 +165,25 @@ pub enum TmuxIntent {
     /// Report the mounted view's cell grid as the control client's size
     /// (`refresh-client -C`), so tmux lays windows out to what's on screen.
     ClientResize(u16, u16),
+    // ── TMUX-FC-4: navigation + arrangement (status bar / toolbar / palette) ─
+    /// Step the current window forward (`next-window`).
+    NextWindow,
+    /// Step the current window back (`previous-window`).
+    PrevWindow,
+    /// Jump to the most recently used window (`last-window`).
+    LastWindow,
+    /// Cycle the active pane forward (`select-pane -t :.+`).
+    NextPane,
+    /// Cycle the active pane back (`select-pane -t :.-`).
+    PrevPane,
+    /// Swap a pane with the next one (`swap-pane -D`).
+    SwapPaneNext(u32),
+    /// Swap a pane with the previous one (`swap-pane -U`).
+    SwapPanePrev(u32),
+    /// Nudge a pane by cells in a direction (`resize-pane -L/-R/-U/-D`).
+    ResizePaneBy(u32, ResizeDir, u16),
+    /// Re-apply a stock layout to a window (`select-layout`).
+    SelectLayout(u32, StockLayout),
 }
 
 /// Turn a [`TmuxIntent`] into the exact `tmux` command line, or [`None`] for the
@@ -158,10 +205,7 @@ pub fn command_for(intent: &TmuxIntent) -> Option<String> {
         TmuxIntent::ClosePane(p) => Some(commands::kill_pane(*p)),
         TmuxIntent::ZoomPane(p) => Some(commands::zoom_pane(*p)),
         TmuxIntent::BreakPane(p) => Some(commands::break_pane(*p)),
-        // A drop joins stacked (tmux's own default split direction).
-        TmuxIntent::JoinPane { src, window } => {
-            Some(commands::join_pane(*src, *window, SplitDir::H))
-        }
+        TmuxIntent::JoinPane { src, window, dir } => Some(commands::join_pane(*src, *window, *dir)),
         TmuxIntent::SwapPanes(a, b) => Some(commands::swap_panes(*a, *b)),
         TmuxIntent::MoveWindowBefore { src, dst } => Some(commands::move_window_before(*src, *dst)),
         TmuxIntent::MoveWindowAfter { src, dst } => Some(commands::move_window_after(*src, *dst)),
@@ -169,6 +213,15 @@ pub fn command_for(intent: &TmuxIntent) -> Option<String> {
         TmuxIntent::ResizePaneWidth(p, cols) => Some(commands::resize_pane_width(*p, *cols)),
         TmuxIntent::ResizePaneHeight(p, rows) => Some(commands::resize_pane_height(*p, *rows)),
         TmuxIntent::ClientResize(cols, rows) => Some(commands::refresh_client_size(*cols, *rows)),
+        TmuxIntent::NextWindow => Some(commands::next_window()),
+        TmuxIntent::PrevWindow => Some(commands::previous_window()),
+        TmuxIntent::LastWindow => Some(commands::last_window()),
+        TmuxIntent::NextPane => Some(commands::select_pane_next()),
+        TmuxIntent::PrevPane => Some(commands::select_pane_prev()),
+        TmuxIntent::SwapPaneNext(p) => Some(commands::swap_pane_next(*p)),
+        TmuxIntent::SwapPanePrev(p) => Some(commands::swap_pane_prev(*p)),
+        TmuxIntent::ResizePaneBy(p, dir, cells) => Some(commands::resize_pane(*p, *dir, *cells)),
+        TmuxIntent::SelectLayout(w, layout) => Some(commands::select_layout(*w, *layout)),
         TmuxIntent::StartClient | TmuxIntent::RefreshSessions => None,
     }
 }
@@ -186,6 +239,8 @@ pub enum TmuxMenuChoice {
     NewSession,
     /// Open the all-sessions picker (starting a client first if needed).
     ShowPicker,
+    /// Open the FC-4 fuzzy command palette (starting a client first if needed).
+    ShowPalette,
     /// Detach the control client.
     Detach,
     /// Show/hide the sidebar tree.
@@ -251,6 +306,30 @@ struct ChromeUi {
     resize_drag: Option<(u32, NodePath, f32)>,
     /// The last client cell grid reported via `refresh-client -C`.
     client_grid: Option<(u16, u16)>,
+    /// The FC-4 command palette's own state (open/query/selection).
+    palette: PaletteUi,
+}
+
+impl ChromeUi {
+    /// Open the FC-4 command palette fresh (empty query, first row selected).
+    fn open_palette(&mut self) {
+        self.palette = PaletteUi {
+            open: true,
+            ..PaletteUi::default()
+        };
+    }
+}
+
+/// The FC-4 command palette's UI state — its own struct so each chrome
+/// affordance keeps one flat toggle.
+#[derive(Default)]
+struct PaletteUi {
+    /// Whether the overlay is open.
+    open: bool,
+    /// The fuzzy query.
+    query: String,
+    /// The keyboard-selected row (an index into the filtered list).
+    sel: usize,
 }
 
 /// The surface-held tmux chrome.
@@ -312,6 +391,10 @@ impl TmuxChrome {
                 self.ui.picker_open = true;
                 self.refresh_sessions();
             }
+            Some(TmuxMenuChoice::ShowPalette) => {
+                self.ensure_client();
+                self.ui.open_palette();
+            }
             Some(TmuxMenuChoice::Detach) => {
                 if let Some(ctrl) = self.controller.as_ref() {
                     let _ = ctrl.send(&commands::detach_client());
@@ -330,33 +413,10 @@ impl TmuxChrome {
     /// active pane (falling back to the window's first pane). Honest nothing
     /// when there is no live window/pane to act on.
     fn menu_op_intents(&self, op: TmuxMenuChoice) -> Vec<TmuxIntent> {
-        let Some(model) = self.controller.as_ref().map(TmuxController::model) else {
-            return Vec::new();
-        };
-        if op == TmuxMenuChoice::NewWindow {
-            return vec![TmuxIntent::NewWindow];
-        }
-        let Some(window) = active_window(model) else {
-            return Vec::new();
-        };
-        if op == TmuxMenuChoice::KillWindow {
-            return vec![TmuxIntent::KillWindow(window)];
-        }
-        let Some(pane) = model
-            .window(window)
-            .and_then(TmuxWindow::active_pane)
-            .or_else(|| model.panes_of_window(window).first().copied())
-        else {
-            return Vec::new();
-        };
-        match op {
-            TmuxMenuChoice::SplitRight => vec![TmuxIntent::SplitPane(pane, SplitDir::V)],
-            TmuxMenuChoice::SplitDown => vec![TmuxIntent::SplitPane(pane, SplitDir::H)],
-            TmuxMenuChoice::ZoomPane => vec![TmuxIntent::ZoomPane(pane)],
-            TmuxMenuChoice::BreakPane => vec![TmuxIntent::BreakPane(pane)],
-            TmuxMenuChoice::ClosePane => vec![TmuxIntent::ClosePane(pane)],
-            _ => Vec::new(),
-        }
+        self.controller
+            .as_ref()
+            .map(TmuxController::model)
+            .map_or_else(Vec::new, |model| op_intents(model, op))
     }
 
     /// Mount the sidebar tree (a left [`egui::SidePanel`]) + the picker window,
@@ -416,7 +476,35 @@ impl TmuxChrome {
             // Panes the server dropped unmount with their windows.
             mounts.retain(|pane, _| model.pane(*pane).is_some());
             tab_strip(ui, model, window, state, &mut intents);
-            view_body(ui, model, window, state, mounts, &sink, &mut intents);
+            toolbar(ui, model, state, &mut intents);
+            // Carve the remaining body: the mounted pane tree above the FC-4
+            // native status bar (a fixed bottom band — deterministic, no
+            // panel-allocation order games).
+            let avail = ui.available_rect_before_wrap();
+            let split_y = (avail.max.y - STATUS_BAR_H).max(avail.min.y);
+            let body = Rect::from_min_max(avail.min, pos2(avail.max.x, split_y));
+            let status = Rect::from_min_max(pos2(avail.min.x, split_y), avail.max);
+            {
+                let mut body_ui =
+                    ui.new_child(UiBuilder::new().max_rect(body).id_salt("tmux-view-body"));
+                view_body(
+                    &mut body_ui,
+                    model,
+                    window,
+                    state,
+                    mounts,
+                    &sink,
+                    &mut intents,
+                );
+            }
+            {
+                let mut status_ui =
+                    ui.new_child(UiBuilder::new().max_rect(status).id_salt("tmux-status-bar"));
+                status_bar(&mut status_ui, model, window, &mut intents);
+            }
+            if state.palette.open {
+                render_palette(ui, model, state, &mut intents);
+            }
             true
         };
         self.dispatch(intents);
@@ -477,6 +565,58 @@ fn active_window(model: &TmuxModel) -> Option<u32> {
         .current_window()
         .filter(|w| model.window(*w).is_some())
         .or_else(|| model.windows_in_order().first().copied())
+}
+
+/// A window's acting pane: its active pane, falling back to its first — the
+/// target every "act on the current pane" affordance resolves.
+fn active_pane_of(model: &TmuxModel, window: u32) -> Option<u32> {
+    model
+        .window(window)
+        .and_then(TmuxWindow::active_pane)
+        .or_else(|| model.panes_of_window(window).first().copied())
+}
+
+/// Resolve a window/pane op against the model: the current window's acting
+/// pane. The ONE target-resolution path the Tmux menu, the FC-4 toolbar, and
+/// the palette all share (§6 — one dispatch path). Honest nothing when there is
+/// no live window/pane to act on, or for the chrome-level choices the surface
+/// handles itself.
+fn op_intents(model: &TmuxModel, op: TmuxMenuChoice) -> Vec<TmuxIntent> {
+    if op == TmuxMenuChoice::NewWindow {
+        return vec![TmuxIntent::NewWindow];
+    }
+    let Some(window) = active_window(model) else {
+        return Vec::new();
+    };
+    if op == TmuxMenuChoice::KillWindow {
+        return vec![TmuxIntent::KillWindow(window)];
+    }
+    let Some(pane) = active_pane_of(model, window) else {
+        return Vec::new();
+    };
+    match op {
+        TmuxMenuChoice::SplitRight => vec![TmuxIntent::SplitPane(pane, SplitDir::V)],
+        TmuxMenuChoice::SplitDown => vec![TmuxIntent::SplitPane(pane, SplitDir::H)],
+        TmuxMenuChoice::ZoomPane => vec![TmuxIntent::ZoomPane(pane)],
+        TmuxMenuChoice::BreakPane => vec![TmuxIntent::BreakPane(pane)],
+        TmuxMenuChoice::ClosePane => vec![TmuxIntent::ClosePane(pane)],
+        _ => Vec::new(),
+    }
+}
+
+/// The reorder intent nudging `window` one slot left/right in the strip order —
+/// shared by the tab context menu and the palette. `None` at the edge (§7 —
+/// honestly nothing, never a wrapped surprise).
+fn nudge_window_intent(model: &TmuxModel, window: u32, left: bool) -> Option<TmuxIntent> {
+    let order = model.windows_in_order();
+    let pos = order.iter().position(|w| *w == window)?;
+    if left {
+        let dst = *order.get(pos.checked_sub(1)?)?;
+        Some(TmuxIntent::MoveWindowBefore { src: window, dst })
+    } else {
+        let dst = *order.get(pos + 1)?;
+        Some(TmuxIntent::MoveWindowAfter { src: window, dst })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -718,8 +858,8 @@ fn window_node(
 }
 
 /// One pane row: click selects, drag picks it up (→ swap/join on drop), and the
-/// context menu carries the FC-3 pane ops (split · zoom · break · rename title ·
-/// close) — each an intent that becomes a tmux command.
+/// context menu ([`pane_context_menu`]) carries the FC-3 pane ops plus the
+/// FC-4 swap/join items — each an intent that becomes a tmux command.
 fn pane_node(
     ui: &mut Ui,
     model: &TmuxModel,
@@ -769,34 +909,99 @@ fn pane_node(
                 StrokeKind::Inside,
             );
         }
-        resp.context_menu(|ui| {
-            if ui.button("Split Right").clicked() {
-                intents.push(TmuxIntent::SplitPane(pane, SplitDir::V));
-                ui.close_menu();
-            }
-            if ui.button("Split Down").clicked() {
-                intents.push(TmuxIntent::SplitPane(pane, SplitDir::H));
-                ui.close_menu();
-            }
-            if ui.button("Zoom").clicked() {
-                intents.push(TmuxIntent::ZoomPane(pane));
-                ui.close_menu();
-            }
-            if ui.button("Break to Window").clicked() {
-                intents.push(TmuxIntent::BreakPane(pane));
-                ui.close_menu();
-            }
-            if ui.button("Rename Title\u{2026}").clicked() {
-                state.pane_rename = Some((pane, title.to_owned()));
-                ui.close_menu();
-            }
-            if ui.button("Close Pane").clicked() {
-                intents.push(TmuxIntent::ClosePane(pane));
-                ui.close_menu();
-            }
-        });
+        resp.context_menu(|ui| pane_context_menu(ui, model, pane, title, state, intents));
         rows.push((RowTarget::Pane(pane), resp.rect));
     });
+}
+
+/// The pane row's context menu (FC-3 ops + the FC-4 additions): split · zoom ·
+/// break · **swap next/previous** · the **Join Into Window** submenu — whose
+/// "beside" items are the `join-pane -h` trigger FC-3 noted as missing — plus
+/// rename-title and close. Every item raises an intent that becomes a tmux
+/// command; the drag-drop join stays stacked (`-v`), this menu carries the
+/// explicit direction choice.
+fn pane_context_menu(
+    ui: &mut Ui,
+    model: &TmuxModel,
+    pane: u32,
+    title: &str,
+    state: &mut ChromeUi,
+    intents: &mut Vec<TmuxIntent>,
+) {
+    if ui.button("Split Right").clicked() {
+        intents.push(TmuxIntent::SplitPane(pane, SplitDir::V));
+        ui.close_menu();
+    }
+    if ui.button("Split Down").clicked() {
+        intents.push(TmuxIntent::SplitPane(pane, SplitDir::H));
+        ui.close_menu();
+    }
+    if ui.button("Zoom").clicked() {
+        intents.push(TmuxIntent::ZoomPane(pane));
+        ui.close_menu();
+    }
+    if ui.button("Break to Window").clicked() {
+        intents.push(TmuxIntent::BreakPane(pane));
+        ui.close_menu();
+    }
+    if ui.button("Swap With Next").clicked() {
+        intents.push(TmuxIntent::SwapPaneNext(pane));
+        ui.close_menu();
+    }
+    if ui.button("Swap With Previous").clicked() {
+        intents.push(TmuxIntent::SwapPanePrev(pane));
+        ui.close_menu();
+    }
+    ui.menu_button("Join Into Window", |ui| {
+        let src_window = model.pane(pane).and_then(TmuxPane::window);
+        let mut any = false;
+        for w in model.windows_in_order() {
+            if src_window == Some(w) {
+                continue;
+            }
+            let Some(win) = model.window(w) else {
+                continue;
+            };
+            any = true;
+            if ui
+                .button(format!("@{w} {} \u{2014} beside", win.name()))
+                .clicked()
+            {
+                intents.push(TmuxIntent::JoinPane {
+                    src: pane,
+                    window: w,
+                    dir: SplitDir::V, // tmux `join-pane -h`
+                });
+                ui.close_menu();
+            }
+            if ui
+                .button(format!("@{w} {} \u{2014} stacked", win.name()))
+                .clicked()
+            {
+                intents.push(TmuxIntent::JoinPane {
+                    src: pane,
+                    window: w,
+                    dir: SplitDir::H, // tmux `join-pane -v`
+                });
+                ui.close_menu();
+            }
+        }
+        if !any {
+            ui.label(
+                RichText::new("no other window")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            );
+        }
+    });
+    if ui.button("Rename Title\u{2026}").clicked() {
+        state.pane_rename = Some((pane, title.to_owned()));
+        ui.close_menu();
+    }
+    if ui.button("Close Pane").clicked() {
+        intents.push(TmuxIntent::ClosePane(pane));
+        ui.close_menu();
+    }
 }
 
 /// A shared inline rename row for windows/panes: an edit field + Rename/Cancel.
@@ -843,9 +1048,13 @@ fn pane_drop_intent(
     let (target, _) = rows.iter().find(|(_, rect)| rect.contains(pos))?;
     match target {
         RowTarget::Pane(dst) if *dst != src => Some(TmuxIntent::SwapPanes(src, *dst)),
-        RowTarget::Window(w) if src_window != Some(*w) => {
-            Some(TmuxIntent::JoinPane { src, window: *w })
-        }
+        RowTarget::Window(w) if src_window != Some(*w) => Some(TmuxIntent::JoinPane {
+            src,
+            window: *w,
+            // A drop joins stacked (tmux's own default split direction); the
+            // pane context menu carries the explicit beside/`-h` choice (FC-4).
+            dir: SplitDir::H,
+        }),
         _ => None,
     }
 }
@@ -895,9 +1104,29 @@ fn tab_strip(
                     StrokeKind::Inside,
                 );
             }
+            // FC-4: the full window context menu — select · rename · reorder ·
+            // new/kill, every item a tmux command through the round-trip.
             resp.context_menu(|ui| {
+                if ui.button("Select").clicked() {
+                    intents.push(TmuxIntent::SelectWindow(window));
+                    ui.close_menu();
+                }
                 if ui.button("Rename\u{2026}").clicked() {
                     state.win_rename = Some((window, win.name().to_owned()));
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Move Left").clicked() {
+                    intents.extend(nudge_window_intent(model, window, true));
+                    ui.close_menu();
+                }
+                if ui.button("Move Right").clicked() {
+                    intents.extend(nudge_window_intent(model, window, false));
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("New Window").clicked() {
+                    intents.push(TmuxIntent::NewWindow);
                     ui.close_menu();
                 }
                 if ui.button("Kill Window").clicked() {
@@ -1146,6 +1375,506 @@ fn resize_intent(model: &TmuxModel, window: u32, path: NodePath, ratio: f32) -> 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// TMUX-FC-4 — the toolbar.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The toolbar's op buttons: label · hover hint (naming the tmux command) ·
+/// the shared menu-op it resolves through ([`op_intents`], §6 one dispatch
+/// path). A const table so the affordance→command map is testable data.
+const TOOLBAR_OPS: [(&str, &str, TmuxMenuChoice); 7] = [
+    (
+        "Split \u{2192}",
+        "Split the active pane beside (split-window -h)",
+        TmuxMenuChoice::SplitRight,
+    ),
+    (
+        "Split \u{2193}",
+        "Split the active pane below (split-window -v)",
+        TmuxMenuChoice::SplitDown,
+    ),
+    (
+        "Zoom",
+        "Toggle the active pane's zoom (resize-pane -Z)",
+        TmuxMenuChoice::ZoomPane,
+    ),
+    (
+        "Break",
+        "Break the active pane out to its own window (break-pane)",
+        TmuxMenuChoice::BreakPane,
+    ),
+    (
+        "\u{00d7} Pane",
+        "Close the active pane (kill-pane)",
+        TmuxMenuChoice::ClosePane,
+    ),
+    (
+        "+ Win",
+        "Open a fresh window (new-window)",
+        TmuxMenuChoice::NewWindow,
+    ),
+    (
+        "\u{00d7} Win",
+        "Kill the current window (kill-window)",
+        TmuxMenuChoice::KillWindow,
+    ),
+];
+
+/// FC-4 — the toolbar between the tab strip and the mounted view: one-click
+/// pane/window ops (each resolving its target through [`op_intents`], exactly
+/// as the Tmux menu does) plus the palette, sidebar and detach affordances.
+/// All `Style` tokens (§4); every button's hover text names its tmux command.
+fn toolbar(ui: &mut Ui, model: &TmuxModel, state: &mut ChromeUi, intents: &mut Vec<TmuxIntent>) {
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(Style::SP_XS);
+        for (label, hint, op) in TOOLBAR_OPS {
+            let resp = ui
+                .add(Button::new(
+                    RichText::new(label).size(Style::SMALL).color(Style::TEXT),
+                ))
+                .on_hover_text(hint);
+            if resp.clicked() {
+                intents.extend(op_intents(model, op));
+            }
+        }
+        ui.add_space(Style::SP_S);
+        if ui
+            .add(Button::new(
+                RichText::new("Commands\u{2026}")
+                    .size(Style::SMALL)
+                    .color(Style::ACCENT_TERMINALS),
+            ))
+            .on_hover_text("The tmux command palette (fuzzy, ~30 curated ops)")
+            .clicked()
+        {
+            state.open_palette();
+        }
+        if ui
+            .add(Button::new(
+                RichText::new(if state.tree_open {
+                    "Tree \u{25C0}"
+                } else {
+                    "Tree \u{25B6}"
+                })
+                .size(Style::SMALL)
+                .color(Style::TEXT_DIM),
+            ))
+            .on_hover_text("Show/hide the session tree sidebar")
+            .clicked()
+        {
+            state.tree_open = !state.tree_open;
+        }
+        if ui
+            .add(Button::new(
+                RichText::new("Detach")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            ))
+            .on_hover_text(
+                "Detach this control client (detach-client) \u{2014} the session keeps running",
+            )
+            .clicked()
+        {
+            intents.push(TmuxIntent::Detach);
+        }
+    });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TMUX-FC-4 — the native Quasar status bar.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// FC-4 — the **native Quasar status bar** (design lock #8): the session name,
+/// the window list (current highlighted, `Z` while zoomed; a click round-trips
+/// `select-window`), and a wall clock — rendered from the live model through
+/// `Style` tokens and deliberately **ignoring the user's tmux `status-*`
+/// config** (tmux's own status line never renders here; panes carry only their
+/// content, so the platform look is the one look).
+fn status_bar(ui: &mut Ui, model: &TmuxModel, current: u32, intents: &mut Vec<TmuxIntent>) {
+    let rect = ui.available_rect_before_wrap();
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, Style::SURFACE);
+    painter.hline(rect.x_range(), rect.min.y, Stroke::new(1.0, Style::BORDER));
+
+    ui.horizontal_centered(|ui| {
+        ui.add_space(Style::SP_S);
+        let name = model
+            .current_session()
+            .and_then(|s| model.session(s))
+            .map_or("tmux", TmuxSession::name);
+        ui.label(
+            RichText::new(format!("[{name}]"))
+                .size(Style::SMALL)
+                .color(Style::ACCENT_TERMINALS)
+                .strong(),
+        );
+        ui.add_space(Style::SP_S);
+        for window in model.windows_in_order() {
+            let Some(win) = model.window(window) else {
+                continue;
+            };
+            let idx = win
+                .index()
+                .map_or_else(|| format!("@{window}"), |i| i.to_string());
+            let mark = if window == current { "*" } else { "" };
+            let zoom = if win.is_zoomed() { "Z" } else { "" };
+            let color = if window == current {
+                Style::TEXT
+            } else {
+                Style::TEXT_DIM
+            };
+            let resp = ui.add(
+                Button::new(
+                    RichText::new(format!("{idx}:{}{mark}{zoom}", win.name()))
+                        .size(Style::SMALL)
+                        .color(color),
+                )
+                .frame(false),
+            );
+            if window == current {
+                ui.painter().rect_filled(
+                    Rect::from_min_max(pos2(resp.rect.min.x, resp.rect.max.y - 1.0), resp.rect.max),
+                    0.0,
+                    Style::ACCENT,
+                );
+            }
+            if resp.clicked() {
+                intents.push(TmuxIntent::SelectWindow(window));
+            }
+        }
+        // The clock, right-aligned; repaint scheduled at the minute rollover
+        // so the painted minute is never stale.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(Style::SP_S);
+            let now = now_unix();
+            ui.label(
+                RichText::new(hhmm(now))
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            );
+            ui.ctx()
+                .request_repaint_after(Duration::from_secs(secs_to_next_minute(now).max(1)));
+        });
+    });
+}
+
+/// Seconds since the Unix epoch (0 on a pre-epoch clock — never a panic).
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// The wall-clock `HH:MM` for a Unix timestamp — the platform's one tiny clock
+/// fold (the shell dock's `timers::hhmm`), restated here because the terminal
+/// tier cannot reach across surface crates (§6).
+fn hhmm(unix_secs: i64) -> String {
+    let tod = unix_secs.rem_euclid(DAY_SECS);
+    format!("{:02}:{:02}", tod / 3600, (tod % 3600) / 60)
+}
+
+/// Seconds until the next minute rollover — the status clock's repaint alarm.
+fn secs_to_next_minute(unix_secs: i64) -> u64 {
+    let into = unix_secs.rem_euclid(60);
+    u64::try_from(60 - into).unwrap_or(60)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TMUX-FC-4 — the curated fuzzy command palette.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One palette row's semantic op — resolved against the live model + chrome
+/// state by [`palette_resolve`] when chosen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PaletteOp {
+    NewWindow,
+    KillWindow,
+    RenameWindow,
+    NextWindow,
+    PrevWindow,
+    LastWindow,
+    MoveWindowLeft,
+    MoveWindowRight,
+    SplitRight,
+    SplitDown,
+    ClosePane,
+    ZoomPane,
+    BreakPane,
+    NextPane,
+    PrevPane,
+    RenamePaneTitle,
+    SwapPaneNext,
+    SwapPanePrev,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    LayoutEvenH,
+    LayoutEvenV,
+    LayoutTiled,
+    NewSession,
+    AttachPicker,
+    RenameSession,
+    KillSession,
+    RefreshSessions,
+    DetachClient,
+    ToggleSidebar,
+}
+
+/// The curated command set (design lock #15 — "the ~30 most-used tmux
+/// actions"), fuzzy-searchable. Labels are what [`fuzzy_score`] matches.
+const PALETTE_COMMANDS: [(&str, PaletteOp); 32] = [
+    ("New window", PaletteOp::NewWindow),
+    ("Kill window", PaletteOp::KillWindow),
+    ("Rename window\u{2026}", PaletteOp::RenameWindow),
+    ("Next window", PaletteOp::NextWindow),
+    ("Previous window", PaletteOp::PrevWindow),
+    ("Last window", PaletteOp::LastWindow),
+    ("Move window left", PaletteOp::MoveWindowLeft),
+    ("Move window right", PaletteOp::MoveWindowRight),
+    ("Split pane right", PaletteOp::SplitRight),
+    ("Split pane down", PaletteOp::SplitDown),
+    ("Close pane", PaletteOp::ClosePane),
+    ("Zoom pane", PaletteOp::ZoomPane),
+    ("Break pane to window", PaletteOp::BreakPane),
+    ("Next pane", PaletteOp::NextPane),
+    ("Previous pane", PaletteOp::PrevPane),
+    ("Rename pane title\u{2026}", PaletteOp::RenamePaneTitle),
+    ("Swap pane with next", PaletteOp::SwapPaneNext),
+    ("Swap pane with previous", PaletteOp::SwapPanePrev),
+    ("Resize pane left", PaletteOp::ResizeLeft),
+    ("Resize pane right", PaletteOp::ResizeRight),
+    ("Resize pane up", PaletteOp::ResizeUp),
+    ("Resize pane down", PaletteOp::ResizeDown),
+    ("Layout: even horizontal", PaletteOp::LayoutEvenH),
+    ("Layout: even vertical", PaletteOp::LayoutEvenV),
+    ("Layout: tiled", PaletteOp::LayoutTiled),
+    ("New session\u{2026}", PaletteOp::NewSession),
+    ("Attach session\u{2026}", PaletteOp::AttachPicker),
+    ("Rename session\u{2026}", PaletteOp::RenameSession),
+    ("Kill session", PaletteOp::KillSession),
+    ("Refresh session list", PaletteOp::RefreshSessions),
+    ("Detach client", PaletteOp::DetachClient),
+    ("Toggle sidebar tree", PaletteOp::ToggleSidebar),
+];
+
+/// Case-insensitive fuzzy subsequence score: every `query` character (spaces
+/// skipped) must appear in `label` in order; **lower is better**. Gaps cost
+/// their length and a mid-word jump costs extra, so a prefix beats a tail hit
+/// and word-start matches ("kilw" → "Kill window") rank naturally. `None` = no
+/// match; an empty query matches everything at 0 (the full curated list).
+fn fuzzy_score(query: &str, label: &str) -> Option<u32> {
+    let label: Vec<char> = label.to_lowercase().chars().collect();
+    let mut score: u32 = 0;
+    let mut pos: usize = 0;
+    for qc in query.to_lowercase().chars().filter(|c| !c.is_whitespace()) {
+        let at = (pos..label.len()).find(|&j| label[j] == qc)?;
+        let gap = u32::try_from(at - pos).unwrap_or(u32::MAX);
+        score = score.saturating_add(gap);
+        let word_start = at == 0 || label[at - 1] == ' ';
+        if !word_start && at != pos {
+            score = score.saturating_add(2);
+        }
+        pos = at + 1;
+    }
+    Some(score)
+}
+
+/// The palette rows matching `query`, best score first (stable by table order
+/// on ties). Pure — the filtering the render mounts, unit-tested headlessly.
+fn palette_filter(query: &str) -> Vec<usize> {
+    let mut scored: Vec<(u32, usize)> = PALETTE_COMMANDS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (label, _))| fuzzy_score(query, label).map(|s| (s, i)))
+        .collect();
+    scored.sort_unstable();
+    scored.into_iter().map(|(_, i)| i).collect()
+}
+
+/// Resolve a chosen palette op against the live model + chrome state: the
+/// command ops become [`TmuxIntent`]s (targets = the current window's acting
+/// pane, the same resolution every other affordance uses); the editor ops open
+/// the matching inline editor (revealing the sidebar that hosts it); the
+/// chrome ops toggle UI state. Honest nothing when there is no live target.
+fn palette_resolve(op: PaletteOp, model: &TmuxModel, state: &mut ChromeUi) -> Vec<TmuxIntent> {
+    let window = active_window(model);
+    let pane = window.and_then(|w| active_pane_of(model, w));
+    match op {
+        PaletteOp::NewWindow => vec![TmuxIntent::NewWindow],
+        PaletteOp::KillWindow => window.map_or_else(Vec::new, |w| vec![TmuxIntent::KillWindow(w)]),
+        PaletteOp::RenameWindow => {
+            if let Some(w) = window {
+                let name = model.window(w).map_or("", TmuxWindow::name).to_owned();
+                state.win_rename = Some((w, name));
+            }
+            Vec::new()
+        }
+        PaletteOp::NextWindow => vec![TmuxIntent::NextWindow],
+        PaletteOp::PrevWindow => vec![TmuxIntent::PrevWindow],
+        PaletteOp::LastWindow => vec![TmuxIntent::LastWindow],
+        PaletteOp::MoveWindowLeft => window
+            .and_then(|w| nudge_window_intent(model, w, true))
+            .map_or_else(Vec::new, |i| vec![i]),
+        PaletteOp::MoveWindowRight => window
+            .and_then(|w| nudge_window_intent(model, w, false))
+            .map_or_else(Vec::new, |i| vec![i]),
+        PaletteOp::SplitRight => op_intents(model, TmuxMenuChoice::SplitRight),
+        PaletteOp::SplitDown => op_intents(model, TmuxMenuChoice::SplitDown),
+        PaletteOp::ClosePane => op_intents(model, TmuxMenuChoice::ClosePane),
+        PaletteOp::ZoomPane => op_intents(model, TmuxMenuChoice::ZoomPane),
+        PaletteOp::BreakPane => op_intents(model, TmuxMenuChoice::BreakPane),
+        PaletteOp::NextPane => vec![TmuxIntent::NextPane],
+        PaletteOp::PrevPane => vec![TmuxIntent::PrevPane],
+        PaletteOp::RenamePaneTitle => {
+            if let Some(p) = pane {
+                let title = model.pane(p).map_or("", TmuxPane::title).to_owned();
+                state.pane_rename = Some((p, title));
+                // The pane-rename editor lives in the sidebar tree — reveal it.
+                state.tree_open = true;
+            }
+            Vec::new()
+        }
+        PaletteOp::SwapPaneNext => {
+            pane.map_or_else(Vec::new, |p| vec![TmuxIntent::SwapPaneNext(p)])
+        }
+        PaletteOp::SwapPanePrev => {
+            pane.map_or_else(Vec::new, |p| vec![TmuxIntent::SwapPanePrev(p)])
+        }
+        PaletteOp::ResizeLeft => pane.map_or_else(Vec::new, |p| {
+            vec![TmuxIntent::ResizePaneBy(p, ResizeDir::Left, RESIZE_STEP)]
+        }),
+        PaletteOp::ResizeRight => pane.map_or_else(Vec::new, |p| {
+            vec![TmuxIntent::ResizePaneBy(p, ResizeDir::Right, RESIZE_STEP)]
+        }),
+        PaletteOp::ResizeUp => pane.map_or_else(Vec::new, |p| {
+            vec![TmuxIntent::ResizePaneBy(p, ResizeDir::Up, RESIZE_STEP)]
+        }),
+        PaletteOp::ResizeDown => pane.map_or_else(Vec::new, |p| {
+            vec![TmuxIntent::ResizePaneBy(p, ResizeDir::Down, RESIZE_STEP)]
+        }),
+        PaletteOp::LayoutEvenH => window.map_or_else(Vec::new, |w| {
+            vec![TmuxIntent::SelectLayout(w, StockLayout::EvenHorizontal)]
+        }),
+        PaletteOp::LayoutEvenV => window.map_or_else(Vec::new, |w| {
+            vec![TmuxIntent::SelectLayout(w, StockLayout::EvenVertical)]
+        }),
+        PaletteOp::LayoutTiled => window.map_or_else(Vec::new, |w| {
+            vec![TmuxIntent::SelectLayout(w, StockLayout::Tiled)]
+        }),
+        PaletteOp::NewSession => {
+            // The new-session name field lives in the sidebar — reveal both.
+            state.new_open = true;
+            state.tree_open = true;
+            Vec::new()
+        }
+        PaletteOp::AttachPicker => {
+            state.picker_open = true;
+            vec![TmuxIntent::RefreshSessions]
+        }
+        PaletteOp::RenameSession => {
+            let name = model
+                .current_session()
+                .and_then(|s| model.session(s))
+                .map(TmuxSession::name);
+            if let Some(name) = name {
+                state.rename = Some(SessionRename {
+                    target: name.to_owned(),
+                    buffer: name.to_owned(),
+                });
+                state.tree_open = true;
+            }
+            Vec::new()
+        }
+        PaletteOp::KillSession => model
+            .current_session()
+            .and_then(|s| model.session(s))
+            .map_or_else(Vec::new, |s| {
+                vec![TmuxIntent::KillSession(s.name().to_owned())]
+            }),
+        PaletteOp::RefreshSessions => vec![TmuxIntent::RefreshSessions],
+        PaletteOp::DetachClient => vec![TmuxIntent::Detach],
+        PaletteOp::ToggleSidebar => {
+            state.tree_open = !state.tree_open;
+            Vec::new()
+        }
+    }
+}
+
+/// FC-4 — the palette overlay: a query field over the fuzzy-filtered curated
+/// list. Arrows move the selection, Enter runs it, Esc closes, a click runs a
+/// row — the navigation keys are consumed **before** the query field sees
+/// them, so typing only ever edits the query.
+fn render_palette(ui: &Ui, model: &TmuxModel, state: &mut ChromeUi, intents: &mut Vec<TmuxIntent>) {
+    let mut open = state.palette.open;
+    let mut chosen: Option<PaletteOp> = None;
+    egui::Window::new("tmux commands")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_TOP, Vec2::new(0.0, Style::SP_XL * 2.0))
+        .show(ui.ctx(), |ui| {
+            let (up, down, enter, esc) = ui.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::NONE, Key::ArrowUp),
+                    i.consume_key(Modifiers::NONE, Key::ArrowDown),
+                    i.consume_key(Modifiers::NONE, Key::Enter),
+                    i.consume_key(Modifiers::NONE, Key::Escape),
+                )
+            });
+            if esc {
+                open = false;
+            }
+
+            let field = ui.text_edit_singleline(&mut state.palette.query);
+            field.request_focus();
+            if field.changed() {
+                state.palette.sel = 0;
+            }
+
+            let filtered = palette_filter(&state.palette.query);
+            if filtered.is_empty() {
+                ui.label(
+                    RichText::new("no matching command")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+                return;
+            }
+            if down {
+                state.palette.sel = (state.palette.sel + 1).min(filtered.len() - 1);
+            }
+            if up {
+                state.palette.sel = state.palette.sel.saturating_sub(1);
+            }
+            state.palette.sel = state.palette.sel.min(filtered.len() - 1);
+            if enter {
+                chosen = filtered
+                    .get(state.palette.sel)
+                    .map(|&i| PALETTE_COMMANDS[i].1);
+            }
+
+            ScrollArea::vertical()
+                .max_height(Style::SP_XL * 8.0)
+                .show(ui, |ui| {
+                    for (row, &idx) in filtered.iter().enumerate() {
+                        let (label, op) = PALETTE_COMMANDS[idx];
+                        let resp = ui.selectable_label(
+                            row == state.palette.sel,
+                            RichText::new(label).size(Style::SMALL),
+                        );
+                        if resp.clicked() {
+                            chosen = Some(op);
+                        }
+                    }
+                });
+        });
+    if let Some(op) = chosen {
+        intents.extend(palette_resolve(op, model, state));
+        open = false;
+    }
+    state.palette.open = open;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // The all-sessions picker.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1332,8 +2061,23 @@ mod tests {
             Some("break-pane -s %4")
         );
         assert_eq!(
-            command_for(&TmuxIntent::JoinPane { src: 4, window: 2 }).as_deref(),
+            command_for(&TmuxIntent::JoinPane {
+                src: 4,
+                window: 2,
+                dir: SplitDir::H
+            })
+            .as_deref(),
             Some("join-pane -v -s %4 -t @2")
+        );
+        // The FC-4 "beside" trigger — the -h path FC-3 noted as missing.
+        assert_eq!(
+            command_for(&TmuxIntent::JoinPane {
+                src: 4,
+                window: 2,
+                dir: SplitDir::V
+            })
+            .as_deref(),
+            Some("join-pane -h -s %4 -t @2")
         );
         assert_eq!(
             command_for(&TmuxIntent::SwapPanes(1, 5)).as_deref(),
@@ -1536,10 +2280,15 @@ mod tests {
             pane_drop_intent(1, Some(0), &rows, pos2(50.0, 50.0)),
             Some(TmuxIntent::SwapPanes(1, 2))
         );
-        // Onto a different window's row: join (move) the pane there.
+        // Onto a different window's row: join (move) the pane there (stacked —
+        // the explicit beside/-h choice lives in the FC-4 context menu).
         assert_eq!(
             pane_drop_intent(1, Some(0), &rows, pos2(50.0, 70.0)),
-            Some(TmuxIntent::JoinPane { src: 1, window: 7 })
+            Some(TmuxIntent::JoinPane {
+                src: 1,
+                window: 7,
+                dir: SplitDir::H
+            })
         );
         // Onto its own row / its own window / empty space: honestly nothing.
         assert_eq!(pane_drop_intent(1, Some(0), &rows, pos2(50.0, 30.0)), None);
@@ -1613,5 +2362,254 @@ mod tests {
             tab_strip(ui, &model, 1, &mut state, &mut intents);
         });
         assert!(prims > 0, "the tab strip did not tessellate");
+    }
+
+    // ── TMUX-FC-4: the intent → command map for the new chrome ops ───────────
+
+    #[test]
+    fn command_for_maps_each_fc4_op_to_its_tmux_line() {
+        assert_eq!(
+            command_for(&TmuxIntent::NextWindow).as_deref(),
+            Some("next-window")
+        );
+        assert_eq!(
+            command_for(&TmuxIntent::PrevWindow).as_deref(),
+            Some("previous-window")
+        );
+        assert_eq!(
+            command_for(&TmuxIntent::LastWindow).as_deref(),
+            Some("last-window")
+        );
+        assert_eq!(
+            command_for(&TmuxIntent::NextPane).as_deref(),
+            Some("select-pane -t :.+")
+        );
+        assert_eq!(
+            command_for(&TmuxIntent::PrevPane).as_deref(),
+            Some("select-pane -t :.-")
+        );
+        assert_eq!(
+            command_for(&TmuxIntent::SwapPaneNext(3)).as_deref(),
+            Some("swap-pane -D -t %3")
+        );
+        assert_eq!(
+            command_for(&TmuxIntent::SwapPanePrev(3)).as_deref(),
+            Some("swap-pane -U -t %3")
+        );
+        assert_eq!(
+            command_for(&TmuxIntent::ResizePaneBy(2, ResizeDir::Left, 5)).as_deref(),
+            Some("resize-pane -t %2 -L 5")
+        );
+        assert_eq!(
+            command_for(&TmuxIntent::SelectLayout(1, StockLayout::Tiled)).as_deref(),
+            Some("select-layout -t @1 tiled")
+        );
+    }
+
+    // ── TMUX-FC-4: the shared target resolution + the reorder nudge ──────────
+
+    /// A two-window fixture: @0 "editor" (panes 1,2 — pane 2 active) is
+    /// current; @1 "logs" sits beside it.
+    fn two_window_model() -> TmuxModel {
+        model_from(
+            b"%session-changed $0 main\n\
+              %window-add @0\n\
+              %window-renamed @0 editor\n\
+              %layout-change @0 f9d3,80x24,0,0{40x24,0,0,1,39x24,41,0,2}\n\
+              %window-pane-changed @0 %2\n\
+              %window-add @1\n\
+              %window-renamed @1 logs\n\
+              %session-window-changed $0 @0\n",
+        )
+    }
+
+    #[test]
+    fn op_intents_resolves_the_toolbar_affordances_against_the_model() {
+        let model = two_window_model();
+        // Every toolbar button's op resolves to its intent on the acting pane
+        // (@0's active pane %2) / the current window — the emission map behind
+        // each affordance.
+        assert_eq!(
+            op_intents(&model, TmuxMenuChoice::SplitRight),
+            vec![TmuxIntent::SplitPane(2, SplitDir::V)]
+        );
+        assert_eq!(
+            op_intents(&model, TmuxMenuChoice::SplitDown),
+            vec![TmuxIntent::SplitPane(2, SplitDir::H)]
+        );
+        assert_eq!(
+            op_intents(&model, TmuxMenuChoice::ZoomPane),
+            vec![TmuxIntent::ZoomPane(2)]
+        );
+        assert_eq!(
+            op_intents(&model, TmuxMenuChoice::BreakPane),
+            vec![TmuxIntent::BreakPane(2)]
+        );
+        assert_eq!(
+            op_intents(&model, TmuxMenuChoice::ClosePane),
+            vec![TmuxIntent::ClosePane(2)]
+        );
+        assert_eq!(
+            op_intents(&model, TmuxMenuChoice::NewWindow),
+            vec![TmuxIntent::NewWindow]
+        );
+        assert_eq!(
+            op_intents(&model, TmuxMenuChoice::KillWindow),
+            vec![TmuxIntent::KillWindow(0)]
+        );
+        // An empty model resolves honestly to nothing (§7 — no fake target).
+        assert!(op_intents(&TmuxModel::new(), TmuxMenuChoice::ZoomPane).is_empty());
+    }
+
+    #[test]
+    fn nudge_window_intent_moves_within_the_strip_and_stops_at_the_edges() {
+        let model = two_window_model();
+        assert_eq!(
+            nudge_window_intent(&model, 1, true),
+            Some(TmuxIntent::MoveWindowBefore { src: 1, dst: 0 })
+        );
+        assert_eq!(
+            nudge_window_intent(&model, 0, false),
+            Some(TmuxIntent::MoveWindowAfter { src: 0, dst: 1 })
+        );
+        // The edges honestly refuse (no wrap surprises).
+        assert_eq!(nudge_window_intent(&model, 0, true), None);
+        assert_eq!(nudge_window_intent(&model, 1, false), None);
+        // An unknown window resolves to nothing.
+        assert_eq!(nudge_window_intent(&model, 9, true), None);
+    }
+
+    // ── TMUX-FC-4: the fuzzy palette ─────────────────────────────────────────
+
+    #[test]
+    fn fuzzy_score_matches_subsequences_and_ranks_prefixes_first() {
+        // An exact prefix is a perfect (zero-cost) match.
+        assert_eq!(fuzzy_score("zoom", "Zoom pane"), Some(0));
+        // Word-start subsequences match cheaply ("kilw" → "Kill window").
+        assert!(fuzzy_score("kilw", "Kill window").is_some());
+        // No subsequence → no match.
+        assert_eq!(fuzzy_score("kilw", "Kill session"), None);
+        assert_eq!(fuzzy_score("xyz", "Zoom pane"), None);
+        // The empty query matches everything at zero (lists the whole set).
+        assert_eq!(fuzzy_score("", "anything"), Some(0));
+        // A prefix hit ranks above a scattered hit of the same query.
+        let prefix = fuzzy_score("split", "Split pane right").expect("prefix");
+        let scattered = fuzzy_score("split", "Swap pane with next... lit").unwrap_or(u32::MAX);
+        assert!(prefix < scattered, "{prefix} vs {scattered}");
+    }
+
+    #[test]
+    fn palette_filter_narrows_the_curated_set_and_keeps_order_on_ties() {
+        // Empty query: the whole curated set (~30, lock #15), table order.
+        let all = palette_filter("");
+        assert_eq!(all.len(), PALETTE_COMMANDS.len());
+        assert!(
+            (28..=34).contains(&PALETTE_COMMANDS.len()),
+            "the curated set stays ~30 (got {})",
+            PALETTE_COMMANDS.len()
+        );
+        assert_eq!(all[0], 0, "ties keep table order");
+        // "split" narrows to exactly the two split rows, best first.
+        let split = palette_filter("split");
+        let labels: Vec<&str> = split.iter().map(|&i| PALETTE_COMMANDS[i].0).collect();
+        assert!(labels.contains(&"Split pane right"), "{labels:?}");
+        assert!(labels.contains(&"Split pane down"), "{labels:?}");
+        assert_eq!(labels.len(), 2, "{labels:?}");
+        // No match → an honest empty list.
+        assert!(palette_filter("qqqqq").is_empty());
+    }
+
+    #[test]
+    fn palette_resolve_emits_the_op_intents_against_the_model() {
+        let model = two_window_model();
+        let mut state = ChromeUi::default();
+        // Command ops → the same intents every other affordance raises.
+        assert_eq!(
+            palette_resolve(PaletteOp::NextWindow, &model, &mut state),
+            vec![TmuxIntent::NextWindow]
+        );
+        assert_eq!(
+            palette_resolve(PaletteOp::SplitRight, &model, &mut state),
+            vec![TmuxIntent::SplitPane(2, SplitDir::V)]
+        );
+        assert_eq!(
+            palette_resolve(PaletteOp::SwapPaneNext, &model, &mut state),
+            vec![TmuxIntent::SwapPaneNext(2)]
+        );
+        assert_eq!(
+            palette_resolve(PaletteOp::ResizeLeft, &model, &mut state),
+            vec![TmuxIntent::ResizePaneBy(2, ResizeDir::Left, RESIZE_STEP)]
+        );
+        assert_eq!(
+            palette_resolve(PaletteOp::LayoutTiled, &model, &mut state),
+            vec![TmuxIntent::SelectLayout(0, StockLayout::Tiled)]
+        );
+        assert_eq!(
+            palette_resolve(PaletteOp::MoveWindowRight, &model, &mut state),
+            vec![TmuxIntent::MoveWindowAfter { src: 0, dst: 1 }]
+        );
+        assert_eq!(
+            palette_resolve(PaletteOp::KillSession, &model, &mut state),
+            vec![TmuxIntent::KillSession("main".to_owned())]
+        );
+        // Editor ops open the inline editor (revealing its sidebar host) and
+        // emit nothing — the rename itself round-trips on submit.
+        assert!(palette_resolve(PaletteOp::RenameWindow, &model, &mut state).is_empty());
+        assert_eq!(state.win_rename, Some((0, "editor".to_owned())));
+        assert!(palette_resolve(PaletteOp::RenamePaneTitle, &model, &mut state).is_empty());
+        assert_eq!(state.pane_rename.as_ref().map(|(p, _)| *p), Some(2));
+        assert!(state.tree_open, "the pane-rename editor's host is revealed");
+        // Chrome ops toggle UI state.
+        state.tree_open = false;
+        assert!(palette_resolve(PaletteOp::ToggleSidebar, &model, &mut state).is_empty());
+        assert!(state.tree_open);
+        assert_eq!(
+            palette_resolve(PaletteOp::AttachPicker, &model, &mut state),
+            vec![TmuxIntent::RefreshSessions]
+        );
+        assert!(state.picker_open);
+    }
+
+    // ── TMUX-FC-4: the toolbar + native status bar render headless ───────────
+
+    #[test]
+    fn toolbar_and_status_bar_render_headless() {
+        let model = two_window_model();
+        let mut state = ChromeUi::default();
+        let mut intents: Vec<TmuxIntent> = Vec::new();
+        let prims = headless(|ui| {
+            toolbar(ui, &model, &mut state, &mut intents);
+            status_bar(ui, &model, 0, &mut intents);
+        });
+        assert!(prims > 0, "the FC-4 chrome did not tessellate");
+        // Rendering alone raises no intents — only real clicks do.
+        assert!(intents.is_empty(), "no phantom intents: {intents:?}");
+    }
+
+    #[test]
+    fn the_palette_overlay_renders_headless_when_open() {
+        let model = two_window_model();
+        let mut state = ChromeUi::default();
+        state.open_palette();
+        let mut intents: Vec<TmuxIntent> = Vec::new();
+        let prims = headless(|ui| {
+            render_palette(ui, &model, &mut state, &mut intents);
+        });
+        assert!(prims > 0, "the palette overlay did not tessellate");
+        assert!(state.palette.open, "no input → it stays open");
+        assert!(intents.is_empty());
+    }
+
+    // ── TMUX-FC-4: the status clock folds ────────────────────────────────────
+
+    #[test]
+    fn the_status_clock_folds_read_correctly() {
+        assert_eq!(hhmm(0), "00:00");
+        assert_eq!(hhmm(3_661), "01:01");
+        assert_eq!(hhmm(86_399), "23:59");
+        assert_eq!(hhmm(86_400), "00:00");
+        assert_eq!(secs_to_next_minute(0), 60);
+        assert_eq!(secs_to_next_minute(59), 1);
+        assert_eq!(secs_to_next_minute(61), 59);
     }
 }

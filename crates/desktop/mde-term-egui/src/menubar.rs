@@ -655,8 +655,9 @@ fn terminal_entries(cx: &MenuContext, keymap: &Keymap) -> Vec<Entry<Picked>> {
     out
 }
 
-/// The Tmux drop-down (TMUX-FC-2/3): the session-management entry points plus
-/// the window & pane ops. Each item routes OUT as a [`TmuxMenuChoice`] the
+/// The Tmux drop-down (TMUX-FC-2/3/4): the session-management entry points,
+/// the FC-4 command palette, plus the window & pane ops. Each item routes OUT
+/// as a [`TmuxMenuChoice`] the
 /// surface applies to its [`crate::tmux_ui::TmuxChrome`]; every item needing a
 /// live control client honestly greys out without one (§7). The full
 /// session/window/pane tree lives in the sidebar the "New tmux session" item
@@ -673,6 +674,10 @@ fn tmux_entries(active: bool) -> Vec<Entry<Picked>> {
         Entry::Item(BarItem::new(
             Picked::Tmux(TmuxMenuChoice::ShowPicker),
             "Attach Session\u{2026}",
+        )),
+        Entry::Item(BarItem::new(
+            Picked::Tmux(TmuxMenuChoice::ShowPalette),
+            "Command Palette\u{2026}",
         )),
         Entry::Separator,
         op(TmuxMenuChoice::SplitRight, "Split Pane Right"),

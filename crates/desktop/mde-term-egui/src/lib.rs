@@ -132,7 +132,12 @@
 //!   the real [`tmux::commands`] line (round-trip: the `%`-event reconciles the
 //!   tree, never a direct mutation), and the all-sessions picker (attached AND
 //!   detached, from the control-channel `list-sessions` reply). The [`menubar`]
-//!   tmux menu ([`tmux_ui::TmuxMenuChoice`]) is its entry point.
+//!   tmux menu ([`tmux_ui::TmuxMenuChoice`]) is its entry point. **TMUX-FC-4**
+//!   adds the native chrome: the Quasar status bar (session · window list ·
+//!   clock, ignoring tmux `status-*` config), the op toolbar, the curated
+//!   ~30-command fuzzy palette, and the enriched tab/pane context menus —
+//!   including the `join-pane -h` (beside) trigger — every affordance a tmux
+//!   command through the same round-trip.
 //! - [`menubar`] (TERM-MENUBAR-1) — the **top menu bar**: an `egui::menu::bar`
 //!   of File / Edit / View / Terminal / Splits / Tabs / Session / Help
 //!   drop-downs, each item the mouse twin of an existing seam (tabs / splits /
@@ -216,8 +221,8 @@ pub use tmux::{
     commands as tmux_commands, parse_layout, parse_pane_titles, parse_session_list,
     parse_window_order, resize_for_divider, CommandSink, ControlChannel, Layout, LayoutDir,
     LayoutError, LayoutKind, Notification, PaneResize, Parser as TmuxParser, ResizeDir,
-    SessionInfo, Status as TmuxStatus, TmuxController, TmuxLaunch, TmuxModel, TmuxPane, TmuxPaneIo,
-    TmuxSession, TmuxWindow,
+    SessionInfo, Status as TmuxStatus, StockLayout, TmuxController, TmuxLaunch, TmuxModel,
+    TmuxPane, TmuxPaneIo, TmuxSession, TmuxWindow,
 };
 pub use tmux_ui::{command_for, TmuxChrome, TmuxIntent, TmuxMenuChoice};
 pub use watch::{ActivityWatch, WatchEvent, WatchMode};
