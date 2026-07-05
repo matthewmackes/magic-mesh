@@ -294,9 +294,10 @@ impl DrawerTab {
 
 /// One activation from the shared [`MenuBar`] (MENUBAR-ALL) — each is the mouse
 /// twin of a real DEVMGR seam, dispatched through [`DeviceManagerState::apply`]
-/// (§6/§7, one seam per entry). `Copy` so the static menu tables can hold it and
-/// the shared bar returns it by value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (§6/§7, one seam per entry). The MENU-5 host-switch + category-jump verbs carry
+/// their target (a rail key / a category key), so this is `Clone`, not `Copy` (the
+/// iac.rs idiom) — the shared bar returns it by value.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum MenuAction {
     /// Re-read the published inventory ([`DeviceManagerState::refresh`]).
     Scan,
@@ -315,6 +316,20 @@ enum MenuAction {
     CopyReport,
     /// Open the ⓘ license / credits / mesh-identity dialog.
     About,
+    /// MENU-5 — switch the inspected host to this rail key (the bar twin of a
+    /// host-rail row click, #5/#6; [`DeviceManagerState::select_host`]). Covers
+    /// the non-PC host kinds too — the Hosts menu lists every rail row.
+    SelectHost(String),
+    /// MENU-5 — jump to a published category: switch to By-type and expand it so
+    /// the operator lands on it (the bar twin of a category-header click).
+    JumpCategory(String),
+    /// MENU-5 — copy the SELECTED device's full detail dump to the clipboard (the
+    /// DEVMGR-7 per-device Copy, surfaced in the Device menu; needs the render ctx).
+    CopyDeviceDetails,
+    /// MENU-5 — arm a privileged device op (DEVMGR-8) on the selected device: open
+    /// the typed-arming confirm (#14). Mesh-node hosts only (§7 — a non-PC host
+    /// omits these; nothing publishes until the operator echoes the device name).
+    ArmControl(DeviceControlOp),
 }
 
 /// A stable handle to the selected device across inventory re-reads (#9). A
@@ -1488,6 +1503,8 @@ impl DeviceManagerState {
             MenuAction::ExportJson => self.export(ExportFormat::Json),
             MenuAction::ExportMarkdown => self.export(ExportFormat::Markdown),
             MenuAction::CopyReport => self.copy_report(ctx),
+            // MENU-5 — the Device menu's per-device clipboard copy needs the seat.
+            MenuAction::CopyDeviceDetails => self.copy_device_details(ctx),
             other => self.apply(other),
         }
     }
@@ -1502,9 +1519,63 @@ impl DeviceManagerState {
             MenuAction::ExpandAll => self.expand_all(),
             MenuAction::CollapseAll => self.collapse_all(),
             MenuAction::About => self.show_about = true,
+            // MENU-5 — switch the inspected host (the bar twin of a rail click, #5).
+            MenuAction::SelectHost(host) => {
+                if host != self.selected_host {
+                    self.select_host(host);
+                }
+            }
+            // MENU-5 — jump to a category: land on it in the By-type tree.
+            MenuAction::JumpCategory(key) => {
+                self.view = ViewMode::ByType;
+                self.expanded.insert(key);
+            }
+            // MENU-5 — arm a privileged device op on the selected device (#14).
+            MenuAction::ArmControl(op) => self.arm_control(op),
             // Handled in `dispatch` (they need the render context) — never reached.
-            MenuAction::ExportJson | MenuAction::ExportMarkdown | MenuAction::CopyReport => {}
+            MenuAction::ExportJson
+            | MenuAction::ExportMarkdown
+            | MenuAction::CopyReport
+            | MenuAction::CopyDeviceDetails => {}
         }
+    }
+
+    /// Copy the SELECTED device's full detail dump to the seat clipboard (MENU-5 —
+    /// the DEVMGR-7 per-device Copy surfaced in the Device menu) + confirm on the
+    /// shared toast lane. A no-selection is a silent no-op (the menu item is disabled
+    /// without one) — never a fabricated dump.
+    fn copy_device_details(&self, ctx: &egui::Context) {
+        if let Some((_, dev)) = self.selected_device() {
+            ctx.copy_text(render_device_details(dev));
+            raise_toast(
+                "info",
+                &format!("Copied {} details to the clipboard", dev.name),
+            );
+        }
+    }
+
+    /// Stage the typed-arming confirm for a privileged device op on the selected
+    /// device (MENU-5 → DEVMGR-8, #14) — the Device-menu twin of the row
+    /// context-menu's Control verb, routing through the very same [`DeviceArming`]
+    /// stage + [`Self::dispatch_control`]. Guarded on a mesh-node host + a live
+    /// selection (§7 — a non-PC host / no selection never arms), so nothing reaches
+    /// a node until the operator echoes the device name.
+    fn arm_control(&mut self, op: DeviceControlOp) {
+        if !self.selected_kind().controllable() {
+            return;
+        }
+        // Resolve the target from the immutable read, then release that borrow before
+        // taking `&mut self` (the toggle/selection idiom used across this surface).
+        let Some((category, dev)) = self.selected_device() else {
+            return;
+        };
+        let target = device_target(category, dev);
+        self.arming = Some(DeviceArming {
+            op,
+            target,
+            target_host: self.selected_host.clone(),
+            typed: String::new(),
+        });
     }
 
     /// Export the **selected host + active view mode** to a real file (DEVMGR-6,
@@ -1590,11 +1661,14 @@ impl DeviceManagerState {
     }
 
     /// MENUBAR-ALL (About) — the **shared top bar** that replaces DEVMGR-2's bespoke
-    /// Action/View/Help chrome. Renders the three menus (each item the mouse twin of
-    /// a real seam) + a live status cluster over
+    /// Action/View/Help chrome. Renders the menus (each item the mouse twin of a real
+    /// seam) + a live status cluster over
     /// [`mde_egui::menubar::MenuBar`], tinted with the dock's **System** group accent
     /// ([`Style::ACCENT_SYSTEM`]), and returns the activated [`MenuAction`] (applied
-    /// via [`Self::apply`]). About is the 14th / last surface onto the component.
+    /// via [`Self::dispatch`]). About is the 14th / last surface onto the component;
+    /// MENU-5 grows the spine so the bar fully covers the extended Device Manager —
+    /// **Action · View · Hosts · Device · Help** (host-rail node switching, category
+    /// jumps, and the armed-action posture all reachable from the bar).
     fn chrome_bar(&self, ui: &mut egui::Ui) -> Option<MenuAction> {
         let menus = self.build_menus();
         let status = self.status_chips(now_ms());
@@ -1610,12 +1684,15 @@ impl DeviceManagerState {
         MenuBar::show(ui, &model)
     }
 
-    /// Build the three menus from live state (#19 → MENUBAR-ALL): **Action** (Scan +
-    /// the DEVMGR-6 Export/Copy report seams — MDM's `Action → generate a report`),
-    /// **View** (the three modes as radio items — only [`ViewMode::ByType`] enabled,
-    /// the others honestly disabled §7 — plus Expand/Collapse-all, gated on a loaded
-    /// inventory), and **Help** (the ⓘ dialog). No invented File/Edit spine — the
-    /// export lives under Action, exactly as Device Manager's does (§7).
+    /// Build the menus from live state (#19 → MENUBAR-ALL, extended by MENU-5 so the
+    /// bar fully covers the Device Manager as it stands): **Action** (Scan + the
+    /// DEVMGR-6 Export/Copy report seams — MDM's `Action → generate a report`),
+    /// **View** (the three now-wired modes as radio items, Expand/Collapse-all gated
+    /// on a loaded inventory, and a **Jump to category** submenu), **Hosts** (the
+    /// host-rail node switch surfaced in the bar — every rail row incl. the non-PC
+    /// kinds, #5/#6), **Device** (the DEVMGR-8 armed-action posture on the selected
+    /// device, honestly gated §7), and **Help** (the ⓘ dialog). No invented File/Edit
+    /// spine — export lives under Action, exactly as Device Manager's does (§7).
     fn build_menus(&self) -> Vec<Menu<MenuAction>> {
         let action = Menu::new(
             "Action",
@@ -1661,6 +1738,8 @@ impl DeviceManagerState {
         view_entries.push(Entry::Item(
             Item::new(MenuAction::CollapseAll, "Collapse all").enabled(has_tree),
         ));
+        view_entries.push(Entry::Separator);
+        view_entries.push(self.jump_submenu());
         let view = Menu::new("View", view_entries);
 
         let help = Menu::new(
@@ -1671,7 +1750,132 @@ impl DeviceManagerState {
             ))],
         );
 
-        vec![action, view, help]
+        vec![action, view, self.hosts_menu(), self.device_menu(), help]
+    }
+
+    /// The MENU-5 **Jump to category** submenu (View → …): one item per the selected
+    /// host's published category — activating it switches to By-type and expands that
+    /// category so the operator lands on it. Honest §7 — a host that published no
+    /// category reads a single caption, never a dead entry.
+    fn jump_submenu(&self) -> Entry<MenuAction> {
+        let mut entries = Vec::new();
+        if let Some(inv) = self.inventory.as_ref() {
+            for cat in &inv.categories {
+                entries.push(Entry::Item(Item::new(
+                    MenuAction::JumpCategory(cat.key.clone()),
+                    cat.label.clone(),
+                )));
+            }
+        }
+        if entries.is_empty() {
+            entries.push(Entry::Caption(
+                "No categories published for this host yet.".to_string(),
+            ));
+        }
+        Entry::Submenu {
+            label: "Jump to category".to_string(),
+            mnemonic: None,
+            entries,
+        }
+    }
+
+    /// The MENU-5 **Hosts** menu — the host-rail node switch surfaced in the bar
+    /// (#5/#6): a **Refresh this host** seam (the rail's ↻ live-refresh, the same
+    /// [`Self::refresh`] as Action → Scan), then every rail host grouped by kind
+    /// (Mesh nodes → Cloud instances → Phones → LAN hosts → Routers — the exact rail
+    /// grouping), each a radio checked on the selected host. Selecting one switches
+    /// the inspected host ([`Self::select_host`]). The non-PC kinds (DEVMGR-11) are
+    /// only listed when a real source published them (§7 — the rail is honest); an
+    /// empty rail reads a caption, never a dead entry.
+    fn hosts_menu(&self) -> Menu<MenuAction> {
+        let mut entries = vec![
+            Entry::Item(Item::new(MenuAction::Scan, "Refresh this host")),
+            Entry::Separator,
+        ];
+        if self.hosts.is_empty() {
+            entries.push(Entry::Caption(
+                "No hosts have published an inventory yet.".to_string(),
+            ));
+            return Menu::new("Hosts", entries);
+        }
+        let mut last_kind: Option<HostKind> = None;
+        for entry in &self.hosts {
+            if last_kind != Some(entry.kind) {
+                entries.push(Entry::Caption(entry.kind.section().to_string()));
+                last_kind = Some(entry.kind);
+            }
+            // The local "you are here" node reads its identity in the label (the rail
+            // marks it with a home glyph; the menu names it in words).
+            let is_local = entry.kind == HostKind::Node && entry.host == self.local_host;
+            let label = if is_local {
+                format!("{} (this node)", entry.label)
+            } else {
+                entry.label.clone()
+            };
+            entries.push(Entry::Item(
+                Item::new(MenuAction::SelectHost(entry.host.clone()), label)
+                    .checked(entry.host == self.selected_host),
+            ));
+        }
+        Menu::new("Hosts", entries)
+    }
+
+    /// The MENU-5 **Device** menu — the DEVMGR armed-action posture surfaced in the
+    /// bar (#12/#13/#14). Acts on the SELECTED device row: read-only **Copy device
+    /// details** (any host kind), then — on a **mesh node**, the only kind that runs
+    /// the `device_control` worker (§7) — the armed **Enable / Disable / Reload
+    /// driver module / Rescan bus** verbs, each opening the typed-arming confirm
+    /// (#14) and context-gated on a live selection. A non-PC host honestly OMITS the
+    /// privileged verbs (the exact disclosure the row context-menu shows), never a
+    /// greyed placebo. No device selected reads a leading caption so the disabled
+    /// items have context.
+    fn device_menu(&self) -> Menu<MenuAction> {
+        let has_device = self.selected_device().is_some();
+        let controllable = self.selected_kind().controllable();
+        let mut entries = Vec::new();
+        if !has_device {
+            entries.push(Entry::Caption(
+                "Select a device row to act on it.".to_string(),
+            ));
+        }
+        entries.push(Entry::Item(
+            Item::new(MenuAction::CopyDeviceDetails, "Copy device details").enabled(has_device),
+        ));
+        entries.push(Entry::Separator);
+        if controllable {
+            for op in DeviceControlOp::ALL {
+                entries.push(Entry::Item(
+                    Item::new(
+                        MenuAction::ArmControl(op),
+                        format!("{}\u{2026}", op.label()),
+                    )
+                    .enabled(has_device),
+                ));
+            }
+            entries.push(Entry::Caption(
+                "Enable/Disable, reload + rescan run on the node \u{2014} armed, audited."
+                    .to_string(),
+            ));
+        } else {
+            entries.push(Entry::Caption(
+                "Enable/Disable + driver ops apply to mesh nodes only \u{2014} this host \
+                 runs no mesh device-control worker."
+                    .to_string(),
+            ));
+        }
+        Menu::new("Device", entries)
+    }
+
+    /// The currently selected device resolved against the live inventory (#9) —
+    /// `(category key, record)`, or `None` when nothing is selected / the selection
+    /// no longer resolves (a re-read pruned it). Shared by the Device menu (its
+    /// gating + the armed target) and the clipboard copy, so the menu and the seam
+    /// can never disagree about "is a device selected".
+    fn selected_device(&self) -> Option<(&str, &DeviceRecord)> {
+        let sel = self.selected.as_ref()?;
+        let inv = self.inventory.as_ref()?;
+        let dev = find_device(inv, sel)?;
+        Some((sel.category.as_str(), dev))
     }
 
     /// The live status cluster (MENUBAR-ALL lock 6): **host · N devices · M problems
@@ -4100,7 +4304,7 @@ mod tests {
         menu.entries
             .iter()
             .filter_map(|e| match e {
-                Entry::Item(item) => Some(item.id),
+                Entry::Item(item) => Some(item.id.clone()),
                 _ => None,
             })
             .collect()
@@ -4213,7 +4417,8 @@ mod tests {
         let s = state_with(Some(DeviceInventory::fixture()), true);
         let menus = s.build_menus();
         let titles: Vec<&str> = menus.iter().map(|m| m.title.as_str()).collect();
-        assert_eq!(titles, vec!["Action", "View", "Help"]);
+        // MENU-5 grew the spine so the bar covers the extended Device Manager.
+        assert_eq!(titles, vec!["Action", "View", "Hosts", "Device", "Help"]);
         // No invented File/Edit spine — About has no file/clipboard seam (§7).
         for banned in ["File", "Edit"] {
             assert!(!titles.contains(&banned), "{banned} shipped without a seam");
@@ -4234,7 +4439,8 @@ mod tests {
         let view = &menus[1];
         for entry in &view.entries {
             if let Entry::Item(item) = entry {
-                if let MenuAction::View(mode) = item.id {
+                if let MenuAction::View(mode) = &item.id {
+                    let mode = *mode;
                     assert_eq!(
                         item.enabled,
                         mode.is_available(),
@@ -4248,15 +4454,24 @@ mod tests {
                 }
             }
         }
-        let enabled = |id| {
+        let enabled = |id: MenuAction| {
             view.entries
                 .iter()
                 .any(|e| matches!(e, Entry::Item(it) if it.id == id && it.enabled))
         };
         assert!(enabled(MenuAction::ExpandAll));
         assert!(enabled(MenuAction::CollapseAll));
-        // Help → the ⓘ dialog.
-        assert_eq!(item_ids(&menus[2]), vec![MenuAction::About]);
+        // MENU-5 — View grew a Jump-to-category submenu (the fixture's two categories).
+        assert!(
+            view.entries.iter().any(|e| matches!(
+                e,
+                Entry::Submenu { label, entries, .. }
+                    if label == "Jump to category" && entries.len() == 2
+            )),
+            "View carries a Jump-to-category submenu over the published categories"
+        );
+        // Help → the ⓘ dialog (now the 5th menu after MENU-5's Hosts + Device).
+        assert_eq!(item_ids(&menus[4]), vec![MenuAction::About]);
     }
 
     #[test]
@@ -5810,6 +6025,201 @@ mod tests {
             mackes_mesh_types::device_control::take_requests(scratch.path(), "phone:abc123")
                 .is_empty(),
             "a non-node target must get no dispatched request"
+        );
+    }
+
+    // ── MENU-5: the bar covers the extended Device Manager ───────────────────
+
+    #[test]
+    fn the_hosts_menu_surfaces_rail_node_switching_incl_non_pc_kinds() {
+        // MENU-5 (#5/#6) — the Hosts menu is the bar twin of the host rail: a
+        // Refresh-this-host seam, then every rail row grouped by kind, the selected
+        // host checked. The non-PC kinds ride it too (Cloud / Phones).
+        let nodes = build_rail(&[host_inventory("laptop-mm")], "laptop-mm");
+        let non_pc = vec![
+            nova_host(&nova_unit()),
+            phone_host(&paired_phone(), "eagle"),
+        ];
+        let mut s = state_with(Some(DeviceInventory::fixture()), true);
+        s.hosts = merge_rail(nodes, &non_pc);
+        s.selected_host = "laptop-mm".into();
+
+        let menus = s.build_menus();
+        let hosts = &menus[2];
+        assert_eq!(hosts.title, "Hosts");
+        // The rail's ↻ live-refresh is the first item (== Action → Scan, one seam).
+        assert_eq!(item_ids(hosts)[0], MenuAction::Scan);
+        // Grouped section captions mirror the rail (only kinds that have rows).
+        let captions: Vec<&str> = hosts
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Caption(c) => Some(c.as_str()),
+                _ => None,
+            })
+            .collect();
+        for want in ["Mesh nodes", "Cloud instances", "Phones"] {
+            assert!(
+                captions.contains(&want),
+                "the {want} section header is present"
+            );
+        }
+        // A SelectHost item per rail row, the selected node checked, another not.
+        let select_of = |key: &str| {
+            hosts.entries.iter().find_map(|e| match e {
+                Entry::Item(it) if it.id == MenuAction::SelectHost(key.to_string()) => Some(it),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            select_of("laptop-mm")
+                .expect("local node is a switch target")
+                .checked,
+            Some(true),
+            "the selected host is the checked radio"
+        );
+        assert_eq!(
+            select_of("cloud:instance:0f3a")
+                .expect("the Nova instance is a switch target")
+                .checked,
+            Some(false)
+        );
+        assert!(
+            select_of("phone:abc123").is_some(),
+            "the paired phone is a bar switch target (#6)"
+        );
+
+        // Activating one switches the inspected host (the rail-click seam).
+        let mut s2 = state_with(Some(DeviceInventory::fixture()), true);
+        s2.apply(MenuAction::SelectHost("cloud:instance:0f3a".into()));
+        assert_eq!(s2.selected_host, "cloud:instance:0f3a");
+    }
+
+    #[test]
+    fn the_device_menu_carries_the_armed_posture_gated_by_selection() {
+        // MENU-5 (#12/#14) — on a mesh node the Device menu carries the four DEVMGR-8
+        // armed verbs + Copy details, context-gated on a live device selection.
+        let mut s = state_with(Some(DeviceInventory::fixture()), true);
+        s.selected = Some(DeviceSelection::of(category::PCI_DEVICES, &orphan()));
+        let device = &s.build_menus()[3];
+        assert_eq!(device.title, "Device");
+        let armed: Vec<DeviceControlOp> = device
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Item(it) => match &it.id {
+                    MenuAction::ArmControl(op) => Some(*op),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            armed,
+            DeviceControlOp::ALL.to_vec(),
+            "all four armed verbs present"
+        );
+        // A device is selected, so both the copy + the armed verbs are enabled.
+        let all_enabled = device
+            .entries
+            .iter()
+            .all(|e| matches!(e, Entry::Item(it) if it.enabled) || !matches!(e, Entry::Item(_)));
+        assert!(all_enabled, "every device verb is live with a selection");
+
+        // No selection → every device verb greys, behind an honest leading caption.
+        let none = state_with(Some(DeviceInventory::fixture()), true);
+        let device = &none.build_menus()[3];
+        assert!(
+            device
+                .entries
+                .iter()
+                .any(|e| matches!(e, Entry::Caption(c) if c.contains("Select a device"))),
+            "no selection reads an honest caption"
+        );
+        let none_disabled = device
+            .entries
+            .iter()
+            .all(|e| matches!(e, Entry::Item(it) if !it.enabled) || !matches!(e, Entry::Item(_)));
+        assert!(
+            none_disabled,
+            "every device verb greys without a selection (§7)"
+        );
+    }
+
+    #[test]
+    fn a_non_pc_host_omits_the_armed_device_ops_from_the_bar() {
+        // §7 — a phone runs no device_control worker, so the Device menu OMITS the
+        // privileged verbs (never a greyed placebo) and discloses why.
+        let mut s = state_with(Some(DeviceInventory::fixture()), true);
+        s.hosts = merge_rail(
+            build_rail(&[], "laptop-mm"),
+            &[phone_host(&paired_phone(), "eagle")],
+        );
+        s.selected_host = "phone:abc123".into();
+        assert_eq!(s.selected_kind(), HostKind::Phone);
+        let device = &s.build_menus()[3];
+        let has_armed = device
+            .entries
+            .iter()
+            .any(|e| matches!(e, Entry::Item(it) if matches!(it.id, MenuAction::ArmControl(_))));
+        assert!(!has_armed, "a non-PC host offers no armed verb in the bar");
+        assert!(
+            device
+                .entries
+                .iter()
+                .any(|e| matches!(e, Entry::Caption(c) if c.contains("mesh nodes only"))),
+            "the honest disclosure is present"
+        );
+    }
+
+    #[test]
+    fn arm_control_stages_the_typed_arming_confirm_and_a_non_node_never_arms() {
+        // MENU-5 → DEVMGR-8 (#14) — the Device-menu armed verb opens the same
+        // typed-arming stage as the row context-menu, never firing directly.
+        let mut s = state_with(Some(DeviceInventory::fixture()), true);
+        s.selected = Some(DeviceSelection::of(category::PCI_DEVICES, &orphan()));
+        s.apply(MenuAction::ArmControl(DeviceControlOp::Disable));
+        let arming = s
+            .arming
+            .as_ref()
+            .expect("ArmControl opens the arming stage");
+        assert_eq!(arming.op, DeviceControlOp::Disable);
+        assert_eq!(arming.target.name, orphan().name);
+        assert_eq!(arming.target_host, "laptop-mm");
+        assert!(
+            arming.typed.is_empty(),
+            "nothing dispatched until the echo arms"
+        );
+
+        // §7 — a non-PC host never arms from the bar (guarded on controllable()).
+        let mut phone = state_with(Some(DeviceInventory::fixture()), true);
+        phone.hosts = merge_rail(
+            build_rail(&[], "laptop-mm"),
+            &[phone_host(&paired_phone(), "eagle")],
+        );
+        phone.selected_host = "phone:abc123".into();
+        phone.selected = Some(DeviceSelection::of(category::PCI_DEVICES, &orphan()));
+        phone.apply(MenuAction::ArmControl(DeviceControlOp::Disable));
+        assert!(
+            phone.arming.is_none(),
+            "a non-node host never arms from the bar"
+        );
+    }
+
+    #[test]
+    fn view_jump_to_category_switches_to_by_type_and_expands() {
+        // MENU-5 — a category jump lands the operator on it: By-type + expanded.
+        let mut s = state_with(Some(DeviceInventory::fixture()), true);
+        s.view = ViewMode::ByConnection;
+        s.apply(MenuAction::JumpCategory(category::DISPLAY.to_string()));
+        assert_eq!(
+            s.view,
+            ViewMode::ByType,
+            "a jump re-roots into the by-type tree"
+        );
+        assert!(
+            s.expanded.contains(category::DISPLAY),
+            "the jumped-to category is expanded so the operator lands on it"
         );
     }
 }
