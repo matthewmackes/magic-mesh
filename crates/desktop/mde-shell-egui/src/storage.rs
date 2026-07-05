@@ -3213,3 +3213,263 @@ mod tests {
         assert_eq!(s.selected_node.as_deref(), Some("b"));
     }
 }
+
+/// MENU-6 — the **menubar coverage backstop**: no workspace ships bare again.
+///
+/// Every routed [`Surface`](crate::dock::Surface) is enumerated against ONE
+/// recorded register: it either fronts the shared `MenuBarModel` (with its
+/// recorded, non-empty bar title) or sits on the explicit exemption list with the
+/// reason + its MENUBAR-SWEEP follow-on. The register's `match` is deliberately
+/// exhaustive (no wildcard arm), so adding a `Surface` variant without recording
+/// its menubar posture **fails this crate's build** — the enforcement is the
+/// compiler, not a reviewer's memory. On top of the register, the surfaces whose
+/// states are cheaply constructible are driven through a REAL headless frame and
+/// their UPPERCASE bar title asserted in the emitted text shapes, tying the
+/// register to rendered reality (the rest are recorded with why a headless
+/// construction isn't reachable from a crate-local test).
+///
+/// This module lives in `storage.rs` because `mde-shell-egui` is a binary-only
+/// crate (no lib target): an integration test under `tests/` can't reach the
+/// crate's private modules, and a dedicated `src/menubar_coverage.rs` would need
+/// a `mod` line in `main.rs` — out of this unit's blast radius. The register is
+/// surface-agnostic; only its file placement is a compromise.
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod menubar_coverage {
+    use crate::dock::Surface;
+
+    /// The recorded menubar posture of one routed surface.
+    enum Coverage {
+        /// The surface fronts the shared bar — its recorded title.
+        Covered { title: &'static str },
+        /// The surface is currently bare — the recorded reason + follow-on.
+        Exempt { reason: &'static str },
+    }
+
+    /// The ONE recorded decision per routed `Surface` (exhaustive on purpose).
+    const fn coverage(surface: Surface) -> Coverage {
+        match surface {
+            // ── covered: the MENUBAR-ALL / MENUBAR-SWEEP bars ──
+            Surface::Workbench => Coverage::Covered {
+                title: "State of the Mesh", // MENU-1 (workbench.rs)
+            },
+            Surface::Instances => Coverage::Covered { title: "Instances" },
+            Surface::InfraCode => Coverage::Covered {
+                title: "Infra as Code", // IAC-5 (iac.rs)
+            },
+            Surface::Desktop => Coverage::Covered {
+                title: "Desktop", // vdi.rs desktop_menubar, mounted by the shell
+            },
+            Surface::Browser => Coverage::Covered {
+                title: "Browser", // MENU-3 (web.rs, the two-engine bar)
+            },
+            Surface::Chat => Coverage::Covered {
+                title: "Contacts", // MENU-2 (chat.rs)
+            },
+            Surface::System => Coverage::Covered { title: "System" },
+            Surface::Storage => Coverage::Covered {
+                title: "Local Cylinders", // MENU-4 (this file)
+            },
+            Surface::About => Coverage::Covered {
+                title: "About", // MENU-5 / DEVMGR (device_manager.rs)
+            },
+            // ── recorded exemptions: bare today, each a MENUBAR-SWEEP follow-on ──
+            Surface::MeshView => Coverage::Exempt {
+                reason: "bare — the Mesh Map canvas renders headerless; a bar \
+                         (layout toggles, fold source) is a MENUBAR-SWEEP follow-on",
+            },
+            Surface::Music => Coverage::Exempt {
+                reason: "bare — mde-music-egui mounts with its own header; folding \
+                         it onto the shared bar is a MENUBAR-SWEEP follow-on",
+            },
+            Surface::Media => Coverage::Exempt {
+                reason: "bare — mde-media-egui mounts with its own header; folding \
+                         it onto the shared bar is a MENUBAR-SWEEP follow-on",
+            },
+            Surface::Files => Coverage::Exempt {
+                reason: "bare — mde-files-egui mounts with its own header; folding \
+                         it onto the shared bar is a MENUBAR-SWEEP follow-on",
+            },
+            Surface::Voice => Coverage::Exempt {
+                reason: "bare — mde-voice-egui mounts with its own header; folding \
+                         it onto the shared bar is a MENUBAR-SWEEP follow-on",
+            },
+            Surface::Terminal => Coverage::Exempt {
+                reason: "bare — mde-term-egui carries its own tmux/session menu \
+                         strip; migrating it onto the shared bar is a MENUBAR-SWEEP \
+                         follow-on",
+            },
+            Surface::Editor => Coverage::Exempt {
+                reason: "bare in the shell — mde-editor-egui's Word-97 bar (EDTB-7) \
+                         lives inside the editor crate; surfacing it as the shell \
+                         bar is a MENUBAR-SWEEP follow-on",
+            },
+            Surface::Timers => Coverage::Exempt {
+                reason: "bare — the clock-cell Timers & Alarms surface (VDOCK-5) is \
+                         deliberately chrome-light; a bar is a MENUBAR-SWEEP \
+                         follow-on",
+            },
+        }
+    }
+
+    /// Routed operator-reachable views that are NOT `Surface` variants (the
+    /// pre-session / overlay screens), inventoried here so the MENU-6 sweep list
+    /// is complete. Each is bare today; each entry records why + the follow-on.
+    const ROUTED_NON_SURFACE_VIEWS: [(&str, &str); 2] = [
+        (
+            "explorer/discovery",
+            "bare — the Explorer/Discovery flow renders its own headers; folding \
+             onto the shared bar is a MENUBAR-SWEEP follow-on",
+        ),
+        (
+            "chooser",
+            "bare — the pre-session Desktop Chooser is a full-screen picker with \
+             no workspace chrome; a bar is a MENUBAR-SWEEP follow-on",
+        ),
+    ];
+
+    /// Every routed surface: the picker set plus the clock-cell Timers surface
+    /// (deliberately outside `Surface::ALL`, still routed by the dock).
+    fn every_routed() -> Vec<Surface> {
+        let mut all = Surface::ALL.to_vec();
+        all.push(Surface::Timers);
+        all
+    }
+
+    #[test]
+    fn every_routed_surface_records_a_menubar_posture() {
+        let mut covered = 0usize;
+        let mut exempt = 0usize;
+        for surface in every_routed() {
+            match coverage(surface) {
+                Coverage::Covered { title } => {
+                    assert!(
+                        !title.trim().is_empty(),
+                        "{surface:?}: a covered surface records a non-empty bar title"
+                    );
+                    covered += 1;
+                }
+                Coverage::Exempt { reason } => {
+                    assert!(
+                        reason.contains("MENUBAR-SWEEP"),
+                        "{surface:?}: an exemption names its follow-on, not just a shrug"
+                    );
+                    exempt += 1;
+                }
+            }
+        }
+        assert_eq!(covered + exempt, every_routed().len());
+        assert_eq!(covered, 9, "the covered set is the nine landed bars");
+        for (view, reason) in ROUTED_NON_SURFACE_VIEWS {
+            assert!(
+                reason.contains("MENUBAR-SWEEP"),
+                "{view}: a non-Surface view exemption names its follow-on"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bare_inventory_is_exactly_the_recorded_follow_on_set() {
+        let bare: Vec<Surface> = every_routed()
+            .into_iter()
+            .filter(|s| matches!(coverage(*s), Coverage::Exempt { .. }))
+            .collect();
+        assert_eq!(
+            bare,
+            [
+                Surface::MeshView,
+                Surface::Music,
+                Surface::Media,
+                Surface::Files,
+                Surface::Voice,
+                Surface::Terminal,
+                Surface::Editor,
+                Surface::Timers,
+            ],
+            "a surface leaving (or joining) the bare set updates this inventory \
+             consciously — that's the backstop"
+        );
+    }
+
+    // ── the register is tied to rendered reality where a crate-local test can ──
+
+    /// Drive one headless frame and collect every text run the surface painted
+    /// (the same `Context::run` path the DRM runner drives, minus the GPU).
+    fn rendered_text(mut run: impl FnMut(&mut mde_egui::egui::Ui)) -> String {
+        use mde_egui::egui;
+        fn collect(shape: &egui::epaint::Shape, out: &mut String) {
+            match shape {
+                egui::epaint::Shape::Text(t) => {
+                    out.push_str(t.galley.text());
+                    out.push('\n');
+                }
+                egui::epaint::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        collect(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        mde_egui::Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| run(ui));
+        });
+        let mut text = String::new();
+        for clipped in &out.shapes {
+            collect(&clipped.shape, &mut text);
+        }
+        text
+    }
+
+    /// The four surfaces whose states construct cheaply from here render for
+    /// real, and each bar's UPPERCASE DISPLAY title appears in the painted text —
+    /// the register's `Covered` claim proven at the pixel-feed level for them.
+    /// The other five covered bars (Workbench / `IaC` / Desktop / Browser / System)
+    /// need the shell's full wiring or testkit scaffolding owned by their own
+    /// files' tests, so their register rows rest on those files' render tests.
+    #[test]
+    fn covered_titles_render_on_the_cheaply_constructible_bars() {
+        let proofs: [(Surface, fn() -> String); 4] = [
+            (Surface::Storage, || {
+                let mut s = crate::storage::StorageState {
+                    nodes: crate::storage::project(&[crate::storage::state_body("nodeA", 1, true)]),
+                    bus_root: None,
+                    ..crate::storage::StorageState::default()
+                };
+                rendered_text(|ui| s.show(ui))
+            }),
+            (Surface::Chat, || {
+                let mut s = crate::chat::ChatState::default();
+                rendered_text(|ui| s.show(ui))
+            }),
+            (Surface::Instances, || {
+                let mut s = crate::instances::InstancesState::default();
+                rendered_text(|ui| crate::instances::instances_panel(ui, &mut s))
+            }),
+            (Surface::About, || {
+                let mut s = crate::device_manager::DeviceManagerState::default();
+                rendered_text(|ui| s.show(ui))
+            }),
+        ];
+        for (surface, render) in proofs {
+            let Coverage::Covered { title } = coverage(surface) else {
+                panic!("{surface:?} is registered Covered");
+            };
+            let text = render();
+            assert!(
+                text.contains(&title.to_uppercase()),
+                "{surface:?}: the live bar paints \u{201C}{}\u{201D} (register: {title})",
+                title.to_uppercase()
+            );
+        }
+    }
+}
