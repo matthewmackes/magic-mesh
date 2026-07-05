@@ -1136,12 +1136,24 @@ impl Shell {
             self.console.toggle();
         }
         console::console_panel(ctx, &mut self.console);
-        if let Some(console::ConsoleRequest::Goto(surface)) = self.console.take_request() {
-            // A live surface-link entry (the pinned Terminal, the Cloud-plane
-            // link) routes the shell body — a navigation is never a no-op
-            // behind the session.
-            self.nav.expanded = true;
-            self.nav.surface = surface;
+        match self.console.take_request() {
+            Some(console::ConsoleRequest::Goto(surface)) => {
+                // A live surface-link entry (the pinned Terminal, the Cloud-plane
+                // link) routes the shell body — a navigation is never a no-op
+                // behind the session.
+                self.nav.expanded = true;
+                self.nav.surface = surface;
+            }
+            // CONSOLE-4 — the rail Power section: Lock drops the in-process
+            // curtain (exactly like Super+L); a Power verb drives the seat
+            // honorer (the typed-armed consent is the operator's; a refusal is
+            // an honest no-op, §7). The same seams the VDOCK-4 drain drives —
+            // never a raw `systemctl` (§6).
+            Some(console::ConsoleRequest::Lock) => self.curtain.lock(),
+            Some(console::ConsoleRequest::Power(verb)) => {
+                let _ = self.system.honor_power(verb);
+            }
+            None => {}
         }
     }
 

@@ -29,13 +29,27 @@
 //! from `$PATH` renders greyed and reports the missing tool by name (the design's
 //! "no dead entries" rule).
 //!
+//! **CONSOLE-4** adds the rail's **Power section** (lock #28: Lock → the shell
+//! curtain, Suspend at once, Reboot / Shut Down behind the VDOCK-4 typed-arming
+//! echo — every verb drives the REAL seam via [`ConsoleRequest`]: the curtain /
+//! `system.honor_power`, never a raw `systemctl`) and the **Custom group**
+//! (lock #35): operator-registered named command entries, added in-UI and
+//! persisted to `console-custom.json` under the client data dir (atomic
+//! temp + rename, the timers idiom). A custom entry's launch leg rides the same
+//! CONSOLE-2 spawn-tab seam, so its activation is honest-gated too (§7).
+//!
 //! Like the dock, this module is pure chrome + state: it records a typed
 //! [`ConsoleRequest`] the shell drains after the frame (`main.rs`), and never
 //! reaches the nav / curtain / seat itself (§6, the VDOCK deferred-wire idiom).
 
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use mde_egui::egui;
 use mde_egui::{Motion, Style};
+use mde_seat::PowerVerb;
 use mde_theme::brand::icons::IconId;
+use serde::{Deserialize, Serialize};
 
 use crate::dock::{icon_texture, Surface, DOCK_W};
 
@@ -92,6 +106,14 @@ const ENTRY_ICON: f32 = Style::SP_M;
 
 /// A 1px hairline rule (the dock's `HAIRLINE_W` restated — module-private there).
 const HAIRLINE_W: f32 = 1.0;
+
+/// CONSOLE-4 — the rail Power section's height (lock #28): a heading + the four
+/// action rows; the typed-arming stage renders within the same box, so the rail
+/// never reflows while arming.
+const POWER_H: f32 = Style::SP_L * 5.0;
+
+/// CONSOLE-4 — one Custom add-form field/button row's height (lock #35).
+const FIELD_H: f32 = Style::SP_L;
 
 // ── the entry model (design "Entry model": a const table, no dead entries) ──
 
@@ -505,6 +527,129 @@ impl GateNotice {
 pub enum ConsoleRequest {
     /// Route the shell body to a surface (a live surface-link entry).
     Goto(Surface),
+    /// CONSOLE-4 — drop the shell curtain (the Power section's Lock; the
+    /// in-process lock, exactly like Super+L — NOT logind's session Lock).
+    Lock,
+    /// CONSOLE-4 — drive a real host power verb (Suspend / Reboot / `PowerOff`)
+    /// through `system.honor_power` (§6 — never a raw `systemctl`); the
+    /// host-down verbs arrive here only past the typed-arming echo (lock #36).
+    Power(PowerVerb),
+}
+
+// ── CONSOLE-4: the Power section (lock #28, the VDOCK-4 arming idiom) ───────
+
+/// One rail Power action (lock #28). `Lock` drops the curtain; the rest drive
+/// their real [`PowerVerb`]. Reboot + Shut Down are typed-armed (lock #36);
+/// Lock + Suspend act on a single click. (The VDOCK-4 `PowerItem` idiom
+/// restated — that enum is dock-private and its menu closes with the dock,
+/// while these rows live in the Console rail.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerAction {
+    /// Drop the shell curtain (the in-process lock).
+    Lock,
+    /// Suspend-to-RAM — reversible, so no typed arming.
+    Suspend,
+    /// Reboot the host — typed-armed (lock #36).
+    Reboot,
+    /// Power the host off — typed-armed (lock #36); the design's "Shut Down".
+    ShutDown,
+}
+
+/// The Power section's four rows in render order (lock #28).
+const POWER_ACTIONS: [PowerAction; 4] = [
+    PowerAction::Lock,
+    PowerAction::Suspend,
+    PowerAction::Reboot,
+    PowerAction::ShutDown,
+];
+
+impl PowerAction {
+    /// The operator-facing label — the typed-arming echo must match it exactly
+    /// (case-insensitive).
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Lock => "Lock",
+            Self::Suspend => "Suspend",
+            Self::Reboot => "Reboot",
+            Self::ShutDown => "Shut Down",
+        }
+    }
+
+    /// Whether this verb demands the typed-arming echo before it fires — the
+    /// host-down pair (lock #36); Lock + Suspend act at once.
+    const fn typed_armed(self) -> bool {
+        matches!(self, Self::Reboot | Self::ShutDown)
+    }
+
+    /// The shell request this action fires — every verb the REAL seam: Lock →
+    /// the curtain, the rest their logind verb via `system.honor_power` (§6).
+    const fn request(self) -> ConsoleRequest {
+        match self {
+            Self::Lock => ConsoleRequest::Lock,
+            Self::Suspend => ConsoleRequest::Power(PowerVerb::Suspend),
+            Self::Reboot => ConsoleRequest::Power(PowerVerb::Reboot),
+            Self::ShutDown => ConsoleRequest::Power(PowerVerb::PowerOff),
+        }
+    }
+}
+
+/// A host-down verb mid typed-arming: the action + the echo the operator types
+/// to arm it (the storage / VDOCK-4 arming-echo idiom).
+#[derive(Debug)]
+struct Arming {
+    /// The action this stage fires once its echo matches.
+    action: PowerAction,
+    /// The operator-typed echo — must equal [`PowerAction::label`]
+    /// (case-insensitive, trimmed) for [`ConsoleState::armed`] to hold.
+    echo: String,
+}
+
+// ── CONSOLE-4: the Custom group's persisted config (lock #35) ───────────────
+
+/// The Custom config's file name under the client data dir.
+const CUSTOM_FILE: &str = "console-custom.json";
+
+/// One operator-registered Custom entry (lock #35): a name + the command line
+/// its terminal tab will run once the CONSOLE-2 seam lands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomEntry {
+    /// The operator's entry name (the row label + the tab's name-to-be).
+    pub name: String,
+    /// The command line to run.
+    pub command: String,
+}
+
+/// The persisted Custom store — one JSON file under the client data dir
+/// (atomic temp + rename, the timers idiom).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+struct CustomFile {
+    /// The operator's entries, in registration order.
+    #[serde(default)]
+    entries: Vec<CustomEntry>,
+}
+
+impl CustomFile {
+    /// Load from `path`, honestly folding a missing / half-written / malformed
+    /// file to the empty store (never a fatal, never a fabricated entry).
+    fn load_from(path: &Path) -> Self {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    /// Write to `path` (atomic temp + rename, like the timers / prefs records).
+    fn save_to(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
 }
 
 // ── state ────────────────────────────────────────────────────────────────────
@@ -539,10 +684,35 @@ pub struct ConsoleState {
     identity: String,
     /// The footer's platform version line (lock #43), baked once.
     version: String,
+    /// CONSOLE-4 — a host-down verb mid typed-arming (lock #36); `None` while
+    /// the Power section shows its plain rows.
+    arming: Option<Arming>,
+    /// CONSOLE-4 — the operator's Custom entries (lock #35), loaded from and
+    /// persisted to [`Self::store`].
+    custom: CustomFile,
+    /// The Custom config path (`<client-data-dir>/console-custom.json`);
+    /// `None` headless — persistence is then an honest no-op (§7).
+    store: Option<PathBuf>,
+    /// The Custom add-form's draft name field.
+    draft_name: String,
+    /// The Custom add-form's draft command field.
+    draft_command: String,
 }
 
 impl Default for ConsoleState {
     fn default() -> Self {
+        Self::with_store(mde_bus::client_data_dir().map(|d| d.join(CUSTOM_FILE)))
+    }
+}
+
+impl ConsoleState {
+    /// Build over an explicit Custom store path (the testable constructor
+    /// `Default` folds to — the timers `with_roots` idiom): load the operator's
+    /// Custom entries, everything else cold.
+    fn with_store(store: Option<PathBuf>) -> Self {
+        let custom = store
+            .as_deref()
+            .map_or_else(CustomFile::default, CustomFile::load_from);
         Self {
             open: false,
             just_toggled: false,
@@ -554,11 +724,14 @@ impl Default for ConsoleState {
             present: Vec::new(),
             identity: identity_line(),
             version: mde_theme::brand::build::version_line(),
+            arming: None,
+            custom,
+            store,
+            draft_name: String::new(),
+            draft_command: String::new(),
         }
     }
-}
 
-impl ConsoleState {
     /// Whether the panel is up — the dock mirrors this into the Start cell's
     /// active tint each frame.
     pub(crate) const fn is_open(&self) -> bool {
@@ -577,14 +750,18 @@ impl ConsoleState {
             self.focus_moved = false;
             self.jump = None;
             self.gate = None;
+            self.arming = None;
             self.refresh_presence();
         }
     }
 
-    /// Close the panel (Esc / click-away / a routed link).
+    /// Close the panel (Esc / click-away / a routed link / a fired power verb).
+    /// Drops any in-flight arming — a reopened Console never resumes a stale
+    /// half-typed host-down confirm.
     fn close(&mut self) {
         self.open = false;
         self.gate = None;
+        self.arming = None;
     }
 
     /// Drain the pending shell request — `main.rs` calls this each frame after
@@ -598,10 +775,27 @@ impl ConsoleState {
         self.present = static_rows().map(|e| tool_present(e.tool)).collect();
     }
 
+    /// The whole activation ring's length: the static rows plus the operator's
+    /// Custom entries (CONSOLE-4), which sit at the flat tail.
+    fn rows_total(&self) -> usize {
+        total_rows() + self.custom.entries.len()
+    }
+
     /// Activate the flat row `flat` (a click or Enter): a surface link routes +
     /// closes; a command entry raises its typed honest gate — the missing tool
     /// by name, else the CONSOLE-2 `NotWired` seam (§7 — never a faked launch).
+    /// A Custom row (the flat tail, CONSOLE-4) is a command entry whose launch
+    /// rides the same seam, so it gates the same way.
     fn activate(&mut self, flat: usize) {
+        if flat >= total_rows() {
+            if let Some(entry) = self.custom.entries.get(flat - total_rows()) {
+                self.gate = Some(GateNotice {
+                    entry: entry.name.clone(),
+                    reason: GateReason::SpawnTabNotWired,
+                });
+            }
+            return;
+        }
         let entry = entry_at(flat);
         match entry.kind {
             EntryKind::Link(surface) => {
@@ -619,6 +813,81 @@ impl ConsoleState {
                     reason,
                 });
             }
+        }
+    }
+
+    /// CONSOLE-4 — press a rail Power row (lock #28): Lock / Suspend fire their
+    /// request at once and close the panel; a host-down verb only ENTERS the
+    /// typed-arming stage (lock #36) — nothing fires until the echo matches.
+    fn power_press(&mut self, action: PowerAction) {
+        if action.typed_armed() {
+            self.arming = Some(Arming {
+                action,
+                echo: String::new(),
+            });
+        } else {
+            self.pending = Some(action.request());
+            self.close();
+        }
+    }
+
+    /// Whether the in-flight arming's echo matches its action's label — the
+    /// gate a Reboot / Shut Down confirm must pass (§7 — a blank / mistyped
+    /// echo never fires). The VDOCK-4 `PowerMenu::armed` rule.
+    fn armed(&self) -> bool {
+        self.arming
+            .as_ref()
+            .is_some_and(|a| a.echo.trim().eq_ignore_ascii_case(a.action.label()))
+    }
+
+    /// CONSOLE-4 — fire the armed host-down verb: records its real request and
+    /// closes. Refuses (returns `false`, fires NOTHING) unless [`Self::armed`].
+    fn confirm_armed(&mut self) -> bool {
+        if !self.armed() {
+            return false;
+        }
+        let action = self.arming.as_ref().expect("armed() checked").action;
+        self.pending = Some(action.request());
+        self.close();
+        true
+    }
+
+    /// Cancel the typed-arming stage back to the plain Power rows.
+    fn cancel_arming(&mut self) {
+        self.arming = None;
+    }
+
+    /// CONSOLE-4 — register the drafted Custom entry (lock #35): both fields
+    /// trimmed non-empty, appended, persisted (atomic), drafts cleared. A blank
+    /// draft is refused (`false`) — the Add affordance disables on it too.
+    fn add_custom(&mut self) -> bool {
+        let name = self.draft_name.trim().to_owned();
+        let command = self.draft_command.trim().to_owned();
+        if name.is_empty() || command.is_empty() {
+            return false;
+        }
+        self.custom.entries.push(CustomEntry { name, command });
+        self.draft_name.clear();
+        self.draft_command.clear();
+        self.persist_custom();
+        true
+    }
+
+    /// CONSOLE-4 — unregister a Custom entry by index (persisted); the focus
+    /// ring re-clamps so it never points past the shrunken tail.
+    fn remove_custom(&mut self, index: usize) {
+        if index < self.custom.entries.len() {
+            self.custom.entries.remove(index);
+            self.persist_custom();
+            self.focus = self.focus.min(self.rows_total().saturating_sub(1));
+        }
+    }
+
+    /// Persist the Custom store (a silent no-op headless — no data dir, §7;
+    /// the timers `persist` idiom).
+    fn persist_custom(&self) {
+        if let Some(path) = self.store.as_deref() {
+            let _ = self.custom.save_to(path);
         }
     }
 
@@ -682,6 +951,46 @@ fn console_rail_id(label: &str) -> egui::Id {
 /// prove the jump-scroll).
 fn console_heading_id(label: &str) -> egui::Id {
     egui::Id::new(("console-heading", label))
+}
+
+/// A rail Power row's stable id (CONSOLE-4).
+fn console_power_id(action: PowerAction) -> egui::Id {
+    egui::Id::new(("console-power", action.label()))
+}
+
+/// The typed-arming echo field's stable id (the one field the stage owns).
+fn console_arming_field_id() -> egui::Id {
+    egui::Id::new("console-arming-field")
+}
+
+/// The arming stage's Confirm row id (fires only once armed, §7).
+fn console_confirm_id() -> egui::Id {
+    egui::Id::new("console-arming-confirm")
+}
+
+/// The arming stage's Cancel row id.
+fn console_cancel_id() -> egui::Id {
+    egui::Id::new("console-arming-cancel")
+}
+
+/// A Custom row's remove-cross id (CONSOLE-4), by entry index.
+fn console_custom_remove_id(index: usize) -> egui::Id {
+    egui::Id::new(("console-custom-remove", index))
+}
+
+/// The Custom add-form's name field id.
+fn console_custom_name_id() -> egui::Id {
+    egui::Id::new("console-custom-name")
+}
+
+/// The Custom add-form's command field id.
+fn console_custom_command_id() -> egui::Id {
+    egui::Id::new("console-custom-command")
+}
+
+/// The Custom add-form's Add row id (disabled on a blank draft).
+fn console_custom_add_id() -> egui::Id {
+    egui::Id::new("console-custom-add")
 }
 
 // ── render ───────────────────────────────────────────────────────────────────
@@ -775,7 +1084,7 @@ fn handle_keys(ui: &egui::Ui, state: &mut ConsoleState) {
         state.close();
         return;
     }
-    let total = total_rows();
+    let total = state.rows_total();
     if down {
         state.focus = (state.focus + 1) % total;
         state.focus_moved = true;
@@ -790,9 +1099,9 @@ fn handle_keys(ui: &egui::Ui, state: &mut ConsoleState) {
 }
 
 /// The left rail (lock #5): the "Console / Operations" title (lock #39), the
-/// category jump-index (lock #49), and the `user@host · version` footer
-/// (lock #43). The Power section joins this rail under CONSOLE-4.
-fn rail(ui: &egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
+/// category jump-index (lock #49), the CONSOLE-4 Power section (lock #28), and
+/// the `user@host · version` footer (lock #43).
+fn rail(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
     let painter = ui.painter().clone();
     let rail = egui::Rect::from_min_size(rect.min, egui::vec2(RAIL_W, rect.height()));
 
@@ -815,13 +1124,18 @@ fn rail(ui: &egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
         Style::TEXT_DIM,
     );
 
-    // The category jump-index (lock #49): one row per group; a click asks the
-    // list to jump-scroll to that group's heading.
+    // The category jump-index (lock #49): one row per group — plus the Custom
+    // group's (CONSOLE-4, jump target GROUPS.len()); a click asks the list to
+    // jump-scroll to that group's heading.
     let mut y = rail.top() + TITLE_H;
-    for (i, group) in GROUPS.iter().enumerate() {
+    let jump_labels = GROUPS
+        .iter()
+        .map(|g| g.label)
+        .chain(std::iter::once("Custom"));
+    for (i, label) in jump_labels.enumerate() {
         let row =
             egui::Rect::from_min_size(egui::pos2(rail.left(), y), egui::vec2(RAIL_W, RAIL_ROW_H));
-        let resp = ui.interact(row, console_rail_id(group.label), egui::Sense::click());
+        let resp = ui.interact(row, console_rail_id(label), egui::Sense::click());
         if resp.hovered() {
             painter.rect_filled(row, Style::RADIUS, Style::SURFACE_HI);
         }
@@ -833,7 +1147,7 @@ fn rail(ui: &egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
         painter.text(
             egui::pos2(row.left() + Style::SP_S, row.center().y),
             egui::Align2::LEFT_CENTER,
-            group.label,
+            label,
             egui::FontId::proportional(Style::SMALL),
             color,
         );
@@ -843,9 +1157,12 @@ fn rail(ui: &egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
         y += RAIL_ROW_H;
     }
 
-    // The footer (lock #43): user@host over the platform version, in the Win10
-    // corner. (The Power button joins it under CONSOLE-4.)
+    // CONSOLE-4 — the Power section (lock #28), seated above the footer.
     let footer_top = rail.bottom() - FOOTER_H;
+    power_section(ui, &rail, footer_top - POWER_H, state);
+
+    // The footer (lock #43): user@host over the platform version, in the Win10
+    // corner.
     painter.hline(
         (rail.left() + Style::SP_XS)..=(rail.right() - Style::SP_XS),
         footer_top,
@@ -870,6 +1187,147 @@ fn rail(ui: &egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
     );
 }
 
+/// CONSOLE-4 — the rail's **Power section** (lock #28): a micro-heading over
+/// the four action rows — or, while a host-down verb arms, the typed-arming
+/// stage in the same box (the VDOCK-4 popup idiom laid into the rail). Lock +
+/// Suspend fire at once; Reboot + Shut Down read in DANGER and demand the echo
+/// (lock #36). Every verb drives the REAL seam through [`ConsoleRequest`].
+#[allow(
+    clippy::cast_precision_loss, // the 0..4 row indices are tiny
+    clippy::suboptimal_flops     // layout arithmetic reads clearer than mul_add
+)]
+fn power_section(ui: &mut egui::Ui, rail: &egui::Rect, top: f32, state: &mut ConsoleState) {
+    let painter = ui.painter().clone();
+    painter.hline(
+        (rail.left() + Style::SP_XS)..=(rail.right() - Style::SP_XS),
+        top,
+        egui::Stroke::new(HAIRLINE_W, Style::BORDER),
+    );
+    painter.text(
+        egui::pos2(rail.left() + Style::SP_S, top + Style::SP_L / 2.0),
+        egui::Align2::LEFT_CENTER,
+        "POWER",
+        egui::FontId::proportional(Style::SMALL),
+        Style::TEXT_DIM,
+    );
+    let rows_top = top + Style::SP_L;
+
+    if state.arming.is_some() {
+        power_arming_stage(ui, rail, rows_top, state);
+        return;
+    }
+
+    let mut pressed: Option<PowerAction> = None;
+    for (i, &action) in POWER_ACTIONS.iter().enumerate() {
+        let row = egui::Rect::from_min_size(
+            egui::pos2(rail.left(), rows_top + i as f32 * RAIL_ROW_H),
+            egui::vec2(RAIL_W, RAIL_ROW_H),
+        );
+        let resp = ui.interact(row, console_power_id(action), egui::Sense::click());
+        if resp.hovered() {
+            painter.rect_filled(row, Style::RADIUS, Style::SURFACE_HI);
+        }
+        // The host-down pair reads in DANGER (the dock power_row idiom).
+        let color = if action.typed_armed() {
+            Style::DANGER
+        } else if resp.hovered() {
+            Style::TEXT
+        } else {
+            Style::TEXT_DIM
+        };
+        painter.text(
+            egui::pos2(row.left() + Style::SP_S, row.center().y),
+            egui::Align2::LEFT_CENTER,
+            action.label(),
+            egui::FontId::proportional(Style::SMALL),
+            color,
+        );
+        if resp.clicked() {
+            pressed = Some(action);
+        }
+    }
+    if let Some(action) = pressed {
+        state.power_press(action);
+    }
+}
+
+/// The Power section's **typed-arming stage** (lock #36): the "Type <label> to
+/// confirm" prompt, the echo field, a DANGER Confirm that fires ONLY once the
+/// echo matches (§7 — disarmed it is inert, painted dim), and Cancel back to
+/// the rows. Addressable rows (stable ids), the dock's explicit-rect idiom.
+fn power_arming_stage(ui: &mut egui::Ui, rail: &egui::Rect, top: f32, state: &mut ConsoleState) {
+    let Some(action) = state.arming.as_ref().map(|a| a.action) else {
+        return;
+    };
+    let painter = ui.painter().clone();
+    let inner_l = rail.left() + Style::SP_S;
+    let inner_w = RAIL_W - Style::SP_M;
+    painter.text(
+        egui::pos2(inner_l, top + Style::SP_L / 2.0),
+        egui::Align2::LEFT_CENTER,
+        format!("Type {} to confirm", action.label()),
+        egui::FontId::proportional(Style::SMALL),
+        Style::WARN,
+    );
+    // The echo field (scoped so the `&mut` on the buffer ends before `armed`).
+    let field = egui::Rect::from_min_size(
+        egui::pos2(inner_l, top + Style::SP_L),
+        egui::vec2(inner_w, FIELD_H),
+    );
+    {
+        let echo = &mut state.arming.as_mut().expect("arming set above").echo;
+        ui.put(
+            field,
+            egui::TextEdit::singleline(echo)
+                .id(console_arming_field_id())
+                .hint_text(action.label()),
+        );
+    }
+    let armed = state.armed();
+
+    // Confirm (left) + Cancel (right) — a disarmed Confirm is inert (§7).
+    let buttons_top = top + Style::SP_L + FIELD_H + Style::SP_XS;
+    let confirm = egui::Rect::from_min_size(
+        egui::pos2(inner_l, buttons_top),
+        egui::vec2(inner_w * 0.62, FIELD_H),
+    );
+    let cancel = egui::Rect::from_min_size(
+        egui::pos2(confirm.right() + Style::SP_XS, buttons_top),
+        egui::vec2(inner_w - confirm.width() - Style::SP_XS, FIELD_H),
+    );
+    let confirm_resp = ui.interact(confirm, console_confirm_id(), egui::Sense::click());
+    if armed && confirm_resp.hovered() {
+        painter.rect_filled(confirm, Style::RADIUS, Style::SURFACE_HI);
+    }
+    painter.text(
+        egui::pos2(confirm.left() + Style::SP_XS, confirm.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("Confirm {}", action.label()),
+        egui::FontId::proportional(Style::SMALL),
+        if armed {
+            Style::DANGER
+        } else {
+            Style::TEXT_DIM
+        },
+    );
+    let cancel_resp = ui.interact(cancel, console_cancel_id(), egui::Sense::click());
+    if cancel_resp.hovered() {
+        painter.rect_filled(cancel, Style::RADIUS, Style::SURFACE_HI);
+    }
+    painter.text(
+        egui::pos2(cancel.left() + Style::SP_XS, cancel.center().y),
+        egui::Align2::LEFT_CENTER,
+        "Cancel",
+        egui::FontId::proportional(Style::SMALL),
+        Style::TEXT,
+    );
+    if armed && confirm_resp.clicked() {
+        let _ = state.confirm_armed();
+    } else if cancel_resp.clicked() {
+        state.cancel_arming();
+    }
+}
+
 /// The right pane: the pinned pair + the grouped entry list in one scroll
 /// region (lock #5 — the rail's jump targets scroll this), over the reserved
 /// honest-gate notice strip (§7).
@@ -885,6 +1343,8 @@ fn list_pane(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
     );
 
     let mut activated: Option<usize> = None;
+    let mut remove: Option<usize> = None;
+    let mut add = false;
     egui::ScrollArea::vertical()
         .id_salt("console-list")
         .auto_shrink([false, false])
@@ -913,8 +1373,36 @@ fn list_pane(ui: &mut egui::Ui, rect: egui::Rect, state: &mut ConsoleState) {
                     flat += 1;
                 }
             }
+
+            // CONSOLE-4 — the Custom group (lock #35): the operator's own
+            // command entries at the flat tail (their launch rides the same
+            // CONSOLE-2 seam, so activation honest-gates), then the in-UI add
+            // form. The rail's Custom cell jumps here (target GROUPS.len()).
+            let head = heading(ui, "Custom");
+            if state.jump == Some(GROUPS.len()) {
+                ui.scroll_to_rect(head, Some(egui::Align::Min));
+                state.jump = None;
+            }
+            for (ci, entry) in state.custom.entries.iter().enumerate() {
+                let (clicked, removed) = custom_row(ui, flat + ci, ci, entry, state);
+                if clicked {
+                    activated = Some(flat + ci);
+                }
+                if removed {
+                    remove = Some(ci);
+                }
+            }
+            if custom_add_form(ui, state) {
+                add = true;
+            }
         });
     state.focus_moved = false;
+    if add {
+        let _ = state.add_custom();
+    }
+    if let Some(ci) = remove {
+        state.remove_custom(ci);
+    }
     if let Some(flat) = activated {
         state.activate(flat);
     }
@@ -1053,16 +1541,157 @@ fn entry_row(ui: &mut egui::Ui, flat: usize, entry: &ConsoleEntry, state: &Conso
     resp.clicked()
 }
 
+/// CONSOLE-4 — one **Custom** row (lock #35): the operator's name over its
+/// command line, the Quasar tag (an operator entry is platform-layer config),
+/// the remove cross, and the same focus-ring / activation posture as a static
+/// row. Returns `(clicked, remove_clicked)` — the cross is its own hit target,
+/// registered after the row so it wins the pointer.
+fn custom_row(
+    ui: &mut egui::Ui,
+    flat: usize,
+    index: usize,
+    entry: &CustomEntry,
+    state: &ConsoleState,
+) -> (bool, bool) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW_H),
+        egui::Sense::hover(),
+    );
+    let resp = ui.interact(rect, console_entry_id(flat), egui::Sense::click());
+    let hovered = resp.hovered();
+    let focused = state.open && state.focus == flat;
+    let painter = ui.painter().clone();
+
+    if hovered {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    if focused {
+        painter.rect_stroke(
+            rect,
+            Style::RADIUS,
+            egui::Stroke::new(FOCUS_RING_W, Style::ACCENT_HI),
+            egui::StrokeKind::Inside,
+        );
+        if state.focus_moved {
+            ui.scroll_to_rect(rect, None);
+        }
+    }
+
+    // A command entry wears the Terminal front-door glyph, like a static Tab row.
+    let tint = if hovered || focused {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    if let Some(tex) = icon_texture(ui.ctx(), IconId::Terminal, ENTRY_ICON, tint) {
+        let icon = egui::Rect::from_center_size(
+            egui::pos2(
+                rect.left() + Style::SP_S + ENTRY_ICON / 2.0,
+                rect.center().y,
+            ),
+            egui::vec2(ENTRY_ICON, ENTRY_ICON),
+        );
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
+    }
+
+    let text_left = rect.left() + Style::SP_XL;
+    painter.text(
+        egui::pos2(text_left, rect.top() + Style::SP_XS),
+        egui::Align2::LEFT_TOP,
+        &entry.name,
+        egui::FontId::proportional(Style::BODY),
+        Style::TEXT,
+    );
+    painter.text(
+        egui::pos2(text_left, rect.bottom() - Style::SP_XS),
+        egui::Align2::LEFT_BOTTOM,
+        &entry.command,
+        egui::FontId::proportional(Style::SMALL),
+        Style::TEXT_DIM,
+    );
+    painter.text(
+        egui::pos2(rect.right() - Style::SP_S, rect.top() + Style::SP_XS),
+        egui::Align2::RIGHT_TOP,
+        Provenance::Quasar.label(),
+        egui::FontId::proportional(Style::SMALL),
+        Provenance::Quasar.color(),
+    );
+
+    // The remove cross — its own hit target at the row's lower right.
+    let cross = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - Style::SP_M, rect.bottom() - Style::SP_M),
+        egui::vec2(Style::SP_M, Style::SP_M),
+    );
+    let cross_resp = ui.interact(cross, console_custom_remove_id(index), egui::Sense::click());
+    painter.text(
+        cross.center(),
+        egui::Align2::CENTER_CENTER,
+        "\u{2715}",
+        egui::FontId::proportional(Style::SMALL),
+        if cross_resp.hovered() {
+            Style::DANGER
+        } else {
+            Style::TEXT_DIM
+        },
+    );
+
+    (resp.clicked(), cross_resp.clicked())
+}
+
+/// CONSOLE-4 — the Custom group's **in-UI add form** (lock #35): a name field,
+/// a command field, and the Add row — disabled (dim, inert) until both drafts
+/// are non-blank. Returns `true` when Add was pressed with a valid draft (the
+/// caller registers + persists).
+fn custom_add_form(ui: &mut egui::Ui, state: &mut ConsoleState) -> bool {
+    let form_w = ui.available_width();
+    let (name_rect, _) = ui.allocate_exact_size(egui::vec2(form_w, FIELD_H), egui::Sense::hover());
+    ui.put(
+        name_rect.shrink2(egui::vec2(Style::SP_XS, 1.0)),
+        egui::TextEdit::singleline(&mut state.draft_name)
+            .id(console_custom_name_id())
+            .hint_text("Name"),
+    );
+    let (cmd_rect, _) = ui.allocate_exact_size(egui::vec2(form_w, FIELD_H), egui::Sense::hover());
+    ui.put(
+        cmd_rect.shrink2(egui::vec2(Style::SP_XS, 1.0)),
+        egui::TextEdit::singleline(&mut state.draft_command)
+            .id(console_custom_command_id())
+            .hint_text("Command"),
+    );
+    let (add_rect, _) = ui.allocate_exact_size(egui::vec2(form_w, FIELD_H), egui::Sense::hover());
+    let can_add = !state.draft_name.trim().is_empty() && !state.draft_command.trim().is_empty();
+    let resp = ui.interact(add_rect, console_custom_add_id(), egui::Sense::click());
+    if can_add && resp.hovered() {
+        ui.painter()
+            .rect_filled(add_rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    ui.painter().text(
+        egui::pos2(add_rect.left() + Style::SP_XS, add_rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        "+ Add entry",
+        egui::FontId::proportional(Style::SMALL),
+        if can_add {
+            Style::ACCENT
+        } else {
+            Style::TEXT_DIM
+        },
+    );
+    can_add && resp.clicked()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        console_entry_id, console_heading_id, console_panel, console_rail_id, entry_at,
-        identity_line, static_rows, tool_present, total_rows, ConsoleRequest, ConsoleState,
-        EntryKind, GateReason, CONSOLE_AREA, GROUPS, PINNED,
+        console_confirm_id, console_entry_id, console_heading_id, console_panel, console_power_id,
+        console_rail_id, entry_at, identity_line, static_rows, tool_present, total_rows,
+        ConsoleRequest, ConsoleState, CustomEntry, EntryKind, GateReason, PowerAction,
+        CONSOLE_AREA, GROUPS, PINNED,
     };
     use crate::dock::Surface;
     use mde_egui::egui;
     use mde_egui::Style;
+    use mde_seat::PowerVerb;
 
     /// Drive ONE headless frame of the console over a stand-in surface (the
     /// dock tests' `drive_vdock` idiom — the same `Context::run` path the DRM
@@ -1409,6 +2038,226 @@ mod tests {
         assert!(
             after < before - Style::SP_XL,
             "the jump must scroll the Shells group up the pane (before {before}, after {after})"
+        );
+    }
+
+    // ── CONSOLE-4: the Power section (locks #28/#36 — real seams, typed-armed) ──
+
+    #[test]
+    fn power_lock_and_suspend_fire_at_once_through_the_real_seams() {
+        // Lock → the shell curtain request (NOT a logind verb); Suspend → its
+        // real PowerVerb. Both act on a single press and close the panel.
+        let mut s = ConsoleState::with_store(None);
+        s.toggle();
+        s.power_press(PowerAction::Lock);
+        assert_eq!(
+            s.take_request(),
+            Some(ConsoleRequest::Lock),
+            "Lock drops the curtain, not a logind verb"
+        );
+        assert!(!s.is_open(), "a fired power action closes the panel");
+        assert_eq!(s.take_request(), None, "the request drains exactly once");
+
+        let mut s = ConsoleState::with_store(None);
+        s.toggle();
+        s.power_press(PowerAction::Suspend);
+        assert_eq!(
+            s.take_request(),
+            Some(ConsoleRequest::Power(PowerVerb::Suspend)),
+            "Suspend drives the real seat verb (no arming — reversible)"
+        );
+        assert!(!s.is_open());
+    }
+
+    #[test]
+    fn reboot_and_shut_down_demand_the_typed_echo_before_firing() {
+        // Lock #36 — the host-down pair fires ONLY past the typed echo: a
+        // blank / mistyped echo never arms, a disarmed confirm refuses (§7).
+        let mut s = ConsoleState::with_store(None);
+        s.toggle();
+        s.power_press(PowerAction::Reboot);
+        assert!(s.is_open(), "arming keeps the panel up");
+        assert_eq!(s.take_request(), None, "entering arming fires NOTHING");
+        assert!(!s.armed(), "an empty echo never arms");
+        assert!(!s.confirm_armed(), "a disarmed confirm refuses to fire");
+        s.arming.as_mut().expect("arming set").echo = "nope".to_owned();
+        assert!(!s.armed(), "a mistyped echo never arms");
+        s.arming.as_mut().expect("arming set").echo = "reboot".to_owned();
+        assert!(s.armed(), "the exact verb name (any case) arms it");
+        assert!(s.confirm_armed());
+        assert_eq!(
+            s.take_request(),
+            Some(ConsoleRequest::Power(PowerVerb::Reboot)),
+            "a confirmed Reboot records the real logind verb"
+        );
+        assert!(!s.is_open(), "firing closes the panel");
+        assert!(s.arming.is_none(), "the stage cleared");
+
+        // Shut Down maps to logind PowerOff behind its own echo ("Shut Down").
+        let mut s = ConsoleState::with_store(None);
+        s.toggle();
+        s.power_press(PowerAction::ShutDown);
+        s.arming.as_mut().expect("arming set").echo = "shut down".to_owned();
+        assert!(s.confirm_armed());
+        assert_eq!(
+            s.take_request(),
+            Some(ConsoleRequest::Power(PowerVerb::PowerOff)),
+            "Shut Down maps to logind PowerOff"
+        );
+
+        // Cancel drops the stage without firing; a close drops it too, so a
+        // reopened Console never resumes a stale half-typed confirm.
+        let mut s = ConsoleState::with_store(None);
+        s.toggle();
+        s.power_press(PowerAction::ShutDown);
+        s.cancel_arming();
+        assert!(s.arming.is_none());
+        assert_eq!(s.take_request(), None, "a cancelled arming fired nothing");
+        s.power_press(PowerAction::Reboot);
+        s.close();
+        assert!(s.arming.is_none(), "closing drops the in-flight arming");
+    }
+
+    #[test]
+    fn the_rail_power_rows_dispatch_and_only_an_armed_confirm_fires() {
+        // The pointer path: the rail's Lock row fires its request; the Reboot
+        // row only ARMS; the Confirm row is inert until the echo matches.
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut s = ConsoleState::with_store(None);
+        s.toggle();
+        drive(&ctx, &mut s, Vec::new(), SZ);
+        drive(&ctx, &mut s, Vec::new(), SZ);
+        let lock = ctx
+            .read_response(console_power_id(PowerAction::Lock))
+            .expect("the Lock power row is registered")
+            .rect;
+        click(&ctx, &mut s, lock.center(), SZ);
+        assert_eq!(s.take_request(), Some(ConsoleRequest::Lock));
+
+        let ctx2 = egui::Context::default();
+        Style::install(&ctx2);
+        let mut s2 = ConsoleState::with_store(None);
+        s2.toggle();
+        drive(&ctx2, &mut s2, Vec::new(), SZ);
+        drive(&ctx2, &mut s2, Vec::new(), SZ);
+        let reboot = ctx2
+            .read_response(console_power_id(PowerAction::Reboot))
+            .expect("the Reboot power row is registered")
+            .rect;
+        click(&ctx2, &mut s2, reboot.center(), SZ);
+        assert!(s2.arming.is_some(), "the Reboot row enters arming");
+        assert_eq!(s2.take_request(), None, "the row itself fires nothing");
+
+        // The arming stage mounted in the same box; its DISARMED Confirm is inert.
+        drive(&ctx2, &mut s2, Vec::new(), SZ);
+        drive(&ctx2, &mut s2, Vec::new(), SZ);
+        let confirm = ctx2
+            .read_response(console_confirm_id())
+            .expect("the Confirm row is registered")
+            .rect;
+        click(&ctx2, &mut s2, confirm.center(), SZ);
+        assert_eq!(
+            s2.take_request(),
+            None,
+            "a disarmed Confirm never fires (§7)"
+        );
+        assert!(s2.arming.is_some(), "still arming");
+
+        // Arm the echo (the dock tests' direct-echo idiom) — the Confirm fires.
+        s2.arming.as_mut().expect("arming set").echo = "Reboot".to_owned();
+        drive(&ctx2, &mut s2, Vec::new(), SZ);
+        click(&ctx2, &mut s2, confirm.center(), SZ);
+        assert_eq!(
+            s2.take_request(),
+            Some(ConsoleRequest::Power(PowerVerb::Reboot)),
+            "the armed Confirm fires the real verb"
+        );
+        assert!(!s2.is_open(), "firing closed the panel");
+    }
+
+    // ── CONSOLE-4: the Custom group (lock #35 — config round-trip + honest gate) ──
+
+    #[test]
+    fn custom_entries_round_trip_the_config_and_survive_a_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("console-custom.json");
+        let mut s = ConsoleState::with_store(Some(store.clone()));
+        assert!(s.custom.entries.is_empty(), "a fresh store starts empty");
+
+        // A blank draft is refused — nothing registered, nothing written.
+        assert!(!s.add_custom(), "a blank draft is refused");
+        assert!(!store.exists(), "a refused add persists nothing");
+
+        s.draft_name = "Fleet status".to_owned();
+        s.draft_command = "meshctl fleet status".to_owned();
+        assert!(s.add_custom(), "a full draft registers");
+        assert!(
+            s.draft_name.is_empty() && s.draft_command.is_empty(),
+            "a registered draft clears its fields"
+        );
+        assert!(
+            store.exists(),
+            "the add persisted the config (atomic write)"
+        );
+
+        // The round trip: a fresh state over the same store loads it back.
+        let reloaded = ConsoleState::with_store(Some(store.clone()));
+        assert_eq!(
+            reloaded.custom.entries,
+            vec![CustomEntry {
+                name: "Fleet status".to_owned(),
+                command: "meshctl fleet status".to_owned(),
+            }]
+        );
+
+        // Removal persists too.
+        let mut s2 = reloaded;
+        s2.remove_custom(0);
+        assert!(
+            ConsoleState::with_store(Some(store.clone()))
+                .custom
+                .entries
+                .is_empty(),
+            "a removal persists"
+        );
+
+        // A malformed file folds honestly to the empty store (§7).
+        std::fs::write(&store, "{not json").expect("write");
+        assert!(
+            ConsoleState::with_store(Some(store))
+                .custom
+                .entries
+                .is_empty(),
+            "a malformed config folds to empty, never a panic or a fake entry"
+        );
+    }
+
+    #[test]
+    fn a_custom_entry_activation_is_honest_gated_on_the_spawn_tab_seam() {
+        // §7 — a Custom entry's launch rides the SAME CONSOLE-2 seam, so its
+        // activation raises the typed NotWired notice and routes NOTHING; the
+        // keyboard ring includes the custom tail.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("console-custom.json");
+        let mut s = ConsoleState::with_store(Some(store));
+        s.draft_name = "Farm top".to_owned();
+        s.draft_command = "ssh mm@bigboy btop".to_owned();
+        assert!(s.add_custom());
+        s.toggle();
+        assert_eq!(
+            s.rows_total(),
+            total_rows() + 1,
+            "the activation ring includes the custom tail"
+        );
+        s.activate(total_rows());
+        let gate = s.gate.clone().expect("a gated activation raises a notice");
+        assert_eq!(gate.reason, GateReason::SpawnTabNotWired);
+        assert_eq!(gate.entry, "Farm top");
+        assert_eq!(
+            s.take_request(),
+            None,
+            "a gated custom entry routes NOTHING"
         );
     }
 }
