@@ -737,6 +737,19 @@ impl Verb {
                 | Self::Invite
         )
     }
+
+    /// Whether this verb makes sense fanned across a multi-selection
+    /// (EXPLORER-17, design O10): the per-unit lifecycle + health verbs —
+    /// "reboot 3 instances, health-check 5 peers". A navigation hand-off
+    /// (console / inspect / open-in-Fleet / invite) targets ONE surface for ONE
+    /// unit and stays single-hero; the dead-seam verbs (`ObjectDelete`/`Evict`)
+    /// are excluded by the seam filter anyway (§7 — no dead bulk verb).
+    const fn bulk_capable(self) -> bool {
+        matches!(
+            self,
+            Self::Start | Self::Stop | Self::Reboot | Self::Delete | Self::HealthCheck
+        )
+    }
 }
 
 /// The verbs a unit of `kind` offers, in bar order.
@@ -845,6 +858,105 @@ struct ArmedVerb {
     verb: Verb,
     /// The operator's typed echo, matched against the unit name to arm.
     echo: String,
+}
+
+// ─────────────── multi-select + armed bulk actions (EXPLORER-17, O10) ───────────────
+
+/// A destructive **bulk** verb armed over the whole marked selection
+/// (EXPLORER-17), awaiting its typed confirm — the same typed-arming interlock
+/// as [`ArmedVerb`], keyed to the selection instead of one unit. The echo must
+/// match [`bulk_phrase`] so the operator states exactly what fires and how
+/// many units it hits before anything dispatches.
+struct BulkArm {
+    /// Which destructive verb is armed over the selection.
+    verb: Verb,
+    /// The operator's typed echo, matched against [`bulk_phrase`] to arm.
+    echo: String,
+}
+
+/// The typed confirm phrase arming a bulk `verb` over `n` units — the verb
+/// word plus the exact count (`"delete 3"`), so arming names the blast radius
+/// the way the single-unit interlock names the unit.
+fn bulk_phrase(verb: Verb, n: usize) -> String {
+    format!("{} {n}", verb.label().to_lowercase())
+}
+
+/// The outcome of one bulk run (EXPLORER-17): the per-unit dispatch tallies —
+/// an honest **requested** rollup (the requests were published; the fleet acts
+/// asynchronously — never a fabricated "done", §7).
+struct BulkRollup {
+    /// The verb that ran.
+    verb: Verb,
+    /// How many marked units it fanned across.
+    total: usize,
+    /// How many per-unit dispatches published cleanly.
+    ok: usize,
+    /// The units whose dispatch failed: `(name, reason)`.
+    failed: Vec<(String, String)>,
+}
+
+/// The rollup's inline note (`true` ⇒ carries a failure) — "Reboot requested
+/// for 3/3 units.", failures named per-unit with their honest reason.
+fn bulk_note(r: &BulkRollup) -> (String, bool) {
+    let note = format!(
+        "{} requested for {}/{} units.",
+        r.verb.label(),
+        r.ok,
+        r.total
+    );
+    if r.failed.is_empty() {
+        (note, false)
+    } else {
+        let names: Vec<String> = r
+            .failed
+            .iter()
+            .map(|(name, why)| format!("{name} — {why}"))
+            .collect();
+        (format!("{note} Failed: {}.", names.join("; ")), true)
+    }
+}
+
+/// The verbs the whole selection **shares** (EXPLORER-17, O10): the
+/// intersection of every marked unit's per-type verb set, kept to the
+/// bulk-capable lifecycle/health verbs, and only where the seam resolves for
+/// EVERY unit — the bar never offers a verb that would dead-end on any member
+/// (§7 — no dead bulk verb). Order follows the first unit's bar order. Pure —
+/// the selection model, unit-tested without a render.
+fn shared_bulk_verbs(units: &[Unit]) -> Vec<Verb> {
+    let Some(first) = units.first() else {
+        return Vec::new();
+    };
+    verbs_for(first.kind)
+        .iter()
+        .copied()
+        .filter(|v| v.bulk_capable())
+        .filter(|v| units.iter().all(|u| verbs_for(u.kind).contains(v)))
+        .filter(|&v| units.iter().all(|u| verb_seam(v, u).is_ok()))
+        .collect()
+}
+
+/// How a mosaic tile pick lands (EXPLORER-17 over the O3 zoom): Ctrl/Cmd
+/// toggles the tile's mark, Shift range-marks from the focus anchor, and a
+/// plain pick keeps the O1 zoom-into-hero. Pure over the modifier state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickAction {
+    /// Toggle the picked tile's mark (Ctrl/Cmd-click).
+    ToggleMark,
+    /// Mark the whole run from the focus anchor to the pick (Shift-click).
+    RangeMark,
+    /// Zoom the picked tile into its hero (the plain O3 pick).
+    Zoom,
+}
+
+/// Resolve the modifier state at pick time to its [`PickAction`].
+const fn pick_action(mods: egui::Modifiers) -> PickAction {
+    if mods.command || mods.ctrl {
+        PickAction::ToggleMark
+    } else if mods.shift {
+        PickAction::RangeMark
+    } else {
+        PickAction::Zoom
+    }
 }
 
 // ─────────────────────────── pure fold ───────────────────────────
@@ -1805,6 +1917,15 @@ pub struct ExplorerState {
     /// EXPLORER-14: the `/` universal-search overlay while open (`None` ⇒
     /// closed) — the query box + ranked hit list over every discovered unit.
     search: Option<SearchState>,
+    /// EXPLORER-17: the marked unit ids (O10 multi-select), in mark order.
+    /// Deliberately **transient** — a selection is action-scoped, so it does
+    /// NOT ride the O5 view record; pruned to the live shelf on each refresh.
+    marked: Vec<String>,
+    /// EXPLORER-17: the destructive bulk verb armed over the selection,
+    /// awaiting its typed [`bulk_phrase`] confirm (`None` ⇒ nothing armed).
+    bulk_arm: Option<BulkArm>,
+    /// EXPLORER-17: the last bulk run's per-unit rollup (`None` ⇒ no run yet).
+    bulk_rollup: Option<BulkRollup>,
 }
 
 impl Default for ExplorerState {
@@ -1836,6 +1957,9 @@ impl Default for ExplorerState {
             last_advance_at: None,
             pending_focus: None,
             search: None,
+            marked: Vec::new(),
+            bulk_arm: None,
+            bulk_rollup: None,
         };
         // EXPLORER-13 — restore the persisted view record (O5). The mirrors
         // haven't been read yet, so the remembered selection is held and lands
@@ -2189,6 +2313,14 @@ impl ExplorerState {
         let states = self.client.read();
         self.edges = fold_edges(&states);
         self.units = fold_units(&states, &self.local_host, &self.prefs.pinned);
+        // EXPLORER-17 — a mark on a departed unit is meaningless: prune the
+        // selection to the live shelf so a bulk verb can never target a ghost,
+        // and drop a bulk arm whose selection emptied out from under it.
+        let live: HashSet<&str> = self.units.iter().map(|u| u.id.as_str()).collect();
+        self.marked.retain(|id| live.contains(id.as_str()));
+        if self.marked.is_empty() {
+            self.bulk_arm = None;
+        }
         self.sample_history();
         self.apply_pending_focus();
     }
@@ -2698,6 +2830,230 @@ impl ExplorerState {
         }
     }
 
+    // ─────────── multi-select + armed bulk actions (EXPLORER-17, O10) ───────────
+
+    /// Whether `id` is in the marked selection (the same linear-scan trade-off
+    /// as [`Self::is_pinned`] — the mark set is small).
+    fn is_marked(&self, id: &str) -> bool {
+        self.marked.iter().any(|m| m == id)
+    }
+
+    /// Mark/unmark one unit (Ctrl/Cmd-click, or Space on the D-pad). Emptying
+    /// the selection disarms any pending bulk verb — nothing left to fire at.
+    fn toggle_mark(&mut self, id: &str) {
+        if let Some(pos) = self.marked.iter().position(|m| m == id) {
+            self.marked.remove(pos);
+        } else {
+            self.marked.push(id.to_string());
+        }
+        if self.marked.is_empty() {
+            self.bulk_arm = None;
+        }
+    }
+
+    /// Shift-click range mark: add every unit between view positions `a` and
+    /// `b` (inclusive, either order) in the current filtered view to the
+    /// selection — additive, like every file-manager range select.
+    fn mark_range(&mut self, a: usize, b: usize) {
+        let view = self.filtered_indices();
+        for pos in a.min(b)..=a.max(b) {
+            let Some(&idx) = view.get(pos) else { continue };
+            let id = &self.units[idx].id;
+            if !self.is_marked(id) {
+                self.marked.push(id.clone());
+            }
+        }
+    }
+
+    /// Clear the whole selection (Esc / the Clear button) — marks, any pending
+    /// bulk arm, and the stale rollup note go together.
+    fn clear_marks(&mut self) {
+        self.marked.clear();
+        self.bulk_arm = None;
+        self.bulk_rollup = None;
+    }
+
+    /// The marked units still on the shelf, in shelf order (the deterministic
+    /// per-unit dispatch + rollup order).
+    fn marked_units(&self) -> Vec<Unit> {
+        self.units
+            .iter()
+            .filter(|u| self.is_marked(&u.id))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the armed bulk verb's typed echo matches the exact
+    /// [`bulk_phrase`] for the CURRENT selection size — a selection that grew
+    /// or shrank since arming re-gates until the operator re-states the count.
+    fn bulk_ready(&self) -> bool {
+        let n = self.marked_units().len();
+        n > 0
+            && self
+                .bulk_arm
+                .as_ref()
+                .is_some_and(|a| a.echo.trim() == bulk_phrase(a.verb, n))
+    }
+
+    /// The bulk confirm gate: fire the armed verb across the selection IFF the
+    /// typed phrase matches ([`Self::bulk_ready`]). Returns whether it ran —
+    /// the ONE gate the Confirm button and the tests share (the
+    /// [`Self::confirm_armed`] idiom, selection-wide).
+    fn confirm_bulk(&mut self) -> bool {
+        if !self.bulk_ready() {
+            return false;
+        }
+        let Some(arm) = self.bulk_arm.take() else {
+            return false;
+        };
+        self.run_bulk(arm.verb);
+        true
+    }
+
+    /// Execute `verb` across every marked unit, one real dispatch per unit
+    /// (O10), folding the outcomes into the [`BulkRollup`]. Callers gate:
+    /// non-destructive verbs run directly, destructive only via
+    /// [`Self::confirm_bulk`].
+    fn run_bulk(&mut self, verb: Verb) {
+        let units = self.marked_units();
+        let total = units.len();
+        let mut ok = 0usize;
+        let mut failed: Vec<(String, String)> = Vec::new();
+        for unit in &units {
+            match verb_seam(verb, unit).and_then(|action| self.dispatch(&action)) {
+                Ok(()) => ok += 1,
+                Err(why) => failed.push((unit.name.clone(), why)),
+            }
+        }
+        self.bulk_rollup = Some(BulkRollup {
+            verb,
+            total,
+            ok,
+            failed,
+        });
+    }
+
+    /// The bulk action bar under the mosaic (EXPLORER-17): the selection count,
+    /// the verbs the whole selection SHARES (or the honest none-shared note,
+    /// §7), Clear, the typed bulk-arming challenge, and the per-unit rollup of
+    /// the last run.
+    fn bulk_bar(&mut self, ui: &mut egui::Ui) {
+        let units = self.marked_units();
+        let n = units.len();
+        let verbs = shared_bulk_verbs(&units);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = Style::SP_S;
+            ui.label(
+                RichText::new(format!("{n} selected"))
+                    .size(Style::SMALL)
+                    .strong()
+                    .color(Style::TEXT),
+            );
+            if verbs.is_empty() {
+                // A mixed selection with nothing in common: say so — never a
+                // dead or padded verb (§7).
+                ui.label(
+                    RichText::new("No shared actions across this selection.")
+                        .size(Style::SMALL)
+                        .color(Style::TEXT_DIM),
+                );
+            }
+            for &verb in &verbs {
+                let armed_here = self.bulk_arm.as_ref().is_some_and(|a| a.verb == verb);
+                let tint = if verb.destructive() {
+                    Style::DANGER
+                } else {
+                    Style::TEXT
+                };
+                let button =
+                    egui::Button::new(RichText::new(verb.label()).size(Style::SMALL).color(tint))
+                        .fill(Style::SURFACE)
+                        .stroke(Stroke::new(
+                            1.0,
+                            if armed_here {
+                                Style::DANGER
+                            } else {
+                                Style::BORDER
+                            },
+                        ));
+                if ui.add(button).clicked() {
+                    if verb.destructive() {
+                        self.bulk_arm = Some(BulkArm {
+                            verb,
+                            echo: String::new(),
+                        });
+                        self.bulk_rollup = None;
+                    } else {
+                        self.run_bulk(verb);
+                    }
+                }
+            }
+            if ui
+                .button(RichText::new("Clear").size(Style::SMALL))
+                .clicked()
+            {
+                self.clear_marks();
+            }
+        });
+        // The typed bulk challenge (the EXPLORER-5 arming idiom, selection-wide).
+        if let Some(verb) = self.bulk_arm.as_ref().map(|a| a.verb) {
+            self.bulk_challenge(ui, verb, n);
+        }
+        // The honest per-unit rollup of the last run.
+        if let Some(rollup) = &self.bulk_rollup {
+            let (note, is_err) = bulk_note(rollup);
+            ui.add_space(Style::SP_XS);
+            ui.label(RichText::new(note).size(Style::SMALL).color(if is_err {
+                Style::DANGER
+            } else {
+                Style::TEXT_DIM
+            }));
+        }
+    }
+
+    /// The typed **bulk** challenge row (EXPLORER-17): type the exact
+    /// [`bulk_phrase`] (`"<verb> <count>"`) to enable Confirm — the
+    /// [`Self::arm_challenge`] idiom widened to the whole selection. Confirm
+    /// fires through the ONE gate ([`Self::confirm_bulk`]).
+    fn bulk_challenge(&mut self, ui: &mut egui::Ui, verb: Verb, n: usize) {
+        let phrase = bulk_phrase(verb, n);
+        ui.add_space(Style::SP_S);
+        ui.label(
+            RichText::new(format!(
+                "Type \u{201C}{phrase}\u{201D} to arm {} on {n} units.",
+                verb.label().to_lowercase()
+            ))
+            .size(Style::SMALL)
+            .color(Style::WARN),
+        );
+        ui.add_space(Style::SP_XS);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = Style::SP_S;
+            if let Some(arm) = self.bulk_arm.as_mut() {
+                ui.add(
+                    egui::TextEdit::singleline(&mut arm.echo)
+                        .hint_text(phrase.as_str())
+                        .desired_width(Style::SP_XL * 5.0),
+                );
+            }
+            let ready = self.bulk_ready();
+            let confirm = egui::Button::new(
+                RichText::new(format!("Confirm {}", verb.label())).size(Style::SMALL),
+            )
+            .fill(Style::SURFACE)
+            .stroke(Stroke::new(1.0, Style::DANGER));
+            if ui.add_enabled(ready, confirm).clicked() {
+                self.confirm_bulk();
+            }
+            if ui
+                .button(RichText::new("Cancel").size(Style::SMALL))
+                .clicked()
+            {
+                self.bulk_arm = None;
+            }
+        });
+    }
+
     /// The typed-arming challenge row: type the unit name to enable Confirm (the
     /// `surface_card::show_mok_arm` / `mde-files` typed-echo idiom, reused not
     /// reinvented). Confirm fires through the ONE gate ([`Self::confirm_armed`]).
@@ -2802,6 +3158,14 @@ impl ExplorerState {
         }
         match self.mode {
             SurfaceMode::Mosaic => {
+                // EXPLORER-17 — the bulk action bar rides under the mosaic
+                // while units are marked: the shared verbs over the selection,
+                // the typed bulk arming, and the per-unit rollup.
+                if !self.marked.is_empty() {
+                    egui::TopBottomPanel::bottom(ui.id().with("explorer-bulk"))
+                        .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
+                        .show_inside(ui, |ui| self.bulk_bar(ui));
+                }
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE.inner_margin(Style::SP_S))
                     .show_inside(ui, |ui| self.mosaic(ui));
@@ -2929,14 +3293,16 @@ impl ExplorerState {
     }
 
     /// Mosaic-mode grid nav (O6/O11): Left/Right step one tile, Up/Down move a
-    /// whole row, Home/End jump to the ends, Enter/Space zoom the focused tile into
-    /// its hero (O3). Couch-or-desk — the same focus index the hero pages, so a
-    /// zoom lands on exactly the selected tile. The column step matches the render's
-    /// (`mosaic_columns` over the inner content width).
+    /// whole row, Home/End jump to the ends, Enter zooms the focused tile into
+    /// its hero (O3), **Space marks it** (the EXPLORER-17 D-pad mark — the
+    /// file-manager idiom), and Esc clears a live selection. Couch-or-desk —
+    /// the same focus index the hero pages, so a zoom lands on exactly the
+    /// selected tile. The column step matches the render's (`mosaic_columns`
+    /// over the inner content width).
     fn handle_mosaic_keys(&mut self, ui: &egui::Ui) {
         let cols = mosaic_columns(ui.available_width() - Style::SP_S * 2.0);
         let count = self.hero_count();
-        let (left, right, up, down, home, end, enter) = ui.input(|i| {
+        let (left, right, up, down, home, end, enter, mark, esc) = ui.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowLeft),
                 i.key_pressed(egui::Key::ArrowRight),
@@ -2944,9 +3310,19 @@ impl ExplorerState {
                 i.key_pressed(egui::Key::ArrowDown),
                 i.key_pressed(egui::Key::Home),
                 i.key_pressed(egui::Key::End),
-                i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::Escape),
             )
         });
+        if mark {
+            if let Some(id) = self.focused_unit_id() {
+                self.toggle_mark(&id);
+            }
+        }
+        if esc && !self.marked.is_empty() {
+            self.clear_marks();
+        }
         if left {
             self.focus = grid_move(self.focus, count, cols, GridDir::Left);
         }
@@ -3269,7 +3645,7 @@ impl ExplorerState {
                 // #23 — no mirror yet: show THIS node's own tile, discovering.
                 let me = self_placeholder(&self.local_host);
                 ui.vertical_centered(|ui| {
-                    mosaic_tile(ui, &me, true, false);
+                    mosaic_tile(ui, &me, true, false, false);
                     ui.add_space(Style::SP_S);
                     muted_note(ui, "Discovering units… others tile in as they're found.");
                 });
@@ -3318,7 +3694,9 @@ impl ExplorerState {
                                 let focused = pos == focus;
                                 let unit = &self.units[idx];
                                 let pinned = self.is_pinned(&unit.id);
-                                let (rect, clicked, pin) = mosaic_tile(ui, unit, focused, pinned);
+                                let marked = self.is_marked(&unit.id);
+                                let (rect, clicked, pin) =
+                                    mosaic_tile(ui, unit, focused, pinned, marked);
                                 if focused {
                                     focus_rect = Some(rect);
                                 }
@@ -3340,8 +3718,24 @@ impl ExplorerState {
         if let Some(id) = pin_toggle {
             self.toggle_pin(&id);
         }
+        // EXPLORER-17 — a modified pick marks instead of zooming: Ctrl/Cmd
+        // toggles the tile, Shift range-marks from the focus anchor; a plain
+        // pick keeps the O3 zoom.
         if let Some((pos, rect)) = pick {
-            self.zoom_into(pos, Some(rect));
+            match pick_action(ui.input(|i| i.modifiers)) {
+                PickAction::ToggleMark => {
+                    if let Some(&idx) = self.filtered_indices().get(pos) {
+                        let id = self.units[idx].id.clone();
+                        self.toggle_mark(&id);
+                    }
+                    self.focus = pos;
+                }
+                PickAction::RangeMark => {
+                    self.mark_range(self.focus, pos);
+                    self.focus = pos;
+                }
+                PickAction::Zoom => self.zoom_into(pos, Some(rect)),
+            }
         }
     }
 
@@ -3751,21 +4145,31 @@ fn mosaic_cluster_header(ui: &mut egui::Ui, cluster: Cluster, count: usize) {
 /// One mosaic hero-tile (EXPLORER-11): a mini status ring + kind glyph, the
 /// truncated name, and a type badge, in a category-tinted frame; the keyboard/
 /// D-pad-focused tile wears a thick high-contrast focus ring (O11); a pinned
-/// tile wears the pin marker (O9). Hand-painted so the procedural glyph family
-/// (O8) rides inside, echoing the hero at tile scale. Returns its rect (the
-/// zoom-in origin), whether it was clicked (the O3 pick), and whether it was
-/// right-clicked (the O9 pin toggle).
-fn mosaic_tile(ui: &mut egui::Ui, unit: &Unit, focused: bool, pinned: bool) -> (Rect, bool, bool) {
+/// tile wears the pin marker (O9); a **marked** tile (EXPLORER-17 multi-select)
+/// wears an accent frame + a filled mark square at top-right. Hand-painted so
+/// the procedural glyph family (O8) rides inside, echoing the hero at tile
+/// scale. Returns its rect (the zoom-in origin), whether it was clicked (the
+/// O3 pick), and whether it was right-clicked (the O9 pin toggle).
+fn mosaic_tile(
+    ui: &mut egui::Ui,
+    unit: &Unit,
+    focused: bool,
+    pinned: bool,
+    marked: bool,
+) -> (Rect, bool, bool) {
     let cat = unit.kind.category();
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(MOSAIC_TILE_W, MOSAIC_TILE_H), Sense::click());
     let hovered = resp.hovered();
     let painter = ui.painter();
     painter.rect_filled(rect, Style::RADIUS, Style::SURFACE);
-    // The frame: a thick accent focus ring for the selection, else a hover accent
-    // or a calm border (O11 — the selection is always legible for D-pad nav).
+    // The frame: a thick accent focus ring for the selection, else the mark
+    // accent, a hover accent, or a calm border (O11 — the selection is always
+    // legible for D-pad nav; a marked tile stays visibly in the set).
     let (stroke_w, frame) = if focused {
         (FOCUS_RING_W, Style::ACCENT_HI)
+    } else if marked {
+        (1.0, Style::ACCENT)
     } else if hovered {
         (1.0, cat.accent())
     } else {
@@ -3777,6 +4181,15 @@ fn mosaic_tile(ui: &mut egui::Ui, unit: &Unit, focused: bool, pinned: bool) -> (
         Stroke::new(stroke_w, frame),
         StrokeKind::Inside,
     );
+    // The EXPLORER-17 mark: a small filled accent square at top-right (the O9
+    // pin keeps top-left), so a marked tile reads at a glance in the grid.
+    if marked {
+        let m = Rect::from_center_size(
+            egui::pos2(rect.max.x - Style::SP_S, rect.min.y + Style::SP_S),
+            Vec2::splat(Style::SP_S),
+        );
+        painter.rect_filled(m, Style::RADIUS * 0.3, Style::ACCENT);
+    }
     // The mini status ring + kind glyph (echoes the hero, O1/O8). A known health
     // tier tints the ring; an unprobed unit reads as a calm border, never faked.
     let ring_c = egui::pos2(
@@ -3811,9 +4224,9 @@ fn mosaic_tile(ui: &mut egui::Ui, unit: &Unit, focused: bool, pinned: bool) -> (
         );
     }
     let resp = resp.on_hover_text(if pinned {
-        "Right-click to unpin"
+        "Right-click to unpin · Ctrl-click / Space marks"
     } else {
-        "Right-click to pin"
+        "Right-click to pin · Ctrl-click / Space marks"
     });
     (rect, resp.clicked(), resp.secondary_clicked())
 }
@@ -4389,6 +4802,9 @@ mod tests {
                 last_advance_at: None,
                 pending_focus: None,
                 search: None,
+                marked: Vec::new(),
+                bulk_arm: None,
+                bulk_rollup: None,
             };
             s.refresh();
             s
@@ -6655,5 +7071,314 @@ mod tests {
         let mut none = ExplorerState::with_fake(addressed_state(), "me");
         none.set_pinned_only(true);
         assert!(render(&mut none), "the empty Pinned scope drew its note");
+    }
+
+    // ─────────── EXPLORER-17 multi-select + armed bulk actions ───────────
+
+    /// A sink that accepts the first `fail_from` publishes then faults — the
+    /// partial-failure fixture for the bulk rollup.
+    struct FailingActions {
+        calls: std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>,
+        fail_from: usize,
+    }
+    impl ActionSink for FailingActions {
+        fn publish(&self, topic: &str, body: &str) -> Result<(), String> {
+            let mut calls = self.calls.borrow_mut();
+            if calls.len() >= self.fail_from {
+                return Err("bus write fault".to_string());
+            }
+            calls.push((topic.to_string(), body.to_string()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn bulk_verbs_are_the_shared_real_intersection() {
+        // Peers share exactly the health check (open/evict are single-target
+        // or dead seams).
+        let peers = vec![
+            unit("peer:a", UnitKind::Peer, "a", 1),
+            unit("peer:b", UnitKind::Peer, "b", 1),
+        ];
+        assert_eq!(shared_bulk_verbs(&peers), vec![Verb::HealthCheck]);
+        // Instances share the four lifecycle verbs; Console is a single-target
+        // navigation hand-off and never a bulk verb, even with addresses.
+        let instances = vec![
+            instance_unit("cloud:instance:i1", "web"),
+            instance_unit("cloud:instance:i2", "db"),
+        ];
+        assert_eq!(
+            shared_bulk_verbs(&instances),
+            vec![Verb::Start, Verb::Stop, Verb::Reboot, Verb::Delete]
+        );
+        // A mixed peer+instance selection shares NOTHING — the bar offers no
+        // padded verb (§7, "no dead bulk verb").
+        let mixed = vec![
+            unit("peer:a", UnitKind::Peer, "a", 1),
+            instance_unit("cloud:instance:i1", "web"),
+        ];
+        assert!(shared_bulk_verbs(&mixed).is_empty());
+        // A peer + LAN host DO share the health check.
+        let peer_lan = vec![
+            unit("peer:a", UnitKind::Peer, "a", 1),
+            unit("lan:x", UnitKind::LanHost, "x", 1),
+        ];
+        assert_eq!(shared_bulk_verbs(&peer_lan), vec![Verb::HealthCheck]);
+        // Volumes offer only nav/dead verbs → nothing bulk-capable.
+        let volumes = vec![
+            unit("cloud:volume:v1", UnitKind::Volume, "v1", 1),
+            unit("cloud:volume:v2", UnitKind::Volume, "v2", 1),
+        ];
+        assert!(shared_bulk_verbs(&volumes).is_empty());
+        // An empty selection has no verbs at all.
+        assert!(shared_bulk_verbs(&[]).is_empty());
+    }
+
+    #[test]
+    fn marks_toggle_range_and_prune_with_the_shelf() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        // Toggle on / off.
+        s.toggle_mark("peer:anvil");
+        assert!(s.is_marked("peer:anvil"));
+        s.toggle_mark("peer:anvil");
+        assert!(!s.is_marked("peer:anvil"));
+        // Range over the filtered view (positions 0..=2 = me, anvil, printer),
+        // additive + idempotent in either direction.
+        s.mark_range(0, 2);
+        assert_eq!(s.marked_units().len(), 3);
+        s.mark_range(2, 0);
+        assert_eq!(s.marked_units().len(), 3, "range marking is additive");
+        // A unit leaving the shelf prunes its mark; an emptied selection
+        // disarms a pending bulk verb.
+        s.bulk_arm = Some(BulkArm {
+            verb: Verb::HealthCheck,
+            echo: String::new(),
+        });
+        s.client = Box::new(FakeUnits(vec![UnitsState {
+            host: "me".into(),
+            units: vec![addr_unit(
+                "peer:anvil",
+                UnitKind::Peer,
+                "anvil",
+                "10.42.0.7",
+            )],
+            edges: Vec::new(),
+        }]));
+        s.refresh();
+        assert_eq!(
+            s.marked,
+            vec!["peer:anvil".to_string()],
+            "departed units' marks pruned"
+        );
+        assert!(s.bulk_arm.is_some(), "a live selection keeps its arm");
+        s.toggle_mark("peer:anvil");
+        assert!(
+            s.bulk_arm.is_none(),
+            "an emptied selection disarms the bulk verb"
+        );
+    }
+
+    #[test]
+    fn bulk_destructive_is_gated_on_the_typed_count_phrase() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        let fake = s.recording();
+        s.toggle_mark("cloud:instance:i1"); // web
+        s.toggle_mark("cloud:instance:i2"); // db
+        s.bulk_arm = Some(BulkArm {
+            verb: Verb::Delete,
+            echo: String::new(),
+        });
+        // Un-echoed / mis-counted phrases never fire (§7 + O10 arming).
+        assert!(!s.confirm_bulk(), "a blank echo is a no-op");
+        s.bulk_arm.as_mut().expect("armed").echo = "delete 3".to_string();
+        assert!(!s.confirm_bulk(), "a wrong count never fires");
+        assert!(
+            fake.calls.borrow().is_empty(),
+            "nothing published while gated"
+        );
+        // The exact phrase fires one real dispatch per unit, in shelf order.
+        s.bulk_arm.as_mut().expect("armed").echo = " delete 2 ".to_string();
+        assert!(s.bulk_ready(), "the trimmed exact phrase arms");
+        assert!(s.confirm_bulk());
+        assert_eq!(
+            fake.calls.borrow().as_slice(),
+            &[
+                (
+                    "action/cloud/instance-delete".to_string(),
+                    r#"{"instance":"i2"}"#.to_string() // db sorts before web
+                ),
+                (
+                    "action/cloud/instance-delete".to_string(),
+                    r#"{"instance":"i1"}"#.to_string()
+                ),
+            ],
+            "one QC-11 request per marked instance"
+        );
+        assert!(s.bulk_arm.is_none(), "the arm clears after the run");
+        let rollup = s.bulk_rollup.as_ref().expect("a rollup landed");
+        assert_eq!((rollup.ok, rollup.total), (2, 2));
+        let (note, is_err) = bulk_note(rollup);
+        assert!(note.contains("2/2"), "the rollup names the tally: {note}");
+        assert!(!is_err);
+    }
+
+    #[test]
+    fn bulk_nondestructive_fires_per_unit_with_a_rollup() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        let fake = s.recording();
+        s.toggle_mark("peer:me");
+        s.toggle_mark("peer:anvil");
+        s.run_bulk(Verb::HealthCheck);
+        let calls = fake.calls.borrow();
+        assert_eq!(calls.len(), 2, "one health request per marked peer");
+        assert!(calls.iter().all(|(t, _)| t == "action/units/get-stream"));
+        let rollup = s.bulk_rollup.as_ref().expect("rollup");
+        assert_eq!((rollup.ok, rollup.total), (2, 2));
+        assert!(rollup.failed.is_empty());
+    }
+
+    #[test]
+    fn bulk_rollup_names_per_unit_failures_honestly() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        s.action_sink = Box::new(FailingActions {
+            calls: calls.clone(),
+            fail_from: 1, // the first dispatch lands, the second faults
+        });
+        s.toggle_mark("cloud:instance:i1"); // web (second in shelf order)
+        s.toggle_mark("cloud:instance:i2"); // db (first in shelf order)
+        s.run_bulk(Verb::Start);
+        assert_eq!(
+            calls.borrow().len(),
+            1,
+            "only the first per-unit dispatch reached the bus"
+        );
+        let rollup = s.bulk_rollup.as_ref().expect("rollup");
+        assert_eq!((rollup.ok, rollup.total), (1, 2));
+        assert_eq!(
+            rollup.failed,
+            vec![("web".to_string(), "bus write fault".to_string())],
+            "the failed unit is named with its honest reason"
+        );
+        let (note, is_err) = bulk_note(rollup);
+        assert!(is_err);
+        assert!(
+            note.contains("1/2") && note.contains("web — bus write fault"),
+            "the note carries tally + failure: {note}"
+        );
+    }
+
+    #[test]
+    fn modified_picks_mark_instead_of_zooming() {
+        let plain = egui::Modifiers::default();
+        assert_eq!(pick_action(plain), PickAction::Zoom);
+        let ctrl = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(pick_action(ctrl), PickAction::ToggleMark);
+        let cmd = egui::Modifiers {
+            command: true,
+            ..Default::default()
+        };
+        assert_eq!(pick_action(cmd), PickAction::ToggleMark);
+        let shift = egui::Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(pick_action(shift), PickAction::RangeMark);
+        // Ctrl outranks Shift when both are held (a single deterministic rule).
+        let both = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(pick_action(both), PickAction::ToggleMark);
+    }
+
+    #[test]
+    fn space_marks_enter_zooms_and_esc_clears_on_the_dpad() {
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        assert_eq!(s.mode, SurfaceMode::Mosaic, "the landing is the mosaic");
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let key = |k: egui::Key| egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        };
+        // Space marks the focused tile (peer:me at focus 0) — it no longer zooms.
+        ambient_frame(&ctx, &mut s, 0.0, vec![key(egui::Key::Space)]);
+        assert!(s.is_marked("peer:me"), "Space is the D-pad mark");
+        assert_eq!(s.mode, SurfaceMode::Mosaic, "Space never zooms");
+        // Enter zooms the focused tile into its hero; the marks survive.
+        ambient_frame(&ctx, &mut s, 0.5, vec![key(egui::Key::Enter)]);
+        assert_eq!(s.mode, SurfaceMode::Hero, "Enter zooms in");
+        assert!(s.is_marked("peer:me"), "zooming never clears the selection");
+        // Esc in the hero zooms back out (the O3 reverse), marks intact…
+        ambient_frame(&ctx, &mut s, 1.0, vec![key(egui::Key::Escape)]);
+        assert_eq!(s.mode, SurfaceMode::Mosaic);
+        assert!(s.is_marked("peer:me"));
+        // …and Esc in the mosaic clears the live selection.
+        ambient_frame(&ctx, &mut s, 1.5, vec![key(egui::Key::Escape)]);
+        assert!(s.marked.is_empty(), "Esc clears the selection");
+    }
+
+    #[test]
+    fn the_bulk_bar_renders_headless() {
+        // Selection + shared verbs + the typed challenge + a rollup all
+        // tessellate cleanly under the mosaic.
+        let mut s = ExplorerState::with_fake(addressed_state(), "me");
+        s.toggle_mark("cloud:instance:i1");
+        s.toggle_mark("cloud:instance:i2");
+        s.bulk_arm = Some(BulkArm {
+            verb: Verb::Reboot,
+            echo: "reb".to_string(),
+        });
+        s.bulk_rollup = Some(BulkRollup {
+            verb: Verb::Start,
+            total: 2,
+            ok: 1,
+            failed: vec![("web".to_string(), "bus write fault".to_string())],
+        });
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                Vec2::new(1200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| s.show(ui));
+        });
+        assert!(
+            !ctx.tessellate(out.shapes, out.pixels_per_point).is_empty(),
+            "the marked mosaic + bulk bar drew primitives"
+        );
+        // A mixed selection renders the honest no-shared-verbs note.
+        let mut mixed = ExplorerState::with_fake(addressed_state(), "me");
+        mixed.toggle_mark("peer:me");
+        mixed.toggle_mark("cloud:instance:i1");
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    Vec2::new(1200.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| mixed.show(ui));
+            },
+        );
+        assert!(!ctx.tessellate(out.shapes, out.pixels_per_point).is_empty());
+        assert!(
+            shared_bulk_verbs(&mixed.marked_units()).is_empty(),
+            "the mixed bar offers no padded verb (§7)"
+        );
     }
 }
