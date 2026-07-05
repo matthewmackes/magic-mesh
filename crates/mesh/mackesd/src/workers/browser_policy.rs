@@ -1473,4 +1473,71 @@ mod tests {
         let w = worker("n1", "workstation", local.path(), share.path(), now);
         assert_eq!(w.name(), "browser_policy");
     }
+
+    // ── BUG-BROWSER-5 — the tick path must not leak file descriptors ──
+    //
+    // Eagle logged a recurring `state publish failed … Too many open files
+    // (os error 24)` from this worker's `publish_state`. This soak drives the REAL
+    // per-tick body — `drain_requests` (list_topics + a net-new enforcement action
+    // each iteration) then `flush` (persist + mirror own doc, rebuild the converged
+    // view, read the browser-data dir, and publish `state/browser-policy/<node>`) —
+    // N times against ONE long-lived `Persist`, exactly as `run()` reuses it, and
+    // asserts the process fd count stays bounded. A handle opened each tick and never
+    // dropped (a re-opened Bus connection, an un-consumed `ReadDir`, an unreaped
+    // child) would climb the count until it trips EMFILE; a small slack absorbs the
+    // one-time lazy fds (the sqlite wal/shm, the `/proc/self/fd` snapshot itself).
+
+    /// Count this process's open file descriptors (Linux `/proc/self/fd`).
+    #[cfg(target_os = "linux")]
+    fn open_fd_count() -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .map(std::iter::Iterator::count)
+            .unwrap_or(0)
+    }
+
+    /// Publish one fresh `action/browser/launch` so each soak iteration has a net-new
+    /// message to drain + `enforce` (the drain cursor advances past prior ones).
+    #[cfg(target_os = "linux")]
+    fn publish_launch(persist: &Persist) {
+        let _ = persist.write("action/browser/launch", Priority::Default, None, Some("{}"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tick_does_not_leak_file_descriptors_over_a_soak() {
+        let bus = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let (_c, now) = fake_clock(1_000);
+        let persist =
+            Persist::open(bus.path().to_path_buf()).expect("open the bus Persist for the soak");
+        let mut w = worker("soak", "workstation", local.path(), share.path(), now)
+            .with_share_gate(Arc::new(AtomicBool::new(true))); // share up: exercise the mirror path
+        w.load();
+
+        // Warm-up: let one-time lazy fds (sqlite wal/shm, the first topic dirs) settle
+        // so they don't count as "leaked" against the measured window.
+        for _ in 0..10 {
+            publish_launch(&persist);
+            w.drain_requests(&persist);
+            w.flush(&persist);
+        }
+
+        let before = open_fd_count();
+        assert!(
+            before > 0,
+            "/proc/self/fd must be readable to measure the soak"
+        );
+        for _ in 0..400 {
+            publish_launch(&persist);
+            w.drain_requests(&persist);
+            w.flush(&persist);
+        }
+        let after = open_fd_count();
+
+        assert!(
+            after <= before + 8,
+            "browser_policy tick leaked file descriptors over 400 ticks: {before} → {after}"
+        );
+    }
 }
