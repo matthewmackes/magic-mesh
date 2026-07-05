@@ -3,28 +3,40 @@
 //! E12-3 shipped the *skeleton*: the five scope-first planes as a selectable rail
 //! beside an honest content pane. Live data then wires into each plane: **This
 //! Node** (WB-ThisNode — this host's role / overlay IP / presence + heartbeat /
-//! daemon health, off the mesh-status snapshot), **Controller** (WB-Controller —
-//! the elected controller + its leader lease and the fleet-wide control-service
-//! health rollup), **Network** (WB-Network — the overlay IP + cipher, elected
-//! leader, the peer directory as network links, and overlay routing), **Fleet**
-//! (MV-6 — per-node KVM reality off the Bus), and **Provisioning** (WB-Provisioning
-//! — per-node deployment tier + role rollup, the fleet version target vs each
-//! node's build, and per-node enrollment readiness) — all five planes are now
-//! live off the mesh-status snapshot / Bus. Nothing here fakes a metric (governance
-//! §7) — a plane shows live data or an honest blurb, never stand-in data.
+//! daemon health, off the mesh-status snapshot), **Cloud** (QC-12 — the
+//! QUASAR-CLOUD Q70 lock: *the Controller plane BECOMES the Cloud plane*; the
+//! five cloud resource kinds + the full launch picker + fleet-state launch
+//! presets over the typed QC-11 verbs, with the old Controller view — the
+//! elected leader + control-service rollup — kept live inside it, collapsed),
+//! **Network** (WB-Network — the overlay IP + cipher, elected leader, the peer
+//! directory as network links, and overlay routing), **Fleet** (MV-6 — per-node
+//! KVM reality off the Bus), and **Provisioning** (WB-Provisioning — per-node
+//! deployment tier + role rollup, the fleet version target vs each node's build,
+//! and per-node enrollment readiness) — all five planes are live off the
+//! mesh-status snapshot / Bus. Nothing here fakes a metric (governance §7) — a
+//! plane shows live data or an honest blurb, never stand-in data.
 
 use mde_egui::egui::{self, RichText};
 use mde_egui::Style;
 
+// QC-12 — the Cloud plane's own module file, mounted here (rather than from
+// `main.rs`) because the crate root is owned by parallel wave units; the
+// `#[path]` mount keeps the plane in its own file while this module stays the
+// one place the planes meet.
+#[path = "cloud_plane.rs"]
+pub mod cloud_plane;
+
 /// One of the five top-level control planes of the Workbench, ordered by blast
 /// radius — from the local host outward to the whole fleet.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub(crate) enum Plane {
+pub enum Plane {
     /// This host — hardware, the local desktop seat, node-local services.
     #[default]
     ThisNode,
-    /// The mesh controller — leader election, etcd state, controller health.
-    Controller,
+    /// The mesh cloud — `OpenStack` self-service for every member (QC-12; the
+    /// Q70 lock renamed the Controller plane: `OpenStack` IS the control brain
+    /// the old plane described).
+    Cloud,
     /// Network fabric — the Nebula overlay, lighthouses, routes, reachability.
     Network,
     /// The fleet — every peer and the VM desktops they serve.
@@ -35,22 +47,22 @@ pub(crate) enum Plane {
 
 impl Plane {
     /// The five planes in nav order (local host → fleet-wide).
-    pub(crate) const ALL: [Plane; 5] = [
-        Plane::ThisNode,
-        Plane::Controller,
-        Plane::Network,
-        Plane::Fleet,
-        Plane::Provisioning,
+    pub(crate) const ALL: [Self; 5] = [
+        Self::ThisNode,
+        Self::Cloud,
+        Self::Network,
+        Self::Fleet,
+        Self::Provisioning,
     ];
 
     /// The short rail label.
     pub(crate) const fn label(self) -> &'static str {
         match self {
-            Plane::ThisNode => "This Node",
-            Plane::Controller => "Controller",
-            Plane::Network => "Network",
-            Plane::Fleet => "Fleet",
-            Plane::Provisioning => "Provisioning",
+            Self::ThisNode => "This Node",
+            Self::Cloud => "Cloud",
+            Self::Network => "Network",
+            Self::Fleet => "Fleet",
+            Self::Provisioning => "Provisioning",
         }
     }
 
@@ -58,17 +70,18 @@ impl Plane {
     /// copy only — never a stand-in for live data (§7).
     pub(crate) const fn blurb(self) -> &'static str {
         match self {
-            Plane::ThisNode => {
+            Self::ThisNode => {
                 "This host — hardware, the local desktop seat, and node-local services."
             }
-            Plane::Controller => {
-                "Control plane — leader election, etcd state, and controller health."
+            Self::Cloud => {
+                "The mesh cloud — instances, volumes, images, networks, and stacks, \
+                 self-served by every member."
             }
-            Plane::Network => {
+            Self::Network => {
                 "Mesh fabric — the Nebula overlay, lighthouses, routes, and reachability."
             }
-            Plane::Fleet => "Every peer in the mesh and the VM desktops they serve.",
-            Plane::Provisioning => "Golden images, node enrollment, and bringing new peers online.",
+            Self::Fleet => "Every peer in the mesh and the VM desktops they serve.",
+            Self::Provisioning => "Golden images, node enrollment, and bringing new peers online.",
         }
     }
 }
@@ -76,25 +89,29 @@ impl Plane {
 /// Render the expanded Workbench: a title, the plane rail, and the selected
 /// plane's content pane. `selected` is read and written, so a rail click changes
 /// the active plane. The This Node plane renders this host's live status from
-/// `thisnode` (WB-ThisNode), the Controller plane from `controller` (WB-Controller),
-/// the Network plane from `network` (WB-Network), the Fleet plane's live per-node
-/// KVM reality from `datacenter` (MV-6), and the Provisioning plane's live
-/// deployment / version / enrollment posture from `provisioning` (WB-Provisioning)
-/// — every plane now renders live status. The Provisioning plane additionally
-/// hosts two Bus-driven onboarding flows: the Spawn Lighthouse flow
+/// `thisnode` (WB-ThisNode), the Cloud plane (QC-12) renders the mesh cloud off
+/// the typed QC-11 Bus verbs (its mutable picker/arming state rides the egui
+/// data store — `cloud_plane::state_handle` — because this signature is frozen
+/// this wave; the old Controller view stays live inside it via `controller`),
+/// the Network plane from `network` (WB-Network), the Fleet plane's live
+/// per-node KVM reality from `datacenter` (MV-6), and the Provisioning plane's
+/// live deployment / version / enrollment posture from `provisioning`
+/// (WB-Provisioning) — every plane renders live status. The Provisioning plane
+/// additionally hosts two Bus-driven onboarding flows: the Spawn Lighthouse flow
 /// (`spawn_lighthouse`, OW-7) — promote a LAN-only mesh by standing up its first
 /// lighthouse + migrating the CA — and the day-2 Services flow (`services`,
 /// OW-11): pick Music/Files/Voice, preview the daemon's plan, apply over the Bus.
 // One state struct per mounted plane view — the Workbench is the single place
 // they all meet, so the arity IS the plane count, not a design smell.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn show(
+pub fn show(
     ui: &mut egui::Ui,
     selected: &mut Plane,
     datacenter: &mut crate::datacenter::DatacenterState,
-    // Read-only: the This Node / Controller / Network / Provisioning planes only
-    // render their polled status (`&self`), unlike the Fleet plane whose
-    // `datacenter` publishes lifecycle actions.
+    // Read-only: the This Node / Network / Provisioning planes only render
+    // their polled status (`&self`), unlike the Fleet plane whose `datacenter`
+    // publishes lifecycle actions. `controller` is read-only too — the Cloud
+    // plane embeds its view and keeps its own mutable state in egui memory.
     thisnode: &crate::thisnode::ThisNodeState,
     // Mutable: the SURFACE-6 card reads the surface workers' typed state off the
     // Bus and publishes typed enable / fw-apply requests (it holds the in-flight
@@ -171,10 +188,20 @@ pub(crate) fn show(
                         surface_card.show(ui);
                     }
                 }
-                // WB-Controller — the mesh control plane's live status (the elected
-                // controller + its leader lease, and the fleet-wide control-service
-                // health rollup) off the same snapshot.
-                Plane::Controller => controller.show(ui),
+                // QC-12 — the Cloud plane (the Q70 lock: the Controller plane
+                // BECOMES the Cloud plane). Renders the mesh cloud off the typed
+                // QC-11 Bus verbs; its mutable picker/arming/poll state rides the
+                // egui data store because this signature is frozen this wave (see
+                // the cloud_plane module docs). The old Controller view stays
+                // live inside the plane, collapsed (§6 reuse — the leader lease
+                // the leader-hosted MariaDB follows is part of the cloud story).
+                Plane::Cloud => {
+                    let handle = cloud_plane::state_handle(ui);
+                    let mut cloud = handle
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    cloud_plane::show(ui, &mut cloud, controller);
+                }
                 // WB-Network — the mesh fabric's live status (overlay IP + cipher,
                 // elected leader, the peer directory as network links, network
                 // service health, overlay routing) off the same snapshot.
@@ -332,7 +359,19 @@ mod tests {
     fn there_are_five_planes_in_blast_radius_order() {
         assert_eq!(Plane::ALL.len(), 5);
         assert_eq!(Plane::ALL[0], Plane::ThisNode);
+        // QC-12 / Q70 — the Controller slot is now the Cloud plane.
+        assert_eq!(Plane::ALL[1], Plane::Cloud);
         assert_eq!(Plane::ALL[4], Plane::Provisioning);
+    }
+
+    #[test]
+    fn the_controller_plane_became_the_cloud_plane() {
+        // The Q70 lock: no plane is labelled Controller any more, and the Cloud
+        // plane is reachable with an honest cloud blurb.
+        assert!(Plane::ALL.iter().all(|p| p.label() != "Controller"));
+        assert_eq!(Plane::Cloud.label(), "Cloud");
+        assert!(Plane::Cloud.blurb().contains("instances"));
+        assert!(Plane::Cloud.blurb().contains("stacks"));
     }
 
     #[test]

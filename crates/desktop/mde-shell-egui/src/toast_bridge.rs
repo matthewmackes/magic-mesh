@@ -241,7 +241,10 @@ fn surface_by_name(name: &str) -> Option<Surface> {
 fn plane_by_name(name: &str) -> Option<Plane> {
     match name.to_ascii_lowercase().as_str() {
         "thisnode" => Some(Plane::ThisNode),
-        "controller" => Some(Plane::Controller),
+        // QC-12 (Q70) — the Controller plane became the Cloud plane; a forward
+        // emitter's old `shell/plane/controller` still reaches the live plane
+        // (the retired-verb aliasing idiom `notifications`/`clipboard` use).
+        "cloud" | "controller" => Some(Plane::Cloud),
         "network" => Some(Plane::Network),
         "fleet" => Some(Plane::Fleet),
         "provisioning" => Some(Plane::Provisioning),
@@ -545,6 +548,13 @@ mod tests {
     fn name_maps_are_case_insensitive() {
         assert_eq!(surface_by_name("SYSTEM"), Some(Surface::System));
         assert_eq!(plane_by_name("ThisNode"), Some(Plane::ThisNode));
+    }
+
+    #[test]
+    fn the_retired_controller_plane_verb_reaches_the_cloud_plane() {
+        // QC-12 (Q70) — the rename must not strand a forward emitter's old verb.
+        assert_eq!(plane_by_name("cloud"), Some(Plane::Cloud));
+        assert_eq!(plane_by_name("controller"), Some(Plane::Cloud));
     }
 
     // ── suppress policy is pure ────────────────────────────────────────────────
