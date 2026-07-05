@@ -608,9 +608,16 @@ impl RdpConnection {
         session: &mut RdpSession,
         timeout: Duration,
     ) -> Result<PumpOutcome, ConnectError> {
+        // `tokio::time::timeout` registers its timer against the *current*
+        // runtime handle the instant it is constructed, so it MUST be built
+        // inside the runtime context — constructing it eagerly as a `block_on`
+        // argument (outside the reactor) panics "there is no reactor running"
+        // (caught live against xrdp, TESTVM-4). Build + await it inside the
+        // async block so the timer driver is in scope.
+        let framed = &mut self.framed;
         let read = self
             .runtime
-            .block_on(tokio::time::timeout(timeout, self.framed.read_pdu()));
+            .block_on(async { tokio::time::timeout(timeout, framed.read_pdu()).await });
         let (action, frame) = match read {
             Err(_elapsed) => {
                 session.record_stall(self.now_ms());
