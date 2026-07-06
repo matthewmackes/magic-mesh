@@ -46,9 +46,9 @@ pub struct PlannedUnit {
 ///   `mackesd` daemon, the etcd + Syncthing substrate, and the health + status
 ///   timers. This is [`crate::site_yml::CONVERGE_SERVICES`] plus the status
 ///   timer (a unit test pins that superset relationship).
-/// * **Rank 1 (Workstation only)** — the desktop adds: the voice stack
-///   (kamailio/rtpengine, gated to the rank-1 `voice_config` worker's tier) and
-///   the one-way Carbon desktop branding.
+/// * **Rank 1 (Workstation only)** — the desktop adds: the DRM-seat shell, the
+///   voice stack (kamailio/rtpengine, gated to the rank-1 `voice_config`
+///   worker's tier), and the one-way Carbon desktop branding.
 const ROLE_UNITS: &[(&str, u8)] = &[
     // ── Rank 0 — universal control/data plane (CONVERGE_SERVICES + status timer).
     ("nebula.service", 0),
@@ -58,6 +58,7 @@ const ROLE_UNITS: &[(&str, u8)] = &[
     ("mesh-health.timer", 0),
     ("mesh-status.timer", 0),
     // ── Rank 1 — Workstation-only: the voice stack + desktop branding.
+    ("mde-shell-egui.service", 1),
     ("kamailio-mde.service", 1),
     ("rtpengine-mde.service", 1),
     ("magic-mesh-brand.service", 1),
@@ -212,6 +213,7 @@ mod tests {
         }
         // Rank-1 Workstation units → masked (a lighthouse never runs them).
         for u in [
+            "mde-shell-egui.service",
             "kamailio-mde.service",
             "rtpengine-mde.service",
             "magic-mesh-brand.service",
@@ -309,11 +311,11 @@ mod tests {
                 pu.unit
             );
         }
-        // Lighthouse masks exactly the 3 Workstation units.
+        // Lighthouse masks exactly the 4 Workstation units.
         assert_eq!(
             calls.iter().filter(|(v, _)| v == "mask").count(),
-            3,
-            "lighthouse masks the rank-1 voice + brand units"
+            4,
+            "lighthouse masks the rank-1 shell + voice + brand units"
         );
     }
 

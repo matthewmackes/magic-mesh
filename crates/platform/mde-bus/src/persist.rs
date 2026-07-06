@@ -30,7 +30,7 @@
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -1079,6 +1079,23 @@ mod tests {
         assert_eq!(p.list_since("a", None).unwrap().len(), 2);
         assert_eq!(p.list_since("b", None).unwrap().len(), 1);
         assert_eq!(p.list_since("nonexistent", None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn dotted_unenrolled_hostname_topics_write_and_list() {
+        let (_tmp, p) = open_tmp();
+        p.write(
+            "audit/localhost.localdomain",
+            Priority::Min,
+            None,
+            Some("{}"),
+        )
+        .unwrap();
+        let topics = p.list_topics().unwrap();
+        assert!(
+            topics.iter().any(|t| t == "audit/localhost.localdomain"),
+            "fresh Fedora's default dotted hostname must be a listable topic"
+        );
     }
 
     #[test]

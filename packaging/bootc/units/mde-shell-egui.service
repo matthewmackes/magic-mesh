@@ -1,5 +1,6 @@
-# E12-13 — the Quasar DRM-seat unit (bootc image lane only; the dnf/RPM lane
-# still launches the shell from a session via org.magicmesh.Shell.desktop).
+# E12-13 / SEAT-BOOT-1 — the Quasar DRM-seat unit for both bootc and RPM lanes.
+# org.magicmesh.Shell.desktop remains the session-launch face; this is the
+# boot-to-seat face.
 #
 # systemd launches the ONE egui shell directly on the DRM/KMS seat, greetd-style
 # — no display manager, no Wayland compositor (§5, quasar-vdi-desktop.md lock 34).

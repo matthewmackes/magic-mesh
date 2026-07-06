@@ -294,10 +294,23 @@ impl Unit {
     }
 }
 
+/// The canonical hostname inside a peer unit id.
+///
+/// Older or partially-enrolled sources may already carry the unit namespace
+/// (`peer:<hostname>`). Keep the public id stable by stripping any accidental
+/// namespace before adding exactly one `peer:` prefix.
+#[must_use]
+pub fn peer_hostname(mut hostname: &str) -> &str {
+    while let Some(rest) = hostname.strip_prefix("peer:") {
+        hostname = rest;
+    }
+    hostname
+}
+
 /// The stable unit id for a mesh peer (or self): `peer:<hostname>`.
 #[must_use]
 pub fn peer_unit_id(hostname: &str) -> String {
-    format!("peer:{hostname}")
+    format!("peer:{}", peer_hostname(hostname))
 }
 
 /// The stable unit id for a LAN host (EXPLORER-2 producer): `lan:<key>`, where
@@ -371,6 +384,8 @@ mod tests {
     #[test]
     fn ids_are_namespaced_per_source() {
         assert_eq!(peer_unit_id("anvil"), "peer:anvil");
+        assert_eq!(peer_unit_id("peer:anvil"), "peer:anvil");
+        assert_eq!(peer_unit_id("peer:peer:anvil"), "peer:anvil");
         assert_eq!(lan_unit_id("aa:bb:cc"), "lan:aa:bb:cc");
         // Distinct namespaces never collide across kinds.
         assert_ne!(peer_unit_id("x"), lan_unit_id("x"));

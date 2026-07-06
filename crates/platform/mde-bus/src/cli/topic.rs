@@ -124,6 +124,15 @@ mod tests {
     }
 
     #[test]
+    fn seeded_registry_accepts_fresh_fedora_dotted_hostname() {
+        let mut reg = Registry::new();
+        seed::seed_defaults_with_hostname(&mut reg, "localhost.localdomain").unwrap();
+        let names: Vec<&str> = reg.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"peer/localhost.localdomain/alerts"));
+        assert!(names.contains(&"peer/localhost.localdomain/system"));
+    }
+
+    #[test]
     fn match_filters_by_pattern() {
         // Verify against the registry directly to avoid stdout
         // capture.

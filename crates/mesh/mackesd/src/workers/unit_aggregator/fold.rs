@@ -18,7 +18,8 @@ use mackes_mesh_types::peers::PeerRecord;
 use super::enrich;
 use super::sources::{CloudObjectRecord, LanHostRecord, MeshSnapshot};
 use super::unit::{
-    lan_unit_id, peer_unit_id, Extras, Health, MeshFacts, Reachability, Unit, UnitKind,
+    Extras, Health, MeshFacts, Reachability, Unit, UnitKind, lan_unit_id, peer_hostname,
+    peer_unit_id,
 };
 
 /// Per-unit-id first-seen memory carried across ticks (E10).
@@ -112,17 +113,18 @@ fn peer_extras(rec: &PeerRecord) -> Extras {
 
 /// Build a `Peer` unit from a directory row + the current leader hostname.
 fn peer_unit(rec: &PeerRecord, leader: Option<&str>) -> Unit {
+    let hostname = peer_hostname(&rec.hostname);
     Unit {
-        id: peer_unit_id(&rec.hostname),
+        id: peer_unit_id(hostname),
         kind: UnitKind::Peer,
-        name: rec.hostname.clone(),
+        name: hostname.to_string(),
         reachability: Reachability::InMesh,
         address: rec.overlay_ip.clone(),
         health: Some(Health::from_mesh(&rec.health)),
         telemetry: None,
         mesh: Some(MeshFacts {
             role: rec.role.clone(),
-            leader: leader == Some(rec.hostname.as_str()),
+            leader: leader.map(peer_hostname) == Some(hostname),
             mde_version: rec.mde_version.clone(),
         }),
         cloud: None,
@@ -136,17 +138,18 @@ fn peer_unit(rec: &PeerRecord, leader: Option<&str>) -> Unit {
 /// heartbeat): we still know ourselves (lock #23), with honest unknowns for the
 /// fields the directory would carry (§7).
 fn self_unit_synthetic(self_host: &str, leader: Option<&str>) -> Unit {
+    let hostname = peer_hostname(self_host);
     Unit {
-        id: peer_unit_id(self_host),
+        id: peer_unit_id(hostname),
         kind: UnitKind::Peer,
-        name: self_host.to_string(),
+        name: hostname.to_string(),
         reachability: Reachability::InMesh,
         address: None,
         health: None,
         telemetry: None,
         mesh: Some(MeshFacts {
             role: None,
-            leader: leader == Some(self_host),
+            leader: leader.map(peer_hostname) == Some(hostname),
             mde_version: None,
         }),
         cloud: None,
@@ -242,20 +245,23 @@ fn cloud_unit(rec: &CloudObjectRecord) -> Unit {
 /// peers by name.
 fn fold_peers(mesh: &MeshSnapshot) -> Vec<Unit> {
     let leader = mesh.leader.as_deref();
-    let self_row = mesh.peers.iter().find(|p| p.hostname == mesh.self_host);
+    let self_host = peer_hostname(&mesh.self_host);
+    let self_row = mesh
+        .peers
+        .iter()
+        .find(|p| peer_hostname(&p.hostname) == self_host);
     let self_unit = self_row.map_or_else(
-        || self_unit_synthetic(&mesh.self_host, leader),
+        || self_unit_synthetic(self_host, leader),
         |row| peer_unit(row, leader),
     );
+    let mut seen_peer_ids = BTreeSet::from([self_unit.id.clone()]);
     let mut units = vec![self_unit];
     // The directory read is already hostname-sorted; keep that order for the
     // non-self peers.
-    units.extend(
-        mesh.peers
-            .iter()
-            .filter(|p| p.hostname != mesh.self_host)
-            .map(|p| peer_unit(p, leader)),
-    );
+    units.extend(mesh.peers.iter().filter_map(|p| {
+        let peer = peer_unit(p, leader);
+        seen_peer_ids.insert(peer.id.clone()).then_some(peer)
+    }));
     units
 }
 
@@ -359,6 +365,25 @@ mod tests {
         // Synthesized self carries honest unknowns (no directory row yet).
         assert!(units[0].health.is_none());
         assert!(units[0].address.is_none());
+    }
+
+    #[test]
+    fn prefixed_unenrolled_self_row_dedups_to_one_peer_unit() {
+        let mesh = MeshSnapshot {
+            self_host: "localhost.localdomain".into(),
+            leader: Some("peer:localhost.localdomain".into()),
+            peers: vec![peer_rec(
+                "peer:localhost.localdomain",
+                "healthy",
+                Some("10.42.0.10"),
+            )],
+        };
+        let mut seen = SeenTracker::new();
+        let units = aggregate(&mesh, &[], &[], &mut seen, 1000);
+        assert_eq!(ids(&units), vec![peer_unit_id("localhost.localdomain")]);
+        assert_eq!(units[0].name, "localhost.localdomain");
+        assert_eq!(units[0].health, Some(Health::Healthy));
+        assert_eq!(units[0].mesh.as_ref().map(|m| m.leader), Some(true));
     }
 
     #[test]

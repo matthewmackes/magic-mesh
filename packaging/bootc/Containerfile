@@ -224,8 +224,8 @@ RUN set -eux; \
     rm -f /tmp/cloud-hypervisor; \
     /usr/bin/cloud-hypervisor --version
 
-# The DRM-seat unit (bootc lane only — the dnf/RPM lane keeps the .desktop
-# launcher) + its preset. Boot-to-seat: quasar-vdi-desktop.md lock 34.
+# The DRM-seat unit + its preset. Boot-to-seat: quasar-vdi-desktop.md lock 34.
+# The RPM lane ships the same unit through generate-rpm (SEAT-BOOT-1).
 COPY packaging/bootc/units/mde-shell-egui.service /usr/lib/systemd/system/mde-shell-egui.service
 COPY packaging/bootc/system-preset/45-mcnf-quasar.preset /usr/lib/systemd/system-preset/45-mcnf-quasar.preset
 

@@ -194,6 +194,21 @@ mod tests {
     }
 
     #[test]
+    fn dotted_unenrolled_hostname_substitution_runs() {
+        let mut r = Registry::new();
+        let created = seed_defaults_with_hostname(&mut r, "localhost.localdomain").unwrap();
+        assert_eq!(created, 12);
+        assert!(
+            r.get("peer/localhost.localdomain/alerts").is_some(),
+            "fresh Fedora's default dotted hostname must not break topic seeding"
+        );
+        assert!(
+            r.get("peer/localhost.localdomain/system").is_some(),
+            "fresh Fedora's default dotted hostname must not break topic seeding"
+        );
+    }
+
+    #[test]
     fn seeded_topics_cover_every_class() {
         let mut r = Registry::new();
         let _ = seed_defaults_with_hostname(&mut r, "alpha").unwrap();

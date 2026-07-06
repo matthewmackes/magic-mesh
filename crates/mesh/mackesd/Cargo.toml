@@ -411,7 +411,12 @@ assets = [
     # graphical surface now that the Cosmic-era GUIs are stripped (E12-14b), with a
     # .desktop so it's launchable from a session too.
     { source = "target/release/mde-shell-egui",     dest = "/usr/bin/mde-shell-egui",     mode = "755" },
-    # (the org.magicmesh.Shell.desktop launcher ships via the packaging/applications/*.desktop glob below)
+    # SEAT-BOOT-1 — the boot-to-seat face for the same shell. The unit self-gates
+    # on /var/lib/mde/role.toml role="workstation" and role-provision masks it
+    # on Lighthouse, so the base RPM can enable it without starting a shell on
+    # headless roles. The org.magicmesh.Shell.desktop launcher still ships via
+    # the packaging/applications/*.desktop glob below for session launches.
+    { source = "packaging/bootc/units/mde-shell-egui.service", dest = "/usr/lib/systemd/system/mde-shell-egui.service", mode = "644" },
     # BOOKMARKS-9 — the out-of-process, OS-sandboxed Servo browser helper
     # (BOOKMARKS-5). The shell spawns it per browser session; it renders offscreen
     # into a shared-memory frame the Browser surface uploads to an egui texture.
@@ -710,6 +715,10 @@ systemctl enable mesh-netdata-setup.service >/dev/null 2>&1 || :
 # (ConditionPathExists=!/var/lib/mde/role.toml) + takes tty1 only, so enabling
 # it everywhere is safe: a configured node skips it and getty owns tty1.
 systemctl enable magic-setup.service >/dev/null 2>&1 || :
+# SEAT-BOOT-1 — the DRM shell seat launcher. It is enabled everywhere in the
+# base RPM but only starts on role="workstation"; `mackesd onboard
+# role-provision` masks it on Lighthouse as a hard-off guard.
+systemctl enable mde-shell-egui.service >/dev/null 2>&1 || :
 # SELINUX-1 — load the local SELinux policy module so the node runs clean under
 # Enforcing (no AVC flood from mackesd's podman transition / libvirt /proc scans;
 # no repeating "SELinux security alert" toasts). Self-skips if SELinux is off.

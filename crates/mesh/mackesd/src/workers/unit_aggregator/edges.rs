@@ -38,7 +38,7 @@ use std::net::Ipv4Addr;
 use serde::{Deserialize, Serialize};
 
 use super::sources::{CloudKind, CloudObjectRecord, LanHostRecord, MeshSnapshot};
-use super::unit::{lan_unit_id, peer_unit_id};
+use super::unit::{lan_unit_id, peer_hostname, peer_unit_id};
 
 /// The pinned role token a lighthouse peer carries in the directory row.
 const LIGHTHOUSE_ROLE: &str = "lighthouse";
@@ -157,13 +157,17 @@ pub fn derive_edges(
 fn mesh_tunnels(mesh: &MeshSnapshot, out: &mut Vec<Edge>) {
     // Self is always a peer unit (lock #23); union it with the roster, deduped +
     // sorted so the endpoint order is deterministic.
-    let mut hosts: BTreeSet<&str> = mesh.peers.iter().map(|p| p.hostname.as_str()).collect();
-    hosts.insert(mesh.self_host.as_str());
+    let mut hosts: BTreeSet<&str> = mesh
+        .peers
+        .iter()
+        .map(|p| peer_hostname(&p.hostname))
+        .collect();
+    hosts.insert(peer_hostname(&mesh.self_host));
     let lighthouses: BTreeSet<&str> = mesh
         .peers
         .iter()
         .filter(|p| p.role.as_deref() == Some(LIGHTHOUSE_ROLE))
-        .map(|p| p.hostname.as_str())
+        .map(|p| peer_hostname(&p.hostname))
         .collect();
     let relay = lighthouses.iter().next().copied();
     let hosts: Vec<&str> = hosts.into_iter().collect();
@@ -426,6 +430,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(tunnels.len(), 1);
         assert_eq!(tunnels[0].detail.as_deref(), Some("direct"));
+    }
+
+    #[test]
+    fn mesh_tunnel_dedups_prefixed_unenrolled_self_edge() {
+        let m = mesh(
+            "localhost.localdomain",
+            vec![peer("peer:localhost.localdomain", None)],
+        );
+        let edges = derive_edges(&m, &[], &[]);
+        assert!(
+            edges.is_empty(),
+            "prefixed self row should not create peer:peer self-edge"
+        );
     }
 
     #[test]

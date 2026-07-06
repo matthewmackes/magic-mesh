@@ -63,12 +63,18 @@ impl Default for Priority {
 pub enum TopicError {
     #[error("topic name is empty")]
     Empty,
-    #[error("topic name `{0}` contains a wildcard character (`+` or `#`); wildcards are subscription-side only")]
+    #[error(
+        "topic name `{0}` contains a wildcard character (`+` or `#`); wildcards are subscription-side only"
+    )]
     WildcardInName(String),
     #[error("topic name `{0}` contains an empty segment (double slash or leading/trailing slash)")]
     EmptySegment(String),
-    #[error("topic name `{0}` contains an invalid character (allowed: `[A-Za-z0-9_-]` and `/` between segments)")]
+    #[error(
+        "topic name `{0}` contains an invalid character (allowed: `[A-Za-z0-9_.-]` and `/` between segments)"
+    )]
     InvalidChar(String),
+    #[error("topic name `{0}` contains a path traversal segment")]
+    PathTraversal(String),
     #[error("topic name `{0}` is longer than {1} bytes")]
     TooLong(String, usize),
 }
@@ -119,7 +125,11 @@ impl Registry {
         if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
             return Err(TopicError::EmptySegment(name.to_string()));
         }
-        let ok_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '/';
+        if name.split('/').any(|seg| seg == "." || seg == "..") || name.contains("..") {
+            return Err(TopicError::PathTraversal(name.to_string()));
+        }
+        let ok_char =
+            |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/';
         if !name.chars().all(ok_char) {
             return Err(TopicError::InvalidChar(name.to_string()));
         }
@@ -247,8 +257,22 @@ mod tests {
             Registry::validate_publish_name("fleet/sec!"),
             Err(TopicError::InvalidChar(_))
         ));
-        // Underscore + dash + digits are allowed.
+        // Underscore + dash + digits + DNS hostname dots are allowed.
         assert!(Registry::validate_publish_name("fleet/sec-1_a").is_ok());
+        assert!(Registry::validate_publish_name("audit/localhost.localdomain").is_ok());
+        assert!(Registry::validate_publish_name("peer/localhost.localdomain/alerts").is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_path_traversal_dots() {
+        assert!(matches!(
+            Registry::validate_publish_name("audit/../escape"),
+            Err(TopicError::PathTraversal(_))
+        ));
+        assert!(matches!(
+            Registry::validate_publish_name("audit/localhost..localdomain"),
+            Err(TopicError::PathTraversal(_))
+        ));
     }
 
     #[test]
