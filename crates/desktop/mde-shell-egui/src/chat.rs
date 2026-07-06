@@ -2199,6 +2199,26 @@ fn publish_mute(bus_root: Option<&Path>, target: &str, id: &str, muted: bool) {
     publish(bus_root, ACTION_CHAT_MUTE, &body);
 }
 
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn local_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "local".to_string())
+}
+
 /// Fire the voice worker's dial verb for `host` (lock 15 — Call hands off to
 /// `mde-voice`). The publish is reachable now; a running SIP agent draining it +
 /// the live register/call is integration-gated.
