@@ -1,7 +1,8 @@
 # BUILD-PLATFORM-7 — the nightly internal test pyramid (L1 install + L2 feature +
-# L3 stability) on the snapshot-reset VM pool. Off the critical path; results→Bus.
+# L3 stability + L4 lighthouse replacement) on the snapshot-reset VM pool. Off
+# the critical path; results→Bus.
 [Unit]
-Description=MCNF nightly internal tests (install + feature + stability)
+Description=MCNF nightly internal tests (install + feature + stability + lighthouse)
 After=network-online.target
 Wants=network-online.target
 [Service]

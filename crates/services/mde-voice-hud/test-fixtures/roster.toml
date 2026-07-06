@@ -2,8 +2,7 @@
 #
 # Used when the live Bus topic `mesh/roster` is not reachable (e.g.,
 # `cargo run -p mde-voice-hud` outside a fully-booted mded session).
-# Matches the 8-peer fixture from the design bundle for parity with
-# the Claude Design reference.
+# Matches the design-bundle fixture for parity with the locked roster layout.
 #
 # Per VOIP-27 acceptance: Peers tab renders these rows when the Bus
 # subscription returns no data. The fixture path is determined at

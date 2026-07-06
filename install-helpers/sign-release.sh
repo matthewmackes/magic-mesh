@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# EFF-30 — operator-gated release signing (run by /release, never CI).
+# EFF-30 — operator-gated release signing (manual, never CI).
 #
 # Signs the built RPM with the project GPG key (EFF-17 — public half
 # committed at packaging/repo/RPM-GPG-KEY-magic-mesh; private half in

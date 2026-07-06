@@ -144,6 +144,15 @@ fn min_version(a: &str, b: &str) -> String {
 /// list).
 pub const CLIENT_NAME: &str = "mde-music";
 
+/// Active-active media DNS endpoint written by `mackesd` on each node.
+pub const MUSIC_READ_HOST: &str = "music.mesh";
+
+/// Deterministic single-writer media DNS endpoint for playlist mutations.
+pub const MUSIC_WRITER_HOST: &str = "music-writer.mesh";
+
+/// Optional override for nonstandard media deployments.
+pub const MUSIC_WRITER_URL_ENV: &str = "MDE_MUSIC_WRITER_URL";
+
 /// `token = md5(password + salt)`, lower-hex. The Subsonic auth scheme
 /// (avoids sending the password in clear on every request).
 #[must_use]
@@ -420,6 +429,17 @@ impl Client {
     /// Build the full URL for `view` with `extra` query params appended.
     #[must_use]
     pub fn endpoint_url(&self, view: &str, extra: &[(&str, &str)]) -> String {
+        self.endpoint_url_at_base(&self.base_url, view, extra)
+    }
+
+    /// Build the full URL for `view` against an explicit base URL.
+    #[must_use]
+    pub fn endpoint_url_at_base(
+        &self,
+        base_url: &str,
+        view: &str,
+        extra: &[(&str, &str)],
+    ) -> String {
         let mut params = self.query_params();
         for (k, v) in extra {
             params.push(((*k).to_string(), (*v).to_string()));
@@ -429,7 +449,29 @@ impl Client {
             .map(|(k, v)| format!("{}={}", k, urlencode(v)))
             .collect::<Vec<_>>()
             .join("&");
-        format!("{}/rest/{view}?{query}", self.base_url)
+        format!("{}/rest/{view}?{query}", base_url.trim_end_matches('/'))
+    }
+
+    /// MEDIA-6 — playlist writes must land on one durable writer instead of the
+    /// active-active read endpoint. The default autoconfig URL is
+    /// `music.mesh`; swap only that host to `music-writer.mesh`. Manual/legacy
+    /// URLs keep their original base unless the operator provides
+    /// [`MUSIC_WRITER_URL_ENV`].
+    #[must_use]
+    pub fn playlist_writer_base_url(&self) -> String {
+        if let Ok(override_url) = std::env::var(MUSIC_WRITER_URL_ENV) {
+            let trimmed = override_url.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        self.base_url.replace(MUSIC_READ_HOST, MUSIC_WRITER_HOST)
+    }
+
+    /// Build a URL for a playlist mutation against the deterministic writer.
+    #[must_use]
+    pub fn playlist_writer_endpoint_url(&self, view: &str, extra: &[(&str, &str)]) -> String {
+        self.endpoint_url_at_base(&self.playlist_writer_base_url(), view, extra)
     }
 
     /// Direct stream URL for a song id (the playback engine + cache
@@ -457,7 +499,16 @@ impl Client {
     /// # Errors
     /// Transport, API-error, or parse failures.
     pub async fn get(&self, view: &str, extra: &[(&str, &str)]) -> Result<Value, AirsonicError> {
-        let body = self.fetch_body(view, extra).await?;
+        self.get_at_base(&self.base_url, view, extra).await
+    }
+
+    async fn get_at_base(
+        &self,
+        base_url: &str,
+        view: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<Value, AirsonicError> {
+        let body = self.fetch_body_at_base(base_url, view, extra).await?;
         match unwrap_envelope(&body) {
             Err(AirsonicError::Api {
                 code: ERR_INCOMPATIBLE_VERSION,
@@ -495,7 +546,7 @@ impl Client {
                 }
                 if changed {
                     // Retry with the negotiated version (it sticks for later calls).
-                    let body2 = self.fetch_body(view, extra).await?;
+                    let body2 = self.fetch_body_at_base(base_url, view, extra).await?;
                     unwrap_envelope(&body2)
                 } else {
                     unwrap_envelope(&body)
@@ -505,11 +556,13 @@ impl Client {
         }
     }
 
-    /// GET `view` and parse the JSON envelope body (no status interpretation).
-    /// Split out so [`get`](Self::get) can re-issue a request after negotiating
-    /// the API version down (NOTIFY/AIR — Airsonic error 30 compatibility).
-    async fn fetch_body(&self, view: &str, extra: &[(&str, &str)]) -> Result<Value, AirsonicError> {
-        let url = self.endpoint_url(view, extra);
+    async fn fetch_body_at_base(
+        &self,
+        base_url: &str,
+        view: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<Value, AirsonicError> {
+        let url = self.endpoint_url_at_base(base_url, view, extra);
         let resp = self
             .http
             .get(&url)
@@ -749,12 +802,16 @@ impl Client {
         Ok(parse_podcast_episodes(&inner))
     }
 
-    /// `getPlaylists` — the server's playlists (AIR-4.b Playlists tile).
+    /// `getPlaylists` — the shared writer's playlists (AIR-4.b Playlists tile).
+    /// MEDIA-6 keeps playlist reads on the same deterministic endpoint as
+    /// mutations so per-instance Navidrome SQLite cannot split visible state.
     ///
     /// # Errors
     /// Transport / API / parse failures.
     pub async fn get_playlists(&self) -> Result<Vec<Playlist>, AirsonicError> {
-        let inner = self.get("getPlaylists", &[]).await?;
+        let inner = self
+            .get_at_base(&self.playlist_writer_base_url(), "getPlaylists", &[])
+            .await?;
         Ok(parse_playlists(&inner))
     }
 
@@ -836,7 +893,13 @@ impl Client {
     /// # Errors
     /// Transport / API / parse failures.
     pub async fn get_playlist(&self, id: &str) -> Result<Vec<Song>, AirsonicError> {
-        let inner = self.get("getPlaylist", &[("id", id)]).await?;
+        let inner = self
+            .get_at_base(
+                &self.playlist_writer_base_url(),
+                "getPlaylist",
+                &[("id", id)],
+            )
+            .await?;
         Ok(parse_playlist_entries(&inner))
     }
 
@@ -853,7 +916,9 @@ impl Client {
     ) -> Result<(), AirsonicError> {
         let mut extra: Vec<(&str, &str)> = vec![("name", name)];
         extra.extend(song_ids.iter().map(|s| ("songId", s.as_str())));
-        self.get("createPlaylist", &extra).await.map(|_| ())
+        self.get_at_base(&self.playlist_writer_base_url(), "createPlaylist", &extra)
+            .await
+            .map(|_| ())
     }
 
     /// MUSIC-RFX-3 — `updatePlaylist?playlistId=` — rename (`name`), add tracks
@@ -878,7 +943,9 @@ impl Client {
                 .iter()
                 .map(|s| ("songIndexToRemove", s.as_str())),
         );
-        self.get("updatePlaylist", &extra).await.map(|_| ())
+        self.get_at_base(&self.playlist_writer_base_url(), "updatePlaylist", &extra)
+            .await
+            .map(|_| ())
     }
 
     /// MUSIC-RFX-6b — reorder a playlist **in place**, preserving its id.
@@ -912,7 +979,13 @@ impl Client {
     /// # Errors
     /// Transport / API / parse failures.
     pub async fn delete_playlist(&self, id: &str) -> Result<(), AirsonicError> {
-        self.get("deletePlaylist", &[("id", id)]).await.map(|_| ())
+        self.get_at_base(
+            &self.playlist_writer_base_url(),
+            "deletePlaylist",
+            &[("id", id)],
+        )
+        .await
+        .map(|_| ())
     }
 
     /// `getLyricsBySongId` (OpenSubsonic) — lyrics for a song, flattened to
@@ -1272,6 +1345,12 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     #[test]
     fn error30_envelope_detected_in_raw_bytes() {
@@ -1367,7 +1446,7 @@ mod tests {
         assert_eq!(cmp_version("1.13.0", "1.16.1"), Ordering::Less);
         assert_eq!(cmp_version("1.16.1", "1.16.1"), Ordering::Equal);
         assert_eq!(cmp_version("1.9.0", "1.10.0"), Ordering::Less); // numeric, not lexical
-                                                                    // min_version never exceeds either input.
+        // min_version never exceeds either input.
         assert_eq!(min_version("1.16.1", "1.13.0"), "1.13.0");
         assert_eq!(min_version("1.13.0", "1.16.1"), "1.13.0");
         // A server that reports a newer version than our ceiling is clamped to us.
@@ -1395,6 +1474,39 @@ mod tests {
         assert!(u.starts_with("http://h:4040/rest/getArtists?"));
         // No double slash from the trimmed base.
         assert!(!u.contains(":4040//rest"));
+    }
+
+    #[test]
+    fn playlist_writer_url_uses_single_writer_alias_for_music_mesh() {
+        let _guard = env_lock();
+        std::env::remove_var(MUSIC_WRITER_URL_ENV);
+        let c = Client::with_salt("http://music.mesh:4533", "alice", "pw", "abc");
+        assert_eq!(
+            c.playlist_writer_base_url(),
+            "http://music-writer.mesh:4533"
+        );
+        let u = c.playlist_writer_endpoint_url("createPlaylist", &[("name", "Roadtrip")]);
+        assert!(u.starts_with("http://music-writer.mesh:4533/rest/createPlaylist?"));
+        assert!(u.contains("name=Roadtrip"));
+        let list = c.playlist_writer_endpoint_url("getPlaylists", &[]);
+        assert!(list.starts_with("http://music-writer.mesh:4533/rest/getPlaylists?"));
+    }
+
+    #[test]
+    fn playlist_writer_url_leaves_manual_servers_alone_without_override() {
+        let _guard = env_lock();
+        std::env::remove_var(MUSIC_WRITER_URL_ENV);
+        let c = Client::with_salt("http://airsonic.local:4040", "alice", "pw", "abc");
+        assert_eq!(c.playlist_writer_base_url(), "http://airsonic.local:4040");
+    }
+
+    #[test]
+    fn playlist_writer_url_accepts_operator_override() {
+        let _guard = env_lock();
+        std::env::set_var(MUSIC_WRITER_URL_ENV, "http://writer.example:4533/");
+        let c = Client::with_salt("http://music.mesh:4533", "alice", "pw", "abc");
+        assert_eq!(c.playlist_writer_base_url(), "http://writer.example:4533");
+        std::env::remove_var(MUSIC_WRITER_URL_ENV);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! VOIP-28 — pure-Rust SIP signaling for the softphone (NOT PJSIP, per
-//! CLAUDE.md §1's pure-Rust lock; operator decision 2026-06-07).
+//! AI_GOVERNANCE.md §4's pure-Rust toolkit lock; operator decision 2026-06-07).
 //!
 //! Slice 1: a SIP account loaded from `~/.config/mde/voice/account.toml` and a
 //! real `REGISTER` over UDP with RFC 2617 / RFC 7616 digest auth. Requests are

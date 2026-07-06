@@ -197,6 +197,8 @@ pub mod health_reconciler;
 // 30 s cadence; the renderer (metrics::write_textfile) existed with
 // no production caller until this worker.
 pub mod metrics_exporter;
+// MEDIA-3 — exact-role-gated Navidrome supervisor for Lighthouse_Media.
+pub mod media_navidrome;
 // EFF-20 — timeout-bounded subprocess execution shared by the workers
 // that shell out on a tick, so a hung child can't pin a runtime thread.
 pub mod proc;

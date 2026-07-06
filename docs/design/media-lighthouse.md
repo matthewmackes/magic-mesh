@@ -62,8 +62,14 @@ lighthouse leaves music reachable.
 - **Active-active + `music.mesh`** — `mesh_dns` publishes an A-record set of all
   media-lighthouse overlay IPs; the `mde-musicd` browse retry (MUSIC-RESPONSIVE-1)
   + client reconnect handle a dead instance.
-- **Shared service account** — auto-provisioned in Navidrome at first start;
-  password is a leader-managed secret distributed inside the birthright creds.
+- **Single playlist writer + `music-writer.mesh`** — browse/stream reads use
+  active-active `music.mesh`; playlist reads and mutations use one deterministic
+  writer alias so per-instance SQLite does not split the shared account's
+  playlists.
+- **Shared service account** — auto-provisioned in Navidrome at first start by
+  a local oneshot that verifies login before calling `/createAdmin`; password is
+  a leader-managed secret distributed inside the birthright creds and is not put
+  on process argv.
 - **Auto-config (the headline)** — `mackesd` writes `airsonic-creds.json`
   (`music.mesh:4533` + shared account) at enroll, and the service is registered
   so already-enrolled nodes self-configure. mde-musicd then uses it by default;
@@ -89,14 +95,15 @@ lighthouse leaves music reachable.
   bucket.
 - **Tiny-node protection** — the whole reason for `Lighthouse_Media`; never let
   the container land on the 947 MB master (netdata-thrash memory).
-- **Spaces S3 creds** — must be a leader-managed encrypted secret, never in
-  `ps`/logs/env (mirror EFF-21 + XCP-7).
+- **Spaces S3 creds + music account password** — must be leader-managed
+  encrypted secrets, never in process argv or logs (mirror EFF-21 + XCP-7).
 - **DNS failover sharpness** — A-record round-robin fails over only as fast as
   clients retry; the MUSIC-RESPONSIVE-1 retry + reconnect cover it, but verify
   the user-visible gap on an instance kill.
-- **Shared-account write contention** — playlists written from two instances
-  concurrently; per-instance SQLite means playlist writes must land on the
-  shared store or a designated writer. Resolve in MEDIA-6/MEDIA-3.
+- **Shared-account write contention** — playlists are routed to a designated
+  writer (`music-writer.mesh`) because Navidrome keeps playlist state in
+  per-instance SQLite. Validate live that reads after writes hit the writer or
+  otherwise converge acceptably for the shared-account UX.
 
 ## Out of scope (this epic)
 

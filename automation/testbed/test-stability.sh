@@ -31,8 +31,33 @@ for ip in "$A" "$B"; do
   for t in $(seq 1 24); do timeout 3 bash -c "cat </dev/null >/dev/tcp/$ip/22" 2>/dev/null && break; sleep 5; done
   scp -i "$KEY" $SSHO "$RPM" "mm@$ip:/tmp/mm.rpm" >/dev/null 2>&1
   on "$ip" "sudo dnf install -y /tmp/mm.rpm" >/dev/null 2>&1
-  on "$ip" "sudo systemctl start mackesd 2>/dev/null || true" >/dev/null 2>&1
 done
+
+# Bring up a minimal real mesh before measuring daemon stability. Starting
+# mackesd on an unenrolled image can legitimately leave no long-running daemon,
+# which made the old RSS check read 0 KiB and test nothing.
+check "found a stability mesh on node A"            on "$A" "sudo mackesd found l3test --external-addr ${A}:4242 --role lighthouse"
+ADD_PEER_OUT="$(on "$A" "sudo mackesd add-peer --lighthouse ${A} --role server 2>&1" | tr -d '\r' || true)"
+TOKEN="$(printf '%s\n' "$ADD_PEER_OUT" | grep -E '^mesh:' | tail -1)"
+check "stability add-peer minted a join token"      test -n "$TOKEN"
+on "$A" "sudo systemctl enable --now mackesd" >/dev/null 2>&1
+for t in $(seq 1 15); do on "$A" "ip -4 addr show | grep -q 10.42" && break; sleep 3; done
+check "node A overlay is up for stability"          on "$A" "ip -4 addr show | grep -q 10.42"
+JOIN_OUT="$(on "$B" "sudo mackesd join '$TOKEN' --role server 2>&1" | tr -d '\r' || true)"
+JOIN_OK=0
+printf '%s\n' "$JOIN_OUT" | grep -q 'joined `' && JOIN_OK=1
+check "node B joins the stability mesh"             test "$JOIN_OK" -eq 1
+if [ "$JOIN_OK" -ne 1 ]; then
+  echo "  DIAG  join output on B:"
+  printf '%s\n' "$JOIN_OUT" | sed -n '1,80p'
+  echo "  DIAG  B service/config state:"
+  on "$B" "systemctl --no-pager -l status nebula mackesd 2>&1 | sed -n '1,120p'; sudo ls -l /etc/nebula /var/lib/mackesd 2>&1 | sed -n '1,80p'" || true
+fi
+on "$B" "sudo systemctl enable --now mackesd" >/dev/null 2>&1
+for t in $(seq 1 15); do on "$B" "ip -4 addr show | grep -q 10.42" && break; sleep 3; done
+check "node B overlay is up for stability"          on "$B" "ip -4 addr show | grep -q 10.42"
+for t in $(seq 1 30); do on "$A" "ping -c1 -W2 10.42.0.2 >/dev/null 2>&1" && break; sleep 2; done
+check "stability mesh overlay is reachable"         on "$A" "ping -c1 -W2 10.42.0.2 >/dev/null 2>&1"
 
 # soak — RSS should plateau, not climb, under repeated bus traffic.
 echo "-- soak (footprint plateau) --"

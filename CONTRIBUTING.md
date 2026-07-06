@@ -31,9 +31,9 @@ sudo dnf install -y gcc gcc-c++ cmake mold pkg-config \
   file header).
 - The vendored Opus tree needs `CMAKE_POLICY_VERSION_MINIMUM=3.5`;
   `.cargo/config.toml` sets it, CI sets it explicitly.
-- All 22 crates are workspace members; nothing is excluded from the build.
+- All 24 crates are workspace members; nothing is excluded from the build.
 - **Offload heavy/parallel builds to the farm:** `install-helpers/xcp-build.sh
-  cargo …` (builds on `172.20.0.50`); status via `install-helpers/farm.sh status`.
+  cargo …` (routes to the farm); status via `install-helpers/farm.sh status`.
 
 ## Test rules
 
@@ -90,7 +90,7 @@ floor, and a CycloneDX SBOM artifact.
 
 Small, scoped, individually runtime-reachable + stub-free (§7). Why-not-what
 messages. Pushing and releasing are operator-gated — don't push from
-automation; the RPM cut is `/release` only.
+automation; RPM cuts stay operator-gated.
 
 ## Where things live
 

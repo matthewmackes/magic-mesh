@@ -24,8 +24,8 @@
 //! informal notation meaning "different requests have different
 //! correlation ULIDs," not literal topic content. This worker locks
 //! the Bus-convention interpretation. (Standing-auth best-choice
-//! decision per CLAUDE.md §0 Q83; flagged in worklist follow-up so
-//! the design doc gets amended in a separate commit.)
+//! decision recorded in governance/worklist follow-up so the design
+//! doc gets amended in a separate commit.)
 //!
 //! ## Outcomes
 //!

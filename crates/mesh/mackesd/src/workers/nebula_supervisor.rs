@@ -497,6 +497,41 @@ pub fn render_guest_config_yaml(bundle: &crate::ca::bundle::NebulaBundle) -> Str
     render_config_yaml_inner(bundle, ConfigRole::Peer, false, &[], &[])
 }
 
+fn external_addr_host_is_numeric(addr: &str) -> bool {
+    let host = addr
+        .rsplit_once(':')
+        .map_or(addr, |(host, _port)| host)
+        .trim_matches(['[', ']']);
+    host.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn unique_lighthouse_static_maps<'a>(
+    bundle: &'a crate::ca::bundle::NebulaBundle,
+) -> Vec<&'a crate::ca::bundle::LighthouseEntry> {
+    let mut entries: Vec<&crate::ca::bundle::LighthouseEntry> = Vec::new();
+    for lh in &bundle.lighthouses {
+        // Never map ourselves — a lighthouse that lists its own overlay
+        // IP here tries to handshake itself ("Refusing to handshake with
+        // myself"). Bug #3, found on the VM bed 2026-06-10.
+        if lh.overlay_ip == bundle.overlay_ip {
+            continue;
+        }
+        if let Some(existing) = entries
+            .iter()
+            .position(|existing| existing.overlay_ip == lh.overlay_ip)
+        {
+            if !external_addr_host_is_numeric(&entries[existing].external_addr)
+                && external_addr_host_is_numeric(&lh.external_addr)
+            {
+                entries[existing] = lh;
+            }
+            continue;
+        }
+        entries.push(lh);
+    }
+    entries
+}
+
 fn render_config_yaml_inner(
     bundle: &crate::ca::bundle::NebulaBundle,
     role: ConfigRole,
@@ -525,13 +560,7 @@ fn render_config_yaml_inner(
         out.push('\n');
     }
     out.push_str("static_host_map:\n");
-    for lh in &bundle.lighthouses {
-        // Never map ourselves — a lighthouse that lists its own overlay
-        // IP here tries to handshake itself ("Refusing to handshake with
-        // myself"). Bug #3, found on the VM bed 2026-06-10.
-        if lh.overlay_ip == bundle.overlay_ip {
-            continue;
-        }
+    for lh in unique_lighthouse_static_maps(bundle) {
         out.push_str(&format!(
             "  \"{}\": [\"{}\"]\n",
             lh.overlay_ip, lh.external_addr,
@@ -545,8 +574,11 @@ fn render_config_yaml_inner(
         ConfigRole::Peer => {
             out.push_str("  am_lighthouse: false\n");
             out.push_str("  hosts:\n");
+            let mut seen = std::collections::BTreeSet::new();
             for lh in &bundle.lighthouses {
-                out.push_str(&format!("    - \"{}\"\n", lh.overlay_ip));
+                if seen.insert(&lh.overlay_ip) {
+                    out.push_str(&format!("    - \"{}\"\n", lh.overlay_ip));
+                }
             }
         }
     }
@@ -823,6 +855,36 @@ mod tests {
         let yaml = render_config_yaml(&sample_bundle(), ConfigRole::Peer);
         assert!(yaml.contains("am_lighthouse: false"));
         assert!(yaml.contains("\"10.42.0.1\""));
+    }
+
+    #[test]
+    fn duplicate_lighthouse_rows_render_one_static_map_preferring_numeric_addr() {
+        let mut b = sample_bundle();
+        b.lighthouses.push(LighthouseEntry {
+            node_id: "peer:lh1".into(),
+            overlay_ip: "10.42.0.1".into(),
+            external_addr: "203.0.113.7:4242".into(),
+        });
+
+        let yaml = render_config_yaml(&b, ConfigRole::Peer);
+        assert_eq!(
+            yaml.matches("  \"10.42.0.1\":").count(),
+            1,
+            "static_host_map must not emit duplicate YAML keys:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("203.0.113.7:4242"),
+            "numeric underlay address should win over hostname fallback:\n{yaml}"
+        );
+        assert!(
+            !yaml.contains("lh1.example.com:4242"),
+            "hostname fallback must not survive as duplicate static_host_map:\n{yaml}"
+        );
+        assert_eq!(
+            yaml.matches("    - \"10.42.0.1\"").count(),
+            1,
+            "lighthouse.hosts should be deduped too:\n{yaml}"
+        );
     }
 
     #[test]

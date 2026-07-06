@@ -20,8 +20,7 @@
 //!   (KDC2-2 acceptance) live next to the code they exercise
 //!   without dragging in tokio + zbus + rustls just to run a
 //!   fuzz iteration.
-//! - Strict layer boundaries per
-//!   `~/.claude/projects/.../memory/project_v2_1_kdc2_native.md`:
+//! - Strict layer boundaries per the current KDC2 layering lock:
 //!   `Protocol → Router → Daemon API → Surface`. The protocol
 //!   layer never knows the mesh or peer-card exist.
 //!

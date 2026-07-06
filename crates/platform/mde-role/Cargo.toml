@@ -1,6 +1,6 @@
 [package]
 name        = "mde-role"
-description = "Mackes Workstation pinned deployment role (Lighthouse ⊂ Server ⊂ Workstation) + the upgrade-only /var/lib/mde/role.toml loader (E1.1)."
+description = "Mackes Workstation pinned deployment role (Lighthouse ⊂ Lighthouse_Media ⊂ Server ⊂ Workstation) + the upgrade-only /var/lib/mde/role.toml loader (E1.1)."
 version.workspace      = true
 edition.workspace      = true
 rust-version.workspace = true

@@ -668,14 +668,15 @@ pub async fn build_reply(svc: &NebulaStatusService, verb: &str, body: Option<&st
             json!({ "ok": ok, "message": message }).to_string()
         }
         // RETIRE-PY.7 — the Service-Publishing panel's summary (was a
-        // `python3 -c mackes.mesh_nebula` shell-out). Pure read: the 7 canonical
-        // services × this peer's overlay IP.
+        // `python3 -c mackes.mesh_nebula` shell-out). Pure read: the canonical
+        // services × this peer's overlay IP, plus role-specific mesh services.
         "published-services" => build_published_services(),
         other => json!({ "error": format!("unknown nebula verb: {other}") }).to_string(),
     }
 }
 
-/// The canonical Nebula-published services: `(id, display, default-port, proto)`.
+/// The canonical Nebula-published fabric services:
+/// `(id, display, default-port, proto)`.
 /// Mirrors the v1.x `mackes.mesh_nebula.CANONICAL_SERVICES` tuple.
 const CANONICAL_SERVICES: [(&str, &str, u16, &str); 7] = [
     ("ssh", "SSH", 22, "tcp"),
@@ -687,13 +688,25 @@ const CANONICAL_SERVICES: [(&str, &str, u16, &str); 7] = [
     ("av", "Audio/video transport", 5004, "udp"),
 ];
 
+const MUSIC_SERVICE: (&str, &str, u16, &str) = ("music", "Music mesh endpoint", 4533, "tcp");
+
 /// Build the published-services summary JSON (one row per canonical service ×
-/// the current overlay IP; `is_publishable` = an overlay IP exists). Replaces
-/// the python `published_services_summary()` — same JSON list-of-rows shape the
-/// workbench `service_publishing` panel's `parse_summary` already expects.
+/// the current overlay IP; `is_publishable` = an overlay IP exists), with
+/// role-specific mesh endpoints added only when this node can serve them.
+/// Replaces the python `published_services_summary()` — same JSON list-of-rows
+/// shape the workbench `service_publishing` panel's `parse_summary` expects.
 fn build_published_services() -> String {
     let overlay = crate::voip_rtt::own_nebula_ip();
-    let rows: Vec<serde_json::Value> = CANONICAL_SERVICES
+    let class = mde_role::load_class().ok();
+    let rows = build_published_services_rows(overlay, class);
+    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn build_published_services_rows(
+    overlay: Option<String>,
+    class: Option<mde_role::RoleClass>,
+) -> Vec<serde_json::Value> {
+    let mut rows: Vec<serde_json::Value> = CANONICAL_SERVICES
         .iter()
         .map(|(id, name, port, proto)| {
             json!({
@@ -706,7 +719,18 @@ fn build_published_services() -> String {
             })
         })
         .collect();
-    serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
+    if class.is_some_and(|class| class.is_media_lighthouse()) {
+        let (id, name, port, proto) = MUSIC_SERVICE;
+        rows.push(json!({
+            "id": id,
+            "name": name,
+            "port": port,
+            "proto": proto,
+            "overlay_ip": "music.mesh",
+            "is_publishable": overlay.is_some(),
+        }));
+    }
+    rows
 }
 
 /// Run the Bus responder loop on the current thread, building a
@@ -1139,6 +1163,34 @@ mod tests {
             assert_eq!(parts[1], "nebula");
             assert_eq!(parts[2], verb);
         }
+    }
+
+    #[test]
+    fn published_services_add_music_only_for_media_lighthouse() {
+        let regular = build_published_services_rows(
+            Some("10.42.0.7".to_string()),
+            Some(mde_role::RoleClass::plain(mde_role::Role::Lighthouse)),
+        );
+        assert_eq!(regular.len(), 7);
+        assert!(!regular.iter().any(|row| row["id"] == "music"));
+
+        let media = build_published_services_rows(
+            Some("10.42.0.20".to_string()),
+            Some(mde_role::RoleClass {
+                role: mde_role::Role::Lighthouse,
+                media: true,
+            }),
+        );
+        assert_eq!(media.len(), 8);
+        let music = media
+            .iter()
+            .find(|row| row["id"] == "music")
+            .expect("music service row");
+        assert_eq!(music["name"], "Music mesh endpoint");
+        assert_eq!(music["port"], 4533);
+        assert_eq!(music["proto"], "tcp");
+        assert_eq!(music["overlay_ip"], "music.mesh");
+        assert_eq!(music["is_publishable"], true);
     }
 
     #[tokio::test]
