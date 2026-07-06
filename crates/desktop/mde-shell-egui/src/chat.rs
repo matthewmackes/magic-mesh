@@ -945,6 +945,7 @@ impl ChatState {
     fn notifications_pane(&mut self, ui: &mut egui::Ui) {
         let bus_root = self.bus_root.clone();
         let items = self.notification_items();
+        let unread = self.notifications_unread();
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("Notifications")
@@ -952,7 +953,12 @@ impl ChatState {
                     .size(Style::HEADING),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                mde_egui::muted_note(ui, format!("{} alerts", items.len()));
+                let count = if unread > 0 {
+                    format!("{unread} unread · {} alerts", items.len())
+                } else {
+                    format!("{} alerts", items.len())
+                };
+                mde_egui::muted_note(ui, count);
             });
         });
         mde_egui::muted_note(
@@ -3103,6 +3109,63 @@ mod tests {
         );
         state.seen.insert(NOTIFICATIONS_SEEN_KEY.to_string(), 1);
         assert_eq!(state.notifications_unread(), 2);
+    }
+
+    #[test]
+    fn notifications_lane_renders_and_opening_it_clears_session_unread() {
+        use mde_egui::egui::{Rect, pos2, vec2};
+
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+
+        let mut state = ChatState::default();
+        let mut roster = Roster::new("eagle");
+        roster.upsert(Contact::new("nyc3", NodeRole::Headless).with_presence(Presence::Online));
+        state.roster = Some(roster);
+
+        let mut fields = BTreeMap::new();
+        fields.insert("summary".to_string(), "disk critical".to_string());
+        let mut conv = Conversation::new("nyc3");
+        conv.insert(Message::new(
+            "nyc3",
+            20,
+            MessageKind::Alert {
+                severity: Severity::Critical,
+                flag: "storage".into(),
+                fields,
+                action_verb: None,
+            },
+        ));
+        state.convos.insert("nyc3".into(), conv);
+        state.seen.insert("nyc3".into(), 0);
+        state.seen.insert(NOTIFICATIONS_SEEN_KEY.to_string(), 0);
+        state.selected = Some(Selection::Notifications);
+        assert_eq!(state.notifications_unread(), 1);
+
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1024.0, 720.0))),
+            ..Default::default()
+        };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.push_id("shell-chat-notifications", |ui| state.show(ui));
+            });
+        });
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "the Notifications lane produced no draw primitives"
+        );
+        assert_eq!(
+            state.notifications_unread(),
+            0,
+            "opening the lane writes the session-only watermark"
+        );
+        assert_eq!(
+            state.total_unread(),
+            1,
+            "the Chat icon still counts the underlying host alert"
+        );
     }
 
     #[test]

@@ -1,0 +1,1 @@
+Redirecting to /chart.js@4.5.1/dist/chart.umd.min.js
