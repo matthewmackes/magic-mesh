@@ -442,13 +442,18 @@ case "${1:-}" in
     log "vendoring birthright blobs on the VM (off the local host)"
     remote "./install-helpers/vendor-birthright-blobs.sh"
     log "release build + generate-rpm on the VM (heavy — runs on XCP, not local)"
+    # BOOKMARKS-9 — mde-web-preview is intentionally excluded from the parent
+    # workspace because Servo's sqlite dependency conflicts with the mesh lock.
+    # The full RPM still ships /usr/bin/mde-web-preview, so build that separate
+    # workspace into the same target/release directory before generate-rpm.
+    remote "sudo dnf install -y --setopt=install_weak_deps=False clang llvm python3 fontconfig-devel freetype-devel harfbuzz-devel mesa-libEGL-devel mesa-libGL-devel mesa-libgbm-devel libxkbcommon-devel"
     # E12-3 DRM: after the workspace build, re-link mde-shell-egui with --features drm
     # so it owns the bare KMS/DRM seat (no Wayland compositor). The workspace build
     # compiles all dependencies; this one-crate rebuild only re-links the final binary.
     # + BOOKMARKS-6 `live-helper`: the RPM ships /usr/bin/mde-web-preview, so the
     # shipped shell must be able to spawn it — without this feature the Browser
     # surface is permanently the gated EmptyState (the live 2026-07-05 finding).
-    remote "cargo build --workspace --release && cargo build --release -p mde-shell-egui --features drm,live-helper && cargo generate-rpm -p crates/mesh/mackesd"
+    remote "cargo build --workspace --release && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release --locked --manifest-path crates/desktop/mde-web-preview/Cargo.toml && cargo build --release -p mde-shell-egui --features drm,live-helper && cargo generate-rpm -p crates/mesh/mackesd"
     mkdir -p "$ARTIFACTS"
     log "pulling RPM(s) → $ARTIFACTS"
     rsync -az -e "${SSH[*]}" "$DEST:$REMOTE_DIR/target/generate-rpm/*.rpm" "$ARTIFACTS/"
