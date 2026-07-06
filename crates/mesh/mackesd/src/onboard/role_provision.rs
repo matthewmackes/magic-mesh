@@ -260,6 +260,39 @@ mod tests {
         }
     }
 
+    #[test]
+    fn base_rpm_ships_and_enables_the_drm_seat_unit() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("mackesd Cargo.toml parses");
+        let rpm = &manifest["package"]["metadata"]["generate-rpm"];
+        let base_assets = rpm["assets"].as_array().expect("base assets array");
+        assert!(
+            base_assets.iter().any(|asset| {
+                asset["dest"].as_str() == Some("/usr/lib/systemd/system/mde-shell-egui.service")
+                    && asset["source"].as_str()
+                        == Some("packaging/bootc/units/mde-shell-egui.service")
+            }),
+            "base RPM must ship the DRM-seat unit"
+        );
+        assert!(
+            rpm["post_install_script"]
+                .as_str()
+                .expect("base post install script")
+                .contains("systemctl enable mde-shell-egui.service"),
+            "base RPM post-install must enable the self-gated seat unit"
+        );
+
+        let server_assets = rpm["variants"]["server"]["assets"]
+            .as_array()
+            .expect("server assets array");
+        assert!(
+            server_assets.iter().all(|asset| {
+                asset["dest"].as_str() != Some("/usr/lib/systemd/system/mde-shell-egui.service")
+            }),
+            "headless server RPM must not ship a seat unit without the shell binary"
+        );
+    }
+
     /// Fake manager: records every call and always succeeds.
     struct Recorder {
         calls: RefCell<Vec<(String, String)>>,
