@@ -27,9 +27,9 @@
 //! [`Delivery`]).
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use mde_bus::hooks::config::Priority;
@@ -38,11 +38,11 @@ use mde_chat::{
     Contact, Conversation, Message, MessageKind, NotifyPrefs, Presence, RoomDescriptor, RoomKind,
     Roster, Severity,
 };
-use mde_egui::egui::{self, Align, Color32, Layout, RichText, ScrollArea};
 use mde_egui::Style;
+use mde_egui::egui::{self, Align, Color32, Layout, RichText, ScrollArea};
 
 use crate::discovery::request_host_desktop;
-use crate::toast_bridge::{resolve_action, TOAST_TOPIC};
+use crate::toast_bridge::{TOAST_TOPIC, resolve_action};
 
 /// Poll cadence — matches the chat worker's own 2s tick so the roster and open
 /// conversation stay live without a cold-start wait.
@@ -74,6 +74,8 @@ const ACTION_CHAT_PRESENCE: &str = "action/chat/presence";
 /// `{target:"contact"|"room", id, muted}` — the worker updates its `NotifyPrefs`
 /// and republishes [`NOTIFY_TOPIC`].
 const ACTION_CHAT_MUTE: &str = "action/chat/mute";
+/// The UI's notification-policy verb for fields outside the mute target matrix.
+const ACTION_CHAT_NOTIFY_PREFS: &str = "action/chat/notify-prefs";
 /// The voice worker's dial verb (lock 15 — Call hands off to `mde-voice`). Chat is
 /// the launch point; a running SIP agent draining this is integration-gated.
 const ACTION_VOICE_DIAL: &str = "action/voice/dial";
@@ -108,11 +110,25 @@ fn room_key(id: &str) -> String {
     format!("room:{id}")
 }
 
+/// The in-memory unread watermark key for the aggregate Notifications lane. It is
+/// session-only UI state over the live per-host alert conversations.
+const NOTIFICATIONS_SEEN_KEY: &str = "__notifications__";
+
+/// One folded alert in the aggregate Notifications lane, carrying its originating
+/// contact alongside the message so host attribution survives aggregation.
+#[derive(Debug, Clone, Copy)]
+struct NotificationItem<'a> {
+    host: &'a str,
+    msg: &'a Message,
+}
+
 /// What the operator has open in the conversation pane: a 1:1 contact (its merged
 /// human+alert timeline) or a room (its shared log). A single selection so exactly
 /// one pane is open at a time (the ICQ single-window idiom on a DRM seat).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Selection {
+    /// Aggregate alert-only lane, newest-first across all host timelines.
+    Notifications,
     /// A contact host — its `dm:` ∪ `alert:` timeline.
     Contact(String),
     /// A room id — its `room:<id>` shared log.
@@ -428,6 +444,43 @@ impl ChatState {
         now.saturating_sub(seen)
     }
 
+    /// Alert messages folded across all host contacts, newest first. This is a
+    /// view over live contact timelines, not another persisted feed.
+    fn notification_items(&self) -> Vec<NotificationItem<'_>> {
+        let mut items: Vec<NotificationItem<'_>> = self
+            .convos
+            .iter()
+            .flat_map(|(host, conv)| {
+                conv.messages()
+                    .iter()
+                    .filter(|m| matches!(m.kind, MessageKind::Alert { .. }))
+                    .map(|msg| NotificationItem {
+                        host: host.as_str(),
+                        msg,
+                    })
+            })
+            .collect();
+        items.sort_by(|a, b| {
+            b.msg
+                .ts_unix_ms
+                .cmp(&a.msg.ts_unix_ms)
+                .then_with(|| b.host.cmp(a.host))
+                .then_with(|| b.msg.id.as_str().cmp(a.msg.id.as_str()))
+        });
+        items
+    }
+
+    /// Session-only unread count for the aggregate Notifications lane.
+    fn notifications_unread(&self) -> usize {
+        let now = self.notification_items().len();
+        let seen = self
+            .seen
+            .get(NOTIFICATIONS_SEEN_KEY)
+            .copied()
+            .unwrap_or(now);
+        now.saturating_sub(seen)
+    }
+
     /// The total unread across every contact **and** room — the count the shell's
     /// chrome unread indicator shows (NOTIFY-CHAT-6). Because Chat is the ONE
     /// notification interface, this is the whole-mesh unread tally (folded alerts +
@@ -470,6 +523,11 @@ impl ChatState {
             });
 
         match self.selected.clone() {
+            Some(Selection::Notifications) => {
+                let now = self.notification_items().len();
+                self.seen.insert(NOTIFICATIONS_SEEN_KEY.to_string(), now);
+                self.notifications_pane(ui);
+            }
             Some(Selection::Contact(host)) if roster.get(&host).is_some() => {
                 // Opening the pane marks it read (watermark → current length).
                 let now = self.convos.get(&host).map_or(0, Conversation::len);
@@ -573,6 +631,7 @@ impl ChatState {
     fn roster_rail(&mut self, ui: &mut egui::Ui, roster: &Roster) {
         // Self line, pinned at the top with its own presence (lock 17).
         self.self_line(ui, roster);
+        self.notifications_row(ui);
 
         ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -595,6 +654,51 @@ impl ChatState {
                 ui.add_space(Style::SP_S);
                 self.rooms_group(ui);
             });
+    }
+
+    /// Aggregate Notifications lane row pinned with the roster controls. It is a
+    /// session-only alert view; per-host timelines remain the durable source.
+    fn notifications_row(&mut self, ui: &mut egui::Ui) {
+        let unread = self.notifications_unread();
+        let selected = self.selected == Some(Selection::Notifications);
+        let label = if unread > 0 {
+            RichText::new("Notifications")
+                .color(Style::TEXT)
+                .size(Style::BODY)
+                .strong()
+        } else {
+            RichText::new("Notifications")
+                .color(Style::TEXT_DIM)
+                .size(Style::BODY)
+        };
+        let clicked = ui
+            .horizontal(|ui| {
+                ui.label(
+                    RichText::new("!")
+                        .color(Style::ACCENT)
+                        .size(Style::BODY)
+                        .strong(),
+                );
+                let clicked = ui.selectable_label(selected, label).clicked();
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if unread > 0 {
+                        ui.label(
+                            RichText::new(unread.to_string())
+                                .color(Style::ACCENT)
+                                .size(Style::SMALL)
+                                .strong(),
+                        );
+                    }
+                    mde_egui::muted_note(ui, "alerts");
+                });
+                clicked
+            })
+            .inner;
+        if clicked {
+            self.selected = Some(Selection::Notifications);
+            self.draft.clear();
+        }
+        ui.separator();
     }
 
     /// The Rooms group under the contact roster (NOTIFY-CHAT-5): the auto system
@@ -834,6 +938,93 @@ impl ChatState {
                     crate::session::empty_state(ui, "No messages", subtitle);
                 }
             });
+    }
+
+    /// The aggregate Notifications pane: folded alert messages only, newest first,
+    /// with inline controls for DND, minimum severity, and per-source mute.
+    fn notifications_pane(&mut self, ui: &mut egui::Ui) {
+        let bus_root = self.bus_root.clone();
+        let items = self.notification_items();
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Notifications")
+                    .color(Style::TEXT)
+                    .size(Style::HEADING),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                mde_egui::muted_note(ui, format!("{} alerts", items.len()));
+            });
+        });
+        mde_egui::muted_note(
+            ui,
+            "Session lane over host alert messages; open a contact for its full timeline.",
+        );
+        self.notification_controls(ui, &items);
+        ui.separator();
+
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if items.is_empty() {
+                    crate::session::empty_state(
+                        ui,
+                        "No notifications",
+                        "Folded system alerts from mesh hosts appear here as messages from their contacts.",
+                    );
+                    return;
+                }
+                for item in items {
+                    notification_row(ui, item, bus_root.as_deref());
+                    ui.add_space(Style::SP_XS);
+                }
+            });
+    }
+
+    /// Inline notification controls (NOTIF-10). These controls silence surfaces;
+    /// folded alerts still fill the feed and contact timelines.
+    fn notification_controls(&self, ui: &mut egui::Ui, items: &[NotificationItem<'_>]) {
+        ui.add_space(Style::SP_XS);
+        ui.horizontal_wrapped(|ui| {
+            let mut dnd = self.dnd_active();
+            if ui
+                .checkbox(&mut dnd, "Do Not Disturb")
+                .on_hover_text("Mute notification surfaces; the feed and Alerts pip still fill")
+                .changed()
+            {
+                self.set_dnd(dnd);
+            }
+
+            let current_threshold = self.notify_threshold();
+            let mut threshold = current_threshold;
+            egui::ComboBox::from_id_salt("chat-notify-threshold")
+                .selected_text(format!("Min {}", threshold.tag()))
+                .show_ui(ui, |ui| {
+                    for sev in [Severity::Info, Severity::Warning, Severity::Critical] {
+                        ui.selectable_value(&mut threshold, sev, sev.tag());
+                    }
+                });
+            if threshold != current_threshold {
+                self.set_notify_threshold(threshold);
+            }
+        });
+
+        let sources = notification_sources(items);
+        if !sources.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                mde_egui::muted_note(ui, "sources");
+                for source in sources {
+                    let mut muted = self.is_source_muted(&source);
+                    if ui
+                        .checkbox(&mut muted, source.as_str())
+                        .on_hover_text(format!("Mute {source} notification surfaces"))
+                        .changed()
+                    {
+                        publish_mute(self.bus_root.as_deref(), "source", &source, muted);
+                    }
+                }
+            });
+        }
+        ui.add_space(Style::SP_XS);
     }
 
     /// The message composer — a text field + Send that writes `action/chat/send`.
@@ -1157,6 +1348,50 @@ impl ChatState {
     fn is_room_muted(&self, id: &str) -> bool {
         self.notify.as_ref().is_some_and(|n| n.is_room_muted(id))
     }
+
+    /// Whether folded-alert source `source` is muted per the worker's published
+    /// policy.
+    fn is_source_muted(&self, source: &str) -> bool {
+        self.notify
+            .as_ref()
+            .is_some_and(|n| n.is_source_muted(source))
+    }
+
+    /// The current alert severity threshold from the worker mirror, or the
+    /// model's default before the first mirror arrives.
+    fn notify_threshold(&self) -> Severity {
+        self.notify
+            .as_ref()
+            .map_or_else(|| NotifyPrefs::new().threshold(), NotifyPrefs::threshold)
+    }
+
+    /// Post `action/chat/notify-prefs` to update the persisted alert threshold.
+    fn set_notify_threshold(&self, threshold: Severity) {
+        let body = serde_json::json!({ "threshold": threshold.tag() }).to_string();
+        publish(self.bus_root.as_deref(), ACTION_CHAT_NOTIFY_PREFS, &body);
+    }
+
+    /// Read the fleet-wide DND toggle. Missing Bus state honestly reads as off.
+    fn dnd_active(&self) -> bool {
+        self.bus_root
+            .as_deref()
+            .is_some_and(|root| mde_bus::dnd::load_default(root).active)
+    }
+
+    /// Write the fleet-wide DND toggle without dropping active topic snoozes.
+    fn set_dnd(&self, active: bool) {
+        let Some(root) = self.bus_root.as_deref() else {
+            return;
+        };
+        let existing = mde_bus::dnd::load_default(root);
+        let state = mde_bus::dnd::DndState {
+            active,
+            since_unix_ms: now_unix_ms(),
+            set_by_peer: local_hostname(),
+            snoozes: existing.snoozes,
+        };
+        let _ = mde_bus::dnd::save_default(root, &state);
+    }
 }
 
 /// MENU-2 (Contacts) — the shared top bar over the ICQ roster workspace.
@@ -1249,6 +1484,7 @@ mod menubar {
     /// The selected conversation's mute state, or `None` when nothing is open.
     fn selected_muted(state: &ChatState) -> Option<bool> {
         match state.selected.as_ref()? {
+            Selection::Notifications => None,
             Selection::Contact(host) => Some(state.is_contact_muted(host)),
             Selection::Room(id) => Some(state.is_room_muted(id)),
         }
@@ -1352,6 +1588,13 @@ mod menubar {
     /// when nothing is unread.
     fn mark_read_entries(state: &ChatState) -> Vec<Entry<MenuAction>> {
         let mut entries = Vec::new();
+        let notifications_unread = state.notifications_unread();
+        if notifications_unread > 0 {
+            entries.push(Entry::Item(Item::new(
+                MenuAction::MarkRead(Selection::Notifications),
+                format!("Notifications ({notifications_unread})"),
+            )));
+        }
         for host in state.convos.keys() {
             let unread = state.unread(host);
             if unread > 0 {
@@ -1509,6 +1752,12 @@ mod menubar {
     /// performs, so the menu and the pane can't diverge.
     fn mark_read(state: &mut ChatState, sel: &Selection) {
         match sel {
+            Selection::Notifications => {
+                let now = state.notification_items().len();
+                state
+                    .seen
+                    .insert(super::NOTIFICATIONS_SEEN_KEY.to_string(), now);
+            }
             Selection::Contact(host) => {
                 let now = state.convos.get(host).map_or(0, Conversation::len);
                 state.seen.insert(host.clone(), now);
@@ -1534,6 +1783,7 @@ mod menubar {
                     return;
                 };
                 let (target, id, muted) = match &sel {
+                    Selection::Notifications => return,
                     Selection::Contact(host) => {
                         ("contact", host.clone(), state.is_contact_muted(host))
                     }
@@ -1566,7 +1816,7 @@ mod menubar {
                             state.draft.clear();
                         }
                     }
-                    None => {}
+                    Some(Selection::Notifications) | None => {}
                 }
             }
             MenuAction::ClearUnread => {
@@ -1606,13 +1856,13 @@ mod menubar {
     #[cfg(test)]
     #[allow(clippy::panic)]
     mod tests {
-        use super::super::{alert_key, dm_key, ChatState, Selection};
+        use super::super::{ChatState, Selection, alert_key, dm_key};
         use super::{
-            build_menus, build_status, can_send, presence_tone, MenuAction, PresenceChoice,
+            MenuAction, PresenceChoice, build_menus, build_status, can_send, presence_tone,
         };
         use mde_chat::{Contact, Conversation, Message, NodeRole, Presence, Roster};
-        use mde_egui::menubar::Entry;
         use mde_egui::ChipTone;
+        use mde_egui::menubar::Entry;
 
         /// A roster with self ("eagle") + an online peer ("nyc3") and one unread
         /// message from that peer — the smallest live-looking state.
@@ -1813,8 +2063,8 @@ mod menubar {
 
         #[test]
         fn menu_bar_renders_headless() {
-            use mde_egui::egui::{self, pos2, vec2, Rect};
             use mde_egui::Style;
+            use mde_egui::egui::{self, Rect, pos2, vec2};
             let ctx = egui::Context::default();
             Style::install(&ctx);
             let state = ChatState::default();
@@ -2143,6 +2393,81 @@ fn message_body(ui: &mut egui::Ui, msg: &Message, bus_root: Option<&Path>) {
     }
 }
 
+/// Render one item in the aggregate Notifications lane. The lane is newest-first
+/// and alert-only; each row shows the originating host contact before the folded
+/// alert body so attribution is never lost.
+fn notification_row(ui: &mut egui::Ui, item: NotificationItem<'_>, bus_root: Option<&Path>) {
+    let MessageKind::Alert {
+        severity,
+        flag,
+        fields,
+        action_verb,
+    } = &item.msg.kind
+    else {
+        return;
+    };
+    let title = fields
+        .get("summary")
+        .or_else(|| fields.get("title"))
+        .map_or(flag.as_str(), String::as_str);
+    ui.group(|ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(item.host)
+                    .color(Style::TEXT)
+                    .size(Style::SMALL)
+                    .strong(),
+            );
+            ui.colored_label(
+                severity_color(*severity),
+                RichText::new(flag).size(Style::SMALL).strong(),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let hhmm = fmt_hh_mm(item.msg.ts_unix_ms);
+                if !hhmm.is_empty() {
+                    ui.label(
+                        RichText::new(hhmm)
+                            .color(Style::TEXT_DIM)
+                            .size(Style::SMALL),
+                    )
+                    .on_hover_text(fmt_full_datetime(item.msg.ts_unix_ms));
+                }
+            });
+        });
+        ui.colored_label(
+            severity_color(*severity),
+            RichText::new(title).size(Style::BODY).strong(),
+        );
+        for (k, v) in fields {
+            if k == "summary" || k == "title" {
+                continue;
+            }
+            mde_egui::field(ui, k, v, Style::TEXT_DIM);
+        }
+        if let Some(verb) = alert_nav_verb(action_verb.as_deref()) {
+            ui.horizontal(|ui| {
+                mde_egui::muted_note(ui, "actions");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Go to \u{2192}").clicked() {
+                        navigate_via_toast(bus_root, "chat", title, &verb);
+                    }
+                });
+            });
+        }
+    });
+}
+
+/// Unique folded-alert source flags present in the aggregate Notifications lane.
+fn notification_sources(items: &[NotificationItem<'_>]) -> Vec<String> {
+    let mut sources = BTreeSet::new();
+    for item in items {
+        if let MessageKind::Alert { flag, .. } = &item.msg.kind {
+            sources.insert(flag.clone());
+        }
+    }
+    sources.into_iter().collect()
+}
+
 /// The per-contact action bar under the conversation header: **Call** (SIP),
 /// **Remote Control** (VDI) — the two per-contact hand-offs of lock 15 — and a
 /// **Mute** toggle (NOTIFY-CHAT-5) that silences this contact's messages + alerts.
@@ -2330,7 +2655,7 @@ mod tests {
     /// Proves the surface actually draws over real model state (no demo data).
     #[test]
     fn surface_mounts_and_tessellates_over_real_state() {
-        use mde_egui::egui::{pos2, vec2, Rect};
+        use mde_egui::egui::{Rect, pos2, vec2};
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -2412,7 +2737,7 @@ mod tests {
     /// same CPU paint path the DRM runner drives.
     #[test]
     fn every_message_kind_renders_its_action() {
-        use mde_egui::egui::{pos2, vec2, Rect};
+        use mde_egui::egui::{Rect, pos2, vec2};
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -2562,7 +2887,7 @@ mod tests {
     /// rooms surface and open without a live display (no demo data).
     #[test]
     fn room_surfaces_in_the_roster_and_its_pane_tessellates() {
-        use mde_egui::egui::{pos2, vec2, Rect};
+        use mde_egui::egui::{Rect, pos2, vec2};
 
         let ctx = egui::Context::default();
         Style::install(&ctx);
@@ -2635,7 +2960,7 @@ mod tests {
     /// message. A non-positive time renders blank (never a fabricated "00:00").
     #[test]
     fn message_row_renders_a_timestamp() {
-        use mde_egui::egui::{pos2, vec2, Rect};
+        use mde_egui::egui::{Rect, pos2, vec2};
 
         // A known epoch: 1_700_000_000_000 ms = 2023-11-14 22:13:20 UTC.
         assert_eq!(fmt_hh_mm(1_700_000_000_000), "22:13");
@@ -2704,16 +3029,117 @@ mod tests {
         let mut state = ChatState::default();
         assert!(!state.is_contact_muted("nyc3"));
         assert!(!state.is_room_muted("ops"));
+        assert!(!state.is_source_muted("security"));
         let mut prefs = NotifyPrefs::new();
         prefs.mute_contact("nyc3");
         prefs.mute_room("ops");
+        prefs.mute_source("security");
         state.notify = Some(prefs);
         assert!(state.is_contact_muted("nyc3"));
         assert!(state.is_room_muted("ops"));
+        assert!(state.is_source_muted("security"));
         assert!(
             !state.is_contact_muted("fra1"),
             "an unmuted contact still rings"
         );
+        assert_eq!(state.notify_threshold(), Severity::Warning);
+    }
+
+    #[test]
+    fn notification_items_collect_newest_first_and_unique_sources() {
+        let mut state = ChatState::default();
+        let mut security_fields = BTreeMap::new();
+        security_fields.insert("summary".to_string(), "intrusion".to_string());
+        let mut nyc3 = Conversation::new("nyc3");
+        nyc3.insert(Message::new(
+            "nyc3",
+            20,
+            MessageKind::Alert {
+                severity: Severity::Critical,
+                flag: "security".into(),
+                fields: security_fields,
+                action_verb: None,
+            },
+        ));
+        let mut fra1 = Conversation::new("fra1");
+        fra1.insert(Message::new(
+            "fra1",
+            10,
+            MessageKind::Alert {
+                severity: Severity::Warning,
+                flag: "compute".into(),
+                fields: BTreeMap::new(),
+                action_verb: None,
+            },
+        ));
+        fra1.insert(Message::text("fra1", 30, "human line"));
+        let mut lh1 = Conversation::new("lh1");
+        lh1.insert(Message::new(
+            "lh1",
+            30,
+            MessageKind::Alert {
+                severity: Severity::Info,
+                flag: "security".into(),
+                fields: BTreeMap::new(),
+                action_verb: None,
+            },
+        ));
+        state.convos.insert("nyc3".into(), nyc3);
+        state.convos.insert("fra1".into(), fra1);
+        state.convos.insert("lh1".into(), lh1);
+
+        let items = state.notification_items();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].host, "lh1");
+        assert_eq!(items[1].host, "nyc3");
+        assert_eq!(
+            notification_sources(&items),
+            vec!["compute".to_string(), "security".to_string()]
+        );
+        assert_eq!(
+            state.notifications_unread(),
+            0,
+            "first sight is watermarked"
+        );
+        state.seen.insert(NOTIFICATIONS_SEEN_KEY.to_string(), 1);
+        assert_eq!(state.notifications_unread(), 2);
+    }
+
+    #[test]
+    fn notification_control_helpers_publish_and_persist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus_root = tmp.path().join("bus");
+        let state = ChatState {
+            bus_root: Some(bus_root.clone()),
+            ..ChatState::default()
+        };
+
+        state.set_notify_threshold(Severity::Critical);
+        publish_mute(Some(&bus_root), "source", "security", true);
+        let persist = Persist::open(bus_root.clone()).expect("persist");
+        let prefs_msgs = persist
+            .list_since(ACTION_CHAT_NOTIFY_PREFS, None)
+            .expect("notify prefs action");
+        assert_eq!(
+            prefs_msgs.last().and_then(|m| m.body.as_deref()),
+            Some(r#"{"threshold":"critical"}"#)
+        );
+        let mute_msgs = persist
+            .list_since(ACTION_CHAT_MUTE, None)
+            .expect("mute action");
+        assert_eq!(
+            mute_msgs.last().and_then(|m| m.body.as_deref()),
+            Some(r#"{"id":"security","muted":true,"target":"source"}"#)
+        );
+
+        assert!(!state.dnd_active());
+        state.set_dnd(true);
+        let dnd = mde_bus::dnd::load_default(&bus_root);
+        assert!(dnd.active);
+        assert!(dnd.since_unix_ms > 0);
+        assert!(!dnd.set_by_peer.is_empty());
+        state.set_dnd(false);
+        assert!(!mde_bus::dnd::load_default(&bus_root).active);
     }
 
     // ── MENU-2: the View feed filters + Unread Only ────────────────────────────

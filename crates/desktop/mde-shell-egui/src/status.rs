@@ -1,0 +1,1153 @@
+//! NOTIF-3 — the dock's compact health strip.
+//!
+//! The daemon owns event severity and segment rollups (`state/notify/segment/*`);
+//! the shell only renders the latest read-model: one local A-F grade pip plus the
+//! four count-free health pips Device · Mesh · Power · Alerts. Missing state is an
+//! honest dim baseline, never fabricated green. NOTIF-6's critical edge cue is
+//! also kept here so status has one shell-side code path.
+
+use std::time::{Duration, Instant};
+
+use mde_bus::persist::Persist;
+use mde_egui::egui::{self, FontId};
+use mde_egui::{GradeBand, Style};
+use mde_seat::{Battery, BatteryState, Probe, SeatSnapshot};
+use mde_theme::brand::icons::IconId;
+use serde::Deserialize;
+
+use crate::chrome::NodeGrades;
+use crate::dock::{Surface, icon_texture};
+
+const REFRESH: Duration = Duration::from_secs(2);
+const TOPIC_PREFIX: &str = "state/notify/segment/";
+const BATTERY_LOW: f64 = 20.0;
+const BATTERY_CRITICAL: f64 = 5.0;
+const CRITICAL_POLICY_OWN_SEAT: &str = "own-seat-light-show";
+const EDGE_PULSE_SECONDS: f32 = 2.4;
+const EDGE_PULSE_HALF_CYCLE_SECONDS: f32 = 0.24;
+const EDGE_HELD_W: f32 = 3.0;
+const EDGE_PULSE_W: f32 = 14.0;
+
+/// The four daemon-owned status segments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StatusSegment {
+    /// Local device/platform health.
+    Device,
+    /// Mesh/fleet/cloud health.
+    Mesh,
+    /// Power and energy posture.
+    Power,
+    /// Aggregate alert health.
+    Alerts,
+}
+
+impl StatusSegment {
+    /// Render order, top to bottom.
+    pub const ALL: [Self; 4] = [Self::Device, Self::Mesh, Self::Power, Self::Alerts];
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Device => "device",
+            Self::Mesh => "mesh",
+            Self::Power => "power",
+            Self::Alerts => "alerts",
+        }
+    }
+
+    const fn route(self) -> Surface {
+        match self {
+            Self::Device | Self::Power => Surface::System,
+            Self::Mesh => Surface::MeshView,
+            Self::Alerts => Surface::Chat,
+        }
+    }
+
+    const fn icon(self) -> IconId {
+        match self {
+            Self::Device => IconId::Settings,
+            Self::Mesh => IconId::MeshView,
+            Self::Power => IconId::BatteryBolt,
+            Self::Alerts => IconId::Chat,
+        }
+    }
+
+    fn topic(self) -> String {
+        format!("{TOPIC_PREFIX}{}", self.key())
+    }
+}
+
+/// A segment's latest rollup as published by the notify worker.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SegmentRollup {
+    /// The wire segment name.
+    pub segment: String,
+    /// `critical` / `warning` / `info`.
+    pub severity: String,
+    /// The source currently driving the segment's worst state.
+    pub source: String,
+    /// Human summary for expanded surfaces.
+    pub summary: String,
+    /// Host the worst event belongs to.
+    pub host: String,
+    /// Cross-node critical policy.
+    pub critical_policy: String,
+    /// Event timestamp.
+    pub ts_unix_ms: i64,
+}
+
+/// The pips the dock renders.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusSegments {
+    /// Latest Device rollup.
+    pub device: Option<SegmentRollup>,
+    /// Latest Mesh rollup.
+    pub mesh: Option<SegmentRollup>,
+    /// Latest Power rollup.
+    pub power: Option<SegmentRollup>,
+    /// Latest Alerts aggregate rollup.
+    pub alerts: Option<SegmentRollup>,
+    /// `true` once a poll was attempted.
+    pub seen: bool,
+}
+
+impl StatusSegments {
+    fn set(&mut self, segment: StatusSegment, rollup: Option<SegmentRollup>) {
+        match segment {
+            StatusSegment::Device => self.device = rollup,
+            StatusSegment::Mesh => self.mesh = rollup,
+            StatusSegment::Power => self.power = rollup,
+            StatusSegment::Alerts => self.alerts = rollup,
+        }
+    }
+
+    fn get(&self, segment: StatusSegment) -> Option<&SegmentRollup> {
+        match segment {
+            StatusSegment::Device => self.device.as_ref(),
+            StatusSegment::Mesh => self.mesh.as_ref(),
+            StatusSegment::Power => self.power.as_ref(),
+            StatusSegment::Alerts => self.alerts.as_ref(),
+        }
+    }
+}
+
+/// Polls `state/notify/segment/*` for the dock.
+#[derive(Debug)]
+pub struct StatusState {
+    bus_root: Option<std::path::PathBuf>,
+    segments: StatusSegments,
+    last_poll: Option<Instant>,
+}
+
+impl Default for StatusState {
+    fn default() -> Self {
+        Self {
+            bus_root: mde_bus::client_data_dir(),
+            segments: StatusSegments::default(),
+            last_poll: None,
+        }
+    }
+}
+
+impl StatusState {
+    /// Test seam.
+    #[cfg(test)]
+    fn with_bus_root(bus_root: std::path::PathBuf) -> Self {
+        Self {
+            bus_root: Some(bus_root),
+            segments: StatusSegments::default(),
+            last_poll: None,
+        }
+    }
+
+    /// Poll the local Bus mirror, self-gated to a cheap cadence.
+    pub fn poll(&mut self, ctx: &egui::Context) {
+        if self.last_poll.is_some_and(|t| t.elapsed() < REFRESH) {
+            return;
+        }
+        self.last_poll = Some(Instant::now());
+        let Some(root) = &self.bus_root else {
+            self.segments.seen = true;
+            ctx.request_repaint_after(REFRESH);
+            return;
+        };
+        if let Ok(persist) = Persist::open(root.clone()) {
+            self.segments = read_segments(&persist);
+        } else {
+            self.segments.seen = true;
+        }
+        ctx.request_repaint_after(REFRESH);
+    }
+
+    /// Latest folded segment state.
+    pub const fn segments(&self) -> &StatusSegments {
+        &self.segments
+    }
+}
+
+fn read_segments(persist: &Persist) -> StatusSegments {
+    let mut out = StatusSegments {
+        seen: true,
+        ..StatusSegments::default()
+    };
+    for segment in StatusSegment::ALL {
+        out.set(segment, latest_rollup(persist, segment));
+    }
+    out
+}
+
+fn latest_rollup(persist: &Persist, segment: StatusSegment) -> Option<SegmentRollup> {
+    let topic = segment.topic();
+    let msg = persist.list_since(&topic, None).ok()?.pop()?;
+    serde_json::from_str(msg.body.as_deref()?).ok()
+}
+
+fn severity_color(rollup: Option<&SegmentRollup>) -> egui::Color32 {
+    match rollup.map(|r| r.severity.as_str()) {
+        Some("critical" | "error" | "fatal" | "urgent") => Style::SUPPORT_ERROR,
+        Some("warning" | "warn" | "high") => Style::SUPPORT_WARNING,
+        Some("info" | "notice" | "debug") => Style::SUPPORT_INFO,
+        Some("success" | "ok") => Style::SUPPORT_SUCCESS,
+        _ => Style::TEXT_DIM,
+    }
+}
+
+fn is_critical_severity(severity: &str) -> bool {
+    matches!(severity, "critical" | "error" | "fatal" | "urgent")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CriticalEdgeKey {
+    segment: StatusSegment,
+    host: String,
+    source: String,
+    ts_unix_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveCriticalEdge {
+    key: CriticalEdgeKey,
+    started_at: Instant,
+}
+
+/// NOTIF-6 — ambient all-edges cue for an own-seat critical.
+#[derive(Debug, Default)]
+pub struct CriticalEdgeCue {
+    active: Option<ActiveCriticalEdge>,
+    acknowledged: Option<CriticalEdgeKey>,
+    muted: bool,
+}
+
+impl CriticalEdgeCue {
+    /// Fold the daemon segment rollups into this seat's edge-cue state.
+    pub fn update(&mut self, segments: &StatusSegments, local_host: &str, muted: bool) {
+        self.muted = muted;
+        let next = critical_edge_key(segments, local_host);
+        match next {
+            Some(key) => {
+                if self.active.as_ref().map(|a| &a.key) != Some(&key) {
+                    self.active = Some(ActiveCriticalEdge {
+                        key,
+                        started_at: Instant::now(),
+                    });
+                }
+            }
+            None => {
+                self.active = None;
+                self.acknowledged = None;
+            }
+        }
+    }
+
+    /// Acknowledge the live cue without clearing the underlying daemon rollup.
+    pub fn acknowledge(&mut self) {
+        if let Some(active) = &self.active {
+            self.acknowledged = Some(active.key.clone());
+        }
+    }
+
+    /// Whether the cue should be visible right now.
+    pub fn visible(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| !self.muted && self.acknowledged.as_ref() != Some(&active.key))
+    }
+
+    /// Render the no-text all-edges cue and let an edge click acknowledge it.
+    pub fn show(&mut self, ctx: &egui::Context) {
+        if !self.visible() {
+            return;
+        }
+        let Some(active) = &self.active else {
+            return;
+        };
+        let elapsed = active.started_at.elapsed().as_secs_f32();
+        let intensity = edge_cue_intensity(elapsed);
+        let width = EDGE_HELD_W + (EDGE_PULSE_W - EDGE_HELD_W) * intensity;
+        let alpha = 110.0 + 125.0 * intensity;
+        let color = Style::SUPPORT_ERROR.linear_multiply((alpha / 255.0).clamp(0.0, 1.0));
+
+        let mut clicked = false;
+        egui::Area::new(critical_edge_cue_id())
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::LEFT_TOP, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                let rect = ui.ctx().screen_rect();
+                ui.set_min_size(rect.size());
+                let painter = ui.painter();
+                for (i, edge) in edge_rects(rect, width).into_iter().enumerate() {
+                    painter.rect_filled(edge, 0.0, color);
+                    clicked |= ui
+                        .interact(
+                            edge,
+                            egui::Id::new(("notif-critical-edge", i)),
+                            egui::Sense::click(),
+                        )
+                        .clicked();
+                }
+            });
+        ctx.request_repaint_after(Duration::from_secs_f32(EDGE_PULSE_HALF_CYCLE_SECONDS));
+        if clicked {
+            self.acknowledge();
+        }
+    }
+}
+
+/// Stable id for NOTIF-6's foreground all-edges cue.
+pub fn critical_edge_cue_id() -> egui::Id {
+    egui::Id::new("notif-critical-edge-cue")
+}
+
+fn critical_edge_key(segments: &StatusSegments, local_host: &str) -> Option<CriticalEdgeKey> {
+    for segment in StatusSegment::ALL {
+        let Some(rollup) = segments.get(segment) else {
+            continue;
+        };
+        if is_critical_severity(&rollup.severity)
+            && rollup.critical_policy == CRITICAL_POLICY_OWN_SEAT
+            && rollup.host == local_host
+        {
+            return Some(CriticalEdgeKey {
+                segment,
+                host: rollup.host.clone(),
+                source: rollup.source.clone(),
+                ts_unix_ms: rollup.ts_unix_ms,
+            });
+        }
+    }
+    None
+}
+
+fn edge_cue_intensity(elapsed: f32) -> f32 {
+    if elapsed < 0.0 || elapsed >= EDGE_PULSE_SECONDS {
+        return 0.0;
+    }
+    let phase = (elapsed / EDGE_PULSE_HALF_CYCLE_SECONDS).floor() as i32;
+    if phase.rem_euclid(2) == 0 { 1.0 } else { 0.35 }
+}
+
+fn edge_rects(rect: egui::Rect, width: f32) -> [egui::Rect; 4] {
+    [
+        egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(rect.right(), rect.top() + width),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left(), rect.bottom() - width),
+            rect.right_bottom(),
+        ),
+        egui::Rect::from_min_max(
+            rect.left_top(),
+            egui::pos2(rect.left() + width, rect.bottom()),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(rect.right() - width, rect.top()),
+            rect.right_bottom(),
+        ),
+    ]
+}
+
+fn local_grade_color(grades: &NodeGrades) -> egui::Color32 {
+    grades
+        .rows
+        .iter()
+        .find(|row| row.is_local)
+        .map_or(Style::TEXT_DIM, |row| {
+            if row.stale {
+                Style::TEXT_DIM
+            } else {
+                GradeBand::from_score(f32::from(row.score)).color()
+            }
+        })
+}
+
+fn local_grade_label(grades: &NodeGrades) -> String {
+    grades.rows.iter().find(|row| row.is_local).map_or_else(
+        || "?".to_string(),
+        |row| {
+            if row.stale {
+                "?".to_string()
+            } else {
+                GradeBand::from_score(f32::from(row.score))
+                    .letter()
+                    .to_string()
+            }
+        },
+    )
+}
+
+/// Stable id for the local grade pip.
+pub fn local_grade_pip_id() -> egui::Id {
+    egui::Id::new("notif-status-local-grade-pip")
+}
+
+/// Stable id for one segment pip.
+pub fn segment_pip_id(segment: StatusSegment) -> egui::Id {
+    egui::Id::new(("notif-status-segment-pip", segment.key()))
+}
+
+/// Stable id for NOTIF-4's expansion chevron.
+pub fn status_chevron_id() -> egui::Id {
+    egui::Id::new("notif-status-chevron")
+}
+
+/// Stable id for NOTIF-4's expansion panel.
+pub fn status_panel_id() -> egui::Id {
+    egui::Id::new("notif-status-panel")
+}
+
+/// Stable id for a peer row in the expansion panel.
+pub fn status_panel_grade_id(host: &str) -> egui::Id {
+    egui::Id::new(("notif-status-panel-grade", host))
+}
+
+/// Stable id for the expansion panel's device-control band.
+pub fn status_panel_device_id() -> egui::Id {
+    egui::Id::new("notif-status-panel-device")
+}
+
+/// Output from rendering the compact row.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StatusBarOutcome {
+    /// A pip or local grade routed to a surface.
+    pub routed: bool,
+    /// The chevron was clicked.
+    pub toggle_panel: bool,
+}
+
+/// Output from rendering NOTIF-4's expansion panel.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StatusPanelOutcome {
+    /// A peer grade row requested focus.
+    pub node_focus: Option<String>,
+    /// Device controls requested the full System surface.
+    pub route_system: bool,
+}
+
+/// Render one dock row containing `[local grade] + [Device · Mesh · Power · Alerts]`.
+pub fn status_bar(
+    ui: &egui::Ui,
+    active: &mut Surface,
+    grades: &NodeGrades,
+    segments: &StatusSegments,
+    rect: egui::Rect,
+    expanded: bool,
+) -> StatusBarOutcome {
+    let painter = ui.painter().clone();
+    painter.rect_stroke(
+        rect,
+        Style::RADIUS,
+        egui::Stroke::new(1.0, Style::BORDER),
+        egui::StrokeKind::Inside,
+    );
+
+    let grade_rect =
+        egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.center().x, rect.bottom()))
+            .shrink(Style::SP_XS);
+    let resp = ui.interact(grade_rect, local_grade_pip_id(), egui::Sense::click());
+    if resp.hovered() {
+        painter.rect_filled(grade_rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let grade_color = local_grade_color(grades);
+    painter.circle_filled(grade_rect.center(), Style::SP_S, grade_color);
+    painter.text(
+        grade_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        local_grade_label(grades),
+        FontId::proportional(Style::SMALL),
+        Style::BG,
+    );
+    let mut out = StatusBarOutcome::default();
+    if resp.clicked() {
+        *active = Surface::MeshView;
+        out.routed = true;
+    }
+
+    let chev_rect = egui::Rect::from_min_size(
+        egui::pos2(grade_rect.left(), grade_rect.bottom() - Style::SP_M),
+        egui::vec2(Style::SP_M, Style::SP_M),
+    );
+    let chev = ui.interact(chev_rect, status_chevron_id(), egui::Sense::click());
+    let chev_tint = if expanded || chev.hovered() {
+        Style::TEXT
+    } else {
+        Style::TEXT_DIM
+    };
+    painter.text(
+        chev_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        if expanded { "‹" } else { "›" },
+        FontId::proportional(Style::BODY),
+        chev_tint,
+    );
+    if chev.clicked() {
+        out.toggle_panel = true;
+    }
+
+    let pip_left = rect.center().x;
+    let pip_h = rect.height() / StatusSegment::ALL.len() as f32;
+    for (i, segment) in StatusSegment::ALL.iter().copied().enumerate() {
+        let pip_rect = egui::Rect::from_min_size(
+            egui::pos2(pip_left, rect.top() + i as f32 * pip_h),
+            egui::vec2(rect.width() / 2.0, pip_h),
+        )
+        .shrink(1.0);
+        if segment_pip(ui, segment, segments.get(segment), pip_rect) {
+            *active = segment.route();
+            out.routed = true;
+        }
+    }
+    out
+}
+
+fn segment_pip(
+    ui: &egui::Ui,
+    segment: StatusSegment,
+    rollup: Option<&SegmentRollup>,
+    rect: egui::Rect,
+) -> bool {
+    let resp = ui.interact(rect, segment_pip_id(segment), egui::Sense::click());
+    let painter = ui.painter().clone();
+    if resp.hovered() {
+        painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    let color = severity_color(rollup);
+    let center = rect.center();
+    if let Some(tex) = icon_texture(ui.ctx(), segment.icon(), Style::SP_M, color) {
+        let icon = egui::Rect::from_center_size(center, egui::vec2(Style::SP_M, Style::SP_M));
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
+    } else {
+        painter.circle_filled(center, Style::SP_XS, color);
+    }
+    resp.clicked()
+}
+
+/// Render NOTIF-4's slide-out detail panel to the right of the dock.
+pub fn status_panel(
+    ui: &egui::Ui,
+    grades: &NodeGrades,
+    seat: Option<&SeatSnapshot>,
+    rect: egui::Rect,
+) -> StatusPanelOutcome {
+    let painter = ui.painter().clone();
+    painter.rect_filled(rect, Style::RADIUS, Style::SURFACE);
+    painter.rect_stroke(
+        rect,
+        Style::RADIUS,
+        egui::Stroke::new(1.0, Style::BORDER),
+        egui::StrokeKind::Inside,
+    );
+    let _panel = ui.interact(rect, status_panel_id(), egui::Sense::hover());
+
+    let mut out = StatusPanelOutcome::default();
+    let mut y = rect.top() + Style::SP_S;
+    let inner_left = rect.left() + Style::SP_S;
+    let inner_right = rect.right() - Style::SP_S;
+    let row_h = Style::SP_L;
+
+    painter.text(
+        egui::pos2(inner_left, y),
+        egui::Align2::LEFT_TOP,
+        "Health",
+        FontId::proportional(Style::BODY),
+        Style::TEXT,
+    );
+    y += row_h;
+
+    let mut rows = grades.rows.clone();
+    rows.sort_by_key(|row| {
+        (
+            !row.is_local,
+            std::cmp::Reverse(if row.stale { 0 } else { row.score }),
+        )
+    });
+    if rows.is_empty() {
+        painter.text(
+            egui::pos2(inner_left, y),
+            egui::Align2::LEFT_TOP,
+            "No grades yet",
+            FontId::proportional(Style::SMALL),
+            Style::TEXT_DIM,
+        );
+        y += row_h;
+    }
+    for row in rows.iter().take(5) {
+        let r = egui::Rect::from_min_max(
+            egui::pos2(inner_left, y),
+            egui::pos2(inner_right, y + row_h),
+        );
+        let resp = ui.interact(r, status_panel_grade_id(&row.host), egui::Sense::click());
+        if resp.hovered() {
+            painter.rect_filled(r, Style::RADIUS, Style::SURFACE_HI);
+        }
+        let grade = if row.stale {
+            "?".to_string()
+        } else {
+            GradeBand::from_score(f32::from(row.score))
+                .letter()
+                .to_string()
+        };
+        let color = if row.stale {
+            Style::TEXT_DIM
+        } else {
+            GradeBand::from_score(f32::from(row.score)).color()
+        };
+        painter.circle_filled(
+            egui::pos2(r.left() + Style::SP_M, r.center().y),
+            Style::SP_XS,
+            color,
+        );
+        painter.text(
+            egui::pos2(r.left() + Style::SP_L, r.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!("{}  {grade}", row.host),
+            FontId::proportional(Style::SMALL),
+            if row.is_local {
+                Style::TEXT
+            } else {
+                Style::TEXT_DIM
+            },
+        );
+        if resp.clicked() {
+            out.node_focus = Some(row.host.clone());
+        }
+        y += row_h;
+    }
+
+    y += Style::SP_XS;
+    painter.hline(
+        inner_left..=inner_right,
+        y,
+        egui::Stroke::new(1.0, Style::BORDER),
+    );
+    y += Style::SP_S;
+
+    let device_rect = egui::Rect::from_min_max(
+        egui::pos2(inner_left, y),
+        egui::pos2(inner_right, y + row_h * 3.0),
+    );
+    let resp = ui.interact(device_rect, status_panel_device_id(), egui::Sense::click());
+    if resp.hovered() {
+        painter.rect_filled(device_rect, Style::RADIUS, Style::SURFACE_HI);
+    }
+    if resp.clicked() {
+        out.route_system = true;
+    }
+    draw_device_controls(ui, seat, device_rect);
+    out
+}
+
+fn draw_device_controls(ui: &egui::Ui, seat: Option<&SeatSnapshot>, rect: egui::Rect) {
+    let painter = ui.painter().clone();
+    let left = rect.left() + Style::SP_S;
+    let right = rect.right() - Style::SP_S;
+    let volume = seat.and_then(|snap| match &snap.mixer {
+        Probe::Present(m) => Some((m.master.volume, m.master.muted)),
+        Probe::Absent { .. } => None,
+    });
+    let bt = seat.and_then(|snap| match &snap.bluetooth {
+        Probe::Present(b) => Some((b.any_adapter_powered(), b.connected_devices())),
+        Probe::Absent { .. } => None,
+    });
+    let battery = battery_status(seat);
+    let vol_y = rect.top() + Style::SP_M;
+    painter.text(
+        egui::pos2(left, vol_y),
+        egui::Align2::LEFT_CENTER,
+        volume.map_or("Vol --".to_string(), |(v, muted)| {
+            if muted {
+                format!("Vol {v}% muted")
+            } else {
+                format!("Vol {v}%")
+            }
+        }),
+        FontId::proportional(Style::SMALL),
+        Style::TEXT,
+    );
+    draw_meter(
+        &painter,
+        egui::Rect::from_min_max(
+            egui::pos2(left, vol_y + Style::SP_S),
+            egui::pos2(right, vol_y + Style::SP_M),
+        ),
+        volume.map_or(0.0, |(v, _)| f32::from(v) / 100.0),
+    );
+    let bt_y = rect.top() + Style::SP_L + Style::SP_M;
+    painter.text(
+        egui::pos2(left, bt_y),
+        egui::Align2::LEFT_CENTER,
+        bt.map_or("BT --".to_string(), |(on, connected)| {
+            format!("BT {} · {connected}", if on { "on" } else { "off" })
+        }),
+        FontId::proportional(Style::SMALL),
+        Style::TEXT_DIM,
+    );
+    draw_meter(
+        &painter,
+        egui::Rect::from_min_max(
+            egui::pos2(left, bt_y + Style::SP_S),
+            egui::pos2(right, bt_y + Style::SP_M),
+        ),
+        bt.map_or(0.0, |(on, _)| if on { 1.0 } else { 0.0 }),
+    );
+    let battery_y = rect.top() + Style::SP_L * 2.0 + Style::SP_M;
+    let (battery_text, battery_pct, battery_tone, charging) =
+        battery.map_or(("Batt --".to_string(), 0.0, Style::TEXT_DIM, false), |b| {
+            (
+                format!(
+                    "Batt {:.0}%{}",
+                    b.percentage,
+                    if battery_charging(b.state) {
+                        " charging"
+                    } else {
+                        ""
+                    }
+                ),
+                (b.percentage / 100.0) as f32,
+                battery_tone(b),
+                battery_charging(b.state),
+            )
+        });
+    painter.text(
+        egui::pos2(left, battery_y),
+        egui::Align2::LEFT_CENTER,
+        battery_text,
+        FontId::proportional(Style::SMALL),
+        if charging {
+            Style::TEXT
+        } else {
+            Style::TEXT_DIM
+        },
+    );
+    let battery_icon = battery.map_or(IconId::BatteryEmpty, |b| battery_fill_icon(b.percentage));
+    if let Some(tex) = icon_texture(ui.ctx(), battery_icon, Style::SP_M, battery_tone) {
+        let icon = egui::Rect::from_center_size(
+            egui::pos2(right - Style::SP_S, battery_y),
+            egui::vec2(Style::SP_M, Style::SP_M),
+        );
+        let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        painter.image(tex.id(), icon, uv, egui::Color32::WHITE);
+    }
+    draw_meter(
+        &painter,
+        egui::Rect::from_min_max(
+            egui::pos2(left, battery_y + Style::SP_S),
+            egui::pos2(right, battery_y + Style::SP_M),
+        ),
+        battery_pct,
+    );
+}
+
+fn draw_meter(painter: &egui::Painter, rect: egui::Rect, pct: f32) {
+    painter.rect_filled(rect, Style::RADIUS, Style::SURFACE_HI);
+    let fill = egui::Rect::from_min_max(
+        rect.min,
+        egui::pos2(
+            rect.left() + rect.width() * pct.clamp(0.0, 1.0),
+            rect.bottom(),
+        ),
+    );
+    painter.rect_filled(fill, Style::RADIUS, Style::ACCENT);
+}
+
+fn battery_status(seat: Option<&SeatSnapshot>) -> Option<&Battery> {
+    match seat.map(|s| &s.batteries) {
+        Some(Probe::Present(cells)) => system_pack(cells),
+        _ => None,
+    }
+}
+
+fn battery_fill_icon(percentage: f64) -> IconId {
+    if percentage < 12.5 {
+        IconId::BatteryEmpty
+    } else if percentage < 37.5 {
+        IconId::BatteryQuarter
+    } else if percentage < 62.5 {
+        IconId::BatteryHalf
+    } else if percentage < 87.5 {
+        IconId::BatteryThreeQuarter
+    } else {
+        IconId::BatteryFull
+    }
+}
+
+const fn battery_charging(state: BatteryState) -> bool {
+    matches!(state, BatteryState::Charging | BatteryState::PendingCharge)
+}
+
+fn battery_tone(b: &Battery) -> egui::Color32 {
+    match b.state {
+        BatteryState::Charging | BatteryState::FullyCharged => Style::SUPPORT_SUCCESS,
+        BatteryState::Empty => Style::SUPPORT_ERROR,
+        BatteryState::Discharging | BatteryState::PendingDischarge => {
+            if b.percentage <= BATTERY_CRITICAL {
+                Style::SUPPORT_ERROR
+            } else if b.percentage < BATTERY_LOW {
+                Style::SUPPORT_WARNING
+            } else {
+                Style::TEXT_DIM
+            }
+        }
+        BatteryState::PendingCharge | BatteryState::Unknown => Style::TEXT_DIM,
+    }
+}
+
+fn system_pack(cells: &[Battery]) -> Option<&Battery> {
+    cells.iter().find(|b| b.power_supply).or_else(|| {
+        cells.iter().max_by(|a, b| {
+            a.percentage
+                .partial_cmp(&b.percentage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chrome::{GradeRow, GradeTrend};
+    use mde_bus::hooks::config::Priority;
+    use mde_seat::BatteryKind;
+
+    fn grade(score: u8, stale: bool) -> NodeGrades {
+        NodeGrades {
+            rows: vec![GradeRow {
+                host: "eagle".to_string(),
+                score,
+                trend: GradeTrend::Steady,
+                is_local: true,
+                stale,
+            }],
+            seen: true,
+        }
+    }
+
+    fn battery(percentage: f64, state: BatteryState, power_supply: bool) -> Battery {
+        Battery {
+            model: "BAT".to_string(),
+            kind: BatteryKind::Internal,
+            percentage,
+            state,
+            power_supply,
+            time_to_empty: None,
+            time_to_full: None,
+            energy_rate: None,
+        }
+    }
+
+    fn rollup(segment: &str, severity: &str, host: &str, policy: &str, ts: i64) -> SegmentRollup {
+        SegmentRollup {
+            segment: segment.to_string(),
+            severity: severity.to_string(),
+            source: "test".to_string(),
+            summary: "test".to_string(),
+            host: host.to_string(),
+            critical_policy: policy.to_string(),
+            ts_unix_ms: ts,
+        }
+    }
+
+    #[test]
+    fn segment_severity_maps_to_carbon_support_tokens() {
+        let rollup = |severity: &str| SegmentRollup {
+            segment: "alerts".to_string(),
+            severity: severity.to_string(),
+            source: "test".to_string(),
+            summary: "test".to_string(),
+            host: "eagle".to_string(),
+            critical_policy: "own-seat-light-show".to_string(),
+            ts_unix_ms: 1,
+        };
+        assert_eq!(
+            severity_color(Some(&rollup("critical"))),
+            Style::SUPPORT_ERROR
+        );
+        assert_eq!(
+            severity_color(Some(&rollup("warning"))),
+            Style::SUPPORT_WARNING
+        );
+        assert_eq!(severity_color(Some(&rollup("info"))), Style::SUPPORT_INFO);
+        assert_eq!(severity_color(None), Style::TEXT_DIM);
+    }
+
+    #[test]
+    fn local_grade_pip_uses_grade_band_or_dim_unknown() {
+        assert_eq!(local_grade_label(&grade(95, false)), "A");
+        assert_eq!(
+            local_grade_color(&grade(95, false)),
+            GradeBand::from_score(95.0).color()
+        );
+        assert_eq!(local_grade_label(&grade(20, true)), "?");
+        assert_eq!(local_grade_color(&grade(20, true)), Style::TEXT_DIM);
+        assert_eq!(local_grade_label(&NodeGrades::default()), "?");
+    }
+
+    #[test]
+    fn read_segments_pulls_latest_rollup_for_each_topic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        let body = serde_json::json!({
+            "segment": "mesh",
+            "severity": "critical",
+            "source": "cloud",
+            "summary": "cloud api down",
+            "host": "lh-1",
+            "critical_policy": "remote-pip-chat",
+            "ts_unix_ms": 10
+        })
+        .to_string();
+        persist
+            .write(
+                &StatusSegment::Mesh.topic(),
+                Priority::Default,
+                None,
+                Some(&body),
+            )
+            .unwrap();
+
+        let segments = read_segments(&persist);
+        assert!(segments.seen);
+        assert_eq!(
+            segments.mesh.as_ref().map(|r| r.severity.as_str()),
+            Some("critical")
+        );
+        assert!(segments.device.is_none(), "missing segments stay dim");
+    }
+
+    #[test]
+    fn status_state_polls_the_bus_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).unwrap();
+        persist
+            .write(
+                &StatusSegment::Alerts.topic(),
+                Priority::Default,
+                None,
+                Some(
+                    r#"{"segment":"alerts","severity":"warning","source":"journal","summary":"warn","host":"eagle","critical_policy":"remote-pip-chat","ts_unix_ms":1}"#,
+                ),
+            )
+            .unwrap();
+        let ctx = egui::Context::default();
+        let mut state = StatusState::with_bus_root(tmp.path().to_path_buf());
+        state.poll(&ctx);
+        assert_eq!(
+            state.segments().alerts.as_ref().map(|r| r.source.as_str()),
+            Some("journal")
+        );
+    }
+
+    #[test]
+    fn battery_fill_ladder_survives_tray_retirement() {
+        assert_eq!(battery_fill_icon(0.0), IconId::BatteryEmpty);
+        assert_eq!(battery_fill_icon(20.0), IconId::BatteryQuarter);
+        assert_eq!(battery_fill_icon(50.0), IconId::BatteryHalf);
+        assert_eq!(battery_fill_icon(80.0), IconId::BatteryThreeQuarter);
+        assert_eq!(battery_fill_icon(95.0), IconId::BatteryFull);
+    }
+
+    #[test]
+    fn system_pack_and_battery_tone_stay_honest() {
+        let peripheral = battery(90.0, BatteryState::Discharging, false);
+        let system = battery(35.0, BatteryState::Discharging, true);
+        assert_eq!(
+            system_pack(&[peripheral.clone(), system.clone()]),
+            Some(&system)
+        );
+        assert_eq!(
+            system_pack(std::slice::from_ref(&peripheral)),
+            Some(&peripheral)
+        );
+
+        assert_eq!(
+            battery_tone(&battery(80.0, BatteryState::Charging, true)),
+            Style::SUPPORT_SUCCESS
+        );
+        assert_eq!(
+            battery_tone(&battery(10.0, BatteryState::Discharging, true)),
+            Style::SUPPORT_WARNING
+        );
+        assert_eq!(
+            battery_tone(&battery(4.0, BatteryState::Discharging, true)),
+            Style::SUPPORT_ERROR
+        );
+        assert_eq!(
+            battery_tone(&battery(80.0, BatteryState::Discharging, true)),
+            Style::TEXT_DIM
+        );
+    }
+
+    #[test]
+    fn critical_edge_cue_only_keys_own_seat_critical_rollups() {
+        let mut segments = StatusSegments {
+            alerts: Some(rollup(
+                "alerts",
+                "critical",
+                "eagle",
+                CRITICAL_POLICY_OWN_SEAT,
+                11,
+            )),
+            ..StatusSegments::default()
+        };
+        assert!(
+            critical_edge_key(&segments, "eagle").is_some(),
+            "own-seat criticals light the edge cue"
+        );
+
+        segments.alerts = Some(rollup(
+            "alerts",
+            "warning",
+            "eagle",
+            CRITICAL_POLICY_OWN_SEAT,
+            12,
+        ));
+        assert!(
+            critical_edge_key(&segments, "eagle").is_none(),
+            "warnings stay pull-only"
+        );
+
+        segments.alerts = Some(rollup(
+            "alerts",
+            "critical",
+            "oak",
+            CRITICAL_POLICY_OWN_SEAT,
+            13,
+        ));
+        assert!(
+            critical_edge_key(&segments, "eagle").is_none(),
+            "remote host criticals stay in the pip/chat path"
+        );
+
+        segments.alerts = Some(rollup("alerts", "critical", "eagle", "remote-pip-chat", 14));
+        assert!(
+            critical_edge_key(&segments, "eagle").is_none(),
+            "the daemon policy must opt into the own-seat light-show"
+        );
+    }
+
+    #[test]
+    fn critical_edge_cue_acknowledges_and_clears_on_resolve() {
+        let live = StatusSegments {
+            alerts: Some(rollup(
+                "alerts",
+                "critical",
+                "eagle",
+                CRITICAL_POLICY_OWN_SEAT,
+                11,
+            )),
+            ..StatusSegments::default()
+        };
+        let mut cue = CriticalEdgeCue::default();
+        cue.update(&live, "eagle", false);
+        assert!(cue.visible(), "a live unmuted critical is visible");
+
+        cue.acknowledge();
+        assert!(
+            !cue.visible(),
+            "ack hides the cue while the same rollup is live"
+        );
+
+        cue.update(&live, "eagle", false);
+        assert!(
+            !cue.visible(),
+            "the same acknowledged rollup does not immediately reappear"
+        );
+
+        let reraised = StatusSegments {
+            alerts: Some(rollup(
+                "alerts",
+                "critical",
+                "eagle",
+                CRITICAL_POLICY_OWN_SEAT,
+                12,
+            )),
+            ..StatusSegments::default()
+        };
+        cue.update(&reraised, "eagle", false);
+        assert!(cue.visible(), "a new live critical re-raises the cue");
+
+        cue.update(&StatusSegments::default(), "eagle", false);
+        assert!(!cue.visible(), "resolved rollups clear the cue");
+    }
+
+    #[test]
+    fn critical_edge_cue_respects_push_mute_without_clearing_state() {
+        let live = StatusSegments {
+            alerts: Some(rollup(
+                "alerts",
+                "critical",
+                "eagle",
+                CRITICAL_POLICY_OWN_SEAT,
+                11,
+            )),
+            ..StatusSegments::default()
+        };
+        let mut cue = CriticalEdgeCue::default();
+        cue.update(&live, "eagle", true);
+        assert!(!cue.visible(), "DND/focus mute suppresses the ambient push");
+        cue.update(&live, "eagle", false);
+        assert!(cue.visible(), "unmuting reveals the still-live critical");
+    }
+
+    #[test]
+    fn critical_edge_pulse_settles_to_a_held_glow() {
+        assert_eq!(edge_cue_intensity(0.0), 1.0);
+        assert_eq!(
+            edge_cue_intensity(EDGE_PULSE_HALF_CYCLE_SECONDS * 1.1),
+            0.35
+        );
+        assert_eq!(edge_cue_intensity(EDGE_PULSE_SECONDS + 0.01), 0.0);
+    }
+
+    #[test]
+    fn critical_edge_cue_tessellates_as_an_ambient_edge_overlay() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let live = StatusSegments {
+            alerts: Some(rollup(
+                "alerts",
+                "critical",
+                "eagle",
+                CRITICAL_POLICY_OWN_SEAT,
+                11,
+            )),
+            ..StatusSegments::default()
+        };
+        let mut cue = CriticalEdgeCue::default();
+        cue.update(&live, "eagle", false);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1280.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |ctx| cue.show(ctx));
+        let out = ctx.run(input(), |ctx| cue.show(ctx));
+        let prims = ctx.tessellate(out.shapes, out.pixels_per_point);
+        assert!(
+            !prims.is_empty(),
+            "a live own-seat critical paints a real no-text edge overlay"
+        );
+    }
+}

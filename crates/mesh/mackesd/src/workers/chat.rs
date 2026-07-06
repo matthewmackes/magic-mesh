@@ -55,9 +55,9 @@ use ed25519_dalek::SigningKey;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::{Persist, StoredMessage};
 use mde_chat::{
-    fold_alert, severity_room_id, sign, system_room_descriptors, Contact, Conversation, Message,
-    MessageId, MessageKind, NodeRole, NotifyPrefs, Presence, Room, RoomDescriptor, RoomKind,
-    Roster, Severity,
+    Contact, Conversation, Message, MessageId, MessageKind, NodeRole, NotifyPrefs, Presence, Room,
+    RoomDescriptor, RoomKind, Roster, Severity, fold_alert, severity_room_id, sign,
+    system_room_descriptors,
 };
 use serde::{Deserialize, Serialize};
 
@@ -75,10 +75,12 @@ pub const ACTION_CHAT_ROOM: &str = "action/chat/room";
 pub const ACTION_CHAT_PRESENCE: &str = "action/chat/presence";
 /// The UI's mute verb (NOTIFY-CHAT-5).
 ///
-/// Mutes/unmutes a contact or room in this seat's [`NotifyPrefs`]; drained +
+/// Mutes/unmutes a contact, room, or alert source in this seat's [`NotifyPrefs`]; drained +
 /// persisted to the seat-local `notify.json` + republished on `state/chat/notify`
 /// so the UI's toggle reflects the true state.
 pub const ACTION_CHAT_MUTE: &str = "action/chat/mute";
+/// Update global notification preferences that are not target mutes.
+pub const ACTION_CHAT_NOTIFY_PREFS: &str = "action/chat/notify-prefs";
 /// The signed-envelope delivery lane (fast path; the log is the durable copy).
 pub const EVENT_CHAT_MESSAGE: &str = "event/chat/message";
 /// The presence roster mirror the UI reads.
@@ -295,7 +297,8 @@ struct PresenceRequest {
     status: Option<String>,
 }
 
-/// Whether an `action/chat/mute` op targets a contact host or a room id.
+/// Whether an `action/chat/mute` op targets a contact host, room id, or alert
+/// source flag.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum MuteTarget {
@@ -303,18 +306,29 @@ enum MuteTarget {
     Contact,
     /// A room id.
     Room,
+    /// A folded-alert source flag.
+    Source,
 }
 
 /// The UI's `action/chat/mute` request body (NOTIFY-CHAT-5): set or clear a
-/// per-contact / per-room mute in this seat's [`NotifyPrefs`].
+/// per-contact / per-room / per-source mute in this seat's [`NotifyPrefs`].
 #[derive(Debug, Clone, Deserialize)]
 struct MuteRequest {
-    /// Whether `id` is a contact host or a room id.
+    /// Whether `id` is a contact host, room id, or folded-alert source flag.
     target: MuteTarget,
-    /// The contact host / room id to (un)mute.
+    /// The contact host / room id / source flag to (un)mute.
     id: String,
     /// `true` mutes, `false` unmutes.
     muted: bool,
+}
+
+/// The UI's `action/chat/notify-prefs` request body: update global notification
+/// policy fields in this seat's [`NotifyPrefs`].
+#[derive(Debug, Clone, Deserialize)]
+struct NotifyPrefsRequest {
+    /// Least-severe alert that may ring (`info`, `warning`, or `critical`).
+    #[serde(default)]
+    threshold: Option<Severity>,
 }
 
 /// A one-line headline for a **chat-message** chyron (NOTIFY-CHAT-5, KIRON lock
@@ -482,6 +496,16 @@ const fn alert_severity(msg: &Message) -> Option<Severity> {
         Some(*severity)
     } else {
         None
+    }
+}
+
+/// The folded alert source flag used by per-source notification mute. Non-alerts
+/// should not reach this helper; return `system` as a stable fallback.
+fn alert_source(msg: &Message) -> String {
+    if let MessageKind::Alert { flag, .. } = &msg.kind {
+        flag.clone()
+    } else {
+        "system".to_string()
     }
 }
 
@@ -830,9 +854,10 @@ impl ChatWorker {
         // gossip file so an operator's manual override survives a restart — the
         // same durability the notify prefs + room registry below already have. A
         // missing file leaves the construction seed intact.
-        if let Some(g) = std::fs::read_to_string(presence_path(&self.workgroup_root, &self.self_host))
-            .ok()
-            .and_then(|s| serde_json::from_str::<PresenceGossip>(&s).ok())
+        if let Some(g) =
+            std::fs::read_to_string(presence_path(&self.workgroup_root, &self.self_host))
+                .ok()
+                .and_then(|s| serde_json::from_str::<PresenceGossip>(&s).ok())
         {
             self.manual_presence = g.manual;
             self.status_message = g.status_message;
@@ -867,6 +892,7 @@ impl ChatWorker {
         self.drain_sends(persist, state, now_ms);
         self.drain_room_ops(persist, state);
         self.drain_mutes(persist, state);
+        self.drain_notify_prefs(persist, state);
         self.drain_inbound(persist, state, dnd);
         self.drain_alerts(persist, state, dnd);
         self.publish_roster(persist, state);
@@ -884,7 +910,10 @@ impl ChatWorker {
     /// Parse an `action/chat/*` message body into the typed request `T`, or `None`
     /// (skip the message): a missing body or malformed JSON logs a warn and is
     /// dropped — the shared shape the four action drains use.
-    fn parse_action_body<T: serde::de::DeserializeOwned>(m: &StoredMessage, verb: &str) -> Option<T> {
+    fn parse_action_body<T: serde::de::DeserializeOwned>(
+        m: &StoredMessage,
+        verb: &str,
+    ) -> Option<T> {
         let body = m.body.as_deref()?;
         match serde_json::from_str::<T>(body) {
             Ok(r) => Some(r),
@@ -910,7 +939,7 @@ impl ChatWorker {
         }
     }
 
-    /// Drain `action/chat/mute`: set/clear a per-contact or per-room mute in this
+    /// Drain `action/chat/mute`: set/clear a per-contact, per-room, or per-source mute in this
     /// seat's [`NotifyPrefs`] (NOTIFY-CHAT-5), persist the seat-local `notify.json`
     /// so it survives a restart, and mark the `state/chat/notify` mirror for
     /// republish so the UI's toggle reflects the new state. Seat-local: a mute is
@@ -936,8 +965,43 @@ impl ChatWorker {
                         state.notify.unmute_room(&req.id)
                     }
                 }
+                MuteTarget::Source => {
+                    if req.muted {
+                        state.notify.mute_source(req.id)
+                    } else {
+                        state.notify.unmute_source(&req.id)
+                    }
+                }
             };
             changed |= applied;
+        }
+        if changed {
+            if let Ok(body) = serde_json::to_string(&state.notify) {
+                if let Err(e) =
+                    write_atomic(&notify_path(&self.workgroup_root, &self.self_host), &body)
+                {
+                    tracing::warn!(target: "mackesd::chat", error = %e, "notify prefs persist failed");
+                }
+            }
+            state.notify_dirty = true;
+        }
+    }
+
+    /// Drain `action/chat/notify-prefs`: update global notification policy
+    /// fields, persist them, and republish the mirror the UI reads.
+    fn drain_notify_prefs(&self, persist: &Persist, state: &mut ChatState) {
+        let mut changed = false;
+        for m in take_new(persist, &mut state.cursors, ACTION_CHAT_NOTIFY_PREFS) {
+            let Some(req) = Self::parse_action_body::<NotifyPrefsRequest>(&m, "notify-prefs")
+            else {
+                continue;
+            };
+            if let Some(threshold) = req.threshold {
+                if state.notify.threshold() != threshold {
+                    state.notify.set_threshold(threshold);
+                    changed = true;
+                }
+            }
         }
         if changed {
             if let Ok(body) = serde_json::to_string(&state.notify) {
@@ -1059,6 +1123,7 @@ impl ChatWorker {
                 let msg = alert_message(topic, &m.ulid, body, m.ts_unix_ms, &self.self_host);
                 let origin = msg.sender.clone();
                 let severity = alert_severity(&msg);
+                let source = alert_source(&msg);
                 // Build the chyron body before the ring consumes the message.
                 let show = toast_for_alert(&msg);
                 let key = alert_key(&origin);
@@ -1087,7 +1152,7 @@ impl ChatWorker {
                 }
                 // Raise the transient lower-third only when the gate permits it.
                 if let (Some(show), Some(sev)) = (show, severity) {
-                    if state.notify.should_ring_alert(&origin, sev, dnd) {
+                    if state.notify.should_ring_alert(&origin, &source, sev, dnd) {
                         emit_toast(persist, &show);
                     }
                 }
@@ -1699,10 +1764,12 @@ mod tests {
             MessageKind::Alert { .. }
         ));
         // And the read-model mirror is published for the UI.
-        assert!(!persist
-            .list_since(&conversation_topic(&k), None)
-            .unwrap()
-            .is_empty());
+        assert!(
+            !persist
+                .list_since(&conversation_topic(&k), None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1776,7 +1843,12 @@ mod tests {
         assert!(toast_for_alert(&msg).is_some(), "the body is shaped");
         let prefs = NotifyPrefs::new();
         assert!(
-            !prefs.should_ring_alert("nyc3", alert_severity(&msg).unwrap(), false),
+            !prefs.should_ring_alert(
+                "nyc3",
+                &alert_source(&msg),
+                alert_severity(&msg).unwrap(),
+                false
+            ),
             "but the default Warning threshold silences an Info alert"
         );
     }
@@ -1968,7 +2040,7 @@ mod tests {
             )
             .unwrap();
         w.tick_once(&persist, &mut state, 100); // seed
-                                                // A Warning under DND is silent …
+        // A Warning under DND is silent …
         persist
             .write(
                 "event/security/alert",
@@ -2035,9 +2107,11 @@ mod tests {
             "the per-severity Warnings room is a real, populated view"
         );
         // It is NOT in the Critical room.
-        assert!(!state
-            .convos
-            .contains_key(&room_key(&severity_room_id(Severity::Critical))));
+        assert!(
+            !state
+                .convos
+                .contains_key(&room_key(&severity_room_id(Severity::Critical)))
+        );
     }
 
     // ── room lifecycle: create · open-join · creator-only dissolve ──────
@@ -2081,9 +2155,11 @@ mod tests {
             &format!(r#"{{"op":"join","id":"{SYS_ALL_FLEET_ID}"}}"#),
         );
         w.tick_once(&persist, &mut state, 300);
-        assert!(state.rooms[SYS_ALL_FLEET_ID]
-            .members
-            .contains(&"eagle".to_string()));
+        assert!(
+            state.rooms[SYS_ALL_FLEET_ID]
+                .members
+                .contains(&"eagle".to_string())
+        );
 
         // A non-creator cannot dissolve: fake nyc3 as creator by editing, then
         // eagle's dissolve is refused.
@@ -2125,9 +2201,11 @@ mod tests {
         w.bootstrap(&mut state);
         // System rooms are seeded …
         assert!(state.rooms.contains_key(SYS_ALL_FLEET_ID));
-        assert!(state
-            .rooms
-            .contains_key(&severity_room_id(Severity::Critical)));
+        assert!(
+            state
+                .rooms
+                .contains_key(&severity_room_id(Severity::Critical))
+        );
         // … the ad-hoc room reloaded, and the mute list restored.
         assert!(state.rooms.contains_key("ops"));
         assert!(state.notify.is_contact_muted("nyc3"));
@@ -2197,7 +2275,10 @@ mod tests {
         };
         let r = published(&persist);
         assert_eq!(r.self_contact().presence, Presence::Dnd);
-        assert_eq!(r.self_contact().status_message.as_deref(), Some("heads-down"));
+        assert_eq!(
+            r.self_contact().status_message.as_deref(),
+            Some("heads-down")
+        );
         assert!(w.self_dnd(), "self DND now gates the alert firehose");
         // The manual override is gossiped for peers, too.
         let g: PresenceGossip =
@@ -2217,7 +2298,11 @@ mod tests {
             .unwrap();
         w.tick_once(&persist, &mut state, 300);
         let r = published(&persist);
-        assert_eq!(r.self_contact().presence, Presence::Online, "cleared → auto");
+        assert_eq!(
+            r.self_contact().presence,
+            Presence::Online,
+            "cleared → auto"
+        );
         assert_eq!(r.self_contact().status_message, None, "empty clears status");
         assert!(!w.self_dnd());
     }
@@ -2288,7 +2373,7 @@ mod tests {
         let mut state = ChatState::default();
         w.tick_once(&persist, &mut state, 100); // seed the mute lane cursor
 
-        // Mute a contact and a room.
+        // Mute a contact, a room, and an alert source.
         persist
             .write(
                 ACTION_CHAT_MUTE,
@@ -2305,15 +2390,25 @@ mod tests {
                 Some(r#"{"target":"room","id":"ops","muted":true}"#),
             )
             .unwrap();
+        persist
+            .write(
+                ACTION_CHAT_MUTE,
+                Priority::Default,
+                None,
+                Some(r#"{"target":"source","id":"security","muted":true}"#),
+            )
+            .unwrap();
         w.tick_once(&persist, &mut state, 200);
 
         // Worker state mutated …
         assert!(state.notify.is_contact_muted("nyc3"));
         assert!(state.notify.is_room_muted("ops"));
+        assert!(state.notify.is_source_muted("security"));
         // … persisted to the seat-local notify.json (survives a restart) …
         let saved = load_notify_prefs(root, "eagle");
         assert!(saved.is_contact_muted("nyc3"));
         assert!(saved.is_room_muted("ops"));
+        assert!(saved.is_source_muted("security"));
         // … and republished on the mirror the UI reads to render its toggle.
         let mirror = |p: &Persist| -> NotifyPrefs {
             let msgs = p.list_since(STATE_CHAT_NOTIFY, None).unwrap();
@@ -2322,6 +2417,7 @@ mod tests {
         let prefs = mirror(&persist);
         assert!(prefs.is_contact_muted("nyc3"));
         assert!(prefs.is_room_muted("ops"));
+        assert!(prefs.is_source_muted("security"));
 
         // A muted contact's Critical alert is now silent (the mute actually bites).
         persist
@@ -2363,6 +2459,74 @@ mod tests {
         let prefs = mirror(&persist);
         assert!(!prefs.is_contact_muted("nyc3"));
         assert!(prefs.is_room_muted("ops"), "the room mute is untouched");
+        assert!(
+            prefs.is_source_muted("security"),
+            "the source mute is untouched"
+        );
+    }
+
+    #[test]
+    fn notify_prefs_action_updates_threshold_and_source_mute_silences_alerts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut w = worker(root);
+        let persist = persist_at(root);
+        let mut state = ChatState::default();
+        w.tick_once(&persist, &mut state, 100); // seed action cursors
+
+        persist
+            .write(
+                ACTION_CHAT_NOTIFY_PREFS,
+                Priority::Default,
+                None,
+                Some(r#"{"threshold":"critical"}"#),
+            )
+            .unwrap();
+        persist
+            .write(
+                ACTION_CHAT_MUTE,
+                Priority::Default,
+                None,
+                Some(r#"{"target":"source","id":"security","muted":true}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 200);
+        assert_eq!(state.notify.threshold(), Severity::Critical);
+        assert!(state.notify.is_source_muted("security"));
+
+        let saved = load_notify_prefs(root, "eagle");
+        assert_eq!(saved.threshold(), Severity::Critical);
+        assert!(saved.is_source_muted("security"));
+
+        persist
+            .write(
+                "event/security/alert",
+                Priority::Min,
+                None,
+                Some(r#"{"severity":"info","host":"nyc3","summary":"seed"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 250); // seed alert lane
+        let toasts_before = persist.list_since(EVENT_TOAST_SHOW, None).unwrap().len();
+        persist
+            .write(
+                "event/security/alert",
+                Priority::Urgent,
+                None,
+                Some(r#"{"severity":"critical","host":"fra1","summary":"intrusion"}"#),
+            )
+            .unwrap();
+        w.tick_once(&persist, &mut state, 300);
+        assert_eq!(
+            persist.list_since(EVENT_TOAST_SHOW, None).unwrap().len(),
+            toasts_before,
+            "a muted alert source raises no chyron, even for Critical"
+        );
+        assert_eq!(
+            state.convos.get(&alert_key("fra1")).map(Conversation::len),
+            Some(1),
+            "source-muted alerts are still logged in the feed"
+        );
     }
 
     #[tokio::test]

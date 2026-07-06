@@ -1,7 +1,7 @@
-//! [`NotifyPrefs`] — the pure **notification policy** (NOTIFY-CHAT-5): per-contact
-//! and per-room **mute** plus a **global per-severity threshold**, and the pure
-//! decision of whether an incoming event should *ring* (raise a KIRON chyron +
-//! its sound) or stay silent.
+//! [`NotifyPrefs`] — the pure **notification policy** (NOTIFY-CHAT-5): per-contact,
+//! per-room, and per-source **mute** plus a **global per-severity threshold**, and
+//! the pure decision of whether an incoming event should *ring* (raise a KIRON
+//! chyron + its sound) or stay silent.
 //!
 //! The one invariant the worker leans on (design lock 16, taming the machine-
 //! alert firehose): a muted / below-threshold / DND-suppressed event is **silent
@@ -39,6 +39,7 @@ const fn default_threshold() -> Severity {
 /// withhold one — the message is logged either way):
 ///   * `muted_contacts` — hostnames whose messages + alerts never ring.
 ///   * `muted_rooms` — room ids whose messages never ring.
+///   * `muted_sources` — alert source flags whose folded alerts never ring.
 ///   * `threshold` — the least-severe alert that still rings; anything less
 ///     severe (a higher [`Severity`] value) is silent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +50,9 @@ pub struct NotifyPrefs {
     /// Muted room ids.
     #[serde(default)]
     muted_rooms: BTreeSet<String>,
+    /// Muted folded-alert source flags (`security`, `compute`, `system`, …).
+    #[serde(default)]
+    muted_sources: BTreeSet<String>,
     /// The global per-severity gate for **alerts**: an alert rings only if it is
     /// at least this severe. Human chat messages are not gated by it.
     #[serde(default = "default_threshold")]
@@ -60,6 +64,7 @@ impl Default for NotifyPrefs {
         Self {
             muted_contacts: BTreeSet::new(),
             muted_rooms: BTreeSet::new(),
+            muted_sources: BTreeSet::new(),
             threshold: default_threshold(),
         }
     }
@@ -104,6 +109,22 @@ impl NotifyPrefs {
         self.muted_rooms.contains(room_id)
     }
 
+    /// Mute a folded-alert source flag. Returns `true` if newly muted.
+    pub fn mute_source(&mut self, source: impl Into<String>) -> bool {
+        self.muted_sources.insert(source.into())
+    }
+
+    /// Unmute a folded-alert source flag. Returns `true` if it had been muted.
+    pub fn unmute_source(&mut self, source: &str) -> bool {
+        self.muted_sources.remove(source)
+    }
+
+    /// Whether alert source `source` is muted.
+    #[must_use]
+    pub fn is_source_muted(&self, source: &str) -> bool {
+        self.muted_sources.contains(source)
+    }
+
     /// The current global alert threshold.
     #[must_use]
     pub const fn threshold(&self) -> Severity {
@@ -125,13 +146,20 @@ impl NotifyPrefs {
         (severity as u8) <= (self.threshold as u8)
     }
 
-    /// Should a **folded alert** from `origin_host` at `severity` ring (raise a
-    /// chyron + sound)? It rings unless the origin is muted, the severity is
-    /// below the global threshold, or DND is active — except a **Critical always
-    /// breaks through DND** (lock 10). Either way the caller still logs it.
+    /// Should a **folded alert** from `origin_host` / `source` at `severity` ring
+    /// (raise a chyron + sound)? It rings unless the origin or source is muted,
+    /// the severity is below the global threshold, or DND is active — except a
+    /// **Critical always breaks through DND** (lock 10). Either way the caller
+    /// still logs it.
     #[must_use]
-    pub fn should_ring_alert(&self, origin_host: &str, severity: Severity, dnd: bool) -> bool {
-        if self.is_contact_muted(origin_host) {
+    pub fn should_ring_alert(
+        &self,
+        origin_host: &str,
+        source: &str,
+        severity: Severity,
+        dnd: bool,
+    ) -> bool {
+        if self.is_contact_muted(origin_host) || self.is_source_muted(source) {
             return false;
         }
         if !self.passes_threshold(severity) {
@@ -168,30 +196,30 @@ mod tests {
         assert!(!p.mute_contact("nyc3"), "muting twice is idempotent");
         // Silent across the whole severity range — including Critical (an explicit
         // per-contact mute has no breakthrough; the operator asked for silence).
-        assert!(!p.should_ring_alert("nyc3", Severity::Critical, false));
-        assert!(!p.should_ring_alert("nyc3", Severity::Warning, false));
+        assert!(!p.should_ring_alert("nyc3", "security", Severity::Critical, false));
+        assert!(!p.should_ring_alert("nyc3", "security", Severity::Warning, false));
         assert!(!p.should_ring_message("nyc3", None, false));
         // A different contact is unaffected.
-        assert!(p.should_ring_alert("fra1", Severity::Warning, false));
+        assert!(p.should_ring_alert("fra1", "security", Severity::Warning, false));
         // Unmute restores the ring.
         assert!(p.unmute_contact("nyc3"));
-        assert!(p.should_ring_alert("nyc3", Severity::Warning, false));
+        assert!(p.should_ring_alert("nyc3", "security", Severity::Warning, false));
     }
 
     #[test]
     fn severity_threshold_gates_alerts_but_not_messages() {
         let mut p = NotifyPrefs::new();
         // Default Warning threshold: Warning+ ring, Info stays silent (firehose).
-        assert!(p.should_ring_alert("h", Severity::Critical, false));
-        assert!(p.should_ring_alert("h", Severity::Warning, false));
-        assert!(!p.should_ring_alert("h", Severity::Info, false));
+        assert!(p.should_ring_alert("h", "system", Severity::Critical, false));
+        assert!(p.should_ring_alert("h", "system", Severity::Warning, false));
+        assert!(!p.should_ring_alert("h", "system", Severity::Info, false));
         // Raise the bar to Critical: a Warning now stays silent too.
         p.set_threshold(Severity::Critical);
-        assert!(p.should_ring_alert("h", Severity::Critical, false));
-        assert!(!p.should_ring_alert("h", Severity::Warning, false));
+        assert!(p.should_ring_alert("h", "system", Severity::Critical, false));
+        assert!(!p.should_ring_alert("h", "system", Severity::Warning, false));
         // Lower it to Info: everything rings.
         p.set_threshold(Severity::Info);
-        assert!(p.should_ring_alert("h", Severity::Info, false));
+        assert!(p.should_ring_alert("h", "system", Severity::Info, false));
         // The threshold never gates a human message — a chat line is not a machine
         // alert, so it rings even at the strictest threshold.
         p.set_threshold(Severity::Critical);
@@ -202,12 +230,23 @@ mod tests {
     fn dnd_hushes_non_critical_but_a_critical_alert_breaks_through() {
         let p = NotifyPrefs::new();
         // Under DND: Warning alert + message go silent, Critical rings.
-        assert!(!p.should_ring_alert("h", Severity::Warning, true));
+        assert!(!p.should_ring_alert("h", "system", Severity::Warning, true));
         assert!(!p.should_ring_message("h", None, true));
         assert!(
-            p.should_ring_alert("h", Severity::Critical, true),
+            p.should_ring_alert("h", "system", Severity::Critical, true),
             "a Critical alert breaks through DND (safety over quiet)"
         );
+    }
+
+    #[test]
+    fn per_source_mute_silences_matching_alerts_only() {
+        let mut p = NotifyPrefs::new();
+        assert!(p.mute_source("security"));
+        assert!(!p.mute_source("security"), "muting twice is idempotent");
+        assert!(!p.should_ring_alert("nyc3", "security", Severity::Critical, false));
+        assert!(p.should_ring_alert("nyc3", "compute", Severity::Critical, false));
+        assert!(p.unmute_source("security"));
+        assert!(p.should_ring_alert("nyc3", "security", Severity::Warning, false));
     }
 
     #[test]
@@ -227,10 +266,12 @@ mod tests {
         let mut p = NotifyPrefs::new();
         p.mute_contact("nyc3");
         p.mute_room("room:ops");
+        p.mute_source("security");
         p.set_threshold(Severity::Critical);
         let json = serde_json::to_string(&p).expect("serialize");
         let back: NotifyPrefs = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(p, back);
+        assert!(back.is_source_muted("security"));
         // An empty object hydrates to the defaults (forward/backward compatible).
         let fresh: NotifyPrefs = serde_json::from_str("{}").expect("empty object");
         assert_eq!(fresh, NotifyPrefs::new());
