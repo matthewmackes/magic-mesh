@@ -1,10 +1,10 @@
 # CONSOLE — the Terminal's Start-Menu front door
 
 Operator-locked 2026-07-04 (50-Q `/plan` survey). A Carbon-styled **Start Menu that is
-the Front Door for the Terminal**: a terminal-icon button at the far-left of the taskbar
-opens a Win10-style panel of **operational entries**, each of which launches a TUI/CLI op
-as a **new tab in the terminal emulator** (`mde-term-egui`, which already has tabs). The
-menu title is **"Console" / "Operations."**
+the Front Door for the Terminal**: the bottom rail's far-left Start/Advanced icon opens a
+Win10-style panel of **operational entries**, each of which launches a TUI/CLI op as a
+**new tab in the terminal emulator** (`mde-term-egui`, which already has tabs). The menu
+title is **"Console" / "Operations."**
 
 Grounded in a live evaluation of Eagle (a real install): present tools are **btop**
 (not htop), systemctl/journalctl/systemd-cgtop, **nmcli/ip/ss/mtr** (no nmtui),
@@ -17,7 +17,7 @@ mtr, tmux, ncdu (to bundle), and the entire mesh layer beyond stock Fedora Serve
 | # | Area | Lock |
 |---|------|------|
 | 1 | Trigger | Start button **only** (Super stays the shell leader key) |
-| 2 | Button | Far-left, before Workbench; **icon = the Terminal glyph** (it's the terminal's front door) |
+| 2 | Button | Far-left of the bottom rail, before Desktop; **icon = the Start/Advanced tray glyph** |
 | 3 | Shape | Bottom-left panel, rises from the button (Win10 footprint) |
 | 4 | Dismiss | Click-away + Esc + pressing the button again |
 | — | Launch model | Each entry opens a **new tab in the terminal emulator** (`mde-term-egui::new_tab`) |
@@ -83,7 +83,7 @@ mtr, tmux, ncdu (to bundle), and the entire mesh layer beyond stock Fedora Serve
 ## Architecture
 
 - **Shell (`mde-shell-egui`):** a new `console.rs` (the Start-Menu panel) + a Start button
-  in `dock.rs` (far-left, terminal glyph) that toggles it. The panel is a Win10 two-pane
+  in `dock.rs` (far-left bottom rail, Start/Advanced tray glyph) that toggles it. The panel is a Win10 two-pane
   `Area` rising from the button (slide-up Motion); left rail = category jump-index +
   power/session + footer (user@host·version); right = pinned (Terminal+Monitor) + the
   grouped entry list; each entry = icon + label + one-line desc + a Fedora/Quasar tag;
@@ -120,7 +120,7 @@ Two defects, both real:
    `notify` worker (above) fills this.
 
 ## Acceptance (runtime-observable)
-- The far-left terminal-glyph button opens the Console panel (slide-up); Esc/click-away/re-click close it.
+- The far-left bottom-rail Start/Advanced icon opens the Console panel (slide-up); Esc/click-away/re-click close it.
 - Every group renders its entries (icon + desc + provenance tag); arrow keys navigate with a visible focus ring.
 - Selecting an entry switches to the Terminal and opens a **named tab running the real command** (btop actually launches, dnf actually runs, mtr actually probes); root ops sudo-prompt in the tab; the tab stays open on exit.
 - Destructive power ops require typed arming; the Containers&VMs surface link opens the Cloud plane.

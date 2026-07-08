@@ -59,6 +59,7 @@ use crate::auth::{
     self, AuthStage, CredentialPrompt, CredentialStore, DesktopAuth, MeshCredentialStore,
     SealOutcome,
 };
+use crate::dock::DesktopRailSource;
 use crate::vdi::{ConnectRequest, DisplayMode, MonitorSpan, RequestedTarget, VdiProtocol};
 use chooser_prefs::{unix_millis, ChooserPrefs, ManualEntry};
 
@@ -1254,6 +1255,89 @@ impl ChooserState {
             .filter(|m| !self.roster_has(&m.id))
             .count();
         roster + pinned
+    }
+
+    /// Reconnect the newest recently-used source that is still present/connectable.
+    /// This is the compact rail face of the same chooser state: it reuses the
+    /// existing `activate` + `confirm_connect` path and returns the same
+    /// [`ConnectRequest`] the expanded chooser would hand to the Desktop surface.
+    /// If a source needs a credential prompt, the pending picker remains raised and
+    /// `None` is returned so the shell can show the chooser face honestly.
+    pub(crate) fn connect_last_recent(&mut self) -> Option<ConnectRequest> {
+        self.refresh_prefs_cache();
+        let sources = self.sources_snapshot();
+        let recents = self.prefs.merged().recents;
+        for recent in recents {
+            let Some(source) = sources
+                .iter()
+                .find(|s| s.id == recent.id && s.connectable())
+            else {
+                continue;
+            };
+            let id = source.id.clone();
+            self.activate(&sources, &id);
+            self.confirm_connect(&sources);
+            if let Some(request) = self.take_connect() {
+                return Some(request);
+            }
+            if self.pending.is_some() {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Compact source rows for the Desktop rail flyout (NAVBAR-U2). This is only a
+    /// bounded presentation of the same chooser snapshot; selecting a row must come
+    /// back through [`Self::connect_source_id`] so the full chooser remains the
+    /// source of truth for protocol/auth decisions.
+    pub(crate) fn rail_sources(&mut self) -> Vec<DesktopRailSource> {
+        self.refresh_prefs_cache();
+        let mut sources = self.sources_snapshot();
+        sources.sort_by(|a, b| {
+            let af = self.favorites.contains(&a.id);
+            let bf = self.favorites.contains(&b.id);
+            bf.cmp(&af)
+                .then_with(|| {
+                    self.recents
+                        .contains(&b.id)
+                        .cmp(&self.recents.contains(&a.id))
+                })
+                .then_with(|| a.node.cmp(&b.node))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        sources
+            .iter()
+            .map(|source| {
+                let protocol = source
+                    .protocols
+                    .iter()
+                    .find(|offer| offer.protocol.route().is_some())
+                    .or_else(|| source.protocols.first())
+                    .map_or("?", |offer| offer.protocol.badge());
+                DesktopRailSource::new(
+                    source.id.clone(),
+                    source.name.clone(),
+                    source.node.clone(),
+                    protocol,
+                    source.connectable(),
+                    self.favorites.contains(&source.id),
+                    self.recents.contains(&source.id),
+                )
+            })
+            .collect()
+    }
+
+    /// Connect a source selected from the compact rail flyout. Reuses the same
+    /// activation/confirmation path as the expanded chooser; if credentials are
+    /// needed, the pending prompt remains in `ChooserState` and the shell simply
+    /// surfaces Desktop/Chooser.
+    pub(crate) fn connect_source_id(&mut self, id: &str) -> Option<ConnectRequest> {
+        self.refresh_prefs_cache();
+        let sources = self.sources_snapshot();
+        self.activate(&sources, id);
+        self.confirm_connect(&sources);
+        self.take_connect()
     }
 
     /// Force an immediate roster re-read now (MENUBAR-ALL — the Desktop bar's
@@ -4846,6 +4930,96 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compact_reconnect_uses_the_newest_recent_source() {
+        let root = temp_prefs_root("compact-reconnect");
+        let older = source("peer:ash", "ash", &[Protocol::Vnc]);
+        let newer = source("peer:oak", "oak", &[Protocol::Rdp]);
+        let mut state = state_with_prefs(
+            Some(roster(vec![older.clone(), newer.clone()])),
+            None,
+            root.clone(),
+            "seat-a",
+        );
+
+        state.prefs.record_recent("peer:ash", "ash", 10);
+        state.prefs.record_recent("peer:oak", "oak", 20);
+        state.refresh_prefs_cache();
+
+        let request = state
+            .connect_last_recent()
+            .expect("newest recent reconnects");
+        assert_eq!(request.target.name, "oak");
+        assert_eq!(request.protocol, VdiProtocol::Rdp);
+        assert!(
+            state.take_connect().is_none(),
+            "the compact reconnect returns and drains the request"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compact_source_rows_reuse_chooser_state_and_selected_source_connects() {
+        let root = temp_prefs_root("compact-source-rows");
+        let plain = source("peer:ash", "ash", &[Protocol::Vnc]);
+        let pinned = source("peer:oak", "oak", &[Protocol::Rdp]);
+        let mut state = state_with_prefs(
+            Some(roster(vec![plain.clone(), pinned.clone()])),
+            None,
+            root.clone(),
+            "seat-a",
+        );
+        state.toggle_favorite("peer:oak");
+        state.refresh_prefs_cache();
+
+        let rows = state.rail_sources();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "peer:oak", "pinned source floats first");
+        assert_eq!(rows[0].label, "oak");
+        assert!(rows[0].connectable);
+
+        let request = state
+            .connect_source_id("peer:ash")
+            .expect("selected compact row connects through chooser");
+        assert_eq!(request.target.name, "ash");
+        assert_eq!(request.protocol, VdiProtocol::Vnc);
+        assert!(
+            state.take_connect().is_none(),
+            "compact source connect returns and drains the request"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compact_selection_and_expanded_panel_share_the_same_pending_picker() {
+        // NAVBAR-U4 — the compact rail face and the expanded chooser face are one
+        // `ChooserState`: selecting an external source from compact mode raises the
+        // credential picker in the same state the expanded panel renders.
+        let (mut state, id) = external_state(Box::new(RecordingStore::default()));
+        assert!(
+            state.connect_source_id(&id).is_none(),
+            "no sealed external credential means compact selection must not connect blind"
+        );
+        assert!(
+            state
+                .pending
+                .as_ref()
+                .is_some_and(|d| d.source_id == id && d.cred_prompt.is_some()),
+            "compact selection raised the expanded chooser's pending credential prompt"
+        );
+        assert!(
+            run_panel(&mut state),
+            "the expanded chooser renders the pending prompt from the compact pick"
+        );
+        assert!(
+            state
+                .pending
+                .as_ref()
+                .is_some_and(|d| d.source_id == id && d.cred_prompt.is_some()),
+            "rendering the expanded face keeps the same pending picker state"
+        );
     }
 
     #[test]

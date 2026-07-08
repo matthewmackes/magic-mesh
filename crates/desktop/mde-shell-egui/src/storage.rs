@@ -3263,6 +3263,11 @@ mod menubar_coverage {
             Surface::Browser => Coverage::Covered {
                 title: "Browser", // MENU-3 (web.rs, the two-engine bar)
             },
+            Surface::Bookmarks => Coverage::Exempt {
+                reason: "bare — mde-bookmarks-egui mounts with its own manager \
+                         header; folding it onto the shared bar is a MENUBAR-SWEEP \
+                         follow-on",
+            },
             Surface::Chat => Coverage::Covered {
                 title: "Contacts", // MENU-2 (chat.rs)
             },
@@ -3387,6 +3392,7 @@ mod menubar_coverage {
                 Surface::Media,
                 Surface::Files,
                 Surface::Voice,
+                Surface::Bookmarks,
                 Surface::Terminal,
                 Surface::Editor,
                 Surface::Phones,

@@ -279,7 +279,9 @@ const GROUPS: [ConsoleGroup; 7] = [
                 tool: "ip",
                 provenance: Provenance::Quasar,
                 icon: IconId::Signal,
-                kind: EntryKind::Tab("bash -lc 'ip -br addr; echo; ip route; echo; meshctl status'"),
+                kind: EntryKind::Tab(
+                    "bash -lc 'ip -br addr; echo; ip route; echo; meshctl status'",
+                ),
             },
             ConsoleEntry {
                 label: "Connections & Ports",
@@ -1350,10 +1352,10 @@ fn power_section(ui: &mut egui::Ui, rail: &egui::Rect, top: f32, state: &mut Con
     }
 }
 
-/// The Power section's **typed-arming stage** (lock #36): the "Type <label> to
-/// confirm" prompt, the echo field, a DANGER Confirm that fires ONLY once the
-/// echo matches (§7 — disarmed it is inert, painted dim), and Cancel back to
-/// the rows. Addressable rows (stable ids), the dock's explicit-rect idiom.
+/// The Power section's **typed-arming stage** (lock #36): the echo field, a
+/// DANGER Confirm that fires ONLY once the echo matches (§7 — disarmed it is inert,
+/// painted dim), and Cancel back to the rows. Addressable rows (stable ids), the
+/// dock's explicit-rect idiom.
 fn power_arming_stage(ui: &mut egui::Ui, rail: &egui::Rect, top: f32, state: &mut ConsoleState) {
     let Some(action) = state.arming.as_ref().map(|a| a.action) else {
         return;
@@ -1361,16 +1363,9 @@ fn power_arming_stage(ui: &mut egui::Ui, rail: &egui::Rect, top: f32, state: &mu
     let painter = ui.painter().clone();
     let inner_l = rail.left() + Style::SP_S;
     let inner_w = RAIL_W - Style::SP_M;
-    painter.text(
-        egui::pos2(inner_l, top + Style::SP_L / 2.0),
-        egui::Align2::LEFT_CENTER,
-        format!("Type {} to confirm", action.label()),
-        egui::FontId::proportional(Style::SMALL),
-        Style::WARN,
-    );
     // The echo field (scoped so the `&mut` on the buffer ends before `armed`).
     let field = egui::Rect::from_min_size(
-        egui::pos2(inner_l, top + Style::SP_L),
+        egui::pos2(inner_l, top + Style::SP_XS),
         egui::vec2(inner_w, FIELD_H),
     );
     {
@@ -1385,7 +1380,7 @@ fn power_arming_stage(ui: &mut egui::Ui, rail: &egui::Rect, top: f32, state: &mu
     let armed = state.armed();
 
     // Confirm (left) + Cancel (right) — a disarmed Confirm is inert (§7).
-    let buttons_top = top + Style::SP_L + FIELD_H + Style::SP_XS;
+    let buttons_top = top + Style::SP_XS + FIELD_H + Style::SP_XS;
     let confirm = egui::Rect::from_min_size(
         egui::pos2(inner_l, buttons_top),
         egui::vec2(inner_w * 0.62, FIELD_H),

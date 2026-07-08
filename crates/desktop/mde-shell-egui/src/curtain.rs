@@ -332,13 +332,12 @@ const EXTRAS_W_FRAC: f32 = 0.5;
 const EXTRAS_H_FRAC: f32 = 0.22;
 /// The locked volume slider's width, on the spacing grid.
 const VOL_SLIDER_W: f32 = Style::SP_XL * 5.0;
-/// The mute-toggle glyph edge (the tray's 16px raster idiom).
+/// The mute-toggle glyph edge (the compact status raster idiom).
 const GLANCE_ICON: f32 = Style::SP_M;
-/// A status-row glanceable dot's radius (the tray's tiny state-dot idiom).
+/// A status-row glanceable dot's radius (the compact state-dot idiom).
 const GLANCE_DOT_R: f32 = Style::SP_XS / 2.0;
 /// Charge (%) at/under which the battery glanceable reads red, and under which
-/// it reads amber (the tray's ladder, restated — `tray.rs` is a sibling worker's
-/// file and its folds are private, so the thresholds live here too).
+/// it reads amber (the status ladder, restated for the lock screen).
 const GLANCE_BATTERY_CRITICAL: f64 = 5.0;
 const GLANCE_BATTERY_LOW: f64 = 20.0;
 /// How far the idle dim drops the face type toward black — the clock stays
@@ -748,7 +747,7 @@ impl Curtain {
     /// (design lock 3/7), `seat` carries the master-mixer level + the battery
     /// glanceable (lock 4), and `mesh` the network-health glanceable (lock 4).
     /// The shell passes its own `self.media` / `system.snapshot()` /
-    /// `chrome.summary()` — the same reads the taskbar tray folds, no new poll.
+    /// `chrome.summary()` — the same reads the dock status folds, no new poll.
     pub(crate) fn show(
         &mut self,
         ctx: &egui::Context,
@@ -1151,8 +1150,8 @@ fn now_playing_strip(ui: &mut egui::Ui, media: &mut dyn LockMedia) {
 
 /// The glanceable status row (design lock 4): battery · mesh health · date — the
 /// ONLY status the curtain shows. NO message content: chat previews stay private
-/// until unlock, and the curtain is handed no chat state to leak. The tray's
-/// fold logic, restated (its helpers are private to a sibling worker's tray.rs).
+/// until unlock, and the curtain is handed no chat state to leak. The status fold
+/// logic is restated locally for the lock screen.
 fn status_row(ui: &mut egui::Ui, seat: Option<&SeatSnapshot>, mesh: &MeshSummary) {
     ui.horizontal(|ui| {
         if let Some((pct, tone)) = battery_glance(seat) {

@@ -27,6 +27,18 @@ use mde_egui::hostkeys::HostScan;
 
 use mde_seat::hotkeys::{action_for, HotkeyAction};
 
+/// A Super+number navigation target. Slot `0` is the first visible launcher
+/// surface; `9` is the tenth (`Super+0`, the Win10 taskbar convention).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NavSlot(usize);
+
+impl NavSlot {
+    /// The zero-based surface index this slot selects.
+    pub(crate) const fn index(self) -> usize {
+        self.0
+    }
+}
+
 /// An XF86 media/system key — the host-first set (lock 8). Each maps to a fixed
 /// chord string in `mde_seat::hotkeys::HOTKEYS`, so its action is looked up there
 /// rather than duplicated.
@@ -133,6 +145,9 @@ pub(crate) struct HotkeyRouter {
     /// Latched `true` on a clean Super-tap release; drained by
     /// [`Self::take_dock_toggle`]. A leader-chord hold never sets it.
     dock_toggle: bool,
+    /// Latched Super+number navigation request. Drained by the shell after normal
+    /// hotkey actions so the existing typed host-action table stays closed.
+    nav_slot: Option<NavSlot>,
 }
 
 impl HotkeyRouter {
@@ -148,6 +163,11 @@ impl HotkeyRouter {
     /// never sets it, so the tap-toggle and the leader chord don't collide.
     pub(crate) fn take_dock_toggle(&mut self) -> bool {
         std::mem::take(&mut self.dock_toggle)
+    }
+
+    /// Drain a Super+number navigation request, if one fired this frame.
+    pub(crate) fn take_nav_slot(&mut self) -> Option<NavSlot> {
+        self.nav_slot.take()
     }
 
     /// Fold one forwarded host-key scan: a media key is host-first (always yields
@@ -188,6 +208,11 @@ impl HotkeyRouter {
         if !self.leader {
             return None;
         }
+        if let Some(slot) = nav_slot_for_key(key) {
+            self.leader_used = true;
+            self.nav_slot = Some(slot);
+            return None;
+        }
         let action = leader_chord(key).and_then(action_for);
         if action.is_some() {
             self.leader_used = true;
@@ -218,6 +243,22 @@ impl HotkeyRouter {
         }
         actions
     }
+}
+
+const fn nav_slot_for_key(key: egui::Key) -> Option<NavSlot> {
+    Some(NavSlot(match key {
+        egui::Key::Num1 => 0,
+        egui::Key::Num2 => 1,
+        egui::Key::Num3 => 2,
+        egui::Key::Num4 => 3,
+        egui::Key::Num5 => 4,
+        egui::Key::Num6 => 5,
+        egui::Key::Num7 => 6,
+        egui::Key::Num8 => 7,
+        egui::Key::Num9 => 8,
+        egui::Key::Num0 => 9,
+        _ => return None,
+    }))
 }
 
 /// The egui key **presses** in this frame's input (a press, not a release), the
@@ -310,6 +351,31 @@ mod tests {
         assert_eq!(
             r.dispatch(&[], &[egui::Key::Escape]),
             vec![HotkeyAction::ReturnToChrome]
+        );
+    }
+
+    #[test]
+    fn super_numbers_latch_taskbar_navigation_slots_without_toggling_the_dock() {
+        let mut r = HotkeyRouter::default();
+
+        let acts = r.dispatch(&[scan(125, true)], &[egui::Key::Num1]);
+        assert!(acts.is_empty(), "Super+1 is shell nav, not a host action");
+        assert_eq!(r.take_nav_slot().map(NavSlot::index), Some(0));
+        assert!(
+            r.take_nav_slot().is_none(),
+            "the nav slot latch drains exactly once"
+        );
+        let _ = r.dispatch(&[scan(125, false)], &[]);
+        assert!(
+            !r.take_dock_toggle(),
+            "a Super+number hold is not a clean Super tap"
+        );
+
+        let _ = r.dispatch(&[scan(125, true)], &[egui::Key::Num0]);
+        assert_eq!(
+            r.take_nav_slot().map(NavSlot::index),
+            Some(9),
+            "Super+0 maps to the tenth visible slot"
         );
     }
 

@@ -318,7 +318,10 @@ mod tests {
             if let Some(verdict) = verifier.poll() {
                 return verdict;
             }
-            assert!(Instant::now() < deadline, "the verdict never arrived off-thread");
+            assert!(
+                Instant::now() < deadline,
+                "the verdict never arrived off-thread"
+            );
             std::thread::yield_now();
         }
     }
@@ -341,8 +344,12 @@ mod tests {
         );
         // $LOGNAME is the second choice.
         assert_eq!(
-            seat_user_from(|k| (k == "LOGNAME").then(|| "carol".to_owned()), || None, || None)
-                .as_deref(),
+            seat_user_from(
+                |k| (k == "LOGNAME").then(|| "carol".to_owned()),
+                || None,
+                || None
+            )
+            .as_deref(),
             Some("carol")
         );
         // A blank env value is ignored — resolution falls through to the uid.
@@ -402,15 +409,23 @@ mod tests {
         let (release_tx, release_rx): (Sender<()>, Receiver<()>) = mpsc::channel();
         let gate = Arc::new(Mutex::new(release_rx));
         let backend: Backend = Arc::new(move |_user, _password| {
-            let guard = gate.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ = guard.recv(); // park until the test releases the worker
             Verdict::Granted
         });
 
         let mut verifier = PamVerifier::with_backend(Some("seat".to_owned()), backend);
         verifier.begin("hunter2");
-        assert!(verifier.poll().is_none(), "poll must be None while the worker runs");
-        assert!(verifier.poll().is_none(), "and stays None until the verdict lands");
+        assert!(
+            verifier.poll().is_none(),
+            "poll must be None while the worker runs"
+        );
+        assert!(
+            verifier.poll().is_none(),
+            "and stays None until the verdict lands"
+        );
 
         release_tx.send(()).expect("release the parked worker");
         assert_eq!(wait_verdict(&mut verifier), Verdict::Granted);

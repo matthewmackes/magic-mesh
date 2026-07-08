@@ -98,7 +98,10 @@ pub(crate) fn profile_body(ui: &mut egui::Ui, state: &ProfileState, actions: &mu
         for name in &state.available {
             let selected = state.active == *name;
             if ui
-                .selectable_label(selected, RichText::new(profile_label(name)).size(Style::SMALL))
+                .selectable_label(
+                    selected,
+                    RichText::new(profile_label(name)).size(Style::SMALL),
+                )
                 .clicked()
             {
                 if let Some(action) = profile_action(state, name) {
@@ -295,7 +298,10 @@ pub(crate) fn idle_timeout_body(
                 for action in IdleAction::ALL {
                     let selected = config.idle_action == action;
                     if ui
-                        .selectable_label(selected, RichText::new(action.label()).size(Style::SMALL))
+                        .selectable_label(
+                            selected,
+                            RichText::new(action.label()).size(Style::SMALL),
+                        )
                         .clicked()
                         && !selected
                     {
@@ -333,7 +339,10 @@ pub(crate) fn lid_action_body(
                 for action in LidAction::ALL {
                     let selected = config.lid_action == action;
                     if ui
-                        .selectable_label(selected, RichText::new(action.label()).size(Style::SMALL))
+                        .selectable_label(
+                            selected,
+                            RichText::new(action.label()).size(Style::SMALL),
+                        )
                         .clicked()
                         && !selected
                     {

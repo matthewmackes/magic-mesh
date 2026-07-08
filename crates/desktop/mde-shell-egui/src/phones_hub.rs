@@ -21,16 +21,18 @@
 //!   flag) + a composer that emits a `runcommands.toml` stanza to drop on a node.
 //! * **Pair** — the pair-a-phone flow: the KDE Connect device name the phone sees
 //!   (the "Quasar Mesh" endpoint name when this node is the mesh-fanout endpoint,
-//!   #8), the reachable overlay address, and the pairing code. *(The scannable QR
-//!   bitmap + one-scan enroll+pair token is KDC-MESH-4's onboarding deliverable; the
-//!   hub presents the honest manual-pair flow + the code that QR carries — never a
-//!   faked bitmap, §7.)*
+//!   #8), the reachable overlay address, and the scannable KDC-MESH-4 QR payload.
+//!   The payload already has slots for both the mesh enroll token and KDC pairing
+//!   token; until the onboarding worker publishes a fresh enroll token to this hub,
+//!   the QR honestly carries `enroll:null` and the UI labels that leg pending (§7).
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use mde_egui::egui::{self, RichText};
 use mde_egui::Style;
+use qrcode::{types::Color, EcLevel, QrCode};
 
 use mackes_mesh_types::peers::default_workgroup_root;
 use mde_bus::hooks::config::Priority;
@@ -54,6 +56,10 @@ const MESH_NAME_PREFIX: &str = "MDE-MESH";
 /// The single device name the designated mesh-fanout endpoint advertises to stock
 /// KDE Connect (mirrors `mde_kdc_host::fanout::MESH_ENDPOINT_NAME`, #8).
 const MESH_ENDPOINT_NAME: &str = "Quasar Mesh";
+
+/// KDC-MESH-4 — latest-wins short-TTL mesh enroll token for the Pair QR. Minting
+/// stays in the onboard path; the hub only consumes the worker-published state.
+const PAIR_ENROLL_TOKEN_TOPIC: &str = "state/connect/mesh-enroll-token";
 
 // ── Bus payload mirrors (local serde, the shell-tier pattern) ────────────────
 
@@ -117,6 +123,16 @@ struct BrowseReply {
     entries: Vec<EntryMirror>,
     #[serde(default)]
     error: Option<String>,
+}
+
+/// Worker-published short-TTL mesh enroll token for the Pair QR.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct PairEnrollToken {
+    token: String,
+    #[serde(default)]
+    expires_at_ms: Option<i64>,
+    #[serde(default)]
+    source: Option<String>,
 }
 
 // ── UI model ─────────────────────────────────────────────────────────────────
@@ -250,6 +266,13 @@ pub struct PhonesHubState {
     note: Option<(String, bool)>,
     /// The Commands tab composer draft.
     draft: CmdDraft,
+    /// KDC-MESH-4 — operator-provided short-TTL mesh enroll token to include in
+    /// the Pair QR. Minting remains owned by the onboard path; the hub never
+    /// fabricates a token.
+    pair_enroll_token: String,
+    /// KDC-MESH-4 — worker-published short-TTL token, read from
+    /// [`PAIR_ENROLL_TOKEN_TOPIC`]. Manual paste above wins when non-empty.
+    published_pair_enroll: Option<PairEnrollToken>,
 }
 
 impl Default for PhonesHubState {
@@ -270,6 +293,8 @@ impl Default for PhonesHubState {
             pending: None,
             note: None,
             draft: CmdDraft::default(),
+            pair_enroll_token: String::new(),
+            published_pair_enroll: None,
         }
     }
 }
@@ -316,6 +341,7 @@ impl PhonesHubState {
         if due {
             self.last_refresh = Some(Instant::now());
             self.refresh_directory();
+            self.refresh_pair_enroll_token();
             if self.roster_pending.is_none() {
                 self.request_roster();
             }
@@ -327,6 +353,14 @@ impl PhonesHubState {
     /// scan, KDC-MESH-7) — every node's published KDC services + shared-roots snapshot.
     fn refresh_directory(&mut self) {
         self.nodes = collect_nodes(&self.workgroup_root);
+    }
+
+    /// Re-read the daemon-minted short-TTL mesh enroll token for the Pair QR.
+    /// Expired/malformed state is treated as absent so the QR stays honest.
+    fn refresh_pair_enroll_token(&mut self) {
+        self.published_pair_enroll = self
+            .persist()
+            .and_then(|persist| latest_pair_enroll_token(&persist, now_ms()));
     }
 
     /// Publish an (empty) `action/connect/devices` request; the reply lands the live
@@ -916,30 +950,60 @@ impl PhonesHubState {
             );
             ui.add_space(Style::SP_S);
             ui.label(
-                RichText::new("Pairing code")
+                RichText::new("Mesh enroll token")
                     .size(Style::SMALL)
                     .color(Style::TEXT_DIM),
             );
-            let mut shown = code.clone();
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pair_enroll_token)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("mesh:... or mde-invite:...")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.colored_label(
+                Style::TEXT_DIM,
+                RichText::new(
+                    "Paste a fresh short-TTL token from `mackesd found` or \
+                     `mackesd onboard invite-issue`. Empty uses the latest \
+                     daemon-published token when available.",
+                )
+                .size(Style::SMALL),
+            );
+            let selected_enroll = selected_pair_enroll_token(
+                &self.pair_enroll_token,
+                self.published_pair_enroll.as_ref(),
+                now_ms(),
+            );
+            let qr_payload = pair_qr_payload(selected_enroll, &code);
+            ui.add_space(Style::SP_S);
+            ui.label(
+                RichText::new("Pairing QR")
+                    .size(Style::SMALL)
+                    .color(Style::TEXT_DIM),
+            );
+            render_pair_qr(ui, &qr_payload);
+            ui.add_space(Style::SP_XS);
+            let mut shown = qr_payload.clone();
             ui.add(
                 egui::TextEdit::multiline(&mut shown)
                     .font(egui::TextStyle::Monospace)
-                    .desired_rows(2)
+                    .desired_rows(3)
                     .desired_width(f32::INFINITY),
             );
             ui.horizontal(|ui| {
-                if ui.button("Copy code").clicked() {
-                    ui.ctx().copy_text(code.clone());
-                    self.note = Some(("copied the pairing code".to_string(), false));
+                if ui.button("Copy QR payload").clicked() {
+                    ui.ctx().copy_text(qr_payload.clone());
+                    self.note = Some(("copied the pairing QR payload".to_string(), false));
                 }
             });
             ui.add_space(Style::SP_XS);
             ui.colored_label(
                 Style::TEXT_DIM,
-                RichText::new(
-                    "This is the code a pairing QR carries. One-scan enroll-and-pair (a scannable \
-                     QR that also joins the phone to Nebula) is the mesh onboarding flow.",
-                )
+                RichText::new(pair_qr_status_text(
+                    normalized_enroll_token(&self.pair_enroll_token),
+                    self.published_pair_enroll.as_ref(),
+                    now_ms(),
+                ))
                 .size(Style::SMALL),
             );
         });
@@ -1192,6 +1256,116 @@ fn pairing_code(device_id: Option<&str>, overlay_ip: Option<&str>) -> String {
     }
 }
 
+#[derive(Debug, serde::Serialize)]
+struct PairQrPayload<'a> {
+    v: u8,
+    enroll: Option<&'a str>,
+    pair: &'a str,
+}
+
+/// KDC-MESH-4 QR payload. The URI prefix makes the scan target explicit; the
+/// base64url body is compact JSON so future phone-side scanners can validate `v`
+/// before consuming the enroll/pair fields.
+fn pair_qr_payload(enroll_token: Option<&str>, pair_code: &str) -> String {
+    let payload = PairQrPayload {
+        v: 1,
+        enroll: enroll_token.filter(|s| !s.trim().is_empty()),
+        pair: pair_code,
+    };
+    let body = serde_json::to_vec(&payload).unwrap_or_default();
+    format!("mde-kdc-mesh-pair:{}", URL_SAFE_NO_PAD.encode(body))
+}
+
+fn normalized_enroll_token(token: &str) -> Option<&str> {
+    let trimmed = token.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn selected_pair_enroll_token<'a>(
+    manual: &'a str,
+    published: Option<&'a PairEnrollToken>,
+    now_ms: i64,
+) -> Option<&'a str> {
+    normalized_enroll_token(manual).or_else(|| fresh_pair_enroll_token(published, now_ms))
+}
+
+fn fresh_pair_enroll_token(published: Option<&PairEnrollToken>, now_ms: i64) -> Option<&str> {
+    let published = published?;
+    let token = normalized_enroll_token(&published.token)?;
+    if published
+        .expires_at_ms
+        .is_some_and(|expiry| expiry <= now_ms)
+    {
+        return None;
+    }
+    Some(token)
+}
+
+fn pair_qr_status_text(
+    manual: Option<&str>,
+    published: Option<&PairEnrollToken>,
+    now_ms: i64,
+) -> String {
+    if manual.is_some() {
+        return "The QR payload includes the KDC pairing target and the pasted mesh enroll token."
+            .to_string();
+    }
+    match fresh_pair_enroll_token(published, now_ms) {
+        Some(_) => "The QR payload includes the KDC pairing target and the latest daemon-published mesh enroll token.".to_string(),
+        None => "The QR payload includes the KDC pairing target. No fresh mesh enroll token is published yet, so the enroll leg remains pending.".to_string(),
+    }
+}
+
+fn latest_pair_enroll_token(persist: &Persist, now_ms: i64) -> Option<PairEnrollToken> {
+    let msgs = persist.list_since(PAIR_ENROLL_TOKEN_TOPIC, None).ok()?;
+    let body = msgs.last()?.body.as_deref()?;
+    let token = serde_json::from_str::<PairEnrollToken>(body).ok()?;
+    fresh_pair_enroll_token(Some(&token), now_ms)?;
+    Some(token)
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+fn pair_qr_matrix(payload: &str) -> Option<QrCode> {
+    QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::M).ok()
+}
+
+fn render_pair_qr(ui: &mut egui::Ui, payload: &str) {
+    let Some(code) = pair_qr_matrix(payload) else {
+        ui.colored_label(
+            Style::WARN,
+            RichText::new("QR payload is too large to render").size(Style::SMALL),
+        );
+        return;
+    };
+    let modules = code.width();
+    let edge = 176.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(edge, edge), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, Style::RADIUS, Style::TEXT_STRONG);
+    let quiet = 4.0_f32;
+    let module = edge / (modules as f32 + quiet * 2.0);
+    let origin = rect.min + egui::vec2(module * quiet, module * quiet);
+    for y in 0..modules {
+        for x in 0..modules {
+            if code[(x, y)] == Color::Dark {
+                let min = origin + egui::vec2(x as f32 * module, y as f32 * module);
+                let max = min + egui::vec2(module.ceil(), module.ceil());
+                painter.rect_filled(
+                    egui::Rect::from_min_max(min, max),
+                    egui::CornerRadius::ZERO,
+                    Style::BG,
+                );
+            }
+        }
+    }
+}
+
 // ── small render helpers ─────────────────────────────────────────────────────
 
 /// A labeled read-only value row.
@@ -1319,6 +1493,116 @@ mod tests {
         );
         assert!(pairing_code(Some("dev1"), None).contains("not on the mesh"));
         assert!(pairing_code(None, Some("10.42.0.9")).contains("not on the mesh"));
+    }
+
+    #[test]
+    fn pair_qr_payload_carries_enroll_and_pair_fields() {
+        let pair = format!("mde-kdc-pair:dev1@10.42.0.9:{KDC_PORT}");
+        let payload = pair_qr_payload(Some("mesh:magic@203.0.113.10:4243#bearer?fp=abc"), &pair);
+        assert!(payload.starts_with("mde-kdc-mesh-pair:"));
+        let encoded = payload
+            .strip_prefix("mde-kdc-mesh-pair:")
+            .expect("payload prefix");
+        let body = URL_SAFE_NO_PAD.decode(encoded).expect("base64url payload");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json payload");
+        assert_eq!(json["v"], 1);
+        assert_eq!(json["enroll"], "mesh:magic@203.0.113.10:4243#bearer?fp=abc");
+        assert_eq!(json["pair"], pair);
+        assert!(
+            pair_qr_matrix(&payload).is_some(),
+            "combined enroll+pair payload should fit in a QR matrix"
+        );
+    }
+
+    #[test]
+    fn pair_qr_payload_honestly_allows_pending_enroll_token() {
+        let pair = format!("mde-kdc-pair:dev1@10.42.0.9:{KDC_PORT}");
+        let payload = pair_qr_payload(None, &pair);
+        let encoded = payload
+            .strip_prefix("mde-kdc-mesh-pair:")
+            .expect("payload prefix");
+        let body = URL_SAFE_NO_PAD.decode(encoded).expect("base64url payload");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json payload");
+        assert!(json["enroll"].is_null());
+        assert_eq!(json["pair"], pair);
+    }
+
+    #[test]
+    fn normalized_enroll_token_trims_manual_token_for_the_qr() {
+        assert_eq!(
+            normalized_enroll_token("  mesh:m@1.2.3.4:4243#b  "),
+            Some("mesh:m@1.2.3.4:4243#b")
+        );
+        assert_eq!(normalized_enroll_token(" \n\t "), None);
+    }
+
+    #[test]
+    fn daemon_published_enroll_token_feeds_the_pair_qr_when_manual_is_empty() {
+        let token = PairEnrollToken {
+            token: "mesh:auto@203.0.113.10:4243#bearer?fp=abc".to_string(),
+            expires_at_ms: Some(2_000),
+            source: Some("onboard".to_string()),
+        };
+        assert_eq!(
+            selected_pair_enroll_token("", Some(&token), 1_000),
+            Some("mesh:auto@203.0.113.10:4243#bearer?fp=abc")
+        );
+        assert!(
+            pair_qr_status_text(None, Some(&token), 1_000).contains("daemon-published"),
+            "status text should name the automatic source"
+        );
+    }
+
+    #[test]
+    fn manual_enroll_token_overrides_the_daemon_published_token() {
+        let token = PairEnrollToken {
+            token: "mesh:auto@203.0.113.10:4243#bearer?fp=abc".to_string(),
+            expires_at_ms: Some(2_000),
+            source: None,
+        };
+        assert_eq!(
+            selected_pair_enroll_token(" mesh:manual@203.0.113.20:4243#m ", Some(&token), 1_000),
+            Some("mesh:manual@203.0.113.20:4243#m")
+        );
+    }
+
+    #[test]
+    fn expired_daemon_published_enroll_token_is_not_put_in_the_qr() {
+        let token = PairEnrollToken {
+            token: "mesh:expired@203.0.113.10:4243#bearer?fp=abc".to_string(),
+            expires_at_ms: Some(999),
+            source: None,
+        };
+        assert_eq!(selected_pair_enroll_token("", Some(&token), 1_000), None);
+        assert!(
+            pair_qr_status_text(None, Some(&token), 1_000).contains("pending"),
+            "status text should stay honest when the published token is stale"
+        );
+    }
+
+    #[test]
+    fn latest_pair_enroll_token_reads_latest_wins_bus_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = Persist::open(tmp.path().to_path_buf()).expect("bus");
+        persist
+            .write(
+                PAIR_ENROLL_TOKEN_TOPIC,
+                Priority::Default,
+                None,
+                Some(r#"{"token":"mesh:old@203.0.113.1:4243#old","expires_at_ms":2000}"#),
+            )
+            .expect("write old");
+        persist
+            .write(
+                PAIR_ENROLL_TOKEN_TOPIC,
+                Priority::Default,
+                None,
+                Some(r#"{"token":"mesh:new@203.0.113.2:4243#new","expires_at_ms":3000}"#),
+            )
+            .expect("write new");
+        let got = latest_pair_enroll_token(&persist, 1_000).expect("fresh token");
+        assert_eq!(got.token, "mesh:new@203.0.113.2:4243#new");
+        assert!(latest_pair_enroll_token(&persist, 4_000).is_none());
     }
 
     #[test]
