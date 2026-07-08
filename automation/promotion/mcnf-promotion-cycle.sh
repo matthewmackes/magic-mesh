@@ -9,6 +9,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ARTIFACTS="${MCNF_BUILD_ARTIFACTS:-$HOME/mcnf-release-artifacts}"
+PROMOTION_STATE_DIR="${MCNF_PROMOTION_STATE_DIR:-$ROOT/automation/.state/promotion}"
+PROMOTION_EVIDENCE_LOG="${MCNF_PROMOTION_EVIDENCE_LOG:-$PROMOTION_STATE_DIR/evidence.jsonl}"
 RPM="${MCNF_RPM:-}"
 DO_DOMAIN="${MCNF_DO_DOMAIN:-matthewmackes.com}"
 DO_TAG="${MCNF_DO_TAG:-magic-lighthouse}"
@@ -26,6 +28,15 @@ log() { printf '==> %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
 
+ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+json_escape() {
+  local s="${1//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/ }"
+  printf '%s' "$s"
+}
+
 latest_rpm() {
   if [ -n "$RPM" ]; then printf '%s\n' "$RPM"; return; fi
   ls -t "$ARTIFACTS"/*.rpm 2>/dev/null | head -1
@@ -35,6 +46,28 @@ rpm_sha256() {
   local rpm="$1"
   [ -f "$rpm" ] || return 0
   sha256sum "$rpm" 2>/dev/null | awk '{print $1}'
+}
+
+record_gate() {
+  local stage="$1" result="${2:-pass}" detail="${3:-}" rpm version sha
+  rpm="$(latest_rpm || true)"
+  if [ -n "$rpm" ] && [ -f "$rpm" ]; then
+    version="$(rpm_version_token "$rpm")"
+    sha="$(rpm_sha256 "$rpm")"
+  else
+    rpm=""
+    version=""
+    sha=""
+  fi
+  mkdir -p "$PROMOTION_STATE_DIR"
+  printf '{"ts":"%s","stage":"%s","result":"%s","candidate_rpm":"%s","candidate_version":"%s","candidate_sha256":"%s","detail":"%s"}\n' \
+    "$(ts)" \
+    "$(json_escape "$stage")" \
+    "$(json_escape "$result")" \
+    "$(json_escape "$rpm")" \
+    "$(json_escape "$version")" \
+    "$(json_escape "$sha")" \
+    "$(json_escape "$detail")" >>"$PROMOTION_EVIDENCE_LOG"
 }
 
 worklist_open_count() {
@@ -70,6 +103,40 @@ worklist_active_breakdown() {
     "$(worklist_marker_count '→')" \
     "$(worklist_marker_count '~')" \
     "$(worklist_marker_count '◐')"
+}
+
+json_value() {
+  local line="$1" key="$2"
+  printf '%s\n' "$line" | sed -n "s/.*\"$key\":\"\\([^\"]*\\)\".*/\\1/p"
+}
+
+latest_gate_evidence() {
+  local stage="$1" sha="$2"
+  [ -n "$sha" ] || return 1
+  [ -f "$PROMOTION_EVIDENCE_LOG" ] || return 1
+  grep "\"stage\":\"$stage\"" "$PROMOTION_EVIDENCE_LOG" 2>/dev/null \
+    | grep "\"candidate_sha256\":\"$sha\"" \
+    | tail -1
+}
+
+status_gate_evidence() {
+  local sha="$1" stage line result gate_ts detail
+  echo "  promotion_evidence_log: $PROMOTION_EVIDENCE_LOG"
+  echo "  promotion_evidence:"
+  for stage in build l1 l2 l3 l4 eagle do live-smoke live-audit media-verify fd-soak; do
+    if line="$(latest_gate_evidence "$stage" "$sha")" && [ -n "$line" ]; then
+      gate_ts="$(json_value "$line" ts)"
+      result="$(json_value "$line" result)"
+      detail="$(json_value "$line" detail)"
+      if [ -n "$detail" ]; then
+        echo "    - $stage: $result at $gate_ts ($detail)"
+      else
+        echo "    - $stage: $result at $gate_ts"
+      fi
+    else
+      echo "    - $stage: missing"
+    fi
+  done
 }
 
 do_active_count() {
@@ -200,30 +267,35 @@ build_rpm() {
   [ -n "$RPM" ] && [ -f "$RPM" ] || die "farm build did not leave an RPM in $ARTIFACTS"
   log "RPM=$RPM"
   publish_promote build "$(rpm_version_token "$RPM")" ready "farm-rpm"
+  record_gate build pass "farm-rpm"
 }
 
 run_l1() {
   RPM="$(latest_rpm)"; [ -f "$RPM" ] || die "no RPM; run build first"
   log "L1 install gate"
   "$ROOT/automation/testbed/test-install.sh" "$RPM"
+  record_gate l1 pass "clean-install"
 }
 
 run_l2() {
   RPM="$(latest_rpm)"; [ -f "$RPM" ] || die "no RPM; run build first"
   log "L2 feature mini-mesh gate"
   "$ROOT/automation/testbed/test-feature.sh" "$RPM"
+  record_gate l2 pass "mini-mesh"
 }
 
 run_l3() {
   RPM="$(latest_rpm)"; [ -f "$RPM" ] || die "no RPM; run build first"
   log "L3 stability gate"
   "$ROOT/automation/testbed/test-stability.sh" "$RPM"
+  record_gate l3 pass "stability"
 }
 
 run_l4() {
   RPM="$(latest_rpm)"; [ -f "$RPM" ] || die "no RPM; run build first"
   log "L4 staged lighthouse replace gate"
   "$ROOT/automation/testbed/test-lighthouse-replace.sh" "$RPM"
+  record_gate l4 pass "staged-lighthouse-replace"
 }
 
 promote_eagle() {
@@ -239,6 +311,7 @@ promote_eagle() {
     return 1
   fi
   publish_promote eagle "$(rpm_version_token "$RPM")" ready "$EAGLE"
+  record_gate eagle pass "$EAGLE"
 }
 
 live_smoke() {
@@ -248,6 +321,7 @@ live_smoke() {
      mackesd peers &&
      df -h /run | awk "NR==2" &&
      test "$(journalctl -u mackesd --since "70 sec ago" | grep -Eic "SIGABRT|ABRT|dumped|coredump")" = 0'
+  record_gate live-smoke pass "live-mesh"
 }
 
 audit_do_node() {
@@ -311,6 +385,7 @@ live_audit() {
   log "Audit Eagle ($EAGLE)"
   audit_eagle
   publish_promote eagle "$(eagle_version)" ready "$EAGLE"
+  record_gate live-audit pass "do-lighthouses-and-eagle"
 }
 
 media_verify() {
@@ -329,6 +404,7 @@ media_verify() {
     "$ROOT/automation/media/verify-media-lighthouse.sh" "root@$host:/tmp/verify-media-lighthouse.sh"
   ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$host" \
     "chmod 700 /tmp/verify-media-lighthouse.sh && MCNF_MEDIA_ENV_FILE=/etc/mackesd/media-spaces.env /tmp/verify-media-lighthouse.sh $extra_args"
+  record_gate media-verify pass "${extra_args:-non-mutating}"
 }
 
 media_verify_for_cycle() {
@@ -342,6 +418,7 @@ media_verify_for_cycle() {
 live_fd_soak() {
   log "Live fd/EMFILE soak"
   "$ROOT/automation/promotion/live-fd-soak.sh"
+  record_gate fd-soak pass "duration=${MCNF_LIVE_FD_SOAK_SECONDS:-3600}s"
 }
 
 declaration_status() {
@@ -378,6 +455,7 @@ EOF
   else
     echo "  candidate_rpm: missing"
   fi
+  status_gate_evidence "${sha:-}"
 
   if command -v doctl >/dev/null 2>&1; then
     local limit active free lh
@@ -446,6 +524,7 @@ promote_do() {
     publish_lighthouse_version "$ip" "$(node_version "$ip")" ready "$(node_hostname "$ip")"
   done
   publish_promote "do" "$(rpm_version_token "$RPM")" ready "$DO_TAG"
+  record_gate do pass "$DO_TAG"
 }
 
 cycle() {
