@@ -27,6 +27,9 @@ pub const ACTION_TOPIC: &str = "action/browser/session-sync";
 /// Browser-owned send-tab action topic.
 pub const SEND_TAB_TOPIC: &str = "action/browser/send-tab";
 
+/// Existing KDE Connect phone-share verb used for phone-targeted send-tab delivery.
+const ACTION_CONNECT_SHARE: &str = "action/connect/share";
+
 /// Retained-latest status topic for this node.
 pub const STATE_PREFIX: &str = "state/browser-session-sync/";
 
@@ -176,7 +179,7 @@ impl BrowserSessionSyncWorker {
             self.send_tab_cursor = Some(msg.ulid.clone());
             let body = msg.body.unwrap_or_default();
             match parse_send_tab(&body, &msg.ulid) {
-                Ok(handoff) => self.apply_send_tab(handoff),
+                Ok(handoff) => self.apply_send_tab(handoff, persist),
                 Err(e) => {
                     tracing::warn!(
                         target: "mackesd::browser_session_sync",
@@ -232,7 +235,7 @@ impl BrowserSessionSyncWorker {
         self.last_mirror_ms = Some(self.now_ms());
     }
 
-    fn apply_send_tab(&mut self, handoff: BrowserSendTabHandoff) {
+    fn apply_send_tab(&mut self, handoff: BrowserSendTabHandoff, persist: &Persist) {
         let path = send_tab_path(
             &self.local_root,
             &handoff.target,
@@ -249,7 +252,31 @@ impl BrowserSessionSyncWorker {
             );
             return;
         }
+        self.publish_phone_send_tab(&handoff, persist);
         self.mirror_send_tab_outbox();
+    }
+
+    fn publish_phone_send_tab(&self, handoff: &BrowserSendTabHandoff, persist: &Persist) {
+        if handoff.target != "phone" {
+            return;
+        }
+        let body = serde_json::json!({
+            "device_id": handoff.target_id,
+            "url": handoff.url,
+            "open": true,
+            "source": "browser_send_tab",
+            "source_host": handoff.source_host,
+            "handoff_id": handoff.id,
+        })
+        .to_string();
+        if let Err(e) = persist.write(ACTION_CONNECT_SHARE, Priority::Default, None, Some(&body)) {
+            tracing::warn!(
+                target: "mackesd::browser_session_sync",
+                device = %handoff.target_id,
+                error = %e,
+                "failed to publish phone browser send-tab handoff"
+            );
+        }
     }
 
     fn mirror_send_tab_outbox(&self) {
@@ -343,6 +370,7 @@ struct BrowserSendTabHandoff {
     target: String,
     target_id: String,
     source_host: String,
+    url: String,
     body: String,
 }
 
@@ -396,13 +424,12 @@ fn parse_send_tab(body: &str, id: &str) -> Result<BrowserSendTabHandoff, String>
         .map(str::trim)
         .filter(|target_id| !target_id.is_empty())
         .unwrap_or(target);
-    if !v
+    let url = v
         .get("url")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|url| !url.trim().is_empty())
-    {
-        return Err("missing url".to_owned());
-    }
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| "missing url".to_owned())?;
     if !v
         .get("engine")
         .and_then(serde_json::Value::as_str)
@@ -428,6 +455,7 @@ fn parse_send_tab(body: &str, id: &str) -> Result<BrowserSendTabHandoff, String>
         target: target.to_owned(),
         target_id,
         source_host,
+        url: url.to_owned(),
         body,
     })
 }
@@ -717,6 +745,8 @@ mod tests {
     fn apply_send_tab_writes_local_and_mirrors_when_share_is_up() {
         let local = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
         let gate = Arc::new(AtomicBool::new(true));
         let mut worker = BrowserSessionSyncWorker::new(
             "node-a".to_owned(),
@@ -730,7 +760,7 @@ mod tests {
         )
         .unwrap();
 
-        worker.apply_send_tab(handoff);
+        worker.apply_send_tab(handoff, &persist);
 
         let local_body = std::fs::read_to_string(send_tab_path(
             local.path(),
@@ -751,12 +781,21 @@ mod tests {
         assert_eq!(local_body, share_body);
         let v: serde_json::Value = serde_json::from_str(&share_body).unwrap();
         assert_eq!(v["url"], "https://mesh.test/");
+        assert!(
+            persist
+                .list_since(ACTION_CONNECT_SHARE, None)
+                .unwrap()
+                .is_empty(),
+            "node send-tab records do not publish KDE Connect phone shares"
+        );
     }
 
     #[test]
     fn send_tab_outbox_mirrors_pending_local_entries_when_share_returns() {
         let local = tempfile::tempdir().unwrap();
         let share = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
         let gate = Arc::new(AtomicBool::new(false));
         let mut worker = BrowserSessionSyncWorker::new(
             "node-a".to_owned(),
@@ -770,12 +809,43 @@ mod tests {
         )
         .unwrap();
 
-        worker.apply_send_tab(handoff);
+        worker.apply_send_tab(handoff, &persist);
 
         assert!(send_tab_path(local.path(), "phone", "pixel-8", "node-a", "01Phone").is_file());
         assert!(!send_tab_path(share.path(), "phone", "pixel-8", "node-a", "01Phone").exists());
         gate.store(true, Ordering::SeqCst);
         worker.mirror_send_tab_outbox();
         assert!(send_tab_path(share.path(), "phone", "pixel-8", "node-a", "01Phone").is_file());
+    }
+
+    #[test]
+    fn phone_send_tab_publishes_the_existing_kde_connect_share_verb() {
+        let local = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        let bus = tempfile::tempdir().unwrap();
+        let persist = Persist::open(bus.path().to_path_buf()).unwrap();
+        let mut worker = BrowserSessionSyncWorker::new(
+            "node-a".to_owned(),
+            local.path().to_path_buf(),
+            share.path().to_path_buf(),
+        );
+        let handoff = parse_send_tab(
+            &send_tab_with_target_id("phone", "pixel-8", "node-a", "https://mesh.test/"),
+            "01Phone",
+        )
+        .unwrap();
+
+        worker.apply_send_tab(handoff, &persist);
+
+        let msgs = persist.list_since(ACTION_CONNECT_SHARE, None).unwrap();
+        assert_eq!(msgs.len(), 1);
+        let body = msgs[0].body.as_deref().expect("share body");
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(v["device_id"], "pixel-8");
+        assert_eq!(v["url"], "https://mesh.test/");
+        assert_eq!(v["open"], true);
+        assert_eq!(v["source"], "browser_send_tab");
+        assert_eq!(v["source_host"], "node-a");
+        assert_eq!(v["handoff_id"], "01Phone");
     }
 }
