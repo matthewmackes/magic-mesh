@@ -346,7 +346,7 @@ promote_eagle() {
 
 live_smoke() {
   log "Live mesh smoke"
-  local out
+  local bad_peers out
   if ! out="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@165.227.188.238 \
     'ETCDCTL_API=3 etcdctl --endpoints=http://10.42.0.1:2379 endpoint health --cluster &&
      mackesd peers &&
@@ -357,8 +357,15 @@ live_smoke() {
     return 1
   fi
   printf '%s\n' "$out"
-  if printf '%s\n' "$out" | grep -Eq '\b(degraded|critical|unreachable|offline)\b'; then
-    record_gate live-smoke fail "peer-health"
+  bad_peers="$(printf '%s\n' "$out" | awk '
+    $1 == "PEER" || $1 == "fleet" || $1 ~ /^http/ || $1 == "Filesystem" || $1 == "tmpfs" || $1 ~ /^\// { next }
+    NF >= 4 && ($2 != "online" || $3 != "healthy") {
+      printf "%s%s=%s/%s", sep, $1, $2, $3
+      sep = ","
+    }
+  ')"
+  if [ -n "$bad_peers" ]; then
+    record_gate live-smoke fail "peer-health:$bad_peers"
     return 1
   fi
   record_gate live-smoke pass "live-mesh"
