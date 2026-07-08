@@ -132,6 +132,26 @@ missing_gate_list() {
   printf '%s\n' "${missing:-none}"
 }
 
+gate_blocker_summary() {
+  local sha="$1"; shift
+  local stage line result detail blockers="" sep=""
+  for stage in "$@"; do
+    line="$(latest_gate_evidence "$stage" "$sha" || true)"
+    if [ -z "$line" ]; then
+      blockers="${blockers}${sep}${stage}=missing"
+      sep=","
+      continue
+    fi
+    result="$(json_value "$line" result)"
+    if [ "$result" != pass ]; then
+      detail="$(json_value "$line" detail)"
+      blockers="${blockers}${sep}${stage}=${detail:-$result}"
+      sep=","
+    fi
+  done
+  printf '%s\n' "${blockers:-none}"
+}
+
 status_gate_evidence() {
   local sha="$1" stage line result gate_ts detail farm_missing post_missing
   farm_missing="$(missing_gate_list "$sha" build l1 l2 l3 l4 eagle do)"
@@ -143,6 +163,7 @@ status_gate_evidence() {
   fi
   echo "  candidate_gate_missing_farm: $farm_missing"
   echo "  candidate_gate_missing_postroll: $post_missing"
+  echo "  candidate_gate_blockers: $(gate_blocker_summary "$sha" build l1 l2 l3 l4 eagle do live-smoke live-audit media-verify fd-soak)"
   echo "  promotion_evidence_log: $PROMOTION_EVIDENCE_LOG"
   echo "  promotion_evidence:"
   for stage in build l1 l2 l3 l4 eagle do live-smoke live-audit media-verify fd-soak; do
