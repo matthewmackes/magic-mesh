@@ -23,6 +23,7 @@
 //! page (§7).
 
 use base64::Engine as _;
+use mackes_mesh_types::peers::default_workgroup_root;
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_chat::{MessageKind, Severity};
@@ -630,6 +631,13 @@ pub(crate) struct WebState {
     /// and ledger refreshes from flooding the Bus while still making every state
     /// transition observable.
     last_session_sync_body: Option<String>,
+    /// One-shot startup restore latch. The Browser reads the daemon-owned latest
+    /// session-sync snapshot once, before the live-helper blank-tab fallback.
+    startup_restore_attempted: bool,
+    /// Candidate roots for daemon-persisted startup restore snapshots. Production
+    /// probes the local durable root first, then the Syncthing-backed workgroup
+    /// root; tests inject temp roots without touching operator state.
+    session_restore_roots: Vec<PathBuf>,
     /// Whether the compact download manager drawer is visible.
     downloads_open: bool,
     /// Last time the browser refreshed its ledger view.
@@ -700,6 +708,8 @@ impl Default for WebState {
             download_jobs: Vec::new(),
             notified_downloads: BTreeSet::new(),
             last_session_sync_body: None,
+            startup_restore_attempted: false,
+            session_restore_roots: default_session_restore_roots(),
             downloads_open: false,
             downloads_last_poll: None,
             download_notice: None,
@@ -738,6 +748,13 @@ impl WebState {
     #[cfg(test)]
     fn with_bus_root(mut self, bus_root: Option<PathBuf>) -> Self {
         self.bus_root = bus_root;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_session_restore_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.session_restore_roots = roots;
+        self.startup_restore_attempted = false;
         self
     }
 
@@ -996,6 +1013,29 @@ impl WebState {
             self.request_new_tab_with_url(engine, url);
         }
         Ok(count)
+    }
+
+    /// One-shot startup restore from the daemon-owned latest snapshot files. The
+    /// helper-spawn path drains the resulting open queue, so restore and ordinary
+    /// new-tab creation stay on the same code path.
+    fn restore_startup_session_once(&mut self) -> Option<usize> {
+        if self.startup_restore_attempted {
+            return None;
+        }
+        self.startup_restore_attempted = true;
+        let host = local_hostname();
+        for root in self.session_restore_roots.clone() {
+            let path = session_sync_latest_path(&root, &host);
+            let Ok(body) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            match self.restore_session_sync_snapshot(&body) {
+                Ok(0) => continue,
+                Ok(count) => return Some(count),
+                Err(_) => continue,
+            }
+        }
+        None
     }
 
     fn request_bookmarks_manager(&mut self) {
@@ -1999,6 +2039,12 @@ impl WebState {
         if !self.tabs.is_empty() || self.spawn_attempted {
             return;
         }
+        self.restore_startup_session_once();
+        if !self.open_requested.is_empty() {
+            self.spawn_attempted = true;
+            self.drain_live_tab_requests(seat_present);
+            return;
+        }
         self.spawn_attempted = true;
         self.open_with(
             seat_present,
@@ -2703,6 +2749,15 @@ const ACTION_BROWSER_SEND_TAB: &str = "action/browser/send-tab";
 /// publishes the state it already owns.
 const ACTION_BROWSER_SESSION_SYNC: &str = "action/browser/session-sync";
 
+/// Daemon-owned Browser session-sync snapshot subdirectory. Must match
+/// `mackesd::workers::browser_session_sync::SESSION_SYNC_SUBDIR` without creating
+/// a desktop-shell dependency on the daemon crate.
+const SESSION_SYNC_SUBDIR: &str = "browser-session-sync";
+
+/// Daemon-owned latest snapshot filename. The file body is the Browser snapshot
+/// JSON itself, so startup restore can feed it straight into the parser.
+const SESSION_SYNC_LATEST_FILE: &str = "latest.json";
+
 /// Browser idle-tab suspension handoff for deeper engine/process orchestration.
 const ACTION_BROWSER_TAB_SUSPEND: &str = "action/browser/tab-suspend";
 
@@ -2853,6 +2908,52 @@ fn default_speed_dial() -> Vec<SpeedDialEntry> {
     NEW_TAB_SERVICES
         .iter()
         .map(|service| SpeedDialEntry::new(service.label, service.url, service.hint))
+        .collect()
+}
+
+fn default_session_restore_roots() -> Vec<PathBuf> {
+    vec![local_session_sync_root(), default_workgroup_root()]
+}
+
+fn local_session_sync_root() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME").map_or_else(
+        || {
+            std::env::var_os("HOME").map_or_else(
+                || PathBuf::from("/var/lib/mde/browser-session-sync"),
+                |home| {
+                    PathBuf::from(home)
+                        .join(".local")
+                        .join("share")
+                        .join("mde")
+                        .join("browser-session-sync")
+                },
+            )
+        },
+        |data_home| {
+            PathBuf::from(data_home)
+                .join("mde")
+                .join("browser-session-sync")
+        },
+    )
+}
+
+fn session_sync_latest_path(root: &Path, host: &str) -> PathBuf {
+    root.join(SESSION_SYNC_SUBDIR)
+        .join(sanitize_session_host(host))
+        .join(SESSION_SYNC_LATEST_FILE)
+}
+
+fn sanitize_session_host(host: &str) -> String {
+    host.chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                Some(c)
+            } else if c.is_ascii_whitespace() {
+                Some('-')
+            } else {
+                None
+            }
+        })
         .collect()
 }
 
@@ -9105,6 +9206,60 @@ mod tests {
         assert!(state
             .restore_session_sync_snapshot(r#"{"op":"browser_send_tab","tabs":[]}"#)
             .is_err());
+    }
+
+    #[test]
+    fn browser_startup_restore_reads_daemon_latest_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let host = local_hostname();
+        let path = session_sync_latest_path(root.path(), &host);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "op": "browser_session_sync",
+                "active_index": 0,
+                "settings": {
+                    "future_engine": "cef",
+                    "speed_dial": [
+                        {"label": "Ops", "url": "https://ops.mesh/", "hint": "Open ops"}
+                    ],
+                },
+                "tabs": [
+                    {"index": 0, "engine": "cef", "url": "https://restored.mesh/"}
+                ],
+                "downloads": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut state =
+            WebState::default().with_session_restore_roots(vec![root.path().to_path_buf()]);
+
+        assert_eq!(state.restore_startup_session_once(), Some(1));
+
+        assert_eq!(state.engine, BrowserEngine::Cef);
+        assert_eq!(
+            state.speed_dial,
+            vec![SpeedDialEntry::new("Ops", "https://ops.mesh/", "Open ops")]
+        );
+        assert_eq!(
+            state.take_open_request(),
+            Some(TabOpenIntent::NewForegroundUrl {
+                engine: BrowserEngine::Cef,
+                url: "https://restored.mesh/".to_owned(),
+            })
+        );
+        assert_eq!(state.restore_startup_session_once(), None);
+    }
+
+    #[test]
+    fn browser_startup_restore_host_path_matches_the_daemon_sanitizer() {
+        assert_eq!(sanitize_session_host("work station/1"), "work-station1");
+        assert_eq!(
+            session_sync_latest_path(Path::new("/mesh"), "work station/1"),
+            PathBuf::from("/mesh/browser-session-sync/work-station1/latest.json")
+        );
     }
 
     #[test]
