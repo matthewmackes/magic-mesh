@@ -60,7 +60,9 @@ use crate::auth::{
     SealOutcome,
 };
 use crate::dock::DesktopRailSource;
-use crate::vdi::{ConnectRequest, DisplayMode, MonitorSpan, RequestedTarget, VdiProtocol};
+use crate::vdi::{
+    ConnectRequest, DesktopEndpoint, DisplayMode, MonitorSpan, RequestedTarget, VdiProtocol,
+};
 use chooser_prefs::{unix_millis, ChooserPrefs, ManualEntry};
 
 /// The retained-latest state topic the CHOOSER-1 worker publishes the merged
@@ -321,6 +323,33 @@ impl DesktopSource {
     const fn connectable(&self) -> bool {
         !matches!(self.reachability, Reachability::Unreachable)
     }
+
+    /// The dialable endpoint for a selected protocol, if discovery published one.
+    /// The worker keeps the host separate from the protocol offer's port, and this
+    /// fold preserves that typed shape for the live VDI transport.
+    fn endpoint_for(&self, protocol: VdiProtocol) -> Option<DesktopEndpoint> {
+        let port = self
+            .protocols
+            .iter()
+            .find(|offer| offer.protocol.route() == Some(protocol))
+            .and_then(|offer| offer.port)
+            .or_else(|| port_from_host(&self.host))?;
+        DesktopEndpoint::new(host_without_matching_port(&self.host, port), port)
+    }
+}
+
+fn port_from_host(host: &str) -> Option<u16> {
+    host.rsplit_once(':')
+        .and_then(|(_, suffix)| suffix.parse::<u16>().ok())
+}
+
+fn host_without_matching_port(host: &str, port: u16) -> String {
+    if let Some((addr, suffix)) = host.rsplit_once(':') {
+        if suffix.parse::<u16>().ok() == Some(port) && !addr.is_empty() {
+            return addr.to_string();
+        }
+    }
+    host.to_string()
 }
 
 /// One discovery lane's honest status (`ok …` / `gated: …` / `error: …`) — so
@@ -2091,7 +2120,8 @@ impl ChooserState {
             }
         }
         self.connect = Some(ConnectRequest::new(
-            RequestedTarget::new(source.node.clone(), source.name.clone()),
+            RequestedTarget::new(source.node.clone(), source.name.clone())
+                .with_endpoint(source.endpoint_for(protocol)),
             protocol,
             display,
             monitors,
@@ -3649,6 +3679,13 @@ mod tests {
         let req = state.take_connect().expect("hand-off");
         assert_eq!(req.target.name, "OfficePC");
         assert_eq!(req.protocol, VdiProtocol::Rdp);
+        assert_eq!(
+            req.target
+                .endpoint
+                .as_ref()
+                .map(|e| (e.host.as_str(), e.port)),
+            Some(("192.168.1.60", 3389))
+        );
         assert!(matches!(req.auth, DesktopAuth::Sealed { .. }));
         assert!(!format!("{req:?}").contains("s3cr3t-pw"));
     }
@@ -5242,6 +5279,14 @@ mod tests {
             .expect("the stored credential connects straight through");
         assert_eq!(request.protocol, VdiProtocol::Rdp);
         assert_eq!(request.target.name, "testvm-win");
+        assert_eq!(
+            request
+                .target
+                .endpoint
+                .as_ref()
+                .map(|e| (e.host.as_str(), e.port)),
+            Some(("172.20.146.54", 3389))
+        );
         let DesktopAuth::Sealed {
             credential,
             store_ref,

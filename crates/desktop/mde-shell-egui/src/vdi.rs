@@ -24,6 +24,14 @@ use mde_vdi_vnc::VncSession;
 
 use crate::auth::DesktopAuth;
 
+#[cfg(feature = "live-vdi")]
+use {
+    mde_vdi_rdp::{PumpOutcome, RdpConfig, RdpConnection},
+    std::sync::mpsc,
+    std::thread,
+    std::time::Duration,
+};
+
 /// A live VDI desktop the shell drives — RDP-primary, VNC the console fallback.
 /// Both decoder crates expose the *identical* egui-facing surface
 /// (`frame()` → [`egui::ColorImage`], `send_input(&egui::Event)`), so the panel
@@ -66,17 +74,48 @@ impl Session {
     }
 }
 
+/// A dialable endpoint for a direct desktop transport. Mesh-brokered connects may
+/// omit it while the broker resolves the overlay route; manual/mDNS/external rows
+/// carry it so the live VDI transport can attach without re-parsing UI text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DesktopEndpoint {
+    /// TCP host/address to dial. For mesh rows this should be the Nebula overlay
+    /// address or name once the registry publishes it.
+    pub host: String,
+    /// TCP port for the chosen protocol.
+    pub port: u16,
+}
+
+impl DesktopEndpoint {
+    /// A non-empty host plus non-zero port.
+    pub(crate) fn new(host: impl Into<String>, port: u16) -> Option<Self> {
+        let host = host.into();
+        if host.trim().is_empty() || port == 0 {
+            return None;
+        }
+        Some(Self { host, port })
+    }
+
+    /// Log/UI-safe dial address.
+    fn label(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
 /// A desktop target the Chooser (CHOOSER-2, née the E12-5b picker) handed to the
-/// surface: the desktop the operator chose. Recorded so the surface reflects the
-/// pending connect *by name* until the gated E12-4 wire transport attaches the
-/// live decoder `session` — an honest "connecting" caption, never a fake desktop
-/// (§7).
+/// surface: the desktop the operator chose, plus the direct endpoint if discovery
+/// published one. Recorded so the surface reflects the pending connect by name
+/// until the live transport attaches the decoder `session` — an honest
+/// "connecting" caption, never a fake desktop (§7).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RequestedTarget {
     /// The peer serving the VM (a scheduler node id).
     pub serving_peer: String,
     /// The VM's display name — the surface caption.
     pub name: String,
+    /// Direct dial target for manual/mDNS/external endpoints, or for mesh rows once
+    /// the registry has published an overlay address + port.
+    pub endpoint: Option<DesktopEndpoint>,
 }
 
 impl RequestedTarget {
@@ -85,7 +124,14 @@ impl RequestedTarget {
         Self {
             serving_peer: serving_peer.into(),
             name: name.into(),
+            endpoint: None,
         }
+    }
+
+    /// Attach a direct dial endpoint to the target.
+    pub(crate) fn with_endpoint(mut self, endpoint: Option<DesktopEndpoint>) -> Self {
+        self.endpoint = endpoint;
+        self
     }
 }
 
@@ -217,6 +263,139 @@ impl ConnectRequest {
     }
 }
 
+#[cfg(feature = "live-vdi")]
+enum LiveRdpEvent {
+    Connected(String),
+    Frame(egui::ColorImage),
+    Error(String),
+    Ended(String),
+}
+
+#[cfg(feature = "live-vdi")]
+struct LiveRdpHandle {
+    input_tx: mpsc::Sender<egui::Event>,
+    stop_tx: mpsc::Sender<()>,
+    event_rx: mpsc::Receiver<LiveRdpEvent>,
+}
+
+#[cfg(feature = "live-vdi")]
+impl LiveRdpHandle {
+    fn spawn(request: &ConnectRequest) -> Result<Self, String> {
+        let Some(endpoint) = request.target.endpoint.clone() else {
+            return Err("discovery has not published a dialable endpoint for this desktop".into());
+        };
+        let DesktopAuth::Sealed { credential, .. } = &request.auth else {
+            return Err("mesh-identity desktop SSO is broker-gated; direct RDP needs a sealed guest credential".into());
+        };
+        if credential.username.trim().is_empty() {
+            return Err("RDP requires a username in the sealed desktop credential".into());
+        }
+
+        let config = RdpConfig::new(
+            endpoint.host.clone(),
+            credential.username.clone(),
+            credential.secret.expose().to_owned(),
+        )
+        .with_port(endpoint.port)
+        .with_resolution(1024, 768);
+        let (input_tx, input_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+
+        thread::Builder::new()
+            .name(format!("mde-live-rdp-{}", request.target.name))
+            .spawn(move || run_live_rdp(config, input_rx, stop_rx, event_tx))
+            .map_err(|e| format!("failed to spawn live RDP worker: {e}"))?;
+
+        Ok(Self {
+            input_tx,
+            stop_tx,
+            event_rx,
+        })
+    }
+
+    fn send_input(&self, event: egui::Event) {
+        let _ = self.input_tx.send(event);
+    }
+
+    fn stop(&self) {
+        let _ = self.stop_tx.send(());
+    }
+}
+
+#[cfg(feature = "live-vdi")]
+impl Drop for LiveRdpHandle {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+    }
+}
+
+#[cfg(feature = "live-vdi")]
+fn run_live_rdp(
+    config: RdpConfig,
+    input_rx: mpsc::Receiver<egui::Event>,
+    stop_rx: mpsc::Receiver<()>,
+    event_tx: mpsc::Sender<LiveRdpEvent>,
+) {
+    let target = format!("{}:{}", config.host, config.port);
+    let mut session = match RdpSession::new(config) {
+        Ok(session) => session,
+        Err(e) => {
+            let _ = event_tx.send(LiveRdpEvent::Error(format!("RDP config rejected: {e}")));
+            return;
+        }
+    };
+    let mut conn = match RdpConnection::connect(&mut session) {
+        Ok(conn) => conn,
+        Err(e) => {
+            let _ = event_tx.send(LiveRdpEvent::Error(format!("RDP connect failed: {e}")));
+            return;
+        }
+    };
+    let _ = event_tx.send(LiveRdpEvent::Connected(target));
+    if let Some(frame) = session.frame() {
+        let _ = event_tx.send(LiveRdpEvent::Frame(frame));
+    }
+
+    loop {
+        if stop_rx.try_recv().is_ok() {
+            let _ = conn.shutdown(&mut session);
+            return;
+        }
+
+        let mut had_input = false;
+        while let Ok(event) = input_rx.try_recv() {
+            session.send_input(&event);
+            had_input = true;
+        }
+        if had_input {
+            if let Err(e) = conn.flush_input(&mut session) {
+                let _ = event_tx.send(LiveRdpEvent::Error(format!("RDP input failed: {e}")));
+                return;
+            }
+        }
+
+        match conn.pump_once(&mut session, Duration::from_millis(50)) {
+            Ok(PumpOutcome::Processed { painted_rects }) => {
+                if painted_rects > 0 {
+                    if let Some(frame) = session.frame() {
+                        let _ = event_tx.send(LiveRdpEvent::Frame(frame));
+                    }
+                }
+            }
+            Ok(PumpOutcome::TimedOut) => {}
+            Ok(PumpOutcome::Terminated { reason }) => {
+                let _ = event_tx.send(LiveRdpEvent::Ended(reason));
+                return;
+            }
+            Err(e) => {
+                let _ = event_tx.send(LiveRdpEvent::Error(format!("RDP pump failed: {e}")));
+                return;
+            }
+        }
+    }
+}
+
 /// The Desktop surface's state: the active session (if any), the desktop texture
 /// the framebuffer is uploaded into, the decode → upload hand-off slot, and the
 /// picked target the discovery picker requested before a live session attaches.
@@ -242,6 +421,14 @@ pub(crate) struct VdiState {
     /// `session`. Drives the honest "connecting" caption (which names the chosen
     /// protocol + display) and tells the shell to show the Desktop surface.
     requested: Option<ConnectRequest>,
+    /// Live in-shell RDP transport for a direct endpoint. Kept separate from
+    /// `session`, which remains the single-threaded decoder used by tests and VNC.
+    #[cfg(feature = "live-vdi")]
+    live_rdp: Option<LiveRdpHandle>,
+    /// Log-safe live transport status/error shown under the empty backdrop until a
+    /// frame arrives.
+    #[cfg(feature = "live-vdi")]
+    live_status: Option<String>,
 }
 
 impl VdiState {
@@ -272,6 +459,26 @@ impl VdiState {
     /// shows a "connecting" state naming the target + chosen protocol until the
     /// gated wire transport attaches the live decoder session.
     pub(crate) fn request_connect(&mut self, request: ConnectRequest) {
+        #[cfg(feature = "live-vdi")]
+        {
+            self.live_status = None;
+            if let Some(live) = self.live_rdp.take() {
+                live.stop();
+            }
+            self.texture = None;
+            self.incoming = None;
+            if request.protocol == VdiProtocol::Rdp {
+                match LiveRdpHandle::spawn(&request) {
+                    Ok(handle) => {
+                        self.live_status = Some("Opening live RDP transport".to_string());
+                        self.live_rdp = Some(handle);
+                    }
+                    Err(reason) => {
+                        self.live_status = Some(format!("Live RDP gated: {reason}"));
+                    }
+                }
+            }
+        }
         self.requested = Some(request);
     }
 
@@ -284,7 +491,39 @@ impl VdiState {
     /// Clear the pending connect — the operator backed out before a live session
     /// attached, so the Desktop surface falls back to the Chooser.
     pub(crate) fn clear_target(&mut self) {
+        #[cfg(feature = "live-vdi")]
+        {
+            if let Some(live) = self.live_rdp.take() {
+                live.stop();
+            }
+            self.live_status = None;
+            self.texture = None;
+            self.incoming = None;
+        }
         self.requested = None;
+    }
+
+    #[cfg(feature = "live-vdi")]
+    fn poll_live_rdp(&mut self) {
+        let Some(live) = self.live_rdp.as_ref() else {
+            return;
+        };
+        while let Ok(event) = live.event_rx.try_recv() {
+            match event {
+                LiveRdpEvent::Connected(target) => {
+                    self.live_status = Some(format!("Live RDP connected to {target}"));
+                }
+                LiveRdpEvent::Frame(frame) => {
+                    self.incoming = Some(frame);
+                }
+                LiveRdpEvent::Error(reason) => {
+                    self.live_status = Some(reason);
+                }
+                LiveRdpEvent::Ended(reason) => {
+                    self.live_status = Some(format!("RDP session ended: {reason}"));
+                }
+            }
+        }
     }
 }
 
@@ -296,6 +535,9 @@ const DESKTOP_TEX: TextureOptions = TextureOptions::LINEAR;
 /// fill the body, and forward this frame's egui input to the guest. With no
 /// session attached it draws the honest "no desktop" EmptyState instead.
 pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
+    #[cfg(feature = "live-vdi")]
+    state.poll_live_rdp();
+
     // 1. Pull the newest decoded frame off the live session into the upload slot.
     if let Some(session) = state.session.as_mut() {
         if let Some(img) = session.frame() {
@@ -351,10 +593,29 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
                     // `auth.summary()` is log-safe and never carries the secret.
                     let auth = req.auth.summary();
                     let detail = if req.protocol.has_client() {
+                        let endpoint = req.target.endpoint.as_ref().map_or_else(
+                            || req.target.serving_peer.clone(),
+                            DesktopEndpoint::label,
+                        );
+                        let live_status = {
+                            #[cfg(feature = "live-vdi")]
+                            {
+                                state
+                                    .live_status
+                                    .as_deref()
+                                    .unwrap_or("Waiting for the live transport")
+                                    .to_string()
+                            }
+                            #[cfg(not(feature = "live-vdi"))]
+                            {
+                                "the live transport is not compiled into this shell build"
+                                    .to_string()
+                            }
+                        };
                         format!(
-                            "Brokering the {} desktop from {} ({} \u{00B7} {} \u{00B7} {auth}) — the live transport (E12-4) is gated.",
+                            "Brokering the {} desktop from {} ({} \u{00B7} {} \u{00B7} {auth}) — {live_status}.",
                             req.protocol.client_crate(),
-                            req.target.serving_peer,
+                            endpoint,
                             req.display.label(),
                             req.monitors.label(),
                         )
@@ -392,9 +653,19 @@ pub(crate) fn vdi_panel(ui: &mut egui::Ui, state: &mut VdiState) {
 /// other event is handed to the session, which maps the ones it understands
 /// (pointer / button / wheel / key / text) and drops the rest.
 fn forward_input(ui: &egui::Ui, state: &mut VdiState) {
-    let Some(session) = state.session.as_mut() else {
-        return;
+    let has_live = {
+        #[cfg(feature = "live-vdi")]
+        {
+            state.live_rdp.is_some()
+        }
+        #[cfg(not(feature = "live-vdi"))]
+        {
+            false
+        }
     };
+    if state.session.is_none() && !has_live {
+        return;
+    }
     for event in ui.input(|i| i.events.clone()) {
         if matches!(
             event,
@@ -407,7 +678,13 @@ fn forward_input(ui: &egui::Ui, state: &mut VdiState) {
             state.return_to_chrome = true;
             continue;
         }
-        session.send_input(&event);
+        if let Some(session) = state.session.as_mut() {
+            session.send_input(&event);
+        }
+        #[cfg(feature = "live-vdi")]
+        if let Some(live) = state.live_rdp.as_ref() {
+            live.send_input(event);
+        }
     }
 }
 
@@ -634,7 +911,8 @@ mod tests {
         // The request-construction fold: the picked target + the three choices
         // land on the request verbatim.
         let req = ConnectRequest::new(
-            RequestedTarget::new("oak", "web1"),
+            RequestedTarget::new("oak", "web1")
+                .with_endpoint(DesktopEndpoint::new("10.42.0.9", 5900)),
             VdiProtocol::Vnc,
             DisplayMode::Windowed,
             MonitorSpan::All,
@@ -645,6 +923,10 @@ mod tests {
         );
         assert_eq!(req.target.serving_peer, "oak");
         assert_eq!(req.target.name, "web1");
+        assert_eq!(
+            req.target.endpoint.as_ref().map(DesktopEndpoint::label),
+            Some("10.42.0.9:5900".to_string())
+        );
         assert_eq!(req.protocol, VdiProtocol::Vnc);
         assert_eq!(req.display, DisplayMode::Windowed);
         assert_eq!(req.monitors, MonitorSpan::All);
@@ -654,6 +936,16 @@ mod tests {
         // from Debug so the request stays log-safe.
         assert_eq!(req.auth.summary(), "sealed credential (admin)");
         assert!(!format!("{req:?}").contains("rfb-secret"));
+    }
+
+    #[test]
+    fn invalid_desktop_endpoints_are_rejected_before_the_live_transport() {
+        assert!(DesktopEndpoint::new("", 3389).is_none());
+        assert!(DesktopEndpoint::new("10.42.0.9", 0).is_none());
+        assert_eq!(
+            DesktopEndpoint::new("10.42.0.9", 3389).map(|endpoint| endpoint.label()),
+            Some("10.42.0.9:3389".to_string())
+        );
     }
 
     #[test]

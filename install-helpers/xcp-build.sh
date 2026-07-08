@@ -448,7 +448,9 @@ case "${1:-}" in
     # + BOOKMARKS-6 `live-helper`: the RPM ships /usr/bin/mde-web-preview, so the
     # shipped shell must be able to spawn it — without this feature the Browser
     # surface is permanently the gated EmptyState (the live 2026-07-05 finding).
-    remote "cargo build --workspace --release && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release --locked --manifest-path crates/desktop/mde-web-preview/Cargo.toml && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release --locked --manifest-path crates/desktop/mde-web-cef/Cargo.toml && cargo build --release -p mde-shell-egui --features drm,live-helper && cargo generate-rpm -p crates/mesh/mackesd"
+    # + E12-5 `live-vdi`: the RPM shell must also carry the in-shell IronRDP
+    # transport, otherwise Desktop connects stay at the honest gated caption.
+    remote "cargo build --workspace --release && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release --locked --manifest-path crates/desktop/mde-web-preview/Cargo.toml && CARGO_TARGET_DIR=\"\$PWD/target\" cargo build --release --locked --manifest-path crates/desktop/mde-web-cef/Cargo.toml && cargo build --release -p mde-shell-egui --features drm,live-helper,live-vdi && cargo generate-rpm -p crates/mesh/mackesd"
     mkdir -p "$ARTIFACTS"
     log "pulling RPM(s) → $ARTIFACTS"
     rsync -az -e "${SSH[*]}" "$DEST:$REMOTE_DIR/target/generate-rpm/*.rpm" "$ARTIFACTS/"

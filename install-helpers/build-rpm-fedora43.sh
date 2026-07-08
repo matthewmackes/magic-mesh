@@ -133,13 +133,14 @@ else
   cargo build --release --locked \
       --manifest-path crates/desktop/mde-web-cef/Cargo.toml
   # E12-3 DRM + BOOKMARKS-6 live path — re-link the ONE shell binary with the
-  # features the shipped seat needs: `drm` so it owns the bare KMS/DRM seat, and
+  # features the shipped seat needs: `drm` so it owns the bare KMS/DRM seat,
   # `live-helper` so the Browser surface really spawns the sandboxed
   # `mde-web-preview` shipped right above (without it the surface is permanently
   # the gated EmptyState — the RPM would ship a browser helper no shell can ever
-  # start). The workspace build compiled all deps; this only re-links one bin.
-  echo "[f43] re-linking mde-shell-egui --features drm,live-helper"
-  cargo build --release --locked -p mde-shell-egui --features drm,live-helper
+  # start), and `live-vdi` so the Desktop surface can pump live RDP in-shell. The
+  # workspace build compiled all deps; this only re-links one bin.
+  echo "[f43] re-linking mde-shell-egui --features drm,live-helper,live-vdi"
+  cargo build --release --locked -p mde-shell-egui --features drm,live-helper,live-vdi
   echo "[f43] generating RPM"
   cargo generate-rpm -p crates/mesh/mackesd
 fi

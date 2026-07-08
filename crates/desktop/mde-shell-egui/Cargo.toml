@@ -29,6 +29,11 @@ drm = ["mde-egui/drm"]
 # client crate's own `live-helper` gate, exactly as the VDI crates gate live-connect.
 live-helper = ["mde-web-preview-client/live-helper"]
 
+# E12-5 live VDI path — turn on the RDP crate's live IronRDP transport so the
+# Desktop surface can attach a sealed external RDP endpoint and pump frames/input
+# in-shell. OFF by default for portable unit builds; ON for shipped shell builds.
+live-vdi = ["mde-vdi-rdp/live-connect"]
+
 [dependencies]
 # The §4/§5 harness is the shell's primary inward dependency (§6 layered tiers):
 # it provides run_client (the eframe Wayland-client runner), the shared Style, the
