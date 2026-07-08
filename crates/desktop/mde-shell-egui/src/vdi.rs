@@ -317,9 +317,7 @@ impl LiveRdpHandle {
         let Some(endpoint) = request.target.endpoint.clone() else {
             return Err("discovery has not published a dialable endpoint for this desktop".into());
         };
-        let DesktopAuth::Sealed { credential, .. } = &request.auth else {
-            return Err("mesh-identity desktop SSO is broker-gated; direct RDP needs a sealed guest credential".into());
-        };
+        let credential = live_rdp_credential(request)?;
         if credential.username.trim().is_empty() {
             return Err("RDP requires a username in the sealed desktop credential".into());
         }
@@ -353,6 +351,19 @@ impl LiveRdpHandle {
 
     fn stop(&self) {
         let _ = self.stop_tx.send(());
+    }
+}
+
+#[cfg(feature = "live-vdi")]
+fn live_rdp_credential(request: &ConnectRequest) -> Result<&crate::auth::Credential, String> {
+    match &request.auth {
+        DesktopAuth::Sealed { credential, .. } => Ok(credential),
+        DesktopAuth::MeshIdentity {
+            guest: Some(guest), ..
+        } => Ok(&guest.credential),
+        DesktopAuth::MeshIdentity { guest: None, .. } => {
+            Err("mesh-gated RDP needs a sealed guest credential for OS login".into())
+        }
     }
 }
 
@@ -1052,6 +1063,41 @@ mod tests {
             DesktopEndpoint::new("10.42.0.9", 3389).map(|endpoint| endpoint.label()),
             Some("10.42.0.9:3389".to_string())
         );
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn live_rdp_accepts_a_mesh_identity_with_a_guest_credential() {
+        let req = ConnectRequest::new(
+            RequestedTarget::new("oak", "win11")
+                .with_endpoint(DesktopEndpoint::new("10.42.0.9", 3389)),
+            VdiProtocol::Rdp,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity_with_guest(
+                "client-node",
+                "desktop/oak/rdp",
+                Credential::new("administrator", "mesh-rdp-pw"),
+            ),
+        );
+        let credential = live_rdp_credential(&req).expect("guest credential accepted");
+        assert_eq!(credential.username, "administrator");
+        assert_eq!(credential.secret.expose(), "mesh-rdp-pw");
+    }
+
+    #[cfg(feature = "live-vdi")]
+    #[test]
+    fn live_rdp_gates_a_bare_mesh_identity_until_guest_login_is_available() {
+        let req = ConnectRequest::new(
+            RequestedTarget::new("oak", "win11")
+                .with_endpoint(DesktopEndpoint::new("10.42.0.9", 3389)),
+            VdiProtocol::Rdp,
+            DisplayMode::Fullscreen,
+            MonitorSpan::Single,
+            DesktopAuth::mesh_identity("client-node"),
+        );
+        let err = live_rdp_credential(&req).expect_err("guest credential required");
+        assert!(err.contains("sealed guest credential"));
     }
 
     #[test]

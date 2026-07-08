@@ -3279,6 +3279,11 @@ mod tests {
         fn get_ref(&self, store_ref: &str) -> Option<crate::auth::Credential> {
             self.inner.borrow().get(store_ref).cloned()
         }
+
+        /// Number of remembered credentials in the fake store.
+        fn seal_count(&self) -> usize {
+            self.inner.borrow().len()
+        }
     }
 
     impl CredentialStore for RecordingStore {
@@ -3291,18 +3296,6 @@ mod tests {
                 .borrow_mut()
                 .insert(store_ref.to_string(), credential.clone());
             SealOutcome::Sealed
-        }
-    }
-
-    /// A credential store that must NEVER be touched — proves the SSO path
-    /// connects a mesh peer with no store read or seal.
-    struct ForbiddenStore;
-    impl CredentialStore for ForbiddenStore {
-        fn get(&self, _r: &str) -> Result<Option<crate::auth::Credential>, String> {
-            unreachable!("a mesh-peer SSO connect must not read the credential store")
-        }
-        fn seal(&self, _r: &str, _c: &crate::auth::Credential) -> SealOutcome {
-            unreachable!("a mesh-peer SSO connect must not seal a credential")
         }
     }
 
@@ -3734,21 +3727,26 @@ mod tests {
     #[test]
     fn a_mesh_peer_connects_with_no_credential_prompt_via_sso() {
         // The SSO path: a mesh-brokered peer connects with the node's mesh identity
-        // and NEVER touches the credential store (the forbidden store panics if it
-        // does). No prompt is raised.
+        // and no prompt is raised when there is no remembered guest credential.
+        let store = RecordingStore::default();
         let mut state = state_with_store(
             Some(roster(vec![source("peer:oak", "oak", &[Protocol::Rdp])])),
-            Box::new(ForbiddenStore),
+            Box::new(store.clone()),
         );
         let sources = state.sources_snapshot();
         state.activate(&sources, "peer:oak");
         state.confirm_connect(&sources);
         assert!(state.pending.is_none(), "SSO needs no credential prompt");
         let req = state.take_connect().expect("SSO connects straight through");
-        let DesktopAuth::MeshIdentity { node } = req.auth else {
+        let DesktopAuth::MeshIdentity { node, guest } = req.auth else {
             unreachable!("expected mesh-identity SSO")
         };
         assert_eq!(node, "client-node");
+        assert!(
+            guest.is_none(),
+            "no remembered guest credential was present"
+        );
+        assert_eq!(store.seal_count(), 0, "SSO resolution must not seal");
         // The broker publish had no Bus root → the honest inline error (mesh peer),
         // and the note names SSO, never a credential.
         assert!(
@@ -3782,6 +3780,59 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(v["op"], "open");
         assert_eq!(v["id"], broker.id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mesh_peer_can_carry_a_remembered_guest_credential_for_live_rdp() {
+        let dir = temp_bus_dir("vdi-open-guest");
+        let store = RecordingStore::default();
+        assert_eq!(
+            store.seal(
+                "desktop/oak/rdp",
+                &crate::auth::Credential::new("administrator", "mesh-rdp-pw"),
+            ),
+            SealOutcome::Sealed
+        );
+        let mut state = ChooserState::with_client(
+            Box::new(FakeSources(Some(roster(vec![source(
+                "peer:oak",
+                "oak",
+                &[Protocol::Rdp],
+            )])))),
+            Some(dir.clone()),
+            "client-node".to_string(),
+            Box::new(store),
+            inert_prefs(),
+        );
+        state.refresh();
+        let sources = state.sources_snapshot();
+        state.activate(&sources, "peer:oak");
+        state.confirm_connect(&sources);
+        let req = state.take_connect().expect("SSO connects straight through");
+        assert!(
+            req.broker_session.is_some(),
+            "mesh guest login still keeps broker lifecycle tracking"
+        );
+        assert!(!format!("{req:?}").contains("mesh-rdp-pw"));
+        let DesktopAuth::MeshIdentity {
+            node,
+            guest: Some(guest),
+        } = &req.auth
+        else {
+            unreachable!("expected mesh identity plus remembered guest credential")
+        };
+        assert_eq!(node, "client-node");
+        assert_eq!(guest.store_ref, "desktop/oak/rdp");
+        assert_eq!(guest.credential.username, "administrator");
+        assert_eq!(guest.credential.secret.expose(), "mesh-rdp-pw");
+        assert!(
+            state
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("sealed guest credential")),
+            "the note names guest auth without leaking the secret"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5286,14 +5337,14 @@ mod tests {
     #[test]
     fn a_pinned_endpoint_with_a_stored_credential_connects_without_a_prompt() {
         // THE TESTVM-4 connect acceptance: the stored register credential drives
-        // Connect straight through — no prompt, and the credential store is
-        // NEVER touched (ForbiddenStore panics on any access).
+        // Connect straight through — no prompt, and no credential is sealed.
         let root = temp_prefs_root("pin-connect");
+        let store = RecordingStore::default();
         let mut state = ChooserState::with_client(
             Box::new(FakeSources(None)),
             None,
             "client-node".to_string(),
-            Box::new(ForbiddenStore),
+            Box::new(store.clone()),
             prefs_at(root.clone(), "seat-a"),
         );
         state.prefs.set_manual(ManualEntry {
@@ -5320,6 +5371,11 @@ mod tests {
         let request = state
             .take_connect()
             .expect("the stored credential connects straight through");
+        assert_eq!(
+            store.seal_count(),
+            0,
+            "the stored register cred is not re-sealed"
+        );
         assert_eq!(request.protocol, VdiProtocol::Rdp);
         assert_eq!(request.target.name, "testvm-win");
         assert_eq!(

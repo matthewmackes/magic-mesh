@@ -5,12 +5,13 @@
 //! two ways, and this module is the typed model + resolution fold for both:
 //!
 //!   * **Mesh-brokered source** (a peer seat / peer VM / local VM) authenticates
-//!     with **this node's mesh identity — SSO, no credential prompt**. The mesh
-//!     identity is [`crate::discovery::local_peer`] (the node hostname the mesh
-//!     keys nodes by), the SAME value the broker `Open` request already carries as
-//!     its `client_peer` ([`crate::discovery::publish_open`]). So an SSO connect
-//!     never touches the secret store and never prompts (§6 — reuse the mesh
-//!     identity, don't mint a second login).
+//!     the transport with **this node's mesh identity** and may additionally use a
+//!     remembered sealed **guest-OS credential** for protocol login. If no guest
+//!     credential is sealed, it remains SSO/no-prompt: the mesh identity is
+//!     [`crate::discovery::local_peer`] (the node hostname the mesh keys nodes by),
+//!     the SAME value the broker `Open` request already carries as `client_peer`
+//!     ([`crate::discovery::publish_open`]). This matches the Quasar lock:
+//!     mesh cert gates the connection, guest login still applies.
 //!   * **External RDP/VNC/Spice endpoint** (an mDNS / manual source, off the mesh
 //!     broker) authenticates with a **credential sealed in the secret store**,
 //!     resolved once then remembered. The credential feeds the protocol config's
@@ -102,6 +103,16 @@ pub(crate) struct Credential {
     pub(crate) secret: Secret,
 }
 
+/// Optional guest-OS credential carried by a mesh-brokered connection after the
+/// mesh identity has gated the route.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct GuestCredential {
+    /// The `desktop/…` secret-store key the credential was read from.
+    pub(crate) store_ref: String,
+    /// The resolved guest credential (fed to the protocol client on connect).
+    pub(crate) credential: Credential,
+}
+
 impl Credential {
     /// Assemble a credential from a username + plaintext secret.
     pub(crate) fn new(username: impl Into<String>, secret: impl Into<String>) -> Self {
@@ -122,6 +133,8 @@ pub(crate) enum DesktopAuth {
     MeshIdentity {
         /// This node's mesh identity (hostname).
         node: String,
+        /// Optional remembered guest login for the selected desktop/protocol.
+        guest: Option<GuestCredential>,
     },
     /// An external endpoint: a credential sealed in the secret store under
     /// `store_ref`, resolved once then remembered.
@@ -136,14 +149,49 @@ pub(crate) enum DesktopAuth {
 impl DesktopAuth {
     /// The mesh-identity SSO auth for a mesh-brokered source.
     pub(crate) fn mesh_identity(node: impl Into<String>) -> Self {
-        Self::MeshIdentity { node: node.into() }
+        Self::MeshIdentity {
+            node: node.into(),
+            guest: None,
+        }
+    }
+
+    /// The mesh-identity auth plus a remembered guest credential.
+    pub(crate) fn mesh_identity_with_guest(
+        node: impl Into<String>,
+        store_ref: impl Into<String>,
+        credential: Credential,
+    ) -> Self {
+        Self::MeshIdentity {
+            node: node.into(),
+            guest: Some(GuestCredential {
+                store_ref: store_ref.into(),
+                credential,
+            }),
+        }
     }
 
     /// A short, log-safe summary of how the connect authenticates — for the honest
     /// connect note / caption (§7). NEVER includes the secret.
     pub(crate) fn summary(&self) -> String {
         match self {
-            Self::MeshIdentity { node } => format!("mesh identity ({node}) — SSO"),
+            Self::MeshIdentity { node, guest: None } => {
+                format!("mesh identity ({node}) — SSO")
+            }
+            Self::MeshIdentity {
+                node,
+                guest: Some(guest),
+            } if guest.credential.username.is_empty() => {
+                format!("mesh identity ({node}) + sealed guest credential")
+            }
+            Self::MeshIdentity {
+                node,
+                guest: Some(guest),
+            } => {
+                format!(
+                    "mesh identity ({node}) + sealed guest credential ({})",
+                    guest.credential.username
+                )
+            }
             Self::Sealed { credential, .. } if credential.username.is_empty() => {
                 "sealed credential".to_string()
             }
@@ -300,11 +348,14 @@ impl CredentialStore for MeshCredentialStore {
 
 /// Resolve a source's auth at activate time (the SSO-vs-sealed decision).
 ///
-/// A mesh-brokered source resolves to mesh-identity SSO WITHOUT touching the store
-/// (no prompt, no read). An external endpoint derives its [`derive_store_ref`] key
-/// and reads the store: a sealed credential resolves ready (remembered), an absent
-/// one asks for a one-time prompt. A store fault surfaces as `Err` (never a silent
-/// prompt that would hide a broken store).
+/// A mesh-brokered source resolves to mesh-identity SSO and also reads the same
+/// sealed desktop credential key as an optional guest login. Missing guest creds
+/// keep the no-prompt SSO path; present creds ride inside the mesh auth so the
+/// protocol client can log into the guest after the mesh cert gates the route. An
+/// external endpoint derives its [`derive_store_ref`] key and reads the store: a
+/// sealed credential resolves ready (remembered), an absent one asks for a
+/// one-time prompt. A store fault surfaces as `Err` (never a silent prompt that
+/// would hide a broken store).
 pub(crate) fn resolve(
     is_mesh_brokered: bool,
     node: &str,
@@ -312,10 +363,15 @@ pub(crate) fn resolve(
     protocol: VdiProtocol,
     store: &dyn CredentialStore,
 ) -> Result<AuthStage, String> {
-    if is_mesh_brokered {
-        return Ok(AuthStage::Ready(DesktopAuth::mesh_identity(node)));
-    }
     let store_ref = derive_store_ref(host, protocol);
+    if is_mesh_brokered {
+        return match store.get(&store_ref)? {
+            Some(credential) => Ok(AuthStage::Ready(DesktopAuth::mesh_identity_with_guest(
+                node, store_ref, credential,
+            ))),
+            None => Ok(AuthStage::Ready(DesktopAuth::mesh_identity(node))),
+        };
+    }
     match store.get(&store_ref)? {
         Some(credential) => Ok(AuthStage::Ready(DesktopAuth::Sealed {
             store_ref,
@@ -395,18 +451,6 @@ mod tests {
         }
     }
 
-    /// A store that must NEVER be touched — proves the SSO path resolves without a
-    /// read or a seal.
-    struct ForbiddenStore;
-    impl CredentialStore for ForbiddenStore {
-        fn get(&self, _store_ref: &str) -> Result<Option<Credential>, String> {
-            unreachable!("SSO must not read the credential store")
-        }
-        fn seal(&self, _store_ref: &str, _credential: &Credential) -> SealOutcome {
-            unreachable!("SSO must not seal a credential")
-        }
-    }
-
     // ── the store-key derivation (mirrors the secret_store xcp_creds_ref tests) ──
 
     #[test]
@@ -436,21 +480,47 @@ mod tests {
     // ── the SSO-vs-sealed decision ──
 
     #[test]
-    fn a_mesh_brokered_source_resolves_to_sso_without_touching_the_store() {
-        // The forbidden store panics on any access — reaching Ready proves SSO
-        // never read or sealed (no credential prompt for a mesh peer).
-        let stage = resolve(
-            true,
-            "this-node",
-            "10.42.0.7",
-            VdiProtocol::Rdp,
-            &ForbiddenStore,
-        )
-        .expect("SSO resolves");
-        let AuthStage::Ready(DesktopAuth::MeshIdentity { node }) = stage else {
+    fn a_mesh_brokered_source_with_no_guest_credential_resolves_to_sso_without_prompt() {
+        // A missing guest credential stays SSO/no-prompt; guest login is optional
+        // until a sealed credential is remembered for this desktop/protocol.
+        let store = FakeStore::default();
+        let stage = resolve(true, "this-node", "10.42.0.7", VdiProtocol::Rdp, &store)
+            .expect("SSO resolves");
+        let AuthStage::Ready(DesktopAuth::MeshIdentity { node, guest }) = stage else {
             unreachable!("expected mesh-identity SSO")
         };
         assert_eq!(node, "this-node");
+        assert!(guest.is_none());
+        assert_eq!(store.seal_count(), 0, "resolving must not seal anything");
+    }
+
+    #[test]
+    fn a_mesh_brokered_source_reads_a_remembered_guest_credential() {
+        let store = FakeStore::default();
+        let store_ref = derive_store_ref("10.42.0.7", VdiProtocol::Rdp);
+        assert_eq!(
+            store.seal(&store_ref, &Credential::new("administrator", "mesh-rdp-pw")),
+            SealOutcome::Sealed
+        );
+        let stage = resolve(true, "this-node", "10.42.0.7", VdiProtocol::Rdp, &store)
+            .expect("SSO resolves");
+        let AuthStage::Ready(DesktopAuth::MeshIdentity {
+            node,
+            guest: Some(guest),
+        }) = stage
+        else {
+            unreachable!("expected mesh identity plus guest credential")
+        };
+        assert_eq!(node, "this-node");
+        assert_eq!(guest.store_ref, store_ref);
+        assert_eq!(guest.credential.username, "administrator");
+        assert_eq!(guest.credential.secret.expose(), "mesh-rdp-pw");
+        assert!(DesktopAuth::MeshIdentity {
+            node,
+            guest: Some(guest)
+        }
+        .summary()
+        .contains("sealed guest credential"));
     }
 
     #[test]
